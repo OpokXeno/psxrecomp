@@ -1,0 +1,1200 @@
+{
+  "schema": "psxrecomp-v4 phase1c function_edges v1",
+  "total_edges": 199,
+  "edges": [
+    {
+      "caller_func": "0xBFC008A0",
+      "caller_pc": "0xBFC008E4",
+      "callee_addr": "0xBFC00944",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC008A0",
+      "caller_pc": "0xBFC008FC",
+      "callee_addr": "0xBFC00944",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC008A0",
+      "caller_pc": "0xBFC00914",
+      "callee_addr": "0xBFC00944",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC008A0",
+      "caller_pc": "0xBFC0092C",
+      "callee_addr": "0xBFC00B7C",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC00978",
+      "callee_addr": "0xBFC03494",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC009FC",
+      "callee_addr": "0xBFC03494",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC00988",
+      "callee_addr": "0xBFC03310",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC009DC",
+      "callee_addr": "0xBFC03494",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC009EC",
+      "callee_addr": "0xBFC03310",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC00B04",
+      "callee_addr": "0xBFC02EA0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00944",
+      "caller_pc": "0xBFC00B5C",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00B7C",
+      "caller_pc": "0xBFC00BA4",
+      "callee_addr": "0xBFC03494",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00B7C",
+      "caller_pc": "0xBFC00BC8",
+      "callee_addr": "0xBFC03310",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00B7C",
+      "caller_pc": "0xBFC00D0C",
+      "callee_addr": "0xBFC033C8",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00B7C",
+      "caller_pc": "0xBFC00D20",
+      "callee_addr": "0xBFC03418",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00B7C",
+      "caller_pc": "0xBFC00D30",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00B7C",
+      "caller_pc": "0xBFC00D40",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC00E64",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC016B8",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC0119C",
+      "callee_addr": "0xBFC03494",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC0114C",
+      "callee_addr": "0xBFC02CC0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC013E4",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC0141C",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC013A8",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC01490",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC014DC",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC01444",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC01528",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC01564",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC00DA0",
+      "caller_pc": "0xBFC015B4",
+      "callee_addr": "0xBFC0D880",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC018E0",
+      "caller_pc": "0xBFC01908",
+      "callee_addr": "0xBFC00DA0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC01A60",
+      "caller_pc": "0xBFC01A70",
+      "callee_addr": "0xBFC03990",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03A18",
+      "caller_pc": "0xBFC03A24",
+      "callee_addr": "0xBFC0D890",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03A18",
+      "caller_pc": "0xBFC03A40",
+      "callee_addr": "0xBFC03C90",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03A18",
+      "caller_pc": "0xBFC03A54",
+      "callee_addr": "0xBFC0D8A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03A18",
+      "caller_pc": "0xBFC03A74",
+      "callee_addr": "0xBFC0D8B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03A18",
+      "caller_pc": "0xBFC03A80",
+      "callee_addr": "0xBFC0D8A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03A18",
+      "caller_pc": "0xBFC03A88",
+      "callee_addr": "0xBFC01920",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03C90",
+      "caller_pc": "0xBFC03CA4",
+      "callee_addr": "0xBFC0D8B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC03C90",
+      "caller_pc": "0xBFC03CCC",
+      "callee_addr": "0xBFC02B50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC04610",
+      "caller_pc": "0xBFC04624",
+      "callee_addr": "0xBFC0DAE0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC04610",
+      "caller_pc": "0xBFC04644",
+      "callee_addr": "0xBFC01ACC",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC04678",
+      "caller_pc": "0xBFC04690",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC04678",
+      "caller_pc": "0xBFC046B8",
+      "callee_addr": "0xBFC0DAE0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0472C",
+      "caller_pc": "0xBFC0474C",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0472C",
+      "caller_pc": "0xBFC04780",
+      "callee_addr": "0xBFC0DAE0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0472C",
+      "caller_pc": "0xBFC0479C",
+      "callee_addr": "0xBFC0DAE0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06784",
+      "caller_pc": "0xBFC06794",
+      "callee_addr": "0xBFC033C8",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06784",
+      "caller_pc": "0xBFC067A4",
+      "callee_addr": "0xBFC03190",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06784",
+      "caller_pc": "0xBFC067B4",
+      "callee_addr": "0xBFC033C8",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06784",
+      "caller_pc": "0xBFC067C4",
+      "callee_addr": "0xBFC03190",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06784",
+      "caller_pc": "0xBFC067D0",
+      "callee_addr": "0xBFC067E8",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC067F8",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06800",
+      "callee_addr": "0xBFC03968",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0680C",
+      "callee_addr": "0xBFC03978",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0682C",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06834",
+      "callee_addr": "0xBFC00420",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0683C",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06844",
+      "callee_addr": "0xBFC042D0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0684C",
+      "callee_addr": "0xBFC042A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06854",
+      "callee_addr": "0xBFC0DB10",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0685C",
+      "callee_addr": "0xBFC0DB20",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06864",
+      "callee_addr": "0xBFC0D9A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0686C",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC068A4",
+      "callee_addr": "0xBFC0DB30",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC068AC",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC068B8",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC068C0",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC068F0",
+      "callee_addr": "0xBFC02B50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC068FC",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0690C",
+      "callee_addr": "0xBFC0DB40",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06914",
+      "callee_addr": "0xBFC04610",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0691C",
+      "callee_addr": "0xBFC0DB50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06924",
+      "callee_addr": "0xBFC0DB60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06934",
+      "callee_addr": "0xBFC04678",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06944",
+      "callee_addr": "0xBFC0472C",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC0694C",
+      "callee_addr": "0xBFC0DB70",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06970",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06980",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06988",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06990",
+      "callee_addr": "0xBFC06FF0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06998",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069AC",
+      "callee_addr": "0xBFC073A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069B8",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069C8",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069D0",
+      "callee_addr": "0xBFC070AC",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069E4",
+      "callee_addr": "0xBFC07148",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069F0",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC069FC",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A0C",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A14",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A20",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A30",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A3C",
+      "callee_addr": "0xBFC0D890",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B1C",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A54",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B2C",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A60",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A70",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06A84",
+      "callee_addr": "0xBFC0D8B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B48",
+      "callee_addr": "0xBFC02B50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B58",
+      "callee_addr": "0xBFC033C8",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06AD0",
+      "callee_addr": "0xBFC0D8A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B64",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06AA4",
+      "callee_addr": "0xBFC02B50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06ADC",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B74",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B7C",
+      "callee_addr": "0xBFC06F28",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06AB4",
+      "callee_addr": "0xBFC033C8",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06AEC",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B90",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B9C",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06B08",
+      "callee_addr": "0xBFC008A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06BAC",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06BB4",
+      "callee_addr": "0xBFC0D850",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06BC8",
+      "callee_addr": "0xBFC03A18",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06BD8",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06BFC",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C18",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C40",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C48",
+      "callee_addr": "0xBFC0D960",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C54",
+      "callee_addr": "0xBFC02240",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C64",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C78",
+      "callee_addr": "0xBFC0D570",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C84",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC067E8",
+      "caller_pc": "0xBFC06C8C",
+      "callee_addr": "0xBFC06FA4",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F34",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F44",
+      "callee_addr": "0xBFC0DB40",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F4C",
+      "callee_addr": "0xBFC04610",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F54",
+      "callee_addr": "0xBFC0DB50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F5C",
+      "callee_addr": "0xBFC0DB60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F6C",
+      "callee_addr": "0xBFC04678",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F7C",
+      "callee_addr": "0xBFC0472C",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F84",
+      "callee_addr": "0xBFC0DB70",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06F28",
+      "caller_pc": "0xBFC06F8C",
+      "callee_addr": "0xBFC071A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06FA4",
+      "caller_pc": "0xBFC06FB0",
+      "callee_addr": "0xBFC01A60",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06FA4",
+      "caller_pc": "0xBFC06FBC",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06FF0",
+      "caller_pc": "0xBFC0700C",
+      "callee_addr": "0xBFC02B50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC06FF0",
+      "caller_pc": "0xBFC07014",
+      "callee_addr": "0xBFC01920",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07148",
+      "caller_pc": "0xBFC07154",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07148",
+      "caller_pc": "0xBFC07168",
+      "callee_addr": "0xBFC018E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC071A8",
+      "callee_addr": "0xBFC0DBF0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC071C0",
+      "callee_addr": "0xBFC0D9B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC071E0",
+      "callee_addr": "0xBFC0D9B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07200",
+      "callee_addr": "0xBFC0D9B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07220",
+      "callee_addr": "0xBFC0D9B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07240",
+      "callee_addr": "0xBFC0D9B0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07254",
+      "callee_addr": "0xBFC0D9C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07264",
+      "callee_addr": "0xBFC0D9C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07274",
+      "callee_addr": "0xBFC0D9C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07284",
+      "callee_addr": "0xBFC0D9C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC07294",
+      "callee_addr": "0xBFC0D9C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC071A0",
+      "caller_pc": "0xBFC0729C",
+      "callee_addr": "0xBFC0D8C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07330",
+      "caller_pc": "0xBFC07338",
+      "callee_addr": "0xBFC071A0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07330",
+      "caller_pc": "0xBFC07340",
+      "callee_addr": "0xBFC0DC10",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07330",
+      "caller_pc": "0xBFC07350",
+      "callee_addr": "0xBFC0DC10",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC073A0",
+      "caller_pc": "0xBFC073A8",
+      "callee_addr": "0xBFC07330",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC073A0",
+      "caller_pc": "0xBFC073F8",
+      "callee_addr": "0xBFC07410",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07410",
+      "caller_pc": "0xBFC07430",
+      "callee_addr": "0xBFC07C1C",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07410",
+      "caller_pc": "0xBFC0745C",
+      "callee_addr": "0xBFC03310",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07410",
+      "caller_pc": "0xBFC074E8",
+      "callee_addr": "0xBFC07C1C",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07410",
+      "caller_pc": "0xBFC075D4",
+      "callee_addr": "0xBFC02B50",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07C68",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07D84",
+      "callee_addr": "0xBFC0DC20",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07DA0",
+      "callee_addr": "0xBFC0DC20",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07DBC",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07DD4",
+      "callee_addr": "0xBFC0D9E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07DF8",
+      "callee_addr": "0xBFC0D9E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07E24",
+      "callee_addr": "0xBFC0DC30",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07E0C",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07E64",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07E48",
+      "callee_addr": "0xBFC0DC30",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07E84",
+      "callee_addr": "0xBFC0D9E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07EA4",
+      "callee_addr": "0xBFC0D9E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07EB8",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07ED0",
+      "callee_addr": "0xBFC0D9E0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC07C1C",
+      "caller_pc": "0xBFC07EE4",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D580",
+      "callee_addr": "0xBFC0D8C0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D59C",
+      "callee_addr": "0xBFC0D72C",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D5D4",
+      "callee_addr": "0xBFC0D960",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D5B8",
+      "callee_addr": "0xBFC0D7BC",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D5B0",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D5E8",
+      "callee_addr": "0xBFC03CF0",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D570",
+      "caller_pc": "0xBFC0D5CC",
+      "callee_addr": "0xBFC0D950",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D688",
+      "caller_pc": "0xBFC0D6E0",
+      "callee_addr": "0xBFC0D600",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D734",
+      "callee_addr": "0xBFC0D600",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D73C",
+      "callee_addr": "0xBFC0D664",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D75C",
+      "callee_addr": "0xBFC0D688",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D76C",
+      "callee_addr": "0xBFC0D640",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D788",
+      "callee_addr": "0xBFC0D640",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D798",
+      "callee_addr": "0xBFC0D600",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D72C",
+      "caller_pc": "0xBFC0D7A0",
+      "callee_addr": "0xBFC0D640",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D7C4",
+      "callee_addr": "0xBFC0D600",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D7CC",
+      "callee_addr": "0xBFC0D664",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D7EC",
+      "callee_addr": "0xBFC0D688",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D7FC",
+      "callee_addr": "0xBFC0D640",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D818",
+      "callee_addr": "0xBFC0D640",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D828",
+      "callee_addr": "0xBFC0D600",
+      "in_rom": true
+    },
+    {
+      "caller_func": "0xBFC0D7BC",
+      "caller_pc": "0xBFC0D830",
+      "callee_addr": "0xBFC0D640",
+      "in_rom": true
+    }
+  ]
+}

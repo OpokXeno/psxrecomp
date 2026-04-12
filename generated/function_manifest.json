@@ -1,0 +1,694 @@
+{
+  "schema": "psxrecomp-v4 phase1c function_manifest v1",
+  "bios_sha256": "71af94d1e47a68c11e8fdb9f8368040601514a42a5a399cda48c7d3bff1e99d3",
+  "total_functions": 76,
+  "total_instructions": 2988,
+  "total_edges": 199,
+  "total_indirect_jumps": 27,
+  "functions": [
+    {
+      "entry_addr": "0xBFC00000",
+      "normalized_addr": "0x1FC00000",
+      "end_addr": "0xBFC0017C",
+      "instruction_count": 42,
+      "termination_reason": "no_exit_found",
+      "discovered_by": "reset_vector",
+      "block_leaders": ["0xBFC00000", "0xBFC00150"]
+    },
+    {
+      "entry_addr": "0xBFC00180",
+      "normalized_addr": "0x1FC00180",
+      "end_addr": "0xBFC0041C",
+      "instruction_count": 168,
+      "termination_reason": "j_out_of_function",
+      "discovered_by": "general_exception_bev1",
+      "block_leaders": ["0xBFC00180", "0xBFC00250", "0xBFC00278", "0xBFC002A0", "0xBFC00328", "0xBFC003B8", "0xBFC003CC"]
+    },
+    {
+      "entry_addr": "0xBFC00420",
+      "normalized_addr": "0x1FC00420",
+      "end_addr": "0xBFC00458",
+      "instruction_count": 15,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06834",
+      "block_leaders": ["0xBFC00420", "0xBFC00434", "0xBFC0044C"]
+    },
+    {
+      "entry_addr": "0xBFC008A0",
+      "normalized_addr": "0x1FC008A0",
+      "end_addr": "0xBFC00940",
+      "instruction_count": 41,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B08",
+      "block_leaders": ["0xBFC008A0", "0xBFC008BC", "0xBFC008CC", "0xBFC008EC", "0xBFC00904", "0xBFC0091C", "0xBFC00934"]
+    },
+    {
+      "entry_addr": "0xBFC00944",
+      "normalized_addr": "0x1FC00944",
+      "end_addr": "0xBFC00B78",
+      "instruction_count": 142,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B08 -> jal at 0xBFC008E4",
+      "block_leaders": ["0xBFC00944", "0xBFC00970", "0xBFC00978", "0xBFC00980", "0xBFC00990", "0xBFC00998", "0xBFC009A0", "0xBFC009A4", "0xBFC009B4", "0xBFC009BC", "0xBFC009CC", "0xBFC009DC", "0xBFC009E4", "0xBFC009F4", "0xBFC009FC", "0xBFC00A04", "0xBFC00A30", "0xBFC00A38", "0xBFC00A40", "0xBFC00A64", "0xBFC00A6C", "0xBFC00A74", "0xBFC00A7C", "0xBFC00AA4", "0xBFC00AAC", "0xBFC00AB4", "0xBFC00ADC", "0xBFC00AE0", "0xBFC00AE8", "0xBFC00AEC", "0xBFC00AF4", "0xBFC00B04", "0xBFC00B0C", "0xBFC00B20", "0xBFC00B48", "0xBFC00B64", "0xBFC00B68"]
+    },
+    {
+      "entry_addr": "0xBFC00B7C",
+      "normalized_addr": "0x1FC00B7C",
+      "end_addr": "0xBFC00D9C",
+      "instruction_count": 137,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B08 -> jal at 0xBFC0092C",
+      "block_leaders": ["0xBFC00B7C", "0xBFC00BAC", "0xBFC00BBC", "0xBFC00BC4", "0xBFC00BD0", "0xBFC00BD8", "0xBFC00C04", "0xBFC00C0C", "0xBFC00C14", "0xBFC00C38", "0xBFC00C40", "0xBFC00C48", "0xBFC00C50", "0xBFC00C74", "0xBFC00C7C", "0xBFC00C84", "0xBFC00CA8", "0xBFC00CB0", "0xBFC00CC0", "0xBFC00CE4", "0xBFC00D04", "0xBFC00D14", "0xBFC00D28", "0xBFC00D38", "0xBFC00D48", "0xBFC00D50", "0xBFC00D60", "0xBFC00D68", "0xBFC00D78", "0xBFC00D88", "0xBFC00D8C"]
+    },
+    {
+      "entry_addr": "0xBFC00DA0",
+      "normalized_addr": "0x1FC00DA0",
+      "end_addr": "0xBFC018D8",
+      "instruction_count": 719,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068B8 -> jal at 0xBFC01908",
+      "block_leaders": ["0xBFC00DA0", "0xBFC00DB8", "0xBFC00DC0", "0xBFC00E1C", "0xBFC00E2C", "0xBFC00E58", "0xBFC00E5C", "0xBFC00E64", "0xBFC00E6C", "0xBFC00E90", "0xBFC00E94", "0xBFC00EA8", "0xBFC00EB8", "0xBFC00EC0", "0xBFC00EC8", "0xBFC00ED0", "0xBFC00EE0", "0xBFC00EE4", "0xBFC00EEC", "0xBFC00EF4", "0xBFC00F04", "0xBFC00F10", "0xBFC00F14", "0xBFC00F1C", "0xBFC00F34", "0xBFC00F38", "0xBFC00F58", "0xBFC00F70", "0xBFC00F74", "0xBFC00F7C", "0xBFC00F84", "0xBFC00F8C", "0xBFC00F94", "0xBFC00F98", "0xBFC00F9C", "0xBFC00FBC", "0xBFC00FD4", "0xBFC00FE0", "0xBFC00FE8", "0xBFC00FF0", "0xBFC00FF8", "0xBFC01014", "0xBFC01018", "0xBFC01028", "0xBFC01034", "0xBFC01040", "0xBFC0104C", "0xBFC01054", "0xBFC01058", "0xBFC01060", "0xBFC0106C", "0xBFC01078", "0xBFC0108C", "0xBFC01090", "0xBFC01098", "0xBFC010AC", "0xBFC010B0", "0xBFC010C0", "0xBFC010C8", "0xBFC010D8", "0xBFC010E4", "0xBFC010F0", "0xBFC010FC", "0xBFC01104", "0xBFC0110C", "0xBFC01124", "0xBFC01134", "0xBFC0113C", "0xBFC01144", "0xBFC01154", "0xBFC0117C", "0xBFC0118C", "0xBFC01194", "0xBFC0119C", "0xBFC011A4", "0xBFC011CC", "0xBFC011D0", "0xBFC011E4", "0xBFC011F0", "0xBFC011FC", "0xBFC01208", "0xBFC01210", "0xBFC01218", "0xBFC01228", "0xBFC01238", "0xBFC01244", "0xBFC01250", "0xBFC0125C", "0xBFC01264", "0xBFC01268", "0xBFC01274", "0xBFC0127C", "0xBFC01280", "0xBFC01288", "0xBFC01290", "0xBFC01298", "0xBFC012A0", "0xBFC012A8", "0xBFC012CC", "0xBFC012D0", "0xBFC012D8", "0xBFC012E8", "0xBFC012F4", "0xBFC01304", "0xBFC01310", "0xBFC01314", "0xBFC01318", "0xBFC01328", "0xBFC01338", "0xBFC01344", "0xBFC01354", "0xBFC0136C", "0xBFC01374", "0xBFC01378", "0xBFC01380", "0xBFC0138C", "0xBFC01394", "0xBFC013A8", "0xBFC013B0", "0xBFC013DC", "0xBFC013E4", "0xBFC013EC", "0xBFC01410", "0xBFC0141C", "0xBFC01424", "0xBFC0144C", "0xBFC01470", "0xBFC0147C", "0xBFC01490", "0xBFC01498", "0xBFC014C4", "0xBFC014C8", "0xBFC014DC", "0xBFC014E4", "0xBFC01514", "0xBFC01518", "0xBFC01524", "0xBFC01530", "0xBFC01558", "0xBFC01564", "0xBFC0156C", "0xBFC01594", "0xBFC01598", "0xBFC015A0", "0xBFC015B4", "0xBFC015BC", "0xBFC015E8", "0xBFC015EC", "0xBFC015FC", "0xBFC01604", "0xBFC01608", "0xBFC0160C", "0xBFC01620", "0xBFC01624", "0xBFC0164C", "0xBFC01654", "0xBFC0165C", "0xBFC01664", "0xBFC0166C", "0xBFC01674", "0xBFC0167C", "0xBFC01684", "0xBFC0168C", "0xBFC01694", "0xBFC0169C", "0xBFC016A4", "0xBFC016AC", "0xBFC016B4", "0xBFC016B8", "0xBFC016C0", "0xBFC016F0", "0xBFC016F8", "0xBFC01700", "0xBFC01708", "0xBFC01710", "0xBFC01718", "0xBFC01720", "0xBFC0172C", "0xBFC01734", "0xBFC01738", "0xBFC01740", "0xBFC01748", "0xBFC01750", "0xBFC01758", "0xBFC01760", "0xBFC01768", "0xBFC01774", "0xBFC0177C", "0xBFC01788", "0xBFC01790", "0xBFC01798", "0xBFC017A0", "0xBFC017AC", "0xBFC017B4", "0xBFC017B8", "0xBFC017C0", "0xBFC017C8", "0xBFC017D0", "0xBFC017D8", "0xBFC017E0", "0xBFC017E8", "0xBFC017F0", "0xBFC017F8", "0xBFC01804", "0xBFC0180C", "0xBFC01818", "0xBFC01820", "0xBFC01828", "0xBFC01830", "0xBFC0183C", "0xBFC01844", "0xBFC01850", "0xBFC01858", "0xBFC01860", "0xBFC01868", "0xBFC01870", "0xBFC01878", "0xBFC01884", "0xBFC0188C", "0xBFC01898", "0xBFC018A0", "0xBFC018A8", "0xBFC018B0", "0xBFC018BC", "0xBFC018C4", "0xBFC018CC", "0xBFC018D0"]
+    },
+    {
+      "entry_addr": "0xBFC018E0",
+      "normalized_addr": "0x1FC018E0",
+      "end_addr": "0xBFC0191C",
+      "instruction_count": 16,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068B8",
+      "block_leaders": ["0xBFC018E0", "0xBFC01910"]
+    },
+    {
+      "entry_addr": "0xBFC01920",
+      "normalized_addr": "0x1FC01920",
+      "end_addr": "0xBFC0193C",
+      "instruction_count": 8,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06990 -> jal at 0xBFC07014",
+      "block_leaders": ["0xBFC01920"]
+    },
+    {
+      "entry_addr": "0xBFC01A60",
+      "normalized_addr": "0x1FC01A60",
+      "end_addr": "0xBFC01A84",
+      "instruction_count": 10,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06ECC",
+      "block_leaders": ["0xBFC01A60", "0xBFC01A78"]
+    },
+    {
+      "entry_addr": "0xBFC01ACC",
+      "normalized_addr": "0x1FC01ACC",
+      "end_addr": "0xBFC01B04",
+      "instruction_count": 15,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06914 -> jal at 0xBFC04644",
+      "block_leaders": ["0xBFC01ACC", "0xBFC01AD4", "0xBFC01ADC", "0xBFC01AE4", "0xBFC01AEC", "0xBFC01AFC"]
+    },
+    {
+      "entry_addr": "0xBFC02240",
+      "normalized_addr": "0x1FC02240",
+      "end_addr": "0xBFC02278",
+      "instruction_count": 15,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06970",
+      "block_leaders": ["0xBFC02240"]
+    },
+    {
+      "entry_addr": "0xBFC02B50",
+      "normalized_addr": "0x1FC02B50",
+      "end_addr": "0xBFC02B88",
+      "instruction_count": 15,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068F0",
+      "block_leaders": ["0xBFC02B50", "0xBFC02B58", "0xBFC02B60", "0xBFC02B68", "0xBFC02B80"]
+    },
+    {
+      "entry_addr": "0xBFC02CC0",
+      "normalized_addr": "0x1FC02CC0",
+      "end_addr": "0xBFC02D10",
+      "instruction_count": 19,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068B8 -> jal at 0xBFC01908 -> jal at 0xBFC0114C",
+      "block_leaders": ["0xBFC02CC0", "0xBFC02CC8", "0xBFC02CD0", "0xBFC02CDC", "0xBFC02CE4", "0xBFC02CF4", "0xBFC02D00", "0xBFC02D08", "0xBFC02D0C"]
+    },
+    {
+      "entry_addr": "0xBFC02EA0",
+      "normalized_addr": "0x1FC02EA0",
+      "end_addr": "0xBFC02ED8",
+      "instruction_count": 15,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B08 -> jal at 0xBFC008E4 -> jal at 0xBFC00B04",
+      "block_leaders": ["0xBFC02EA0", "0xBFC02EC8", "0xBFC02ED4"]
+    },
+    {
+      "entry_addr": "0xBFC03190",
+      "normalized_addr": "0x1FC03190",
+      "end_addr": "0xBFC031FC",
+      "instruction_count": 28,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067A4",
+      "block_leaders": ["0xBFC03190", "0xBFC03198", "0xBFC031A0", "0xBFC031A8", "0xBFC031B8", "0xBFC031C8", "0xBFC031E0", "0xBFC031F4"]
+    },
+    {
+      "entry_addr": "0xBFC03310",
+      "normalized_addr": "0x1FC03310",
+      "end_addr": "0xBFC033C4",
+      "instruction_count": 45,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073F8 -> jal at 0xBFC0745C",
+      "block_leaders": ["0xBFC03310", "0xBFC03318", "0xBFC03320", "0xBFC03328", "0xBFC03330", "0xBFC03338", "0xBFC03340", "0xBFC0334C", "0xBFC03354", "0xBFC03368", "0xBFC0336C", "0xBFC03374", "0xBFC0337C", "0xBFC03388", "0xBFC0339C", "0xBFC033A4", "0xBFC033AC", "0xBFC033BC"]
+    },
+    {
+      "entry_addr": "0xBFC033C8",
+      "normalized_addr": "0x1FC033C8",
+      "end_addr": "0xBFC03414",
+      "instruction_count": 20,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC06794",
+      "block_leaders": ["0xBFC033C8", "0xBFC033D0", "0xBFC033D8", "0xBFC033E0", "0xBFC033F8", "0xBFC0340C"]
+    },
+    {
+      "entry_addr": "0xBFC03418",
+      "normalized_addr": "0x1FC03418",
+      "end_addr": "0xBFC03490",
+      "instruction_count": 31,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B08 -> jal at 0xBFC0092C -> jal at 0xBFC00D20",
+      "block_leaders": ["0xBFC03418", "0xBFC03420", "0xBFC03428", "0xBFC03430", "0xBFC0343C", "0xBFC03450", "0xBFC03460", "0xBFC03474", "0xBFC0347C", "0xBFC03488"]
+    },
+    {
+      "entry_addr": "0xBFC03494",
+      "normalized_addr": "0x1FC03494",
+      "end_addr": "0xBFC034CC",
+      "instruction_count": 15,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068B8 -> jal at 0xBFC01908 -> jal at 0xBFC0119C",
+      "block_leaders": ["0xBFC03494", "0xBFC0349C", "0xBFC034A4", "0xBFC034B4", "0xBFC034C4", "0xBFC034C8"]
+    },
+    {
+      "entry_addr": "0xBFC03968",
+      "normalized_addr": "0x1FC03968",
+      "end_addr": "0xBFC03974",
+      "instruction_count": 4,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06800",
+      "block_leaders": ["0xBFC03968"]
+    },
+    {
+      "entry_addr": "0xBFC03978",
+      "normalized_addr": "0x1FC03978",
+      "end_addr": "0xBFC03984",
+      "instruction_count": 4,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC0680C",
+      "block_leaders": ["0xBFC03978"]
+    },
+    {
+      "entry_addr": "0xBFC03990",
+      "normalized_addr": "0x1FC03990",
+      "end_addr": "0xBFC039A8",
+      "instruction_count": 7,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06ECC -> jal at 0xBFC01A70",
+      "block_leaders": ["0xBFC03990"]
+    },
+    {
+      "entry_addr": "0xBFC03A18",
+      "normalized_addr": "0x1FC03A18",
+      "end_addr": "0xBFC03AA0",
+      "instruction_count": 35,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06BC8",
+      "block_leaders": ["0xBFC03A18", "0xBFC03A2C", "0xBFC03A34", "0xBFC03A3C", "0xBFC03A48", "0xBFC03A54", "0xBFC03A5C", "0xBFC03A64", "0xBFC03A68", "0xBFC03A7C", "0xBFC03A88", "0xBFC03A90", "0xBFC03A94"]
+    },
+    {
+      "entry_addr": "0xBFC03C90",
+      "normalized_addr": "0x1FC03C90",
+      "end_addr": "0xBFC03CE4",
+      "instruction_count": 22,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06BC8 -> jal at 0xBFC03A40",
+      "block_leaders": ["0xBFC03C90", "0xBFC03CAC", "0xBFC03CB8", "0xBFC03CC0", "0xBFC03CC4", "0xBFC03CD4", "0xBFC03CD8"]
+    },
+    {
+      "entry_addr": "0xBFC03CF0",
+      "normalized_addr": "0x1FC03CF0",
+      "end_addr": "0xBFC03D78",
+      "instruction_count": 35,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D5E8",
+      "block_leaders": ["0xBFC03CF0", "0xBFC03D10", "0xBFC03D18", "0xBFC03D28", "0xBFC03D38", "0xBFC03D4C", "0xBFC03D60"]
+    },
+    {
+      "entry_addr": "0xBFC042A0",
+      "normalized_addr": "0x1FC042A0",
+      "end_addr": "0xBFC042CC",
+      "instruction_count": 12,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC0684C",
+      "block_leaders": ["0xBFC042A0", "0xBFC042B4", "0xBFC042C8"]
+    },
+    {
+      "entry_addr": "0xBFC042D0",
+      "normalized_addr": "0x1FC042D0",
+      "end_addr": "0xBFC042FC",
+      "instruction_count": 12,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06844",
+      "block_leaders": ["0xBFC042D0", "0xBFC042E4", "0xBFC042F8"]
+    },
+    {
+      "entry_addr": "0xBFC04610",
+      "normalized_addr": "0x1FC04610",
+      "end_addr": "0xBFC04674",
+      "instruction_count": 26,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06914",
+      "block_leaders": ["0xBFC04610", "0xBFC0462C", "0xBFC04638", "0xBFC04640", "0xBFC0464C", "0xBFC04668"]
+    },
+    {
+      "entry_addr": "0xBFC04678",
+      "normalized_addr": "0x1FC04678",
+      "end_addr": "0xBFC04728",
+      "instruction_count": 45,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06934",
+      "block_leaders": ["0xBFC04678", "0xBFC04698", "0xBFC046C0", "0xBFC046CC", "0xBFC046D4", "0xBFC046D8", "0xBFC04708", "0xBFC04718", "0xBFC0471C"]
+    },
+    {
+      "entry_addr": "0xBFC0472C",
+      "normalized_addr": "0x1FC0472C",
+      "end_addr": "0xBFC0484C",
+      "instruction_count": 73,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06944",
+      "block_leaders": ["0xBFC0472C", "0xBFC04754", "0xBFC04788", "0xBFC04790", "0xBFC04798", "0xBFC047A4", "0xBFC047B0", "0xBFC047B8", "0xBFC047D4", "0xBFC047E4", "0xBFC047E8", "0xBFC04808", "0xBFC0480C", "0xBFC0481C", "0xBFC0483C"]
+    },
+    {
+      "entry_addr": "0xBFC06784",
+      "normalized_addr": "0x1FC06784",
+      "end_addr": "0xBFC067E4",
+      "instruction_count": 25,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10",
+      "block_leaders": ["0xBFC06784", "0xBFC0679C", "0xBFC067AC", "0xBFC067BC", "0xBFC067CC", "0xBFC067D8"]
+    },
+    {
+      "entry_addr": "0xBFC067E8",
+      "normalized_addr": "0x1FC067E8",
+      "end_addr": "0xBFC06CA0",
+      "instruction_count": 303,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0",
+      "block_leaders": ["0xBFC067E8", "0xBFC06800", "0xBFC06808", "0xBFC06814", "0xBFC06834", "0xBFC0683C", "0xBFC06844", "0xBFC0684C", "0xBFC06854", "0xBFC0685C", "0xBFC06864", "0xBFC0686C", "0xBFC06874", "0xBFC068AC", "0xBFC068B4", "0xBFC068C0", "0xBFC068C8", "0xBFC068F8", "0xBFC06904", "0xBFC06914", "0xBFC0691C", "0xBFC06924", "0xBFC0692C", "0xBFC0693C", "0xBFC0694C", "0xBFC06954", "0xBFC06978", "0xBFC06980", "0xBFC06988", "0xBFC06990", "0xBFC06998", "0xBFC069A0", "0xBFC069B4", "0xBFC069C0", "0xBFC069C8", "0xBFC069D0", "0xBFC069D8", "0xBFC069E4", "0xBFC069EC", "0xBFC069F8", "0xBFC06A04", "0xBFC06A0C", "0xBFC06A14", "0xBFC06A1C", "0xBFC06A28", "0xBFC06A30", "0xBFC06A38", "0xBFC06A3C", "0xBFC06A44", "0xBFC06A4C", "0xBFC06A5C", "0xBFC06A68", "0xBFC06A70", "0xBFC06A78", "0xBFC06A7C", "0xBFC06A8C", "0xBFC06A94", "0xBFC06AAC", "0xBFC06ABC", "0xBFC06AC4", "0xBFC06AD8", "0xBFC06AE4", "0xBFC06AEC", "0xBFC06AF4", "0xBFC06B10", "0xBFC06B18", "0xBFC06B24", "0xBFC06B2C", "0xBFC06B34", "0xBFC06B50", "0xBFC06B60", "0xBFC06B6C", "0xBFC06B74", "0xBFC06B7C", "0xBFC06B84", "0xBFC06B98", "0xBFC06BA4", "0xBFC06BAC", "0xBFC06BB4", "0xBFC06BBC", "0xBFC06BD0", "0xBFC06BD8", "0xBFC06BE0", "0xBFC06C04", "0xBFC06C20", "0xBFC06C48", "0xBFC06C50", "0xBFC06C5C", "0xBFC06C64", "0xBFC06C6C", "0xBFC06C80", "0xBFC06C8C", "0xBFC06C94"]
+    },
+    {
+      "entry_addr": "0xBFC06F28",
+      "normalized_addr": "0x1FC06F28",
+      "end_addr": "0xBFC06FA0",
+      "instruction_count": 31,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B7C",
+      "block_leaders": ["0xBFC06F28", "0xBFC06F3C", "0xBFC06F4C", "0xBFC06F54", "0xBFC06F5C", "0xBFC06F64", "0xBFC06F74", "0xBFC06F84", "0xBFC06F8C", "0xBFC06F94"]
+    },
+    {
+      "entry_addr": "0xBFC06FA4",
+      "normalized_addr": "0x1FC06FA4",
+      "end_addr": "0xBFC06FD0",
+      "instruction_count": 12,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06980",
+      "block_leaders": ["0xBFC06FA4", "0xBFC06FB8", "0xBFC06FC4"]
+    },
+    {
+      "entry_addr": "0xBFC06FF0",
+      "normalized_addr": "0x1FC06FF0",
+      "end_addr": "0xBFC07038",
+      "instruction_count": 19,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06990",
+      "block_leaders": ["0xBFC06FF0", "0xBFC07014", "0xBFC0701C", "0xBFC0702C"]
+    },
+    {
+      "entry_addr": "0xBFC0703C",
+      "normalized_addr": "0x1FC0703C",
+      "end_addr": "0xBFC070A8",
+      "instruction_count": 27,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06EE8",
+      "block_leaders": ["0xBFC0703C", "0xBFC0705C", "0xBFC07064", "0xBFC07078", "0xBFC07088", "0xBFC07098", "0xBFC070A4"]
+    },
+    {
+      "entry_addr": "0xBFC070AC",
+      "normalized_addr": "0x1FC070AC",
+      "end_addr": "0xBFC07118",
+      "instruction_count": 27,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069D0",
+      "block_leaders": ["0xBFC070AC", "0xBFC070CC", "0xBFC070D4", "0xBFC070E8", "0xBFC070F8", "0xBFC07108", "0xBFC07114"]
+    },
+    {
+      "entry_addr": "0xBFC0711C",
+      "normalized_addr": "0x1FC0711C",
+      "end_addr": "0xBFC07144",
+      "instruction_count": 11,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06EFC",
+      "block_leaders": ["0xBFC0711C", "0xBFC07138"]
+    },
+    {
+      "entry_addr": "0xBFC07148",
+      "normalized_addr": "0x1FC07148",
+      "end_addr": "0xBFC07190",
+      "instruction_count": 19,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069E4",
+      "block_leaders": ["0xBFC07148", "0xBFC0715C", "0xBFC07170", "0xBFC07184"]
+    },
+    {
+      "entry_addr": "0xBFC071A0",
+      "normalized_addr": "0x1FC071A0",
+      "end_addr": "0xBFC072B4",
+      "instruction_count": 70,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B7C -> jal at 0xBFC06F8C",
+      "block_leaders": ["0xBFC071A0", "0xBFC071B0", "0xBFC071C8", "0xBFC071E8", "0xBFC07208", "0xBFC07228", "0xBFC07248", "0xBFC0725C", "0xBFC0726C", "0xBFC0727C", "0xBFC0728C", "0xBFC0729C", "0xBFC072A4"]
+    },
+    {
+      "entry_addr": "0xBFC07330",
+      "normalized_addr": "0x1FC07330",
+      "end_addr": "0xBFC0736C",
+      "instruction_count": 16,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073A8",
+      "block_leaders": ["0xBFC07330", "0xBFC07340", "0xBFC07348", "0xBFC07350", "0xBFC07358", "0xBFC07360", "0xBFC07364"]
+    },
+    {
+      "entry_addr": "0xBFC073A0",
+      "normalized_addr": "0x1FC073A0",
+      "end_addr": "0xBFC0740C",
+      "instruction_count": 28,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC",
+      "block_leaders": ["0xBFC073A0", "0xBFC073B0", "0xBFC073C8", "0xBFC073CC", "0xBFC073F8", "0xBFC07400"]
+    },
+    {
+      "entry_addr": "0xBFC07410",
+      "normalized_addr": "0x1FC07410",
+      "end_addr": "0xBFC07660",
+      "instruction_count": 149,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073F8",
+      "block_leaders": ["0xBFC07410", "0xBFC07438", "0xBFC07444", "0xBFC0744C", "0xBFC07464", "0xBFC0746C", "0xBFC07474", "0xBFC074F0", "0xBFC074F8", "0xBFC07500", "0xBFC07518", "0xBFC07540", "0xBFC07560", "0xBFC07570", "0xBFC07580", "0xBFC075DC", "0xBFC075F8", "0xBFC07604", "0xBFC0760C", "0xBFC07618", "0xBFC07620", "0xBFC07630", "0xBFC07650"]
+    },
+    {
+      "entry_addr": "0xBFC07C1C",
+      "normalized_addr": "0x1FC07C1C",
+      "end_addr": "0xBFC07F24",
+      "instruction_count": 195,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073F8 -> jal at 0xBFC07430",
+      "block_leaders": ["0xBFC07C1C", "0xBFC07C5C", "0xBFC07C64", "0xBFC07C70", "0xBFC07C78", "0xBFC07D8C", "0xBFC07D94", "0xBFC07DA0", "0xBFC07DA8", "0xBFC07DB0", "0xBFC07DB8", "0xBFC07DC4", "0xBFC07DCC", "0xBFC07DDC", "0xBFC07DE4", "0xBFC07DF0", "0xBFC07E00", "0xBFC07E08", "0xBFC07E14", "0xBFC07E1C", "0xBFC07E2C", "0xBFC07E34", "0xBFC07E40", "0xBFC07E50", "0xBFC07E58", "0xBFC07E60", "0xBFC07E6C", "0xBFC07E74", "0xBFC07E7C", "0xBFC07E8C", "0xBFC07E94", "0xBFC07E9C", "0xBFC07EAC", "0xBFC07EB4", "0xBFC07EC0", "0xBFC07EC8", "0xBFC07ED8", "0xBFC07EE0", "0xBFC07EEC", "0xBFC07EF4", "0xBFC07EFC", "0xBFC07F00"]
+    },
+    {
+      "entry_addr": "0xBFC0D570",
+      "normalized_addr": "0x1FC0D570",
+      "end_addr": "0xBFC0D5FC",
+      "instruction_count": 36,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78",
+      "block_leaders": ["0xBFC0D570", "0xBFC0D588", "0xBFC0D59C", "0xBFC0D5A4", "0xBFC0D5AC", "0xBFC0D5B8", "0xBFC0D5C0", "0xBFC0D5C8", "0xBFC0D5D4", "0xBFC0D5DC", "0xBFC0D5F0"]
+    },
+    {
+      "entry_addr": "0xBFC0D600",
+      "normalized_addr": "0x1FC0D600",
+      "end_addr": "0xBFC0D63C",
+      "instruction_count": 16,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D59C -> jal at 0xBFC0D734",
+      "block_leaders": ["0xBFC0D600", "0xBFC0D628", "0xBFC0D638"]
+    },
+    {
+      "entry_addr": "0xBFC0D640",
+      "normalized_addr": "0x1FC0D640",
+      "end_addr": "0xBFC0D660",
+      "instruction_count": 9,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D59C -> jal at 0xBFC0D76C",
+      "block_leaders": ["0xBFC0D640"]
+    },
+    {
+      "entry_addr": "0xBFC0D664",
+      "normalized_addr": "0x1FC0D664",
+      "end_addr": "0xBFC0D684",
+      "instruction_count": 9,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D59C -> jal at 0xBFC0D73C",
+      "block_leaders": ["0xBFC0D664"]
+    },
+    {
+      "entry_addr": "0xBFC0D688",
+      "normalized_addr": "0x1FC0D688",
+      "end_addr": "0xBFC0D728",
+      "instruction_count": 41,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D59C -> jal at 0xBFC0D75C",
+      "block_leaders": ["0xBFC0D688", "0xBFC0D6B4", "0xBFC0D6E0", "0xBFC0D6E8", "0xBFC0D6F4", "0xBFC0D6FC", "0xBFC0D704", "0xBFC0D70C", "0xBFC0D710"]
+    },
+    {
+      "entry_addr": "0xBFC0D72C",
+      "normalized_addr": "0x1FC0D72C",
+      "end_addr": "0xBFC0D7B8",
+      "instruction_count": 36,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D59C",
+      "block_leaders": ["0xBFC0D72C", "0xBFC0D73C", "0xBFC0D744", "0xBFC0D764", "0xBFC0D76C", "0xBFC0D774", "0xBFC0D77C", "0xBFC0D780", "0xBFC0D788", "0xBFC0D790", "0xBFC0D798", "0xBFC0D7A0", "0xBFC0D7A8", "0xBFC0D7AC"]
+    },
+    {
+      "entry_addr": "0xBFC0D7BC",
+      "normalized_addr": "0x1FC0D7BC",
+      "end_addr": "0xBFC0D848",
+      "instruction_count": 36,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D5B8",
+      "block_leaders": ["0xBFC0D7BC", "0xBFC0D7CC", "0xBFC0D7D4", "0xBFC0D7F4", "0xBFC0D7FC", "0xBFC0D804", "0xBFC0D80C", "0xBFC0D810", "0xBFC0D818", "0xBFC0D820", "0xBFC0D828", "0xBFC0D830", "0xBFC0D838", "0xBFC0D83C"]
+    },
+    {
+      "entry_addr": "0xBFC0D850",
+      "normalized_addr": "0x1FC0D850",
+      "end_addr": "0xBFC0D878",
+      "instruction_count": 11,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06BB4",
+      "block_leaders": ["0xBFC0D850", "0xBFC0D864", "0xBFC0D874"]
+    },
+    {
+      "entry_addr": "0xBFC0D880",
+      "normalized_addr": "0x1FC0D880",
+      "end_addr": "0xBFC0D888",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068B8 -> jal at 0xBFC01908 -> jal at 0xBFC00E64",
+      "block_leaders": ["0xBFC0D880"]
+    },
+    {
+      "entry_addr": "0xBFC0D890",
+      "normalized_addr": "0x1FC0D890",
+      "end_addr": "0xBFC0D898",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06A3C",
+      "block_leaders": ["0xBFC0D890"]
+    },
+    {
+      "entry_addr": "0xBFC0D8A0",
+      "normalized_addr": "0x1FC0D8A0",
+      "end_addr": "0xBFC0D8A8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06AD0",
+      "block_leaders": ["0xBFC0D8A0"]
+    },
+    {
+      "entry_addr": "0xBFC0D8B0",
+      "normalized_addr": "0x1FC0D8B0",
+      "end_addr": "0xBFC0D8B8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06A84",
+      "block_leaders": ["0xBFC0D8B0"]
+    },
+    {
+      "entry_addr": "0xBFC0D8C0",
+      "normalized_addr": "0x1FC0D8C0",
+      "end_addr": "0xBFC0D8CC",
+      "instruction_count": 4,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C78 -> jal at 0xBFC0D580",
+      "block_leaders": ["0xBFC0D8C0"]
+    },
+    {
+      "entry_addr": "0xBFC0D950",
+      "normalized_addr": "0x1FC0D950",
+      "end_addr": "0xBFC0D958",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06980 -> jal at 0xBFC06FBC",
+      "block_leaders": ["0xBFC0D950"]
+    },
+    {
+      "entry_addr": "0xBFC0D960",
+      "normalized_addr": "0x1FC0D960",
+      "end_addr": "0xBFC0D96C",
+      "instruction_count": 4,
+      "termination_reason": "jr_ra",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06C48",
+      "block_leaders": ["0xBFC0D960"]
+    },
+    {
+      "entry_addr": "0xBFC0D9A0",
+      "normalized_addr": "0x1FC0D9A0",
+      "end_addr": "0xBFC0D9A8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06864",
+      "block_leaders": ["0xBFC0D9A0"]
+    },
+    {
+      "entry_addr": "0xBFC0D9B0",
+      "normalized_addr": "0x1FC0D9B0",
+      "end_addr": "0xBFC0D9B8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B7C -> jal at 0xBFC06F8C -> jal at 0xBFC071C0",
+      "block_leaders": ["0xBFC0D9B0"]
+    },
+    {
+      "entry_addr": "0xBFC0D9C0",
+      "normalized_addr": "0x1FC0D9C0",
+      "end_addr": "0xBFC0D9C8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B7C -> jal at 0xBFC06F8C -> jal at 0xBFC07254",
+      "block_leaders": ["0xBFC0D9C0"]
+    },
+    {
+      "entry_addr": "0xBFC0D9E0",
+      "normalized_addr": "0x1FC0D9E0",
+      "end_addr": "0xBFC0D9E8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073F8 -> jal at 0xBFC07430 -> jal at 0xBFC07DD4",
+      "block_leaders": ["0xBFC0D9E0"]
+    },
+    {
+      "entry_addr": "0xBFC0DAE0",
+      "normalized_addr": "0x1FC0DAE0",
+      "end_addr": "0xBFC0DAE8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06914 -> jal at 0xBFC04624",
+      "block_leaders": ["0xBFC0DAE0"]
+    },
+    {
+      "entry_addr": "0xBFC0DB10",
+      "normalized_addr": "0x1FC0DB10",
+      "end_addr": "0xBFC0DB18",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06854",
+      "block_leaders": ["0xBFC0DB10"]
+    },
+    {
+      "entry_addr": "0xBFC0DB20",
+      "normalized_addr": "0x1FC0DB20",
+      "end_addr": "0xBFC0DB28",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC0685C",
+      "block_leaders": ["0xBFC0DB20"]
+    },
+    {
+      "entry_addr": "0xBFC0DB30",
+      "normalized_addr": "0x1FC0DB30",
+      "end_addr": "0xBFC0DB38",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC068A4",
+      "block_leaders": ["0xBFC0DB30"]
+    },
+    {
+      "entry_addr": "0xBFC0DB40",
+      "normalized_addr": "0x1FC0DB40",
+      "end_addr": "0xBFC0DB48",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC0690C",
+      "block_leaders": ["0xBFC0DB40"]
+    },
+    {
+      "entry_addr": "0xBFC0DB50",
+      "normalized_addr": "0x1FC0DB50",
+      "end_addr": "0xBFC0DB58",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC0691C",
+      "block_leaders": ["0xBFC0DB50"]
+    },
+    {
+      "entry_addr": "0xBFC0DB60",
+      "normalized_addr": "0x1FC0DB60",
+      "end_addr": "0xBFC0DB68",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06924",
+      "block_leaders": ["0xBFC0DB60"]
+    },
+    {
+      "entry_addr": "0xBFC0DB70",
+      "normalized_addr": "0x1FC0DB70",
+      "end_addr": "0xBFC0DB78",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC0694C",
+      "block_leaders": ["0xBFC0DB70"]
+    },
+    {
+      "entry_addr": "0xBFC0DBF0",
+      "normalized_addr": "0x1FC0DBF0",
+      "end_addr": "0xBFC0DBF8",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC06B7C -> jal at 0xBFC06F8C -> jal at 0xBFC071A8",
+      "block_leaders": ["0xBFC0DBF0"]
+    },
+    {
+      "entry_addr": "0xBFC0DC10",
+      "normalized_addr": "0x1FC0DC10",
+      "end_addr": "0xBFC0DC18",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073A8 -> jal at 0xBFC07340",
+      "block_leaders": ["0xBFC0DC10"]
+    },
+    {
+      "entry_addr": "0xBFC0DC20",
+      "normalized_addr": "0x1FC0DC20",
+      "end_addr": "0xBFC0DC28",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073F8 -> jal at 0xBFC07430 -> jal at 0xBFC07D84",
+      "block_leaders": ["0xBFC0DC20"]
+    },
+    {
+      "entry_addr": "0xBFC0DC30",
+      "normalized_addr": "0x1FC0DC30",
+      "end_addr": "0xBFC0DC38",
+      "instruction_count": 3,
+      "termination_reason": "indirect_jump_recorded_for_1d",
+      "discovered_by": "general_exception_bev1 -> jal at 0xBFC06F10 -> jal at 0xBFC067D0 -> jal at 0xBFC069AC -> jal at 0xBFC073F8 -> jal at 0xBFC07430 -> jal at 0xBFC07E24",
+      "block_leaders": ["0xBFC0DC30"]
+    }
+  ]
+}

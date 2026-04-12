@@ -1,0 +1,18 @@
+{
+  "schema": "psxrecomp-v4 phase1d indirect_jump_classes v1",
+  "total_sites": 27,
+  "classes": {
+    "a0_b0_c0_dispatch": {
+      "count": 21,
+      "sites": ["0xBFC0D884", "0xBFC0D894", "0xBFC0D8A4", "0xBFC0D8B4", "0xBFC0D954", "0xBFC0D9A4", "0xBFC0D9B4", "0xBFC0D9C4", "0xBFC0D9E4", "0xBFC0DAE4", "0xBFC0DB14", "0xBFC0DB24", "0xBFC0DB34", "0xBFC0DB44", "0xBFC0DB54", "0xBFC0DB64", "0xBFC0DB74", "0xBFC0DBF4", "0xBFC0DC14", "0xBFC0DC24", "0xBFC0DC34"]
+    },
+    "computed_call": {
+      "count": 4,
+      "sites": ["0xBFC03D58", "0xBFC07024", "0xBFC07130", "0xBFC0717C"]
+    },
+    "computed_tail_call": {
+      "count": 2,
+      "sites": ["0xBFC00454", "0xBFC01938"]
+    }
+  }
+}
