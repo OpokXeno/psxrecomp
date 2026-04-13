@@ -43,6 +43,8 @@ typedef struct CPUState {
     uint32_t pc;        /* program counter */
     uint32_t hi, lo;    /* mult/div result registers */
     uint32_t cop0[32];  /* COP0 system control registers (SR, Cause, EPC, ...) */
+    uint32_t gte_data[32]; /* COP2 (GTE) data registers */
+    uint32_t gte_ctrl[32]; /* COP2 (GTE) control registers */
 
     /* Memory access function pointers. Phase 1a leaves these NULL.
      * The recompiled boot_slice.c calls them via cpu->write_word(...);
