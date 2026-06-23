@@ -99,13 +99,19 @@ void     audio_trace_get_stats(AudioTraceStats *out);
 uint64_t audio_trace_tap_total(int tap);
 uint64_t audio_trace_events_total(void);
 
+/* Taps default to 44100 Hz; the host tap may run at the device rate in
+ * bridge/pull mode. The WAV dumper stamps this rate — a mislabeled header
+ * silently poisons every offline A/B. */
+void     audio_trace_set_tap_rate(int tap, uint32_t rate);
+uint32_t audio_trace_tap_rate(int tap);
+
 /* Copy the most recent `max` events, oldest first. Returns count copied. */
 uint32_t audio_trace_events_get(AudioTraceEvent *out, uint32_t max);
 
-/* Write a tap slice as a 44100 Hz stereo s16 WAV. start=-1,count=0 dumps the
- * whole currently-buffered ring. `start`/`count` are absolute frame indices
- * on the tap's production timeline. Returns frames written, or -1 on error
- * (unwritable path / empty ring / slice already evicted). */
+/* Write a tap slice as a stereo s16 WAV at the tap's rate. start=-1,count=0
+ * dumps the whole currently-buffered ring. `start`/`count` are absolute frame
+ * indices on the tap's production timeline. Returns frames written, or -1 on
+ * error (unwritable path / empty ring / slice already evicted). */
 int64_t audio_trace_dump_wav(int tap, const char *path,
                              int64_t start, uint64_t count);
 

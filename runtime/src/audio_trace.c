@@ -35,6 +35,22 @@ typedef struct {
 
 static PcmTap s_taps[AUDIO_TAP_COUNT];
 
+/* Per-tap sample rate for WAV headers. SPU-side taps are natively 44100;
+ * the host tap follows the device rate in bridge/pull mode. */
+static uint32_t s_tap_rate[AUDIO_TAP_COUNT] = { 44100u, 44100u, 44100u };
+
+void audio_trace_set_tap_rate(int tap, uint32_t rate)
+{
+    if (tap < 0 || tap >= AUDIO_TAP_COUNT || rate == 0) return;
+    s_tap_rate[tap] = rate;
+}
+
+uint32_t audio_trace_tap_rate(int tap)
+{
+    if (tap < 0 || tap >= AUDIO_TAP_COUNT) return 44100u;
+    return s_tap_rate[tap];
+}
+
 static AudioTraceEvent  s_events[EV_RING_CAP];
 static _Atomic uint64_t s_event_head;
 
@@ -226,9 +242,10 @@ int64_t audio_trace_dump_wav(int tap, const char *path,
 
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
-    /* PSX SPU native output rate is exactly 44100 Hz. A mislabeled header
-     * rate silently poisons every offline A/B (snesrecomp da33c06). */
-    wav_write_header(fp, (uint32_t)(count * 4u), 44100u);
+    /* Stamp the tap's true rate (SPU taps: exactly 44100; host tap: device
+     * rate in bridge mode). A mislabeled header silently poisons every
+     * offline A/B (snesrecomp da33c06). */
+    wav_write_header(fp, (uint32_t)(count * 4u), s_tap_rate[tap]);
 
     uint64_t done = 0;
     while (done < count) {

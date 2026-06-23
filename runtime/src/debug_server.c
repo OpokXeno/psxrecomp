@@ -5650,39 +5650,60 @@ static void handle_spu_events_reset(int id, const char *json)
  * audio_events — most recent N pipeline events (REG_WRITE/RENDER/SKIP/
  *                UNDERRUN/MUTE/UNMUTE/CD_PUSH/DMA), sample-clock stamped.
  * Protocol mirrored on psx-beetle's port 4380 (beetle_debug_server.c). */
+/* Bridge/legacy output health (main.cpp; C linkage). Returns 0 pre-device. */
+extern int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+                               uint64_t *overflow_drops, double *correction,
+                               int *legacy, int *host_rate);
+
 static void handle_audio_stats(int id, const char *json)
 {
     (void)json;
     AudioTraceStats st;
     audio_trace_get_stats(&st);
+    double fill_ms = 0.0, correction = 0.0;
+    uint64_t out_underruns = 0, overflow_drops = 0;
+    int legacy = 1, host_rate = 44100;
+    int out_ok = psx_audio_out_stats(&fill_ms, &out_underruns, &overflow_drops,
+                                     &correction, &legacy, &host_rate);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"taps\":["
              "{\"name\":\"spu_out\",\"frames\":%llu,\"nonzero\":%llu,"
-             "\"audible\":%llu,\"peak\":%d},"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u},"
              "{\"name\":\"cd_in\",\"frames\":%llu,\"nonzero\":%llu,"
-             "\"audible\":%llu,\"peak\":%d},"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u},"
              "{\"name\":\"host\",\"frames\":%llu,\"nonzero\":%llu,"
-             "\"audible\":%llu,\"peak\":%d}],"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u}],"
              "\"pump_calls\":%llu,\"pump_skips\":%llu,\"underruns\":%llu,"
              "\"queue_hiwater\":%u,\"queue_lowater\":%u,"
-             "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu}",
+             "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu,"
+             "\"out\":{\"active\":%d,\"mode\":\"%s\",\"host_rate\":%d,"
+             "\"fill_ms\":%.1f,\"underruns\":%llu,\"overflow_drops\":%llu,"
+             "\"correction\":%.5f}}",
              id,
              (unsigned long long)st.tap_frames[0],
              (unsigned long long)st.tap_nonzero[0],
              (unsigned long long)st.tap_audible[0], st.tap_peak[0],
+             audio_trace_tap_rate(0),
              (unsigned long long)st.tap_frames[1],
              (unsigned long long)st.tap_nonzero[1],
              (unsigned long long)st.tap_audible[1], st.tap_peak[1],
+             audio_trace_tap_rate(1),
              (unsigned long long)st.tap_frames[2],
              (unsigned long long)st.tap_nonzero[2],
              (unsigned long long)st.tap_audible[2], st.tap_peak[2],
+             audio_trace_tap_rate(2),
              (unsigned long long)st.pump_calls,
              (unsigned long long)st.pump_skips,
              (unsigned long long)st.underruns,
              st.queue_hiwater, st.queue_lowater,
              (unsigned long long)st.mute_events,
              (unsigned long long)st.unmute_events,
-             (unsigned long long)st.events_total);
+             (unsigned long long)st.events_total,
+             out_ok, legacy ? "legacy-push" : "bridge-pull", host_rate,
+             fill_ms,
+             (unsigned long long)out_underruns,
+             (unsigned long long)overflow_drops,
+             correction);
 }
 
 static void handle_audio_wav(int id, const char *json)
@@ -5713,8 +5734,9 @@ static void handle_audio_wav(int id, const char *json)
     }
     uint64_t total = audio_trace_tap_total(tap);
     send_fmt("{\"id\":%d,\"ok\":true,\"tap\":%d,\"frames\":%lld,"
-             "\"rate\":44100,\"tap_total\":%llu}",
-             id, tap, (long long)wrote, (unsigned long long)total);
+             "\"rate\":%u,\"tap_total\":%llu}",
+             id, tap, (long long)wrote, audio_trace_tap_rate(tap),
+             (unsigned long long)total);
 }
 
 static void handle_audio_events(int id, const char *json)

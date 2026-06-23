@@ -32,6 +32,14 @@
 #include "spu.h"
 #include "audio_trace.h"
 #include "spu_shadow.h"
+
+/* Shared clock-domain bridge: band-limited polyphase resampler + P-only DRC.
+ * The SPU renders at a fixed 44100/60 per wall-clock frame while the host
+ * consumes on its own crystal; with no resampling/DRC the queue slowly drifts
+ * to underrun (silence gaps). The bridge resamples ~1:1 with a <=+/-0.5% ratio
+ * trim to hold the ring near target -- no gaps. See recomp_audio_drc.h. */
+#define RECOMP_AUDIO_DRC_IMPL
+#include "recomp_audio_drc.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "crash_trace.h"
@@ -275,6 +283,38 @@ uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
 #define TURBO_LOADS_ENGAGE_FRAMES 20
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
+
+/* DRC bridge. Producer (sdl_audio_pump) runs on the main loop thread under
+ * SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
+ * thread. */
+static rab_bridge s_drc;
+static bool       s_drc_ready = false;
+
+/* Observability + A/B. PSXRECOMP_AUDIO_LEGACY=1 keeps the historical push model
+ * (SDL_QueueAudio, no bridge) so the underrun baseline can be measured against
+ * the bridge from a single build; default (unset) = bridge/pull model. Output
+ * health is surfaced through the audio_stats TCP command (no stderr probe). */
+static bool audio_legacy_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PSXRECOMP_AUDIO_LEGACY"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v != 0;
+}
+/* Legacy-mode underrun counter: incremented when the SDL queue is found empty
+ * at pump time (the device was silence-filling = an audible gap). */
+static uint64_t g_legacy_underruns = 0;
+/* Actual device rate the host opened at (bridge mode may differ from 44100;
+ * the T3 tap ring runs at this rate and its WAV dump must say so). */
+int g_audio_host_rate = 44100;
+
+static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
+    if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
+    int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
+    rab_pull(&s_drc, reinterpret_cast<int16_t*>(stream), frames);
+    /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
+     * This callback is the tap's single writer while the bridge is active. */
+    audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
+                    frames);
+}
 
 static std::filesystem::path find_upward(std::filesystem::path start,
                                          const std::filesystem::path& marker) {
@@ -636,9 +676,10 @@ static void shutdown_runtime(void) {
     overlay_capture_write_json();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
-        SDL_CloseAudioDevice(sdl_audio_device);
+        SDL_CloseAudioDevice(sdl_audio_device);   /* stops the pull callback */
         sdl_audio_device = 0;
     }
+    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
     debug_server_shutdown();
 }
@@ -665,17 +706,38 @@ static void sdl_audio_pump(void) {
     if (!sdl_audio_device) return;
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
-    const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-    const uint32_t queued = SDL_GetQueuedAudioSize(sdl_audio_device);
-    /* Underrun = the device drained everything between two pumps. Only
-     * meaningful after the first audio has been queued; before that the
-     * queue is legitimately empty. */
+    const bool legacy = audio_legacy_mode();
     static int had_audio = 0;
-    if (queued == 0 && had_audio)
-        audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
-    if (queued > max_queue_bytes) {
-        audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
-        return;
+    uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
+    if (legacy) {
+        /* Historical push model + baseline measurement: a drained (==0) queue
+         * means the device was silence-filling since the last pump = a gap.
+         * Only meaningful after the first audio has been queued. */
+        const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
+        queued = SDL_GetQueuedAudioSize(sdl_audio_device);
+        if (queued == 0 && had_audio) {
+            g_legacy_underruns++;
+            audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
+        }
+        if (queued > max_queue_bytes) {
+            audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
+            return;
+        }
+    } else {
+        /* No host-queue backpressure check: the bridge's ring + P-only DRC hold
+         * the fill near target, so we always render this frame and push it. */
+        if (!s_drc_ready) return;
+        /* Surface bridge underruns (counted on the SDL audio thread) into the
+         * event ring from this thread — the event ring is single-writer. */
+        rab_stats st;
+        rab_get_stats(&s_drc, &st);
+        static uint64_t prev_underruns = 0;
+        if (st.underrun_events > prev_underruns) {
+            audio_trace_event(AUDIO_EV_UNDERRUN,
+                              (uint32_t)(st.underrun_events - prev_underruns), 1);
+            prev_underruns = st.underrun_events;
+        }
+        queued = (uint32_t)st.last_fill_ms;
     }
 
     static double sample_accum = 0.0;
@@ -696,11 +758,21 @@ static void sdl_audio_pump(void) {
         sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
         sdl_audio_fadein_left -= ramp;
     }
-    /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
-    audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
-    SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                   (uint32_t)frames * bytes_per_frame);
-    had_audio = 1;
+    if (legacy) {
+        /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
+        audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
+        SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                       (uint32_t)frames * bytes_per_frame);
+        had_audio = 1;
+    } else {
+        /* Hand to the bridge (band-limited resample + DRC) instead of
+         * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
+         * The T3 tap moves to sdl_drc_callback: what the device actually
+         * receives is the bridge's device-rate output, not this buffer. */
+        SDL_LockAudioDevice(sdl_audio_device);
+        rab_push(&s_drc, sdl_audio_buf, frames);
+        SDL_UnlockAudioDevice(sdl_audio_device);
+    }
 }
 
 /* Audio gating across turbo-loads transitions.
@@ -716,6 +788,34 @@ static void sdl_audio_pump(void) {
  *     re-trigger within a few frames; without the debounce the mute would
  *     flicker audibly), then resume pumping with a rising ramp applied
  *     across the first ~50 ms of samples (sdl_audio_pump above). */
+/* Bridge/legacy output health, surfaced through the audio_stats TCP command
+ * (debug_server.c) — no stderr probe; rule 3. */
+extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+                                   uint64_t *overflow_drops, double *correction,
+                                   int *legacy, int *host_rate)
+{
+    extern int g_audio_host_rate;   /* set at device open */
+    *legacy = audio_legacy_mode() ? 1 : 0;
+    *host_rate = g_audio_host_rate;
+    if (*legacy || !s_drc_ready) {
+        *fill_ms = sdl_audio_device
+                   ? (double)SDL_GetQueuedAudioSize(sdl_audio_device)
+                     / (44100.0 * 4.0) * 1000.0
+                   : 0.0;
+        *underruns = g_legacy_underruns;
+        *overflow_drops = 0;
+        *correction = 0.0;
+        return sdl_audio_device != 0;
+    }
+    rab_stats st;
+    rab_get_stats(&s_drc, &st);
+    *fill_ms = st.last_fill_ms;
+    *underruns = st.underrun_events;
+    *overflow_drops = st.overflow_drops;
+    *correction = st.last_correction;
+    return 1;
+}
+
 static void sdl_audio_update(int turbo_active) {
     if (!sdl_audio_device) return;
     {   /* Tag audio events with the vblank frame counter. */
@@ -739,9 +839,15 @@ static void sdl_audio_update(int turbo_active) {
             spu_render(sdl_audio_buf, tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
             audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
-            audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
-            SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                           (uint32_t)tail * sizeof(int16_t) * 2u);
+            if (audio_legacy_mode()) {
+                audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
+                SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                               (uint32_t)tail * sizeof(int16_t) * 2u);
+            } else if (s_drc_ready) {
+                SDL_LockAudioDevice(sdl_audio_device);
+                rab_push(&s_drc, sdl_audio_buf, tail);
+                SDL_UnlockAudioDevice(sdl_audio_device);
+            }
             muted = 1;
         }
         hangover = HANGOVER_FRAMES;
@@ -2664,8 +2770,21 @@ int main(int argc, char** argv) {
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
-        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        const bool legacy = audio_legacy_mode();
+        if (!legacy)
+            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
+        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have,
+                                               legacy ? 0 : SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (sdl_audio_device) {
+            if (!legacy) {
+                rab_config cfg; rab_config_defaults(&cfg);
+                cfg.channels    = 2;
+                cfg.source_rate = 44100.0;            /* SPU render rate */
+                cfg.host_rate   = (double)have.freq;  /* actual device rate */
+                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+            }
+            g_audio_host_rate = have.freq;
+            audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
             SDL_PauseAudioDevice(sdl_audio_device, 0);
         }
     }
