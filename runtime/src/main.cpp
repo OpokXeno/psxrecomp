@@ -2004,6 +2004,12 @@ int main(int argc, char** argv) {
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
+    /* The game-DECLARED port modes, captured at game.toml load and immune to the
+     * settings.toml overrides below. Under lock_mode these are the only valid
+     * modes (the game supports exactly one pad type), so they are what the
+     * runtime clamps to and what the launcher locks its selector to. */
+    int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -2086,6 +2092,8 @@ int main(int argc, char** argv) {
                 p1_mode = gc.runtime.default_p1_mode;
                 p2_mode = gc.runtime.default_p2_mode;
             }
+            ctrl_locked_p1_mode = gc.runtime.default_p1_mode;
+            ctrl_locked_p2_mode = gc.runtime.default_p2_mode;
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
@@ -2310,6 +2318,20 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+    }
+
+    /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
+     * digital-only — X4's pre-DualShock libpad silently discards input from a
+     * pad answering id 0x73). The launcher hides its selector for such games,
+     * but that alone left two holes: (a) launcher-less builds still honoured a
+     * settings.toml p1_mode/p2_mode, and (b) a settings.toml persisted BEFORE
+     * the game declared lock_mode fed the stale mode back as the launcher's
+     * locked_mode. Clamp to the game-declared modes here, after every
+     * config/settings source has been applied, so a locked game can never boot
+     * a pad type it doesn't support. */
+    if (ctrl_lock_mode) {
+        p1_mode = ctrl_locked_p1_mode;
+        p2_mode = ctrl_locked_p2_mode;
     }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
