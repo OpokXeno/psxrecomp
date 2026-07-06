@@ -71,6 +71,7 @@
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <errno.h>
+#  include <pthread.h>      /* phase_profile sampler thread */
    typedef int sock_t;
 #  define SOCK_INVALID (-1)
 #  define sock_close close
@@ -9885,16 +9886,25 @@ static void handle_autocompile_status(int id, const char *json)
     extern void overlay_autocapture_get_status(int *enabled,
                                                uint32_t *triggers,
                                                uint64_t *last_delta);
+    extern uint64_t overlay_autocapture_last_insns_delta(void);
+    extern void overlay_autocapture_get_futility(uint32_t *backoff,
+                                                 uint32_t *futile);
     (void)json;
     int      ac_en = 0;
     uint32_t trig = 0;
     uint64_t delta = 0;
+    uint32_t backoff = 0, futile = 0;
     overlay_autocapture_get_status(&ac_en, &trig, &delta);
+    overlay_autocapture_get_futility(&backoff, &futile);
     char comp[4096];
     autocompile_status_json(comp, sizeof(comp));
     send_fmt("{\"id\":%d,\"ok\":true,\"autocapture_enabled\":%d,"
-             "\"triggers\":%u,\"last_pressure\":%llu,\"compile\":%s}\n",
-             id, ac_en, trig, (unsigned long long)delta, comp);
+             "\"triggers\":%u,\"futile_skips\":%u,\"backoff_mult\":%u,"
+             "\"last_pressure\":%llu,"
+             "\"last_insns_pressure\":%llu,\"compile\":%s}\n",
+             id, ac_en, trig, futile, backoff,
+             (unsigned long long)delta,
+             (unsigned long long)overlay_autocapture_last_insns_delta(), comp);
 }
 
 /* sljit_status: Tier-2 in-process JIT backend state. Runs the codegen smoke
@@ -10993,7 +11003,222 @@ static void handle_lockstep_func(int id, const char *json) {
     send_fmt("{\"id\":%d,\"ok\":true,\"lockstep_func\":%s}", id, buf);
 }
 
+/* ---- phase_profile: statistical wall-time attribution (always-on) ---------
+ * A dedicated ~1 kHz sampler thread reads the emu thread's phase flags and
+ * accumulates per-second buckets in a ring. It answers "what fraction of wall
+ * time is the dirty-RAM interpreter / guest exception context" DIRECTLY,
+ * without inference from dispatch or instruction counts. Two properties are
+ * load-bearing:
+ *  - It runs OFF the main thread. The TCP server itself pumps on the main
+ *    thread, so a handler-side busy sampler would freeze the very thing it
+ *    measures.
+ *  - It samples g_exec_phase (dirty_ram_interp.c), the INNERMOST backend
+ *    executing at that instant — NOT g_dirty_interp_active, which stays 1
+ *    across native overlay calls made from the interpreter's call contract
+ *    and therefore reads "inside the dispatch tree", not "interpreting".
+ *    g_exec_phase is save/restored at every backend boundary and across
+ *    exception delivery, so leaked intervals self-heal at the next bracket.
+ * SDL init gives the process 1 ms timer resolution, so Sleep(1) really is
+ * ~1 kHz. Query: {"cmd":"phase_profile","window":N} -> shares over the last
+ * N whole seconds (default 10, in-progress second excluded) + cumulative. */
+extern int psx_exec_phase(void);   /* 0=other 1=interp 2=native 3=static 4=gpu-gp0 */
+extern int psx_get_in_exception(void);
+extern uint32_t overlay_loader_native_inprogress(void);
+
+#define PHASE_RING_SECS 64
+static volatile uint32_t s_phase_total [PHASE_RING_SECS];
+static volatile uint32_t s_phase_interp[PHASE_RING_SECS];
+static volatile uint32_t s_phase_native[PHASE_RING_SECS];
+static volatile uint32_t s_phase_static[PHASE_RING_SECS];
+static volatile uint32_t s_phase_gpu   [PHASE_RING_SECS];
+static volatile uint32_t s_phase_exc   [PHASE_RING_SECS];
+static volatile uint64_t s_phase_sec   [PHASE_RING_SECS];
+static volatile uint64_t s_phase_samples_all = 0, s_phase_interp_all = 0;
+
+/* Hot-function histogram: when a sample lands in a native overlay shard,
+ * bucket the shard's registered entry address (cumulative since boot; a
+ * client diffs two snapshots for a window). Open addressing, sampler-thread
+ * writes only. */
+#define PHOT_SLOTS 4096
+static volatile uint32_t s_phot_addr[PHOT_SLOTS];
+static volatile uint64_t s_phot_cnt [PHOT_SLOTS];
+static volatile uint64_t s_phot_native_total = 0, s_phot_drops = 0;
+
+static void phot_add(uint32_t addr)
+{
+    if (!addr) return;
+    uint32_t h = (addr >> 2) * 2654435761u;
+    for (uint32_t p = 0; p < 16; p++) {
+        uint32_t i = (h + p) & (PHOT_SLOTS - 1u);
+        uint32_t a = s_phot_addr[i];
+        if (a == addr) { s_phot_cnt[i]++; return; }
+        if (a == 0)    { s_phot_addr[i] = addr; s_phot_cnt[i] = 1; return; }
+    }
+    s_phot_drops++;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI phase_sampler_main(LPVOID arg)
+#else
+static void *phase_sampler_main(void *arg)
+#endif
+{
+    (void)arg;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+#endif
+        uint64_t sec = monotonic_ms() / 1000u;
+        int slot = (int)(sec % PHASE_RING_SECS);
+        if (s_phase_sec[slot] != sec) {          /* bucket rolls to a new second */
+            s_phase_sec[slot]    = sec;
+            s_phase_total[slot]  = 0;
+            s_phase_interp[slot] = 0;
+            s_phase_native[slot] = 0;
+            s_phase_static[slot] = 0;
+            s_phase_gpu[slot]    = 0;
+            s_phase_exc[slot]    = 0;
+        }
+        s_phase_total[slot]++;
+        s_phase_samples_all++;
+        switch (psx_exec_phase()) {
+        case 1: s_phase_interp[slot]++; s_phase_interp_all++; break;
+        case 2: s_phase_native[slot]++;
+                s_phot_native_total++;
+                phot_add(overlay_loader_native_inprogress());
+                break;
+        case 3: s_phase_static[slot]++; break;
+        case 4: s_phase_gpu[slot]++; break;
+        default: break;                          /* 0 = host/other */
+        }
+        if (psx_get_in_exception())       { s_phase_exc[slot]++; }
+    }
+#ifndef _WIN32
+    return NULL;
+#endif
+}
+
+static void phase_sampler_start(void)
+{
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, phase_sampler_main, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, phase_sampler_main, NULL) == 0)
+        pthread_detach(t);
+#endif
+}
+
+static void handle_phase_profile(int id, const char *json)
+{
+    int window = json_get_int(json, "window", 10);
+    if (window < 1) window = 1;
+    if (window > PHASE_RING_SECS - 2) window = PHASE_RING_SECS - 2;
+    uint64_t now_sec = monotonic_ms() / 1000u;
+    uint32_t tot = 0, itp = 0, nat = 0, sta = 0, gpu = 0, exc = 0;
+    for (int k = 1; k <= window; k++) {          /* whole seconds only */
+        uint64_t sec = now_sec - (uint64_t)k;
+        int slot = (int)(sec % PHASE_RING_SECS);
+        if (s_phase_sec[slot] == sec) {
+            tot += s_phase_total[slot];
+            itp += s_phase_interp[slot];
+            nat += s_phase_native[slot];
+            sta += s_phase_static[slot];
+            gpu += s_phase_gpu[slot];
+            exc += s_phase_exc[slot];
+        }
+    }
+    uint32_t oth = tot - itp - nat - sta - gpu;
+    send_fmt("{\"id\":%d,\"ok\":true,\"window_s\":%d,\"samples\":%u,"
+             "\"interp_samples\":%u,\"interp_share\":%.4f,"
+             "\"native_samples\":%u,\"native_share\":%.4f,"
+             "\"static_samples\":%u,\"static_share\":%.4f,"
+             "\"gpu_samples\":%u,\"gpu_share\":%.4f,"
+             "\"other_samples\":%u,\"other_share\":%.4f,"
+             "\"exc_samples\":%u,\"exc_share\":%.4f,"
+             "\"samples_total\":%llu,\"interp_total\":%llu}",
+             id, window, tot,
+             itp, tot ? (double)itp / (double)tot : 0.0,
+             nat, tot ? (double)nat / (double)tot : 0.0,
+             sta, tot ? (double)sta / (double)tot : 0.0,
+             gpu, tot ? (double)gpu / (double)tot : 0.0,
+             oth, tot ? (double)oth / (double)tot : 0.0,
+             exc, tot ? (double)exc / (double)tot : 0.0,
+             (unsigned long long)s_phase_samples_all,
+             (unsigned long long)s_phase_interp_all);
+}
+
+/* phase_hot: top guest functions by native wall-time samples (cumulative
+ * since boot — diff two snapshots for a window). {"cmd":"phase_hot","top":N} */
+static void handle_phase_hot(int id, const char *json)
+{
+    int top = json_get_int(json, "top", 20);
+    if (top < 1)  top = 1;
+    if (top > 64) top = 64;
+    uint32_t best_addr[64];
+    uint64_t best_cnt[64];
+    int n = 0;
+    for (int i = 0; i < PHOT_SLOTS; i++) {
+        uint32_t a = s_phot_addr[i];
+        if (!a) continue;
+        uint64_t c = s_phot_cnt[i];
+        int j = n < top ? n : top - 1;
+        if (n < top) n++;
+        else if (c <= best_cnt[j]) continue;
+        while (j > 0 && best_cnt[j - 1] < c) {
+            best_addr[j] = best_addr[j - 1];
+            best_cnt[j]  = best_cnt[j - 1];
+            j--;
+        }
+        best_addr[j] = a;
+        best_cnt[j]  = c;
+    }
+    uint64_t tot = s_phot_native_total;
+    char buf[4096];
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"id\":%d,\"ok\":true,\"native_samples_total\":%llu,"
+                       "\"hash_drops\":%llu,\"top\":[",
+                       id, (unsigned long long)tot,
+                       (unsigned long long)s_phot_drops);
+    for (int i = 0; i < n && len < (int)sizeof(buf) - 96; i++) {
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len,
+                        "%s{\"addr\":\"0x%08X\",\"samples\":%llu,\"share\":%.4f}",
+                        i ? "," : "", best_addr[i],
+                        (unsigned long long)best_cnt[i],
+                        tot ? (double)best_cnt[i] / (double)tot : 0.0);
+    }
+    len += snprintf(buf + len, sizeof(buf) - (size_t)len, "]}");
+    (void)len;
+    send_fmt("%s", buf);
+}
+
+/* idle_skip: idle-loop cycle-skip status + runtime toggle.
+ *   {"cmd":"idle_skip"}              -> counters
+ *   {"cmd":"idle_skip","enable":0|1} -> toggle, then counters */
+static void handle_idle_skip(int id, const char *json)
+{
+    extern int      g_idle_skip_enabled;
+    extern uint64_t g_idle_skip_count, g_idle_skip_cycles;
+    extern uint32_t g_idle_skip_last_pc, g_idle_skip_last_quantum;
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) g_idle_skip_enabled = en;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,"
+             "\"skips\":%llu,\"cycles_skipped\":%llu,"
+             "\"last_pc\":\"0x%08X\",\"last_quantum\":%u}",
+             id, g_idle_skip_enabled,
+             (unsigned long long)g_idle_skip_count,
+             (unsigned long long)g_idle_skip_cycles,
+             g_idle_skip_last_pc, g_idle_skip_last_quantum);
+}
+
 static const CmdEntry s_commands[] = {
+    { "phase_profile",     handle_phase_profile },
+    { "phase_hot",         handle_phase_hot },
+    { "idle_skip",         handle_idle_skip },
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
@@ -11368,6 +11593,10 @@ void debug_server_init(int port)
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
     listen(s_listen, 16);
+
+    /* Always-on wall-time phase sampler (phase_profile). Own thread: the
+     * server pumps on the main thread, so sampling must not live there. */
+    phase_sampler_start();
     /* Blocking accept — the dedicated I/O thread waits on it (no busy-poll). */
 
     /* Start the TCP I/O thread + its handoff primitives. */
