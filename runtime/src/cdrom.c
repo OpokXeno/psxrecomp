@@ -989,6 +989,34 @@ static void queue_or_exec_command(uint8_t cmd) {
     record_command_history('Q', cmd, queued_cmd.params, queued_cmd.param_count);
 }
 
+/* Pause (0x09) completion latency — Beetle PS_CDC::Command_Pause.
+ *
+ * A Pause issued while the drive is reading/playing completes only after the
+ * head settles: (1124584 + lba*42596/4500) CPU cycles in double-speed mode,
+ * doubled at single speed — roughly 1.1M+ cycles (~2 video frames). A Pause
+ * issued while already paused/stopped acks its second response quickly (5000).
+ *
+ * This is a CPU-visible ordering contract, NOT sector cadence: games issue
+ * Pause from mainline code at every streamed-file boundary and finish their
+ * driver bookkeeping in the frames before the completion INT2 arrives. The
+ * previous flat apply_speed(10000) delivered INT2 ~100x early — inside the
+ * issuing frame — and the game's driver intermittently lost the completion
+ * (Ape Escape's memcard scene loader wedged at a random file boundary, its
+ * async CD queue never pumping the next file). Hence also NO apply_speed():
+ * disc-speed divisors / 'instant' mode must never compress this latency back
+ * into the race window. Call BEFORE stop_read_stream()/CDSTAT_READ clear. */
+static int pause_complete_delay_cycles(void) {
+    if (!reading && !(stat_reg & (CDSTAT_READ | CDSTAT_PLAY)))
+        return 5000;
+    int lba = reading ? msf_to_lba(read_min, read_sec, read_sect)
+                      : last_sector_lba;
+    if (lba < 0) lba = 0;
+    int64_t cycles = 1124584 + (int64_t)lba * 42596 / (75 * 60);
+    if (!(mode_reg & 0x80))
+        cycles *= 2;
+    return (int)cycles;
+}
+
 static void exec_command(uint8_t cmd) {
 #if !defined(PSX_NO_DEBUG_TOOLS) && !defined(_WIN32)
     /* Self-stop trap: PSX_CD_TRAP_CMD=<byte> makes the process SIGSTOP
@@ -1104,7 +1132,8 @@ static void exec_command(uint8_t cmd) {
         pending.phase = 1;
         break;
 
-    case 0x09: /* Pause */
+    case 0x09: { /* Pause */
+        int complete_delay = pause_complete_delay_cycles();
         stop_read_stream();
         xa_reset_decode();
         spu_cd_audio_reset();
@@ -1113,9 +1142,10 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
         pending.pending = 1;
-        pending.delay = apply_speed(10000);
+        pending.delay = complete_delay;
         pending.phase = 1;
         break;
+    }
 
     case 0x0A: /* Init */
         stop_read_stream();
@@ -1126,7 +1156,11 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x0A;
         pending.pending = 1;
-        pending.delay = apply_speed(50000);
+        /* Beetle models the drive-reset busy period as 1136000 cycles
+         * (PS_CDC::Command_Reset, PSRCounter). Same second-response class as
+         * Pause: an authentic multi-frame latency games' drivers rely on —
+         * never scaled by the disc-speed divisor. */
+        pending.delay = 1136000;
         pending.phase = 1;
         break;
 
@@ -1306,7 +1340,9 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1A;
         pending.pending = 1;
-        pending.delay = apply_speed(30000);
+        /* Beetle PS_CDC::Command_ID: second response after 33868 cycles.
+         * Unscaled — same authentic-latency class as Pause/Init/ReadTOC. */
+        pending.delay = 33868;
         pending.phase = 1;
         break;
 
@@ -1326,7 +1362,10 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1E;
         pending.pending = 1;
-        pending.delay = apply_speed(100000);
+        /* Beetle PS_CDC::Command_ReadTOC: ~30M cycles (a near-second TOC
+         * re-scan; Beetle adds a seek term on top — we keep the dominant
+         * constant). Unscaled — authentic-latency class. */
+        pending.delay = 30000000;
         pending.phase = 1;
         break;
 
