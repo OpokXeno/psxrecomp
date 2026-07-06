@@ -105,6 +105,7 @@ void sw_wide_emit_tile(int band_y, int x, int y, int u, int v,
                        uint32_t color24, int semi_trans, int semi_mode, int raw_texture);
 int  sw_render_wide_display(uint32_t* out_pixels, int out_pitch, int base_x,
                             int disp_y, int disp_h);
+int  sw_wide_dump_full(uint32_t* out, int cap_pixels, int* ow, int* oh, int base_x);
 int  sw_wide_width(void);
 
 #ifdef __cplusplus

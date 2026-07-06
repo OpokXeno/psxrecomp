@@ -2364,6 +2364,42 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     return count;
 }
 
+/* Dump the ENTIRE wide compositor surface for base_x (all double-buffer bands +
+ * both reveal margins), g_wide_w x VRAM_H at scale. Debug/inspection tool (TCP
+ * wide_full) — the GL analog of sw_wide_dump_full, so native-wide can be
+ * inspected without touching the game window. Runs the same authoritative
+ * centre blit first so the dump matches what present shows. Top-down, alpha=FF
+ * (matches sw_wide_dump_full / render_wide_display orientation). */
+static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
+                              int base_x) {
+    if (!s_raster_ok || !s_ctx || g_wide_w <= 0) return 0;
+    GLuint fbo = 0;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (s_wide_fbo[i] && s_wide_base[i] == base_x) { fbo = s_wide_fbo[i]; break; }
+    if (!fbo) return 0;
+    flush_tex_batch();
+    flush_cpu_upload();
+    wide_blit_center(fbo, base_x, 0, VRAM_H);   /* authoritative centre (full height) */
+    glFinish();
+    int W = g_wide_w * s_scale;
+    int H = VRAM_H * s_scale;
+    if (cap_pixels > 0 && (long)W * H > cap_pixels) { H = cap_pixels / W; if (H <= 0) return 0; }
+    uint32_t *tmp = (uint32_t *)malloc((size_t)W * H * sizeof(uint32_t));
+    if (!tmp) return 0;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, W, H, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    /* Same orientation reasoning as glb_render_wide_display: glReadPixels row 0 =
+     * PS1 top scanline, so copy straight (top-down). */
+    int count = 0;
+    for (int i = 0; i < W * H; i++) { out[i] = tmp[i] | 0xFF000000u; count++; }
+    free(tmp);
+    if (ow) *ow = W;
+    if (oh) *oh = H;
+    return count;
+}
+
 /* THE present path for 15-bit frames: blit the display region from the
  * authoritative hr FBO into a letterboxed rect. Deterministic — runs
  * every 15-bit frame regardless of what mix of ops produced it.
@@ -2636,13 +2672,22 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     int native_w = g_wide_w - 2 * g_wide_off;
     if (native_w <= 0) return;
     int S = s_scale;
+    (void)disp_y; (void)disp_h;
+    /* Copy the canonical framebuffer column into the wide surface CENTRE over the
+     * FULL VRAM height, not just the current display band [disp_y, disp_y+disp_h].
+     * The wide surface holds BOTH vertical double-buffer bands (Ape flips
+     * display_y 0<->256), and the game's draw area / display band can differ per
+     * scene (the cityscape intro exposed rows outside disp_h). Copying the whole
+     * column makes the wide CENTRE bit-identical to what the full mirror would
+     * have drawn there for every band, so nothing the present reads is ever left
+     * black. The margins (x outside the centre) are untouched. */
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(base_x * S, disp_y * S,
-                        (base_x + native_w) * S, (disp_y + disp_h) * S,
-                        g_wide_off * S, disp_y * S,
-                        (g_wide_off + native_w) * S, (disp_y + disp_h) * S,
+    p_glBlitFramebuffer(base_x * S, 0,
+                        (base_x + native_w) * S, VRAM_H * S,
+                        g_wide_off * S, 0,
+                        (g_wide_off + native_w) * S, VRAM_H * S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
@@ -2713,6 +2758,7 @@ static const GpuRenderBackend GL_BACKEND = {
     .wide_disable_target = glb_wide_disable_target,
     .wide_clear = glb_wide_clear,
     .render_wide_display = glb_render_wide_display,
+    .wide_dump_full = glb_wide_dump_full,
 };
 
 const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }

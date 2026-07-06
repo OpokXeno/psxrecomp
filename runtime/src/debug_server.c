@@ -7325,7 +7325,12 @@ static void handle_wide_shot(int id, const char *json)
  * to 0 (the common vertical-double-buffer origin). */
 static void handle_wide_full(int id, const char *json)
 {
-    extern int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    /* Backend-dispatched: gr_wide_dump_full routes to the active renderer's full
+     * wide-surface dump (SW: sw_wide_dump_full; GL: glb_wide_dump_full), so the
+     * whole compositor surface can be inspected on either backend over TCP. */
+    extern int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();   /* no-op on SW; ensures pending GL frame is flushed */
     int base_x = json_get_int(json, "base_x", 0);
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
@@ -7336,7 +7341,7 @@ static void handle_wide_full(int id, const char *json)
     uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
     if (!buf) { send_err(id, "alloc failed"); return; }
     int W = 0, H = 0;
-    int n = sw_wide_dump_full(buf, cap, &W, &H, base_x);
+    int n = gr_wide_dump_full(buf, cap, &W, &H, base_x);
     if (n <= 0) { free(buf); send_err(id, "no wide surface (SW backend? native-wide engaged?)"); return; }
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
