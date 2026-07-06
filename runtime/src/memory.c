@@ -396,7 +396,21 @@ uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
  * watching (adds 0). */
 int      g_shadow_mmio_watch = 0;
 uint64_t g_shadow_mmio_hits  = 0;
-#define SHADOW_NOTE_MMIO()  do { g_shadow_mmio_hits += (uint64_t)g_shadow_mmio_watch; } while (0)
+/* Always-on MMIO access counter (reads AND writes of the device page). The
+ * idle-loop cycle skip (psx_cycles.c) requires "no MMIO touched since the
+ * last interrupt check" before fast-forwarding time: an MMIO read can return
+ * time-varying or side-effecting values (timer counters, CD response FIFO),
+ * so any touch disqualifies the window. One increment per access. */
+uint64_t g_mmio_access_count = 0;
+#define SHADOW_NOTE_MMIO()  do { g_mmio_access_count++; \
+    g_shadow_mmio_hits += (uint64_t)g_shadow_mmio_watch; } while (0)
+
+/* Always-on guest store counter, bumped at the top of every raw store
+ * (RAM, scratchpad, MMIO, even discarded KSEG2/IsC stores — over-counting
+ * is conservative). Second gate of the idle-loop cycle skip: a window with
+ * ANY store is not a pure poll loop. CPU stores and in-flight DMA writes
+ * both funnel through the psx_write_*_raw chokepoints. */
+uint64_t g_guest_store_count = 0;
 
 /* ---- Card protocol trace: tracks I_MASK bit 7 transitions ---- */
 #define IMASK_TRACE_CAP 4096
@@ -1070,6 +1084,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     s_ls_op_active = 0;
 }
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
+    g_guest_store_count++;
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
     /* KSEG2 guard — see psx_read_word_raw. */
@@ -1169,6 +1184,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     s_ls_op_active = 0;
 }
 static void psx_write_half_raw(uint32_t addr, uint16_t val) {
+    g_guest_store_count++;
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
         /* KSEG2 guard — see psx_read_word_raw. */
@@ -1397,6 +1413,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
     s_ls_op_active = 0;
 }
 static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
+    g_guest_store_count++;
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
         /* KSEG2 guard — see psx_read_word_raw. */

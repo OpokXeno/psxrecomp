@@ -29,6 +29,19 @@ void psx_devices_mmio_sync(void);
 /* Read accessor for telemetry. */
 uint64_t psx_get_cycle_count(void);
 
+/* Idle-loop cycle skip (see psx_cycles.c "Idle-loop cycle skip"). Called by
+ * psx_check_interrupts with the resume PC of the current check; detects
+ * side-effect-free poll loops and fast-forwards guest time to the next
+ * internal device event in whole loop quanta (bit-exact vs executing them).
+ * Counters/toggle are the TCP `idle_skip` command's surface. */
+struct CPUState;
+void psx_idle_note_check(struct CPUState *cpu, uint32_t check_pc);
+extern int      g_idle_skip_enabled;
+extern uint64_t g_idle_skip_count;
+extern uint64_t g_idle_skip_cycles;
+extern uint32_t g_idle_skip_last_pc;
+extern uint32_t g_idle_skip_last_quantum;
+
 /* Save-state restore: re-anchor the deadline device model after psx_cycle_count
  * is overwritten from a snapshot (call once, right after boot_state_load). */
 void psx_cycles_resync_after_restore(void);
