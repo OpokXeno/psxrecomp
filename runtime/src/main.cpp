@@ -47,6 +47,7 @@
 #include <SDL.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -1168,23 +1169,33 @@ static uint16_t controller_pad_buttons(SDL_GameController* h) {
     return buttons;
 }
 
-/* Map an SDL axis (-32768..32767) to a PSX analog byte (0..255, 0x80 centred),
- * applying the configured centre deadzone: travel within controller_deadzone
- * reads as centred (0x80) and the remaining travel is rescaled to the full range
- * so the stick still reaches the extremes. Gives clean variable analog speed
- * with no centre drift. */
-static uint8_t axis_to_pad_byte(int16_t v) {
-    const int dz = controller_deadzone;
-    int av = v < 0 ? -(int)v : (int)v;        /* |v|, 0..32768 */
-    if (av <= dz) return 0x80;                /* inside deadzone -> centred */
-    int range = 32767 - dz;
-    if (range < 1) range = 1;
-    int mag = (av - dz) * 32767 / range;      /* 0..32767 past the deadzone */
-    if (mag > 32767) mag = 32767;
-    int sv = v < 0 ? -mag : mag;
-    int b = (sv + 32768) >> 8;                /* 0..255 */
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-    return (uint8_t)b;
+/* Radial deadzone: process a stick's X and Y together so the dead region is a
+ * small CIRCLE, not a per-axis square. Travel within controller_deadzone reads
+ * centred (0x80/0x80); beyond it the vector MAGNITUDE is rescaled to the full
+ * range along the stick's true direction, so diagonals are preserved (a
+ * per-axis deadzone snaps diagonals toward the cardinals and feels notchy —
+ * bad for directional analog like Ape Escape's net swing). The magnitude is
+ * capped at 32767 before rescale so a full-diagonal push (raw mag ~46341) maps
+ * to ~0x9E/0x9E per axis — the circular gate a real DualShock stick reports,
+ * not 0xFF/0xFF. At dz==0 it reduces to a plain magnitude-preserving map. */
+static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby) {
+    const double dz = controller_deadzone;
+    double x = vx, y = vy;
+    double mag = std::sqrt(x * x + y * y);            /* 0 .. ~46341 */
+    if (mag <= dz || mag <= 0.0) { *obx = 0x80; *oby = 0x80; return; }
+    double capped = mag > 32767.0 ? 32767.0 : mag;
+    double range = 32767.0 - dz;
+    if (range < 1.0) range = 1.0;
+    double newmag = (capped - dz) * 32767.0 / range;  /* 0 .. 32767 */
+    double scale = newmag / mag;                       /* along true direction */
+    int sx = (int)std::lround(x * scale);
+    int sy = (int)std::lround(y * scale);
+    if (sx > 32767) sx = 32767; else if (sx < -32768) sx = -32768;
+    if (sy > 32767) sy = 32767; else if (sy < -32768) sy = -32768;
+    int bx = (sx + 32768) >> 8;
+    int by = (sy + 32768) >> 8;
+    *obx = (uint8_t)(bx < 0 ? 0 : (bx > 255 ? 255 : bx));
+    *oby = (uint8_t)(by < 0 ? 0 : (by > 255 ? 255 : by));
 }
 
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
@@ -1219,10 +1230,12 @@ static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], boo
         return;
     }
     if (p.kind == 2 && p.handle) {
-        out[0] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX));
-        out[1] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY));
-        out[2] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX));
-        out[3] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY));
+        axes_to_pad_pair(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY),
+                         &out[0], &out[1]);
+        axes_to_pad_pair(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY),
+                         &out[2], &out[3]);
         if (fold_dpad) {
             if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out[0] = 0x00;
             if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) out[0] = 0xFF;

@@ -3457,6 +3457,7 @@ static const char *thread_kind_name(uint32_t kind)
         case 20: return "syscall3_enter";             /* ChangeThread/RFE syscall, in_exc==0 (switch-eligible) */
         case 24: return "syscall3_enter_in_exc";      /* ChangeThread/RFE syscall, in_exc==1 (forced manual-RFE) */
         case 26: return "fiber_dispatch_exit_in_exc"; /* fiber's psx_dispatch returned, in_exc==1 */
+        case 30: return "inexc_switch_escape";        /* guest moved PCB[0] inside handler -> scheduler escape */
         default: return "unknown";
     }
 }
@@ -8128,22 +8129,36 @@ static void handle_d44_ring(int id, const char *json)
  * CD DMA was mid-transfer (the VSync-in-DMA-window bug). */
 static void handle_irqctx_ring(int id, const char *json)
 {
-    (void)json;
     typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
                      cdrom_active, is_vblank; int dma_depth;
                      uint32_t take_pc, real_epc, exit_pc, exit_reason, same_thread,
                      restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects; } E;
     extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
-    uint64_t total = g_irqctx_seq; uint32_t cap = 64u;
-    uint32_t n = total < cap ? (uint32_t)total : cap;
-    static char buf[49152]; size_t pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    /* Ring cap must track IRQCTX_RING_CAP in interrupts.c. */
+    uint32_t cap = 4096u;
+    /* Optional frame-window filter + newest-N count so a deep ring can be
+     * windowed to the delivery window of interest (ring-buffer discipline). */
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
+    int count    = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > (int)cap) count = (int)cap;
+    uint64_t total = g_irqctx_seq;
+    uint32_t avail = total < cap ? (uint32_t)total : cap;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 512u + (size_t)n * 360u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
                     id, (unsigned long long)total);
-    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 512; i++) {
+    int emitted = 0;
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 512; i++) {
         uint64_t idx = total - n + i;
         E *e = &g_irqctx_ring[idx & (cap - 1u)];
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
             "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"vblank\":%u,"
             "\"d44\":\"0x%08X\",\"cdrom_active\":%u,\"dma_depth\":%d,"
             "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
@@ -8151,15 +8166,17 @@ static void handle_irqctx_ring(int id, const char *json)
             "\"exit_reason\":%u,\"same_thread\":%u,\"restored\":%u,"
             "\"v1_exit\":\"0x%08X\",\"v1_saved\":\"0x%08X\","
             "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u}",
-            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            emitted ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
             e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
             e->sr, e->istat, e->imask,
             e->take_pc, e->real_epc, e->exit_pc, e->exit_reason, e->same_thread,
             e->restored, e->v1_exit, e->v1_saved, e->ra_exit, e->ra_saved,
             e->redirects);
+        emitted++;
     }
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
     debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_freeze_check(int id, const char *json)

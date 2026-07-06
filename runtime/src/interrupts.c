@@ -36,6 +36,7 @@
 #include "event_ring.h"
 #include "lockstep.h"
 #include "psx_cycles.h"
+#include "psx_scheduler.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -47,7 +48,7 @@ extern int g_dirty_interp_active;
 extern uint32_t g_dirty_safe_resume_pc;
 
 /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt; dumped via `irqctx_ring`). */
-#define IRQCTX_RING_CAP 64u
+#define IRQCTX_RING_CAP 4096u
 typedef struct {
     uint64_t seq, cycle;
     uint32_t frame, istat, imask, sr, d44, cdrom_active, is_vblank;
@@ -1117,6 +1118,51 @@ void psx_check_interrupts(CPUState* cpu) {
             : psx_get_cycle_count() + POST_EXC_CLAIMED_COOLDOWN_CYCLES;
     }
     if (g_ls_suppress_record > 0) g_ls_suppress_record--;
+
+    /* In-exception thread switch (Ape Escape NEW GAME memcard scene).
+     *
+     * A game can run its OWN cooperative scheduler inside the kernel exception
+     * handler: its VBlank/exception callback moves dword_108->entry (PCB[0], the
+     * current-thread pointer) to the next thread, and ReturnFromException (0xF40)
+     * then restores THAT thread. On real hardware the RFE atomically switches
+     * execution to the new thread. (docs/psx_bios_disasm.txt: both ExceptionHandler
+     * 0xC80 and ReturnFromException 0xF40 key off dword_108->entry.)
+     *
+     * Under the HLE TCB scheduler the interrupted thread is running via a
+     * structured dispatch on the host stack. Returning normally here does NOT
+     * transfer to the new thread — the generated block leader just falls through
+     * to the interrupted thread's next block (it never re-reads cpu->pc). The
+     * interrupted thread therefore keeps physically executing while PCB[0] already
+     * names a different thread; a subsequent exception then saves the running
+     * (old) thread's EPC into the NEW thread's TCB, corrupting it. That is the
+     * Ape "Checking… MEMORY CARD" wedge: the transition thread's ec8 PC is written
+     * into main's TCB EPC, main is later RFE'd there with main's regs, and its
+     * store lands on the transition thread's TCB status word (kill → target_missing
+     * forever). See ape_thread_smear_rootcause.md.
+     *
+     * Honor the switch exactly as a cooperative ChangeThread is honored: unwind to
+     * psx_scheduler_run and dispatch whatever PCB[0] now points at, from its
+     * committed TCB context (the guest handler already saved the interrupted
+     * thread into ITS own TCB before the switch). Gated to the OUTERMOST exception
+     * (prev_in_exception==0 → no live outer exception_jmpbuf frame to skip) and to
+     * the HLE scheduler (the legacy fiber bridge has no g_scheduler_jmpbuf and
+     * switches threads by fiber). */
+    if (prev_in_exception == 0 && psx_hle_scheduler_enabled() &&
+        entry_tcb != 0u && exit_tcb != 0u && entry_tcb != exit_tcb) {
+        extern uint32_t psx_read_word(uint32_t addr);   /* memory.c (plain RAM read) */
+        uint32_t new_state = psx_read_word(exit_tcb & 0x1FFFFFFFu);
+        if (new_state == 0x4000u) {   /* the new current thread must be runnable */
+            debug_server_log_thread_event(30, cpu, entry_tcb, exit_tcb, cpu->pc);
+            /* The longjmp skips psx_check_interrupts_at's restore of the compiled
+             * resume-PC latch; clear it so the next thread's block-leader delivery
+             * recomputes real_pc cleanly rather than inheriting a stale value. */
+            s_compiled_interrupt_resume_pc = 0;
+            g_sched_escape.target_tcb = exit_tcb;
+            g_sched_escape.resume_pc  = 0;
+            g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;
+            longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
+        }
+    }
 #ifdef PSX_COSIM
 #undef COSIM_IRQ_NOTE
 #undef COSIM_IRQ_TAKE_PC
