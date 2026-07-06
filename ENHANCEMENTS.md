@@ -224,3 +224,65 @@ cost); VK correctness (Tomba2 persistent text boxes + 3-slot HUD icon; Tomba1 lo
 bar artifact); Tomba2 widescreen sprite-tag hooks; MMX6 Rainy Turtloid perf even on
 GL 16:9; and the pending MMX6 shipping-default flip software->opengl to close
 MegaManX6Recomp ISSUES.md #7 (GL validated this session).
+
+---
+
+## W1 — Tomba2 16:9: USER-FLAGGED visible issues queue (2026-07-06, NOT STARTED)
+
+User-prioritized alongside the P0 crash work (ISSUES.md #8). None of these have
+been investigated yet — this section is the work queue + every known lead.
+All Tomba2, GL 16:9, worktree `_wt-tomba2-ipr` / `Tomba2Recomp` build-t2.
+
+### W1.1 — Black background columns in 16:9 (P3; incl. beach area)
+
+- **Symptom:** huge black regions where the 2D far backdrop should fill the wide
+  margins (user Image 1: large black sky scene); also a ~24px black column in
+  beach-village at game-x 85–109.
+- **Class:** 2D far-backdrop doesn't cover the wide FBO edges.
+- **Prior art / leads:**
+  - `[widescreen.bg2d]` config (recompiler/src/config_loader.cpp:699).
+  - Memory `ws_backdrop_preload.md` (Tomba1): far-backdrop void = early
+    sprite-tagged 0x65 tile grid; fix = centre-stretch gated preload.
+  - Memory `ws_draw_census_8c.md` (Tomba1 8C scene): void was GTE-3D driver
+    FUN_8004db3c; fixed via depth-gated un-squash. The **8C draw-census ring**
+    is the attribution instrument (always-on; query, don't arm).
+- **Next step:** per-scene attribution — which producer draws the sky strips,
+  and why the wide margins get no tiles. Attract may cover some scenes; the
+  beach needs navigation (user drive or save).
+
+### W1.2 — 4:3 object culling visible at wide edges (P2 cull widening)
+
+- **Symptom:** objects pop in/out at the 4:3 boundary in 16:9 (world objects
+  culled by game code against 4:3 screen extents).
+- **Ghidra cull sites already identified** (tomba2_ram.bin; overlay addresses —
+  validate per scene variant before wiring):
+  - `FUN_8003e030`: sltiu 0x140 @ 0x8003E228
+  - `FUN_80069b6c`: addiu +0xE6 @ 0x80069B84 + sltiu 0x1CD @ 0x80069B8C
+  - `0x80110A08`: addiu +0x80 / sltiu 0x101
+- **Fix shape:** `[widescreen.cull]` bias_sites/range_sites per-game config
+  (enhancement-tier per-game shims are legitimate here). Prior art: Ape
+  bring-up used per-game cull imms (0x181) + signed idioms (slti/bltz)
+  (memory `ape_widescreen_bringup.md`).
+
+### W1.3 — Dialogue-box text tearing in 16:9 (P4)
+
+- **Symptom:** full-width dialogue text splits with gaps (user Image 2: "Water
+  cam…e out from th…e faucet").
+- **Cause known:** gpu.c `ws_nw_hud` thirds — left/right-third sprites are
+  anchored apart for HUD proportion; full-width dialogue glyphs tear at the
+  third boundaries. Needs a smarter anchor (e.g. detect wide text rows /
+  dialogue-box association) rather than blanket thirds.
+
+### W1.4 — Beach-area framerate (P1 perf; also user-flagged)
+
+- 2D isometric scenes run 0.42–0.70× (beach/village worst). The convergence
+  blockers are FIXED (autocapture futility backoff + entry-based coverage in
+  tools/compile_overlays.py — see handoff 2026-07-06); the campaign was
+  interrupted by ISSUES.md #8 and should resume after it: expect 2D scenes to
+  climb past 0.85 as coverage converges. Residual axes if short of ~1.0:
+  per-block pump overhead (psx_check_interrupts ~2.6M calls/s), attract
+  cycling. Measure ONLY with two freeze_check snapshots over a known wall
+  interval (executed throughput = d(psx_cycle_count) − d(cycles_skipped));
+  phase_profile is a ring read and returns instantly.
+- CAUTION: any pace numbers taken in diff mode before ISSUES.md #9's redesign
+  lands are garbage (the wedged shadow silently disabled all native dispatch).
