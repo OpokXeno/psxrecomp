@@ -6667,6 +6667,34 @@ static void handle_ws_dome(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"num\":%d,\"den\":%d}", id, on ? 1 : 0, num, den);
 }
 
+/* ws_dome_probe on=<0|1> [thr=<SZ>] | dump: tally which guest function projects
+ * far (SZ>=thr) vertices -> identifies the sky-dome draw fn (top far emitter,
+ * highest max_sz) for the per-function dome-expand bracket. Arm with on=1, let a
+ * dome frame render, then call with no args to dump the tally. */
+extern void gte_dome_probe(int on, int thr);
+extern int  gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* maxsz, int cap);
+static void handle_ws_dome_probe(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    int thr = json_get_int(json, "thr", -1);
+    if (on >= 0) gte_dome_probe(on, thr);
+    uint32_t funcs[48], counts[48]; int32_t maxsz[48];
+    int n = gte_dome_probe_dump(funcs, counts, maxsz, 48);
+    /* simple insertion-sort by count desc for readability */
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && counts[j] > counts[j-1]; j--) {
+            uint32_t tf=funcs[j];funcs[j]=funcs[j-1];funcs[j-1]=tf;
+            uint32_t tc=counts[j];counts[j]=counts[j-1];counts[j-1]=tc;
+            int32_t tm=maxsz[j];maxsz[j]=maxsz[j-1];maxsz[j-1]=tm;
+        }
+    char buf[4096]; int p = snprintf(buf, sizeof buf, "{\"id\":%d,\"ok\":true,\"n\":%d,\"funcs\":[", id, n);
+    for (int i = 0; i < n && p < (int)sizeof(buf)-80; i++)
+        p += snprintf(buf+p, sizeof(buf)-p, "%s{\"ra\":\"0x%08X\",\"n\":%u,\"max_sz\":%d}",
+                      i?",":"", funcs[i], counts[i], maxsz[i]);
+    snprintf(buf+p, sizeof(buf)-p, "]}");
+    debug_server_send_line(buf);
+}
+
 static void handle_ws_census(int id, const char *json)
 {
     char act[16] = {0};
@@ -11072,6 +11100,7 @@ static const CmdEntry s_commands[] = {
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
     { "ws_dome",           handle_ws_dome },
+    { "ws_dome_probe",     handle_ws_dome_probe },
     { "ws_census",         handle_ws_census },
     { "mmx6_freshfix",     handle_mmx6_freshfix },
     { "mmx6_reveal",       handle_mmx6_reveal },

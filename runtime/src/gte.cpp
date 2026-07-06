@@ -209,6 +209,45 @@ extern "C" void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den) {
     s_ws_dome_num = n; s_ws_dome_den = d;
 }
 
+// ---- Dome-locate probe -----------------------------------------------------
+// Tally which guest function (g_debug_current_func_addr, set at dispatch)
+// projects FAR (SZ >= threshold) vertices, so the sky-dome draw function can be
+// identified as the top far-vertex emitter — the target for the per-function
+// dome-expand bracket (the clean alternative to the scene-dependent depth gate).
+extern "C" { extern uint32_t g_debug_current_func_addr; }
+static uint32_t s_gte_caller_ra = 0;   /* guest ra at gte_execute = return into the GAME fn that issued the projection (not the libgte leaf) */
+#define DOME_PROBE_SLOTS 48
+static struct { uint32_t func; uint32_t count; int32_t max_sz; } s_dome_probe[DOME_PROBE_SLOTS];
+static int     s_dome_probe_on  = 0;
+static int32_t s_dome_probe_thr = 4000;
+extern "C" void gte_dome_probe(int on, int thr) {
+    s_dome_probe_on = on ? 1 : 0;
+    if (thr > 0) s_dome_probe_thr = thr;
+    if (on) for (int i = 0; i < DOME_PROBE_SLOTS; i++) { s_dome_probe[i].func = 0; s_dome_probe[i].count = 0; s_dome_probe[i].max_sz = 0; }
+}
+static inline void dome_probe_note(int32_t sz) {
+    if (!s_dome_probe_on || sz < s_dome_probe_thr) return;
+    /* Tally the guest RA (the GAME fn that jal'd to libgte for this projection),
+     * NOT g_debug_current_func_addr (which is the libgte leaf 0x80000F40). */
+    uint32_t f = s_gte_caller_ra;
+    int slot = -1, empty = -1;
+    for (int i = 0; i < DOME_PROBE_SLOTS; i++) {
+        if (s_dome_probe[i].count && s_dome_probe[i].func == f) { slot = i; break; }
+        if (empty < 0 && s_dome_probe[i].count == 0) empty = i;
+    }
+    if (slot < 0) slot = empty;
+    if (slot < 0) return;
+    s_dome_probe[slot].func = f;
+    s_dome_probe[slot].count++;
+    if (sz > s_dome_probe[slot].max_sz) s_dome_probe[slot].max_sz = sz;
+}
+extern "C" int gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* maxsz, int cap) {
+    int n = 0;
+    for (int i = 0; i < DOME_PROBE_SLOTS && n < cap; i++)
+        if (s_dome_probe[i].count) { funcs[n] = s_dome_probe[i].func; counts[n] = s_dome_probe[i].count; maxsz[n] = s_dome_probe[i].max_sz; n++; }
+    return n;
+}
+
 extern "C" void gte_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { s_ws_xnum = s_ws_xden = 1; return; }
     // squash = (4/3) / (num/den) = (4*den) / (3*num); identity for 4:3.
@@ -284,6 +323,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
             s_ws_sz_far++;
         }
     }
+    dome_probe_note(gte->SZ[3]);   /* locate the dome draw fn (far-vertex tally) */
     int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
     gte->push_sxy(sx, sy);
@@ -914,6 +954,7 @@ extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
     s_gte_exec_count++;
+    s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
 
     GTEState gte;
     // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and
