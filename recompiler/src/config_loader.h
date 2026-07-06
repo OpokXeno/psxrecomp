@@ -409,6 +409,21 @@ struct GameConfig {
     std::vector<uint32_t> ws_cull_range_sites;
     std::vector<uint32_t> ws_cull_a1_sites;
 
+    // [widescreen.cull] slti_sites — explicit signed right-edge widen sites
+    // (`slti rt, sx, W` → psx_ws_cull_slti) for funnel functions the
+    // auto-detector cannot qualify (e.g. an X-only test with no height compare
+    // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
+    std::vector<uint32_t> ws_cull_slti_sites;
+
+    // [widescreen.cull] screen_w_imms / screen_h_imms — the width/height
+    // immediates of the GTE screen-extent reject signature, per game (the
+    // display width varies: Tomba 320 → 0x140/0x141; Ape Escape 368 → 0x181).
+    // Consumed by the auto_screen_x detector + emit on every backend (the
+    // runtime mirrors get them via gpu_ws_set_cull_imms). Defaults preserve
+    // the original Tomba signature.
+    std::vector<uint32_t> ws_cull_w_imms;
+    std::vector<uint32_t> ws_cull_h_imms;
+
     // Backdrop screen-X squash ([widescreen.backdrop] x_sites). The parallax
     // 2D backdrop layer (ocean/cloud/mountain/grass — overlay actor handlers)
     // computes screenX = (worldX - camX) >> parallax in pure integer math and
@@ -462,6 +477,24 @@ struct GameConfig {
     // flag only opts the title into the 2D widescreen present path. Off by
     // default; the env var PSX_WS_FORCE_2D=1 forces it on for testing.
     bool ws_full_2d = false;
+
+    // [widescreen] gte_game_mode — GTE-activity gameplay detector for a fully
+    // 3D title with no sprite-tag helper (e.g. Ape Escape). When true, a frame
+    // that projects enough vertices through RTPS/RTPT is stamped as gameplay
+    // (native-wide engages); genuine full-2D screens (save/options) still
+    // pillarbox 4:3. Runtime-only — no regen required. Off by default.
+    bool ws_gte_game_mode = false;
+
+    // [widescreen] nw_hud_corners — in native-wide, push outer-third screen-
+    // space HUD sprites out to the true wide-frame corners (they otherwise sit
+    // inset by the reveal offset). Runtime-only — no regen. Off by default.
+    bool ws_nw_hud_corners = false;
+
+    // [widescreen] nw_backdrop — in native-wide, stretch a screen-space quad
+    // that covers the whole 4:3 framebuffer (sky gradient / backdrop image) to
+    // fill the wide frame, so it stops pillarboxing at the reveal margins.
+    // Runtime-only — no regen. Off by default.
+    bool ws_nw_backdrop = false;
 
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a

@@ -642,6 +642,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_sprite_anchor_addr = 0;
     bool ws_hud_sprt_squash = false;
     bool ws_full_2d = false;
+    bool ws_gte_game_mode = false;
+    bool ws_nw_hud_corners = false;
+    bool ws_nw_backdrop = false;
     bool ws_offered = true;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
@@ -664,12 +667,24 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
         if (ws.contains("full_2d"))
             ws_full_2d = toml::find<bool>(ws, "full_2d");
+        if (ws.contains("gte_game_mode"))
+            ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
+        if (ws.contains("nw_hud_corners"))
+            ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
+        if (ws.contains("nw_backdrop"))
+            ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
+    std::vector<uint32_t> ws_cull_slti_sites;
+    // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
+    // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
+    // game with a different display width overrides them (Ape Escape: 0x181).
+    std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 };
+    std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };
     bool ws_auto_screen_x_cull = false;
     bool ws_auto_backdrop_preload = false;
     if (cfg.contains("widescreen")) {
@@ -684,6 +699,15 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("bias_sites",  ws_cull_bias_sites);
             load_sites("range_sites", ws_cull_range_sites);
             load_sites("a1_sites",    ws_cull_a1_sites);
+            load_sites("slti_sites",  ws_cull_slti_sites);
+            if (cull.contains("screen_w_imms")) {
+                ws_cull_w_imms.clear();
+                load_sites("screen_w_imms", ws_cull_w_imms);
+            }
+            if (cull.contains("screen_h_imms")) {
+                ws_cull_h_imms.clear();
+                load_sites("screen_h_imms", ws_cull_h_imms);
+            }
             if (cull.contains("auto_screen_x"))
                 ws_auto_screen_x_cull = toml::find<bool>(cull, "auto_screen_x");
             if (cull.contains("auto_backdrop"))
@@ -760,11 +784,17 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
+        /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_w_imms*/        ws_cull_w_imms,
+        /*ws_cull_h_imms*/        ws_cull_h_imms,
         /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,
         /*ws_backdrop_unsquash_funcs*/ ws_backdrop_unsquash_funcs,
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
         /*ws_full_2d*/            ws_full_2d,
+        /*ws_gte_game_mode*/      ws_gte_game_mode,
+        /*ws_nw_hud_corners*/     ws_nw_hud_corners,
+        /*ws_nw_backdrop*/        ws_nw_backdrop,
         /*ws_offered*/            ws_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,

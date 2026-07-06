@@ -325,6 +325,34 @@ static int ws_cull_site(uint32_t pc) {
     return flag;
 }
 
+/* Widescreen LEFT-edge funnel-bltz classification (auto_screen_x, signed
+ * min/max + center±halfwidth idioms — ws_cull_detect.h). Same ±512-byte window
+ * qualification + per-PC cache discipline as ws_cull_site above; additionally
+ * classifies THIS bltz structurally (delay-slot width compare / addu-subu
+ * pair), so an unrelated bltz in a qualifying window stays vanilla. */
+static int ws_cull_bltz_site(uint32_t pc) {
+    enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
+    static struct { uint32_t pc; uint32_t gen; uint32_t word; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
+    uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen &&
+        cache[slot].word == fetch_word(phys))
+        return cache[slot].flag;
+    uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+    uint32_t hi = phys + (uint32_t)(WIN * 4);
+    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    static uint32_t words[2 * WIN + 1];
+    int n = 0;
+    for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
+        words[n++] = fetch_word(a);
+    int idx = (int)((phys - lo) / 4u);
+    int flag = psx_ws_func_has_screen_cull(words, n) &&
+               psx_ws_cull_bltz_at(words, n, idx);
+    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
+    cache[slot].word = fetch_word(phys); cache[slot].flag = (int8_t)flag;
+    return flag;
+}
+
 /* Widescreen far-backdrop column-PRELOAD site classification for the interpreter
  * ([widescreen.cull] auto_backdrop). The scrolling-backdrop column-window
  * generators run interpreted in the dev build, so the recompiler emit can't
@@ -1453,7 +1481,15 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x01: { /* REGIMM: BLTZ/BGEZ/BLTZAL/BGEZAL by rt field */
         int taken;
         switch (rt) {
-        case 0x00: /* BLTZ */    taken = ((int32_t)cpu->gpr[rs] <  0); break;
+        case 0x00: /* BLTZ */
+            /* Widescreen render-funnel LEFT-edge widen (auto_screen_x): a
+             * classified funnel bltz rejects only past the revealed margin.
+             * Identity at 4:3 (margin 0). Gated per-game, cheap cached scan. */
+            if (psx_ws_auto_cull_on() && ws_cull_bltz_site(pc))
+                taken = psx_ws_cull_bltz(cpu->gpr[rs]);
+            else
+                taken = ((int32_t)cpu->gpr[rs] <  0);
+            break;
         case 0x01: /* BGEZ */    taken = ((int32_t)cpu->gpr[rs] >= 0); break;
         case 0x10: /* BLTZAL */  taken = ((int32_t)cpu->gpr[rs] <  0);
                                   cpu->gpr[31] = pc + 8; break;
@@ -1475,15 +1511,21 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
-        cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+        /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
+         * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
+         * edge is the bltz above. Identity at 4:3 (margin 0). */
+        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
+        else
+            cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
         cpu->gpr[0] = 0;
         return 0;
     case 0x0B: /* SLTIU */
-        /* Widescreen render-funnel cull widening (auto_screen_x): always apply
-         * the shared helper for a flagged render-cull site — it is byte-identical
+        /* Widescreen render-funnel cull widening (auto_screen_x): apply the
+         * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
-        if ((imm == 0x140 || imm == 0x141) && ws_cull_site(pc))
+        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;

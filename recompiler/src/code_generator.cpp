@@ -5,6 +5,7 @@
 // included via relative path to avoid an include-dir collision (recompiler and
 // runtime both ship a gte.h).
 #include "../../runtime/include/ws_backdrop_detect.h"
+#include "../../runtime/include/ws_cull_detect.h"
 #include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp) */
 #include <fmt/format.h>
 #include <algorithm>
@@ -699,7 +700,7 @@ std::string CodeGenerator::translate_mtlo(uint32_t instr) {
     return fmt::format("cpu->lo = {};", reg_name(rs));
 }
 
-std::string CodeGenerator::generate_branch_condition(uint32_t instr) {
+std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t addr) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
@@ -708,6 +709,11 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr) {
     if (opcode == 0x01) {
         uint32_t regimm_op = (instr >> 16) & 0x1F;
         if (regimm_op == 0x00) { // bltz
+            // Classified LEFT-edge funnel bltz (auto_screen_x, signed idioms):
+            // reject only past the revealed margin. Identity at 4:3 (margin 0).
+            if (ws_cull_bltz_pcs_.count(addr))
+                return fmt::format("psx_ws_cull_bltz({}) /* ws auto screen-x cull (left edge) */",
+                                   reg_name(rs));
             return fmt::format("(int32_t){} < 0", reg_name(rs));
         } else if (regimm_op == 0x01) { // bgez
             return fmt::format("(int32_t){} >= 0", reg_name(rs));
@@ -847,19 +853,44 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     // than culled at the 320 boundary. Same shape as an explicit range_site but
     // applied by signature — no per-address list. (Reached only when the addr is
     // not already an explicit cull site, which returns above.)
-    if (ws_auto_cull_func_ && opcode == 0x0B) {  // sltiu
+    if (ws_auto_cull_func_ && (opcode == 0x0B || opcode == 0x0A)) {  // sltiu / slti
         uint16_t uimm = get_imm16_u(instr);
-        if (uimm == 0x140 || uimm == 0x141) {
+        if (psx_ws_cull_imm_in(uimm, config_.ws_cull_w_imms.data(),
+                               (int)config_.ws_cull_w_imms.size())) {
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
-            // Route through the shared runtime helper psx_ws_cull_sltiu so the
-            // gcc emit, the sljit JIT, and the interpreter all widen identically.
-            // It sign-extends SX and shifts by +margin (wide window
-            // -margin <= SX < imm+margin, both edges); at margin=0 it reduces
-            // bit-for-bit to the vanilla `SX <u imm` verdict (4:3 byte-identical).
-            return fmt::format("{} = psx_ws_cull_sltiu({}, {});"
-                               "  /* ws auto screen-x cull (both edges) */{}",
+            if (opcode == 0x0B) {
+                // Route through the shared runtime helper psx_ws_cull_sltiu so the
+                // gcc emit, the sljit JIT, and the interpreter all widen identically.
+                // It sign-extends SX and shifts by +margin (wide window
+                // -margin <= SX < imm+margin, both edges); at margin=0 it reduces
+                // bit-for-bit to the vanilla `SX <u imm` verdict (4:3 byte-identical).
+                return fmt::format("{} = psx_ws_cull_sltiu({}, {});"
+                                   "  /* ws auto screen-x cull (both edges) */{}",
+                                   reg_name(rt), reg_name(rs), (int)uimm, comment);
+            }
+            // Signed min/max funnel: `slti v, minSX, W` is the RIGHT edge only
+            // (the paired left edge is the classified bltz — see
+            // generate_branch_condition); widen by +margin.
+            return fmt::format("{} = psx_ws_cull_slti({}, {});"
+                               "  /* ws auto screen-x cull (right edge) */{}",
                                reg_name(rt), reg_name(rs), (int)uimm, comment);
         }
+    }
+    // Explicit signed right-edge widen site ([widescreen.cull] slti_sites) for
+    // funnel functions the auto-detector cannot qualify (X-only, no H compare).
+    if (config_.ws_cull_slti_sites.count(addr)) {
+        if (opcode == 0x0A) {  // slti
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t uimm = get_imm16_u(instr);
+            return fmt::format("{} = psx_ws_cull_slti({}, {});"
+                               "  /* ws cull slti site (right edge) */{}",
+                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] slti site 0x{:08X} is not "
+                       "slti (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // overlay variant: addr is different code here — fall through to vanilla.
     }
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). The
     // site is the `sh rt,off(base)` storing a parallax 2D backdrop layer's
@@ -1464,7 +1495,7 @@ std::string CodeGenerator::translate_basic_block(
                         // For branch-likely variants, delay slot is conditional
                         if (block.exit_instr.is_likely) {
                             ss << config_.indent << "/* delay slot (likely) - conditional execution */\n";
-                            ss << config_.indent << "if (" << generate_branch_condition(block.exit_instr.instruction) << ") {\n";
+                            ss << config_.indent << "if (" << generate_branch_condition(block.exit_instr.instruction, block.exit_instr.address) << ") {\n";
                             ss << config_.indent << translate_instruction(delay_slot_addr, delay_instr) << "\n";
                             emit_cosim_instr(delay_slot_addr, config_.indent + config_.indent);
                             ss << config_.indent << "}\n";
@@ -1474,7 +1505,7 @@ std::string CodeGenerator::translate_basic_block(
                             // instruction (before the delay slot). If the delay slot
                             // modifies a condition register we must save the result first.
                             if (block.exit_instr.type == ControlFlowType::Branch) {
-                                std::string cond = generate_branch_condition(block.exit_instr.instruction);
+                                std::string cond = generate_branch_condition(block.exit_instr.instruction, block.exit_instr.address);
                                 delay_saved_cond = fmt::format("_bc_{:08X}", addr);
                                 ss << config_.indent
                                    << fmt::format("int {} = ({});  /* save branch cond before delay slot */\n",
@@ -1509,7 +1540,7 @@ std::string CodeGenerator::translate_basic_block(
                     }
                     // Conditional branch - use pre-captured condition if available
                     std::string condition = delay_saved_cond.empty()
-                        ? generate_branch_condition(block.exit_instr.instruction)
+                        ? generate_branch_condition(block.exit_instr.instruction, block.exit_instr.address)
                         : delay_saved_cond;
                     if (block.successors.size() == 2) {
                         ss << config_.indent << "if (" << condition << ") {\n";
@@ -1926,10 +1957,11 @@ std::string CodeGenerator::translate_basic_block(
 }
 
 bool CodeGenerator::func_has_screen_extent_cull(const ControlFlowGraph& cfg) const {
-    // The GTE per-vertex trivial-reject pairs a width compare (sltiu …,0x140 or
-    // inclusive 0x141) with a height compare (sltiu …,0xE0 or 0xF1) in the same
-    // function. Presence of both is the signature of a screen-extent render
-    // funnel; a lone width compare elsewhere (rare) is left alone.
+    // The GTE trivial-reject pairs a width compare (slti/sltiu, immediate from
+    // the per-game W set) with a height compare (immediate from the H set) in
+    // the same function. Presence of both is the signature of a screen-extent
+    // render funnel; a lone width compare elsewhere (rare) is left alone.
+    // Shared scan (ws_cull_detect.h) so every backend derives one verdict.
     bool has_x = false, has_y = false;
     for (uint32_t block_addr : cfg.block_order) {
         const BasicBlock& block = cfg.blocks.at(block_addr);
@@ -1937,14 +1969,42 @@ bool CodeGenerator::func_has_screen_extent_cull(const ControlFlowGraph& cfg) con
             auto io = exe_.read_word(a);
             if (!io.has_value()) continue;
             uint32_t in = *io;
-            if ((in & 0xFC000000u) != 0x2C000000u) continue;  // not sltiu
-            uint16_t im = (uint16_t)(in & 0xFFFF);
-            if (im == 0x140 || im == 0x141) has_x = true;
-            else if (im == 0xE0 || im == 0xF1) has_y = true;
+            uint32_t op = in >> 26;
+            if (op != 0x0Au && op != 0x0Bu) continue;  // not slti/sltiu
+            uint32_t im = in & 0xFFFFu;
+            if (psx_ws_cull_imm_in(im, config_.ws_cull_w_imms.data(),
+                                   (int)config_.ws_cull_w_imms.size())) has_x = true;
+            else if (psx_ws_cull_imm_in(im, config_.ws_cull_h_imms.data(),
+                                        (int)config_.ws_cull_h_imms.size())) has_y = true;
             if (has_x && has_y) return true;
         }
     }
     return false;
+}
+
+int CodeGenerator::detect_cull_bltz_sites(const ControlFlowGraph& cfg) {
+    // Populate ws_cull_bltz_pcs_ with the function's LEFT-edge funnel bltz
+    // addresses (ws_cull_detect.h idioms 2/3). Only meaningful when the
+    // function already qualified (ws_auto_cull_func_). Build a contiguous word
+    // image over the function range (same approach as detect_backdrop_windows)
+    // so the structural classifier sees cross-block context.
+    ws_cull_bltz_pcs_.clear();
+    if (!ws_auto_cull_func_) return 0;
+    uint32_t lo = cfg.function_start, hi = cfg.function_end;
+    if (hi <= lo || (hi - lo) > 0x40000u) return 0;   // sanity bound
+    std::vector<uint32_t> words;
+    words.reserve((hi - lo) / 4u);
+    for (uint32_t a = lo; a < hi; a += 4) {
+        auto io = exe_.read_word(a);
+        words.push_back(io.has_value() ? *io : 0u);
+    }
+    int n = (int)words.size();
+    for (int i = 0; i < n; i++)
+        if (psx_ws_cull_bltz_here(words.data(), n, i,
+                                  config_.ws_cull_w_imms.data(),
+                                  (int)config_.ws_cull_w_imms.size()))
+            ws_cull_bltz_pcs_.insert(lo + (uint32_t)i * 4u);
+    return (int)ws_cull_bltz_pcs_.size();
 }
 
 int CodeGenerator::detect_backdrop_windows(const ControlFlowGraph& cfg) {
@@ -1984,9 +2044,11 @@ GeneratedFunction CodeGenerator::generate_function(
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
     // translate_instruction widens this function's width compares. Cleared for
-    // every function so it never leaks across functions.
+    // every function so it never leaks across functions. The LEFT-edge funnel
+    // bltz sites (signed idioms) are classified alongside.
     ws_auto_cull_func_ = config_.ws_auto_screen_x_cull &&
                          func_has_screen_extent_cull(cfg);
+    detect_cull_bltz_sites(cfg);
 
     // Widescreen backdrop preload (gated): detect each scrolling-backdrop column
     // window so translate_instruction rewrites its START/END finalize. Cleared +
@@ -2228,6 +2290,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // generate_function() call can't leak into this body. (See generate_function.)
     ws_auto_cull_func_ = config_.ws_auto_screen_x_cull &&
                          func_has_screen_extent_cull(cfg);
+    detect_cull_bltz_sites(cfg);
 
     // Backdrop preload sites for this alias group's shared CFG (see
     // generate_function). Set per-group so a stale map can't leak in.
@@ -2497,6 +2560,8 @@ std::string CodeGenerator::generate_file(
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_cols(int base);     /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_startcol(int col);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";

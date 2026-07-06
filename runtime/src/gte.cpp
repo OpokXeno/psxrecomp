@@ -157,6 +157,7 @@ static void depth_cue_from_ir(GTEState* gte) {
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
+extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 
 // Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
 // (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
@@ -890,6 +891,11 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
 
     uint8_t func = cmd & 0x3F;
+    /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every
+     * perspective projection so gpu.c can stamp real 3D frames as gameplay
+     * (no-op unless the game opts in — early-out on the config flag). */
+    if (func == 0x01 || func == 0x30)
+        psx_ws_note_gte_project(func == 0x30 ? 3 : 1);
     switch (func) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;

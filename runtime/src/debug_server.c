@@ -6513,6 +6513,19 @@ static void handle_gl_ws_ablate(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
 }
 
+/* gl_wide_fast on=<0|1>: native-wide centre-blit fast path. 1 (default) = skip
+ * the redundant centre mirror and copy the canonical 4:3 frame into the wide
+ * surface centre at present (fast). 0 = re-rasterize the whole wide surface
+ * every prim (the original full-mirror path). For A/B perf + parity checks. */
+extern void gl_renderer_set_wide_fast(int on);
+extern int  gl_renderer_get_wide_fast(void);
+static void handle_gl_wide_fast(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) gl_renderer_set_wide_fast(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_get_wide_fast());
+}
+
 /* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
  * ws_aspect num=<n> den=<d> calls gte_set_display_aspect at runtime so we can
  * compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a relaunch. */
@@ -11048,6 +11061,7 @@ static const CmdEntry s_commands[] = {
     { "gl_present_ring",   handle_gl_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
+    { "gl_wide_fast",      handle_gl_wide_fast },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },

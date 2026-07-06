@@ -997,6 +997,15 @@ int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
     return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
             < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
+/* Signed-funnel variants (min/max + center±halfwidth idioms). Same contract:
+ * self-contained, identity at margin 0, MUST stay byte-for-byte identical to
+ * the gpu.c implementations. */
+int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
+    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+}
+int psx_ws_cull_bltz(uint32_t v) {
+    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }

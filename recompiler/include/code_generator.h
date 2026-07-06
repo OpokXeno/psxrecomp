@@ -66,6 +66,17 @@ struct CodeGenConfig {
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
 
+    // Explicit signed right-edge widen sites ([widescreen.cull] slti_sites):
+    // `slti rt, sx, W` emitted through psx_ws_cull_slti for funnel functions
+    // the auto-detector cannot qualify (X-only test, no height compare).
+    std::set<uint32_t> ws_cull_slti_sites;
+
+    // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
+    // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
+    // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).
+    std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 };
+    std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };
+
     // Widescreen automatic horizontal-FOV cull widening ([widescreen.cull]
     // auto_screen_x). When true, any function carrying the GTE screen-extent
     // reject signature — at least one `sltiu …,0x140/0x141` (right/width) AND
@@ -232,6 +243,11 @@ private:
     // translate_instruction to widen that function's width compares. See
     // func_has_screen_extent_cull().
     bool ws_auto_cull_func_ = false;
+    // LEFT-edge funnel bltz addresses in the current function (auto_screen_x,
+    // signed min/max + center±halfwidth idioms — ws_cull_detect.h). Populated
+    // per function alongside ws_auto_cull_func_; generate_branch_condition
+    // emits a listed bltz through psx_ws_cull_bltz. Cleared per function.
+    std::set<uint32_t> ws_cull_bltz_pcs_;
 
     // True iff the function's instruction stream contains both a screen-width
     // reject (`sltiu …,0x140` or `…,0x141`) and a screen-height reject
@@ -249,6 +265,9 @@ private:
     // Populate ws_backdrop_sites_ from the shared psx_ws_find_backdrop_windows()
     // detector over this function's instruction words; returns the window count.
     int detect_backdrop_windows(const ControlFlowGraph& cfg);
+    // Populate ws_cull_bltz_pcs_ (LEFT-edge funnel bltz addresses) for the
+    // current function; no-op unless ws_auto_cull_func_ is set.
+    int detect_cull_bltz_sites(const ControlFlowGraph& cfg);
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);
@@ -269,7 +288,7 @@ private:
         std::map<uint32_t, std::vector<uint32_t>>& out_edges);
 
     // Control flow translation
-    std::string generate_branch_condition(uint32_t instr);
+    std::string generate_branch_condition(uint32_t instr, uint32_t addr);
     std::string translate_branch(const ControlFlowInstr& cf, uint32_t fall_through);
     std::string translate_jump(const ControlFlowInstr& cf);
 

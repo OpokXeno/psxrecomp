@@ -1138,6 +1138,39 @@ static int bd_prim_gate(const int *xs, int n) {
     return 1;
 }
 
+/* ---- native-wide FAST path (skip redundant center mirror) ----------------- *
+ * The wide surface's CENTRE columns [g_wide_off, g_wide_off+native_w) are, by
+ * construction, identical to the canonical 4:3 framebuffer. So instead of
+ * re-rasterizing every primitive into the wide surface (the "mirror" pass — the
+ * dominant native-wide GPU cost, ~2x scene fill), we copy the canonical centre
+ * into the wide surface once at present (blit_wide_center_from_canonical), and
+ * the per-prim mirror only needs to produce the reveal MARGINS. Any prim/batch
+ * whose x-range is fully inside the 4:3 frame contributes nothing to the margins,
+ * so its mirror is skipped entirely. Correctness does not depend on the skip
+ * being precise: the centre is authoritatively overwritten by the blit, so the
+ * ONLY requirement is that a margin-reaching prim is NOT skipped — hence the
+ * conservative strict-inside test. 4:3 never runs any of this (g_wide_cur == 0).
+ * Toggle via gl_wide_fast for A/B; default ON. */
+static int s_wide_fast = 1;
+void gl_renderer_set_wide_fast(int on) { s_wide_fast = on ? 1 : 0; }
+int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
+static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h); /* def below */
+/* True if [lo,hi] (canonical draw-x) lies strictly inside the 4:3 frame, so the
+ * prim adds nothing to either reveal margin and its mirror can be skipped. */
+static int mirror_x_center_only(int lo, int hi) {
+    if (!s_wide_fast) return 0;
+    int base = g_wide_cur_base, native_w = g_wide_w - 2 * g_wide_off;
+    if (native_w <= 0) return 0;
+    return (lo >= base) && (hi < base + native_w);
+}
+static int mirror_geo_center_only(const int *xs, int n) {
+    if (!s_wide_fast) return 0;
+    int lo = xs[0], hi = xs[0];
+    for (int i = 1; i < n; i++) { if (xs[i] < lo) lo = xs[i]; if (xs[i] > hi) hi = xs[i]; }
+    return mirror_x_center_only(lo, hi);
+}
+/* mirror_batch_center_only (textured-batch variant) is defined after s_tb below. */
+
 /* Set / clear the 2D-backdrop x-stretch for a wide-mirror draw, per the current
  * gate (s_bd_gate, set by the caller from bd_prim_gate / the batch gate). */
 static void wide_set_bd_scale(GLint uScale, GLint uCenter) {
@@ -1234,6 +1267,18 @@ static double s_cw_wide_ms  = 0.0;   /* CPU wall inside glb_wide_* entry points 
 static int    s_cw_batches = 0, s_cw_wide_sets = 0, s_cw_wide_cfgs = 0,
               s_cw_wide_clears = 0, s_cw_fbo_creates = 0, s_cw_flush_depth = 0;
 
+/* Textured-batch variant of mirror_x_center_only: scan the queued verts' x
+ * (attr 0, stride TEXV). Defined here so s_tb / TEXV are in scope. */
+static int mirror_batch_center_only(int nverts) {
+    if (!s_wide_fast || nverts <= 0) return 0;
+    int lo = (int)s_tb[0], hi = (int)s_tb[0];
+    for (int i = 1; i < nverts; i++) {
+        int x = (int)s_tb[i * TEXV];
+        if (x < lo) lo = x; if (x > hi) hi = x;
+    }
+    return mirror_x_center_only(lo, hi);
+}
+
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
@@ -1255,7 +1300,12 @@ static void flush_tex_batch(void) {
 
     tex_batch_draw_passes(nverts, semi);
 
-    if (g_wide_cur && s_ws_ablate != 1) {   /* native-wide mirror */
+    /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
+     * centre content comes from the present-time canonical blit; nothing to add
+     * to the margins). A backdrop-stretched batch (s_tb_gate) widens past the
+     * frame, so it is never treated as centre-only. */
+    if (g_wide_cur && s_ws_ablate != 1 &&
+        !(s_tb_gate == 0 && mirror_batch_center_only(nverts))) {   /* native-wide mirror */
         int dx = wide_dx();
         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
         gl_perf_mirror_begin();
@@ -1302,7 +1352,8 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      * bound). Geometry positions are unchanged on the host side — the x shift
      * is applied in the vertex shader via u_xoff, and the wider clip via
      * u_xhalf. Canonical pass above is untouched (u_xoff=0/u_xhalf=512). */
-    if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1) {
+    if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+        !(!g_ws_bd_stretch_on && mirror_geo_center_only(xs, n))) {
         int dx = wide_dx();
         s_bd_gate = bd_prim_gate(xs, n);   /* flat prims are immediate -> gate per prim */
         gl_perf_mirror_begin();
@@ -2278,6 +2329,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
      * make sure all wide-FBO draws have completed before the readback. */
     flush_tex_batch();
     flush_cpu_upload();
+    wide_blit_center(fbo, base_x, disp_y, disp_h);   /* fast-path: authoritative centre before readback */
     glFinish();
 
     int W = g_wide_w * s_scale;
@@ -2572,6 +2624,30 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
 }
 
+/* Native-wide fast path: authoritatively copy the canonical 4:3 framebuffer
+ * into the wide surface's CENTRE columns [g_wide_off, g_wide_off+native_w) for
+ * the displayed Y band, so the per-prim mirror could skip every centre-only
+ * prim (the dominant native-wide GPU saving). The reveal margins were already
+ * produced by the mirror; this leaves them untouched. One FBO->FBO blit,
+ * x-translated by the reveal offset. No-op when s_wide_fast is off (then the
+ * mirror drew the full surface, as before). Shared by both present paths. */
+static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h) {
+    if (!s_wide_fast || g_wide_w <= 0) return;
+    int native_w = g_wide_w - 2 * g_wide_off;
+    if (native_w <= 0) return;
+    int S = s_scale;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(base_x * S, disp_y * S,
+                        (base_x + native_w) * S, (disp_y + disp_h) * S,
+                        g_wide_off * S, disp_y * S,
+                        (g_wide_off + native_w) * S, (disp_y + disp_h) * S,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
+
 /* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
  * to the window (no glReadPixels / glFinish CPU round-trip). The wide surface is
  * g_wide_w wide × VRAM_H tall (at scale S); present its [0,g_wide_w] × [disp_y,
@@ -2590,13 +2666,15 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    int S = s_scale;
+
+    wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
-    int S = s_scale;
     /* Source: full wide width [0, g_wide_w], displayed Y band [disp_y, +disp_h].
      * V-flip the dst (ly+lh .. ly) so the top scanline lands at the rect top. */
     p_glBlitFramebuffer(0, disp_y * S, g_wide_w * S, (disp_y + disp_h) * S,

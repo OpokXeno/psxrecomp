@@ -161,8 +161,18 @@ static uint32_t s_gpr_lru;
  * overlay widens identically to the gcc cache + interp (widescreen FOV). */
 static int      s_frag_ws_cull;
 extern int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* gpu.c — shared widen */
+extern int psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* gpu.c — signed right edge */
+extern int psx_ws_cull_bltz(uint32_t v);                  /* gpu.c — signed left edge */
+extern int psx_ws_is_cull_w_imm(uint32_t imm);            /* gpu.c — per-game W-imm set */
+extern int psx_ws_auto_cull_on(void);                     /* gpu.c — per-game opt-in gate */
+extern int psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx);  /* gpu.c */
+extern int psx_ws_func_has_screen_cull(const uint32_t *words, int n);   /* gpu.c */
 #define SLJIT_MAX_FRAG_INSNS 2048u
 #define SLJIT_MAX_FRAG_CTRL  512u   /* branches/jumps per fragment cap */
+/* Per-fragment (PASS 1) map of classified LEFT-edge funnel bltz words
+ * (ws_cull_detect.h idioms 2/3): emit_cond_to_S1 routes those through
+ * psx_ws_cull_bltz so the reject widens with the revealed margin. */
+static uint8_t  s_ws_bltz[SLJIT_MAX_FRAG_INSNS];
 /* Per-fragment (PASS 1) backdrop-preload site map ([widescreen.cull]
  * auto_backdrop): s_bd_kind[i] = WS_BD_START_ZERO/END_WIDEN for the window
  * START/END finalize at fragment word i, else WS_BD_NONE. emit_one routes those
@@ -354,26 +364,31 @@ static void emit_helper2(struct sljit_compiler *C, int helper_idx, uint32_t insn
  * of the persisted sljit cache). Order MUST match the SLJIT_HLP_* enum. Called
  * once at startup, after CPUState's memory fn-pointers are wired. */
 void overlay_sljit_init_helpers(CPUState *cpu) {
-    cpu->sljit_helpers[SLJIT_HLP_MEMX]    = (void *)psx_sljit_memx;
-    cpu->sljit_helpers[SLJIT_HLP_COP2]    = (void *)psx_sljit_cop2;
-    cpu->sljit_helpers[SLJIT_HLP_WS_CULL] = (void *)psx_ws_cull_sltiu;
-    cpu->sljit_helpers[SLJIT_HLP_CALL]    = (void *)psx_sljit_call;
+    cpu->sljit_helpers[SLJIT_HLP_MEMX]         = (void *)psx_sljit_memx;
+    cpu->sljit_helpers[SLJIT_HLP_COP2]         = (void *)psx_sljit_cop2;
+    cpu->sljit_helpers[SLJIT_HLP_WS_CULL]      = (void *)psx_ws_cull_sltiu;
+    cpu->sljit_helpers[SLJIT_HLP_CALL]         = (void *)psx_sljit_call;
+    cpu->sljit_helpers[SLJIT_HLP_WS_CULL_SLTI] = (void *)psx_ws_cull_slti;
+    cpu->sljit_helpers[SLJIT_HLP_WS_CULL_BLTZ] = (void *)psx_ws_cull_bltz;
 }
 
-/* Emit `rt = psx_ws_cull_sltiu(gpr[rs], imm)` for a flagged auto_screen_x cull
- * site, so a sljit-JIT'd overlay widens the render-funnel screen-X reject the
- * same way the gcc backend does. The helper reads only its two args (+ the
- * runtime widescreen margin); it does NOT touch cpu->gpr[], so the GPR cache
- * survives — same icall discipline as emit_load (materialise the source into a
- * scratch before the call, write the result into rt after). */
-static void emit_ws_cull(struct sljit_compiler *C, uint32_t rt, uint32_t rs, uint32_t imm) {
+/* Emit `rt = <cull helper>(gpr[rs], imm)` for a flagged auto_screen_x cull
+ * site (helper_idx = SLJIT_HLP_WS_CULL for the unsigned per-vertex idiom,
+ * SLJIT_HLP_WS_CULL_SLTI for the signed min/max right edge), so a sljit-JIT'd
+ * overlay widens the render-funnel screen-X reject the same way the gcc
+ * backend does. The helper reads only its two args (+ the runtime widescreen
+ * margin); it does NOT touch cpu->gpr[], so the GPR cache survives — same
+ * icall discipline as emit_load (materialise the source into a scratch before
+ * the call, write the result into rt after). */
+static void emit_ws_cull(struct sljit_compiler *C, uint32_t rt, uint32_t rs, uint32_t imm,
+                         int helper_idx) {
     sljit_s32 a; sljit_sw aw;
     gpr_src(C, rs, &a, &aw);
     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);                 /* sx  -> R0 (arg0) */
     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)imm); /* imm -> R1 (arg1) */
     sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(R_CPU),           /* fn (cpu-relative) */
                    (sljit_sw)(offsetof(CPUState, sljit_helpers)
-                              + (size_t)SLJIT_HLP_WS_CULL * sizeof(void *)));
+                              + (size_t)helper_idx * sizeof(void *)));
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, 32), SLJIT_R2, 0); /* R0 = verdict */
     sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_R0, 0);
     gpr_unpin();
@@ -577,11 +592,14 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn, int bd_kind, int bd
         return EMIT_OK;
     }
     case 0x0A: /* SLTI (signed) */
-        emit_slt(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rt, rs, 0, 0, simm);
+        if (s_frag_ws_cull && psx_ws_is_cull_w_imm(imm))
+            emit_ws_cull(C, rt, rs, imm, SLJIT_HLP_WS_CULL_SLTI);  /* signed funnel right edge */
+        else
+            emit_slt(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rt, rs, 0, 0, simm);
         return EMIT_OK;
     case 0x0B: /* SLTIU (unsigned, simm sign-extended then compared unsigned) */
-        if (s_frag_ws_cull && (imm == 0x140 || imm == 0x141))
-            emit_ws_cull(C, rt, rs, imm);   /* widescreen render-funnel cull widen (auto_screen_x) */
+        if (s_frag_ws_cull && psx_ws_is_cull_w_imm(imm))
+            emit_ws_cull(C, rt, rs, imm, SLJIT_HLP_WS_CULL);   /* widescreen render-funnel cull widen (auto_screen_x) */
         else
             emit_slt(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rt, rs, 0, 0, simm);
         return EMIT_OK;
@@ -663,9 +681,25 @@ static int classify_control(uint32_t insn, uint32_t off, uint32_t entry_phys,
  * the source registers at the BRANCH instruction (before its delay slot runs).
  * Reads go through the GPR cache; the predicate lands in S1, which is never a
  * cache slot, so it survives the delay slot + the pre-jump flush. */
-static void emit_cond_to_S1(struct sljit_compiler *C, uint32_t insn) {
+static void emit_cond_to_S1(struct sljit_compiler *C, uint32_t insn, int ws_bltz) {
     uint32_t op = f_op(insn), rs = f_rs(insn), rt = f_rt(insn);
     sljit_s32 a, b; sljit_sw aw, bw;
+    /* Classified LEFT-edge funnel bltz (auto_screen_x): predicate comes from
+     * psx_ws_cull_bltz(gpr[rs]) — reject only past the revealed margin
+     * (identity at 4:3). Helper reads only its arg, but the icall discipline
+     * still flushes/resets the GPR cache via emit-helper conventions; here we
+     * call through the cpu-relative table and land the verdict in S1. */
+    if (ws_bltz && op == 0x01 && rt == 0x00) {
+        gpr_src(C, rs, &a, &aw);
+        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(R_CPU),
+                       (sljit_sw)(offsetof(CPUState, sljit_helpers)
+                                  + (size_t)SLJIT_HLP_WS_CULL_BLTZ * sizeof(void *)));
+        sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(32, 32), SLJIT_R2, 0);
+        sljit_emit_op1(C, SLJIT_MOV32, R_CTRL, 0, SLJIT_R0, 0);
+        gpr_unpin();
+        return;
+    }
     switch (op) {
     case 0x04: /* BEQ rs==rt */
     case 0x05: /* BNE rs!=rt */
@@ -816,31 +850,30 @@ void overlay_sljit_try_compile(uint32_t entry,
      * see gpr_ref_mask). distinct >= the max regs in any single instruction, so
      * gpr_alloc always finds a slot. */
     uint32_t used_mask = 0;
-    int ws_hx = 0, ws_hy = 0;   /* render-funnel screen-cull signature (auto_screen_x) */
-    for (uint32_t i = 0; i < frag_words; i++) {
-        uint32_t w = img_word(bytes, off0 + i * 4u);
-        used_mask |= gpr_ref_mask(w);
-        if ((w & 0xFC000000u) == 0x2C000000u) {     /* sltiu */
-            uint32_t im = w & 0xFFFFu;
-            if (im == 0x140 || im == 0x141) ws_hx = 1;
-            else if (im == 0xE0 || im == 0xF1) ws_hy = 1;
-        }
-    }
-    s_frag_ws_cull = ws_hx && ws_hy;
+    for (uint32_t i = 0; i < frag_words; i++)
+        used_mask |= gpr_ref_mask(img_word(bytes, off0 + i * 4u));
 
-    /* Backdrop-preload window detection ([widescreen.cull] auto_backdrop): scan
-     * the fragment for column-window generators and mark the START/END finalize
-     * words so emit_one routes them through psx_ws_backdrop_value. base_pc =
-     * entry (virtual) so a site PC maps to its fragment word index. A window
-     * whose magic load falls outside this fragment is simply not detected here
-     * (the contiguous case body is the common shape; the interp/gcc paths cover
-     * the rest), so the worst case is a missed widen, never a mis-compile. */
+    /* Widescreen cull + backdrop-preload detection ([widescreen.cull]
+     * auto_screen_x / auto_backdrop): both run over the same fragment word
+     * image via the shared detectors (ws_cull_detect.h / ws_backdrop_detect.h)
+     * so the sljit JIT derives the SAME sites as the gcc emit + interp. Both
+     * are gated on the per-game opt-in (a title that never opted in must never
+     * have its code pattern-scanned and rewritten). A window whose context
+     * falls outside this fragment is simply not detected here (the interp/gcc
+     * paths cover the rest) — worst case a missed widen, never a mis-compile. */
     for (uint32_t i = 0; i < frag_words && i < SLJIT_MAX_FRAG_INSNS; i++) {
-        s_bd_kind[i] = WS_BD_NONE; s_bd_cols[i] = 0;
+        s_bd_kind[i] = WS_BD_NONE; s_bd_cols[i] = 0; s_ws_bltz[i] = 0;
     }
+    s_frag_ws_cull = 0;
     {
         static uint32_t bdwords[SLJIT_MAX_FRAG_INSNS];
         for (uint32_t i = 0; i < frag_words; i++) bdwords[i] = img_word(bytes, off0 + i * 4u);
+        if (psx_ws_auto_cull_on()) {
+            s_frag_ws_cull = psx_ws_func_has_screen_cull(bdwords, (int)frag_words);
+            if (s_frag_ws_cull)
+                for (uint32_t i = 0; i < frag_words && i < SLJIT_MAX_FRAG_INSNS; i++)
+                    s_ws_bltz[i] = (uint8_t)psx_ws_cull_bltz_at(bdwords, (int)frag_words, (int)i);
+        }
         WsBackdropSite bds[16];
         int nb = psx_ws_find_backdrop_windows(bdwords, (int)frag_words, entry, bds, 16);
         for (int b = 0; b < nb; b++) {
@@ -909,7 +942,8 @@ void overlay_sljit_try_compile(uint32_t entry,
                             sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, 31), 0,
                                            SLJIT_IMM, (sljit_sw)(entry + i * 4u + 8u));
                     }
-                    emit_cond_to_S1(C, insn);  /* predicate read BEFORE the delay slot */
+                    emit_cond_to_S1(C, insn,   /* predicate read BEFORE the delay slot */
+                                    s_frag_ws_cull && i < SLJIT_MAX_FRAG_INSNS && s_ws_bltz[i]);
                 }
                 pending   = PEND_BR;
                 pend_cond = (ctrl == CTRL_BRANCH);

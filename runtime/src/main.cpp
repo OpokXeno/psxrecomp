@@ -2078,6 +2078,20 @@ int main(int argc, char** argv) {
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
             gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
+            /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
+            gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
+            gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
+            /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
+            gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen.cull] per-game gates + signature immediates for the
+             * pattern-scanned interp/sljit widen hooks. A title that never
+             * opted in must never have its live code scanned and rewritten. */
+            gpu_ws_set_auto_hooks(gc.ws_auto_screen_x_cull ? 1 : 0,
+                                  gc.ws_auto_backdrop_preload ? 1 : 0);
+            if (!gc.ws_cull_w_imms.empty() || !gc.ws_cull_h_imms.empty())
+                gpu_ws_set_cull_imms(gc.ws_cull_w_imms.data(), (int)gc.ws_cull_w_imms.size(),
+                                     gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
