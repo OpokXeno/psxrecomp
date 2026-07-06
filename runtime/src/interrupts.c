@@ -423,6 +423,15 @@ extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
  * That fiber's wrapped SwitchToFiber call will observe the flag on
  * return and execute the longjmp on the correct stack. */
 jmp_buf exception_jmpbuf;  /* non-static so traps.c can deferred-longjmp */
+/* Monotonic epoch of the exception setjmp frame: bumped each time the setjmp
+ * loop is (re)armed at exception entry. Lets an observer holding a frame on
+ * the C stack (the overlay shadow-diff, run_shadow_diff) decide whether a
+ * longjmp targets a frame BELOW it (armed before it — the unwind escapes its
+ * frame and skips its epilogue) or a frame armed after it (contained). The
+ * single global exception_jmpbuf always holds the latest-armed frame, so the
+ * current epoch identifies every longjmp's target. */
+uint64_t g_exc_setjmp_epoch = 0;
+uint64_t psx_exception_setjmp_epoch(void) { return g_exc_setjmp_epoch; }
 /* The fiber that owns the current exception setjmp. A longjmp must run on
  * that same fiber/stack, so a non-owner defers by switching back to it
  * first (see deferred_exception_longjmp). Used on all platforms now that
@@ -532,6 +541,9 @@ void psx_rfe_escape_check(CPUState* cpu) {
     if (g_rfe_escape_pending && in_exception &&
         psx_fiber_current() == g_exception_owner_fiber) {
         g_rfe_escape_pending = 0;
+        /* Same shadow-frame hardening as deferred_exception_longjmp. */
+        extern void overlay_loader_shadow_escape_fixup(uint64_t target_epoch);
+        overlay_loader_shadow_escape_fixup(g_exc_setjmp_epoch);
         longjmp(exception_jmpbuf, 1); /* same fiber: safe; lands in psx_check_interrupts */
     }
 }
@@ -589,6 +601,13 @@ void interrupts_init(void) {
  * check in traps.c psx_change_thread_fiber executes the longjmp on the
  * correct stack. */
 static void deferred_exception_longjmp(int code) {
+    /* If this unwind blows through a live shadow-diff frame (a frame armed
+     * BEFORE the shadow started), restore the shadow-scoped globals its
+     * skipped epilogue would have restored — otherwise the diff instrument
+     * silently dies for the rest of the run (s_in_shadow stuck). No-op when
+     * no shadow is live or the target frame was armed inside the shadow. */
+    extern void overlay_loader_shadow_escape_fixup(uint64_t target_epoch);
+    overlay_loader_shadow_escape_fixup(g_exc_setjmp_epoch);
     if (!g_exception_owner_fiber || psx_fiber_current() == g_exception_owner_fiber) {
         longjmp(exception_jmpbuf, code);
     }
@@ -673,6 +692,15 @@ void psx_check_interrupts(CPUState* cpu) {
      * sees it. */
 
     interrupts_service_scheduled_events();
+
+    /* Idle-loop cycle skip (psx_cycles.c): detect a side-effect-free poll
+     * loop by its repeated same-PC checks and fast-forward guest time to the
+     * next internal device event in whole loop quanta. Runs BEFORE the
+     * deliverability evaluation below so an event raised by the skip is
+     * delivered in this same check, exactly at the boundary real execution
+     * would have taken it. No-ops in exception context / precise mode /
+     * lockstep (gated inside). */
+    psx_idle_note_check(cpu, s_last_interrupt_check_pc);
 
     /* User save states: this is a block-leader boundary with a known resume PC;
      * only act outside the exception handler so a restore's stack-unwind can't
@@ -1066,6 +1094,12 @@ void psx_check_interrupts(CPUState* cpu) {
     }
     uint32_t saved_dirty_resume_pc = g_dirty_safe_resume_pc;
     if (s_clear_resume_latch) g_dirty_safe_resume_pc = 0;
+    /* Wall-time sampler phase: the handler dispatch runs recompiled static
+     * BIOS text. Same save/restore contract as g_dirty_interp_active above —
+     * the restore sits after the setjmp loop, covering longjmp landings. */
+    extern int g_exec_phase;
+    int prev_exec_phase = g_exec_phase;
+    g_exec_phase = 3;
     /* Dispatch-depth contract across the async handler (Tomba 2 splash, post
      * overlay-floor fix). The interrupt can be delivered from a NESTED dispatch
      * (the local-flow pump runs inside dirty_ram_dispatch at depth > 0). The
@@ -1078,6 +1112,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * ("execution completed" abnormal exit). */
     int saved_dispatch_depth = g_psx_dispatch_depth;
     g_psx_dispatch_depth = 0;
+    g_exc_setjmp_epoch++;   /* new setjmp frame armed (see decl above) */
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
         if (jmp_val == 2) {
@@ -1111,6 +1146,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * RFE/RestoreState longjmp — which lands in the setjmp loop above — can't
      * strand it at 0. */
     if (s_clear_resume_latch) g_dirty_safe_resume_pc = saved_dirty_resume_pc;
+    g_exec_phase = prev_exec_phase;
     /* Restore the interrupted code's dispatch nesting (see save above). The
      * handler's frames were unwound by longjmp without decrementing, so the
      * live counter is meaningless here — overwrite, don't decrement. */
