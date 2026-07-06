@@ -275,8 +275,17 @@ static uint32_t idle_reg_fp(const CPUState *cpu) {
 
 static int idle_skip_on(void) {
     if (g_idle_skip_enabled < 0) {
+        /* DISABLED BY DEFAULT (2026-07-06). The skip fast-forwards guest time
+         * to the next INTERNAL device event, but an SIO/memory-card transfer
+         * in flight is not currently modeled as a bounding deadline, so the
+         * skip jumps past the write-completion the card driver polls for at
+         * boot — Tomba2's "checking memory card" livelocks (frame rate
+         * collapses to a few fps; the game never advances). Opt in with
+         * PSX_IDLE_SKIP=1. Re-enable by default only once the skip is bounded
+         * by the SIO transfer/IRQ deadline (devices_cycles_to_next_internal_
+         * event must include the in-flight card-byte completion). */
         const char *e = getenv("PSX_IDLE_SKIP");
-        g_idle_skip_enabled = !(e && e[0] == '0');
+        g_idle_skip_enabled = (e && e[0] == '1');
     }
     return g_idle_skip_enabled;
 }
