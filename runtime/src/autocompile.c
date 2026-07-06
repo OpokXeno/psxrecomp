@@ -221,6 +221,10 @@ static int json_escape_into(char *dst, int cap, const char *src, int n) {
         else if (c == '\r') { /* drop */ }
         else if (c == '\t') { dst[o++] = '\\'; dst[o++] = 't'; }
         else if (c < 0x20)  { o += snprintf(dst + o, cap - o, "\\u%04x", c); }
+        /* Bytes >= 0x80 are cp1252 console output from the child compile
+         * (e.g. 0x97 em-dash) — raw they make the JSON invalid UTF-8 and
+         * break strict clients. Escape as \u00XX (Latin-1 view). */
+        else if (c >= 0x80) { o += snprintf(dst + o, cap - o, "\\u%04x", c); }
         else dst[o++] = (char)c;
     }
     dst[o] = '\0';
