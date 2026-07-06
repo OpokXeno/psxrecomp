@@ -593,6 +593,13 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     if (g_pending_exception_longjmp && psx_fiber_current() == g_exception_owner_fiber) {
         int code = g_pending_exception_longjmp;
         g_pending_exception_longjmp = 0;
+        /* Same shadow-frame hardening as deferred_exception_longjmp: this is
+         * the deferred-honor site — the actual unwind of the OWNER fiber's
+         * frames happens here, so a live shadow frame on this stack must have
+         * its globals restored before the jump. */
+        extern uint64_t g_exc_setjmp_epoch;
+        extern void overlay_loader_shadow_escape_fixup(uint64_t target_epoch);
+        overlay_loader_shadow_escape_fixup(g_exc_setjmp_epoch);
         longjmp(exception_jmpbuf, code);
     }
 

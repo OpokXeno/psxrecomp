@@ -132,6 +132,9 @@ static NRingEnt s_nring[NRING_CAP];
 static uint32_t s_nring_pos = 0;
 static uint64_t s_nring_seq = 0;
 static uint32_t s_native_inprogress = 0;   /* addr of fn currently in native, 0 = none */
+/* Sampler accessor (phase_profile hot-function histogram): the innermost native
+ * candidate's registered entry. Read off-thread; a torn read is harmless. */
+uint32_t overlay_loader_native_inprogress(void) { return s_native_inprogress; }
 static uint64_t s_native_calls_total = 0;
 extern uint64_t s_frame_count;
 
@@ -248,6 +251,27 @@ uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
 /* Same-state differential — defined fully below; declared here for dispatch. */
 static int  s_diff_mode = 0;
 static int  s_in_shadow = 0;
+/* Candidate whose shadow NATIVE pass is currently executing (NULL outside it).
+ * Set ONLY around run_shadow_diff's native pass — never during the interp pass,
+ * which must stay pure interp. Lets the CPS continuation re-entry path below
+ * run THIS candidate's own interiors natively inside its shadow run (so the
+ * diff exercises the whole function, not just the first CPS segment), while
+ * every other dispatch inside the shadow stays on the interpreter. */
+static const void *s_shadow_cand = NULL;
+/* Longjmp-escape hardening. run_shadow_diff saves the pre-shadow values of
+ * s_native_exec / s_suppress_irq here (in addition to its locals) so that
+ * overlay_loader_shadow_escape_fixup() can restore them if an exception
+ * longjmp ever unwinds through a live shadow frame (should be impossible —
+ * the dispatch gate refuses to start a shadow while in an exception dispatch —
+ * but an escape must fail LOUD and self-heal, not silently kill the
+ * instrument). s_shadow_epoch is the exception-setjmp epoch at shadow start:
+ * a longjmp targeting a frame with epoch <= s_shadow_epoch escapes the shadow;
+ * a larger epoch is an exception armed INSIDE the shadow (contained). */
+static int      s_shadow_saved_native_exec = 0;
+static int      s_shadow_saved_supp       = 0;
+static uint64_t s_shadow_epoch            = 0;
+static uint32_t s_shadow_escapes          = 0;
+static uint32_t s_shadow_escapes_native   = 0;
 /* Live sljit mode (PSX_OVERLAY_SLJIT_LIVE / sljit_live debug cmd): JIT overlay
  * functions on-miss and run them LIVE without the per-shard differential — the
  * production model (sljit is the sync on-miss producer; safety is the emitter's
@@ -272,6 +296,9 @@ static uint32_t s_rehash_miss    = 0;   /* hashes that didn't match crc_code  */
 static uint64_t s_gen_fastpath   = 0;   /* dispatches that skipped the crc32   */
                                         /* via the unchanged page-generation   */
                                         /* fast path (overlay-cache v2 P2)      */
+static uint64_t s_diffgate_interp = 0;  /* CPS interior re-entries sent to the  */
+                                        /* interp because their candidate is    */
+                                        /* still inside the diff verify budget  */
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
@@ -1177,6 +1204,11 @@ static int overlay_irq_budget_blocks_now(void) {
 
 static void overlay_post_dispatch_irq_pump(CPUState *cpu) {
     if (!s_irq_post_dispatch_pump) return;
+    /* Never deliver an IRQ inside a shadow run: the handler would ack device
+     * state (I_STAT) that survives the sandbox while the guest state it ran on
+     * is rolled back — a lost interrupt. Shadow runs are IRQ-suppressed by
+     * design (s_suppress_irq in run_shadow_diff); this pump must match. */
+    if (s_in_shadow) return;
     if (overlay_irq_budget_blocks_now()) return;
     if (cpu->pc != 0u) psx_check_interrupts_at(cpu, cpu->pc);
     else psx_check_interrupts(cpu);
@@ -1186,9 +1218,13 @@ static void overlay_post_dispatch_irq_pump(CPUState *cpu) {
  * xprobe-watched targets (before + after) so overlay-DLL call-outs are visible
  * in the xprobe `watched` dump the way interp JAL/JALR sites already are. */
 extern void dirty_ram_xprobe_call_note(CPUState *cpu, uint32_t target, uint32_t ra, uint8_t phase);
+extern int g_exec_phase;   /* wall-time sampler phase (dirty_ram_interp.c) */
 static void overlay_dispatch_call_probed(CPUState *cpu, uint32_t addr, uint32_t ra) {
     dirty_ram_xprobe_call_note(cpu, addr, ra, 0);
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
     psx_dispatch_call(cpu, addr, ra);
+    g_exec_phase = prev_phase;
     dirty_ram_xprobe_call_note(cpu, addr, ra, 1);
 }
 
@@ -1519,7 +1555,9 @@ void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
 
 /* ---- Lazy region cache check (first dispatch miss for a region) -------- */
 
-#define MAX_CHECKED 64
+/* 64 -> 256 (2026-07-06): the dirty boot-text window adds per-variant regions
+ * below FLOOR; a full memo silently stops caching new region checks. */
+#define MAX_CHECKED 256
 static uint32_t s_checked[MAX_CHECKED];
 static int      s_nchecked = 0;
 static int      s_last_file_found = 0;
@@ -1549,7 +1587,10 @@ void overlay_loader_rescan(void) {
  * ALL of them; each contributes its functions as separate candidates, and
  * per-entry validity (the live-RAM hash) decides which candidate is callable
  * at any moment. Nothing is ever clobbered — discoveries accumulate. */
-#define MAX_LOADED_DLLS 128
+/* 128 -> 512 (2026-07-06): the warmed vault already loads 190 DLLs, past the
+ * old cap — dll_already_loaded() then misses and a rescan can double-register
+ * a DLL's candidates. Sized for vault + autocompile + boot-text regions. */
+#define MAX_LOADED_DLLS 512
 static char s_loaded_paths[MAX_LOADED_DLLS][768];
 static int  s_nloaded_paths = 0;
 
@@ -1596,19 +1637,20 @@ static void try_load_region(uint32_t phys) {
      * DLLs are keyed by this start address in their filename.
      *
      * CRITICAL: the capture clamps each region to its WINDOW — kernel
-     * [0, DIRTY_RAM_KERNEL_WINDOW_END) or overlay [OVERLAY_REGION_FLOOR, end) —
-     * so a DLL's region_start is the first dirty page AT OR ABOVE the window
-     * floor. But the dirty run is contiguous ACROSS the static-EXE gap between
-     * those windows: the boot EXE image (0x10000..floor) was written at load
-     * time, so its pages are dirty too. Walking back without the same floor
-     * clamp overshoots through the EXE region and yields a region_start (e.g.
-     * 0x10000) that NO DLL filename matches — so the overlay's DLLs never load
-     * and its functions interpret forever (the dominant slowness). Clamp the
-     * walkback to the window floor so region_start matches the capture. */
-    uint32_t floor_pg = (phys < DIRTY_RAM_KERNEL_WINDOW_END)
-                      ? 0u
-                      : (OVERLAY_REGION_FLOOR / page_sz);
+     * [0, KERNEL_WINDOW_END), dirty boot-text [KERNEL_WINDOW_END, FLOOR), or
+     * overlay [FLOOR, end) — so a DLL's region_start is the first dirty page
+     * AT OR ABOVE the window floor. The walkback must apply the SAME clamp,
+     * chosen by PAGE (the capture windows are page-granular and FLOOR need
+     * not be page-aligned): an overlay-region walk stopping anywhere below
+     * FLOOR's page, or a boot-text walk crossing into the kernel window,
+     * yields a region_start that NO DLL filename matches — the overlay's
+     * DLLs never load and its functions interpret forever. */
+    uint32_t kern_pg = DIRTY_RAM_KERNEL_WINDOW_END / page_sz;
+    uint32_t ovl_pg  = OVERLAY_REGION_FLOOR / page_sz;
     uint32_t pg = phys / page_sz;
+    uint32_t floor_pg = (pg < kern_pg) ? 0u
+                      : (pg < ovl_pg)  ? kern_pg
+                      :                  ovl_pg;
     while (pg > floor_pg) {
         uint32_t pp = pg - 1;
         if (!((dirty_ram_get_bitmap_word(pp >> 5) >> (pp & 31u)) & 1u)) break;
@@ -1739,8 +1781,33 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
                 if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
-                if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
-                                       { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
+                /* Diff instrument — same contract as the entry chain's want_diff
+                 * gate below. A continuation re-entry must NOT run native blind
+                 * while its candidate is still inside the verify budget: CPS
+                 * interiors dominate dispatch, so without this gate ~all native
+                 * execution bypassed the diff harness (shadow_calls=1 over 51K
+                 * frames while gen_fastpath took ~600M hits). Interiors are
+                 * validated transitively: the entry-level shadow diff runs the
+                 * WHOLE function natively (in_own_shadow below), so until the
+                 * candidate passes its budget its interiors take the interpreter
+                 * (the authority). Inside the candidate's OWN shadow native pass
+                 * interiors DO run native — that IS the diff exercising the
+                 * continuation blocks; the blocklist is not consulted there,
+                 * matching the entry gate (which shadow-diffs blocked candidates
+                 * too — the blocklist blocks LIVE native, not the sandbox). */
+                int in_own_shadow = (s_in_shadow && (const void *)c == s_shadow_cand);
+                if (!in_own_shadow) {
+                    int want_diff = s_diff_mode || (s_sljit_live && c->dll < 0);
+                    if (want_diff && addr < 0x10000u) want_diff = 0;
+                    if (want_diff && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+                        if (_probe) s_cps_probe_outcome = 5;
+                        s_diffgate_interp++;
+                        s_disp_interp++;
+                        return 0;
+                    }
+                    if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
+                                           { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
+                }
                 if (_probe) s_cps_probe_outcome = 2;
                 uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
                 s_nring[slot].addr = addr;
@@ -1755,7 +1822,12 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                     s_active_stack[s_active_depth++] = ci;
                 s_disp_native++;
                 cpu->pc = addr;          /* route the func's entry-switch to the block */
-                c->fn(cpu);
+                {
+                    int prev_phase = g_exec_phase;
+                    g_exec_phase = 2;
+                    c->fn(cpu);
+                    g_exec_phase = prev_phase;
+                }
                 overlay_post_dispatch_irq_pump(cpu);
                 if (s_active_depth > 0) s_active_depth--;
                 s_nring[slot].returned = 1;
@@ -1827,7 +1899,34 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
              * the trusted tier (validated at dev time) and run native directly;
              * they are diffed only in explicit dev diff mode. */
             int want_diff = s_diff_mode || (s_sljit_live && c->dll < 0);
+            /* Kernel-window candidates (call gates 0xA0/0xB0/0xC0 and the RAM
+             * kernel) are NOT shadow-diffable: the gates tail-jump via RAM
+             * tables into kernel SERVICES whose behavior depends on scheduler/
+             * event state and can block (TestEvent/WaitEvent) — the two passes
+             * legitimately run different instruction paths and every call
+             * "diverges" (observed: 2016/2017 calls, all 0xB0, flooding the
+             * ring). The diff harness validates OVERLAY shard codegen against
+             * the interp oracle; kernel gates stay on their normal route. */
+            if (want_diff && addr < 0x10000u) want_diff = 0;
             if (want_diff && !s_in_shadow && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+                /* NEVER start a shadow inside an exception dispatch: the guest's
+                 * ReturnFromException longjmps to the setjmp frame BELOW us
+                 * (psx_check_interrupts), unwinding run_shadow_diff WITHOUT its
+                 * epilogue — s_in_shadow/s_native_exec/s_suppress_irq stay stuck
+                 * and the diff instrument is dead for the rest of the run
+                 * (observed: shadow_calls=1 over 51K frames). Exceptions ENTERED
+                 * during a shadow are contained — their setjmp is armed inside
+                 * the shadow frame — so gating the START is structurally
+                 * sufficient (every psx_exception_longjmp site is guarded by
+                 * psx_get_in_exception()). The candidate still must not run
+                 * native unvalidated: route to the interpreter (the authority);
+                 * it gets diffed at its next non-exception dispatch. */
+                extern int psx_get_in_exception(void);
+                if (psx_get_in_exception()) {
+                    s_diffgate_interp++;
+                    s_disp_interp++;
+                    return 0;
+                }
                 run_shadow_diff(cpu, c, addr);
                 return 1;
             }
@@ -1859,7 +1958,12 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             extern void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind);
             uint32_t mtag = (uint32_t)s_nring[slot].seq;  /* stable across nesting */
             dirty_ram_log_marker(c->addr, mtag, 0);
-            c->fn(cpu);
+            {
+                int prev_phase = g_exec_phase;
+                g_exec_phase = 2;
+                c->fn(cpu);
+                g_exec_phase = prev_phase;
+            }
             overlay_post_dispatch_irq_pump(cpu);
             dirty_ram_log_marker(c->addr, mtag, 1);
             if (s_active_depth > 0) s_active_depth--;
@@ -2076,9 +2180,12 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     uint8_t *ram  = memory_get_ram_ptr();
     uint8_t *spad = memory_get_scratchpad_ptr();
 
+    extern uint64_t psx_exception_setjmp_epoch(void);
     s_in_shadow = 1;
+    s_shadow_epoch = psx_exception_setjmp_epoch();
     int saved_supp = s_suppress_irq;
     s_suppress_irq = 1;                 /* isolate computation; longjmp-safe */
+    s_shadow_saved_supp = saved_supp;   /* escape-fixup mirror (see decl) */
     /* Validate ONE function at a time: nested OVERLAY calls run via the
      * INTERPRETER on BOTH passes (s_native_exec=0). Otherwise the native pass
      * dispatches each callee as its own native shard while the interp pass runs
@@ -2089,6 +2196,7 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
      * tree soundness then follows by induction. */
     int sv = s_native_exec;
     s_native_exec = 0;
+    s_shadow_saved_native_exec = sv;    /* escape-fixup mirror (see decl) */
 
     CPUState cpu0 = *cpu;
     memcpy(s_ram0,  ram,  SHADOW_RAM_SIZE);
@@ -2131,7 +2239,19 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
 
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
-    c->fn(cpu);
+    /* Arm the own-interior native route for the NATIVE pass only (see
+     * s_shadow_cand decl): the candidate's CPS continuation re-entries run
+     * native so the diff exercises every block of the function, not just the
+     * first segment (nested CALLS still run interp on both passes —
+     * s_native_exec=0 above). Never armed during the interp pass, which must
+     * stay pure interp. */
+    s_shadow_cand = c;
+    {
+        int prev_phase = g_exec_phase;
+        g_exec_phase = 2;
+        c->fn(cpu);
+        g_exec_phase = prev_phase;
+    }
     /* CPS shards exit with cpu->pc set to the next tail target. Chain through
      * the normal dispatcher to the original caller return, with s_native_exec=0
      * above so nested overlay calls still run through the interpreter on both
@@ -2143,9 +2263,13 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
             uint32_t tv = cpu->pc;
             if ((tv & 0x1FFFFFFFu) == (stop_ra & 0x1FFFFFFFu)) break;  /* returned */
             cpu->pc = 0;
+            int prev_phase = g_exec_phase;
+            g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
             psx_dispatch_call(cpu, tv, stop_ra);
+            g_exec_phase = prev_phase;
         }
     }
+    s_shadow_cand = NULL;
     CPUState cpuN = *cpu;
     memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
 
@@ -2178,7 +2302,13 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
             s_detail_nat_hi = cpuN.hi; s_detail_nat_lo = cpuN.lo;
             s_detail_int_hi = cpuI.hi; s_detail_int_lo = cpuI.lo;
         }
-        if (s_sdiv_n < SDIV_CAP) {
+        /* Ring-flood guard: one persistently-diverging site must not evict
+         * every other site's records (512x 0xB0 drowned the 0xF514 hunt).
+         * Cap records per address; the divergence COUNTER still increments. */
+        int addr_recs = 0;
+        for (int i = 0; i < s_sdiv_n; i++)
+            if (s_sdiv[i].addr == c->addr && ++addr_recs >= 16) break;
+        if (s_sdiv_n < SDIV_CAP && addr_recs < 16) {
             ShadowDiv *d = &s_sdiv[s_sdiv_n++];
             d->seq = s_shadow_calls; d->addr = c->addr;
             d->reg = reg;
@@ -2203,6 +2333,29 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     s_native_exec  = sv;
     s_suppress_irq = saved_supp;
     s_in_shadow    = 0;
+}
+
+/* Called by deferred_exception_longjmp() (interrupts.c) before it unwinds.
+ * If the longjmp target frame predates a live shadow run (target_epoch <=
+ * s_shadow_epoch), the unwind blows through run_shadow_diff and its epilogue
+ * never runs — restore the shadow-scoped globals here and count the escape.
+ * The dispatch gate (no shadow start while in an exception dispatch) makes
+ * this structurally unreachable; if the counters ever move, that invariant is
+ * broken and must be investigated. An escape during the NATIVE pass
+ * (s_shadow_cand set) additionally means speculative native state leaked into
+ * the live timeline — counted separately; it must stay 0. A longjmp to a
+ * frame armed AFTER shadow start (target_epoch > s_shadow_epoch) is an
+ * exception contained inside the shadow: it lands inside the shadow frame and
+ * the shadow continues — the flags must NOT be touched. */
+void overlay_loader_shadow_escape_fixup(uint64_t target_epoch) {
+    if (!s_in_shadow) return;
+    if (target_epoch > s_shadow_epoch) return;   /* contained: leave armed */
+    s_shadow_escapes++;
+    if (s_shadow_cand != NULL) s_shadow_escapes_native++;
+    s_in_shadow    = 0;
+    s_shadow_cand  = NULL;
+    s_native_exec  = s_shadow_saved_native_exec;
+    s_suppress_irq = s_shadow_saved_supp;
 }
 
 int overlay_loader_dump_shadow_detail(char *out, int cap) {
@@ -2230,10 +2383,15 @@ int overlay_loader_dump_shadow(char *out, int cap) {
     int n = 0;
     n += snprintf(out + n, cap - n,
         "{\"diff_mode\":%d,\"shadow_calls\":%llu,\"divergences\":%llu,"
-        "\"skipped_device\":%llu,\"records\":[",
+        "\"skipped_device\":%llu,\"interior_gated\":%llu,"
+        "\"in_shadow\":%d,\"native_exec\":%d,"
+        "\"escapes\":%u,\"escapes_native\":%u,\"records\":[",
         s_diff_mode, (unsigned long long)s_shadow_calls,
         (unsigned long long)s_shadow_divs,
-        (unsigned long long)s_shadow_skipped_dev);
+        (unsigned long long)s_shadow_skipped_dev,
+        (unsigned long long)s_diffgate_interp,
+        s_in_shadow, s_native_exec,
+        s_shadow_escapes, s_shadow_escapes_native);
     for (int i = 0; i < s_sdiv_n && n < cap - 200; i++) {
         ShadowDiv *d = &s_sdiv[i];
         n += snprintf(out + n, cap - n,
@@ -2345,7 +2503,11 @@ static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_
     if (dirty_ram_text_native_ok(target & 0x1FFFFFFFu)) {
         extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
         cpu->pc = 0;
-        if (psx_dispatch_game_compiled(cpu, target)) {
+        int prev_phase = g_exec_phase;
+        g_exec_phase = 3;
+        int _gc = psx_dispatch_game_compiled(cpu, target);
+        g_exec_phase = prev_phase;
+        if (_gc) {
             if (g_psx_call_bail) return 1;
             if (cpu->pc != 0) return 1;
             if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
@@ -2364,7 +2526,12 @@ static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_
      * interpreter's nonlocal path — handles interp/dirty callees + the return
      * contract internally). */
     cpu->pc = 0;
-    psx_dispatch_call(cpu, target, return_pc);
+    {
+        int prev_phase = g_exec_phase;
+        g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
+        psx_dispatch_call(cpu, target, return_pc);
+        g_exec_phase = prev_phase;
+    }
     if (g_psx_call_bail) return 1;
     if (cpu->pc != 0) return 1;
     return 0;
