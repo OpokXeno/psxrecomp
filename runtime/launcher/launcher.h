@@ -39,6 +39,7 @@ struct GameInfo {
     bool        allow_hybrid     = true;     // offer the "Hybrid" pad mode (false => Analog | D-Pad only)
     bool        lock_mode        = false;    // hide the whole pad-mode selector and force locked_mode (single-pad-type games)
     int         locked_mode      = 2;        // PAD_MODE_DIGITAL; the mode forced when lock_mode is true
+    bool        lock_device      = false;    // hide the Player 1/2 controller cards entirely (fixed, auto-bound pad type; e.g. Ape Escape DualShock)
     bool        ws_offered       = true;     // offer the EXPERIMENTAL Widescreen toggle (false = hidden, game ships 4:3 only)
 
     // Optional "Localization" dropdown. Populated from game.toml

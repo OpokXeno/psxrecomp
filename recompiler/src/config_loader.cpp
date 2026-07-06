@@ -318,6 +318,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (ct.contains("lock_mode")) {
             rt.controller_lock_mode = toml::find<bool>(ct, "lock_mode");
         }
+        if (ct.contains("lock_device")) {
+            rt.controller_lock_device = toml::find<bool>(ct, "lock_device");
+        }
         if (ct.contains("deadzone")) {
             const auto n = toml::find<int64_t>(ct, "deadzone");
             if (n < 0 || n > 32767)

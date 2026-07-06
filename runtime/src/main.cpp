@@ -2004,6 +2004,7 @@ int main(int argc, char** argv) {
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
+    bool ctrl_lock_device  = false; /* game.toml [controller] lock_device; true hides the Player controller cards entirely */
     /* The game-DECLARED port modes, captured at game.toml load and immune to the
      * settings.toml overrides below. Under lock_mode these are the only valid
      * modes (the game supports exactly one pad type), so they are what the
@@ -2112,6 +2113,7 @@ int main(int argc, char** argv) {
             ctrl_locked_p2_mode = gc.runtime.default_p2_mode;
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
+            ctrl_lock_device  = gc.runtime.controller_lock_device;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             /* LEGACY per-game pad-config opt-in (default modern). Only Tomba sets
              * it, so its launcher Hybrid mode's analog<->digital flip doesn't make
@@ -2491,6 +2493,7 @@ int main(int argc, char** argv) {
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
                     ginfo.lock_mode        = ctrl_lock_mode;
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+                    ginfo.lock_device      = ctrl_lock_device;
                     ginfo.ws_offered       = ws_offered;
                     for (const auto& lo : lang_menu_options)
                         ginfo.languages.push_back({ lo.code, lo.label });

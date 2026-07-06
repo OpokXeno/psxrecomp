@@ -273,6 +273,14 @@ struct RuntimeConfig {
     // allow_hybrid (which only hides the Hybrid segment). Default false.
     bool                  controller_lock_mode = false;
 
+    // lock_device: when true the launcher HIDES the Player 1/2 controller cards
+    // entirely (no device picker, no config) — the game's controller type is
+    // fixed and auto-bound. For a title that presents exactly one hardcoded pad
+    // type (e.g. Ape Escape = DualShock analog) where exposing a device/mode
+    // choice is pointless. Distinct from lock_mode (which only hides the pad-mode
+    // segment but keeps the device dropdown). Default false.
+    bool                  controller_lock_device = false;
+
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre
     // dead-band. Absent => runtime default (12000). Overridden per-install by
