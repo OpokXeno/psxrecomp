@@ -2010,6 +2010,7 @@ int main(int argc, char** argv) {
      * runtime clamps to and what the launcher locks its selector to. */
     int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -2077,6 +2078,7 @@ int main(int argc, char** argv) {
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
             gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
+            ws_offered = gc.ws_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -2334,6 +2336,19 @@ int main(int argc, char** argv) {
         p2_mode = ctrl_locked_p2_mode;
     }
 
+    /* [widescreen] offer=false: this title's widescreen is unported/unvalidated,
+     * so the launcher hides its toggle — and, same completeness treatment as
+     * lock_mode above, the runtime clamps the display aspect to native 4:3 here
+     * so a stale persisted 16:9 in settings.toml can't engage the hack in
+     * launcher-less builds either. */
+    if (!ws_offered && (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
+        std::fprintf(stdout, "psxrecomp: widescreen not offered for this title; "
+                     "clamping display aspect %d:%d -> 4:3\n",
+                     g_video_aspect_num, g_video_aspect_den);
+        g_video_aspect_num = 4;
+        g_video_aspect_den = 3;
+    }
+
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
@@ -2462,6 +2477,7 @@ int main(int argc, char** argv) {
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
                     ginfo.lock_mode        = ctrl_lock_mode;
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+                    ginfo.ws_offered       = ws_offered;
                     for (const auto& lo : lang_menu_options)
                         ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());

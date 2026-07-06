@@ -463,6 +463,15 @@ struct GameConfig {
     // default; the env var PSX_WS_FORCE_2D=1 forces it on for testing.
     bool ws_full_2d = false;
 
+    // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
+    // Widescreen toggle for this title. Default true. Set false while a
+    // title's widescreen is unported/unvalidated (e.g. MMX4 at bring-up):
+    // the toggle is hidden in the launcher UI AND the runtime clamps the
+    // display aspect to 4:3 after all config sources, so a stale persisted
+    // 16:9 in settings.toml can never engage the hack. Runtime-only (read at
+    // startup; no codegen impact) — no regen required.
+    bool ws_offered = true;
+
     // [widescreen.bg2d] — pure-2D background tile-loop widen (e.g. MMX6's
     // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
     // whose column count and loop start are rewritten so the loop draws the

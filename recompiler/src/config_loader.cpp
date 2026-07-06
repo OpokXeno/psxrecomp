@@ -642,6 +642,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_sprite_anchor_addr = 0;
     bool ws_hud_sprt_squash = false;
     bool ws_full_2d = false;
+    bool ws_offered = true;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -663,6 +664,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
         if (ws.contains("full_2d"))
             ws_full_2d = toml::find<bool>(ws, "full_2d");
+        if (ws.contains("offer"))
+            ws_offered = toml::find<bool>(ws, "offer");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
@@ -762,6 +765,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
         /*ws_full_2d*/            ws_full_2d,
+        /*ws_offered*/            ws_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
         /*ws_bg2d_startx_site*/   ws_bg2d_startx_site,

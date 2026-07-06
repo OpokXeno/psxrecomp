@@ -429,7 +429,9 @@ void refresh_labels(LauncherModel& m) {
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
-    m.ws_eligible     = true;                     // native-wide works on BOTH backends now (SW + GL compositor)
+    /* ws_eligible is set once at model init from GameInfo.ws_offered ([widescreen]
+     * offer): renderer no longer matters (native-wide works on SW + GL), so
+     * refresh must not overwrite the per-game gate. */
 }
 
 std::string region_long(const std::string& r) {
@@ -697,6 +699,11 @@ Result run(SDL_Window* window, void* gl_context,
     m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
+    // Games whose widescreen is unported/unvalidated declare [widescreen]
+    // offer=false: hide the toggle AND clamp a stale persisted 16:9 back to
+    // 4:3 so the hack can't engage from an old settings.toml.
+    m.ws_eligible    = game.ws_offered;
+    if (!game.ws_offered) m.aspect_index = 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
