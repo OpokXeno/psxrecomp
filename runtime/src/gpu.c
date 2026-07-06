@@ -3042,7 +3042,7 @@ uint16_t gpu_vram_peek(int x, int y) {
     return gr_vram_read(x, y);
 }
 
-void gpu_write_gp0(uint32_t val) {
+static void gpu_write_gp0_body(uint32_t val) {
     gp0_write_count++;
 
     /* State: consuming pixel data for CPU→VRAM transfer */
@@ -3217,6 +3217,18 @@ void gpu_write_gp0(uint32_t val) {
         gp0_words_collected = 1;
         gp0_words_needed = word_count;
     }
+}
+
+/* Wall-time sampler bracket (phase_profile): tag GP0 command processing —
+ * rasterization / batching / VRAM transfer work on the emu thread — as its
+ * own phase so it is separable from the guest code that issued the write.
+ * Covers both the MMIO store chokepoint and DMA channel-2 feeds. */
+void gpu_write_gp0(uint32_t val) {
+    extern int g_exec_phase;
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 4;
+    gpu_write_gp0_body(val);
+    g_exec_phase = prev_phase;
 }
 
 /* ---- GP1 write (0x1F801814 write) ---- */

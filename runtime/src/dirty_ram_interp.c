@@ -210,6 +210,23 @@ extern uint32_t g_debug_last_store_pc;
 int g_dirty_interp_active = 0;
 int dirty_ram_interp_is_active(void) { return g_dirty_interp_active; }
 
+/* Innermost execution phase, for the wall-time sampler (phase_profile).
+ * g_dirty_interp_active is NOT this: it stays 1 across a native overlay call
+ * made from the interpreter's jal/jalr contract (overlay_loader_call_native),
+ * so sampling it reads "inside the dispatch tree", not "interpreting". This
+ * variable is save/set/restored at EVERY backend boundary, so a sample reads
+ * the backend actually executing at that instant:
+ *   0 = host/other (SDL, GPU, top-level dispatch glue, idle)
+ *   1 = dirty-RAM interpreter (exec_one body / precise slice)
+ *   2 = native overlay shard (gcc DLL or sljit)
+ *   3 = compiled static text (game EXE / recompiled BIOS, incl. IRQ handler)
+ *   4 = GPU GP0 command processing (gpu.c — raster/batch/VRAM-transfer work)
+ * Longjmp contract mirrors g_dirty_interp_active: exception delivery saves it
+ * at entry and restores after its setjmp loop (interrupts.c), so a skipped
+ * inner restore self-heals at the next bracket. */
+int g_exec_phase = 0;
+int psx_exec_phase(void) { return g_exec_phase; }
+
 /* TCP-armed instruction-window capture (native↔interp divergence drill).
  * g_insn_gate_*: an extra runtime-settable PC range that the per-insn log
  * records (on top of the hardwired kernel ranges). Freeze latch: on the Nth
@@ -667,7 +684,12 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t return_pc,
                                   uint32_t *next_pc_out) {
     cpu->pc = 0;
-    psx_dispatch_call(cpu, target, return_pc);
+    {
+        int prev_phase = g_exec_phase;
+        g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
+        psx_dispatch_call(cpu, target, return_pc);
+        g_exec_phase = prev_phase;
+    }
     /* psx_dispatch_call validated the (return_pc, sp) contract; a bail
      * unwind in progress surfaces with cpu->pc = the guest's true target. */
     if (g_psx_call_bail) return 1;
@@ -1050,7 +1072,10 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     }
     g_mixed_depth++;
     ls_func_enter(target, cpu);
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 3;
     int r = psx_dispatch_game_compiled(cpu, target);
+    g_exec_phase = prev_phase;
     ls_func_exit(target, cpu, r);
     g_mixed_depth--;
     return r;
@@ -1757,6 +1782,8 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     else if (addr == 0x80046264u) site_note(&g_site_dd264);   /* loop tail re-dispatch */
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
 
     /* pc=0 producer tripwire: the dirty path reported "handled" yet published a
@@ -1820,6 +1847,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     }
 
     g_dirty_interp_active = prev;
+    g_exec_phase = prev_phase;
     return r;
 }
 
@@ -1873,8 +1901,10 @@ static int precise_pc_dispatchable(uint32_t pc) {
 static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
     int prev_precise = g_precise_mode;
     int prev_active  = g_dirty_interp_active;
+    int prev_phase   = g_exec_phase;
     g_precise_mode = 1;
     g_dirty_interp_active = 1;
+    g_exec_phase = 1;
 
     uint32_t pc = cpu->pc;
     g_slice_last_block    = pc;
@@ -2021,6 +2051,7 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
 #endif
     g_precise_mode = prev_precise;
     g_dirty_interp_active = prev_active;
+    g_exec_phase = prev_phase;
 }
 
 /* Block-leader slice guard, called by the emitted prologue of every compiled
@@ -2109,7 +2140,10 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         g_mixed_depth++;
         {
             ls_func_enter(addr, cpu);
+            int prev_phase = g_exec_phase;
+            g_exec_phase = 3;
             int _gc = psx_dispatch_game_compiled(cpu, addr);
+            g_exec_phase = prev_phase;
             ls_func_exit(addr, cpu, _gc);
             g_mixed_depth--;
             if (_gc) return 1;
