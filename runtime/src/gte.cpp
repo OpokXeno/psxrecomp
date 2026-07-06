@@ -189,6 +189,26 @@ extern "C" void gte_ws_get_sz_stats(int* mn, int* mx, unsigned* n, unsigned* far
     s_ws_sz_min = 0x7FFFFFFF; s_ws_sz_max = 0; s_ws_sz_n = 0; s_ws_sz_far = 0;
 }
 
+// ---- Native-wide sky-DOME expand ------------------------------------------
+// In native-wide (mode 2) the GTE is fed identity (no squash) so the world
+// fills the wider FOV via the cull widening. But a sky DOME is a FINITE mesh
+// authored to fill 4:3 — its curved edge falls short of the wider frame corners
+// (black corners). Fix: scale the FAR-depth vertices' projected X OUTWARD from
+// the projection centre (OFX) by the frame-widening ratio (3*num)/(4*den) — the
+// inverse of the squash — so the dome grows to cover the wider FOV. DEPTH-GATED
+// (SZ >= s_ws_far_threshold) so only the farthest layer (the sky) expands while
+// nearer world geometry stays put. On + ratio set from main.cpp when native-
+// wide engages; threshold tuned live via ws_far_threshold. Off => identity.
+static int      s_ws_dome_on  = 0;
+static int32_t  s_ws_dome_num = 1, s_ws_dome_den = 1;  // expand = num/den (>1)
+extern "C" void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den) {
+    s_ws_dome_on = on ? 1 : 0;
+    // widen ratio = wide_w / disp_w = (aspect/(4:3)) = (3*num)/(4*den).
+    int32_t n = 3 * aspect_num, d = 4 * aspect_den;
+    if (n <= 0 || d <= 0 || n <= d) { s_ws_dome_num = s_ws_dome_den = 1; return; }
+    s_ws_dome_num = n; s_ws_dome_den = d;
+}
+
 extern "C" void gte_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { s_ws_xnum = s_ws_xden = 1; return; }
     // squash = (4/3) / (num/den) = (4*den) / (3*num); identity for 4:3.
@@ -250,6 +270,20 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     }
     if (do_squash)
         xterm = xterm * s_ws_xnum / s_ws_xden;
+    // Native-wide sky-dome expand: no squash active (identity), dome mode on,
+    // this frame is stretched, and the vertex is far (sky). Scale X outward from
+    // the projection centre so the finite dome mesh reaches the wider frame.
+    else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
+             !gpu_ws_present_native_43()) {
+        int32_t sz = gte->SZ[3];
+        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+        s_ws_sz_n++;
+        if (sz >= s_ws_far_threshold) {
+            xterm = xterm * s_ws_dome_num / s_ws_dome_den;
+            s_ws_sz_far++;
+        }
+    }
     int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
     gte->push_sxy(sx, sy);

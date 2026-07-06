@@ -6653,6 +6653,20 @@ static void handle_ws_far_threshold(int id, const char *json)
              id, gte_ws_get_far_threshold(), mn, mx, n, far_n);
 }
 
+/* ws_dome on=<0|1> [num=<W> den=<H>]: native-wide sky-DOME expand. Scales far-
+ * depth (SZ >= ws_far_threshold) GTE X outward from the projection centre by
+ * (3*num)/(4*den) so a finite sky dome grows to fill the wider FOV. Tune the
+ * depth split with ws_far_threshold (its sz_far count = verts being expanded). */
+extern void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den);
+static void handle_ws_dome(int id, const char *json)
+{
+    int on  = json_get_int(json, "on", 1);
+    int num = json_get_int(json, "num", 16);
+    int den = json_get_int(json, "den", 9);
+    gte_ws_set_dome_expand(on, num, den);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"num\":%d,\"den\":%d}", id, on ? 1 : 0, num, den);
+}
+
 static void handle_ws_census(int id, const char *json)
 {
     char act[16] = {0};
@@ -11057,6 +11071,7 @@ static const CmdEntry s_commands[] = {
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
+    { "ws_dome",           handle_ws_dome },
     { "ws_census",         handle_ws_census },
     { "mmx6_freshfix",     handle_mmx6_freshfix },
     { "mmx6_reveal",       handle_mmx6_reveal },
