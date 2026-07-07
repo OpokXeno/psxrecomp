@@ -1157,6 +1157,20 @@ void psx_check_interrupts(CPUState* cpu) {
              * resume-PC latch; clear it so the next thread's block-leader delivery
              * recomputes real_pc cleanly rather than inheriting a stale value. */
             s_compiled_interrupt_resume_pc = 0;
+            /* This escape uses g_scheduler_jmpbuf (unwinding to psx_scheduler_run),
+             * NOT exception_jmpbuf — so it BYPASSES the landing above that restores
+             * g_dirty_interp_active (line ~985) and, crucially, the g_dirty_interp_active
+             * restore in dirty_ram_dispatch's wrapper (dirty_ram_interp.c ~1822).
+             * When this psx_check_interrupts was invoked from the dirty-RAM interpreter
+             * entry poll (dirty_ram_interp.c: poll every 64 entries), that wrapper's
+             * `prev` was 1, so the flag is currently 1 and would LEAK as 1 across the
+             * unwind — the next thread then mis-tags execution as dirty-interp and
+             * hard-wedges (Ape Escape memcard scene). We are abandoning the entire
+             * dirty-interp dispatch here, so the flag MUST be 0, exactly as the
+             * documented "cleared at the longjmp landing" contract (dirty_ram_interp.c
+             * ~205-210) requires. Call-site-agnostic: from compiled code the flag was
+             * already 0, so this is a no-op there. */
+            g_dirty_interp_active = 0;
             g_sched_escape.target_tcb = exit_tcb;
             g_sched_escape.resume_pc  = 0;
             g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;

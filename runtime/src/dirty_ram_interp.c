@@ -2232,7 +2232,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * registers restored, so continuing the loop afterward is safe. */
     {
         static uint32_t s_interp_entry_poll = 0;
-        if ((++s_interp_entry_poll & 0x3Fu) == 0) {
+        static int s_entry_poll_enabled = -1;   /* DIAGNOSTIC toggle (590c236 x kind-30 escape regression hunt) */
+        if (s_entry_poll_enabled < 0) {
+            const char* e = getenv("PSX_DIRTY_ENTRY_POLL");
+            s_entry_poll_enabled = (e && e[0] == '0') ? 0 : 1;
+        }
+        if (s_entry_poll_enabled && (++s_interp_entry_poll & 0x3Fu) == 0) {
             cpu->pc = pc;
             psx_check_interrupts(cpu);
         }
