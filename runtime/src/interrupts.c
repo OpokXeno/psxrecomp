@@ -68,6 +68,13 @@ typedef struct {
     uint32_t ra_exit;      /* cpu->gpr[31] at exit before restore decision */
     uint32_t ra_saved;     /* saved_gpr[31] */
     uint32_t redirects;    /* jmp_val==2 RestoreState redirects in this delivery */
+    /* Ape memcard native<->interp resume-desync probe: the live sp and the
+     * dirty pump-site at IRQ ENTRY. The interrupted-thread TCB save captures
+     * exactly this (resume_pc=take_pc, sp=entry_sp); a pair where take_pc is a
+     * dirty return point but entry_sp belongs to a native callee's frame is the
+     * corrupt snapshot (0x801384AC paired with 0x801EFE80). */
+    uint32_t entry_sp;     /* cpu->gpr[29] at exception entry */
+    uint32_t pump_site;    /* g_cosim_dirty_pump_site at entry (which delivery path) */
 } IrqCtxEntry;
 IrqCtxEntry g_irqctx_ring[IRQCTX_RING_CAP];
 uint64_t    g_irqctx_seq = 0;
@@ -861,6 +868,9 @@ void psx_check_interrupts(CPUState* cpu) {
             e->exit_pc = 0; e->exit_reason = 0; e->same_thread = 0;
             e->restored = 0; e->v1_exit = 0; e->v1_saved = 0;
             e->ra_exit = 0; e->ra_saved = 0; e->redirects = 0;
+            e->entry_sp   = cpu->gpr[29];
+            { extern int g_cosim_dirty_pump_site;
+              e->pump_site = (uint32_t)g_cosim_dirty_pump_site; }
         }
     }
 
