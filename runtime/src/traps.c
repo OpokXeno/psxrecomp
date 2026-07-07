@@ -348,6 +348,34 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
     return cpu->gpr[26];
 }
 
+/* Deferred cooperative thread switch (Ape Escape memcard fix #2).
+ *
+ * A genuine in-exception ChangeThread (interrupts.c kind-30) must be honored at
+ * the OUTERMOST dispatch boundary, never mid-nested-host-dispatch: only at the
+ * outermost boundary is the interrupted thread's guest state fully materialized
+ * in CPUState (cpu->pc == the true block PC, GPRs live) rather than split across
+ * a stale resume-PC latch + the host C call stack. Switching mid-nest saves a
+ * poisoned TCB context (latched PC ahead of the live registers) → the resumed
+ * thread dispatches a jumptable with a smeared index → misaligned DISPATCH FATAL.
+ *
+ * These thin exports let the interrupt path (interrupts.c) re-save the deferred
+ * thread cleanly and re-point PCB[0] at the outermost boundary, using the same
+ * TCB layout the scheduler save/restore already owns. */
+void psx_sched_save_context(CPUState* cpu, uint32_t tcb, uint32_t resume_pc)
+{
+    psx_save_context_to_tcb(cpu, tcb, resume_pc);
+}
+
+void psx_sched_set_current_tcb(CPUState* cpu, uint32_t tcb)
+{
+    psx_set_current_tcb(cpu, tcb);
+}
+
+uint32_t psx_sched_current_tcb(CPUState* cpu)
+{
+    return psx_current_tcb_ptr(cpu);
+}
+
 typedef struct HostThreadFiber {
     uint32_t tcb;
     psx_fiber_t fiber;
