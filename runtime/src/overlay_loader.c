@@ -1059,6 +1059,41 @@ static int      s_irq_defer_cdrom = 0;
 extern uint32_t i_stat;
 extern uint32_t i_mask;
 
+/* Nested call-unit depth (Ape memcard native<->interp resume-desync fix).
+ *
+ * When the dirty interpreter (or a shard) issues a guest jal/jalr to a callee
+ * run as a UNIT — an overlay-native shard (overlay_loader_call_native) OR a
+ * non-local dirty/kernel routine (dispatch_nonlocal_call -> psx_dispatch_call) —
+ * that callee must be ATOMIC w.r.t. the cooperative thread switch, exactly like
+ * statically-compiled code (psx_dispatch_impl checks interrupts ONLY at the
+ * outermost dispatch return; a nested callee never interrupts before its caller
+ * runs the post-call continuation). Both the overlay CI wrappers AND the dirty
+ * per-transfer IRQ pumps, however, checked interrupts at EVERY block/transfer
+ * regardless of nesting; an IRQ + cooperative ChangeThread landing inside such a
+ * nested unit suspended the interrupted thread with an INCONSISTENT snapshot
+ * (resume PC at the caller's post-call point, sp still mid-callee) -> a leaked
+ * stack frame that compounded across cooperative cycles into a smeared jumptable
+ * index (the Ape "Checking MEMORY CARD" softlock/fatal). While this depth is >0
+ * both backends defer the IRQ check; the callee runs to completion, then the
+ * enclosing top-level dirty pump / outermost dispatch return delivers the IRQ at
+ * a consistent (pc, sp) boundary. The TOP-LEVEL flow (depth 0) still pumps IRQs,
+ * so the consumer's poll loop and long overlay game-loops keep their
+ * responsiveness. Incremented only when the A/B toggle is on (below). */
+int g_call_unit_depth = 0;
+
+/* A/B toggle for the nested-unit IRQ deferral (PSX_OVERLAY_UNIT_DEFER, default
+ * ON). Gates the depth INCREMENTS (so =0 leaves g_call_unit_depth at 0 and
+ * nothing defers — the pre-fix behavior), letting us attribute a behavior change
+ * to this fix without a rebuild. */
+int overlay_unit_defer_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("PSX_OVERLAY_UNIT_DEFER");
+        cached = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) ? 0 : 1;
+    }
+    return cached;
+}
+
 void overlay_loader_set_irq_suppress(int mode, uint32_t ratelimit) {
     s_suppress_irq  = mode ? 1 : 0;
     s_irq_ratelimit = ratelimit;
@@ -1098,6 +1133,9 @@ static int overlay_irq_suppressed_now(void) {
 }
 
 static void overlay_ci_wrapper(CPUState *cpu) {
+    /* Defer while inside a nested call unit — a callee must not interrupt
+     * mid-call (static-call atomicity). See g_call_unit_depth. */
+    if (g_call_unit_depth > 0) return;
     if (overlay_irq_suppressed_now()) return;
     if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
         uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
@@ -1110,6 +1148,10 @@ static void overlay_ci_wrapper(CPUState *cpu) {
 }
 
 static void overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
+    /* Defer while inside a nested call unit (see g_call_unit_depth): suspending
+     * here would save resume_pc at the callee's block leader while the enclosing
+     * dirty caller expects an atomic unit — the resume-desync bug. */
+    if (g_call_unit_depth > 0) return;
     if (overlay_irq_suppressed_now()) return;
     if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
         uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
@@ -2260,7 +2302,17 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
     if (idx_head(phys) < 0) return 0;        /* fast reject: not a candidate */
     uint32_t in_regs[34];
     overlay_regs_snap(in_regs, cpu);
-    if (!overlay_loader_dispatch(cpu, addr)) return 0;
+    /* Run the callee as an atomic UNIT: IRQ delivery is deferred inside it (both
+     * the overlay CI wrappers and the dirty IRQ pumps check g_call_unit_depth) so
+     * a cooperative ChangeThread cannot suspend the interrupted thread mid-callee
+     * with an inconsistent (resume_pc, sp) snapshot. Restore (not just decrement)
+     * so a bail/longjmp-out unwinds the depth correctly; the scheduler landing
+     * also resets it to 0 as a backstop. Gated by the A/B toggle. */
+    int prev_unit_depth = g_call_unit_depth;
+    if (overlay_unit_defer_enabled()) g_call_unit_depth = prev_unit_depth + 1;
+    int ran = overlay_loader_dispatch(cpu, addr);
+    g_call_unit_depth = prev_unit_depth;
+    if (!ran) return 0;
     overlay_fp_log(addr, in_regs, cpu, 1);
     return 1;
 }

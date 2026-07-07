@@ -707,6 +707,11 @@ void psx_scheduler_run(CPUState* cpu)
              * with in_exception==0), so interrupt state needs no fixup here. */
             g_psx_dispatch_depth = 0;
             g_psx_call_bail      = 0;
+            /* A longjmp-out through a nested call unit (overlay_loader_call_native
+             * or dispatch_nonlocal_call) would skip its depth restore; clear the
+             * nested-unit gate so IRQ checks are not wedged-off after the escape
+             * (backstop for the Ape memcard native<->interp fix). */
+            { extern int g_call_unit_depth; g_call_unit_depth = 0; }
         }
 
         switch (g_sched_escape.reason) {
