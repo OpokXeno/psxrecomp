@@ -1282,17 +1282,64 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always)
  * (stick -> analog, D-pad -> digital) so the game runs its own analog or
  * digital input path exactly as on hardware (mirrors the inline block this
  * helper was extracted from for the low-latency re-sample). */
-/* Dev builds (PSX_DEBUG_TOOLS — the dev/debug configuration) ALWAYS feed the
- * keyboard into Player 1 alongside whatever device the launcher routed to port 1,
- * so a tester can drive the game from EITHER the keyboard OR the selected
- * controller (e.g. a DualShock) at the same time, with no reconfiguration. The
- * keyboard map and the controller are merged (active-low AND) onto the P1 pad
- * word. Release builds keep the single launcher-selected device per port. */
-#if defined(PSX_DEBUG_TOOLS)
-static const bool g_dev_kb_p1 = true;
-#else
-static const bool g_dev_kb_p1 = false;
-#endif
+/* Dev input mode: while enabled, Player 1 is driven by the keyboard AND EVERY
+ * connected game controller, all merged together (active-low AND) onto the P1 pad
+ * word — so a tester can navigate P1 from whatever is plugged in (keyboard, the
+ * launcher-assigned pad, or any other controller) with no reconfiguration. The P1
+ * pad TYPE is left unchanged: a launcher-assigned analog DualShock still presents
+ * as analog (so the game's analog input path / SIO handshake cadence is preserved
+ * exactly), and merged sources only contribute button/stick STATE, never a type
+ * downgrade. Controlled by PSX_DEV_INPUT (default ON for the dev workflow); set
+ * PSX_DEV_INPUT=0 to restore strict single-device-per-port routing. */
+static bool dev_any_input_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = std::getenv("PSX_DEV_INPUT");
+        cached = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F')) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Merge (active-low AND) the button words of every connected game controller.
+ * Handles are resolved from SDL's already-open set when possible and opened once
+ * on first sight otherwise (kept open for the process lifetime; if a slot later
+ * closes a shared device this self-heals by reopening next frame). This does NOT
+ * disturb per-slot routing — SDL returns the same handle for an already-open
+ * device, so reads are shared and harmless. */
+static uint16_t dev_all_controllers_buttons() {
+    uint16_t btn = 0xFFFF;
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
+        if (!h) h = SDL_GameControllerOpen(i);   /* open once; SDL keeps it */
+        if (h) btn &= controller_pad_buttons(h);
+    }
+    return btn;
+}
+
+/* Fold the first live (non-neutral) left/right stick from ANY connected
+ * controller into st[] (lx,ly,rx,ry). Lets an analog-mode P1 steer from
+ * whatever pad is plugged in, not only the launcher-assigned one. Only axes
+ * that read past the deadzone override; a neutral pad leaves st[] untouched. */
+static void dev_any_controller_sticks(uint8_t st[4]) {
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
+        if (!h) h = SDL_GameControllerOpen(i);
+        if (!h) continue;
+        uint8_t lx, ly, rx, ry;
+        axes_to_pad_pair(SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTY), &lx, &ly);
+        axes_to_pad_pair(SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_RIGHTY), &rx, &ry);
+        if (lx != 0x80 || ly != 0x80) { st[0] = lx; st[1] = ly; }
+        if (rx != 0x80 || ry != 0x80) { st[2] = rx; st[3] = ry; }
+    }
+}
 
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
@@ -1302,18 +1349,32 @@ static void sample_pad_into_sio(int override) {
     for (int s = 0; s < 2; s++) {
         PlayerInput& p = g_players[s];
         const int  player  = s + 1;             /* keybinds.ini section (1|2) */
-        const bool kb_here = (g_dev_kb_p1 && s == 0);
-        if (p.kind == 0 && !kb_here) continue;  /* no device in this port */
+        /* Dev input: P1 is driven by the keyboard AND every connected controller,
+         * so a tester can navigate from whatever is plugged in (P2 keeps strict
+         * per-port routing). */
+        const bool dev_here = (dev_any_input_enabled() && s == 0);
+        if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
 
         /* Buttons: merge the assigned device with the keyboard (PSX pad word is
-         * active-low, so AND combines "pressed on either source"). */
+         * active-low, so AND combines "pressed on either source"). In dev mode P1
+         * also folds in the keyboard binds and EVERY connected controller. */
         uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
-        if (kb_here) btn &= pad_from_keyboard(1);  /* dev keyboard drives P1 binds */
+        if (dev_here) {
+            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
+            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
+        }
         sio_set_pad_state_slot(s, btn);
 
-        /* Resolve the pad type this frame from the player's mode (a port driven
-         * by the keyboard alone presents as a digital pad). */
-        const int mode = (p.kind != 0) ? p.mode : (int)PSXRecompV4::PAD_MODE_DIGITAL;
+        /* Resolve the pad type this frame. An assigned device keeps its configured
+         * mode (a launcher-selected analog DualShock stays analog, so its input
+         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
+         * device but dev-any-input on presents as HYBRID — boots analog like a
+         * DualShock and auto-drops to digital on the d-pad — so any plugged
+         * controller and the keyboard both navigate. */
+        int mode;
+        if (p.kind != 0)      mode = p.mode;
+        else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+        else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
         int eff_analog;
         uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
         if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
@@ -1323,15 +1384,17 @@ static void sample_pad_into_sio(int override) {
             pad_sticks_for(p, player, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
             if (hybrid_stick_active(p))                       p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, player, kb_here))  p.hybrid_analog = false;
+            else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
             if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
-        /* In dev builds also fold the keyboard's stick binds onto the analog
-         * stick, so an analog-mode P1 still steers from the keyboard (P1 binds). */
-        if (kb_here && eff_analog) {
+        /* Dev mode: fold the keyboard's stick binds AND any connected controller's
+         * sticks onto the analog stick, so an analog-mode P1 steers from whatever
+         * is plugged in (P1 binds). */
+        if (dev_here && eff_analog) {
             const Uint8* keys = SDL_GetKeyboardState(NULL);
             psx_keybinds_sticks(keys, 1, st);
+            dev_any_controller_sticks(st);
         }
         /* Push sticks every frame; request the pad type (digital/analog) through
          * the coherent channel so a hybrid stick<->d-pad flip is applied only at
@@ -2003,10 +2066,11 @@ int main(int argc, char** argv) {
     bool memcard2_enabled = true;
     /* [controller] device routing (defaults: P1 keyboard/digital, P2 none). */
     /* Dev builds default Player 1 to the first connected controller ("auto"):
-     * combined with the always-on keyboard merge (g_dev_kb_p1) this means the
-     * selected controller AND the keyboard both drive P1 with no launcher setup.
-     * If no controller is present, "auto" opens nothing and the keyboard merge
-     * still drives P1. Release keeps "keyboard" (the launcher assigns devices). */
+     * combined with dev-any-input (dev_any_input_enabled(), default ON) the
+     * selected controller, EVERY other plugged-in controller, AND the keyboard
+     * all drive P1 with no launcher setup. If no controller is present, "auto"
+     * opens nothing and the keyboard/any-controller merge still drives P1.
+     * Release keeps "keyboard" (the launcher assigns devices). */
 #if defined(PSX_DEBUG_TOOLS)
     std::string p1_device = "auto";
 #else
@@ -2660,10 +2724,10 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_mode);
     set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
-        /* Dev builds keep P1 connected even with no controller so the always-on
-         * keyboard (g_dev_kb_p1) can drive port 1 standalone. */
-        const bool kb_p1 = (g_dev_kb_p1 && s == 0);
-        sio_set_pad_connected(s, (g_players[s].kind != 0 || kb_p1) ? 1 : 0);
+        /* Dev-any-input keeps P1 connected even with no assigned controller so the
+         * keyboard / any plugged-in controller can drive port 1 standalone. */
+        const bool dev_p1 = (dev_any_input_enabled() && s == 0);
+        sio_set_pad_connected(s, (g_players[s].kind != 0 || dev_p1) ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(g_players[s].mode), 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs
