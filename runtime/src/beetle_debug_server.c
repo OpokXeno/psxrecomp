@@ -150,6 +150,7 @@ extern int beetle_spu_get_global_state(
 #include "beetle_history.h"
 #include "parity_trace.h"
 #include "device_trace.h"
+#include "png_write.h"   /* png_write_rgb — shared PNG encoder (matches runtime) */
 extern void beetle_history_get_bounds(uint64_t *out_count,
                                        uint64_t *out_oldest,
                                        uint64_t *out_newest);
@@ -397,48 +398,32 @@ static void h_vram_peek(int id, const char *json) {
 static void h_screenshot_file(int id, const char *json) {
     char path[512] = {0};
     if (!json_get_str(json, "path", path, sizeof(path))) {
-        strncpy(path, "psx_screenshot.bmp", sizeof(path) - 1);
+        strncpy(path, "psx_screenshot.png", sizeof(path) - 1);
     }
     uint32_t *pixels = NULL;
     unsigned w = 0, h = 0;
     if (!beetle_get_framebuffer(&pixels, &w, &h) || !pixels || w == 0 || h == 0) {
         send_err(id, "no frame"); return;
     }
-    /* BMP write (XRGB8888 → 24bpp BGR for portability). */
-    FILE *f = fopen(path, "wb");
-    if (!f) { send_err(id, "fopen"); return; }
-    int row_bytes = ((int)w * 3 + 3) & ~3;
-    int img_size = row_bytes * (int)h;
-    uint8_t hdr[54] = {0};
-    hdr[0] = 'B'; hdr[1] = 'M';
-    int filesz = 54 + img_size;
-    hdr[2] = filesz & 0xFF; hdr[3] = (filesz >> 8) & 0xFF;
-    hdr[4] = (filesz >> 16) & 0xFF; hdr[5] = (filesz >> 24) & 0xFF;
-    hdr[10] = 54;
-    hdr[14] = 40;
-    hdr[18] = w & 0xFF; hdr[19] = (w >> 8) & 0xFF;
-    hdr[20] = (w >> 16) & 0xFF; hdr[21] = (w >> 24) & 0xFF;
-    /* height stored positive → bottom-up rows */
-    hdr[22] = h & 0xFF; hdr[23] = (h >> 8) & 0xFF;
-    hdr[24] = (h >> 16) & 0xFF; hdr[25] = (h >> 24) & 0xFF;
-    hdr[26] = 1; hdr[28] = 24;
-    hdr[34] = img_size & 0xFF; hdr[35] = (img_size >> 8) & 0xFF;
-    hdr[36] = (img_size >> 16) & 0xFF; hdr[37] = (img_size >> 24) & 0xFF;
-    fwrite(hdr, 1, 54, f);
-    uint8_t *row = (uint8_t*)malloc(row_bytes);
-    if (!row) { fclose(f); send_err(id, "alloc"); return; }
-    memset(row, 0, row_bytes);
-    for (int y = (int)h - 1; y >= 0; y--) {
+    /* PNG write (XRGB8888 → 24bpp top-down RGB), matching the runtime's
+     * screenshot format so both backends emit the same viewer-friendly PNG. */
+    uint8_t *rgb = (uint8_t*)malloc((size_t)w * h * 3);
+    if (!rgb) { send_err(id, "alloc"); return; }
+    for (unsigned y = 0; y < h; y++) {
         for (unsigned x = 0; x < w; x++) {
-            uint32_t px = pixels[y * w + x];
-            row[x*3 + 0] = (px      ) & 0xFF; /* B */
-            row[x*3 + 1] = (px >>  8) & 0xFF; /* G */
-            row[x*3 + 2] = (px >> 16) & 0xFF; /* R */
+            uint32_t px = pixels[(size_t)y * w + x];
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = (px >> 16) & 0xFF; /* R */
+            p[1] = (px >>  8) & 0xFF; /* G */
+            p[2] = (px      ) & 0xFF; /* B */
         }
-        fwrite(row, 1, row_bytes, f);
     }
-    free(row);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "fopen"); return; }
+    int ok = png_write_rgb(f, rgb, w, h);
     fclose(f);
+    free(rgb);
+    if (!ok) { send_err(id, "png encode failed"); return; }
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}\n",
              id, path, w, h);
 }
