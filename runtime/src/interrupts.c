@@ -1035,6 +1035,37 @@ void psx_check_interrupts(CPUState* cpu) {
      * so the EPC-sentinel longjmp can't leave the flag wrong. */
     int prev_interp_active = g_dirty_interp_active;
     g_dirty_interp_active = 0;
+    /* Ape memcard fix #3 (2026-07-07): clear the dirty-interp resume-PC latch
+     * across the handler dispatch, exactly like g_dirty_interp_active above.
+     *
+     * The interrupted dirty block set g_dirty_safe_resume_pc = its committed PC
+     * and left it LIVE across its own psx_check_interrupts call (the dirty pump
+     * only restores it AFTER that call returns). Without clearing it here, a
+     * NESTED interrupt taken inside the handler — e.g. a VBLANK delivered while
+     * the kernel's async-poll memory-card callback runs (in_exception, IEc
+     * re-enabled) — inherits the OUTER interrupted block's stale resume PC as its
+     * EPC. same-thread-restore then matches (cpu->pc == that stale EPC) and
+     * resumes the OUTER block with the CALLBACK's registers: the Ape memcard
+     * consumer at 0x801382CC gets v1 (jumptable index) = the callback's pointer
+     * 0x800B4E30, bounds-check already passed, `jr jumptable[garbage]` faults
+     * (DISPATCH FATAL misaligned 0x3) — or, in the soft variant, drives a wrong
+     * branch that skips DeliverEvent(0xF0000011,4) and the card scene wedges.
+     * (irqctx_ring proof: exit_pc=0x801382CC, ra_saved=0x80010094 [callback],
+     * v1_saved=0x800B4E30, restored=1.)
+     *
+     * Cleared here so a nested delivery latches the ACTUALLY-running code's PC:
+     * the callback's own dirty pump re-sets g_dirty_safe_resume_pc for its
+     * blocks, and compiled handler code uses s_compiled_interrupt_resume_pc.
+     * Restored after the dispatch loop (below), which the RFE/escape longjmp
+     * lands in — so the escape can't leave the latch wrong. A/B off:
+     * PSX_EXC_CLEAR_RESUME_LATCH=0. */
+    static int s_clear_resume_latch = -1;
+    if (s_clear_resume_latch < 0) {
+        const char *e = getenv("PSX_EXC_CLEAR_RESUME_LATCH");
+        s_clear_resume_latch = (e && *e) ? atoi(e) : 1;
+    }
+    uint32_t saved_dirty_resume_pc = g_dirty_safe_resume_pc;
+    if (s_clear_resume_latch) g_dirty_safe_resume_pc = 0;
     /* Dispatch-depth contract across the async handler (Tomba 2 splash, post
      * overlay-floor fix). The interrupt can be delivered from a NESTED dispatch
      * (the local-flow pump runs inside dirty_ram_dispatch at depth > 0). The
@@ -1075,6 +1106,11 @@ void psx_check_interrupts(CPUState* cpu) {
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
     g_dirty_interp_active = prev_interp_active;
+    /* Ape memcard fix #3: restore the resume-PC latch cleared at handler entry
+     * (see above). Sits with the other post-dispatch-loop restores so an
+     * RFE/RestoreState longjmp — which lands in the setjmp loop above — can't
+     * strand it at 0. */
+    if (s_clear_resume_latch) g_dirty_safe_resume_pc = saved_dirty_resume_pc;
     /* Restore the interrupted code's dispatch nesting (see save above). The
      * handler's frames were unwound by longjmp without decrementing, so the
      * live counter is meaningless here — overwrite, don't decrement. */
