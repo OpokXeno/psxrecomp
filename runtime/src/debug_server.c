@@ -11519,7 +11519,32 @@ void debug_server_init(int port)
     s_wtrace_ranges[14].hi = 0x00066BD0u;
     s_wtrace_ranges[15].lo = 0x00097420u; /* movie/frame handoff state */
     s_wtrace_ranges[15].hi = 0x00097430u;
-    s_wtrace_range_count = 16;
+    /* Ape LOAD-GAME higher-layer (libcard + game card-manager) always-on
+     * capture. Oracle diff (2026-07-07 session 3) proved the low-level card
+     * protocol succeeds on both runtimes, but ours stays in top-scene 1
+     * ("Checking") while Beetle advances to scene 4 (file-select). These cells
+     * are the higher-layer state that diverges; capturing every writer from
+     * boot (never probe-time armed) attributes WHICH libcard op-state stalls
+     * and what completion it awaits. Masked-physical (KUSEG) addresses.
+     *   0x800b4e30 = libcard op struct field 0 (count/op-state; 0 ours vs 1 Beetle)
+     *   0x800b4e50 = save-name ptr + filename buffer ("bu00:BASCUS-94423SYS" on Beetle, zeros ours)
+     *   0x800b4ed0 = libcard op-handler ptr (0x80020f4c ours vs 0x80020bc8 Beetle)
+     *   0x800e3880 = SCENE (no-op flip-flop) + 0x800e3884 = TRIG (= top-scene index; 1 ours vs 4 Beetle)
+     *   0x8013af50 = game card-menu substate block (0x8013af56 = 0 ours vs 1 Beetle)
+     *   0x00007264 = kernel card-driver per-state byte M8[0x7264] (handoff: stuck at 1) */
+    s_wtrace_ranges[16].lo = 0x000B4E2Cu;
+    s_wtrace_ranges[16].hi = 0x000B4E40u;
+    s_wtrace_ranges[17].lo = 0x000B4E50u;
+    s_wtrace_ranges[17].hi = 0x000B4E68u;
+    s_wtrace_ranges[18].lo = 0x000B4ECCu;
+    s_wtrace_ranges[18].hi = 0x000B4ED4u;
+    s_wtrace_ranges[19].lo = 0x000E3880u;
+    s_wtrace_ranges[19].hi = 0x000E3888u;
+    s_wtrace_ranges[20].lo = 0x0013AF50u;
+    s_wtrace_ranges[20].hi = 0x0013AF60u;
+    s_wtrace_ranges[21].lo = 0x00007260u;
+    s_wtrace_ranges[21].hi = 0x00007270u;
+    s_wtrace_range_count = 22;
 
     s_wtrace_boot_ranges[0].lo = 0x00097420u; /* movie/frame handoff state */
     s_wtrace_boot_ranges[0].hi = 0x00097430u;
