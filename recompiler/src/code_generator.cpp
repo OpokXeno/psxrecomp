@@ -2527,6 +2527,43 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
         }
 
         GeneratedFunction gen_func = generate_function(func, cfg, fallthrough_name);
+
+        // EXPERIMENT (PSX_EMIT_PROD): a "function" whose body is overwhelmingly
+        // untranslatable (TODO-opcode) words is a data region that discovery's
+        // primary-opcode-only validity check let slip through as code (valid
+        // primary opcode, garbage sub-field). Re-emit it as the same compact,
+        // fail-closed data stub used for is_data_section — if it is ever
+        // dispatched (it should not be: real reachable code never hits a TODO)
+        // psx_unknown_dispatch fatals LOUDLY rather than silently no-op'ing.
+        // Default OFF => byte-identical to the full-scan baseline. The proper
+        // productionization deepens discovery's validity check (sub-field aware)
+        // in function_analysis; this downstream heuristic just measures the win.
+        static int s_emit_prod = -1;
+        if (s_emit_prod < 0) {
+            const char* e = std::getenv("PSX_EMIT_PROD");
+            s_emit_prod = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (s_emit_prod) {
+            size_t todo = 0, pos = 0;
+            while ((pos = gen_func.body.find("TODO: opcode", pos)) != std::string::npos) { todo++; pos += 12; }
+            pos = 0;
+            while ((pos = gen_func.body.find("TODO: SPECIAL", pos)) != std::string::npos) { todo++; pos += 13; }
+            uint32_t instrs = func.size / 4u;
+            if (instrs > 0 && todo * 2u >= instrs) {   // >= 50% untranslatable => data
+                GeneratedFunction data_stub;
+                data_stub.function_name = func.name;
+                data_stub.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+                data_stub.body = fmt::format(
+                    "{{\n    psx_unknown_dispatch(cpu, 0x{:08X}u, 0x{:08X}u);\n}}\n",
+                    func.start_addr, func.start_addr & 0x1FFFFFFFu);
+                data_stub.full_code = data_stub.signature + "\n" + data_stub.body;
+                data_stub.line_count = 4;
+                total_lines += data_stub.line_count;
+                results.push_back(std::move(data_stub));
+                continue;
+            }
+        }
+
         total_lines += gen_func.line_count;
         results.push_back(gen_func);
     }
