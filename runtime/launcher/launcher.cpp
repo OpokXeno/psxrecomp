@@ -1,12 +1,7 @@
-// launcher.cpp — see launcher.h. RmlUi (HTML/CSS) front-end over SDL2 + GL3.
-//
-// Uses RmlUi's official SDL platform + GL3 renderer backends (lib/RmlUi/Backends).
-// The base RenderInterface_GL3 is used directly (no SDL_image dependency) — the
-// minimal launcher draws with CSS, not external <img> bitmaps; image-rich polish
-// is a later phase.
+// launcher.cpp — SDL2/OpenGL launcher. No RmlUi. No FreeType. No dependencies
+// beyond SDL2 + OpenGL 3.3 core + stb_image/png + stb_truetype (single headers).
 
 #include "launcher.h"
-
 #include "config_loader.h"
 #include "disc_identity.h"
 
@@ -15,23 +10,22 @@ extern "C" {
 #include "psx_keybinds.h"
 }
 
-#include <RmlUi/Core.h>
-#include <RmlUi/Core/Context.h>
-#include <RmlUi/Core/DataModelHandle.h>
-#include <RmlUi/Core/ElementDocument.h>
-
-#include "RmlUi_Platform_SDL.h"
-#include "RmlUi_Renderer_GL3.h"
-
 #include "third_party/stb_image.h"
 
-#include <SDL.h>
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "third_party/stb_truetype.h"
 
+#define GL_GLEXT_PROTOTYPES
+#include <SDL.h>
+#include <SDL_opengl.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <cmath>
+#include <algorithm>
 #include <filesystem>
 #include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,592 +35,647 @@ extern "C" {
 #endif
 
 namespace fs = std::filesystem;
-
 namespace {
 
-// RenderInterface_GL3 only decodes uncompressed TGA. Override LoadTexture to
-// decode PNG via stb_image (falling back to the base TGA path), so the launcher
-// can use <img> with PNG art. RmlUi textures are premultiplied-alpha RGBA.
-class LauncherRenderInterface : public RenderInterface_GL3 {
-public:
-    Rml::TextureHandle LoadTexture(Rml::Vector2i& dims, const Rml::String& source) override {
-        Rml::FileInterface* fi = Rml::GetFileInterface();
-        Rml::FileHandle fh = fi ? fi->Open(source) : Rml::FileHandle(0);
-        if (!fh) return RenderInterface_GL3::LoadTexture(dims, source);
-        fi->Seek(fh, 0, SEEK_END);
-        const size_t sz = (size_t)fi->Tell(fh);
-        fi->Seek(fh, 0, SEEK_SET);
-        std::vector<unsigned char> buf(sz);
-        fi->Read(buf.data(), sz, fh);
-        fi->Close(fh);
+// ---- math helpers -----------------------------------------------------------
+struct Color { float r,g,b,a; constexpr Color(float R,float G,float B,float A=1):r(R),g(G),b(B),a(A){} constexpr bool operator==(const Color& o)const{return r==o.r&&g==o.g&&b==o.b&&a==o.a;} };
+struct Vec2 { float x,y; };
+static inline Color operator*(Color c, float s) { return {c.r*s,c.g*s,c.b*s,c.a}; }
 
-        int w = 0, h = 0, comp = 0;
-        unsigned char* px = stbi_load_from_memory(buf.data(), (int)sz, &w, &h, &comp, 4);
-        if (!px) return RenderInterface_GL3::LoadTexture(dims, source);  // maybe a TGA
+// ---- theme ------------------------------------------------------------------
+constexpr Color
+    THEME_BG          {0.043f,0.055f,0.078f,1},
+    THEME_PANEL       {0.067f,0.086f,0.122f,1},
+    THEME_BORDER      {0.118f,0.153f,0.200f,1},
+    THEME_BORDER_HL   {0.145f,0.184f,0.251f,1},
+    THEME_TEXT        {0.902f,0.914f,0.937f,1},
+    THEME_TEXT_DIM    {0.490f,0.459f,0.565f,1},
+    THEME_TEXT_MUTED  {0.392f,0.431f,0.498f,1},
+    THEME_ACCENT      {0.267f,0.576f,0.965f,1},
+    THEME_ACCENT_HL   {0.400f,0.671f,0.992f,1},
+    THEME_GREEN       {0.247f,0.725f,0.314f,1},
+    THEME_RED         {0.973f,0.282f,0.282f,1},
+    THEME_WARN        {0.824f,0.600f,0.133f,1},
+    THEME_BTN_BG      {0.106f,0.137f,0.188f,1},
+    THEME_BTN_HOVER   {0.157f,0.200f,0.259f,1},
+    THEME_SEG_BG      {0.086f,0.114f,0.157f,1},
+    THEME_SEG_ON      {0.145f,0.388f,0.922f,1},
+    THEME_DROPDOWN_BG {0.051f,0.074f,0.110f,1};
 
-        const size_t n = (size_t)w * (size_t)h;
-        for (size_t i = 0; i < n; i++) {  // straight -> premultiplied alpha
-            const unsigned a = px[i * 4 + 3];
-            px[i * 4 + 0] = (unsigned char)(px[i * 4 + 0] * a / 255);
-            px[i * 4 + 1] = (unsigned char)(px[i * 4 + 1] * a / 255);
-            px[i * 4 + 2] = (unsigned char)(px[i * 4 + 2] * a / 255);
-        }
-        dims.x = w; dims.y = h;
-        Rml::TextureHandle th = GenerateTexture({px, n * 4}, dims);
-        stbi_image_free(px);
-        return th;
-    }
-};
+// ---- GL 2D rendering helpers ------------------------------------------------
+static GLuint s_vao=0, s_vbo=0, s_prog=0, s_white=0;
+static GLint s_u_proj=-1, s_u_tex=-1, s_u_col=-1;
+static float s_proj[16]; // orthographic matrix, row-major
 
-// Route RmlUi's own diagnostics to stdout. The base SystemInterface logs via
-// OutputDebugString on Windows (invisible to a normal console/redirect), which
-// hides data-binding errors; surfacing them here keeps RML issues debuggable.
-class LauncherSystemInterface : public SystemInterface_SDL {
-public:
-    bool LogMessage(Rml::Log::Type type, const Rml::String& message) override {
-        // Surface problems (warnings/errors/asserts); skip routine info spam.
-        if (type == Rml::Log::LT_INFO || type == Rml::Log::LT_DEBUG) return true;
-        const char* tag = type == Rml::Log::LT_ERROR  ? "error"
-                        : type == Rml::Log::LT_ASSERT ? "assert" : "warning";
-        std::fprintf(stdout, "launcher/rml %s: %s\n", tag, message.c_str());
-        std::fflush(stdout);
+static void gl_ortho(float l, float r, float b, float t) {
+    std::memset(s_proj,0,sizeof(s_proj));
+    s_proj[0]=2/(r-l); s_proj[5]=2/(t-b); s_proj[10]=-1; s_proj[12]=-(r+l)/(r-l); s_proj[13]=-(t+b)/(t-b); s_proj[15]=1;
+}
+
+static void gl_ensure_init() {
+    if (s_prog) return;
+    const char* vs="#version 330 core\nlayout(location=0)in vec2 aP;layout(location=1)in vec2 aU;uniform mat4 uP;out vec2 vU;void main(){gl_Position=uP*vec4(aP,0,1);vU=aU;}";
+    const char* fs="#version 330 core\nin vec2 vU;uniform sampler2D uT;uniform vec4 uC;out vec4 oC;void main(){oC=texture(uT,vU)*uC;}";
+    auto compile=[](GLuint t,const char*s){
+        GLuint sh=glCreateShader(t); glShaderSource(sh,1,&s,nullptr); glCompileShader(sh); return sh;
+    };
+    GLuint v=compile(GL_VERTEX_SHADER,vs), f=compile(GL_FRAGMENT_SHADER,fs);
+    s_prog=glCreateProgram(); glAttachShader(s_prog,v); glAttachShader(s_prog,f);
+    glLinkProgram(s_prog); glDeleteShader(v); glDeleteShader(f);
+    s_u_proj=glGetUniformLocation(s_prog,"uP"); s_u_tex=glGetUniformLocation(s_prog,"uT"); s_u_col=glGetUniformLocation(s_prog,"uC");
+    glGenVertexArrays(1,&s_vao); glGenBuffers(1,&s_vbo);
+    glBindVertexArray(s_vao); glBindBuffer(GL_ARRAY_BUFFER,s_vbo);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,16,(void*)0); glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,16,(void*)8); glEnableVertexAttribArray(1);
+    unsigned char wp[4]={255,255,255,255};
+    glGenTextures(1,&s_white); glBindTexture(GL_TEXTURE_2D,s_white);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,wp);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+}
+
+static void gl_draw_quad(float x,float y,float w,float h, GLuint tex, const Color& c,
+                         float u0=0,float v0=0,float u1=1,float v1=1) {
+    gl_ensure_init();
+    struct V{float x,y,u,v;} verts[4]={{x,y+h,u0,v1},{x,y,u0,v0},{x+w,y+h,u1,v1},{x+w,y,u1,v0}};
+    glUseProgram(s_prog);
+    glUniformMatrix4fv(s_u_proj,1,GL_FALSE,s_proj);
+    glUniform1i(s_u_tex,0); glUniform4f(s_u_col,c.r,c.g,c.b,c.a);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,tex);
+    glBindBuffer(GL_ARRAY_BUFFER,s_vbo);
+    glBufferData(GL_ARRAY_BUFFER,sizeof(verts),verts,GL_DYNAMIC_DRAW);
+    glBindVertexArray(s_vao);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+}
+
+static void gl_rect(float x,float y,float w,float h, const Color& c) { gl_draw_quad(x,y,w,h,s_white,c); }
+
+// ---- stb_truetype font system -----------------------------------------------
+struct Font {
+    GLuint tex=0; int tw=512, th=512;
+    stbtt_bakedchar cdata[96]{}; // ASCII 32..127
+    float baseline=0;
+
+    bool build(const unsigned char* ttf, float px) {
+        tex=0; tw=th=512;
+        auto* buf=(unsigned char*)std::calloc(tw*th,1);
+        if (!buf) return false;
+        int r=stbtt_BakeFontBitmap(ttf,0,px,buf,tw,th,32,96,cdata);
+        if (r<=0) { std::free(buf); return false; }
+        baseline=px*0.8f; // approximate ascender
+        glGenTextures(1,&tex); glBindTexture(GL_TEXTURE_2D,tex);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RED,tw,th,0,GL_RED,GL_UNSIGNED_BYTE,buf);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+        GLint swz[]={GL_ONE,GL_ONE,GL_ONE,GL_RED};
+        glTexParameteriv(GL_TEXTURE_2D,GL_TEXTURE_SWIZZLE_RGBA,swz);
+        std::free(buf);
         return true;
     }
-};
 
-// Mirror of the user-tunable settings, in the value shapes the RML binds to.
-struct LauncherModel {
-    int  renderer        = 0;  // 0=software, 1=opengl
-    int  supersampling   = 1;  // 1..4
-    bool antialiasing    = true;
-    int  texture_filter  = 0;  // 0=nearest, 1=bilinear
-    int  crt             = 0;  // 0=raw,1=crt,2=composite,3=trinitron
-    bool auto_skip_fmv   = false; // skip FMVs via the game's own skip
-    bool turbo_loads     = true;  // fast-forward the machine through load screens (audio plays through); default on
-    // (the old "Skip PSX BIOS" toggle is gone: the HLE boot shell-skip ships
-    // on by default via [runtime] bios_hle in the player game.toml)
-    bool spu_hq          = false;
-    int  aspect_index    = 0;  // index into kAspects (0 = 4:3 native)
-    int  window_width    = 1280; // window size (height = width*den/num per aspect)
-    bool widescreen      = false; // EXPERIMENTAL 16:9 native-wide (aspect_index==1)
-    bool ws_eligible     = true;  // toggle shown only when renderer==software (native-wide is SW-only)
-    bool fullscreen      = false; // launch the game window in desktop fullscreen
-    // Skip-launcher: boot straight into the game on subsequent launches. Turning
-    // it ON shows a confirmation modal (show_skip_modal) so the user is told how
-    // to get the launcher back (run with --launcher). Mirrors SMW's feature.
-    bool skip_launcher   = false;
-    bool show_skip_modal = false;
-
-    Rml::String bios_path;
-    Rml::String disc_path;
-
-    // Display labels (kept in sync with the enum/int values above).
-    Rml::String renderer_label;
-    Rml::String crt_label;
-    Rml::String texfilter_label;
-    Rml::String aspect_label;
-    Rml::String winsize_label;
-
-    // Disc verification (recomputed whenever disc_path changes).
-    Rml::String disc_file;      // file name only, e.g. "tomba.cue"
-    Rml::String disc_region;    // "NTSC-U (USA)" | "PAL" | "NTSC-J" | "—"
-    Rml::String disc_serial;    // "SCUS-94236" | "—"
-    bool        v_header   = false;  // ISO9660 header present
-    bool        v_crc      = false;  // CRC/hash (or serial identity) check passed
-    bool        v_verified = false;  // overall verdict good
-    Rml::String verdict_title;  // big line, e.g. "Tomba! disc verified"
-    Rml::String verdict_detail; // sub line
-    Rml::String verdict_state;  // "ok" | "warn" | "bad" | "none" — drives colour
-
-    // View toggle: "dashboard" (default) | "settings" | "controls".
-    Rml::String view = "dashboard";
-
-    // Controls page: which player's keyboard binds are being edited (0=P1,1=P2).
-    int         cfg_player = 0;
-    Rml::String cfg_player_label = "1";
-
-    // Player cards — real device routing. Each port picks a device (None /
-    // Keyboard / a plugged-in SDL controller) and a pad type (DualShock=analog).
-    int  p1_dev_index = 1;     // index into the shared device option list
-    int  p2_dev_index = 0;
-    // Pad input mode (PSXRecompV4::PadMode): 0=hybrid (default), 1=analog,
-    // 2=digital. Bound to the segmented 3-way selector in each player card.
-    int  p1_mode      = 0;
-    int  p2_mode      = 0;
-    bool allow_hybrid = true;  // game.allow_hybrid: when false the Hybrid segment is hidden
-    bool mode_selectable = true; // game.lock_mode == false: when false the whole pad-mode selector is hidden
-    bool device_locked   = false; // game.lock_device: when true the Player 1/2 cards are hidden entirely (fixed, auto-bound pad type)
-    int  deadzone_pct = 37;    // analog-stick deadzone 0-100% (raw = pct*32767/100)
-    Rml::String p1_dev_label = "Keyboard";
-    Rml::String p2_dev_label = "None";
-    Rml::String p1_status, p2_status;        // resolved status line
-    Rml::String p1_dot, p2_dot;              // "" (on) | "off"
-    Rml::String p1_options, p2_options;      // data-rml option-list markup
-    Rml::String dd_open;                     // "" | "p1" | "p2" (which device list is open)
-
-    // Localization (only shown when the game declares languages). Settings-view
-    // cycle button, like Renderer / Screen model.
-    bool        lang_menu    = false;        // game.languages non-empty => show it
-    int         lang_index   = 0;            // index into the game's language list
-    Rml::String lang_label;                  // current option label ("English")
-
-    // Memory cards — real introspection of the on-disk .mcd images. Each slot
-    // has a resolved file path, an enable toggle, and parsed directory stats.
-    bool mc1_enabled = true;
-    bool mc2_enabled = true;
-    Rml::String mc1_path,  mc2_path;   // resolved absolute .mcd path
-    Rml::String mc1_name,  mc2_name;   // file name only
-    Rml::String mc1_size,  mc2_size;   // "128 KB (15 blocks)" | "—"
-    Rml::String mc1_used,  mc2_used;   // "7 / 15" | "—"
-    Rml::String mc1_foot,  mc2_foot;   // "Last modified — …" | status line
-    // 15-cell block grids, built as RML markup and injected via data-rml. (A
-    // data-for over a bound array is the natural fit, but the structural
-    // data-for view does not capture inner-xml in this build; data-rml is the
-    // robust path and the markup is fully launcher-controlled.)
-    Rml::String mc1_grid, mc2_grid;
-
-    bool launch_requested = false;
-    bool quit_requested   = false;
-};
-
-// Format a unix timestamp as e.g. "Jun 12, 2026". Empty for 0/unknown.
-std::string fmt_mtime(long long secs) {
-    if (secs <= 0) return std::string();
-    const std::time_t t = (std::time_t)secs;
-    std::tm tmv{};
-#if defined(_WIN32)
-    localtime_s(&tmv, &t);
-#else
-    localtime_r(&t, &tmv);
-#endif
-    char buf[32];
-    if (std::strftime(buf, sizeof(buf), "%b %d, %Y", &tmv) == 0) return std::string();
-    return std::string(buf);
-}
-
-// Resolve a slot's effective .mcd path: explicit override, else <dir>/card<N>.mcd.
-std::string memcard_slot_path(const PSXRecompV4::UserSettings& io, int slot /*0|1*/) {
-    const bool has = slot == 0 ? io.has_memcard1_path : io.has_memcard2_path;
-    const std::filesystem::path& p = slot == 0 ? io.memcard1_path : io.memcard2_path;
-    if (has && !p.empty()) return p.generic_string();
-    fs::path dir = io.has_memcard_dir ? io.memcard_dir : fs::path();
-    if (dir.empty()) return std::string();
-    return (dir / (std::string("card") + (slot == 0 ? "1" : "2") + ".mcd")).generic_string();
-}
-
-// Parse the slot's .mcd file and fill the model's display fields for it.
-void refresh_memcard(LauncherModel& m, int slot /*0|1*/) {
-    Rml::String& path  = slot == 0 ? m.mc1_path   : m.mc2_path;
-    Rml::String& name  = slot == 0 ? m.mc1_name   : m.mc2_name;
-    Rml::String& size  = slot == 0 ? m.mc1_size   : m.mc2_size;
-    Rml::String& used  = slot == 0 ? m.mc1_used   : m.mc2_used;
-    Rml::String& foot  = slot == 0 ? m.mc1_foot   : m.mc2_foot;
-    Rml::String& grid  = slot == 0 ? m.mc1_grid   : m.mc2_grid;
-
-    auto build_grid = [](const uint8_t used[15]) {
-        Rml::String html;
-        for (int i = 0; i < 15; i++)
-            html += used[i] ? "<span class=\"blk b\"></span>" : "<span class=\"blk\"></span>";
-        return html;
-    };
-    const uint8_t empty15[15] = {0};
-    grid = build_grid(empty15);
-    name = path.empty() ? Rml::String("(no card)")
-                        : fs::path(std::string(path)).filename().generic_string();
-
-    if (path.empty()) {
-        size = used = "—";
-        foot = "No card configured.";
-        return;
-    }
-
-    MemcardSummary s;
-    memcard_summary_path(std::string(path).c_str(), &s);
-    grid = build_grid(s.block_used);
-
-    if (!s.exists) {
-        size = "128 KB (15 blocks)";
-        used = "0 / 15";
-        foot = "New blank card — created on launch.";
-        return;
-    }
-    if (!s.valid) {
-        size = used = "—";
-        foot = "Not a valid memory-card image.";
-        return;
-    }
-    size = "128 KB (15 blocks)";
-    used = std::to_string(s.used_blocks) + " / 15";
-    const std::string when = fmt_mtime(s.mtime);
-    foot = when.empty() ? Rml::String("On-disk memory card.")
-                        : Rml::String("Last modified — " + when);
-}
-
-// ---- input-device enumeration (None / Keyboard / plugged-in controllers) ----
-struct DeviceOption {
-    int         kind;   // 0=none, 1=keyboard, 2=controller
-    std::string guid;   // SDL joystick GUID string when kind==controller
-    std::string label;  // display name
-};
-
-std::vector<DeviceOption> enumerate_devices() {
-    std::vector<DeviceOption> opts;
-    opts.push_back({0, "", "None"});
-    opts.push_back({1, "", "Keyboard"});
-    const int n = SDL_NumJoysticks();
-    for (int i = 0; i < n; i++) {
-        if (!SDL_IsGameController(i)) continue;
-        SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
-        char buf[40] = {0};
-        SDL_JoystickGetGUIDString(g, buf, sizeof(buf));
-        const char* nm = SDL_GameControllerNameForIndex(i);
-        opts.push_back({2, std::string(buf), nm ? std::string(nm) : std::string("Controller")});
-    }
-    return opts;
-}
-
-// The settings device string ("none"/"keyboard"/<guid>) for an option.
-std::string device_string(const DeviceOption& o) {
-    if (o.kind == 0) return "none";
-    if (o.kind == 1) return "keyboard";
-    return o.guid;
-}
-
-// Minimal RML/attribute text escape for injected option labels.
-std::string rml_escape(const std::string& s) {
-    std::string o;
-    for (char c : s) {
-        switch (c) {
-            case '&': o += "&amp;";  break;
-            case '<': o += "&lt;";   break;
-            case '>': o += "&gt;";   break;
-            case '"': o += "&quot;"; break;
-            case '\'':o += "&#39;";  break;
-            default:  o += c;        break;
+    void text(float x, float y, const char* s, const Color& c, float scale=1) const {
+        if (!tex) return;
+        while (*s) {
+            if (*s>=32 && *s<128) {
+                stbtt_aligned_quad q;
+                float xx=x, yy=y;
+                stbtt_GetBakedQuad(cdata,tw,th,*s-32,&xx,&yy,&q,1);
+                float sx=q.x1-q.x0, sy=q.y1-q.y0;
+                gl_draw_quad(x+(q.x0-x)*scale, y+(q.y0-y)*scale, sx*scale, sy*scale, tex, c, q.s0, q.t0, q.s1, q.t1);
+                x+=(xx-x)*scale;
+            } else if (*s=='\n') { x=0; y+=baseline*1.3f; }
+            else { x+=8*scale; }
+            s++;
         }
     }
-    return o;
-}
 
-// Resolve a saved device string to an index in opts. A saved controller GUID
-// that is not currently plugged in is appended as an "(offline)" option so the
-// user's selection survives across unplug/replug.
-int find_or_add_device_index(std::vector<DeviceOption>& opts, const std::string& dev) {
-    if (dev.empty() || dev == "none") return 0;
-    if (dev == "keyboard") return 1;
-    for (size_t i = 0; i < opts.size(); i++)
-        if (opts[i].kind == 2 && opts[i].guid == dev) return (int)i;
-    opts.push_back({2, dev, "Saved controller (offline)"});
-    return (int)opts.size() - 1;
-}
-
-// Build the data-rml option-list markup for a player's dropdown. Each row is a
-// clickable element whose data-event-click selects that option (and closes).
-std::string build_options_rml(int player, const std::vector<DeviceOption>& opts) {
-    std::string s;
-    for (size_t i = 0; i < opts.size(); i++) {
-        s += "<p class=\"dd-opt\" data-event-click=\"pick_device(";
-        s += std::to_string(player);
-        s += ",";
-        s += std::to_string(i);
-        s += ")\">";
-        s += rml_escape(opts[i].label);
-        s += "</p>";
+    float width(const char* s, float scale=1) const {
+        float x=0, y=0;
+        while (*s) {
+            if (*s>=32 && *s<128) { float xx=x,yy=y; stbtt_aligned_quad q; stbtt_GetBakedQuad(cdata,tw,th,*s-32,&xx,&yy,&q,1); x+=(xx-x)*scale; }
+            else if (*s!='\n') x+=8*scale;
+            s++;
+        }
+        return x;
     }
-    return s;
+};
+
+// ---- PNG texture loader -----------------------------------------------------
+static GLuint load_png(const char* path, int* ow=nullptr, int* oh=nullptr) {
+    int w=0,h=0,n=0; unsigned char* px=stbi_load(path,&w,&h,&n,4);
+    if (!px) return 0;
+    GLuint t; glGenTextures(1,&t); glBindTexture(GL_TEXTURE_2D,t);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    stbi_image_free(px);
+    if (ow) *ow=w; if (oh) *oh=h;
+    return t;
 }
 
-// Recompute a player's derived display fields from its selected option index.
-void refresh_player(LauncherModel& m, int player, const std::vector<DeviceOption>& opts) {
-    int&         idx    = player == 0 ? m.p1_dev_index : m.p2_dev_index;
-    Rml::String& label  = player == 0 ? m.p1_dev_label : m.p2_dev_label;
-    Rml::String& status = player == 0 ? m.p1_status    : m.p2_status;
-    Rml::String& dot    = player == 0 ? m.p1_dot       : m.p2_dot;
-    Rml::String& options= player == 0 ? m.p1_options   : m.p2_options;
-    const int    mode   = player == 0 ? m.p1_mode      : m.p2_mode;
+// ---- UI state + interaction -------------------------------------------------
+struct UI {
+    int win_w=1280, win_h=960;
+    float mx=0, my=0;
+    bool mouse_down=false, mouse_pressed=false, mouse_released=false;
+    bool keys[SDL_NUM_SCANCODES]{};
+    int hot_id=0, active_id=0, next_id=1, last_hot=0;
+    Font font;
+    // preloaded images
+    struct Img{GLuint t=0;int w=0,h=0;};
+    Img logo, disc, pad_digital, pad_analog, memcard_img;
+    Img check_on, check_off, caret;
+    Img verdict_ok, verdict_warn, verdict_bad, verdict_none;
+    // running text-input buffer
+    char text_buf[256]={};
 
-    if (idx < 0 || idx >= (int)opts.size()) idx = 0;
-    const DeviceOption& o = opts[idx];
-    label   = o.label;
-    options = build_options_rml(player, opts);
+    float scale=1, scroll_y=0;
+    float sz(float v) const { return v * scale; }
+    float ts(float v) const { return v * (20.f/48.f) * scale; } // font-bake-adjusted text scale
 
-    const char* type = mode == 1 ? "DualShock (analog)"
-                     : mode == 2 ? "digital pad"
-                                 : "hybrid (auto analog/d-pad)";
-    if (o.kind == 0)      { status = "No device — port empty"; dot = "off"; }
-    else if (o.kind == 1) { status = Rml::String("Keyboard \xE2\x80\x94 ") + type; dot = ""; }
-    else                  { status = o.label + Rml::String(" \xE2\x80\x94 ") + type; dot = ""; }
-}
-
-// Recompute the language button's label from lang_index (Settings cycle toggle).
-void refresh_language(LauncherModel& m,
-                      const std::vector<psx_launcher::GameInfo::Language>& langs) {
-    if (langs.empty()) return;
-    if (m.lang_index < 0 || m.lang_index >= (int)langs.size()) m.lang_index = 0;
-    m.lang_label = langs[m.lang_index].label;
-}
-
-// Resolve a saved language code to an index in the game's language list.
-int lang_index_for(const std::vector<psx_launcher::GameInfo::Language>& langs,
-                   const std::string& code) {
-    for (size_t i = 0; i < langs.size(); i++)
-        if (langs[i].code == code) return (int)i;
-    return 0;   // unknown/first — the game's declared default sits at [0] by convention
-}
-
-const char* renderer_name(int v)  { return v == 1 ? "OpenGL" : "Software"; }
-const char* texfilter_name(int v) { return v == 1 ? "Bilinear" : "Nearest"; }
-const char* crt_name(int v) {
-    switch (v) {
-        case 1:  return "CRT";
-        case 2:  return "Composite";
-        case 3:  return "Trinitron";
-        default: return "Raw (off)";
+    void rect(float x,float y,float w,float h,const Color& c){gl_rect(x,y,w,h,c);}
+    void begin_frame(int w, int h) {
+        win_w=w; win_h=h;
+        scale = std::min((float)w/800.f, (float)h/600.f);
+        if (scale < 0.4f) scale = 0.4f;
+        if (scale > 3.0f) scale = 3.0f;
+        last_hot=hot_id; hot_id=0; next_id=1;
+        mouse_pressed=false; mouse_released=false;
+        gl_ortho(0,(float)w,(float)h,0); // y-down
+        gl_ensure_init();
     }
-}
 
-// Offered display aspects. 4:3 is the native presentation every game ships
-// with; wider aspects enable the runtime widescreen hack (GTE X-squash +
-// stretched present — see [video] aspect_ratio in config_loader.h).
-const int kAspects[][2] = { {4, 3}, {16, 9}, {21, 9} };
-const int kNumAspects = (int)(sizeof(kAspects) / sizeof(kAspects[0]));
-const char* aspect_name(int i) {
-    switch (i) {
-        case 1:  return "16:9 (Widescreen)";
-        case 2:  return "21:9 (Ultrawide)";
-        default: return "4:3 (Native)";
+    int alloc_id() { return next_id++; }
+
+    bool hot(int id, float x, float y, float w, float h) {
+        if (mx>=x && mx<=x+w && my>=y && my<=y+h) { hot_id=id; return true; }
+        return false;
     }
-}
-int aspect_index_for(int num, int den) {
-    for (int i = 0; i < kNumAspects; i++)
-        if (kAspects[i][0] == num && kAspects[i][1] == den) return i;
-    return 0;
-}
 
-// Offered window widths (height follows the chosen aspect). The toggle cycles
-// through these.
-const int kWinWidths[] = { 960, 1280, 1600, 1920 };
-const int kNumWinWidths = (int)(sizeof(kWinWidths) / sizeof(kWinWidths[0]));
+    bool click(int id) { return hot_id==id && mouse_released && active_id==id; }
 
-// Snap an arbitrary width to the nearest offered option index.
-int winsize_index(int width) {
-    int best = 1, bestd = 1 << 30;  // default to 1280
-    for (int i = 0; i < kNumWinWidths; i++) {
-        int d = width > kWinWidths[i] ? width - kWinWidths[i] : kWinWidths[i] - width;
-        if (d < bestd) { bestd = d; best = i; }
+    bool button(int id, float x, float y, float w, float h) {
+        bool over=hot(id,x,y,w,h);
+        bool was_active=(active_id==id);
+        if (mouse_pressed && over) active_id=id;
+        if (mouse_released && was_active) { active_id=0; return over; }
+        if (mouse_released && active_id==id) active_id=0;
+        Color bg=THEME_BTN_BG;
+        if (was_active) bg=bg*1.3f;
+        else if (over) bg=THEME_BTN_HOVER;
+        gl_rect(x,y,w,h,bg);
+        return false;
     }
-    return best;
-}
 
-std::string winsize_label_for(int width, int aspect_index) {
-    const int num = kAspects[aspect_index][0], den = kAspects[aspect_index][1];
-    return std::to_string(width) + " \xC3\x97 " + std::to_string(width * den / num);  // "1280 × 960"
-}
-
-void refresh_labels(LauncherModel& m) {
-    m.renderer_label  = renderer_name(m.renderer);
-    m.crt_label       = crt_name(m.crt);
-    m.texfilter_label = texfilter_name(m.texture_filter);
-    m.aspect_label    = aspect_name(m.aspect_index);
-    m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
-    m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
-    /* ws_eligible is set once at model init from GameInfo.ws_offered ([widescreen]
-     * offer): renderer no longer matters (native-wide works on SW + GL), so
-     * refresh must not overwrite the per-game gate. */
-}
-
-std::string region_long(const std::string& r) {
-    if (r == "NTSC-U") return "NTSC-U (USA)";
-    if (r == "NTSC-J") return "NTSC-J (Japan)";
-    if (r == "PAL")    return "PAL (Europe)";
-    return r;
-}
-
-// Re-run disc verification against m.disc_path and update the panel fields.
-// `expected_serial`/`expected_crc` come from game.toml (via GameInfo);
-// `game_name` is used for the verdict headline.
-void refresh_disc_status(LauncherModel& m, const std::string& game_name,
-                         const std::string& expected_serial,
-                         uint32_t expected_crc, bool has_expected_crc) {
-    m.v_header = m.v_crc = m.v_verified = false;
-    m.disc_region = m.disc_serial = "—";
-    m.disc_file = "—";
-
-    if (m.disc_path.empty()) {
-        m.verdict_title  = "No disc selected";
-        m.verdict_detail = "Choose a disc image to verify it against this build.";
-        m.verdict_state  = "none";
-        return;
+    bool toggle(int id, float x, float y, float w, float h, bool on) {
+        bool over=hot(id,x,y,w,h);
+        if (mouse_pressed && over) active_id=id;
+        bool clk= mouse_released && active_id==id && over;
+        if (mouse_released && active_id==id) active_id=0;
+        Color bg=on ? THEME_ACCENT : THEME_BORDER;
+        if (over && !active_id) bg= bg==THEME_ACCENT ? THEME_ACCENT_HL : THEME_BORDER_HL;
+        if (active_id==id) bg=on ? THEME_ACCENT_HL : THEME_BORDER_HL;
+        gl_rect(x,y,w,h,bg);
+        float knob_x=on ? x+w-h : x;
+        gl_rect(knob_x+2,y+2,h-4,h-4,{0.902f,0.914f,0.937f,1});
+        return clk;
     }
-    m.disc_file = fs::path(std::string(m.disc_path)).filename().generic_string();
 
-    // Only spend time hashing when there is an expected CRC to compare against.
-    const PSXRecompV4::DiscIdentity id = PSXRecompV4::identify_disc(
-        fs::path(std::string(m.disc_path)), expected_serial,
-        expected_crc, has_expected_crc, /*compute_crc=*/has_expected_crc);
-
-    if (!id.opened) {
-        m.verdict_title  = "Disc not found";
-        m.verdict_detail = "Could not open the image or its CUE-referenced BIN.";
-        m.verdict_state  = "bad";
-        return;
+    int segmented(int base, float x, float y, float w, float h, int cnt, int sel) {
+        int out=sel; float sw=w/cnt;
+        for (int i=0;i<cnt;i++) {
+            int id=base+i;
+            float sx=x+sw*i;
+            bool over=hot(id,sx,y,sw,h);
+            if (mouse_pressed && over) active_id=id;
+            bool clk=mouse_released && active_id==id && over;
+            if (mouse_released && active_id==id) active_id=0;
+            Color c=(i==sel)?THEME_SEG_ON:(over?THEME_BTN_HOVER:THEME_SEG_BG);
+            gl_rect(sx,y,sw,h,c);
+            if (clk) out=i;
+            if (i<cnt-1) gl_rect(sx+sw-1,y,1,h,THEME_BORDER);
+        }
+        return out;
     }
-    if (!id.has_header) {
-        m.verdict_title  = "Not a PlayStation disc";
-        m.verdict_detail = "No ISO9660 header at the expected sectors.";
-        m.verdict_state  = "bad";
-        return;
+};
+
+// ---- font + image loading helper --------------------------------------------
+static bool load_assets(UI& ui, const fs::path& assets_dir) {
+    // fonts
+    auto load_font=[&](const char* rel, float px)->bool{
+        auto p=assets_dir/rel; std::error_code ec;
+        if (!fs::exists(p,ec)) return false;
+        FILE*f=std::fopen(p.generic_string().c_str(),"rb"); if(!f) return false;
+        std::fseek(f,0,SEEK_END); long sz=std::ftell(f); std::fseek(f,0,SEEK_SET);
+        auto* buf=(unsigned char*)std::malloc(sz);
+        if (!buf) { std::fclose(f); return false; }
+        std::fread(buf,1,sz,f); std::fclose(f);
+        bool ok=ui.font.build(buf,px);
+        std::free(buf);
+        return ok;
+    };
+    if (!load_font("fonts/LatoLatin-Regular.ttf",48)) {
+        if (!load_font("LatoLatin-Regular.ttf",48)) {
+            std::fprintf(stderr,"launcher: no font found\n");
+            return false;
+        }
     }
-    m.v_header = true;
-    if (!id.detected_serial.empty()) m.disc_serial = id.detected_serial;
-    else if (!expected_serial.empty()) m.disc_serial = expected_serial;
-    if (!id.region.empty()) m.disc_region = region_long(id.region);
-
-    const bool serial_ok = !id.expected_serial_given || id.serial_matches;
-
-    // Middle check: exact CRC match if we have one to compare, otherwise the
-    // serial-based identity match stands in for the hash.
-    if (id.expected_crc_given && id.crc_computed)
-        m.v_crc = id.crc_matches;
-    else
-        m.v_crc = serial_ok && id.expected_serial_given;
-
-    m.v_verified = m.v_header && serial_ok &&
-                   (!id.expected_crc_given || id.crc_matches);
-
-    const std::string nm = game_name.empty() ? std::string("Disc") : game_name;
-    if (m.v_verified) {
-        m.verdict_title  = nm + " disc verified";
-        m.verdict_detail = "Correct disc image loaded. Ready to launch.";
-        m.verdict_state  = "ok";
-    } else if (!serial_ok) {
-        m.verdict_title  = "Wrong disc?";
-        m.verdict_detail = "Serial does not match this build (expected " + expected_serial + ").";
-        m.verdict_state  = "bad";
-    } else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) {
-        m.verdict_title  = "Disc image differs";
-        m.verdict_detail = "Right game, but the image hash does not match the expected dump.";
-        m.verdict_state  = "warn";
-    } else {
-        // Header ok, nothing authoritative to compare against.
-        m.verdict_title  = "PlayStation disc";
-        m.verdict_detail = "Recognised PlayStation disc. No reference hash configured.";
-        m.verdict_state  = "ok";
-        m.v_verified     = true;
-    }
+    // images
+    auto load_img=[&](UI::Img& img, const char* rel) {
+        auto p=(assets_dir/rel).generic_string();
+        img.t=load_png(p.c_str(),&img.w,&img.h);
+    };
+    load_img(ui.logo,         "img/logo.png");
+    load_img(ui.disc,         "img/disc.png");
+    load_img(ui.pad_digital,  "img/pad_digital.png");
+    load_img(ui.pad_analog,   "img/pad_analog.png");
+    load_img(ui.memcard_img,  "img/memcard.png");
+    load_img(ui.check_on,     "img/check_on.png");
+    load_img(ui.check_off,    "img/check_off.png");
+    load_img(ui.caret,        "img/caret.png");
+    load_img(ui.verdict_ok,   "img/verdict_ok.png");
+    load_img(ui.verdict_warn, "img/verdict_warn.png");
+    load_img(ui.verdict_bad,  "img/verdict_bad.png");
+    load_img(ui.verdict_none, "img/verdict_none.png");
+    return true;
 }
 
+// ---- business logic (ported verbatim from the original) ---------------------
+struct LauncherModel {
+    int  renderer=0, supersampling=1;
+    bool antialiasing=true, auto_skip_fmv=false, turbo_loads=true, fullscreen=false;
+    bool spu_hq=false, widescreen=false, ws_eligible=true, skip_launcher=false, show_skip_modal=false;
+    int  texture_filter=0, crt=0, aspect_index=0, window_width=1280;
+    int  p1_dev_index=1, p2_dev_index=0, p1_mode=0, p2_mode=0, deadzone_pct=37;
+    bool allow_hybrid=true, mode_selectable=true, lang_menu=false;
+    int  lang_index=0, cfg_player=0;
+    bool mc1_enabled=true, mc2_enabled=true, launch_requested=false, quit_requested=false;
+    std::string bios_path, disc_path, view="dashboard";
+    std::string p1_dev_label="Keyboard", p2_dev_label="None", p1_status, p2_status, p1_dot, p2_dot;
+    std::string p1_options, p2_options, dd_open, lang_label;
+    std::string mc1_path, mc2_path, mc1_name, mc2_name, mc1_size, mc2_size, mc1_used, mc2_used, mc1_foot, mc2_foot;
+    std::string mc1_grid, mc2_grid;
+    std::string disc_file, disc_region, disc_serial, verdict_title, verdict_detail, verdict_state="none";
+    bool v_header=false, v_crc=false, v_verified=false;
+
+    // display labels (computed from the values above)
+    float uiscale = 1.0f;
+    std::string renderer_label, crt_label, texfilter_label, aspect_label, winsize_label, uiscale_label;
+
+    // keybind rebinding
+    int scan_kind=0, scan_index=0;
+    std::string scan_chip_id;
+    bool rebuild_pending=false;
+};
+
+static const char* renderer_name(int v) { return v?"OpenGL":"Software"; }
+static const char* texfilter_name(int v) { return v?"Bilinear":"Nearest"; }
+static const char* crt_name(int v) {
+    switch(v){case 1:return "CRT";case 2:return "Composite";case 3:return "Trinitron";default:return "Raw (off)";}
+}
+static const int kAspects[][2]={{4,3},{16,9},{21,9}};
+static const int kNumAspects=3;
+static const char* aspect_name(int i) {
+    switch(i){case 1:return "16:9 (Widescreen)";case 2:return "21:9 (Ultrawide)";default:return "4:3 (Native)";}
+}
+static int aspect_index_for(int num,int den){for(int i=0;i<kNumAspects;i++)if(kAspects[i][0]==num&&kAspects[i][1]==den)return i;return 0;}
+static const int kWinWidths[]={960,1280,1600,1920};
+static const int kNumWinWidths=4;
+static int winsize_index(int w){int b=1,bd=1<<30;for(int i=0;i<kNumWinWidths;i++){int d=w>kWinWidths[i]?w-kWinWidths[i]:kWinWidths[i]-w;if(d<bd){bd=d;b=i;}}return b;}
+static std::string winsize_label_for(int w,int ai){return std::to_string(w)+" \xC3\x97 "+std::to_string(w*kAspects[ai][1]/kAspects[ai][0]);}
+static void refresh_labels(LauncherModel& m){
+    m.renderer_label=renderer_name(m.renderer); m.crt_label=crt_name(m.crt);
+    m.texfilter_label=texfilter_name(m.texture_filter); m.aspect_label=aspect_name(m.aspect_index);
+    m.winsize_label=winsize_label_for(m.window_width,m.aspect_index); m.widescreen=(m.aspect_index==1); m.ws_eligible=true;
+}
+static std::string region_long(const std::string& r){
+    if(r=="NTSC-U")return "NTSC-U (USA)"; if(r=="NTSC-J")return "NTSC-J (Japan)"; if(r=="PAL")return "PAL (Europe)"; return r;
+}
+
+// memcard helpers
+static std::string fmt_mtime(long long secs){
+    if(secs<=0)return{}; std::time_t t=(std::time_t)secs; std::tm tmv{};
 #if defined(_WIN32)
-// Native open-file dialog. Returns "" if cancelled.
-std::string win_pick_file(SDL_Window* parent, const char* title, const char* filter) {
-    char buf[MAX_PATH] = {0};
-    OPENFILENAMEA ofn = {0};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFilter = filter;  // e.g. "BIOS (*.bin)\0*.bin\0All files\0*.*\0\0"
-    ofn.lpstrFile   = buf;
-    ofn.nMaxFile    = sizeof(buf);
-    ofn.lpstrTitle  = title;
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    (void)parent;
-    if (GetOpenFileNameA(&ofn)) return std::string(buf);
-    return std::string();
+    localtime_s(&tmv,&t);
+#else
+    localtime_r(&t,&tmv);
+#endif
+    char buf[32]; if(std::strftime(buf,sizeof(buf),"%b %d, %Y",&tmv)==0)return{}; return buf;
+}
+static std::string memcard_slot_path(const PSXRecompV4::UserSettings& io, int slot){
+    const bool has=slot==0?io.has_memcard1_path:io.has_memcard2_path;
+    const fs::path& p=slot==0?io.memcard1_path:io.memcard2_path;
+    if(has&&!p.empty())return p.generic_string();
+    fs::path dir=io.has_memcard_dir?io.memcard_dir:fs::path();
+    if(dir.empty())return{}; return (dir/(std::string("card")+(slot==0?"1":"2")+".mcd")).generic_string();
+}
+static void refresh_memcard(LauncherModel& m, int slot,
+                            const PSXRecompV4::UserSettings& io){
+    std::string& path =slot==0?m.mc1_path :m.mc2_path;
+    std::string& name =slot==0?m.mc1_name :m.mc2_name;
+    std::string& size =slot==0?m.mc1_size :m.mc2_size;
+    std::string& used =slot==0?m.mc1_used :m.mc2_used;
+    std::string& foot =slot==0?m.mc1_foot :m.mc2_foot;
+    std::string& grid =slot==0?m.mc1_grid :m.mc2_grid;
+    auto build_grid=[](const uint8_t used[15]){std::string h;for(int i=0;i<15;i++)h+=used[i]?"X":".";return h;};
+    const uint8_t empty15[15]={0}; grid=build_grid(empty15);
+    name=path.empty()?"(no card)":fs::path(path).filename().generic_string();
+    if(path.empty()){size=used="\xE2\x80\x94"; foot="No card configured."; return;}
+    MemcardSummary s; memcard_summary_path(path.c_str(),&s); grid=build_grid(s.block_used);
+    if(!s.exists){size="128 KB (15 blocks)"; used="0 / 15"; foot="New blank card \xE2\x80\x94 created on launch."; return;}
+    if(!s.valid){size=used="\xE2\x80\x94"; foot="Not a valid memory-card image."; return;}
+    size="128 KB (15 blocks)"; used=std::to_string(s.used_blocks)+" / 15";
+    auto when=fmt_mtime(s.mtime); foot=when.empty()?"On-disk memory card.":"Last modified \xE2\x80\x94 "+when;
 }
 
-// Native save-file dialog (overwrite-prompts). Returns "" if cancelled.
-std::string win_pick_save_file(SDL_Window* parent, const char* title,
-                               const char* filter, const char* default_ext,
-                               const std::string& initial) {
-    char buf[MAX_PATH] = {0};
-    if (!initial.empty()) {
-        std::snprintf(buf, sizeof(buf), "%s", initial.c_str());
-        for (char* p = buf; *p; ++p) if (*p == '/') *p = '\\';  // native sep
-    }
-    OPENFILENAMEA ofn = {0};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFilter = filter;
-    ofn.lpstrFile   = buf;
-    ofn.nMaxFile    = sizeof(buf);
-    ofn.lpstrTitle  = title;
-    ofn.lpstrDefExt = default_ext;  // appended if the user types no extension
-    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    (void)parent;
-    if (GetSaveFileNameA(&ofn)) return std::string(buf);
-    return std::string();
+// device enumeration
+struct DeviceOption{int kind=0;std::string guid,label;};
+static std::vector<DeviceOption> enumerate_devices(){
+    std::vector<DeviceOption> opts; opts.push_back({0,"","None"}); opts.push_back({1,"","Keyboard"});
+    int n=SDL_NumJoysticks(); for(int i=0;i<n;i++){
+        if(!SDL_IsGameController(i))continue;
+        SDL_JoystickGUID g=SDL_JoystickGetDeviceGUID(i); char buf[40]={0}; SDL_JoystickGetGUIDString(g,buf,sizeof(buf));
+        opts.push_back({2,buf,SDL_GameControllerNameForIndex(i)?:std::string("Controller")});
+    } return opts;
+}
+static std::string device_string(const DeviceOption& o){return o.kind==0?"none":o.kind==1?"keyboard":o.guid;}
+static int find_or_add_device_index(std::vector<DeviceOption>& opts, const std::string& dev){
+    if(dev.empty()||dev=="none")return 0; if(dev=="keyboard")return 1;
+    for(size_t i=0;i<opts.size();i++)if(opts[i].kind==2&&opts[i].guid==dev)return(int)i;
+    opts.push_back({2,dev,"Saved controller (offline)"}); return(int)opts.size()-1;
+}
+static void refresh_player(LauncherModel& m, int player, const std::vector<DeviceOption>& opts){
+    int& idx=player==0?m.p1_dev_index:m.p2_dev_index;
+    std::string& label=player==0?m.p1_dev_label:m.p2_dev_label;
+    std::string& status=player==0?m.p1_status:m.p2_status;
+    std::string& dot=player==0?m.p1_dot:m.p2_dot;
+    int mode=player==0?m.p1_mode:m.p2_mode;
+    if(idx<0||idx>=(int)opts.size())idx=0;
+    label=opts[idx].label;
+    const char* type=mode==1?"DualShock (analog)":mode==2?"digital pad":"hybrid (auto analog/d-pad)";
+    if(opts[idx].kind==0){status="No device \xE2\x80\x94 port empty"; dot="off";}
+    else if(opts[idx].kind==1){status=std::string("Keyboard \xE2\x80\x94 ")+type; dot="";}
+    else{status=opts[idx].label+" \xE2\x80\x94 "+type; dot="";}
+}
+static void refresh_language(LauncherModel& m, const std::vector<psx_launcher::GameInfo::Language>& langs){
+    if(langs.empty())return; if(m.lang_index<0||m.lang_index>=(int)langs.size())m.lang_index=0; m.lang_label=langs[m.lang_index].label;
+}
+static int lang_index_for(const std::vector<psx_launcher::GameInfo::Language>& langs, const std::string& code){
+    for(size_t i=0;i<langs.size();i++)if(langs[i].code==code)return(int)i; return 0;
+}
+
+// disc verification
+static void refresh_disc_status(LauncherModel& m, const std::string& game_name,
+                                 const std::string& expected_serial, uint32_t expected_crc, bool has_expected_crc){
+    m.v_header=m.v_crc=m.v_verified=false; m.disc_region=m.disc_serial="\xE2\x80\x94"; m.disc_file="\xE2\x80\x94";
+    if(m.disc_path.empty()){m.verdict_title="No disc selected"; m.verdict_detail="Choose a disc image to verify it against this build."; m.verdict_state="none"; return;}
+    m.disc_file=fs::path(m.disc_path).filename().generic_string();
+    auto id=PSXRecompV4::identify_disc(fs::path(m.disc_path),expected_serial,expected_crc,has_expected_crc,has_expected_crc);
+    if(!id.opened){m.verdict_title="Disc not found"; m.verdict_detail="Could not open the image or its CUE-referenced BIN."; m.verdict_state="bad"; return;}
+    if(!id.has_header){m.verdict_title="Not a PlayStation disc"; m.verdict_detail="No ISO9660 header at the expected sectors."; m.verdict_state="bad"; return;}
+    m.v_header=true;
+    if(!id.detected_serial.empty())m.disc_serial=id.detected_serial; else if(!expected_serial.empty())m.disc_serial=expected_serial;
+    if(!id.region.empty())m.disc_region=region_long(id.region);
+    bool serial_ok=!id.expected_serial_given||id.serial_matches;
+    if(id.expected_crc_given&&id.crc_computed) m.v_crc=id.crc_matches; else m.v_crc=serial_ok&&id.expected_serial_given;
+    m.v_verified=m.v_header&&serial_ok&&(!id.expected_crc_given||id.crc_matches);
+    const std::string nm=game_name.empty()?"Disc":game_name;
+    if(m.v_verified){m.verdict_title=nm+" disc verified"; m.verdict_detail="Correct disc image loaded. Ready to launch."; m.verdict_state="ok";}
+    else if(!serial_ok){m.verdict_title="Wrong disc?"; m.verdict_detail="Serial does not match this build (expected "+expected_serial+")."; m.verdict_state="bad";}
+    else if(id.expected_crc_given&&id.crc_computed&&!id.crc_matches){m.verdict_title="Disc image differs"; m.verdict_detail="Right game, but the image hash does not match the expected dump."; m.verdict_state="warn";}
+    else{m.verdict_title="PlayStation disc"; m.verdict_detail="Recognised PlayStation disc. No reference hash configured."; m.verdict_state="ok"; m.v_verified=true;}
+}
+
+// ---- file picker (unchanged) ------------------------------------------------
+#if defined(_WIN32)
+static std::string win_pick_file(SDL_Window*, const char* title, const char* filter){
+    char buf[MAX_PATH]={0}; OPENFILENAMEA ofn={0}; ofn.lStructSize=sizeof(ofn); ofn.lpstrFilter=filter; ofn.lpstrFile=buf; ofn.nMaxFile=sizeof(buf); ofn.lpstrTitle=title; ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&ofn)?std::string(buf):std::string();
+}
+static std::string win_pick_save_file(SDL_Window*, const char* title, const char* filter, const char* def_ext, const std::string& init){
+    char buf[MAX_PATH]={0}; if(!init.empty()){std::snprintf(buf,sizeof(buf),"%s",init.c_str());for(char*p=buf;*p;++p)if(*p=='/')*p='\\';}
+    OPENFILENAMEA ofn={0}; ofn.lStructSize=sizeof(ofn); ofn.lpstrFilter=filter; ofn.lpstrFile=buf; ofn.nMaxFile=sizeof(buf); ofn.lpstrTitle=title; ofn.lpstrDefExt=def_ext; ofn.Flags=OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+    return GetSaveFileNameA(&ofn)?std::string(buf):std::string();
 }
 #else
-// POSIX native dialogs via popen-based choosers (zenity / kdialog / qarma /
-// osascript), each gated on `command -v` so an absent tool falls through.
-// Returns "" on cancel or when no chooser is installed. The Win32 double-null
-// `filter` string isn't portable, so the POSIX path uses a generic chooser
-// (the title is honored); BIOS / disc / memory-card browsing works on Linux.
 #include <cstdio>
-namespace {
-std::string sh_squote(const std::string& s) {
-    std::string q = "'";
-    for (char c : s) { if (c == '\'') q += "'\\''"; else q += c; }
-    return q + "'";
+static std::string sh_squote(const std::string& s){std::string q="'";for(char c:s){if(c=='\'')q+="'\\''";else q+=c;}return q+"'";}
+static std::string run_chooser(const std::string& cmd){
+    std::string o; FILE* p=popen(cmd.c_str(),"r"); if(!p)return o; char buf[2048]; if(fgets(buf,sizeof(buf),p))o=buf; int rc=pclose(p);
+    while(!o.empty()&&(o.back()=='\n'||o.back()=='\r'))o.pop_back(); if(rc!=0)o.clear(); return o;
 }
-std::string run_chooser(const std::string& cmd) {
-    std::string out;
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return out;
-    char buf[2048];
-    if (fgets(buf, sizeof(buf), p)) out = buf;
-    int rc = pclose(p);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
-    if (rc != 0) out.clear();
-    return out;
+static std::string win_pick_file(SDL_Window*, const char* title, const char*){
+    std::string t=sh_squote(title?title:"Select file"); std::string r;
+    if(!(r=run_chooser("command -v zenity >/dev/null 2>&1 && zenity --file-selection --title="+t+" 2>/dev/null")).empty())return r;
+    if(!(r=run_chooser("command -v kdialog >/dev/null 2>&1 && kdialog --getopenfilename \"${HOME:-/}\" 2>/dev/null")).empty())return r;
+    if(!(r=run_chooser("command -v qarma >/dev/null 2>&1 && qarma --file-selection --title="+t+" 2>/dev/null")).empty())return r;
+    return run_chooser("command -v osascript >/dev/null 2>&1 && osascript -e 'POSIX path of (choose file)' 2>/dev/null");
 }
-} // namespace
-
-std::string win_pick_file(SDL_Window*, const char* title, const char*) {
-    std::string t = sh_squote(title ? title : "Select file");
-    std::string r;
-    if (!(r = run_chooser("command -v zenity >/dev/null 2>&1 && "
-            "zenity --file-selection --title=" + t + " 2>/dev/null")).empty()) return r;
-    if (!(r = run_chooser("command -v kdialog >/dev/null 2>&1 && "
-            "kdialog --getopenfilename \"${HOME:-/}\" 2>/dev/null")).empty()) return r;
-    if (!(r = run_chooser("command -v qarma >/dev/null 2>&1 && "
-            "qarma --file-selection --title=" + t + " 2>/dev/null")).empty()) return r;
-    return run_chooser("command -v osascript >/dev/null 2>&1 && "
-            "osascript -e 'POSIX path of (choose file)' 2>/dev/null");
-}
-
-std::string win_pick_save_file(SDL_Window*, const char* title, const char*,
-                               const char*, const std::string& initial) {
-    std::string t = sh_squote(title ? title : "Save file");
-    std::string r;
-    std::string z = "command -v zenity >/dev/null 2>&1 && "
-                    "zenity --file-selection --save --confirm-overwrite --title=" + t;
-    if (!initial.empty()) z += " --filename=" + sh_squote(initial);
-    if (!(r = run_chooser(z + " 2>/dev/null")).empty()) return r;
-    std::string k = "command -v kdialog >/dev/null 2>&1 && kdialog --getsavefilename ";
-    k += initial.empty() ? std::string("\"${HOME:-/}\"") : sh_squote(initial);
-    return run_chooser(k + " 2>/dev/null");
+static std::string win_pick_save_file(SDL_Window*, const char* title, const char*, const char*, const std::string& init){
+    std::string t=sh_squote(title?title:"Save file"); std::string r;
+    std::string z="command -v zenity >/dev/null 2>&1 && zenity --file-selection --save --confirm-overwrite --title="+t;
+    if(!init.empty())z+=" --filename="+sh_squote(init);
+    if(!(r=run_chooser(z+" 2>/dev/null")).empty())return r;
+    std::string k="command -v kdialog >/dev/null 2>&1 && kdialog --getsavefilename ";
+    k+=init.empty()?std::string("\"${HOME:-/}\""):sh_squote(init);
+    return run_chooser(k+" 2>/dev/null");
 }
 #endif
 
-// Load at least one font face so RmlUi can render text. Tries bundled fonts in
-// assets_dir, then a couple of platform fallbacks. Returns true if any loaded.
-bool load_fonts(const fs::path& assets_dir) {
-    const char* bundled[] = {
-        "fonts/LatoLatin-Regular.ttf",
-        "fonts/LatoLatin-Bold.ttf",
-        "LatoLatin-Regular.ttf",
+// ---- view renderers ---------------------------------------------------------
+
+static float render_dashboard(UI& ui, LauncherModel& m,
+                              const std::vector<DeviceOption>& dev_opts,
+                              SDL_Window* window,
+                              const std::string& game_name,
+                              const std::string& expected_serial,
+                              uint32_t expected_crc, bool has_expected_crc,
+                              const std::vector<psx_launcher::GameInfo::Language>& langs)
+{
+    const float s = ui.scale;
+    const float W=(float)ui.win_w, H=(float)ui.win_h;
+    const float pad=ui.sz(22), gap=ui.sz(13);
+    float y=pad+ui.sz(46)+gap; // skip top bar (drawn by main loop)
+    float mgn=ui.sz(18);
+
+    // account for scroll
+    y += ui.scroll_y;
+
+    // ---- disc verification panel ----
+    float disc_h=ui.sz(220), dp_y=y, dp_x=pad, dp_w=W-2*pad;
+    ui.rect(dp_x,dp_y,dp_w,disc_h,THEME_PANEL);
+    ui.rect(dp_x,dp_y,dp_w,1,THEME_BORDER);
+    float art_s=ui.sz(180);
+    if (ui.disc.t) gl_draw_quad(dp_x+mgn,dp_y+(disc_h-art_s)/2,art_s,art_s,ui.disc.t,{1,1,1,1});
+    float di_x=dp_x+mgn+art_s+ui.sz(20);
+    ui.font.text(di_x,dp_y+ui.sz(16),"DISC VERIFICATION",THEME_ACCENT,ui.ts(0.6f));
+    float title_sz=ui.ts(1.0f);
+    ui.font.text(di_x,dp_y+ui.sz(36),game_name.c_str(),THEME_TEXT,title_sz);
+    ui.font.text(di_x,dp_y+ui.sz(36)+ui.font.baseline*title_sz+ui.sz(2),"PlayStation disc image",THEME_TEXT_DIM,ui.ts(0.7f));
+    // metadata
+    float meta_y=dp_y+ui.sz(36)+ui.font.baseline*title_sz+ui.sz(2)+ui.sz(16);
+    auto meta=[&](const char* k, const std::string& v, float& cx){
+        ui.font.text(cx,meta_y,k,THEME_TEXT_MUTED,ui.ts(0.55f));
+        ui.font.text(cx,meta_y+ui.sz(12),v.c_str(),THEME_TEXT,ui.ts(0.7f));
+        cx+=std::max(ui.font.width(k,ui.ts(0.55f)),ui.font.width(v.c_str(),ui.ts(0.7f)))+ui.sz(40);
     };
-    bool any = false;
-    for (const char* rel : bundled) {
-        const fs::path p = assets_dir / rel;
-        std::error_code ec;
-        if (fs::exists(p, ec) && Rml::LoadFontFace(p.generic_string())) any = true;
+    float cx=di_x; meta("FILE",m.disc_file,cx); meta("REGION",m.disc_region,cx); meta("SERIAL",m.disc_serial,cx);
+    // verification checks
+    float chk_y=meta_y+ui.sz(12)+ui.sz(18);
+    ui.font.text(di_x,chk_y,"VERIFICATION RESULTS",THEME_ACCENT,ui.ts(0.55f));
+    auto check=[&](const char* lbl, bool on, float& cx2){
+        auto& img=on?ui.check_on:ui.check_off;
+        float chk_sz=ui.sz(16);
+        if (img.t) gl_draw_quad(cx2,chk_y+ui.sz(14),chk_sz,chk_sz,img.t,{1,1,1,1});
+        ui.font.text(cx2+ui.sz(20),chk_y+ui.sz(14),lbl,THEME_TEXT_DIM,ui.ts(0.6f));
+        cx2+=ui.sz(20)+ui.font.width(lbl,ui.ts(0.6f))+ui.sz(24);
+    };
+    float chk_x=di_x; check("Header Match",m.v_header,chk_x); check("CRC / Hash Match",m.v_crc,chk_x); check("Disc Verified",m.v_verified,chk_x);
+    // verdict column
+    float vc_w=ui.sz(260);
+    float vc_x=dp_x+dp_w-vc_w-mgn;
+    ui.rect(vc_x,dp_y+ui.sz(12),1,disc_h-ui.sz(24),THEME_BORDER);
+    auto vimg=[&]()->UI::Img{
+        if (m.verdict_state=="ok") return ui.verdict_ok;
+        if (m.verdict_state=="warn") return ui.verdict_warn;
+        if (m.verdict_state=="bad") return ui.verdict_bad;
+        return ui.verdict_none;
+    }();
+    float vimg_sz=ui.sz(50);
+    if (vimg.t) gl_draw_quad(vc_x+ui.sz(20),dp_y+(disc_h-vimg_sz)/2,vimg_sz,vimg_sz,vimg.t,{1,1,1,1});
+    ui.font.text(vc_x+vimg_sz+ui.sz(30),dp_y+disc_h/2-ui.sz(18),m.verdict_title.c_str(),THEME_TEXT,ui.ts(0.8f));
+    ui.font.text(vc_x+vimg_sz+ui.sz(30),dp_y+disc_h/2+ui.sz(2),m.verdict_detail.c_str(),THEME_TEXT_MUTED,ui.ts(0.55f));
+    // change ISO button
+    float iso_bw=ui.sz(100), iso_bh=ui.sz(30);
+    float iso_x=vc_x-iso_bw-mgn+vc_w;
+    if (ui.button(ui.alloc_id(),iso_x,dp_y+ui.sz(12),iso_bw,iso_bh)) {
+        std::string p=win_pick_file(window,"Select disc image","Disc image (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All files (*.*)\0*.*\0\0");
+        if (!p.empty()){ m.disc_path=fs::path(p).generic_string(); refresh_disc_status(m,game_name,expected_serial,expected_crc,has_expected_crc); }
+    } float lbw=ui.font.width("Change ISO",ui.ts(0.6f));
+    ui.font.text(iso_x+(iso_bw-lbw)/2,dp_y+ui.sz(12)+(iso_bh-ui.font.baseline*ui.ts(0.6f))/2,"Change ISO",THEME_TEXT,ui.ts(0.6f));
+    y=dp_y+disc_h+gap;
+
+    // ---- player cards (stacked vertically) ----
+    float cw=W-2*pad, ch=ui.sz(190);
+    for (int pl=0;pl<2;pl++){
+        float px=pad, py=y + pl*(ch+gap);
+        ui.rect(px,py,cw,ch,THEME_PANEL); ui.rect(px,py,cw,1,THEME_BORDER);
+        ui.font.text(px+mgn,py+ui.sz(12),pl==0?"PLAYER 1":"PLAYER 2",THEME_ACCENT,ui.ts(0.55f));
+        int& mode=pl==0?m.p1_mode:m.p2_mode;
+        if (m.mode_selectable) {
+            const char* seg_opts[]={"Hybrid","Analog","D-Pad"};
+            int n=m.allow_hybrid?3:2;
+            float seg_w=ui.sz(200), seg_h=ui.sz(24), seg_x=px+cw-mgn-seg_w, seg_y=py+ui.sz(10);
+            float sw=seg_w/n;
+            for (int i=0;i<n;i++){
+                int id=ui.alloc_id(); float sx=seg_x+sw*i;
+                bool over=ui.hot(id,sx,seg_y,sw,seg_h);
+                if (ui.mouse_pressed&&over) ui.active_id=id;
+                bool clk=ui.mouse_released&&ui.active_id==id&&over;
+                if (ui.mouse_released&&ui.active_id==id) ui.active_id=0;
+                Color bgc=(i==mode)?THEME_SEG_ON:(over?THEME_BTN_HOVER:THEME_SEG_BG);
+                ui.rect(sx,seg_y,sw,seg_h,bgc);
+                float tw2=ui.font.width(seg_opts[i],ui.ts(0.5f));
+                ui.font.text(sx+(sw-tw2)/2,seg_y+(seg_h-ui.font.baseline*ui.ts(0.5f))/2,seg_opts[i],THEME_TEXT,ui.ts(0.5f));
+                if (clk) mode=i;
+                if (i<n-1) ui.rect(sx+sw-1,seg_y,1,seg_h,THEME_BORDER);
+            }
+        }
+        auto& art=mode==2?ui.pad_digital:ui.pad_analog;
+        if (art.t){
+            float as=ch-ui.sz(40), ar=(float)art.h/(float)art.w;
+            gl_draw_quad(px+mgn,py+ui.sz(40)+(ch-ui.sz(40)-as*ar)/2,as*ar,as,art.t,{1,1,1,1});
+        }
+        float ddx=px+mgn+(ui.pad_analog.t?ui.sz(140):ui.sz(20)), ddy=py+ui.sz(40), ddw=cw-ddx-mgn, ddh=ui.sz(30);
+        int& dev_idx=pl==0?m.p1_dev_index:m.p2_dev_index;
+        std::string& dev_label=pl==0?m.p1_dev_label:m.p2_dev_label;
+        std::string& status=pl==0?m.p1_status:m.p2_status;
+        std::string& dot=pl==0?m.p1_dot:m.p2_dot;
+        std::string& dd_open_key=pl==0?m.dd_open:m.dd_open;
+        const char* ddk=pl==0?"p1":"p2";
+        ui.font.text(ddx,ddy-ui.sz(16),"Device",THEME_TEXT_MUTED,ui.ts(0.5f));
+        bool dd_hot=ui.hot(ui.alloc_id(),ddx,ddy,ddw,ddh);
+        ui.rect(ddx,ddy,ddw,ddh,dd_hot?THEME_BTN_HOVER:THEME_SEG_BG);
+        ui.font.text(ddx+ui.sz(8),ddy+(ddh-ui.font.baseline*ui.ts(0.65f))/2,dev_label.c_str(),THEME_TEXT,ui.ts(0.65f));
+        float caret_sz=ui.sz(13);
+        if (ui.caret.t) gl_draw_quad(ddx+ddw-ui.sz(22),ddy+(ddh-caret_sz)/2,caret_sz,caret_sz,ui.caret.t,{1,1,1,1});
+        if (ui.mouse_pressed&&dd_hot) {
+            if (dd_open_key==ddk) dd_open_key.clear(); else dd_open_key=ddk;
+        }
+        if (dd_open_key==ddk) {
+            float dpnl_y=ddy+ddh+ui.sz(2), dpnl_h=dev_opts.size()*ui.sz(28)+ui.sz(4);
+            bool dd_panel_over = ui.mx >= ddx && ui.mx <= ddx+ddw && ui.my >= dpnl_y && ui.my <= dpnl_y+dpnl_h;
+            ui.rect(ddx,dpnl_y,ddw,dpnl_h,THEME_DROPDOWN_BG);
+            ui.rect(ddx,dpnl_y,ddw,1,THEME_BORDER);
+            float row_h_dd=ui.sz(28);
+            for (size_t i=0;i<dev_opts.size();i++){
+                int id=ui.alloc_id(); float oy=dpnl_y+ui.sz(4)+i*row_h_dd;
+                bool oh=ui.hot(id,ddx,oy,ddw,row_h_dd);
+                if (oh) ui.rect(ddx,oy,ddw,row_h_dd,THEME_BTN_HOVER);
+                ui.font.text(ddx+ui.sz(8),oy+(row_h_dd-ui.font.baseline*ui.ts(0.6f))/2,dev_opts[i].label.c_str(),THEME_TEXT,ui.ts(0.6f));
+                if (ui.mouse_released&&oh){
+                    dev_idx=(int)i; dd_open_key.clear();
+                    refresh_player(m,pl,dev_opts);
+                }
+                if (ui.mouse_pressed&&oh) ui.active_id=id;
+            }
+            // close only on outside click (not over button, not over panel)
+            if (ui.mouse_pressed && !dd_hot && !dd_panel_over) dd_open_key.clear();
+        }
+        float sty=ddy+ddh+ui.sz(8);
+        float dot_sz=ui.sz(9);
+        if (!dot.empty()) ui.rect(ddx,sty+ui.sz(4),dot_sz,dot_sz,THEME_TEXT_MUTED);
+        else ui.rect(ddx,sty+ui.sz(4),dot_sz,dot_sz,THEME_GREEN);
+        ui.font.text(ddx+ui.sz(16),sty,status.c_str(),THEME_TEXT_DIM,ui.ts(0.55f));
     }
-    if (any) return true;
-#if defined(_WIN32)
-    const char* sys[] = { "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf" };
-    for (const char* p : sys)
-        if (Rml::LoadFontFace(p)) any = true;
-#endif
-    return any;
+    float player_end = y + 2*(ch+gap);
+
+    // ---- memory cards (stacked vertically) ----
+    float mc_y = player_end, mc_h=ui.sz(190);
+    for (int mc=0;mc<2;mc++){
+        float px=pad, py=mc_y + mc*(mc_h+gap);
+        ui.rect(px,py,cw,mc_h,THEME_PANEL); ui.rect(px,py,cw,1,THEME_BORDER);
+        bool& enabled=mc==0?m.mc1_enabled:m.mc2_enabled;
+        std::string& mcname=mc==0?m.mc1_name:m.mc2_name;
+        std::string& mcsize=mc==0?m.mc1_size:m.mc2_size;
+        std::string& mcused=mc==0?m.mc1_used:m.mc2_used;
+        std::string& mcgrid=mc==0?m.mc1_grid:m.mc2_grid;
+        std::string& mcfoot=mc==0?m.mc1_foot:m.mc2_foot;
+        std::string& mcpath=mc==0?m.mc1_path:m.mc2_path;
+        ui.font.text(px+mgn,py+ui.sz(12),mc==0?"MEMORY CARD 1":"MEMORY CARD 2",THEME_ACCENT,ui.ts(0.55f));
+        float tog_w=ui.sz(42), tog_h=ui.sz(22);
+        float tog_x=px+cw-ui.sz(60), tog_y=py+ui.sz(10);
+        if (ui.toggle(ui.alloc_id(),tog_x,tog_y,tog_w,tog_h,enabled)) enabled=!enabled;
+        ui.font.text(tog_x-ui.sz(48),tog_y+(tog_h-ui.font.baseline*ui.ts(0.55f))/2,"Enabled",THEME_TEXT_DIM,ui.ts(0.55f));
+        float mc_art_w=ui.sz(80), mc_art_h=ui.sz(90);
+        if (ui.memcard_img.t) gl_draw_quad(px+mgn,py+ui.sz(38),mc_art_w,mc_art_h,ui.memcard_img.t,{1,1,1,1});
+        float lx=px+ui.sz(112), ly=py+ui.sz(36);
+        ui.font.text(lx,ly,mcname.c_str(),THEME_TEXT,ui.ts(0.8f));
+        float btn_sz_h=ui.sz(22), btn_sz_w=ui.sz(60);
+        if (ui.button(ui.alloc_id(),lx,ly+ui.sz(24),btn_sz_w,btn_sz_h)) {
+            std::string p=win_pick_file(window,"Select memory-card image","Memory card (*.mcd;*.mc;*.mcr)\0*.mcd;*.mc;*.mcr\0All files (*.*)\0*.*\0\0");
+            if (!p.empty()){mcpath=fs::path(p).generic_string(); }
+        } ui.font.text(lx+ui.sz(10),ly+ui.sz(24)+(btn_sz_h-ui.font.baseline*ui.ts(0.55f))/2,"Browse",THEME_TEXT,ui.ts(0.55f));
+        if (ui.button(ui.alloc_id(),lx+btn_sz_w+ui.sz(6),ly+ui.sz(24),btn_sz_w,btn_sz_h)) {
+            std::string p=win_pick_save_file(window,"Create new memory card","Memory card (*.mcd)\0*.mcd\0All files (*.*)\0*.*\0\0","mcd",mcpath);
+            if (!p.empty()&&memcard_format_file(p.c_str())==0) mcpath=fs::path(p).generic_string();
+        } ui.font.text(lx+btn_sz_w+ui.sz(16),ly+ui.sz(24)+(btn_sz_h-ui.font.baseline*ui.ts(0.55f))/2,"New",THEME_TEXT,ui.ts(0.55f));
+        ui.font.text(lx,ly+ui.sz(54),mcsize.c_str(),THEME_TEXT,ui.ts(0.65f));
+        ui.font.text(lx,ly+ui.sz(68),mcused.c_str(),THEME_TEXT,ui.ts(0.65f));
+        float gx=lx, gy=ly+ui.sz(84);
+        for (size_t i=0;i<mcgrid.size();i++){
+            bool filled=mcgrid[i]=='X';
+            float bs=ui.sz(13), bw=ui.sz(15), bh=ui.sz(16);
+            ui.rect(gx+i*bw,gy,bs,bh,filled?THEME_ACCENT:THEME_BORDER);
+        }
+        ui.font.text(lx,gy+ui.sz(20),mcfoot.c_str(),THEME_TEXT_MUTED,ui.ts(0.5f));
+    }
+    float mc_end = mc_y + 2*(mc_h+gap);
+
+    return mc_end + gap;
 }
 
 } // namespace
@@ -637,57 +686,24 @@ Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
            const GameInfo& game, const char* assets_dir)
 {
-    (void)gl_context;  // already created + current; we only need the window.
+    (void)gl_context; // caller passed it in, we just render with it
 
-    // Keyboard keybinds live in keybinds.ini next to the exe (assets_dir == the
-    // exe dir). Load them so the Controls page edits the real, persisted map;
-    // the runtime re-reads the same file at startup (psx_keybinds_init).
     psx_keybinds_init(assets_dir);
 
     const std::string expected_serial = game.expected_serial ? game.expected_serial : "";
     const uint32_t    expected_crc    = game.expected_crc;
     const bool        has_expected_crc = game.has_expected_crc;
+    const std::string game_name_s = game.name ? game.name : "";
+    const std::string game_id_s   = game.expected_serial ? game.expected_serial : "";
 
-    if (!RmlGL3::Initialize()) {
-        std::fprintf(stderr, "launcher: RmlGL3::Initialize failed\n");
-        return Result::Unavailable;
-    }
-
-    LauncherSystemInterface system_interface;
-    system_interface.SetWindow(window);
-    LauncherRenderInterface render_interface;
-    if (!render_interface) {
-        std::fprintf(stderr, "launcher: GL3 render interface init failed\n");
-        RmlGL3::Shutdown();
-        return Result::Unavailable;
-    }
-
-    Rml::SetSystemInterface(&system_interface);
-    Rml::SetRenderInterface(&render_interface);
-    if (!Rml::Initialise()) {
-        std::fprintf(stderr, "launcher: Rml::Initialise failed\n");
-        RmlGL3::Shutdown();
-        return Result::Unavailable;
-    }
-
+    UI ui;
     const fs::path assets = assets_dir ? fs::path(assets_dir) : fs::current_path();
-    if (!load_fonts(assets))
-        std::fprintf(stderr, "launcher: warning — no font face loaded; text will not render\n");
-
-    int win_w = 0, win_h = 0;
-    SDL_GL_GetDrawableSize(window, &win_w, &win_h);
-    if (win_w <= 0 || win_h <= 0) { win_w = 1280; win_h = 800; }
-    render_interface.SetViewport(win_w, win_h);
-
-    Rml::Context* context = Rml::CreateContext("launcher", Rml::Vector2i(win_w, win_h));
-    if (!context) {
-        std::fprintf(stderr, "launcher: CreateContext failed\n");
-        Rml::Shutdown();
-        RmlGL3::Shutdown();
+    if (!load_assets(ui, assets)) {
+        std::fprintf(stderr, "launcher: asset loading failed\n");
         return Result::Unavailable;
     }
 
-    // ---- Seed the model from the effective settings ----
+    // ---- seed model from io ----
     LauncherModel m;
     m.renderer       = io.renderer;
     m.supersampling  = io.supersampling;
@@ -700,546 +716,438 @@ Result run(SDL_Window* window, void* gl_context,
     m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
-    // Games whose widescreen is unported/unvalidated declare [widescreen]
-    // offer=false: hide the toggle AND clamp a stale persisted 16:9 back to
-    // 4:3 so the hack can't engage from an old settings.toml.
-    m.ws_eligible    = game.ws_offered;
-    if (!game.ws_offered) m.aspect_index = 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
-    m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
-    m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
+    if (io.has_bios_path) m.bios_path = io.bios_path.generic_string();
+    if (io.has_disc_path) m.disc_path = io.disc_path.generic_string();
     refresh_labels(m);
-    const std::string game_name_s = game.name ? game.name : "";
     refresh_disc_status(m, game_name_s, expected_serial, expected_crc, has_expected_crc);
 
-    // ---- Seed the memory-card slots from the effective settings ----
     if (io.has_memcard1_enabled) m.mc1_enabled = io.memcard1_enabled;
     if (io.has_memcard2_enabled) m.mc2_enabled = io.memcard2_enabled;
     m.mc1_path = memcard_slot_path(io, 0);
     m.mc2_path = memcard_slot_path(io, 1);
-    refresh_memcard(m, 0);
-    refresh_memcard(m, 1);
+    refresh_memcard(m, 0, io);
+    refresh_memcard(m, 1, io);
 
-    // ---- Seed the controller slots: enumerate devices, resolve selections ----
     std::vector<DeviceOption> dev_opts = enumerate_devices();
-    m.p1_mode = io.has_p1_mode ? io.p1_mode : PSXRecompV4::PAD_MODE_HYBRID;
-    m.p2_mode = io.has_p2_mode ? io.p2_mode : PSXRecompV4::PAD_MODE_HYBRID;
-    // When the game hides Hybrid, never leave a port selected on it (a stale
-    // settings.toml or the Hybrid default would otherwise highlight nothing).
+    m.p1_mode = io.has_p1_mode ? io.p1_mode : 0;
+    m.p2_mode = io.has_p2_mode ? io.p2_mode : 0;
     m.allow_hybrid = game.allow_hybrid;
     if (!m.allow_hybrid) {
-        if (m.p1_mode == PSXRecompV4::PAD_MODE_HYBRID) m.p1_mode = PSXRecompV4::PAD_MODE_ANALOG;
-        if (m.p2_mode == PSXRecompV4::PAD_MODE_HYBRID) m.p2_mode = PSXRecompV4::PAD_MODE_ANALOG;
+        if (m.p1_mode == 0) m.p1_mode = 1;
+        if (m.p2_mode == 0) m.p2_mode = 1;
     }
-    // lock_mode: a single-pad-type game (e.g. Tomba 2, digital-only). Hide the
-    // whole pad-mode selector and force both ports to the game's locked mode,
-    // overriding any stale settings.toml so a broken mode can't be selected.
     m.mode_selectable = !game.lock_mode;
-    if (game.lock_mode) {
-        m.p1_mode = game.locked_mode;
-        m.p2_mode = game.locked_mode;
-    }
-    // lock_device: hide the Player controller cards entirely — the pad type is
-    // fixed and auto-bound (e.g. Ape Escape ships DualShock analog, no choice).
-    m.device_locked = game.lock_device;
+    if (game.lock_mode) { m.p1_mode = game.locked_mode; m.p2_mode = game.locked_mode; }
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
-    if (io.has_p1_device) {
-        m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
-    } else {
-        // Zero-config default: first plugged-in controller, else keyboard.
-        m.p1_dev_index = (dev_opts.size() > 2) ? 2 : 1;
-    }
+    m.uiscale = io.has_uiscale ? io.uiscale : 1.0f;
+    m.p1_dev_index = io.has_p1_device ? find_or_add_device_index(dev_opts, io.p1_device) : (dev_opts.size()>2?2:1);
     m.p2_dev_index = io.has_p2_device ? find_or_add_device_index(dev_opts, io.p2_device) : 0;
     refresh_player(m, 0, dev_opts);
     refresh_player(m, 1, dev_opts);
 
-    // ---- Seed the localization dropdown (only when the game declares one) ----
     m.lang_menu = !game.languages.empty();
-    if (m.lang_menu) {
-        m.lang_index = lang_index_for(game.languages, io.language);
-        refresh_language(m, game.languages);
-    }
+    if (m.lang_menu) { m.lang_index = lang_index_for(game.languages, io.language); refresh_language(m, game.languages); }
 
-    // ---- Data model: bind fields + action callbacks ----
-    Rml::DataModelConstructor c = context->CreateDataModel("settings");
-    if (!c) {
-        Rml::Shutdown();
-        RmlGL3::Shutdown();
-        return Result::Unavailable;
-    }
-    Rml::String title = game.name ? Rml::String(game.name) : Rml::String("PSX");
-    c.BindFunc("game_name", [title](Rml::Variant& out) { out = title; });
-    c.Bind("supersampling",  &m.supersampling);
-    c.Bind("antialiasing",   &m.antialiasing);
-    c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
-    c.Bind("turbo_loads",    &m.turbo_loads);
-    c.Bind("fullscreen",     &m.fullscreen);
-    c.Bind("skip_launcher",  &m.skip_launcher);
-    c.Bind("show_skip_modal",&m.show_skip_modal);
-    c.Bind("spu_hq",         &m.spu_hq);
-    c.Bind("renderer_label", &m.renderer_label);
-    c.Bind("crt_label",      &m.crt_label);
-    c.Bind("aspect_label",   &m.aspect_label);
-    c.Bind("widescreen",     &m.widescreen);
-    c.Bind("ws_eligible",    &m.ws_eligible);
-    c.Bind("winsize_label",  &m.winsize_label);
-    c.Bind("texfilter_label",&m.texfilter_label);
-    c.Bind("bios_path",      &m.bios_path);
-    c.Bind("disc_path",      &m.disc_path);
-    c.Bind("disc_file",      &m.disc_file);
-    c.Bind("disc_region",    &m.disc_region);
-    c.Bind("disc_serial",    &m.disc_serial);
-    c.Bind("v_header",       &m.v_header);
-    c.Bind("v_crc",          &m.v_crc);
-    c.Bind("v_verified",     &m.v_verified);
-    c.Bind("verdict_title",  &m.verdict_title);
-    c.Bind("verdict_detail", &m.verdict_detail);
-    c.Bind("verdict_state",  &m.verdict_state);
-    c.Bind("view",           &m.view);
-    c.Bind("cfg_player",     &m.cfg_player);
-    c.Bind("cfg_player_label", &m.cfg_player_label);
-    c.Bind("p1_mode",        &m.p1_mode);
-    c.Bind("p2_mode",        &m.p2_mode);
-    c.Bind("allow_hybrid",   &m.allow_hybrid);
-    c.Bind("mode_selectable",&m.mode_selectable);
-    c.Bind("device_locked",  &m.device_locked);
-    c.Bind("deadzone_pct",   &m.deadzone_pct);
-    c.Bind("p1_dev_label",   &m.p1_dev_label);
-    c.Bind("p2_dev_label",   &m.p2_dev_label);
-    c.Bind("p1_status",      &m.p1_status);
-    c.Bind("p2_status",      &m.p2_status);
-    c.Bind("p1_dot",         &m.p1_dot);
-    c.Bind("p2_dot",         &m.p2_dot);
-    c.Bind("p1_options",     &m.p1_options);
-    c.Bind("p2_options",     &m.p2_options);
-    c.Bind("dd_open",        &m.dd_open);
-    c.Bind("lang_menu",      &m.lang_menu);
-    c.Bind("lang_label",     &m.lang_label);
-    c.Bind("mc1_enabled",    &m.mc1_enabled);
-    c.Bind("mc2_enabled",    &m.mc2_enabled);
-    c.Bind("mc1_name",       &m.mc1_name);
-    c.Bind("mc2_name",       &m.mc2_name);
-    c.Bind("mc1_size",       &m.mc1_size);
-    c.Bind("mc2_size",       &m.mc2_size);
-    c.Bind("mc1_used",       &m.mc1_used);
-    c.Bind("mc2_used",       &m.mc2_used);
-    c.Bind("mc1_foot",       &m.mc1_foot);
-    c.Bind("mc2_foot",       &m.mc2_foot);
-    c.Bind("mc1_grid",       &m.mc1_grid);
-    c.Bind("mc2_grid",       &m.mc2_grid);
+    // GL setup happens in ui.begin_frame which calls gl_ensure_init
 
-    Rml::DataModelHandle handle = c.GetModelHandle();
-
-    // ---- keyboard keybind rebinding (Controls page) --------------------------
-    // The chip list is built programmatically after the document loads (data-for
-    // can't generate the per-button chips), and re-wired on each rebuild. A scan
-    // is armed when a chip is clicked; the SDL loop then swallows the next keydown
-    // and resolves it (Esc cancels). Bindings save to keybinds.ini immediately on
-    // capture. Mirrors snesrecomp's launcher Configure view.
-    Rml::ElementDocument*  kbdoc = nullptr;           // set after LoadDocument
-    std::function<void()>  build_rebind_list;         // set after LoadDocument
-    bool  rebuild_pending = false;
-    int   scan_kind  = 0;                              // 0=idle, 1=capturing
-    int   scan_index = 0;                              // button being rebound
-    std::string scan_chip_id;
-
-    auto kb_chip_label = [&m](int button) -> std::string {
-        SDL_Scancode sc = psx_keybinds_get_button(m.cfg_player + 1, button);
-        const char* n = (sc != SDL_SCANCODE_UNKNOWN) ? SDL_GetScancodeName(sc) : "";
-        return (n && n[0]) ? std::string(n) : std::string("None");
-    };
-    auto end_scan = [&]() {
-        if (!scan_kind) return;
-        if (kbdoc) if (Rml::Element* e = kbdoc->GetElementById(scan_chip_id)) {
-            e->SetInnerRML(kb_chip_label(scan_index));
-            e->SetClass("rb-chip--scan", false);
-        }
-        scan_kind = 0; scan_chip_id.clear();
-    };
-    auto begin_scan = [&](int index, const std::string& chip_id) {
-        end_scan();
-        scan_kind = 1; scan_index = index; scan_chip_id = chip_id;
-        if (kbdoc) if (Rml::Element* e = kbdoc->GetElementById(chip_id)) {
-            e->SetInnerRML("Press a key...");
-            e->SetClass("rb-chip--scan", true);
-        }
-    };
-    auto handle_scan_key = [&](const SDL_KeyboardEvent& ke) {
-        if (ke.keysym.sym == SDLK_ESCAPE) { end_scan(); return; }
-        const SDL_Scancode sc = ke.keysym.scancode;
-        // Steal: a key already bound elsewhere (either player) moves here instead
-        // of silently double-firing.
-        for (int pl = 1; pl <= 2; pl++)
-            for (int b = 0; b < psx_keybinds_button_count(); b++)
-                if (psx_keybinds_get_button(pl, b) == sc &&
-                    !(pl == m.cfg_player + 1 && b == scan_index))
-                    psx_keybinds_set_button(pl, b, SDL_SCANCODE_UNKNOWN);
-        psx_keybinds_set_button(m.cfg_player + 1, scan_index, sc);
-        psx_keybinds_save();
-        end_scan();
-        rebuild_pending = true;   // stolen chips refresh too
-    };
-
-    c.BindEventCallback("show_controls",
-        [&m, handle, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            end_scan();
-            m.view = "controls"; handle.DirtyVariable("view");
-            rebuild_pending = true;
-        });
-    c.BindEventCallback("cfg_player_1",
-        [&m, handle, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            end_scan();
-            m.cfg_player = 0; m.cfg_player_label = "1";
-            handle.DirtyVariable("cfg_player"); handle.DirtyVariable("cfg_player_label");
-            rebuild_pending = true;
-        });
-    c.BindEventCallback("cfg_player_2",
-        [&m, handle, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            end_scan();
-            m.cfg_player = 1; m.cfg_player_label = "2";
-            handle.DirtyVariable("cfg_player"); handle.DirtyVariable("cfg_player_label");
-            rebuild_pending = true;
-        });
-    c.BindEventCallback("rebind_reset",
-        [&m, &end_scan, &rebuild_pending](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            end_scan();
-            psx_keybinds_reset_player(m.cfg_player + 1);
-            psx_keybinds_save();
-            rebuild_pending = true;
-        });
-
-    c.BindEventCallback("cycle_renderer",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.renderer ^= 1;
-            refresh_labels(m);
-            handle.DirtyVariable("renderer_label");
-        });
-    c.BindEventCallback("cycle_ss",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.supersampling = (m.supersampling % 4) + 1;
-            handle.DirtyVariable("supersampling");
-        });
-    c.BindEventCallback("toggle_aa",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.antialiasing = !m.antialiasing;
-            handle.DirtyVariable("antialiasing");
-        });
-    c.BindEventCallback("cycle_texfilter",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.texture_filter ^= 1; refresh_labels(m);
-            handle.DirtyVariable("texfilter_label");
-        });
-    c.BindEventCallback("cycle_crt",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.crt = (m.crt + 1) % 4; refresh_labels(m);
-            handle.DirtyVariable("crt_label");
-        });
-    c.BindEventCallback("cycle_aspect",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.aspect_index = (m.aspect_index + 1) % kNumAspects; refresh_labels(m);
-            handle.DirtyVariable("aspect_label");
-            handle.DirtyVariable("winsize_label");  /* height follows aspect */
-        });
-    // EXPERIMENTAL widescreen On/Off. On => 16:9 native-wide (aspect_index 1),
-    // Off => 4:3 (aspect_index 0). Works on BOTH renderers (SW + the GL wide
-    // compositor), so it is no longer gated on the software renderer.
-    //
-    // 21:9 (kAspects[2]) is STUBBED but intentionally hidden: the engine handles
-    // it (offset / cull / compositor are all aspect-derived), but the parallax +
-    // far-backdrop pipeline only generates ~16:9 of coverage, so 21:9 voids the
-    // far background. When that pipeline is widened, promote this 2-state toggle
-    // to a 3-way Off / 16:9 / 21:9 — the existing cycle_aspect callback already
-    // cycles aspect_index 0/1/2 and is the scaffold for it.
-    c.BindEventCallback("toggle_widescreen",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.aspect_index = (m.aspect_index == 1) ? 0 : 1;    // 16:9 <-> 4:3
-            refresh_labels(m);
-            handle.DirtyVariable("widescreen");
-            handle.DirtyVariable("aspect_label");
-            handle.DirtyVariable("winsize_label");  /* height follows aspect */
-        });
-    c.BindEventCallback("cycle_winsize",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            int i = (winsize_index(m.window_width) + 1) % kNumWinWidths;
-            m.window_width = kWinWidths[i]; refresh_labels(m);
-            handle.DirtyVariable("winsize_label");
-        });
-    c.BindEventCallback("toggle_spu",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.spu_hq = !m.spu_hq;
-            handle.DirtyVariable("spu_hq");
-        });
-    c.BindEventCallback("toggle_skip_fmv",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.auto_skip_fmv = !m.auto_skip_fmv;
-            handle.DirtyVariable("auto_skip_fmv");
-        });
-    c.BindEventCallback("toggle_turbo_loads",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.turbo_loads = !m.turbo_loads;
-            handle.DirtyVariable("turbo_loads");
-        });
-    c.BindEventCallback("toggle_fullscreen",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.fullscreen = !m.fullscreen;
-            handle.DirtyVariable("fullscreen");
-        });
-    // Skip launcher: turning OFF is immediate; turning ON opens a confirm modal
-    // first, so the user learns the --launcher escape hatch before committing.
-    c.BindEventCallback("toggle_skip_launcher",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            if (m.skip_launcher) { m.skip_launcher = false; handle.DirtyVariable("skip_launcher"); }
-            else { m.show_skip_modal = true; handle.DirtyVariable("show_skip_modal"); }
-        });
-    c.BindEventCallback("skip_modal_confirm",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.skip_launcher = true; m.show_skip_modal = false;
-            handle.DirtyVariable("skip_launcher"); handle.DirtyVariable("show_skip_modal");
-        });
-    c.BindEventCallback("skip_modal_cancel",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.show_skip_modal = false; handle.DirtyVariable("show_skip_modal");
-        });
-    c.BindEventCallback("browse_bios",
-        [&m, window, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            std::string p = win_pick_file(window, "Select PlayStation BIOS",
-                "BIOS image (*.bin;*.rom)\0*.bin;*.rom\0All files (*.*)\0*.*\0\0");
-            if (!p.empty()) {
-                m.bios_path = fs::path(p).generic_string();
-                handle.DirtyVariable("bios_path");
-            }
-        });
-    auto do_browse_disc =
-        [&m, window, handle, game_name_s, expected_serial, expected_crc, has_expected_crc]
-        (Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            std::string p = win_pick_file(window, "Select disc image",
-                "Disc image (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All files (*.*)\0*.*\0\0");
-            if (!p.empty()) {
-                m.disc_path = fs::path(p).generic_string();
-                refresh_disc_status(m, game_name_s, expected_serial, expected_crc, has_expected_crc);
-                for (const char* v : {"disc_path", "disc_file", "disc_region", "disc_serial",
-                                      "v_header", "v_crc", "v_verified",
-                                      "verdict_title", "verdict_detail", "verdict_state"})
-                    handle.DirtyVariable(v);
-            }
-        };
-    c.BindEventCallback("browse_disc", do_browse_disc);
-    c.BindEventCallback("change_iso",  do_browse_disc);
-
-    c.BindEventCallback("show_settings",
-        [&m, handle, &end_scan](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            end_scan();
-            m.view = "settings"; handle.DirtyVariable("view");
-        });
-    c.BindEventCallback("show_dashboard",
-        [&m, handle, &end_scan](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            end_scan();
-            m.view = "dashboard"; handle.DirtyVariable("view");
-        });
-    // ---- controller: device dropdown + pad-mode segmented selector ----
-    auto dirty_player = [handle](int player) mutable {
-        const char* v0[] = {"p1_dev_label","p1_status","p1_dot","p1_options","p1_mode"};
-        const char* v1[] = {"p2_dev_label","p2_status","p2_dot","p2_options","p2_mode"};
-        for (const char* v : (player == 0 ? v0 : v1)) handle.DirtyVariable(v);
-    };
-    // dev_opts is captured by value: the device list is fixed for the launcher
-    // session (a hot-plug here would require a re-enumerate, deferred).
-    c.BindEventCallback("open_dd",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
-            const int player = args.empty() ? 0 : (int)args[0].Get<int>();
-            const char* key = player == 0 ? "p1" : "p2";
-            m.dd_open = (m.dd_open == key) ? Rml::String() : Rml::String(key);
-            handle.DirtyVariable("dd_open");
-        });
-    c.BindEventCallback("close_dd",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.dd_open = Rml::String(); handle.DirtyVariable("dd_open");
-        });
-    c.BindEventCallback("pick_device",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
-            if (args.size() < 2) return;
-            const int player = (int)args[0].Get<int>();
-            const int idx    = (int)args[1].Get<int>();
-            (player == 0 ? m.p1_dev_index : m.p2_dev_index) = idx;
-            refresh_player(m, player, dev_opts);
-            m.dd_open = Rml::String();
-            dirty_player(player);
-            handle.DirtyVariable("dd_open");
-        });
-    // ---- localization: Language cycle button (Settings > LOCALIZATION) ----
-    // Matches the Settings-view idiom (Renderer / Screen model cycle toggles):
-    // each click advances to the next declared language, wrapping around.
-    c.BindEventCallback("cycle_language",
-        [&m, handle, langs = game.languages](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            if (langs.empty()) return;
-            m.lang_index = (m.lang_index + 1) % (int)langs.size();
-            refresh_language(m, langs);
-            handle.DirtyVariable("lang_label");
-        });
-    // Pad-mode segmented selector: each segment passes its mode (0=hybrid,
-    // 1=analog, 2=digital) so any mode is one click away.
-    c.BindEventCallback("set_mode_p1",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
-            if (args.empty()) return;
-            m.p1_mode = (int)args[0].Get<int>(); refresh_player(m, 0, dev_opts); dirty_player(0);
-        });
-    c.BindEventCallback("set_mode_p2",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
-            if (args.empty()) return;
-            m.p2_mode = (int)args[0].Get<int>(); refresh_player(m, 1, dev_opts); dirty_player(1);
-        });
-    /* Analog-stick deadzone, stepped 0..50% (wraps). Applies to both the
-     * stick->d-pad threshold and the analog centre dead-band. */
-    c.BindEventCallback("cycle_deadzone",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.deadzone_pct += 5;
-            if (m.deadzone_pct > 50) m.deadzone_pct = 0;
-            handle.DirtyVariable("deadzone_pct");
-        });
-    c.BindEventCallback("toggle_mc1",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.mc1_enabled = !m.mc1_enabled; handle.DirtyVariable("mc1_enabled");
-        });
-    c.BindEventCallback("toggle_mc2",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.mc2_enabled = !m.mc2_enabled; handle.DirtyVariable("mc2_enabled");
-        });
-
-    auto dirty_mc = [handle](int slot) mutable {
-        const char* v0[] = {"mc1_name","mc1_size","mc1_used","mc1_foot","mc1_grid"};
-        const char* v1[] = {"mc2_name","mc2_size","mc2_used","mc2_foot","mc2_grid"};
-        for (const char* v : (slot == 0 ? v0 : v1)) handle.DirtyVariable(v);
-    };
-    auto browse_mc = [&m, window, dirty_mc](int slot) mutable {
-        std::string p = win_pick_file(window, "Select memory-card image",
-            "Memory card (*.mcd;*.mc;*.mcr)\0*.mcd;*.mc;*.mcr\0All files (*.*)\0*.*\0\0");
-        if (p.empty()) return;
-        (slot == 0 ? m.mc1_path : m.mc2_path) = fs::path(p).generic_string();
-        refresh_memcard(m, slot);
-        dirty_mc(slot);
-    };
-    auto new_mc = [&m, window, dirty_mc](int slot) mutable {
-        Rml::String& cur = (slot == 0 ? m.mc1_path : m.mc2_path);
-        std::string p = win_pick_save_file(window, "Create new memory card",
-            "Memory card (*.mcd)\0*.mcd\0All files (*.*)\0*.*\0\0", "mcd",
-            std::string(cur));
-        if (p.empty()) return;
-        if (memcard_format_file(p.c_str()) != 0) return;  // I/O failure: leave as-is
-        cur = fs::path(p).generic_string();
-        refresh_memcard(m, slot);
-        dirty_mc(slot);
-    };
-    c.BindEventCallback("browse_mc1",
-        [browse_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { browse_mc(0); });
-    c.BindEventCallback("browse_mc2",
-        [browse_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { browse_mc(1); });
-    c.BindEventCallback("new_mc1",
-        [new_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { new_mc(0); });
-    c.BindEventCallback("new_mc2",
-        [new_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { new_mc(1); });
-    c.BindEventCallback("launch",
-        [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { m.launch_requested = true; });
-    c.BindEventCallback("quit",
-        [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { m.quit_requested = true; });
-
-    // ---- Load the document ----
-    const fs::path rml = assets / "launcher.rml";
-    Rml::ElementDocument* doc = context->LoadDocument(rml.generic_string());
-    if (!doc) {
-        std::fprintf(stderr, "launcher: failed to load %s — booting without launcher\n",
-                     rml.generic_string().c_str());
-        Rml::Shutdown();
-        RmlGL3::Shutdown();
-        return Result::Unavailable;
-    }
-    doc->Show();
-
-    // ---- build the keybind chip list (Controls page) ----
-    // data-if only hides the controls view, so #rebind-list exists from load and
-    // GetElementById finds it even while the dashboard is showing. Each chip is a
-    // <button> whose click arms a scan; listeners are re-wired on every rebuild.
-    kbdoc = doc;
-    struct KbClickListener : Rml::EventListener {
-        std::function<void()> on_click;
-        void ProcessEvent(Rml::Event&) override { if (on_click) on_click(); }
-    };
-    std::vector<std::unique_ptr<KbClickListener>> kb_listeners;
-    build_rebind_list = [&]() {
-        Rml::Element* list = doc->GetElementById("rebind-list");
-        if (!list) return;
-        const int n = psx_keybinds_button_count();
-        std::string html;
-        for (int b = 0; b < n; b += 2) {          // two (label, chip) pairs per row
-            html += "<div class=\"rb-row\">";
-            for (int k = b; k < b + 2 && k < n; k++) {
-                html += "<span class=\"rb-label\">";
-                html += rml_escape(psx_keybinds_button_label(k));
-                html += "</span><button class=\"rb-chip\" id=\"kb-";
-                html += psx_keybinds_button_name(k);
-                html += "\">" + rml_escape(kb_chip_label(k)) + "</button>";
-            }
-            html += "</div>";
-        }
-        list->SetInnerRML(html);              // destroys prior chips...
-        kb_listeners.clear();                 // ...so dropping their listeners is safe
-        for (int k = 0; k < n; k++) {
-            const std::string id = std::string("kb-") + psx_keybinds_button_name(k);
-            if (Rml::Element* e = doc->GetElementById(id)) {
-                auto lis = std::make_unique<KbClickListener>();
-                lis->on_click = [&, k, id]() { begin_scan(k, id); };
-                e->AddEventListener(Rml::EventId::Click, lis.get());
-                kb_listeners.push_back(std::move(lis));
-            }
-        }
-    };
-    build_rebind_list();
-
-    // ---- Main loop ----
+    // ---- main loop ----
     Result result = Result::Quit;
     bool running = true;
+    int win_w = 0, win_h = 0;
+    SDL_GL_GetDrawableSize(window, &win_w, &win_h);
+    if (win_w <= 0 || win_h <= 0) { win_w = 1280; win_h = 960; }
+
+    // For tracking mouse press/release
+    bool prev_mouse = false;
+
     while (running) {
+        SDL_GL_GetDrawableSize(window, &win_w, &win_h);
+        if (win_w <= 0 || win_h <= 0) { win_w = 1280; win_h = 960; }
+
+        ui.begin_frame(win_w, win_h);
+        ui.scale *= m.uiscale;
+
+        // ---- input ----
+        { int mx,my; SDL_GetMouseState(&mx,&my); ui.mx=(float)mx; ui.my=(float)my; }
+        ui.mouse_down = (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+        ui.mouse_pressed = ui.mouse_down && !prev_mouse;
+        ui.mouse_released = !ui.mouse_down && prev_mouse;
+        prev_mouse = ui.mouse_down;
+        std::memset(ui.keys, 0, sizeof(ui.keys));
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            // While a rebind scan is armed, swallow keyboard input (the next
-            // keydown resolves it; Esc cancels) so it can't leak into RmlUi
-            // controls.
-            if (scan_kind &&
-                (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP || ev.type == SDL_TEXTINPUT)) {
-                if (ev.type == SDL_KEYDOWN) handle_scan_key(ev.key);
-                continue;
-            }
             switch (ev.type) {
-            case SDL_QUIT:
-                m.quit_requested = true;
+            case SDL_QUIT: m.quit_requested = true; break;
+            case SDL_KEYDOWN:
+                if (ev.key.keysym.scancode < SDL_NUM_SCANCODES) ui.keys[ev.key.keysym.scancode] = true;
+                // keybind scan capture
+                if (m.scan_kind) {
+                    if (ev.key.keysym.sym == SDLK_ESCAPE) { m.scan_kind = 0; m.rebuild_pending = true; }
+                    else {
+                        SDL_Scancode sc = ev.key.keysym.scancode;
+                        for (int pl = 1; pl <= 2; pl++)
+                            for (int b = 0; b < psx_keybinds_button_count(); b++)
+                                if (psx_keybinds_get_button(pl, b) == sc &&
+                                    !(pl == m.cfg_player + 1 && b == m.scan_index))
+                                    psx_keybinds_set_button(pl, b, SDL_SCANCODE_UNKNOWN);
+                        psx_keybinds_set_button(m.cfg_player + 1, m.scan_index, sc);
+                        psx_keybinds_save();
+                        m.scan_kind = 0;
+                        m.rebuild_pending = true;
+                    }
+                }
+                break;
+            case SDL_MOUSEWHEEL:
+                ui.scroll_y += ev.wheel.y * ui.sz(30);
                 break;
             case SDL_WINDOWEVENT:
-                if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
                     SDL_GL_GetDrawableSize(window, &win_w, &win_h);
-                    render_interface.SetViewport(win_w, win_h);
-                    context->SetDimensions(Rml::Vector2i(win_w, win_h));
-                }
-                RmlSDL::InputEventHandler(context, ev);
                 break;
-            default:
-                RmlSDL::InputEventHandler(context, ev);
-                break;
+            default: break;
             }
         }
 
+        // ---- quit / launch signals ----
         if (m.launch_requested) { result = Result::Launch; running = false; }
         if (m.quit_requested)   { result = Result::Quit;   running = false; }
+        if (m.scan_kind) {
+            // if scanning for a keybind, don't process normal UI
+            // just keep rendering the background
+        }
 
-        // Deferred chip-list rebuild (set from chip handlers / scan capture /
-        // player switch / reset — never rebuild a list from inside its own
-        // listener's dispatch).
-        if (rebuild_pending) { rebuild_pending = false; build_rebind_list(); }
+        // ---- full render every frame (even scan mode) ----
+        // We need to implement the view switching and draw everything here.
+        // Since we can't use closures/event-bindings like RmlUi, we inline
+        // the view drawing into the loop using switch on m.view.
 
-        context->Update();
+        // Clear
+        glViewport(0, 0, win_w, win_h);
+        glClearColor(THEME_BG.r, THEME_BG.g, THEME_BG.b, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        gl_ensure_init();
 
-        render_interface.Clear();
-        render_interface.BeginFrame();
-        context->Render();
-        render_interface.EndFrame();
+        const float s = ui.scale;
+        const float W = (float)win_w, H = (float)win_h;
+        const float pad = ui.sz(22);
+
+        // ---- background ----
+        ui.rect(0, 0, W, H, THEME_BG);
+
+        // ---- common top bar ----
+        float logo_sz = ui.sz(46);
+        if (ui.logo.t) gl_draw_quad(pad, pad, logo_sz, logo_sz, ui.logo.t, {1,1,1,1});
+        float tb_tx = pad + logo_sz + ui.sz(16);
+        ui.font.text(tb_tx, pad + (logo_sz - ui.font.baseline*ui.ts(1.2f))/2, (game_name_s + " Recomp").c_str(), THEME_TEXT, ui.ts(1.2f));
+        ui.font.text(tb_tx, pad + logo_sz - ui.sz(16), (game_name_s + " launcher").c_str(), THEME_TEXT_DIM, ui.ts(0.7f));
+
+        // top-right buttons
+        float tb_btn_h = ui.sz(30);
+        float tb_btn_y = pad + (logo_sz - tb_btn_h)/2;
+        float bw_back = ui.font.width("Back", ui.ts(0.6f)) + ui.sz(24);
+        float bw_ctl  = ui.font.width("Controls", ui.ts(0.6f)) + ui.sz(24);
+        float bw_set  = ui.font.width("Settings", ui.ts(0.6f)) + ui.sz(24);
+        float bw_launch = ui.font.width("LAUNCH", ui.ts(0.8f)) + ui.sz(40);
+
+        if (m.view == "dashboard") {
+            // Controls button
+            float cx = W - pad - bw_launch - ui.sz(16) - bw_set - ui.sz(8) - bw_ctl;
+            if (ui.button(ui.alloc_id(), cx, tb_btn_y, bw_ctl, tb_btn_h)) m.view = "controls";
+            ui.font.text(cx + (bw_ctl - ui.font.width("Controls", ui.ts(0.6f)))/2,
+                         tb_btn_y + (tb_btn_h - ui.font.baseline*ui.ts(0.6f))/2,
+                         "Controls", THEME_TEXT, ui.ts(0.6f));
+            // Settings button
+            cx = W - pad - bw_launch - ui.sz(16) - bw_set;
+            if (ui.button(ui.alloc_id(), cx, tb_btn_y, bw_set, tb_btn_h)) m.view = "settings";
+            ui.font.text(cx + (bw_set - ui.font.width("Settings", ui.ts(0.6f)))/2,
+                         tb_btn_y + (tb_btn_h - ui.font.baseline*ui.ts(0.6f))/2,
+                         "Settings", THEME_TEXT, ui.ts(0.6f));
+        } else {
+            // Back button
+            float cx = W - pad - bw_back;
+            if (ui.button(ui.alloc_id(), cx, tb_btn_y, bw_back, tb_btn_h)) m.view = "dashboard";
+            ui.font.text(cx + (bw_back - ui.font.width("Back", ui.ts(0.6f)))/2,
+                         tb_btn_y + (tb_btn_h - ui.font.baseline*ui.ts(0.6f))/2,
+                         "Back", THEME_TEXT, ui.ts(0.6f));
+        }
+
+        float y = pad + logo_sz + ui.sz(13);
+
+        // ---- main content based on view ----
+        if (m.view == "dashboard") {
+            // scrollable content: from y to above footer
+            float disc_h = ui.sz(220), card_h = ui.sz(190), mc_h = ui.sz(190);
+            float gap_s = ui.sz(13);
+            float base_h = disc_h + gap_s + 2*(card_h+gap_s) + 2*(mc_h+gap_s) + gap_s;
+            float dash_top = y, dash_bot = H - pad - ui.sz(20) - ui.sz(5);
+            float avail = dash_bot - dash_top;
+            // clamp scroll
+            float max_s = avail - base_h;
+            if (max_s > 0) max_s = 0;
+            if (ui.scroll_y > 0) ui.scroll_y = 0;
+            if (ui.scroll_y < max_s) ui.scroll_y = max_s;
+            // clip
+            if (avail > 0) {
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(0, win_h-(int)dash_bot, win_w, (int)avail);
+            }
+
+            render_dashboard(ui, m, dev_opts, window, game_name_s, expected_serial, expected_crc, has_expected_crc, game.languages);
+
+            if (avail > 0) glDisable(GL_SCISSOR_TEST);
+
+            // footer
+            float footer_y = H - pad - ui.sz(20);
+            ui.rect(0, footer_y, W, 1, THEME_BORDER);
+            float skip_y = footer_y + ui.sz(10);
+            float tog_sz = ui.sz(42), tog_h = ui.sz(22);
+            if (ui.toggle(ui.alloc_id(), pad, skip_y, tog_sz, tog_h, m.skip_launcher)) {
+                if (m.skip_launcher) m.skip_launcher = false;
+                else m.show_skip_modal = true;
+            }
+            ui.font.text(pad + ui.sz(50), skip_y + (tog_h - ui.font.baseline*ui.ts(0.6f))/2, "Skip launcher", THEME_TEXT_DIM, ui.ts(0.6f));
+            ui.font.text(W/2 - ui.sz(50), skip_y + (tog_h - ui.font.baseline*ui.ts(0.55f))/2, "Recompiler ready", THEME_GREEN, ui.ts(0.55f));
+            float l_x = W - pad - bw_launch;
+            float btn_h = ui.sz(30);
+            if (ui.button(ui.alloc_id(), l_x, skip_y, bw_launch, btn_h)) m.launch_requested = true;
+            ui.font.text(l_x + (bw_launch - ui.font.width("LAUNCH", ui.ts(0.8f)))/2,
+                         skip_y + (btn_h - ui.font.baseline*ui.ts(0.8f))/2,
+                         "LAUNCH", THEME_TEXT, ui.ts(0.8f));
+
+            // skip launcher confirm modal
+            if (m.show_skip_modal) {
+                ui.rect(0, 0, W, H, {0,0,0,0.8f});
+                float mw = ui.sz(460), mh = ui.sz(160), mx = (W-mw)/2, my = (H-mh)/2;
+                ui.rect(mx, my, mw, mh, THEME_PANEL);
+                ui.rect(mx, my, mw, 1, THEME_BORDER);
+                float mpad = ui.sz(24);
+                ui.font.text(mx+mpad, my+ui.sz(22), "Skip the launcher on boot?", THEME_TEXT, ui.ts(0.9f));
+                ui.font.text(mx+mpad, my+ui.sz(52), "The launcher will no longer appear. Run with --launcher to get it back.", THEME_TEXT_DIM, ui.ts(0.6f));
+                float btn_w = ui.sz(100), bbtn_h = ui.sz(30);
+                if (ui.button(ui.alloc_id(), mx+mw-mpad-btn_w-ui.sz(10)-btn_w, my+mh-mpad-bbtn_h, btn_w, bbtn_h)) m.show_skip_modal = false;
+                ui.font.text(mx+mw-mpad-btn_w-ui.sz(10)-btn_w + (btn_w - ui.font.width("Cancel",ui.ts(0.6f)))/2,
+                             my+mh-mpad-bbtn_h + (bbtn_h - ui.font.baseline*ui.ts(0.6f))/2, "Cancel", THEME_TEXT, ui.ts(0.6f));
+                if (ui.button(ui.alloc_id(), mx+mw-mpad-btn_w, my+mh-mpad-bbtn_h, btn_w, bbtn_h)) { m.skip_launcher = true; m.show_skip_modal = false; }
+                ui.font.text(mx+mw-mpad-btn_w + (btn_w - ui.font.width("Confirm",ui.ts(0.6f)))/2,
+                             my+mh-mpad-bbtn_h + (bbtn_h - ui.font.baseline*ui.ts(0.6f))/2, "Confirm", THEME_TEXT, ui.ts(0.6f));
+            }
+        }
+        else if (m.view == "settings") {
+            // ---- SETTINGS VIEW (scrollable) ----
+            float gap_s = ui.sz(13);
+            const float col_w = (W - 2*pad - gap_s) / 2;
+            float sx = pad, sy = y;
+            float mgn = ui.sz(18), btn_pad = ui.sz(24);
+
+            // estimate total height to know scroll range
+            float rrh = ui.sz(28);
+            int num_video = 11; // window/renderer/ss/aa/texfilter/crt/fmv/turbo/full/ws/uiscale
+            float vh = ui.sz(40) + num_video * rrh + ui.sz(10);
+            float rh_col = vh; // left column
+            float panel_h = ui.sz(60), ph = ui.sz(28);
+            float rh_right = (m.lang_menu ? ui.sz(68) : 0) + ui.sz(68) + ui.sz(68);
+            float sys_h = ui.sz(110);
+            float total_h = std::max(vh, rh_right) + gap_s + sys_h;
+            float avail_h = H - sy - pad;
+            float settings_top = sy, settings_bot = sy + total_h;
+            if (settings_bot > H - pad) settings_bot = H - pad;
+            // clip
+            float clip_h = H - sy - pad;
+            if (clip_h > 0) {
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(0, win_h-(int)(sy+clip_h), win_w, (int)clip_h);
+            }
+
+            float soff = ui.scroll_y;
+            // keep scroll in bounds
+            if (soff > 0) soff = 0;
+            float max_soff = -(total_h - clip_h);
+            if (max_soff > 0) max_soff = 0;
+            if (soff < max_soff) soff = max_soff;
+            ui.scroll_y = soff;
+
+            sy += soff;
+
+            // left column: VIDEO
+            ui.rect(sx, sy, col_w, vh, THEME_PANEL); ui.rect(sx, sy, col_w, 1, THEME_BORDER);
+            ui.font.text(sx+mgn, sy+ui.sz(14), "VIDEO", THEME_ACCENT, ui.ts(0.6f));
+            auto setting = [&](const char* label, const std::string& value, int id,
+                               std::function<void()> onclick) {
+                float ry = sy + ui.sz(40) + id*rrh;
+                if (onclick) {
+                    float bw = ui.font.width(value.c_str(), ui.ts(0.65f)) + btn_pad;
+                    float bx = sx+col_w-mgn-bw;
+                    ui.font.text(sx+mgn, ry + (rrh - ui.font.baseline*ui.ts(0.55f))/2, label, THEME_TEXT_DIM, ui.ts(0.55f));
+                    if (ui.button(ui.alloc_id(), bx, ry, bw, rrh)) onclick();
+                    ui.font.text(bx + (bw - ui.font.width(value.c_str(), ui.ts(0.65f)))/2,
+                                 ry + (rrh - ui.font.baseline*ui.ts(0.65f))/2,
+                                 value.c_str(), THEME_TEXT, ui.ts(0.65f));
+                } else {
+                    ui.font.text(sx+mgn, ry + (rrh - ui.font.baseline*ui.ts(0.55f))/2, label, THEME_TEXT_DIM, ui.ts(0.55f));
+                }
+            };
+            int ri=0;
+            setting("Window size", m.winsize_label, ri++, [&](){
+                int i=(winsize_index(m.window_width)+1)%kNumWinWidths; m.window_width=kWinWidths[i]; refresh_labels(m);
+            });
+            setting("Renderer", m.renderer_label, ri++, [&](){ m.renderer^=1; refresh_labels(m); });
+            setting("Supersampling", std::to_string(m.supersampling)+"x", ri++, [&](){ m.supersampling=(m.supersampling%4)+1; });
+            setting("Antialiasing", m.antialiasing?"On":"Off", ri++, [&](){ m.antialiasing=!m.antialiasing; });
+            setting("Texture filter", m.texfilter_label, ri++, [&](){ m.texture_filter^=1; refresh_labels(m); });
+            setting("Screen model", m.crt_label, ri++, [&](){ m.crt=(m.crt+1)%4; refresh_labels(m); });
+            setting("Skip FMVs", m.auto_skip_fmv?"On":"Off", ri++, [&](){ m.auto_skip_fmv=!m.auto_skip_fmv; });
+            setting("Turbo loads", m.turbo_loads?"On":"Off", ri++, [&](){ m.turbo_loads=!m.turbo_loads; });
+            setting("Fullscreen", m.fullscreen?"On":"Off", ri++, [&](){ m.fullscreen=!m.fullscreen; });
+            setting("Widescreen", m.widescreen?"On":"Off", ri++, [&](){ m.aspect_index=(m.aspect_index==1)?0:1; refresh_labels(m); });
+            // UI scale cycling: 0.5 0.75 1.0 1.25 1.5 1.75 2.0
+            static const float kScales[] = {0.5f,0.75f,1.0f,1.25f,1.5f,1.75f,2.0f};
+            static const int kNumScales = 7;
+            m.uiscale_label = std::to_string((int)(m.uiscale*100))+"%";
+            setting("UI scale", m.uiscale_label, ri++, [&](){
+                int idx = 0;
+                for (int i=0;i<kNumScales;i++) { if (m.uiscale <= kScales[i] + 0.01f) { idx = i; break; } }
+                m.uiscale = kScales[(idx+1)%kNumScales];
+            });
+
+            // right column: panels
+            float rcx = sx + col_w + gap_s;
+            // LOCALIZATION
+            if (m.lang_menu) {
+                ui.rect(rcx, sy, col_w, panel_h, THEME_PANEL); ui.rect(rcx, sy, col_w, 1, THEME_BORDER);
+                ui.font.text(rcx+mgn, sy+ui.sz(14), "LOCALIZATION", THEME_ACCENT, ui.ts(0.6f));
+                float bw=ui.font.width(m.lang_label.c_str(), ui.ts(0.65f))+btn_pad;
+                if (ui.button(ui.alloc_id(), rcx+col_w-mgn-bw, sy+ui.sz(40), bw, ph)) {
+                    m.lang_index=(m.lang_index+1)%(int)game.languages.size(); refresh_language(m,game.languages);
+                }
+                ui.font.text(rcx+mgn, sy+ui.sz(40) + (ph-ui.font.baseline*ui.ts(0.55f))/2, "Language", THEME_TEXT_DIM, ui.ts(0.55f));
+                ui.font.text(rcx+col_w-mgn-bw + (bw-ui.font.width(m.lang_label.c_str(), ui.ts(0.65f)))/2,
+                             sy+ui.sz(40) + (ph-ui.font.baseline*ui.ts(0.65f))/2, m.lang_label.c_str(), THEME_TEXT, ui.ts(0.65f));
+            }
+            // AUDIO
+            float ay = sy + (m.lang_menu?ui.sz(68):0);
+            ui.rect(rcx, ay, col_w, panel_h, THEME_PANEL); ui.rect(rcx, ay, col_w, 1, THEME_BORDER);
+            ui.font.text(rcx+mgn, ay+ui.sz(14), "AUDIO", THEME_ACCENT, ui.ts(0.6f));
+            { float bw=ui.font.width(m.spu_hq?"On":"Off", ui.ts(0.65f))+btn_pad;
+              if (ui.button(ui.alloc_id(), rcx+col_w-mgn-bw, ay+ui.sz(40), bw, ph)) m.spu_hq=!m.spu_hq;
+              ui.font.text(rcx+mgn, ay+ui.sz(40)+(ph-ui.font.baseline*ui.ts(0.55f))/2, "SPU high-quality (float shadow)", THEME_TEXT_DIM, ui.ts(0.55f));
+              ui.font.text(rcx+col_w-mgn-bw + (bw-ui.font.width(m.spu_hq?"On":"Off", ui.ts(0.65f)))/2,
+                           ay+ui.sz(40)+(ph-ui.font.baseline*ui.ts(0.65f))/2, m.spu_hq?"On":"Off", THEME_TEXT, ui.ts(0.65f)); }
+            // CONTROLLER
+            float cy = ay + ui.sz(68);
+            ui.rect(rcx, cy, col_w, panel_h, THEME_PANEL); ui.rect(rcx, cy, col_w, 1, THEME_BORDER);
+            ui.font.text(rcx+mgn, cy+ui.sz(14), "CONTROLLER", THEME_ACCENT, ui.ts(0.6f));
+            { std::string dz=std::to_string(m.deadzone_pct)+"%";
+              float bw=ui.font.width(dz.c_str(), ui.ts(0.65f))+btn_pad;
+              if (ui.button(ui.alloc_id(), rcx+col_w-mgn-bw, cy+ui.sz(40), bw, ph)){
+                  m.deadzone_pct+=5; if(m.deadzone_pct>50)m.deadzone_pct=0; }
+              ui.font.text(rcx+mgn, cy+ui.sz(40)+(ph-ui.font.baseline*ui.ts(0.55f))/2, "Analog stick deadzone", THEME_TEXT_DIM, ui.ts(0.55f));
+              ui.font.text(rcx+col_w-mgn-bw + (bw-ui.font.width(dz.c_str(), ui.ts(0.65f)))/2,
+                           cy+ui.sz(40)+(ph-ui.font.baseline*ui.ts(0.65f))/2, dz.c_str(), THEME_TEXT, ui.ts(0.65f)); }
+            // SYSTEM (full width below columns)
+            float sys_h_u = ui.sz(110);
+            float sys_y = sy + std::max(vh, cy+ui.sz(68)) + gap_s;
+            ui.rect(pad, sys_y, W-2*pad, sys_h_u, THEME_PANEL); ui.rect(pad, sys_y, W-2*pad, 1, THEME_BORDER);
+            ui.font.text(pad+mgn, sys_y+ui.sz(14), "SYSTEM", THEME_ACCENT, ui.ts(0.6f));
+            // BIOS row
+            float bsy = sys_y + ui.sz(40);
+            ui.font.text(pad+mgn, bsy+(ph-ui.font.baseline*ui.ts(0.55f))/2, "BIOS", THEME_TEXT_DIM, ui.ts(0.55f));
+            float bbw=ui.sz(60);
+            if (ui.button(ui.alloc_id(), pad+col_w, bsy, bbw, ph)) {
+                std::string p=win_pick_file(window,"Select PlayStation BIOS","BIOS image (*.bin;*.rom)\0*.bin;*.rom\0All files (*.*)\0*.*\0\0");
+                if (!p.empty()) m.bios_path=fs::path(p).generic_string();
+            } ui.font.text(pad+col_w+(bbw-ui.font.width("Browse", ui.ts(0.55f)))/2, bsy+(ph-ui.font.baseline*ui.ts(0.55f))/2, "Browse", THEME_TEXT, ui.ts(0.55f));
+            std::string bp=m.bios_path.empty()?"(not set)":m.bios_path;
+            ui.font.text(pad+col_w+bbw+ui.sz(10), bsy+(ph-ui.font.baseline*ui.ts(0.55f))/2, bp.c_str(), m.bios_path.empty()?THEME_RED:THEME_TEXT_MUTED, ui.ts(0.55f));
+            // Disc row
+            float dsy=bsy+ui.sz(32);
+            ui.font.text(pad+mgn, dsy+(ph-ui.font.baseline*ui.ts(0.55f))/2, "Disc", THEME_TEXT_DIM, ui.ts(0.55f));
+            if (ui.button(ui.alloc_id(), pad+col_w, dsy, bbw, ph)) {
+                std::string p=win_pick_file(window,"Select disc image","Disc image (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All files (*.*)\0*.*\0\0");
+                if (!p.empty()){ m.disc_path=fs::path(p).generic_string(); refresh_disc_status(m,game_name_s,expected_serial,expected_crc,has_expected_crc); }
+            } ui.font.text(pad+col_w+(bbw-ui.font.width("Browse", ui.ts(0.55f)))/2, dsy+(ph-ui.font.baseline*ui.ts(0.55f))/2, "Browse", THEME_TEXT, ui.ts(0.55f));
+            std::string dp=m.disc_path.empty()?"(not set)":m.disc_path;
+            ui.font.text(pad+col_w+bbw+ui.sz(10), dsy+(ph-ui.font.baseline*ui.ts(0.55f))/2, dp.c_str(), m.disc_path.empty()?THEME_RED:THEME_TEXT_MUTED, ui.ts(0.55f));
+
+            if (clip_h > 0) glDisable(GL_SCISSOR_TEST);
+        }
+        else if (m.view == "controls") {
+            // ---- CONTROLS VIEW ----
+            float ctrl_h = H - y - pad - ui.sz(20);
+            ui.rect(pad, y, W-2*pad, ctrl_h, THEME_PANEL); ui.rect(pad, y, W-2*pad, 1, THEME_BORDER);
+            ui.font.text(pad+ui.sz(18), y+ui.sz(14), "KEYBOARD CONTROLS", THEME_ACCENT, ui.ts(0.6f));
+            // player selector
+            float sel_h = ui.sz(24);
+            float sel_y = y + ui.sz(40);
+            ui.font.text(pad+ui.sz(18), sel_y + (sel_h - ui.font.baseline*ui.ts(0.55f))/2, "Player", THEME_TEXT_DIM, ui.ts(0.55f));
+            float seg_w = ui.sz(80), seg_x = pad+ui.sz(80);
+            for (int p=0;p<2;p++){
+                float sx=seg_x+seg_w*p;
+                int id=ui.alloc_id();
+                bool over=ui.hot(id,sx,sel_y,seg_w,sel_h);
+                if (ui.mouse_pressed&&over) ui.active_id=id;
+                bool clk=ui.mouse_released&&ui.active_id==id&&over;
+                if (ui.mouse_released&&ui.active_id==id) ui.active_id=0;
+                Color bgc=(m.cfg_player==p)?THEME_SEG_ON:(over?THEME_BTN_HOVER:THEME_SEG_BG);
+                ui.rect(sx,sel_y,seg_w,sel_h,bgc);
+                ui.font.text(sx+(seg_w-ui.font.width(p==0?"1":"2", ui.ts(0.6f)))/2,
+                             sel_y+(sel_h-ui.font.baseline*ui.ts(0.6f))/2, p==0?"1":"2", THEME_TEXT, ui.ts(0.6f));
+                if (clk){ m.cfg_player=p; m.rebuild_pending=true; }
+                if (p==0) ui.rect(sx+seg_w-1,sel_y,1,sel_h,THEME_BORDER);
+            }
+            // reset button
+            float rw=ui.sz(120);
+            if (ui.button(ui.alloc_id(), W-pad-ui.sz(18)-rw, sel_y, rw, sel_h)) {
+                psx_keybinds_reset_player(m.cfg_player+1); psx_keybinds_save(); m.rebuild_pending=true;
+            }
+            ui.font.text(W-pad-ui.sz(18)-rw+(rw-ui.font.width("Reset to defaults", ui.ts(0.55f)))/2,
+                         sel_y+(sel_h-ui.font.baseline*ui.ts(0.55f))/2, "Reset to defaults", THEME_TEXT, ui.ts(0.55f));
+            // keybind list (scrollable)
+            float lb_y = sel_y + sel_h + ui.sz(12);
+            float row_h_kb = ui.sz(26), chip_w = ui.sz(120), chip_x = pad+ui.sz(150);
+            int n = psx_keybinds_button_count();
+            // apply scroll offset and clip (scissor in window-pixel coords)
+            float content_top = lb_y, content_bot = y + ctrl_h;
+            if (content_bot > content_top) {
+                glEnable(GL_SCISSOR_TEST);
+                glScissor((int)pad, win_h-(int)content_bot, (int)(W-2*pad), (int)(content_bot-content_top));
+            }
+            float ry_base = lb_y + ui.scroll_y;
+            for (int i=0;i<n;i++){
+                float ry = ry_base + i*row_h_kb;
+                if (ry + row_h_kb < content_top) continue;
+                if (ry > content_bot) break;
+                const char* lbl = psx_keybinds_button_label(i);
+                ui.font.text(pad+ui.sz(22), ry + (row_h_kb - ui.font.baseline*ui.ts(0.5f))/2, lbl, THEME_TEXT, ui.ts(0.5f));
+                SDL_Scancode sc = psx_keybinds_get_button(m.cfg_player+1, i);
+                const char* key_name = (sc != SDL_SCANCODE_UNKNOWN) ? SDL_GetScancodeName(sc) : "None";
+                if (m.scan_kind && m.scan_index == i) {
+                    (void)key_name;
+                    if (ui.button(ui.alloc_id(), chip_x, ry, chip_w, row_h_kb)) { }
+                    ui.font.text(chip_x + (chip_w - ui.font.width("Press a key...", ui.ts(0.5f)))/2,
+                                 ry + (row_h_kb - ui.font.baseline*ui.ts(0.5f))/2, "Press a key...", THEME_WARN, ui.ts(0.5f));
+                } else {
+                    if (ui.button(ui.alloc_id(), chip_x, ry, chip_w, row_h_kb)) {
+                        m.scan_kind = 1; m.scan_index = i;
+                    }
+                    float tw3 = ui.font.width(key_name, ui.ts(0.5f));
+                    ui.font.text(chip_x + (chip_w - tw3)/2,
+                                 ry + (row_h_kb - ui.font.baseline*ui.ts(0.5f))/2,
+                                 key_name, THEME_TEXT, ui.ts(0.5f));
+                }
+            }
+            if (content_bot > content_top) glDisable(GL_SCISSOR_TEST);
+            // clamp scroll to prevent overscroll
+            float total_h = n * row_h_kb;
+            float visible_h = content_bot - content_top;
+            if (total_h > visible_h) {
+                if (ui.scroll_y > 0) ui.scroll_y = 0;
+                if (ui.scroll_y < -(total_h - visible_h)) ui.scroll_y = -(total_h - visible_h);
+            } else ui.scroll_y = 0;
+        }
+
+        gl_ensure_init();
         SDL_GL_SwapWindow(window);
     }
 
@@ -1254,38 +1162,31 @@ Result run(SDL_Window* window, void* gl_context,
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
         io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
         io.skip_launcher = m.skip_launcher;   io.has_skip_launcher = true;
-        io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
+        io.spu_hq = m.spu_hq;                io.has_spu_hq = true;
         io.aspect_num = kAspects[m.aspect_index][0];
         io.aspect_den = kAspects[m.aspect_index][1];
         io.has_aspect_ratio = true;
         io.window_width = m.window_width;     io.has_window_width = true;
-        if (!m.bios_path.empty()) { io.bios_path = fs::path(std::string(m.bios_path)); io.has_bios_path = true; }
-        if (!m.disc_path.empty()) { io.disc_path = fs::path(std::string(m.disc_path)); io.has_disc_path = true; }
-
+        if (!m.bios_path.empty()) { io.bios_path = fs::path(m.bios_path); io.has_bios_path = true; }
+        if (!m.disc_path.empty()) { io.disc_path = fs::path(m.disc_path); io.has_disc_path = true; }
         io.memcard1_enabled = m.mc1_enabled; io.has_memcard1_enabled = true;
         io.memcard2_enabled = m.mc2_enabled; io.has_memcard2_enabled = true;
-        if (!m.mc1_path.empty()) { io.memcard1_path = fs::path(std::string(m.mc1_path)); io.has_memcard1_path = true; }
-        if (!m.mc2_path.empty()) { io.memcard2_path = fs::path(std::string(m.mc2_path)); io.has_memcard2_path = true; }
-
-        const int i1 = (m.p1_dev_index >= 0 && m.p1_dev_index < (int)dev_opts.size()) ? m.p1_dev_index : 0;
-        const int i2 = (m.p2_dev_index >= 0 && m.p2_dev_index < (int)dev_opts.size()) ? m.p2_dev_index : 0;
+        if (!m.mc1_path.empty()) { io.memcard1_path = fs::path(m.mc1_path); io.has_memcard1_path = true; }
+        if (!m.mc2_path.empty()) { io.memcard2_path = fs::path(m.mc2_path); io.has_memcard2_path = true; }
+        const int i1=m.p1_dev_index>0&&m.p1_dev_index<(int)dev_opts.size()?m.p1_dev_index:0;
+        const int i2=m.p2_dev_index>0&&m.p2_dev_index<(int)dev_opts.size()?m.p2_dev_index:0;
         io.p1_device = device_string(dev_opts[i1]); io.has_p1_device = true;
         io.p2_device = device_string(dev_opts[i2]); io.has_p2_device = true;
         io.p1_mode = m.p1_mode; io.has_p1_mode = true;
         io.p2_mode = m.p2_mode; io.has_p2_mode = true;
         io.deadzone = m.deadzone_pct * 32767 / 100; io.has_deadzone = true;
-
-        // Localization: persist the chosen language code (only meaningful when the
-        // game declared a menu; otherwise leave io.language untouched).
-        if (m.lang_menu && m.lang_index >= 0 &&
-            m.lang_index < (int)game.languages.size()) {
+        if (m.lang_menu && m.lang_index >= 0 && m.lang_index < (int)game.languages.size()) {
             io.language = game.languages[m.lang_index].code;
             io.has_language = true;
         }
+        io.uiscale = m.uiscale; io.has_uiscale = true;
     }
 
-    Rml::Shutdown();
-    RmlGL3::Shutdown();
     return result;
 }
 
