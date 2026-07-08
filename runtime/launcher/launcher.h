@@ -36,6 +36,9 @@ struct GameInfo {
     bool        lock_mode        = false;
     int         locked_mode      = 2; // PAD_MODE_DIGITAL
 
+    bool        lock_device      = false; // true hides the Player controller-card device selector
+    bool        ws_offered       = true;  // false hides the widescreen toggle + clamps to 4:3
+
     struct Language { std::string code; std::string label; };
     std::vector<Language> languages;
 };

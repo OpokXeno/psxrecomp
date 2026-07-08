@@ -310,7 +310,7 @@ struct LauncherModel {
     bool spu_hq=false, widescreen=false, ws_eligible=true, skip_launcher=false, show_skip_modal=false;
     int  texture_filter=0, crt=0, aspect_index=0, window_width=1280;
     int  p1_dev_index=1, p2_dev_index=0, p1_mode=0, p2_mode=0, deadzone_pct=37;
-    bool allow_hybrid=true, mode_selectable=true, lang_menu=false;
+    bool allow_hybrid=true, mode_selectable=true, lock_device=false, ws_offered=true, lang_menu=false;
     int  lang_index=0, cfg_player=0;
     bool mc1_enabled=true, mc2_enabled=true, launch_requested=false, quit_requested=false;
     std::string bios_path, disc_path, view="dashboard";
@@ -348,8 +348,9 @@ static int winsize_index(int w){int b=1,bd=1<<30;for(int i=0;i<kNumWinWidths;i++
 static std::string winsize_label_for(int w,int ai){return std::to_string(w)+" \xC3\x97 "+std::to_string(w*kAspects[ai][1]/kAspects[ai][0]);}
 static void refresh_labels(LauncherModel& m){
     m.renderer_label=renderer_name(m.renderer); m.crt_label=crt_name(m.crt);
-    m.texfilter_label=texfilter_name(m.texture_filter); m.aspect_label=aspect_name(m.aspect_index);
-    m.winsize_label=winsize_label_for(m.window_width,m.aspect_index); m.widescreen=(m.aspect_index==1); m.ws_eligible=true;
+    m.texfilter_label=texfilter_name(m.texture_filter);
+    if (!m.ws_offered && m.aspect_index != 0) m.aspect_index = 0;
+    m.aspect_label=aspect_name(m.aspect_index); m.winsize_label=winsize_label_for(m.window_width,m.aspect_index); m.widescreen=(m.aspect_index==1); m.ws_eligible=m.ws_offered;
 }
 static std::string region_long(const std::string& r){
     if(r=="NTSC-U")return "NTSC-U (USA)"; if(r=="NTSC-J")return "NTSC-J (Japan)"; if(r=="PAL")return "PAL (Europe)"; return r;
@@ -596,14 +597,17 @@ static float render_dashboard(UI& ui, LauncherModel& m,
         std::string& dot=pl==0?m.p1_dot:m.p2_dot;
         std::string& dd_open_key=pl==0?m.dd_open:m.dd_open;
         const char* ddk=pl==0?"p1":"p2";
+        bool dd_hot=false;
         ui.font.text(ddx,ddy-ui.sz(16),"Device",THEME_TEXT_MUTED,ui.ts(0.5f));
-        bool dd_hot=ui.hot(ui.alloc_id(),ddx,ddy,ddw,ddh);
-        ui.rect(ddx,ddy,ddw,ddh,dd_hot?THEME_BTN_HOVER:THEME_SEG_BG);
-        ui.font.text(ddx+ui.sz(8),ddy+(ddh-ui.font.baseline*ui.ts(0.65f))/2,dev_label.c_str(),THEME_TEXT,ui.ts(0.65f));
-        float caret_sz=ui.sz(13);
-        if (ui.caret.t) gl_draw_quad(ddx+ddw-ui.sz(22),ddy+(ddh-caret_sz)/2,caret_sz,caret_sz,ui.caret.t,{1,1,1,1});
-        if (ui.mouse_pressed&&dd_hot) {
-            if (dd_open_key==ddk) dd_open_key.clear(); else dd_open_key=ddk;
+        if (!m.lock_device) {
+            dd_hot=ui.hot(ui.alloc_id(),ddx,ddy,ddw,ddh);
+            ui.rect(ddx,ddy,ddw,ddh,dd_hot?THEME_BTN_HOVER:THEME_SEG_BG);
+            ui.font.text(ddx+ui.sz(8),ddy+(ddh-ui.font.baseline*ui.ts(0.65f))/2,dev_label.c_str(),THEME_TEXT,ui.ts(0.65f));
+            float caret_sz=ui.sz(13);
+            if (ui.caret.t) gl_draw_quad(ddx+ddw-ui.sz(22),ddy+(ddh-caret_sz)/2,caret_sz,caret_sz,ui.caret.t,{1,1,1,1});
+            if (ui.mouse_pressed&&dd_hot) {
+                if (dd_open_key==ddk) dd_open_key.clear(); else dd_open_key=ddk;
+            }
         }
         if (dd_open_key==ddk) {
             float dpnl_y=ddy+ddh+ui.sz(2), dpnl_h=dev_opts.size()*ui.sz(28)+ui.sz(4);
@@ -739,8 +743,10 @@ Result run(SDL_Window* window, void* gl_context,
     }
     m.mode_selectable = !game.lock_mode;
     if (game.lock_mode) { m.p1_mode = game.locked_mode; m.p2_mode = game.locked_mode; }
+    m.lock_device = game.lock_device;
+    m.ws_offered  = game.ws_offered;
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
-    m.uiscale = io.has_uiscale ? io.uiscale : 1.0f;
+    m.uiscale = 1.0f; // TODO: persist uiscale in UserSettings
     m.p1_dev_index = io.has_p1_device ? find_or_add_device_index(dev_opts, io.p1_device) : (dev_opts.size()>2?2:1);
     m.p2_dev_index = io.has_p2_device ? find_or_add_device_index(dev_opts, io.p2_device) : 0;
     refresh_player(m, 0, dev_opts);
@@ -1000,7 +1006,8 @@ Result run(SDL_Window* window, void* gl_context,
             setting("Skip FMVs", m.auto_skip_fmv?"On":"Off", ri++, [&](){ m.auto_skip_fmv=!m.auto_skip_fmv; });
             setting("Turbo loads", m.turbo_loads?"On":"Off", ri++, [&](){ m.turbo_loads=!m.turbo_loads; });
             setting("Fullscreen", m.fullscreen?"On":"Off", ri++, [&](){ m.fullscreen=!m.fullscreen; });
-            setting("Widescreen", m.widescreen?"On":"Off", ri++, [&](){ m.aspect_index=(m.aspect_index==1)?0:1; refresh_labels(m); });
+            if (m.ws_offered)
+                setting("Widescreen", m.widescreen?"On":"Off", ri++, [&](){ m.aspect_index=(m.aspect_index==1)?0:1; refresh_labels(m); });
             // UI scale cycling: 0.5 0.75 1.0 1.25 1.5 1.75 2.0
             static const float kScales[] = {0.5f,0.75f,1.0f,1.25f,1.5f,1.75f,2.0f};
             static const int kNumScales = 7;
@@ -1184,7 +1191,7 @@ Result run(SDL_Window* window, void* gl_context,
             io.language = game.languages[m.lang_index].code;
             io.has_language = true;
         }
-        io.uiscale = m.uiscale; io.has_uiscale = true;
+        // io.uiscale = m.uiscale; io.has_uiscale = true;
     }
 
     return result;
