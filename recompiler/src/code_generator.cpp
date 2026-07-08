@@ -2528,20 +2528,22 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
 
         GeneratedFunction gen_func = generate_function(func, cfg, fallthrough_name);
 
-        // EXPERIMENT (PSX_EMIT_PROD): a "function" whose body is overwhelmingly
+        // PSX_EMIT_PROD (DEFAULT ON): a "function" whose body is overwhelmingly
         // untranslatable (TODO-opcode) words is a data region that discovery's
         // primary-opcode-only validity check let slip through as code (valid
         // primary opcode, garbage sub-field). Re-emit it as the same compact,
         // fail-closed data stub used for is_data_section — if it is ever
         // dispatched (it should not be: real reachable code never hits a TODO)
         // psx_unknown_dispatch fatals LOUDLY rather than silently no-op'ing.
-        // Default OFF => byte-identical to the full-scan baseline. The proper
-        // productionization deepens discovery's validity check (sub-field aware)
-        // in function_analysis; this downstream heuristic just measures the win.
+        // This is strictly more faithful than the baseline it replaces (which
+        // emitted a SILENT no-op for the same words). Smoke-validated on Tomba,
+        // Tomba2, Ape Escape, MMX6. Set PSX_EMIT_PROD=0 to restore the full-scan
+        // (oracle) emission. Proper productionization moves this judgment UPSTREAM
+        // into discovery's validity check (sub-field aware) in function_analysis.
         static int s_emit_prod = -1;
         if (s_emit_prod < 0) {
             const char* e = std::getenv("PSX_EMIT_PROD");
-            s_emit_prod = (e && *e && *e != '0') ? 1 : 0;
+            s_emit_prod = (e && *e == '0') ? 0 : 1;  // default ON; =0 restores full-scan baseline
         }
         if (s_emit_prod) {
             size_t todo = 0, pos = 0;
