@@ -1,11 +1,14 @@
-/* code_provider.c — the two CodeProvider implementations + active selection.
- * See code_provider.h for the abstraction and SLJIT.md §3/§6/§7 for the plan.
+/* code_provider.c — the CodeProvider implementations + active selection.
+ * See code_provider.h for the abstraction.
  *
- * This is the step-2 seam: the gcc provider is a thin pass-through over the
- * validated autocompile_* path (no behavior change), and the sljit provider
- * wraps the in-process JIT. Which one is active is decided once at init by
- * overlay_backend_resolve (env PSX_OVERLAY_BACKEND > [runtime] overlay_backend >
- * auto; auto => gcc if a compile cmd is wired, else sljit). gcc is the default. */
+ * The "spawn compiler" provider is a thin pass-through over the validated
+ * autocompile_* path (compile emitted overlay C to a DLL and load it); it backs
+ * BOTH the gcc and tcc tiers, which differ only in which compiler the pipeline
+ * invokes. The in-process JIT provider (code_provider_sljit) is a separate,
+ * legacy path. Which provider is active is decided once at init by
+ * overlay_backend_resolve() in overlay_backend.c (env PSX_OVERLAY_BACKEND >
+ * [runtime] overlay_backend > auto). The auto tier order is:
+ *   static -> gcc (if gcc on PATH) -> tcc (bundled toolchain-free fallback). */
 
 #include <stddef.h>
 

@@ -21,11 +21,18 @@ BIOS layer, no stubs, and no general-purpose interpreter fallback for static
 code.
 
 PSXRecomp is a framework. Game-specific projects live in their own
-repositories and pull this one in to build a game binary. The active end-to-end
-targets are:
+repositories and link this one in as a **git submodule** to build a game binary.
+The active end-to-end targets are:
 
 - [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
 - [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
+
+**New here?** The fastest way in:
+[`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md) (how a game actually
+runs — static / native-overlay / interpreter), then
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+[`docs/BUILDING.md`](docs/BUILDING.md), and
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Philosophy — toward 100% static recompilation
 
@@ -144,29 +151,30 @@ Windows, `ucontext` on POSIX (`runtime/src/psx_fiber.c`) — so the recompiled
 BIOS's cooperative thread switching (the CD-boot handoff in particular) behaves
 the same on every platform.
 
-Requirements:
+Requirements at a glance (full details, dependency table, and per-platform
+prerequisites in [`docs/BUILDING.md`](docs/BUILDING.md)):
 
-- A C/C++ toolchain: MSVC or MinGW (Windows), Apple Clang (macOS), Clang/GCC (Linux).
-- CMake 3.20+. On macOS/Linux also `ninja` and `pkg-config`.
-- SDL2: the bundled dev pack on Windows; `brew install sdl2 pkg-config ninja`
-  on macOS; `libsdl2-dev` (or distro equivalent) on Linux.
+- A C/C++ toolchain: MSVC or MinGW/MSYS2 (Windows), Apple Clang (macOS),
+  Clang/GCC (Linux). CMake 3.20+; on macOS/Linux also `ninja` and `pkg-config`.
+- SDL2 (system / bundled). RmlUi and FreeType come in as **git submodules** —
+  clone with `--recurse-submodules`.
 - A legally obtained `SCPH1001.BIN` BIOS dump. Not included.
 - For game projects, a legally obtained game disc/EXE dump. Not included.
 
-Build the framework runtime:
+Build the framework (recompiler tool + BIOS-only runtime):
 
 ```sh
-# Windows (MSYS2/MinGW)
-cmake -S recompiler -B recompiler/build -G "Unix Makefiles" && cmake --build recompiler/build
-cmake -S runtime    -B runtime/build    -G "Unix Makefiles" && cmake --build runtime/build --target psx-runtime
+git clone --recurse-submodules https://github.com/mstan/psxrecomp.git && cd psxrecomp
 
-# macOS / Linux (Ninja)
-cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C recompiler/build
-cmake -S runtime    -B runtime/build    -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C runtime/build psx-runtime
+cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build recompiler/build
+cmake -S runtime    -B runtime/build    -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build runtime/build --target psx-runtime
 ```
 
-Game projects generate their own `generated/<serial>_*.c` files and link this
-runtime source tree through CMake.
+On Windows swap `-G Ninja` for your generator if you prefer (e.g.
+`-G "Unix Makefiles"`); always keep an explicit `-DCMAKE_BUILD_TYPE` so the
+generated C is optimized. Game projects generate their own
+`generated/<serial>_*.c` files and link this runtime through CMake — see
+[`docs/BUILDING.md`](docs/BUILDING.md#build-and-run-a-game).
 
 ## Keyboard Map
 
@@ -209,10 +217,19 @@ The recompiler emits C functions and dispatch tables for BIOS and game code.
 The runtime loads the BIOS/game assets into emulated PS1 memory, links the
 generated C as native code, and simulates hardware through MMIO handlers for
 GPU, DMA, timers, CD-ROM, MDEC, SIO0, memory cards, SPU, GTE, and interrupt
-delivery. BIOS A0/B0/C0 vectors go through the recompiled BIOS, not HLE shims.
+delivery. The recompiled `SCPH1001.BIN` is the low-level (LLE) kernel and the
+correctness oracle; an optional HLE tier lays instant boot-skip and a few BIOS
+services on top, always falling through to the recompiled BIOS.
 
-See `CLAUDE.md`, `PLAN.md`, and `FAITHFUL_TIMING_PLAN.md` for the development
-rules and current project context.
+Code that can't be seen ahead of time (disc-streamed **overlays**) is captured
+and compiled to native code the first time it appears (`static → gcc → tcc`
+backend), with a small interpreter as the correctness fallback until it is. Full
+story in [`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md); component-level
+detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md) for the
+development rules, and [`docs/internal/`](docs/internal/) for the phased plans
+and deep design notes (`PLAN.md`, `FAITHFUL_TIMING_PLAN.md`, …).
 
 ## Disc Speed
 
