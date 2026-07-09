@@ -10084,9 +10084,7 @@ static void handle_sljit_status(int id, const char *json)
     int selftest = overlay_sljit_selftest();
     int available = 0, st_ok = 0;
     unsigned long long compiles = 0, declines = 0, bytes = 0;
-// Sorry but i cant compile with this
-//    overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
-    overlay_sljit_get_status(&available, &st_ok, (uint64_t *)&compiles, (uint64_t *)&declines, (uint64_t *)&bytes);
+    overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
              "\"selftest_ok\":%d,\"live\":%d,\"compiles\":%llu,\"declines\":%llu,"
              "\"bytes_emitted\":%llu,\"shards_registered\":%u,\"obsoleted\":%u,"
