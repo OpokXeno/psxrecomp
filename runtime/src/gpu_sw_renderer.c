@@ -422,8 +422,10 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
 /* uv sampling bounds for a textured triangle (see g_uv_lim): min/max of the
  * vertex uvs; for axis-aligned (2D) mappings — any zero uv derivative — the
  * max-uv vertex is an exclusive edge whose texel the DDA never samples, so
- * back it off by one. Crossing a 256 boundary means page wrap: widen to the
- * full page (clamp disabled). */
+ * back it off by one. (The software DDA truncates exactly like the PS1, so
+ * unlike the GL/VK backends no mirrored-2D uv compensation is needed here —
+ * these bounds only feed the bilinear-filter neighbour clamp.) Crossing a
+ * 256 boundary means page wrap: widen to the full page (clamp disabled). */
 static void sw_tri_uv_limits(const int *xs, const int *ys,
                              const int *us, const int *vs) {
     int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];

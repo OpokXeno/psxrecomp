@@ -1329,13 +1329,46 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
     gpu_geometry(GL_LINES, xs, ys, cs, 2, semi);
 }
 
+/* Mirrored-2D uv compensation, the Beetle-PSX / parallel-psx
+ * Calc_UVOffsets_Adjust_Verts model. Modern GPUs interpolate attributes at
+ * fragment CENTERS; the PS1 DDA latches the interpolant at the pixel's
+ * top-left corner. The sample-grid shift (u_shift = 0.5/S - 1/64, see
+ * gl_renderer pipeline init) makes floor(uv) land on the exact PS1 texel for
+ * FORWARD axis-aligned mappings, but a MIRRORED one — u or v DECREASING
+ * along its screen axis, i.e. X/Y-flipped 2D sprites such as right-facing
+ * MMX entity quads (cels stored facing left) — interpolates 1/64 SHORT of
+ * each integer and floors one texel low. That painted the cel's never-
+ * sampled edge column/row (opaque body texels) as a detached 1px sliver at
+ * quad seams (MMX6 sprite slivers; pink line under rolling wheels).
+ * Compensate exactly like Beetle: bump the prim's uv by +1 along the
+ * decreasing axis. This also puts the max-uv vertex back on the exclusive
+ * raster edge, so tri_uv_limits' unconditional max back-off is correct for
+ * both directions. Diagonal (3D-ish) mappings are left untouched; like
+ * Beetle, a rare 3D poly that happens to be axis-aligned accepts a
+ * one-texel shift in exchange for correct 2D sprites. The derivatives are
+ * area2-scaled, so area2's sign (winding) normalizes their direction. */
+static void tri_uv_mirror_offset(const int *xs, const int *ys, int *us, int *vs) {
+    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
+    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
+    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
+    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
+    long area2 = (long)(xs[1]-xs[0])*(ys[2]-ys[0]) - (long)(xs[2]-xs[0])*(ys[1]-ys[0]);
+    if (area2 == 0) return;
+    long du = dudx == 0 ? dudy : (dudy == 0 ? dudx : 0);
+    long dv = dvdx == 0 ? dvdy : (dvdy == 0 ? dvdx : 0);
+    if (area2 < 0) { du = -du; dv = -dv; }
+    if (du < 0) { us[0]++; us[1]++; us[2]++; }
+    if (dv < 0) { vs[0]++; vs[1]++; vs[2]++; }
+}
+
 /* Per-prim uv sampling bounds (inclusive), Beetle-PSX model: filtered
  * neighbours (and S>1 interpolation overshoot) clamp to these so a sample
  * never reads outside the prim's own texture rect. For axis-aligned (2D)
  * uv mappings — any zero uv derivative — the max-uv vertex is an exclusive
- * edge whose texel the PS1 DDA never samples, so back it off by one. If the
- * uv range crosses a 256 wrap boundary the prim relies on page wrapping and
- * the bounds widen to the full page (clamp disabled). */
+ * edge whose texel the PS1 DDA never samples (mirrored mappings included,
+ * AFTER tri_uv_mirror_offset has bumped their uv), so back it off by one.
+ * If the uv range crosses a 256 wrap boundary the prim relies on page
+ * wrapping and the bounds widen to the full page (clamp disabled). */
 static void tri_uv_limits(const int *xs, const int *ys,
                           const int *us, const int *vs, int lim[4]) {
     int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
@@ -1368,7 +1401,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
                                   int semi, const int *lim) {
     int lim_buf[4];
-    if (!lim) { tri_uv_limits(xs, ys, us, vs, lim_buf); lim = lim_buf; }
+    int uv_buf[6];
+    if (!lim) {
+        /* Poly path: apply the mirrored-2D uv compensation first (rect prims
+         * are always forward-mapped and pass their own precomputed lim). */
+        int *mu = uv_buf, *mv = uv_buf + 3;
+        for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+        tri_uv_mirror_offset(xs, ys, mu, mv);
+        us = mu; vs = mv;
+        tri_uv_limits(xs, ys, us, vs, lim_buf);
+        lim = lim_buf;
+    }
     s_scene_prims_tex++;
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;

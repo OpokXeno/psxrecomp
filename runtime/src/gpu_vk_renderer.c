@@ -2515,8 +2515,29 @@ static void flush_tex_batch(void) {
     s_gpu_dirty = 1;
 }
 
+/* Mirrored-2D uv compensation — same Beetle-PSX Calc_UVOffsets model as the
+ * GL backend (see gpu_gl_renderer.c tri_uv_mirror_offset for the full
+ * rationale): a mirrored axis-aligned mapping (u or v decreasing along its
+ * screen axis — X/Y-flipped 2D sprites) floors one texel low under
+ * center-sampled interpolation; bump its uv by +1 along the decreasing axis. */
+static void tri_uv_mirror_offset(const int *xs, const int *ys, int *us, int *vs) {
+    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
+    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
+    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
+    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
+    long area2 = (long)(xs[1]-xs[0])*(ys[2]-ys[0]) - (long)(xs[2]-xs[0])*(ys[1]-ys[0]);
+    if (area2 == 0) return;
+    long du = dudx == 0 ? dudy : (dudy == 0 ? dudx : 0);
+    long dv = dvdx == 0 ? dvdy : (dvdy == 0 ? dvdx : 0);
+    if (area2 < 0) { du = -du; dv = -dv; }
+    if (du < 0) { us[0]++; us[1]++; us[2]++; }
+    if (dv < 0) { vs[0]++; vs[1]++; vs[2]++; }
+}
+
 /* Per-prim uv sampling bounds (inclusive), Beetle-PSX model — see the GL
- * backend's tri_uv_limits. */
+ * backend's tri_uv_limits (mirrored mappings are compensated by
+ * tri_uv_mirror_offset BEFORE this runs, so the unconditional max back-off
+ * is correct for both directions). */
 static void tri_uv_limits(const int *xs, const int *ys,
                           const int *us, const int *vs, int lim[4]) {
     int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
@@ -2546,7 +2567,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
                                   int semi, const int *lim) {
     if (!s_ready) return;
     int lim_buf[4];
-    if (!lim) { tri_uv_limits(xs, ys, us, vs, lim_buf); lim = lim_buf; }
+    int uv_buf[6];
+    if (!lim) {
+        /* Poly path: apply the mirrored-2D uv compensation first (rect prims
+         * are always forward-mapped and pass their own precomputed lim). */
+        int *mu = uv_buf, *mv = uv_buf + 3;
+        for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+        tri_uv_mirror_offset(xs, ys, mu, mv);
+        us = mu; vs = mv;
+        tri_uv_limits(xs, ys, us, vs, lim_buf);
+        lim = lim_buf;
+    }
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
