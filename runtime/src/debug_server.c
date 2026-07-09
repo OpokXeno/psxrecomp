@@ -3459,6 +3459,9 @@ static const char *thread_kind_name(uint32_t kind)
         case 24: return "syscall3_enter_in_exc";      /* ChangeThread/RFE syscall, in_exc==1 (forced manual-RFE) */
         case 26: return "fiber_dispatch_exit_in_exc"; /* fiber's psx_dispatch returned, in_exc==1 */
         case 30: return "inexc_switch_escape";        /* guest moved PCB[0] inside handler -> scheduler escape */
+        case 31: return "inexc_switch_defer";
+        case 32: return "deferred_switch_escape";
+        case 33: return "deferred_switch_stale";
         default: return "unknown";
     }
 }

@@ -132,6 +132,7 @@ static uint32_t dispatch_count;
 static uint64_t total_checks;
 static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
 extern uint64_t g_vblank_raise_count;
+extern int g_cosim_dirty_pump_site;
 
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
@@ -448,7 +449,7 @@ static uint32_t s_compiled_interrupt_resume_pc = 0;
 static uint32_t s_last_interrupt_check_pc = 0;
 static uint64_t s_last_interrupt_check_cycle = UINT64_MAX;
 
-/* Deferred cooperative thread switch (Ape Escape memcard fix #2).
+/* Deferred cooperative thread switch from nested exception delivery.
  *
  * A genuine in-exception ChangeThread (kind-30, escape site below) must be
  * honored at the OUTERMOST dispatch boundary, never mid-nested-host-dispatch.
@@ -711,19 +712,18 @@ void psx_check_interrupts(CPUState* cpu) {
         savestate_poll(cpu, s_last_interrupt_check_pc);
     }
 
-    /* Deferred cooperative thread switch — honor at the next CLEAN block leader
-     * (Ape Escape memcard fix #2; see s_defer_switch_* above). We are at a
-     * block-leader boundary outside the exception handler. A genuine in-exception
-     * ChangeThread was deferred because it was detected at a POISONED point (the
-     * IRQ fired deep inside a nested call — e.g. the async-poll callback — so the
-     * resume-PC latch desynced from the live GPRs). The deferred thread was resumed
-     * transparently at its OWN PC; now, at any subsequent block leader where IT is
-     * the running thread and its resume PC is materialized in the latch, its state
-     * is clean — re-save it, re-point PCB[0], and escape to the scheduler. We do NOT
-     * require the outermost STATIC dispatch boundary: the memcard consumer lives
-     * permanently inside the nested dirty-RAM interpreter and never reaches it, and
-     * the scheduler landing (traps.c) resets the nested dispatch/call-unit counters
-     * on the longjmp anyway — exactly as the immediate-switch path already does.
+    /* Deferred cooperative thread switch: honor at the next real thread-save
+     * boundary (see s_defer_switch_* above). A
+     * genuine in-exception ChangeThread was deferred because it was detected at a
+     * poisoned point (the IRQ fired deep inside a nested call, e.g. the
+     * async-poll callback, so the resume-PC latch desynced from the live GPRs).
+     *
+     * The dirty-RAM interpreter also pumps interrupts at synthetic transfer and
+     * call-return sites. Those sites are precise enough to deliver hardware IRQs,
+     * but not necessarily safe to snapshot a cooperative thread: the interpreter
+     * may have committed a candidate resume PC while the live CPUState stack/GPRs
+     * still describe the previous local frame. Keep the deferral pending there and
+     * honor it only once execution reaches a normal interrupt poll with site 0.
      * Near-free when nothing is pending. */
     if (s_defer_switch_pending && !in_exception) {
         if (psx_hle_scheduler_enabled()) {
@@ -733,7 +733,7 @@ void psx_check_interrupts(CPUState* cpu) {
             if (from_tcb == 0u || to_tcb == 0u ||
                 psx_sched_current_tcb(cpu) != from_tcb) {
                 /* STALE: the guest already re-scheduled cooperatively (PCB[0] no
-                 * longer names the deferred thread) — abandon the deferral. This is
+                 * longer names the deferred thread) - abandon the deferral. This is
                  * the ONLY case we clear pending without honoring; dropping when a
                  * clean resume PC merely isn't available yet would LOSE the guest's
                  * ChangeThread and wedge (the bug this replaces). */
@@ -741,9 +741,13 @@ void psx_check_interrupts(CPUState* cpu) {
                 s_defer_switch_target  = 0;
                 s_defer_switch_from    = 0;
                 debug_server_log_thread_event(33, cpu, from_tcb, to_tcb, resume_pc);
+            } else if (g_cosim_dirty_pump_site != 0) {
+                /* Not a real suspend boundary: dirty interpreter pump sites expose
+                 * committed PCs for IRQ timing, but the matching CPUState may not
+                 * be materialized yet. */
             } else if (resume_pc != 0u && (resume_pc & 0x3u) == 0u &&
                        psx_is_dispatchable(resume_pc)) {
-                /* Materialized clean boundary — re-save the deferred thread cleanly
+                /* Materialized clean boundary: re-save the deferred thread cleanly
                  * (this OVERWRITES any poisoned/sentinel EPC the guest handler wrote
                  * for it while nested), re-point PCB[0], and honor the switch. */
                 s_defer_switch_pending = 0;
@@ -759,7 +763,7 @@ void psx_check_interrupts(CPUState* cpu) {
                 g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;
                 longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run */
             }
-            /* else: KEEP pending — this outermost boundary has no materialized
+            /* else: KEEP pending - this outermost boundary has no materialized
              * resume PC (both latches 0, e.g. a scheduled-event check not tied to a
              * block leader). Wait for the next block-leader boundary that does. */
         }
@@ -1334,7 +1338,11 @@ void psx_check_interrupts(CPUState* cpu) {
              * as well, not leave it pointing at the target. If we have no clean
              * outgoing resume PC (sentinel / clean-trampoline boundary), or the
              * toggle is off, or we are already outermost, switch immediately. */
-            int can_defer = defer_switch_enabled() && !at_outermost &&
+            /* Low BIOS/kernel code is already scheduler code; deferring it can
+             * starve a target thread by re-entering the same VBlank EPC forever. */
+            uint32_t epc_phys = g_exception_real_epc & 0x1FFFFFFFu;
+            int low_kernel_epc = (epc_phys < 0x00010000u);
+            int can_defer = defer_switch_enabled() && !low_kernel_epc && !at_outermost &&
                             g_exception_real_epc != 0u &&
                             (g_exception_real_epc & 0x3u) == 0u &&
                             g_exception_real_epc != (uint32_t)PSX_EXC_SENTINEL_PC &&
