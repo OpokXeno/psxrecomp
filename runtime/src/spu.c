@@ -10,6 +10,7 @@
 #include "spu.h"
 #include "spu_shadow.h"
 #include "audio_trace.h"
+#include "psx_cycles.h"
 
 #include <string.h>
 
@@ -286,9 +287,13 @@ void spu_cd_audio_push(const int16_t* stereo, int frames) {
     cd_frame_count += in_frames;
     cd_push_frames += in_frames;
 
-    /* T2 tap: what the CD/XA decoder feeds the SPU CD input bus. */
+    /* T2 tap: what the CD/XA decoder feeds the SPU CD input bus. The event
+     * stamps the GLOBAL GUEST CYCLE clock (low 32 bits) so push-to-push
+     * spacing measures true delivery cadence — the spu_out sample_idx stamp
+     * is pump-chunk quantized and useless for that. */
     audio_trace_pcm(AUDIO_TAP_CD_IN, stereo, (int)in_frames);
-    audio_trace_event(AUDIO_EV_CD_PUSH, in_frames, cd_frame_count);
+    audio_trace_event(AUDIO_EV_CD_PUSH, (uint32_t)psx_get_cycle_count(),
+                      cd_frame_count);
 }
 
 static int cd_audio_pop(int16_t* left, int16_t* right) {

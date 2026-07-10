@@ -4759,6 +4759,8 @@ static void handle_cdrom_state(int id, const char *json)
              "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
              "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
              "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
+             "\"read_hold_cycles\":%llu,\"read_hold_events\":%llu,"
+             "\"int1_pended\":%llu,\"int1_lost\":%llu,\"int1_pending_now\":%u,"
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
@@ -4772,6 +4774,11 @@ static void handle_cdrom_state(int id, const char *json)
              s.sector_available, s.sector_read_pos, s.sector_size,
              s.reading, s.read_min, s.read_sec, s.read_sect,
              s.read_cmd, s.read_delay,
+             (unsigned long long)s.read_hold_cycles,
+             (unsigned long long)s.read_hold_events,
+             (unsigned long long)s.int1_pended,
+             (unsigned long long)s.int1_lost,
+             s.int1_pending_now,
              s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
@@ -5878,7 +5885,7 @@ static void handle_audio_events(int id, const char *json)
     uint64_t total = audio_trace_events_total();
     static const char *kind_names[] = {
         "?", "REG", "RENDER", "SKIP", "UNDERRUN",
-        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO"
     };
 
     size_t cap = 256u + (size_t)got * 192u;
