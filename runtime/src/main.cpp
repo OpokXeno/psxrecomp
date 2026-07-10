@@ -283,6 +283,7 @@ static int           g_fmv_skip_end_total   = 3;
  * movies never stream XA, so the default MDEC+XA detector misses them —
  * Tomba2's Whoopee Camp logo). Presentation-side fast-forward only. */
 static int           g_fmv_skip_no_xa       = 0;
+static int           g_fmv_skip_no_xa_hold  = 4;
 /* Low-latency present options (see [video] in config_loader). Measured on a
  * 60Hz box the dominant input->photon cost is NOT vsync at the swap (that
  * blocks ~tens of us) but that input is sampled ~one pacer-wait (~13.6ms)
@@ -305,10 +306,12 @@ extern "C" uint32_t mdec_get_decode_count(void);
  * resolved. */
 const char *g_active_config_path = nullptr;
 extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
-                                     uint32_t *movie_id, const char **cfg_path) {
+                                      uint32_t *movie_id, int *no_xa_hold,
+                                      const char **cfg_path) {
     if (auto_skip)   *auto_skip   = g_auto_skip_fmv;
     if (total_table) *total_table = g_fmv_skip_total_table;
     if (movie_id)    *movie_id    = g_fmv_skip_movie_id;
+    if (no_xa_hold)  *no_xa_hold  = g_fmv_skip_no_xa_hold;
     if (cfg_path)    *cfg_path    = g_active_config_path ? g_active_config_path : "(null)";
 }
 
@@ -1934,7 +1937,8 @@ static void sdl_vblank_present(void) {
          * satisfy the MDEC+XA detector; with the per-game opt-in, MDEC
          * activity alone qualifies. */
         int detected = mdec_decoding && (xa || g_fmv_skip_no_xa);
-        if (detected) s_fmv_hold = 4;
+        if (detected) s_fmv_hold = (!xa && g_fmv_skip_no_xa)
+                                     ? g_fmv_skip_no_xa_hold : 4;
         else if (s_fmv_hold > 0) s_fmv_hold--;
         fmv_skip_active = (s_fmv_hold > 0) && (xa || g_fmv_skip_no_xa);
         if (fmv_skip_active) {
@@ -2486,6 +2490,7 @@ int main(int argc, char** argv) {
             if (gc.runtime.video_fmv_skip_end_total)
                 g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
             g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
+            g_fmv_skip_no_xa_hold  = gc.runtime.video_fmv_skip_no_xa_hold;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
@@ -2511,6 +2516,12 @@ int main(int argc, char** argv) {
                                                 gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
+             * in the native-wide mirror, preserving the canonical 4:3 image. */
+            gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);
+            /* [widescreen] nw_phase_backdrop — stretch only the textured
+             * backdrop phase emitted before shaded 3D foreground geometry. */
+            gpu_ws_set_nw_phase_backdrop(gc.ws_nw_phase_backdrop ? 1 : 0);
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
