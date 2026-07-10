@@ -49,6 +49,7 @@
 #include "game_options.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
@@ -98,6 +99,111 @@ extern "C" uint32_t memory_get_bios_checksum(void);
 extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
                                                   uint32_t len);
+
+/* Arm the dirty-RAM text-image guard with the boot EXE bytes. The guard is
+ * load-bearing: dispatch native-safety (dirty_ram_text_native_ok) and the
+ * fntrace alternate game-start latch both key off the registered image, so
+ * every install must arm it — not just repo checkouts that happen to carry a
+ * loose EXE copy next to game.toml. Source order:
+ *   1. The local EXE file from game.toml (dev checkouts; recompiler input).
+ *   2. The boot EXE extracted from the mounted disc image (end-user installs
+ *      — the disc is the same bytes the BIOS loads, i.e. the true reference).
+ * Registration passes ownership of the malloc'd buffer to memory.c. */
+static void arm_text_image_guard(const std::string &exe_path,
+                                 uint32_t load_address,
+                                 const std::string &disc_path) {
+    const uint32_t phys_lo = load_address & 0x1FFFFFFFu;
+    /* 1. Local EXE file (skip the 2048-byte PS-X EXE header). */
+    if (!exe_path.empty()) {
+        std::ifstream ef(exe_path, std::ios::binary | std::ios::ate);
+        if (ef) {
+            std::streamsize sz = ef.tellg();
+            if (sz > 2048) {
+                uint32_t img_len = (uint32_t)(sz - 2048);
+                uint8_t *img = (uint8_t *)std::malloc(img_len);
+                if (img) {
+                    ef.seekg(2048, std::ios::beg);
+                    if (ef.read((char *)img, img_len)) {
+                        dirty_ram_register_text_image(phys_lo, img, img_len);
+                        std::fprintf(stdout,
+                            "psxrecomp: text image guard armed (0x%08X..0x%08X, local EXE)\n",
+                            load_address, load_address + img_len);
+                        return;
+                    }
+                    std::free(img);
+                }
+            }
+        }
+    }
+    /* 2. Extract the boot EXE from the disc image. */
+    if (!disc_path.empty()) {
+        PS1::ISOReader iso;
+        if (iso.Open(disc_path)) {
+            /* The boot filename: basename of the game.toml exe field (it names
+             * the same file the recompiler consumed, which came off this disc);
+             * fall back to the SYSTEM.CNF BOOT token for configs whose local
+             * name differs from the disc name. */
+            std::string boot_name;
+            if (!exe_path.empty()) {
+                const size_t slash = exe_path.find_last_of("/\\");
+                boot_name = (slash == std::string::npos)
+                                ? exe_path : exe_path.substr(slash + 1);
+            }
+            PS1::ISOFileEntry ent;
+            if (boot_name.empty() || !iso.FindFile(boot_name, ent)) {
+                /* SYSTEM.CNF: `BOOT = cdrom:\SCUS_944.23;1` */
+                uint8_t cnf[2048] = {0};
+                size_t n = iso.ReadFile("SYSTEM.CNF", cnf, sizeof(cnf) - 1);
+                if (n > 0) {
+                    std::string text((const char *)cnf, n);
+                    std::string lower = text;
+                    for (char &c : lower) c = (char)std::tolower((unsigned char)c);
+                    const size_t key = lower.find("cdrom:");
+                    if (key != std::string::npos) {
+                        size_t j = key + 6;
+                        while (j < text.size() && (text[j] == '\\' || text[j] == '/')) j++;
+                        std::string tok;
+                        while (j < text.size()) {
+                            char c = text[j];
+                            if (c == ';' || c == '\r' || c == '\n' || c == ' ' ||
+                                c == '\t' || c == '\0') break;
+                            tok += c; j++;
+                            if (tok.size() > 64) break;
+                        }
+                        const size_t s2 = tok.find_last_of("\\/");
+                        if (s2 != std::string::npos) tok = tok.substr(s2 + 1);
+                        if (!tok.empty() && iso.FindFile(tok, ent)) boot_name = tok;
+                    }
+                }
+            }
+            if (!boot_name.empty() && iso.FindFile(boot_name, ent) &&
+                ent.size > 2048) {
+                uint8_t *file = (uint8_t *)std::malloc(ent.size);
+                if (file) {
+                    size_t got = iso.ReadFile(boot_name, file, ent.size);
+                    if (got > 2048) {
+                        uint32_t img_len = (uint32_t)(got - 2048);
+                        uint8_t *img = (uint8_t *)std::malloc(img_len);
+                        if (img) {
+                            memcpy(img, file + 2048, img_len);
+                            std::free(file);
+                            dirty_ram_register_text_image(phys_lo, img, img_len);
+                            std::fprintf(stdout,
+                                "psxrecomp: text image guard armed (0x%08X..0x%08X, disc %s)\n",
+                                load_address, load_address + img_len,
+                                boot_name.c_str());
+                            return;
+                        }
+                    }
+                    std::free(file);
+                }
+            }
+        }
+    }
+    std::fprintf(stdout,
+        "psxrecomp: WARNING: text image guard NOT armed (no local EXE, no disc "
+        "boot EXE) — native text dispatch will be conservative\n");
+}
 
 /* dma.c */
 extern "C" void dma_init(void);
@@ -2335,6 +2441,10 @@ int main(int argc, char** argv) {
     bool       fast_boot     = false;  /* DEPRECATED alias: HLE boot-skip only */
     bool       bios_hle      = false;  /* HLE kernel-service tier (bios_hle.c) */
     bool       bios_hle_keep_intro = false;
+    /* Text-image guard source, captured at config load; armed after the disc
+     * path is resolved (arm_text_image_guard). */
+    std::string text_guard_exe_path;
+    uint32_t    text_guard_load_addr = 0;
 
     if (game_config_path) {
         try {
@@ -2455,30 +2565,12 @@ int main(int argc, char** argv) {
              * loaded" from "diverged because runtime wrote different code over
              * the original EXE image". Packed/self-modifying games can rewrite
              * their own text; those pages must execute from live RAM, not stale
-             * static native code. Best effort: without the local EXE file, the
-             * guard remains on the existing dirty-page behavior. */
-            if (!gc.exe_path.empty()) {
-                std::ifstream ef(gc.exe_path, std::ios::binary | std::ios::ate);
-                if (ef) {
-                    std::streamsize sz = ef.tellg();
-                    if (sz > 2048) {
-                        uint32_t img_len = (uint32_t)(sz - 2048);
-                        uint8_t *img = (uint8_t *)std::malloc(img_len);
-                        if (img) {
-                            ef.seekg(2048, std::ios::beg);
-                            if (ef.read((char *)img, img_len)) {
-                                dirty_ram_register_text_image(
-                                    gc.load_address & 0x1FFFFFFFu, img, img_len);
-                                std::fprintf(stdout,
-                                    "psxrecomp: text image guard armed (0x%08X..0x%08X)\n",
-                                    gc.load_address, gc.load_address + img_len);
-                            } else {
-                                std::free(img);
-                            }
-                        }
-                    }
-                }
-            }
+             * static native code. Arming is DEFERRED until the disc path is
+             * resolved (arm_text_image_guard below): release installs have no
+             * local EXE file, so the guard extracts the boot EXE from the
+             * user's disc image instead. */
+            text_guard_exe_path  = gc.exe_path.string();
+            text_guard_load_addr = gc.load_address;
             /* HLE-tier scheduler subsystem replacement default (env
              * PSX_HLE_SCHEDULER still wins; latched at first dispatch). */
             psx_hle_scheduler_set_default(gc.runtime.hle_scheduler ? 1 : 0);
@@ -3005,6 +3097,11 @@ int main(int argc, char** argv) {
             std::fprintf(stdout, "psxrecomp: disc region %s (serial %s)\n",
                          ident.region.c_str(), ident.detected_serial.c_str());
     }
+    /* Arm the text-image guard now that both possible sources are resolved:
+     * the local EXE file (dev checkouts) and the disc image (every install). */
+    if (game_config_path)
+        arm_text_image_guard(text_guard_exe_path, text_guard_load_addr,
+                             disc_path_str);
     {
         int divisor = 1; /* default: authentic 1x timing */
         if (disc_speed == "instant") divisor = 0;

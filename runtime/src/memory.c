@@ -166,6 +166,8 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     g_text_diverged_pages = 0;
 }
 
+int dirty_ram_text_image_registered(void) { return text_ref_image != NULL; }
+
 static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) {
     if (!text_ref_image) return;
     if (phys < text_ref_lo || phys + (uint32_t)size > text_ref_hi) return;

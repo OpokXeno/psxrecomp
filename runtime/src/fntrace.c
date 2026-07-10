@@ -113,13 +113,20 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
          * active over REAL game text. Crash Bash: entry 0x2E7B0 is reached
          * internally, so its first shell-window call (0x30FF4 / 0x3358C) got
          * shadowed to dead shell ROM -> unknown-dispatch abort. The native-ok
-         * test is safe before the game loads: that RAM still holds shell bytes
-         * that differ from the game image, so it cannot fire prematurely. */
+         * test is safe before the game loads ONLY while a reference text image
+         * is registered: RAM still holds shell bytes that differ from the game
+         * image, so it cannot fire prematurely. With no image registered,
+         * native_ok degrades to !dirty and untouched text pages pass it —
+         * latching game-start before the EXE has loaded and clearing the dirty
+         * baseline mid-load (the v0.0.2/v0.0.3 release-install boot crash).
+         * Without an image, only the exact entry_pc dispatch may latch. */
         extern int psx_game_address_in_text(uint32_t addr);
         extern int dirty_ram_text_native_ok(uint32_t phys);
+        extern int dirty_ram_text_image_registered(void);
         uint32_t _tphys = target & 0x1FFFFFFFu;
         if (_tphys == s_game_entry_phys ||
-            (psx_game_address_in_text(target) && dirty_ram_text_native_ok(_tphys))) {
+            (dirty_ram_text_image_registered() &&
+             psx_game_address_in_text(target) && dirty_ram_text_native_ok(_tphys))) {
             s_game_started = 1;
             /* Establish the clean compiled-image baseline now: the boot EXE is fully
              * loaded into the game-text region (== compiled image) and no gameplay
