@@ -30,6 +30,7 @@
 #include "sio.h"
 #include "memcard.h"
 #include "spu.h"
+#include "audio_trace.h"
 #include "mdec.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
@@ -5654,6 +5655,146 @@ static void handle_spu_events_reset(int id, const char *json)
     (void)json;
     spu_event_reset();
     send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
+/* ---- Always-on audio tap rings (audio_trace.c) -------------------------
+ * audio_stats  — counters: per-tap produced/nonzero/audible/peak + pump
+ *                behavior (skips, underruns, queue watermarks).
+ * audio_wav    — dump a tap's PCM ring slice to a 44100 Hz s16 WAV on the
+ *                server side: {"tap":0,"path":"...","start":-1,"count":0}.
+ * audio_events — most recent N pipeline events (REG_WRITE/RENDER/SKIP/
+ *                UNDERRUN/MUTE/UNMUTE/CD_PUSH/DMA), sample-clock stamped.
+ * Protocol mirrored on psx-beetle's port 4380 (beetle_debug_server.c). */
+/* Bridge/legacy output health (main.cpp; C linkage). Returns 0 pre-device. */
+extern int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+                               uint64_t *overflow_drops, double *correction,
+                               int *legacy, int *host_rate);
+
+static void handle_audio_stats(int id, const char *json)
+{
+    (void)json;
+    AudioTraceStats st;
+    audio_trace_get_stats(&st);
+    double fill_ms = 0.0, correction = 0.0;
+    uint64_t out_underruns = 0, overflow_drops = 0;
+    int legacy = 1, host_rate = 44100;
+    int out_ok = psx_audio_out_stats(&fill_ms, &out_underruns, &overflow_drops,
+                                     &correction, &legacy, &host_rate);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"taps\":["
+             "{\"name\":\"spu_out\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u},"
+             "{\"name\":\"cd_in\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u},"
+             "{\"name\":\"host\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u}],"
+             "\"pump_calls\":%llu,\"pump_skips\":%llu,\"underruns\":%llu,"
+             "\"queue_hiwater\":%u,\"queue_lowater\":%u,"
+             "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu,"
+             "\"out\":{\"active\":%d,\"mode\":\"%s\",\"host_rate\":%d,"
+             "\"fill_ms\":%.1f,\"underruns\":%llu,\"overflow_drops\":%llu,"
+             "\"correction\":%.5f}}",
+             id,
+             (unsigned long long)st.tap_frames[0],
+             (unsigned long long)st.tap_nonzero[0],
+             (unsigned long long)st.tap_audible[0], st.tap_peak[0],
+             audio_trace_tap_rate(0),
+             (unsigned long long)st.tap_frames[1],
+             (unsigned long long)st.tap_nonzero[1],
+             (unsigned long long)st.tap_audible[1], st.tap_peak[1],
+             audio_trace_tap_rate(1),
+             (unsigned long long)st.tap_frames[2],
+             (unsigned long long)st.tap_nonzero[2],
+             (unsigned long long)st.tap_audible[2], st.tap_peak[2],
+             audio_trace_tap_rate(2),
+             (unsigned long long)st.pump_calls,
+             (unsigned long long)st.pump_skips,
+             (unsigned long long)st.underruns,
+             st.queue_hiwater, st.queue_lowater,
+             (unsigned long long)st.mute_events,
+             (unsigned long long)st.unmute_events,
+             (unsigned long long)st.events_total,
+             out_ok, legacy ? "legacy-push" : "bridge-pull", host_rate,
+             fill_ms,
+             (unsigned long long)out_underruns,
+             (unsigned long long)overflow_drops,
+             correction);
+}
+
+static void handle_audio_wav(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"missing path\"}", id);
+        return;
+    }
+    int tap = json_get_int(json, "tap", AUDIO_TAP_SPU_OUT);
+    /* start/count as strings so 64-bit sample indices survive. */
+    char buf[32];
+    int64_t start = -1;
+    uint64_t count = 0;
+    if (json_get_str(json, "start", buf, sizeof(buf)))
+        start = strtoll(buf, NULL, 0);
+    else
+        start = (int64_t)json_get_int(json, "start", -1);
+    if (json_get_str(json, "count", buf, sizeof(buf)))
+        count = strtoull(buf, NULL, 0);
+    else
+        count = (uint64_t)json_get_int(json, "count", 0);
+
+    int64_t wrote = audio_trace_dump_wav(tap, path, start, count);
+    if (wrote < 0) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"dump failed (bad tap/path or empty ring)\"}", id);
+        return;
+    }
+    uint64_t total = audio_trace_tap_total(tap);
+    send_fmt("{\"id\":%d,\"ok\":true,\"tap\":%d,\"frames\":%lld,"
+             "\"rate\":%u,\"tap_total\":%llu}",
+             id, tap, (long long)wrote, audio_trace_tap_rate(tap),
+             (unsigned long long)total);
+}
+
+static void handle_audio_events(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+    AudioTraceEvent *evs =
+        (AudioTraceEvent *)malloc((size_t)count * sizeof(AudioTraceEvent));
+    if (!evs) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    uint32_t got = audio_trace_events_get(evs, (uint32_t)count);
+    uint64_t total = audio_trace_events_total();
+    static const char *kind_names[] = {
+        "?", "REG", "RENDER", "SKIP", "UNDERRUN",
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+    };
+
+    size_t cap = 256u + (size_t)got * 192u;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(evs); send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    size_t off = 0;
+    int n = snprintf(out + off, cap - off,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
+        id, (unsigned long long)total, (unsigned)got);
+    if (n > 0) off += (size_t)n;
+    for (uint32_t i = 0; i < got; i++) {
+        const AudioTraceEvent *e = &evs[i];
+        const char *kn = (e->kind < sizeof(kind_names) / sizeof(kind_names[0]))
+                         ? kind_names[e->kind] : "?";
+        n = snprintf(out + off, cap - off,
+            "%s{\"seq\":%llu,\"smp\":%llu,\"frame\":%u,"
+            "\"kind\":\"%s\",\"a\":\"0x%X\",\"b\":\"0x%X\"}",
+            i == 0 ? "" : ",",
+            (unsigned long long)e->seq,
+            (unsigned long long)e->sample_idx,
+            e->frame, kn, e->a, e->b);
+        if (n > 0) off += (size_t)n;
+    }
+    n = snprintf(out + off, cap - off, "]}");
+    if (n > 0) off += (size_t)n;
+    send_fmt("%s", out);
+    free(out);
+    free(evs);
 }
 
 /* ---- SIO IRQ-arm audit -----------------------------------------------
@@ -11443,6 +11584,9 @@ static const CmdEntry s_commands[] = {
     { "spu_voices",        handle_spu_voices },
     { "spu_events",        handle_spu_events },
     { "spu_events_reset",  handle_spu_events_reset },
+    { "audio_stats",       handle_audio_stats },
+    { "audio_wav",         handle_audio_wav },
+    { "audio_events",      handle_audio_events },
     { "card_buffer_dump",  handle_card_buffer_dump },
     { "sio_arm_audit",     handle_sio_arm_audit },
     { "sio_burst_stats",   handle_sio_burst_stats },

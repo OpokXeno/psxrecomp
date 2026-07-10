@@ -635,6 +635,31 @@ static void xa_reset_decode(void) {
     xa_stream_active = 0;
 }
 
+/* CD-audio volume matrix ([data_source][output_port], 0x80 = unity) applied
+ * to every decoded XA/CD-DA sample, exactly as the CD controller does on
+ * real hardware (Beetle PS_CDC::ApplyVolume, cdc.cpp:524). Written via the
+ * index-2/3 register banks and latched by the "apply changes" bit; games
+ * drive it CONSTANTLY — X5 fades music between scenes with it (measured
+ * 0x7E steady, ramping to 0x00 at transitions on the Beetle oracle). Not
+ * modeling it left fades missing and steady levels ~0.6 dB hot. */
+static uint8_t cd_pending_vol[2][2] = { { 0x80, 0x00 }, { 0x00, 0x80 } };
+static uint8_t cd_decode_vol[2][2]  = { { 0x80, 0x00 }, { 0x00, 0x80 } };
+
+static void cd_apply_decode_volume(int16_t *stereo, int frames) {
+    /* Fast path: identity matrix (the reset state). */
+    if (cd_decode_vol[0][0] == 0x80 && cd_decode_vol[1][1] == 0x80 &&
+        cd_decode_vol[0][1] == 0x00 && cd_decode_vol[1][0] == 0x00)
+        return;
+    for (int i = 0; i < frames; i++) {
+        int32_t l = stereo[i * 2 + 0];
+        int32_t r = stereo[i * 2 + 1];
+        int32_t lo = ((l * cd_decode_vol[0][0]) >> 7) + ((r * cd_decode_vol[1][0]) >> 7);
+        int32_t ro = ((l * cd_decode_vol[0][1]) >> 7) + ((r * cd_decode_vol[1][1]) >> 7);
+        stereo[i * 2 + 0] = clamp16_cd(lo);
+        stereo[i * 2 + 1] = clamp16_cd(ro);
+    }
+}
+
 static int xa_decode_sector_4bit_stereo(const uint8_t* data, int16_t* out) {
     static const int k0[5] = { 0, 60, 115, 98, 122 };
     static const int k1[5] = { 0, 0, -52, -55, -60 };
@@ -787,6 +812,9 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data,
         : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
     int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
                                           pcm_44100, XA_MAX_44100_FRAMES);
+    /* Volume is applied after resampling, per PS1 hardware tests (Beetle
+     * cdc.cpp GetCDAudio comment). */
+    cd_apply_decode_volume(pcm_44100, out_frames);
     spu_cd_audio_push(pcm_44100, out_frames);
     trace_cdrom('A', 0,
                 ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
@@ -1668,6 +1696,8 @@ void cdrom_write(uint32_t addr, uint32_t value) {
     case 0x1F801801:
         if (index_reg == 0) {
             queue_or_exec_command(val);
+        } else if (index_reg == 3) {
+            cd_pending_vol[1][1] = val;   /* Right-CD -> Right-SPU */
         }
         break;
 
@@ -1678,11 +1708,24 @@ void cdrom_write(uint32_t addr, uint32_t value) {
             }
         } else if (index_reg == 1) {
             irq_enable = val & 0x1F;
+        } else if (index_reg == 2) {
+            cd_pending_vol[0][0] = val;   /* Left-CD -> Left-SPU */
+        } else if (index_reg == 3) {
+            cd_pending_vol[1][0] = val;   /* Right-CD -> Left-SPU */
         }
         break;
 
     case 0x1F801803:
-        if (index_reg == 0) {
+        if (index_reg == 2) {
+            cd_pending_vol[0][1] = val;   /* Left-CD -> Right-SPU */
+        } else if (index_reg == 3) {
+            /* Apply-changes latch (bit 5) copies pending -> live, exactly
+             * like Beetle cdc.cpp case 0x0B. (ADPMute bit 0 is not modeled
+             * by the Beetle oracle either.) */
+            if (val & 0x20) {
+                memcpy(cd_decode_vol, cd_pending_vol, sizeof(cd_decode_vol));
+            }
+        } else if (index_reg == 0) {
             request_reg = val;
             if (!(request_reg & CDROM_REQUEST_BFRD)) {
                 sector_read_pos = 0;

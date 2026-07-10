@@ -22,9 +22,11 @@
 #include "mednafen/psx/cpu.h"
 #include "mednafen/psx/gpu.h"
 #include "mednafen/psx/spu.h"
+#include "mednafen/psx/cdc.h"
 #include "mednafen/psx/frontio.h"
 #include "mednafen/psx/irq.h"
 #include "beetle_history.h"
+#include "audio_trace.h"    /* always-on oracle PCM tap ring (port 4380 audio_wav) */
 #include "parity_trace.h"   /* general control-flow parity ring (oracle producer) */
 #include "device_trace.h"   /* general device-event cycle ring (oracle producer) */
 static void irq_event_callback(int which);  /* fwd: device-event ring producer */
@@ -375,8 +377,18 @@ void on_video_refresh(const void *data, unsigned width, unsigned height, size_t 
     }
 }
 
-void on_audio_sample(int16_t l, int16_t r) { (void)l; (void)r; }
-size_t on_audio_sample_batch(const int16_t *data, size_t frames) { (void)data; return frames; }
+/* Beetle's fully-mixed 44.1 kHz reference SPU output arrives here every
+ * retro_run. Record it into the always-on audio trace (tap SPU_OUT) so port
+ * 4380's audio_wav can dump oracle PCM for offline A/B against the recomp's
+ * tap on port 4370. The host still plays no audio from psx-beetle. */
+void on_audio_sample(int16_t l, int16_t r) {
+    int16_t frame[2] = { l, r };
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, frame, 1);
+}
+size_t on_audio_sample_batch(const int16_t *data, size_t frames) {
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, data, (int)frames);
+    return frames;
+}
 void on_input_poll(void) {}
 
 int16_t on_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
@@ -576,6 +588,7 @@ extern "C" void beetle_run_frame(uint16_t pad1_buttons) {
     if (!s_loaded) return;
     s_joypad = pad1_buttons;
     s_frame_count++;
+    audio_trace_note_frame(s_frame_count);
     retro_run();
     beetle_history_record_frame();
 }
@@ -994,6 +1007,21 @@ extern "C" void psxrecomp_beetle_spu_event(unsigned kind, unsigned voice,
 }
 
 extern "C" uint64_t beetle_spu_event_total(void) { return s_spu_event_seq; }
+
+/* CD-audio volume matrix ground truth (PS_CDC::DecodeVolume; 0x80 = unity).
+ * Returns 0 if the CDC isn't up. */
+extern "C" int beetle_cdc_decode_volume(unsigned out[4])
+{
+    extern PS_CDC *PSX_CDC;
+    if (!PSX_CDC) return 0;
+    uint8 m[2][2];
+    PSX_CDC->PSXRecomp_GetDecodeVolume(m);
+    out[0] = m[0][0];  /* L -> L */
+    out[1] = m[0][1];  /* L -> R */
+    out[2] = m[1][0];  /* R -> L */
+    out[3] = m[1][1];  /* R -> R */
+    return 1;
+}
 
 extern "C" uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
                                          uint32_t *out_addr, uint16_t *out_env,
