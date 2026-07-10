@@ -257,6 +257,12 @@ typedef struct {
     int      nw_extra;          /* native-wide frame growth (display px), 0 if off */
     uint64_t cur_frame;
     uint32_t last_tag_frame;    /* frame of newest tagged prim */
+    uint32_t last_3d_frame;     /* frame of newest shaded prim (diagnostic) */
+    uint32_t gte_verts;         /* RTPS/RTPT verts in the last completed frame */
+    uint32_t last_world3d_frame;/* newest SUSTAINED world-scale projection frame */
+    uint32_t ovh_prims;         /* overhanging polys in the last completed frame */
+    uint32_t last_ovh_frame;    /* newest SUSTAINED polygon-overhang frame (the
+                                   2D-only-scene classifier's world signal) */
 } GpuWsDebug;
 void gpu_ws_get_debug(GpuWsDebug* out);
 

@@ -26,6 +26,7 @@
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
+#include "present_ring.h"
 #include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
@@ -289,6 +290,11 @@ static uint64_t s_dirty_break_hits = 0;
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
+/* Optional analog-stick override (set_input lx/ly/rx/ry, 0..255, 0x80 =
+ * centre). Lets injected input drive analog-mode movement; consumed by the
+ * pad sampler alongside the button word. */
+static int     s_axis_override = 0;
+static uint8_t s_axis_st[4]    = { 0x80, 0x80, 0x80, 0x80 };
 
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
@@ -4591,7 +4597,9 @@ static void handle_gpu_state(int id, const char *json)
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
              "\"present_native_43\":%d,\"x_margin\":%d,\"squash\":[%d,%d],"
              "\"mode\":%d,\"nw_extra\":%d,"
-             "\"cur_frame\":%llu,\"last_tag_frame\":%u}}",
+             "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
+             "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
+             "\"ovh_prims\":%u,\"last_ovh_frame\":%u}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
@@ -4606,7 +4614,9 @@ static void handle_gpu_state(int id, const char *json)
              ws.configured, ws.active, ws.game_mode,
              ws.present_native_43, ws.x_margin, ws.xnum, ws.xden,
              ws.mode, ws.nw_extra,
-             (unsigned long long)ws.cur_frame, ws.last_tag_frame);
+             (unsigned long long)ws.cur_frame, ws.last_tag_frame,
+             ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
+             ws.ovh_prims, ws.last_ovh_frame);
 }
 
 static void handle_mem_words(int id, const char *json)
@@ -6640,6 +6650,15 @@ static void handle_set_input(int id, const char *json)
     }
     s_input_override = (int)hex_to_u32(val_str);
     s_input_frames = 0;
+    /* Optional stick override: any of lx/ly/rx/ry (0..255) arms it; omitted
+     * axes centre. Absent entirely -> released (buttons-only injection). */
+    int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
+                  json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
+    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    for (int i = 0; i < 4; i++) {
+        int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
+        s_axis_st[i] = (uint8_t)v;
+    }
     send_ok(id);
 }
 
@@ -6679,6 +6698,8 @@ static void handle_clear_input(int id, const char *json)
     (void)json;
     s_input_override = -1;
     s_input_frames   = 0;
+    s_axis_override  = 0;
+    s_axis_st[0] = s_axis_st[1] = s_axis_st[2] = s_axis_st[3] = 0x80;
     send_ok(id);
 }
 
@@ -7015,15 +7036,24 @@ static void handle_mmx6_freshfix(int id, const char *json)
  * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
 static void handle_savestate(int id, const char *json)
 {
-    extern void savestate_request_save(int slot);
-    extern void savestate_request_load(int slot);
+    extern int savestate_request_save(int slot);
+    extern int savestate_request_load(int slot);
     int slot = json_get_int(json, "slot", -1);
     if (slot < 0) { send_err(id, "missing slot"); return; }
     char op[16];
     if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
-    if      (!strcmp(op, "save")) savestate_request_save(slot);
-    else if (!strcmp(op, "load")) savestate_request_load(slot);
+    int staged;
+    if      (!strcmp(op, "save")) staged = savestate_request_save(slot);
+    else if (!strcmp(op, "load")) staged = savestate_request_load(slot);
     else { send_err(id, "op must be save|load"); return; }
+    if (!staged) {
+        /* Refused: bad slot, not configured, or load on an LLE host-fiber run
+         * (cross-fiber unwind is unsafe there — see savestate_request_load).
+         * The old handler ack'd ok:true anyway, which read as a silent no-op. */
+        send_err(id, "savestate request refused (LLE run cannot load states; "
+                     "check slot / configuration)");
+        return;
+    }
     send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
 }
 
@@ -7935,6 +7965,49 @@ static void handle_gl_present_ring(int id, const char *json)
                         e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
                         e.px_r, e.px_g, e.px_b, e.glerr,
                         e.src_r, e.src_g, e.src_b, e.src_valid);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+/* Present-classification ring (all backends; see present_ring.h): how each
+ * present was classified — 4:3 pillarbox / native-wide / canonical — and
+ * whether a native-wide present fell back to the canonical width (the
+ * "everything stretched for a while" signature). Always-on; this reads a
+ * window.
+ *   {"cmd":"present_ring","n":600}
+ * -> events: [seq, frame, path, present_w, disp_w, disp_h, game_mode,
+ *             native_43, fellback, tag_delta, nw_extra, gte_verts,
+ *             ovh_prims] */
+static void handle_present_ring(int id, const char *json)
+{
+    static const char *pres_path_name[4] =
+        { "blank", "native43", "wide", "canonical" };
+    int n = json_get_int(json, "n", 300);
+    if (n < 1) n = 1;
+    if (n > 4096) n = 4096;
+    uint64_t total = present_ring_total();
+    uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
+    int bufsz = 96 + n * 112;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"events\":[",
+                       id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t s = start; s < total && pos < bufsz - 128; s++) {
+        PresRingEntry e;
+        if (!present_ring_get(s, &e)) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%u,%u,%u,%u,%u,%u,%ld,%u,%u,%u]",
+                        first ? "" : ",", (unsigned long long)s, e.frame,
+                        e.path < 4 ? pres_path_name[e.path] : "?",
+                        e.present_w, e.disp_w, e.disp_h,
+                        e.game_mode, e.native_43, e.wide_fellback,
+                        (long)e.tag_delta, e.nw_extra,
+                        e.gte_verts, e.ovh_prims);
         first = 0;
     }
     pos += snprintf(buf + pos, bufsz - pos, "]}");
@@ -11708,6 +11781,7 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "gl_present_ring",   handle_gl_present_ring },
+    { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
     { "gl_wide_fast",      handle_gl_wide_fast },
@@ -12641,6 +12715,14 @@ int debug_server_get_input_override(void)
             s_input_override = -1;
     }
     return s_input_override;
+}
+
+int debug_server_get_axis_override(unsigned char st[4])
+{
+    if (!s_axis_override) return 0;
+    st[0] = s_axis_st[0]; st[1] = s_axis_st[1];
+    st[2] = s_axis_st[2]; st[3] = s_axis_st[3];
+    return 1;
 }
 
 int debug_server_turbo_enabled(void)
