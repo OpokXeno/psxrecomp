@@ -5427,6 +5427,94 @@ static void handle_gte_state(int id, const char *json)
     send_fmt("%s", buf);
 }
 
+/* Dump recent GTE RTPS/RTPT projections (inputs + outputs) from the always-on
+ * GTE ring. {"cmd":"gte_ring_dump","count":N,"newest":1,"frame":F} — frame
+ * optional (omit or -1 for all). Used to find flattened/degenerate character
+ * projections and split game-code input bugs from GTE-math bugs. */
+static void handle_gte_ring_dump(int id, const char *json)
+{
+    extern unsigned long long gte_rtp_ring_total(void);
+    extern int gte_rtp_ring_dump_json(char *out, int outsz, int max_count,
+                                      int newest_first, long frame_filter);
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    int newest = json_get_int(json, "newest", 1) != 0;
+    long frame = (long)json_get_int(json, "frame", -1);
+
+    size_t BUF_SZ = 256u + (size_t)count * 720u;
+    char *entries = (char *)malloc(BUF_SZ);
+    char *reply   = (char *)malloc(BUF_SZ + 256u);
+    if (!entries || !reply) { free(entries); free(reply); send_err(id, "oom"); return; }
+    int n = gte_rtp_ring_dump_json(entries, (int)BUF_SZ, count, newest, frame);
+    snprintf(reply, BUF_SZ + 256u,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
+             id, gte_rtp_ring_total(), n, entries);
+    debug_server_send_line(reply);
+    free(entries); free(reply);
+}
+
+/* INTPL (vertex-lerp) ring: inputs (ir0 blend, in=IR1-3 pose A, fc=pose B)
+ * and outputs (mac / out=IR1-3 / flag) per op. offset pages through the
+ * matching entries after the frame filter, so a whole frame is reachable. */
+static void handle_gte_intpl_dump(int id, const char *json)
+{
+    extern unsigned long long gte_intpl_ring_total(void);
+    extern int gte_intpl_ring_dump_json(char *out, int outsz, int max_count,
+                                        int newest_first, long frame_filter,
+                                        int offset);
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    int newest = json_get_int(json, "newest", 1) != 0;
+    long frame = (long)json_get_int(json, "frame", -1);
+    int offset = json_get_int(json, "offset", 0);
+    if (offset < 0) offset = 0;
+
+    size_t BUF_SZ = 256u + (size_t)count * 420u;
+    char *entries = (char *)malloc(BUF_SZ);
+    char *reply   = (char *)malloc(BUF_SZ + 256u);
+    if (!entries || !reply) { free(entries); free(reply); send_err(id, "oom"); return; }
+    int n = gte_intpl_ring_dump_json(entries, (int)BUF_SZ, count, newest, frame, offset);
+    snprintf(reply, BUF_SZ + 256u,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"emitted\":%d,\"offset\":%d,\"entries\":[%s]}",
+             id, gte_intpl_ring_total(), n, offset, entries);
+    debug_server_send_line(reply);
+    free(entries); free(reply);
+}
+
+/* Per-frame GTE projection stats (nproj / nsat / nflat) over recent frames —
+ * shows the alternating flat/normal render pattern. */
+static void handle_gte_frame_stats(int id, const char *json)
+{
+    extern int gte_fstat_dump_json(char *out, int outsz, int max_frames);
+    int n = json_get_int(json, "frames", 120);
+    if (n < 1) n = 1; if (n > 512) n = 512;
+    size_t BUF = 256u + (size_t)n * 96u;
+    char *body = (char *)malloc(BUF), *reply = (char *)malloc(BUF + 128u);
+    if (!body || !reply) { free(body); free(reply); send_err(id, "oom"); return; }
+    int emitted = gte_fstat_dump_json(body, (int)BUF, n);
+    snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"emitted\":%d,\"frames\":[%s]}",
+             id, emitted, body);
+    debug_server_send_line(reply); free(body); free(reply);
+}
+
+/* Latched degenerate (saturated-output) GTE projections with full inputs. */
+static void handle_gte_latch_dump(int id, const char *json)
+{
+    extern unsigned long long gte_latch_total(void);
+    extern int gte_latch_dump_json(char *out, int outsz, int max_count);
+    int n = json_get_int(json, "count", 64);
+    if (n < 1) n = 1; if (n > 256) n = 256;
+    size_t BUF = 256u + (size_t)n * 720u;
+    char *body = (char *)malloc(BUF), *reply = (char *)malloc(BUF + 128u);
+    if (!body || !reply) { free(body); free(reply); send_err(id, "oom"); return; }
+    int emitted = gte_latch_dump_json(body, (int)BUF, n);
+    snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"latch_total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
+             id, gte_latch_total(), emitted, body);
+    debug_server_send_line(reply); free(body); free(reply);
+}
+
 static void handle_sio_state(int id, const char *json)
 {
     (void)json;
@@ -11496,6 +11584,10 @@ static const CmdEntry s_commands[] = {
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
+    { "gte_ring_dump",     handle_gte_ring_dump },
+    { "gte_intpl_dump",    handle_gte_intpl_dump },
+    { "gte_frame_stats",   handle_gte_frame_stats },
+    { "gte_latch_dump",    handle_gte_latch_dump },
     { "quit",              handle_quit },
     { "dispatch_stats",    handle_dispatch_stats },
     { "dispatch_check",    handle_dispatch_check },
