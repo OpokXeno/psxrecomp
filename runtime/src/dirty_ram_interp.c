@@ -2152,6 +2152,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             if (_gc) return 1;
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
+    } else if (psx_game_address_in_text(addr)) {
+        /* RAM at a game-text address diverged from the static EXE image
+         * (runtime-relocated / overlaid / self-modified code the compiled
+         * static function no longer reflects). The live RAM is the truth:
+         * fall through to INTERPRET it here rather than bail (line below) to
+         * the shell shadow (normalize() -> shell ROM). Crash Bash relocates a
+         * code page onto 0x30000 (inside the BIOS shell window); without this
+         * its 0x30FF4 call diverged (native_ok=0) yet was not dirty, so the
+         * interpreter bailed and normalize() shadowed it to dead shell ROM ->
+         * unknown-dispatch abort. Marking it a clean game-text miss lets the
+         * dirty interpreter execute the real RAM bytes. */
+        clean_game_text_miss = 1;
     }
 #endif
 
