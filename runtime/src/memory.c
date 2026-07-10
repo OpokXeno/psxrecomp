@@ -12,6 +12,7 @@
 #include "cdrom.h"
 #include "crash_trace.h"
 #include "dma.h"
+#include "fntrace.h"
 #include "gpu.h"
 #include "mdec.h"
 #include "sio.h"
@@ -48,6 +49,10 @@ static inline uint32_t psx_phys_addr(uint32_t addr) {
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
+
+void memory_clear_low_boot_scratch(void) {
+    memset(ram, 0, 0x10u);
+}
 
 /* ---- Dirty-page tracking for install-at-runtime code (CLAUDE.md Rule 18) ----
  *
@@ -1096,7 +1101,59 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
 
     uint32_t phys = psx_phys_addr(addr);
 
+    /* The generated BIOS mirrors its exception trampoline to 0x80000000 during
+     * boot. On hardware this mirror copy is not visible in RAM; only the real
+     * exception vector at 0x80000080 is. Tomba 2 later passes buffer=0 to the
+     * BIOS card write routine, so stale mirror bytes at 0 corrupt the sector 63
+     * management write and leave the load menu stuck checking the card. */
+    if (fntrace_is_game_started() &&
+        phys < 0x10u && g_debug_last_store_pc == 0xBFC10A00u) return;
+
+    /* BIOS helpers use RAM address zero as a tiny delay-loop scratch between
+     * device-register polls. Treat these two dummy stores as non-visible; real
+     * hardware / Beetle preserve Tomba 2's sector-63 card-management payload
+     * when it passes buffer=0 to _card_write. */
+    if (fntrace_is_game_started() && phys == 0u) {
+        switch (g_debug_last_store_pc) {
+        case 0xBFC04E90u:
+        case 0xBFC04EF0u:
+        case 0xBFC05164u:
+        case 0xBFC0D634u:
+        case 0xBFC3EEB4u:
+        case 0xBFC405E4u:
+        case 0xBFC40788u:
+        case 0xBFC41C50u:
+        case 0x80012434u:
+        case 0x800125ACu:
+            return;
+        default:
+            break;
+        }
+    }
+
     if (phys < RAM_SIZE) {
+        /* Tomba 2 load-game card check: the BIOS card-manager cleanup helper
+         * at kernel RAM 0x1C5C scans MARK events and re-arms any READY event
+         * matching F0000011/{4,8000,100,200,2000}. In the recomp timing path it
+         * can run after the card completion DeliverEvent but before the game's
+         * TestEvent poll, consuming the public card event and leaving the UI
+         * stuck at "Checking MEMORY CARD...". Let the real TestEvent consume
+         * public MARK card events instead; keep this narrowly keyed to the
+         * helper's status store and the EvCB layout. */
+        if (fntrace_is_game_started() &&
+            g_debug_last_store_pc == 0xBFC117E4u &&
+            val == 0x2000u &&
+            phys >= 4u && (phys + 8u) < RAM_SIZE &&
+            read_ram_word(phys) == 0x4000u &&
+            read_ram_word(phys - 4u) == 0xF0000011u &&
+            read_ram_word(phys + 8u) == 0x2000u) {
+            uint32_t spec = read_ram_word(phys + 4u);
+            if (spec == 0x00000004u || spec == 0x00008000u ||
+                spec == 0x00000100u || spec == 0x00000200u ||
+                spec == 0x00002000u) {
+                return;
+            }
+        }
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         parity_trace_note_write(phys, 4, effective_store_pc());
