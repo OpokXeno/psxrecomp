@@ -4759,6 +4759,8 @@ static void handle_cdrom_state(int id, const char *json)
              "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
              "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
              "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
+             "\"read_hold_cycles\":%llu,\"read_hold_events\":%llu,"
+             "\"int1_pended\":%llu,\"int1_lost\":%llu,\"int1_pending_now\":%u,"
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
@@ -4772,6 +4774,11 @@ static void handle_cdrom_state(int id, const char *json)
              s.sector_available, s.sector_read_pos, s.sector_size,
              s.reading, s.read_min, s.read_sec, s.read_sect,
              s.read_cmd, s.read_delay,
+             (unsigned long long)s.read_hold_cycles,
+             (unsigned long long)s.read_hold_events,
+             (unsigned long long)s.int1_pended,
+             (unsigned long long)s.int1_lost,
+             s.int1_pending_now,
              s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
@@ -5700,7 +5707,8 @@ static void handle_spu_voices(int id, const char *json)
             "\"start\":\"0x%05X\",\"loop\":\"0x%05X\","
             "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
             "\"cur_addr\":\"0x%05X\",\"repeat_addr\":\"0x%05X\","
-            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\"}",
+            "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\","
+            "\"env\":\"0x%04X\",\"env_phase\":%d}",
             v == 0 ? "" : ",",
             v, s.active,
             s.vol_ctrl_l, s.vol_ctrl_r,
@@ -5709,13 +5717,33 @@ static void handle_spu_voices(int id, const char *json)
             (uint32_t)s.loop_lo  << 3,
             s.adsr_lo, s.adsr_hi,
             s.cur_addr, s.repeat_addr,
-            s.last_flags, s.sample_idx, s.phase);
+            s.last_flags, s.sample_idx, s.phase,
+            s.env_level, s.adsr_phase);
         if (n > 0) off += (size_t)n;
     }
     n = snprintf(out + off, cap - off, "]}");
     if (n > 0) off += (size_t)n;
     send_fmt("%s", out);
     free(out);
+}
+
+/* ---- SPU RAM peek: {"addr":N,"len":M} -> hex bytes. Sample data is the
+ * ground truth for voice-rail triage (what does a parked loop block hold?). */
+static void handle_spu_ram(int id, const char *json)
+{
+    uint32_t addr = (uint32_t)json_get_int(json, "addr", 0);
+    int len = json_get_int(json, "len", 16);
+    if (len < 1) len = 1;
+    if (len > 4096) len = 4096;
+    uint8_t bytes[4096];
+    uint32_t got = spu_ram_peek(addr, bytes, (uint32_t)len);
+    char *hex = (char *)malloc((size_t)got * 2u + 1u);
+    if (!hex) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    for (uint32_t i = 0; i < got; i++)
+        snprintf(hex + i * 2u, 3u, "%02X", bytes[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%05X\",\"len\":%u,\"hex\":\"%s\"}",
+             id, addr, (unsigned)got, hex);
+    free(hex);
 }
 
 /* ---- SPU event ring dump. Returns the most recent N events
@@ -5878,7 +5906,7 @@ static void handle_audio_events(int id, const char *json)
     uint64_t total = audio_trace_events_total();
     static const char *kind_names[] = {
         "?", "REG", "RENDER", "SKIP", "UNDERRUN",
-        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO"
     };
 
     size_t cap = 256u + (size_t)got * 192u;
@@ -11738,6 +11766,7 @@ static const CmdEntry s_commands[] = {
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
     { "spu_voices",        handle_spu_voices },
+    { "spu_ram",           handle_spu_ram },
     { "spu_events",        handle_spu_events },
     { "spu_events_reset",  handle_spu_events_reset },
     { "audio_stats",       handle_audio_stats },
