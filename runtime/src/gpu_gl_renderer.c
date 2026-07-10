@@ -2386,13 +2386,16 @@ static int glb_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh,
  * every 15-bit frame regardless of what mix of ops produced it.
  * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
 /* ===================== frame_perf: per-frame GPU/CPU phase timing ============
- * Always-on (Release too). Two GL_TIME_ELAPSED queries per frame bracket (a) the
+ * Developer builds use two GL_TIME_ELAPSED queries per frame to bracket (a) the
  * scene draws (all GP0 raster issued between two presents) and (b) the present
  * clear+blit, giving TRUE GPU time per phase independent of CPU/GPU overlap
  * (glFinish would only catch the non-overlapped tail and mislead). CPU wall time
  * (present-to-present total, and the present call) comes from SDL perf counters.
  * Results are read back GLPERF_NBUF frames late (no pipeline stall) into a ring
- * the debug server's frame_perf command aggregates. One question this answers:
+ * the debug server's frame_perf command aggregates. Release builds compile out
+ * the debug server, so they also leave this instrumentation disabled: a native-
+ * wide frame can otherwise issue hundreds of unused mirror timestamp queries.
+ * One question this answers in a diagnostics build:
  * where does a 16:9 frame go vs 4:3 — scene fill, wide composite, or CPU. */
 #define GLPERF_NBUF 4
 #define GLPERF_RING 256
@@ -2448,6 +2451,9 @@ static GlPerfSample s_pf_ring[GLPERF_RING];
 static uint64_t     s_pf_ring_seq = 0;
 
 static void gl_perf_init(void) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    return;
+#else
     if (!p_glGenQueries || !p_glBeginQuery || !p_glEndQuery || !p_glGetQueryObjectui64v) return;
     p_glGenQueries(GLPERF_NBUF, s_pf_scene_q);
     p_glGenQueries(GLPERF_NBUF, s_pf_present_q);
@@ -2463,6 +2469,7 @@ static void gl_perf_init(void) {
     s_pf_b = 0; s_pf_scene_active = 0; s_pf_count = 0; s_pf_ring_seq = 0;
     s_pf_last_enter = 0;
     s_pf_on = 1;
+#endif
 }
 
 /* Bracket ONE native-wide mirror pass (called from the wide-mirror draw sites).
