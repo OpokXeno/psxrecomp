@@ -79,12 +79,22 @@ validated against this change. No subset, no sampling.
 double-buffers and in all frames of a jittered screenshot burst;
 menus/animation healthy.
 
-**Pending (every one required):**
+**Ape Escape (SCUS-94423)** — 2026-07-10. Full branch-flavor rebuild
+(BIOS + game regen, `build-crashbash-fw/`). Booted to title; lit title
+models healthy (Ape was the highest-risk title — heavy GTE user, most
+likely to exercise the depth-cue step clamp). User-validated in play.
 
-**Mega Man X6**, **Tomba 2**, **Ape Escape**. Ape Escape is the highest-risk
-of the three — a heavy GTE user and the most likely to exercise the
-depth-cue step clamp with distant far colors; Tomba 2 and MMX6 exercise the
-standard `lm = 1` lighting path that must be bit-identical to before.
+**Tomba 2 (SCUS-94454)** — 2026-07-10. Full branch-flavor rebuild. Attract
+gameplay healthy; `gte_frame_stats` over the attract scene: `nintpl = 0`
+(no INTPL use), steady `nsat`/`nflat`, `nintpl_tiny = 0`. User-validated.
+
+**Mega Man X6 (SLUS-01395)** — 2026-07-10. Full branch-flavor rebuild.
+Attract gameplay demo healthy (standard `lm = 1` lighting path).
+
+All four titles validated → merged to master `e4145d7` on 2026-07-10.
+Post-merge gate: Tomba rebuilt clean against merged master; Crash Bash
+junction re-pointed to master, regenerated, rebuilt — SELECT GAME TYPE
+character present, `nintpl_tiny = 0` across the sampled frames.
 
 **Per-title procedure (same for all):**
 
