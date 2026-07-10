@@ -187,6 +187,7 @@ generated C is optimized. Game projects generate their own
 | Triangle | A |
 | L1 / R1 | Q / W |
 | L2 / R2 | E / R |
+| L3 / R3 (stick clicks) | T / Y |
 | Start | Enter |
 | Select | Right Shift |
 | Turbo | Tab (hold) |
@@ -205,6 +206,7 @@ Xbox-style controller defaults are enabled when a controller is connected:
 | Triangle | Y |
 | L1 / R1 | LB / RB |
 | L2 / R2 | LT / RT |
+| L3 / R3 | Left / right stick click |
 | Start | Menu |
 | Select | View / Back |
 

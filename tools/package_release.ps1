@@ -54,7 +54,8 @@ Write-Host "Verified self-contained: imports only system DLLs ($($imports.Count)
 @"
 ; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.
 ; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,
-; lefttrigger,righttrigger,dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.
+; lefttrigger,righttrigger,leftstick,rightstick (stick clicks -> L3/R3),
+; dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.
 
 [controller]
 enabled = true
@@ -74,6 +75,8 @@ l1 = leftshoulder
 r1 = rightshoulder
 l2 = lefttrigger
 r2 = righttrigger
+l3 = leftstick
+r3 = rightstick
 start = start
 select = back
 "@ | Set-Content -Encoding ASCII (Join-Path $Stage "input.ini")

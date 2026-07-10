@@ -26,6 +26,8 @@ int  beetle_debug_server_get_input_override(void);
 }
 
 #define PAD_SELECT   (1 << 0)
+#define PAD_L3       (1 << 1)
+#define PAD_R3       (1 << 2)
 #define PAD_START    (1 << 3)
 #define PAD_UP       (1 << 4)
 #define PAD_RIGHT    (1 << 5)
@@ -57,6 +59,8 @@ static uint16_t pad_from_keyboard(void) {
     if (keys[SDL_SCANCODE_W])       b &= ~PAD_R1;
     if (keys[SDL_SCANCODE_E])       b &= ~PAD_L2;
     if (keys[SDL_SCANCODE_R])       b &= ~PAD_R2;
+    if (keys[SDL_SCANCODE_T])       b &= ~PAD_L3;   /* stick clicks: same keys */
+    if (keys[SDL_SCANCODE_Y])       b &= ~PAD_R3;   /* as psx-runtime defaults */
     return b;
 }
 

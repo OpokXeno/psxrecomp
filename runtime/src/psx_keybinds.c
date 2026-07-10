@@ -39,7 +39,8 @@
  * with defaults changes nothing until the user edits it:
  *   D-pad: Arrow keys      Start: Return     Select: Right Shift
  *   Cross: X   Circle: S   Square: Z   Triangle: A
- *   L1: Q  R1: W  L2: E  R2: R          L3/R3: unbound
+ *   L1: Q  R1: W  L2: E  R2: R  L3: T  R3: Y (stick clicks continue the
+ *   shoulder row; DualShock-only games like Ape Escape require L3/R3)
  *   Left analog stick: Arrow keys (matches the old keyboard analog path)
  *   Right analog stick: unbound (the keyboard never drove it before)
  * Player 2 is fully unbound (add binds to enable a 2nd keyboard player).
@@ -52,7 +53,7 @@
         .square = SDL_SCANCODE_Z, .triangle = SDL_SCANCODE_A, \
         .l1 = SDL_SCANCODE_Q, .r1 = SDL_SCANCODE_W, \
         .l2 = SDL_SCANCODE_E, .r2 = SDL_SCANCODE_R, \
-        .l3 = SDL_SCANCODE_UNKNOWN, .r3 = SDL_SCANCODE_UNKNOWN, \
+        .l3 = SDL_SCANCODE_T, .r3 = SDL_SCANCODE_Y, \
         .start = SDL_SCANCODE_RETURN, .select = SDL_SCANCODE_RSHIFT, \
         .ls_up = SDL_SCANCODE_UP, .ls_down = SDL_SCANCODE_DOWN, \
         .ls_left = SDL_SCANCODE_LEFT, .ls_right = SDL_SCANCODE_RIGHT, \

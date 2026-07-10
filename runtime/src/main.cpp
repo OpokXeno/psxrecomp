@@ -903,11 +903,15 @@ static void sdl_audio_update(int turbo_active) {
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
- * Bit 0 = SELECT, Bit 3 = START, Bit 4 = UP, Bit 5 = RIGHT,
- * Bit 6 = DOWN, Bit 7 = LEFT, Bit 8 = L2, Bit 9 = R2,
- * Bit 10 = L1, Bit 11 = R1, Bit 12 = TRIANGLE, Bit 13 = CIRCLE,
- * Bit 14 = CROSS, Bit 15 = SQUARE */
+ * Bit 0 = SELECT, Bit 1 = L3, Bit 2 = R3, Bit 3 = START,
+ * Bit 4 = UP, Bit 5 = RIGHT, Bit 6 = DOWN, Bit 7 = LEFT,
+ * Bit 8 = L2, Bit 9 = R2, Bit 10 = L1, Bit 11 = R1,
+ * Bit 12 = TRIANGLE, Bit 13 = CIRCLE, Bit 14 = CROSS, Bit 15 = SQUARE.
+ * L3/R3 (stick clicks) exist on a DualShock only; the wire reports them like
+ * Beetle's dualshock.cpp does — straight from the button word, no mode mask. */
 #define PAD_SELECT   (1 << 0)
+#define PAD_L3       (1 << 1)
+#define PAD_R3       (1 << 2)
 #define PAD_START    (1 << 3)
 #define PAD_UP       (1 << 4)
 #define PAD_RIGHT    (1 << 5)
@@ -942,7 +946,7 @@ struct PsxButtonMap {
 
 static int controller_device_index = 0;
 static int controller_deadzone = 12000;
-static std::array<PsxButtonMap, 14> controller_map = {{
+static std::array<PsxButtonMap, 16> controller_map = {{
     { PAD_UP,       "up",       {} },
     { PAD_DOWN,     "down",     {} },
     { PAD_LEFT,     "left",     {} },
@@ -955,6 +959,8 @@ static std::array<PsxButtonMap, 14> controller_map = {{
     { PAD_R1,       "r1",       {} },
     { PAD_L2,       "l2",       {} },
     { PAD_R2,       "r2",       {} },
+    { PAD_L3,       "l3",       {} },
+    { PAD_R3,       "r3",       {} },
     { PAD_START,    "start",    {} },
     { PAD_SELECT,   "select",   {} },
 }};
@@ -1099,6 +1105,8 @@ static void set_default_controller_mapping(void) {
     set_sources("r1",       "rightshoulder");
     set_sources("l2",       "lefttrigger");
     set_sources("r2",       "righttrigger");
+    set_sources("l3",       "leftstick");
+    set_sources("r3",       "rightstick");
     set_sources("start",    "start");
     set_sources("select",   "back");
 }
@@ -1107,7 +1115,8 @@ static std::string default_input_ini_text(void) {
     return
         "; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.\n"
         "; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,\n"
-        "; lefttrigger,righttrigger,dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
+        "; lefttrigger,righttrigger,leftstick,rightstick (stick clicks -> L3/R3),\n"
+        "; dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
         "\n"
         "[controller]\n"
         "enabled = true\n"
@@ -1127,6 +1136,8 @@ static std::string default_input_ini_text(void) {
         "r1 = rightshoulder\n"
         "l2 = lefttrigger\n"
         "r2 = righttrigger\n"
+        "l3 = leftstick\n"
+        "r3 = rightstick\n"
         "start = start\n"
         "select = back\n";
 }
@@ -1311,7 +1322,7 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
 /* Keyboard -> PSX button word for `player` (1 or 2), via the configurable
  * keybinds.ini map (psx_keybinds). Defaults reproduce the old hardcoded layout
  * (arrows=d-pad, X/S/Z/A=Cross/Circle/Square/Triangle, Q/W/E/R=L1/R1/L2/R2,
- * Return=Start, RShift=Select), so out-of-the-box behaviour is unchanged. */
+ * Return=Start, RShift=Select) plus T/Y=L3/R3 stick clicks. */
 static uint16_t pad_from_keyboard(int player) {
     const Uint8* keys = SDL_GetKeyboardState(NULL);
     return psx_keybinds_pad_word(keys, player);
