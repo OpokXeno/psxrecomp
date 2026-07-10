@@ -50,6 +50,10 @@ struct CodeGenConfig {
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
 
+    // MMX6-class 2D tile-ring stage initializer. Emit a reveal-invalidation
+    // callback at entry so host-only wide pixels cannot survive a stage swap.
+    uint32_t ws_bg2d_init_func = 0;
+
     // Widescreen far-backdrop un-squash ([widescreen] backdrop_unsquash_funcs):
     // functions whose body is bracketed by gte_ws_set_suppress(1)/(0) so the
     // GTE X-squash is OFF for their (far-backdrop) draws — the backdrop fills
@@ -61,11 +65,12 @@ struct CodeGenConfig {
     // addresses the immediate is emitted with a runtime margin term
     // psx_ws_x_margin() so the world-space draw cull widens with the aspect
     // (0 at 4:3). bias = addiu (+margin); range = sltiu (+2*margin); a1 = a
-    // nop replaced with `a1 += margin`, or a `move rd,a1` emitted as
-    // `rd = a1 + margin`. See config_loader.h. Empty = default.
+    // nop replaced with `a1 += margin`, or move rD,a1 replaced with
+    // `rD = a1 + margin`. See config_loader.h. Empty = default.
     std::set<uint32_t> ws_cull_bias_sites;
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
+    std::set<uint32_t> ws_cull_screen_x_sites;
 
     // Explicit signed right-edge widen sites ([widescreen.cull] slti_sites):
     // `slti rt, sx, W` emitted through psx_ws_cull_slti for funnel functions
@@ -105,10 +110,11 @@ struct CodeGenConfig {
     // Widescreen pure-2D background tile-loop widen ([widescreen.bg2d]). Three
     // instruction addresses in a 2D game's per-layer BG renderer (MMX6's
     // FUN_800270d0): the column-count load/compare, the start tile-column mask,
-    // and the start screen-x calculation. MMX6 uses a li count + sra start;
-    // MMX4/MMX5 use an inline slti[u] count, which selects generic helpers that
-    // preserve the instruction's ring mask. Identity at 4:3 / 512 hi-res.
-    // 0 = unset. Main-EXE addresses; verified by opcode at gen time.
+    // and the start screen-x calculation (MMX6: li count + sra start; MMX4/MMX5:
+    // inline slti[u] count, sra or subu-zero start), rewritten through the gpu.c
+    // psx_ws_bg2d_* helpers so the loop draws the 16:9 reveal columns on both
+    // sides (identity at 4:3 / 512 hi-res). 0 = unset. Main-EXE addresses;
+    // verified by opcode at gen time.
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;
     uint32_t ws_bg2d_startx_site   = 0;

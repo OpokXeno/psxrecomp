@@ -1528,18 +1528,21 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         return 1;
     }
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x09: /* ADDIU rt, rs, simm */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
-        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+        if (psx_ws_is_cull_slti_site(pc) ||
+            (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
@@ -2149,6 +2152,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             if (_gc) return 1;
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
+    } else if (psx_game_address_in_text(addr)) {
+        /* RAM at a game-text address diverged from the static EXE image
+         * (runtime-relocated / overlaid / self-modified code the compiled
+         * static function no longer reflects). The live RAM is the truth:
+         * fall through to INTERPRET it here rather than bail (line below) to
+         * the shell shadow (normalize() -> shell ROM). Crash Bash relocates a
+         * code page onto 0x30000 (inside the BIOS shell window); without this
+         * its 0x30FF4 call diverged (native_ok=0) yet was not dirty, so the
+         * interpreter bailed and normalize() shadowed it to dead shell ROM ->
+         * unknown-dispatch abort. Marking it a clean game-text miss lets the
+         * dirty interpreter execute the real RAM bytes. */
+        clean_game_text_miss = 1;
     }
 #endif
 

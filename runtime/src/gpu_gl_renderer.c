@@ -2284,6 +2284,50 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     s_cw_wide_ms += cw_ms() - t0;
 }
 
+/* Clear only the two synthetic reveal strips, preserving the centred canonical
+ * framebuffer. This is an opt-in transition cleanup driven by gpu.c. */
+static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
+    if (!s_raster_ok || s_ws_ablate == 1 || g_wide_off <= 0) return;
+    double t0 = cw_ms(); s_cw_wide_clears++;
+    flush_tex_batch();
+    GLuint fbo = wide_fbo_for(base_x);
+    if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
+    gl_perf_mirror_begin();
+    int H = VRAM_H * s_scale;
+    int W = g_wide_w * s_scale;
+    int margin = g_wide_off * s_scale;
+    int y0 = y * s_scale, y1 = (y + h) * s_scale;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (y1 <= y0 || margin * 2 >= W) {
+        gl_perf_mirror_end();
+        s_cw_wide_ms += cw_ms() - t0;
+        return;
+    }
+    float r = (color & 0x1F) / 31.0f;
+    float g = ((color >> 5) & 0x1F) / 31.0f;
+    float b = ((color >> 10) & 0x1F) / 31.0f;
+    float a = (color >> 15) & 1 ? 1.0f : 0.0f;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, W, H);
+    glEnable(GL_SCISSOR_TEST);
+    glClearColor(r, g, b, a);
+    glClearStencil((color >> 15) & 1);
+    glStencilMask(0xFF);
+    if (sides & 1) {
+        glScissor(0, y0, margin, y1 - y0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    }
+    if (sides & 2) {
+        glScissor(W - margin, y0, margin, y1 - y0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    gl_perf_mirror_end();
+    s_cw_wide_ms += cw_ms() - t0;
+}
+
 /* Present source: read the wide FBO for the displayed buffer (base_x) into the
  * CPU present buffer as ARGB8888, byte-identical to sw_render_wide_display's
  * output so the shared CPU present path consumes it the same way. Output is
@@ -2745,6 +2789,7 @@ static const GpuRenderBackend GL_BACKEND = {
     .wide_set_target = glb_wide_set_target,
     .wide_disable_target = glb_wide_disable_target,
     .wide_clear = glb_wide_clear,
+    .wide_clear_margins = glb_wide_clear_margins,
     .render_wide_display = glb_render_wide_display,
     .wide_dump_full = glb_wide_dump_full,
 };

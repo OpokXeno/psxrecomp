@@ -65,6 +65,11 @@ sprite_anchor_addr = "0x1F800070"      # scratchpad holding the prim's
                                        # GTE-projected anchor SXY at tag time.
 hud_sprt_squash    = true              # center/edge-squash untagged SPRTs
                                        # (screen-space HUD/menus).
+clear_reveal       = true              # clear synthetic native-wide side margins
+                                       # at opted-in scene/map boundaries (default false).
+nw_left_hud_packet_lo = "0x000E3400"  # optional targeted left-HUD packet range
+nw_left_hud_packet_hi = "0x000E4100"  # (half-open); avoids shifting 2D scenery.
+offer_ultrawide    = true              # separate experimental 21:9 launcher row.
 ```
 
 Tomba's values are Ghidra-evidenced: `0x8005E08C` is the shared per-prim helper

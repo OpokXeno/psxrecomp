@@ -410,19 +410,23 @@ struct GameConfig {
     // ~the half-extra-width when stretching) into the relevant immediates:
     //   cull_bias_sites:  an addiu rT,rS,imm → rT = rS + (imm + margin)
     //   cull_range_sites: an sltiu rT,rS,imm → rT = rS <u (imm + 2*margin)
-    //   cull_a1_sites:    a nop (load/branch-delay) -> a1 += margin, or a
-    //                     move rd,a1 -> rd = a1 + margin (caller-supplied
-    //                     horizontal-margin classifier variants)
+    //   cull_a1_sites:    a nop → a1 += margin, or move rD,a1 →
+    //                     rD = a1 + margin (caller-margin classifier variants)
     // All Ghidra-evidenced; empty by default. Changing these requires a regen.
     std::vector<uint32_t> ws_cull_bias_sites;
     std::vector<uint32_t> ws_cull_range_sites;
     std::vector<uint32_t> ws_cull_a1_sites;
+    // Explicit `sltiu rt,sx,W` render rejects for cases where codegen function
+    // splitting separates the paired vertical test from auto_screen_x.
+    std::vector<uint32_t> ws_cull_screen_x_sites;
 
     // [widescreen.cull] slti_sites — explicit signed right-edge widen sites
     // (`slti rt, sx, W` → psx_ws_cull_slti) for funnel functions the
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Extra per-side actor overdraw beyond the visible widescreen edge.
+    int                   ws_cull_guard_pixels = 0;
 
     // [widescreen.cull] screen_w_imms / screen_h_imms — the width/height
     // immediates of the GTE screen-extent reject signature, per game (the
@@ -499,19 +503,26 @@ struct GameConfig {
     // inset by the reveal offset). Runtime-only — no regen. Off by default.
     bool ws_nw_hud_corners = false;
 
-    // Optional GP0 command-source filter for nw_hud_corners. When both values
-    // are nonzero, only primitives whose command word was DMA-read from the
-    // half-open guest range [lo, hi) are re-anchored. This lets pure-2D games
-    // move their HUD without also moving ordinary world sprites in the outer
-    // thirds. Runtime-only; 0/0 preserves the legacy unfiltered behavior.
-    uint32_t ws_nw_hud_source_lo = 0;
-    uint32_t ws_nw_hud_source_hi = 0;
+    // [widescreen] nw_left_hud_packet_lo / nw_left_hud_packet_hi — optional
+    // half-open physical-RAM source range for a specifically identified HUD
+    // pool. In native-wide, primitives from this pool anchor by screen third
+    // (left/right), without moving similarly placed scenery from other pools
+    // (essential for pure-2D games whose world is also screen-space prims).
+    // Both values must be present together. Runtime-only; no regen required.
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
 
     // [widescreen] nw_backdrop — in native-wide, stretch a screen-space quad
     // that covers the whole 4:3 framebuffer (sky gradient / backdrop image) to
     // fill the wide frame, so it stops pillarboxing at the reveal margins.
     // Runtime-only — no regen. Off by default.
     bool ws_nw_backdrop = false;
+
+    // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
+    // cleanup. A game-specific stage/map boundary can clear only proven-void
+    // sides while preserving the canonical 4:3 surface and guest VRAM. Runtime-
+    // only gate; any game-specific init hook remains regen-class. Off by default.
+    bool ws_clear_reveal = false;
 
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a
@@ -522,13 +533,19 @@ struct GameConfig {
     // startup; no codegen impact) — no regen required.
     bool ws_offered = true;
 
+    // [widescreen] offer_ultrawide — expose a separate experimental 21:9
+    // launcher choice for titles that have explicitly tested it. Default off;
+    // ordinary widescreen offer remains the independent 16:9 choice.
+    bool ws_ultrawide_offered = false;
+
     // [widescreen.bg2d] — pure-2D background tile-loop widen (e.g. MMX6's
     // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
     // whose column count and loop start are rewritten so the loop draws the
     // 16:9 reveal columns on both sides of the 320 view (see gpu.c
-    // psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
-    //   count_site:    the `li rt,21` column-count load (addiu/ori), or the
-    //                  inline `slti[u] rt,rs,21` loop compare (MMX4/MMX5).
+    // psx_ws_bg2d_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
+    //   count_site:    either the `li rt,21` column-count load (addiu/ori), or
+    //                  the loop-closing inline `slti[u] rt,index,21` bound
+    //                  compare (MMX4/MMX5).
     //   startcol_site: the `andi rt,rs,0x3f` start tile-column mask.
     //   startx_site:   the `sra rd,rt,sa` or `subu rd,zero,rt` start screen-x.
     // 0 = unset (feature off). Verified by opcode at gen time.
@@ -548,6 +565,21 @@ struct GameConfig {
     //   raised to match the bigger buffer. Together they cure the dense-stage overflow.
     uint32_t ws_bg2d_bufbase_site = 0;
     uint32_t ws_bg2d_cap_site     = 0;
+    // Tile-ring layout used by the once-per-frame freshness refill. Defaults
+    // describe MMX6; sibling engines such as MMX5 override the shifted RAM
+    // addresses and smaller ring width in game.toml.
+    uint32_t ws_bg2d_layer_base       = 0x800971F8u;
+    uint32_t ws_bg2d_ring_base        = 0x800A21B8u;
+    uint32_t ws_bg2d_map_size_addr    = 0x800CD338u;
+    uint32_t ws_bg2d_layer_stride_addr = 0x8008EC10u;
+    uint32_t ws_bg2d_ring_cols        = 64;
+    uint32_t ws_bg2d_layer_count      = 3;
+    uint32_t ws_bg2d_layer_struct_stride = 0x54;
+    //   init_func: full tile-ring initializer called only when an independent
+    //   layer's stage data is dirty. A callback at entry invalidates stale host
+    //   reveal pixels once before the new stage background is submitted.
+    uint32_t ws_bg2d_init_func    = 0;
+    uint32_t ws_bg2d_packet_cap       = 1000;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

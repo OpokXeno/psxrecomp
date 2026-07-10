@@ -31,7 +31,16 @@
 #include "latency_ring.h"
 #include "sio.h"
 #include "spu.h"
+#include "audio_trace.h"
 #include "spu_shadow.h"
+
+/* Shared clock-domain bridge: band-limited polyphase resampler + P-only DRC.
+ * The SPU renders at a fixed 44100/60 per wall-clock frame while the host
+ * consumes on its own crystal; with no resampling/DRC the queue slowly drifts
+ * to underrun (silence gaps). The bridge resamples ~1:1 with a <=+/-0.5% ratio
+ * trim to hold the ring near target -- no gaps. See recomp_audio_drc.h. */
+#define RECOMP_AUDIO_DRC_IMPL
+#include "recomp_audio_drc.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "crash_trace.h"
@@ -206,6 +215,9 @@ static int           g_video_aspect_den = 3;
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
 static bool          g_ws_hud_sprt = false;
+/* Runtime-only transition cleanup; kept out of gpu.h because generated game
+ * units include that ABI header and do not need this frontend-only setter. */
+extern "C" void gpu_ws_set_clear_reveal(int on);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -280,6 +292,41 @@ uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
 #define TURBO_LOADS_ENGAGE_FRAMES 20
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
+
+/* DRC bridge. Producer (sdl_audio_pump) runs on the main loop thread under
+ * SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
+ * thread. */
+static rab_bridge s_drc;
+static bool       s_drc_ready = false;
+
+/* Observability + A/B. PSXRECOMP_AUDIO_LEGACY=1 keeps the historical push model
+ * (SDL_QueueAudio, no bridge) so the underrun baseline can be measured against
+ * the bridge from a single build; default (unset) = bridge/pull model. Output
+ * health is surfaced through the audio_stats TCP command (no stderr probe). */
+static bool audio_legacy_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PSXRECOMP_AUDIO_LEGACY"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v != 0;
+}
+/* Legacy-mode underrun counter: incremented when the SDL queue is found empty
+ * at pump time (the device was silence-filling = an audible gap). */
+static uint64_t g_legacy_underruns = 0;
+/* Set at unmute so the pump resyncs its bridge-underrun baseline past the
+ * intentional mute-drain instead of reporting it as gaps. */
+int g_audio_unmute_resync = 0;
+/* Actual device rate the host opened at (bridge mode may differ from 44100;
+ * the T3 tap ring runs at this rate and its WAV dump must say so). */
+int g_audio_host_rate = 44100;
+
+static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
+    if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
+    int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
+    rab_pull(&s_drc, reinterpret_cast<int16_t*>(stream), frames);
+    /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
+     * This callback is the tap's single writer while the bridge is active. */
+    audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
+                    frames);
+}
 
 static std::filesystem::path find_upward(std::filesystem::path start,
                                          const std::filesystem::path& marker) {
@@ -641,9 +688,10 @@ static void shutdown_runtime(void) {
     overlay_capture_write_json();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
-        SDL_CloseAudioDevice(sdl_audio_device);
+        SDL_CloseAudioDevice(sdl_audio_device);   /* stops the pull callback */
         sdl_audio_device = 0;
     }
+    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
     debug_server_shutdown();
 }
@@ -670,16 +718,74 @@ static void sdl_audio_pump(void) {
     if (!sdl_audio_device) return;
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
-    const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-    if (SDL_GetQueuedAudioSize(sdl_audio_device) > max_queue_bytes) return;
+    const bool legacy = audio_legacy_mode();
+    static int had_audio = 0;
+    uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
+    if (legacy) {
+        /* Historical push model + baseline measurement: a drained (==0) queue
+         * means the device was silence-filling since the last pump = a gap.
+         * Only meaningful after the first audio has been queued. */
+        const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
+        queued = SDL_GetQueuedAudioSize(sdl_audio_device);
+        if (queued == 0 && had_audio) {
+            g_legacy_underruns++;
+            audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
+        }
+        if (queued > max_queue_bytes) {
+            audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
+            return;
+        }
+    } else {
+        /* No host-queue backpressure check: the bridge's ring + DRC hold the
+         * fill near target, so we always render this frame and push it. */
+        if (!s_drc_ready) return;
+        /* Surface bridge underruns (counted on the SDL audio thread) into the
+         * event ring from this thread — the event ring is single-writer.
+         * Across a turbo mute the ring intentionally runs dry (the pump stops
+         * while the callback keeps pulling); those dry pulls are the mute,
+         * not gaps — resync past them instead of reporting them. */
+        rab_stats st;
+        rab_get_stats(&s_drc, &st);
+        static uint64_t prev_underruns = 0;
+        extern int g_audio_unmute_resync;
+        if (g_audio_unmute_resync) {
+            prev_underruns = st.underrun_events;
+            g_audio_unmute_resync = 0;
+        } else if (st.underrun_events > prev_underruns) {
+            audio_trace_event(AUDIO_EV_UNDERRUN,
+                              (uint32_t)(st.underrun_events - prev_underruns), 1);
+            prev_underruns = st.underrun_events;
+        }
+        queued = (uint32_t)st.last_fill_ms;
+    }
 
-    static double sample_accum = 0.0;
-    sample_accum += 44100.0 / 60.0;
-    int frames = (int)sample_accum;
-    sample_accum -= (double)frames;
+    /* Faithful sample budget: the SPU is clocked by the GUEST, not by host
+     * presents. 33.8688 MHz / 44100 Hz = exactly 768 guest cycles per output
+     * frame, so production tracks guest time precisely — including the real
+     * NTSC 59.94 Hz vblank — instead of assuming 60.00 Hz per present, which
+     * built in a systematic -0.1% production deficit (measured: 43950/s
+     * produced vs 44100/s consumed = recurring ring underruns no +/-0.5%
+     * DRC trim could absorb during jitter spikes). */
+    extern uint64_t psx_cycle_count;
+    static uint64_t last_cycles = 0;
+    static uint64_t cycle_carry = 0;
+    const uint64_t now_cycles = psx_cycle_count;
+    if (last_cycles == 0) last_cycles = now_cycles;
+    uint64_t delta = (now_cycles - last_cycles) + cycle_carry;
+    last_cycles = now_cycles;
+    int frames = (int)(delta / 768u);
+    cycle_carry = delta % 768u;
     if (frames <= 0) return;
-    if (frames > 2048) frames = 2048;
+    if (frames > 2048) {
+        /* A burst beyond one buffer (e.g. right after an unmute or a long
+         * stall): render one full buffer and DROP the remainder of the debt —
+         * same semantic as the mute model (voice positions freeze across the
+         * gap) rather than time-compressing a backlog into garble. */
+        frames = 2048;
+        cycle_carry = 0;
+    }
 
+    audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
     spu_render(sdl_audio_buf, frames);
     if (sdl_audio_fadein_left > 0) {
         const float g0 = 1.0f - (float)sdl_audio_fadein_left
@@ -690,8 +796,21 @@ static void sdl_audio_pump(void) {
         sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
         sdl_audio_fadein_left -= ramp;
     }
-    SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                   (uint32_t)frames * bytes_per_frame);
+    if (legacy) {
+        /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
+        audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
+        SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                       (uint32_t)frames * bytes_per_frame);
+        had_audio = 1;
+    } else {
+        /* Hand to the bridge (band-limited resample + DRC) instead of
+         * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
+         * The T3 tap moves to sdl_drc_callback: what the device actually
+         * receives is the bridge's device-rate output, not this buffer. */
+        SDL_LockAudioDevice(sdl_audio_device);
+        rab_push(&s_drc, sdl_audio_buf, frames);
+        SDL_UnlockAudioDevice(sdl_audio_device);
+    }
 }
 
 /* Audio gating across turbo-loads transitions.
@@ -707,8 +826,40 @@ static void sdl_audio_pump(void) {
  *     re-trigger within a few frames; without the debounce the mute would
  *     flicker audibly), then resume pumping with a rising ramp applied
  *     across the first ~50 ms of samples (sdl_audio_pump above). */
+/* Bridge/legacy output health, surfaced through the audio_stats TCP command
+ * (debug_server.c) — no stderr probe; rule 3. */
+extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+                                   uint64_t *overflow_drops, double *correction,
+                                   int *legacy, int *host_rate)
+{
+    extern int g_audio_host_rate;   /* set at device open */
+    *legacy = audio_legacy_mode() ? 1 : 0;
+    *host_rate = g_audio_host_rate;
+    if (*legacy || !s_drc_ready) {
+        *fill_ms = sdl_audio_device
+                   ? (double)SDL_GetQueuedAudioSize(sdl_audio_device)
+                     / (44100.0 * 4.0) * 1000.0
+                   : 0.0;
+        *underruns = g_legacy_underruns;
+        *overflow_drops = 0;
+        *correction = 0.0;
+        return sdl_audio_device != 0;
+    }
+    rab_stats st;
+    rab_get_stats(&s_drc, &st);
+    *fill_ms = st.last_fill_ms;
+    *underruns = st.underrun_events;
+    *overflow_drops = st.overflow_drops;
+    *correction = st.last_correction;
+    return 1;
+}
+
 static void sdl_audio_update(int turbo_active) {
     if (!sdl_audio_device) return;
+    {   /* Tag audio events with the vblank frame counter. */
+        extern uint64_t s_frame_count;
+        audio_trace_note_frame((uint32_t)s_frame_count);
+    }
     const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
     static int muted = 0;
     static int hangover = 0;
@@ -725,8 +876,16 @@ static void sdl_audio_update(int turbo_active) {
             sdl_audio_fadein_left = 0;
             spu_render(sdl_audio_buf, tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
-            SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                           (uint32_t)tail * sizeof(int16_t) * 2u);
+            audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
+            if (audio_legacy_mode()) {
+                audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
+                SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                               (uint32_t)tail * sizeof(int16_t) * 2u);
+            } else if (s_drc_ready) {
+                SDL_LockAudioDevice(sdl_audio_device);
+                rab_push(&s_drc, sdl_audio_buf, tail);
+                SDL_UnlockAudioDevice(sdl_audio_device);
+            }
             muted = 1;
         }
         hangover = HANGOVER_FRAMES;
@@ -736,6 +895,9 @@ static void sdl_audio_update(int turbo_active) {
         if (hangover > 0) { hangover--; return; }
         muted = 0;
         sdl_audio_fadein_left = sdl_audio_fade_samples;
+        audio_trace_event(AUDIO_EV_UNMUTE, (uint32_t)sdl_audio_fadein_left, 0);
+        extern int g_audio_unmute_resync;
+        g_audio_unmute_resync = 1;
     }
     sdl_audio_pump();
 }
@@ -1432,8 +1594,19 @@ static void sample_headless_pad_into_sio(int override) {
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
  * and underruns. Uncapped, the host runs the simulation at whatever
- * speed it can — typically several × realtime — and audio glitches. */
+ * speed it can — typically several × realtime — and audio glitches.
+ *
+ * The wall-clock pacer target; nudged to the host display refresh at
+ * window-creation time (sync-to-host-refresh) so the pacer and SDL PRESENTVSYNC
+ * do not fight — a fixed 59.94 pacer against a 60.00 Hz panel makes rendered
+ * frames land on an uneven vblank count (a 2/3/1 beat) that reads as
+ * moving-object judder/flicker. See g_frame_period_ms. */
 static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
+/* Live pacer period (ms). Defaults to the PSX rate; set to the host refresh
+ * period when the panel is within ~2% of 60 Hz so 30fps content pads evenly to
+ * two host refreshes. Left at the PSX rate on non-~60Hz panels to avoid running
+ * the sim at the wrong speed. */
+static double g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 
 /* ── Host-stack-usage profile (RECURSION_BUG.md §17) ──────────────────────────
  * The decisive instrument for the long-run freeze. The guest call graph mirrors
@@ -1731,7 +1904,7 @@ static void sdl_vblank_present(void) {
      * hard freeze). */
     {
         static FramePacer pacer = { 0 };
-        frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
+        frame_pacer_wait(&pacer, g_frame_period_ms);
     }
     latency_ring_mark(LAT_PACED);
 
@@ -1900,6 +2073,47 @@ static void sdl_vblank_present(void) {
                 for (uint32_t y = 0; y < h; y++) {
                     for (uint32_t x = 0; x < present_w; x++) {
                         sdl_pixel_buf[y * present_w + x] = gpu_display_pixel_argb(&di, x, y);
+                    }
+                }
+            }
+        }
+
+        /* Frame blending (CRT-persistence masker for 30fps double-buffered
+         * content). Some games (e.g. Crash Bash menus/characters) leave a
+         * dynamic object in only one of the two display buffers per 30fps cycle,
+         * so it strobes on/off as the display alternates buffers — the static
+         * background, present in both, stays put. Real CRTs hid this via phosphor
+         * persistence; accurate emulators either time it away (cycle accuracy) or
+         * offer a "blend frames" option that averages the last two presented
+         * frames. This is the latter: presentation only, game logic untouched.
+         * Guarded to the plain software present path (no GL/VK/wide/hires/FMV) so
+         * the buffer is a simple present_w*h ARGB grid. PSX_FRAME_BLEND=0 off. */
+        {
+            static int blend_cfg = -1;   /* -1 unresolved, 0 off, 1 on */
+            if (blend_cfg < 0) {
+                const char* e = getenv("PSX_FRAME_BLEND");
+                blend_cfg = (e && e[0] == '1') ? 1 : 0;   /* default off (masker only) */
+            }
+            const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
+                                   !di.depth24 && active_scale == 1;
+            if (blend_cfg && simple_sw) {
+                static uint32_t prev_buf[640 * 512];
+                static uint32_t prev_px = 0;
+                const uint32_t npx = present_w * h;
+                if (npx <= (uint32_t)(640 * 512)) {
+                    if (prev_px == npx) {
+                        for (uint32_t i = 0; i < npx; i++) {
+                            const uint32_t a = sdl_pixel_buf[i];
+                            const uint32_t b = prev_buf[i];
+                            prev_buf[i] = a;   /* store this frame (pre-blend) */
+                            sdl_pixel_buf[i] =
+                                0xFF000000u |
+                                (((a & 0xFEFEFEu) >> 1) + ((b & 0xFEFEFEu) >> 1));
+                        }
+                    } else {
+                        /* Resolution changed / first frame: seed, no blend. */
+                        for (uint32_t i = 0; i < npx; i++) prev_buf[i] = sdl_pixel_buf[i];
+                        prev_px = npx;
                     }
                 }
             }
@@ -2089,6 +2303,7 @@ int main(int argc, char** argv) {
     int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
+    bool ws_ultrawide_offered = false;
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -2156,14 +2371,32 @@ int main(int argc, char** argv) {
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
             gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
+            /* [widescreen.bg2d] engine tile-ring layout for the freshness
+             * refill shared by the MMX5/MMX6 2D background hook. */
+            gpu_ws_bg2d_configure(gc.ws_bg2d_layer_base,
+                                  gc.ws_bg2d_ring_base,
+                                  gc.ws_bg2d_map_size_addr,
+                                  gc.ws_bg2d_layer_stride_addr,
+                                  gc.ws_bg2d_ring_cols,
+                                  gc.ws_bg2d_layer_count,
+                                  gc.ws_bg2d_layer_struct_stride,
+                                  gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
-            gpu_ws_set_nw_hud_source_range(gc.ws_nw_hud_source_lo,
-                                           gc.ws_nw_hud_source_hi);
+            /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
+            gpu_ws_set_nw_left_hud_packet_range(gc.ws_nw_left_hud_packet_lo,
+                                                gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
+             * cleanup of synthetic native-wide margins. */
+            gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
+            gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
+            gpu_ws_set_explicit_cull_sites(
+                gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
+                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp/sljit widen hooks. A title that never
              * opted in must never have its live code scanned and rewritten. */
@@ -2173,6 +2406,7 @@ int main(int argc, char** argv) {
                 gpu_ws_set_cull_imms(gc.ws_cull_w_imms.data(), (int)gc.ws_cull_w_imms.size(),
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
+            ws_ultrawide_offered = gc.ws_ultrawide_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -2443,6 +2677,12 @@ int main(int argc, char** argv) {
         g_video_aspect_num = 4;
         g_video_aspect_den = 3;
     }
+    if (!ws_ultrawide_offered && g_video_aspect_num * 9 == g_video_aspect_den * 21) {
+        std::fprintf(stdout, "psxrecomp: 21:9 is not offered for this title; clamping to %s\n",
+                     ws_offered ? "16:9" : "4:3");
+        g_video_aspect_num = ws_offered ? 16 : 4;
+        g_video_aspect_den = ws_offered ? 9 : 3;
+    }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
@@ -2574,6 +2814,7 @@ int main(int argc, char** argv) {
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
                     ginfo.lock_device      = ctrl_lock_device;
                     ginfo.ws_offered       = ws_offered;
+                    ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
                     for (const auto& lo : lang_menu_options)
                         ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
@@ -2828,6 +3069,7 @@ int main(int argc, char** argv) {
         controller_deadzone = std::max(0, std::min(32767, resolved_deadzone));
     refresh_player_devices();  /* open SDL handles to match the player config */
 #ifndef PSX_SDL_NO_AUDIO
+    audio_trace_init();
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
         SDL_AudioSpec have;
@@ -2836,8 +3078,21 @@ int main(int argc, char** argv) {
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
-        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        const bool legacy = audio_legacy_mode();
+        if (!legacy)
+            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
+        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have,
+                                               legacy ? 0 : SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (sdl_audio_device) {
+            if (!legacy) {
+                rab_config cfg; rab_config_defaults(&cfg);
+                cfg.channels    = 2;
+                cfg.source_rate = 44100.0;            /* SPU render rate */
+                cfg.host_rate   = (double)have.freq;  /* actual device rate */
+                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+            }
+            g_audio_host_rate = have.freq;
+            audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
             SDL_PauseAudioDevice(sdl_audio_device, 0);
         }
     }
@@ -2866,6 +3121,29 @@ int main(int argc, char** argv) {
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
+    }
+
+    /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
+     * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
+     * count (2/3/1 beat) that reads as moving-object judder. If the panel is
+     * within ~2% of 60 Hz, nudge the pacer to the exact panel period so the pacer
+     * and vsync agree and 30fps content pads to a steady 2 refreshes each.
+     * Non-~60Hz panels keep the PSX rate (vsync then governs; wrong-speed sim is
+     * worse than a benign slow beat). */
+    {
+        SDL_DisplayMode dm;
+        int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
+            double host_hz = (double)dm.refresh_rate;
+            if (host_hz >= 58.8 && host_hz <= 61.2) {
+                g_frame_period_ms = 1000.0 / host_hz;
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+            } else {
+                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", dm.refresh_rate);
+            }
+        }
     }
 
     /* OpenGL backend: create the GL context now. On failure, relabel the

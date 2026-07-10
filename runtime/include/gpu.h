@@ -106,23 +106,25 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
 /* [widescreen] full_2d: opt a pure-2D sprite game into the widescreen present
  * path (treat every in-game frame as gameplay, since it never tags 3D prims). */
 void gpu_ws_set_full_2d(int on);
-/* [widescreen.bg2d] MMX6 background tile-loop widen — hooked at the renderer's
+/* [widescreen.bg2d] Capcom 2D background tile-loop widen — hooked at the renderer's
  * column-count / start-tile-col / start-screen-x instructions. Identity at 4:3
  * and in the engine's 512 hi-res mode. */
+void gpu_ws_bg2d_configure(uint32_t layer_base, uint32_t ring_base,
+                           uint32_t map_size_addr, uint32_t layer_stride_addr,
+                           uint32_t ring_cols, uint32_t layer_count,
+                           uint32_t layer_struct_stride, uint32_t packet_cap);
+int psx_ws_bg2d_cols(int base);
+int psx_ws_bg2d_startcol(int col, unsigned mask);
+int psx_ws_bg2d_startx(int x);
+int psx_ws_bg2d_stream_left(int x);
+int psx_ws_bg2d_stream_right(int x);
+int psx_ws_bg2d_undercap(int counter, int native_cap);
+/* Compatibility entry points for already-generated MMX6 sources. */
 int psx_ws_mmx6_bg_cols(int base);
 int psx_ws_mmx6_bg_startcol(int col);
 int psx_ws_mmx6_bg_startx(int x);
 int psx_ws_mmx6_bg_stream_left(int x);
 int psx_ws_mmx6_bg_stream_right(int x);
-/* Generic Capcom 2D variant used by MMX4/MMX5. Those revisions keep the
- * 21-column loop bound in an inline slti/sltiu and use a 32-column tile ring.
- * Unlike the MMX6-specialized helpers above, these do not touch MMX6's
- * hard-coded host-side refill state. */
-int psx_ws_bg2d_cols(int base);
-int psx_ws_bg2d_startcol(int col, uint32_t mask);
-int psx_ws_bg2d_startx(int x);
-int psx_ws_bg2d_stream_left(int x);
-int psx_ws_bg2d_stream_right(int x);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
 
@@ -138,6 +140,11 @@ int  gpu_ws_present_native_43(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
+void gpu_ws_set_cull_guard_pixels(int pixels);
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti);
+int  psx_ws_is_cull_bias_site(uint32_t pc);
+int  psx_ws_is_cull_slti_site(uint32_t pc);
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x):
  * the gcc emit, the sljit JIT, and the interpreter all route a flagged
@@ -171,11 +178,12 @@ void gpu_ws_set_gte_game_mode(int on);
 void psx_ws_note_gte_project(int nverts);
 /* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
  * outer-third screen-space HUD primitives out to the true wide-frame corners
- * (they otherwise sit inset by the reveal). An optional half-open GP0 command
- * source range limits this to a game's dedicated HUD packet arena; 0/0 keeps
- * the legacy unfiltered behavior. Runtime-only. Off by default. */
+ * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
 void gpu_ws_set_nw_hud_corners(int on);
-void gpu_ws_set_nw_hud_source_range(uint32_t lo, uint32_t hi);
+/* Targeted alternative for sprite-heavy 2D games: corner-anchor only primitives
+ * whose ordering-table packet lives in the configured half-open RAM range. */
+void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi);
+void gpu_ws_begin_linked_list(void);
 /* Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop):
  * stretch a screen-space quad that covers the whole 4:3 framebuffer (sky
  * gradient / backdrop image) to fill the wide frame, so it no longer
