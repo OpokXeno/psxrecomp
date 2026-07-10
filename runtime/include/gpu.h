@@ -129,6 +129,11 @@ int  gpu_ws_present_native_43(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
+void gpu_ws_set_cull_guard_pixels(int pixels);
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti);
+int  psx_ws_is_cull_bias_site(uint32_t pc);
+int  psx_ws_is_cull_slti_site(uint32_t pc);
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x):
  * the gcc emit, the sljit JIT, and the interpreter all route a flagged
@@ -164,8 +169,8 @@ void psx_ws_note_gte_project(int nverts);
  * outer-third screen-space HUD sprites out to the true wide-frame corners
  * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
 void gpu_ws_set_nw_hud_corners(int on);
-/* Targeted alternative for sprite-heavy 2D games: move only primitives whose
- * ordering-table packet lives in the configured half-open physical-RAM range. */
+/* Targeted alternative for sprite-heavy 2D games: corner-anchor only primitives
+ * whose ordering-table packet lives in the configured half-open RAM range. */
 void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi);
 void gpu_ws_begin_linked_list(void);
 /* Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop):

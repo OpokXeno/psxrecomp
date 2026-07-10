@@ -760,6 +760,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
+    int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
     // game with a different display width overrides them (Ape Escape: 0x181).
@@ -780,6 +781,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("range_sites", ws_cull_range_sites);
             load_sites("a1_sites",    ws_cull_a1_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
+            if (cull.contains("guard_pixels")) {
+                ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
+                if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
+                    throw std::runtime_error(fmt::format(
+                        "{}: [widescreen.cull] guard_pixels must be in [0, 256]",
+                        config_path.string()));
+            }
             if (cull.contains("screen_w_imms")) {
                 ws_cull_w_imms.clear();
                 load_sites("screen_w_imms", ws_cull_w_imms);
@@ -867,6 +875,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,
         /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,

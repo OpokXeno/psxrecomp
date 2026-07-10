@@ -2172,6 +2172,10 @@ int main(int argc, char** argv) {
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
+            gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
+            gpu_ws_set_explicit_cull_sites(
+                gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
+                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp/sljit widen hooks. A title that never
              * opted in must never have its live code scanned and rewritten. */

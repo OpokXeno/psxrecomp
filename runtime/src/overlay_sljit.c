@@ -18,6 +18,7 @@
 #include <stdlib.h>
 
 #include "sljitLir.h"
+#include "gpu.h"
 #include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
 
 #ifdef _WIN32
@@ -833,6 +834,17 @@ void overlay_sljit_try_compile(uint32_t entry,
     }
     if (!found_term || frag_words == 0 || frag_words > SLJIT_MAX_FRAG_INSNS) {
         s_declines++; return;
+    }
+
+    /* Explicit address-listed cull hooks carry a live aspect term. Generated
+     * overlay DLLs and the interpreter implement it directly; keep these rare
+     * fragments out of the generic JIT so a vanilla immediate is never cached. */
+    for (uint32_t i = 0; i < frag_words; i++) {
+        uint32_t pc = entry + i * 4u;
+        if (psx_ws_is_cull_bias_site(pc) || psx_ws_is_cull_slti_site(pc)) {
+            s_declines++;
+            return;
+        }
     }
     if (off0 + frag_words * 4u > size) { s_declines++; return; }  /* delay slot off image */
 

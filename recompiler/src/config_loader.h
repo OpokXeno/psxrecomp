@@ -422,6 +422,8 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Extra per-side actor overdraw beyond the visible widescreen edge.
+    int                   ws_cull_guard_pixels = 0;
 
     // [widescreen.cull] screen_w_imms / screen_h_imms — the width/height
     // immediates of the GTE screen-extent reject signature, per game (the
@@ -499,10 +501,9 @@ struct GameConfig {
     bool ws_nw_hud_corners = false;
 
     // [widescreen] nw_left_hud_packet_lo / nw_left_hud_packet_hi — optional
-    // half-open physical-RAM source range for a specifically identified left
-    // HUD assembly. In native-wide, only primitives submitted from this packet
-    // range move left by the reveal offset. This is safer for sprite-heavy 2D
-    // games where the broad nw_hud_corners heuristic would also catch scenery.
+    // half-open physical-RAM source range for a specifically identified HUD
+    // pool. In native-wide, primitives from this pool anchor by screen third
+    // (left/right), without moving similarly placed scenery from other pools.
     // Both values must be present together. Runtime-only; no regen required.
     uint32_t ws_nw_left_hud_packet_lo = 0;
     uint32_t ws_nw_left_hud_packet_hi = 0;

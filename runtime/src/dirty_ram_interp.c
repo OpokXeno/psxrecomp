@@ -1528,18 +1528,21 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         return 1;
     }
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x09: /* ADDIU rt, rs, simm */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
-        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+        if (psx_ws_is_cull_slti_site(pc) ||
+            (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;

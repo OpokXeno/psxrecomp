@@ -226,7 +226,41 @@ int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
  * cull while still stretching; large = over-draw) at a fixed camera position.
  * -1 = normal computed margin. */
 static int ws_margin_override = -1;
+static int ws_cull_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
+void gpu_ws_set_cull_guard_pixels(int pixels) {
+    if (pixels < 0) pixels = 0;
+    if (pixels > 256) pixels = 256;
+    ws_cull_guard_pixels = pixels;
+}
+
+#define WS_EXPLICIT_CULL_SITES_MAX 64
+static uint32_t ws_explicit_bias_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_slti_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_bias_n = 0;
+static int ws_explicit_slti_n = 0;
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti) {
+    if (nbias < 0) nbias = 0;
+    if (nslti < 0) nslti = 0;
+    if (nbias > WS_EXPLICIT_CULL_SITES_MAX) nbias = WS_EXPLICIT_CULL_SITES_MAX;
+    if (nslti > WS_EXPLICIT_CULL_SITES_MAX) nslti = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_bias_n = nbias;
+    ws_explicit_slti_n = nslti;
+    for (int i = 0; i < nbias; i++) ws_explicit_bias_sites[i] = bias[i] & 0x1FFFFFFFu;
+    for (int i = 0; i < nslti; i++) ws_explicit_slti_sites[i] = slti[i] & 0x1FFFFFFFu;
+}
+static int ws_explicit_site(const uint32_t *sites, int n, uint32_t pc) {
+    uint32_t p = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < n; i++) if (sites[i] == p) return 1;
+    return 0;
+}
+int psx_ws_is_cull_bias_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_bias_sites, ws_explicit_bias_n, pc);
+}
+int psx_ws_is_cull_slti_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_slti_sites, ws_explicit_slti_n, pc);
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
@@ -235,7 +269,7 @@ int psx_ws_x_margin(void) {
      * that previously fell outside the 4:3 cull window; the wide compositor then
      * rasterizes it into the revealed margins. Same recompiler emit sites as the
      * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
-    if (ws_native_wide_active()) return ws_nw_offset();
+    if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
@@ -268,7 +302,6 @@ static int ws_mmx6_left_cols(void) {
     if (off <= 0) return 0;
     return (off + 15) / 16;             /* ceil to whole tile columns */
 }
-static void mmx6_clear_void_before_bg(void);
 /* HOST-SIDE reveal mode (elective, default ON): the guest-side widen below overruns
  * the engine's 1024-slot BG packet buffer / 999-tile cap in dense stages (void/stale
  * columns). When host-side mode is active we keep the GUEST renderer at its NATIVE 21
@@ -1165,15 +1198,11 @@ static int ws_nw_left_hud_packet(void) {
     int matched = a >= ws_nw_left_hud_packet_lo && a < ws_nw_left_hud_packet_hi;
     return matched;
 }
-static int32_t ws_nw_left_hud_shift(void) {
-    return ws_nw_left_hud_packet() ? -ws_nw_offset() : 0;
-}
 static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
     if (!ws_native_wide_active()) return 0;
     int32_t off = ws_nw_offset();
     if (off <= 0) return 0;
-    if (ws_nw_left_hud_packet()) return -off;
-    if (!ws_nw_hud_corners) return 0;
+    if (!ws_nw_left_hud_packet() && !ws_nw_hud_corners) return 0;
     int32_t W  = ws_disp_w();
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
@@ -1338,19 +1367,11 @@ static void ws_clear_all_reveal_margins(void) {
         gr_wide_clear_margins((int)ws_fb_base[i], 0, 512, 0, 3);
 }
 
-static void mmx6_clear_void_before_bg(void) {
-    static uint32_t cleared_generation[WS_FB_BASES] = { 0, 0, 0, 0 };
-    if (!ws_clear_reveal || !ws_native_wide_active() || !g_mmx6_void_sides)
-        return;
-    int fb = -1;
-    for (int i = 0; i < ws_fb_n; i++)
-        if (ws_fb_base[i] == draw_area_left) { fb = i; break; }
-    if (fb < 0 || cleared_generation[fb] == g_mmx6_void_generation) return;
-    gr_wide_clear_margins((int)draw_area_left, 0, 512, 0,
-                          g_mmx6_void_sides);
-    cleared_generation[fb] = g_mmx6_void_generation;
-}
-void gpu_ws_begin_linked_list(void) { mmx6_clear_void_before_bg(); }
+/* Stage-init already clears both synthetic margins once. Do not keep clearing
+ * a guessed finite-map side here: MMX6's authored layers enter the reveal at
+ * different times, so the side guess produced a moving black trim over valid
+ * stage art. A stale reveal tile is safer than deleting submitted content. */
+void gpu_ws_begin_linked_list(void) { }
 
 
 /* Horizontal display range (GP1(06h)) */
@@ -1898,7 +1919,12 @@ static void gp0_exec_shaded_quad(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
-    int32_t hud_dx = ws_nw_left_hud_shift();
+    int32_t minx = vx[0], maxx = vx[0];
+    for (int i = 1; i < 4; i++) {
+        if (vx[i] < minx) minx = vx[i];
+        if (vx[i] > maxx) maxx = vx[i];
+    }
+    int32_t hud_dx = ws_nw_hud_shift(minx, maxx - minx);
     if (hud_dx)
         for (int i = 0; i < 4; i++) vx[i] += hud_dx;
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
@@ -2280,17 +2306,9 @@ static void gp0_exec_textured_16x16(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
-    /* MMX6 finite-map void: the widened renderer still submits stale ring slots
-     * for columns before/after the real map. DMA linked-list start has cleared
-     * that synthetic side once for this stage generation; suppress only those
-     * extra BG packets so they cannot paint stale tiles back over the void. */
-    if (ws_clear_reveal && gp0_cmd_source_addr != 0xFFFFFFFFu) {
-        uint32_t src = gp0_cmd_source_addr & 0x1FFFFFFFu;
-        if (src >= MMX6_BG_BUF_LO && src < MMX6_BG_BUF_HI) {
-            if ((g_mmx6_void_sides & 1) && x0 < 0) return;
-            if ((g_mmx6_void_sides & 2) && x0 >= (int32_t)ws_disp_w()) return;
-        }
-    }
+    /* Never suppress MMX6 BG packets at a guessed finite-map boundary. The
+     * classifier cannot distinguish an authored layer entering the reveal from
+     * a stale ring slot; suppressing here caused the stage-start black flicker. */
     int ws_w = ws_sprt_fixed_transform(&x0, 16);
     x0 += ws_nw_hud_shift(x0, 16);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
