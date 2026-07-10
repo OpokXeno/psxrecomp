@@ -273,6 +273,21 @@ copyrighted material — keep it on your own machine, alongside your disc
 image. A metadata-only contribution format (addresses and checksums, no
 game code) is planned so discoveries can be shared safely in the future.
 
+## Contributing
+
+Contributions are welcome — AI-assisted or not — as long as they're reviewed,
+tested, and keep the core game-agnostic. A few things hold this project together:
+the faithful recompiled BIOS is the baseline and oracle, generated code is never
+hand-edited (fix the recompiler and regenerate), and a change proves itself
+against the Beetle oracle / on screen rather than by assertion. Game-specific work
+lives in the game repos, which pin an exact framework commit as a submodule.
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR — it covers the core
+rules, how to verify a change, the regression checklist across the known games,
+and how a framework fix reaches a game through its pin. Bugs and build problems go
+to GitHub issues (include `gcc -v` / OS / generator for build failures); design
+discussion happens in the **R.A.I.D.** Discord (invite below).
+
 ## License
 
 PolyForm Noncommercial 1.0.0. See `LICENSE`.
