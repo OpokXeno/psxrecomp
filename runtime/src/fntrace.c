@@ -104,7 +104,22 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     }
 
     if (!s_game_started && s_game_entry_phys != 0) {
-        if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
+        /* Latch on the entry_pc dispatch (the common case) OR the first dispatch
+         * to any game-text address whose RAM already holds the loaded game EXE
+         * image (native-ok). Some titles reach their PS-EXE entry via compiled
+         * internal flow rather than a dispatcher round-trip, so the entry_pc
+         * dispatch never arrives and `started` would never latch — leaving the
+         * shell-window shadow (normalize() maps RAM 0x30000-0x5AFFF -> shell ROM)
+         * active over REAL game text. Crash Bash: entry 0x2E7B0 is reached
+         * internally, so its first shell-window call (0x30FF4 / 0x3358C) got
+         * shadowed to dead shell ROM -> unknown-dispatch abort. The native-ok
+         * test is safe before the game loads: that RAM still holds shell bytes
+         * that differ from the game image, so it cannot fire prematurely. */
+        extern int psx_game_address_in_text(uint32_t addr);
+        extern int dirty_ram_text_native_ok(uint32_t phys);
+        uint32_t _tphys = target & 0x1FFFFFFFu;
+        if (_tphys == s_game_entry_phys ||
+            (psx_game_address_in_text(target) && dirty_ram_text_native_ok(_tphys))) {
             s_game_started = 1;
             /* Establish the clean compiled-image baseline now: the boot EXE is fully
              * loaded into the game-text region (== compiled image) and no gameplay
