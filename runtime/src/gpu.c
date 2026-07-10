@@ -1207,6 +1207,15 @@ static uint32_t draw_area_right, draw_area_bottom;
 
 /* Draw offset (set by GP0(E5h)) */
 static int32_t draw_offset_x, draw_offset_y;
+/* Instrumentation: per-vblank range/count of GP0(E5) draw-offset-Y sets. If a
+ * single frame sets offsets in BOTH the top (y<128) and bottom (y>=128) buffer
+ * bands, the game is drawing different parts of the scene into different display
+ * buffers in the same frame (candidate root of a character-in-one-buffer
+ * strobe). Snapshotted each vblank into the *_last copies, exposed via debug. */
+int32_t  g_doff_min_this = 0x7fffffff, g_doff_max_this = -0x7fffffff;
+uint32_t g_doff_cnt_this = 0;
+int32_t  g_doff_min_last = 0, g_doff_max_last = 0;
+uint32_t g_doff_cnt_last = 0;
 
 /* Texture window raw value (set by GP0(E2h), readback via GP1(10h)) */
 static uint32_t texture_window_value;
@@ -1317,6 +1326,7 @@ static int sq_cap_armed;
  * flips every ~33,868 GPU clocks (one NTSC frame). */
 #define GPUSTAT_POLL_VBLANK_THRESHOLD 1000
 static uint32_t gpustat_poll_count;
+uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank IRQ count */
 
 /* ---- Initialization ---- */
 
@@ -1398,11 +1408,29 @@ uint32_t gpu_read_gpustat(void) {
     gpustat_poll_count++;
     if (gpustat_poll_count >= GPUSTAT_POLL_VBLANK_THRESHOLD) {
         gpustat_poll_count = 0;
-        lcf ^= 1;
-        psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
-        /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
-         * from the cycle-paced VBlank in psx_check_interrupts). */
-        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
+        /* The recompiled BIOS + game carry per-block interrupt checks
+         * (psx_check_interrupts_at) and per-block cycle charging, so tight
+         * LCF/VSync poll loops DO advance guest cycles and let the ONE
+         * cycle-paced VBlank authority (interrupts.c) fire on schedule. The old
+         * "spin forever" premise that justified raising VBlank+LCF from a raw
+         * GPUSTAT read-count is stale — and it injected ~38 fake VBlanks/s
+         * (measured on Crash Bash), delivering ~96/s to the game instead of 60,
+         * over-advancing the game's VSync frame counter and jittering animation
+         * (character strobe). Firing is now OFF by default; PSX_POLLHACK_VBLANK=1
+         * restores the legacy behavior for A/B. */
+        static int poll_fire = -1;
+        if (poll_fire < 0) {
+            const char* e = getenv("PSX_POLLHACK_VBLANK");
+            poll_fire = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (poll_fire) {
+            g_pollhack_vblank_count++;   /* count only when actually firing */
+            lcf ^= 1;
+            psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
+            /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
+             * from the cycle-paced VBlank in psx_check_interrupts). */
+            event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
+        }
     }
 
     uint32_t stat = 0;
@@ -1512,6 +1540,13 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
 
 void gpu_vblank_tick(void) {
     lcf ^= 1;
+    /* snapshot per-frame draw-offset-Y range for the strobe instrumentation */
+    if (g_doff_cnt_this) {
+        g_doff_min_last = g_doff_min_this;
+        g_doff_max_last = g_doff_max_this;
+        g_doff_cnt_last = g_doff_cnt_this;
+    }
+    g_doff_min_this = 0x7fffffff; g_doff_max_this = -0x7fffffff; g_doff_cnt_this = 0;
     gpustat_poll_count = 0;
     psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (vblank_callback) vblank_callback();
@@ -2316,6 +2351,9 @@ static void gp0_exec_draw_offset(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_offset_x = sign_extend(param & 0x7FFu, 11);
     draw_offset_y = sign_extend((param >> 11) & 0x7FFu, 11);
+    if (draw_offset_y < g_doff_min_this) g_doff_min_this = draw_offset_y;
+    if (draw_offset_y > g_doff_max_this) g_doff_max_this = draw_offset_y;
+    g_doff_cnt_this++;
     /* Native-wide mirrors framebuffer draws into a separate wide surface (canonical
      * VRAM stays faithful); the renderer needs the live draw offset to translate
      * into surface-local coords, so keep gr_set_draw_offset current. */

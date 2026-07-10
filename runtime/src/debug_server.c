@@ -4677,6 +4677,30 @@ static void handle_irq_state(int id, const char *json)
              dma_get_dpcr(), dma_get_dicr());
 }
 
+/* vblank_rate: report the ONE cycle-paced VBlank authority's raise/deliver
+ * counts, the (normally-off) GPUSTAT-poll fallback raise count, and the
+ * per-frame GP0(E5) draw-offset-Y range/count. Used to confirm the guest is
+ * receiving exactly 60 VBlanks/s (not the ~96/s the stale poll fallback caused)
+ * and to probe double-buffer draw-offset alternation. */
+static void handle_vblank_rate(int id, const char *json)
+{
+    (void)json;
+    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+    extern uint64_t g_pollhack_vblank_count;
+    extern int32_t  g_doff_min_last, g_doff_max_last;
+    extern uint32_t g_doff_cnt_last;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"cycle_paced_raise\":%llu,"
+             "\"delivered\":%llu,"
+             "\"pollhack_raise\":%llu,"
+             "\"doff_min\":%d,\"doff_max\":%d,\"doff_cnt\":%u}",
+             id,
+             (unsigned long long)g_vblank_raise_count,
+             (unsigned long long)g_vblank_deliver_count,
+             (unsigned long long)g_pollhack_vblank_count,
+             g_doff_min_last, g_doff_max_last, g_doff_cnt_last);
+}
+
 static void handle_timers_state(int id, const char *json)
 {
     (void)json;
@@ -7211,6 +7235,45 @@ static void handle_screenshot_file(int id, const char *json)
 
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}",
              id, path, w, h);
+}
+
+/* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
+ * PNG, regardless of what the game currently displays. Used to inspect BOTH
+ * double-buffer halves (y=0 and y=256) coherently in one call to see whether a
+ * strobing character is present in one buffer only. */
+static void handle_dump_buffer(int id, const char *json)
+{
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();
+    extern void vk_renderer_sync_cpu(void);
+    vk_renderer_sync_cpu();
+
+    int y0 = json_get_int(json, "y", 0);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_buffer.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    GpuDisplayInfo di;
+    di.display_x = 0; di.display_y = (uint32_t)y0; di.depth24 = 0;
+    di.disabled = 0; di.width = 512; di.height = 240;
+
+    uint32_t w = 512, h = 240;
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_err(id, "cannot open file"); return; }
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { fclose(f); send_err(id, "alloc failed"); return; }
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = r; p[1] = g; p[2] = b;
+        }
+    int ok = png_write_rgb(f, rgb, w, h);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"y\":%d}", id, path, y0);
 }
 
 /* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
@@ -11273,6 +11336,7 @@ static const CmdEntry s_commands[] = {
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
+    { "vblank_rate",       handle_vblank_rate },
     { "cycles_to_next_event", handle_cycles_to_next_event },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
@@ -11421,6 +11485,7 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "dump_buffer",       handle_dump_buffer },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },

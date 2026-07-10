@@ -1432,8 +1432,19 @@ static void sample_headless_pad_into_sio(int override) {
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
  * and underruns. Uncapped, the host runs the simulation at whatever
- * speed it can — typically several × realtime — and audio glitches. */
+ * speed it can — typically several × realtime — and audio glitches.
+ *
+ * The wall-clock pacer target; nudged to the host display refresh at
+ * window-creation time (sync-to-host-refresh) so the pacer and SDL PRESENTVSYNC
+ * do not fight — a fixed 59.94 pacer against a 60.00 Hz panel makes rendered
+ * frames land on an uneven vblank count (a 2/3/1 beat) that reads as
+ * moving-object judder/flicker. See g_frame_period_ms. */
 static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
+/* Live pacer period (ms). Defaults to the PSX rate; set to the host refresh
+ * period when the panel is within ~2% of 60 Hz so 30fps content pads evenly to
+ * two host refreshes. Left at the PSX rate on non-~60Hz panels to avoid running
+ * the sim at the wrong speed. */
+static double g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 
 /* ── Host-stack-usage profile (RECURSION_BUG.md §17) ──────────────────────────
  * The decisive instrument for the long-run freeze. The guest call graph mirrors
@@ -1731,7 +1742,7 @@ static void sdl_vblank_present(void) {
      * hard freeze). */
     {
         static FramePacer pacer = { 0 };
-        frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
+        frame_pacer_wait(&pacer, g_frame_period_ms);
     }
     latency_ring_mark(LAT_PACED);
 
@@ -1900,6 +1911,47 @@ static void sdl_vblank_present(void) {
                 for (uint32_t y = 0; y < h; y++) {
                     for (uint32_t x = 0; x < present_w; x++) {
                         sdl_pixel_buf[y * present_w + x] = gpu_display_pixel_argb(&di, x, y);
+                    }
+                }
+            }
+        }
+
+        /* Frame blending (CRT-persistence masker for 30fps double-buffered
+         * content). Some games (e.g. Crash Bash menus/characters) leave a
+         * dynamic object in only one of the two display buffers per 30fps cycle,
+         * so it strobes on/off as the display alternates buffers — the static
+         * background, present in both, stays put. Real CRTs hid this via phosphor
+         * persistence; accurate emulators either time it away (cycle accuracy) or
+         * offer a "blend frames" option that averages the last two presented
+         * frames. This is the latter: presentation only, game logic untouched.
+         * Guarded to the plain software present path (no GL/VK/wide/hires/FMV) so
+         * the buffer is a simple present_w*h ARGB grid. PSX_FRAME_BLEND=0 off. */
+        {
+            static int blend_cfg = -1;   /* -1 unresolved, 0 off, 1 on */
+            if (blend_cfg < 0) {
+                const char* e = getenv("PSX_FRAME_BLEND");
+                blend_cfg = (e && e[0] == '1') ? 1 : 0;   /* default off (masker only) */
+            }
+            const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
+                                   !di.depth24 && active_scale == 1;
+            if (blend_cfg && simple_sw) {
+                static uint32_t prev_buf[640 * 512];
+                static uint32_t prev_px = 0;
+                const uint32_t npx = present_w * h;
+                if (npx <= (uint32_t)(640 * 512)) {
+                    if (prev_px == npx) {
+                        for (uint32_t i = 0; i < npx; i++) {
+                            const uint32_t a = sdl_pixel_buf[i];
+                            const uint32_t b = prev_buf[i];
+                            prev_buf[i] = a;   /* store this frame (pre-blend) */
+                            sdl_pixel_buf[i] =
+                                0xFF000000u |
+                                (((a & 0xFEFEFEu) >> 1) + ((b & 0xFEFEFEu) >> 1));
+                        }
+                    } else {
+                        /* Resolution changed / first frame: seed, no blend. */
+                        for (uint32_t i = 0; i < npx; i++) prev_buf[i] = sdl_pixel_buf[i];
+                        prev_px = npx;
                     }
                 }
             }
@@ -2864,6 +2916,29 @@ int main(int argc, char** argv) {
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
+    }
+
+    /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
+     * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
+     * count (2/3/1 beat) that reads as moving-object judder. If the panel is
+     * within ~2% of 60 Hz, nudge the pacer to the exact panel period so the pacer
+     * and vsync agree and 30fps content pads to a steady 2 refreshes each.
+     * Non-~60Hz panels keep the PSX rate (vsync then governs; wrong-speed sim is
+     * worse than a benign slow beat). */
+    {
+        SDL_DisplayMode dm;
+        int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
+            double host_hz = (double)dm.refresh_rate;
+            if (host_hz >= 58.8 && host_hz <= 61.2) {
+                g_frame_period_ms = 1000.0 / host_hz;
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+            } else {
+                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", dm.refresh_rate);
+            }
+        }
     }
 
     /* OpenGL backend: create the GL context now. On failure, relabel the
