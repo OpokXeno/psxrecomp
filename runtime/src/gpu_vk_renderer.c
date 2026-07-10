@@ -2633,9 +2633,15 @@ static void gpu_textured_rect(int x,int y,int w,int h, int u0,int v0,int u1,int 
     if (w <= 0 || h <= 0) return;
     float mr = s_mod_r/255.0f, mg = s_mod_g/255.0f, mb = s_mod_b/255.0f;
     float col[9] = { mr,mg,mb, mr,mg,mb, mr,mg,mb };
+    /* Mirrored-2D compensation, rect form — see the GL backend's
+     * gpu_textured_rect: axis-aligned mirrored quads arrive here as scaled
+     * rects with u0>u1 / v0>v1 and floor one texel low under center-sampled
+     * interpolation; bump the range +1 along each decreasing axis. */
+    if (u1 < u0) { u0++; u1++; }
+    if (v1 < v0) { v0++; v1++; }
     int lim[4];
-    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
-    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
+    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = (u0 < u1 ? u1 : u0) - 1;
+    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = (v0 < v1 ? v1 : v0) - 1;
     if (lim[2] < lim[0]) lim[2] = lim[0];
     if (lim[3] < lim[1]) lim[3] = lim[1];
     if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; } else { lim[0] = 0; lim[2] = 255; }

@@ -1548,12 +1548,23 @@ static void gpu_textured_rect(int x,int y,int w,int h,
     if (w <= 0 || h <= 0) return;
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
-    /* uv sampling bounds: forward mappings sample [u0, u1-1] (u1 is the
-     * exclusive edge); mirrored ones keep the full inclusive range. Crossing
-     * a 256 boundary means page wrap — widen to the full page. */
+    /* Mirrored-2D compensation, rect form (Beetle Calc_UVOffsets model —
+     * see tri_uv_mirror_offset). gpu.c routes axis-aligned MIRRORED quads
+     * (X/Y-flipped 2D sprites, e.g. right-facing MMX entities) through THIS
+     * path as scaled rects with u0>u1 / v0>v1 — they never reach the poly
+     * path. Center-sampled interpolation with the -1/64 grid shift floors
+     * one texel LOW along a decreasing axis (the PS1 DDA latches the
+     * top-left corner value), painting the cel's never-sampled edge texels
+     * as detached slivers at cell seams. Bump the uv range +1 along each
+     * decreasing axis so floor() lands on the exact PS1 texel. */
+    if (u1 < u0) { u0++; u1++; }
+    if (v1 < v0) { v0++; v1++; }
+    /* uv sampling bounds: post-bump, the max-uv end is the exclusive edge
+     * in BOTH directions — sample range is [min, max-1]. Crossing a 256
+     * boundary means page wrap — widen to the full page. */
     int lim[4];
-    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
-    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
+    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = (u0 < u1 ? u1 : u0) - 1;
+    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = (v0 < v1 ? v1 : v0) - 1;
     if (lim[2] < lim[0]) lim[2] = lim[0];
     if (lim[3] < lim[1]) lim[3] = lim[1];
     if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; }
