@@ -38,6 +38,7 @@ struct GameInfo {
 
     bool        lock_device      = false; // true hides the Player controller-card device selector
     bool        ws_offered       = true;  // false hides the widescreen toggle + clamps to 4:3
+    bool        ws_ultrawide_offered = false; // separate experimental 21:9 choice
 
     struct Language { std::string code; std::string label; };
     std::vector<Language> languages;

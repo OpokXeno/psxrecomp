@@ -50,6 +50,10 @@ struct CodeGenConfig {
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
 
+    // MMX6-class 2D tile-ring stage initializer. Emit a reveal-invalidation
+    // callback at entry so host-only wide pixels cannot survive a stage swap.
+    uint32_t ws_bg2d_init_func = 0;
+
     // Widescreen far-backdrop un-squash ([widescreen] backdrop_unsquash_funcs):
     // functions whose body is bracketed by gte_ws_set_suppress(1)/(0) so the
     // GTE X-squash is OFF for their (far-backdrop) draws — the backdrop fills

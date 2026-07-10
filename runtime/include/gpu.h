@@ -164,6 +164,10 @@ void psx_ws_note_gte_project(int nverts);
  * outer-third screen-space HUD sprites out to the true wide-frame corners
  * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
 void gpu_ws_set_nw_hud_corners(int on);
+/* Targeted alternative for sprite-heavy 2D games: move only primitives whose
+ * ordering-table packet lives in the configured half-open physical-RAM range. */
+void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi);
+void gpu_ws_begin_linked_list(void);
 /* Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop):
  * stretch a screen-space quad that covers the whole 4:3 framebuffer (sky
  * gradient / backdrop image) to fill the wide frame, so it no longer

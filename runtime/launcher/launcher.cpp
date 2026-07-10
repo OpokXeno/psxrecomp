@@ -307,10 +307,10 @@ static bool load_assets(UI& ui, const fs::path& assets_dir) {
 struct LauncherModel {
     int  renderer=0, supersampling=1;
     bool antialiasing=true, auto_skip_fmv=false, turbo_loads=true, fullscreen=false;
-    bool spu_hq=false, widescreen=false, ws_eligible=true, skip_launcher=false, show_skip_modal=false;
+    bool spu_hq=false, widescreen=false, ultrawide=false, ws_eligible=true, uw_eligible=false, skip_launcher=false, show_skip_modal=false;
     int  texture_filter=0, crt=0, aspect_index=0, window_width=1280;
     int  p1_dev_index=1, p2_dev_index=0, p1_mode=0, p2_mode=0, deadzone_pct=37;
-    bool allow_hybrid=true, mode_selectable=true, lock_device=false, ws_offered=true, lang_menu=false;
+    bool allow_hybrid=true, mode_selectable=true, lock_device=false, ws_offered=true, ws_ultrawide_offered=false, lang_menu=false;
     int  lang_index=0, cfg_player=0;
     bool mc1_enabled=true, mc2_enabled=true, launch_requested=false, quit_requested=false;
     std::string bios_path, disc_path, view="dashboard";
@@ -349,8 +349,11 @@ static std::string winsize_label_for(int w,int ai){return std::to_string(w)+" \x
 static void refresh_labels(LauncherModel& m){
     m.renderer_label=renderer_name(m.renderer); m.crt_label=crt_name(m.crt);
     m.texfilter_label=texfilter_name(m.texture_filter);
-    if (!m.ws_offered && m.aspect_index != 0) m.aspect_index = 0;
-    m.aspect_label=aspect_name(m.aspect_index); m.winsize_label=winsize_label_for(m.window_width,m.aspect_index); m.widescreen=(m.aspect_index==1); m.ws_eligible=m.ws_offered;
+    if (!m.ws_offered && m.aspect_index == 1) m.aspect_index = 0;
+    if (!m.ws_ultrawide_offered && m.aspect_index == 2) m.aspect_index = m.ws_offered ? 1 : 0;
+    m.aspect_label=aspect_name(m.aspect_index); m.winsize_label=winsize_label_for(m.window_width,m.aspect_index);
+    m.widescreen=(m.aspect_index==1); m.ultrawide=(m.aspect_index==2);
+    m.ws_eligible=m.ws_offered; m.uw_eligible=m.ws_ultrawide_offered;
 }
 static std::string region_long(const std::string& r){
     if(r=="NTSC-U")return "NTSC-U (USA)"; if(r=="NTSC-J")return "NTSC-J (Japan)"; if(r=="PAL")return "PAL (Europe)"; return r;
@@ -745,6 +748,7 @@ Result run(SDL_Window* window, void* gl_context,
     if (game.lock_mode) { m.p1_mode = game.locked_mode; m.p2_mode = game.locked_mode; }
     m.lock_device = game.lock_device;
     m.ws_offered  = game.ws_offered;
+    m.ws_ultrawide_offered = game.ws_ultrawide_offered;
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
     m.uiscale = 1.0f; // TODO: persist uiscale in UserSettings
     m.p1_dev_index = io.has_p1_device ? find_or_add_device_index(dev_opts, io.p1_device) : (dev_opts.size()>2?2:1);
@@ -1008,6 +1012,8 @@ Result run(SDL_Window* window, void* gl_context,
             setting("Fullscreen", m.fullscreen?"On":"Off", ri++, [&](){ m.fullscreen=!m.fullscreen; });
             if (m.ws_offered)
                 setting("Widescreen", m.widescreen?"On":"Off", ri++, [&](){ m.aspect_index=(m.aspect_index==1)?0:1; refresh_labels(m); });
+            if (m.ws_ultrawide_offered)
+                setting("Ultrawide (EXPERIMENTAL)", m.ultrawide?"On":"Off", ri++, [&](){ m.aspect_index=(m.aspect_index==2)?0:2; refresh_labels(m); });
             // UI scale cycling: 0.5 0.75 1.0 1.25 1.5 1.75 2.0
             static const float kScales[] = {0.5f,0.75f,1.0f,1.25f,1.5f,1.75f,2.0f};
             static const int kNumScales = 7;

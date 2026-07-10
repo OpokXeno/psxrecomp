@@ -697,8 +697,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
     bool ws_nw_hud_corners = false;
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
     bool ws_nw_backdrop = false;
+    bool ws_clear_reveal = false;
     bool ws_offered = true;
+    bool ws_ultrawide_offered = false;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -724,10 +728,33 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
         if (ws.contains("nw_hud_corners"))
             ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
+        const bool has_nw_left_hud_lo = ws.contains("nw_left_hud_packet_lo");
+        const bool has_nw_left_hud_hi = ws.contains("nw_left_hud_packet_hi");
+        if (has_nw_left_hud_lo != has_nw_left_hud_hi)
+            throw std::runtime_error(fmt::format(
+                "{}: [widescreen] nw_left_hud_packet_lo and "
+                "nw_left_hud_packet_hi must be set together",
+                config_path.string()));
+        if (has_nw_left_hud_lo) {
+            ws_nw_left_hud_packet_lo = parse_hex(
+                toml::find<std::string>(ws, "nw_left_hud_packet_lo"),
+                "widescreen.nw_left_hud_packet_lo");
+            ws_nw_left_hud_packet_hi = parse_hex(
+                toml::find<std::string>(ws, "nw_left_hud_packet_hi"),
+                "widescreen.nw_left_hud_packet_hi");
+            if (ws_nw_left_hud_packet_lo >= ws_nw_left_hud_packet_hi)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_left_hud_packet range is empty or reversed",
+                    config_path.string()));
+        }
         if (ws.contains("nw_backdrop"))
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
+        if (ws.contains("clear_reveal"))
+            ws_clear_reveal = toml::find<bool>(ws, "clear_reveal");
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
+        if (ws.contains("offer_ultrawide"))
+            ws_ultrawide_offered = toml::find<bool>(ws, "offer_ultrawide");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
@@ -772,6 +799,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0, ws_bg2d_startx_site = 0;
     uint32_t ws_bg2d_stream_left_site = 0, ws_bg2d_stream_right_site = 0;
     uint32_t ws_bg2d_bufbase_site = 0, ws_bg2d_cap_site = 0;
+    uint32_t ws_bg2d_init_func = 0;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("bg2d")) {
@@ -789,6 +817,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_bg2d_stream_right_site = load1("stream_right_site");
             ws_bg2d_bufbase_site = load1("bufbase_site");
             ws_bg2d_cap_site     = load1("cap_site");
+            ws_bg2d_init_func    = load1("init_func");
         }
     }
 
@@ -847,8 +876,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_full_2d*/            ws_full_2d,
         /*ws_gte_game_mode*/      ws_gte_game_mode,
         /*ws_nw_hud_corners*/     ws_nw_hud_corners,
+        /*ws_nw_left_hud_packet_lo*/ ws_nw_left_hud_packet_lo,
+        /*ws_nw_left_hud_packet_hi*/ ws_nw_left_hud_packet_hi,
         /*ws_nw_backdrop*/        ws_nw_backdrop,
+        /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_offered*/            ws_offered,
+        /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
         /*ws_bg2d_startx_site*/   ws_bg2d_startx_site,
@@ -856,6 +889,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_stream_right_site*/ ws_bg2d_stream_right_site,
         /*ws_bg2d_bufbase_site*/  ws_bg2d_bufbase_site,
         /*ws_bg2d_cap_site*/      ws_bg2d_cap_site,
+        /*ws_bg2d_init_func*/     ws_bg2d_init_func,
     };
 }
 
