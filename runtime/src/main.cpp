@@ -2394,6 +2394,9 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* Keep titles with known native-wide regressions on the original
+             * projection-squash + stretched-present widescreen path. */
+            g_ws_native_wide = gc.ws_native_wide ? 1 : 0;
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
             /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
@@ -2408,6 +2411,8 @@ int main(int argc, char** argv) {
             gpu_ws_set_explicit_cull_sites(
                 gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
                 gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
+            gte_ws_configure_dome_sites(
+                gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp/sljit widen hooks. A title that never
              * opted in must never have its live code scanned and rewritten. */

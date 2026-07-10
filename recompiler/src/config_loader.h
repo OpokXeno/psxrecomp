@@ -456,6 +456,10 @@ struct GameConfig {
     // frame instead of leaving edge void (8C). Main-EXE addresses; regen-class.
     std::vector<uint32_t> ws_backdrop_unsquash_funcs;
 
+    // [widescreen.dome] call_sites: exact guest JAL addresses whose GTE
+    // projections belong to a finite curved backdrop mesh authored for 4:3.
+    std::vector<uint32_t> ws_dome_call_sites;
+
     // [widescreen.cull] auto_screen_x — automatic horizontal-FOV cull widening.
     // GTE-projected render funnels reject a primitive when ALL its vertices fall
     // off the 4:3 frame: a per-vertex `sltiu vN, SX, 0x140` (right edge) paired
@@ -497,6 +501,11 @@ struct GameConfig {
     // (native-wide engages); genuine full-2D screens (save/options) still
     // pillarbox 4:3. Runtime-only — no regen required. Off by default.
     bool ws_gte_game_mode = false;
+
+    // [widescreen] native_wide — select the newer wide render-target path.
+    // Defaults on for compatibility. Titles can keep the original GTE-squash
+    // + stretched-present path when native-wide is not regression-free.
+    bool ws_native_wide = true;
 
     // [widescreen] nw_hud_corners — in native-wide, push outer-third screen-
     // space HUD sprites out to the true wide-frame corners (they otherwise sit
