@@ -410,8 +410,8 @@ struct GameConfig {
     // ~the half-extra-width when stretching) into the relevant immediates:
     //   cull_bias_sites:  an addiu rT,rS,imm → rT = rS + (imm + margin)
     //   cull_range_sites: an sltiu rT,rS,imm → rT = rS <u (imm + 2*margin)
-    //   cull_a1_sites:    a nop (load/branch-delay) → a1 += margin (for the
-    //                     caller-supplied-margin classifier variants)
+    //   cull_a1_sites:    a nop → a1 += margin, or move rD,a1 →
+    //                     rD = a1 + margin (caller-margin classifier variants)
     // All Ghidra-evidenced; empty by default. Changing these requires a regen.
     std::vector<uint32_t> ws_cull_bias_sites;
     std::vector<uint32_t> ws_cull_range_sites;
@@ -577,6 +577,7 @@ struct GameConfig {
     //   layer's stage data is dirty. A callback at entry invalidates stale host
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
+    uint32_t ws_bg2d_packet_cap       = 1000;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

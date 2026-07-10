@@ -814,6 +814,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_bg2d_ring_cols = 64, ws_bg2d_layer_count = 3;
     uint32_t ws_bg2d_layer_struct_stride = 0x54;
     uint32_t ws_bg2d_init_func = 0;
+    uint32_t ws_bg2d_packet_cap = 1000;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("bg2d")) {
@@ -851,6 +852,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_bg2d_layer_count = load_positive("layer_count", ws_bg2d_layer_count);
             ws_bg2d_layer_struct_stride = load_positive(
                 "layer_struct_stride", ws_bg2d_layer_struct_stride);
+            ws_bg2d_packet_cap = load_positive("packet_cap", ws_bg2d_packet_cap);
             if ((ws_bg2d_ring_cols & (ws_bg2d_ring_cols - 1u)) != 0u)
                 throw std::runtime_error(
                     "widescreen.bg2d.ring_cols must be a power of two");
@@ -936,6 +938,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_layer_count*/   ws_bg2d_layer_count,
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
+        /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
     };
 }
 

@@ -300,12 +300,13 @@ static uint32_t g_bg2d_layer_stride_addr = 0x8008EC10u;
 static uint32_t g_bg2d_ring_cols = 64;
 static uint32_t g_bg2d_layer_count = 3;
 static uint32_t g_bg2d_layer_struct_stride = 0x54;
+static uint32_t g_bg2d_packet_cap = 1000;
 static int g_bg2d_native_cols = 21;
 
 void gpu_ws_bg2d_configure(uint32_t layer_base, uint32_t ring_base,
                            uint32_t map_size_addr, uint32_t layer_stride_addr,
                            uint32_t ring_cols, uint32_t layer_count,
-                           uint32_t layer_struct_stride) {
+                           uint32_t layer_struct_stride, uint32_t packet_cap) {
     g_bg2d_layer_base = layer_base;
     g_bg2d_ring_base = ring_base;
     g_bg2d_map_size_addr = map_size_addr;
@@ -313,6 +314,7 @@ void gpu_ws_bg2d_configure(uint32_t layer_base, uint32_t ring_base,
     g_bg2d_ring_cols = ring_cols;
     g_bg2d_layer_count = layer_count;
     g_bg2d_layer_struct_stride = layer_struct_stride;
+    g_bg2d_packet_cap = packet_cap;
 }
 
 static int ws_bg2d_left_cols(void) {
@@ -369,6 +371,10 @@ int psx_ws_bg2d_startx(int x)        { return mmx6_hostside_active() ? x : (x - 
  * there. The 64-col ring has ample slack (visible ~21 cols) for ±LEFT more. */
 int psx_ws_bg2d_stream_left(int x)  { return x - ws_bg2d_left_cols() * 16; }
 int psx_ws_bg2d_stream_right(int x) { return x + ws_bg2d_left_cols() * 16; }
+int psx_ws_bg2d_undercap(int counter, int native_cap) {
+    int cap = ws_bg2d_left_cols() > 0 ? (int)g_bg2d_packet_cap : native_cap;
+    return counter < cap;
+}
 
 /* Compatibility for generated MMX6 sources predating the generic names. */
 int psx_ws_mmx6_bg_cols(int base)       { return psx_ws_bg2d_cols(base); }
@@ -452,8 +458,8 @@ int psx_ws_mmx6_bg_bufbase(int addr) {
 /* Hook at the BG cap slti (0x80027278): counter < cap. Raises the cap to MMX6_RELOC_CAP when
  * relocated (the bigger buffer can hold them); plain 1000 otherwise (byte-identical). */
 int psx_ws_mmx6_bg_undercap(int counter) {
-    int cap = mmx6_bg_reloc_active() ? MMX6_RELOC_CAP : 1000;
-    return (counter < cap) ? 1 : 0;
+    if (mmx6_bg_reloc_active()) return counter < MMX6_RELOC_CAP;
+    return psx_ws_bg2d_undercap(counter, 1000);
 }
 
 /* ===== MMX6 host-side reveal columns ====================================== *
@@ -587,12 +593,28 @@ void gpu_ws_mmx6_emit_reveal(int base_x, int band_y) {
  * native-wide + ~320 mode, so 4:3 and the 512 hi-res title stay byte-identical. */
 extern void psx_write_half(uint32_t addr, uint16_t val);
 
+static void bg2d_clear_column(int layer, int ringcol, int worldY) {
+    int rows = 0x12;
+    if (worldY < 0) { worldY = 0; rows = 0x11; }
+    int wrapY = worldY - (((worldY < 0) ? worldY + 0x1ff : worldY) >> 9) * 0x200;
+    int ringrow = ((wrapY < 0) ? wrapY + 0xf : wrapY) >> 4;
+    uint32_t ringbase = g_bg2d_ring_base
+                      + (uint32_t)layer * (g_bg2d_ring_cols * 64u);
+    for (int i = 0; i < rows; i++) {
+        uint32_t cell = ringbase
+                      + (uint32_t)((ringcol & (int)(g_bg2d_ring_cols - 1u)) * 2)
+                      + (uint32_t)((ringrow & 0x1f) * (int)(g_bg2d_ring_cols * 2u));
+        psx_write_half(cell, 0);
+        ringrow = (ringrow + 1) & 0x1f;
+    }
+}
+
 /* Faithful clone of FUN_800274a0's inner fill: stream one tile column at guest pixel
  * (worldX, worldY) of `layer` into the 64x32 ring. Compares mirror the engine's sltu
  * (UNSIGNED). When write!=0 the tiles are written to the ring; when write==0 they are
  * compared against the live ring (validation), counting *cmp_total / *cmp_bad. Returns
  * 1 if the column was streamed, 0 if skipped (map-loop seam early-return). */
-static int bg2d_fill_column(int layer, int worldX, int worldY, int write,
+static int bg2d_fill_column(int layer, int worldX, int worldY, int scrollX, int write,
                              int *cmp_total, int *cmp_bad) {
     /* The guest column streamer returns immediately for negative world X. Do
      * not wrap it into the far edge of the map, which produces repeated blocks
@@ -618,7 +640,6 @@ static int bg2d_fill_column(int layer, int worldX, int worldY, int write,
 
     int mapLeft  = psx_read_byte(lbase + 0x4d);
     int mapRight = psx_read_byte(lbase + 0x4e);
-    int scrollX  = (int16_t)psx_read_half(lbase + 0xa);
     /* C integer division toward zero makes worldX -255..-1 resolve to metatile
      * column 0 below. The native 4:3 streamer never requests those coordinates,
      * but the widened left window does at a stage starting on mapLeft. Treat
@@ -683,10 +704,12 @@ void gpu_ws_mmx6_set_freshfix(int on) { g_mmx6_freshfix = on ? 1 : 0; }
 int  gpu_ws_mmx6_freshfix_get(void)   { return g_mmx6_freshfix; }
 long gpu_ws_mmx6_refill_cols(void)    { return g_mmx6_refill_cols; }
 
-/* Re-stream every tile column of the widened window for each independently streamed
- * BG layer, using its OWN scroll and worldY = scrollY - 0x10 (mirrors the driver).
- * Parent-linked layers are skipped exactly as they are by the guest streamer. ci
- * spans the renderer's widened span [-LEFT, 20+LEFT].
+/* Re-stream every tile column of the widened window for every BG layer. Independent
+ * layers use their own scroll; parent-linked layers use the same combined scroll
+ * that the renderer uses to index their ring. The guest's incremental streamer
+ * skips linked layers because their native 4:3 window is prefilled, but the newly
+ * revealed columns still need to be populated here. worldY = scrollY - 0x10 mirrors
+ * the driver. ci spans the renderer's widened span [-LEFT, 20+LEFT].
  * No-op at 4:3 / 512 hi-res (left==0). Idempotent over the native columns the engine
  * already streamed correctly, so re-streaming them is harmless. */
 void psx_ws_mmx6_bg_refill_all(void) {
@@ -697,15 +720,26 @@ void psx_ws_mmx6_bg_refill_all(void) {
     g_mmx6_refill_cols = 0;
     for (uint32_t layer = 0; layer < g_bg2d_layer_count; layer++) {
         uint32_t lbase = g_bg2d_layer_base + layer * g_bg2d_layer_struct_stride;
-        /* Match the guest driver: parent-linked layers are not incrementally
-         * streamed and must retain their prefilled ring contents. */
-        if ((int8_t)psx_read_byte(lbase + 0x52) >= 0) continue;
         int sx = (int16_t)psx_read_half(lbase + 0xa);
         int sy = (int16_t)psx_read_half(lbase + 0xe);
+        int8_t parent = (int8_t)psx_read_byte(lbase + 0x52);
+        if (parent >= 0 && (uint32_t)(uint8_t)parent < g_bg2d_layer_count) {
+            uint32_t pbase = g_bg2d_layer_base
+                           + (uint32_t)(uint8_t)parent * g_bg2d_layer_struct_stride;
+            sx += (int16_t)psx_read_half(pbase + 0xa);
+            sy += (int16_t)psx_read_half(pbase + 0xe);
+        }
+        int sxr = sx;
+        if (sxr < 0) sxr += 0xf;
+        int start_col = sxr >> 4;
         for (int ci = -left; ci < g_bg2d_native_cols + left; ci++) {
-            int filled = bg2d_fill_column((int)layer, sx + ci * 16,
-                                          sy - 0x10, 1, NULL, NULL);
-            if (filled)
+            int world_x = sx + ci * 16;
+            if (world_x < 0) {
+                bg2d_clear_column((int)layer, start_col + ci, sy - 0x10);
+                continue;
+            }
+            if (bg2d_fill_column((int)layer, world_x, sy - 0x10,
+                                 sx, 1, NULL, NULL))
                 g_mmx6_refill_cols++;
         }
     }
@@ -729,11 +763,18 @@ int gpu_ws_mmx6_validate(int *bad_out) {
     int total = 0, bad = 0;
     for (uint32_t layer = 0; layer < g_bg2d_layer_count; layer++) {
         uint32_t lbase = g_bg2d_layer_base + layer * g_bg2d_layer_struct_stride;
-        if ((int8_t)psx_read_byte(lbase + 0x52) >= 0) continue;
         int sx = (int16_t)psx_read_half(lbase + 0xa);
         int sy = (int16_t)psx_read_half(lbase + 0xe);
+        int8_t parent = (int8_t)psx_read_byte(lbase + 0x52);
+        if (parent >= 0 && (uint32_t)(uint8_t)parent < g_bg2d_layer_count) {
+            uint32_t pbase = g_bg2d_layer_base
+                           + (uint32_t)(uint8_t)parent * g_bg2d_layer_struct_stride;
+            sx += (int16_t)psx_read_half(pbase + 0xa);
+            sy += (int16_t)psx_read_half(pbase + 0xe);
+        }
         for (int ci = 0; ci < g_bg2d_native_cols; ci++)
-            bg2d_fill_column((int)layer, sx + ci * 16, sy - 0x10, 0, &total, &bad);
+            bg2d_fill_column((int)layer, sx + ci * 16, sy - 0x10,
+                             sx, 0, &total, &bad);
     }
     if (bad_out) *bad_out = bad;
     return total;
@@ -1181,6 +1222,25 @@ static int32_t ws_disp_w(void) {
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     return di.width ? (int32_t)di.width : 320;
+}
+
+static int32_t ws_disp_h(void) {
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    return di.height ? (int32_t)di.height : 240;
+}
+
+/* Full-screen fades and environmental filters are authored as 320x240 TILEs.
+ * In native-wide mode, grow only primitives that cover the complete native
+ * display; ordinary world-space rectangles remain untouched. */
+static void ws_expand_fullscreen_rect(int32_t *x, int32_t y, int *w, int h) {
+    if (!ws_native_wide_active()) return;
+    int W = (int)ws_disp_w(), H = (int)ws_disp_h();
+    if (*x <= 0 && *x + *w >= W && y <= 0 && y + h >= H) {
+        int off = ws_nw_offset();
+        *x -= off;
+        *w += 2 * off;
+    }
 }
 
 /* In-game HUD pivot for an untagged screen-space SPRT spanning [x, x+w).
@@ -1954,6 +2014,28 @@ static void gp0_exec_mono_quad(void) {
     int32_t vx[4], vy[4];
     for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+
+    /* Full-screen filters are commonly encoded as an axis-aligned quad. Drawing
+     * a semi-transparent quad as two independent triangles blends their shared
+     * diagonal twice; render the equivalent rectangle once to avoid that seam.
+     * The full-screen helper also grows the native 320-wide filter across the
+     * sidecar surface in native-wide mode. Ordinary world quads are unchanged. */
+    if (vx[0] == vx[2] && vx[1] == vx[3] &&
+        vy[0] == vy[1] && vy[2] == vy[3] &&
+        vx[1] > vx[0] && vy[2] > vy[0] &&
+        vx[0] <= 0 && vx[1] >= ws_disp_w() &&
+        vy[0] <= 0 && vy[2] >= ws_disp_h()) {
+        int32_t x = vx[0];
+        int32_t y = vy[0];
+        int w = (int)(vx[1] - vx[0]);
+        int h = (int)(vy[2] - vy[0]);
+        ws_expand_fullscreen_rect(&x, y, &w, h);
+        x += draw_offset_x;
+        y += draw_offset_y;
+        gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+        gr_draw_flat_rect(x, y, w, h, color);
+        return;
+    }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (no-op else) */
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
@@ -2286,6 +2368,7 @@ static void gp0_exec_mono_rect(void) {
     int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
+    ws_expand_fullscreen_rect(&x0, y0, &w, h);
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, w, h, color);

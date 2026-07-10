@@ -837,9 +837,16 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             // a1 = $5: widen the caller-supplied margin (param-margin classifiers).
             return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
                                "  /* ws cull a1 bias */{}", comment);
+        } else if (opcode == 0x00 && get_funct(instr) == 0x21 &&
+                   get_rs(instr) == 5 && get_rt(instr) == 0) {
+            // move rD,a1 (addu rD,a1,zero): widen the copied classifier margin.
+            uint32_t rd = get_rd(instr);
+            return fmt::format("{} = cpu->gpr[5] + psx_ws_x_margin();"
+                               "  /* ws cull copied a1 bias */{}",
+                               reg_name(rd), comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] a1 site 0x{:08X} is not a "
-                       "nop (0x{:08X})\n", addr, instr);
+                       "nop or move rD,a1 (0x{:08X})\n", addr, instr);
             std::exit(1);
         }
         // overlay variant: addr is different code here — fall through to vanilla.
@@ -1021,8 +1028,8 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (config_.ws_bg2d_cap_site && addr == config_.ws_bg2d_cap_site) {
         if (opcode == 0x0A) {  // slti rt,rs,imm  (BG per-frame tile cap compare)
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
-            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_undercap((int32_t){});{}",
-                               reg_name(rt), reg_name(rs), comment);
+            return fmt::format("{} = (uint32_t)psx_ws_bg2d_undercap((int32_t){}, {});{}",
+                               reg_name(rt), reg_name(rs), (int16_t)(instr & 0xFFFFu), comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] cap_site 0x{:08X} is not "
                        "slti (opcode 0x{:02X})\n", addr, opcode);
@@ -2631,6 +2638,7 @@ std::string CodeGenerator::generate_file(
     ss << "extern int  psx_ws_bg2d_startx(int x);                     /* ws 2D bg tile-loop widen: start screen-x (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_stream_left(int x);                /* ws 2D bg tile-ring streamer: left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_stream_right(int x);               /* ws 2D bg tile-ring streamer: right edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_bg2d_undercap(int counter, int native_cap); /* ws 2D BG packet cap (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_bufbase(int addr);   /* ws 2D bg packet-buffer relocation (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_undercap(int counter);/* ws 2D bg per-frame tile cap (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";

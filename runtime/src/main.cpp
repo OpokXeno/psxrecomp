@@ -2379,7 +2379,8 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_layer_stride_addr,
                                   gc.ws_bg2d_ring_cols,
                                   gc.ws_bg2d_layer_count,
-                                  gc.ws_bg2d_layer_struct_stride);
+                                  gc.ws_bg2d_layer_struct_stride,
+                                  gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */

@@ -112,12 +112,13 @@ void gpu_ws_set_full_2d(int on);
 void gpu_ws_bg2d_configure(uint32_t layer_base, uint32_t ring_base,
                            uint32_t map_size_addr, uint32_t layer_stride_addr,
                            uint32_t ring_cols, uint32_t layer_count,
-                           uint32_t layer_struct_stride);
+                           uint32_t layer_struct_stride, uint32_t packet_cap);
 int psx_ws_bg2d_cols(int base);
 int psx_ws_bg2d_startcol(int col, unsigned mask);
 int psx_ws_bg2d_startx(int x);
 int psx_ws_bg2d_stream_left(int x);
 int psx_ws_bg2d_stream_right(int x);
+int psx_ws_bg2d_undercap(int counter, int native_cap);
 /* Compatibility entry points for already-generated MMX6 sources. */
 int psx_ws_mmx6_bg_cols(int base);
 int psx_ws_mmx6_bg_startcol(int col);
