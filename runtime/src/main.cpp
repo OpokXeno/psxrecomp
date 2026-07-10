@@ -302,6 +302,9 @@ static bool audio_legacy_mode(void) {
 /* Legacy-mode underrun counter: incremented when the SDL queue is found empty
  * at pump time (the device was silence-filling = an audible gap). */
 static uint64_t g_legacy_underruns = 0;
+/* Set at unmute so the pump resyncs its bridge-underrun baseline past the
+ * intentional mute-drain instead of reporting it as gaps. */
+int g_audio_unmute_resync = 0;
 /* Actual device rate the host opened at (bridge mode may differ from 44100;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
 int g_audio_host_rate = 44100;
@@ -724,15 +727,22 @@ static void sdl_audio_pump(void) {
             return;
         }
     } else {
-        /* No host-queue backpressure check: the bridge's ring + P-only DRC hold
-         * the fill near target, so we always render this frame and push it. */
+        /* No host-queue backpressure check: the bridge's ring + DRC hold the
+         * fill near target, so we always render this frame and push it. */
         if (!s_drc_ready) return;
         /* Surface bridge underruns (counted on the SDL audio thread) into the
-         * event ring from this thread — the event ring is single-writer. */
+         * event ring from this thread — the event ring is single-writer.
+         * Across a turbo mute the ring intentionally runs dry (the pump stops
+         * while the callback keeps pulling); those dry pulls are the mute,
+         * not gaps — resync past them instead of reporting them. */
         rab_stats st;
         rab_get_stats(&s_drc, &st);
         static uint64_t prev_underruns = 0;
-        if (st.underrun_events > prev_underruns) {
+        extern int g_audio_unmute_resync;
+        if (g_audio_unmute_resync) {
+            prev_underruns = st.underrun_events;
+            g_audio_unmute_resync = 0;
+        } else if (st.underrun_events > prev_underruns) {
             audio_trace_event(AUDIO_EV_UNDERRUN,
                               (uint32_t)(st.underrun_events - prev_underruns), 1);
             prev_underruns = st.underrun_events;
@@ -740,12 +750,31 @@ static void sdl_audio_pump(void) {
         queued = (uint32_t)st.last_fill_ms;
     }
 
-    static double sample_accum = 0.0;
-    sample_accum += 44100.0 / 60.0;
-    int frames = (int)sample_accum;
-    sample_accum -= (double)frames;
+    /* Faithful sample budget: the SPU is clocked by the GUEST, not by host
+     * presents. 33.8688 MHz / 44100 Hz = exactly 768 guest cycles per output
+     * frame, so production tracks guest time precisely — including the real
+     * NTSC 59.94 Hz vblank — instead of assuming 60.00 Hz per present, which
+     * built in a systematic -0.1% production deficit (measured: 43950/s
+     * produced vs 44100/s consumed = recurring ring underruns no +/-0.5%
+     * DRC trim could absorb during jitter spikes). */
+    extern uint64_t psx_cycle_count;
+    static uint64_t last_cycles = 0;
+    static uint64_t cycle_carry = 0;
+    const uint64_t now_cycles = psx_cycle_count;
+    if (last_cycles == 0) last_cycles = now_cycles;
+    uint64_t delta = (now_cycles - last_cycles) + cycle_carry;
+    last_cycles = now_cycles;
+    int frames = (int)(delta / 768u);
+    cycle_carry = delta % 768u;
     if (frames <= 0) return;
-    if (frames > 2048) frames = 2048;
+    if (frames > 2048) {
+        /* A burst beyond one buffer (e.g. right after an unmute or a long
+         * stall): render one full buffer and DROP the remainder of the debt —
+         * same semantic as the mute model (voice positions freeze across the
+         * gap) rather than time-compressing a backlog into garble. */
+        frames = 2048;
+        cycle_carry = 0;
+    }
 
     audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
     spu_render(sdl_audio_buf, frames);
@@ -858,6 +887,8 @@ static void sdl_audio_update(int turbo_active) {
         muted = 0;
         sdl_audio_fadein_left = sdl_audio_fade_samples;
         audio_trace_event(AUDIO_EV_UNMUTE, (uint32_t)sdl_audio_fadein_left, 0);
+        extern int g_audio_unmute_resync;
+        g_audio_unmute_resync = 1;
     }
     sdl_audio_pump();
 }

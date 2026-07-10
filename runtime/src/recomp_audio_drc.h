@@ -39,9 +39,13 @@ typedef struct {
     double host_rate;       /* host device sample rate (Hz)                     */
     int    taps;            /* prototype length; 16 min, 32 preferred          */
     int    phases;          /* fractional phases; 256-1024 (512 default)       */
-    double target_ms;       /* steady-state ring fill target (default 50)      */
-    double ring_ms;         /* ring capacity in ms (default 150)               */
+    double target_ms;       /* steady-state ring fill target (default 80)      */
+    double ring_ms;         /* ring capacity in ms (default 250)               */
     double kp;              /* proportional gain (default 0.02)                */
+    double ki_per_s;        /* integral gain per second (default 0.02): holds
+                               a steady clock-skew correction with ZERO
+                               standing fill error (P-only must run a permanent
+                               fill deficit of corr/kp to sustain correction)  */
     double max_correction;  /* clamp on ratio correction (default 0.005)       */
     double err_lp_ms;       /* error low-pass time constant ms (default 75)    */
     double slew_pp_per_s;   /* correction slew, percent-points/sec (default 0.75) */
@@ -74,6 +78,8 @@ typedef struct rab_bridge {
     double cur_step;        /* current source frames consumed per output frame */
     double err_lp;          /* low-passed normalized error                     */
     double corr;            /* current (slew-limited) correction               */
+    double corr_i;          /* integral term: holds steady clock-skew with
+                               zero standing fill error (see controller)       */
 
     /* fade / emergency */
     double gain;            /* 0..1 smooth gate for startup/underrun           */
@@ -137,15 +143,20 @@ void rab_config_defaults(rab_config *c) {
     c->host_rate      = 48000.0;
     c->taps           = 32;
     c->phases         = 512;
-    c->target_ms      = 50.0;
-    c->ring_ms        = 150.0;
+    /* target/ring raised 50/150 -> 80/250: a producer paced by an emulated
+     * machine stalls for tens of ms at a time (heavy frames, CD bursts) —
+     * jitter far beyond a host audio driver's. 80 ms keeps the servo's
+     * operating point clear of the dry floor through those spikes. */
+    c->target_ms      = 80.0;
+    c->ring_ms        = 250.0;
     c->kp             = 0.02;
+    c->ki_per_s       = 0.02;
     c->max_correction = 0.005;
     c->err_lp_ms      = 75.0;
     c->slew_pp_per_s  = 0.75;
     c->deadband_ms    = 1.0;
     c->em_low_ms      = 12.0;
-    c->em_high_ms     = 105.0;
+    c->em_high_ms     = 205.0;
 }
 
 int rab_init(rab_bridge *b, const rab_config *cfg) {
@@ -261,7 +272,20 @@ static void rab__update_controller(rab_bridge *b) {
     double alpha = dt_ms / (c->err_lp_ms + dt_ms);
     b->err_lp += alpha * (err - b->err_lp);
 
-    double target_corr = c->kp * b->err_lp;
+    /* PI control. P alone cannot hold a sustained source-clock skew without a
+     * standing fill error of corr/kp (a 0.3% skew cost 7.5 ms of permanent
+     * fill deficit at kp=0.02/target=50 — margin that jitter spikes then
+     * drained to underrun). The integral accumulates the steady skew so fill
+     * returns to target; anti-windup: never integrate deeper into the clamp. */
+    double target_corr = c->kp * b->err_lp + b->corr_i;
+    int clamped_hi = target_corr >  c->max_correction;
+    int clamped_lo = target_corr < -c->max_correction;
+    if ((!clamped_hi && !clamped_lo) ||
+        (clamped_hi && b->err_lp < 0.0) || (clamped_lo && b->err_lp > 0.0)) {
+        b->corr_i += c->ki_per_s * (dt_ms / 1000.0) * b->err_lp;
+        if (b->corr_i >  c->max_correction) b->corr_i =  c->max_correction;
+        if (b->corr_i < -c->max_correction) b->corr_i = -c->max_correction;
+    }
     if (target_corr >  c->max_correction) target_corr =  c->max_correction;
     if (target_corr < -c->max_correction) target_corr = -c->max_correction;
 
