@@ -127,6 +127,7 @@ typedef enum {
     MC_READ_CHK,
     MC_READ_END,
     /* Write states */
+    MC_WRITE_LSB_ECHO,   /* rx = sector_lsb while accepting first data byte */
     MC_WRITE_DATA,
     MC_WRITE_CHK,
     MC_WRITE_ACK1,
@@ -1066,11 +1067,17 @@ static void mc_process_byte(uint8_t tx_byte) {
             for (int i = 0; i < 128; i++)
                 mc_checksum ^= mc_data[i];
             mc_state = MC_READ_ACK1;
+            sio_rx_data = 0x00;
         } else {
             mc_data_idx = 0;
-            mc_state = MC_WRITE_DATA;
+            mc_state = MC_WRITE_LSB_ECHO;
+            /* Hardware/Beetle echo the high address byte on the address-LSB
+             * transfer (zero for all 1Mbit card sectors), then echo the low
+             * address byte while receiving the first payload byte.  Some BIOS
+             * card-write paths validate this handshake before they schedule the
+             * follow-up directory reads. */
+            sio_rx_data = mc_sector_msb;
         }
-        sio_rx_data = 0x00;
         sio_stat |= SIO_STAT_ACK;
         break;
 
@@ -1135,6 +1142,13 @@ static void mc_process_byte(uint8_t tx_byte) {
     }
 
     /* ---- WRITE states ---- */
+    case MC_WRITE_LSB_ECHO:
+        mc_data[mc_data_idx++] = tx_byte;
+        mc_state = MC_WRITE_DATA;
+        sio_rx_data = mc_sector_lsb;
+        sio_stat |= SIO_STAT_ACK;
+        break;
+
     case MC_WRITE_DATA:
         mc_data[mc_data_idx++] = tx_byte;
         sio_rx_data = 0x00;
@@ -1313,7 +1327,8 @@ static void sio_process_byte(uint8_t tx_byte) {
     /* ---- Card transaction tracking: record + maybe-close ---- */
     if (txn_was_card_byte && sio_txn_open) {
         int got_ack = (sio_mc_ack_count > trace_ack_before) ? 1 : 0;
-        uint16_t sector_now = (mc_state >= MC_READ_ACK1 || mc_state == MC_WRITE_DATA
+        uint16_t sector_now = (mc_state >= MC_READ_ACK1 || mc_state == MC_WRITE_LSB_ECHO
+                               || mc_state == MC_WRITE_DATA
                                || mc_state >= MC_WRITE_ACK1)
                               ? mc_sector : 0xFFFF;
         txn_record_byte(tx_byte, sio_rx_data, mc_cmd, sector_now,

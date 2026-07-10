@@ -113,7 +113,9 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
              * later overlay overwrites, so the dispatch runs clean text compiled and
              * interprets only true overlays (Tomba 2 boot-text loader overlay). */
             extern void dirty_ram_clear_image_baseline(void);
+            extern void memory_clear_low_boot_scratch(void);
             dirty_ram_clear_image_baseline();
+            memory_clear_low_boot_scratch();
             cdrom_notify_game_started();
             boot_state_trigger_capture(cpu);
         }
