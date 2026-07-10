@@ -67,20 +67,30 @@ Low, and skewed toward correctness:
 - `sf` handling: all common libgte encodings of these ops use `sf = 1`,
   which reproduces the old shift exactly.
 
-## Cross-game validation (open)
+## Cross-game validation — REQUIRED, all titles, before merge
 
-Verified so far:
+This branch does not merge to master until every supported title has been
+validated against this change. No subset, no sampling.
 
-- [x] **Crash Bash (SCUS-94570)** — menu strobe gone; `nintpl_tiny`
-      335–352/473 → 0–3; character present in both VRAM double-buffers and
-      in all frames of a jittered screenshot burst; menus/animation healthy.
-- [ ] **Mega Man X6** — boot to gameplay, verify sprites/models and any
-      depth-cued fades match pre-fix behavior (expected unchanged: lighting
-      uses `lm = 1`).
-- [ ] **Tomba 2** — boot to gameplay, same checks (expected unchanged).
-- [ ] **Ape Escape** — boot to gameplay, same checks; heavy GTE user, good
-      canary for the depth-cue step clamp.
+**Validated:**
 
-For each: run the game's existing verify flow, watch `gte_frame_stats` for
-anomalous `nsat`/`nflat` shifts vs a pre-fix baseline, and eyeball lit /
-fogged scenes.
+**Crash Bash (SCUS-94570)** — the fix target. Menu strobe gone;
+`nintpl_tiny` 335–352/473 → 0–3; character present in both VRAM
+double-buffers and in all frames of a jittered screenshot burst;
+menus/animation healthy.
+
+**Pending (every one required):**
+
+**Mega Man X6**, **Tomba 2**, **Ape Escape**. Ape Escape is the highest-risk
+of the three — a heavy GTE user and the most likely to exercise the
+depth-cue step clamp with distant far colors; Tomba 2 and MMX6 exercise the
+standard `lm = 1` lighting path that must be bit-identical to before.
+
+**Per-title procedure (same for all):**
+
+1. Boot to gameplay through the title's existing verify flow on this branch.
+2. Capture `gte_frame_stats` over a representative scene and diff
+   `nsat`/`nflat` against a pre-fix baseline built from master + this
+   branch's parent commit — any shift is a stop-and-investigate, not a note.
+3. Eyeball lit and fogged/depth-cued scenes side-by-side with the Beetle
+   oracle; the oracle is ground truth, not the pre-fix recomp.
