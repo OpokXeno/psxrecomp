@@ -6,6 +6,7 @@
 #include <string>
 #include <algorithm>
 #include <set>
+#include <vector>
 
 #include "ps1_exe_parser.h"
 #include "gte.h"
@@ -924,33 +925,67 @@ int main(int argc, char** argv) {
                           game_text_start, game_text_end);
         ds << "}\n\n";
 
-        ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
-        ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
-        ds << "    switch (addr) {\n";
+        // Materialize one sorted data table for dispatch and entry probes. A
+        // giant sparse switch is catastrophically slow in Debug/-O0 builds:
+        // GCC lowers X4's roughly 60K cases to a multi-megabyte linear compare
+        // chain. Binary search stays O(log N) at every optimizer level and
+        // avoids emitting the same case set twice.
+        struct DispatchRecord {
+            uint32_t addr;
+            uint32_t resume;
+            uint32_t owner;
+        };
+        std::vector<DispatchRecord> records;
+        records.reserve(dispatch_addrs.size() +
+                        (codegen.cps_enabled() ? codegen.cps_continuations().size() : 0));
+        for (uint32_t addr : dispatch_addrs)
+            records.push_back({addr, 0, addr});
         if (codegen.cps_enabled()) {
-            // CPS (§25): entries clear cpu->pc so the function's entry-switch is
-            // skipped (runs from the top); continuations set cpu->pc so the
-            // entry-switch routes into the owning block. The unified flat
-            // trampoline (psx_dispatch_impl) then drives every tail-transfer.
-            for (uint32_t addr : dispatch_addrs) {
-                ds << fmt::format("        case 0x{:08X}u: psx_check_interrupts_dispatch_entry(cpu, 0x{:08X}u); cpu->pc = 0; func_{:08X}(cpu); return 1;\n",
-                                  addr, addr, addr);
-            }
             const auto& conts = codegen.cps_continuations();
-            ds << fmt::format("        /* {} continuation return-points (CPS) */\n", conts.size());
             for (const auto& [cont, owner] : conts) {
-                if (dispatch_addrs.count(cont)) continue;  /* already a function entry */
-                ds << fmt::format("        case 0x{:08X}u: psx_check_interrupts_dispatch_entry(cpu, 0x{:08X}u); cpu->pc = 0x{:08X}u; func_{:08X}(cpu); return 1;\n",
-                                  cont, cont, cont, owner);
-            }
-        } else {
-            for (uint32_t addr : dispatch_addrs) {
-                ds << fmt::format("        case 0x{:08X}u: psx_check_interrupts_dispatch_entry(cpu, 0x{:08X}u); func_{:08X}(cpu); return 1;\n",
-                                  addr, addr, addr);
+                if (dispatch_addrs.count(cont)) continue;
+                records.push_back({cont, cont, owner});
             }
         }
-        ds << "        default: return 0;\n";
+        std::sort(records.begin(), records.end(),
+                  [](const DispatchRecord& a, const DispatchRecord& b) {
+                      return a.addr < b.addr;
+                  });
+
+        ds << "typedef void (*PsxGameDispatchFn)(CPUState* cpu);\n";
+        ds << "typedef struct {\n";
+        ds << "    uint32_t addr;\n";
+        ds << "    uint32_t resume_pc;\n";
+        ds << "    PsxGameDispatchFn fn;\n";
+        ds << "} PsxGameDispatchEntry;\n\n";
+        ds << "static const PsxGameDispatchEntry k_psx_game_dispatch[] = {\n";
+        for (const auto& rec : records) {
+            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, func_{:08X}}},\n",
+                              rec.addr, rec.resume, rec.owner);
+        }
+        ds << "};\n";
+        ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
+        ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
+        ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
+        ds << "    while (lo < hi) {\n";
+        ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
+        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr;\n";
+        ds << "        if (addr < key) hi = mid;\n";
+        ds << "        else if (addr > key) lo = mid + 1;\n";
+        ds << "        else return &k_psx_game_dispatch[mid];\n";
         ds << "    }\n";
+        ds << "    return 0;\n";
+        ds << "}\n\n";
+
+        ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
+        ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
+        ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
+        ds << "    if (!entry) return 0;\n";
+        ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
+        if (codegen.cps_enabled())
+            ds << "    cpu->pc = entry->resume_pc;\n";
+        ds << "    entry->fn(cpu);\n";
+        ds << "    return 1;\n";
         ds << "}\n";
 
         // Non-destructive companion to psx_dispatch_game_compiled: is `addr` a PC
@@ -960,22 +995,10 @@ int main(int argc, char** argv) {
         // a MID-function clean-text PC is NOT re-enterable (the switch falls to
         // `default: return 0` and the dirty path returns 0 -> top-level PC=0 exit),
         // so the slicer must keep interpreting until cpu->pc lands on a true entry.
-        // Same case set as the dispatch switch above, minus the function calls.
+        // Same precise address set as dispatch, without executing the entry.
         ds << "\n/* 1 iff addr is a re-enterable compiled entry/continuation (no exec). */\n";
         ds << "int psx_game_is_function_entry(uint32_t addr) {\n";
-        ds << "    switch (addr) {\n";
-        for (uint32_t addr : dispatch_addrs) {
-            ds << fmt::format("        case 0x{:08X}u: return 1;\n", addr);
-        }
-        if (codegen.cps_enabled()) {
-            const auto& conts = codegen.cps_continuations();
-            for (const auto& [cont, owner] : conts) {
-                if (dispatch_addrs.count(cont)) continue;
-                ds << fmt::format("        case 0x{:08X}u: return 1;\n", cont);
-            }
-        }
-        ds << "        default: return 0;\n";
-        ds << "    }\n";
+        ds << "    return psx_game_find_entry(addr) != 0;\n";
         ds << "}\n";
 
         if (codegen.cps_enabled()) {

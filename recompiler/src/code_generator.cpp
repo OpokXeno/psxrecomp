@@ -837,13 +837,21 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             // a1 = $5: widen the caller-supplied margin (param-margin classifiers).
             return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
                                "  /* ws cull a1 bias */{}", comment);
-        } else if (opcode == 0x00 && get_funct(instr) == 0x21 &&
-                   get_rs(instr) == 5 && get_rt(instr) == 0) {
-            // move rD,a1 (addu rD,a1,zero): widen the copied classifier margin.
-            uint32_t rd = get_rd(instr);
-            return fmt::format("{} = cpu->gpr[5] + psx_ws_x_margin();"
-                               "  /* ws cull copied a1 bias */{}",
-                               reg_name(rd), comment);
+        } else if (opcode == 0x00 && get_funct(instr) == 0x21) {
+            // move rD,a1 (addu rD,a1,zero or addu rD,zero,a1): some Capcom
+            // classifiers copy the caller-supplied horizontal margin
+            // immediately, leaving no delay-slot nop to repurpose. Widen the
+            // copied value; a1 itself and the vertical margin stay unchanged.
+            uint32_t rs = get_rs(instr), rt = get_rt(instr), rd = get_rd(instr);
+            if ((rs == 5 && rt == 0) || (rs == 0 && rt == 5))
+                return fmt::format("{} = cpu->gpr[5] + psx_ws_x_margin();"
+                                   "  /* ws cull copied a1 bias */{}",
+                                   reg_name(rd), comment);
+            if (!config_.overlay_mode) {
+                fmt::print(stderr, "ERROR: [widescreen.cull] a1 site 0x{:08X} "
+                           "is addu but not move rD,a1 (0x{:08X})\n", addr, instr);
+                std::exit(1);
+            }
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] a1 site 0x{:08X} is not a "
                        "nop or move rD,a1 (0x{:08X})\n", addr, instr);
@@ -939,7 +947,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     // Widescreen pure-2D background tile-loop widen ([widescreen.bg2d]). The
     // per-layer BG renderer draws `count` 16px tile columns from a start column /
     // start screen-x derived from the camera scroll. Rewrite those three values
-    // (via the gpu.c psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res) so
+    // (via the gpu.c psx_ws_bg2d_* helpers — identity at 4:3 / 512 hi-res) so
     // the loop draws the 16:9 reveal columns on both sides. Each site's opcode is
     // verified; a mismatch is a loud build error (main-EXE addresses).
     if (config_.ws_bg2d_count_site && addr == config_.ws_bg2d_count_site) {
@@ -948,14 +956,17 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             uint16_t imm = get_imm16_u(instr);
             return fmt::format("{} = (uint32_t)psx_ws_bg2d_cols({});{}",
                                reg_name(rt), (int)imm, comment);
-        } else if (opcode == 0x0B) {  // sltiu rt,rs,imm (loop bound compare)
+        } else if (opcode == 0x0A || opcode == 0x0B) {  // slti/sltiu rt,rs,imm (loop bound compare)
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             uint16_t imm = get_imm16_u(instr);
+            if (opcode == 0x0A)  // signed variant
+                return fmt::format("{} = ((int32_t){} < psx_ws_bg2d_cols({})) ? 1u : 0u;{}",
+                                   reg_name(rt), reg_name(rs), (int)imm, comment);
             return fmt::format("{} = ({} < (uint32_t)psx_ws_bg2d_cols({})) ? 1u : 0u;{}",
                                reg_name(rt), reg_name(rs), (int)imm, comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] count_site 0x{:08X} is not "
-                       "addiu/ori/sltiu (opcode 0x{:02X})\n", addr, opcode);
+                       "addiu/ori/slti/sltiu (opcode 0x{:02X})\n", addr, opcode);
             std::exit(1);
         }
     }
@@ -976,9 +987,15 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             uint32_t rt = get_rt(instr), rd = get_rd(instr), sh = get_shamt(instr);
             return fmt::format("{} = (uint32_t)psx_ws_bg2d_startx((int32_t){} >> {});{}",
                                reg_name(rd), reg_name(rt), sh, comment);
+        } else if (opcode == 0x00 &&
+                   (instr & 0x3F) == 0x23 && get_rs(instr) == 0) {
+            // subu rd,zero,rt (MMX4's start screen-x = -(scrollX & 15))
+            uint32_t rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_bg2d_startx(-(int32_t){});{}",
+                               reg_name(rd), reg_name(rt), comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.bg2d] startx_site 0x{:08X} is not "
-                       "sra (instr 0x{:08X})\n", addr, instr);
+                       "sra or subu-zero (instr 0x{:08X})\n", addr, instr);
             std::exit(1);
         }
     }

@@ -109,10 +109,12 @@ struct CodeGenConfig {
 
     // Widescreen pure-2D background tile-loop widen ([widescreen.bg2d]). Three
     // instruction addresses in a 2D game's per-layer BG renderer (MMX6's
-    // FUN_800270d0): the column-count load/compare, the start tile-column mask, and the
-    // start screen-x shift, rewritten through the gpu.c psx_ws_mmx6_bg_* helpers
-    // so the loop draws the 16:9 reveal columns on both sides (identity at 4:3 /
-    // 512 hi-res). 0 = unset. Main-EXE addresses; verified by opcode at gen time.
+    // FUN_800270d0): the column-count load/compare, the start tile-column mask,
+    // and the start screen-x calculation (MMX6: li count + sra start; MMX4/MMX5:
+    // inline slti[u] count, sra or subu-zero start), rewritten through the gpu.c
+    // psx_ws_bg2d_* helpers so the loop draws the 16:9 reveal columns on both
+    // sides (identity at 4:3 / 512 hi-res). 0 = unset. Main-EXE addresses;
+    // verified by opcode at gen time.
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;
     uint32_t ws_bg2d_startx_site   = 0;

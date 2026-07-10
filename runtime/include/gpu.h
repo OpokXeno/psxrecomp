@@ -177,7 +177,7 @@ int  psx_ws_auto_cull_on(void);
 void gpu_ws_set_gte_game_mode(int on);
 void psx_ws_note_gte_project(int nverts);
 /* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
- * outer-third screen-space HUD sprites out to the true wide-frame corners
+ * outer-third screen-space HUD primitives out to the true wide-frame corners
  * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
 void gpu_ws_set_nw_hud_corners(int on);
 /* Targeted alternative for sprite-heavy 2D games: corner-anchor only primitives

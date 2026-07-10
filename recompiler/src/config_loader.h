@@ -506,7 +506,8 @@ struct GameConfig {
     // [widescreen] nw_left_hud_packet_lo / nw_left_hud_packet_hi — optional
     // half-open physical-RAM source range for a specifically identified HUD
     // pool. In native-wide, primitives from this pool anchor by screen third
-    // (left/right), without moving similarly placed scenery from other pools.
+    // (left/right), without moving similarly placed scenery from other pools
+    // (essential for pure-2D games whose world is also screen-space prims).
     // Both values must be present together. Runtime-only; no regen required.
     uint32_t ws_nw_left_hud_packet_lo = 0;
     uint32_t ws_nw_left_hud_packet_hi = 0;
@@ -543,9 +544,10 @@ struct GameConfig {
     // 16:9 reveal columns on both sides of the 320 view (see gpu.c
     // psx_ws_bg2d_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
     //   count_site:    either the `li rt,21` column-count load (addiu/ori), or
-    //                  the loop-closing `sltiu rt,index,21` bound compare.
+    //                  the loop-closing inline `slti[u] rt,index,21` bound
+    //                  compare (MMX4/MMX5).
     //   startcol_site: the `andi rt,rs,0x3f` start tile-column mask.
-    //   startx_site:   the `sra rd,rt,sa` start screen-x.
+    //   startx_site:   the `sra rd,rt,sa` or `subu rd,zero,rt` start screen-x.
     // 0 = unset (feature off). Verified by opcode at gen time.
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;
