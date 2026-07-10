@@ -1592,6 +1592,26 @@ void sw_wide_clear(int base_x, int y, int h, uint16_t color) {
     }
 }
 
+/* Clear only the synthetic columns outside the centred canonical framebuffer.
+ * This provides a defined black void without disturbing guest-owned pixels. */
+void sw_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
+    uint16_t *surf = wide_surf_for(base_x);
+    if (!surf) return;
+    int s = g_scale;
+    int W = g_wide_w * s;
+    int H = VRAM_HEIGHT * s;
+    int margin = g_wide_off * s;
+    int y0 = y * s, y1 = (y + h) * s;
+    if (margin <= 0 || margin * 2 >= W) return;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    for (int row = y0; row < y1; row++) {
+        uint16_t *dst = surf + (size_t)row * W;
+        if (sides & 1) for (int col = 0; col < margin; col++) dst[col] = color;
+        if (sides & 2) for (int col = W - margin; col < W; col++) dst[col] = color;
+    }
+}
+
 /* Present source: convert the wide surface for the displayed buffer (base_x) to
  * ARGB. Output is (g_wide_w*scale) wide × (disp_h*scale) tall. Returns 0 if no
  * surface exists for base_x (caller falls back to the canonical present). */

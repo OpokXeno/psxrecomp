@@ -98,6 +98,8 @@ void gr_wide_configure(int wide_w, int offset);
 void gr_wide_set_target(int base_x);
 void gr_wide_disable_target(void);
 void gr_wide_clear(int base_x, int y, int h, uint16_t color);
+/* sides: bit 0 = left synthetic margin, bit 1 = right. */
+void gr_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides);
 int  gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
 int  gr_render_wide_display(uint32_t *out, int pitch, int base_x,
                             int disp_y, int disp_h);
@@ -166,6 +168,7 @@ typedef struct GpuRenderBackend {
     void (*wide_set_target)(int base_x);
     void (*wide_disable_target)(void);
     void (*wide_clear)(int base_x, int y, int h, uint16_t color);
+    void (*wide_clear_margins)(int base_x, int y, int h, uint16_t color, int sides);
     int  (*render_wide_display)(uint32_t *out, int pitch, int base_x,
                                 int disp_y, int disp_h);
     /* Dump the ENTIRE wide compositor surface for base_x (all double-buffer

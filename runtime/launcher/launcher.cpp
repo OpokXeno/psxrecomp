@@ -110,6 +110,8 @@ struct LauncherModel {
     int  window_width    = 1280; // window size (height = width*den/num per aspect)
     bool widescreen      = false; // EXPERIMENTAL 16:9 native-wide (aspect_index==1)
     bool ws_eligible     = true;  // toggle shown only when renderer==software (native-wide is SW-only)
+    bool ultrawide       = false; // separate EXPERIMENTAL 21:9 choice
+    bool uw_eligible     = false; // per-game offer_ultrawide gate
     bool fullscreen      = false; // launch the game window in desktop fullscreen
     // Skip-launcher: boot straight into the game on subsequent launches. Turning
     // it ON shows a confirmation modal (show_skip_modal) so the user is told how
@@ -430,6 +432,7 @@ void refresh_labels(LauncherModel& m) {
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
+    m.ultrawide       = (m.aspect_index == 2);   // 21:9 is offered separately
     /* ws_eligible is set once at model init from GameInfo.ws_offered ([widescreen]
      * offer): renderer no longer matters (native-wide works on SW + GL), so
      * refresh must not overwrite the per-game gate. */
@@ -704,7 +707,10 @@ Result run(SDL_Window* window, void* gl_context,
     // offer=false: hide the toggle AND clamp a stale persisted 16:9 back to
     // 4:3 so the hack can't engage from an old settings.toml.
     m.ws_eligible    = game.ws_offered;
-    if (!game.ws_offered) m.aspect_index = 0;
+    m.uw_eligible    = game.ws_ultrawide_offered;
+    if (!game.ws_offered && m.aspect_index == 1) m.aspect_index = 0;
+    if (!game.ws_ultrawide_offered && m.aspect_index == 2)
+        m.aspect_index = game.ws_offered ? 1 : 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
@@ -782,6 +788,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("aspect_label",   &m.aspect_label);
     c.Bind("widescreen",     &m.widescreen);
     c.Bind("ws_eligible",    &m.ws_eligible);
+    c.Bind("ultrawide",      &m.ultrawide);
+    c.Bind("uw_eligible",    &m.uw_eligible);
     c.Bind("winsize_label",  &m.winsize_label);
     c.Bind("texfilter_label",&m.texfilter_label);
     c.Bind("bios_path",      &m.bios_path);
@@ -944,10 +952,10 @@ Result run(SDL_Window* window, void* gl_context,
     // Off => 4:3 (aspect_index 0). Works on BOTH renderers (SW + the GL wide
     // compositor), so it is no longer gated on the software renderer.
     //
-    // 21:9 (kAspects[2]) is STUBBED but intentionally hidden: the engine handles
+    // 21:9 (kAspects[2]) is separately gated per game. The engine handles
     // it (offset / cull / compositor are all aspect-derived), but the parallax +
     // far-backdrop pipeline only generates ~16:9 of coverage, so 21:9 voids the
-    // far background. When that pipeline is widened, promote this 2-state toggle
+    // far background. Titles opt in only after that pipeline is validated;
     // to a 3-way Off / 16:9 / 21:9 — the existing cycle_aspect callback already
     // cycles aspect_index 0/1/2 and is the scaffold for it.
     c.BindEventCallback("toggle_widescreen",
@@ -955,8 +963,18 @@ Result run(SDL_Window* window, void* gl_context,
             m.aspect_index = (m.aspect_index == 1) ? 0 : 1;    // 16:9 <-> 4:3
             refresh_labels(m);
             handle.DirtyVariable("widescreen");
+            handle.DirtyVariable("ultrawide");
             handle.DirtyVariable("aspect_label");
             handle.DirtyVariable("winsize_label");  /* height follows aspect */
+        });
+    c.BindEventCallback("toggle_ultrawide",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.aspect_index = (m.aspect_index == 2) ? 0 : 2;    // 21:9 <-> 4:3
+            refresh_labels(m);
+            handle.DirtyVariable("widescreen");
+            handle.DirtyVariable("ultrawide");
+            handle.DirtyVariable("aspect_label");
+            handle.DirtyVariable("winsize_label");
         });
     c.BindEventCallback("cycle_winsize",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {

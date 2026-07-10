@@ -389,6 +389,9 @@ button:hover { background-color: #232d3c; }
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
+			<div class="setting-row" data-if="uw_eligible"><span class="setting-name">Ultrawide <span class="exp">EXPERIMENTAL</span></span><span class="setting-control">
+				<button class="toggle" data-event-click="toggle_ultrawide"><span class="value" data-if="ultrawide">On</span><span class="value" data-if="ultrawide == false">Off</span></button>
+				<span class="ws-hint" data-if="ultrawide">21:9 native field-of-view</span></span></div>
 		</div>
 		</div>
 		<div class="settings-col">

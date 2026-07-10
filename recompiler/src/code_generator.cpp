@@ -2162,6 +2162,10 @@ GeneratedFunction CodeGenerator::generate_function(
         body_ss << config_.indent
                 << "psx_ws_sprite_tag(cpu);  /* widescreen: record prim ($a0) + anchor */\n";
     }
+    if (config_.ws_bg2d_init_func == func.start_addr) {
+        body_ss << config_.indent
+                << "psx_ws_mmx6_bg_stage_init();  /* widescreen: invalidate stale reveal at stage BG init */\n";
+    }
     if (config_.ws_backdrop_unsquash_funcs.count(func.start_addr)) {
         body_ss << config_.indent
                 << "gte_ws_set_suppress(1);  /* widescreen: un-squash far backdrop (8C) */\n";
@@ -2597,6 +2601,7 @@ std::string CodeGenerator::generate_file(
     ss << "extern void cosim_instr(uint32_t pc);\n";
     ss << "#endif\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
+    ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";

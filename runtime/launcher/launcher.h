@@ -41,6 +41,7 @@ struct GameInfo {
     int         locked_mode      = 2;        // PAD_MODE_DIGITAL; the mode forced when lock_mode is true
     bool        lock_device      = false;    // hide the Player 1/2 controller cards entirely (fixed, auto-bound pad type; e.g. Ape Escape DualShock)
     bool        ws_offered       = true;     // offer the EXPERIMENTAL Widescreen toggle (false = hidden, game ships 4:3 only)
+    bool        ws_ultrawide_offered = false; // separately offer experimental 21:9
 
     // Optional "Localization" dropdown. Populated from game.toml
     // [localization].languages. When non-empty the launcher shows a language

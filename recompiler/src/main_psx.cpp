@@ -133,7 +133,8 @@ int main(int argc, char** argv) {
                           ws_bg2d_stream_left_site = 0,
                           ws_bg2d_stream_right_site = 0,
                           ws_bg2d_bufbase_site = 0,
-                          ws_bg2d_cap_site = 0; // [widescreen.bg2d]
+                          ws_bg2d_cap_site = 0,
+                          ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -161,6 +162,7 @@ int main(int argc, char** argv) {
         if (cfg.ws_bg2d_stream_right_site) ws_bg2d_stream_right_site = cfg.ws_bg2d_stream_right_site;
         if (cfg.ws_bg2d_bufbase_site) ws_bg2d_bufbase_site = cfg.ws_bg2d_bufbase_site;
         if (cfg.ws_bg2d_cap_site)     ws_bg2d_cap_site     = cfg.ws_bg2d_cap_site;
+        if (cfg.ws_bg2d_init_func)    ws_bg2d_init_func    = cfg.ws_bg2d_init_func;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
         // settings, kept separate from game.toml/settings.toml). Best-effort:
@@ -231,6 +233,7 @@ int main(int argc, char** argv) {
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
         ws_auto_backdrop_preload = ws_auto_backdrop_preload || wscfg.ws_auto_backdrop_preload;
+        if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
     }
@@ -770,6 +773,7 @@ int main(int argc, char** argv) {
     codegen_config.split_mid_function_targets = !overlay_mode;
     codegen_config.overlay_mode = overlay_mode;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
+    codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;

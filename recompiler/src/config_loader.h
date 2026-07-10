@@ -422,6 +422,8 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Extra per-side actor overdraw beyond the visible widescreen edge.
+    int                   ws_cull_guard_pixels = 0;
 
     // [widescreen.cull] screen_w_imms / screen_h_imms — the width/height
     // immediates of the GTE screen-extent reject signature, per game (the
@@ -498,11 +500,25 @@ struct GameConfig {
     // inset by the reveal offset). Runtime-only — no regen. Off by default.
     bool ws_nw_hud_corners = false;
 
+    // [widescreen] nw_left_hud_packet_lo / nw_left_hud_packet_hi — optional
+    // half-open physical-RAM source range for a specifically identified HUD
+    // pool. In native-wide, primitives from this pool anchor by screen third
+    // (left/right), without moving similarly placed scenery from other pools.
+    // Both values must be present together. Runtime-only; no regen required.
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
+
     // [widescreen] nw_backdrop — in native-wide, stretch a screen-space quad
     // that covers the whole 4:3 framebuffer (sky gradient / backdrop image) to
     // fill the wide frame, so it stops pillarboxing at the reveal margins.
     // Runtime-only — no regen. Off by default.
     bool ws_nw_backdrop = false;
+
+    // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
+    // cleanup. A game-specific stage/map boundary can clear only proven-void
+    // sides while preserving the canonical 4:3 surface and guest VRAM. Runtime-
+    // only gate; any game-specific init hook remains regen-class. Off by default.
+    bool ws_clear_reveal = false;
 
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a
@@ -512,6 +528,11 @@ struct GameConfig {
     // 16:9 in settings.toml can never engage the hack. Runtime-only (read at
     // startup; no codegen impact) — no regen required.
     bool ws_offered = true;
+
+    // [widescreen] offer_ultrawide — expose a separate experimental 21:9
+    // launcher choice for titles that have explicitly tested it. Default off;
+    // ordinary widescreen offer remains the independent 16:9 choice.
+    bool ws_ultrawide_offered = false;
 
     // [widescreen.bg2d] — pure-2D background tile-loop widen (e.g. MMX6's
     // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
@@ -538,6 +559,10 @@ struct GameConfig {
     //   raised to match the bigger buffer. Together they cure the dense-stage overflow.
     uint32_t ws_bg2d_bufbase_site = 0;
     uint32_t ws_bg2d_cap_site     = 0;
+    //   init_func: full tile-ring initializer called only when an independent
+    //   layer's stage data is dirty. A callback at entry invalidates stale host
+    //   reveal pixels once before the new stage background is submitted.
+    uint32_t ws_bg2d_init_func    = 0;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

@@ -215,6 +215,9 @@ static int           g_video_aspect_den = 3;
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
 static bool          g_ws_hud_sprt = false;
+/* Runtime-only transition cleanup; kept out of gpu.h because generated game
+ * units include that ABI header and do not need this frontend-only setter. */
+extern "C" void gpu_ws_set_clear_reveal(int on);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -2248,6 +2251,7 @@ int main(int argc, char** argv) {
     int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
+    bool ws_ultrawide_offered = false;
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -2319,8 +2323,18 @@ int main(int argc, char** argv) {
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
+            /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
+            gpu_ws_set_nw_left_hud_packet_range(gc.ws_nw_left_hud_packet_lo,
+                                                gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
+             * cleanup of synthetic native-wide margins. */
+            gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
+            gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
+            gpu_ws_set_explicit_cull_sites(
+                gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
+                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp/sljit widen hooks. A title that never
              * opted in must never have its live code scanned and rewritten. */
@@ -2330,6 +2344,7 @@ int main(int argc, char** argv) {
                 gpu_ws_set_cull_imms(gc.ws_cull_w_imms.data(), (int)gc.ws_cull_w_imms.size(),
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
+            ws_ultrawide_offered = gc.ws_ultrawide_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -2600,6 +2615,12 @@ int main(int argc, char** argv) {
         g_video_aspect_num = 4;
         g_video_aspect_den = 3;
     }
+    if (!ws_ultrawide_offered && g_video_aspect_num * 9 == g_video_aspect_den * 21) {
+        std::fprintf(stdout, "psxrecomp: 21:9 is not offered for this title; clamping to %s\n",
+                     ws_offered ? "16:9" : "4:3");
+        g_video_aspect_num = ws_offered ? 16 : 4;
+        g_video_aspect_den = ws_offered ? 9 : 3;
+    }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
@@ -2731,6 +2752,7 @@ int main(int argc, char** argv) {
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
                     ginfo.lock_device      = ctrl_lock_device;
                     ginfo.ws_offered       = ws_offered;
+                    ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
                     for (const auto& lo : lang_menu_options)
                         ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());

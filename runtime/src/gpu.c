@@ -100,6 +100,7 @@ static int ws_engaged(void) { return ws_mode != 0; }
 /* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
 static int32_t ws_scale_about(int32_t x, int32_t ax);
 static int32_t ws_disp_w(void);
+static void ws_clear_all_reveal_margins(void);
 
 /* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
  * within the last couple of frames => the actor render funnel is running =>
@@ -113,6 +114,10 @@ static int32_t ws_disp_w(void);
  * engage (gpu_ws_set_full_2d); PSX_WS_FORCE_2D=1 forces it on for testing. */
 static int ws_full_2d = 0;
 void gpu_ws_set_full_2d(int on) { ws_full_2d = on ? 1 : 0; }
+static int ws_clear_reveal = 0;
+static int g_mmx6_void_sides = 0;
+static uint32_t g_mmx6_void_generation = 1;
+void gpu_ws_set_clear_reveal(int on) { ws_clear_reveal = on ? 1 : 0; }
 
 /* GTE-activity gameplay detector ([widescreen] gte_game_mode) — the generic
  * 3D-title analog of the sprite-tag stamp. A fully-3D game (e.g. Ape Escape)
@@ -221,7 +226,41 @@ int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
  * cull while still stretching; large = over-draw) at a fixed camera position.
  * -1 = normal computed margin. */
 static int ws_margin_override = -1;
+static int ws_cull_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
+void gpu_ws_set_cull_guard_pixels(int pixels) {
+    if (pixels < 0) pixels = 0;
+    if (pixels > 256) pixels = 256;
+    ws_cull_guard_pixels = pixels;
+}
+
+#define WS_EXPLICIT_CULL_SITES_MAX 64
+static uint32_t ws_explicit_bias_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_slti_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_bias_n = 0;
+static int ws_explicit_slti_n = 0;
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti) {
+    if (nbias < 0) nbias = 0;
+    if (nslti < 0) nslti = 0;
+    if (nbias > WS_EXPLICIT_CULL_SITES_MAX) nbias = WS_EXPLICIT_CULL_SITES_MAX;
+    if (nslti > WS_EXPLICIT_CULL_SITES_MAX) nslti = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_bias_n = nbias;
+    ws_explicit_slti_n = nslti;
+    for (int i = 0; i < nbias; i++) ws_explicit_bias_sites[i] = bias[i] & 0x1FFFFFFFu;
+    for (int i = 0; i < nslti; i++) ws_explicit_slti_sites[i] = slti[i] & 0x1FFFFFFFu;
+}
+static int ws_explicit_site(const uint32_t *sites, int n, uint32_t pc) {
+    uint32_t p = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < n; i++) if (sites[i] == p) return 1;
+    return 0;
+}
+int psx_ws_is_cull_bias_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_bias_sites, ws_explicit_bias_n, pc);
+}
+int psx_ws_is_cull_slti_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_slti_sites, ws_explicit_slti_n, pc);
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
@@ -230,7 +269,7 @@ int psx_ws_x_margin(void) {
      * that previously fell outside the 4:3 cull window; the wide compositor then
      * rasterizes it into the revealed margins. Same recompiler emit sites as the
      * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
-    if (ws_native_wide_active()) return ws_nw_offset();
+    if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
@@ -284,7 +323,10 @@ static int mmx6_hostside_active(void) {
  * hook fires at the start of each layer's render, so the first call of a new frame
  * re-streams the widened window for all 3 layers right before they are drawn. */
 static void mmx6_bg_refill_tick(void);   /* defined below (ring-freshness fix) */
-int psx_ws_mmx6_bg_cols(int base)    { mmx6_bg_refill_tick(); return mmx6_hostside_active() ? base : base + 2 * ws_mmx6_left_cols(); }
+int psx_ws_mmx6_bg_cols(int base)    {
+    mmx6_bg_refill_tick();
+    return mmx6_hostside_active() ? base : base + 2 * ws_mmx6_left_cols();
+}
 /* Start tile column: native under host-side mode; else LEFT earlier (64-col ring). */
 int psx_ws_mmx6_bg_startcol(int col) { return mmx6_hostside_active() ? col : ((col - ws_mmx6_left_cols()) & 0x3f); }
 /* Start screen-x: native under host-side mode; else LEFT*16 further left. */
@@ -302,6 +344,19 @@ int psx_ws_mmx6_bg_startx(int x)     { return mmx6_hostside_active() ? x : (x - 
  * there. The 64-col ring has ample slack (visible ~21 cols) for ±LEFT more. */
 int psx_ws_mmx6_bg_stream_left(int x)  { return x - ws_mmx6_left_cols() * 16; }
 int psx_ws_mmx6_bg_stream_right(int x) { return x + ws_mmx6_left_cols() * 16; }
+
+/* Called at entry to MMX6's full tile-ring initializer (FUN_800269F4). The
+ * independent layers invoke it only when stage/background data is dirty; gate
+ * by frame because up to three layers initialize together. This is the exact
+ * point where pixels retained from the old stage cease to be meaningful. */
+void psx_ws_mmx6_bg_stage_init(void) {
+    static uint32_t last_frame = 0xFFFFFFFFu;
+    uint32_t frame = (uint32_t)s_frame_count;
+    if (!ws_clear_reveal || ws_mode != 2 || frame == last_frame) return;
+    last_frame = frame;
+    g_mmx6_void_generation++;
+    ws_clear_all_reveal_margins();
+}
 
 /* ===== MMX6 BG packet-buffer RELOCATION ([widescreen.bg2d] bufbase_site/cap_site) ===
  * The widened BG render (29 cols) overruns the engine's BG packet double-buffer (driver
@@ -522,13 +577,26 @@ static int mmx6_fill_column(int layer, int worldX, int worldY, int write,
     int mapLeft  = psx_read_byte(lbase + 0x4d);
     int mapRight = psx_read_byte(lbase + 0x4e);
     int scrollX  = (int16_t)psx_read_half(lbase + 0xa);
+    /* C integer division toward zero makes worldX -255..-1 resolve to metatile
+     * column 0 below. The native 4:3 streamer never requests those coordinates,
+     * but the widened left window does at a stage starting on mapLeft. Treat
+     * them as finite-map void before the engine's loop/wrap bookkeeping. */
+    if (worldX < mapLeft * 0x100)
+        return 2;
     if ((uint32_t)metaCol < (uint32_t)mapLeft) {
         metaCol = metaCol + 1 + (mapRight - mapLeft);
-        if (scrollX <= (mapLeft - 1) * 0x100) return 0;                 /* engine early-return: skip */
+        if (scrollX <= (mapLeft - 1) * 0x100) {
+            /* The native renderer never sees this column, so the engine leaves
+             * its ring slot alone. Report finite-map void to the DMA-start
+             * cleanup without mutating ring slots canonical draws can alias. */
+            return 2;   /* finite-map void, not merely a normal streamed column */
+        }
     }
     if ((uint32_t)mapRight < (uint32_t)metaCol) {
         metaCol = (metaCol - 1 - mapRight) + mapLeft;
-        if ((mapRight + 1) * 0x100 <= scrollX) return 0;
+        if ((mapRight + 1) * 0x100 <= scrollX) {
+            return 2;
+        }
     }
     int mapW = psx_read_byte(0x800CD338u);
     int mapH = psx_read_byte(0x800CD339u);
@@ -582,13 +650,19 @@ void psx_ws_mmx6_bg_refill_all(void) {
     int left = ws_mmx6_left_cols();
     if (left <= 0) return;
     g_mmx6_refill_cols = 0;
+    g_mmx6_void_sides = 0;
     for (int layer = 0; layer < 3; layer++) {
         uint32_t lbase = 0x800971F8u + (uint32_t)layer * 0x54u;
         int sx = (int16_t)psx_read_half(lbase + 0xa);
         int sy = (int16_t)psx_read_half(lbase + 0xe);
         for (int ci = -left; ci <= 20 + left; ci++) {
-            if (mmx6_fill_column(layer, sx + ci * 16, sy - 0x10, 1, NULL, NULL))
+            int filled = mmx6_fill_column(layer, sx + ci * 16, sy - 0x10, 1, NULL, NULL);
+            if (filled)
                 g_mmx6_refill_cols++;
+            if (filled == 2) {
+                if (ci < 0) g_mmx6_void_sides |= 1;
+                if (ci > 20) g_mmx6_void_sides |= 2;
+            }
         }
     }
 }
@@ -1109,11 +1183,26 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
  * AND the game opts in, so 4:3 and non-opted titles are byte-identical.
  * Returns the signed x delta to add to the prim's x before draw_offset. */
 static int ws_nw_hud_corners = 0;
+static uint32_t ws_nw_left_hud_packet_lo = 0;
+static uint32_t ws_nw_left_hud_packet_hi = 0;
 void gpu_ws_set_nw_hud_corners(int on) { ws_nw_hud_corners = on ? 1 : 0; }
+void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi) {
+    ws_nw_left_hud_packet_lo = lo & 0x1FFFFFFFu;
+    ws_nw_left_hud_packet_hi = hi & 0x1FFFFFFFu;
+}
+static int ws_nw_left_hud_packet(void) {
+    if (!ws_native_wide_active() || gp0_cmd_source_addr == 0xFFFFFFFFu ||
+        ws_nw_left_hud_packet_hi <= ws_nw_left_hud_packet_lo)
+        return 0;
+    uint32_t a = gp0_cmd_source_addr & 0x1FFFFFFFu;
+    int matched = a >= ws_nw_left_hud_packet_lo && a < ws_nw_left_hud_packet_hi;
+    return matched;
+}
 static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
-    if (!ws_nw_hud_corners || !ws_native_wide_active()) return 0;
+    if (!ws_native_wide_active()) return 0;
     int32_t off = ws_nw_offset();
     if (off <= 0) return 0;
+    if (!ws_nw_left_hud_packet() && !ws_nw_hud_corners) return 0;
     int32_t W  = ws_disp_w();
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
@@ -1272,6 +1361,18 @@ static void ws_nw_sync_target(void) {
     if (ws_is_fb_base(base)) gr_wide_set_target((int)base);
     else                     gr_wide_disable_target();
 }
+
+static void ws_clear_all_reveal_margins(void) {
+    for (int i = 0; i < ws_fb_n; i++)
+        gr_wide_clear_margins((int)ws_fb_base[i], 0, 512, 0, 3);
+}
+
+/* Stage-init already clears both synthetic margins once. Do not keep clearing
+ * a guessed finite-map side here: MMX6's authored layers enter the reveal at
+ * different times, so the side guess produced a moving black trim over valid
+ * stage art. A stale reveal tile is safer than deleting submitted content. */
+void gpu_ws_begin_linked_list(void) { }
+
 
 /* Horizontal display range (GP1(06h)) */
 static uint32_t h_display_x1;
@@ -1818,6 +1919,14 @@ static void gp0_exec_shaded_quad(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    int32_t minx = vx[0], maxx = vx[0];
+    for (int i = 1; i < 4; i++) {
+        if (vx[i] < minx) minx = vx[i];
+        if (vx[i] > maxx) maxx = vx[i];
+    }
+    int32_t hud_dx = ws_nw_hud_shift(minx, maxx - minx);
+    if (hud_dx)
+        for (int i = 0; i < 4; i++) vx[i] += hud_dx;
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
@@ -2197,6 +2306,9 @@ static void gp0_exec_textured_16x16(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    /* Never suppress MMX6 BG packets at a guessed finite-map boundary. The
+     * classifier cannot distinguish an authored layer entering the reveal from
+     * a stale ring slot; suppressing here caused the stage-start black flicker. */
     int ws_w = ws_sprt_fixed_transform(&x0, 16);
     x0 += ws_nw_hud_shift(x0, 16);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
@@ -3255,7 +3367,16 @@ static void gp1_ack_irq1(void) {
 
 static void gp1_display_enable(uint32_t val) {
     /* GP1(03h): Display enable — bit 0: 0=on, 1=off */
-    display_disabled = val & 1;
+    uint32_t next_disabled = val & 1;
+    /* Native-wide reveal pixels have no guest-VRAM backing, so they cannot be
+     * reconstructed from the canonical framebuffer after a scene change. Treat
+     * the guest's ON->OFF transition as invalidation of those synthetic strips.
+     * This is deliberately transition-scoped: MMX6 retains valid background
+     * pixels across ordinary frames, so per-frame clearing pillarboxes gameplay. */
+    if (ws_clear_reveal && next_disabled && !display_disabled && ws_mode == 2) {
+        ws_clear_all_reveal_margins();
+    }
+    display_disabled = next_disabled;
 }
 
 static void gp1_dma_direction(uint32_t val) {

@@ -2740,6 +2740,48 @@ static void vkb_wide_clear(int base_x, int y, int h, uint16_t color) {
     end_oneshot(cb);
 }
 
+/* Clear only the two synthetic reveal strips, leaving the guest-owned centre
+ * intact. Mirrors the software/OpenGL opt-in transition cleanup. */
+static void vkb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
+    if (!s_ready || s_wide_w <= 0 || s_wide_offset <= 0) return;
+    flush_tex_batch(); flush_geometry();
+    int i = wide_surf_for(base_x);
+    if (i < 0) return;
+    s_perf_cur.wide_clears++;
+    int S = s_scale, H = VRAM_H * S;
+    int W = s_wide_w * S, margin = s_wide_offset * S;
+    int y0 = y * S, y1 = (y + h) * S;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (y1 <= y0 || margin * 2 >= W) return;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderArea.extent.width = (uint32_t)W;
+    rp.renderArea.extent.height = (uint32_t)H;
+    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearAttachment ca[2] = {0};
+    ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca[0].colorAttachment = 0;
+    ca[0].clearValue.color.float32[0] = (float)((color)       & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[1] = (float)((color >> 5)  & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[2] = (float)((color >> 10) & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[3] = (color >> 15) & 1 ? 1.0f : 0.0f;
+    ca[1].aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    ca[1].clearValue.depthStencil.depth = 0.0f;
+    ca[1].clearValue.depthStencil.stencil = (color >> 15) & 1;
+    VkClearRect cr[2];
+    uint32_t ncr = 0;
+    if (sides & 1)
+        cr[ncr++] = (VkClearRect){ { { 0, y0 }, { (uint32_t)margin, (uint32_t)(y1 - y0) } }, 0, 1 };
+    if (sides & 2)
+        cr[ncr++] = (VkClearRect){ { { W - margin, y0 }, { (uint32_t)margin, (uint32_t)(y1 - y0) } }, 0, 1 };
+    if (ncr) p_vkCmdClearAttachments(cb, 2, ca, ncr, cr);
+    p_vkCmdEndRenderPass(cb);
+    end_oneshot(cb);
+}
+
 /* Present source (CPU): read the wide surface band for the displayed buffer
  * into an ARGB8888 buffer, byte-compatible with sw_render_wide_display — used
  * by the shared CPU present fallback and the ws debug dump. The GPU-direct
@@ -2821,6 +2863,7 @@ static const GpuRenderBackend VK_BACKEND = {
     .wide_set_target               = vkb_wide_set_target,
     .wide_disable_target           = vkb_wide_disable_target,
     .wide_clear                    = vkb_wide_clear,
+    .wide_clear_margins            = vkb_wide_clear_margins,
     .render_wide_display           = vkb_render_wide_display,
 };
 
