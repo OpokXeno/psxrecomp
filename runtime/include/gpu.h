@@ -114,6 +114,15 @@ int psx_ws_mmx6_bg_startcol(int col);
 int psx_ws_mmx6_bg_startx(int x);
 int psx_ws_mmx6_bg_stream_left(int x);
 int psx_ws_mmx6_bg_stream_right(int x);
+/* Generic Capcom 2D variant used by MMX4/MMX5. Those revisions keep the
+ * 21-column loop bound in an inline slti/sltiu and use a 32-column tile ring.
+ * Unlike the MMX6-specialized helpers above, these do not touch MMX6's
+ * hard-coded host-side refill state. */
+int psx_ws_bg2d_cols(int base);
+int psx_ws_bg2d_startcol(int col, uint32_t mask);
+int psx_ws_bg2d_startx(int x);
+int psx_ws_bg2d_stream_left(int x);
+int psx_ws_bg2d_stream_right(int x);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
 
@@ -161,9 +170,12 @@ int  psx_ws_auto_cull_on(void);
 void gpu_ws_set_gte_game_mode(int on);
 void psx_ws_note_gte_project(int nverts);
 /* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
- * outer-third screen-space HUD sprites out to the true wide-frame corners
- * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
+ * outer-third screen-space HUD primitives out to the true wide-frame corners
+ * (they otherwise sit inset by the reveal). An optional half-open GP0 command
+ * source range limits this to a game's dedicated HUD packet arena; 0/0 keeps
+ * the legacy unfiltered behavior. Runtime-only. Off by default. */
 void gpu_ws_set_nw_hud_corners(int on);
+void gpu_ws_set_nw_hud_source_range(uint32_t lo, uint32_t hi);
 /* Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop):
  * stretch a screen-space quad that covers the whole 4:3 framebuffer (sky
  * gradient / backdrop image) to fill the wide frame, so it no longer

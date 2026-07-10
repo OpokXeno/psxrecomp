@@ -410,8 +410,9 @@ struct GameConfig {
     // ~the half-extra-width when stretching) into the relevant immediates:
     //   cull_bias_sites:  an addiu rT,rS,imm → rT = rS + (imm + margin)
     //   cull_range_sites: an sltiu rT,rS,imm → rT = rS <u (imm + 2*margin)
-    //   cull_a1_sites:    a nop (load/branch-delay) → a1 += margin (for the
-    //                     caller-supplied-margin classifier variants)
+    //   cull_a1_sites:    a nop (load/branch-delay) -> a1 += margin, or a
+    //                     move rd,a1 -> rd = a1 + margin (caller-supplied
+    //                     horizontal-margin classifier variants)
     // All Ghidra-evidenced; empty by default. Changing these requires a regen.
     std::vector<uint32_t> ws_cull_bias_sites;
     std::vector<uint32_t> ws_cull_range_sites;
@@ -498,6 +499,14 @@ struct GameConfig {
     // inset by the reveal offset). Runtime-only — no regen. Off by default.
     bool ws_nw_hud_corners = false;
 
+    // Optional GP0 command-source filter for nw_hud_corners. When both values
+    // are nonzero, only primitives whose command word was DMA-read from the
+    // half-open guest range [lo, hi) are re-anchored. This lets pure-2D games
+    // move their HUD without also moving ordinary world sprites in the outer
+    // thirds. Runtime-only; 0/0 preserves the legacy unfiltered behavior.
+    uint32_t ws_nw_hud_source_lo = 0;
+    uint32_t ws_nw_hud_source_hi = 0;
+
     // [widescreen] nw_backdrop — in native-wide, stretch a screen-space quad
     // that covers the whole 4:3 framebuffer (sky gradient / backdrop image) to
     // fill the wide frame, so it stops pillarboxing at the reveal margins.
@@ -518,9 +527,10 @@ struct GameConfig {
     // whose column count and loop start are rewritten so the loop draws the
     // 16:9 reveal columns on both sides of the 320 view (see gpu.c
     // psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
-    //   count_site:    the `li rt,21` column-count load (addiu/ori).
+    //   count_site:    the `li rt,21` column-count load (addiu/ori), or the
+    //                  inline `slti[u] rt,rs,21` loop compare (MMX4/MMX5).
     //   startcol_site: the `andi rt,rs,0x3f` start tile-column mask.
-    //   startx_site:   the `sra rd,rt,sa` start screen-x.
+    //   startx_site:   the `sra rd,rt,sa` or `subu rd,zero,rt` start screen-x.
     // 0 = unset (feature off). Verified by opcode at gen time.
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;

@@ -697,6 +697,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_full_2d = false;
     bool ws_gte_game_mode = false;
     bool ws_nw_hud_corners = false;
+    uint32_t ws_nw_hud_source_lo = 0;
+    uint32_t ws_nw_hud_source_hi = 0;
     bool ws_nw_backdrop = false;
     bool ws_offered = true;
     if (cfg.contains("widescreen")) {
@@ -724,6 +726,19 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
         if (ws.contains("nw_hud_corners"))
             ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
+        if (ws.contains("nw_hud_source_lo"))
+            ws_nw_hud_source_lo = parse_hex(
+                toml::find<std::string>(ws, "nw_hud_source_lo"),
+                "widescreen.nw_hud_source_lo");
+        if (ws.contains("nw_hud_source_hi"))
+            ws_nw_hud_source_hi = parse_hex(
+                toml::find<std::string>(ws, "nw_hud_source_hi"),
+                "widescreen.nw_hud_source_hi");
+        if ((ws_nw_hud_source_lo == 0) != (ws_nw_hud_source_hi == 0) ||
+            (ws_nw_hud_source_lo && ws_nw_hud_source_hi <= ws_nw_hud_source_lo))
+            throw std::runtime_error(fmt::format(
+                "{}: [widescreen] nw_hud_source_lo/hi must define a non-empty range",
+                config_path.string()));
         if (ws.contains("nw_backdrop"))
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
         if (ws.contains("offer"))
@@ -847,6 +862,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_full_2d*/            ws_full_2d,
         /*ws_gte_game_mode*/      ws_gte_game_mode,
         /*ws_nw_hud_corners*/     ws_nw_hud_corners,
+        /*ws_nw_hud_source_lo*/   ws_nw_hud_source_lo,
+        /*ws_nw_hud_source_hi*/   ws_nw_hud_source_hi,
         /*ws_nw_backdrop*/        ws_nw_backdrop,
         /*ws_offered*/            ws_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,

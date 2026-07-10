@@ -2160,6 +2160,8 @@ int main(int argc, char** argv) {
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
             gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
+            gpu_ws_set_nw_hud_source_range(gc.ws_nw_hud_source_lo,
+                                           gc.ws_nw_hud_source_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
             /* [widescreen.cull] per-game gates + signature immediates for the

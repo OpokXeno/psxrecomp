@@ -303,6 +303,21 @@ int psx_ws_mmx6_bg_startx(int x)     { return mmx6_hostside_active() ? x : (x - 
 int psx_ws_mmx6_bg_stream_left(int x)  { return x - ws_mmx6_left_cols() * 16; }
 int psx_ws_mmx6_bg_stream_right(int x) { return x + ws_mmx6_left_cols() * 16; }
 
+/* Generic Capcom 2D background hooks (MMX4/MMX5 engine revisions).
+ *
+ * These games share MMX6's 21x16, three-layer renderer, but the loop bound is
+ * an inline sltiu and the tile ring is 32 columns rather than 64. Keep the
+ * ring mask as an emitted argument and deliberately avoid MMX6's host-side
+ * refill, whose guest addresses are title-specific. The guest stream-edge
+ * hooks below keep the widened ring window populated. */
+int psx_ws_bg2d_cols(int base) { return base + 2 * ws_mmx6_left_cols(); }
+int psx_ws_bg2d_startcol(int col, uint32_t mask) {
+    return (col - ws_mmx6_left_cols()) & (int)mask;
+}
+int psx_ws_bg2d_startx(int x) { return x - ws_mmx6_left_cols() * 16; }
+int psx_ws_bg2d_stream_left(int x) { return x - ws_mmx6_left_cols() * 16; }
+int psx_ws_bg2d_stream_right(int x) { return x + ws_mmx6_left_cols() * 16; }
+
 /* ===== MMX6 BG packet-buffer RELOCATION ([widescreen.bg2d] bufbase_site/cap_site) ===
  * The widened BG render (29 cols) overruns the engine's BG packet double-buffer (driver
  * base 0x800B91C0, stride 0x4000 = 1024 tile slots/buffer) and its per-frame 1000-tile cap
@@ -1101,17 +1116,32 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
  * ws_nw_offset() per side (the reveal). Screen-space 2D HUD (drawn with fixed
  * rect/sprite GP0 commands, never through the GTE — a 3D title's world is all
  * polygons) therefore lands inset from the true wide edges by exactly the
- * reveal. This pushes an outer-third HUD element the rest of the way to its
+ * reveal. This pushes an outer-third HUD primitive the rest of the way to its
  * wide corner with an additive thirds shift: left third −offset, right third
  * +offset, middle unchanged (matches the squash-path ws_hud_pivot geometry, but
  * as a translate since native-wide does not squash). Composite pieces in one
- * zone share a shift and stay aligned. Identity unless native-wide is engaged
- * AND the game opts in, so 4:3 and non-opted titles are byte-identical.
+ * zone share a shift and stay aligned. A configured command-source range lets
+ * pure-2D games opt in only their HUD packet arena, leaving world primitives
+ * untouched. Identity unless native-wide is engaged AND the game opts in, so
+ * 4:3 and non-opted titles are byte-identical.
  * Returns the signed x delta to add to the prim's x before draw_offset. */
 static int ws_nw_hud_corners = 0;
+static uint32_t ws_nw_hud_source_lo = 0;
+static uint32_t ws_nw_hud_source_hi = 0;
 void gpu_ws_set_nw_hud_corners(int on) { ws_nw_hud_corners = on ? 1 : 0; }
+void gpu_ws_set_nw_hud_source_range(uint32_t lo, uint32_t hi) {
+    ws_nw_hud_source_lo = lo & 0x1FFFFFFFu;
+    ws_nw_hud_source_hi = hi & 0x1FFFFFFFu;
+}
+static int ws_nw_hud_source_matches(void) {
+    if (ws_nw_hud_source_lo == 0 && ws_nw_hud_source_hi == 0) return 1;
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    uint32_t a = gp0_cmd_source_addr & 0x1FFFFFFFu;
+    return a >= ws_nw_hud_source_lo && a < ws_nw_hud_source_hi;
+}
 static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
     if (!ws_nw_hud_corners || !ws_native_wide_active()) return 0;
+    if (!ws_nw_hud_source_matches()) return 0;
     int32_t off = ws_nw_offset();
     if (off <= 0) return 0;
     int32_t W  = ws_disp_w();
@@ -1119,6 +1149,20 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
     if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
     if (3 * cx > 4 * W) return  off;   /* right third -> push to right edge */
     return 0;                          /* middle third -> stay centred      */
+}
+
+/* Re-anchor every X coordinate of a HUD polygon as one rigid composite. The
+ * command-source filter above is what makes this safe for pure-2D titles: only
+ * the game's dedicated HUD packet arena reaches here, never world polygons. */
+static void ws_nw_hud_shift_vertices(int32_t *vx, int count) {
+    if (count <= 0) return;
+    int32_t lo = vx[0], hi = vx[0];
+    for (int i = 1; i < count; i++) {
+        if (vx[i] < lo) lo = vx[i];
+        if (vx[i] > hi) hi = vx[i];
+    }
+    int32_t d = ws_nw_hud_shift(lo, hi - lo);
+    if (d) for (int i = 0; i < count; i++) vx[i] += d;
 }
 
 /* ---- Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop) ---
@@ -1759,6 +1803,9 @@ static void gp0_exec_mono_tri(void) {
     int32_t vx[3], vy[3];
     for (int i = 0; i < 3; i++) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+    }
+    ws_nw_hud_shift_vertices(vx, 3);
+    for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
@@ -1774,6 +1821,7 @@ static void gp0_exec_mono_quad(void) {
     for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (no-op else) */
+    ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -1792,6 +1840,9 @@ static void gp0_exec_shaded_tri(void) {
     for (int i = 0; i < 3; i++) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
+    }
+    ws_nw_hud_shift_vertices(vx, 3);
+    for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
@@ -1819,6 +1870,7 @@ static void gp0_exec_shaded_quad(void) {
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
+    ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -1895,6 +1947,7 @@ static void gp0_exec_textured_tri(void) {
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);
 
+    ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -1938,6 +1991,7 @@ static void gp0_exec_textured_quad(void) {
             for (int i = 0; i < 4; i++) vx[i] = ws_scale_about(vx[i], ws_ax);
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop image stretch (no-op else) */
+    ws_nw_hud_shift_vertices(vx, 4);
 
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
@@ -2005,6 +2059,7 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);
 
+    ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -2044,6 +2099,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);
 
+    ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -2067,6 +2123,9 @@ static void gp0_exec_mono_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
+    int32_t vx[2] = { x0, x1 };
+    ws_nw_hud_shift_vertices(vx, 2);
+    x0 = vx[0]; x1 = vx[1];
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -2081,6 +2140,9 @@ static void gp0_exec_shaded_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
+    int32_t vx[2] = { x0, x1 };
+    ws_nw_hud_shift_vertices(vx, 2);
+    x0 = vx[0]; x1 = vx[1];
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -2097,6 +2159,7 @@ static void gp0_exec_mono_rect(void) {
     int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
+    x0 += ws_nw_hud_shift(x0, w);
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, w, h, color);
@@ -2150,6 +2213,7 @@ static void gp0_exec_mono_dot(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
+    x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x, y, 1, 1, color);
@@ -2185,6 +2249,7 @@ static void gp0_exec_mono_8x8(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    x0 += ws_nw_hud_shift(x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, 8, 8, color);
