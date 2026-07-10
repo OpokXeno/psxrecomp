@@ -7163,6 +7163,158 @@ static void handle_get_snapshots(int id, const char *json)
  * the old "screenshot" inline-hex-row variant streamed h+1 response lines
  * per request, which violated the one-request/one-response protocol and
  * poisoned every client connection that used it. */
+/* ---- Always-on display ring ----------------------------------------------
+ * The last DISP_RING_CAP vblanks' display areas, raw 15-bit VRAM halfwords,
+ * captured in debug_server_record_frame (ring-buffer rule: continuous
+ * capture, observers query a window after the fact). Purpose: FRAME-EXACT
+ * screenshots. `screenshot_file` returns whatever is displayed when the
+ * command lands — 1-3 frames after the `frame` query that named it — which
+ * makes cross-renderer same-frame diffing impossible. With this ring, two
+ * deterministic runs (GL vs software) can each serve the display for the
+ * SAME frame number, giving a pixel-exact renderer-divergence census.
+ * GL reads GPU-side truth via the fbo peek; software reads CPU VRAM (its
+ * authoritative surface). depth24 scanout frames are tagged and refused
+ * (15-bit only). */
+#define DISP_RING_CAP   64    /* full-VRAM entries are 1MB each; 32 frames of
+                               * lookback (~0.3-0.5s) for exact-frame forensics */
+#define DISP_RING_MAX_W 640
+#define DISP_RING_MAX_H 256
+/* Full-VRAM aux capture alongside the display: the entire 1024x512 raw VRAM
+ * as the renderer sees it at this frame (GL: FBO truth; SW: CPU truth), so an
+ * offline client can micro-cosim ANY prim of the frame — rasterize it from
+ * the GP0 ring against the exact same-frame texels/CLUTs — and attribute a
+ * bad pixel to sampling vs content. Streamed texture pages and palette
+ * cycling make later peeks worthless; only a same-frame capture is evidence. */
+typedef struct {
+    uint32_t frame;
+    uint16_t w, h;
+    uint8_t  depth24, valid;
+    uint16_t *px;                 /* DISP_RING_MAX_W*DISP_RING_MAX_H halfwords */
+    uint16_t *vram;               /* full 1024x512 */
+} DispRingEntry;
+static DispRingEntry s_disp_ring[DISP_RING_CAP];
+static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
+
+static void disp_ring_capture(void)
+{
+    if (!s_disp_ring_px) {
+        size_t per  = (size_t)DISP_RING_MAX_W * DISP_RING_MAX_H;
+        size_t vram = (size_t)1024 * 512;
+        s_disp_ring_px = (uint16_t *)malloc(DISP_RING_CAP * (per + vram) * sizeof(uint16_t));
+        if (!s_disp_ring_px) return;
+        for (int i = 0; i < DISP_RING_CAP; i++) {
+            uint16_t *base = s_disp_ring_px + (size_t)i * (per + vram);
+            s_disp_ring[i].px   = base;
+            s_disp_ring[i].vram = base + per;
+        }
+    }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)(s_frame_count % DISP_RING_CAP)];
+    e->frame = (uint32_t)s_frame_count;
+    e->valid = 0;
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) return;
+    uint32_t w = di.width, h = di.height;
+    if (w > DISP_RING_MAX_W) w = DISP_RING_MAX_W;
+    if (h > DISP_RING_MAX_H) h = DISP_RING_MAX_H;
+    e->w = (uint16_t)w; e->h = (uint16_t)h;
+    e->depth24 = (uint8_t)(di.depth24 ? 1 : 0);
+    /* GPU-side truth when the GL raster pipeline is live (scissored pack of
+     * just the display rect + one small readback); CPU VRAM otherwise (the
+     * software backend's authoritative surface). Runs on the present thread,
+     * where the GL context is current. */
+    extern int gl_renderer_fbo_peek(int x, int y, int w_, int h_, uint16_t *out);
+    int got = 0;
+    if (di.display_x + w <= 1024 && di.display_y + h <= 512)
+        got = gl_renderer_fbo_peek((int)di.display_x, (int)di.display_y,
+                                   (int)w, (int)h, e->px);
+    if (!got) {
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++)
+                e->px[y * w + x] =
+                    gpu_vram_peek((int)(di.display_x + x), (int)(di.display_y + y));
+    }
+    /* Full-VRAM aux capture (same GL-truth/CPU-truth split as the display). */
+    if (!gl_renderer_fbo_peek(0, 0, 1024, 512, e->vram)) {
+        const uint16_t *v = gpu_get_vram();
+        memcpy(e->vram, v, (size_t)1024 * 512 * sizeof(uint16_t));
+    }
+    e->valid = 1;
+}
+
+/* Dump an entry's full-VRAM capture as a raw little-endian u16 blob
+ * (1024x512 row-major). */
+static void handle_display_ring_aux(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path"); return;
+    }
+    if (!s_disp_ring_px) { send_err(id, "display ring not started"); return; }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)((uint64_t)f % DISP_RING_CAP)];
+    if (!e->valid || e->frame != (uint32_t)f) {
+        send_err(id, "frame not in display ring"); return;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { send_err(id, "cannot open file"); return; }
+    size_t n1 = fwrite(e->vram, sizeof(uint16_t), (size_t)1024 * 512, fp);
+    fclose(fp);
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"path\":\"%s\","
+             "\"vram_words\":%u}", id, f, path, (unsigned)n1);
+}
+
+static void handle_display_ring_stats(int id, const char *json)
+{
+    (void)json;
+    uint32_t oldest = 0, newest = 0;
+    int n = 0;
+    for (int i = 0; i < DISP_RING_CAP; i++) {
+        if (!s_disp_ring_px || !s_disp_ring[i].valid) continue;
+        uint32_t f = s_disp_ring[i].frame;
+        if (n == 0 || f < oldest) oldest = f;
+        if (n == 0 || f > newest) newest = f;
+        n++;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"capacity\":%d,\"valid\":%d,"
+             "\"oldest_frame\":%u,\"newest_frame\":%u}",
+             id, DISP_RING_CAP, n, oldest, newest);
+}
+
+static void handle_display_ring_get(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path"); return;
+    }
+    if (!s_disp_ring_px) { send_err(id, "display ring not started"); return; }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)((uint64_t)f % DISP_RING_CAP)];
+    if (!e->valid || e->frame != (uint32_t)f) {
+        send_err(id, "frame not in display ring"); return;
+    }
+    if (e->depth24) { send_err(id, "frame is 24bpp scanout (unsupported)"); return; }
+    uint32_t w = e->w, h = e->h;
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { send_err(id, "alloc failed"); return; }
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint16_t p = e->px[i];
+        rgb[i * 3 + 0] = (uint8_t)((p & 0x1F) << 3);
+        rgb[i * 3 + 1] = (uint8_t)(((p >> 5) & 0x1F) << 3);
+        rgb[i * 3 + 2] = (uint8_t)(((p >> 10) & 0x1F) << 3);
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(fp, rgb, w, h);
+    free(rgb);
+    fclose(fp);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"path\":\"%s\","
+             "\"width\":%u,\"height\":%u}", id, f, path, w, h);
+}
+
 static void handle_screenshot_file(int id, const char *json)
 {
     /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
@@ -11421,6 +11573,9 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "display_ring_get",  handle_display_ring_get },
+    { "display_ring_aux",  handle_display_ring_aux },
+    { "display_ring_stats", handle_display_ring_stats },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
@@ -12105,6 +12260,10 @@ void debug_server_record_frame(void)
 
     /* Last function */
     strcpy(r->last_func, "(no tracking)");
+
+    /* Always-on display ring: raw display-area pixels for THIS frame number
+     * (pre-increment, matching what the `frame` command reports right now). */
+    disp_ring_capture();
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;

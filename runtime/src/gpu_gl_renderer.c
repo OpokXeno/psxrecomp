@@ -1380,34 +1380,9 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
     gpu_geometry(GL_LINES, xs, ys, cs, 2, semi);
 }
 
-/* Per-prim uv sampling bounds (inclusive), Beetle-PSX model: filtered
- * neighbours (and S>1 interpolation overshoot) clamp to these so a sample
- * never reads outside the prim's own texture rect. For axis-aligned (2D)
- * uv mappings — any zero uv derivative — the max-uv vertex is an exclusive
- * edge whose texel the PS1 DDA never samples, so back it off by one. If the
- * uv range crosses a 256 wrap boundary the prim relies on page wrapping and
- * the bounds widen to the full page (clamp disabled). */
-static void tri_uv_limits(const int *xs, const int *ys,
-                          const int *us, const int *vs, int lim[4]) {
-    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
-    for (int i = 1; i < 3; i++) {
-        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
-        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
-    }
-    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
-    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
-    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
-    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
-    if (dudx == 0 || dudy == 0 || dvdx == 0 || dvdy == 0) {
-        if (hi_u > lo_u) hi_u--;
-        if (hi_v > lo_v) hi_v--;
-    }
-    if ((lo_u >> 8) == (hi_u >> 8)) { lo_u &= 255; hi_u &= 255; }
-    else                            { lo_u = 0; hi_u = 255; }
-    if ((lo_v >> 8) == (hi_v >> 8)) { lo_v &= 255; hi_v &= 255; }
-    else                            { lo_v = 0; hi_v = 255; }
-    lim[0] = lo_u; lim[1] = lo_v; lim[2] = hi_u; lim[3] = hi_v;
-}
+/* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
+ * implementation for GL/VK/SW, see gpu_uv.h. */
+#include "gpu_uv.h"
 
 /* Textured triangle. Always two passes split by the per-texel STP bit so the
  * stencil (mask) write value is constant within each pass; the semi pass is
@@ -1419,7 +1394,18 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
                                   int semi, const int *lim) {
     int lim_buf[4];
-    if (!lim) { tri_uv_limits(xs, ys, us, vs, lim_buf); lim = lim_buf; }
+    int uv_buf[6];
+    if (!lim) {
+        /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
+         * center-sampling mirror compensation (rect prims arrive with their
+         * own precomputed lim and pre-bumped uvs). */
+        int *mu = uv_buf, *mv = uv_buf + 3;
+        for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+        psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
+        psx_uv_tri_mirror_offset(xs, ys, mu, mv);
+        us = mu; vs = mv;
+        lim = lim_buf;
+    }
     s_scene_prims_tex++;
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;
@@ -1556,18 +1542,13 @@ static void gpu_textured_rect(int x,int y,int w,int h,
     if (w <= 0 || h <= 0) return;
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
-    /* uv sampling bounds: forward mappings sample [u0, u1-1] (u1 is the
-     * exclusive edge); mirrored ones keep the full inclusive range. Crossing
-     * a 256 boundary means page wrap — widen to the full page. */
+    /* gpu.c routes axis-aligned MIRRORED quads (X/Y-flipped 2D sprites,
+     * e.g. right-facing MMX entities) through THIS path as scaled rects
+     * with u0>u1 / v0>v1 — they never reach the poly path. Exact bounds
+     * from the original corners, then the mirror bump (see gpu_uv.h). */
     int lim[4];
-    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
-    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
-    if (lim[2] < lim[0]) lim[2] = lim[0];
-    if (lim[3] < lim[1]) lim[3] = lim[1];
-    if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; }
-    else                                { lim[0] = 0; lim[2] = 255; }
-    if ((lim[1] >> 8) == (lim[3] >> 8)) { lim[1] &= 255; lim[3] &= 255; }
-    else                                { lim[1] = 0; lim[3] = 255; }
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
     gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);

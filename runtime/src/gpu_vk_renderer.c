@@ -2515,27 +2515,9 @@ static void flush_tex_batch(void) {
     s_gpu_dirty = 1;
 }
 
-/* Per-prim uv sampling bounds (inclusive), Beetle-PSX model — see the GL
- * backend's tri_uv_limits. */
-static void tri_uv_limits(const int *xs, const int *ys,
-                          const int *us, const int *vs, int lim[4]) {
-    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
-    for (int i = 1; i < 3; i++) {
-        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
-        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
-    }
-    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
-    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
-    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
-    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
-    if (dudx == 0 || dudy == 0 || dvdx == 0 || dvdy == 0) {
-        if (hi_u > lo_u) hi_u--;
-        if (hi_v > lo_v) hi_v--;
-    }
-    if ((lo_u >> 8) == (hi_u >> 8)) { lo_u &= 255; hi_u &= 255; } else { lo_u = 0; hi_u = 255; }
-    if ((lo_v >> 8) == (hi_v >> 8)) { lo_v &= 255; hi_v &= 255; } else { lo_v = 0; hi_v = 255; }
-    lim[0] = lo_u; lim[1] = lo_v; lim[2] = hi_u; lim[3] = hi_v;
-}
+/* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
+ * implementation for GL/VK/SW, see gpu_uv.h. */
+#include "gpu_uv.h"
 
 /* Append a textured triangle to the batch (per-prim state in the vertex; flush
  * first if the batch keys differ or the raw mirror needs packing). col = 3x RGB
@@ -2546,7 +2528,18 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
                                   int semi, const int *lim) {
     if (!s_ready) return;
     int lim_buf[4];
-    if (!lim) { tri_uv_limits(xs, ys, us, vs, lim_buf); lim = lim_buf; }
+    int uv_buf[6];
+    if (!lim) {
+        /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
+         * center-sampling mirror compensation (rect prims arrive with their
+         * own precomputed lim and pre-bumped uvs). */
+        int *mu = uv_buf, *mv = uv_buf + 3;
+        for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+        psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
+        psx_uv_tri_mirror_offset(xs, ys, mu, mv);
+        us = mu; vs = mv;
+        lim = lim_buf;
+    }
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
@@ -2602,13 +2595,12 @@ static void gpu_textured_rect(int x,int y,int w,int h, int u0,int v0,int u1,int 
     if (w <= 0 || h <= 0) return;
     float mr = s_mod_r/255.0f, mg = s_mod_g/255.0f, mb = s_mod_b/255.0f;
     float col[9] = { mr,mg,mb, mr,mg,mb, mr,mg,mb };
+    /* Mirrored quads arrive here as scaled rects with u0>u1 / v0>v1 (see
+     * the GL backend): exact bounds from the original corners, then the
+     * mirror bump (gpu_uv.h). */
     int lim[4];
-    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
-    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
-    if (lim[2] < lim[0]) lim[2] = lim[0];
-    if (lim[3] < lim[1]) lim[3] = lim[1];
-    if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; } else { lim[0] = 0; lim[2] = 255; }
-    if ((lim[1] >> 8) == (lim[3] >> 8)) { lim[1] &= 255; lim[3] &= 255; } else { lim[1] = 0; lim[3] = 255; }
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
     gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
