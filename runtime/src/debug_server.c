@@ -6703,6 +6703,18 @@ static void handle_clear_input(int id, const char *json)
     send_ok(id);
 }
 
+/* Live A/B for the native-wide HUD corner gate:
+ *   {"cmd":"ws_hud_mode","tag_rects":0|1}
+ * tag_rects=1 lets TAGGED rect-family prims re-anchor too (Tomba's AP
+ * counter renders through the tagged sprite funnel). */
+static void handle_ws_hud_mode(int id, const char *json)
+{
+    int v = json_get_int(json, "tag_rects", -1);
+    if (v < 0) { send_err(id, "missing tag_rects (0|1)"); return; }
+    gpu_ws_set_nw_hud_tag_rects(v);
+    send_fmt("{\"id\":%d,\"ok\":true,\"tag_rects\":%d}", id, v ? 1 : 0);
+}
+
 static void handle_ws_margin(int id, const char *json)
 {
     int v = json_get_int(json, "value", -2);
@@ -11765,6 +11777,7 @@ static const CmdEntry s_commands[] = {
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
+    { "ws_hud_mode",       handle_ws_hud_mode },
     { "ws_aspect",         handle_ws_aspect },
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },

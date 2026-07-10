@@ -270,6 +270,11 @@ void gpu_ws_get_debug(GpuWsDebug* out);
  * or -1 to restore the normal computed margin. For live cull-margin sweeps. */
 void gpu_ws_set_margin_override(int v);
 
+/* Native-wide HUD corner re-anchoring: allow TAGGED rect-family prims to
+ * shift too (live A/B via TCP ws_hud_mode; some HUD composites render
+ * through the tagged sprite funnel). */
+void gpu_ws_set_nw_hud_tag_rects(int on);
+
 /* Always-on draw-census ring: every drawn primitive records frame / source
  * addr / camera / first-vertex screen pos, so object spawn/despawn and edge
  * culls are observable in data. Dump frames [f0,f1] to a CSV file. */

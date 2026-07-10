@@ -1371,9 +1371,11 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
  * 4:3 and non-opted titles are byte-identical.
  * Returns the signed x delta to add to the prim's x before draw_offset. */
 static int ws_nw_hud_corners = 0;
+static int ws_nw_hud_tag_rects = 0;   /* rects shift even when tagged (A/B) */
 static uint32_t ws_nw_left_hud_packet_lo = 0;
 static uint32_t ws_nw_left_hud_packet_hi = 0;
 void gpu_ws_set_nw_hud_corners(int on) { ws_nw_hud_corners = on ? 1 : 0; }
+void gpu_ws_set_nw_hud_tag_rects(int on) { ws_nw_hud_tag_rects = on ? 1 : 0; }
 void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi) {
     ws_nw_left_hud_packet_lo = lo & 0x1FFFFFFFu;
     ws_nw_left_hud_packet_hi = hi & 0x1FFFFFFFu;
@@ -1395,8 +1397,11 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
      * — the same discriminator the squash path's hud_sprt_squash used. Tagged
      * prims are character billboards positioned from their GTE anchor; they
      * must never re-anchor. (Poly/line sites are excluded wholesale for tag
-     * titles in ws_nw_hud_shift_vertices — their polys are the world.) */
-    if (ws_anchor_addr && psx_ws_prim_is_tagged()) return 0;
+     * titles in ws_nw_hud_shift_vertices — their polys are the world.)
+     * ws_nw_hud_tag_rects (TCP ws_hud_mode) lifts the exclusion for rects,
+     * for live A/B: some HUD composites (Tomba's AP counter) render through
+     * the tagged sprite funnel and stay inset without it. */
+    if (ws_anchor_addr && !ws_nw_hud_tag_rects && psx_ws_prim_is_tagged()) return 0;
     int32_t W  = ws_disp_w();
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
@@ -3131,7 +3136,7 @@ typedef struct {
     int16_t  xmin, xmax;  /* screen-X extent across the prim's position verts */
     int16_t  base_x;      /* back-buffer origin (draw_area_left) at draw time */
     uint8_t  opcode;
-    uint8_t  pad;
+    uint8_t  tagged;      /* psx_ws_prim_is_tagged() at draw time */
 } WsCensusEntry;
 static WsCensusEntry *ws_census = NULL;
 static uint64_t       ws_census_seq = 0;
@@ -3210,6 +3215,7 @@ static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     e->xmax     = (int16_t)xmx;
     e->base_x   = (int16_t)draw_area_left;
     e->opcode   = opcode;
+    e->tagged   = (uint8_t)psx_ws_prim_is_tagged();
     ws_census_seq++;
 }
 
@@ -3218,7 +3224,7 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     if (!ws_census) return 0;
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode\n");
+    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode,tagged\n");
     uint64_t total = ws_census_seq;
     uint64_t avail = total < WS_CENSUS_CAP ? total : WS_CENSUS_CAP;
     uint64_t start = total - avail;
@@ -3226,9 +3232,9 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     for (uint64_t s = start; s < total; s++) {
         WsCensusEntry *e = &ws_census[s & (WS_CENSUS_CAP - 1)];
         if (e->frame < f0 || e->frame > f1) continue;
-        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X\n",
+        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X,%u\n",
                 e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y,
-                e->xmin, e->xmax, e->base_x, e->opcode);
+                e->xmin, e->xmax, e->base_x, e->opcode, e->tagged);
         n++;
     }
     fclose(fp);
