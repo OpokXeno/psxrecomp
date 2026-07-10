@@ -410,12 +410,15 @@ struct GameConfig {
     // ~the half-extra-width when stretching) into the relevant immediates:
     //   cull_bias_sites:  an addiu rT,rS,imm → rT = rS + (imm + margin)
     //   cull_range_sites: an sltiu rT,rS,imm → rT = rS <u (imm + 2*margin)
-    //   cull_a1_sites:    a nop (load/branch-delay) → a1 += margin (for the
-    //                     caller-supplied-margin classifier variants)
+    //   cull_a1_sites:    a nop → a1 += margin, or move rD,a1 →
+    //                     rD = a1 + margin (caller-margin classifier variants)
     // All Ghidra-evidenced; empty by default. Changing these requires a regen.
     std::vector<uint32_t> ws_cull_bias_sites;
     std::vector<uint32_t> ws_cull_range_sites;
     std::vector<uint32_t> ws_cull_a1_sites;
+    // Explicit `sltiu rt,sx,W` render rejects for cases where codegen function
+    // splitting separates the paired vertical test from auto_screen_x.
+    std::vector<uint32_t> ws_cull_screen_x_sites;
 
     // [widescreen.cull] slti_sites — explicit signed right-edge widen sites
     // (`slti rt, sx, W` → psx_ws_cull_slti) for funnel functions the
@@ -538,8 +541,9 @@ struct GameConfig {
     // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
     // whose column count and loop start are rewritten so the loop draws the
     // 16:9 reveal columns on both sides of the 320 view (see gpu.c
-    // psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
-    //   count_site:    the `li rt,21` column-count load (addiu/ori).
+    // psx_ws_bg2d_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
+    //   count_site:    either the `li rt,21` column-count load (addiu/ori), or
+    //                  the loop-closing `sltiu rt,index,21` bound compare.
     //   startcol_site: the `andi rt,rs,0x3f` start tile-column mask.
     //   startx_site:   the `sra rd,rt,sa` start screen-x.
     // 0 = unset (feature off). Verified by opcode at gen time.
@@ -559,10 +563,21 @@ struct GameConfig {
     //   raised to match the bigger buffer. Together they cure the dense-stage overflow.
     uint32_t ws_bg2d_bufbase_site = 0;
     uint32_t ws_bg2d_cap_site     = 0;
+    // Tile-ring layout used by the once-per-frame freshness refill. Defaults
+    // describe MMX6; sibling engines such as MMX5 override the shifted RAM
+    // addresses and smaller ring width in game.toml.
+    uint32_t ws_bg2d_layer_base       = 0x800971F8u;
+    uint32_t ws_bg2d_ring_base        = 0x800A21B8u;
+    uint32_t ws_bg2d_map_size_addr    = 0x800CD338u;
+    uint32_t ws_bg2d_layer_stride_addr = 0x8008EC10u;
+    uint32_t ws_bg2d_ring_cols        = 64;
+    uint32_t ws_bg2d_layer_count      = 3;
+    uint32_t ws_bg2d_layer_struct_stride = 0x54;
     //   init_func: full tile-ring initializer called only when an independent
     //   layer's stage data is dirty. A callback at entry invalidates stale host
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
+    uint32_t ws_bg2d_packet_cap       = 1000;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

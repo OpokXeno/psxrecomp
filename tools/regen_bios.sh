@@ -42,6 +42,7 @@ EXE="$BUILD/psxrecomp-bios.exe"; [ -f "$EXE" ] || EXE="$BUILD/psxrecomp-bios"
 
 # 2. Regenerate the BIOS C.
 echo "regen_bios: emit-full $BIOS -> $OUT (seeds: $SEEDS)"
+mkdir -p "$OUT"
 "$EXE" "$BIOS" "$OUT" --emit-full "$SEEDS"
 
 # 3. Record the emitter fingerprint so the build can detect future drift. MUST

@@ -759,6 +759,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
+    std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
     int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
@@ -780,6 +781,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("bias_sites",  ws_cull_bias_sites);
             load_sites("range_sites", ws_cull_range_sites);
             load_sites("a1_sites",    ws_cull_a1_sites);
+            load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
             if (cull.contains("guard_pixels")) {
                 ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
@@ -807,7 +809,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0, ws_bg2d_startx_site = 0;
     uint32_t ws_bg2d_stream_left_site = 0, ws_bg2d_stream_right_site = 0;
     uint32_t ws_bg2d_bufbase_site = 0, ws_bg2d_cap_site = 0;
+    uint32_t ws_bg2d_layer_base = 0x800971F8u, ws_bg2d_ring_base = 0x800A21B8u;
+    uint32_t ws_bg2d_map_size_addr = 0x800CD338u, ws_bg2d_layer_stride_addr = 0x8008EC10u;
+    uint32_t ws_bg2d_ring_cols = 64, ws_bg2d_layer_count = 3;
+    uint32_t ws_bg2d_layer_struct_stride = 0x54;
     uint32_t ws_bg2d_init_func = 0;
+    uint32_t ws_bg2d_packet_cap = 1000;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("bg2d")) {
@@ -825,6 +832,30 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_bg2d_stream_right_site = load1("stream_right_site");
             ws_bg2d_bufbase_site = load1("bufbase_site");
             ws_bg2d_cap_site     = load1("cap_site");
+            if (bg.contains("layer_base"))
+                ws_bg2d_layer_base = load1("layer_base");
+            if (bg.contains("ring_base"))
+                ws_bg2d_ring_base = load1("ring_base");
+            if (bg.contains("map_size_addr"))
+                ws_bg2d_map_size_addr = load1("map_size_addr");
+            if (bg.contains("layer_stride_addr"))
+                ws_bg2d_layer_stride_addr = load1("layer_stride_addr");
+            auto load_positive = [&](const char* key, uint32_t current) -> uint32_t {
+                if (!bg.contains(key)) return current;
+                const int64_t value = toml::find<int64_t>(bg, key);
+                if (value <= 0 || value > UINT32_MAX)
+                    throw std::runtime_error(fmt::format(
+                        "widescreen.bg2d.{} must be a positive 32-bit integer", key));
+                return static_cast<uint32_t>(value);
+            };
+            ws_bg2d_ring_cols = load_positive("ring_cols", ws_bg2d_ring_cols);
+            ws_bg2d_layer_count = load_positive("layer_count", ws_bg2d_layer_count);
+            ws_bg2d_layer_struct_stride = load_positive(
+                "layer_struct_stride", ws_bg2d_layer_struct_stride);
+            ws_bg2d_packet_cap = load_positive("packet_cap", ws_bg2d_packet_cap);
+            if ((ws_bg2d_ring_cols & (ws_bg2d_ring_cols - 1u)) != 0u)
+                throw std::runtime_error(
+                    "widescreen.bg2d.ring_cols must be a power of two");
             ws_bg2d_init_func    = load1("init_func");
         }
     }
@@ -874,6 +905,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
+        /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
@@ -898,7 +930,15 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_stream_right_site*/ ws_bg2d_stream_right_site,
         /*ws_bg2d_bufbase_site*/  ws_bg2d_bufbase_site,
         /*ws_bg2d_cap_site*/      ws_bg2d_cap_site,
+        /*ws_bg2d_layer_base*/    ws_bg2d_layer_base,
+        /*ws_bg2d_ring_base*/     ws_bg2d_ring_base,
+        /*ws_bg2d_map_size_addr*/ ws_bg2d_map_size_addr,
+        /*ws_bg2d_layer_stride_addr*/ ws_bg2d_layer_stride_addr,
+        /*ws_bg2d_ring_cols*/     ws_bg2d_ring_cols,
+        /*ws_bg2d_layer_count*/   ws_bg2d_layer_count,
+        /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
+        /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
     };
 }
 

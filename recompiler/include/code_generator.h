@@ -65,10 +65,12 @@ struct CodeGenConfig {
     // addresses the immediate is emitted with a runtime margin term
     // psx_ws_x_margin() so the world-space draw cull widens with the aspect
     // (0 at 4:3). bias = addiu (+margin); range = sltiu (+2*margin); a1 = a
-    // nop replaced with `a1 += margin`. See config_loader.h. Empty = default.
+    // nop replaced with `a1 += margin`, or move rD,a1 replaced with
+    // `rD = a1 + margin`. See config_loader.h. Empty = default.
     std::set<uint32_t> ws_cull_bias_sites;
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
+    std::set<uint32_t> ws_cull_screen_x_sites;
 
     // Explicit signed right-edge widen sites ([widescreen.cull] slti_sites):
     // `slti rt, sx, W` emitted through psx_ws_cull_slti for funnel functions
@@ -107,7 +109,7 @@ struct CodeGenConfig {
 
     // Widescreen pure-2D background tile-loop widen ([widescreen.bg2d]). Three
     // instruction addresses in a 2D game's per-layer BG renderer (MMX6's
-    // FUN_800270d0): the column-count load, the start tile-column mask, and the
+    // FUN_800270d0): the column-count load/compare, the start tile-column mask, and the
     // start screen-x shift, rewritten through the gpu.c psx_ws_mmx6_bg_* helpers
     // so the loop draws the 16:9 reveal columns on both sides (identity at 4:3 /
     // 512 hi-res). 0 = unset. Main-EXE addresses; verified by opcode at gen time.

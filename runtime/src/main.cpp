@@ -2371,6 +2371,16 @@ int main(int argc, char** argv) {
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */
             gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
+            /* [widescreen.bg2d] engine tile-ring layout for the freshness
+             * refill shared by the MMX5/MMX6 2D background hook. */
+            gpu_ws_bg2d_configure(gc.ws_bg2d_layer_base,
+                                  gc.ws_bg2d_ring_base,
+                                  gc.ws_bg2d_map_size_addr,
+                                  gc.ws_bg2d_layer_stride_addr,
+                                  gc.ws_bg2d_ring_cols,
+                                  gc.ws_bg2d_layer_count,
+                                  gc.ws_bg2d_layer_struct_stride,
+                                  gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
             /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
