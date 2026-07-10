@@ -169,6 +169,13 @@ void gpu_ws_set_nw_hud_corners(int on);
  * gradient / backdrop image) to fill the wide frame, so it no longer
  * pillarboxes at the reveal margins. Runtime-only. Off by default. */
 void gpu_ws_set_nw_backdrop(int on);
+/* Native-wide flat-polygon backdrop stretch ([widescreen] nw_flat_backdrop):
+ * stretch untextured primitives in the wide mirror without changing the
+ * canonical 4:3 framebuffer. Intended for flat-colour sky/water backdrops. */
+void gpu_ws_set_nw_flat_backdrop(int on);
+int  gpu_ws_nw_flat_backdrop_enabled(void);
+/* Stretch the title-opted textured pre-3D backdrop phase in the wide mirror. */
+void gpu_ws_set_nw_phase_backdrop(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the

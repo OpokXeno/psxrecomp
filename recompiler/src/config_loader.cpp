@@ -244,6 +244,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("fmv_skip_no_xa")) {
             rt.video_fmv_skip_no_xa = toml::find<bool>(video, "fmv_skip_no_xa");
         }
+        if (video.contains("fmv_skip_no_xa_hold")) {
+            rt.video_fmv_skip_no_xa_hold =
+                (int)toml::find<int64_t>(video, "fmv_skip_no_xa_hold");
+            if (rt.video_fmv_skip_no_xa_hold < 4 || rt.video_fmv_skip_no_xa_hold > 3600)
+                throw std::runtime_error(
+                    "[video] fmv_skip_no_xa_hold must be between 4 and 3600 vblanks");
+        }
         if (video.contains("low_latency_input")) {
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }
@@ -698,6 +705,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_gte_game_mode = false;
     bool ws_nw_hud_corners = false;
     bool ws_nw_backdrop = false;
+    bool ws_nw_flat_backdrop = false;
+    bool ws_nw_phase_backdrop = false;
     bool ws_offered = true;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
@@ -726,6 +735,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
         if (ws.contains("nw_backdrop"))
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
+        if (ws.contains("nw_flat_backdrop"))
+            ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
+        if (ws.contains("nw_phase_backdrop"))
+            ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
     }
@@ -848,6 +861,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_gte_game_mode*/      ws_gte_game_mode,
         /*ws_nw_hud_corners*/     ws_nw_hud_corners,
         /*ws_nw_backdrop*/        ws_nw_backdrop,
+        /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
+        /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
         /*ws_offered*/            ws_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,

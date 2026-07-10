@@ -945,6 +945,8 @@ static int ws_tagged_anchor(int32_t *out_ax) {
  * flower-field tiles — the 3D rock/foreground is untagged AND has narrow prims,
  * so tag/narrow heuristics alone mis-stretch and tear it. */
 uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
+static int ws_nw_phase_backdrop = 0;
+void gpu_ws_set_nw_phase_backdrop(int on) { ws_nw_phase_backdrop = on ? 1 : 0; }
 /* diag: per-frame min/max of the prim source addrs the GL gate sees */
 uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
 static uint32_t bdg_src_frame = 0xFFFFFFFFu;
@@ -960,6 +962,8 @@ static uint32_t bdg_src_frame = 0xFFFFFFFFu;
  *   4 tagged     : prim is sprite-tagged (psx_ws_prim_is_tagged)
  *   5 untag-tex  : textured AND not sprite-tagged
  *   6 all-tex    : every textured prim (sanity: should fill void + distort 3D)
+ *   7 all        : every primitive (coarse correlation sanity check)
+ *   8 all-flat   : every untextured primitive
  * Counters (per-frame, snapshotted by the present hook) report how many prims
  * matched and how many of those were sprite-tagged. */
 int      g_dbg_mode = 0;
@@ -983,6 +987,8 @@ static int dbg_gate_match(void) {
         case 4: m = tagged; break;
         case 5: m = (textured && !tagged); break;
         case 6: m = textured; break;
+        case 7: m = 1; break;
+        case 8: m = !textured; break;
         default: m = 0; break;
     }
     if (m) { s_dbg_match_n++; if (tagged) s_dbg_match_tagged++; }
@@ -1022,6 +1028,7 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (ws_nw_phase_backdrop && !ws_bg_phase_over()) return 1;
     /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
      * background phase (before the 3D world). Fills the native-wide void for both
      * the flower grid and the sky band; HUD/characters (tagged but post-3D) and the
@@ -1135,6 +1142,9 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
  * Transforms vx[0..3] IN PLACE (pre-draw_offset); returns 1 if it applied. */
 static int ws_nw_backdrop = 0;
 void gpu_ws_set_nw_backdrop(int on) { ws_nw_backdrop = on ? 1 : 0; }
+static int ws_nw_flat_backdrop = 0;
+void gpu_ws_set_nw_flat_backdrop(int on) { ws_nw_flat_backdrop = on ? 1 : 0; }
+int gpu_ws_nw_flat_backdrop_enabled(void) { return ws_nw_flat_backdrop; }
 static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
     if (!ws_nw_backdrop || !ws_native_wide_active()) return 0;
     int32_t extra = ws_nw_extra();

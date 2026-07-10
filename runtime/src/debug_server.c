@@ -6614,7 +6614,7 @@ static void handle_ws_backdrop_stretch(int id, const char *json)
 /* prim<->pixel correlation gate (ws_dbg_stretch). Forces g_ws_bd_stretch_on=1 and
  * sets the selectable match mode used by the GL native-wide 2D-stretch gate so a
  * probe can stretch an exact prim set and screenshot which one fills the void.
- * Args: mode (0..6), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
+ * Args: mode (0..8), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
  * Reports matched/tagged counts (last frame) + applied. */
 static void handle_ws_dbg_stretch(int id, const char *json)
 {
@@ -9493,24 +9493,28 @@ static void handle_mdec_state(int id, const char *json)
 static void handle_fmv_state(int id, const char *json)
 {
     (void)json;
-    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, const char **);
+    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, int *, const char **);
     extern uint32_t mdec_get_decode_count(void);
     extern int cdrom_xa_stream_active(void);
     extern uint16_t sio_get_pad_buttons(void);
     extern uint64_t cdrom_get_dataready_fires(void);
     extern uint64_t g_cdrom_deliver_count;
-    int auto_skip = -1; uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
-    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &cfg);
+    int auto_skip = -1, no_xa_hold = 0;
+    uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
+    char cfg_json[1024];
+    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &no_xa_hold, &cfg);
+    json_escape_string(cfg_json, sizeof(cfg_json), cfg ? cfg : "(null)");
     MDECDebugState s; mdec_debug_get_state(&s);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"config_path\":\"%s\","
              "\"auto_skip_fmv\":%d,"
+             "\"fmv_skip_no_xa_hold\":%d,"
              "\"fmv_skip_total_table\":\"0x%08X\",\"fmv_skip_movie_id\":\"0x%08X\","
              "\"mdec_decode_count\":%u,\"mdec_decode_macroblocks\":%u,\"mdec_dma_out_words\":%u,"
              "\"xa_stream_active\":%d,"
              "\"cd_dataready_fires\":%llu,\"cd_irq_delivered\":%llu,"
              "\"pad1\":\"0x%04X\"}",
-             id, cfg ? cfg : "(null)", auto_skip,
+             id, cfg_json, auto_skip, no_xa_hold,
              total_table, movie_id,
              mdec_get_decode_count(), s.decode_macroblocks, s.dma_out_words,
              cdrom_xa_stream_active(),
