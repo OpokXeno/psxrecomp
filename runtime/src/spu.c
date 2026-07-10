@@ -414,20 +414,32 @@ static int16_t voice_next_sample(int idx) {
 
     if (v->sample_idx >= SPU_BLOCK_SAMPLES) {
         if (v->flags & 0x01u) {
+            /* END flag: the decode pointer jumps to the latched repeat
+             * address in BOTH the loop and stop cases — Beetle spu.cpp:333
+             * (CurAddr = LoopAddr) does this unconditionally. */
+            v->cur_addr = v->repeat_addr & (SPU_RAM_SIZE - 1u);
             if (v->flags & 0x02u) {
-                v->cur_addr = v->repeat_addr & (SPU_RAM_SIZE - 1u);
                 spu_event_record(SPU_EV_END_LOOP, idx, v->repeat_addr);
             } else {
-                /* End-without-repeat triggers Release on real hardware
-                 * (Beetle's RunDecoder calls ReleaseEnvelope here). The
-                 * voice keeps decoding past the end block — whatever
-                 * follows in SPU RAM — while env_level decays to 0.
-                 * Garbage samples are masked by the dying envelope, so
-                 * by the time anything would be audible it's silent. */
+                /* END without REPEAT: hardware forces the envelope to ZERO
+                 * and enters Release (Beetle spu.cpp:341-352 — "Force
+                 * enveloping to 0 if not looping"). The voice keeps decoding
+                 * from the repeat address, silently.
+                 *
+                 * The previous shape decoded FORWARD past the terminator
+                 * with the envelope intact, assuming the release would mask
+                 * whatever follows. X4's SFX bank breaks both assumptions:
+                 * its one-shot samples end on an END-only block whose
+                 * successor is non-silent filler (0x77 nibbles at shift 0 =
+                 * +28672 DC) with a self-looping LOOPSTART flag, and its
+                 * ADSR release shift is ~infinite. Every finished SFX voice
+                 * parked there at full envelope; a handful of ice-block
+                 * hits in the X4 attract demo railed the whole mix at
+                 * +32767 for ~35 s ("static" / music cut-out). */
                 spu_event_record(SPU_EV_END_STOP, idx, v->cur_addr);
                 v->adsr_phase = ADSR_RELEASE;
                 v->adsr_divider = 0;
-                v->flags = 0;  /* don't re-enter this branch */
+                v->env_level = 0;
             }
         }
         decode_block(v);
@@ -781,6 +793,16 @@ void spu_get_voice_state(int idx, SpuVoiceState* out) {
     out->last_flags  = v->flags;
     out->sample_idx  = (uint8_t)v->sample_idx;
     out->phase       = (uint16_t)v->phase;
+    out->env_level   = v->env_level;
+    out->adsr_phase  = v->adsr_phase;
+}
+
+/* Debug peek into SPU RAM (spu_ram TCP command). Returns bytes copied. */
+uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len) {
+    if (!out || addr >= SPU_RAM_SIZE) return 0;
+    if (len > SPU_RAM_SIZE - addr) len = SPU_RAM_SIZE - addr;
+    memcpy(out, spu_ram + addr, len);
+    return len;
 }
 
 void spu_get_global_state(SpuGlobalState* out) {
