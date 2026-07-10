@@ -419,49 +419,19 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     return (uint16_t)(r | (g << 5) | (b << 10) | (stp ? 0x8000 : 0));
 }
 
-/* uv sampling bounds for a textured triangle (see g_uv_lim): min/max of the
- * vertex uvs; for axis-aligned (2D) mappings — any zero uv derivative — the
- * max-uv vertex is an exclusive edge whose texel the DDA never samples, so
- * back it off by one. (The software DDA truncates exactly like the PS1, so
- * unlike the GL/VK backends no mirrored-2D uv compensation is needed here —
- * these bounds only feed the bilinear-filter neighbour clamp.) Crossing a
- * 256 boundary means page wrap: widen to the full page (clamp disabled). */
+/* uv sampling bounds (see g_uv_lim): the shared PS1 uv model in gpu_uv.h.
+ * The software DDA truncates exactly like the PS1, so unlike the GL/VK
+ * backends NO mirrored-2D compensation is applied here — these bounds only
+ * feed the bilinear-filter neighbour clamp. */
+#include "gpu_uv.h"
+
 static void sw_tri_uv_limits(const int *xs, const int *ys,
                              const int *us, const int *vs) {
-    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
-    for (int i = 1; i < 3; i++) {
-        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
-        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
-    }
-    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
-    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
-    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
-    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
-    if (dudx == 0 || dudy == 0 || dvdx == 0 || dvdy == 0) {
-        if (hi_u > lo_u) hi_u--;
-        if (hi_v > lo_v) hi_v--;
-    }
-    if ((lo_u >> 8) == (hi_u >> 8)) { lo_u &= 255; hi_u &= 255; }
-    else                            { lo_u = 0; hi_u = 255; }
-    if ((lo_v >> 8) == (hi_v >> 8)) { lo_v &= 255; hi_v &= 255; }
-    else                            { lo_v = 0; hi_v = 255; }
-    g_uv_lim[0] = lo_u; g_uv_lim[1] = lo_v; g_uv_lim[2] = hi_u; g_uv_lim[3] = hi_v;
+    psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
 }
 
-/* uv sampling bounds for rect prims: forward mappings sample [u0, u1-1]
- * (u1 is the exclusive edge); mirrored ones keep the full inclusive range. */
 static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
-    int lim[4];
-    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
-    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
-    if (lim[2] < lim[0]) lim[2] = lim[0];
-    if (lim[3] < lim[1]) lim[3] = lim[1];
-    if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; }
-    else                                { lim[0] = 0; lim[2] = 255; }
-    if ((lim[1] >> 8) == (lim[3] >> 8)) { lim[1] &= 255; lim[3] &= 255; }
-    else                                { lim[1] = 0; lim[3] = 255; }
-    g_uv_lim[0] = lim[0]; g_uv_lim[1] = lim[1];
-    g_uv_lim[2] = lim[2]; g_uv_lim[3] = lim[3];
+    psx_uv_rect_limits(u0, v0, u1, v1, g_uv_lim);
 }
 
 /* ------------------------------------------------------------------ */
