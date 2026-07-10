@@ -24,6 +24,7 @@
 #include "mednafen/psx/frontio.h"
 #include "mednafen/psx/irq.h"
 #include "beetle_history.h"
+#include "audio_trace.h"    /* always-on oracle PCM tap ring (port 4380 audio_wav) */
 #include "parity_trace.h"   /* general control-flow parity ring (oracle producer) */
 #include "device_trace.h"   /* general device-event cycle ring (oracle producer) */
 static void irq_event_callback(int which);  /* fwd: device-event ring producer */
@@ -336,8 +337,18 @@ void on_video_refresh(const void *data, unsigned width, unsigned height, size_t 
     }
 }
 
-void on_audio_sample(int16_t l, int16_t r) { (void)l; (void)r; }
-size_t on_audio_sample_batch(const int16_t *data, size_t frames) { (void)data; return frames; }
+/* Beetle's fully-mixed 44.1 kHz reference SPU output arrives here every
+ * retro_run. Record it into the always-on audio trace (tap SPU_OUT) so port
+ * 4380's audio_wav can dump oracle PCM for offline A/B against the recomp's
+ * tap on port 4370. The host still plays no audio from psx-beetle. */
+void on_audio_sample(int16_t l, int16_t r) {
+    int16_t frame[2] = { l, r };
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, frame, 1);
+}
+size_t on_audio_sample_batch(const int16_t *data, size_t frames) {
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, data, (int)frames);
+    return frames;
+}
 void on_input_poll(void) {}
 
 int16_t on_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
@@ -535,6 +546,7 @@ extern "C" void beetle_run_frame(uint16_t pad1_buttons) {
     if (!s_loaded) return;
     s_joypad = pad1_buttons;
     s_frame_count++;
+    audio_trace_note_frame(s_frame_count);
     retro_run();
     beetle_history_record_frame();
 }

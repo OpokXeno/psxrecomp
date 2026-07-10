@@ -139,6 +139,7 @@ extern int beetle_spu_get_global_state(
 
 /* Per-frame history ring (parity with runtime's frame_history). */
 #include "beetle_history.h"
+#include "audio_trace.h"
 #include "parity_trace.h"
 #include "device_trace.h"
 extern void beetle_history_get_bounds(uint64_t *out_count,
@@ -1016,6 +1017,107 @@ static void h_spu_events(int id, const char *json) {
     free(vlcs); free(vrcs); free(als); free(ahs); free(kinds); free(vs);
 }
 
+/* ---- audio_stats / audio_wav / audio_events: always-on oracle PCM tap ----
+ *
+ * Wire-protocol mirror of psx-runtime's audio_* commands (port 4370).
+ * On psx-beetle only tap 0 (spu_out) is fed — Beetle's fully-mixed
+ * 44.1 kHz reference SPU output captured at the libretro audio_batch
+ * callback (beetle_libretro.cpp). Pump/queue fields report zero: this
+ * binary never opens a host audio device. */
+static void h_audio_stats(int id, const char *json) {
+    (void)json;
+    AudioTraceStats st;
+    audio_trace_get_stats(&st);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"taps\":["
+             "{\"name\":\"spu_out\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d},"
+             "{\"name\":\"cd_in\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d},"
+             "{\"name\":\"host\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d}],"
+             "\"pump_calls\":%llu,\"pump_skips\":%llu,\"underruns\":%llu,"
+             "\"queue_hiwater\":%u,\"queue_lowater\":%u,"
+             "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu}\n",
+             id,
+             (unsigned long long)st.tap_frames[0],
+             (unsigned long long)st.tap_nonzero[0],
+             (unsigned long long)st.tap_audible[0], st.tap_peak[0],
+             (unsigned long long)st.tap_frames[1],
+             (unsigned long long)st.tap_nonzero[1],
+             (unsigned long long)st.tap_audible[1], st.tap_peak[1],
+             (unsigned long long)st.tap_frames[2],
+             (unsigned long long)st.tap_nonzero[2],
+             (unsigned long long)st.tap_audible[2], st.tap_peak[2],
+             (unsigned long long)st.pump_calls,
+             (unsigned long long)st.pump_skips,
+             (unsigned long long)st.underruns,
+             st.queue_hiwater, st.queue_lowater,
+             (unsigned long long)st.mute_events,
+             (unsigned long long)st.unmute_events,
+             (unsigned long long)st.events_total);
+}
+
+static void h_audio_wav(int id, const char *json) {
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path");
+        return;
+    }
+    int tap = json_get_int(json, "tap", AUDIO_TAP_SPU_OUT);
+    char buf[32];
+    int64_t start = -1;
+    uint64_t count = 0;
+    if (json_get_str(json, "start", buf, sizeof(buf)))
+        start = strtoll(buf, NULL, 0);
+    else
+        start = (int64_t)json_get_int(json, "start", -1);
+    if (json_get_str(json, "count", buf, sizeof(buf)))
+        count = strtoull(buf, NULL, 0);
+    else
+        count = (uint64_t)json_get_int(json, "count", 0);
+
+    int64_t wrote = audio_trace_dump_wav(tap, path, start, count);
+    if (wrote < 0) {
+        send_err(id, "dump failed (bad tap/path or empty ring)");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"tap\":%d,\"frames\":%lld,"
+             "\"rate\":44100,\"tap_total\":%llu}\n",
+             id, tap, (long long)wrote,
+             (unsigned long long)audio_trace_tap_total(tap));
+}
+
+static void h_audio_events(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+    AudioTraceEvent *evs =
+        (AudioTraceEvent *)malloc((size_t)count * sizeof(AudioTraceEvent));
+    if (!evs) { send_err(id, "alloc"); return; }
+    uint32_t got = audio_trace_events_get(evs, (uint32_t)count);
+    uint64_t total = audio_trace_events_total();
+    static const char *kind_names[] = {
+        "?", "REG", "RENDER", "SKIP", "UNDERRUN",
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+    };
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
+             id, (unsigned long long)total, (unsigned)got);
+    for (uint32_t i = 0; i < got; i++) {
+        const AudioTraceEvent *e = &evs[i];
+        const char *kn = (e->kind < sizeof(kind_names) / sizeof(kind_names[0]))
+                         ? kind_names[e->kind] : "?";
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"smp\":%llu,\"frame\":%u,"
+                 "\"kind\":\"%s\",\"a\":\"0x%X\",\"b\":\"0x%X\"}",
+                 (unsigned long long)e->seq,
+                 (unsigned long long)e->sample_idx,
+                 e->frame, kn, e->a, e->b);
+    }
+    send_fmt("]}\n");
+    free(evs);
+}
+
 /* ---- wtrace_all (always-on, no-filter, lean fields) ----
  * Mirrors runtime's wtrace_all surface so probes that haven't pre-armed
  * a range can still see the last ~1 second of writes the moment they
@@ -1513,6 +1615,9 @@ static const CmdEntry CMDS[] = {
     { "fntrace_dump",          h_fntrace_dump },
     { "spu_voices",            h_spu_voices },
     { "spu_events",            h_spu_events },
+    { "audio_stats",           h_audio_stats },
+    { "audio_wav",             h_audio_wav },
+    { "audio_events",          h_audio_events },
     /* Per-frame history ring (parity with psx-runtime). */
     { "history",               h_history },
     { "get_frame",             h_get_frame },

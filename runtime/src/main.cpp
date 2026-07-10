@@ -30,6 +30,7 @@
 #include "latency_ring.h"
 #include "sio.h"
 #include "spu.h"
+#include "audio_trace.h"
 #include "spu_shadow.h"
 #include "memcard.h"
 #include "debug_server.h"
@@ -665,7 +666,17 @@ static void sdl_audio_pump(void) {
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
     const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-    if (SDL_GetQueuedAudioSize(sdl_audio_device) > max_queue_bytes) return;
+    const uint32_t queued = SDL_GetQueuedAudioSize(sdl_audio_device);
+    /* Underrun = the device drained everything between two pumps. Only
+     * meaningful after the first audio has been queued; before that the
+     * queue is legitimately empty. */
+    static int had_audio = 0;
+    if (queued == 0 && had_audio)
+        audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
+    if (queued > max_queue_bytes) {
+        audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
+        return;
+    }
 
     static double sample_accum = 0.0;
     sample_accum += 44100.0 / 60.0;
@@ -674,6 +685,7 @@ static void sdl_audio_pump(void) {
     if (frames <= 0) return;
     if (frames > 2048) frames = 2048;
 
+    audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
     spu_render(sdl_audio_buf, frames);
     if (sdl_audio_fadein_left > 0) {
         const float g0 = 1.0f - (float)sdl_audio_fadein_left
@@ -684,8 +696,11 @@ static void sdl_audio_pump(void) {
         sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
         sdl_audio_fadein_left -= ramp;
     }
+    /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
+    audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
     SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
                    (uint32_t)frames * bytes_per_frame);
+    had_audio = 1;
 }
 
 /* Audio gating across turbo-loads transitions.
@@ -703,6 +718,10 @@ static void sdl_audio_pump(void) {
  *     across the first ~50 ms of samples (sdl_audio_pump above). */
 static void sdl_audio_update(int turbo_active) {
     if (!sdl_audio_device) return;
+    {   /* Tag audio events with the vblank frame counter. */
+        extern uint64_t s_frame_count;
+        audio_trace_note_frame((uint32_t)s_frame_count);
+    }
     const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
     static int muted = 0;
     static int hangover = 0;
@@ -719,6 +738,8 @@ static void sdl_audio_update(int turbo_active) {
             sdl_audio_fadein_left = 0;
             spu_render(sdl_audio_buf, tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
+            audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
+            audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
             SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
                            (uint32_t)tail * sizeof(int16_t) * 2u);
             muted = 1;
@@ -730,6 +751,7 @@ static void sdl_audio_update(int turbo_active) {
         if (hangover > 0) { hangover--; return; }
         muted = 0;
         sdl_audio_fadein_left = sdl_audio_fade_samples;
+        audio_trace_event(AUDIO_EV_UNMUTE, (uint32_t)sdl_audio_fadein_left, 0);
     }
     sdl_audio_pump();
 }
@@ -2633,6 +2655,7 @@ int main(int argc, char** argv) {
         controller_deadzone = std::max(0, std::min(32767, resolved_deadzone));
     refresh_player_devices();  /* open SDL handles to match the player config */
 #ifndef PSX_SDL_NO_AUDIO
+    audio_trace_init();
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
         SDL_AudioSpec have;

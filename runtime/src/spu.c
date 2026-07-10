@@ -9,6 +9,7 @@
 
 #include "spu.h"
 #include "spu_shadow.h"
+#include "audio_trace.h"
 
 #include <string.h>
 
@@ -284,6 +285,10 @@ void spu_cd_audio_push(const int16_t* stereo, int frames) {
     }
     cd_frame_count += in_frames;
     cd_push_frames += in_frames;
+
+    /* T2 tap: what the CD/XA decoder feeds the SPU CD input bus. */
+    audio_trace_pcm(AUDIO_TAP_CD_IN, stereo, (int)in_frames);
+    audio_trace_event(AUDIO_EV_CD_PUSH, in_frames, cd_frame_count);
 }
 
 static int cd_audio_pop(int16_t* left, int16_t* right) {
@@ -596,6 +601,11 @@ void spu_render(int16_t* out_stereo, int frames) {
      * while proven. No-op (byte-identical) when disabled. The canon mix above
      * stays the authoritative output AND the verify oracle. */
     spu_shadow_process(out_stereo, frames);
+
+    /* T1 tap: the SPU's final output block as handed to the host layer
+     * (post-shadow, pre host fade/mute). Placed here so every spu_render
+     * caller — the vblank pump and the turbo fade tail — is covered. */
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, out_stereo, frames);
 }
 
 void spu_debug_info(SpuDebugInfo* out) {
@@ -660,6 +670,12 @@ void spu_write(uint32_t addr, uint32_t value) {
     if (addr >= 0x1F801C00u && addr <= 0x1F801DFFu) {
         uint32_t idx = reg_index(addr);
         if (idx < SPU_REG_COUNT) {
+            /* Event-ring every register store with its SPU_OUT sample-clock
+             * timestamp: this is what lets offline analysis correlate a
+             * write (key-on, pitch, volume) with the exact output sample
+             * the render loop first honored it at — the write-to-render
+             * quantization audit (snesrecomp 8ffc797 class). */
+            audio_trace_event(AUDIO_EV_REG_WRITE, addr, value & 0xFFFFu);
             spu_regs[idx] = (uint16_t)value;
 
             if (addr == 0x1F801D88u) {

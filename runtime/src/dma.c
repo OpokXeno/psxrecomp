@@ -20,6 +20,7 @@
 #include "mdec.h"
 #include "overlay_capture.h"
 #include "spu.h"
+#include "audio_trace.h"
 #include "event_ring.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -748,6 +749,10 @@ static uint32_t execute_ch4_spu(void) {
             spu_dma_write(psx_read_word(addr));
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
+        /* One aggregated event per SPU-bound transfer (per-word would flood
+         * the ring: a full sound-bank upload is ~128k words). */
+        audio_trace_event(AUDIO_EV_DMA_WRITE, total_words,
+                          channels[4].madr & 0x1FFFFCu);
     } else {
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, 0);
