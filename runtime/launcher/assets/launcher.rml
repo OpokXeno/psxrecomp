@@ -8,7 +8,7 @@ body {
 	background-color: #0b0e14;
 	font-size: 15dp;
 }
-#root { width: 100%; height: 100%; display: block; }
+#root { width: 100%; height: 100%; display: block; overflow-y: auto; }
 #frame { display: block; padding: 22dp 26dp; }
 
 /* ---- top bar ---- */
@@ -34,6 +34,12 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 	padding: 18dp 22dp;
 	margin-bottom: 13dp;
 }
+/* Settings view: two side-by-side columns so the panels use the horizontal
+   space and the view fits without scrolling. SYSTEM stays full-width below
+   (its BIOS/disc paths need the room). */
+.settings-cols { display: flex; flex-direction: row; align-items: flex-start; }
+.settings-col { display: block; flex: 1 1 0; min-width: 0; }
+.settings-col:first-child { margin-right: 13dp; }
 .cards-row { display: flex; flex-direction: row; align-items: stretch; margin-bottom: 13dp; }
 .card {
 	display: block;
@@ -171,6 +177,23 @@ button:hover { background-color: #232d3c; }
 	white-space: nowrap; overflow: hidden; }
 .path.empty { color: #f85149; }
 
+/* ---- controls / keybind rebind view ---- */
+.kb-head { display: flex; flex-direction: row; align-items: center; margin-bottom: 16dp; }
+.kb-player-lbl { color: #adbac7; margin-right: 10dp; }
+.kb-hint { color: #7d8590; font-size: 12dp; margin-left: 18dp; flex: 1 1 auto;
+	white-space: nowrap; overflow: hidden; }
+.kb-reset { background-color: #1b2330; border: 1dp #2b3543; border-radius: 7dp;
+	color: #e6e9ef; padding: 7dp 14dp; margin-left: 12dp; }
+.kb-reset:hover { border-color: #3b82f6; }
+.rebind-list { display: block; }
+.rb-row { display: flex; flex-direction: row; align-items: center; margin-bottom: 8dp; }
+.rb-label { width: 130dp; flex: 0 0 130dp; color: #adbac7; font-size: 13dp; }
+.rb-chip { width: 150dp; flex: 0 0 150dp; text-align: center; margin-right: 34dp;
+	background-color: #161d28; border: 1dp #2b3543; border-radius: 7dp;
+	color: #e6e9ef; padding: 7dp 10dp; }
+.rb-chip:hover { border-color: #3b82f6; }
+.rb-chip--scan { border-color: #f0b429; color: #f0b429; }
+
 /* ---- footer ---- */
 .footer { display: flex; flex-direction: row; align-items: center; margin-top: 6dp;
 	border-top: 1dp #1e2733; padding-top: 16dp; }
@@ -210,8 +233,10 @@ button:hover { background-color: #232d3c; }
 			<div class="subtitle">{{game_name}} launcher</div>
 		</div>
 		<div class="topbar-actions">
+			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_controls">Controls</button>
 			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_settings">Settings</button>
 			<button class="top-btn primary" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back to dashboard</button>
+			<button class="top-btn primary" data-if="view == 'controls'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 		</div>
 	</div>
 
@@ -241,7 +266,7 @@ button:hover { background-color: #232d3c; }
 			<button class="change-iso" data-event-click="change_iso">Change ISO</button>
 		</div>
 
-		<div class="cards-row">
+		<div class="cards-row" data-if="device_locked == false">
 			<div class="card left">
 				<div class="card-head">
 					<span class="card-name">PLAYER 1</span>
@@ -338,6 +363,8 @@ button:hover { background-color: #232d3c; }
 
 	<!-- ================= SETTINGS VIEW ================= -->
 	<div data-if="view == 'settings'">
+		<div class="settings-cols">
+		<div class="settings-col">
 		<div class="panel">
 			<div class="eyebrow">VIDEO</div>
 			<div class="set-row"><span class="set-lbl">Window size</span><span class="set-ctl">
@@ -362,6 +389,16 @@ button:hover { background-color: #232d3c; }
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
+			<div class="setting-row" data-if="uw_eligible"><span class="setting-name">Ultrawide <span class="exp">EXPERIMENTAL</span></span><span class="setting-control">
+				<button class="toggle" data-event-click="toggle_ultrawide"><span class="value" data-if="ultrawide">On</span><span class="value" data-if="ultrawide == false">Off</span></button>
+				<span class="ws-hint" data-if="ultrawide">21:9 native field-of-view</span></span></div>
+		</div>
+		</div>
+		<div class="settings-col">
+		<div class="panel" data-if="lang_menu">
+			<div class="eyebrow">LOCALIZATION</div>
+			<div class="set-row"><span class="set-lbl">Language</span><span class="set-ctl">
+				<button class="toggle wide" data-event-click="cycle_language"><span class="value">{{lang_label}}</span></button></span></div>
 		</div>
 		<div class="panel">
 			<div class="eyebrow">AUDIO</div>
@@ -373,6 +410,8 @@ button:hover { background-color: #232d3c; }
 			<div class="set-row"><span class="set-lbl">Analog stick deadzone</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_deadzone"><span class="value">{{deadzone_pct}}%</span></button></span></div>
 		</div>
+		</div>
+		</div>
 		<div class="panel">
 			<div class="eyebrow">SYSTEM</div>
 			<div class="set-row"><span class="set-lbl">BIOS</span><span class="set-ctl">
@@ -383,6 +422,23 @@ button:hover { background-color: #232d3c; }
 				<button data-event-click="browse_disc">Browse</button>
 				<span class="path" data-if="disc_path != ''">{{disc_path}}</span>
 				<span class="path empty" data-if="disc_path == ''">(not set)</span></span></div>
+		</div>
+	</div>
+
+	<!-- ================= CONTROLS (KEYBOARD KEYBINDS) VIEW ================= -->
+	<div data-if="view == 'controls'">
+		<div class="panel">
+			<div class="eyebrow">KEYBOARD CONTROLS</div>
+			<div class="kb-head">
+				<span class="kb-player-lbl">Player</span>
+				<div class="seg">
+					<span class="seg-opt" data-class-on="cfg_player == 0" data-event-click="cfg_player_1">1</span>
+					<span class="seg-opt" data-class-on="cfg_player == 1" data-event-click="cfg_player_2">2</span>
+				</div>
+				<span class="kb-hint">Click a key, then press the new key to bind it. Esc cancels. Changes save instantly.</span>
+				<button class="kb-reset" data-event-click="rebind_reset">Reset to defaults</button>
+			</div>
+			<div id="rebind-list" class="rebind-list"></div>
 		</div>
 	</div>
 

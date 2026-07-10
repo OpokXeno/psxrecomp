@@ -67,6 +67,15 @@ extern uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
 extern uint32_t beetle_get_sio_trace_total(void);
 extern void     beetle_reset_sio_trace(void);
 
+/* CD command trace */
+extern uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
+                                       uint8_t *out_nargs, uint8_t *out_a0,
+                                       uint8_t *out_a1, uint8_t *out_a2,
+                                       uint32_t *out_pc,
+                                       int max_count);
+extern uint32_t beetle_get_cdcmd_trace_total(void);
+extern void     beetle_reset_cdcmd_trace(void);
+
 /* wtrace */
 extern int      beetle_wtrace_arm(uint32_t lo, uint32_t hi);
 extern int      beetle_wtrace_disarm(int slot);
@@ -139,8 +148,10 @@ extern int beetle_spu_get_global_state(
 
 /* Per-frame history ring (parity with runtime's frame_history). */
 #include "beetle_history.h"
+#include "audio_trace.h"
 #include "parity_trace.h"
 #include "device_trace.h"
+#include "png_write.h"   /* png_write_rgb — shared PNG encoder (matches runtime) */
 extern void beetle_history_get_bounds(uint64_t *out_count,
                                        uint64_t *out_oldest,
                                        uint64_t *out_newest);
@@ -160,7 +171,8 @@ extern uint64_t beetle_fntrace_total(void);
 extern uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                     uint32_t *out_caller, uint32_t *out_target,
                                     uint32_t *out_ra, uint32_t *out_a0,
-                                    uint32_t *out_a1, uint32_t *out_frame,
+                                    uint32_t *out_a1, uint32_t *out_a2,
+                                    uint32_t *out_a3, uint32_t *out_frame,
                                     uint8_t *out_kind, uint32_t *out_sp,
                                     int max_count);
 
@@ -387,48 +399,32 @@ static void h_vram_peek(int id, const char *json) {
 static void h_screenshot_file(int id, const char *json) {
     char path[512] = {0};
     if (!json_get_str(json, "path", path, sizeof(path))) {
-        strncpy(path, "psx_screenshot.bmp", sizeof(path) - 1);
+        strncpy(path, "psx_screenshot.png", sizeof(path) - 1);
     }
     uint32_t *pixels = NULL;
     unsigned w = 0, h = 0;
     if (!beetle_get_framebuffer(&pixels, &w, &h) || !pixels || w == 0 || h == 0) {
         send_err(id, "no frame"); return;
     }
-    /* BMP write (XRGB8888 → 24bpp BGR for portability). */
-    FILE *f = fopen(path, "wb");
-    if (!f) { send_err(id, "fopen"); return; }
-    int row_bytes = ((int)w * 3 + 3) & ~3;
-    int img_size = row_bytes * (int)h;
-    uint8_t hdr[54] = {0};
-    hdr[0] = 'B'; hdr[1] = 'M';
-    int filesz = 54 + img_size;
-    hdr[2] = filesz & 0xFF; hdr[3] = (filesz >> 8) & 0xFF;
-    hdr[4] = (filesz >> 16) & 0xFF; hdr[5] = (filesz >> 24) & 0xFF;
-    hdr[10] = 54;
-    hdr[14] = 40;
-    hdr[18] = w & 0xFF; hdr[19] = (w >> 8) & 0xFF;
-    hdr[20] = (w >> 16) & 0xFF; hdr[21] = (w >> 24) & 0xFF;
-    /* height stored positive → bottom-up rows */
-    hdr[22] = h & 0xFF; hdr[23] = (h >> 8) & 0xFF;
-    hdr[24] = (h >> 16) & 0xFF; hdr[25] = (h >> 24) & 0xFF;
-    hdr[26] = 1; hdr[28] = 24;
-    hdr[34] = img_size & 0xFF; hdr[35] = (img_size >> 8) & 0xFF;
-    hdr[36] = (img_size >> 16) & 0xFF; hdr[37] = (img_size >> 24) & 0xFF;
-    fwrite(hdr, 1, 54, f);
-    uint8_t *row = (uint8_t*)malloc(row_bytes);
-    if (!row) { fclose(f); send_err(id, "alloc"); return; }
-    memset(row, 0, row_bytes);
-    for (int y = (int)h - 1; y >= 0; y--) {
+    /* PNG write (XRGB8888 → 24bpp top-down RGB), matching the runtime's
+     * screenshot format so both backends emit the same viewer-friendly PNG. */
+    uint8_t *rgb = (uint8_t*)malloc((size_t)w * h * 3);
+    if (!rgb) { send_err(id, "alloc"); return; }
+    for (unsigned y = 0; y < h; y++) {
         for (unsigned x = 0; x < w; x++) {
-            uint32_t px = pixels[y * w + x];
-            row[x*3 + 0] = (px      ) & 0xFF; /* B */
-            row[x*3 + 1] = (px >>  8) & 0xFF; /* G */
-            row[x*3 + 2] = (px >> 16) & 0xFF; /* R */
+            uint32_t px = pixels[(size_t)y * w + x];
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = (px >> 16) & 0xFF; /* R */
+            p[1] = (px >>  8) & 0xFF; /* G */
+            p[2] = (px      ) & 0xFF; /* B */
         }
-        fwrite(row, 1, row_bytes, f);
     }
-    free(row);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "fopen"); return; }
+    int ok = png_write_rgb(f, rgb, w, h);
     fclose(f);
+    free(rgb);
+    if (!ok) { send_err(id, "png encode failed"); return; }
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}\n",
              id, path, w, h);
 }
@@ -468,6 +464,41 @@ static void h_sio_trace(int id, const char *json) {
     send_fmt("]}\n");
 
     free(seqs); free(txs); free(rxs); free(ctrl);
+}
+
+static void h_cdrom_cmd_dump(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+
+    uint32_t *seqs = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *pcs  = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint8_t *cmds = (uint8_t*)malloc(count), *nargs = (uint8_t*)malloc(count);
+    uint8_t *a0 = (uint8_t*)malloc(count), *a1 = (uint8_t*)malloc(count), *a2 = (uint8_t*)malloc(count);
+    if (!seqs || !pcs || !cmds || !nargs || !a0 || !a1 || !a2) {
+        free(seqs); free(pcs); free(cmds); free(nargs); free(a0); free(a1); free(a2);
+        send_err(id, "alloc"); return;
+    }
+    uint32_t got = beetle_get_cdcmd_trace(seqs, cmds, nargs, a0, a1, a2, pcs, count);
+    uint32_t total = beetle_get_cdcmd_trace_total();
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%u,\"entries\":[",
+             id, total, got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"cmd\":\"0x%02X\",\"nargs\":%u,"
+                 "\"a0\":\"0x%02X\",\"a1\":\"0x%02X\",\"a2\":\"0x%02X\","
+                 "\"pc\":\"0x%08X\"}",
+                 seqs[i], cmds[i], nargs[i], a0[i], a1[i], a2[i], pcs[i]);
+    }
+    send_fmt("]}\n");
+    free(seqs); free(pcs); free(cmds); free(nargs); free(a0); free(a1); free(a2);
+}
+
+static void h_cdrom_cmd_reset(int id, const char *json) {
+    (void)json;
+    beetle_reset_cdcmd_trace();
+    send_ok(id);
 }
 
 static void h_sio_write_window(int id, const char *json) {
@@ -872,16 +903,19 @@ static void h_fntrace_dump(int id, const char *json) {
     uint32_t *ras     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *a0s     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *a1s     = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *a2s     = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *a3s     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *frames  = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint8_t  *kinds   = (uint8_t*) malloc(count);
     uint32_t *sps     = (uint32_t*)malloc(count * sizeof(uint32_t));
-    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !frames || !kinds || !sps) {
+    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !a2s || !a3s ||
+        !frames || !kinds || !sps) {
         free(seqs); free(callers); free(targets); free(ras);
-        free(a0s); free(a1s); free(frames); free(kinds); free(sps);
+        free(a0s); free(a1s); free(a2s); free(a3s); free(frames); free(kinds); free(sps);
         send_err(id, "alloc"); return;
     }
     uint32_t got = beetle_fntrace_get(seqs, callers, targets, ras,
-                                       a0s, a1s, frames, kinds, sps, count);
+                                       a0s, a1s, a2s, a3s, frames, kinds, sps, count);
     uint64_t total = beetle_fntrace_total();
 
     send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
@@ -890,14 +924,16 @@ static void h_fntrace_dump(int id, const char *json) {
         if (i > 0) send_fmt(",");
         send_fmt("{\"seq\":%llu,\"caller\":\"0x%08X\",\"target\":\"0x%08X\","
                  "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                 "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
                  "\"frame\":%u,\"kind\":\"%s\",\"sp\":\"0x%08X\"}",
                  (unsigned long long)seqs[i], callers[i], targets[i],
-                 ras[i], a0s[i], a1s[i], frames[i], fn_kind_str(kinds[i]), sps[i]);
+                 ras[i], a0s[i], a1s[i], a2s[i], a3s[i],
+                 frames[i], fn_kind_str(kinds[i]), sps[i]);
     }
     send_fmt("]}\n");
 
     free(seqs); free(callers); free(targets); free(ras);
-    free(a0s); free(a1s); free(frames); free(kinds); free(sps);
+    free(a0s); free(a1s); free(a2s); free(a3s); free(frames); free(kinds); free(sps);
 }
 
 /* ---- spu_voices: Beetle oracle ground truth via PS_SPU::GetRegister ----
@@ -1014,6 +1050,119 @@ static void h_spu_events(int id, const char *json) {
 
     free(seqs); free(frames); free(addrs); free(envs); free(pits);
     free(vlcs); free(vrcs); free(als); free(ahs); free(kinds); free(vs);
+}
+
+/* ---- audio_stats / audio_wav / audio_events: always-on oracle PCM tap ----
+ *
+ * Wire-protocol mirror of psx-runtime's audio_* commands (port 4370).
+ * On psx-beetle only tap 0 (spu_out) is fed — Beetle's fully-mixed
+ * 44.1 kHz reference SPU output captured at the libretro audio_batch
+ * callback (beetle_libretro.cpp). Pump/queue fields report zero: this
+ * binary never opens a host audio device. */
+static void h_audio_stats(int id, const char *json) {
+    (void)json;
+    AudioTraceStats st;
+    audio_trace_get_stats(&st);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"taps\":["
+             "{\"name\":\"spu_out\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d},"
+             "{\"name\":\"cd_in\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d},"
+             "{\"name\":\"host\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d}],"
+             "\"pump_calls\":%llu,\"pump_skips\":%llu,\"underruns\":%llu,"
+             "\"queue_hiwater\":%u,\"queue_lowater\":%u,"
+             "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu}\n",
+             id,
+             (unsigned long long)st.tap_frames[0],
+             (unsigned long long)st.tap_nonzero[0],
+             (unsigned long long)st.tap_audible[0], st.tap_peak[0],
+             (unsigned long long)st.tap_frames[1],
+             (unsigned long long)st.tap_nonzero[1],
+             (unsigned long long)st.tap_audible[1], st.tap_peak[1],
+             (unsigned long long)st.tap_frames[2],
+             (unsigned long long)st.tap_nonzero[2],
+             (unsigned long long)st.tap_audible[2], st.tap_peak[2],
+             (unsigned long long)st.pump_calls,
+             (unsigned long long)st.pump_skips,
+             (unsigned long long)st.underruns,
+             st.queue_hiwater, st.queue_lowater,
+             (unsigned long long)st.mute_events,
+             (unsigned long long)st.unmute_events,
+             (unsigned long long)st.events_total);
+}
+
+static void h_audio_wav(int id, const char *json) {
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path");
+        return;
+    }
+    int tap = json_get_int(json, "tap", AUDIO_TAP_SPU_OUT);
+    char buf[32];
+    int64_t start = -1;
+    uint64_t count = 0;
+    if (json_get_str(json, "start", buf, sizeof(buf)))
+        start = strtoll(buf, NULL, 0);
+    else
+        start = (int64_t)json_get_int(json, "start", -1);
+    if (json_get_str(json, "count", buf, sizeof(buf)))
+        count = strtoull(buf, NULL, 0);
+    else
+        count = (uint64_t)json_get_int(json, "count", 0);
+
+    int64_t wrote = audio_trace_dump_wav(tap, path, start, count);
+    if (wrote < 0) {
+        send_err(id, "dump failed (bad tap/path or empty ring)");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"tap\":%d,\"frames\":%lld,"
+             "\"rate\":44100,\"tap_total\":%llu}\n",
+             id, tap, (long long)wrote,
+             (unsigned long long)audio_trace_tap_total(tap));
+}
+
+static void h_audio_events(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+    AudioTraceEvent *evs =
+        (AudioTraceEvent *)malloc((size_t)count * sizeof(AudioTraceEvent));
+    if (!evs) { send_err(id, "alloc"); return; }
+    uint32_t got = audio_trace_events_get(evs, (uint32_t)count);
+    uint64_t total = audio_trace_events_total();
+    static const char *kind_names[] = {
+        "?", "REG", "RENDER", "SKIP", "UNDERRUN",
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+    };
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
+             id, (unsigned long long)total, (unsigned)got);
+    for (uint32_t i = 0; i < got; i++) {
+        const AudioTraceEvent *e = &evs[i];
+        const char *kn = (e->kind < sizeof(kind_names) / sizeof(kind_names[0]))
+                         ? kind_names[e->kind] : "?";
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"smp\":%llu,\"frame\":%u,"
+                 "\"kind\":\"%s\",\"a\":\"0x%X\",\"b\":\"0x%X\"}",
+                 (unsigned long long)e->seq,
+                 (unsigned long long)e->sample_idx,
+                 e->frame, kn, e->a, e->b);
+    }
+    send_fmt("]}\n");
+    free(evs);
+}
+
+/* ---- cdc_volume: CD-audio DecodeVolume matrix ground truth ---- */
+extern int beetle_cdc_decode_volume(unsigned out[4]);
+static void h_cdc_volume(int id, const char *json) {
+    (void)json;
+    unsigned m[4] = {0, 0, 0, 0};
+    if (!beetle_cdc_decode_volume(m)) { send_err(id, "cdc_unavailable"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"ll\":\"0x%02X\",\"lr\":\"0x%02X\","
+             "\"rl\":\"0x%02X\",\"rr\":\"0x%02X\"}\n",
+             id, m[0], m[1], m[2], m[3]);
 }
 
 /* ---- wtrace_all (always-on, no-filter, lean fields) ----
@@ -1484,6 +1633,8 @@ static const CmdEntry CMDS[] = {
     { "vram_peek",             h_vram_peek },
     { "sio_trace_reset",       h_sio_trace_reset },
     { "sio_trace",             h_sio_trace },
+    { "cdrom_cmd_dump",        h_cdrom_cmd_dump },
+    { "cdrom_cmd_reset",       h_cdrom_cmd_reset },
     { "sio_write_window",      h_sio_write_window },
     /* wtrace — normalized verb set (parity contract with psx-runtime). */
     { "wtrace_arm",            h_wtrace_arm },
@@ -1513,6 +1664,10 @@ static const CmdEntry CMDS[] = {
     { "fntrace_dump",          h_fntrace_dump },
     { "spu_voices",            h_spu_voices },
     { "spu_events",            h_spu_events },
+    { "audio_stats",           h_audio_stats },
+    { "audio_wav",             h_audio_wav },
+    { "audio_events",          h_audio_events },
+    { "cdc_volume",            h_cdc_volume },
     /* Per-frame history ring (parity with psx-runtime). */
     { "history",               h_history },
     { "get_frame",             h_get_frame },

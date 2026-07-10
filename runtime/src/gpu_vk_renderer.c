@@ -2515,27 +2515,9 @@ static void flush_tex_batch(void) {
     s_gpu_dirty = 1;
 }
 
-/* Per-prim uv sampling bounds (inclusive), Beetle-PSX model — see the GL
- * backend's tri_uv_limits. */
-static void tri_uv_limits(const int *xs, const int *ys,
-                          const int *us, const int *vs, int lim[4]) {
-    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
-    for (int i = 1; i < 3; i++) {
-        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
-        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
-    }
-    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
-    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
-    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
-    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
-    if (dudx == 0 || dudy == 0 || dvdx == 0 || dvdy == 0) {
-        if (hi_u > lo_u) hi_u--;
-        if (hi_v > lo_v) hi_v--;
-    }
-    if ((lo_u >> 8) == (hi_u >> 8)) { lo_u &= 255; hi_u &= 255; } else { lo_u = 0; hi_u = 255; }
-    if ((lo_v >> 8) == (hi_v >> 8)) { lo_v &= 255; hi_v &= 255; } else { lo_v = 0; hi_v = 255; }
-    lim[0] = lo_u; lim[1] = lo_v; lim[2] = hi_u; lim[3] = hi_v;
-}
+/* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
+ * implementation for GL/VK/SW, see gpu_uv.h. */
+#include "gpu_uv.h"
 
 /* Append a textured triangle to the batch (per-prim state in the vertex; flush
  * first if the batch keys differ or the raw mirror needs packing). col = 3x RGB
@@ -2546,7 +2528,18 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
                                   int semi, const int *lim) {
     if (!s_ready) return;
     int lim_buf[4];
-    if (!lim) { tri_uv_limits(xs, ys, us, vs, lim_buf); lim = lim_buf; }
+    int uv_buf[6];
+    if (!lim) {
+        /* Poly path: exact sampled bounds from the ORIGINAL uvs, then the
+         * center-sampling mirror compensation (rect prims arrive with their
+         * own precomputed lim and pre-bumped uvs). */
+        int *mu = uv_buf, *mv = uv_buf + 3;
+        for (int i = 0; i < 3; i++) { mu[i] = us[i]; mv[i] = vs[i]; }
+        psx_uv_tri_limits(xs, ys, mu, mv, lim_buf);
+        psx_uv_tri_mirror_offset(xs, ys, mu, mv);
+        us = mu; vs = mv;
+        lim = lim_buf;
+    }
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
@@ -2602,13 +2595,12 @@ static void gpu_textured_rect(int x,int y,int w,int h, int u0,int v0,int u1,int 
     if (w <= 0 || h <= 0) return;
     float mr = s_mod_r/255.0f, mg = s_mod_g/255.0f, mb = s_mod_b/255.0f;
     float col[9] = { mr,mg,mb, mr,mg,mb, mr,mg,mb };
+    /* Mirrored quads arrive here as scaled rects with u0>u1 / v0>v1 (see
+     * the GL backend): exact bounds from the original corners, then the
+     * mirror bump (gpu_uv.h). */
     int lim[4];
-    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
-    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
-    if (lim[2] < lim[0]) lim[2] = lim[0];
-    if (lim[3] < lim[1]) lim[3] = lim[1];
-    if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; } else { lim[0] = 0; lim[2] = 255; }
-    if ((lim[1] >> 8) == (lim[3] >> 8)) { lim[1] &= 255; lim[3] &= 255; } else { lim[1] = 0; lim[3] = 255; }
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
     gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
@@ -2748,6 +2740,48 @@ static void vkb_wide_clear(int base_x, int y, int h, uint16_t color) {
     end_oneshot(cb);
 }
 
+/* Clear only the two synthetic reveal strips, leaving the guest-owned centre
+ * intact. Mirrors the software/OpenGL opt-in transition cleanup. */
+static void vkb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) {
+    if (!s_ready || s_wide_w <= 0 || s_wide_offset <= 0) return;
+    flush_tex_batch(); flush_geometry();
+    int i = wide_surf_for(base_x);
+    if (i < 0) return;
+    s_perf_cur.wide_clears++;
+    int S = s_scale, H = VRAM_H * S;
+    int W = s_wide_w * S, margin = s_wide_offset * S;
+    int y0 = y * S, y1 = (y + h) * S;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (y1 <= y0 || margin * 2 >= W) return;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderArea.extent.width = (uint32_t)W;
+    rp.renderArea.extent.height = (uint32_t)H;
+    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearAttachment ca[2] = {0};
+    ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca[0].colorAttachment = 0;
+    ca[0].clearValue.color.float32[0] = (float)((color)       & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[1] = (float)((color >> 5)  & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[2] = (float)((color >> 10) & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[3] = (color >> 15) & 1 ? 1.0f : 0.0f;
+    ca[1].aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    ca[1].clearValue.depthStencil.depth = 0.0f;
+    ca[1].clearValue.depthStencil.stencil = (color >> 15) & 1;
+    VkClearRect cr[2];
+    uint32_t ncr = 0;
+    if (sides & 1)
+        cr[ncr++] = (VkClearRect){ { { 0, y0 }, { (uint32_t)margin, (uint32_t)(y1 - y0) } }, 0, 1 };
+    if (sides & 2)
+        cr[ncr++] = (VkClearRect){ { { W - margin, y0 }, { (uint32_t)margin, (uint32_t)(y1 - y0) } }, 0, 1 };
+    if (ncr) p_vkCmdClearAttachments(cb, 2, ca, ncr, cr);
+    p_vkCmdEndRenderPass(cb);
+    end_oneshot(cb);
+}
+
 /* Present source (CPU): read the wide surface band for the displayed buffer
  * into an ARGB8888 buffer, byte-compatible with sw_render_wide_display — used
  * by the shared CPU present fallback and the ws debug dump. The GPU-direct
@@ -2829,6 +2863,7 @@ static const GpuRenderBackend VK_BACKEND = {
     .wide_set_target               = vkb_wide_set_target,
     .wide_disable_target           = vkb_wide_disable_target,
     .wide_clear                    = vkb_wide_clear,
+    .wide_clear_margins            = vkb_wide_clear_margins,
     .render_wide_display           = vkb_render_wide_display,
 };
 

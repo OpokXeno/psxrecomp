@@ -8,6 +8,19 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+# Default to an optimized build. The recompiled game is a huge (~270 MB) block of
+# generated C; with no CMAKE_BUILD_TYPE the compiler emits it at -O0 and the game
+# runs at a small fraction of full speed (terrible framerate). A naive
+# `cmake -B build` (as in the README) must NOT produce that, so default to
+# Release when the user hasn't chosen a type. Single-config generators only;
+# multi-config (VS/Xcode) pick per-build. Overridable with -DCMAKE_BUILD_TYPE=...
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Release/RelWithDebInfo/Debug)" FORCE)
+    message(STATUS "psxrecomp: no CMAKE_BUILD_TYPE set — defaulting to Release "
+                   "(optimized). Use -DCMAKE_BUILD_TYPE=RelWithDebInfo/Debug to override.")
+endif()
+
 # Content-addressed compiler cache (ccache). git branch operations (checkout /
 # merge / new branch) rewrite working-tree file mtimes, which makes ninja treat
 # the ~279 MB generated-C objects as stale and recompile them (~15 min) even when
@@ -151,6 +164,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
     ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
+    ${PSXRECOMP_ROOT}/runtime/src/text_xlate.cpp
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/device_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
@@ -168,6 +182,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/spu.c
     ${PSXRECOMP_ROOT}/runtime/src/spu_shadow.c
     ${PSXRECOMP_ROOT}/runtime/src/audio_shadow.c
+    ${PSXRECOMP_ROOT}/runtime/src/audio_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/color_lut.c
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader.cpp
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader_c.cpp
@@ -186,7 +201,9 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/code_provider.c
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/game_options.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_keybinds.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
+    ${PSXRECOMP_ROOT}/recompiler/src/ps1_exe_parser.cpp
     # Tier-2 in-process JIT backend (sljit, BSD-2-Clause). Single TU; sljit
     # auto-detects the host arch (SLJIT_CONFIG_AUTO). See lib/sljit/LICENSE.
     ${PSXRECOMP_ROOT}/lib/sljit/sljit_src/sljitLir.c
@@ -195,6 +212,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
 set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
     ${PSXRECOMP_ROOT}/runtime/include
     ${PSXRECOMP_ROOT}/recompiler/src
+    ${PSXRECOMP_ROOT}/recompiler/include
     ${PSXRECOMP_ROOT}/recompiler/lib/fmt/include
     ${PSXRECOMP_ROOT}/recompiler/lib/toml11
     ${PSXRECOMP_ROOT}/lib/sljit/sljit_src

@@ -36,6 +36,7 @@
 #include "event_ring.h"
 #include "lockstep.h"
 #include "psx_cycles.h"
+#include "psx_scheduler.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -47,7 +48,7 @@ extern int g_dirty_interp_active;
 extern uint32_t g_dirty_safe_resume_pc;
 
 /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt; dumped via `irqctx_ring`). */
-#define IRQCTX_RING_CAP 64u
+#define IRQCTX_RING_CAP 4096u
 typedef struct {
     uint64_t seq, cycle;
     uint32_t frame, istat, imask, sr, d44, cdrom_active, is_vblank;
@@ -67,6 +68,13 @@ typedef struct {
     uint32_t ra_exit;      /* cpu->gpr[31] at exit before restore decision */
     uint32_t ra_saved;     /* saved_gpr[31] */
     uint32_t redirects;    /* jmp_val==2 RestoreState redirects in this delivery */
+    /* Ape memcard native<->interp resume-desync probe: the live sp and the
+     * dirty pump-site at IRQ ENTRY. The interrupted-thread TCB save captures
+     * exactly this (resume_pc=take_pc, sp=entry_sp); a pair where take_pc is a
+     * dirty return point but entry_sp belongs to a native callee's frame is the
+     * corrupt snapshot (0x801384AC paired with 0x801EFE80). */
+    uint32_t entry_sp;     /* cpu->gpr[29] at exception entry */
+    uint32_t pump_site;    /* g_cosim_dirty_pump_site at entry (which delivery path) */
 } IrqCtxEntry;
 IrqCtxEntry g_irqctx_ring[IRQCTX_RING_CAP];
 uint64_t    g_irqctx_seq = 0;
@@ -124,6 +132,7 @@ static uint32_t dispatch_count;
 static uint64_t total_checks;
 static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
 extern uint64_t g_vblank_raise_count;
+extern int g_cosim_dirty_pump_site;
 
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
@@ -415,6 +424,15 @@ extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
  * That fiber's wrapped SwitchToFiber call will observe the flag on
  * return and execute the longjmp on the correct stack. */
 jmp_buf exception_jmpbuf;  /* non-static so traps.c can deferred-longjmp */
+/* Monotonic epoch of the exception setjmp frame: bumped each time the setjmp
+ * loop is (re)armed at exception entry. Lets an observer holding a frame on
+ * the C stack (the overlay shadow-diff, run_shadow_diff) decide whether a
+ * longjmp targets a frame BELOW it (armed before it — the unwind escapes its
+ * frame and skips its epilogue) or a frame armed after it (contained). The
+ * single global exception_jmpbuf always holds the latest-armed frame, so the
+ * current epoch identifies every longjmp's target. */
+uint64_t g_exc_setjmp_epoch = 0;
+uint64_t psx_exception_setjmp_epoch(void) { return g_exc_setjmp_epoch; }
 /* The fiber that owns the current exception setjmp. A longjmp must run on
  * that same fiber/stack, so a non-owner defers by switching back to it
  * first (see deferred_exception_longjmp). Used on all platforms now that
@@ -430,6 +448,34 @@ extern int g_psx_dispatch_depth;
 static uint32_t s_compiled_interrupt_resume_pc = 0;
 static uint32_t s_last_interrupt_check_pc = 0;
 static uint64_t s_last_interrupt_check_cycle = UINT64_MAX;
+
+/* Deferred cooperative thread switch from nested exception delivery.
+ *
+ * A genuine in-exception ChangeThread (kind-30, escape site below) must be
+ * honored at the OUTERMOST dispatch boundary, never mid-nested-host-dispatch.
+ * Only at the outermost boundary is the outgoing thread's guest state fully
+ * materialized in CPUState (its true block PC is live, GPRs current); nested
+ * inside a call unit / dirty pump the PC lives only in the resume-PC latch,
+ * which desyncs from the live GPRs when the IRQ was taken deep inside a nested
+ * call (the async-poll callback), so switching there saves a poisoned context
+ * (latched PC ahead of the callback's registers) → the resumed thread dispatches
+ * a jumptable with a smeared index → misaligned DISPATCH FATAL. When a switch is
+ * detected nested, we record it here, let the outgoing thread resume
+ * transparently, and honor it at the next outermost block-leader boundary (top
+ * of psx_check_interrupts) where the thread can be re-saved cleanly. */
+static int      s_defer_switch_pending = 0;
+static uint32_t s_defer_switch_target  = 0;  /* TCB PCB[0] should name after the switch */
+static uint32_t s_defer_switch_from    = 0;  /* the interrupted thread to re-save cleanly */
+
+/* A/B toggle: PSX_DEFER_SWITCH=0 forces the legacy immediate-switch behavior
+ * (longjmp the instant a mid-exception ChangeThread is detected, regardless of
+ * nesting) so the deferred-switch fix can be compared against the baseline
+ * without a rebuild. Default ON. Latched at first query. */
+static int defer_switch_enabled(void) {
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("PSX_DEFER_SWITCH"); s = (e && e[0] == '0') ? 0 : 1; }
+    return s;
+}
 
 static int same_guest_pc(uint32_t a, uint32_t b) {
     return (((a ^ b) & 0x1FFFFFFFu) == 0);
@@ -496,6 +542,9 @@ void psx_rfe_escape_check(CPUState* cpu) {
     if (g_rfe_escape_pending && in_exception &&
         psx_fiber_current() == g_exception_owner_fiber) {
         g_rfe_escape_pending = 0;
+        /* Same shadow-frame hardening as deferred_exception_longjmp. */
+        extern void overlay_loader_shadow_escape_fixup(uint64_t target_epoch);
+        overlay_loader_shadow_escape_fixup(g_exc_setjmp_epoch);
         longjmp(exception_jmpbuf, 1); /* same fiber: safe; lands in psx_check_interrupts */
     }
 }
@@ -553,6 +602,13 @@ void interrupts_init(void) {
  * check in traps.c psx_change_thread_fiber executes the longjmp on the
  * correct stack. */
 static void deferred_exception_longjmp(int code) {
+    /* If this unwind blows through a live shadow-diff frame (a frame armed
+     * BEFORE the shadow started), restore the shadow-scoped globals its
+     * skipped epilogue would have restored — otherwise the diff instrument
+     * silently dies for the rest of the run (s_in_shadow stuck). No-op when
+     * no shadow is live or the target frame was armed inside the shadow. */
+    extern void overlay_loader_shadow_escape_fixup(uint64_t target_epoch);
+    overlay_loader_shadow_escape_fixup(g_exc_setjmp_epoch);
     if (!g_exception_owner_fiber || psx_fiber_current() == g_exception_owner_fiber) {
         longjmp(exception_jmpbuf, code);
     }
@@ -638,6 +694,15 @@ void psx_check_interrupts(CPUState* cpu) {
 
     interrupts_service_scheduled_events();
 
+    /* Idle-loop cycle skip (psx_cycles.c): detect a side-effect-free poll
+     * loop by its repeated same-PC checks and fast-forward guest time to the
+     * next internal device event in whole loop quanta. Runs BEFORE the
+     * deliverability evaluation below so an event raised by the skip is
+     * delivered in this same check, exactly at the boundary real execution
+     * would have taken it. No-ops in exception context / precise mode /
+     * lockstep (gated inside). */
+    psx_idle_note_check(cpu, s_last_interrupt_check_pc);
+
     /* User save states: this is a block-leader boundary with a known resume PC;
      * only act outside the exception handler so a restore's stack-unwind can't
      * strand a half-finished handler. Near-free when nothing is staged. A load
@@ -645,6 +710,63 @@ void psx_check_interrupts(CPUState* cpu) {
     if (!in_exception) {
         extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
         savestate_poll(cpu, s_last_interrupt_check_pc);
+    }
+
+    /* Deferred cooperative thread switch: honor at the next real thread-save
+     * boundary (see s_defer_switch_* above). A
+     * genuine in-exception ChangeThread was deferred because it was detected at a
+     * poisoned point (the IRQ fired deep inside a nested call, e.g. the
+     * async-poll callback, so the resume-PC latch desynced from the live GPRs).
+     *
+     * The dirty-RAM interpreter also pumps interrupts at synthetic transfer and
+     * call-return sites. Those sites are precise enough to deliver hardware IRQs,
+     * but not necessarily safe to snapshot a cooperative thread: the interpreter
+     * may have committed a candidate resume PC while the live CPUState stack/GPRs
+     * still describe the previous local frame. Keep the deferral pending there and
+     * honor it only once execution reaches a normal interrupt poll with site 0.
+     * Near-free when nothing is pending. */
+    if (s_defer_switch_pending && !in_exception) {
+        if (psx_hle_scheduler_enabled()) {
+            uint32_t from_tcb  = s_defer_switch_from;
+            uint32_t to_tcb    = s_defer_switch_target;
+            uint32_t resume_pc = s_last_interrupt_check_pc; /* materialized block PC */
+            if (from_tcb == 0u || to_tcb == 0u ||
+                psx_sched_current_tcb(cpu) != from_tcb) {
+                /* STALE: the guest already re-scheduled cooperatively (PCB[0] no
+                 * longer names the deferred thread) - abandon the deferral. This is
+                 * the ONLY case we clear pending without honoring; dropping when a
+                 * clean resume PC merely isn't available yet would LOSE the guest's
+                 * ChangeThread and wedge (the bug this replaces). */
+                s_defer_switch_pending = 0;
+                s_defer_switch_target  = 0;
+                s_defer_switch_from    = 0;
+                debug_server_log_thread_event(33, cpu, from_tcb, to_tcb, resume_pc);
+            } else if (g_cosim_dirty_pump_site != 0) {
+                /* Not a real suspend boundary: dirty interpreter pump sites expose
+                 * committed PCs for IRQ timing, but the matching CPUState may not
+                 * be materialized yet. */
+            } else if (resume_pc != 0u && (resume_pc & 0x3u) == 0u &&
+                       psx_is_dispatchable(resume_pc)) {
+                /* Materialized clean boundary: re-save the deferred thread cleanly
+                 * (this OVERWRITES any poisoned/sentinel EPC the guest handler wrote
+                 * for it while nested), re-point PCB[0], and honor the switch. */
+                s_defer_switch_pending = 0;
+                s_defer_switch_target  = 0;
+                s_defer_switch_from    = 0;
+                psx_sched_save_context(cpu, from_tcb, resume_pc);
+                psx_sched_set_current_tcb(cpu, to_tcb);
+                debug_server_log_thread_event(32, cpu, from_tcb, to_tcb, resume_pc);
+                g_dirty_interp_active = 0;
+                s_compiled_interrupt_resume_pc = 0;
+                g_sched_escape.target_tcb = to_tcb;
+                g_sched_escape.resume_pc  = 0;
+                g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;
+                longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run */
+            }
+            /* else: KEEP pending - this outermost boundary has no materialized
+             * resume PC (both latches 0, e.g. a scheduled-event check not tied to a
+             * block leader). Wait for the next block-leader boundary that does. */
+        }
     }
 
     /* Dispatch-loop maintenance only when NOT inside the exception handler. */
@@ -860,6 +982,9 @@ void psx_check_interrupts(CPUState* cpu) {
             e->exit_pc = 0; e->exit_reason = 0; e->same_thread = 0;
             e->restored = 0; e->v1_exit = 0; e->v1_saved = 0;
             e->ra_exit = 0; e->ra_saved = 0; e->redirects = 0;
+            e->entry_sp   = cpu->gpr[29];
+            { extern int g_cosim_dirty_pump_site;
+              e->pump_site = (uint32_t)g_cosim_dirty_pump_site; }
         }
     }
 
@@ -942,6 +1067,43 @@ void psx_check_interrupts(CPUState* cpu) {
      * so the EPC-sentinel longjmp can't leave the flag wrong. */
     int prev_interp_active = g_dirty_interp_active;
     g_dirty_interp_active = 0;
+    /* Ape memcard fix #3 (2026-07-07): clear the dirty-interp resume-PC latch
+     * across the handler dispatch, exactly like g_dirty_interp_active above.
+     *
+     * The interrupted dirty block set g_dirty_safe_resume_pc = its committed PC
+     * and left it LIVE across its own psx_check_interrupts call (the dirty pump
+     * only restores it AFTER that call returns). Without clearing it here, a
+     * NESTED interrupt taken inside the handler — e.g. a VBLANK delivered while
+     * the kernel's async-poll memory-card callback runs (in_exception, IEc
+     * re-enabled) — inherits the OUTER interrupted block's stale resume PC as its
+     * EPC. same-thread-restore then matches (cpu->pc == that stale EPC) and
+     * resumes the OUTER block with the CALLBACK's registers: the Ape memcard
+     * consumer at 0x801382CC gets v1 (jumptable index) = the callback's pointer
+     * 0x800B4E30, bounds-check already passed, `jr jumptable[garbage]` faults
+     * (DISPATCH FATAL misaligned 0x3) — or, in the soft variant, drives a wrong
+     * branch that skips DeliverEvent(0xF0000011,4) and the card scene wedges.
+     * (irqctx_ring proof: exit_pc=0x801382CC, ra_saved=0x80010094 [callback],
+     * v1_saved=0x800B4E30, restored=1.)
+     *
+     * Cleared here so a nested delivery latches the ACTUALLY-running code's PC:
+     * the callback's own dirty pump re-sets g_dirty_safe_resume_pc for its
+     * blocks, and compiled handler code uses s_compiled_interrupt_resume_pc.
+     * Restored after the dispatch loop (below), which the RFE/escape longjmp
+     * lands in — so the escape can't leave the latch wrong. A/B off:
+     * PSX_EXC_CLEAR_RESUME_LATCH=0. */
+    static int s_clear_resume_latch = -1;
+    if (s_clear_resume_latch < 0) {
+        const char *e = getenv("PSX_EXC_CLEAR_RESUME_LATCH");
+        s_clear_resume_latch = (e && *e) ? atoi(e) : 1;
+    }
+    uint32_t saved_dirty_resume_pc = g_dirty_safe_resume_pc;
+    if (s_clear_resume_latch) g_dirty_safe_resume_pc = 0;
+    /* Wall-time sampler phase: the handler dispatch runs recompiled static
+     * BIOS text. Same save/restore contract as g_dirty_interp_active above —
+     * the restore sits after the setjmp loop, covering longjmp landings. */
+    extern int g_exec_phase;
+    int prev_exec_phase = g_exec_phase;
+    g_exec_phase = 3;
     /* Dispatch-depth contract across the async handler (Tomba 2 splash, post
      * overlay-floor fix). The interrupt can be delivered from a NESTED dispatch
      * (the local-flow pump runs inside dirty_ram_dispatch at depth > 0). The
@@ -954,6 +1116,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * ("execution completed" abnormal exit). */
     int saved_dispatch_depth = g_psx_dispatch_depth;
     g_psx_dispatch_depth = 0;
+    g_exc_setjmp_epoch++;   /* new setjmp frame armed (see decl above) */
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
         if (jmp_val == 2) {
@@ -982,6 +1145,12 @@ void psx_check_interrupts(CPUState* cpu) {
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
     g_dirty_interp_active = prev_interp_active;
+    /* Ape memcard fix #3: restore the resume-PC latch cleared at handler entry
+     * (see above). Sits with the other post-dispatch-loop restores so an
+     * RFE/RestoreState longjmp — which lands in the setjmp loop above — can't
+     * strand it at 0. */
+    if (s_clear_resume_latch) g_dirty_safe_resume_pc = saved_dirty_resume_pc;
+    g_exec_phase = prev_exec_phase;
     /* Restore the interrupted code's dispatch nesting (see save above). The
      * handler's frames were unwound by longjmp without decrementing, so the
      * live counter is meaningless here — overwrite, don't decrement. */
@@ -1117,6 +1286,118 @@ void psx_check_interrupts(CPUState* cpu) {
             : psx_get_cycle_count() + POST_EXC_CLAIMED_COOLDOWN_CYCLES;
     }
     if (g_ls_suppress_record > 0) g_ls_suppress_record--;
+
+    /* In-exception thread switch (Ape Escape NEW GAME memcard scene).
+     *
+     * A game can run its OWN cooperative scheduler inside the kernel exception
+     * handler: its VBlank/exception callback moves dword_108->entry (PCB[0], the
+     * current-thread pointer) to the next thread, and ReturnFromException (0xF40)
+     * then restores THAT thread. On real hardware the RFE atomically switches
+     * execution to the new thread. (docs/psx_bios_disasm.txt: both ExceptionHandler
+     * 0xC80 and ReturnFromException 0xF40 key off dword_108->entry.)
+     *
+     * Under the HLE TCB scheduler the interrupted thread is running via a
+     * structured dispatch on the host stack. Returning normally here does NOT
+     * transfer to the new thread — the generated block leader just falls through
+     * to the interrupted thread's next block (it never re-reads cpu->pc). The
+     * interrupted thread therefore keeps physically executing while PCB[0] already
+     * names a different thread; a subsequent exception then saves the running
+     * (old) thread's EPC into the NEW thread's TCB, corrupting it. That is the
+     * Ape "Checking… MEMORY CARD" wedge: the transition thread's ec8 PC is written
+     * into main's TCB EPC, main is later RFE'd there with main's regs, and its
+     * store lands on the transition thread's TCB status word (kill → target_missing
+     * forever). See ape_thread_smear_rootcause.md.
+     *
+     * Honor the switch exactly as a cooperative ChangeThread is honored: unwind to
+     * psx_scheduler_run and dispatch whatever PCB[0] now points at, from its
+     * committed TCB context (the guest handler already saved the interrupted
+     * thread into ITS own TCB before the switch). Gated to the OUTERMOST exception
+     * (prev_in_exception==0 → no live outer exception_jmpbuf frame to skip) and to
+     * the HLE scheduler (the legacy fiber bridge has no g_scheduler_jmpbuf and
+     * switches threads by fiber). */
+    if (prev_in_exception == 0 && psx_hle_scheduler_enabled() &&
+        entry_tcb != 0u && exit_tcb != 0u && entry_tcb != exit_tcb) {
+        extern uint32_t psx_read_word(uint32_t addr);   /* memory.c (plain RAM read) */
+        uint32_t new_state = psx_read_word(exit_tcb & 0x1FFFFFFFu);
+        if (new_state == 0x4000u) {   /* the new current thread must be runnable */
+            /* Fix #2: honor the switch ONLY at the outermost dispatch boundary,
+             * where the outgoing thread's guest state is fully materialized in
+             * CPUState. Nested inside a host call unit / dirty pump, the outgoing
+             * thread's PC lives only in the resume-PC latch, which desyncs from the
+             * live GPRs when the IRQ was taken deep inside a nested call (the
+             * async-poll callback) — switching there commits a poisoned TCB context
+             * and the resumed thread faults on a smeared jumptable index. */
+            extern int g_call_unit_depth;
+            int at_outermost = (g_psx_dispatch_depth == 0 && g_call_unit_depth == 0);
+            /* Defer only when nested AND the outgoing thread has a valid resume PC
+             * of its OWN (g_exception_real_epc — the architectural EPC latched for
+             * THIS delivery). The guest handler's in-exception ReturnFromException
+             * (traps.c syscall 3, in_exception path) has already restored the TARGET
+             * thread's GPRs and set cpu->pc to the target's EPC; to resume the
+             * OUTGOING thread transparently we must put cpu->pc back to ITS resume PC
+             * as well, not leave it pointing at the target. If we have no clean
+             * outgoing resume PC (sentinel / clean-trampoline boundary), or the
+             * toggle is off, or we are already outermost, switch immediately. */
+            /* Low BIOS/kernel code is already scheduler code; deferring it can
+             * starve a target thread by re-entering the same VBlank EPC forever. */
+            uint32_t epc_phys = g_exception_real_epc & 0x1FFFFFFFu;
+            int low_kernel_epc = (epc_phys < 0x00010000u);
+            int can_defer = defer_switch_enabled() && !low_kernel_epc && !at_outermost &&
+                            g_exception_real_epc != 0u &&
+                            (g_exception_real_epc & 0x3u) == 0u &&
+                            g_exception_real_epc != (uint32_t)PSX_EXC_SENTINEL_PC &&
+                            psx_is_dispatchable(g_exception_real_epc);
+            if (!can_defer) {
+                /* Outermost / no clean deferral: honor immediately — the guest
+                 * handler's save of the outgoing thread is consistent here (or this
+                 * is the pre-existing baseline path). */
+                debug_server_log_thread_event(30, cpu, entry_tcb, exit_tcb, cpu->pc);
+                /* The longjmp skips psx_check_interrupts_at's restore of the compiled
+                 * resume-PC latch; clear it so the next thread's block-leader delivery
+                 * recomputes real_pc cleanly rather than inheriting a stale value. */
+                s_compiled_interrupt_resume_pc = 0;
+                /* This escape uses g_scheduler_jmpbuf (unwinding to psx_scheduler_run),
+                 * NOT exception_jmpbuf — so it BYPASSES the landing above that restores
+                 * g_dirty_interp_active. From the dirty-RAM entry poll the flag is 1
+                 * and would LEAK across the unwind; we abandon the dirty-interp
+                 * dispatch here, so it MUST be 0 (dirty_ram_interp.c ~205-210 contract;
+                 * no-op from compiled code where the flag was already 0). */
+                g_dirty_interp_active = 0;
+                g_sched_escape.target_tcb = exit_tcb;
+                g_sched_escape.resume_pc  = 0;
+                g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;
+                longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
+            }
+            /* Nested in host dispatch: DEFER. The guest handler has already saved a
+             * POISONED context for the outgoing thread (latched PC ahead of the live
+             * registers), but we do NOT switch off it. Instead resume the outgoing
+             * thread transparently — restoring its clean pre-exception GPRs/HI/LO/SR
+             * (do_restore above ran false for this genuine cross-thread case) — so it
+             * finishes its nested calls; record the switch as pending and honor it at
+             * the next outermost boundary (top of this function), re-saving the thread
+             * cleanly there. Keep PCB[0] naming the STILL-RUNNING thread during the
+             * interim so any interim exception saves into the right TCB (closes the
+             * mis-save window the immediate switch used to avoid); the guest's intent
+             * to run exit_tcb is preserved as the pending switch. Coalesces: the newest
+             * guest ChangeThread wins the target. */
+            for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
+            cpu->hi = saved_hi;
+            cpu->lo = saved_lo;
+            cpu->cop0[COP0_SR] = sr;   /* pre-exception SR (IEc was set — gate above) */
+            cpu->pc = g_exception_real_epc; /* resume the OUTGOING thread at ITS own PC,
+                                             * not the target PC the in-exception RFE
+                                             * left in cpu->pc — else it runs the target's
+                                             * code under the outgoing thread and never
+                                             * reaches its own block leaders to be honored. */
+            psx_sched_set_current_tcb(cpu, entry_tcb);
+            s_defer_switch_from    = entry_tcb;
+            s_defer_switch_target  = exit_tcb;
+            s_defer_switch_pending = 1;
+            s_compiled_interrupt_resume_pc = 0;
+            debug_server_log_thread_event(31, cpu, entry_tcb, exit_tcb, cpu->pc);
+            /* fall through: return normally — the outgoing thread resumes. */
+        }
+    }
 #ifdef PSX_COSIM
 #undef COSIM_IRQ_NOTE
 #undef COSIM_IRQ_TAKE_PC

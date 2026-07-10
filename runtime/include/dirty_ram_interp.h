@@ -50,15 +50,20 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
  *   Overlay region [OVERLAY_REGION_FLOOR, RAM_SIZE): game overlays loaded by
  *     CD DMA (dirty_ram_mark_executable_range).
  *
- * Main-EXE text [0x10000, OVERLAY_REGION_FLOOR) is statically recompiled and
- * is NEVER a capture/candidate window. The floor equals the main EXE text end
- * (Tomba: load 0x10000 + text 0x88000).
+ * Main-EXE text [0x10000, OVERLAY_REGION_FLOOR): CLEAN pages are statically
+ * recompiled and never captured. But games that discard their boot/init code
+ * load gameplay overlays OVER this region (Tomba 2: hot gameplay code at
+ * 0x1DA88/0x24548/0x3116C, well below its 0x38800 floor). Post-baseline
+ * (dirty_ram_clear_image_baseline) a DIRTY page here is by definition live
+ * overlay code — the compiled image is stale for it — so dirty boot-text
+ * pages ARE a capture/candidate window (2026-07-06; before this they could
+ * only interpret, which dominated wall time at ~300ns/insn).
  *
  * The interpreter's LOCAL-FLOW gates (is_local_dirty_target /
- * allow_local_dirty_flow) intentionally use OVERLAY_REGION_FLOOR alone, NOT
- * this window predicate: kernel-RAM code runs in exception context where the
- * verified per-block dispatch cadence is preserved. Native coverage for the
- * kernel window comes from the overlay loader, not from interp chaining. */
+ * phys_is_overlay_flow_region) use DIRTY_RAM_KERNEL_WINDOW_END alone: only
+ * the kernel window stays per-block (it runs in exception context where the
+ * verified dispatch cadence is delicate). Native coverage for the kernel
+ * window comes from the overlay loader, not from interp chaining. */
 #define DIRTY_RAM_KERNEL_WINDOW_END 0x00010000u
 
 /* The overlay-region floor is the END of THIS game's statically-recompiled
@@ -76,17 +81,34 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 #define OVERLAY_REGION_FLOOR_DEFAULT 0x00098000u
 extern uint32_t g_overlay_region_floor;
 #define OVERLAY_REGION_FLOOR (g_overlay_region_floor)
-static inline int overlay_cache_window_contains(uint32_t phys) {
-    return phys < DIRTY_RAM_KERNEL_WINDOW_END || phys >= OVERLAY_REGION_FLOOR;
-}
 
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
+
+/* Capture/candidate window membership. Kernel window and overlay region are
+ * unconditional; main-EXE text [KERNEL_WINDOW_END, FLOOR) is included only
+ * when the page is dirty — i.e. a gameplay overlay overwrote the boot text
+ * after the game-start baseline, so the bytes there are runtime overlay code
+ * (see the window model note above). Clean boot text never enters the window
+ * (it runs compiled; capturing it would violate the static-first design). */
+static inline int overlay_cache_window_contains(uint32_t phys) {
+    return phys < DIRTY_RAM_KERNEL_WINDOW_END
+        || phys >= OVERLAY_REGION_FLOOR
+        || dirty_ram_is_dirty(phys);
+}
 uint32_t dirty_ram_get_bitmap(void);
 uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
 uint32_t dirty_ram_get_bitmap_word_count(void);
 void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
+void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
+                                       uint32_t len);
+int      dirty_ram_text_native_ok(uint32_t phys);
+/* Bless an intentional runtime data patch (e.g. text_xlate string/glyph tables)
+ * into the text reference image so it is not mistaken for self-modifying code. */
+void     dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len);
+uint64_t dirty_ram_text_native_blocked(void);
+uint32_t dirty_ram_text_diverged_pages(void);
 
 /* Counters for visibility / TCP debug.  Increment in interpreter; expose
  * via debug_server.c if helpful. */

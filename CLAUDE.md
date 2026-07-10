@@ -43,11 +43,11 @@ loss), never as the starting point — see §0's amendment below and
 recomp-template `PRINCIPLES.md` → "LLE Is the Baseline; HLE Is a Subsystem
 Replacement, Not a Starting Point".
 
-**The authoritative game plan is `FAITHFUL_TIMING_PLAN.md` — READ IT EACH
+**The authoritative game plan is `docs/internal/FAITHFUL_TIMING_PLAN.md` — READ IT EACH
 SESSION** (north star, phased plan P1–P6, current status/log). Update its
 Status/Log section every session. The full-coverage accuracy burndown across ALL
 axes (semantics, cycle, IRQ, MMIO, peripherals, static-vs-dynamic, determinism)
-lives in `ACCURACY_BURNDOWN.md` — every item must be cross-referenced against an
+lives in `docs/internal/ACCURACY_BURNDOWN.md` — every item must be cross-referenced against an
 external comparative (psx-spx / in-tree Beetle source / DuckStation / HW test
 ROMs), not asserted. Axis 5 (peripherals — esp. SIO/controller, the hybrid-pad
 bug) is the suspected-weakest second front after the cycle axis.
@@ -114,11 +114,19 @@ first-class High-Level Emulation tier alongside LLE, modeled on
 `F:/Projects/gbarecomp/gbarecomp` (`src/runtime/bios_hle.{h,cpp}`, commits
 23a57ce + 168e313):
 
-1. **Two selectable backends, LLE default.** A null-by-default hook intercepts
-   BIOS service dispatch before the recompiled BIOS runs; selection is
-   per-game config (`[runtime] bios_hle = true`) + env override (PSX_BIOS_HLE), with a startup
-   banner naming the active backend. With HLE off the build is byte-identical
-   to a build without the tier.
+1. **Two selectable backends. AMENDMENT 2026-07-06 — HLE is now the DEFAULT, but
+   this changes NOTHING institutional.** We still BUILD LLE: the recompiled BIOS
+   is the foundation we architect against, the reference implementation, and the
+   oracle — fully linked, load-bearing, selectable, and the thing every accuracy
+   check runs against. HLE is a QoL layer we lay ON TOP (instant boot-skip for
+   players); the faithful LLE core is proven, so defaulting the convenience on is
+   an enhancement-phase load-time win, not an architecture change. Mechanically
+   this only flips the framework runtime default `bios_hle` false→true
+   (`config_loader.h`); opt OUT per-game with `[runtime] bios_hle = false` or env
+   `PSX_BIOS_HLE=0`. A null-by-default hook intercepts BIOS service dispatch
+   before the recompiled BIOS runs; a startup banner names the active backend.
+   With HLE off the build is byte-identical to a build without the tier. Keep new
+   bring-up and all verification on LLE; HLE-default is the shipping convenience.
 2. **LLE remains the reference implementation and the oracle.** It stays fully
    linked, load-bearing, and selectable; every BIOS call the HLE layer does
    not implement transparently falls through to the recompiled BIOS, so HLE is
@@ -141,14 +149,14 @@ first-class High-Level Emulation tier alongside LLE, modeled on
 
 If you find yourself wanting to violate any of the above three
 paragraphs **beyond the two amendments just above**,
-**stop and re-read PLAN.md**. Every prior attempt failed by
+**stop and re-read docs/internal/PLAN.md**. Every prior attempt failed by
 violating exactly these rules under pressure.
 
 ---
 
 ## 1. The BIOS is recompilation target #1, the game is target #2
 
-Phase 1-3 of PLAN.md exist to get the BIOS recompiled and booting on
+Phase 1-3 of docs/internal/PLAN.md exist to get the BIOS recompiled and booting on
 its own. The BIOS must reach the Sony logo and the BIOS shell, running
 entirely as native C, before any game work begins. There is no path
 that loads a game EXE before the BIOS is fully working in v4. **Do not
@@ -228,7 +236,7 @@ a fake event. The fake delivery was not progress, it was theater.
 At the start of every session, before any code change:
 
 1. Read this file (CLAUDE.md).
-2. Read PLAN.md to confirm what phase we are in and what the next
+2. Read docs/internal/PLAN.md to confirm what phase we are in and what the next
    concrete milestone is.
 3. Verify `docs/psx_bios_disasm.txt` exists (primary reference).
 4. Verify Ghidra MCP is reachable. If not, stop and ask.
@@ -322,7 +330,7 @@ Code without proof is invalid.
 
 Before any Phase 2 work:
 
-- FIRST_MILESTONE.md must be complete
+- docs/internal/FIRST_MILESTONE.md must be complete
 - boot_slice must compile
 - all instructions must be supported
 
@@ -454,7 +462,7 @@ the visibility you need.
 
 ## 17. Phase 5 gate — fix hardware stubs before loading a game
 
-`STUBS_TO_FIX.md` lists every known stub in the runtime. Before any
+`docs/internal/STUBS_TO_FIX.md` lists every known stub in the runtime. Before any
 Phase 5 work (loading Tomba or any game EXE), every stub marked
 "Phase 5+" in that file **must be implemented and oracle-verified**:
 

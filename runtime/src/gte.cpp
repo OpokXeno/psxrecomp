@@ -2,6 +2,8 @@
 #include "cpu_state.h"
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 namespace PSXRecomp {
 namespace GTE {
@@ -10,23 +12,70 @@ namespace GTE {
 // Common helpers
 // ---------------------------------------------------------------------------
 
-// Perspective division: H * 0x20000 / SZ3, result capped at 0x1FFFF
+// Perspective division: H / SZ3, scaled, saturated to 17 bits.
+//
+// The real PS1 GTE does NOT compute an exact H*0x20000/SZ3. It uses an
+// Unsigned Newton-Raphson (UNR) reciprocal approximation driven by a 257-entry
+// seed table (documented in PSX-SPX "GTE Division Inaccuracy"; identical to the
+// mednafen/Beetle oracle in beetle-psx/mednafen/psx/gte.cpp). Exact division
+// diverges from hardware by +/-1 (occasionally up to a few units) on ~25% of
+// inputs, which is enough to flip games' distance/intensity threshold branches
+// (e.g. Ape Escape's additive-glow CLUT semi-transparency bit). This is the
+// faithful hardware algorithm, shared by every RTPS/RTPT caller.
+static uint8_t s_gte_div_table[0x101];
+static bool    s_gte_div_table_init = false;
+static void gte_init_div_table() {
+    for (uint32_t divisor = 0x8000; divisor < 0x10000; divisor += 0x80) {
+        uint32_t xa = 512;
+        for (unsigned i = 1; i < 5; i++)
+            xa = (xa * (1024u * 512u - ((divisor >> 7) * xa))) >> 18;
+        s_gte_div_table[(divisor >> 7) & 0xFF] =
+            (uint8_t)(((xa + 1) >> 1) - 0x101);
+    }
+    s_gte_div_table[0x100] = s_gte_div_table[0xFF];
+    s_gte_div_table_init = true;
+}
+static int32_t gte_calc_recip(uint16_t divisor) {
+    int32_t x    = 0x101 + s_gte_div_table[(((divisor & 0x7FFF) + 0x40) >> 7)];
+    int32_t tmp  = (((int32_t)divisor * -x) + 0x80) >> 8;
+    int32_t tmp2 = ((x * (131072 + tmp)) + 0x80) >> 8;
+    return tmp2;
+}
+// count leading zeros of a 16-bit value (0 -> 16)
+static inline unsigned gte_clz16(uint16_t v) {
+    unsigned n = 0;
+    for (int b = 15; b >= 0; --b) { if (v & (1u << b)) break; ++n; }
+    return n;
+}
 static int32_t gte_divide(uint16_t H, uint16_t SZ3, uint32_t& FLAG) {
-    if (SZ3 == 0) {
+    if (!s_gte_div_table_init) gte_init_div_table();
+    // Hardware: overflow flag + saturate when 2*SZ3 <= H (includes SZ3 == 0).
+    if ((uint32_t)SZ3 * 2 <= (uint32_t)H) {
         FLAG |= FLAG_DIV_OVF;
         return 0x1FFFF;
     }
-    // (H * 0x20000 / SZ3 + 1) / 2 — correct PS1 formula with rounding
-    int64_t result = (((int64_t)H * 0x20000) / SZ3 + 1) / 2;
-    if (result > 0x1FFFF) {
-        FLAG |= FLAG_DIV_OVF;
-        return 0x1FFFF;
-    }
-    return static_cast<int32_t>(result);
+    unsigned shift_bias = gte_clz16(SZ3);
+    uint32_t dividend = (uint32_t)H   << shift_bias;
+    uint32_t divisor  = (uint32_t)SZ3 << shift_bias;
+    uint32_t result = (uint32_t)(((uint64_t)dividend *
+                                  (uint32_t)gte_calc_recip((uint16_t)(divisor | 0x8000))
+                                  + 32768) >> 16);
+    if (result > 0x1FFFF) result = 0x1FFFF;   // 17-bit saturate (no flag; matches hw path)
+    return (int32_t)result;
 }
 
+// lm (bit 10) selects the lower clamp bound of every IR write in the
+// lighting/depth-cue ops: 0 → -0x8000, 1 → 0. sf (bit 19) selects the
+// accumulator shift. Hardware takes BOTH from the instruction word; these
+// helpers used to hardcode lm=1, which zeroed every negative component —
+// Crash Bash lerps signed VERTICES through INTPL (lm=0), so its characters
+// collapsed onto their anchor point on every tween frame (menu strobe bug).
+static inline bool gte_instr_lm(uint32_t instr) { return (instr & (1u << 10)) != 0; }
+static inline int  gte_instr_sf(uint32_t instr) { return (instr & (1u << 19)) ? 12 : 0; }
+
 // Transform a vertex by Light matrix → IR1/IR2/IR3 (step 1 of lighting)
-static void light_transform(GTEState* gte, int16_t* V) {
+static void light_transform(GTEState* gte, int16_t* V, uint32_t instr) {
+    const bool lm = gte_instr_lm(instr);
     int64_t mac1 = ((int64_t)gte->L[0][0] * V[0] +
                     (int64_t)gte->L[0][1] * V[1] +
                     (int64_t)gte->L[0][2] * V[2]) >> 12;
@@ -39,13 +88,14 @@ static void light_transform(GTEState* gte, int16_t* V) {
     gte->MAC1 = static_cast<int32_t>(mac1);
     gte->MAC2 = static_cast<int32_t>(mac2);
     gte->MAC3 = static_cast<int32_t>(mac3);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, true);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, true);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, true);
+    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
+    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
+    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
 }
 
 // Apply light color matrix + background color to IR → IR (step 2 of lighting)
-static void light_color(GTEState* gte) {
+static void light_color(GTEState* gte, uint32_t instr) {
+    const bool lm = gte_instr_lm(instr);
     int64_t mac1 = ((int64_t)gte->BK[0] << 12) +
                    (int64_t)gte->LC[0][0] * gte->IR1 +
                    (int64_t)gte->LC[0][1] * gte->IR2 +
@@ -61,13 +111,14 @@ static void light_color(GTEState* gte) {
     gte->MAC1 = static_cast<int32_t>(mac1 >> 12);
     gte->MAC2 = static_cast<int32_t>(mac2 >> 12);
     gte->MAC3 = static_cast<int32_t>(mac3 >> 12);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, true);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, true);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, true);
+    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
+    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
+    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
 }
 
 // Multiply IR by RGBC color and push to RGB FIFO (step 3 of color output)
-static void color_output(GTEState* gte) {
+static void color_output(GTEState* gte, uint32_t instr) {
+    const bool lm = gte_instr_lm(instr);
     uint8_t r0 = (gte->RGBC >> 0)  & 0xFF;
     uint8_t g0 = (gte->RGBC >> 8)  & 0xFF;
     uint8_t b0 = (gte->RGBC >> 16) & 0xFF;
@@ -77,32 +128,45 @@ static void color_output(GTEState* gte) {
     gte->MAC1 = static_cast<int32_t>(mac1 >> 12);
     gte->MAC2 = static_cast<int32_t>(mac2 >> 12);
     gte->MAC3 = static_cast<int32_t>(mac3 >> 12);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, true);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, true);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, true);
+    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
+    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
+    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
     gte->push_rgb(
         gte->saturate_color(gte->MAC1 >> 4, 0),
         gte->saturate_color(gte->MAC2 >> 4, 1),
         gte->saturate_color(gte->MAC3 >> 4, 2));
 }
 
-// Depth cue from current IR values using IR0 interpolation toward far color
-// MAC = FC * 0x1000 - (BK + LC*IR) * 0x1000 ; then IR = (BK+LC*IR) + IR0 * MAC / 0x1000
-static void depth_cue_from_ir(GTEState* gte) {
-    // Interpolate: result = IR + IR0 * (FC - IR) / 0x1000
-    int64_t mac1 = ((int64_t)gte->FC[0] << 12) - ((int64_t)gte->IR1 << 12);
-    int64_t mac2 = ((int64_t)gte->FC[1] << 12) - ((int64_t)gte->IR2 << 12);
-    int64_t mac3 = ((int64_t)gte->FC[2] << 12) - ((int64_t)gte->IR3 << 12);
-    // Scale by IR0 and add back
-    mac1 = (int64_t)gte->IR1 + ((gte->IR0 * (mac1 >> 12)) >> 12);
-    mac2 = (int64_t)gte->IR2 + ((gte->IR0 * (mac2 >> 12)) >> 12);
-    mac3 = (int64_t)gte->IR3 + ((gte->IR0 * (mac3 >> 12)) >> 12);
+// Depth cue / interpolate current IR toward the far color using IR0
+// (common tail of DPCS/DPCT/DPCL/INTPL/NCDS/NCDT/CDP). Hardware:
+//   base    = IR << 12
+//   step    = lim(((FC << 12) - base) >> (sf*12))   ; ±0x8000 clamp, lm FORCED off
+//   MAC     = (base + IR0 * step) >> (sf*12)
+//   IR      = lim(MAC, lm)                          ; lm from the instruction
+static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
+    const int  shift = gte_instr_sf(instr);
+    const bool lm    = gte_instr_lm(instr);
+    int64_t base1 = (int64_t)gte->IR1 << 12;
+    int64_t base2 = (int64_t)gte->IR2 << 12;
+    int64_t base3 = (int64_t)gte->IR3 << 12;
+    int16_t step1 = gte->saturate_ir(
+        (int32_t)(( ((int64_t)gte->FC[0] << 12) - base1) >> shift), 1, false);
+    int16_t step2 = gte->saturate_ir(
+        (int32_t)(( ((int64_t)gte->FC[1] << 12) - base2) >> shift), 2, false);
+    int16_t step3 = gte->saturate_ir(
+        (int32_t)(( ((int64_t)gte->FC[2] << 12) - base3) >> shift), 3, false);
+    int64_t mac1 = (base1 + (int64_t)gte->IR0 * step1) >> shift;
+    int64_t mac2 = (base2 + (int64_t)gte->IR0 * step2) >> shift;
+    int64_t mac3 = (base3 + (int64_t)gte->IR0 * step3) >> shift;
+    gte->check_mac_overflow(mac1, 1);
+    gte->check_mac_overflow(mac2, 2);
+    gte->check_mac_overflow(mac3, 3);
     gte->MAC1 = static_cast<int32_t>(mac1);
     gte->MAC2 = static_cast<int32_t>(mac2);
     gte->MAC3 = static_cast<int32_t>(mac3);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, true);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, true);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, true);
+    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
+    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
+    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +184,7 @@ static void depth_cue_from_ir(GTEState* gte) {
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
+extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 
 // Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
 // (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
@@ -149,6 +214,345 @@ extern "C" void gte_ws_get_sz_stats(int* mn, int* mx, unsigned* n, unsigned* far
     if (n)  *n  = s_ws_sz_n;
     if (far_n) *far_n = s_ws_sz_far;
     s_ws_sz_min = 0x7FFFFFFF; s_ws_sz_max = 0; s_ws_sz_n = 0; s_ws_sz_far = 0;
+}
+
+// ---- Native-wide sky-DOME expand ------------------------------------------
+// In native-wide (mode 2) the GTE is fed identity (no squash) so the world
+// fills the wider FOV via the cull widening. But a sky DOME is a FINITE mesh
+// authored to fill 4:3 — its curved edge falls short of the wider frame corners
+// (black corners). Fix: scale the FAR-depth vertices' projected X OUTWARD from
+// the projection centre (OFX) by the frame-widening ratio (3*num)/(4*den) — the
+// inverse of the squash — so the dome grows to cover the wider FOV. DEPTH-GATED
+// (SZ >= s_ws_far_threshold) so only the farthest layer (the sky) expands while
+// nearer world geometry stays put. On + ratio set from main.cpp when native-
+// wide engages; threshold tuned live via ws_far_threshold. Off => identity.
+static int      s_ws_dome_on  = 0;
+static int32_t  s_ws_dome_num = 1, s_ws_dome_den = 1;  // expand = num/den (>1)
+extern "C" void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den) {
+    s_ws_dome_on = on ? 1 : 0;
+    // widen ratio = wide_w / disp_w = (aspect/(4:3)) = (3*num)/(4*den).
+    int32_t n = 3 * aspect_num, d = 4 * aspect_den;
+    if (n <= 0 || d <= 0 || n <= d) { s_ws_dome_num = s_ws_dome_den = 1; return; }
+    s_ws_dome_num = n; s_ws_dome_den = d;
+}
+
+// ---- Dome-locate probe -----------------------------------------------------
+// Tally which guest function (g_debug_current_func_addr, set at dispatch)
+// projects FAR (SZ >= threshold) vertices, so the sky-dome draw function can be
+// identified as the top far-vertex emitter — the target for the per-function
+// dome-expand bracket (the clean alternative to the scene-dependent depth gate).
+extern "C" { extern uint32_t g_debug_current_func_addr; }
+static uint32_t s_gte_caller_ra = 0;   /* guest ra at gte_execute = return into the GAME fn that issued the projection (not the libgte leaf) */
+#define DOME_PROBE_SLOTS 48
+static struct { uint32_t func; uint32_t count; int32_t max_sz; } s_dome_probe[DOME_PROBE_SLOTS];
+static int     s_dome_probe_on  = 0;
+static int32_t s_dome_probe_thr = 4000;
+extern "C" void gte_dome_probe(int on, int thr) {
+    s_dome_probe_on = on ? 1 : 0;
+    if (thr > 0) s_dome_probe_thr = thr;
+    if (on) for (int i = 0; i < DOME_PROBE_SLOTS; i++) { s_dome_probe[i].func = 0; s_dome_probe[i].count = 0; s_dome_probe[i].max_sz = 0; }
+}
+static inline void dome_probe_note(int32_t sz) {
+    if (!s_dome_probe_on || sz < s_dome_probe_thr) return;
+    /* Tally the guest RA (the GAME fn that jal'd to libgte for this projection),
+     * NOT g_debug_current_func_addr (which is the libgte leaf 0x80000F40). */
+    uint32_t f = s_gte_caller_ra;
+    int slot = -1, empty = -1;
+    for (int i = 0; i < DOME_PROBE_SLOTS; i++) {
+        if (s_dome_probe[i].count && s_dome_probe[i].func == f) { slot = i; break; }
+        if (empty < 0 && s_dome_probe[i].count == 0) empty = i;
+    }
+    if (slot < 0) slot = empty;
+    if (slot < 0) return;
+    s_dome_probe[slot].func = f;
+    s_dome_probe[slot].count++;
+    if (sz > s_dome_probe[slot].max_sz) s_dome_probe[slot].max_sz = sz;
+}
+extern "C" int gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* maxsz, int cap) {
+    int n = 0;
+    for (int i = 0; i < DOME_PROBE_SLOTS && n < cap; i++)
+        if (s_dome_probe[i].count) { funcs[n] = s_dome_probe[i].func; counts[n] = s_dome_probe[i].count; maxsz[n] = s_dome_probe[i].max_sz; n++; }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// GTE projection ring (ALWAYS-ON) — records each RTPS/RTPT's inputs (vertex,
+// rotation matrix, translation, projection config) and outputs (screen XY / Z /
+// FLAG). A post-hoc probe queries this to find flattened/degenerate character
+// projections and decide whether the fault is in the INPUTS supplied by the
+// recompiled game code (bad matrix/vertex) or the GTE math itself.
+// ---------------------------------------------------------------------------
+// NOTE: this block is already inside namespace PSXRecomp::GTE (opened line 8),
+// so types are referred to unqualified.
+extern "C" { extern uint64_t s_frame_count; }
+struct GteRtpRec {
+    uint32_t seq, frame, caller_ra, cmd;
+    int16_t  V0[3], V1[3], V2[3];
+    int16_t  RT[9];
+    int32_t  TR[3];
+    uint16_t H;  int32_t OFX, OFY;
+    int32_t  SXY0, SXY1, SXY2;
+    uint16_t SZ1, SZ2, SZ3;
+    uint32_t FLAG;
+};
+#define GTE_RTP_RING_CAP (1u << 18)   /* 256K raw entries (~a few seconds) */
+static GteRtpRec* s_gte_rtp_ring = nullptr;
+static uint64_t   s_gte_rtp_seq  = 0;
+
+/* Per-frame aggregate stats (retained ring over recent distinct frames). Lets a
+ * probe see the alternating flat/normal render pattern without shipping 84k
+ * projections/sec over JSON. nsat = projections whose newest output vertex
+ * saturated off-screen; nflat = RTP whose last-3 output verts are collinear
+ * (area 0) = a flattened triangle. */
+#define GTE_FSTAT_CAP 512
+struct GteFStat { uint32_t frame, nproj, nsat, nflat, nintpl, nintpl_tiny; };
+static GteFStat s_gte_fstat[GTE_FSTAT_CAP];
+static uint32_t s_gte_fstat_head = 0;   /* index of most-recent frame slot */
+static int      s_gte_fstat_valid = 0;
+
+/* Degenerate-latch: full records of flat/saturated projections, retained (small
+ * ring) so intermittent flat frames are caught regardless of raw-ring roll. */
+#define GTE_LATCH_CAP (1u << 13)   /* 8192 */
+static GteRtpRec* s_gte_latch = nullptr;
+static uint64_t   s_gte_latch_seq = 0;
+
+static inline int gte_sxx(int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; }
+static inline int gte_syy(int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; }
+
+static void gte_rtp_record(const GTEState* g, uint32_t cmd) {
+    if (!s_gte_rtp_ring) {
+        s_gte_rtp_ring = (GteRtpRec*)calloc(GTE_RTP_RING_CAP, sizeof(GteRtpRec));
+        if (!s_gte_rtp_ring) return;
+    }
+    GteRtpRec* e = &s_gte_rtp_ring[s_gte_rtp_seq % GTE_RTP_RING_CAP];
+    e->seq = (uint32_t)s_gte_rtp_seq;
+    e->frame = (uint32_t)s_frame_count;
+    e->caller_ra = s_gte_caller_ra;
+    e->cmd = cmd;
+    for (int i = 0; i < 3; i++) { e->V0[i]=g->V0[i]; e->V1[i]=g->V1[i]; e->V2[i]=g->V2[i]; }
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) e->RT[r*3+c]=g->RT[r][c];
+    for (int i = 0; i < 3; i++) e->TR[i]=g->TR[i];
+    e->H=g->H; e->OFX=g->OFX; e->OFY=g->OFY;
+    e->SXY0=g->SXY[0]; e->SXY1=g->SXY[1]; e->SXY2=g->SXY[2];
+    e->SZ1=g->SZ[1]; e->SZ2=g->SZ[2]; e->SZ3=g->SZ[3];
+    e->FLAG=g->FLAG;
+    s_gte_rtp_seq++;
+
+    /* classify */
+    int x0=gte_sxx(e->SXY0),y0=gte_syy(e->SXY0);
+    int x1=gte_sxx(e->SXY1),y1=gte_syy(e->SXY1);
+    int x2=gte_sxx(e->SXY2),y2=gte_syy(e->SXY2);
+    int sat = (x2<=-1023||x2>=1023||y2<=-1023||y2>=1023) ? 1 : 0;
+    long area2 = (long)(x1-x0)*(y2-y0) - (long)(x2-x0)*(y1-y0);
+    int flat = (area2==0) ? 1 : 0;   /* three output verts exactly collinear */
+
+    /* per-frame stats */
+    uint32_t f=(uint32_t)s_frame_count;
+    if (!s_gte_fstat_valid || s_gte_fstat[s_gte_fstat_head].frame != f) {
+        s_gte_fstat_head = s_gte_fstat_valid ? (s_gte_fstat_head+1)%GTE_FSTAT_CAP : 0;
+        s_gte_fstat_valid = 1;
+        s_gte_fstat[s_gte_fstat_head].frame=f;
+        s_gte_fstat[s_gte_fstat_head].nproj=0;
+        s_gte_fstat[s_gte_fstat_head].nsat=0;
+        s_gte_fstat[s_gte_fstat_head].nflat=0;
+        s_gte_fstat[s_gte_fstat_head].nintpl=0;
+        s_gte_fstat[s_gte_fstat_head].nintpl_tiny=0;
+    }
+    s_gte_fstat[s_gte_fstat_head].nproj++;
+    s_gte_fstat[s_gte_fstat_head].nsat += sat;
+    s_gte_fstat[s_gte_fstat_head].nflat += flat;
+
+    /* latch degenerate (saturated) projections — the "flat/absent" character */
+    if (sat) {
+        if (!s_gte_latch) {
+            s_gte_latch = (GteRtpRec*)calloc(GTE_LATCH_CAP, sizeof(GteRtpRec));
+            if (!s_gte_latch) return;
+        }
+        s_gte_latch[s_gte_latch_seq % GTE_LATCH_CAP] = *e;
+        s_gte_latch_seq++;
+    }
+}
+
+extern "C" uint64_t gte_rtp_ring_total(void) { return s_gte_rtp_seq; }
+extern "C" uint64_t gte_latch_total(void) { return s_gte_latch_seq; }
+
+// ---------------------------------------------------------------------------
+// GTE INTPL ring (ALWAYS-ON) — records each INTPL (0x11) vertex-lerp: inputs
+// (IR0 blend, IR1-3 pose-A vertex, FC pose-B vertex) snapshotted BEFORE the op
+// and outputs (MAC1-3 / IR1-3 / FLAG) after. Crash Bash tweens character
+// vertex animation through INTPL; this ring decides whether collapsed tween
+// output comes from already-tiny inputs (upstream CPU/game-state divergence)
+// or from the INTPL math itself.
+// ---------------------------------------------------------------------------
+struct GteIntplRec {
+    uint32_t seq, frame, caller_ra;
+    int16_t  ir0, in1, in2, in3;
+    int32_t  fc[3];
+    int32_t  mac[3];
+    int16_t  out1, out2, out3;
+    uint32_t flag;
+};
+#define GTE_INTPL_RING_CAP (1u << 17)   /* 128K entries (~4s at menu rates) */
+static GteIntplRec* s_gte_intpl_ring = nullptr;
+static uint64_t     s_gte_intpl_seq  = 0;
+
+static void gte_intpl_record(const GTEState* g,
+                             const int16_t pre_ir[4], const int32_t pre_fc[3]) {
+    if (!s_gte_intpl_ring) {
+        s_gte_intpl_ring = (GteIntplRec*)calloc(GTE_INTPL_RING_CAP, sizeof(GteIntplRec));
+        if (!s_gte_intpl_ring) return;
+    }
+    GteIntplRec* e = &s_gte_intpl_ring[s_gte_intpl_seq % GTE_INTPL_RING_CAP];
+    e->seq = (uint32_t)s_gte_intpl_seq;
+    e->frame = (uint32_t)s_frame_count;
+    e->caller_ra = s_gte_caller_ra;
+    e->ir0 = pre_ir[0]; e->in1 = pre_ir[1]; e->in2 = pre_ir[2]; e->in3 = pre_ir[3];
+    for (int i = 0; i < 3; i++) e->fc[i] = pre_fc[i];
+    e->mac[0]=g->MAC1; e->mac[1]=g->MAC2; e->mac[2]=g->MAC3;
+    e->out1=g->IR1; e->out2=g->IR2; e->out3=g->IR3;
+    e->flag=g->FLAG;
+    s_gte_intpl_seq++;
+
+    /* per-frame stats (shares the fstat ring; nintpl_tiny = all outputs small
+     * while at least one input was not — the collapse signature) */
+    uint32_t f=(uint32_t)s_frame_count;
+    if (!s_gte_fstat_valid || s_gte_fstat[s_gte_fstat_head].frame != f) {
+        s_gte_fstat_head = s_gte_fstat_valid ? (s_gte_fstat_head+1)%GTE_FSTAT_CAP : 0;
+        s_gte_fstat_valid = 1;
+        s_gte_fstat[s_gte_fstat_head].frame=f;
+        s_gte_fstat[s_gte_fstat_head].nproj=0;
+        s_gte_fstat[s_gte_fstat_head].nsat=0;
+        s_gte_fstat[s_gte_fstat_head].nflat=0;
+        s_gte_fstat[s_gte_fstat_head].nintpl=0;
+        s_gte_fstat[s_gte_fstat_head].nintpl_tiny=0;
+    }
+    s_gte_fstat[s_gte_fstat_head].nintpl++;
+    {
+        int out_tiny = (e->out1>-48 && e->out1<48 && e->out2>-48 && e->out2<48
+                        && e->out3>-48 && e->out3<48);
+        int in_big = (e->in1<=-48 || e->in1>=48 || e->in2<=-48 || e->in2>=48
+                      || e->in3<=-48 || e->in3>=48
+                      || e->fc[0]<=-48 || e->fc[0]>=48
+                      || e->fc[1]<=-48 || e->fc[1]>=48
+                      || e->fc[2]<=-48 || e->fc[2]>=48);
+        if (out_tiny && in_big) s_gte_fstat[s_gte_fstat_head].nintpl_tiny++;
+    }
+}
+
+extern "C" uint64_t gte_intpl_ring_total(void) { return s_gte_intpl_seq; }
+
+/* Dump INTPL ring entries as JSON array body. offset skips the first N
+ * MATCHING entries (after frame filtering), so a probe can page through a
+ * whole frame regardless of where it sits in the ring. */
+extern "C" int gte_intpl_ring_dump_json(char* out, int outsz, int max_count,
+                                        int newest_first, long frame_filter,
+                                        int offset) {
+    if (!s_gte_intpl_ring || outsz < 64) { if (out && outsz) out[0]=0; return 0; }
+    uint64_t total = s_gte_intpl_seq;
+    if (total == 0) { out[0]=0; return 0; }
+    uint64_t oldest = total > GTE_INTPL_RING_CAP ? total - GTE_INTPL_RING_CAP : 0;
+    int pos = 0, emitted = 0, matched = 0;
+    for (uint64_t k = 0; k < (total - oldest) && emitted < max_count; k++) {
+        uint64_t seq = newest_first ? (total - 1 - k) : (oldest + k);
+        if (seq < oldest || seq >= total) break;
+        const GteIntplRec* e = &s_gte_intpl_ring[seq % GTE_INTPL_RING_CAP];
+        if (frame_filter >= 0 && e->frame != (uint32_t)frame_filter) continue;
+        if (matched++ < offset) continue;
+        if (pos > outsz - 400) break;
+        pos += snprintf(out+pos, outsz-pos,
+            "%s{\"seq\":%u,\"frame\":%u,\"ra\":\"0x%08X\","
+            "\"ir0\":%d,\"in\":[%d,%d,%d],\"fc\":[%d,%d,%d],"
+            "\"mac\":[%d,%d,%d],\"out\":[%d,%d,%d],\"flag\":\"0x%08X\"}",
+            emitted?",":"", e->seq, e->frame, e->caller_ra,
+            e->ir0, e->in1, e->in2, e->in3, e->fc[0], e->fc[1], e->fc[2],
+            e->mac[0], e->mac[1], e->mac[2], e->out1, e->out2, e->out3,
+            e->flag);
+        emitted++;
+    }
+    out[pos] = 0;
+    return emitted;
+}
+
+/* Emit per-frame stats (newest first) as JSON array body. */
+extern "C" int gte_fstat_dump_json(char* out, int outsz, int max_frames) {
+    if (!s_gte_fstat_valid) { if(out&&outsz) out[0]=0; return 0; }
+    int pos=0, emitted=0;
+    for (int k=0; k<GTE_FSTAT_CAP && emitted<max_frames; k++) {
+        int idx=(int)((s_gte_fstat_head + GTE_FSTAT_CAP - k)%GTE_FSTAT_CAP);
+        GteFStat* s=&s_gte_fstat[idx];
+        if (s->nproj==0 && !(k==0)) continue;
+        if (pos>outsz-96) break;
+        pos+=snprintf(out+pos,outsz-pos,
+                      "%s{\"frame\":%u,\"nproj\":%u,\"nsat\":%u,\"nflat\":%u,"
+                      "\"nintpl\":%u,\"nintpl_tiny\":%u}",
+                      emitted?",":"", s->frame,s->nproj,s->nsat,s->nflat,
+                      s->nintpl,s->nintpl_tiny);
+        emitted++;
+    }
+    out[pos]=0; return emitted;
+}
+
+/* Dump latched degenerate projections (newest first). */
+extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
+    if (!s_gte_latch || s_gte_latch_seq==0){ if(out&&outsz) out[0]=0; return 0; }
+    uint64_t total=s_gte_latch_seq;
+    uint64_t oldest = total>GTE_LATCH_CAP ? total-GTE_LATCH_CAP : 0;
+    int pos=0, emitted=0;
+    for (uint64_t k=0; k<(total-oldest) && emitted<max_count; k++) {
+        uint64_t seq=total-1-k;
+        if (seq<oldest) break;
+        const GteRtpRec* e=&s_gte_latch[seq % GTE_LATCH_CAP];
+        if (pos>outsz-700) break;
+        pos+=snprintf(out+pos,outsz-pos,
+            "%s{\"frame\":%u,\"ra\":\"0x%08X\",\"cmd\":\"0x%08X\","
+            "\"RT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],\"TR\":[%d,%d,%d],\"H\":%u,"
+            "\"V0\":[%d,%d,%d],\"V1\":[%d,%d,%d],\"V2\":[%d,%d,%d],"
+            "\"S0\":[%d,%d],\"S1\":[%d,%d],\"S2\":[%d,%d],\"SZ\":[%u,%u,%u],\"FLAG\":\"0x%08X\"}",
+            emitted?",":"", e->frame, e->caller_ra, e->cmd,
+            e->RT[0],e->RT[1],e->RT[2],e->RT[3],e->RT[4],e->RT[5],e->RT[6],e->RT[7],e->RT[8],
+            e->TR[0],e->TR[1],e->TR[2],(unsigned)e->H,
+            e->V0[0],e->V0[1],e->V0[2], e->V1[0],e->V1[1],e->V1[2], e->V2[0],e->V2[1],e->V2[2],
+            gte_sxx(e->SXY0),gte_syy(e->SXY0),gte_sxx(e->SXY1),gte_syy(e->SXY1),
+            gte_sxx(e->SXY2),gte_syy(e->SXY2),(unsigned)e->SZ1,(unsigned)e->SZ2,(unsigned)e->SZ3,e->FLAG);
+        emitted++;
+    }
+    out[pos]=0; return emitted;
+}
+
+/* Format up to max_count recent entries as a JSON array body (no outer braces).
+ * If frame_filter >= 0, only entries with that frame are emitted. Returns count. */
+extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
+                                      int newest_first, long frame_filter) {
+    if (!s_gte_rtp_ring || outsz < 64) { if (out && outsz) out[0]=0; return 0; }
+    uint64_t total = s_gte_rtp_seq;
+    if (total == 0) { out[0]=0; return 0; }
+    uint64_t oldest = total > GTE_RTP_RING_CAP ? total - GTE_RTP_RING_CAP : 0;
+    int pos = 0, emitted = 0;
+    for (uint64_t k = 0; k < (total - oldest) && emitted < max_count; k++) {
+        uint64_t seq = newest_first ? (total - 1 - k) : (oldest + k);
+        if (seq < oldest || seq >= total) break;
+        const GteRtpRec* e = &s_gte_rtp_ring[seq % GTE_RTP_RING_CAP];
+        if (frame_filter >= 0 && e->frame != (uint32_t)frame_filter) continue;
+        auto sxx = [](int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; };
+        auto syy = [](int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; };
+        if (pos > outsz - 700) break;
+        pos += snprintf(out+pos, outsz-pos,
+            "%s{\"seq\":%u,\"frame\":%u,\"ra\":\"0x%08X\",\"cmd\":\"0x%08X\","
+            "\"V0\":[%d,%d,%d],\"V1\":[%d,%d,%d],\"V2\":[%d,%d,%d],"
+            "\"RT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],\"TR\":[%d,%d,%d],"
+            "\"H\":%u,\"OFX\":%d,\"OFY\":%d,"
+            "\"S0\":[%d,%d],\"S1\":[%d,%d],\"S2\":[%d,%d],"
+            "\"SZ\":[%u,%u,%u],\"FLAG\":\"0x%08X\"}",
+            emitted?",":"", e->seq, e->frame, e->caller_ra, e->cmd,
+            e->V0[0],e->V0[1],e->V0[2], e->V1[0],e->V1[1],e->V1[2], e->V2[0],e->V2[1],e->V2[2],
+            e->RT[0],e->RT[1],e->RT[2],e->RT[3],e->RT[4],e->RT[5],e->RT[6],e->RT[7],e->RT[8],
+            e->TR[0],e->TR[1],e->TR[2], (unsigned)e->H, e->OFX, e->OFY,
+            sxx(e->SXY0),syy(e->SXY0), sxx(e->SXY1),syy(e->SXY1), sxx(e->SXY2),syy(e->SXY2),
+            (unsigned)e->SZ1,(unsigned)e->SZ2,(unsigned)e->SZ3, e->FLAG);
+        emitted++;
+    }
+    out[pos] = 0;
+    return emitted;
 }
 
 extern "C" void gte_set_display_aspect(int num, int den) {
@@ -212,6 +616,21 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     }
     if (do_squash)
         xterm = xterm * s_ws_xnum / s_ws_xden;
+    // Native-wide sky-dome expand: no squash active (identity), dome mode on,
+    // this frame is stretched, and the vertex is far (sky). Scale X outward from
+    // the projection centre so the finite dome mesh reaches the wider frame.
+    else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
+             !gpu_ws_present_native_43()) {
+        int32_t sz = gte->SZ[3];
+        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+        s_ws_sz_n++;
+        if (sz >= s_ws_far_threshold) {
+            xterm = xterm * s_ws_dome_num / s_ws_dome_den;
+            s_ws_sz_far++;
+        }
+    }
+    dome_probe_note(gte->SZ[3]);   /* locate the dome draw fn (far-vertex tally) */
     int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
     gte->push_sxy(sx, sy);
@@ -287,15 +706,15 @@ void gte_avsz4(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 // NCCS (0x1B) — Normal Color Color Single
 // ---------------------------------------------------------------------------
-void gte_nccs_internal(GTEState* gte, int16_t* V) {
-    light_transform(gte, V);
-    light_color(gte);
-    color_output(gte);
+void gte_nccs_internal(GTEState* gte, int16_t* V, uint32_t instr) {
+    light_transform(gte, V, instr);
+    light_color(gte, instr);
+    color_output(gte, instr);
 }
 
 void gte_nccs(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_nccs_internal(gte, gte->V0);
+    gte_nccs_internal(gte, gte->V0, instr);
     gte->set_error_flag();
 }
 
@@ -304,25 +723,25 @@ void gte_nccs(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 void gte_ncct(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_nccs_internal(gte, gte->V0);
-    gte_nccs_internal(gte, gte->V1);
-    gte_nccs_internal(gte, gte->V2);
+    gte_nccs_internal(gte, gte->V0, instr);
+    gte_nccs_internal(gte, gte->V1, instr);
+    gte_nccs_internal(gte, gte->V2, instr);
     gte->set_error_flag();
 }
 
 // ---------------------------------------------------------------------------
 // NCDS (0x13) — Normal Color Depth Cue Single
 // ---------------------------------------------------------------------------
-void gte_ncds_internal(GTEState* gte, int16_t* V) {
-    light_transform(gte, V);
-    light_color(gte);
-    depth_cue_from_ir(gte);
-    color_output(gte);
+void gte_ncds_internal(GTEState* gte, int16_t* V, uint32_t instr) {
+    light_transform(gte, V, instr);
+    light_color(gte, instr);
+    depth_cue_from_ir(gte, instr);
+    color_output(gte, instr);
 }
 
 void gte_ncds(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_ncds_internal(gte, gte->V0);
+    gte_ncds_internal(gte, gte->V0, instr);
     gte->set_error_flag();
 }
 
@@ -331,18 +750,18 @@ void gte_ncds(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 void gte_ncdt(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_ncds_internal(gte, gte->V0);
-    gte_ncds_internal(gte, gte->V1);
-    gte_ncds_internal(gte, gte->V2);
+    gte_ncds_internal(gte, gte->V0, instr);
+    gte_ncds_internal(gte, gte->V1, instr);
+    gte_ncds_internal(gte, gte->V2, instr);
     gte->set_error_flag();
 }
 
 // ---------------------------------------------------------------------------
 // NCS (0x1E) — Normal Color Single (no vertex color multiply)
 // ---------------------------------------------------------------------------
-void gte_ncs_internal(GTEState* gte, int16_t* V) {
-    light_transform(gte, V);
-    light_color(gte);
+void gte_ncs_internal(GTEState* gte, int16_t* V, uint32_t instr) {
+    light_transform(gte, V, instr);
+    light_color(gte, instr);
     // Output directly (no RGBC multiply)
     gte->push_rgb(
         gte->saturate_color(gte->MAC1 >> 4, 0),
@@ -352,7 +771,7 @@ void gte_ncs_internal(GTEState* gte, int16_t* V) {
 
 void gte_ncs(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_ncs_internal(gte, gte->V0);
+    gte_ncs_internal(gte, gte->V0, instr);
     gte->set_error_flag();
 }
 
@@ -361,9 +780,9 @@ void gte_ncs(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 void gte_nct(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_ncs_internal(gte, gte->V0);
-    gte_ncs_internal(gte, gte->V1);
-    gte_ncs_internal(gte, gte->V2);
+    gte_ncs_internal(gte, gte->V0, instr);
+    gte_ncs_internal(gte, gte->V1, instr);
+    gte_ncs_internal(gte, gte->V2, instr);
     gte->set_error_flag();
 }
 
@@ -380,7 +799,7 @@ void gte_dpcs(GTEState* gte, uint32_t instr) {
     gte->IR2 = gte->saturate_ir(g << 4, 2, false);
     gte->IR3 = gte->saturate_ir(b << 4, 3, false);
     // Interpolate toward far color using IR0
-    depth_cue_from_ir(gte);
+    depth_cue_from_ir(gte, instr);
     // Output
     gte->push_rgb(
         gte->saturate_color(gte->MAC1 >> 4, 0),
@@ -401,7 +820,7 @@ void gte_dpct(GTEState* gte, uint32_t instr) {
         gte->IR1 = gte->saturate_ir(r << 4, 1, false);
         gte->IR2 = gte->saturate_ir(g << 4, 2, false);
         gte->IR3 = gte->saturate_ir(b << 4, 3, false);
-        depth_cue_from_ir(gte);
+        depth_cue_from_ir(gte, instr);
         gte->push_rgb(
             gte->saturate_color(gte->MAC1 >> 4, 0),
             gte->saturate_color(gte->MAC2 >> 4, 1),
@@ -422,11 +841,11 @@ void gte_dpcl(GTEState* gte, uint32_t instr) {
     gte->MAC1 = (r * gte->IR1) >> 8;
     gte->MAC2 = (g * gte->IR2) >> 8;
     gte->MAC3 = (b * gte->IR3) >> 8;
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, true);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, true);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, true);
+    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, gte_instr_lm(instr));
+    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, gte_instr_lm(instr));
+    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, gte_instr_lm(instr));
     // Depth cue toward far color
-    depth_cue_from_ir(gte);
+    depth_cue_from_ir(gte, instr);
     gte->push_rgb(
         gte->saturate_color(gte->MAC1 >> 4, 0),
         gte->saturate_color(gte->MAC2 >> 4, 1),
@@ -439,7 +858,7 @@ void gte_dpcl(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 void gte_intpl(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    depth_cue_from_ir(gte);
+    depth_cue_from_ir(gte, instr);
     gte->push_rgb(
         gte->saturate_color(gte->MAC1 >> 4, 0),
         gte->saturate_color(gte->MAC2 >> 4, 1),
@@ -453,9 +872,9 @@ void gte_intpl(GTEState* gte, uint32_t instr) {
 void gte_cdp(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     // IR1/IR2/IR3 already set (from previous NCS or similar)
-    light_color(gte);
-    depth_cue_from_ir(gte);
-    color_output(gte);
+    light_color(gte, instr);
+    depth_cue_from_ir(gte, instr);
+    color_output(gte, instr);
     gte->set_error_flag();
 }
 
@@ -464,8 +883,8 @@ void gte_cdp(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 void gte_cc(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    light_color(gte);
-    color_output(gte);
+    light_color(gte, instr);
+    color_output(gte, instr);
     gte->set_error_flag();
 }
 
@@ -842,6 +1261,7 @@ extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
     s_gte_exec_count++;
+    s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
 
     GTEState gte;
     // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and
@@ -853,6 +1273,20 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
 
     uint8_t func = cmd & 0x3F;
+    /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every
+     * perspective projection so gpu.c can stamp real 3D frames as gameplay
+     * (no-op unless the game opts in — early-out on the config flag). */
+    if (func == 0x01 || func == 0x30)
+        psx_ws_note_gte_project(func == 0x30 ? 3 : 1);
+    /* INTPL ring: snapshot inputs before the op mutates IR (outputs recorded
+     * after the switch). */
+    int16_t intpl_pre_ir[4] = {0,0,0,0};
+    int32_t intpl_pre_fc[3] = {0,0,0};
+    if (func == 0x11) {
+        intpl_pre_ir[0]=gte.IR0; intpl_pre_ir[1]=gte.IR1;
+        intpl_pre_ir[2]=gte.IR2; intpl_pre_ir[3]=gte.IR3;
+        intpl_pre_fc[0]=gte.FC[0]; intpl_pre_fc[1]=gte.FC[1]; intpl_pre_fc[2]=gte.FC[2];
+    }
     switch (func) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;
@@ -880,6 +1314,9 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
             exit(1);
             break;
     }
+
+    if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);
+    if (func == 0x11) gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc);
 
     for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
     for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);

@@ -80,6 +80,7 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
         src/frame_pacing.c
         src/parity_trace.c
         src/device_trace.c
+        src/audio_trace.c
         ${LIBRETRO_COMMON_SOURCES}
     )
 

@@ -557,8 +557,8 @@ fringe on them.
 Tooling: `tools/crop_launcher_assets.ps1` (crop + knockout),
 `tools/gen_launcher_assets.ps1` (procedural check/verdict icons),
 `tools/shot_launcher.ps1` (screenshot the GL launcher window). Mockup
-source: `C:\Users\Matthew\Desktop\ef772e04-a7db-4ecd-98bb-eb75a01de0a6.png`
-(1448×1086). Pure-cosmetic; does not block Phase 4/5 wiring.
+source: a local mockup PNG (1448×1086). Pure-cosmetic; does not block
+Phase 4/5 wiring.
 
 ---
 
@@ -626,3 +626,123 @@ save-load, FMV, menus, and combat with **0 divergences, 0 wedges**, shards
 validated-then-promoted, device functions correctly pinned to the interpreter.
 "Diff is clean" or "shard validated" is NOT success until the full save-load loop
 closes live.
+
+---
+
+## Issue #8 — Tomba2 P0: wild-jump FAIL-FAST fatal after coverage-wave native promotion
+
+**Status:** OPEN — root-cause hunt in flight, currently blocked on Issue #9
+**Date opened:** 2026-07-06 (carried from session handoff)
+**Area:** overlay native execution (codegen OR dispatch/call-contract layer)
+**Rule:** root-cause via first-divergence; do NOT ship a block/disable.
+`overlay_native_block` on 0x80073328 acceptable for ATTRIBUTION only.
+
+### Symptom
+
+Two FAIL-FAST unknown-dispatch fatals in attract soaks (~15–20 min apart per
+run) after the 2026-07-06 entry-based-coverage wave promoted new PCs to native
+(the convergence fixes work; they exposed a latent defect):
+
+- **Crash 1:** addr=ra=0x0000F514 (zeroed kernel heap, page not dirty),
+  4 seconds after 0x80073328 went native for the first time (its only-new-entry
+  DLL `00038000_0A16928B` built 09:04:14). 0x80073328 fired ra=0x80139400 every
+  2 frames all scene.
+- **Crash 2:** addr=0x009D6830, ra=0x00000001 (beyond 4× RAM mirror), pre-fatal
+  register soup: target==ra; interp dispatches into 0x13xxxx drivers with
+  garbage args (a0=0xDF73E104, a1=0xE2000318 = raw GP0 word as pointer).
+- Both: same kernel event-delivery dispatch chain (…0x20D4, 0x650, 0x2104)
+  immediately before; a0=0x800F42E0 (persistent struct) at both fatals.
+  Corruption PRECEDES the fatal; fail-fast catches the landing.
+
+Evidence: memory `tomba2_f514_wildjump_first_native.md` + prior session's
+scratchpad `crash_f514/` (psx_crash.txt, psx_last_run_report.json,
+psx_freeze_heartbeat.json).
+
+### Suspect set
+
+The post-08:44 coverage wave DLLs in
+`build-t2/cache/SCUS-94454/gcc/win-x64/cg4_d44a063d/`: new region DLLs +
+island fragments (incl. F 80073328 in `00038000_0A16928B`; F 80106D7C /
+F 80106E58 / F 80024548; jump-table-ladder aliases F 8011040C/43C/45C/478/4CC
+in `00106000_1675417D`).
+
+### Plan (two independent paths)
+
+1. **Instrumented path (preferred):** finish the shadow-diff segment redesign
+   (Issue #9), soak with `PSX_OVERLAY_DIFF=1` from boot. Expect either a named
+   divergence record (→ shard codegen defect, fix recompiler) or clean segments
+   everywhere + crash persists (→ exit/call-contract class, bugA/bugD family —
+   fix the dispatch contract layer).
+2. **Bisection path (no instrument needed):** quarantine halves of the
+   post-08:44 DLL wave out of the cache dir, ~20-min attract soak per round
+   (crash repro interval). First single-candidate probe: `overlay_native_block`
+   on 0x80073328 (attribution only, never a fix).
+
+---
+
+## Issue #9 — Overlay shadow-diff instrument is structurally unsound (never engages)
+
+**Status:** ROOT-CAUSED; partial fixes in tree (uncommitted, `_wt-tomba2-ipr`);
+segment-granular redesign DESIGNED but NOT implemented
+**Date opened:** 2026-07-06
+**Area:** `runtime/src/overlay_loader.c` (run_shadow_diff + dispatch gates),
+`runtime/src/dirty_ram_interp.c`, `runtime/src/interrupts.c`, `runtime/src/traps.c`
+**Blocks:** Issue #8 path 1. Full detail + design in memory
+`tomba2_shadow_diff_unsound_segment_redesign.md`.
+
+### Symptom
+
+With `overlay_diff_on` / `PSX_OVERLAY_DIFF=1`, shadow_calls=1 over 51K+ frames
+(two independent runs) — the diff instrument validates essentially nothing while
+dispatch_native runs millions of calls. The game LOOKS fine, so the failure is
+silent.
+
+### Root cause chain (three stacked defects, found in order)
+
+1. **CPS interior re-entry path had no diff gate** — continuation re-entries
+   (the dominant dispatch class under CPS) ran native blind in diff mode.
+   FIXED in tree: gate mirrors the entry chain (`interior_gated` counter in
+   `overlay_shadow_dump`).
+2. **Longjmp-escape hazard** — a shadow started inside an exception dispatch is
+   unwound by the guest RFE's longjmp (setjmp frame below run_shadow_diff);
+   epilogue skipped; s_in_shadow/s_native_exec/s_suppress_irq stuck forever.
+   HARDENED in tree: `g_exc_setjmp_epoch` (interrupts.c) + 
+   `overlay_loader_shadow_escape_fixup()` at all 3 longjmp sites; dump fields
+   `escapes`/`escapes_native` must stay 0.
+3. **THE WEDGE (design flaw, predates this session): run_shadow_diff never
+   terminates for non-returning functions.** Interp pass = one
+   dirty_ram_dispatch call (returns at first exit-to-elsewhere, NOT at stop_ra);
+   native pass chases via psx_dispatch_call until pc==stop_ra — NEVER for a
+   main-loop-shaped function. The live game then runs FOREVER inside the
+   abandoned shadow native pass: **speculative native state becomes the live
+   timeline**, IRQ-suppress stuck on, all downstream native disabled
+   (native_exec=0). Verified live both runs: in_shadow=1, native_exec=0,
+   escapes=0, wedge at frame ~1000. ⇒ Any pace/behavior data from a diff-mode
+   run is garbage; the instrument was never capable of validating this game.
+
+### The fix (designed, ready to implement): CPS segment-granular diff
+
+Diff exactly ONE `c->fn` invocation extent (entry/interior PC → first
+jal/jalr/jr/region-exit). Verified against generated DLL C: CPS codegen
+surfaces at EVERY call/return/indirect jump (no local jump-table switches), so
+a lean interp segment runner (in dirty_ram_interp.c; must intercept
+jal/jalr/jr/j BEFORE exec_one — exec_one nests calls inline) can run an
+identical extent. Both passes bounded by construction; no chasing, no fiber/RFE
+exposure; validates interior re-entries directly; compares pc (boundary target)
+as a first-class divergence signal. Abandon (no diff, interp state stands) on:
+syscall/break/rfe, unsupported insn, insn cap, MMIO (device_touch as today).
+Asymmetry guards: psx_slice_block no-fire in shadow (currently moot — slicing
+default OFF); cycle-counter snapshot/restore around the native pass;
+post-dispatch IRQ pump shadow guard (already in tree).
+
+### Uncommitted worktree state (this session, runtime-only, cg tag intact)
+
+- `overlay_loader.c`: CPS interior diff gate + `interior_gated`; in-exception
+  shadow-start detour (superseded by segment design — remove when implementing);
+  `s_shadow_cand` own-interior native route for shadow native pass; escape-fixup
+  mirrors + `overlay_loader_shadow_escape_fixup()`; shadow dump fields
+  `in_shadow`/`native_exec`/`escapes`/`escapes_native`; IRQ pump shadow guard.
+- `interrupts.c`: `g_exc_setjmp_epoch` + getter; fixup calls in
+  deferred_exception_longjmp + psx_rfe_escape_check.
+- `traps.c`: fixup call at the deferred-honor longjmp site.
+- All inert when diff mode is off; normal play unaffected. Builds clean.

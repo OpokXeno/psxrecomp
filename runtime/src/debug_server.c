@@ -30,6 +30,7 @@
 #include "sio.h"
 #include "memcard.h"
 #include "spu.h"
+#include "audio_trace.h"
 #include "mdec.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
@@ -71,6 +72,7 @@
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <errno.h>
+#  include <pthread.h>      /* phase_profile sampler thread */
    typedef int sock_t;
 #  define SOCK_INVALID (-1)
 #  define sock_close close
@@ -3457,6 +3459,10 @@ static const char *thread_kind_name(uint32_t kind)
         case 20: return "syscall3_enter";             /* ChangeThread/RFE syscall, in_exc==0 (switch-eligible) */
         case 24: return "syscall3_enter_in_exc";      /* ChangeThread/RFE syscall, in_exc==1 (forced manual-RFE) */
         case 26: return "fiber_dispatch_exit_in_exc"; /* fiber's psx_dispatch returned, in_exc==1 */
+        case 30: return "inexc_switch_escape";        /* guest moved PCB[0] inside handler -> scheduler escape */
+        case 31: return "inexc_switch_defer";
+        case 32: return "deferred_switch_escape";
+        case 33: return "deferred_switch_stale";
         default: return "unknown";
     }
 }
@@ -4672,6 +4678,30 @@ static void handle_irq_state(int id, const char *json)
              dma_get_dpcr(), dma_get_dicr());
 }
 
+/* vblank_rate: report the ONE cycle-paced VBlank authority's raise/deliver
+ * counts, the (normally-off) GPUSTAT-poll fallback raise count, and the
+ * per-frame GP0(E5) draw-offset-Y range/count. Used to confirm the guest is
+ * receiving exactly 60 VBlanks/s (not the ~96/s the stale poll fallback caused)
+ * and to probe double-buffer draw-offset alternation. */
+static void handle_vblank_rate(int id, const char *json)
+{
+    (void)json;
+    extern uint64_t g_vblank_raise_count, g_vblank_deliver_count;
+    extern uint64_t g_pollhack_vblank_count;
+    extern int32_t  g_doff_min_last, g_doff_max_last;
+    extern uint32_t g_doff_cnt_last;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"cycle_paced_raise\":%llu,"
+             "\"delivered\":%llu,"
+             "\"pollhack_raise\":%llu,"
+             "\"doff_min\":%d,\"doff_max\":%d,\"doff_cnt\":%u}",
+             id,
+             (unsigned long long)g_vblank_raise_count,
+             (unsigned long long)g_vblank_deliver_count,
+             (unsigned long long)g_pollhack_vblank_count,
+             g_doff_min_last, g_doff_max_last, g_doff_cnt_last);
+}
+
 static void handle_timers_state(int id, const char *json)
 {
     (void)json;
@@ -5309,8 +5339,8 @@ static void handle_gpu_frame_dump(int id, const char *json)
 
     int n = gpu_gp0_ring_dump_frame((uint32_t)target, entries, max_entries);
 
-    /* ~190 bytes per entry in JSON; budget conservatively. */
-    size_t buf_sz = 256 + (size_t)n * 280u;
+    /* ~190 bytes base + up to ~90 for the copy builder chain; budget conservatively. */
+    size_t buf_sz = 256 + (size_t)n * 400u;
     char *buf = (char *)malloc(buf_sz);
     if (!buf) { free(entries); send_err(id, "alloc failed"); return; }
 
@@ -5322,16 +5352,26 @@ static void handle_gpu_frame_dump(int id, const char *json)
         const GpuGp0RingEntry *e = &entries[i];
         pos += (size_t)snprintf(buf + pos, buf_sz - pos,
             "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,"
-            "\"src\":\"0x%08X\",\"pc\":\"0x%08X\",\"w\":[",
+            "\"src\":\"0x%08X\",\"pc\":\"0x%08X\","
+            "\"func\":\"0x%08X\",\"ra\":\"0x%08X\",\"w\":[",
             i ? "," : "", e->seq, e->opcode, e->n_words,
-            e->src_addr, e->pc);
+            e->src_addr, e->pc, e->func, e->ra);
         int show = e->n_words < GPU_GP0_RING_MAX_WORDS
                  ? e->n_words : GPU_GP0_RING_MAX_WORDS;
         for (int k = 0; k < show && pos < buf_sz - 32; k++) {
             pos += (size_t)snprintf(buf + pos, buf_sz - pos,
                 "%s\"0x%08X\"", k ? "," : "", e->cmd[k]);
         }
-        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]}");
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]");
+        if (e->opcode == 0x80) {
+            pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+                ",\"csp\":\"0x%08X\",\"bld\":[", e->csp);
+            for (int k = 0; k < 6 && e->bld[k] && pos < buf_sz - 32; k++)
+                pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+                    "%s\"0x%08X\"", k ? "," : "", e->bld[k]);
+            pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]");
+        }
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "}");
     }
     snprintf(buf + pos, buf_sz - pos, "]}");
     debug_server_send_line(buf);
@@ -5386,6 +5426,94 @@ static void handle_gte_state(int id, const char *json)
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_fmt("%s", buf);
+}
+
+/* Dump recent GTE RTPS/RTPT projections (inputs + outputs) from the always-on
+ * GTE ring. {"cmd":"gte_ring_dump","count":N,"newest":1,"frame":F} — frame
+ * optional (omit or -1 for all). Used to find flattened/degenerate character
+ * projections and split game-code input bugs from GTE-math bugs. */
+static void handle_gte_ring_dump(int id, const char *json)
+{
+    extern unsigned long long gte_rtp_ring_total(void);
+    extern int gte_rtp_ring_dump_json(char *out, int outsz, int max_count,
+                                      int newest_first, long frame_filter);
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    int newest = json_get_int(json, "newest", 1) != 0;
+    long frame = (long)json_get_int(json, "frame", -1);
+
+    size_t BUF_SZ = 256u + (size_t)count * 720u;
+    char *entries = (char *)malloc(BUF_SZ);
+    char *reply   = (char *)malloc(BUF_SZ + 256u);
+    if (!entries || !reply) { free(entries); free(reply); send_err(id, "oom"); return; }
+    int n = gte_rtp_ring_dump_json(entries, (int)BUF_SZ, count, newest, frame);
+    snprintf(reply, BUF_SZ + 256u,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
+             id, gte_rtp_ring_total(), n, entries);
+    debug_server_send_line(reply);
+    free(entries); free(reply);
+}
+
+/* INTPL (vertex-lerp) ring: inputs (ir0 blend, in=IR1-3 pose A, fc=pose B)
+ * and outputs (mac / out=IR1-3 / flag) per op. offset pages through the
+ * matching entries after the frame filter, so a whole frame is reachable. */
+static void handle_gte_intpl_dump(int id, const char *json)
+{
+    extern unsigned long long gte_intpl_ring_total(void);
+    extern int gte_intpl_ring_dump_json(char *out, int outsz, int max_count,
+                                        int newest_first, long frame_filter,
+                                        int offset);
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    int newest = json_get_int(json, "newest", 1) != 0;
+    long frame = (long)json_get_int(json, "frame", -1);
+    int offset = json_get_int(json, "offset", 0);
+    if (offset < 0) offset = 0;
+
+    size_t BUF_SZ = 256u + (size_t)count * 420u;
+    char *entries = (char *)malloc(BUF_SZ);
+    char *reply   = (char *)malloc(BUF_SZ + 256u);
+    if (!entries || !reply) { free(entries); free(reply); send_err(id, "oom"); return; }
+    int n = gte_intpl_ring_dump_json(entries, (int)BUF_SZ, count, newest, frame, offset);
+    snprintf(reply, BUF_SZ + 256u,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"emitted\":%d,\"offset\":%d,\"entries\":[%s]}",
+             id, gte_intpl_ring_total(), n, offset, entries);
+    debug_server_send_line(reply);
+    free(entries); free(reply);
+}
+
+/* Per-frame GTE projection stats (nproj / nsat / nflat) over recent frames —
+ * shows the alternating flat/normal render pattern. */
+static void handle_gte_frame_stats(int id, const char *json)
+{
+    extern int gte_fstat_dump_json(char *out, int outsz, int max_frames);
+    int n = json_get_int(json, "frames", 120);
+    if (n < 1) n = 1; if (n > 512) n = 512;
+    size_t BUF = 256u + (size_t)n * 96u;
+    char *body = (char *)malloc(BUF), *reply = (char *)malloc(BUF + 128u);
+    if (!body || !reply) { free(body); free(reply); send_err(id, "oom"); return; }
+    int emitted = gte_fstat_dump_json(body, (int)BUF, n);
+    snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"emitted\":%d,\"frames\":[%s]}",
+             id, emitted, body);
+    debug_server_send_line(reply); free(body); free(reply);
+}
+
+/* Latched degenerate (saturated-output) GTE projections with full inputs. */
+static void handle_gte_latch_dump(int id, const char *json)
+{
+    extern unsigned long long gte_latch_total(void);
+    extern int gte_latch_dump_json(char *out, int outsz, int max_count);
+    int n = json_get_int(json, "count", 64);
+    if (n < 1) n = 1; if (n > 256) n = 256;
+    size_t BUF = 256u + (size_t)n * 720u;
+    char *body = (char *)malloc(BUF), *reply = (char *)malloc(BUF + 128u);
+    if (!body || !reply) { free(body); free(reply); send_err(id, "oom"); return; }
+    int emitted = gte_latch_dump_json(body, (int)BUF, n);
+    snprintf(reply, BUF + 128u, "{\"id\":%d,\"ok\":true,\"latch_total\":%llu,\"emitted\":%d,\"entries\":[%s]}",
+             id, gte_latch_total(), emitted, body);
+    debug_server_send_line(reply); free(body); free(reply);
 }
 
 static void handle_sio_state(int id, const char *json)
@@ -5639,6 +5767,146 @@ static void handle_spu_events_reset(int id, const char *json)
     (void)json;
     spu_event_reset();
     send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
+/* ---- Always-on audio tap rings (audio_trace.c) -------------------------
+ * audio_stats  — counters: per-tap produced/nonzero/audible/peak + pump
+ *                behavior (skips, underruns, queue watermarks).
+ * audio_wav    — dump a tap's PCM ring slice to a 44100 Hz s16 WAV on the
+ *                server side: {"tap":0,"path":"...","start":-1,"count":0}.
+ * audio_events — most recent N pipeline events (REG_WRITE/RENDER/SKIP/
+ *                UNDERRUN/MUTE/UNMUTE/CD_PUSH/DMA), sample-clock stamped.
+ * Protocol mirrored on psx-beetle's port 4380 (beetle_debug_server.c). */
+/* Bridge/legacy output health (main.cpp; C linkage). Returns 0 pre-device. */
+extern int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+                               uint64_t *overflow_drops, double *correction,
+                               int *legacy, int *host_rate);
+
+static void handle_audio_stats(int id, const char *json)
+{
+    (void)json;
+    AudioTraceStats st;
+    audio_trace_get_stats(&st);
+    double fill_ms = 0.0, correction = 0.0;
+    uint64_t out_underruns = 0, overflow_drops = 0;
+    int legacy = 1, host_rate = 44100;
+    int out_ok = psx_audio_out_stats(&fill_ms, &out_underruns, &overflow_drops,
+                                     &correction, &legacy, &host_rate);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"taps\":["
+             "{\"name\":\"spu_out\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u},"
+             "{\"name\":\"cd_in\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u},"
+             "{\"name\":\"host\",\"frames\":%llu,\"nonzero\":%llu,"
+             "\"audible\":%llu,\"peak\":%d,\"rate\":%u}],"
+             "\"pump_calls\":%llu,\"pump_skips\":%llu,\"underruns\":%llu,"
+             "\"queue_hiwater\":%u,\"queue_lowater\":%u,"
+             "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu,"
+             "\"out\":{\"active\":%d,\"mode\":\"%s\",\"host_rate\":%d,"
+             "\"fill_ms\":%.1f,\"underruns\":%llu,\"overflow_drops\":%llu,"
+             "\"correction\":%.5f}}",
+             id,
+             (unsigned long long)st.tap_frames[0],
+             (unsigned long long)st.tap_nonzero[0],
+             (unsigned long long)st.tap_audible[0], st.tap_peak[0],
+             audio_trace_tap_rate(0),
+             (unsigned long long)st.tap_frames[1],
+             (unsigned long long)st.tap_nonzero[1],
+             (unsigned long long)st.tap_audible[1], st.tap_peak[1],
+             audio_trace_tap_rate(1),
+             (unsigned long long)st.tap_frames[2],
+             (unsigned long long)st.tap_nonzero[2],
+             (unsigned long long)st.tap_audible[2], st.tap_peak[2],
+             audio_trace_tap_rate(2),
+             (unsigned long long)st.pump_calls,
+             (unsigned long long)st.pump_skips,
+             (unsigned long long)st.underruns,
+             st.queue_hiwater, st.queue_lowater,
+             (unsigned long long)st.mute_events,
+             (unsigned long long)st.unmute_events,
+             (unsigned long long)st.events_total,
+             out_ok, legacy ? "legacy-push" : "bridge-pull", host_rate,
+             fill_ms,
+             (unsigned long long)out_underruns,
+             (unsigned long long)overflow_drops,
+             correction);
+}
+
+static void handle_audio_wav(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"missing path\"}", id);
+        return;
+    }
+    int tap = json_get_int(json, "tap", AUDIO_TAP_SPU_OUT);
+    /* start/count as strings so 64-bit sample indices survive. */
+    char buf[32];
+    int64_t start = -1;
+    uint64_t count = 0;
+    if (json_get_str(json, "start", buf, sizeof(buf)))
+        start = strtoll(buf, NULL, 0);
+    else
+        start = (int64_t)json_get_int(json, "start", -1);
+    if (json_get_str(json, "count", buf, sizeof(buf)))
+        count = strtoull(buf, NULL, 0);
+    else
+        count = (uint64_t)json_get_int(json, "count", 0);
+
+    int64_t wrote = audio_trace_dump_wav(tap, path, start, count);
+    if (wrote < 0) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"dump failed (bad tap/path or empty ring)\"}", id);
+        return;
+    }
+    uint64_t total = audio_trace_tap_total(tap);
+    send_fmt("{\"id\":%d,\"ok\":true,\"tap\":%d,\"frames\":%lld,"
+             "\"rate\":%u,\"tap_total\":%llu}",
+             id, tap, (long long)wrote, audio_trace_tap_rate(tap),
+             (unsigned long long)total);
+}
+
+static void handle_audio_events(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+    AudioTraceEvent *evs =
+        (AudioTraceEvent *)malloc((size_t)count * sizeof(AudioTraceEvent));
+    if (!evs) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    uint32_t got = audio_trace_events_get(evs, (uint32_t)count);
+    uint64_t total = audio_trace_events_total();
+    static const char *kind_names[] = {
+        "?", "REG", "RENDER", "SKIP", "UNDERRUN",
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA"
+    };
+
+    size_t cap = 256u + (size_t)got * 192u;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(evs); send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
+    size_t off = 0;
+    int n = snprintf(out + off, cap - off,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"events\":[",
+        id, (unsigned long long)total, (unsigned)got);
+    if (n > 0) off += (size_t)n;
+    for (uint32_t i = 0; i < got; i++) {
+        const AudioTraceEvent *e = &evs[i];
+        const char *kn = (e->kind < sizeof(kind_names) / sizeof(kind_names[0]))
+                         ? kind_names[e->kind] : "?";
+        n = snprintf(out + off, cap - off,
+            "%s{\"seq\":%llu,\"smp\":%llu,\"frame\":%u,"
+            "\"kind\":\"%s\",\"a\":\"0x%X\",\"b\":\"0x%X\"}",
+            i == 0 ? "" : ",",
+            (unsigned long long)e->seq,
+            (unsigned long long)e->sample_idx,
+            e->frame, kn, e->a, e->b);
+        if (n > 0) off += (size_t)n;
+    }
+    n = snprintf(out + off, cap - off, "]}");
+    if (n > 0) off += (size_t)n;
+    send_fmt("%s", out);
+    free(out);
+    free(evs);
 }
 
 /* ---- SIO IRQ-arm audit -----------------------------------------------
@@ -6503,6 +6771,19 @@ static void handle_gl_ws_ablate(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
 }
 
+/* gl_wide_fast on=<0|1>: native-wide centre-blit fast path. 1 (default) = skip
+ * the redundant centre mirror and copy the canonical 4:3 frame into the wide
+ * surface centre at present (fast). 0 = re-rasterize the whole wide surface
+ * every prim (the original full-mirror path). For A/B perf + parity checks. */
+extern void gl_renderer_set_wide_fast(int on);
+extern int  gl_renderer_get_wide_fast(void);
+static void handle_gl_wide_fast(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) gl_renderer_set_wide_fast(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d}", id, gl_renderer_get_wide_fast());
+}
+
 /* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
  * ws_aspect num=<n> den=<d> calls gte_set_display_aspect at runtime so we can
  * compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a relaunch. */
@@ -6628,6 +6909,48 @@ static void handle_ws_far_threshold(int id, const char *json)
     gte_ws_get_sz_stats(&mn, &mx, &n, &far_n);
     send_fmt("{\"id\":%d,\"ok\":true,\"threshold\":%d,\"sz_min\":%d,\"sz_max\":%d,\"sz_n\":%u,\"sz_far\":%u}",
              id, gte_ws_get_far_threshold(), mn, mx, n, far_n);
+}
+
+/* ws_dome on=<0|1> [num=<W> den=<H>]: native-wide sky-DOME expand. Scales far-
+ * depth (SZ >= ws_far_threshold) GTE X outward from the projection centre by
+ * (3*num)/(4*den) so a finite sky dome grows to fill the wider FOV. Tune the
+ * depth split with ws_far_threshold (its sz_far count = verts being expanded). */
+extern void gte_ws_set_dome_expand(int on, int aspect_num, int aspect_den);
+static void handle_ws_dome(int id, const char *json)
+{
+    int on  = json_get_int(json, "on", 1);
+    int num = json_get_int(json, "num", 16);
+    int den = json_get_int(json, "den", 9);
+    gte_ws_set_dome_expand(on, num, den);
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"num\":%d,\"den\":%d}", id, on ? 1 : 0, num, den);
+}
+
+/* ws_dome_probe on=<0|1> [thr=<SZ>] | dump: tally which guest function projects
+ * far (SZ>=thr) vertices -> identifies the sky-dome draw fn (top far emitter,
+ * highest max_sz) for the per-function dome-expand bracket. Arm with on=1, let a
+ * dome frame render, then call with no args to dump the tally. */
+extern void gte_dome_probe(int on, int thr);
+extern int  gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* maxsz, int cap);
+static void handle_ws_dome_probe(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    int thr = json_get_int(json, "thr", -1);
+    if (on >= 0) gte_dome_probe(on, thr);
+    uint32_t funcs[48], counts[48]; int32_t maxsz[48];
+    int n = gte_dome_probe_dump(funcs, counts, maxsz, 48);
+    /* simple insertion-sort by count desc for readability */
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && counts[j] > counts[j-1]; j--) {
+            uint32_t tf=funcs[j];funcs[j]=funcs[j-1];funcs[j-1]=tf;
+            uint32_t tc=counts[j];counts[j]=counts[j-1];counts[j-1]=tc;
+            int32_t tm=maxsz[j];maxsz[j]=maxsz[j-1];maxsz[j-1]=tm;
+        }
+    char buf[4096]; int p = snprintf(buf, sizeof buf, "{\"id\":%d,\"ok\":true,\"n\":%d,\"funcs\":[", id, n);
+    for (int i = 0; i < n && p < (int)sizeof(buf)-80; i++)
+        p += snprintf(buf+p, sizeof(buf)-p, "%s{\"ra\":\"0x%08X\",\"n\":%u,\"max_sz\":%d}",
+                      i?",":"", funcs[i], counts[i], maxsz[i]);
+    snprintf(buf+p, sizeof(buf)-p, "]}");
+    debug_server_send_line(buf);
 }
 
 static void handle_ws_census(int id, const char *json)
@@ -7085,98 +7408,7 @@ static void handle_get_snapshots(int id, const char *json)
  * blocks. Bigger on disk than a compressed PNG, but a real PNG that every
  * viewer (and the harness Read tool) accepts, and nothing new to link against
  * — which keeps the self-contained static runtime self-contained. */
-static uint32_t s_png_crc_tbl[256];
-static int      s_png_crc_init = 0;
-static void png_crc_build(void) {
-    for (uint32_t n = 0; n < 256; n++) {
-        uint32_t c = n;
-        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        s_png_crc_tbl[n] = c;
-    }
-    s_png_crc_init = 1;
-}
-static uint32_t png_crc_update(uint32_t crc, const uint8_t *p, size_t n) {
-    if (!s_png_crc_init) png_crc_build();
-    for (size_t i = 0; i < n; i++) crc = s_png_crc_tbl[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-    return crc;
-}
-static uint32_t png_adler32(const uint8_t *p, size_t n) {
-    uint32_t a = 1, b = 0;
-    /* process in blocks so the 16-bit sums never overflow before the mod */
-    while (n) {
-        size_t k = n < 5552 ? n : 5552;
-        for (size_t i = 0; i < k; i++) { a += p[i]; b += a; }
-        a %= 65521; b %= 65521; p += k; n -= k;
-    }
-    return (b << 16) | a;
-}
-static void png_put_be32(FILE *f, uint32_t v) {
-    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16),
-                     (uint8_t)(v >> 8), (uint8_t)v };
-    fwrite(b, 1, 4, f);
-}
-static void png_chunk(FILE *f, const char *type, const uint8_t *data, size_t len) {
-    png_put_be32(f, (uint32_t)len);
-    uint32_t crc = 0xFFFFFFFFu;
-    crc = png_crc_update(crc, (const uint8_t *)type, 4);
-    crc = png_crc_update(crc, data, len);
-    fwrite(type, 1, 4, f);
-    if (len) fwrite(data, 1, len, f);
-    png_put_be32(f, crc ^ 0xFFFFFFFFu);
-}
-/* Write an RGB (3 bytes/pixel, top-down) buffer as a PNG. Returns 1 on success. */
-static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
-    static const uint8_t sig[8] = { 137,80,78,71,13,10,26,10 };
-    fwrite(sig, 1, 8, f);
-
-    uint8_t ihdr[13];
-    ihdr[0]=(uint8_t)(w>>24); ihdr[1]=(uint8_t)(w>>16); ihdr[2]=(uint8_t)(w>>8); ihdr[3]=(uint8_t)w;
-    ihdr[4]=(uint8_t)(h>>24); ihdr[5]=(uint8_t)(h>>16); ihdr[6]=(uint8_t)(h>>8); ihdr[7]=(uint8_t)h;
-    ihdr[8]=8;   /* bit depth   */
-    ihdr[9]=2;   /* color type 2 = truecolor RGB */
-    ihdr[10]=0;  /* compression */
-    ihdr[11]=0;  /* filter      */
-    ihdr[12]=0;  /* interlace   */
-    png_chunk(f, "IHDR", ihdr, sizeof ihdr);
-
-    /* Filtered raw scanlines: each row prefixed with filter byte 0 (None). */
-    size_t raw_len = (size_t)h * (1 + (size_t)w * 3);
-    uint8_t *raw = (uint8_t *)malloc(raw_len);
-    if (!raw) return 0;
-    for (uint32_t y = 0; y < h; y++) {
-        uint8_t *row = raw + (size_t)y * (1 + (size_t)w * 3);
-        row[0] = 0;
-        memcpy(row + 1, rgb + (size_t)y * w * 3, (size_t)w * 3);
-    }
-
-    /* zlib stream: 2-byte header + stored DEFLATE blocks + 4-byte Adler32. */
-    size_t nblocks = (raw_len + 65534) / 65535; if (nblocks == 0) nblocks = 1;
-    size_t z_len = 2 + nblocks * 5 + raw_len + 4;
-    uint8_t *z = (uint8_t *)malloc(z_len);
-    if (!z) { free(raw); return 0; }
-    size_t zi = 0;
-    z[zi++] = 0x78;  /* CMF: 32K window, deflate */
-    z[zi++] = 0x01;  /* FLG: check bits make 0x7801 a multiple of 31 */
-    size_t off = 0;
-    while (off < raw_len) {
-        size_t n = raw_len - off; if (n > 65535) n = 65535;
-        int final = (off + n >= raw_len);
-        z[zi++] = (uint8_t)(final ? 1 : 0);          /* BFINAL | BTYPE=00 */
-        z[zi++] = (uint8_t)(n & 0xFF); z[zi++] = (uint8_t)(n >> 8);
-        uint16_t nl = (uint16_t)~n;
-        z[zi++] = (uint8_t)(nl & 0xFF); z[zi++] = (uint8_t)(nl >> 8);
-        memcpy(z + zi, raw + off, n); zi += n; off += n;
-    }
-    uint32_t ad = png_adler32(raw, raw_len);
-    z[zi++] = (uint8_t)(ad >> 24); z[zi++] = (uint8_t)(ad >> 16);
-    z[zi++] = (uint8_t)(ad >> 8);  z[zi++] = (uint8_t)ad;
-    free(raw);
-
-    png_chunk(f, "IDAT", z, zi);
-    free(z);
-    png_chunk(f, "IEND", NULL, 0);
-    return 1;
-}
+#include "png_write.h"   /* png_write_rgb + zlib/CRC helpers (shared with Beetle) */
 
 /* Unified screenshot: writes an 8-bit RGB PNG of the current display to "path"
  * (default psx_screenshot.png in the runtime cwd) and answers with a single
@@ -7184,6 +7416,158 @@ static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
  * the old "screenshot" inline-hex-row variant streamed h+1 response lines
  * per request, which violated the one-request/one-response protocol and
  * poisoned every client connection that used it. */
+/* ---- Always-on display ring ----------------------------------------------
+ * The last DISP_RING_CAP vblanks' display areas, raw 15-bit VRAM halfwords,
+ * captured in debug_server_record_frame (ring-buffer rule: continuous
+ * capture, observers query a window after the fact). Purpose: FRAME-EXACT
+ * screenshots. `screenshot_file` returns whatever is displayed when the
+ * command lands — 1-3 frames after the `frame` query that named it — which
+ * makes cross-renderer same-frame diffing impossible. With this ring, two
+ * deterministic runs (GL vs software) can each serve the display for the
+ * SAME frame number, giving a pixel-exact renderer-divergence census.
+ * GL reads GPU-side truth via the fbo peek; software reads CPU VRAM (its
+ * authoritative surface). depth24 scanout frames are tagged and refused
+ * (15-bit only). */
+#define DISP_RING_CAP   64    /* full-VRAM entries are 1MB each; 32 frames of
+                               * lookback (~0.3-0.5s) for exact-frame forensics */
+#define DISP_RING_MAX_W 640
+#define DISP_RING_MAX_H 256
+/* Full-VRAM aux capture alongside the display: the entire 1024x512 raw VRAM
+ * as the renderer sees it at this frame (GL: FBO truth; SW: CPU truth), so an
+ * offline client can micro-cosim ANY prim of the frame — rasterize it from
+ * the GP0 ring against the exact same-frame texels/CLUTs — and attribute a
+ * bad pixel to sampling vs content. Streamed texture pages and palette
+ * cycling make later peeks worthless; only a same-frame capture is evidence. */
+typedef struct {
+    uint32_t frame;
+    uint16_t w, h;
+    uint8_t  depth24, valid;
+    uint16_t *px;                 /* DISP_RING_MAX_W*DISP_RING_MAX_H halfwords */
+    uint16_t *vram;               /* full 1024x512 */
+} DispRingEntry;
+static DispRingEntry s_disp_ring[DISP_RING_CAP];
+static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
+
+static void disp_ring_capture(void)
+{
+    if (!s_disp_ring_px) {
+        size_t per  = (size_t)DISP_RING_MAX_W * DISP_RING_MAX_H;
+        size_t vram = (size_t)1024 * 512;
+        s_disp_ring_px = (uint16_t *)malloc(DISP_RING_CAP * (per + vram) * sizeof(uint16_t));
+        if (!s_disp_ring_px) return;
+        for (int i = 0; i < DISP_RING_CAP; i++) {
+            uint16_t *base = s_disp_ring_px + (size_t)i * (per + vram);
+            s_disp_ring[i].px   = base;
+            s_disp_ring[i].vram = base + per;
+        }
+    }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)(s_frame_count % DISP_RING_CAP)];
+    e->frame = (uint32_t)s_frame_count;
+    e->valid = 0;
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) return;
+    uint32_t w = di.width, h = di.height;
+    if (w > DISP_RING_MAX_W) w = DISP_RING_MAX_W;
+    if (h > DISP_RING_MAX_H) h = DISP_RING_MAX_H;
+    e->w = (uint16_t)w; e->h = (uint16_t)h;
+    e->depth24 = (uint8_t)(di.depth24 ? 1 : 0);
+    /* GPU-side truth when the GL raster pipeline is live (scissored pack of
+     * just the display rect + one small readback); CPU VRAM otherwise (the
+     * software backend's authoritative surface). Runs on the present thread,
+     * where the GL context is current. */
+    extern int gl_renderer_fbo_peek(int x, int y, int w_, int h_, uint16_t *out);
+    int got = 0;
+    if (di.display_x + w <= 1024 && di.display_y + h <= 512)
+        got = gl_renderer_fbo_peek((int)di.display_x, (int)di.display_y,
+                                   (int)w, (int)h, e->px);
+    if (!got) {
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++)
+                e->px[y * w + x] =
+                    gpu_vram_peek((int)(di.display_x + x), (int)(di.display_y + y));
+    }
+    /* Full-VRAM aux capture (same GL-truth/CPU-truth split as the display). */
+    if (!gl_renderer_fbo_peek(0, 0, 1024, 512, e->vram)) {
+        const uint16_t *v = gpu_get_vram();
+        memcpy(e->vram, v, (size_t)1024 * 512 * sizeof(uint16_t));
+    }
+    e->valid = 1;
+}
+
+/* Dump an entry's full-VRAM capture as a raw little-endian u16 blob
+ * (1024x512 row-major). */
+static void handle_display_ring_aux(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path"); return;
+    }
+    if (!s_disp_ring_px) { send_err(id, "display ring not started"); return; }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)((uint64_t)f % DISP_RING_CAP)];
+    if (!e->valid || e->frame != (uint32_t)f) {
+        send_err(id, "frame not in display ring"); return;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { send_err(id, "cannot open file"); return; }
+    size_t n1 = fwrite(e->vram, sizeof(uint16_t), (size_t)1024 * 512, fp);
+    fclose(fp);
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"path\":\"%s\","
+             "\"vram_words\":%u}", id, f, path, (unsigned)n1);
+}
+
+static void handle_display_ring_stats(int id, const char *json)
+{
+    (void)json;
+    uint32_t oldest = 0, newest = 0;
+    int n = 0;
+    for (int i = 0; i < DISP_RING_CAP; i++) {
+        if (!s_disp_ring_px || !s_disp_ring[i].valid) continue;
+        uint32_t f = s_disp_ring[i].frame;
+        if (n == 0 || f < oldest) oldest = f;
+        if (n == 0 || f > newest) newest = f;
+        n++;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"capacity\":%d,\"valid\":%d,"
+             "\"oldest_frame\":%u,\"newest_frame\":%u}",
+             id, DISP_RING_CAP, n, oldest, newest);
+}
+
+static void handle_display_ring_get(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path"); return;
+    }
+    if (!s_disp_ring_px) { send_err(id, "display ring not started"); return; }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)((uint64_t)f % DISP_RING_CAP)];
+    if (!e->valid || e->frame != (uint32_t)f) {
+        send_err(id, "frame not in display ring"); return;
+    }
+    if (e->depth24) { send_err(id, "frame is 24bpp scanout (unsupported)"); return; }
+    uint32_t w = e->w, h = e->h;
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { send_err(id, "alloc failed"); return; }
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint16_t p = e->px[i];
+        rgb[i * 3 + 0] = (uint8_t)((p & 0x1F) << 3);
+        rgb[i * 3 + 1] = (uint8_t)(((p >> 5) & 0x1F) << 3);
+        rgb[i * 3 + 2] = (uint8_t)(((p >> 10) & 0x1F) << 3);
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(fp, rgb, w, h);
+    free(rgb);
+    fclose(fp);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"path\":\"%s\","
+             "\"width\":%u,\"height\":%u}", id, f, path, w, h);
+}
+
 static void handle_screenshot_file(int id, const char *json)
 {
     /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
@@ -7232,6 +7616,45 @@ static void handle_screenshot_file(int id, const char *json)
 
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}",
              id, path, w, h);
+}
+
+/* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
+ * PNG, regardless of what the game currently displays. Used to inspect BOTH
+ * double-buffer halves (y=0 and y=256) coherently in one call to see whether a
+ * strobing character is present in one buffer only. */
+static void handle_dump_buffer(int id, const char *json)
+{
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();
+    extern void vk_renderer_sync_cpu(void);
+    vk_renderer_sync_cpu();
+
+    int y0 = json_get_int(json, "y", 0);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_buffer.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    GpuDisplayInfo di;
+    di.display_x = 0; di.display_y = (uint32_t)y0; di.depth24 = 0;
+    di.disabled = 0; di.width = 512; di.height = 240;
+
+    uint32_t w = 512, h = 240;
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_err(id, "cannot open file"); return; }
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { fclose(f); send_err(id, "alloc failed"); return; }
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = r; p[1] = g; p[2] = b;
+        }
+    int ok = png_write_rgb(f, rgb, w, h);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"y\":%d}", id, path, y0);
 }
 
 /* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
@@ -7302,7 +7725,12 @@ static void handle_wide_shot(int id, const char *json)
  * to 0 (the common vertical-double-buffer origin). */
 static void handle_wide_full(int id, const char *json)
 {
-    extern int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    /* Backend-dispatched: gr_wide_dump_full routes to the active renderer's full
+     * wide-surface dump (SW: sw_wide_dump_full; GL: glb_wide_dump_full), so the
+     * whole compositor surface can be inspected on either backend over TCP. */
+    extern int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();   /* no-op on SW; ensures pending GL frame is flushed */
     int base_x = json_get_int(json, "base_x", 0);
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
@@ -7313,7 +7741,7 @@ static void handle_wide_full(int id, const char *json)
     uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
     if (!buf) { send_err(id, "alloc failed"); return; }
     int W = 0, H = 0;
-    int n = sw_wide_dump_full(buf, cap, &W, &H, base_x);
+    int n = gr_wide_dump_full(buf, cap, &W, &H, base_x);
     if (n <= 0) { free(buf); send_err(id, "no wide surface (SW backend? native-wide engaged?)"); return; }
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
@@ -8058,38 +8486,56 @@ static void handle_d44_ring(int id, const char *json)
  * CD DMA was mid-transfer (the VSync-in-DMA-window bug). */
 static void handle_irqctx_ring(int id, const char *json)
 {
-    (void)json;
     typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
                      cdrom_active, is_vblank; int dma_depth;
                      uint32_t take_pc, real_epc, exit_pc, exit_reason, same_thread,
-                     restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects; } E;
+                     restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects,
+                     entry_sp, pump_site; } E;
     extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
-    uint64_t total = g_irqctx_seq; uint32_t cap = 64u;
-    uint32_t n = total < cap ? (uint32_t)total : cap;
-    static char buf[49152]; size_t pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    /* Ring cap must track IRQCTX_RING_CAP in interrupts.c. */
+    uint32_t cap = 4096u;
+    /* Optional frame-window filter + newest-N count so a deep ring can be
+     * windowed to the delivery window of interest (ring-buffer discipline). */
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
+    int count    = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > (int)cap) count = (int)cap;
+    uint64_t total = g_irqctx_seq;
+    uint32_t avail = total < cap ? (uint32_t)total : cap;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 512u + (size_t)n * 410u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
                     id, (unsigned long long)total);
-    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 512; i++) {
+    int emitted = 0;
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 512; i++) {
         uint64_t idx = total - n + i;
         E *e = &g_irqctx_ring[idx & (cap - 1u)];
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
             "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"vblank\":%u,"
             "\"d44\":\"0x%08X\",\"cdrom_active\":%u,\"dma_depth\":%d,"
             "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
             "\"take_pc\":\"0x%08X\",\"real_epc\":\"0x%08X\",\"exit_pc\":\"0x%08X\","
             "\"exit_reason\":%u,\"same_thread\":%u,\"restored\":%u,"
             "\"v1_exit\":\"0x%08X\",\"v1_saved\":\"0x%08X\","
-            "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u}",
-            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u,"
+            "\"entry_sp\":\"0x%08X\",\"pump_site\":%u}",
+            emitted ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
             e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
             e->sr, e->istat, e->imask,
             e->take_pc, e->real_epc, e->exit_pc, e->exit_reason, e->same_thread,
             e->restored, e->v1_exit, e->v1_saved, e->ra_exit, e->ra_saved,
-            e->redirects);
+            e->redirects, e->entry_sp, e->pump_site);
+        emitted++;
     }
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
     debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_freeze_check(int id, const char *json)
@@ -9887,16 +10333,25 @@ static void handle_autocompile_status(int id, const char *json)
     extern void overlay_autocapture_get_status(int *enabled,
                                                uint32_t *triggers,
                                                uint64_t *last_delta);
+    extern uint64_t overlay_autocapture_last_insns_delta(void);
+    extern void overlay_autocapture_get_futility(uint32_t *backoff,
+                                                 uint32_t *futile);
     (void)json;
     int      ac_en = 0;
     uint32_t trig = 0;
     uint64_t delta = 0;
+    uint32_t backoff = 0, futile = 0;
     overlay_autocapture_get_status(&ac_en, &trig, &delta);
+    overlay_autocapture_get_futility(&backoff, &futile);
     char comp[4096];
     autocompile_status_json(comp, sizeof(comp));
     send_fmt("{\"id\":%d,\"ok\":true,\"autocapture_enabled\":%d,"
-             "\"triggers\":%u,\"last_pressure\":%llu,\"compile\":%s}\n",
-             id, ac_en, trig, (unsigned long long)delta, comp);
+             "\"triggers\":%u,\"futile_skips\":%u,\"backoff_mult\":%u,"
+             "\"last_pressure\":%llu,"
+             "\"last_insns_pressure\":%llu,\"compile\":%s}\n",
+             id, ac_en, trig, futile, backoff,
+             (unsigned long long)delta,
+             (unsigned long long)overlay_autocapture_last_insns_delta(), comp);
 }
 
 /* sljit_status: Tier-2 in-process JIT backend state. Runs the codegen smoke
@@ -10864,6 +11319,21 @@ static void handle_game_options(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"go\":%s}", id, buf);
 }
 
+/* On-the-fly string translation (text_xlate.cpp). Always-on capture inventory +
+ * apply stats/dump, queried over TCP (no log files — Rule 3). sub: stats (def) |
+ * dump | todo | reload. */
+static void handle_xlate(int id, const char *json)
+{
+    extern int text_xlate_debug_json(const char *subcmd, char *out, int cap);
+    char sub[32] = {0};
+    if (!json_get_str(json, "sub", sub, sizeof(sub))) strcpy(sub, "stats");
+    static char buf[1 << 20];   /* 1 MB — the inventory dump can be large */
+    int n = text_xlate_debug_json(sub, buf, (int)sizeof(buf));
+    if (n < 0) n = 0;
+    if (n < (int)sizeof(buf)) buf[n] = 0; else buf[sizeof(buf) - 1] = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"xlate\":%s}", id, buf);
+}
+
 /* Live host-stack-usage profile (RECURSION_BUG.md §17): read the always-on ring
  * while the game is still responsive to distinguish a gradual cross-frame leak
  * (used_kb climbs linearly with frame) from a within-one-frame runaway. */
@@ -10980,10 +11450,226 @@ static void handle_lockstep_func(int id, const char *json) {
     send_fmt("{\"id\":%d,\"ok\":true,\"lockstep_func\":%s}", id, buf);
 }
 
+/* ---- phase_profile: statistical wall-time attribution (always-on) ---------
+ * A dedicated ~1 kHz sampler thread reads the emu thread's phase flags and
+ * accumulates per-second buckets in a ring. It answers "what fraction of wall
+ * time is the dirty-RAM interpreter / guest exception context" DIRECTLY,
+ * without inference from dispatch or instruction counts. Two properties are
+ * load-bearing:
+ *  - It runs OFF the main thread. The TCP server itself pumps on the main
+ *    thread, so a handler-side busy sampler would freeze the very thing it
+ *    measures.
+ *  - It samples g_exec_phase (dirty_ram_interp.c), the INNERMOST backend
+ *    executing at that instant — NOT g_dirty_interp_active, which stays 1
+ *    across native overlay calls made from the interpreter's call contract
+ *    and therefore reads "inside the dispatch tree", not "interpreting".
+ *    g_exec_phase is save/restored at every backend boundary and across
+ *    exception delivery, so leaked intervals self-heal at the next bracket.
+ * SDL init gives the process 1 ms timer resolution, so Sleep(1) really is
+ * ~1 kHz. Query: {"cmd":"phase_profile","window":N} -> shares over the last
+ * N whole seconds (default 10, in-progress second excluded) + cumulative. */
+extern int psx_exec_phase(void);   /* 0=other 1=interp 2=native 3=static 4=gpu-gp0 */
+extern int psx_get_in_exception(void);
+extern uint32_t overlay_loader_native_inprogress(void);
+
+#define PHASE_RING_SECS 64
+static volatile uint32_t s_phase_total [PHASE_RING_SECS];
+static volatile uint32_t s_phase_interp[PHASE_RING_SECS];
+static volatile uint32_t s_phase_native[PHASE_RING_SECS];
+static volatile uint32_t s_phase_static[PHASE_RING_SECS];
+static volatile uint32_t s_phase_gpu   [PHASE_RING_SECS];
+static volatile uint32_t s_phase_exc   [PHASE_RING_SECS];
+static volatile uint64_t s_phase_sec   [PHASE_RING_SECS];
+static volatile uint64_t s_phase_samples_all = 0, s_phase_interp_all = 0;
+
+/* Hot-function histogram: when a sample lands in a native overlay shard,
+ * bucket the shard's registered entry address (cumulative since boot; a
+ * client diffs two snapshots for a window). Open addressing, sampler-thread
+ * writes only. */
+#define PHOT_SLOTS 4096
+static volatile uint32_t s_phot_addr[PHOT_SLOTS];
+static volatile uint64_t s_phot_cnt [PHOT_SLOTS];
+static volatile uint64_t s_phot_native_total = 0, s_phot_drops = 0;
+
+static void phot_add(uint32_t addr)
+{
+    if (!addr) return;
+    uint32_t h = (addr >> 2) * 2654435761u;
+    for (uint32_t p = 0; p < 16; p++) {
+        uint32_t i = (h + p) & (PHOT_SLOTS - 1u);
+        uint32_t a = s_phot_addr[i];
+        if (a == addr) { s_phot_cnt[i]++; return; }
+        if (a == 0)    { s_phot_addr[i] = addr; s_phot_cnt[i] = 1; return; }
+    }
+    s_phot_drops++;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI phase_sampler_main(LPVOID arg)
+#else
+static void *phase_sampler_main(void *arg)
+#endif
+{
+    (void)arg;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+#endif
+        uint64_t sec = monotonic_ms() / 1000u;
+        int slot = (int)(sec % PHASE_RING_SECS);
+        if (s_phase_sec[slot] != sec) {          /* bucket rolls to a new second */
+            s_phase_sec[slot]    = sec;
+            s_phase_total[slot]  = 0;
+            s_phase_interp[slot] = 0;
+            s_phase_native[slot] = 0;
+            s_phase_static[slot] = 0;
+            s_phase_gpu[slot]    = 0;
+            s_phase_exc[slot]    = 0;
+        }
+        s_phase_total[slot]++;
+        s_phase_samples_all++;
+        switch (psx_exec_phase()) {
+        case 1: s_phase_interp[slot]++; s_phase_interp_all++; break;
+        case 2: s_phase_native[slot]++;
+                s_phot_native_total++;
+                phot_add(overlay_loader_native_inprogress());
+                break;
+        case 3: s_phase_static[slot]++; break;
+        case 4: s_phase_gpu[slot]++; break;
+        default: break;                          /* 0 = host/other */
+        }
+        if (psx_get_in_exception())       { s_phase_exc[slot]++; }
+    }
+#ifndef _WIN32
+    return NULL;
+#endif
+}
+
+static void phase_sampler_start(void)
+{
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, phase_sampler_main, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, phase_sampler_main, NULL) == 0)
+        pthread_detach(t);
+#endif
+}
+
+static void handle_phase_profile(int id, const char *json)
+{
+    int window = json_get_int(json, "window", 10);
+    if (window < 1) window = 1;
+    if (window > PHASE_RING_SECS - 2) window = PHASE_RING_SECS - 2;
+    uint64_t now_sec = monotonic_ms() / 1000u;
+    uint32_t tot = 0, itp = 0, nat = 0, sta = 0, gpu = 0, exc = 0;
+    for (int k = 1; k <= window; k++) {          /* whole seconds only */
+        uint64_t sec = now_sec - (uint64_t)k;
+        int slot = (int)(sec % PHASE_RING_SECS);
+        if (s_phase_sec[slot] == sec) {
+            tot += s_phase_total[slot];
+            itp += s_phase_interp[slot];
+            nat += s_phase_native[slot];
+            sta += s_phase_static[slot];
+            gpu += s_phase_gpu[slot];
+            exc += s_phase_exc[slot];
+        }
+    }
+    uint32_t oth = tot - itp - nat - sta - gpu;
+    send_fmt("{\"id\":%d,\"ok\":true,\"window_s\":%d,\"samples\":%u,"
+             "\"interp_samples\":%u,\"interp_share\":%.4f,"
+             "\"native_samples\":%u,\"native_share\":%.4f,"
+             "\"static_samples\":%u,\"static_share\":%.4f,"
+             "\"gpu_samples\":%u,\"gpu_share\":%.4f,"
+             "\"other_samples\":%u,\"other_share\":%.4f,"
+             "\"exc_samples\":%u,\"exc_share\":%.4f,"
+             "\"samples_total\":%llu,\"interp_total\":%llu}",
+             id, window, tot,
+             itp, tot ? (double)itp / (double)tot : 0.0,
+             nat, tot ? (double)nat / (double)tot : 0.0,
+             sta, tot ? (double)sta / (double)tot : 0.0,
+             gpu, tot ? (double)gpu / (double)tot : 0.0,
+             oth, tot ? (double)oth / (double)tot : 0.0,
+             exc, tot ? (double)exc / (double)tot : 0.0,
+             (unsigned long long)s_phase_samples_all,
+             (unsigned long long)s_phase_interp_all);
+}
+
+/* phase_hot: top guest functions by native wall-time samples (cumulative
+ * since boot — diff two snapshots for a window). {"cmd":"phase_hot","top":N} */
+static void handle_phase_hot(int id, const char *json)
+{
+    int top = json_get_int(json, "top", 20);
+    if (top < 1)  top = 1;
+    if (top > 64) top = 64;
+    uint32_t best_addr[64];
+    uint64_t best_cnt[64];
+    int n = 0;
+    for (int i = 0; i < PHOT_SLOTS; i++) {
+        uint32_t a = s_phot_addr[i];
+        if (!a) continue;
+        uint64_t c = s_phot_cnt[i];
+        int j = n < top ? n : top - 1;
+        if (n < top) n++;
+        else if (c <= best_cnt[j]) continue;
+        while (j > 0 && best_cnt[j - 1] < c) {
+            best_addr[j] = best_addr[j - 1];
+            best_cnt[j]  = best_cnt[j - 1];
+            j--;
+        }
+        best_addr[j] = a;
+        best_cnt[j]  = c;
+    }
+    uint64_t tot = s_phot_native_total;
+    char buf[4096];
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"id\":%d,\"ok\":true,\"native_samples_total\":%llu,"
+                       "\"hash_drops\":%llu,\"top\":[",
+                       id, (unsigned long long)tot,
+                       (unsigned long long)s_phot_drops);
+    for (int i = 0; i < n && len < (int)sizeof(buf) - 96; i++) {
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len,
+                        "%s{\"addr\":\"0x%08X\",\"samples\":%llu,\"share\":%.4f}",
+                        i ? "," : "", best_addr[i],
+                        (unsigned long long)best_cnt[i],
+                        tot ? (double)best_cnt[i] / (double)tot : 0.0);
+    }
+    len += snprintf(buf + len, sizeof(buf) - (size_t)len, "]}");
+    (void)len;
+    send_fmt("%s", buf);
+}
+
+/* idle_skip: idle-loop cycle-skip status + runtime toggle.
+ *   {"cmd":"idle_skip"}              -> counters
+ *   {"cmd":"idle_skip","enable":0|1} -> toggle, then counters */
+static void handle_idle_skip(int id, const char *json)
+{
+    extern int      g_idle_skip_enabled;
+    extern uint64_t g_idle_skip_count, g_idle_skip_cycles;
+    extern uint32_t g_idle_skip_last_pc, g_idle_skip_last_quantum;
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) g_idle_skip_enabled = en;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,"
+             "\"skips\":%llu,\"cycles_skipped\":%llu,"
+             "\"last_pc\":\"0x%08X\",\"last_quantum\":%u}",
+             id, g_idle_skip_enabled,
+             (unsigned long long)g_idle_skip_count,
+             (unsigned long long)g_idle_skip_cycles,
+             g_idle_skip_last_pc, g_idle_skip_last_quantum);
+}
+
 static const CmdEntry s_commands[] = {
+    { "phase_profile",     handle_phase_profile },
+    { "phase_hot",         handle_phase_hot },
+    { "idle_skip",         handle_idle_skip },
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
+    { "xlate",             handle_xlate },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },
     { "devtrace_dump",     handle_devtrace_dump },
@@ -11013,6 +11699,8 @@ static const CmdEntry s_commands[] = {
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
+    { "ws_dome",           handle_ws_dome },
+    { "ws_dome_probe",     handle_ws_dome_probe },
     { "ws_census",         handle_ws_census },
     { "mmx6_freshfix",     handle_mmx6_freshfix },
     { "mmx6_reveal",       handle_mmx6_reveal },
@@ -11022,10 +11710,12 @@ static const CmdEntry s_commands[] = {
     { "gl_present_ring",   handle_gl_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "gl_ws_ablate",      handle_gl_ws_ablate },
+    { "gl_wide_fast",      handle_gl_wide_fast },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
+    { "vblank_rate",       handle_vblank_rate },
     { "cycles_to_next_event", handle_cycles_to_next_event },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
@@ -11046,6 +11736,9 @@ static const CmdEntry s_commands[] = {
     { "spu_voices",        handle_spu_voices },
     { "spu_events",        handle_spu_events },
     { "spu_events_reset",  handle_spu_events_reset },
+    { "audio_stats",       handle_audio_stats },
+    { "audio_wav",         handle_audio_wav },
+    { "audio_events",      handle_audio_events },
     { "card_buffer_dump",  handle_card_buffer_dump },
     { "sio_arm_audit",     handle_sio_arm_audit },
     { "sio_burst_stats",   handle_sio_burst_stats },
@@ -11174,6 +11867,10 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "display_ring_get",  handle_display_ring_get },
+    { "display_ring_aux",  handle_display_ring_aux },
+    { "display_ring_stats", handle_display_ring_stats },
+    { "dump_buffer",       handle_dump_buffer },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
@@ -11184,6 +11881,10 @@ static const CmdEntry s_commands[] = {
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
+    { "gte_ring_dump",     handle_gte_ring_dump },
+    { "gte_intpl_dump",    handle_gte_intpl_dump },
+    { "gte_frame_stats",   handle_gte_frame_stats },
+    { "gte_latch_dump",    handle_gte_latch_dump },
     { "quit",              handle_quit },
     { "dispatch_stats",    handle_dispatch_stats },
     { "dispatch_check",    handle_dispatch_check },
@@ -11280,6 +11981,11 @@ static void process_command(const char *line)
 static CPUState *s_init_cpu = NULL;
 CPUState *debug_cpu_ptr = NULL; /* Global, used by memory.c watchpoints */
 
+/* Guest $ra accessor for other TUs (e.g. gpu.c GP0 ring caller capture) that
+ * must not depend on the CPUState layout. Returns 0 before the CPU is bound. */
+uint32_t debug_guest_ra(void) { return debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0; }
+uint32_t debug_guest_sp(void) { return debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0; }
+
 void debug_server_set_cpu(CPUState *cpu)
 {
     s_cpu = cpu;
@@ -11346,6 +12052,10 @@ void debug_server_init(int port)
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
     listen(s_listen, 16);
+
+    /* Always-on wall-time phase sampler (phase_profile). Own thread: the
+     * server pumps on the main thread, so sampling must not live there. */
+    phase_sampler_start();
     /* Blocking accept — the dedicated I/O thread waits on it (no busy-poll). */
 
     /* Start the TCP I/O thread + its handoff primitives. */
@@ -11497,7 +12207,32 @@ void debug_server_init(int port)
     s_wtrace_ranges[14].hi = 0x00066BD0u;
     s_wtrace_ranges[15].lo = 0x00097420u; /* movie/frame handoff state */
     s_wtrace_ranges[15].hi = 0x00097430u;
-    s_wtrace_range_count = 16;
+    /* Ape LOAD-GAME higher-layer (libcard + game card-manager) always-on
+     * capture. Oracle diff (2026-07-07 session 3) proved the low-level card
+     * protocol succeeds on both runtimes, but ours stays in top-scene 1
+     * ("Checking") while Beetle advances to scene 4 (file-select). These cells
+     * are the higher-layer state that diverges; capturing every writer from
+     * boot (never probe-time armed) attributes WHICH libcard op-state stalls
+     * and what completion it awaits. Masked-physical (KUSEG) addresses.
+     *   0x800b4e30 = libcard op struct field 0 (count/op-state; 0 ours vs 1 Beetle)
+     *   0x800b4e50 = save-name ptr + filename buffer ("bu00:BASCUS-94423SYS" on Beetle, zeros ours)
+     *   0x800b4ed0 = libcard op-handler ptr (0x80020f4c ours vs 0x80020bc8 Beetle)
+     *   0x800e3880 = SCENE (no-op flip-flop) + 0x800e3884 = TRIG (= top-scene index; 1 ours vs 4 Beetle)
+     *   0x8013af50 = game card-menu substate block (0x8013af56 = 0 ours vs 1 Beetle)
+     *   0x00007264 = kernel card-driver per-state byte M8[0x7264] (handoff: stuck at 1) */
+    s_wtrace_ranges[16].lo = 0x000B4E2Cu;
+    s_wtrace_ranges[16].hi = 0x000B4E40u;
+    s_wtrace_ranges[17].lo = 0x000B4E50u;
+    s_wtrace_ranges[17].hi = 0x000B4E68u;
+    s_wtrace_ranges[18].lo = 0x000B4ECCu;
+    s_wtrace_ranges[18].hi = 0x000B4ED4u;
+    s_wtrace_ranges[19].lo = 0x000E3880u;
+    s_wtrace_ranges[19].hi = 0x000E3888u;
+    s_wtrace_ranges[20].lo = 0x0013AF50u;
+    s_wtrace_ranges[20].hi = 0x0013AF60u;
+    s_wtrace_ranges[21].lo = 0x00007260u;
+    s_wtrace_ranges[21].hi = 0x00007270u;
+    s_wtrace_range_count = 22;
 
     s_wtrace_boot_ranges[0].lo = 0x00097420u; /* movie/frame handoff state */
     s_wtrace_boot_ranges[0].hi = 0x00097430u;
@@ -11824,6 +12559,10 @@ void debug_server_record_frame(void)
 
     /* Last function */
     strcpy(r->last_func, "(no tracking)");
+
+    /* Always-on display ring: raw display-area pixels for THIS frame number
+     * (pre-increment, matching what the `frame` command reports right now). */
+    disp_ring_capture();
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;

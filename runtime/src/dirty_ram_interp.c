@@ -210,6 +210,23 @@ extern uint32_t g_debug_last_store_pc;
 int g_dirty_interp_active = 0;
 int dirty_ram_interp_is_active(void) { return g_dirty_interp_active; }
 
+/* Innermost execution phase, for the wall-time sampler (phase_profile).
+ * g_dirty_interp_active is NOT this: it stays 1 across a native overlay call
+ * made from the interpreter's jal/jalr contract (overlay_loader_call_native),
+ * so sampling it reads "inside the dispatch tree", not "interpreting". This
+ * variable is save/set/restored at EVERY backend boundary, so a sample reads
+ * the backend actually executing at that instant:
+ *   0 = host/other (SDL, GPU, top-level dispatch glue, idle)
+ *   1 = dirty-RAM interpreter (exec_one body / precise slice)
+ *   2 = native overlay shard (gcc DLL or sljit)
+ *   3 = compiled static text (game EXE / recompiled BIOS, incl. IRQ handler)
+ *   4 = GPU GP0 command processing (gpu.c — raster/batch/VRAM-transfer work)
+ * Longjmp contract mirrors g_dirty_interp_active: exception delivery saves it
+ * at entry and restores after its setjmp loop (interrupts.c), so a skipped
+ * inner restore self-heals at the next bracket. */
+int g_exec_phase = 0;
+int psx_exec_phase(void) { return g_exec_phase; }
+
 /* TCP-armed instruction-window capture (native↔interp divergence drill).
  * g_insn_gate_*: an extra runtime-settable PC range that the per-insn log
  * records (on top of the hardwired kernel ranges). Freeze latch: on the Nth
@@ -320,6 +337,34 @@ static int ws_cull_site(uint32_t pc) {
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
         words[n++] = fetch_word(a);
     int flag = psx_ws_func_has_screen_cull(words, n);
+    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
+    cache[slot].word = fetch_word(phys); cache[slot].flag = (int8_t)flag;
+    return flag;
+}
+
+/* Widescreen LEFT-edge funnel-bltz classification (auto_screen_x, signed
+ * min/max + center±halfwidth idioms — ws_cull_detect.h). Same ±512-byte window
+ * qualification + per-PC cache discipline as ws_cull_site above; additionally
+ * classifies THIS bltz structurally (delay-slot width compare / addu-subu
+ * pair), so an unrelated bltz in a qualifying window stays vanilla. */
+static int ws_cull_bltz_site(uint32_t pc) {
+    enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
+    static struct { uint32_t pc; uint32_t gen; uint32_t word; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
+    uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen &&
+        cache[slot].word == fetch_word(phys))
+        return cache[slot].flag;
+    uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+    uint32_t hi = phys + (uint32_t)(WIN * 4);
+    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    static uint32_t words[2 * WIN + 1];
+    int n = 0;
+    for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
+        words[n++] = fetch_word(a);
+    int idx = (int)((phys - lo) / 4u);
+    int flag = psx_ws_func_has_screen_cull(words, n) &&
+               psx_ws_cull_bltz_at(words, n, idx);
     cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
     cache[slot].word = fetch_word(phys); cache[slot].flag = (int8_t)flag;
     return flag;
@@ -639,7 +684,12 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t return_pc,
                                   uint32_t *next_pc_out) {
     cpu->pc = 0;
-    psx_dispatch_call(cpu, target, return_pc);
+    {
+        int prev_phase = g_exec_phase;
+        g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
+        psx_dispatch_call(cpu, target, return_pc);
+        g_exec_phase = prev_phase;
+    }
     /* psx_dispatch_call validated the (return_pc, sp) contract; a bail
      * unwind in progress surfaces with cpu->pc = the guest's true target. */
     if (g_psx_call_bail) return 1;
@@ -1010,12 +1060,10 @@ int dirty_ram_xprobe_json(char *out, int cap) {
 #ifdef PSX_HAS_GAME_DISPATCH
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     if (target == 0x8001A954u) site_note(&g_site_interp);
-    /* Decline if the target page is dirty: an overlay overwrote it after the
-     * game-start baseline, so the compiled function is STALE. Returning 0 lets the
-     * JAL/JALR handler fall through to is_local_dirty_target -> local-flow interp of
-     * the live overlay, instead of running stale compiled code (the same staleness
-     * the dirty_ram_dispatch_inner gate guards). Clean targets run compiled. */
-    if (dirty_ram_is_dirty(target & 0x1FFFFFFFu)) return 0;
+    /* Decline when the target page no longer matches the static game image.
+     * Returning 0 lets the JAL/JALR handler fall through to local-flow interp
+     * of the live RAM bytes instead of running stale compiled code. */
+    if (!dirty_ram_text_native_ok(target & 0x1FFFFFFFu)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -1024,7 +1072,10 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     }
     g_mixed_depth++;
     ls_func_enter(target, cpu);
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 3;
     int r = psx_dispatch_game_compiled(cpu, target);
+    g_exec_phase = prev_phase;
     ls_func_exit(target, cpu, r);
     g_mixed_depth--;
     return r;
@@ -1455,7 +1506,15 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x01: { /* REGIMM: BLTZ/BGEZ/BLTZAL/BGEZAL by rt field */
         int taken;
         switch (rt) {
-        case 0x00: /* BLTZ */    taken = ((int32_t)cpu->gpr[rs] <  0); break;
+        case 0x00: /* BLTZ */
+            /* Widescreen render-funnel LEFT-edge widen (auto_screen_x): a
+             * classified funnel bltz rejects only past the revealed margin.
+             * Identity at 4:3 (margin 0). Gated per-game, cheap cached scan. */
+            if (psx_ws_auto_cull_on() && ws_cull_bltz_site(pc))
+                taken = psx_ws_cull_bltz(cpu->gpr[rs]);
+            else
+                taken = ((int32_t)cpu->gpr[rs] <  0);
+            break;
         case 0x01: /* BGEZ */    taken = ((int32_t)cpu->gpr[rs] >= 0); break;
         case 0x10: /* BLTZAL */  taken = ((int32_t)cpu->gpr[rs] <  0);
                                   cpu->gpr[31] = pc + 8; break;
@@ -1469,23 +1528,32 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         return 1;
     }
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x09: /* ADDIU rt, rs, simm */
-        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm;
+        cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+                     + (psx_ws_is_cull_bias_site(pc) ? (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
-        cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+        /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
+         * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
+         * edge is the bltz above. Identity at 4:3 (margin 0). */
+        if (psx_ws_is_cull_slti_site(pc) ||
+            (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
+        else
+            cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
         cpu->gpr[0] = 0;
         return 0;
     case 0x0B: /* SLTIU */
-        /* Widescreen render-funnel cull widening (auto_screen_x): always apply
-         * the shared helper for a flagged render-cull site — it is byte-identical
+        /* Widescreen render-funnel cull widening (auto_screen_x): apply the
+         * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
-        if ((imm == 0x140 || imm == 0x141) && ws_cull_site(pc))
+        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
@@ -1717,6 +1785,8 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     else if (addr == 0x80046264u) site_note(&g_site_dd264);   /* loop tail re-dispatch */
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
 
     /* pc=0 producer tripwire: the dirty path reported "handled" yet published a
@@ -1780,6 +1850,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     }
 
     g_dirty_interp_active = prev;
+    g_exec_phase = prev_phase;
     return r;
 }
 
@@ -1833,8 +1904,10 @@ static int precise_pc_dispatchable(uint32_t pc) {
 static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
     int prev_precise = g_precise_mode;
     int prev_active  = g_dirty_interp_active;
+    int prev_phase   = g_exec_phase;
     g_precise_mode = 1;
     g_dirty_interp_active = 1;
+    g_exec_phase = 1;
 
     uint32_t pc = cpu->pc;
     g_slice_last_block    = pc;
@@ -1981,6 +2054,7 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
 #endif
     g_precise_mode = prev_precise;
     g_dirty_interp_active = prev_active;
+    g_exec_phase = prev_phase;
 }
 
 /* Block-leader slice guard, called by the emitted prologue of every compiled
@@ -2062,24 +2136,34 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
 #ifdef PSX_HAS_GAME_DISPATCH
     xprobe_event(cpu->gpr[31], XOP_DD, XSITE_DD, addr, 0u, cpu->gpr[29], cpu->gpr[31], 0);
-    /* Run the statically-compiled game function ONLY for a CLEAN page (RAM matches
-     * the compiled image). A dirty page in the game-text region means an overlay
-     * overwrote it after the game-start baseline (dirty_ram_clear_image_baseline),
-     * so the compiled function is STALE and we must fall through to interpret the
-     * live overlay. Without this gate the loader thread's psx_dispatch(0x8001DB38)
-     * ran the stale compiled func_8001DB38 instead of the START.BIN-loader overlay
-     * (Tomba 2 Whoopee-Camp splash). Clean text still runs compiled (the fast path,
-     * unchanged for non-overlaying games once their text is baselined). */
-    if (!dirty_ram_is_dirty(phys)) {
+    /* Run the statically-compiled game function only while the target is still
+     * native-safe. Dirty overlay pages and pages whose text bytes diverged from
+     * the original EXE image fall through to interpret the live RAM bytes. */
+    if (dirty_ram_text_native_ok(phys)) {
         g_mixed_depth++;
         {
             ls_func_enter(addr, cpu);
+            int prev_phase = g_exec_phase;
+            g_exec_phase = 3;
             int _gc = psx_dispatch_game_compiled(cpu, addr);
+            g_exec_phase = prev_phase;
             ls_func_exit(addr, cpu, _gc);
             g_mixed_depth--;
             if (_gc) return 1;
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
+    } else if (psx_game_address_in_text(addr)) {
+        /* RAM at a game-text address diverged from the static EXE image
+         * (runtime-relocated / overlaid / self-modified code the compiled
+         * static function no longer reflects). The live RAM is the truth:
+         * fall through to INTERPRET it here rather than bail (line below) to
+         * the shell shadow (normalize() -> shell ROM). Crash Bash relocates a
+         * code page onto 0x30000 (inside the BIOS shell window); without this
+         * its 0x30FF4 call diverged (native_ok=0) yet was not dirty, so the
+         * interpreter bailed and normalize() shadowed it to dead shell ROM ->
+         * unknown-dispatch abort. Marking it a clean game-text miss lets the
+         * dirty interpreter execute the real RAM bytes. */
+        clean_game_text_miss = 1;
     }
 #endif
 
@@ -2185,6 +2269,28 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifndef PSX_NO_DEBUG_TOOLS
     extern void debug_server_cyc_observe(uint32_t block_leader_phys);
 #endif
+    /* Async-interrupt latency fix. A guest wait loop that lives ENTIRELY in
+     * dirty RAM (e.g. libcd's CdSync spin, as in Kula World) re-enters this
+     * interpreter once per short (~7-insn) block and exits before the
+     * per-invocation `(insns_executed & 0xFFF)` gate below can fire — so a
+     * pending, IEc+IM2-enabled interrupt is never taken and the loop spins for
+     * seconds while the CD IRQ that would set its wait-flag is never serviced.
+     * Poll on a GLOBAL invocation counter so short-block loops still yield to
+     * interrupts (this is the interpreter analogue of a block-leader poll in
+     * static code). psx_check_interrupts runs the handler and returns with
+     * registers restored, so continuing the loop afterward is safe. */
+    {
+        static uint32_t s_interp_entry_poll = 0;
+        static int s_entry_poll_enabled = -1;   /* DIAGNOSTIC toggle (590c236 x kind-30 escape regression hunt) */
+        if (s_entry_poll_enabled < 0) {
+            const char* e = getenv("PSX_DIRTY_ENTRY_POLL");
+            s_entry_poll_enabled = (e && e[0] == '0') ? 0 : 1;
+        }
+        if (s_entry_poll_enabled && (++s_interp_entry_poll & 0x3Fu) == 0) {
+            cpu->pc = pc;
+            psx_check_interrupts(cpu);
+        }
+    }
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
 #ifndef PSX_NO_DEBUG_TOOLS

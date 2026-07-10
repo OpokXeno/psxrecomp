@@ -16,6 +16,9 @@
 #include "event_ring.h"
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#  include <signal.h>
+#endif
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -48,6 +51,21 @@ static uint8_t stat_reg;
 static uint8_t request_reg;
 static uint8_t irq_enable;
 static uint8_t irq_flag;
+
+/* Disc license region string returned in GetID's last four response bytes
+ * ("SCEE" PAL / "SCEA" NTSC-U / "SCEI" NTSC-J). Real hardware reports the
+ * region of the INSERTED DISC (mechacon reads it from the license area);
+ * the BIOS CD driver revalidates it when the kernel CD subsystem
+ * reinitializes mid-game, and a mismatch throws it into an endless
+ * GetStat/Init retry loop (Kula World wedged at its first level load this
+ * way). Set from the mounted disc's SYSTEM.CNF serial at launch
+ * (main.cpp); the default matches the console region of the one supported
+ * BIOS (SCPH1001, NTSC-U). */
+static uint8_t disc_scex[4] = { 'S', 'C', 'E', 'A' };
+
+void cdrom_set_disc_scex(const char scex[4]) {
+    memcpy(disc_scex, scex, 4);
+}
 
 /* CPS-native CD interrupt single-outstanding latch.
  *
@@ -617,6 +635,31 @@ static void xa_reset_decode(void) {
     xa_stream_active = 0;
 }
 
+/* CD-audio volume matrix ([data_source][output_port], 0x80 = unity) applied
+ * to every decoded XA/CD-DA sample, exactly as the CD controller does on
+ * real hardware (Beetle PS_CDC::ApplyVolume, cdc.cpp:524). Written via the
+ * index-2/3 register banks and latched by the "apply changes" bit; games
+ * drive it CONSTANTLY — X5 fades music between scenes with it (measured
+ * 0x7E steady, ramping to 0x00 at transitions on the Beetle oracle). Not
+ * modeling it left fades missing and steady levels ~0.6 dB hot. */
+static uint8_t cd_pending_vol[2][2] = { { 0x80, 0x00 }, { 0x00, 0x80 } };
+static uint8_t cd_decode_vol[2][2]  = { { 0x80, 0x00 }, { 0x00, 0x80 } };
+
+static void cd_apply_decode_volume(int16_t *stereo, int frames) {
+    /* Fast path: identity matrix (the reset state). */
+    if (cd_decode_vol[0][0] == 0x80 && cd_decode_vol[1][1] == 0x80 &&
+        cd_decode_vol[0][1] == 0x00 && cd_decode_vol[1][0] == 0x00)
+        return;
+    for (int i = 0; i < frames; i++) {
+        int32_t l = stereo[i * 2 + 0];
+        int32_t r = stereo[i * 2 + 1];
+        int32_t lo = ((l * cd_decode_vol[0][0]) >> 7) + ((r * cd_decode_vol[1][0]) >> 7);
+        int32_t ro = ((l * cd_decode_vol[0][1]) >> 7) + ((r * cd_decode_vol[1][1]) >> 7);
+        stereo[i * 2 + 0] = clamp16_cd(lo);
+        stereo[i * 2 + 1] = clamp16_cd(ro);
+    }
+}
+
 static int xa_decode_sector_4bit_stereo(const uint8_t* data, int16_t* out) {
     static const int k0[5] = { 0, 60, 115, 98, 122 };
     static const int k1[5] = { 0, 0, -52, -55, -60 };
@@ -769,6 +812,9 @@ static int maybe_deliver_xa_audio(const uint8_t* raw_data,
         : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
     int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
                                           pcm_44100, XA_MAX_44100_FRAMES);
+    /* Volume is applied after resampling, per PS1 hardware tests (Beetle
+     * cdc.cpp GetCDAudio comment). */
+    cd_apply_decode_volume(pcm_44100, out_frames);
     spu_cd_audio_push(pcm_44100, out_frames);
     trace_cdrom('A', 0,
                 ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
@@ -971,7 +1017,53 @@ static void queue_or_exec_command(uint8_t cmd) {
     record_command_history('Q', cmd, queued_cmd.params, queued_cmd.param_count);
 }
 
+/* Pause (0x09) completion latency — Beetle PS_CDC::Command_Pause.
+ *
+ * A Pause issued while the drive is reading/playing completes only after the
+ * head settles: (1124584 + lba*42596/4500) CPU cycles in double-speed mode,
+ * doubled at single speed — roughly 1.1M+ cycles (~2 video frames). A Pause
+ * issued while already paused/stopped acks its second response quickly (5000).
+ *
+ * This is a CPU-visible ordering contract, NOT sector cadence: games issue
+ * Pause from mainline code at every streamed-file boundary and finish their
+ * driver bookkeeping in the frames before the completion INT2 arrives. The
+ * previous flat apply_speed(10000) delivered INT2 ~100x early — inside the
+ * issuing frame — and the game's driver intermittently lost the completion
+ * (Ape Escape's memcard scene loader wedged at a random file boundary, its
+ * async CD queue never pumping the next file). Hence also NO apply_speed():
+ * disc-speed divisors / 'instant' mode must never compress this latency back
+ * into the race window. Call BEFORE stop_read_stream()/CDSTAT_READ clear. */
+static int pause_complete_delay_cycles(void) {
+    if (!reading && !(stat_reg & (CDSTAT_READ | CDSTAT_PLAY)))
+        return 5000;
+    int lba = reading ? msf_to_lba(read_min, read_sec, read_sect)
+                      : last_sector_lba;
+    if (lba < 0) lba = 0;
+    int64_t cycles = 1124584 + (int64_t)lba * 42596 / (75 * 60);
+    if (!(mode_reg & 0x80))
+        cycles *= 2;
+    return (int)cycles;
+}
+
 static void exec_command(uint8_t cmd) {
+#if !defined(PSX_NO_DEBUG_TOOLS) && !defined(_WIN32)
+    /* Self-stop trap: PSX_CD_TRAP_CMD=<byte> makes the process SIGSTOP
+     * itself the moment that CD command dispatches, so a debugger can
+     * attach and read the full native+guest call chain at the exact
+     * instant with ZERO run-speed cost. (A gdb conditional breakpoint on
+     * this function slows the emu two orders of magnitude via ptrace —
+     * unusable for wedges that need minutes of healthy boot first.) */
+    {
+        static long trap_cmd = -2, trap_nth = 1, trap_hits = 0;
+        if (trap_cmd == -2) {
+            const char *e = getenv("PSX_CD_TRAP_CMD");
+            trap_cmd = (e && *e) ? strtol(e, NULL, 0) : -1;
+            e = getenv("PSX_CD_TRAP_NTH");   /* stop on the Nth match (default 1st) */
+            if (e && *e) trap_nth = strtol(e, NULL, 0);
+        }
+        if ((long)cmd == trap_cmd && ++trap_hits == trap_nth) raise(SIGSTOP);
+    }
+#endif
     trace_cdrom('C', 0, cmd, 0);
     /* ENQUEUE: a CD command was issued (aux = command byte). */
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
@@ -1021,7 +1113,55 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         break;
 
-    case 0x09: /* Pause */
+    case 0x07: /* MotorOn — spin the drive motor up. Two-phase like Stop:
+                * INT3 (ACK) now with the current status, then a pending INT2
+                * (COMPLETE) after spin-up reporting status with the motor bit
+                * SET (psx-spx "07h MotorOn"). If the motor is ALREADY spinning
+                * the hardware rejects the command with INT5 (ERROR) and error
+                * code 0x20 ("wrong condition") — replicate that.
+                *
+                * Previously 0x07 had no case and fell through to default ->
+                * CDIRQ_ERROR (INT5) with no error code, so a game that spins the
+                * motor up (e.g. after a Stop) and waits for the MotorOn
+                * completion IRQ would never see it. */
+        if (stat_reg & CDSTAT_MOTOR) {
+            response_push(stat_reg | CDSTAT_ERROR);
+            response_push(0x20); /* error code: motor already on */
+            set_irq(CDIRQ_ERROR);
+            break;
+        }
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        pending.cmd = 0x07;
+        pending.pending = 1;
+        pending.delay = apply_speed(30000); /* motor spin-up */
+        pending.phase = 1;
+        break;
+
+    case 0x08: /* Stop — stop the motor. Two-phase like Pause: INT3 (ACK) now
+                * with the pre-stop status (motor still spinning), then a pending
+                * INT2 (COMPLETE) after the motor spins down, reporting the new
+                * status with the motor bit cleared (psx-spx "08h Stop").
+                *
+                * Previously 0x08 had no case and fell through to default ->
+                * CDIRQ_ERROR (INT5). A game that stops the drive on a scene
+                * change then waits for the Stop completion IRQ never sees it and
+                * hangs: Tsumu Light's CD library retries Stop forever (~90-frame
+                * timeout) and never advances past its first content load. */
+        stop_read_stream();
+        xa_reset_decode();
+        spu_cd_audio_reset();
+        stat_reg &= ~(CDSTAT_READ | CDSTAT_PLAY | CDSTAT_SEEK);
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        pending.cmd = 0x08;
+        pending.pending = 1;
+        pending.delay = apply_speed(30000); /* motor spin-down */
+        pending.phase = 1;
+        break;
+
+    case 0x09: { /* Pause */
+        int complete_delay = pause_complete_delay_cycles();
         stop_read_stream();
         xa_reset_decode();
         spu_cd_audio_reset();
@@ -1030,9 +1170,10 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
         pending.pending = 1;
-        pending.delay = apply_speed(10000);
+        pending.delay = complete_delay;
         pending.phase = 1;
         break;
+    }
 
     case 0x0A: /* Init */
         stop_read_stream();
@@ -1043,7 +1184,11 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x0A;
         pending.pending = 1;
-        pending.delay = apply_speed(50000);
+        /* Beetle models the drive-reset busy period as 1136000 cycles
+         * (PS_CDC::Command_Reset, PSRCounter). Same second-response class as
+         * Pause: an authentic multi-frame latency games' drivers rely on —
+         * never scaled by the disc-speed divisor. */
+        pending.delay = 1136000;
         pending.phase = 1;
         break;
 
@@ -1223,7 +1368,9 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1A;
         pending.pending = 1;
-        pending.delay = apply_speed(30000);
+        /* Beetle PS_CDC::Command_ID: second response after 33868 cycles.
+         * Unscaled — same authentic-latency class as Pause/Init/ReadTOC. */
+        pending.delay = 33868;
         pending.phase = 1;
         break;
 
@@ -1243,16 +1390,28 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1E;
         pending.pending = 1;
-        pending.delay = apply_speed(100000);
+        /* Beetle PS_CDC::Command_ReadTOC: ~30M cycles (a near-second TOC
+         * re-scan; Beetle adds a seek term on top — we keep the dominant
+         * constant). Unscaled — authentic-latency class. */
+        pending.delay = 30000000;
         pending.phase = 1;
         break;
 
     case 0x19: /* Test */
         if (param_count >= 1 && param_fifo[0] == 0x20) {
-            response_push(0x97);
-            response_push(0x01);
-            response_push(0x10);
-            response_push(0xC2);
+            /* CD controller firmware version (BCD date + region). This BIOS is
+             * SCPH-1001, whose sub-CPU reports the 1994 controller: 94/09/19 C0.
+             * The value must be < 0x95 in the high byte — the shell's CD-init
+             * (func at ROM 0x1DF50) sets kernel flag [0xA000DFFC]=1 when the
+             * version byte >= 0x95, which later makes the boot CD-open
+             * (0xBFC0D570) issue a spurious ReadTOC that wedges the game's
+             * streaming reads. Beetle hardcodes the PSone-era 0x97 regardless of
+             * BIOS, which is wrong for SCPH-1001; matching the real 1994
+             * controller keeps the flag clear (Kula World demo-load wedge). */
+            response_push(0x94);
+            response_push(0x09);
+            response_push(0x19);
+            response_push(0xC0);
             set_irq(CDIRQ_ACK);
         } else {
             response_push(stat_reg);
@@ -1303,6 +1462,20 @@ static void process_pending(uint32_t cycles) {
         }
         break;
 
+    case 0x07: /* MotorOn complete — motor now spinning */
+        stat_reg |= CDSTAT_MOTOR;
+        response_push(stat_reg);
+        set_irq(CDIRQ_COMPLETE);
+        fire_cdrom_irq();
+        break;
+
+    case 0x08: /* Stop complete — motor has spun down */
+        stat_reg &= ~(CDSTAT_MOTOR | CDSTAT_READ | CDSTAT_PLAY | CDSTAT_SEEK);
+        response_push(stat_reg);
+        set_irq(CDIRQ_COMPLETE);
+        fire_cdrom_irq();
+        break;
+
     case 0x09: /* Pause complete */
         stat_reg &= ~CDSTAT_READ;
         response_push(stat_reg);
@@ -1335,10 +1508,10 @@ static void process_pending(uint32_t cycles) {
             response_push(0x00);
             response_push(0x20);
             response_push(0x00);
-            response_push('S');
-            response_push('C');
-            response_push('E');
-            response_push('I');
+            response_push(disc_scex[0]);
+            response_push(disc_scex[1]);
+            response_push(disc_scex[2]);
+            response_push(disc_scex[3]);
             set_irq(CDIRQ_COMPLETE);
         }
         fire_cdrom_irq();
@@ -1463,11 +1636,19 @@ uint32_t cdrom_read(uint32_t addr) {
     switch (addr) {
     case 0x1F801800: {
         uint8_t s = index_reg & 0x03;
-        s |= (1 << 2); /* ADPCM empty */
+        /* Bit 2 is ADPBUSY (XA-ADPCM playback in progress), NOT "ADPCM
+         * empty" — it must idle at 0. The oracle (beetle cdc.cpp, Read
+         * A==0) never raises it. Raising it permanently made every BIOS
+         * status poll see "XA busy" and steered the kernel CD driver
+         * init down a different branch from real hardware. */
         if (param_count == 0) s |= (1 << 3);
         if (param_count < PARAM_FIFO_SIZE) s |= (1 << 4);
         if (response_read < response_count) s |= (1 << 5);
         if (data_fifo_ready()) s |= (1 << 6);
+        /* Bit 7 BUSYSTS: command written but not yet executed (our queued
+         * path; the synchronous path leaves no guest-observable window).
+         * Mirrors beetle's PendingCommandCounter/phase<=1 busy window. */
+        if (queued_cmd.pending) s |= (1 << 7);
         ret = s;
         break;
     }
@@ -1515,6 +1696,8 @@ void cdrom_write(uint32_t addr, uint32_t value) {
     case 0x1F801801:
         if (index_reg == 0) {
             queue_or_exec_command(val);
+        } else if (index_reg == 3) {
+            cd_pending_vol[1][1] = val;   /* Right-CD -> Right-SPU */
         }
         break;
 
@@ -1525,11 +1708,24 @@ void cdrom_write(uint32_t addr, uint32_t value) {
             }
         } else if (index_reg == 1) {
             irq_enable = val & 0x1F;
+        } else if (index_reg == 2) {
+            cd_pending_vol[0][0] = val;   /* Left-CD -> Left-SPU */
+        } else if (index_reg == 3) {
+            cd_pending_vol[1][0] = val;   /* Right-CD -> Left-SPU */
         }
         break;
 
     case 0x1F801803:
-        if (index_reg == 0) {
+        if (index_reg == 2) {
+            cd_pending_vol[0][1] = val;   /* Left-CD -> Right-SPU */
+        } else if (index_reg == 3) {
+            /* Apply-changes latch (bit 5) copies pending -> live, exactly
+             * like Beetle cdc.cpp case 0x0B. (ADPMute bit 0 is not modeled
+             * by the Beetle oracle either.) */
+            if (val & 0x20) {
+                memcpy(cd_decode_vol, cd_pending_vol, sizeof(cd_decode_vol));
+            }
+        } else if (index_reg == 0) {
             request_reg = val;
             if (!(request_reg & CDROM_REQUEST_BFRD)) {
                 sector_read_pos = 0;

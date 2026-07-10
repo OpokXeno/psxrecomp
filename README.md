@@ -21,11 +21,18 @@ BIOS layer, no stubs, and no general-purpose interpreter fallback for static
 code.
 
 PSXRecomp is a framework. Game-specific projects live in their own
-repositories and pull this one in to build a game binary. The active end-to-end
-targets are:
+repositories and link this one in as a **git submodule** to build a game binary.
+The active end-to-end targets are:
 
 - [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
 - [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
+
+**New here?** The fastest way in:
+[`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md) (how a game actually
+runs — static / native-overlay / interpreter), then
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+[`docs/BUILDING.md`](docs/BUILDING.md), and
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Philosophy — toward 100% static recompilation
 
@@ -113,7 +120,7 @@ Known follow-up work:
 For the current game milestone, build and run the sibling TombaRecomp project:
 
 ```sh
-cd F:/Projects/TombaRecomp
+cd ../TombaRecomp
 cmake --build build -j16
 ./build/psx-runtime.exe --game game.toml
 ```
@@ -144,29 +151,30 @@ Windows, `ucontext` on POSIX (`runtime/src/psx_fiber.c`) — so the recompiled
 BIOS's cooperative thread switching (the CD-boot handoff in particular) behaves
 the same on every platform.
 
-Requirements:
+Requirements at a glance (full details, dependency table, and per-platform
+prerequisites in [`docs/BUILDING.md`](docs/BUILDING.md)):
 
-- A C/C++ toolchain: MSVC or MinGW (Windows), Apple Clang (macOS), Clang/GCC (Linux).
-- CMake 3.20+. On macOS/Linux also `ninja` and `pkg-config`.
-- SDL2: the bundled dev pack on Windows; `brew install sdl2 pkg-config ninja`
-  on macOS; `libsdl2-dev` (or distro equivalent) on Linux.
+- A C/C++ toolchain: MSVC or MinGW/MSYS2 (Windows), Apple Clang (macOS),
+  Clang/GCC (Linux). CMake 3.20+; on macOS/Linux also `ninja` and `pkg-config`.
+- SDL2 (system / bundled). RmlUi and FreeType come in as **git submodules** —
+  clone with `--recurse-submodules`.
 - A legally obtained `SCPH1001.BIN` BIOS dump. Not included.
 - For game projects, a legally obtained game disc/EXE dump. Not included.
 
-Build the framework runtime:
+Build the framework (recompiler tool + BIOS-only runtime):
 
 ```sh
-# Windows (MSYS2/MinGW)
-cmake -S recompiler -B recompiler/build -G "Unix Makefiles" && cmake --build recompiler/build
-cmake -S runtime    -B runtime/build    -G "Unix Makefiles" && cmake --build runtime/build --target psx-runtime
+git clone --recurse-submodules https://github.com/mstan/psxrecomp.git && cd psxrecomp
 
-# macOS / Linux (Ninja)
-cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C recompiler/build
-cmake -S runtime    -B runtime/build    -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C runtime/build psx-runtime
+cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build recompiler/build
+cmake -S runtime    -B runtime/build    -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build runtime/build --target psx-runtime
 ```
 
-Game projects generate their own `generated/<serial>_*.c` files and link this
-runtime source tree through CMake.
+On Windows swap `-G Ninja` for your generator if you prefer (e.g.
+`-G "Unix Makefiles"`); always keep an explicit `-DCMAKE_BUILD_TYPE` so the
+generated C is optimized. Game projects generate their own
+`generated/<serial>_*.c` files and link this runtime through CMake — see
+[`docs/BUILDING.md`](docs/BUILDING.md#build-and-run-a-game).
 
 ## Keyboard Map
 
@@ -209,10 +217,19 @@ The recompiler emits C functions and dispatch tables for BIOS and game code.
 The runtime loads the BIOS/game assets into emulated PS1 memory, links the
 generated C as native code, and simulates hardware through MMIO handlers for
 GPU, DMA, timers, CD-ROM, MDEC, SIO0, memory cards, SPU, GTE, and interrupt
-delivery. BIOS A0/B0/C0 vectors go through the recompiled BIOS, not HLE shims.
+delivery. The recompiled `SCPH1001.BIN` is the low-level (LLE) kernel and the
+correctness oracle; an optional HLE tier lays instant boot-skip and a few BIOS
+services on top, always falling through to the recompiled BIOS.
 
-See `CLAUDE.md`, `PLAN.md`, and `CURRENT_STATE.md` for the development rules
-and current project context.
+Code that can't be seen ahead of time (disc-streamed **overlays**) is captured
+and compiled to native code the first time it appears (`static → gcc → tcc`
+backend), with a small interpreter as the correctness fallback until it is. Full
+story in [`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md); component-level
+detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md) for the
+development rules, and [`docs/internal/`](docs/internal/) for the phased plans
+and deep design notes (`PLAN.md`, `FAITHFUL_TIMING_PLAN.md`, …).
 
 ## Disc Speed
 
@@ -256,6 +273,21 @@ copyrighted material — keep it on your own machine, alongside your disc
 image. A metadata-only contribution format (addresses and checksums, no
 game code) is planned so discoveries can be shared safely in the future.
 
+## Contributing
+
+Contributions are welcome — AI-assisted or not — as long as they're reviewed,
+tested, and keep the core game-agnostic. A few things hold this project together:
+the faithful recompiled BIOS is the baseline and oracle, generated code is never
+hand-edited (fix the recompiler and regenerate), and a change proves itself
+against the Beetle oracle / on screen rather than by assertion. Game-specific work
+lives in the game repos, which pin an exact framework commit as a submodule.
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR — it covers the core
+rules, how to verify a change, the regression checklist across the known games,
+and how a framework fix reaches a game through its pin. Bugs and build problems go
+to GitHub issues (include `gcc -v` / OS / generator for build failures); design
+discussion happens in the **R.A.I.D.** Discord (invite below).
+
 ## License
 
 PolyForm Noncommercial 1.0.0. See `LICENSE`.
@@ -267,3 +299,13 @@ collection. Release executables (and per-game overlay caches) contain
 statically recompiled (machine-translated) builds of the original code,
 the same distribution model used by other static recompilation projects
 such as N64: Recompiled.
+
+---
+
+<p align="center">
+  <sub><b>R.A.I.D. — Retro AI Development</b> · a Discord for AI-assisted retro reverse-engineering, decomp &amp; recomp</sub>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/Ad9BwSzctP"><img src=".github/raid-discord.png" alt="Join the Retro AI Development (R.A.I.D.) Discord" width="200"></a>
+</p>

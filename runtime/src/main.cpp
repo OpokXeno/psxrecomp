@@ -12,6 +12,7 @@
 #include "psx_interpreter.h"
 #include "cdrom.h"
 #include "fntrace.h"
+#include "text_xlate.h"
 #include "boot_state.h"
 #include "bios_hle.h"
 #include "savestate.h"
@@ -30,7 +31,16 @@
 #include "latency_ring.h"
 #include "sio.h"
 #include "spu.h"
+#include "audio_trace.h"
 #include "spu_shadow.h"
+
+/* Shared clock-domain bridge: band-limited polyphase resampler + P-only DRC.
+ * The SPU renders at a fixed 44100/60 per wall-clock frame while the host
+ * consumes on its own crystal; with no resampling/DRC the queue slowly drifts
+ * to underrun (silence gaps). The bridge resamples ~1:1 with a <=+/-0.5% ratio
+ * trim to hold the ring near target -- no gaps. See recomp_audio_drc.h. */
+#define RECOMP_AUDIO_DRC_IMPL
+#include "recomp_audio_drc.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "crash_trace.h"
@@ -39,12 +49,14 @@
 #include "game_options.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
 #endif
 #include <SDL.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -83,6 +95,9 @@ extern "C" uint64_t gte_get_exec_count(void);
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);
 extern "C" uint32_t memory_get_bios_checksum(void);
+extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
+                                                  const uint8_t *bytes,
+                                                  uint32_t len);
 
 /* dma.c */
 extern "C" void dma_init(void);
@@ -200,6 +215,9 @@ static int           g_video_aspect_den = 3;
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
 static bool          g_ws_hud_sprt = false;
+/* Runtime-only transition cleanup; kept out of gpu.h because generated game
+ * units include that ABI header and do not need this frontend-only setter. */
+extern "C" void gpu_ws_set_clear_reveal(int on);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
@@ -274,6 +292,41 @@ uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
 #define TURBO_LOADS_ENGAGE_FRAMES 20
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
+
+/* DRC bridge. Producer (sdl_audio_pump) runs on the main loop thread under
+ * SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
+ * thread. */
+static rab_bridge s_drc;
+static bool       s_drc_ready = false;
+
+/* Observability + A/B. PSXRECOMP_AUDIO_LEGACY=1 keeps the historical push model
+ * (SDL_QueueAudio, no bridge) so the underrun baseline can be measured against
+ * the bridge from a single build; default (unset) = bridge/pull model. Output
+ * health is surfaced through the audio_stats TCP command (no stderr probe). */
+static bool audio_legacy_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PSXRECOMP_AUDIO_LEGACY"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v != 0;
+}
+/* Legacy-mode underrun counter: incremented when the SDL queue is found empty
+ * at pump time (the device was silence-filling = an audible gap). */
+static uint64_t g_legacy_underruns = 0;
+/* Set at unmute so the pump resyncs its bridge-underrun baseline past the
+ * intentional mute-drain instead of reporting it as gaps. */
+int g_audio_unmute_resync = 0;
+/* Actual device rate the host opened at (bridge mode may differ from 44100;
+ * the T3 tap ring runs at this rate and its WAV dump must say so). */
+int g_audio_host_rate = 44100;
+
+static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
+    if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
+    int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
+    rab_pull(&s_drc, reinterpret_cast<int16_t*>(stream), frames);
+    /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
+     * This callback is the tap's single writer while the bridge is active. */
+    audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
+                    frames);
+}
 
 static std::filesystem::path find_upward(std::filesystem::path start,
                                          const std::filesystem::path& marker) {
@@ -635,9 +688,10 @@ static void shutdown_runtime(void) {
     overlay_capture_write_json();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
-        SDL_CloseAudioDevice(sdl_audio_device);
+        SDL_CloseAudioDevice(sdl_audio_device);   /* stops the pull callback */
         sdl_audio_device = 0;
     }
+    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
     debug_server_shutdown();
 }
@@ -664,16 +718,74 @@ static void sdl_audio_pump(void) {
     if (!sdl_audio_device) return;
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
-    const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-    if (SDL_GetQueuedAudioSize(sdl_audio_device) > max_queue_bytes) return;
+    const bool legacy = audio_legacy_mode();
+    static int had_audio = 0;
+    uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
+    if (legacy) {
+        /* Historical push model + baseline measurement: a drained (==0) queue
+         * means the device was silence-filling since the last pump = a gap.
+         * Only meaningful after the first audio has been queued. */
+        const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
+        queued = SDL_GetQueuedAudioSize(sdl_audio_device);
+        if (queued == 0 && had_audio) {
+            g_legacy_underruns++;
+            audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
+        }
+        if (queued > max_queue_bytes) {
+            audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
+            return;
+        }
+    } else {
+        /* No host-queue backpressure check: the bridge's ring + DRC hold the
+         * fill near target, so we always render this frame and push it. */
+        if (!s_drc_ready) return;
+        /* Surface bridge underruns (counted on the SDL audio thread) into the
+         * event ring from this thread — the event ring is single-writer.
+         * Across a turbo mute the ring intentionally runs dry (the pump stops
+         * while the callback keeps pulling); those dry pulls are the mute,
+         * not gaps — resync past them instead of reporting them. */
+        rab_stats st;
+        rab_get_stats(&s_drc, &st);
+        static uint64_t prev_underruns = 0;
+        extern int g_audio_unmute_resync;
+        if (g_audio_unmute_resync) {
+            prev_underruns = st.underrun_events;
+            g_audio_unmute_resync = 0;
+        } else if (st.underrun_events > prev_underruns) {
+            audio_trace_event(AUDIO_EV_UNDERRUN,
+                              (uint32_t)(st.underrun_events - prev_underruns), 1);
+            prev_underruns = st.underrun_events;
+        }
+        queued = (uint32_t)st.last_fill_ms;
+    }
 
-    static double sample_accum = 0.0;
-    sample_accum += 44100.0 / 60.0;
-    int frames = (int)sample_accum;
-    sample_accum -= (double)frames;
+    /* Faithful sample budget: the SPU is clocked by the GUEST, not by host
+     * presents. 33.8688 MHz / 44100 Hz = exactly 768 guest cycles per output
+     * frame, so production tracks guest time precisely — including the real
+     * NTSC 59.94 Hz vblank — instead of assuming 60.00 Hz per present, which
+     * built in a systematic -0.1% production deficit (measured: 43950/s
+     * produced vs 44100/s consumed = recurring ring underruns no +/-0.5%
+     * DRC trim could absorb during jitter spikes). */
+    extern uint64_t psx_cycle_count;
+    static uint64_t last_cycles = 0;
+    static uint64_t cycle_carry = 0;
+    const uint64_t now_cycles = psx_cycle_count;
+    if (last_cycles == 0) last_cycles = now_cycles;
+    uint64_t delta = (now_cycles - last_cycles) + cycle_carry;
+    last_cycles = now_cycles;
+    int frames = (int)(delta / 768u);
+    cycle_carry = delta % 768u;
     if (frames <= 0) return;
-    if (frames > 2048) frames = 2048;
+    if (frames > 2048) {
+        /* A burst beyond one buffer (e.g. right after an unmute or a long
+         * stall): render one full buffer and DROP the remainder of the debt —
+         * same semantic as the mute model (voice positions freeze across the
+         * gap) rather than time-compressing a backlog into garble. */
+        frames = 2048;
+        cycle_carry = 0;
+    }
 
+    audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
     spu_render(sdl_audio_buf, frames);
     if (sdl_audio_fadein_left > 0) {
         const float g0 = 1.0f - (float)sdl_audio_fadein_left
@@ -684,8 +796,21 @@ static void sdl_audio_pump(void) {
         sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
         sdl_audio_fadein_left -= ramp;
     }
-    SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                   (uint32_t)frames * bytes_per_frame);
+    if (legacy) {
+        /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
+        audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
+        SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                       (uint32_t)frames * bytes_per_frame);
+        had_audio = 1;
+    } else {
+        /* Hand to the bridge (band-limited resample + DRC) instead of
+         * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
+         * The T3 tap moves to sdl_drc_callback: what the device actually
+         * receives is the bridge's device-rate output, not this buffer. */
+        SDL_LockAudioDevice(sdl_audio_device);
+        rab_push(&s_drc, sdl_audio_buf, frames);
+        SDL_UnlockAudioDevice(sdl_audio_device);
+    }
 }
 
 /* Audio gating across turbo-loads transitions.
@@ -701,8 +826,40 @@ static void sdl_audio_pump(void) {
  *     re-trigger within a few frames; without the debounce the mute would
  *     flicker audibly), then resume pumping with a rising ramp applied
  *     across the first ~50 ms of samples (sdl_audio_pump above). */
+/* Bridge/legacy output health, surfaced through the audio_stats TCP command
+ * (debug_server.c) — no stderr probe; rule 3. */
+extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+                                   uint64_t *overflow_drops, double *correction,
+                                   int *legacy, int *host_rate)
+{
+    extern int g_audio_host_rate;   /* set at device open */
+    *legacy = audio_legacy_mode() ? 1 : 0;
+    *host_rate = g_audio_host_rate;
+    if (*legacy || !s_drc_ready) {
+        *fill_ms = sdl_audio_device
+                   ? (double)SDL_GetQueuedAudioSize(sdl_audio_device)
+                     / (44100.0 * 4.0) * 1000.0
+                   : 0.0;
+        *underruns = g_legacy_underruns;
+        *overflow_drops = 0;
+        *correction = 0.0;
+        return sdl_audio_device != 0;
+    }
+    rab_stats st;
+    rab_get_stats(&s_drc, &st);
+    *fill_ms = st.last_fill_ms;
+    *underruns = st.underrun_events;
+    *overflow_drops = st.overflow_drops;
+    *correction = st.last_correction;
+    return 1;
+}
+
 static void sdl_audio_update(int turbo_active) {
     if (!sdl_audio_device) return;
+    {   /* Tag audio events with the vblank frame counter. */
+        extern uint64_t s_frame_count;
+        audio_trace_note_frame((uint32_t)s_frame_count);
+    }
     const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
     static int muted = 0;
     static int hangover = 0;
@@ -719,8 +876,16 @@ static void sdl_audio_update(int turbo_active) {
             sdl_audio_fadein_left = 0;
             spu_render(sdl_audio_buf, tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
-            SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                           (uint32_t)tail * sizeof(int16_t) * 2u);
+            audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
+            if (audio_legacy_mode()) {
+                audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
+                SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                               (uint32_t)tail * sizeof(int16_t) * 2u);
+            } else if (s_drc_ready) {
+                SDL_LockAudioDevice(sdl_audio_device);
+                rab_push(&s_drc, sdl_audio_buf, tail);
+                SDL_UnlockAudioDevice(sdl_audio_device);
+            }
             muted = 1;
         }
         hangover = HANGOVER_FRAMES;
@@ -730,6 +895,9 @@ static void sdl_audio_update(int turbo_active) {
         if (hangover > 0) { hangover--; return; }
         muted = 0;
         sdl_audio_fadein_left = sdl_audio_fade_samples;
+        audio_trace_event(AUDIO_EV_UNMUTE, (uint32_t)sdl_audio_fadein_left, 0);
+        extern int g_audio_unmute_resync;
+        g_audio_unmute_resync = 1;
     }
     sdl_audio_pump();
 }
@@ -1016,6 +1184,12 @@ static void load_input_config(const char* argv0) {
     if (!controller_enabled) {
         for (auto& entry : controller_map) entry.sources.clear();
     }
+
+    /* Configurable KEYBOARD keybinds (keybinds.ini, next to the exe) — separate
+     * from input.ini's gamepad map. Loads the user's map (or writes defaults on
+     * first run). The launcher may have just edited+saved this file; we re-read
+     * it here so the runtime always reflects the current bindings. */
+    psx_keybinds_init(argv0);
 }
 
 static void close_player(PlayerInput& p) {
@@ -1134,26 +1308,13 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
     }
 }
 
-static uint16_t pad_from_keyboard(void) {
+/* Keyboard -> PSX button word for `player` (1 or 2), via the configurable
+ * keybinds.ini map (psx_keybinds). Defaults reproduce the old hardcoded layout
+ * (arrows=d-pad, X/S/Z/A=Cross/Circle/Square/Triangle, Q/W/E/R=L1/R1/L2/R2,
+ * Return=Start, RShift=Select), so out-of-the-box behaviour is unchanged. */
+static uint16_t pad_from_keyboard(int player) {
     const Uint8* keys = SDL_GetKeyboardState(NULL);
-    uint16_t buttons = 0xFFFF; /* all released */
-
-    if (keys[SDL_SCANCODE_UP])      buttons &= ~PAD_UP;
-    if (keys[SDL_SCANCODE_DOWN])    buttons &= ~PAD_DOWN;
-    if (keys[SDL_SCANCODE_LEFT])    buttons &= ~PAD_LEFT;
-    if (keys[SDL_SCANCODE_RIGHT])   buttons &= ~PAD_RIGHT;
-    if (keys[SDL_SCANCODE_RETURN])  buttons &= ~PAD_START;
-    if (keys[SDL_SCANCODE_RSHIFT])  buttons &= ~PAD_SELECT;
-    if (keys[SDL_SCANCODE_X])       buttons &= ~PAD_CROSS;
-    if (keys[SDL_SCANCODE_Z])       buttons &= ~PAD_SQUARE;
-    if (keys[SDL_SCANCODE_S])       buttons &= ~PAD_CIRCLE;
-    if (keys[SDL_SCANCODE_A])       buttons &= ~PAD_TRIANGLE;
-    if (keys[SDL_SCANCODE_Q])       buttons &= ~PAD_L1;
-    if (keys[SDL_SCANCODE_W])       buttons &= ~PAD_R1;
-    if (keys[SDL_SCANCODE_E])       buttons &= ~PAD_L2;
-    if (keys[SDL_SCANCODE_R])       buttons &= ~PAD_R2;
-
-    return buttons;
+    return psx_keybinds_pad_word(keys, player);
 }
 
 static uint16_t controller_pad_buttons(SDL_GameController* h) {
@@ -1170,28 +1331,39 @@ static uint16_t controller_pad_buttons(SDL_GameController* h) {
     return buttons;
 }
 
-/* Map an SDL axis (-32768..32767) to a PSX analog byte (0..255, 0x80 centred),
- * applying the configured centre deadzone: travel within controller_deadzone
- * reads as centred (0x80) and the remaining travel is rescaled to the full range
- * so the stick still reaches the extremes. Gives clean variable analog speed
- * with no centre drift. */
-static uint8_t axis_to_pad_byte(int16_t v) {
-    const int dz = controller_deadzone;
-    int av = v < 0 ? -(int)v : (int)v;        /* |v|, 0..32768 */
-    if (av <= dz) return 0x80;                /* inside deadzone -> centred */
-    int range = 32767 - dz;
-    if (range < 1) range = 1;
-    int mag = (av - dz) * 32767 / range;      /* 0..32767 past the deadzone */
-    if (mag > 32767) mag = 32767;
-    int sv = v < 0 ? -mag : mag;
-    int b = (sv + 32768) >> 8;                /* 0..255 */
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-    return (uint8_t)b;
+/* Radial deadzone: process a stick's X and Y together so the dead region is a
+ * small CIRCLE, not a per-axis square. Travel within controller_deadzone reads
+ * centred (0x80/0x80); beyond it the vector MAGNITUDE is rescaled to the full
+ * range along the stick's true direction, so diagonals are preserved (a
+ * per-axis deadzone snaps diagonals toward the cardinals and feels notchy —
+ * bad for directional analog like Ape Escape's net swing). The magnitude is
+ * capped at 32767 before rescale so a full-diagonal push (raw mag ~46341) maps
+ * to ~0x9E/0x9E per axis — the circular gate a real DualShock stick reports,
+ * not 0xFF/0xFF. At dz==0 it reduces to a plain magnitude-preserving map. */
+static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby) {
+    const double dz = controller_deadzone;
+    double x = vx, y = vy;
+    double mag = std::sqrt(x * x + y * y);            /* 0 .. ~46341 */
+    if (mag <= dz || mag <= 0.0) { *obx = 0x80; *oby = 0x80; return; }
+    double capped = mag > 32767.0 ? 32767.0 : mag;
+    double range = 32767.0 - dz;
+    if (range < 1.0) range = 1.0;
+    double newmag = (capped - dz) * 32767.0 / range;  /* 0 .. 32767 */
+    double scale = newmag / mag;                       /* along true direction */
+    int sx = (int)std::lround(x * scale);
+    int sy = (int)std::lround(y * scale);
+    if (sx > 32767) sx = 32767; else if (sx < -32768) sx = -32768;
+    if (sy > 32767) sy = 32767; else if (sy < -32768) sy = -32768;
+    int bx = (sx + 32768) >> 8;
+    int by = (sy + 32768) >> 8;
+    *obx = (uint8_t)(bx < 0 ? 0 : (bx > 255 ? 255 : bx));
+    *oby = (uint8_t)(by < 0 ? 0 : (by > 255 ? 255 : by));
 }
 
-/* Buttons for a player's selected device (0xFFFF = none pressed). */
-static uint16_t pad_buttons_for(const PlayerInput& p) {
-    if (p.kind == 1) return pad_from_keyboard();
+/* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
+ * 1 or 2 — selects which keybinds.ini section drives a keyboard port. */
+static uint16_t pad_buttons_for(const PlayerInput& p, int player) {
+    if (p.kind == 1) return pad_from_keyboard(player);
     if (p.kind == 2) return controller_pad_buttons(p.handle);
     return 0xFFFF;
 }
@@ -1209,21 +1381,23 @@ static uint16_t pad_buttons_for(const PlayerInput& p) {
  * D-pad instead flips the pad to digital, so the game runs its own d-pad path)
  * and true in pinned-ANALOG mode. The keyboard branch always folds the arrows
  * — they are that player's only stick source. */
-static void pad_sticks_for(const PlayerInput& p, uint8_t out[4], bool fold_dpad) {
+static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], bool fold_dpad) {
     out[0] = out[1] = out[2] = out[3] = 0x80;
     if (p.kind == 1) {
+        /* Keyboard analog: the configurable left/right stick-direction binds
+         * (default = arrow keys on the LEFT stick; RIGHT stick unbound), so the
+         * old keyboard analog behaviour is preserved unless the user rebinds. */
         const Uint8* keys = SDL_GetKeyboardState(NULL);
-        if (keys[SDL_SCANCODE_LEFT])  out[0] = 0x00;
-        if (keys[SDL_SCANCODE_RIGHT]) out[0] = 0xFF;
-        if (keys[SDL_SCANCODE_UP])    out[1] = 0x00;
-        if (keys[SDL_SCANCODE_DOWN])  out[1] = 0xFF;
+        psx_keybinds_sticks(keys, player, out);
         return;
     }
     if (p.kind == 2 && p.handle) {
-        out[0] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX));
-        out[1] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY));
-        out[2] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX));
-        out[3] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY));
+        axes_to_pad_pair(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY),
+                         &out[0], &out[1]);
+        axes_to_pad_pair(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY),
+                         &out[2], &out[3]);
         if (fold_dpad) {
             if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out[0] = 0x00;
             if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) out[0] = 0xFF;
@@ -1245,7 +1419,7 @@ static bool hybrid_stick_active(const PlayerInput& p) {
     int ly = SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY);
     return lx > dz || lx < -dz || ly > dz || ly < -dz;
 }
-static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
+static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always) {
     if (p.kind == 2 && p.handle) {
         if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT)  ||
             SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
@@ -1255,9 +1429,7 @@ static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
     }
     if (p.kind == 1 || kb_always) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
-        if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_RIGHT] ||
-            keys[SDL_SCANCODE_UP]   || keys[SDL_SCANCODE_DOWN])
-            return true;
+        if (psx_keybinds_dpad_active(keys, player)) return true;
     }
     return false;
 }
@@ -1272,17 +1444,64 @@ static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
  * (stick -> analog, D-pad -> digital) so the game runs its own analog or
  * digital input path exactly as on hardware (mirrors the inline block this
  * helper was extracted from for the low-latency re-sample). */
-/* Dev builds (PSX_DEBUG_TOOLS — the dev/debug configuration) ALWAYS feed the
- * keyboard into Player 1 alongside whatever device the launcher routed to port 1,
- * so a tester can drive the game from EITHER the keyboard OR the selected
- * controller (e.g. a DualShock) at the same time, with no reconfiguration. The
- * keyboard map and the controller are merged (active-low AND) onto the P1 pad
- * word. Release builds keep the single launcher-selected device per port. */
-#if defined(PSX_DEBUG_TOOLS)
-static const bool g_dev_kb_p1 = true;
-#else
-static const bool g_dev_kb_p1 = false;
-#endif
+/* Dev input mode: while enabled, Player 1 is driven by the keyboard AND EVERY
+ * connected game controller, all merged together (active-low AND) onto the P1 pad
+ * word — so a tester can navigate P1 from whatever is plugged in (keyboard, the
+ * launcher-assigned pad, or any other controller) with no reconfiguration. The P1
+ * pad TYPE is left unchanged: a launcher-assigned analog DualShock still presents
+ * as analog (so the game's analog input path / SIO handshake cadence is preserved
+ * exactly), and merged sources only contribute button/stick STATE, never a type
+ * downgrade. Controlled by PSX_DEV_INPUT (default ON for the dev workflow); set
+ * PSX_DEV_INPUT=0 to restore strict single-device-per-port routing. */
+static bool dev_any_input_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = std::getenv("PSX_DEV_INPUT");
+        cached = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F')) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Merge (active-low AND) the button words of every connected game controller.
+ * Handles are resolved from SDL's already-open set when possible and opened once
+ * on first sight otherwise (kept open for the process lifetime; if a slot later
+ * closes a shared device this self-heals by reopening next frame). This does NOT
+ * disturb per-slot routing — SDL returns the same handle for an already-open
+ * device, so reads are shared and harmless. */
+static uint16_t dev_all_controllers_buttons() {
+    uint16_t btn = 0xFFFF;
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
+        if (!h) h = SDL_GameControllerOpen(i);   /* open once; SDL keeps it */
+        if (h) btn &= controller_pad_buttons(h);
+    }
+    return btn;
+}
+
+/* Fold the first live (non-neutral) left/right stick from ANY connected
+ * controller into st[] (lx,ly,rx,ry). Lets an analog-mode P1 steer from
+ * whatever pad is plugged in, not only the launcher-assigned one. Only axes
+ * that read past the deadzone override; a neutral pad leaves st[] untouched. */
+static void dev_any_controller_sticks(uint8_t st[4]) {
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
+        if (!h) h = SDL_GameControllerOpen(i);
+        if (!h) continue;
+        uint8_t lx, ly, rx, ry;
+        axes_to_pad_pair(SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTY), &lx, &ly);
+        axes_to_pad_pair(SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_RIGHTY), &rx, &ry);
+        if (lx != 0x80 || ly != 0x80) { st[0] = lx; st[1] = ly; }
+        if (rx != 0x80 || ry != 0x80) { st[2] = rx; st[3] = ry; }
+    }
+}
 
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
@@ -1291,39 +1510,53 @@ static void sample_pad_into_sio(int override) {
     }
     for (int s = 0; s < 2; s++) {
         PlayerInput& p = g_players[s];
-        const bool kb_here = (g_dev_kb_p1 && s == 0);
-        if (p.kind == 0 && !kb_here) continue;  /* no device in this port */
+        const int  player  = s + 1;             /* keybinds.ini section (1|2) */
+        /* Dev input: P1 is driven by the keyboard AND every connected controller,
+         * so a tester can navigate from whatever is plugged in (P2 keeps strict
+         * per-port routing). */
+        const bool dev_here = (dev_any_input_enabled() && s == 0);
+        if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
 
         /* Buttons: merge the assigned device with the keyboard (PSX pad word is
-         * active-low, so AND combines "pressed on either source"). */
-        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p) : (uint16_t)0xFFFF;
-        if (kb_here) btn &= pad_from_keyboard();
+         * active-low, so AND combines "pressed on either source"). In dev mode P1
+         * also folds in the keyboard binds and EVERY connected controller. */
+        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
+        if (dev_here) {
+            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
+            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
+        }
         sio_set_pad_state_slot(s, btn);
 
-        /* Resolve the pad type this frame from the player's mode (a port driven
-         * by the keyboard alone presents as a digital pad). */
-        const int mode = (p.kind != 0) ? p.mode : (int)PSXRecompV4::PAD_MODE_DIGITAL;
+        /* Resolve the pad type this frame. An assigned device keeps its configured
+         * mode (a launcher-selected analog DualShock stays analog, so its input
+         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
+         * device but dev-any-input on presents as HYBRID — boots analog like a
+         * DualShock and auto-drops to digital on the d-pad — so any plugged
+         * controller and the keyboard both navigate. */
+        int mode;
+        if (p.kind != 0)      mode = p.mode;
+        else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+        else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
         int eff_analog;
         uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
         if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
             eff_analog = 0;
         } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
             eff_analog = 1;
-            pad_sticks_for(p, st, /*fold_dpad=*/true);
+            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
-            if (hybrid_stick_active(p))               p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, kb_here))  p.hybrid_analog = false;
+            if (hybrid_stick_active(p))                       p.hybrid_analog = true;
+            else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
-            if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
+            if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
-        /* In dev builds also fold the keyboard arrows onto the analog stick, so an
-         * analog-mode P1 still steers from the keyboard. */
-        if (kb_here && eff_analog) {
+        /* Dev mode: fold the keyboard's stick binds AND any connected controller's
+         * sticks onto the analog stick, so an analog-mode P1 steers from whatever
+         * is plugged in (P1 binds). */
+        if (dev_here && eff_analog) {
             const Uint8* keys = SDL_GetKeyboardState(NULL);
-            if (keys[SDL_SCANCODE_LEFT])  st[0] = 0x00;
-            if (keys[SDL_SCANCODE_RIGHT]) st[0] = 0xFF;
-            if (keys[SDL_SCANCODE_UP])    st[1] = 0x00;
-            if (keys[SDL_SCANCODE_DOWN])  st[1] = 0xFF;
+            psx_keybinds_sticks(keys, 1, st);
+            dev_any_controller_sticks(st);
         }
         /* Push sticks every frame; request the pad type (digital/analog) through
          * the coherent channel so a hybrid stick<->d-pad flip is applied only at
@@ -1361,8 +1594,19 @@ static void sample_headless_pad_into_sio(int override) {
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
  * and underruns. Uncapped, the host runs the simulation at whatever
- * speed it can — typically several × realtime — and audio glitches. */
+ * speed it can — typically several × realtime — and audio glitches.
+ *
+ * The wall-clock pacer target; nudged to the host display refresh at
+ * window-creation time (sync-to-host-refresh) so the pacer and SDL PRESENTVSYNC
+ * do not fight — a fixed 59.94 pacer against a 60.00 Hz panel makes rendered
+ * frames land on an uneven vblank count (a 2/3/1 beat) that reads as
+ * moving-object judder/flicker. See g_frame_period_ms. */
 static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
+/* Live pacer period (ms). Defaults to the PSX rate; set to the host refresh
+ * period when the panel is within ~2% of 60 Hz so 30fps content pads evenly to
+ * two host refreshes. Left at the PSX rate on non-~60Hz panels to avoid running
+ * the sim at the wrong speed. */
+static double g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 
 /* ── Host-stack-usage profile (RECURSION_BUG.md §17) ──────────────────────────
  * The decisive instrument for the long-run freeze. The guest call graph mirrors
@@ -1660,7 +1904,7 @@ static void sdl_vblank_present(void) {
      * hard freeze). */
     {
         static FramePacer pacer = { 0 };
-        frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
+        frame_pacer_wait(&pacer, g_frame_period_ms);
     }
     latency_ring_mark(LAT_PACED);
 
@@ -1833,6 +2077,47 @@ static void sdl_vblank_present(void) {
                 }
             }
         }
+
+        /* Frame blending (CRT-persistence masker for 30fps double-buffered
+         * content). Some games (e.g. Crash Bash menus/characters) leave a
+         * dynamic object in only one of the two display buffers per 30fps cycle,
+         * so it strobes on/off as the display alternates buffers — the static
+         * background, present in both, stays put. Real CRTs hid this via phosphor
+         * persistence; accurate emulators either time it away (cycle accuracy) or
+         * offer a "blend frames" option that averages the last two presented
+         * frames. This is the latter: presentation only, game logic untouched.
+         * Guarded to the plain software present path (no GL/VK/wide/hires/FMV) so
+         * the buffer is a simple present_w*h ARGB grid. PSX_FRAME_BLEND=0 off. */
+        {
+            static int blend_cfg = -1;   /* -1 unresolved, 0 off, 1 on */
+            if (blend_cfg < 0) {
+                const char* e = getenv("PSX_FRAME_BLEND");
+                blend_cfg = (e && e[0] == '1') ? 1 : 0;   /* default off (masker only) */
+            }
+            const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
+                                   !di.depth24 && active_scale == 1;
+            if (blend_cfg && simple_sw) {
+                static uint32_t prev_buf[640 * 512];
+                static uint32_t prev_px = 0;
+                const uint32_t npx = present_w * h;
+                if (npx <= (uint32_t)(640 * 512)) {
+                    if (prev_px == npx) {
+                        for (uint32_t i = 0; i < npx; i++) {
+                            const uint32_t a = sdl_pixel_buf[i];
+                            const uint32_t b = prev_buf[i];
+                            prev_buf[i] = a;   /* store this frame (pre-blend) */
+                            sdl_pixel_buf[i] =
+                                0xFF000000u |
+                                (((a & 0xFEFEFEu) >> 1) + ((b & 0xFEFEFEu) >> 1));
+                        }
+                    } else {
+                        /* Resolution changed / first frame: seed, no blend. */
+                        for (uint32_t i = 0; i < npx; i++) prev_buf[i] = sdl_pixel_buf[i];
+                        prev_px = npx;
+                    }
+                }
+            }
+        }
     }
 
     /* Update only the active display rectangle. The backing texture is sized
@@ -1995,10 +2280,11 @@ int main(int argc, char** argv) {
     bool memcard2_enabled = true;
     /* [controller] device routing (defaults: P1 keyboard/digital, P2 none). */
     /* Dev builds default Player 1 to the first connected controller ("auto"):
-     * combined with the always-on keyboard merge (g_dev_kb_p1) this means the
-     * selected controller AND the keyboard both drive P1 with no launcher setup.
-     * If no controller is present, "auto" opens nothing and the keyboard merge
-     * still drives P1. Release keeps "keyboard" (the launcher assigns devices). */
+     * combined with dev-any-input (dev_any_input_enabled(), default ON) the
+     * selected controller, EVERY other plugged-in controller, AND the keyboard
+     * all drive P1 with no launcher setup. If no controller is present, "auto"
+     * opens nothing and the keyboard/any-controller merge still drives P1.
+     * Release keeps "keyboard" (the launcher assigns devices). */
 #if defined(PSX_DEBUG_TOOLS)
     std::string p1_device = "auto";
 #else
@@ -2009,7 +2295,22 @@ int main(int argc, char** argv) {
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
+    bool ctrl_lock_device  = false; /* game.toml [controller] lock_device; true hides the Player controller cards entirely */
+    /* The game-DECLARED port modes, captured at game.toml load and immune to the
+     * settings.toml overrides below. Under lock_mode these are the only valid
+     * modes (the game supports exactly one pad type), so they are what the
+     * runtime clamps to and what the launcher locks its selector to. */
+    int  ctrl_locked_p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
+    bool ws_ultrawide_offered = false;
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
+    /* Localization: the effective language (game.toml default -> settings.toml ->
+     * launcher choice), applied to the translation layer AFTER the launcher runs.
+     * lang_menu_options drives the launcher's "Localization" dropdown (empty =>
+     * no dropdown; only games that declare [localization].languages get one). */
+    std::string resolved_language = "en";
+    std::vector<PSXRecompV4::RuntimeConfig::LanguageOption> lang_menu_options;
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
@@ -2035,6 +2336,14 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+            /* On-the-fly string translation / localization (framework feature —
+             * text_xlate.cpp): load translations/ *.toml under the project root
+             * and select the language. Capture inventory is always-on; APPLY is
+             * gated by language + table presence. See docs/STRING_TRANSLATION.md. */
+            text_xlate_init(gc.project_root.string().c_str(),
+                            gc.runtime.language.c_str());
+            resolved_language = gc.runtime.language;   /* launcher/settings may override */
+            lang_menu_options = gc.runtime.languages;  /* launcher localization dropdown */
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;
@@ -2071,6 +2380,32 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_ring_cols,
                                   gc.ws_bg2d_layer_count,
                                   gc.ws_bg2d_layer_struct_stride);
+            /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
+            gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            /* [widescreen] nw_hud_corners — push HUD to the true wide corners. */
+            gpu_ws_set_nw_hud_corners(gc.ws_nw_hud_corners ? 1 : 0);
+            /* Targeted left-HUD packet range — avoids shifting 2D scenery. */
+            gpu_ws_set_nw_left_hud_packet_range(gc.ws_nw_left_hud_packet_lo,
+                                                gc.ws_nw_left_hud_packet_hi);
+            /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
+            gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
+             * cleanup of synthetic native-wide margins. */
+            gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
+            gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
+            gpu_ws_set_explicit_cull_sites(
+                gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
+                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
+            /* [widescreen.cull] per-game gates + signature immediates for the
+             * pattern-scanned interp/sljit widen hooks. A title that never
+             * opted in must never have its live code scanned and rewritten. */
+            gpu_ws_set_auto_hooks(gc.ws_auto_screen_x_cull ? 1 : 0,
+                                  gc.ws_auto_backdrop_preload ? 1 : 0);
+            if (!gc.ws_cull_w_imms.empty() || !gc.ws_cull_h_imms.empty())
+                gpu_ws_set_cull_imms(gc.ws_cull_w_imms.data(), (int)gc.ws_cull_w_imms.size(),
+                                     gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
+            ws_offered = gc.ws_offered;
+            ws_ultrawide_offered = gc.ws_ultrawide_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -2086,8 +2421,11 @@ int main(int argc, char** argv) {
                 p1_mode = gc.runtime.default_p1_mode;
                 p2_mode = gc.runtime.default_p2_mode;
             }
+            ctrl_locked_p1_mode = gc.runtime.default_p1_mode;
+            ctrl_locked_p2_mode = gc.runtime.default_p2_mode;
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
+            ctrl_lock_device  = gc.runtime.controller_lock_device;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             /* LEGACY per-game pad-config opt-in (default modern). Only Tomba sets
              * it, so its launcher Hybrid mode's analog<->digital flip doesn't make
@@ -2101,6 +2439,34 @@ int main(int argc, char** argv) {
             fast_boot     = gc.runtime.fast_boot;
             bios_hle      = gc.runtime.bios_hle;
             bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
+            /* Let the dispatch layer distinguish "dirty because text was
+             * loaded" from "diverged because runtime wrote different code over
+             * the original EXE image". Packed/self-modifying games can rewrite
+             * their own text; those pages must execute from live RAM, not stale
+             * static native code. Best effort: without the local EXE file, the
+             * guard remains on the existing dirty-page behavior. */
+            if (!gc.exe_path.empty()) {
+                std::ifstream ef(gc.exe_path, std::ios::binary | std::ios::ate);
+                if (ef) {
+                    std::streamsize sz = ef.tellg();
+                    if (sz > 2048) {
+                        uint32_t img_len = (uint32_t)(sz - 2048);
+                        uint8_t *img = (uint8_t *)std::malloc(img_len);
+                        if (img) {
+                            ef.seekg(2048, std::ios::beg);
+                            if (ef.read((char *)img, img_len)) {
+                                dirty_ram_register_text_image(
+                                    gc.load_address & 0x1FFFFFFFu, img, img_len);
+                                std::fprintf(stdout,
+                                    "psxrecomp: text image guard armed (0x%08X..0x%08X)\n",
+                                    gc.load_address, gc.load_address + img_len);
+                            } else {
+                                std::free(img);
+                            }
+                        }
+                    }
+                }
+            }
             /* HLE-tier scheduler subsystem replacement default (env
              * PSX_HLE_SCHEDULER still wins; latched at first dispatch). */
             psx_hle_scheduler_set_default(gc.runtime.hle_scheduler ? 1 : 0);
@@ -2274,6 +2640,7 @@ int main(int argc, char** argv) {
         if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
         if (us.has_memcard1_enabled) memcard1_enabled = us.memcard1_enabled;
         if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
+        if (us.has_language) resolved_language = us.language;
         if (us.has_p1_device) p1_device = us.p1_device;
         if (us.has_p2_device) p2_device = us.p2_device;
         if (us.has_p1_mode) p1_mode = us.p1_mode;
@@ -2281,6 +2648,39 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+    }
+
+    /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
+     * digital-only — X4's pre-DualShock libpad silently discards input from a
+     * pad answering id 0x73). The launcher hides its selector for such games,
+     * but that alone left two holes: (a) launcher-less builds still honoured a
+     * settings.toml p1_mode/p2_mode, and (b) a settings.toml persisted BEFORE
+     * the game declared lock_mode fed the stale mode back as the launcher's
+     * locked_mode. Clamp to the game-declared modes here, after every
+     * config/settings source has been applied, so a locked game can never boot
+     * a pad type it doesn't support. */
+    if (ctrl_lock_mode) {
+        p1_mode = ctrl_locked_p1_mode;
+        p2_mode = ctrl_locked_p2_mode;
+    }
+
+    /* [widescreen] offer=false: this title's widescreen is unported/unvalidated,
+     * so the launcher hides its toggle — and, same completeness treatment as
+     * lock_mode above, the runtime clamps the display aspect to native 4:3 here
+     * so a stale persisted 16:9 in settings.toml can't engage the hack in
+     * launcher-less builds either. */
+    if (!ws_offered && (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
+        std::fprintf(stdout, "psxrecomp: widescreen not offered for this title; "
+                     "clamping display aspect %d:%d -> 4:3\n",
+                     g_video_aspect_num, g_video_aspect_den);
+        g_video_aspect_num = 4;
+        g_video_aspect_den = 3;
+    }
+    if (!ws_ultrawide_offered && g_video_aspect_num * 9 == g_video_aspect_den * 21) {
+        std::fprintf(stdout, "psxrecomp: 21:9 is not offered for this title; clamping to %s\n",
+                     ws_offered ? "16:9" : "4:3");
+        g_video_aspect_num = ws_offered ? 16 : 4;
+        g_video_aspect_den = ws_offered ? 9 : 3;
     }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
@@ -2370,6 +2770,7 @@ int main(int argc, char** argv) {
             seed.memcard2_enabled = memcard2_enabled; seed.has_memcard2_enabled = true;
             if (!memcard1_path.empty()) { seed.memcard1_path = memcard1_path; seed.has_memcard1_path = true; }
             if (!memcard2_path.empty()) { seed.memcard2_path = memcard2_path; seed.has_memcard2_path = true; }
+            seed.language = resolved_language; seed.has_language = true;
             seed.p1_device = p1_device; seed.has_p1_device = true;
             seed.p2_device = p2_device; seed.has_p2_device = true;
             seed.p1_mode = p1_mode; seed.has_p1_mode = true;
@@ -2410,6 +2811,11 @@ int main(int argc, char** argv) {
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
                     ginfo.lock_mode        = ctrl_lock_mode;
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+                    ginfo.lock_device      = ctrl_lock_device;
+                    ginfo.ws_offered       = ws_offered;
+                    ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
+                    for (const auto& lo : lang_menu_options)
+                        ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
                     SDL_GL_DeleteContext(lctx);
                 }
@@ -2446,6 +2852,7 @@ int main(int argc, char** argv) {
                 memcard2_enabled = seed.memcard2_enabled;
                 if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
                 if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
+                if (seed.has_language) resolved_language = seed.language;
                 p1_device = seed.p1_device; p2_device = seed.p2_device;
                 p1_mode = seed.p1_mode; p2_mode = seed.p2_mode;
                 if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
@@ -2457,6 +2864,11 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+
+    /* Re-apply the resolved language to the translation layer. text_xlate_init
+     * (at config load) only saw the game.toml default; this folds in the
+     * settings.toml override and the launcher's choice. No-op when unchanged. */
+    text_xlate_set_language(resolved_language.c_str());
 
     /* CLI overrides win over config — applied last, before backend/port init.
      * Enables a soak fleet: several instances on distinct ports + renderers,
@@ -2554,10 +2966,10 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_mode);
     set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
-        /* Dev builds keep P1 connected even with no controller so the always-on
-         * keyboard (g_dev_kb_p1) can drive port 1 standalone. */
-        const bool kb_p1 = (g_dev_kb_p1 && s == 0);
-        sio_set_pad_connected(s, (g_players[s].kind != 0 || kb_p1) ? 1 : 0);
+        /* Dev-any-input keeps P1 connected even with no assigned controller so the
+         * keyboard / any plugged-in controller can drive port 1 standalone. */
+        const bool dev_p1 = (dev_any_input_enabled() && s == 0);
+        sio_set_pad_connected(s, (g_players[s].kind != 0 || dev_p1) ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(g_players[s].mode), 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs
@@ -2567,6 +2979,20 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    if (!disc_path_str.empty()) {
+        /* GetID must report the inserted disc's license region (the BIOS CD
+         * driver revalidates it mid-game). Derive it from the disc's boot
+         * serial via the same disc_identity module the launch check uses. */
+        const auto ident = PSXRecompV4::identify_disc(
+            disc_path_str, /*expected_serial*/"", /*expected_crc*/0,
+            /*has_expected_crc*/false, /*compute_crc*/false);
+        if (ident.region == "PAL")         cdrom_set_disc_scex("SCEE");
+        else if (ident.region == "NTSC-J") cdrom_set_disc_scex("SCEI");
+        else if (ident.region == "NTSC-U") cdrom_set_disc_scex("SCEA");
+        if (!ident.region.empty())
+            std::fprintf(stdout, "psxrecomp: disc region %s (serial %s)\n",
+                         ident.region.c_str(), ident.detected_serial.c_str());
+    }
     {
         int divisor = 1; /* default: authentic 1x timing */
         if (disc_speed == "instant") divisor = 0;
@@ -2642,6 +3068,7 @@ int main(int argc, char** argv) {
         controller_deadzone = std::max(0, std::min(32767, resolved_deadzone));
     refresh_player_devices();  /* open SDL handles to match the player config */
 #ifndef PSX_SDL_NO_AUDIO
+    audio_trace_init();
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
         SDL_AudioSpec have;
@@ -2650,8 +3077,21 @@ int main(int argc, char** argv) {
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
-        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        const bool legacy = audio_legacy_mode();
+        if (!legacy)
+            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
+        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have,
+                                               legacy ? 0 : SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (sdl_audio_device) {
+            if (!legacy) {
+                rab_config cfg; rab_config_defaults(&cfg);
+                cfg.channels    = 2;
+                cfg.source_rate = 44100.0;            /* SPU render rate */
+                cfg.host_rate   = (double)have.freq;  /* actual device rate */
+                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+            }
+            g_audio_host_rate = have.freq;
+            audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
             SDL_PauseAudioDevice(sdl_audio_device, 0);
         }
     }
@@ -2680,6 +3120,29 @@ int main(int argc, char** argv) {
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
+    }
+
+    /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
+     * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
+     * count (2/3/1 beat) that reads as moving-object judder. If the panel is
+     * within ~2% of 60 Hz, nudge the pacer to the exact panel period so the pacer
+     * and vsync agree and 30fps content pads to a steady 2 refreshes each.
+     * Non-~60Hz panels keep the PSX rate (vsync then governs; wrong-speed sim is
+     * worse than a benign slow beat). */
+    {
+        SDL_DisplayMode dm;
+        int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
+            double host_hz = (double)dm.refresh_rate;
+            if (host_hz >= 58.8 && host_hz <= 61.2) {
+                g_frame_period_ms = 1000.0 / host_hz;
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+            } else {
+                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", dm.refresh_rate);
+            }
+        }
     }
 
     /* OpenGL backend: create the GL context now. On failure, relabel the

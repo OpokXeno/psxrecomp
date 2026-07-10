@@ -65,6 +65,11 @@ sprite_anchor_addr = "0x1F800070"      # scratchpad holding the prim's
                                        # GTE-projected anchor SXY at tag time.
 hud_sprt_squash    = true              # center/edge-squash untagged SPRTs
                                        # (screen-space HUD/menus).
+clear_reveal       = true              # clear synthetic native-wide side margins
+                                       # at opted-in scene/map boundaries (default false).
+nw_left_hud_packet_lo = "0x000E3400"  # optional targeted left-HUD packet range
+nw_left_hud_packet_hi = "0x000E4100"  # (half-open); avoids shifting 2D scenery.
+offer_ultrawide    = true              # separate experimental 21:9 launcher row.
 ```
 
 Tomba's values are Ghidra-evidenced: `0x8005E08C` is the shared per-prim helper
@@ -219,12 +224,12 @@ Runtime-only changes (everything except `sprite_tag_funcs` / cull-widen) just
 need a rebuild:
 ```
 PATH=/c/msys64/mingw64/bin:$PATH
-cmake --build F:/Projects/psxrecomp/TombaRecomp/build-stable --target psx-runtime -j16
+cmake --build ../TombaRecomp/build-stable --target psx-runtime -j16
 ```
 Changes that emit into generated C (`sprite_tag_funcs`, future cull-widen) need
 a regen first (see `memory/regen_build_recipe.md`):
 ```
-F:/Projects/psxrecomp/psxrecomp/recompiler/build/psxrecomp-game.exe --config game.toml
+recompiler/build/psxrecomp-game.exe --config game.toml
 ```
 `build-stable` is RelWithDebInfo + debug tools (TCP port 4470) + launcher ON.
 Always `taskkill /F /IM psx-runtime.exe` before relaunching.

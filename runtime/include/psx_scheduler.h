@@ -62,6 +62,15 @@ typedef struct {
 extern jmp_buf            g_scheduler_jmpbuf;
 extern psx_sched_escape_t g_sched_escape;
 
+/* Deferred cooperative thread switch (Ape Escape memcard fix #2). Thin exports
+ * over the scheduler's private TCB save/restore + PCB[0] accessors, so the
+ * interrupt path can re-save a deferred thread cleanly and re-point the kernel
+ * current-thread pointer at the outermost dispatch boundary. See traps.c. */
+struct CPUState;
+void     psx_sched_save_context(struct CPUState* cpu, uint32_t tcb, uint32_t resume_pc);
+void     psx_sched_set_current_tcb(struct CPUState* cpu, uint32_t tcb);
+uint32_t psx_sched_current_tcb(struct CPUState* cpu);
+
 /* Fail-closed guard: is `pc` a valid, dispatchable guest resume point? A TCB
  * EPC / resume PC that is NOT dispatchable (0, the exception sentinel, or not a
  * known function/re-enterable block-leader entry) is an invariant violation —

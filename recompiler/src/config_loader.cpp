@@ -8,6 +8,7 @@
 #include <string>
 
 #include "fmt/format.h"
+#include "ps1_exe_parser.h"
 
 // toml11 is header-only.
 #define TOML11_USE_UNRELEASED_TOML_FEATURES
@@ -80,8 +81,30 @@ static bool parse_aspect_ratio(const std::string& s, int* num, int* den) {
 // to `root` (project root).
 static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path& root) {
     RuntimeConfig rt;
+    // [localization] language = "en"  (top-level; independent of [runtime]).
+    if (cfg.contains("localization")) {
+        const toml::value& loc = toml::find(cfg, "localization");
+        if (loc.contains("language"))
+            rt.language = toml::find<std::string>(loc, "language");
+        // `default` is the launcher-facing alias for the pre-selected language.
+        if (loc.contains("default"))
+            rt.language = toml::find<std::string>(loc, "default");
+        // Optional launcher dropdown options: languages = [ {code, label}, ... ].
+        if (loc.contains("languages") && toml::find(loc, "languages").is_array()) {
+            for (const auto& e : toml::find(loc, "languages").as_array()) {
+                if (!e.contains("code")) continue;
+                RuntimeConfig::LanguageOption lo;
+                lo.code  = toml::find<std::string>(e, "code");
+                lo.label = e.contains("label") ? toml::find<std::string>(e, "label")
+                                                : lo.code;
+                if (!lo.code.empty()) rt.languages.push_back(std::move(lo));
+            }
+        }
+    }
     if (!cfg.contains("runtime")) return rt;
     const toml::value& runtime = toml::find(cfg, "runtime");
+    if (runtime.contains("language"))  // [runtime].language convenience alias
+        rt.language = toml::find<std::string>(runtime, "language");
 
     if (runtime.contains("debug_port")) {
         const auto port = toml::find<int64_t>(runtime, "debug_port");
@@ -295,6 +318,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (ct.contains("lock_mode")) {
             rt.controller_lock_mode = toml::find<bool>(ct, "lock_mode");
+        }
+        if (ct.contains("lock_device")) {
+            rt.controller_lock_device = toml::find<bool>(ct, "lock_device");
         }
         if (ct.contains("deadzone")) {
             const auto n = toml::find<int64_t>(ct, "deadzone");
@@ -541,18 +567,67 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     }
     const fs::path exe_path = fs::absolute(root / exe_field);
 
+    // Auto-detect EXE header values for any field not explicitly set in TOML.
+    // Parses the PS-X EXE header once and fills in load_address, entry_pc,
+    // text_size, and stack_base from the binary. If the EXE cannot be read
+    // (malformed header, file not found) and a required field is missing
+    // from TOML, the error surfaces when the EXE parse itself fails.
+    struct ExeHeaderAuto {
+        bool ok = false;
+        uint32_t load_address = 0;
+        uint32_t entry_pc = 0;
+        uint32_t text_size = 0;
+        uint32_t stack_base = 0;
+    };
+    ExeHeaderAuto auto_hdr;
+    // We only parse the EXE header if at least one field is missing from TOML.
+    const bool need_auto =
+    !game.contains("load_address") || !game.contains("entry_pc") ||
+    !game.contains("text_size") || !game.contains("stack_base");
+    if (need_auto) {
+        std::string err;
+        if (auto exe = PSXRecomp::PS1ExeParser::parse_file(exe_path, err)) {
+            auto_hdr.ok = true;
+            auto_hdr.load_address = exe->load_address();
+            auto_hdr.entry_pc     = exe->entry_point();
+            auto_hdr.text_size    = exe->code_size();
+            auto_hdr.stack_base   = exe->header.stack_base;
+            // Round text_size up to next 4K page if it's not already
+            // page-aligned (the runtime's overlay region floor uses this
+            // as a guard, and the text segment in RAM is always fully
+            // page-reserved even if the EXE doesn't fill the last page).
+            if (auto_hdr.text_size & 0xFFF) {
+                auto_hdr.text_size = (auto_hdr.text_size + 0xFFF) & ~0xFFFu;
+            }
+        }
+    }
+
     const uint32_t load_address =
-        parse_hex(toml::find<std::string>(game, "load_address"), "game.load_address");
+        game.contains("load_address")
+            ? parse_hex(toml::find<std::string>(game, "load_address"), "game.load_address")
+            : (auto_hdr.ok ? auto_hdr.load_address : []() -> uint32_t {
+                throw std::runtime_error(
+                    "game.toml: missing 'load_address' in [game] and could not "
+                    "auto-detect from EXE header");
+              }());
     const uint32_t entry_pc =
         game.contains("entry_pc")
             ? parse_hex(toml::find<std::string>(game, "entry_pc"), "game.entry_pc")
-            : load_address;
+            : (auto_hdr.ok ? auto_hdr.entry_pc : load_address);
     const uint32_t text_size =
-        parse_hex(toml::find<std::string>(game, "text_size"), "game.text_size");
+        game.contains("text_size")
+            ? parse_hex(toml::find<std::string>(game, "text_size"), "game.text_size")
+            : (auto_hdr.ok ? auto_hdr.text_size : []() -> uint32_t {
+                throw std::runtime_error(
+                    "game.toml: missing 'text_size' in [game] and could not "
+                    "auto-detect from EXE header");
+              }());
     const uint32_t stack_base =
         game.contains("stack_base")
             ? parse_hex(toml::find<std::string>(game, "stack_base"), "game.stack_base")
-            : 0x801FFFF0u;
+            : (auto_hdr.ok && auto_hdr.stack_base != 0
+                   ? auto_hdr.stack_base
+                   : 0x801FFFF0u);
 
     // Disc paths: accept either single `disc` or array `discs`.
     std::vector<fs::path> discs;
@@ -620,6 +695,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_sprite_anchor_addr = 0;
     bool ws_hud_sprt_squash = false;
     bool ws_full_2d = false;
+    bool ws_gte_game_mode = false;
+    bool ws_nw_hud_corners = false;
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
+    bool ws_nw_backdrop = false;
+    bool ws_clear_reveal = false;
+    bool ws_offered = true;
+    bool ws_ultrawide_offered = false;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -641,11 +724,49 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
         if (ws.contains("full_2d"))
             ws_full_2d = toml::find<bool>(ws, "full_2d");
+        if (ws.contains("gte_game_mode"))
+            ws_gte_game_mode = toml::find<bool>(ws, "gte_game_mode");
+        if (ws.contains("nw_hud_corners"))
+            ws_nw_hud_corners = toml::find<bool>(ws, "nw_hud_corners");
+        const bool has_nw_left_hud_lo = ws.contains("nw_left_hud_packet_lo");
+        const bool has_nw_left_hud_hi = ws.contains("nw_left_hud_packet_hi");
+        if (has_nw_left_hud_lo != has_nw_left_hud_hi)
+            throw std::runtime_error(fmt::format(
+                "{}: [widescreen] nw_left_hud_packet_lo and "
+                "nw_left_hud_packet_hi must be set together",
+                config_path.string()));
+        if (has_nw_left_hud_lo) {
+            ws_nw_left_hud_packet_lo = parse_hex(
+                toml::find<std::string>(ws, "nw_left_hud_packet_lo"),
+                "widescreen.nw_left_hud_packet_lo");
+            ws_nw_left_hud_packet_hi = parse_hex(
+                toml::find<std::string>(ws, "nw_left_hud_packet_hi"),
+                "widescreen.nw_left_hud_packet_hi");
+            if (ws_nw_left_hud_packet_lo >= ws_nw_left_hud_packet_hi)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_left_hud_packet range is empty or reversed",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_backdrop"))
+            ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
+        if (ws.contains("clear_reveal"))
+            ws_clear_reveal = toml::find<bool>(ws, "clear_reveal");
+        if (ws.contains("offer"))
+            ws_offered = toml::find<bool>(ws, "offer");
+        if (ws.contains("offer_ultrawide"))
+            ws_ultrawide_offered = toml::find<bool>(ws, "offer_ultrawide");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
     std::vector<uint32_t> ws_cull_screen_x_sites;
+    std::vector<uint32_t> ws_cull_slti_sites;
+    int ws_cull_guard_pixels = 0;
+    // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
+    // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
+    // game with a different display width overrides them (Ape Escape: 0x181).
+    std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 };
+    std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };
     bool ws_auto_screen_x_cull = false;
     bool ws_auto_backdrop_preload = false;
     if (cfg.contains("widescreen")) {
@@ -661,6 +782,22 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("range_sites", ws_cull_range_sites);
             load_sites("a1_sites",    ws_cull_a1_sites);
             load_sites("screen_x_sites", ws_cull_screen_x_sites);
+            load_sites("slti_sites",  ws_cull_slti_sites);
+            if (cull.contains("guard_pixels")) {
+                ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
+                if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
+                    throw std::runtime_error(fmt::format(
+                        "{}: [widescreen.cull] guard_pixels must be in [0, 256]",
+                        config_path.string()));
+            }
+            if (cull.contains("screen_w_imms")) {
+                ws_cull_w_imms.clear();
+                load_sites("screen_w_imms", ws_cull_w_imms);
+            }
+            if (cull.contains("screen_h_imms")) {
+                ws_cull_h_imms.clear();
+                load_sites("screen_h_imms", ws_cull_h_imms);
+            }
             if (cull.contains("auto_screen_x"))
                 ws_auto_screen_x_cull = toml::find<bool>(cull, "auto_screen_x");
             if (cull.contains("auto_backdrop"))
@@ -676,6 +813,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t ws_bg2d_map_size_addr = 0x800CD338u, ws_bg2d_layer_stride_addr = 0x8008EC10u;
     uint32_t ws_bg2d_ring_cols = 64, ws_bg2d_layer_count = 3;
     uint32_t ws_bg2d_layer_struct_stride = 0x54;
+    uint32_t ws_bg2d_init_func = 0;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("bg2d")) {
@@ -716,6 +854,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             if ((ws_bg2d_ring_cols & (ws_bg2d_ring_cols - 1u)) != 0u)
                 throw std::runtime_error(
                     "widescreen.bg2d.ring_cols must be a power of two");
+            ws_bg2d_init_func    = load1("init_func");
         }
     }
 
@@ -765,11 +904,23 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
         /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
+        /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
+        /*ws_cull_w_imms*/        ws_cull_w_imms,
+        /*ws_cull_h_imms*/        ws_cull_h_imms,
         /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,
         /*ws_backdrop_unsquash_funcs*/ ws_backdrop_unsquash_funcs,
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
         /*ws_full_2d*/            ws_full_2d,
+        /*ws_gte_game_mode*/      ws_gte_game_mode,
+        /*ws_nw_hud_corners*/     ws_nw_hud_corners,
+        /*ws_nw_left_hud_packet_lo*/ ws_nw_left_hud_packet_lo,
+        /*ws_nw_left_hud_packet_hi*/ ws_nw_left_hud_packet_hi,
+        /*ws_nw_backdrop*/        ws_nw_backdrop,
+        /*ws_clear_reveal*/       ws_clear_reveal,
+        /*ws_offered*/            ws_offered,
+        /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
         /*ws_bg2d_startx_site*/   ws_bg2d_startx_site,
@@ -784,6 +935,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_ring_cols*/     ws_bg2d_ring_cols,
         /*ws_bg2d_layer_count*/   ws_bg2d_layer_count,
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
+        /*ws_bg2d_init_func*/     ws_bg2d_init_func,
     };
 }
 
@@ -953,6 +1105,13 @@ UserSettings load_user_settings(const fs::path& path) {
             s.memcard2_enabled = toml::find<bool>(m, "enable2"); s.has_memcard2_enabled = true;
         });
     }
+    if (doc.contains("localization")) {
+        const toml::value& lc = toml::find(doc, "localization");
+        if (lc.contains("language")) try_get([&]{
+            const auto v = toml::find<std::string>(lc, "language");
+            if (!v.empty()) { s.language = v; s.has_language = true; }
+        });
+    }
     if (doc.contains("controller")) {
         const toml::value& ct = toml::find(doc, "controller");
         if (ct.contains("p1_device")) try_get([&]{
@@ -1082,6 +1241,11 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "p2_mode   = \"" << pad_mode_to_string(s.p2_mode) << "\"\n";
         if (s.has_deadzone)
             f << "deadzone  = " << s.deadzone << "\n";
+    }
+
+    if (s.has_language) {
+        f << "\n[localization]\n";
+        f << "language = \"" << s.language << "\"\n";
     }
 
     return f.good();

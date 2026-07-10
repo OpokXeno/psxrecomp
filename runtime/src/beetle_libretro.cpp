@@ -15,15 +15,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <csignal>
 
 #include "libretro.h"
 #include "mednafen/psx/psx.h"
 #include "mednafen/psx/cpu.h"
 #include "mednafen/psx/gpu.h"
 #include "mednafen/psx/spu.h"
+#include "mednafen/psx/cdc.h"
 #include "mednafen/psx/frontio.h"
 #include "mednafen/psx/irq.h"
 #include "beetle_history.h"
+#include "audio_trace.h"    /* always-on oracle PCM tap ring (port 4380 audio_wav) */
 #include "parity_trace.h"   /* general control-flow parity ring (oracle producer) */
 #include "device_trace.h"   /* general device-event cycle ring (oracle producer) */
 static void irq_event_callback(int which);  /* fwd: device-event ring producer */
@@ -57,6 +60,36 @@ static void sio_trace_callback(uint8_t tx, uint8_t rx, uint16_t ctrl) {
     BeetleSioTraceEntry *e = &s_sio_trace[s_sio_trace_idx];
     e->seq = s_sio_trace_seq++; e->tx = tx; e->rx = rx; e->ctrl = ctrl;
     s_sio_trace_idx = (s_sio_trace_idx + 1) % BEETLE_SIO_TRACE_CAP;
+}
+
+/* ---- CD command trace (oracle-diff for the Kula World CD-init wedge) ---- */
+#define BEETLE_CDCMD_TRACE_CAP 8192
+struct BeetleCdcmdEntry {
+    uint32_t seq; uint32_t pc; uint8_t cmd, nargs, a0, a1, a2;
+};
+static BeetleCdcmdEntry s_cdcmd_trace[BEETLE_CDCMD_TRACE_CAP];
+static int      s_cdcmd_idx = 0;
+static uint32_t s_cdcmd_seq = 0;
+static void cdcmd_trace_callback(uint8_t cmd, uint8_t nargs,
+                                 uint8_t a0, uint8_t a1, uint8_t a2,
+                                 uint32_t pc) {
+    /* Symmetric self-stop trap (mirror of the runtime's PSX_CD_TRAP_CMD):
+     * SIGSTOP on the Nth matching CD command so a debugger can freeze the
+     * oracle at the exact boot point and diff its state against ours. */
+    {
+        static long trap_cmd = -2, trap_nth = 1, hits = 0;
+        if (trap_cmd == -2) {
+            const char *e2 = getenv("PSX_CD_TRAP_CMD");
+            trap_cmd = (e2 && *e2) ? strtol(e2, NULL, 0) : -1;
+            const char *e3 = getenv("PSX_CD_TRAP_NTH");
+            if (e3 && *e3) trap_nth = strtol(e3, NULL, 0);
+        }
+        if ((long)cmd == trap_cmd && ++hits == trap_nth) raise(SIGSTOP);
+    }
+    BeetleCdcmdEntry *e = &s_cdcmd_trace[s_cdcmd_idx];
+    e->seq = s_cdcmd_seq++; e->pc = pc; e->cmd = cmd; e->nargs = nargs;
+    e->a0 = a0; e->a1 = a1; e->a2 = a2;
+    s_cdcmd_idx = (s_cdcmd_idx + 1) % BEETLE_CDCMD_TRACE_CAP;
 }
 
 /* ---- wtrace_all ring (ALWAYS-ON; no filter; captures every write) ----
@@ -249,7 +282,7 @@ static void rtrace_callback(uint32_t addr, uint32_t value,
 #define BEETLE_FNTRACE_MAX_ARMS   64
 struct BeetleFnTraceEntry {
     uint64_t seq;
-    uint32_t caller_pc, target_pc, parent_ra, a0, a1, frame, sp;
+    uint32_t caller_pc, target_pc, parent_ra, a0, a1, a2, a3, frame, sp;
     uint8_t  kind, pad[3];
 };
 static BeetleFnTraceEntry s_fntrace[BEETLE_FNTRACE_CAP];
@@ -296,6 +329,14 @@ static void fntrace_callback(uint32_t caller_pc, uint32_t target_pc,
     e->parent_ra = parent_ra;
     e->a0        = a0;
     e->a1        = a1;
+    if (PSX_CPU) {
+        char dummy[8] = {0};
+        e->a2 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 6, dummy, sizeof(dummy));
+        e->a3 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 7, dummy, sizeof(dummy));
+    } else {
+        e->a2 = 0;
+        e->a3 = 0;
+    }
     e->frame     = s_frame_count;
     e->kind      = kind;
     /* SP at retire — needed for the func_8001A954 SP/RA-lifecycle oracle
@@ -336,8 +377,18 @@ void on_video_refresh(const void *data, unsigned width, unsigned height, size_t 
     }
 }
 
-void on_audio_sample(int16_t l, int16_t r) { (void)l; (void)r; }
-size_t on_audio_sample_batch(const int16_t *data, size_t frames) { (void)data; return frames; }
+/* Beetle's fully-mixed 44.1 kHz reference SPU output arrives here every
+ * retro_run. Record it into the always-on audio trace (tap SPU_OUT) so port
+ * 4380's audio_wav can dump oracle PCM for offline A/B against the recomp's
+ * tap on port 4370. The host still plays no audio from psx-beetle. */
+void on_audio_sample(int16_t l, int16_t r) {
+    int16_t frame[2] = { l, r };
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, frame, 1);
+}
+size_t on_audio_sample_batch(const int16_t *data, size_t frames) {
+    audio_trace_pcm(AUDIO_TAP_SPU_OUT, data, (int)frames);
+    return frames;
+}
 void on_input_poll(void) {}
 
 int16_t on_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
@@ -519,6 +570,8 @@ extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_pat
     g_psxrecomp_rtrace_cb = rtrace_callback;
     g_psxrecomp_irq_cb = irq_event_callback;
     std::fprintf(stderr, "[psx-beetle] wtrace + fntrace + rtrace + irq callbacks registered\n");
+    g_psxrecomp_cdcmd_cb = cdcmd_trace_callback;
+    std::fprintf(stderr, "[psx-beetle] wtrace + fntrace + cdcmd callbacks registered\n");
     std::fflush(stderr);
 
     return 0;
@@ -535,6 +588,7 @@ extern "C" void beetle_run_frame(uint16_t pad1_buttons) {
     if (!s_loaded) return;
     s_joypad = pad1_buttons;
     s_frame_count++;
+    audio_trace_note_frame(s_frame_count);
     retro_run();
     beetle_history_record_frame();
 }
@@ -683,6 +737,36 @@ extern "C" void beetle_reset_sio_trace(void) {
     s_sio_trace_idx = 0;
     s_sio_trace_seq = 0;
     memset(s_sio_trace, 0, sizeof(s_sio_trace));
+}
+
+/* ---- CD command trace accessors ---- */
+extern "C" uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
+                                           uint8_t *out_nargs, uint8_t *out_a0,
+                                           uint8_t *out_a1, uint8_t *out_a2,
+                                           uint32_t *out_pc,
+                                           int max_count)
+{
+    int avail = (int)(s_cdcmd_seq < (uint32_t)BEETLE_CDCMD_TRACE_CAP
+                      ? s_cdcmd_seq : BEETLE_CDCMD_TRACE_CAP);
+    int count = max_count < avail ? max_count : avail;
+    int start = (s_cdcmd_idx - count + BEETLE_CDCMD_TRACE_CAP) % BEETLE_CDCMD_TRACE_CAP;
+    for (int i = 0; i < count; i++) {
+        const BeetleCdcmdEntry *e = &s_cdcmd_trace[(start + i) % BEETLE_CDCMD_TRACE_CAP];
+        out_seq[i]   = e->seq;
+        out_cmd[i]   = e->cmd;
+        out_nargs[i] = e->nargs;
+        out_a0[i]    = e->a0;
+        out_a1[i]    = e->a1;
+        out_a2[i]    = e->a2;
+        out_pc[i]    = e->pc;
+    }
+    return (uint32_t)count;
+}
+extern "C" uint32_t beetle_get_cdcmd_trace_total(void) { return s_cdcmd_seq; }
+extern "C" void beetle_reset_cdcmd_trace(void) {
+    s_cdcmd_idx = 0;
+    s_cdcmd_seq = 0;
+    memset(s_cdcmd_trace, 0, sizeof(s_cdcmd_trace));
 }
 
 /* ---- wtrace accessors ---- */
@@ -924,6 +1008,21 @@ extern "C" void psxrecomp_beetle_spu_event(unsigned kind, unsigned voice,
 
 extern "C" uint64_t beetle_spu_event_total(void) { return s_spu_event_seq; }
 
+/* CD-audio volume matrix ground truth (PS_CDC::DecodeVolume; 0x80 = unity).
+ * Returns 0 if the CDC isn't up. */
+extern "C" int beetle_cdc_decode_volume(unsigned out[4])
+{
+    extern PS_CDC *PSX_CDC;
+    if (!PSX_CDC) return 0;
+    uint8 m[2][2];
+    PSX_CDC->PSXRecomp_GetDecodeVolume(m);
+    out[0] = m[0][0];  /* L -> L */
+    out[1] = m[0][1];  /* L -> R */
+    out[2] = m[1][0];  /* R -> L */
+    out[3] = m[1][1];  /* R -> R */
+    return 1;
+}
+
 extern "C" uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
                                          uint32_t *out_addr, uint16_t *out_env,
                                          uint16_t *out_pitch,
@@ -1010,7 +1109,8 @@ extern "C" int beetle_spu_get_global_state(
 extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                        uint32_t *out_caller, uint32_t *out_target,
                                        uint32_t *out_ra, uint32_t *out_a0,
-                                       uint32_t *out_a1, uint32_t *out_frame,
+                                       uint32_t *out_a1, uint32_t *out_a2,
+                                       uint32_t *out_a3, uint32_t *out_frame,
                                        uint8_t *out_kind, uint32_t *out_sp,
                                        int max_count)
 {
@@ -1027,6 +1127,8 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
         out_ra[i]     = e->parent_ra;
         out_a0[i]     = e->a0;
         out_a1[i]     = e->a1;
+        out_a2[i]     = e->a2;
+        out_a3[i]     = e->a3;
         out_frame[i]  = e->frame;
         out_kind[i]   = e->kind;
         out_sp[i]     = e->sp;

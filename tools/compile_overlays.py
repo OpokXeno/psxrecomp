@@ -997,6 +997,15 @@ int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
     return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
             < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
+/* Signed-funnel variants (min/max + center±halfwidth idioms). Same contract:
+ * self-contained, identity at margin 0, MUST stay byte-for-byte identical to
+ * the gpu.c implementations. */
+int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
+    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+}
+int psx_ws_cull_bltz(uint32_t v) {
+    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
@@ -1289,12 +1298,16 @@ def _addr_in_func_ids(addr: int, func_ids: list) -> bool:
     return False
 
 
-def load_region_covered_ranges(cache_dir: str, phys_addr: int) -> list:
-    """List of (lo_phys, length) code ranges already provided by ALL built DLLs
-    (region + fragment) for this region_start, from their .ranges manifests. Used
-    to decide whether an executed orphan interior is already covered (so we don't
-    mint a redundant island fragment for it)."""
-    out = []
+def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
+    """Set of phys-normalized F-line ENTRY addresses provided by ALL built DLLs
+    (region + fragment) for this region_start. This — not range coverage — is
+    the dispatchability test: native code is enterable ONLY at F entries, so a
+    dispatch-proven PC inside a compiled range but absent from every manifest's
+    F set still runs its whole chain on the interpreter (the 0x80106D7C class,
+    2026-07-06: 80% of Tomba2 attract interp residue was two range-covered,
+    entry-less interior PCs that the range-based orphan test refused to
+    fragment, while the region compile skipped as 'already covered')."""
+    out = set()
     prefix = f'{phys_addr:08X}_'
     try:
         names = os.listdir(cache_dir)
@@ -1307,9 +1320,9 @@ def load_region_covered_ranges(cache_dir: str, phys_addr: int) -> list:
             with open(os.path.join(cache_dir, name)) as f:
                 for ln in f:
                     p = ln.split()
-                    if len(p) >= 3 and p[0] == 'R':
+                    if len(p) >= 2 and p[0] == 'F':
                         try:
-                            out.append((int(p[1], 16) & 0x1FFFFFFF, int(p[2], 16)))
+                            out.add(int(p[1], 16) & 0x1FFFFFFF)
                         except ValueError:
                             pass
         except OSError:
@@ -1696,15 +1709,23 @@ def main():
                                                    crc32, toml)
         this_ids = None   # region func-ids once recompiled (None if skipped early)
 
-        # Record this region's executed interiors for the decoupled fragment pass
-        # (runs after the loop, regardless of this region's compile outcome).
+        # Record this region's executed dispatch-proven PCs for the decoupled
+        # fragment pass (runs after the loop, regardless of this region's
+        # compile outcome). Interiors AND callable dispatch roots both go in:
+        # a callable root can be starved by the DLL-already-exists skip when
+        # an OLDER capture of the same image bytes built this region's DLL
+        # before the PC became dispatch-proven (same filename, stale entry
+        # set — the 0x80024548 class), and the fragment pass is the demand-
+        # driven recovery path for exactly that.
         if not args.static:
             _interiors = {a for a, r in seed_audit['included_reasons'].items()
                           if r == 'DISPATCH_INTERIOR'}
+            _disp_roots = {a for a, r in seed_audit['included_reasons'].items()
+                           if r in ('DISPATCH_ENTRY', 'DISPATCH_ROOT')}
             _executed = seed_audit.get('executed_pcs', set())
-            if _interiors and _executed:
+            if (_interiors or _disp_roots) and _executed:
                 interior_frag_jobs.append((phys_addr, load_addr, size, data,
-                                           _interiors, _executed))
+                                           _interiors | _disp_roots, _executed))
 
         if not args.static:
             dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}.dll')
@@ -1885,12 +1906,15 @@ def main():
             frag_env['PSX_CPS'] = '1'
         for job in interior_frag_jobs:
             phys_addr, load_addr, size, data, interior_pcs, executed = job
-            covered = load_region_covered_ranges(cache_dir, phys_addr)
-            def _is_covered(a):
-                a &= 0x1FFFFFFF
-                return any(lo <= a < lo + length for lo, length in covered)
+            # ENTRY-based orphan test, not range-based: native code is
+            # enterable only at manifest F entries, so "inside a compiled
+            # range" does NOT make a dispatch target servable — a range-
+            # covered PC with no F entry anywhere still interps its whole
+            # chain on every dispatch. Demand an entry at exactly this PC.
+            covered_entries = load_region_entry_set(cache_dir, phys_addr)
             orphans = sorted(a for a in interior_pcs
-                             if a in executed and not _is_covered(a))
+                             if a in executed
+                             and (a & 0x1FFFFFFF) not in covered_entries)
             if not orphans:
                 continue
             built = 0
@@ -1900,8 +1924,8 @@ def main():
                                                      frag_env)
                 if frag_ids:
                     built += 1
-                    for ev, _cc, ranges in frag_ids:
-                        covered.extend((lo & 0x1FFFFFFF, L) for lo, L in ranges)
+                    for ev, _cc, _ranges in frag_ids:
+                        covered_entries.add(ev & 0x1FFFFFFF)
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
                   f'executed orphan interior(s) -> isolated island shards')
 

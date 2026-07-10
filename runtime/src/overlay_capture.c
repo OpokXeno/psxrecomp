@@ -110,10 +110,13 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
 /* ---- JSON output — assembled dirty_ram regions -------------------------- */
 
 /* Emit every dirty-page run within [win_lo_page, win_hi_page) as a capture
- * region. Runs are clamped to the window: the kernel window must never merge
- * with main-EXE pages (both can be dirty and adjacent — kernel via CPU
- * stores, main EXE via CD DMA), and main-EXE text is statically recompiled,
- * never captured. */
+ * region. Runs are clamped to the window so region_start keys are stable
+ * across window boundaries: the kernel window must never merge with
+ * boot-text pages (both can be dirty and adjacent — kernel via CPU stores,
+ * boot-text via overlay CD DMA), and a boot-text run must never merge
+ * across the overlay-region floor (existing [FLOOR,...) DLL keys would
+ * shift). Dirty boot-text runs ARE captured — post-baseline they are live
+ * overlay code (see dirty_ram_interp.h window model). */
 static void write_json_window(FILE *f, uint32_t win_lo_page,
                               uint32_t win_hi_page, int *first_region)
 {
@@ -259,10 +262,18 @@ void overlay_capture_write_json(void)
     fprintf(f, "[\n");
     first_region = 1;
 
-    /* Kernel window first, then the overlay region (see dirty_ram_interp.h
-     * for the window model). Main-EXE text between them is never captured. */
+    /* Kernel window, then dirty boot-text, then the overlay region (see
+     * dirty_ram_interp.h for the window model). The boot-text window
+     * [KERNEL_WINDOW_END, FLOOR) emits only genuinely-overlaid runs: the
+     * game-start baseline cleared the EXE-load false positives, so a dirty
+     * page there is runtime overlay code by definition. Windows stay
+     * separate so runs clamp at the boundaries and region_start keys match
+     * try_load_region's clamped walkback (existing overlay-region DLL keys
+     * are unchanged). */
     write_json_window(f, 0u,
                       DIRTY_RAM_KERNEL_WINDOW_END / page_sz, &first_region);
+    write_json_window(f, DIRTY_RAM_KERNEL_WINDOW_END / page_sz,
+                      OVERLAY_REGION_FLOOR / page_sz, &first_region);
     write_json_window(f, OVERLAY_REGION_FLOOR / page_sz, bw * 32u,
                       &first_region);
 
@@ -285,17 +296,47 @@ int overlay_capture_count(void)
  * skips image CRCs already in the cache — and the loop self-limits: once
  * the hot code goes native the pressure signal drops to zero and no more
  * captures fire. */
-#define AUTOCAP_CHECK_FRAMES    600u   /* ~10 s between pressure samples    */
-#define AUTOCAP_MIN_DISPATCHES  256u   /* interp pressure gate per sample   */
-#define AUTOCAP_COOLDOWN_FRAMES 3600u  /* >= 60 s between auto-fires        */
-#define AUTOCAP_MAX_TRIGGERS    16u    /* session backstop (TCP-visible)    */
+/* Cadence/threshold retune 2026-07-06 (measured, Tomba2 attract): a single
+ * interp dispatch can chain ~129K insns, so DISPATCH count under-reports
+ * pressure by orders of magnitude — a scene burning >50% of wall time in the
+ * interpreter produced ~250 dispatches per old 10s window, hovering at the
+ * old 256 gate (triggers effectively never fired mid-scene). Pressure is now
+ * EITHER signal: dispatch count (many short stubs) OR interpreted-insn count
+ * (few long chains). ~250K insns/window ≈ interp >~2.5% of wall — worth a
+ * capture. Faster cadence + short cooldown are safe: fires are still gated
+ * on a coherent moment (not loading, provider idle) and the loop self-limits
+ * as coverage converges (pressure → 0). */
+/* There is deliberately NO lifetime trigger cap. A 64-fire "session backstop"
+ * shipped 2026-07-06 and was exhausted ~4h into an attract soak, silently
+ * freezing coverage growth with interp still ~50% of wall in 2D scenes —
+ * convergence IS many fires over a long session. The runaway case a cap was
+ * papering over (pressure that never converts: excluded PCs, failing shards
+ * — fires every cooldown forever, spawning futile provider runs) is handled
+ * by FUTILITY BACKOFF instead: a fire is skipped when the capture manifest
+ * is byte-identical to the last compile request AND that request registered
+ * no new candidates; skips retry on exponential backoff and any change in
+ * either signal resets to normal cadence. Concurrency is already bounded
+ * (cp->busy defers fires while a compile is in flight) and identical images
+ * dedup downstream (compile_overlays.py skips cached CRCs). */
+#define AUTOCAP_CHECK_FRAMES    120u   /* ~2 s between pressure samples     */
+#define AUTOCAP_MIN_DISPATCHES  256u   /* dispatch-count pressure gate      */
+#define AUTOCAP_MIN_INSNS       250000ull /* interp-insn pressure gate      */
+#define AUTOCAP_COOLDOWN_FRAMES 300u   /* >= ~5 s between auto-fires        */
+#define AUTOCAP_BACKOFF_MAX     64u    /* futile-retry ceiling: 64*5s ≈ 5min */
 
 static int      s_autocap_enabled    = 0;
 static uint64_t s_autocap_last_check = 0;
 static uint64_t s_autocap_last_fire  = 0;
 static uint64_t s_autocap_last_disp  = 0;
+static uint64_t s_autocap_last_insns = 0;
 static uint32_t s_autocap_triggers   = 0;
 static uint64_t s_autocap_last_delta = 0;
+static uint64_t s_autocap_last_insns_delta = 0;
+static uint64_t s_autocap_next_ok    = 0;    /* frame gate for next attempt  */
+static uint64_t s_autocap_sig_at_req = 0;    /* manifest FNV at last request */
+static int      s_autocap_reg_at_req = -1;   /* loader candidates at last req */
+static uint32_t s_autocap_backoff    = 1;    /* cooldown multiplier (futile)  */
+static uint32_t s_autocap_futile     = 0;    /* futile skips (telemetry)      */
 
 void overlay_autocapture_set_enabled(int on) { s_autocap_enabled = on ? 1 : 0; }
 
@@ -304,6 +345,35 @@ void overlay_autocapture_get_status(int *enabled, uint32_t *triggers,
     if (enabled)    *enabled    = s_autocap_enabled;
     if (triggers)   *triggers   = s_autocap_triggers;
     if (last_delta) *last_delta = s_autocap_last_delta;
+}
+
+uint64_t overlay_autocapture_last_insns_delta(void) {
+    return s_autocap_last_insns_delta;
+}
+
+void overlay_autocapture_get_futility(uint32_t *backoff, uint32_t *futile) {
+    if (backoff) *backoff = s_autocap_backoff;
+    if (futile)  *futile  = s_autocap_futile;
+}
+
+/* FNV-1a of the just-written capture manifest. The manifest is a pure
+ * function of the capture inputs (live overlay bytes + observed seed-PC
+ * sets, both grow-only), so an unchanged hash means a compile request
+ * would redo exactly the work of the previous one. */
+static uint64_t autocap_manifest_sig(void)
+{
+    char path[600];
+    FILE *f;
+    uint64_t h = 1469598103934665603ull;
+    unsigned char buf[65536];
+    size_t n, i;
+    snprintf(path, sizeof(path), "%s/overlay_captures.json", s_out_dir);
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        for (i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+    fclose(f);
+    return h;
 }
 
 void overlay_autocapture_tick(void)
@@ -320,21 +390,44 @@ void overlay_autocapture_tick(void)
     uint64_t delta = disp - s_autocap_last_disp;
     s_autocap_last_disp  = disp;
     s_autocap_last_delta = delta;
+    uint64_t insns = g_dirty_ram_insns_run;
+    uint64_t insns_delta = insns - s_autocap_last_insns;
+    s_autocap_last_insns = insns;
+    s_autocap_last_insns_delta = insns_delta;
 
-    if (delta < AUTOCAP_MIN_DISPATCHES) return;
+    if (delta < AUTOCAP_MIN_DISPATCHES && insns_delta < AUTOCAP_MIN_INSNS)
+        return;
     if (cdrom_load_in_progress()) return;          /* coherent moment only  */
     if (cp->busy && cp->busy()) return;
-    if (s_autocap_triggers >= AUTOCAP_MAX_TRIGGERS) return;
-    if (s_autocap_last_fire != 0 &&
-        s_frame_count - s_autocap_last_fire < AUTOCAP_COOLDOWN_FRAMES) return;
+    if (s_frame_count < s_autocap_next_ok) return; /* cooldown (x backoff)  */
+
+    /* Always write the backend-neutral coverage manifest (the player-shareable
+     * contribution file). It doubles as the futility probe: unchanged content
+     * since the last compile request, with no new candidates registered by
+     * that request, means the provider would redo identical work — skip and
+     * back off instead of spawning it. */
+    overlay_capture_write_json();
+    {
+        uint64_t sig = autocap_manifest_sig();
+        int      reg = overlay_loader_registered_count();
+        if (sig == s_autocap_sig_at_req && reg == s_autocap_reg_at_req) {
+            s_autocap_futile++;
+            if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
+                s_autocap_backoff <<= 1;
+            s_autocap_next_ok = s_frame_count +
+                (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
+            return;
+        }
+        s_autocap_backoff    = 1;
+        s_autocap_sig_at_req = sig;
+        s_autocap_reg_at_req = reg;
+    }
 
     s_autocap_last_fire = s_frame_count;
     s_autocap_triggers++;
-    /* Always write the backend-neutral coverage manifest (the player-shareable
-     * contribution file) — then ask the active provider to produce code from it.
-     * gcc spawns the background compile; sljit (sync producer) declines here and
-     * JITs on the dispatch miss instead. */
-    overlay_capture_write_json();
+    s_autocap_next_ok = s_frame_count + AUTOCAP_COOLDOWN_FRAMES;
+    /* gcc spawns the background compile; sljit (sync producer) declines here
+     * and JITs on the dispatch miss instead. */
     if (cp->request) cp->request();
 }
 

@@ -13,11 +13,13 @@
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
+#include "text_xlate.h"
 #include "crash_trace.h"
 #include "debug_server.h"
 #include "cpu_state.h"
 #include "event_ring.h"
 #include "color_lut.h"
+#include "ws_cull_detect.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +100,7 @@ static int ws_engaged(void) { return ws_mode != 0; }
 /* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
 static int32_t ws_scale_about(int32_t x, int32_t ax);
 static int32_t ws_disp_w(void);
+static void ws_clear_all_reveal_margins(void);
 
 /* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
  * within the last couple of frames => the actor render funnel is running =>
@@ -111,6 +114,40 @@ static int32_t ws_disp_w(void);
  * engage (gpu_ws_set_full_2d); PSX_WS_FORCE_2D=1 forces it on for testing. */
 static int ws_full_2d = 0;
 void gpu_ws_set_full_2d(int on) { ws_full_2d = on ? 1 : 0; }
+static int ws_clear_reveal = 0;
+static int g_mmx6_void_sides = 0;
+static uint32_t g_mmx6_void_generation = 1;
+void gpu_ws_set_clear_reveal(int on) { ws_clear_reveal = on ? 1 : 0; }
+
+/* GTE-activity gameplay detector ([widescreen] gte_game_mode) — the generic
+ * 3D-title analog of the sprite-tag stamp. A fully-3D game (e.g. Ape Escape)
+ * has no per-prim tag helper to hook, but every gameplay frame projects a
+ * meaningful number of vertices through RTPS/RTPT, while a full-2D screen
+ * (save/options/memory-card) projects none (or a token few). gte.cpp notes
+ * every projection here; when a frame accumulates >= the threshold the frame
+ * is stamped as gameplay, with the same 2-frame hysteresis the tag path uses.
+ * Off unless the game opts in, so existing titles are untouched. */
+static int      ws_gte_game_mode_cfg = 0;
+static uint32_t ws_gte_frame = (uint32_t)-1;
+static uint32_t ws_gte_count = 0;
+static uint32_t ws_last_gte_stamp = (uint32_t)-1000;
+/* Any frame that projects a handful of vertices is "3D" (a low threshold so a
+ * sparse close-up cutscene frame still counts — the flicker was frames dipping
+ * below a high 16-vert bar and pillarboxing for a frame or two). */
+#define WS_GTE_GAME_MODE_MIN_VERTS 3u
+/* STICKY: stay in native-wide for ~0.75s after the last 3D frame, so brief
+ * low-poly frames in a real-time 3D cutscene never flip to a 4:3 pillarbox (the
+ * intro-cutscene flicker). Only a genuine full-2D screen — no GTE projection for
+ * this many consecutive frames (save/options/memory-card) — reverts to 4:3. */
+#define WS_GTE_GAME_MODE_HYSTERESIS 45u
+void gpu_ws_set_gte_game_mode(int on) { ws_gte_game_mode_cfg = on ? 1 : 0; }
+void psx_ws_note_gte_project(int nverts) {
+    if (!ws_gte_game_mode_cfg) return;
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != ws_gte_frame) { ws_gte_frame = f; ws_gte_count = 0; }
+    ws_gte_count += (uint32_t)nverts;
+    if (ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS) ws_last_gte_stamp = f;
+}
 
 /* Full-2D tile-engine mode (MMX6): config [widescreen] full_2d, or the PSX_WS_FORCE_2D
  * test override. Distinct from ws_game_mode (which also fires on the 3D sprite-tag path,
@@ -122,6 +159,8 @@ static int ws_full_2d_mode(void) {
 }
 static int ws_game_mode(void) {
     if (ws_full_2d_mode()) return 1;
+    if (ws_gte_game_mode_cfg &&
+        (uint32_t)s_frame_count - ws_last_gte_stamp <= WS_GTE_GAME_MODE_HYSTERESIS) return 1;
     return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
 }
 
@@ -187,7 +226,41 @@ int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
  * cull while still stretching; large = over-draw) at a fixed camera position.
  * -1 = normal computed margin. */
 static int ws_margin_override = -1;
+static int ws_cull_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
+void gpu_ws_set_cull_guard_pixels(int pixels) {
+    if (pixels < 0) pixels = 0;
+    if (pixels > 256) pixels = 256;
+    ws_cull_guard_pixels = pixels;
+}
+
+#define WS_EXPLICIT_CULL_SITES_MAX 64
+static uint32_t ws_explicit_bias_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_slti_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_bias_n = 0;
+static int ws_explicit_slti_n = 0;
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti) {
+    if (nbias < 0) nbias = 0;
+    if (nslti < 0) nslti = 0;
+    if (nbias > WS_EXPLICIT_CULL_SITES_MAX) nbias = WS_EXPLICIT_CULL_SITES_MAX;
+    if (nslti > WS_EXPLICIT_CULL_SITES_MAX) nslti = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_bias_n = nbias;
+    ws_explicit_slti_n = nslti;
+    for (int i = 0; i < nbias; i++) ws_explicit_bias_sites[i] = bias[i] & 0x1FFFFFFFu;
+    for (int i = 0; i < nslti; i++) ws_explicit_slti_sites[i] = slti[i] & 0x1FFFFFFFu;
+}
+static int ws_explicit_site(const uint32_t *sites, int n, uint32_t pc) {
+    uint32_t p = pc & 0x1FFFFFFFu;
+    for (int i = 0; i < n; i++) if (sites[i] == p) return 1;
+    return 0;
+}
+int psx_ws_is_cull_bias_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_bias_sites, ws_explicit_bias_n, pc);
+}
+int psx_ws_is_cull_slti_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_slti_sites, ws_explicit_slti_n, pc);
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
@@ -196,7 +269,7 @@ int psx_ws_x_margin(void) {
      * that previously fell outside the 4:3 cull window; the wide compositor then
      * rasterizes it into the revealed margins. Same recompiler emit sites as the
      * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
-    if (ws_native_wide_active()) return ws_nw_offset();
+    if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
@@ -303,6 +376,19 @@ int psx_ws_mmx6_bg_startcol(int col)    { return psx_ws_bg2d_startcol(col, 0x3fu
 int psx_ws_mmx6_bg_startx(int x)        { return psx_ws_bg2d_startx(x); }
 int psx_ws_mmx6_bg_stream_left(int x)   { return psx_ws_bg2d_stream_left(x); }
 int psx_ws_mmx6_bg_stream_right(int x)  { return psx_ws_bg2d_stream_right(x); }
+
+/* Called at entry to MMX6's full tile-ring initializer (FUN_800269F4). The
+ * independent layers invoke it only when stage/background data is dirty; gate
+ * by frame because up to three layers initialize together. This is the exact
+ * point where pixels retained from the old stage cease to be meaningful. */
+void psx_ws_mmx6_bg_stage_init(void) {
+    static uint32_t last_frame = 0xFFFFFFFFu;
+    uint32_t frame = (uint32_t)s_frame_count;
+    if (!ws_clear_reveal || ws_mode != 2 || frame == last_frame) return;
+    last_frame = frame;
+    g_mmx6_void_generation++;
+    ws_clear_all_reveal_margins();
+}
 
 /* ===== MMX6 BG packet-buffer RELOCATION ([widescreen.bg2d] bufbase_site/cap_site) ===
  * The widened BG render (29 cols) overruns the engine's BG packet double-buffer (driver
@@ -533,13 +619,26 @@ static int bg2d_fill_column(int layer, int worldX, int worldY, int write,
     int mapLeft  = psx_read_byte(lbase + 0x4d);
     int mapRight = psx_read_byte(lbase + 0x4e);
     int scrollX  = (int16_t)psx_read_half(lbase + 0xa);
+    /* C integer division toward zero makes worldX -255..-1 resolve to metatile
+     * column 0 below. The native 4:3 streamer never requests those coordinates,
+     * but the widened left window does at a stage starting on mapLeft. Treat
+     * them as finite-map void before the engine's loop/wrap bookkeeping. */
+    if (worldX < mapLeft * 0x100)
+        return 2;
     if ((uint32_t)metaCol < (uint32_t)mapLeft) {
         metaCol = metaCol + 1 + (mapRight - mapLeft);
-        if (scrollX <= (mapLeft - 1) * 0x100) return 0;                 /* engine early-return: skip */
+        if (scrollX <= (mapLeft - 1) * 0x100) {
+            /* The native renderer never sees this column, so the engine leaves
+             * its ring slot alone. Report finite-map void to the DMA-start
+             * cleanup without mutating ring slots canonical draws can alias. */
+            return 2;   /* finite-map void, not merely a normal streamed column */
+        }
     }
     if ((uint32_t)mapRight < (uint32_t)metaCol) {
         metaCol = (metaCol - 1 - mapRight) + mapLeft;
-        if ((mapRight + 1) * 0x100 <= scrollX) return 0;
+        if ((mapRight + 1) * 0x100 <= scrollX) {
+            return 2;
+        }
     }
     int mapW = psx_read_byte(g_bg2d_map_size_addr);
     int mapH = psx_read_byte(g_bg2d_map_size_addr + 1u);
@@ -604,7 +703,9 @@ void psx_ws_mmx6_bg_refill_all(void) {
         int sx = (int16_t)psx_read_half(lbase + 0xa);
         int sy = (int16_t)psx_read_half(lbase + 0xe);
         for (int ci = -left; ci < g_bg2d_native_cols + left; ci++) {
-            if (bg2d_fill_column((int)layer, sx + ci * 16, sy - 0x10, 1, NULL, NULL))
+            int filled = bg2d_fill_column((int)layer, sx + ci * 16,
+                                          sy - 0x10, 1, NULL, NULL);
+            if (filled)
                 g_mmx6_refill_cols++;
         }
     }
@@ -651,22 +752,77 @@ int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
             < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
 }
 
-/* Detect the GTE per-vertex trivial-reject signature in a run of instruction
- * words: at least one `sltiu …,0x140/0x141` (width) AND one `sltiu …,0xE0/0xF1`
- * (height). Lets the sljit JIT + interpreter gate the cull-widening to real
- * render funnels (a lone sltiu 0x140 elsewhere must stay vanilla). Mirrors the
- * recompiler's func_has_screen_extent_cull. */
-int psx_ws_func_has_screen_cull(const uint32_t *words, int n) {
-    int has_x = 0, has_y = 0;
-    for (int i = 0; i < n; i++) {
-        uint32_t w = words[i];
-        if ((w & 0xFC000000u) != 0x2C000000u) continue;  /* sltiu */
-        uint32_t imm = w & 0xFFFFu;
-        if (imm == 0x140 || imm == 0x141) has_x = 1;
-        else if (imm == 0xE0 || imm == 0xF1) has_y = 1;
-        if (has_x && has_y) return 1;
+/* Signed right-edge widen for the min/max funnel idiom (`slti v, minSX, W`):
+ * the paired LEFT edge is a separate bltz (psx_ws_cull_bltz below), so this
+ * bound moves out by ONE margin only. Operand is an already sign-extended /
+ * computed 32-bit screen X. Identity at margin 0 (4:3). */
+int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
+    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
+}
+
+/* Signed left-edge widen for the funnel's `bltz maxSX, reject`: reject only
+ * when the prim ends left of the REVEALED edge (maxSX < -margin). Returns the
+ * branch predicate. Identity at margin 0 (4:3). */
+int psx_ws_cull_bltz(uint32_t v) {
+    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+}
+
+/* ---- Cull signature configuration ([widescreen.cull] screen_w_imms /
+ * screen_h_imms). The width/height immediates are per-game (Tomba: 0x140/0x141
+ * + 0xE0/0xF1 on a 320 display; Ape Escape: 0x181 + 0xF1 on 368). Defaults
+ * keep the original Tomba signature so existing configs are unchanged. The
+ * sets are consulted by the shared detector on every backend (interp + sljit;
+ * the recompiler reads the same config at gen time). */
+static uint32_t ws_cull_w_imms[8] = { 0x140, 0x141 };
+static int      ws_cull_w_n = 2;
+static uint32_t ws_cull_h_imms[8] = { 0xE0, 0xF1 };
+static int      ws_cull_h_n = 2;
+void gpu_ws_set_cull_imms(const uint32_t *w, int nw, const uint32_t *h, int nh) {
+    if (w && nw > 0) {
+        if (nw > 8) nw = 8;
+        for (int i = 0; i < nw; i++) ws_cull_w_imms[i] = w[i];
+        ws_cull_w_n = nw;
     }
-    return 0;
+    if (h && nh > 0) {
+        if (nh > 8) nh = 8;
+        for (int i = 0; i < nh; i++) ws_cull_h_imms[i] = h[i];
+        ws_cull_h_n = nh;
+    }
+}
+int psx_ws_is_cull_w_imm(uint32_t imm) {
+    return psx_ws_cull_imm_in(imm, ws_cull_w_imms, ws_cull_w_n);
+}
+
+/* ---- Runtime gates for the pattern-scanned widescreen hooks. The interp and
+ * sljit derive widen sites by scanning live code; that derivation must honor
+ * the SAME per-game [widescreen.cull] opt-ins the recompiler emit does. These
+ * default OFF: a title that never opted in must never have its code
+ * pattern-scanned and rewritten (an ungated backdrop false positive rewrites a
+ * live GPR = wild-jump fatal — the exact class this gate closes). Set from
+ * game.toml at startup (main.cpp). */
+static int ws_auto_cull_on_cfg = 0;
+static int ws_auto_backdrop_on_cfg = 0;
+void gpu_ws_set_auto_hooks(int cull_on, int backdrop_on) {
+    ws_auto_cull_on_cfg     = cull_on ? 1 : 0;
+    ws_auto_backdrop_on_cfg = backdrop_on ? 1 : 0;
+}
+int psx_ws_auto_cull_on(void) { return ws_auto_cull_on_cfg; }
+
+/* Detect the GTE screen-extent trivial-reject signature in a run of
+ * instruction words: at least one width compare AND one height compare
+ * (slti or sltiu, immediates from the configured sets). Lets the sljit JIT +
+ * interpreter gate the cull-widening to real render funnels (a lone width
+ * compare elsewhere must stay vanilla). Same shared scan the recompiler's
+ * func_has_screen_extent_cull uses (ws_cull_detect.h). */
+int psx_ws_func_has_screen_cull(const uint32_t *words, int n) {
+    return psx_ws_cull_scan(words, n, ws_cull_w_imms, ws_cull_w_n,
+                            ws_cull_h_imms, ws_cull_h_n);
+}
+
+/* Classify words[idx] as an X left-edge reject bltz (shared structural
+ * detector, runtime imm sets). Caller qualifies the window first. */
+int psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx) {
+    return psx_ws_cull_bltz_here(words, n, idx, ws_cull_w_imms, ws_cull_w_n);
 }
 
 /* Widescreen backdrop screen-X correction ([widescreen.backdrop] x_sites).
@@ -700,7 +856,9 @@ int psx_ws_backdrop_x(int x) {
  * generator's own low/high clamps still bound it at the level edges. Gated on
  * native-wide only (NOT squash: that path uses psx_ws_backdrop_x()). Returns
  * `orig` unchanged at 4:3 / squash / boot / FMV, so 4:3 stays byte-identical. */
-int psx_ws_backdrop_preload(void) { return ws_native_wide_active(); }
+int psx_ws_backdrop_preload(void) {
+    return ws_auto_backdrop_on_cfg && ws_native_wide_active();
+}
 
 /* Live-tunable widen amount (set via the `ws_backdrop_margin` debug command):
  *   <0  => WHOLE-ROW preload: START->0, END->extent-1 (max generous)
@@ -1057,6 +1215,92 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
     return 0;
 }
 
+/* ---- Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners) ------
+ * In native-wide the whole frame is composited into a wider surface centred by
+ * ws_nw_offset() per side (the reveal). Screen-space 2D HUD (drawn with fixed
+ * rect/sprite GP0 commands, never through the GTE — a 3D title's world is all
+ * polygons) therefore lands inset from the true wide edges by exactly the
+ * reveal. This pushes an outer-third HUD element the rest of the way to its
+ * wide corner with an additive thirds shift: left third −offset, right third
+ * +offset, middle unchanged (matches the squash-path ws_hud_pivot geometry, but
+ * as a translate since native-wide does not squash). Composite pieces in one
+ * zone share a shift and stay aligned. Identity unless native-wide is engaged
+ * AND the game opts in, so 4:3 and non-opted titles are byte-identical.
+ * Returns the signed x delta to add to the prim's x before draw_offset. */
+static int ws_nw_hud_corners = 0;
+static uint32_t ws_nw_left_hud_packet_lo = 0;
+static uint32_t ws_nw_left_hud_packet_hi = 0;
+void gpu_ws_set_nw_hud_corners(int on) { ws_nw_hud_corners = on ? 1 : 0; }
+void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi) {
+    ws_nw_left_hud_packet_lo = lo & 0x1FFFFFFFu;
+    ws_nw_left_hud_packet_hi = hi & 0x1FFFFFFFu;
+}
+static int ws_nw_left_hud_packet(void) {
+    if (!ws_native_wide_active() || gp0_cmd_source_addr == 0xFFFFFFFFu ||
+        ws_nw_left_hud_packet_hi <= ws_nw_left_hud_packet_lo)
+        return 0;
+    uint32_t a = gp0_cmd_source_addr & 0x1FFFFFFFu;
+    int matched = a >= ws_nw_left_hud_packet_lo && a < ws_nw_left_hud_packet_hi;
+    return matched;
+}
+static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
+    if (!ws_native_wide_active()) return 0;
+    int32_t off = ws_nw_offset();
+    if (off <= 0) return 0;
+    if (!ws_nw_left_hud_packet() && !ws_nw_hud_corners) return 0;
+    int32_t W  = ws_disp_w();
+    int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
+    if (3 * cx < 2 * W) return -off;   /* left third  -> pull to left edge  */
+    if (3 * cx > 4 * W) return  off;   /* right third -> push to right edge */
+    return 0;                          /* middle third -> stay centred      */
+}
+
+/* ---- Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop) ---
+ * A screen-space background plane (sky gradient / backdrop image) is drawn as an
+ * axis-aligned quad covering the whole 4:3 framebuffer [0,W]x[0,H]. It is NOT
+ * GTE-projected, so native-wide leaves it at its 4:3 span, composited centred =
+ * black bars in the revealed side margins (the pillarboxed sky). Detect exactly
+ * that shape — a 4-vertex quad whose corners form a rectangle spanning ~the full
+ * display width from ~the left edge — and stretch its X vertices about the
+ * display centre by the wide ratio so it fills the wider frame; the texture/UV
+ * (or gradient) simply stretches horizontally (invisible on a sky). GTE-drawn
+ * world quads are perspective-distorted (not axis-aligned) and partial-width, so
+ * they never match. Identity unless native-wide is engaged AND the game opts in.
+ * Transforms vx[0..3] IN PLACE (pre-draw_offset); returns 1 if it applied. */
+static int ws_nw_backdrop = 0;
+void gpu_ws_set_nw_backdrop(int on) { ws_nw_backdrop = on ? 1 : 0; }
+static int ws_nw_backdrop_stretch_quad(int32_t *vx, const int32_t *vy) {
+    if (!ws_nw_backdrop || !ws_native_wide_active()) return 0;
+    int32_t extra = ws_nw_extra();
+    if (extra <= 0) return 0;
+    int32_t W = ws_disp_w();
+    const int32_t EDGE = 24;                 /* slack for "touches the frame edge" */
+    int32_t minx = vx[0], maxx = vx[0], miny = vy[0], maxy = vy[0];
+    for (int i = 1; i < 4; i++) {
+        if (vx[i] < minx) minx = vx[i];
+        if (vx[i] > maxx) maxx = vx[i];
+        if (vy[i] < miny) miny = vy[i];
+        if (vy[i] > maxy) maxy = vy[i];
+    }
+    /* Must span the full display width and a real vertical extent. */
+    if (minx > EDGE || maxx < W - EDGE || (maxy - miny) < 64) return 0;
+    /* Axis-aligned: every vertex X sits at either the min or the max edge, and
+     * every Y at the top or bottom edge (a true screen-space rectangle). */
+    for (int i = 0; i < 4; i++) {
+        int xe = (vx[i] - minx <= EDGE) || (maxx - vx[i] <= EDGE);
+        int ye = (vy[i] - miny <= EDGE) || (maxy - vy[i] <= EDGE);
+        if (!xe || !ye) return 0;
+    }
+    /* Stretch X about the display centre by (W+extra)/W so [0,W] -> [-off, W+off],
+     * which the wide compositor (+off) maps onto the full [0, W+extra] surface. */
+    int32_t cx = W / 2;
+    for (int i = 0; i < 4; i++) {
+        int32_t d = vx[i] - cx;
+        vx[i] = cx + (d * (W + extra) + (d >= 0 ? W / 2 : -W / 2)) / W;
+    }
+    return 1;
+}
+
 /* Polyline state */
 static uint16_t polyline_color;       /* mono polyline: current color */
 static int32_t  polyline_prev_x, polyline_prev_y;  /* previous vertex */
@@ -1097,6 +1341,15 @@ static uint32_t draw_area_right, draw_area_bottom;
 
 /* Draw offset (set by GP0(E5h)) */
 static int32_t draw_offset_x, draw_offset_y;
+/* Instrumentation: per-vblank range/count of GP0(E5) draw-offset-Y sets. If a
+ * single frame sets offsets in BOTH the top (y<128) and bottom (y>=128) buffer
+ * bands, the game is drawing different parts of the scene into different display
+ * buffers in the same frame (candidate root of a character-in-one-buffer
+ * strobe). Snapshotted each vblank into the *_last copies, exposed via debug. */
+int32_t  g_doff_min_this = 0x7fffffff, g_doff_max_this = -0x7fffffff;
+uint32_t g_doff_cnt_this = 0;
+int32_t  g_doff_min_last = 0, g_doff_max_last = 0;
+uint32_t g_doff_cnt_last = 0;
 
 /* Texture window raw value (set by GP0(E2h), readback via GP1(10h)) */
 static uint32_t texture_window_value;
@@ -1163,6 +1416,18 @@ static void ws_nw_sync_target(void) {
     else                     gr_wide_disable_target();
 }
 
+static void ws_clear_all_reveal_margins(void) {
+    for (int i = 0; i < ws_fb_n; i++)
+        gr_wide_clear_margins((int)ws_fb_base[i], 0, 512, 0, 3);
+}
+
+/* Stage-init already clears both synthetic margins once. Do not keep clearing
+ * a guessed finite-map side here: MMX6's authored layers enter the reveal at
+ * different times, so the side guess produced a moving black trim over valid
+ * stage art. A stale reveal tile is safer than deleting submitted content. */
+void gpu_ws_begin_linked_list(void) { }
+
+
 /* Horizontal display range (GP1(06h)) */
 static uint32_t h_display_x1;
 static uint32_t h_display_x2;
@@ -1207,6 +1472,7 @@ static int sq_cap_armed;
  * flips every ~33,868 GPU clocks (one NTSC frame). */
 #define GPUSTAT_POLL_VBLANK_THRESHOLD 1000
 static uint32_t gpustat_poll_count;
+uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank IRQ count */
 
 /* ---- Initialization ---- */
 
@@ -1288,11 +1554,29 @@ uint32_t gpu_read_gpustat(void) {
     gpustat_poll_count++;
     if (gpustat_poll_count >= GPUSTAT_POLL_VBLANK_THRESHOLD) {
         gpustat_poll_count = 0;
-        lcf ^= 1;
-        psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
-        /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
-         * from the cycle-paced VBlank in psx_check_interrupts). */
-        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
+        /* The recompiled BIOS + game carry per-block interrupt checks
+         * (psx_check_interrupts_at) and per-block cycle charging, so tight
+         * LCF/VSync poll loops DO advance guest cycles and let the ONE
+         * cycle-paced VBlank authority (interrupts.c) fire on schedule. The old
+         * "spin forever" premise that justified raising VBlank+LCF from a raw
+         * GPUSTAT read-count is stale — and it injected ~38 fake VBlanks/s
+         * (measured on Crash Bash), delivering ~96/s to the game instead of 60,
+         * over-advancing the game's VSync frame counter and jittering animation
+         * (character strobe). Firing is now OFF by default; PSX_POLLHACK_VBLANK=1
+         * restores the legacy behavior for A/B. */
+        static int poll_fire = -1;
+        if (poll_fire < 0) {
+            const char* e = getenv("PSX_POLLHACK_VBLANK");
+            poll_fire = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (poll_fire) {
+            g_pollhack_vblank_count++;   /* count only when actually firing */
+            lcf ^= 1;
+            psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
+            /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
+             * from the cycle-paced VBlank in psx_check_interrupts). */
+            event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
+        }
     }
 
     uint32_t stat = 0;
@@ -1402,6 +1686,13 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
 
 void gpu_vblank_tick(void) {
     lcf ^= 1;
+    /* snapshot per-frame draw-offset-Y range for the strobe instrumentation */
+    if (g_doff_cnt_this) {
+        g_doff_min_last = g_doff_min_this;
+        g_doff_max_last = g_doff_max_this;
+        g_doff_cnt_last = g_doff_cnt_this;
+    }
+    g_doff_min_this = 0x7fffffff; g_doff_max_this = -0x7fffffff; g_doff_cnt_this = 0;
     gpustat_poll_count = 0;
     psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (vblank_callback) vblank_callback();
@@ -1661,8 +1952,10 @@ static void gp0_exec_mono_quad(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t vx[4], vy[4];
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+    ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (no-op else) */
+    for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
@@ -1705,6 +1998,17 @@ static void gp0_exec_shaded_quad(void) {
     for (int i = 0; i < 4; i++) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
+    }
+    int32_t minx = vx[0], maxx = vx[0];
+    for (int i = 1; i < 4; i++) {
+        if (vx[i] < minx) minx = vx[i];
+        if (vx[i] > maxx) maxx = vx[i];
+    }
+    int32_t hud_dx = ws_nw_hud_shift(minx, maxx - minx);
+    if (hud_dx)
+        for (int i = 0; i < 4; i++) vx[i] += hud_dx;
+    ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
+    for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
@@ -1730,6 +2034,21 @@ static void gp0_exec_shaded_quad(void) {
 static uint16_t current_texpage(void) {
     return (uint16_t)(texpage_x | (texpage_y << 4) |
                       (semi_transparency << 5) | (texpage_colors << 7));
+}
+
+/* Hardware: the texpage attribute word carried inside every textured polygon
+ * (GP0 0x24-0x3F with the texture bit) is copied into the GPU draw-mode state
+ * (GPUSTAT bits 0-8) exactly like GP0(E1) bits 0-8 — the poly's own word, not
+ * the last E1, decides its semi-transparency mode, and later rectangle/sprite
+ * prims (which carry no texpage word) consume the state the poly left behind.
+ * Beetle: SetTPage(CB[4 + ((cc>>4)&1)] >> 16) on every textured poly.
+ * Bits 9-10 (dither / draw-to-display) exist only in E1; bit 11 (texture
+ * disable) only latches when GP1(09h) allowed it, which polys can't grant. */
+static void set_tpage_from_poly(uint16_t tpage_word) {
+    texpage_x         = tpage_word & 0xF;
+    texpage_y         = (tpage_word >> 4) & 1;
+    semi_transparency = (tpage_word >> 5) & 3;
+    texpage_colors    = (tpage_word >> 7) & 3;
 }
 
 /* Helper: set up SW renderer state before a textured draw.
@@ -1760,9 +2079,10 @@ static void gp0_exec_textured_tri(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    /* Texpage from word 4 bits 16-31, or use current state */
+    /* Texpage from word 4 bits 16-31 */
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
@@ -1795,7 +2115,9 @@ static void gp0_exec_textured_quad(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    uint16_t tpage = (uint16_t)(gp0_cmd_buf[4] >> 16) & 0x1FF;
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     /* Widescreen: tagged billboard quads carry CPU-computed pixel offsets the
      * GTE squash never saw — re-squash every X around the prim's anchor. */
@@ -1804,6 +2126,7 @@ static void gp0_exec_textured_quad(void) {
         if (ws_tagged_anchor(&ws_ax))
             for (int i = 0; i < 4; i++) vx[i] = ws_scale_about(vx[i], ws_ax);
     }
+    ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop image stretch (no-op else) */
 
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
@@ -1867,7 +2190,9 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    uint16_t tpage = (uint16_t)(gp0_cmd_buf[5] >> 16) & 0x1FF;
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
@@ -1904,7 +2229,9 @@ static void gp0_exec_shaded_textured_quad(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    uint16_t tpage = (uint16_t)(gp0_cmd_buf[5] >> 16) & 0x1FF;
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
@@ -1995,6 +2322,7 @@ static void gp0_exec_textured_rect(void) {
             ws_w = (int)ws_scale_len(w);
         }
     }
+    x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
 
     x0 += draw_offset_x; y0 += draw_offset_y;
     setup_textured_draw(color24, semi_trans, raw_texture);
@@ -2024,6 +2352,7 @@ static void gp0_exec_textured_8x8(void) {
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     int ws_w = ws_sprt_fixed_transform(&x0, 8);
+    x0 += ws_nw_hud_shift(x0, 8);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
@@ -2057,7 +2386,11 @@ static void gp0_exec_textured_16x16(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    /* Never suppress MMX6 BG packets at a guessed finite-map boundary. The
+     * classifier cannot distinguish an authored layer entering the reveal from
+     * a stale ring slot; suppressing here caused the stage-start black flicker. */
     int ws_w = ws_sprt_fixed_transform(&x0, 16);
+    x0 += ws_nw_hud_shift(x0, 16);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
@@ -2175,6 +2508,9 @@ static void gp0_exec_draw_offset(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_offset_x = sign_extend(param & 0x7FFu, 11);
     draw_offset_y = sign_extend((param >> 11) & 0x7FFu, 11);
+    if (draw_offset_y < g_doff_min_this) g_doff_min_this = draw_offset_y;
+    if (draw_offset_y > g_doff_max_this) g_doff_max_this = draw_offset_y;
+    g_doff_cnt_this++;
     /* Native-wide mirrors framebuffer draws into a separate wide surface (canonical
      * VRAM stays faithful); the renderer needs the live draw offset to translate
      * into surface-local coords, so keep gr_set_draw_offset current. */
@@ -2463,6 +2799,44 @@ uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
 
 extern uint64_t s_frame_count;  /* defined in debug_server.c */
 extern uint32_t g_debug_last_store_pc;  /* defined in debug_server.c */
+extern uint32_t g_debug_current_func_addr;  /* defined in debug_server.c */
+uint32_t debug_guest_ra(void);  /* accessor in debug_server.c (guest $ra) */
+uint32_t debug_guest_sp(void);  /* accessor in debug_server.c (guest $sp) */
+extern uint8_t *memory_get_ram_ptr(void); /* raw 2MB main-RAM base (no lockstep) */
+
+/* Bounded guest-stack unwind for VRAM-copy builder attribution. Scans the live
+ * stack for words that are valid return addresses (main-RAM code range, and the
+ * instruction at ret-8 is a jal/jalr), innermost first. A consumer skips the
+ * libgpu funnel band to name the game-level routine that issued the copy. Pure
+ * reads against the raw RAM array — no lockstep/observer pollution. */
+uint32_t g_gp0_last_copy_sp = 0;   /* diag: raw guest $sp at last op-0x80 copy */
+static void gp0_capture_builder_chain(uint32_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = 0;
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    const uint32_t RMASK = 0x001FFFFFu;             /* 2 MB, mirror-folded */
+    uint32_t rawsp = debug_guest_sp();
+    g_gp0_last_copy_sp = rawsp;
+    if ((rawsp & 0x1FFFFFFFu) >= 0x00800000u) return; /* not in RAM/mirror */
+    uint32_t sp = rawsp & RMASK & ~3u;              /* fold to 2MB, word-align */
+    /* Two-pass: prefer words that are genuine return addresses (call at ret-8),
+     * but if guest code validation yields none, fall back to any code-range
+     * stack word so the chain is never silently empty. */
+    int found = 0;
+    for (int pass = 0; pass < 2 && found == 0; pass++) {
+        for (uint32_t off = 0; off + 4 <= 0x400u && found < 6; off += 4) {
+            uint32_t w; memcpy(&w, ram + ((sp + off) & RMASK), 4);
+            if ((w & 3u) || w < 0x80010000u || w >= 0x80120000u) continue;
+            if (pass == 0) {
+                uint32_t ins; memcpy(&ins, ram + ((w - 8u) & RMASK), 4);
+                uint32_t op = ins >> 26;
+                int is_call = (op == 3u) || (op == 0u && (ins & 0x3Fu) == 9u);
+                if (!is_call) continue;
+            }
+            out[found++] = w;
+        }
+    }
+}
 
 #define GP0_RING_CAP        (1u << 20)  /* 1 048 576 entries */
 /* GpuGp0RingEntry + GPU_GP0_RING_MAX_WORDS are public types in gpu.h. */
@@ -2481,12 +2855,16 @@ static void gp0_ring_record(const uint32_t *words, int n) {
     e->seq     = (uint32_t)gp0_ring_seq;
     e->src_addr = gp0_cmd_source_addr;
     e->pc      = g_debug_last_store_pc;
+    e->func    = g_debug_current_func_addr;
+    e->ra      = debug_guest_ra();
     e->opcode  = (uint8_t)((words[0] >> 24) & 0xFF);
     e->n_words = (uint8_t)(n > 255 ? 255 : (n < 0 ? 1 : n));
     e->pad     = 0;
     int copy_n = e->n_words > GPU_GP0_RING_MAX_WORDS ? GPU_GP0_RING_MAX_WORDS : e->n_words;
     for (int i = 0; i < copy_n; i++) e->cmd[i] = words[i];
     for (int i = copy_n; i < GPU_GP0_RING_MAX_WORDS; i++) e->cmd[i] = 0;
+    if (e->opcode == 0x80) { gp0_capture_builder_chain(e->bld); e->csp = g_gp0_last_copy_sp; }
+    else { for (int i = 0; i < 6; i++) e->bld[i] = 0; e->csp = 0; }
     gp0_ring_head = (gp0_ring_head + 1) % GP0_RING_CAP;
     gp0_ring_seq++;
 }
@@ -2859,7 +3237,7 @@ uint16_t gpu_vram_peek(int x, int y) {
     return gr_vram_read(x, y);
 }
 
-void gpu_write_gp0(uint32_t val) {
+static void gpu_write_gp0_body(uint32_t val) {
     gp0_write_count++;
 
     /* State: consuming pixel data for CPU→VRAM transfer */
@@ -2896,13 +3274,18 @@ void gpu_write_gp0(uint32_t val) {
                     /* Transfer complete */
                     gp0_state = GP0_IDLE;
                     vram_write_remaining = 0;
+                    text_xlate_vram_upload(vram_write_x, vram_write_y,
+                                           vram_write_w, vram_write_h);
                     return;
                 }
             }
         }
 
-        if (--vram_write_remaining == 0)
+        if (--vram_write_remaining == 0) {
             gp0_state = GP0_IDLE;
+            text_xlate_vram_upload(vram_write_x, vram_write_y,
+                                   vram_write_w, vram_write_h);
+        }
 
         return;
     }
@@ -3031,6 +3414,18 @@ void gpu_write_gp0(uint32_t val) {
     }
 }
 
+/* Wall-time sampler bracket (phase_profile): tag GP0 command processing —
+ * rasterization / batching / VRAM transfer work on the emu thread — as its
+ * own phase so it is separable from the guest code that issued the write.
+ * Covers both the MMIO store chokepoint and DMA channel-2 feeds. */
+void gpu_write_gp0(uint32_t val) {
+    extern int g_exec_phase;
+    int prev_phase = g_exec_phase;
+    g_exec_phase = 4;
+    gpu_write_gp0_body(val);
+    g_exec_phase = prev_phase;
+}
+
 /* ---- GP1 write (0x1F801814 write) ---- */
 
 static void gp1_reset(void) {
@@ -3055,7 +3450,16 @@ static void gp1_ack_irq1(void) {
 
 static void gp1_display_enable(uint32_t val) {
     /* GP1(03h): Display enable — bit 0: 0=on, 1=off */
-    display_disabled = val & 1;
+    uint32_t next_disabled = val & 1;
+    /* Native-wide reveal pixels have no guest-VRAM backing, so they cannot be
+     * reconstructed from the canonical framebuffer after a scene change. Treat
+     * the guest's ON->OFF transition as invalidation of those synthetic strips.
+     * This is deliberately transition-scoped: MMX6 retains valid background
+     * pixels across ordinary frames, so per-frame clearing pillarboxes gameplay. */
+    if (ws_clear_reveal && next_disabled && !display_disabled && ws_mode == 2) {
+        ws_clear_all_reveal_margins();
+    }
+    display_disabled = next_disabled;
 }
 
 static void gp1_dma_direction(uint32_t val) {

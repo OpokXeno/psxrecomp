@@ -1,6 +1,7 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "text_xlate.h"     /* on-the-fly string translation hook (framework) */
 #include "parity_trace.h"   /* general control-flow parity ring (native producer) */
 #include <string.h>
 #include <stdlib.h>
@@ -43,6 +44,13 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
 int fntrace_is_game_started(void) { return s_game_started; }
 
 static inline int armed_match(uint32_t target) {
+    /* PSX_FNTRACE_ALL=1 records every dispatch from power-on — the ring
+     * then holds the earliest boot execution (before any TCP client can
+     * arm it) for offline first-divergence diffs. Checked once. */
+    static int boot_all = -1;
+    if (boot_all == -1) { const char *e = getenv("PSX_FNTRACE_ALL");
+                          boot_all = (e && *e && *e != '0') ? 1 : 0; }
+    if (boot_all) return 1;
     if (s_arm_record_all) return 1;
     /* Hot path: when nothing is armed, record nothing. Recording every
      * dispatch by default makes the ring fill in seconds and burns ~10%
@@ -56,6 +64,15 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* On-the-fly string translation (framework feature — text_xlate.cpp). The
+     * generated psx_dispatch_impl calls us at the top of each dispatch iteration
+     * with cpu->gpr[4..7] holding THIS call's args, BEFORE the target function
+     * runs — the exact chokepoint to (a) capture every source string drawn and
+     * (b) repoint a string-arg at a translated replacement so the game's own
+     * renderer draws it. Cheap no-op when uninitialised/disarmed. No BIOS regen
+     * (runtime-side), works in Release. See docs/STRING_TRANSLATION.md. */
+    text_xlate_on_dispatch(cpu, target);
+
     /* General parity ring: one DISPATCH row per leader while current_tcb matches
      * the watched thread. Gated by the cheap armed flag so disarmed runs pay only
      * a single branch on this hot path. pc==target (the leader being entered). */
@@ -87,7 +104,22 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     }
 
     if (!s_game_started && s_game_entry_phys != 0) {
-        if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
+        /* Latch on the entry_pc dispatch (the common case) OR the first dispatch
+         * to any game-text address whose RAM already holds the loaded game EXE
+         * image (native-ok). Some titles reach their PS-EXE entry via compiled
+         * internal flow rather than a dispatcher round-trip, so the entry_pc
+         * dispatch never arrives and `started` would never latch — leaving the
+         * shell-window shadow (normalize() maps RAM 0x30000-0x5AFFF -> shell ROM)
+         * active over REAL game text. Crash Bash: entry 0x2E7B0 is reached
+         * internally, so its first shell-window call (0x30FF4 / 0x3358C) got
+         * shadowed to dead shell ROM -> unknown-dispatch abort. The native-ok
+         * test is safe before the game loads: that RAM still holds shell bytes
+         * that differ from the game image, so it cannot fire prematurely. */
+        extern int psx_game_address_in_text(uint32_t addr);
+        extern int dirty_ram_text_native_ok(uint32_t phys);
+        uint32_t _tphys = target & 0x1FFFFFFFu;
+        if (_tphys == s_game_entry_phys ||
+            (psx_game_address_in_text(target) && dirty_ram_text_native_ok(_tphys))) {
             s_game_started = 1;
             /* Establish the clean compiled-image baseline now: the boot EXE is fully
              * loaded into the game-text region (== compiled image) and no gameplay
@@ -96,16 +128,25 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
              * later overlay overwrites, so the dispatch runs clean text compiled and
              * interprets only true overlays (Tomba 2 boot-text loader overlay). */
             extern void dirty_ram_clear_image_baseline(void);
+            extern void memory_clear_low_boot_scratch(void);
             dirty_ram_clear_image_baseline();
+            memory_clear_low_boot_scratch();
             cdrom_notify_game_started();
             boot_state_trigger_capture(cpu);
         }
     }
-    if (!armed_match(target)) return;
     /* Honor the one-shot capture freeze (insn_freeze): once latched, the ring
      * preserves the pre-divergence window instead of evicting it. */
     extern int g_insn_log_frozen;
-    if (g_insn_log_frozen) return;
+    int was_frozen = g_insn_log_frozen;
+    /* Null-page dispatch guard: a dispatch whose phys target sits below the
+     * exception vectors (0x80/0xA0) is a jump through a null/garbage pointer —
+     * the wedge itself, never legitimate code. Latch the capture freeze so the
+     * ring preserves the window that led here (this culprit entry, with its
+     * ra, still records; the wedge storm after it does not). */
+    if ((target & 0x1FFFFFFFu) < 0x40u) g_insn_log_frozen = 1;
+    if (!armed_match(target)) return;
+    if (was_frozen) return;
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
     FntraceEntry* e = &g_fntrace_ring[idx];
     e->frame  = (uint32_t)s_frame_count;

@@ -48,6 +48,19 @@ struct RuntimeConfig {
     bool                  has_debug_port = false;
     uint16_t              debug_port     = 0;
 
+    // Localization / on-the-fly string translation (docs/STRING_TRANSLATION.md).
+    // language selects the translations/*.toml column; "jp"/"off"/"" disables
+    // APPLY (capture still runs). From [localization].language or [runtime].
+    // language; env PSX_LANG overrides at runtime. Also the launcher default.
+    std::string           language = "en";
+
+    // Optional launcher-facing language menu. When a game declares
+    // [localization].languages, the launcher shows a "Localization" dropdown of
+    // these {code,label} options (code feeds `language`; "off"/"jp"/"" = the
+    // untranslated native game). Empty => no dropdown (the general default).
+    struct LanguageOption { std::string code; std::string label; };
+    std::vector<LanguageOption> languages;
+
     bool                  has_window_title = false;
     std::string           window_title;
 
@@ -79,15 +92,18 @@ struct RuntimeConfig {
     // at host speed. Kept so existing game.toml/settings.toml keep working.
     bool                  fast_boot = false;
 
-    // bios_hle: opt-in High-Level Emulation tier for BIOS kernel services
-    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). Default off =
-    // LLE (the recompiled BIOS), which remains the reference implementation
-    // and the oracle. When on, implemented kernel services are computed
-    // in-runtime against the real guest kernel structures and every other
-    // call falls through to LLE. Implies the HLE boot shell-skip unless
-    // bios_hle_keep_intro. PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env
-    // override at launch. Runtime: runtime/src/bios_hle.c.
-    bool                  bios_hle = false;
+    // bios_hle: High-Level Emulation tier for BIOS kernel services
+    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). DEFAULT ON as of
+    // 2026-07-06 (user-directed player default: instant boot-skip for every
+    // game). Opt OUT with [runtime] bios_hle = false or env PSX_BIOS_HLE=0 to run
+    // pure LLE (the recompiled BIOS), which REMAINS the reference implementation
+    // and the oracle — this only flips the default, LLE is still fully linked and
+    // selectable. When on, implemented kernel services are computed in-runtime
+    // against the real guest kernel structures and every other call falls through
+    // to LLE. Implies the HLE boot shell-skip unless bios_hle_keep_intro.
+    // PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env override at launch.
+    // Runtime: runtime/src/bios_hle.c.
+    bool                  bios_hle = true;
     bool                  bios_hle_keep_intro = false;
 
     // hle_scheduler: the HLE tier's standing SUBSYSTEM REPLACEMENT for guest
@@ -257,6 +273,14 @@ struct RuntimeConfig {
     // allow_hybrid (which only hides the Hybrid segment). Default false.
     bool                  controller_lock_mode = false;
 
+    // lock_device: when true the launcher HIDES the Player 1/2 controller cards
+    // entirely (no device picker, no config) — the game's controller type is
+    // fixed and auto-bound. For a title that presents exactly one hardcoded pad
+    // type (e.g. Ape Escape = DualShock analog) where exposing a device/mode
+    // choice is pointless. Distinct from lock_mode (which only hides the pad-mode
+    // segment but keeps the device dropdown). Default false.
+    bool                  controller_lock_device = false;
+
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre
     // dead-band. Absent => runtime default (12000). Overridden per-install by
@@ -396,6 +420,23 @@ struct GameConfig {
     // splitting separates the paired vertical test from auto_screen_x.
     std::vector<uint32_t> ws_cull_screen_x_sites;
 
+    // [widescreen.cull] slti_sites — explicit signed right-edge widen sites
+    // (`slti rt, sx, W` → psx_ws_cull_slti) for funnel functions the
+    // auto-detector cannot qualify (e.g. an X-only test with no height compare
+    // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
+    std::vector<uint32_t> ws_cull_slti_sites;
+    // Extra per-side actor overdraw beyond the visible widescreen edge.
+    int                   ws_cull_guard_pixels = 0;
+
+    // [widescreen.cull] screen_w_imms / screen_h_imms — the width/height
+    // immediates of the GTE screen-extent reject signature, per game (the
+    // display width varies: Tomba 320 → 0x140/0x141; Ape Escape 368 → 0x181).
+    // Consumed by the auto_screen_x detector + emit on every backend (the
+    // runtime mirrors get them via gpu_ws_set_cull_imms). Defaults preserve
+    // the original Tomba signature.
+    std::vector<uint32_t> ws_cull_w_imms;
+    std::vector<uint32_t> ws_cull_h_imms;
+
     // Backdrop screen-X squash ([widescreen.backdrop] x_sites). The parallax
     // 2D backdrop layer (ocean/cloud/mountain/grass — overlay actor handlers)
     // computes screenX = (worldX - camX) >> parallax in pure integer math and
@@ -450,6 +491,52 @@ struct GameConfig {
     // default; the env var PSX_WS_FORCE_2D=1 forces it on for testing.
     bool ws_full_2d = false;
 
+    // [widescreen] gte_game_mode — GTE-activity gameplay detector for a fully
+    // 3D title with no sprite-tag helper (e.g. Ape Escape). When true, a frame
+    // that projects enough vertices through RTPS/RTPT is stamped as gameplay
+    // (native-wide engages); genuine full-2D screens (save/options) still
+    // pillarbox 4:3. Runtime-only — no regen required. Off by default.
+    bool ws_gte_game_mode = false;
+
+    // [widescreen] nw_hud_corners — in native-wide, push outer-third screen-
+    // space HUD sprites out to the true wide-frame corners (they otherwise sit
+    // inset by the reveal offset). Runtime-only — no regen. Off by default.
+    bool ws_nw_hud_corners = false;
+
+    // [widescreen] nw_left_hud_packet_lo / nw_left_hud_packet_hi — optional
+    // half-open physical-RAM source range for a specifically identified HUD
+    // pool. In native-wide, primitives from this pool anchor by screen third
+    // (left/right), without moving similarly placed scenery from other pools.
+    // Both values must be present together. Runtime-only; no regen required.
+    uint32_t ws_nw_left_hud_packet_lo = 0;
+    uint32_t ws_nw_left_hud_packet_hi = 0;
+
+    // [widescreen] nw_backdrop — in native-wide, stretch a screen-space quad
+    // that covers the whole 4:3 framebuffer (sky gradient / backdrop image) to
+    // fill the wide frame, so it stops pillarboxing at the reveal margins.
+    // Runtime-only — no regen. Off by default.
+    bool ws_nw_backdrop = false;
+
+    // [widescreen] clear_reveal — opt a title into synthetic native-wide margin
+    // cleanup. A game-specific stage/map boundary can clear only proven-void
+    // sides while preserving the canonical 4:3 surface and guest VRAM. Runtime-
+    // only gate; any game-specific init hook remains regen-class. Off by default.
+    bool ws_clear_reveal = false;
+
+    // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
+    // Widescreen toggle for this title. Default true. Set false while a
+    // title's widescreen is unported/unvalidated (e.g. MMX4 at bring-up):
+    // the toggle is hidden in the launcher UI AND the runtime clamps the
+    // display aspect to 4:3 after all config sources, so a stale persisted
+    // 16:9 in settings.toml can never engage the hack. Runtime-only (read at
+    // startup; no codegen impact) — no regen required.
+    bool ws_offered = true;
+
+    // [widescreen] offer_ultrawide — expose a separate experimental 21:9
+    // launcher choice for titles that have explicitly tested it. Default off;
+    // ordinary widescreen offer remains the independent 16:9 choice.
+    bool ws_ultrawide_offered = false;
+
     // [widescreen.bg2d] — pure-2D background tile-loop widen (e.g. MMX6's
     // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
     // whose column count and loop start are rewritten so the loop draws the
@@ -476,7 +563,6 @@ struct GameConfig {
     //   raised to match the bigger buffer. Together they cure the dense-stage overflow.
     uint32_t ws_bg2d_bufbase_site = 0;
     uint32_t ws_bg2d_cap_site     = 0;
-
     // Tile-ring layout used by the once-per-frame freshness refill. Defaults
     // describe MMX6; sibling engines such as MMX5 override the shifted RAM
     // addresses and smaller ring width in game.toml.
@@ -487,6 +573,10 @@ struct GameConfig {
     uint32_t ws_bg2d_ring_cols        = 64;
     uint32_t ws_bg2d_layer_count      = 3;
     uint32_t ws_bg2d_layer_struct_stride = 0x54;
+    //   init_func: full tile-ring initializer called only when an independent
+    //   layer's stage data is dirty. A callback at entry invalidates stale host
+    //   reveal pixels once before the new stage background is submitted.
+    uint32_t ws_bg2d_init_func    = 0;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.
@@ -565,6 +655,10 @@ struct UserSettings {
     // Analog-stick deadzone, raw SDL axis units (0..32767). The launcher edits
     // this as 0-100% (raw = pct*32767/100), mirroring snesrecomp's GamepadDeadzone.
     bool has_deadzone  = false; int  deadzone  = 12000;
+    // Localization: the launcher's chosen language code (feeds RuntimeConfig
+    // .language / g_lang). "off"/"jp"/"" = untranslated native game. Persisted to
+    // settings.toml [localization].language.
+    bool has_language = false; std::string language = "en";
 };
 
 // GameOptions — the game's OWN native OPTION-screen settings, declared in a

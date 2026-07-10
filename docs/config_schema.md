@@ -1,14 +1,13 @@
 # PSXRecomp v4 — config TOML schema
 
 Consumed by:
-- `psxrecomp-bios.exe` and `psxrecomp-game.exe` (once Phase A2/A3 ships
-  `--config <toml>` support)
+- `psxrecomp-bios.exe` and `psxrecomp-game.exe` (via `--config <toml>`)
 - `tools/audit_config.py` and the audit tooling that wraps it
 - The runtime cmake macro (`runtime/runtime.cmake`)
 
 Examples:
 - `bios/SCPH1001.toml` — BIOS-only config (no game; psx-runtime targets this)
-- `F:/Projects/TombaRecomp/game.toml` — game config (tomba-runtime targets this)
+- `../TombaRecomp/game.toml` — game config (tomba-runtime targets this)
 
 ## How configs combine
 

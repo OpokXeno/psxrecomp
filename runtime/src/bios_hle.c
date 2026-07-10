@@ -237,7 +237,11 @@ static void hle_deliver_event(CPUState* cpu, uint32_t base, uint32_t n)
                  * $ra is restored before the hook returns. */
                 uint32_t saved_ra = cpu->gpr[31];
                 cpu->gpr[31] = KADDR_DELIVER_RET;
+                extern int g_exec_phase;   /* wall-time sampler (dirty_ram_interp.c) */
+                int prev_phase = g_exec_phase;
+                g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
                 psx_dispatch_call(cpu, func, KADDR_DELIVER_RET);
+                g_exec_phase = prev_phase;
                 cpu->gpr[31] = saved_ra;
             }
         }

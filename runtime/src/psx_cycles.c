@@ -2,6 +2,7 @@
 
 #include "psx_cycles.h"
 #include "cpu_state.h"
+#include <stdlib.h>
 #include "cdrom.h"
 #include "dma.h"
 #include "interrupts.h"
@@ -203,6 +204,159 @@ void psx_advance_cycles(uint32_t cycles) {
 
 uint64_t psx_get_cycle_count(void) {
     return psx_cycle_count;
+}
+
+/* ===== Idle-loop cycle skip (wait-loop elision, 2026-07-06) ==================
+ *
+ * A pure poll loop (Tomba2 main loop: `do {} while (vbl_count < target)`)
+ * burns its full guest-cycle budget at real emulation cost even though every
+ * iteration is a provable no-op: no stores, no MMIO, and register state at
+ * the loop's interrupt-check boundary identical each time. Nothing such a
+ * loop can observe changes except via device servicing, which happens at
+ * deterministic cycle deadlines. So time is fast-forwarded to the next
+ * INTERNAL device event (mask-blind min over vblank pacing / timers / cdrom /
+ * dma / sio — the full set of async guest-visible mutators) in whole loop
+ * quanta, bit-exact vs executing the iterations:
+ *   - real execution takes a deliverable IRQ at the first check boundary at
+ *     or after the event cycle; the skip lands on exactly that boundary
+ *     (k = ceil(dist / quantum) whole iterations).
+ *   - device RAM writes (DMA) replay at their exact cycles inside
+ *     psx_advance_cycles' deadline-servicing path either way.
+ *   - if the event does not release the loop, the detector re-arms and
+ *     skips to the next internal event.
+ *
+ * Detection is evidence-based; ALL gates must hold across IDLE_STREAK_MIN
+ * consecutive interrupt checks at the SAME resume PC with a STABLE quantum:
+ *   1. zero guest stores   (g_guest_store_count unchanged — covers RAM,
+ *      scratchpad, MMIO and DMA writes; memory.c chokepoints)
+ *   2. zero MMIO accesses  (g_mmio_access_count unchanged — an MMIO read can
+ *      be side-effecting or time-varying, strictly disqualifying. I_STAT-
+ *      polling kernel loops therefore never skip; whitelisting side-effect-
+ *      free I_STAT reads is a possible later refinement.)
+ *   3. identical GPR/hi/lo fingerprint at the check boundary — rules out
+ *      progressing pure-load loops (strlen/memcmp-style scans) whose exit
+ *      depends on register progress, not time. (COP0/GTE-held loop state is
+ *      not fingerprinted; no realistic poll loop keys its exit on those.)
+ *
+ * Excluded contexts: exception delivery, bail unwinds, precise slicing,
+ * lockstep record/replay, and PSX_COSIM builds entirely (the cosim oracle
+ * compares per-instruction streams; elided iterations would false-diverge).
+ *
+ * Off switch: PSX_IDLE_SKIP=0 (env) or {"cmd":"idle_skip","enable":0} (TCP).
+ * The always-on counters below are the observability surface. */
+
+enum {
+    IDLE_STREAK_MIN      = 4,        /* stable same-PC windows before a skip */
+    IDLE_QUANTUM_MAX     = 32768,    /* interp pump gap fits; junk deltas don't */
+    IDLE_SKIP_MAX_CYCLES = 1200000   /* defensive cap (> one vblank interval)  */
+};
+
+int      g_idle_skip_enabled = -1;   /* -1 = read PSX_IDLE_SKIP once; TCP-togglable */
+uint64_t g_idle_skip_count  = 0;     /* skips performed                */
+uint64_t g_idle_skip_cycles = 0;     /* guest cycles fast-forwarded    */
+uint32_t g_idle_skip_last_pc = 0;    /* loop PC of the last skip       */
+uint32_t g_idle_skip_last_quantum = 0;
+
+static uint32_t s_idle_pc = 0;
+static uint32_t s_idle_quantum = 0;
+static uint32_t s_idle_streak = 0;
+static uint32_t s_idle_fp = 0;
+static uint64_t s_idle_last_cycle = 0;
+static uint64_t s_idle_last_stores = 0;
+static uint64_t s_idle_last_mmio = 0;
+
+static uint32_t idle_reg_fp(const CPUState *cpu) {
+    uint32_t h = 0x811C9DC5u;                 /* FNV-1a over r1..r31 + hi/lo */
+    for (int i = 1; i < 32; i++) { h ^= cpu->gpr[i]; h *= 16777619u; }
+    h ^= cpu->hi; h *= 16777619u;
+    h ^= cpu->lo; h *= 16777619u;
+    return h;
+}
+
+static int idle_skip_on(void) {
+    if (g_idle_skip_enabled < 0) {
+        /* DISABLED BY DEFAULT (2026-07-06). The skip fast-forwards guest time
+         * to the next INTERNAL device event, but an SIO/memory-card transfer
+         * in flight is not currently modeled as a bounding deadline, so the
+         * skip jumps past the write-completion the card driver polls for at
+         * boot — Tomba2's "checking memory card" livelocks (frame rate
+         * collapses to a few fps; the game never advances). Opt in with
+         * PSX_IDLE_SKIP=1. Re-enable by default only once the skip is bounded
+         * by the SIO transfer/IRQ deadline (devices_cycles_to_next_internal_
+         * event must include the in-flight card-byte completion). */
+        const char *e = getenv("PSX_IDLE_SKIP");
+        g_idle_skip_enabled = (e && e[0] == '1');
+    }
+    return g_idle_skip_enabled;
+}
+
+void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
+#ifdef PSX_COSIM
+    (void)cpu; (void)check_pc;
+    return;
+#else
+    extern int g_psx_call_bail, g_precise_mode, g_ls_mode, g_ls_replay_active;
+    extern int psx_get_in_exception(void);
+    extern uint64_t g_guest_store_count, g_mmio_access_count;
+
+    if (!idle_skip_on()) return;
+    if (check_pc == 0 || psx_get_in_exception() || g_psx_call_bail ||
+        g_precise_mode || g_ls_mode != 0 || g_ls_replay_active) {
+        s_idle_pc = 0;
+        s_idle_streak = 0;
+        return;
+    }
+
+    uint64_t cyc = psx_cycle_count;
+    if (check_pc == s_idle_pc &&
+        g_guest_store_count == s_idle_last_stores &&
+        g_mmio_access_count == s_idle_last_mmio) {
+        uint32_t fp = idle_reg_fp(cpu);
+        uint32_t delta = (uint32_t)(cyc - s_idle_last_cycle);
+        if (fp == s_idle_fp && delta > 0 && delta <= IDLE_QUANTUM_MAX) {
+            if (delta == s_idle_quantum) {
+                if (s_idle_streak < 1000000u) s_idle_streak++;
+            } else {
+                s_idle_quantum = delta;
+                s_idle_streak = 1;
+            }
+        } else {
+            s_idle_streak = 0;
+            s_idle_quantum = 0;
+        }
+        s_idle_fp = fp;
+    } else {
+        s_idle_pc = check_pc;
+        s_idle_streak = 0;
+        s_idle_quantum = 0;
+        s_idle_fp = idle_reg_fp(cpu);
+    }
+    s_idle_last_cycle  = cyc;
+    s_idle_last_stores = g_guest_store_count;
+    s_idle_last_mmio   = g_mmio_access_count;
+
+    if (s_idle_streak < IDLE_STREAK_MIN) return;
+    uint32_t q = s_idle_quantum;
+    uint32_t dist = devices_cycles_to_next_internal_event();
+    if (dist <= q) return;               /* one real iteration reaches it */
+    uint32_t k = (dist + q - 1u) / q;    /* first check boundary >= event */
+    uint64_t skip = (uint64_t)k * q;
+    if (skip > IDLE_SKIP_MAX_CYCLES) return;
+
+    g_idle_skip_count++;
+    g_idle_skip_cycles += skip;
+    g_idle_skip_last_pc = check_pc;
+    g_idle_skip_last_quantum = q;
+    psx_advance_cycles((uint32_t)skip);  /* replays device events exactly */
+
+    /* Device servicing may have written RAM / raised I_STAT — the caller
+     * (psx_check_interrupts) evaluates deliverability right after this with
+     * the post-skip state. Re-detect from scratch either way. */
+    s_idle_streak = 0;
+    s_idle_last_cycle  = psx_cycle_count;
+    s_idle_last_stores = g_guest_store_count;
+    s_idle_last_mmio   = g_mmio_access_count;
+#endif
 }
 
 /* Save-state restore: psx_cycle_count was just overwritten from the snapshot, so

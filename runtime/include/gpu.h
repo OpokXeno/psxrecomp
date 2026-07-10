@@ -64,10 +64,18 @@ typedef struct {
     uint32_t seq;
     uint32_t src_addr;      /* RAM/MMIO source address of command header, if known */
     uint32_t pc;            /* g_debug_last_store_pc when command completes */
+    uint32_t func;          /* g_debug_current_func_addr at issue (executing guest fn) */
+    uint32_t ra;            /* guest $ra at issue: direct caller of the leaf GP0 helper */
     uint8_t  opcode;
     uint8_t  n_words;       /* total command length; >MAX means truncated */
     uint16_t pad;
     uint32_t cmd[GPU_GP0_RING_MAX_WORDS];
+    /* Builder attribution (populated only for VRAM->VRAM copies, op 0x80):
+     * bounded guest-stack unwind of validated return addresses, innermost
+     * first. Lets a caller skip the libgpu funnel band and name the game-level
+     * routine that assembled the copy. Zero for non-copy commands. */
+    uint32_t bld[6];
+    uint32_t csp;           /* raw guest $sp at copy time (diagnostic) */
 } GpuGp0RingEntry;
 
 uint64_t gpu_gp0_ring_total(void);
@@ -131,16 +139,55 @@ int  gpu_ws_present_native_43(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
+void gpu_ws_set_cull_guard_pixels(int pixels);
+void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
+                                    const uint32_t *slti, int nslti);
+int  psx_ws_is_cull_bias_site(uint32_t pc);
+int  psx_ws_is_cull_slti_site(uint32_t pc);
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x):
  * the gcc emit, the sljit JIT, and the interpreter all route a flagged
  * `sltiu rt, sx, 0x140/0x141` through this one helper so every overlay execution
  * path widens identically. Returns the sltiu verdict (1 = keep). 0 at 4:3. */
 int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
+/* Signed-funnel variants (min/max + center±halfwidth idioms — see
+ * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
+ * widen for the paired `bltz maxSX` reject. Identity at 4:3. */
+int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
+int  psx_ws_cull_bltz(uint32_t v);
 /* True if a run of instruction words carries the screen-extent reject signature
- * (a sltiu 0x140/0x141 AND a sltiu 0xE0/0xF1). Used by sljit/interp to gate the
- * widening to real render funnels. */
+ * (a width compare AND a height compare from the configured immediate sets).
+ * Used by sljit/interp to gate the widening to real render funnels. */
 int  psx_ws_func_has_screen_cull(const uint32_t *words, int n);
+/* Classify words[idx] as an X left-edge reject bltz (runtime imm sets). */
+int  psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx);
+/* Per-game cull signature immediates ([widescreen.cull] screen_w_imms /
+ * screen_h_imms); defaults 0x140/0x141 + 0xE0/0xF1. */
+void gpu_ws_set_cull_imms(const uint32_t *w, int nw, const uint32_t *h, int nh);
+int  psx_ws_is_cull_w_imm(uint32_t imm);
+/* Per-game opt-in gates for the pattern-scanned interp/sljit widen hooks
+ * (auto_screen_x cull + auto_backdrop preload). Default OFF: a title that
+ * never opted in must never have its live code pattern-scanned and rewritten. */
+void gpu_ws_set_auto_hooks(int cull_on, int backdrop_on);
+int  psx_ws_auto_cull_on(void);
+/* GTE-activity gameplay detector ([widescreen] gte_game_mode) for 3D titles
+ * with no sprite-tag helper: gte.cpp notes every RTPS/RTPT projection; a frame
+ * that projects enough vertices is stamped as gameplay. */
+void gpu_ws_set_gte_game_mode(int on);
+void psx_ws_note_gte_project(int nverts);
+/* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
+ * outer-third screen-space HUD sprites out to the true wide-frame corners
+ * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
+void gpu_ws_set_nw_hud_corners(int on);
+/* Targeted alternative for sprite-heavy 2D games: corner-anchor only primitives
+ * whose ordering-table packet lives in the configured half-open RAM range. */
+void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi);
+void gpu_ws_begin_linked_list(void);
+/* Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop):
+ * stretch a screen-space quad that covers the whole 4:3 framebuffer (sky
+ * gradient / backdrop image) to fill the wide frame, so it no longer
+ * pillarboxes at the reveal margins. Runtime-only. Off by default. */
+void gpu_ws_set_nw_backdrop(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the
