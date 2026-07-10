@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
     bool                  overlay_mode = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
+    std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
@@ -144,6 +145,7 @@ int main(int argc, char** argv) {
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
+        ws_cull_screen_x.insert(cfg.ws_cull_screen_x_sites.begin(), cfg.ws_cull_screen_x_sites.end());
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(cfg.ws_backdrop_unsquash_funcs.begin(), cfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || cfg.ws_auto_screen_x_cull;
@@ -218,6 +220,7 @@ int main(int argc, char** argv) {
         ws_cull_bias.insert(wscfg.ws_cull_bias_sites.begin(), wscfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
+        ws_cull_screen_x.insert(wscfg.ws_cull_screen_x_sites.begin(), wscfg.ws_cull_screen_x_sites.end());
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
@@ -764,6 +767,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
+    codegen_config.ws_cull_screen_x_sites = ws_cull_screen_x;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
     codegen_config.ws_backdrop_unsquash_funcs = ws_backdrop_unsquash;
     codegen_config.ws_auto_screen_x_cull = ws_auto_screen_x_cull;
