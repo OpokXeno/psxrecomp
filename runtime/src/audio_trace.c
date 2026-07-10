@@ -37,7 +37,7 @@ static PcmTap s_taps[AUDIO_TAP_COUNT];
 
 /* Per-tap sample rate for WAV headers. SPU-side taps are natively 44100;
  * the host tap follows the device rate in bridge/pull mode. */
-static uint32_t s_tap_rate[AUDIO_TAP_COUNT] = { 44100u, 44100u, 44100u };
+static uint32_t s_tap_rate[AUDIO_TAP_COUNT] = { 44100u, 44100u, 44100u, 44100u };
 
 void audio_trace_set_tap_rate(int tap, uint32_t rate)
 {

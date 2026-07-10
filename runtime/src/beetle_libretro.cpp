@@ -21,6 +21,7 @@
 #include "mednafen/psx/cpu.h"
 #include "mednafen/psx/gpu.h"
 #include "mednafen/psx/spu.h"
+#include "mednafen/psx/cdc.h"
 #include "mednafen/psx/frontio.h"
 #include "mednafen/psx/irq.h"
 #include "beetle_history.h"
@@ -935,6 +936,21 @@ extern "C" void psxrecomp_beetle_spu_event(unsigned kind, unsigned voice,
 }
 
 extern "C" uint64_t beetle_spu_event_total(void) { return s_spu_event_seq; }
+
+/* CD-audio volume matrix ground truth (PS_CDC::DecodeVolume; 0x80 = unity).
+ * Returns 0 if the CDC isn't up. */
+extern "C" int beetle_cdc_decode_volume(unsigned out[4])
+{
+    extern PS_CDC *PSX_CDC;
+    if (!PSX_CDC) return 0;
+    uint8 m[2][2];
+    PSX_CDC->PSXRecomp_GetDecodeVolume(m);
+    out[0] = m[0][0];  /* L -> L */
+    out[1] = m[0][1];  /* L -> R */
+    out[2] = m[1][0];  /* R -> L */
+    out[3] = m[1][1];  /* R -> R */
+    return 1;
+}
 
 extern "C" uint32_t beetle_spu_event_get(uint64_t *out_seq, uint32_t *out_frame,
                                          uint32_t *out_addr, uint16_t *out_env,

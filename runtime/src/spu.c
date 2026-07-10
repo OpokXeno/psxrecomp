@@ -332,7 +332,15 @@ static void decode_block(SpuVoice *v) {
         }
     }
 
-    if (flags & 0x04u) v->repeat_addr = addr;
+    if (flags & 0x04u) {
+        v->repeat_addr = addr;
+        /* The auto-latch updates the guest-visible register too (Beetle
+         * spu.cpp:386 + read path 1302): drivers read it back to save
+         * loop points. */
+        int v_idx = (int)(v - voices);
+        if (v_idx >= 0 && v_idx < SPU_VOICE_COUNT)
+            spu_regs[(uint32_t)v_idx * 8u + 7u] = (uint16_t)(addr >> 3);
+    }
     v->flags = flags;
     v->sample_idx = 0;
     v->cur_addr = (addr + 16u) & (SPU_RAM_SIZE - 1u);
@@ -563,6 +571,13 @@ void spu_render(int16_t* out_stereo, int frames) {
                 mix_l += ((int32_t)s * vl) >> 14;
                 mix_r += ((int32_t)s * vr) >> 14;
             }
+            {   /* T0 tap: voice sum only (pre CD mix, pre main volume) so the
+                 * final mix can be decomposed source-by-source offline. */
+                int16_t vsum[2];
+                vsum[0] = clamp16(mix_l);
+                vsum[1] = clamp16(mix_r);
+                audio_trace_pcm(AUDIO_TAP_VOICES, vsum, 1);
+            }
             if (ctrl & 0x0001u) {
                 int16_t cd_l = 0;
                 int16_t cd_r = 0;
@@ -677,6 +692,20 @@ void spu_write(uint32_t addr, uint32_t value) {
              * quantization audit (snesrecomp 8ffc797 class). */
             audio_trace_event(AUDIO_EV_REG_WRITE, addr, value & 0xFFFFu);
             spu_regs[idx] = (uint16_t)value;
+
+            /* Voice repeat/loop address (voice reg 7) is LIVE state on real
+             * hardware: writing it after KEYON retargets where the next
+             * END+REPEAT block jumps (Beetle spu.cpp:1150/333). X5's driver
+             * uses exactly this to end one-shots on looped samples — KEYON,
+             * then point the loop register at a silent tail block; no KEYOFF
+             * is ever sent. Caching repeat_addr only at KEYON left voices
+             * looping the loud sample body forever (measured: 3 stuck voices
+             * re-looping ~1400x/s, +11 dB over the oracle, clipping). */
+            if (idx < (uint32_t)SPU_VOICE_COUNT * 8u && (idx & 7u) == 7u) {
+                int v = (int)(idx >> 3);
+                voices[v].repeat_addr =
+                    ((uint32_t)(uint16_t)value << 3) & (SPU_RAM_SIZE - 1u);
+            }
 
             if (addr == 0x1F801D88u) {
                 kon_latch = (kon_latch & 0xFFFF0000u) | (uint32_t)(uint16_t)value;

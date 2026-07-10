@@ -1118,6 +1118,18 @@ static void h_audio_events(int id, const char *json) {
     free(evs);
 }
 
+/* ---- cdc_volume: CD-audio DecodeVolume matrix ground truth ---- */
+extern int beetle_cdc_decode_volume(unsigned out[4]);
+static void h_cdc_volume(int id, const char *json) {
+    (void)json;
+    unsigned m[4] = {0, 0, 0, 0};
+    if (!beetle_cdc_decode_volume(m)) { send_err(id, "cdc_unavailable"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"ll\":\"0x%02X\",\"lr\":\"0x%02X\","
+             "\"rl\":\"0x%02X\",\"rr\":\"0x%02X\"}\n",
+             id, m[0], m[1], m[2], m[3]);
+}
+
 /* ---- wtrace_all (always-on, no-filter, lean fields) ----
  * Mirrors runtime's wtrace_all surface so probes that haven't pre-armed
  * a range can still see the last ~1 second of writes the moment they
@@ -1618,6 +1630,7 @@ static const CmdEntry CMDS[] = {
     { "audio_stats",           h_audio_stats },
     { "audio_wav",             h_audio_wav },
     { "audio_events",          h_audio_events },
+    { "cdc_volume",            h_cdc_volume },
     /* Per-frame history ring (parity with psx-runtime). */
     { "history",               h_history },
     { "get_frame",             h_get_frame },

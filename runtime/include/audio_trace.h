@@ -38,7 +38,8 @@ enum {
     AUDIO_TAP_SPU_OUT = 0,
     AUDIO_TAP_CD_IN   = 1,
     AUDIO_TAP_HOST    = 2,
-    AUDIO_TAP_COUNT   = 3
+    AUDIO_TAP_VOICES  = 3,   /* T0: 24-voice sum only (pre CD mix, pre main) */
+    AUDIO_TAP_COUNT   = 4
 };
 
 /* Event kinds. REG_WRITE covers every SPU register store (addr/value), which
