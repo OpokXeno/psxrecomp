@@ -42,6 +42,7 @@ uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
+uint64_t g_dirty_ram_native_handoffs = 0;
 /* Scheduling-contract pump telemetry (see dirty_ram_dispatch). Always-on:
  * g_dirty_pump_max_gap_insns is the largest interpreted-insn gap ever seen
  * between two interrupt pumps — must stay bounded (~4096 + one block) once the
@@ -2183,10 +2184,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * candidate overlay function, so native and interpreted runs can be diffed
      * by sequence. Additive only — no control-flow change. */
     extern int      overlay_loader_is_candidate(uint32_t phys);
+    extern int      overlay_fp_enabled(void);
     extern void     overlay_regs_snap(uint32_t out[34], const CPUState *cpu);
     extern void     overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
                                    const CPUState *cpu, int native);
-    int      _ovfp = overlay_cache_window_contains(phys) &&
+    int      _ovfp = overlay_fp_enabled() &&
+                     overlay_cache_window_contains(phys) &&
                      overlay_loader_is_candidate(phys);
     uint32_t _in_regs[34];
     if (_ovfp) {
@@ -2426,6 +2429,26 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 target != stop_addr &&
                 phys_is_overlay_flow_region(target_phys) &&
                 dirty_ram_is_dirty(target_phys)) {
+                /* A runtime overlay may start executing while its final code
+                 * bytes are still being installed. Entry-time native validation
+                 * must reject that partial image, but local dirty flow used to
+                 * remain here for up to one million instructions after the bytes
+                 * became an exact cached match. Tomba 2's MDEC path turns that
+                 * one early miss into an entire FMV interpreted at ~23 fps.
+                 *
+                 * Re-check exact cached entries at safe guest transfer
+                 * boundaries. The loader re-hashes generation-changed code
+                 * before executing it, so incomplete/self-modified bytes stay on
+                 * this authoritative interpreter path. */
+                if (overlay_loader_is_candidate(target_phys)) {
+                    extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+                    if (overlay_loader_dispatch(cpu, target)) {
+                        g_dirty_ram_native_handoffs++;
+                        g_dirty_ram_blocks_run++;
+                        if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                        OV_FPLOG_RET1();
+                    }
+                }
                 /* Capture freeze gates ONLY the ring write — never flow. */
                 if (!g_insn_log_frozen) {
                     uint64_t s = g_dirty_ram_flow_log_seq++;

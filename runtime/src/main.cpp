@@ -295,6 +295,9 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * it trims the display-side scanout latency the CPU-side ring can't see. */
 static int           g_low_latency_input = 1;
 static int           g_video_vsync        = 1;
+static int           g_frame_interpolation = 0;
+static int           g_frame_interpolation_fps = 0;
+static double        g_host_refresh_hz = 0.0;
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -962,6 +965,78 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
     *overflow_drops = st.overflow_drops;
     *correction = st.last_correction;
     return 1;
+}
+
+/* Lightweight production-safe cadence probe. Unlike the TCP debug build this
+ * adds no per-block recording; it is intended for long, representative attract
+ * runs where instrumentation overhead would itself cause audio starvation. */
+static void runtime_perf_diag_tick() {
+    static int enabled = -1;
+    static uint64_t last_counter = 0, last_frame = 0, last_spu = 0;
+    static uint64_t last_underruns = 0, last_overflows = 0;
+    static uint64_t last_up[6] = {0};
+    static uint32_t last_overlay_loads = 0;
+    static uint64_t last_overlay_load_us = 0;
+    if (enabled < 0) {
+        const char *e = std::getenv("PSX_RUNTIME_PERF_DIAG");
+        enabled = e && e[0] && e[0] != '0';
+    }
+    if (!enabled) return;
+    uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    extern uint64_t s_frame_count;
+    AudioTraceStats audio;
+    audio_trace_get_stats(&audio);
+    double fill_ms = 0.0, correction = 0.0;
+    uint64_t underruns = 0, overflows = 0;
+    int legacy = 0, host_rate = 0;
+    psx_audio_out_stats(&fill_ms, &underruns, &overflows, &correction,
+                        &legacy, &host_rate);
+    uint64_t up[6] = {0};
+    gl_renderer_runtime_diag(up);
+    uint32_t overlay_loads = 0;
+    uint64_t overlay_load_us = 0, overlay_load_max_us = 0, overlay_load_last_us = 0;
+    overlay_loader_get_counters(&overlay_loads, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    overlay_loader_get_load_timing(&overlay_load_us, &overlay_load_max_us,
+                                   &overlay_load_last_us);
+    if (!last_counter) {
+        last_counter = now; last_frame = s_frame_count;
+        last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+        last_underruns = underruns; last_overflows = overflows;
+        last_overlay_loads = overlay_loads;
+        last_overlay_load_us = overlay_load_us;
+        for (int i = 0; i < 6; i++) last_up[i] = up[i];
+        return;
+    }
+    if (now - last_counter < freq * 5u) return;
+    double dt = (double)(now - last_counter) / (double)freq;
+    fprintf(stdout, "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
+            "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
+            "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
+            "cpu=%.1f tex=%.1f draw=%.1f ms/s; overlay loads=+%u "
+            "wall=%.1f ms max=%.1f last=%.1f ms\n",
+            (double)(s_frame_count - last_frame) / dt,
+            (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+            fill_ms, (unsigned long long)(underruns - last_underruns),
+            (unsigned long long)(overflows - last_overflows), correction,
+            (double)(up[0] - last_up[0]) / dt,
+            (double)(up[1] - last_up[1]) / dt,
+            (double)(up[2] - last_up[2]) / dt / 1.0e6,
+            (double)(up[3] - last_up[3]) * 1000.0 / (double)freq / dt,
+            (double)(up[4] - last_up[4]) * 1000.0 / (double)freq / dt,
+            (double)(up[5] - last_up[5]) * 1000.0 / (double)freq / dt,
+            overlay_loads - last_overlay_loads,
+            (double)(overlay_load_us - last_overlay_load_us) / 1000.0,
+            (double)overlay_load_max_us / 1000.0,
+            (double)overlay_load_last_us / 1000.0);
+    fflush(stdout);
+    last_counter = now; last_frame = s_frame_count;
+    last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+    last_underruns = underruns; last_overflows = overflows;
+    last_overlay_loads = overlay_loads;
+    last_overlay_load_us = overlay_load_us;
+    for (int i = 0; i < 6; i++) last_up[i] = up[i];
 }
 
 static void sdl_audio_update(int turbo_active) {
@@ -1901,6 +1976,8 @@ static void sdl_vblank_present(void) {
     int override = -1;
 #endif
 
+    runtime_perf_diag_tick();
+
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
      * returns so the curve is captured even when presents are skipped. */
@@ -2178,6 +2255,14 @@ static void sdl_vblank_present(void) {
          * of truth, shared with the GTE/GPU squash so content and present stay
          * locked: we squash IFF we stretch. */
         fmv_frame = !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* MDEC movies are already decoded at their authored cadence and are
+         * CPU/upload heavy. High-refresh crossfades only contend with decoding
+         * and can starve audio, so present native-4:3/MDEC phases directly.
+         * The classification catches the transition frame before the first
+         * decode; the activity stamp also covers authentic 4:3 configurations. */
+        if (g_gl_active)
+            gl_renderer_set_interpolation_suspended(
+                fmv_frame || mdec_recently_active(2));
 
         /* Canonical present width. Native-wide does NOT widen the canonical read
          * (that bled across adjacent framebuffers); it composites into a separate
@@ -2595,6 +2680,8 @@ int main(int argc, char** argv) {
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             g_video_vsync       = gc.runtime.video_vsync;
+            g_frame_interpolation = gc.runtime.video_frame_interpolation ? 1 : 0;
+            g_frame_interpolation_fps = gc.runtime.video_frame_interpolation_fps;
             g_fmv_skip_total_table = gc.runtime.video_fmv_skip_total_table;
             g_fmv_skip_movie_id    = gc.runtime.video_fmv_skip_movie_id;
             if (gc.runtime.video_fmv_skip_end_total)
@@ -2878,6 +2965,10 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+        if (us.has_frame_interpolation)
+            g_frame_interpolation = us.frame_interpolation ? 1 : 0;
+        if (us.has_frame_interpolation_fps)
+            g_frame_interpolation_fps = us.frame_interpolation_fps;
     }
 
     /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
@@ -2914,9 +3005,16 @@ int main(int argc, char** argv) {
     }
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
-     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
+     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
+     * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
+        g_frame_interpolation = atoi(e) ? 1 : 0;
+    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
+        int fps = atoi(e);
+        if (fps == 0 || fps >= 90) g_frame_interpolation_fps = fps;
+    }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used
@@ -2989,6 +3087,10 @@ int main(int argc, char** argv) {
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
+            seed.frame_interpolation = (g_frame_interpolation != 0);
+            seed.has_frame_interpolation = true;
+            seed.frame_interpolation_fps = g_frame_interpolation_fps;
+            seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
@@ -3069,6 +3171,8 @@ int main(int argc, char** argv) {
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
+                g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
+                g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
                 g_audio_spu_hq    = seed.spu_hq;
@@ -3369,6 +3473,7 @@ int main(int argc, char** argv) {
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
         if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
             double host_hz = (double)dm.refresh_rate;
+            g_host_refresh_hz = host_hz;
             if (host_hz >= 58.8 && host_hz <= 61.2) {
                 g_frame_period_ms = 1000.0 / host_hz;
                 std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
@@ -3394,6 +3499,8 @@ int main(int argc, char** argv) {
          * (which uses gr_scale()) matches it — otherwise sdl_pixel_buf is
          * undersized and the wide readback overflows it. */
         g_video_scale = gr_scale();
+        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
+                                      (double)g_frame_interpolation_fps);
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init

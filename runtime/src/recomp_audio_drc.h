@@ -39,13 +39,12 @@ typedef struct {
     double host_rate;       /* host device sample rate (Hz)                     */
     int    taps;            /* prototype length; 16 min, 32 preferred          */
     int    phases;          /* fractional phases; 256-1024 (512 default)       */
-    double target_ms;       /* steady-state ring fill target (default 80)      */
+    double target_ms;       /* steady-state ring fill target (default 160)     */
     double ring_ms;         /* ring capacity in ms (default 250)               */
     double kp;              /* proportional gain (default 0.02)                */
-    double ki_per_s;        /* integral gain per second (default 0.02): holds
-                               a steady clock-skew correction with ZERO
-                               standing fill error (P-only must run a permanent
-                               fill deficit of corr/kp to sustain correction)  */
+    double ki_per_s;        /* optional integral gain per second (default 0):
+                               P-only is bounded and cannot wind up across
+                               bursty frame/stage transitions                  */
     double max_correction;  /* clamp on ratio correction (default 0.005)       */
     double err_lp_ms;       /* error low-pass time constant ms (default 75)    */
     double slew_pp_per_s;   /* correction slew, percent-points/sec (default 0.75) */
@@ -143,14 +142,19 @@ void rab_config_defaults(rab_config *c) {
     c->host_rate      = 48000.0;
     c->taps           = 32;
     c->phases         = 512;
-    /* target/ring raised 50/150 -> 80/250: a producer paced by an emulated
-     * machine stalls for tens of ms at a time (heavy frames, CD bursts) —
-     * jitter far beyond a host audio driver's. 80 ms keeps the servo's
-     * operating point clear of the dry floor through those spikes. */
-    c->target_ms      = 80.0;
+    /* Streamed stage transitions can pause PSX audio production for ~140 ms
+     * while guest cadence catches up inside the same reporting window. Keep a
+     * measured 160 ms reserve; sustained slow emulation still drains it and
+     * remains visible in telemetry. The existing 250 ms ring leaves 90 ms of
+     * overflow headroom without changing guest timing or presentation. */
+    c->target_ms      = 160.0;
     c->ring_ms        = 250.0;
     c->kp             = 0.02;
-    c->ki_per_s       = 0.02;
+    /* P-only intentionally: the former 0.02/s integral retained a +0.5%
+     * correction after transition bursts and drained a steady 59.94 Hz
+     * producer. At the measured ~0.1% source skew, kp=0.02 settles only ~4 ms
+     * off target and cannot accumulate that destructive history. */
+    c->ki_per_s       = 0.0;
     c->max_correction = 0.005;
     c->err_lp_ms      = 75.0;
     c->slew_pp_per_s  = 0.75;
@@ -252,23 +256,25 @@ void rab_push(rab_bridge *b, const int16_t *in, int frames) {
     b->stats.pushed_frames += (uint64_t)frames;
 }
 
-static void rab__update_controller(rab_bridge *b) {
+static void rab__update_controller(rab_bridge *b, int pull_frames) {
     rab_config *c = &b->cfg;
     double fill_ms = rab_fill_ms(b);
     b->stats.last_fill_ms = fill_ms;
 
     if (!b->primed && fill_ms >= c->target_ms) b->primed = 1;
 
-    /* one control update per pull; low-pass the normalized error. Use the pull
-     * block duration as dt (approx via host_rate is unnecessary here -- we fold
-     * the time constant into a per-update smoothing alpha sized for ~10-20ms). */
+    /* One control update per pull. Use the callback's REAL duration: assuming
+     * 12 ms made integral gain and slew run more than twice as fast with common
+     * 256-frame/48 kHz callbacks. The resulting limit cycle repeatedly hit the
+     * +0.5% clamp and drained an otherwise steady producer ring. */
+    double dt_ms = (double)pull_frames * 1000.0 / c->host_rate;
+    if (dt_ms < 0.1) dt_ms = 0.1;
+    if (dt_ms > 100.0) dt_ms = 100.0;
     double err = (fill_ms - c->target_ms) / c->target_ms;
     if (fill_ms > c->target_ms - c->deadband_ms &&
         fill_ms < c->target_ms + c->deadband_ms) {
         err = 0.0; /* deadband */
     }
-    /* smoothing alpha: assume ~one update per host audio block (~10ms typical). */
-    double dt_ms = 12.0;
     double alpha = dt_ms / (c->err_lp_ms + dt_ms);
     b->err_lp += alpha * (err - b->err_lp);
 
@@ -303,7 +309,7 @@ static void rab__update_controller(rab_bridge *b) {
 
 void rab_pull(rab_bridge *b, int16_t *out, int frames) {
     int ch = b->cfg.channels;
-    rab__update_controller(b);
+    rab__update_controller(b, frames);
 
     double gstep = 1.0 / (b->cfg.host_rate * 0.003); /* ~3ms fade in/out */
     double step  = b->cur_step;
