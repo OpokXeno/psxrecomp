@@ -6743,6 +6743,23 @@ static void handle_ws_hud_mode(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"tag_rects\":%d}", id, v ? 1 : 0);
 }
 
+/* Kernel-image bless state: {"cmd":"kernel_bless"} ->
+ * entries/clean/mismatch/native_hits/verifies/invalidations.
+ * (memory.c psx_kernel_bless_*; PSX_KERNEL_BLESS=0 disables the mechanism.) */
+static void handle_kernel_bless(int id, const char *json)
+{
+    extern void psx_kernel_bless_stats(uint64_t out[6]);
+    (void)json;
+    uint64_t s[6];
+    psx_kernel_bless_stats(s);
+    send_fmt("{\"id\":%d,\"ok\":true,\"entries\":%llu,\"clean\":%llu,"
+             "\"mismatch\":%llu,\"native_hits\":%llu,\"verifies\":%llu,"
+             "\"invalidations\":%llu}",
+             id, (unsigned long long)s[0], (unsigned long long)s[1],
+             (unsigned long long)s[2], (unsigned long long)s[3],
+             (unsigned long long)s[4], (unsigned long long)s[5]);
+}
+
 static void handle_ws_margin(int id, const char *json)
 {
     int v = json_get_int(json, "value", -2);
@@ -11810,6 +11827,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
     { "ws_hud_mode",       handle_ws_hud_mode },
+    { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
