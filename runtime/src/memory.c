@@ -1230,6 +1230,8 @@ static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
 
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
 void psx_write_word(uint32_t addr, uint32_t val) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_word_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
@@ -1382,6 +1384,8 @@ static uint16_t psx_read_half_raw(uint32_t addr) {
 
 static void psx_write_half_raw(uint32_t addr, uint16_t val);
 void psx_write_half(uint32_t addr, uint16_t val) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_half_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
@@ -1611,6 +1615,8 @@ uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
 
 static void psx_write_byte_raw(uint32_t addr, uint8_t val);
 void psx_write_byte(uint32_t addr, uint8_t val) {
+    extern void (*g_overlay_flush_pending_cycles)(void);
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 1, val); return; }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_byte_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 1, val);
