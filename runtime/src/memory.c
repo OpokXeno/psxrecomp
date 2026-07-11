@@ -19,6 +19,7 @@
 #include "spu.h"
 #include "timers.h"
 #include "lockstep.h"
+#include "data_shards.h"
 #include "psx_cycles.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -1200,8 +1201,14 @@ extern int g_ls_suppress_record;
 extern int g_dma_exec_depth;
 extern int psx_get_in_exception(void);
 static uint32_t psx_read_word_raw(uint32_t addr);
+/* data-shard capture feed (data_shards.c): record guest reads/writes while a
+ * capture window is armed. Same exclusions as the lockstep hooks: never in
+ * exception context (ISR work replays live), never under DMA (DMA writes
+ * poison the window via ds_note_dma_write instead). */
 uint32_t psx_read_word(uint32_t addr) {
     if (g_ls_mode == 2) return ls_read_hook(addr, 4, 0u);
+    if (g_ds_recording && g_dma_exec_depth == 0 && !psx_get_in_exception())
+        ds_note_read(addr, 4);
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_word_raw(addr);
     s_ls_op_active = 1;
     uint32_t v = psx_read_word_raw(addr);
@@ -1308,6 +1315,10 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
+    if (g_ds_recording) {
+        if (g_dma_exec_depth > 0) ds_note_dma_write();
+        else if (!psx_get_in_exception()) ds_note_write(addr, 4);
+    }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_word_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
     s_ls_op_active = 1;
@@ -1426,6 +1437,8 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
 static uint16_t psx_read_half_raw(uint32_t addr);
 uint16_t psx_read_half(uint32_t addr) {
     if (g_ls_mode == 2) return (uint16_t)ls_read_hook(addr, 2, 0u);
+    if (g_ds_recording && g_dma_exec_depth == 0 && !psx_get_in_exception())
+        ds_note_read(addr, 2);
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_half_raw(addr);
     s_ls_op_active = 1;
     uint16_t v = psx_read_half_raw(addr);
@@ -1462,6 +1475,10 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
+    if (g_ds_recording) {
+        if (g_dma_exec_depth > 0) ds_note_dma_write();
+        else if (!psx_get_in_exception()) ds_note_write(addr, 2);
+    }
     if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_half_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
     s_ls_op_active = 1;

@@ -410,6 +410,13 @@ struct GameConfig {
     uint32_t              ws_sprite_anchor_addr = 0;
     bool                  ws_hud_sprt_squash = false;
 
+    // [data_shards] funcs: functions that get the memoized pure-function
+    // replay entry/return hooks (psx_datashard_enter/psx_datashard_ret).
+    // Enhancement-phase load-time work; see docs/DATA_SHARDS.md. Capture is
+    // self-proving (byte-verified read-set), so listing a function that turns
+    // out to be impure only costs a poisoned capture, never a wrong replay.
+    std::vector<uint32_t> data_shard_funcs;
+
     // Cull-margin widening. The game's per-object draw classifier compares
     // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
     // the GTE squash shows ~33% more world, so the fixed margin collapses and

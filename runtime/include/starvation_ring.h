@@ -101,6 +101,14 @@ void starvation_ring_dump(const char *path);
 /* Periodic PC sample. Caller responsible for throttling. */
 void starvation_ring_pc_sample(void);
 
+/* Ring query (TCP `starv_ring`): total events recorded so far, and a copy
+ * of the entry with sequence number `seq` (0 = first ever). Returns 1 and
+ * fills *out when `seq` is still resident in the ring; 0 when evicted or
+ * not yet written. Same-thread with the writers (emu/main thread), so the
+ * copy is tear-free. */
+uint64_t starvation_ring_total(void);
+int      starvation_ring_get(uint64_t seq, StarvationEntry *out);
+
 #ifdef __cplusplus
 }
 #endif

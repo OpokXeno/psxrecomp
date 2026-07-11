@@ -50,6 +50,12 @@ struct CodeGenConfig {
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
 
+    // Data-shard hooks ([data_shards] funcs): memoized pure-function replay.
+    // Entry gets `if (psx_datashard_enter(cpu, KEY)) return;` (replay path),
+    // every jr-$ra return gets `psx_datashard_ret(cpu)` (capture finalize).
+    // See docs/DATA_SHARDS.md. Empty = no hooks (default).
+    std::set<uint32_t> data_shard_funcs;
+
     // MMX6-class 2D tile-ring stage initializer. Emit a reveal-invalidation
     // callback at entry so host-only wide pixels cannot survive a stage swap.
     uint32_t ws_bg2d_init_func = 0;

@@ -165,6 +165,16 @@ void starvation_ring_pc_sample(void) {
     e->i_mask               = i_mask;
 }
 
+uint64_t starvation_ring_total(void) { return s_seq; }
+
+int starvation_ring_get(uint64_t seq, StarvationEntry *out) {
+    if (seq >= s_seq) return 0;                                /* not written yet */
+    if (s_seq - seq > STARVATION_RING_CAP) return 0;           /* evicted */
+    *out = s_ring[seq & (STARVATION_RING_CAP - 1)];
+    if (out->seq != seq) return 0;                             /* raced an eviction */
+    return 1;
+}
+
 void starvation_ring_dump(const char *path) {
     if (s_dump_done) return;  /* dump exactly once */
     s_dump_done = 1;
@@ -255,5 +265,7 @@ void starvation_watchdog_heartbeat(void) {}
 void starvation_watchdog_check(void) {}
 void starvation_ring_dump(const char *path) { (void)path; }
 void starvation_ring_pc_sample(void) {}
+uint64_t starvation_ring_total(void) { return 0; }
+int starvation_ring_get(uint64_t seq, StarvationEntry *out) { (void)seq; (void)out; return 0; }
 
 #endif /* STARVATION_RING_ENABLED */

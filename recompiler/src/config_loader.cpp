@@ -725,6 +725,16 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_nw_phase_backdrop = false;
     bool ws_offered = true;
     bool ws_ultrawide_offered = false;
+    // Optional [data_shards] block — memoized pure-function replay hooks.
+    std::vector<uint32_t> data_shard_funcs;
+    if (cfg.contains("data_shards")) {
+        const toml::value& dsv = toml::find(cfg, "data_shards");
+        if (dsv.contains("funcs")) {
+            const auto& arr = toml::find<std::vector<std::string>>(dsv, "funcs");
+            for (const auto& a : arr)
+                data_shard_funcs.push_back(parse_hex(a, "data_shards.funcs"));
+        }
+    }
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -944,6 +954,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
+        /*data_shard_funcs*/      data_shard_funcs,
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,

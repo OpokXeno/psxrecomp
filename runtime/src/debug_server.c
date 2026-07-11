@@ -1999,7 +1999,17 @@ void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
+
+/* Last guest function ENTERED, fed unconditionally at every compiled entry
+ * (one u32 store). The wall-time sampler's static histogram keys on THIS, not
+ * g_debug_current_func_addr: the dispatch stamp survives across post-exception
+ * resumption, so under any IRQ cadence it pools most static samples on the
+ * kernel exception-exit body (measured 55% on 0xF40) instead of the code that
+ * actually ran. Entry-stamp attribution is leaf-biased but honest. */
+volatile uint32_t g_psx_last_fn_entry = 0;
+
 void debug_server_log_call_entry(uint32_t func_addr) {
+    g_psx_last_fn_entry = func_addr;
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
@@ -2723,6 +2733,7 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
  * argument-passing chains, and answer "who called X with what args"
  * across processes (psx-runtime port 4370, psx-beetle port 4380). */
 #include "fntrace.h"
+#include "starvation_ring.h"
 #include "bios_hle.h"
 #include "parity_trace.h"
 #include "device_trace.h"
@@ -11750,17 +11761,32 @@ static volatile uint32_t s_phot_addr[PHOT_SLOTS];
 static volatile uint64_t s_phot_cnt [PHOT_SLOTS];
 static volatile uint64_t s_phot_native_total = 0, s_phot_drops = 0;
 
-static void phot_add(uint32_t addr)
+/* Same histogram for STATIC-phase samples, keyed on the static-dispatch
+ * stamp (g_debug_current_func_addr). Coarser than the native histogram —
+ * the stamp is per static dispatch, not per C frame — but under CPS the
+ * dispatch cadence is dense enough to attribute wall time to main-EXE
+ * functions (the load-window decompressor question). */
+static volatile uint32_t s_phots_addr[PHOT_SLOTS];
+static volatile uint64_t s_phots_cnt [PHOT_SLOTS];
+static volatile uint64_t s_phot_static_total = 0, s_phots_drops = 0;
+
+static void phot_add_to(volatile uint32_t *ha, volatile uint64_t *hc,
+                        volatile uint64_t *drops, uint32_t addr)
 {
     if (!addr) return;
     uint32_t h = (addr >> 2) * 2654435761u;
     for (uint32_t p = 0; p < 16; p++) {
         uint32_t i = (h + p) & (PHOT_SLOTS - 1u);
-        uint32_t a = s_phot_addr[i];
-        if (a == addr) { s_phot_cnt[i]++; return; }
-        if (a == 0)    { s_phot_addr[i] = addr; s_phot_cnt[i] = 1; return; }
+        uint32_t a = ha[i];
+        if (a == addr) { hc[i]++; return; }
+        if (a == 0)    { ha[i] = addr; hc[i] = 1; return; }
     }
-    s_phot_drops++;
+    (*drops)++;
+}
+
+static void phot_add(uint32_t addr)
+{
+    phot_add_to(s_phot_addr, s_phot_cnt, &s_phot_drops, addr);
 }
 
 #ifdef _WIN32
@@ -11796,7 +11822,14 @@ static void *phase_sampler_main(void *arg)
                 s_phot_native_total++;
                 phot_add(overlay_loader_native_inprogress());
                 break;
-        case 3: s_phase_static[slot]++; break;
+        case 3: s_phase_static[slot]++;
+                s_phot_static_total++;
+                {
+                    extern volatile uint32_t g_psx_last_fn_entry;
+                    phot_add_to(s_phots_addr, s_phots_cnt, &s_phots_drops,
+                                g_psx_last_fn_entry);
+                }
+                break;
         case 4: s_phase_gpu[slot]++; break;
         default: break;                          /* 0 = host/other */
         }
@@ -11859,19 +11892,26 @@ static void handle_phase_profile(int id, const char *json)
 }
 
 /* phase_hot: top guest functions by native wall-time samples (cumulative
- * since boot — diff two snapshots for a window). {"cmd":"phase_hot","top":N} */
+ * since boot — diff two snapshots for a window). {"cmd":"phase_hot","top":N}
+ * Optional {"set":"static"} ranks the STATIC-phase histogram instead
+ * (main-EXE functions via the static-dispatch stamp). */
 static void handle_phase_hot(int id, const char *json)
 {
     int top = json_get_int(json, "top", 20);
     if (top < 1)  top = 1;
     if (top > 64) top = 64;
+    char set[16] = "native";
+    json_get_str(json, "set", set, sizeof(set));
+    int is_static = (set[0] == 's');
+    volatile uint32_t *ha = is_static ? s_phots_addr : s_phot_addr;
+    volatile uint64_t *hc = is_static ? s_phots_cnt  : s_phot_cnt;
     uint32_t best_addr[64];
     uint64_t best_cnt[64];
     int n = 0;
     for (int i = 0; i < PHOT_SLOTS; i++) {
-        uint32_t a = s_phot_addr[i];
+        uint32_t a = ha[i];
         if (!a) continue;
-        uint64_t c = s_phot_cnt[i];
+        uint64_t c = hc[i];
         int j = n < top ? n : top - 1;
         if (n < top) n++;
         else if (c <= best_cnt[j]) continue;
@@ -11883,13 +11923,16 @@ static void handle_phase_hot(int id, const char *json)
         best_addr[j] = a;
         best_cnt[j]  = c;
     }
-    uint64_t tot = s_phot_native_total;
+    uint64_t tot = is_static ? s_phot_static_total : s_phot_native_total;
     char buf[4096];
     int len = snprintf(buf, sizeof(buf),
-                       "{\"id\":%d,\"ok\":true,\"native_samples_total\":%llu,"
+                       "{\"id\":%d,\"ok\":true,\"set\":\"%s\","
+                       "\"phase_samples_total\":%llu,"
                        "\"hash_drops\":%llu,\"top\":[",
-                       id, (unsigned long long)tot,
-                       (unsigned long long)s_phot_drops);
+                       id, is_static ? "static" : "native",
+                       (unsigned long long)tot,
+                       (unsigned long long)(is_static ? s_phots_drops
+                                                      : s_phot_drops));
     for (int i = 0; i < n && len < (int)sizeof(buf) - 96; i++) {
         len += snprintf(buf + len, sizeof(buf) - (size_t)len,
                         "%s{\"addr\":\"0x%08X\",\"samples\":%llu,\"share\":%.4f}",
@@ -11921,8 +11964,74 @@ static void handle_idle_skip(int id, const char *json)
              g_idle_skip_last_pc, g_idle_skip_last_quantum);
 }
 
+/* starv_ring: query the always-on starvation/PC-sample ring (16K entries,
+ * continuous since boot). {"cmd":"starv_ring","count":N,"kind":K} -> last N
+ * entries (newest last), K = StarvationEventKind filter (15 = PC samples;
+ * -1/omitted = all kinds). PC samples carry (cyc, host_us, current_func):
+ * consecutive deltas give guest-throughput over wall time, and current_func
+ * localizes where the emu thread was — the ring-buffer answer to "where did
+ * the last N seconds go" without arming anything. */
+static void handle_starv_ring(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 128);
+    int kind  = json_get_int(json, "kind", -1);
+    if (count < 1)    count = 1;
+    if (count > 2048) count = 2048;
+    uint64_t total = starvation_ring_total();
+    /* Walk backward collecting up to `count` matches, then emit oldest-first. */
+    static uint64_t match_seq[2048];
+    int n = 0;
+    uint64_t seq = total;
+    StarvationEntry e;
+    while (n < count && seq > 0) {
+        seq--;
+        if (!starvation_ring_get(seq, &e)) break;   /* fell off the ring */
+        if (kind >= 0 && e.kind != (uint8_t)kind) continue;
+        match_seq[n++] = seq;
+    }
+    size_t cap = 160u * (size_t)(n + 2);
+    char *buf = (char *)malloc(cap);
+    if (!buf) { send_err(id, "oom"); return; }
+    int len = snprintf(buf, cap,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"returned\":%d,"
+                       "\"entries\":[", id, (unsigned long long)total, n);
+    int emitted = 0;
+    for (int i = n - 1; i >= 0; i--) {              /* oldest first */
+        if (!starvation_ring_get(match_seq[i], &e)) continue;
+        len += snprintf(buf + len, cap - (size_t)len,
+                        "%s{\"seq\":%llu,\"kind\":%u,\"cyc\":%llu,\"us\":%llu,"
+                        "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\",\"in_exc\":%u}",
+                        emitted++ ? "," : "",
+                        (unsigned long long)e.seq, e.kind,
+                        (unsigned long long)e.psx_cycle_count,
+                        (unsigned long long)e.host_us,
+                        e.current_func, e.last_store_pc, e.in_exception);
+        if ((size_t)len + 192 > cap) break;         /* never overrun */
+    }
+    len += snprintf(buf + len, cap - (size_t)len, "]}");
+    (void)len;
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+/* data_shards: memoized pure-function replay counters (data_shards.c).
+ *   {"cmd":"data_shards"}              -> counters
+ *   {"cmd":"data_shards","enable":0|1} -> toggle, then counters */
+static void handle_data_shards(int id, const char *json)
+{
+    extern void ds_stats_json(char* buf, int cap);
+    extern void ds_set_enabled(int on);
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) ds_set_enabled(en);
+    char body[1024];
+    ds_stats_json(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
 static const CmdEntry s_commands[] = {
     { "phase_profile",     handle_phase_profile },
+    { "starv_ring",        handle_starv_ring },
+    { "data_shards",       handle_data_shards },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
     { "lockstep",          handle_lockstep },

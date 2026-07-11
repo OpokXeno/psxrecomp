@@ -535,6 +535,9 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
 static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 {
     uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    /* data-shard purity: a green-thread switch inside a capture window would
+     * record OTHER threads' work into the shard — poison the capture. */
+    { extern void ds_note_thread_switch(void); ds_note_thread_switch(); }
     debug_server_log_thread_event(3, cpu, current_tcb, target_tcb, 0);
     if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
         debug_server_log_thread_event(4, cpu, current_tcb, target_tcb, 0);
