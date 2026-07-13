@@ -622,6 +622,12 @@ struct GameConfig {
 // Unlike game.toml, paths here are stored verbatim (the user picked them); they
 // are NOT resolved against a project root.
 struct UserSettings {
+    // Set when the file existed but failed to parse as TOML: every field below
+    // is defaults and the caller must warn loudly — silently dropping a user's
+    // hand-edited settings looks like the settings "don't work", and a later
+    // launcher save would overwrite their file with defaults.
+    bool parse_error = false;
+
     // [video]
     bool has_renderer       = false; int  renderer       = 0; // 0=software,1=opengl
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4

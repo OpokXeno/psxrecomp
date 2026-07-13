@@ -1036,7 +1036,10 @@ UserSettings load_user_settings(const fs::path& path) {
     try {
         doc = toml::parse(path.string());
     } catch (const std::exception&) {
-        // Malformed file: fall back to all-defaults rather than refuse to boot.
+        // Malformed file: fall back to all-defaults rather than refuse to boot,
+        // but tell the caller so the user hears about it (and so the file can
+        // be preserved before any launcher save overwrites it with defaults).
+        s.parse_error = true;
         return s;
     }
 
