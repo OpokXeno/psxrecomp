@@ -1523,11 +1523,34 @@ static uint16_t pad_from_keyboard(int player) {
     return psx_keybinds_pad_word(keys, player);
 }
 
-static uint16_t controller_pad_buttons(SDL_GameController* h) {
+/* A left/right ANALOG-STICK axis source (LEFTX/LEFTY/RIGHTX/RIGHTY), as opposed
+ * to a trigger axis (L2/R2) or a button. The default map folds the left stick
+ * onto the D-pad bits (up=dpup,lefty- … right=dpright,leftx+) so the stick works
+ * as a D-pad for DIGITAL games. In ANALOG mode that fold is WRONG: the stick
+ * already drives the analog axes, and on a real DualShock the stick and D-pad
+ * are independent — so a dual-analog game that uses the D-pad as its own control
+ * (e.g. Ape Escape's camera rotate) would see phantom D-pad presses from every
+ * stick movement, and constant rotation from centre drift. controller_pad_buttons
+ * suppresses these sources when the pad presents as analog. Trigger axes and
+ * button sources are never suppressed. */
+static bool source_is_stick_axis(const ControllerSource& s) {
+    if (s.kind != ControllerSource::Kind::AxisPositive &&
+        s.kind != ControllerSource::Kind::AxisNegative) return false;
+    return s.id == SDL_CONTROLLER_AXIS_LEFTX  || s.id == SDL_CONTROLLER_AXIS_LEFTY ||
+           s.id == SDL_CONTROLLER_AXIS_RIGHTX || s.id == SDL_CONTROLLER_AXIS_RIGHTY;
+}
+
+/* Build the active-low PSX button word from a controller's input.ini map. When
+ * suppress_stick_axes is set (the pad is presenting as analog this frame), the
+ * left/right analog-stick axes do NOT contribute button bits — see
+ * source_is_stick_axis above. Digital mode passes false, so the stick still
+ * folds onto the D-pad (its only outlet there). */
+static uint16_t controller_pad_buttons(SDL_GameController* h, bool suppress_stick_axes) {
     uint16_t buttons = 0xFFFF;  /* all released */
     if (!h) return buttons;
     for (const auto& entry : controller_map) {
         for (const auto& source : entry.sources) {
+            if (suppress_stick_axes && source_is_stick_axis(source)) continue;
             if (controller_source_pressed_h(h, source)) {
                 buttons &= (uint16_t)~entry.bit;
                 break;
@@ -1568,9 +1591,9 @@ static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby)
 
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
  * 1 or 2 — selects which keybinds.ini section drives a keyboard port. */
-static uint16_t pad_buttons_for(const PlayerInput& p, int player) {
+static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_stick_axes) {
     if (p.kind == 1) return pad_from_keyboard(player);
-    if (p.kind == 2) return controller_pad_buttons(p.handle);
+    if (p.kind == 2) return controller_pad_buttons(p.handle, suppress_stick_axes);
     return 0xFFFF;
 }
 
@@ -1674,7 +1697,7 @@ static bool dev_any_input_enabled() {
  * closes a shared device this self-heals by reopening next frame). This does NOT
  * disturb per-slot routing — SDL returns the same handle for an already-open
  * device, so reads are shared and harmless. */
-static uint16_t dev_all_controllers_buttons() {
+static uint16_t dev_all_controllers_buttons(bool suppress_stick_axes) {
     uint16_t btn = 0xFFFF;
     const int n = SDL_NumJoysticks();
     for (int i = 0; i < n; i++) {
@@ -1682,7 +1705,7 @@ static uint16_t dev_all_controllers_buttons() {
         SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
         SDL_GameController* h = SDL_GameControllerFromInstanceID(inst);
         if (!h) h = SDL_GameControllerOpen(i);   /* open once; SDL keeps it */
-        if (h) btn &= controller_pad_buttons(h);
+        if (h) btn &= controller_pad_buttons(h, suppress_stick_axes);
     }
     return btn;
 }
@@ -1766,38 +1789,57 @@ static void sample_pad_into_sio(int override) {
         const bool dev_here = (dev_any_input_enabled() && s == 0);
         if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
 
-        /* Buttons: merge the assigned device with the keyboard (PSX pad word is
-         * active-low, so AND combines "pressed on either source"). In dev mode P1
-         * also folds in the keyboard binds and EVERY connected controller. */
-        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
-        if (dev_here) {
-            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
-            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
-        }
-        sio_set_pad_state_slot(s, btn);
-
-        /* Resolve the pad type this frame. An assigned device keeps its configured
-         * mode (a launcher-selected analog DualShock stays analog, so its input
-         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
-         * device but dev-any-input on presents as HYBRID — boots analog like a
-         * DualShock and auto-drops to digital on the d-pad — so any plugged
-         * controller and the keyboard both navigate. */
+        /* Resolve the pad type this frame FIRST — the effective analog/digital
+         * state gates how the left stick is read for BOTH the button word and the
+         * analog axes below. An assigned device keeps its configured mode (a
+         * launcher-selected analog DualShock stays analog, so its input path / SIO
+         * handshake cadence is preserved exactly). A P1 with no assigned device but
+         * dev-any-input on presents as HYBRID — boots analog like a DualShock and
+         * auto-drops to digital on the d-pad — so any plugged controller and the
+         * keyboard both navigate. The hybrid latch reads raw device state, so it is
+         * safe to resolve here before the button word is built. */
         int mode;
         if (p.kind != 0)      mode = p.mode;
         else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
         else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
         int eff_analog;
-        uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
         if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
             eff_analog = 0;
         } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
             eff_analog = 1;
-            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
             if (hybrid_stick_active(p))                       p.hybrid_analog = true;
             else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
-            if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
+        }
+
+        /* Buttons: merge the assigned device with the keyboard (PSX pad word is
+         * active-low, so AND combines "pressed on either source"). In dev mode P1
+         * also folds in the keyboard binds and EVERY connected controller. When the
+         * pad presents as ANALOG this frame (eff_analog), the left/right analog-
+         * stick axes are suppressed as button sources so the stick drives ONLY the
+         * analog axes — the D-pad bits then come solely from the physical D-pad,
+         * exactly as on a real DualShock. This is what stops a dual-analog game's
+         * D-pad control (Ape Escape's camera rotate) from being spun by stick
+         * movement or centre drift. Digital mode keeps the stick->D-pad fold. */
+        const bool suppress_stick = (eff_analog != 0);
+        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player, suppress_stick)
+                                     : (uint16_t)0xFFFF;
+        if (dev_here) {
+            btn &= pad_from_keyboard(1);                        /* keyboard P1 binds  */
+            btn &= dev_all_controllers_buttons(suppress_stick); /* any plugged-in pad */
+        }
+        sio_set_pad_state_slot(s, btn);
+
+        /* Analog axes. Pinned-ANALOG folds the physical D-pad onto the left axes
+         * (fold_dpad) so the D-pad still moves stick-only games; HYBRID feeds the
+         * raw stick when currently analog (no fold — the D-pad drives its own
+         * digital path there); DIGITAL leaves the axes centred. */
+        uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+        if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
+            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
+        } else if (eff_analog) {  /* HYBRID, currently presenting analog */
+            pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
         /* Dev mode: fold the keyboard's stick binds AND any connected controller's
          * sticks onto the analog stick, so an analog-mode P1 steers from whatever
