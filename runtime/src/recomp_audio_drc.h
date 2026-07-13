@@ -39,8 +39,8 @@ typedef struct {
     double host_rate;       /* host device sample rate (Hz)                     */
     int    taps;            /* prototype length; 16 min, 32 preferred          */
     int    phases;          /* fractional phases; 256-1024 (512 default)       */
-    double target_ms;       /* steady-state ring fill target (default 160)     */
-    double ring_ms;         /* ring capacity in ms (default 250)               */
+    double target_ms;       /* steady-state ring fill target (default 180)     */
+    double ring_ms;         /* ring capacity in ms (default 280)               */
     double kp;              /* proportional gain (default 0.02)                */
     double ki_per_s;        /* optional integral gain per second (default 0):
                                P-only is bounded and cannot wind up across
@@ -50,7 +50,7 @@ typedef struct {
     double slew_pp_per_s;   /* correction slew, percent-points/sec (default 0.75) */
     double deadband_ms;     /* +/- band around target with no correction (1.0)  */
     double em_low_ms;       /* below this = underrun emergency (default 12)     */
-    double em_high_ms;      /* above this = overflow emergency (default 105)    */
+    double em_high_ms;      /* above this = overflow emergency (default 235)    */
 } rab_config;
 
 typedef struct {
@@ -143,12 +143,14 @@ void rab_config_defaults(rab_config *c) {
     c->taps           = 32;
     c->phases         = 512;
     /* Streamed stage transitions can pause PSX audio production for ~140 ms
-     * while guest cadence catches up inside the same reporting window. Keep a
-     * measured 160 ms reserve; sustained slow emulation still drains it and
-     * remains visible in telemetry. The existing 250 ms ring leaves 90 ms of
-     * overflow headroom without changing guest timing or presentation. */
-    c->target_ms      = 160.0;
-    c->ring_ms        = 250.0;
+     * while guest cadence catches up inside the same reporting window. A
+     * 160 ms target proved just short once: the 1024-frame host callback
+     * crossed the remaining edge and emitted 216 faded frames (4.9 ms).
+     * Keep 180 ms so the measured pause retains more than one callback of
+     * reserve. Sustained slow emulation still drains it and remains visible
+     * in telemetry. A 280 ms ring preserves 100 ms of overflow headroom. */
+    c->target_ms      = 180.0;
+    c->ring_ms        = 280.0;
     c->kp             = 0.02;
     /* P-only intentionally: the former 0.02/s integral retained a +0.5%
      * correction after transition bursts and drained a steady 59.94 Hz
@@ -160,7 +162,7 @@ void rab_config_defaults(rab_config *c) {
     c->slew_pp_per_s  = 0.75;
     c->deadband_ms    = 1.0;
     c->em_low_ms      = 12.0;
-    c->em_high_ms     = 205.0;
+    c->em_high_ms     = 235.0;
 }
 
 int rab_init(rab_bridge *b, const rab_config *cfg) {
