@@ -46,7 +46,24 @@ struct RootDirectoryInfo {
 struct CDTrack {
     int      number;     // 1-based track number
     bool     is_audio;   // true = CD-DA audio (Red Book); false = data
-    uint32_t start_lba;  // .bin-relative start LBA (cue INDEX 01; track 1 = 0)
+    uint32_t start_lba;  // disc-relative start LBA (cue INDEX 01; track 1 = 0).
+                         // Single-FILE cues: equals the .bin-relative INDEX time.
+                         // Multi-FILE cues (redump "(Track N).bin" dumps): the
+                         // owning file's first disc sector plus its INDEX time.
+};
+
+/**
+ * One BINARY file backing a contiguous run of disc sectors. Single-file
+ * images have exactly one segment; redump-style dumps have one per track
+ * file, concatenated in cue order to form the flat disc-sector space that
+ * ReadSector()/ReadRawSector() address.
+ */
+struct BinSegment {
+    std::string   path;          // resolved on-disk path
+    std::ifstream file;          // opened for the reader's lifetime
+    uint32_t      start_lba;     // first disc-relative sector of this file
+    uint32_t      sector_count;  // sectors stored in this file
+    bool          raw;           // 2352-byte raw sectors (BIN) vs 2048 (ISO)
 };
 
 class ISOReader {
@@ -187,12 +204,18 @@ private:
      */
     std::vector<ISOFileEntry> ListFilesByLBA(uint32_t lba, uint32_t dir_size);
 
-    std::ifstream file_;
+    /**
+     * Helper: find the BinSegment containing a disc-relative LBA.
+     * @return segment pointer, or nullptr when lba is past the disc end
+     */
+    BinSegment* SegmentForLBA(uint32_t lba);
+
     bool is_open_;
     std::string volume_id_;
-    std::string bin_path_;
+    std::string bin_path_;          // first (data) segment; kept for callers
     RootDirectoryInfo root_dir_;
     std::vector<CDTrack> tracks_;   // from the .cue TOC; >=1 entry after Open()
+    std::vector<BinSegment> segments_;  // cue FILE entries in disc order; >=1 after Open()
 };
 
 } // namespace PS1

@@ -782,6 +782,16 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
     // Anchor on the exe directory — never cwd (see exe_dir_from_argv).
     fs::path found = find_upward(exe_dir_from_argv(argv0), p);
     if (!found.empty()) return found / p;
+
+    // Dev-checkout rung: game projects keep the framework at
+    // <game root>/psxrecomp-v4 (junction/worktree), so a relative default like
+    // "bios/SCPH1001.BIN" lives under that prefix rather than at the game root.
+    // A user install has no psxrecomp-v4 directory, so this rung cannot
+    // resolve a build-machine BIOS there — it falls through to bios.cfg or the
+    // interactive picker.
+    const fs::path dev_marker = fs::path("psxrecomp-v4") / p;
+    found = find_upward(exe_dir_from_argv(argv0), dev_marker);
+    if (!found.empty()) return found / dev_marker;
     return p;
 }
 
@@ -2930,6 +2940,27 @@ int main(int argc, char** argv) {
             exe_dir_from_argv(argv[0]) / "settings.toml";
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
+        if (us.parse_error) {
+            /* The file exists but is not valid TOML: every setting in it (the
+             * user's renderer choice, BIOS/disc paths, ...) is being ignored,
+             * and any later launcher save would overwrite it with defaults.
+             * Preserve their file and say so loudly instead of both failing
+             * silently (GH Tomba2Recomp#1 triage: a stray character disabled a
+             * user's whole settings file with no indication anywhere). */
+            std::error_code rn_ec;
+            std::filesystem::path bad = settings_path;
+            bad += ".bad";
+            std::filesystem::remove(bad, rn_ec);
+            rn_ec.clear();
+            std::filesystem::rename(settings_path, bad, rn_ec);
+            launcher_warning("Settings file ignored",
+                "settings.toml has a TOML syntax error, so ALL settings in it were "
+                "ignored this run (renderer, BIOS/disc paths, everything).\n\n" +
+                (rn_ec ? "The broken file was left at:\n" + settings_path.string()
+                       : "The broken file was preserved as:\n" + bad.string()) +
+                "\n\nFix the syntax error and restore the file, or set your options "
+                "again from the launcher (a fresh settings.toml will be written).");
+        }
         if (us.has_skip_launcher)  skip_launcher_setting = us.skip_launcher;
         if (us.has_renderer)       g_video_renderer  = us.renderer;
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
