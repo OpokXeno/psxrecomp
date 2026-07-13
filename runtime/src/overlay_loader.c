@@ -404,6 +404,98 @@ static uint32_t cand_gensum(const Candidate *c) {
     return s;
 }
 
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+/* Static-overlay validation uses the same exact-code-range contract as the
+ * dynamic DLL loader. Generated code passes immutable {phys_lo, len} pairs and
+ * the CRC of the bytes it was compiled from. A page-generation cache keeps the
+ * hot path O(number of ranges), without re-hashing unchanged code each call. */
+#define STATIC_MATCH_CACHE_CAP 4096u
+typedef struct {
+    const uint32_t *ranges;
+    uint32_t count;
+    uint32_t expected_crc;
+    uint32_t gen_sum;
+    int      matches;
+} StaticMatchCache;
+
+static StaticMatchCache s_static_match_cache[STATIC_MATCH_CACHE_CAP];
+static uint64_t s_static_match_rehashes = 0;
+static uint64_t s_static_match_crc_misses = 0;
+static uint64_t s_static_match_gen_fastpath = 0;
+
+int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
+                                    uint32_t count,
+                                    uint32_t expected_crc) {
+    const uint8_t *ram = memory_get_ram_ptr();
+    if (!ram || !lo_len_pairs || count == 0u || count > 4096u) {
+        s_static_match_crc_misses++;
+        return 0;
+    }
+
+    uint32_t gen_sum = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (len == 0u || lo >= 2u * 1024u * 1024u ||
+            len > 2u * 1024u * 1024u - lo) {
+            s_static_match_crc_misses++;
+            return 0;
+        }
+        gen_sum += overlay_watch_pagegen_sum(lo, len);
+    }
+
+    uintptr_t raw = (uintptr_t)lo_len_pairs;
+    uint32_t slot = (uint32_t)(((raw >> 4) ^ (raw >> 19) ^ expected_crc ^
+                                (count * 0x9E3779B9u)) &
+                               (STATIC_MATCH_CACHE_CAP - 1u));
+    StaticMatchCache *entry = NULL;
+    for (uint32_t probe = 0; probe < STATIC_MATCH_CACHE_CAP; probe++) {
+        StaticMatchCache *candidate =
+            &s_static_match_cache[(slot + probe) & (STATIC_MATCH_CACHE_CAP - 1u)];
+        if (!candidate->ranges ||
+            (candidate->ranges == lo_len_pairs &&
+             candidate->count == count &&
+             candidate->expected_crc == expected_crc)) {
+            entry = candidate;
+            break;
+        }
+    }
+
+    if (entry && entry->ranges && entry->gen_sum == gen_sum) {
+        s_static_match_gen_fastpath++;
+        return entry->matches;
+    }
+
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        crc = crc32_update(crc, ram + lo, len);
+    }
+    crc ^= 0xFFFFFFFFu;
+    int matches = (crc == expected_crc) ? 1 : 0;
+    s_static_match_rehashes++;
+    if (!matches) s_static_match_crc_misses++;
+
+    if (entry) {
+        entry->ranges = lo_len_pairs;
+        entry->count = count;
+        entry->expected_crc = expected_crc;
+        entry->gen_sum = gen_sum;
+        entry->matches = matches;
+    }
+    return matches;
+}
+
+void overlay_loader_static_match_stats(uint64_t *rehashes,
+                                       uint64_t *crc_misses,
+                                       uint64_t *gen_fastpath) {
+    if (rehashes) *rehashes = s_static_match_rehashes;
+    if (crc_misses) *crc_misses = s_static_match_crc_misses;
+    if (gen_fastpath) *gen_fastpath = s_static_match_gen_fastpath;
+}
+#endif
+
 /* ---- Per-DLL code-range manifest --------------------------------------- */
 /* Minimal line format emitted by tools/compile_overlays.py beside each DLL:
  *   F <entry_hex>            start a function (entry = virtual export addr)
@@ -3184,7 +3276,8 @@ static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_
 #ifdef PSX_HAS_GAME_DISPATCH
     /* Skip the compiled game function when its target is no longer native-safe;
      * fall through to the native/interp paths that run the live RAM bytes. */
-    if (dirty_ram_text_native_ok(target & 0x1FFFFFFFu)) {
+    extern int psx_game_text_native_ok(uint32_t addr);
+    if (psx_game_text_native_ok(target)) {
         extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
         cpu->pc = 0;
         int prev_phase = g_exec_phase;

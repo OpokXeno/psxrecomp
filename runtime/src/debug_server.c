@@ -2371,9 +2371,13 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
+    extern uint32_t dirty_ram_text_modified_bitmap_word(uint32_t word_index);
+    extern uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index);
+    extern void dirty_ram_text_exact_mismatch_stats(uint64_t *count,
+                                                     uint32_t out[5]);
     (void)json;
 
-    char buf[16 * 1024];
+    char buf[32 * 1024];
     int n = snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
@@ -2400,7 +2404,8 @@ static void handle_dirty_ram_stats(int id, const char *json)
                       (unsigned long long)e->insns,
                       (unsigned long long)e->entry_hits);
         first = 0;
-        if (n >= (int)sizeof(buf) - 128) break;
+        /* Reserve enough tail room for all bitmap/guard diagnostics below. */
+        if (n >= (int)sizeof(buf) - 2048) break;
     }
     n += snprintf(buf + n, sizeof(buf) - n, "],\"dirty_bitmap_words\":[");
     uint32_t word_count = dirty_ram_get_bitmap_word_count();
@@ -2409,6 +2414,41 @@ static void handle_dirty_ram_stats(int id, const char *json)
                       "%s\"0x%08X\"",
                       i == 0 ? "" : ",",
                       (unsigned)dirty_ram_get_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
+    uint64_t exact_mismatches = 0;
+    uint32_t exact_last[5] = {0};
+    dirty_ram_text_exact_mismatch_stats(&exact_mismatches, exact_last);
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "],\"text_native_blocked\":%llu,"
+                  "\"text_diverged_pages\":%u,"
+                  "\"text_exact_mismatches\":%llu,"
+                  "\"text_exact_last_range\":\"0x%08X\","
+                  "\"text_exact_last_len\":%u,"
+                  "\"text_exact_last_mismatch\":\"0x%08X\","
+                  "\"text_exact_last_live\":%u,"
+                  "\"text_exact_last_ref\":%u,"
+                  "\"text_modified_bitmap_words\":[",
+                  (unsigned long long)dirty_ram_text_native_blocked(),
+                  (unsigned)dirty_ram_text_diverged_pages(),
+                  (unsigned long long)exact_mismatches,
+                  (unsigned)exact_last[0], (unsigned)exact_last[1],
+                  (unsigned)exact_last[2], (unsigned)exact_last[3],
+                  (unsigned)exact_last[4]);
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_text_modified_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "],\"text_diverged_bitmap_words\":[");
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_text_diverged_bitmap_word(i));
         if (n >= (int)sizeof(buf) - 64) break;
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
@@ -10694,7 +10734,7 @@ static void handle_overlay_loader_status(int id, const char *json)
         if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
         esc_msg[di++] = msg[si];
     }
-    char buf[2048];
+    char buf[4096];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
         "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
@@ -10753,6 +10793,32 @@ static void handle_overlay_loader_status(int id, const char *json)
         n += snprintf(buf + n, sizeof(buf) - n,
             ",\"image_warm_loaded\":%ld,\"image_warm_pending\":%ld",
             g_overlay_image_warm_loaded, g_overlay_image_warm_pending);
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+        {
+            uint64_t checks=0, hits=0, variant_misses=0, address_misses=0;
+            uint64_t rehashes=0, crc_misses=0, static_gen_fastpath=0;
+            extern void psx_overlay_static_get_stats(uint64_t *, uint64_t *,
+                                                     uint64_t *, uint64_t *);
+            extern void overlay_loader_static_match_stats(uint64_t *, uint64_t *,
+                                                          uint64_t *);
+            psx_overlay_static_get_stats(&checks, &hits, &variant_misses,
+                                         &address_misses);
+            overlay_loader_static_match_stats(&rehashes, &crc_misses,
+                                              &static_gen_fastpath);
+            n += snprintf(buf + n, sizeof(buf) - n,
+                ",\"static_checks\":%llu,\"static_hits\":%llu,"
+                "\"static_variant_misses\":%llu,\"static_address_misses\":%llu,"
+                "\"static_rehashes\":%llu,\"static_crc_misses\":%llu,"
+                "\"static_gen_fastpath\":%llu",
+                (unsigned long long)checks,
+                (unsigned long long)hits,
+                (unsigned long long)variant_misses,
+                (unsigned long long)address_misses,
+                (unsigned long long)rehashes,
+                (unsigned long long)crc_misses,
+                (unsigned long long)static_gen_fastpath);
+        }
+#endif
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);

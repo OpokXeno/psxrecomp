@@ -1107,6 +1107,15 @@ void psx_check_interrupts(CPUState* cpu) {
         uint32_t hi_val = (w0 & 0xFFFF) << 16;
         int16_t lo_val = (int16_t)(w1 & 0xFFFF);
         target_pc = hi_val + (uint32_t)(int32_t)lo_val;
+        /* The RAM exception vector is a LUI/ADDIU pair that materializes the
+         * installed handler address in $k0 before transferring to it.  The
+         * host-side fast path decodes that pair and dispatches straight to the
+         * target, so it must also commit the pair's architectural register
+         * result.  Vigilante 8's handler uses $k0 as its table base on its very
+         * first instruction; leaving the interrupted value in $k0 made it load
+         * a BIOS instruction word (0xAD400000) as a jump target. */
+        uint32_t vector_reg = (w1 >> 16) & 31u;
+        if (vector_reg != 0u) cpu->gpr[vector_reg] = target_pc;
     }
 
     /* Record which fiber owns this setjmp. Any subsequent longjmp must
