@@ -313,27 +313,25 @@ profile pattern is continuing to grow.
 ## First-wave implementation branches
 
 The first wave was rebuilt in isolated worktrees from current `master`, reviewed
-through `2026-07-13T22:00:00-07:00`, and published only as draft PRs. Each branch
+through `2026-07-13T22:00:00-07:00`, and initially published as draft PRs. Each branch
 has an in-tree `docs/internal/upstream/` record linking its exact source,
 preserving human credit, and listing related material deliberately excluded.
 
-| Draft PR / branch | Implementation commit | Evaluated source | Last evaluated | Validation / state |
+| PR / branch | Implementation commit | Evaluated source | Last evaluated | Validation / state |
 |---|---|---|---|---|
 | [#20 `fix/cdrom-encoded-interrupts-kem0x`](https://github.com/mstan/psxrecomp/pull/20) | [`52eb8e8a`](https://github.com/mstan/psxrecomp/commit/52eb8e8a24ca3715afc835b1994f69e269bf4796) | [PR #14 `dd9e5c6`](https://github.com/mstan/psxrecomp/commit/dd9e5c65073dd41fbac2d965d2f945a866ec59e2) | `2026-07-13` | Focused mask test and standalone compile pass; Kareem co-author |
 | [#17 `fix/spu-end-mute-kem0x`](https://github.com/mstan/psxrecomp/pull/17) | [`76ddcc00`](https://github.com/mstan/psxrecomp/commit/76ddcc008a72b1dbb8d9bee227e02ae6549caa99) | [PR #14 `b2597df`](https://github.com/mstan/psxrecomp/commit/b2597df6d5905a0e183b5309a9b84720cd417e19) | `2026-07-13` | Runtime behavior already on master; new END/REPEAT regression passes; Kareem co-author |
 | [#23 `fix/overlay-init-guard-shaneomac`](https://github.com/mstan/psxrecomp/pull/23) | [`5b8098a9`](https://github.com/mstan/psxrecomp/commit/5b8098a9d997424cbd57829b8ae11369ab06935a) | [PR #16 `e6809cc`](https://github.com/mstan/psxrecomp/commit/e6809ccf7d778a4c2f32d9e27c0ec31a44cbd2ba) | `2026-07-13` | Pre-init regression and standalone compile pass; source co-authors preserved |
 | [#21 `fix/msvc-generated-init-shaneomac`](https://github.com/mstan/psxrecomp/pull/21) | [`05d4f35b`](https://github.com/mstan/psxrecomp/commit/05d4f35bd6314d56ac95e6cec4b90655950dbd86) | [PR #16 `df4cc5c`](https://github.com/mstan/psxrecomp/commit/df4cc5c70ab1e5d0fd2a8f817dd346905d4d0eeb) | `2026-07-13` | MSVC game/BIOS/test builds, 44/44 L2, and 63 runtime objects; original author preserved |
-| [#18 `fix/posix-overlay-export-scan-douglas`](https://github.com/mstan/psxrecomp/pull/18) | [`c0fa9b1e`](https://github.com/mstan/psxrecomp/commit/c0fa9b1e89fb6c210011dc25a92b124df43692d4) | [`df7d1fa`](https://github.com/douglasjv/psxrecomp-tweaks/commit/df7d1faa5f27be0ba357463a763c77efc43e1f91), [`7abbfdf`](https://github.com/douglasjv/psxrecomp-tweaks/commit/7abbfdf38b488d3764b96c155549bc930e0521b6) | `2026-07-13` | Real Linux shared-library fixture and Windows compile pass; awaiting Douglas review |
-| [#22 `feat/config-guarded-mips-patches-douglas`](https://github.com/mstan/psxrecomp/pull/22) | [`5f62deda`](https://github.com/mstan/psxrecomp/commit/5f62dedaa3bddfdae6903524449215caa0b612f5) | [PR #15 `19001c0`](https://github.com/douglasjv/psxrecomp-tweaks/commit/19001c0a383edde439988b93eb2385e2d789d350) | `2026-07-13` | Patch CTest 2/2 (including C++17 public-header coverage), L2 44/44, combined Tomba 2/MMX6/Ape builds; awaiting Douglas review |
-| [#19 `feat/reachable-main-discovery-douglas`](https://github.com/mstan/psxrecomp/pull/19) | [`bd705bfc`](https://github.com/mstan/psxrecomp/commit/bd705bfcecff91a3c0832ccd01b0504c54b100b1) | [MM8 `8415f3a`](https://github.com/douglasjv/mm8/commit/8415f3a95458c41c7f48fbe36caaf0ee82730720) | `2026-07-13` | Parser/codegen tests, L2 44/44, overlay/static guard pass; awaiting Douglas review |
+| [#18 `fix/posix-overlay-export-scan-douglas`](https://github.com/mstan/psxrecomp/pull/18) | [`c0fa9b1e`](https://github.com/mstan/psxrecomp/commit/c0fa9b1e89fb6c210011dc25a92b124df43692d4) | [`df7d1fa`](https://github.com/douglasjv/psxrecomp-tweaks/commit/df7d1faa5f27be0ba357463a763c77efc43e1f91), [`7abbfdf`](https://github.com/douglasjv/psxrecomp-tweaks/commit/7abbfdf38b488d3764b96c155549bc930e0521b6) | `2026-07-13` | Real Linux shared-library fixture and Windows compile pass; merged with author approval |
+| [#22 `feat/config-guarded-mips-patches-douglas`](https://github.com/mstan/psxrecomp/pull/22) | [`5f62deda`](https://github.com/mstan/psxrecomp/commit/5f62dedaa3bddfdae6903524449215caa0b612f5) | [PR #15 `19001c0`](https://github.com/douglasjv/psxrecomp-tweaks/commit/19001c0a383edde439988b93eb2385e2d789d350) | `2026-07-13` | Patch CTest 2/2 (including C++17 public-header coverage), L2 44/44, combined game builds; merged with author approval |
+| [#19 `feat/reachable-main-discovery-douglas`](https://github.com/mstan/psxrecomp/pull/19) | [`bd705bfc`](https://github.com/mstan/psxrecomp/commit/bd705bfcecff91a3c0832ccd01b0504c54b100b1) | [MM8 `8415f3a`](https://github.com/douglasjv/mm8/commit/8415f3a95458c41c7f48fbe36caaf0ee82730720) | `2026-07-13` | Parser/codegen tests, L2 44/44, overlay/static guard pass; merged with author approval |
 
-No draft above should be merged until its source attribution and adapted scope
-are accepted. In particular, the Douglas-derived drafts explicitly await
-Douglas's review and say-so.
+The Douglas-derived changes were merged with author approval.
 
 ## Disposable combined regression exercise
 
-The draft branches were combined only in the unpushed local branch
+The PR branches were combined only in the unpushed local branch
 `test/ecosystem-wave-integration` at `bed0c08048b954f7f76d6a44bd97ce1eb40688f8`.
 This is a test fixture based on unchanged `master` `dde268dc`; it is not a
 merge proposal. The exercise was evaluated through
@@ -363,7 +361,7 @@ harness anomaly: Ape Escape's wall-clock starvation watchdog aborted at frame
 268 after the process received no heartbeat opportunity for 6.59 seconds. It
 had completed the earlier parallel soak, and it immediately passed the isolated
 4,418-frame rerun above. Treat this as host-contention evidence when scheduling
-parallel soaks, not as a reproducible guest or draft-branch failure; retain the
+parallel soaks, not as a reproducible guest or PR-branch failure; retain the
 crash report and starvation dump in the temporary Ape test worktree.
 
 ## Remaining upstream branch queue
