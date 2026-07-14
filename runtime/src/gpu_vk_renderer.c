@@ -183,6 +183,44 @@ static VkBuffer       s_pending_buf[PENDING_STAGING_MAX];
 static VkDeviceMemory s_pending_mem[PENDING_STAGING_MAX];
 static int            s_pending_n;
 
+#define STAGING_CACHE_MAX 16
+typedef struct {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    VkDeviceSize size;
+    void *map;
+    int busy;
+} StagingCacheEntry;
+static StagingCacheEntry s_staging_cache[STAGING_CACHE_MAX];
+
+static void staging_release(VkBuffer buf, VkDeviceMemory mem) {
+    for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
+        if (s_staging_cache[i].buf == buf && s_staging_cache[i].mem == mem) {
+            s_staging_cache[i].busy = 0;
+            return;
+        }
+    }
+    p_vkUnmapMemory(s_dev, mem);
+    p_vkDestroyBuffer(s_dev, buf, NULL);
+    p_vkFreeMemory(s_dev, mem, NULL);
+}
+
+static void staging_destroy(VkBuffer buf, VkDeviceMemory mem) {
+    for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
+        StagingCacheEntry *entry = &s_staging_cache[i];
+        if (entry->buf == buf && entry->mem == mem) {
+            if (entry->map) p_vkUnmapMemory(s_dev, mem);
+            p_vkDestroyBuffer(s_dev, buf, NULL);
+            p_vkFreeMemory(s_dev, mem, NULL);
+            memset(entry, 0, sizeof *entry);
+            return;
+        }
+    }
+    p_vkUnmapMemory(s_dev, mem);
+    p_vkDestroyBuffer(s_dev, buf, NULL);
+    p_vkFreeMemory(s_dev, mem, NULL);
+}
+
 static VkSwapchainKHR   s_swapchain;
 static VkFormat         s_sc_format;
 static VkExtent2D       s_sc_extent;
@@ -567,8 +605,7 @@ static void vk_gpu_sync_internal(void) {
         s_work_pending = 0;
     }
     for (int i = 0; i < s_pending_n; i++) {
-        p_vkDestroyBuffer(s_dev, s_pending_buf[i], NULL);
-        p_vkFreeMemory(s_dev, s_pending_mem[i], NULL);
+        staging_release(s_pending_buf[i], s_pending_mem[i]);
     }
     s_pending_n = 0;
     s_ds_blit_idx = 0;
@@ -1321,6 +1358,10 @@ void vk_renderer_shutdown(void) {
     p_vkDeviceWaitIdle(s_dev);
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
     cpres_cache_free();       /* FMV CPU-present cached image + staging */
+    for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
+        if (s_staging_cache[i].buf)
+            staging_destroy(s_staging_cache[i].buf, s_staging_cache[i].mem);
+    }
     wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
     for (int i = 0; i < PIPE_CACHE_N; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
@@ -1523,8 +1564,11 @@ static int            s_cpres_w = 0, s_cpres_h = 0;
 static void cpres_cache_free(void) {
     if (s_cpres_img)  { p_vkDestroyImage(s_dev, s_cpres_img, NULL);  s_cpres_img = VK_NULL_HANDLE; }
     if (s_cpres_imem) { p_vkFreeMemory(s_dev, s_cpres_imem, NULL);   s_cpres_imem = VK_NULL_HANDLE; }
-    if (s_cpres_buf)  { p_vkDestroyBuffer(s_dev, s_cpres_buf, NULL); s_cpres_buf = VK_NULL_HANDLE; }
-    if (s_cpres_mem)  { p_vkFreeMemory(s_dev, s_cpres_mem, NULL);    s_cpres_mem = VK_NULL_HANDLE; }
+    if (s_cpres_buf)  {
+        staging_destroy(s_cpres_buf, s_cpres_mem);
+        s_cpres_buf = VK_NULL_HANDLE;
+        s_cpres_mem = VK_NULL_HANDLE;
+    }
     s_cpres_map = NULL; s_cpres_w = s_cpres_h = 0;
     s_cpres_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 }
@@ -1767,6 +1811,22 @@ static void bind_masked_stencil_only(VkCommandBuffer cb, int prog, int topo, int
 
 /* Host-visible staging buffer (TRANSFER_SRC). */
 static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, void **map) {
+    int best = -1;
+    for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
+        StagingCacheEntry *entry = &s_staging_cache[i];
+        if (!entry->busy && entry->buf && entry->size >= bytes &&
+            (best < 0 || entry->size < s_staging_cache[best].size))
+            best = i;
+    }
+    if (best >= 0) {
+        StagingCacheEntry *entry = &s_staging_cache[best];
+        entry->busy = 1;
+        *buf = entry->buf;
+        *mem = entry->mem;
+        *map = entry->map;
+        return 1;
+    }
+
     VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -1780,13 +1840,27 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, 
         p_vkDestroyBuffer(s_dev, *buf, NULL); return 0;
     }
     p_vkBindBufferMemory(s_dev, *buf, *mem, 0);
-    p_vkMapMemory(s_dev, *mem, 0, bytes, 0, map);
+    if (p_vkMapMemory(s_dev, *mem, 0, bytes, 0, map) != VK_SUCCESS) {
+        p_vkDestroyBuffer(s_dev, *buf, NULL);
+        p_vkFreeMemory(s_dev, *mem, NULL);
+        return 0;
+    }
+    for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
+        if (!s_staging_cache[i].buf) {
+            s_staging_cache[i].buf = *buf;
+            s_staging_cache[i].mem = *mem;
+            s_staging_cache[i].size = bytes;
+            s_staging_cache[i].map = *map;
+            s_staging_cache[i].busy = 1;
+            break;
+        }
+    }
     s_perf_cur.allocs++;
     s_perf_cur.alloc_kb += (uint32_t)(bytes / 1024);
     return 1;
 }
 static void free_staging(VkBuffer buf, VkDeviceMemory mem) {
-    p_vkDestroyBuffer(s_dev, buf, NULL); p_vkFreeMemory(s_dev, mem, NULL);
+    staging_release(buf, mem);
 }
 
 /* hr -> raw mirror: pack the dirty rect via the compute pass (top-left sample of
@@ -1885,7 +1959,6 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) 
     VkBuffer rbuf; VkDeviceMemory rmem; void *rmap;
     if (make_staging((VkDeviceSize)w * h * 2, &rbuf, &rmem, &rmap)) {
         memcpy(rmap, data, (size_t)w * h * 2);
-        p_vkUnmapMemory(s_dev, rmem);
         VkCommandBuffer cb = begin_oneshot();
         img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy rc = {0};
@@ -1903,7 +1976,6 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) 
     if (make_staging((VkDeviceSize)w * h * 4, &ubuf, &umem, &umap)) {
         uint8_t *m = (uint8_t*)umap;
         for (int i = 0; i < w * h; i++) rgb555_to_rgba8(data[i], m + (size_t)i * 4);
-        p_vkUnmapMemory(s_dev, umem);
         VkCommandBuffer cb = begin_oneshot();
         img_to(cb, s_up_img, &s_up_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy uc = {0};
@@ -1953,7 +2025,6 @@ static void flush_cpu_upload(void) {
     if (!make_staging((VkDeviceSize)total * 2, &rbuf, &rmem, &rmap)) return;
     VkBuffer ubuf; VkDeviceMemory umem; void *umap;
     if (!make_staging((VkDeviceSize)total * 4, &ubuf, &umem, &umap)) {
-        p_vkUnmapMemory(s_dev, rmem);
         defer_staging(rbuf, rmem);
         return;
     }
@@ -1986,8 +2057,6 @@ static void flush_cpu_upload(void) {
          * VkBufferImageCopy offsets at two modulo four bytes. */
         texoff += vk_upload_aligned_texels((size_t)w * h);
     }
-    p_vkUnmapMemory(s_dev, rmem);
-    p_vkUnmapMemory(s_dev, umem);
 
     /* Submit 1: both image copy sets. */
     VkCommandBuffer cb = begin_oneshot();
