@@ -1400,7 +1400,12 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
 
 static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
     p_vkEndCommandBuffer(cb);
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    /* Present command buffers write the acquired swapchain image with
+     * transfer barriers, clears, and blits. Waiting only at color attachment
+     * output does not order those operations after presentation-engine
+     * release on stricter drivers. */
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s_sem_acquire[fr];
     si.pWaitDstStageMask = &wait_stage;
