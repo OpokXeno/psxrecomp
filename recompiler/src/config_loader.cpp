@@ -703,6 +703,16 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                             ? toml::find<bool>(recomp, "strict")
                             : true;
 
+    const std::string discovery =
+        recomp.contains("discovery")
+            ? toml::find<std::string>(recomp, "discovery")
+            : std::string{"whole-image"};
+    if (discovery != "whole-image" && discovery != "reachable") {
+        throw std::runtime_error(fmt::format(
+            "{}: [recompiler].discovery must be 'whole-image' or 'reachable'",
+            config_path.string()));
+    }
+
     std::string out_stem;
     if (recomp.contains("out_stem")) {
         out_stem = toml::find<std::string>(recomp, "out_stem");
@@ -986,6 +996,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*bios_thunks_path*/ bios_thunks_path,
         /*out_dir*/          out_dir,
         /*strict*/           strict,
+        /*discovery*/        discovery,
         /*out_stem*/         out_stem,
         /*recompiler_patches*/ recompiler_patches,
         /*runtime*/          parse_runtime_block(cfg, root),

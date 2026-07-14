@@ -245,3 +245,16 @@ if(BUILD_TESTING)
     add_test(NAME recompiler_patch_cxx17_header_test
              COMMAND recompiler_patch_cxx17_header_test)
 endif()
+
+# Reachable main-EXE discovery test: parser-bound validation plus exact-entry
+# analysis behavior for direct, indirect, seeded, and out-of-bound targets.
+add_executable(reachable_discovery_test
+    tests/reachable_discovery_test.cpp
+    src/function_analysis.cpp
+    src/ps1_exe_parser.cpp
+)
+target_include_directories(reachable_discovery_test PRIVATE
+    include
+    lib/fmt/include
+)
+target_link_libraries(reachable_discovery_test PRIVATE fmt)

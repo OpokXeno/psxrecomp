@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
     const char*           extra_funcs_path = nullptr;
     bool                  inspect_mode = false;
     bool                  overlay_mode = false;
+    bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
@@ -139,10 +140,13 @@ int main(int argc, char** argv) {
                           ws_bg2d_cap_site = 0,
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
+    uint32_t              configured_text_size = 0;
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
         exe_path             = cfg.exe_path;
+        configured_text_size = cfg.text_size;
+        reachable_discovery  = cfg.discovery == "reachable";
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
@@ -257,7 +261,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Patch the parsed image before discovery/CFG analysis so replacements of
+    // [game].text_size is the title-owned static-analysis bound. It may trim a
+    // verified data/padding tail, but it may never widen the parsed payload or
+    // exclude the executable entry. Runtime disc loading remains unchanged.
+    if (!config_path.empty()) {
+        const uint32_t parsed_size = exe->header.file_size;
+        std::string bound_error;
+        if (!PSXRecomp::apply_static_analysis_bound(
+                *exe, configured_text_size, bound_error)) {
+            fmt::print(stderr, "Invalid static analysis bound: {}\n", bound_error);
+            return 1;
+        }
+        if (exe->header.file_size < parsed_size) {
+            fmt::print("Static analysis bound: 0x{:X} bytes from game.text_size "
+                       "(PS-X EXE header: 0x{:X})\n",
+                       exe->header.file_size, parsed_size);
+        }
+    }
+
+    // Patch the bounded image before discovery/CFG analysis so replacements of
     // control-flow instructions cannot disagree with the generated graph.
     PSXRecompV4::apply_recompiler_patches_to_executable(
         *exe, instruction_patches, overlay_mode);
@@ -436,8 +458,8 @@ int main(int argc, char** argv) {
 
     PSXRecomp::FunctionAnalysisResult analysis_result;
 
-    if (overlay_mode) {
-        // ── Overlay exact mode: partition seeds into walk roots and interior
+    if (overlay_mode || reachable_discovery) {
+        // ── Exact-entry mode: partition seeds into walk roots and interior
         // alias candidates. `interior`-marked seeds (classifier-proven
         // dispatch targets without a callable boundary) are NEVER walk roots —
         // a root inside a host function hard-caps (truncates) it, the
@@ -462,7 +484,11 @@ int main(int argc, char** argv) {
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
         for (uint32_t a : exact_entries) {
-            if (trusted_root_seeds.count(a)) {
+            if (reachable_discovery && a == exe->header.initial_pc) {
+                // The PS-X EXE header is direct execution evidence for the
+                // main entry even when it uses a nonstandard prologue.
+                roots.insert(a);
+            } else if (trusted_root_seeds.count(a)) {
                 /* Classifier-proven dispatch root (install-slot class): the
                  * static code tail-dispatches into this PC, so it is a real
                  * execution root despite having no callable boundary. */
@@ -555,7 +581,7 @@ int main(int argc, char** argv) {
                        "(range-ownership completeness)\n", jal_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
-        fmt::print("Overlay alias entries emitted: {}\n\n", alias_entries.size());
+        fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
     } else {
         // ── Iterative discovery: seed classification + static data-table scan ──
         //
