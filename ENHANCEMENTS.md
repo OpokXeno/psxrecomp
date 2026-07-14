@@ -287,6 +287,64 @@ All Tomba2, GL 16:9, worktree `_wt-tomba2-ipr` / `Tomba2Recomp` build-t2.
 - CAUTION: any pace numbers taken in diff mode before ISSUES.md #9's redesign
   lands are garbage (the wedged shadow silently disabled all native dispatch).
 
+## L1 — Load-time-toward-0 burndown (2026-07-14, ACTIVE — guinea pig: Tomba 1)
+
+Full analysis + gates/kill criteria: `docs/LOAD_TIME_ZERO.md` (this branch,
+`spike/load-time-zero`). ChatGPT consult merged (thread "PSXrecomp
+workspace"). Already-settled items are NOT re-tried: turbo_loads (shipped,
+~2x), disc_speed divisor 4x/instant (proven unsafe — MMX6 VSync-callback
+wedge), yield pumps r1/r2 (proven fatal — green-thread corruption), BIOS CD
+HLE (rejected — no landmine, no host win). The frame:
+`wall = guest_time x host_cost_per_guest_sec`; under turbo the window is
+emulation-throughput-bound, so the safe axis is host cost (multiplies with
+turbo), the risky axis is guest time.
+
+**Prioritized burndown (most agnostic + most likely beneficial first):**
+
+- [ ] **L1.0 — E0 `load_probe_v2`: load-window decomposition on Tomba 1.**
+  100% agnostic, zero risk, prices every bet below. Split a real pig-load
+  window into guest time (seek / sector cadence / per-sector processing /
+  explicit waits) and host time (native code / decompressors / interp /
+  CD-event machinery / SPU / GPU / pump). Existing rings first
+  (freeze_check, cdrom_bursts, dirty_ram_stats per_pc, phase_profile);
+  extend rings only where attribution is blind. Decisive question: why
+  only ~2x during a presentation-suppressed window? Thresholds: decomp
+  ≥~40% host → shards serious; ≤~8% → kill shards; CD/event/SPU machinery
+  dominates → L1.2; wall-clock limiter found → fix that first.
+- [ ] **L1.1 — Turbo hardening.** (a) re-validate SDL pump under a live
+  burst (fix appears in-tree: pump precedes the turbo early-return);
+  (b) audio at the HOST SINK only (drop excess samples, crossfade on
+  exit; never guest state); (c) root-cause MMX5 dev-tools+turbo 0xE10
+  boot wedge (foundation timing bug).
+- [ ] **L1.2 — Event-horizon acceleration + batched device ticking.**
+  Provably side-effect-free poll/idle regions jump to the next scheduled
+  observable event with exact cycle credit + identical event ordering;
+  devices advance to deadlines instead of per-block ticks. Attacks the
+  ~2x ceiling directly; class-level, all titles inherit. Gate set from
+  L1.0's poll/idle share. Kill: <10% gain or ONE event-order divergence.
+- [ ] **L1.3 — Load-path overlay coverage.** Only if L1.0 shows interp
+  share >~10% in-window; coverage-capture the load path, reshard.
+- [ ] **L1.4 — Data shards (spike/tomba-load-shards): verify-only SHADOW
+  mode, then replay.** Gated on L1.0 (decomp ≥~20-25% host share).
+  Correctness bar: temporal write visibility — replay sound only if
+  IRQs-off across the window OR duration < next observable event.
+- [ ] **L1.5 — Authentic drive backlog (never-early + catch-up).**
+  Correctness work, not acceleration. Probe deadline-vs-exposure deltas
+  first; prereq = resolve the CD-model split (live tree Ape
+  direct-delivery vs master model).
+- [ ] **L1.6 — Seek-only latency probe.** Bounded (seeks × ~250ms), NOT
+  proven safe, per-game opt-in at best. Kill: seek share <10% of window.
+- [ ] **L1.7 — Phase-2 doors (open only with cause):** per-title read
+  speedup with XA/CDDA/MDEC exclusions; decompressor HLE (only via L1.4
+  failing for a named reason); load-transition state cache (the only
+  true near-zero; needs thousands-of-frames differential validation).
+
+Method, every experiment: measure first via always-on rings; flag-gated
+default-off; one per session; kill criterion written before code; corpus
+gate ≥2 titles (Tomba + MMX6 minimum) before any default flips.
+
+---
+
 ## W2 — Tomba 1 (SCUS-94236) 16:9: HUD at the true wide corners (DEFERRED 2026-07-10)
 
 User ask: in native-wide 16:9, re-anchor the HUD to the wide corners
