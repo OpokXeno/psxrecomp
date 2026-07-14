@@ -324,12 +324,34 @@ preserving human credit, and listing related material deliberately excluded.
 | [#23 `fix/overlay-init-guard-shaneomac`](https://github.com/mstan/psxrecomp/pull/23) | [`5b8098a9`](https://github.com/mstan/psxrecomp/commit/5b8098a9d997424cbd57829b8ae11369ab06935a) | [PR #16 `e6809cc`](https://github.com/mstan/psxrecomp/commit/e6809ccf7d778a4c2f32d9e27c0ec31a44cbd2ba) | `2026-07-13` | Pre-init regression and standalone compile pass; source co-authors preserved |
 | [#21 `fix/msvc-generated-init-shaneomac`](https://github.com/mstan/psxrecomp/pull/21) | [`05d4f35b`](https://github.com/mstan/psxrecomp/commit/05d4f35bd6314d56ac95e6cec4b90655950dbd86) | [PR #16 `df4cc5c`](https://github.com/mstan/psxrecomp/commit/df4cc5c70ab1e5d0fd2a8f817dd346905d4d0eeb) | `2026-07-13` | MSVC game/BIOS/test builds, 44/44 L2, and 63 runtime objects; original author preserved |
 | [#18 `fix/posix-overlay-export-scan-douglas`](https://github.com/mstan/psxrecomp/pull/18) | [`c0fa9b1e`](https://github.com/mstan/psxrecomp/commit/c0fa9b1e89fb6c210011dc25a92b124df43692d4) | [`df7d1fa`](https://github.com/douglasjv/psxrecomp-tweaks/commit/df7d1faa5f27be0ba357463a763c77efc43e1f91), [`7abbfdf`](https://github.com/douglasjv/psxrecomp-tweaks/commit/7abbfdf38b488d3764b96c155549bc930e0521b6) | `2026-07-13` | Real Linux shared-library fixture and Windows compile pass; awaiting Douglas review |
-| [#22 `feat/config-guarded-mips-patches-douglas`](https://github.com/mstan/psxrecomp/pull/22) | [`e7b61c80`](https://github.com/mstan/psxrecomp/commit/e7b61c807c9e06684bdfeaa47f740c349d253062) | [PR #15 `19001c0`](https://github.com/douglasjv/psxrecomp-tweaks/commit/19001c0a383edde439988b93eb2385e2d789d350) | `2026-07-13` | Patch CTest 1/1, L2 44/44, all recompiler targets build; awaiting Douglas review |
+| [#22 `feat/config-guarded-mips-patches-douglas`](https://github.com/mstan/psxrecomp/pull/22) | [`5f62deda`](https://github.com/mstan/psxrecomp/commit/5f62dedaa3bddfdae6903524449215caa0b612f5) | [PR #15 `19001c0`](https://github.com/douglasjv/psxrecomp-tweaks/commit/19001c0a383edde439988b93eb2385e2d789d350) | `2026-07-13` | Patch CTest 2/2 (including C++17 public-header coverage), L2 44/44, combined Tomba 2/MMX6/Ape builds; awaiting Douglas review |
 | [#19 `feat/reachable-main-discovery-douglas`](https://github.com/mstan/psxrecomp/pull/19) | [`bd705bfc`](https://github.com/mstan/psxrecomp/commit/bd705bfcecff91a3c0832ccd01b0504c54b100b1) | [MM8 `8415f3a`](https://github.com/douglasjv/mm8/commit/8415f3a95458c41c7f48fbe36caaf0ee82730720) | `2026-07-13` | Parser/codegen tests, L2 44/44, overlay/static guard pass; awaiting Douglas review |
 
 No draft above should be merged until its source attribution and adapted scope
 are accepted. In particular, the Douglas-derived drafts explicitly await
 Douglas's review and say-so.
+
+## Disposable combined regression exercise
+
+The draft branches were combined only in the unpushed local branch
+`test/ecosystem-wave-integration` at `bed0c08048b954f7f76d6a44bd97ce1eb40688f8`.
+This is a test fixture based on unchanged `master` `dde268dc`; it is not a
+merge proposal. The exercise was evaluated through
+`2026-07-13T23:09:30-07:00` (America/Los_Angeles).
+
+| Game repository / test ref | Framework under test | Last evaluated | Regeneration/build | Offscreen attract soak |
+|---|---|---|---|---|
+| Tomba 1 `05e058f` | local combined fixture `bed0c080` | `2026-07-13` | Blocked: no local `SCUS_942.36` or CUE; retained generated C predates the current `psx_game_text_native_ok` ABI | Not run |
+| Tomba 2 `3562540` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and Debug runtime build passed | 328 s, 4,477 frames, 4,477 VBlanks raised, 22,898 IRQs; no fatal heartbeat, crash report, or error-pattern log hit |
+| Mega Man X6 `66d0f16` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | 328 s, 4,400 frames, 4,401 VBlanks raised, 59,918 IRQs; no fatal heartbeat, crash report, or error-pattern log hit |
+| Ape Escape `3367eb1` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | 328 s, 5,231 frames, 5,231 VBlanks raised, 25,405 IRQs; no fatal heartbeat, crash report, or error-pattern log hit |
+
+The soaks used `--headless --no-launcher --renderer software`, isolated working
+directories, and distinct debug ports. They cover guest execution, disc/CD,
+SPU timing, interrupts, overlay loading, and unattended title/attract
+progression, but are not visual-renderer or audible-output acceptance tests.
+The game worktrees contain only temporary path/junction wiring and regenerated
+output for this exercise; no game-repository change is proposed.
 
 ## Remaining upstream branch queue
 
