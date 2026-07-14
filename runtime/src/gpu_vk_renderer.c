@@ -507,10 +507,14 @@ static uint32_t find_mem_type(uint32_t type_bits, VkMemoryPropertyFlags want) {
 
 static void vk_gpu_sync_internal(void);   /* drain queue + reclaim work pool/staging */
 
-/* Begin a one-shot work command buffer (allocated from s_work_pool, which is
- * bulk-reset at gpu_sync). */
+/* Coalesce work operations into one command buffer per sync interval. This
+ * preserves recording order while removing a queue submission per small GPU
+ * operation. */
+static VkCommandBuffer s_work_cb;
+
 static VkCommandBuffer begin_oneshot(void) {
     s_perf_cur.oneshots++;
+    if (s_work_cb) return s_work_cb;
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     ai.commandPool = s_work_pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -520,21 +524,25 @@ static VkCommandBuffer begin_oneshot(void) {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     p_vkBeginCommandBuffer(cb, &bi);
+    s_work_cb = cb;
     return cb;
 }
 
-/* Submit the work CB WITHOUT waiting. Cross-submit ordering is provided by the
- * per-op image-layout barriers (img_to): a barrier's first scope covers all
- * commands earlier in queue submission order, so each op's transitions wait for
- * prior ops' writes. The queue is drained only at gpu_sync (present / readback). */
+/* Finish a logical operation but keep the shared command buffer open. */
 static void end_oneshot(VkCommandBuffer cb) {
-    p_vkEndCommandBuffer(cb);
+    (void)cb;
+    s_work_pending = 1;
+}
+
+static void flush_work(void) {
+    if (!s_work_cb) return;
+    p_vkEndCommandBuffer(s_work_cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
+    si.pCommandBuffers = &s_work_cb;
     p_vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
     s_perf_cur.submits++;
-    s_work_pending = 1;
+    s_work_cb = VK_NULL_HANDLE;
 }
 
 /* Defer a staging buffer's destruction until the queue is next idle (its
@@ -549,6 +557,7 @@ static void defer_staging(VkBuffer buf, VkDeviceMemory mem) {
  * The single sync point for the deferred-submit model. */
 static void vk_gpu_sync_internal(void) {
     s_perf_cur.syncs++;
+    flush_work();
     if (s_work_pending) {
         p_vkQueueWaitIdle(s_queue);
         /* RELEASE_RESOURCES so the per-op command buffers allocated since the
