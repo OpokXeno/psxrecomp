@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
+    std::vector<PSXRecompV4::RecompilerPatch> instruction_patches;
     bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     uint32_t              ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0,
                           ws_bg2d_startx_site = 0,
@@ -149,6 +150,7 @@ int main(int argc, char** argv) {
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
+        instruction_patches  = cfg.recompiler_patches;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
@@ -241,6 +243,8 @@ int main(int argc, char** argv) {
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
         ws_auto_backdrop_preload = ws_auto_backdrop_preload || wscfg.ws_auto_backdrop_preload;
+        PSXRecompV4::merge_recompiler_patches(
+            instruction_patches, wscfg.recompiler_patches);
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
@@ -274,6 +278,11 @@ int main(int argc, char** argv) {
                        exe->header.file_size, parsed_size);
         }
     }
+
+    // Patch the bounded image before discovery/CFG analysis so replacements of
+    // control-flow instructions cannot disagree with the generated graph.
+    PSXRecompV4::apply_recompiler_patches_to_executable(
+        *exe, instruction_patches, overlay_mode);
 
     fmt::print("✓ Successfully parsed PS1-EXE!\n\n");
 
@@ -1112,9 +1121,17 @@ int main(int argc, char** argv) {
             // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
             // with the BIOS dispatch's marker.
             ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
-            ds << "__attribute__((constructor)) static void psx_cps_mark_game(void) {\n";
+            ds << "static void psx_cps_mark_game(void) {\n";
             ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
             ds << "}\n";
+            // Run psx_cps_mark_game before main(). __attribute__((constructor)) is
+            // GCC/Clang-only; MSVC uses a static initializer pointer in .CRT$XCU.
+            ds << "#if defined(_MSC_VER)\n";
+            ds << "#pragma section(\".CRT$XCU\", read)\n";
+            ds << "__declspec(allocate(\".CRT$XCU\")) static void (*psx_cps_mark_game_ctor)(void) = psx_cps_mark_game;\n";
+            ds << "#else\n";
+            ds << "__attribute__((constructor)) static void psx_cps_mark_game_ctor(void) { psx_cps_mark_game(); }\n";
+            ds << "#endif\n";
         }
 
         std::ofstream dispatch_file(dispatch_filename);

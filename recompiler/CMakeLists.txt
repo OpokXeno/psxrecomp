@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(PSXRecomp C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+include(CTest)
 
 add_subdirectory(lib/fmt)
 
@@ -72,6 +73,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/code_generator.cpp
     src/annotations.cpp
     src/config_loader.cpp
+    src/recompiler_patch.cpp
     src/main_psx.cpp
 )
 
@@ -160,6 +162,7 @@ add_executable(psxrecomp-bios
     src/function_discovery.cpp
     src/full_function_emitter.cpp
     src/config_loader.cpp
+    src/recompiler_patch.cpp
     src/main_bios.cpp
 )
 target_include_directories(psxrecomp-bios PRIVATE
@@ -206,6 +209,42 @@ target_include_directories(l2_structural_test PRIVATE
     lib/fmt/include
 )
 target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
+
+if(BUILD_TESTING)
+    add_executable(recompiler_patch_test
+        tests/recompiler_patch_test.cpp
+        src/ps1_exe_parser.cpp
+        src/mips_decoder.cpp
+        src/control_flow.cpp
+        src/function_analysis.cpp
+        src/code_generator.cpp
+        src/annotations.cpp
+        src/config_loader.cpp
+        src/recompiler_patch.cpp
+    )
+    target_include_directories(recompiler_patch_test PRIVATE
+        include
+        src
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+        lib/toml11
+        lib/ELFIO
+    )
+    target_link_libraries(recompiler_patch_test PRIVATE fmt rabbitizer)
+    add_test(NAME recompiler_patch_test COMMAND recompiler_patch_test)
+
+    add_executable(recompiler_patch_cxx17_header_test
+        tests/recompiler_patch_cxx17_header_test.cpp
+    )
+    target_include_directories(recompiler_patch_cxx17_header_test PRIVATE src)
+    set_target_properties(recompiler_patch_cxx17_header_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+    add_test(NAME recompiler_patch_cxx17_header_test
+             COMMAND recompiler_patch_cxx17_header_test)
+endif()
 
 # Reachable main-EXE discovery test: parser-bound validation plus exact-entry
 # analysis behavior for direct, indirect, seeded, and out-of-bound targets.

@@ -87,6 +87,13 @@ out_dir     = "generated"                                  # both
 strict      = true                                         # both — currently always true
 discovery   = "whole-image"                                # game-only: "whole-image" or "reachable"
 out_stem    = "SCPH1001"                                   # optional; overrides the auto-derived stem
+
+[[recompiler.patch]]
+id          = "descriptive-policy-name"
+address     = "0x80012340"
+expected    = "0x24020002"
+replacement = "0x24020001"
+note        = "Why this game-owned instruction change is required" # optional
 ```
 
 Output filenames: `<out_dir>/<out_stem>_full.c` and
@@ -107,6 +114,31 @@ uses it as a static-analysis bound. The value must be nonzero, instruction- and
 4 KiB-aligned, retain `entry_pc`, and not extend past PS1 RAM. The original EXE
 is still loaded from the user's disc. A generated config's canonical final-page
 reservation may be slightly larger than the header; it does not widen analysis.
+
+Each `[[recompiler.patch]]` replaces one exact 32-bit MIPS word before function
+discovery, control-flow analysis, and normal translation. It is intended for
+small, understood game-code changes whose addresses, opcodes, and policy remain
+in the game repository. The framework does not contain title IDs or
+title-specific addresses.
+
+- `id`, `address`, `expected`, and `replacement` are required hex/string
+  fields; `note` is optional.
+- IDs are case-sensitive and unique within one config.
+- Addresses must be four-byte aligned and are unique by the PSX 29-bit physical
+  address. Thus `0x00012340`, `0x80012340`, and `0xA0012340` are aliases of one
+  site and cannot define separate patches.
+- Main-EXE generation fails if the word at the target site is not `expected`.
+  This catches a wrong disc revision or stale patch instead of guessing.
+- Captured overlays may place unrelated variants at one virtual address. In
+  overlay mode, a patch is applied only to a variant whose word is `expected`;
+  a nonmatching variant is translated unchanged.
+- When `--config` and `--ws-config` supply the same byte-identical patch it is
+  deduplicated. Reusing an ID or physical address for different patch data is
+  an error.
+
+Patches are build-time inputs, not runtime memory writes or live toggles.
+Regenerate the affected main executable or captured overlays after changing
+them.
 
 ## Runtime block
 

@@ -22,6 +22,8 @@ set(PSXRECOMP_CODEGEN_HASH_SRCS
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/control_flow.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/basic_block.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_analysis.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/recompiler_patch.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/recompiler_patch.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.cpp

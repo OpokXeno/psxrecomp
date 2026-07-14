@@ -8,6 +8,7 @@
 #include "interrupts.h"
 #include "debug_server.h"
 #include "psx_cycles.h"
+#include "overlay_posix.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +19,7 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #else
-#  include <dlfcn.h>
+#  include <unistd.h>
 #endif
 
 /* ============================================================================
@@ -1059,6 +1060,26 @@ static int cache_idx_has_basename(const char *fname) {
 
 const char *overlay_loader_arch_abi(void) { return PSX_OVERLAY_ARCH_ABI; }
 
+#ifndef _WIN32
+static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
+    (void)opaque;
+    if (s_cache_idx_count >= CACHE_IDX_CAP) {
+        loader_log("*** CACHE INDEX FULL (%d): further DLLs near %s are being "
+                   "IGNORED — their regions will run interpreted. Raise "
+                   "CACHE_IDX_CAP.", CACHE_IDX_CAP, file->path);
+        return 1;
+    }
+    if (cache_idx_has_basename(file->name)) return 0;
+    CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
+    e->region_start = file->region_start;
+    e->mtime = file->mtime;
+    e->func_count = 0;
+    e->indexed_func_count = 0;
+    snprintf(e->path, sizeof(e->path), "%s", file->path);
+    return 0;
+}
+#endif
+
 /* Scan one directory for <addr8>_<crc8>.dll cache entries into the index.
  * `dir` is a full directory path. Idempotent (skips already-indexed paths). */
 static void scan_one_cache_dir(const char *dir) {
@@ -1069,18 +1090,9 @@ static void scan_one_cache_dir(const char *dir) {
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (strlen(fd.cFileName) != 21) continue; /* 8+1+8+4 = 21 */
-        /* Validate the <addr8>_<crc8>.dll shape explicitly: region_start 0 is
-         * LEGAL (the kernel-RAM window starts at phys 0), so a zero parse
-         * result can't be used as the invalid sentinel. */
-        int valid = (fd.cFileName[8] == '_');
-        for (int ci = 0; valid && ci < 8; ci++) {
-            char c = fd.cFileName[ci];
-            valid = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
-                    (c >= 'a' && c <= 'f');
-        }
-        if (!valid) continue;
-        uint32_t addr = (uint32_t)strtoul(fd.cFileName, NULL, 16);
+        uint32_t addr = 0, crc = 0;
+        if (!psx_overlay_cache_name_parse(fd.cFileName, &addr, &crc)) continue;
+        (void)crc;
         if (s_cache_idx_count >= CACHE_IDX_CAP) {
             /* Never-again (the silent-256 truncation): overflowing the index
              * means real native coverage is being IGNORED. Shout once. */
@@ -1104,7 +1116,7 @@ static void scan_one_cache_dir(const char *dir) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    (void)dir;
+    psx_overlay_posix_scan_cache_dir(dir, add_posix_cache_file, NULL);
 #endif
 }
 
@@ -1152,9 +1164,81 @@ static void warn_on_cgtag_mismatch(const char *tier) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    (void)tier;
+    char base[768], expect[64], found[256];
+    snprintf(base, sizeof base, "%s/%s/%s/%s",
+             s_cache_dir, s_game_id, tier, PSX_OVERLAY_ARCH_ABI);
+    snprintf(expect, sizeof expect, "cg%d_%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    if (psx_overlay_posix_find_other_cache_tag(base, expect, found,
+                                               sizeof(found))) {
+        loader_log("*** OVERLAY CACHE HASH MISMATCH: this build reads %s/%s but "
+                   "shards exist under %s/%s. The autocompile is writing to a "
+                   "DIFFERENT codegen hash than this runtime reads -> ALL overlays "
+                   "run INTERPRETED (slow). Fix overlay_autocompile_cmd's "
+                   "--recompiler/--runtime-include to match THIS build's framework.",
+                   tier, expect, tier, found);
+    }
 #endif
 }
+
+static void cache_idx_remove_path(const char *path) {
+    for (int i = 0; i < s_cache_idx_count; i++) {
+        if (strcmp(s_cache_idx[i].path, path) == 0) {
+            s_cache_idx[i] = s_cache_idx[--s_cache_idx_count];
+            return;
+        }
+    }
+}
+
+static void remove_posix_dll_and_manifest(const char *dll_path) {
+#ifndef _WIN32
+    remove(dll_path);
+    char ranges[800];
+    int n = snprintf(ranges, sizeof(ranges), "%s", dll_path);
+    if (n >= 4 && (size_t)n + 4 < sizeof(ranges) &&
+        strcmp(ranges + n - 4, ".dll") == 0) {
+        memcpy(ranges + n - 4, ".ranges", 8);
+        remove(ranges);
+    }
+#else
+    (void)dll_path;
+#endif
+}
+
+#ifndef _WIN32
+typedef struct PosixAbiSweep {
+    int purged;
+    int kept;
+} PosixAbiSweep;
+
+static int posix_abi_sweep_file(const PsxOverlayCacheFile *file, void *opaque) {
+    PosixAbiSweep *sweep = (PosixAbiSweep *)opaque;
+    char error[256] = {0};
+    void *handle = psx_overlay_posix_library_open(file->path, error, sizeof(error));
+    int abi = 0;
+    if (handle) {
+        typedef int (*AbiFn)(void);
+        AbiFn abi_fn = (AbiFn)psx_overlay_posix_library_symbol(handle, "overlay_abi");
+        abi = abi_fn ? abi_fn() : 0;
+        psx_overlay_posix_library_close(handle);
+    }
+    if (handle && abi == PSX_OVERLAY_ABI_TAG) {
+        sweep->kept++;
+        return 0;
+    }
+
+    if (handle)
+        loader_log("ABI preflight rejecting %s: dll=0x%X runtime=0x%X",
+                   file->path, abi, PSX_OVERLAY_ABI_TAG);
+    else
+        loader_log("ABI preflight rejecting unloadable %s: %s",
+                   file->path, error);
+    remove_posix_dll_and_manifest(file->path);
+    cache_idx_remove_path(file->path);
+    sweep->purged++;
+    return 0;
+}
+#endif
 
 /* ---- ABI pre-flight sweep (batch purge) ----------------------------------
  * A contract-ABI bump (e.g. v9 -> v10) invalidates EVERY cached DLL at once.
@@ -1225,7 +1309,18 @@ static void abi_preflight_sweep(const char *dir) {
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (m != INVALID_HANDLE_VALUE) CloseHandle(m);
 #else
-    (void)dir;
+    char marker[900];
+    snprintf(marker, sizeof marker, "%s/.abi_%08x.ok", dir,
+             (unsigned)PSX_OVERLAY_ABI_TAG);
+    if (access(marker, F_OK) == 0) return;
+
+    PosixAbiSweep sweep = {0};
+    psx_overlay_posix_scan_cache_dir(dir, posix_abi_sweep_file, &sweep);
+    if (sweep.purged)
+        loader_log("abi preflight: purged %d stale DLL(s), kept %d in %s",
+                   sweep.purged, sweep.kept, dir);
+    FILE *m = fopen(marker, "wb");
+    if (m) fclose(m);
 #endif
 }
 
@@ -1833,34 +1928,60 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
 }
 #else
 static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll) {
-    (void)man; (void)man_n; (void)dll;
-    void *h = dlopen(dll_path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, dlerror()); return 0; }
+    char error[256] = {0};
+    void *h = psx_overlay_posix_library_open(dll_path, error, sizeof(error));
+    if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, error); return 0; }
     /* ABI gate (see the _WIN32 branch). */
     typedef int (*AbiFn)(void);
-    AbiFn abi_fn = (AbiFn)dlsym(h, "overlay_abi");
+    AbiFn abi_fn = (AbiFn)psx_overlay_posix_library_symbol(h, "overlay_abi");
     int abi = abi_fn ? abi_fn() : 0;
     if (abi != PSX_OVERLAY_ABI_TAG) {
         loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
                    "and deleting stale cache entry", dll_path, abi,
                    PSX_OVERLAY_ABI_TAG);
-        dlclose(h);
-        remove(dll_path);
+        psx_overlay_posix_library_close(h);
+        remove_posix_dll_and_manifest(dll_path);
         return 0;
     }
     typedef void (*InitFn)(const OverlayCallbacks *);
-    InitFn init_fn = (InitFn)dlsym(h, "overlay_init");
-    if (!init_fn) { loader_log("no overlay_init in %s", dll_path); dlclose(h); return 0; }
+    InitFn init_fn = (InitFn)psx_overlay_posix_library_symbol(h, "overlay_init");
+    if (!init_fn) {
+        loader_log("no overlay_init in %s", dll_path);
+        psx_overlay_posix_library_close(h);
+        return 0;
+    }
     init_fn(&s_callbacks);
-    OverlayFlushFn flush_fn = (OverlayFlushFn)dlsym(h, "overlay_flush_cycles");
+    OverlayFlushFn flush_fn = (OverlayFlushFn)psx_overlay_posix_library_symbol(
+        h, "overlay_flush_cycles");
     if (!flush_fn || dll < 0 || dll >= (int)(sizeof(s_dll_flush) / sizeof(s_dll_flush[0]))) {
         loader_log("no ABI-v11 cycle flush export in %s", dll_path);
-        dlclose(h);
+        psx_overlay_posix_library_close(h);
         return 0;
     }
     s_dll_flush[dll] = flush_fn;
-    loader_log("%s loaded (posix export scan TODO)", dll_path);
-    return 0;
+
+    /* ELF/Mach-O do not expose a portable export-table walker. The range
+     * manifest is already the loader's authority, so resolve only its exact
+     * callable entries. Missing symbols stay interpreted rather than acquiring
+     * a guessed extent. */
+    int registered = 0;
+    for (int i = 0; i < man_n; i++) {
+        ManFn *m = &man[i];
+        if (m->entry == 0 || m->n == 0) continue;
+        OverlayFn fn = (OverlayFn)psx_overlay_posix_library_entry(h, m->entry);
+        if (!fn) continue;
+        cand_register(m->entry & 0x1FFFFFFFu, fn, m, dll);
+        registered++;
+    }
+    loader_log("loaded %s -> %d manifest candidates", dll_path, registered);
+    if (registered == 0) {
+        s_dll_flush[dll] = NULL;
+        psx_overlay_posix_library_close(h);
+    }
+    /* A successful handle intentionally stays open for process lifetime: the
+     * registered function and flush pointers refer into it. Rescans are
+     * idempotent through s_loaded_paths and never acquire a second reference. */
+    return registered;
 }
 #endif
 
@@ -2390,6 +2511,7 @@ static int overlay_find_by_range(uint32_t phys) {
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    if (!s_active) return 0;
     int lazy_loaded = 0;
 retry_candidates:
     int head = idx_head(phys);
@@ -2883,6 +3005,7 @@ static FpEnt    s_fp[FP_CAP];
 static uint64_t s_fp_seq = 0;
 
 int overlay_loader_is_candidate(uint32_t phys) {
+    if (!s_active) return 0;
     phys &= 0x1FFFFFFFu;
     return idx_head(phys) >= 0 || lazy_has_exact_entry(phys);
 }
@@ -3229,7 +3352,8 @@ void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
  * leaks (root cause of the dwarf->overworld native blue screen).
  * Returns 1 iff a native candidate ran. */
 int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
-    if (!s_native_exec) return 0;  /* interp mode: keep the legacy inline path */
+    if (!s_active || !s_native_exec)
+        return 0;  /* inactive/interp mode: keep the legacy inline path */
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (idx_head(phys) < 0 && !lazy_has_exact_entry(phys))
         return 0; /* neither a registered nor an exact cached entry */
