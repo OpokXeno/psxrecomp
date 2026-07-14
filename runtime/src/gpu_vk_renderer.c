@@ -329,6 +329,8 @@ static int s_ds_blit_idx;
  * a frame that jumps from ~10 to ~2000 allocs is the smoking gun). Always on. */
 typedef struct {
     uint32_t present_idx;
+    uint64_t present_qpc;
+    uint32_t wait_us, acquire_us, present_us;
     uint32_t allocs, alloc_kb, oneshots, submits, syncs, pack_flushes,
              blits, upload_blocks, copy_rects, geo_flushes, tex_flushes,
              wide_passes, wide_clears;
@@ -339,8 +341,15 @@ static uint32_t s_perf_head;          /* number of frames recorded (monotonic) *
 static VkPerf s_perf_cur;             /* current (in-progress) frame */
 static uint32_t s_present_idx;
 
+static uint32_t perf_elapsed_us(uint64_t start) {
+    uint64_t frequency = SDL_GetPerformanceFrequency();
+    uint64_t ticks = SDL_GetPerformanceCounter() - start;
+    return frequency ? (uint32_t)(ticks * 1000000u / frequency) : 0;
+}
+
 static void perf_snapshot_present(void) {
     s_perf_cur.present_idx = s_present_idx++;
+    s_perf_cur.present_qpc = SDL_GetPerformanceCounter();
     s_perf_ring[s_perf_head % VK_PERF_RING] = s_perf_cur;
     s_perf_head++;
     memset(&s_perf_cur, 0, sizeof s_perf_cur);
@@ -597,7 +606,9 @@ static void vk_gpu_sync_internal(void) {
     s_perf_cur.syncs++;
     flush_work();
     if (s_work_pending) {
+        uint64_t wait_start = SDL_GetPerformanceCounter();
         p_vkQueueWaitIdle(s_queue);
+        s_perf_cur.wait_us += perf_elapsed_us(wait_start);
         /* RELEASE_RESOURCES so the per-op command buffers allocated since the
          * last sync are actually freed (a plain reset only recycles them, and
          * begin_oneshot always allocates fresh -> unbounded growth). */
@@ -1429,8 +1440,10 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
     uint32_t fr = s_frame_idx % VK_FRAMES;
     p_vkWaitForFences(s_dev, 1, &s_fence[fr], VK_TRUE, UINT64_MAX);
     uint32_t img_idx = 0;
+    uint64_t acquire_start = SDL_GetPerformanceCounter();
     VkResult r = p_vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX,
                                          s_sem_acquire[fr], VK_NULL_HANDLE, &img_idx);
+    s_perf_cur.acquire_us += perf_elapsed_us(acquire_start);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         p_vkDeviceWaitIdle(s_dev);
         destroy_swapchain();
@@ -1469,7 +1482,9 @@ static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr) {
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s_sem_render[fr];
     pi.swapchainCount = 1; pi.pSwapchains = &s_swapchain;
     pi.pImageIndices = &img_idx;
+    uint64_t present_start = SDL_GetPerformanceCounter();
     p_vkQueuePresentKHR(s_queue, &pi);
+    s_perf_cur.present_us += perf_elapsed_us(present_start);
     s_frame_idx++;
 }
 
@@ -1711,11 +1726,14 @@ int vk_perf_json(char *out, int cap, int count) {
         uint32_t k = total - n + i;          /* frame index, oldest..newest */
         VkPerf *p = &s_perf_ring[k % VK_PERF_RING];
         o += snprintf(out + o, cap - o,
-            "%s{\"f\":%u,\"alloc\":%u,\"alloc_kb\":%u,\"oneshot\":%u,\"submit\":%u,"
+            "%s{\"f\":%u,\"qpc\":%llu,\"wait_us\":%u,\"acquire_us\":%u,\"present_us\":%u,"
+            "\"alloc\":%u,\"alloc_kb\":%u,\"oneshot\":%u,\"submit\":%u,"
             "\"sync\":%u,\"pack\":%u,\"blit\":%u,\"upload\":%u,\"copy\":%u,"
             "\"geo\":%u,\"tex\":%u,\"wide\":%u,\"wclr\":%u}",
             i ? "," : "",
-            p->present_idx, p->allocs, p->alloc_kb, p->oneshots, p->submits,
+            p->present_idx, (unsigned long long)p->present_qpc,
+            p->wait_us, p->acquire_us, p->present_us,
+            p->allocs, p->alloc_kb, p->oneshots, p->submits,
             p->syncs, p->pack_flushes, p->blits, p->upload_blocks, p->copy_rects,
             p->geo_flushes, p->tex_flushes, p->wide_passes, p->wide_clears);
         if (o >= cap - 256) break;
