@@ -9,14 +9,14 @@ cache="$tmp/cache"
 base="$tmp/tags"
 expected="cg12_11111111"
 other="cg12_22222222"
-mkdir -p "$cache/00000000_11111111.dll" "$base/$expected" "$base/$other"
+mkdir -p "$cache/00000000_11111111.so" "$base/$expected" "$base/$other"
 
 cc -std=c99 -Wall -Wextra -Werror -fPIC -shared \
   "$root/runtime/tests/overlay_posix_fixture.c" \
-  -o "$cache/80010000_DEADBEEF.dll"
-: > "$cache/00000000_00000000.dll"
-: > "$cache/80010000_DEADBEG0.dll"
-: > "$base/$other/80020000_12345678.dll"
+  -o "$cache/80010000_DEADBEEF.so"
+: > "$cache/00000000_00000000.so"
+: > "$cache/80010000_DEADBEG0.so"
+: > "$base/$other/80020000_12345678.so"
 
 cc -std=c99 -Wall -Wextra -Werror \
   -I"$root/runtime/include" \

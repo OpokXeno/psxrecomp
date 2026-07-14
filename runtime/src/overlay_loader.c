@@ -22,6 +22,14 @@
 #  include <unistd.h>
 #endif
 
+#ifdef _WIN32
+#  define OVERLAY_SHARED_EXT ".dll"
+#  define OVERLAY_SHARED_EXT_LEN 4
+#else
+#  define OVERLAY_SHARED_EXT ".so"
+#  define OVERLAY_SHARED_EXT_LEN 3
+#endif
+
 /* ============================================================================
  * Inc3 — Per-entry validity + multi-candidate dispatch (design doc §8)
  *
@@ -953,8 +961,11 @@ static void rebuild_lazy_manifest_index(void) {
         char path[800];
         snprintf(path, sizeof(path), "%s", s_cache_idx[ci].path);
         size_t n = strlen(path);
-        if (n < 4 || strcmp(path + n - 4, ".dll") != 0) continue;
-        snprintf(path + n - 4, sizeof(path) - (n - 4), ".ranges");
+        if (n < OVERLAY_SHARED_EXT_LEN ||
+            strcmp(path + n - OVERLAY_SHARED_EXT_LEN, OVERLAY_SHARED_EXT) != 0)
+            continue;
+        snprintf(path + n - OVERLAY_SHARED_EXT_LEN,
+                 sizeof(path) - (n - OVERLAY_SHARED_EXT_LEN), ".ranges");
         int man_n = 0;
         ManFn *man = parse_manifest(path, &man_n);
         if (!man) continue;
@@ -1195,9 +1206,10 @@ static void remove_posix_dll_and_manifest(const char *dll_path) {
     remove(dll_path);
     char ranges[800];
     int n = snprintf(ranges, sizeof(ranges), "%s", dll_path);
-    if (n >= 4 && (size_t)n + 4 < sizeof(ranges) &&
-        strcmp(ranges + n - 4, ".dll") == 0) {
-        memcpy(ranges + n - 4, ".ranges", 8);
+    if (n >= OVERLAY_SHARED_EXT_LEN &&
+        (size_t)n + 7 - OVERLAY_SHARED_EXT_LEN < sizeof(ranges) &&
+        strcmp(ranges + n - OVERLAY_SHARED_EXT_LEN, OVERLAY_SHARED_EXT) == 0) {
+        memcpy(ranges + n - OVERLAY_SHARED_EXT_LEN, ".ranges", 8);
         remove(ranges);
     }
 #else
@@ -1565,7 +1577,9 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
         if (s_cache_idx[i].region_start != region_start) continue;
         const char *fn = strrchr(s_cache_idx[i].path, '/');
         fn = fn ? fn + 1 : s_cache_idx[i].path;
-        if (strlen(fn) == 21 && (uint32_t)strtoul(fn + 9, NULL, 16) == crc)
+        if (strlen(fn) == 17u + OVERLAY_SHARED_EXT_LEN &&
+            strcmp(fn + 17, OVERLAY_SHARED_EXT) == 0 &&
+            (uint32_t)strtoul(fn + 9, NULL, 16) == crc)
             return 1;
     }
     return 0;
@@ -2218,8 +2232,10 @@ static int load_one_dll(const char *dll_path) {
     char ranges_path[800];
     snprintf(ranges_path, sizeof(ranges_path), "%s", dll_path);
     size_t plen = strlen(ranges_path);
-    if (plen >= 4 && strcmp(ranges_path + plen - 4, ".dll") == 0)
-        snprintf(ranges_path + plen - 4, sizeof(ranges_path) - (plen - 4), ".ranges");
+    if (plen >= OVERLAY_SHARED_EXT_LEN &&
+        strcmp(ranges_path + plen - OVERLAY_SHARED_EXT_LEN, OVERLAY_SHARED_EXT) == 0)
+        snprintf(ranges_path + plen - OVERLAY_SHARED_EXT_LEN,
+                 sizeof(ranges_path) - (plen - OVERLAY_SHARED_EXT_LEN), ".ranges");
 
     int man_n = 0;
     ManFn *man = parse_manifest(ranges_path, &man_n);
