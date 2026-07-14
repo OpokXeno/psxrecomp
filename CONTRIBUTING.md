@@ -95,6 +95,11 @@ Known game repos:
 - [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
 - [ApeEscapeRecomp](https://github.com/mstan/ApeEscapeRecomp) — *Ape Escape*
 
+Maintainers record evaluated external branches, game repos, exact revisions,
+and reusable upstream candidates in the
+[`ecosystem watch`](docs/ecosystem-watch.md). Check it before porting work from
+an older framework fork.
+
 ### Framework changes and the pin
 
 Because each game pins an exact framework commit (its `psxrecomp/` submodule
@@ -227,6 +232,22 @@ out when not needed. Avoid cleverness unless it's clearly justified.
 By contributing, you agree your contribution is licensed under the same license as
 the project. Do not submit code you don't have the right to contribute, and do not
 copy from incompatible licenses or proprietary sources.
+
+### Upstream-derived work and credit
+
+When a change adapts code or behavior from another branch or repository, add a
+short record under `docs/internal/upstream/`. The record must include:
+
+- clickable links to the source repository or PR and the exact source commit;
+- the original author identity and how commit/co-author credit is preserved;
+- the behavior or files actually adapted;
+- related source material deliberately excluded from the focused change; and
+- the validation performed after rebuilding the change on current `master`.
+
+Prefer preserving the source commit's author when a clean cherry-pick is
+appropriate. For a reconstructed or partial port, add the human contributor's
+exact `Co-authored-by` trailer and cite the source in the commit or PR body.
+Attribution does not replace license compatibility or permission.
 
 ## Be respectful
 
