@@ -21,6 +21,7 @@
 #include "gpu_vk_renderer.h"
 #include "gpu_sw_renderer.h"
 #include "crash_trace.h"
+#include "gpu_vk_upload.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1905,8 +1906,9 @@ static void flush_cpu_upload(void) {
      * ONE RGBA8 staging, addressed via VkBufferImageCopy bufferOffset. */
     size_t total = 0;
     for (int i = 0; i < nrects; i++)
-        total += (size_t)(rects[i].x1 - rects[i].x0 + 1) *
-                 (size_t)(rects[i].y1 - rects[i].y0 + 1);
+        total += vk_upload_aligned_texels(
+            (size_t)(rects[i].x1 - rects[i].x0 + 1) *
+            (size_t)(rects[i].y1 - rects[i].y0 + 1));
     if (total == 0) return;
 
     VkBuffer rbuf; VkDeviceMemory rmem; void *rmap;
@@ -1942,7 +1944,9 @@ static void flush_cpu_upload(void) {
         rcopies[i].imageExtent.depth = 1;
         ucopies[i] = rcopies[i];
         ucopies[i].bufferOffset = (VkDeviceSize)texoff * 4;
-        texoff += (size_t)w * h;
+        /* Padding prevents an odd-sized R16 rect from leaving all following
+         * VkBufferImageCopy offsets at two modulo four bytes. */
+        texoff += vk_upload_aligned_texels((size_t)w * h);
     }
     p_vkUnmapMemory(s_dev, rmem);
     p_vkUnmapMemory(s_dev, umem);
