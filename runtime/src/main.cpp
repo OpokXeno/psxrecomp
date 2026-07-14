@@ -374,6 +374,17 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     *h = width * den / num;
 }
 
+/* SDL GL attributes are global inputs to the next context creation.  Set the
+ * runtime requirements immediately before every GL window, because launcher
+ * teardown resets them and macOS otherwise supplies a legacy 2.1 context. */
+static void configure_core_gl_context_attributes() {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+}
+
 /* Live native-wide vs squash toggle (ws_nw TCP command) for A/B comparison.
  * Re-engages with the chosen mode in place if widescreen is already running. */
 extern "C" void psx_ws_set_native_wide(int on) {
@@ -3243,10 +3254,7 @@ int main(int argc, char** argv) {
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
 
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+            configure_core_gl_context_attributes();
 
             /* Launcher opens at the same 4:3 size the game will, so there's no
              * jarring resize on LAUNCH. The dense dashboard needs a usable
@@ -3569,7 +3577,10 @@ int main(int argc, char** argv) {
 #endif
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-    if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
+    if (g_video_renderer == 1) {
+        configure_core_gl_context_attributes();
+        win_flags |= SDL_WINDOW_OPENGL;
+    }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
     /* Fullscreen on launch (launcher "Fullscreen on launch" toggle). DESKTOP
      * fullscreen keeps the desktop resolution and letterboxes the image, matching
