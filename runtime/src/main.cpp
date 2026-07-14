@@ -2621,8 +2621,18 @@ int main(int argc, char** argv) {
             g_headless = 1;
             force_no_launcher = true;
         } else if (argv[i][0] != '-') {
-            bios_path = argv[i];
-            bios_from_cli = true;
+            /* The positional BIOS alias predates the named CLI. Consume it at
+             * most once. In particular, never let a stray split argument
+             * replace an explicit --bios path (for example when a Windows
+             * launcher fails to quote a multi-word --window-title value). */
+            if (!bios_from_cli) {
+                bios_path = argv[i];
+                bios_from_cli = true;
+            } else {
+                std::fprintf(stderr,
+                    "psxrecomp: ignoring unexpected positional argument after BIOS selection: %s\n",
+                    argv[i]);
+            }
         }
     }
     if (const char *e = std::getenv("PSX_HEADLESS")) {
