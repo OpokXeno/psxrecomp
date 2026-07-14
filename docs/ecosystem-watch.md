@@ -337,14 +337,19 @@ The draft branches were combined only in the unpushed local branch
 `test/ecosystem-wave-integration` at `bed0c08048b954f7f76d6a44bd97ce1eb40688f8`.
 This is a test fixture based on unchanged `master` `dde268dc`; it is not a
 merge proposal. The exercise was evaluated through
-`2026-07-13T23:09:30-07:00` (America/Los_Angeles).
+`2026-07-13T23:53:52-07:00` (America/Los_Angeles).
 
-| Game repository / test ref | Framework under test | Last evaluated | Regeneration/build | Offscreen attract soak |
+| Game repository / test ref | Framework under test | Last evaluated | Regeneration/build | Runtime acceptance |
 |---|---|---|---|---|
-| Tomba 1 `05e058f` | local combined fixture `bed0c080` | `2026-07-13` | Blocked: no local `SCUS_942.36` or CUE; retained generated C predates the current `psx_game_text_native_ok` ABI | Not run |
+| Tomba 1 `05e058f` | local combined fixture `bed0c080` | `2026-07-13` | External local disc located, `SCUS_942.36` freshly extracted, 6,245-entry regeneration and launcher-free Debug runtime build passed | Visible manual pass reported: attract, gameplay, and save loading |
 | Tomba 2 `3562540` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and Debug runtime build passed | 328 s, 4,477 frames, 4,477 VBlanks raised, 22,898 IRQs; no fatal heartbeat, crash report, or error-pattern log hit; follow-up framebuffer showed active gameplay/tutorial content |
 | Mega Man X6 `66d0f16` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | 328 s, 4,400 frames, 4,401 VBlanks raised, 59,918 IRQs; no fatal heartbeat, crash report, or error-pattern log hit; follow-up framebuffer showed the active intro sequence |
 | Ape Escape `3367eb1` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | Initial parallel run: 328 s, 5,231 frames, 5,231 VBlanks raised, 25,405 IRQs, clean. Isolated follow-up: 4,418 frames, clean, framebuffer showed active intro/demo content |
+
+The user additionally completed visible manual attract, gameplay, and save-load
+smoke checks across all four games. The simultaneous three-game pass was
+subjectively sluggish under host contention, so it is compatibility evidence,
+not a performance comparison.
 
 The soaks used `--headless --no-launcher --renderer software`, isolated working
 directories, and distinct debug ports. They cover guest execution, disc/CD,
