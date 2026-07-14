@@ -11,6 +11,7 @@
  */
 
 #include "cdrom.h"
+#include "cdrom_irq.h"
 #include "dma.h"
 #include "spu.h"
 #include "event_ring.h"
@@ -578,7 +579,8 @@ static void present_cdrom_irq(void) {
      * the guest's command/ack write — and thus from being lost to that ISR's
      * own trailing INTC ack. */
     if (cdrom_irq_present_delay > 0) return;
-    if (irq_flag && (irq_enable & (1 << (irq_flag - 1))) && !cdrom_intc_request_latched) {
+    if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag) &&
+        !cdrom_intc_request_latched) {
         psx_irq_raise(2, irq_flag); /* IRQ_CDROM; detail = CD response/IRQ type */
         cdrom_intc_request_latched = 1;
         cdrom_intc_latched_generation = cdrom_irq_generation;
@@ -590,7 +592,7 @@ static void present_cdrom_irq(void) {
 /* Fire CDROM IRQ into the interrupt controller (explicit, per command/response).
  * Trace the masked case here only (low-frequency); refresh stays silent. */
 static void fire_cdrom_irq(void) {
-    if (irq_flag && !(irq_enable & (1 << (irq_flag - 1)))) {
+    if (irq_flag && !cdrom_irq_mask_matches_reason(irq_enable, irq_flag)) {
         trace_cdrom('f', 0, irq_flag, 0);
     }
     present_cdrom_irq();
@@ -1841,7 +1843,7 @@ uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
     if (!(i_mask & (1u << 2))) return 0xFFFFFFFFu;   /* IRQ_CDROM masked */
     uint32_t best = 0xFFFFFFFFu;
     /* Armed response awaiting presentation (will raise bit2 when delay hits 0). */
-    if (irq_flag && (irq_enable & (1u << (irq_flag - 1)))) {
+    if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag)) {
         uint32_t d = cdrom_irq_present_delay > 0 ? (uint32_t)cdrom_irq_present_delay : 0u;
         if (d < best) best = d;
     }
