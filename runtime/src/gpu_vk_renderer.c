@@ -226,7 +226,7 @@ static VkFormat         s_sc_format;
 static VkExtent2D       s_sc_extent;
 static uint32_t         s_sc_count;
 static VkImage          s_sc_images[8];
-static int              s_present_mode_req = 1;   /* 1 FIFO, 0 IMMEDIATE, -1 MAILBOX */
+static int              s_present_mode_req = 1;   /* 1 tear-free, 0 IMMEDIATE, -1 MAILBOX */
 
 /* Per-frame sync (double-buffered command recording). */
 #define VK_FRAMES 2
@@ -778,9 +778,11 @@ static VkPresentModeKHR choose_present_mode(void) {
     if (n > 8) n = 8;
     VkPresentModeKHR modes[8];
     p_vkGetPhysicalDeviceSurfacePresentModesKHR(s_phys, s_surface, &n, modes);
-    VkPresentModeKHR want = (s_present_mode_req == 0) ? VK_PRESENT_MODE_IMMEDIATE_KHR
-                          : (s_present_mode_req < 0)  ? VK_PRESENT_MODE_MAILBOX_KHR
-                          :                             VK_PRESENT_MODE_FIFO_KHR;
+    /* The frontend already owns frame cadence. Prefer MAILBOX for tear-free
+     * delivery so FIFO does not introduce a second blocking pacer. */
+    VkPresentModeKHR want = (s_present_mode_req == 0)
+                          ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                          : VK_PRESENT_MODE_MAILBOX_KHR;
     for (uint32_t i = 0; i < n; i++) if (modes[i] == want) return want;
     return VK_PRESENT_MODE_FIFO_KHR;  /* always supported */
 }
