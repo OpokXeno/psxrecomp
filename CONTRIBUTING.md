@@ -95,6 +95,11 @@ Known game repos:
 - [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
 - [ApeEscapeRecomp](https://github.com/mstan/ApeEscapeRecomp) — *Ape Escape*
 
+Maintainers record evaluated external branches, game repos, exact revisions,
+and reusable upstream candidates in the
+[`ecosystem watch`](docs/ecosystem-watch.md). Check it before porting work from
+an older framework fork.
+
 ### Framework changes and the pin
 
 Because each game pins an exact framework commit (its `psxrecomp/` submodule
