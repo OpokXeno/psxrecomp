@@ -27,23 +27,33 @@ X1_MCYC_PER_S = 33.8688  # NTSC PSX CPU clock, guest Mcyc per real second at 1x
 
 
 class Client:
+    """One-shot connection per command (the server aborts a second request
+    on the same socket — matches debug_client.py's connect/send/close)."""
+
     def __init__(self, host, port, timeout=8.0):
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.buf = b""
+        self.host, self.port, self.timeout = host, port, timeout
         self.next_id = 1
 
     def cmd(self, name, **params):
         req = {"cmd": name, "id": self.next_id}
         req.update(params)
         self.next_id += 1
+        self.sock = socket.create_connection((self.host, self.port),
+                                             timeout=self.timeout)
+        self.buf = b""
         self.sock.sendall((json.dumps(req) + "\n").encode())
+        # Responses may span multiple lines (e.g. cdrom_bursts emits one
+        # record per line): accumulate until the buffer parses as one JSON
+        # object, not until the first newline.
         while True:
-            nl = self.buf.find(b"\n")
-            if nl >= 0:
-                line, self.buf = self.buf[:nl], self.buf[nl + 1:]
-                if not line.strip():
-                    continue
-                return json.loads(line)
+            text = self.buf.decode(errors="replace").strip()
+            if text:
+                try:
+                    obj, _end = json.JSONDecoder().raw_decode(text)
+                    self.sock.close()
+                    return obj
+                except json.JSONDecodeError:
+                    pass
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise ConnectionError("server closed")
