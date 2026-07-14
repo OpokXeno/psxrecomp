@@ -21,7 +21,9 @@ struct RecompilerPatch {
     std::string note;
 };
 
-uint32_t recompiler_patch_address_key(uint32_t address);
+inline uint32_t recompiler_patch_address_key(uint32_t address) {
+    return address & 0x1FFFFFFFu;
+}
 
 // Apply the patch targeting address, if any. A main-EXE guard mismatch throws;
 // an overlay mismatch is an expected different variant and leaves the observed

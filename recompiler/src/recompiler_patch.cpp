@@ -23,10 +23,6 @@ uint32_t apply_one_recompiler_patch(const RecompilerPatch& patch,
 
 } // namespace
 
-uint32_t recompiler_patch_address_key(uint32_t address) {
-    return address & 0x1FFFFFFFu;
-}
-
 uint32_t apply_recompiler_patch(const std::vector<RecompilerPatch>& patches,
                                 uint32_t address,
                                 uint32_t observed,
