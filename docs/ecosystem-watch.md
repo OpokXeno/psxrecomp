@@ -11,8 +11,9 @@ framework fixes.
   `master` at `dde268dc0fb9daf8fe6529f4aebfe80995350334` (committed
   `2026-07-13T12:54:28-07:00`).
 - Investigation worktree: `audit/ecosystem-2026-07-13`.
-- This audit inspected diffs and history but did not import external code or
-  reproduce the contributors' game builds.
+- The initial audit inspected diffs and history without importing external
+  code or reproducing the contributors' game builds. Focused follow-up ports
+  are tracked below; the audit branch itself remains documentation-only.
 - A candidate must be game-agnostic or explicitly configured by the game repo,
   hardware-backed where it claims correctness, independently testable, and one
   focused PR. Hard-coded title behavior, generated output, local paths, and
@@ -309,20 +310,34 @@ R4 descend from the PR but do not currently consume its guarded-patch,
 signed-bound, or textured-edge entries; they instead demonstrate that the typed
 profile pattern is continuing to grow.
 
-## Proposed upstream branch queue
+## First-wave implementation branches
 
-No implementation branch has been created yet. The first wave below is small,
-hardware-backed, and suitable for maintainer approval before code is moved.
+The first wave was rebuilt in isolated worktrees from current `master`, reviewed
+through `2026-07-13T22:00:00-07:00`, and published only as draft PRs. Each branch
+has an in-tree `docs/internal/upstream/` record linking its exact source,
+preserving human credit, and listing related material deliberately excluded.
+
+| Draft PR / branch | Implementation commit | Evaluated source | Last evaluated | Validation / state |
+|---|---|---|---|---|
+| [#20 `fix/cdrom-encoded-interrupts-kem0x`](https://github.com/mstan/psxrecomp/pull/20) | [`52eb8e8a`](https://github.com/mstan/psxrecomp/commit/52eb8e8a24ca3715afc835b1994f69e269bf4796) | [PR #14 `dd9e5c6`](https://github.com/mstan/psxrecomp/commit/dd9e5c65073dd41fbac2d965d2f945a866ec59e2) | `2026-07-13` | Focused mask test and standalone compile pass; Kareem co-author |
+| [#17 `fix/spu-end-mute-kem0x`](https://github.com/mstan/psxrecomp/pull/17) | [`76ddcc00`](https://github.com/mstan/psxrecomp/commit/76ddcc008a72b1dbb8d9bee227e02ae6549caa99) | [PR #14 `b2597df`](https://github.com/mstan/psxrecomp/commit/b2597df6d5905a0e183b5309a9b84720cd417e19) | `2026-07-13` | Runtime behavior already on master; new END/REPEAT regression passes; Kareem co-author |
+| [#23 `fix/overlay-init-guard-shaneomac`](https://github.com/mstan/psxrecomp/pull/23) | [`5b8098a9`](https://github.com/mstan/psxrecomp/commit/5b8098a9d997424cbd57829b8ae11369ab06935a) | [PR #16 `e6809cc`](https://github.com/mstan/psxrecomp/commit/e6809ccf7d778a4c2f32d9e27c0ec31a44cbd2ba) | `2026-07-13` | Pre-init regression and standalone compile pass; source co-authors preserved |
+| [#21 `fix/msvc-generated-init-shaneomac`](https://github.com/mstan/psxrecomp/pull/21) | [`05d4f35b`](https://github.com/mstan/psxrecomp/commit/05d4f35bd6314d56ac95e6cec4b90655950dbd86) | [PR #16 `df4cc5c`](https://github.com/mstan/psxrecomp/commit/df4cc5c70ab1e5d0fd2a8f817dd346905d4d0eeb) | `2026-07-13` | MSVC game/BIOS/test builds, 44/44 L2, and 63 runtime objects; original author preserved |
+| [#18 `fix/posix-overlay-export-scan-douglas`](https://github.com/mstan/psxrecomp/pull/18) | [`c0fa9b1e`](https://github.com/mstan/psxrecomp/commit/c0fa9b1e89fb6c210011dc25a92b124df43692d4) | [`df7d1fa`](https://github.com/douglasjv/psxrecomp-tweaks/commit/df7d1faa5f27be0ba357463a763c77efc43e1f91), [`7abbfdf`](https://github.com/douglasjv/psxrecomp-tweaks/commit/7abbfdf38b488d3764b96c155549bc930e0521b6) | `2026-07-13` | Real Linux shared-library fixture and Windows compile pass; awaiting Douglas review |
+| [#22 `feat/config-guarded-mips-patches-douglas`](https://github.com/mstan/psxrecomp/pull/22) | [`e7b61c80`](https://github.com/mstan/psxrecomp/commit/e7b61c807c9e06684bdfeaa47f740c349d253062) | [PR #15 `19001c0`](https://github.com/douglasjv/psxrecomp-tweaks/commit/19001c0a383edde439988b93eb2385e2d789d350) | `2026-07-13` | Patch CTest 1/1, L2 44/44, all recompiler targets build; awaiting Douglas review |
+| [#19 `feat/reachable-main-discovery-douglas`](https://github.com/mstan/psxrecomp/pull/19) | [`bd705bfc`](https://github.com/mstan/psxrecomp/commit/bd705bfcecff91a3c0832ccd01b0504c54b100b1) | [MM8 `8415f3a`](https://github.com/douglasjv/mm8/commit/8415f3a95458c41c7f48fbe36caaf0ee82730720) | `2026-07-13` | Parser/codegen tests, L2 44/44, overlay/static guard pass; awaiting Douglas review |
+
+No draft above should be merged until its source attribution and adapted scope
+are accepted. In particular, the Douglas-derived drafts explicitly await
+Douglas's review and say-so.
+
+## Remaining upstream branch queue
+
+The completed first-wave branches are recorded above. The remaining queue is
+kept narrow so each source and exclusion decision receives its own review.
 
 | Priority | Proposed branch | Source credit | Scope / gate |
 |---|---|---|---|
-| 1 | `fix/cdrom-encoded-interrupts-kem0x` | Kareem Olim, `dd9e5c6` | CD IRQ encoding; PSX-SPX + focused tests |
-| 1 | `fix/spu-end-mute-kem0x` | Kareem Olim, subset of `b2597df` | Generic END/mute only; Beetle comparison |
-| 1 | `fix/overlay-init-guard-shaneomac` | Martin Penkava, subset of `e6809cc` | Lifecycle guards only; boot/save/load regressions |
-| 1 | `fix/msvc-generated-init-shaneomac` | Martin Penkava, `df4cc5c` | MSVC portability; three-compiler build evidence |
-| 1 | `fix/posix-overlay-export-scan-douglas` | Douglas, portions of `df7d1fa`/`7abbfdf` | Linux/macOS overlay loading on current ABI/cache code |
-| 1 | `feat/config-guarded-mips-patches-douglas` | Douglas, `19001c0` | Opcode-verified game-owned data; parser/codegen tests |
-| 1 | `feat/reachable-main-discovery-douglas` | Douglas, `8415f3a` | Bounded/reachable discovery; indirect-target safety |
 | 2 | `fix/sw-raster-exclusive-edges-kem0x` | Kareem Olim, `91a654f` | Edge rules; image/oracle suite |
 | 2 | `fix/gpu-primitive-size-reject-shaneomac` | Martin Penkava, `cfc5d0e` | Complete existing partial hardware rule |
 | 2 | `fix/dirty-text-page-mark-nyper` | NyperYuhgard, subset of `b07cb79` | Dirty/native dispatch invariant; no Crash Bash logging |
