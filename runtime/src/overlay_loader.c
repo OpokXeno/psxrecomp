@@ -1746,6 +1746,13 @@ static void init_callbacks(void) {
             s_callbacks.gte_write_data = gte_write_data;
             s_callbacks.gte_write_ctrl = gte_write_ctrl;
         }
+        /* ABI v12: rfe escape marker — emitted at every `rfe`, including in
+         * overlay-resident exception-context code; mutates the runtime's
+         * shared RFE-pending state so it must forward. */
+        {
+            extern void psx_rfe_mark_escape(void);
+            s_callbacks.rfe_mark_escape = psx_rfe_mark_escape;
+        }
     }
 }
 

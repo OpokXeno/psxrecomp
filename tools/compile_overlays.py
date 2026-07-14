@@ -953,6 +953,15 @@ void psx_restore_state_escape(void) {
     overlay_flush_cycles();
     if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
 }
+/* RFE escape marker (ABI v12): emitted at every `rfe`, including in
+ * overlay-resident exception-context code. Mutates the runtime's shared
+ * RFE-pending state, so it MUST forward (a local no-op would swallow
+ * exception returns). Unconditional — v12 hosts always supply it; the
+ * ABI gate rejects mixes that don't. */
+void psx_rfe_mark_escape(void) {
+    overlay_flush_cycles();
+    g_cbs.rfe_mark_escape();
+}
 /* Faithful-timing functions (ABI v9): overlay code built with PSX_ENABLE_BLOCK_CYCLES
  * emits these; forward to the runtime's real impls so native overlays charge cycles on
  * the SAME timeline as the interp/BIOS (a local copy would diverge). NULL-guarded so a

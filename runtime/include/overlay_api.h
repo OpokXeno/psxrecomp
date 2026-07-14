@@ -46,7 +46,14 @@
 /* v11 batches per-instruction cycle charges inside overlay DLLs and flushes at
  * block/device/store boundaries, removing a cross-DLL callback per instruction
  * without changing the shared guest-cycle timeline. */
-#define PSX_OVERLAY_ABI_VERSION 11
+/* v12: rfe_mark_escape callback — the emitter emits psx_rfe_mark_escape() at
+ * every `rfe` (code_generator.cpp COP0 case), including in overlay-resident
+ * exception-context code (Tomba kernel-window overlays hit this). It mutates
+ * the runtime's shared RFE-pending escape state (interrupts.c), so the DLL
+ * MUST forward — a local no-op would swallow exception returns. Without the
+ * shim any rfe-containing overlay fails to LINK (undefined psx_rfe_mark_escape)
+ * and that variant runs interpreted forever — the gte_read_ctrl class again. */
+#define PSX_OVERLAY_ABI_VERSION 12
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -196,6 +203,10 @@ typedef struct {
     uint32_t (*gte_read_ctrl)(CPUState *cpu, uint8_t reg);
     void     (*gte_write_data)(CPUState *cpu, uint8_t reg, uint32_t value);
     void     (*gte_write_ctrl)(CPUState *cpu, uint8_t reg, uint32_t value);
+    /* RFE escape marker (ABI v12; see the version-history note above).
+     * Appended last; forwards unconditionally — v12 hosts always supply it
+     * and the ABI gate rejects DLL/host mixes that don't. */
+    void     (*rfe_mark_escape)(void);
 } OverlayCallbacks;
 
 #ifdef __cplusplus
