@@ -14,7 +14,7 @@ typedef struct ScanResult {
 static int record_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
     ScanResult *result = (ScanResult *)opaque;
     result->count++;
-    if (strcmp(file->name, "80010000_DEADBEEF.dll") == 0) {
+    if (strcmp(file->name, "80010000_DEADBEEF.so") == 0) {
         result->addr = file->region_start;
         result->crc = file->content_crc;
     }
@@ -23,16 +23,16 @@ static int record_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
 
 static void check_name_parser(void) {
     uint32_t addr = 1, crc = 1;
-    assert(psx_overlay_cache_name_parse("00000000_00000000.dll", &addr, &crc));
+    assert(psx_overlay_cache_name_parse("00000000_00000000.so", &addr, &crc));
     assert(addr == 0 && crc == 0);
-    assert(psx_overlay_cache_name_parse("89abcdef_ABCDEF01.dll", &addr, &crc));
+    assert(psx_overlay_cache_name_parse("89abcdef_ABCDEF01.so", &addr, &crc));
     assert(addr == 0x89ABCDEFu && crc == 0xABCDEF01u);
 
-    assert(!psx_overlay_cache_name_parse("G0010000_DEADBEEF.dll", &addr, &crc));
-    assert(!psx_overlay_cache_name_parse("80010000_DEADBEG0.dll", &addr, &crc));
-    assert(!psx_overlay_cache_name_parse("80010000_DEADBEEF.so", &addr, &crc));
-    assert(!psx_overlay_cache_name_parse("80010000-DEADBEEF.dll", &addr, &crc));
-    assert(!psx_overlay_cache_name_parse("80010000_DEADBEEF.dll.extra", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse("G0010000_DEADBEEF.so", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse("80010000_DEADBEG0.so", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse("80010000_DEADBEEF.dll", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse("80010000-DEADBEEF.so", &addr, &crc));
+    assert(!psx_overlay_cache_name_parse("80010000_DEADBEEF.so.extra", &addr, &crc));
 }
 
 int main(int argc, char **argv) {
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
     assert(handle == NULL); /* A directory is not a loadable overlay library. */
 
     char fixture[1024];
-    snprintf(fixture, sizeof(fixture), "%s/80010000_DEADBEEF.dll", argv[1]);
+    snprintf(fixture, sizeof(fixture), "%s/80010000_DEADBEEF.so", argv[1]);
     handle = psx_overlay_posix_library_open(fixture, error, sizeof(error));
     assert(handle != NULL);
     typedef int (*AbiFn)(void);
