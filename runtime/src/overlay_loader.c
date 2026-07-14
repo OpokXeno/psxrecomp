@@ -1348,6 +1348,23 @@ static void scan_cache_dir(void) {
         warn_on_cgtag_mismatch("gcc");
         warn_on_cgtag_mismatch("tcc");
     }
+
+    /* Opt-in startup/rescan inventory from PR #13. Current master deliberately
+     * keeps routine loader events off stderr, so retain that policy unless the
+     * operator explicitly requests the diagnostic. */
+    const char *inventory = getenv("PSX_OVERLAY_CACHE_INVENTORY");
+    if (inventory && *inventory && *inventory != '0') {
+        fprintf(stderr, "overlay cache scan: %d shared library file(s) indexed "
+                        "[arch=%s]\n", s_cache_idx_count, PSX_OVERLAY_ARCH_ABI);
+        for (int i = 0; i < s_cache_idx_count; i++) {
+            const char *base = strrchr(s_cache_idx[i].path, '/');
+            base = base ? base + 1 : s_cache_idx[i].path;
+            fprintf(stderr, "  [%d] %s (region=0x%08X, functions=%d)\n",
+                    i, base, s_cache_idx[i].region_start,
+                    s_cache_idx[i].indexed_func_count);
+        }
+        fflush(stderr);
+    }
 }
 
 /* ---- Persisted sljit shard cache (Stage 2, SLJIT_PERSIST_CACHE.md) -------- */
