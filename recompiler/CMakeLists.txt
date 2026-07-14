@@ -233,4 +233,15 @@ if(BUILD_TESTING)
     )
     target_link_libraries(recompiler_patch_test PRIVATE fmt rabbitizer)
     add_test(NAME recompiler_patch_test COMMAND recompiler_patch_test)
+
+    add_executable(recompiler_patch_cxx17_header_test
+        tests/recompiler_patch_cxx17_header_test.cpp
+    )
+    target_include_directories(recompiler_patch_cxx17_header_test PRIVATE src)
+    set_target_properties(recompiler_patch_cxx17_header_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+    add_test(NAME recompiler_patch_cxx17_header_test
+             COMMAND recompiler_patch_cxx17_header_test)
 endif()

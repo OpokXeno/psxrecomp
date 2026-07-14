@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -27,7 +26,7 @@ uint32_t recompiler_patch_address_key(uint32_t address);
 // Apply the patch targeting address, if any. A main-EXE guard mismatch throws;
 // an overlay mismatch is an expected different variant and leaves the observed
 // instruction unchanged.
-uint32_t apply_recompiler_patch(std::span<const RecompilerPatch> patches,
+uint32_t apply_recompiler_patch(const std::vector<RecompilerPatch>& patches,
                                 uint32_t address,
                                 uint32_t observed,
                                 bool overlay_mode);
@@ -36,12 +35,12 @@ uint32_t apply_recompiler_patch(std::span<const RecompilerPatch> patches,
 // CFG analysis. This keeps control-flow replacements and emitted code in sync.
 void apply_recompiler_patches_to_executable(
     PSXRecomp::PS1Executable& executable,
-    std::span<const RecompilerPatch> patches,
+    const std::vector<RecompilerPatch>& patches,
     bool overlay_mode);
 
 // Merge patches received through --config and --ws-config. Byte-identical
 // repeats are deduplicated; conflicting IDs or aliased addresses throw.
 void merge_recompiler_patches(std::vector<RecompilerPatch>& destination,
-                              std::span<const RecompilerPatch> incoming);
+                              const std::vector<RecompilerPatch>& incoming);
 
 } // namespace PSXRecompV4

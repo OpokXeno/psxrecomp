@@ -200,7 +200,7 @@ void codegen_tests() {
           "patch is applied before control-flow analysis");
 
     std::vector<RecompilerPatch> merged{physical_alias};
-    PSXRecompV4::merge_recompiler_patches(merged, {&physical_alias, 1});
+    PSXRecompV4::merge_recompiler_patches(merged, {physical_alias});
     check(merged.size() == 1,
           "config merge deduplicates an identical patch");
 
@@ -208,8 +208,7 @@ void codegen_tests() {
         "gameplay-rate", 0x00010004u, original, replacement, ""};
     check_throws(
         [&] {
-            PSXRecompV4::merge_recompiler_patches(
-                merged, {&conflicting_id, 1});
+            PSXRecompV4::merge_recompiler_patches(merged, {conflicting_id});
         },
         "conflicting recompiler patches",
         "config merge rejects cross-config ID conflicts");

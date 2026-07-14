@@ -7,30 +7,41 @@
 
 namespace PSXRecompV4 {
 
+namespace {
+
+uint32_t apply_one_recompiler_patch(const RecompilerPatch& patch,
+                                    uint32_t address,
+                                    uint32_t observed,
+                                    bool overlay_mode) {
+    if (observed == patch.expected) return patch.replacement;
+    if (overlay_mode) return observed;
+    throw std::runtime_error(fmt::format(
+        "recompiler patch '{}' expected 0x{:08X} at 0x{:08X}, found "
+        "0x{:08X}; wrong game revision or stale patch",
+        patch.id, patch.expected, address, observed));
+}
+
+} // namespace
+
 uint32_t recompiler_patch_address_key(uint32_t address) {
     return address & 0x1FFFFFFFu;
 }
 
-uint32_t apply_recompiler_patch(std::span<const RecompilerPatch> patches,
+uint32_t apply_recompiler_patch(const std::vector<RecompilerPatch>& patches,
                                 uint32_t address,
                                 uint32_t observed,
                                 bool overlay_mode) {
     const uint32_t address_key = recompiler_patch_address_key(address);
     for (const auto& patch : patches) {
         if (recompiler_patch_address_key(patch.address) != address_key) continue;
-        if (observed == patch.expected) return patch.replacement;
-        if (overlay_mode) return observed;
-        throw std::runtime_error(fmt::format(
-            "recompiler patch '{}' expected 0x{:08X} at 0x{:08X}, found "
-            "0x{:08X}; wrong game revision or stale patch",
-            patch.id, patch.expected, address, observed));
+        return apply_one_recompiler_patch(patch, address, observed, overlay_mode);
     }
     return observed;
 }
 
 void apply_recompiler_patches_to_executable(
     PSXRecomp::PS1Executable& executable,
-    std::span<const RecompilerPatch> patches,
+    const std::vector<RecompilerPatch>& patches,
     bool overlay_mode) {
     const uint32_t load_key =
         recompiler_patch_address_key(executable.load_address());
@@ -49,9 +60,8 @@ void apply_recompiler_patches_to_executable(
             (static_cast<uint32_t>(executable.code_data[offset + 1]) << 8) |
             (static_cast<uint32_t>(executable.code_data[offset + 2]) << 16) |
             (static_cast<uint32_t>(executable.code_data[offset + 3]) << 24);
-        const uint32_t resolved = apply_recompiler_patch(
-            std::span<const RecompilerPatch>(&patch, 1), patch.address,
-            observed, overlay_mode);
+        const uint32_t resolved = apply_one_recompiler_patch(
+            patch, patch.address, observed, overlay_mode);
         if (resolved == observed) continue;
 
         executable.code_data[offset] = static_cast<uint8_t>(resolved);
@@ -62,7 +72,7 @@ void apply_recompiler_patches_to_executable(
 }
 
 void merge_recompiler_patches(std::vector<RecompilerPatch>& destination,
-                              std::span<const RecompilerPatch> incoming) {
+                              const std::vector<RecompilerPatch>& incoming) {
     for (const auto& candidate : incoming) {
         bool repeated = false;
         for (const auto& existing : destination) {
