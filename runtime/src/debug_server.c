@@ -6739,6 +6739,13 @@ static void handle_press(int id, const char *json)
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
     s_input_override = buttons;
     s_input_frames   = frames;
+    int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
+                  json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
+    s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
+    for (int i = 0; i < 4; i++) {
+        int v = ax[i] < 0 ? 0x80 : (ax[i] > 255 ? 255 : ax[i]);
+        s_axis_st[i] = (uint8_t)v;
+    }
     send_ok(id);
 }
 
@@ -6748,19 +6755,28 @@ extern uint16_t sio_get_pad_buttons(void);
 extern uint16_t sio_get_pad_buttons_slot(int slot);
 extern int sio_get_pad_connected(int slot);
 extern int sio_get_pad_analog(int slot);
+extern void sio_get_pad_sticks(int slot, uint8_t out[4]);
 static void handle_pad_status(int id, const char *json)
 {
     (void)json;
     uint16_t pad0 = sio_get_pad_buttons_slot(0);
     uint16_t pad1 = sio_get_pad_buttons_slot(1);
+    uint8_t sticks0[4], sticks1[4];
+    sio_get_pad_sticks(0, sticks0);
+    sio_get_pad_sticks(1, sticks1);
     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
-             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s},"
-             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s},"
-             "\"override\":%d,\"override_frames\":%d}\n",
+             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u]},"
+             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"sticks\":[%u,%u,%u,%u]},"
+             "\"override\":%d,\"override_frames\":%d,"
+             "\"override_axes\":[%u,%u,%u,%u],\"override_axes_valid\":%s}\n",
              id, pad0,
              pad0, sio_get_pad_connected(0) ? "true" : "false", sio_get_pad_analog(0) ? "true" : "false",
+             sticks0[0], sticks0[1], sticks0[2], sticks0[3],
              pad1, sio_get_pad_connected(1) ? "true" : "false", sio_get_pad_analog(1) ? "true" : "false",
-             s_input_override, s_input_frames);
+             sticks1[0], sticks1[1], sticks1[2], sticks1[3],
+             s_input_override, s_input_frames,
+             s_axis_st[0], s_axis_st[1], s_axis_st[2], s_axis_st[3],
+             s_axis_override ? "true" : "false");
 }
 
 static void handle_clear_input(int id, const char *json)
