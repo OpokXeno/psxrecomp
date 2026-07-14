@@ -71,7 +71,7 @@ respective files.
 | `exe` | game | path to PS-X EXE file, relative to project root |
 | `load_address` | both | hex string, virtual address of first byte (`"0xBFC00000"` BIOS, `"0x80010000"` typical game) |
 | `entry_pc` | both | hex string, first PC to execute |
-| `text_size` | both | hex string, size in bytes of code segment (used by audits to bound region walks) |
+| `text_size` | both | hex string, size in bytes of the static region. For games this also bounds main-EXE analysis and establishes the overlay floor. A smaller-than-header bound must be verified non-code and 4 KiB aligned. |
 | `stack_base` | game | hex string, initial `$sp` value for the game |
 | `disc` | game (single-disc) | path to .cue, relative to project root |
 | `discs` | game (multi-disc) | array of .cue paths; `disc` is sugar for `discs = [disc]` |
@@ -85,6 +85,7 @@ seeds       = "seeds/ghidra_funcs.txt"                     # game (note: game se
 bios_thunks = "seeds/tomba_bios_thunks.txt"                # game-only
 out_dir     = "generated"                                  # both
 strict      = true                                         # both — currently always true
+discovery   = "whole-image"                                # game-only: "whole-image" or "reachable"
 out_stem    = "SCPH1001"                                   # optional; overrides the auto-derived stem
 ```
 
@@ -92,6 +93,20 @@ Output filenames: `<out_dir>/<out_stem>_full.c` and
 `<out_dir>/<out_stem>_dispatch.c`. If `out_stem` is omitted, it's derived
 from the `rom`/`exe` file basename with the trailing `.BIN` or `.EXE`
 stripped (`Path.stem` is NOT used because it mishandles `SCUS_942.36`).
+
+Game `discovery` defaults to `"whole-image"`, preserving the existing sweep and
+pointer-table heuristics. Opt-in `"reachable"` starts at the executable entry
+and evidence-backed seed roots, then follows callable direct `jal` targets. It
+does not sweep arbitrary bytes for prologues or return-shaped words. Unresolved
+`jalr`/indirect targets and unseen callbacks fail closed to runtime
+interpretation; add an evidence-backed seed (or a `dispatch_root` seed for a
+proven nonstandard boundary) when they should be compiled.
+
+When `game.text_size` is smaller than the PS-X EXE header size, recompilation
+uses it as a static-analysis bound. The value must be nonzero, instruction- and
+4 KiB-aligned, retain `entry_pc`, and not extend past PS1 RAM. The original EXE
+is still loaded from the user's disc. A generated config's canonical final-page
+reservation may be slightly larger than the header; it does not widen analysis.
 
 ## Runtime block
 

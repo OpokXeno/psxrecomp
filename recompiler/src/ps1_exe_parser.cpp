@@ -5,6 +5,76 @@
 
 namespace PSXRecomp {
 
+bool apply_static_analysis_bound(PS1Executable& exe,
+                                 uint32_t configured_size,
+                                 std::string& error_msg) {
+    const uint32_t image_size = exe.header.file_size;
+    const uint64_t configured_end =
+        static_cast<uint64_t>(exe.header.load_address) + configured_size;
+
+    if (configured_size == 0) {
+        error_msg = "game.text_size must be nonzero";
+        return false;
+    }
+    if ((configured_size & 3u) != 0) {
+        error_msg = fmt::format(
+            "game.text_size 0x{:X} is not instruction-aligned", configured_size);
+        return false;
+    }
+    if (configured_end > 0x80200000ull) {
+        error_msg = fmt::format(
+            "game.text_size 0x{:X} extends past PS1 RAM", configured_size);
+        return false;
+    }
+
+    const uint32_t effective_size =
+        configured_size < image_size ? configured_size : image_size;
+    const uint64_t effective_end =
+        static_cast<uint64_t>(exe.header.load_address) + effective_size;
+    if (exe.header.initial_pc < exe.header.load_address ||
+        static_cast<uint64_t>(exe.header.initial_pc) >= effective_end) {
+        error_msg = fmt::format(
+            "game.text_size 0x{:X} excludes entry_pc 0x{:08X}",
+            configured_size, exe.header.initial_pc);
+        return false;
+    }
+
+    if (configured_size > image_size) {
+        // Existing config generation reserves the remainder of the final 4 KiB
+        // page for the runtime overlay floor. That value is not evidence that
+        // bytes beyond the EXE payload exist, so it must not widen analysis.
+        const uint64_t rounded =
+            (static_cast<uint64_t>(image_size) + 0xFFFull) & ~0xFFFull;
+        if (configured_size != rounded) {
+            error_msg = fmt::format(
+                "game.text_size 0x{:X} exceeds PS-X EXE size 0x{:X} "
+                "and is not its canonical page-rounded reservation",
+                configured_size, image_size);
+            return false;
+        }
+        return true;
+    }
+
+    if (configured_size == image_size) return true;
+
+    if ((configured_size & 0xFFFu) != 0) {
+        error_msg = fmt::format(
+            "truncated game.text_size 0x{:X} must be 4 KiB page-aligned",
+            configured_size);
+        return false;
+    }
+    if (exe.code_data.size() != image_size) {
+        error_msg = fmt::format(
+            "cannot apply analysis bound: EXE payload is {} bytes, header is {}",
+            exe.code_data.size(), image_size);
+        return false;
+    }
+
+    exe.header.file_size = configured_size;
+    exe.code_data.resize(configured_size);
+    return true;
+}
+
 // Validate PS1-EXE header
 bool PS1ExeParser::validate_header(const PS1ExeHeader& header, std::string& error_msg) {
     // Check magic identifier

@@ -106,4 +106,13 @@ public:
     static bool validate_header(const PS1ExeHeader& header, std::string& error_msg);
 };
 
+// Restrict a parsed main executable to a title-verified static-analysis size.
+// The original disc image is not modified; only this in-memory analysis view
+// is shortened. Returns false without mutation when the configured bound is
+// invalid. A canonical page-rounded size above the header size is accepted as
+// an existing runtime reservation and leaves the analysis view unchanged.
+bool apply_static_analysis_bound(PS1Executable& exe,
+                                 uint32_t configured_size,
+                                 std::string& error_msg);
+
 } // namespace PSXRecomp

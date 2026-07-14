@@ -206,3 +206,16 @@ target_include_directories(l2_structural_test PRIVATE
     lib/fmt/include
 )
 target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
+
+# Reachable main-EXE discovery test: parser-bound validation plus exact-entry
+# analysis behavior for direct, indirect, seeded, and out-of-bound targets.
+add_executable(reachable_discovery_test
+    tests/reachable_discovery_test.cpp
+    src/function_analysis.cpp
+    src/ps1_exe_parser.cpp
+)
+target_include_directories(reachable_discovery_test PRIVATE
+    include
+    lib/fmt/include
+)
+target_link_libraries(reachable_discovery_test PRIVATE fmt)

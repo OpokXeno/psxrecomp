@@ -549,7 +549,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
     result.call_discovered_count = 0;
     result.state_continuation_count = 0;
 
-    fmt::print("\n=== Exact Overlay Function Analysis ===\n\n");
+    fmt::print("\n=== Exact-Entry Function Analysis ===\n\n");
 
     auto in_exe = [&](uint32_t addr) {
         return addr >= exe_.header.load_address && addr < exe_.end_address() && (addr & 3u) == 0;

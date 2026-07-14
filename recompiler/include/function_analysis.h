@@ -48,9 +48,10 @@ public:
     // Scan entire executable for function boundaries
     FunctionAnalysisResult analyze();
 
-    // Analyze only explicit entry points and direct JAL targets reachable from
-    // them. This is for runtime-loaded overlays where scanning the whole blob
-    // treats data and basic-block targets as standalone functions.
+    // Analyze only explicit entry points and callable direct-JAL targets
+    // reachable from them. Used by runtime-loaded overlays and opt-in main-EXE
+    // reachable discovery. Unresolved jalr/indirect targets do not mint
+    // functions; evidence-backed entries must be supplied explicitly.
     FunctionAnalysisResult analyze_exact_entries(const std::vector<uint32_t>& entries);
 
     // Add a forced entry point address that is treated as a function start

@@ -386,6 +386,7 @@ struct GameConfig {
     std::filesystem::path bios_thunks_path; // optional; empty if not set
     std::filesystem::path out_dir;
     bool                  strict;
+    std::string           discovery;     // "whole-image" (default) or "reachable"
     std::string           out_stem;       // derived if not explicit
 
     // [runtime] block (optional)
