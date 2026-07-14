@@ -2045,6 +2045,40 @@ static void sdl_vblank_present(void) {
 
     runtime_perf_diag_tick();
 
+    /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
+     * than presents so turbo and skipped-frame modes still report game speed. */
+    {
+        static Uint64 fps_last_time = 0;
+        static uint64_t fps_last_frame = 0;
+        static std::string fps_base_title;
+        extern uint64_t s_frame_count;
+        const Uint64 now = SDL_GetPerformanceCounter();
+        const Uint64 frequency = SDL_GetPerformanceFrequency();
+        if (!fps_last_time) {
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+            if (sdl_window) {
+                const char *title = SDL_GetWindowTitle(sdl_window);
+                if (title) fps_base_title = title;
+            }
+        } else if (frequency && now - fps_last_time >= frequency) {
+            const double seconds = (double)(now - fps_last_time) / (double)frequency;
+            const double fps = (double)(s_frame_count - fps_last_frame) / seconds;
+            const double speed = fps / 59.94;
+            if (!g_headless && sdl_window) {
+                char title[256];
+                snprintf(title, sizeof(title), "%s  [%.0f fps %.2fx]",
+                         fps_base_title.c_str(), fps, speed);
+                SDL_SetWindowTitle(sdl_window, title);
+            }
+            std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                         fps, speed, (unsigned long long)s_frame_count);
+            std::fflush(stderr);
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+        }
+    }
+
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
      * returns so the curve is captured even when presents are skipped. */
