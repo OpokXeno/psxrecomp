@@ -12916,11 +12916,12 @@ int debug_server_is_connected(void)
 
 int debug_server_get_input_override(void)
 {
+    int current = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
         if (--s_input_frames == 0)
             s_input_override = -1;
     }
-    return s_input_override;
+    return current;
 }
 
 int debug_server_get_axis_override(unsigned char st[4])
