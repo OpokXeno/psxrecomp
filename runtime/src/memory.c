@@ -510,6 +510,10 @@ int dirty_ram_is_dirty(uint32_t phys) {
     if (phys >= RAM_SIZE) return 0;
     if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
     if (dirty_ram_shellwin_interp() && phys >= 0x00030000u && phys <= 0x0005AFFFu) return 1;
+    /* Experimental fallback for overlays copied into their final location by
+     * ordinary guest CPU stores rather than CD DMA. Dispatch above the static
+     * image floor is treated as dynamic and validated by the interpreter. */
+    if (phys >= g_overlay_region_floor) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
