@@ -194,6 +194,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
+    ${PSXRECOMP_ROOT}/runtime/src/overlay_posix.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_compile_worker.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_backend.c
@@ -506,6 +507,9 @@ function(psxrecomp_add_runtime_target target)
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
     else()
+        if(CMAKE_DL_LIBS)
+            target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+        endif()
         find_package(OpenGL)
         if(OpenGL_FOUND)
             target_link_libraries(${target} PRIVATE OpenGL::GL)
