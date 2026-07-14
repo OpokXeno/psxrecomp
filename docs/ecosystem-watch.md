@@ -342,9 +342,9 @@ merge proposal. The exercise was evaluated through
 | Game repository / test ref | Framework under test | Last evaluated | Regeneration/build | Offscreen attract soak |
 |---|---|---|---|---|
 | Tomba 1 `05e058f` | local combined fixture `bed0c080` | `2026-07-13` | Blocked: no local `SCUS_942.36` or CUE; retained generated C predates the current `psx_game_text_native_ok` ABI | Not run |
-| Tomba 2 `3562540` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and Debug runtime build passed | 328 s, 4,477 frames, 4,477 VBlanks raised, 22,898 IRQs; no fatal heartbeat, crash report, or error-pattern log hit |
-| Mega Man X6 `66d0f16` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | 328 s, 4,400 frames, 4,401 VBlanks raised, 59,918 IRQs; no fatal heartbeat, crash report, or error-pattern log hit |
-| Ape Escape `3367eb1` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | 328 s, 5,231 frames, 5,231 VBlanks raised, 25,405 IRQs; no fatal heartbeat, crash report, or error-pattern log hit |
+| Tomba 2 `3562540` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and Debug runtime build passed | 328 s, 4,477 frames, 4,477 VBlanks raised, 22,898 IRQs; no fatal heartbeat, crash report, or error-pattern log hit; follow-up framebuffer showed active gameplay/tutorial content |
+| Mega Man X6 `66d0f16` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | 328 s, 4,400 frames, 4,401 VBlanks raised, 59,918 IRQs; no fatal heartbeat, crash report, or error-pattern log hit; follow-up framebuffer showed the active intro sequence |
+| Ape Escape `3367eb1` | local combined fixture `bed0c080` | `2026-07-13` | Fresh regeneration and launcher-free Debug runtime build passed | Initial parallel run: 328 s, 5,231 frames, 5,231 VBlanks raised, 25,405 IRQs, clean. Isolated follow-up: 4,418 frames, clean, framebuffer showed active intro/demo content |
 
 The soaks used `--headless --no-launcher --renderer software`, isolated working
 directories, and distinct debug ports. They cover guest execution, disc/CD,
@@ -352,6 +352,14 @@ SPU timing, interrupts, overlay loading, and unattended title/attract
 progression, but are not visual-renderer or audible-output acceptance tests.
 The game worktrees contain only temporary path/junction wiring and regenerated
 output for this exercise; no game-repository change is proposed.
+
+A second three-process framebuffer-check run exposed one load-sensitive test
+harness anomaly: Ape Escape's wall-clock starvation watchdog aborted at frame
+268 after the process received no heartbeat opportunity for 6.59 seconds. It
+had completed the earlier parallel soak, and it immediately passed the isolated
+4,418-frame rerun above. Treat this as host-contention evidence when scheduling
+parallel soaks, not as a reproducible guest or draft-branch failure; retain the
+crash report and starvation dump in the temporary Ape test worktree.
 
 ## Remaining upstream branch queue
 
