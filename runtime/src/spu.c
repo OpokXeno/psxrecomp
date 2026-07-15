@@ -8,6 +8,7 @@
  */
 
 #include "spu.h"
+#include "spu_gauss.h"
 #include "spu_shadow.h"
 #include "audio_trace.h"
 #include "psx_cycles.h"
@@ -72,6 +73,7 @@ typedef struct {
     uint32_t cur_addr;
     uint32_t repeat_addr;
     int16_t samples[SPU_BLOCK_SAMPLES];
+    int16_t previous_samples[3];
     int sample_idx;
     uint32_t phase;
     int16_t hist1;
@@ -319,6 +321,13 @@ static void decode_block(SpuVoice *v) {
     if (filter > 4) filter = 0;
     if (shift > 12) shift = 12;
 
+    /* Gaussian interpolation reaches three samples into the preceding ADPCM
+     * block. KEYON clears samples[], so the first block naturally sees
+     * silence for its unavailable history. */
+    v->previous_samples[0] = v->samples[SPU_BLOCK_SAMPLES - 3];
+    v->previous_samples[1] = v->samples[SPU_BLOCK_SAMPLES - 2];
+    v->previous_samples[2] = v->samples[SPU_BLOCK_SAMPLES - 1];
+
     int out = 0;
     for (int b = 0; b < 14; b++) {
         uint8_t packed = spu_ram[addr + 2u + (uint32_t)b];
@@ -445,7 +454,10 @@ static int16_t voice_next_sample(int idx) {
         decode_block(v);
     }
 
-    int16_t raw_s = v->samples[v->sample_idx];
+    int16_t raw_s = spu_gaussian_interpolate(v->previous_samples,
+                                              v->samples,
+                                              v->sample_idx,
+                                              v->phase);
     /* Apply envelope (0..0x7FFF as a 15-bit gain). */
     int32_t shaped = ((int32_t)raw_s * (int32_t)v->env_level) >> 15;
     if (shaped > 32767)  shaped = 32767;
@@ -453,9 +465,9 @@ static int16_t voice_next_sample(int idx) {
 
     /* Shadow tap: record the four decoded samples bracketing the current
      * sample position + the fractional phase + envelope, BEFORE the phase
-     * advances. The shadow re-interpolates these in float. Cross-block
-     * neighbours clamp to the block edge (the canon never interpolates across
-     * blocks either; documented in docs/SHADOW_ENHANCEMENTS.md). */
+     * advances. The optional shadow keeps its own cubic, block-clamped window;
+     * the canonical hardware path above independently uses the preceding
+     * block's tail for Gaussian interpolation. */
     if (s_shadow_tap_on && s_shadow_tap_frame < SPU_SHADOW_TAP_FRAMES) {
         SpuShadowVoiceTap *t =
             &s_shadow_tap[s_shadow_tap_frame].voice[idx];
