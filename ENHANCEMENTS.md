@@ -322,8 +322,9 @@ turbo), the risky axis is guest time.
   devices advance to deadlines instead of per-block ticks. Attacks the
   ~2x ceiling directly; class-level, all titles inherit. Gate set from
   L1.0's poll/idle share. Shipped: deadline-based device servicing, six Tomba
-  wait sites, and proof-gated generic idle skipping. Cross-game validation is
-  queued at the end. Kill: <10% gain or ONE event-order divergence.
+  wait sites, and proof-gated generic idle skipping. Default-off cross-game
+  smoke validation passed on MMX5 and MMX6. Kill: <10% gain or ONE event-order
+  divergence.
 - [x] **L1.3 — Load-path overlay coverage (killed by gate).** L1.0 measured
   zero in-window interpreter instructions, so there is no coverage win to buy.
 - [x] **L1.4 — Data shards (rejected/quarantined): verify-only SHADOW
@@ -349,8 +350,8 @@ turbo), the risky axis is guest time.
 | Item | Verdict | Evidence / measured result |
 |---|---|---|
 | L1.0 decomposition | DONE | 761 sectors, ~9.5 s baseline window; zero in-window interp; host/static execution dominated. |
-| L1.1 turbo hardening | IMPLEMENTED ON TOMBA; CORPUS GATE OPEN | SDL pump remains before every turbo return; 4-frame engage + 6-frame release debounce passed live QA. Opt-in host-audio sink advances canonical SPU state while discarding only accelerated host output; Tomba listening QA passed after 1,100,752 discarded SPU frames. |
-| L1.2 event horizon | IMPLEMENTED; CORPUS VALIDATION QUEUED | Production cycle advancement already batches device service at event/MMIO deadlines. Six configured PsyQ CD-wait sites delivered ~27% + ~9% stages. Generic idle-loop skip then cut warm bursts 0.53->0.34 s and 2.19->1.73 s, with 4,599 skips / 765M guest cycles and zero CD overwrites. Strictly per-game opt-in. |
+| L1.1 turbo hardening | IMPLEMENTED ON TOMBA; CROSS-GAME SMOKE PASSED | SDL pump remains before every turbo return; 4-frame engage + 6-frame release debounce passed live QA. Opt-in host-audio sink advances canonical SPU state while discarding only accelerated host output; Tomba listening QA passed after 1,100,752 discarded SPU frames. MMX5 and MMX6 debug-tools builds booted through loads into live gameplay with normal visuals/audio; the historic intermittent MMX5 0xE10 root cause remains a separate long-run investigation. |
+| L1.2 event horizon | IMPLEMENTED; CROSS-GAME SMOKE PASSED | Production cycle advancement already batches device service at event/MMIO deadlines. Six configured PsyQ CD-wait sites delivered ~27% + ~9% stages. Generic idle-loop skip then cut warm bursts 0.53->0.34 s and 2.19->1.73 s, with 4,599 skips / 765M guest cycles and zero CD overwrites. Strictly per-game opt-in; MMX5/MMX6 exercised the default-off compatibility path successfully. |
 | L1.3 overlay coverage | KILLED | Interpreter share was zero in the measured load window. |
 | L1.4 asset/data replay | REJECTED FOR NOW | `FUN_8003EF50` replay produced title/game texture corruption despite zero verifier failures: v1 temporal verifier is unsound. Data shards default off and artifacts removed. |
 | Configurable warm CD routes (L1.7 read-speed branch) | ACCEPTED, STRICTLY PER-GAME OPT-IN | Framework accepts up to 16 strict LBA routes with mismatch fallback and consumer-paced IRQ/DMA. Only data-read cadence accelerates; XA/CDDA, seek, and motor timing remain authentic. Tomba multi-route regression: 3 matches, 1,944 accelerated sectors, zero overwrites. Legacy singular config is deprecated. |
@@ -361,7 +362,7 @@ turbo), the risky axis is guest time.
 Method, every experiment: measure first via always-on rings; start flag-gated;
 one per session; kill criterion written before code. `idle_skip`, warm CD routes,
 and the turbo host-audio sink are all strictly per-game opt-in. MMX6 remains the
-next corpus validation.
+next deeper corpus/soak target after its successful boot/load/gameplay smoke.
 
 ---
 

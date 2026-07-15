@@ -67,9 +67,10 @@ Three levers, in ascending order of danger:
    muted (queue capped). ~2x wall on Tomba loads with a healthy overlay
    cache. NOTE (survey 2026-07-13): the primary SDL event pump now runs
    BEFORE the turbo early-return (`main.cpp:2006-2009`), so the historic
-   "Not Responding" starvation appears fixed in code — needs live
-   re-validation, not re-fixing. Still open: MMX5 dev-tools+turbo boot
-   wedge (0xE10 exception storm) — foundation timing bug.
+   "Not Responding" starvation appears fixed in code. A 2026-07-14
+   MMX5 debug-tools+turbo smoke reached live gameplay with normal load,
+   video, and audio; recurrence/root cause of the historic intermittent
+   0xE10 exception storm remains a longer-soak foundation issue.
 2. **disc_speed=4x/instant — PROVEN UNSAFE as a divisor.** Changes how
    many VBlanks fall between guest state transitions; MMX6
    VSync-callback tick counter freezes → boot wedge, even with the
