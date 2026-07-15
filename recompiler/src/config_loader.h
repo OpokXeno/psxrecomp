@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "recompiler_patch.h"
+
 namespace PSXRecompV4 {
 
 // Pad input mode (per player). Replaces the old analog on/off boolean.
@@ -411,7 +413,11 @@ struct GameConfig {
     std::filesystem::path bios_thunks_path; // optional; empty if not set
     std::filesystem::path out_dir;
     bool                  strict;
+    std::string           discovery;     // "whole-image" (default) or "reachable"
     std::string           out_stem;       // derived if not explicit
+    // Game-owned, exact MIPS word replacements. IDs and physical instruction
+    // addresses are unique within a config; see docs/config_schema.md.
+    std::vector<RecompilerPatch> recompiler_patches;
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;

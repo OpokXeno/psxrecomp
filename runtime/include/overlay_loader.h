@@ -49,7 +49,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
  * (loaded DLLs stay loaded); emu thread only. */
 void overlay_loader_rescan(void);
 
-/* True if the cache holds a DLL named <region_start8>_<crc8>.dll. */
+/* True if the cache holds <region_start8>_<crc8>.{dll,so}. */
 int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc);
 
 /* Returns number of functions currently registered in the dynamic table. */

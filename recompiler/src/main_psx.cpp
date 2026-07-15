@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
     const char*           extra_funcs_path = nullptr;
     bool                  inspect_mode = false;
     bool                  overlay_mode = false;
+    bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
     std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
@@ -131,6 +132,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
+    std::vector<PSXRecompV4::RecompilerPatch> instruction_patches;
     bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     uint32_t              ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0,
                           ws_bg2d_startx_site = 0,
@@ -140,13 +142,17 @@ int main(int argc, char** argv) {
                           ws_bg2d_cap_site = 0,
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
+    uint32_t              configured_text_size = 0;
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
         exe_path             = cfg.exe_path;
+        configured_text_size = cfg.text_size;
+        reachable_discovery  = cfg.discovery == "reachable";
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
+        instruction_patches  = cfg.recompiler_patches;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
@@ -244,6 +250,8 @@ int main(int argc, char** argv) {
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
         ws_auto_backdrop_preload = ws_auto_backdrop_preload || wscfg.ws_auto_backdrop_preload;
+        PSXRecompV4::merge_recompiler_patches(
+            instruction_patches, wscfg.recompiler_patches);
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
@@ -259,6 +267,29 @@ int main(int argc, char** argv) {
         fmt::print(stderr, "Failed to parse PS1-EXE: {}\n", error_msg);
         return 1;
     }
+
+    // [game].text_size is the title-owned static-analysis bound. It may trim a
+    // verified data/padding tail, but it may never widen the parsed payload or
+    // exclude the executable entry. Runtime disc loading remains unchanged.
+    if (!config_path.empty()) {
+        const uint32_t parsed_size = exe->header.file_size;
+        std::string bound_error;
+        if (!PSXRecomp::apply_static_analysis_bound(
+                *exe, configured_text_size, bound_error)) {
+            fmt::print(stderr, "Invalid static analysis bound: {}\n", bound_error);
+            return 1;
+        }
+        if (exe->header.file_size < parsed_size) {
+            fmt::print("Static analysis bound: 0x{:X} bytes from game.text_size "
+                       "(PS-X EXE header: 0x{:X})\n",
+                       exe->header.file_size, parsed_size);
+        }
+    }
+
+    // Patch the bounded image before discovery/CFG analysis so replacements of
+    // control-flow instructions cannot disagree with the generated graph.
+    PSXRecompV4::apply_recompiler_patches_to_executable(
+        *exe, instruction_patches, overlay_mode);
 
     fmt::print("✓ Successfully parsed PS1-EXE!\n\n");
 
@@ -434,8 +465,8 @@ int main(int argc, char** argv) {
 
     PSXRecomp::FunctionAnalysisResult analysis_result;
 
-    if (overlay_mode) {
-        // ── Overlay exact mode: partition seeds into walk roots and interior
+    if (overlay_mode || reachable_discovery) {
+        // ── Exact-entry mode: partition seeds into walk roots and interior
         // alias candidates. `interior`-marked seeds (classifier-proven
         // dispatch targets without a callable boundary) are NEVER walk roots —
         // a root inside a host function hard-caps (truncates) it, the
@@ -460,7 +491,11 @@ int main(int argc, char** argv) {
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
         for (uint32_t a : exact_entries) {
-            if (trusted_root_seeds.count(a)) {
+            if (reachable_discovery && a == exe->header.initial_pc) {
+                // The PS-X EXE header is direct execution evidence for the
+                // main entry even when it uses a nonstandard prologue.
+                roots.insert(a);
+            } else if (trusted_root_seeds.count(a)) {
                 /* Classifier-proven dispatch root (install-slot class): the
                  * static code tail-dispatches into this PC, so it is a real
                  * execution root despite having no callable boundary. */
@@ -553,7 +588,7 @@ int main(int argc, char** argv) {
                        "(range-ownership completeness)\n", jal_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
-        fmt::print("Overlay alias entries emitted: {}\n\n", alias_entries.size());
+        fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
     } else {
         // ── Iterative discovery: seed classification + static data-table scan ──
         //
@@ -1095,9 +1130,17 @@ int main(int argc, char** argv) {
             // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
             // with the BIOS dispatch's marker.
             ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
-            ds << "__attribute__((constructor)) static void psx_cps_mark_game(void) {\n";
+            ds << "static void psx_cps_mark_game(void) {\n";
             ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
             ds << "}\n";
+            // Run psx_cps_mark_game before main(). __attribute__((constructor)) is
+            // GCC/Clang-only; MSVC uses a static initializer pointer in .CRT$XCU.
+            ds << "#if defined(_MSC_VER)\n";
+            ds << "#pragma section(\".CRT$XCU\", read)\n";
+            ds << "__declspec(allocate(\".CRT$XCU\")) static void (*psx_cps_mark_game_ctor)(void) = psx_cps_mark_game;\n";
+            ds << "#else\n";
+            ds << "__attribute__((constructor)) static void psx_cps_mark_game_ctor(void) { psx_cps_mark_game(); }\n";
+            ds << "#endif\n";
         }
 
         std::ofstream dispatch_file(dispatch_filename);

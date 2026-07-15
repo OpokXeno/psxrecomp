@@ -11,6 +11,7 @@
  */
 
 #include "cdrom.h"
+#include "cdrom_irq.h"
 #include "dma.h"
 #include "spu.h"
 #include "event_ring.h"
@@ -38,6 +39,7 @@ extern void iso_close(void* handle);
 /* Multi-track TOC accessors (CD-DA / multi-track discs). track is 1-based. */
 extern int iso_track_count(void* handle);
 extern uint32_t iso_track_start_lba(void* handle, int track);
+extern uint32_t iso_track_pregap_lba(void* handle, int track);
 extern int iso_track_is_audio(void* handle, int track);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
@@ -240,6 +242,19 @@ static uint8_t xa_stream_file;
 static uint8_t xa_stream_channel;
 static uint8_t xa_stream_coding;
 static int xa_stream_active;
+
+/* Red Book CD-DA playback state. One raw audio sector contains exactly 588
+ * stereo frames; at 75 sectors/second this is the SPU's native 44.1 kHz. */
+#define CDDA_SECTOR_FRAMES 588
+static int cdda_playing;
+static int cdda_track;
+static uint32_t cdda_lba;
+static int cdda_delay;
+/* Natural track-end INT4 can occur while a previous CD response is still
+ * awaiting acknowledgement. Keep it pending instead of dropping the only
+ * notification the game uses to restart looping level music. */
+static int cdda_data_end_pending;
+static uint64_t cdda_sectors_played;
 
 /* Operating divisor: 1x during BIOS boot, switches to g_game_divisor
  * when the game's entry point first fires (via cdrom_notify_game_started). */
@@ -786,7 +801,8 @@ static void present_cdrom_irq(void) {
      * the guest's command/ack write — and thus from being lost to that ISR's
      * own trailing INTC ack. */
     if (cdrom_irq_present_delay > 0) return;
-    if (irq_flag && (irq_enable & (1 << (irq_flag - 1))) && !cdrom_intc_request_latched) {
+    if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag) &&
+        !cdrom_intc_request_latched) {
         psx_irq_raise(2, irq_flag); /* IRQ_CDROM; detail = CD response/IRQ type */
         cdrom_intc_request_latched = 1;
         cdrom_intc_latched_generation = cdrom_irq_generation;
@@ -799,7 +815,7 @@ static void present_cdrom_irq(void) {
 /* Fire CDROM IRQ into the interrupt controller (explicit, per command/response).
  * Trace the masked case here only (low-frequency); refresh stays silent. */
 static void fire_cdrom_irq(void) {
-    if (irq_flag && !(irq_enable & (1 << (irq_flag - 1)))) {
+    if (irq_flag && !cdrom_irq_mask_matches_reason(irq_enable, irq_flag)) {
         trace_cdrom('f', 0, irq_flag, 0);
     }
     present_cdrom_irq();
@@ -1340,6 +1356,11 @@ static void cdrom_clear_pending_dataready(void) {
 }
 
 static void start_read_stream(uint8_t cmd) {
+    cdda_playing = 0;
+    cdda_track = 0;
+    cdda_delay = 0;
+    cdda_data_end_pending = 0;
+    stat_reg &= (uint8_t)~CDSTAT_PLAY;
     clear_sector_buffer();
     /* Drive-state change cancels any pended notification (Beetle clears
      * AIP on Play/Read/Pause/Stop/Seek alike). */
@@ -1371,6 +1392,127 @@ static void stop_read_stream(void) {
     read_delay = 0;
     s_cd_timing_next_due = 0;
     cdrom_clear_pending_dataready();
+}
+
+static void stop_cdda_playback(void) {
+    cdda_playing = 0;
+    cdda_track = 0;
+    cdda_delay = 0;
+    cdda_data_end_pending = 0;
+    stat_reg &= (uint8_t)~CDSTAT_PLAY;
+}
+
+static void deliver_cdda_data_end(void) {
+    if (!cdda_data_end_pending || irq_flag != 0) return;
+    cdda_data_end_pending = 0;
+    response_clear();
+    response_push(stat_reg);
+    set_irq(CDIRQ_DATA_END);
+    fire_cdrom_irq();
+}
+
+static int cdda_track_for_lba(uint32_t lba) {
+    int count = iso_handle ? iso_track_count(iso_handle) : 0;
+    int found = 0;
+    for (int track = 1; track <= count; ++track) {
+        if (iso_track_pregap_lba(iso_handle, track) > lba) break;
+        found = track;
+    }
+    return found;
+}
+
+static uint32_t cdda_track_end_lba(int track) {
+    int count = iso_handle ? iso_track_count(iso_handle) : 0;
+    if (track > 0 && track < count)
+        return iso_track_pregap_lba(iso_handle, track + 1);
+    return iso_handle ? iso_sector_count(iso_handle) : 0;
+}
+
+static int start_cdda_playback(int requested_track) {
+    uint32_t lba;
+    int track;
+    if (requested_track > 0) {
+        track = requested_track;
+        lba = iso_track_start_lba(iso_handle, track);
+    } else {
+        int pos = s_setloc_lba >= 0
+            ? s_setloc_lba
+            : msf_to_lba(seek_min, seek_sec, seek_sect);
+        if (pos < 0) pos = 0;
+        lba = (uint32_t)pos;
+        track = cdda_track_for_lba(lba);
+    }
+
+    if (track <= 0 || track > iso_track_count(iso_handle) ||
+        !iso_track_is_audio(iso_handle, track))
+        return 0;
+
+    stop_read_stream();
+    spu_cd_audio_reset();
+    cdda_data_end_pending = 0;
+    cdda_playing = 1;
+    cdda_track = track;
+    cdda_lba = lba;
+    cdda_delay = CDROM_SINGLE_SPEED_SECTOR_CYCLES;
+    stat_reg = (stat_reg & ~(CDSTAT_SEEK | CDSTAT_READ)) |
+               CDSTAT_MOTOR | CDSTAT_PLAY;
+    return 1;
+}
+
+static void process_cdda_stream(uint32_t cycles) {
+    if (!cdda_playing) {
+        deliver_cdda_data_end();
+        return;
+    }
+    cdda_delay -= (int)cycles;
+
+    int delivered = 0;
+    while (cdda_playing && cdda_delay <= 0 && delivered < 16) {
+        uint8_t raw[RAW_SECTOR_SIZE];
+        int16_t pcm[CDDA_SECTOR_FRAMES * 2];
+        if (!iso_read_raw_sector(iso_handle, cdda_lba, raw, sizeof(raw))) {
+            memset(pcm, 0, sizeof(pcm));
+        } else {
+            /* BIN/CUE CD-DA sectors store signed 16-bit interleaved stereo in
+             * little-endian byte order. */
+            for (int i = 0; i < CDDA_SECTOR_FRAMES * 2; ++i) {
+                uint16_t u = (uint16_t)raw[i * 2 + 0] |
+                             ((uint16_t)raw[i * 2 + 1] << 8);
+                pcm[i] = (int16_t)u;
+            }
+        }
+
+        if (cd_muted) memset(pcm, 0, sizeof(pcm));
+        cd_apply_decode_volume(pcm, CDDA_SECTOR_FRAMES);
+        spu_cd_audio_push(pcm, CDDA_SECTOR_FRAMES);
+        cdda_sectors_played++;
+        trace_cdrom('a', 0, cdda_lba, (uint32_t)cdda_track);
+
+        cdda_lba++;
+        delivered++;
+        cdda_delay += CDROM_SINGLE_SPEED_SECTOR_CYCLES;
+
+        uint32_t track_end = cdda_track_end_lba(cdda_track);
+        if (track_end == 0 || cdda_lba >= track_end) {
+            int next = cdda_track + 1;
+            int count = iso_track_count(iso_handle);
+            if ((mode_reg & 0x02u) || next > count ||
+                !iso_track_is_audio(iso_handle, next)) {
+                stop_cdda_playback();
+                cdda_data_end_pending = 1;
+                deliver_cdda_data_end();
+            } else {
+                cdda_track = next;
+            }
+        }
+    }
+
+    /* A very large host-side cycle jump must not create an unbounded catch-up
+     * burst. Resume at the authentic next-sector cadence. */
+    if (cdda_playing && cdda_delay <= 0)
+        cdda_delay = CDROM_SINGLE_SPEED_SECTOR_CYCLES;
+
+    deliver_cdda_data_end();
 }
 
 static int data_fifo_ready(void) {
@@ -1571,6 +1713,7 @@ static void exec_command(uint8_t cmd) {
                 * hangs: Tsumu Light's CD library retries Stop forever (~90-frame
                 * timeout) and never advances past its first content load. */
         stop_read_stream();
+        stop_cdda_playback();
         xa_reset_decode();
         spu_cd_audio_reset();
         stat_reg &= ~(CDSTAT_READ | CDSTAT_PLAY | CDSTAT_SEEK);
@@ -1587,9 +1730,10 @@ static void exec_command(uint8_t cmd) {
     case 0x09: { /* Pause */
         int complete_delay = pause_complete_delay_cycles();
         stop_read_stream();
+        stop_cdda_playback();
         xa_reset_decode();
         spu_cd_audio_reset();
-        stat_reg &= ~CDSTAT_READ;
+        stat_reg &= ~(CDSTAT_READ | CDSTAT_PLAY);
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
@@ -1603,6 +1747,7 @@ static void exec_command(uint8_t cmd) {
 
     case 0x0A: /* Init */
         stop_read_stream();
+        stop_cdda_playback();
         spu_cd_audio_reset();
         xa_reset_decode();
         stat_reg = has_disc() ? CDSTAT_MOTOR : CDSTAT_SHELL;
@@ -1681,7 +1826,13 @@ static void exec_command(uint8_t cmd) {
 
     case 0x11: { /* GetlocP */
         int lba;
-        if (reading) {
+        int track = 1;
+        int track_lba = 0;
+        if (cdda_playing) {
+            lba = (int)cdda_lba;
+            track = cdda_track;
+            track_lba = (int)iso_track_start_lba(iso_handle, track);
+        } else if (reading) {
             /* GetlocP reports the drive/sub-Q position. During a read the
              * sector stream has already advanced past the data-ready sector. */
             lba = msf_to_lba(read_min, read_sec, read_sect);
@@ -1692,9 +1843,9 @@ static void exec_command(uint8_t cmd) {
         }
         int rm, rs, rf;
         int am, as, af;
-        lba_to_msf(lba, 0, &rm, &rs, &rf);
+        lba_to_msf(lba - track_lba, 0, &rm, &rs, &rf);
         lba_to_msf(lba, 150, &am, &as, &af);
-        response_push(0x01); /* single data track */
+        response_push(bin_to_bcd(track));
         response_push(0x01);
         response_push(bin_to_bcd(rm));
         response_push(bin_to_bcd(rs));
@@ -1748,28 +1899,31 @@ static void exec_command(uint8_t cmd) {
         break;
     }
 
-    case 0x03: /* Play — start CD-DA audio playback (from SetLoc, or optional
-                * param[0] = BCD track). Multi-track / CD-DA discs (Tomba 2's
-                * Whoopee Camp jingle) issue this; an unhandled Play (default ->
-                * ERROR) stalls the boot. Ack + enter PLAY state so the game's
-                * audio sequence proceeds. (Red Book sample output is not yet
-                * decoded -- silent for now -- but the flow no longer stalls.) */
+    case 0x03: /* Play — start CD-DA audio playback from SetLoc, or from the
+                * optional BCD track number in param[0]. */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR);
             set_irq(CDIRQ_ERROR);
             break;
         }
-        stat_reg = (stat_reg & ~(CDSTAT_SEEK | CDSTAT_READ)) | CDSTAT_MOTOR | CDSTAT_PLAY;
+        {
+            int requested_track = 0;
+            if (param_count >= 1 && param_fifo[0] != 0)
+                requested_track = bcd_to_bin(param_fifo[0]);
+            if (!start_cdda_playback(requested_track)) {
+                response_push(stat_reg | CDSTAT_ERROR);
+                response_push(0x10); /* invalid track / position */
+                set_irq(CDIRQ_ERROR);
+                break;
+            }
+        }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
         break;
 
     case 0x15: /* SeekL (data-mode seek, uses sector headers) */
-    case 0x16: /* SeekP (audio-mode seek, uses subchannel Q) — our hw-sim seeks
-                * to the SetLoc position the same way for both. Needed for
-                * multi-track / CD-DA discs (Tomba 2): the game seeks the audio
-                * track with SeekP, and an unhandled SeekP (default -> ERROR)
-                * makes its CD setup loop forever. */
+    case 0x16: /* SeekP (audio-mode seek, uses subchannel Q) — this model seeks
+                * to the SetLoc position the same way for both commands. */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR | CDSTAT_SEEKERR);
             set_irq(CDIRQ_ERROR);
@@ -1777,6 +1931,7 @@ static void exec_command(uint8_t cmd) {
         }
         xa_reset_decode();
         spu_cd_audio_reset();
+        stop_cdda_playback();
         stat_reg |= CDSTAT_SEEK;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -2093,6 +2248,9 @@ void cdrom_init(const char* cue_path) {
     last_sector_xa_submode = 0;
     last_sector_xa_coding = 0;
     stop_read_stream();
+    stop_cdda_playback();
+    cdda_lba = 0;
+    cdda_sectors_played = 0;
     mode_reg = 0;
     filter_file = 0;
     filter_channel = 0;
@@ -2266,7 +2424,7 @@ uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
     if (!(i_mask & (1u << 2))) return 0xFFFFFFFFu;   /* IRQ_CDROM masked */
     uint32_t best = 0xFFFFFFFFu;
     /* Armed response awaiting presentation (will raise bit2 when delay hits 0). */
-    if (irq_flag && (irq_enable & (1u << (irq_flag - 1)))) {
+    if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag)) {
         uint32_t d = cdrom_irq_present_delay > 0 ? (uint32_t)cdrom_irq_present_delay : 0u;
         if (d < best) best = d;
     }
@@ -2293,6 +2451,7 @@ void cdrom_advance(uint32_t cycles) {
     try_execute_queued_command();
     process_pending(cycles);
     process_read_stream(cycles);
+    process_cdda_stream(cycles);
     refresh_cdrom_irq_line();
 }
 
@@ -2498,6 +2657,9 @@ int cdrom_data_read_active(void) {
     /* read stream state */ \
     X(reading) X(read_min) X(read_sec) X(read_sect) X(mode_reg) \
     X(read_cmd) X(read_delay) X(filter_file) X(filter_channel) X(cd_muted) \
+    /* Red Book CD-DA stream */ \
+    X(cdda_playing) X(cdda_track) X(cdda_lba) X(cdda_delay) \
+    X(cdda_data_end_pending) X(cdda_sectors_played) \
     /* XA ADPCM decode + active-stream identity */ \
     X(xa_hist_l) X(xa_hist_r) X(xa_stream_file) X(xa_stream_channel) \
     X(xa_stream_coding) X(xa_stream_active) \

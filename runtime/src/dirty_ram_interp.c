@@ -280,6 +280,7 @@ extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr
 
 /* Forward decls from memory.c — used to read instruction bytes. */
 extern uint8_t *memory_get_ram_ptr(void);
+extern void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 
 /* MIPS instruction field decoders. */
 static inline uint32_t op_field    (uint32_t i) { return (i >> 26) & 0x3Fu; }
@@ -2211,7 +2212,20 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 #define OV_FPLOG_RET1() do { if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
 
-    if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) return 0;
+    if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) {
+        /* Bulk host transfers can populate post-EXE executable RAM without
+         * passing through the write hooks that mark dirty pages. A real
+         * control transfer to a decodable word above the configured boot-EXE
+         * text end is enough evidence to admit that word to the interpreter.
+         * Data and invalid targets still fail closed. */
+        if (phys < (2u * 1024u * 1024u) &&
+            phys >= g_overlay_region_floor &&
+            dirty_ram_word_looks_decodable(fetch_word(phys))) {
+            dirty_ram_mark_executable_range(phys, 4u);
+        } else {
+            return 0;
+        }
+    }
 
     /* Interp-pressure signal for variant-capture automation (step 2.8):
      * counts dispatches the interpreter actually handles inside a capture

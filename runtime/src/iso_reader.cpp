@@ -51,6 +51,8 @@ bool ISOReader::Open(const std::string& filename) {
         bool     is_audio;
         size_t   file_index;  // index into bin_files
         uint32_t index01;     // INDEX 01 as a file-relative LBA
+        uint32_t index00;     // INDEX 00 pregap, file-relative
+        bool     has_index00;
     };
     std::vector<PendingTrack> pending_tracks;
 
@@ -72,6 +74,8 @@ bool ISOReader::Open(const std::string& filename) {
         std::string line;
         int  cur_track_num   = -1;
         bool cur_track_audio = false;
+        uint32_t cur_index00 = 0;
+        bool cur_has_index00 = false;
         while (std::getline(cue_file, line)) {
             // FILE "filename.bin" BINARY
             size_t file_pos = line.find("FILE");
@@ -104,18 +108,29 @@ bool ISOReader::Open(const std::string& filename) {
             if (std::sscanf(line.c_str(), " TRACK %d %31s", &tn, type) == 2) {
                 cur_track_num   = tn;
                 cur_track_audio = (std::strstr(type, "AUDIO") != nullptr);
+                cur_index00 = 0;
+                cur_has_index00 = false;
                 continue;
             }
 
             // INDEX 01 MM:SS:FF — the track's start (INDEX 00 is its pregap).
             int idx = 0, mm = 0, ss = 0, ff = 0;
             if (std::sscanf(line.c_str(), " INDEX %d %d:%d:%d", &idx, &mm, &ss, &ff) == 4
-                && idx == 1 && cur_track_num >= 1 && !bin_files.empty()) {
+                && cur_track_num >= 1 && !bin_files.empty()) {
+                const uint32_t index_lba = (uint32_t)(((mm * 60 + ss) * 75) + ff);
+                if (idx == 0) {
+                    cur_index00 = index_lba;
+                    cur_has_index00 = true;
+                    continue;
+                }
+                if (idx != 1) continue;
                 PendingTrack t;
                 t.number     = cur_track_num;
                 t.is_audio   = cur_track_audio;
                 t.file_index = bin_files.size() - 1;
-                t.index01    = (uint32_t)(((mm * 60 + ss) * 75) + ff);
+                t.index01    = index_lba;
+                t.index00    = cur_index00;
+                t.has_index00 = cur_has_index00;
                 pending_tracks.push_back(t);
                 cur_track_num = -1;
             }
@@ -164,6 +179,8 @@ bool ISOReader::Open(const std::string& filename) {
         t.number    = p.number;
         t.is_audio  = p.is_audio;
         t.start_lba = segments_[p.file_index].start_lba + p.index01;
+        t.pregap_lba = segments_[p.file_index].start_lba +
+                       (p.has_index00 ? p.index00 : p.index01);
         tracks_.push_back(t);
     }
 
@@ -171,7 +188,7 @@ bool ISOReader::Open(const std::string& filename) {
     // parseable TRACK entries, so TrackCount() is always >= 1.
     if (tracks_.empty()) {
         CDTrack t;
-        t.number = 1; t.is_audio = false; t.start_lba = 0;
+        t.number = 1; t.is_audio = false; t.start_lba = 0; t.pregap_lba = 0;
         tracks_.push_back(t);
     }
 
@@ -319,6 +336,13 @@ int ISOReader::TrackCount() const {
 uint32_t ISOReader::TrackStartLBA(int track) const {
     for (const auto& t : tracks_) {
         if (t.number == track) return t.start_lba;
+    }
+    return 0;
+}
+
+uint32_t ISOReader::TrackPregapLBA(int track) const {
+    for (const auto& t : tracks_) {
+        if (t.number == track) return t.pregap_lba;
     }
     return 0;
 }

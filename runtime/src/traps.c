@@ -1036,8 +1036,8 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
 
     /* Reject non-word-aligned targets — corrupt function pointer. Hard fail. */
     if (addr & 3) {
-        char buf[512];
-        snprintf(buf, sizeof(buf),
+        char buf[16384];
+        int pos = snprintf(buf, sizeof(buf),
             "DISPATCH FATAL: misaligned target 0x%08X\n"
             "  aligned form: 0x%08X\n"
             "  physical:     0x%08X\n"
@@ -1057,9 +1057,54 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             cpu->gpr[2], cpu->gpr[4], cpu->gpr[5],
             cpu->gpr[6], cpu->gpr[7],
             cpu->cop0[14], cpu->cop0[12], cpu->cop0[13]);
-        trap_crash(buf);
+        /* Include the dispatch chain that led to the corrupt target. */
+        {
+            extern uint32_t crash_trace_dispatch_ring_get(int idx);
+            extern uint64_t crash_trace_dispatch_seq_get(void);
+            uint64_t total = crash_trace_dispatch_seq_get();
+            int count = total < 32 ? (int)total : 32;
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                            "\n  dispatch_tail (last %d of %llu):\n", count,
+                            (unsigned long long)total);
+            uint64_t start = total - (uint64_t)count;
+            for (int i = 0; i < count && pos < (int)sizeof(buf) - 48; i++) {
+                uint32_t dispatch = crash_trace_dispatch_ring_get(
+                    (int)((start + (uint64_t)i) & 0xFFFFu));
+                pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                "    [%3d] 0x%08X\n", i, dispatch);
+            }
+        }
+
+        /* Locate stored copies of both the bad pointer and its aligned form.
+         * This is diagnostic-only and runs immediately before the fatal trap. */
+        {
+            extern uint8_t *memory_get_ram_ptr(void);
+            uint8_t *ram = memory_get_ram_ptr();
+            uint32_t needles[2] = { addr, addr & ~3u };
+            int needle_count = needles[0] == needles[1] ? 1 : 2;
+            for (int n = 0; n < needle_count; n++) {
+                int hits = 0;
+                pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                "\n  RAM scan for 0x%08X:\n", needles[n]);
+                for (uint32_t off = 0; off + 4 <= 2u * 1024u * 1024u; off += 4) {
+                    uint32_t word;
+                    memcpy(&word, ram + off, sizeof(word));
+                    if (word != needles[n]) continue;
+                    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                    "    RAM[0x%08X] = 0x%08X\n",
+                                    0x80000000u + off, word);
+                    if (++hits == 16 || pos >= (int)sizeof(buf) - 64) break;
+                }
+                if (!hits)
+                    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                    "    (not found in 2MB PSX RAM)\n");
+            }
+        }
+
+        /* stderr is emitted before trap_crash enters halt-and-serve. */
         fprintf(stderr, "%s", buf);
         fflush(stderr);
+        trap_crash(buf);
         exit(1);
     }
 

@@ -95,6 +95,21 @@
 
 extern "C" uint64_t gte_get_exec_count(void);
 
+/* Cross-language globals defined in C translation units. Declared extern "C" at
+ * file scope so MSVC gives them C linkage (matching the C definitions); without
+ * this MSVC name-mangles the C++ references and they fail to link. GCC/Clang do
+ * not mangle namespace-scope variables, so this is a no-op there. The existing
+ * block-scope `extern` redeclarations inside functions inherit this C linkage. */
+extern "C" {
+    extern uint64_t psx_cycle_count;
+    extern uint64_t s_frame_count;
+    extern uint32_t g_overlay_region_floor;
+    extern int      g_psx_cps_mode;
+    extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
+    extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+    extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
+}
+
 /* memory.c */
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);
@@ -359,6 +374,17 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     }
     *w = width;
     *h = width * den / num;
+}
+
+/* SDL GL attributes are global inputs to the next context creation.  Set the
+ * runtime requirements immediately before every GL window, because launcher
+ * teardown resets them and macOS otherwise supplies a legacy 2.1 context. */
+static void configure_core_gl_context_attributes() {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 }
 
 /* Live native-wide vs squash toggle (ws_nw TCP command) for A/B comparison.
@@ -2100,6 +2126,40 @@ static void sdl_vblank_present(void) {
 
     runtime_perf_diag_tick();
 
+    /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
+     * than presents so turbo and skipped-frame modes still report game speed. */
+    {
+        static Uint64 fps_last_time = 0;
+        static uint64_t fps_last_frame = 0;
+        static std::string fps_base_title;
+        extern uint64_t s_frame_count;
+        const Uint64 now = SDL_GetPerformanceCounter();
+        const Uint64 frequency = SDL_GetPerformanceFrequency();
+        if (!fps_last_time) {
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+            if (sdl_window) {
+                const char *title = SDL_GetWindowTitle(sdl_window);
+                if (title) fps_base_title = title;
+            }
+        } else if (frequency && now - fps_last_time >= frequency) {
+            const double seconds = (double)(now - fps_last_time) / (double)frequency;
+            const double fps = (double)(s_frame_count - fps_last_frame) / seconds;
+            const double speed = fps / 59.94;
+            if (!g_headless && sdl_window) {
+                char title[256];
+                snprintf(title, sizeof(title), "%s  [%.0f fps %.2fx]",
+                         fps_base_title.c_str(), fps, speed);
+                SDL_SetWindowTitle(sdl_window, title);
+            }
+            std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                         fps, speed, (unsigned long long)s_frame_count);
+            std::fflush(stderr);
+            fps_last_time = now;
+            fps_last_frame = s_frame_count;
+        }
+    }
+
     /* Host-stack-usage profile sample — frame counter is now current, and we are
      * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
      * returns so the curve is captured even when presents are skipped. */
@@ -2685,8 +2745,18 @@ int main(int argc, char** argv) {
             g_headless = 1;
             force_no_launcher = true;
         } else if (argv[i][0] != '-') {
-            bios_path = argv[i];
-            bios_from_cli = true;
+            /* The positional BIOS alias predates the named CLI. Consume it at
+             * most once. In particular, never let a stray split argument
+             * replace an explicit --bios path (for example when a Windows
+             * launcher fails to quote a multi-word --window-title value). */
+            if (!bios_from_cli) {
+                bios_path = argv[i];
+                bios_from_cli = true;
+            } else {
+                std::fprintf(stderr,
+                    "psxrecomp: ignoring unexpected positional argument after BIOS selection: %s\n",
+                    argv[i]);
+            }
         }
     }
     if (const char *e = std::getenv("PSX_HEADLESS")) {
@@ -3284,10 +3354,7 @@ int main(int argc, char** argv) {
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
 
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+            configure_core_gl_context_attributes();
 
             /* Launcher opens at the same 4:3 size the game will, so there's no
              * jarring resize on LAUNCH. The dense dashboard needs a usable
@@ -3620,7 +3687,10 @@ int main(int argc, char** argv) {
 #endif
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-    if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
+    if (g_video_renderer == 1) {
+        configure_core_gl_context_attributes();
+        win_flags |= SDL_WINDOW_OPENGL;
+    }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
     /* Fullscreen on launch (launcher "Fullscreen on launch" toggle). DESKTOP
      * fullscreen keeps the desktop resolution and letterboxes the image, matching

@@ -39,7 +39,7 @@ struct RootDirectoryInfo {
 
 /**
  * A CD track parsed from the .cue sheet (or the synthesized single data
- * track for a bare .bin/.iso). Multi-track discs (Tomba 2 etc.) carry a
+ * track for a bare .bin/.iso). Multi-track discs can carry a
  * Red Book CD-DA audio track after the data track; the CD model's TOC
  * commands (GetTN/GetTD) must report them.
  */
@@ -50,6 +50,7 @@ struct CDTrack {
                          // Single-FILE cues: equals the .bin-relative INDEX time.
                          // Multi-FILE cues (redump "(Track N).bin" dumps): the
                          // owning file's first disc sector plus its INDEX time.
+    uint32_t pregap_lba; // disc-relative INDEX 00, or INDEX 01 when absent
 };
 
 /**
@@ -132,10 +133,11 @@ public:
     /**
      * CD-track TOC accessors (multi-track .cue support).
      * TrackCount() is >= 1 (a bare image synthesizes one data track).
-     * TrackStartLBA(n)/TrackIsAudio(n) take a 1-based track number.
+     * TrackStartLBA(n)/TrackPregapLBA(n)/TrackIsAudio(n) take a 1-based track number.
      */
     int      TrackCount() const;
     uint32_t TrackStartLBA(int track) const;
+    uint32_t TrackPregapLBA(int track) const;
     bool     TrackIsAudio(int track) const;
 
     /**

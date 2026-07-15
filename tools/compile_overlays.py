@@ -151,6 +151,11 @@ def is_windows() -> bool:
             or platform.system().startswith(('MSYS', 'CYGWIN', 'MINGW')))
 
 
+def overlay_ext() -> str:
+    """Use the host platform's conventional shared-library suffix."""
+    return '.dll' if is_windows() else '.so'
+
+
 def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
@@ -1695,7 +1700,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         key = binascii.crc32(b''.join(
             struct.pack('<II', ev, crc)
             for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
-        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}.dll')
+        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
         if os.path.exists(dll_path) and not args.force:
             return frag_ids   # already built
         patched_c = os.path.join(tmp, 'frag_patched.c')
@@ -1717,7 +1722,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         if not compile_dll(patched_c, dll_path, include_dirs,
                            gcc=args.gcc, flavor=args.flavor):
             return None
-        write_overlay_ranges_from(frag_ids, dll_path[:-4] + '.ranges')
+        write_overlay_ranges_from(frag_ids, os.path.splitext(dll_path)[0] + '.ranges')
         return frag_ids
 
 
@@ -2084,7 +2089,7 @@ def main():
                                            _interiors | _disp_roots, _executed))
 
         if not args.static:
-            dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}.dll')
+            dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}{overlay_ext()}')
 
         print(f'Overlay  load=0x{load_addr:08X}  size={size}  crc32=0x{crc32:08X}')
         if args.static:
@@ -2278,7 +2283,7 @@ def main():
                     # Emit the per-entry code-range manifest beside the DLL from
                     # the same func-id list we keyed the dedup on. The loader keys
                     # it by the same filename stem with .ranges (replacing .dll).
-                    ranges_out = dll_path[:-4] + '.ranges'
+                    ranges_out = os.path.splitext(dll_path)[0] + '.ranges'
                     if this_ids:
                         nfn = write_overlay_ranges_from(this_ids, ranges_out)
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
