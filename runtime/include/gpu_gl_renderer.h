@@ -67,6 +67,10 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
 
+/* Select full native-wide mirror rendering instead of the centre-splice fast
+ * path. Textured edge expansion needs the complete mirror surface. */
+void gl_renderer_set_wide_fast(int on);
+
 void gl_renderer_shutdown(void);
 
 /* Diagnostics (debug server): read GPU-side VRAM without touching the CPU
