@@ -3584,6 +3584,14 @@ static void gpu_write_gp0_body(uint32_t val) {
 
     /* State: shaded polyline — alternating color, vertex words */
     if (gp0_state == GP0_POLYLINE_SHADED) {
+        /* The terminator can arrive in either the color or vertex position.
+         * Check it before interpreting the alternating shaded-polyline stream;
+         * otherwise a vertex-position terminator is consumed as coordinates and
+         * de-phases all following GP0 commands. */
+        if ((val & 0xF000F000u) == 0x50005000u) {
+            gp0_state = GP0_IDLE;
+            return;
+        }
         /* Even words (after cmd) are colors, odd words are vertices.
          * Sequence: [cmd+C0] [V0] [C1] [V1] [C2] [V2] ...
          * polyline_has_prev tracks: 0=need V0, 1=need C_next, 2=need V_next */
@@ -3598,12 +3606,7 @@ static void gpu_write_gp0_body(uint32_t val) {
             return;
         }
         if (polyline_has_prev == 1) {
-            /* Expecting color word (or terminator). Same hardware rule as the
-             * mono case: ONLY the masked 0x50005000 pattern terminates. */
-            if ((val & 0xF000F000u) == 0x50005000u) {
-                gp0_state = GP0_IDLE;
-                return;
-            }
+            /* Expecting color word. */
             polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
             polyline_has_prev = 2;
             return;
