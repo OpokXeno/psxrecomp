@@ -301,7 +301,7 @@ turbo), the risky axis is guest time.
 
 **Prioritized burndown (most agnostic + most likely beneficial first):**
 
-- [ ] **L1.0 — E0 `load_probe_v2`: load-window decomposition on Tomba 1.**
+- [x] **L1.0 — E0 `load_probe_v2`: load-window decomposition on Tomba 1.**
   100% agnostic, zero risk, prices every bet below. Split a real pig-load
   window into guest time (seek / sector cadence / per-sector processing /
   explicit waits) and host time (native code / decompressors / interp /
@@ -316,32 +316,52 @@ turbo), the risky axis is guest time.
   (b) audio at the HOST SINK only (drop excess samples, crossfade on
   exit; never guest state); (c) root-cause MMX5 dev-tools+turbo 0xE10
   boot wedge (foundation timing bug).
-- [ ] **L1.2 — Event-horizon acceleration + batched device ticking.**
+- [x] **L1.2 — Event-horizon acceleration + batched device ticking.**
   Provably side-effect-free poll/idle regions jump to the next scheduled
   observable event with exact cycle credit + identical event ordering;
   devices advance to deadlines instead of per-block ticks. Attacks the
   ~2x ceiling directly; class-level, all titles inherit. Gate set from
-  L1.0's poll/idle share. Kill: <10% gain or ONE event-order divergence.
-- [ ] **L1.3 — Load-path overlay coverage.** Only if L1.0 shows interp
-  share >~10% in-window; coverage-capture the load path, reshard.
-- [ ] **L1.4 — Data shards (spike/tomba-load-shards): verify-only SHADOW
+  L1.0's poll/idle share. Shipped: deadline-based device servicing, six Tomba
+  wait sites, and proof-gated generic idle skipping. Cross-game validation is
+  queued at the end. Kill: <10% gain or ONE event-order divergence.
+- [x] **L1.3 — Load-path overlay coverage (killed by gate).** L1.0 measured
+  zero in-window interpreter instructions, so there is no coverage win to buy.
+- [x] **L1.4 — Data shards (rejected/quarantined): verify-only SHADOW
   mode, then replay.** Gated on L1.0 (decomp ≥~20-25% host share).
   Correctness bar: temporal write visibility — replay sound only if
   IRQs-off across the window OR duration < next observable event.
-- [ ] **L1.5 — Authentic drive backlog (never-early + catch-up).**
-  Correctness work, not acceleration. Probe deadline-vs-exposure deltas
-  first; prereq = resolve the CD-model split (live tree Ape
-  direct-delivery vs master model).
-- [ ] **L1.6 — Seek-only latency probe.** Bounded (seeks × ~250ms), NOT
-  proven safe, per-game opt-in at best. Kill: seek share <10% of window.
+- [x] **L1.5 — Authentic drive backlog (killed as acceleration).** Passive
+  deadline-vs-exposure probe measured 1,304/1,304 data sectors available on
+  their exact scheduled cycle, then the intentional fixed 5,000-cycle INT1
+  presentation delay. Zero early/late sectors, holds, pending/lost INT1s, or
+  overwrites: there is no artificial lateness for backlog/catch-up to remove.
+- [x] **L1.6 — Seek-only latency probe (killed on Tomba).** The measured
+  New Game window issued zero seek commands. Read-start latency was only
+  7,676,928 / 298,130,657 cycles (2.57%); pause latency was 8.11% but is an
+  authentic CPU-visible ordering contract, not a safe seek-speedup target.
 - [ ] **L1.7 — Phase-2 doors (open only with cause):** per-title read
   speedup with XA/CDDA/MDEC exclusions; decompressor HLE (only via L1.4
   failing for a named reason); load-transition state cache (the only
   true near-zero; needs thousands-of-frames differential validation).
 
-Method, every experiment: measure first via always-on rings; flag-gated
-default-off; one per session; kill criterion written before code; corpus
-gate ≥2 titles (Tomba + MMX6 minimum) before any default flips.
+**Live status / decision ledger (Tomba 1, 2026-07-14):**
+
+| Item | Verdict | Evidence / measured result |
+|---|---|---|
+| L1.0 decomposition | DONE | 761 sectors, ~9.5 s baseline window; zero in-window interp; host/static execution dominated. |
+| L1.1 turbo hardening | IMPLEMENTED ON TOMBA; CORPUS GATE OPEN | SDL pump remains before every turbo return; 4-frame engage + 6-frame release debounce passed live QA. Opt-in host-audio sink advances canonical SPU state while discarding only accelerated host output; Tomba listening QA passed after 1,100,752 discarded SPU frames. |
+| L1.2 event horizon | IMPLEMENTED; CORPUS VALIDATION QUEUED | Production cycle advancement already batches device service at event/MMIO deadlines. Six configured PsyQ CD-wait sites delivered ~27% + ~9% stages. Generic idle-loop skip then cut warm bursts 0.53->0.34 s and 2.19->1.73 s, with 4,599 skips / 765M guest cycles and zero CD overwrites. Strictly per-game opt-in. |
+| L1.3 overlay coverage | KILLED | Interpreter share was zero in the measured load window. |
+| L1.4 asset/data replay | REJECTED FOR NOW | `FUN_8003EF50` replay produced title/game texture corruption despite zero verifier failures: v1 temporal verifier is unsound. Data shards default off and artifacts removed. |
+| Configurable warm CD routes (L1.7 read-speed branch) | ACCEPTED, STRICTLY PER-GAME OPT-IN | Framework accepts up to 16 strict LBA routes with mismatch fallback and consumer-paced IRQ/DMA. Only data-read cadence accelerates; XA/CDDA, seek, and motor timing remain authentic. Tomba multi-route regression: 3 matches, 1,944 accelerated sectors, zero overwrites. Legacy singular config is deprecated. |
+| L1.5 authentic backlog | DONE / KILLED AS ACCELERATION | 1,304/1,304 sectors exact-deadline; INT1 exposure exactly +5,000 cycles; zero holds, pending/lost, or overwrites. |
+| L1.6 seek-only probe | DONE / KILLED ON TOMBA | Automated New Game: 0 seeks across 792 data sectors. Read-start latency was 2.57% of the data span, below the 10% gate. Pause was 8.11% but remains authentic because early completion is a known race/wedge class. |
+| L1.7 state cache / broader HLE | DEFERRED | User excludes savestates; decompressor replay failed correctness. |
+
+Method, every experiment: measure first via always-on rings; start flag-gated;
+one per session; kill criterion written before code. `idle_skip`, warm CD routes,
+and the turbo host-audio sink are all strictly per-game opt-in. MMX6 remains the
+next corpus validation.
 
 ---
 

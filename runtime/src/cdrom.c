@@ -15,6 +15,8 @@
 #include "spu.h"
 #include "event_ring.h"
 #include "audio_trace.h"
+#include "psx_cycles.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #ifndef _WIN32
@@ -166,6 +168,43 @@ static int read_min, read_sec, read_sect;
 static uint8_t mode_reg;
 static uint8_t read_cmd;
 static int read_delay;
+
+/* ---- Sector deadline/exposure telemetry (L1.5, passive) -----------------
+ * One record per physical sector deadline. It separates drive scheduling
+ * lateness (buffer_cycle - due_cycle) from guest/controller backpressure
+ * (IRQ arm/presentation after the buffer already exists). */
+#define CD_TIMING_CAP 4096u
+#define CDT_DATA      0x01u
+#define CDT_DMA       0x02u
+#define CDT_PENDED    0x04u
+#define CDT_LOST      0x08u
+#define CDT_IRQ_ARMED 0x10u
+#define CDT_INTC      0x20u
+typedef struct {
+    uint64_t seq;
+    uint64_t due_cycle;
+    uint64_t buffer_cycle;
+    uint64_t irq_arm_cycle;
+    uint64_t intc_cycle;
+    uint32_t frame;
+    int32_t  lba;
+    uint8_t  flags;
+} CdTimingRecord;
+static CdTimingRecord s_cd_timing[CD_TIMING_CAP];
+static uint64_t s_cd_timing_total;
+static uint64_t s_cd_timing_reset_seq;
+static uint64_t s_cd_timing_next_due;
+static uint64_t s_cd_timing_irq_seq = UINT64_MAX;
+static uint64_t s_cd_timing_pending_seq = UINT64_MAX;
+static uint64_t s_cd_timing_stream_starts;
+static uint64_t s_cd_timing_reset_cycle;
+static uint64_t s_cd_probe_read_start_count, s_cd_probe_read_start_cycles;
+static uint64_t s_cd_probe_pause_count, s_cd_probe_pause_cycles;
+static uint64_t s_cd_probe_seek_count, s_cd_probe_seek_cycles;
+static uint64_t s_cd_probe_motor_count, s_cd_probe_motor_cycles;
+static uint64_t s_cd_probe_stop_count, s_cd_probe_stop_cycles;
+
+static void cd_timing_note_intc(void);
 static uint8_t filter_file;
 static uint8_t filter_channel;
 static uint8_t cd_muted;
@@ -269,6 +308,157 @@ uint32_t g_cd_overwrite_last_frame = 0;
  * effective ceiling is VBLANK_CYCLES_NTSC/CDROM_MIN_DELAY ≈ 1128/frame. */
 static int g_instant_max_per_frame = CDROM_INSTANT_MAX_PER_FRAME_DEFAULT;
 
+/* Config-driven, game-specific warm-load routes. These deliberately change
+ * only non-XA read cadence: the normal command, seek/motor timing, IRQ,
+ * callback, DMA, and guest decompression paths remain authoritative. */
+#define CDROM_WARM_ROUTE_MAX 64
+#define CDROM_WARM_ROUTES_MAX 16
+typedef struct CDROMWarmRoute {
+    int arm_lba;
+    int lbas[CDROM_WARM_ROUTE_MAX];
+    int count;
+    int rate;
+} CDROMWarmRoute;
+static CDROMWarmRoute s_warm_routes[CDROM_WARM_ROUTES_MAX];
+static int      s_warm_routes_count;
+static int      s_warm_route_configured;
+static int      s_warm_route_enabled;
+static int      s_warm_route_armed;
+static int      s_warm_route_armed_lba = -1;
+static int      s_warm_route_active;
+static int      s_warm_route_active_index = -1;
+static int      s_warm_route_next;
+static int      s_warm_route_last_lba = -1;
+static uint64_t s_warm_route_matches;
+static uint64_t s_warm_route_mismatches;
+static uint64_t s_warm_route_sectors;
+static uint64_t s_warm_route_consumer_waits;
+static uint64_t s_warm_route_consumer_wait_cycles;
+
+void cdrom_register_warm_route(int arm_lba, const int* lbas, int count,
+                               int instant_max_per_frame) {
+    if (!lbas || count < 1 || count > CDROM_WARM_ROUTE_MAX || arm_lba < 0 ||
+        s_warm_routes_count >= CDROM_WARM_ROUTES_MAX) return;
+    if (instant_max_per_frame < 1) instant_max_per_frame = 1;
+    if (instant_max_per_frame > 4096) instant_max_per_frame = 4096;
+    CDROMWarmRoute *route = &s_warm_routes[s_warm_routes_count++];
+    memcpy(route->lbas, lbas, (size_t)count * sizeof(lbas[0]));
+    route->arm_lba = arm_lba;
+    route->count = count;
+    route->rate = instant_max_per_frame;
+    s_warm_route_configured = 1;
+    s_warm_route_enabled = 1;
+    s_warm_route_armed = 0;
+    s_warm_route_armed_lba = -1;
+    s_warm_route_active = 0;
+    s_warm_route_active_index = -1;
+    s_warm_route_next = 0;
+    s_warm_route_last_lba = -1;
+}
+
+void cdrom_warm_route_set_enabled(int enabled) {
+    s_warm_route_enabled = enabled ? 1 : 0;
+    if (!s_warm_route_enabled) {
+        s_warm_route_armed = 0;
+        s_warm_route_armed_lba = -1;
+        s_warm_route_active = 0;
+        s_warm_route_active_index = -1;
+        s_warm_route_next = 0;
+        s_warm_route_last_lba = -1;
+    }
+}
+
+static const CDROMWarmRoute* warm_route_current(void) {
+    if (!s_warm_route_active || s_warm_route_active_index < 0 ||
+        s_warm_route_active_index >= s_warm_routes_count) return NULL;
+    return &s_warm_routes[s_warm_route_active_index];
+}
+
+void cdrom_warm_route_stats_json(char* out, int cap) {
+    if (!out || cap <= 0) return;
+    int state_index = s_warm_route_active ? s_warm_route_active_index : -1;
+    const CDROMWarmRoute *route = state_index >= 0
+        ? &s_warm_routes[state_index]
+        : (s_warm_routes_count > 0 ? &s_warm_routes[0] : NULL);
+    snprintf(out, (size_t)cap,
+             "\"configured\":%d,\"enabled\":%d,\"armed\":%d,"
+             "\"active\":%d,\"routes\":%d,\"active_route\":%d,"
+             "\"arm_lba\":%d,\"route_entries\":%d,"
+             "\"next_entry\":%d,\"rate\":%d,\"matches\":%llu,"
+             "\"mismatches\":%llu,\"sectors\":%llu,"
+             "\"consumer_waits\":%llu,\"consumer_wait_cycles\":%llu",
+             s_warm_route_configured, s_warm_route_enabled,
+             s_warm_route_armed, s_warm_route_active, s_warm_routes_count,
+             state_index, route ? route->arm_lba : -1,
+             route ? route->count : 0, s_warm_route_next,
+             route ? route->rate : 0,
+             (unsigned long long)s_warm_route_matches,
+             (unsigned long long)s_warm_route_mismatches,
+             (unsigned long long)s_warm_route_sectors,
+             (unsigned long long)s_warm_route_consumer_waits,
+             (unsigned long long)s_warm_route_consumer_wait_cycles);
+}
+
+static void warm_route_on_setloc(int lba) {
+    if (!s_warm_route_configured || !s_warm_route_enabled) return;
+
+    for (int i = 0; i < s_warm_routes_count; i++) {
+        if (lba == s_warm_routes[i].arm_lba) {
+            s_warm_route_armed = 1;
+            s_warm_route_armed_lba = lba;
+            s_warm_route_active = 0;
+            s_warm_route_active_index = -1;
+            s_warm_route_next = 0;
+            s_warm_route_last_lba = lba;
+            return;
+        }
+    }
+
+    if (!s_warm_route_active) {
+        if (s_warm_route_armed) {
+            int match = -1;
+            for (int i = 0; i < s_warm_routes_count; i++) {
+                if (s_warm_routes[i].arm_lba == s_warm_route_armed_lba &&
+                    lba == s_warm_routes[i].lbas[0]) {
+                    match = i;
+                    break;
+                }
+            }
+            s_warm_route_armed = 0;
+            s_warm_route_armed_lba = -1;
+            if (match >= 0) {
+                s_warm_route_active = 1;
+                s_warm_route_active_index = match;
+                s_warm_route_next = 1;
+                s_warm_route_last_lba = lba;
+                s_warm_route_matches++;
+            } else {
+                s_warm_route_mismatches++;
+            }
+        }
+        return;
+    }
+
+    const CDROMWarmRoute *route = warm_route_current();
+    /* Repeated SetLoc for the current file is harmless. Every transition to
+     * a new file must match the captured order exactly. */
+    if (lba == s_warm_route_last_lba) return;
+    if (route && s_warm_route_next < route->count &&
+        lba == route->lbas[s_warm_route_next]) {
+        s_warm_route_last_lba = lba;
+        s_warm_route_next++;
+        return;
+    }
+
+    s_warm_route_active = 0;
+    s_warm_route_active_index = -1;
+    s_warm_route_armed = 0;
+    s_warm_route_armed_lba = -1;
+    s_warm_route_next = 0;
+    s_warm_route_last_lba = -1;
+    s_warm_route_mismatches++;
+}
+
 void cdrom_set_instant_rate(int per_frame) {
     if (per_frame < 1)    per_frame = 1;
     if (per_frame > 4096) per_frame = 4096;
@@ -281,6 +471,13 @@ static int instant_period(void) {
     return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
 }
 
+static int warm_route_period(void) {
+    const CDROMWarmRoute *route = warm_route_current();
+    int rate = route ? route->rate : CDROM_INSTANT_MAX_PER_FRAME_DEFAULT;
+    int p = VBLANK_CYCLES_NTSC / rate;
+    return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
+}
+
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
@@ -289,6 +486,15 @@ static int apply_speed(int delay) {
     if (g_disc_speed_divisor == 0) return instant_period(); /* bounded 'instant' */
     int d = delay / g_disc_speed_divisor;
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
+}
+
+static int apply_read_speed(int delay) {
+    /* A route is an explicit DATA-read allowlist, never a blanket drive-speed
+     * change. XA filter/ADPCM modes are rejected before the first streaming
+     * sector can set xa_stream_active; established XA remains authentic too. */
+    if (xa_stream_active || (mode_reg & 0x48u)) return delay;
+    if (s_warm_route_active) return warm_route_period();
+    return apply_speed(delay);
 }
 
 /* ---- CD load-burst ring (always-on; CLAUDE.md ring-buffer rule) ----------
@@ -326,8 +532,10 @@ static void burst_note_sector(void) {
     b->end_frame = f;
     b->end_ms    = ms;
     b->sectors++;
-    b->rate    = (uint32_t)g_instant_max_per_frame;
-    b->divisor = (uint32_t)g_disc_speed_divisor;
+    const CDROMWarmRoute *route = warm_route_current();
+    b->rate    = (uint32_t)(route ? route->rate : g_instant_max_per_frame);
+    b->divisor = (uint32_t)(s_warm_route_active ? 0
+                                                : g_disc_speed_divisor);
 }
 
 /* Copy out the most recent `max` bursts, newest first. Returns count. */
@@ -348,7 +556,7 @@ static int sector_delay_cycles(void) {
     int base = (mode_reg & 0x80)
         ? (CDROM_SINGLE_SPEED_SECTOR_CYCLES / 2)
         : CDROM_SINGLE_SPEED_SECTOR_CYCLES;
-    return apply_speed(base);
+    return apply_read_speed(base);
 }
 
 static int initial_read_delay_cycles(void) {
@@ -358,7 +566,7 @@ static int initial_read_delay_cycles(void) {
     int base = (mode_reg & 0x80)
         ? CDROM_SINGLE_SPEED_SECTOR_CYCLES
         : (CDROM_SINGLE_SPEED_SECTOR_CYCLES * 2);
-    return apply_speed(base);
+    return apply_read_speed(base);
 }
 
 static int seek_complete_delay_cycles(void) {
@@ -584,6 +792,7 @@ static void present_cdrom_irq(void) {
         cdrom_intc_latched_generation = cdrom_irq_generation;
         event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
         trace_cdrom('F', 0, irq_flag, 0);
+        if (irq_flag == CDIRQ_DATA_READY) cd_timing_note_intc();
     }
 }
 
@@ -606,6 +815,158 @@ static int bcd_to_bin(uint8_t bcd) {
 
 static int msf_to_lba(int m, int s, int f) {
     return (m * 60 + s) * 75 + f - 150;
+}
+
+static CdTimingRecord *cd_timing_lookup(uint64_t seq) {
+    if (seq == UINT64_MAX || seq >= s_cd_timing_total ||
+        s_cd_timing_total - seq > CD_TIMING_CAP) return NULL;
+    CdTimingRecord *r = &s_cd_timing[seq & (CD_TIMING_CAP - 1u)];
+    return r->seq == seq ? r : NULL;
+}
+
+static uint64_t cd_timing_begin_sector(int lba) {
+    uint64_t seq = s_cd_timing_total++;
+    CdTimingRecord *r = &s_cd_timing[seq & (CD_TIMING_CAP - 1u)];
+    memset(r, 0, sizeof(*r));
+    r->seq = seq;
+    r->due_cycle = s_cd_timing_next_due ? s_cd_timing_next_due : psx_cycle_count;
+    r->buffer_cycle = psx_cycle_count;
+    r->frame = (uint32_t)s_frame_count;
+    r->lba = lba;
+    return seq;
+}
+
+static void cd_timing_flag(uint64_t seq, uint8_t flags) {
+    CdTimingRecord *r = cd_timing_lookup(seq);
+    if (r) r->flags |= flags;
+}
+
+static void cd_timing_arm_irq(uint64_t seq) {
+    CdTimingRecord *r = cd_timing_lookup(seq);
+    if (!r) return;
+    r->flags |= CDT_IRQ_ARMED;
+    r->irq_arm_cycle = psx_cycle_count;
+    s_cd_timing_irq_seq = seq;
+}
+
+static void cd_timing_note_intc(void) {
+    CdTimingRecord *r = cd_timing_lookup(s_cd_timing_irq_seq);
+    if (!r || (r->flags & CDT_INTC)) return;
+    r->flags |= CDT_INTC;
+    r->intc_cycle = psx_cycle_count;
+}
+
+void cdrom_timing_reset(void) {
+    s_cd_timing_reset_seq = s_cd_timing_total;
+    s_cd_timing_stream_starts = 0;
+    s_cd_timing_reset_cycle = psx_cycle_count;
+    s_cd_probe_read_start_count = s_cd_probe_read_start_cycles = 0;
+    s_cd_probe_pause_count = s_cd_probe_pause_cycles = 0;
+    s_cd_probe_seek_count = s_cd_probe_seek_cycles = 0;
+    s_cd_probe_motor_count = s_cd_probe_motor_cycles = 0;
+    s_cd_probe_stop_count = s_cd_probe_stop_cycles = 0;
+}
+
+void cdrom_timing_stats_json(char *out, int cap) {
+    if (!out || cap <= 0) return;
+    uint64_t start = s_cd_timing_reset_seq;
+    uint64_t dropped = 0;
+    if (s_cd_timing_total - start > CD_TIMING_CAP) {
+        dropped = s_cd_timing_total - start - CD_TIMING_CAP;
+        start = s_cd_timing_total - CD_TIMING_CAP;
+    }
+    uint64_t data = 0, exact = 0, early = 0, late = 0;
+    uint64_t late_sum = 0, late_max = 0;
+    uint64_t armed = 0, arm_sum = 0, arm_max = 0;
+    uint64_t exposed = 0, exposure_sum = 0, exposure_max = 0;
+    uint64_t pended = 0, lost = 0, dma = 0, over_sector = 0;
+    uint64_t first_due = UINT64_MAX, last_buffer = 0;
+    uint64_t bins[5] = {0, 0, 0, 0, 0};
+    for (uint64_t seq = start; seq < s_cd_timing_total; seq++) {
+        CdTimingRecord *r = cd_timing_lookup(seq);
+        if (!r || !(r->flags & CDT_DATA)) continue;
+        data++;
+        if (r->due_cycle < first_due) first_due = r->due_cycle;
+        if (r->buffer_cycle > last_buffer) last_buffer = r->buffer_cycle;
+        if (r->buffer_cycle < r->due_cycle) {
+            early++;
+        } else {
+            uint64_t d = r->buffer_cycle - r->due_cycle;
+            if (d == 0) { exact++; bins[0]++; }
+            else {
+                late++; late_sum += d; if (d > late_max) late_max = d;
+                if (d <= 64u) bins[1]++;
+                else if (d <= 1024u) bins[2]++;
+                else if (d <= 5000u) bins[3]++;
+                else bins[4]++;
+            }
+        }
+        if (r->flags & CDT_IRQ_ARMED) {
+            uint64_t d = r->irq_arm_cycle - r->buffer_cycle;
+            armed++; arm_sum += d; if (d > arm_max) arm_max = d;
+        }
+        if (r->flags & CDT_INTC) {
+            uint64_t d = r->intc_cycle - r->buffer_cycle;
+            exposed++; exposure_sum += d;
+            if (d > exposure_max) exposure_max = d;
+            if (d > CDROM_SINGLE_SPEED_SECTOR_CYCLES) over_sector++;
+        }
+        if (r->flags & CDT_PENDED) pended++;
+        if (r->flags & CDT_LOST) lost++;
+        if (r->flags & CDT_DMA) dma++;
+    }
+    snprintf(out, (size_t)cap,
+             "\"stream_starts\":%llu,\"records\":%llu,\"dropped\":%llu,"
+             "\"data_sectors\":%llu,\"schedule_exact\":%llu,"
+             "\"schedule_early\":%llu,\"schedule_late\":%llu,"
+             "\"late_cycles_avg\":%llu,\"late_cycles_max\":%llu,"
+             "\"late_bins\":[%llu,%llu,%llu,%llu,%llu],"
+             "\"irq_armed\":%llu,\"arm_delay_avg\":%llu,"
+             "\"arm_delay_max\":%llu,\"intc_exposed\":%llu,"
+             "\"exposure_delay_avg\":%llu,\"exposure_delay_max\":%llu,"
+             "\"exposure_over_1x_sector\":%llu,\"pended\":%llu,"
+             "\"lost\":%llu,\"dma_refills\":%llu,"
+             "\"data_span_cycles\":%llu,\"window_cycles\":%llu,"
+             "\"read_start_count\":%llu,\"read_start_cycles\":%llu,"
+             "\"pause_count\":%llu,\"pause_cycles\":%llu,"
+             "\"seek_count\":%llu,\"seek_cycles\":%llu,"
+             "\"motor_count\":%llu,\"motor_cycles\":%llu,"
+             "\"stop_count\":%llu,\"stop_cycles\":%llu,"
+             "\"latency_upper_cycles\":%llu",
+             (unsigned long long)s_cd_timing_stream_starts,
+             (unsigned long long)(s_cd_timing_total - s_cd_timing_reset_seq),
+             (unsigned long long)dropped, (unsigned long long)data,
+             (unsigned long long)exact, (unsigned long long)early,
+             (unsigned long long)late,
+             (unsigned long long)(late ? late_sum / late : 0),
+             (unsigned long long)late_max,
+             (unsigned long long)bins[0], (unsigned long long)bins[1],
+             (unsigned long long)bins[2], (unsigned long long)bins[3],
+             (unsigned long long)bins[4], (unsigned long long)armed,
+             (unsigned long long)(armed ? arm_sum / armed : 0),
+             (unsigned long long)arm_max, (unsigned long long)exposed,
+             (unsigned long long)(exposed ? exposure_sum / exposed : 0),
+             (unsigned long long)exposure_max,
+             (unsigned long long)over_sector, (unsigned long long)pended,
+             (unsigned long long)lost, (unsigned long long)dma,
+             (unsigned long long)(first_due != UINT64_MAX && last_buffer >= first_due
+                                  ? last_buffer - first_due : 0),
+             (unsigned long long)(psx_cycle_count - s_cd_timing_reset_cycle),
+             (unsigned long long)s_cd_probe_read_start_count,
+             (unsigned long long)s_cd_probe_read_start_cycles,
+             (unsigned long long)s_cd_probe_pause_count,
+             (unsigned long long)s_cd_probe_pause_cycles,
+             (unsigned long long)s_cd_probe_seek_count,
+             (unsigned long long)s_cd_probe_seek_cycles,
+             (unsigned long long)s_cd_probe_motor_count,
+             (unsigned long long)s_cd_probe_motor_cycles,
+             (unsigned long long)s_cd_probe_stop_count,
+             (unsigned long long)s_cd_probe_stop_cycles,
+             (unsigned long long)(s_cd_probe_read_start_cycles +
+                                  s_cd_probe_pause_cycles +
+                                  s_cd_probe_seek_cycles +
+                                  s_cd_probe_motor_cycles +
+                                  s_cd_probe_stop_cycles));
 }
 
 static uint8_t bin_to_bcd(int val) {
@@ -911,6 +1272,7 @@ static int read_sector_at(int min, int sec, int sect) {
     if (delivery.data_delivered) {
         memcpy(last_sector_buffer, sector_buffer, (size_t)sector_size);
         burst_note_sector();
+        if (s_warm_route_active) s_warm_route_sectors++;
     } else {
         uint32_t copy_size = history_size < SECTOR_BUFFER_SIZE ? (uint32_t)history_size
                                                                : SECTOR_BUFFER_SIZE;
@@ -974,6 +1336,7 @@ static uint64_t s_int1_lost;              /* pended INT1s replaced unseen */
 static void cdrom_clear_pending_dataready(void) {
     pending_dataready = 0;
     pending_dataready_stat = 0;
+    s_cd_timing_pending_seq = UINT64_MAX;
 }
 
 static void start_read_stream(uint8_t cmd) {
@@ -990,6 +1353,10 @@ static void start_read_stream(uint8_t cmd) {
     read_sect = seek_sect;
     read_cmd = cmd;
     read_delay = initial_read_delay_cycles();
+    s_cd_probe_read_start_count++;
+    s_cd_probe_read_start_cycles += (uint64_t)read_delay;
+    s_cd_timing_next_due = psx_cycle_count + (uint64_t)read_delay;
+    s_cd_timing_stream_starts++;
     reading = 1;
     stat_reg |= CDSTAT_READ;
     /* ENQUEUE: sector-read stream scheduled (due in read_delay cycles). A
@@ -1002,6 +1369,7 @@ static void stop_read_stream(void) {
     reading = 0;
     read_cmd = 0;
     read_delay = 0;
+    s_cd_timing_next_due = 0;
     cdrom_clear_pending_dataready();
 }
 
@@ -1148,6 +1516,7 @@ static void exec_command(uint8_t cmd) {
             seek_sect = bcd_to_bin(param_fifo[2]);
             s_setloc_lba = msf_to_lba(seek_min, seek_sec, seek_sect);
             setloc_seek_far = (abs(current_lba - s_setloc_lba) > 16) ? 1 : 0;
+            warm_route_on_setloc(s_setloc_lba);
         }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -1186,6 +1555,8 @@ static void exec_command(uint8_t cmd) {
         pending.cmd = 0x07;
         pending.pending = 1;
         pending.delay = apply_speed(30000); /* motor spin-up */
+        s_cd_probe_motor_count++;
+        s_cd_probe_motor_cycles += (uint64_t)pending.delay;
         pending.phase = 1;
         break;
 
@@ -1208,6 +1579,8 @@ static void exec_command(uint8_t cmd) {
         pending.cmd = 0x08;
         pending.pending = 1;
         pending.delay = apply_speed(30000); /* motor spin-down */
+        s_cd_probe_stop_count++;
+        s_cd_probe_stop_cycles += (uint64_t)pending.delay;
         pending.phase = 1;
         break;
 
@@ -1222,6 +1595,8 @@ static void exec_command(uint8_t cmd) {
         pending.cmd = 0x09;
         pending.pending = 1;
         pending.delay = complete_delay;
+        s_cd_probe_pause_count++;
+        s_cd_probe_pause_cycles += (uint64_t)complete_delay;
         pending.phase = 1;
         break;
     }
@@ -1408,6 +1783,8 @@ static void exec_command(uint8_t cmd) {
         pending.cmd = cmd;   /* 0x15 or 0x16 — completed in process_pending */
         pending.pending = 1;
         pending.delay = seek_complete_delay_cycles();
+        s_cd_probe_seek_count++;
+        s_cd_probe_seek_cycles += (uint64_t)pending.delay;
         pending.phase = 1;
         break;
 
@@ -1590,8 +1967,29 @@ static void process_pending(uint32_t cycles) {
 static uint64_t s_read_hold_cycles;
 static uint64_t s_read_hold_events;
 
+/* Route-only HLE producer/consumer handshake. Do not overwrite a cached
+ * sector or data-ready callback: make the next sector eligible only after the
+ * guest consumes the FIFO and acknowledges the previous notification.
+ * Multi-sector DMA may refill while its original data-ready IRQ is active. */
+static int warm_route_consumer_blocked(void) {
+    if (!s_warm_route_active) return 0;
+    /* Tomba's raw-sector path intentionally consumes 12 header + 2048 data
+     * bytes from a 2340-byte FIFO and leaves the final 280 bytes unread. The
+     * IRQ ack (plus an inactive DMA channel), not sector_available, is the
+     * authoritative consumer-complete handshake. */
+    if (pending_dataready) return 1;
+    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return 1;
+    return 0;
+}
+
 static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
+
+    if (warm_route_consumer_blocked()) {
+        s_warm_route_consumer_waits++;
+        s_warm_route_consumer_wait_cycles += cycles;
+        return;
+    }
 
     /* Disc time NEVER pauses while the drive reads (Beetle cdc.cpp
      * HandleSectorRead: the sector pipeline advances on cycle deadlines
@@ -1603,29 +2001,38 @@ static void process_read_stream(uint32_t cycles) {
     }
 
     if (read_delay <= 0) {
+        uint64_t timing_seq = cd_timing_begin_sector(
+            msf_to_lba(read_min, read_sec, read_sect));
         if (irq_flag == 0) {
             if (sector_available) {
                 trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
             }
-            deliver_read_sector();
+            if (deliver_read_sector()) {
+                cd_timing_flag(timing_seq, CDT_DATA);
+                cd_timing_arm_irq(timing_seq);
+            }
         } else if (dma_cdrom_transfer_active()) {
             /* Active multi-sector CD DMA with the data-ready INT still
              * asserted: refill the buffer so the DMA keeps draining, no new
              * INT (the historical shape; games start the DMA inside the
              * data-ready callback before acking). */
-            deliver_read_sector_without_irq();
+            if (deliver_read_sector_without_irq())
+                cd_timing_flag(timing_seq, CDT_DATA | CDT_DMA);
         } else {
             /* Guest hasn't acked the previous INT yet. Read the sector on
              * schedule (XA audio + buffer overwrite happen inside), and
              * pend its data-ready INT1 one deep. */
             int delivered = deliver_read_sector_without_irq();
             if (delivered) {
+                cd_timing_flag(timing_seq, CDT_DATA | CDT_PENDED);
                 if (pending_dataready) {
                     s_int1_lost++;
                     trace_cdrom('P', 0, (uint32_t)last_sector_lba, 0);
+                    cd_timing_flag(s_cd_timing_pending_seq, CDT_LOST);
                 }
                 pending_dataready = 1;
                 pending_dataready_stat = stat_reg;
+                s_cd_timing_pending_seq = timing_seq;
                 s_int1_pended++;
             }
         }
@@ -1635,6 +2042,7 @@ static void process_read_stream(uint32_t cycles) {
         if (read_delay <= 0) {
             read_delay = sector_delay_cycles();
         }
+        s_cd_timing_next_due = psx_cycle_count + (uint64_t)read_delay;
     }
 }
 
@@ -1643,11 +2051,14 @@ static void process_read_stream(uint32_t cycles) {
  * register clears). Called from the irq_flag ack write. */
 static void present_pending_dataready(void) {
     if (!pending_dataready || irq_flag != 0) return;
+    uint64_t timing_seq = s_cd_timing_pending_seq;
     pending_dataready = 0;
+    s_cd_timing_pending_seq = UINT64_MAX;
     response_clear();
     response_push(pending_dataready_stat);
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
+    cd_timing_arm_irq(timing_seq);
     s_dataready_fires++;
 }
 
@@ -1692,6 +2103,20 @@ void cdrom_init(const char* cue_path) {
     memset(&queued_cmd, 0, sizeof(queued_cmd));
     seek_min = seek_sec = seek_sect = 0;
     setloc_seek_far = 0;
+    s_warm_routes_count = 0;
+    s_warm_route_configured = 0;
+    s_warm_route_enabled = 0;
+    s_warm_route_armed = 0;
+    s_warm_route_armed_lba = -1;
+    s_warm_route_active = 0;
+    s_warm_route_active_index = -1;
+    s_warm_route_next = 0;
+    s_warm_route_last_lba = -1;
+    s_warm_route_matches = 0;
+    s_warm_route_mismatches = 0;
+    s_warm_route_sectors = 0;
+    s_warm_route_consumer_waits = 0;
+    s_warm_route_consumer_wait_cycles = 0;
     cdrom_debug_clear_sector_history();
 
     if (cue_path) {
@@ -1849,7 +2274,8 @@ uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
     if (pending.pending && pending.delay > 0 && (uint32_t)pending.delay < best)
         best = (uint32_t)pending.delay;
     /* Active sector read: next data-ready in read_delay cycles. */
-    if (reading && read_delay > 0 && (uint32_t)read_delay < best)
+    if (reading && !warm_route_consumer_blocked() &&
+        read_delay > 0 && (uint32_t)read_delay < best)
         best = (uint32_t)read_delay;
     return best;
 }
@@ -2037,6 +2463,10 @@ int cdrom_load_in_progress(void) {
             return 1;
     }
     return 0;
+}
+
+int cdrom_data_read_active(void) {
+    return reading && !xa_stream_active;
 }
 
 /* ---- boot snapshot: complete CD-ROM controller FSM (see boot_state.h) ---- */

@@ -29,6 +29,20 @@ int  cdrom_get_setloc_lba(void);
 void cdrom_set_instant_rate(int per_frame);
 int  cdrom_get_instant_rate(void);
 
+/* Strict, config-driven warm-load route accelerator. Up to 16 routes may be
+ * registered after cdrom_init. A route arms only after arm_lba and activates
+ * only if the following SetLoc values match lbas in order. Any mismatch
+ * restores normal disc timing. Only non-XA read cadence is accelerated. */
+void cdrom_register_warm_route(int arm_lba, const int* lbas, int count,
+                               int instant_max_per_frame);
+void cdrom_warm_route_set_enabled(int enabled);
+void cdrom_warm_route_stats_json(char* out, int cap);
+
+/* Passive physical-deadline -> buffer -> INT1 exposure telemetry (L1.5).
+ * Diagnostics only: recording never changes CD scheduling or delivery. */
+void cdrom_timing_reset(void);
+void cdrom_timing_stats_json(char* out, int cap);
+
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA
@@ -52,6 +66,9 @@ uint32_t cdrom_get_burst_total(void);
  * data sector delivered within the burst-gap window). XA streaming is never
  * a load. Drives turbo-through-loads (step 4). */
 int cdrom_load_in_progress(void);
+/* Physical non-XA data-read command state, without the logical load gap
+ * bridge used by cdrom_load_in_progress(). Diagnostics only. */
+int cdrom_data_read_active(void);
 
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);

@@ -121,6 +121,7 @@ int main(int argc, char** argv) {
     bool                  overlay_mode = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
+    std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_cull_slti;         // [widescreen.cull] slti_sites
@@ -149,6 +150,10 @@ int main(int argc, char** argv) {
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
+        if (cfg.vsync_query_func)
+            vsync_query_hle_funcs[cfg.vsync_query_func] = {
+                cfg.vsync_counter_addr, cfg.vsync_gpustat_ptr_addr,
+                cfg.vsync_timer1_ptr_addr, cfg.vsync_timer1_cache_addr };
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
@@ -780,6 +785,7 @@ int main(int argc, char** argv) {
     codegen_config.overlay_mode = overlay_mode;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
     codegen_config.data_shard_funcs = ds_funcs;
+    codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;

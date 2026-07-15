@@ -75,15 +75,23 @@ def delta_top(before, after, k=10):
     return items[:k]
 
 
-def snap(c):
-    fz = c.cmd("freeze_check", window=1)
-    return {
-        "t": time.monotonic(),
-        "wall": time.time(),
-        "cycles": int(fz["psx_cycle_count"]),
-        "frame": int(fz["frame_count"]),
-        "dirty_insns": int(fz["dirty_ram_insns"]),
-    }
+def snap(c, retries=3):
+    # freeze_check occasionally returns a short/err response; retry rather
+    # than kill a long monitoring run over one bad sample.
+    for attempt in range(retries):
+        try:
+            fz = c.cmd("freeze_check", window=1)
+            return {
+                "t": time.monotonic(),
+                "wall": time.time(),
+                "cycles": int(fz["psx_cycle_count"]),
+                "frame": int(fz["frame_count"]),
+                "dirty_insns": int(fz["dirty_ram_insns"]),
+            }
+        except (KeyError, ValueError, json.JSONDecodeError):
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.1)
 
 
 def run(c, secs, tick, out):
@@ -92,12 +100,14 @@ def run(c, secs, tick, out):
     t0 = time.monotonic()
     bursts0 = c.cmd("cdrom_bursts", count=1).get("total", 0)
     phot0 = phot_map(c.cmd("phase_hot", top=64))
+    stat0 = phot_map(c.cmd("phase_hot", set="static", top=64))
     perpc0 = perpc_map(c.cmd("dirty_ram_stats"))
     series = [snap(c)]
     while time.monotonic() - t0 < secs:
         time.sleep(tick)
         series.append(snap(c))
     phot1 = phot_map(c.cmd("phase_hot", top=64))
+    stat1 = phot_map(c.cmd("phase_hot", set="static", top=64))
     perpc1 = perpc_map(c.cmd("dirty_ram_stats"))
     bursts = c.cmd("cdrom_bursts", count=64)
     span_s = series[-1]["t"] - series[0]["t"]
@@ -124,6 +134,7 @@ def run(c, secs, tick, out):
 
     report = {"span_s": span_s, "span_mcyc_per_s": rate,
               "bursts": [], "phot_delta": delta_top(phot0, phot1),
+              "static_delta": delta_top(stat0, stat1, 15),
               "perpc_delta": delta_top(perpc0, perpc1)}
 
     now_t = time.monotonic()
@@ -158,11 +169,15 @@ def run(c, secs, tick, out):
         print(f"    guest {gcyc/1e6:.0f} Mcyc = {rec['guest_s_at_1x']}s at 1x"
               f" -> {rec['multiplier_vs_1x']}x effective")
         print(f"    interp insns in window: {gint}")
-        keys = ("interp", "native", "static", "gpu", "other", "exception")
-        w = ph.get("window", ph)
-        shares = {k: w.get(k) for k in keys if k in w}
+        shares = {k.replace("_share", ""): v for k, v in ph.items()
+                  if k.endswith("_share")}
         print(f"    phase shares (covering secs, approximate): {shares}")
 
+    if report["static_delta"]:
+        tot = sum(v for _, v in report["static_delta"]) or 1
+        print("\ntop STATIC funcs by wall samples (span delta):")
+        for a, v in report["static_delta"]:
+            print(f"    {a}  {v}  ({100.0*v/tot:.1f}% of top)")
     if report["phot_delta"]:
         print("\ntop native-overlay funcs by wall samples (span delta):")
         for a, v in report["phot_delta"]:

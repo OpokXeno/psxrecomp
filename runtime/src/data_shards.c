@@ -82,7 +82,11 @@ static DsShard* s_buckets[DS_KEY_BUCKETS];
 static int s_loaded_keys[256]; static int s_loaded_n = 0;  /* keys with disk load done */
 
 volatile int g_ds_recording = 0;
-static int   s_enabled = 1;
+/* Fail closed. A configured hook is only a candidate boundary; replay must be
+ * enabled explicitly after capture/verification for the current experiment.
+ * This prevents an unsafe persisted candidate from mutating boot assets before
+ * the debug/control plane is available to disable it. */
+static int   s_enabled = 0;
 
 /* ---- recorder state ---- */
 static CPUState* s_arm_cpu = 0;

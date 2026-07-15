@@ -5,6 +5,8 @@
 #include <vector>
 #include <sstream>
 #include <set>
+#include <map>
+#include <array>
 #include "ps1_exe_parser.h"
 #include "function_analysis.h"
 #include "control_flow.h"
@@ -55,6 +57,13 @@ struct CodeGenConfig {
     // every jr-$ra return gets `psx_datashard_ret(cpu)` (capture finalize).
     // See docs/DATA_SHARDS.md. Empty = no hooks (default).
     std::set<uint32_t> data_shard_funcs;
+
+    // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
+    // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
+    // guest RAM VBlank counter returned by that query path.  Empty = inert.
+    // value = {VBlank counter, GPUSTAT-pointer global, Timer1-pointer global,
+    //          cached Timer1 global}
+    std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
 
     // MMX6-class 2D tile-ring stage initializer. Emit a reveal-invalidation
     // callback at entry so host-only wide pixels cannot survive a stage swap.

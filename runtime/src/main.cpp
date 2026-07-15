@@ -15,6 +15,7 @@
 #include "text_xlate.h"
 #include "boot_state.h"
 #include "bios_hle.h"
+#include "load_accel.h"
 #include "savestate.h"
 #include "overlay_capture.h"
 #include "overlay_loader.h"
@@ -24,6 +25,7 @@
 #include "overlay_backend.h"
 #include "gpu.h"
 #include "present_ring.h"
+#include "load_transition_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
@@ -395,14 +397,18 @@ int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
 extern "C" {
 int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
+int      g_turbo_audio_sink_enabled = 0;
+int      g_turbo_audio_sink_active = 0;
+uint64_t g_turbo_audio_sink_frames = 0; /* guest SPU frames advanced, not queued */
 }
-/* Engage turbo only after a load has been continuously in progress for this many
- * frames. Filters brief incidental reads (e.g. a boss/stage-select screen that
- * streams XA music and reads a few preview sectors as you hover): each 1-2 frame
- * blip would otherwise flip turbo on, muting the music for the audio hangover and
- * stuttering the frame rate. Real loads hold for hundreds of frames, so they
- * lose only this brief authentic-paced prefix. */
-#define TURBO_LOADS_ENGAGE_FRAMES 20
+/* The CD predicate already excludes XA and holds across ordinary inter-file
+ * gaps. A short engage debounce rejects a one-frame controller blip without
+ * leaving a visible authentic-paced prefix on every real load. Once engaged,
+ * a symmetric release debounce rides through tiny late-sector/IRQ gaps. This
+ * changes host presentation/pacing only; guest cycles and input sampling keep
+ * advancing normally. */
+#define TURBO_LOADS_ENGAGE_FRAMES  4
+#define TURBO_LOADS_RELEASE_FRAMES 6
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -837,14 +843,17 @@ static void sdl_audio_gain_ramp(int16_t* buf, int frames, float g0, float g1) {
 static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
 static int       sdl_audio_fadein_left  = 0;
 
-static void sdl_audio_pump(void) {
+static void sdl_audio_pump(bool discard_output = false) {
     if (!sdl_audio_device) return;
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
     const bool legacy = audio_legacy_mode();
     static int had_audio = 0;
     uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
-    if (legacy) {
+    if (discard_output) {
+        /* Host-only sink: skip all queue/bridge interaction, but continue to
+         * the guest-cycle sample budget and spu_render below. */
+    } else if (legacy) {
         /* Historical push model + baseline measurement: a drained (==0) queue
          * means the device was silence-filling since the last pump = a gap.
          * Only meaningful after the first audio has been queued. */
@@ -910,6 +919,11 @@ static void sdl_audio_pump(void) {
 
     audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
     spu_render(sdl_audio_buf, frames);
+    if (discard_output) {
+        g_turbo_audio_sink_frames += (uint64_t)frames;
+        audio_trace_event(AUDIO_EV_SINK_DROP, (uint32_t)frames, 0);
+        return;
+    }
     if (sdl_audio_fadein_left > 0) {
         const float g0 = 1.0f - (float)sdl_audio_fadein_left
                                 / (float)sdl_audio_fade_samples;
@@ -1049,7 +1063,7 @@ static void runtime_perf_diag_tick() {
     for (int i = 0; i < 6; i++) last_up[i] = up[i];
 }
 
-static void sdl_audio_update(int turbo_active) {
+static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
     if (!sdl_audio_device) return;
     {   /* Tag audio events with the vblank frame counter. */
         extern uint64_t s_frame_count;
@@ -1058,8 +1072,9 @@ static void sdl_audio_update(int turbo_active) {
     const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
     static int muted = 0;
     static int hangover = 0;
+    static int sink_was_active = 0;
 
-    if (turbo_active) {
+    if (hard_mute_active) {
         if (!muted) {
             int tail = sdl_audio_fade_samples;
             const int buf_cap = (int)(sizeof(sdl_audio_buf) / (2 * sizeof(int16_t)));
@@ -1094,7 +1109,24 @@ static void sdl_audio_update(int turbo_active) {
         extern int g_audio_unmute_resync;
         g_audio_unmute_resync = 1;
     }
-    sdl_audio_pump();
+    if (turbo_sink_active) {
+        if (!sink_was_active) {
+            sink_was_active = 1;
+            audio_trace_event(AUDIO_EV_MUTE, 0, 2); /* b=2: discard-only sink */
+        }
+        g_turbo_audio_sink_active = 1;
+        sdl_audio_pump(true);
+        return;
+    }
+    g_turbo_audio_sink_active = 0;
+    if (sink_was_active) {
+        sink_was_active = 0;
+        sdl_audio_fadein_left = sdl_audio_fade_samples;
+        audio_trace_event(AUDIO_EV_UNMUTE,
+                          (uint32_t)sdl_audio_fadein_left, 2);
+        g_audio_unmute_resync = 1;
+    }
+    sdl_audio_pump(false);
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
@@ -2009,6 +2041,44 @@ static PresRingEntry* present_ring_commit(uint8_t path, uint16_t disp_w,
     return e;
 }
 
+/* ---- Load-transition ring ---------------------------------------------
+ * State edges only, rather than one record per frame. This makes the exact
+ * CD-read -> bridged-load -> turbo -> paced transitions cheap and queryable
+ * without changing any runtime behavior. */
+#define LOAD_TRANSITION_CAP 512u
+static LoadTransitionEntry s_load_transitions[LOAD_TRANSITION_CAP];
+static uint64_t s_load_transition_total = 0;
+
+extern "C" uint64_t load_transition_total(void) {
+    return s_load_transition_total;
+}
+extern "C" int load_transition_get(uint64_t seq, LoadTransitionEntry *out) {
+    if (seq >= s_load_transition_total) return 0;
+    if (s_load_transition_total - seq > LOAD_TRANSITION_CAP) return 0;
+    *out = s_load_transitions[seq & (LOAD_TRANSITION_CAP - 1u)];
+    return 1;
+}
+
+static void load_transition_note(int read_active, int load_active,
+                                 int turbo_active, int load_run) {
+    static int prev_read = -1, prev_load = -1, prev_turbo = -1;
+    if (read_active == prev_read && load_active == prev_load &&
+        turbo_active == prev_turbo) return;
+    extern uint64_t s_frame_count;
+    LoadTransitionEntry *e =
+        &s_load_transitions[s_load_transition_total & (LOAD_TRANSITION_CAP - 1u)];
+    s_load_transition_total++;
+    e->frame = (uint32_t)s_frame_count;
+    e->host_ms = (uint32_t)SDL_GetTicks();
+    e->load_run = (uint16_t)(load_run > 0xFFFF ? 0xFFFF : load_run);
+    e->read_active = (uint8_t)(read_active != 0);
+    e->load_active = (uint8_t)(load_active != 0);
+    e->turbo_active = (uint8_t)(turbo_active != 0);
+    prev_read = read_active;
+    prev_load = load_active;
+    prev_turbo = turbo_active;
+}
+
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -2097,26 +2167,33 @@ static void sdl_vblank_present(void) {
      * sampled into SIO.  Always-on; queried via the debug server "latency". */
     latency_ring_frame_begin();
 
-    /* Turbo-active test, shared by the audio gate here and the pacing/
-     * present gate below. sdl_audio_update owns the mute + fade-in/out +
-     * debounce across turbo transitions (see its comment). */
+    /* Turbo-active test shared by the pacing/present gate below. */
     int turbo_loads_active = 0;
+    extern int fntrace_is_game_started(void);
+    int logical_load_active = fntrace_is_game_started() && cdrom_load_in_progress();
+    int load_run_value = 0;
+    static int load_run = 0;
+    static int release_run = 0;
     if (g_turbo_loads_enabled) {
-        extern int fntrace_is_game_started(void);
-        /* Hysteresis: count consecutive frames the load has held, and only
-         * engage turbo once it is SUSTAINED (TURBO_LOADS_ENGAGE_FRAMES). This
-         * stops brief incidental reads on music screens (boss/stage select) from
-         * flickering turbo on and chopping the audio. cdrom_load_in_progress()
-         * already bridges short intra-load gaps (CD_BURST_GAP_FRAMES), so a real
-         * load's counter does not reset mid-load. */
-        static int load_run = 0;
-        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
+        /* Require a short sustained predicate on entry, then retain turbo over
+         * a short false gap after it has engaged. */
+        if (logical_load_active) {
             if (load_run < (1 << 20)) load_run++;
+            if (load_run >= TURBO_LOADS_ENGAGE_FRAMES || release_run > 0) {
+                turbo_loads_active = 1;
+                release_run = TURBO_LOADS_RELEASE_FRAMES;
+            }
         } else {
             load_run = 0;
+            if (release_run > 0) {
+                turbo_loads_active = 1;
+                release_run--;
+            }
         }
-        if (load_run >= TURBO_LOADS_ENGAGE_FRAMES)
-            turbo_loads_active = 1;
+        load_run_value = load_run;
+    } else {
+        load_run = 0;
+        release_run = 0;
     }
     /* HLE boot-skip window: from reset until the game entry PC first
      * dispatches, run unpaced so the (shell-skipped) BIOS kernel init +
@@ -2124,6 +2201,9 @@ static void sdl_vblank_present(void) {
      * old fast_boot snapshot restore; all guest timing is authentic. */
     if (psx_bios_hle_boot_turbo_active())
         turbo_loads_active = 1;
+
+    load_transition_note(cdrom_data_read_active(), logical_load_active,
+                         turbo_loads_active, load_run_value);
 
     /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
      * video together. Detect "MDEC produced a frame since the last vblank AND XA
@@ -2170,13 +2250,12 @@ static void sdl_vblank_present(void) {
     }
 
 #ifndef PSX_SDL_NO_AUDIO
-    /* Turbo-loads no longer mutes audio. Loads at 1x+turbo are sub-second, and
-     * the mute/fade/hangover model produced more audible disruption (cuts and
-     * "restarts") than just letting the stream play through; the audio queue is
-     * capped (sdl_audio_pump max_queue_bytes) so a brief turbo burst can't build
-     * unbounded latency. FMV-skip still mutes: it fast-forwards an entire movie,
-     * where rendering the time-compressed audio would be pure noise. */
-    sdl_audio_update(fmv_skip_active);
+    /* Optional turbo host sink advances the canonical SPU on the exact guest
+     * sample budget but drops accelerated output before SDL. This is distinct
+     * from the old mute/freeze model: voice and CD state never pause. FMV skip
+     * retains the hard mute because it deliberately fast-forwards a movie. */
+    sdl_audio_update(fmv_skip_active,
+                     turbo_loads_active && g_turbo_audio_sink_enabled);
 #endif
 
     if (g_headless) return;
@@ -2688,6 +2767,7 @@ int main(int argc, char** argv) {
     uint32_t    game_disc_crc     = 0;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
     int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
+    std::vector<PSXRecompV4::RuntimeConfig::WarmCdRoute> warm_cd_routes;
     uint32_t   game_entry_pc = 0;
     bool       fast_boot     = false;  /* DEPRECATED alias: HLE boot-skip only */
     bool       bios_hle      = false;  /* HLE kernel-service tier (bios_hle.c) */
@@ -2719,10 +2799,30 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;
+            warm_cd_routes = gc.runtime.warm_cd_routes;
             if (gc.runtime.turbo_loads) {
                 g_turbo_loads_enabled = 1;
                 std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
             }
+            if (gc.runtime.turbo_audio_sink) {
+                g_turbo_audio_sink_enabled = 1;
+                std::fprintf(stdout,
+                    "psxrecomp: turbo_audio_sink enabled (opt-in)\n");
+            }
+            {
+                extern int g_idle_skip_enabled;
+                const char *idle_env = std::getenv("PSX_IDLE_SKIP");
+                g_idle_skip_enabled = idle_env
+                    ? (idle_env[0] == '1' ? 1 : 0)
+                    : (gc.runtime.idle_skip ? 1 : 0);
+                std::fprintf(stdout, "psxrecomp: idle_skip %s%s\n",
+                             g_idle_skip_enabled ? "enabled" : "disabled",
+                             idle_env ? " (environment override)" : "");
+            }
+            for (uint32_t site : gc.vsync_event_horizon_sites)
+                psx_vsync_query_hle_add_event_horizon_site(site);
+            for (uint32_t site : gc.vsync_event_horizon_extra_sites)
+                psx_vsync_query_hle_add_extra_event_horizon_site(site);
             g_video_scale      = gc.runtime.video_supersampling;
             g_video_aa         = gc.runtime.video_antialiasing;
             g_video_texfilter  = gc.runtime.video_texture_filter;
@@ -3386,6 +3486,16 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    for (const auto& route : warm_cd_routes) {
+        cdrom_register_warm_route(route.arm_lba, route.lbas.data(),
+                                  (int)route.lbas.size(),
+                                  route.instant_max_per_frame);
+        std::fprintf(stdout,
+                     "psxrecomp: warm CD route armed at LBA %d (%zu entries, "
+                     "%d sectors/frame)\n",
+                     route.arm_lba, route.lbas.size(),
+                     route.instant_max_per_frame);
+    }
     if (!disc_path_str.empty()) {
         /* GetID must report the inserted disc's license region (the BIOS CD
          * driver revalidates it mid-game). Derive it from the disc's boot

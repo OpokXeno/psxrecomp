@@ -3,6 +3,7 @@
 #include "config_loader.h"
 
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -149,6 +150,74 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.instant_max_per_frame     = static_cast<int>(n);
         rt.has_instant_max_per_frame = true;
     }
+    auto parse_warm_cd_route = [&](const toml::value& route,
+                                   const std::string& label) {
+        if (!route.contains("arm_lba") || !route.contains("lbas")) {
+            throw std::runtime_error(
+                label + " arm_lba and lbas are required");
+        }
+        const auto arm = toml::find<int64_t>(route, "arm_lba");
+        if (arm < 0 || arm > 0x7FFFFFFFll) {
+            throw std::runtime_error(fmt::format(
+                "{} arm_lba out of range: {}", label, arm));
+        }
+        RuntimeConfig::WarmCdRoute parsed;
+        parsed.arm_lba = static_cast<int>(arm);
+        const auto& lbas = toml::find<std::vector<int64_t>>(route, "lbas");
+        if (lbas.empty() || lbas.size() > 64) {
+            throw std::runtime_error(
+                label + " lbas must contain 1..64 entries");
+        }
+        for (const auto lba : lbas) {
+            if (lba < 0 || lba > 0x7FFFFFFFll) {
+                throw std::runtime_error(fmt::format(
+                    "{} LBA out of range: {}", label, lba));
+            }
+            parsed.lbas.push_back(static_cast<int>(lba));
+        }
+        if (route.contains("instant_max_per_frame")) {
+            const auto n = toml::find<int64_t>(route, "instant_max_per_frame");
+            if (n < 1 || n > 4096) {
+                throw std::runtime_error(fmt::format(
+                    "{} instant_max_per_frame out of range (1..4096): {}",
+                    label, n));
+            }
+            parsed.instant_max_per_frame = static_cast<int>(n);
+        }
+        for (const auto& existing : rt.warm_cd_routes) {
+            if (existing.arm_lba == parsed.arm_lba &&
+                existing.lbas.front() == parsed.lbas.front()) {
+                throw std::runtime_error(fmt::format(
+                    "{} duplicates route arm {} / first LBA {}", label,
+                    parsed.arm_lba, parsed.lbas.front()));
+            }
+        }
+        rt.warm_cd_routes.push_back(std::move(parsed));
+    };
+    if (runtime.contains("warm_cd_route")) {
+        std::fprintf(stderr,
+            "psxrecomp: warning: [runtime.warm_cd_route] is deprecated; "
+            "use [[runtime.warm_cd_routes]]\n");
+        parse_warm_cd_route(toml::find(runtime, "warm_cd_route"),
+                            "[runtime.warm_cd_route]");
+    }
+    if (runtime.contains("warm_cd_routes")) {
+        const auto& routes = toml::find(runtime, "warm_cd_routes");
+        if (!routes.is_array() || routes.as_array().empty() ||
+            routes.as_array().size() > 16) {
+            throw std::runtime_error(
+                "[[runtime.warm_cd_routes]] must contain 1..16 routes");
+        }
+        size_t route_index = 0;
+        for (const auto& route : routes.as_array()) {
+            if (!route.is_table()) {
+                throw std::runtime_error(
+                    "[[runtime.warm_cd_routes]] entries must be tables");
+            }
+            parse_warm_cd_route(route, fmt::format(
+                "[[runtime.warm_cd_routes]] entry {}", route_index++));
+        }
+    }
     if (runtime.contains("fast_boot")) {
         rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
     }
@@ -166,6 +235,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     }
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
+    }
+    if (runtime.contains("turbo_audio_sink")) {
+        rt.turbo_audio_sink = toml::find<bool>(runtime, "turbo_audio_sink");
+    }
+    if (runtime.contains("idle_skip")) {
+        rt.idle_skip = toml::find<bool>(runtime, "idle_skip");
     }
     if (runtime.contains("overlay_autocompile_cmd")) {
         rt.overlay_autocompile_cmd =
@@ -735,6 +810,62 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 data_shard_funcs.push_back(parse_hex(a, "data_shards.funcs"));
         }
     }
+    uint32_t vsync_query_func = 0;
+    uint32_t vsync_counter_addr = 0;
+    uint32_t vsync_gpustat_ptr_addr = 0;
+    uint32_t vsync_timer1_ptr_addr = 0;
+    uint32_t vsync_timer1_cache_addr = 0;
+    std::vector<uint32_t> vsync_event_horizon_sites;
+    std::vector<uint32_t> vsync_event_horizon_extra_sites;
+    if (cfg.contains("load_accel")) {
+        const toml::value& lav = toml::find(cfg, "load_accel");
+        if (lav.contains("vsync_query")) {
+            const toml::value& vq = toml::find(lav, "vsync_query");
+            const bool has_func = vq.contains("func");
+            const bool has_counter = vq.contains("counter_addr");
+            const bool has_gpu_ptr = vq.contains("gpustat_ptr_addr");
+            const bool has_timer_ptr = vq.contains("timer1_ptr_addr");
+            const bool has_timer_cache = vq.contains("timer1_cache_addr");
+            const int present = (int)has_func + (int)has_counter + (int)has_gpu_ptr +
+                                (int)has_timer_ptr + (int)has_timer_cache;
+            if (present != 0 && present != 5)
+                throw std::runtime_error(fmt::format(
+                    "{}: [load_accel.vsync_query] func, counter_addr, gpustat_ptr_addr, "
+                    "timer1_ptr_addr, and timer1_cache_addr must be set together",
+                    config_path.string()));
+            if (has_func) {
+                vsync_query_func = parse_hex(
+                    toml::find<std::string>(vq, "func"),
+                    "load_accel.vsync_query.func");
+                vsync_counter_addr = parse_hex(
+                    toml::find<std::string>(vq, "counter_addr"),
+                    "load_accel.vsync_query.counter_addr");
+                vsync_gpustat_ptr_addr = parse_hex(
+                    toml::find<std::string>(vq, "gpustat_ptr_addr"),
+                    "load_accel.vsync_query.gpustat_ptr_addr");
+                vsync_timer1_ptr_addr = parse_hex(
+                    toml::find<std::string>(vq, "timer1_ptr_addr"),
+                    "load_accel.vsync_query.timer1_ptr_addr");
+                vsync_timer1_cache_addr = parse_hex(
+                    toml::find<std::string>(vq, "timer1_cache_addr"),
+                    "load_accel.vsync_query.timer1_cache_addr");
+                if (vq.contains("event_horizon_sites")) {
+                    const auto& arr = toml::find<std::vector<std::string>>(
+                        vq, "event_horizon_sites");
+                    for (const auto& a : arr)
+                        vsync_event_horizon_sites.push_back(parse_hex(
+                            a, "load_accel.vsync_query.event_horizon_sites"));
+                }
+                if (vq.contains("event_horizon_extra_sites")) {
+                    const auto& arr = toml::find<std::vector<std::string>>(
+                        vq, "event_horizon_extra_sites");
+                    for (const auto& a : arr)
+                        vsync_event_horizon_extra_sites.push_back(parse_hex(
+                            a, "load_accel.vsync_query.event_horizon_extra_sites"));
+                }
+            }
+        }
+    }
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -955,6 +1086,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
         /*data_shard_funcs*/      data_shard_funcs,
+        /*vsync_query_func*/      vsync_query_func,
+        /*vsync_counter_addr*/    vsync_counter_addr,
+        /*vsync_gpustat_ptr_addr*/ vsync_gpustat_ptr_addr,
+        /*vsync_timer1_ptr_addr*/ vsync_timer1_ptr_addr,
+        /*vsync_timer1_cache_addr*/ vsync_timer1_cache_addr,
+        /*vsync_event_horizon_sites*/ vsync_event_horizon_sites,
+        /*vsync_event_horizon_extra_sites*/ vsync_event_horizon_extra_sites,
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,

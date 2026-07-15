@@ -61,7 +61,8 @@ Three levers, in ascending order of danger:
 ## 2. Prior-attempt ledger (do not re-litigate; verbatim outcomes)
 
 1. **turbo_loads — SHIPPED, production path.** Engage = sustained
-   `cdrom_load_in_progress()` + game-started, 20-frame hysteresis
+   `cdrom_load_in_progress()` + game-started, 4-frame entry debounce +
+   6-frame release debounce
    (`main.cpp:2062-2084`); presents 1-in-30; audio deliberately NOT
    muted (queue capped). ~2x wall on Tomba loads with a healthy overlay
    cache. NOTE (survey 2026-07-13): the primary SDL event pump now runs
@@ -87,15 +88,44 @@ Three levers, in ascending order of danger:
    green-thread yield bookkeeping; ONE skipped switch is eventually
    fatal. Kept: the `[instant_loads]` inert scaffold (load-grid
    detector, window plumbing, TCP counters) and the measure-first method.
-5. **Data shards — BUILT on `spike/tomba-load-shards` (2a4e574), never
-   regen'd/run.** Memoized pure-function replay: read-set/write-set/
+5. **Data shards — REJECTED/QUARANTINED after live Tomba test.** Memoized
+   pure-function replay: read-set/write-set/
    reg-out/cycle-cost capture at emitter-hooked funcs, byte-verified
    replay, recorded cycles credited in slices through the normal
    advance+IRQ path. Purity poisons: MMIO, DMA write, thread switch,
    4MiB budget, staleness. Persists per-shard `.dss`. Known v1 fidelity
    deltas (documented in DATA_SHARDS.md): ISR cycles double-credited;
    IRQ arriving mid-credit observes the completed write-set; GTE/COP0
-   not captured. §5 adds ChatGPT's sharper version of that last flaw.
+   not captured. Live replay of `FUN_8003EF50` corrupted title and gameplay
+   textures despite zero verifier failures, proving the v1 temporal verifier
+   unsound. Runtime default is off and derived shards were removed.
+
+6. **Generic idle-loop skip — SHIPPED, strictly per-game opt-in.** Requires
+   repeated same-PC interrupt boundaries with no stores, no MMIO, and stable
+   registers; advances to the next device deadline in whole loop quanta.
+   Tomba live A/B: 4,599 skips / 765M guest cycles, warm main burst
+   2.19 s -> 1.73 s, zero CD overwrites. Opt in per game with
+   `[runtime] idle_skip=true`, per process with `PSX_IDLE_SKIP=1`, or live
+   through the `idle_skip` debug command. Known accepted cosmetic tradeoff:
+   an occasional partial texture frame may flash under aggressive load turbo
+   and resolves on the following complete frame.
+
+7. **Strict warm CD routes — SHIPPED, per-game opt-in only.** The reusable
+   `[[runtime.warm_cd_routes]]` schema supports up to 16 exact LBA sequences.
+   A mismatch immediately restores normal timing. Only non-XA data-read cadence
+   changes; XA/CDDA, seek, motor, IRQ, DMA, callback, and decompression paths
+   remain authoritative. Tomba regression: three route matches, 1,944 accelerated
+   sectors, zero response overwrites. The legacy `[runtime.warm_cd_route]`
+   singular table is deprecated but remains readable with a warning.
+
+8. **Turbo host-audio sink — SHIPPED, per-game opt-in only.** With
+   `[runtime] turbo_audio_sink=true`, the canonical SPU still renders every
+   guest-time sample during an active turbo load, preserving voice and CD state,
+   but the accelerated buffers stop before SDL playback. Normal playback fades
+   back in from the current guest state. Tomba listening QA passed with
+   1,100,752 sink-discarded SPU frames, two accelerated load-route matches, and
+   zero CD response overwrites. This does not revive the rejected mute/freeze
+   model, which paused voice state and produced audible cuts/restarts.
 
 Also relevant, shipped: FMV auto-skip (unpaced + muted + game-native
 teardown), HLE boot shell-skip + boot-turbo window (`bios_hle.c`),
@@ -223,6 +253,14 @@ has NO acceleration value and is pure drive-model correctness work.
 Prereq: resolve the CD-model tree split (Ape direct-delivery vs master
 model) — pick ONE canonical model.
 
+**Tomba verdict (2026-07-14): KILLED as acceleration.** The passive
+`cdrom_timing` ring observed 1,304 data sectors: every buffer fill landed on
+its exact scheduled cycle (zero early, zero late), and every exposed INT1 used
+the intentional fixed +5,000-cycle controller-presentation latency. There were
+zero read holds, pending/lost INT1s, or response overwrites. The current model
+already maintains the continuous physical timeline; no catch-up work can make
+this load faster.
+
 ### E6 — `cd_seek_speedup` (Lever B, bounded, per-game opt-in)
 Probe first: seek/pause/spin share of window guest time. Upper bound =
 number_of_seeks x ~250ms — a seek-only hack cannot touch a sequential
@@ -232,10 +270,25 @@ some titles, broke others). `pause_complete_delay_cycles` is a known
 CPU-visible ordering contract (Ape memcard wedge) — stays authentic.
 Kill: seek share <10% or <~250ms, or any callback/VBlank divergence.
 
+**Tomba verdict (2026-07-14): KILLED by the gate.** An automated, authentic
+New Game sample covered 792 data sectors over 298,130,657 guest cycles and
+issued zero seek commands. Seventeen read-start delays totalled 7,676,928
+cycles (2.57% of the data span), below the 10% threshold. Seventeen pause
+delays totalled 24,167,597 cycles (8.11%), but pause completion is the
+CPU-visible ordering contract explicitly excluded above. The combined
+31,844,525-cycle figure is only a theoretical upper bound: it includes that
+unsafe pause term and assumes impossible zero-cost, non-overlapping removal.
+No seek-speedup implementation is justified for this path.
+
 ### E7 — `cd_read_speedup_exp` (Lever B, Phase-2 only)
 Per-title, with explicit XA/CDDA/MDEC and timing-sensitive exclusions
 (the DuckStation trait architecture). First unexplained wedge ⇒
 permanently non-default. Never foundation.
+
+**Implemented scope (2026-07-14):** strict, config-declared warm routes only.
+This is not automatic global read acceleration and remains absent unless a game
+opts in. Multiple routes share the same fail-closed matcher and consumer-paced
+delivery path; XA/CDDA and non-read drive timing are excluded.
 
 ### E8 — Decompressor HLE (only via E4's failure)
 Entered only if E0 shows decompression host-hot AND shards fail for an

@@ -59,6 +59,7 @@ enum {
                                 b=(stage<<28)|(start_frame<<14)|run_len.
                                 stage 0=post-ADPCM-decode (native rate),
                                 stage 1=post-resample+volume (44100). */
+    AUDIO_EV_SINK_DROP = 10, /* turbo host sink; a=guest SPU frames discarded */
 };
 
 typedef struct {

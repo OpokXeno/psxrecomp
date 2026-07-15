@@ -2196,6 +2196,18 @@ GeneratedFunction CodeGenerator::generate_function(
     body_ss << config_.indent
             << fmt::format("debug_server_log_call_entry(0x{:08X}u);\n",
                           func.start_addr);
+    {
+        const auto vq = config_.vsync_query_hle_funcs.find(func.start_addr);
+        if (vq != config_.vsync_query_hle_funcs.end()) {
+            body_ss << config_.indent
+                    << fmt::format(
+                        "if (psx_vsync_query_hle_enter(cpu, 0x{:08X}u, 0x{:08X}u, "
+                        "0x{:08X}u, 0x{:08X}u, 0x{:08X}u)) return;"
+                        "  /* load accel: cycle-faithful VSync(-1) query */\n",
+                        func.start_addr, vq->second[0], vq->second[1],
+                        vq->second[2], vq->second[3]);
+        }
+    }
     if (config_.data_shard_funcs.count(func.start_addr)) {
         // Data-shard hook (docs/DATA_SHARDS.md): on a verified shard hit the
         // runtime applies the recorded effect, credits the recorded cycles,
@@ -2650,6 +2662,7 @@ std::string CodeGenerator::generate_file(
     ss << "#endif\n";
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
+    ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";

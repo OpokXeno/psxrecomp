@@ -259,7 +259,7 @@ uint64_t psx_get_cycle_count(void) {
  * lockstep record/replay, and PSX_COSIM builds entirely (the cosim oracle
  * compares per-instruction streams; elided iterations would false-diverge).
  *
- * Off switch: PSX_IDLE_SKIP=0 (env) or {"cmd":"idle_skip","enable":0} (TCP).
+ * Opt in: game config, PSX_IDLE_SKIP=1 (env), or the `idle_skip` TCP command.
  * The always-on counters below are the observability surface. */
 
 enum {
@@ -298,17 +298,11 @@ static void idle_snapshot_regs(const CPUState *cpu) {
 
 static int idle_skip_on(void) {
     if (g_idle_skip_enabled < 0) {
-        /* DISABLED BY DEFAULT (2026-07-06). The skip fast-forwards guest time
-         * to the next INTERNAL device event, but an SIO/memory-card transfer
-         * in flight is not currently modeled as a bounding deadline, so the
-         * skip jumps past the write-completion the card driver polls for at
-         * boot — Tomba2's "checking memory card" livelocks (frame rate
-         * collapses to a few fps; the game never advances). Opt in with
-         * PSX_IDLE_SKIP=1. Re-enable by default only once the skip is bounded
-         * by the SIO transfer/IRQ deadline (devices_cycles_to_next_internal_
-         * event must include the in-flight card-byte completion). */
+        /* No game config reached this process (for example a BIOS-only
+         * runtime). Keep the enhancement inert unless the environment opts in;
+         * normal game launches set g_idle_skip_enabled from RuntimeConfig. */
         const char *e = getenv("PSX_IDLE_SKIP");
-        g_idle_skip_enabled = (e && e[0] == '1');
+        g_idle_skip_enabled = e ? (e[0] == '1') : 0;
     }
     return g_idle_skip_enabled;
 }

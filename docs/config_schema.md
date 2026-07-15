@@ -106,6 +106,39 @@ controller    = "digital"       # "digital" or "dualshock"
 memcard_dir   = "."             # memcard files location, relative to project root
 ```
 
+### Opt-in warm CD routes
+
+Per-game read acceleration is disabled unless the game explicitly declares
+one or more strict routes. Each route arms on one `SetLoc`, then requires every
+later file start to match `lbas` in order. A mismatch immediately restores the
+normal configured disc timing. Only data-read cadence is accelerated; XA/CDDA,
+seek, and motor timing remain authentic.
+
+```toml
+[[runtime.warm_cd_routes]]
+arm_lba = 95947
+lbas = [298, 299, 306]
+instant_max_per_frame = 32
+```
+
+Up to 16 routes may be declared, with 1–64 LBAs each. The old singular
+`[runtime.warm_cd_route]` table is deprecated and emits a warning when loaded;
+it remains readable for compatibility. This enhancement is intentionally
+opt-in and must not acquire a global default.
+
+The other load-time accelerators are likewise opt-in:
+
+```toml
+[runtime]
+turbo_loads = true
+idle_skip = true
+turbo_audio_sink = true
+```
+
+`turbo_audio_sink` is meaningful only while `turbo_loads` is active. It keeps
+the guest SPU timeline advancing but discards accelerated samples before host
+playback, then fades normal output back in.
+
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc
 - `default_game_root` — for sibling-junction setups

@@ -88,6 +88,12 @@ extern uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uin
 extern uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 extern uint8_t  psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
+/* Charge the exact timing/pipeline effects of a 32-bit CPU load without
+ * invoking the memory handler.  Enhancement HLE may use this only when static
+ * analysis proves the loaded value and read side effects are unobservable. */
+extern void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
+                                           uint32_t rt, uint32_t reg_mask);
+
 /* LWC2 (GTE load) ReadMemory timing only (completion +1, NO LDWhich arm — the dest
  * is a GTE register). Call AFTER psx_cyc_step(cpu,0) (§1+DO_LDS) and psx_gte_stall.
  * Returns the raw 32-bit value. */

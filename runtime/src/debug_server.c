@@ -27,6 +27,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "present_ring.h"
+#include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
@@ -5969,7 +5970,7 @@ static void handle_audio_events(int id, const char *json)
     uint64_t total = audio_trace_events_total();
     static const char *kind_names[] = {
         "?", "REG", "RENDER", "SKIP", "UNDERRUN",
-        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO"
+        "MUTE", "UNMUTE", "CD_PUSH", "DMA", "XA_ZERO", "SINK_DROP"
     };
 
     size_t cap = 256u + (size_t)got * 192u;
@@ -10516,6 +10517,46 @@ static void handle_turbo_loads(int id, const char *json)
              (unsigned long long)g_turbo_loads_frames);
 }
 
+/* turbo_audio_sink: opt-in host-output discard while turbo loads run. Guest
+ * SPU state continues advancing; only accelerated playback samples are sunk. */
+static void handle_turbo_audio_sink(int id, const char *json)
+{
+    extern int      g_turbo_audio_sink_enabled;
+    extern int      g_turbo_audio_sink_active;
+    extern uint64_t g_turbo_audio_sink_frames;
+    int n = json_get_int(json, "n", -1);
+    if (n == 0 || n == 1) g_turbo_audio_sink_enabled = n;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"active\":%d,"
+             "\"discarded_spu_frames\":%llu}\n", id,
+             g_turbo_audio_sink_enabled, g_turbo_audio_sink_active,
+             (unsigned long long)g_turbo_audio_sink_frames);
+}
+
+/* load_transitions: state-edge log for physical reads, the bridged logical
+ * load predicate, and host-side turbo pacing. Newest entries are returned
+ * last so adjacent edges can be read as a timeline. */
+static void handle_load_transitions(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    uint64_t total = load_transition_total();
+    uint64_t start = total > (uint64_t)count ? total - (uint64_t)count : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"edges\":[",
+             id, (unsigned long long)total);
+    int emitted = 0;
+    for (uint64_t seq = start; seq < total; seq++) {
+        LoadTransitionEntry e;
+        if (!load_transition_get(seq, &e)) continue;
+        send_fmt("%s{\"seq\":%llu,\"frame\":%u,\"host_ms\":%u,"
+                 "\"read\":%u,\"load\":%u,\"turbo\":%u,\"load_run\":%u}",
+                 emitted++ ? "," : "", (unsigned long long)seq, e.frame,
+                 e.host_ms, e.read_active, e.load_active, e.turbo_active,
+                 e.load_run);
+    }
+    send_fmt("]}\n");
+}
+
 /* cdrom_bursts: dump the always-on CD load-burst ring, newest first. Each
  * record is one gap-separated run of delivered data sectors — i.e. one load.
  * Param "count" (optional, default 32, max 128). */
@@ -10540,6 +10581,18 @@ static void handle_cdrom_bursts(int id, const char *json)
                  b->sectors, b->rate, b->divisor);
     }
     send_fmt("]}\n");
+}
+
+/* cdrom_timing: passive L1.5 physical deadline -> buffer -> INT1 exposure
+ * summary. `reset:1` starts a fresh measurement window without touching the
+ * controller or its schedules. late_bins are exact, 1..64, 65..1024,
+ * 1025..5000, and >5000 guest cycles. */
+static void handle_cdrom_timing(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0) == 1) cdrom_timing_reset();
+    char stats[2048];
+    cdrom_timing_stats_json(stats, (int)sizeof(stats));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, stats);
 }
 
 /* autocompile_status: variant-capture automation state — autocapture
@@ -12028,10 +12081,42 @@ static void handle_data_shards(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+/* vsync_query_hle: cycle-faithful VSync(-1) query acceleration counters. */
+static void handle_vsync_query_hle(int id, const char *json)
+{
+    extern void psx_vsync_query_hle_stats_json(char* buf, int cap);
+    extern void psx_vsync_query_hle_set_enabled(int on);
+    extern void psx_vsync_query_hle_set_horizon_enabled(int on);
+    extern void psx_vsync_query_hle_set_extra_horizon_enabled(int on);
+    int en = json_get_int(json, "enable", -1);
+    int horizon = json_get_int(json, "horizon", -1);
+    int extra = json_get_int(json, "extra", -1);
+    if (en == 0 || en == 1) psx_vsync_query_hle_set_enabled(en);
+    if (horizon == 0 || horizon == 1)
+        psx_vsync_query_hle_set_horizon_enabled(horizon);
+    if (extra == 0 || extra == 1)
+        psx_vsync_query_hle_set_extra_horizon_enabled(extra);
+    char body[512];
+    psx_vsync_query_hle_stats_json(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* warm_cd_route: live A/B toggle and fail-closed route counters. */
+static void handle_warm_cd_route(int id, const char *json)
+{
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) cdrom_warm_route_set_enabled(en);
+    char body[512];
+    cdrom_warm_route_stats_json(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, body);
+}
+
 static const CmdEntry s_commands[] = {
     { "phase_profile",     handle_phase_profile },
     { "starv_ring",        handle_starv_ring },
     { "data_shards",       handle_data_shards },
+    { "vsync_query_hle",   handle_vsync_query_hle },
+    { "warm_cd_route",     handle_warm_cd_route },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
     { "lockstep",          handle_lockstep },
@@ -12302,7 +12387,10 @@ static const CmdEntry s_commands[] = {
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cd_overwrite",         handle_cd_overwrite },
     { "cdrom_bursts",         handle_cdrom_bursts },
+    { "cdrom_timing",         handle_cdrom_timing },
     { "turbo_loads",          handle_turbo_loads },
+    { "turbo_audio_sink",     handle_turbo_audio_sink },
+    { "load_transitions",     handle_load_transitions },
     { "autocompile_status",   handle_autocompile_status },
     { "sljit_status",         handle_sljit_status },
     { "sljit_async",          handle_sljit_async },

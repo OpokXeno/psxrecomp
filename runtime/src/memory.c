@@ -1678,6 +1678,10 @@ uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t r
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
     return psx_read_word(addr);
 }
+void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
+                                   uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
+}
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
     return psx_read_half(addr);

@@ -191,6 +191,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/data_shards.c
+    ${PSXRECOMP_ROOT}/runtime/src/load_accel.c
     ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c

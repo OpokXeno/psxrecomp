@@ -84,6 +84,19 @@ struct RuntimeConfig {
     bool                  has_instant_max_per_frame = false;
     int                   instant_max_per_frame = 0;
 
+    // Optional, game-specific warm-load route accelerators. A matching SetLoc
+    // at arm_lba followed by the exact ordered lbas sequence switches only
+    // those data reads to the bounded instant cadence. Any sequence mismatch
+    // fails closed to the configured disc_speed. The parser accepts the legacy
+    // [runtime.warm_cd_route] table and the reusable
+    // [[runtime.warm_cd_routes]] array-of-tables.
+    struct WarmCdRoute {
+        int              arm_lba = -1;
+        std::vector<int> lbas;
+        int              instant_max_per_frame = 32;
+    };
+    std::vector<WarmCdRoute> warm_cd_routes;
+
     // fast_boot: DEPRECATED alias for the HLE boot shell-skip (see bios_hle
     // below). The old mechanism (snapshot BIOS state at first handoff, restore
     // on later launches) is gone; fast_boot=true now skips only the BIOS shell
@@ -124,6 +137,18 @@ struct RuntimeConfig {
     // skips wall-clock pacing so the guest runs at host speed — compressing
     // load wall-time. Streaming titles (e.g. Crash) must leave this off.
     bool                  turbo_loads = false;
+
+    // turbo_audio_sink: while turbo_loads is actively running unpaced, keep
+    // rendering the exact guest-time SPU sample budget (so voice/CD state
+    // advances) but discard those samples before the host playback queue.
+    // Opt-in while the experiment is under live audio QA.
+    bool                  turbo_audio_sink = false;
+
+    // idle_skip: proof-gated fast-forward through repeated CPU polling
+    // loops with no stores/MMIO and stable register state. Guest time and
+    // device events still advance exactly. Opt-in per game; the idle_skip
+    // debug command and PSX_IDLE_SKIP environment variable support live A/B.
+    bool                  idle_skip = false;
 
     // overlay_autocompile_cmd: variant-capture automation (step 2.8). A
     // shell command (run via cmd.exe /C, cwd = project root) that compiles
@@ -416,6 +441,22 @@ struct GameConfig {
     // self-proving (byte-verified read-set), so listing a function that turns
     // out to be impure only costs a poisoned capture, never a wrong replay.
     std::vector<uint32_t> data_shard_funcs;
+
+    // [load_accel.vsync_query] opt-in for a byte-verified PsyQ VSync(mode)
+    // implementation.  mode=-1 returns vsync_counter_addr while bypassing two
+    // unused MMIO reads; every other mode executes the original function.
+    uint32_t              vsync_query_func = 0;
+    uint32_t              vsync_counter_addr = 0;
+    uint32_t              vsync_gpustat_ptr_addr = 0;
+    uint32_t              vsync_timer1_ptr_addr = 0;
+    uint32_t              vsync_timer1_cache_addr = 0;
+    // Return addresses of verified CD wait-loop VSync(-1) calls.  At these
+    // sites only, the runtime may advance guest time to the next deliverable
+    // device event while a sustained CD load is active.
+    std::vector<uint32_t> vsync_event_horizon_sites;
+    // Separately togglable second tier for additional verified loops, allowing
+    // per-feature A/B without disabling the accepted base site set.
+    std::vector<uint32_t> vsync_event_horizon_extra_sites;
 
     // Cull-margin widening. The game's per-object draw classifier compares
     // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
