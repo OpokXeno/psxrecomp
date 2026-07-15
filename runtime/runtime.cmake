@@ -163,6 +163,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
+    ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
     ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
     ${PSXRECOMP_ROOT}/runtime/src/text_xlate.cpp
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
@@ -318,6 +319,15 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${PSXRT_GAME_GENERATED_DISPATCH_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_DISPATCH_C}")
         set(has_game_dispatch TRUE)
+        if(EXISTS "${PSXRT_GAME_GENERATED_DISPATCH_C}")
+            file(STRINGS "${PSXRT_GAME_GENERATED_DISPATCH_C}"
+                game_dispatch_native_ok_decl
+                REGEX "int[ \t]+psx_game_text_native_ok\\("
+                LIMIT_COUNT 1)
+            if(game_dispatch_native_ok_decl)
+                set(has_game_dispatch_native_ok TRUE)
+            endif()
+        endif()
     endif()
     # Layer B: statically-compiled overlay dispatch. Inert unless a game
     # provides a generated overlays_static.c — no target sets this yet.
@@ -452,6 +462,16 @@ function(psxrecomp_add_runtime_target target)
     endif()
     if(has_game_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_GAME_DISPATCH=1)
+    endif()
+    if(has_game_dispatch_native_ok)
+        # Only the compatibility translation unit needs to know whether the
+        # generated dispatcher supplies the modern exact-range predicate.
+        # Keeping this off the target-wide definitions avoids recompiling the
+        # entire runtime when an existing game regenerates its dispatcher.
+        set_property(SOURCE
+            ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
+            APPEND PROPERTY COMPILE_DEFINITIONS
+            PSX_GAME_DISPATCH_HAS_NATIVE_OK=1)
     endif()
     if(has_overlay_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
