@@ -39,6 +39,10 @@ namespace PSXRecompV4 {
 //   digital — always present a digital pad (id 0x41); sticks disabled.
 enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 
+struct WidescreenSignedBoundSite {
+    uint32_t address = 0;
+    uint32_t expected = 0; // guarded LUI instruction
+};
 // Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
 // "digital" (case-insensitive) and returns `fallback` for anything else.
 int         pad_mode_from_string(const std::string& s, int fallback);
@@ -607,6 +611,21 @@ struct GameConfig {
     // off by default because draw ordering is title-specific.
     bool ws_nw_phase_backdrop = false;
 
+    // Expand only textured polygon vertices that already lie beyond the
+    // canonical 4:3 boundary. Useful for finite arena/background meshes while
+    // leaving actors, HUD, sprites, and centre geometry untouched.
+    bool ws_nw_textured_edges = false;
+    int  ws_nw_textured_edge_scale = 0; // percent; 0 = aspect-derived
+
+    // Render the complete wide mirror instead of splicing its centre from
+    // canonical VRAM. Required when edge-crossing polygon interpolation is
+    // transformed in the mirror.
+    bool ws_nw_full_mirror = false;
+
+    // [[widescreen.signed_x_bound]] guarded LUI sites whose signed Q16
+    // constants scale with the active native-wide field and remain identity in
+    // 4:3/menus/FMV. Shared by static codegen, overlay JIT, and interpreter.
+    std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     // [widescreen] offer — whether the launcher OFFERS its EXPERIMENTAL
     // Widescreen toggle for this title. Default true. Set false while a
     // title's widescreen is unported/unvalidated (e.g. MMX4 at bring-up):

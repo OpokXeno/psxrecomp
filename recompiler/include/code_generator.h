@@ -11,6 +11,7 @@
 #include "function_analysis.h"
 #include "control_flow.h"
 #include "../src/annotations.hpp"
+#include "../src/config_loader.h"
 
 namespace PSXRecomp {
 
@@ -45,6 +46,7 @@ struct CodeGenConfig {
     // mismatch is EXPECTED (apply the transform only where the bytes match, skip
     // it elsewhere) rather than a hard config error.
     bool overlay_mode = false;
+    std::vector<PSXRecompV4::WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     std::string indent;           // Indentation string (default: "    ")
     // Widescreen sprite-tag hooks ([widescreen] sprite_tag_funcs): functions
     // that get a psx_ws_sprite_tag(cpu) callback emitted at entry, so the

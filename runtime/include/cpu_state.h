@@ -33,6 +33,7 @@ enum {
     SLJIT_HLP_CALL,       /* psx_sljit_call    — jal/jalr call contract       */
     SLJIT_HLP_WS_CULL_SLTI, /* psx_ws_cull_slti — signed funnel right edge (appended) */
     SLJIT_HLP_WS_CULL_BLTZ, /* psx_ws_cull_bltz — signed funnel left edge (appended) */
+    SLJIT_HLP_WS_PLAYER_X_BOUND, /* typed native-wide signed gameplay bound */
     SLJIT_HLP_COUNT
 };
 
@@ -189,6 +190,7 @@ extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
 extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
+extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
 
 /* ============================================================================
  * Dispatch call contract (Bug D / wild-return family fix)

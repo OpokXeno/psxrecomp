@@ -855,6 +855,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
+    bool ws_nw_textured_edges = false;
+    int ws_nw_textured_edge_scale = 0;
+    bool ws_nw_full_mirror = false;
+    std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
     bool ws_ultrawide_offered = false;
     // Optional [data_shards] block — memoized pure-function replay hooks.
@@ -977,6 +981,37 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
         if (ws.contains("nw_phase_backdrop"))
             ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
+        if (ws.contains("nw_textured_edges"))
+            ws_nw_textured_edges = toml::find<bool>(ws, "nw_textured_edges");
+        if (ws.contains("nw_textured_edge_scale")) {
+            ws_nw_textured_edge_scale = toml::find<int>(ws, "nw_textured_edge_scale");
+            if (ws_nw_textured_edge_scale != 0 &&
+                (ws_nw_textured_edge_scale < 100 || ws_nw_textured_edge_scale > 400))
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_textured_edge_scale must be 0 or in [100, 400]",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_full_mirror"))
+            ws_nw_full_mirror = toml::find<bool>(ws, "nw_full_mirror");
+        if (ws.contains("signed_x_bound")) {
+            std::set<uint32_t> seen;
+            for (const auto& item : toml::find<toml::array>(ws, "signed_x_bound")) {
+                WidescreenSignedBoundSite site;
+                site.address = parse_hex(toml::find<std::string>(item, "address"),
+                                         "widescreen.signed_x_bound.address");
+                site.expected = parse_hex(toml::find<std::string>(item, "expected"),
+                                          "widescreen.signed_x_bound.expected");
+                if ((site.expected >> 26) != 0x0Fu)
+                    throw std::runtime_error(fmt::format(
+                        "{}: [[widescreen.signed_x_bound]] expected must be LUI",
+                        config_path.string()));
+                if (!seen.insert(site.address & 0x1FFFFFFFu).second)
+                    throw std::runtime_error(fmt::format(
+                        "{}: duplicate [[widescreen.signed_x_bound]] address 0x{:08X}",
+                        config_path.string(), site.address));
+                ws_signed_x_bound_sites.push_back(site);
+            }
+        }
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
         if (ws.contains("offer_ultrawide"))
@@ -1175,6 +1210,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
+        /*ws_nw_textured_edges*/ ws_nw_textured_edges,
+        /*ws_nw_textured_edge_scale*/ ws_nw_textured_edge_scale,
+        /*ws_nw_full_mirror*/ ws_nw_full_mirror,
+        /*ws_signed_x_bound_sites*/ ws_signed_x_bound_sites,
         /*ws_offered*/            ws_offered,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
