@@ -1536,10 +1536,23 @@ static void exec_command(uint8_t cmd) {
             if (param_count >= 1 && param_fifo[0] != 0)
                 requested_track = bcd_to_bin(param_fifo[0]);
             if (!start_cdda_playback(requested_track)) {
-                response_push(stat_reg | CDSTAT_ERROR);
-                response_push(0x10); /* invalid track / position */
-                set_irq(CDIRQ_ERROR);
-                break;
+                if (requested_track == 0) {
+                    /* Some games probe Play from a data-track SetLoc before
+                     * selecting their real audio track. The previous CD model
+                     * acknowledged that command and entered a silent PLAY
+                     * state; rejecting it makes Tomba 2 reset and retry its CD
+                     * initialization forever. Preserve that compatibility
+                     * behavior without feeding data sectors to the SPU. */
+                    stop_read_stream();
+                    cdda_data_end_pending = 0;
+                    stat_reg = (stat_reg & ~(CDSTAT_SEEK | CDSTAT_READ)) |
+                               CDSTAT_MOTOR | CDSTAT_PLAY;
+                } else {
+                    response_push(stat_reg | CDSTAT_ERROR);
+                    response_push(0x10); /* invalid explicit track */
+                    set_irq(CDIRQ_ERROR);
+                    break;
+                }
             }
         }
         response_push(stat_reg);
