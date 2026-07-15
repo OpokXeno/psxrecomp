@@ -56,7 +56,11 @@
 #include "launcher.h"
 #endif
 #include <SDL.h>
+#if defined(PSX_WEB)
+#include <emscripten/emscripten.h>
+#endif
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -273,6 +277,120 @@ static PlayerInput g_players[2];
  * 640*scale x 512*scale. Allocated once the supersampling scale is known
  * (sized for the native 640x512 when supersampling is off). */
 static uint32_t*     sdl_pixel_buf = nullptr;
+
+/* Presentation-only interpolation for software-rendered content that repeats
+ * each guest image for two vblanks. This never changes guest or audio timing. */
+static std::atomic<int> g_smooth_60fps{0};
+
+struct Smooth60State {
+    std::vector<uint32_t> previous_source;
+    uint64_t source_hash = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool have_source = false;
+    bool previous_was_duplicate = false;
+    bool announced = false;
+};
+
+static Smooth60State g_smooth_60_state;
+
+static void smooth_60_reset(void) {
+    g_smooth_60_state.previous_source.clear();
+    g_smooth_60_state.source_hash = 0;
+    g_smooth_60_state.width = 0;
+    g_smooth_60_state.height = 0;
+    g_smooth_60_state.have_source = false;
+    g_smooth_60_state.previous_was_duplicate = false;
+}
+
+static uint64_t smooth_60_frame_hash(const uint32_t* pixels, size_t count) {
+    uint64_t hash = 1469598103934665603ull;
+    const size_t step = std::max<size_t>(1, count / 4096u);
+    for (size_t i = 0; i < count; i += step) {
+        hash ^= pixels[i];
+        hash *= 1099511628211ull;
+    }
+    hash ^= count;
+    return hash * 1099511628211ull;
+}
+
+static bool smooth_60_scene_cut(const uint32_t* current,
+                                const uint32_t* previous,
+                                size_t count) {
+    const size_t step = std::max<size_t>(1, count / 4096u);
+    uint64_t difference = 0;
+    size_t samples = 0;
+    size_t large_changes = 0;
+    for (size_t i = 0; i < count; i += step) {
+        const uint32_t a = current[i];
+        const uint32_t b = previous[i];
+        const unsigned dr = (unsigned)std::abs((int)((a >> 16) & 0xFFu) -
+                                               (int)((b >> 16) & 0xFFu));
+        const unsigned dg = (unsigned)std::abs((int)((a >> 8) & 0xFFu) -
+                                               (int)((b >> 8) & 0xFFu));
+        const unsigned db = (unsigned)std::abs((int)(a & 0xFFu) -
+                                               (int)(b & 0xFFu));
+        const unsigned pixel_difference = dr + dg + db;
+        difference += pixel_difference;
+        if (pixel_difference > 320u) large_changes++;
+        samples++;
+    }
+    return samples && large_changes * 4u > samples * 3u &&
+           difference > (uint64_t)samples * 360u;
+}
+
+static void smooth_60_present(uint32_t* pixels, uint32_t width, uint32_t height,
+                              bool eligible) {
+    if (!eligible || !pixels || !g_smooth_60fps.load(std::memory_order_acquire)) {
+        if (g_smooth_60_state.have_source) smooth_60_reset();
+        return;
+    }
+    Smooth60State& state = g_smooth_60_state;
+    const size_t count = (size_t)width * height;
+    if (!count) { smooth_60_reset(); return; }
+    const uint64_t hash = smooth_60_frame_hash(pixels, count);
+    if (!state.have_source || state.width != width || state.height != height) {
+        state.previous_source.assign(pixels, pixels + count);
+        state.source_hash = hash;
+        state.width = width;
+        state.height = height;
+        state.have_source = true;
+        state.previous_was_duplicate = false;
+        return;
+    }
+    const bool duplicate = hash == state.source_hash &&
+        std::memcmp(pixels, state.previous_source.data(), count * sizeof(uint32_t)) == 0;
+    if (duplicate) { state.previous_was_duplicate = true; return; }
+    const bool interpolate = state.previous_was_duplicate &&
+        !smooth_60_scene_cut(pixels, state.previous_source.data(), count);
+    state.previous_was_duplicate = false;
+    state.source_hash = hash;
+    if (!interpolate) {
+        std::copy(pixels, pixels + count, state.previous_source.begin());
+        return;
+    }
+    if (!state.announced) {
+        std::fprintf(stdout,
+            "psxrecomp: 60 FPS smoothing active (guest timing preserved)\n");
+        state.announced = true;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t current = pixels[i];
+        const uint32_t previous = state.previous_source[i];
+        state.previous_source[i] = current;
+        pixels[i] = 0xFF000000u |
+            (((current & 0x00FEFEFEu) >> 1) + ((previous & 0x00FEFEFEu) >> 1));
+    }
+}
+
+extern "C" void psx_smooth_60fps_set(int enabled) {
+    g_smooth_60fps.store(enabled ? 1 : 0, std::memory_order_release);
+}
+#if defined(PSX_WEB)
+extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
+    psx_smooth_60fps_set(enabled);
+}
+#endif
 
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
@@ -2343,6 +2461,7 @@ static void sdl_vblank_present(void) {
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
         if (di.disabled || di.width == 0 || di.height == 0) {
+            smooth_60_present(nullptr, 0, 0, false);
             present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
                                 (uint16_t)di.height, 0);
 #ifndef PSX_SDL_NO_RENDER
@@ -2506,6 +2625,11 @@ static void sdl_vblank_present(void) {
             }
         }
 
+        smooth_60_present(sdl_pixel_buf,
+                          present_w * (uint32_t)active_scale,
+                          h * (uint32_t)active_scale,
+                          !g_gl_active && !g_vk_active && !di.depth24 && !fmv_frame);
+
         /* Frame blending (CRT-persistence masker for 30fps double-buffered
          * content). Some games (e.g. Crash Bash menus/characters) leave a
          * dynamic object in only one of the two display buffers per 30fps cycle,
@@ -2524,7 +2648,8 @@ static void sdl_vblank_present(void) {
             }
             const bool simple_sw = !g_gl_active && !g_vk_active && !wide_present &&
                                    !di.depth24 && active_scale == 1;
-            if (blend_cfg && simple_sw) {
+            if (blend_cfg && simple_sw &&
+                !g_smooth_60fps.load(std::memory_order_acquire)) {
                 static uint32_t prev_buf[640 * 512];
                 static uint32_t prev_px = 0;
                 const uint32_t npx = present_w * h;
@@ -3168,6 +3293,8 @@ int main(int argc, char** argv) {
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
+        psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
         g_frame_interpolation = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
