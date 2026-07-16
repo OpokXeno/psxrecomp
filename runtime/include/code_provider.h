@@ -1,28 +1,21 @@
-/* code_provider.h — the backend-agnostic code-production seam (SLJIT.md §3).
+/* code_provider.h — the backend-agnostic code-production seam.
  *
  * One interface the overlay capture/dispatch spine talks to instead of calling
- * a specific backend directly. The validated gcc spawn->DLL path becomes its
- * first implementation; the in-process sljit JIT (SLJIT.md §7 step 4) becomes
- * the second. Everything that makes overlays correct — content-keyed multi-
- * candidate dispatch, per-call live-byte validation, the self-mod blacklist,
- * the coverage manifest — is unchanged and backend-blind (SLJIT.md §2).
+ * a specific backend directly. The validated gcc/tcc spawn->DLL->rescan path is
+ * its implementation. Everything that makes overlays correct — content-keyed
+ * multi-candidate dispatch, per-call live-byte validation, the self-mod
+ * blacklist, the coverage manifest — is backend-blind.
  *
- * Two production lifecycles, BOTH expressed here because the two backends model
- * production differently and a provider implements whichever it supports:
+ * Production is BATCH / ASYNC (request / busy / poll_main): kicked by the
+ * autocapture tick, spawns a compiler off-thread, applied later via a cache
+ * rescan on the emu thread. Seconds of latency; many fragments per run. A
+ * provider sets the hooks it supports and leaves the rest NULL; callers
+ * null-check before invoking.
  *
- *   - BATCH / ASYNC  (request / busy / poll_main): the gcc model. Kicked by the
- *     autocapture tick, spawns a compiler off-thread, applied later via a cache
- *     rescan on the emu thread. Seconds of latency; many fragments per run.
- *   - SYNC / ON-MISS (compile_fragment): the sljit model. JIT a single fragment
- *     in-process at a dispatch miss, sub-ms, return a native fn the caller
- *     registers immediately. Wired into the dispatch path (overlay_loader.c
- *     try_sljit_region); the sljit shard is then VALIDATED via the same-state
- *     diff before it runs live (see SLJIT.md §11 / overlay_loader_dispatch).
- *
- * A provider sets the hooks it supports and leaves the rest NULL; callers
- * null-check before invoking. The gcc provider's batch hooks are thin pass-
- * throughs to autocompile_* — behavior is byte-for-byte what it was before the
- * abstraction (this is a pure refactor; selection defaults to gcc).
+ * (The in-process sljit JIT provider — a synchronous on-miss producer with a
+ * compile_fragment hook — was removed 2026-07-15; it had been disabled by
+ * default since 2026-06-25 due to an emitter bug. Gaps gcc/tcc have not yet
+ * covered fall to the interpreter, the always-safe precision-over-recall floor.)
  */
 #ifndef PSXRECOMP_CODE_PROVIDER_H
 #define PSXRECOMP_CODE_PROVIDER_H
@@ -34,29 +27,12 @@
 extern "C" {
 #endif
 
-/* Native shard ABI — identical to overlay_loader's OverlayFn / OverlaySljitFn. */
+/* Native shard ABI — identical to overlay_loader's OverlayFn. */
 typedef void (*CodeProviderFn)(CPUState *);
 
-/* Result of a synchronous on-miss compile. fn == NULL means the provider
- * declined (caller runs the interpreter). On success [code_lo, code_lo+code_len)
- * is the PHYS byte-range the fragment was compiled from — the caller registers a
- * candidate over it for per-call live-byte validation (the backend-neutral
- * equivalent of the gcc .ranges manifest). */
-typedef struct {
-    CodeProviderFn fn;        /* NULL = declined */
-    uint32_t       code_lo;   /* phys start of compiled code range */
-    uint32_t       code_len;  /* byte length of compiled code range */
-    /* sljit: position-independent serialized LIR for the persisted shard cache
-     * (the caller writes it to disk then frees it via the sljit free helper);
-     * NULL for providers/results that don't serialize. */
-    void          *serialized;
-    unsigned long  serialized_size;
-} CompiledFragment;
-
 typedef struct CodeProvider {
-    const char *name;                 /* "gcc" | "sljit"                       */
-    int  (*available)(void);          /* gcc: a compile cmd is configured;
-                                         sljit: always (no external toolchain) */
+    const char *name;                 /* "gcc" (spawns gcc OR tcc)             */
+    int  (*available)(void);          /* a compile cmd is configured           */
 
     /* Batch/async production (autocapture-driven). request() returns 1 if a
      * compile was started. busy() is 1 while one is in flight. poll_main() runs
@@ -65,35 +41,18 @@ typedef struct CodeProvider {
     int  (*request)(void);
     int  (*busy)(void);
     void (*poll_main)(void);
-
-    /* Synchronous on-miss production of one fragment. Fills *out (out->fn NULL =
-     * declined → caller runs the interpreter, the always-safe precision-over-
-     * recall floor). gcc leaves this hook NULL (a compiler spawn is far too slow
-     * for the dispatch path); sljit JITs in-process. A NULL hook == always
-     * declines. `bytes`/`size`/`image_base_vram` describe the image to decode
-     * from (typically live RAM: bytes = RAM base, image_base_vram = 0). */
-    void (*compile_fragment)(uint32_t entry, const uint8_t *bytes, uint32_t size,
-                             uint32_t image_base_vram, CompiledFragment *out);
 } CodeProvider;
 
 /* Resolve the active backend (overlay_backend_resolve) and cache the matching
- * provider. cfg_backend = [runtime] overlay_backend ("auto"|"gcc"|"sljit", may
- * be NULL/empty for auto); gcc_configured = autocompile_configured(). Call once
- * at overlay-cache init, on the emu thread, before the run loop starts. */
+ * provider. cfg_backend = [runtime] overlay_backend ("auto"|"gcc"|"tcc"|
+ * "auto-no-gcc", may be NULL/empty for auto); gcc_configured =
+ * autocompile_configured(). Call once at overlay-cache init, on the emu thread,
+ * before the run loop starts. */
 void code_provider_init(const char *cfg_backend, int gcc_configured);
 
 /* The active/primary provider (owns the batch path + default selection). Never
  * NULL — defaults to the gcc provider before code_provider_init() runs. */
 const CodeProvider *code_provider_active(void);
-
-/* The sljit provider IF it is available, else NULL. gcc and sljit are
- * COMPLEMENTARY, not exclusive: gcc fills the cache via the async batch path +
- * prebuilt DLLs and never JITs synchronously (compile_fragment == NULL), while
- * sljit is the synchronous JIT-on-miss that fills the gaps gcc has not (yet)
- * covered. The dispatch path uses this — independent of which provider is
- * "active" — so on a gcc dev box sljit still JITs gcc-absent regions
- * (priority gcc > sljit > interp). NULL => sljit unavailable, gaps fall to interp. */
-const CodeProvider *code_provider_sljit(void);
 
 #ifdef __cplusplus
 }

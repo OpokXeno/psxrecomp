@@ -219,7 +219,7 @@ int dirty_ram_interp_is_active(void) { return g_dirty_interp_active; }
  * the backend actually executing at that instant:
  *   0 = host/other (SDL, GPU, top-level dispatch glue, idle)
  *   1 = dirty-RAM interpreter (exec_one body / precise slice)
- *   2 = native overlay shard (gcc DLL or sljit)
+ *   2 = native overlay shard (gcc/tcc DLL)
  *   3 = compiled static text (game EXE / recompiled BIOS, incl. IRQ handler)
  *   4 = GPU GP0 command processing (gpu.c — raster/batch/VRAM-transfer work)
  * Longjmp contract mirrors g_dirty_interp_active: exception delivery saves it
@@ -916,7 +916,7 @@ static int g_xprobe_watch(uint32_t t) {
 static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t target,
                          uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail);
 /* Watched-target call note for NON-interp call sites (overlay shard call-outs
- * via dispatch_call / psx_sljit_call). phase 0 = before the call (ds = a0),
+ * via dispatch_call). phase 0 = before the call (ds = a0),
  * phase 1 = after it returned (ds = v0). Recorded as XOP_RES with
  * site = 20+phase so the `watched` dump shows the shard-side call + result. */
 void dirty_ram_xprobe_call_note(CPUState *cpu, uint32_t target, uint32_t ra, uint8_t phase) {

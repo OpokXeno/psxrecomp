@@ -1654,8 +1654,8 @@ void FullFunctionEmitter::emit_dispatch(
 
     if (cps) {
         // RECURSION_BUG.md §25 — mark CPS mode at startup for runtime code that
-        // must emit the CPS contract (the overlay sljit JIT, overlay_sljit.c).
-        out += "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
+        // routes CPS continuations (overlay_loader.c).
+        out += "\n/* CPS runtime-mode marker (the overlay loader reads g_psx_cps_mode). */\n";
         out += "static void psx_cps_mark_bios(void) {\n";
         out += "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
         out += "}\n";

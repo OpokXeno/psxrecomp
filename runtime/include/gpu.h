@@ -153,7 +153,7 @@ void gpu_ws_set_signed_x_bound_sites(const uint32_t *addresses,
 int psx_ws_is_signed_x_bound_site(uint32_t pc, uint32_t instr);
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x):
- * the gcc emit, the sljit JIT, and the interpreter all route a flagged
+ * the gcc emit and the interpreter both route a flagged
  * `sltiu rt, sx, 0x140/0x141` through this one helper so every overlay execution
  * path widens identically. Returns the sltiu verdict (1 = keep). 0 at 4:3. */
 int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
@@ -164,7 +164,7 @@ int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
 int  psx_ws_cull_bltz(uint32_t v);
 /* True if a run of instruction words carries the screen-extent reject signature
  * (a width compare AND a height compare from the configured immediate sets).
- * Used by sljit/interp to gate the widening to real render funnels. */
+ * Used by the interp to gate the widening to real render funnels. */
 int  psx_ws_func_has_screen_cull(const uint32_t *words, int n);
 /* Classify words[idx] as an X left-edge reject bltz (runtime imm sets). */
 int  psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx);
@@ -172,7 +172,7 @@ int  psx_ws_cull_bltz_at(const uint32_t *words, int n, int idx);
  * screen_h_imms); defaults 0x140/0x141 + 0xE0/0xF1. */
 void gpu_ws_set_cull_imms(const uint32_t *w, int nw, const uint32_t *h, int nh);
 int  psx_ws_is_cull_w_imm(uint32_t imm);
-/* Per-game opt-in gates for the pattern-scanned interp/sljit widen hooks
+/* Per-game opt-in gates for the pattern-scanned interp widen hooks
  * (auto_screen_x cull + auto_backdrop preload). Default OFF: a title that
  * never opted in must never have its live code pattern-scanned and rewritten. */
 void gpu_ws_set_auto_hooks(int cull_on, int backdrop_on);
@@ -213,7 +213,7 @@ int  psx_ws_backdrop_x(int x);
 /* Backdrop PRELOAD ([widescreen.cull] auto_backdrop). psx_ws_backdrop_preload()
  * is nonzero only while native-wide widescreen is engaged (0 at 4:3 / boot /
  * FMV / full-2D), so the rewrite is byte-identical when off. psx_ws_backdrop_value()
- * is the one value substitution shared by the gcc emit, the sljit JIT, and the
+ * is the one value substitution shared by the gcc emit and the
  * interpreter for a detected window bound: it returns `orig` unless preload is
  * engaged, in which case it forces the bound to preload the WHOLE finite tile
  * row (START -> 0, END -> large sentinel pinned by the generator's high clamp to

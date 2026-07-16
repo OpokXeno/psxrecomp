@@ -30,7 +30,7 @@ void autocompile_set_cache_paths(const char *cache_dir, const char *captures);
  * REAL "developer machine" signal, distinct from autocompile_configured() which
  * only reports that a command STRING is set (the shipped game.toml always sets
  * one). overlay_backend_resolve uses this so `auto` picks gcc only when the
- * toolchain can really build a shard, else sljit (toolchain-less production).
+ * toolchain can really build a shard, else tcc (toolchain-less production).
  * Memoized; safe to call repeatedly. */
 int  autocompile_toolchain_available(void);
 

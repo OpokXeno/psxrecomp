@@ -4,7 +4,7 @@
  * Generic widescreen BACKDROP-PRELOAD detector ([widescreen.cull] auto_backdrop)
  *
  * Self-contained (depends only on <stdint.h>) so ONE implementation is shared
- * verbatim by the recompiler (C++) and the runtime interpreter + sljit emitter
+ * verbatim by the recompiler (C++) and the runtime interpreter
  * (C). Having a single source of truth matters here: a false positive corrupts
  * unrelated overlay codegen (see BACKDROP_PRELOAD.md §risk), so the gate must be
  * identical on every path.

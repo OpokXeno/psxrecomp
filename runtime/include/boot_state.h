@@ -30,7 +30,7 @@ extern "C" {
  * Every mutable hardware subsystem gets a section here, and the capture is
  * proven complete by diffing a restored session's frames against a normal-boot
  * session's frames (see the "bootsnap" debug command). Host-side / recompiler-
- * derived state (dirty-RAM bitmap, overlay/sljit tables, debug rings) is NOT
+ * derived state (dirty-RAM bitmap, overlay tables, debug rings) is NOT
  * serialized — it is re-derived from restored guest RAM on load.
  */
 

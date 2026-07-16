@@ -160,7 +160,7 @@ def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
     gcc DLLs are namespaced under <game_id>/gcc/<arch-abi>/ so same-OS
-    different-arch caches (and, later, sljit blobs) never comingle. Keep this
+    different-arch caches never comingle. Keep this
     mapping in lockstep with overlay_loader.c."""
     if is_windows():
         os_tag = 'win'

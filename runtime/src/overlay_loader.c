@@ -1,7 +1,6 @@
 #include "overlay_loader.h"
 #include "overlay_api.h"
 #include "code_provider.h"
-#include "overlay_sljit.h"
 #include "overlay_backend.h"
 #include "crc32.h"
 #include "dirty_ram_interp.h"
@@ -144,8 +143,8 @@ static void range_index_add_candidate(int ci) {
 }
 
 /* RECURSION_BUG.md §25 — 1 when the build is continuation-passing (set by a
- * constructor in the generated CPS dispatch). The overlay dispatch + sljit JIT
- * read it to emit/route the CPS tail-transfer contract. Defined here (before
+ * constructor in the generated CPS dispatch). The overlay dispatch reads it to
+ * emit/route the CPS tail-transfer contract. Defined here (before
  * overlay_loader_dispatch) so both can see it. 0 = legacy unit-model. */
 int g_psx_cps_mode = 0;
 
@@ -333,15 +332,8 @@ static int      s_shadow_saved_supp       = 0;
 static uint64_t s_shadow_epoch            = 0;
 static uint32_t s_shadow_escapes          = 0;
 static uint32_t s_shadow_escapes_native   = 0;
-/* Live sljit mode (PSX_OVERLAY_SLJIT_LIVE / sljit_live debug cmd): JIT overlay
- * functions on-miss and run them LIVE without the per-shard differential — the
- * production model (sljit is the sync on-miss producer; safety is the emitter's
- * decline-on-unsupported contract, validated broadly). Off by default; the diff
- * gate above stays the dev path. Lets a developer feel the real toolchain-less
- * player experience (pure sljit + interp floor, no gcc, no diff overhead). */
-static int  s_sljit_live = 0;
-void overlay_loader_set_sljit_live(int on) { s_sljit_live = on ? 1 : 0; }
-int  overlay_loader_get_sljit_live(void)   { return s_sljit_live; }
+/* (sljit removed 2026-07-15: the deprecated in-process JIT tier and its
+ * live-execution mode are gone; overlay gaps fall to the interpreter.) */
 static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr);
 
 /* ---- Counters (surfaced via overlay_loader_status) --------------------- */
@@ -366,8 +358,6 @@ static uint64_t s_diffgate_interp = 0;  /* CPS interior re-entries sent to the  
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
-static uint32_t s_sljit_registered = 0; /* sljit Tier-2 shards registered     */
-static uint32_t s_sljit_obsoleted  = 0; /* sljit shards superseded by a gcc DLL*/
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
 static uint32_t s_last_write_size = 0;
@@ -607,155 +597,14 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     idx_set_head(phys, idx);
     range_index_add_candidate(idx);
     if (c->state == ENTRY_VALID) s_valid_count++;
-
-    /* Obsolescence (load priority: static > gcc shard > sljit shard > interp). A
-     * gcc DLL is the optimized, dev-validated artifact and OUTRANKS an sljit shard
-     * a user machine JIT'd for the same function. Once this gcc candidate is in the
-     * chain it already wins dispatch (it's at the head, ahead of the older sljit
-     * shard, and content-keyed dispatch picks the first match), but we also
-     * explicitly retire the superseded sljit shard so it can never run — even if
-     * this gcc candidate is later self-mod-blacklisted.
-     *
-     * "Same function/content" is keyed on CURRENT LIVE-RAM VALIDITY, not crc_code
-     * equality: the two backends hash DIFFERENT byte ranges for the same function
-     * (sljit hashes its contiguous JIT fragment [entry, terminator]; the gcc
-     * .ranges manifest hashes the recompiler's per-function instruction walk, with
-     * interleaved jump-tables/data excised), so their crc_code values legitimately
-     * differ even for identical source bytes. The backend-independent test is: this
-     * gcc candidate matches live RAM (c->state == VALID, computed above) AND the
-     * sljit shard at the same entry also matches live RAM right now — i.e. both
-     * describe the CURRENTLY-LIVE variant. An sljit shard for a DIFFERENT overlay
-     * variant at this address does NOT match live and is kept (distinct coverage). */
-    if (c->state == ENTRY_VALID) {
-        for (int j = c->next; j >= 0; j = s_cand[j].next) {
-            Candidate *o = &s_cand[j];
-            if (o->dll == -1 && o->state != ENTRY_BLACKLIST &&
-                cand_crc(o) == o->crc_code) {        /* o matches live => same variant */
-                if (o->state == ENTRY_VALID && s_valid_count > 0) s_valid_count--;
-                o->state = ENTRY_BLACKLIST;
-                s_sljit_obsoleted++;
-                loader_log("sljit shard 0x%08X obsoleted by gcc DLL", o->addr);
-            }
-        }
-    }
+    /* (sljit removed 2026-07-15: the gcc-DLL-obsoletes-older-sljit-shard block
+     * lived here. With no sljit shards ever registered (dll == -1), there is
+     * nothing to obsolete; the normal content-keyed chain dispatch stands.) */
 }
 
-/* ---- sljit Tier-2 shard registration (SLJIT.md §7 step 5) -------------- */
-/* Register an in-process JIT shard as a native candidate, parallel to
- * cand_register but without a .ranges manifest: the shard was JIT'd from the
- * live RAM bytes over [lo, lo+len), so crc_code is hashed from those same bytes
- * — a later dispatch runs the shard iff the code is still byte-identical
- * (reload-on-return / self-mod safety, the same live-byte contract gcc
- * candidates obey). */
-/* crc_override: 0 => hash the crc from live RAM (an in-session JIT, where the
- * overlay bytes ARE loaded). Non-zero => use it verbatim — a shard RELOADED from
- * the persisted cache at init, where the overlay code may not be in RAM yet; the
- * blob header carries the crc it was compiled from, and dispatch re-hashes live
- * RAM against it so the shard only runs once the identical bytes are present. */
-static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
-                                     uint32_t lo, uint32_t len, uint32_t crc_override) {
-    if (s_cand_n >= CAND_CAP || len == 0) return;
-    int idx = s_cand_n++;
-    Candidate *c = &s_cand[idx];
-    c->addr        = phys & 0x1FFFFFFFu;
-    c->fn          = fn;
-    c->dll         = -1;            /* sentinel: sljit shard, not a DLL */
-    c->nranges     = 1;
-    c->range_lo[0] = lo & 0x1FFFFFFFu;
-    c->range_len[0] = len;
-    extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
-    overlay_watch_set_range(c->range_lo[0], c->range_len[0]);
-    c->crc_code = crc_override ? crc_override : cand_crc(c);  /* live bytes == JIT'd-from bytes */
-    c->val_gen  = cand_gensum(c);
-    c->state    = ENTRY_VALID;
-    c->diff_passes = 0;
-    c->device_touch = 0;
-    c->next     = idx_head(c->addr);
-    idx_set_head(c->addr, idx);
-    range_index_add_candidate(idx);
-    s_valid_count++;
-    s_sljit_registered++;
-    loader_log("sljit shard registered 0x%08X [%u bytes]", c->addr, len);
-}
-
-/* JIT-on-miss memo: phys entries already attempted (compiled or declined), so a
- * declined fragment isn't re-attempted every dispatch. */
-#define MAX_SLJIT_TRIED 512
-static uint32_t s_sljit_tried[MAX_SLJIT_TRIED];
-static int      s_sljit_tried_n = 0;
-static int sljit_already_tried(uint32_t phys) {
-    for (int i = 0; i < s_sljit_tried_n; i++)
-        if (s_sljit_tried[i] == phys) return 1;
-    return 0;
-}
-static void sljit_mark_tried(uint32_t phys) {
-    if (s_sljit_tried_n < MAX_SLJIT_TRIED) s_sljit_tried[s_sljit_tried_n++] = phys;
-}
-
-/* Persist a freshly-JIT'd shard's serialized LIR to the on-disk cache (defined
- * below, after the cache-path globals). */
-static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
-                                const void *blob, unsigned long blob_size);
-
-#include "overlay_compile_worker.h"
-/* Off-main-thread sljit compile (docs/ASYNC_OVERLAY_COMPILE.md). The background
- * worker JITs from a snapshot and PUBLISHES the shard to the on-disk cache +
- * sets s_async_cache_dirty; the DISPATCH thread rescans-and-registers on its
- * next miss (candidate table stays single-threaded). PSX_SLJIT_SYNC=1 forces
- * the legacy synchronous JIT-on-miss path. */
-#ifdef _WIN32
-static volatile LONG s_async_cache_dirty = 0;
-#  define async_cache_dirty_exchange(v) InterlockedExchange(&s_async_cache_dirty, (v))
-#else
-static volatile int  s_async_cache_dirty = 0;
-#  define async_cache_dirty_exchange(v) __atomic_exchange_n(&s_async_cache_dirty, (v), __ATOMIC_SEQ_CST)
-#endif
-static int           g_sljit_async = 1;
-
-/* MASTER SAFETY GATE (2026-06-25): the sljit EMITTER mistranslates some overlay
- * instruction(s). Proven on MMX6: sljit-only save-load softlocks/loopbacks, PURE
- * INTERP works (discriminator), and it reproduces in the SYNCHRONOUS path — so it
- * is the emitter, not the async worker. Until the emitter bug is found + fixed the
- * whole sljit tier is DISABLED by default: no shard READ (scan_sljit_cache_dir),
- * no shard GENERATE (worker / sync try / live gap-fill), every overlay miss falls
- * to the interpreter. gcc (DLL cache + autocompile) and overlay capture are
- * untouched, so priority is gcc > interp and dispatch misses are still recorded
- * for future gcc coverage. PSX_SLJIT_ENABLE=1 re-enables it for emitter-fix
- * testing. See memory mmx6_sljit_shard_malformed. */
-static int           g_sljit_tier_enabled = 0;
-
-/* Attempt an in-process JIT of the leaf function at `phys` from live RAM, and
- * register the shard as a candidate on success. Gated by the caller to the
- * validation configuration only (backend==sljit + diff_mode); see the dispatch
- * hook. Decodes from live RAM exactly as the interpreter does. */
-static void try_sljit_region(uint32_t addr) {
-    uint32_t phys = addr & 0x1FFFFFFFu;
-    /* Use the sljit provider specifically (not the active one): gcc is the
-     * primary/batch provider with compile_fragment == NULL, so the synchronous
-     * JIT-on-miss gap-fill must go through sljit even when gcc is "active". */
-    const CodeProvider *cp = code_provider_sljit();
-    if (!cp || !cp->compile_fragment) return;
-    if (sljit_already_tried(phys)) return;
-    extern int dirty_ram_is_dirty(uint32_t phys);
-    if (!dirty_ram_is_dirty(phys)) return;   /* only JIT real runtime code */
-    sljit_mark_tried(phys);
-    uint8_t *ram = memory_get_ram_ptr();
-    if (!ram) return;
-    CompiledFragment frag = {0};
-    /* Decode from live RAM: bytes = RAM base, image_base_vram = 0 ⇒ byte offset =
-     * (entry & 0x1FFFFFFF) = phys. Pass the VIRTUAL entry so return_pc and
-     * jal/J targets carry the KSEG bits the guest uses — the interpreter computes
-     * pc from the virtual address, and saved $ra values must match byte-exact. */
-    cp->compile_fragment(addr, ram, 2u * 1024u * 1024u, 0u, &frag);
-    if (frag.fn) {
-        register_sljit_candidate(phys, (OverlayFn)frag.fn, frag.code_lo, frag.code_len, 0);
-        /* Persist the position-independent shard so a later (possibly toolchain-
-         * less) session reloads it instead of re-JITing through the interpreter. */
-        persist_sljit_shard(phys, frag.code_lo, frag.code_len,
-                            frag.serialized, frag.serialized_size);
-    }
-    if (frag.serialized) overlay_sljit_free_serialized(frag.serialized);
-}
+/* (sljit removed 2026-07-15: register_sljit_candidate, the JIT-on-miss memo,
+ * the async compile-worker glue, the master tier gate, and try_sljit_region
+ * lived here. Overlay misses now fall to the interpreter.) */
 
 /* ---- Global state ------------------------------------------------------ */
 
@@ -1046,9 +895,9 @@ static int cache_idx_has_basename(const char *fname) {
     return 0;
 }
 
-/* Canonical cache arch-abi tag (see SLJIT.md §4 — caches are namespaced per
- * backend AND per target so a Windows-x64 gcc DLL and, later, a same-OS arm64
- * or an sljit blob for the same fragment never comingle). compile_overlays.py
+/* Canonical cache arch-abi tag (caches are namespaced per backend AND per
+ * target so a Windows-x64 gcc DLL and, later, a same-OS arm64 build for the
+ * same fragment never comingle). compile_overlays.py
  * computes the IDENTICAL string from platform.system()/machine(); keep the two
  * mappings in lockstep ("<os>-<arch>": win|linux|macos + x64|arm64|x86). */
 #if defined(_WIN32)
@@ -1134,9 +983,8 @@ static void scan_one_cache_dir(const char *dir) {
 /* Scan the namespaced gcc cache: gcc/<arch-abi>/cg<codegen-ver>/. The codegen
  * version segment means a build with new emitter output reads a FRESH directory
  * and never picks up a stale DLL (old versions coexist on disk, no migration).
- * The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs: sljit re-JITs
- * from the coverage manifest; see SLJIT.md §5.3). (Pre-1.0: no legacy fallback —
- * older flat / unversioned caches are simply ignored and regenerated.) */
+ * (Pre-1.0: no legacy fallback — older flat / unversioned caches are simply
+ * ignored and regenerated.) */
 /* Hardening (never-again for the silent cg-tag read≠write drift): when the loader
  * finds ZERO shards under its OWN cg-tag, check whether a SIBLING cg<...> folder in
  * the same tier holds shards. If so, the autocompile wrote to a different codegen
@@ -1379,196 +1227,9 @@ static void scan_cache_dir(void) {
     }
 }
 
-/* ---- Persisted sljit shard cache (Stage 2, SLJIT_PERSIST_CACHE.md) -------- */
-/* JIT'd sljit shards are serialized (position-independent LIR — Stage 1) and
- * written to <cache>/<game_id>/sljit/<arch-abi>/cg<N>/<entry8>_<crc8>.sljit; at
- * init they are deserialized + regenerated for THIS process and registered as
- * dll<0 candidates. The arch-abi + codegen-version + helper-order tags namespace
- * and invalidate stale blobs. Priority is unchanged (gcc > sljit > interp): a gcc
- * DLL covering the same live function still supersedes a reloaded shard via the
- * obsolete path. Safety is unchanged too: a reloaded shard re-earns trust each
- * session through the same per-dispatch crc re-hash + same-state diff gate. */
-#define SLJIT_BLOB_MAGIC       0x534A4C53u   /* 'SLJS' */
-#define SLJIT_BLOB_FORMAT_VER  2u   /* v2: serialized with debug info (options=0) */
-#define SLJIT_HELPER_ORDER_VER 1u            /* bump if the SLJIT_HLP_* order changes */
-
-typedef struct {
-    uint32_t magic, format_ver, helper_order_ver;
-    uint32_t entry_phys, code_lo, code_len, crc_code, blob_size;
-} SljitBlobHeader;
-
-static int      s_sljit_persist  = 0;        /* write JIT'd shards to disk        */
-static uint32_t s_sljit_reloaded = 0;        /* shards loaded from disk at init   */
-static uint32_t s_sljit_persist_calls = 0;   /* persist_sljit_shard entered        */
-static uint32_t s_sljit_persist_writes = 0;  /* blobs actually written             */
-static int      s_persist_dbg = 0;           /* last persist exit reason (1..6)    */
-static uint32_t s_reload_seen = 0;           /* .sljit files matched by the scan   */
-static uint32_t s_reload_hdrbad = 0;         /* files rejected on header validation */
-static uint32_t s_reload_deserfail = 0;      /* files that failed deserialize       */
-uint32_t overlay_loader_sljit_reload_seen(void)     { return s_reload_seen; }
-uint32_t overlay_loader_sljit_reload_hdrbad(void)   { return s_reload_hdrbad; }
-uint32_t overlay_loader_sljit_reload_deserfail(void){ return s_reload_deserfail; }
-uint32_t overlay_loader_sljit_reloaded(void) { return s_sljit_reloaded; }
-uint32_t overlay_loader_sljit_persist_calls(void) { return s_sljit_persist_calls; }
-uint32_t overlay_loader_sljit_persist_writes(void) { return s_sljit_persist_writes; }
-int      overlay_loader_sljit_persist_on(void) { return s_sljit_persist; }
-int      overlay_loader_sljit_persist_dbg(void) { return s_persist_dbg; }
-
-static void sljit_cache_dir(char *buf, size_t n) {
-    snprintf(buf, n, "%s/%s/sljit/%s/cg%d_%08x",
-             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
-             (unsigned)PSX_OVERLAY_CODEGEN_HASH);
-}
-
-/* Public: the resolved on-disk sljit shard dir, so the sljit_async debug command
- * can report exactly where the worker writes (no guessing about cache location). */
-void overlay_loader_sljit_cache_dir(char *buf, int n) {
-    if (buf && n > 0) sljit_cache_dir(buf, (size_t)n);
-}
-int overlay_loader_sljit_async_on(void) { return g_sljit_async; }
-int overlay_loader_sljit_tier_enabled(void) { return g_sljit_tier_enabled; }
-
-#ifdef _WIN32
-static void sljit_mkdir_p(const char *path) {
-    char tmp[768];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/' || *p == '\\') { char sep = *p; *p = '\0'; CreateDirectoryA(tmp, NULL); *p = sep; }
-    }
-    CreateDirectoryA(tmp, NULL);
-}
-#endif
-
-static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
-                                const void *blob, unsigned long blob_size) {
-#ifdef _WIN32
-    s_sljit_persist_calls++;
-    if (!s_sljit_persist)            { s_persist_dbg = 1; return; }
-    if (!blob || blob_size == 0)     { s_persist_dbg = 2; return; }
-    if (len == 0)                    { s_persist_dbg = 3; return; }
-    const uint8_t *ram = memory_get_ram_ptr();
-    if (!ram)                        { s_persist_dbg = 4; return; }
-    /* crc over the live bytes the shard was JIT'd from — identical to cand_crc()
-     * for this single range, so the reloaded candidate's crc matches what
-     * dispatch re-hashes. */
-    uint32_t crc = crc32_update(0xFFFFFFFFu, ram + (lo & 0x1FFFFFFFu), len) ^ 0xFFFFFFFFu;
-    char dir[768]; sljit_cache_dir(dir, sizeof(dir));
-    sljit_mkdir_p(dir);
-    char path[860];
-    snprintf(path, sizeof(path), "%s/%08X_%08X.sljit", dir, entry_phys & 0x1FFFFFFFu, crc);
-    FILE *f = fopen(path, "wb");
-    if (!f)                          { s_persist_dbg = 5; return; }
-    SljitBlobHeader hh;
-    hh.magic = SLJIT_BLOB_MAGIC; hh.format_ver = SLJIT_BLOB_FORMAT_VER;
-    hh.helper_order_ver = SLJIT_HELPER_ORDER_VER;
-    hh.entry_phys = entry_phys & 0x1FFFFFFFu; hh.code_lo = lo & 0x1FFFFFFFu;
-    hh.code_len = len; hh.crc_code = crc; hh.blob_size = (uint32_t)blob_size;
-    fwrite(&hh, sizeof(hh), 1, f);
-    fwrite(blob, 1, blob_size, f);
-    fclose(f);
-    s_sljit_persist_writes++;
-    s_persist_dbg = 6;
-    loader_log("sljit shard persisted %08X_%08X [%lu bytes]",
-               entry_phys & 0x1FFFFFFFu, crc, blob_size);
-#else
-    (void)entry_phys; (void)lo; (void)len; (void)blob; (void)blob_size;
-#endif
-}
-
-/* Worker-thread publish (overlay_compile_worker.c): write a freshly-JIT'd shard
- * into the on-disk cache ATOMICALLY (temp + rename, so dispatch's scan never
- * reads a partial file) with an EXPLICIT crc (computed by the worker over the
- * snapshot's compiled range, NOT live RAM), then flag dispatch to rescan. Only
- * the filesystem + read-only-after-init cache-path globals are touched — never
- * the candidate table — so it is safe off the dispatch thread. */
-void overlay_loader_async_publish(uint32_t entry_phys, uint32_t lo, uint32_t len,
-                                  uint32_t crc, const void *blob,
-                                  unsigned long blob_size) {
-#ifdef _WIN32
-    if (!s_sljit_persist || !blob || blob_size == 0 || len == 0) return;
-    char dir[768]; sljit_cache_dir(dir, sizeof(dir));
-    sljit_mkdir_p(dir);
-    char path[860], tmp[920];
-    snprintf(path, sizeof(path), "%s/%08X_%08X.sljit", dir, entry_phys & 0x1FFFFFFFu, crc);
-    snprintf(tmp,  sizeof(tmp),  "%s.tmp%lu", path, (unsigned long)GetCurrentThreadId());
-    FILE *f = fopen(tmp, "wb");
-    if (!f) return;
-    SljitBlobHeader hh;
-    hh.magic = SLJIT_BLOB_MAGIC; hh.format_ver = SLJIT_BLOB_FORMAT_VER;
-    hh.helper_order_ver = SLJIT_HELPER_ORDER_VER;
-    hh.entry_phys = entry_phys & 0x1FFFFFFFu; hh.code_lo = lo & 0x1FFFFFFFu;
-    hh.code_len = len; hh.crc_code = crc; hh.blob_size = (uint32_t)blob_size;
-    int wok = (fwrite(&hh, sizeof hh, 1, f) == 1) &&
-              (fwrite(blob, 1, blob_size, f) == blob_size);
-    fclose(f);
-    if (!wok) { remove(tmp); return; }
-    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { remove(tmp); return; }
-    s_sljit_persist_writes++;   /* telemetry-only; benign cross-thread incr */
-    async_cache_dirty_exchange(1);
-#else
-    (void)entry_phys; (void)lo; (void)len; (void)crc; (void)blob; (void)blob_size;
-#endif
-}
-
-/* Idempotency for the on-miss rescan: a dispatch-thread-only set of .sljit
- * filenames already deserialized+registered, so re-running scan_sljit_cache_dir
- * after a worker publish never double-registers. */
-#define MAX_LOADED_BLOBS 8192
-static char s_loaded_blobs[MAX_LOADED_BLOBS][24];  /* "XXXXXXXX_XXXXXXXX.sljit" */
-static int  s_loaded_blob_n;
-static int blob_already_loaded(const char *name) {
-    for (int i = 0; i < s_loaded_blob_n; i++)
-        if (!strcmp(s_loaded_blobs[i], name)) return 1;
-    return 0;
-}
-static void blob_mark_loaded(const char *name) {
-    if (s_loaded_blob_n < MAX_LOADED_BLOBS) {
-        strncpy(s_loaded_blobs[s_loaded_blob_n], name, 23);
-        s_loaded_blobs[s_loaded_blob_n][23] = '\0';
-        s_loaded_blob_n++;
-    }
-}
-
-/* Reload persisted shards at init: deserialize + regenerate + register. The crc
- * comes from the blob header (overlay RAM may not be loaded yet; dispatch
- * re-hashes live RAM against it before ever running the shard). */
-static void scan_sljit_cache_dir(void) {
-#ifdef _WIN32
-    char dir[768]; sljit_cache_dir(dir, sizeof(dir));
-    char pattern[860];
-    snprintf(pattern, sizeof(pattern), "%s/*.sljit", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE fh = FindFirstFileA(pattern, &fd);
-    if (fh == INVALID_HANDLE_VALUE) return;
-    do {
-        s_reload_seen++;
-        if (blob_already_loaded(fd.cFileName)) continue;  /* idempotent rescan */
-        char full[900];
-        snprintf(full, sizeof(full), "%s/%s", dir, fd.cFileName);
-        FILE *f = fopen(full, "rb");
-        if (!f) continue;
-        SljitBlobHeader hd;
-        if (fread(&hd, sizeof(hd), 1, f) != 1) { fclose(f); s_reload_hdrbad++; continue; }
-        if (hd.magic != SLJIT_BLOB_MAGIC || hd.format_ver != SLJIT_BLOB_FORMAT_VER ||
-            hd.helper_order_ver != SLJIT_HELPER_ORDER_VER ||
-            hd.blob_size == 0 || hd.blob_size > (4u * 1024u * 1024u)) { fclose(f); s_reload_hdrbad++; continue; }
-        void *blob = malloc(hd.blob_size);
-        if (!blob) { fclose(f); continue; }
-        size_t got = fread(blob, 1, hd.blob_size, f);
-        fclose(f);
-        if (got != hd.blob_size) { free(blob); s_reload_hdrbad++; continue; }
-        OverlaySljitFn fn = overlay_sljit_deserialize(blob, hd.blob_size);
-        free(blob);
-        if (!fn) { s_reload_deserfail++; continue; }
-        register_sljit_candidate(hd.entry_phys, (OverlayFn)fn,
-                                 hd.code_lo, hd.code_len, hd.crc_code);
-        s_sljit_reloaded++;
-        blob_mark_loaded(fd.cFileName);
-    } while (FindNextFileA(fh, &fd));
-    FindClose(fh);
-    if (s_sljit_reloaded) loader_log("sljit cache: reloaded %u shard(s)", s_sljit_reloaded);
-#endif
-}
+/* (sljit removed 2026-07-15: the persisted sljit shard cache — blob header,
+ * persist/publish writers, on-disk reload scan, and their debug accessors —
+ * lived here. No shards are produced or reloaded anymore.) */
 
 /* True if the cache holds a DLL for this region compiled from an image with
  * this CRC (filename <addr8>_<crc8>.dll). Autocapture's "unseen" test. */
@@ -1797,6 +1458,7 @@ static void overlay_dispatch_call_probed(CPUState *cpu, uint32_t addr, uint32_t 
 
 static void init_callbacks(void) {
     extern void psx_restore_state_escape(void);
+    extern void psx_rfe_mark_escape(void);
     s_callbacks.dispatch_call        = overlay_dispatch_call_probed;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
     s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
@@ -1814,6 +1476,8 @@ static void init_callbacks(void) {
     s_callbacks.log_call_entry       = debug_server_log_call_entry;
 #endif
     s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
+    /* Return-from-exception mark (ABI v12): overlay `rfe` ops forward here. */
+    s_callbacks.rfe_mark_escape          = psx_rfe_mark_escape;
     /* Call-contract state (ABI v2): DLL code shares the runtime's bail
      * flag and counters through these pointers. */
     s_callbacks.call_bail_flag = &g_psx_call_bail;
@@ -2051,22 +1715,8 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     scan_cache_dir();
     overlay_image_warm_init();
     overlay_image_warm_seed_boot_text();
-    /* Persisted sljit shard cache (Stage 2): the cache is enabled (this init only
-     * runs when [runtime] overlay_cache is on), so persist JIT'd shards and reload
-     * any from a prior session now. Reloaded shards register as dll<0 candidates
-     * and re-earn trust via the normal per-dispatch crc + diff gate. */
-    { const char *e = getenv("PSX_SLJIT_ENABLE"); if (e && *e && *e != '0') g_sljit_tier_enabled = 1; }
-    if (g_sljit_tier_enabled) {
-        s_sljit_persist = 1;
-        scan_sljit_cache_dir();
-        { const char *e = getenv("PSX_SLJIT_SYNC"); if (e && *e && *e != '0') g_sljit_async = 0; }
-        if (g_sljit_async) overlay_compile_worker_start();   /* off-thread JIT */
-    } else {
-        /* Tier disabled (default): no read, no generate. persist off so the worker
-         * publish + persist_sljit_shard are inert even if reached. gcc > interp. */
-        s_sljit_persist = 0;
-        loader_log("sljit tier DISABLED (emitter bug; gcc>interp). PSX_SLJIT_ENABLE=1 to re-enable");
-    }
+    /* (sljit removed 2026-07-15: the persisted-shard reload + off-thread compile
+     * worker were started here. Overlay misses fall to the interpreter.) */
     /* Pre-seed native-block bisection list from PSX_NATIVE_BLOCK (comma/space
      * separated hex addrs). Lets us route init-time overlay functions through the
      * sanctioned dirty-RAM interpreter from the FIRST boot instruction — the
@@ -2149,44 +1799,13 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
             loader_log("PSX_OVERLAY_DIFF set: native/interp shadow diff ON from boot");
         }
     }
-    /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
-     * AFTER code_provider_init resolves the backend (the default depends on it). */
     s_active = 1;
 }
 
-/* Apply the sljit live-execution policy once the Tier-2 backend is resolved
- * (call AFTER code_provider_init). Default: live ON when the resolved backend is
- * sljit (the toolchain-less production model — JIT on miss, VALIDATE via the
- * same-state diff, promote to native only on a clean verify budget; device +
- * diverging shards stay on the interpreter), OFF otherwise. The
- * PSX_OVERLAY_SLJIT_LIVE env var overrides either way (0 forces off, nonzero
- * forces on) — a dev escape hatch. NOTE: "live" here is VALIDATED-live, not the
- * old blind path; see overlay_loader_dispatch's diff gate. */
-void overlay_loader_apply_live_policy(void) {
-    /* DEFAULT-ON (validated): sljit is live whenever it is AVAILABLE, so it fills
-     * gcc-absent overlay regions even on a gcc dev box (gcc > sljit > interp).
-     * "Live" is VALIDATED-live — shards still route through the same-state diff
-     * gate (see overlay_loader_dispatch) and device-touching / diverging shards
-     * stay on the interpreter, so default-on cannot reintroduce the save-load
-     * wedge. The PSX_OVERLAY_SLJIT_LIVE env var still overrides (0 forces off). */
-    int live = (code_provider_sljit() != NULL) ? 1 : 0;
-    /* Mutually exclusive (user preference, RECURSION_BUG.md §25): if gcc is the
-     * active backend, do NOT run sljit live. The gcc autocompile produces
-     * full-coverage CPS DLLs in the background; the gap before they land is the
-     * interpreter (relatively fast), not sljit leaf shards. So gcc boxes are
-     * gcc>interp; toolchain-less boxes are sljit>interp. PSX_OVERLAY_SLJIT_LIVE
-     * still overrides for testing. */
-    if (overlay_backend_active() == OVERLAY_BACKEND_GCC) live = 0;
-    const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
-    if (e && *e) live = (*e != '0') ? 1 : 0;
-    /* MASTER GATE: the sljit tier is disabled by default (emitter bug) — never go
-     * live, regardless of backend/env, until PSX_SLJIT_ENABLE=1. */
-    if (!g_sljit_tier_enabled) live = 0;
-    s_sljit_live = live;
-    loader_log("sljit live policy: active_backend=%s sljit_avail=%d env=%s -> live=%d",
-               overlay_backend_name(overlay_backend_active()),
-               code_provider_sljit() != NULL, e && *e ? e : "(unset)", live);
-}
+/* (sljit removed 2026-07-15: overlay_loader_apply_live_policy resolved the
+ * sljit live-execution policy once the Tier-2 backend was known. With the tier
+ * gone there is no live policy to apply; the interpreter is the overlay-miss
+ * floor unconditionally.) */
 
 void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
                                 const uint8_t *bytes) {
@@ -2594,12 +2213,6 @@ retry_candidates:
     int lazy_exact = 0;
     int exact_needs_load = 0;
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
-        /* Pick up shards the background compile worker just published (idempotent
-         * rescan; runs only when a publish has flipped the dirty flag). */
-        if (g_sljit_tier_enabled && g_sljit_async && async_cache_dirty_exchange(0)) {
-            scan_sljit_cache_dir();
-            head = idx_head(phys);
-        }
         lazy_exact = head < 0 && lazy_has_exact_entry(phys);
         /* A CPS continuation is normally not a registered function ENTRY. Its
          * already-loaded range owner must be checked before lazy discovery:
@@ -2617,38 +2230,8 @@ retry_candidates:
             lazy_loaded = 1;
             goto retry_candidates;
         }
-        /* sljit JIT-on-miss (SLJIT.md §7 step 5). Fires when the active backend is
-         * sljit and EITHER the same-state differential is armed (dev validation
-         * path — shards created then diffed vs interp) OR live mode is on (the
-         * production model — shards created and run live, no per-shard diff).
-         * Never inside a shadow run. */
-        if (head < 0 && g_sljit_tier_enabled && (s_diff_mode || s_sljit_live) && !s_in_shadow &&
-            code_provider_sljit() != NULL) {
-            /* head < 0 == no gcc DLL (or any candidate) registered for this region
-             * after the cache-load attempt above => gcc-absent => sljit fills the
-             * gap (priority gcc > sljit > interp). */
-            if (g_sljit_async) {
-                /* OFF-THREAD: snapshot the region bytes + enqueue for the worker;
-                 * interpret THIS pass. The shard registers on a later miss via the
-                 * rescan above — no synchronous JIT spike on the dispatch thread. */
-                if (!sljit_already_tried(phys)) {
-                    extern int dirty_ram_is_dirty(uint32_t phys);
-                    uint8_t *ram = memory_get_ram_ptr();
-                    if (ram && dirty_ram_is_dirty(phys)) {   /* only JIT runtime code */
-                        sljit_mark_tried(phys);
-                        uint32_t snap = 8u * 1024u;          /* SLJIT_MAX_FRAG_INSNS*4 */
-                        if (phys + snap > 2u * 1024u * 1024u)
-                            snap = 2u * 1024u * 1024u - phys;
-                        uint32_t crc = crc32_update(0xFFFFFFFFu, ram + phys, snap)
-                                       ^ 0xFFFFFFFFu;
-                        overlay_compile_worker_enqueue(addr, phys, ram + phys, snap, crc);
-                    }
-                }
-            } else {
-                try_sljit_region(addr);   /* legacy synchronous path (PSX_SLJIT_SYNC=1) */
-                head = idx_head(phys);
-            }
-        }
+        /* (sljit removed 2026-07-15: the JIT-on-miss gap-fill — off-thread
+         * enqueue or synchronous compile — ran here. Misses fall to interp.) */
     }
 
     /* CPS (§25) continuation re-entry: phys is not an overlay ENTRY, but it may
@@ -2709,7 +2292,7 @@ retry_candidates:
                  * too — the blocklist blocks LIVE native, not the sandbox). */
                 int in_own_shadow = (s_in_shadow && (const void *)c == s_shadow_cand);
                 if (!in_own_shadow) {
-                    int want_diff = s_diff_mode || (s_sljit_live && c->dll < 0);
+                    int want_diff = s_diff_mode;
                     if (want_diff && addr < 0x10000u) want_diff = 0;
                     if (want_diff && c->diff_passes < OVERLAY_DIFF_BUDGET) {
                         if (_probe) s_cps_probe_outcome = 5;
@@ -2812,16 +2395,10 @@ retry_candidates:
              * times it's trusted and falls through to normal execution, so the
              * diff cost stays bounded (a diverging candidate never reaches the
              * budget — it keeps being diff-gated and never runs native live).
-             *
-             * VALIDATED-LIVE: live sljit mode (s_sljit_live) is NOT a separate
-             * "JIT and run blind" path — it routes its sljit SHARDS (dll < 0)
-             * through the SAME diff gate, so a shard runs native live only after a
-             * clean verify budget, and run_shadow_diff's interp-first pass computes
-             * device_touch (device functions get pinned to interp, never double-
-             * executing I/O — the save-load wedge). gcc candidates (dll >= 0) are
-             * the trusted tier (validated at dev time) and run native directly;
-             * they are diffed only in explicit dev diff mode. */
-            int want_diff = s_diff_mode || (s_sljit_live && c->dll < 0);
+             * gcc/DLL candidates are the trusted tier (validated at dev time) and
+             * run native directly; they are diffed only in explicit dev diff mode
+             * (PSX_OVERLAY_DIFF / overlay_diff cmd). */
+            int want_diff = s_diff_mode;
             /* Kernel-window candidates (call gates 0xA0/0xB0/0xC0 and the RAM
              * kernel) are NOT shadow-diffable: the gates tail-jump via RAM
              * tables into kernel SERVICES whose behavior depends on scheduler/
@@ -3023,9 +2600,6 @@ void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
 
 int overlay_loader_registered_count(void) { return s_valid_count; }
 
-/* sljit Tier-2 shards registered as candidates this session (diagnostics). */
-uint32_t overlay_loader_sljit_registered(void) { return s_sljit_registered; }
-
 /* Dispatches that ran native via the unchanged-page-generation fast path,
  * i.e. skipped the per-dispatch code-range crc32 (overlay-cache v2 P2). High
  * values relative to reval_attempts mean the warm-cache hot path is cheap. */
@@ -3035,27 +2609,8 @@ int overlay_loader_range_index_overflow(void) { return s_range_index_overflow; }
 int overlay_loader_lazy_manifest_count(void) { return s_lazy_man_n; }
 int overlay_loader_lazy_manifest_overflow(void) { return s_lazy_man_overflow; }
 
-/* sljit shards superseded by a higher-priority gcc DLL (same content). */
-uint32_t overlay_loader_sljit_obsoleted(void) { return s_sljit_obsoleted; }
-
-/* Force a one-shot sljit JIT attempt of the leaf function at `addr` from live
- * RAM and register it on success (bypasses the diff-mode gate — a probe). For
- * the sljit_try debug command. Returns via the result struct. */
-void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out) {
-    out->fn = NULL; out->code_lo = 0; out->code_len = 0; out->insns = 0;
-    uint8_t *ram = memory_get_ram_ptr();
-    if (!ram) return;
-    /* Virtual entry so return_pc / jal targets carry the KSEG bits (see
-     * try_sljit_region); byte offset is still (entry & 0x1FFFFFFF) = phys. */
-    overlay_sljit_try_compile(addr, ram, 2u * 1024u * 1024u, 0u, out);
-    if (out->fn) {
-        register_sljit_candidate(addr & 0x1FFFFFFFu, (OverlayFn)out->fn,
-                                 out->code_lo, out->code_len, 0);
-        persist_sljit_shard(addr & 0x1FFFFFFFu, out->code_lo, out->code_len,
-                            out->serialized, out->serialized_size);
-    }
-    if (out->serialized) { overlay_sljit_free_serialized(out->serialized); out->serialized = NULL; }
-}
+/* (sljit removed 2026-07-15: overlay_loader_sljit_obsoleted and the
+ * overlay_loader_sljit_probe one-shot JIT helper lived here.) */
 
 /* ---- Native↔interp execution fingerprint differential (§5-E) ----------- */
 /* For each CANDIDATE function execution we record the FULL register file at
@@ -3181,8 +2736,8 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     if (g_shadow_mmio_hits != mmio0) {
         /* Device-touching: keep the interp result live (already in *cpu/ram/spad),
          * mark the candidate so it ALWAYS runs via the interpreter (never its
-         * shard, never re-diffed). sljit covers the pure-compute majority; device
-         * functions stay on the interpreter — safe by construction, no double I/O. */
+         * shard, never re-diffed). Device functions stay on the interpreter —
+         * safe by construction, no double I/O. */
         c->device_touch = 1;
         s_shadow_skipped_dev++;
         g_psx_call_bail = 0;
@@ -3450,124 +3005,9 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
     return 1;
 }
 
-/* ---- jal/jalr call helper for sljit shards (SLJIT.md §7) ---------------- */
-/* A JIT'd shard calls this at every jal/jalr site instead of open-coding the
- * call contract. It reproduces the dirty-RAM interpreter's call path EXACTLY
- * (see exec_one cases 0x03 / SPECIAL 0x09 and dispatch_nonlocal_call), so a
- * shard-issued call behaves identically to an interpreted one — including the
- * wild-return / bail unwind that the contract guards (Bug A/C/D family). The
- * one principled difference from the interpreter's local-dirty fast path: a
- * native shard cannot resume itself block-by-block, so a not-yet-native callee
- * is run as a UNIT via psx_dispatch_call (which handles interp/dirty callees to
- * the return contract) rather than the interpreter's pc-chain. See overlay_sljit.h. */
-static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_pc,
-                                int check_contract);
-int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
-                   int check_contract) {
-    dirty_ram_xprobe_call_note(cpu, target, return_pc, 0);
-    int r = psx_sljit_call_inner(cpu, target, return_pc, check_contract);
-    dirty_ram_xprobe_call_note(cpu, target, return_pc, 1);
-    return r;
-}
-static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_pc,
-                                int check_contract) {
-    uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
-#ifdef PSX_HAS_GAME_DISPATCH
-    /* Skip the compiled game function when its target is no longer native-safe;
-     * fall through to the native/interp paths that run the live RAM bytes. */
-    extern int psx_game_text_native_ok(uint32_t addr);
-    if (psx_game_text_native_ok(target)) {
-        extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
-        cpu->pc = 0;
-        int prev_phase = g_exec_phase;
-        g_exec_phase = 3;
-        int _gc = psx_dispatch_game_compiled(cpu, target);
-        g_exec_phase = prev_phase;
-        if (_gc) {
-            if (g_psx_call_bail) return 1;
-            if (cpu->pc != 0) return 1;
-            if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
-            return 0;
-        }
-    }
-#endif
-    cpu->pc = 0;
-    if (overlay_loader_call_native(cpu, target)) {
-        if (g_psx_call_bail) return 1;
-        if (cpu->pc != 0) return 1;
-        if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
-        return 0;
-    }
-    /* Not a resolved compiled/native unit: dispatch the callee as a unit (the
-     * interpreter's nonlocal path — handles interp/dirty callees + the return
-     * contract internally). */
-    cpu->pc = 0;
-    {
-        int prev_phase = g_exec_phase;
-        g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
-        psx_dispatch_call(cpu, target, return_pc);
-        g_exec_phase = prev_phase;
-    }
-    if (g_psx_call_bail) return 1;
-    if (cpu->pc != 0) return 1;
-    return 0;
-}
-
-/* COP2/GTE helper — mirrors dirty_ram_interp.c case 0x12 + LWC2/SWC2. */
-void psx_sljit_cop2(CPUState *cpu, uint32_t insn) {
-    uint32_t op = (insn >> 26) & 0x3Fu, rs = (insn >> 21) & 0x1Fu;
-    uint32_t rt = (insn >> 16) & 0x1Fu, rd = (insn >> 11) & 0x1Fu;
-    if (op == 0x12) {                              /* COP2 */
-        uint32_t cop_op = rs;
-        if      (cop_op == 0x00) { cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd); cpu->gpr[0] = 0; } /* MFC2 */
-        else if (cop_op == 0x02) { cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd); cpu->gpr[0] = 0; } /* CFC2 */
-        else if (cop_op == 0x04) { gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]); }                  /* MTC2 */
-        else if (cop_op == 0x06) { gte_write_ctrl(cpu, (uint8_t)rd, cpu->gpr[rt]); }                  /* CTC2 */
-        else if (cop_op & 0x10)  { gte_execute(cpu, insn & 0x1FFFFFFu); }                             /* GTE cmd */
-        return;
-    }
-    int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
-    uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-    if      (op == 0x32) { gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr)); }   /* LWC2 */
-    else if (op == 0x3A) { cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt)); gte_precision_store_word(addr, (uint8_t)rt); }   /* SWC2 */
-}
-
-/* Unaligned load/store helper — mirrors dirty_ram_interp.c interp_lwl/lwr/swl/swr
- * + cases 0x22/0x26/0x2A/0x2E. */
-void psx_sljit_memx(CPUState *cpu, uint32_t insn) {
-    uint32_t op = (insn >> 26) & 0x3Fu, rs = (insn >> 21) & 0x1Fu, rt = (insn >> 16) & 0x1Fu;
-    int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
-    uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-    uint32_t aligned = addr & ~3u;
-    uint32_t word = cpu->read_word(aligned);
-    uint32_t sh = addr & 3u, rtv = cpu->gpr[rt], v;
-    switch (op) {
-    case 0x22: /* LWL */
-        switch (sh) { case 0: v = (rtv & 0x00FFFFFFu) | (word << 24); break;
-                      case 1: v = (rtv & 0x0000FFFFu) | (word << 16); break;
-                      case 2: v = (rtv & 0x000000FFu) | (word << 8);  break;
-                      default: v = word; }
-        cpu->gpr[rt] = v; cpu->gpr[0] = 0; break;
-    case 0x26: /* LWR */
-        switch (sh) { case 0: v = word; break;
-                      case 1: v = (rtv & 0xFF000000u) | (word >> 8);  break;
-                      case 2: v = (rtv & 0xFFFF0000u) | (word >> 16); break;
-                      default: v = (rtv & 0xFFFFFF00u) | (word >> 24); }
-        cpu->gpr[rt] = v; cpu->gpr[0] = 0; break;
-    case 0x2A: /* SWL */
-        switch (sh) { case 0: word = (word & 0xFFFFFF00u) | (rtv >> 24); break;
-                      case 1: word = (word & 0xFFFF0000u) | (rtv >> 16); break;
-                      case 2: word = (word & 0xFF000000u) | (rtv >> 8);  break;
-                      default: word = rtv; }
-        cpu->write_word(aligned, word); break;
-    case 0x2E: /* SWR */
-        switch (sh) { case 0: word = rtv; break;
-                      case 1: word = (word & 0x000000FFu) | (rtv << 8);  break;
-                      case 2: word = (word & 0x0000FFFFu) | (rtv << 16); break;
-                      default: word = (word & 0x00FFFFFFu) | (rtv << 24); }
-        cpu->write_word(aligned, word); break;
-    }
-}
+/* (sljit removed 2026-07-15: the JIT-shard host helpers psx_sljit_call /
+ * psx_sljit_cop2 / psx_sljit_memx lived here. They were called only by sljit-
+ * emitted shards via the cpu->sljit_helpers table, which is no longer wired.) */
 
 /* Write the whole fingerprint log to a file (no TCP size limit). Returns the
  * number of entries written, or -1 on open failure. */

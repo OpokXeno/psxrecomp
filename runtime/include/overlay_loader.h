@@ -28,10 +28,8 @@ void overlay_loader_init(const char *cache_dir, const char *game_id);
  * Addresses may be KUSEG/KSEG0/KSEG1; the loader keys by physical address. */
 int overlay_loader_native_block_add(uint32_t addr);
 
-/* Apply the sljit live-execution policy once the Tier-2 backend is resolved.
- * Call AFTER code_provider_init(). Default live ON iff the resolved backend is
- * sljit (validated-live production); PSX_OVERLAY_SLJIT_LIVE env overrides. */
-void overlay_loader_apply_live_policy(void);
+/* (sljit removed 2026-07-15: overlay_loader_apply_live_policy was declared
+ * here to resolve the sljit live-execution policy after code_provider_init.) */
 
 /* Called from overlay_capture_on_dma after the capture-set insert.
  * Computes CRC32 of bytes, checks cache, loads DLL if present.
