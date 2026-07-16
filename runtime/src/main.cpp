@@ -3532,6 +3532,11 @@ int main(int argc, char** argv) {
             ls.skip_launcher  = seed.skip_launcher ? 1 : 0;
             ls.msu1_enabled   = 0;
             ls.msu1_dir[0]    = '\0';
+            ls.pad_mode[0]    = seed.p1_mode;
+            ls.pad_mode[1]    = seed.p2_mode;
+            /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
+            ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
+                                 (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
 
             RecompLauncherCGameInfo gi{};
             gi.name                 = "Ape Escape";
@@ -3550,6 +3555,17 @@ int main(int argc, char** argv) {
             gi.platform             = "PLAYSTATION";
             gi.theme                = "psx";
             gi.config_path          = nullptr;
+            /* Pad-mode + aspect capabilities, sourced the same way the RmlUi
+             * launcher path (psx_launcher::GameInfo, below in the #else arm)
+             * sources ginfo.allow_hybrid/lock_mode/locked_mode/lock_device/
+             * ws_offered/ws_ultrawide_offered — from game.toml [controller]/
+             * [widescreen] via GameConfig. PSX always has pad modes. */
+            gi.pad_mode_supported   = 1;
+            gi.pad_mode_selectable  = ctrl_lock_mode ? 0 : 1;
+            gi.allow_hybrid         = ctrl_allow_hybrid ? 1 : 0;
+            gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+            gi.lock_device          = ctrl_lock_device ? 1 : 0;
+            gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
 
             char rui_out_disc[1024] = {0};
             int rui_rc = recomp_launcher_run_window(
@@ -3568,14 +3584,22 @@ int main(int argc, char** argv) {
                 }
                 seed.fullscreen    = ls.fullscreen != 0;      seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
-                seed.aspect_num = ls.widescreen ? 16 : 4;
-                seed.aspect_den = ls.widescreen ? 9 : 3;      seed.has_aspect_ratio = true;
+                /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
+                 * legacy ls.widescreen bool (still set above for older callers). */
+                switch (ls.aspect_index) {
+                    case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
+                    case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
+                    default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
+                }
+                seed.has_aspect_ratio = true;
                 seed.texture_filter = ls.linear_filter ? 1 : 0; seed.has_texture_filter = true;
                 p1_device = (ls.player_src[0] == 1) ? "keyboard" : (ls.player_src[0] == 0) ? "none" : p1_device;
                 p2_device = (ls.player_src[1] == 1) ? "keyboard" : (ls.player_src[1] == 0) ? "none" : p2_device;
                 seed.p1_device = p1_device; seed.has_p1_device = true;
                 seed.p2_device = p2_device; seed.has_p2_device = true;
                 seed.deadzone = ls.deadzone[0] * 32767 / 100; seed.has_deadzone = true;
+                seed.p1_mode = ls.pad_mode[0]; seed.has_p1_mode = true;
+                seed.p2_mode = ls.pad_mode[1]; seed.has_p2_mode = true;
             }
 #else
             configure_core_gl_context_attributes();
