@@ -53,7 +53,16 @@
  * MUST forward — a local no-op would swallow exception returns. Without the
  * shim any rfe-containing overlay fails to LINK (undefined psx_rfe_mark_escape)
  * and that variant runs interpreted forever — the gte_read_ctrl class again. */
-#define PSX_OVERLAY_ABI_VERSION 12
+/* v13: ws_player_x_bound callback — the emitter rewrites a configured
+ * [widescreen] signed_x_bound LUI site into psx_ws_player_x_bound(vanilla)
+ * (code_generator.cpp; Einhander native-wide player bounds, 28165d6),
+ * INCLUDING in overlay-resident code (the site loop runs in overlay_mode
+ * too). The clamp computes against the host's live widescreen state (gpu.c),
+ * so the DLL must forward; without the shim any shard containing a bound
+ * site fails to LINK (undefined psx_ws_player_x_bound) and runs interpreted
+ * forever — the rfe/gte_read_ctrl class again. Identity fallback (vanilla)
+ * on a NULL host pointer keeps a v13 DLL correct (4:3) on an older host. */
+#define PSX_OVERLAY_ABI_VERSION 13
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -207,6 +216,11 @@ typedef struct {
      * Appended last; forwards unconditionally — v12 hosts always supply it
      * and the ABI gate rejects DLL/host mixes that don't. */
     void     (*rfe_mark_escape)(void);
+    /* Typed native-wide signed player-X bound (ABI v13; see the version-history
+     * note above). Computes against the host's live widescreen state (gpu.c
+     * psx_ws_player_x_bound). Appended last; may be NULL on a host that
+     * predates it — the DLL glue falls back to the vanilla constant (4:3). */
+    int32_t  (*ws_player_x_bound)(int32_t vanilla);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

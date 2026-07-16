@@ -883,7 +883,7 @@ int gpu_ws_mmx6_validate(int *bad_out) {
 }
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x),
- * called identically by the gcc emit, the sljit JIT, and the interpreter so every
+ * called identically by the gcc emit and the interpreter so every
  * overlay execution path widens the same way. sx = the GTE screen-X as loaded by
  * the guest's lhu (low 16 bits significant); imm = the original bound (0x140 /
  * 0x141). Returns the sltiu verdict (1 = on-screen/keep). Sign-extends sx and
@@ -914,7 +914,7 @@ int psx_ws_cull_bltz(uint32_t v) {
  * screen_h_imms). The width/height immediates are per-game (Tomba: 0x140/0x141
  * + 0xE0/0xF1 on a 320 display; Ape Escape: 0x181 + 0xF1 on 368). Defaults
  * keep the original Tomba signature so existing configs are unchanged. The
- * sets are consulted by the shared detector on every backend (interp + sljit;
+ * sets are consulted by the shared detector on every backend (interp;
  * the recompiler reads the same config at gen time). */
 static uint32_t ws_cull_w_imms[8] = { 0x140, 0x141 };
 static int      ws_cull_w_n = 2;
@@ -936,8 +936,8 @@ int psx_ws_is_cull_w_imm(uint32_t imm) {
     return psx_ws_cull_imm_in(imm, ws_cull_w_imms, ws_cull_w_n);
 }
 
-/* ---- Runtime gates for the pattern-scanned widescreen hooks. The interp and
- * sljit derive widen sites by scanning live code; that derivation must honor
+/* ---- Runtime gates for the pattern-scanned widescreen hooks. The interp
+ * derives widen sites by scanning live code; that derivation must honor
  * the SAME per-game [widescreen.cull] opt-ins the recompiler emit does. These
  * default OFF: a title that never opted in must never have its code
  * pattern-scanned and rewritten (an ungated backdrop false positive rewrites a
@@ -953,7 +953,7 @@ int psx_ws_auto_cull_on(void) { return ws_auto_cull_on_cfg; }
 
 /* Detect the GTE screen-extent trivial-reject signature in a run of
  * instruction words: at least one width compare AND one height compare
- * (slti or sltiu, immediates from the configured sets). Lets the sljit JIT +
+ * (slti or sltiu, immediates from the configured sets). Lets the
  * interpreter gate the cull-widening to real render funnels (a lone width
  * compare elsewhere must stay vanilla). Same shared scan the recompiler's
  * func_has_screen_extent_cull uses (ws_cull_detect.h). */
@@ -987,7 +987,7 @@ int psx_ws_backdrop_x(int x) {
 }
 
 /* Backdrop PRELOAD predicate + value substitution ([widescreen.cull]
- * auto_backdrop). The recompiler/sljit/interp detect each scrolling-backdrop
+ * auto_backdrop). The recompiler/interp detect each scrolling-backdrop
  * column-window generator (see ws_backdrop_detect.h) and route its window START
  * and END bounds through psx_ws_backdrop_value(). When native-wide is engaged we
  * WIDEN the camera-tracked window by the 16:9 reveal: the START (left) bound
@@ -1035,7 +1035,7 @@ uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
         finalv = is_end ? (orig + (uint32_t)m) : (orig - (uint32_t)m);
     }
     /* Single chokepoint for every path (interp hook, native cache-DLL via the
-     * overlay callback, sljit). The interp records its own richer entry, so skip
+     * overlay callback). The interp records its own richer entry, so skip
      * here when it set the flag; native-DLL calls (flag 0) are recorded here with
      * pc/extent/camera = 0 -- which is how the ring sees native execution. */
     if (!from_interp)

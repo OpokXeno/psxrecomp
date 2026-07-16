@@ -21,7 +21,6 @@
 #include "overlay_loader.h"
 #include "autocompile.h"
 #include "code_provider.h"
-#include "overlay_sljit.h"
 #include "overlay_backend.h"
 #include "gpu.h"
 #include "present_ring.h"
@@ -956,9 +955,9 @@ static std::filesystem::path default_memcard_dir(const char* argv0) {
 
 static void close_controller(void);
 
-extern "C" void overlay_compile_worker_stop(void);
 static void shutdown_runtime(void) {
-    overlay_compile_worker_stop();   /* signal + join the off-thread sljit worker */
+    /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
+     * off-thread JIT worker here; the worker no longer exists.) */
     memcard_flush_all();
     overlay_capture_write_json();
     if (sdl_audio_device) {
@@ -2290,7 +2289,7 @@ static void sdl_vblank_present(void) {
      * frontend is skipping presents. Both are cheap and emu-thread-only. */
     overlay_autocapture_tick();
     {   /* Apply a finished batch compile via the active code provider (gcc:
-         * cache rescan on done; sljit: no-op — it produces synchronously). */
+         * cache rescan on done). */
         const CodeProvider *cp = code_provider_active();
         if (cp->poll_main) cp->poll_main();
     }
@@ -3095,8 +3094,8 @@ int main(int argc, char** argv) {
             gte_ws_configure_dome_sites(
                 gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
-             * pattern-scanned interp/sljit widen hooks. A title that never
-             * opted in must never have its live code scanned and rewritten. */
+             * pattern-scanned interp widen hooks. A title that never opted in
+             * must never have its live code scanned and rewritten. */
             gpu_ws_set_auto_hooks(gc.ws_auto_screen_x_cull ? 1 : 0,
                                   gc.ws_auto_backdrop_preload ? 1 : 0);
             if (!gc.ws_cull_w_imms.empty() || !gc.ws_cull_h_imms.empty())
@@ -3196,7 +3195,7 @@ int main(int argc, char** argv) {
                  * dev/production box). auto => gcc if so, else tcc; auto-no-gcc =>
                  * tcc even with gcc present (simulate a toolchain-less user box).
                  * env PSX_OVERLAY_BACKEND overrides. Tiers: static > gcc > tcc >
-                 * (sljit, deprecated/off) > interp. */
+                 * interp. */
                 const char *cfg_backend = gc.runtime.overlay_backend.empty()
                         ? nullptr : gc.runtime.overlay_backend.c_str();
                 int gcc_avail = gc.runtime.has_overlay_autocompile_cmd
@@ -3265,11 +3264,8 @@ int main(int argc, char** argv) {
                         overlay_backend_name(eff), cache_dir.c_str());
                 }
                 code_provider_init(cfg_backend, gcc_avail);
-                /* Now that the backend is resolved, apply the sljit live policy:
-                 * a toolchain-less (sljit) machine runs validated shards live so
-                 * it self-improves on the normal play path; PSX_OVERLAY_SLJIT_LIVE
-                 * overrides. (Validated-live, not blind — see the dispatch gate.) */
-                overlay_loader_apply_live_policy();
+                /* (sljit removed 2026-07-15: overlay_loader_apply_live_policy was
+                 * called here once the backend resolved.) */
             }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
@@ -4011,10 +4007,8 @@ int main(int argc, char** argv) {
     cpu.write_half = psx_write_half;
     cpu.read_byte  = psx_read_byte;
     cpu.write_byte = psx_write_byte;
-    /* Wire the sljit JIT host-helper table (cpu-relative => position-independent
-     * shards; prerequisite for the persisted sljit shard cache). Harmless when
-     * sljit isn't the active backend. */
-    overlay_sljit_init_helpers(&cpu);
+    /* (sljit removed 2026-07-15: overlay_sljit_init_helpers wired the JIT-shard
+     * host-helper table into cpu here; no shards consume it now.) */
 
     /* BIOS backend select (CLAUDE.md §0 amendment 2026-07-02): LLE (the
      * recompiled BIOS — default, reference implementation, oracle) vs the

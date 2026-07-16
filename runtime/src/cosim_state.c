@@ -143,7 +143,7 @@ static uint64_t hash_cpu(const CPUState *c) {
     h = fnv(h, &c->read_fudge, 1);
     h = fnv(h, &c->ld_which_t, 1);
     h = fnv_u32(h, c->ld_absorb);
-    /* EXCLUDED (host-only): read_word/.../write_byte fn ptrs, sljit_helpers. */
+    /* EXCLUDED (host-only): read_word/.../write_byte fn ptrs. */
     return h;
 }
 

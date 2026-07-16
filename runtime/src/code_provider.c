@@ -1,20 +1,20 @@
-/* code_provider.c — the CodeProvider implementations + active selection.
+/* code_provider.c — the CodeProvider implementation + active selection.
  * See code_provider.h for the abstraction.
  *
  * The "spawn compiler" provider is a thin pass-through over the validated
  * autocompile_* path (compile emitted overlay C to a DLL and load it); it backs
  * BOTH the gcc and tcc tiers, which differ only in which compiler the pipeline
- * invokes. The in-process JIT provider (code_provider_sljit) is a separate,
- * legacy path. Which provider is active is decided once at init by
+ * invokes. Which behavior is active is decided once at init by
  * overlay_backend_resolve() in overlay_backend.c (env PSX_OVERLAY_BACKEND >
  * [runtime] overlay_backend > auto). The auto tier order is:
- *   static -> gcc (if gcc on PATH) -> tcc (bundled toolchain-free fallback). */
+ *   static -> gcc (if gcc on PATH) -> tcc (bundled toolchain-free fallback).
+ * (The in-process sljit JIT provider was removed 2026-07-15; overlay gaps fall
+ * to the interpreter.) */
 
 #include <stddef.h>
 
 #include "code_provider.h"
 #include "autocompile.h"
-#include "overlay_sljit.h"
 #include "overlay_backend.h"
 
 /* ---- gcc provider: pass-through to the validated spawn->DLL->rescan path --- */
@@ -29,39 +29,6 @@ static const CodeProvider s_gcc = {
     /* request          */ autocompile_request,
     /* busy             */ autocompile_busy,
     /* poll_main        */ autocompile_poll_main,
-    /* compile_fragment */ NULL,
-};
-
-/* ---- sljit provider: in-process JIT (sync on-miss only, v1) ---------------- */
-/* No batch/async path: sljit produces synchronously at a dispatch miss, so
- * request/busy/poll_main are inert. compile_fragment delegates to the MIPS->sljit
- * emitter (overlay_sljit_try_compile), which compiles the supported instruction
- * classes and declines the rest (fn=NULL) — safe by construction (precision over
- * recall). The returned shard is validated via the same-state diff before live. */
-static int  sljit_request(void)   { return 0; }
-static int  sljit_busy(void)      { return 0; }
-static void sljit_poll_main(void) { }
-
-static void sljit_compile_fragment(uint32_t entry, const uint8_t *bytes,
-                                   uint32_t size, uint32_t image_base_vram,
-                                   CompiledFragment *out) {
-    OverlaySljitResult r = {0};
-    overlay_sljit_try_compile(entry, bytes, size, image_base_vram, &r);
-    /* OverlaySljitFn and CodeProviderFn are the same void fn(CPUState*) type. */
-    out->fn       = (CodeProviderFn)r.fn;
-    out->code_lo  = r.code_lo;
-    out->code_len = r.code_len;
-    out->serialized      = r.serialized;       /* for the persisted shard cache */
-    out->serialized_size = r.serialized_size;
-}
-
-static const CodeProvider s_sljit = {
-    /* name             */ "sljit",
-    /* available        */ overlay_sljit_available,
-    /* request          */ sljit_request,
-    /* busy             */ sljit_busy,
-    /* poll_main        */ sljit_poll_main,
-    /* compile_fragment */ sljit_compile_fragment,
 };
 
 /* ---- active selection ------------------------------------------------------ */
@@ -70,22 +37,14 @@ static const CodeProvider s_sljit = {
 static const CodeProvider *s_active = &s_gcc;
 
 void code_provider_init(const char *cfg_backend, int gcc_configured) {
-    /* overlay_backend_resolve resolves AUTO to GCC or SLJIT and never returns
-     * AUTO, so this maps cleanly to one of the two providers. It also logs the
-     * decision (surfaced via the sljit_status debug command). */
-    OverlayBackend b = overlay_backend_resolve(cfg_backend, gcc_configured);
-    /* The "gcc" provider is really the spawn-a-compiler->DLL->rescan path; it is
-     * compiler-agnostic (the actual compiler is whatever overlay_autocompile_cmd
-     * runs — gcc OR tcc, selected in main.cpp by the resolved backend). So BOTH
-     * gcc and tcc map to it. Only the deprecated in-process sljit producer is
-     * separate. */
-    s_active = (b == OVERLAY_BACKEND_SLJIT) ? &s_sljit : &s_gcc;
+    /* overlay_backend_resolve resolves AUTO to GCC or TCC (never AUTO). Both the
+     * gcc and tcc tiers are the same spawn-a-compiler->DLL->rescan provider
+     * (the actual compiler is whatever overlay_autocompile_cmd runs, selected in
+     * main.cpp by the resolved backend), so there is a single provider now. The
+     * call still runs for its side effect of logging the resolved backend
+     * (surfaced via the overlay_status debug command). */
+    (void)overlay_backend_resolve(cfg_backend, gcc_configured);
+    s_active = &s_gcc;
 }
 
 const CodeProvider *code_provider_active(void) { return s_active; }
-
-/* sljit provider for the synchronous JIT-on-miss gap-fill, regardless of which
- * provider is "active". NULL when sljit isn't available so callers fall to interp. */
-const CodeProvider *code_provider_sljit(void) {
-    return (s_sljit.available && s_sljit.available()) ? &s_sljit : NULL;
-}

@@ -20,9 +20,7 @@
 #include "overlay_loader.h"
 #include "overlay_capture.h"
 #include "code_provider.h"
-#include "overlay_sljit.h"
 #include "overlay_backend.h"
-#include "overlay_compile_worker.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -10641,120 +10639,12 @@ static void handle_autocompile_status(int id, const char *json)
              (unsigned long long)overlay_autocapture_last_insns_delta(), comp);
 }
 
-/* sljit_status: Tier-2 in-process JIT backend state. Runs the codegen smoke
- * test on first query (JITs a trivial leaf and executes it), reports the
- * resolved overlay backend (gcc/sljit/auto) and the shard compile/decline
- * counters. */
-static void handle_sljit_status(int id, const char *json)
-{
-    /* Declarations come from overlay_sljit.h (included above). */
-    extern unsigned int overlay_loader_sljit_registered(void);
-    extern unsigned int overlay_loader_sljit_obsoleted(void);
-    extern unsigned int overlay_loader_sljit_reloaded(void);
-    extern unsigned int overlay_loader_sljit_reload_seen(void);
-    extern unsigned int overlay_loader_sljit_reload_hdrbad(void);
-    extern unsigned int overlay_loader_sljit_reload_deserfail(void);
-    extern unsigned int overlay_loader_sljit_persist_calls(void);
-    extern unsigned int overlay_loader_sljit_persist_writes(void);
-    extern int overlay_loader_sljit_persist_on(void);
-    extern int overlay_loader_sljit_persist_dbg(void);
-    extern int overlay_loader_get_sljit_live(void);
-    (void)json;
-    int selftest = overlay_sljit_selftest();
-    int available = 0, st_ok = 0;
-    unsigned long long compiles = 0, declines = 0, bytes = 0;
-    overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
-    send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
-             "\"selftest_ok\":%d,\"live\":%d,\"compiles\":%llu,\"declines\":%llu,"
-             "\"bytes_emitted\":%llu,\"shards_registered\":%u,\"obsoleted\":%u,"
-             "\"reloaded\":%u,\"reload_seen\":%u,\"reload_hdrbad\":%u,\"reload_deserfail\":%u,"
-             "\"persist_on\":%d,\"persist_calls\":%u,\"persist_writes\":%u,"
-             "\"persist_dbg\":%d}\n",
-             id, overlay_backend_name(overlay_backend_active()), available,
-             selftest, overlay_loader_get_sljit_live(), compiles, declines, bytes,
-             overlay_loader_sljit_registered(),
-             overlay_loader_sljit_obsoleted(),
-             overlay_loader_sljit_reloaded(),
-             overlay_loader_sljit_reload_seen(),
-             overlay_loader_sljit_reload_hdrbad(),
-             overlay_loader_sljit_reload_deserfail(),
-             overlay_loader_sljit_persist_on(),
-             overlay_loader_sljit_persist_calls(),
-             overlay_loader_sljit_persist_writes(),
-             overlay_loader_sljit_persist_dbg());
-}
-
-/* sljit_async: off-thread compile-worker telemetry. Reports the always-on
- * counters (enqueued/compiled/failed/queued_now), last/worst off-thread compile
- * time, the resolved on-disk shard dir, and the recent-compile ring. This is the
- * ring-buffer proof that the worker actually does work: a rising `compiled` with
- * a populated `recent[]` (each with a phys/crc/code_len/ms) while the dispatch
- * thread's ce_profile stays flat == JIT moved off the hot path. */
-static void handle_sljit_async(int id, const char *json)
-{
-    extern void overlay_loader_sljit_cache_dir(char *buf, int n);
-    extern int  overlay_loader_sljit_async_on(void);
-    extern int  overlay_loader_sljit_tier_enabled(void);
-    (void)json;
-    uint64_t enq = 0, done = 0, failed = 0;
-    uint32_t queued = 0, last_ms = 0, max_ms = 0;
-    overlay_compile_worker_stats(&enq, &done, &failed, &queued);
-    overlay_compile_worker_timing(&last_ms, &max_ms);
-    char dir[768] = {0};
-    overlay_loader_sljit_cache_dir(dir, (int)sizeof(dir));
-    /* escape backslashes in the Windows path for valid JSON */
-    char dir_esc[1536]; int di = 0;
-    for (int i = 0; dir[i] && di < (int)sizeof(dir_esc) - 2; i++) {
-        if (dir[i] == '\\') dir_esc[di++] = '\\';
-        dir_esc[di++] = dir[i];
-    }
-    dir_esc[di] = '\0';
-
-    OverlayCompileEvent evs[64];
-    int ne = overlay_compile_worker_recent(evs, 64);
-
-    char out[16384];
-    int n = snprintf(out, sizeof(out),
-        "{\"id\":%d,\"ok\":true,\"tier_enabled\":%d,\"worker_running\":%d,\"async_on\":%d,"
-        "\"enqueued\":%llu,\"compiled\":%llu,\"failed\":%llu,\"queued_now\":%u,"
-        "\"last_compile_ms\":%u,\"max_compile_ms\":%u,\"cache_dir\":\"%s\","
-        "\"recent\":[",
-        id, overlay_loader_sljit_tier_enabled(),
-        overlay_compile_worker_running(), overlay_loader_sljit_async_on(),
-        (unsigned long long)enq, (unsigned long long)done,
-        (unsigned long long)failed, queued, last_ms, max_ms, dir_esc);
-    for (int i = 0; i < ne && n < (int)sizeof(out) - 160; i++) {
-        n += snprintf(out + n, sizeof(out) - n,
-            "%s{\"vaddr\":\"0x%08X\",\"phys\":\"0x%08X\",\"crc\":\"0x%08X\","
-            "\"code_lo\":\"0x%08X\",\"code_len\":%u,\"ms\":%u,\"ok\":%d}",
-            i ? "," : "", evs[i].vaddr, evs[i].phys, evs[i].crc,
-            evs[i].code_lo, evs[i].code_len, evs[i].compile_ms, evs[i].ok);
-    }
-    n += snprintf(out + n, sizeof(out) - n, "]}\n");
-    send_fmt("%s", out);
-}
-
-/* sljit_try <hex_addr>: force a one-shot JIT of the leaf function at a phys
- * address from live RAM (bypasses the diff gate — a probe) and report whether
- * the emitter accepted it. Lets the leaf emitter be exercised against a known
- * function without waiting for a dispatch miss. */
-static void handle_sljit_try(int id, const char *json)
-{
-    extern void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out);
-    uint32_t addr = 0;
-    const char *p = strstr(json, "\"addr\"");
-    if (p) { p = strchr(p, ':'); if (p) addr = (uint32_t)strtoul(p + 1, NULL, 0); }
-    if (!addr) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"need addr\"}\n", id); return; }
-    OverlaySljitResult r = {0};
-    overlay_loader_sljit_probe(addr, &r);
-    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"compiled\":%d,"
-             "\"insns\":%u,\"code_lo\":\"0x%08X\",\"code_len\":%u}\n",
-             id, addr, r.fn ? 1 : 0, r.insns, r.code_lo, r.code_len);
-}
+/* (sljit removed 2026-07-15: the sljit_status, sljit_async, and sljit_try TCP
+ * command handlers lived here. They reported the deprecated in-process JIT
+ * tier's backend/worker/probe state, which no longer exists.) */
 
 /* autocompile_run: manually kick the active code provider's batch production
- * (gcc: spawn the configured background compile; sljit: inert, it produces
- * synchronously on a dispatch miss). */
+ * (gcc: spawn the configured background compile). */
 static void handle_autocompile_run(int id, const char *json)
 {
     (void)json;
@@ -12408,9 +12298,6 @@ static const CmdEntry s_commands[] = {
     { "turbo_audio_sink",     handle_turbo_audio_sink },
     { "load_transitions",     handle_load_transitions },
     { "autocompile_status",   handle_autocompile_status },
-    { "sljit_status",         handle_sljit_status },
-    { "sljit_async",          handle_sljit_async },
-    { "sljit_try",            handle_sljit_try },
     { "autocompile_run",      handle_autocompile_run },
     { "overlay_rescan",       handle_overlay_rescan },
     { NULL, NULL }

@@ -6,14 +6,15 @@
  * This is NOT specific to any one producer. It decides which native overlay
  * tier fills a gap, in priority order:
  *
- *   static  >  gcc shard  >  tcc shard  >  sljit shard (deprecated)  >  interp
+ *   static  >  gcc shard  >  tcc shard  >  interp
  *
  * - gcc:  spawn-gcc -> overlay DLL. The developer / production "holy grail"
  *         (best-optimized; the shards shipped in releases).
  * - tcc:  spawn-tcc -> overlay DLL. Bundled, toolchain-free user fallback that
  *         fills regions the shipped gcc cache misses on a machine without gcc.
- * - sljit: in-process JIT. DEPRECATED (it mis-compiled; gated off) — kept only
- *         until it is removed, and always the lowest native priority.
+ *
+ * (The in-process sljit JIT tier was removed 2026-07-15 — it mis-compiled and
+ * had been gated off since 2026-06-25. Uncovered gaps fall to the interpreter.)
  *
  * gcc and tcc go through the IDENTICAL pipeline (recompiler -> C -> compiler ->
  * DLL -> loader); they differ only in the compiler binary the autocompile
@@ -29,7 +30,7 @@ extern "C" {
 typedef enum {
     OVERLAY_BACKEND_AUTO        = 0, /* gcc if a gcc toolchain is present, else tcc */
     OVERLAY_BACKEND_GCC         = 1, /* force spawn-gcc->DLL (dev / production shards) */
-    OVERLAY_BACKEND_SLJIT       = 2, /* DEPRECATED in-process sljit producer (gated off) */
+    /* value 2 was OVERLAY_BACKEND_SLJIT (removed 2026-07-15) */
     OVERLAY_BACKEND_TCC         = 3, /* spawn-tcc->DLL (bundled, toolchain-free fallback) */
     OVERLAY_BACKEND_AUTO_NO_GCC = 4  /* dev/test: resolve like AUTO but pretend no gcc toolchain
                                       * (gcc shards still LOAD; gaps fill via tcc) — simulate a
@@ -47,7 +48,7 @@ OverlayBackend overlay_backend_resolve(const char *cfg, int gcc_toolchain_availa
 /* The cached resolution (OVERLAY_BACKEND_AUTO until resolve() runs). */
 OverlayBackend overlay_backend_active(void);
 
-/* "auto" | "gcc" | "sljit" | "tcc" | "auto-no-gcc". */
+/* "auto" | "gcc" | "tcc" | "auto-no-gcc". */
 const char *overlay_backend_name(OverlayBackend b);
 
 #ifdef __cplusplus

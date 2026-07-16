@@ -177,8 +177,9 @@ struct RuntimeConfig {
     std::string           overlay_autocompile_cmd_tcc;
 
     // overlay_backend: overlay tier-selection (overlay_backend.h).
-    // "auto" (default, empty == auto) | "gcc" | "tcc" | "auto-no-gcc" | "sljit"
-    // (deprecated). auto resolves to gcc when a gcc TOOLCHAIN is present (a dev /
+    // "auto" (default, empty == auto) | "gcc" | "tcc" | "auto-no-gcc". ("sljit"
+    // was removed 2026-07-15; a stale value degrades to auto.) auto resolves to
+    // gcc when a gcc TOOLCHAIN is present (a dev /
     // production box), else tcc (bundled, toolchain-free). "auto-no-gcc" forces
     // the tcc branch even with gcc present (simulate a toolchain-less user box;
     // gcc shards still load). The env var PSX_OVERLAY_BACKEND overrides at runtime.

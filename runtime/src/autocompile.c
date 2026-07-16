@@ -30,6 +30,18 @@ static volatile int s_exit_code = -1;
 static uint32_t     s_runs      = 0;
 static uint32_t     s_fails     = 0;
 static uint32_t     s_rescans   = 0;
+/* Per-shard build accounting, parsed from compile_overlays.py's machine-readable
+ * "PSX_SHARD_RESULT ok=N failed=M skipped=K" line. Before this, a compile run
+ * that built zero shards because a header change broke EVERY shard compile
+ * looked identical to a clean run: the script still exited 0 and the runtime
+ * quietly ran everything interpreted. These counters make that visible over the
+ * TCP debug server (autocompile_status). s_shard_fail_total accumulates across
+ * runs so a single failing run is never overwritten by a later clean one. */
+static uint32_t     s_shard_ok         = 0;   /* last run */
+static uint32_t     s_shard_fail       = 0;   /* last run */
+static uint32_t     s_shard_skipped    = 0;   /* last run */
+static uint32_t     s_shard_fail_total = 0;   /* accumulated across all runs */
+static int          s_shard_result_seen = 0;  /* did we parse a result line? */
 
 /* Child-output tail ring. Watcher thread writes, TCP reads — guarded by a
  * critical section on Windows. Holds the TAIL (newest bytes win). */
@@ -200,15 +212,66 @@ int autocompile_request(void) {
 #endif
 }
 
+/* Scan the child-output tail ring for the LAST "PSX_SHARD_RESULT ok=N failed=M
+ * skipped=K" line and record the counts. Returns 1 if a result line was found.
+ * Called from autocompile_poll_main (emu thread) after the child exits. */
+static int parse_shard_result(void) {
+#ifdef _WIN32
+    char buf[AC_OUT_CAP + 1];
+    int n = 0;
+    if (s_out_lock_init) {
+        EnterCriticalSection(&s_out_lock);
+        n = s_out_len;
+        memcpy(buf, s_out, (size_t)n);
+        LeaveCriticalSection(&s_out_lock);
+    }
+    buf[n] = '\0';
+    /* Find the LAST occurrence (a run may print more than once over its life). */
+    const char *marker = "PSX_SHARD_RESULT";
+    const char *hit = NULL, *p = buf;
+    for (;;) {
+        const char *q = strstr(p, marker);
+        if (!q) break;
+        hit = q;
+        p = q + 1;
+    }
+    if (!hit) return 0;
+    unsigned ok = 0, failed = 0, skipped = 0;
+    /* Tolerant of field order: scan for each key independently within the line. */
+    const char *ln_end = strchr(hit, '\n');
+    size_t span = ln_end ? (size_t)(ln_end - hit) : strlen(hit);
+    char line[256];
+    size_t cp = span < sizeof(line) - 1 ? span : sizeof(line) - 1;
+    memcpy(line, hit, cp);
+    line[cp] = '\0';
+    const char *f;
+    if ((f = strstr(line, "ok=")))      sscanf(f, "ok=%u", &ok);
+    if ((f = strstr(line, "failed=")))  sscanf(f, "failed=%u", &failed);
+    if ((f = strstr(line, "skipped="))) sscanf(f, "skipped=%u", &skipped);
+    s_shard_ok      = ok;
+    s_shard_fail    = failed;
+    s_shard_skipped = skipped;
+    if (failed) s_shard_fail_total += failed;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 void autocompile_poll_main(void) {
     if (s_state != AC_DONE) return;
     s_state = AC_IDLE;
-    if (s_exit_code == 0) {
-        overlay_loader_rescan();
-        s_rescans++;
-    } else {
+    /* ALWAYS rescan on completion: shards that DID build must load even when the
+     * run also reported per-shard failures (partial success). The loader is
+     * idempotent — rescanning after a failed compile is harmless. */
+    overlay_loader_rescan();
+    s_rescans++;
+    s_shard_result_seen = parse_shard_result();
+    /* A run "failed" if the process exited non-zero OR it reported shard
+     * failures. compile_overlays.py exits 2 when any shard that should have
+     * built failed, so these usually agree; the parsed count is the detail. */
+    if (s_exit_code != 0 || (s_shard_result_seen && s_shard_fail > 0))
         s_fails++;
-    }
 }
 
 /* Minimal JSON string escaper for the output tail. */
@@ -248,7 +311,12 @@ int autocompile_status_json(char *out, int cap) {
     (void)tn;
     return snprintf(out, cap,
         "{\"configured\":%d,\"state\":\"%s\",\"runs\":%u,\"fails\":%u,"
-        "\"rescans\":%u,\"last_exit\":%d,\"output_tail\":\"%s\"}",
+        "\"rescans\":%u,\"last_exit\":%d,"
+        "\"shard_ok\":%u,\"shard_fail\":%u,\"shard_skipped\":%u,"
+        "\"shard_fail_total\":%u,\"shard_result_seen\":%d,"
+        "\"output_tail\":\"%s\"}",
         autocompile_configured(), names[s_state & 3], s_runs, s_fails,
-        s_rescans, s_exit_code, tail);
+        s_rescans, s_exit_code,
+        s_shard_ok, s_shard_fail, s_shard_skipped,
+        s_shard_fail_total, s_shard_result_seen, tail);
 }

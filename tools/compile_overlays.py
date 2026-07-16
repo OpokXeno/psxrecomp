@@ -160,7 +160,7 @@ def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
     gcc DLLs are namespaced under <game_id>/gcc/<arch-abi>/ so same-OS
-    different-arch caches (and, later, sljit blobs) never comingle. Keep this
+    different-arch caches never comingle. Keep this
     mapping in lockstep with overlay_loader.c."""
     if is_windows():
         os_tag = 'win'
@@ -176,6 +176,68 @@ def cache_arch_abi() -> str:
     else:
         arch = 'unknown'
     return f'{os_tag}-{arch}'
+
+
+# ---------------------------------------------------------------------------
+# Shard build accounting — make failures LOUD
+# ---------------------------------------------------------------------------
+# Historically a per-shard failure (recompiler error, generated-C audit reject,
+# gcc/tcc compile error, dropped interior fragment) only printed a line into an
+# ephemeral log and the script still exited 0. The runtime's autocompile watcher
+# keys "did it work?" off the exit code, so a header change that broke EVERY
+# shard looked identical to a fully-successful run: the affected code just ran
+# interpreted forever. ShardStats fixes that — every build outcome is tallied
+# (thread-safe, since captures compile on a pool), a SUMMARY prints at the end,
+# a machine-readable PSX_SHARD_RESULT line is emitted for the runtime to parse,
+# and main() exits non-zero when any shard that SHOULD have built failed.
+class ShardStats:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.ok = 0
+        self.skipped = 0
+        self.fail_by_class = Counter()
+        self.failures = []          # [(label, cls, detail), ...] (detail truncated)
+
+    def add_ok(self, n=1):
+        with self._lock:
+            self.ok += n
+
+    def add_skip(self, n=1):
+        with self._lock:
+            self.skipped += n
+
+    def add_fail(self, label, cls, detail=''):
+        # Print immediately AND record, so the failure is visible in the live
+        # stream (per-worker buffered) and in the end-of-run summary.
+        d = (detail or '').strip().replace('\n', ' ')
+        if len(d) > 240:
+            d = d[:237] + '...'
+        print(f'  SHARD FAIL [{cls}] {label}{(": " + d) if d else ""}')
+        with self._lock:
+            self.fail_by_class[cls] += 1
+            self.failures.append((label, cls, d))
+
+    def total_fail(self):
+        with self._lock:
+            return sum(self.fail_by_class.values())
+
+    def print_summary(self):
+        with self._lock:
+            fail = sum(self.fail_by_class.values())
+            print('\n=== SHARD BUILD SUMMARY ===')
+            print(f'  built OK : {self.ok}')
+            print(f'  skipped  : {self.skipped}  (data-only / already-covered)')
+            print(f'  FAILED   : {fail}')
+            for cls, n in sorted(self.fail_by_class.items()):
+                print(f'    - {cls}: {n}')
+            for label, cls, detail in self.failures[:40]:
+                print(f'    ! [{cls}] {label}{(": " + detail) if detail else ""}')
+            if len(self.failures) > 40:
+                print(f'    ... {len(self.failures) - 40} more')
+            # Stable, grep-able result line the runtime (autocompile.c) parses to
+            # surface shard_ok / shard_fail without depending on the exit code.
+            print(f'PSX_SHARD_RESULT ok={self.ok} failed={fail} skipped={self.skipped}')
+        return fail
 
 
 # ---------------------------------------------------------------------------
@@ -871,225 +933,36 @@ def print_generated_c_audit(load_addr: int, size: int, crc32: int,
 # Post-process generated C for DLL compilation
 # ---------------------------------------------------------------------------
 
-DISPATCH_PREAMBLE = """\
-#include "overlay_api.h"
+# The overlay dispatch shim / link contract is the SINGLE SOURCE OF TRUTH for
+# the symbols every compiled shard links against (dispatch forwarders, GTE/WS
+# hooks, cycle callbacks). It lives beside the ABI header it must agree with,
+# at <runtime_include>/overlay_dispatch_preamble.c.inc, so cmake can fold its
+# content into the overlay cache tag (codegen_hash_sources.cmake) -- a change to
+# the link contract then auto-invalidates the cache instead of silently
+# breaking every shard compile against a moved-on runtime. Loaded once by
+# load_dispatch_preamble(); patch_generated_c() reads this global.
+DISPATCH_PREAMBLE = None
+PREAMBLE_INC_NAME = "overlay_dispatch_preamble.c.inc"
 
-/* ---- Overlay dispatch shim (inserted by compile_overlays.py) ----------- */
-static OverlayCallbacks g_cbs;
-static uint32_t s_pending_cycles;
 
-#ifdef _WIN32
-__declspec(dllexport)
-#else
-__attribute__((visibility("default")))
-#endif
-void overlay_flush_cycles(void) {
-    uint32_t cycles = s_pending_cycles;
-    s_pending_cycles = 0;
-    if (cycles && g_cbs.advance_cycles) g_cbs.advance_cycles(cycles);
-}
-
-/* Call-contract state (ABI v2): generated code reads/bumps the runtime's
- * bail state through these pointers (cpu_state.h PSX_OVERLAY_DLL_BUILD
- * branch).  They start at local dummies so a pre-init call can't fault. */
-static int      s_bail_dummy;
-static uint64_t s_ctr_dummy0, s_ctr_dummy1;
-int      *g_psx_call_bail_p    = &s_bail_dummy;
-uint64_t *g_psx_bail_first_p   = &s_ctr_dummy0;
-uint64_t *g_psx_bail_resolved_p = &s_ctr_dummy1;
-
-#ifdef _WIN32
-__declspec(dllexport)
-#else
-__attribute__((visibility("default")))
-#endif
-int overlay_abi(void) { return PSX_OVERLAY_ABI_VERSION | (PSX_OVERLAY_FLAVOR << 16); }
-
-#ifdef _WIN32
-__declspec(dllexport)
-#else
-__attribute__((visibility("default")))
-#endif
-void overlay_init(const OverlayCallbacks *cbs) {
-    g_cbs = *cbs;
-    if (g_cbs.call_bail_flag) g_psx_call_bail_p    = g_cbs.call_bail_flag;
-    if (g_cbs.bail_first)     g_psx_bail_first_p   = g_cbs.bail_first;
-    if (g_cbs.bail_resolved)  g_psx_bail_resolved_p = g_cbs.bail_resolved;
-}
-
-void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
-    overlay_flush_cycles();
-    (void)ra;
-    g_cbs.dispatch_call(cpu, addr, cpu->gpr[31]);
-}
-void psx_check_interrupts(CPUState *cpu) {
-    overlay_flush_cycles();
-    g_cbs.check_interrupts(cpu);
-}
-void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc) {
-    overlay_flush_cycles();
-    if (g_cbs.check_interrupts_at) g_cbs.check_interrupts_at(cpu, resume_pc);
-    else g_cbs.check_interrupts(cpu);
-}
-void psx_advance_cycles(uint32_t cycles) {
-    if (cycles > UINT32_MAX - s_pending_cycles) overlay_flush_cycles();
-    s_pending_cycles += cycles;
-}
-void gte_execute(CPUState *cpu, uint32_t cmd) {
-    overlay_flush_cycles();
-    g_cbs.gte_execute(cpu, cmd);
-}
-int psx_syscall(CPUState *cpu, uint32_t code) {
-    overlay_flush_cycles();
-    return g_cbs.psx_syscall(cpu, code);
-}
-void psx_native_bad_entry(CPUState *cpu, uint32_t owner, uint32_t pc) {
-    overlay_flush_cycles();
-    if (g_cbs.psx_native_bad_entry) g_cbs.psx_native_bad_entry(cpu, owner, pc);
-}
-void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
-    overlay_flush_cycles();
-    g_cbs.psx_unknown_dispatch(cpu, addr, phys);
-}
-void debug_server_log_call_entry(uint32_t func_addr) {
-    if (g_cbs.log_call_entry) g_cbs.log_call_entry(func_addr);
-}
-void psx_restore_state_escape(void) {
-    overlay_flush_cycles();
-    if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
-}
-/* RFE escape marker (ABI v12): emitted at every `rfe`, including in
- * overlay-resident exception-context code. Mutates the runtime's shared
- * RFE-pending state, so it MUST forward (a local no-op would swallow
- * exception returns). Unconditional — v12 hosts always supply it; the
- * ABI gate rejects mixes that don't. */
-void psx_rfe_mark_escape(void) {
-    overlay_flush_cycles();
-    g_cbs.rfe_mark_escape();
-}
-/* Faithful-timing functions (ABI v9): overlay code built with PSX_ENABLE_BLOCK_CYCLES
- * emits these; forward to the runtime's real impls so native overlays charge cycles on
- * the SAME timeline as the interp/BIOS (a local copy would diverge). NULL-guarded so a
- * v9 DLL stays safe on a host that predates a given callback. */
-uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    overlay_flush_cycles();
-    return g_cbs.cyc_load_word ? g_cbs.cyc_load_word(cpu, addr, rt, reg_mask) : cpu->read_word(addr);
-}
-uint16_t psx_cyc_load_half(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    overlay_flush_cycles();
-    return g_cbs.cyc_load_half ? g_cbs.cyc_load_half(cpu, addr, rt, reg_mask) : cpu->read_half(addr);
-}
-uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    overlay_flush_cycles();
-    return g_cbs.cyc_load_byte ? g_cbs.cyc_load_byte(cpu, addr, rt, reg_mask) : cpu->read_byte(addr);
-}
-uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
-    overlay_flush_cycles();
-    return g_cbs.cyc_lwc2_read ? g_cbs.cyc_lwc2_read(cpu, addr) : cpu->read_word(addr);
-}
-void psx_icache_fetch(CPUState *cpu, uint32_t addr) {
-    overlay_flush_cycles();
-    if (g_cbs.icache_fetch) g_cbs.icache_fetch(cpu, addr);
-}
-void psx_muldiv_set(CPUState *cpu, uint32_t latency) {
-    overlay_flush_cycles();
-    if (g_cbs.muldiv_set) g_cbs.muldiv_set(cpu, latency);
-}
-void psx_muldiv_stall(CPUState *cpu) {
-    overlay_flush_cycles();
-    if (g_cbs.muldiv_stall) g_cbs.muldiv_stall(cpu);
-}
-uint32_t psx_mult_latency_s(uint32_t rs) {
-    return g_cbs.mult_latency_s ? g_cbs.mult_latency_s(rs) : 0u;
-}
-uint32_t psx_mult_latency_u(uint32_t rs) {
-    return g_cbs.mult_latency_u ? g_cbs.mult_latency_u(rs) : 0u;
-}
-void psx_gte_stall(CPUState *cpu) {
-    overlay_flush_cycles();
-    if (g_cbs.gte_stall) g_cbs.gte_stall(cpu);
-}
-void psx_gte_read(CPUState *cpu, uint32_t rt) {
-    overlay_flush_cycles();
-    if (g_cbs.gte_read) g_cbs.gte_read(cpu, rt);
-}
-int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
-    overlay_flush_cycles();
-    return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
-}
-/* GTE special-register accessors (ABI v10). The emitter routes mfc2/cfc2/mtc2/
- * ctc2 on flag/IR/derived GTE regs through these as DIRECT calls, so any
- * GTE-heavy overlay (Tomba2 lava / Trolley attract demos) fails to link
- * without them — undefined gte_read_ctrl was the signature that silently
- * blocked all new overlay coverage. GTE state is SHARED runtime state; a
- * local fallback would fork the flag/IR timeline, so these forward
- * unconditionally (ABI v10 hosts always supply them; the v10 gate rejects
- * DLL/host mixes that don't).
- * NOTE the plain-data fast paths (cpu->gte_data[i] / cpu->gte_ctrl[i]) stay
- * direct CPUState accesses in emitted code — only the derived/flag registers
- * come through here, matching code_generator.cpp's COP2 case. */
-uint32_t gte_read_data(CPUState *cpu, uint8_t reg) {
-    overlay_flush_cycles();
-    return g_cbs.gte_read_data(cpu, reg);
-}
-uint32_t gte_read_ctrl(CPUState *cpu, uint8_t reg) {
-    overlay_flush_cycles();
-    return g_cbs.gte_read_ctrl(cpu, reg);
-}
-void gte_write_data(CPUState *cpu, uint8_t reg, uint32_t value) {
-    overlay_flush_cycles();
-    g_cbs.gte_write_data(cpu, reg, value);
-}
-void gte_write_ctrl(CPUState *cpu, uint8_t reg, uint32_t value) {
-    overlay_flush_cycles();
-    g_cbs.gte_write_ctrl(cpu, reg, value);
-}
-/* g_debug_last_store_pc: a provenance breadcrumb the emitter writes before stores.
- * Overlays are built PSX_NO_DEBUG_TOOLS (the runtime's only consumer is debug tooling),
- * so a local definition satisfies the link; overlay-store provenance is simply not
- * tracked in a no-debug-tools build (by design). */
-uint32_t g_debug_last_store_pc;
-/* Widescreen hooks (ABI v3): forward to the runtime's live widescreen state.
- * Identity fallback if the host predates the callbacks (NULL) — so a v3 DLL
- * stays correct (4:3) on an older host. */
-int psx_ws_backdrop_x(int x) {
-    return g_cbs.ws_backdrop_x ? g_cbs.ws_backdrop_x(x) : (int)(short)x;
-}
-int psx_ws_x_margin(void) {
-    return g_cbs.ws_x_margin ? g_cbs.ws_x_margin() : 0;
-}
-/* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x).
- * The recompiler emits `rt = psx_ws_cull_sltiu(sx, imm)` at every width-compare
- * cull site, INCLUDING in overlay-resident code, so the overlay DLL must define
- * it or it fails to link (undefined reference) -> no native shard -> that overlay
- * variant runs interpreted forever (the dwarf-village-style lag). Self-contained:
- * depends only on psx_ws_x_margin() above. Identity at 4:3 (margin 0). MUST stay
- * byte-for-byte identical to gpu.c psx_ws_cull_sltiu. */
-int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
-    int m = psx_ws_x_margin();
-    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
-            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
-}
-/* Signed-funnel variants (min/max + center±halfwidth idioms). Same contract:
- * self-contained, identity at margin 0, MUST stay byte-for-byte identical to
- * the gpu.c implementations. */
-int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
-    return ((int32_t)sx < (int32_t)imm + psx_ws_x_margin()) ? 1 : 0;
-}
-int psx_ws_cull_bltz(uint32_t v) {
-    return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
-}
-void psx_ws_sprite_tag(CPUState *cpu) {
-    if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
-}
-/* Widescreen backdrop column-preload value (ABI v4). Identity fallback if the
- * host predates the callback, so the DLL stays correct (4:3) on an older host. */
-uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
-    return g_cbs.ws_backdrop_value ? g_cbs.ws_backdrop_value(orig, is_end, window_cols) : orig;
-}
-/* ----------------------------------------------------------------------- */
-
-"""
+def load_dispatch_preamble(runtime_include: str) -> str:
+    """Load the shard dispatch-shim preamble from <runtime_include>/<inc> and
+    cache it in the module global. Missing is a HARD error: a shard built
+    without the shim links against nothing, and silently skipping it is exactly
+    the invisible-failure class this tooling exists to eliminate."""
+    global DISPATCH_PREAMBLE
+    if DISPATCH_PREAMBLE is not None:
+        return DISPATCH_PREAMBLE
+    path = os.path.join(runtime_include, PREAMBLE_INC_NAME)
+    try:
+        with open(path, encoding="utf-8") as f:
+            DISPATCH_PREAMBLE = f.read()
+    except OSError as e:
+        raise SystemExit(
+            f"FATAL: cannot read overlay dispatch preamble {path}: {e}\n"
+            f"  This file is the shard link contract and MUST ship in "
+            f"runtime/include. Without it no shard can be compiled.")
+    return DISPATCH_PREAMBLE
 
 def patch_generated_c(src: str, load_addr: int, size: int) -> str:
     """
@@ -1566,6 +1439,51 @@ def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Doomed-interior fail memo
+# ---------------------------------------------------------------------------
+# An executed orphan interior whose bytes (in THIS captured image) are data, not
+# code, fails the generated-C audit EVERY time — but the fragment pass re-attempts
+# it on every autocompile cycle, making the recompiler walk thousands of words of
+# data and emit tens of thousands of lines of C only to reject it (measured on
+# Vigilante 8: 91 interiors, ~16k walked words each, per cycle). The memo records
+# which (region_phys, interior_pc, region_crc) fragments have already failed so
+# later cycles SKIP them instead of re-walking. Correctness is preserved:
+#   - The key includes region_crc, so a DIFFERENT captured variant (different
+#     bytes at the same PC) is NOT memoized — it re-attempts and can succeed.
+#   - The memo file lives inside the cg<N>_<hash> cache dir, so ANY codegen/
+#     contract/header change (which bumps the hash -> fresh dir -> fresh memo)
+#     re-attempts everything (e.g. the psx_rfe_mark_escape contract fix).
+# So a memoized skip only ever elides a build that is deterministically doomed.
+INTERIOR_FAIL_MEMO = 'interior_fail_memo.txt'
+
+
+def _interior_fail_key(phys_addr: int, interior: int, region_crc: int) -> str:
+    return f'{phys_addr:08X}_{interior & 0x1FFFFFFF:08X}_{region_crc:08X}'
+
+
+def load_interior_fail_memo(cache_dir: str) -> set:
+    memo = set()
+    try:
+        with open(os.path.join(cache_dir, INTERIOR_FAIL_MEMO)) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith('#'):
+                    memo.add(ln.split()[0])
+    except OSError:
+        pass
+    return memo
+
+
+def append_interior_fail_memo(cache_dir: str, key: str, reason: str) -> None:
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(os.path.join(cache_dir, INTERIOR_FAIL_MEMO), 'a') as f:
+            f.write(f'{key}  # {(reason or "").strip()[:120]}\n')
+    except OSError:
+        pass   # best-effort; a memo write failure must never break the compile
+
+
 def generate_interior_fragment_static(interior: int, data: bytes,
                                       load_addr: int, size: int,
                                       phys_addr: int, args):
@@ -1657,8 +1575,10 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
     that would reject a mid-function start; the recompiler translates mid-function
     code literally (regs from CPU state, no synthesized stack frame — the caller
     already set up the frame); and the loader's per-function live-RAM CRC gate
-    rejects any fragment whose bytes don't match. Returns the fragment func-id
-    list, or None on failure/skip."""
+    rejects any fragment whose bytes don't match. Returns (frag_ids, status):
+    status 'built' or 'cached' on success (frag_ids is the func-id list), or
+    (None, reason) on failure/skip so the caller can tally WHY a fragment
+    dropped instead of the old silent None."""
     with tempfile.TemporaryDirectory() as tmp:
         psx = os.path.join(tmp, 'frag.psx')
         with open(psx, 'wb') as f:
@@ -1675,7 +1595,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
                            cwd=os.path.dirname(os.path.abspath(args.game_toml)),
                            env=sub_env)
         if r.returncode != 0:
-            return None
+            return None, f'recompiler-error: {(r.stderr or r.stdout or "").strip()}'
         full_c = ranges_src = None
         for fn in os.listdir(out_dir_tmp):
             if fn.endswith('_full.c'):
@@ -1683,16 +1603,43 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             elif fn.endswith('_full.ranges'):
                 ranges_src = os.path.join(out_dir_tmp, fn)
         if not full_c or not ranges_src:
-            return None
+            return None, 'no-generated-output (_full.c/_full.ranges missing)'
         with open(full_c) as f:
             src = patch_generated_c(f.read(), load_addr, size)
         c_audit = audit_generated_c(src, load_addr, size,
                                     binascii.crc32(data) & 0xFFFFFFFF, {})
         if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
-            return None   # isolated audit failure — drop THIS fragment only
+            # RETAIN the failed fragment's C for triage. Region shards already
+            # keep their _patched.c on audit failure; interior fragments used to
+            # return here BEFORE the (success-only) retain below, so the exact
+            # shards you most want to inspect — WHY did this orphan interior fail
+            # to lower — vanished with the temp dir. Write it out with a header
+            # summarizing the audit verdict so a failure is drillable, not just
+            # counted. (compile_overlays.py is not in the codegen hash: no reshard.)
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                ub = ', '.join(f'0x{a:08X}' for a in sorted(c_audit['unknown_bad']))
+                us = ', '.join(f'0x{a:08X}'
+                               for a in sorted(c_audit['unsupported_todo_addrs']))
+                header = (
+                    f'/* FRAGMENT AUDIT FAILED — retained for triage (not compiled).\n'
+                    f' * interior entry : 0x{interior:08X}\n'
+                    f' * region phys    : 0x{phys_addr:08X}\n'
+                    f' * unknown_bad ({len(c_audit["unknown_bad"])}): {ub}\n'
+                    f' * unsupported ({len(c_audit["unsupported_todo_addrs"])}): {us}\n'
+                    f' */\n')
+                failed_c = os.path.join(
+                    cache_dir, f'{phys_addr:08X}_{interior:08X}_fragment_FAILED.c')
+                with open(failed_c, 'w') as f:
+                    f.write(header + src)
+            except OSError:
+                pass   # retention is best-effort; never mask the real failure
+            return None, (f'generated-c-audit: '
+                          f'{len(c_audit["unknown_bad"])} unknown_bad, '
+                          f'{len(c_audit["unsupported_todo_addrs"])} unsupported')
         frag_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
         if not frag_ids:
-            return None
+            return None, 'no-func-ids (empty ranges manifest)'
         # Key the fragment DLL by its func-identity SET (dedup like a region
         # bundle); the loader keys DLLs by the region_start filename prefix and
         # content-matches each function, so a fragment is just another DLL for
@@ -1702,7 +1649,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
         dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
         if os.path.exists(dll_path) and not args.force:
-            return frag_ids   # already built
+            return frag_ids, 'cached'   # already built
         patched_c = os.path.join(tmp, 'frag_patched.c')
         with open(patched_c, 'w') as f:
             f.write(src)
@@ -1719,11 +1666,17 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         p = os.path.join(recomp_root, 'lib/fmt/include')
         if os.path.isdir(p):
             include_dirs.append(p)
+        # Honor the SAME compiler the region path uses (args.compiler / args.tcc).
+        # Previously this hardcoded gcc, so on a tcc-only player box (no gcc on
+        # PATH) EVERY interior-fragment shard silently failed to build — the
+        # FMV-driver / orphan-interior class ran interpreted forever. The cache
+        # dir already namespaces by args.compiler, so only the invocation was wrong.
         if not compile_dll(patched_c, dll_path, include_dirs,
-                           gcc=args.gcc, flavor=args.flavor):
-            return None
+                           gcc=args.gcc, flavor=args.flavor,
+                           compiler=args.compiler, tcc=args.tcc):
+            return None, 'compile-error (see COMPILE ERROR above)'
         write_overlay_ranges_from(frag_ids, os.path.splitext(dll_path)[0] + '.ranges')
-        return frag_ids
+        return frag_ids, 'built'
 
 
 def _toolchain_env(gcc: str):
@@ -1886,6 +1839,14 @@ def main():
                     help='TinyCC binary (used when --compiler tcc)')
     ap.add_argument('--force',           action='store_true',
                     help='recompile even if output already exists')
+    ap.add_argument('--check',           action='store_true',
+                    help='PREFLIGHT: build every shard into a throwaway temp dir '
+                         '(implies --force, ignores any injected cache dir, never '
+                         'touches the real cache) and report pass/fail. Answers '
+                         '"would this game\'s shards compile against the CURRENT '
+                         'recompiler + runtime headers?" — exits non-zero if any '
+                         'shard that should build fails. Use after a header/ABI '
+                         'or emitter change to catch silent shard breakage.')
     ap.add_argument('--force-interior',  action='append', default=[],
                     help='also compile this virtual/physical PC as an isolated '
                          'interior fragment (repeatable; diagnostic recovery for '
@@ -1919,7 +1880,15 @@ def main():
     # are always exactly where the loader reads — no per-game config, no drift
     # between dev and prod (the read/write-location divergence bug). The CLI flags
     # remain the fallback for manual/offline invocation (no env set).
-    _env_out = os.environ.get('PSX_OVERLAY_CACHE_DIR')
+    # --check is a preflight: it must NEVER write the real cache, so it ignores
+    # the injected cache dir and builds into a throwaway temp dir with --force.
+    _check_tmp = None
+    if args.check:
+        args.force = True
+        _check_tmp = tempfile.mkdtemp(prefix='shardcheck_')
+        args.out_dir = _check_tmp
+        print(f'[check] preflight build into throwaway dir: {_check_tmp}')
+    _env_out = None if args.check else os.environ.get('PSX_OVERLAY_CACHE_DIR')
     if _env_out:
         if _env_out != args.out_dir:
             print(f'[cache] PSX_OVERLAY_CACHE_DIR overrides --out-dir: {_env_out}')
@@ -1947,6 +1916,10 @@ def main():
     # relative paths are meant to resolve) makes relative config work everywhere.
     args.recompiler      = os.path.abspath(args.recompiler)
     args.runtime_include = os.path.abspath(args.runtime_include)
+
+    # Load the shard link-contract preamble from runtime/include up front (hard
+    # error if absent). Threads/fragments read the module global thereafter.
+    load_dispatch_preamble(args.runtime_include)
 
     # Read game ID from game.toml (strip BOM if present)
     with open(args.game_toml, 'rb') as f:
@@ -2004,12 +1977,13 @@ def main():
     # it. All shared state is either read-only closure (args/toml/cache_dir)
     # or passed per-region (region_coverage_cache / interior_frag_jobs), so a
     # worker owning a region owns every mutable it touches.
-    def _do_capture(cap, region_coverage_cache, interior_frag_jobs):
+    def _do_capture(cap, region_coverage_cache, interior_frag_jobs, stats):
         load_addr = int(cap['load_addr'], 16)
         size      = int(cap['size'])
         data      = base64.b64decode(cap['bytes_b64'])
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
         phys_addr = (load_addr & 0x1FFFFFFF)
+        _label = f'overlay 0x{load_addr:08X} crc {crc32:08X}'
         if args.static:
             for captured_entry in _parse_addr_list(
                     cap.get('dispatch_entry_pcs', [])):
@@ -2101,10 +2075,12 @@ def main():
         root_seeds = [s for s in seeds if not s.startswith('interior')]
         if not root_seeds:
             print('  SKIP: no walk-root seeds (data-only region)\n')
+            stats.add_skip()
             return
 
         if not args.static and os.path.exists(dll_path) and not args.force:
             print('  SKIP: DLL already exists (use --force to recompile)\n')
+            stats.add_skip()
             return
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2149,6 +2125,7 @@ def main():
                                cwd=toml_dir, env=sub_env)
             if r.returncode != 0:
                 print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
+                stats.add_fail(_label, 'recompiler', r.stderr or r.stdout)
                 return
 
             # Find the generated _full.c
@@ -2159,6 +2136,7 @@ def main():
                 candidates = [f for f in os.listdir(out_dir_tmp) if f.endswith('_full.c')]
                 if not candidates:
                     print(f'  ERROR: no _full.c in {out_dir_tmp}')
+                    stats.add_fail(_label, 'no_output', 'no _full.c emitted')
                     return
                 full_c = os.path.join(out_dir_tmp, candidates[0])
 
@@ -2179,9 +2157,13 @@ def main():
                 print_generated_c_audit(load_addr, size, crc32, c_audit)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
+                    stats.add_fail(_label, 'audit',
+                                   f'{len(c_audit["unknown_bad"])} unknown_bad, '
+                                   f'{len(c_audit["unsupported_todo_addrs"])} unsupported')
                     return
                 if not ranges_src:
                     print('  STATIC RANGE AUDIT FAILED: no _full.ranges manifest\n')
+                    stats.add_fail(_label, 'no_ranges', 'no _full.ranges manifest')
                     return
 
                 func_ids = parse_overlay_func_ids(ranges_src, data,
@@ -2194,6 +2176,8 @@ def main():
                     sample = ', '.join(f'0x{a:08X}' for a in missing[:8])
                     print(f'  STATIC RANGE AUDIT FAILED: {len(missing)} '
                           f'dispatchable function(s) lack exact ranges: {sample}\n')
+                    stats.add_fail(_label, 'static_ranges',
+                                   f'{len(missing)} funcs lack exact ranges')
                     return
 
                 # Whole-image identity plus compiled-entry coverage makes the
@@ -2225,6 +2209,7 @@ def main():
                 })
                 print(f'  recompiled: {len(func_addrs)} functions, '
                       f'{len(variants)} exact identities\n')
+                stats.add_ok()
             else:
                 src = patch_generated_c(src, load_addr, size)
                 c_audit = audit_generated_c(src, load_addr, size, crc32, toml)
@@ -2238,6 +2223,9 @@ def main():
                     f.write(src)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
+                    stats.add_fail(_label, 'audit',
+                                   f'{len(c_audit["unknown_bad"])} unknown_bad, '
+                                   f'{len(c_audit["unsupported_todo_addrs"])} unsupported')
                     return
                 patched_c = os.path.join(tmp, 'overlay_patched.c')
                 with open(patched_c, 'w') as f:
@@ -2266,6 +2254,7 @@ def main():
                     print(f'  SKIP: all {len(this_set)} function(s) already '
                           f'covered by existing DLL(s) at this region — no new '
                           f'native code to build\n')
+                    stats.add_skip()
                     return
 
                 # Compile to DLL
@@ -2297,12 +2286,20 @@ def main():
                         # DLLs at a region.)
                         with cov_lock:
                             covered |= this_set
+                        print(f'  OK -> {dll_path}\n')
+                        stats.add_ok()
                     else:
                         print('  WARNING: recompiler emitted no _full.ranges — '
                               'loader will leave this region to the interpreter')
-                    print(f'  OK -> {dll_path}\n')
+                        # A DLL with no .ranges is dead weight: the loader has no
+                        # per-function identities to dispatch, so the region stays
+                        # interpreted. Tally it as a failure, not a silent "OK".
+                        stats.add_fail(_label, 'no_ranges',
+                                       'DLL built but no _full.ranges (undispatchable)')
                 else:
                     print(f'  FAILED\n')
+                    stats.add_fail(_label, 'compile',
+                                   'gcc/tcc compile failed (see COMPILE ERROR above)')
 
     # Interior-entry "island" fragments (overlay-cache v2): the FMV-driver class.
     # Run as a SEPARATE pass AFTER all region compiles, so it is DECOUPLED from
@@ -2314,12 +2311,18 @@ def main():
     # compile each as its OWN isolated <region>_<key>.dll that ENTERS at the
     # interior PC (recovers no host). Isolated => a bad fragment fails alone and
     # never poisons a region's trusted DLL.
-    def _do_frags(interior_frag_jobs):
+    def _do_frags(interior_frag_jobs, stats):
         frag_env = dict(os.environ)
         if args.cps:
             frag_env['PSX_CPS'] = '1'
+        # Persistent doomed-interior memo: skip interiors already proven to fail
+        # audit from IDENTICAL bytes, so autocompile stops re-walking data-as-code
+        # every cycle. --force ignores the skip (re-attempts) for triage/debug.
+        fail_memo = load_interior_fail_memo(cache_dir)
+        memo_skipped = 0
         for job in interior_frag_jobs:
             phys_addr, load_addr, size, data, interior_pcs, executed = job
+            region_crc = binascii.crc32(data) & 0xFFFFFFFF
             region_lo = load_addr & 0x1FFFFFFF
             region_hi = region_lo + size
             interior_pcs = set(interior_pcs)
@@ -2339,15 +2342,39 @@ def main():
                 continue
             built = 0
             for a in orphans:
-                frag_ids = compile_interior_fragment(a, data, load_addr, size,
-                                                     phys_addr, cache_dir, args,
-                                                     frag_env)
+                key = _interior_fail_key(phys_addr, a, region_crc)
+                if key in fail_memo and not args.force:
+                    # Deterministically doomed from these exact bytes — skip the
+                    # ~16k-word data walk. NOT a fresh failure (already counted
+                    # when first memoized); count as a skip so the summary is honest.
+                    memo_skipped += 1
+                    stats.add_skip()
+                    continue
+                frag_ids, status = compile_interior_fragment(
+                    a, data, load_addr, size, phys_addr, cache_dir, args, frag_env)
                 if frag_ids:
                     built += 1
+                    if status == 'cached':
+                        stats.add_skip()
+                    else:
+                        stats.add_ok()
                     for ev, _cc, _ranges in frag_ids:
                         covered_entries.add(ev & 0x1FFFFFFF)
+                else:
+                    # An executed orphan interior that would NOT build is a real
+                    # coverage hole: that PC's whole dispatch chain runs
+                    # interpreted forever. Tally it loudly with the reason, and
+                    # memoize it so later cycles don't re-walk the same doomed bytes.
+                    stats.add_fail(f'interior 0x{a:08X} @region 0x{phys_addr:08X}',
+                                   'fragment', status)
+                    fail_memo.add(key)
+                    append_interior_fail_memo(cache_dir, key, status)
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
                   f'executed orphan interior(s) -> isolated island shards')
+        if memo_skipped:
+            print(f'  interior fail-memo: skipped {memo_skipped} known-doomed '
+                  f'interior(s) (data-as-code from identical bytes; '
+                  f'{INTERIOR_FAIL_MEMO})')
 
     # ---- Drive the capture list -------------------------------------------
     # Captures run CONCURRENTLY on a thread pool: the wall clock is dominated
@@ -2363,11 +2390,12 @@ def main():
     #     exactly as it would sequentially.
     # The interior-fragment pass runs after the pool drains, same as the
     # sequential order (it reads the final on-disk entry coverage).
+    stats = ShardStats()
     if args.static or args.jobs <= 1:
         for cap in captures:
-            _do_capture(cap, region_coverage_cache, interior_frag_jobs)
+            _do_capture(cap, region_coverage_cache, interior_frag_jobs, stats)
         if not args.static:
-            _do_frags(interior_frag_jobs)
+            _do_frags(interior_frag_jobs, stats)
     else:
         print(f'Parallel compile: {len(captures)} capture(s) on '
               f'{args.jobs} worker(s)\n')
@@ -2390,7 +2418,7 @@ def main():
                 phys = load_addr & 0x1FFFFFFF
                 crc = binascii.crc32(base64.b64decode(cap['bytes_b64'])) & 0xFFFFFFFF
                 with _key_lock(phys, crc):
-                    _do_capture(cap, region_coverage_cache, interior_frag_jobs)
+                    _do_capture(cap, region_coverage_cache, interior_frag_jobs, stats)
             finally:
                 proxy.set_buffer(None)
             return ''.join(buf)
@@ -2403,7 +2431,7 @@ def main():
                     with print_lock:
                         real_stdout.write(fut.result())
                         real_stdout.flush()
-            _do_frags(interior_frag_jobs)
+            _do_frags(interior_frag_jobs, stats)
         finally:
             sys.stdout = real_stdout
 
@@ -2489,6 +2517,9 @@ def main():
             sample = ', '.join(f'0x{entry:08X}' for entry in unresolved[:12])
             print(f'STATIC COVERAGE WARNING: {len(unresolved)} captured dispatch '
                   f'entry(s) have no compiled body/owner: {sample}')
+            for entry in unresolved:
+                stats.add_fail(f'static entry 0x{entry:08X}', 'static_unresolved',
+                               'captured dispatch entry with no compiled body/owner')
 
         all_variants = []
         combined = '/* Auto-generated overlay dispatch — do not edit.\n'
@@ -2503,7 +2534,19 @@ def main():
         print(f'Static output: {static_out}  '
               f'({len(all_variants)} exact function identities total)')
 
+    # LOUD summary + machine-readable result line, then a non-zero exit when any
+    # shard that should have built failed. The runtime's autocompile watcher and
+    # any CI/dev invocation now SEE shard failures instead of a green exit 0 that
+    # masked a header-drift breakage. Skips (data-only / already-covered) and a
+    # zero-capture run are NOT failures.
+    n_fail = stats.print_summary()
+    if _check_tmp:
+        import shutil
+        shutil.rmtree(_check_tmp, ignore_errors=True)
+        print(f'[check] removed throwaway dir {_check_tmp}')
     print('Done.')
+    if n_fail:
+        raise SystemExit(2)
 
 
 if __name__ == '__main__':

@@ -198,8 +198,6 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_posix.c
-    ${PSXRECOMP_ROOT}/runtime/src/overlay_compile_worker.c
-    ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
     ${PSXRECOMP_ROOT}/runtime/src/code_provider.c
@@ -208,9 +206,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_keybinds.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
     ${PSXRECOMP_ROOT}/recompiler/src/ps1_exe_parser.cpp
-    # Tier-2 in-process JIT backend (sljit, BSD-2-Clause). Single TU; sljit
-    # auto-detects the host arch (SLJIT_CONFIG_AUTO). See lib/sljit/LICENSE.
-    ${PSXRECOMP_ROOT}/lib/sljit/sljit_src/sljitLir.c
+    # (sljit Tier-2 in-process JIT backend removed 2026-07-15 — was disabled by
+    # default since 2026-06-25; gaps fall to the interpreter, gcc/tcc unaffected.)
 )
 
 set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
@@ -219,7 +216,6 @@ set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
     ${PSXRECOMP_ROOT}/recompiler/include
     ${PSXRECOMP_ROOT}/recompiler/lib/fmt/include
     ${PSXRECOMP_ROOT}/recompiler/lib/toml11
-    ${PSXRECOMP_ROOT}/lib/sljit/sljit_src
 )
 
 set(PSXRECOMP_BIOS_GENERATED

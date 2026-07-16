@@ -5,7 +5,7 @@
  * auto_screen_x)
  *
  * Self-contained (depends only on <stdint.h>) so ONE implementation is shared
- * verbatim by the recompiler (C++) and the runtime interpreter + sljit emitter
+ * verbatim by the recompiler (C++) and the runtime interpreter
  * (C) — the widen must be identical on every execution path or the backends
  * diverge (same contract as ws_backdrop_detect.h).
  *

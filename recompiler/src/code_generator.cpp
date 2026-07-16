@@ -1,7 +1,7 @@
 #include "code_generator.h"
 #include "control_flow.h"
 // Shared widescreen backdrop-window detector (single source of truth across the
-// recompiler, the interpreter, and the sljit emitter). Self-contained C header;
+// recompiler and the interpreter). Self-contained C header;
 // included via relative path to avoid an include-dir collision (recompiler and
 // runtime both ship a gte.h).
 #include "../../runtime/include/ws_backdrop_detect.h"
@@ -904,7 +904,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             if (opcode == 0x0B) {
                 // Route through the shared runtime helper psx_ws_cull_sltiu so the
-                // gcc emit, the sljit JIT, and the interpreter all widen identically.
+                // gcc emit and the interpreter both widen identically.
                 // It sign-extends SX and shifts by +margin (wide window
                 // -margin <= SX < imm+margin, both edges); at margin=0 it reduces
                 // bit-for-bit to the vanilla `SX <u imm` verdict (4:3 byte-identical).
