@@ -56,6 +56,9 @@
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
 #endif
+#if defined(RECOMP_LAUNCHER)
+#include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher (prototype) */
+#endif
 #include <SDL.h>
 #if defined(PSX_WEB)
 #include <emscripten/emscripten.h>
@@ -3493,6 +3496,88 @@ int main(int argc, char** argv) {
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
 
+#if defined(RECOMP_LAUNCHER)
+            /* ---- recomp-ui (Dear ImGui) launcher path — PROTOTYPE ----------
+             * Runs the shared, console-agnostic recomp-ui launcher (see
+             * F:\Projects\recomp-ui) INSTEAD OF the RmlUi launcher above. Unlike
+             * psx_launcher::run, recomp_launcher_run_window() creates + owns its
+             * own SDL2/GL window internally, so there is no lwin/lctx to manage
+             * here and no GL-attribute pre-configuration needed. The result is
+             * funneled into the same `seed` / `lr` locals the shared
+             * post-launcher block below (Quit / Launch handling + settings.toml
+             * persistence) already consumes, so that code needs no changes. */
+            std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
+            std::string rui_initial_disc = resolved_disc.string();
+            std::string rui_title = (game_name.empty() ? std::string("PSX") : game_name)
+                                     + " \xE2\x80\x94 Launcher";
+
+            RecompLauncherCSettings ls{};
+            ls.output_method  = 2;  /* OpenGL */
+            ls.window_scale   = std::max(1, std::min(4, g_video_win_w / 320));
+            ls.fullscreen     = seed.fullscreen ? 1 : 0;
+            ls.ignore_aspect  = 0;
+            ls.linear_filter  = (seed.texture_filter != 0) ? 1 : 0;
+            ls.widescreen     = (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
+            ls.widescreen_hud = ls.widescreen;
+            ls.enable_audio   = 1;
+            ls.audio_freq     = 44100;
+            ls.volume         = 100;
+            ls.player_src[0]  = (p1_device == "keyboard") ? 1 : (p1_device == "none") ? 0 : 2;
+            ls.player_src[1]  = (p2_device == "keyboard") ? 1 : (p2_device == "none") ? 0 : 2;
+            {
+                int rui_deadzone_pct = seed.deadzone * 100 / 32767;
+                ls.deadzone[0] = rui_deadzone_pct;
+                ls.deadzone[1] = rui_deadzone_pct;
+            }
+            ls.skip_launcher  = seed.skip_launcher ? 1 : 0;
+            ls.msu1_enabled   = 0;
+            ls.msu1_dir[0]    = '\0';
+
+            RecompLauncherCGameInfo gi{};
+            gi.name                 = "Ape Escape";
+            gi.region               = "(USA)";
+            gi.expected_crc         = 0;
+            gi.has_expected_crc     = 0;      /* the launcher's simple file-CRC doesn't fit
+                                                  PSX multi-track discs — skip verification */
+            gi.known_sha256         = nullptr;
+            gi.num_known_sha256     = 0;
+            gi.widescreen_supported = 1;
+            gi.num_players          = 1;
+            gi.msu1_supported       = 0;
+            gi.msu1_note            = nullptr;
+            gi.msu1_patch_path      = nullptr;
+            gi.sram_path            = nullptr;   /* PSX uses memory cards, not SRAM -> hide SAVES */
+            gi.platform             = "PLAYSTATION";
+            gi.theme                = "psx";
+            gi.config_path          = nullptr;
+
+            char rui_out_disc[1024] = {0};
+            int rui_rc = recomp_launcher_run_window(
+                rui_title.c_str(), &ls, &gi, assets_dir_str.c_str(),
+                rui_initial_disc.c_str(), rui_out_disc, sizeof(rui_out_disc));
+
+            psx_launcher::Result lr =
+                (rui_rc == 0) ? psx_launcher::Result::Launch :
+                (rui_rc == 1) ? psx_launcher::Result::Quit :
+                                 psx_launcher::Result::Unavailable;
+
+            if (lr == psx_launcher::Result::Launch) {
+                if (rui_out_disc[0]) {
+                    seed.disc_path = rui_out_disc;
+                    seed.has_disc_path = true;
+                }
+                seed.fullscreen    = ls.fullscreen != 0;      seed.has_fullscreen = true;
+                seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
+                seed.aspect_num = ls.widescreen ? 16 : 4;
+                seed.aspect_den = ls.widescreen ? 9 : 3;      seed.has_aspect_ratio = true;
+                seed.texture_filter = ls.linear_filter ? 1 : 0; seed.has_texture_filter = true;
+                p1_device = (ls.player_src[0] == 1) ? "keyboard" : (ls.player_src[0] == 0) ? "none" : p1_device;
+                p2_device = (ls.player_src[1] == 1) ? "keyboard" : (ls.player_src[1] == 0) ? "none" : p2_device;
+                seed.p1_device = p1_device; seed.has_p1_device = true;
+                seed.p2_device = p2_device; seed.has_p2_device = true;
+                seed.deadzone = ls.deadzone[0] * 32767 / 100; seed.has_deadzone = true;
+            }
+#else
             configure_core_gl_context_attributes();
 
             /* Launcher opens at the same 4:3 size the game will, so there's no
@@ -3534,6 +3619,7 @@ int main(int argc, char** argv) {
             }
             /* Reset GL attributes so the emulator window starts from defaults. */
             SDL_GL_ResetAttributes();
+#endif
 
             if (lr == psx_launcher::Result::Quit) {
                 std::fprintf(stdout, "psxrecomp: launcher closed; exiting.\n");
