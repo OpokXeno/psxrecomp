@@ -2459,6 +2459,11 @@ static int try_load_region(uint32_t phys) {
  * first (the Whoopee 0x107624 fix); the former must be allowed to publish its
  * exact DLL even when a broader conservative owner contains the same PC. */
 static int lazy_has_exact_entry(uint32_t phys) {
+    /* Same overlay-off hazard as overlay_find_by_range: the lazy entry index
+     * (s_lazy_entry_head) is -1-initialized only when overlay_cache is enabled;
+     * with overlay off it is zero-initialized and the link traversal below
+     * spins forever. Fail closed (no lazy entry) when the loader is inactive. */
+    if (!s_active) return 0;
     uint32_t bucket = (phys * 2654435761u) & LAZY_ENTRY_MASK;
     for (int li = s_lazy_entry_head[bucket]; li >= 0;
          li = s_lazy_man[li].next_entry) {
@@ -2521,6 +2526,13 @@ static int range_candidate_matches(int i, uint32_t phys) {
 }
 
 static int overlay_find_by_range(uint32_t phys) {
+    /* Definitive guard for the overlay-off case: the range page index
+     * (s_range_page_head) is only initialized to -1 by overlay_loader_init,
+     * which runs solely when overlay_cache is enabled. With overlay off it is
+     * zero-initialized (0 = a valid index, not the -1 sentinel), so the link
+     * traversal below never terminates. Fail closed (no candidate) when the
+     * loader is inactive — there are no candidates to find anyway. */
+    if (!s_active) return -1;
     uint32_t page = phys >> 12;
     if (page >= RANGE_PAGE_COUNT) return -1;
 
@@ -2553,6 +2565,18 @@ static int overlay_find_by_range(uint32_t phys) {
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    /* Overlay dispatch is a no-op when the overlay loader is inactive
+     * (overlay_cache=false): there are no candidates to match, so this must
+     * return 0 (dispatch to interp). This guard is also a HARD SAFETY:
+     * overlay_loader_init() — the ONLY place the range index s_range_page_head[]
+     * is initialized to -1 (empty) — runs only when overlay_cache is enabled
+     * (main.cpp). With overlay off, that array stays zero-initialized (0 is a
+     * VALID index, not the -1 sentinel), so the CPS continuation range lookup
+     * below (gated on g_psx_cps_mode, independent of s_active) would traverse a
+     * garbage index: s_range_page_head[page]=0 -> s_range_links[0].next=0 -> the
+     * loop never terminates (infinite spin in range_candidate_matches). Every
+     * overlay-off + CPS game hit this and wedged at boot before any game code ran
+     * (found via Ape Escape, the only overlay-off title). Fail closed here. */
     if (!s_active) return 0;
     int lazy_loaded = 0;
 retry_candidates:
