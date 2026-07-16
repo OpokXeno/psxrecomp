@@ -213,5 +213,15 @@ void psx_ws_sprite_tag(CPUState *cpu) {
 uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
     return g_cbs.ws_backdrop_value ? g_cbs.ws_backdrop_value(orig, is_end, window_cols) : orig;
 }
+/* Typed native-wide signed player-X bound (ABI v13). The emitter rewrites a
+ * configured [widescreen] signed_x_bound LUI site into
+ * psx_ws_player_x_bound(vanilla) (Einhander player bounds), including in
+ * overlay-resident code, so the DLL must define it or the shard fails to link
+ * (undefined reference — the rfe/gte_read_ctrl class). Computes against the
+ * host's live widescreen state; identity fallback (the vanilla constant, i.e.
+ * 4:3 behavior) if the host predates the callback. */
+int32_t psx_ws_player_x_bound(int32_t vanilla) {
+    return g_cbs.ws_player_x_bound ? g_cbs.ws_player_x_bound(vanilla) : vanilla;
+}
 /* ----------------------------------------------------------------------- */
 

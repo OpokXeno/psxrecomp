@@ -1879,6 +1879,15 @@ static void init_callbacks(void) {
             extern void psx_rfe_mark_escape(void);
             s_callbacks.rfe_mark_escape = psx_rfe_mark_escape;
         }
+        /* ABI v13: typed native-wide signed player-X bound — the emitter
+         * rewrites configured signed_x_bound LUI sites (Einhander player
+         * bounds) into psx_ws_player_x_bound() calls, including in
+         * overlay-resident code; the clamp reads the host's live widescreen
+         * state (gpu.c) so the DLL must forward. */
+        {
+            extern int32_t psx_ws_player_x_bound(int32_t vanilla);
+            s_callbacks.ws_player_x_bound = psx_ws_player_x_bound;
+        }
     }
 }
 
