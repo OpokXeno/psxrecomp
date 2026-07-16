@@ -29,4 +29,18 @@ set(PSXRECOMP_CODEGEN_HASH_SRCS
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_discovery.cpp
-    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_discovery.h)
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_discovery.h
+
+    # --- Shard COMPILE surface -------------------------------------------------
+    # The cg tag must invalidate on anything a shard compiles/links against, not
+    # just what the emitter WRITES. A change to the overlay ABI header, the
+    # CPUState layout, or the dispatch-shim link contract leaves the emitter
+    # sources untouched — so without these the tag stayed put, existing DLLs kept
+    # loading, and every NEW shard silently failed to compile against the moved-on
+    # runtime (the recurring "header change broke the shards" class). Folding the
+    # compile surface in makes such a change reshard SAME-TREE instead of breaking
+    # silently. overlay_api.h transitively pulls stdint; cpu_state.h is its only
+    # project include; the .inc is the shim every shard links against.
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/overlay_api.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/cpu_state.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/overlay_dispatch_preamble.c.inc)
