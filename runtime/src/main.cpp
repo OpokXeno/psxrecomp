@@ -2811,6 +2811,48 @@ static void sdl_vblank_present(void) {
 #endif
 }
 
+#if defined(RECOMP_LAUNCHER)
+// Host verification/inspection callbacks for the shared recomp-ui launcher.
+// The launcher re-runs these on every disc/memory-card change so the "Disc
+// verified" verdict + memcard block grids reflect the REAL images (parity with
+// the old RmlUi launcher, which computed the same facts inline). The expected
+// serial/CRC are passed via these file-scope statics (set just before
+// recomp_launcher_run_window) because the C-ABI callback can't capture locals.
+namespace {
+    std::string g_lnch_expected_serial;
+    uint32_t    g_lnch_expected_crc  = 0;
+    bool        g_lnch_has_crc       = false;
+
+    int ae_disc_verify(const char* disc_path, RecompLauncherCDiscVerify* out) {
+        if (!disc_path || !disc_path[0] || !out) return 0;
+        PSXRecompV4::DiscIdentity id = PSXRecompV4::identify_disc(
+            disc_path, g_lnch_expected_serial, g_lnch_expected_crc,
+            g_lnch_has_crc, /*compute_crc*/ g_lnch_has_crc);
+        const std::string& serial = !id.detected_serial.empty()
+            ? id.detected_serial : g_lnch_expected_serial;
+        std::snprintf(out->serial, sizeof(out->serial), "%s", serial.c_str());
+        std::snprintf(out->region, sizeof(out->region), "%s", id.region.c_str());
+        out->iso_ok = id.has_header ? 1 : 0;
+        // Verdict, mirroring the RmlUi launcher's state machine.
+        if (!id.opened || !id.has_header)                            out->verdict = 3; // bad
+        else if (id.expected_serial_given && !id.serial_matches)     out->verdict = 3; // wrong disc
+        else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) out->verdict = 2; // warn
+        else                                                          out->verdict = 1; // ok
+        return 1;
+    }
+
+    int ae_memcard_inspect(const char* card_path, RecompLauncherCMemcard* out) {
+        if (!card_path || !card_path[0] || !out) return 0;
+        MemcardSummary s;
+        if (memcard_summary_path(card_path, &s) != 0) return 0;
+        out->valid       = s.valid;
+        out->used_blocks = s.used_blocks;
+        for (int i = 0; i < 15; ++i) out->block_used[i] = s.block_used[i];
+        return 1;
+    }
+}  // namespace
+#endif
+
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -3558,6 +3600,21 @@ int main(int argc, char** argv) {
                 std::snprintf(ls.bios_path, sizeof(ls.bios_path), "%s", bios_str.c_str());
             }
 
+            /* Memory-card slots: point each slot at the REAL card the runtime
+             * will use — an explicit settings.toml path if set, else the default
+             * <memcard_dir>/cardN.mcd the runtime derives — so the launcher's
+             * block grids reflect the actual on-disk saves (memcard_inspect). */
+            {
+                std::string mc1 = seed.has_memcard1_path ? seed.memcard1_path.string()
+                                                         : (memcard_dir / "card1.mcd").string();
+                std::string mc2 = seed.has_memcard2_path ? seed.memcard2_path.string()
+                                                         : (memcard_dir / "card2.mcd").string();
+                std::snprintf(ls.memcard_path[0], sizeof(ls.memcard_path[0]), "%s", mc1.c_str());
+                std::snprintf(ls.memcard_path[1], sizeof(ls.memcard_path[1]), "%s", mc2.c_str());
+            }
+            ls.memcard_enabled[0] = seed.memcard1_enabled ? 1 : 0;
+            ls.memcard_enabled[1] = seed.memcard2_enabled ? 1 : 0;
+
             RecompLauncherCGameInfo gi{};
             /* System identity + full PS1 settings-surface capability set (theme,
              * platform label, rom_noun, pad-mode support, aspect mask base, and
@@ -3586,6 +3643,18 @@ int main(int argc, char** argv) {
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
             /* Ape Escape has no game.toml [runtime].languages list -> leave the
              * profile's language_labels/num_languages at 0 (Localization hidden). */
+
+            /* Real disc-verify + memcard-inspect (identify_disc / memcard_summary_path
+             * via the ae_* callbacks). The launcher re-runs these whenever the
+             * user changes the disc or a memory card, so the verdict + block
+             * grids reflect the actual images — parity with the RmlUi launcher.
+             * The expected serial/CRC ride on file-scope statics (the C-ABI
+             * callback can't capture these locals). */
+            g_lnch_expected_serial = game_id;
+            g_lnch_expected_crc    = game_disc_crc;
+            g_lnch_has_crc         = game_has_disc_crc;
+            gi.disc_verify     = ae_disc_verify;
+            gi.memcard_inspect = ae_memcard_inspect;
 
             char rui_out_disc[1024] = {0};
             int rui_rc = recomp_launcher_run_window(
@@ -3641,6 +3710,11 @@ int main(int argc, char** argv) {
                     seed.bios_path = ls.bios_path;
                     seed.has_bios_path = true;
                 }
+                /* Memory-card slots: enable flags + any Browse/New paths. */
+                seed.memcard1_enabled = ls.memcard_enabled[0] != 0; seed.has_memcard1_enabled = true;
+                seed.memcard2_enabled = ls.memcard_enabled[1] != 0; seed.has_memcard2_enabled = true;
+                if (ls.memcard_path[0][0]) { seed.memcard1_path = ls.memcard_path[0]; seed.has_memcard1_path = true; }
+                if (ls.memcard_path[1][0]) { seed.memcard2_path = ls.memcard_path[1]; seed.has_memcard2_path = true; }
             }
 #else
             configure_core_gl_context_attributes();
