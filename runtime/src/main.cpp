@@ -58,6 +58,7 @@
 #endif
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher (prototype) */
+#include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
 #endif
 #include <SDL.h>
 #if defined(PSX_WEB)
@@ -3538,34 +3539,53 @@ int main(int argc, char** argv) {
             ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
                                  (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
 
+            /* ---- deeper PSX-style settings (capability-gated via launcher_profile
+             * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
+            ls.window_width      = seed.window_width;
+            ls.renderer           = seed.renderer;
+            ls.supersampling      = seed.supersampling;
+            ls.antialiasing       = seed.antialiasing ? 1 : 0;
+            ls.texture_filter     = seed.texture_filter;
+            ls.screen_kind        = seed.screen_kind;
+            ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
+            ls.frame_interp_fps   = seed.frame_interpolation_fps;
+            ls.spu_hq             = seed.spu_hq ? 1 : 0;
+            ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
+            ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
+            ls.language_index     = 0;  /* Ape Escape has no game.toml [runtime].languages */
+            {
+                std::string bios_str = seed.bios_path.string();
+                std::snprintf(ls.bios_path, sizeof(ls.bios_path), "%s", bios_str.c_str());
+            }
+
             RecompLauncherCGameInfo gi{};
+            /* System identity + full PS1 settings-surface capability set (theme,
+             * platform label, rom_noun, pad-mode support, aspect mask base, and
+             * all has_* deep-settings flags) — one profile call keeps them from
+             * drifting apart across PSX titles. Per-game specifics below override
+             * only what the profile can't know. */
+            launcher_profile_apply("psx", &gi);
             gi.name                 = "Ape Escape";
             gi.region               = "(USA)";
-            gi.expected_crc         = 0;
             gi.has_expected_crc     = 0;      /* the launcher's simple file-CRC doesn't fit
                                                   PSX multi-track discs — skip verification */
-            gi.known_sha256         = nullptr;
             gi.num_known_sha256     = 0;
             gi.widescreen_supported = 1;
             gi.num_players          = 1;
             gi.msu1_supported       = 0;
-            gi.msu1_note            = nullptr;
-            gi.msu1_patch_path      = nullptr;
             gi.sram_path            = nullptr;   /* PSX uses memory cards, not SRAM -> hide SAVES */
-            gi.platform             = "PLAYSTATION";
-            gi.theme                = "psx";
-            gi.config_path          = nullptr;
             /* Pad-mode + aspect capabilities, sourced the same way the RmlUi
              * launcher path (psx_launcher::GameInfo, below in the #else arm)
              * sources ginfo.allow_hybrid/lock_mode/locked_mode/lock_device/
              * ws_offered/ws_ultrawide_offered — from game.toml [controller]/
              * [widescreen] via GameConfig. PSX always has pad modes. */
-            gi.pad_mode_supported   = 1;
             gi.pad_mode_selectable  = ctrl_lock_mode ? 0 : 1;
             gi.allow_hybrid         = ctrl_allow_hybrid ? 1 : 0;
             gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
             gi.lock_device          = ctrl_lock_device ? 1 : 0;
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
+            /* Ape Escape has no game.toml [runtime].languages list -> leave the
+             * profile's language_labels/num_languages at 0 (Localization hidden). */
 
             char rui_out_disc[1024] = {0};
             int rui_rc = recomp_launcher_run_window(
@@ -3592,7 +3612,11 @@ int main(int argc, char** argv) {
                     default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
                 }
                 seed.has_aspect_ratio = true;
-                seed.texture_filter = ls.linear_filter ? 1 : 0; seed.has_texture_filter = true;
+                /* has_texture_filter is on (PSX profile) so the launcher edits
+                 * ls.texture_filter directly (0=nearest,1=bilinear); ls.linear_filter
+                 * is the legacy fallback field for consoles without the cap and is
+                 * left unused here. */
+                seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
                 p1_device = (ls.player_src[0] == 1) ? "keyboard" : (ls.player_src[0] == 0) ? "none" : p1_device;
                 p2_device = (ls.player_src[1] == 1) ? "keyboard" : (ls.player_src[1] == 0) ? "none" : p2_device;
                 seed.p1_device = p1_device; seed.has_p1_device = true;
@@ -3600,6 +3624,23 @@ int main(int argc, char** argv) {
                 seed.deadzone = ls.deadzone[0] * 32767 / 100; seed.has_deadzone = true;
                 seed.p1_mode = ls.pad_mode[0]; seed.has_p1_mode = true;
                 seed.p2_mode = ls.pad_mode[1]; seed.has_p2_mode = true;
+
+                /* ---- deeper PSX-style settings write-back (mirrors the seed
+                 * fields above), all gated on by the "psx" launcher_profile caps. */
+                seed.window_width          = ls.window_width;          seed.has_window_width          = true;
+                seed.renderer              = ls.renderer;              seed.has_renderer              = true;
+                seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
+                seed.antialiasing          = ls.antialiasing != 0;     seed.has_antialiasing          = true;
+                seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
+                seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
+                seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
+                seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
+                seed.auto_skip_fmv         = ls.auto_skip_fmv != 0;    seed.has_auto_skip_fmv         = true;
+                seed.turbo_loads           = ls.turbo_loads != 0;      seed.has_turbo_loads           = true;
+                if (ls.bios_path[0]) {
+                    seed.bios_path = ls.bios_path;
+                    seed.has_bios_path = true;
+                }
             }
 #else
             configure_core_gl_context_attributes();
