@@ -156,6 +156,25 @@ def overlay_ext() -> str:
     return '.dll' if is_windows() else '.so'
 
 
+def native_path(p: str) -> str:
+    """Absolute form of `p`, in the RUNNING interpreter's own path flavor, for
+    handing to native tools (gcc, tcc). Two hard-won rules live here
+    (2026-07-15, runtime `cmd.exe /C python` resolved to devkitPro's MSYS
+    python and every in-game shard compile died exit-1/empty-stderr):
+
+    1. ABSOLUTE is mandatory: gcc invoked from cmd.exe silently fails on
+       relative forward-slash paths.
+    2. Do NOT translate flavors here. Under an MSYS-flavored python, POSIX
+       args (/f/..., /home/...) are translated to Windows form AT THE EXEC
+       BOUNDARY by the msys runtime using its OWN mount table — verified
+       correct (gcc -v showed /home/... arriving as C:/Users/...). Translating
+       here with `cygpath`/heuristics uses whatever foreign cygpath is first
+       on PATH (e.g. Git-for-Windows') and corrupts the path. The actual
+       silent-failure root cause was never the args — it was the child PATH
+       flavor (_toolchain_env below)."""
+    return os.path.abspath(p)
+
+
 def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
@@ -1704,7 +1723,21 @@ def _toolchain_env(gcc: str):
     for d in cands:
         if d and (os.path.isfile(os.path.join(d, 'gcc.exe')) or
                   os.path.isfile(os.path.join(d, 'gcc'))):
-            env['PATH'] = d + os.pathsep + env.get('PATH', '')
+            # Prepend in the RUNNING INTERPRETER'S path flavor. Under an
+            # MSYS-flavored python (os.sep == '/'), PATH is a ':'-separated
+            # POSIX list; splicing a Windows 'C:/...' entry in (its drive
+            # colon reads as a separator) mangles the whole child PATH, so
+            # cc1/as/ld/collect2 lose their DLLs and gcc dies exit-1 with
+            # EMPTY stderr — the 2026-07-15 in-game shard-compile root cause
+            # (runtime cmd.exe /C python resolved to devkitPro's MSYS python).
+            # Convert X:[/\]... -> /x/... before prepending; verified live:
+            # POSIX-prepend rc 0, Windows-prepend rc 1.
+            pd = d
+            if os.sep == '/':
+                m = re.match(r'^([A-Za-z]):[\\/](.*)$', d)
+                if m:
+                    pd = '/' + m.group(1).lower() + '/' + m.group(2).replace('\\', '/')
+            env['PATH'] = pd + os.pathsep + env.get('PATH', '')
             return env, d
     return env, None
 
@@ -1745,9 +1778,9 @@ def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
     cmd = [tcc, '-shared',
            '-DPSX_OVERLAY_DLL_BUILD',
            f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
-           c_path, '-o', out_dll]
+           native_path(c_path), '-o', native_path(out_dll)]
     for d in include_dirs:
-        cmd.append('-I' + _bom_free_incdir(d))
+        cmd.append('-I' + native_path(_bom_free_incdir(d)))
     print(f'  compile (tcc): {" ".join(cmd)}')
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -1760,15 +1793,15 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 gcc: str = 'gcc', flavor: int = 0,
                 compiler: str = 'gcc', tcc: str = 'tcc') -> bool:
     import platform
-    # Absolute OS-native paths: gcc invoked from cmd.exe (the runtime's
-    # autocompile spawn) silently fails (exit 1, no stderr) on relative
-    # forward-slash paths; absolute backslash paths work in every context.
-    c_path  = os.path.abspath(c_path)
-    out_dll = os.path.abspath(out_dll)
+    # Absolute paths (interpreter flavor) for EVERY path the native compiler
+    # touches — see native_path's docstring for the two rules and the
+    # 2026-07-15 MSYS-python incident they encode.
+    c_path  = native_path(c_path)
+    out_dll = native_path(out_dll)
     if compiler == 'tcc':
         return _compile_dll_tcc(c_path, out_dll, include_dirs, flavor, tcc)
     env, tc_dir = _toolchain_env(gcc)
-    includes = [f'-I{os.path.abspath(d)}' for d in include_dirs]
+    includes = [f'-I{native_path(d)}' for d in include_dirs]
     # On Windows, DLLs use PE relocations — -fPIC triggers GCC CRT init
     # that conflicts with the host process. Use -shared without -fPIC.
     pic_flag = [] if is_windows() else ['-fPIC']
@@ -1804,7 +1837,16 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     print(f'  compile: {" ".join(cmd)}')
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
-        print(f'  COMPILE ERROR (exit {r.returncode}):\n{r.stderr or r.stdout}')
+        msg = (r.stderr or r.stdout or '').strip()
+        if not msg:
+            # No compiler output at all = the compiler never really ran
+            # (spawn/DLL-load failure: foreign-MSYS runtime mix, bad toolchain
+            # dir, or non-native paths). Say so instead of printing nothing —
+            # an empty COMPILE ERROR is undiagnosable from the runtime's tail.
+            msg = ('(no compiler output — gcc likely failed to launch: '
+                   f'toolchain dir={tc_dir!r}, check PATH/DLL mix and that '
+                   'all paths above are OS-native)')
+        print(f'  COMPILE ERROR (exit {r.returncode}):\n{msg}')
         return False
     return True
 
