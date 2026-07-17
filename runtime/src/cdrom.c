@@ -2698,3 +2698,28 @@ int cdrom_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=cdrom_snapshot_
     CDROM_SNAP_FIELDS(X)
 #undef X
     return 1; }
+
+void debug_force_cd_reinsert(void) {
+    // Simulamos la apertura de la bandeja borrando los flujos actuales
+    stop_read_stream();
+    stop_cdda_playback();
+    xa_reset_decode();
+    spu_cd_audio_reset();
+
+    // Forzamos el estado de la lectora a "Bandeja Abierta" temporalmente
+    stat_reg = CDSTAT_SHELL;
+    cdrom_clear_pending_dataready();
+    response_clear();
+
+    // Forzamos al emulador a reinicializar el lector con el archivo de disco actual
+    if (iso_handle) {
+        stat_reg = CDSTAT_MOTOR; // Volvemos a encender el motor virtual
+    }
+
+    // Emitimos una interrupción de ACK para despertar al kernel del juego
+    set_irq(CDIRQ_ACK);
+    fire_cdrom_irq();
+
+    // Forzamos la ejecución de cualquier comando atascado en cola
+    try_execute_queued_command();
+}

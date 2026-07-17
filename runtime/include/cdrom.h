@@ -42,7 +42,7 @@ void cdrom_warm_route_stats_json(char* out, int cap);
  * Diagnostics only: recording never changes CD scheduling or delivery. */
 void cdrom_timing_reset(void);
 void cdrom_timing_stats_json(char* out, int cap);
-
+void debug_force_cd_reinsert(void);
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA

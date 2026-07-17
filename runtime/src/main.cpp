@@ -2339,6 +2339,10 @@ static void sdl_vblank_present(void) {
                     if (mod & KMOD_SHIFT) savestate_request_save(slot);
                     else                  savestate_request_load(slot);
                 }
+                else if (ev.key.keysym.sym == SDLK_c && (mod & KMOD_CTRL)) {
+                    std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
+                    debug_force_cd_reinsert();
+                }
                 /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. FULLSCREEN_DESKTOP
                  * keeps the desktop resolution; the renderer's logical size
                  * letterboxes the 640x480 image. */
