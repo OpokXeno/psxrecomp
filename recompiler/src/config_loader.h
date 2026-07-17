@@ -396,6 +396,14 @@ struct GameConfig {
     // [game] block
     std::string           name;          // e.g. "Tomba!"
     std::string           id;            // e.g. "SCUS-94236"
+    // Optional region label shown by the launcher (e.g. "(USA)", "(Europe)",
+    // "(Japan)"). Empty = derive from the `id` serial prefix at the call site
+    // (SCUS/SLUS/LSP -> USA, SCES/SLES -> Europe, SCPS/SLPS/SLPM -> Japan);
+    // an unrecognized/empty serial yields no region badge.
+    std::string           region;
+    // How many players the game supports (1 or 2). Defaults to 1; most PSX
+    // titles configs never set this explicitly.
+    int                    players = 1;
     std::filesystem::path exe_path;      // absolute path to PS-X EXE
     uint32_t              load_address;
     uint32_t              entry_pc;

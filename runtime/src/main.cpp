@@ -753,6 +753,21 @@ static std::string uppercase_ascii(std::string s) {
     return s;
 }
 
+// Region display label for the launcher, derived from the game-id serial
+// prefix (e.g. "SCUS-94423" -> "(USA)"). Used only when game.toml [game]
+// leaves `region` unset. Unknown/empty serials yield "" (no badge) rather
+// than guessing.
+static std::string region_label_from_serial(const std::string& serial) {
+    if (serial.size() < 3) return std::string();
+    const std::string up  = uppercase_ascii(serial);
+    const std::string p4  = up.substr(0, std::min<size_t>(4, up.size()));
+    const std::string p3  = up.substr(0, 3);
+    if (p4 == "SCUS" || p4 == "SLUS" || p3 == "LSP") return "(USA)";
+    if (p4 == "SCES" || p4 == "SLES")                return "(Europe)";
+    if (p4 == "SCPS" || p4 == "SLPS" || p4 == "SLPM") return "(Japan)";
+    return std::string();
+}
+
 static bool read_at(std::ifstream& f, uint64_t offset, uint8_t* out, size_t len) {
     f.clear();
     f.seekg((std::streamoff)offset, std::ios::beg);
@@ -3005,6 +3020,8 @@ int main(int argc, char** argv) {
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
     std::string game_id;
+    std::string game_region;          /* game.toml [game] region; empty => derive from game_id serial */
+    int         game_players = 1;     /* game.toml [game] players; launcher hides the P2 row when 1 */
     bool        game_has_disc_crc = false;
     uint32_t    game_disc_crc     = 0;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
@@ -3024,6 +3041,8 @@ int main(int argc, char** argv) {
             const auto gc = PSXRecompV4::load_game_config(game_config_path);
             game_name = gc.name;
             game_id   = gc.id;
+            game_region = gc.region;
+            game_players = gc.players;
             game_has_disc_crc = gc.has_disc_crc;
             game_disc_crc     = gc.disc_crc;
             if (!gc.discs.empty()) resolved_disc = gc.discs.front();
@@ -3594,7 +3613,17 @@ int main(int argc, char** argv) {
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
-            ls.language_index     = 0;  /* Ape Escape has no game.toml [runtime].languages */
+            /* Localization: index of resolved_language within lang_menu_options
+             * (match by code; games with no [runtime].languages list leave
+             * lang_menu_options empty and this stays 0 / unused), mirroring
+             * lang_index_for() in launcher.cpp (RmlUi path, below). */
+            ls.language_index = 0;
+            for (size_t li = 0; li < lang_menu_options.size(); li++) {
+                if (lang_menu_options[li].code == resolved_language) {
+                    ls.language_index = (int)li;
+                    break;
+                }
+            }
             {
                 std::string bios_str = seed.bios_path.string();
                 std::snprintf(ls.bios_path, sizeof(ls.bios_path), "%s", bios_str.c_str());
@@ -3615,6 +3644,22 @@ int main(int argc, char** argv) {
             ls.memcard_enabled[0] = seed.memcard1_enabled ? 1 : 0;
             ls.memcard_enabled[1] = seed.memcard2_enabled ? 1 : 0;
 
+            /* Region badge: game.toml [game] region wins verbatim; otherwise derive
+             * from the game_id serial prefix (SCUS/SLUS/LSP -> USA, SCES/SLES ->
+             * Europe, SCPS/SLPS/SLPM -> Japan). Empty/unknown -> no badge (gi.region
+             * left null; the launcher model treats that as "" and hides the row). */
+            const std::string rui_region =
+                !game_region.empty() ? game_region : region_label_from_serial(game_id);
+
+            /* Localization: parallels the RmlUi ginfo.languages push_back loop
+             * below (#else arm) — one C-string array pointing at lang_menu_options'
+             * own storage (that vector outlives this call, it's a main()-scope
+             * local), so no separate copy is needed. Empty when the game declares
+             * no [runtime].languages -> Localization stays hidden (num_languages=0). */
+            std::vector<const char*> rui_lang_labels;
+            rui_lang_labels.reserve(lang_menu_options.size());
+            for (const auto& lo : lang_menu_options) rui_lang_labels.push_back(lo.label.c_str());
+
             RecompLauncherCGameInfo gi{};
             /* System identity + full PS1 settings-surface capability set (theme,
              * platform label, rom_noun, pad-mode support, aspect mask base, and
@@ -3622,13 +3667,13 @@ int main(int argc, char** argv) {
              * drifting apart across PSX titles. Per-game specifics below override
              * only what the profile can't know. */
             launcher_profile_apply("psx", &gi);
-            gi.name                 = "Ape Escape";
-            gi.region               = "(USA)";
+            gi.name                 = game_name.empty() ? nullptr : game_name.c_str();
+            gi.region               = rui_region.empty() ? nullptr : rui_region.c_str();
             gi.has_expected_crc     = 0;      /* the launcher's simple file-CRC doesn't fit
                                                   PSX multi-track discs — skip verification */
             gi.num_known_sha256     = 0;
-            gi.widescreen_supported = 1;
-            gi.num_players          = 1;
+            gi.widescreen_supported = ws_offered ? 1 : 0;
+            gi.num_players          = game_players;
             gi.msu1_supported       = 0;
             gi.sram_path            = nullptr;   /* PSX uses memory cards, not SRAM -> hide SAVES */
             /* Pad-mode + aspect capabilities, sourced the same way the RmlUi
@@ -3641,8 +3686,12 @@ int main(int argc, char** argv) {
             gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
             gi.lock_device          = ctrl_lock_device ? 1 : 0;
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
-            /* Ape Escape has no game.toml [runtime].languages list -> leave the
-             * profile's language_labels/num_languages at 0 (Localization hidden). */
+            /* Localization menu: shown only when the game declares languages
+             * (mirrors the RmlUi ginfo.languages parity below). */
+            if (!rui_lang_labels.empty()) {
+                gi.language_labels = rui_lang_labels.data();
+                gi.num_languages   = (int)rui_lang_labels.size();
+            }
 
             /* Real disc-verify + memcard-inspect (identify_disc / memcard_summary_path
              * via the ae_* callbacks). The launcher re-runs these whenever the
@@ -3715,6 +3764,16 @@ int main(int argc, char** argv) {
                 seed.memcard2_enabled = ls.memcard_enabled[1] != 0; seed.has_memcard2_enabled = true;
                 if (ls.memcard_path[0][0]) { seed.memcard1_path = ls.memcard_path[0]; seed.has_memcard1_path = true; }
                 if (ls.memcard_path[1][0]) { seed.memcard2_path = ls.memcard_path[1]; seed.has_memcard2_path = true; }
+
+                /* Localization: persist the chosen language code (only meaningful
+                 * when the game declared a menu; otherwise leave seed.language
+                 * untouched) -- mirrors launcher.cpp's io.language write-back
+                 * (RmlUi path, below) exactly, down to the bounds check. */
+                if (!lang_menu_options.empty() && ls.language_index >= 0 &&
+                    ls.language_index < (int)lang_menu_options.size()) {
+                    seed.language = lang_menu_options[ls.language_index].code;
+                    seed.has_language = true;
+                }
             }
 #else
             configure_core_gl_context_attributes();

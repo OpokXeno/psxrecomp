@@ -650,6 +650,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     const std::string id   = game.contains("id")
                                 ? toml::find<std::string>(game, "id")
                                 : std::string{};
+    const std::string region = game.contains("region")
+                                ? toml::find<std::string>(game, "region")
+                                : std::string{};
+    const int players = game.contains("players")
+                                ? (int)toml::find<int64_t>(game, "players")
+                                : 1;
 
     std::string exe_field;
     if (game.contains("exe")) {
@@ -1159,6 +1165,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*project_root*/     root,
         /*name*/             name,
         /*id*/               id,
+        /*region*/           region,
+        /*players*/          players,
         /*exe_path*/         exe_path,
         /*load_address*/     load_address,
         /*entry_pc*/         entry_pc,
