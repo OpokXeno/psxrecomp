@@ -98,3 +98,6 @@ tools/_options_session/
 
 # Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked)
 runtime/tests/*.exe
+
+# transient split-gen build dirs
+recompiler/build-splitgen/

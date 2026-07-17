@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <ostream>
 #include <set>
 #include <map>
 #include <array>
@@ -200,6 +201,20 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // The generated functions from the most recent generate_file() call
+    // (post mid-function-split pass). Consumed by main_psx to write the
+    // split full.c shards + shared decls header. Not populated until
+    // generate_file() has run.
+    const std::vector<GeneratedFunction>& last_gen_funcs() const { return last_gen_funcs_; }
+
+    // Build the shared-declarations header shared by every full.c shard:
+    // the runtime extern prologue, the unaligned-access helpers (as static
+    // inline, since this header is included by multiple translation units),
+    // and forward declarations for every recompiled function plus every
+    // overlapping-alias shared body. Byte-for-byte the same declaration set
+    // the monolith emits inline, just hoisted into a header.
+    std::string build_shared_decls_header(const std::vector<GeneratedFunction>& gen_funcs) const;
+
     // Generate the per-function code-range manifest consumed by the overlay
     // loader's per-entry validity hash (design §8). For each function, emits its
     // compiled code byte-ranges (union of basic-block extents), coalesced;
@@ -230,6 +245,29 @@ private:
     std::string last_ranges_manifest_;
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;
+
+    // Forward declarations for every psx_alias_body_XXXXXXXX() emitted by
+    // generate_alias_group() during the most recent generate_all_functions()
+    // pass. These bodies are externally linked (split-TU build) so every
+    // shard/header that calls into another shard's alias body needs the
+    // prototype. Cleared at the top of generate_all_functions().
+    std::vector<std::string> alias_body_decls_;
+
+    // The functions emitted by the most recent generate_file() call, stashed
+    // for main_psx's split-shard writer. See last_gen_funcs().
+    std::vector<GeneratedFunction> last_gen_funcs_;
+
+    // Emit the runtime-hook extern prologue (debug_server_log_call_entry ...
+    // g_debug_last_store_pc). Shared verbatim between the monolith path
+    // (generate_file) and the split-shard shared header
+    // (build_shared_decls_header).
+    void emit_runtime_externs(std::ostream& ss) const;
+
+    // Emit the LWL/LWR/SWL/SWR unaligned-access reference helpers.
+    // as_inline selects `static inline` (shared header, included by many
+    // TUs) vs `static` (monolith, single TU) linkage for the 4 helper
+    // function definitions; everything else is identical.
+    void emit_unaligned_helpers(std::ostream& ss, bool as_inline) const;
 
     // RECURSION_BUG.md §25 — continuation-passing call/return (the universal fix
     // for the idle-freeze host-stack leak). When set (gen-time env PSX_CPS),

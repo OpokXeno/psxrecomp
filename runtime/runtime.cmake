@@ -263,7 +263,6 @@ endif()
 function(psxrecomp_add_runtime_target target)
     set(options ORACLE COSIM)
     set(oneValueArgs
-        GAME_GENERATED_FULL_C
         GAME_GENERATED_DISPATCH_C
         GAME_OVERLAY_STATIC_C
         DEBUG_PORT
@@ -272,7 +271,12 @@ function(psxrecomp_add_runtime_target target)
         DEFAULT_GAME_CONFIG_PATH
         EXE_NAME
     )
-    set(multiValueArgs EXTRAS_SOURCES)
+    # GAME_GENERATED_FULL_C is a list (not a single value): the split-TU build
+    # writes the recompiled game as N full_NN.c shards instead of one
+    # monolithic full.c, so this argument may carry 1..N paths. A single path
+    # is just a one-element list, so games still passing one file are
+    # unaffected.
+    set(multiValueArgs EXTRAS_SOURCES GAME_GENERATED_FULL_C)
     cmake_parse_arguments(PSXRT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # DEBUG_PORT and WINDOW_TITLE were previously required cmake-time defaults.
@@ -307,8 +311,10 @@ function(psxrecomp_add_runtime_target target)
 
     set(generated_sources ${PSXRECOMP_BIOS_GENERATED})
     if(PSXRT_GAME_GENERATED_FULL_C)
-        set_source_files_properties("${PSXRT_GAME_GENERATED_FULL_C}" PROPERTIES GENERATED TRUE)
-        list(APPEND generated_sources "${PSXRT_GAME_GENERATED_FULL_C}")
+        foreach(_full_src IN LISTS PSXRT_GAME_GENERATED_FULL_C)
+            set_source_files_properties("${_full_src}" PROPERTIES GENERATED TRUE)
+            list(APPEND generated_sources "${_full_src}")
+        endforeach()
         set(has_game_dispatch TRUE)
     endif()
     if(PSXRT_GAME_GENERATED_DISPATCH_C)
