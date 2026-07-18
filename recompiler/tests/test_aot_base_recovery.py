@@ -2,9 +2,12 @@
 """Focused regression checks for generic AOT overlay base selection."""
 import collections
 import importlib.util
+import hashlib
+import json
 import pathlib
 import struct
 import sys
+import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -52,6 +55,42 @@ def main():
     struct.pack_into('<I', data, 0x80, 0)
     struct.pack_into('<I', data, 0x84, 0)
     assert MOD.pointer_table_targets(data, base) == set()
+
+    # Exact-hash BIOS resident recipes synthesize only their declared code and
+    # data words. Entries must point into code fragments; a different BIOS is a
+    # safe empty result rather than a speculative shard.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        bios = td / 'bios.bin'
+        bios.write_bytes(b'test bios')
+        manifest = td / 'resident.json'
+        manifest.write_text(json.dumps({
+            'schema': 'psxrecomp bios resident code v1',
+            'images': [{
+                'name': 'test helper',
+                'bios_sha256': hashlib.sha256(b'test bios').hexdigest(),
+                'region_start': '0x8000DF80',
+                'region_size': '0x80',
+                'code_fragments': [{
+                    'address': '0x8000DF80',
+                    'words': ['0x03E00008', '0x00000000'],
+                }],
+                'data_words': [{
+                    'address': '0x8000DFFC', 'word': '0x12345678',
+                }],
+                'dispatch_entry_pcs': ['0x8000DF80'],
+            }],
+        }), encoding='utf-8')
+        resident = MOD.bios_resident_records(str(bios), str(manifest))
+        assert len(resident) == 1
+        capture = resident[0]
+        decoded = __import__('base64').b64decode(capture['bytes_b64'])
+        assert struct.unpack_from('<I', decoded, 0)[0] == 0x03E00008
+        assert struct.unpack_from('<I', decoded, 0x7C)[0] == 0x12345678
+        assert capture['producer_ranges'] == [{
+            'start': '0x8000DF80', 'end': '0x8000DF88'}]
+        bios.write_bytes(b'different bios')
+        assert MOD.bios_resident_records(str(bios), str(manifest)) == []
 
     print("ALL PASS")
 

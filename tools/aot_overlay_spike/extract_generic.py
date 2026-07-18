@@ -20,7 +20,7 @@ Usage:
                      --out <captures.json> [--tmp <dir>]
 Requires extract_overlays.py (same dir chain) for the DiscReader/ISO9660 walker.
 """
-import argparse, os, sys, json, base64, struct, subprocess, tempfile, re, binascii
+import argparse, os, sys, json, base64, struct, subprocess, tempfile, re, binascii, hashlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import extract_overlays as eo
 try:
@@ -268,13 +268,118 @@ def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
             f"0x{addr:08X}" for addr in sorted(set(static_discovery))]
     return out
 
+def bios_resident_records(bios_path=None, manifest_path=None):
+    """Build guarded captures for BIOS-installed RAM code known by exact hash.
+
+    Some BIOS helpers are assembled or patched into RAM during boot rather than
+    copied as one contiguous ROM range.  They therefore cannot be emitted by
+    the ordinary ROM->RAM relocation path.  The manifest records only verified
+    code words and dispatch entries for an exact BIOS SHA-256.  Any gap in a
+    declared image is inert zero fill, is outside ``producer_ranges``, and can never
+    become a discovery root.  compile_overlays.py still emits its normal
+    per-function live-byte CRC guards, so a different install image fails closed
+    to the interpreter.
+    """
+    here=os.path.dirname(os.path.abspath(__file__))
+    if manifest_path is None:
+        manifest_path=os.path.join(here, 'bios_resident_code.json')
+    if bios_path is None:
+        bios_path=os.environ.get('PSXRECOMP_BIOS_ROM') or os.path.abspath(
+            os.path.join(here, '..', '..', 'bios', 'SCPH1001.BIN'))
+    if not os.path.isfile(manifest_path) or not os.path.isfile(bios_path):
+        return []
+
+    with open(bios_path, 'rb') as f:
+        bios_sha=hashlib.sha256(f.read()).hexdigest().lower()
+    with open(manifest_path, encoding='utf-8') as f:
+        manifest=json.load(f)
+    if manifest.get('schema') != 'psxrecomp bios resident code v1':
+        raise ValueError(f'{manifest_path}: unsupported BIOS resident manifest schema')
+
+    def number(value, label):
+        try:
+            return value if isinstance(value, int) else int(str(value), 0)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f'{manifest_path}: invalid {label}: {value!r}') from e
+
+    records=[]
+    for image in manifest.get('images', []):
+        if str(image.get('bios_sha256', '')).lower() != bios_sha:
+            continue
+        start=number(image.get('region_start'), 'region_start')
+        size=number(image.get('region_size'), 'region_size')
+        if (start & 3) or size <= 0 or size > 0x10000 or (size & 3):
+            raise ValueError(f'{manifest_path}: resident region must be '
+                             'word-aligned, word-sized, and at most 64 KiB')
+        end=start+size
+        data=bytearray(size)
+        written={}
+        producer_ranges=[]
+
+        def put_word(addr, word, label):
+            if (addr & 3) or not (start <= addr <= end-4):
+                raise ValueError(f'{manifest_path}: {label} address 0x{addr:08X} '
+                                 'is outside/alignment-invalid for its region')
+            word &= 0xFFFFFFFF
+            if addr in written and written[addr] != word:
+                raise ValueError(f'{manifest_path}: conflicting resident word at '
+                                 f'0x{addr:08X}')
+            written[addr]=word
+            struct.pack_into('<I', data, addr-start, word)
+
+        for frag in image.get('code_fragments', []):
+            addr=number(frag.get('address'), 'code fragment address')
+            words=[number(w, 'code word') for w in frag.get('words', [])]
+            if not words:
+                raise ValueError(f'{manifest_path}: empty resident code fragment')
+            for i,word in enumerate(words):
+                put_word(addr+i*4, word, 'code fragment')
+            producer_ranges.append((addr,addr+len(words)*4))
+        for item in image.get('data_words', []):
+            put_word(number(item.get('address'), 'data word address'),
+                     number(item.get('word'), 'data word'), 'data word')
+
+        entries=sorted({number(v, 'dispatch entry')
+                        for v in image.get('dispatch_entry_pcs', [])})
+        code_words={addr for lo,hi in producer_ranges for addr in range(lo,hi,4)}
+        if not entries or any(entry not in code_words for entry in entries):
+            raise ValueError(f'{manifest_path}: every resident dispatch entry must '
+                             'name a listed code word')
+        record=rec(start, bytes(data), [], dispatch_extra=entries,
+                   producer_ranges=producer_ranges)
+        record['producer']='bios_resident_manifest'
+        record['bios_sha256']=bios_sha
+        record['producer_name']=str(image.get('name', 'BIOS resident code'))
+        records.append(record)
+    return records
+
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--game-toml', required=True)
-    ap.add_argument('--recompiler', required=True)
+    ap.add_argument('--game-toml')
+    ap.add_argument('--recompiler')
     ap.add_argument('--out', required=True)
     ap.add_argument('--tmp', default=None)
+    ap.add_argument('--bios', default=None,
+                    help='BIOS ROM for exact-hash resident-code recipes (default: '
+                         'PSXRECOMP_BIOS_ROM or framework bios/SCPH1001.BIN)')
+    ap.add_argument('--bios-resident-manifest', default=None,
+                    help='resident-code recipe JSON (default: bundled manifest)')
+    ap.add_argument('--no-bios-resident', action='store_true',
+                    help='omit exact-hash BIOS-installed RAM code captures')
+    ap.add_argument('--only-bios-resident', action='store_true',
+                    help='emit only exact-hash BIOS-installed RAM code captures')
     a=ap.parse_args()
+    if a.only_bios_resident:
+        if a.no_bios_resident:
+            ap.error('--only-bios-resident conflicts with --no-bios-resident')
+        records=bios_resident_records(a.bios, a.bios_resident_manifest)
+        with open(a.out, 'w') as f:
+            json.dump(records, f)
+        print(f"BIOS resident: {len(records)} regions -> {a.out}")
+        return
+    if not a.game_toml or not a.recompiler:
+        ap.error('--game-toml and --recompiler are required unless '
+                 '--only-bios-resident is used')
     doc=tomllib.loads(open(a.game_toml, encoding='utf-8-sig').read())  # utf-8-sig strips BOM
     game=doc.get('game',doc)
     root=os.path.dirname(os.path.abspath(a.game_toml))
@@ -437,9 +542,20 @@ def main():
             print(f"  [composite] {lp} + {rp}: {len(region)}B "
                   f"region@0x{page_base:08X} (exact adjacent producers), "
                   f"seeds={len(seeds)}")
-    json.dump(records, open(a.out,'w'))
+    nb=0
+    if not a.no_bios_resident:
+        resident=bios_resident_records(a.bios, a.bios_resident_manifest)
+        records.extend(resident)
+        nb=len(resident)
+        for record in resident:
+            print(f"  [BIOS resident] {record['producer_name']}: "
+                  f"{record['size']}B @0x{int(record['load_addr'],16):08X}, "
+                  f"dispatch entries={len(record['dispatch_entry_pcs'])}, "
+                  f"sha256={record['bios_sha256'][:12]}...")
+    with open(a.out, 'w') as f:
+        json.dump(records, f)
     print(f"producers: {np} PS-X EXE (full-discovery), {nh} header-table, "
-          f"{nr} raw-code, {nc} adjacent composites; "
+          f"{nr} raw-code, {nc} adjacent composites, {nb} BIOS resident; "
           f"{len(records)} regions -> {a.out}")
 
 if __name__=='__main__': main()

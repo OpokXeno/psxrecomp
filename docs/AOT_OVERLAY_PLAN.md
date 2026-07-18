@@ -167,6 +167,16 @@ scoreboard preserves overlay-cache-only recall and also reports combined native
 coverage from the dispatch table plus guarded relocated-kernel body ranges. Do not
 manufacture overlay shards merely to duplicate those already-native BIOS bodies.
 
+Boot-installed RAM helpers that are not contiguous ROM relocations use a separate
+exact-hash recipe (`tools/aot_overlay_spike/bios_resident_code.json`). The generic
+extractor emits only the listed code words/entries when the supplied BIOS SHA-256
+matches. `compile_overlays.py` adds a `.resident` sidecar, and the runtime preloads
+only explicitly marked resident shards. Preload is registration, not trust: every
+entry still passes the same live code-range CRC before native execution. The
+current SCPH-1001 recipe is exactly `0x8000DF80-0x8000DFF0`; it deliberately omits
+page fill and the `0x8000DFFC` callback-pointer data. This closes the six durable
+Tomba 2 kernel gaps without turning adjacent zeros/data into code.
+
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
    `_walk_overlay_function`) with a strict callable-prologue gate; interior/
@@ -187,6 +197,8 @@ manufacture overlay shards merely to duplicate those already-native BIOS bodies.
    A reachable direct branch that crosses a sibling-entry hard cap may add its
    target as a static root only when a bounded target-local CFG reaches a return
    without invalid words or sequential escape.
+   Exact-hash BIOS resident captures additionally receive a `.resident` sidecar;
+   ordinary captures actively remove a stale sidecar for the same output stem.
 5. `--static` mode instead namespaces the C and folds variants into
    `overlays_static.c` linked directly into the binary, dispatched via a generated
    `psx_overlay_dispatch()` — **this is already an AOT delivery path**; it moves
@@ -202,6 +214,10 @@ manufacture overlay shards merely to duplicate those already-native BIOS bodies.
   `:595`). Cache is **additive** — every variant ever seen for an address stays
   loaded; per-dispatch CRC picks the one that currently matches (`:1844`). This is
   how one address (`0x800E7xxx`) hosts village vs overworld safely.
+- Marked BIOS-resident shards are registered during cache scan because their exact
+  compact code envelope is not the runtime's page-coalesced kernel region key.
+  They begin invalid while boot RAM differs, then revalidate after the BIOS writes
+  the expected bytes. Unmarked shards retain lazy region loading.
 
 ---
 

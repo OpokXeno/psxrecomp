@@ -16,6 +16,22 @@ SPEC.loader.exec_module(MOD)
 
 
 class CoverageVaultHistoryTests(unittest.TestCase):
+    def test_cache_merge_preserves_resident_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, 'source')
+            dst = os.path.join(tmp, 'vault')
+            rel = os.path.join('gcc', 'win-x64', 'cg5_12345678')
+            os.makedirs(os.path.join(src, rel))
+            stem = os.path.join(src, rel, '0000DF80_4EE6AC69')
+            for ext, contents in (('.dll', b'dll'), ('.ranges', b'ranges'),
+                                  ('.resident', b'resident')):
+                with open(stem + ext, 'wb') as out:
+                    out.write(contents)
+            self.assertEqual(MOD.merge_cache(dst, src), 1)
+            for ext in ('.dll', '.ranges', '.resident'):
+                self.assertTrue(os.path.exists(os.path.join(
+                    dst, rel, '0000DF80_4EE6AC69' + ext)))
+
     def test_v1_and_verified_v2_records_survive_a_torn_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             snapshot = os.path.join(tmp, "immutable.json")

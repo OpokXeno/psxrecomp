@@ -637,6 +637,7 @@ typedef struct {
     uint64_t mtime;
     int func_count;
     int indexed_func_count;
+    int resident;
     char path[768];
 } CacheEntry;
 static CacheEntry s_cache_idx[CACHE_IDX_CAP];
@@ -895,6 +896,38 @@ static int cache_idx_has_basename(const char *fname) {
     return 0;
 }
 
+/* A BIOS-resident shard is generated from an exact-BIOS-hash manifest and has
+ * a synthetic page envelope rather than a runtime dirty-run envelope. Its
+ * region filename therefore cannot participate in the ordinary region-start
+ * lookup. compile_overlays.py publishes this explicit sidecar only for those
+ * shards. Loading it early merely registers candidates: every dispatch still
+ * passes the ordinary per-function live-byte CRC guard, so a different BIOS or
+ * boot-time patch fails closed to the interpreter. */
+#define BIOS_RESIDENT_MARKER_SCHEMA "psxrecomp bios resident shard v1"
+static int cache_path_is_bios_resident(const char *dll_path) {
+    char path[800];
+    snprintf(path, sizeof(path), "%s", dll_path);
+    size_t n = strlen(path);
+    if (n < OVERLAY_SHARED_EXT_LEN ||
+        strcmp(path + n - OVERLAY_SHARED_EXT_LEN, OVERLAY_SHARED_EXT) != 0)
+        return 0;
+    snprintf(path + n - OVERLAY_SHARED_EXT_LEN,
+             sizeof(path) - (n - OVERLAY_SHARED_EXT_LEN), ".resident");
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[256] = {0};
+    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+    return strstr(buf, BIOS_RESIDENT_MARKER_SCHEMA) != NULL;
+}
+
+static void refresh_bios_resident_flags(void) {
+    for (int i = 0; i < s_cache_idx_count; i++)
+        s_cache_idx[i].resident =
+            cache_path_is_bios_resident(s_cache_idx[i].path);
+}
+
 /* Canonical cache arch-abi tag (caches are namespaced per backend AND per
  * target so a Windows-x64 gcc DLL and, later, a same-OS arm64 build for the
  * same fragment never comingle). compile_overlays.py
@@ -935,6 +968,7 @@ static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
     e->mtime = file->mtime;
     e->func_count = 0;
     e->indexed_func_count = 0;
+    e->resident = cache_path_is_bios_resident(file->path);
     snprintf(e->path, sizeof(e->path), "%s", file->path);
     return 0;
 }
@@ -973,6 +1007,7 @@ static void scan_one_cache_dir(const char *dir) {
         e->func_count = 0;
         e->indexed_func_count = 0;
         snprintf(e->path, sizeof(e->path), "%s", full);
+        e->resident = cache_path_is_bios_resident(full);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
@@ -1201,6 +1236,7 @@ static void scan_cache_dir(void) {
     scan_one_cache_dir(dir);
     abi_preflight_sweep(dir);
 
+    refresh_bios_resident_flags();
     rebuild_lazy_manifest_index();
 
     /* Never-again guard: if we loaded NOTHING but wrong-hash shards exist, shout. */
@@ -1219,9 +1255,10 @@ static void scan_cache_dir(void) {
         for (int i = 0; i < s_cache_idx_count; i++) {
             const char *base = strrchr(s_cache_idx[i].path, '/');
             base = base ? base + 1 : s_cache_idx[i].path;
-            fprintf(stderr, "  [%d] %s (region=0x%08X, functions=%d)\n",
+            fprintf(stderr, "  [%d] %s (region=0x%08X, functions=%d%s)\n",
                     i, base, s_cache_idx[i].region_start,
-                    s_cache_idx[i].indexed_func_count);
+                    s_cache_idx[i].indexed_func_count,
+                    s_cache_idx[i].resident ? ", BIOS-resident" : "");
         }
         fflush(stderr);
     }
@@ -1706,6 +1743,26 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
 
 /* ---- Public API -------------------------------------------------------- */
 
+static int dll_already_loaded(const char *path);
+static int load_one_dll(const char *dll_path);
+
+static int load_bios_resident_shards(void) {
+    int bundles = 0, functions = 0;
+    for (int i = 0; i < s_cache_idx_count; i++) {
+        CacheEntry *e = &s_cache_idx[i];
+        if (!e->resident || e->func_count <= 0 ||
+            e->indexed_func_count != e->func_count ||
+            dll_already_loaded(e->path))
+            continue;
+        int loaded = load_one_dll(e->path);
+        if (loaded > 0) { bundles++; functions += loaded; }
+    }
+    if (bundles > 0)
+        loader_log("preloaded %d exact-guarded BIOS resident shard(s), %d candidates",
+                   bundles, functions);
+    return functions;
+}
+
 void overlay_loader_init(const char *cache_dir, const char *game_id) {
     for (uint32_t p = 0; p < RANGE_PAGE_COUNT; p++) {
         s_range_page_head[p] = -1;
@@ -1721,6 +1778,7 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     { extern void ds_init(const char*, const char*); ds_init(cache_dir, game_id); }
     init_callbacks();
     scan_cache_dir();
+    load_bios_resident_shards();
     overlay_image_warm_init();
     overlay_image_warm_seed_boot_text();
     /* (sljit removed 2026-07-15: the persisted-shard reload + off-thread compile
@@ -1846,6 +1904,7 @@ static void mark_checked(uint32_t region_start) {
 void overlay_loader_rescan(void) {
     if (!s_active) return;
     scan_cache_dir();
+    load_bios_resident_shards();
     s_nchecked = 0;
 }
 

@@ -309,6 +309,35 @@ INCLUDE_REASONS = {
     'DISPATCH_ROOT',
 }
 FATAL_SEED_REASONS = {'BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'}
+BIOS_RESIDENT_PRODUCER = 'bios_resident_manifest'
+BIOS_RESIDENT_MARKER = 'psxrecomp bios resident shard v1'
+
+
+def update_bios_resident_marker(dll_path: str, cap: dict) -> None:
+    """Publish/remove the opt-in marker consumed by the runtime preloader.
+
+    Resident BIOS helpers use a synthetic page envelope, so their filename's
+    region key cannot equal the dirty-run start recovered at runtime.  The
+    marker tells the loader to register the shard at cache scan time; normal
+    per-function code-CRC validation remains the execution authority.
+    """
+    marker = os.path.splitext(dll_path)[0] + '.resident'
+    if cap.get('producer') != BIOS_RESIDENT_PRODUCER:
+        try:
+            os.remove(marker)
+        except FileNotFoundError:
+            pass
+        return
+    payload = {
+        'schema': BIOS_RESIDENT_MARKER,
+        'bios_sha256': str(cap.get('bios_sha256', '')),
+        'producer_name': str(cap.get('producer_name', 'BIOS resident code')),
+    }
+    tmp = marker + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp, marker)
 
 
 def _parse_addr(value) -> int:
@@ -2631,7 +2660,9 @@ def main():
                         covered = load_region_coverage(cache_dir, phys_addr)
                         region_coverage_cache[phys_addr] = covered
                     fully_covered = (bool(this_set) and this_set <= covered
-                                     and not args.force)
+                                     and not args.force
+                                     and cap.get('producer') !=
+                                         BIOS_RESIDENT_PRODUCER)
                 if fully_covered:
                     print(f'  SKIP: all {len(this_set)} function(s) already '
                           f'covered by existing DLL(s) at this region — no new '
@@ -2657,6 +2688,7 @@ def main():
                     ranges_out = os.path.splitext(dll_path)[0] + '.ranges'
                     if this_ids:
                         nfn = write_overlay_ranges_from(this_ids, ranges_out)
+                        update_bios_resident_marker(dll_path, cap)
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
                         # New identities are now available for this region_start;
                         # keep the warm coverage set current so later captures in

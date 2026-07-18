@@ -266,7 +266,7 @@ def merge_addendum(vault_json, addendum):
     return merge_capture_regions(vault_json, _load_addendum(addendum))
 
 def merge_cache(vault_cache, src_cache):
-    """Mirror compiled DLLs/.ranges into the vault, PRESERVING the relative
+    """Mirror compiled DLLs/.ranges/.resident into the vault, preserving relative
     layout (<compiler>/<arch-abi>/cg<N>_<hash>/file). The layout is load-
     bearing: the same content-keyed filename exists under different cg dirs
     with DIFFERENT compiled bytes (per-emitter generations), so a flat copy
@@ -279,7 +279,8 @@ def merge_cache(vault_cache, src_cache):
     for root, _dirs, files in os.walk(src_cache):
         rel = os.path.relpath(root, src_cache)
         for fn in files:
-            if not (fn.endswith(".dll") or fn.endswith(".ranges")):
+            if not (fn.endswith(".dll") or fn.endswith(".ranges") or
+                    fn.endswith(".resident")):
                 continue
             src = os.path.join(root, fn)
             dstdir = os.path.join(vault_cache, rel) if rel != "." else vault_cache

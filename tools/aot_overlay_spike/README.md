@@ -5,10 +5,10 @@ disc image at build time, so a fresh install ships with overlay coverage instead
 of relying entirely on runtime (tcc/gcc) autocompile. See `docs/AOT_OVERLAY_PLAN.md`
 for the full design, findings, and honest coverage numbers.
 
-**Status: SPIKE. Provably-correct for clean producers, not exhaustive.** These
-scripts carry hardcoded paths (disc, scratchpad) and are Tomba-specific proofs of
-concept, not a finished general tool. They exist so a future session can improve
-discovery quality, not to be run as-is in a build.
+**Status: ENHANCEMENT SPIKE. Provably-correct for clean producers, not exhaustive.**
+`extract_generic.py` is path-parameterized and suitable for the current build
+pipeline. Disc-container discovery remains engine-specific; unsupported producers
+fail closed instead of being guessed as code.
 
 ## What each does
 
@@ -92,6 +92,34 @@ Reachable direct branches that cross a sibling-entry hard cap are also promoted
 only after the target passes the same bounded CFG proof. This recovers out-of-line
 switch/state blocks without a blind byte or pointer sweep.
 
+## Exact-hash BIOS resident code
+
+The base BIOS emitter covers ordinary ROM-resident code and the relocated kernel,
+but SCPH-1001 also assembles a small device helper directly into RAM at
+`0x8000DF80`. It is not one contiguous ROM relocation. The bundled
+`bios_resident_code.json` records the exact 112-byte installed code image and its
+six observed dispatch entries for BIOS SHA-256
+`71af94d1...f1e99d3`. Evidence is invariant across 415 snapshots from 10 sessions.
+
+`extract_generic.py` automatically appends the matching recipe when the framework
+BIOS exists (or `--bios` / `PSXRECOMP_BIOS_ROM` names it). A different/missing BIOS
+emits no resident record. `--only-bios-resident` materializes just these shared
+recipes without scanning a game disc. The capture contains the code bytes only:
+no page padding, no adjacent callback-pointer data, and no synthetic execution
+claims. Its sole producer range is `DF80-DFF0`.
+
+`compile_overlays.py` marks only manifest-produced resident shards with a
+`.resident` sidecar. The runtime preloads those marked DLLs because their compact
+synthetic envelope cannot equal the kernel dirty-run key. Preload only registers
+candidates: normal per-function live-byte CRC checks remain authoritative. At
+boot the candidate initially mismatches and is invalid; after the BIOS installs
+the helper, page-generation invalidation rechecks it and enables native dispatch.
+An exact T2 static-only attract soak verified all six entries native, zero
+interpreter appearances, zero aborts/guard yields, correct scene transitions, and
+60-61 fps at BelowNormal priority. The shard emits exactly six functions with
+zero unsupported instructions or bad targets; a rejected earlier page-envelope
+prototype exposed padding as a seventh function and was not retained.
+
 ## Multi-game sweep findings (2026-07-17)
 
 `extract_generic.py` runs the improved extraction from a game.toml. Results:
@@ -158,12 +186,14 @@ code-range recall. The distinction matters: runtime/autocompile vaults may conta
 one-entry fragments at consecutive instructions, while static AOT emits one broad
 function with the same PCs in its guarded `R` ranges. Exact-entry parity is retained
 for continuity; code-range recall is the useful uncovered-code roadmap. At the
-current Tomba 2 checkpoint these are 1270/1856 (68.4%) exact entries and 1811/1856
-(97.6%) overlay-cache code-range coverage. Pass the generated base BIOS dispatcher
-with `--bios-dispatch generated/SCPH1001_dispatch.c` to report separate combined
-metrics. The base recompiler already covers relocated kernel bodies with a live-byte
-guard; including it raises Tomba 2 to 1852/1856 (99.8%) native code-range coverage.
-This avoids generating duplicate overlay shards for code that is already native.
+current Tomba 2 checkpoint the play-free overlay cache plus the exact-hash
+resident shard covers 97.6% of vault code ranges. Pass the generated base BIOS
+dispatcher with `--bios-dispatch generated/SCPH1001_dispatch.c` to report separate
+combined metrics. The base recompiler covers relocated kernel bodies with a
+live-byte guard; including it raises both the full-playthrough vault and the
+verified append-only live-history needed set to **100% native code-range
+coverage**. This avoids generating duplicate overlay shards for code that is
+already native.
 
 ## Next to raise coverage (future session)
 
@@ -186,10 +216,9 @@ This avoids generating duplicate overlay shards for code that is already native.
    A09/A0J/OPN; GAME's 8-byte near-tie resolves through the exact base independently
    proved by DEMO. The played vault byte-proves GAME at 0x80106228. Ambiguous files
    without one unique trusted match still fail closed.
-4. ~~Extract the kernel `0x80000000` region once from the BIOS~~ â€” NOT NEEDED for
-   the measured body gaps. The base BIOS recompiler already emits 499 relocated,
-   guarded kernel bodies. Of the four combined gaps, A0/B0/C0 are tiny installed
-   vector thunks and EE7C is an all-zero runtime-fragment artifact; keep the latter
-   interpreted rather than treating padding/data as code.
-   this is now the complete 45-PC Tomba 2 code-range gap set.
+4. ~~AOT the game-independent kernel region once from the BIOS~~ —
+   DONE without compiling the whole dirty kernel capture. The base BIOS recompiler
+   supplies relocated guarded bodies and A0/B0/C0 stubs. The only invariant
+   installed-code gap is the exact-hash `DF80-DFF0` resident recipe above. Padding
+   and the adjacent `DFFC` callback pointer are intentionally excluded from code.
 5. Generalize into a real `tools/` producer (no hardcoded paths; disc + game.toml in).
