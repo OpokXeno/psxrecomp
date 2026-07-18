@@ -149,6 +149,47 @@ def jal_targets(data):
             ts.add(0x80000000 | ((w & 0x03FFFFFF) << 2))
     return ts
 
+def direct_jal_roots(data, base):
+    """Locally bounded call targets with independent boundary evidence."""
+    lo,hi=base,base+len(data)
+    return sorted(t for t in jal_targets(data)
+                  if lo <= t < hi and (t&3)==0 and
+                  (_callable_boundary(data,t-base) or
+                   ((_word(data,t-base) or 0)>>16)==0x27BD))
+
+def bounded_dispatch_fallback(data, base, entries):
+    """Bound authoritative mid-function entries to their nearest hosts.
+
+    Header-table exports are real dispatch targets but are commonly switch
+    cases rather than function starts.  For a conservative retry, pair each
+    with only its nearest preceding prologue and stop that host at the very
+    next prologue.  A host without a provable upper boundary is omitted.
+    """
+    starts=prologues(data,base)
+    if len(starts)<2:
+        return None
+    hosts=set(); dispatch=set(); ranges=set()
+    for entry in sorted(set(entries)):
+        before=[start for start in starts if start<=entry]
+        if not before:
+            continue
+        host=before[-1]
+        end=next((start for start in starts if start>host),None)
+        if end is None or not (host<=entry<end):
+            continue
+        hosts.add(host); dispatch.add(entry); ranges.add((host,end))
+    if not hosts or not dispatch:
+        return None
+    return {
+        'function_entry_pcs':[f"0x{addr:08X}" for addr in sorted(hosts)],
+        'dispatch_entry_pcs':[f"0x{addr:08X}" for addr in sorted(dispatch)],
+        'static_discovery_entry_pcs':[],
+        'producer_ranges':[
+            {'start':f"0x{lo:08X}",'end':f"0x{hi:08X}"}
+            for lo,hi in sorted(ranges)],
+        'strict_producer_ranges':True,
+    }
+
 def _select_base_vote(hist, trusted_bases=()):
     """Select a sharp vote peak, or an exact independently trusted near-tie.
 
@@ -330,17 +371,13 @@ def recover_consensus_members(members, base_lo, base_hi=0x80200000):
         runner=ranked[1][0] if len(ranked)>1 else 0
         if score < 2 or score < runner*2:
             continue
-        lo,hi=base,base+len(body)
-        direct={t for t in jal_targets(body)
-                if lo <= t < hi and (t&3)==0 and
-                (_callable_boundary(body,t-base) or
-                 ((_word(body,t-base) or 0)>>16)==0x27BD)}
-        seeds=sorted(direct)
+        direct=direct_jal_roots(body,base)
+        seeds=list(direct)
         if len(direct) < 2:
             continue
         recovered.append({
             'id':ident, 'file_offset':off, 'data':body, 'base':base,
-            'score':score, 'runner':runner, 'direct_seeds':sorted(direct),
+            'score':score, 'runner':runner, 'direct_seeds':direct,
             'seeds':seeds,
         })
     return recovered
@@ -815,7 +852,17 @@ def main():
         page_base = base & ~0xFFF
         fill = base - page_base
         region = b'\x00'*fill + data
-        records.append(rec(page_base, region, seeds, dispatch_extra=hdr_entries))
+        direct=direct_jal_roots(data,base)
+        record=rec(page_base, region, seeds, dispatch_extra=hdr_entries,
+                   static_discovery=direct)
+        fallback=bounded_dispatch_fallback(data,base,hdr_entries)
+        if fallback:
+            # The on-disc export table is authoritative dispatch evidence but
+            # its entries are commonly mid-function.  On audit rejection,
+            # classify those entries from scratch without retaining broad
+            # prologue/pointer guesses or trusting unrooted JAL-shaped data.
+            record['optional_enrichment_fallback_entry_pcs'] = fallback
+        records.append(record)
         positioned.append((p,data,base,seeds,hdr_entries))
         nh+=1
         extra=len(set(hdr_entries)-set(seeds))
@@ -838,7 +885,12 @@ def main():
             supplemental=supplemental_callable_seeds(data,base)
             seeds=sorted(set(prologue_seeds)|supplemental)
             page_base,region=page_aligned_region(base,data)
-            records.append(rec(page_base,region,seeds))
+            direct=direct_jal_roots(data,base)
+            record=rec(page_base,region,seeds,static_discovery=direct)
+            if direct and set(seeds) != set(direct):
+                record['optional_enrichment_fallback_entry_pcs'] = [
+                    f"0x{addr:08X}" for addr in direct]
+            records.append(record)
             positioned.append((p,data,base,seeds,()))
             nr+=1
             print(f"  [raw-code] {p}: {len(data)}B file@0x{base:08X} "

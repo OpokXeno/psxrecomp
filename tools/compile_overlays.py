@@ -364,15 +364,38 @@ def optional_enrichment_fallback_capture(cap: dict) -> dict | None:
     shard while all optional aliases and normal-mode discoveries are dropped.
     """
     key = 'optional_enrichment_fallback_entry_pcs'
-    entries = sorted(_parse_addr_list(cap.get(key, [])))
-    if not entries:
-        return None
-    encoded = [f'0x{entry:08X}' for entry in entries]
+    recipe = cap.get(key, [])
     fallback = dict(cap)
-    fallback['function_entry_pcs'] = encoded
-    fallback['dispatch_entry_pcs'] = encoded
-    fallback['static_discovery_entry_pcs'] = encoded
-    fallback['seeds'] = encoded
+    if isinstance(recipe, dict):
+        functions = sorted(_parse_addr_list(
+            recipe.get('function_entry_pcs', [])))
+        dispatch = sorted(_parse_addr_list(
+            recipe.get('dispatch_entry_pcs', [])))
+        static = sorted(_parse_addr_list(
+            recipe.get('static_discovery_entry_pcs', [])))
+        if not (functions or dispatch or static):
+            return None
+        fallback['function_entry_pcs'] = [
+            f'0x{entry:08X}' for entry in functions]
+        fallback['dispatch_entry_pcs'] = [
+            f'0x{entry:08X}' for entry in dispatch]
+        fallback['static_discovery_entry_pcs'] = [
+            f'0x{entry:08X}' for entry in static]
+        fallback['seeds'] = fallback['function_entry_pcs']
+        if 'producer_ranges' in recipe:
+            fallback['producer_ranges'] = recipe['producer_ranges']
+        if 'strict_producer_ranges' in recipe:
+            fallback['strict_producer_ranges'] = bool(
+                recipe['strict_producer_ranges'])
+    else:
+        entries = sorted(_parse_addr_list(recipe))
+        if not entries:
+            return None
+        encoded = [f'0x{entry:08X}' for entry in entries]
+        fallback['function_entry_pcs'] = encoded
+        fallback['dispatch_entry_pcs'] = encoded
+        fallback['static_discovery_entry_pcs'] = encoded
+        fallback['seeds'] = encoded
     fallback.pop('static_alias_ranges', None)
     fallback.pop('_prior_aliases', None)
     fallback.pop(key, None)
@@ -693,7 +716,8 @@ def _plausible_callable_target(data: bytes, load_addr: int, size: int,
 
 def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                            entry: int, hard_cap: int,
-                           producer_ranges=()) -> dict:
+                           producer_ranges=(),
+                           allow_cross_producer_calls=True) -> dict:
     lo = load_addr
     hi = load_addr + size
 
@@ -723,6 +747,9 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         target_range = producer_for(target)
         if source_range is not None and source_range == target_range:
             return True
+        if not allow_cross_producer_calls:
+            rejected_cross_producer_calls.add(target)
+            return False
         # Adjacent-producer composites are a byte envelope, not proof that a
         # call encoded by producer A is linked to arbitrary bytes at the same
         # address in every producer-B variant. Cross-boundary calls therefore
@@ -878,6 +905,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         raise RuntimeError('producer_ranges overlap')
 
     static_alias_ranges = set()
+    allow_cross_producer_calls = not bool(cap.get('strict_producer_ranges'))
     for raw_alias in cap.get('static_alias_ranges', []) or []:
         if not isinstance(raw_alias, dict):
             raise RuntimeError('static_alias_ranges entries must be objects')
@@ -929,7 +957,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     for i, entry in enumerate(pre_roots_sorted):
         hard_cap = pre_roots_sorted[i + 1] if i + 1 < len(pre_roots_sorted) else hi
         walk = _walk_overlay_function(
-            data, load_addr, size, entry, hard_cap, producer_ranges)
+            data, load_addr, size, entry, hard_cap, producer_ranges,
+            allow_cross_producer_calls)
         jump_table_targets.update(walk['jump_table_targets'])
 
     def impossible_entry_start(addr: int) -> bool:
@@ -1030,7 +1059,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             sorted_known = sorted(known)
             hard_cap = next((x for x in sorted_known if x > entry), hi)
             walk = _walk_overlay_function(
-                data, load_addr, size, entry, hard_cap, producer_ranges)
+                data, load_addr, size, entry, hard_cap, producer_ranges,
+                allow_cross_producer_calls)
             all_branch_targets.update(walk['branch_targets'])
             all_branch_targets.update(walk['jump_table_targets'])
             for target in sorted(walk['direct_jals']):
@@ -1084,7 +1114,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         for i, entry in enumerate(sorted_known):
             hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
             walk = _walk_overlay_function(
-                data, load_addr, size, entry, hard_cap, producer_ranges)
+                data, load_addr, size, entry, hard_cap, producer_ranges,
+                allow_cross_producer_calls)
             covered |= walk['visited']
         promoted = sorted(a for a, r in included.items()
                           if r == 'DISPATCH_INTERIOR' and a not in covered
@@ -1109,7 +1140,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     for i, entry in enumerate(sorted_known):
         hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
         walk = _walk_overlay_function(
-            data, load_addr, size, entry, hard_cap, producer_ranges)
+            data, load_addr, size, entry, hard_cap, producer_ranges,
+            allow_cross_producer_calls)
         all_branch_targets.update(walk['branch_targets'])
         all_branch_targets.update(walk['jump_table_targets'])
         all_branch_targets.update(walk['forward_branch_targets'])
@@ -2683,7 +2715,7 @@ def main():
                     fallback = optional_enrichment_fallback_capture(cap)
                     if fallback is not None:
                         print('  OPTIONAL ENRICHMENT AUDIT REJECTED; '
-                              'retrying direct-call roots only\n')
+                              'retrying conservative recipe\n')
                         _do_capture(fallback, region_coverage_cache,
                                     interior_frag_jobs, stats)
                         return
@@ -2768,7 +2800,7 @@ def main():
                     fallback = optional_enrichment_fallback_capture(cap)
                     if fallback is not None:
                         print('  OPTIONAL ENRICHMENT COMPILE REJECTED; '
-                              'retrying direct-call roots only\n')
+                              'retrying conservative recipe\n')
                         _do_capture(fallback, region_coverage_cache,
                                     interior_frag_jobs, stats)
                         return

@@ -65,6 +65,12 @@ def check_composite_call_boundaries():
         data, LOAD, len(data), LOAD, LOAD + 0x100, ranges)
     assert cross_target in scoped['direct_jals']
 
+    strict = MOD._walk_overlay_function(
+        data, LOAD, len(data), LOAD, LOAD + 0x100, ranges,
+        allow_cross_producer_calls=False)
+    assert cross_target not in strict['direct_jals']
+    assert cross_target in strict['rejected_cross_producer_calls']
+
     # Independent target-local boundary evidence makes a real cross-producer
     # export safe to retain.
     put(data, 0x50, 0x27BDFFE0)
@@ -140,6 +146,26 @@ def check_optional_enrichment_fallback():
     assert '_prior_aliases' not in fallback
     assert 'optional_enrichment_fallback_entry_pcs' not in fallback
     assert MOD.optional_enrichment_fallback_capture(fallback) is None
+
+    dispatch = LOAD + 0x30
+    cap['optional_enrichment_fallback_entry_pcs'] = {
+        'function_entry_pcs': [],
+        'dispatch_entry_pcs': [f'0x{dispatch:08X}'],
+        'static_discovery_entry_pcs': [],
+        'producer_ranges': [{
+            'start': f'0x{LOAD + 0x20:08X}',
+            'end': f'0x{LOAD + 0x40:08X}',
+        }],
+        'strict_producer_ranges': True,
+    }
+    fallback = MOD.optional_enrichment_fallback_capture(cap)
+    assert fallback['function_entry_pcs'] == []
+    assert fallback['dispatch_entry_pcs'] == [f'0x{dispatch:08X}']
+    assert fallback['static_discovery_entry_pcs'] == []
+    assert fallback['seeds'] == []
+    assert fallback['producer_ranges'] == cap[
+        'optional_enrichment_fallback_entry_pcs']['producer_ranges']
+    assert fallback['strict_producer_ranges'] is True
 
 
 def check_forward_branch_root():

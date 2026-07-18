@@ -38,6 +38,27 @@ def main():
     struct.pack_into("<I", data, 4, 0x0C000000 | ((0x80105678 >> 2) & 0x03FFFFFF))
     assert MOD.jal_targets(data) == {0x80105678}
 
+    # A JAL target becomes a conservative shard root only when the target is
+    # local and has independent callable-boundary evidence.
+    rooted = bytearray(0x80)
+    struct.pack_into('<I', rooted, 0, 0x0C000000 |
+                     (((0x80100000 + 0x40) >> 2) & 0x03FFFFFF))
+    struct.pack_into('<I', rooted, 0x40, 0x27BDFFF0)
+    assert MOD.direct_jal_roots(rooted, 0x80100000) == [0x80100040]
+    struct.pack_into('<I', rooted, 0x40, 0x24020001)
+    assert MOD.direct_jal_roots(rooted, 0x80100000) == []
+
+    bounded = bytearray(0x90)
+    for off in (0x10, 0x40, 0x70):
+        struct.pack_into('<I', bounded, off, 0x27BDFFF0)
+    recipe = MOD.bounded_dispatch_fallback(
+        bounded, 0x80100000, [0x80100024, 0x80100050])
+    assert recipe['function_entry_pcs'] == ['0x80100010', '0x80100040']
+    assert recipe['producer_ranges'] == [
+        {'start': '0x80100010', 'end': '0x80100040'},
+        {'start': '0x80100040', 'end': '0x80100070'},
+    ]
+
     wrapped = MOD.make_psx_exe(b'\x11\x22\x33\x44', 0x80102000,
                                0x80102040)
     assert wrapped[:8] == b'PS-X EXE'

@@ -50,6 +50,13 @@ continue to fail safely to the interpreter.
   100% combined BIOS code-range coverage for both vault and live history.
 - Large archive reads are now linear rather than quadratic sector concatenation.
   These validations wrote only `%TEMP%` caches; title caches remain untouched.
+- Tomba 1 header exports are authoritative mid-function dispatch entries rather
+  than callable roots. Their conservative retry now uses only the nearest
+  preceding prologue host, hard-stops it at the next prologue, and rejects calls
+  outside those producer ranges. The clean 25-record corpus built 18 unique DLLs
+  with zero failures (the rest deduplicated); across 24 legacy sessions it covers
+  86.2% of played PCs by overlay code range and 95.1% with base BIOS/kernel code,
+  leaving 22 genuine range misses rather than admitting embedded data as code.
 
 ---
 

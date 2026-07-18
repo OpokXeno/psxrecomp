@@ -227,6 +227,18 @@ including the separately recompiled, live-byte-guarded base BIOS raises combined
 native code-range recall to **100.0%** (677/677). Validation used only disposable
 `%TEMP%` caches.
 
+Tomba 1's header-table exports require a different conservative retry. Those
+authoritative addresses are commonly switch-case entries in the middle of a
+function, so a direct-JAL-only retry loses the dispatcher while a broad scan can
+walk into embedded data. The extractor now pairs each export with its nearest
+preceding prologue, hard-bounds that host at the next prologue, and forbids calls
+from escaping those proven producer ranges. A clean 25-record build produced 18
+unique DLLs with zero failures; the other records were safely deduplicated. Across
+24 legacy capture files, the disposable cache covers **86.2%** of exercised PCs
+by overlay code range and **95.1%** with the separately generated BIOS/kernel
+ranges, leaving 22 true range misses for later producer recovery. The generated-C
+audit remains the gate: rejected broad discovery is never installed.
+
 Ape Escape's `KKIIDDZZ.HED` encodes contiguous
 `size_sectors:12 | logical_sector:20` runs spanning sibling DAT then BNS files.
 The same cross-member vote gate proves `0x80136000` (10 anchors), `0x8013D000`
