@@ -1552,6 +1552,14 @@ static void init_callbacks(void) {
             extern int32_t psx_ws_player_x_bound(int32_t vanilla);
             s_callbacks.ws_player_x_bound = psx_ws_player_x_bound;
         }
+        /* ABI v14: GTE precision-store tracker — the emitter emits a direct
+         * gte_precision_store_word() call for every swc2 (GTE store-word),
+         * including in overlay-resident code; it mutates the host's stateful
+         * sub-pixel projection cache (gte.cpp) so the DLL must forward. */
+        {
+            extern void gte_precision_store_word(uint32_t addr, uint8_t reg);
+            s_callbacks.gte_precision_store_word = gte_precision_store_word;
+        }
     }
 }
 

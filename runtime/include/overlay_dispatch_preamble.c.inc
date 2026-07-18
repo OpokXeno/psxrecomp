@@ -223,5 +223,15 @@ uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
 int32_t psx_ws_player_x_bound(int32_t vanilla) {
     return g_cbs.ws_player_x_bound ? g_cbs.ws_player_x_bound(vanilla) : vanilla;
 }
+/* Sub-pixel GTE precision-store tracker (ABI v14). The emitter emits a direct
+ * gte_precision_store_word() call for every swc2 (GTE store-word), including in
+ * overlay-resident code, so the DLL must define it or the shard fails to link
+ * (undefined reference — the rfe/gte_read_ctrl class). Forwards to the host's
+ * stateful tracker (gte.cpp); no-op if the host predates the callback
+ * (precision tracking is a widescreen enhancement, off by default — 4:3
+ * behavior is unaffected). */
+void gte_precision_store_word(uint32_t addr, uint8_t reg) {
+    if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
+}
 /* ----------------------------------------------------------------------- */
 

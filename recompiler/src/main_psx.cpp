@@ -927,7 +927,22 @@ int main(int argc, char** argv) {
     // the on-disk representation changes. Function bodies are byte-identical
     // to what full_c_code would have contained; see
     // CodeGenerator::last_gen_funcs() / build_shared_decls_header().
-    {
+    if (overlay_mode) {
+        // Overlays are single small TUs consumed by compile_overlays.py, which
+        // reads <stem>_full.c directly. Emit the monolith; the split path below
+        // would delete _full.c and leave only shards, breaking overlay compile
+        // (no_output). Splitting a small overlay TU has no parallel-compile
+        // benefit anyway.
+        std::ofstream full_file(output_filename);
+        if (full_file.is_open()) {
+            full_file << full_c_code;
+            full_file.close();
+            fmt::print("✓ Saved overlay monolith to {}\n", output_filename.string());
+        } else {
+            fmt::print(stderr, "⚠ Failed to write overlay monolith {}\n\n",
+                       output_filename.string());
+        }
+    } else {
         // 1. Remove stale outputs: the old monolith and any previously
         //    written shards (a shard count shrink must not leave orphans).
         std::error_code rm_ec;
