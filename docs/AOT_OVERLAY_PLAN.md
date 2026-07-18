@@ -75,13 +75,14 @@ continue to fail safely to the interpreter.
   and retained 107/107 combined live-history range coverage. MMX6 rebuilt 31/31;
   two unsafe broad-discovery attempts failed their audit/compile gates and fell
   back to conservative seeds, retaining 677/677 combined range coverage. Tomba 2
-  audited all 53 candidates with zero unsupported/bad targets and GCC-built eight
-  representative shards (MAIN, four large area variants, OPN/CRD, and BIOS);
-  its remaining full GCC compile is a low-priority disposable-cache follow-up.
+  audited all 53 candidates with zero unsupported/bad targets, TCC-built the full
+  53/53 set, and GCC-built 11 representative shards including MAIN, large area
+  variants, OPN/CRD, and BIOS.
 - TCC overlay compilation now receives the same release/debug and cycle-model
   defines as GCC. A TCC-only generated-source shim supplies `__builtin_ctz`
-  without changing the hashed runtime headers. Real T2 BIOS and OPN/CRD shards
-  compile cleanly through the packaged TinyCC 0.9.27 toolchain.
+  without changing the hashed runtime headers. The packaged TinyCC 0.9.27
+  toolchain compiles the complete T2 corpus, and atomic publication now removes
+  its staged `.def` sidecars after both success and failure.
 
 ---
 

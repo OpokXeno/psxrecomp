@@ -2353,10 +2353,15 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         os.replace(staged, final_out)
         return True
     finally:
-        try:
-            os.unlink(staged)
-        except FileNotFoundError:
-            pass
+        # TinyCC emits an export-definition sidecar beside its requested DLL.
+        # It inherits the unique staged basename and must not accumulate in the
+        # content cache after either success or failure.
+        staged_sidecars = [os.path.splitext(staged)[0] + '.def']
+        for temporary in [staged, *staged_sidecars]:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def compiled_shard_complete(dll_path: str) -> bool:

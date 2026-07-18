@@ -359,6 +359,8 @@ def check_atomic_dll_publication():
             def fail_compile(_src, staged, _includes, **_kwargs):
                 with open(staged, "wb") as out:
                     out.write(b"partial")
+                with open(os.path.splitext(staged)[0] + ".def", "w") as out:
+                    out.write("temporary exports")
                 return False
 
             MOD._compile_dll_direct = fail_compile
@@ -371,6 +373,8 @@ def check_atomic_dll_publication():
             def good_compile(_src, staged, _includes, **_kwargs):
                 with open(staged, "wb") as out:
                     out.write(b"new-complete-shard")
+                with open(os.path.splitext(staged)[0] + ".def", "w") as out:
+                    out.write("temporary exports")
                 return True
 
             MOD._compile_dll_direct = good_compile

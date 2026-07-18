@@ -292,12 +292,13 @@ attempts containing embedded data or an incomplete label graph were rejected and
 the corresponding shards safely retried with direct seeds. Tomba 2's full set of
 **53/53** candidates passed the generated-C audit with zero unsupported/bad
 targets, and GCC built representative MAIN, large-area, OPN/CRD, and BIOS shards;
-the remaining full GCC pass is intentionally running at low priority in a
-disposable cache. That validation also exposed and fixed two TCC-path parity
+11 representative GCC shards were retained before the full-corpus pass switched
+to the packaged compiler. That validation also exposed and fixed TCC-path parity
 bugs: TCC now receives the same `PSX_NO_DEBUG_TOOLS` and block-cycle defines as
 GCC, and a generated-source-only shim supplies the unsupported `__builtin_ctz`
-without changing hashed runtime headers. The packaged TinyCC 0.9.27 now builds
-real T2 BIOS and OPN/CRD shards cleanly.
+without changing hashed runtime headers. TinyCC 0.9.27 then built the complete
+T2 set **53/53**. Atomic publication also removes TCC's staged `.def` sidecars,
+so successful and interrupted compiles leave only final DLL/manifest pairs.
 
 ## Next to raise coverage (future session)
 
