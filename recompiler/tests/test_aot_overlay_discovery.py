@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Focused regression checks for play-free overlay call-target discovery."""
+import argparse
 import importlib.util
+import os
 import pathlib
 import struct
+import subprocess
 import sys
+import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -24,7 +28,53 @@ def jal(target):
     return 0x0C000000 | ((target >> 2) & 0x03FFFFFF)
 
 
+def make_psxexe(entry, data):
+    header = bytearray(2048)
+    header[0:8] = b"PS-X EXE"
+    put(header, 0x10, entry)
+    put(header, 0x18, LOAD)
+    put(header, 0x1C, len(data))
+    return bytes(header) + data
+
+
+def check_padded_return_boundary(recompiler):
+    # Exact-entry mode re-verifies every untrusted seed. Psy-Q aligns frameless
+    # leaves with NOPs after the prior function's JR delay slot; those NOPs must
+    # not erase the otherwise exact return-boundary evidence.
+    data = bytearray(0x80)
+    put(data, 0x00, 0x03E00008)  # jr $ra
+    put(data, 0x04, 0x24020007)  # non-NOP delay slot
+    # 0x08..0x10 are alignment NOPs.
+    put(data, 0x14, 0x24020001)  # padded frameless leaf
+    put(data, 0x18, 0x03E00008)
+    put(data, 0x1C, 0x00000000)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, "padded.psx")
+        seeds = os.path.join(tmp, "seeds.txt")
+        out = os.path.join(tmp, "out")
+        with open(psx, "wb") as f:
+            f.write(make_psxexe(LOAD, data))
+        with open(seeds, "w", encoding="utf-8") as f:
+            f.write(f"0x{LOAD:08X}\n0x{LOAD + 0x14:08X}\n")
+        result = subprocess.run(
+            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr or result.stdout
+        full = next(pathlib.Path(out).glob("*_full.c")).read_text()
+        assert f"void func_{LOAD + 0x14:08X}" in full
+        ranges = next(pathlib.Path(out).glob("*_full.ranges")).read_text()
+        assert f"F {LOAD + 0x14:08X}" in ranges
+
+
 def main():
+    default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--recompiler", default=str(default_recompiler))
+    args = parser.parse_args()
+    if not os.path.isfile(args.recompiler):
+        raise SystemExit(f"recompiler not found: {args.recompiler}")
+
     data = bytearray(0x200)
 
     # A framed root directly calls a frameless leaf.  JAL is the boundary
@@ -62,6 +112,8 @@ def main():
     walk = MOD._walk_overlay_function(
         bytes(data), LOAD, len(data), LOAD + 0x100, LOAD + len(data))
     assert walk["static_indirect_targets"] == {LOAD + 0x40}
+
+    check_padded_return_boundary(args.recompiler)
 
     print("ALL PASS")
 

@@ -496,6 +496,20 @@ int main(int argc, char** argv) {
             if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
             if (a == exe_lo) return true;
             if (a >= exe_lo + 8 && read_w(a - 8) == 0x03E00008u) return true;
+            // Normal-mode discovery already skips alignment padding after a
+            // return when it infers a frameless function start. Preserve that
+            // evidence here. Requiring the next entry to be exactly jr-ra+8
+            // demoted legitimate Psy-Q leaf routines separated by one to six
+            // padding NOPs to orphan interiors, so exact-entry analysis emitted
+            // no function at all. The delay slot (jr+4) may be non-NOP; only
+            // words after it and before the proposed entry must be padding.
+            bool padding_only = true;
+            for (uint32_t back = 12; back <= 32 && a >= exe_lo + back;
+                 back += 4) {
+                if (read_w(a - back + 8) != 0u) padding_only = false;
+                if (!padding_only) break;
+                if (read_w(a - back) == 0x03E00008u) return true;
+            }
             int32_t frame = 0;
             return PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
                    !(a >= exe_lo + 4 &&
