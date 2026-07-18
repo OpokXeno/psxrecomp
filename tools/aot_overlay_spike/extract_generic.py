@@ -139,10 +139,17 @@ def full_discovery_seeds(data, recompiler, tmp):
                 a=int(m.group(1),16); seeds.add(a if a>=0x80000000 else (0x80000000|a))
     return sorted(seeds) or None
 
-def rec(load_addr, data, seeds):
+def rec(load_addr, data, seeds, dispatch_extra=None):
+    # function_entry_pcs = prologue-scanned function starts (walk roots).
+    # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
+    # overlay's own export table). compile_overlays promotes clean starts to
+    # entries and mid-function dispatch targets to DISPATCH_INTERIOR aliases
+    # (impossible_entry_start guards garbage), so passing the game's authoritative
+    # dispatch table here recovers indirect-only entries a prologue scan misses.
+    disp = sorted(set(seeds) | set(dispatch_extra or ()))
     return {"schema":"psxrecomp overlay capture v2","load_addr":f"0x{load_addr:08X}",
             "size":len(data),"bytes_b64":base64.b64encode(data).decode(),
-            "executed_pcs":[],"dispatch_entry_pcs":[f"0x{a:08X}" for a in seeds],
+            "executed_pcs":[],"dispatch_entry_pcs":[f"0x{a:08X}" for a in disp],
             "function_entry_pcs":[f"0x{a:08X}" for a in seeds],
             "seeds":[f"0x{a:08X}" for a in seeds]}
 
@@ -212,6 +219,13 @@ def main():
                 continue
             base,score=rb
             seeds=prologues(data,base)   # seed via full-file prologue scan
+            # SUPPLEMENT the prologue seeds with the overlay's OWN export/dispatch
+            # table (the header pointers) — the game's authoritative list of live
+            # entry points, sitting on the disc (play-free). These are exactly the
+            # indirect-dispatch-only / interior entries a prologue scan can't see;
+            # compile_overlays emits them as DISPATCH_INTERIOR aliases as needed.
+            hdr_entries=[p for p in ptrs
+                         if p and (p&3)==0 and base <= p < base+len(data)]
             # The runtime keys shards by a PAGE-ALIGNED region_start (the first
             # dirty page of the overlay's contiguous run), and compile_overlays
             # takes the capture's load_addr verbatim as that key (phys = load_addr
@@ -222,11 +236,13 @@ def main():
             page_base = base & ~0xFFF
             fill = base - page_base
             region = b'\x00'*fill + data
-            records.append(rec(page_base, region, seeds))
+            records.append(rec(page_base, region, seeds, dispatch_extra=hdr_entries))
             nh+=1
+            extra=len(set(hdr_entries)-set(seeds))
             print(f"  [header-table] {p}: {len(data)}B file@0x{base:08X} "
                   f"region@0x{page_base:08X}(+{fill}) "
-                  f"(jal-fit score={score}), prologue seeds={len(seeds)}")
+                  f"(jal-fit score={score}), prologue seeds={len(seeds)} "
+                  f"+{extra} export-table dispatch entries")
     json.dump(records, open(a.out,'w'))
     print(f"producers: {np} PS-X EXE (full-discovery), {nh} header-table; {len(records)} regions -> {a.out}")
 
