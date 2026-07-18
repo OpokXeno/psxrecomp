@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 import coverage_report
 
@@ -86,7 +87,235 @@ const PsxNativeStub psx_bios_native_stubs[1] = {
         self.assertEqual(entries, {0x100, 0x200})
         self.assertEqual(audit, {
             'v1_records': 1, 'v2_records': 3, 'invalid_records': 2,
-            'duplicate_refs': 1, 'verified_snapshots': 1})
+            'duplicate_refs': 1, 'verified_snapshots': 1,
+            'unverified_superseded_records': 0,
+            'unverified_superseded_bytes': 0})
+
+    def test_addendum_uses_newest_cumulative_snapshot_per_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshots = []
+            captures = [
+                [{'dispatch_entry_pcs': ['0x80000100']}],
+                [{'dispatch_entry_pcs': ['0x80000100', '0x80000200']}],
+            ]
+            for index, body in enumerate(captures, 1):
+                snapshot = os.path.join(tmp, f'immutable-{index}.json')
+                with open(snapshot, 'w', encoding='utf-8') as out:
+                    json.dump(body, out)
+                snapshots.append(snapshot)
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for sequence, snapshot in enumerate(snapshots, 1):
+                    out.write(json.dumps({
+                        'schema': 'psxrecomp overlay capture addendum v2',
+                        'game': 'TEST', 'session': 'session-1',
+                        'sequence': sequence, 'snapshot': snapshot,
+                        'fnv64': '%016X' % coverage_report._fnv64_file(snapshot),
+                    }) + '\n')
+            entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200})
+        self.assertEqual(audit['v2_records'], 2)
+        self.assertEqual(audit['verified_snapshots'], 1)
+        self.assertEqual(audit['unverified_superseded_records'], 1)
+
+    def test_addendum_falls_back_when_newest_snapshot_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            older = os.path.join(tmp, 'older.json')
+            newer = os.path.join(tmp, 'newer.json')
+            with open(older, 'w', encoding='utf-8') as out:
+                json.dump([{'function_entry_pcs': ['0x80000100']}], out)
+            with open(newer, 'w', encoding='utf-8') as out:
+                json.dump([{'function_entry_pcs': ['0x80000200']}], out)
+            addendum = os.path.join(tmp, 'history.jsonl')
+            records = [
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'game': 'TEST', 'session': 'session-1', 'sequence': 1,
+                 'snapshot': older,
+                 'fnv64': '%016X' % coverage_report._fnv64_file(older)},
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'game': 'TEST', 'session': 'session-1', 'sequence': 2,
+                 'snapshot': newer, 'fnv64': '0000000000000000'},
+            ]
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for record in records:
+                    out.write(json.dumps(record) + '\n')
+            entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100})
+        self.assertEqual(audit['invalid_records'], 1)
+        self.assertEqual(audit['verified_snapshots'], 1)
+        self.assertEqual(audit['unverified_superseded_records'], 0)
+
+    def test_addendum_does_not_collapse_nonmonotonic_session_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            records = []
+            for sequence, address in ((2, '0x80000200'), (1, '0x80000100')):
+                snapshot = os.path.join(tmp, f'immutable-{sequence}.json')
+                with open(snapshot, 'w', encoding='utf-8') as out:
+                    json.dump([{'dispatch_entry_pcs': [address]}], out)
+                records.append({
+                    'schema': 'psxrecomp overlay capture addendum v2',
+                    'game': 'TEST', 'session': 'session-1',
+                    'sequence': sequence, 'snapshot': snapshot,
+                    'fnv64': '%016X' % coverage_report._fnv64_file(snapshot),
+                })
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for record in records:
+                    out.write(json.dumps(record) + '\n')
+            entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200})
+        self.assertEqual(audit['verified_snapshots'], 2)
+        self.assertEqual(audit['unverified_superseded_records'], 0)
+
+    def test_addendum_does_not_collapse_non_cumulative_session_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            records = []
+            for sequence, address in ((1, '0x80000100'), (2, '0x80000200')):
+                snapshot = os.path.join(tmp, f'immutable-{sequence}.json')
+                with open(snapshot, 'w', encoding='utf-8') as out:
+                    json.dump([{'dispatch_entry_pcs': [address]}], out)
+                records.append({
+                    'schema': 'psxrecomp overlay capture addendum v2',
+                    'game': 'TEST', 'session': 'session-1',
+                    'sequence': sequence, 'snapshot': snapshot,
+                    'fnv64': '%016X' % coverage_report._fnv64_file(snapshot),
+                })
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for record in records:
+                    out.write(json.dumps(record) + '\n')
+            entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200})
+        self.assertEqual(audit['verified_snapshots'], 2)
+        self.assertEqual(audit['unverified_superseded_records'], 0)
+
+    def test_tampered_superseded_hash_cannot_change_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            older = os.path.join(tmp, 'older.json')
+            newer = os.path.join(tmp, 'newer.json')
+            with open(older, 'w', encoding='utf-8') as out:
+                json.dump([{'dispatch_entry_pcs': ['0x80000100']}], out)
+            stale_signature = '%016X' % coverage_report._fnv64_file(older)
+            # Change the bytes while preserving an entry set contained by the
+            # verified head. The old file must not contribute to the score.
+            with open(older, 'a', encoding='utf-8') as out:
+                out.write(' ')
+            with open(newer, 'w', encoding='utf-8') as out:
+                json.dump([{'dispatch_entry_pcs': [
+                    '0x80000100', '0x80000200']}], out)
+            records = [
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'game': 'TEST', 'session': 'session-1', 'sequence': 1,
+                 'snapshot': older, 'fnv64': stale_signature},
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'game': 'TEST', 'session': 'session-1', 'sequence': 2,
+                 'snapshot': newer,
+                 'fnv64': '%016X' % coverage_report._fnv64_file(newer)},
+            ]
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for record in records:
+                    out.write(json.dumps(record) + '\n')
+            entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200})
+        self.assertEqual(audit['verified_snapshots'], 1)
+        self.assertEqual(audit['invalid_records'], 0)
+        self.assertEqual(audit['unverified_superseded_records'], 1)
+
+    def test_bad_older_fnv_metadata_forces_invalid_record_audit(self):
+        for label, bad_fnv in (('missing', None), ('garbage', 'not-a-hash')):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                older = os.path.join(tmp, 'older.json')
+                newer = os.path.join(tmp, 'newer.json')
+                with open(older, 'w', encoding='utf-8') as out:
+                    json.dump([{'dispatch_entry_pcs': ['0x80000100']}], out)
+                with open(newer, 'w', encoding='utf-8') as out:
+                    json.dump([{'dispatch_entry_pcs': [
+                        '0x80000100', '0x80000200']}], out)
+                older_record = {
+                    'schema': 'psxrecomp overlay capture addendum v2',
+                    'game': 'TEST', 'session': 'session-1', 'sequence': 1,
+                    'snapshot': older,
+                }
+                if bad_fnv is not None:
+                    older_record['fnv64'] = bad_fnv
+                records = [
+                    older_record,
+                    {'schema': 'psxrecomp overlay capture addendum v2',
+                     'game': 'TEST', 'session': 'session-1', 'sequence': 2,
+                     'snapshot': newer,
+                     'fnv64': '%016X' % coverage_report._fnv64_file(newer)},
+                ]
+                addendum = os.path.join(tmp, 'history.jsonl')
+                with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                    for record in records:
+                        out.write(json.dumps(record) + '\n')
+                entries, audit = coverage_report.parse_addendum_entries(addendum)
+            self.assertEqual(entries, {0x100, 0x200})
+            self.assertEqual(audit['invalid_records'], 1)
+            self.assertEqual(audit['verified_snapshots'], 1)
+            self.assertEqual(audit['unverified_superseded_records'], 0)
+
+    def test_oversized_unverified_snapshot_forces_full_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            older = os.path.join(tmp, 'older.json')
+            newer = os.path.join(tmp, 'newer.json')
+            with open(older, 'w', encoding='utf-8') as out:
+                json.dump([{'dispatch_entry_pcs': ['0x80000100']}], out)
+                out.write(' ' * 64)
+            with open(newer, 'w', encoding='utf-8') as out:
+                json.dump([{'dispatch_entry_pcs': [
+                    '0x80000100', '0x80000200']}], out)
+            records = [
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'game': 'TEST', 'session': 'session-1', 'sequence': 1,
+                 'snapshot': older,
+                 'fnv64': '%016X' % coverage_report._fnv64_file(older)},
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'game': 'TEST', 'session': 'session-1', 'sequence': 2,
+                 'snapshot': newer,
+                 'fnv64': '%016X' % coverage_report._fnv64_file(newer)},
+            ]
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for record in records:
+                    out.write(json.dumps(record) + '\n')
+            with mock.patch.object(
+                    coverage_report, 'MAX_UNVERIFIED_SNAPSHOT_BYTES', 32):
+                entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200})
+        self.assertEqual(audit['verified_snapshots'], 2)
+        self.assertEqual(audit['unverified_superseded_records'], 0)
+
+    def test_aggregate_unverified_size_bound_forces_full_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshots = []
+            bodies = [
+                [{'dispatch_entry_pcs': ['0x80000100']}],
+                [{'dispatch_entry_pcs': ['0x80000100', '0x80000200']}],
+                [{'dispatch_entry_pcs': [
+                    '0x80000100', '0x80000200', '0x80000300']}],
+            ]
+            for sequence, body in enumerate(bodies, 1):
+                snapshot = os.path.join(tmp, f'immutable-{sequence}.json')
+                with open(snapshot, 'w', encoding='utf-8') as out:
+                    json.dump(body, out)
+                snapshots.append(snapshot)
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for sequence, snapshot in enumerate(snapshots, 1):
+                    out.write(json.dumps({
+                        'schema': 'psxrecomp overlay capture addendum v2',
+                        'game': 'TEST', 'session': 'session-1',
+                        'sequence': sequence, 'snapshot': snapshot,
+                        'fnv64': '%016X' % coverage_report._fnv64_file(snapshot),
+                    }) + '\n')
+            with mock.patch.object(
+                    coverage_report, 'MAX_UNVERIFIED_TOTAL_BYTES', 1):
+                entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200, 0x300})
+        self.assertEqual(audit['verified_snapshots'], 3)
+        self.assertEqual(audit['unverified_superseded_records'], 0)
 
 
 if __name__ == '__main__':

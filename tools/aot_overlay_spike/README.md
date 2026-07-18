@@ -79,8 +79,18 @@ record lacks its exact immutable snapshot.
 
 For a live-recall scoreboard that survives individual launches, pass the same
 history to `coverage_report.py --addendum ...`. It unions only dispatch/function
-entries from every verified snapshot, so the report no longer depends on which
-latest capture happened to be present when it ran.
+entries from verified snapshots, so the report no longer depends on which latest
+capture happened to be present when it ran. Runtime snapshots are cumulative
+within a session. For well-formed v2 records the reporter verifies the newest
+snapshot, parses the older entry lists, and skips their expensive FNV passes only
+after proving every older set is contained by the verified head. The report calls
+these records out explicitly as superseded but not FNV-verified; only the verified
+head contributes entries. Every candidate must still carry a syntactically valid
+FNV signature, and unverified parsing has per-file and aggregate size bounds.
+Non-cumulative
+content and records with missing, duplicate, or nonmonotonic session metadata are
+conservatively processed independently with FNV verification; invalid records are
+rejected.
 For existing corpora that predate the addendum, `--captures` is repeatable; all
 named snapshots are unioned into one live-history denominator.
 

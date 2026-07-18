@@ -30,6 +30,10 @@ import argparse, bisect, os, sys, json, re, glob, zlib
 from collections import defaultdict
 
 MASK = 0x1FFFFFFF
+FNV64_OFFSET = 1469598103934665603
+FNV64_PRIME = 1099511628211
+MAX_UNVERIFIED_SNAPSHOT_BYTES = 32 * 1024 * 1024
+MAX_UNVERIFIED_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 
 def norm(a): return a & MASK
 
@@ -172,35 +176,85 @@ def parse_captures_executed(path):
                 ent.add(norm(int(a, 16)))
     return ent
 
+def _fnv64_bytes(data, value=FNV64_OFFSET):
+    for byte in data:
+        value ^= byte
+        value = (value * FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return value
+
 def _fnv64_file(path):
-    value = 1469598103934665603
+    value = FNV64_OFFSET
     with open(path, 'rb') as source:
         while True:
             chunk = source.read(65536)
             if not chunk:
                 break
-            for byte in chunk:
-                value ^= byte
-                value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+            value = _fnv64_bytes(chunk, value)
     return value
 
 def parse_addendum_entries(path):
-    """Union dispatch/function entries from verified v1/v2 history records."""
+    """Union dispatch/function entries from verified v1/v2 history records.
+
+    Runtime v2 snapshots are cumulative within one session: the capture tables
+    only grow, and every history record references a full immutable snapshot.
+    For a well-formed session, verify the newest snapshot and cheaply prove that
+    every older entry set is a subset before skipping their expensive FNV pass.
+    Every candidate must still have a syntactically valid signature, and the
+    unverified reads are size-bounded. If content is non-cumulative, missing, or
+    unreadable, fall back to verifying and unioning every valid record as before.
+
+    Records without trustworthy session/sequence metadata remain independent,
+    preserving the conservative behavior for hand-written and legacy history.
+    """
     entries = set()
     seen_refs = set()
     audit = {'v1_records': 0, 'v2_records': 0, 'invalid_records': 0,
-             'duplicate_refs': 0, 'verified_snapshots': 0}
+             'duplicate_refs': 0, 'verified_snapshots': 0,
+             'unverified_superseded_records': 0,
+             'unverified_superseded_bytes': 0}
+    session_records = defaultdict(list)
+    independent_records = []
+    all_v2_records = []
+    verified_probe = {}
+    unverified_bytes_read = 0
 
-    def add_captures(captures):
+    def capture_entries(captures):
+        found = set()
         if not isinstance(captures, list):
-            return
+            return found
         for cap in captures:
             if not isinstance(cap, dict):
                 continue
             for key in ('dispatch_entry_pcs', 'function_entry_pcs'):
                 for addr in cap.get(key, []):
-                    entries.add(norm(int(addr, 16) if isinstance(addr, str)
-                                     else int(addr)))
+                    found.add(norm(int(addr, 16) if isinstance(addr, str)
+                                   else int(addr)))
+        return found
+
+    def add_captures(captures):
+        entries.update(capture_entries(captures))
+
+    def snapshot_fields(record):
+        snapshot = record.get('snapshot')
+        expected = str(record.get('fnv64', '')).upper()
+        if not isinstance(snapshot, str) or not snapshot:
+            return None, expected, None
+        if not os.path.isabs(snapshot):
+            snapshot = os.path.join(os.path.dirname(path), snapshot)
+        snapshot = os.path.abspath(snapshot)
+        return snapshot, expected, (os.path.normcase(snapshot), expected)
+
+    def read_snapshot_bytes(snapshot, max_bytes=None):
+        with open(snapshot, 'rb') as source:
+            if max_bytes is not None and os.fstat(source.fileno()).st_size > max_bytes:
+                raise ValueError('snapshot exceeds unverified parse bound')
+            data = source.read() if max_bytes is None else source.read(max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ValueError('snapshot exceeds unverified parse bound')
+        return data
+
+    def entries_from_bytes(data):
+        return capture_entries(json.loads(data))
 
     with open(path, encoding='utf-8', errors='replace') as history:
         for lineno, line in enumerate(history, 1):
@@ -224,30 +278,120 @@ def parse_addendum_entries(path):
                 audit['invalid_records'] += 1
                 continue
             audit['v2_records'] += 1
-            snapshot = record.get('snapshot')
-            expected = str(record.get('fnv64', '')).upper()
-            if not isinstance(snapshot, str) or not snapshot:
+            all_v2_records.append((lineno, record))
+            game = record.get('game')
+            session = record.get('session')
+            sequence = record.get('sequence')
+            if (isinstance(game, str) and game and
+                    isinstance(session, str) and session and
+                    isinstance(sequence, int) and not isinstance(sequence, bool) and
+                    sequence > 0):
+                session_records[(game, session)].append(
+                    (sequence, lineno, record))
+            else:
+                independent_records.append((lineno, record))
+
+    # Preserve the original duplicate-reference audit even when cumulative
+    # session records later avoid per-file verification.
+    referenced = set()
+    for _, record in all_v2_records:
+        _, _, ref = snapshot_fields(record)
+        if ref is not None:
+            if ref in referenced:
+                audit['duplicate_refs'] += 1
+            else:
+                referenced.add(ref)
+
+    # A valid runtime session has unique, monotonically increasing sequence
+    # numbers in append order.  Anything else is treated independently rather
+    # than assuming the producer's cumulative-snapshot contract.
+    candidate_groups = []
+    for records in session_records.values():
+        append_order = [sequence for sequence, _, _ in records]
+        if (len(set(append_order)) != len(append_order) or
+                append_order != sorted(append_order)):
+            independent_records.extend((lineno, record)
+                                       for _, lineno, record in records)
+        else:
+            candidate_groups.append(list(reversed(records)))
+    candidate_groups.extend([[(0, lineno, record)]
+                             for lineno, record in independent_records])
+
+    for candidates in candidate_groups:
+        # Metadata is not itself proof that a hand-written v2 producer is
+        # cumulative.  Parse (but do not FNV-hash) the older entry lists and
+        # skip them only when the newest verified set demonstrably contains
+        # every one.  Otherwise the original per-record verifier below runs.
+        collapse_metadata_valid = all(
+            re.fullmatch(r'[0-9A-F]{16}', snapshot_fields(record)[1])
+            for _, _, record in candidates)
+        if len(candidates) > 1 and collapse_metadata_valid:
+            _, _, newest_record = candidates[0]
+            newest_path, newest_expected, newest_ref = snapshot_fields(newest_record)
+            if (newest_path is not None and newest_ref not in seen_refs and
+                    os.path.isfile(newest_path) and newest_expected):
+                try:
+                    # Hash and parse one byte buffer.  Reopening between those
+                    # operations would permit a replacement-file TOCTOU.
+                    newest_bytes = read_snapshot_bytes(newest_path)
+                    if newest_expected != '%016X' % _fnv64_bytes(newest_bytes):
+                        raise ValueError('snapshot signature mismatch')
+                    newest_entries = entries_from_bytes(newest_bytes)
+                    verified_probe[newest_ref] = newest_entries
+                    cumulative = True
+                    unverified_limit = min(
+                        MAX_UNVERIFIED_SNAPSHOT_BYTES,
+                        max(1024 * 1024, len(newest_bytes) * 2))
+                    group_unverified_bytes = 0
+                    for _, _, older_record in candidates[1:]:
+                        older_path, _, _ = snapshot_fields(older_record)
+                        if older_path is None or not os.path.isfile(older_path):
+                            cumulative = False
+                            break
+                        remaining = (MAX_UNVERIFIED_TOTAL_BYTES -
+                                     unverified_bytes_read)
+                        if remaining <= 0:
+                            cumulative = False
+                            break
+                        older_bytes = read_snapshot_bytes(
+                            older_path, min(unverified_limit, remaining))
+                        unverified_bytes_read += len(older_bytes)
+                        group_unverified_bytes += len(older_bytes)
+                        if not entries_from_bytes(older_bytes).issubset(newest_entries):
+                            cumulative = False
+                            break
+                except Exception:
+                    cumulative = False
+                if cumulative:
+                    seen_refs.add(newest_ref)
+                    entries.update(newest_entries)
+                    audit['verified_snapshots'] += 1
+                    audit['unverified_superseded_records'] += len(candidates) - 1
+                    audit['unverified_superseded_bytes'] += group_unverified_bytes
+                    continue
+        for _, lineno, record in candidates:
+            snapshot, expected, ref = snapshot_fields(record)
+            if snapshot is None:
                 audit['invalid_records'] += 1
                 continue
-            if not os.path.isabs(snapshot):
-                snapshot = os.path.join(os.path.dirname(path), snapshot)
-            snapshot = os.path.abspath(snapshot)
-            ref = (os.path.normcase(snapshot), expected)
             if ref in seen_refs:
-                audit['duplicate_refs'] += 1
                 continue
             seen_refs.add(ref)
-            if (not os.path.isfile(snapshot) or not expected or
-                    expected != '%016X' % _fnv64_file(snapshot)):
+            if not os.path.isfile(snapshot) or not expected:
                 print(f'  warn: ignoring missing/mismatched snapshot on line '
                       f'{lineno}: {snapshot}')
                 audit['invalid_records'] += 1
                 continue
             try:
-                with open(snapshot, encoding='utf-8') as source:
-                    add_captures(json.load(source))
+                snapshot_entries = verified_probe.pop(ref, None)
+                if snapshot_entries is None:
+                    snapshot_bytes = read_snapshot_bytes(snapshot)
+                    if expected != '%016X' % _fnv64_bytes(snapshot_bytes):
+                        raise ValueError('snapshot signature mismatch')
+                    snapshot_entries = entries_from_bytes(snapshot_bytes)
+                entries.update(snapshot_entries)
             except Exception as exc:
-                print(f'  warn: ignoring unreadable snapshot on line {lineno} '
+                print(f'  warn: ignoring unreadable/mismatched snapshot on line {lineno} '
                       f'({exc})')
                 audit['invalid_records'] += 1
                 continue
@@ -437,9 +581,16 @@ def main():
         md.append(f'- Sources: **{" + ".join(live_sources)}**')
         if a.addendum and 'live_addendum_audit' in report:
             aa = report['live_addendum_audit']
-            md.append(f'- Verified immutable snapshots: '
+            md.append(f'- FNV-verified immutable snapshots: '
                       f'**{aa["verified_snapshots"]}**; invalid records: '
                       f'**{aa["invalid_records"]}**')
+            if aa.get('unverified_superseded_records'):
+                unverified_mib = (aa.get('unverified_superseded_bytes', 0) /
+                                  (1024 * 1024))
+                md.append('- Superseded session snapshots **not FNV-verified** '
+                          '(their parsed entry sets were subsets of a verified '
+                          f'head): **{aa["unverified_superseded_records"]}** '
+                          f'({unverified_mib:.1f} MiB parsed under bounds)')
         md.append(f'- Dispatch entries exercised: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
