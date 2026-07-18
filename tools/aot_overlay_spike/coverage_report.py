@@ -20,7 +20,7 @@ Recall is reported at three strengths:
 Usage:
   coverage_report.py --static <static-cache-dir> --vault <vault-cache-dir>
                      [--bios-dispatch <SCPHxxxx_dispatch.c>]
-                     [--captures <runtime_overlay_captures.json>]
+                     [--captures <runtime_overlay_captures.json>]...
                      [--addendum <overlay_captures.addendum.jsonl>]
                      [--prior-report <gaps.json> --assume-static-superset]
                      --out-md <path.md> --out-json <path.json> [--game <id>]
@@ -290,7 +290,8 @@ def main():
                     help='generated base-BIOS dispatch C; adds already-native BIOS '
                          'entries/ranges to separate combined metrics')
     ap.add_argument('--vault', help='played/coverage vault cache dir (.ranges)')
-    ap.add_argument('--captures', help='runtime overlay_captures.json (executed_pcs)')
+    ap.add_argument('--captures', action='append',
+                    help='runtime overlay_captures.json (repeat for multiple sessions)')
     ap.add_argument('--addendum', help='append-only runtime capture history (.jsonl)')
     ap.add_argument('--prior-report', help='roll forward a persisted live gap set')
     ap.add_argument('--assume-static-superset', action='store_true',
@@ -404,9 +405,15 @@ def main():
 
     live = set()
     live_sources = []
-    if a.captures and os.path.exists(a.captures):
-        live.update(parse_captures_executed(a.captures))
-        live_sources.append('latest capture')
+    capture_source_count = 0
+    for captures_path in a.captures or []:
+        if os.path.exists(captures_path):
+            live.update(parse_captures_executed(captures_path))
+            capture_source_count += 1
+    if capture_source_count:
+        live_sources.append(
+            f'{capture_source_count} capture file'
+            f'{"s" if capture_source_count != 1 else ""}')
     if a.addendum and os.path.exists(a.addendum):
         addendum_entries, addendum_audit = parse_addendum_entries(a.addendum)
         live.update(addendum_entries)

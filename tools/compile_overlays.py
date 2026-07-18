@@ -356,6 +356,29 @@ def _parse_addr_list(values) -> set[int]:
     return out
 
 
+def optional_enrichment_fallback_capture(cap: dict) -> dict | None:
+    """Return a conservative retry recipe declared by a static extractor.
+
+    The richer recipe is always attempted first.  If its generated C or host
+    compile is rejected, these independently proven roots preserve the safe
+    shard while all optional aliases and normal-mode discoveries are dropped.
+    """
+    key = 'optional_enrichment_fallback_entry_pcs'
+    entries = sorted(_parse_addr_list(cap.get(key, [])))
+    if not entries:
+        return None
+    encoded = [f'0x{entry:08X}' for entry in entries]
+    fallback = dict(cap)
+    fallback['function_entry_pcs'] = encoded
+    fallback['dispatch_entry_pcs'] = encoded
+    fallback['static_discovery_entry_pcs'] = encoded
+    fallback['seeds'] = encoded
+    fallback.pop('static_alias_ranges', None)
+    fallback.pop('_prior_aliases', None)
+    fallback.pop(key, None)
+    return fallback
+
+
 def _word_at(data: bytes, load_addr: int, addr: int):
     off = addr - load_addr
     if off < 0 or off + 4 > len(data):
@@ -2657,6 +2680,13 @@ def main():
                 with open(debug_c, 'w') as f:
                     f.write(src)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
+                    fallback = optional_enrichment_fallback_capture(cap)
+                    if fallback is not None:
+                        print('  OPTIONAL ENRICHMENT AUDIT REJECTED; '
+                              'retrying direct-call roots only\n')
+                        _do_capture(fallback, region_coverage_cache,
+                                    interior_frag_jobs, stats)
+                        return
                     print('  GENERATED-C AUDIT FAILED\n')
                     stats.add_fail(_label, 'audit',
                                    f'{len(c_audit["unknown_bad"])} unknown_bad, '
@@ -2735,6 +2765,13 @@ def main():
                         stats.add_fail(_label, 'no_ranges',
                                        'DLL built but no _full.ranges (undispatchable)')
                 else:
+                    fallback = optional_enrichment_fallback_capture(cap)
+                    if fallback is not None:
+                        print('  OPTIONAL ENRICHMENT COMPILE REJECTED; '
+                              'retrying direct-call roots only\n')
+                        _do_capture(fallback, region_coverage_cache,
+                                    interior_frag_jobs, stats)
+                        return
                     print(f'  FAILED\n')
                     stats.add_fail(_label, 'compile',
                                    'gcc/tcc compile failed (see COMPILE ERROR above)')

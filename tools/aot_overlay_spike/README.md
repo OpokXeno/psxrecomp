@@ -81,6 +81,8 @@ For a live-recall scoreboard that survives individual launches, pass the same
 history to `coverage_report.py --addendum ...`. It unions only dispatch/function
 entries from every verified snapshot, so the report no longer depends on which
 latest capture happened to be present when it ran.
+For existing corpora that predate the addendum, `--captures` is repeatable; all
+named snapshots are unioned into one live-history denominator.
 
 PS-X EXE extraction records normal-mode discovery provenance separately from
 generic function-pointer candidates. `compile_overlays.py` promotes only those
@@ -208,13 +210,22 @@ about 0.25 seconds on the validation machine.
 code. Its members independently vote three link bases (`0x800E9060`,
 `0x800F9800`, `0x801E9800`). A base is trusted only after at least two members
 produce a sharp >=8-vote, >=2x jal-to-prologue peak; siblings need at least two
-votes for that exact consensus. Mixed archive members use **direct-JAL roots
-only**. A broader pointer-table experiment compiled 24/31 but correctly failed
-seven generated-C audits; removing those speculative roots produced
-`PSX_SHARD_RESULT ok=31 failed=0 skipped=0` (30 members + BIOS resident). Against
-the union of 16 legacy MMX6 capture files this first conservative pass covers
-71.8% of entries by combined native code range. The remaining gap is discovery
-inside byte-proven members, not container enumeration.
+votes for that exact consensus. Mixed archive members retain **direct-JAL roots**
+as their conservative recipe. Normal-mode discovery may additionally contribute
+decoder-classified entries and exact overlapping alias ranges. This enrichment
+is explicitly optional: `compile_overlays.py` attempts it first, but any
+generated-C audit or host-compiler rejection retries the exact same bytes with
+direct-call roots only. A rejected recipe never contributes a DLL or a failure
+to the final cache.
+
+The validation compile produced `PSX_SHARD_RESULT ok=31 failed=0 skipped=0`
+(30 members + BIOS resident); unsafe enrichment fell back while clean members
+retained broad ranges. Against the union of 16 legacy MMX6 capture files, overlay
+code-range recall rose from the direct-only **71.8%** baseline to **93.9%**
+(636/677). Every one of the remaining 41 PCs is in the BIOS/kernel window;
+including the separately recompiled, live-byte-guarded base BIOS raises combined
+native code-range recall to **100.0%** (677/677). Validation used only disposable
+`%TEMP%` caches.
 
 Ape Escape's `KKIIDDZZ.HED` encodes contiguous
 `size_sectors:12 | logical_sector:20` runs spanning sibling DAT then BNS files.

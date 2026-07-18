@@ -114,6 +114,34 @@ def check_static_alias_recipe():
         (LOAD + 0x20, LOAD, LOAD + 0x2C)}
 
 
+def check_optional_enrichment_fallback():
+    direct = LOAD + 0x20
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'function_entry_pcs': [f'0x{LOAD:08X}', f'0x{direct:08X}'],
+        'dispatch_entry_pcs': [f'0x{LOAD:08X}', f'0x{direct:08X}'],
+        'static_discovery_entry_pcs': [f'0x{direct:08X}'],
+        'seeds': [f'0x{LOAD:08X}', f'0x{direct:08X}'],
+        'static_alias_ranges': [{
+            'entry': f'0x{direct:08X}',
+            'start': f'0x{LOAD:08X}',
+            'end': f'0x{LOAD + 0x2C:08X}',
+        }],
+        '_prior_aliases': [(direct, LOAD, LOAD + 0x2C)],
+        'optional_enrichment_fallback_entry_pcs': [f'0x{direct:08X}'],
+    }
+    fallback = MOD.optional_enrichment_fallback_capture(cap)
+    encoded = [f'0x{direct:08X}']
+    assert fallback['function_entry_pcs'] == encoded
+    assert fallback['dispatch_entry_pcs'] == encoded
+    assert fallback['static_discovery_entry_pcs'] == encoded
+    assert fallback['seeds'] == encoded
+    assert 'static_alias_ranges' not in fallback
+    assert '_prior_aliases' not in fallback
+    assert 'optional_enrichment_fallback_entry_pcs' not in fallback
+    assert MOD.optional_enrichment_fallback_capture(fallback) is None
+
+
 def check_forward_branch_root():
     data = bytearray(0x80)
     target = LOAD + 0x40
@@ -245,6 +273,7 @@ def main():
     check_composite_call_boundaries()
     check_static_discovery_provenance()
     check_static_alias_recipe()
+    check_optional_enrichment_fallback()
     check_forward_branch_root()
     check_recompiler_composite_contract(args.recompiler)
     check_retained_alias_contract(args.recompiler)

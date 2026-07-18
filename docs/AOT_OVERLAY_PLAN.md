@@ -32,10 +32,14 @@ continue to fail safely to the interpreter.
 - Link bases are not guessed from title constants. Multiple independent members
   must anchor one sharp jal/prologue consensus; a sibling then needs at least two
   votes for that exact trusted base.
-- Mixed archive members seed only locally callable direct-JAL targets. The first
-  MMX6 pointer-table expansion demonstrated why: seven variants hit the generated-C
-  unsupported-instruction audit. Direct-only roots compile all 30 members cleanly,
-  plus the exact-hash BIOS resident shard.
+- Mixed archive members keep locally callable direct-JAL targets as a conservative
+  retry recipe. Normal-mode entries and exact aliases are optional enrichment:
+  generated-C audit or GCC rejection automatically retries the same byte-proven
+  member with direct roots only. The final disposable MMX6 build compiled all 30
+  members plus the BIOS resident shard (`ok=31 failed=0 skipped=0`). Across 16
+  legacy capture files it covers 636/677 entries by overlay code range (93.9%);
+  all 41 residual gaps are BIOS/kernel PCs, and the separately recompiled base
+  BIOS raises combined native code-range recall to 677/677 (100.0%).
 - Ape's two PS-X EXE mirrors are deduplicated in favor of the self-describing EXE
   producer. Its remaining 44 HED/BNS members plus two minigame EXEs and the BIOS
   recipe are also audit-clean in a disposable cache.

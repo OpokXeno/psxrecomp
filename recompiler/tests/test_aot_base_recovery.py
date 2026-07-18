@@ -38,6 +38,14 @@ def main():
     struct.pack_into("<I", data, 4, 0x0C000000 | ((0x80105678 >> 2) & 0x03FFFFFF))
     assert MOD.jal_targets(data) == {0x80105678}
 
+    wrapped = MOD.make_psx_exe(b'\x11\x22\x33\x44', 0x80102000,
+                               0x80102040)
+    assert wrapped[:8] == b'PS-X EXE'
+    assert struct.unpack_from('<III', wrapped, 0x10) == (
+        0x80102040, 0, 0x80102000)
+    assert struct.unpack_from('<I', wrapped, 0x1C)[0] == 4
+    assert wrapped[0x800:] == b'\x11\x22\x33\x44'
+
     # Psy-Q may schedule a global load before allocating the stack frame.  The
     # exact function starts immediately after the previous return, not at the
     # otherwise recognizable addiu-sp instruction eight bytes later.

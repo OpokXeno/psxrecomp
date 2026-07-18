@@ -432,6 +432,20 @@ def page_aligned_region(base, data):
 def is_psx_exe(data):
     return len(data) >= 0x20 and data[:8] == b'PS-X EXE'
 
+def make_psx_exe(body, load_addr, entry_pc):
+    """Wrap positioned bytes for normal-mode discovery only.
+
+    The wrapper is never emitted or loaded by the runtime. Its header merely
+    gives the recompiler the independently recovered link base and one locally
+    proven direct-call entry while preserving the member bytes verbatim.
+    """
+    header=bytearray(0x800)
+    header[:8]=b'PS-X EXE'
+    struct.pack_into('<I',header,0x10,entry_pc)
+    struct.pack_into('<I',header,0x18,load_addr)
+    struct.pack_into('<I',header,0x1C,len(body))
+    return bytes(header)+body
+
 def is_header_table(data):
     if len(data) < 8: return None
     cnt = struct.unpack_from('<I', data, 0)[0]
@@ -480,6 +494,21 @@ def full_discovery_seeds(data, recompiler, tmp):
     seeds,aliases=parse_full_discovery_ranges(lines)
     return (seeds,aliases) if seeds else (None,[])
 
+def full_discovery_output_audit_clean(data, tmp):
+    """Fail closed when normal mode emitted any unsupported instruction TODO."""
+    out=os.path.join(tmp,f'disc_out_{binascii.crc32(data)&0xFFFFFFFF:08X}')
+    sources=[]
+    if os.path.isdir(out):
+        sources=[os.path.join(out,name) for name in os.listdir(out)
+                 if name.endswith('.c') and '_full' in name]
+    if not sources:
+        return False
+    for path in sources:
+        with open(path,errors='ignore') as f:
+            if re.search(r'TODO:[^\n]*?0x[0-9A-Fa-f]{8}:',f.read()):
+                return False
+    return True
+
 def filter_full_discovery_seeds(body, base, candidates, declared_entry):
     """Quarantine normal mode's unproven image-body fallback entry.
 
@@ -494,6 +523,38 @@ def filter_full_discovery_seeds(body, base, candidates, declared_entry):
     """
     return sorted({addr for addr in candidates
                    if addr != base or addr == declared_entry})
+
+def enrich_positioned_member(member, recompiler, tmp):
+    """Add normal-mode entries/aliases to a consensus-positioned member.
+
+    Direct JAL targets established the member's link base and remain its only
+    hard roots. Normal mode contributes decoder-classified candidates and exact
+    overlapping alias recipes; the unproven image-start fallback is removed.
+    Downstream overlay compilation still re-walks and audits every emitted byte.
+    """
+    body=member['data']; base=member['base']
+    direct=member['direct_seeds']
+    if not direct:
+        return member
+    wrapped=make_psx_exe(body,base,direct[0])
+    discovered,aliases=full_discovery_seeds(wrapped,recompiler,tmp)
+    if discovered is None or not full_discovery_output_audit_clean(wrapped,tmp):
+        out=dict(member)
+        out['normal_rejected']='normal generated-C audit'
+        return out
+    discovered=filter_full_discovery_seeds(
+        body,base,discovered,direct[0])
+    hi=base+len(body)
+    aliases=[alias for alias in aliases
+             if base <= alias[0] < hi and
+             base <= alias[1] < alias[2] <= hi and
+             alias[0] != base and
+             not any(alias[1] < root < alias[2] for root in direct)]
+    out=dict(member)
+    out['seeds']=sorted(set(discovered)|set(direct))
+    out['static_alias_ranges']=sorted(set(aliases))
+    out['normal_seed_count']=len(discovered)
+    return out
 
 def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
         static_discovery=None, static_alias_ranges=None):
@@ -788,13 +849,18 @@ def main():
             continue
 
         for member in recover_indexed_archive(data,raw_base_lo):
+            member=enrich_positioned_member(member,a.recompiler,tmp)
             base=member['base']; body=member['data']
             page_base,region=page_aligned_region(base,body)
             producer_lo=max(base,page_base)
             record=rec(
                 page_base,region,member['seeds'],
                 producer_ranges=((producer_lo,base+len(body)),),
-                static_discovery=member['direct_seeds'])
+                static_discovery=member['direct_seeds'],
+                static_alias_ranges=member.get('static_alias_ranges'))
+            if member.get('normal_seed_count'):
+                record['optional_enrichment_fallback_entry_pcs'] = [
+                    f"0x{addr:08X}" for addr in member['direct_seeds']]
             record['producer_name']=(
                 f"{p}:member_{member['id']:04X}@{member['file_offset']:08X}")
             records.append(record)
@@ -804,6 +870,9 @@ def main():
                   f"@0x{base:08X}, region@0x{page_base:08X}, "
                   f"trusted-fit={member['score']}:{member['runner']}, "
                   f"direct seeds={len(member['direct_seeds'])}, "
+                  f"normal seeds={member.get('normal_seed_count',0)}, "
+                  f"aliases={len(member.get('static_alias_ranges',()))}, "
+                  f"normal reject={member.get('normal_rejected','none')}, "
                   f"total seeds={len(member['seeds'])}")
 
     for group in hed_groups:
