@@ -19,6 +19,7 @@ Recall is reported at three strengths:
 
 Usage:
   coverage_report.py --static <static-cache-dir> --vault <vault-cache-dir>
+                     [--bios-dispatch <SCPHxxxx_dispatch.c>]
                      [--captures <runtime_overlay_captures.json>]
                      [--prior-report <gaps.json> --assume-static-superset]
                      --out-md <path.md> --out-json <path.json> [--game <id>]
@@ -35,6 +36,15 @@ def region_of(a):
     """Page-region label for grouping (aligns to the overlay window bases)."""
     return norm(a) & 0xFFFFF000
 
+def merge_intervals(intervals):
+    merged = []
+    for lo, hi in sorted(intervals):
+        if not merged or lo > merged[-1][1]:
+            merged.append([lo, hi])
+        elif hi > merged[-1][1]:
+            merged[-1][1] = hi
+    return [(lo, hi) for lo, hi in merged]
+
 def parse_ranges_dir(d):
     """Return ({entry_masked: code_crc}, merged compiled-code intervals)."""
     ent = {}
@@ -49,13 +59,53 @@ def parse_ranges_dir(d):
             if m:
                 lo = norm(int(m.group(1), 16))
                 intervals.append((lo, lo + int(m.group(2), 16)))
-    merged = []
-    for lo, hi in sorted(intervals):
-        if not merged or lo > merged[-1][1]:
-            merged.append([lo, hi])
-        elif hi > merged[-1][1]:
-            merged[-1][1] = hi
-    return ent, [(lo, hi) for lo, hi in merged]
+    return ent, merge_intervals(intervals)
+
+def _c_initializer(text, declaration_pattern):
+    """Return the braced initializer following a unique C declaration."""
+    match = re.search(declaration_pattern, text)
+    if not match:
+        raise ValueError(f'missing generated-C declaration: {declaration_pattern}')
+    start = text.find('{', match.end())
+    if start < 0:
+        raise ValueError('generated-C declaration has no initializer')
+    depth = 0
+    for pos in range(start, len(text)):
+        if text[pos] == '{':
+            depth += 1
+        elif text[pos] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:pos]
+    raise ValueError('unterminated generated-C initializer')
+
+def parse_bios_dispatch(path):
+    """Return base-BIOS dispatch entries and relocated kernel body ranges.
+
+    The generated dispatcher has many unrelated numeric initializers, so parse
+    only the two named tables instead of matching address triples globally.
+    """
+    with open(path, encoding='utf-8', errors='ignore') as generated:
+        text = generated.read()
+    dispatch = _c_initializer(
+        text, r'\bDispatchEntry\s+dispatch_table\s*\[[^]]*\]\s*=')
+    bodies = _c_initializer(
+        text, r'\bPsxKernelBody\s+psx_bios_kernel_bodies\s*\[[^]]*\]\s*=')
+    entries = {
+        norm(int(value, 16))
+        for value in re.findall(
+            r'\{\s*0x([0-9A-Fa-f]+)u?\s*,\s*func_[0-9A-Fa-f]+\s*\}', dispatch)
+    }
+    intervals = []
+    for _, lo, hi in re.findall(
+            r'\{\s*0x([0-9A-Fa-f]+)u?\s*,\s*'
+            r'0x([0-9A-Fa-f]+)u?\s*,\s*0x([0-9A-Fa-f]+)u?\s*\}', bodies):
+        lo, hi = norm(int(lo, 16)), norm(int(hi, 16))
+        if hi > lo:
+            intervals.append((lo, hi))
+    if not entries or not intervals:
+        raise ValueError('generated BIOS dispatcher contained an empty static table')
+    return entries, merge_intervals(intervals)
 
 def parse_captures_executed(path):
     """-> set of FUNCTION-ENTRY addrs (masked) the runtime dispatched to.
@@ -101,6 +151,9 @@ def group_by_region(addrs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--static', required=True, help='static shard cache dir (.ranges)')
+    ap.add_argument('--bios-dispatch',
+                    help='generated base-BIOS dispatch C; adds already-native BIOS '
+                         'entries/ranges to separate combined metrics')
     ap.add_argument('--vault', help='played/coverage vault cache dir (.ranges)')
     ap.add_argument('--captures', help='runtime overlay_captures.json (executed_pcs)')
     ap.add_argument('--prior-report', help='roll forward a persisted live gap set')
@@ -116,6 +169,18 @@ def main():
 
     static_ent, static_ranges = parse_ranges_dir(a.static)
     report = {'game': a.game, 'static_entries': len(static_ent), 'sources': {}}
+    combined_ent = dict(static_ent)
+    combined_ranges = static_ranges
+    if a.bios_dispatch:
+        try:
+            bios_ent, bios_ranges = parse_bios_dispatch(a.bios_dispatch)
+        except (OSError, ValueError) as exc:
+            ap.error(f'cannot parse --bios-dispatch: {exc}')
+        combined_ent.update({entry: None for entry in bios_ent})
+        combined_ranges = merge_intervals(static_ranges + bios_ranges)
+        report['bios_dispatch'] = a.bios_dispatch
+        report['bios_static_entries'] = len(bios_ent)
+        report['bios_static_ranges'] = len(bios_ranges)
 
     md = []
     md.append(f'# AOT static-coverage recall — {a.game}\n')
@@ -123,6 +188,11 @@ def main():
               'extractor reproduce, and how much lies in compiled static code?_\n')
     md.append(f'- Static shard cache: `{a.static}`')
     md.append(f'- Static manifest entries: **{len(static_ent)}**\n')
+    if a.bios_dispatch:
+        md.append(f'- Base BIOS native dispatch entries: **{len(bios_ent)}**; '
+                  f'relocated kernel body ranges: **{len(bios_ranges)}**')
+        md.append('- Combined metrics below count both the play-free overlay cache '
+                  'and the separately generated, live-byte-guarded base BIOS.\n')
 
     if a.vault:
         vault_ent, _ = parse_ranges_dir(a.vault)
@@ -132,6 +202,13 @@ def main():
         report['vault_misses'] = [f'0x{x|0x80000000:08X}' for x in r['misses']]
         report['vault_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in r['range_misses']]
+        combined = None
+        if a.bios_dispatch:
+            combined = recall(set(vault_ent), combined_ent, combined_ranges)
+            report['sources']['vault_combined_bios'] = {
+                k: v for k, v in combined.items() if k not in ('misses', 'range_misses')}
+            report['vault_combined_range_misses'] = [
+                f'0x{x|0x80000000:08X}' for x in combined['range_misses']]
         md.append('## vs played vault (most complete needed-set)\n')
         md.append(f'- Manifest entries in the full-playthrough vault: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
@@ -149,6 +226,24 @@ def main():
         md.append(f'- **MISSED exact entries: {r["missed"]}**')
         md.append(f'- **TRUE CODE-RANGE GAPS: {r["missed_code_range"]}** played '
                   'entry PCs outside all compiled static ranges\n')
+        if combined:
+            md.append('### Combined with base recompiled BIOS\n')
+            md.append(f'- Exact native dispatch entries: **{combined["covered_here"]}** '
+                      f'(**{combined["recall_entry"]*100:.1f}%**)')
+            md.append(f'- Covered by native code ranges: '
+                      f'**{combined["covered_by_code_range"]}** '
+                      f'(**{combined["recall_code_range"]*100:.1f}%**)')
+            md.append(f'- **COMBINED CODE-RANGE GAPS: '
+                      f'{combined["missed_code_range"]}**\n')
+            md.append('#### Combined gaps grouped by region\n')
+            for reg, addrs in group_by_region(combined['range_misses']).items():
+                md.append(f'- region `0x{reg|0x80000000:08X}`: {len(addrs)} misses')
+                md.append('  ```')
+                for i in range(0, len(addrs), 8):
+                    md.append('  ' + ' '.join(
+                        f'{x|0x80000000:08X}' for x in addrs[i:i+8]))
+                md.append('  ```')
+            md.append('')
         md.append('### Code-range gaps grouped by overlay region\n')
         for reg, addrs in group_by_region(r['range_misses']).items():
             md.append(f'- region `0x{reg|0x80000000:08X}`: {len(addrs)} misses')
@@ -166,6 +261,13 @@ def main():
         report['live_misses'] = [f'0x{x|0x80000000:08X}' for x in r['misses']]
         report['live_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in r['range_misses']]
+        combined = None
+        if a.bios_dispatch:
+            combined = recall(live, combined_ent, combined_ranges)
+            report['sources']['live_session_combined_bios'] = {
+                k: v for k, v in combined.items() if k not in ('misses', 'range_misses')}
+            report['live_combined_range_misses'] = [
+                f'0x{x|0x80000000:08X}' for x in combined['range_misses']]
         md.append('## vs live session captures (this drive)\n')
         md.append(f'- Dispatch entries this session exercised: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
@@ -173,6 +275,10 @@ def main():
         md.append(f'- Covered by compiled static code ranges: '
                   f'**{r["covered_by_code_range"]}** '
                   f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
+        if combined:
+            md.append(f'- Including base BIOS native code ranges: '
+                      f'**{combined["covered_by_code_range"]}** '
+                      f'(**{combined["recall_code_range"]*100:.1f}%**)')
         md.append(f'- **MISSED live: {r["missed"]}**\n')
     elif a.prior_report:
         with open(a.prior_report, encoding='utf-8') as prior_in:
@@ -204,6 +310,29 @@ def main():
         report['live_misses'] = [f'0x{x|0x80000000:08X}' for x in sorted(miss)]
         report['live_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in sorted(range_miss)]
+        combined = None
+        if a.bios_dispatch:
+            combined_miss = old_miss - set(combined_ent)
+            combined_starts = [lo for lo, _ in combined_ranges]
+            def in_combined_range(entry):
+                i = bisect.bisect_right(combined_starts, entry) - 1
+                return i >= 0 and entry < combined_ranges[i][1]
+            combined_range_miss = {
+                entry for entry in old_miss if not in_combined_range(entry)}
+            combined_covered = needed - len(combined_miss)
+            combined = {
+                'needed': needed,
+                'covered_here': combined_covered,
+                'missed': len(combined_miss),
+                'recall_entry': (combined_covered/needed if needed else 0.0),
+                'covered_by_code_range': needed - len(combined_range_miss),
+                'missed_code_range': len(combined_range_miss),
+                'recall_code_range': (
+                    (needed - len(combined_range_miss))/needed if needed else 0.0),
+                'provenance': r['provenance']}
+            report['sources']['live_session_combined_bios'] = combined
+            report['live_combined_range_misses'] = [
+                f'0x{x|0x80000000:08X}' for x in sorted(combined_range_miss)]
         md.append('## vs persisted live-session gaps (monotonic roll-forward)\n')
         md.append(f'- Dispatch entries the persisted session exercised: **{needed}**')
         md.append(f'- Discovered by current static: **{covered}** '
@@ -211,6 +340,10 @@ def main():
         md.append(f'- Covered by current static code ranges: '
                   f'**{r["covered_by_code_range"]}** '
                   f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
+        if combined:
+            md.append(f'- Including base BIOS native code ranges: '
+                      f'**{combined["covered_by_code_range"]}** '
+                      f'(**{combined["recall_code_range"]*100:.1f}%**)')
         md.append(f'- **MISSED live: {len(miss)}**')
         md.append('- Provenance: caller explicitly asserted that the current static '
                   'entry set retains every prior static entry.\n')

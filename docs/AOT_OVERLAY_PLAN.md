@@ -149,6 +149,12 @@ explicit assertion is required because an old gap
 manifest stores misses, not every previously covered entry; silently assuming
 monotonicity would make a regressed static set look healthier than it is.
 
+The base BIOS recompiler is a separate static producer. When its generated
+dispatcher is available, pass `--bios-dispatch <SCPHxxxx_dispatch.c>` so the
+scoreboard preserves overlay-cache-only recall and also reports combined native
+coverage from the dispatch table plus guarded relocated-kernel body ranges. Do not
+manufacture overlay shards merely to duplicate those already-native BIOS bodies.
+
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
    `_walk_overlay_function`) with a strict callable-prologue gate; interior/

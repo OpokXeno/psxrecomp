@@ -130,7 +130,11 @@ one-entry fragments at consecutive instructions, while static AOT emits one broa
 function with the same PCs in its guarded `R` ranges. Exact-entry parity is retained
 for continuity; code-range recall is the useful uncovered-code roadmap. At the
 current Tomba 2 checkpoint these are 1270/1856 (68.4%) exact entries and 1811/1856
-(97.6%) code-range coverage. All 45 remaining code-range gaps are in low/kernel RAM.
+(97.6%) overlay-cache code-range coverage. Pass the generated base BIOS dispatcher
+with `--bios-dispatch generated/SCPH1001_dispatch.c` to report separate combined
+metrics. The base recompiler already covers relocated kernel bodies with a live-byte
+guard; including it raises Tomba 2 to 1852/1856 (99.8%) native code-range coverage.
+This avoids generating duplicate overlay shards for code that is already native.
 
 ## Next to raise coverage (future session)
 
@@ -147,6 +151,10 @@ current Tomba 2 checkpoint these are 1270/1856 (68.4%) exact entries and 1811/18
    A09/A0J/OPN; GAME's 8-byte near-tie resolves through the exact base independently
    proved by DEMO. The played vault byte-proves GAME at 0x80106228. Ambiguous files
    without one unique trusted match still fail closed.
-4. Extract the kernel `0x80000000` region once from the BIOS (game-independent):
+4. ~~Extract the kernel `0x80000000` region once from the BIOS~~ â€” NOT NEEDED for
+   the measured body gaps. The base BIOS recompiler already emits 499 relocated,
+   guarded kernel bodies. Of the four combined gaps, A0/B0/C0 are tiny installed
+   vector thunks and EE7C is an all-zero runtime-fragment artifact; keep the latter
+   interpreted rather than treating padding/data as code.
    this is now the complete 45-PC Tomba 2 code-range gap set.
 5. Generalize into a real `tools/` producer (no hardcoded paths; disc + game.toml in).
