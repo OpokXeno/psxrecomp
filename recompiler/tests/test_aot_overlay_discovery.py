@@ -73,6 +73,23 @@ def check_composite_call_boundaries():
     assert cross_target in scoped['direct_jals']
 
 
+def check_static_discovery_provenance():
+    data = bytearray(0x80)
+    entry = LOAD + 0x20
+    put(data, 0x20, 0x30620008)  # andi v0,v1,8 -- frameless body
+    put(data, 0x24, 0x03E00008)
+    put(data, 0x28, 0x00000000)
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'function_entry_pcs': [f'0x{entry:08X}'],
+        'static_discovery_entry_pcs': [f'0x{entry:08X}'],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    assert f'call_root 0x{entry:08X}' in seeds
+    assert audit['included_reasons'][entry] == 'STATIC_DISCOVERY_ROOT'
+
+
 def check_padded_return_boundary(recompiler):
     # Exact-entry mode re-verifies every untrusted seed. Psy-Q aligns frameless
     # leaves with NOPs after the prior function's JR delay slot; those NOPs must
@@ -138,6 +155,38 @@ def check_recompiler_composite_contract(recompiler):
         assert f"void func_{target:08X}" in generated(True)
 
 
+def check_retained_alias_contract(recompiler):
+    # A previously compiled indirect entry retains its overlapping host body
+    # without becoming a root that caps the newly discovered ordinary walk.
+    data = bytearray(0x80)
+    put(data, 0x00, 0x03E00008)
+    put(data, 0x04, 0x00000000)
+    put(data, 0x20, 0x24020001)
+    put(data, 0x24, 0x03E00008)
+    put(data, 0x28, 0x00000000)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, "retained_alias.psx")
+        seeds = os.path.join(tmp, "seeds.txt")
+        out = os.path.join(tmp, "out")
+        with open(psx, "wb") as f:
+            f.write(make_psxexe(LOAD, data))
+        with open(seeds, "w", encoding="utf-8") as f:
+            f.write(f"0x{LOAD:08X}\n")
+            f.write(
+                f"retained_alias 0x{LOAD + 0x20:08X} "
+                f"0x{LOAD:08X} 0x{LOAD + 0x2C:08X}\n")
+        result = subprocess.run(
+            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr or result.stdout
+        full = ''.join(path.read_text() for path in pathlib.Path(out).glob("*_full*.c"))
+        assert f"void func_{LOAD + 0x20:08X}" in full
+        ranges = next(pathlib.Path(out).glob("*_full.ranges")).read_text()
+        assert f"F {LOAD + 0x20:08X}" in ranges
+        assert f"R {LOAD:08X} 2C" in ranges
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -147,7 +196,9 @@ def main():
         raise SystemExit(f"recompiler not found: {args.recompiler}")
 
     check_composite_call_boundaries()
+    check_static_discovery_provenance()
     check_recompiler_composite_contract(args.recompiler)
+    check_retained_alias_contract(args.recompiler)
 
     data = bytearray(0x200)
 

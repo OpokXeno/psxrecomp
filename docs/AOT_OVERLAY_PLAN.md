@@ -150,6 +150,9 @@ references with `coverage_vault.py compact-addendum --addendum ...
 --persist-dir ...`. The tool verifies every valid record against its exact
 immutable snapshot before atomically replacing the addendum, and leaves the
 source untouched if any snapshot is missing or mismatched.
+`coverage_report.py --addendum ...` streams those verified history snapshots and
+unions their dispatch/function entries into the live scoreboard, preserving
+cross-launch recall without loading their game bytes into the static needed set.
 
 The recall scoreboard can roll a persisted live gap set forward after a verified
 monotonic static expansion with
@@ -178,6 +181,9 @@ manufacture overlay shards merely to duplicate those already-native BIOS bodies.
 4. Per-function identity = CRC32 over its exact compiled code ranges. Output:
    `<phys>_<region_crc>.dll` + a `.ranges` manifest (`F <entry> <code_crc>` /
    `R <entry> <len>`).
+   Rebuilding identical region bytes also imports prior overlapping alias groups
+   as non-root `retained_alias` bodies. This makes discovery additive: newly
+   proven frameless roots cannot hard-cap and erase an older indirect-entry body.
 5. `--static` mode instead namespaces the C and folds variants into
    `overlays_static.c` linked directly into the binary, dispatched via a generated
    `psx_overlay_dispatch()` — **this is already an AOT delivery path**; it moves

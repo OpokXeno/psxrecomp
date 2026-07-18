@@ -245,7 +245,8 @@ def full_discovery_seeds(data, recompiler, tmp):
                 a=int(m.group(1),16); seeds.add(a if a>=0x80000000 else (0x80000000|a))
     return sorted(seeds) or None
 
-def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None):
+def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
+        static_discovery=None):
     # function_entry_pcs = prologue-scanned function starts (walk roots).
     # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
     # overlay's own export table). compile_overlays promotes clean starts to
@@ -262,6 +263,9 @@ def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None):
         out["producer_ranges"]=[
             {"start":f"0x{lo:08X}","end":f"0x{hi:08X}"}
             for lo,hi in producer_ranges]
+    if static_discovery:
+        out["static_discovery_entry_pcs"]=[
+            f"0x{addr:08X}" for addr in sorted(set(static_discovery))]
     return out
 
 def main():
@@ -304,6 +308,7 @@ def main():
             t_addr=struct.unpack_from('<I',data,0x18)[0]
             body=data[2048:]
             seeds_all=full_discovery_seeds(data, a.recompiler, tmp)
+            used_full_discovery=seeds_all is not None
             if seeds_all is None: seeds_all=prologues(body, t_addr)
             # split body into floor-clamped window regions
             base=t_addr & 0x1FFFFFFF
@@ -315,7 +320,9 @@ def main():
                 seg=body[lo-base:hi-base]
                 va=0x80000000|lo
                 sd=[x for x in seeds_all if lo<=(x&0x1FFFFFFF)<hi]
-                records.append(rec(va,seg,sd))
+                records.append(rec(
+                    va,seg,sd,
+                    static_discovery=sd if used_full_discovery else None))
             np+=1
             print(f"  [PS-X EXE] {p}: {len(body)}B @0x{0x80000000|base:08X}, full-disc seeds={len(seeds_all)}")
         else:

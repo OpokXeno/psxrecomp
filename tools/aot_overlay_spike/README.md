@@ -77,6 +77,18 @@ python tools/coverage_vault.py compact-addendum \
 The replacement is atomic and aborts without changing the addendum if any valid
 record lacks its exact immutable snapshot.
 
+For a live-recall scoreboard that survives individual launches, pass the same
+history to `coverage_report.py --addendum ...`. It unions only dispatch/function
+entries from every verified snapshot, so the report no longer depends on which
+latest capture happened to be present when it ran.
+
+PS-X EXE extraction records normal-mode discovery provenance separately from
+generic function-pointer candidates. `compile_overlays.py` promotes only those
+entries that also pass its local callable/CFG proof to trusted `call_root`s.
+When rebuilding identical bytes, prior overlapping alias groups are retained as
+non-root bodies, so stronger new roots add coverage without displacing already
+compiled indirect entries.
+
 ## Multi-game sweep findings (2026-07-17)
 
 `extract_generic.py` runs the improved extraction from a game.toml. Results:

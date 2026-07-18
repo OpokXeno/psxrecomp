@@ -282,6 +282,9 @@ INCLUDE_REASONS = {
     'DISPATCH_ENTRY',
     'DIRECT_JAL_TARGET',
     'STATIC_INDIRECT_TARGET',
+    # Play-free normal-mode discovery entry that also passes a target-local
+    # callable-boundary/CFG proof. Stronger than a generic captured pointer.
+    'STATIC_DISCOVERY_ROOT',
     'FUNCTION_POINTER_TARGET',
     'TOML_DECLARED_ENTRY',
     # Dispatch-proven PC with no callable boundary (mid-function code reached
@@ -822,6 +825,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                                                     legacy_seeds if not has_split_schema else [])))
     dispatch_entry_pcs = _parse_addr_list(cap.get('dispatch_entry_pcs', []))
     captured_function_entries = _parse_addr_list(cap.get('function_entry_pcs', []))
+    static_discovery_entries = _parse_addr_list(
+        cap.get('static_discovery_entry_pcs', []))
     toml_entries = _collect_toml_overlay_entries(toml_doc, load_addr, crc32)
     legacy_callable_seeds = {a for a in legacy_seeds
                              if region(a) and _callable_legacy_seed(data, load_addr, a)}
@@ -833,7 +838,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     # A dispatch into dirty RAM can land on a jump-table case label. That
     # proves coverage, not a callable function boundary, so discover those
     # labels before promoting dispatch entries to seeds.
-    pre_roots = set(legacy_callable_seeds) | set(captured_function_entries) | set(toml_entries)
+    pre_roots = (set(legacy_callable_seeds) | set(captured_function_entries) |
+                 set(static_discovery_entries) | set(toml_entries))
     pre_roots.update(a for a in dispatch_entry_pcs
                      if region(a) and _callable_legacy_seed(data, load_addr, a))
     jump_table_targets = set()
@@ -881,6 +887,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                 included.setdefault(addr, 'DISPATCH_INTERIOR')
                 return
         elif (reason not in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                             'STATIC_DISCOVERY_ROOT',
                              'TOML_DECLARED_ENTRY') and
                 addr in jump_table_targets and
                 not _callable_legacy_seed(data, load_addr, addr)):
@@ -889,7 +896,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         if reason in FATAL_SEED_REASONS:
             raise RuntimeError(f'BUG: refusing to include 0x{addr:08X} as {reason}')
         old = included.get(addr)
-        if reason in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET'):
+        if reason in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                      'STATIC_DISCOVERY_ROOT'):
             # Static call-edge evidence outranks heuristic capture metadata.
             included[addr] = reason
         elif old is None or old in ('FUNCTION_POINTER_TARGET', 'DISPATCH_INTERIOR'):
@@ -899,6 +907,16 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         include(addr, 'DISPATCH_ENTRY')
     for addr in captured_function_entries:
         include(addr, 'FUNCTION_POINTER_TARGET')
+    for addr in static_discovery_entries:
+        if not region(addr):
+            excluded[addr] = 'UNKNOWN'
+        elif (_callable_legacy_seed(data, load_addr, addr) or
+              _plausible_callable_target(data, load_addr, size, addr, hi)):
+            include(addr, 'STATIC_DISCOVERY_ROOT')
+        else:
+            # Preserve the weaker classification. Overlay mode will perform
+            # its ordinary boundary recheck and fail closed if needed.
+            include(addr, 'FUNCTION_POINTER_TARGET')
     for addr in toml_entries:
         include(addr, 'TOML_DECLARED_ENTRY')
 
@@ -991,7 +1009,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             walk['accepted_cross_producer_calls'])
 
     candidates = {a for a in (executed_pcs | dispatch_entry_pcs |
-                              captured_function_entries | legacy_seeds | toml_entries)
+                              captured_function_entries | static_discovery_entries |
+                              legacy_seeds | toml_entries)
                   if region(a)}
     for addr in sorted(candidates - set(included)):
         if addr in all_branch_targets or addr in jump_table_targets:
@@ -1035,7 +1054,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             return f'interior 0x{addr:08X}'
         if r == 'DISPATCH_ROOT':
             return f'dispatch_root 0x{addr:08X}'
-        if r in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET'):
+        if r in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                 'STATIC_DISCOVERY_ROOT'):
             return f'call_root 0x{addr:08X}'
         return f'0x{addr:08X}'
     seeds = []
@@ -1043,6 +1063,9 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         seeds.append(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}')
     for addr in sorted(accepted_cross_producer_calls):
         seeds.append(f'cross_call_allow 0x{addr:08X}')
+    for addr, range_lo, range_hi in cap.get('_prior_aliases', []):
+        seeds.append(
+            f'retained_alias 0x{addr:08X} 0x{range_lo:08X} 0x{range_hi:08X}')
     seeds.extend(seed_line(addr) for addr in sorted(included))
     return seeds, audit
 
@@ -1055,6 +1078,8 @@ def print_seed_audit(audit: dict) -> None:
     print(f'function_entry_pcs: {len(audit["function_entry_pcs"])}')
     print(f'direct_jal_targets_included: {audit["counts"].get("DIRECT_JAL_TARGET", 0)}')
     print(f'static_indirect_targets_included: {audit["counts"].get("STATIC_INDIRECT_TARGET", 0)}')
+    print(f'static_discovery_roots_included: '
+          f'{audit["counts"].get("STATIC_DISCOVERY_ROOT", 0)}')
     print(f'function_pointer_targets_included: {audit["counts"].get("FUNCTION_POINTER_TARGET", 0)}')
     print(f'toml_entries_included: {audit["counts"].get("TOML_DECLARED_ENTRY", 0)}')
     print(f'dispatch_interior_included: {audit["counts"].get("DISPATCH_INTERIOR", 0)}')
@@ -2118,6 +2143,9 @@ def main():
                     help='TinyCC binary (used when --compiler tcc)')
     ap.add_argument('--force',           action='store_true',
                     help='recompile even if output already exists')
+    ap.add_argument('--only-region', action='append', default=[],
+                    help='compile only captures whose normalized load address '
+                         'matches this value (repeatable; manual validation aid)')
     ap.add_argument('--check',           action='store_true',
                     help='PREFLIGHT: build every shard into a throwaway temp dir '
                          '(implies --force, ignores any injected cache dir, never '
@@ -2232,6 +2260,14 @@ def main():
     with open(args.captures) as f:
         captures = json.load(f)
 
+    if args.only_region:
+        only_regions = {int(value, 0) & 0x1FFFFFFF
+                        for value in args.only_region}
+        captures = [cap for cap in captures
+                    if (int(cap['load_addr'], 16) & 0x1FFFFFFF) in only_regions]
+        if not captures:
+            ap.error('--only-region did not match any capture')
+
     print(f'Captures: {len(captures)} overlay(s) to process\n')
 
     # B-2 static mode: accumulate privately-namespaced generated C plus exact
@@ -2291,18 +2327,27 @@ def main():
         # entries (walk-root eligible); non-callable ones (alias wrappers
         # from a prior build) re-enter as dispatch entries so the classifier
         # re-derives their interior/alias disposition — feeding them back as
-        # roots would truncate their hosts.
+        # roots would truncate their hosts. Their prior R ranges additionally
+        # reconstruct overlapping alias groups through retained_alias lines, so
+        # stronger new roots and old indirect dispatch entries can coexist.
         if not args.static:
             ranges_name = f'{phys_addr:08X}_{crc32:08X}.ranges'
-            prior_ranges = os.path.join(cache_dir, ranges_name)
-            if os.path.exists(prior_ranges):
+            prior_ranges_path = os.path.join(cache_dir, ranges_name)
+            if os.path.exists(prior_ranges_path):
                 prior_entries = []
-                with open(prior_ranges) as pf:
+                prior_func_ranges = []
+                with open(prior_ranges_path) as pf:
                     for ln in pf:
                         parts = ln.split()
                         if parts and parts[0] == 'F':
                             try:
                                 prior_entries.append(int(parts[1], 16))
+                            except (IndexError, ValueError):
+                                pass
+                        elif parts and parts[0] == 'R':
+                            try:
+                                prior_func_ranges.append(
+                                    (int(parts[1], 16), int(parts[2], 16)))
                             except (IndexError, ValueError):
                                 pass
                 if prior_entries:
@@ -2315,9 +2360,26 @@ def main():
                             de.add(a)
                     cap['function_entry_pcs'] = sorted(fe)
                     cap['dispatch_entry_pcs'] = sorted(de)
+                    alias_groups = {}
+                    if len(prior_entries) != len(prior_func_ranges):
+                        print(f'  WARNING: malformed prior manifest has '
+                              f'{len(prior_entries)} F lines and '
+                              f'{len(prior_func_ranges)} R lines; alias groups '
+                              f'will not be retained')
+                    else:
+                        for entry, (range_lo, range_size) in zip(
+                                prior_entries, prior_func_ranges):
+                            alias_groups.setdefault(
+                                (range_lo, range_lo + range_size), []).append(entry)
+                    cap['_prior_aliases'] = [
+                        (entry, range_lo, range_hi)
+                        for (range_lo, range_hi), entries in alias_groups.items()
+                        if len(entries) > 1 or any(e != range_lo for e in entries)
+                        for entry in entries
+                    ]
                     cap.setdefault('schema', 'merged')
                     print(f'  merged {len(prior_entries)} prior-manifest entries '
-                          f'from {prior_ranges}')
+                          f'from {prior_ranges_path}')
 
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
