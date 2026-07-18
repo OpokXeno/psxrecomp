@@ -446,11 +446,16 @@ def main():
         md.append(f'- Covered by compiled static code ranges: '
                   f'**{r["covered_by_code_range"]}** '
                   f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
+        md.append(f'- Overlay-only true code-range gaps: '
+                  f'**{r["missed_code_range"]}**')
         if combined:
             md.append(f'- Including base BIOS native code ranges: '
                       f'**{combined["covered_by_code_range"]}** '
                       f'(**{combined["recall_code_range"]*100:.1f}%**)')
-        md.append(f'- **MISSED live: {r["missed"]}**\n')
+            md.append(f'- Combined true code-range gaps: '
+                      f'**{combined["missed_code_range"]}**')
+        md.append(f'- Exact-entry misses (diagnostic; may be interior fragments): '
+                  f'**{r["missed"]}**\n')
     if a.prior_report:
         if a.prior_report == '-':
             prior = json.load(sys.stdin)
@@ -531,11 +536,16 @@ def main():
         md.append(f'- Covered by current static code ranges: '
                   f'**{r["covered_by_code_range"]}** '
                   f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
+        md.append(f'- Overlay-only true code-range gaps: '
+                  f'**{r["missed_code_range"]}**')
         if combined:
             md.append(f'- Including base BIOS native code ranges: '
                       f'**{combined["covered_by_code_range"]}** '
                       f'(**{combined["recall_code_range"]*100:.1f}%**)')
-        md.append(f'- **MISSED live: {len(miss)}**')
+            md.append(f'- Combined true code-range gaps: '
+                      f'**{combined["missed_code_range"]}**')
+        md.append(f'- Exact-entry misses (diagnostic; may be interior fragments): '
+                  f'**{len(miss)}**')
         md.append('- Provenance: caller explicitly asserted that the current static '
                   'entry set retains every prior static entry.\n')
 

@@ -43,6 +43,13 @@ continue to fail safely to the interpreter.
 - Ape's two PS-X EXE mirrors are deduplicated in favor of the self-describing EXE
   producer. Its remaining 44 HED/BNS members plus two minigame EXEs and the BIOS
   recipe are also audit-clean in a disposable cache.
+- A fresh 47/47 clean Ape rebuild then completed a title-to-attract-to-title
+  soak across four overlay generations. All 72 exercised game PCs lie in static
+  compiled ranges; the other 35 PCs are covered by the separately generated
+  BIOS/kernel ranges, yielding 107/107 combined range coverage with zero true
+  gaps. Live-byte guards safely rejected 21 stale candidates, visuals remained
+  correct, and the dev history recorded 21 verified immutable snapshots with no
+  invalid or duplicate references.
 - Normal PS-X discovery now exports its exact overlapping `F/R` alias recipes.
   Clean overlay builds therefore preserve decoder-proven indirect entries without
   promoting every entry to a hard root or borrowing a previous cache manifest.

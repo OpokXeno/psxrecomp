@@ -262,6 +262,18 @@ framed scans likewise recover Psy-Q's exact
 the old root eight bytes late. This closes Tomba 1's historical `0x80110E30` gap
 in the clean X00 variant without minting overlapping functions.
 
+A fresh Ape validation rebuilt all **47/47** candidates with zero audit or host-
+compiler failures. A full title-to-attract-to-title cycle exercised four overlay
+generations and 107 dispatch PCs. The overlay cache covers all 72 exercised game
+PCs by compiled range; the remaining 35 are BIOS/kernel PCs, and the separately
+generated base BIOS covers them all (**100.0% combined code-range recall, zero
+true gaps**). Live-byte validation rejected 21 stale candidates without executing
+them, while every loaded shard reported zero missing manifests and both loader
+indexes stayed within capacity. Screenshots verified the rainbow/falling attract
+scene and returned title screen rendered correctly. The dev persistence profile
+produced 21/21 signed immutable snapshots with zero invalid or duplicate records;
+production uses only the append-only executable-local history.
+
 ## Next to raise coverage (future session)
 
 1. ~~Direct-call frameless-leaf discovery~~ — DONE. Reachable `jal` targets are
