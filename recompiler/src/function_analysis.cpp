@@ -644,7 +644,10 @@ static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
 
 } // namespace
 
-FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector<uint32_t>& entries) {
+FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
+    const std::vector<uint32_t>& entries,
+    const std::vector<std::pair<uint32_t, uint32_t>>& producer_ranges,
+    const std::set<uint32_t>& cross_call_allow) {
     FunctionAnalysisResult result;
     result.total_instructions = 0;
     result.jr_ra_count = 0;
@@ -658,13 +661,28 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
         return addr >= exe_.header.load_address && addr < exe_.end_address() && (addr & 3u) == 0;
     };
 
-    auto callable_direct_jal_target = [&](uint32_t addr) {
+    auto producer_for = [&](uint32_t addr) -> int {
+        for (size_t i = 0; i < producer_ranges.size(); i++) {
+            if (addr >= producer_ranges[i].first && addr < producer_ranges[i].second)
+                return static_cast<int>(i);
+        }
+        return -1;
+    };
+
+    auto callable_direct_jal_target = [&](uint32_t source, uint32_t addr) {
         auto word_opt = exe_.read_word(addr);
         // A JAL encountered by the reachable CFG walk is direct call evidence.
         // Requiring a stack prologue here discarded legitimate frameless leaf
         // functions and tiny library wrappers.  The target still has to decode
         // as a valid PS1 instruction and lie inside the verified image bound.
-        return word_opt.has_value() && exact_is_valid_mips_word(*word_opt);
+        if (!word_opt.has_value() || !exact_is_valid_mips_word(*word_opt))
+            return false;
+        if (producer_ranges.empty()) return true;
+        int source_producer = producer_for(source);
+        int target_producer = producer_for(addr);
+        if (source_producer >= 0 && source_producer == target_producer)
+            return true;
+        return cross_call_allow.count(addr) != 0;
     };
 
     auto find_jump_table_targets = [&](uint32_t entry, uint32_t hard_cap,
@@ -788,7 +806,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
             case ExactCfKind::Jal:
                 if (in_function(delay)) wr.visited.insert(delay);
                 if (in_function(pc + 8u)) work.push(pc + 8u);
-                if (in_exe(cf.target) && callable_direct_jal_target(cf.target)) {
+                if (in_exe(cf.target) &&
+                    callable_direct_jal_target(pc, cf.target)) {
                     wr.direct_jal_targets.insert(cf.target);
                 }
                 break;
@@ -800,7 +819,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
                     uint32_t target_reg = (instr >> 21) & 0x1Fu;
                     if (exact_resolve_constant_transfer(exe_, entry, pc,
                                                         target_reg, target) &&
-                        in_exe(target)) {
+                        in_exe(target) &&
+                        callable_direct_jal_target(pc, target)) {
                         wr.direct_jal_targets.insert(target);
                     }
                 }
@@ -819,7 +839,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
                         if (in_function(target)) {
                             wr.jump_table_targets.insert(target);
                             work.push(target);
-                        } else if (in_exe(target)) {
+                        } else if (in_exe(target) &&
+                                   callable_direct_jal_target(pc, target)) {
                             // An absolute JR out of the current function is a
                             // statically proven tail-call entry.
                             wr.direct_jal_targets.insert(target);

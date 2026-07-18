@@ -245,7 +245,7 @@ def full_discovery_seeds(data, recompiler, tmp):
                 a=int(m.group(1),16); seeds.add(a if a>=0x80000000 else (0x80000000|a))
     return sorted(seeds) or None
 
-def rec(load_addr, data, seeds, dispatch_extra=None):
+def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None):
     # function_entry_pcs = prologue-scanned function starts (walk roots).
     # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
     # overlay's own export table). compile_overlays promotes clean starts to
@@ -253,11 +253,16 @@ def rec(load_addr, data, seeds, dispatch_extra=None):
     # (impossible_entry_start guards garbage), so passing the game's authoritative
     # dispatch table here recovers indirect-only entries a prologue scan misses.
     disp = sorted(set(seeds) | set(dispatch_extra or ()))
-    return {"schema":"psxrecomp overlay capture v2","load_addr":f"0x{load_addr:08X}",
-            "size":len(data),"bytes_b64":base64.b64encode(data).decode(),
-            "executed_pcs":[],"dispatch_entry_pcs":[f"0x{a:08X}" for a in disp],
-            "function_entry_pcs":[f"0x{a:08X}" for a in seeds],
-            "seeds":[f"0x{a:08X}" for a in seeds]}
+    out={"schema":"psxrecomp overlay capture v2","load_addr":f"0x{load_addr:08X}",
+         "size":len(data),"bytes_b64":base64.b64encode(data).decode(),
+         "executed_pcs":[],"dispatch_entry_pcs":[f"0x{a:08X}" for a in disp],
+         "function_entry_pcs":[f"0x{a:08X}" for a in seeds],
+         "seeds":[f"0x{a:08X}" for a in seeds]}
+    if producer_ranges:
+        out["producer_ranges"]=[
+            {"start":f"0x{lo:08X}","end":f"0x{hi:08X}"}
+            for lo,hi in producer_ranges]
+    return out
 
 def main():
     ap=argparse.ArgumentParser()
@@ -417,7 +422,10 @@ def main():
             composite_keys.add(key)
             seeds=sorted(set(lseeds)|set(rseeds))
             dispatch=sorted(set(ldispatch)|set(rdispatch))
-            records.append(rec(page_base,region,seeds,dispatch_extra=dispatch))
+            records.append(rec(
+                page_base,region,seeds,dispatch_extra=dispatch,
+                producer_ranges=((lbase,lbase+len(ldata)),
+                                 (rbase,rbase+len(rdata)))))
             nc+=1
             print(f"  [composite] {lp} + {rp}: {len(region)}B "
                   f"region@0x{page_base:08X} (exact adjacent producers), "

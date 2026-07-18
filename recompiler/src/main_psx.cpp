@@ -432,6 +432,8 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> interior_seeds;
     std::set<uint32_t>    trusted_root_seeds;
     std::set<uint32_t>    trusted_call_root_seeds;
+    std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
+    std::set<uint32_t> cross_call_allow;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
@@ -440,6 +442,33 @@ int main(int argc, char** argv) {
             std::string line;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
+                if (line.rfind("producer_range", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, lo_text, hi_text;
+                    in >> tag >> lo_text >> hi_text;
+                    uint32_t lo = static_cast<uint32_t>(
+                        std::strtoul(lo_text.c_str(), nullptr, 16));
+                    uint32_t hi = static_cast<uint32_t>(
+                        std::strtoul(hi_text.c_str(), nullptr, 16));
+                    if (lo_text.empty() || hi_text.empty() ||
+                        lo < seed_lo || lo >= hi || hi > seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid producer_range: {}\n", line);
+                        return 1;
+                    }
+                    producer_ranges.emplace_back(lo, hi);
+                    continue;
+                }
+                if (line.rfind("cross_call_allow", 0) == 0) {
+                    const char* p = line.c_str() + 16;
+                    uint32_t addr = static_cast<uint32_t>(
+                        std::strtoul(p, nullptr, 16));
+                    if (addr < seed_lo || addr >= seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid cross_call_allow: {}\n", line);
+                        return 1;
+                    }
+                    cross_call_allow.insert(addr);
+                    continue;
+                }
                 bool interior = false;
                 bool trusted_root = false;
                 bool trusted_call_root = false;
@@ -466,11 +495,35 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            std::sort(producer_ranges.begin(), producer_ranges.end());
+            for (size_t i = 1; i < producer_ranges.size(); i++) {
+                if (producer_ranges[i - 1].second > producer_ranges[i].first) {
+                    fmt::print(stderr, "ERROR: overlapping producer_range entries\n");
+                    return 1;
+                }
+            }
+            for (uint32_t addr : cross_call_allow) {
+                bool contained = false;
+                for (const auto& range : producer_ranges) {
+                    if (addr >= range.first && addr < range.second) {
+                        contained = true;
+                        break;
+                    }
+                }
+                if (!contained) {
+                    fmt::print(stderr,
+                               "ERROR: cross_call_allow 0x{:08X} is outside "
+                               "producer ranges\n", addr);
+                    return 1;
+                }
+            }
             fmt::print("Loaded {} extra function addresses ({} interior, "
-                       "{} dispatch-root, {} call-root) from {}\n",
+                       "{} dispatch-root, {} call-root, {} producer ranges, "
+                       "{} cross-call allows) from {}\n",
                        file_seeds.size() + interior_seeds.size(),
                        interior_seeds.size(), trusted_root_seeds.size(),
                        trusted_call_root_seeds.size(),
+                       producer_ranges.size(), cross_call_allow.size(),
                        extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
@@ -560,7 +613,8 @@ int main(int argc, char** argv) {
         {
             PSXRecomp::FunctionAnalyzer analyzer(*exe);
             std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
-            analysis_result = analyzer.analyze_exact_entries(roots_vec);
+            analysis_result = analyzer.analyze_exact_entries(
+                roots_vec, producer_ranges, cross_call_allow);
         }
 
         std::vector<AliasEntry> alias_entries;

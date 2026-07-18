@@ -563,8 +563,81 @@ def _resolve_constant_transfer(data: bytes, load_addr: int,
     return None
 
 
+def _plausible_callable_target(data: bytes, load_addr: int, size: int,
+                               target: int, producer_hi: int) -> bool:
+    """CFG proof for a cross-producer call target without a classic prologue.
+
+    Direct calls are sufficient boundary evidence inside one linked producer.
+    Across a synthetic adjacent-producer envelope, additionally require a
+    bounded, valid CFG with a reachable return and no sequential fallthrough.
+    This retains real frameless exports while rejecting pointer tables/NOP
+    runways that only happen to decode as instructions.
+    """
+    first = _word_at(data, load_addr, target)
+    if first in (None, 0) or not _is_valid_mips_word(first):
+        return False
+    cap = min(load_addr + size, producer_hi, target + 0x4000)
+    work = deque([target])
+    visited = set()
+    saw_return = False
+    bad = False
+
+    def inside(addr: int) -> bool:
+        return target <= addr < cap and (addr & 3) == 0
+
+    def add_delay(pc: int) -> None:
+        nonlocal bad
+        delay = pc + 4
+        if not inside(delay):
+            bad = True
+            return
+        word = _word_at(data, load_addr, delay)
+        if not _is_valid_mips_word(word):
+            bad = True
+        else:
+            visited.add(delay)
+
+    while work and not bad and len(visited) < 2048:
+        pc = work.popleft()
+        if pc in visited:
+            continue
+        if not inside(pc):
+            bad = True  # sequential fallthrough past the bounded probe
+            break
+        word = _word_at(data, load_addr, pc)
+        if not _is_valid_mips_word(word):
+            bad = True
+            break
+        visited.add(pc)
+        kind, branch_target = _classify_cf(pc, word)
+        if kind == 'normal':
+            work.append(pc + 4)
+        elif kind == 'branch':
+            add_delay(pc)
+            work.append(pc + 8)  # conditional fallthrough must remain bounded
+            if inside(branch_target):
+                work.append(branch_target)
+            # An out-of-probe branch target is a shared external code edge.
+        elif kind in ('jal', 'jalr'):
+            add_delay(pc)
+            work.append(pc + 8)
+        elif kind == 'j':
+            add_delay(pc)
+            if inside(branch_target):
+                work.append(branch_target)
+            # Otherwise this is a bounded tail edge.
+        elif kind == 'jr_ra':
+            add_delay(pc)
+            saw_return = True
+        elif kind == 'jr':
+            add_delay(pc)  # bounded indirect/tail exit
+
+    return saw_return and not bad and not work and len(visited) < 2048
+
+
 def _walk_overlay_function(data: bytes, load_addr: int, size: int,
-                           entry: int, hard_cap: int) -> dict:
+                           entry: int, hard_cap: int,
+                           producer_ranges=()) -> dict:
     lo = load_addr
     hi = load_addr + size
 
@@ -577,6 +650,37 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     static_indirect_targets = set()
     branch_targets = set()
     jump_table_targets = set()
+    rejected_cross_producer_calls = set()
+    accepted_cross_producer_calls = set()
+
+    def producer_for(addr: int):
+        for range_lo, range_hi in producer_ranges:
+            if range_lo <= addr < range_hi:
+                return range_lo, range_hi
+        return None
+
+    def callable_transfer_target(source: int, target: int) -> bool:
+        if not producer_ranges:
+            return True
+        source_range = producer_for(source)
+        target_range = producer_for(target)
+        if source_range is not None and source_range == target_range:
+            return True
+        # Adjacent-producer composites are a byte envelope, not proof that a
+        # call encoded by producer A is linked to arbitrary bytes at the same
+        # address in every producer-B variant. Cross-boundary calls therefore
+        # need independent local boundary evidence. This keeps real exports
+        # while rejecting pointer/data words that happen to be valid MIPS.
+        if _callable_direct_jal_target(data, load_addr, target):
+            accepted_cross_producer_calls.add(target)
+            return True
+        if (target_range is not None and
+                _plausible_callable_target(
+                    data, load_addr, size, target, target_range[1])):
+            accepted_cross_producer_calls.add(target)
+            return True
+        rejected_cross_producer_calls.add(target)
+        return False
 
     while work:
         pc = work.popleft()
@@ -614,7 +718,8 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
             if (lo <= target < hi and (target & 3) == 0 and
-                    _is_valid_mips_word(_word_at(data, load_addr, target))):
+                    _is_valid_mips_word(_word_at(data, load_addr, target)) and
+                    callable_transfer_target(pc, target)):
                 direct_jals.add(target)
         elif kind == 'jalr':
             if in_function(delay):
@@ -625,7 +730,8 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             target_reg = (word >> 21) & 0x1F
             target = _resolve_constant_transfer(data, load_addr, entry, pc,
                                                 target_reg)
-            if target is not None and lo <= target < hi and (target & 3) == 0:
+            if (target is not None and lo <= target < hi and (target & 3) == 0
+                    and callable_transfer_target(pc, target)):
                 static_indirect_targets.add(target)
         elif kind == 'jr':
             if in_function(delay):
@@ -636,7 +742,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 if in_function(target):
                     branch_targets.add(target)
                     work.append(target)
-                else:
+                elif callable_transfer_target(pc, target):
                     static_indirect_targets.add(target)
             else:
                 for jt in _find_jump_table_targets(data, load_addr, size,
@@ -655,6 +761,8 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         'static_indirect_targets': static_indirect_targets,
         'branch_targets': branch_targets,
         'jump_table_targets': jump_table_targets,
+        'rejected_cross_producer_calls': rejected_cross_producer_calls,
+        'accepted_cross_producer_calls': accepted_cross_producer_calls,
     }
 
 
@@ -685,6 +793,24 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     lo = load_addr
     hi = load_addr + size
     region = lambda a: lo <= a < hi and (a & 3) == 0
+    producer_ranges = []
+    for raw_range in cap.get('producer_ranges', []) or []:
+        if not isinstance(raw_range, dict):
+            raise RuntimeError('producer_ranges entries must be objects')
+        try:
+            range_lo = _parse_addr(raw_range['start'])
+            range_hi = _parse_addr(raw_range['end'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f'invalid producer_ranges entry: {raw_range}') from exc
+        if not (lo <= range_lo < range_hi <= hi):
+            raise RuntimeError(
+                f'producer range 0x{range_lo:08X}..0x{range_hi:08X} '
+                f'outside capture 0x{lo:08X}..0x{hi:08X}')
+        producer_ranges.append((range_lo, range_hi))
+    producer_ranges.sort()
+    if any(producer_ranges[i-1][1] > producer_ranges[i][0]
+           for i in range(1, len(producer_ranges))):
+        raise RuntimeError('producer_ranges overlap')
 
     schema_keys = {'executed_pcs', 'observed_pcs', 'dispatch_entry_pcs',
                    'function_entry_pcs'}
@@ -714,7 +840,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     pre_roots_sorted = sorted(a for a in pre_roots if region(a))
     for i, entry in enumerate(pre_roots_sorted):
         hard_cap = pre_roots_sorted[i + 1] if i + 1 < len(pre_roots_sorted) else hi
-        walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+        walk = _walk_overlay_function(
+            data, load_addr, size, entry, hard_cap, producer_ranges)
         jump_table_targets.update(walk['jump_table_targets'])
 
     def impossible_entry_start(addr: int) -> bool:
@@ -800,7 +927,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             processed.add(entry)
             sorted_known = sorted(known)
             hard_cap = next((x for x in sorted_known if x > entry), hi)
-            walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+            walk = _walk_overlay_function(
+                data, load_addr, size, entry, hard_cap, producer_ranges)
             all_branch_targets.update(walk['branch_targets'])
             all_branch_targets.update(walk['jump_table_targets'])
             for target in sorted(walk['direct_jals']):
@@ -828,7 +956,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         sorted_known = sorted(known)
         for i, entry in enumerate(sorted_known):
             hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
-            walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+            walk = _walk_overlay_function(
+                data, load_addr, size, entry, hard_cap, producer_ranges)
             covered |= walk['visited']
         promoted = sorted(a for a, r in included.items()
                           if r == 'DISPATCH_INTERIOR' and a not in covered
@@ -847,12 +976,19 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     # Re-walk with the final function set so the branch-target exclusion count
     # matches the actual compilation boundaries.
     all_branch_targets.clear()
+    rejected_cross_producer_calls = set()
+    accepted_cross_producer_calls = set()
     sorted_known = sorted(known)
     for i, entry in enumerate(sorted_known):
         hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
-        walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+        walk = _walk_overlay_function(
+            data, load_addr, size, entry, hard_cap, producer_ranges)
         all_branch_targets.update(walk['branch_targets'])
         all_branch_targets.update(walk['jump_table_targets'])
+        rejected_cross_producer_calls.update(
+            walk['rejected_cross_producer_calls'])
+        accepted_cross_producer_calls.update(
+            walk['accepted_cross_producer_calls'])
 
     candidates = {a for a in (executed_pcs | dispatch_entry_pcs |
                               captured_function_entries | legacy_seeds | toml_entries)
@@ -885,6 +1021,9 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'branch_targets_excluded_count': len(all_branch_targets - set(included)),
         'counts': counts,
         'excluded_counts': excluded_counts,
+        'producer_ranges': producer_ranges,
+        'rejected_cross_producer_calls': rejected_cross_producer_calls,
+        'accepted_cross_producer_calls': accepted_cross_producer_calls,
     }
     # Interior entries carry the 'interior' marker so the recompiler emits
     # them as overlapping aliases, never as walk roots. Promoted kernel
@@ -899,7 +1038,12 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         if r in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET'):
             return f'call_root 0x{addr:08X}'
         return f'0x{addr:08X}'
-    seeds = [seed_line(addr) for addr in sorted(included)]
+    seeds = []
+    for range_lo, range_hi in producer_ranges:
+        seeds.append(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}')
+    for addr in sorted(accepted_cross_producer_calls):
+        seeds.append(f'cross_call_allow 0x{addr:08X}')
+    seeds.extend(seed_line(addr) for addr in sorted(included))
     return seeds, audit
 
 
@@ -915,6 +1059,10 @@ def print_seed_audit(audit: dict) -> None:
     print(f'toml_entries_included: {audit["counts"].get("TOML_DECLARED_ENTRY", 0)}')
     print(f'dispatch_interior_included: {audit["counts"].get("DISPATCH_INTERIOR", 0)}')
     print(f'dispatch_roots_promoted: {audit["counts"].get("DISPATCH_ROOT", 0)}')
+    print(f'cross_producer_calls_rejected: '
+          f'{len(audit["rejected_cross_producer_calls"])}')
+    print(f'cross_producer_calls_accepted: '
+          f'{len(audit["accepted_cross_producer_calls"])}')
     print(f'branch_targets_excluded: {audit["branch_targets_excluded_count"]}')
     print(f'observed_only_excluded: {audit["excluded_counts"].get("OBSERVED_PC_ONLY", 0)}')
     print(f'unknown_excluded: {audit["excluded_counts"].get("UNKNOWN", 0)}')

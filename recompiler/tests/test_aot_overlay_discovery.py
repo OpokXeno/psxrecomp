@@ -37,6 +37,42 @@ def make_psxexe(entry, data):
     return bytes(header) + data
 
 
+def check_composite_call_boundaries():
+    data = bytearray(0x100)
+    cross_target = LOAD + 0x50
+    put(data, 0x00, jal(cross_target))
+    put(data, 0x04, 0x00000000)
+    put(data, 0x08, 0x03E00008)
+    put(data, 0x0C, 0x00000000)
+    put(data, 0x50, 0x24020001)  # valid MIPS, but no callable boundary
+    ranges = ((LOAD, LOAD + 0x40), (LOAD + 0x40, LOAD + 0x100))
+
+    # A direct JAL remains sufficient for frameless leaves inside one producer,
+    # but not when an adjacent-producer variant merely puts pointer/data-shaped
+    # bytes at the encoded address.
+    unscoped = MOD._walk_overlay_function(data, LOAD, len(data), LOAD, LOAD + 0x100)
+    assert cross_target in unscoped['direct_jals']
+    scoped = MOD._walk_overlay_function(
+        data, LOAD, len(data), LOAD, LOAD + 0x100, ranges)
+    assert cross_target not in scoped['direct_jals']
+    assert cross_target in scoped['rejected_cross_producer_calls']
+
+    # A bounded frameless body with a real return is independently code-like
+    # and remains discoverable across the producer boundary.
+    put(data, 0x54, 0x03E00008)
+    put(data, 0x58, 0x00000000)
+    scoped = MOD._walk_overlay_function(
+        data, LOAD, len(data), LOAD, LOAD + 0x100, ranges)
+    assert cross_target in scoped['direct_jals']
+
+    # Independent target-local boundary evidence makes a real cross-producer
+    # export safe to retain.
+    put(data, 0x50, 0x27BDFFE0)
+    scoped = MOD._walk_overlay_function(
+        data, LOAD, len(data), LOAD, LOAD + 0x100, ranges)
+    assert cross_target in scoped['direct_jals']
+
+
 def check_padded_return_boundary(recompiler):
     # Exact-entry mode re-verifies every untrusted seed. Psy-Q aligns frameless
     # leaves with NOPs after the prior function's JR delay slot; those NOPs must
@@ -67,6 +103,41 @@ def check_padded_return_boundary(recompiler):
         assert f"F {LOAD + 0x14:08X}" in ranges
 
 
+def check_recompiler_composite_contract(recompiler):
+    data = bytearray(0x80)
+    target = LOAD + 0x50
+    put(data, 0x00, jal(target))
+    put(data, 0x04, 0x00000000)
+    put(data, 0x08, 0x03E00008)
+    put(data, 0x0C, 0x00000000)
+    put(data, 0x50, 0x24020001)
+    put(data, 0x54, 0x03E00008)
+    put(data, 0x58, 0x00000000)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, "composite.psx")
+        with open(psx, "wb") as f:
+            f.write(make_psxexe(LOAD, data))
+
+        def generated(allow):
+            seeds = os.path.join(tmp, f"seeds_{allow}.txt")
+            out = os.path.join(tmp, f"out_{allow}")
+            with open(seeds, "w", encoding="utf-8") as f:
+                f.write(f"producer_range 0x{LOAD:08X} 0x{LOAD + 0x40:08X}\n")
+                f.write(f"producer_range 0x{LOAD + 0x40:08X} 0x{LOAD + 0x80:08X}\n")
+                if allow:
+                    f.write(f"cross_call_allow 0x{target:08X}\n")
+                f.write(f"0x{LOAD:08X}\n")
+            result = subprocess.run(
+                [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+                capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr or result.stdout
+            return ''.join(path.read_text() for path in pathlib.Path(out).glob("*_full*.c"))
+
+        assert f"void func_{target:08X}" not in generated(False)
+        assert f"void func_{target:08X}" in generated(True)
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -74,6 +145,9 @@ def main():
     args = parser.parse_args()
     if not os.path.isfile(args.recompiler):
         raise SystemExit(f"recompiler not found: {args.recompiler}")
+
+    check_composite_call_boundaries()
+    check_recompiler_composite_contract(args.recompiler)
 
     data = bytearray(0x200)
 

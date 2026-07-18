@@ -111,6 +111,19 @@ int main() {
     CHECK(!reachable.count(kLoad + 0x1100),
           "direct target beyond verified bound fails closed");
 
+    // A synthetic adjacent-producer envelope is not one linked image. The
+    // caller supplies the cross-boundary targets that passed its independent
+    // callable-CFG proof; other valid-looking targets stay with the interpreter.
+    PSXRecomp::FunctionAnalyzer composite_analyzer(exe);
+    const std::vector<std::pair<uint32_t, uint32_t>> producer_ranges = {
+        {kLoad, kLoad + 0x80}, {kLoad + 0x80, kLoad + 0x1000}};
+    const auto composite = starts(composite_analyzer.analyze_exact_entries(
+        {kLoad}, producer_ranges, {kLoad + 0x100}));
+    CHECK(composite.count(kLoad) && composite.count(kLoad + 0x100),
+          "approved cross-producer call target is discovered");
+    CHECK(!composite.count(kLoad + 0x300),
+          "unapproved cross-producer JAL target fails closed");
+
     // A constant-register JR out of the current function is a statically
     // proven tail call.  Resolve the common lui/addiu/jr sequence without an
     // execution-derived seed.
