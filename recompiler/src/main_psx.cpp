@@ -430,7 +430,6 @@ int main(int argc, char** argv) {
      * valid seeds. */
     std::vector<uint32_t> file_seeds;
     std::vector<uint32_t> interior_seeds;
-    std::vector<AliasEntry> retained_alias_seeds;
     std::set<uint32_t>    trusted_root_seeds;
     std::set<uint32_t>    trusted_call_root_seeds;
     std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
@@ -471,21 +470,8 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (line.rfind("retained_alias", 0) == 0) {
-                    std::istringstream in(line);
-                    std::string tag, addr_text, lo_text, hi_text;
-                    in >> tag >> addr_text >> lo_text >> hi_text;
-                    uint32_t addr = static_cast<uint32_t>(
-                        std::strtoul(addr_text.c_str(), nullptr, 16));
-                    uint32_t lo = static_cast<uint32_t>(
-                        std::strtoul(lo_text.c_str(), nullptr, 16));
-                    uint32_t hi = static_cast<uint32_t>(
-                        std::strtoul(hi_text.c_str(), nullptr, 16));
-                    if (addr_text.empty() || lo_text.empty() || hi_text.empty() ||
-                        lo < seed_lo || addr < lo || addr >= hi || hi > seed_hi) {
-                        fmt::print(stderr, "ERROR: invalid retained_alias: {}\n", line);
-                        return 1;
-                    }
-                    retained_alias_seeds.push_back({addr, lo, hi});
+                    fmt::print("  ignoring legacy retained_alias; old host "
+                               "ranges are never reused: {}\n", line);
                     continue;
                 }
                 bool interior = false;
@@ -538,12 +524,11 @@ int main(int argc, char** argv) {
             }
             fmt::print("Loaded {} extra function addresses ({} interior, "
                        "{} dispatch-root, {} call-root, {} producer ranges, "
-                       "{} cross-call allows, {} retained aliases) from {}\n",
+                       "{} cross-call allows) from {}\n",
                        file_seeds.size() + interior_seeds.size(),
                        interior_seeds.size(), trusted_root_seeds.size(),
                        trusted_call_root_seeds.size(),
                        producer_ranges.size(), cross_call_allow.size(),
-                       retained_alias_seeds.size(),
                        extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
@@ -653,7 +638,7 @@ int main(int argc, char** argv) {
         for (uint32_t a : interior) {
             const PSXRecomp::Function* host = containing(a);
             if (host && a == host->start_addr) continue;  // became a real entry
-            if (host) {
+            if (host && analysis_result.exact_reachable_pcs.count(a)) {
                 if (alias_seen.insert(a).second)
                     alias_entries.push_back({a, host->start_addr, host->end_addr});
             } else {
@@ -662,73 +647,19 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Range-ownership completeness (B): a DIRECT CALL (jal) whose target
-        // lands strictly INSIDE an already-discovered function is a separate
-        // routine the host's discovered range absorbed (e.g. via a break/trap
-        // fall-through in discovery — the crt0 `jal main; break` that swallowed
-        // the next function, the Tomba 2 FMV-freeze root cause). Register every
-        // such target as an ALIAS entry so the host's entry-switch routes a
-        // dispatch of that PC to the correct interior block (running the absorbed
-        // routine natively) instead of failing closed to the interpreter. This is
-        // derived purely from static jal evidence in the discovered code, so it
-        // does not depend on the PC having been captured/executed. jal encodes a
-        // code target, so this never mints code from data.
-        size_t jal_alias_added = 0;
-        {
-            std::set<uint32_t> known_starts;
-            for (const auto& f : analysis_result.functions)
-                known_starts.insert(f.start_addr);
-            std::set<uint32_t> jal_targets;
-            for (const auto& f : analysis_result.functions) {
-                for (uint32_t a = f.start_addr; a + 4 <= f.end_addr; a += 4) {
-                    uint32_t w = read_w(a);
-                    if ((w >> 26) == 0x03u) {  // jal
-                        uint32_t tgt = (a & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
-                        jal_targets.insert(tgt);
-                    }
-                }
-            }
-            for (uint32_t t : jal_targets) {
-                if (known_starts.count(t)) continue;          // already a real entry
-                if (!alias_seen.count(t)) {
-                    const PSXRecomp::Function* host = containing(t);
-                    if (host && t != host->start_addr) {
-                        alias_seen.insert(t);
-                        alias_entries.push_back({t, host->start_addr, host->end_addr});
-                        jal_alias_added++;
-                    }
-                }
-            }
+        // Range-ownership completeness uses only analyzer-proven transfers from
+        // reachable instructions. The analyzer also revalidates each target's
+        // host against the final root partition and producer boundaries.
+        size_t proven_alias_added = 0;
+        for (const auto& absorbed : analysis_result.absorbed_entries) {
+            if (!alias_seen.insert(absorbed.addr).second) continue;
+            alias_entries.push_back(
+                {absorbed.addr, absorbed.host_start, absorbed.host_end});
+            proven_alias_added++;
         }
-        if (jal_alias_added)
-            fmt::print("  +{} in-function jal-target alias entries "
-                       "(range-ownership completeness)\n", jal_alias_added);
-
-        // An existing manifest for these exact image bytes is durable proof
-        // that its overlapping alias groups compiled successfully before.
-        // Preserve those groups without feeding their entries back as walk
-        // roots: roots would hard-cap newly discovered siblings, while a
-        // retained overlapping body lets old indirect entries and new static
-        // call roots coexist. Ordinary current functions win at an identical
-        // entry; retained aliases replace only an ordinary alias at that PC.
-        if (!retained_alias_seeds.empty()) {
-            std::set<uint32_t> current_starts;
-            for (const auto& f : analysis_result.functions)
-                current_starts.insert(f.start_addr);
-            size_t retained_added = 0;
-            for (const auto& retained : retained_alias_seeds) {
-                if (current_starts.count(retained.addr)) continue;
-                alias_entries.erase(
-                    std::remove_if(alias_entries.begin(), alias_entries.end(),
-                        [&](const AliasEntry& ae) { return ae.addr == retained.addr; }),
-                    alias_entries.end());
-                alias_entries.push_back(retained);
-                retained_added++;
-            }
-            if (retained_added)
-                fmt::print("  +{} retained prior-manifest alias entries "
-                           "(monotonic identical-image coverage)\n", retained_added);
-        }
+        if (proven_alias_added)
+            fmt::print("  +{} analyzer-proven absorbed alias entries "
+                       "(final range ownership)\n", proven_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());

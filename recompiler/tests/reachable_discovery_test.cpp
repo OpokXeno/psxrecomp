@@ -151,6 +151,269 @@ int main() {
               std::set<uint32_t>({kLoad, kLoad + 0x100}),
           "direct call into an owned function stays an interior alias");
 
+    // Ownership must also settle among roots discovered in the same round.
+    // The initial root calls both A and an address B inside A. Neither address
+    // is owned by the initial partition, but walking A without B as a cap
+    // reaches B, so B is an alias rather than a sibling function.
+    auto same_round_image = make_exe_buffer(0x1000);
+    put32(same_round_image, text + 0x00, jal(kLoad + 0x100));
+    put32(same_round_image, text + 0x04, 0x00000000u);
+    put32(same_round_image, text + 0x08, jal(kLoad + 0x110));
+    put32(same_round_image, text + 0x0C, 0x00000000u);
+    put32(same_round_image, text + 0x10, 0x03E00008u);
+    put32(same_round_image, text + 0x14, 0x00000000u);
+    put32(same_round_image, text + 0x100, jal(kLoad + 0x110));
+    put32(same_round_image, text + 0x104, 0x00000000u);
+    put32(same_round_image, text + 0x108, 0x24420001u);
+    put32(same_round_image, text + 0x10C, 0x24420001u);
+    put32(same_round_image, text + 0x110, 0x03E00008u);
+    put32(same_round_image, text + 0x114, 0x00000000u);
+    auto same_round_exe = parse(same_round_image);
+    PSXRecomp::FunctionAnalyzer same_round_analyzer(same_round_exe);
+    const auto same_round_result =
+        same_round_analyzer.analyze_exact_entries({kLoad});
+    const auto same_round_starts = starts(same_round_result);
+    CHECK(same_round_starts ==
+              std::set<uint32_t>({kLoad, kLoad + 0x100}),
+          "same-round call target inside a discovered host stays absorbed");
+    bool same_round_hosted = false;
+    for (const auto& absorbed : same_round_result.absorbed_entries) {
+        same_round_hosted |= (absorbed.addr == kLoad + 0x110 &&
+                              absorbed.host_start == kLoad + 0x100 &&
+                              absorbed.addr < absorbed.host_end &&
+                              absorbed.source_addr == kLoad + 0x100 &&
+                              !absorbed.resolved_indirect);
+    }
+    CHECK(same_round_hosted,
+          "every analyzer-proven absorbed target names its final CFG host");
+
+    // Resolved constant-register calls carry the same reachable provenance as
+    // direct JALs and can therefore become final hosted aliases too.
+    auto indirect_alias_image = make_exe_buffer(0x1000);
+    put32(indirect_alias_image, text + 0x00, jal(kLoad + 0x100));
+    put32(indirect_alias_image, text + 0x04, 0x00000000u);
+    put32(indirect_alias_image, text + 0x08, 0x03E00008u);
+    put32(indirect_alias_image, text + 0x0C, 0x00000000u);
+    put32(indirect_alias_image, text + 0x100, 0x3C088001u);
+    put32(indirect_alias_image, text + 0x104, 0x25080110u);
+    put32(indirect_alias_image, text + 0x108, 0x0100F809u);
+    put32(indirect_alias_image, text + 0x10C, 0x00000000u);
+    put32(indirect_alias_image, text + 0x110, 0x03E00008u);
+    put32(indirect_alias_image, text + 0x114, 0x00000000u);
+    auto indirect_alias_exe = parse(indirect_alias_image);
+    PSXRecomp::FunctionAnalyzer indirect_alias_analyzer(indirect_alias_exe);
+    const auto indirect_alias_result =
+        indirect_alias_analyzer.analyze_exact_entries({kLoad});
+    bool indirect_alias_hosted = false;
+    for (const auto& absorbed : indirect_alias_result.absorbed_entries) {
+        indirect_alias_hosted |= (absorbed.addr == kLoad + 0x110 &&
+                                  absorbed.host_start == kLoad + 0x100 &&
+                                  absorbed.source_addr == kLoad + 0x108 &&
+                                  absorbed.resolved_indirect);
+    }
+    CHECK(indirect_alias_hosted,
+          "resolved indirect call target exports final alias provenance");
+
+    // The ordering can span rounds too: B is found first, then B discovers an
+    // earlier A whose reachable body contains B. Once A exists, ownership must
+    // be recomputed without retaining B as a stale hard cap.
+    auto later_round_image = make_exe_buffer(0x1000);
+    put32(later_round_image, text + 0x00, jal(kLoad + 0x120));
+    put32(later_round_image, text + 0x04, 0x00000000u);
+    put32(later_round_image, text + 0x08, 0x03E00008u);
+    put32(later_round_image, text + 0x0C, 0x00000000u);
+    put32(later_round_image, text + 0x100, 0x10000007u); // b 0x80010120
+    put32(later_round_image, text + 0x104, 0x00000000u);
+    put32(later_round_image, text + 0x120, jal(kLoad + 0x100));
+    put32(later_round_image, text + 0x124, 0x00000000u);
+    put32(later_round_image, text + 0x128, 0x03E00008u);
+    put32(later_round_image, text + 0x12C, 0x00000000u);
+    auto later_round_exe = parse(later_round_image);
+    PSXRecomp::FunctionAnalyzer later_round_analyzer(later_round_exe);
+    const auto later_round_starts = starts(
+        later_round_analyzer.analyze_exact_entries({kLoad}));
+    CHECK(later_round_starts ==
+              std::set<uint32_t>({kLoad, kLoad + 0x100}),
+          "later-discovered host retracts its stale interior hard cap");
+
+    // R discovers A and B; A initially owns B. Walking that expanded A then
+    // discovers X between them. X caps A before B and does not itself reach B,
+    // so final ownership must reconsider B and restore it as a real root.
+    auto invalidated_owner_image = make_exe_buffer(0x1000);
+    put32(invalidated_owner_image, text + 0x00, jal(kLoad + 0x100));
+    put32(invalidated_owner_image, text + 0x04, 0x00000000u);
+    put32(invalidated_owner_image, text + 0x08, jal(kLoad + 0x140));
+    put32(invalidated_owner_image, text + 0x0C, 0x00000000u);
+    put32(invalidated_owner_image, text + 0x10, 0x03E00008u);
+    put32(invalidated_owner_image, text + 0x14, 0x00000000u);
+    put32(invalidated_owner_image, text + 0x100,
+          0x08000000u | (((kLoad + 0x130) >> 2) & 0x03FFFFFFu));
+    put32(invalidated_owner_image, text + 0x104, 0x00000000u);
+    put32(invalidated_owner_image, text + 0x120, 0x03E00008u); // X
+    put32(invalidated_owner_image, text + 0x124, 0x00000000u);
+    put32(invalidated_owner_image, text + 0x130, 0x24420001u);
+    put32(invalidated_owner_image, text + 0x134, 0x24420001u);
+    put32(invalidated_owner_image, text + 0x138, 0x24420001u);
+    put32(invalidated_owner_image, text + 0x13C, 0x24420001u);
+    put32(invalidated_owner_image, text + 0x140, jal(kLoad + 0x120)); // B -> X
+    put32(invalidated_owner_image, text + 0x144, 0x00000000u);
+    put32(invalidated_owner_image, text + 0x148, 0x03E00008u);
+    put32(invalidated_owner_image, text + 0x14C, 0x00000000u);
+    auto invalidated_owner_exe = parse(invalidated_owner_image);
+    PSXRecomp::FunctionAnalyzer invalidated_owner_analyzer(
+        invalidated_owner_exe);
+    const auto invalidated_owner_result =
+        invalidated_owner_analyzer.analyze_exact_entries({kLoad});
+    const auto invalidated_owner_starts = starts(invalidated_owner_result);
+    CHECK(invalidated_owner_starts.count(kLoad + 0x100) &&
+          invalidated_owner_starts.count(kLoad + 0x120) &&
+          invalidated_owner_starts.count(kLoad + 0x140),
+          "R/A/X/B ownership invalidation restores B as a final root");
+    bool stale_b_alias = false;
+    for (const auto& absorbed : invalidated_owner_result.absorbed_entries)
+        stale_b_alias |= absorbed.addr == kLoad + 0x140;
+    CHECK(!stale_b_alias,
+          "R/A/X/B final ownership does not retain stale B alias");
+
+    // Producer boundaries are hard CFG ownership boundaries. A call into the
+    // next producer is rejected without approval and, when approved, becomes
+    // its own root rather than being absorbed by fallthrough from producer A.
+    auto producer_owner_image = make_exe_buffer(0x1000);
+    put32(producer_owner_image, text + 0x00, jal(kLoad + 0x100));
+    put32(producer_owner_image, text + 0x04, 0x00000000u);
+    put32(producer_owner_image, text + 0x08, jal(kLoad + 0x108));
+    put32(producer_owner_image, text + 0x0C, 0x00000000u);
+    put32(producer_owner_image, text + 0x10, 0x03E00008u);
+    put32(producer_owner_image, text + 0x14, 0x00000000u);
+    put32(producer_owner_image, text + 0x100, 0x24420001u);
+    put32(producer_owner_image, text + 0x104, 0x24420001u);
+    put32(producer_owner_image, text + 0x108, 0x03E00008u);
+    put32(producer_owner_image, text + 0x10C, 0x00000000u);
+    auto producer_owner_exe = parse(producer_owner_image);
+    const std::vector<std::pair<uint32_t, uint32_t>> ownership_ranges = {
+        {kLoad, kLoad + 0x108}, {kLoad + 0x108, kLoad + 0x1000}};
+    PSXRecomp::FunctionAnalyzer rejected_owner_analyzer(producer_owner_exe);
+    const auto rejected_owner = rejected_owner_analyzer.analyze_exact_entries(
+        {kLoad}, ownership_ranges, {});
+    CHECK(!starts(rejected_owner).count(kLoad + 0x108) &&
+          rejected_owner.absorbed_entries.empty(),
+          "rejected cross-producer call is neither root nor alias");
+    PSXRecomp::FunctionAnalyzer allowed_owner_analyzer(producer_owner_exe);
+    const auto allowed_owner = allowed_owner_analyzer.analyze_exact_entries(
+        {kLoad}, ownership_ranges, {kLoad + 0x108});
+    CHECK(starts(allowed_owner).count(kLoad + 0x108),
+          "approved cross-producer call remains a separate root");
+    bool cross_absorbed = false;
+    for (const auto& absorbed : allowed_owner.absorbed_entries)
+        cross_absorbed |= absorbed.addr == kLoad + 0x108;
+    CHECK(!cross_absorbed,
+          "approved cross-producer target is never absorbed across boundary");
+
+    // An uncovered composite gap has no producer identity. Two gap addresses
+    // both returning producer -1 must not become a synthetic shared producer.
+    auto producer_gap_image = make_exe_buffer(0x1000);
+    put32(producer_gap_image, text + 0x00, 0x03E00008u);
+    put32(producer_gap_image, text + 0x04, 0x00000000u);
+    put32(producer_gap_image, text + 0x60, 0x24020001u);
+    put32(producer_gap_image, text + 0x64, 0x03E00008u);
+    put32(producer_gap_image, text + 0x68, 0x00000000u);
+    const auto producer_gap_exe = parse(producer_gap_image);
+    PSXRecomp::FunctionAnalyzer producer_gap_analyzer(producer_gap_exe);
+    const std::vector<std::pair<uint32_t, uint32_t>> gap_ranges = {
+        {kLoad, kLoad + 0x40}, {kLoad + 0x80, kLoad + 0x100}};
+    const auto producer_gap_result = producer_gap_analyzer.analyze_exact_entries(
+        {kLoad, kLoad + 0x60}, gap_ranges, {});
+    CHECK(starts(producer_gap_result) == std::set<uint32_t>({kLoad}) &&
+          !producer_gap_result.exact_reachable_pcs.count(kLoad + 0x60),
+          "explicit roots in uncovered producer gaps fail closed");
+
+    // R reaches S, S calls B, and B calls earlier X. X then caps R before S,
+    // invalidating B's only source edge. Recomputing evidence oscillates, so the
+    // analyzer must fail closed to explicit R instead of retaining B forever.
+    auto stale_source_image = make_exe_buffer(0x1000);
+    put32(stale_source_image, text + 0x00,
+          0x08000000u | (((kLoad + 0x100) >> 2) & 0x03FFFFFFu));
+    put32(stale_source_image, text + 0x04, 0x00000000u);
+    put32(stale_source_image, text + 0x80, 0x03E00008u); // X
+    put32(stale_source_image, text + 0x84, 0x00000000u);
+    put32(stale_source_image, text + 0x100, jal(kLoad + 0x140)); // S -> B
+    put32(stale_source_image, text + 0x104, 0x00000000u);
+    put32(stale_source_image, text + 0x108, 0x03E00008u);
+    put32(stale_source_image, text + 0x10C, 0x00000000u);
+    put32(stale_source_image, text + 0x140, jal(kLoad + 0x80)); // B -> X
+    put32(stale_source_image, text + 0x144, 0x00000000u);
+    put32(stale_source_image, text + 0x148, 0x03E00008u);
+    put32(stale_source_image, text + 0x14C, 0x00000000u);
+    auto stale_source_exe = parse(stale_source_image);
+    PSXRecomp::FunctionAnalyzer stale_source_analyzer(stale_source_exe);
+    const auto stale_source_result =
+        stale_source_analyzer.analyze_exact_entries({kLoad});
+    CHECK(starts(stale_source_result) == std::set<uint32_t>({kLoad}) &&
+          stale_source_result.absorbed_entries.empty(),
+          "cyclic stale call evidence fails closed to explicit roots");
+
+    // beq rN,rN is unconditional: PC+8 is not reachable and a hidden JAL
+    // there cannot manufacture a function or absorbed alias.
+    auto always_branch_image = make_exe_buffer(0x1000);
+    put32(always_branch_image, text + 0x00,
+          (0x04u << 26) | (8u << 21) | (8u << 16) | 0x1Fu); // -> +0x80
+    put32(always_branch_image, text + 0x04, 0x00000000u);
+    put32(always_branch_image, text + 0x08, jal(kLoad + 0x40));
+    put32(always_branch_image, text + 0x0C, 0x00000000u);
+    put32(always_branch_image, text + 0x40, 0x03E00008u);
+    put32(always_branch_image, text + 0x44, 0x00000000u);
+    put32(always_branch_image, text + 0x80, 0x03E00008u);
+    put32(always_branch_image, text + 0x84, 0x00000000u);
+    auto always_branch_exe = parse(always_branch_image);
+    PSXRecomp::FunctionAnalyzer always_branch_analyzer(always_branch_exe);
+    const auto always_branch_result =
+        always_branch_analyzer.analyze_exact_entries({kLoad});
+    CHECK(starts(always_branch_result) == std::set<uint32_t>({kLoad}) &&
+          always_branch_result.absorbed_entries.empty(),
+          "always-taken branch excludes unreachable fallthrough call");
+
+    // bne rN,rN is never taken: its encoded target cannot contribute a hidden
+    // call edge, while its ordinary delay slot and PC+8 remain reachable.
+    auto never_branch_image = make_exe_buffer(0x1000);
+    put32(never_branch_image, text + 0x00,
+          (0x05u << 26) | (8u << 21) | (8u << 16) | 0x1Fu); // false -> +0x80
+    put32(never_branch_image, text + 0x04, 0x00000000u);
+    put32(never_branch_image, text + 0x08, 0x03E00008u);
+    put32(never_branch_image, text + 0x0C, 0x00000000u);
+    put32(never_branch_image, text + 0x40, 0x03E00008u);
+    put32(never_branch_image, text + 0x44, 0x00000000u);
+    put32(never_branch_image, text + 0x80, jal(kLoad + 0x40));
+    put32(never_branch_image, text + 0x84, 0x00000000u);
+    put32(never_branch_image, text + 0x88, 0x03E00008u);
+    put32(never_branch_image, text + 0x8C, 0x00000000u);
+    auto never_branch_exe = parse(never_branch_image);
+    PSXRecomp::FunctionAnalyzer never_branch_analyzer(never_branch_exe);
+    const auto never_branch_result =
+        never_branch_analyzer.analyze_exact_entries({kLoad});
+    CHECK(starts(never_branch_result) == std::set<uint32_t>({kLoad}) &&
+          never_branch_result.absorbed_entries.empty(),
+          "never-taken branch excludes unreachable target call");
+
+    // bgezal $zero is the BAL alias: the target is call evidence and the
+    // return continuation at PC+8 remains reachable.
+    auto bal_image = make_exe_buffer(0x1000);
+    put32(bal_image, text + 0x00,
+          (0x01u << 26) | (0x11u << 16) | 0x1Fu); // bal +0x80
+    put32(bal_image, text + 0x04, 0x00000000u);
+    put32(bal_image, text + 0x08, jal(kLoad + 0x40));
+    put32(bal_image, text + 0x0C, 0x00000000u);
+    put32(bal_image, text + 0x10, 0x03E00008u);
+    put32(bal_image, text + 0x14, 0x00000000u);
+    put32(bal_image, text + 0x40, 0x03E00008u);
+    put32(bal_image, text + 0x44, 0x00000000u);
+    put32(bal_image, text + 0x80, 0x03E00008u);
+    put32(bal_image, text + 0x84, 0x00000000u);
+    auto bal_exe = parse(bal_image);
+    PSXRecomp::FunctionAnalyzer bal_analyzer(bal_exe);
+    const auto bal_starts = starts(bal_analyzer.analyze_exact_entries({kLoad}));
+    CHECK(bal_starts.count(kLoad + 0x40) && bal_starts.count(kLoad + 0x80),
+          "BAL preserves call target and return-continuation discovery");
+
     // A synthetic adjacent-producer envelope is not one linked image. The
     // caller supplies the cross-boundary targets that passed its independent
     // callable-CFG proof; other valid-looking targets stay with the interpreter.
@@ -181,6 +444,49 @@ int main() {
         indirect_analyzer.analyze_exact_entries({kLoad + 0x500}));
     CHECK(indirect.count(kLoad + 0x400) && indirect.count(kLoad + 0x500),
           "constant-register JR discovers its frameless tail-call target");
+
+    // A jump enters at the low-half definition and skips the preceding LUI.
+    // A raw backward scan would combine them; reaching-definition proof must
+    // reject that synthetic indirect target.
+    auto split_constant_image = make_exe_buffer(0x1000, kLoad + 0x500);
+    put32(split_constant_image, text + 0x400, 0x03E00008u);
+    put32(split_constant_image, text + 0x404, 0x00000000u);
+    put32(split_constant_image, text + 0x500,
+          0x08000000u | (((kLoad + 0x518) >> 2) & 0x03FFFFFFu));
+    put32(split_constant_image, text + 0x504, 0x00000000u);
+    put32(split_constant_image, text + 0x514, 0x3C088001u);
+    put32(split_constant_image, text + 0x518, 0x25080400u);
+    put32(split_constant_image, text + 0x51C, 0x01000008u);
+    put32(split_constant_image, text + 0x520, 0x00000000u);
+    auto split_constant_exe = parse(split_constant_image);
+    PSXRecomp::FunctionAnalyzer split_constant_analyzer(split_constant_exe);
+    const auto split_constant = starts(
+        split_constant_analyzer.analyze_exact_entries({kLoad + 0x500}));
+    CHECK(!split_constant.count(kLoad + 0x400),
+          "indirect resolver rejects a definition skipped by an inbound edge");
+
+    // The LUI executes in a JAL delay slot, then the callee may clobber t0
+    // before returning to the low half. It is not a reaching definition for
+    // the later JALR even though the raw words are adjacent.
+    auto call_delay_image = make_exe_buffer(0x1000, kLoad + 0x500);
+    put32(call_delay_image, text + 0x300, 0x03E00008u);
+    put32(call_delay_image, text + 0x304, 0x00000000u);
+    put32(call_delay_image, text + 0x400, 0x03E00008u);
+    put32(call_delay_image, text + 0x404, 0x00000000u);
+    put32(call_delay_image, text + 0x500, jal(kLoad + 0x300));
+    put32(call_delay_image, text + 0x504, 0x3C088001u); // call delay LUI
+    put32(call_delay_image, text + 0x508, 0x25080400u);
+    put32(call_delay_image, text + 0x50C, 0x0100F809u);
+    put32(call_delay_image, text + 0x510, 0x00000000u);
+    put32(call_delay_image, text + 0x514, 0x03E00008u);
+    put32(call_delay_image, text + 0x518, 0x00000000u);
+    auto call_delay_exe = parse(call_delay_image);
+    PSXRecomp::FunctionAnalyzer call_delay_analyzer(call_delay_exe);
+    const auto call_delay = starts(
+        call_delay_analyzer.analyze_exact_entries({kLoad + 0x500}));
+    CHECK(call_delay.count(kLoad + 0x300) &&
+          !call_delay.count(kLoad + 0x400),
+          "indirect resolver rejects a LUI in a call delay slot");
 
     // A packed BIOS thunk is also a backward-scan boundary.  The frameless
     // leaf after its delay slot must not be swallowed into the thunk run.

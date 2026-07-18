@@ -310,6 +310,9 @@ uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
 
 /* Same-state differential — defined fully below; declared here for dispatch. */
 static int  s_diff_mode = 0;
+/* Optional diagnostic filter: when non-zero, shadow-diff only this candidate
+ * entry while every other validated candidate follows its normal live route. */
+static uint32_t s_diff_addr = 0;
 static int  s_in_shadow = 0;
 /* Candidate whose shadow NATIVE pass is currently executing (NULL outside it).
  * Set ONLY around run_shadow_diff's native pass — never during the interp pass,
@@ -497,6 +500,7 @@ void overlay_loader_static_match_stats(uint64_t *rehashes,
 
 /* ---- Per-DLL code-range manifest --------------------------------------- */
 /* Minimal line format emitted by tools/compile_overlays.py beside each DLL:
+ *   P <pair_id_hex>          optional DLL/manifest publication identity
  *   F <entry_hex>            start a function (entry = virtual export addr)
  *   R <lo_hex> <len_hex>     a code byte-range (virtual addr, byte length)
  * The recompiler's per-function instruction walk yields exactly the executed
@@ -511,8 +515,12 @@ typedef struct {
     int      n;
 } ManFn;
 
-static ManFn *parse_manifest(const char *path, int *out_n) {
+static ManFn *parse_manifest(const char *path, int *out_n,
+                             uint64_t *out_pair_id,
+                             int *out_has_pair_id) {
     *out_n = 0;
+    if (out_pair_id) *out_pair_id = 0;
+    if (out_has_pair_id) *out_has_pair_id = 0;
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
     int cap = 1024, n = 0;
@@ -521,7 +529,13 @@ static ManFn *parse_manifest(const char *path, int *out_n) {
     char line[160];
     ManFn *cur = NULL;
     while (fgets(line, sizeof(line), f)) {
-        if (line[0] == 'F') {
+        if (line[0] == 'P') {
+            unsigned long long parsed = 0;
+            if (sscanf(line + 1, "%llx", &parsed) == 1) {
+                if (out_pair_id) *out_pair_id = (uint64_t)parsed;
+                if (out_has_pair_id) *out_has_pair_id = 1;
+            }
+        } else if (line[0] == 'F') {
             uint32_t e = 0, crc = 0;
             int got = sscanf(line + 1, "%x %x", &e, &crc);
             if (got >= 1) {
@@ -817,7 +831,7 @@ static void rebuild_lazy_manifest_index(void) {
         snprintf(path + n - OVERLAY_SHARED_EXT_LEN,
                  sizeof(path) - (n - OVERLAY_SHARED_EXT_LEN), ".ranges");
         int man_n = 0;
-        ManFn *man = parse_manifest(path, &man_n);
+        ManFn *man = parse_manifest(path, &man_n, NULL, NULL);
         if (!man) continue;
         s_cache_idx[ci].func_count = man_n;
         s_cache_idx[ci].indexed_func_count = 0;
@@ -1084,22 +1098,6 @@ static void cache_idx_remove_path(const char *path) {
     }
 }
 
-static void remove_posix_dll_and_manifest(const char *dll_path) {
-#ifndef _WIN32
-    remove(dll_path);
-    char ranges[800];
-    int n = snprintf(ranges, sizeof(ranges), "%s", dll_path);
-    if (n >= OVERLAY_SHARED_EXT_LEN &&
-        (size_t)n + 7 - OVERLAY_SHARED_EXT_LEN < sizeof(ranges) &&
-        strcmp(ranges + n - OVERLAY_SHARED_EXT_LEN, OVERLAY_SHARED_EXT) == 0) {
-        memcpy(ranges + n - OVERLAY_SHARED_EXT_LEN, ".ranges", 8);
-        remove(ranges);
-    }
-#else
-    (void)dll_path;
-#endif
-}
-
 #ifndef _WIN32
 typedef struct PosixAbiSweep {
     int purged;
@@ -1128,7 +1126,8 @@ static int posix_abi_sweep_file(const PsxOverlayCacheFile *file, void *opaque) {
     else
         loader_log("ABI preflight rejecting unloadable %s: %s",
                    file->path, error);
-    remove_posix_dll_and_manifest(file->path);
+    /* Do not delete by canonical pathname after inspecting a loaded handle:
+     * an atomic publisher may already have replaced that path with a new file. */
     cache_idx_remove_path(file->path);
     sweep->purged++;
     return 0;
@@ -1143,8 +1142,9 @@ static int posix_abi_sweep_file(const PsxOverlayCacheFile *file, void *opaque) {
  * presented as a "(Not Responding)" black window for minutes (MMX6, 136-DLL
  * cache, the v10 migration, 2026-07-03 regression gate).
  *
- * Instead, sweep ONCE at scan time: load each indexed DLL, check overlay_abi,
- * delete mismatches (DLL + .ranges) and drop them from the index. A marker
+ * Instead, sweep at scan time: load each indexed DLL, check overlay_abi, and
+ * drop mismatches from the in-memory index. Never delete by canonical path
+ * after loading: a concurrent atomic publisher may have replaced that name. A marker
  * file (.abi_<tag>.ok) per cache dir records a completed sweep, so healthy
  * caches skip the sweep entirely on later boots — steady-state cost is one
  * stat per dir. Autocompile only ever writes current-ABI DLLs, so the marker
@@ -1177,15 +1177,9 @@ static void abi_preflight_sweep(const char *dir) {
                 FreeLibrary(h);
                 if (abi == PSX_OVERLAY_ABI_TAG) { kept++; continue; }
             }
-            /* Unloadable or wrong ABI: purge DLL + its .ranges + index entry. */
-            DeleteFileA(full);
-            char ranges[912];
-            size_t n = strlen(full);
-            if (n > 4 && n + 4 < sizeof ranges) {
-                memcpy(ranges, full, n - 4);
-                memcpy(ranges + n - 4, ".ranges", 8);
-                DeleteFileA(ranges);
-            }
+            /* Drop only the index entry. Deleting `full` here can delete a new
+             * shard atomically swapped in after LoadLibrary returned the old
+             * handle. The compiler owns on-disk replacement. */
             purged++;
             for (int i = 0; i < s_cache_idx_count; i++) {
                 if (strcmp(s_cache_idx[i].path, full) == 0) {
@@ -1197,12 +1191,15 @@ static void abi_preflight_sweep(const char *dir) {
         FindClose(hf);
     }
     if (purged)
-        loader_log("abi preflight: purged %d stale DLL(s), kept %d in %s",
+        loader_log("abi preflight: rejected %d stale DLL(s), kept %d in %s",
                    purged, kept, dir);
-    /* Mark the sweep complete (even if nothing purged) so later boots skip it. */
-    HANDLE m = CreateFileA(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (m != INVALID_HANDLE_VALUE) CloseHandle(m);
+    /* Rejected files remain until the compiler replaces them, so do not create
+     * a marker that would skip their in-memory rejection next boot. */
+    if (!purged) {
+        HANDLE m = CreateFileA(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        if (m != INVALID_HANDLE_VALUE) CloseHandle(m);
+    }
 #else
     char marker[900];
     snprintf(marker, sizeof marker, "%s/.abi_%08x.ok", dir,
@@ -1212,10 +1209,12 @@ static void abi_preflight_sweep(const char *dir) {
     PosixAbiSweep sweep = {0};
     psx_overlay_posix_scan_cache_dir(dir, posix_abi_sweep_file, &sweep);
     if (sweep.purged)
-        loader_log("abi preflight: purged %d stale DLL(s), kept %d in %s",
+        loader_log("abi preflight: rejected %d stale DLL(s), kept %d in %s",
                    sweep.purged, sweep.kept, dir);
-    FILE *m = fopen(marker, "wb");
-    if (m) fclose(m);
+    if (!sweep.purged) {
+        FILE *m = fopen(marker, "wb");
+        if (m) fclose(m);
+    }
 #endif
 }
 
@@ -1603,28 +1602,39 @@ static void init_callbacks(void) {
 /* ---- DLL loading and export enumeration -------------------------------- */
 
 #ifdef _WIN32
-static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll) {
+static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll,
+                            uint64_t manifest_pair_id,
+                            int manifest_has_pair_id) {
     HMODULE h = LoadLibraryA(dll_path);
     if (!h) {
         loader_log("LoadLibrary(%s) failed: %lu", dll_path, GetLastError());
         return 0;
     }
-    /* ABI gate: reject any DLL whose contract ABI doesn't match this
-     * runtime (pre-versioning DLLs lack the export entirely).  Delete the
-     * stale file so the autocompile path regenerates it with the current
-     * emitter. */
+    /* ABI gate: reject any DLL whose contract ABI doesn't match this runtime
+     * (pre-versioning DLLs lack the export entirely). The compiler, not this
+     * loaded handle, owns safe on-disk replacement. */
     typedef int (*AbiFn)(void);
     AbiFn abi_fn = (AbiFn)GetProcAddress(h, "overlay_abi");
     int abi = abi_fn ? abi_fn() : 0;
     /* Tag = ABI version (low 16) | codegen flavor (high 16). Mismatch on either
      * (wrong ABI, or a different-flavor cache e.g. widescreen vs base) is
-     * rejected + deleted so autocompile regenerates it for THIS build. */
+     * rejected so autocompile can replace it for THIS build. */
     if (abi != PSX_OVERLAY_ABI_TAG) {
         loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
-                   "and deleting stale cache entry", dll_path, abi,
+                   "without pathname deletion", dll_path, abi,
                    PSX_OVERLAY_ABI_TAG);
         FreeLibrary(h);
-        DeleteFileA(dll_path);
+        return 0;
+    }
+    typedef uint64_t (*PairIdFn)(void);
+    PairIdFn pair_fn = (PairIdFn)GetProcAddress(h, "overlay_pair_id");
+    int dll_has_pair_id = pair_fn != NULL;
+    uint64_t dll_pair_id = pair_fn ? pair_fn() : 0;
+    if (dll_has_pair_id != manifest_has_pair_id ||
+        (dll_has_pair_id && dll_pair_id != manifest_pair_id)) {
+        loader_log("DLL/manifest pair mismatch in %s -- rejecting without "
+                   "deleting (publication may be in progress)", dll_path);
+        FreeLibrary(h);
         return 0;
     }
     typedef void (*InitFn)(const OverlayCallbacks *);
@@ -1683,7 +1693,9 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     return registered;
 }
 #else
-static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll) {
+static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll,
+                            uint64_t manifest_pair_id,
+                            int manifest_has_pair_id) {
     char error[256] = {0};
     void *h = psx_overlay_posix_library_open(dll_path, error, sizeof(error));
     if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, error); return 0; }
@@ -1693,10 +1705,21 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     int abi = abi_fn ? abi_fn() : 0;
     if (abi != PSX_OVERLAY_ABI_TAG) {
         loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
-                   "and deleting stale cache entry", dll_path, abi,
+                   "without pathname deletion", dll_path, abi,
                    PSX_OVERLAY_ABI_TAG);
         psx_overlay_posix_library_close(h);
-        remove_posix_dll_and_manifest(dll_path);
+        return 0;
+    }
+    typedef uint64_t (*PairIdFn)(void);
+    PairIdFn pair_fn = (PairIdFn)psx_overlay_posix_library_symbol(
+        h, "overlay_pair_id");
+    int dll_has_pair_id = pair_fn != NULL;
+    uint64_t dll_pair_id = pair_fn ? pair_fn() : 0;
+    if (dll_has_pair_id != manifest_has_pair_id ||
+        (dll_has_pair_id && dll_pair_id != manifest_pair_id)) {
+        loader_log("DLL/manifest pair mismatch in %s -- rejecting without "
+                   "deleting (publication may be in progress)", dll_path);
+        psx_overlay_posix_library_close(h);
         return 0;
     }
     typedef void (*InitFn)(const OverlayCallbacks *);
@@ -1864,6 +1887,12 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
             s_diff_mode = 1;
             loader_log("PSX_OVERLAY_DIFF set: native/interp shadow diff ON from boot");
         }
+        const char *diff_addr = getenv("PSX_OVERLAY_DIFF_ADDR");
+        if (diff_addr && *diff_addr) {
+            s_diff_addr = (uint32_t)strtoul(diff_addr, NULL, 0);
+            loader_log("PSX_OVERLAY_DIFF_ADDR set: shadow diff restricted to 0x%08X",
+                       s_diff_addr);
+        }
     }
     s_active = 1;
 }
@@ -1942,13 +1971,19 @@ static int load_one_dll(const char *dll_path) {
                  sizeof(ranges_path) - (plen - OVERLAY_SHARED_EXT_LEN), ".ranges");
 
     int man_n = 0;
-    ManFn *man = parse_manifest(ranges_path, &man_n);
+    uint64_t manifest_pair_id = 0;
+    int manifest_has_pair_id = 0;
+    ManFn *man = parse_manifest(ranges_path, &man_n,
+                                &manifest_pair_id,
+                                &manifest_has_pair_id);
     if (!man || man_n == 0) {
         loader_log("no/empty manifest %s — DLL left to interpreter", ranges_path);
         free(man);
         return 0;
     }
-    int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls);
+    int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls,
+                                      manifest_pair_id,
+                                      manifest_has_pair_id);
 #ifdef _WIN32
     QueryPerformanceCounter(&q1);
     QueryPerformanceFrequency(&qf);
@@ -2359,7 +2394,8 @@ retry_candidates:
                  * too — the blocklist blocks LIVE native, not the sandbox). */
                 int in_own_shadow = (s_in_shadow && (const void *)c == s_shadow_cand);
                 if (!in_own_shadow) {
-                    int want_diff = s_diff_mode;
+                    int want_diff = s_diff_mode &&
+                                    (!s_diff_addr || phys == (s_diff_addr & 0x1FFFFFFFu));
                     if (want_diff && addr < 0x10000u) want_diff = 0;
                     if (want_diff && c->diff_passes < OVERLAY_DIFF_BUDGET) {
                         if (_probe) s_cps_probe_outcome = 5;
@@ -2465,7 +2501,8 @@ retry_candidates:
              * gcc/DLL candidates are the trusted tier (validated at dev time) and
              * run native directly; they are diffed only in explicit dev diff mode
              * (PSX_OVERLAY_DIFF / overlay_diff cmd). */
-            int want_diff = s_diff_mode;
+            int want_diff = s_diff_mode &&
+                            (!s_diff_addr || phys == (s_diff_addr & 0x1FFFFFFFu));
             /* Kernel-window candidates (call gates 0xA0/0xB0/0xC0 and the RAM
              * kernel) are NOT shadow-diffable: the gates tail-jump via RAM
              * tables into kernel SERVICES whose behavior depends on scheduler/

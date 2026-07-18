@@ -475,6 +475,8 @@ namespace {
 enum class ExactCfKind {
     Normal,
     Branch,
+    BranchNever,
+    BranchNeverLikely,
     Jump,
     Jal,
     JrRa,
@@ -490,9 +492,13 @@ struct ExactCf {
 struct ExactWalkResult {
     std::set<uint32_t> visited;
     std::set<uint32_t> direct_jal_targets;
+    // target -> reachable (source PC, was resolved jalr/jr) evidence
+    std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> transfer_sources;
     std::set<uint32_t> jump_table_targets;
     uint32_t jr_ra_count = 0;
 };
+
+static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr);
 
 static bool exact_is_jr_ra_word(uint32_t instr) {
     return instr == 0x03E00008u;
@@ -592,6 +598,44 @@ static bool exact_resolve_constant_transfer(const PS1Executable& exe,
             continue;
         }
         if (opcode == 0x0Fu && rt == target_reg) {
+            // A definition in a control-transfer delay slot is not a local
+            // reaching definition for the linear suffix.  A call can clobber
+            // the register before returning at pc+4; a branch/jump can enter a
+            // different path entirely.  Without path/interprocedural proof,
+            // reject every such candidate rather than combine raw words.
+            if (pc >= entry + 4u) {
+                auto predecessor = exe.read_word(pc - 4u);
+                if (predecessor.has_value()) {
+                    uint32_t predecessor_op = (*predecessor >> 26) & 0x3Fu;
+                    if (FunctionAnalyzer::is_branch_or_jump(*predecessor) ||
+                        (predecessor_op >= 0x14u && predecessor_op <= 0x17u)) {
+                        return false;
+                    }
+                }
+            }
+
+            // A linear backward scan is only a reaching-definition proof when
+            // no direct control-flow edge can enter the suffix after this LUI.
+            // For example, `j low; lui rN,hi; low: addiu rN,rN,lo; jalr rN`
+            // skips the LUI at runtime.  Without this boundary check the raw
+            // words still look like a constant pair and manufacture a target.
+            bool crossed_inbound_boundary = false;
+            for (uint32_t source = entry; source < transfer_pc; source += 4u) {
+                auto source_word = exe.read_word(source);
+                if (!source_word.has_value()) continue;
+                ExactCf source_cf = exact_classify_cf(source, *source_word);
+                bool has_direct_target =
+                    source_cf.kind == ExactCfKind::Branch ||
+                    source_cf.kind == ExactCfKind::Jump ||
+                    source_cf.kind == ExactCfKind::Jal;
+                if (has_direct_target && source_cf.target > pc &&
+                    source_cf.target <= transfer_pc) {
+                    crossed_inbound_boundary = true;
+                    break;
+                }
+            }
+            if (crossed_inbound_boundary) return false;
+
             uint32_t upper = (instr & 0xFFFFu) << 16;
             if (!have_low) {
                 target_out = upper;
@@ -633,8 +677,79 @@ static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
         cf.target = exact_jump_target(pc, instr);
         return cf;
     }
+    uint32_t rt = (instr >> 16) & 0x1Fu;
+
+    // `beq rN,rN,target` is an unconditional branch. Treating its
+    // syntactic fallthrough as reachable lets raw data after the delay slot
+    // manufacture call/ownership evidence.
+    if ((opcode == 0x04u || opcode == 0x14u) && rs == rt) {
+        cf.kind = ExactCfKind::Jump;
+        cf.target = exact_branch_target(pc, instr);
+        return cf;
+    }
+    // Conversely, `bne rN,rN,target` can never take its encoded target.  Keep
+    // its delay slot and PC+8 path, but never walk target-shaped data.
+    if (opcode == 0x05u && rs == rt) {
+        cf.kind = ExactCfKind::BranchNever;
+        return cf;
+    }
+    // Branch-likely annuls its delay slot when the condition is false.
+    if (opcode == 0x15u && rs == rt) {
+        cf.kind = ExactCfKind::BranchNeverLikely;
+        return cf;
+    }
+    // Conditions against the architectural zero register are also exact.
+    if (opcode == 0x06u && rs == 0u) { // blez $zero
+        cf.kind = ExactCfKind::Jump;
+        cf.target = exact_branch_target(pc, instr);
+        return cf;
+    }
+    if (opcode == 0x07u && rs == 0u) { // bgtz $zero
+        cf.kind = ExactCfKind::BranchNever;
+        return cf;
+    }
+    if (opcode == 0x16u && rs == 0u) { // blezl $zero
+        cf.kind = ExactCfKind::Jump;
+        cf.target = exact_branch_target(pc, instr);
+        return cf;
+    }
+    if (opcode == 0x17u && rs == 0u) { // bgtzl $zero
+        cf.kind = ExactCfKind::BranchNeverLikely;
+        return cf;
+    }
+    if (opcode == 0x01u && rs == 0u) {
+        // BLTZ/BLTZAL (and likely forms) are false for zero; BGEZ forms are
+        // true.  The link-true forms are BAL/BALL aliases, so model their
+        // target and return continuation like a call rather than a tail jump.
+        if (rt == 0x00u || rt == 0x10u) {
+            cf.kind = ExactCfKind::BranchNever;
+            return cf;
+        }
+        if (rt == 0x02u || rt == 0x12u) {
+            cf.kind = ExactCfKind::BranchNeverLikely;
+            return cf;
+        }
+        if (rt == 0x01u || rt == 0x03u) {
+            cf.kind = ExactCfKind::Jump;
+            cf.target = exact_branch_target(pc, instr);
+            return cf;
+        }
+        if (rt == 0x11u || rt == 0x13u) { // bal / ball aliases
+            cf.kind = ExactCfKind::Jal;
+            cf.target = exact_branch_target(pc, instr);
+            return cf;
+        }
+    }
     if (opcode == 0x01u || (opcode >= 0x04u && opcode <= 0x07u) ||
         (opcode >= 0x14u && opcode <= 0x17u)) {
+        cf.kind = ExactCfKind::Branch;
+        cf.target = exact_branch_target(pc, instr);
+        return cf;
+    }
+    // COP1/COP2 condition branches are ordinary conditional branches.  COP1
+    // is not present on PS1, but classifying both keeps raw control-flow and
+    // delay-slot boundaries conservative for composite inputs.
+    if ((opcode == 0x11u || opcode == 0x12u) && rs == 0x08u) {
         cf.kind = ExactCfKind::Branch;
         cf.target = exact_branch_target(pc, instr);
         return cf;
@@ -697,12 +812,16 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         if (producer_ranges.empty()) return true;
         int source_producer = producer_for(source);
         int target_producer = producer_for(addr);
-        if (source_producer >= 0 && source_producer == target_producer)
+        // A composite's uncovered padding is not a producer.  In particular,
+        // two gap addresses both map to -1 and must not be treated as sharing
+        // ownership, nor may an allow-list bless a target with no producer.
+        if (source_producer < 0 || target_producer < 0) return false;
+        if (source_producer == target_producer)
             return true;
         return cross_call_allow.count(addr) != 0;
     };
 
-    auto find_jump_table_targets = [&](uint32_t entry, uint32_t hard_cap,
+    [[maybe_unused]] auto find_jump_table_targets = [&](uint32_t entry, uint32_t hard_cap,
                                        uint32_t jr_pc, uint32_t jr_rs) {
         std::vector<uint32_t> targets;
         uint32_t lw_base = 0xFFu;
@@ -789,9 +908,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         ExactWalkResult wr;
         std::queue<uint32_t> work;
         work.push(entry);
+        const int entry_producer = producer_for(entry);
 
         auto in_function = [&](uint32_t addr) {
-            return in_exe(addr) && addr >= entry && addr < hard_cap;
+            return in_exe(addr) && addr >= entry && addr < hard_cap &&
+                   (producer_ranges.empty() ||
+                    (entry_producer >= 0 &&
+                     producer_for(addr) == entry_producer));
         };
 
         while (!work.empty()) {
@@ -816,6 +939,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                 if (in_function(pc + 8u)) work.push(pc + 8u);
                 if (in_function(cf.target)) work.push(cf.target);
                 break;
+            case ExactCfKind::BranchNever:
+                if (in_function(delay)) wr.visited.insert(delay);
+                if (in_function(pc + 8u)) work.push(pc + 8u);
+                break;
+            case ExactCfKind::BranchNeverLikely:
+                if (in_function(pc + 8u)) work.push(pc + 8u);
+                break;
             case ExactCfKind::Jump:
                 if (in_function(delay)) wr.visited.insert(delay);
                 if (in_function(cf.target)) work.push(cf.target);
@@ -826,6 +956,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                 if (in_exe(cf.target) &&
                     callable_direct_jal_target(pc, cf.target)) {
                     wr.direct_jal_targets.insert(cf.target);
+                    wr.transfer_sources[cf.target].insert(
+                        std::make_pair(pc, false));
                 }
                 break;
             case ExactCfKind::Jalr:
@@ -839,6 +971,8 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                         in_exe(target) &&
                         callable_direct_jal_target(pc, target)) {
                         wr.direct_jal_targets.insert(target);
+                        wr.transfer_sources[target].insert(
+                            std::make_pair(pc, true));
                     }
                 }
                 break;
@@ -861,13 +995,14 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                             // An absolute JR out of the current function is a
                             // statically proven tail-call entry.
                             wr.direct_jal_targets.insert(target);
+                            wr.transfer_sources[target].insert(
+                                std::make_pair(pc, true));
                         }
                     } else {
-                        for (uint32_t jt : find_jump_table_targets(entry, hard_cap,
-                                                                   pc, jr_rs)) {
-                            wr.jump_table_targets.insert(jt);
-                            if (in_function(jt)) work.push(jt);
-                        }
+                        // Fail closed: the former 40-word raw backscan could
+                        // combine unrelated loads/constants into a synthetic
+                        // jump table. Unresolved JR cases stay interpreted until
+                        // register/control dependence is proven.
                     }
                 }
                 break;
@@ -879,10 +1014,14 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     std::set<uint32_t> known_entries;
     for (uint32_t entry : entries) {
         if (!in_exe(entry)) continue;
+        if (!producer_ranges.empty() && producer_for(entry) < 0) continue;
         known_entries.insert(entry);
     }
 
     size_t explicit_count = known_entries.size();
+    const std::set<uint32_t> explicit_entries = known_entries;
+    std::set<uint32_t> derived_entries;
+    std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> derived_evidence;
     fmt::print("Explicit entries: {}\n", explicit_count);
 
     // Discover callees in rounds against one stable entry partition. Processing
@@ -890,30 +1029,72 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     // lay inside a later explicit root. That new entry hard-capped the later
     // root before it was walked (Tomba X01's jump-table host), splitting one
     // function and losing every case after the accidental cap. If a candidate
-    // is already owned by any walk in the current partition, leave it absorbed;
-    // main_psx's range-ownership pass materializes it as an interior alias.
+    // is already owned by any walk in the final partition, leave it absorbed;
+    // the analyzer exports that proven host mapping for main_psx to materialize.
+    uint32_t discovery_round = 0;
+    std::set<std::pair<std::set<uint32_t>, std::set<uint32_t>>> seen_states;
     while (true) {
+        auto state = std::make_pair(known_entries, derived_entries);
+        if (++discovery_round > 64u || !seen_states.insert(state).second) {
+            fmt::print("WARNING: exact-entry ownership did not converge; "
+                       "falling back to explicit roots only\n");
+            known_entries = explicit_entries;
+            derived_entries.clear();
+            derived_evidence.clear();
+            break;
+        }
+        const std::set<uint32_t> previous_entries = known_entries;
+        const std::set<uint32_t> previous_derived = derived_entries;
         std::vector<uint32_t> round_entries(
             known_entries.begin(), known_entries.end());
-        std::set<uint32_t> owned_addresses;
         std::set<uint32_t> candidate_targets;
+        std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> candidate_evidence;
         for (size_t i = 0; i < round_entries.size(); i++) {
             uint32_t hard_cap = (i + 1 < round_entries.size())
                 ? round_entries[i + 1] : exe_.end_address();
             ExactWalkResult wr = walk(round_entries[i], hard_cap);
-            owned_addresses.insert(wr.visited.begin(), wr.visited.end());
             candidate_targets.insert(wr.direct_jal_targets.begin(),
                                      wr.direct_jal_targets.end());
+            for (const auto& [target, evidence] : wr.transfer_sources)
+                candidate_evidence[target].insert(
+                    evidence.begin(), evidence.end());
         }
 
-        bool added = false;
-        for (uint32_t target : candidate_targets) {
-            if (known_entries.count(target) || owned_addresses.count(target))
+        derived_entries.clear();
+        derived_evidence.clear();
+        for (uint32_t target : candidate_targets)
+            if (!explicit_entries.count(target)) {
+                derived_entries.insert(target);
+                auto evidence = candidate_evidence.find(target);
+                if (evidence != candidate_evidence.end())
+                    derived_evidence.emplace(target, evidence->second);
+            }
+
+        // Rebuild ownership FROM SCRATCH whenever the candidate universe grows.
+        // A target B absorbed by A in one round may need to become a root after
+        // a later target X lands between A and B and caps A. A monotonic
+        // "absorbed forever" set therefore loses reachable code.
+        known_entries = explicit_entries;
+        known_entries.insert(derived_entries.begin(), derived_entries.end());
+        for (uint32_t target : derived_entries) {
+            auto target_it = known_entries.find(target);
+            if (target_it == known_entries.end() ||
+                explicit_entries.count(target) ||
+                target_it == known_entries.begin()) {
                 continue;
-            known_entries.insert(target);
-            added = true;
+            }
+            auto owner_it = std::prev(target_it);
+            auto next_it = std::next(target_it);
+            uint32_t hard_cap = next_it != known_entries.end()
+                ? *next_it : exe_.end_address();
+            ExactWalkResult owner_walk = walk(*owner_it, hard_cap);
+            if (owner_walk.visited.count(target)) {
+                known_entries.erase(target_it);
+            }
         }
-        if (!added) break;
+
+        if (known_entries == previous_entries &&
+            derived_entries == previous_derived) break;
     }
 
     result.call_discovered_count = static_cast<int>(known_entries.size() - explicit_count);
@@ -953,7 +1134,42 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
 
         result.jr_ra_count += static_cast<int>(wr.jr_ra_count);
         result.total_instructions += static_cast<int>(wr.visited.size());
+        result.exact_reachable_pcs.insert(wr.visited.begin(), wr.visited.end());
         result.functions.push_back(func);
+    }
+
+    // Export only analyzer-proven aliases with a host in the FINAL partition.
+    // Re-walking final roots makes stale ownership impossible: if a later root
+    // now caps the old host before B, B is either a real root or absent here.
+    std::set<uint32_t> final_starts(known_entries.begin(), known_entries.end());
+    std::vector<std::pair<Function, ExactWalkResult>> final_walks;
+    for (size_t i = 0; i < starts_vec.size(); i++) {
+        uint32_t host_start = starts_vec[i];
+        uint32_t hard_cap = (i + 1 < starts_vec.size())
+            ? starts_vec[i + 1] : exe_.end_address();
+        ExactWalkResult wr = walk(host_start, hard_cap);
+        if (wr.visited.empty()) continue;
+        uint32_t host_end = *wr.visited.rbegin() + 4u;
+        Function host{};
+        host.start_addr = host_start;
+        host.end_addr = host_end;
+        final_walks.push_back({host, std::move(wr)});
+    }
+    for (uint32_t target : derived_entries) {
+        if (final_starts.count(target)) continue;
+        for (const auto& [host, wr] : final_walks) {
+            if (!wr.visited.count(target)) continue;
+            auto evidence = derived_evidence.find(target);
+            if (evidence == derived_evidence.end()) break;
+            auto source = std::find_if(
+                evidence->second.begin(), evidence->second.end(),
+                [&](const auto& item) { return wr.visited.count(item.first); });
+            if (source == evidence->second.end()) break;
+            result.absorbed_entries.push_back(
+                {target, host.start_addr, host.end_addr,
+                 source->first, source->second});
+            break;
+        }
     }
 
     return result;
@@ -1436,6 +1652,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
                 if (in_fn(delay)) visited.insert(delay);
                 if (in_fn(pc + 8u)) work.push(pc + 8u);
                 if (in_fn(cf.target)) work.push(cf.target);
+                break;
+            case ExactCfKind::BranchNever:
+                if (in_fn(delay)) visited.insert(delay);
+                if (in_fn(pc + 8u)) work.push(pc + 8u);
+                break;
+            case ExactCfKind::BranchNeverLikely:
+                if (in_fn(pc + 8u)) work.push(pc + 8u);
                 break;
             case ExactCfKind::Jump:
                 if (in_fn(delay)) visited.insert(delay);

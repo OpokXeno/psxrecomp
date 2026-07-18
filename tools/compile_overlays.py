@@ -23,8 +23,12 @@ Each DLL exports:
 import argparse
 import base64
 import binascii
+from bisect import bisect_left
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+import glob
+import hashlib
 import os
 import re
 import struct
@@ -32,6 +36,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import uuid
 
 
 class _ThreadLocalStdout:
@@ -80,6 +86,17 @@ def codegen_ver(runtime_include: str) -> int:
     if not m:
         raise SystemExit(f'PSX_OVERLAY_CODEGEN_VER not found in {hdr}')
     return int(m.group(1))
+
+
+def overlay_abi_tag(runtime_include: str, flavor: int) -> int:
+    """Return the exact ABI/flavor export expected from a cached shard."""
+    hdr = os.path.join(runtime_include, 'overlay_api.h')
+    with open(hdr) as source:
+        match = re.search(
+            r'#define\s+PSX_OVERLAY_ABI_VERSION\s+(\d+)', source.read())
+    if not match:
+        raise SystemExit(f'PSX_OVERLAY_ABI_VERSION not found in {hdr}')
+    return (int(match.group(1)) & 0xFFFF) | ((int(flavor) & 0xFFFF) << 16)
 
 
 def codegen_hash(runtime_include: str) -> int:
@@ -427,8 +444,10 @@ def _is_control_flow(word) -> bool:
         return False
     op = (word >> 26) & 0x3F
     fn = word & 0x3F
-    return op in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                  0x14, 0x15, 0x16, 0x17) or (op == 0 and fn in (0x08, 0x09))
+    return (op in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                   0x14, 0x15, 0x16, 0x17) or
+            (op == 0 and fn in (0x08, 0x09)) or
+            (op in (0x11, 0x12) and ((word >> 21) & 0x1F) == 0x08))
 
 
 def _is_valid_mips_word(word) -> bool:
@@ -485,6 +504,30 @@ def _classify_cf(pc: int, word: int) -> tuple[str, int]:
         return ('j', _jump_target(pc, word))
     if op == 0x03:
         return ('jal', _jump_target(pc, word))
+    rt = (word >> 16) & 0x1F
+    if op in (0x04, 0x14) and rs == rt:
+        return ('j', _branch_target(pc, word))
+    if op == 0x05 and rs == rt:
+        return ('branch_never', 0)
+    if op == 0x15 and rs == rt:
+        return ('branch_never_likely', 0)
+    if op in (0x06, 0x16) and rs == 0:
+        return ('j', _branch_target(pc, word))
+    if op == 0x07 and rs == 0:
+        return ('branch_never', 0)
+    if op == 0x17 and rs == 0:
+        return ('branch_never_likely', 0)
+    if op == 0x01 and rs == 0:
+        if rt in (0x00, 0x10):       # bltz / bltzal
+            return ('branch_never', 0)
+        if rt in (0x02, 0x12):       # bltzl / bltzall
+            return ('branch_never_likely', 0)
+        if rt in (0x01, 0x03):       # bgez / bgezl
+            return ('j', _branch_target(pc, word))
+        if rt in (0x11, 0x13):       # bal / ball aliases: target + continuation
+            return ('jal', _branch_target(pc, word))
+    if op in (0x11, 0x12) and rs == 0x08:
+        return ('branch', _branch_target(pc, word))
     if op in (0x01, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17):
         return ('branch', _branch_target(pc, word))
     return ('normal', 0)
@@ -493,76 +536,12 @@ def _classify_cf(pc: int, word: int) -> tuple[str, int]:
 def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
                              entry: int, hard_cap: int,
                              jr_pc: int, jr_rs: int) -> set[int]:
-    """Recognize the compiler's local jump-table idiom feeding `jr reg`."""
-    lw_base = None
-    lw_offset = 0
-    addu_cand = [None, None]
-    lui_val = None
-    addiu_val = [0, 0]
-    found_addiu = [False, False]
-    table_count = 0
+    """Fail closed until JR-table register/control dependence is proven.
 
-    for back in range(1, 41):
-        scan_addr = jr_pc - back * 4
-        if scan_addr < entry:
-            break
-        word = _word_at(data, load_addr, scan_addr)
-        if word is None:
-            break
-        op = (word >> 26) & 0x3F
-        rs = (word >> 21) & 0x1F
-        rt = (word >> 16) & 0x1F
-        rd = (word >> 11) & 0x1F
-        fn = word & 0x3F
-
-        if op == 0x23 and rt == jr_rs and lw_base is None:
-            lw_base = rs
-            lw_offset = word & 0xFFFF
-            if lw_offset & 0x8000:
-                lw_offset -= 0x10000
-            continue
-        if op == 0x00 and fn == 0x21 and lw_base is not None and rd == lw_base \
-                and addu_cand[0] is None:
-            addu_cand = [rs, rt]
-            continue
-        if op == 0x09 and addu_cand[0] is not None:
-            for i, cand in enumerate(addu_cand):
-                if cand is not None and not found_addiu[i] and rs == cand and rt == cand:
-                    imm = word & 0xFFFF
-                    if imm & 0x8000:
-                        imm -= 0x10000
-                    addiu_val[i] = imm
-                    found_addiu[i] = True
-                    break
-            continue
-        if op == 0x0F and addu_cand[0] is not None and lui_val is None:
-            for i, cand in enumerate(addu_cand):
-                if cand is not None and rt == cand:
-                    lui_val = (word & 0xFFFF) << 16
-                    addiu_val[0] = addiu_val[i] if found_addiu[i] else 0
-                    found_addiu[0] = found_addiu[i]
-                    break
-            continue
-        if op == 0x0B and table_count == 0:
-            table_count = word & 0xFFFF
-            continue
-        if lui_val is not None and table_count:
-            break
-
-    if lui_val is None or table_count == 0 or table_count >= 512:
-        return set()
-
-    table_base = lui_val + (addiu_val[0] if found_addiu[0] else 0) + lw_offset
-    lo = load_addr
-    hi = load_addr + size
-    targets = set()
-    for i in range(table_count):
-        target = _word_at(data, load_addr, table_base + i * 4)
-        if target is None:
-            continue
-        if lo <= target < hi and entry <= target < hard_cap and (target & 3) == 0:
-            targets.add(target)
-    return targets
+    The former 40-word raw backscan could combine unrelated loads, constants,
+    and bounds checks across basic blocks into a synthetic table.
+    """
+    return set()
 
 
 def _callable_legacy_seed(data: bytes, load_addr: int, addr: int) -> bool:
@@ -643,6 +622,31 @@ def _resolve_constant_transfer(data: bytes, load_addr: int,
             low_is_addiu = op == 0x09
             continue
         if op == 0x0F and rt == target_reg:
+            # A LUI in a control-transfer delay slot is not a local reaching
+            # definition for the following suffix. A callee may clobber the
+            # register before returning at LUI+4, while a branch/jump can leave
+            # the linear path entirely. Fail closed without path/call proof.
+            predecessor = _word_at(data, load_addr, pc - 4)
+            if pc >= entry + 4 and _is_control_flow(predecessor):
+                return None
+
+            # Reject a syntactic constant pair when a direct control-flow edge
+            # can enter after this LUI.  Example: `j low; lui; low: addiu;
+            # jalr` never executes the LUI, despite looking like a pair to a
+            # raw backward scan.
+            crossed_inbound_boundary = False
+            for source in range(entry, transfer_pc, 4):
+                source_word = _word_at(data, load_addr, source)
+                if source_word is None:
+                    continue
+                source_kind, source_target = _classify_cf(source, source_word)
+                if (source_kind in ('branch', 'j', 'jal') and
+                        pc < source_target <= transfer_pc):
+                    crossed_inbound_boundary = True
+                    break
+            if crossed_inbound_boundary:
+                return None
+
             upper = (word & 0xFFFF) << 16
             if low is None:
                 return upper
@@ -711,6 +715,11 @@ def plausible_callable_target(data: bytes, load_addr: int, size: int,
             if inside(branch_target):
                 work.append(branch_target)
             # An out-of-probe branch target is a shared external code edge.
+        elif kind == 'branch_never':
+            add_delay(pc)
+            work.append(pc + 8)
+        elif kind == 'branch_never_likely':
+            work.append(pc + 8)
         elif kind in ('jal', 'jalr'):
             add_delay(pc)
             work.append(pc + 8)
@@ -735,9 +744,6 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     lo = load_addr
     hi = load_addr + size
 
-    def in_function(addr: int) -> bool:
-        return lo <= addr < hi and entry <= addr < hard_cap and (addr & 3) == 0
-
     work = deque([entry])
     visited = set()
     direct_jals = set()
@@ -754,6 +760,15 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 return range_lo, range_hi
         return None
 
+    entry_producer = producer_for(entry)
+
+    def in_function(addr: int) -> bool:
+        return (lo <= addr < hi and entry <= addr < hard_cap and
+                (addr & 3) == 0 and
+                (not producer_ranges or
+                 (entry_producer is not None and
+                  producer_for(addr) == entry_producer)))
+
     def callable_transfer_target(source: int, target: int) -> bool:
         if _dense_local_pointer_table(data, load_addr, target):
             rejected_cross_producer_calls.add(target)
@@ -762,6 +777,9 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             return True
         source_range = producer_for(source)
         target_range = producer_for(target)
+        if source_range is None or target_range is None:
+            rejected_cross_producer_calls.add(target)
+            return False
         if source_range is not None and source_range == target_range:
             return True
         if not allow_cross_producer_calls:
@@ -811,6 +829,16 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 # Exact-entry partitioning hard-caps the current walk there,
                 # but the target remains mechanically proven code reachability.
                 forward_branch_targets.add(target)
+        elif kind == 'branch_never':
+            if in_function(delay):
+                visited.add(delay)
+            if in_function(pc + 8):
+                work.append(pc + 8)
+                branch_targets.add(pc + 8)
+        elif kind == 'branch_never_likely':
+            if in_function(pc + 8):
+                work.append(pc + 8)
+                branch_targets.add(pc + 8)
         elif kind == 'j':
             if in_function(delay):
                 visited.add(delay)
@@ -921,6 +949,12 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
            for i in range(1, len(producer_ranges))):
         raise RuntimeError('producer_ranges overlap')
 
+    def capture_producer_for(addr: int):
+        for producer_lo, producer_hi in producer_ranges:
+            if producer_lo <= addr < producer_hi:
+                return producer_lo, producer_hi
+        return None
+
     static_alias_ranges = set()
     allow_cross_producer_calls = not bool(cap.get('strict_producer_ranges'))
     for raw_alias in cap.get('static_alias_ranges', []) or []:
@@ -940,6 +974,15 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                 f'static alias 0x{entry:08X} -> '
                 f'0x{range_lo:08X}..0x{range_hi:08X} outside/misaligned for '
                 f'capture 0x{lo:08X}..0x{hi:08X}')
+        if producer_ranges:
+            owners = [index for index, (producer_lo, producer_hi) in
+                      enumerate(producer_ranges)
+                      if (producer_lo <= range_lo < producer_hi and
+                          producer_lo <= entry < producer_hi and
+                          producer_lo <= range_hi - 1 < producer_hi)]
+            if not owners:
+                raise RuntimeError(
+                    f'static alias 0x{entry:08X} crosses producer boundary')
         static_alias_ranges.add((entry, range_lo, range_hi))
 
     schema_keys = {'executed_pcs', 'observed_pcs', 'dispatch_entry_pcs',
@@ -993,6 +1036,12 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
 
     def include(addr: int, reason: str):
         if not region(addr):
+            excluded[addr] = 'UNKNOWN'
+            return
+        # Composite padding has bytes but no producer identity.  A root there
+        # would otherwise get entry_producer=None and could walk through every
+        # disconnected zero-fill gap as though those gaps shared ownership.
+        if producer_ranges and capture_producer_for(addr) is None:
             excluded[addr] = 'UNKNOWN'
             return
         # Boundary gate: a dispatched-to PC is proof of *code reachability*, not
@@ -1058,86 +1107,141 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         for addr in legacy_callable_seeds:
             include(addr, 'FUNCTION_POINTER_TARGET')
 
+    # Current-capture alias recipes contribute only an interior ENTRY candidate;
+    # their historical host range is not trusted. Final exact reachability below
+    # must discover a current host or the entry is dropped to the interpreter.
+    for addr, _range_lo, _range_hi in static_alias_ranges:
+        if region(addr):
+            included[addr] = 'DISPATCH_INTERIOR'
+
     # Walk roots: callable entries only. DISPATCH_INTERIOR addresses are NOT
     # roots — as roots they would hard-cap (truncate) the sibling walk that
     # owns them.
     known = {a for a, r in included.items() if r != 'DISPATCH_INTERIOR'}
-    # Establish range ownership before call-derived roots can change the
-    # partition. A direct-call target already visited by an existing root is an
-    # interior alias, not a sibling root: promoting it would hard-cap the host
-    # and can hide the remainder of a jump-table function.
-    initial_owned = set()
     initial_known = set(known)
-    initial_sorted = sorted(initial_known)
-    for index, entry in enumerate(initial_sorted):
-        hard_cap = initial_sorted[index + 1] if index + 1 < len(initial_sorted) else hi
-        walk = _walk_overlay_function(
-            data, load_addr, size, entry, hard_cap, producer_ranges,
-            allow_cross_producer_calls)
-        initial_owned.update(walk['visited'])
-
-    pending = deque(sorted(known))
-    processed = set()
+    derived_reasons = {}
+    promoted_roots = set()
+    suppressed_derived = set()
+    suppression_passes = 0
     all_branch_targets = set()
     kernel_window = (load_addr & 0x1FFFFFFF) < 0x10000
 
     while True:
-        while pending:
-            entry = pending.popleft()
-            if entry in processed:
-                continue
-            processed.add(entry)
+        # Recompute call/branch evidence from the CURRENT partition. Evidence is
+        # not monotonic: a new hard cap can make an old source PC unreachable.
+        # Dropping stale candidates here prevents an old speculative walk from
+        # resurrecting a target in the final shard.
+        discovery_round = 0
+        seen_states = {}
+        state_history = []
+        while True:
+            discovery_round += 1
+            state = (tuple(sorted(known)), tuple(sorted(derived_reasons)))
+            cycle_start = seen_states.get(state)
+            if discovery_round > 64 or cycle_start is not None:
+                unstable = set()
+                if cycle_start is not None:
+                    cycle_states = state_history[cycle_start:]
+                    known_sets = [set(item[0]) for item in cycle_states]
+                    derived_sets = [set(item[1]) for item in cycle_states]
+                    if known_sets:
+                        unstable |= set.union(*known_sets) - set.intersection(*known_sets)
+                    if derived_sets:
+                        unstable |= (set.union(*derived_sets) -
+                                     set.intersection(*derived_sets))
+                unstable_text = ','.join(f'{addr:08X}'
+                                         for addr in sorted(unstable)[:12])
+                unstable -= initial_known | promoted_roots
+                if unstable and suppression_passes < 64:
+                    suppression_passes += 1
+                    suppressed_derived.update(unstable)
+                    print('  WARNING: ownership discovery cycle; suppressing '
+                          f'{len(unstable)} unstable derived roots'
+                          + (f' ({unstable_text})' if unstable_text else ''))
+                    known = initial_known | promoted_roots
+                    derived_reasons = {}
+                    discovery_round = 0
+                    seen_states = {}
+                    state_history = []
+                    continue
+                print('  WARNING: ownership discovery did not converge; '
+                      'falling back to explicit/dispatch roots'
+                      + (f' (cycle={len(state_history) - cycle_start}, '
+                         f'unstable={unstable_text})'
+                         if cycle_start is not None else ' (round limit)'))
+                known = initial_known | promoted_roots
+                derived_reasons = {}
+                break
+            seen_states[state] = len(state_history)
+            state_history.append(state)
+            next_reasons = {}
+            round_branch_targets = set()
             sorted_known = sorted(known)
-            hard_cap = next((x for x in sorted_known if x > entry), hi)
-            walk = _walk_overlay_function(
-                data, load_addr, size, entry, hard_cap, producer_ranges,
-                allow_cross_producer_calls)
-            all_branch_targets.update(walk['branch_targets'])
-            all_branch_targets.update(walk['jump_table_targets'])
-            for target in sorted(walk['direct_jals']):
-                if target not in initial_known and target in initial_owned:
-                    included[target] = 'DISPATCH_INTERIOR'
+            for index, entry in enumerate(sorted_known):
+                hard_cap = (sorted_known[index + 1]
+                            if index + 1 < len(sorted_known) else hi)
+                walk = _walk_overlay_function(
+                    data, load_addr, size, entry, hard_cap, producer_ranges,
+                    allow_cross_producer_calls)
+                round_branch_targets.update(walk['branch_targets'])
+                round_branch_targets.update(walk['jump_table_targets'])
+                for target in walk['direct_jals']:
+                    if (target not in initial_known and
+                            target not in suppressed_derived):
+                        next_reasons[target] = 'DIRECT_JAL_TARGET'
+                for target in walk['static_indirect_targets']:
+                    if (target not in initial_known and
+                            target not in suppressed_derived):
+                        next_reasons.setdefault(target, 'STATIC_INDIRECT_TARGET')
+                for target in walk['forward_branch_targets']:
+                    source_reason = (included.get(entry) or
+                                     derived_reasons.get(entry) or
+                                     ('DISPATCH_ROOT'
+                                      if entry in promoted_roots else None))
+                    strong_source = source_reason in (
+                        'DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                        'STATIC_BRANCH_ROOT', 'STATIC_DISCOVERY_ROOT',
+                        'TOML_DECLARED_ENTRY', 'DISPATCH_ROOT')
+                    if not strong_source and not _callable_legacy_seed(
+                            data, load_addr, entry):
+                        continue
+                    source_range = next(
+                        ((rlo, rhi) for rlo, rhi in producer_ranges
+                         if rlo <= entry < rhi), None)
+                    target_range = next(
+                        ((rlo, rhi) for rlo, rhi in producer_ranges
+                         if rlo <= target < rhi), None)
+                    if producer_ranges and source_range != target_range:
+                        continue
+                    producer_hi = target_range[1] if target_range else hi
+                    if plausible_callable_target(
+                            data, load_addr, size, target, producer_hi):
+                        if (target not in initial_known and
+                                target not in suppressed_derived):
+                            next_reasons.setdefault(target, 'STATIC_BRANCH_ROOT')
+
+            normalized = initial_known | promoted_roots | set(next_reasons)
+            roots = sorted(normalized)
+            for target in sorted(next_reasons):
+                if target not in normalized:
                     continue
-                # Always re-include: a target may already be present as a
-                # heuristic FUNCTION_POINTER_TARGET.  Reachable JAL evidence
-                # upgrades it to a trusted call root.
-                include(target, 'DIRECT_JAL_TARGET')
-                if target in included and target not in known:
-                    known.add(target)
-                    pending.append(target)
-            for target in sorted(walk['static_indirect_targets']):
-                if target not in initial_known and target in initial_owned:
-                    included[target] = 'DISPATCH_INTERIOR'
+                index = bisect_left(roots, target)
+                if index == len(roots) or roots[index] != target or index == 0:
                     continue
-                include(target, 'STATIC_INDIRECT_TARGET')
-                if target in included and target not in known:
-                    known.add(target)
-                    pending.append(target)
-            for target in sorted(walk['forward_branch_targets']):
-                source_reason = included.get(entry)
-                strong_source = source_reason in (
-                    'DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
-                    'STATIC_BRANCH_ROOT', 'STATIC_DISCOVERY_ROOT',
-                    'TOML_DECLARED_ENTRY', 'DISPATCH_ROOT')
-                if not strong_source and not _callable_legacy_seed(
-                        data, load_addr, entry):
-                    continue
-                source_range = next(
-                    ((lo, hi) for lo, hi in producer_ranges
-                     if lo <= entry < hi), None)
-                target_range = next(
-                    ((lo, hi) for lo, hi in producer_ranges
-                     if lo <= target < hi), None)
-                if producer_ranges and source_range != target_range:
-                    continue
-                producer_hi = target_range[1] if target_range else hi
-                if not plausible_callable_target(
-                        data, load_addr, size, target, producer_hi):
-                    continue
-                include(target, 'STATIC_BRANCH_ROOT')
-                if target in included and target not in known:
-                    known.add(target)
-                    pending.append(target)
+                owner = roots[index - 1]
+                hard_cap = roots[index + 1] if index + 1 < len(roots) else hi
+                owner_walk = _walk_overlay_function(
+                    data, load_addr, size, owner, hard_cap, producer_ranges,
+                    allow_cross_producer_calls)
+                if target in owner_walk['visited']:
+                    normalized.remove(target)
+                    roots.pop(index)
+
+            if normalized == known and next_reasons == derived_reasons:
+                all_branch_targets = round_branch_targets
+                break
+            known = normalized
+            derived_reasons = next_reasons
 
         if not kernel_window:
             break
@@ -1165,14 +1269,15 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         # that split one real function and hard-cap each other.
         a = promoted[0]
         included[a] = 'DISPATCH_ROOT'
+        promoted_roots.add(a)
         known.add(a)
-        pending.append(a)
 
     # Re-walk with the final function set so the branch-target exclusion count
     # matches the actual compilation boundaries.
     all_branch_targets.clear()
     rejected_cross_producer_calls = set()
     accepted_cross_producer_calls = set()
+    final_covered = set()
     sorted_known = sorted(known)
     for i, entry in enumerate(sorted_known):
         hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
@@ -1182,10 +1287,29 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         all_branch_targets.update(walk['branch_targets'])
         all_branch_targets.update(walk['jump_table_targets'])
         all_branch_targets.update(walk['forward_branch_targets'])
+        final_covered.update(walk['visited'])
         rejected_cross_producer_calls.update(
             walk['rejected_cross_producer_calls'])
         accepted_cross_producer_calls.update(
             walk['accepted_cross_producer_calls'])
+
+    # A DISPATCH_INTERIOR is emitted only when the final partition has a real
+    # CFG host for that exact PC. Reconsider every derived target after all
+    # later roots have settled; stale ownership falls back to a root (when it
+    # remains call-proven) or to the interpreter, never a hostless alias.
+    for addr, reason in sorted(derived_reasons.items()):
+        if addr in known:
+            include(addr, reason)
+        elif addr in final_covered:
+            included[addr] = 'DISPATCH_INTERIOR'
+        else:
+            included.pop(addr, None)
+            excluded[addr] = 'OBSERVED_PC_ONLY'
+    for addr, reason in list(included.items()):
+        if reason == 'DISPATCH_INTERIOR' and addr not in final_covered:
+            del included[addr]
+            excluded[addr] = ('OBSERVED_PC_ONLY'
+                              if addr in executed_pcs else 'UNKNOWN')
 
     candidates = {a for a in (executed_pcs | dispatch_entry_pcs |
                               captured_function_entries | static_discovery_entries |
@@ -1244,12 +1368,6 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         seeds.append(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}')
     for addr in sorted(accepted_cross_producer_calls):
         seeds.append(f'cross_call_allow 0x{addr:08X}')
-    retained_aliases = static_alias_ranges | {
-        (int(addr), int(range_lo), int(range_hi))
-        for addr, range_lo, range_hi in cap.get('_prior_aliases', [])}
-    for addr, range_lo, range_hi in sorted(retained_aliases):
-        seeds.append(
-            f'retained_alias 0x{addr:08X} 0x{range_lo:08X} 0x{range_hi:08X}')
     seeds.extend(seed_line(addr) for addr in sorted(included))
     return seeds, audit
 
@@ -1805,23 +1923,60 @@ def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
             continue
         ev = (entry & 0x1FFFFFFF) | 0x80000000
         out.append((ev, crc & 0xFFFFFFFF, ranges))
+
     return out
 
 
-def write_overlay_ranges_from(func_ids: list, out_path: str) -> int:
+def overlay_ranges_text(func_ids: list, pair_id: int | None = None) -> str:
+    """Serialize one loader manifest.
+
+    ``P`` is an optional DLL/manifest publication identity.  Old runtimes
+    ignore the unfamiliar record, while pair-aware runtimes require a matching
+    ``overlay_pair_id`` export whenever it is present.
+    """
+    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
+    if pair_id is not None:
+        out_lines.append(f'P {pair_id & 0xFFFFFFFFFFFFFFFF:016X}\n')
+    for ev, crc, ranges in func_ids:
+        out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
+        for lo, length in ranges:
+            out_lines.append(
+                f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
+    return ''.join(out_lines)
+
+
+def overlay_pair_id(src: str, func_ids: list) -> int:
+    """Bind a newly compiled DLL to the exact C and range manifest it uses."""
+    digest = hashlib.sha256()
+    digest.update(b'psxrecomp overlay pair v1\0')
+    digest.update(src.encode('utf-8'))
+    digest.update(b'\0')
+    digest.update(overlay_ranges_text(func_ids).encode('ascii'))
+    return int.from_bytes(digest.digest()[:8], 'big')
+
+
+def add_overlay_pair_export(src: str, pair_id: int) -> str:
+    """Add the optional v2-pair binding export without changing the shard ABI."""
+    return src + f'''\n
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+uint64_t overlay_pair_id(void) {{ return UINT64_C(0x{pair_id:016X}); }}
+'''
+
+
+def write_overlay_ranges_from(func_ids: list, out_path: str,
+                              pair_id: int | None = None) -> int:
     """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
     parse_overlay_func_ids. Returns the number of functions written.
 
     Manifest v2 line format:
       F <entry_hex> <code_crc_hex>     one per function
       R <lo_hex> <len_hex>             one per coalesced code range"""
-    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
-    for ev, crc, ranges in func_ids:
-        out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
-        for lo, length in ranges:
-            out_lines.append(f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
     with open(out_path, 'w') as f:
-        f.writelines(out_lines)
+        f.write(overlay_ranges_text(func_ids, pair_id))
     return len(func_ids)
 
 
@@ -1833,7 +1988,8 @@ def write_overlay_ranges(src_path: str, out_path: str,
         parse_overlay_func_ids(src_path, data, load_addr, size), out_path)
 
 
-def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
+def load_region_coverage(cache_dir: str, phys_addr: int,
+                         expected_abi: int | None = None) -> set:
     """Set of (ev, code_crc) function identities already provided by built DLLs
     for this region_start. The loader content-matches per function across ALL
     DLLs sharing a region_start, so a function is "covered" as soon as ANY
@@ -1849,15 +2005,30 @@ def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
     for name in names:
         if not (name.startswith(prefix) and name.endswith('.ranges')):
             continue
+        ranges_path = os.path.join(cache_dir, name)
+        dll_path = os.path.splitext(ranges_path)[0] + overlay_ext()
         try:
-            with open(os.path.join(cache_dir, name)) as f:
-                for ln in f:
-                    p = ln.split()
-                    if len(p) >= 3 and p[0] == 'F':
-                        try:
-                            covered.add((int(p[1], 16), int(p[2], 16)))
-                        except ValueError:
-                            pass
+            # Keep recovery, DLL validation, and the entire manifest snapshot
+            # under one OS lock. Otherwise a publisher can remove/replace one
+            # half between the existence check and F-record parsing.
+            with _shard_pair_lock(dll_path):
+                _recover_shard_pair_locked(dll_path)
+                if (not os.path.isfile(dll_path) or
+                        os.path.getsize(dll_path) == 0 or
+                        not os.path.isfile(ranges_path) or
+                        os.path.getsize(ranges_path) == 0):
+                    continue
+                if (expected_abi is not None and
+                        not _dll_abi_matches(dll_path, expected_abi)):
+                    continue
+                with open(ranges_path) as f:
+                    for ln in f:
+                        p = ln.split()
+                        if len(p) >= 3 and p[0] == 'F':
+                            try:
+                                covered.add((int(p[1], 16), int(p[2], 16)))
+                            except ValueError:
+                                pass
         except OSError:
             pass
     return covered
@@ -1874,7 +2045,8 @@ def _addr_in_func_ids(addr: int, func_ids: list) -> bool:
     return False
 
 
-def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
+def load_region_entry_set(cache_dir: str, phys_addr: int,
+                          expected_abi: int | None = None) -> set:
     """Set of phys-normalized F-line ENTRY addresses provided by ALL built DLLs
     (region + fragment) for this region_start. This — not range coverage — is
     the dispatchability test: native code is enterable ONLY at F entries, so a
@@ -1892,15 +2064,27 @@ def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
     for name in names:
         if not (name.startswith(prefix) and name.endswith('.ranges')):
             continue
+        ranges_path = os.path.join(cache_dir, name)
+        dll_path = os.path.splitext(ranges_path)[0] + overlay_ext()
         try:
-            with open(os.path.join(cache_dir, name)) as f:
-                for ln in f:
-                    p = ln.split()
-                    if len(p) >= 2 and p[0] == 'F':
-                        try:
-                            out.add(int(p[1], 16) & 0x1FFFFFFF)
-                        except ValueError:
-                            pass
+            with _shard_pair_lock(dll_path):
+                _recover_shard_pair_locked(dll_path)
+                if (not os.path.isfile(dll_path) or
+                        os.path.getsize(dll_path) == 0 or
+                        not os.path.isfile(ranges_path) or
+                        os.path.getsize(ranges_path) == 0):
+                    continue
+                if (expected_abi is not None and
+                        not _dll_abi_matches(dll_path, expected_abi)):
+                    continue
+                with open(ranges_path) as f:
+                    for ln in f:
+                        p = ln.split()
+                        if len(p) >= 2 and p[0] == 'F':
+                            try:
+                                out.add(int(p[1], 16) & 0x1FFFFFFF)
+                            except ValueError:
+                                pass
         except OSError:
             pass
     return out
@@ -2107,6 +2291,8 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         frag_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
         if not frag_ids:
             return None, 'no-func-ids (empty ranges manifest)'
+        pair_id = overlay_pair_id(src, frag_ids)
+        src = add_overlay_pair_export(src, pair_id)
         # Key the fragment DLL by its func-identity SET (dedup like a region
         # bundle); the loader keys DLLs by the region_start filename prefix and
         # content-matches each function, so a fragment is just another DLL for
@@ -2115,7 +2301,9 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             struct.pack('<II', ev, crc)
             for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
         dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
-        if compiled_shard_complete(dll_path) and not args.force:
+        if (compiled_shard_complete(
+                dll_path, overlay_abi_tag(args.runtime_include, args.flavor)) and
+                not args.force):
             return frag_ids, 'cached'   # already built
         patched_c = os.path.join(tmp, 'frag_patched.c')
         with open(patched_c, 'w') as f:
@@ -2140,9 +2328,9 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         # dir already namespaces by args.compiler, so only the invocation was wrong.
         if not compile_dll(patched_c, dll_path, include_dirs,
                            gcc=args.gcc, flavor=args.flavor,
-                           compiler=args.compiler, tcc=args.tcc):
+                           compiler=args.compiler, tcc=args.tcc,
+                           func_ids=frag_ids, pair_id=pair_id):
             return None, 'compile-error (see COMPILE ERROR above)'
-        write_overlay_ranges_from(frag_ids, os.path.splitext(dll_path)[0] + '.ranges')
         return frag_ids, 'built'
 
 
@@ -2324,14 +2512,21 @@ def _compile_dll_direct(c_path: str, out_dll: str, include_dirs: list[str],
 
 def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 gcc: str = 'gcc', flavor: int = 0,
-                compiler: str = 'gcc', tcc: str = 'tcc') -> bool:
-    """Publish a shard only after its compiler has completed successfully.
+                compiler: str = 'gcc', tcc: str = 'tcc',
+                func_ids: list | None = None,
+                pair_id: int | None = None) -> bool:
+    """Publish a shard only after all of its artifacts are complete.
 
     GCC and tcc write their output incrementally. If the process is interrupted
     while targeting the final cache name, the next run sees that partial file
-    and used to skip it as if it were complete. Compile to a unique sibling and
-    atomically replace the final DLL instead; an existing good shard therefore
-    also survives a failed --force rebuild.
+    and used to skip it as if it were complete. Compile to a unique sibling.
+
+    When ``func_ids`` is supplied, stage the range manifest too and publish the
+    two as one recoverable transaction.  Moving the old DLL out of its loader-
+    visible name first means every interruption point contains either a complete
+    old pair, a complete new pair, or no loadable pair -- never mixed halves.
+    The pair ID additionally lets a pair-aware loader reject the only filesystem
+    TOCTOU left: an old manifest parsed immediately before the DLL rename.
     """
     final_out = os.path.abspath(out_dll)
     out_dir = os.path.dirname(final_out)
@@ -2342,6 +2537,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         dir=out_dir)
     os.close(fd)
     os.unlink(staged)  # let the native compiler create its output normally
+    staged_ranges = os.path.splitext(staged)[0] + '.ranges'
     try:
         if not _compile_dll_direct(
                 c_path, staged, include_dirs, gcc=gcc, flavor=flavor,
@@ -2350,25 +2546,278 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         if not os.path.isfile(staged) or os.path.getsize(staged) == 0:
             print('  COMPILE ERROR: compiler reported success but emitted no DLL')
             return False
-        os.replace(staged, final_out)
+        if func_ids is None:
+            os.replace(staged, final_out)
+            return True
+        if not func_ids or pair_id is None:
+            print('  COMPILE ERROR: paired shard requires non-empty ranges and pair ID')
+            return False
+        write_overlay_ranges_from(func_ids, staged_ranges, pair_id)
+        if not os.path.isfile(staged_ranges) or os.path.getsize(staged_ranges) == 0:
+            print('  COMPILE ERROR: range manifest staging produced no output')
+            return False
+        try:
+            publish_shard_pair(staged, staged_ranges, final_out)
+        except Exception as exc:
+            print(f'  COMPILE ERROR: could not publish DLL/ranges pair: {exc}')
+            try:
+                recover_shard_pair(final_out)
+            except Exception as recover_exc:
+                print(f'  COMPILE ERROR: shard-pair recovery also failed: '
+                      f'{recover_exc}')
+            return False
         return True
     finally:
         # TinyCC emits an export-definition sidecar beside its requested DLL.
         # It inherits the unique staged basename and must not accumulate in the
         # content cache after either success or failure.
         staged_sidecars = [os.path.splitext(staged)[0] + '.def']
-        for temporary in [staged, *staged_sidecars]:
+        for temporary in [staged, staged_ranges, *staged_sidecars]:
             try:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
 
 
-def compiled_shard_complete(dll_path: str) -> bool:
-    """A cached shard is dispatchable only with its non-empty range manifest."""
+def _shard_pair_paths(dll_path: str) -> tuple[str, str, str, str]:
+    dll_path = os.path.abspath(dll_path)
+    ranges_path = os.path.splitext(dll_path)[0] + '.ranges'
+    return (dll_path, ranges_path,
+            dll_path + '.pair-lock', dll_path + '.pair-txn.json')
+
+
+def _unlink_if_present(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _best_effort_unlink(path: str) -> None:
+    """Remove transaction debris when possible (loaded Windows DLLs may refuse)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _file_sha256(path: str) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _write_json_atomic(path: str, value: dict) -> None:
+    directory = os.path.dirname(path)
+    fd, staged = tempfile.mkstemp(prefix=f'.{os.path.basename(path)}.',
+                                  suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            json.dump(value, out, sort_keys=True)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(staged, path)
+    finally:
+        _best_effort_unlink(staged)
+
+
+@contextmanager
+def _shard_pair_lock(dll_path: str, timeout: float = 120.0):
+    """Cross-process lock for one canonical DLL/ranges filename pair.
+
+    The lock file is intentionally permanent.  OS byte-range/advisory locks are
+    released by the kernel when a process dies; deleting the file would create
+    an inode/handle split that permits two simultaneous owners.
+    """
+    _dll, _ranges, lock_path, _journal = _shard_pair_paths(dll_path)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lock_file = open(lock_path, 'a+b')
+    if os.path.getsize(lock_path) == 0:
+        lock_file.write(b'\0')
+        lock_file.flush()
+    deadline = time.monotonic() + timeout
+    acquired = False
+    try:
+        while not acquired:
+            try:
+                lock_file.seek(0)
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX |
+                                fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f'timed out waiting for shard-pair lock {lock_path}')
+                time.sleep(0.025)
+        yield
+    finally:
+        if acquired:
+            lock_file.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _cleanup_old_pair_debris(dll_path: str) -> None:
+    for path in glob.glob(os.path.abspath(dll_path) + '.pair-txn.*.old-*'):
+        _best_effort_unlink(path)
+
+
+def _recover_shard_pair_locked(dll_path: str) -> None:
+    dll, ranges, _lock, journal_path = _shard_pair_paths(dll_path)
+    if not os.path.isfile(journal_path):
+        _cleanup_old_pair_debris(dll)
+        return
+    try:
+        with open(journal_path, encoding='utf-8') as source:
+            txn = json.load(source)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f'cannot recover shard transaction {journal_path}: {exc}')
+
+    required = ('backup_dll', 'backup_ranges', 'new_dll_sha256',
+                'new_ranges_sha256', 'old_dll_sha256', 'old_ranges_sha256')
+    if txn.get('schema') != 'psxrecomp shard pair transaction v1' or any(
+            key not in txn for key in required):
+        raise RuntimeError(f'invalid shard transaction journal {journal_path}')
+
+    backup_dll = txn['backup_dll']
+    backup_ranges = txn['backup_ranges']
+    token = txn.get('token', '')
+    if (not re.fullmatch(r'[0-9a-f]{32}', token) or
+            backup_dll != f'{dll}.pair-txn.{token}.old-dll' or
+            backup_ranges != f'{dll}.pair-txn.{token}.old-ranges'):
+        raise RuntimeError(f'invalid shard transaction ownership in {journal_path}')
+    new_complete = (_file_sha256(dll) == txn['new_dll_sha256'] and
+                    _file_sha256(ranges) == txn['new_ranges_sha256'])
+    if new_complete:
+        # The DLL rename is the commit point.  A crash before a journal phase
+        # update must not roll back a new DLL already paired with its exact
+        # manifest.  Remove the journal first; old loaded-DLL backups are merely
+        # deferred debris and may remain locked until process exit on Windows.
+        _unlink_if_present(journal_path)
+        _best_effort_unlink(backup_dll)
+        _best_effort_unlink(backup_ranges)
+        return
+
+    def restore(path: str, backup: str, expected_hash: str | None) -> None:
+        current_hash = _file_sha256(path)
+        if expected_hash is None:
+            if current_hash is not None:
+                _unlink_if_present(path)
+            return
+        if current_hash == expected_hash:
+            return
+        if _file_sha256(backup) != expected_hash:
+            raise RuntimeError(
+                f'cannot recover {path}: neither canonical nor backup is the old file')
+        if current_hash is not None:
+            _unlink_if_present(path)
+        os.replace(backup, path)
+
+    # Restore the manifest first; restoring the DLL is the rollback commit.
+    restore(ranges, backup_ranges, txn['old_ranges_sha256'])
+    restore(dll, backup_dll, txn['old_dll_sha256'])
+    _unlink_if_present(journal_path)
+    _best_effort_unlink(backup_dll)
+    _best_effort_unlink(backup_ranges)
+
+
+def recover_shard_pair(dll_path: str) -> None:
+    """Recover/finish a dead writer's transaction under its OS-owned lock."""
+    with _shard_pair_lock(dll_path):
+        _recover_shard_pair_locked(dll_path)
+
+
+def publish_shard_pair(staged_dll: str, staged_ranges: str,
+                       final_dll: str) -> None:
+    """Commit staged DLL/ranges under an interprocess transaction lock."""
+    dll, ranges, _lock, journal_path = _shard_pair_paths(final_dll)
+    token = uuid.uuid4().hex
+    backup_dll = f'{dll}.pair-txn.{token}.old-dll'
+    backup_ranges = f'{dll}.pair-txn.{token}.old-ranges'
+
+    with _shard_pair_lock(dll):
+        _recover_shard_pair_locked(dll)
+        txn = {
+            'schema': 'psxrecomp shard pair transaction v1',
+            'token': token,
+            'backup_dll': backup_dll,
+            'backup_ranges': backup_ranges,
+            'old_dll_sha256': _file_sha256(dll),
+            'old_ranges_sha256': _file_sha256(ranges),
+            'new_dll_sha256': _file_sha256(staged_dll),
+            'new_ranges_sha256': _file_sha256(staged_ranges),
+        }
+        if txn['new_dll_sha256'] is None or txn['new_ranges_sha256'] is None:
+            raise RuntimeError('staged DLL/ranges disappeared before publication')
+        _write_json_atomic(journal_path, txn)
+        try:
+            if txn['old_dll_sha256'] is not None:
+                os.replace(dll, backup_dll)
+            if txn['old_ranges_sha256'] is not None:
+                os.replace(ranges, backup_ranges)
+
+            # The new manifest alone is inert. Publishing the DLL is the commit.
+            os.replace(staged_ranges, ranges)
+            os.replace(staged_dll, dll)
+            _recover_shard_pair_locked(dll)  # recognizes committed hashes
+        except BaseException:
+            _recover_shard_pair_locked(dll)
+            raise
+
+
+def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
+    """Read overlay_abi from one loaded image, then release it immediately."""
+    import _ctypes
+    import ctypes
+    library = None
+    try:
+        library = (ctypes.WinDLL(dll_path) if os.name == 'nt'
+                   else ctypes.CDLL(dll_path))
+        abi_fn = library.overlay_abi
+        abi_fn.argtypes = []
+        abi_fn.restype = ctypes.c_int
+        return (abi_fn() & 0xFFFFFFFF) == (expected_abi & 0xFFFFFFFF)
+    except (OSError, AttributeError):
+        return False
+    finally:
+        if library is not None and library._handle:
+            handle = library._handle
+            library._handle = 0
+            if os.name == 'nt':
+                _ctypes.FreeLibrary(handle)
+            else:
+                _ctypes.dlclose(handle)
+
+
+def compiled_shard_complete(dll_path: str,
+                            expected_abi: int | None = None) -> bool:
+    """Check pair completeness and optional ABI/flavor under one OS lock."""
     ranges = os.path.splitext(dll_path)[0] + '.ranges'
-    return (os.path.isfile(dll_path) and os.path.getsize(dll_path) > 0 and
-            os.path.isfile(ranges) and os.path.getsize(ranges) > 0)
+    with _shard_pair_lock(dll_path):
+        _recover_shard_pair_locked(dll_path)
+        complete = (os.path.isfile(dll_path) and
+                    os.path.getsize(dll_path) > 0 and
+                    os.path.isfile(ranges) and
+                    os.path.getsize(ranges) > 0)
+        if not complete:
+            return False
+        return (expected_abi is None or
+                _dll_abi_matches(dll_path, expected_abi))
 
 
 # ---------------------------------------------------------------------------
@@ -2578,34 +3027,21 @@ def main():
                     static_entry_sources[entry] = (
                         data, load_addr, size, phys_addr)
 
-        # Merge evidence from a prior build of the SAME bytes: every F entry
-        # in an existing ranges manifest for this exact image was proven
-        # compilable before, so a fresh (poorer) capture can't regress
-        # coverage on rebuild. Callable entries re-enter as captured function
-        # entries (walk-root eligible); non-callable ones (alias wrappers
-        # from a prior build) re-enter as dispatch entries so the classifier
-        # re-derives their interior/alias disposition — feeding them back as
-        # roots would truncate their hosts. Their prior R ranges additionally
-        # reconstruct overlapping alias groups through retained_alias lines, so
-        # stronger new roots and old indirect dispatch entries can coexist.
+        # Reclassify prior F entry addresses from an identical image. Callable
+        # entries may become current roots; other entries re-enter as dispatch
+        # candidates and require a current exact host. Never reuse prior R host
+        # ranges: later roots can repartition the same bytes incompatibly.
         if not args.static:
             ranges_name = f'{phys_addr:08X}_{crc32:08X}.ranges'
             prior_ranges_path = os.path.join(cache_dir, ranges_name)
             if os.path.exists(prior_ranges_path):
                 prior_entries = []
-                prior_func_ranges = []
                 with open(prior_ranges_path) as pf:
                     for ln in pf:
                         parts = ln.split()
                         if parts and parts[0] == 'F':
                             try:
                                 prior_entries.append(int(parts[1], 16))
-                            except (IndexError, ValueError):
-                                pass
-                        elif parts and parts[0] == 'R':
-                            try:
-                                prior_func_ranges.append(
-                                    (int(parts[1], 16), int(parts[2], 16)))
                             except (IndexError, ValueError):
                                 pass
                 if prior_entries:
@@ -2618,23 +3054,6 @@ def main():
                             de.add(a)
                     cap['function_entry_pcs'] = sorted(fe)
                     cap['dispatch_entry_pcs'] = sorted(de)
-                    alias_groups = {}
-                    if len(prior_entries) != len(prior_func_ranges):
-                        print(f'  WARNING: malformed prior manifest has '
-                              f'{len(prior_entries)} F lines and '
-                              f'{len(prior_func_ranges)} R lines; alias groups '
-                              f'will not be retained')
-                    else:
-                        for entry, (range_lo, range_size) in zip(
-                                prior_entries, prior_func_ranges):
-                            alias_groups.setdefault(
-                                (range_lo, range_lo + range_size), []).append(entry)
-                    cap['_prior_aliases'] = [
-                        (entry, range_lo, range_hi)
-                        for (range_lo, range_hi), entries in alias_groups.items()
-                        if len(entries) > 1 or any(e != range_lo for e in entries)
-                        for entry in entries
-                    ]
                     cap.setdefault('schema', 'merged')
                     print(f'  merged {len(prior_entries)} prior-manifest entries '
                           f'from {prior_ranges_path}')
@@ -2677,7 +3096,8 @@ def main():
             stats.add_skip()
             return
 
-        if (not args.static and compiled_shard_complete(dll_path) and
+        if (not args.static and compiled_shard_complete(
+                dll_path, overlay_abi_tag(args.runtime_include, args.flavor)) and
                 not args.force):
             print('  SKIP: DLL already exists (use --force to recompile)\n')
             stats.add_skip()
@@ -2853,7 +3273,9 @@ def main():
                 with cov_lock:
                     covered = region_coverage_cache.get(phys_addr)
                     if covered is None:
-                        covered = load_region_coverage(cache_dir, phys_addr)
+                        covered = load_region_coverage(
+                            cache_dir, phys_addr,
+                            overlay_abi_tag(args.runtime_include, args.flavor))
                         region_coverage_cache[phys_addr] = covered
                     fully_covered = (bool(this_set) and this_set <= covered
                                      and not args.force
@@ -2866,6 +3288,19 @@ def main():
                     stats.add_skip()
                     return
 
+                if not this_ids:
+                    print('  WARNING: recompiler emitted no usable _full.ranges -- '
+                          'preserving any prior DLL/ranges pair and leaving this '
+                          'region to the interpreter')
+                    stats.add_fail(_label, 'no_ranges',
+                                   'no usable function identities (DLL not built)')
+                    return
+                pair_id = overlay_pair_id(src, this_ids)
+                src = add_overlay_pair_export(src, pair_id)
+                # Retained source is the exact source compiled into the DLL.
+                with open(patched_c, 'w') as f:
+                    f.write(src)
+
                 # Compile to DLL
                 include_dirs = [args.runtime_include]
                 recomp_root = os.path.dirname(os.path.dirname(args.recompiler))
@@ -2876,14 +3311,16 @@ def main():
 
                 success = compile_dll(patched_c, dll_path, include_dirs,
                                       gcc=args.gcc, flavor=args.flavor,
-                                      compiler=args.compiler, tcc=args.tcc)
+                                      compiler=args.compiler, tcc=args.tcc,
+                                      func_ids=this_ids,
+                                      pair_id=pair_id)
                 if success:
-                    # Emit the per-entry code-range manifest beside the DLL from
-                    # the same func-id list we keyed the dedup on. The loader keys
-                    # it by the same filename stem with .ranges (replacing .dll).
+                    # compile_dll transactionally published the per-entry range
+                    # manifest beside the DLL from the same func-id list used by
+                    # dedup. The loader keys it by the same filename stem.
                     ranges_out = os.path.splitext(dll_path)[0] + '.ranges'
                     if this_ids:
-                        nfn = write_overlay_ranges_from(this_ids, ranges_out)
+                        nfn = len(this_ids)
                         update_bios_resident_marker(dll_path, cap)
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
                         # New identities are now available for this region_start;
@@ -2951,7 +3388,9 @@ def main():
             # range" does NOT make a dispatch target servable — a range-
             # covered PC with no F entry anywhere still interps its whole
             # chain on every dispatch. Demand an entry at exactly this PC.
-            covered_entries = load_region_entry_set(cache_dir, phys_addr)
+            covered_entries = load_region_entry_set(
+                cache_dir, phys_addr,
+                overlay_abi_tag(args.runtime_include, args.flavor))
             orphans = sorted(a for a in interior_pcs
                              if (a in executed or a in forced_interiors)
                              and (a & 0x1FFFFFFF) not in covered_entries)

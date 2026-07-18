@@ -31,6 +31,14 @@ struct Function {
     std::vector<uint32_t> alias_group_entries;
 };
 
+struct AbsorbedEntry {
+    uint32_t addr;
+    uint32_t host_start;
+    uint32_t host_end;
+    uint32_t source_addr;
+    bool resolved_indirect;
+};
+
 struct FunctionAnalysisResult {
     std::vector<Function> functions;
     int total_instructions;
@@ -41,6 +49,15 @@ struct FunctionAnalysisResult {
     int bios_thunk_count = 0; // Packed A0/B0/C0 BIOS dispatch thunks
     int state_continuation_count = 0; // Split entries after calls to SaveState-style helpers
     int pointer_table_entry_count = 0; // Function entries found from executable pointer tables
+    // Statically proven direct/constant-register transfer targets that the
+    // FINAL exact-entry partition reaches inside another function. These are
+    // safe overlapping aliases: the source edge and host reachability were
+    // both observed by the analyzer (not inferred from a raw byte envelope).
+    std::vector<AbsorbedEntry> absorbed_entries;
+    // Instruction PCs reached by the FINAL exact-entry partition. Consumers
+    // use this to reject hostless `interior` seeds that merely fall inside a
+    // function's coarse [start,end) envelope or an unreachable data hole.
+    std::set<uint32_t> exact_reachable_pcs;
 };
 
 class FunctionAnalyzer {
