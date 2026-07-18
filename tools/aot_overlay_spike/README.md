@@ -49,10 +49,13 @@ misses, production autocompile (tcc/gcc) self-heals on first visit.
 
 The canonical `overlay_captures.json` is atomically replaced for live consumers.
 With `[runtime] overlay_capture_history = true`, each changed coherent snapshot is
-also appended as one independent record to
-`overlay_captures.addendum.jsonl` beside the executable. A torn final line does
-not invalidate earlier or later records. Merge it into the private additive vault
-with:
+also represented by an independent record in `overlay_captures.addendum.jsonl`
+beside the executable. Production's simple mode embeds the full snapshot (v1).
+When an immutable persist directory is configured, dev mode writes a small v2
+record referencing the already-atomically-published snapshot instead of duplicating
+megabytes of base64 every autocap interval. Vault merge verifies the referenced
+file's FNV signature before ingesting it. A torn final line does not invalidate
+earlier or later records. Merge it into the private additive vault with:
 
 ```sh
 python tools/coverage_vault.py merge --vault <vault-dir> \
@@ -62,6 +65,17 @@ python tools/coverage_vault.py merge --vault <vault-dir> \
 Dev configs can additionally set the project-relative
 `overlay_capture_persist_dir` to retain immutable per-snapshot JSON files. Both
 settings are opt-in; capture artifacts contain game bytes and must stay ignored.
+Legacy dev addenda that embedded full snapshots before v2 can be compacted only
+after every immutable copy passes its signature check:
+
+```sh
+python tools/coverage_vault.py compact-addendum \
+  --addendum <exe-dir>/overlay_captures.addendum.jsonl \
+  --persist-dir <immutable-snapshot-dir>
+```
+
+The replacement is atomic and aborts without changing the addendum if any valid
+record lacks its exact immutable snapshot.
 
 ## Multi-game sweep findings (2026-07-17)
 

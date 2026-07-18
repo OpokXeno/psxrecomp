@@ -22,6 +22,8 @@ Usage:
   coverage_vault.py merge --vault DIR [--captures captures.json]
                           [--addendum captures.addendum.jsonl] [--cache CACHE_DIR]
   coverage_vault.py stats --vault DIR
+  coverage_vault.py compact-addendum --addendum captures.addendum.jsonl
+                                      --persist-dir IMMUTABLE_DIR
 """
 import argparse, json, os, shutil, hashlib, sys
 
@@ -51,6 +53,7 @@ def _load_addendum(path):
     quarantines the bad tail with a newline.
     """
     regions = []
+    seen_refs = set()
     if not path or not os.path.exists(path):
         return regions
     with open(path, encoding="utf-8", errors="replace") as history:
@@ -63,15 +66,55 @@ def _load_addendum(path):
                 print("  warn: ignoring invalid addendum line %d in %s (%s)" %
                       (lineno, path, e))
                 continue
-            if not isinstance(record, dict) or record.get("schema") != (
-                    "psxrecomp overlay capture addendum v1"):
+            if not isinstance(record, dict):
                 print("  warn: ignoring unknown addendum record on line %d in %s" %
                       (lineno, path))
                 continue
-            captures = record.get("captures", [])
-            if isinstance(captures, list):
-                regions.extend(r for r in captures if isinstance(r, dict))
+            schema = record.get("schema")
+            if schema == "psxrecomp overlay capture addendum v1":
+                captures = record.get("captures", [])
+                if isinstance(captures, list):
+                    regions.extend(r for r in captures if isinstance(r, dict))
+                continue
+            if schema == "psxrecomp overlay capture addendum v2":
+                snapshot = record.get("snapshot")
+                expected = str(record.get("fnv64", "")).upper()
+                if not isinstance(snapshot, str) or not snapshot:
+                    print("  warn: v2 addendum line %d has no snapshot" % lineno)
+                    continue
+                if not os.path.isabs(snapshot):
+                    snapshot = os.path.join(os.path.dirname(path), snapshot)
+                ref_key = (os.path.normcase(os.path.abspath(snapshot)), expected)
+                if ref_key in seen_refs:
+                    continue
+                seen_refs.add(ref_key)
+                if not os.path.exists(snapshot):
+                    print("  warn: v2 snapshot missing on line %d: %s" %
+                          (lineno, snapshot))
+                    continue
+                actual = _fnv64_file(snapshot)
+                if expected and expected != "%016X" % actual:
+                    print("  warn: v2 snapshot signature mismatch on line %d: %s" %
+                          (lineno, snapshot))
+                    continue
+                regions.extend(r for r in _load_list(snapshot)
+                               if isinstance(r, dict))
+                continue
+            print("  warn: ignoring unknown addendum record on line %d in %s" %
+                  (lineno, path))
     return regions
+
+def _fnv64_file(path):
+    value = 1469598103934665603
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            for byte in chunk:
+                value ^= byte
+                value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return value
 
 def _write_list_atomic(path, value):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -86,6 +129,111 @@ def _write_list_atomic(path, value):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+def _verified_v2_record(record, addendum, lineno):
+    snapshot = record.get("snapshot")
+    expected = str(record.get("fnv64", "")).upper()
+    if not isinstance(snapshot, str) or not snapshot:
+        raise ValueError("v2 addendum line %d has no snapshot" % lineno)
+    if not os.path.isabs(snapshot):
+        snapshot = os.path.join(os.path.dirname(addendum), snapshot)
+    snapshot = os.path.abspath(snapshot)
+    if not os.path.isfile(snapshot):
+        raise ValueError("v2 snapshot missing on line %d: %s" %
+                         (lineno, snapshot))
+    actual = "%016X" % _fnv64_file(snapshot)
+    if not expected or expected != actual:
+        raise ValueError("v2 snapshot signature mismatch on line %d: %s" %
+                         (lineno, snapshot))
+    result = dict(record)
+    result["fnv64"] = actual
+    result["snapshot"] = snapshot
+    return result
+
+def compact_addendum(addendum, persist_dir):
+    """Atomically replace embedded v1 snapshots with verified v2 references.
+
+    Immutable snapshots are the authority during this operation. Every valid
+    v1 record must have its exact runtime-named file and matching FNV signature;
+    otherwise the original addendum is left byte-for-byte untouched.
+    """
+    if not addendum or not os.path.isfile(addendum):
+        raise ValueError("addendum does not exist: %s" % addendum)
+    if not persist_dir or not os.path.isdir(persist_dir):
+        raise ValueError("persist directory does not exist: %s" % persist_dir)
+    addendum = os.path.abspath(addendum)
+    persist_dir = os.path.abspath(persist_dir)
+    old_bytes = os.path.getsize(addendum)
+    records = []
+    seen_refs = set()
+    v1_count = v2_count = invalid_count = duplicate_count = 0
+    with open(addendum, encoding="utf-8", errors="replace") as history:
+        for lineno, line in enumerate(history, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except Exception as e:
+                print("  warn: dropping invalid addendum line %d (%s)" %
+                      (lineno, e))
+                invalid_count += 1
+                continue
+            if not isinstance(record, dict):
+                raise ValueError("unknown addendum record on line %d" % lineno)
+            schema = record.get("schema")
+            if schema == "psxrecomp overlay capture addendum v1":
+                game = record.get("game")
+                session = record.get("session")
+                sequence = record.get("sequence")
+                expected = str(record.get("fnv64", "")).upper()
+                if (not isinstance(game, str) or not game or
+                        not isinstance(session, str) or not session or
+                        not isinstance(sequence, int) or sequence < 0 or
+                        len(expected) != 16 or
+                        any(c not in "0123456789ABCDEF" for c in expected)):
+                    raise ValueError("malformed v1 metadata on line %d" % lineno)
+                basename = "%s_%s_%04d_%s.json" % (
+                    game, session, sequence, expected)
+                snapshot = os.path.join(persist_dir, basename)
+                converted = dict(record)
+                converted.pop("captures", None)
+                converted["schema"] = "psxrecomp overlay capture addendum v2"
+                converted["snapshot"] = snapshot
+                converted = _verified_v2_record(converted, addendum, lineno)
+                v1_count += 1
+            elif schema == "psxrecomp overlay capture addendum v2":
+                converted = _verified_v2_record(record, addendum, lineno)
+                v2_count += 1
+            else:
+                raise ValueError("unknown addendum schema on line %d: %r" %
+                                 (lineno, schema))
+            ref_key = (os.path.normcase(converted["snapshot"]),
+                       converted["fnv64"])
+            if ref_key in seen_refs:
+                duplicate_count += 1
+                continue
+            seen_refs.add(ref_key)
+            records.append(converted)
+
+    tmp = "%s.tmp-%d" % (addendum, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as out:
+            for record in records:
+                out.write(json.dumps(record, separators=(",", ":")))
+                out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, addendum)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    new_bytes = os.path.getsize(addendum)
+    print("coverage_vault: compacted %s" % addendum)
+    print("  records: %d v1 converted, %d v2 retained, %d duplicates and %d invalid lines dropped" %
+          (v1_count, v2_count, duplicate_count, invalid_count))
+    print("  bytes:   %d -> %d (saved %d)" %
+          (old_bytes, new_bytes, old_bytes - new_bytes))
+    return v1_count, v2_count, duplicate_count, invalid_count
 
 def merge_capture_regions(vault_json, src):
     if not src:
@@ -158,12 +306,20 @@ def cmd_stats(vault):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["merge", "stats"])
-    ap.add_argument("--vault", required=True, help="vault directory (kept gitignored/private)")
+    ap.add_argument("cmd", choices=["merge", "stats", "compact-addendum"])
+    ap.add_argument("--vault", help="vault directory (kept gitignored/private)")
     ap.add_argument("--captures", help="source overlay_captures.json to merge in")
     ap.add_argument("--addendum", help="append-only overlay capture history (.jsonl)")
     ap.add_argument("--cache", help="source cache dir (e.g. build/cache/<game_id>) to merge in")
+    ap.add_argument("--persist-dir", help="immutable capture snapshot directory")
     a = ap.parse_args()
+    if a.cmd == "compact-addendum":
+        if not a.addendum or not a.persist_dir:
+            ap.error("compact-addendum requires --addendum and --persist-dir")
+        compact_addendum(a.addendum, a.persist_dir)
+        return 0
+    if not a.vault:
+        ap.error("%s requires --vault" % a.cmd)
     if a.cmd == "stats":
         cmd_stats(a.vault)
         return 0

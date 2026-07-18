@@ -131,9 +131,13 @@ compiler, but it is published through a same-directory temporary file plus atomi
 replace so readers never observe a half-written manifest. Games may additionally
 set `overlay_capture_history = true` to append each changed coherent snapshot as
 an independent JSONL record to `overlay_captures.addendum.jsonl` beside the
-executable. A hard kill can damage only the last line; the next append quarantines
-that tail, and `tools/coverage_vault.py merge --addendum ...` ignores malformed
-lines while additively merging every valid record.
+executable. Without a persist directory the v1 record embeds the full snapshot.
+With dev immutable persistence enabled, a compact v2 record references the
+atomically published JSON and vault merge verifies its FNV signature before use;
+this avoids repeatedly embedding multi-megabyte base64 snapshots. A hard kill can
+damage only the last line; the next append quarantines that tail, and
+`tools/coverage_vault.py merge --addendum ...` ignores malformed records while
+additively merging every valid snapshot.
 
 Development configs may also set a project-relative
 `overlay_capture_persist_dir`. This creates one atomically published, immutable
@@ -141,6 +145,11 @@ JSON snapshot per changed capture. Absolute paths and `..` components are reject
 Production configs normally omit this key and retain only the naive executable-
 local addendum. Both history modes are off by default and contain game-derived
 bytes, so their outputs remain private/gitignored artifacts.
+Previously embedded development histories can be converted to verified compact
+references with `coverage_vault.py compact-addendum --addendum ...
+--persist-dir ...`. The tool verifies every valid record against its exact
+immutable snapshot before atomically replacing the addendum, and leaves the
+source untouched if any snapshot is missing or mismatched.
 
 The recall scoreboard can roll a persisted live gap set forward after a verified
 monotonic static expansion with

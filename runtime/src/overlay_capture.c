@@ -492,6 +492,55 @@ static int append_history_record(const char *snapshot_path, const char *reason,
     return ok;
 }
 
+static int write_json_string(FILE *dst, const char *value)
+{
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    if (fputc('"', dst) == EOF) return 0;
+    for (; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (fputc('\\', dst) == EOF || fputc(*p, dst) == EOF) return 0;
+        } else if (*p < 0x20) {
+            if (fprintf(dst, "\\u%04X", (unsigned)*p) < 0) return 0;
+        } else if (fputc(*p, dst) == EOF) {
+            return 0;
+        }
+    }
+    return fputc('"', dst) != EOF;
+}
+
+/* Dev persistence already owns an atomically published immutable full JSON
+ * snapshot. Append only a durable reference to it instead of embedding the
+ * same multi-megabyte capture array again every autocap interval. Production
+ * configs without persist_dir continue to use the self-contained v1 record. */
+static int append_history_reference(const char *persist_path, const char *reason,
+                                    uint64_t sig, uint32_t sequence)
+{
+    FILE *dst, *tail;
+    int c, needs_separator = 0, ok = 1;
+    tail = fopen(s_history_addendum, "rb");
+    if (tail) {
+        if (fseek(tail, -1, SEEK_END) == 0) {
+            c = fgetc(tail);
+            needs_separator = c != '\n';
+        }
+        fclose(tail);
+    }
+    dst = fopen(s_history_addendum, "ab");
+    if (!dst) return 0;
+    if (needs_separator && fputc('\n', dst) == EOF) ok = 0;
+    if (ok && fprintf(dst,
+            "{\"schema\":\"psxrecomp overlay capture addendum v2\","
+            "\"game\":\"%s\",\"session\":\"%s\",\"sequence\":%u,"
+            "\"reason\":\"%s\",\"fnv64\":\"%016llX\",\"snapshot\":",
+            s_history_game_id, s_history_session, sequence,
+            reason ? reason : "snapshot", (unsigned long long)sig) < 0) ok = 0;
+    if (ok) ok = write_json_string(dst, persist_path);
+    if (ok && fputs("}\n", dst) == EOF) ok = 0;
+    if (ok) ok = sync_file(dst);
+    if (fclose(dst) != 0) ok = 0;
+    return ok;
+}
+
 static void persist_history_snapshot(const char *snapshot_path,
                                      const char *reason, uint64_t sig)
 {
@@ -513,7 +562,12 @@ static void persist_history_snapshot(const char *snapshot_path,
             "psxrecomp: failed to persist overlay capture snapshot %s\n",
             persist_path);
     }
-    addendum_saved = append_history_record(snapshot_path, reason, sig, sequence);
+    if (s_history_persist_dir[0] && persist_saved)
+        addendum_saved = append_history_reference(
+            persist_path, reason, sig, sequence);
+    else
+        addendum_saved = append_history_record(
+            snapshot_path, reason, sig, sequence);
     if (!addendum_saved)
         fprintf(stderr, "psxrecomp: failed to append overlay capture history %s\n",
                 s_history_addendum);
