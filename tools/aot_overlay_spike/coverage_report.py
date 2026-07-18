@@ -25,7 +25,7 @@ Usage:
                      --out-md <path.md> --out-json <path.json> [--game <id>]
 Cache dirs are scanned recursively for *.ranges; a captures json is the v2 schema.
 """
-import argparse, bisect, os, sys, json, re, glob
+import argparse, bisect, os, sys, json, re, glob, zlib
 from collections import defaultdict
 
 MASK = 0x1FFFFFFF
@@ -45,21 +45,61 @@ def merge_intervals(intervals):
             merged[-1][1] = hi
     return [(lo, hi) for lo, hi in merged]
 
-def parse_ranges_dir(d):
-    """Return ({entry_masked: code_crc}, merged compiled-code intervals)."""
+def _zero_filled_crc(size):
+    crc = 0
+    zeroes = bytes(min(size, 65536))
+    remaining = size
+    while remaining:
+        take = min(remaining, len(zeroes))
+        crc = zlib.crc32(zeroes[:take], crc)
+        remaining -= take
+    return crc & 0xFFFFFFFF
+
+def parse_ranges_dir(d, with_audit=False):
+    """Return entries/ranges, rejecting proven all-zero data-as-code records.
+
+    A valid function cannot be an entire compiled range of MIPS NOP words: it
+    has no return or transfer. Historical runtime compilers nevertheless minted
+    such ranges from observed sequential PCs. The v2 manifest has enough proof
+    to quarantine them without needing the original capture bytes: F carries
+    the range CRC and its following R carries the exact byte count.
+    """
     ent = {}
     intervals = []
+    quarantined = set()
     for rf in glob.glob(os.path.join(d, '**', '*.ranges'), recursive=True):
-        for line in open(rf, errors='ignore'):
-            m = re.match(r'F\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
-            if m:
-                ent[norm(int(m.group(1), 16))] = int(m.group(2), 16)
-                continue
-            m = re.match(r'R\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
-            if m:
-                lo = norm(int(m.group(1), 16))
-                intervals.append((lo, lo + int(m.group(2), 16)))
-    return ent, merge_intervals(intervals)
+        pending = None
+        with open(rf, errors='ignore') as manifest:
+            for line in manifest:
+                m = re.match(r'F\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
+                if m:
+                    if pending is not None:
+                        ent[pending[0]] = pending[1]
+                    pending = (norm(int(m.group(1), 16)), int(m.group(2), 16))
+                    continue
+                m = re.match(r'R\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
+                if m:
+                    lo = norm(int(m.group(1), 16))
+                    size = int(m.group(2), 16)
+                    if (pending is not None and size > 0 and size % 4 == 0 and
+                            pending[1] == _zero_filled_crc(size)):
+                        quarantined.add((pending[0], pending[1], size))
+                    else:
+                        if pending is not None:
+                            ent[pending[0]] = pending[1]
+                        intervals.append((lo, lo + size))
+                    pending = None
+        if pending is not None:
+            ent[pending[0]] = pending[1]
+    result = (ent, merge_intervals(intervals))
+    if not with_audit:
+        return result
+    audit = [
+        {'entry': f'0x{entry | 0x80000000:08X}',
+         'code_crc': f'{crc:08X}', 'size': size}
+        for entry, crc, size in sorted(quarantined)
+    ]
+    return result + (audit,)
 
 def _c_initializer(text, declaration_pattern):
     """Return the braced initializer following a unique C declaration."""
@@ -102,6 +142,18 @@ def parse_bios_dispatch(path):
             r'0x([0-9A-Fa-f]+)u?\s*,\s*0x([0-9A-Fa-f]+)u?\s*\}', bodies):
         lo, hi = norm(int(lo, 16)), norm(int(hi, 16))
         if hi > lo:
+            intervals.append((lo, hi))
+    try:
+        native_stubs = _c_initializer(
+            text, r'\bPsxNativeStub\s+psx_bios_native_stubs\s*\[[^]]*\]\s*=')
+    except ValueError:
+        native_stubs = ''
+    for key, lo, hi in re.findall(
+            r'\{\s*0x([0-9A-Fa-f]+)u?\s*,\s*'
+            r'0x([0-9A-Fa-f]+)u?\s*,\s*0x([0-9A-Fa-f]+)u?\s*\}', native_stubs):
+        key, lo, hi = norm(int(key, 16)), norm(int(lo, 16)), norm(int(hi, 16))
+        if hi > lo and lo <= key < hi:
+            entries.add(key)
             intervals.append((lo, hi))
     if not entries or not intervals:
         raise ValueError('generated BIOS dispatcher contained an empty static table')
@@ -167,8 +219,10 @@ def main():
     if a.prior_report and not a.assume_static_superset:
         ap.error('--prior-report requires the explicit --assume-static-superset assertion')
 
-    static_ent, static_ranges = parse_ranges_dir(a.static)
+    static_ent, static_ranges, static_zero = parse_ranges_dir(
+        a.static, with_audit=True)
     report = {'game': a.game, 'static_entries': len(static_ent), 'sources': {}}
+    report['static_quarantined_zero_ranges'] = static_zero
     combined_ent = dict(static_ent)
     combined_ranges = static_ranges
     if a.bios_dispatch:
@@ -188,6 +242,9 @@ def main():
               'extractor reproduce, and how much lies in compiled static code?_\n')
     md.append(f'- Static shard cache: `{a.static}`')
     md.append(f'- Static manifest entries: **{len(static_ent)}**\n')
+    if static_zero:
+        md.append(f'- Quarantined proven all-zero static ranges: '
+                  f'**{len(static_zero)}** (excluded as data, not code)\n')
     if a.bios_dispatch:
         md.append(f'- Base BIOS native dispatch entries: **{len(bios_ent)}**; '
                   f'relocated kernel body ranges: **{len(bios_ranges)}**')
@@ -195,7 +252,8 @@ def main():
                   'and the separately generated, live-byte-guarded base BIOS.\n')
 
     if a.vault:
-        vault_ent, _ = parse_ranges_dir(a.vault)
+        vault_ent, _, vault_zero = parse_ranges_dir(a.vault, with_audit=True)
+        report['vault_quarantined_zero_ranges'] = vault_zero
         r = recall(set(vault_ent), static_ent, static_ranges, vault_ent)
         report['sources']['vault'] = {
             k: v for k, v in r.items() if k not in ('misses', 'range_misses')}
@@ -210,6 +268,9 @@ def main():
             report['vault_combined_range_misses'] = [
                 f'0x{x|0x80000000:08X}' for x in combined['range_misses']]
         md.append('## vs played vault (most complete needed-set)\n')
+        if vault_zero:
+            md.append(f'- Quarantined proven all-zero played ranges: '
+                      f'**{len(vault_zero)}** (excluded from the needed set)')
         md.append(f'- Manifest entries in the full-playthrough vault: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
@@ -236,13 +297,17 @@ def main():
             md.append(f'- **COMBINED CODE-RANGE GAPS: '
                       f'{combined["missed_code_range"]}**\n')
             md.append('#### Combined gaps grouped by region\n')
-            for reg, addrs in group_by_region(combined['range_misses']).items():
-                md.append(f'- region `0x{reg|0x80000000:08X}`: {len(addrs)} misses')
-                md.append('  ```')
-                for i in range(0, len(addrs), 8):
-                    md.append('  ' + ' '.join(
-                        f'{x|0x80000000:08X}' for x in addrs[i:i+8]))
-                md.append('  ```')
+            grouped_combined = group_by_region(combined['range_misses'])
+            if not grouped_combined:
+                md.append('- None.')
+            else:
+                for reg, addrs in grouped_combined.items():
+                    md.append(f'- region `0x{reg|0x80000000:08X}`: {len(addrs)} misses')
+                    md.append('  ```')
+                    for i in range(0, len(addrs), 8):
+                        md.append('  ' + ' '.join(
+                            f'{x|0x80000000:08X}' for x in addrs[i:i+8]))
+                    md.append('  ```')
             md.append('')
         md.append('### Code-range gaps grouped by overlay region\n')
         for reg, addrs in group_by_region(r['range_misses']).items():
