@@ -274,6 +274,13 @@ scene and returned title screen rendered correctly. The dev persistence profile
 produced 21/21 signed immutable snapshots with zero invalid or duplicate records;
 production uses only the append-only executable-local history.
 
+Shard publication is interruption-safe. GCC/tcc now writes a unique sibling
+temporary DLL and the tool atomically replaces the content-keyed cache name only
+after a successful, non-empty output. Cache reuse additionally requires a
+non-empty `.ranges` manifest. A killed compiler therefore cannot leave a partial
+final-named DLL that a later build mistakes for a valid shard, and a failed
+`--force` rebuild cannot destroy the previous good DLL.
+
 ## Next to raise coverage (future session)
 
 1. ~~Direct-call frameless-leaf discovery~~ — DONE. Reachable `jal` targets are

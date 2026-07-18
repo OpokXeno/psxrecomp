@@ -288,6 +288,44 @@ def check_retained_alias_contract(recompiler):
         assert f"R {LOAD:08X} 2C" in ranges
 
 
+def check_atomic_dll_publication():
+    original = MOD._compile_dll_direct
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            final = os.path.join(tmp, "shard.dll")
+            ranges = os.path.join(tmp, "shard.ranges")
+            with open(final, "wb") as out:
+                out.write(b"old-good-shard")
+
+            def fail_compile(_src, staged, _includes, **_kwargs):
+                with open(staged, "wb") as out:
+                    out.write(b"partial")
+                return False
+
+            MOD._compile_dll_direct = fail_compile
+            assert not MOD.compile_dll("ignored.c", final, [])
+            with open(final, "rb") as built:
+                assert built.read() == b"old-good-shard"
+            assert not list(pathlib.Path(tmp).glob(".*.tmp.*"))
+            assert not MOD.compiled_shard_complete(final)
+
+            def good_compile(_src, staged, _includes, **_kwargs):
+                with open(staged, "wb") as out:
+                    out.write(b"new-complete-shard")
+                return True
+
+            MOD._compile_dll_direct = good_compile
+            assert MOD.compile_dll("ignored.c", final, [])
+            with open(final, "rb") as built:
+                assert built.read() == b"new-complete-shard"
+            with open(ranges, "w", encoding="utf-8") as out:
+                out.write("F 80010000 DEADBEEF\nR 80010000 10\n")
+            assert MOD.compiled_shard_complete(final)
+            assert not list(pathlib.Path(tmp).glob(".*.tmp.*"))
+    finally:
+        MOD._compile_dll_direct = original
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -303,6 +341,7 @@ def main():
     check_forward_branch_root()
     check_recompiler_composite_contract(args.recompiler)
     check_retained_alias_contract(args.recompiler)
+    check_atomic_dll_publication()
 
     data = bytearray(0x200)
 

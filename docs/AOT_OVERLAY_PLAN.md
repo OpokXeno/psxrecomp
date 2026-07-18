@@ -57,6 +57,10 @@ continue to fail safely to the interpreter.
   100% combined BIOS code-range coverage for both vault and live history.
 - Large archive reads are now linear rather than quadratic sector concatenation.
   These validations wrote only `%TEMP%` caches; title caches remain untouched.
+- DLL publication is now atomic: compilers target a unique sibling temporary,
+  successful non-empty output replaces the final cache name, and cache reuse
+  requires its non-empty range manifest. Interrupted compiles can no longer
+  poison later runs or overwrite a prior good shard during `--force`.
 - Tomba 1 header exports are authoritative mid-function dispatch entries rather
   than callable roots. Their conservative retry now uses only the nearest
   preceding prologue host, hard-stops it at the next prologue, and rejects calls

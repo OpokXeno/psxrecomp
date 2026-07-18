@@ -2078,7 +2078,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             struct.pack('<II', ev, crc)
             for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
         dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
-        if os.path.exists(dll_path) and not args.force:
+        if compiled_shard_complete(dll_path) and not args.force:
             return frag_ids, 'cached'   # already built
         patched_c = os.path.join(tmp, 'frag_patched.c')
         with open(patched_c, 'w') as f:
@@ -2200,9 +2200,9 @@ def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
     return True
 
 
-def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
-                gcc: str = 'gcc', flavor: int = 0,
-                compiler: str = 'gcc', tcc: str = 'tcc') -> bool:
+def _compile_dll_direct(c_path: str, out_dll: str, include_dirs: list[str],
+                        gcc: str = 'gcc', flavor: int = 0,
+                        compiler: str = 'gcc', tcc: str = 'tcc') -> bool:
     import platform
     # Absolute paths (interpreter flavor) for EVERY path the native compiler
     # touches — see native_path's docstring for the two rules and the
@@ -2260,6 +2260,50 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         print(f'  COMPILE ERROR (exit {r.returncode}):\n{msg}')
         return False
     return True
+
+
+def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
+                gcc: str = 'gcc', flavor: int = 0,
+                compiler: str = 'gcc', tcc: str = 'tcc') -> bool:
+    """Publish a shard only after its compiler has completed successfully.
+
+    GCC and tcc write their output incrementally. If the process is interrupted
+    while targeting the final cache name, the next run sees that partial file
+    and used to skip it as if it were complete. Compile to a unique sibling and
+    atomically replace the final DLL instead; an existing good shard therefore
+    also survives a failed --force rebuild.
+    """
+    final_out = os.path.abspath(out_dll)
+    out_dir = os.path.dirname(final_out)
+    os.makedirs(out_dir, exist_ok=True)
+    suffix = os.path.splitext(final_out)[1] or overlay_ext()
+    fd, staged = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(final_out)}.tmp.', suffix=suffix,
+        dir=out_dir)
+    os.close(fd)
+    os.unlink(staged)  # let the native compiler create its output normally
+    try:
+        if not _compile_dll_direct(
+                c_path, staged, include_dirs, gcc=gcc, flavor=flavor,
+                compiler=compiler, tcc=tcc):
+            return False
+        if not os.path.isfile(staged) or os.path.getsize(staged) == 0:
+            print('  COMPILE ERROR: compiler reported success but emitted no DLL')
+            return False
+        os.replace(staged, final_out)
+        return True
+    finally:
+        try:
+            os.unlink(staged)
+        except FileNotFoundError:
+            pass
+
+
+def compiled_shard_complete(dll_path: str) -> bool:
+    """A cached shard is dispatchable only with its non-empty range manifest."""
+    ranges = os.path.splitext(dll_path)[0] + '.ranges'
+    return (os.path.isfile(dll_path) and os.path.getsize(dll_path) > 0 and
+            os.path.isfile(ranges) and os.path.getsize(ranges) > 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2568,7 +2612,8 @@ def main():
             stats.add_skip()
             return
 
-        if not args.static and os.path.exists(dll_path) and not args.force:
+        if (not args.static and compiled_shard_complete(dll_path) and
+                not args.force):
             print('  SKIP: DLL already exists (use --force to recompile)\n')
             stats.add_skip()
             return
