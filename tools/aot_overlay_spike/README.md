@@ -284,6 +284,21 @@ non-empty `.ranges` manifest. A killed compiler therefore cannot leave a partial
 final-named DLL that a later build mistakes for a valid shard, and a failed
 `--force` rebuild cannot destroy the previous good DLL.
 
+The `cg5_060368b2` discovery checkpoint was then regenerated from each disc and
+cross-title checked in disposable caches. Ape GCC-built **47/47** candidates and
+retained **107/107 combined live-history code-range coverage**. MMX6 GCC-built
+**31/31** candidates and retained **677/677 combined coverage**; broad normal-mode
+attempts containing embedded data or an incomplete label graph were rejected and
+the corresponding shards safely retried with direct seeds. Tomba 2's full set of
+**53/53** candidates passed the generated-C audit with zero unsupported/bad
+targets, and GCC built representative MAIN, large-area, OPN/CRD, and BIOS shards;
+the remaining full GCC pass is intentionally running at low priority in a
+disposable cache. That validation also exposed and fixed two TCC-path parity
+bugs: TCC now receives the same `PSX_NO_DEBUG_TOOLS` and block-cycle defines as
+GCC, and a generated-source-only shim supplies the unsupported `__builtin_ctz`
+without changing hashed runtime headers. The packaged TinyCC 0.9.27 now builds
+real T2 BIOS and OPN/CRD shards cleanly.
+
 ## Next to raise coverage (future session)
 
 1. ~~Direct-call frameless-leaf discovery~~ — DONE. Reachable `jal` targets are

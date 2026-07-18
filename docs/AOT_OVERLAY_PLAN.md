@@ -70,6 +70,18 @@ continue to fail safely to the interpreter.
   Overlay ranges cover 820/823 historical-vault PCs and 410/450 live-history PCs;
   every residual is in the separately recompiled BIOS/kernel ranges, yielding
   **100.0% combined code-range recall and zero true gaps** for both scoreboards.
+- The resulting `cg5_060368b2` checkpoint was re-extracted from disc and tested
+  against disposable caches on the other producers. Ape rebuilt 47/47 GCC shards
+  and retained 107/107 combined live-history range coverage. MMX6 rebuilt 31/31;
+  two unsafe broad-discovery attempts failed their audit/compile gates and fell
+  back to conservative seeds, retaining 677/677 combined range coverage. Tomba 2
+  audited all 53 candidates with zero unsupported/bad targets and GCC-built eight
+  representative shards (MAIN, four large area variants, OPN/CRD, and BIOS);
+  its remaining full GCC compile is a low-priority disposable-cache follow-up.
+- TCC overlay compilation now receives the same release/debug and cycle-model
+  defines as GCC. A TCC-only generated-source shim supplies `__builtin_ctz`
+  without changing the hashed runtime headers. Real T2 BIOS and OPN/CRD shards
+  compile cleanly through the packaged TinyCC 0.9.27 toolchain.
 
 ---
 

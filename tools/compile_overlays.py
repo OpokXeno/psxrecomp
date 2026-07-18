@@ -2197,6 +2197,19 @@ def _toolchain_env(gcc: str):
 # BOM-stripped copy of the include dirs (used ONLY for tcc's -I; the codegen hash
 # still derives from the real headers, so the cache dir matches the runtime).
 _TCC_BOMFREE_INC = {}   # orig include dir -> bom-stripped temp dir (memoized)
+_TCC_COMPAT_PREFIX = b'''\
+#ifdef __TINYC__
+/* TinyCC 0.9.27 has no GCC __builtin_ctz. Keep this shim local to the
+ * disposable generated source so runtime headers and the codegen hash stay
+ * byte-identical across compilers. */
+static inline unsigned psx_tcc_ctz(unsigned value) {
+    unsigned bit = 0u;
+    while (((value >> bit) & 1u) == 0u) ++bit;
+    return bit;
+}
+#define __builtin_ctz(value) psx_tcc_ctz((unsigned)(value))
+#endif
+'''
 
 def _bom_free_incdir(d: str) -> str:
     d = os.path.abspath(d)
@@ -2217,14 +2230,24 @@ def _bom_free_incdir(d: str) -> str:
 
 def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
                      tcc: str) -> bool:
-    # strip a UTF-8 BOM off the overlay C itself (tcc 0.9.27 chokes on it)
+    # Strip a UTF-8 BOM off the overlay C itself (tcc 0.9.27 chokes on it) and
+    # provide the one GCC builtin used by the shared cycle-model header.
     with open(c_path, 'rb') as f:
         data = f.read()
     if data[:3] == b'\xef\xbb\xbf':
-        with open(c_path, 'wb') as f:
-            f.write(data[3:])
+        data = data[3:]
+    if not data.startswith(_TCC_COMPAT_PREFIX):
+        data = _TCC_COMPAT_PREFIX + data
+    with open(c_path, 'wb') as f:
+        f.write(data)
     cmd = [tcc, '-shared',
            '-DPSX_OVERLAY_DLL_BUILD',
+           # Keep TCC semantically identical to the GCC overlay path. Omitting
+           # these left debug_server_cyc_observe unresolved in release shards
+           # and disabled guest-cycle charging in every successfully linked
+           # TCC shard.
+           '-DPSX_NO_DEBUG_TOOLS',
+           '-DPSX_ENABLE_BLOCK_CYCLES=1',
            f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
            native_path(c_path), '-o', native_path(out_dll)]
     for d in include_dirs:

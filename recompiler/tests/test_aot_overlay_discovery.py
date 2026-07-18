@@ -385,6 +385,40 @@ def check_atomic_dll_publication():
         MOD._compile_dll_direct = original
 
 
+def check_tcc_runtime_define_parity():
+    """TCC shards must use the same release/cycle contract as GCC shards."""
+    seen = []
+    old_run = MOD.subprocess.run
+    old_inc = MOD._bom_free_incdir
+
+    class Result:
+        returncode = 0
+        stdout = ''
+        stderr = ''
+
+    def fake_run(cmd, **_kwargs):
+        seen.extend(cmd)
+        return Result()
+
+    try:
+        MOD.subprocess.run = fake_run
+        MOD._bom_free_incdir = lambda path: path
+        with tempfile.TemporaryDirectory() as td:
+            source = pathlib.Path(td) / 'overlay.c'
+            source.write_text('int overlay_test(void) { return 0; }\n')
+            assert MOD._compile_dll_tcc(
+                str(source), str(pathlib.Path(td) / 'overlay.dll'),
+                [td], 3, 'tcc')
+            assert b'psx_tcc_ctz' in source.read_bytes()
+    finally:
+        MOD.subprocess.run = old_run
+        MOD._bom_free_incdir = old_inc
+
+    assert '-DPSX_NO_DEBUG_TOOLS' in seen
+    assert '-DPSX_ENABLE_BLOCK_CYCLES=1' in seen
+    assert '-DPSX_OVERLAY_FLAVOR=3' in seen
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -403,6 +437,7 @@ def main():
     check_recompiler_pointer_table_call_root(args.recompiler)
     check_retained_alias_contract(args.recompiler)
     check_atomic_dll_publication()
+    check_tcc_runtime_define_parity()
 
     data = bytearray(0x200)
 
