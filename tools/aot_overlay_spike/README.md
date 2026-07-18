@@ -120,21 +120,32 @@ For Tomba 2, `GAME.BIN` ends exactly where every A*/SOP file begins, producing
 `0x80106000` envelope variants in addition to the standalone `0x80108000` shards.
 The A01 composite—the live attract scene's measured hot variant—audits cleanly
 (459 functions, zero unsupported/bad targets). Its performance recheck remains
-pending because an unrelated eight-core build prevented a valid BelowNormal soak.
+pending; the earlier attempt overlapped an unrelated build and was not a valid
+BelowNormal measurement.
+
+`coverage_report.py` reports both exact manifest-entry recall and compiled
+code-range recall. The distinction matters: runtime/autocompile vaults may contain
+one-entry fragments at consecutive instructions, while static AOT emits one broad
+function with the same PCs in its guarded `R` ranges. Exact-entry parity is retained
+for continuity; code-range recall is the useful uncovered-code roadmap. At the
+current Tomba 2 checkpoint these are 1270/1856 (68.4%) exact entries and 1811/1856
+(97.6%) code-range coverage. All 45 remaining code-range gaps are in low/kernel RAM.
 
 ## Next to raise coverage (future session)
 
 1. ~~Direct-call frameless-leaf discovery~~ — DONE. Reachable `jal` targets are
    emitted as trusted `call_root` seeds; same-basic-block constant-register
-   `jalr`/tail-`jr` targets are resolved with clobber checks. Tomba 2 vault recall
-   rose 60.0% -> 64.0% (+74 MAIN.EXE entries), with 23/23 shards compiling cleanly.
-   Continue with statically proven function-pointer/jump-table consumers; the
-   first corpus sweep correctly rejected apparent constants clobbered by `lw`.
+   `jalr`/tail-`jr` targets are resolved with clobber checks. Exact-entry recall
+   first rose by 74 MAIN.EXE entries. Exact-entry boundary verification now also
+   retains normal-mode frameless leaves aligned by NOPs after a preceding return;
+   this added 13 clean MAIN definitions and closed every remaining MAIN code-range
+   gap. The generated-C audit remains zero unsupported / zero bad targets.
 2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
 3. ~~Recover weak-signal A09/A0J/GAME/OPN~~ — DONE. They are ordinary uncompressed
    MIPS, not archives. Counting only callable `jal` targets sharply resolves
    A09/A0J/OPN; GAME's 8-byte near-tie resolves through the exact base independently
    proved by DEMO. The played vault byte-proves GAME at 0x80106228. Ambiguous files
    without one unique trusted match still fail closed.
-4. Extract the kernel `0x80000000` region once from the BIOS (game-independent).
+4. Extract the kernel `0x80000000` region once from the BIOS (game-independent):
+   this is now the complete 45-PC Tomba 2 code-range gap set.
 5. Generalize into a real `tools/` producer (no hardcoded paths; disc + game.toml in).

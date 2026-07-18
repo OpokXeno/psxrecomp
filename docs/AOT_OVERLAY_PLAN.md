@@ -5,14 +5,19 @@ Author: investigation via 4 parallel agents + adversarial source verification.
 Scope: can we move overlay sharding from *runtime discovery* to *build-time (AOT)*,
 starting with Tomba (SCUS-94236)?
 
-Current Tomba 2 checkpoint: generic play-free extraction emits 27 clean regions;
-all 27 compile under `cg5_d0a05489`. Direct-call frameless-leaf discovery plus
-call-only/cross-file base recovery raised full-playthrough-vault entry recall from
-1113/1856 (60.0%) to 1219/1856 (65.7%), and entry+code_crc recall from 1012 to
-1102. The gains are 74 MAIN.EXE entries plus 32 overlay-window entries. The
-remaining manifest has 637 misses: 268 MAIN.EXE, 324 overlay-window, and 45
-kernel/low-memory entries. Runtime static-only smoke loaded the matching tag with
-`stale_blocked=0`; misses continue to fail safely to the interpreter via CRC guards.
+Current Tomba 2 checkpoint: generic play-free extraction emits 29 base/raw regions
+plus exact adjacent-producer composites (52 capture records total). The 29 base/raw
+shards and the live A01 composite audit with zero unsupported instructions or bad
+targets under `cg5_d0a05489`. Direct/constant-register call discovery, raw/cross-file
+base recovery, and padded-return frameless-boundary retention raised full-playthrough
+vault exact-entry recall from 1113/1856 (60.0%) to 1270/1856 (68.4%); entry+code_crc
+is 1150/1856 (62.0%). Exact entry parity is intentionally no longer treated as the
+uncovered-code count: the runtime vault contains fine-grained fragments, including
+consecutive instruction entries, while static AOT emits broad functions. Compiled
+code-range recall is 1811/1856 (97.6%), leaving exactly 45 true gaps, all in the
+game-independent kernel/low-memory region. Runtime static-only validation loaded
+the richer MAIN shard at 60 fps with `stale_blocked=0`, no range/manifest overflow,
+and byte-matching candidates; misses continue to fail safely to the interpreter.
 
 ---
 
