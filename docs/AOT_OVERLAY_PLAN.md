@@ -306,7 +306,13 @@ Remove dependence on a recorded route.
 - For Class-A titles (position-fixed, disc==RAM), add a pure-static extractor
   (extend `extract_overlays.py`, seeded by the loader table) that skips headless
   execution entirely — validated by the same CRC guard.
-- Fold Legaia-style `jal`-call-graph base recovery for titles lacking a clean table.
+- ~~Fold Legaia-style `jal`-call-graph base recovery for titles lacking a clean
+  table.~~ **DONE 2026-07-17** — `extract_generic.py recover_base()`: `jal`/`j`
+  targets are base-independent, so at the true base the max number of intra-overlay
+  jal targets land on a 0x27BD prologue. Byte-identical to the live-proven Tomba 1
+  hand tool (all 22 overlays, base 0x800E7388); Tomba 2's 21 A*.BIN converge on
+  0x80108F9C. Emitted page-aligned (+FILL) to match the runtime's page-aligned
+  region_start key. See `tools/aot_overlay_spike/README.md`.
 - Run the harness across the ecosystem (Ape, MMX, Tomba2, …); each title's shards
   become build artifacts, killing the runtime background-compile requirement fleet-
   wide.

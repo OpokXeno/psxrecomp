@@ -22,15 +22,16 @@ discovery quality, not to be run as-is in a build.
   verbatim, seeds via prologue scan @ region+904.
 - `tomba2_extract.py` — Tomba 2 (SCUS-94454). Two producers: MAIN.EXE (a PS-X EXE
   whose header self-describes the load address — ROBUST) and BIN/A*.BIN (header
-  table; base recovery via prologue delta-sweep — UNRELIABLE, produces data-as-code).
+  table). Superseded for base recovery by `extract_generic.py`'s jal-fit method.
 
 ## Validated result (see plan doc for detail)
 
 - **Tomba 1:** 90% of played functions reproduced play-free + ~1964 unplayed
   extra; live-validated in-game (Dwarf Village went native, no runtime compile).
 - **Tomba 2:** 661 functions byte-identical (entry+code_crc) to the shipped/played
-  vault — provably real — ALL from the MAIN.EXE producer; the BIN producer yields
-  0 usable shards (broken base recovery). Generality is producer-dependent.
+  vault — provably real — from the MAIN.EXE producer. The BIN header-table producer
+  now recovers a correct, self-consistent common base (jal-fit, below) — 21 A*.BIN
+  overlays converge on region 0x80108000 (+3996), 4 weak-signal files safely skipped.
 
 ## Correctness guarantee (why partial coverage is safe)
 
@@ -56,13 +57,26 @@ misses, production autocompile (tcc/gcc) self-heals on first visit.
   different container/format (likely compressed/archived). Each engine family
   needs its own producer. Matches the Legaia-decomp finding: overlay enumeration
   is bespoke per engine.
-- **KNOWN REGRESSION — header-table base recovery is unreliable.** The generic
-  delta-sweep (find the base where header pointers hit prologues) produces
-  scattered/wrong bases: on Tomba 1 it regresses the hand tool's known-correct
-  FIXED base (0x800E7000, content @ +904), and on Tomba 2 BIN it decodes data as
-  code (6 audit fails). Header-table producers still need a fixed/known base or
-  real loader-table RE. Prefer the hand extractors (tomba1_extract.py) for
-  header-table games until this is fixed.
+- **SOLVED (2026-07-17) — header-table base recovery via jal-target self-consistency.**
+  The old delta-sweep matched the export-table pointers against prologues, but those
+  pointers point at mid-function DISPATCH entries, not prologues (measured: 0/29 hit
+  a prologue at the true base) — so it scattered by 2-16KB. Root cause & fix:
+  `j`/`jal` targets are BASE-INDEPENDENT (`0x80000000 | (imm26<<2)`, since all game
+  code is in 0x800xxxxx). At the TRUE base, the maximum number of intra-overlay jal
+  targets land on a real 0x27BD prologue. `recover_base()` votes every (jal-target,
+  prologue-offset) pair for base `t-o` inside the pointer-containment window; the
+  peak is unique and sharp (~2x margin over runner-up). Then the record is emitted
+  PAGE-ALIGNED with a FILL prefix (page_base + (file_base - page_base)), because the
+  runtime keys shards by a page-aligned region_start and compile_overlays takes
+  load_addr verbatim (`phys = load_addr & 0x1FFFFFFF`, no re-align).
+  - **Validation:** generic output is byte-identical (base, region envelope, seed
+    set) to the live-proven `tomba1_extract.py` hand tool for ALL 22 Tomba 1
+    overlays — recovered 0x800E7388 (region 0x800E7000 +904) with no hardcoded
+    constants. Tomba 2's 21 A*.BIN overlays converge on 0x80108F9C (region
+    0x80108000 +3996). Weak-signal files are skipped (score<4 or <1.5x runner-up),
+    which is safe: coverage loss, never wrong execution, per the CRC guard.
+  - The hand tools (tomba1/tomba2_extract.py) remain only as the offline oracle for
+    this validation; `extract_generic.py` is now the general path.
 - Bugs fixed by the sweep: multi-.bin cue (data-track selection), base-EXE
   exclusion, game.toml UTF-8 BOM, normal-mode .ranges format (`F <entry>` w/o crc).
 
@@ -70,6 +84,9 @@ misses, production autocompile (tcc/gcc) self-heals on first visit.
 
 1. Frameless-leaf + indirect-call-table seed discovery (helps every game; would
    lift MAIN.EXE past ~62% and Tomba 1 past 90%).
-2. Real loader-table RE for header-table (BIN) base recovery (per-game).
-3. Extract the kernel `0x80000000` region once from the BIOS (game-independent).
-4. Generalize into a real `tools/` producer (no hardcoded paths; disc + game.toml in).
+2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
+3. Recover the weak-signal skipped overlays (Tomba 2 A09/A0J/GAME/OPN): likely
+   compressed/archived or too few intra-overlay calls; may need a decompressor or
+   a lower-confidence seed source before jal-fit can lock a base.
+4. Extract the kernel `0x80000000` region once from the BIOS (game-independent).
+5. Generalize into a real `tools/` producer (no hardcoded paths; disc + game.toml in).

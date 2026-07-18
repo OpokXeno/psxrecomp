@@ -20,7 +20,7 @@ Usage:
                      --out <captures.json> [--tmp <dir>]
 Requires extract_overlays.py (same dir chain) for the DiscReader/ISO9660 walker.
 """
-import argparse, os, sys, json, base64, struct, subprocess, tempfile, re
+import argparse, os, sys, json, base64, struct, subprocess, tempfile, re, binascii
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import extract_overlays as eo
 try:
@@ -47,6 +47,65 @@ def prologues(data, base):
     return [base+off for off in range(0,len(data)-4,4)
             if (struct.unpack_from('<I',data,off)[0]>>16)==0x27BD
             and (struct.unpack_from('<I',data,off)[0]&0x8000)]
+
+def prologue_offsets(data):
+    """File offsets whose word is an `addiu $sp,$sp,-N` stack-frame prologue."""
+    return [off for off in range(0,len(data)-4,4)
+            if (struct.unpack_from('<I',data,off)[0]>>16)==0x27BD
+            and (struct.unpack_from('<I',data,off)[0]&0x8000)]
+
+def jal_targets(data):
+    """Distinct absolute j/jal targets. These are BASE-INDEPENDENT: the target
+    is 0x80000000 | (imm26<<2) regardless of where the file loads, because all
+    PSX game code lives in the 0x800xxxxx region (PC[31:28] is always 0x8)."""
+    ts=set()
+    for off in range(0,len(data)-4,4):
+        w=struct.unpack_from('<I',data,off)[0]
+        if (w>>26) in (0x02,0x03):                 # j / jal
+            ts.add(0x80000000 | ((w & 0x03FFFFFF) << 2))
+    return ts
+
+def recover_base(data, ptrs):
+    """Recover the verbatim load base of a position-fixed header-table overlay.
+
+    The export-table pointers point at mid-function DISPATCH entries, not
+    prologues, so matching them against 0x27BD is useless (0 hits at the true
+    base — measured). Instead use jal-target self-consistency: jal targets are
+    base-independent, and at the TRUE base the maximum number of intra-overlay
+    jal targets land on a real 0x27BD prologue. This peaks uniquely and sharply
+    on the correct base (~2x margin over runner-up on Tomba 1's 22 overlays).
+
+    Returns (base, score) or None when the signal is too weak to trust (safe:
+    a skipped overlay is coverage loss, never wrong execution — the runtime's
+    per-function code_crc dispatch guard rejects any mis-based shard anyway)."""
+    import bisect
+    from collections import Counter
+    nonnull=[p for p in ptrs if p]
+    if not nonnull: return None
+    n=len(data)
+    # Containment: every export pointer must map to a valid in-file offset when
+    # the file loads verbatim at `base`  =>  0 <= ptr-base <= n-4.
+    win_hi=min(nonnull)                 # base <= min(ptr)
+    win_lo=max(nonnull)-(n-4)           # base >= max(ptr)-(n-4)
+    if win_hi < win_lo: return None
+    P=prologue_offsets(data)
+    if not P: return None
+    # For each jal target t and prologue offset o, base (t-o) makes t hit a
+    # prologue. Tally votes over bases inside the containment window; the peak
+    # base is the one the most distinct jal targets agree on.
+    hist=Counter()
+    for t in jal_targets(data):
+        lo_i=bisect.bisect_left(P, t-win_hi)
+        hi_i=bisect.bisect_right(P, t-win_lo)
+        for o in P[lo_i:hi_i]:
+            hist[t-o]+=1
+    if not hist: return None
+    top=hist.most_common(2)
+    base,score=top[0]
+    second=top[1][1] if len(top)>1 else 0
+    if score < 4 or score < second*1.5:      # demand a clear, unique-ish peak
+        return None
+    return base, score
 
 def is_psx_exe(data):
     return len(data) >= 0x20 and data[:8] == b'PS-X EXE'
@@ -111,12 +170,17 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     # The boot EXE (game.toml `exe`) is the STATIC-recompiled base, NOT an overlay.
     exe_base=os.path.basename(str(game.get('exe',''))).upper()
-    records=[]; np=nh=0
+    records=[]; np=nh=0; seen_crc=set()
     for p,l,s in sorted(files):
         if s<8 or s>2_000_000: continue
         if exe_base and os.path.basename(p).upper()==exe_base:
             continue   # skip the statically-compiled base executable
         data=dr.read_file_bytes(l,s)
+        # Position-fixed overlays are reused verbatim across AREA folders; dedup
+        # by content so identical bytes -> one shard set, not N (same as hand tool).
+        dcrc=binascii.crc32(data)&0xFFFFFFFF
+        if dcrc in seen_crc: continue
+        seen_crc.add(dcrc)
         if is_psx_exe(data):
             t_addr=struct.unpack_from('<I',data,0x18)[0]
             body=data[2048:]
@@ -138,19 +202,31 @@ def main():
         else:
             cnt=is_header_table(data)
             if not cnt: continue
-            # delta-sweep base recovery (best-effort; see plan doc limitations)
-            ptrs=[x for x in struct.unpack_from(f'<{cnt}I',data,4) if x]
-            lo0=(min(ptrs)&~0xFFF)
-            best=None
-            for b in range(lo0-0x4000, lo0+0x1000, 4):
-                h=sum(1 for x in ptrs if 0<=x-b<=len(data)-4
-                      and (struct.unpack_from('<I',data,x-b)[0]>>16)==0x27BD
-                      and (struct.unpack_from('<I',data,x-b)[0]&0x8000))
-                if best is None or h>best[1]: best=(b,h)
-            base,hits=best
-            if hits==0: continue
-            records.append(rec(base,data,prologues(data,base)))
+            # jal-target self-consistency base recovery (robust; supersedes the
+            # old prologue-density delta-sweep, which matched export pointers
+            # against prologues they never point at -> wrong base by 2-16KB).
+            ptrs=struct.unpack_from(f'<{cnt}I',data,4)
+            rb=recover_base(data, ptrs)
+            if rb is None:
+                print(f"  [header-table] {p}: base signal too weak, SKIPPED (safe)")
+                continue
+            base,score=rb
+            seeds=prologues(data,base)   # seed via full-file prologue scan
+            # The runtime keys shards by a PAGE-ALIGNED region_start (the first
+            # dirty page of the overlay's contiguous run), and compile_overlays
+            # takes the capture's load_addr verbatim as that key (phys = load_addr
+            # & 0x1FFFFFFF, no re-align). So we must present a page-aligned base
+            # with a FILL prefix bridging page_base -> file base, exactly as the
+            # played-vault layout for these position-fixed overlays. Seeds are
+            # absolute so they are unaffected; region bytes stay byte-identical.
+            page_base = base & ~0xFFF
+            fill = base - page_base
+            region = b'\x00'*fill + data
+            records.append(rec(page_base, region, seeds))
             nh+=1
+            print(f"  [header-table] {p}: {len(data)}B file@0x{base:08X} "
+                  f"region@0x{page_base:08X}(+{fill}) "
+                  f"(jal-fit score={score}), prologue seeds={len(seeds)}")
     json.dump(records, open(a.out,'w'))
     print(f"producers: {np} PS-X EXE (full-discovery), {nh} header-table; {len(records)} regions -> {a.out}")
 
