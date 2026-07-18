@@ -40,6 +40,32 @@ A mis-positioned / data-as-code shard either fails audit at compile time or neve
 fires at runtime → coverage loss, never incorrect execution. Whatever static
 misses, production autocompile (tcc/gcc) self-heals on first visit.
 
+## Multi-game sweep findings (2026-07-17)
+
+`extract_generic.py` runs the improved extraction from a game.toml. Results:
+
+- **Full-discovery for PS-X-EXE producers WORKS & is validated.** Running the
+  recompiler in NORMAL mode (jr-$ra boundary scan) finds frameless functions
+  overlay-mode's prologue-scan misses. Tomba2 MAIN.EXE: prologue 710 fns / 62%
+  vault -> full-discovery 786 fns / 69% vault (3296 shards, 0 audit fails);
+  the tool now emits 3500 discovered seeds vs 1210 prologues.
+- **Generality is ENGINE-SPECIFIC, not universal.** The two producer types
+  (self-describing PS-X-EXE + {count,ptr[]} header-table) cover the Whoopee Camp
+  engine (Tomba 1 header-table; Tomba 2 MAIN.EXE + BIN) but detect ZERO overlays
+  on Vigilante 8 (Luxoflux) and Mega Man X6 (Capcom) — those load overlays in a
+  different container/format (likely compressed/archived). Each engine family
+  needs its own producer. Matches the Legaia-decomp finding: overlay enumeration
+  is bespoke per engine.
+- **KNOWN REGRESSION — header-table base recovery is unreliable.** The generic
+  delta-sweep (find the base where header pointers hit prologues) produces
+  scattered/wrong bases: on Tomba 1 it regresses the hand tool's known-correct
+  FIXED base (0x800E7000, content @ +904), and on Tomba 2 BIN it decodes data as
+  code (6 audit fails). Header-table producers still need a fixed/known base or
+  real loader-table RE. Prefer the hand extractors (tomba1_extract.py) for
+  header-table games until this is fixed.
+- Bugs fixed by the sweep: multi-.bin cue (data-track selection), base-EXE
+  exclusion, game.toml UTF-8 BOM, normal-mode .ranges format (`F <entry>` w/o crc).
+
 ## Next to raise coverage (future session)
 
 1. Frameless-leaf + indirect-call-table seed discovery (helps every game; would
