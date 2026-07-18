@@ -130,6 +130,40 @@ def recover_base(data, ptrs, trusted_bases=()):
     if not hist: return None
     return _select_base_vote(hist, trusted_bases)
 
+def recover_raw_base(data, base_lo, base_hi=0x80200000):
+    """Recover a position-fixed raw-code blob without an export-pointer table.
+
+    This uses the same base-independent jal-target/prologue self-consistency as
+    recover_base(), but has no pointer-containment window. Compensate with a
+    deliberately stricter proof: at least eight distinct call targets, a 2x
+    margin over the runner-up, and at least 25% of all apparent prologues must
+    agree on one RAM-fitting base. This finds call-dense raw siblings such as
+    Tomba 2 CRD.BIN/SOP.BIN while rejecting ordinary data files. A false positive
+    remains fail-safe at dispatch because every compiled function is code-CRC
+    guarded, but the strict gate also avoids wasting shards on data-as-code.
+    """
+    import bisect
+    from collections import Counter
+    P=prologue_offsets(data)
+    T=jal_targets(data)
+    if not P or not T: return None
+    hist=Counter()
+    max_base=base_hi-len(data)
+    for t in T:
+        lo_i=bisect.bisect_left(P,t-max_base)
+        hi_i=bisect.bisect_right(P,t-base_lo)
+        for o in P[lo_i:hi_i]:
+            base=t-o
+            if (base&3)==0:
+                hist[base]+=1
+    if not hist: return None
+    top=hist.most_common(2)
+    base,score=top[0]
+    second=top[1][1] if len(top)>1 else 0
+    if score < 8 or score < second*2 or score*4 < len(P):
+        return None
+    return base,score,second
+
 def is_psx_exe(data):
     return len(data) >= 0x20 and data[:8] == b'PS-X EXE'
 
@@ -200,7 +234,8 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     # The boot EXE (game.toml `exe`) is the STATIC-recompiled base, NOT an overlay.
     exe_base=os.path.basename(str(game.get('exe',''))).upper()
-    records=[]; np=nh=0; seen_crc=set(); header_files=[]
+    records=[]; np=nh=nr=nc=0; seen_crc=set(); header_files=[]; raw_files=[]
+    positioned=[]
     for p,l,s in sorted(files):
         if s<8 or s>2_000_000: continue
         if exe_base and os.path.basename(p).upper()==exe_base:
@@ -231,9 +266,11 @@ def main():
             print(f"  [PS-X EXE] {p}: {len(body)}B @0x{0x80000000|base:08X}, full-disc seeds={len(seeds_all)}")
         else:
             cnt=is_header_table(data)
-            if not cnt: continue
-            ptrs=struct.unpack_from(f'<{cnt}I',data,4)
-            header_files.append((p, data, ptrs))
+            if cnt:
+                ptrs=struct.unpack_from(f'<{cnt}I',data,4)
+                header_files.append((p, data, ptrs))
+            else:
+                raw_files.append((p, data))
 
     # Resolve call-dense files first. A small sibling that does not clear the
     # peak-margin test may then reuse one exact base independently proved by a
@@ -277,13 +314,62 @@ def main():
         fill = base - page_base
         region = b'\x00'*fill + data
         records.append(rec(page_base, region, seeds, dispatch_extra=hdr_entries))
+        positioned.append((p,data,base,seeds,hdr_entries))
         nh+=1
         extra=len(set(hdr_entries)-set(seeds))
         print(f"  [header-table] {p}: {len(data)}B file@0x{base:08X} "
               f"region@0x{page_base:08X}(+{fill}) "
               f"({fit_method} score={score}), prologue seeds={len(seeds)} "
               f"+{extra} export-table dispatch entries")
+
+    # Some engines keep call-dense position-fixed code in raw siblings whose
+    # leading table mixes pointers with strings/offsets, so the strict
+    # {count,ptr[]} recognizer correctly refuses to call it an export table.
+    # Recover only raw blobs with a much stronger unbounded jal-fit proof.
+    raw_base_lo=0x80000000|floor_page
+    for p,data in raw_files:
+        rb=recover_raw_base(data, raw_base_lo)
+        if rb is None: continue
+        base,score,second=rb
+        seeds=prologues(data,base)
+        page_base=base&~0xFFF
+        fill=base-page_base
+        region=b'\x00'*fill+data
+        records.append(rec(page_base,region,seeds))
+        positioned.append((p,data,base,seeds,()))
+        nr+=1
+        print(f"  [raw-code] {p}: {len(data)}B file@0x{base:08X} "
+              f"region@0x{page_base:08X}(+{fill}) "
+              f"(strict jal-fit score={score}, runner-up={second}), "
+              f"prologue seeds={len(seeds)}")
+
+    # Runtime dirty-page capture coalesces directly adjacent producers into one
+    # region keyed by the earlier page. Emit each provable two-file composition
+    # as an additional variant so the later file's functions are registered
+    # under that live region key. The bytes are an exact disc concatenation and
+    # per-function code CRCs still guard every dispatch. Tomba 2's GAME.BIN ends
+    # exactly at the common A*/SOP base; standalone records remain necessary for
+    # sessions where either producer appears under its own page key.
+    composite_keys=set()
+    for lp,ldata,lbase,lseeds,ldispatch in positioned:
+        for rp,rdata,rbase,rseeds,rdispatch in positioned:
+            if lbase >= rbase or lbase+len(ldata) != rbase:
+                continue
+            page_base=lbase&~0xFFF
+            region=b'\x00'*(lbase-page_base)+ldata+rdata
+            key=(page_base,binascii.crc32(region)&0xFFFFFFFF)
+            if key in composite_keys: continue
+            composite_keys.add(key)
+            seeds=sorted(set(lseeds)|set(rseeds))
+            dispatch=sorted(set(ldispatch)|set(rdispatch))
+            records.append(rec(page_base,region,seeds,dispatch_extra=dispatch))
+            nc+=1
+            print(f"  [composite] {lp} + {rp}: {len(region)}B "
+                  f"region@0x{page_base:08X} (exact adjacent producers), "
+                  f"seeds={len(seeds)}")
     json.dump(records, open(a.out,'w'))
-    print(f"producers: {np} PS-X EXE (full-discovery), {nh} header-table; {len(records)} regions -> {a.out}")
+    print(f"producers: {np} PS-X EXE (full-discovery), {nh} header-table, "
+          f"{nr} raw-code, {nc} adjacent composites; "
+          f"{len(records)} regions -> {a.out}")
 
 if __name__=='__main__': main()

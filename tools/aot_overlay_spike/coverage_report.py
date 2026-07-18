@@ -19,6 +19,7 @@ reported at two strengths:
 Usage:
   coverage_report.py --static <static-cache-dir> --vault <vault-cache-dir>
                      [--captures <runtime_overlay_captures.json>]
+                     [--prior-report <gaps.json> --assume-static-superset]
                      --out-md <path.md> --out-json <path.json> [--game <id>]
 Cache dirs are scanned recursively for *.ranges; a captures json is the v2 schema.
 """
@@ -79,10 +80,16 @@ def main():
     ap.add_argument('--static', required=True, help='static shard cache dir (.ranges)')
     ap.add_argument('--vault', help='played/coverage vault cache dir (.ranges)')
     ap.add_argument('--captures', help='runtime overlay_captures.json (executed_pcs)')
+    ap.add_argument('--prior-report', help='roll forward a persisted live gap set')
+    ap.add_argument('--assume-static-superset', action='store_true',
+                    help='assert current static entries retain every prior static entry')
     ap.add_argument('--game', default='UNKNOWN')
     ap.add_argument('--out-md', required=True)
     ap.add_argument('--out-json', required=True)
     a = ap.parse_args()
+
+    if a.prior_report and not a.assume_static_superset:
+        ap.error('--prior-report requires the explicit --assume-static-superset assertion')
 
     static_ent = parse_ranges_dir(a.static)
     report = {'game': a.game, 'static_entries': len(static_ent), 'sources': {}}
@@ -127,6 +134,33 @@ def main():
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
         md.append(f'- **MISSED live: {r["missed"]}**\n')
+    elif a.prior_report:
+        with open(a.prior_report, encoding='utf-8') as prior_in:
+            prior = json.load(prior_in)
+        prior_live = prior.get('sources', {}).get('live_session')
+        prior_misses = prior.get('live_misses')
+        if not isinstance(prior_live, dict) or not isinstance(prior_misses, list):
+            ap.error('--prior-report has no persisted live_session/live_misses')
+        if len(static_ent) < int(prior.get('static_entries', 0)):
+            ap.error('current static entry count is smaller than the prior report; '
+                     'the asserted superset cannot hold')
+        needed = int(prior_live.get('needed', 0))
+        old_miss = {norm(int(x, 16)) for x in prior_misses}
+        miss = old_miss - set(static_ent)
+        covered = needed - len(miss)
+        r = {'needed': needed, 'covered_here': covered, 'missed': len(miss),
+             'recall_entry': (covered/needed if needed else 0.0)}
+        r['provenance'] = ('rolled forward from the persisted live gap manifest; '
+                           'caller asserted the current static entry set is a superset')
+        report['sources']['live_session'] = r
+        report['live_misses'] = [f'0x{x|0x80000000:08X}' for x in sorted(miss)]
+        md.append('## vs persisted live-session gaps (monotonic roll-forward)\n')
+        md.append(f'- Functions the persisted session exercised: **{needed}**')
+        md.append(f'- Discovered by current static: **{covered}** '
+                  f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
+        md.append(f'- **MISSED live: {len(miss)}**')
+        md.append('- Provenance: caller explicitly asserted that the current static '
+                  'entry set retains every prior static entry.\n')
 
     for output_path in (a.out_md, a.out_json):
         output_dir = os.path.dirname(os.path.abspath(output_path))

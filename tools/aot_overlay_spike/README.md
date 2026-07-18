@@ -28,10 +28,12 @@ discovery quality, not to be run as-is in a build.
 
 - **Tomba 1:** 90% of played functions reproduced play-free + ~1964 unplayed
   extra; live-validated in-game (Dwarf Village went native, no runtime compile).
-- **Tomba 2:** the clean play-free cache now covers 1219/1856 played entries
-  (**65.7%**) and byte-matches 1102 (**59.4% entry+code_crc**). Direct-call
+- **Tomba 2:** the clean play-free cache now covers 1264/1856 played entries
+  (**68.1%**) and byte-matches 1144 (**61.6% entry+code_crc**). Direct-call
   provenance for frameless leaves added 74 MAIN.EXE hits over the 60.0% baseline;
-  recovering the four call-sparse files added another 32 overlay-window hits.
+  recovering the four call-sparse files added another 32 overlay-window hits;
+  strict raw-code recovery of CRD/SOP added 43 more played hits, and the first
+  audited adjacent-envelope shard added 2 more.
   All 22 A*.BIN overlays converge on 0x80108F9C (region 0x80108000 +3996),
   DEMO/GAME converge on 0x80106228, and OPN resolves to 0x8018A000.
 
@@ -99,6 +101,26 @@ settings are opt-in; capture artifacts contain game bytes and must stay ignored.
     this validation; `extract_generic.py` is now the general path.
 - Bugs fixed by the sweep: multi-.bin cue (data-track selection), base-EXE
   exclusion, game.toml UTF-8 BOM, normal-mode .ranges format (`F <entry>` w/o crc).
+
+## Raw-code and adjacent-envelope recovery (2026-07-18)
+
+Not every position-fixed code file has a pure `{count, ptr[]}` export header.
+`recover_raw_base()` applies a stricter unbounded jal/prologue vote: score >= 8,
+at least 2x the runner-up, and at least 25% of apparent prologues agreeing on one
+RAM-fitting base. This recovers Tomba 2 `CRD.BIN` at `0x8018A000` (32:3) and
+`SOP.BIN` at `0x80108F9C` (12:3). Both are byte-identical to multiple played-vault
+images; their two shards compile with zero unsupported instructions or bad
+targets. It also finds Tomba 1 `OPTSUB00.BIN` (exact played-vault match) and
+`DSPSUB2.BIN` (99.96% live-byte match, consistent with runtime fixups), without
+touching the Tomba 1 cache.
+
+Runtime dirty-page capture may coalesce directly adjacent files under the earlier
+page key. The extractor therefore also emits exact two-producer concatenations.
+For Tomba 2, `GAME.BIN` ends exactly where every A*/SOP file begins, producing
+`0x80106000` envelope variants in addition to the standalone `0x80108000` shards.
+The A01 composite—the live attract scene's measured hot variant—audits cleanly
+(459 functions, zero unsupported/bad targets). Its performance recheck remains
+pending because an unrelated eight-core build prevented a valid BelowNormal soak.
 
 ## Next to raise coverage (future session)
 

@@ -134,6 +134,13 @@ Production configs normally omit this key and retain only the naive executable-
 local addendum. Both history modes are off by default and contain game-derived
 bytes, so their outputs remain private/gitignored artifacts.
 
+The recall scoreboard can roll a persisted live gap set forward after a verified
+monotonic static expansion with
+`coverage_report.py --prior-report <old.json> --assume-static-superset`. The
+explicit assertion is required because an old gap
+manifest stores misses, not every previously covered entry; silently assuming
+monotonicity would make a regressed static set look healthier than it is.
+
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
    `_walk_overlay_function`) with a strict callable-prologue gate; interior/
