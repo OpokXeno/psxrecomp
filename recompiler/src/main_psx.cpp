@@ -564,6 +564,16 @@ int main(int argc, char** argv) {
             auto w = exe->read_word(a);
             return w.has_value() ? *w : 0u;
         };
+        auto dense_local_pointer_table = [&](uint32_t a) -> bool {
+            for (uint32_t i = 0; i < 3u; i++) {
+                auto value = exe->read_word(a + i * 4u);
+                if (!value.has_value() || (*value & 3u) != 0u ||
+                    *value < exe_lo || *value >= exe->end_address()) {
+                    return false;
+                }
+            }
+            return true;
+        };
         auto callable_boundary = [&](uint32_t a) -> bool {
             uint32_t w = read_w(a);
             if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
@@ -603,7 +613,8 @@ int main(int argc, char** argv) {
                 fmt::print("  seed 0x{:08X} accepted as dispatch root "
                            "(install-slot class, no boundary evidence)\n", a);
                 roots.insert(a);
-            } else if (trusted_call_root_seeds.count(a)) {
+            } else if (trusted_call_root_seeds.count(a) &&
+                       !dense_local_pointer_table(a)) {
                 fmt::print("  seed 0x{:08X} accepted as static call root "
                            "(direct/constant-register target)\n", a);
                 roots.insert(a);

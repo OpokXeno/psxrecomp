@@ -579,9 +579,21 @@ def _callable_legacy_seed(data: bytes, load_addr: int, addr: int) -> bool:
     return _is_addiu_sp_neg(word) and not _is_control_flow(prev)
 
 
+def _dense_local_pointer_table(data: bytes, load_addr: int,
+                               addr: int, count: int = 3) -> bool:
+    """Reject instruction-shaped data at a supposed callable target."""
+    hi = load_addr + len(data)
+    for index in range(count):
+        value = _word_at(data, load_addr, addr + index * 4)
+        if value is None or (value & 3) or not (load_addr <= value < hi):
+            return False
+    return True
+
+
 def _callable_direct_jal_target(data: bytes, load_addr: int, addr: int) -> bool:
     """True only when a direct JAL target has independent boundary evidence."""
-    return _callable_legacy_seed(data, load_addr, addr)
+    return (not _dense_local_pointer_table(data, load_addr, addr) and
+            _callable_legacy_seed(data, load_addr, addr))
 
 
 def _instruction_writes_gpr(word: int, reg: int) -> bool:
@@ -642,8 +654,8 @@ def _resolve_constant_transfer(data: bytes, load_addr: int,
     return None
 
 
-def _plausible_callable_target(data: bytes, load_addr: int, size: int,
-                               target: int, producer_hi: int) -> bool:
+def plausible_callable_target(data: bytes, load_addr: int, size: int,
+                              target: int, producer_hi: int) -> bool:
     """CFG proof for a cross-producer call target without a classic prologue.
 
     Direct calls are sufficient boundary evidence inside one linked producer.
@@ -654,6 +666,8 @@ def _plausible_callable_target(data: bytes, load_addr: int, size: int,
     """
     first = _word_at(data, load_addr, target)
     if first in (None, 0) or not _is_valid_mips_word(first):
+        return False
+    if _dense_local_pointer_table(data, load_addr, target):
         return False
     cap = min(load_addr + size, producer_hi, target + 0x4000)
     work = deque([target])
@@ -741,6 +755,9 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         return None
 
     def callable_transfer_target(source: int, target: int) -> bool:
+        if _dense_local_pointer_table(data, load_addr, target):
+            rejected_cross_producer_calls.add(target)
+            return False
         if not producer_ranges:
             return True
         source_range = producer_for(source)
@@ -759,7 +776,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             accepted_cross_producer_calls.add(target)
             return True
         if (target_range is not None and
-                _plausible_callable_target(
+                plausible_callable_target(
                     data, load_addr, size, target, target_range[1])):
             accepted_cross_producer_calls.add(target)
             return True
@@ -1024,7 +1041,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         if not region(addr):
             excluded[addr] = 'UNKNOWN'
         elif (_callable_legacy_seed(data, load_addr, addr) or
-              _plausible_callable_target(data, load_addr, size, addr, hi)):
+              plausible_callable_target(data, load_addr, size, addr, hi)):
             include(addr, 'STATIC_DISCOVERY_ROOT')
         else:
             # Preserve the weaker classification. Overlay mode will perform
@@ -1045,6 +1062,20 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     # roots — as roots they would hard-cap (truncate) the sibling walk that
     # owns them.
     known = {a for a, r in included.items() if r != 'DISPATCH_INTERIOR'}
+    # Establish range ownership before call-derived roots can change the
+    # partition. A direct-call target already visited by an existing root is an
+    # interior alias, not a sibling root: promoting it would hard-cap the host
+    # and can hide the remainder of a jump-table function.
+    initial_owned = set()
+    initial_known = set(known)
+    initial_sorted = sorted(initial_known)
+    for index, entry in enumerate(initial_sorted):
+        hard_cap = initial_sorted[index + 1] if index + 1 < len(initial_sorted) else hi
+        walk = _walk_overlay_function(
+            data, load_addr, size, entry, hard_cap, producer_ranges,
+            allow_cross_producer_calls)
+        initial_owned.update(walk['visited'])
+
     pending = deque(sorted(known))
     processed = set()
     all_branch_targets = set()
@@ -1064,6 +1095,9 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             all_branch_targets.update(walk['branch_targets'])
             all_branch_targets.update(walk['jump_table_targets'])
             for target in sorted(walk['direct_jals']):
+                if target not in initial_known and target in initial_owned:
+                    included[target] = 'DISPATCH_INTERIOR'
+                    continue
                 # Always re-include: a target may already be present as a
                 # heuristic FUNCTION_POINTER_TARGET.  Reachable JAL evidence
                 # upgrades it to a trusted call root.
@@ -1072,6 +1106,9 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                     known.add(target)
                     pending.append(target)
             for target in sorted(walk['static_indirect_targets']):
+                if target not in initial_known and target in initial_owned:
+                    included[target] = 'DISPATCH_INTERIOR'
+                    continue
                 include(target, 'STATIC_INDIRECT_TARGET')
                 if target in included and target not in known:
                     known.add(target)
@@ -1094,7 +1131,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                 if producer_ranges and source_range != target_range:
                     continue
                 producer_hi = target_range[1] if target_range else hi
-                if not _plausible_callable_target(
+                if not plausible_callable_target(
                         data, load_addr, size, target, producer_hi):
                     continue
                 include(target, 'STATIC_BRANCH_ROOT')

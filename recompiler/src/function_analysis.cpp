@@ -675,8 +675,25 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         // Requiring a stack prologue here discarded legitimate frameless leaf
         // functions and tiny library wrappers.  The target still has to decode
         // as a valid PS1 instruction and lie inside the verified image bound.
+        //
+        // Three adjacent aligned words that all point back into this image are
+        // stronger evidence for a position-fixed pointer table than the first
+        // word's accidental MIPS decode.  Do not follow a JAL-shaped word into
+        // that data.  The caller remains valid and dispatches the unresolved
+        // target at runtime, where the ordinary live-byte guard can select a
+        // separately proven implementation or fall back to the interpreter.
         if (!word_opt.has_value() || !exact_is_valid_mips_word(*word_opt))
             return false;
+        bool dense_local_pointer_table = true;
+        for (uint32_t i = 0; i < 3u; i++) {
+            auto value = exe_.read_word(addr + i * 4u);
+            if (!value.has_value() || (*value & 3u) != 0u ||
+                !in_exe(*value)) {
+                dense_local_pointer_table = false;
+                break;
+            }
+        }
+        if (dense_local_pointer_table) return false;
         if (producer_ranges.empty()) return true;
         int source_producer = producer_for(source);
         int target_producer = producer_for(addr);
@@ -860,29 +877,43 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     };
 
     std::set<uint32_t> known_entries;
-    std::queue<uint32_t> pending;
     for (uint32_t entry : entries) {
         if (!in_exe(entry)) continue;
-        if (known_entries.insert(entry).second) pending.push(entry);
+        known_entries.insert(entry);
     }
 
     size_t explicit_count = known_entries.size();
     fmt::print("Explicit entries: {}\n", explicit_count);
 
-    std::set<uint32_t> processed;
-    while (!pending.empty()) {
-        uint32_t entry = pending.front();
-        pending.pop();
-        if (processed.count(entry)) continue;
-        processed.insert(entry);
-
-        auto next_it = known_entries.upper_bound(entry);
-        uint32_t hard_cap = (next_it != known_entries.end()) ? *next_it : exe_.end_address();
-        ExactWalkResult wr = walk(entry, hard_cap);
-
-        for (uint32_t target : wr.direct_jal_targets) {
-            if (known_entries.insert(target).second) pending.push(target);
+    // Discover callees in rounds against one stable entry partition. Processing
+    // roots sequentially let an early caller insert a JAL target that actually
+    // lay inside a later explicit root. That new entry hard-capped the later
+    // root before it was walked (Tomba X01's jump-table host), splitting one
+    // function and losing every case after the accidental cap. If a candidate
+    // is already owned by any walk in the current partition, leave it absorbed;
+    // main_psx's range-ownership pass materializes it as an interior alias.
+    while (true) {
+        std::vector<uint32_t> round_entries(
+            known_entries.begin(), known_entries.end());
+        std::set<uint32_t> owned_addresses;
+        std::set<uint32_t> candidate_targets;
+        for (size_t i = 0; i < round_entries.size(); i++) {
+            uint32_t hard_cap = (i + 1 < round_entries.size())
+                ? round_entries[i + 1] : exe_.end_address();
+            ExactWalkResult wr = walk(round_entries[i], hard_cap);
+            owned_addresses.insert(wr.visited.begin(), wr.visited.end());
+            candidate_targets.insert(wr.direct_jal_targets.begin(),
+                                     wr.direct_jal_targets.end());
         }
+
+        bool added = false;
+        for (uint32_t target : candidate_targets) {
+            if (known_entries.count(target) || owned_addresses.count(target))
+                continue;
+            known_entries.insert(target);
+            added = true;
+        }
+        if (!added) break;
     }
 
     result.call_discovered_count = static_cast<int>(known_entries.size() - explicit_count);

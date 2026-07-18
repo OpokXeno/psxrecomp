@@ -111,6 +111,46 @@ int main() {
     CHECK(!reachable.count(kLoad + 0x1100),
           "direct target beyond verified bound fails closed");
 
+    // A JAL-shaped word can target an embedded table whose first pointer also
+    // happens to decode as a legal MIPS instruction. Three adjacent local
+    // pointers are stronger data evidence; keep that target interpreted.
+    auto pointer_image = make_exe_buffer(0x1000);
+    put32(pointer_image, text + 0x00, jal(kLoad + 0x400));
+    put32(pointer_image, text + 0x04, 0x00000000u);
+    put32(pointer_image, text + 0x08, 0x03E00008u);
+    put32(pointer_image, text + 0x0C, 0x00000000u);
+    put32(pointer_image, text + 0x400, kLoad + 0x500);
+    put32(pointer_image, text + 0x404, kLoad + 0x520);
+    put32(pointer_image, text + 0x408, kLoad + 0x540);
+    auto pointer_exe = parse(pointer_image);
+    PSXRecomp::FunctionAnalyzer pointer_analyzer(pointer_exe);
+    const auto pointer_starts = starts(
+        pointer_analyzer.analyze_exact_entries({kLoad}));
+    CHECK(!pointer_starts.count(kLoad + 0x400),
+          "reachable analysis rejects a dense local pointer table target");
+
+    // Discover call targets in stable rounds. An early root's JAL into the
+    // middle of a later explicit root must remain absorbed by that host rather
+    // than splitting/hard-capping it before the host is walked.
+    auto interior_call_image = make_exe_buffer(0x1000);
+    put32(interior_call_image, text + 0x00, jal(kLoad + 0x108));
+    put32(interior_call_image, text + 0x04, 0x00000000u);
+    put32(interior_call_image, text + 0x08, 0x03E00008u);
+    put32(interior_call_image, text + 0x0C, 0x00000000u);
+    put32(interior_call_image, text + 0x100, 0x24020001u);
+    put32(interior_call_image, text + 0x104, 0x24420001u);
+    put32(interior_call_image, text + 0x108, 0x24420001u);
+    put32(interior_call_image, text + 0x10C, 0x03E00008u);
+    put32(interior_call_image, text + 0x110, 0x00000000u);
+    auto interior_call_exe = parse(interior_call_image);
+    PSXRecomp::FunctionAnalyzer interior_call_analyzer(interior_call_exe);
+    const auto interior_call_starts = starts(
+        interior_call_analyzer.analyze_exact_entries(
+            {kLoad, kLoad + 0x100}));
+    CHECK(interior_call_starts ==
+              std::set<uint32_t>({kLoad, kLoad + 0x100}),
+          "direct call into an owned function stays an interior alias");
+
     // A synthetic adjacent-producer envelope is not one linked image. The
     // caller supplies the cross-boundary targets that passed its independent
     // callable-CFG proof; other valid-looking targets stay with the interpreter.

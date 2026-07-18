@@ -29,6 +29,7 @@ Requires extract_overlays.py (same dir chain) for the DiscReader/ISO9660 walker.
 import argparse, os, sys, json, base64, struct, subprocess, tempfile, re, binascii, hashlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import extract_overlays as eo
+import compile_overlays as co
 try:
     import tomllib
 except ImportError:
@@ -87,6 +88,22 @@ def prologue_offsets(data):
 def _word(data, off):
     return struct.unpack_from('<I', data, off)[0] if 0 <= off <= len(data)-4 else None
 
+def _dense_local_pointer_table(data, base, off, count=3):
+    """True when ``off`` begins a run of position-fixed in-image pointers.
+
+    A word such as ``0x80118CC4`` is technically a decodable MIPS ``lb`` when
+    viewed as an instruction, but three adjacent aligned values in the loaded
+    image's address range are substantially stronger evidence for a data table.
+    In particular, a JAL-shaped word in a dispatcher must not turn such a table
+    into a frameless function root.
+    """
+    hi = base + len(data)
+    for index in range(count):
+        value = _word(data, off + index * 4)
+        if value is None or (value & 3) or not (base <= value < hi):
+            return False
+    return True
+
 def _callable_boundary(data, off):
     """Strong local evidence that an in-file pointer names a callable entry."""
     w = _word(data, off)
@@ -125,13 +142,40 @@ def pointer_table_targets(data, base):
             end += 1
         if end - start >= 3:
             for value in words[start:end]:
-                if _callable_boundary(data, value-base):
+                if (_callable_boundary(data, value-base) and
+                        not _dense_local_pointer_table(data,base,value-base)):
                     targets.add(value)
         start = end
     return targets
 
 def supplemental_callable_seeds(data, base):
     return pointer_table_targets(data, base)
+
+def frameless_leaf_entries(data, base):
+    """Return independently bounded functions immediately following returns.
+
+    A previous ``jr ra`` plus its architectural delay slot establishes the
+    start boundary (allowing the same six alignment NOPs as exact-entry mode).
+    The shared bounded-CFG verifier then requires the candidate itself to reach
+    a return without invalid instructions or sequential runway. This recovers
+    unreferenced callback leaves without promoting arbitrary return-adjacent
+    data; dense local-pointer tables fail that verifier explicitly.
+    """
+    entries=set()
+    for jr_off in range(0,len(data)-12,4):
+        if _word(data,jr_off) != 0x03E00008:
+            continue
+        entry_off=jr_off+8
+        padding=0
+        while padding<6 and _word(data,entry_off)==0:
+            entry_off+=4; padding+=1
+        if entry_off>len(data)-4:
+            continue
+        entry=base+entry_off
+        if co.plausible_callable_target(
+                data,base,len(data),entry,base+len(data)):
+            entries.add(entry)
+    return entries
 
 def jal_targets(data):
     """Distinct absolute jal call targets. These are BASE-INDEPENDENT: the target
@@ -154,6 +198,7 @@ def direct_jal_roots(data, base):
     lo,hi=base,base+len(data)
     return sorted(t for t in jal_targets(data)
                   if lo <= t < hi and (t&3)==0 and
+                  not _dense_local_pointer_table(data,base,t-base) and
                   (_callable_boundary(data,t-base) or
                    ((_word(data,t-base) or 0)>>16)==0x27BD))
 
@@ -833,8 +878,9 @@ def main():
         # against prologues they never point at -> wrong base by 2-16KB).
         base,score=rb
         prologue_seeds=prologues(data,base)
+        frameless=frameless_leaf_entries(data,base)
         supplemental=supplemental_callable_seeds(data,base)
-        seeds=sorted(set(prologue_seeds)|supplemental)
+        seeds=sorted(set(prologue_seeds)|frameless|supplemental)
         # SUPPLEMENT the prologue seeds with the overlay's OWN export/dispatch
         # table (the header pointers) — the game's authoritative list of live
         # entry points, sitting on the disc (play-free). These are exactly the
@@ -869,6 +915,7 @@ def main():
         print(f"  [header-table] {p}: {len(data)}B file@0x{base:08X} "
               f"region@0x{page_base:08X}(+{fill}) "
               f"({fit_method} score={score}), prologue seeds={len(prologue_seeds)} "
+              f"+{len(frameless-set(prologue_seeds))} bounded frameless leaves "
               f"+{len(supplemental-set(prologue_seeds))} pointer-table seeds "
               f"+{extra} export-table dispatch entries")
 
@@ -882,8 +929,9 @@ def main():
         if rb is not None:
             base,score,second=rb
             prologue_seeds=prologues(data,base)
+            frameless=frameless_leaf_entries(data,base)
             supplemental=supplemental_callable_seeds(data,base)
-            seeds=sorted(set(prologue_seeds)|supplemental)
+            seeds=sorted(set(prologue_seeds)|frameless|supplemental)
             page_base,region=page_aligned_region(base,data)
             direct=direct_jal_roots(data,base)
             record=rec(page_base,region,seeds,static_discovery=direct)
@@ -897,6 +945,7 @@ def main():
                   f"region@0x{page_base:08X} "
                   f"(strict jal-fit score={score}, runner-up={second}), "
                   f"prologue seeds={len(prologue_seeds)} "
+                  f"+{len(frameless-set(prologue_seeds))} bounded frameless leaves "
                   f"+{len(supplemental-set(prologue_seeds))} pointer-table seeds")
             continue
 

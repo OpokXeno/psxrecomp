@@ -62,12 +62,14 @@ continue to fail safely to the interpreter.
   requires its non-empty range manifest. Interrupted compiles can no longer
   poison later runs or overwrite a prior good shard during `--force`.
 - Tomba 1 header exports are authoritative mid-function dispatch entries rather
-  than callable roots. Their conservative retry now uses only the nearest
-  preceding prologue host, hard-stops it at the next prologue, and rejects calls
-  outside those producer ranges. The clean 25-record corpus built 18 unique DLLs
-  with zero failures (the rest deduplicated); across 24 legacy sessions it covers
-  86.2% of played PCs by overlay code range and 95.1% with base BIOS/kernel code,
-  leaving 22 genuine range misses rather than admitting embedded data as code.
+  than callable roots. Their conservative retry uses the nearest preceding
+  prologue host, stable-round call discovery prevents interior callees from
+  truncating that host, and dense local pointer tables are rejected as code.
+  Bounded return-to-return scanning also recovers unreferenced frameless leaves.
+  The clean 25-record corpus produces 17 unique shards with zero audit failures.
+  Overlay ranges cover 820/823 historical-vault PCs and 410/450 live-history PCs;
+  every residual is in the separately recompiled BIOS/kernel ranges, yielding
+  **100.0% combined code-range recall and zero true gaps** for both scoreboards.
 
 ---
 

@@ -230,14 +230,17 @@ native code-range recall to **100.0%** (677/677). Validation used only disposabl
 Tomba 1's header-table exports require a different conservative retry. Those
 authoritative addresses are commonly switch-case entries in the middle of a
 function, so a direct-JAL-only retry loses the dispatcher while a broad scan can
-walk into embedded data. The extractor now pairs each export with its nearest
-preceding prologue, hard-bounds that host at the next prologue, and forbids calls
-from escaping those proven producer ranges. A clean 25-record build produced 18
-unique DLLs with zero failures; the other records were safely deduplicated. Across
-24 legacy capture files, the disposable cache covers **86.2%** of exercised PCs
-by overlay code range and **95.1%** with the separately generated BIOS/kernel
-ranges, leaving 22 true range misses for later producer recovery. The generated-C
-audit remains the gate: rejected broad discovery is never installed.
+walk into embedded data. The extractor pairs each export with its nearest
+preceding prologue and bounds it to the proven producer. Call discovery proceeds
+in stable rounds so an interior callee cannot split and truncate a later explicit
+host. Dense in-image pointer tables are rejected even when their words happen to
+decode as MIPS, while bounded return-to-return scanning recovers independently
+valid unreferenced frameless leaves. A clean 25-record corpus produces 17 unique
+shards with zero audit failures. Overlay ranges cover **820/823 (99.6%)**
+historical-vault PCs and **410/450 (91.1%)** live-history PCs; every residual is
+in the separately recompiled BIOS/kernel ranges, producing **100.0% combined
+code-range recall and zero true gaps** on both scoreboards. The generated-C audit
+remains the gate: rejected broad discovery is never installed.
 
 Ape Escape's `KKIIDDZZ.HED` encodes contiguous
 `size_sectors:12 | logical_sector:20` runs spanning sibling DAT then BNS files.
@@ -295,7 +298,13 @@ final-named DLL that a later build mistakes for a valid shard, and a failed
    prologue or preceding return boundary, so isolated pointer-shaped data and
    mid-function labels remain excluded. Read-only Tomba 1 regression data proves
    this finds its indirect-only leaves at 0x80111BB4/0x80111BCC; all 11 new
-   Tomba 2 targets audit cleanly in their standalone image variants.
+   Tomba 2 targets audit cleanly in their standalone image variants. Position-
+   fixed extraction additionally verifies unreferenced candidates immediately
+   after a prior return with the same bounded CFG proof; this recovers Tomba 1's
+   final historical miss at `0x8010427C`. Stable-round exact discovery absorbs
+   call-derived interior aliases into their existing host instead of using them
+   as hard caps. Together these changes bring Tomba 1's combined historical and
+   live code-range scoreboards to **100.0% with zero true gaps**.
 2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
 3. ~~Recover weak-signal A09/A0J/GAME/OPN~~ — DONE. They are ordinary uncompressed
    MIPS, not archives. Counting only callable `jal` targets sharply resolves

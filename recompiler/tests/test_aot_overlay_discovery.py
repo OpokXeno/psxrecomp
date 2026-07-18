@@ -65,6 +65,15 @@ def check_composite_call_boundaries():
         data, LOAD, len(data), LOAD, LOAD + 0x100, ranges)
     assert cross_target in scoped['direct_jals']
 
+    # Even within one nominal producer, a dense run of local pointers is data,
+    # not a frameless callable merely because a reachable word looks like JAL.
+    for index, offset in enumerate((0x70, 0x80, 0x90)):
+        put(data, 0x50 + index * 4, LOAD + offset)
+    unscoped = MOD._walk_overlay_function(
+        data, LOAD, len(data), LOAD, LOAD + 0x100)
+    assert cross_target not in unscoped['direct_jals']
+    assert cross_target in unscoped['rejected_cross_producer_calls']
+
     strict = MOD._walk_overlay_function(
         data, LOAD, len(data), LOAD, LOAD + 0x100, ranges,
         allow_cross_producer_calls=False)
@@ -94,6 +103,29 @@ def check_static_discovery_provenance():
         cap, bytes(data), LOAD, len(data), 0, {})
     assert f'call_root 0x{entry:08X}' in seeds
     assert audit['included_reasons'][entry] == 'STATIC_DISCOVERY_ROOT'
+
+
+def check_owned_direct_call_is_interior():
+    data = bytearray(0x200)
+    host = LOAD + 0x100
+    target = host + 0x08
+    put(data, 0x00, jal(target))
+    put(data, 0x04, 0x00000000)
+    put(data, 0x08, 0x03E00008)
+    put(data, 0x0C, 0x00000000)
+    put(data, 0x100, 0x24020001)
+    put(data, 0x104, 0x24420001)
+    put(data, 0x108, 0x24420001)
+    put(data, 0x10C, 0x03E00008)
+    put(data, 0x110, 0x00000000)
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'function_entry_pcs': [f'0x{LOAD:08X}', f'0x{host:08X}'],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    assert audit['included_reasons'][target] == 'DISPATCH_INTERIOR'
+    assert f'interior 0x{target:08X}' in seeds
 
 
 def check_static_alias_recipe():
@@ -256,6 +288,33 @@ def check_recompiler_composite_contract(recompiler):
         assert f"void func_{target:08X}" in generated(True)
 
 
+def check_recompiler_pointer_table_call_root(recompiler):
+    data = bytearray(0x100)
+    target = LOAD + 0x50
+    put(data, 0x00, jal(target))
+    put(data, 0x04, 0x00000000)
+    put(data, 0x08, 0x03E00008)
+    put(data, 0x0C, 0x00000000)
+    for index, offset in enumerate((0x70, 0x80, 0x90)):
+        put(data, 0x50 + index * 4, LOAD + offset)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, "pointer_table.psx")
+        seeds = os.path.join(tmp, "seeds.txt")
+        out = os.path.join(tmp, "out")
+        with open(psx, "wb") as f:
+            f.write(make_psxexe(LOAD, data))
+        with open(seeds, "w", encoding="utf-8") as f:
+            f.write(f"0x{LOAD:08X}\ncall_root 0x{target:08X}\n")
+        result = subprocess.run(
+            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr or result.stdout
+        full = ''.join(path.read_text()
+                       for path in pathlib.Path(out).glob("*_full*.c"))
+        assert f"void func_{target:08X}" not in full
+
+
 def check_retained_alias_contract(recompiler):
     # A previously compiled indirect entry retains its overlapping host body
     # without becoming a root that caps the newly discovered ordinary walk.
@@ -336,10 +395,12 @@ def main():
 
     check_composite_call_boundaries()
     check_static_discovery_provenance()
+    check_owned_direct_call_is_interior()
     check_static_alias_recipe()
     check_optional_enrichment_fallback()
     check_forward_branch_root()
     check_recompiler_composite_contract(args.recompiler)
+    check_recompiler_pointer_table_call_root(args.recompiler)
     check_retained_alias_contract(args.recompiler)
     check_atomic_dll_publication()
 

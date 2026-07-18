@@ -48,6 +48,19 @@ def main():
     struct.pack_into('<I', rooted, 0x40, 0x24020001)
     assert MOD.direct_jal_roots(rooted, 0x80100000) == []
 
+    # A return boundary plus a JAL-shaped source is still not enough when the
+    # alleged target begins with a dense run of local pointers. Those words are
+    # data even though the first one has a syntactically valid MIPS decode.
+    pointer_root = bytearray(0x100)
+    struct.pack_into('<I', pointer_root, 0, 0x0C000000 |
+                     (((0x80100000 + 0x40) >> 2) & 0x03FFFFFF))
+    struct.pack_into('<I', pointer_root, 0x38, 0x03E00008)
+    struct.pack_into('<I', pointer_root, 0x3C, 0x00000000)
+    for index, target in enumerate((0x60, 0x70, 0x80)):
+        struct.pack_into('<I', pointer_root, 0x40 + index * 4,
+                         0x80100000 + target)
+    assert MOD.direct_jal_roots(pointer_root, 0x80100000) == []
+
     bounded = bytearray(0x90)
     for off in (0x10, 0x40, 0x70):
         struct.pack_into('<I', bounded, off, 0x27BDFFF0)
@@ -123,6 +136,20 @@ def main():
     struct.pack_into('<I', data, 0x80, 0)
     struct.pack_into('<I', data, 0x84, 0)
     assert MOD.pointer_table_targets(data, base) == set()
+
+    # An unreferenced frameless leaf can still be proven play-free by exact
+    # return-to-return boundaries plus a bounded valid CFG.
+    leaf = bytearray(0x80)
+    struct.pack_into('<I', leaf, 0x00, 0x03E00008)
+    struct.pack_into('<I', leaf, 0x04, 0x24020000)  # arbitrary delay slot
+    struct.pack_into('<I', leaf, 0x08, 0x24020001)
+    struct.pack_into('<I', leaf, 0x0C, 0x03E00008)
+    struct.pack_into('<I', leaf, 0x10, 0x00000000)
+    assert base + 0x08 in MOD.frameless_leaf_entries(leaf, base)
+    # The same positional evidence must not promote a dense pointer table.
+    for index, off in enumerate((0x40, 0x50, 0x60)):
+        struct.pack_into('<I', leaf, 0x08 + index * 4, base + off)
+    assert base + 0x08 not in MOD.frameless_leaf_entries(leaf, base)
 
     # A strict aligned {id,size} archive can share an independently voted link
     # base across members.  Direct JAL targets are the roots; unrelated padding
