@@ -17,7 +17,10 @@ consecutive instruction entries, while static AOT emits broad functions. Compile
 code-range recall is 1811/1856 (97.6%), leaving exactly 45 true gaps, all in the
 game-independent kernel/low-memory region. Runtime static-only validation loaded
 the richer MAIN shard at 60 fps with `stale_blocked=0`, no range/manifest overflow,
-and byte-matching candidates; misses continue to fail safely to the interpreter.
+and byte-matching candidates. The clean static-only attract soak then loaded the
+459-function A01 composite and ran the formerly ~14 fps lava demo at 65–67 fps at
+BelowNormal priority, with correct rendering and no range/manifest overflow. Misses
+continue to fail safely to the interpreter.
 
 ---
 

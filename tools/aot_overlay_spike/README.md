@@ -119,9 +119,10 @@ page key. The extractor therefore also emits exact two-producer concatenations.
 For Tomba 2, `GAME.BIN` ends exactly where every A*/SOP file begins, producing
 `0x80106000` envelope variants in addition to the standalone `0x80108000` shards.
 The A01 composite—the live attract scene's measured hot variant—audits cleanly
-(459 functions, zero unsupported/bad targets). Its performance recheck remains
-pending; the earlier attempt overlapped an unrelated build and was not a valid
-BelowNormal measurement.
+(459 functions, zero unsupported/bad targets). A clean static-only soak loaded
+that exact `00106000_0DC32D96` shard and ran the formerly ~14 fps lava-area attract
+demo at 65–67 fps while the runtime process remained BelowNormal. The scene rendered
+correctly, with no range-index or lazy-manifest overflow.
 
 `coverage_report.py` reports both exact manifest-entry recall and compiled
 code-range recall. The distinction matters: runtime/autocompile vaults may contain
