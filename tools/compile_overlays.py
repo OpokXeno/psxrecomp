@@ -854,6 +854,26 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
            for i in range(1, len(producer_ranges))):
         raise RuntimeError('producer_ranges overlap')
 
+    static_alias_ranges = set()
+    for raw_alias in cap.get('static_alias_ranges', []) or []:
+        if not isinstance(raw_alias, dict):
+            raise RuntimeError('static_alias_ranges entries must be objects')
+        try:
+            entry = _parse_addr(raw_alias['entry'])
+            range_lo = _parse_addr(raw_alias['start'])
+            range_hi = _parse_addr(raw_alias['end'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f'invalid static_alias_ranges entry: {raw_alias}') from exc
+        if not (lo <= range_lo <= entry < range_hi <= hi and
+                (entry & 3) == 0 and (range_lo & 3) == 0 and
+                (range_hi & 3) == 0):
+            raise RuntimeError(
+                f'static alias 0x{entry:08X} -> '
+                f'0x{range_lo:08X}..0x{range_hi:08X} outside/misaligned for '
+                f'capture 0x{lo:08X}..0x{hi:08X}')
+        static_alias_ranges.add((entry, range_lo, range_hi))
+
     schema_keys = {'executed_pcs', 'observed_pcs', 'dispatch_entry_pcs',
                    'function_entry_pcs'}
     has_split_schema = any(k in cap for k in schema_keys)
@@ -1108,6 +1128,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'counts': counts,
         'excluded_counts': excluded_counts,
         'producer_ranges': producer_ranges,
+        'static_alias_ranges': static_alias_ranges,
         'rejected_cross_producer_calls': rejected_cross_producer_calls,
         'accepted_cross_producer_calls': accepted_cross_producer_calls,
     }
@@ -1131,7 +1152,10 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         seeds.append(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}')
     for addr in sorted(accepted_cross_producer_calls):
         seeds.append(f'cross_call_allow 0x{addr:08X}')
-    for addr, range_lo, range_hi in cap.get('_prior_aliases', []):
+    retained_aliases = static_alias_ranges | {
+        (int(addr), int(range_lo), int(range_hi))
+        for addr, range_lo, range_hi in cap.get('_prior_aliases', [])}
+    for addr, range_lo, range_hi in sorted(retained_aliases):
         seeds.append(
             f'retained_alias 0x{addr:08X} 0x{range_lo:08X} 0x{range_hi:08X}')
     seeds.extend(seed_line(addr) for addr in sorted(included))

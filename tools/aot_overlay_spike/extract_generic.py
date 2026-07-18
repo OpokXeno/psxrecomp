@@ -2,7 +2,7 @@
 """Generic play-free overlay extractor (AOT spike, v2 — full-discovery producers).
 
 Given a game.toml (disc + load_address + text_size), enumerate the disc and emit
-a synthetic overlay_captures.json for compile_overlays.py. Two producer types:
+a synthetic overlay_captures.json for compile_overlays.py. Producer types:
 
  1. PS-X EXE files (magic "PS-X EXE") — the load address is self-described in the
     header. Run the recompiler in NORMAL mode (full discovery: jr-$ra boundary
@@ -14,6 +14,12 @@ a synthetic overlay_captures.json for compile_overlays.py. Two producer types:
  2. Header-table files ({count:u32, ptr[count]:u32} with in-range pointers) —
     prologue-scan seeds at a delta-swept base. LESS robust (base recovery
     unreliable when header ptrs aren't clean function starts); see plan doc.
+
+ 3. Strict 0x800-aligned {id,size} member archives — multiple members must
+    independently vote the same link base; mixed members use direct-call roots.
+
+ 4. Companion HED/DAT/BNS archives — contiguous packed-sector runs address a
+    logical namespace across payload siblings, with the same consensus gate.
 
 Usage:
   extract_generic.py --game-toml <path> --recompiler <psxrecomp-game.exe>
@@ -44,9 +50,33 @@ def parse_cue_datatrack(cue_path):
     return eo.parse_cue(cue_path)   # fallback
 
 def prologues(data, base):
-    return [base+off for off in range(0,len(data)-4,4)
-            if (struct.unpack_from('<I',data,off)[0]>>16)==0x27BD
-            and (struct.unpack_from('<I',data,off)[0]&0x8000)]
+    """Return framed function entries, including a proven pre-frame prelude.
+
+    Psy-Q commonly schedules ``lui R`` / ``load ...,off(R)`` before the usual
+    ``addiu sp,sp,-N``.  A raw prologue scan consequently starts those functions
+    eight bytes late and leaves the real dispatch entry uncovered.  Recover the
+    earlier entry only for that exact register-linked pair immediately following
+    a previous ``jr ra`` + delay-slot boundary.  Replace (rather than supplement)
+    the late prologue root so exact-entry compilation cannot split one function
+    into overlapping siblings.
+
+    This deliberately does not scan arbitrary instructions before a prologue:
+    the return boundary, LUI/load opcode pair, and matching address register are
+    all required data-as-code gates.
+    """
+    entries=[]
+    for off in prologue_offsets(data):
+        entry=off
+        if off >= 16 and _word(data, off-16) == 0x03E00008:
+            lui=_word(data, off-8)
+            load=_word(data, off-4)
+            lui_rt=(lui >> 16) & 0x1F
+            if (lui >> 26) == 0x0F and lui_rt != 0 and \
+                    0x20 <= (load >> 26) <= 0x26 and \
+                    ((load >> 21) & 0x1F) == lui_rt:
+                entry=off-8
+        entries.append(base+entry)
+    return entries
 
 def prologue_offsets(data):
     """File offsets whose word is an `addiu $sp,$sp,-N` stack-frame prologue."""
@@ -213,6 +243,192 @@ def recover_raw_base(data, base_lo, base_hi=0x80200000):
         return None
     return base,score,second
 
+def raw_base_votes(data, base_lo, base_hi=0x80200000):
+    """Return jal/prologue base votes for a position-fixed code blob."""
+    import bisect
+    from collections import Counter
+    P=prologue_offsets(data)
+    T=jal_targets(data)
+    hist=Counter()
+    if not P or not T:
+        return hist
+    max_base=base_hi-len(data)
+    for t in T:
+        lo_i=bisect.bisect_left(P,t-max_base)
+        hi_i=bisect.bisect_right(P,t-base_lo)
+        for o in P[lo_i:hi_i]:
+            base=t-o
+            if (base&3)==0:
+                hist[base]+=1
+    return hist
+
+def split_indexed_archive(data, alignment=0x800):
+    """Recognize a strict ``{id,size}[]`` + aligned-payload archive.
+
+    Mega Man X6's ROCK_X6.BIN uses one monotonically increasing table in the
+    first sector.  Payload members follow in table order, each rounded up to a
+    0x800-byte boundary.  Require the complete layout to account for the file
+    (apart from at most one format trailer sector) so ordinary data cannot
+    be mistaken for this container merely because its first words look small.
+    """
+    if len(data) < alignment*2 or len(data) % alignment:
+        return None
+    entries=[]
+    for off in range(0, alignment, 8):
+        ident,size=struct.unpack_from('<II',data,off)
+        if ident == 0 and size == 0:
+            break
+        if ident == 0 or size < 4 or size > 2_000_000:
+            return None
+        if entries and ident <= entries[-1][0]:
+            return None
+        entries.append((ident,size))
+    if len(entries) < 4:
+        return None
+    pos=alignment
+    members=[]
+    for ident,size in entries:
+        if pos+size > len(data):
+            return None
+        members.append((ident,pos,data[pos:pos+size]))
+        pos=(pos+size+alignment-1)&~(alignment-1)
+    if pos > len(data) or len(data)-pos > alignment:
+        return None
+    return members
+
+def recover_consensus_members(members, base_lo, base_hi=0x80200000):
+    """Recover linked code from members that independently vote shared bases.
+
+    An anchor member needs >=8 agreeing jal/prologue pairs and a 2x vote peak.
+    A base becomes trusted only when at least two independent members anchor it.
+    Other members may reuse that exact consensus with >=2 agreeing pairs.  Only
+    locally callable direct-JAL targets become roots; pointer tables and apparent
+    prologues are deliberately insufficient inside a mixed code/data archive.
+    """
+    from collections import Counter
+    if not members:
+        return []
+    votes=[]
+    anchor_support=Counter()
+    for ident,off,body in members:
+        hist=raw_base_votes(body,base_lo,base_hi)
+        votes.append((ident,off,body,hist))
+        top=hist.most_common(2)
+        if top:
+            base,score=top[0]
+            second=top[1][1] if len(top)>1 else 0
+            if score >= 8 and score >= second*2:
+                anchor_support[base]+=1
+    trusted={base for base,count in anchor_support.items() if count >= 2}
+    if not trusted:
+        return []
+
+    recovered=[]
+    for ident,off,body,hist in votes:
+        ranked=sorted(((hist.get(base,0),base) for base in trusted),reverse=True)
+        score,base=ranked[0]
+        runner=ranked[1][0] if len(ranked)>1 else 0
+        if score < 2 or score < runner*2:
+            continue
+        lo,hi=base,base+len(body)
+        direct={t for t in jal_targets(body)
+                if lo <= t < hi and (t&3)==0 and
+                (_callable_boundary(body,t-base) or
+                 ((_word(body,t-base) or 0)>>16)==0x27BD)}
+        seeds=sorted(direct)
+        if len(direct) < 2:
+            continue
+        recovered.append({
+            'id':ident, 'file_offset':off, 'data':body, 'base':base,
+            'score':score, 'runner':runner, 'direct_seeds':sorted(direct),
+            'seeds':seeds,
+        })
+    return recovered
+
+def recover_indexed_archive(data, base_lo, base_hi=0x80200000):
+    """Recover independently linked code members from a strict archive."""
+    members=split_indexed_archive(data)
+    return recover_consensus_members(members or (),base_lo,base_hi)
+
+def hed_companion_members(disc, files):
+    """Return strict sector-table members from sibling HED/DAT/BNS files.
+
+    Ape Escape stores 32-bit descriptors as ``size_sectors:12 | lba:20``.
+    Descriptor runs are contiguous, while the payload namespace concatenates
+    same-stem DAT then BNS companions.  Require runs of at least four entries,
+    exact sector continuity, sector-aligned companions, and no cross-file member.
+    """
+    by_upper={p.upper():(p,l,s) for p,l,s in files}
+    groups=[]
+    for hed_path,hed_lba,hed_size in files:
+        if not hed_path.upper().endswith('.HED') or hed_size > 0x10000:
+            continue
+        stem=hed_path[:-4]
+        companions=[]
+        for ext in ('.DAT','.BNS'):
+            item=by_upper.get((stem+ext).upper())
+            if item:
+                companions.append(item)
+        if not companions or any(size%0x800 for _,_,size in companions):
+            continue
+        hed=disc.read_file_bytes(hed_lba,hed_size)
+        words=[struct.unpack_from('<I',hed,off)[0]
+               for off in range(0,len(hed)-3,4)]
+        runs=[]; i=0
+        while i < len(words):
+            word=words[i]; sector=word&0xFFFFF; count=word>>20
+            if not count:
+                i+=1; continue
+            run=[]; expected=sector; j=i
+            while j < len(words):
+                value=words[j]; at=value&0xFFFFF; span=value>>20
+                if not span or at != expected:
+                    break
+                run.append((j,at,span)); expected+=span; j+=1
+            if len(run) >= 4:
+                runs.extend(run); i=j
+            else:
+                i+=1
+        if not runs:
+            continue
+
+        logical=[]; cursor=0
+        for path,lba,size in companions:
+            body=disc.read_file_bytes(lba,size)
+            logical.append((cursor,cursor+size//0x800,path,body))
+            cursor+=size//0x800
+        members=[]; seen=set()
+        for table_index,sector,count in runs:
+            key=(sector,count)
+            if key in seen:
+                continue
+            seen.add(key)
+            owner=next((x for x in logical
+                        if x[0] <= sector and sector+count <= x[1]),None)
+            if owner is None:
+                continue
+            lo,hi,path,body=owner
+            off=(sector-lo)*0x800
+            member=body[off:off+count*0x800]
+            members.append((table_index,sector*0x800,member))
+        if members:
+            groups.append({
+                'hed_path':hed_path,
+                'members':members,
+                'consumed':{hed_path.upper(),
+                            *(path.upper() for path,_,_ in companions)},
+            })
+    return groups
+
+def page_aligned_region(base, data):
+    """Build a runtime-keyed region and discard only proven all-zero lead pages."""
+    page_base=base&~0xFFF
+    region=b'\x00'*(base-page_base)+data
+    while len(region)>0x1000 and not any(region[:0x1000]):
+        page_base+=0x1000
+        region=region[0x1000:]
+    return page_base,region
+
 def is_psx_exe(data):
     return len(data) >= 0x20 and data[:8] == b'PS-X EXE'
 
@@ -225,28 +441,62 @@ def is_header_table(data):
     nul = sum(1 for p in ptrs if p == 0)
     return cnt if (inr+nul == cnt and inr >= 1) else None
 
+def parse_full_discovery_ranges(lines):
+    """Return entries and overlapping alias recipes from normal-mode ranges."""
+    seeds=set(); aliases=[]; pending=None
+    for line in lines:
+        m=re.match(r'F ([0-9A-Fa-f]+)',line)
+        if m:
+            pending=int(m.group(1),16)
+            seeds.add(pending if pending>=0x80000000 else (0x80000000|pending))
+            continue
+        m=re.match(r'R ([0-9A-Fa-f]+) ([0-9A-Fa-f]+)',line)
+        if m and pending is not None:
+            lo=int(m.group(1),16); size=int(m.group(2),16)
+            entry=pending if pending>=0x80000000 else (0x80000000|pending)
+            lo=lo if lo>=0x80000000 else (0x80000000|lo)
+            if size and entry != lo and lo <= entry < lo+size:
+                aliases.append((entry,lo,lo+size))
+            pending=None
+    return sorted(seeds),sorted(set(aliases))
+
 def full_discovery_seeds(data, recompiler, tmp):
-    """Run recompiler NORMAL mode on a PS-X EXE; return discovered function entries."""
+    """Run NORMAL mode; return discovered entries plus exact alias recipes."""
     exe_path = os.path.join(tmp, 'producer.exe')
     open(exe_path,'wb').write(data)
-    out = os.path.join(tmp, 'disc_out'); os.makedirs(out, exist_ok=True)
+    out = os.path.join(tmp, f'disc_out_{binascii.crc32(data)&0xFFFFFFFF:08X}')
+    os.makedirs(out, exist_ok=True)
     try:
         # errors='replace': the recompiler prints non-ASCII (✓) that would raise
         # a decode error under text=True and lose the (already-written) ranges.
         subprocess.run([recompiler, exe_path, '--out-dir', out],
                        capture_output=True, text=True, errors='replace', timeout=300)
     except Exception as e:
-        print(f"    full-discovery failed ({e}); falling back to prologue scan"); return None
-    seeds=set()
+        print(f"    full-discovery failed ({e}); falling back to prologue scan")
+        return None,[]
+    lines=[]
     for rf in [f for f in os.listdir(out) if f.endswith('.ranges')]:
-        for line in open(os.path.join(out,rf), errors='ignore'):
-            m=re.match(r'F ([0-9A-Fa-f]+)', line)   # normal-mode: "F <entry>" (no crc suffix)
-            if m:
-                a=int(m.group(1),16); seeds.add(a if a>=0x80000000 else (0x80000000|a))
-    return sorted(seeds) or None
+        lines.extend(open(os.path.join(out,rf), errors='ignore'))
+    seeds,aliases=parse_full_discovery_ranges(lines)
+    return (seeds,aliases) if seeds else (None,[])
+
+def filter_full_discovery_seeds(body, base, candidates, declared_entry):
+    """Quarantine normal mode's unproven image-body fallback entry.
+
+    Normal mode derives interior entries from return/prologue/call/control-flow
+    evidence and classifies their reachable extents.  Its one provenance-free
+    fallback is the image load address: a backward return scan that reaches the
+    beginning promotes that first body word.  Ape MINI2 begins with a pointer
+    table there, while its PS-X header declares the real entry later.  Quarantine
+    only that unproven body-start fallback; preserving the additive interior set
+    is essential because removing selected roots can split otherwise broad
+    functions and create native code-range holes.
+    """
+    return sorted({addr for addr in candidates
+                   if addr != base or addr == declared_entry})
 
 def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
-        static_discovery=None):
+        static_discovery=None, static_alias_ranges=None):
     # function_entry_pcs = prologue-scanned function starts (walk roots).
     # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
     # overlay's own export table). compile_overlays promotes clean starts to
@@ -266,6 +516,11 @@ def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
     if static_discovery:
         out["static_discovery_entry_pcs"]=[
             f"0x{addr:08X}" for addr in sorted(set(static_discovery))]
+    if static_alias_ranges:
+        out["static_alias_ranges"]=[
+            {"entry":f"0x{entry:08X}", "start":f"0x{lo:08X}",
+             "end":f"0x{hi:08X}"}
+            for entry,lo,hi in sorted(set(static_alias_ranges))]
     return out
 
 def bios_resident_records(bios_path=None, manifest_path=None):
@@ -393,13 +648,18 @@ def main():
     bp,raw=parse_cue_datatrack(disc)   # multi-bin safe: pick track-1 data bin
     dr=eo.DiscReader(bp,raw=raw)
     files=list(eo.enumerate_files(dr))
+    hed_groups=hed_companion_members(dr,files)
+    hed_consumed=set().union(*(group['consumed'] for group in hed_groups)) \
+        if hed_groups else set()
     tmp=a.tmp or tempfile.mkdtemp()
     os.makedirs(tmp, exist_ok=True)
     # The boot EXE (game.toml `exe`) is the STATIC-recompiled base, NOT an overlay.
     exe_base=os.path.basename(str(game.get('exe',''))).upper()
-    records=[]; np=nh=nr=nc=0; seen_crc=set(); header_files=[]; raw_files=[]
+    records=[]; np=nh=nr=na=ne=nc=0; seen_crc=set(); header_files=[]; raw_files=[]
     positioned=[]
     for p,l,s in sorted(files):
+        if p.upper() in hed_consumed:
+            continue
         if s<8 or s>2_000_000: continue
         if exe_base and os.path.basename(p).upper()==exe_base:
             continue   # skip the statically-compiled base executable
@@ -410,11 +670,15 @@ def main():
         if dcrc in seen_crc: continue
         seen_crc.add(dcrc)
         if is_psx_exe(data):
+            entry_pc=struct.unpack_from('<I',data,0x10)[0]
             t_addr=struct.unpack_from('<I',data,0x18)[0]
             body=data[2048:]
-            seeds_all=full_discovery_seeds(data, a.recompiler, tmp)
-            used_full_discovery=seeds_all is not None
-            if seeds_all is None: seeds_all=prologues(body, t_addr)
+            seeds_all,aliases_all=full_discovery_seeds(data, a.recompiler, tmp)
+            if seeds_all is None:
+                seeds_all=prologues(body, t_addr)
+            else:
+                seeds_all=filter_full_discovery_seeds(
+                    body,t_addr,seeds_all,entry_pc)
             # split body into floor-clamped window regions
             base=t_addr & 0x1FFFFFFF
             end=base+len(body)
@@ -425,9 +689,18 @@ def main():
                 seg=body[lo-base:hi-base]
                 va=0x80000000|lo
                 sd=[x for x in seeds_all if lo<=(x&0x1FFFFFFF)<hi]
+                # Normal-mode entries are already decoder/classifier output.
+                # Leave them as ordinary captured candidates so overlay mode
+                # can preserve overlapping alias groups. Marking them as hard
+                # STATIC_DISCOVERY_ROOT call roots truncates broad owners and
+                # makes a clean build lose native code-range coverage.
+                span_hi=va+len(seg)
+                aliases=[alias for alias in aliases_all
+                         if va <= alias[0] < span_hi and
+                         va <= alias[1] < alias[2] <= span_hi and
+                         (alias[0] != t_addr or alias[0] == entry_pc)]
                 records.append(rec(
-                    va,seg,sd,
-                    static_discovery=sd if used_full_discovery else None))
+                    va,seg,sd,static_alias_ranges=aliases))
             np+=1
             print(f"  [PS-X EXE] {p}: {len(body)}B @0x{0x80000000|base:08X}, full-disc seeds={len(seeds_all)}")
         else:
@@ -498,22 +771,68 @@ def main():
     raw_base_lo=0x80000000|floor_page
     for p,data in raw_files:
         rb=recover_raw_base(data, raw_base_lo)
-        if rb is None: continue
-        base,score,second=rb
-        prologue_seeds=prologues(data,base)
-        supplemental=supplemental_callable_seeds(data,base)
-        seeds=sorted(set(prologue_seeds)|supplemental)
-        page_base=base&~0xFFF
-        fill=base-page_base
-        region=b'\x00'*fill+data
-        records.append(rec(page_base,region,seeds))
-        positioned.append((p,data,base,seeds,()))
-        nr+=1
-        print(f"  [raw-code] {p}: {len(data)}B file@0x{base:08X} "
-              f"region@0x{page_base:08X}(+{fill}) "
-              f"(strict jal-fit score={score}, runner-up={second}), "
-              f"prologue seeds={len(prologue_seeds)} "
-              f"+{len(supplemental-set(prologue_seeds))} pointer-table seeds")
+        if rb is not None:
+            base,score,second=rb
+            prologue_seeds=prologues(data,base)
+            supplemental=supplemental_callable_seeds(data,base)
+            seeds=sorted(set(prologue_seeds)|supplemental)
+            page_base,region=page_aligned_region(base,data)
+            records.append(rec(page_base,region,seeds))
+            positioned.append((p,data,base,seeds,()))
+            nr+=1
+            print(f"  [raw-code] {p}: {len(data)}B file@0x{base:08X} "
+                  f"region@0x{page_base:08X} "
+                  f"(strict jal-fit score={score}, runner-up={second}), "
+                  f"prologue seeds={len(prologue_seeds)} "
+                  f"+{len(supplemental-set(prologue_seeds))} pointer-table seeds")
+            continue
+
+        for member in recover_indexed_archive(data,raw_base_lo):
+            base=member['base']; body=member['data']
+            page_base,region=page_aligned_region(base,body)
+            producer_lo=max(base,page_base)
+            record=rec(
+                page_base,region,member['seeds'],
+                producer_ranges=((producer_lo,base+len(body)),),
+                static_discovery=member['direct_seeds'])
+            record['producer_name']=(
+                f"{p}:member_{member['id']:04X}@{member['file_offset']:08X}")
+            records.append(record)
+            na+=1
+            print(f"  [indexed-archive] {p} member 0x{member['id']:X}: "
+                  f"{len(body)}B file+0x{member['file_offset']:X} "
+                  f"@0x{base:08X}, region@0x{page_base:08X}, "
+                  f"trusted-fit={member['score']}:{member['runner']}, "
+                  f"direct seeds={len(member['direct_seeds'])}, "
+                  f"total seeds={len(member['seeds'])}")
+
+    for group in hed_groups:
+        for member in recover_consensus_members(
+                group['members'],raw_base_lo):
+            base=member['base']; body=member['data']
+            # Some HED archives mirror ordinary PS-X EXE files verbatim. The
+            # self-describing producer above already emits their body at the
+            # header-declared address; do not also emit the staging buffer that
+            # includes the 0x800-byte executable header.
+            if is_psx_exe(body):
+                continue
+            page_base,region=page_aligned_region(base,body)
+            producer_lo=max(base,page_base)
+            record=rec(
+                page_base,region,member['seeds'],
+                producer_ranges=((producer_lo,base+len(body)),),
+                static_discovery=member['direct_seeds'])
+            record['producer_name']=(
+                f"{group['hed_path']}:entry_{member['id']:04X}"
+                f"@logical_{member['file_offset']:08X}")
+            records.append(record)
+            ne+=1
+            print(f"  [HED archive] {group['hed_path']} entry "
+                  f"0x{member['id']:X}: {len(body)}B "
+                  f"logical+0x{member['file_offset']:X} @0x{base:08X}, "
+                  f"region@0x{page_base:08X}, "
+                  f"trusted-fit={member['score']}:{member['runner']}, "
+                  f"direct seeds={len(member['direct_seeds'])}")
 
     # Runtime dirty-page capture coalesces directly adjacent producers into one
     # region keyed by the earlier page. Emit each provable two-file composition
@@ -555,7 +874,9 @@ def main():
     with open(a.out, 'w') as f:
         json.dump(records, f)
     print(f"producers: {np} PS-X EXE (full-discovery), {nh} header-table, "
-          f"{nr} raw-code, {nc} adjacent composites, {nb} BIOS resident; "
+          f"{nr} raw-code, {na} indexed-archive members, "
+          f"{ne} HED-companion members, "
+          f"{nc} adjacent composites, {nb} BIOS resident; "
           f"{len(records)} regions -> {a.out}")
 
 if __name__=='__main__': main()

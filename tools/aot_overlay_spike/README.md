@@ -128,14 +128,16 @@ prototype exposed padding as a seventh function and was not retained.
   recompiler in NORMAL mode (jr-$ra boundary scan) finds frameless functions
   overlay-mode's prologue-scan misses. Tomba2 MAIN.EXE: prologue 710 fns / 62%
   vault -> full-discovery 786 fns / 69% vault (3296 shards, 0 audit fails);
-  the tool now emits 3500 discovered seeds vs 1210 prologues.
-- **Generality is ENGINE-SPECIFIC, not universal.** The two producer types
+  the current tool emits 3503 discovered entries vs 1210 prologues. It also
+  carries normal mode's exact overlapping-range recipes into clean overlay
+  builds, so alias coverage does not depend on an older cache manifest.
+- **Generality is ENGINE-SPECIFIC, not universal.** The initial two producer types
   (self-describing PS-X-EXE + {count,ptr[]} header-table) cover the Whoopee Camp
   engine (Tomba 1 header-table; Tomba 2 MAIN.EXE + BIN) but detect ZERO overlays
-  on Vigilante 8 (Luxoflux) and Mega Man X6 (Capcom) — those load overlays in a
-  different container/format (likely compressed/archived). Each engine family
-  needs its own producer. Matches the Legaia-decomp finding: overlay enumeration
-  is bespoke per engine.
+  on Vigilante 8 (Luxoflux) and initially detected zero on Mega Man X6 (Capcom).
+  The indexed/HED archive producers below now cover MMX6 and Ape Escape; other
+  engine families still need their own byte-proven container parser. Matches the
+  Legaia-decomp finding: overlay enumeration is bespoke per engine.
 - **SOLVED (2026-07-17) — header-table base recovery via jal-target self-consistency.**
   The old delta-sweep matched the export-table pointers against prologues, but those
   pointers point at mid-function DISPATCH entries, not prologues (measured: 0/29 hit
@@ -194,6 +196,48 @@ live-byte guard; including it raises both the full-playthrough vault and the
 verified append-only live-history needed set to **100% native code-range
 coverage**. This avoids generating duplicate overlay shards for code that is
 already native.
+
+## Indexed and companion archive recovery (2026-07-18)
+
+Large-container extraction first exposed an unrelated quadratic I/O bug:
+`DiscReader.read_file_bytes()` appended immutable bytes once per 2 KiB sector.
+It now joins sector chunks once; reading MMX6's 50.9 MB DAT fell from minutes to
+about 0.25 seconds on the validation machine.
+
+`ROCK_X6.BIN` is a strict 0x800-aligned `{id,size}[]` archive, not compressed
+code. Its members independently vote three link bases (`0x800E9060`,
+`0x800F9800`, `0x801E9800`). A base is trusted only after at least two members
+produce a sharp >=8-vote, >=2x jal-to-prologue peak; siblings need at least two
+votes for that exact consensus. Mixed archive members use **direct-JAL roots
+only**. A broader pointer-table experiment compiled 24/31 but correctly failed
+seven generated-C audits; removing those speculative roots produced
+`PSX_SHARD_RESULT ok=31 failed=0 skipped=0` (30 members + BIOS resident). Against
+the union of 16 legacy MMX6 capture files this first conservative pass covers
+71.8% of entries by combined native code range. The remaining gap is discovery
+inside byte-proven members, not container enumeration.
+
+Ape Escape's `KKIIDDZZ.HED` encodes contiguous
+`size_sectors:12 | logical_sector:20` runs spanning sibling DAT then BNS files.
+The same cross-member vote gate proves `0x80136000` (10 anchors), `0x8013D000`
+(27), and two mirrored minigame EXEs. Ordinary PS-X EXE handling owns the latter;
+the HED producer emits 44 BNS members. Together with two self-describing minigame
+EXEs and the resident BIOS recipe, the disposable validation cache has all 47
+candidates compiled with zero unsupported/bad targets.
+
+Normal-mode PS-X discovery quarantines its one provenance-free fallback: the
+image body start is excluded when the PS-X header declares a different entry.
+This removes Ape MINI2's body-leading address/string table at `0x80100000` while
+retaining its declared `0x80100C84` entry. All decoder-classified interior
+entries remain ordinary candidates, and the extractor serializes their `F/R`
+overlapping alias recipes instead of promoting them to hard call roots. A clean
+Tomba 2 disposable rebuild compiled 53/53 candidates with zero unsupported/bad
+targets and, together with the base BIOS, reproduced **100% code-range coverage**
+against both the full-playthrough vault and 765-entry append-only live history.
+No prior MAIN manifest was present for the two regenerated shards. Position-fixed
+framed scans likewise recover Psy-Q's exact
+`lui R; load ...,off(R); addiu sp,sp,-N` entry after a previous return, replacing
+the old root eight bytes late. This closes Tomba 1's historical `0x80110E30` gap
+in the clean X00 variant without minting overlapping functions.
 
 ## Next to raise coverage (future session)
 

@@ -24,6 +24,31 @@ continue to fail safely to the interpreter.
 
 ---
 
+## 2026-07-18: byte-proven archive producers
+
+- The generic extractor now recognizes strict 0x800-aligned `{id,size}` member
+  archives (MMX6 `ROCK_X6.BIN`) and companion HED sector tables spanning DAT/BNS
+  payload namespaces (Ape Escape `KKIIDDZZ.*`).
+- Link bases are not guessed from title constants. Multiple independent members
+  must anchor one sharp jal/prologue consensus; a sibling then needs at least two
+  votes for that exact trusted base.
+- Mixed archive members seed only locally callable direct-JAL targets. The first
+  MMX6 pointer-table expansion demonstrated why: seven variants hit the generated-C
+  unsupported-instruction audit. Direct-only roots compile all 30 members cleanly,
+  plus the exact-hash BIOS resident shard.
+- Ape's two PS-X EXE mirrors are deduplicated in favor of the self-describing EXE
+  producer. Its remaining 44 HED/BNS members plus two minigame EXEs and the BIOS
+  recipe are also audit-clean in a disposable cache.
+- Normal PS-X discovery now exports its exact overlapping `F/R` alias recipes.
+  Clean overlay builds therefore preserve decoder-proven indirect entries without
+  promoting every entry to a hard root or borrowing a previous cache manifest.
+  T2 compiled 53/53 disposable candidates with zero audit failures and restored
+  100% combined BIOS code-range coverage for both vault and live history.
+- Large archive reads are now linear rather than quadratic sector concatenation.
+  These validations wrote only `%TEMP%` caches; title caches remain untouched.
+
+---
+
 ## ⭐ SESSION-2 BREAKTHROUGH (2026-07-17, VERIFIED FROM DISC + CORPUS)
 
 Adversarial disc analysis overturned the pessimistic framing below. For Tomba's

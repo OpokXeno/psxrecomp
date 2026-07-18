@@ -90,6 +90,30 @@ def check_static_discovery_provenance():
     assert audit['included_reasons'][entry] == 'STATIC_DISCOVERY_ROOT'
 
 
+def check_static_alias_recipe():
+    data = bytearray(0x40)
+    put(data, 0x00, 0x03E00008)
+    put(data, 0x04, 0x00000000)
+    put(data, 0x20, 0x24020001)
+    put(data, 0x24, 0x03E00008)
+    put(data, 0x28, 0x00000000)
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'function_entry_pcs': [f'0x{LOAD:08X}', f'0x{LOAD + 0x20:08X}'],
+        'static_alias_ranges': [{
+            'entry': f'0x{LOAD + 0x20:08X}',
+            'start': f'0x{LOAD:08X}',
+            'end': f'0x{LOAD + 0x2C:08X}',
+        }],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    assert (f'retained_alias 0x{LOAD + 0x20:08X} '
+            f'0x{LOAD:08X} 0x{LOAD + 0x2C:08X}') in seeds
+    assert audit['static_alias_ranges'] == {
+        (LOAD + 0x20, LOAD, LOAD + 0x2C)}
+
+
 def check_forward_branch_root():
     data = bytearray(0x80)
     target = LOAD + 0x40
@@ -220,6 +244,7 @@ def main():
 
     check_composite_call_boundaries()
     check_static_discovery_provenance()
+    check_static_alias_recipe()
     check_forward_branch_root()
     check_recompiler_composite_contract(args.recompiler)
     check_retained_alias_contract(args.recompiler)
