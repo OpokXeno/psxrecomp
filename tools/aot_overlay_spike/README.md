@@ -28,12 +28,12 @@ discovery quality, not to be run as-is in a build.
 
 - **Tomba 1:** 90% of played functions reproduced play-free + ~1964 unplayed
   extra; live-validated in-game (Dwarf Village went native, no runtime compile).
-- **Tomba 2:** the clean play-free cache now covers 1187/1856 played entries
-  (**64.0%**) and byte-matches 1084 (**58.4% entry+code_crc**). Direct-call
-  provenance for frameless leaves added 74 MAIN.EXE hits over the 60.0% baseline.
-  The BIN header-table producer recovers a correct, self-consistent common base
-  (jal-fit, below): 21 A*.BIN overlays converge on region 0x80108000 (+3996), with
-  4 weak-signal files safely skipped.
+- **Tomba 2:** the clean play-free cache now covers 1219/1856 played entries
+  (**65.7%**) and byte-matches 1102 (**59.4% entry+code_crc**). Direct-call
+  provenance for frameless leaves added 74 MAIN.EXE hits over the 60.0% baseline;
+  recovering the four call-sparse files added another 32 overlay-window hits.
+  All 22 A*.BIN overlays converge on 0x80108F9C (region 0x80108000 +3996),
+  DEMO/GAME converge on 0x80106228, and OPN resolves to 0x8018A000.
 
 ## Correctness guarantee (why partial coverage is safe)
 
@@ -91,8 +91,10 @@ misses, production autocompile (tcc/gcc) self-heals on first visit.
    Continue with statically proven function-pointer/jump-table consumers; the
    first corpus sweep correctly rejected apparent constants clobbered by `lw`.
 2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
-3. Recover the weak-signal skipped overlays (Tomba 2 A09/A0J/GAME/OPN): likely
-   compressed/archived or too few intra-overlay calls; may need a decompressor or
-   a lower-confidence seed source before jal-fit can lock a base.
+3. ~~Recover weak-signal A09/A0J/GAME/OPN~~ — DONE. They are ordinary uncompressed
+   MIPS, not archives. Counting only callable `jal` targets sharply resolves
+   A09/A0J/OPN; GAME's 8-byte near-tie resolves through the exact base independently
+   proved by DEMO. The played vault byte-proves GAME at 0x80106228. Ambiguous files
+   without one unique trusted match still fail closed.
 4. Extract the kernel `0x80000000` region once from the BIOS (game-independent).
 5. Generalize into a real `tools/` producer (no hardcoded paths; disc + game.toml in).
