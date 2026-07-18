@@ -21,6 +21,7 @@ Usage:
   coverage_report.py --static <static-cache-dir> --vault <vault-cache-dir>
                      [--bios-dispatch <SCPHxxxx_dispatch.c>]
                      [--captures <runtime_overlay_captures.json>]
+                     [--addendum <overlay_captures.addendum.jsonl>]
                      [--prior-report <gaps.json> --assume-static-superset]
                      --out-md <path.md> --out-json <path.json> [--game <id>]
 Cache dirs are scanned recursively for *.ranges; a captures json is the v2 schema.
@@ -171,6 +172,88 @@ def parse_captures_executed(path):
                 ent.add(norm(int(a, 16)))
     return ent
 
+def _fnv64_file(path):
+    value = 1469598103934665603
+    with open(path, 'rb') as source:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            for byte in chunk:
+                value ^= byte
+                value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+def parse_addendum_entries(path):
+    """Union dispatch/function entries from verified v1/v2 history records."""
+    entries = set()
+    seen_refs = set()
+    audit = {'v1_records': 0, 'v2_records': 0, 'invalid_records': 0,
+             'duplicate_refs': 0, 'verified_snapshots': 0}
+
+    def add_captures(captures):
+        if not isinstance(captures, list):
+            return
+        for cap in captures:
+            if not isinstance(cap, dict):
+                continue
+            for key in ('dispatch_entry_pcs', 'function_entry_pcs'):
+                for addr in cap.get(key, []):
+                    entries.add(norm(int(addr, 16) if isinstance(addr, str)
+                                     else int(addr)))
+
+    with open(path, encoding='utf-8', errors='replace') as history:
+        for lineno, line in enumerate(history, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except Exception as exc:
+                print(f'  warn: ignoring invalid addendum line {lineno} ({exc})')
+                audit['invalid_records'] += 1
+                continue
+            if not isinstance(record, dict):
+                audit['invalid_records'] += 1
+                continue
+            schema = record.get('schema')
+            if schema == 'psxrecomp overlay capture addendum v1':
+                audit['v1_records'] += 1
+                add_captures(record.get('captures'))
+                continue
+            if schema != 'psxrecomp overlay capture addendum v2':
+                audit['invalid_records'] += 1
+                continue
+            audit['v2_records'] += 1
+            snapshot = record.get('snapshot')
+            expected = str(record.get('fnv64', '')).upper()
+            if not isinstance(snapshot, str) or not snapshot:
+                audit['invalid_records'] += 1
+                continue
+            if not os.path.isabs(snapshot):
+                snapshot = os.path.join(os.path.dirname(path), snapshot)
+            snapshot = os.path.abspath(snapshot)
+            ref = (os.path.normcase(snapshot), expected)
+            if ref in seen_refs:
+                audit['duplicate_refs'] += 1
+                continue
+            seen_refs.add(ref)
+            if (not os.path.isfile(snapshot) or not expected or
+                    expected != '%016X' % _fnv64_file(snapshot)):
+                print(f'  warn: ignoring missing/mismatched snapshot on line '
+                      f'{lineno}: {snapshot}')
+                audit['invalid_records'] += 1
+                continue
+            try:
+                with open(snapshot, encoding='utf-8') as source:
+                    add_captures(json.load(source))
+            except Exception as exc:
+                print(f'  warn: ignoring unreadable snapshot on line {lineno} '
+                      f'({exc})')
+                audit['invalid_records'] += 1
+                continue
+            audit['verified_snapshots'] += 1
+    return entries, audit
+
 def recall(needed_entries, static_ent, static_ranges, needed_crc=None):
     """needed_entries: set; static_ent: {entry->crc}. Returns dict of metrics."""
     covered = set(static_ent)
@@ -208,6 +291,7 @@ def main():
                          'entries/ranges to separate combined metrics')
     ap.add_argument('--vault', help='played/coverage vault cache dir (.ranges)')
     ap.add_argument('--captures', help='runtime overlay_captures.json (executed_pcs)')
+    ap.add_argument('--addendum', help='append-only runtime capture history (.jsonl)')
     ap.add_argument('--prior-report', help='roll forward a persisted live gap set')
     ap.add_argument('--assume-static-superset', action='store_true',
                     help='assert current static entries retain every prior static entry')
@@ -318,8 +402,17 @@ def main():
             md.append('  ```')
         md.append('')
 
+    live = set()
+    live_sources = []
     if a.captures and os.path.exists(a.captures):
-        live = parse_captures_executed(a.captures)
+        live.update(parse_captures_executed(a.captures))
+        live_sources.append('latest capture')
+    if a.addendum and os.path.exists(a.addendum):
+        addendum_entries, addendum_audit = parse_addendum_entries(a.addendum)
+        live.update(addendum_entries)
+        live_sources.append('verified append-only history')
+        report['live_addendum_audit'] = addendum_audit
+    if live_sources:
         r = recall(live, static_ent, static_ranges)
         report['sources']['live_session'] = {
             k: v for k, v in r.items() if k not in ('misses', 'range_misses')}
@@ -333,8 +426,14 @@ def main():
                 k: v for k, v in combined.items() if k not in ('misses', 'range_misses')}
             report['live_combined_range_misses'] = [
                 f'0x{x|0x80000000:08X}' for x in combined['range_misses']]
-        md.append('## vs live session captures (this drive)\n')
-        md.append(f'- Dispatch entries this session exercised: **{r["needed"]}**')
+        md.append('## vs live capture history\n')
+        md.append(f'- Sources: **{" + ".join(live_sources)}**')
+        if a.addendum and 'live_addendum_audit' in report:
+            aa = report['live_addendum_audit']
+            md.append(f'- Verified immutable snapshots: '
+                      f'**{aa["verified_snapshots"]}**; invalid records: '
+                      f'**{aa["invalid_records"]}**')
+        md.append(f'- Dispatch entries exercised: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
         md.append(f'- Covered by compiled static code ranges: '
@@ -345,11 +444,19 @@ def main():
                       f'**{combined["covered_by_code_range"]}** '
                       f'(**{combined["recall_code_range"]*100:.1f}%**)')
         md.append(f'- **MISSED live: {r["missed"]}**\n')
-    elif a.prior_report:
-        with open(a.prior_report, encoding='utf-8') as prior_in:
-            prior = json.load(prior_in)
-        prior_live = prior.get('sources', {}).get('live_session')
-        prior_misses = prior.get('live_misses')
+    if a.prior_report:
+        if a.prior_report == '-':
+            prior = json.load(sys.stdin)
+        else:
+            with open(a.prior_report, encoding='utf-8') as prior_in:
+                prior = json.load(prior_in)
+        prior_sources = prior.get('sources', {})
+        if 'prior_live_session' in prior_sources:
+            prior_live = prior_sources.get('prior_live_session')
+            prior_misses = prior.get('prior_live_misses')
+        else:
+            prior_live = prior_sources.get('live_session')
+            prior_misses = prior.get('live_misses')
         if not isinstance(prior_live, dict) or not isinstance(prior_misses, list):
             ap.error('--prior-report has no persisted live_session/live_misses')
         if len(static_ent) < int(prior.get('static_entries', 0)):
@@ -371,9 +478,12 @@ def main():
              'recall_code_range': ((needed - len(range_miss))/needed if needed else 0.0)}
         r['provenance'] = ('rolled forward from the persisted live gap manifest; '
                            'caller asserted the current static entry set is a superset')
-        report['sources']['live_session'] = r
-        report['live_misses'] = [f'0x{x|0x80000000:08X}' for x in sorted(miss)]
-        report['live_range_misses'] = [
+        prior_key = 'prior_live_session' if live_sources else 'live_session'
+        prior_prefix = 'prior_live' if live_sources else 'live'
+        report['sources'][prior_key] = r
+        report[f'{prior_prefix}_misses'] = [
+            f'0x{x|0x80000000:08X}' for x in sorted(miss)]
+        report[f'{prior_prefix}_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in sorted(range_miss)]
         combined = None
         if a.bios_dispatch:
@@ -395,10 +505,19 @@ def main():
                 'recall_code_range': (
                     (needed - len(combined_range_miss))/needed if needed else 0.0),
                 'provenance': r['provenance']}
-            report['sources']['live_session_combined_bios'] = combined
-            report['live_combined_range_misses'] = [
+            combined_key = ('prior_live_session_combined_bios' if live_sources
+                            else 'live_session_combined_bios')
+            report['sources'][combined_key] = combined
+            report[f'{prior_prefix}_combined_range_misses'] = [
                 f'0x{x|0x80000000:08X}' for x in sorted(combined_range_miss)]
-        md.append('## vs persisted live-session gaps (monotonic roll-forward)\n')
+        heading = ('## vs pre-history persisted live-session gaps '
+                   '(separate monotonic roll-forward)\n' if live_sources else
+                   '## vs persisted live-session gaps (monotonic roll-forward)\n')
+        md.append(heading)
+        if live_sources:
+            md.append('- This older needed set predates append-only history. It is '
+                      'reported separately because the old report retained misses, '
+                      'not enough addresses to compute an honest set union.\n')
         md.append(f'- Dispatch entries the persisted session exercised: **{needed}**')
         md.append(f'- Discovered by current static: **{covered}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')

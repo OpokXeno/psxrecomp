@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import tempfile
 import unittest
 import zlib
@@ -59,6 +60,33 @@ const PsxNativeStub psx_bios_native_stubs[1] = {
         self.assertEqual(audit, [{
             'entry': '0x8000EE7C', 'code_crc': '%08X' % zero_crc,
             'size': zero_size}])
+
+    def test_addendum_unions_v1_and_verified_v2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = os.path.join(tmp, 'immutable.json')
+            addendum = os.path.join(tmp, 'history.jsonl')
+            with open(snapshot, 'w', encoding='utf-8') as out:
+                json.dump([{'dispatch_entry_pcs': ['0x80000200']}], out)
+            signature = '%016X' % coverage_report._fnv64_file(snapshot)
+            records = [
+                {'schema': 'psxrecomp overlay capture addendum v1',
+                 'captures': [{'function_entry_pcs': ['0x80000100']}]},
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'snapshot': snapshot, 'fnv64': signature},
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'snapshot': snapshot, 'fnv64': signature},
+                {'schema': 'psxrecomp overlay capture addendum v2',
+                 'snapshot': snapshot, 'fnv64': '0000000000000000'},
+            ]
+            with open(addendum, 'w', encoding='utf-8', newline='\n') as out:
+                for record in records:
+                    out.write(json.dumps(record) + '\n')
+                out.write('{"schema":"torn')
+            entries, audit = coverage_report.parse_addendum_entries(addendum)
+        self.assertEqual(entries, {0x100, 0x200})
+        self.assertEqual(audit, {
+            'v1_records': 1, 'v2_records': 3, 'invalid_records': 2,
+            'duplicate_refs': 1, 'verified_snapshots': 1})
 
 
 if __name__ == '__main__':
