@@ -179,9 +179,9 @@ std::string CodeGenerator::translate_sw(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     if (offset == 0) {
-        return fmt::format("cpu->write_word({}, {});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_word({}, {});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->write_word({} + {}, {});",
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_word({} + {}, {});",
                           reg_name(rs), offset, reg_name(rt));
     }
 }
@@ -457,9 +457,9 @@ std::string CodeGenerator::translate_sb(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     if (offset == 0) {
-        return fmt::format("cpu->write_byte({}, (uint8_t){});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_byte({}, (uint8_t){});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->write_byte({} + {}, (uint8_t){});",
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_byte({} + {}, (uint8_t){});",
                           reg_name(rs), offset, reg_name(rt));
     }
 }
@@ -470,9 +470,9 @@ std::string CodeGenerator::translate_sh(uint32_t instr) {
     int16_t offset = get_imm16(instr);
 
     if (offset == 0) {
-        return fmt::format("cpu->write_half({}, (uint16_t){});", reg_name(rs), reg_name(rt));
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_half({}, (uint16_t){});", reg_name(rs), reg_name(rt));
     } else {
-        return fmt::format("cpu->write_half({} + {}, (uint16_t){});",
+        return fmt::format("psx_store_cycle_barrier(); cpu->write_half({} + {}, (uint16_t){});",
                           reg_name(rs), offset, reg_name(rt));
     }
 }
@@ -947,9 +947,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             int16_t offset = get_imm16(instr);
             std::string store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
             if (offset == 0)
-                return store_pc + fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
                                    reg_name(rs), reg_name(rt), comment);
-            return store_pc + fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+            return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
                                reg_name(rs), offset, reg_name(rt), comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.backdrop] x site 0x{:08X} is not "
@@ -1086,10 +1086,10 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             : std::string(reg_name(rs));
         std::string store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
         if (opcode == 0x28)  // sb
-            return store_pc + fmt::format("cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
+            return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
                                aexpr, reg_name(rt), comment);
         if (opcode == 0x29)  // sh
-            return store_pc + fmt::format("cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
+            return store_pc + fmt::format("psx_store_cycle_barrier(); cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
                                aexpr, reg_name(rt), comment);
         fmt::print(stderr, "ERROR: [persist_options] init site 0x{:08X} is not sb/sh "
                    "(opcode 0x{:02X})\n", addr, opcode);
@@ -1296,11 +1296,11 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     std::string swc2_store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
                     if (offset == 0) {
                         code = gte_stall + swc2_store_pc + fmt::format(
-                            "cpu->write_word({}, {}); gte_precision_store_word({}, {});  /* swc2 gte[{}], ({}) */",
+                            "psx_store_cycle_barrier(); cpu->write_word({}, {}); gte_precision_store_word({}, {});  /* swc2 gte[{}], ({}) */",
                             reg_name(rs), value, reg_name(rs), rt, rt, reg_name(rs));
                     } else {
                         code = gte_stall + swc2_store_pc + fmt::format(
-                            "cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
+                            "psx_store_cycle_barrier(); cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
                             reg_name(rs), offset, value, reg_name(rs), offset, rt,
                             rt, offset, reg_name(rs));
                     }
@@ -2741,6 +2741,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * rt_value is the value of the source register.\n";
     ss << " */\n";
     ss << kw << "void psx_swl(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
+    ss << "    psx_store_cycle_barrier();\n";
     ss << "    uint32_t aligned_addr = addr & ~3u;\n";
     ss << "    uint32_t word = cpu->read_word(aligned_addr);\n";
     ss << "    switch (addr & 3u) {\n";
@@ -2757,6 +2758,7 @@ void CodeGenerator::emit_unaligned_helpers(std::ostream& ss, bool as_inline) con
     ss << " * rt_value is the value of the source register.\n";
     ss << " */\n";
     ss << kw << "void psx_swr(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
+    ss << "    psx_store_cycle_barrier();\n";
     ss << "    uint32_t aligned_addr = addr & ~3u;\n";
     ss << "    uint32_t word = cpu->read_word(aligned_addr);\n";
     ss << "    switch (addr & 3u) {\n";

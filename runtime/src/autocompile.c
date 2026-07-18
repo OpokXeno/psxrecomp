@@ -14,6 +14,7 @@
 #endif
 
 extern void overlay_loader_rescan(void);
+extern int overlay_loader_load_published(const char *dll_path);
 
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
                             * many absolute paths (python+script+recompiler+tcc+...) */
@@ -25,8 +26,21 @@ static char s_cache_dir[512];
 static char s_captures[512];
 
 enum { AC_IDLE = 0, AC_RUNNING = 1, AC_DONE = 2 };
-static volatile int s_state     = AC_IDLE;
-static volatile int s_exit_code = -1;
+#ifdef _WIN32
+static volatile LONG s_state     = AC_IDLE;
+static volatile LONG s_exit_code = -1;
+static int ac_state_load(void) {
+    return (int)InterlockedCompareExchange(&s_state, AC_IDLE, AC_IDLE);
+}
+static void ac_state_store(int value) {
+    InterlockedExchange(&s_state, (LONG)value);
+}
+#else
+static int s_state     = AC_IDLE;
+static int s_exit_code = -1;
+static int ac_state_load(void) { return s_state; }
+static void ac_state_store(int value) { s_state = value; }
+#endif
 static uint32_t     s_runs      = 0;
 static uint32_t     s_fails     = 0;
 static uint32_t     s_rescans   = 0;
@@ -54,8 +68,66 @@ static CRITICAL_SECTION s_out_lock;
 static int              s_out_lock_init = 0;
 static HANDLE           s_proc = NULL;
 
+#define AC_PUBLISH_CAP 128
+static char s_publish_paths[AC_PUBLISH_CAP][768];
+static unsigned s_publish_head = 0, s_publish_count = 0;
+static unsigned s_publish_seen_run = 0, s_publish_drops_run = 0;
+static char s_child_line[1024];
+static int  s_child_line_len = 0;
+
+static void publish_line_locked(void) {
+    static const char marker[] = "PSX_SHARD_PUBLISHED ";
+    if (strncmp(s_child_line, marker, sizeof(marker) - 1) != 0) return;
+    const char *path = s_child_line + sizeof(marker) - 1;
+    if (!path[0]) return;
+    s_publish_seen_run++;
+    if (s_publish_count >= AC_PUBLISH_CAP) {
+        s_publish_drops_run++;
+        return;
+    }
+    unsigned slot = (s_publish_head + s_publish_count) % AC_PUBLISH_CAP;
+    snprintf(s_publish_paths[slot], sizeof(s_publish_paths[slot]), "%s", path);
+    s_publish_count++;
+}
+
+static void publish_parse_locked(const char *buf, int n) {
+    for (int i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\r') continue;
+        if (c == '\n') {
+            s_child_line[s_child_line_len] = '\0';
+            publish_line_locked();
+            s_child_line_len = 0;
+        } else if (s_child_line_len < (int)sizeof(s_child_line) - 1) {
+            s_child_line[s_child_line_len++] = c;
+        }
+    }
+}
+
+static int publish_pop(char *out, int cap) {
+    int found = 0;
+    EnterCriticalSection(&s_out_lock);
+    if (s_publish_count) {
+        snprintf(out, (size_t)cap, "%s", s_publish_paths[s_publish_head]);
+        s_publish_head = (s_publish_head + 1u) % AC_PUBLISH_CAP;
+        s_publish_count--;
+        found = 1;
+    }
+    LeaveCriticalSection(&s_out_lock);
+    return found;
+}
+
+static int publish_pending(void) {
+    int pending;
+    EnterCriticalSection(&s_out_lock);
+    pending = s_publish_count != 0;
+    LeaveCriticalSection(&s_out_lock);
+    return pending;
+}
+
 static void out_append(const char *buf, int n) {
     EnterCriticalSection(&s_out_lock);
+    publish_parse_locked(buf, n);
     if (n >= AC_OUT_CAP) {
         memcpy(s_out, buf + (n - AC_OUT_CAP), AC_OUT_CAP);
         s_out_len = AC_OUT_CAP;
@@ -85,8 +157,8 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
     GetExitCodeProcess(ctx->proc, &code);
     CloseHandle(ctx->proc);
     HeapFree(GetProcessHeap(), 0, ctx);
-    s_exit_code = (int)code;
-    s_state = AC_DONE;          /* emu thread applies via autocompile_poll_main */
+    InterlockedExchange(&s_exit_code, (LONG)code);
+    ac_state_store(AC_DONE);    /* emu thread applies via autocompile_poll_main */
     return 0;
 }
 #endif /* _WIN32 */
@@ -108,7 +180,7 @@ void autocompile_set_cache_paths(const char *cache_dir, const char *captures) {
 }
 
 int autocompile_configured(void) { return s_cmd[0] != '\0'; }
-int autocompile_busy(void)       { return s_state == AC_RUNNING; }
+int autocompile_busy(void)       { return ac_state_load() != AC_IDLE; }
 
 /* Probe PATH for a real C compiler (gcc/cc/clang). A configured command STRING
  * (autocompile_configured) is not enough: the shipped game.toml always carries
@@ -149,8 +221,15 @@ int autocompile_toolchain_available(void) {
 }
 
 int autocompile_request(void) {
-    if (!autocompile_configured() || s_state == AC_RUNNING) return 0;
+    /* DONE owns an unconsumed cache rescan/result. Only the emulation-thread
+     * poll may return it to IDLE; never overwrite it with another child. */
+    if (!autocompile_configured() || ac_state_load() != AC_IDLE) return 0;
 #ifdef _WIN32
+    EnterCriticalSection(&s_out_lock);
+    s_publish_head = s_publish_count = 0;
+    s_publish_seen_run = s_publish_drops_run = 0;
+    s_child_line_len = 0;
+    LeaveCriticalSection(&s_out_lock);
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE rd = NULL, wr = NULL;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
@@ -163,6 +242,7 @@ int autocompile_request(void) {
      * the loader reads. This is THE fix for the read/write-location divergence. */
     if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
     if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
+    SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). */
@@ -177,12 +257,11 @@ int autocompile_request(void) {
     si.hStdError  = wr;
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
-    /* Children (cmd -> python -> gcc) inherit NORMAL priority. Large streamed
-     * snapshots otherwise take long enough at BELOW_NORMAL for an interpreter
-     * gap to span several audio buffers. The emulation/audio threads retain
-     * their own scheduling policy, and acceptance still uses a settled cache. */
+    /* Compilation is opportunistic: it must never outrank the interpreter that
+     * keeps the current frame alive. cmd -> python -> gcc inherit below-normal
+     * priority, while the live compile script also defaults to one worker. */
     BOOL ok = CreateProcessA(NULL, full, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
+                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
                              NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
     CloseHandle(wr);
     if (!ok) {
@@ -202,10 +281,23 @@ int autocompile_request(void) {
     ctx->read_pipe = rd;
     ctx->proc      = pi.hProcess;
     s_proc = pi.hProcess;
-    s_state = AC_RUNNING;
+    ac_state_store(AC_RUNNING);
     s_runs++;
     HANDLE th = CreateThread(NULL, 0, watch_thread, ctx, 0, NULL);
-    if (th) CloseHandle(th);
+    if (th) {
+        CloseHandle(th);
+    } else {
+        /* Without the watcher nobody drains stdout, observes completion, or
+         * closes the process handle. Cancel the just-created child fail-closed. */
+        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+        CloseHandle(rd);
+        CloseHandle(pi.hProcess);
+        HeapFree(GetProcessHeap(), 0, ctx);
+        s_proc = NULL;
+        ac_state_store(AC_IDLE);
+        s_fails++;
+        return 0;
+    }
     return 1;
 #else
     return 0;  /* non-Windows hosts: manual compile flow only */
@@ -259,13 +351,33 @@ static int parse_shard_result(void) {
 }
 
 void autocompile_poll_main(void) {
-    if (s_state != AC_DONE) return;
-    s_state = AC_IDLE;
-    /* ALWAYS rescan on completion: shards that DID build must load even when the
-     * run also reported per-shard failures (partial success). The loader is
+    /* Drain at most one atomic publication per frame. The producer only sends
+     * paths; candidate registration remains single-threaded here. */
+#ifdef _WIN32
+    char published[768];
+    if (publish_pop(published, (int)sizeof(published))) {
+        (void)overlay_loader_load_published(published);
+        s_rescans++;
+    }
+    if (ac_state_load() == AC_RUNNING) return;
+#endif
+    if (ac_state_load() != AC_DONE) return;
+#ifdef _WIN32
+    if (publish_pending()) return;
+#endif
+    ac_state_store(AC_IDLE);
+    /* New producers report each DLL directly; a full rescan is only the
+     * compatibility/overflow fallback. The loader is
      * idempotent — rescanning after a failed compile is harmless. */
+#ifdef _WIN32
+    if (s_publish_seen_run == 0 || s_publish_drops_run != 0) {
+        overlay_loader_rescan();
+        s_rescans++;
+    }
+#else
     overlay_loader_rescan();
     s_rescans++;
+#endif
     s_shard_result_seen = parse_shard_result();
     /* A run "failed" if the process exited non-zero OR it reported shard
      * failures. compile_overlays.py exits 2 when any shard that should have
@@ -315,7 +427,7 @@ int autocompile_status_json(char *out, int cap) {
         "\"shard_ok\":%u,\"shard_fail\":%u,\"shard_skipped\":%u,"
         "\"shard_fail_total\":%u,\"shard_result_seen\":%d,"
         "\"output_tail\":\"%s\"}",
-        autocompile_configured(), names[s_state & 3], s_runs, s_fails,
+        autocompile_configured(), names[ac_state_load() & 3], s_runs, s_fails,
         s_rescans, s_exit_code,
         s_shard_ok, s_shard_fail, s_shard_skipped,
         s_shard_fail_total, s_shard_result_seen, tail);

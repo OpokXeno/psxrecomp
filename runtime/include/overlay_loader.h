@@ -47,6 +47,10 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
  * (loaded DLLs stay loaded); emu thread only. */
 void overlay_loader_rescan(void);
 
+/* Load one atomically-published autocompile artifact directly. The path must be
+ * inside this loader's canonical cache root. Emulation thread only. */
+int overlay_loader_load_published(const char *dll_path);
+
 /* True if the cache holds <region_start8>_<crc8>.{dll,so}. */
 int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc);
 
@@ -71,6 +75,8 @@ const char *overlay_loader_last_msg(void);
  * blacklisted to the interpreter. Called from the psx_write_* store path
  * (memory.c) only when the written page is a watched overlay code page. */
 void overlay_loader_active_write_check(uint32_t phys, uint32_t size);
+/* Invalidate negative lazy-lookups after a write to manifested code pages. */
+void overlay_loader_note_code_write(void);
 
 /* Inc3 counters, surfaced via overlay_loader_status (field meanings remapped
  * to the per-entry model — see overlay_loader.c getters). */

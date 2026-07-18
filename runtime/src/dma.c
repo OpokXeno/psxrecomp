@@ -931,6 +931,16 @@ void dma_advance(uint32_t cycles) {
             uint32_t moved = 0;
             g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
             g_dma_initiator_pc = s_dma_ch_initiator_pc[3];  /* deferred: restore kick PC */
+            /* Snapshot outgoing executed code at the last possible coherent
+             * moment: after the async wait, immediately before the first RAM
+             * word. Scheduling-time capture was too early because guest code
+             * can continue executing while the CD device is not ready. */
+            if (a->remaining_words == a->total_words && words_budget > 0 &&
+                addr < 0x1C0000u) {
+                uint32_t bytes = a->total_words * 4u;
+                if (bytes > 0x200000u - addr) bytes = 0x200000u - addr;
+                overlay_capture_before_dma(addr, bytes);
+            }
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
                 uint32_t word = cdrom_dma_read();
                 g_dma_cur_madr = addr;

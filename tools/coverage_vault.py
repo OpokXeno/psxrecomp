@@ -22,7 +22,7 @@ Usage:
   coverage_vault.py merge --vault DIR [--captures captures.json] [--cache CACHE_DIR]
   coverage_vault.py stats --vault DIR
 """
-import argparse, json, os, shutil, hashlib, sys
+import argparse, json, os, shutil, hashlib, sys, contextlib
 
 CAP_NAME = "overlay_captures.json"
 CACHE_SUB = "cache"
@@ -32,39 +32,114 @@ def _variant_key(region):
     return "%s:%s" % (region.get("load_addr"), hashlib.sha1(b.encode()).hexdigest())
 
 def _load_list(path):
-    if not os.path.exists(path):
-        return []
+    """Load the legacy/latest manifest plus runtime additive contributions."""
+    paths = [path] if os.path.isfile(path) else []
+    history = path + ".d"
+    if os.path.isdir(history):
+        paths = [os.path.join(history, n) for n in sorted(os.listdir(history))
+                 if n.lower().endswith(".json")] + paths
+    index = {}
+    for source in paths:
+        try:
+            with open(source, encoding="utf-8") as f:
+                v = json.load(f)
+            if not isinstance(v, list):
+                raise ValueError("root is not a list")
+        except Exception as e:
+            print("  warn: could not read %s (%s); skipping contribution" %
+                  (source, e))
+            continue
+        for r in v:
+            k = _variant_key(r)
+            if k not in index:
+                index[k] = dict(r)
+            else:
+                tgt = index[k]
+                for fld in ("executed_pcs", "dispatch_entry_pcs",
+                            "function_entry_pcs", "seeds"):
+                    tgt[fld] = sorted(set(tgt.get(fld, [])) |
+                                      set(r.get(fld, [])))
+    return list(index.values())
+
+@contextlib.contextmanager
+def _exclusive_lock(path):
+    """Cross-process lock for the read/union/replace capture transaction."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path + ".lock", "a+b") as lock:
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            if os.path.getsize(path + ".lock") == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+def _atomic_write_json(path, records):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
-        v = json.load(open(path, encoding="utf-8"))
-        return v if isinstance(v, list) else []
-    except Exception as e:
-        print("  warn: could not read %s (%s); starting fresh" % (path, e))
-        return []
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        if os.name != "nt":
+            dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 def merge_captures(vault_json, src_json):
-    if not src_json or not os.path.exists(src_json):
+    if not src_json or not (os.path.exists(src_json) or
+                            os.path.isdir(src_json + ".d")):
         return 0, 0
     src = _load_list(src_json)
     if not src:
         return 0, 0
-    index = { _variant_key(r): r for r in _load_list(vault_json) }
-    new_variants = new_pcs = 0
-    for r in src:
-        k = _variant_key(r)
-        if k not in index:
-            index[k] = dict(r)
-            new_variants += 1
-            new_pcs += len(r.get("executed_pcs", []))
-        else:
-            tgt = index[k]
-            for fld in ("executed_pcs", "dispatch_entry_pcs"):
-                cur = set(tgt.get(fld, []))
-                add = set(r.get(fld, []))
-                if fld == "executed_pcs":
-                    new_pcs += len(add - cur)
-                tgt[fld] = sorted(cur | add)
-    os.makedirs(os.path.dirname(vault_json) or ".", exist_ok=True)
-    json.dump(list(index.values()), open(vault_json, "w", encoding="utf-8"), indent=1)
+    with _exclusive_lock(vault_json):
+        # Keep a corrupt existing union visible instead of silently replacing
+        # it as an empty vault. Immutable contributions remain usable for repair.
+        if os.path.isfile(vault_json):
+            try:
+                with open(vault_json, encoding="utf-8") as f:
+                    if not isinstance(json.load(f), list):
+                        raise ValueError("root is not a list")
+            except Exception as exc:
+                raise RuntimeError("refusing to overwrite corrupt vault %s: %s" %
+                                   (vault_json, exc))
+        index = { _variant_key(r): r for r in _load_list(vault_json) }
+        new_variants = new_pcs = 0
+        for r in src:
+            k = _variant_key(r)
+            if k not in index:
+                index[k] = dict(r)
+                new_variants += 1
+                new_pcs += len(r.get("executed_pcs", []))
+            else:
+                tgt = index[k]
+                for fld in ("executed_pcs", "dispatch_entry_pcs",
+                            "function_entry_pcs", "seeds"):
+                    cur = set(tgt.get(fld, []))
+                    add = set(r.get(fld, []))
+                    if fld == "executed_pcs":
+                        new_pcs += len(add - cur)
+                    tgt[fld] = sorted(cur | add)
+        _atomic_write_json(vault_json, list(index.values()))
     return new_variants, new_pcs
 
 def merge_cache(vault_cache, src_cache):

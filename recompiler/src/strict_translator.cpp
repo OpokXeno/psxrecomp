@@ -1078,7 +1078,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const int32_t simm = static_cast<int32_t>(static_cast<int16_t>(d.raw & 0xFFFF));
         r.supported = true;
         r.c_code = fmt::format(
-            "g_debug_last_store_pc = 0x{:08X}u; "
+            "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_byte((uint32_t)((int32_t)cpu->gpr[{}] + ({})), (uint8_t)(cpu->gpr[{}] & 0xFFu));",
             d.address, static_cast<int>(rs), simm, static_cast<int>(rt));
         r.comment = fmt::format("sb {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
@@ -1092,7 +1092,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const int32_t simm = static_cast<int32_t>(static_cast<int16_t>(d.raw & 0xFFFF));
         r.supported = true;
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 1u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_half(psx_addr, (uint16_t)(cpu->gpr[{}] & 0xFFFFu)); }}",
@@ -1130,7 +1130,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // design — it is the instruction PS1 code uses precisely
         // when the address is not 4-aligned.
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "uint32_t psx_aligned = psx_addr & ~3u; "
             "uint32_t psx_shift_bytes = psx_addr & 3u; "
             "uint32_t psx_shift_bits  = (3u - psx_shift_bytes) * 8u; "
@@ -1151,7 +1151,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const int32_t simm = static_cast<int32_t>(static_cast<int16_t>(d.raw & 0xFFFF));
         r.supported = true;
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 3u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_word(psx_addr, cpu->gpr[{}]); }}",
@@ -1182,7 +1182,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // SWR with addr & 3 == 0 stores the full word at addr.
         // Verified against IDT R3000 manual and PSX-SPX.
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "uint32_t psx_aligned = psx_addr & ~3u; "
             "uint32_t psx_shift_bytes = psx_addr & 3u; "
             "uint32_t psx_shift_bits  = psx_shift_bytes * 8u; "
@@ -1385,14 +1385,14 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));
         if (offset == 0) {
             r.c_code = gte_stall + fmt::format(
-                "g_debug_last_store_pc = 0x{:08X}u; "
+                "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
                 "cpu->write_word(cpu->gpr[{}], {}); "
                 "gte_precision_store_word(cpu->gpr[{}], {});",
                 d.address, static_cast<int>(rs), value,
                 static_cast<int>(rs), static_cast<int>(rt));
         } else {
             r.c_code = gte_stall + fmt::format(
-                "g_debug_last_store_pc = 0x{:08X}u; "
+                "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
                 "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {}); "
                 "gte_precision_store_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
                 d.address, static_cast<int>(rs), static_cast<int>(offset), value,

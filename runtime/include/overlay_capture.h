@@ -10,19 +10,20 @@ extern "C" {
 /* overlay_capture — B-1 implementation of the overlay capture set.
  *
  * On every CD DMA completion into game-code RAM (dest < 0x1C0000), the runtime
- * calls overlay_capture_on_dma().  Each unique load_addr is stored exactly once
- * in a write-once set.  At clean process exit, overlay_capture_write_json()
- * writes overlay_captures.json next to the executable for user contribution.
- *
- * The set never overwrites: a second DMA to the same load_addr is a no-op.
- * This is correct because PSX overlays always load the same bytes to the same
- * address; recording once is sufficient.
+ * calls overlay_capture_on_dma(). The in-memory DMA set tracks the current
+ * image; executed outgoing variants are preserved as coherent immutable
+ * snapshots before replacement. At clean process exit,
+ * overlay_capture_write_json() writes the latest coherent manifest too.
  */
 
 /* Call once at startup (before the run loop) with the exe directory.
  * Sets the output path for overlay_captures.json.  Capture is not yet
  * active — it activates automatically on the first post-game DMA transfer. */
 void overlay_capture_set_out_dir(const char *out_dir);
+
+/* Set the canonical capture manifest path directly. The runtime also keeps an
+ * immutable additive history in <path>.d/ for future shard regeneration. */
+int overlay_capture_set_path(const char *path);
 
 /* Legacy init alias kept for compatibility; same as set_out_dir. */
 void overlay_capture_init(const char *out_dir);
@@ -39,10 +40,16 @@ void overlay_capture_set_enabled(int enabled);
 void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
                              const uint8_t *bytes);
 
+/* Called before a to-RAM CD DMA overwrites its destination. If that span held
+ * executed code, journal the coherent outgoing bytes/evidence first. */
+void overlay_capture_before_dma(uint32_t load_addr, uint32_t size);
+
 /* Write overlay_captures.json to the directory supplied at init time.
  * Safe to call even if no overlays were captured (writes nothing).
  * Called from shutdown_runtime() in main.cpp. */
 void overlay_capture_write_json(void);
+/* Join any background snapshot writer before process shutdown. */
+void overlay_capture_wait_pending(void);
 
 /* Returns number of unique overlays captured so far. */
 int overlay_capture_count(void);

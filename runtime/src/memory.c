@@ -20,7 +20,9 @@
 #include "timers.h"
 #include "lockstep.h"
 #include "data_shards.h"
+#include "dirty_ram_interp.h"
 #include "psx_cycles.h"
+#include "starvation_ring.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -590,8 +592,28 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
 static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
     uint32_t pg = phys >> DIRTY_RAM_PAGE_SHIFT;
     if (pg >= DIRTY_RAM_PAGE_COUNT) return;
+    /* Never attach pre-write PC evidence to post-write bytes, including for
+     * completely unknown/self-modifying code. This is deliberately a compact
+     * page clear, not a capture: serializing snapshots from this universal
+     * guest-store hook caused unbounded queues and multi-second stalls. CD DMA
+     * and periodic coherent capture remain the durable variant boundaries. */
+    if ((g_dirty_ram_exec_page_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
+        uint32_t bitmap_word = pg * (4096u / 4u / 32u);
+        memset(&g_dirty_ram_exec_pc_bitmap[bitmap_word], 0,
+               (4096u / 4u / 32u) * sizeof(uint32_t));
+        memset(&g_dirty_ram_dispatch_pc_bitmap[bitmap_word], 0,
+               (4096u / 4u / 32u) * sizeof(uint32_t));
+        g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+    }
     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
         overlay_page_gen[pg]++;
+        /* Also invalidate generation-aware negative overlay lookups: bytes in
+         * a manifested code page may now match a previously absent variant.
+         * Keep this separate from g_dirty_ram_code_gen: interpreter widescreen
+         * classifiers use that epoch and must not churn on every watched-page
+         * data write. */
+        extern void overlay_loader_note_code_write(void);
+        overlay_loader_note_code_write();
         /* Self-modification of a currently-executing native entry cannot be
          * recovered lazily (the next dispatch is too late) — the loader
          * blacklists that entry. Everything else is handled at dispatch. */
@@ -1589,6 +1611,29 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
  * dynamic axis; the per-region device waits below are the static, validatable piece. */
 extern void psx_advance_cycles(uint32_t cycles);
 
+/* Runtime-only production cycle charge for data-load timing.  Overlay DLLs
+ * flush their local pending-cycle accumulator before entering these host
+ * helpers, so this stays on the host side of that ABI boundary. */
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
+extern uint64_t g_psx_cycle_fast_limit;
+extern int g_event_step_conservative;
+extern int g_ls_replay_active;
+static inline void psx_load_charge_cycles(uint32_t cycles) {
+    if (g_ls_replay_active || cycles == 0u) return;
+    uint64_t next = psx_cycle_count + (uint64_t)cycles;
+    if (!g_event_step_conservative && g_psx_cycle_fast_limit != 0u &&
+        next >= psx_cycle_count && next <= g_psx_cycle_fast_limit) {
+        psx_cycle_count = next;
+        return;
+    }
+    psx_advance_cycles(cycles);
+}
+#else
+static inline void psx_load_charge_cycles(uint32_t cycles) {
+    psx_advance_cycles(cycles);
+}
+#endif
+
 /* Beetle MemRW device-region READ wait (libretro.cpp:859-1131), the device-dependent
  * part of a load's access cost (added to the timestamp before the +completion). `size`
  * is the access width in bytes (1/2/4) — the SPU and CDC waits are width-dependent.
@@ -1639,11 +1684,11 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
         return;
     }
     /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20). */
-    psx_advance_cycles((uint32_t)((cpu->read_fudge >> 4) & 2u));
+    psx_load_charge_cycles((uint32_t)((cpu->read_fudge >> 4) & 2u));
     uint32_t region = psx_mmio_read_wait(phys, size);  /* device-region wait */
     uint32_t cost = region + compl_cost;               /* LDAbsorb = region + completion */
     cpu->ld_absorb = cost;
-    psx_advance_cycles(cost);
+    psx_load_charge_cycles(cost);
     cpu->ld_which_t = (uint8_t)arm_rt;
     /* PROOF GATE (PSX_POLL_PROOF=N, default 0/off): a FLAT, non-absorbed extra N
      * cycles per main-RAM data read — replicates the historical "+6 cyc/main-RAM
@@ -1656,7 +1701,7 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
     if (phys < 0x00800000u) {
         static int s_pp = -1;
         if (s_pp < 0) { const char* e = getenv("PSX_POLL_PROOF"); s_pp = (e && e[0]) ? atoi(e) : 0; }
-        if (s_pp > 0) psx_advance_cycles((uint32_t)s_pp);
+        if (s_pp > 0) psx_load_charge_cycles((uint32_t)s_pp);
     }
 }
 
@@ -1671,7 +1716,11 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
     static int s_ld = -1;
     if (s_ld < 0) { const char* e = getenv("PSX_LOAD_DELAY"); s_ld = (e && e[0] == '0') ? 0 : 1; }
     if (!s_ld) { (void)addr; (void)size; (void)rt; (void)reg_mask; return; }
-    psx_cyc_base(cpu);
+    {
+        uint8_t w = cpu->read_absorb_which;
+        if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
+        else                     psx_load_charge_cycles(1u);
+    }
     psx_cyc_deps(cpu, reg_mask);
     if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
     psx_cyc_lds(cpu);
@@ -1681,8 +1730,44 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
 #endif
 }
 
+/* Production value-read fast path for the overwhelmingly common main-RAM
+ * load. Timing has already run before this helper is consulted, so a device
+ * deadline (and any DMA it services) remains ordered before the value read.
+ *
+ * Keep this host-local: generated overlay DLLs flush their pending cycles
+ * before entering psx_cyc_load_* and must not depend on runtime globals. Every
+ * mode with observable read-side instrumentation falls back to psx_read_*.
+ * The physical-range test is done before the 2 MiB mirror fold so MMIO, BIOS,
+ * scratchpad, KSEG2/cache-control and open-bus behavior remain canonical. */
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
+static inline int psx_cyc_main_ram_fast_addr(uint32_t addr, uint32_t width,
+                                             uint32_t *phys_out) {
+    if (g_ls_mode != 0 || g_ls_replay_active || g_ds_recording ||
+        g_ram_read_watch_active ||
+        g_dma_exec_depth > 0 || addr >= 0xC0000000u)
+        return 0;
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= 0x00800000u) return 0;
+    phys &= (uint32_t)(RAM_SIZE - 1);
+    /* Aligned guest loads cannot cross this boundary, but fail closed for a
+     * malformed/unaligned caller instead of introducing a host OOB read. */
+    if (phys > (uint32_t)RAM_SIZE - width) return 0;
+    *phys_out = phys;
+    return 1;
+}
+#endif
+
 uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
+    uint32_t phys;
+    if (psx_cyc_main_ram_fast_addr(addr, 4u, &phys)) {
+        return (uint32_t)ram[phys]
+             | ((uint32_t)ram[phys + 1] << 8)
+             | ((uint32_t)ram[phys + 2] << 16)
+             | ((uint32_t)ram[phys + 3] << 24);
+    }
+#endif
     return psx_read_word(addr);
 }
 void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
@@ -1691,10 +1776,19 @@ void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
 }
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
+    uint32_t phys;
+    if (psx_cyc_main_ram_fast_addr(addr, 2u, &phys))
+        return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
+#endif
     return psx_read_half(addr);
 }
 uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 1u, rt, reg_mask);
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
+    uint32_t phys;
+    if (psx_cyc_main_ram_fast_addr(addr, 1u, &phys)) return ram[phys];
+#endif
     return psx_read_byte(addr);
 }
 
@@ -1706,6 +1800,15 @@ uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
     psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);
 #else
     (void)cpu;
+#endif
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
+    uint32_t phys;
+    if (psx_cyc_main_ram_fast_addr(addr, 4u, &phys)) {
+        return (uint32_t)ram[phys]
+             | ((uint32_t)ram[phys + 1] << 8)
+             | ((uint32_t)ram[phys + 2] << 16)
+             | ((uint32_t)ram[phys + 3] << 24);
+    }
 #endif
     return psx_read_word(addr);
 }

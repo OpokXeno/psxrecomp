@@ -69,6 +69,95 @@ import platform
 import re
 
 
+def load_additive_captures(capture_path):
+    """Load the latest manifest plus immutable runtime contributions.
+
+    The runtime stores coherent snapshots in ``<capture_path>.d/*.json`` so it
+    never has to parse and rewrite historical game-derived data.  Unioning is
+    by exact region byte identity: reused addresses with different bytes remain
+    separate variants; repeated observations of the same bytes accumulate PC
+    evidence. A directory may also be supplied directly for offline workflows.
+    """
+    if os.path.isdir(capture_path):
+        base_path = os.path.join(capture_path, 'overlay_captures.json')
+        contribution_dir = capture_path
+    else:
+        base_path = capture_path
+        contribution_dir = capture_path + '.d'
+
+    paths = []
+    if os.path.isdir(contribution_dir):
+        history_paths = [os.path.join(contribution_dir, name)
+                         for name in os.listdir(contribution_dir)
+                         if name.lower().endswith('.json')]
+        history_paths.sort(key=lambda p: (os.path.getmtime(p), p))
+        paths.extend(history_paths)
+    if os.path.isfile(base_path):
+        paths.append(base_path)  # latest evidence wins scalar metadata
+    if not paths:
+        raise FileNotFoundError(f'no capture manifests at {capture_path}')
+
+    merged = {}
+    evidence_fields = ('executed_pcs', 'dispatch_entry_pcs',
+                       'function_entry_pcs', 'seeds')
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8') as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                raise ValueError('root is not a list')
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f'[captures] WARNING: skipping unreadable contribution '
+                  f'{path}: {exc}')
+            continue
+        for record_index, region in enumerate(records):
+            try:
+                if not isinstance(region, dict):
+                    raise ValueError('record is not an object')
+                raw_load = region['load_addr']
+                load_addr = (int(raw_load, 0) if isinstance(raw_load, str)
+                             else int(raw_load)) & 0x1FFFFFFF
+                size = int(region['size'])
+                bytes_b64 = region['bytes_b64']
+                if size <= 0 or not isinstance(bytes_b64, str):
+                    raise ValueError('invalid size or bytes_b64')
+                decoded = base64.b64decode(bytes_b64, validate=True)
+                if len(decoded) != size:
+                    raise ValueError('decoded byte length does not match size')
+                if load_addr >= 0x200000 or size > 0x200000 - load_addr:
+                    raise ValueError('capture range is outside 2 MiB RAM')
+                validated = dict(region)
+                for field in evidence_fields:
+                    values = region.get(field, [])
+                    if not isinstance(values, list):
+                        raise ValueError(f'{field} is not a list')
+                    parsed = set()
+                    for value in values:
+                        addr = _parse_addr(value)
+                        if (addr & 0x1FFFFFFF) >= 0x200000:
+                            raise ValueError(f'{field} address is outside RAM')
+                        parsed.add(addr)
+                    validated[field] = sorted(parsed)
+            except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+                print(f'[captures] WARNING: skipping malformed record '
+                      f'{record_index} in {path}: {exc}')
+                continue
+            key = (load_addr, size, bytes_b64)
+            if key not in merged:
+                merged[key] = validated
+                continue
+            target = merged[key]
+            for field in evidence_fields:
+                target[field] = sorted(_parse_addr_list(target.get(field, [])) |
+                                       set(validated[field]))
+            for field, value in region.items():
+                if field not in evidence_fields:
+                    target[field] = value
+    if not merged:
+        raise ValueError(f'no valid capture records at {capture_path}')
+    return list(merged.values()), paths
+
+
 def codegen_ver(runtime_include: str) -> int:
     """Parse PSX_OVERLAY_CODEGEN_VER from overlay_api.h so the cache path version
     is the SAME value the runtime (overlay_loader.c) uses — the two can't drift.
@@ -1690,11 +1779,12 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         # PATH) EVERY interior-fragment shard silently failed to build — the
         # FMV-driver / orphan-interior class ran interpreted forever. The cache
         # dir already namespaces by args.compiler, so only the invocation was wrong.
-        if not compile_dll(patched_c, dll_path, include_dirs,
-                           gcc=args.gcc, flavor=args.flavor,
-                           compiler=args.compiler, tcc=args.tcc):
+        published, _ = compile_and_publish_dll(
+            patched_c, dll_path, include_dirs, frag_ids,
+            gcc=args.gcc, flavor=args.flavor,
+            compiler=args.compiler, tcc=args.tcc)
+        if not published:
             return None, 'compile-error (see COMPILE ERROR above)'
-        write_overlay_ranges_from(frag_ids, os.path.splitext(dll_path)[0] + '.ranges')
         return frag_ids, 'built'
 
 
@@ -1851,6 +1941,50 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     return True
 
 
+def compile_and_publish_dll(c_path: str, out_dll: str, include_dirs: list[str],
+                            func_ids, gcc: str = 'gcc', flavor: int = 0,
+                            compiler: str = 'gcc', tcc: str = 'tcc'):
+    """Compile privately, then atomically publish ranges followed by the DLL.
+
+    Live runtime rescans may occur while a batch is still running. The DLL name
+    is therefore the commit marker: a scanner can see neither artifact, or a
+    complete ranges file plus a complete DLL, but never a half-linked library.
+    """
+    stem, ext = os.path.splitext(out_dll)
+    token = f'{os.getpid()}.{threading.get_ident()}'
+    tmp_dll = f'{stem}.{token}.tmp{ext}'
+    out_ranges = stem + '.ranges'
+    tmp_ranges = f'{stem}.{token}.tmp.ranges'
+    for path in (tmp_dll, tmp_ranges):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    try:
+        if not compile_dll(c_path, tmp_dll, include_dirs, gcc=gcc,
+                           flavor=flavor, compiler=compiler, tcc=tcc):
+            return False, 0
+        nfunc = write_overlay_ranges_from(func_ids, tmp_ranges)
+        if not nfunc:
+            return False, 0
+        os.replace(tmp_ranges, out_ranges)
+        os.replace(tmp_dll, out_dll)  # publication/commit marker, always last
+        # Machine-readable live handoff. flush=True is essential because stdout
+        # is a pipe under the runtime and a completed shard must not wait in
+        # Python's block buffer until the whole batch exits.
+        print(f'PSX_SHARD_PUBLISHED {out_dll}', flush=True)
+        return True, nfunc
+    except OSError as exc:
+        print(f'  PUBLISH ERROR: {exc}')
+        return False, 0
+    finally:
+        for path in (tmp_dll, tmp_ranges):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1904,9 +2038,13 @@ def main():
                     help='continuation-passing (RECURSION_BUG.md §25): set PSX_CPS '
                          'when invoking the recompiler so overlay funcs tail-transfer '
                          '+ carry an entry-switch. Must match the runtime build.')
+    live_autocompile = os.environ.get('PSX_OVERLAY_LIVE_AUTOCOMPILE', '') not in ('', '0')
     ap.add_argument('--jobs',            type=int,
-                    default=max(1, (os.cpu_count() or 4) - 2),
+                    default=(1 if live_autocompile else
+                             max(1, (os.cpu_count() or 4) - 2)),
                     help='parallel region-group workers (default: cores-2). '
+                         'Live runtime autocompile defaults to 1 so compilation '
+                         'cannot consume the interpreter\'s frame budget. '
                          'Captures are grouped by region start; regions are '
                          'independent (dedup coverage, prior-ranges merge, '
                          'fragments, and filenames all key on the region), '
@@ -1992,10 +2130,10 @@ def main():
         os.makedirs(cache_dir, exist_ok=True)
         print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x})')
 
-    with open(args.captures) as f:
-        captures = json.load(f)
+    captures, capture_sources = load_additive_captures(args.captures)
 
-    print(f'Captures: {len(captures)} overlay(s) to process\n')
+    print(f'Captures: {len(captures)} overlay variant(s) from '
+          f'{len(capture_sources)} additive manifest(s)\n')
 
     # B-2 static mode: accumulate privately-namespaced generated C plus exact
     # per-function identities for the content-validated dispatcher.
@@ -2307,17 +2445,14 @@ def main():
                     if os.path.isdir(p):
                         include_dirs.append(p)
 
-                success = compile_dll(patched_c, dll_path, include_dirs,
-                                      gcc=args.gcc, flavor=args.flavor,
-                                      compiler=args.compiler, tcc=args.tcc)
+                success, nfn = compile_and_publish_dll(
+                    patched_c, dll_path, include_dirs, this_ids,
+                    gcc=args.gcc, flavor=args.flavor,
+                    compiler=args.compiler, tcc=args.tcc)
                 if success:
-                    # Emit the per-entry code-range manifest beside the DLL from
-                    # the same func-id list we keyed the dedup on. The loader keys
-                    # it by the same filename stem with .ranges (replacing .dll).
-                    ranges_out = os.path.splitext(dll_path)[0] + '.ranges'
                     if this_ids:
-                        nfn = write_overlay_ranges_from(this_ids, ranges_out)
-                        print(f'  ranges: {nfn} functions -> {ranges_out}')
+                        print(f'  ranges: {nfn} functions -> '
+                              f'{os.path.splitext(dll_path)[0]}.ranges')
                         # New identities are now available for this region_start;
                         # keep the warm coverage set current so later captures in
                         # this same run dedup against them. (Parallel note: the

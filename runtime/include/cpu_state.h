@@ -66,6 +66,20 @@ typedef struct CPUState {
     uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
 } CPUState;
 
+/* Overlay DLLs batch per-instruction cycle charges in a DLL-local accumulator.
+ * A guest store is an observation boundary: MMIO handlers must see the cycle
+ * count through the store instruction, and RAM/self-modification/capture hooks
+ * must run after those cycles have been published to the host.  Generated code
+ * calls this immediately before every store (and before SWL/SWR's raw read).
+ * Static recompiled code and the interpreter share host cycle state directly,
+ * so their barrier compiles to nothing. */
+#ifdef PSX_OVERLAY_DLL_BUILD
+void overlay_flush_cycles(void);
+static inline void psx_store_cycle_barrier(void) { overlay_flush_cycles(); }
+#else
+static inline void psx_store_cycle_barrier(void) { }
+#endif
+
 /* Faithful exception-return (fix B) — defined in runtime/src/interrupts.c. The
  * interrupted-thread resume PC is the REAL guest PC, stored in COP0.EPC and (by the
  * BIOS handler) in the thread's TCB EPC slot — never a sentinel, never a single

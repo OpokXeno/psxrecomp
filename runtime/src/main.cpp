@@ -113,6 +113,7 @@ extern "C" {
     extern uint32_t g_overlay_region_floor;
     extern int      g_psx_cps_mode;
     extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
+    extern uint64_t g_dirty_window_dispatches;
     extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
     extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
 }
@@ -976,8 +977,9 @@ static void close_controller(void);
 
 static void shutdown_runtime(void) {
     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
-     * off-thread JIT worker here; the worker no longer exists.) */
+    * off-thread JIT worker here; the worker no longer exists.) */
     memcard_flush_all();
+    overlay_capture_wait_pending();
     overlay_capture_write_json();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
@@ -1156,23 +1158,226 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
 }
 
 /* Lightweight production-safe cadence probe. Unlike the TCP debug build this
- * adds no per-block recording; it is intended for long, representative attract
- * runs where instrumentation overhead would itself cause audio starvation. */
-static void runtime_perf_diag_tick() {
-    static int enabled = -1;
-    static uint64_t last_counter = 0, last_frame = 0, last_spu = 0;
-    static uint64_t last_underruns = 0, last_overflows = 0;
-    static uint64_t last_up[6] = {0};
-    static uint32_t last_overlay_loads = 0;
-    static uint64_t last_overlay_load_us = 0;
-    if (enabled < 0) {
-        const char *e = std::getenv("PSX_RUNTIME_PERF_DIAG");
-        enabled = e && e[0] && e[0] != '0';
+ * adds no per-block or per-instruction recording. All counter/timer work below
+ * is opt-in via PSX_RUNTIME_PERF_DIAG; the normal Release path pays only the
+ * existing once-per-vblank disabled checks. */
+struct RuntimePerfSnapshot {
+    uint64_t counter = 0;
+    uint64_t frame = 0;
+    uint64_t guest_work_ticks = 0;
+    uint64_t pacer_ticks = 0;
+    uint64_t autocapture_ticks = 0;
+    uint64_t provider_poll_ticks = 0;
+    uint64_t dirty_insns = 0;
+    uint64_t dirty_dispatches = 0;
+    uint32_t overlay_loads = 0;
+    uint32_t overlay_invalidations = 0;
+    uint32_t overlay_unregistered = 0;
+    uint64_t overlay_native = 0;
+    uint64_t overlay_interp = 0;
+    uint64_t overlay_stale = 0;
+    uint32_t overlay_revalidations = 0;
+    uint32_t capture_triggers = 0;
+    uint64_t capture_last_dispatch_delta = 0;
+    int capture_overlays = 0;
+};
+
+struct RuntimePerfState {
+    bool initialized = false;
+    bool enabled = false;
+    uint32_t interval_ms = 5000;
+    uint64_t frequency = 0;
+    uint64_t last_frame_exit_counter = 0;
+    uint64_t guest_work_ticks = 0;
+    uint64_t pacer_ticks = 0;
+    uint64_t autocapture_ticks = 0;
+    uint64_t provider_poll_ticks = 0;
+    bool bench_configured = false;
+    bool bench_started = false;
+    bool bench_reported = false;
+    uint64_t bench_start_frame = 0;
+    uint64_t bench_end_frame = 0;
+    RuntimePerfSnapshot bench_start;
+};
+
+static RuntimePerfState g_runtime_perf;
+
+static bool runtime_perf_parse_window(const char *text, uint64_t *start,
+                                      uint64_t *end) {
+    if (!text || !text[0]) return false;
+    char *middle = nullptr;
+    unsigned long long first = std::strtoull(text, &middle, 10);
+    if (middle == text || *middle != ':') return false;
+    char *tail = nullptr;
+    unsigned long long last = std::strtoull(middle + 1, &tail, 10);
+    if (tail == middle + 1 || *tail != '\0' || first == 0 || last <= first)
+        return false;
+    *start = (uint64_t)first;
+    *end = (uint64_t)last;
+    return true;
+}
+
+static void runtime_perf_init() {
+    if (g_runtime_perf.initialized) return;
+    g_runtime_perf.initialized = true;
+    const char *enabled = std::getenv("PSX_RUNTIME_PERF_DIAG");
+    g_runtime_perf.enabled = enabled && enabled[0] && enabled[0] != '0';
+    if (!g_runtime_perf.enabled) return;
+
+    g_runtime_perf.frequency = SDL_GetPerformanceFrequency();
+    if (!g_runtime_perf.frequency) g_runtime_perf.frequency = 1;
+    if (const char *interval = std::getenv("PSX_RUNTIME_PERF_DIAG_MS")) {
+        char *tail = nullptr;
+        long requested = std::strtol(interval, &tail, 10);
+        if (tail != interval && *tail == '\0') {
+            if (requested < 250) requested = 250;
+            if (requested > 600000) requested = 600000;
+            g_runtime_perf.interval_ms = (uint32_t)requested;
+        } else {
+            std::fprintf(stderr,
+                "psxrecomp: ignoring invalid PSX_RUNTIME_PERF_DIAG_MS='%s'\n",
+                interval);
+        }
     }
-    if (!enabled) return;
+    if (const char *window = std::getenv("PSX_BENCH_WINDOW")) {
+        if (runtime_perf_parse_window(window,
+                                      &g_runtime_perf.bench_start_frame,
+                                      &g_runtime_perf.bench_end_frame)) {
+            g_runtime_perf.bench_configured = true;
+        } else {
+            std::fprintf(stderr,
+                "psxrecomp: ignoring invalid PSX_BENCH_WINDOW='%s' "
+                "(expected start:end, start >= 1, end > start)\n", window);
+        }
+    }
+    std::fprintf(stdout, "psxrecomp: runtime perf diagnostics enabled: interval=%u ms",
+                 g_runtime_perf.interval_ms);
+    if (g_runtime_perf.bench_configured)
+        std::fprintf(stdout, ", bench=%llu:%llu",
+                     (unsigned long long)g_runtime_perf.bench_start_frame,
+                     (unsigned long long)g_runtime_perf.bench_end_frame);
+    std::fprintf(stdout, "\n");
+    std::fflush(stdout);
+}
+
+static RuntimePerfSnapshot runtime_perf_snapshot(uint64_t now) {
+    RuntimePerfSnapshot s;
+    s.counter = now;
+    s.frame = s_frame_count;
+    s.guest_work_ticks = g_runtime_perf.guest_work_ticks;
+    s.pacer_ticks = g_runtime_perf.pacer_ticks;
+    s.autocapture_ticks = g_runtime_perf.autocapture_ticks;
+    s.provider_poll_ticks = g_runtime_perf.provider_poll_ticks;
+    s.dirty_insns = g_dirty_ram_insns_run;
+    s.dirty_dispatches = g_dirty_window_dispatches;
+    overlay_loader_get_counters(&s.overlay_loads, &s.overlay_invalidations,
+                                &s.overlay_unregistered, &s.overlay_native,
+                                &s.overlay_interp, &s.overlay_stale,
+                                nullptr, nullptr, nullptr, nullptr,
+                                &s.overlay_revalidations);
+    int capture_enabled = 0;
+    overlay_autocapture_get_status(&capture_enabled, &s.capture_triggers,
+                                   &s.capture_last_dispatch_delta);
+    s.capture_overlays = overlay_capture_count();
+    return s;
+}
+
+static double runtime_perf_ticks_ms(uint64_t ticks) {
+    return (double)ticks * 1000.0 / (double)g_runtime_perf.frequency;
+}
+
+static void runtime_perf_bench_tick(uint64_t now) {
+    if (!g_runtime_perf.bench_configured || g_runtime_perf.bench_reported) return;
+    if (!g_runtime_perf.bench_started) {
+        if (s_frame_count == g_runtime_perf.bench_start_frame) {
+            g_runtime_perf.bench_start = runtime_perf_snapshot(now);
+            g_runtime_perf.bench_started = true;
+        }
+        return;
+    }
+    if (s_frame_count != g_runtime_perf.bench_end_frame) return;
+
+    RuntimePerfSnapshot end = runtime_perf_snapshot(now);
+    const RuntimePerfSnapshot &start = g_runtime_perf.bench_start;
+    std::fprintf(stdout,
+        "[BENCH] window=%llu:%llu frames=%llu wall_ms=%.3f "
+        "guest_work_ms=%.3f pacer_ms=%.3f autocapture_main_ms=%.3f "
+        "provider_poll_ms=%.3f "
+        "dirty_insns=+%llu dirty_dispatches=+%llu "
+        "overlay_native=+%llu overlay_interp=+%llu overlay_loads=+%u "
+        "overlay_invalidations=+%u overlay_unregistered=+%u "
+        "overlay_stale=+%llu overlay_revalidations=+%u "
+        "capture_triggers=+%u capture_overlays=+%d "
+        "capture_last_dispatch_delta=%llu\n",
+        (unsigned long long)start.frame, (unsigned long long)end.frame,
+        (unsigned long long)(end.frame - start.frame),
+        runtime_perf_ticks_ms(end.counter - start.counter),
+        runtime_perf_ticks_ms(end.guest_work_ticks - start.guest_work_ticks),
+        runtime_perf_ticks_ms(end.pacer_ticks - start.pacer_ticks),
+        runtime_perf_ticks_ms(end.autocapture_ticks - start.autocapture_ticks),
+        runtime_perf_ticks_ms(end.provider_poll_ticks - start.provider_poll_ticks),
+        (unsigned long long)(end.dirty_insns - start.dirty_insns),
+        (unsigned long long)(end.dirty_dispatches - start.dirty_dispatches),
+        (unsigned long long)(end.overlay_native - start.overlay_native),
+        (unsigned long long)(end.overlay_interp - start.overlay_interp),
+        end.overlay_loads - start.overlay_loads,
+        end.overlay_invalidations - start.overlay_invalidations,
+        end.overlay_unregistered - start.overlay_unregistered,
+        (unsigned long long)(end.overlay_stale - start.overlay_stale),
+        end.overlay_revalidations - start.overlay_revalidations,
+        end.capture_triggers - start.capture_triggers,
+        end.capture_overlays - start.capture_overlays,
+        (unsigned long long)end.capture_last_dispatch_delta);
+    std::fflush(stdout);
+    g_runtime_perf.bench_reported = true;
+}
+
+static void runtime_perf_frame_begin() {
+    runtime_perf_init();
+    if (!g_runtime_perf.enabled) return;
     uint64_t now = SDL_GetPerformanceCounter();
-    uint64_t freq = SDL_GetPerformanceFrequency();
-    extern uint64_t s_frame_count;
+    if (g_runtime_perf.last_frame_exit_counter &&
+        now >= g_runtime_perf.last_frame_exit_counter) {
+        g_runtime_perf.guest_work_ticks +=
+            now - g_runtime_perf.last_frame_exit_counter;
+    }
+    runtime_perf_bench_tick(now);
+}
+
+static void runtime_perf_frame_end() {
+    if (!g_runtime_perf.enabled) return;
+    g_runtime_perf.last_frame_exit_counter = SDL_GetPerformanceCounter();
+}
+
+class RuntimePerfFrameScope {
+public:
+    ~RuntimePerfFrameScope() { runtime_perf_frame_end(); }
+};
+
+static uint64_t runtime_perf_section_begin() {
+    return g_runtime_perf.enabled ? SDL_GetPerformanceCounter() : 0;
+}
+
+static void runtime_perf_section_end(uint64_t start, uint64_t *total) {
+    if (!start) return;
+    uint64_t end = SDL_GetPerformanceCounter();
+    if (end >= start) *total += end - start;
+}
+
+static void runtime_perf_diag_tick() {
+    static bool have_last = false;
+    static RuntimePerfSnapshot last;
+    static uint64_t last_spu = 0, last_underruns = 0, last_overflows = 0;
+    static uint64_t last_up[6] = {0};
+    static uint64_t last_overlay_load_us = 0;
+    if (!g_runtime_perf.enabled) return;
+
+    uint64_t now = SDL_GetPerformanceCounter();
+    const uint64_t interval_ticks =
+        g_runtime_perf.frequency * (uint64_t)g_runtime_perf.interval_ms / 1000u;
+    if (have_last && now - last.counter < interval_ticks) return;
+
+    RuntimePerfSnapshot current = runtime_perf_snapshot(now);
     AudioTraceStats audio;
     audio_trace_get_stats(&audio);
     double fill_ms = 0.0, correction = 0.0;
@@ -1182,47 +1387,66 @@ static void runtime_perf_diag_tick() {
                         &legacy, &host_rate);
     uint64_t up[6] = {0};
     gl_renderer_runtime_diag(up);
-    uint32_t overlay_loads = 0;
     uint64_t overlay_load_us = 0, overlay_load_max_us = 0, overlay_load_last_us = 0;
-    overlay_loader_get_counters(&overlay_loads, nullptr, nullptr, nullptr, nullptr,
-                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     overlay_loader_get_load_timing(&overlay_load_us, &overlay_load_max_us,
                                    &overlay_load_last_us);
-    if (!last_counter) {
-        last_counter = now; last_frame = s_frame_count;
+    if (!have_last) {
+        last = current;
         last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
-        last_underruns = underruns; last_overflows = overflows;
-        last_overlay_loads = overlay_loads;
+        last_underruns = underruns;
+        last_overflows = overflows;
         last_overlay_load_us = overlay_load_us;
         for (int i = 0; i < 6; i++) last_up[i] = up[i];
+        have_last = true;
         return;
     }
-    if (now - last_counter < freq * 5u) return;
-    double dt = (double)(now - last_counter) / (double)freq;
-    fprintf(stdout, "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
-            "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
-            "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
-            "cpu=%.1f tex=%.1f draw=%.1f ms/s; overlay loads=+%u "
-            "wall=%.1f ms max=%.1f last=%.1f ms\n",
-            (double)(s_frame_count - last_frame) / dt,
-            (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
-            fill_ms, (unsigned long long)(underruns - last_underruns),
-            (unsigned long long)(overflows - last_overflows), correction,
-            (double)(up[0] - last_up[0]) / dt,
-            (double)(up[1] - last_up[1]) / dt,
-            (double)(up[2] - last_up[2]) / dt / 1.0e6,
-            (double)(up[3] - last_up[3]) * 1000.0 / (double)freq / dt,
-            (double)(up[4] - last_up[4]) * 1000.0 / (double)freq / dt,
-            (double)(up[5] - last_up[5]) * 1000.0 / (double)freq / dt,
-            overlay_loads - last_overlay_loads,
-            (double)(overlay_load_us - last_overlay_load_us) / 1000.0,
-            (double)overlay_load_max_us / 1000.0,
-            (double)overlay_load_last_us / 1000.0);
-    fflush(stdout);
-    last_counter = now; last_frame = s_frame_count;
+
+    const double dt = (double)(current.counter - last.counter) /
+                      (double)g_runtime_perf.frequency;
+    std::fprintf(stdout,
+        "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
+        "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
+        "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
+        "cpu=%.1f tex=%.1f draw=%.1f ms/s; "
+        "work guest=%.1f pacer=%.1f autocapture=%.1f provider_poll=%.1f ms/s, "
+        "dirty=%.0f insn/s %.0f dispatch/s; "
+        "overlay native=+%llu interp=+%llu loads=+%u revalidations=+%u "
+        "load_wall=%.1f ms max=%.1f last=%.1f ms; "
+        "capture triggers=+%u overlays=+%d last_dispatch_delta=%llu\n",
+        (double)(current.frame - last.frame) / dt,
+        (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+        fill_ms, (unsigned long long)(underruns - last_underruns),
+        (unsigned long long)(overflows - last_overflows), correction,
+        (double)(up[0] - last_up[0]) / dt,
+        (double)(up[1] - last_up[1]) / dt,
+        (double)(up[2] - last_up[2]) / dt / 1.0e6,
+        (double)(up[3] - last_up[3]) * 1000.0 /
+            (double)g_runtime_perf.frequency / dt,
+        (double)(up[4] - last_up[4]) * 1000.0 /
+            (double)g_runtime_perf.frequency / dt,
+        (double)(up[5] - last_up[5]) * 1000.0 /
+            (double)g_runtime_perf.frequency / dt,
+        runtime_perf_ticks_ms(current.guest_work_ticks - last.guest_work_ticks) / dt,
+        runtime_perf_ticks_ms(current.pacer_ticks - last.pacer_ticks) / dt,
+        runtime_perf_ticks_ms(current.autocapture_ticks - last.autocapture_ticks) / dt,
+        runtime_perf_ticks_ms(current.provider_poll_ticks - last.provider_poll_ticks) / dt,
+        (double)(current.dirty_insns - last.dirty_insns) / dt,
+        (double)(current.dirty_dispatches - last.dirty_dispatches) / dt,
+        (unsigned long long)(current.overlay_native - last.overlay_native),
+        (unsigned long long)(current.overlay_interp - last.overlay_interp),
+        current.overlay_loads - last.overlay_loads,
+        current.overlay_revalidations - last.overlay_revalidations,
+        (double)(overlay_load_us - last_overlay_load_us) / 1000.0,
+        (double)overlay_load_max_us / 1000.0,
+        (double)overlay_load_last_us / 1000.0,
+        current.capture_triggers - last.capture_triggers,
+        current.capture_overlays - last.capture_overlays,
+        (unsigned long long)current.capture_last_dispatch_delta);
+    std::fflush(stdout);
+    last = current;
     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
-    last_underruns = underruns; last_overflows = overflows;
-    last_overlay_loads = overlay_loads;
+    last_underruns = underruns;
+    last_overflows = overflows;
     last_overlay_load_us = overlay_load_us;
     for (int i = 0; i < 6; i++) last_up[i] = up[i];
 }
@@ -1362,6 +1586,81 @@ static std::string trim_copy(const std::string& s) {
     size_t last = s.size();
     while (last > first && std::isspace((unsigned char)s[last - 1])) last--;
     return s.substr(first, last - first);
+}
+
+/* Resolve the durable additive overlay-capture store. Explicit process env is
+ * authoritative. For local development, parse only the two known capture keys
+ * from a gitignored root .psxrecomp.env (or .env); do not import unrelated
+ * variables/secrets into the game process. Relative paths are root-relative. */
+static std::filesystem::path resolve_overlay_capture_path(
+        const std::filesystem::path& project_root,
+        const std::filesystem::path& exe_dir,
+        const std::string& game_id) {
+    std::string direct;
+    std::string store_root;
+    std::filesystem::path value_base = project_root;
+    if (const char* e = std::getenv("PSX_OVERLAY_CAPTURES")) direct = e;
+    if (const char* e = std::getenv("PSX_OVERLAY_CAPTURE_ROOT")) store_root = e;
+
+    if (direct.empty() && store_root.empty()) {
+        std::vector<std::filesystem::path> configs = {
+            project_root / ".psxrecomp.env", project_root / ".env"
+        };
+        /* Framework developers commonly build a game whose config root is a
+         * sibling repository. Walk upward from the executable as well so the
+         * framework worktree's private config remains the durable authority. */
+        std::filesystem::path cur = exe_dir;
+        for (int i = 0; i < 8; ++i) {
+            configs.push_back(cur / ".psxrecomp.env");
+            const auto parent = cur.parent_path();
+            if (parent == cur) break;
+            cur = parent;
+        }
+        for (const auto& config : configs) {
+            std::ifstream in(config);
+            if (!in) continue;
+            std::string line;
+            while (std::getline(in, line)) {
+                line = trim_copy(line);
+                if (line.empty() || line[0] == '#') continue;
+                const size_t eq = line.find('=');
+                if (eq == std::string::npos) continue;
+                std::string key = trim_copy(line.substr(0, eq));
+                std::string value = trim_copy(line.substr(eq + 1));
+                if (value.size() >= 2 &&
+                    ((value.front() == '"' && value.back() == '"') ||
+                     (value.front() == '\'' && value.back() == '\'')))
+                    value = value.substr(1, value.size() - 2);
+                if (key == "PSX_OVERLAY_CAPTURES") {
+                    direct = value;
+                    value_base = config.parent_path();
+                } else if (key == "PSX_OVERLAY_CAPTURE_ROOT") {
+                    store_root = value;
+                    value_base = config.parent_path();
+                }
+            }
+            if (!direct.empty() || !store_root.empty()) break;
+        }
+    }
+
+    auto root_relative = [&](const std::string& raw) {
+        std::filesystem::path p(raw);
+        return p.is_absolute() ? p : value_base / p;
+    };
+    std::filesystem::path result;
+    if (!direct.empty()) result = root_relative(direct);
+    else if (!store_root.empty())
+        result = root_relative(store_root) / game_id / "overlay_captures.json";
+    else result = exe_dir / "overlay_captures.json";
+
+    std::error_code ec;
+    std::filesystem::create_directories(result.parent_path(), ec);
+    if (ec) {
+        std::fprintf(stderr, "psxrecomp: cannot create overlay capture store %s: %s\n",
+                     result.parent_path().string().c_str(), ec.message().c_str());
+        return exe_dir / "overlay_captures.json";
+    }
+    return result.lexically_normal();
 }
 
 static std::string lower_copy(std::string s) {
@@ -2262,6 +2561,8 @@ static void sdl_vblank_present(void) {
     int override = -1;
 #endif
 
+    runtime_perf_frame_begin();
+    RuntimePerfFrameScope runtime_perf_frame_scope;
     runtime_perf_diag_tick();
 
     /* Lightweight frontend telemetry from PR #13. Count simulated vblanks rather
@@ -2306,11 +2607,19 @@ static void sdl_vblank_present(void) {
     /* Step 2.8 automation ticks — BEFORE the turbo/fast-boot early returns
      * below, so capture detection and compile pickup keep running while the
      * frontend is skipping presents. Both are cheap and emu-thread-only. */
-    overlay_autocapture_tick();
+    {
+        uint64_t perf_start = runtime_perf_section_begin();
+        overlay_autocapture_tick();
+        runtime_perf_section_end(perf_start,
+                                 &g_runtime_perf.autocapture_ticks);
+    }
     {   /* Apply a finished batch compile via the active code provider (gcc:
          * cache rescan on done). */
+        uint64_t perf_start = runtime_perf_section_begin();
         const CodeProvider *cp = code_provider_active();
         if (cp->poll_main) cp->poll_main();
+        runtime_perf_section_end(perf_start,
+                                 &g_runtime_perf.provider_poll_ticks);
     }
 
     if (!g_headless) {
@@ -2520,7 +2829,9 @@ static void sdl_vblank_present(void) {
      * hard freeze). */
     {
         static FramePacer pacer = { 0 };
+        uint64_t perf_start = runtime_perf_section_begin();
         frame_pacer_wait(&pacer, g_frame_period_ms);
+        runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
     }
     latency_ring_mark(LAT_PACED);
 
@@ -3239,8 +3550,17 @@ int main(int argc, char** argv) {
             if (gc.runtime.overlay_cache) {
                 std::filesystem::path exe_dir = exe_dir_from_argv(argv[0]);
                 std::string cache_dir = (exe_dir / "cache").string();
-                overlay_capture_set_out_dir(exe_dir.string().c_str());
+                std::filesystem::path captures_path =
+                    resolve_overlay_capture_path(gc.project_root, exe_dir, game_id);
+                if (!overlay_capture_set_path(captures_path.string().c_str())) {
+                    captures_path = exe_dir / "overlay_captures.json";
+                    if (!overlay_capture_set_path(captures_path.string().c_str()))
+                        throw std::runtime_error("overlay capture path exceeds runtime limit");
+                }
                 overlay_capture_set_enabled(1);
+                std::fprintf(stdout,
+                    "psxrecomp: additive overlay capture store = %s (+ .d history)\n",
+                    captures_path.string().c_str());
                 overlay_loader_init(cache_dir.c_str(), game_id.c_str());
                 for (uint32_t addr : gc.runtime.overlay_native_block) {
                     overlay_loader_native_block_add(addr);
@@ -3251,13 +3571,13 @@ int main(int argc, char** argv) {
                         gc.runtime.overlay_native_block.size(),
                         gc.runtime.overlay_native_block.size() == 1 ? "y" : "ies");
                 }
-                /* Step 2.8 variant-capture automation. Autocapture is ON
-                 * whenever the cache is on: it writes the player-shareable
-                 * overlay_captures.json (the contribution file the README
-                 * promises) even on machines with no compile toolchain.
-                 * The background compile additionally needs a configured
-                 * command; autocompile_request() no-ops without one. */
-                overlay_autocapture_set_enabled(1);
+                /* Scoped pre-DMA journaling and the shutdown snapshot remain
+                 * active whenever the cache is on, including toolchain-less
+                 * production machines. The periodic pressure trigger exists to
+                 * feed a live compiler; leave it off when no provider command
+                 * exists, otherwise it rewrites manifests every cooldown while
+                 * being unable to reduce interpreter residency. */
+                overlay_autocapture_set_enabled(0);
                 /* Resolve the overlay tier first so we wire the RIGHT compiler's
                  * autocompile command. gcc is "available" only when a gcc cmd is
                  * configured AND a gcc toolchain is actually reachable (a real
@@ -3277,6 +3597,7 @@ int main(int argc, char** argv) {
                  * (the loader is compiler-blind), so a tcc box uses shipped gcc
                  * shards first and fills the rest with tcc. */
                 std::string built_tcc_cmd;  /* runtime-constructed bundled tcc cmd */
+                std::string env_ac_cmd;
                 const std::string *ac_cmd = nullptr;
                 if (eff == OVERLAY_BACKEND_TCC) {
                     if (gc.runtime.has_overlay_autocompile_cmd_tcc) {
@@ -3292,15 +3613,21 @@ int main(int argc, char** argv) {
                         std::filesystem::path tk = xd / "overlay_toolchain";
                         std::filesystem::path py = tk / "python" / "python.exe";
                         if (std::filesystem::exists(py)) {
+                            auto cmd_quote = [](const std::string& s) {
+                                return std::string("\"") + s + "\"";
+                            };
                             built_tcc_cmd =
-                                py.string() + " " + (tk / "compile_overlays.py").string() +
-                                " --captures " + (xd / "overlay_captures.json").string() +
-                                " --game-toml " + std::string(game_config_path ? game_config_path : "game.toml") +
-                                " --recompiler " + (tk / "psxrecomp-game.exe").string() +
-                                " --runtime-include " + (tk / "include").string() +
-                                " --out-dir " + (xd / "cache").string() +
+                                cmd_quote(py.string()) + " " +
+                                cmd_quote((tk / "compile_overlays.py").string()) +
+                                " --captures " + cmd_quote(captures_path.string()) +
+                                " --game-toml " + cmd_quote(std::string(
+                                    game_config_path ? game_config_path : "game.toml")) +
+                                " --recompiler " + cmd_quote((tk / "psxrecomp-game.exe").string()) +
+                                " --runtime-include " + cmd_quote((tk / "include").string()) +
+                                " --out-dir " + cmd_quote((xd / "cache").string()) +
                                 (g_psx_cps_mode ? " --cps" : "") +
-                                " --compiler tcc --tcc " + (tk / "tcc" / "tcc.exe").string();
+                                " --compiler tcc --tcc " +
+                                cmd_quote((tk / "tcc" / "tcc.exe").string());
                             ac_cmd = &built_tcc_cmd;
                             std::fprintf(stdout,
                                 "psxrecomp: tcc tier using bundled toolchain (%s)\n",
@@ -3315,6 +3642,19 @@ int main(int argc, char** argv) {
                     if (gc.runtime.has_overlay_autocompile_cmd)
                         ac_cmd = &gc.runtime.overlay_autocompile_cmd;
                 }
+                /* A developer may run a game config from one checkout against a
+                 * runtime/recompiler built in another worktree. Let the launch
+                 * pin the producer command to that exact worktree so the baked
+                 * codegen hash, additive-capture reader, and runtime headers
+                 * cannot silently drift through a game-repo junction. */
+                if (const char *e = std::getenv("PSX_OVERLAY_AUTOCOMPILE_CMD")) {
+                    if (e[0]) {
+                        env_ac_cmd = e;
+                        ac_cmd = &env_ac_cmd;
+                        std::fprintf(stdout,
+                            "psxrecomp: overlay autocompile command overridden by environment\n");
+                    }
+                }
                 if (ac_cmd) {
                     /* Pin the compile's WRITE cache + READ captures to the SAME
                      * canonical locations the loader uses (cache_dir = <exe>/cache,
@@ -3322,15 +3662,18 @@ int main(int argc, char** argv) {
                      * the cache location; no game.toml --out-dir/--captures can make
                      * the write drift from the read. Single source of truth, all
                      * games, dev or prod. */
-                    std::string captures_path =
-                        (exe_dir / "overlay_captures.json").string();
                     autocompile_set_cache_paths(cache_dir.c_str(),
-                                                captures_path.c_str());
-                    autocompile_configure(ac_cmd->c_str(),
-                                          gc.project_root.string().c_str());
+                                                captures_path.string().c_str());
+                    std::string ac_cwd = gc.project_root.string();
+                    if (const char *e = std::getenv("PSX_OVERLAY_AUTOCOMPILE_CWD")) {
+                        if (e[0]) ac_cwd = e;
+                    }
+                    autocompile_configure(ac_cmd->c_str(), ac_cwd.c_str());
+                    overlay_autocapture_set_enabled(1);
                     std::fprintf(stdout,
-                        "psxrecomp: overlay autocompile enabled (%s); cache=%s\n",
-                        overlay_backend_name(eff), cache_dir.c_str());
+                        "psxrecomp: overlay autocompile enabled (%s); cache=%s; captures=%s\n",
+                        overlay_backend_name(eff), cache_dir.c_str(),
+                        captures_path.string().c_str());
                 }
                 code_provider_init(cfg_backend, gcc_avail);
                 /* (sljit removed 2026-07-15: overlay_loader_apply_live_policy was

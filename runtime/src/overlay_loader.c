@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -154,6 +156,24 @@ int g_psx_cps_mode = 0;
 #define IDX_MASK (IDX_CAP - 1u)
 typedef struct { uint32_t addr; int head; } IdxSlot;
 static IdxSlot s_idx[IDX_CAP];
+/* Presence-only exact-entry index for the interpreter's common local-transfer
+ * negative check. Full byte/bundle validation remains in dispatch. */
+static uint32_t s_exact_entry_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+
+static void exact_entry_set(uint32_t phys) {
+    phys &= 0x1FFFFFFFu;
+    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+        uint32_t word = phys >> 2;
+        s_exact_entry_bitmap[word >> 5] |= 1u << (word & 31u);
+    }
+}
+
+static int exact_entry_has(uint32_t phys) {
+    phys &= 0x1FFFFFFFu;
+    if (phys >= 2u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
+    uint32_t word = phys >> 2;
+    return (s_exact_entry_bitmap[word >> 5] >> (word & 31u)) & 1u;
+}
 
 static int idx_head(uint32_t phys) {
     uint32_t h = (phys * 2654435761u) & IDX_MASK;
@@ -595,6 +615,7 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     c->state   = (cand_crc(c) == c->crc_code) ? ENTRY_VALID : ENTRY_INVALID;
     c->next    = idx_head(phys);
     idx_set_head(phys, idx);
+    exact_entry_set(phys);
     range_index_add_candidate(idx);
     if (c->state == ENTRY_VALID) s_valid_count++;
     /* (sljit removed 2026-07-15: the gcc-DLL-obsoletes-older-sljit-shard block
@@ -793,7 +814,55 @@ static int     s_lazy_page_tail[RANGE_PAGE_COUNT];
 static RangeLink s_lazy_range_links[LAZY_RANGE_LINK_CAP];
 static int       s_lazy_range_link_n = 0;
 
+/* A direct-mapped negative cache for the final "no live native owner" result.
+ * Hot uncovered PCs otherwise repeat manifest/range-chain discovery on every
+ * branch into the interpreter. The entry is valid only for the current RAM
+ * code generation and loader generation: executable writes, DLL publication,
+ * and cache rescans all make old misses disappear immediately. */
+#define LAZY_MISS_CACHE_CAP 16384u
+#define LAZY_MISS_CACHE_MASK (LAZY_MISS_CACHE_CAP - 1u)
+typedef struct {
+    uint32_t phys;
+    uint32_t code_gen;
+    uint32_t watched_code_gen;
+    uint32_t loader_gen;
+} LazyMissEntry;
+static LazyMissEntry s_lazy_miss_cache[LAZY_MISS_CACHE_CAP];
+static uint32_t s_lazy_loader_gen = 1;
+static uint32_t s_lazy_watched_code_gen = 1;
+extern uint32_t g_dirty_ram_code_gen;
+
+static void lazy_miss_invalidate_loader(void) {
+    if (++s_lazy_loader_gen == 0) {
+        memset(s_lazy_miss_cache, 0, sizeof(s_lazy_miss_cache));
+        s_lazy_loader_gen = 1;
+    }
+}
+
+static int lazy_miss_cached(uint32_t phys) {
+    LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
+    return e->phys == phys && e->code_gen == g_dirty_ram_code_gen &&
+           e->watched_code_gen == s_lazy_watched_code_gen &&
+           e->loader_gen == s_lazy_loader_gen;
+}
+
+static void lazy_miss_record(uint32_t phys) {
+    LazyMissEntry *e = &s_lazy_miss_cache[(phys >> 2) & LAZY_MISS_CACHE_MASK];
+    e->phys = phys;
+    e->code_gen = g_dirty_ram_code_gen;
+    e->watched_code_gen = s_lazy_watched_code_gen;
+    e->loader_gen = s_lazy_loader_gen;
+}
+
+void overlay_loader_note_code_write(void) {
+    if (++s_lazy_watched_code_gen == 0) {
+        memset(s_lazy_miss_cache, 0, sizeof(s_lazy_miss_cache));
+        s_lazy_watched_code_gen = 1;
+    }
+}
+
 static void rebuild_lazy_manifest_index(void) {
+    memset(s_exact_entry_bitmap, 0, sizeof(s_exact_entry_bitmap));
     s_lazy_man_n = 0;
     s_lazy_man_overflow = 0;
     s_lazy_range_link_n = 0;
@@ -823,6 +892,7 @@ static void rebuild_lazy_manifest_index(void) {
         for (int mi = 0; mi < man_n; mi++) {
             if (!man[mi].has_crc || man[mi].n <= 0) continue;
             uint32_t entry = man[mi].entry & 0x1FFFFFFFu;
+            exact_entry_set(entry);
             uint32_t bucket = (entry * 2654435761u) & LAZY_ENTRY_MASK;
 
             if (s_lazy_man_n >= LAZY_MAN_CAP) {
@@ -849,6 +919,11 @@ static void rebuild_lazy_manifest_index(void) {
             for (int r = 0; r < lm->fn.n; r++) {
                 uint32_t lo = lm->fn.lo[r] & 0x1FFFFFFFu;
                 uint32_t hi = lo + lm->fn.len[r] - 1u;
+                /* Unloaded manifests must participate in the same page
+                 * generations as registered DLL candidates. Otherwise a CPU
+                 * copy can turn INVALID bytes into a match while both the
+                 * LazyMan state and final-miss cache remain stale forever. */
+                overlay_watch_set_range(lo, lm->fn.len[r]);
                 uint32_t p0 = lo >> 12, p1 = hi >> 12;
                 if (p0 >= RANGE_PAGE_COUNT) continue;
                 if (p1 >= RANGE_PAGE_COUNT) p1 = RANGE_PAGE_COUNT - 1u;
@@ -874,6 +949,7 @@ static void rebuild_lazy_manifest_index(void) {
         free(man);
         if (s_lazy_man_overflow) break;
     }
+    for (int i = 0; i < s_cand_n; i++) exact_entry_set(s_cand[i].addr);
 }
 
 static int cache_idx_has_path(const char *path) {
@@ -1847,6 +1923,7 @@ void overlay_loader_rescan(void) {
     if (!s_active) return;
     scan_cache_dir();
     s_nchecked = 0;
+    lazy_miss_invalidate_loader();
 }
 
 /* Loaded-DLL set — the cache is ADDITIVE: a memory slot reused by several
@@ -1902,6 +1979,9 @@ static int load_one_dll(const char *dll_path) {
     free(man);
     if (registered <= 0) return 0;
 
+    /* The DLL may publish other PCs that were previously negative-cached. */
+    lazy_miss_invalidate_loader();
+
     if (s_nloaded_paths < MAX_LOADED_DLLS) {
         strncpy(s_loaded_paths[s_nloaded_paths], dll_path, 767);
         s_loaded_paths[s_nloaded_paths][767] = '\0';
@@ -1909,6 +1989,29 @@ static int load_one_dll(const char *dll_path) {
     }
     s_ndlls++;
     return registered;
+}
+
+int overlay_loader_load_published(const char *dll_path) {
+    if (!s_active || !dll_path || !dll_path[0]) return 0;
+    /* The compiler command is trusted local code, but keep its native-library
+     * output confined to the cache root the framework injected. */
+    size_t root_len = strlen(s_cache_dir);
+#ifdef _WIN32
+    if (_strnicmp(dll_path, s_cache_dir, root_len) != 0) return 0;
+#else
+    if (strncmp(dll_path, s_cache_dir, root_len) != 0) return 0;
+#endif
+    if (dll_path[root_len] != '/' && dll_path[root_len] != '\\') return 0;
+    const char *base = strrchr(dll_path, '/');
+    const char *win_base = strrchr(dll_path, '\\');
+    if (!base || (win_base && win_base > base)) base = win_base;
+    base = base ? base + 1 : dll_path;
+    uint32_t addr = 0, crc = 0;
+    if (!psx_overlay_cache_name_parse(base, &addr, &crc)) return 0;
+    (void)addr;
+    (void)crc;
+    if (dll_already_loaded(dll_path)) return 0;
+    return load_one_dll(dll_path);
 }
 
 static int lazy_man_contains(const ManFn *m, uint32_t phys) {
@@ -1983,12 +2086,14 @@ static void overlay_image_warm_seed_boot_text(void) {
     overlay_image_warm_queue(indices, count);
 }
 
-static int lazy_is_loadable(int li, uint32_t region_start, uint32_t phys) {
+static int lazy_is_loadable(int li, uint32_t region_start, uint32_t phys,
+                            int require_region_start) {
     if (li < 0 || li >= s_lazy_man_n) return 0;
     LazyMan *lm = &s_lazy_man[li];
     int ci = lm->cache_idx;
     if (ci < 0 || ci >= s_cache_idx_count) return 0;
-    return s_cache_idx[ci].region_start == region_start &&
+    return (!require_region_start ||
+            s_cache_idx[ci].region_start == region_start) &&
         !dll_already_loaded(s_cache_idx[ci].path) &&
         lazy_man_contains(&lm->fn, phys) && lazy_man_matches(lm);
 }
@@ -2059,12 +2164,24 @@ static int try_load_region(uint32_t phys) {
     for (int li = s_lazy_entry_head[bucket]; li >= 0;
          li = s_lazy_man[li].next_entry) {
         if ((s_lazy_man[li].fn.entry & 0x1FFFFFFFu) != phys) continue;
-        if (!lazy_is_loadable(li, region_start, phys)) continue;
-        if (fallback < 0) fallback = li;
+        /* This function is reached only for a real runtime dispatch at phys
+         * (external entry or CPS continuation). The manifest supplies exact
+         * code identity, and cross-region recovery below additionally requires
+         * every directly-owned function in the CPS bundle to match. The dirty
+         * bitmap is sticky across streamed
+         * variants, so walkback can recover an older adjacent run's base
+         * (e.g. 0x106000 instead of an exact live 0x108000 shard). Rejecting
+         * the exact entry on that heuristic strands valid DLLs forever. */
+        if (!lazy_is_loadable(li, region_start, phys, 0)) continue;
         int ci = s_lazy_man[li].cache_idx;
-        if (lazy_bundle_matches(ci) &&
-            (best < 0 || s_cache_idx[ci].func_count >
-                         s_cache_idx[s_lazy_man[best].cache_idx].func_count))
+        /* Cross-region recovery is safe only for a fully coherent CPS bundle.
+         * A partial exact-function match can have snapshot-specific internal
+         * tails, so retain it as fallback only when the heuristic base agrees. */
+        if (s_cache_idx[ci].region_start == region_start && fallback < 0)
+            fallback = li;
+        /* Entry chains are newest-first/semantic. Preserve their established
+         * order instead of substituting a larger historical bundle. */
+        if (lazy_bundle_matches(ci) && best < 0)
             best = li;
     }
 
@@ -2077,12 +2194,13 @@ static int try_load_region(uint32_t phys) {
              ri = s_lazy_range_links[ri].next) {
             int li = s_lazy_range_links[ri].cand;
             if ((s_lazy_man[li].fn.entry & 0x1FFFFFFFu) == phys) continue;
-            if (!lazy_is_loadable(li, region_start, phys)) continue;
+            /* Non-exact range ownership remains region-narrowed: unlike an
+             * exact manifested entry, an interior PC alone is not a unique
+             * identity for a reused-address CPS bundle. */
+            if (!lazy_is_loadable(li, region_start, phys, 1)) continue;
             if (fallback < 0) fallback = li;
             int ci = s_lazy_man[li].cache_idx;
-            if (lazy_bundle_matches(ci) &&
-                (best < 0 || s_cache_idx[ci].func_count >
-                             s_cache_idx[s_lazy_man[best].cache_idx].func_count))
+            if (lazy_bundle_matches(ci) && best < 0)
                 best = li;
         }
     }
@@ -2214,6 +2332,10 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * overlay-off + CPS game hit this and wedged at boot before any game code ran
      * (found via Ape Escape, the only overlay-off title). Fail closed here. */
     if (!s_active) return 0;
+    if (overlay_cache_window_contains(phys) && lazy_miss_cached(phys)) {
+        s_disp_interp++;
+        return 0;
+    }
     int lazy_loaded = 0;
 retry_candidates:
     int head = idx_head(phys);
@@ -2516,6 +2638,7 @@ retry_candidates:
         goto retry_candidates;
     }
 
+    if (overlay_cache_window_contains(phys)) lazy_miss_record(phys);
     s_disp_interp++;
     return 0;
 }
@@ -2644,8 +2767,7 @@ static uint64_t s_fp_seq = 0;
 
 int overlay_loader_is_candidate(uint32_t phys) {
     if (!s_active) return 0;
-    phys &= 0x1FFFFFFFu;
-    return idx_head(phys) >= 0 || lazy_has_exact_entry(phys);
+    return exact_entry_has(phys);
 }
 
 int overlay_fp_enabled(void) {

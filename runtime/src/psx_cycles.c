@@ -18,11 +18,13 @@
 
 uint64_t psx_cycle_count = 0;
 
-/* Throttle watchdog check to once per ~64K cycles to keep hot-path cost
- * negligible (most blocks emit 5-30 cycles, so the check fires every
- * ~2K-12K blocks). */
+/* Throttle diagnostic checks in debug-tool builds.  Production defines
+ * STARVATION_RING_ENABLED=0, so interpreted instructions do not pay two
+ * diagnostic global read/modify/writes on every cycle charge. */
+#if STARVATION_RING_ENABLED
 static uint32_t s_watchdog_throttle = 0;
 static uint32_t s_pc_sample_throttle = 0;
+#endif
 
 /* Conservative event-granularity diagnostic (set via debug cmd
  * overlay_native_event_granularity). Normally psx_advance_cycles charges a
@@ -77,6 +79,10 @@ static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here 
 static uint64_t s_next_service_cycle   = 0;  /* absolute; 0 = dirty, recompute  */
 static int      s_in_device_service    = 0;  /* re-entrancy guard               */
 
+/* Absolute inclusive limit for dirty_ram_interp.c's exact one-cycle path.
+ * Zero means that the next charge must visit psx_advance_cycles(). */
+uint64_t g_psx_cycle_fast_limit = 0;
+
 /* Distance to the nearest INTERNAL device event, mask-blind (i_mask =
  * all-unmasked). This is the chunking bound for catch-up: the sio/cdrom/dma
  * *_advance() functions fire at most ONE event boundary per call (their
@@ -115,10 +121,12 @@ static void psx_devices_recompute_deadline(void) {
     uint32_t next = devices_cycles_to_next_internal_event();
     if (next > PSX_DEADLINE_HARD_CAP) next = PSX_DEADLINE_HARD_CAP;
     s_next_service_cycle = psx_cycle_count + (uint64_t)next;
+    g_psx_cycle_fast_limit = s_next_service_cycle - 1u;
 }
 
 static void psx_devices_service_to_now(void) {
     if (s_in_device_service) return;                 /* device code charged cycles: absorb */
+    g_psx_cycle_fast_limit = 0;
     s_in_device_service = 1;
     uint64_t target = psx_cycle_count;
     if (s_devices_synced_cycle < target) {
@@ -151,6 +159,9 @@ void psx_devices_mmio_sync(void) {
         psx_devices_service_to_now();
     }
     s_next_service_cycle = 0;   /* recompute on the next charge */
+    /* Service-to-now republishes its old deadline.  Clear the inline limit
+     * after it returns because the MMIO operation can re-arm an earlier event. */
+    g_psx_cycle_fast_limit = 0;
 }
 
 /* Exact per-charge path (legacy semantics). Used by PSX_COSIM builds and the
@@ -185,6 +196,7 @@ static void psx_advance_cycles_exact(uint32_t cycles) {
     }
     s_devices_synced_cycle = psx_cycle_count;
     s_next_service_cycle   = 0;
+    g_psx_cycle_fast_limit = 0;
 }
 
 void psx_advance_cycles(uint32_t cycles) {
@@ -206,6 +218,7 @@ void psx_advance_cycles(uint32_t cycles) {
         }
     }
 #endif
+#if STARVATION_RING_ENABLED
     s_watchdog_throttle += charged_cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;
@@ -220,6 +233,9 @@ void psx_advance_cycles(uint32_t cycles) {
         s_pc_sample_throttle = 0;
         starvation_ring_pc_sample();
     }
+#else
+    (void)charged_cycles;
+#endif
 }
 
 uint64_t psx_get_cycle_count(void) {
@@ -423,6 +439,7 @@ void psx_cycles_resync_after_restore(void) {
     s_devices_synced_cycle = psx_cycle_count;
     s_next_service_cycle   = 0;   /* recompute on next charge */
     s_in_device_service    = 0;
+    g_psx_cycle_fast_limit = 0;
 }
 
 /* ---- Mult/div completion-stall timing (faithful R3000A; Beetle muldiv_ts_done) ----
