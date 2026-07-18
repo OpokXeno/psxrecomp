@@ -54,6 +54,55 @@ def prologue_offsets(data):
             if (struct.unpack_from('<I',data,off)[0]>>16)==0x27BD
             and (struct.unpack_from('<I',data,off)[0]&0x8000)]
 
+def _word(data, off):
+    return struct.unpack_from('<I', data, off)[0] if 0 <= off <= len(data)-4 else None
+
+def _callable_boundary(data, off):
+    """Strong local evidence that an in-file pointer names a callable entry."""
+    w = _word(data, off)
+    if w is None or w == 0:
+        return False
+    if (w >> 16) == 0x27BD and (w & 0x8000):
+        return True
+    # A return, arbitrary architectural delay slot, and up to six alignment
+    # NOPs is the same Psy-Q boundary accepted by overlay exact-entry mode.
+    for padding in range(7):
+        jr_off = off - 8 - padding*4
+        if _word(data, jr_off) != 0x03E00008:
+            continue
+        if all(_word(data, p) == 0 for p in range(jr_off+8, off, 4)):
+            return True
+    return False
+
+def pointer_table_targets(data, base):
+    """Callable targets from dense in-file function-pointer tables.
+
+    A run needs at least three adjacent in-range pointers, and each promoted
+    target independently needs a prologue/return boundary. This deliberately
+    refuses isolated pointer-shaped data and mid-function dispatch labels.
+    """
+    lo, hi = base, base + len(data)
+    words = [_word(data, off) for off in range(0, len(data)-3, 4)]
+    in_range = lambda value: value is not None and (value & 3) == 0 and lo <= value < hi
+    targets = set()
+    start = 0
+    while start < len(words):
+        if not in_range(words[start]):
+            start += 1
+            continue
+        end = start + 1
+        while end < len(words) and in_range(words[end]):
+            end += 1
+        if end - start >= 3:
+            for value in words[start:end]:
+                if _callable_boundary(data, value-base):
+                    targets.add(value)
+        start = end
+    return targets
+
+def supplemental_callable_seeds(data, base):
+    return pointer_table_targets(data, base)
+
 def jal_targets(data):
     """Distinct absolute jal call targets. These are BASE-INDEPENDENT: the target
     is 0x80000000 | (imm26<<2) regardless of where the file loads, because all
@@ -295,7 +344,9 @@ def main():
         # the old prologue-density delta-sweep, which matched export pointers
         # against prologues they never point at -> wrong base by 2-16KB).
         base,score=rb
-        seeds=prologues(data,base)   # seed via full-file prologue scan
+        prologue_seeds=prologues(data,base)
+        supplemental=supplemental_callable_seeds(data,base)
+        seeds=sorted(set(prologue_seeds)|supplemental)
         # SUPPLEMENT the prologue seeds with the overlay's OWN export/dispatch
         # table (the header pointers) — the game's authoritative list of live
         # entry points, sitting on the disc (play-free). These are exactly the
@@ -319,7 +370,8 @@ def main():
         extra=len(set(hdr_entries)-set(seeds))
         print(f"  [header-table] {p}: {len(data)}B file@0x{base:08X} "
               f"region@0x{page_base:08X}(+{fill}) "
-              f"({fit_method} score={score}), prologue seeds={len(seeds)} "
+              f"({fit_method} score={score}), prologue seeds={len(prologue_seeds)} "
+              f"+{len(supplemental-set(prologue_seeds))} pointer-table seeds "
               f"+{extra} export-table dispatch entries")
 
     # Some engines keep call-dense position-fixed code in raw siblings whose
@@ -331,7 +383,9 @@ def main():
         rb=recover_raw_base(data, raw_base_lo)
         if rb is None: continue
         base,score,second=rb
-        seeds=prologues(data,base)
+        prologue_seeds=prologues(data,base)
+        supplemental=supplemental_callable_seeds(data,base)
+        seeds=sorted(set(prologue_seeds)|supplemental)
         page_base=base&~0xFFF
         fill=base-page_base
         region=b'\x00'*fill+data
@@ -341,7 +395,8 @@ def main():
         print(f"  [raw-code] {p}: {len(data)}B file@0x{base:08X} "
               f"region@0x{page_base:08X}(+{fill}) "
               f"(strict jal-fit score={score}, runner-up={second}), "
-              f"prologue seeds={len(seeds)}")
+              f"prologue seeds={len(prologue_seeds)} "
+              f"+{len(supplemental-set(prologue_seeds))} pointer-table seeds")
 
     # Runtime dirty-page capture coalesces directly adjacent producers into one
     # region keyed by the earlier page. Emit each provable two-file composition

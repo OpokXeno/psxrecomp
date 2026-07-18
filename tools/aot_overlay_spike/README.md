@@ -145,6 +145,12 @@ This avoids generating duplicate overlay shards for code that is already native.
    retains normal-mode frameless leaves aligned by NOPs after a preceding return;
    this added 13 clean MAIN definitions and closed every remaining MAIN code-range
    gap. The generated-C audit remains zero unsupported / zero bad targets.
+   Position-fixed producers also scan dense runs of at least three in-range
+   function pointers. A target is promoted only when it independently has a
+   prologue or preceding return boundary, so isolated pointer-shaped data and
+   mid-function labels remain excluded. Read-only Tomba 1 regression data proves
+   this finds its indirect-only leaves at 0x80111BB4/0x80111BCC; all 11 new
+   Tomba 2 targets audit cleanly in their standalone image variants.
 2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
 3. ~~Recover weak-signal A09/A0J/GAME/OPN~~ — DONE. They are ordinary uncompressed
    MIPS, not archives. Counting only callable `jal` targets sharply resolves

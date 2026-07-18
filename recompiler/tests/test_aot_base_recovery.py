@@ -35,6 +35,24 @@ def main():
     struct.pack_into("<I", data, 4, 0x0C000000 | ((0x80105678 >> 2) & 0x03FFFFFF))
     assert MOD.jal_targets(data) == {0x80105678}
 
+    # Dense function-pointer tables may recover framed or frameless functions,
+    # but only when every target has independent callable-boundary evidence.
+    base = 0x80100000
+    data = bytearray(0x100)
+    # Three adjacent leaves, each immediately after a previous return.
+    for off in (0x18, 0x28, 0x38):
+        struct.pack_into('<I', data, off-8, 0x03E00008)
+        struct.pack_into('<I', data, off-4, 0x00000000)
+        struct.pack_into('<I', data, off, 0x24020001)
+    for i, off in enumerate((0x18, 0x28, 0x38)):
+        struct.pack_into('<I', data, 0x80+i*4, base+off)
+    assert MOD.pointer_table_targets(data, base) == {
+        base+0x18, base+0x28, base+0x38}
+    # An isolated pointer-shaped word is intentionally insufficient.
+    struct.pack_into('<I', data, 0x80, 0)
+    struct.pack_into('<I', data, 0x84, 0)
+    assert MOD.pointer_table_targets(data, base) == set()
+
     print("ALL PASS")
 
 
