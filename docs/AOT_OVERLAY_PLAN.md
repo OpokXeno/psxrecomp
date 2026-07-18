@@ -1,9 +1,17 @@
 # AOT Overlay Sharding — Spike Findings & Plan (Tomba-first)
 
-Status: SPIKE / DESIGN (2026-07-17). Not yet executed.
+Status: ENHANCEMENT SPIKE (2026-07-17). Foundation executed and live-proven.
 Author: investigation via 4 parallel agents + adversarial source verification.
 Scope: can we move overlay sharding from *runtime discovery* to *build-time (AOT)*,
 starting with Tomba (SCUS-94236)?
+
+Current Tomba 2 checkpoint: generic play-free extraction emits 23 clean regions;
+all 23 compile under `cg5_d0a05489`. Direct-call frameless-leaf discovery raised
+full-playthrough-vault entry recall from 1113/1856 (60.0%) to 1187/1856 (64.0%),
+and entry+code_crc recall from 1012 to 1084. All 74 newly covered vault entries are
+in MAIN.EXE. The remaining manifest has 669 misses: 268 MAIN.EXE, 356 overlay-window,
+and 45 kernel/low-memory entries. Runtime static-only smoke loaded the new tag with
+`stale_blocked=0`; misses continue to fail safely to the interpreter via CRC guards.
 
 ---
 

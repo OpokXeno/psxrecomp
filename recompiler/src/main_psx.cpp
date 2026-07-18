@@ -420,7 +420,9 @@ int main(int argc, char** argv) {
      * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
      * exactly these PCs, so they are real execution roots even though no
      * prologue / preceding jr $ra exists. They are trusted walk roots and
-     * exempt from the overlay-mode boundary re-check below.
+         * exempt from the overlay-mode boundary re-check below.  Lines of the
+         * form `call_root 0xXXXXXXXX` carry the same mechanical trust for a
+         * statically proven direct or constant-register call/tail-call target.
      *
      * Seeds are accepted within the loaded image's own bounds — overlay mode
      * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
@@ -429,6 +431,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> file_seeds;
     std::vector<uint32_t> interior_seeds;
     std::set<uint32_t>    trusted_root_seeds;
+    std::set<uint32_t>    trusted_call_root_seeds;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
@@ -439,6 +442,7 @@ int main(int argc, char** argv) {
                 if (line.empty() || line[0] == '#') continue;
                 bool interior = false;
                 bool trusted_root = false;
+                bool trusted_call_root = false;
                 const char* p = line.c_str();
                 if (line.rfind("interior", 0) == 0) {
                     interior = true;
@@ -446,6 +450,9 @@ int main(int argc, char** argv) {
                 } else if (line.rfind("dispatch_root", 0) == 0) {
                     trusted_root = true;
                     p += 13;
+                } else if (line.rfind("call_root", 0) == 0) {
+                    trusted_call_root = true;
+                    p += 9;
                 }
                 uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
                 if (addr >= seed_lo && addr < seed_hi) {
@@ -453,15 +460,17 @@ int main(int argc, char** argv) {
                         interior_seeds.push_back(addr);
                     } else {
                         if (trusted_root) trusted_root_seeds.insert(addr);
+                        if (trusted_call_root) trusted_call_root_seeds.insert(addr);
                         file_seeds.push_back(addr);
                         exact_entries.push_back(addr);
                     }
                 }
             }
             fmt::print("Loaded {} extra function addresses ({} interior, "
-                       "{} dispatch-root) from {}\n",
+                       "{} dispatch-root, {} call-root) from {}\n",
                        file_seeds.size() + interior_seeds.size(),
                        interior_seeds.size(), trusted_root_seeds.size(),
+                       trusted_call_root_seeds.size(),
                        extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
@@ -506,6 +515,10 @@ int main(int argc, char** argv) {
                  * execution root despite having no callable boundary. */
                 fmt::print("  seed 0x{:08X} accepted as dispatch root "
                            "(install-slot class, no boundary evidence)\n", a);
+                roots.insert(a);
+            } else if (trusted_call_root_seeds.count(a)) {
+                fmt::print("  seed 0x{:08X} accepted as static call root "
+                           "(direct/constant-register target)\n", a);
                 roots.insert(a);
             } else if (callable_boundary(a)) {
                 roots.insert(a);

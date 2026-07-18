@@ -281,6 +281,7 @@ def make_psxexe(load_addr: int, entry_pc: int, data: bytes) -> bytes:
 INCLUDE_REASONS = {
     'DISPATCH_ENTRY',
     'DIRECT_JAL_TARGET',
+    'STATIC_INDIRECT_TARGET',
     'FUNCTION_POINTER_TARGET',
     'TOML_DECLARED_ENTRY',
     # Dispatch-proven PC with no callable boundary (mid-function code reached
@@ -504,6 +505,64 @@ def _callable_direct_jal_target(data: bytes, load_addr: int, addr: int) -> bool:
     return _callable_legacy_seed(data, load_addr, addr)
 
 
+def _instruction_writes_gpr(word: int, reg: int) -> bool:
+    if not reg:
+        return False
+    op = (word >> 26) & 0x3F
+    rs = (word >> 21) & 0x1F
+    rt = (word >> 16) & 0x1F
+    rd = (word >> 11) & 0x1F
+    fn = word & 0x3F
+    if op == 0:
+        if fn in (0x08, 0x0C, 0x0D, 0x11, 0x13,
+                  0x18, 0x19, 0x1A, 0x1B):
+            return False
+        return rd == reg
+    if op == 0x03:
+        return reg == 31
+    if op == 0x01 and rt in (0x10, 0x11):
+        return reg == 31
+    if op in range(0x08, 0x10) or op in range(0x20, 0x27) \
+            or op in (0x30, 0x32):
+        return rt == reg
+    if op in (0x10, 0x12) and rs in (0, 2):
+        return rt == reg
+    return False
+
+
+def _resolve_constant_transfer(data: bytes, load_addr: int,
+                               entry: int, transfer_pc: int,
+                               target_reg: int):
+    """Resolve a same-basic-block lui + addiu/ori constant feeding jr/jalr."""
+    low = None
+    low_is_addiu = False
+    for count in range(1, 17):
+        pc = transfer_pc - count * 4
+        if pc < entry:
+            break
+        word = _word_at(data, load_addr, pc)
+        if word is None:
+            break
+        op = (word >> 26) & 0x3F
+        rs = (word >> 21) & 0x1F
+        rt = (word >> 16) & 0x1F
+        if low is None and op in (0x09, 0x0D) \
+                and rs == target_reg and rt == target_reg:
+            low = word & 0xFFFF
+            low_is_addiu = op == 0x09
+            continue
+        if op == 0x0F and rt == target_reg:
+            upper = (word & 0xFFFF) << 16
+            if low is None:
+                return upper
+            if low_is_addiu and low & 0x8000:
+                low -= 0x10000
+            return (upper + low) & 0xFFFFFFFF if low_is_addiu else upper | low
+        if _instruction_writes_gpr(word, target_reg) or _is_control_flow(word):
+            break
+    return None
+
+
 def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                            entry: int, hard_cap: int) -> dict:
     lo = load_addr
@@ -515,6 +574,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     work = deque([entry])
     visited = set()
     direct_jals = set()
+    static_indirect_targets = set()
     branch_targets = set()
     jump_table_targets = set()
 
@@ -554,7 +614,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
             if (lo <= target < hi and (target & 3) == 0 and
-                    _callable_direct_jal_target(data, load_addr, target)):
+                    _is_valid_mips_word(_word_at(data, load_addr, target))):
                 direct_jals.add(target)
         elif kind == 'jalr':
             if in_function(delay):
@@ -562,16 +622,29 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
+            target_reg = (word >> 21) & 0x1F
+            target = _resolve_constant_transfer(data, load_addr, entry, pc,
+                                                target_reg)
+            if target is not None and lo <= target < hi and (target & 3) == 0:
+                static_indirect_targets.add(target)
         elif kind == 'jr':
             if in_function(delay):
                 visited.add(delay)
             jr_rs = (word >> 21) & 0x1F
-            for jt in _find_jump_table_targets(data, load_addr, size,
-                                               entry, hard_cap, pc, jr_rs):
-                jump_table_targets.add(jt)
-                branch_targets.add(jt)
-                if in_function(jt):
-                    work.append(jt)
+            target = _resolve_constant_transfer(data, load_addr, entry, pc, jr_rs)
+            if target is not None and lo <= target < hi and (target & 3) == 0:
+                if in_function(target):
+                    branch_targets.add(target)
+                    work.append(target)
+                else:
+                    static_indirect_targets.add(target)
+            else:
+                for jt in _find_jump_table_targets(data, load_addr, size,
+                                                   entry, hard_cap, pc, jr_rs):
+                    jump_table_targets.add(jt)
+                    branch_targets.add(jt)
+                    if in_function(jt):
+                        work.append(jt)
         elif kind == 'jr_ra':
             if in_function(delay):
                 visited.add(delay)
@@ -579,6 +652,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     return {
         'visited': visited,
         'direct_jals': direct_jals,
+        'static_indirect_targets': static_indirect_targets,
         'branch_targets': branch_targets,
         'jump_table_targets': jump_table_targets,
     }
@@ -679,14 +753,19 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                     not _callable_legacy_seed(data, load_addr, addr)):
                 included.setdefault(addr, 'DISPATCH_INTERIOR')
                 return
-        elif (reason != 'TOML_DECLARED_ENTRY' and addr in jump_table_targets and
+        elif (reason not in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                             'TOML_DECLARED_ENTRY') and
+                addr in jump_table_targets and
                 not _callable_legacy_seed(data, load_addr, addr)):
             excluded[addr] = 'BRANCH_TARGET_ONLY'
             return
         if reason in FATAL_SEED_REASONS:
             raise RuntimeError(f'BUG: refusing to include 0x{addr:08X} as {reason}')
         old = included.get(addr)
-        if old is None or old in ('FUNCTION_POINTER_TARGET', 'DISPATCH_INTERIOR'):
+        if reason in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET'):
+            # Static call-edge evidence outranks heuristic capture metadata.
+            included[addr] = reason
+        elif old is None or old in ('FUNCTION_POINTER_TARGET', 'DISPATCH_INTERIOR'):
             included[addr] = reason
 
     for addr in dispatch_entry_pcs:
@@ -725,11 +804,18 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             all_branch_targets.update(walk['branch_targets'])
             all_branch_targets.update(walk['jump_table_targets'])
             for target in sorted(walk['direct_jals']):
-                if target not in known:
-                    include(target, 'DIRECT_JAL_TARGET')
-                    if target in included:
-                        known.add(target)
-                        pending.append(target)
+                # Always re-include: a target may already be present as a
+                # heuristic FUNCTION_POINTER_TARGET.  Reachable JAL evidence
+                # upgrades it to a trusted call root.
+                include(target, 'DIRECT_JAL_TARGET')
+                if target in included and target not in known:
+                    known.add(target)
+                    pending.append(target)
+            for target in sorted(walk['static_indirect_targets']):
+                include(target, 'STATIC_INDIRECT_TARGET')
+                if target in included and target not in known:
+                    known.add(target)
+                    pending.append(target)
 
         if not kernel_window:
             break
@@ -810,6 +896,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             return f'interior 0x{addr:08X}'
         if r == 'DISPATCH_ROOT':
             return f'dispatch_root 0x{addr:08X}'
+        if r in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET'):
+            return f'call_root 0x{addr:08X}'
         return f'0x{addr:08X}'
     seeds = [seed_line(addr) for addr in sorted(included)]
     return seeds, audit
@@ -822,6 +910,7 @@ def print_seed_audit(audit: dict) -> None:
     print(f'dispatch_entry_pcs: {len(audit["dispatch_entry_pcs"])}')
     print(f'function_entry_pcs: {len(audit["function_entry_pcs"])}')
     print(f'direct_jal_targets_included: {audit["counts"].get("DIRECT_JAL_TARGET", 0)}')
+    print(f'static_indirect_targets_included: {audit["counts"].get("STATIC_INDIRECT_TARGET", 0)}')
     print(f'function_pointer_targets_included: {audit["counts"].get("FUNCTION_POINTER_TARGET", 0)}')
     print(f'toml_entries_included: {audit["counts"].get("TOML_DECLARED_ENTRY", 0)}')
     print(f'dispatch_interior_included: {audit["counts"].get("DISPATCH_INTERIOR", 0)}')

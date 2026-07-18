@@ -128,9 +128,14 @@ def main():
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
         md.append(f'- **MISSED live: {r["missed"]}**\n')
 
-    os.makedirs(os.path.dirname(a.out_md), exist_ok=True)
-    open(a.out_md, 'w', encoding='utf-8').write('\n'.join(md))
-    json.dump(report, open(a.out_json, 'w'), indent=1)
+    for output_path in (a.out_md, a.out_json):
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(output_dir, exist_ok=True)
+    with open(a.out_md, 'w', encoding='utf-8', newline='\n') as out_md:
+        out_md.write('\n'.join(md).rstrip('\n') + '\n')
+    with open(a.out_json, 'w', encoding='utf-8', newline='\n') as out_json:
+        json.dump(report, out_json, indent=1)
+        out_json.write('\n')
     print(f'wrote {a.out_md}')
     print(f'wrote {a.out_json}')
     for src, m in report['sources'].items():

@@ -60,16 +60,18 @@ int main() {
     auto image = make_exe_buffer(0x2000);
     const size_t text = 2048;
 
-    // Root: direct call to a callable target, unresolved jalr, direct call
-    // beyond the eventual bound, then return.
+    // Root: direct call to a framed target, direct call to a frameless leaf,
+    // unresolved jalr, direct call beyond the eventual bound, then return.
     put32(image, text + 0x00, jal(kLoad + 0x100));
     put32(image, text + 0x04, 0x00000000u);
-    put32(image, text + 0x08, 0x0320F809u); // jalr $ra,$t9 (unresolved)
+    put32(image, text + 0x08, jal(kLoad + 0x300));
     put32(image, text + 0x0C, 0x00000000u);
-    put32(image, text + 0x10, jal(kLoad + 0x1100));
+    put32(image, text + 0x10, 0x0320F809u); // jalr $ra,$t9 (unresolved)
     put32(image, text + 0x14, 0x00000000u);
-    put32(image, text + 0x18, 0x03E00008u);
+    put32(image, text + 0x18, jal(kLoad + 0x1100));
     put32(image, text + 0x1C, 0x00000000u);
+    put32(image, text + 0x20, 0x03E00008u);
+    put32(image, text + 0x24, 0x00000000u);
 
     // Callable direct target.
     put32(image, text + 0x100, 0x27BDFFF0u);
@@ -80,6 +82,12 @@ int main() {
     put32(image, text + 0x200, 0x27BDFFF0u);
     put32(image, text + 0x204, 0x03E00008u);
     put32(image, text + 0x208, 0x27BD0010u);
+
+    // A direct JAL is sufficient callable-boundary evidence even when the
+    // target is a tiny frameless leaf.
+    put32(image, text + 0x300, 0x24020001u); // addiu $v0,$zero,1
+    put32(image, text + 0x304, 0x03E00008u);
+    put32(image, text + 0x308, 0x00000000u);
 
     // Callable target outside the verified static bound.
     put32(image, text + 0x1100, 0x27BDFFF0u);
@@ -95,12 +103,48 @@ int main() {
 
     PSXRecomp::FunctionAnalyzer analyzer(exe);
     const auto reachable = starts(analyzer.analyze_exact_entries({kLoad}));
-    CHECK(reachable == std::set<uint32_t>({kLoad, kLoad + 0x100}),
-          "reachable analysis follows direct callable JAL only");
+    CHECK(reachable == std::set<uint32_t>({kLoad, kLoad + 0x100,
+                                           kLoad + 0x300}),
+          "reachable analysis follows framed and frameless direct JAL targets");
     CHECK(!reachable.count(kLoad + 0x200),
           "unseen indirect callback fails closed");
     CHECK(!reachable.count(kLoad + 0x1100),
           "direct target beyond verified bound fails closed");
+
+    // A constant-register JR out of the current function is a statically
+    // proven tail call.  Resolve the common lui/addiu/jr sequence without an
+    // execution-derived seed.
+    auto indirect_image = make_exe_buffer(0x1000, kLoad + 0x500);
+    put32(indirect_image, text + 0x400, 0x24020001u);
+    put32(indirect_image, text + 0x404, 0x03E00008u);
+    put32(indirect_image, text + 0x408, 0x00000000u);
+    put32(indirect_image, text + 0x500, 0x3C088001u); // lui $t0,0x8001
+    put32(indirect_image, text + 0x504, 0x25080400u); // addiu $t0,$t0,0x400
+    put32(indirect_image, text + 0x508, 0x01000008u); // jr $t0
+    put32(indirect_image, text + 0x50C, 0x00000000u);
+    auto indirect_exe = parse(indirect_image);
+    PSXRecomp::FunctionAnalyzer indirect_analyzer(indirect_exe);
+    const auto indirect = starts(
+        indirect_analyzer.analyze_exact_entries({kLoad + 0x500}));
+    CHECK(indirect.count(kLoad + 0x400) && indirect.count(kLoad + 0x500),
+          "constant-register JR discovers its frameless tail-call target");
+
+    // A packed BIOS thunk is also a backward-scan boundary.  The frameless
+    // leaf after its delay slot must not be swallowed into the thunk run.
+    auto thunk_image = make_exe_buffer(0x1000);
+    put32(thunk_image, text + 0x600, 0x240A00B0u);
+    put32(thunk_image, text + 0x604, 0x01400008u);
+    put32(thunk_image, text + 0x608, 0x24090008u);
+    put32(thunk_image, text + 0x60C, 0x00000000u);
+    put32(thunk_image, text + 0x610, 0x24020001u);
+    put32(thunk_image, text + 0x614, 0x03E00008u);
+    put32(thunk_image, text + 0x618, 0x00000000u);
+    auto thunk_exe = parse(thunk_image);
+    PSXRecomp::FunctionAnalyzer thunk_analyzer(thunk_exe);
+    const auto thunk_starts = starts(thunk_analyzer.analyze());
+    CHECK(thunk_starts.count(kLoad + 0x600) &&
+          thunk_starts.count(kLoad + 0x610),
+          "packed BIOS thunk bounds the following frameless leaf");
 
     PSXRecomp::FunctionAnalyzer seeded_analyzer(exe);
     const auto seeded = starts(

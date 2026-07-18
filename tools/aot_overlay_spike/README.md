@@ -28,10 +28,12 @@ discovery quality, not to be run as-is in a build.
 
 - **Tomba 1:** 90% of played functions reproduced play-free + ~1964 unplayed
   extra; live-validated in-game (Dwarf Village went native, no runtime compile).
-- **Tomba 2:** 661 functions byte-identical (entry+code_crc) to the shipped/played
-  vault — provably real — from the MAIN.EXE producer. The BIN header-table producer
-  now recovers a correct, self-consistent common base (jal-fit, below) — 21 A*.BIN
-  overlays converge on region 0x80108000 (+3996), 4 weak-signal files safely skipped.
+- **Tomba 2:** the clean play-free cache now covers 1187/1856 played entries
+  (**64.0%**) and byte-matches 1084 (**58.4% entry+code_crc**). Direct-call
+  provenance for frameless leaves added 74 MAIN.EXE hits over the 60.0% baseline.
+  The BIN header-table producer recovers a correct, self-consistent common base
+  (jal-fit, below): 21 A*.BIN overlays converge on region 0x80108000 (+3996), with
+  4 weak-signal files safely skipped.
 
 ## Correctness guarantee (why partial coverage is safe)
 
@@ -82,8 +84,12 @@ misses, production autocompile (tcc/gcc) self-heals on first visit.
 
 ## Next to raise coverage (future session)
 
-1. Frameless-leaf + indirect-call-table seed discovery (helps every game; would
-   lift MAIN.EXE past ~62% and Tomba 1 past 90%).
+1. ~~Direct-call frameless-leaf discovery~~ — DONE. Reachable `jal` targets are
+   emitted as trusted `call_root` seeds; same-basic-block constant-register
+   `jalr`/tail-`jr` targets are resolved with clobber checks. Tomba 2 vault recall
+   rose 60.0% -> 64.0% (+74 MAIN.EXE entries), with 23/23 shards compiling cleanly.
+   Continue with statically proven function-pointer/jump-table consumers; the
+   first corpus sweep correctly rejected apparent constants clobbered by `lw`.
 2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
 3. Recover the weak-signal skipped overlays (Tomba 2 A09/A0J/GAME/OPN): likely
    compressed/archived or too few intra-overlay calls; may need a decompressor or

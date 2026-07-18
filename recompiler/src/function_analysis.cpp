@@ -392,6 +392,19 @@ uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
             // from the previous function's trailing gap.
             return skip_leading_padding_nops(exe_, search_addr + 8, return_addr);
         }
+
+        // Packed Psy-Q BIOS thunks tail-jump through A0/B0/C0 and therefore do
+        // not contain `jr $ra`.  Treat their JR delay slot as a real boundary
+        // while scanning backward, otherwise the following frameless routine
+        // is swallowed into the whole preceding thunk run.
+        if (search_addr >= exe_.header.load_address + 4u) {
+            uint32_t thunk_jr = 0;
+            if (is_bios_dispatch_thunk(search_addr - 4u, thunk_jr) &&
+                thunk_jr == search_addr) {
+                return skip_leading_padding_nops(exe_, search_addr + 8u,
+                                                 return_addr);
+            }
+        }
     }
 
     // Couldn't find clear start, assume max search distance
@@ -506,6 +519,96 @@ static uint32_t exact_jump_target(uint32_t pc, uint32_t instr) {
     return ((pc + 4u) & 0xF0000000u) | ((instr & 0x03FFFFFFu) << 2);
 }
 
+static bool exact_instruction_writes_gpr(uint32_t instr, uint32_t reg) {
+    if (reg == 0u) return false;
+
+    uint32_t opcode = (instr >> 26) & 0x3Fu;
+    uint32_t rs = (instr >> 21) & 0x1Fu;
+    uint32_t rt = (instr >> 16) & 0x1Fu;
+    uint32_t rd = (instr >> 11) & 0x1Fu;
+    uint32_t funct = instr & 0x3Fu;
+
+    if (opcode == 0x00u) {
+        // SPECIAL instructions with a GPR destination use rd.  JR, stores to
+        // HI/LO, multiply/divide, syscall, and break have no GPR result.
+        switch (funct) {
+        case 0x08u: case 0x0Cu: case 0x0Du:
+        case 0x11u: case 0x13u:
+        case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
+            return false;
+        default:
+            return rd == reg;
+        }
+    }
+    if (opcode == 0x03u) return reg == 31u; // JAL
+    if (opcode == 0x01u && (rt == 0x10u || rt == 0x11u)) return reg == 31u;
+
+    // Immediate ALU ops, LUI, and loads write rt.  Branches and stores do not.
+    if ((opcode >= 0x08u && opcode <= 0x0Fu) ||
+        (opcode >= 0x20u && opcode <= 0x26u) ||
+        opcode == 0x30u || opcode == 0x32u) {
+        return rt == reg;
+    }
+    // MFC/CFC from COP0/COP2 write rt; MTC/CTC do not.
+    if ((opcode == 0x10u || opcode == 0x12u) && (rs == 0u || rs == 2u)) {
+        return rt == reg;
+    }
+    return false;
+}
+
+// Resolve the common absolute indirect-transfer idiom within one basic block:
+//
+//   lui    rN, hi(target)
+//   addiu/ori rN, rN, lo(target)
+//   jr/jalr rN
+//
+// The backward scan stops at control flow or any intervening write to rN, so a
+// stale constant from another path cannot be mistaken for the transfer target.
+static bool exact_resolve_constant_transfer(const PS1Executable& exe,
+                                            uint32_t entry,
+                                            uint32_t transfer_pc,
+                                            uint32_t target_reg,
+                                            uint32_t& target_out) {
+    bool have_low = false;
+    bool low_is_addiu = false;
+    uint16_t low = 0;
+
+    for (uint32_t count = 1; count <= 16u; count++) {
+        uint32_t bytes = count * 4u;
+        if (transfer_pc < entry + bytes) break;
+        uint32_t pc = transfer_pc - bytes;
+        auto word_opt = exe.read_word(pc);
+        if (!word_opt.has_value()) break;
+        uint32_t instr = *word_opt;
+        uint32_t opcode = (instr >> 26) & 0x3Fu;
+        uint32_t rs = (instr >> 21) & 0x1Fu;
+        uint32_t rt = (instr >> 16) & 0x1Fu;
+
+        if (!have_low && (opcode == 0x09u || opcode == 0x0Du) &&
+            rs == target_reg && rt == target_reg) {
+            have_low = true;
+            low_is_addiu = opcode == 0x09u;
+            low = static_cast<uint16_t>(instr & 0xFFFFu);
+            continue;
+        }
+        if (opcode == 0x0Fu && rt == target_reg) {
+            uint32_t upper = (instr & 0xFFFFu) << 16;
+            if (!have_low) {
+                target_out = upper;
+            } else if (low_is_addiu) {
+                target_out = upper + static_cast<uint32_t>(
+                    static_cast<int32_t>(static_cast<int16_t>(low)));
+            } else {
+                target_out = upper | low;
+            }
+            return true;
+        }
+        if (exact_instruction_writes_gpr(instr, target_reg)) break;
+        if (FunctionAnalyzer::is_branch_or_jump(instr)) break;
+    }
+    return false;
+}
+
 static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
     ExactCf cf;
     uint32_t opcode = (instr >> 26) & 0x3Fu;
@@ -557,22 +660,11 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
 
     auto callable_direct_jal_target = [&](uint32_t addr) {
         auto word_opt = exe_.read_word(addr);
-        if (!word_opt.has_value() || !exact_is_valid_mips_word(*word_opt)) return false;
-        if (addr == exe_.header.load_address) return true;
-
-        if (addr >= exe_.header.load_address + 8u) {
-            auto prev8_opt = exe_.read_word(addr - 8u);
-            if (prev8_opt.has_value() && exact_is_jr_ra_word(*prev8_opt)) return true;
-        }
-
-        if (exact_is_addiu_sp_neg(*word_opt)) {
-            if (addr < exe_.header.load_address + 4u) return true;
-            auto prev_opt = exe_.read_word(addr - 4u);
-            if (!prev_opt.has_value()) return true;
-            return exact_classify_cf(addr - 4u, *prev_opt).kind == ExactCfKind::Normal;
-        }
-
-        return false;
+        // A JAL encountered by the reachable CFG walk is direct call evidence.
+        // Requiring a stack prologue here discarded legitimate frameless leaf
+        // functions and tiny library wrappers.  The target still has to decode
+        // as a valid PS1 instruction and lie inside the verified image bound.
+        return word_opt.has_value() && exact_is_valid_mips_word(*word_opt);
     };
 
     auto find_jump_table_targets = [&](uint32_t entry, uint32_t hard_cap,
@@ -703,6 +795,15 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
             case ExactCfKind::Jalr:
                 if (in_function(delay)) wr.visited.insert(delay);
                 if (in_function(pc + 8u)) work.push(pc + 8u);
+                {
+                    uint32_t target = 0;
+                    uint32_t target_reg = (instr >> 21) & 0x1Fu;
+                    if (exact_resolve_constant_transfer(exe_, entry, pc,
+                                                        target_reg, target) &&
+                        in_exe(target)) {
+                        wr.direct_jal_targets.insert(target);
+                    }
+                }
                 break;
             case ExactCfKind::JrRa:
                 if (in_function(delay)) wr.visited.insert(delay);
@@ -712,9 +813,23 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector
                 if (in_function(delay)) wr.visited.insert(delay);
                 {
                     uint32_t jr_rs = (instr >> 21) & 0x1Fu;
-                    for (uint32_t target : find_jump_table_targets(entry, hard_cap, pc, jr_rs)) {
-                        wr.jump_table_targets.insert(target);
-                        if (in_function(target)) work.push(target);
+                    uint32_t target = 0;
+                    if (exact_resolve_constant_transfer(exe_, entry, pc, jr_rs,
+                                                        target)) {
+                        if (in_function(target)) {
+                            wr.jump_table_targets.insert(target);
+                            work.push(target);
+                        } else if (in_exe(target)) {
+                            // An absolute JR out of the current function is a
+                            // statically proven tail-call entry.
+                            wr.direct_jal_targets.insert(target);
+                        }
+                    } else {
+                        for (uint32_t jt : find_jump_table_targets(entry, hard_cap,
+                                                                   pc, jr_rs)) {
+                            wr.jump_table_targets.insert(jt);
+                            if (in_function(jt)) work.push(jt);
+                        }
                     }
                 }
                 break;
@@ -1286,13 +1401,21 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
                 break;
             case ExactCfKind::JrOther: {
                 if (in_fn(delay)) visited.insert(delay);
-                std::vector<uint32_t> jt;
                 uint32_t jr_rs = (instr >> 21) & 0x1Fu;
-                if (resolve_jt_p3(entry, hard_cap, pc, jr_rs, jt)) {
+                uint32_t constant_target = 0;
+                if (exact_resolve_constant_transfer(exe_, entry, pc, jr_rs,
+                                                    constant_target)) {
                     resolved_jt = true;
-                    for (uint32_t t : jt) if (in_fn(t)) work.push(t);
+                    if (in_fn(constant_target)) work.push(constant_target);
+                    else reached_exit = true;
                 } else {
-                    unresolved_indirect = true;  // computed jump we can't bound
+                    std::vector<uint32_t> jt;
+                    if (resolve_jt_p3(entry, hard_cap, pc, jr_rs, jt)) {
+                        resolved_jt = true;
+                        for (uint32_t t : jt) if (in_fn(t)) work.push(t);
+                    } else {
+                        unresolved_indirect = true;  // computed jump we can't bound
+                    }
                 }
                 break;
             }
