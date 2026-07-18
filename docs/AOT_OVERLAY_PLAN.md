@@ -184,6 +184,9 @@ manufacture overlay shards merely to duplicate those already-native BIOS bodies.
    Rebuilding identical region bytes also imports prior overlapping alias groups
    as non-root `retained_alias` bodies. This makes discovery additive: newly
    proven frameless roots cannot hard-cap and erase an older indirect-entry body.
+   A reachable direct branch that crosses a sibling-entry hard cap may add its
+   target as a static root only when a bounded target-local CFG reaches a return
+   without invalid words or sequential escape.
 5. `--static` mode instead namespaces the C and folds variants into
    `overlays_static.c` linked directly into the binary, dispatched via a generated
    `psx_overlay_dispatch()` — **this is already an AOT delivery path**; it moves

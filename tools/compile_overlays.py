@@ -282,6 +282,7 @@ INCLUDE_REASONS = {
     'DISPATCH_ENTRY',
     'DIRECT_JAL_TARGET',
     'STATIC_INDIRECT_TARGET',
+    'STATIC_BRANCH_ROOT',
     # Play-free normal-mode discovery entry that also passes a target-local
     # callable-boundary/CFG proof. Stronger than a generic captured pointer.
     'STATIC_DISCOVERY_ROOT',
@@ -653,6 +654,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     static_indirect_targets = set()
     branch_targets = set()
     jump_table_targets = set()
+    forward_branch_targets = set()
     rejected_cross_producer_calls = set()
     accepted_cross_producer_calls = set()
 
@@ -708,12 +710,19 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             if in_function(target):
                 work.append(target)
                 branch_targets.add(target)
+            elif lo <= target < hi and target >= hard_cap and (target & 3) == 0:
+                # A reachable direct branch may jump across a sibling entry.
+                # Exact-entry partitioning hard-caps the current walk there,
+                # but the target remains mechanically proven code reachability.
+                forward_branch_targets.add(target)
         elif kind == 'j':
             if in_function(delay):
                 visited.add(delay)
             if in_function(target):
                 work.append(target)
                 branch_targets.add(target)
+            elif lo <= target < hi and target >= hard_cap and (target & 3) == 0:
+                forward_branch_targets.add(target)
         elif kind == 'jal':
             if in_function(delay):
                 visited.add(delay)
@@ -764,6 +773,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         'static_indirect_targets': static_indirect_targets,
         'branch_targets': branch_targets,
         'jump_table_targets': jump_table_targets,
+        'forward_branch_targets': forward_branch_targets,
         'rejected_cross_producer_calls': rejected_cross_producer_calls,
         'accepted_cross_producer_calls': accepted_cross_producer_calls,
     }
@@ -887,6 +897,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                 included.setdefault(addr, 'DISPATCH_INTERIOR')
                 return
         elif (reason not in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                             'STATIC_BRANCH_ROOT',
                              'STATIC_DISCOVERY_ROOT',
                              'TOML_DECLARED_ENTRY') and
                 addr in jump_table_targets and
@@ -897,6 +908,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             raise RuntimeError(f'BUG: refusing to include 0x{addr:08X} as {reason}')
         old = included.get(addr)
         if reason in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                      'STATIC_BRANCH_ROOT',
                       'STATIC_DISCOVERY_ROOT'):
             # Static call-edge evidence outranks heuristic capture metadata.
             included[addr] = reason
@@ -962,6 +974,31 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                 if target in included and target not in known:
                     known.add(target)
                     pending.append(target)
+            for target in sorted(walk['forward_branch_targets']):
+                source_reason = included.get(entry)
+                strong_source = source_reason in (
+                    'DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                    'STATIC_BRANCH_ROOT', 'STATIC_DISCOVERY_ROOT',
+                    'TOML_DECLARED_ENTRY', 'DISPATCH_ROOT')
+                if not strong_source and not _callable_legacy_seed(
+                        data, load_addr, entry):
+                    continue
+                source_range = next(
+                    ((lo, hi) for lo, hi in producer_ranges
+                     if lo <= entry < hi), None)
+                target_range = next(
+                    ((lo, hi) for lo, hi in producer_ranges
+                     if lo <= target < hi), None)
+                if producer_ranges and source_range != target_range:
+                    continue
+                producer_hi = target_range[1] if target_range else hi
+                if not _plausible_callable_target(
+                        data, load_addr, size, target, producer_hi):
+                    continue
+                include(target, 'STATIC_BRANCH_ROOT')
+                if target in included and target not in known:
+                    known.add(target)
+                    pending.append(target)
 
         if not kernel_window:
             break
@@ -1003,6 +1040,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             data, load_addr, size, entry, hard_cap, producer_ranges)
         all_branch_targets.update(walk['branch_targets'])
         all_branch_targets.update(walk['jump_table_targets'])
+        all_branch_targets.update(walk['forward_branch_targets'])
         rejected_cross_producer_calls.update(
             walk['rejected_cross_producer_calls'])
         accepted_cross_producer_calls.update(
@@ -1055,6 +1093,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         if r == 'DISPATCH_ROOT':
             return f'dispatch_root 0x{addr:08X}'
         if r in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                 'STATIC_BRANCH_ROOT',
                  'STATIC_DISCOVERY_ROOT'):
             return f'call_root 0x{addr:08X}'
         return f'0x{addr:08X}'
@@ -1078,6 +1117,8 @@ def print_seed_audit(audit: dict) -> None:
     print(f'function_entry_pcs: {len(audit["function_entry_pcs"])}')
     print(f'direct_jal_targets_included: {audit["counts"].get("DIRECT_JAL_TARGET", 0)}')
     print(f'static_indirect_targets_included: {audit["counts"].get("STATIC_INDIRECT_TARGET", 0)}')
+    print(f'static_branch_roots_included: '
+          f'{audit["counts"].get("STATIC_BRANCH_ROOT", 0)}')
     print(f'static_discovery_roots_included: '
           f'{audit["counts"].get("STATIC_DISCOVERY_ROOT", 0)}')
     print(f'function_pointer_targets_included: {audit["counts"].get("FUNCTION_POINTER_TARGET", 0)}')

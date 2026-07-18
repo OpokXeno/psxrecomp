@@ -88,6 +88,9 @@ entries that also pass its local callable/CFG proof to trusted `call_root`s.
 When rebuilding identical bytes, prior overlapping alias groups are retained as
 non-root bodies, so stronger new roots add coverage without displacing already
 compiled indirect entries.
+Reachable direct branches that cross a sibling-entry hard cap are also promoted
+only after the target passes the same bounded CFG proof. This recovers out-of-line
+switch/state blocks without a blind byte or pointer sweep.
 
 ## Multi-game sweep findings (2026-07-17)
 
