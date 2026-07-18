@@ -43,6 +43,24 @@ A mis-positioned / data-as-code shard either fails audit at compile time or neve
 fires at runtime → coverage loss, never incorrect execution. Whatever static
 misses, production autocompile (tcc/gcc) self-heals on first visit.
 
+## Durable runtime capture history
+
+The canonical `overlay_captures.json` is atomically replaced for live consumers.
+With `[runtime] overlay_capture_history = true`, each changed coherent snapshot is
+also appended as one independent record to
+`overlay_captures.addendum.jsonl` beside the executable. A torn final line does
+not invalidate earlier or later records. Merge it into the private additive vault
+with:
+
+```sh
+python tools/coverage_vault.py merge --vault <vault-dir> \
+  --addendum <exe-dir>/overlay_captures.addendum.jsonl
+```
+
+Dev configs can additionally set the project-relative
+`overlay_capture_persist_dir` to retain immutable per-snapshot JSON files. Both
+settings are opt-in; capture artifacts contain game bytes and must stay ignored.
+
 ## Multi-game sweep findings (2026-07-17)
 
 `extract_generic.py` runs the improved extraction from a game.toml. Results:

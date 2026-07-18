@@ -19,7 +19,8 @@ It contains game-derived bytes, so the vault dir must stay gitignored / private
 and is committed.
 
 Usage:
-  coverage_vault.py merge --vault DIR [--captures captures.json] [--cache CACHE_DIR]
+  coverage_vault.py merge --vault DIR [--captures captures.json]
+                          [--addendum captures.addendum.jsonl] [--cache CACHE_DIR]
   coverage_vault.py stats --vault DIR
 """
 import argparse, json, os, shutil, hashlib, sys
@@ -35,16 +36,58 @@ def _load_list(path):
     if not os.path.exists(path):
         return []
     try:
-        v = json.load(open(path, encoding="utf-8"))
-        return v if isinstance(v, list) else []
+        with open(path, encoding="utf-8") as source:
+            value = json.load(source)
+        return value if isinstance(value, list) else []
     except Exception as e:
         print("  warn: could not read %s (%s); starting fresh" % (path, e))
         return []
 
-def merge_captures(vault_json, src_json):
-    if not src_json or not os.path.exists(src_json):
-        return 0, 0
-    src = _load_list(src_json)
+def _load_addendum(path):
+    """Load every valid append-only history record, ignoring a torn tail.
+
+    Each line is an independent snapshot wrapper. A hard kill may truncate only
+    the final line; earlier launches remain usable and a later runtime append
+    quarantines the bad tail with a newline.
+    """
+    regions = []
+    if not path or not os.path.exists(path):
+        return regions
+    with open(path, encoding="utf-8", errors="replace") as history:
+        for lineno, line in enumerate(history, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except Exception as e:
+                print("  warn: ignoring invalid addendum line %d in %s (%s)" %
+                      (lineno, path, e))
+                continue
+            if not isinstance(record, dict) or record.get("schema") != (
+                    "psxrecomp overlay capture addendum v1"):
+                print("  warn: ignoring unknown addendum record on line %d in %s" %
+                      (lineno, path))
+                continue
+            captures = record.get("captures", [])
+            if isinstance(captures, list):
+                regions.extend(r for r in captures if isinstance(r, dict))
+    return regions
+
+def _write_list_atomic(path, value):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as out:
+            json.dump(value, out, indent=1)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+def merge_capture_regions(vault_json, src):
     if not src:
         return 0, 0
     index = { _variant_key(r): r for r in _load_list(vault_json) }
@@ -63,9 +106,16 @@ def merge_captures(vault_json, src_json):
                 if fld == "executed_pcs":
                     new_pcs += len(add - cur)
                 tgt[fld] = sorted(cur | add)
-    os.makedirs(os.path.dirname(vault_json) or ".", exist_ok=True)
-    json.dump(list(index.values()), open(vault_json, "w", encoding="utf-8"), indent=1)
+    _write_list_atomic(vault_json, list(index.values()))
     return new_variants, new_pcs
+
+def merge_captures(vault_json, src_json):
+    if not src_json or not os.path.exists(src_json):
+        return 0, 0
+    return merge_capture_regions(vault_json, _load_list(src_json))
+
+def merge_addendum(vault_json, addendum):
+    return merge_capture_regions(vault_json, _load_addendum(addendum))
 
 def merge_cache(vault_cache, src_cache):
     """Mirror compiled DLLs/.ranges into the vault, PRESERVING the relative
@@ -111,6 +161,7 @@ def main():
     ap.add_argument("cmd", choices=["merge", "stats"])
     ap.add_argument("--vault", required=True, help="vault directory (kept gitignored/private)")
     ap.add_argument("--captures", help="source overlay_captures.json to merge in")
+    ap.add_argument("--addendum", help="append-only overlay capture history (.jsonl)")
     ap.add_argument("--cache", help="source cache dir (e.g. build/cache/<game_id>) to merge in")
     a = ap.parse_args()
     if a.cmd == "stats":
@@ -118,7 +169,13 @@ def main():
         return 0
     vj = os.path.join(a.vault, CAP_NAME)
     vc = os.path.join(a.vault, CACHE_SUB)
-    nv, np_ = merge_captures(vj, a.captures) if a.captures else (0, 0)
+    nv = np_ = 0
+    if a.captures:
+        add_v, add_p = merge_captures(vj, a.captures)
+        nv += add_v; np_ += add_p
+    if a.addendum:
+        add_v, add_p = merge_addendum(vj, a.addendum)
+        nv += add_v; np_ += add_p
     nd = merge_cache(vc, a.cache) if a.cache else 0
     print("coverage_vault: +%d new variant(s), +%d new PC(s), +%d new DLL(s) -> %s" % (nv, np_, nd, a.vault))
     return 0

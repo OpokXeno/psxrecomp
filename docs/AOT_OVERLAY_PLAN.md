@@ -116,6 +116,24 @@ executed_pcs[], dispatch_entry_pcs[], function_entry_pcs[], seeds[]
 (`g_dirty_ram_pc_table`, `g_dirty_ram_exec_pc_table`) — **execution-verified**, not
 disassembly guesses.
 
+#### Durable capture history (opt-in)
+
+`overlay_captures.json` remains the canonical latest snapshot consumed by the live
+compiler, but it is published through a same-directory temporary file plus atomic
+replace so readers never observe a half-written manifest. Games may additionally
+set `overlay_capture_history = true` to append each changed coherent snapshot as
+an independent JSONL record to `overlay_captures.addendum.jsonl` beside the
+executable. A hard kill can damage only the last line; the next append quarantines
+that tail, and `tools/coverage_vault.py merge --addendum ...` ignores malformed
+lines while additively merging every valid record.
+
+Development configs may also set a project-relative
+`overlay_capture_persist_dir`. This creates one atomically published, immutable
+JSON snapshot per changed capture. Absolute paths and `..` components are rejected.
+Production configs normally omit this key and retain only the naive executable-
+local addendum. Both history modes are off by default and contain game-derived
+bytes, so their outputs remain private/gitignored artifacts.
+
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
    `_walk_overlay_function`) with a strict callable-prologue gate; interior/

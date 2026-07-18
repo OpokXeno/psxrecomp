@@ -166,6 +166,37 @@ replacement = "0x24020001"
                  "instruction-aligned", "parser rejects unaligned sites");
 }
 
+void capture_history_config_tests(const fs::path& root) {
+    const auto valid = write_config(root, "capture-history", R"toml(
+[runtime]
+overlay_cache = true
+overlay_capture_history = true
+overlay_capture_persist_dir = ".aot_capture_history/TEST-00000"
+)toml");
+    const auto cfg = PSXRecompV4::load_game_config(valid);
+    check(cfg.runtime.overlay_capture_history,
+          "parser enables durable overlay capture history");
+    check(cfg.runtime.overlay_capture_persist_dir ==
+              ".aot_capture_history/TEST-00000",
+          "parser preserves project-relative capture history directory");
+
+    const auto escaping = write_config(root, "capture-history-escape", R"toml(
+[runtime]
+overlay_capture_persist_dir = "../outside"
+)toml");
+    check_throws([&] { (void)PSXRecompV4::load_game_config(escaping); },
+                 "must stay inside the project",
+                 "parser rejects escaping capture history directory");
+
+    const auto absolute = write_config(root, "capture-history-absolute", R"toml(
+[runtime]
+overlay_capture_persist_dir = "C:/outside"
+)toml");
+    check_throws([&] { (void)PSXRecompV4::load_game_config(absolute); },
+                 "must be project-relative",
+                 "parser rejects absolute capture history directory");
+}
+
 void codegen_tests() {
     constexpr uint32_t original = 0x24020002u;    // addiu v0, zero, 2
     constexpr uint32_t replacement = 0x24020001u; // addiu v0, zero, 1
@@ -224,6 +255,7 @@ int main() {
 
     try {
         parser_tests(root);
+        capture_history_config_tests(root);
         codegen_tests();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
