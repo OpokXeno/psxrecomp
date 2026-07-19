@@ -68,6 +68,11 @@ static CRITICAL_SECTION s_out_lock;
 static CONDITION_VARIABLE s_publish_cv;
 static int              s_out_lock_init = 0;
 static HANDLE           s_proc = NULL;
+/* Kill-on-close job tying the whole cmd->python->gcc compile tree to this
+ * process: any exit path (including a crash) closes the handle and the kernel
+ * reaps the tree, so a compiler can never keep writing into the cache after
+ * the runtime is gone. Owned exclusively by the emulation thread. */
+static HANDLE           s_job = NULL;
 static HANDLE           s_watch_thread = NULL;
 static HANDLE           s_prepare_thread = NULL;
 
@@ -90,6 +95,8 @@ static uint64_t s_publish_prepare_max_us;
 static uint64_t s_publish_prepare_last_us;
 static unsigned s_publish_prepare_count;
 static unsigned s_publish_prepare_fail;
+static unsigned s_publish_prepare_retry;
+static unsigned s_publish_prepare_giveup;
 static char s_child_line[1024];
 static int  s_child_line_len = 0;
 static int  s_child_line_overflow = 0;
@@ -162,10 +169,31 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
         s_publish_preparing++;
         LeaveCriticalSection(&s_out_lock);
 
+        /* A dropped publication silently reverts this artifact to a
+         * synchronous emulation-thread first-map on its next dispatch miss —
+         * the exact stall this pipeline exists to remove. Mapping failures
+         * right after the writer finishes are usually transient (AV scan or
+         * a sharing violation holding the file), so retry here where waiting
+         * costs no frame time. Validation rejects also land here and burn two
+         * pointless sleeps; that's an accepted cost of keeping prepare's
+         * failure reasons opaque. */
+        enum { AC_PREPARE_ATTEMPTS = 3, AC_PREPARE_RETRY_MS = 100 };
         LARGE_INTEGER q0, q1, qf;
-        QueryPerformanceCounter(&q0);
-        item->image = overlay_loader_prepare_published(item->path);
-        QueryPerformanceCounter(&q1);
+        int attempts = 0;
+        for (;;) {
+            QueryPerformanceCounter(&q0);
+            item->image = overlay_loader_prepare_published(item->path);
+            QueryPerformanceCounter(&q1);
+            attempts++;
+            if (item->image || attempts >= AC_PREPARE_ATTEMPTS) break;
+            int stopping;
+            EnterCriticalSection(&s_out_lock);
+            s_publish_prepare_retry++;
+            stopping = s_publish_stop;
+            LeaveCriticalSection(&s_out_lock);
+            if (stopping) break;
+            Sleep(AC_PREPARE_RETRY_MS);
+        }
         QueryPerformanceFrequency(&qf);
         uint64_t elapsed_us = qf.QuadPart > 0
             ? (uint64_t)((q1.QuadPart - q0.QuadPart) * 1000000LL /
@@ -175,6 +203,7 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
             s_publish_preparing--;
             s_publish_prepare_count++;
             s_publish_prepare_fail++;
+            s_publish_prepare_giveup++;
             s_publish_prepare_last_us = elapsed_us;
             s_publish_prepare_total_us += elapsed_us;
             if (elapsed_us > s_publish_prepare_max_us)
@@ -476,6 +505,8 @@ int autocompile_request(void) {
     s_publish_prepare_last_us = 0;
     s_publish_prepare_count = 0;
     s_publish_prepare_fail = 0;
+    s_publish_prepare_retry = 0;
+    s_publish_prepare_giveup = 0;
     s_publish_commit_active = 0;
     s_publish_input_done = 0;
     s_publish_stop = 0;
@@ -513,18 +544,43 @@ int autocompile_request(void) {
     si.hStdError  = wr;
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
+    /* Kill-on-close job for the whole compile tree. Created before the child
+     * and assigned while the child is still SUSPENDED, so cmd.exe cannot spawn
+     * python/gcc grandchildren outside the job. If job setup fails (rare),
+     * proceed without it — the shutdown path still terminates the direct
+     * child; only crash-orphan protection is lost. */
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+        memset(&jeli, 0, sizeof(jeli));
+        jeli.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &jeli, sizeof(jeli))) {
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
+
     /* Compilation is opportunistic: it must never outrank the interpreter that
      * keeps the current frame alive. cmd -> python -> gcc inherit below-normal
      * priority, while the live compile script also defaults to one worker. */
     BOOL ok = CreateProcessA(NULL, full, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS |
+                                 CREATE_SUSPENDED,
                              NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
     CloseHandle(wr);
     if (!ok) {
+        if (job) CloseHandle(job);
         CloseHandle(rd);
         s_fails++;
         return 0;
     }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        CloseHandle(job);
+        job = NULL;
+    }
+    ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
     WatchCtx *ctx = (WatchCtx *)HeapAlloc(GetProcessHeap(), 0, sizeof(*ctx));
@@ -535,12 +591,14 @@ int autocompile_request(void) {
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(rd);
         CloseHandle(pi.hProcess);
+        if (job) CloseHandle(job);   /* reaps any grandchild */
         s_fails++;
         return 0;
     }
     ctx->read_pipe = rd;
     ctx->proc      = pi.hProcess;
     s_proc = pi.hProcess;
+    s_job  = job;
     ac_state_store(AC_RUNNING);
     s_runs++;
     s_prepare_thread = CreateThread(NULL, 0, publish_prepare_thread_main,
@@ -552,6 +610,7 @@ int autocompile_request(void) {
         CloseHandle(pi.hProcess);
         HeapFree(GetProcessHeap(), 0, ctx);
         s_proc = NULL;
+        if (s_job) { CloseHandle(s_job); s_job = NULL; }
         ac_state_store(AC_IDLE);
         s_fails++;
         return 0;
@@ -573,6 +632,7 @@ int autocompile_request(void) {
         WaitForSingleObject(s_prepare_thread, INFINITE);
         CloseHandle(s_prepare_thread);
         s_prepare_thread = NULL;
+        if (s_job) { CloseHandle(s_job); s_job = NULL; }
         ac_state_store(AC_IDLE);
         s_fails++;
         return 0;
@@ -663,6 +723,12 @@ void autocompile_poll_main(void) {
         CloseHandle(s_watch_thread);
         s_watch_thread = NULL;
     }
+    if (s_job) {
+        /* Child already exited (watcher joined); closing the kill-on-close
+         * job only reaps any grandchild the tree left behind. */
+        CloseHandle(s_job);
+        s_job = NULL;
+    }
 #endif
     ac_state_store(AC_IDLE);
     s_shard_result_seen = parse_shard_result();
@@ -679,6 +745,48 @@ void autocompile_poll_main(void) {
         s_publish_drops_run != 0 || s_publish_load_fail_run != 0 ||
         s_publish_parse_fail_run != 0)
         s_fails++;
+}
+
+void autocompile_shutdown(void) {
+#ifdef _WIN32
+    if (!s_out_lock_init) return;   /* never configured — nothing to stop */
+    /* Halt the pipeline first so the preparer can never START another
+     * LoadLibrary; one already in flight is waited out below (terminating a
+     * thread that holds the Windows loader lock can deadlock ExitProcess). */
+    HANDLE proc_dup = NULL;
+    EnterCriticalSection(&s_out_lock);
+    s_publish_stop = 1;
+    WakeAllConditionVariable(&s_publish_cv);
+    /* s_proc is cleared+closed by the watcher on child exit; duplicate under
+     * the lock so the kill below can never race that close onto a reused
+     * handle value. */
+    if (s_proc)
+        DuplicateHandle(GetCurrentProcess(), s_proc, GetCurrentProcess(),
+                        &proc_dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    LeaveCriticalSection(&s_out_lock);
+    /* Kill the compile tree; the dying pipe write end unblocks the watcher. */
+    if (s_job) TerminateJobObject(s_job, 1);
+    else if (proc_dup) TerminateProcess(proc_dup, 1);
+    if (proc_dup) CloseHandle(proc_dup);
+    if (s_prepare_thread) {
+        WaitForSingleObject(s_prepare_thread, INFINITE);
+        CloseHandle(s_prepare_thread);
+        s_prepare_thread = NULL;
+    }
+    if (s_watch_thread) {
+        WaitForSingleObject(s_watch_thread, INFINITE);
+        CloseHandle(s_watch_thread);
+        s_watch_thread = NULL;
+    }
+    if (s_job) {
+        CloseHandle(s_job);
+        s_job = NULL;
+    }
+    /* Both workers are joined and this is the emulation thread, so nothing is
+     * preparing or committing: the discard cannot be refused. */
+    (void)publish_discard_all();
+    ac_state_store(AC_IDLE);
+#endif
 }
 
 /* Minimal JSON string escaper for the output tail. */
@@ -708,6 +816,7 @@ int autocompile_status_json(char *out, int cap) {
     unsigned publish_ready = 0, publish_ready_highwater = 0;
     unsigned publish_preparing = 0, publish_prepare_count = 0;
     unsigned publish_prepare_fail = 0;
+    unsigned publish_prepare_retry = 0, publish_prepare_giveup = 0;
     uint64_t publish_prepare_total_us = 0, publish_prepare_max_us = 0;
     uint64_t publish_prepare_last_us = 0;
     tail[0] = '\0';
@@ -722,6 +831,8 @@ int autocompile_status_json(char *out, int cap) {
         publish_preparing = s_publish_preparing;
         publish_prepare_count = s_publish_prepare_count;
         publish_prepare_fail = s_publish_prepare_fail;
+        publish_prepare_retry = s_publish_prepare_retry;
+        publish_prepare_giveup = s_publish_prepare_giveup;
         publish_prepare_total_us = s_publish_prepare_total_us;
         publish_prepare_max_us = s_publish_prepare_max_us;
         publish_prepare_last_us = s_publish_prepare_last_us;
@@ -737,6 +848,7 @@ int autocompile_status_json(char *out, int cap) {
         "\"publish_ready\":%u,\"publish_ready_highwater\":%u,"
         "\"publish_preparing\":%u,\"publish_prepare_count\":%u,"
         "\"publish_prepare_fail\":%u,"
+        "\"publish_prepare_retry\":%u,\"publish_prepare_giveup\":%u,"
         "\"publish_prepare_total_us\":%llu,"
         "\"publish_prepare_max_us\":%llu,"
         "\"publish_prepare_last_us\":%llu,"
@@ -747,6 +859,7 @@ int autocompile_status_json(char *out, int cap) {
         s_shard_fail_total, s_shard_result_seen,
         publish_ready, publish_ready_highwater, publish_preparing,
         publish_prepare_count, publish_prepare_fail,
+        publish_prepare_retry, publish_prepare_giveup,
         (unsigned long long)publish_prepare_total_us,
         (unsigned long long)publish_prepare_max_us,
         (unsigned long long)publish_prepare_last_us, tail);

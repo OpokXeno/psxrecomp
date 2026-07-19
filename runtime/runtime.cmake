@@ -197,6 +197,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
+    ${PSXRECOMP_ROOT}/runtime/src/overlay_path_canon.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_posix.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/autocompile.c

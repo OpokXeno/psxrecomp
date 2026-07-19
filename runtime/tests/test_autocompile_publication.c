@@ -135,7 +135,35 @@ int main(void) {
         return 1;
     }
 
+    /* Shutdown mid-run: feed markers, never signal input-done, and tear down
+     * while the preparer may be anywhere in its loop. autocompile_shutdown
+     * must join the worker (never abandon it) and conserve every reference:
+     * prepared == committed + discarded, with nothing left queued. */
+    {
+        static char feed[8 * 96];
+        int len = 0;
+        for (unsigned i = 0; i < 8; ++i)
+            len += snprintf(feed + len, sizeof(feed) - (size_t)len,
+                "PSX_SHARD_PUBLISHED C:\\cache\\00010000_DEADBEEF_%08X.dll\n",
+                0x1000u + i);
+        if (!autocompile_test_start_preparer()) return 1;
+        autocompile_test_feed_output(feed, len);
+        autocompile_shutdown();   /* input never finished — stop must win */
+    }
+    if (autocompile_test_ready_count() != 0 ||
+        autocompile_test_preparing_count() != 0 ||
+        s_prepared != s_committed + s_discarded) {
+        fprintf(stderr,
+                "FAIL: shutdown conservation prep=%ld commit=%ld discard=%ld "
+                "ready=%d preparing=%d\n",
+                s_prepared, s_committed, s_discarded,
+                autocompile_test_ready_count(),
+                autocompile_test_preparing_count());
+        return 1;
+    }
+
     puts("PASS: publications prepare off-thread, backpressure at one mapped "
-         "images, and commit on the emulation thread");
+         "images, commit on the emulation thread, and shutdown conserves "
+         "every prepared reference");
     return 0;
 }

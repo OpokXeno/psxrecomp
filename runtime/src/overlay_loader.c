@@ -1,5 +1,6 @@
 #include "overlay_loader.h"
 #include "overlay_api.h"
+#include "overlay_path_canon.h"
 #include "code_provider.h"
 #include "overlay_backend.h"
 #include "crc32.h"
@@ -753,7 +754,20 @@ static int cand_delay_slots_hashed(const Candidate *c) {
 static void loader_log(const char *fmt, ...);   /* defined below */
 static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
                           int tier) {
-    if (s_cand_n >= CAND_CAP || !man_structurally_valid(m)) return;
+    if (s_cand_n >= CAND_CAP) {
+        /* Never-again (the silent-256 truncation, see CACHE_IDX_CAP): a full
+         * candidate table means real native coverage is being IGNORED. Shout
+         * once — per-registration would spam a big rescan. */
+        static int s_cand_overflow_logged = 0;
+        if (!s_cand_overflow_logged) {
+            s_cand_overflow_logged = 1;
+            loader_log("*** CANDIDATE TABLE FULL (%d): func_%08X and every "
+                       "later candidate are being DROPPED — their code runs "
+                       "interpreted. Raise CAND_CAP.", CAND_CAP, phys);
+        }
+        return;
+    }
+    if (!man_structurally_valid(m)) return;
     int idx = s_cand_n++;
     Candidate *c = &s_cand[idx];
     c->addr    = phys;
@@ -816,6 +830,14 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
 static char s_cache_dir[512];
 static char s_game_id[64];
 static int  s_active = 0;
+
+/* Canonical (filesystem-resolved) form of s_cache_dir, computed lazily on the
+ * first live publication — the root is guaranteed to exist by then (the
+ * compiler just wrote a DLL into it). cache_path_has_root() is sound ONLY on
+ * canonical inputs: raw pipe text can smuggle `..` segments or a junction
+ * past a lexical prefix compare. */
+static char s_cache_root_canon[768];
+static int  s_cache_root_canon_ok = 0;
 
 /* Rule 3: no stderr logging. Most recent loader event recorded here and
  * surfaced through overlay_loader_status. */
@@ -2096,6 +2118,7 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
         s_range_pc_cache[i].cand = -1;
     strncpy(s_cache_dir, cache_dir, sizeof(s_cache_dir) - 1);
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
+    s_cache_root_canon_ok = 0;   /* re-resolve for the (re)assigned root */
     /* data shards persist under the same unified cache root (data_shards.c) */
     { extern void ds_init(const char*, const char*); ds_init(cache_dir, game_id); }
     init_callbacks();
@@ -2297,6 +2320,17 @@ static void overlay_library_close(OverlayLibraryHandle handle) {
  * retains that reference for process lifetime, matching the ordinary loader. */
 static int load_one_dll_prepared(const char *dll_path,
                                  OverlayLibraryHandle prepared) {
+    /* Fail CLOSED at the tracking cap, BEFORE registering anything: past this
+     * point dll_already_loaded() would lose track of the DLL and a later
+     * rescan could double-register its candidates (stale-chain execution).
+     * Refusing keeps the region interpreted — same contract as CACHE_IDX_CAP. */
+    if (s_nloaded_paths >= MAX_LOADED_DLLS) {
+        loader_log("*** LOADED-DLL TABLE FULL (%d): refusing %s — its region "
+                   "stays interpreted. Raise MAX_LOADED_DLLS.",
+                   MAX_LOADED_DLLS, dll_path);
+        overlay_library_close(prepared);
+        return 0;
+    }
 #ifdef _WIN32
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);
@@ -2334,11 +2368,11 @@ static int load_one_dll_prepared(const char *dll_path,
     /* The DLL may publish other PCs that were previously negative-cached. */
     lazy_miss_invalidate_loader();
 
-    if (s_nloaded_paths < MAX_LOADED_DLLS) {
-        strncpy(s_loaded_paths[s_nloaded_paths], dll_path, 767);
-        s_loaded_paths[s_nloaded_paths][767] = '\0';
-        s_nloaded_paths++;
-    }
+    /* Unconditional: the fail-closed gate at entry guarantees room, so the
+     * tracking table can never silently lose a loaded DLL again. */
+    strncpy(s_loaded_paths[s_nloaded_paths], dll_path, 767);
+    s_loaded_paths[s_nloaded_paths][767] = '\0';
+    s_nloaded_paths++;
     s_ndlls++;
     return registered;
 }
@@ -2347,15 +2381,38 @@ static int load_one_dll(const char *dll_path) {
     return load_one_dll_prepared(dll_path, NULL);
 }
 
-static int published_path_valid(const char *dll_path) {
+static int published_root_canonical(void) {
+    if (s_cache_root_canon_ok) return 1;
+    if (!overlay_path_canonicalize(s_cache_dir, s_cache_root_canon,
+                                   sizeof(s_cache_root_canon))) {
+        /* Not cached as a failure: the root may simply not exist yet; the
+         * next publication retries. Rejecting until it resolves is the
+         * fail-closed direction. */
+        loader_log("publication rejected: cache root %s does not "
+                   "canonicalize", s_cache_dir);
+        return 0;
+    }
+    return s_cache_root_canon_ok = 1;
+}
+
+/* Validates dll_path and writes its CANONICAL form into canon; every later
+ * consumer (LoadLibrary, .ranges derivation, loaded-path tracking) uses the
+ * canonical string, never the raw pipe text. */
+static int published_path_valid(const char *dll_path, char *canon,
+                                size_t canon_cap) {
     if (!s_active || !dll_path || !dll_path[0]) return 0;
     /* The compiler command is trusted local code, but keep its native-library
-     * output confined to the cache root the framework injected. */
-    if (!cache_path_has_root(dll_path, s_cache_dir)) return 0;
-    const char *base = strrchr(dll_path, '/');
-    const char *win_base = strrchr(dll_path, '\\');
+     * output confined to the cache root the framework injected — resolved
+     * through the filesystem on BOTH sides, exactly as the OS loader will
+     * resolve it, so `..`/short-name/reparse forms cannot slip a lexical
+     * prefix check. */
+    if (!published_root_canonical()) return 0;
+    if (!overlay_path_canonicalize(dll_path, canon, canon_cap)) return 0;
+    if (!cache_path_has_root(canon, s_cache_root_canon)) return 0;
+    const char *base = strrchr(canon, '/');
+    const char *win_base = strrchr(canon, '\\');
     if (!base || (win_base && win_base > base)) base = win_base;
-    base = base ? base + 1 : dll_path;
+    base = base ? base + 1 : canon;
     uint32_t addr = 0, crc = 0;
     if (!psx_overlay_cache_name_parse(base, &addr, &crc)) return 0;
     if (!cache_name_is_immutable(base)) return 0;
@@ -2365,16 +2422,37 @@ static int published_path_valid(const char *dll_path) {
 }
 
 OverlayPreparedImage *overlay_loader_prepare_published(const char *dll_path) {
-    if (!published_path_valid(dll_path)) return NULL;
+    char canon[768];
+    if (!published_path_valid(dll_path, canon, sizeof(canon))) return NULL;
     OverlayPreparedImage *image =
         (OverlayPreparedImage *)calloc(1, sizeof(*image));
     if (!image) return NULL;
-    snprintf(image->path, sizeof(image->path), "%s", dll_path);
 #ifdef _WIN32
-    image->handle = LoadLibraryA(dll_path);
+    /* Guard handle: GENERIC_READ with only READ shared blocks rename/replace/
+     * delete of the validated file until LoadLibrary has mapped it, and the
+     * canonical identity is re-derived from the object actually held — so a
+     * swap between validation and mapping cannot survive the re-check.
+     * (Anything already writable inside the cache root itself is outside this
+     * boundary by design; see the threat-model note above cand_register.) */
+    HANDLE guard = CreateFileA(canon, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (guard == INVALID_HANDLE_VALUE) {
+        free(image);
+        return NULL;
+    }
+    if (!overlay_path_canonicalize_handle(guard, canon, sizeof(canon)) ||
+        !cache_path_has_root(canon, s_cache_root_canon)) {
+        CloseHandle(guard);
+        free(image);
+        return NULL;
+    }
+    snprintf(image->path, sizeof(image->path), "%s", canon);
+    image->handle = LoadLibraryA(canon);
+    CloseHandle(guard);
 #else
+    snprintf(image->path, sizeof(image->path), "%s", canon);
     char error[256] = {0};
-    image->handle = psx_overlay_posix_library_open(dll_path, error,
+    image->handle = psx_overlay_posix_library_open(canon, error,
                                                    sizeof(error));
 #endif
     if (!image->handle) {
@@ -2389,9 +2467,12 @@ int overlay_loader_commit_published(OverlayPreparedImage *image) {
     OverlayLibraryHandle handle = image->handle;
     image->handle = NULL;
     int loaded = 0;
-    if (published_path_valid(image->path) &&
-        !dll_already_loaded(image->path))
-        loaded = load_one_dll_prepared(image->path, handle);
+    char canon[768];
+    /* image->path is already canonical (prepare stored the handle-derived
+     * form); re-validating is an idempotent freshness check. */
+    if (published_path_valid(image->path, canon, sizeof(canon)) &&
+        !dll_already_loaded(canon))
+        loaded = load_one_dll_prepared(canon, handle);
     else
         overlay_library_close(handle);
     free(image);

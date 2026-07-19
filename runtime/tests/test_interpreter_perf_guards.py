@@ -166,9 +166,20 @@ def main():
         raise AssertionError("live publication queue can silently overflow a fixed path ring")
     prepare_image = body(loader, "overlay_loader_prepare_published")
     commit_image = body(loader, "overlay_loader_commit_published")
-    if "LoadLibraryA(dll_path)" not in prepare_image:
-        raise AssertionError("Windows published image is not first-mapped on the worker")
-    if ("load_one_dll_prepared(image->path, handle)" not in commit_image or
+    validated = prepare_image.find(
+        "published_path_valid(dll_path, canon, sizeof(canon))")
+    guard_open = prepare_image.find(
+        "CreateFileA(canon, GENERIC_READ, FILE_SHARE_READ")
+    first_map = prepare_image.find("LoadLibraryA(canon)")
+    if min(validated, guard_open, first_map) < 0 or not (
+            validated < guard_open < first_map):
+        raise AssertionError(
+            "Windows published image must be canonical-validated and "
+            "guard-held before its worker first-map")
+    if "LoadLibraryA(dll_path)" in prepare_image:
+        raise AssertionError(
+            "worker first-map regressed to mapping raw (non-canonical) pipe text")
+    if ("load_one_dll_prepared(canon, handle)" not in commit_image or
             "overlay_library_close(handle)" not in commit_image):
         raise AssertionError("prepared image commit does not consume every speculative reference")
     watched_write = body(memory, "overlay_watch_note_write")

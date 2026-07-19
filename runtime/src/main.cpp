@@ -978,6 +978,11 @@ static void close_controller(void);
 static void shutdown_runtime(void) {
     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
     * off-thread JIT worker here; the worker no longer exists.) */
+    /* First: stop the autocompile pipeline (kills the compiler tree, joins the
+     * pipe watcher + publication preparer). Ordered before the capture flush
+     * so no child is still writing into the cache while we finalize state,
+     * and before ExitProcess can strand a thread inside the loader lock. */
+    autocompile_shutdown();
     memcard_flush_all();
     overlay_capture_wait_pending();
     overlay_capture_write_json();

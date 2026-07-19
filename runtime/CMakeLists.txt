@@ -67,6 +67,12 @@ if(BUILD_TESTING)
     target_link_libraries(overlay_capture_retry_test PRIVATE ${SDL2_LIBRARIES})
     add_test(NAME overlay_capture_retry_test COMMAND overlay_capture_retry_test)
 
+    add_executable(overlay_path_canon_test
+        tests/test_overlay_path_canon.c
+        src/overlay_path_canon.c)
+    target_include_directories(overlay_path_canon_test PRIVATE include)
+    add_test(NAME overlay_path_canon_test COMMAND overlay_path_canon_test)
+
     if(WIN32)
         add_executable(autocompile_publication_test
             tests/test_autocompile_publication.c
