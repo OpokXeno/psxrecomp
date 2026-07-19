@@ -1061,6 +1061,10 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                 assert MOD.compiled_shard_complete(pair_dll, 14)
                 assert not MOD.compiled_shard_complete(
                     pair_dll, 14 | (1 << 16))  # same cg dir, stale flavor
+                assert MOD.cached_shard_manifest_status(
+                    pair_dll, 14, manifest, pair_id) == 'match'
+                assert MOD.cached_shard_manifest_status(
+                    pair_dll, 14, manifest, pair_id ^ 1) == 'mismatch'
 
                 source = pathlib.Path(tmp) / "loaded.c"
                 final = str(pathlib.Path(tmp) / "shard.dll")
@@ -1096,6 +1100,107 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
     finally:
         MOD.os.replace = original_replace
         MOD._compile_dll_direct = original
+
+
+def check_interior_fragment_contract():
+    entry = LOAD + 0x20
+    good = [(entry, 0x12345678, [(entry, 8)])]
+    assert MOD.validate_interior_fragment_ids(entry, good, {entry}) is None
+    assert "missing from generated C" in MOD.validate_interior_fragment_ids(
+        entry, good, set())
+    assert "0 manifest identities" in MOD.validate_interior_fragment_ids(
+        entry, [], {entry})
+    assert "2 manifest identities" in MOD.validate_interior_fragment_ids(
+        entry, good + good, {entry})
+    assert "0 ranges" in MOD.validate_interior_fragment_ids(
+        entry, [(entry, 0, [])], {entry})
+    assert "17 ranges" in MOD.validate_interior_fragment_ids(
+        entry, [(entry, 0, [(entry + i * 4, 4) for i in range(17)])],
+        {entry})
+    assert "outside its guarded ranges" in MOD.validate_interior_fragment_ids(
+        entry, [(entry, 0, [(entry + 4, 4)])], {entry})
+    assert "fragment entry" in MOD.validate_interior_fragment_ids(
+        entry, good + [(entry + 0x40, 0,
+                        [(entry + 0x40 + i * 4, 4) for i in range(17)])],
+        {entry, entry + 0x40})
+    assert "empty guarded range" in MOD.validate_interior_fragment_ids(
+        entry, good + [(entry + 0x40, 0, [(entry + 0x40, 0)])],
+        {entry, entry + 0x40})
+    assert MOD.interior_failure_is_deterministic(
+        "generated-c-audit: unsupported")
+    assert MOD.interior_failure_is_deterministic(
+        "requested-entry-audit: omitted")
+    assert not MOD.interior_failure_is_deterministic(
+        "fragment cache-key collision/stale pair")
+
+    audit = {
+        "included_reasons": {},
+        "executed_pcs": set(),
+        "producer_ranges": [(LOAD, LOAD + 0x100)],
+        "accepted_cross_producer_calls": {LOAD + 0x200},
+    }
+    data = bytes(0x100)
+    assert MOD.make_interior_fragment_job(
+        LOAD & 0x1FFFFFFF, LOAD, len(data), data, audit, set()) is None
+    job = MOD.make_interior_fragment_job(
+        LOAD & 0x1FFFFFFF, LOAD, len(data), data, audit, {entry})
+    assert job is not None
+    assert job["candidates"] == {entry}
+    assert job["forced"] == {entry}
+    assert job["executed"] == set()
+    assert job["producer_ranges"] == ((LOAD, LOAD + 0x100),)
+    assert job["cross_call_allow"] == (LOAD + 0x200,)
+    assert MOD.make_interior_fragment_job(
+        LOAD & 0x1FFFFFFF, LOAD, len(data), data, audit,
+        {LOAD + 0x200}) is None
+
+    with tempfile.TemporaryDirectory() as td:
+        dll = pathlib.Path(td) / "fragment.dll"
+        ranges = pathlib.Path(td) / "fragment.ranges"
+        dll.write_bytes(b"DLL")
+        ranges.write_text("EXPECTED\n")
+        assert MOD.cached_shard_manifest_status(
+            str(dll), None, "EXPECTED\n") == "match"
+        assert MOD.cached_shard_manifest_status(
+            str(dll), None, "OTHER\n") == "mismatch"
+        ranges.unlink()
+        assert MOD.cached_shard_manifest_status(
+            str(dll), None, "EXPECTED\n") == "missing"
+
+    old_run = MOD.subprocess.run
+    seen_seeds = []
+
+    class Args:
+        recompiler = "recompiler"
+        game_toml = "game.toml"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "expected stop"
+
+    def stop_after_seeds(cmd, **_kwargs):
+        seeds = pathlib.Path(cmd[cmd.index("--seeds") + 1])
+        seen_seeds.extend(seeds.read_text().splitlines())
+        return Failed()
+
+    try:
+        MOD.subprocess.run = stop_after_seeds
+        ids, status = MOD.compile_interior_fragment(
+            entry, data, LOAD, len(data), LOAD & 0x1FFFFFFF, "unused",
+            Args(), {}, {},
+            ((LOAD, LOAD + 0x40), (LOAD + 0x80, LOAD + 0x100)),
+            (LOAD + 0x200, LOAD + 0x180, LOAD + 0x200))
+        assert ids is None and status.startswith("recompiler-error")
+    finally:
+        MOD.subprocess.run = old_run
+    assert seen_seeds == [
+        f"producer_range 0x{LOAD:08X} 0x{LOAD + 0x40:08X}",
+        f"producer_range 0x{LOAD + 0x80:08X} 0x{LOAD + 0x100:08X}",
+        f"cross_call_allow 0x{LOAD + 0x180:08X}",
+        f"cross_call_allow 0x{LOAD + 0x200:08X}",
+        f"dispatch_root 0x{entry:08X}",
+    ]
 
 
 def check_tcc_runtime_define_parity():
@@ -1158,6 +1263,7 @@ def main():
     check_recompiler_pointer_table_alias(args.recompiler)
     check_retained_alias_contract(args.recompiler)
     check_atomic_dll_publication()
+    check_interior_fragment_contract()
     check_tcc_runtime_define_parity()
 
     data = bytearray(0x200)
