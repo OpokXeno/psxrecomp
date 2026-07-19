@@ -16,15 +16,33 @@ function Quote-ProcessArgument([string]$Value) {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+# Default GameRoot is the ISOLATED game worktree (_wt-tomba2-interp-perf,
+# branch interp/game-isolated, forked from Tomba2Recomp's validated master),
+# NOT the shared F:\Projects\psxrecomp\Tomba2Recomp checkout — that checkout's
+# HEAD belongs to the AOT overlay-spike investigation (branch
+# feat/aot-overlay-spike, uncommitted AOT files) and its game.toml has already
+# drifted from master (adds overlay_capture_history). Reading game.toml from
+# there would silently reintroduce the sharing this worktree split was meant
+# to end. -GameRoot still accepts an explicit override for one-off comparisons.
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspaceRoot = Split-Path $repoRoot -Parent
 if (-not $GameRoot) {
-    $GameRoot = Join-Path $workspaceRoot 'Tomba2Recomp'
+    $GameRoot = Join-Path $workspaceRoot '_wt-tomba2-interp-perf'
 }
 $GameRoot = (Resolve-Path $GameRoot).Path
 
-$buildDir = Join-Path $repoRoot 'runtime\build-tomba2-perf-rel'
-$sourceExe = Join-Path $buildDir 'Tomba2Recomp.exe'
+# build-tomba2-interp-iso-rel is configured from the ISOLATED game worktree
+# (_wt-tomba2-interp-perf, branch interp/game-isolated) with
+# -DPSXRECOMP_GAME_EXE_NAME_OVERRIDE=Tomba2InterpPerf, so the build emits
+# Tomba2InterpPerf.exe natively — there is no more Tomba2Recomp.exe in this
+# build dir to alias. The old build-tomba2-perf-rel dir (shared checkout,
+# CMAKE_HOME_DIRECTORY=Tomba2Recomp) built plain Tomba2Recomp.exe and this
+# script used to Copy-Item a uniquely-named alias next to it so process-name
+# tooling couldn't confuse it with another investigation's run; that copy
+# step is gone because the isolated build dir + isolated exe name make the
+# alias unnecessary; build-tomba2-perf-rel itself is left untouched as
+# evidence of the original shared-checkout measurement.
+$buildDir = Join-Path $repoRoot 'runtime\build-tomba2-interp-iso-rel'
 $isolatedExe = Join-Path $buildDir 'Tomba2InterpPerf.exe'
 $gameConfig = Join-Path $GameRoot 'game.toml'
 $bios = Join-Path $workspaceRoot 'psxrecomp\bios\SCPH1001.BIN'
@@ -32,20 +50,24 @@ $recompiler = Join-Path $repoRoot 'recompiler\build-interpreter-perf-native\psxr
 $compileTool = Join-Path $repoRoot 'tools\compile_overlays.py'
 $runtimeInclude = Join-Path $repoRoot 'runtime\include'
 
-foreach ($required in @($sourceExe, $gameConfig, $bios, $recompiler, $compileTool)) {
+foreach ($required in @($isolatedExe, $gameConfig, $bios, $recompiler, $compileTool)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required launch input is missing: $required"
     }
 }
 
-if ($Launch -and (Get-Process -Name 'Tomba2InterpPerf' -ErrorAction SilentlyContinue)) {
-    throw 'Tomba2InterpPerf is already running; refusing to replace its executable or start another instance.'
+# Refuse to launch if EITHER this isolated build OR the shared-checkout
+# Tomba2Recomp build is already running. The two now build from separate
+# worktrees/exe names, so they can no longer collide on-disk, but they can
+# still collide at runtime (same debug port range, same memcard/BIOS files
+# read concurrently, same taskkill-by-name cleanup a human runs by hand) —
+# so the guard stays broad on purpose rather than narrowing to just our own
+# process name.
+foreach ($conflictingName in @('Tomba2InterpPerf', 'Tomba2Recomp')) {
+    if ($Launch -and (Get-Process -Name $conflictingName -ErrorAction SilentlyContinue)) {
+        throw "$conflictingName is already running; refusing to start another instance (they share BIOS/debug-port/taskkill surface)."
+    }
 }
-
-# Keep the ordinary Tomba2Recomp.exe for build tooling, but launch a uniquely
-# named byte-identical alias so process-name based diagnostics/cleanup cannot
-# touch an AOT investigation running from another build directory.
-Copy-Item -LiteralPath $sourceExe -Destination $isolatedExe -Force
 
 $sessionRoot = Join-Path $repoRoot '.local\tomba2-interp-perf'
 $stateDir = Join-Path $sessionRoot 'state'
