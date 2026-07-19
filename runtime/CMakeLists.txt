@@ -52,6 +52,10 @@ if(BUILD_TESTING)
         PSX_GTE_REGISTER_TEST=1
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
+
+    add_executable(psx_instr_cost_test tests/test_psx_instr_cost.cpp)
+    target_include_directories(psx_instr_cost_test PRIVATE include)
+    add_test(NAME psx_instr_cost_test COMMAND psx_instr_cost_test)
 endif()
 
 if(NOT MSVC)

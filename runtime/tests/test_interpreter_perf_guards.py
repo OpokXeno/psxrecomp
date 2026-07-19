@@ -34,6 +34,7 @@ def main():
     interrupts = (ROOT / "runtime/src/interrupts.c").read_text(encoding="utf-8")
     cycles = (ROOT / "runtime/src/psx_cycles.c").read_text(encoding="utf-8")
     cyc_header = (ROOT / "runtime/include/psx_cyc.h").read_text(encoding="utf-8")
+    instr_cost = (ROOT / "runtime/include/psx_instr_cost.h").read_text(encoding="utf-8")
     starvation = (ROOT / "runtime/include/starvation_ring.h").read_text(encoding="utf-8")
 
     record = body(interp, "exec_pc_table_record")
@@ -195,6 +196,10 @@ def main():
         raise AssertionError("runtime cycle fast path leaked into the overlay-DLL shared header")
     if "PSX_NO_DEBUG_TOOLS" not in starvation or "STARVATION_RING_ENABLED 0" not in starvation:
         raise AssertionError("production still enables the diagnostic starvation ring")
+    dep_mask = body(instr_cost, "psx_cyc_dep_res_mask")
+    if ("op_roles[64]" not in dep_mask or "special_roles[64]" not in dep_mask or
+            "switch (op)" in dep_mask):
+        raise AssertionError("load-delay dependency masks regressed to a second instruction decoder")
     gte_execute = body(gte, "gte_execute")
     direct_import = gte_execute.find("gte_import_cpu_state(&gte, cpu);")
     command = gte_execute.find("gte_run_command(&gte, cmd);")
