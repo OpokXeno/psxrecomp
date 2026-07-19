@@ -195,6 +195,20 @@ def main():
         raise AssertionError("runtime cycle fast path leaked into the overlay-DLL shared header")
     if "PSX_NO_DEBUG_TOOLS" not in starvation or "STARVATION_RING_ENABLED 0" not in starvation:
         raise AssertionError("production still enables the diagnostic starvation ring")
+    gte_execute = body(gte, "gte_execute")
+    direct_import = gte_execute.find("gte_import_cpu_state(&gte, cpu);")
+    command = gte_execute.find("gte_run_command(&gte, cmd);")
+    direct_export = gte_execute.find("gte_export_cpu_state(cpu, &gte);")
+    deadline = gte_execute.find("psx_gte_set(cpu, psx_gte_cmd_latency(cmd));")
+    if min(direct_import, command, direct_export, deadline) < 0 or not (
+            direct_import < command < direct_export < deadline):
+        raise AssertionError("GTE direct marshaling or command deadline ordering regressed")
+    gte_marshaling = (gte_execute + body(gte, "gte_import_cpu_state") +
+                      body(gte, "gte_export_cpu_state"))
+    for old_selector in ("gte_mtc2(&gte", "gte_ctc2(&gte",
+                         "gte_mfc2(&gte", "gte_cfc2(&gte"):
+        if old_selector in gte_marshaling:
+            raise AssertionError("GTE command bridge regressed to selector dispatch loops")
     for fn in ("psx_devices_mmio_sync", "psx_advance_cycles_exact", "psx_cycles_resync_after_restore"):
         if "g_psx_cycle_fast_limit = 0" not in body(cycles, fn):
             raise AssertionError(f"{fn} does not invalidate the inline cycle limit")

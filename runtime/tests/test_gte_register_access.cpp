@@ -32,8 +32,15 @@ extern "C" void gte_test_seed_precise_projection(uint32_t index,
                                                    int32_t x16,
                                                    int32_t y16,
                                                    uint16_t z);
+extern "C" void gte_test_get_precise_projection(uint32_t index,
+                                                  uint32_t *packed,
+                                                  int32_t *x16,
+                                                  int32_t *y16,
+                                                  uint16_t *z,
+                                                  uint8_t *valid);
 extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
                                         int32_t y16);
+extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
 extern "C" int gpu_ws_present_native_43(void) { return 0; }
@@ -42,7 +49,59 @@ extern "C" {
 uint64_t s_frame_count = 0;
 }
 
+uint64_t g_test_cycle = 0;
+uint32_t g_test_gte_set_calls = 0;
+uint32_t g_test_gte_last_latency = 0;
+
+extern "C" uint32_t psx_gte_cmd_latency(uint32_t cmd) {
+    return 7u + (cmd & 0x3Fu);
+}
+
+extern "C" void psx_gte_set(CPUState *cpu, uint32_t latency) {
+    ++g_test_gte_set_calls;
+    g_test_gte_last_latency = latency;
+    if (cpu->gte_ts_done > g_test_cycle) g_test_cycle = cpu->gte_ts_done;
+    cpu->gte_ts_done = g_test_cycle + latency;
+}
+
 namespace {
+
+struct PreciseState {
+    uint32_t packed;
+    int32_t x16;
+    int32_t y16;
+    uint16_t z;
+    uint8_t valid;
+};
+
+std::array<PreciseState, 4> precise_snapshot() {
+    std::array<PreciseState, 4> result{};
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        auto &p = result[i];
+        gte_test_get_precise_projection(i, &p.packed, &p.x16, &p.y16,
+                                        &p.z, &p.valid);
+    }
+    return result;
+}
+
+void seed_precise_snapshot() {
+    for (uint32_t i = 0; i < 4; ++i)
+        gte_test_seed_precise_projection(i, 0x01010001u * (i + 1u),
+                                         0x10000 + static_cast<int32_t>(i * 31),
+                                         -0x20000 - static_cast<int32_t>(i * 47),
+                                         static_cast<uint16_t>(0x100u + i));
+}
+
+bool same_precise(const std::array<PreciseState, 4> &lhs,
+                  const std::array<PreciseState, 4> &rhs) {
+    for (uint32_t i = 0; i < lhs.size(); ++i) {
+        if (lhs[i].packed != rhs[i].packed || lhs[i].x16 != rhs[i].x16 ||
+            lhs[i].y16 != rhs[i].y16 || lhs[i].z != rhs[i].z ||
+            lhs[i].valid != rhs[i].valid)
+            return false;
+    }
+    return true;
+}
 
 constexpr std::array<uint32_t, 10> kEdgeValues = {
     0x00000000u, 0x00000001u, 0x00007FFFu, 0x00008000u, 0x0000FFFFu,
@@ -261,6 +320,7 @@ int test_writes() {
                                   expected, actual);
         }
     }
+
     return 0;
 }
 
@@ -308,6 +368,118 @@ int test_sequence_fuzz() {
                                   expected, actual);
         }
     }
+    return 0;
+}
+
+int test_command_marshaling() {
+    constexpr std::array<uint8_t, 22> kFunctions = {
+        0x01, 0x06, 0x0C, 0x10, 0x11, 0x12, 0x13, 0x14,
+        0x16, 0x1B, 0x1C, 0x1E, 0x20, 0x28, 0x29, 0x2A,
+        0x2D, 0x2E, 0x30, 0x3D, 0x3E, 0x3F,
+    };
+
+    for (uint8_t function : kFunctions) {
+        for (unsigned iteration = 0; iteration < 96; ++iteration) {
+            CPUState seed;
+            randomize_gte(seed);  // deliberately raw/noncanonical legacy state
+            CPUState expected = seed;
+            CPUState actual = seed;
+            const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
+            gte_test_execute_reference(&expected, cmd);
+            gte_execute(&actual, cmd);
+            if (!same_gte(expected, actual))
+                return fail_state("command marshal", iteration, function, cmd,
+                                  expected, actual);
+            if (actual.gte_data[15] != actual.gte_data[14] ||
+                actual.gte_data[23] != 0u ||
+                actual.gte_data[28] != actual.gte_data[29] ||
+                actual.gte_data[31] != gte_read_data(&actual, 31))
+                return fail_value("command canonical aliases", iteration,
+                                  function, cmd, actual.gte_data[14],
+                                  actual.gte_data[15]);
+        }
+    }
+
+    /* MVMVA's matrix/vector/translation dependencies are all selected by the
+     * command word. Exhaust every selector plus sf/lm combination explicitly. */
+    for (uint32_t mx = 0; mx < 4; ++mx) {
+        for (uint32_t vv = 0; vv < 4; ++vv) {
+            for (uint32_t tv = 0; tv < 4; ++tv) {
+                for (uint32_t sf = 0; sf < 2; ++sf) {
+                    for (uint32_t lm = 0; lm < 2; ++lm) {
+                        CPUState seed;
+                        randomize_gte(seed);
+                        CPUState expected = seed;
+                        CPUState actual = seed;
+                        const uint32_t cmd = 0x12u | (mx << 17) | (vv << 15) |
+                                             (tv << 13) | (sf << 19) | (lm << 10);
+                        gte_test_execute_reference(&expected, cmd);
+                        gte_execute(&actual, cmd);
+                        if (!same_gte(expected, actual))
+                            return fail_state("MVMVA selectors", mx * 16u + vv * 4u + tv,
+                                              static_cast<unsigned>(sf * 2u + lm),
+                                              cmd, expected, actual);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Stateful command streams catch FIFO/alias state that single-command
+     * comparisons can accidentally reinitialize away. */
+    for (unsigned iteration = 0; iteration < 64; ++iteration) {
+        CPUState expected;
+        randomize_gte(expected);
+        CPUState actual = expected;
+        for (unsigned step = 0; step < 128; ++step) {
+            const uint8_t function = kFunctions[random_u32() % kFunctions.size()];
+            const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
+            gte_test_execute_reference(&expected, cmd);
+            gte_execute(&actual, cmd);
+            if (!same_gte(expected, actual))
+                return fail_state("command stream", iteration, function, cmd,
+                                  expected, actual);
+        }
+    }
+
+    /* Projection commands update a host-only precise-SXY FIFO. Reset that
+     * global state around each path so the old and direct marshalers can be
+     * compared independently instead of executing twice on one timeline. */
+    for (uint8_t function : kFunctions) {
+        CPUState seed;
+        randomize_gte(seed);
+        CPUState expected = seed;
+        CPUState actual = seed;
+        const uint32_t cmd = (random_u32() & ~0x3Fu) | function;
+        seed_precise_snapshot();
+        gte_test_execute_reference(&expected, cmd);
+        const auto expected_precise = precise_snapshot();
+        seed_precise_snapshot();
+        gte_execute(&actual, cmd);
+        const auto actual_precise = precise_snapshot();
+        if (!same_precise(expected_precise, actual_precise))
+            return fail_value("command precise provenance", 0, function,
+                              cmd, 1u, 0u);
+    }
+    return 0;
+}
+
+int test_command_timing_hook() {
+    CPUState cpu{};
+    g_test_cycle = 100u;
+    cpu.gte_ts_done = 175u;
+    g_test_gte_set_calls = 0;
+    g_test_gte_last_latency = 0;
+    gte_execute(&cpu, 0x06u);
+    if (g_test_gte_set_calls != 1u || g_test_gte_last_latency != 13u ||
+        cpu.gte_ts_done != 188u)
+        return fail_value("command timing serialization", 0, 0x06u, 0,
+                          188u, static_cast<uint32_t>(cpu.gte_ts_done));
+    gte_execute(&cpu, 0x30u);
+    if (g_test_gte_set_calls != 2u || g_test_gte_last_latency != 55u ||
+        cpu.gte_ts_done != 243u)
+        return fail_value("back-to-back command timing", 0, 0x30u, 0,
+                          243u, static_cast<uint32_t>(cpu.gte_ts_done));
     return 0;
 }
 
@@ -478,6 +650,8 @@ int main() {
     if (int rc = test_reads()) return rc;
     if (int rc = test_writes()) return rc;
     if (int rc = test_sequence_fuzz()) return rc;
+    if (int rc = test_command_marshaling()) return rc;
+    if (int rc = test_command_timing_hook()) return rc;
     if (int rc = test_precise_sxy_invalidation()) return rc;
     if (int rc = test_precision_speculative_transaction()) return rc;
     std::puts("PASS: canonical GTE register helpers match GTEState transfer oracle");

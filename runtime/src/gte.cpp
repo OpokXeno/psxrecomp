@@ -96,15 +96,15 @@ static void light_transform(GTEState* gte, int16_t* V, uint32_t instr) {
 // Apply light color matrix + background color to IR → IR (step 2 of lighting)
 static void light_color(GTEState* gte, uint32_t instr) {
     const bool lm = gte_instr_lm(instr);
-    int64_t mac1 = ((int64_t)gte->BK[0] << 12) +
+    int64_t mac1 = (int64_t)gte->BK[0] * 4096 +
                    (int64_t)gte->LC[0][0] * gte->IR1 +
                    (int64_t)gte->LC[0][1] * gte->IR2 +
                    (int64_t)gte->LC[0][2] * gte->IR3;
-    int64_t mac2 = ((int64_t)gte->BK[1] << 12) +
+    int64_t mac2 = (int64_t)gte->BK[1] * 4096 +
                    (int64_t)gte->LC[1][0] * gte->IR1 +
                    (int64_t)gte->LC[1][1] * gte->IR2 +
                    (int64_t)gte->LC[1][2] * gte->IR3;
-    int64_t mac3 = ((int64_t)gte->BK[2] << 12) +
+    int64_t mac3 = (int64_t)gte->BK[2] * 4096 +
                    (int64_t)gte->LC[2][0] * gte->IR1 +
                    (int64_t)gte->LC[2][1] * gte->IR2 +
                    (int64_t)gte->LC[2][2] * gte->IR3;
@@ -122,9 +122,9 @@ static void color_output(GTEState* gte, uint32_t instr) {
     uint8_t r0 = (gte->RGBC >> 0)  & 0xFF;
     uint8_t g0 = (gte->RGBC >> 8)  & 0xFF;
     uint8_t b0 = (gte->RGBC >> 16) & 0xFF;
-    int64_t mac1 = ((int64_t)r0 * gte->IR1) << 4;
-    int64_t mac2 = ((int64_t)g0 * gte->IR2) << 4;
-    int64_t mac3 = ((int64_t)b0 * gte->IR3) << 4;
+    int64_t mac1 = (int64_t)r0 * gte->IR1 * 16;
+    int64_t mac2 = (int64_t)g0 * gte->IR2 * 16;
+    int64_t mac3 = (int64_t)b0 * gte->IR3 * 16;
     gte->MAC1 = static_cast<int32_t>(mac1 >> 12);
     gte->MAC2 = static_cast<int32_t>(mac2 >> 12);
     gte->MAC3 = static_cast<int32_t>(mac3 >> 12);
@@ -146,15 +146,15 @@ static void color_output(GTEState* gte, uint32_t instr) {
 static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
     const int  shift = gte_instr_sf(instr);
     const bool lm    = gte_instr_lm(instr);
-    int64_t base1 = (int64_t)gte->IR1 << 12;
-    int64_t base2 = (int64_t)gte->IR2 << 12;
-    int64_t base3 = (int64_t)gte->IR3 << 12;
+    int64_t base1 = (int64_t)gte->IR1 * 4096;
+    int64_t base2 = (int64_t)gte->IR2 * 4096;
+    int64_t base3 = (int64_t)gte->IR3 * 4096;
     int16_t step1 = gte->saturate_ir(
-        (int32_t)(( ((int64_t)gte->FC[0] << 12) - base1) >> shift), 1, false);
+        (int32_t)((((int64_t)gte->FC[0] * 4096 - base1) >> shift)), 1, false);
     int16_t step2 = gte->saturate_ir(
-        (int32_t)(( ((int64_t)gte->FC[1] << 12) - base2) >> shift), 2, false);
+        (int32_t)((((int64_t)gte->FC[1] * 4096 - base2) >> shift)), 2, false);
     int16_t step3 = gte->saturate_ir(
-        (int32_t)(( ((int64_t)gte->FC[2] << 12) - base3) >> shift), 3, false);
+        (int32_t)((((int64_t)gte->FC[2] * 4096 - base3) >> shift)), 3, false);
     int64_t mac1 = (base1 + (int64_t)gte->IR0 * step1) >> shift;
     int64_t mac2 = (base2 + (int64_t)gte->IR0 * step2) >> shift;
     int64_t mac3 = (base3 + (int64_t)gte->IR0 * step3) >> shift;
@@ -776,15 +776,15 @@ extern "C" void gte_set_display_aspect(int num, int den) {
 // ---------------------------------------------------------------------------
 void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // Step 1: Matrix multiplication + translation
-    int64_t mac1 = ((int64_t)gte->TR[0] << 12) +
+    int64_t mac1 = (int64_t)gte->TR[0] * 4096 +
                    (int64_t)gte->RT[0][0] * V[0] +
                    (int64_t)gte->RT[0][1] * V[1] +
                    (int64_t)gte->RT[0][2] * V[2];
-    int64_t mac2 = ((int64_t)gte->TR[1] << 12) +
+    int64_t mac2 = (int64_t)gte->TR[1] * 4096 +
                    (int64_t)gte->RT[1][0] * V[0] +
                    (int64_t)gte->RT[1][1] * V[1] +
                    (int64_t)gte->RT[1][2] * V[2];
-    int64_t mac3 = ((int64_t)gte->TR[2] << 12) +
+    int64_t mac3 = (int64_t)gte->TR[2] * 4096 +
                    (int64_t)gte->RT[2][0] * V[0] +
                    (int64_t)gte->RT[2][1] * V[1] +
                    (int64_t)gte->RT[2][2] * V[2];
@@ -1140,9 +1140,9 @@ void gte_mvmva(GTEState* gte, uint32_t instr) {
     // Select translation vector
     int64_t T[3];
     switch (tv) {
-        case 0: T[0] = (int64_t)gte->TR[0] << 12; T[1] = (int64_t)gte->TR[1] << 12; T[2] = (int64_t)gte->TR[2] << 12; break;
-        case 1: T[0] = (int64_t)gte->BK[0] << 12; T[1] = (int64_t)gte->BK[1] << 12; T[2] = (int64_t)gte->BK[2] << 12; break;
-        case 2: T[0] = (int64_t)gte->FC[0] << 12; T[1] = (int64_t)gte->FC[1] << 12; T[2] = (int64_t)gte->FC[2] << 12; break;
+        case 0: T[0] = (int64_t)gte->TR[0] * 4096; T[1] = (int64_t)gte->TR[1] * 4096; T[2] = (int64_t)gte->TR[2] * 4096; break;
+        case 1: T[0] = (int64_t)gte->BK[0] * 4096; T[1] = (int64_t)gte->BK[1] * 4096; T[2] = (int64_t)gte->BK[2] * 4096; break;
+        case 2: T[0] = (int64_t)gte->FC[0] * 4096; T[1] = (int64_t)gte->FC[1] * 4096; T[2] = (int64_t)gte->FC[2] * 4096; break;
         case 3: T[0] = 0; T[1] = 0; T[2] = 0; break;
     }
 
@@ -1262,9 +1262,9 @@ void gte_gpl(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     int sf = (instr >> 19) & 1;
 
-    int64_t mac1 = ((int64_t)gte->MAC1 << (sf ? 12 : 0)) + (int64_t)gte->IR0 * gte->IR1;
-    int64_t mac2 = ((int64_t)gte->MAC2 << (sf ? 12 : 0)) + (int64_t)gte->IR0 * gte->IR2;
-    int64_t mac3 = ((int64_t)gte->MAC3 << (sf ? 12 : 0)) + (int64_t)gte->IR0 * gte->IR3;
+    int64_t mac1 = (sf ? (int64_t)gte->MAC1 * 4096 : (int64_t)gte->MAC1) + (int64_t)gte->IR0 * gte->IR1;
+    int64_t mac2 = (sf ? (int64_t)gte->MAC2 * 4096 : (int64_t)gte->MAC2) + (int64_t)gte->IR0 * gte->IR2;
+    int64_t mac3 = (sf ? (int64_t)gte->MAC3 * 4096 : (int64_t)gte->MAC3) + (int64_t)gte->IR0 * gte->IR3;
 
     if (sf) { mac1 >>= 12; mac2 >>= 12; mac3 >>= 12; }
 
@@ -1478,6 +1478,195 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
 static uint64_t s_gte_exec_count = 0;
 extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
 
+static uint32_t gte_cpu_lzcr(uint32_t value);
+
+static inline int16_t gte_unpack_s16(uint32_t value) {
+    return static_cast<int16_t>(value & 0xFFFFu);
+}
+
+static inline uint32_t gte_pack_s16_pair(int16_t lo, int16_t hi) {
+    return static_cast<uint32_t>(static_cast<uint16_t>(lo)) |
+           (static_cast<uint32_t>(static_cast<uint16_t>(hi)) << 16);
+}
+
+/* Exact full marshaling for GTE commands. Keep this explicit: GTEState has
+ * mixed-width fields and padding, while CPUState exposes architectural 32-bit
+ * register words. Whole-struct copies would be layout/endian dependent. */
+static void gte_import_cpu_state(PSXRecomp::GTE::GTEState* gte,
+                                 const CPUState* cpu) {
+    const uint32_t* d = cpu->gte_data;
+    const uint32_t* c = cpu->gte_ctrl;
+
+    gte->V0[0] = gte_unpack_s16(d[0]);
+    gte->V0[1] = gte_unpack_s16(d[0] >> 16);
+    gte->V0[2] = gte_unpack_s16(d[1]);
+    gte->V1[0] = gte_unpack_s16(d[2]);
+    gte->V1[1] = gte_unpack_s16(d[2] >> 16);
+    gte->V1[2] = gte_unpack_s16(d[3]);
+    gte->V2[0] = gte_unpack_s16(d[4]);
+    gte->V2[1] = gte_unpack_s16(d[4] >> 16);
+    gte->V2[2] = gte_unpack_s16(d[5]);
+    gte->RGBC = d[6];
+    gte->OTZ = static_cast<uint16_t>(d[7]);
+    gte->IR0 = gte_unpack_s16(d[8]);
+    gte->IR1 = gte_unpack_s16(d[9]);
+    gte->IR2 = gte_unpack_s16(d[10]);
+    gte->IR3 = gte_unpack_s16(d[11]);
+    gte->SXY[0] = static_cast<int32_t>(d[12]);
+    gte->SXY[1] = static_cast<int32_t>(d[13]);
+    gte->SXY[2] = static_cast<int32_t>(d[14]);
+    gte->SXY[3] = static_cast<int32_t>(d[14]);
+    for (int i = 0; i < 4; ++i) gte->SZ[i] = static_cast<uint16_t>(d[16 + i]);
+    for (int i = 0; i < 3; ++i) gte->RGB[i] = d[20 + i];
+    gte->MAC0 = static_cast<int32_t>(d[24]);
+    gte->MAC1 = static_cast<int32_t>(d[25]);
+    gte->MAC2 = static_cast<int32_t>(d[26]);
+    gte->MAC3 = static_cast<int32_t>(d[27]);
+    /* Skip IRGB (28): importing it would quantize and overwrite IR1..3. */
+    gte->LZCS = static_cast<int32_t>(d[30]);
+    gte->LZCR = static_cast<int32_t>(gte_cpu_lzcr(d[30]));
+
+    gte->RT[0][0] = gte_unpack_s16(c[0]);
+    gte->RT[0][1] = gte_unpack_s16(c[0] >> 16);
+    gte->RT[0][2] = gte_unpack_s16(c[1]);
+    gte->RT[1][0] = gte_unpack_s16(c[1] >> 16);
+    gte->RT[1][1] = gte_unpack_s16(c[2]);
+    gte->RT[1][2] = gte_unpack_s16(c[2] >> 16);
+    gte->RT[2][0] = gte_unpack_s16(c[3]);
+    gte->RT[2][1] = gte_unpack_s16(c[3] >> 16);
+    gte->RT[2][2] = gte_unpack_s16(c[4]);
+    for (int i = 0; i < 3; ++i) gte->TR[i] = static_cast<int32_t>(c[5 + i]);
+
+    gte->L[0][0] = gte_unpack_s16(c[8]);
+    gte->L[0][1] = gte_unpack_s16(c[8] >> 16);
+    gte->L[0][2] = gte_unpack_s16(c[9]);
+    gte->L[1][0] = gte_unpack_s16(c[9] >> 16);
+    gte->L[1][1] = gte_unpack_s16(c[10]);
+    gte->L[1][2] = gte_unpack_s16(c[10] >> 16);
+    gte->L[2][0] = gte_unpack_s16(c[11]);
+    gte->L[2][1] = gte_unpack_s16(c[11] >> 16);
+    gte->L[2][2] = gte_unpack_s16(c[12]);
+    for (int i = 0; i < 3; ++i) gte->BK[i] = static_cast<int32_t>(c[13 + i]);
+
+    gte->LC[0][0] = gte_unpack_s16(c[16]);
+    gte->LC[0][1] = gte_unpack_s16(c[16] >> 16);
+    gte->LC[0][2] = gte_unpack_s16(c[17]);
+    gte->LC[1][0] = gte_unpack_s16(c[17] >> 16);
+    gte->LC[1][1] = gte_unpack_s16(c[18]);
+    gte->LC[1][2] = gte_unpack_s16(c[18] >> 16);
+    gte->LC[2][0] = gte_unpack_s16(c[19]);
+    gte->LC[2][1] = gte_unpack_s16(c[19] >> 16);
+    gte->LC[2][2] = gte_unpack_s16(c[20]);
+    for (int i = 0; i < 3; ++i) gte->FC[i] = static_cast<int32_t>(c[21 + i]);
+    gte->OFX = static_cast<int32_t>(c[24]);
+    gte->OFY = static_cast<int32_t>(c[25]);
+    gte->H = static_cast<uint16_t>(c[26]);
+    gte->DQA = gte_unpack_s16(c[27]);
+    gte->DQB = static_cast<int32_t>(c[28]);
+    gte->ZSF3 = gte_unpack_s16(c[29]);
+    gte->ZSF4 = gte_unpack_s16(c[30]);
+    gte->FLAG = c[31] & 0x7FFFF000u;
+}
+
+static uint32_t gte_state_pack_irgb(const PSXRecomp::GTE::GTEState* gte) {
+    const uint32_t r = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(gte->IR1 >> 7), 0, 0x1F));
+    const uint32_t g = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(gte->IR2 >> 7), 0, 0x1F));
+    const uint32_t b = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(gte->IR3 >> 7), 0, 0x1F));
+    return (b << 10) | (g << 5) | r;
+}
+
+static void gte_export_cpu_state(CPUState* cpu,
+                                 const PSXRecomp::GTE::GTEState* gte) {
+    uint32_t* d = cpu->gte_data;
+    uint32_t* c = cpu->gte_ctrl;
+
+    d[0] = gte_pack_s16_pair(gte->V0[0], gte->V0[1]);
+    d[1] = static_cast<uint16_t>(gte->V0[2]);
+    d[2] = gte_pack_s16_pair(gte->V1[0], gte->V1[1]);
+    d[3] = static_cast<uint16_t>(gte->V1[2]);
+    d[4] = gte_pack_s16_pair(gte->V2[0], gte->V2[1]);
+    d[5] = static_cast<uint16_t>(gte->V2[2]);
+    d[6] = gte->RGBC;
+    d[7] = gte->OTZ;
+    d[8] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR0));
+    d[9] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR1));
+    d[10] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR2));
+    d[11] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR3));
+    d[12] = static_cast<uint32_t>(gte->SXY[0]);
+    d[13] = static_cast<uint32_t>(gte->SXY[1]);
+    d[14] = static_cast<uint32_t>(gte->SXY[2]);
+    d[15] = static_cast<uint32_t>(gte->SXY[3]);
+    for (int i = 0; i < 4; ++i) d[16 + i] = gte->SZ[i];
+    for (int i = 0; i < 3; ++i) d[20 + i] = gte->RGB[i];
+    d[23] = 0;
+    d[24] = static_cast<uint32_t>(gte->MAC0);
+    d[25] = static_cast<uint32_t>(gte->MAC1);
+    d[26] = static_cast<uint32_t>(gte->MAC2);
+    d[27] = static_cast<uint32_t>(gte->MAC3);
+    d[28] = d[29] = gte_state_pack_irgb(gte);
+    d[30] = static_cast<uint32_t>(gte->LZCS);
+    d[31] = static_cast<uint32_t>(gte->LZCR);
+
+    c[0] = gte_pack_s16_pair(gte->RT[0][0], gte->RT[0][1]);
+    c[1] = gte_pack_s16_pair(gte->RT[0][2], gte->RT[1][0]);
+    c[2] = gte_pack_s16_pair(gte->RT[1][1], gte->RT[1][2]);
+    c[3] = gte_pack_s16_pair(gte->RT[2][0], gte->RT[2][1]);
+    c[4] = static_cast<uint16_t>(gte->RT[2][2]);
+    for (int i = 0; i < 3; ++i) c[5 + i] = static_cast<uint32_t>(gte->TR[i]);
+    c[8] = gte_pack_s16_pair(gte->L[0][0], gte->L[0][1]);
+    c[9] = gte_pack_s16_pair(gte->L[0][2], gte->L[1][0]);
+    c[10] = gte_pack_s16_pair(gte->L[1][1], gte->L[1][2]);
+    c[11] = gte_pack_s16_pair(gte->L[2][0], gte->L[2][1]);
+    c[12] = static_cast<uint16_t>(gte->L[2][2]);
+    for (int i = 0; i < 3; ++i) c[13 + i] = static_cast<uint32_t>(gte->BK[i]);
+    c[16] = gte_pack_s16_pair(gte->LC[0][0], gte->LC[0][1]);
+    c[17] = gte_pack_s16_pair(gte->LC[0][2], gte->LC[1][0]);
+    c[18] = gte_pack_s16_pair(gte->LC[1][1], gte->LC[1][2]);
+    c[19] = gte_pack_s16_pair(gte->LC[2][0], gte->LC[2][1]);
+    c[20] = static_cast<uint16_t>(gte->LC[2][2]);
+    for (int i = 0; i < 3; ++i) c[21 + i] = static_cast<uint32_t>(gte->FC[i]);
+    c[24] = static_cast<uint32_t>(gte->OFX);
+    c[25] = static_cast<uint32_t>(gte->OFY);
+    c[26] = gte->H;
+    c[27] = static_cast<uint32_t>(static_cast<int32_t>(gte->DQA));
+    c[28] = static_cast<uint32_t>(gte->DQB);
+    c[29] = static_cast<uint32_t>(static_cast<int32_t>(gte->ZSF3));
+    c[30] = static_cast<uint32_t>(static_cast<int32_t>(gte->ZSF4));
+    c[31] = gte->FLAG;
+}
+
+static void gte_run_command(PSXRecomp::GTE::GTEState* gte, uint32_t cmd) {
+    using namespace PSXRecomp::GTE;
+    switch (cmd & 0x3Fu) {
+        case 0x01: gte_rtps(gte, cmd); break;
+        case 0x06: gte_nclip(gte, cmd); break;
+        case 0x0C: gte_op(gte, cmd); break;
+        case 0x10: gte_dpcs(gte, cmd); break;
+        case 0x11: gte_intpl(gte, cmd); break;
+        case 0x12: gte_mvmva(gte, cmd); break;
+        case 0x13: gte_ncds(gte, cmd); break;
+        case 0x14: gte_cdp(gte, cmd); break;
+        case 0x16: gte_ncdt(gte, cmd); break;
+        case 0x1B: gte_nccs(gte, cmd); break;
+        case 0x1C: gte_cc(gte, cmd); break;
+        case 0x1E: gte_ncs(gte, cmd); break;
+        case 0x20: gte_nct(gte, cmd); break;
+        case 0x28: gte_sqr(gte, cmd); break;
+        case 0x29: gte_dpcl(gte, cmd); break;
+        case 0x2A: gte_dpct(gte, cmd); break;
+        case 0x2D: gte_avsz3(gte, cmd); break;
+        case 0x2E: gte_avsz4(gte, cmd); break;
+        case 0x30: gte_rtpt(gte, cmd); break;
+        case 0x3D: gte_gpf(gte, cmd); break;
+        case 0x3E: gte_gpl(gte, cmd); break;
+        case 0x3F: gte_ncct(gte, cmd); break;
+        default: std::exit(1);
+    }
+}
+
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -1486,13 +1675,7 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
 #endif
 
     GTEState gte;
-    // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and
-    // reg 28 (IRGB: overwrites IR1/2/3 with lossy 5-bit values; use regs 9-11 instead)
-    for (int i = 0; i < 32; i++) {
-        if (i == 15 || i == 28) continue;
-        gte_mtc2(&gte, i, cpu->gte_data[i]);
-    }
-    for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
+    gte_import_cpu_state(&gte, cpu);
 
     uint8_t func = cmd & 0x3F;
     /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every
@@ -1511,7 +1694,36 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
         intpl_pre_fc[0]=gte.FC[0]; intpl_pre_fc[1]=gte.FC[1]; intpl_pre_fc[2]=gte.FC[2];
     }
 #endif
-    switch (func) {
+    gte_run_command(&gte, cmd);
+
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);
+    if (func == 0x11) gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc);
+#endif
+
+    gte_export_cpu_state(cpu, &gte);
+
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Faithful GTE command completion-stall: arm the per-command deadline
+     * (serializing back-to-back ops). Any later COP2 register access stalls to
+     * it. Single shared site for BOTH backends (compiled + dirty interp both
+     * route GTE commands through gte_execute). */
+    psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
+#endif
+}
+
+#ifdef PSX_GTE_REGISTER_TEST
+/* Preserved pre-optimization bridge: test oracle for full command marshaling. */
+extern "C" void gte_test_execute_reference(CPUState* cpu, uint32_t cmd) {
+    using namespace PSXRecomp::GTE;
+    GTEState gte;
+    for (uint8_t reg = 0; reg < 32; ++reg) {
+        if (reg == 15 || reg == 28) continue;
+        gte_mtc2(&gte, reg, cpu->gte_data[reg]);
+    }
+    for (uint8_t reg = 0; reg < 32; ++reg)
+        gte_ctc2(&gte, reg, cpu->gte_ctrl[reg]);
+    switch (cmd & 0x3Fu) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;
         case 0x0C: gte_op(&gte, cmd); break;
@@ -1534,32 +1746,19 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
         case 0x3D: gte_gpf(&gte, cmd); break;
         case 0x3E: gte_gpl(&gte, cmd); break;
         case 0x3F: gte_ncct(&gte, cmd); break;
-        default:
-            exit(1);
-            break;
+        default: std::exit(1);
     }
-
-#ifndef PSX_NO_DEBUG_TOOLS
-    if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);
-    if (func == 0x11) gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc);
-#endif
-
-    for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
-    for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
-
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-    /* Faithful GTE command completion-stall: arm the per-command deadline
-     * (serializing back-to-back ops). Any later COP2 register access stalls to
-     * it. Single shared site for BOTH backends (compiled + dirty interp both
-     * route GTE commands through gte_execute). */
-    psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
-#endif
+    for (uint8_t reg = 0; reg < 32; ++reg)
+        cpu->gte_data[reg] = gte_mfc2(&gte, reg);
+    for (uint8_t reg = 0; reg < 32; ++reg)
+        cpu->gte_ctrl[reg] = gte_cfc2(&gte, reg);
 }
+#endif
 
 /* C-callable wrappers for GTE register transfers.
  *
  * CPUState's arrays are the canonical GTE backing store between commands.
- * The old wrappers rebuilt a 264-byte GTEState by replaying 62 register writes
+ * The old wrappers rebuilt a full GTEState by replaying 62 register writes
  * for every read, and rebuilt plus exported 64 registers for every write.
  * Transfers are common in vertex loops, so that exact-but-accidental work was
  * a severe interpreter-only tax.  These switches implement the same guest
@@ -1781,6 +1980,21 @@ extern "C" void gte_test_seed_precise_projection(uint32_t index,
     p.y16 = y16;
     p.z = z;
     p.valid = 1;
+}
+
+extern "C" void gte_test_get_precise_projection(uint32_t index,
+                                                  uint32_t* packed,
+                                                  int32_t* x16,
+                                                  int32_t* y16,
+                                                  uint16_t* z,
+                                                  uint8_t* valid) {
+    if (index >= 4) return;
+    const auto &p = PSXRecomp::GTE::s_precise_sxy[index];
+    if (packed) *packed = p.packed;
+    if (x16) *x16 = p.x16;
+    if (y16) *y16 = p.y16;
+    if (z) *z = p.z;
+    if (valid) *valid = p.valid;
 }
 
 extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,

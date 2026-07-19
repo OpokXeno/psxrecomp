@@ -49,7 +49,8 @@ if(BUILD_TESTING)
     target_include_directories(gte_register_access_test PRIVATE include)
     target_compile_definitions(gte_register_access_test PRIVATE
         PSX_NO_DEBUG_TOOLS=1
-        PSX_GTE_REGISTER_TEST=1)
+        PSX_GTE_REGISTER_TEST=1
+        PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
 endif()
 
