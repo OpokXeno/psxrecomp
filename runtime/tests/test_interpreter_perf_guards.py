@@ -64,6 +64,36 @@ def main():
     for guard in ("first_page - 1u", "last_page + 1u", "exec_pc_bitmap"):
         if guard not in capture:
             raise AssertionError(f"pre-DMA capture lost executed-page halo: {guard}")
+    autocap_tick = body(capture, "overlay_autocapture_tick")
+    failed_write = autocap_tick.find("if (!sig && job)")
+    clear_owner = autocap_tick.find("s_autocap_write_job = NULL", failed_write)
+    retry_pending = autocap_tick.find("if (s_autocap_write_job)", clear_owner)
+    enabled_gate = autocap_tick.find("if (!s_autocap_enabled || !s_active)")
+    if min(failed_write, clear_owner, retry_pending, enabled_gate) < 0 or not (
+            failed_write < clear_owner < retry_pending < enabled_gate):
+        raise AssertionError("failed periodic capture is not retained and retried before new epochs")
+    failed_branch = autocap_tick[failed_write:clear_owner]
+    for required in ("job->attempts++", "job->retry_frame", "return;"):
+        if required not in failed_branch:
+            raise AssertionError("periodic capture failure can discard its immutable evidence epoch")
+    retry_branch = autocap_tick[retry_pending:enabled_gate]
+    if ("SDL_AtomicGet(&s_autocap_write_state) == 0" not in retry_branch or
+            "autocap_write_launch(job)" not in retry_branch or
+            "autocap_write_job_free" in retry_branch or "memset(" in retry_branch):
+        raise AssertionError("periodic capture retry mutates or frees newer live evidence")
+    provider_try = body(capture, "autocap_provider_request_try")
+    accepted = provider_try.find("if (cp->request && cp->request())")
+    accepted_sig = provider_try.find("s_autocap_sig_at_req =", accepted)
+    retry_sig = provider_try.find("s_autocap_provider_sig_pending = 0", accepted_sig)
+    retry_delay = provider_try.find("s_autocap_provider_retry_frame = frame +", retry_sig)
+    if min(accepted, accepted_sig, retry_sig, retry_delay) < 0 or not (
+            accepted < accepted_sig < retry_sig < retry_delay):
+        raise AssertionError("compiler spawn failure can mark durable evidence as requested")
+    if "s_autocap_provider_sig_pending = sig" not in autocap_tick:
+        raise AssertionError("durable capture is not retained until provider request acceptance")
+    wait_pending = body(capture, "overlay_capture_wait_pending")
+    if "preserve_snapshot_enqueue_owned(job)" not in wait_pending:
+        raise AssertionError("shutdown drops a failed periodic capture instead of draining it")
     dispatch_inner = body(interp, "dirty_ram_dispatch_inner")
     if "(!current_page_dirty || next_page != current_page)" not in dispatch_inner:
         raise AssertionError("page fast path does not preserve clean-miss behavior")

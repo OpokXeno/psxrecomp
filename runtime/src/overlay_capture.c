@@ -607,6 +607,7 @@ int overlay_capture_count(void)
 #define AUTOCAP_MIN_INSNS       100000ull /* long compute gap pressure gate */
 #define AUTOCAP_COOLDOWN_FRAMES 300u   /* >= ~5 s between auto-fires        */
 #define AUTOCAP_BACKOFF_MAX     64u    /* futile-retry ceiling: 64*5s ≈ 5min */
+#define AUTOCAP_WRITE_RETRY_MAX_FRAMES 60u /* cap failed-I/O retry at ~1 s */
 
 static int      s_autocap_enabled    = 0;
 static uint64_t s_autocap_last_check = 0;
@@ -621,6 +622,9 @@ static uint64_t s_autocap_sig_at_req = 0;    /* manifest FNV at last request */
 static int      s_autocap_reg_at_req = -1;   /* loader candidates at last req */
 static uint32_t s_autocap_backoff    = 1;    /* cooldown multiplier (futile)  */
 static uint32_t s_autocap_futile     = 0;    /* futile skips (telemetry)      */
+static uint64_t s_autocap_provider_sig_pending = 0;
+static uint64_t s_autocap_provider_retry_frame = 0;
+static unsigned s_autocap_provider_attempts = 0;
 
 typedef struct {
     uint8_t *ram;
@@ -630,6 +634,8 @@ typedef struct {
     uint32_t bitmap_words;
     uint64_t manifest_sig;
     uint64_t sequence;
+    uint64_t retry_frame;
+    unsigned attempts;
 } AutocapWriteJob;
 static SDL_atomic_t s_autocap_write_state; /* 0 idle, 1 writing, 2 complete */
 static SDL_Thread *s_autocap_write_thread;
@@ -667,6 +673,18 @@ void overlay_autocapture_get_futility(uint32_t *backoff, uint32_t *futile) {
     if (futile)  *futile  = s_autocap_futile;
 }
 
+#ifdef PSX_OVERLAY_CAPTURE_TEST
+int overlay_capture_test_write_state(void) {
+    return SDL_AtomicGet(&s_autocap_write_state);
+}
+unsigned overlay_capture_test_write_attempts(void) {
+    return s_autocap_write_job ? s_autocap_write_job->attempts : 0u;
+}
+int overlay_capture_test_provider_pending(void) {
+    return s_autocap_provider_sig_pending != 0;
+}
+#endif
+
 /* FNV-1a of the just-written capture manifest. The manifest is a pure
  * function of the capture inputs (live overlay bytes + observed seed-PC
  * sets, both grow-only), so an unchanged hash means a compile request
@@ -687,6 +705,53 @@ static int autocap_write_thread_main(void *opaque)
         job->exec_pc_bitmap, job->ram, job->sequence);
     SDL_AtomicSet(&s_autocap_write_state, 2);
     return 0;
+}
+
+static uint64_t autocap_write_retry_delay(unsigned attempts)
+{
+    uint64_t frames = (uint64_t)(attempts ? attempts : 1u) * 6u;
+    return frames < AUTOCAP_WRITE_RETRY_MAX_FRAMES
+         ? frames : AUTOCAP_WRITE_RETRY_MAX_FRAMES;
+}
+
+/* A durable contribution and a successfully started compiler request are two
+ * separate commits. Retain the former's signature until request() accepts it;
+ * otherwise a transient CreateProcess/pipe/thread failure would mark identical
+ * evidence futile and suppress compilation forever. Returns nonzero while a
+ * provider request is still pending. */
+static int autocap_provider_request_try(const CodeProvider *cp, uint64_t frame)
+{
+    if (!s_autocap_provider_sig_pending) return 0;
+    if (frame < s_autocap_provider_retry_frame) return 1;
+    if (cp->busy && cp->busy()) return 1;
+    if (cp->request && cp->request()) {
+        s_autocap_backoff = 1;
+        s_autocap_sig_at_req = s_autocap_provider_sig_pending;
+        s_autocap_reg_at_req = overlay_loader_registered_count();
+        s_autocap_triggers++;
+        s_autocap_provider_sig_pending = 0;
+        s_autocap_provider_retry_frame = 0;
+        s_autocap_provider_attempts = 0;
+        return 0;
+    }
+    s_autocap_provider_attempts++;
+    s_autocap_provider_retry_frame = frame +
+        autocap_write_retry_delay(s_autocap_provider_attempts);
+    return 1;
+}
+
+static int autocap_write_launch(AutocapWriteJob *job)
+{
+    job->manifest_sig = 0;
+    s_autocap_write_job = job;
+    SDL_AtomicSet(&s_autocap_write_state, 1);
+    s_autocap_write_thread = SDL_CreateThread(autocap_write_thread_main,
+                                               "overlay-capture-write", job);
+    if (!s_autocap_write_thread) {
+        SDL_AtomicSet(&s_autocap_write_state, 0);
+        return 0;
+    }
+    return 1;
 }
 
 /* Copy coherent inputs on the emulation thread, then perform base64 formatting,
@@ -773,12 +838,7 @@ static int autocap_write_start(void)
     AutocapWriteJob *job = capture_snapshot_create(
         0, 2u * 1024u * 1024u, 1);
     if (!job) return 0;
-    s_autocap_write_job = job;
-    SDL_AtomicSet(&s_autocap_write_state, 1);
-    s_autocap_write_thread = SDL_CreateThread(autocap_write_thread_main,
-                                               "overlay-capture-write", job);
-    if (!s_autocap_write_thread) {
-        SDL_AtomicSet(&s_autocap_write_state, 0);
+    if (!autocap_write_launch(job)) {
         s_autocap_write_job = NULL;
         autocap_write_job_free(job);
         return 0;
@@ -848,17 +908,16 @@ static int preserve_writer_start(void)
     return ok;
 }
 
-/* Capture coherent bytes before DMA mutates RAM, but keep base64, hashing,
- * copying, and fsync off the emulation thread. The one FIFO writer bounds I/O
- * concurrency; sequence-aware commits also order it against autocapture. */
-static int preserve_snapshot_async(uint32_t scope_lo, uint32_t scope_hi)
+/* Transfer ownership of an already-coherent immutable snapshot to the
+ * retrying FIFO. This is also the shutdown path for a periodic job whose
+ * formatter/fsync/history commit failed: the live evidence epoch has moved on,
+ * so the old bytes must be retried as-is rather than reconstructed or dropped. */
+static int preserve_snapshot_enqueue_owned(AutocapWriteJob *snapshot)
 {
-    if (!preserve_writer_start()) return 0;
-    AutocapWriteJob *snapshot = capture_snapshot_create(scope_lo, scope_hi, 1);
     PreserveWriteJob *job;
-    if (!snapshot) return 0;
+    if (!snapshot || !preserve_writer_start()) return 0;
     job = (PreserveWriteJob *)calloc(1, sizeof(*job));
-    if (!job) { autocap_write_job_free(snapshot); return 0; }
+    if (!job) return 0;
     job->snapshot = *snapshot;
     free(snapshot);
 
@@ -871,6 +930,19 @@ static int preserve_snapshot_async(uint32_t scope_lo, uint32_t scope_hi)
     return 1;
 }
 
+/* Capture coherent bytes before DMA mutates RAM, but keep base64, hashing,
+ * copying, and fsync off the emulation thread. The one FIFO writer bounds I/O
+ * concurrency; sequence-aware commits also order it against autocapture. */
+static int preserve_snapshot_async(uint32_t scope_lo, uint32_t scope_hi)
+{
+    if (!preserve_writer_start()) return 0;
+    AutocapWriteJob *snapshot = capture_snapshot_create(scope_lo, scope_hi, 1);
+    if (!snapshot) return 0;
+    if (preserve_snapshot_enqueue_owned(snapshot)) return 1;
+    autocap_write_job_free(snapshot);
+    return 0;
+}
+
 void overlay_autocapture_tick(void)
 {
     extern uint64_t s_frame_count;
@@ -881,9 +953,18 @@ void overlay_autocapture_tick(void)
         AutocapWriteJob *job = s_autocap_write_job;
         SDL_WaitThread(s_autocap_write_thread, NULL);
         s_autocap_write_thread = NULL;
-        s_autocap_write_job = NULL;
         SDL_AtomicSet(&s_autocap_write_state, 0);
         uint64_t sig = job ? job->manifest_sig : 0;
+        if (!sig && job) {
+            /* The queued snapshot owns the cleared evidence epoch. Keep that
+             * immutable job alive and retry it; never merge it back into or
+             * clear the newer live epoch that has accumulated meanwhile. */
+            job->attempts++;
+            job->retry_frame = s_frame_count +
+                autocap_write_retry_delay(job->attempts);
+            return;
+        }
+        s_autocap_write_job = NULL;
         int reg = overlay_loader_registered_count();
         if (sig && sig == s_autocap_sig_at_req &&
             reg == s_autocap_reg_at_req) {
@@ -894,13 +975,32 @@ void overlay_autocapture_tick(void)
             s_autocap_next_ok = s_frame_count +
                 (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
         } else if (sig) {
-            s_autocap_backoff = 1;
-            s_autocap_sig_at_req = sig;
-            s_autocap_reg_at_req = reg;
-            s_autocap_triggers++;
-            if (cp->request) cp->request();
+            s_autocap_provider_sig_pending = sig;
+            s_autocap_provider_retry_frame = s_frame_count;
+            s_autocap_provider_attempts = 0;
+            (void)autocap_provider_request_try(cp, s_frame_count);
         }
         autocap_write_job_free(job);
+        return;
+    }
+
+    /* A transient formatter/fsync/history-commit or thread-create failure must
+     * not discard an already-cleared evidence epoch. Retry the same immutable
+     * snapshot at bounded cadence before considering another periodic fire. */
+    if (s_autocap_write_job) {
+        AutocapWriteJob *job = s_autocap_write_job;
+        if (SDL_AtomicGet(&s_autocap_write_state) == 0 &&
+            s_frame_count >= job->retry_frame &&
+            !autocap_write_launch(job)) {
+            job->attempts++;
+            job->retry_frame = s_frame_count +
+                autocap_write_retry_delay(job->attempts);
+        }
+        return;
+    }
+
+    if (s_autocap_provider_sig_pending) {
+        (void)autocap_provider_request_try(cp, s_frame_count);
         return;
     }
 
@@ -945,14 +1045,22 @@ void overlay_autocapture_tick(void)
 
 void overlay_capture_wait_pending(void)
 {
-    if (SDL_AtomicGet(&s_autocap_write_state) != 0) {
+    if (s_autocap_write_job) {
         if (s_autocap_write_thread)
             SDL_WaitThread(s_autocap_write_thread, NULL);
         s_autocap_write_thread = NULL;
         AutocapWriteJob *job = s_autocap_write_job;
         s_autocap_write_job = NULL;
         SDL_AtomicSet(&s_autocap_write_state, 0);
-        autocap_write_job_free(job);
+        if (!job->manifest_sig && preserve_snapshot_enqueue_owned(job)) {
+            /* Owned by the retrying FIFO, which is drained just below. */
+        } else {
+            if (!job->manifest_sig) {
+                fprintf(stderr,
+                    "psxrecomp: ERROR: periodic overlay snapshot could not be queued for shutdown retry\n");
+            }
+            autocap_write_job_free(job);
+        }
     }
     if (s_preserve_thread) {
         SDL_LockMutex(s_preserve_mutex);
