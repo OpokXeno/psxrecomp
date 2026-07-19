@@ -7,6 +7,7 @@
 #include "interrupts.h"
 #include "debug_server.h"
 #include "psx_cycles.h"
+#include "lockstep.h"
 #include "overlay_posix.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -332,12 +333,50 @@ static const void *s_shadow_cand = NULL;
  * a larger epoch is an exception armed INSIDE the shadow (contained). */
 static int      s_shadow_saved_native_exec = 0;
 static int      s_shadow_saved_supp       = 0;
+static int      s_shadow_saved_exec_phase = 0;
+static int      s_shadow_saved_call_bail  = 0;
+static uint32_t s_shadow_saved_debug_func = 0;
+static uint32_t s_shadow_saved_irq_calls  = 0;
+static uint64_t s_shadow_saved_irq_supp   = 0;
 static uint64_t s_shadow_epoch            = 0;
 static uint32_t s_shadow_escapes          = 0;
 static uint32_t s_shadow_escapes_native   = 0;
 /* (sljit removed 2026-07-15: the deprecated in-process JIT tier and its
  * live-execution mode are gone; overlay gaps fall to the interpreter.) */
 static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr);
+
+static int cand_range_contains(const Candidate *c, uint32_t phys) {
+    for (int r = 0; r < c->nranges; r++)
+        if (phys >= c->range_lo[r] && phys < c->range_lo[r] + c->range_len[r])
+            return 1;
+    return 0;
+}
+
+static int cand_ranges_overlap(const Candidate *a, const Candidate *b) {
+    for (int ar = 0; ar < a->nranges; ar++) {
+        uint32_t alo = a->range_lo[ar], ahi = alo + a->range_len[ar];
+        for (int br = 0; br < b->nranges; br++) {
+            uint32_t blo = b->range_lo[br], bhi = blo + b->range_len[br];
+            if (alo < bhi && blo < ahi) return 1;
+        }
+    }
+    return 0;
+}
+
+/* An explicit entry filter owns its whole code envelope, including separately
+ * seeded continuation candidates. This prevents an IRQ resume at a mid-function
+ * PC from bypassing the diagnostic quarantine and running native live. The scan
+ * is intentionally diagnostic-only (s_diff_addr != 0). */
+static int cand_selected_for_diff(const Candidate *c) {
+    if (!s_diff_addr) return 1;
+    uint32_t target = s_diff_addr & 0x1FFFFFFFu;
+    if (c->addr == target || cand_range_contains(c, target)) return 1;
+    for (int i = 0; i < s_cand_n; i++) {
+        const Candidate *owner = &s_cand[i];
+        if (owner->addr == target && cand_ranges_overlap(c, owner)) return 1;
+    }
+    return 0;
+}
 
 /* ---- Counters (surfaced via overlay_loader_status) --------------------- */
 static int      s_ndlls          = 0;   /* DLLs LoadLibrary'd                 */
@@ -1372,6 +1411,9 @@ void overlay_loader_get_irq_suppress(int *mode, uint32_t *rl, uint64_t *supp) {
 }
 
 static int overlay_irq_suppressed_now(void) {
+    /* Differential replay (and its authoritative interpreter pass) is atomic.
+     * Never let a previously armed rate-limit punch a real IRQ into a shadow. */
+    if (s_in_shadow) { s_irq_suppressed++; return 1; }
     if (s_suppress_irq) {
         if (s_irq_ratelimit == 0) { s_irq_suppressed++; return 1; }
         if ((++s_irq_callcount % s_irq_ratelimit) != 0) { s_irq_suppressed++; return 1; }
@@ -2394,10 +2436,9 @@ retry_candidates:
                  * too — the blocklist blocks LIVE native, not the sandbox). */
                 int in_own_shadow = (s_in_shadow && (const void *)c == s_shadow_cand);
                 if (!in_own_shadow) {
-                    int want_diff = s_diff_mode &&
-                                    (!s_diff_addr || phys == (s_diff_addr & 0x1FFFFFFFu));
+                    int want_diff = s_diff_mode && cand_selected_for_diff(c);
                     if (want_diff && addr < 0x10000u) want_diff = 0;
-                    if (want_diff && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+                    if (want_diff && (s_diff_addr || c->diff_passes < OVERLAY_DIFF_BUDGET)) {
                         if (_probe) s_cps_probe_outcome = 5;
                         s_diffgate_interp++;
                         s_disp_interp++;
@@ -2501,8 +2542,7 @@ retry_candidates:
              * gcc/DLL candidates are the trusted tier (validated at dev time) and
              * run native directly; they are diffed only in explicit dev diff mode
              * (PSX_OVERLAY_DIFF / overlay_diff cmd). */
-            int want_diff = s_diff_mode &&
-                            (!s_diff_addr || phys == (s_diff_addr & 0x1FFFFFFFu));
+            int want_diff = s_diff_mode && cand_selected_for_diff(c);
             /* Kernel-window candidates (call gates 0xA0/0xB0/0xC0 and the RAM
              * kernel) are NOT shadow-diffable: the gates tail-jump via RAM
              * tables into kernel SERVICES whose behavior depends on scheduler/
@@ -2512,7 +2552,8 @@ retry_candidates:
              * ring). The diff harness validates OVERLAY shard codegen against
              * the interp oracle; kernel gates stay on their normal route. */
             if (want_diff && addr < 0x10000u) want_diff = 0;
-            if (want_diff && !s_in_shadow && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+            if (want_diff && !s_in_shadow &&
+                (s_diff_addr || c->diff_passes < OVERLAY_DIFF_BUDGET)) {
                 /* NEVER start a shadow inside an exception dispatch: the guest's
                  * ReturnFromException longjmps to the setjmp frame BELOW us
                  * (psx_check_interrupts), unwinding run_shadow_diff WITHOUT its
@@ -2762,16 +2803,19 @@ int overlay_fp_enabled(void) {
  * computation is correct and the fault is timing/interrupt-ordering. */
 #define SHADOW_RAM_SIZE  (2u * 1024u * 1024u)
 #define SHADOW_SPAD_SIZE 1024u
-static uint8_t  s_ram0[SHADOW_RAM_SIZE];   /* pre-call main-RAM snapshot  */
-static uint8_t  s_ramN[SHADOW_RAM_SIZE];   /* post-native main-RAM        */
-static uint8_t  s_ramI[SHADOW_RAM_SIZE];   /* post-interp main-RAM (kept) */
-static uint8_t  s_spad0[SHADOW_SPAD_SIZE]; /* pre-call scratchpad snapshot*/
-static uint8_t  s_spadI[SHADOW_SPAD_SIZE]; /* post-interp scratchpad (kept)*/
-static uint64_t s_shadow_skipped_dev = 0;  /* candidates skipped: touch MMIO */
+static uint8_t  s_ram0[SHADOW_RAM_SIZE], s_ramN[SHADOW_RAM_SIZE], s_ramI[SHADOW_RAM_SIZE];
+static uint8_t  s_spad0[SHADOW_SPAD_SIZE], s_spadI[SHADOW_SPAD_SIZE];
+static uint64_t s_shadow_skipped_dev = 0;  /* unsafe/incomplete traces skipped */
 /* s_diff_mode / s_in_shadow declared above (before dispatch). */
 
 typedef struct {
     uint64_t seq; uint32_t addr;
+    int      kind;         /* architectural/trace difference class          */
+    int      index;        /* register/array index, or -1                    */
+    uint64_t cycle_native, cycle_interp;
+    uint32_t trace_ops, replay_ops;
+    int      trace_kind;
+    uint32_t trace_pc, trace_addr, trace_expected, trace_actual;
     int      reg;          /* first differing gpr index, -1 none           */
     uint32_t reg_native, reg_interp;
     int      hi_diff, lo_diff;
@@ -2793,7 +2837,7 @@ static uint32_t s_detail_nat_hi, s_detail_nat_lo, s_detail_int_hi, s_detail_int_
 
 void overlay_loader_set_diff_mode(int on) { s_diff_mode = on ? 1 : 0; }
 
-static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
+static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint8_t *memory_get_ram_ptr(void);
     extern uint8_t *memory_get_scratchpad_ptr(void);
     extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
@@ -2960,6 +3004,215 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     s_in_shadow    = 0;
 }
 
+enum {
+    SHDIFF_NONE = 0, SHDIFF_PC, SHDIFF_GPR, SHDIFF_HI, SHDIFF_LO,
+    SHDIFF_COP0, SHDIFF_GTE_DATA, SHDIFF_GTE_CTRL,
+    SHDIFF_MULDIV_TS, SHDIFF_GTE_TS, SHDIFF_READ_ABSORB,
+    SHDIFF_READ_WHICH, SHDIFF_READ_FUDGE, SHDIFF_LD_WHICH,
+    SHDIFF_LD_ABSORB, SHDIFF_CYCLE, SHDIFF_TRACE, SHDIFF_SETUP
+};
+
+static int shadow_cpu_diff(const CPUState *native, const CPUState *interp,
+                           int *index, uint32_t *nv, uint32_t *iv) {
+#define SHCMP_SCALAR(kind_, field_) do { \
+    if (native->field_ != interp->field_) { \
+        *index = -1; *nv = (uint32_t)native->field_; *iv = (uint32_t)interp->field_; \
+        return (kind_); \
+    } \
+} while (0)
+#define SHCMP_ARRAY(kind_, field_, count_) do { \
+    for (int _i = 0; _i < (count_); _i++) { \
+        if (native->field_[_i] != interp->field_[_i]) { \
+            *index = _i; *nv = (uint32_t)native->field_[_i]; \
+            *iv = (uint32_t)interp->field_[_i]; return (kind_); \
+        } \
+    } \
+} while (0)
+    if (native->pc != interp->pc) {
+        *index = -1; *nv = native->pc; *iv = interp->pc; return SHDIFF_PC;
+    }
+    SHCMP_ARRAY(SHDIFF_GPR, gpr, 32);
+    SHCMP_SCALAR(SHDIFF_HI, hi);
+    SHCMP_SCALAR(SHDIFF_LO, lo);
+    SHCMP_ARRAY(SHDIFF_COP0, cop0, 32);
+    SHCMP_ARRAY(SHDIFF_GTE_DATA, gte_data, 32);
+    SHCMP_ARRAY(SHDIFF_GTE_CTRL, gte_ctrl, 32);
+    SHCMP_SCALAR(SHDIFF_MULDIV_TS, muldiv_ts_done);
+    SHCMP_SCALAR(SHDIFF_GTE_TS, gte_ts_done);
+    SHCMP_ARRAY(SHDIFF_READ_ABSORB, read_absorb, 33);
+    SHCMP_SCALAR(SHDIFF_READ_WHICH, read_absorb_which);
+    SHCMP_SCALAR(SHDIFF_READ_FUDGE, read_fudge);
+    SHCMP_SCALAR(SHDIFF_LD_WHICH, ld_which_t);
+    SHCMP_SCALAR(SHDIFF_LD_ABSORB, ld_absorb);
+#undef SHCMP_ARRAY
+#undef SHCMP_SCALAR
+    *index = -1; *nv = 0; *iv = 0;
+    return SHDIFF_NONE;
+}
+
+/* Authoritative interpreter RECORD + side-effect-free native REPLAY.
+ * Memory reads are replayed and writes verified/no-op, the replay clock advances
+ * without servicing devices, and GTE visual/diagnostic sidecars are sandboxed.
+ * Thus RAM/MMIO/devices mutate exactly once while the comparison covers the full
+ * CPU architectural and timing state plus the ordered memory-operation trace. */
+static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
+    extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
+    extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t return_addr);
+    extern int gte_replay_side_effects_begin(void);
+    extern void gte_replay_side_effects_end(void);
+    extern uint32_t g_debug_current_func_addr;
+    extern uint64_t psx_exception_setjmp_epoch(void);
+
+    s_in_shadow = 1;
+    s_shadow_epoch = psx_exception_setjmp_epoch();
+    int saved_supp = s_suppress_irq;
+    int saved_native = s_native_exec;
+    s_suppress_irq = 1;
+    s_native_exec = 0;
+    s_shadow_saved_supp = saved_supp;
+    s_shadow_saved_native_exec = saved_native;
+    s_shadow_saved_exec_phase = g_exec_phase;
+    s_shadow_saved_call_bail = g_psx_call_bail;
+    s_shadow_saved_debug_func = g_debug_current_func_addr;
+    s_shadow_saved_irq_calls = s_irq_callcount;
+    s_shadow_saved_irq_supp = s_irq_suppressed;
+
+    CPUState cpu0 = *cpu;
+    uint64_t cycle0 = psx_get_cycle_count();
+    uint32_t stop_ra = cpu0.gpr[31];
+    uint32_t record_ops = 0, replay_ops = 0;
+    int saw_exception = 0;
+    int icache_record_ok = psx_icache_shadow_record_begin();
+    int record_owned = 0;
+    int record_ok = icache_record_ok && ls_shadow_record_begin();
+    if (record_ok) {
+        record_owned = 1;
+        dirty_ram_dispatch(cpu, addr, stop_ra);
+        record_ok = ls_shadow_record_end(&record_ops, &saw_exception);
+        record_owned = 0;
+    } else {
+        dirty_ram_dispatch(cpu, addr, stop_ra);
+    }
+    s_shadow_calls++;
+
+    CPUState cpuI = *cpu;
+    uint64_t cycleI = psx_get_cycle_count();
+    if (!record_ok || saw_exception) {
+        s_shadow_skipped_dev++;
+        if (record_owned) ls_shadow_abort();
+        psx_icache_shadow_abort();
+        s_native_exec = saved_native;
+        s_suppress_irq = saved_supp;
+        s_in_shadow = 0;
+        return;
+    }
+
+    CPUState cpuN = cpu0;
+    int trace_kind = 0;
+    uint32_t trace_pc = 0, trace_addr = 0, trace_expected = 0, trace_actual = 0;
+    int replay_owned = 0;
+    int replay_ok = ls_shadow_replay_begin();
+    if (replay_ok) replay_owned = 1;
+    int icache_ok = replay_ok && psx_icache_shadow_replay_begin();
+    int clock_ok = icache_ok && psx_cycle_replay_begin(cycle0);
+    int gte_ok = clock_ok && gte_replay_side_effects_begin();
+    uint32_t saved_debug_func = g_debug_current_func_addr;
+    uint32_t saved_irq_callcount = s_irq_callcount;
+    uint64_t saved_irq_suppressed = s_irq_suppressed;
+    int saved_bail = g_psx_call_bail;
+
+    if (gte_ok) {
+        s_shadow_cand = c;
+        {
+            int prev_phase = g_exec_phase;
+            OverlayFlushFn prev_flush = overlay_flush_enter(c);
+            g_exec_phase = 2;
+            c->fn(&cpuN);
+            overlay_flush_leave(prev_flush);
+            g_exec_phase = prev_phase;
+        }
+        {
+            int guard = 0;
+            while (cpuN.pc != 0 && !g_psx_call_bail && guard++ < 8192) {
+                uint32_t tv = cpuN.pc;
+                if ((tv & 0x1FFFFFFFu) == (stop_ra & 0x1FFFFFFFu)) break;
+                cpuN.pc = 0;
+                int prev_phase = g_exec_phase;
+                g_exec_phase = 3;
+                psx_dispatch_call(&cpuN, tv, stop_ra);
+                g_exec_phase = prev_phase;
+            }
+        }
+        s_shadow_cand = NULL;
+    }
+
+    if (gte_ok) gte_replay_side_effects_end();
+    uint64_t cycleN = clock_ok ? psx_cycle_replay_end() : cycle0;
+    psx_icache_shadow_replay_end();
+    if (replay_ok) {
+        replay_ok = ls_shadow_replay_end(&replay_ops, &trace_kind, &trace_pc,
+                                         &trace_addr, &trace_expected, &trace_actual);
+        replay_owned = 0;
+    } else if (replay_owned) {
+        ls_shadow_abort();
+        replay_owned = 0;
+    }
+    psx_icache_shadow_abort();
+    g_debug_current_func_addr = saved_debug_func;
+    s_irq_callcount = saved_irq_callcount;
+    s_irq_suppressed = saved_irq_suppressed;
+    g_psx_call_bail = saved_bail;
+
+    int index = -1;
+    uint32_t native_value = 0, interp_value = 0;
+    int kind = (!gte_ok || !replay_ok) ? SHDIFF_TRACE :
+               shadow_cpu_diff(&cpuN, &cpuI, &index, &native_value, &interp_value);
+    if (kind == SHDIFF_NONE && cycleN - cycle0 != cycleI - cycle0) {
+        kind = SHDIFF_CYCLE;
+        native_value = (uint32_t)(cycleN - cycle0);
+        interp_value = (uint32_t)(cycleI - cycle0);
+    }
+
+    if (kind == SHDIFF_NONE) {
+        if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
+    } else {
+        c->diff_passes = 0;
+        c->device_touch = 1;  /* fail closed: all later calls stay interpreted */
+        s_shadow_divs++;
+        if (!s_detail_captured) {
+            s_detail_captured = 1;
+            s_detail_addr = c->addr;
+            memcpy(s_detail_nat_gpr, cpuN.gpr, sizeof s_detail_nat_gpr);
+            memcpy(s_detail_int_gpr, cpuI.gpr, sizeof s_detail_int_gpr);
+            s_detail_nat_hi = cpuN.hi; s_detail_nat_lo = cpuN.lo;
+            s_detail_int_hi = cpuI.hi; s_detail_int_lo = cpuI.lo;
+        }
+        int addr_recs = 0;
+        for (int i = 0; i < s_sdiv_n; i++)
+            if (s_sdiv[i].addr == c->addr && ++addr_recs >= 16) break;
+        if (s_sdiv_n < SDIV_CAP && addr_recs < 16) {
+            ShadowDiv *d = &s_sdiv[s_sdiv_n++];
+            memset(d, 0, sizeof *d);
+            d->seq = s_shadow_calls; d->addr = c->addr;
+            d->kind = kind; d->index = index;
+            d->cycle_native = cycleN - cycle0;
+            d->cycle_interp = cycleI - cycle0;
+            d->trace_ops = record_ops; d->replay_ops = replay_ops;
+            d->trace_kind = trace_kind; d->trace_pc = trace_pc;
+            d->trace_addr = trace_addr; d->trace_expected = trace_expected;
+            d->trace_actual = trace_actual;
+            d->reg = kind == SHDIFF_GPR ? index : -1;
+            d->reg_native = native_value; d->reg_interp = interp_value;
+            d->hi_diff = kind == SHDIFF_HI; d->lo_diff = kind == SHDIFF_LO;
+            d->ram_off = -1;
+        }
+    }
+
+    s_native_exec = saved_native;
+    s_suppress_irq = saved_supp;
+    s_in_shadow = 0;
+}
+
 /* Called by deferred_exception_longjmp() (interrupts.c) before it unwinds.
  * If the longjmp target frame predates a live shadow run (target_epoch <=
  * s_shadow_epoch), the unwind blows through run_shadow_diff and its epilogue
@@ -2981,12 +3234,27 @@ void overlay_loader_shadow_escape_fixup(uint64_t target_epoch) {
     g_overlay_flush_pending_cycles = NULL;
     if (!s_in_shadow) return;
     if (target_epoch > s_shadow_epoch) return;   /* contained: leave armed */
+    if (s_shadow_cand != NULL) {
+        Candidate *escaped = (Candidate *)s_shadow_cand;
+        escaped->diff_passes = 0;
+        escaped->device_touch = 1; /* native escape is unverified: fail closed */
+    }
+    { extern void gte_replay_side_effects_end(void); gte_replay_side_effects_end(); }
+    (void)psx_cycle_replay_end();
+    psx_icache_shadow_abort();
+    ls_shadow_abort();
     s_shadow_escapes++;
     if (s_shadow_cand != NULL) s_shadow_escapes_native++;
     s_in_shadow    = 0;
     s_shadow_cand  = NULL;
     s_native_exec  = s_shadow_saved_native_exec;
     s_suppress_irq = s_shadow_saved_supp;
+    g_exec_phase = s_shadow_saved_exec_phase;
+    g_psx_call_bail = s_shadow_saved_call_bail;
+    { extern uint32_t g_debug_current_func_addr;
+      g_debug_current_func_addr = s_shadow_saved_debug_func; }
+    s_irq_callcount = s_shadow_saved_irq_calls;
+    s_irq_suppressed = s_shadow_saved_irq_supp;
 }
 
 int overlay_loader_dump_shadow_detail(char *out, int cap) {
@@ -3026,13 +3294,22 @@ int overlay_loader_dump_shadow(char *out, int cap) {
     for (int i = 0; i < s_sdiv_n && n < cap - 200; i++) {
         ShadowDiv *d = &s_sdiv[i];
         n += snprintf(out + n, cap - n,
-            "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"reg\":%d,"
+            "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"kind\":%d,\"index\":%d,\"reg\":%d,"
             "\"reg_native\":\"0x%08X\",\"reg_interp\":\"0x%08X\","
             "\"hi\":%d,\"lo\":%d,\"ram_off\":%lld,"
-            "\"ram_native\":\"0x%08X\",\"ram_interp\":\"0x%08X\"}",
-            i ? "," : "", (unsigned long long)d->seq, d->addr, d->reg,
+            "\"ram_native\":\"0x%08X\",\"ram_interp\":\"0x%08X\","
+            "\"cycle_native\":%llu,\"cycle_interp\":%llu,"
+            "\"trace_ops\":%u,\"replay_ops\":%u,\"trace_kind\":%d,"
+            "\"trace_pc\":\"0x%08X\",\"trace_addr\":\"0x%08X\","
+            "\"trace_expected\":\"0x%08X\",\"trace_actual\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)d->seq, d->addr,
+            d->kind, d->index, d->reg,
             d->reg_native, d->reg_interp, d->hi_diff, d->lo_diff,
-            (long long)d->ram_off, d->ram_native, d->ram_interp);
+            (long long)d->ram_off, d->ram_native, d->ram_interp,
+            (unsigned long long)d->cycle_native,
+            (unsigned long long)d->cycle_interp,
+            d->trace_ops, d->replay_ops, d->trace_kind,
+            d->trace_pc, d->trace_addr, d->trace_expected, d->trace_actual);
     }
     n += snprintf(out + n, cap - n, "]}");
     return n;
