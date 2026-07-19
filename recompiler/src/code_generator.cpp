@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 namespace PSXRecomp {
@@ -1517,6 +1518,22 @@ std::string CodeGenerator::translate_basic_block(
                 std::string delay_saved_cond;    // branch condition captured before delay
                 std::string delay_saved_target;  // JR/JALR target captured before delay
 
+                const uint32_t branch_opcode =
+                    (block.exit_instr.instruction >> 26) & 0x3Fu;
+                const uint32_t branch_rt =
+                    (block.exit_instr.instruction >> 16) & 0x1Fu;
+                if (branch_opcode >= 0x14u && branch_opcode <= 0x17u) {
+                    throw std::runtime_error(fmt::format(
+                        "cannot emit reserved R3000A branch-likely opcode at 0x{:08X}",
+                        addr));
+                }
+                if (branch_opcode == 0x01u &&
+                    branch_rt != 0x00u && branch_rt != 0x01u &&
+                    branch_rt != 0x10u && branch_rt != 0x11u) {
+                    throw std::runtime_error(fmt::format(
+                        "cannot emit unsupported REGIMM branch at 0x{:08X}", addr));
+                }
+
                 // Per-instruction interlock ORDER (Beetle): the branch's §1+deps+DO_LDS
                 // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
                 // step FIRST (it is pure timing — does not touch GPR values, so it is
@@ -1566,7 +1583,22 @@ std::string CodeGenerator::translate_basic_block(
                     uint32_t delay_slot_addr = addr + 4;
                     auto delay_instr_opt = exe_.read_word(delay_slot_addr);
 
-                    if (delay_instr_opt.has_value()) {
+                    /* A native control transfer without its architectural delay
+                     * slot is never a legal partial shard.  In particular, a
+                     * page-scoped overlay capture can end with the branch at
+                     * ...FFC while the slot lives at ...000 in the next page.
+                     * The old code silently skipped the unavailable word and
+                     * still emitted the transfer, corrupting guest state while
+                     * looking like a successful native call.  Fail generation
+                     * closed; the runtime interpreter remains authoritative
+                     * until a capture containing the guard word is available. */
+                    if (!delay_instr_opt.has_value()) {
+                        throw std::runtime_error(fmt::format(
+                            "cannot emit control flow at 0x{:08X}: mandatory "
+                            "delay slot 0x{:08X} is outside the input image",
+                            addr, delay_slot_addr));
+                    }
+                    {
                         uint32_t delay_instr = *delay_instr_opt;
 
                         // For branch-likely variants, delay slot is conditional
@@ -3052,6 +3084,17 @@ std::string CodeGenerator::generate_ranges_manifest(
             (void)baddr;
             uint32_t lo = blk.start_addr;
             uint32_t hi = blk.end_addr + 4u;
+            /* translate_basic_block clones an out-of-block delay slot when the
+             * control-flow instruction itself is the block's last word.  That
+             * cloned instruction is compiled code too: include it in the exact
+             * validity range so its bytes participate in the candidate CRC and
+             * page-generation watch.  Otherwise a later write to the slot could
+             * leave stale native semantics callable. */
+            if (blk.exit_instr.has_delay_slot &&
+                blk.exit_instr.type != ControlFlowType::None &&
+                blk.exit_instr.address == blk.end_addr && hi <= UINT32_MAX - 4u) {
+                hi += 4u;
+            }
             if (hi > lo) iv.emplace_back(lo, hi);
         }
         if (iv.empty()) continue;

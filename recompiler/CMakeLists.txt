@@ -244,6 +244,15 @@ if(BUILD_TESTING)
     )
     add_test(NAME recompiler_patch_cxx17_header_test
              COMMAND recompiler_patch_cxx17_header_test)
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME overlay_cross_page_delay_codegen
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_cross_page_delay_codegen.py
+                    --recompiler $<TARGET_FILE:psxrecomp-game>)
+    endif()
 endif()
 
 # Reachable main-EXE discovery test: parser-bound validation plus exact-entry

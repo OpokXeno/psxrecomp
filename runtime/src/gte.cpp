@@ -1429,8 +1429,10 @@ extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
 
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
+#ifndef PSX_NO_DEBUG_TOOLS
     s_gte_exec_count++;
     s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
+#endif
 
     GTEState gte;
     // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and
@@ -1447,8 +1449,9 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
      * (no-op unless the game opts in — early-out on the config flag). */
     if (func == 0x01 || func == 0x30)
         psx_ws_note_gte_project(func == 0x30 ? 3 : 1);
+#ifndef PSX_NO_DEBUG_TOOLS
     /* INTPL ring: snapshot inputs before the op mutates IR (outputs recorded
-     * after the switch). */
+     * after the switch). Debug tooling only; production does no probe copies. */
     int16_t intpl_pre_ir[4] = {0,0,0,0};
     int32_t intpl_pre_fc[3] = {0,0,0};
     if (func == 0x11) {
@@ -1456,6 +1459,7 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
         intpl_pre_ir[2]=gte.IR2; intpl_pre_ir[3]=gte.IR3;
         intpl_pre_fc[0]=gte.FC[0]; intpl_pre_fc[1]=gte.FC[1]; intpl_pre_fc[2]=gte.FC[2];
     }
+#endif
     switch (func) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;
@@ -1484,8 +1488,10 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
             break;
     }
 
+#ifndef PSX_NO_DEBUG_TOOLS
     if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);
     if (func == 0x11) gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc);
+#endif
 
     for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
     for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);

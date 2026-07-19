@@ -23,6 +23,7 @@ Each DLL exports:
 import argparse
 import base64
 import binascii
+import hashlib
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from typing import Optional
 
 
 class _ThreadLocalStdout:
@@ -243,6 +245,59 @@ def is_windows() -> bool:
 def overlay_ext() -> str:
     """Use the host platform's conventional shared-library suffix."""
     return '.dll' if is_windows() else '.so'
+
+
+def bundle_path_is_immutable(dll_path: str) -> bool:
+    """True for bound <region>_<logical>_<artifact> shared-library names."""
+    name = os.path.basename(dll_path)
+    return re.fullmatch(
+        rf'[0-9A-Fa-f]{{8}}_[0-9A-Fa-f]{{8}}_[0-9A-Fa-f]{{8}}'
+        rf'{re.escape(overlay_ext())}', name) is not None
+
+
+def cached_bundle_pairs(logical_dll: str):
+    """Yield legacy and immutable pairs for one region/logical cache identity."""
+    stem, ext = os.path.splitext(logical_dll)
+    directory = os.path.dirname(logical_dll) or '.'
+    base = os.path.basename(stem)
+    legacy_ranges = stem + '.ranges'
+    if os.path.isfile(logical_dll) and os.path.isfile(legacy_ranges):
+        yield logical_dll, legacy_ranges
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    pattern = re.compile(rf'^{re.escape(base)}_[0-9A-Fa-f]{{8}}{re.escape(ext)}$')
+    for name in names:
+        if not pattern.fullmatch(name):
+            continue
+        dll = os.path.join(directory, name)
+        ranges = os.path.splitext(dll)[0] + '.ranges'
+        if os.path.isfile(ranges):
+            yield dll, ranges
+
+
+def validated_cached_bundle_ids(logical_dll: str, data: bytes,
+                                load_addr: int, size: int):
+    """Yield every artifact for a logical identity with strict validation.
+
+    The caller deliberately sees all same-logical artifacts: immutable repair
+    and richer additive captures must not depend on directory enumeration order.
+    """
+    for cached_dll, ranges_path in cached_bundle_pairs(logical_dll):
+        func_ids = parse_overlay_func_ids(
+            ranges_path, data, load_addr, size, require_stored_crc=True)
+        delay_errors = audit_func_id_delay_slots(func_ids, data, load_addr)
+        yield cached_dll, ranges_path, func_ids, delay_errors
+
+
+def authoritative_cached_bundle_ids(logical_dll: str, data: bytes,
+                                    load_addr: int, size: int):
+    """Yield only artifact-bound bundles allowed to suppress a rebuild."""
+    for bundle in validated_cached_bundle_ids(
+            logical_dll, data, load_addr, size):
+        if bundle_path_is_immutable(bundle[0]):
+            yield bundle
 
 
 def native_path(p: str) -> str:
@@ -1384,7 +1439,7 @@ def generate_overlay_dispatch(variants: list) -> str:
 # ---------------------------------------------------------------------------
 
 def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
-                           size: int) -> list:
+                           size: int, require_stored_crc: bool = False) -> list:
     """Parse the recompiler's _full.ranges manifest and return the list of
     in-overlay function identities as (ev, code_crc, ranges) tuples, where
     ev = virtual entry, code_crc = AUTHORITATIVE hash of the captured code-range
@@ -1405,48 +1460,169 @@ def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
         return ov_lo <= (a & 0x1FFFFFFF) < ov_hi
 
     # Parse the recompiler manifest into [(entry, [(lo, len), ...]), ...].
-    funcs: list[tuple[int, list[tuple[int, int]]]] = []
+    funcs: list[tuple[int, Optional[int], list[tuple[int, int]]]] = []
     cur = None
+    invalid = False
     with open(src_path) as f:
         for line in f:
             s = line.split()
-            if not s:
+            if not s or s[0].startswith('#'):
                 continue
             if s[0] == 'F':
                 try:
+                    if len(s) not in (2, 3):
+                        raise ValueError
                     addr = int(s[1], 16)
+                    stored_crc = int(s[2], 16) if len(s) == 3 else None
+                    if require_stored_crc and stored_crc is None:
+                        raise ValueError
+                    if (require_stored_crc and
+                            (addr & 0xFFE00000) != 0x80000000):
+                        raise ValueError
                 except (IndexError, ValueError):
-                    cur = None
-                    continue
+                    invalid = True
+                    break
                 if in_ov(addr):
-                    cur = (addr, [])
+                    if any((old_addr & 0x1FFFFFFF) ==
+                           (addr & 0x1FFFFFFF) for old_addr, _, _ in funcs):
+                        invalid = True
+                        break
+                    cur = (addr, stored_crc, [])
                     funcs.append(cur)
                 else:
+                    if require_stored_crc:
+                        invalid = True
+                        break
                     cur = None
             elif s[0] == 'R' and cur is not None:
                 try:
+                    if len(s) != 3:
+                        raise ValueError
                     lo, length = int(s[1], 16), int(s[2], 16)
+                    if (require_stored_crc and
+                            (lo & 0xFFE00000) != 0x80000000):
+                        raise ValueError
                 except (IndexError, ValueError):
-                    continue
-                cur[1].append((lo, length))
+                    invalid = True
+                    break
+                cur[2].append((lo, length))
+                if len(cur[2]) > 16:
+                    invalid = True
+                    break
+            elif s[0] == 'R' and cur is None:
+                if require_stored_crc:
+                    invalid = True
+                    break
+            else:
+                invalid = True
+                break
+
+    if invalid:
+        return []
 
     out = []
-    for entry, ranges in funcs:
+    for entry, stored_crc, ranges in funcs:
         if not ranges:
-            continue
+            return []
         crc = 0
-        ok = True
+        normalized = []
+        entry_phys = entry & 0x1FFFFFFF
         for lo, length in ranges:
-            off = (lo & 0x1FFFFFFF) - ov_lo
+            phys = lo & 0x1FFFFFFF
+            off = phys - ov_lo
+            if ((phys | length) & 3) or length < 4:
+                return []
             if off < 0 or off + length > len(data):
-                ok = False  # range outside captured bytes — can't hash reliably
-                break
+                return []
             crc = binascii.crc32(data[off:off + length], crc)
-        if not ok:
-            continue
-        ev = (entry & 0x1FFFFFFF) | 0x80000000
-        out.append((ev, crc & 0xFFFFFFFF, ranges))
+            hi = phys + length
+            if any(phys < old_hi and old_lo < hi
+                   for old_lo, old_hi in normalized):
+                return []
+            normalized.append((phys, hi))
+        if not any(lo <= entry_phys and entry_phys + 4 <= hi
+                   for lo, hi in normalized):
+            return []
+        crc &= 0xFFFFFFFF
+        if stored_crc is not None and stored_crc != crc:
+            return []
+        ev = entry_phys | 0x80000000
+        out.append((ev, crc, ranges))
     return out
+
+
+def _mips_control_kind(instr: int) -> int:
+    """1=supported delayed transfer, 0=ordinary, -1=reserved/unsupported."""
+    op = (instr >> 26) & 0x3F
+    if op == 0:
+        return int((instr & 0x3F) in (0x08, 0x09))  # JR/JALR
+    if op == 0x01:
+        return 1 if ((instr >> 16) & 0x1F) in (0x00, 0x01, 0x10, 0x11) else -1
+    if op in (0x02, 0x03) or 0x04 <= op <= 0x07:
+        return 1
+    if 0x14 <= op <= 0x17:
+        return -1
+    if 0x10 <= op <= 0x13 and ((instr >> 21) & 0x1F) == 0x08:
+        return -1
+    return 0
+
+
+def audit_func_id_delay_slots(func_ids: list, data: bytes,
+                              load_addr: int) -> list:
+    """Return unsafe emitted dependency errors for exact function identities.
+
+    Every native delay slot must exist in this coherent capture and inside the
+    same function's hashed range union.  This packaging audit is intentionally
+    redundant with the recompiler and loader: it prevents an unsafe DLL/ranges
+    pair from being published or reused even when one layer is stale.
+    """
+    errors = []
+    base = load_addr & 0x1FFFFFFF
+    for entry, _crc, ranges in func_ids:
+        if len(ranges) > 16:
+            errors.append((entry, None,
+                           f'{len(ranges)} ranges exceed loader limit 16'))
+            continue
+        normalized = []
+        malformed = False
+        for lo, length in ranges:
+            phys = lo & 0x1FFFFFFF
+            off = phys - base
+            if (phys & 3) or (length & 3) or length < 4 or \
+                    off < 0 or off + length > len(data):
+                errors.append((entry, phys | 0x80000000,
+                               'malformed/out-of-capture code range'))
+                malformed = True
+                break
+            normalized.append((phys, phys + length))
+        if malformed:
+            continue
+
+        def contains_word(addr: int) -> bool:
+            return any(lo <= addr and addr + 4 <= hi
+                       for lo, hi in normalized)
+
+        controls = set()
+        for lo, hi in normalized:
+            for pc in range(lo, hi, 4):
+                off = pc - base
+                instr = int.from_bytes(data[off:off + 4], 'little')
+                kind = _mips_control_kind(instr)
+                if kind < 0:
+                    errors.append((entry, pc | 0x80000000,
+                                   'reserved/unsupported branch encoding'))
+                elif kind > 0:
+                    controls.add(pc)
+                    if not contains_word(pc + 4):
+                        errors.append((entry, pc | 0x80000000,
+                                       f'delay slot 0x{(pc + 4) | 0x80000000:08X} '
+                                       'is not identity-hashed'))
+        delay_pcs = {pc + 4 for pc in controls}
+        nested = sorted(controls & delay_pcs)
+        for pc in nested:
+            errors.append((entry, pc | 0x80000000,
+                           'control transfer in a delay slot'))
+    return errors
 
 
 def write_overlay_ranges_from(func_ids: list, out_path: str) -> int:
@@ -1474,7 +1650,8 @@ def write_overlay_ranges(src_path: str, out_path: str,
         parse_overlay_func_ids(src_path, data, load_addr, size), out_path)
 
 
-def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
+def load_region_coverage(cache_dir: str, phys_addr: int, data: bytes,
+                         load_addr: int, size: int) -> set:
     """Set of (ev, code_crc) function identities already provided by built DLLs
     for this region_start. The loader content-matches per function across ALL
     DLLs sharing a region_start, so a function is "covered" as soon as ANY
@@ -1490,17 +1667,21 @@ def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
     for name in names:
         if not (name.startswith(prefix) and name.endswith('.ranges')):
             continue
-        try:
-            with open(os.path.join(cache_dir, name)) as f:
-                for ln in f:
-                    p = ln.split()
-                    if len(p) >= 3 and p[0] == 'F':
-                        try:
-                            covered.add((int(p[1], 16), int(p[2], 16)))
-                        except ValueError:
-                            pass
-        except OSError:
-            pass
+        # A sidecar is not a committed cache entry by itself.  A process can
+        # stop between the two same-directory renames, or an antivirus/loader
+        # lock can reject one of them on Windows.  Never let an orphan ranges
+        # file poison coverage and suppress a future rebuild.
+        dll_name = name[:-len('.ranges')] + overlay_ext()
+        if not bundle_path_is_immutable(dll_name):
+            continue
+        if not os.path.isfile(os.path.join(cache_dir, dll_name)):
+            continue
+        manifest = os.path.join(cache_dir, name)
+        func_ids = parse_overlay_func_ids(
+            manifest, data, load_addr, size, require_stored_crc=True)
+        if not func_ids or audit_func_id_delay_slots(func_ids, data, load_addr):
+            continue
+        covered.update((ev, crc) for ev, crc, _ranges in func_ids)
     return covered
 
 
@@ -1515,7 +1696,8 @@ def _addr_in_func_ids(addr: int, func_ids: list) -> bool:
     return False
 
 
-def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
+def load_region_entry_set(cache_dir: str, phys_addr: int, data: bytes,
+                          load_addr: int, size: int) -> set:
     """Set of phys-normalized F-line ENTRY addresses provided by ALL built DLLs
     (region + fragment) for this region_start. This — not range coverage — is
     the dispatchability test: native code is enterable ONLY at F entries, so a
@@ -1533,17 +1715,17 @@ def load_region_entry_set(cache_dir: str, phys_addr: int) -> set:
     for name in names:
         if not (name.startswith(prefix) and name.endswith('.ranges')):
             continue
-        try:
-            with open(os.path.join(cache_dir, name)) as f:
-                for ln in f:
-                    p = ln.split()
-                    if len(p) >= 2 and p[0] == 'F':
-                        try:
-                            out.add(int(p[1], 16) & 0x1FFFFFFF)
-                        except ValueError:
-                            pass
-        except OSError:
-            pass
+        dll_name = name[:-len('.ranges')] + overlay_ext()
+        if not bundle_path_is_immutable(dll_name):
+            continue
+        if not os.path.isfile(os.path.join(cache_dir, dll_name)):
+            continue
+        manifest = os.path.join(cache_dir, name)
+        func_ids = parse_overlay_func_ids(
+            manifest, data, load_addr, size, require_stored_crc=True)
+        if not func_ids or audit_func_id_delay_slots(func_ids, data, load_addr):
+            continue
+        out.update(ev & 0x1FFFFFFF for ev, _crc, _ranges in func_ids)
     return out
 
 
@@ -1634,6 +1816,8 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         if audit['unknown_bad'] or audit['unsupported_todo_addrs']:
             return None
         func_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
+        if audit_func_id_delay_slots(func_ids, data, load_addr):
+            return None
         ids_by_addr = {}
         for ev, code_crc, ranges in func_ids:
             ids_by_addr.setdefault(ev, []).append((code_crc, ranges))
@@ -1748,6 +1932,12 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         frag_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
         if not frag_ids:
             return None, 'no-func-ids (empty ranges manifest)'
+        delay_errors = audit_func_id_delay_slots(frag_ids, data, load_addr)
+        if delay_errors:
+            entry, pc, reason = delay_errors[0]
+            where = f' at 0x{pc:08X}' if pc is not None else ''
+            return None, (f'delay-slot-identity-audit: func 0x{entry:08X}'
+                          f'{where}: {reason}')
         # Key the fragment DLL by its func-identity SET (dedup like a region
         # bundle); the loader keys DLLs by the region_start filename prefix and
         # content-matches each function, so a fragment is just another DLL for
@@ -1756,8 +1946,12 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             struct.pack('<II', ev, crc)
             for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
         dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
-        if os.path.exists(dll_path) and not args.force:
-            return frag_ids, 'cached'   # already built
+        if not args.force:
+            for (_cached_dll, _ranges_path, cached_ids,
+                 delay_errors) in authoritative_cached_bundle_ids(
+                    dll_path, data, load_addr, len(data)):
+                if cached_ids and not delay_errors:
+                    return cached_ids, 'cached'
         patched_c = os.path.join(tmp, 'frag_patched.c')
         with open(patched_c, 'w') as f:
             f.write(src)
@@ -1944,16 +2138,16 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
 def compile_and_publish_dll(c_path: str, out_dll: str, include_dirs: list[str],
                             func_ids, gcc: str = 'gcc', flavor: int = 0,
                             compiler: str = 'gcc', tcc: str = 'tcc'):
-    """Compile privately, then atomically publish ranges followed by the DLL.
+    """Compile privately, then publish an immutable DLL/ranges bundle.
 
-    Live runtime rescans may occur while a batch is still running. The DLL name
-    is therefore the commit marker: a scanner can see neither artifact, or a
-    complete ranges file plus a complete DLL, but never a half-linked library.
+    The final stem is content-addressed from both artifacts. Ranges are linked
+    into place first; the uniquely named DLL is the commit marker and is linked
+    last. A scanner therefore sees either no DLL or the exact sidecar that was
+    hashed with it, never a new DLL paired with an older mutable manifest.
     """
     stem, ext = os.path.splitext(out_dll)
     token = f'{os.getpid()}.{threading.get_ident()}'
     tmp_dll = f'{stem}.{token}.tmp{ext}'
-    out_ranges = stem + '.ranges'
     tmp_ranges = f'{stem}.{token}.tmp.ranges'
     for path in (tmp_dll, tmp_ranges):
         try:
@@ -1967,12 +2161,58 @@ def compile_and_publish_dll(c_path: str, out_dll: str, include_dirs: list[str],
         nfunc = write_overlay_ranges_from(func_ids, tmp_ranges)
         if not nfunc:
             return False, 0
-        os.replace(tmp_ranges, out_ranges)
-        os.replace(tmp_dll, out_dll)  # publication/commit marker, always last
+
+        with open(tmp_dll, 'rb') as f:
+            dll_bytes = f.read()
+        with open(tmp_ranges, 'rb') as f:
+            ranges_bytes = f.read()
+        digest = hashlib.sha256(
+            hashlib.sha256(dll_bytes).digest() + ranges_bytes).digest()
+        directory = os.path.dirname(out_dll)
+        logical = os.path.basename(stem)
+        published_dll = published_ranges = None
+
+        def file_equals(path: str, expected: bytes) -> bool:
+            try:
+                with open(path, 'rb') as f:
+                    return f.read() == expected
+            except OSError:
+                return False
+
+        for attempt in range(256):
+            key_bytes = (digest[attempt * 4:attempt * 4 + 4]
+                         if attempt < 8 else
+                         hashlib.sha256(digest + attempt.to_bytes(4, 'little')).digest()[:4])
+            key = int.from_bytes(key_bytes, 'big')
+            final_stem = os.path.join(directory, f'{logical}_{key:08X}')
+            candidate_dll = final_stem + ext
+            candidate_ranges = final_stem + '.ranges'
+            if os.path.exists(candidate_dll) or os.path.exists(candidate_ranges):
+                if (file_equals(candidate_dll, dll_bytes) and
+                        file_equals(candidate_ranges, ranges_bytes)):
+                    published_dll = candidate_dll
+                    published_ranges = candidate_ranges
+                    break
+                continue
+            try:
+                os.link(tmp_ranges, candidate_ranges)
+                os.link(tmp_dll, candidate_dll)  # immutable commit marker, always last
+            except FileExistsError:
+                if (file_equals(candidate_dll, dll_bytes) and
+                        file_equals(candidate_ranges, ranges_bytes)):
+                    published_dll = candidate_dll
+                    published_ranges = candidate_ranges
+                    break
+                continue
+            published_dll, published_ranges = candidate_dll, candidate_ranges
+            break
+        if not published_dll or not published_ranges:
+            raise OSError('could not allocate an immutable shard bundle name')
+
         # Machine-readable live handoff. flush=True is essential because stdout
         # is a pipe under the runtime and a completed shard must not wait in
         # Python's block buffer until the whole batch exits.
-        print(f'PSX_SHARD_PUBLISHED {out_dll}', flush=True)
+        print(f'PSX_SHARD_PUBLISHED {published_dll}', flush=True)
         return True, nfunc
     except OSError as exc:
         print(f'  PUBLISH ERROR: {exc}')
@@ -2185,6 +2425,10 @@ def main():
                     static_entry_sources[entry] = (
                         data, load_addr, size, phys_addr)
 
+        if not args.static:
+            dll_path = os.path.join(
+                cache_dir, f'{phys_addr:08X}_{crc32:08X}{overlay_ext()}')
+
         # Merge evidence from a prior build of the SAME bytes: every F entry
         # in an existing ranges manifest for this exact image was proven
         # compilable before, so a fresh (poorer) capture can't regress
@@ -2194,31 +2438,26 @@ def main():
         # re-derives their interior/alias disposition — feeding them back as
         # roots would truncate their hosts.
         if not args.static:
-            ranges_name = f'{phys_addr:08X}_{crc32:08X}.ranges'
-            prior_ranges = os.path.join(cache_dir, ranges_name)
-            if os.path.exists(prior_ranges):
-                prior_entries = []
-                with open(prior_ranges) as pf:
-                    for ln in pf:
-                        parts = ln.split()
-                        if parts and parts[0] == 'F':
-                            try:
-                                prior_entries.append(int(parts[1], 16))
-                            except (IndexError, ValueError):
-                                pass
-                if prior_entries:
-                    fe = _parse_addr_list(cap.get('function_entry_pcs', []))
-                    de = _parse_addr_list(cap.get('dispatch_entry_pcs', []))
-                    for a in prior_entries:
-                        if _callable_legacy_seed(data, load_addr, a):
-                            fe.add(a)
-                        else:
-                            de.add(a)
-                    cap['function_entry_pcs'] = sorted(fe)
-                    cap['dispatch_entry_pcs'] = sorted(de)
-                    cap.setdefault('schema', 'merged')
-                    print(f'  merged {len(prior_entries)} prior-manifest entries '
-                          f'from {prior_ranges}')
+            prior_entries = set()
+            for (_prior_dll, prior_ranges, prior_ids,
+                 prior_errors) in validated_cached_bundle_ids(
+                    dll_path, data, load_addr, size):
+                if not prior_ids or prior_errors:
+                    continue
+                prior_entries.update(ev for ev, _crc, _ranges in prior_ids)
+            if prior_entries:
+                fe = _parse_addr_list(cap.get('function_entry_pcs', []))
+                de = _parse_addr_list(cap.get('dispatch_entry_pcs', []))
+                for a in prior_entries:
+                    if _callable_legacy_seed(data, load_addr, a):
+                        fe.add(a)
+                    else:
+                        de.add(a)
+                cap['function_entry_pcs'] = sorted(fe)
+                cap['dispatch_entry_pcs'] = sorted(de)
+                cap.setdefault('schema', 'merged')
+                print(f'  merged {len(prior_entries)} validated prior-manifest '
+                      'entries from additive bundles')
 
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
@@ -2242,9 +2481,6 @@ def main():
                 interior_frag_jobs.append((phys_addr, load_addr, size, data,
                                            _interiors | _disp_roots, _executed))
 
-        if not args.static:
-            dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}{overlay_ext()}')
-
         print(f'Overlay  load=0x{load_addr:08X}  size={size}  crc32=0x{crc32:08X}')
         if args.static:
             print(f'  seeds: {len(seeds)}  mode: static -> {static_out}')
@@ -2258,10 +2494,32 @@ def main():
             stats.add_skip()
             return
 
-        if not args.static and os.path.exists(dll_path) and not args.force:
-            print('  SKIP: DLL already exists (use --force to recompile)\n')
-            stats.add_skip()
-            return
+        if not args.static and not args.force:
+            required_entries = {
+                int(seed.split()[-1], 16) & 0xFFFFFFFF
+                for seed in root_seeds
+            }
+            cached_entries = set()
+            for (_cached_dll, ranges_path, existing_ids,
+                 existing_delay_errors) in authoritative_cached_bundle_ids(
+                    dll_path, data, load_addr, size):
+                if existing_ids and not existing_delay_errors:
+                    cached_entries.update(
+                        ev for ev, _crc, _ranges in existing_ids)
+                    continue
+                reason = (existing_delay_errors[0][2]
+                          if existing_delay_errors else 'empty/unverifiable manifest')
+                print(f'  STALE/UNSAFE existing pair: {reason}; rebuilding fail-closed')
+            if required_entries and required_entries <= cached_entries:
+                print('  SKIP: additive shard bundles cover every requested entry '
+                      '(use --force to recompile)\n')
+                stats.add_skip()
+                return
+            if cached_entries:
+                missing = sorted(required_entries - cached_entries)
+                print('  INCOMPLETE existing bundles: missing requested entries '
+                      + ', '.join(f'0x{entry:08X}' for entry in missing)
+                      + '; rebuilding additively')
 
         with tempfile.TemporaryDirectory() as tmp:
             # Write fake PS-EXE. The header entry PC becomes a walk root in the
@@ -2348,6 +2606,15 @@ def main():
 
                 func_ids = parse_overlay_func_ids(ranges_src, data,
                                                   load_addr, size)
+                delay_errors = audit_func_id_delay_slots(
+                    func_ids, data, load_addr)
+                if delay_errors:
+                    entry, pc, reason = delay_errors[0]
+                    where = f' at 0x{pc:08X}' if pc is not None else ''
+                    print(f'  STATIC DELAY-SLOT IDENTITY AUDIT FAILED: '
+                          f'func 0x{entry:08X}{where}: {reason}\n')
+                    stats.add_fail(_label, 'delay_slot_identity', reason)
+                    return
                 ids_by_addr = {}
                 for ev, code_crc, ranges in func_ids:
                     ids_by_addr.setdefault(ev, []).append((code_crc, ranges))
@@ -2421,12 +2688,22 @@ def main():
                 # an endless pile of redundant DLLs.
                 this_ids = (parse_overlay_func_ids(ranges_src, data, load_addr, size)
                             if ranges_src else [])
+                delay_errors = audit_func_id_delay_slots(
+                    this_ids, data, load_addr)
+                if delay_errors:
+                    entry, pc, reason = delay_errors[0]
+                    where = f' at 0x{pc:08X}' if pc is not None else ''
+                    print(f'  DELAY-SLOT IDENTITY AUDIT FAILED: '
+                          f'func 0x{entry:08X}{where}: {reason}\n')
+                    stats.add_fail(_label, 'delay_slot_identity', reason)
+                    return
                 this_set = {(ev, crc) for ev, crc, _ in this_ids}
 
                 with cov_lock:
                     covered = region_coverage_cache.get(phys_addr)
                     if covered is None:
-                        covered = load_region_coverage(cache_dir, phys_addr)
+                        covered = load_region_coverage(
+                            cache_dir, phys_addr, data, load_addr, size)
                         region_coverage_cache[phys_addr] = covered
                     fully_covered = (bool(this_set) and this_set <= covered
                                      and not args.force)
@@ -2451,8 +2728,7 @@ def main():
                     compiler=args.compiler, tcc=args.tcc)
                 if success:
                     if this_ids:
-                        print(f'  ranges: {nfn} functions -> '
-                              f'{os.path.splitext(dll_path)[0]}.ranges')
+                        print(f'  ranges: {nfn} functions in immutable shard bundle')
                         # New identities are now available for this region_start;
                         # keep the warm coverage set current so later captures in
                         # this same run dedup against them. (Parallel note: the
@@ -2463,7 +2739,7 @@ def main():
                         # DLLs at a region.)
                         with cov_lock:
                             covered |= this_set
-                        print(f'  OK -> {dll_path}\n')
+                        print('  OK -> immutable shard bundle published\n')
                         stats.add_ok()
                     else:
                         print('  WARNING: recompiler emitted no _full.ranges — '
@@ -2511,7 +2787,8 @@ def main():
             # range" does NOT make a dispatch target servable — a range-
             # covered PC with no F entry anywhere still interps its whole
             # chain on every dispatch. Demand an entry at exactly this PC.
-            covered_entries = load_region_entry_set(cache_dir, phys_addr)
+            covered_entries = load_region_entry_set(
+                cache_dir, phys_addr, data, load_addr, size)
             orphans = sorted(a for a in interior_pcs
                              if (a in executed or a in forced_interiors)
                              and (a & 0x1FFFFFFF) not in covered_entries)

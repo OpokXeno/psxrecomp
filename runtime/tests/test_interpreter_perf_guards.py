@@ -27,7 +27,9 @@ def main():
     interp = (ROOT / "runtime/src/dirty_ram_interp.c").read_text(encoding="utf-8")
     capture = (ROOT / "runtime/src/overlay_capture.c").read_text(encoding="utf-8")
     loader = (ROOT / "runtime/src/overlay_loader.c").read_text(encoding="utf-8")
+    autocompile = (ROOT / "runtime/src/autocompile.c").read_text(encoding="utf-8")
     memory = (ROOT / "runtime/src/memory.c").read_text(encoding="utf-8")
+    gte = (ROOT / "runtime/src/gte.cpp").read_text(encoding="utf-8")
     cycles = (ROOT / "runtime/src/psx_cycles.c").read_text(encoding="utf-8")
     cyc_header = (ROOT / "runtime/include/psx_cyc.h").read_text(encoding="utf-8")
     starvation = (ROOT / "runtime/include/starvation_ring.h").read_text(encoding="utf-8")
@@ -39,6 +41,12 @@ def main():
         raise AssertionError("executed-PC recording regressed to hash probing")
     if "sizeof(g_dirty_ram_exec_pc_bitmap)" not in capture:
         raise AssertionError("autocapture does not snapshot the 64 KiB bitmap")
+    write_window = body(capture, "write_json_window")
+    if ("size += 4u" not in write_window or
+            "phys + size <= ram_size - 4u" not in write_window or
+            "window_hi" in write_window):
+        raise AssertionError(
+            "capture delay-slot guard is missing or stops at an artificial window boundary")
     if "g_dirty_ram_exec_pc_table" in capture:
         raise AssertionError("capture still references the removed execution table")
     before_dma = body(capture, "overlay_capture_before_dma")
@@ -50,6 +58,9 @@ def main():
         raise AssertionError("outgoing variant is not queued before evidence reset")
     if "first_page = lo >> page_shift" not in before_dma:
         raise AssertionError("pre-DMA capture is not scoped to touched whole pages")
+    for guard in ("first_page - 1u", "last_page + 1u", "exec_pc_bitmap"):
+        if guard not in capture:
+            raise AssertionError(f"pre-DMA capture lost executed-page halo: {guard}")
     dispatch_inner = body(interp, "dirty_ram_dispatch_inner")
     if "(!current_page_dirty || next_page != current_page)" not in dispatch_inner:
         raise AssertionError("page fast path does not preserve clean-miss behavior")
@@ -64,14 +75,45 @@ def main():
         raise AssertionError("cache rescan does not invalidate negative misses")
     if "lazy_miss_invalidate_loader();" not in body(loader, "load_one_dll"):
         raise AssertionError("DLL publication does not invalidate negative misses")
+    lazy_match = body(loader, "lazy_man_matches")
+    if "man_delay_slots_hashed(&lm->fn)" not in lazy_match:
+        raise AssertionError("legacy manifests can expose unhashed delay slots")
     rebuild = body(loader, "rebuild_lazy_manifest_index")
     if "overlay_watch_set_range(lo, lm->fn.len[r])" not in rebuild:
         raise AssertionError("unloaded manifest pages are not generation-watched")
+    if "manifest_ok = 1" not in rebuild:
+        raise AssertionError("strictly parsed manifests are not marked usable")
+    if "cache_idx_has_basename" in loader:
+        raise AssertionError("immutable repair artifacts are still deduped by logical name")
+    scan_one = body(loader, "scan_one_cache_dir")
+    for guard in ("cache_name_is_immutable(fd.cFileName)",
+                  "cache_idx_has_path(full)", "e->logical_crc = crc",
+                  "e->tier = (uint8_t)tier"):
+        if guard not in scan_one:
+            raise AssertionError(f"artifact-aware cache indexing lost: {guard}")
+    has_crc = body(loader, "overlay_loader_has_cached_crc")
+    for guard in ("manifest_ok", "!s_cache_idx[i].load_failed",
+                  "logical_crc == crc", "lazy_man_crc(",
+                  "man_delay_slots_hashed("):
+        if guard not in has_crc:
+            raise AssertionError(f"cached-CRC query accepts unusable artifacts: {guard}")
     try_load = body(loader, "try_load_region")
     if "lazy_is_loadable(li, region_start, phys, 0)" not in try_load:
         raise AssertionError("exact manifest entries are still gated by dirty-run base")
     if "lazy_is_loadable(li, region_start, phys, 1)" not in try_load:
         raise AssertionError("non-exact range fallback lost region narrowing")
+    if "lazy_candidate_preferred" not in try_load:
+        raise AssertionError("lazy artifact selection is still directory-order dependent")
+    for guard in ("load_failed", "goto retry_artifact"):
+        if guard not in try_load and guard not in body(loader, "lazy_is_loadable"):
+            raise AssertionError(f"failed artifact can suppress a valid fallback: {guard}")
+    range_lookup = body(loader, "overlay_find_by_range")
+    for guard in ("s_range_candidate_generation", "range_candidate_preferred"):
+        if guard not in range_lookup:
+            raise AssertionError(f"loaded range selection lost tier/new-artifact ordering: {guard}")
+    ac_poll = body(autocompile, "autocompile_poll_main")
+    if "one idempotent batch-end" not in ac_poll or "overlay_loader_rescan();" not in ac_poll:
+        raise AssertionError("direct shard handoff is not reconciled into the additive index")
     watched_write = body(memory, "overlay_watch_note_write")
     if "g_dirty_ram_exec_page_bitmap" not in watched_write:
         raise AssertionError("RAM writes do not clear stale per-page capture evidence")
@@ -84,6 +126,17 @@ def main():
     candidate = body(loader, "overlay_loader_is_candidate")
     if "exact_entry_has(phys)" not in candidate or "idx_head" in candidate:
         raise AssertionError("candidate presence regressed from bitmap to hash probes")
+    if "cache_path_equal(s_loaded_paths[i], path)" not in body(
+            loader, "dll_already_loaded"):
+        raise AssertionError("published/scanned path separator aliases can double-load DLLs")
+    posix_sweep = body(loader, "posix_abi_sweep_file")
+    if not (posix_sweep.find("cache_name_is_immutable(file->name)") <
+            posix_sweep.find("psx_overlay_posix_library_open")):
+        raise AssertionError("ABI preflight can execute a legacy POSIX constructor")
+    abi_sweep = body(loader, "abi_preflight_sweep")
+    if not (abi_sweep.find("cache_name_is_immutable(fd.cFileName)") <
+            abi_sweep.find("LoadLibraryA(full)")):
+        raise AssertionError("ABI preflight can execute a legacy Windows DllMain")
 
     interp_step = body(interp, "interp_cyc_step")
     if "g_psx_cycle_fast_limit" not in interp_step or "next <= g_psx_cycle_fast_limit" not in interp_step:
@@ -136,6 +189,16 @@ def main():
             raise AssertionError(f"{fn} does not order timing, RAM fast path, fallback")
     if "defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)" not in memory:
         raise AssertionError("main-RAM value fast path leaks into diagnostic/COSIM builds")
+
+    gte_exec = body(gte, "gte_execute")
+    for probe in ("s_gte_exec_count++", "s_gte_caller_ra =",
+                  "int16_t intpl_pre_ir[4]", "gte_rtp_record(&gte, cmd)",
+                  "gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc)"):
+        pos = gte_exec.find(probe)
+        begin = gte_exec.rfind("#ifndef PSX_NO_DEBUG_TOOLS", 0, pos)
+        end = gte_exec.find("#endif", pos)
+        if pos < 0 or begin < 0 or end < 0:
+            raise AssertionError(f"production GTE path still executes diagnostic probe: {probe}")
 
     print("PASS: capture/cache and interpreter cycle hot-path guards intact")
     return 0

@@ -206,6 +206,19 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
         } else if (!dirty && in_run) {
             uint32_t phys = run_start * page_sz;
             uint32_t size = (page - run_start) * page_sz;
+            /* Carry one coherent guard instruction beyond a dirty-page run.
+             * A MIPS branch/jump at the final word of the run (...FFC) always
+             * executes its delay slot in the next page (...000).  Supplying
+             * that word lets overlay codegen emit exact semantics and lets its
+             * range manifest hash/watch the slot. Keep the established region
+             * start. A four-byte overlap across an artificial kernel/boot or
+             * boot/overlay capture-window boundary is required: those windows
+             * stabilize region keys, but they are not MIPS execution barriers.
+             * Adjacent dirty pages were already folded into this run. */
+            const uint32_t ram_size = 2u * 1024u * 1024u;
+            if (phys <= ram_size && size <= ram_size - phys &&
+                phys + size <= ram_size - 4u)
+                size += 4u;
             uint32_t virt = 0x80000000u | (phys & 0x1FFFFFu);
             in_run = 0;
 
@@ -706,6 +719,31 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
         uint32_t first_page = scope_lo >> 12;
         uint32_t last_page = (scope_hi - 1u) >> 12;
         for (uint32_t page = first_page; page <= last_page; page++) {
+            uint32_t first_exec_word = page * (4096u / 4u);
+            int observed = 0;
+            for (uint32_t b = 0; b < 4096u / 4u / 32u; b++) {
+                if (job->exec_pc_bitmap[(first_exec_word >> 5) + b]) {
+                    observed = 1;
+                    break;
+                }
+            }
+            if (observed)
+                job->bitmap[page >> 5] |= 1u << (page & 31u);
+        }
+        /* Preserve a one-page EXECUTED halo on both sides of a scoped DMA
+         * overwrite.  The overwritten page can contain either the ...FFC
+         * control transfer or the ...000 delay slot; the paired instruction
+         * may live in the neighboring page and must come from this same
+         * coherent pre-write RAM snapshot.  Only executed neighbors qualify,
+         * so a sector overwrite cannot pull unrelated dirty history into an
+         * unbounded capture.  Evidence clearing remains limited to the pages
+         * actually overwritten by DMA. */
+        uint32_t halo_lo = first_page > 0u ? first_page - 1u : first_page;
+        uint32_t ram_pages = (uint32_t)(ram_size >> 12);
+        uint32_t halo_hi = last_page + 1u < ram_pages
+                         ? last_page + 1u : last_page;
+        for (uint32_t page = halo_lo; page <= halo_hi; page++) {
+            if (page >= first_page && page <= last_page) continue;
             uint32_t first_exec_word = page * (4096u / 4u);
             int observed = 0;
             for (uint32_t b = 0; b < 4096u / 4u / 32u; b++) {

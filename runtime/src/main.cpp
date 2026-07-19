@@ -1177,6 +1177,11 @@ struct RuntimePerfSnapshot {
     uint64_t overlay_interp = 0;
     uint64_t overlay_stale = 0;
     uint32_t overlay_revalidations = 0;
+    uint32_t overlay_hot_native_pc = 0;
+    uint64_t overlay_hot_native_calls = 0;
+    uint64_t overlay_shadow_calls = 0;
+    uint64_t overlay_shadow_divergences = 0;
+    uint32_t overlay_first_divergence_pc = 0;
     uint32_t capture_triggers = 0;
     uint64_t capture_last_dispatch_delta = 0;
     int capture_overlays = 0;
@@ -1275,6 +1280,11 @@ static RuntimePerfSnapshot runtime_perf_snapshot(uint64_t now) {
                                 &s.overlay_interp, &s.overlay_stale,
                                 nullptr, nullptr, nullptr, nullptr,
                                 &s.overlay_revalidations);
+    overlay_loader_take_hot_native(&s.overlay_hot_native_pc,
+                                   &s.overlay_hot_native_calls);
+    overlay_loader_get_shadow_summary(&s.overlay_shadow_calls,
+                                      &s.overlay_shadow_divergences,
+                                      &s.overlay_first_divergence_pc);
     int capture_enabled = 0;
     overlay_autocapture_get_status(&capture_enabled, &s.capture_triggers,
                                    &s.capture_last_dispatch_delta);
@@ -1410,7 +1420,9 @@ static void runtime_perf_diag_tick() {
         "cpu=%.1f tex=%.1f draw=%.1f ms/s; "
         "work guest=%.1f pacer=%.1f autocapture=%.1f provider_poll=%.1f ms/s, "
         "dirty=%.0f insn/s %.0f dispatch/s; "
-        "overlay native=+%llu interp=+%llu loads=+%u revalidations=+%u "
+        "overlay native=+%llu interp=+%llu hot_native=0x%08X/+%llu "
+        "shadow=+%llu div=+%llu first_div=0x%08X "
+        "loads=+%u revalidations=+%u "
         "load_wall=%.1f ms max=%.1f last=%.1f ms; "
         "capture triggers=+%u overlays=+%d last_dispatch_delta=%llu\n",
         (double)(current.frame - last.frame) / dt,
@@ -1434,6 +1446,12 @@ static void runtime_perf_diag_tick() {
         (double)(current.dirty_dispatches - last.dirty_dispatches) / dt,
         (unsigned long long)(current.overlay_native - last.overlay_native),
         (unsigned long long)(current.overlay_interp - last.overlay_interp),
+        current.overlay_hot_native_pc,
+        (unsigned long long)current.overlay_hot_native_calls,
+        (unsigned long long)(current.overlay_shadow_calls - last.overlay_shadow_calls),
+        (unsigned long long)(current.overlay_shadow_divergences -
+                             last.overlay_shadow_divergences),
+        current.overlay_first_divergence_pc,
         current.overlay_loads - last.overlay_loads,
         current.overlay_revalidations - last.overlay_revalidations,
         (double)(overlay_load_us - last_overlay_load_us) / 1000.0,

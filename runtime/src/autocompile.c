@@ -71,16 +71,17 @@ static HANDLE           s_proc = NULL;
 #define AC_PUBLISH_CAP 128
 static char s_publish_paths[AC_PUBLISH_CAP][768];
 static unsigned s_publish_head = 0, s_publish_count = 0;
-static unsigned s_publish_seen_run = 0, s_publish_drops_run = 0;
+static unsigned s_publish_drops_run = 0;
+static unsigned s_publish_load_fail_run = 0, s_publish_parse_fail_run = 0;
 static char s_child_line[1024];
 static int  s_child_line_len = 0;
+static int  s_child_line_overflow = 0;
 
 static void publish_line_locked(void) {
     static const char marker[] = "PSX_SHARD_PUBLISHED ";
     if (strncmp(s_child_line, marker, sizeof(marker) - 1) != 0) return;
     const char *path = s_child_line + sizeof(marker) - 1;
     if (!path[0]) return;
-    s_publish_seen_run++;
     if (s_publish_count >= AC_PUBLISH_CAP) {
         s_publish_drops_run++;
         return;
@@ -96,10 +97,16 @@ static void publish_parse_locked(const char *buf, int n) {
         if (c == '\r') continue;
         if (c == '\n') {
             s_child_line[s_child_line_len] = '\0';
-            publish_line_locked();
+            if (s_child_line_overflow)
+                s_publish_parse_fail_run++;
+            else
+                publish_line_locked();
             s_child_line_len = 0;
+            s_child_line_overflow = 0;
         } else if (s_child_line_len < (int)sizeof(s_child_line) - 1) {
             s_child_line[s_child_line_len++] = c;
+        } else {
+            s_child_line_overflow = 1;
         }
     }
 }
@@ -155,6 +162,16 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
     WaitForSingleObject(ctx->proc, INFINITE);
     DWORD code = (DWORD)-1;
     GetExitCodeProcess(ctx->proc, &code);
+    EnterCriticalSection(&s_out_lock);
+    /* A marker/result line cut off by child termination is not trustworthy.
+     * Completion will force the idempotent directory rescan instead. */
+    if (s_child_line_len || s_child_line_overflow) {
+        s_publish_parse_fail_run++;
+        s_child_line_len = 0;
+        s_child_line_overflow = 0;
+    }
+    if (s_proc == ctx->proc) s_proc = NULL;
+    LeaveCriticalSection(&s_out_lock);
     CloseHandle(ctx->proc);
     HeapFree(GetProcessHeap(), 0, ctx);
     InterlockedExchange(&s_exit_code, (LONG)code);
@@ -227,8 +244,14 @@ int autocompile_request(void) {
 #ifdef _WIN32
     EnterCriticalSection(&s_out_lock);
     s_publish_head = s_publish_count = 0;
-    s_publish_seen_run = s_publish_drops_run = 0;
+    s_publish_drops_run = 0;
+    s_publish_load_fail_run = s_publish_parse_fail_run = 0;
     s_child_line_len = 0;
+    s_child_line_overflow = 0;
+    s_out_len = 0;
+    s_exit_code = -1;
+    s_shard_ok = s_shard_fail = s_shard_skipped = 0;
+    s_shard_result_seen = 0;
     LeaveCriticalSection(&s_out_lock);
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE rd = NULL, wr = NULL;
@@ -273,6 +296,10 @@ int autocompile_request(void) {
 
     WatchCtx *ctx = (WatchCtx *)HeapAlloc(GetProcessHeap(), 0, sizeof(*ctx));
     if (!ctx) {
+        /* The child is already running. Leaving it detached would permit the
+         * state to remain IDLE and a second writer to enter the same cache. */
+        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+        WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(rd);
         CloseHandle(pi.hProcess);
         s_fails++;
@@ -290,6 +317,7 @@ int autocompile_request(void) {
         /* Without the watcher nobody drains stdout, observes completion, or
          * closes the process handle. Cancel the just-created child fail-closed. */
         TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+        WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(rd);
         CloseHandle(pi.hProcess);
         HeapFree(GetProcessHeap(), 0, ctx);
@@ -329,17 +357,19 @@ static int parse_shard_result(void) {
     }
     if (!hit) return 0;
     unsigned ok = 0, failed = 0, skipped = 0;
-    /* Tolerant of field order: scan for each key independently within the line. */
     const char *ln_end = strchr(hit, '\n');
     size_t span = ln_end ? (size_t)(ln_end - hit) : strlen(hit);
     char line[256];
     size_t cp = span < sizeof(line) - 1 ? span : sizeof(line) - 1;
     memcpy(line, hit, cp);
     line[cp] = '\0';
-    const char *f;
-    if ((f = strstr(line, "ok=")))      sscanf(f, "ok=%u", &ok);
-    if ((f = strstr(line, "failed=")))  sscanf(f, "failed=%u", &failed);
-    if ((f = strstr(line, "skipped="))) sscanf(f, "skipped=%u", &skipped);
+    int consumed = 0;
+    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u %n",
+               &ok, &failed, &skipped, &consumed) != 3)
+        return 0;
+    for (const char *tail = line + consumed; *tail; tail++) {
+        if (*tail != ' ' && *tail != '\t' && *tail != '\r') return 0;
+    }
     s_shard_ok      = ok;
     s_shard_fail    = failed;
     s_shard_skipped = skipped;
@@ -356,7 +386,8 @@ void autocompile_poll_main(void) {
 #ifdef _WIN32
     char published[768];
     if (publish_pop(published, (int)sizeof(published))) {
-        (void)overlay_loader_load_published(published);
+        if (overlay_loader_load_published(published) <= 0)
+            s_publish_load_fail_run++;
         s_rescans++;
     }
     if (ac_state_load() == AC_RUNNING) return;
@@ -366,23 +397,19 @@ void autocompile_poll_main(void) {
     if (publish_pending()) return;
 #endif
     ac_state_store(AC_IDLE);
-    /* New producers report each DLL directly; a full rescan is only the
-     * compatibility/overflow fallback. The loader is
-     * idempotent — rescanning after a failed compile is harmless. */
-#ifdef _WIN32
-    if (s_publish_seen_run == 0 || s_publish_drops_run != 0) {
-        overlay_loader_rescan();
-        s_rescans++;
-    }
-#else
+    s_shard_result_seen = parse_shard_result();
+    /* Direct markers minimize handoff latency, then one idempotent batch-end
+     * rescan makes every successfully published artifact visible to additive
+     * cache queries and the lazy manifest index. This is intentionally once per
+     * compiler run, never once per DLL or interpreted instruction. */
     overlay_loader_rescan();
     s_rescans++;
-#endif
-    s_shard_result_seen = parse_shard_result();
     /* A run "failed" if the process exited non-zero OR it reported shard
      * failures. compile_overlays.py exits 2 when any shard that should have
      * built failed, so these usually agree; the parsed count is the detail. */
-    if (s_exit_code != 0 || (s_shard_result_seen && s_shard_fail > 0))
+    if (s_exit_code != 0 || !s_shard_result_seen || s_shard_fail > 0 ||
+        s_publish_drops_run != 0 || s_publish_load_fail_run != 0 ||
+        s_publish_parse_fail_run != 0)
         s_fails++;
 }
 

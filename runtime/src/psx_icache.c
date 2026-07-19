@@ -28,6 +28,7 @@
  * leader) so the cache evolves identically to Beetle for the same fetch stream.
  */
 #include "cpu_state.h"
+#include "psx_icache.h"
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -51,20 +52,23 @@ int psx_icache_enabled(void) {
 /* Per-word tag+validity, mirroring Beetle ICache[idx].TV. Init to a value that can
  * never equal an aligned fetch address (aligned addrs have bits 0-1 = 0), so every
  * line starts cold (miss). */
-static uint32_t s_icache_tv[1024];
+uint32_t g_psx_icache_tv[1024];
+int g_psx_icache_active = -1;
 
 void psx_icache_reset(void) {
-    for (int i = 0; i < 1024; i++) s_icache_tv[i] = 0x1u;  /* bit0 set => never matches */
+    g_psx_icache_active = psx_icache_enabled();
+    for (int i = 0; i < 1024; i++) g_psx_icache_tv[i] = 0x1u;
 }
 
 /* Charge the fetch cost for the instruction at `addr` and update the cache tags.
  * `addr` is the runtime guest virtual PC (aligned). Gated on PSX_ENABLE_BLOCK_CYCLES. */
-void psx_icache_fetch(CPUState* cpu, uint32_t addr) {
+void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
     { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global icache mutation */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-    if (!psx_icache_enabled()) return;
+    if (g_psx_icache_active < 0) g_psx_icache_active = psx_icache_enabled();
+    if (!g_psx_icache_active) return;
     uint32_t idx = (addr & 0xFFCu) >> 2;
-    if (s_icache_tv[idx] == addr) return;            /* HIT: +0, no give-back clear */
+    if (g_psx_icache_tv[idx] == addr) return;        /* HIT: +0, no give-back clear */
 
     /* MISS — clear the pending load give-back (Beetle cpu.cpp:542-543). */
     cpu->read_absorb[cpu->read_absorb_which] = 0u;
@@ -79,17 +83,21 @@ void psx_icache_fetch(CPUState* cpu, uint32_t addr) {
      * + count the words from the missing one to the line end. */
     uint32_t line = addr & 0xFFFFFFF0u;
     uint32_t bidx = (addr & 0xFF0u) >> 2;            /* first word index of the line */
-    s_icache_tv[bidx + 0] = line | 0x0u | 0x2u;
-    s_icache_tv[bidx + 1] = line | 0x4u | 0x2u;
-    s_icache_tv[bidx + 2] = line | 0x8u | 0x2u;
-    s_icache_tv[bidx + 3] = line | 0xCu | 0x2u;
+    g_psx_icache_tv[bidx + 0] = line | 0x0u | 0x2u;
+    g_psx_icache_tv[bidx + 1] = line | 0x4u | 0x2u;
+    g_psx_icache_tv[bidx + 2] = line | 0x8u | 0x2u;
+    g_psx_icache_tv[bidx + 3] = line | 0xCu | 0x2u;
     uint32_t cost = 3u;
     for (uint32_t i = (addr & 0xCu) >> 2; i < 4u; i++) {
-        s_icache_tv[bidx + i] &= ~0x2u;              /* valid: TV == that word's addr */
+        g_psx_icache_tv[bidx + i] &= ~0x2u;          /* valid: TV == that word's addr */
         cost++;
     }
     psx_advance_cycles(cost);
 #else
     (void)cpu; (void)addr;
 #endif
+}
+
+void psx_icache_fetch(CPUState* cpu, uint32_t addr) {
+    psx_icache_fetch_miss(cpu, addr);
 }

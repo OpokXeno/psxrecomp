@@ -1,5 +1,6 @@
 ﻿cmake_minimum_required(VERSION 3.20)
 project(psxrecomp-runtime C CXX)
+include(CTest)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
@@ -30,6 +31,17 @@ psxrecomp_add_runtime_target(psx-runtime
     WINDOW_TITLE "psxrecomp - BIOS"
     DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
 )
+
+if(BUILD_TESTING)
+    add_executable(psx_icache_fastpath_test
+        tests/test_psx_icache_fastpath.c
+        src/psx_icache.c
+    )
+    target_include_directories(psx_icache_fastpath_test PRIVATE include)
+    target_compile_definitions(psx_icache_fastpath_test PRIVATE
+        PSX_ENABLE_BLOCK_CYCLES=1)
+    add_test(NAME psx_icache_fastpath_test COMMAND psx_icache_fastpath_test)
+endif()
 
 if(NOT MSVC)
     psxrecomp_add_runtime_target(psx-oracle

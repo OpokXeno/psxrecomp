@@ -90,6 +90,12 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  int *regions, uint32_t *revalidations);
 void overlay_loader_get_load_timing(uint64_t *total_us, uint64_t *max_us,
                                     uint64_t *last_us);
+/* Opt-in PSX_RUNTIME_PERF_DIAG sampler: returns and clears the hottest native
+ * owner since the preceding call. Disabled runs pay no table update cost. */
+void overlay_loader_take_hot_native(uint32_t *pc, uint64_t *calls);
+/* Exact shadow-differential summary for opt-in perf diagnostics. */
+void overlay_loader_get_shadow_summary(uint64_t *calls, uint64_t *divergences,
+                                       uint32_t *first_divergence_pc);
 
 void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
                                      uint32_t *r0_fn_lo, uint32_t *r0_fn_hi,
