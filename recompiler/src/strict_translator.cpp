@@ -7,6 +7,7 @@
 // records this substitution explicitly.
 
 #include "strict_translator.h"
+#include "gte_register_classification.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1275,7 +1276,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             r.supported = true;
             // Computed/sign-extended data registers must route through the
             // helper instead of reading the backing array directly.
-            if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
+            if (PSXRecompGTERegisters::data_read_needs_helper(rd)) {
                 r.c_code = gte_read + emit_gpr_write(rt,
                     fmt::format("gte_read_data(cpu, {})", static_cast<int>(rd)));
             } else {
@@ -1287,7 +1288,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x02) { // CFC2 — move from COP2 control register
             r.supported = true;
-            if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+            if (PSXRecompGTERegisters::ctrl_read_needs_helper(rd)) {
                 r.c_code = gte_read + emit_gpr_write(rt,
                     fmt::format("gte_read_ctrl(cpu, {})", static_cast<int>(rd)));
             } else {
@@ -1299,9 +1300,9 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x04) { // MTC2 — move to COP2 data register
             r.supported = true;
-            // Route registers with side effects or canonical masking through
-            // gte_write_data(): OTZ/IR/SXY2/SXYP/IRGB/LZCS.
-            if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
+            // Masked, aliased, read-only, derived, and precision-shadow data
+            // registers share the runtime helper's exact semantics.
+            if (PSXRecompGTERegisters::data_write_needs_helper(rd)) {
                 r.c_code = gte_stall + fmt::format(
                     "gte_write_data(cpu, {}, cpu->gpr[{}]);",
                     static_cast<int>(rd), static_cast<int>(rt));
@@ -1315,7 +1316,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x06) { // CTC2 — move to COP2 control register
             r.supported = true;
-            if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+            if (PSXRecompGTERegisters::ctrl_write_needs_helper(rd)) {
                 r.c_code = gte_stall + fmt::format(
                     "gte_write_ctrl(cpu, {}, cpu->gpr[{}]);",
                     static_cast<int>(rd), static_cast<int>(rt));
@@ -1356,7 +1357,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         std::string addr = offset == 0
             ? fmt::format("cpu->gpr[{}]", static_cast<int>(rs))
             : fmt::format("(uint32_t)((int32_t)cpu->gpr[{}] + ({}))", static_cast<int>(rs), static_cast<int>(offset));
-        bool special = (rt == 7 || (rt >= 8 && rt <= 11) || rt == 14 || rt == 15 || rt == 28 || rt == 30);
+        bool special = PSXRecompGTERegisters::data_write_needs_helper(rt);
         if (special) {
             r.c_code = gte_stall + fmt::format(
                 "gte_write_data(cpu, {}, psx_cyc_lwc2_read(cpu, {}));",
@@ -1380,7 +1381,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // Faithful GTE: COP2 reg read stalls to the command deadline.
         const std::string gte_stall =
             "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
-        std::string value = ((rt >= 8 && rt <= 11) || rt == 15 || rt == 28 || rt == 29 || rt == 31)
+        std::string value = PSXRecompGTERegisters::data_read_needs_helper(rt)
             ? fmt::format("gte_read_data(cpu, {})", static_cast<int>(rt))
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));
         if (offset == 0) {

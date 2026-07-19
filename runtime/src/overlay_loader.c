@@ -355,12 +355,27 @@ static const void *s_shadow_cand = NULL;
  * a larger epoch is an exception armed INSIDE the shadow (contained). */
 static int      s_shadow_saved_native_exec = 0;
 static int      s_shadow_saved_supp       = 0;
+static int      s_shadow_saved_mmio_watch = 0;
+static int      s_shadow_saved_exec_phase = 0;
+static int      s_shadow_scheduler_bail   = 0;
 static uint64_t s_shadow_epoch            = 0;
 static uint32_t s_shadow_escapes          = 0;
 static uint32_t s_shadow_escapes_native   = 0;
 /* (sljit removed 2026-07-15: the deprecated in-process JIT tier and its
  * live-execution mode are gone; overlay gaps fall to the interpreter.) */
 static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr);
+
+/* A real interpreter-pass ChangeThread is authoritative and escapes before a
+ * native validation pass starts. Therefore a scheduler switch attempted while
+ * s_shadow_cand is armed is necessarily native-only divergence. Traps calls
+ * this before mutating TCB/RAM or longjmping; force the speculative call to
+ * unwind normally so run_shadow_diff can restore the interpreter snapshot. */
+int overlay_loader_shadow_native_thread_switch_bail(void) {
+    if (!s_in_shadow || s_shadow_cand == NULL) return 0;
+    s_shadow_scheduler_bail = 1;
+    g_psx_call_bail = 1;
+    return 1;
+}
 
 /* ---- Counters (surfaced via overlay_loader_status) --------------------- */
 static int      s_ndlls          = 0;   /* DLLs LoadLibrary'd                 */
@@ -3216,6 +3231,9 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     int saved_supp = s_suppress_irq;
     s_suppress_irq = 1;                 /* isolate computation; longjmp-safe */
     s_shadow_saved_supp = saved_supp;   /* escape-fixup mirror (see decl) */
+    s_shadow_saved_mmio_watch = g_shadow_mmio_watch;
+    s_shadow_saved_exec_phase = g_exec_phase;
+    s_shadow_scheduler_bail = 0;
     /* Validate ONE function at a time: nested OVERLAY calls run via the
      * INTERPRETER on BOTH passes (s_native_exec=0). Otherwise the native pass
      * dispatches each callee as its own native shard while the interp pass runs
@@ -3267,7 +3285,6 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     *cpu = cpu0;
     memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
-
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     /* Arm the own-interior native route for the NATIVE pass only (see
      * s_shadow_cand decl): the candidate's CPS continuation re-entries run
@@ -3276,6 +3293,10 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
      * s_native_exec=0 above). Never armed during the interp pass, which must
      * stay pure interp. */
     s_shadow_cand = c;
+    /* Preserve the authoritative interpreter's projection provenance while
+     * making every host-only cache read miss and every cache write a no-op for
+     * the speculative native pass. */
+    gte_precision_speculative_begin();
     {
         int prev_phase = g_exec_phase;
         OverlayFlushFn prev_flush = overlay_flush_enter(c);
@@ -3302,8 +3323,10 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
         }
     }
     s_shadow_cand = NULL;
+    gte_precision_speculative_end();
     CPUState cpuN = *cpu;
     memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
+    int scheduler_bail = s_shadow_scheduler_bail;
 
     /* Compare native (cpuN/s_ramN) vs interp (cpuI/s_ramI) under identical input. */
     int reg = -1;
@@ -3314,7 +3337,7 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
         for (uint32_t a = 0; a < SHADOW_RAM_SIZE; a++)
             if (s_ramN[a] != s_ramI[a]) { ramoff = (int64_t)a; break; }
     }
-    if (reg < 0 && !hidiff && !lodiff && ramoff < 0) {
+    if (!scheduler_bail && reg < 0 && !hidiff && !lodiff && ramoff < 0) {
         /* Clean pass: credit the verify budget. */
         if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
     } else {
@@ -3324,6 +3347,14 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
          * trusted — it stays diff-gated (interp result kept) and never runs live. */
         c->diff_passes = 0;
         s_shadow_divs++;
+        if (scheduler_bail && c->state != ENTRY_BLACKLIST) {
+            /* The interpreter pass completed without switching threads, so a
+             * native-only scheduler attempt proves control-flow divergence.
+             * Permanently keep this shard off the live path. */
+            c->state = ENTRY_BLACKLIST;
+            if (s_valid_count > 0) s_valid_count--;
+            loader_log("blacklist shadow scheduler divergence 0x%08X", c->addr);
+        }
         if (!s_detail_captured) {
             s_detail_captured = 1;
             s_detail_addr = c->addr;
@@ -3367,6 +3398,31 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     s_in_shadow    = 0;
 }
 
+static void shadow_escape_cleanup(void) {
+    extern int g_shadow_mmio_watch;
+    s_shadow_escapes++;
+    if (s_shadow_cand != NULL) {
+        s_shadow_escapes_native++;
+        gte_precision_speculative_end();
+    }
+    /* The interpreter pass arms the MMIO detector around dirty dispatch. A
+     * nonlocal scheduler/exception escape can skip the matching decrement. */
+    g_shadow_mmio_watch = s_shadow_saved_mmio_watch;
+    s_in_shadow    = 0;
+    s_shadow_cand  = NULL;
+    s_native_exec  = s_shadow_saved_native_exec;
+    s_suppress_irq = s_shadow_saved_supp;
+    g_exec_phase   = s_shadow_saved_exec_phase;
+}
+
+static void shadow_escape_flush_cycles(void) {
+    /* A host unwind can skip a candidate call's normal epilogue. Commit any
+     * cycles accumulated before the callback and clear the active DLL store
+     * hook so later static/interpreted writes cannot address stale context. */
+    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+    g_overlay_flush_pending_cycles = NULL;
+}
+
 /* Called by deferred_exception_longjmp() (interrupts.c) before it unwinds.
  * If the longjmp target frame predates a live shadow run (target_epoch <=
  * s_shadow_epoch), the unwind blows through run_shadow_diff and its epilogue
@@ -3380,20 +3436,18 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
  * exception contained inside the shadow: it lands inside the shadow frame and
  * the shadow continues — the flags must NOT be touched. */
 void overlay_loader_shadow_escape_fixup(uint64_t target_epoch) {
-    /* A host unwind can skip a candidate call's normal epilogue. Commit any
-     * cycles accumulated before the interrupt callback and clear the active
-     * DLL store hook so later static/interpreted writes cannot address stale
-     * execution context. */
-    if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
-    g_overlay_flush_pending_cycles = NULL;
+    shadow_escape_flush_cycles();
     if (!s_in_shadow) return;
     if (target_epoch > s_shadow_epoch) return;   /* contained: leave armed */
-    s_shadow_escapes++;
-    if (s_shadow_cand != NULL) s_shadow_escapes_native++;
-    s_in_shadow    = 0;
-    s_shadow_cand  = NULL;
-    s_native_exec  = s_shadow_saved_native_exec;
-    s_suppress_irq = s_shadow_saved_supp;
+    shadow_escape_cleanup();
+}
+
+/* The deterministic HLE scheduler uses a different jmp_buf and therefore has
+ * no exception-setjmp epoch. Its landing calls this after every structured
+ * escape; a live shadow frame was necessarily abandoned in full. */
+void overlay_loader_shadow_scheduler_escape_fixup(void) {
+    shadow_escape_flush_cycles();
+    if (s_in_shadow) shadow_escape_cleanup();
 }
 
 int overlay_loader_dump_shadow_detail(char *out, int cap) {

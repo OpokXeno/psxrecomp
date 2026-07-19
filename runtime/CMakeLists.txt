@@ -41,6 +41,16 @@ if(BUILD_TESTING)
     target_compile_definitions(psx_icache_fastpath_test PRIVATE
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME psx_icache_fastpath_test COMMAND psx_icache_fastpath_test)
+
+    add_executable(gte_register_access_test
+        tests/test_gte_register_access.cpp
+        src/gte.cpp
+    )
+    target_include_directories(gte_register_access_test PRIVATE include)
+    target_compile_definitions(gte_register_access_test PRIVATE
+        PSX_NO_DEBUG_TOOLS=1
+        PSX_GTE_REGISTER_TEST=1)
+    add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
 endif()
 
 if(NOT MSVC)

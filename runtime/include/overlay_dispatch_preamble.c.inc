@@ -143,17 +143,17 @@ int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_
     overlay_flush_cycles();
     return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
 }
-/* GTE special-register accessors (ABI v10). The emitter routes mfc2/cfc2/mtc2/
- * ctc2 on flag/IR/derived GTE regs through these as DIRECT calls, so any
+/* GTE special-register accessors (ABI v10). The emitter routes masked,
+ * sign-extended, aliased/FIFO, read-only, precision-sensitive, flag/IR, and
+ * derived registers through these as DIRECT calls, so any
  * GTE-heavy overlay (Tomba2 lava / Trolley attract demos) fails to link
  * without them — undefined gte_read_ctrl was the signature that silently
  * blocked all new overlay coverage. GTE state is SHARED runtime state; a
- * local fallback would fork the flag/IR timeline, so these forward
+ * local fallback would fork that timeline, so these forward
  * unconditionally (ABI v10 hosts always supply them; the v10 gate rejects
  * DLL/host mixes that don't).
- * NOTE the plain-data fast paths (cpu->gte_data[i] / cpu->gte_ctrl[i]) stay
- * direct CPUState accesses in emitted code — only the derived/flag registers
- * come through here, matching code_generator.cpp's COP2 case. */
+ * Proven bit-transparent registers retain direct CPUState-array fast paths;
+ * the shared emitter classification header is the source of truth. */
 uint32_t gte_read_data(CPUState *cpu, uint8_t reg) {
     overlay_flush_cycles();
     return g_cbs.gte_read_data(cpu, reg);
@@ -234,4 +234,3 @@ void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
 }
 /* ----------------------------------------------------------------------- */
-

@@ -30,6 +30,8 @@ def main():
     autocompile = (ROOT / "runtime/src/autocompile.c").read_text(encoding="utf-8")
     memory = (ROOT / "runtime/src/memory.c").read_text(encoding="utf-8")
     gte = (ROOT / "runtime/src/gte.cpp").read_text(encoding="utf-8")
+    traps = (ROOT / "runtime/src/traps.c").read_text(encoding="utf-8")
+    interrupts = (ROOT / "runtime/src/interrupts.c").read_text(encoding="utf-8")
     cycles = (ROOT / "runtime/src/psx_cycles.c").read_text(encoding="utf-8")
     cyc_header = (ROOT / "runtime/include/psx_cyc.h").read_text(encoding="utf-8")
     starvation = (ROOT / "runtime/include/starvation_ring.h").read_text(encoding="utf-8")
@@ -129,6 +131,52 @@ def main():
     if "cache_path_equal(s_loaded_paths[i], path)" not in body(
             loader, "dll_already_loaded"):
         raise AssertionError("published/scanned path separator aliases can double-load DLLs")
+    scheduler = body(traps, "psx_scheduler_run")
+    shadow_sched_fixup = scheduler.find(
+        "overlay_loader_shadow_scheduler_escape_fixup();")
+    scheduler_reset = scheduler.find("g_psx_dispatch_depth = 0")
+    if min(shadow_sched_fixup, scheduler_reset) < 0 or shadow_sched_fixup > scheduler_reset:
+        raise AssertionError("scheduler longjmp can bypass shadow cleanup")
+    shadow_cleanup = body(loader, "shadow_escape_cleanup")
+    for guard in ("gte_precision_speculative_end();",
+                  "g_shadow_mmio_watch = s_shadow_saved_mmio_watch;",
+                  "s_native_exec  = s_shadow_saved_native_exec;",
+                  "s_suppress_irq = s_shadow_saved_supp;",
+                  "g_exec_phase   = s_shadow_saved_exec_phase;"):
+        if guard not in shadow_cleanup:
+            raise AssertionError(f"shadow nonlocal cleanup lost: {guard}")
+    for switch_fn, mutation in (
+            ("psx_request_thread_switch", "psx_save_context_to_tcb"),
+            ("psx_change_thread_fiber", "psx_bind_current_host_thread")):
+        switch_body = body(traps, switch_fn)
+        bail = switch_body.find(
+            "overlay_loader_shadow_native_thread_switch_bail()")
+        first_mutation = switch_body.find(mutation)
+        if min(bail, first_mutation) < 0 or bail > first_mutation:
+            raise AssertionError(
+                f"{switch_fn} can mutate scheduler state before shadow bail")
+    syscall = body(traps, "psx_syscall")
+    for guard in ("switch_result < 0", "return 1;"):
+        if guard not in syscall:
+            raise AssertionError(f"syscall lost native shadow bail: {guard}")
+    shadow_switch_bail = body(
+        loader, "overlay_loader_shadow_native_thread_switch_bail")
+    for guard in ("s_shadow_scheduler_bail = 1;", "g_psx_call_bail = 1;"):
+        if guard not in shadow_switch_bail:
+            raise AssertionError(f"native scheduler divergence can escape: {guard}")
+    interrupt_poll = body(interrupts, "psx_check_interrupts")
+    scheduler_jumps = [m.start() for m in re.finditer(
+        r"longjmp\(g_scheduler_jmpbuf", interrupt_poll)]
+    if len(scheduler_jumps) != 2:
+        raise AssertionError("unexpected direct interrupt scheduler escape count")
+    previous_jump = -1
+    for jump in scheduler_jumps:
+        guard = interrupt_poll.rfind(
+            "overlay_loader_shadow_native_thread_switch_bail()", 0, jump)
+        if guard <= previous_jump:
+            raise AssertionError(
+                "direct interrupt scheduler escape bypasses native shadow bail")
+        previous_jump = jump
     posix_sweep = body(loader, "posix_abi_sweep_file")
     if not (posix_sweep.find("cache_name_is_immutable(file->name)") <
             posix_sweep.find("psx_overlay_posix_library_open")):

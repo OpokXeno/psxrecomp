@@ -222,6 +222,58 @@ struct PrecisionStoreEntry {
 static PrecisionStoreEntry s_precision_store[PRECISION_STORE_SIZE];
 static uint32_t s_precision_generation = 1;
 static int s_precision_tracking = 0;
+static PreciseProjection s_speculative_saved_sxy[4];
+static uint32_t s_speculative_depth = 0;
+static int s_speculative_timeline_invalidated = 0;
+
+static void gte_precision_generation_advance(void) {
+    if (++s_precision_generation == 0) {
+        std::memset(s_precision_store, 0, sizeof(s_precision_store));
+        s_precision_generation = 1;
+    }
+}
+
+static void gte_geom_generation_advance(void) {
+    if (++s_geom_generation == 0) {
+        std::memset(s_geom_cache, 0, sizeof(s_geom_cache));
+        s_geom_generation = 1;
+    }
+}
+
+extern "C" void gte_precision_timeline_invalidate(void) {
+    for (int i = 0; i < 4; ++i) s_precise_sxy[i].valid = 0;
+    /* Raw machine-state restore is authoritative even if host polling reached
+     * it during a speculative validation pass. Defer the generation advance
+     * until the outer transaction ends so old provenance cannot be restored. */
+    if (s_speculative_depth != 0) {
+        s_speculative_timeline_invalidated = 1;
+        return;
+    }
+    gte_precision_generation_advance();
+    gte_geom_generation_advance();
+}
+
+extern "C" void gte_precision_speculative_begin(void) {
+    if (s_speculative_depth++ == 0) {
+        std::memcpy(s_speculative_saved_sxy, s_precise_sxy,
+                    sizeof(s_precise_sxy));
+        s_speculative_timeline_invalidated = 0;
+    }
+}
+
+extern "C" void gte_precision_speculative_end(void) {
+    if (s_speculative_depth == 0) return;
+    if (--s_speculative_depth == 0) {
+        if (s_speculative_timeline_invalidated) {
+            gte_precision_generation_advance();
+            gte_geom_generation_advance();
+            s_speculative_timeline_invalidated = 0;
+        } else {
+            std::memcpy(s_precise_sxy, s_speculative_saved_sxy,
+                        sizeof(s_precise_sxy));
+        }
+    }
+}
 
 static inline uint32_t precision_hash(uint32_t addr) {
     addr >>= 2;
@@ -238,12 +290,12 @@ static inline int precision_ram_address(uint32_t addr, uint32_t *physical) {
 
 extern "C" void gte_precision_tracking_set(int enabled) {
     s_precision_tracking = enabled ? 1 : 0;
-    s_precision_generation++;
-    if (!s_precision_generation) s_precision_generation = 1;
+    gte_precision_generation_advance();
 }
 
 extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
-    if (!s_precision_tracking || reg < 12 || reg > 15) return;
+    if (s_speculative_depth != 0 || !s_precision_tracking ||
+        reg < 12 || reg > 15) return;
     int index = reg == 15 ? 2 : (int)reg - 12;
     const PreciseProjection &projection = s_precise_sxy[index];
     if (!projection.valid) return;
@@ -256,7 +308,7 @@ extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
 }
 
 extern "C" void gte_precision_invalidate_word(uint32_t addr) {
-    if (!s_precision_tracking) return;
+    if (s_speculative_depth != 0 || !s_precision_tracking) return;
     uint32_t physical;
     if (!precision_ram_address(addr, &physical)) return;
     PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
@@ -267,7 +319,7 @@ extern "C" void gte_precision_invalidate_word(uint32_t addr) {
 extern "C" int gte_precision_load_word(uint32_t addr, uint32_t packed,
                                         int32_t *x16, int32_t *y16,
                                         uint16_t *z) {
-    if (!s_precision_tracking) return 0;
+    if (s_speculative_depth != 0 || !s_precision_tracking) return 0;
     uint32_t physical;
     if (!precision_ram_address(addr, &physical)) return 0;
     const PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
@@ -288,8 +340,7 @@ static inline uint32_t geom_hash(uint32_t packed) {
 extern "C" void gte_geometry_correction_set(int enabled) {
     s_geom_enabled = enabled ? 1 : 0;
     s_geom_hits = 0;
-    s_geom_generation++;
-    if (!s_geom_generation) s_geom_generation = 1;
+    gte_geom_generation_advance();
 }
 
 extern "C" int gte_geometry_correction_enabled(void) {
@@ -302,7 +353,7 @@ extern "C" uint32_t gte_geometry_correction_hits(void) {
 
 extern "C" int gte_geometry_correction_lookup(uint32_t packed,
                                                 int32_t *x16, int32_t *y16) {
-    if (!s_geom_enabled) return 0;
+    if (s_speculative_depth != 0 || !s_geom_enabled) return 0;
     const GeomVertex &entry = s_geom_cache[geom_hash(packed)];
     if (entry.generation != s_geom_generation || entry.packed != packed) return 0;
     if (x16) *x16 = entry.x16;
@@ -312,7 +363,7 @@ extern "C" int gte_geometry_correction_lookup(uint32_t packed,
 }
 
 static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
-    if (!s_geom_enabled) return;
+    if (s_speculative_depth != 0 || !s_geom_enabled) return;
     /* Saturated off-screen projections are unsuitable for subpixel recovery. */
     int32_t x = (int16_t)(packed & 0xFFFFu);
     int32_t y = (int16_t)(packed >> 16);
@@ -1505,51 +1556,240 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
 #endif
 }
 
-/* C-callable wrappers for GTE register transfers */
-// Helper: load GTEState from CPUState, skipping push-write and lossy registers
-static void gte_load_data(PSXRecomp::GTE::GTEState& gte, CPUState* cpu) {
-    using namespace PSXRecomp::GTE;
-    for (int i = 0; i < 32; i++) {
-        if (i == 15 || i == 28) continue;  // SXYP (push) and IRGB (lossy overwrite)
-        gte_mtc2(&gte, i, cpu->gte_data[i]);
+/* C-callable wrappers for GTE register transfers.
+ *
+ * CPUState's arrays are the canonical GTE backing store between commands.
+ * The old wrappers rebuilt a 264-byte GTEState by replaying 62 register writes
+ * for every read, and rebuilt plus exported 64 registers for every write.
+ * Transfers are common in vertex loops, so that exact-but-accidental work was
+ * a severe interpreter-only tax.  These switches implement the same guest
+ * register semantics in O(1), without changing the command implementation. */
+
+static uint32_t gte_cpu_lzcr(uint32_t value) {
+    uint32_t bits = (value & 0x80000000u) ? ~value : value;
+    if (bits == 0) return 32;
+    uint32_t count = 0;
+    while ((bits & 0x80000000u) == 0) {
+        bits <<= 1;
+        ++count;
     }
-    for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
-    /* Loading emulator state is not a guest CTC2 write. CTC2 to FLAG masks
-     * bit 31, but a previously computed FLAG error bit must survive reads and
-     * unrelated control-register writes. */
-    gte.FLAG = cpu->gte_ctrl[31];
+    return count;
+}
+
+static uint32_t gte_cpu_irgb_component(uint32_t value) {
+    const int32_t ir = static_cast<int16_t>(value & 0xFFFFu);
+    if (ir <= 0) return 0;
+    const uint32_t scaled = static_cast<uint32_t>(ir) >> 7;
+    return scaled > 0x1Fu ? 0x1Fu : scaled;
+}
+
+static uint32_t gte_cpu_pack_irgb(const CPUState* cpu) {
+    const uint32_t r = gte_cpu_irgb_component(cpu->gte_data[9]);
+    const uint32_t g = gte_cpu_irgb_component(cpu->gte_data[10]);
+    const uint32_t b = gte_cpu_irgb_component(cpu->gte_data[11]);
+    return (b << 10) | (g << 5) | r;
+}
+
+static uint32_t gte_sign_extend_16(uint32_t value) {
+    return static_cast<uint32_t>(static_cast<int32_t>(
+        static_cast<int16_t>(value & 0xFFFFu)));
+}
+
+/* Normalize only the guest-visible backing words. This deliberately does not
+ * invalidate host precision caches: it is also the compatibility boundary for
+ * committed AOT C emitted before all masked/aliased writes used helpers. */
+static void gte_cpu_canonicalize_backing(CPUState* cpu) {
+    static const uint8_t data_u16[] = {1, 3, 5, 7, 16, 17, 18, 19};
+    static const uint8_t data_s16[] = {8, 9, 10, 11};
+    static const uint8_t ctrl_u16[] = {4, 12, 20, 26};
+    static const uint8_t ctrl_s16[] = {27, 29, 30};
+
+    for (uint8_t reg : data_u16) cpu->gte_data[reg] &= 0xFFFFu;
+    for (uint8_t reg : data_s16)
+        cpu->gte_data[reg] = gte_sign_extend_16(cpu->gte_data[reg]);
+    cpu->gte_data[15] = cpu->gte_data[14];
+    cpu->gte_data[23] = 0;
+    cpu->gte_data[28] = cpu->gte_data[29] = gte_cpu_pack_irgb(cpu);
+    cpu->gte_data[31] = gte_cpu_lzcr(cpu->gte_data[30]);
+
+    for (uint8_t reg : ctrl_u16) cpu->gte_ctrl[reg] &= 0xFFFFu;
+    for (uint8_t reg : ctrl_s16)
+        cpu->gte_ctrl[reg] = gte_sign_extend_16(cpu->gte_ctrl[reg]);
 }
 
 extern "C" uint32_t gte_read_data(CPUState* cpu, uint8_t reg) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    return gte_mfc2(&gte, reg);
+    if (reg >= 32) return 0;
+    switch (reg) {
+        case 1: case 3: case 5: case 7:
+        case 16: case 17: case 18: case 19:
+            return cpu->gte_data[reg] & 0xFFFFu;
+        case 8: case 9: case 10: case 11:
+            return gte_sign_extend_16(cpu->gte_data[reg]);
+        case 15:
+            return cpu->gte_data[14];
+        case 23:
+            return 0;
+        case 28: case 29:
+            return gte_cpu_pack_irgb(cpu);
+        case 31:
+            return gte_cpu_lzcr(cpu->gte_data[30]);
+        default:
+            return cpu->gte_data[reg];
+    }
 }
 
 extern "C" uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    return gte_cfc2(&gte, reg);
+    if (reg >= 32) return 0;
+    switch (reg) {
+        case 4: case 12: case 20: case 26:
+            return cpu->gte_ctrl[reg] & 0xFFFFu;
+        case 27: case 29: case 30:
+            return gte_sign_extend_16(cpu->gte_ctrl[reg]);
+        default:
+            return cpu->gte_ctrl[reg];
+    }
 }
 
 extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    gte_mtc2(&gte, reg, val);
-    if (reg >= 12 && reg <= 15)
-        for (int i = 0; i < 4; i++) s_precise_sxy[i].valid = 0;
-    for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
-    for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
+    if (reg >= 32) return;
+    gte_cpu_canonicalize_backing(cpu);
+    switch (reg) {
+        case 1: case 3: case 5: case 7:
+        case 16: case 17: case 18: case 19:
+            cpu->gte_data[reg] = val & 0xFFFFu;
+            break;
+        case 8: case 9: case 10: case 11:
+            cpu->gte_data[reg] = gte_sign_extend_16(val);
+            if (reg >= 9) {
+                const uint32_t packed = gte_cpu_pack_irgb(cpu);
+                cpu->gte_data[28] = packed;
+                cpu->gte_data[29] = packed;
+            }
+            break;
+        case 12: case 13:
+            cpu->gte_data[reg] = val;
+            for (int i = 0; i < 4; ++i) PSXRecomp::GTE::s_precise_sxy[i].valid = 0;
+            break;
+        case 14:
+            cpu->gte_data[14] = val;
+            cpu->gte_data[15] = val;
+            for (int i = 0; i < 4; ++i) PSXRecomp::GTE::s_precise_sxy[i].valid = 0;
+            break;
+        case 15:
+            cpu->gte_data[12] = cpu->gte_data[13];
+            cpu->gte_data[13] = cpu->gte_data[14];
+            cpu->gte_data[14] = val;
+            cpu->gte_data[15] = val;
+            for (int i = 0; i < 4; ++i) PSXRecomp::GTE::s_precise_sxy[i].valid = 0;
+            break;
+        case 23:
+            cpu->gte_data[23] = 0;
+            break;
+        case 28: {
+            cpu->gte_data[9] = (val & 0x1Fu) << 7;
+            cpu->gte_data[10] = ((val >> 5) & 0x1Fu) << 7;
+            cpu->gte_data[11] = ((val >> 10) & 0x1Fu) << 7;
+            const uint32_t packed = val & 0x7FFFu;
+            cpu->gte_data[28] = packed;
+            cpu->gte_data[29] = packed;
+            break;
+        }
+        case 29: {
+            const uint32_t packed = gte_cpu_pack_irgb(cpu);
+            cpu->gte_data[28] = packed;
+            cpu->gte_data[29] = packed;
+            break;
+        }
+        case 30:
+            cpu->gte_data[30] = val;
+            cpu->gte_data[31] = gte_cpu_lzcr(val);
+            break;
+        case 31:
+            cpu->gte_data[31] = gte_cpu_lzcr(cpu->gte_data[30]);
+            break;
+        default:
+            cpu->gte_data[reg] = val;
+            break;
+    }
 }
 
 extern "C" void gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    gte_ctc2(&gte, reg, val);
-    for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
-    for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
+    if (reg >= 32) return;
+    gte_cpu_canonicalize_backing(cpu);
+    switch (reg) {
+        case 4: case 12: case 20: case 26:
+            cpu->gte_ctrl[reg] = val & 0xFFFFu;
+            break;
+        case 27: case 29: case 30:
+            cpu->gte_ctrl[reg] = gte_sign_extend_16(val);
+            break;
+        case 31:
+            cpu->gte_ctrl[31] = val & 0x7FFFF000u;
+            break;
+        default:
+            cpu->gte_ctrl[reg] = val;
+            break;
+    }
 }
+
+extern "C" void gte_canonicalize_cpu_state(CPUState* cpu) {
+    gte_cpu_canonicalize_backing(cpu);
+    /* ctrl[31] is emulator state, not a guest CTC2 write. Preserve the
+     * command-computed summary bit 31 exactly. */
+    /* Raw restore replaced RAM and SXY0..2. Drop every host-only provenance
+     * cache from the previous timeline, including address-keyed packet depth
+     * and geometry correction entries. */
+    gte_precision_timeline_invalidate();
+}
+
+#ifdef PSX_GTE_REGISTER_TEST
+extern "C" void gte_test_set_precise_valid_mask(uint32_t mask) {
+    for (uint32_t i = 0; i < 4; ++i)
+        PSXRecomp::GTE::s_precise_sxy[i].valid = (mask >> i) & 1u;
+}
+
+extern "C" uint32_t gte_test_get_precise_valid_mask(void) {
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < 4; ++i)
+        mask |= (PSXRecomp::GTE::s_precise_sxy[i].valid ? 1u : 0u) << i;
+    return mask;
+}
+
+extern "C" void gte_test_set_timeline_generations(uint32_t precision,
+                                                    uint32_t geometry) {
+    PSXRecomp::GTE::s_precision_generation = precision;
+    PSXRecomp::GTE::s_geom_generation = geometry;
+}
+
+extern "C" uint32_t gte_test_get_precision_generation(void) {
+    return PSXRecomp::GTE::s_precision_generation;
+}
+
+extern "C" uint32_t gte_test_get_geometry_generation(void) {
+    return PSXRecomp::GTE::s_geom_generation;
+}
+
+extern "C" void gte_test_seed_precise_projection(uint32_t index,
+                                                    uint32_t packed,
+                                                    int32_t x16,
+                                                    int32_t y16,
+                                                    uint16_t z) {
+    if (index >= 4) return;
+    auto &p = PSXRecomp::GTE::s_precise_sxy[index];
+    p.packed = packed;
+    p.x16 = x16;
+    p.y16 = y16;
+    p.z = z;
+    p.valid = 1;
+}
+
+extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
+                                         int32_t y16) {
+    auto &entry = PSXRecomp::GTE::s_geom_cache[
+        PSXRecomp::GTE::geom_hash(packed)];
+    entry.packed = packed;
+    entry.x16 = x16;
+    entry.y16 = y16;
+    entry.generation = PSXRecomp::GTE::s_geom_generation;
+}
+#endif

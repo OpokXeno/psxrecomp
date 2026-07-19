@@ -3228,18 +3228,20 @@ int main(int argc, char** argv) {
     int         cli_debug_port = -1;
     int         cli_renderer   = -1;   /* 0=software 1=opengl 2=vulkan */
     const char* cli_window_title = nullptr;  /* label windows in a fleet */
+    const char* cli_memcard_dir = nullptr;   /* isolate writable state in a fleet */
     /* Parse args.
      *   --bios <path>       override the compile-time BIOS path
      *   --game <toml>       load a game config (single source of truth for
      *                       disc / memcard / window title / debug port)
      *   --disc <path>       override the game config disc path
      *   --debug-port <n>    override the TCP debug-server port (multi-instance)
+     *   --memcard-dir <path> override card/save/options state (multi-instance)
      *   --renderer <name>   override the renderer: software|opengl|vulkan
      *   --launcher          force the GUI launcher (overrides skip_launcher)
      *   --no-launcher       skip the GUI launcher (boot straight in)
      *   --headless          skip SDL window/audio; use TCP screenshots/state
      *   <positional>        deprecated alias for --bios
-     * No --memcard-dir / --game-root flags: those are config-driven. */
+     * No --game-root flag: that remains config-driven. */
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
             bios_path = argv[++i];
@@ -3250,6 +3252,8 @@ int main(int argc, char** argv) {
             disc_override_path = argv[++i];
         } else if (std::strcmp(argv[i], "--debug-port") == 0 && i + 1 < argc) {
             cli_debug_port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
+            cli_memcard_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
             const char* r = argv[++i];
             if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
@@ -3673,6 +3677,13 @@ int main(int argc, char** argv) {
                             "psxrecomp: overlay autocompile command overridden by environment\n");
                     }
                 }
+                if (const char *e = std::getenv("PSX_OVERLAY_AUTOCOMPILE_OFF")) {
+                    if (e[0] && e[0] != '0') {
+                        ac_cmd = nullptr;
+                        std::fprintf(stdout,
+                            "psxrecomp: overlay autocompile disabled by environment\n");
+                    }
+                }
                 if (ac_cmd) {
                     /* Pin the compile's WRITE cache + READ captures to the SAME
                      * canonical locations the loader uses (cache_dir = <exe>/cache,
@@ -3826,6 +3837,28 @@ int main(int argc, char** argv) {
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
         int fps = atoi(e);
         if (fps == 0 || fps >= 90) g_frame_interpolation_fps = fps;
+    }
+
+    /* Apply writable-state isolation before game-options and launcher setup,
+     * not with the later renderer/port overrides. Explicit slot paths from a
+     * shared settings.toml must not escape the isolated directory. */
+    if (cli_memcard_dir) {
+        memcard_dir = std::filesystem::path(cli_memcard_dir);
+        if (memcard_dir.is_relative())
+            memcard_dir = exe_dir_from_argv(argv[0]) / memcard_dir;
+        memcard_dir = memcard_dir.lexically_normal();
+        memcard1_path.clear();
+        memcard2_path.clear();
+        std::error_code memcard_ec;
+        std::filesystem::create_directories(memcard_dir, memcard_ec);
+        if (memcard_ec) {
+            std::fprintf(stderr,
+                "psxrecomp: cannot create --memcard-dir %s: %s\n",
+                memcard_dir.string().c_str(), memcard_ec.message().c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "psxrecomp: CLI writable-state directory = %s\n",
+                     memcard_dir.string().c_str());
     }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
@@ -4238,6 +4271,14 @@ int main(int argc, char** argv) {
     if (cli_debug_port >= 0) debug_port      = (uint16_t)cli_debug_port;
     if (cli_renderer   >= 0) g_video_renderer = cli_renderer;
     if (cli_window_title)    window_title     = cli_window_title;
+    if (cli_memcard_dir) {
+        memcard_dir = std::filesystem::path(cli_memcard_dir);
+        if (memcard_dir.is_relative())
+            memcard_dir = exe_dir_from_argv(argv[0]) / memcard_dir;
+        memcard_dir = memcard_dir.lexically_normal();
+        memcard1_path.clear();
+        memcard2_path.clear();
+    }
 
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {

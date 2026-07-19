@@ -10,6 +10,7 @@
 #include "config_loader.h"
 #include "control_flow.h"
 #include "fmt/format.h"
+#include "gte_register_classification.h"
 #include "recompiler_patch.h"
 
 namespace fs = std::filesystem;
@@ -214,6 +215,44 @@ void codegen_tests() {
         "config merge rejects cross-config ID conflicts");
 }
 
+void gte_codegen_classification_tests() {
+    bool all_ok = true;
+    for (uint8_t reg = 0; reg < 32; ++reg) {
+        const auto expect = [&](uint32_t word, const std::string& call,
+                                bool needs_helper, const char *kind) {
+            const std::string code = generate_first_instruction(word, {}, false);
+            const bool has_helper = code.find(call) != std::string::npos;
+            if (has_helper != needs_helper) {
+                fmt::print(stderr,
+                           "FAIL  full-game GTE {} reg {} helper={} expected={}\n",
+                           kind, reg, has_helper, needs_helper);
+                all_ok = false;
+            }
+        };
+
+        const uint32_t cop2 = 0x12u << 26;
+        expect(cop2 | (0x00u << 21) | (2u << 16) | (uint32_t(reg) << 11),
+               fmt::format("gte_read_data(cpu, {})", reg),
+               PSXRecompGTERegisters::data_read_needs_helper(reg), "MFC2");
+        expect(cop2 | (0x02u << 21) | (2u << 16) | (uint32_t(reg) << 11),
+               fmt::format("gte_read_ctrl(cpu, {})", reg),
+               PSXRecompGTERegisters::ctrl_read_needs_helper(reg), "CFC2");
+        expect(cop2 | (0x04u << 21) | (2u << 16) | (uint32_t(reg) << 11),
+               fmt::format("gte_write_data(cpu, {}", reg),
+               PSXRecompGTERegisters::data_write_needs_helper(reg), "MTC2");
+        expect(cop2 | (0x06u << 21) | (2u << 16) | (uint32_t(reg) << 11),
+               fmt::format("gte_write_ctrl(cpu, {}", reg),
+               PSXRecompGTERegisters::ctrl_write_needs_helper(reg), "CTC2");
+        expect((0x32u << 26) | (3u << 21) | (uint32_t(reg) << 16),
+               fmt::format("gte_write_data(cpu, {}", reg),
+               PSXRecompGTERegisters::data_write_needs_helper(reg), "LWC2");
+        expect((0x3Au << 26) | (3u << 21) | (uint32_t(reg) << 16),
+               fmt::format("gte_read_data(cpu, {})", reg),
+               PSXRecompGTERegisters::data_read_needs_helper(reg), "SWC2");
+    }
+    check(all_ok, "full-game GTE helper classification covers all registers");
+}
+
 } // namespace
 
 int main() {
@@ -225,6 +264,7 @@ int main() {
     try {
         parser_tests(root);
         codegen_tests();
+        gte_codegen_classification_tests();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

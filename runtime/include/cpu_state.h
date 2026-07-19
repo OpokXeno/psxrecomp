@@ -181,6 +181,18 @@ extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
 extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
+/* Normalize raw save-state/imported backing arrays to the architectural form
+ * expected by generated direct-register fast paths.  This is not a guest
+ * register write: in particular, it preserves a computed FLAG bit 31. */
+extern void     gte_canonicalize_cpu_state(CPUState* cpu);
+/* Drop host-only projection/geometry provenance after a raw machine-state
+ * rewind or discarded speculative pass. Guest-visible GTE registers are not
+ * changed. */
+extern void     gte_precision_timeline_invalidate(void);
+/* Isolate a speculative native validation pass from host-only projection
+ * caches while preserving the preceding authoritative interpreter result. */
+extern void     gte_precision_speculative_begin(void);
+extern void     gte_precision_speculative_end(void);
 extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
 
 /* ============================================================================

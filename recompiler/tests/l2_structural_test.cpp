@@ -25,6 +25,7 @@
 
 #include "mips_decoder.h"
 #include "strict_translator.h"
+#include "gte_register_classification.h"
 #include "fmt/format.h"
 
 using PSXRecomp::MipsDecoder;
@@ -363,6 +364,46 @@ int main(int argc, char** argv) {
             if (verbose)
                 fmt::print("        c_code: {}\n", r.c_code);
         }
+    }
+
+    // Exhaustively lock the helper/raw classification for every COP2 register
+    // and transfer form.  This prevents native BIOS/overlay code from drifting
+    // away from the interpreter's canonical register semantics.
+    const auto check_gte_helper = [&](uint32_t word, const std::string& call,
+                                      bool expected, const char *kind,
+                                      uint8_t reg) {
+        ++total;
+        const TranslateResult r = StrictTranslator::translate(
+            MipsDecoder::decode(word, 0));
+        const bool actual = r.supported && contains(r.c_code, call);
+        if (actual == expected) {
+            ++pass;
+        } else {
+            ++fail;
+            fmt::print("  FAIL  strict GTE {} reg {} helper={} expected={} code={}\n",
+                       kind, reg, actual, expected, r.c_code);
+        }
+    };
+    for (uint8_t reg = 0; reg < 32; ++reg) {
+        const uint32_t cop2 = 0x12u << 26;
+        check_gte_helper(cop2 | (0x00u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_read_data(cpu, {})", reg),
+                         PSXRecompGTERegisters::data_read_needs_helper(reg), "MFC2", reg);
+        check_gte_helper(cop2 | (0x02u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_read_ctrl(cpu, {})", reg),
+                         PSXRecompGTERegisters::ctrl_read_needs_helper(reg), "CFC2", reg);
+        check_gte_helper(cop2 | (0x04u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_write_data(cpu, {}", reg),
+                         PSXRecompGTERegisters::data_write_needs_helper(reg), "MTC2", reg);
+        check_gte_helper(cop2 | (0x06u << 21) | (V0 << 16) | (uint32_t(reg) << 11),
+                         fmt::format("gte_write_ctrl(cpu, {}", reg),
+                         PSXRecompGTERegisters::ctrl_write_needs_helper(reg), "CTC2", reg);
+        check_gte_helper(I_TYPE(0x32, V1, reg, 0),
+                         fmt::format("gte_write_data(cpu, {}", reg),
+                         PSXRecompGTERegisters::data_write_needs_helper(reg), "LWC2", reg);
+        check_gte_helper(I_TYPE(0x3A, V1, reg, 0),
+                         fmt::format("gte_read_data(cpu, {})", reg),
+                         PSXRecompGTERegisters::data_read_needs_helper(reg), "SWC2", reg);
     }
 
     fmt::print("\nL2 structural: {}/{} ok", pass, total);

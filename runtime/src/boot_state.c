@@ -200,6 +200,10 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         memcpy(cpu->cop0,     c->cop0,     sizeof cpu->cop0);
         memcpy(cpu->gte_data, c->gte_data, sizeof cpu->gte_data);
         memcpy(cpu->gte_ctrl, c->gte_ctrl, sizeof cpu->gte_ctrl);
+        /* Older generated shards could leave masked/read-only COP2 backing
+         * words noncanonical.  Repair once at the raw restore boundary so
+         * native direct reads and interpreter helpers remain tier-identical. */
+        gte_canonicalize_cpu_state(cpu);
         return 1;
     }
     case BS_SEC_RAM:

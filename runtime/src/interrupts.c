@@ -813,6 +813,9 @@ void psx_check_interrupts(CPUState* cpu) {
                 /* Materialized clean boundary: re-save the deferred thread cleanly
                  * (this OVERWRITES any poisoned/sentinel EPC the guest handler wrote
                  * for it while nested), re-point PCB[0], and honor the switch. */
+                extern int overlay_loader_shadow_native_thread_switch_bail(void);
+                if (overlay_loader_shadow_native_thread_switch_bail())
+                    PSX_CHECK_INTERRUPTS_RETURN();
                 s_defer_switch_pending = 0;
                 s_defer_switch_target  = 0;
                 s_defer_switch_from    = 0;
@@ -1392,6 +1395,12 @@ void psx_check_interrupts(CPUState* cpu) {
         extern uint32_t psx_read_word(uint32_t addr);   /* memory.c (plain RAM read) */
         uint32_t new_state = psx_read_word(exit_tcb & 0x1FFFFFFFu);
         if (new_state == 0x4000u) {   /* the new current thread must be runnable */
+            /* A native-only shadow pass must never commit the handler's TCB/RAM
+             * changes or escape past the authoritative restore. Bail before
+             * configuring either immediate or deferred scheduler state. */
+            extern int overlay_loader_shadow_native_thread_switch_bail(void);
+            if (overlay_loader_shadow_native_thread_switch_bail())
+                PSX_CHECK_INTERRUPTS_RETURN();
             /* Fix #2: honor the switch ONLY at the outermost dispatch boundary,
              * where the outgoing thread's guest state is fully materialized in
              * CPUState. Nested inside a host call unit / dirty pump, the outgoing
