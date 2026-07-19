@@ -108,7 +108,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t best = interrupts_cycles_to_vblank();   /* frame pacing always */
     uint32_t t = timers_cycles_to_irq(0xFFFFFFFFu);  if (t < best) best = t;
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
-    uint32_t d = dma_cycles_to_irq(0xFFFFFFFFu);     if (d < best) best = d;
+    uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
@@ -153,6 +153,18 @@ static void psx_devices_service_to_now(void) {
             uint32_t to_ev = devices_cycles_to_next_internal_event();
             if (to_ev > 0 && to_ev < step) step = to_ev;
             if (step == 0) step = 1;
+            /* Preserve interval causality at an advertised event boundary.
+             * Devices are advanced in a fixed dependency order (CD before DMA,
+             * MDEC input before output). Passing the whole D-cycle interval to
+             * each device lets a state created by an earlier device at cycle D
+             * be treated by a later device as though it existed for all D
+             * cycles. Advance the quiet prefix first, then the boundary cycle:
+             * this is exactly the conservative timeline with O(events), not
+             * O(cycles), host calls. */
+            if (step > 1u && to_ev == step) {
+                advance_devices(step - 1u);
+                step = 1u;
+            }
             advance_devices(step);
             interrupts_service_scheduled_events();
         }
