@@ -723,11 +723,26 @@ static int autocap_provider_request_try(const CodeProvider *cp, uint64_t frame)
 {
     if (!s_autocap_provider_sig_pending) return 0;
     if (frame < s_autocap_provider_retry_frame) return 1;
+    /* busy remains true through AC_DONE until the emulation thread has
+     * committed every prepared DLL and completed the additive final rescan. */
     if (cp->busy && cp->busy()) return 1;
+    int reg = overlay_loader_registered_count();
+    if (s_autocap_provider_sig_pending == s_autocap_sig_at_req &&
+        reg == s_autocap_reg_at_req) {
+        s_autocap_futile++;
+        if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
+            s_autocap_backoff <<= 1;
+        s_autocap_next_ok = frame +
+            (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
+        s_autocap_provider_sig_pending = 0;
+        s_autocap_provider_retry_frame = 0;
+        s_autocap_provider_attempts = 0;
+        return 0;
+    }
     if (cp->request && cp->request()) {
         s_autocap_backoff = 1;
         s_autocap_sig_at_req = s_autocap_provider_sig_pending;
-        s_autocap_reg_at_req = overlay_loader_registered_count();
+        s_autocap_reg_at_req = reg;
         s_autocap_triggers++;
         s_autocap_provider_sig_pending = 0;
         s_autocap_provider_retry_frame = 0;
@@ -965,16 +980,7 @@ void overlay_autocapture_tick(void)
             return;
         }
         s_autocap_write_job = NULL;
-        int reg = overlay_loader_registered_count();
-        if (sig && sig == s_autocap_sig_at_req &&
-            reg == s_autocap_reg_at_req) {
-            s_autocap_futile++;
-            s_autocap_reg_at_req = reg;
-            if (s_autocap_backoff < AUTOCAP_BACKOFF_MAX)
-                s_autocap_backoff <<= 1;
-            s_autocap_next_ok = s_frame_count +
-                (uint64_t)AUTOCAP_COOLDOWN_FRAMES * s_autocap_backoff;
-        } else if (sig) {
+        if (sig) {
             s_autocap_provider_sig_pending = sig;
             s_autocap_provider_retry_frame = s_frame_count;
             s_autocap_provider_attempts = 0;

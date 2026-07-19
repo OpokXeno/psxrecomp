@@ -66,6 +66,17 @@ if(BUILD_TESTING)
         SDL_MAIN_HANDLED PSX_OVERLAY_CAPTURE_TEST=1)
     target_link_libraries(overlay_capture_retry_test PRIVATE ${SDL2_LIBRARIES})
     add_test(NAME overlay_capture_retry_test COMMAND overlay_capture_retry_test)
+
+    if(WIN32)
+        add_executable(autocompile_publication_test
+            tests/test_autocompile_publication.c
+            src/autocompile.c)
+        target_include_directories(autocompile_publication_test PRIVATE include)
+        target_compile_definitions(autocompile_publication_test PRIVATE
+            PSX_AUTOCOMPILE_TEST=1)
+        add_test(NAME autocompile_publication_test
+                 COMMAND autocompile_publication_test)
+    endif()
 endif()
 
 if(NOT MSVC)

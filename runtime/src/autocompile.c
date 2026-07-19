@@ -2,6 +2,7 @@
  * platform); on other hosts the spawn is a graceful no-op and the manual
  * compile_overlays.py flow still works. */
 #include "autocompile.h"
+#include "overlay_loader.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -12,9 +13,6 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #endif
-
-extern void overlay_loader_rescan(void);
-extern int overlay_loader_load_published(const char *dll_path);
 
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
                             * many absolute paths (python+script+recompiler+tcc+...) */
@@ -62,17 +60,36 @@ static int          s_shard_result_seen = 0;  /* did we parse a result line? */
 #define AC_OUT_CAP 8192
 static char s_out[AC_OUT_CAP];
 static int  s_out_len = 0;
+static unsigned s_publish_drops_run = 0;
+static unsigned s_publish_load_fail_run = 0, s_publish_parse_fail_run = 0;
 
 #ifdef _WIN32
 static CRITICAL_SECTION s_out_lock;
+static CONDITION_VARIABLE s_publish_cv;
 static int              s_out_lock_init = 0;
 static HANDLE           s_proc = NULL;
+static HANDLE           s_watch_thread = NULL;
+static HANDLE           s_prepare_thread = NULL;
 
-#define AC_PUBLISH_CAP 128
-static char s_publish_paths[AC_PUBLISH_CAP][768];
-static unsigned s_publish_head = 0, s_publish_count = 0;
-static unsigned s_publish_drops_run = 0;
-static unsigned s_publish_load_fail_run = 0, s_publish_parse_fail_run = 0;
+typedef struct PublishItem {
+    struct PublishItem *next;
+    OverlayPreparedImage *image;
+    char path[768];
+} PublishItem;
+static PublishItem *s_publish_raw_head, *s_publish_raw_tail;
+static PublishItem *s_publish_ready_head, *s_publish_ready_tail;
+enum { AC_PUBLISH_READY_LIMIT = 1 };
+static unsigned s_publish_ready_count;
+static unsigned s_publish_ready_highwater;
+static unsigned s_publish_preparing;
+static unsigned s_publish_commit_active;
+static int s_publish_input_done;
+static int s_publish_stop;
+static uint64_t s_publish_prepare_total_us;
+static uint64_t s_publish_prepare_max_us;
+static uint64_t s_publish_prepare_last_us;
+static unsigned s_publish_prepare_count;
+static unsigned s_publish_prepare_fail;
 static char s_child_line[1024];
 static int  s_child_line_len = 0;
 static int  s_child_line_overflow = 0;
@@ -82,13 +99,20 @@ static void publish_line_locked(void) {
     if (strncmp(s_child_line, marker, sizeof(marker) - 1) != 0) return;
     const char *path = s_child_line + sizeof(marker) - 1;
     if (!path[0]) return;
-    if (s_publish_count >= AC_PUBLISH_CAP) {
+    if (strlen(path) >= sizeof(((PublishItem *)0)->path)) {
+        s_publish_parse_fail_run++;
+        return;
+    }
+    PublishItem *item = (PublishItem *)calloc(1, sizeof(*item));
+    if (!item) {
         s_publish_drops_run++;
         return;
     }
-    unsigned slot = (s_publish_head + s_publish_count) % AC_PUBLISH_CAP;
-    snprintf(s_publish_paths[slot], sizeof(s_publish_paths[slot]), "%s", path);
-    s_publish_count++;
+    snprintf(item->path, sizeof(item->path), "%s", path);
+    if (s_publish_raw_tail) s_publish_raw_tail->next = item;
+    else s_publish_raw_head = item;
+    s_publish_raw_tail = item;
+    WakeConditionVariable(&s_publish_cv);
 }
 
 static void publish_parse_locked(const char *buf, int n) {
@@ -111,25 +135,158 @@ static void publish_parse_locked(const char *buf, int n) {
     }
 }
 
-static int publish_pop(char *out, int cap) {
-    int found = 0;
+/* The pipe reader only queues paths. A separate worker first-maps them, so a
+ * slow antivirus/disk/loader event cannot stop stdout draining and deadlock the
+ * compiler. There is exactly one mapped handoff at a time. The worker also
+ * waits for the preceding main-thread commit to finish before entering the
+ * process-wide Windows loader lock again. */
+static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        PublishItem *item = NULL;
+        EnterCriticalSection(&s_out_lock);
+        while (!s_publish_stop && !s_publish_raw_head &&
+               !s_publish_input_done)
+            SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE);
+        while (!s_publish_stop && s_publish_raw_head &&
+               (s_publish_ready_count != 0 || s_publish_commit_active != 0))
+            SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE);
+        if (s_publish_stop || (!s_publish_raw_head && s_publish_input_done)) {
+            LeaveCriticalSection(&s_out_lock);
+            break;
+        }
+        item = s_publish_raw_head;
+        s_publish_raw_head = item->next;
+        if (!s_publish_raw_head) s_publish_raw_tail = NULL;
+        item->next = NULL;
+        s_publish_preparing++;
+        LeaveCriticalSection(&s_out_lock);
+
+        LARGE_INTEGER q0, q1, qf;
+        QueryPerformanceCounter(&q0);
+        item->image = overlay_loader_prepare_published(item->path);
+        QueryPerformanceCounter(&q1);
+        QueryPerformanceFrequency(&qf);
+        uint64_t elapsed_us = qf.QuadPart > 0
+            ? (uint64_t)((q1.QuadPart - q0.QuadPart) * 1000000LL /
+                         qf.QuadPart) : 0;
+        if (!item->image) {
+            EnterCriticalSection(&s_out_lock);
+            s_publish_preparing--;
+            s_publish_prepare_count++;
+            s_publish_prepare_fail++;
+            s_publish_prepare_last_us = elapsed_us;
+            s_publish_prepare_total_us += elapsed_us;
+            if (elapsed_us > s_publish_prepare_max_us)
+                s_publish_prepare_max_us = elapsed_us;
+            s_publish_load_fail_run++;
+            LeaveCriticalSection(&s_out_lock);
+            free(item);
+            continue;
+        }
+        EnterCriticalSection(&s_out_lock);
+        s_publish_preparing--;
+        s_publish_prepare_count++;
+        s_publish_prepare_last_us = elapsed_us;
+        s_publish_prepare_total_us += elapsed_us;
+        if (elapsed_us > s_publish_prepare_max_us)
+            s_publish_prepare_max_us = elapsed_us;
+        if (s_publish_stop) {
+            LeaveCriticalSection(&s_out_lock);
+            overlay_loader_discard_prepared(item->image);
+            free(item);
+            break;
+        }
+        /* The wait-before-prepare invariant makes this queue depth exactly one.
+         * Keep a defensive condition in case future code adds another worker. */
+        while (!s_publish_stop &&
+               s_publish_ready_count >= AC_PUBLISH_READY_LIMIT)
+            SleepConditionVariableCS(&s_publish_cv, &s_out_lock, INFINITE);
+        if (s_publish_stop) {
+            LeaveCriticalSection(&s_out_lock);
+            overlay_loader_discard_prepared(item->image);
+            free(item);
+            break;
+        }
+        if (s_publish_ready_tail) s_publish_ready_tail->next = item;
+        else s_publish_ready_head = item;
+        s_publish_ready_tail = item;
+        s_publish_ready_count++;
+        if (s_publish_ready_count > s_publish_ready_highwater)
+            s_publish_ready_highwater = s_publish_ready_count;
+        LeaveCriticalSection(&s_out_lock);
+    }
+    if (!s_publish_stop)
+        ac_state_store(AC_DONE);
+    return 0;
+}
+
+static PublishItem *publish_ready_pop(void) {
+    PublishItem *item;
     EnterCriticalSection(&s_out_lock);
-    if (s_publish_count) {
-        snprintf(out, (size_t)cap, "%s", s_publish_paths[s_publish_head]);
-        s_publish_head = (s_publish_head + 1u) % AC_PUBLISH_CAP;
-        s_publish_count--;
-        found = 1;
+    item = s_publish_ready_head;
+    if (item) {
+        s_publish_ready_head = item->next;
+        if (!s_publish_ready_head) s_publish_ready_tail = NULL;
+        item->next = NULL;
+        s_publish_ready_count--;
+        s_publish_commit_active++;
     }
     LeaveCriticalSection(&s_out_lock);
-    return found;
+    return item;
+}
+
+static void publish_commit_finished(void) {
+    EnterCriticalSection(&s_out_lock);
+    if (s_publish_commit_active) s_publish_commit_active--;
+    WakeAllConditionVariable(&s_publish_cv);
+    LeaveCriticalSection(&s_out_lock);
 }
 
 static int publish_pending(void) {
     int pending;
     EnterCriticalSection(&s_out_lock);
-    pending = s_publish_count != 0;
+    pending = s_publish_raw_head != NULL || s_publish_ready_head != NULL ||
+              s_publish_preparing != 0 || s_publish_commit_active != 0;
     LeaveCriticalSection(&s_out_lock);
     return pending;
+}
+
+static void publish_note_load_failure(void) {
+    EnterCriticalSection(&s_out_lock);
+    s_publish_load_fail_run++;
+    LeaveCriticalSection(&s_out_lock);
+}
+
+static int publish_discard_all(void) {
+    PublishItem *raw, *ready;
+    EnterCriticalSection(&s_out_lock);
+    /* Only an idle provider may reset publication ownership. Never pretend an
+     * image currently inside LoadLibrary is no longer preparing: doing so
+     * would let a new run race the old watcher and corrupt the FIFO invariant. */
+    if (s_publish_preparing != 0 || s_publish_commit_active != 0) {
+        LeaveCriticalSection(&s_out_lock);
+        return 0;
+    }
+    raw = s_publish_raw_head;
+    ready = s_publish_ready_head;
+    s_publish_raw_head = s_publish_raw_tail = NULL;
+    s_publish_ready_head = s_publish_ready_tail = NULL;
+    s_publish_ready_count = 0;
+    WakeAllConditionVariable(&s_publish_cv);
+    LeaveCriticalSection(&s_out_lock);
+    while (raw) {
+        PublishItem *next = raw->next;
+        free(raw);
+        raw = next;
+    }
+    while (ready) {
+        PublishItem *next = ready->next;
+        overlay_loader_discard_prepared(ready->image);
+        free(ready);
+        ready = next;
+    }
+    return 1;
 }
 
 static void out_append(const char *buf, int n) {
@@ -149,6 +306,67 @@ static void out_append(const char *buf, int n) {
     }
     LeaveCriticalSection(&s_out_lock);
 }
+
+#ifdef PSX_AUTOCOMPILE_TEST
+void autocompile_test_feed_output(const char *buf, int n) {
+    out_append(buf, n);
+}
+
+int autocompile_test_start_preparer(void) {
+    EnterCriticalSection(&s_out_lock);
+    s_publish_input_done = 0;
+    s_publish_stop = 0;
+    LeaveCriticalSection(&s_out_lock);
+    s_prepare_thread = CreateThread(NULL, 0, publish_prepare_thread_main,
+                                    NULL, 0, NULL);
+    return s_prepare_thread != NULL;
+}
+
+void autocompile_test_finish_input(void) {
+    EnterCriticalSection(&s_out_lock);
+    s_publish_input_done = 1;
+    WakeAllConditionVariable(&s_publish_cv);
+    LeaveCriticalSection(&s_out_lock);
+}
+
+int autocompile_test_join_preparer(DWORD timeout_ms) {
+    if (!s_prepare_thread) return 1;
+    if (WaitForSingleObject(s_prepare_thread, timeout_ms) != WAIT_OBJECT_0)
+        return 0;
+    CloseHandle(s_prepare_thread);
+    s_prepare_thread = NULL;
+    return 1;
+}
+
+int autocompile_test_ready_count(void) {
+    int count = 0;
+    EnterCriticalSection(&s_out_lock);
+    for (PublishItem *item = s_publish_ready_head; item; item = item->next)
+        count++;
+    LeaveCriticalSection(&s_out_lock);
+    return count;
+}
+
+int autocompile_test_ready_highwater(void) {
+    int highwater;
+    EnterCriticalSection(&s_out_lock);
+    highwater = (int)s_publish_ready_highwater;
+    LeaveCriticalSection(&s_out_lock);
+    return highwater;
+}
+
+int autocompile_test_preparing_count(void) {
+    int preparing;
+    EnterCriticalSection(&s_out_lock);
+    preparing = (int)s_publish_preparing;
+    LeaveCriticalSection(&s_out_lock);
+    return preparing;
+}
+
+void autocompile_test_discard_all(void) {
+    (void)publish_discard_all();
+}
+#endif
 
 typedef struct { HANDLE read_pipe; HANDLE proc; } WatchCtx;
 
@@ -175,7 +393,10 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
     CloseHandle(ctx->proc);
     HeapFree(GetProcessHeap(), 0, ctx);
     InterlockedExchange(&s_exit_code, (LONG)code);
-    ac_state_store(AC_DONE);    /* emu thread applies via autocompile_poll_main */
+    EnterCriticalSection(&s_out_lock);
+    s_publish_input_done = 1;
+    WakeAllConditionVariable(&s_publish_cv);
+    LeaveCriticalSection(&s_out_lock);
     return 0;
 }
 #endif /* _WIN32 */
@@ -186,6 +407,7 @@ void autocompile_configure(const char *cmd, const char *cwd) {
 #ifdef _WIN32
     if (!s_out_lock_init) {
         InitializeCriticalSection(&s_out_lock);
+        InitializeConditionVariable(&s_publish_cv);
         s_out_lock_init = 1;
     }
 #endif
@@ -242,10 +464,21 @@ int autocompile_request(void) {
      * poll may return it to IDLE; never overwrite it with another child. */
     if (!autocompile_configured() || ac_state_load() != AC_IDLE) return 0;
 #ifdef _WIN32
+    /* IDLE should imply empty queues; discard defensively so a prior aborted
+     * run can never leak a speculative module reference into the next one. */
+    if (!publish_discard_all()) return 0;
     EnterCriticalSection(&s_out_lock);
-    s_publish_head = s_publish_count = 0;
     s_publish_drops_run = 0;
     s_publish_load_fail_run = s_publish_parse_fail_run = 0;
+    s_publish_ready_highwater = 0;
+    s_publish_prepare_total_us = 0;
+    s_publish_prepare_max_us = 0;
+    s_publish_prepare_last_us = 0;
+    s_publish_prepare_count = 0;
+    s_publish_prepare_fail = 0;
+    s_publish_commit_active = 0;
+    s_publish_input_done = 0;
+    s_publish_stop = 0;
     s_child_line_len = 0;
     s_child_line_overflow = 0;
     s_out_len = 0;
@@ -310,10 +543,21 @@ int autocompile_request(void) {
     s_proc = pi.hProcess;
     ac_state_store(AC_RUNNING);
     s_runs++;
-    HANDLE th = CreateThread(NULL, 0, watch_thread, ctx, 0, NULL);
-    if (th) {
-        CloseHandle(th);
-    } else {
+    s_prepare_thread = CreateThread(NULL, 0, publish_prepare_thread_main,
+                                    NULL, 0, NULL);
+    if (!s_prepare_thread) {
+        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(rd);
+        CloseHandle(pi.hProcess);
+        HeapFree(GetProcessHeap(), 0, ctx);
+        s_proc = NULL;
+        ac_state_store(AC_IDLE);
+        s_fails++;
+        return 0;
+    }
+    s_watch_thread = CreateThread(NULL, 0, watch_thread, ctx, 0, NULL);
+    if (!s_watch_thread) {
         /* Without the watcher nobody drains stdout, observes completion, or
          * closes the process handle. Cancel the just-created child fail-closed. */
         TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
@@ -322,6 +566,13 @@ int autocompile_request(void) {
         CloseHandle(pi.hProcess);
         HeapFree(GetProcessHeap(), 0, ctx);
         s_proc = NULL;
+        EnterCriticalSection(&s_out_lock);
+        s_publish_stop = 1;
+        WakeAllConditionVariable(&s_publish_cv);
+        LeaveCriticalSection(&s_out_lock);
+        WaitForSingleObject(s_prepare_thread, INFINITE);
+        CloseHandle(s_prepare_thread);
+        s_prepare_thread = NULL;
         ac_state_store(AC_IDLE);
         s_fails++;
         return 0;
@@ -382,12 +633,16 @@ static int parse_shard_result(void) {
 
 void autocompile_poll_main(void) {
     /* Drain at most one atomic publication per frame. The producer only sends
-     * paths; candidate registration remains single-threaded here. */
+     * mapped-but-uninitialized images; callback wiring, validation, and
+     * candidate registration remain single-threaded here. */
 #ifdef _WIN32
-    char published[768];
-    if (publish_pop(published, (int)sizeof(published))) {
-        if (overlay_loader_load_published(published) <= 0)
-            s_publish_load_fail_run++;
+    PublishItem *published = publish_ready_pop();
+    if (published) {
+        if (overlay_loader_commit_published(published->image) <= 0)
+            publish_note_load_failure();
+        published->image = NULL; /* commit consumed it on every path */
+        free(published);
+        publish_commit_finished();
         s_rescans++;
     }
     if (ac_state_load() == AC_RUNNING) return;
@@ -395,6 +650,19 @@ void autocompile_poll_main(void) {
     if (ac_state_load() != AC_DONE) return;
 #ifdef _WIN32
     if (publish_pending()) return;
+    /* DONE is published immediately before the preparer returns. Join both
+     * per-run workers before exposing IDLE, so a new run cannot inherit a live
+     * consumer of the shared FIFO. Neither worker needs the emulation thread. */
+    if (s_prepare_thread) {
+        WaitForSingleObject(s_prepare_thread, INFINITE);
+        CloseHandle(s_prepare_thread);
+        s_prepare_thread = NULL;
+    }
+    if (s_watch_thread) {
+        WaitForSingleObject(s_watch_thread, INFINITE);
+        CloseHandle(s_watch_thread);
+        s_watch_thread = NULL;
+    }
 #endif
     ac_state_store(AC_IDLE);
     s_shard_result_seen = parse_shard_result();
@@ -437,6 +705,11 @@ int autocompile_status_json(char *out, int cap) {
     static const char *names[] = { "idle", "running", "done" };
     char tail[2048];
     int  tn = 0;
+    unsigned publish_ready = 0, publish_ready_highwater = 0;
+    unsigned publish_preparing = 0, publish_prepare_count = 0;
+    unsigned publish_prepare_fail = 0;
+    uint64_t publish_prepare_total_us = 0, publish_prepare_max_us = 0;
+    uint64_t publish_prepare_last_us = 0;
     tail[0] = '\0';
 #ifdef _WIN32
     if (s_out_lock_init) {
@@ -444,6 +717,14 @@ int autocompile_status_json(char *out, int cap) {
         int take = s_out_len < 900 ? s_out_len : 900;   /* newest tail */
         tn = json_escape_into(tail, sizeof(tail),
                               s_out + (s_out_len - take), take);
+        publish_ready = s_publish_ready_count;
+        publish_ready_highwater = s_publish_ready_highwater;
+        publish_preparing = s_publish_preparing;
+        publish_prepare_count = s_publish_prepare_count;
+        publish_prepare_fail = s_publish_prepare_fail;
+        publish_prepare_total_us = s_publish_prepare_total_us;
+        publish_prepare_max_us = s_publish_prepare_max_us;
+        publish_prepare_last_us = s_publish_prepare_last_us;
         LeaveCriticalSection(&s_out_lock);
     }
 #endif
@@ -453,9 +734,20 @@ int autocompile_status_json(char *out, int cap) {
         "\"rescans\":%u,\"last_exit\":%d,"
         "\"shard_ok\":%u,\"shard_fail\":%u,\"shard_skipped\":%u,"
         "\"shard_fail_total\":%u,\"shard_result_seen\":%d,"
+        "\"publish_ready\":%u,\"publish_ready_highwater\":%u,"
+        "\"publish_preparing\":%u,\"publish_prepare_count\":%u,"
+        "\"publish_prepare_fail\":%u,"
+        "\"publish_prepare_total_us\":%llu,"
+        "\"publish_prepare_max_us\":%llu,"
+        "\"publish_prepare_last_us\":%llu,"
         "\"output_tail\":\"%s\"}",
         autocompile_configured(), names[ac_state_load() & 3], s_runs, s_fails,
         s_rescans, s_exit_code,
         s_shard_ok, s_shard_fail, s_shard_skipped,
-        s_shard_fail_total, s_shard_result_seen, tail);
+        s_shard_fail_total, s_shard_result_seen,
+        publish_ready, publish_ready_highwater, publish_preparing,
+        publish_prepare_count, publish_prepare_fail,
+        (unsigned long long)publish_prepare_total_us,
+        (unsigned long long)publish_prepare_max_us,
+        (unsigned long long)publish_prepare_last_us, tail);
 }

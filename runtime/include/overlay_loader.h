@@ -47,9 +47,14 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
  * (loaded DLLs stay loaded); emu thread only. */
 void overlay_loader_rescan(void);
 
-/* Load one atomically-published autocompile artifact directly. The path must be
- * inside this loader's canonical cache root. Emulation thread only. */
-int overlay_loader_load_published(const char *dll_path);
+/* Two-phase live publication: the compile-output watcher maps a freshly
+ * published image off the emulation thread, then the emulation thread performs
+ * callback wiring, manifest validation, and candidate registration. The opaque
+ * object owns exactly one speculative library reference until commit/discard. */
+typedef struct OverlayPreparedImage OverlayPreparedImage;
+OverlayPreparedImage *overlay_loader_prepare_published(const char *dll_path);
+int overlay_loader_commit_published(OverlayPreparedImage *image);
+void overlay_loader_discard_prepared(OverlayPreparedImage *image);
 
 /* True if the cache holds <region_start8>_<crc8>.{dll,so}. */
 int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc);

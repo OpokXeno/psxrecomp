@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def body(source, name):
-    match = re.search(rf"\b(?:static\s+)?(?:inline\s+)?(?:int|void|uint8_t|uint16_t|uint32_t|uint64_t)\s+{name}\s*\([^;]*?\)\s*\{{",
+    match = re.search(rf"\b(?:static\s+)?(?:inline\s+)?(?:int|void|uint8_t|uint16_t|uint32_t|uint64_t|DWORD|OverlayPreparedImage|PublishItem)\s*\*?\s*(?:WINAPI\s+)?{name}\s*\([^;]*?\)\s*\{{",
                       source, re.S)
     if not match:
         raise AssertionError(f"missing function {name}")
@@ -106,7 +106,7 @@ def main():
         raise AssertionError("negative miss cache is not guarding lookup/recorded at final miss")
     if "lazy_miss_invalidate_loader();" not in body(loader, "overlay_loader_rescan"):
         raise AssertionError("cache rescan does not invalidate negative misses")
-    if "lazy_miss_invalidate_loader();" not in body(loader, "load_one_dll"):
+    if "lazy_miss_invalidate_loader();" not in body(loader, "load_one_dll_prepared"):
         raise AssertionError("DLL publication does not invalidate negative misses")
     lazy_match = body(loader, "lazy_man_matches")
     if "man_delay_slots_hashed(&lm->fn)" not in lazy_match:
@@ -147,6 +147,30 @@ def main():
     ac_poll = body(autocompile, "autocompile_poll_main")
     if "one idempotent batch-end" not in ac_poll or "overlay_loader_rescan();" not in ac_poll:
         raise AssertionError("direct shard handoff is not reconciled into the additive index")
+    if ("overlay_loader_commit_published(published->image)" not in ac_poll or
+            "overlay_loader_load_published(" in ac_poll):
+        raise AssertionError("emulation thread regressed to first-mapping published DLLs")
+    watcher = body(autocompile, "watch_thread")
+    preparer = body(autocompile, "publish_prepare_thread_main")
+    if "out_append(buf, (int)got);" not in watcher:
+        raise AssertionError("compile watcher no longer drains child output")
+    if ("overlay_loader_prepare_published(item->path)" in watcher or
+            "overlay_loader_prepare_published(item->path)" not in preparer):
+        raise AssertionError("pipe draining and DLL preparation are not separated")
+    if ("s_publish_commit_active" not in preparer or
+            "s_publish_commit_active++" not in body(autocompile,
+                                                     "publish_ready_pop") or
+            "publish_commit_finished();" not in ac_poll):
+        raise AssertionError("worker mapping can overlap main-thread loader commit")
+    if "AC_PUBLISH_CAP" in autocompile:
+        raise AssertionError("live publication queue can silently overflow a fixed path ring")
+    prepare_image = body(loader, "overlay_loader_prepare_published")
+    commit_image = body(loader, "overlay_loader_commit_published")
+    if "LoadLibraryA(dll_path)" not in prepare_image:
+        raise AssertionError("Windows published image is not first-mapped on the worker")
+    if ("load_one_dll_prepared(image->path, handle)" not in commit_image or
+            "overlay_library_close(handle)" not in commit_image):
+        raise AssertionError("prepared image commit does not consume every speculative reference")
     watched_write = body(memory, "overlay_watch_note_write")
     if "g_dirty_ram_exec_page_bitmap" not in watched_write:
         raise AssertionError("RAM writes do not clear stale per-page capture evidence")

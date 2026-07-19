@@ -1920,9 +1920,21 @@ static void init_callbacks(void) {
 /* ---- DLL loading and export enumeration -------------------------------- */
 
 #ifdef _WIN32
-static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll) {
+typedef HMODULE OverlayLibraryHandle;
+#else
+typedef void *OverlayLibraryHandle;
+#endif
+
+struct OverlayPreparedImage {
+    OverlayLibraryHandle handle;
+    char path[768];
+};
+
+#ifdef _WIN32
+static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll,
+                            OverlayLibraryHandle prepared) {
     int tier = cache_tier_from_path(dll_path);
-    HMODULE h = LoadLibraryA(dll_path);
+    HMODULE h = prepared ? prepared : LoadLibraryA(dll_path);
     if (!h) {
         loader_log("LoadLibrary(%s) failed: %lu", dll_path, GetLastError());
         return 0;
@@ -1998,13 +2010,20 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     }
     loader_log("loaded %s -> %d candidates (%u no-manifest)",
                dll_path, registered, s_no_manifest);
+    if (registered == 0) {
+        s_dll_flush[dll] = NULL;
+        FreeLibrary(h);
+    }
     return registered;
 }
 #else
-static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll) {
+static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll,
+                            OverlayLibraryHandle prepared) {
     int tier = cache_tier_from_path(dll_path);
     char error[256] = {0};
-    void *h = psx_overlay_posix_library_open(dll_path, error, sizeof(error));
+    void *h = prepared ? prepared
+                       : psx_overlay_posix_library_open(dll_path, error,
+                                                        sizeof(error));
     if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, error); return 0; }
     /* ABI gate (see the _WIN32 branch). */
     typedef int (*AbiFn)(void);
@@ -2265,7 +2284,19 @@ static int dll_already_loaded(const char *path) {
     return 0;
 }
 
-static int load_one_dll(const char *dll_path) {
+static void overlay_library_close(OverlayLibraryHandle handle) {
+    if (!handle) return;
+#ifdef _WIN32
+    FreeLibrary(handle);
+#else
+    psx_overlay_posix_library_close(handle);
+#endif
+}
+
+/* Consumes prepared on every path. A successful registration intentionally
+ * retains that reference for process lifetime, matching the ordinary loader. */
+static int load_one_dll_prepared(const char *dll_path,
+                                 OverlayLibraryHandle prepared) {
 #ifdef _WIN32
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);
@@ -2284,9 +2315,10 @@ static int load_one_dll(const char *dll_path) {
     if (!man || man_n == 0) {
         loader_log("no/empty manifest %s — DLL left to interpreter", ranges_path);
         free(man);
+        overlay_library_close(prepared);
         return 0;
     }
-    int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls);
+    int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls, prepared);
 #ifdef _WIN32
     QueryPerformanceCounter(&q1);
     QueryPerformanceFrequency(&qf);
@@ -2311,7 +2343,11 @@ static int load_one_dll(const char *dll_path) {
     return registered;
 }
 
-int overlay_loader_load_published(const char *dll_path) {
+static int load_one_dll(const char *dll_path) {
+    return load_one_dll_prepared(dll_path, NULL);
+}
+
+static int published_path_valid(const char *dll_path) {
     if (!s_active || !dll_path || !dll_path[0]) return 0;
     /* The compiler command is trusted local code, but keep its native-library
      * output confined to the cache root the framework injected. */
@@ -2325,8 +2361,48 @@ int overlay_loader_load_published(const char *dll_path) {
     if (!cache_name_is_immutable(base)) return 0;
     (void)addr;
     (void)crc;
-    if (dll_already_loaded(dll_path)) return 0;
-    return load_one_dll(dll_path);
+    return 1;
+}
+
+OverlayPreparedImage *overlay_loader_prepare_published(const char *dll_path) {
+    if (!published_path_valid(dll_path)) return NULL;
+    OverlayPreparedImage *image =
+        (OverlayPreparedImage *)calloc(1, sizeof(*image));
+    if (!image) return NULL;
+    snprintf(image->path, sizeof(image->path), "%s", dll_path);
+#ifdef _WIN32
+    image->handle = LoadLibraryA(dll_path);
+#else
+    char error[256] = {0};
+    image->handle = psx_overlay_posix_library_open(dll_path, error,
+                                                   sizeof(error));
+#endif
+    if (!image->handle) {
+        free(image);
+        return NULL;
+    }
+    return image;
+}
+
+int overlay_loader_commit_published(OverlayPreparedImage *image) {
+    if (!image) return 0;
+    OverlayLibraryHandle handle = image->handle;
+    image->handle = NULL;
+    int loaded = 0;
+    if (published_path_valid(image->path) &&
+        !dll_already_loaded(image->path))
+        loaded = load_one_dll_prepared(image->path, handle);
+    else
+        overlay_library_close(handle);
+    free(image);
+    return loaded;
+}
+
+void overlay_loader_discard_prepared(OverlayPreparedImage *image) {
+    if (!image) return;
+    overlay_library_close(image->handle);
+    image->handle = NULL;
+    free(image);
 }
 
 static int lazy_man_contains(const ManFn *m, uint32_t phys) {
