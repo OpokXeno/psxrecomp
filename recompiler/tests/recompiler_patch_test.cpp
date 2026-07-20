@@ -58,7 +58,8 @@ void write_word(PSXRecomp::PS1Executable& exe, uint32_t address,
 
 std::string generate_first_instruction(uint32_t first_word,
                                        std::vector<RecompilerPatch> patches,
-                                       bool overlay_mode) {
+                                       bool overlay_mode,
+                                       PSXRecomp::CodeGenConfig config = {}) {
     constexpr uint32_t base = 0x80010000u;
     PSXRecomp::PS1Executable exe{};
     exe.header.load_address = base;
@@ -81,7 +82,6 @@ std::string generate_first_instruction(uint32_t first_word,
 
     PSXRecomp::ControlFlowAnalyzer analyzer(exe);
     const auto cfg = analyzer.analyze_function(function);
-    PSXRecomp::CodeGenConfig config;
     config.overlay_mode = overlay_mode;
     PSXRecomp::CodeGenerator generator(exe, config);
     return generator.generate_function(function, cfg).full_code;
@@ -173,6 +173,15 @@ replacement = "0x24020001"
 )toml");
     check_throws([&] { (void)PSXRecompV4::load_game_config(unaligned); },
                  "instruction-aligned", "parser rejects unaligned sites");
+
+    const auto negsub = write_config(root, "negsub", R"toml(
+[widescreen.cull]
+negsub_sites = ["0x80012340"]
+)toml");
+    const auto negsub_config = PSXRecompV4::load_game_config(negsub);
+    check(negsub_config.ws_cull_negsub_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves negsub cull sites");
 }
 
 void capture_history_config_tests(const fs::path& root) {
@@ -252,6 +261,19 @@ void codegen_tests() {
         },
         "conflicting recompiler patches",
         "config merge rejects cross-config ID conflicts");
+
+    PSXRecomp::CodeGenConfig negsub_config;
+    negsub_config.ws_cull_negsub_sites.insert(0x80010000u);
+    const std::string negsub = generate_first_instruction(
+        0x00041023u, {}, false, negsub_config); // subu v0,zero,a0
+    check(negsub.find("cpu->gpr[2] = 0u - cpu->gpr[4] - "
+                      "(uint32_t)psx_ws_x_margin()") != std::string::npos,
+          "codegen emits configured negsub horizontal low-edge widen");
+
+    const std::string overlay_mismatch = generate_first_instruction(
+        0x00041021u, {}, true, negsub_config); // addu v0,zero,a0
+    check(overlay_mismatch.find("ws cull negsub") == std::string::npos,
+          "overlay nonmatching negsub variant remains unchanged");
 }
 
 void jump_table_producer_codegen_test() {
