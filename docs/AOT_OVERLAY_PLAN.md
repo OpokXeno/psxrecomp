@@ -5,6 +5,22 @@ Author: investigation via 4 parallel agents + adversarial source verification.
 Scope: can we move overlay sharding from *runtime discovery* to *build-time (AOT)*,
 starting with Tomba (SCUS-94236)?
 
+Current final-hash checkpoint (`cg5_7125d9b5`, 2026-07-19): strong missing exact
+roots are grouped by complete producer/recompiler recipe into bounded supplemental
+shards, with partitionable failure bisection and post-success coverage pruning. This
+replaces the pathological one-DLL-per-root prototype without weakening the
+per-root generated-C, manifest, ABI, pair, or live-byte gates. A clean MMX6 build
+publishes 107/107 runtime-valid pairs and covers 588/701 historical observations
+by exact entry address (83.9%), or 595/701 with the exact BIOS resident shard
+(84.9%). A clean Tomba 1 build publishes 74/74 runtime-valid pairs and covers
+808/823 played-vault addresses by exact entry (98.2%); its stricter exact
+`(entry, code_crc)` recall is 778/867 (89.7%). Their combined overlay+BIOS interval
+containment is 100% of each named finite observed set, but interval containment is
+not exact native-dispatch proof. MMX6's 17,506 manifest
+identities also motivated a reviewed 32,768 runtime candidate ceiling with durable
+overflow telemetry and fail-closed one-shot bundle suppression; this runtime-only
+headroom change does not roll the shard ABI or codegen hash.
+
 Current Tomba 2 checkpoint: generic play-free extraction emits 29 base/raw regions
 plus exact adjacent-producer composites (52 capture records total). The 29 base/raw
 shards and the live A01 composite audit with zero unsupported instructions or bad

@@ -2655,29 +2655,44 @@ def validate_overlay_func_ids(func_ids: list,
     return None
 
 
-def validate_interior_fragment_ids(interior: int, frag_ids: list,
-                                   generated_defs: set[int]) -> str | None:
-    """Return a fail-closed reason when a fragment omitted its requested entry.
+def validate_fragment_requested_ids(requested: set[int], frag_ids: list,
+                                    generated_defs: set[int]) -> str | None:
+    """Return a fail-closed reason when a fragment omitted a requested entry.
 
     A non-empty manifest is not sufficient: the recompiler can emit some other
-    reachable function while rejecting/demoting the exact interior PC.  The
+    reachable function while rejecting/demoting an exact requested PC.  The
     loader can also retain at most 16 ranges for one function.  Refuse to
-    publish unless the requested entry has one unambiguous, runtime-representable
-    identity whose guarded bytes include the entry itself.
+    publish unless every requested entry has one unambiguous, runtime-
+    representable identity whose guarded bytes include the entry itself.
     """
-    entry = (interior & 0x1FFFFFFF) | 0x80000000
-    if entry not in generated_defs:
-        return f'requested entry 0x{entry:08X} missing from generated C'
-    matches = [(ev, crc, ranges) for ev, crc, ranges in frag_ids if ev == entry]
-    if len(matches) != 1:
-        return (f'requested entry 0x{entry:08X} has {len(matches)} '
-                'manifest identities (expected exactly 1)')
+    for requested_entry in sorted(requested):
+        entry = (requested_entry & 0x1FFFFFFF) | 0x80000000
+        if entry not in generated_defs:
+            return f'requested entry 0x{entry:08X} missing from generated C'
+        matches = [
+            (ev, crc, ranges) for ev, crc, ranges in frag_ids if ev == entry
+        ]
+        if len(matches) != 1:
+            return (f'requested entry 0x{entry:08X} has {len(matches)} '
+                    'manifest identities (expected exactly 1)')
     contract_error = validate_overlay_func_ids(frag_ids, 'fragment')
     if contract_error:
         return contract_error
-    if not _addr_in_func_ids(entry, matches):
-        return f'requested entry 0x{entry:08X} is outside its guarded ranges'
+    for requested_entry in sorted(requested):
+        entry = (requested_entry & 0x1FFFFFFF) | 0x80000000
+        matches = [
+            (ev, crc, ranges) for ev, crc, ranges in frag_ids if ev == entry
+        ]
+        if not _addr_in_func_ids(entry, matches):
+            return f'requested entry 0x{entry:08X} is outside its guarded ranges'
     return None
+
+
+def validate_interior_fragment_ids(interior: int, frag_ids: list,
+                                   generated_defs: set[int]) -> str | None:
+    """Compatibility wrapper for a singleton isolated fragment."""
+    return validate_fragment_requested_ids(
+        {interior}, frag_ids, generated_defs)
 
 
 def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
@@ -2729,6 +2744,44 @@ def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
     }
 
 
+def merge_fragment_jobs_by_recipe(jobs: list[dict],
+                                  invocation_recipe=()) -> list[dict]:
+    """Union evidence that can safely share one byte-variant fragment recipe.
+
+    Repeated captures of identical bytes commonly carry different observed or
+    static roots.  Batching each capture independently would still create many
+    supplemental DLLs, so merge only jobs whose complete recompiler recipe is
+    identical.  Invocation-wide ABI/flavor/CPS/TOML inputs are constant and are
+    therefore intentionally not repeated in this key.
+    """
+    grouped = {}
+    set_fields = (
+        'candidates', 'executed', 'static_demands',
+        'static_exact_demands', 'static_interval_demands', 'forced',
+    )
+    for job in jobs:
+        key = (
+            job['phys_addr'], hashlib.sha256(job['data']).digest(),
+            job['load_addr'], job['size'],
+            tuple(sorted(job['producer_ranges'])),
+            tuple(sorted(set(job['cross_call_allow']))),
+            json.dumps(job.get('resident_cap'), sort_keys=True),
+            tuple(invocation_recipe),
+        )
+        merged = grouped.get(key)
+        if merged is None:
+            merged = dict(job)
+            for field in set_fields:
+                merged[field] = set(job[field])
+            grouped[key] = merged
+            continue
+        for field in set_fields:
+            merged[field].update(job[field])
+        if merged.get('resident_cap') is None and job.get('resident_cap'):
+            merged['resident_cap'] = job['resident_cap']
+    return list(grouped.values())
+
+
 def select_fragment_orphans(candidates: set[int], executed: set[int],
                             forced: set[int], static_exact: set[int],
                             static_interval: set[int],
@@ -2748,14 +2801,73 @@ def select_fragment_orphans(candidates: set[int], executed: set[int],
             (addr in static_exact and
              (addr & 0x1FFFFFFF) not in current_variant_entries) or
             (addr in static_interval and not current_region_contains(addr)) or
-            (addr in executed and
-             (addr & 0x1FFFFFFF) not in current_variant_entries)))
+             (addr in executed and
+              (addr & 0x1FFFFFFF) not in current_variant_entries)))
 
 
-def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
-                              size: int, phys_addr: int, cache_dir: str,
-                              args, sub_env: dict, toml_doc: dict,
-                              producer_ranges=(), cross_call_allow=()):
+def select_batchable_strong_roots(static_exact: set[int], executed: set[int],
+                                  forced: set[int], static_interval: set[int],
+                                  current_variant_entries: set[int]) -> list[int]:
+    """Strong exact roots safe to share a supplemental failure domain."""
+    isolated = executed | forced | static_interval
+    return sorted(
+        entry for entry in static_exact - isolated
+        if (entry & 0x1FFFFFFF) not in current_variant_entries)
+
+
+def compile_batched_fragment_roots(entries, compile_one, on_success,
+                                   on_singleton_failure,
+                                   still_needed=lambda _entry: True,
+                                   should_bisect=lambda _status: True,
+                                   on_batch_failure=None) -> int:
+    """Compile one root batch, bisecting only when the batch fails closed.
+
+    ``compile_one`` returns the normal ``(func_ids, status)`` pair. Successful
+    batches stay grouped; a rejected interaction is recursively partitioned so
+    one bad root cannot discard good roots. Only singleton failures are exposed
+    to memo/accounting policy.
+    """
+    roots = sorted(entry for entry in set(entries) if still_needed(entry))
+    if not roots:
+        return 0
+    frag_ids, status = compile_one(roots)
+    if frag_ids:
+        on_success(roots, frag_ids, status)
+        return 1
+    if len(roots) == 1:
+        on_singleton_failure(roots[0], status)
+        return 0
+    if not should_bisect(status):
+        if on_batch_failure is not None:
+            on_batch_failure(roots, status)
+        else:
+            for root in roots:
+                on_singleton_failure(root, status)
+        return 0
+    middle = len(roots) // 2
+    return (compile_batched_fragment_roots(
+                roots[:middle], compile_one, on_success,
+                on_singleton_failure, still_needed, should_bisect,
+                on_batch_failure) +
+            compile_batched_fragment_roots(
+                roots[middle:], compile_one, on_success,
+                on_singleton_failure, still_needed, should_bisect,
+                on_batch_failure))
+
+
+def fragment_batch_failure_is_partitionable(reason: str) -> bool:
+    """Whether retrying smaller root sets can change this failure verdict."""
+    return reason.startswith((
+        'generated-c-audit:', 'requested-entry-audit:',
+        'no-generated-output', 'no-func-ids',
+        'fragment cache-key collision',
+    ))
+
+
+def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
+                           size: int, phys_addr: int, cache_dir: str,
+                           args, sub_env: dict, toml_doc: dict,
+                           producer_ranges=(), cross_call_allow=()):
     """Compile an ISOLATED interior-entry 'island' fragment that ENTERS at an
     executed orphan DISPATCH_INTERIOR PC (a host that static analysis never
     discovered, e.g. an FMV driver reached via a computed jump) and covers the
@@ -2773,17 +2885,25 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
     status 'built' or 'cached' on success (frag_ids is the func-id list), or
     (None, reason) on failure/skip so the caller can tally WHY a fragment
     dropped instead of the old silent None."""
+    requested = sorted({
+        (entry & 0x1FFFFFFF) | 0x80000000
+        for entry in requested_entries
+    })
+    if not requested:
+        return None, 'no-requested-entries'
+    first_entry = requested[0]
     with tempfile.TemporaryDirectory() as tmp:
         psx = os.path.join(tmp, 'frag.psx')
         with open(psx, 'wb') as f:
-            f.write(make_psxexe(load_addr, interior, data))
+            f.write(make_psxexe(load_addr, first_entry, data))
         seeds_path = os.path.join(tmp, 'seeds.txt')
         with open(seeds_path, 'w') as f:
             for range_lo, range_hi in producer_ranges:
                 f.write(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}\n')
             for target in sorted(set(cross_call_allow)):
                 f.write(f'cross_call_allow 0x{target:08X}\n')
-            f.write(f'dispatch_root 0x{interior:08X}\n')
+            for entry in requested:
+                f.write(f'dispatch_root 0x{entry:08X}\n')
         out_dir_tmp = os.path.join(tmp, 'out')
         os.makedirs(out_dir_tmp)
         cmd = [args.recompiler, psx, '--seeds', seeds_path,
@@ -2821,13 +2941,17 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
                                for a in sorted(c_audit['unsupported_todo_addrs']))
                 header = (
                     f'/* FRAGMENT AUDIT FAILED — retained for triage (not compiled).\n'
-                    f' * interior entry : 0x{interior:08X}\n'
+                    f' * requested ({len(requested)}): '
+                    f'{", ".join(f"0x{entry:08X}" for entry in requested)}\n'
                     f' * region phys    : 0x{phys_addr:08X}\n'
                     f' * unknown_bad ({len(c_audit["unknown_bad"])}): {ub}\n'
                     f' * unsupported ({len(c_audit["unsupported_todo_addrs"])}): {us}\n'
                     f' */\n')
+                request_key = binascii.crc32(b''.join(
+                    struct.pack('<I', entry) for entry in requested)) & 0xFFFFFFFF
                 failed_c = os.path.join(
-                    cache_dir, f'{phys_addr:08X}_{interior:08X}_fragment_FAILED.c')
+                    cache_dir,
+                    f'{phys_addr:08X}_{request_key:08X}_fragment_FAILED.c')
                 with open(failed_c, 'w') as f:
                     f.write(header + src)
             except OSError:
@@ -2838,8 +2962,8 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         frag_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
         if not frag_ids:
             return None, 'no-func-ids (empty ranges manifest)'
-        identity_error = validate_interior_fragment_ids(
-            interior, frag_ids, c_audit['defs'])
+        identity_error = validate_fragment_requested_ids(
+            set(requested), frag_ids, c_audit['defs'])
         if identity_error:
             return None, f'requested-entry-audit: {identity_error}'
         pair_id = overlay_pair_id(src, frag_ids)
@@ -2880,12 +3004,44 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         # PATH) EVERY interior-fragment shard silently failed to build — the
         # FMV-driver / orphan-interior class ran interpreted forever. The cache
         # dir already namespaces by args.compiler, so only the invocation was wrong.
+        publication = {}
         if not compile_dll(patched_c, dll_path, include_dirs,
                            gcc=args.gcc, flavor=args.flavor,
                            compiler=args.compiler, tcc=args.tcc,
-                           func_ids=frag_ids, pair_id=pair_id):
+                           func_ids=frag_ids, pair_id=pair_id,
+                           preserve_existing_pair=not args.force,
+                           expected_existing_abi=overlay_abi_tag(
+                               args.runtime_include, args.flavor),
+                           publication_result=publication):
             return None, 'compile-error (see COMPILE ERROR above)'
+        if not publication.get('published', True):
+            # Another process won the content-key publication race. It is a
+            # cache hit only when the complete pair is byte-for-byte the same
+            # manifest identity; a 32-bit filename-key collision must fail
+            # closed instead of warming coverage from our discarded staging.
+            cache_status = cached_shard_manifest_status(
+                dll_path, overlay_abi_tag(args.runtime_include, args.flavor),
+                overlay_ranges_text(frag_ids, pair_id), pair_id)
+            if cache_status != 'match':
+                return None, ('fragment cache-key collision/concurrent pair: '
+                              'preserved manifest does not match generated identity')
+            return frag_ids, 'cached'
         return frag_ids, 'built'
+
+
+def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
+                              size: int, phys_addr: int, cache_dir: str,
+                              args, sub_env: dict, toml_doc: dict,
+                              producer_ranges=(), cross_call_allow=()):
+    """Compile one isolated uncertain interior entry.
+
+    Executed, operator-forced, and interval-only aliases deliberately use this
+    singleton wrapper so one speculative entry cannot poison trusted roots.
+    Play-free strong roots use ``compile_fragment_batch`` instead.
+    """
+    return compile_fragment_batch(
+        {interior}, data, load_addr, size, phys_addr, cache_dir, args, sub_env,
+        toml_doc, producer_ranges, cross_call_allow)
 
 
 def fragment_shard_key(func_ids: list) -> int:
@@ -4154,7 +4310,18 @@ def main():
         memo_skipped = 0
         variant_coverage_cache = {}
         expected_abi = overlay_abi_tag(args.runtime_include, args.flavor)
-        for job in interior_frag_jobs:
+        invocation_recipe = (
+            expected_abi, int(args.flavor), bool(args.cps), args.compiler,
+            hashlib.sha256(json.dumps(
+                toml, sort_keys=True, separators=(',', ':'),
+                default=str).encode('utf-8')).hexdigest(),
+        )
+        merged_jobs = merge_fragment_jobs_by_recipe(
+            interior_frag_jobs, invocation_recipe)
+        if len(merged_jobs) != len(interior_frag_jobs):
+            print(f'  fragment recipes: merged {len(interior_frag_jobs)} capture '
+                  f'job(s) into {len(merged_jobs)} byte-variant recipe(s)')
+        for job in merged_jobs:
             phys_addr = job['phys_addr']
             load_addr = job['load_addr']
             size = job['size']
@@ -4178,10 +4345,113 @@ def main():
                     cache_dir, phys_addr, data, load_addr, size, expected_abi)
                 variant_coverage_cache[coverage_key] = current_coverage
             current_variant_entries, current_variant_ranges = current_coverage
+
+            def record_fragment_success(frag_ids, status):
+                if status == 'cached':
+                    stats.add_skip()
+                else:
+                    stats.add_ok()
+                for ev, _cc, ranges in frag_ids:
+                    current_variant_entries.add(ev & 0x1FFFFFFF)
+                    current_variant_ranges.extend(
+                        ((start & 0x1FFFFFFF),
+                         (start & 0x1FFFFFFF) + length)
+                        for start, length in ranges)
+                if job.get('resident_cap'):
+                    fragment_dll = os.path.join(
+                        cache_dir,
+                        f'{phys_addr:08X}_{fragment_shard_key(frag_ids):08X}'
+                        f'{overlay_ext()}')
+                    reconcile_bios_resident_marker(
+                        fragment_dll, job['resident_cap'], status == 'built')
+
+            def record_fragment_failure(entry, status):
+                key = _interior_fail_key(
+                    phys_addr, entry, data, load_addr, size,
+                    job['producer_ranges'], job['cross_call_allow'],
+                    expected_abi, args.cps, toml)
+                optional_reject = optional_static_fragment_rejection(
+                    entry, job, status)
+                if optional_reject:
+                    print(f'  static fragment 0x{entry:08X} rejected safely: '
+                          f'{status}')
+                    stats.add_skip()
+                else:
+                    stats.add_fail(
+                        f'interior 0x{entry:08X} @region 0x{phys_addr:08X}',
+                        'fragment', status)
+                if interior_failure_is_deterministic(status):
+                    fail_memo[key] = status
+                    append_interior_fail_memo(cache_dir, key, status)
+
+            # Strong play-free roots have already passed a callable-boundary or
+            # equivalent discovery proof.  Batch every missing root for this
+            # exact byte recipe into one additive shard.  If a combined root set
+            # fails, bisect until the good subset is recovered or a singleton
+            # receives the same fail-closed verdict as the historical path.
+            strong_handled = set()
+            strong_pending = []
+            batchable_strong = select_batchable_strong_roots(
+                static_exact_demands, executed, forced,
+                static_interval_demands, current_variant_entries)
+            for entry in batchable_strong:
+                key = _interior_fail_key(
+                    phys_addr, entry, data, load_addr, size,
+                    job['producer_ranges'], job['cross_call_allow'],
+                    expected_abi, args.cps, toml)
+                memo_action = interior_fail_memo_action(
+                    entry, job, args.force)
+                if key in fail_memo and memo_action != 'retry':
+                    strong_handled.add(entry)
+                    if memo_action == 'skip':
+                        memo_skipped += 1
+                        stats.add_skip()
+                    else:
+                        stats.add_fail(
+                            f'interior 0x{entry:08X} @region 0x{phys_addr:08X}',
+                            'fragment_memo', fail_memo[key])
+                    continue
+                strong_pending.append(entry)
+
+            def compile_strong_batch(entries):
+                return compile_fragment_batch(
+                    entries, data, load_addr, size, phys_addr, cache_dir, args,
+                    frag_env, toml, job['producer_ranges'],
+                    job['cross_call_allow'])
+
+            def strong_batch_success(entries, frag_ids, status):
+                strong_handled.update(entries)
+                record_fragment_success(frag_ids, status)
+
+            def strong_singleton_failure(entry, status):
+                strong_handled.add(entry)
+                record_fragment_failure(entry, status)
+
+            def strong_batch_failure(entries, status):
+                strong_handled.update(entries)
+                stats.add_fail(
+                    f'strong-root batch ({len(entries)} entries) '
+                    f'@region 0x{phys_addr:08X}',
+                    'fragment_batch', status)
+
+            strong_shards = compile_batched_fragment_roots(
+                strong_pending, compile_strong_batch, strong_batch_success,
+                strong_singleton_failure,
+                lambda entry: ((entry & 0x1FFFFFFF) not in
+                               current_variant_entries),
+                fragment_batch_failure_is_partitionable,
+                strong_batch_failure)
+            if strong_pending:
+                print(f'  strong-root supplement @0x{phys_addr:08X}: '
+                      f'{len(strong_pending)} demand(s) -> '
+                      f'{strong_shards} batched shard(s)')
+
             orphans = select_fragment_orphans(
                 interior_pcs, executed, forced, static_exact_demands,
                 static_interval_demands, current_variant_entries,
                 current_variant_ranges)
+            orphans = [entry for entry in orphans
+                       if entry not in strong_handled]
             if not orphans:
                 continue
             built = 0
@@ -4209,24 +4479,7 @@ def main():
                     job['cross_call_allow'])
                 if frag_ids:
                     built += 1
-                    if status == 'cached':
-                        stats.add_skip()
-                    else:
-                        stats.add_ok()
-                    for ev, _cc, ranges in frag_ids:
-                        current_variant_entries.add(ev & 0x1FFFFFFF)
-                        current_variant_ranges.extend(
-                            ((start & 0x1FFFFFFF),
-                             (start & 0x1FFFFFFF) + length)
-                            for start, length in ranges)
-                    if job.get('resident_cap'):
-                        fragment_dll = os.path.join(
-                            cache_dir,
-                            f'{phys_addr:08X}_{fragment_shard_key(frag_ids):08X}'
-                            f'{overlay_ext()}')
-                        reconcile_bios_resident_marker(
-                            fragment_dll, job['resident_cap'],
-                            status == 'built')
+                    record_fragment_success(frag_ids, status)
                 else:
                     # An executed orphan interior that would NOT build is a real
                     # coverage hole: that PC's whole dispatch chain runs
@@ -4234,19 +4487,7 @@ def main():
                     # Persist only deterministic generated-code audit verdicts;
                     # compiler/spawn errors and cache-pair mismatches depend on
                     # mutable external state and must remain retryable.
-                    optional_reject = optional_static_fragment_rejection(
-                        a, job, status)
-                    if optional_reject:
-                        print(f'  static fragment 0x{a:08X} rejected safely: '
-                              f'{status}')
-                        stats.add_skip()
-                    else:
-                        stats.add_fail(
-                            f'interior 0x{a:08X} @region 0x{phys_addr:08X}',
-                            'fragment', status)
-                    if interior_failure_is_deterministic(status):
-                        fail_memo[key] = status
-                        append_interior_fail_memo(cache_dir, key, status)
+                    record_fragment_failure(a, status)
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
                   f'exact-demand orphan interior(s) -> isolated island shards')
         if memo_skipped:

@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import os
 import pathlib
+import shutil
 import struct
 import subprocess
 import sys
@@ -1348,6 +1349,12 @@ def check_interior_fragment_contract():
     ]) == {LOAD, LOAD + 4, LOAD + 8}
     good = [(entry, 0x12345678, [(entry, 8)])]
     assert MOD.validate_interior_fragment_ids(entry, good, {entry}) is None
+    second = entry + 0x40
+    multi = good + [(second, 0x87654321, [(second, 12)])]
+    assert MOD.validate_fragment_requested_ids(
+        {entry, second}, multi, {entry, second}) is None
+    assert "requested entry" in MOD.validate_fragment_requested_ids(
+        {entry, second + 4}, multi, {entry, second})
     assert "missing from generated C" in MOD.validate_interior_fragment_ids(
         entry, good, set())
     assert "0 manifest identities" in MOD.validate_interior_fragment_ids(
@@ -1448,6 +1455,110 @@ def check_interior_fragment_contract():
     assert static_job["executed"] == set()
     assert static_job["forced"] == set()
 
+    # Same-byte/full-recipe captures union their root evidence into one bounded
+    # supplemental job; a byte or producer recipe change remains isolated.
+    other = entry + 0x40
+    same_recipe = dict(static_job)
+    same_recipe["candidates"] = {other}
+    same_recipe["static_demands"] = {other}
+    same_recipe["static_exact_demands"] = {other}
+    merged = MOD.merge_fragment_jobs_by_recipe([static_job, same_recipe])
+    assert len(merged) == 1
+    assert merged[0]["static_exact_demands"] == {entry, other}
+    different_bytes = dict(same_recipe, data=b"x" * len(data))
+    assert len(MOD.merge_fragment_jobs_by_recipe(
+        [static_job, different_bytes])) == 2
+    resident_recipe = dict(
+        same_recipe,
+        resident_cap={"producer": "bios_resident_manifest",
+                      "bios_sha256": "00" * 32})
+    assert len(MOD.merge_fragment_jobs_by_recipe(
+        [static_job, resident_recipe], (14, 0, False, "gcc", "toml"))) == 2
+
+    calls = []
+    successes = []
+    failures = []
+
+    def batch_ok(roots):
+        calls.append(tuple(roots))
+        return [(root, root, [(root, 4)]) for root in roots], "built"
+
+    assert MOD.compile_batched_fragment_roots(
+        {entry, other}, batch_ok,
+        lambda roots, ids, status: successes.append(
+            (tuple(roots), len(ids), status)),
+        lambda root, status: failures.append((root, status))) == 1
+    assert calls == [(entry, other)]
+    assert successes == [((entry, other), 2, "built")]
+    assert failures == []
+
+    calls.clear()
+    successes.clear()
+    bad = other
+
+    def batch_bisect(roots):
+        calls.append(tuple(roots))
+        if bad in roots:
+            return None, "requested-entry-audit: rejected"
+        return [(root, root, [(root, 4)]) for root in roots], "built"
+
+    assert MOD.compile_batched_fragment_roots(
+        {entry, other}, batch_bisect,
+        lambda roots, ids, status: successes.append(tuple(roots)),
+        lambda root, status: failures.append((root, status))) == 1
+    assert calls == [(entry, other), (entry,), (other,)]
+    assert successes == [(entry,)]
+    assert failures[-1] == (other, "requested-entry-audit: rejected")
+
+    # Re-filter after the successful left half: its reachable manifest may
+    # already provide a right-side requested entry, so do not publish a
+    # redundant second supplement.
+    calls.clear()
+    successes.clear()
+    failures.clear()
+    current_entries = set()
+
+    def left_reaches_right(roots):
+        calls.append(tuple(roots))
+        if len(roots) > 1:
+            return None, "requested-entry-audit: split"
+        return [(entry, 1, [(entry, 4)]),
+                (other, 2, [(other, 4)])], "built"
+
+    def warm_from_success(roots, ids, _status):
+        successes.append(tuple(roots))
+        current_entries.update(ev & 0x1FFFFFFF for ev, _crc, _ranges in ids)
+
+    assert MOD.compile_batched_fragment_roots(
+        {entry, other}, left_reaches_right, warm_from_success,
+        lambda root, status: failures.append((root, status)),
+        lambda root: (root & 0x1FFFFFFF) not in current_entries) == 1
+    assert calls == [(entry, other), (entry,)]
+    assert successes == [(entry,)]
+    assert failures == []
+
+    calls.clear()
+    batch_failures = []
+
+    def toolchain_down(roots):
+        calls.append(tuple(roots))
+        return None, "compile-error (toolchain unavailable)"
+
+    assert not MOD.fragment_batch_failure_is_partitionable(
+        "compile-error (toolchain unavailable)")
+    assert MOD.fragment_batch_failure_is_partitionable(
+        "requested-entry-audit: rejected")
+    assert MOD.compile_batched_fragment_roots(
+        {entry, other}, toolchain_down,
+        lambda *_args: None,
+        lambda root, status: failures.append((root, status)),
+        should_bisect=MOD.fragment_batch_failure_is_partitionable,
+        on_batch_failure=lambda roots, status: batch_failures.append(
+            (tuple(roots), status))) == 0
+    assert calls == [(entry, other)]
+    assert batch_failures == [
+        ((entry, other), "compile-error (toolchain unavailable)")]
+
     # Static exact demand is variant-specific: another variant's F entry does
     # not suppress it. Alias demand is narrower and only fills interval holes.
     alias = entry + 0x20
@@ -1462,6 +1573,10 @@ def check_interior_fragment_contract():
     # current_variant_entries and therefore cannot suppress executed demand.
     assert MOD.select_fragment_orphans(
         {entry}, {entry}, set(), set(), set(), set(), []) == [entry]
+    assert MOD.select_batchable_strong_roots(
+        {entry, entry + 4, entry + 8, entry + 12, entry + 16},
+        {entry + 4}, {entry + 8}, {entry + 12},
+        {(entry + 16) & 0x1FFFFFFF}) == [entry]
 
     with tempfile.TemporaryDirectory() as td:
         dll = pathlib.Path(td) / "00010000_fragment.dll"
@@ -1563,6 +1678,22 @@ def check_interior_fragment_contract():
         f"dispatch_root 0x{entry:08X}",
     ]
 
+    seen_seeds.clear()
+    try:
+        MOD.subprocess.run = stop_after_seeds
+        ids, status = MOD.compile_fragment_batch(
+            {entry + 0x40, entry}, data, LOAD, len(data),
+            LOAD & 0x1FFFFFFF, "unused", Args(), {}, {},
+            ((LOAD, LOAD + 0x100),), ())
+        assert ids is None and status.startswith("recompiler-error")
+    finally:
+        MOD.subprocess.run = old_run
+    assert seen_seeds == [
+        f"producer_range 0x{LOAD:08X} 0x{LOAD + 0x100:08X}",
+        f"dispatch_root 0x{entry:08X}",
+        f"dispatch_root 0x{entry + 0x40:08X}",
+    ]
+
 
 def check_tcc_runtime_define_parity():
     """TCC shards must use the same release/cycle contract as GCC shards."""
@@ -1598,6 +1729,88 @@ def check_tcc_runtime_define_parity():
     assert '-DPSX_OVERLAY_FLAVOR=3' in seen
 
 
+def check_real_batched_fragment_publication(recompiler):
+    """A poorer same-byte pair stays intact while one richer supplement wins."""
+    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
+           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
+           else shutil.which('gcc'))
+    if not gcc:
+        return
+
+    data = bytearray(0x100)
+    first = LOAD
+    second = LOAD + 0x40
+    third = LOAD + 0x80
+    for offset in (0, 0x40, 0x80):
+        put(data, offset, 0x03E00008)  # jr ra
+        put(data, offset + 4, 0)
+    runtime_include = str(ROOT / 'runtime' / 'include')
+    MOD.load_dispatch_preamble(runtime_include)
+
+    class Args:
+        game_toml = str(ROOT / 'tools' / 'cycle_testrom' / 'game.toml')
+        flavor = 0
+        compiler = 'gcc'
+        tcc = 'tcc'
+        force = False
+        cps = True
+
+    args = Args()
+    args.recompiler = recompiler
+    args.runtime_include = runtime_include
+    args.gcc = gcc
+    env = os.environ.copy()
+    env['PSX_CPS'] = '1'
+    recipe = ((LOAD, LOAD + len(data)),)
+    extension = MOD.overlay_ext()
+
+    with tempfile.TemporaryDirectory() as td:
+        ids, status = MOD.compile_fragment_batch(
+            {first}, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
+            td, args, env, {}, recipe, ())
+        assert ids and status == 'built'
+        initial_dlls = list(pathlib.Path(td).glob(f'*{extension}'))
+        assert len(initial_dlls) == 1
+        initial_dll = initial_dlls[0]
+        initial_ranges = initial_dll.with_suffix('.ranges')
+        initial_pair = (initial_dll.read_bytes(), initial_ranges.read_bytes())
+
+        current_entries, _ranges = MOD.load_region_current_variant_coverage(
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14)
+        assert current_entries == {first & 0x1FFFFFFF}
+        requested_batches = []
+
+        def compile_missing(roots):
+            requested_batches.append(tuple(roots))
+            return MOD.compile_fragment_batch(
+                roots, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
+                td, args, env, {}, recipe, ())
+
+        def warm(_roots, func_ids, _status):
+            current_entries.update(
+                entry & 0x1FFFFFFF for entry, _crc, _ranges in func_ids)
+
+        assert MOD.compile_batched_fragment_roots(
+            {first, second, third}, compile_missing, warm,
+            lambda root, reason: (_ for _ in ()).throw(
+                AssertionError((root, reason))),
+            lambda root: (root & 0x1FFFFFFF) not in current_entries,
+            MOD.fragment_batch_failure_is_partitionable) == 1
+        assert requested_batches == [(second, third)]
+        assert (initial_dll.read_bytes(), initial_ranges.read_bytes()) == initial_pair
+        final_dlls = list(pathlib.Path(td).glob(f'*{extension}'))
+        assert len(final_dlls) == 2
+        supplemental = next(dll for dll in final_dlls if dll != initial_dll)
+        assert {second & 0x1FFFFFFF, third & 0x1FFFFFFF} <= \
+            MOD.load_shard_entry_set(str(supplemental), 14)
+        final_entries, _ranges = MOD.load_region_current_variant_coverage(
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14)
+        assert {first & 0x1FFFFFFF, second & 0x1FFFFFFF,
+                third & 0x1FFFFFFF} <= final_entries
+        assert all(MOD.compiled_shard_complete(str(dll), 14)
+                   for dll in pathlib.Path(td).glob(f'*{extension}'))
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -1627,6 +1840,7 @@ def main():
     check_atomic_dll_publication()
     check_interior_fragment_contract()
     check_tcc_runtime_define_parity()
+    check_real_batched_fragment_publication(args.recompiler)
 
     data = bytearray(0x200)
 

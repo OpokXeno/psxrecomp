@@ -308,12 +308,20 @@ capture's runtime-valid, CRC-matching shard set. Coverage from another byte
 variant, a mismatched DLL/manifest pair, or a missing DLL export cannot suppress
 a current-variant attempt.
 
-Every fragment remains a separate failure domain and is published only when the
-requested C definition exists, exactly one 1..16-range identity contains the
-entry, generated C has no unsupported/bad target, the host compiler succeeds,
-and the DLL/manifest pair is atomic. Deterministic audit rejection of an unplayed
-static candidate is a memoized safe skip; the same rejection is fatal once live
-execution or `--force-interior` makes it an exact demand.
+Strong missing roots that share the complete byte/recompiler recipe are compiled
+as one supplemental multi-root shard rather than one DLL per root. Partitionable
+generated-C/requested-entry/no-output/no-identity/cache-collision failures are
+recursively bisected; after each successful half, the remaining roots are
+filtered against the newly published coverage so the other half cannot duplicate
+entries already reached. Compiler/toolchain failures stop that recipe once
+instead of triggering an O(N) retry storm. Executed/forced roots and
+static-interval recovery remain singleton failure domains. Every published batch
+still requires every requested C definition, exactly one 1..16-range identity per
+root, zero unsupported/bad targets, a successful host compile, and an atomic
+DLL/manifest pair. A valid concurrent winner is preserved and then revalidated
+for exact manifest, ABI, and pair identity. Deterministic audit rejection of an
+unplayed static candidate is a memoized safe skip; the same rejection is fatal
+once live execution or `--force-interior` makes it an exact demand.
 
 Tomba 2's clean `cg5_7125d9b5` build produced 53 region shards plus 104 accepted
 continuation fragments (`ok=157 failed=0 skipped=5`). All 12 durable MAIN gaps
@@ -325,6 +333,31 @@ coverage: exact native recall is 158/888 and remains the next resume-entry
 target. A matching-hash static-only attract run passed the former sign and ledge
 freezes, returned to title at approximately 60 fps, and recorded about 95.3%
 native dispatch.
+
+The bounded batching checkpoint was then rebuilt cleanly under the same final
+`cg5_7125d9b5` hash. MMX6 produced 107/107 runtime-valid DLL/manifest pairs with
+zero final failures and only 81 duplicate instances among 17,425 unique
+`(entry, code_crc)` identities. Against 701 verified historical observations it
+provides 588 exact entry addresses (83.9%), 595 with the exact BIOS resident
+shard (84.9%), 94.2% overlay interval containment, and 100% combined interval
+containment. Tomba 1 produced 74/74 runtime-valid pairs; its played-vault exact
+entry-address recall is 808/823 (98.2%), while exact `(entry, code_crc)` recall is
+778/867 (89.7%). Overlay interval containment is 820/823 (99.6%), and the exact
+BIOS shard brings combined interval containment to 823/823. Interval containment
+remains potential compiled-byte ownership, not proof of exact native dispatch at
+an interior resume PC.
+
+MMX6's full clean cache contains 17,506 manifest identities, above the runtime's
+old 16,384 process-lifetime candidate ceiling. The candidate table is therefore
+32,768, with all dependent hash/manifest/range tables scaled consistently. A
+durable `candidate_overflow` status counter, loud loader message, and one-shot
+per-bundle suppression make any future exhaustion explicit and fail closed to
+the interpreter without repeated DLL loads. An adversarial lifecycle review and
+the structural capacity regression test cover partial loads, zero-candidate
+cleanup on both platforms, and speculative Windows image-map cancellation.
+The deliberate desktop memory cost is +11.375 MiB of static BSS in the MinGW
+`overlay_loader` object (37.297 to 48.672 MiB), mostly from the proportionally
+scaled lazy indexes; non-desktop ports should account for this fixed allocation.
 
 A fresh Ape validation rebuilt all **47/47** candidates with zero audit or host-
 compiler failures. A full title-to-attract-to-title cycle exercised four overlay
