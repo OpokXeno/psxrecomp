@@ -227,7 +227,14 @@ def bounded_dispatch_fallback(data, base, entries):
         return None
     return {
         'function_entry_pcs':[f"0x{addr:08X}" for addr in sorted(hosts)],
-        'dispatch_entry_pcs':[f"0x{addr:08X}" for addr in sorted(dispatch)],
+        # The prologue hosts and the exported interior targets are both
+        # statically established dispatch candidates. Keep the ordinary dispatch
+        # field as the complete authority set so the more-specific static
+        # provenance below remains a strict subset by construction.
+        'dispatch_entry_pcs':[
+            f"0x{addr:08X}" for addr in sorted(hosts | dispatch)],
+        'static_dispatch_entry_pcs':[
+            f"0x{addr:08X}" for addr in sorted(hosts | dispatch)],
         'static_discovery_entry_pcs':[],
         'producer_ranges':[
             {'start':f"0x{lo:08X}",'end':f"0x{hi:08X}"}
@@ -729,14 +736,22 @@ def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
         jump_table_proofs=None, call_continuations=None):
     # function_entry_pcs = prologue-scanned function starts (walk roots).
     # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
-    # overlay's own export table). compile_overlays promotes clean starts to
-    # entries and mid-function dispatch targets to DISPATCH_INTERIOR aliases
-    # (impossible_entry_start guards garbage), so passing the game's authoritative
-    # dispatch table here recovers indirect-only entries a prologue scan misses.
-    disp = sorted(set(seeds) | set(dispatch_extra or ()))
+    # overlay's own export table). static_dispatch_entry_pcs records this full
+    # extractor-proven dispatch set (both scanner roots and table targets).
+    # Keeping the provenance separate lets
+    # compile_overlays nominate an address in sibling byte variants without
+    # granting the same authority to a runtime-observed dispatch PC.
+    # compile_overlays promotes clean starts to entries and mid-function
+    # dispatch targets to DISPATCH_INTERIOR aliases (impossible_entry_start
+    # guards garbage), so passing the game's authoritative dispatch table here
+    # recovers indirect-only entries a prologue scan misses.
+    static_dispatch = sorted(set(seeds) | set(dispatch_extra or ()))
+    disp = static_dispatch
     out={"schema":"psxrecomp overlay capture v2","load_addr":f"0x{load_addr:08X}",
          "size":len(data),"bytes_b64":base64.b64encode(data).decode(),
          "executed_pcs":[],"dispatch_entry_pcs":[f"0x{a:08X}" for a in disp],
+         "static_dispatch_entry_pcs":[
+             f"0x{a:08X}" for a in static_dispatch],
          "function_entry_pcs":[f"0x{a:08X}" for a in seeds],
          "seeds":[f"0x{a:08X}" for a in seeds]}
     if producer_ranges:

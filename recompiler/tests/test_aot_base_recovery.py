@@ -68,6 +68,10 @@ def main():
     recipe = MOD.bounded_dispatch_fallback(
         bounded, 0x80100000, [0x80100024, 0x80100050])
     assert recipe['function_entry_pcs'] == ['0x80100010', '0x80100040']
+    assert recipe['dispatch_entry_pcs'] == [
+        '0x80100010', '0x80100024', '0x80100040', '0x80100050']
+    assert set(recipe['static_dispatch_entry_pcs']) <= set(
+        recipe['dispatch_entry_pcs'])
     assert recipe['producer_ranges'] == [
         {'start': '0x80100010', 'end': '0x80100040'},
         {'start': '0x80100040', 'end': '0x80100070'},
@@ -270,6 +274,10 @@ def main():
         assert '0x801382B8' in capture['dispatch_entry_pcs']
         assert '0x80138354' in capture['dispatch_entry_pcs']
         assert '0x80138368' in capture['dispatch_entry_pcs']
+        assert '0x801382B8' in capture['static_dispatch_entry_pcs']
+        assert '0x80138354' in capture['static_dispatch_entry_pcs']
+        assert '0x80138368' in capture['static_dispatch_entry_pcs']
+        assert '0x8013829C' in capture['static_dispatch_entry_pcs']
         assert capture['static_jump_table_proofs'][0]['host_entry'] == (
             '0x8013829C')
         assert capture['static_jump_table_proofs'][0]['jr_pc'] == '0x801382DC'

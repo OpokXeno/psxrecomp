@@ -13,6 +13,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 LOADER = ROOT / "runtime" / "src" / "overlay_loader.c"
+OVERLAY_API = ROOT / "runtime" / "include" / "overlay_api.h"
 DEBUG_SERVER = ROOT / "runtime" / "src" / "debug_server.c"
 
 
@@ -44,14 +45,22 @@ def require(pattern: str, text: str, message: str) -> None:
 
 def main() -> int:
     source = LOADER.read_text(encoding="utf-8")
+    overlay_api = OVERLAY_API.read_text(encoding="utf-8")
     debug = DEBUG_SERVER.read_text(encoding="utf-8")
 
-    cap_match = re.search(r"^#define\s+CAND_CAP\s+(\d+)\s*$", source, re.M)
+    cap_match = re.search(
+        r"^#define\s+PSX_OVERLAY_CANDIDATE_CAP\s+(\d+)\s*$",
+        overlay_api, re.M)
     if not cap_match:
-        raise AssertionError("CAND_CAP must remain an auditable integer literal")
+        raise AssertionError(
+            "PSX_OVERLAY_CANDIDATE_CAP must remain an auditable integer literal")
     cap = int(cap_match.group(1))
     if cap < 17_506 or cap & (cap - 1):
-        raise AssertionError(f"CAND_CAP must be power-of-two and >= 17,506, got {cap}")
+        raise AssertionError(
+            "PSX_OVERLAY_CANDIDATE_CAP must be power-of-two and >= 17,506, "
+            f"got {cap}")
+    require(r"#define\s+CAND_CAP\s+PSX_OVERLAY_CANDIDATE_CAP", source,
+            "runtime candidate arrays must use the shared public capacity")
     require(r"#define\s+IDX_CAP\s+\(CAND_CAP\s*\*\s*2u\)", source,
             "candidate hash index must scale at 2x CAND_CAP")
     require(r"#define\s+IDX_MASK\s+\(IDX_CAP\s*-\s*1u\)", source,
@@ -75,6 +84,36 @@ def main() -> int:
             "cand_register must allocate from the bounded candidate array")
     require(r"return\s+1\s*;\s*$", register,
             "cand_register must report successful registration")
+    require(r"c->crc_code\s*=\s*m->crc", register,
+            "candidate CRC must always come from an authoritative manifest")
+    require(r"!arr\[i\]\.has_crc\s*\|\|\s*arr\[i\]\.n\s*<=\s*0", source,
+            "runtime must reject legacy no-CRC/empty-range manifests")
+    require(r"contains_entry", source,
+            "runtime must require each manifest entry inside its guarded ranges")
+    require(r"arr\[j\]\.entry[^\n]*==\s*entry", source,
+            "runtime must reject duplicate physical manifest entries")
+    require(r"lo\s*>=\s*OVERLAY_RAM_SIZE\s*\|\|\s*"
+            r"arr\[i\]\.len\[r\]\s*>\s*OVERLAY_RAM_SIZE\s*-\s*lo", source,
+            "runtime must reject manifest ranges outside 2 MiB RAM")
+    require(r"manifest_skip_space\(line\)", source,
+            "runtime manifest grammar must accept leading whitespace like Python")
+    require(r"manifest_is_space", source,
+            "runtime manifest grammar must use an explicit ASCII whitespace set")
+    require(r"memchr\(line,\s*'\\0',\s*line_len\)", source,
+            "runtime manifest parser must reject embedded NUL bytes")
+    require(r'fopen\(path,\s*"rb"\)', source,
+            "Windows manifest parsing must not treat Ctrl-Z as text EOF")
+    require(r"MANIFEST_PHYSICAL_LINE_MAX\s*\+\s*1u", source,
+            "runtime must bound the same physical-line width as Python")
+    require(r"manifest_hex_field\(&cursor,\s*16", source,
+            "pair ids must use the strict bounded manifest hex parser")
+    if len(re.findall(r"manifest_hex_field\(&cursor,\s*8", source)) < 4:
+        raise AssertionError(
+            "F/R fields must all use the strict bounded manifest hex parser")
+    require(r"manifest_record_end\(cursor\)", source,
+            "runtime manifest records must reject trailing tokens like Python")
+    require(r"#ifdef\s+_WIN32[^#]*_stricmp\(a,\s*b\)", source,
+            "Windows tier dedup must use case-insensitive cache basenames")
     if len(re.findall(r"registered\s*\+=\s*cand_register\s*\(", source)) != 2:
         raise AssertionError("both platform loaders must count cand_register success honestly")
 
@@ -98,6 +137,14 @@ def main() -> int:
     if guard_pos < 0 or load_pos < 0 or guard_pos > load_pos:
         raise AssertionError("capacity guard must run before platform DLL loading")
 
+    range_match = function_body(source, "range_candidate_matches")
+    require(r"first_range_lo\s*=\s*UINT32_MAX", range_match,
+            "CPS ownership must find the canonical lowest range root")
+    require(r"lo\s*<\s*first_range_lo", range_match,
+            "CPS ownership must not accept an alias at a later range island")
+    require(r"!contains\s*\|\|\s*c->addr\s*!=\s*first_range_lo", range_match,
+            "hosted interior aliases must fail closed for CPS range lookup")
+
     first_loader = source.index("static int load_overlay_dll")
     windows_start = source.rfind("#ifdef _WIN32", 0, first_loader)
     if windows_start < 0:
@@ -109,10 +156,21 @@ def main() -> int:
     require(r"if\s*\(registered\s*==\s*0\)\s*\{[^}]*"
             r"s_dll_flush\[dll\]\s*=\s*NULL\s*;[^}]*FreeLibrary\(h\)", windows,
             "Windows zero-candidate loads must clear callbacks and release the DLL")
+    win_preflight = windows.find("manifest/export mismatch")
+    win_register = windows.find("cand_register")
+    if win_preflight < 0 or win_register < 0 or win_preflight > win_register:
+        raise AssertionError(
+            "Windows must reject a partial-export manifest before registration")
     require(r"if\s*\(registered\s*==\s*0\)\s*\{[^}]*"
             r"s_dll_flush\[dll\]\s*=\s*NULL\s*;[^}]*"
             r"psx_overlay_posix_library_close\(h\)", posix,
             "POSIX zero-candidate loads must clear callbacks and release the DLL")
+    posix_preflight = posix.find("manifest/export mismatch")
+    posix_register = posix.find("cand_register")
+    if (posix_preflight < 0 or posix_register < 0 or
+            posix_preflight > posix_register):
+        raise AssertionError(
+            "POSIX must reject a partial-export manifest before registration")
 
     require(r'\\"candidate_overflow\\":%llu', debug,
             "debug status JSON must expose candidate overflow")

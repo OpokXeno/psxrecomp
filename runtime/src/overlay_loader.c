@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -93,7 +94,7 @@ typedef struct {
  * loading means this is a potential long-session population, not proof that one
  * observed run loaded all of them; every encountered variant does remain loaded.
  * Keep enough headroom that coverage cannot silently become interpreter-only. */
-#define CAND_CAP   32768
+#define CAND_CAP   PSX_OVERLAY_CANDIDATE_CAP
 static Candidate s_cand[CAND_CAP];
 static int       s_cand_n = 0;
 
@@ -546,7 +547,7 @@ void overlay_loader_static_match_stats(uint64_t *rehashes,
 /* ---- Per-DLL code-range manifest --------------------------------------- */
 /* Minimal line format emitted by tools/compile_overlays.py beside each DLL:
  *   P <pair_id_hex>          optional DLL/manifest publication identity
- *   F <entry_hex>            start a function (entry = virtual export addr)
+ *   F <entry_hex> <crc_hex>  start a function (entry = virtual export addr)
  *   R <lo_hex> <len_hex>     a code byte-range (virtual addr, byte length)
  * The recompiler's per-function instruction walk yields exactly the executed
  * code bytes — interleaved jump tables / constant pools are excluded, which is
@@ -554,11 +555,48 @@ void overlay_loader_static_match_stats(uint64_t *rehashes,
 typedef struct {
     uint32_t entry;
     uint32_t crc;       /* expected hash of the compiled-from code bytes       */
-    int      has_crc;   /* 1 if the manifest supplied the authoritative hash   */
+    int      has_crc;   /* parser validity bit; authoritative CRC is required  */
     uint32_t lo[MAX_CODE_RANGES];
     uint32_t len[MAX_CODE_RANGES];
     int      n;
 } ManFn;
+
+#define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
+#define MANIFEST_LINE_MAX 128u
+#define MANIFEST_PHYSICAL_LINE_MAX 159u
+
+static int manifest_is_space(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f';
+}
+
+static const char *manifest_skip_space(const char *p) {
+    while (*p && manifest_is_space((unsigned char)*p)) p++;
+    return p;
+}
+
+static int manifest_hex_field(const char **cursor, int max_digits,
+                              uint64_t *out) {
+    const char *p = manifest_skip_space(*cursor);
+    uint64_t value = 0;
+    int digits = 0;
+    while (isxdigit((unsigned char)*p)) {
+        int nibble;
+        if (*p >= '0' && *p <= '9') nibble = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') nibble = *p - 'a' + 10;
+        else nibble = *p - 'A' + 10;
+        if (++digits > max_digits) return 0;
+        value = (value << 4) | (uint64_t)nibble;
+        p++;
+    }
+    if (digits == 0 || (*p && !manifest_is_space((unsigned char)*p))) return 0;
+    *cursor = p;
+    *out = value;
+    return 1;
+}
+
+static int manifest_record_end(const char *cursor) {
+    return *manifest_skip_space(cursor) == '\0';
+}
 
 static ManFn *parse_manifest(const char *path, int *out_n,
                              uint64_t *out_pair_id,
@@ -566,47 +604,103 @@ static ManFn *parse_manifest(const char *path, int *out_n,
     *out_n = 0;
     if (out_pair_id) *out_pair_id = 0;
     if (out_has_pair_id) *out_has_pair_id = 0;
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     int cap = 1024, n = 0;
+    int invalid = 0, pair_seen = 0;
     ManFn *arr = (ManFn *)malloc(sizeof(ManFn) * cap);
     if (!arr) { fclose(f); return NULL; }
-    char line[160];
+    char line[MANIFEST_PHYSICAL_LINE_MAX + 1u];
     ManFn *cur = NULL;
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == 'P') {
-            unsigned long long parsed = 0;
-            if (sscanf(line + 1, "%llx", &parsed) == 1) {
-                if (out_pair_id) *out_pair_id = (uint64_t)parsed;
+    for (;;) {
+        size_t line_len = 0;
+        int ch = 0, too_long = 0;
+        while ((ch = fgetc(f)) != '\n' && ch != EOF) {
+            if (line_len + 1 < sizeof(line)) line[line_len++] = (char)ch;
+            else too_long = 1;
+        }
+        if (ch == EOF && line_len == 0 && !too_long) break;
+        line[line_len] = '\0';
+        const char *record = manifest_skip_space(line);
+        int recognized = ((*record == 'P' || *record == 'F' || *record == 'R') &&
+                          (record[1] == '\0' ||
+                           manifest_is_space((unsigned char)record[1])));
+        int embedded_nul = memchr(line, '\0', line_len) != NULL;
+        int non_ascii = 0;
+        for (size_t i = 0; i < line_len; i++)
+            if ((unsigned char)line[i] >= 0x80u) { non_ascii = 1; break; }
+        size_t record_width = 0;
+        while (record_width < line_len && line[record_width] != '\r')
+            record_width++;
+        if (too_long || embedded_nul || non_ascii ||
+            record_width > MANIFEST_LINE_MAX) {
+            invalid = 1;
+            continue;
+        }
+        if (!recognized) continue;
+        if (*record == 'P') {
+            const char *cursor = record + 1;
+            uint64_t parsed = 0;
+            if (manifest_hex_field(&cursor, 16, &parsed) &&
+                manifest_record_end(cursor)) {
+                if (pair_seen) invalid = 1;
+                pair_seen = 1;
+                if (out_pair_id) *out_pair_id = parsed;
                 if (out_has_pair_id) *out_has_pair_id = 1;
-            }
-        } else if (line[0] == 'F') {
-            uint32_t e = 0, crc = 0;
-            int got = sscanf(line + 1, "%x %x", &e, &crc);
-            if (got >= 1) {
+            } else invalid = 1;
+        } else if (*record == 'F') {
+            const char *cursor = record + 1;
+            uint64_t parsed_e = 0, parsed_crc = 0;
+            if (manifest_hex_field(&cursor, 8, &parsed_e) &&
+                manifest_hex_field(&cursor, 8, &parsed_crc) &&
+                manifest_record_end(cursor)) {
                 if (n >= cap) {
                     cap *= 2;
                     ManFn *na = (ManFn *)realloc(arr, sizeof(ManFn) * cap);
-                    if (!na) break;
+                    if (!na) { invalid = 1; break; }
                     arr = na;
                 }
                 cur = &arr[n++];
-                cur->entry   = e;
-                cur->crc     = crc;
-                cur->has_crc = (got >= 2) ? 1 : 0;
+                cur->entry   = ((uint32_t)parsed_e & 0x1FFFFFFFu) | 0x80000000u;
+                cur->crc     = (uint32_t)parsed_crc;
+                cur->has_crc = 1;
                 cur->n = 0;
-            }
-        } else if (line[0] == 'R' && cur) {
-            uint32_t lo, len;
-            if (sscanf(line + 1, "%x %x", &lo, &len) == 2 &&
-                cur->n < MAX_CODE_RANGES && len > 0) {
-                cur->lo[cur->n]  = lo;
-                cur->len[cur->n] = len;
+            } else invalid = 1;
+        } else if (*record == 'R' && cur) {
+            const char *cursor = record + 1;
+            uint64_t parsed_lo = 0, parsed_len = 0;
+            if (manifest_hex_field(&cursor, 8, &parsed_lo) &&
+                manifest_hex_field(&cursor, 8, &parsed_len) &&
+                manifest_record_end(cursor) &&
+                cur->n < MAX_CODE_RANGES && parsed_len > 0) {
+                cur->lo[cur->n]  = (uint32_t)parsed_lo;
+                cur->len[cur->n] = (uint32_t)parsed_len;
                 cur->n++;
-            }
+            } else invalid = 1;
         }
     }
     fclose(f);
+    for (int i = 0; i < n; i++) {
+        uint32_t entry = arr[i].entry & 0x1FFFFFFFu;
+        int contains_entry = 0;
+        if (!arr[i].has_crc || arr[i].n <= 0) invalid = 1;
+        for (int r = 0; r < arr[i].n; r++) {
+            uint32_t lo = arr[i].lo[r] & 0x1FFFFFFFu;
+            uint64_t hi = (uint64_t)lo + arr[i].len[r];
+            if (lo >= OVERLAY_RAM_SIZE ||
+                arr[i].len[r] > OVERLAY_RAM_SIZE - lo)
+                invalid = 1;
+            if ((uint64_t)entry >= lo && (uint64_t)entry < hi)
+                contains_entry = 1;
+        }
+        if (!contains_entry) invalid = 1;
+        for (int j = 0; j < i; j++)
+            if ((arr[j].entry & 0x1FFFFFFFu) == entry) invalid = 1;
+    }
+    if (invalid || n == 0) {
+        free(arr);
+        return NULL;
+    }
     *out_n = n;
     return arr;
 }
@@ -648,11 +742,7 @@ static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
      * present yet, and other overlays sharing the merged DLL are not present at
      * all). A candidate is callable iff live RAM matches this compiled-from hash,
      * which makes validity timing-independent and reload-on-return work. */
-    if (m->has_crc) {
-        c->crc_code = m->crc;
-    } else {
-        c->crc_code = cand_crc(c);   /* legacy manifest without hashes */
-    }
+    c->crc_code = m->crc;
     c->val_gen = cand_gensum(c);
     c->state   = (cand_crc(c) == c->crc_code) ? ENTRY_VALID : ENTRY_INVALID;
     c->next    = idx_head(phys);
@@ -986,6 +1076,14 @@ static int cache_idx_has_path(const char *path) {
     return 0;
 }
 
+static int cache_basename_equal(const char *a, const char *b) {
+#ifdef _WIN32
+    return _stricmp(a, b) == 0;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
 /* Dedup by FILENAME (<addr8>_<crc8>.dll = region+crc). Used so a tcc/ shard for a
  * region already covered by a gcc/ shard is skipped: scan_cache_dir scans gcc/
  * FIRST, so gcc always wins the tie (tier order gcc > tcc). Also subsumes the
@@ -994,7 +1092,7 @@ static int cache_idx_has_basename(const char *fname) {
     for (int i = 0; i < s_cache_idx_count; i++) {
         const char *b = strrchr(s_cache_idx[i].path, '/');
         b = b ? b + 1 : s_cache_idx[i].path;
-        if (strcmp(b, fname) == 0) return 1;
+        if (cache_basename_equal(b, fname)) return 1;
     }
     return 0;
 }
@@ -1742,6 +1840,18 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         FreeLibrary(h);
         return 0;
     }
+    /* Match the offline pair validator atomically: every manifest F must have
+     * its exact callable export before any Candidate slot is consumed. */
+    for (int i = 0; i < man_n; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "func_%08X", man[i].entry);
+        if (!GetProcAddress(h, name)) {
+            loader_log("manifest/export mismatch in %s: missing %s -- "
+                       "rejecting whole DLL", dll_path, name);
+            FreeLibrary(h);
+            return 0;
+        }
+    }
     init_fn(&s_callbacks);
     OverlayFlushFn flush_fn = (OverlayFlushFn)GetProcAddress(h, "overlay_flush_cycles");
     if (!flush_fn || dll < 0 || dll >= (int)(sizeof(s_dll_flush) / sizeof(s_dll_flush[0]))) {
@@ -1840,6 +1950,14 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         loader_log("no overlay_init in %s", dll_path);
         psx_overlay_posix_library_close(h);
         return 0;
+    }
+    for (int i = 0; i < man_n; i++) {
+        if (!psx_overlay_posix_library_entry(h, man[i].entry)) {
+            loader_log("manifest/export mismatch in %s: missing func_%08X -- "
+                       "rejecting whole DLL", dll_path, man[i].entry);
+            psx_overlay_posix_library_close(h);
+            return 0;
+        }
     }
     init_fn(&s_callbacks);
     OverlayFlushFn flush_fn = (OverlayFlushFn)psx_overlay_posix_library_symbol(
@@ -2346,11 +2464,19 @@ static int range_candidate_matches(int i, uint32_t phys) {
     Candidate *c = &s_cand[i];
     if (c->state == ENTRY_BLACKLIST) return 0;
     int contains = 0;
+    uint32_t first_range_lo = UINT32_MAX;
     for (int r = 0; r < c->nranges; r++) {
         uint32_t lo = c->range_lo[r];
-        if (phys >= lo && phys < lo + c->range_len[r]) { contains = 1; break; }
+        if (lo < first_range_lo) first_range_lo = lo;
+        if (phys >= lo && phys < lo + c->range_len[r]) contains = 1;
     }
-    if (!contains) return 0;
+    /* Interior hosted aliases intentionally share their canonical host's full
+     * CRC/range identity, but their generated wrapper may contain only the
+     * blocks reachable from the alias.  They are valid exact dispatch entries,
+     * never authoritative owners for an arbitrary CPS continuation elsewhere
+     * in the host range.  Prefer the rooted host; if it is unavailable, fail
+     * closed to the interpreter instead of restarting through an alias. */
+    if (!contains || c->addr != first_range_lo) return 0;
 
     /* A reused address can have several range-owning variants. Select the
      * one whose compiled code bytes match live RAM instead of returning the

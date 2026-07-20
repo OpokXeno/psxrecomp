@@ -18,6 +18,12 @@ SPEC = importlib.util.spec_from_file_location(
 MOD = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MOD)
+EXTRACT_SPEC = importlib.util.spec_from_file_location(
+    "extract_generic", ROOT / "tools" / "aot_overlay_spike" /
+    "extract_generic.py")
+EXTRACT = importlib.util.module_from_spec(EXTRACT_SPEC)
+assert EXTRACT_SPEC.loader is not None
+EXTRACT_SPEC.loader.exec_module(EXTRACT)
 
 LOAD = 0x80010000
 
@@ -285,6 +291,52 @@ def check_static_discovery_provenance():
     assert audit['included_reasons'][entry] == 'STATIC_DISCOVERY_ROOT'
 
 
+def check_static_dispatch_provenance():
+    data = bytearray(0x80)
+    runtime_entry = LOAD + 0x20
+    static_entry = LOAD + 0x40
+    interior = LOAD + 0x60
+    put(data, 0x20, 0x27BDFFF0)
+    put(data, 0x24, 0x03E00008)
+    put(data, 0x28, 0x27BD0010)
+    put(data, 0x40, 0x27BDFFF0)
+    put(data, 0x44, 0x10000006)  # branch to interior: block, not callable
+    put(data, 0x48, 0)
+    put(data, 0x4C, 0x03E00008)
+    put(data, 0x50, 0x27BD0010)
+    put(data, 0x60, 0x24420001)
+    put(data, 0x64, 0x03E00008)
+    put(data, 0x68, 0x27BD0010)
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'dispatch_entry_pcs': [
+            f'0x{runtime_entry:08X}', f'0x{static_entry:08X}',
+            f'0x{interior:08X}'],
+        'static_dispatch_entry_pcs': [
+            f'0x{static_entry:08X}', f'0x{interior:08X}'],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    assert audit['included_reasons'][runtime_entry] == 'DISPATCH_ENTRY'
+    assert runtime_entry not in audit['cross_variant_hosted_demands']
+    assert audit['included_reasons'][static_entry] == 'STATIC_DISPATCH_ENTRY'
+    assert static_entry in audit['static_exact_fragment_demands']
+    assert static_entry in audit['cross_variant_hosted_demands']
+    assert f'0x{static_entry:08X}' in seeds
+    assert f'call_root 0x{static_entry:08X}' not in seeds
+    assert audit['included_reasons'][interior] == 'DISPATCH_INTERIOR'
+    assert interior not in audit['cross_variant_hosted_demands']
+
+    malformed = dict(cap, static_dispatch_entry_pcs=[f'0x{LOAD:08X}'])
+    try:
+        MOD.classify_overlay_seeds(
+            malformed, bytes(data), LOAD, len(data), 0, {})
+    except RuntimeError as exc:
+        assert 'must be a subset' in str(exc)
+    else:
+        raise AssertionError('static dispatch superset accepted')
+
+
 def check_owned_direct_call_is_interior():
     data = bytearray(0x200)
     host = LOAD + 0x100
@@ -398,6 +450,100 @@ def check_recompiler_discovered_host_ownership(recompiler):
     assert f'void func_{target:08X}' in full
     assert f'F {target:08X}' in ranges
     assert f'R {host:08X}' in ranges
+
+
+def check_recompiler_explicit_hosted_interior(recompiler):
+    """A hosted alias must be an organic block leader in the named host."""
+    data = bytearray(0x100)
+    host = LOAD
+    target = LOAD + 0x10
+    far_path = LOAD + 0x30
+
+    # The conditional path keeps the host envelope open through far_path.  The
+    # fallthrough exits through an unresolved JR, so target is deliberately not
+    # exact-walk reachable.  It is nevertheless the organic block after that
+    # JR's delay slot -- the indirect-switch case shape this seed is for.
+    put(data, 0x00, 0x1480000B)  # bne a0,zero,far_path
+    put(data, 0x04, 0x00000000)
+    put(data, 0x08, 0x01000008)  # jr t0
+    put(data, 0x0C, 0x00000000)
+    put(data, 0x10, 0x24420001)
+    put(data, 0x14, 0x03E00008)
+    put(data, 0x18, 0x00000000)
+    put(data, 0x30, 0x03E00008)
+    put(data, 0x34, 0x00000000)
+
+    def run(extra_target):
+        with tempfile.TemporaryDirectory() as tmp:
+            psx = os.path.join(tmp, 'hosted_interior.psx')
+            seeds = os.path.join(tmp, 'seeds.txt')
+            out = os.path.join(tmp, 'out')
+            with open(psx, 'wb') as f:
+                f.write(make_psxexe(host, data))
+            with open(seeds, 'w', encoding='utf-8') as f:
+                f.write(f'call_root 0x{host:08X}\n')
+                f.write(
+                    f'hosted_interior 0x{extra_target:08X} 0x{host:08X}\n')
+            result = subprocess.run(
+                [recompiler, psx, '--seeds', seeds, '--out-dir', out,
+                 '--overlay'], capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr or result.stdout
+            ranges_path = next(pathlib.Path(out).glob('*_full.ranges'))
+            identities = MOD.parse_overlay_func_ids(
+                str(ranges_path), bytes(data), LOAD, len(data))
+            full = ''.join(path.read_text()
+                           for path in pathlib.Path(out).glob('*_full*.c'))
+            return identities, full, result.stdout + result.stderr
+
+    identities, full, _log = run(target)
+    by_entry = {entry: (crc, ranges) for entry, crc, ranges in identities}
+    assert target in by_entry
+    assert host in by_entry
+    assert by_entry[target] == by_entry[host]
+    assert f'void func_{target:08X}' in full
+
+    # Four bytes into the same block is not independently enterable.  Naming a
+    # valid host does not turn an arbitrary aligned address into an alias.
+    bad_target = target + 4
+    identities, full, log = run(bad_target)
+    assert bad_target not in {entry for entry, _crc, _ranges in identities}
+    assert f'void func_{bad_target:08X}' not in full
+    assert 'block=no' in log
+
+
+def check_recompiler_hosted_interior_parser(recompiler):
+    data = bytearray(0x80)
+    host = LOAD
+    target = LOAD + 0x10
+    put(data, 0x00, 0x03E00008)
+    put(data, 0x04, 0)
+
+    def invoke(lines):
+        with tempfile.TemporaryDirectory() as tmp:
+            psx = os.path.join(tmp, 'hosted_parser.psx')
+            seeds = os.path.join(tmp, 'seeds.txt')
+            out = os.path.join(tmp, 'out')
+            with open(psx, 'wb') as f:
+                f.write(make_psxexe(host, data))
+            with open(seeds, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+            return subprocess.run(
+                [recompiler, psx, '--seeds', seeds, '--out-dir', out,
+                 '--overlay'], capture_output=True, text=True)
+
+    invalid_cases = (
+        [f'hosted_interiorXYZ 0x{target:08X} 0x{host:08X}'],
+        [f'hosted_interior 0x{target + 2:08X} 0x{host:08X}'],
+        [f'hosted_interior 0x{target:08X} 0x{host:08X}junk'],
+        [f'hosted_interior 0x{target:08X} nope'],
+        [f'hosted_interior 0x{LOAD + len(data):08X} 0x{host:08X}'],
+        [f'hosted_interior 0x{target:08X} 0x{host:08X}',
+         f'hosted_interior 0x{target:08X} 0x{host + 0x20:08X}'],
+    )
+    for lines in invalid_cases:
+        result = invoke(lines)
+        assert result.returncode != 0, lines
+        assert 'ERROR:' in result.stderr, (lines, result.stdout, result.stderr)
 
 
 def assert_all_interiors_have_final_host(data, seeds, producer_ranges=(),
@@ -795,6 +941,7 @@ def check_optional_enrichment_fallback():
     encoded = [f'0x{direct:08X}']
     assert fallback['function_entry_pcs'] == encoded
     assert fallback['dispatch_entry_pcs'] == encoded
+    assert fallback['static_dispatch_entry_pcs'] == []
     assert fallback['static_discovery_entry_pcs'] == encoded
     assert fallback['seeds'] == encoded
     assert 'static_alias_ranges' not in fallback
@@ -808,6 +955,7 @@ def check_optional_enrichment_fallback():
     cap['optional_enrichment_fallback_entry_pcs'] = {
         'function_entry_pcs': [],
         'dispatch_entry_pcs': [f'0x{dispatch:08X}'],
+        'static_dispatch_entry_pcs': [f'0x{dispatch:08X}'],
         'static_discovery_entry_pcs': [],
         'producer_ranges': [{
             'start': f'0x{LOAD + 0x20:08X}',
@@ -818,11 +966,40 @@ def check_optional_enrichment_fallback():
     fallback = MOD.optional_enrichment_fallback_capture(cap)
     assert fallback['function_entry_pcs'] == []
     assert fallback['dispatch_entry_pcs'] == [f'0x{dispatch:08X}']
+    assert fallback['static_dispatch_entry_pcs'] == [f'0x{dispatch:08X}']
     assert fallback['static_discovery_entry_pcs'] == []
     assert fallback['seeds'] == []
     assert fallback['producer_ranges'] == cap[
         'optional_enrichment_fallback_entry_pcs']['producer_ranges']
     assert fallback['strict_producer_ranges'] is True
+
+    # Exercise the real bounded extractor recipe through both downstream
+    # transforms. Prologue-host static provenance must survive sanitization;
+    # otherwise sibling nomination silently loses its only durable authority.
+    bounded = bytearray(0x90)
+    for off in (0x10, 0x40, 0x70):
+        put(bounded, off, 0x27BDFFF0)
+        put(bounded, off + 4, 0x03E00008)
+        put(bounded, off + 8, 0x27BD0010)
+    bounded_recipe = EXTRACT.bounded_dispatch_fallback(
+        bytes(bounded), LOAD, [LOAD + 0x24, LOAD + 0x50])
+    wrapped = {
+        'schema': 'psxrecomp overlay capture v2',
+        'load_addr': f'0x{LOAD:08X}',
+        'size': len(bounded),
+        'optional_enrichment_fallback_entry_pcs': bounded_recipe,
+    }
+    bounded_fallback = MOD.optional_enrichment_fallback_capture(wrapped)
+    assert bounded_fallback['static_dispatch_entry_pcs'] == \
+        bounded_recipe['static_dispatch_entry_pcs']
+    assert set(bounded_fallback['static_dispatch_entry_pcs']) <= set(
+        bounded_fallback['dispatch_entry_pcs'])
+    _seeds, bounded_audit = MOD.classify_overlay_seeds(
+        bounded_fallback, bytes(bounded), LOAD, len(bounded), 0, {})
+    for host in (LOAD + 0x10, LOAD + 0x40):
+        assert bounded_audit['included_reasons'][host] == \
+            'STATIC_DISPATCH_ENTRY'
+        assert host in bounded_audit['cross_variant_hosted_demands']
 
 
 def check_forward_branch_root():
@@ -1337,6 +1514,245 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
         MOD._runtime_valid_shard_pair_locked = original_pair_valid
 
 
+def check_candidate_capacity_publication():
+    """Compiler accounting must match the loader's per-manifest-row cost."""
+    original_exports = MOD._dll_runtime_exports_match
+    original_abi = MOD._dll_abi_matches
+    try:
+        MOD._dll_runtime_exports_match = (
+            lambda _path, _abi, _pair, entries: bool(entries))
+
+        def funcs(count, base=LOAD):
+            return [
+                (base + index * 4, index + 1,
+                 ((base + index * 4, 4),))
+                for index in range(count)
+            ]
+
+        def pair(path, count, pair_id, base=LOAD):
+            pathlib.Path(path).write_bytes(b'DLL')
+            pathlib.Path(path).with_suffix('.ranges').write_text(
+                MOD.overlay_ranges_text(funcs(count, base), pair_id))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            second = os.path.join(tmp, '00010000_00000002.dll')
+            # Deliberately repeat the exact identity in two DLLs. Runtime
+            # registration consumes two Candidate slots, never one set member.
+            pair(first, 1, 1)
+            pair(second, 1, 2)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 2 and counts[first] == counts[second] == 1
+
+            staged = os.path.join(tmp, '.staged.dll')
+            staged_ranges = os.path.join(tmp, '.staged.ranges')
+            pair(staged, 2, 3, LOAD + 0x20)
+            third = os.path.join(tmp, '00010000_00000003.dll')
+            assert MOD.publish_shard_pair(
+                staged, staged_ranges, third, candidate_cap=4)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 4
+            cache_hit = os.path.join(tmp, '.cache-hit.dll')
+            cache_hit_ranges = os.path.join(tmp, '.cache-hit.ranges')
+            pair(cache_hit, 1, 30, LOAD + 0x200)
+            assert not MOD.publish_shard_pair(
+                cache_hit, cache_hit_ranges, third,
+                preserve_existing=True, candidate_cap=4)
+
+            rejected_stage = os.path.join(tmp, '.rejected.dll')
+            rejected_ranges = os.path.join(tmp, '.rejected.ranges')
+            pair(rejected_stage, 1, 4, LOAD + 0x40)
+            fourth = os.path.join(tmp, '00010000_00000004.dll')
+            snapshot = {path: pathlib.Path(path).read_bytes()
+                        for path in (first, second, third)}
+            try:
+                MOD.publish_shard_pair(
+                    rejected_stage, rejected_ranges, fourth, candidate_cap=4)
+            except MOD.ShardCandidateCapacityError:
+                pass
+            else:
+                raise AssertionError('candidate boundary+1 publication accepted')
+            assert not os.path.exists(fourth)
+            assert snapshot == {path: pathlib.Path(path).read_bytes()
+                                for path in snapshot}
+
+            replacement = os.path.join(tmp, '.replacement.dll')
+            replacement_ranges = os.path.join(tmp, '.replacement.ranges')
+            pair(replacement, 1, 5, LOAD + 0x60)
+            assert MOD.publish_shard_pair(
+                replacement, replacement_ranges, third, candidate_cap=4)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 3
+            old_dll = pathlib.Path(third).read_bytes()
+            old_ranges = pathlib.Path(third).with_suffix('.ranges').read_text()
+            growth = os.path.join(tmp, '.growth.dll')
+            growth_ranges = os.path.join(tmp, '.growth.ranges')
+            pair(growth, 3, 6, LOAD + 0x80)
+            try:
+                MOD.publish_shard_pair(
+                    growth, growth_ranges, third, candidate_cap=4)
+            except MOD.ShardCandidateCapacityError:
+                pass
+            else:
+                raise AssertionError('over-cap force replacement accepted')
+            assert pathlib.Path(third).read_bytes() == old_dll
+            assert pathlib.Path(third).with_suffix('.ranges').read_text() == \
+                old_ranges
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hidden = os.path.join(tmp, '00010000_00000001.dll')
+            other = os.path.join(tmp, '00010000_00000002.dll')
+            pair(other, 1, 40)
+            token = 'a' * 32
+            backup_dll = f'{hidden}.pair-txn.{token}.old-dll'
+            backup_ranges = f'{hidden}.pair-txn.{token}.old-ranges'
+            pair(backup_dll, 1, 41, LOAD + 0x20)
+            hidden_ranges = os.path.splitext(hidden)[0] + '.ranges'
+            backup_manifest = pathlib.Path(backup_dll).with_suffix(
+                '.ranges')
+            # pair() names the backup manifest by with_suffix; move it to the
+            # exact transaction backup path used by recovery.
+            pathlib.Path(backup_ranges).write_text(backup_manifest.read_text())
+            backup_manifest.unlink()
+            MOD._write_json_atomic(hidden + '.pair-txn.json', {
+                'schema': 'psxrecomp shard pair transaction v1',
+                'token': token,
+                'backup_dll': backup_dll,
+                'backup_ranges': backup_ranges,
+                'old_dll_sha256': MOD._file_sha256(backup_dll),
+                'old_ranges_sha256': MOD._file_sha256(backup_ranges),
+                'new_dll_sha256': '0' * 64,
+                'new_ranges_sha256': '1' * 64,
+            })
+            staged = os.path.join(tmp, '.new.dll')
+            staged_ranges = os.path.join(tmp, '.new.ranges')
+            pair(staged, 1, 42, LOAD + 0x40)
+            new_final = os.path.join(tmp, '00010000_00000003.dll')
+            try:
+                MOD.publish_shard_pair(
+                    staged, staged_ranges, new_final, candidate_cap=2)
+            except MOD.ShardCandidateCapacityError:
+                pass
+            else:
+                raise AssertionError('transaction-hidden pair was not counted')
+            assert os.path.exists(hidden) and os.path.exists(hidden_ranges)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 2
+            assert not os.path.exists(new_final)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            game = pathlib.Path(tmp) / 'SCUS-TEST'
+            gcc_dir = game / 'gcc' / 'win-x64' / 'cg5_7125d9b5'
+            tcc_dir = game / 'tcc' / 'win-x64' / 'cg5_7125d9b5'
+            gcc_dir.mkdir(parents=True)
+            tcc_dir.mkdir(parents=True)
+            basename = '00010000_00000001.dll'
+            gcc_pair = str(gcc_dir / basename)
+            tcc_pair = str(tcc_dir / basename)
+            pair(gcc_pair, 2, 10)
+            pair(tcc_pair, 3, 11)
+            tier_dirs = [str(gcc_dir), str(tcc_dir)]
+            total, counts = MOD.cache_candidate_inventory(tier_dirs, None)
+            assert total == 2 and counts[gcc_pair] == 2
+            assert tcc_pair not in counts
+            assert MOD.projected_cache_candidate_count(
+                total, counts, tier_dirs, tcc_pair, 4) == 2
+            assert MOD.projected_cache_candidate_count(
+                total, counts, tier_dirs, gcc_pair, 1) == 1
+            MOD._dll_abi_matches = (
+                lambda path, _abi: os.path.normcase(path) !=
+                os.path.normcase(gcc_pair))
+            total, counts = MOD.cache_candidate_inventory(tier_dirs, 14)
+            assert total == 3 and counts[tcc_pair] == 3
+            assert gcc_pair not in counts
+            MOD._dll_abi_matches = original_abi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            game = pathlib.Path(tmp) / 'SCUS-CASE'
+            gcc_dir = game / 'gcc' / 'win-x64' / 'cg5_06162507'
+            tcc_dir = game / 'tcc' / 'win-x64' / 'cg5_06162507'
+            gcc_dir.mkdir(parents=True)
+            tcc_dir.mkdir(parents=True)
+            upper = str(gcc_dir / '00010000_DEADBEEF.dll')
+            lower = str(tcc_dir / '00010000_deadbeef.dll')
+            pair(upper, 2, 12)
+            pair(lower, 3, 13)
+            total, counts = MOD.cache_candidate_inventory(
+                [str(gcc_dir), str(tcc_dir)], None)
+            if os.name == 'nt':
+                assert total == 2 and counts == {upper: 2}
+            else:
+                assert total == 5 and counts == {upper: 2, lower: 3}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            second = os.path.join(tmp, '00010000_00000002.dll')
+            pair(first, 3, 20)
+            pair(second, 2, 21, LOAD + 0x100)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 5
+            shrinking = os.path.join(tmp, '.shrinking.dll')
+            shrinking_ranges = os.path.join(tmp, '.shrinking.ranges')
+            pair(shrinking, 1, 22, LOAD + 0x200)
+            # Still over cap after replacement (5 -> 3), but the operation is
+            # non-growing and therefore improves the process-lifetime bound.
+            assert MOD.publish_shard_pair(
+                shrinking, shrinking_ranges, first, candidate_cap=2)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 3
+    finally:
+        MOD._dll_runtime_exports_match = original_exports
+        MOD._dll_abi_matches = original_abi
+
+    if os.name == 'nt':
+        # Distinct output names race on the namespace lock, not merely their
+        # own pair locks. At cap-1 exactly one process may commit.
+        gcc = r'C:\msys64\mingw64\bin\gcc.exe'
+        assert os.path.isfile(gcc)
+        with tempfile.TemporaryDirectory() as tmp:
+            pair_id = 0x1020304050607080
+            source = pathlib.Path(tmp) / 'capacity.c'
+            template = pathlib.Path(tmp) / 'template.dll'
+            source.write_text(
+                '#include <stdint.h>\n'
+                '__declspec(dllexport) int overlay_abi(void){return 14;}\n'
+                '__declspec(dllexport) uint64_t overlay_pair_id(void){'
+                f'return UINT64_C(0x{pair_id:016X});' '}\n'
+                '__declspec(dllexport) void overlay_init(const void*p){(void)p;}\n'
+                '__declspec(dllexport) void overlay_flush_cycles(void){}\n'
+                '__declspec(dllexport) void func_80010000(void*p){(void)p;}\n')
+            subprocess.run(
+                [gcc, '-shared', str(source), '-o', str(template)],
+                check=True, capture_output=True, text=True)
+            partial_manifest = MOD.overlay_ranges_text([
+                (LOAD, 1, ((LOAD, 4),)),
+                (LOAD + 4, 2, ((LOAD + 4, 4),)),
+            ], pair_id)
+            template.with_suffix('.ranges').write_text(partial_manifest)
+            assert MOD.load_shard_func_ids(str(template), 14) == []
+            template.with_suffix('.ranges').unlink()
+            manifest = MOD.overlay_ranges_text(
+                [(LOAD, 1, ((LOAD, 4),))], pair_id)
+            module_path = str(ROOT / 'tools' / 'compile_overlays.py')
+            child_script = r'''
+import importlib.util, sys
+s=importlib.util.spec_from_file_location("co",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+try:
+    m.publish_shard_pair(sys.argv[2],sys.argv[3],sys.argv[4],expected_existing_abi=14,candidate_cap=1)
+except m.ShardCandidateCapacityError:
+    raise SystemExit(23)
+'''
+            writers = []
+            for index in range(2):
+                staged = pathlib.Path(tmp) / f'.race-{index}.dll'
+                staged_ranges = pathlib.Path(tmp) / f'.race-{index}.ranges'
+                shutil.copy2(template, staged)
+                staged_ranges.write_text(manifest)
+                final = pathlib.Path(tmp) / f'00010000_{index + 1:08X}.dll'
+                writers.append(subprocess.Popen([
+                    sys.executable, '-c', child_script, module_path,
+                    str(staged), str(staged_ranges), str(final)]))
+            codes = sorted(writer.wait(timeout=30) for writer in writers)
+            assert codes == [0, 23], codes
+            total, _counts = MOD.cache_candidate_inventory([tmp], 14)
+            assert total == 1
+
+
 def check_interior_fragment_contract():
     entry = LOAD + 0x20
     assert MOD.walk_root_seed_entries([
@@ -1353,6 +1769,59 @@ def check_interior_fragment_contract():
     multi = good + [(second, 0x87654321, [(second, 12)])]
     assert MOD.validate_fragment_requested_ids(
         {entry, second}, multi, {entry, second}) is None
+
+    host = LOAD
+    hosted_target = LOAD + 0x20
+    owner = (host, 0xAABBCCDD, [(host, 0x40)])
+    hosted_spec = {
+        'host': host,
+        'owner_identity': (host, owner[1], ((host, 0x40),)),
+        'host_reason': 'STATIC_DISCOVERY_ROOT',
+    }
+    hosted_good = [
+        owner,
+        (hosted_target, owner[1], owner[2]),
+    ]
+    # Only the true single-range root may nominate a sibling target. Hosted
+    # aliases and a later rooted island in a multi-range identity stay inert.
+    assert MOD.organic_root_entries(hosted_good) == {host}
+    assert MOD.organic_root_entries([
+        (hosted_target, owner[1], owner[2]),
+        (hosted_target, owner[1], [(host, 8), (hosted_target, 8)]),
+        (hosted_target, owner[1], [(hosted_target, 0)]),
+    ]) == set()
+    hosted_specs = {hosted_target: hosted_spec}
+    assert MOD.validate_hosted_fragment_ids(
+        {hosted_target}, hosted_specs, hosted_good,
+        {host, hosted_target}) is None
+    assert 'changed selected owner' in MOD.validate_hosted_fragment_ids(
+        {hosted_target}, hosted_specs,
+        [(host, owner[1] ^ 1, owner[2]), hosted_good[1]],
+        {host, hosted_target})
+    assert 'changed selected owner' in MOD.validate_hosted_fragment_ids(
+        {hosted_target}, hosted_specs,
+        [owner, (hosted_target, owner[1], [(host, 0x44)])],
+        {host, hosted_target})
+    host2 = LOAD + 0x80
+    target2 = host2 + 0x20
+    owner2 = (host2, 0x11223344, [(host2, 0x40)])
+    spec2 = {
+        'host': host2, 'owner_identity': owner2,
+        'host_reason': 'STATIC_DISPATCH_ENTRY',
+    }
+    assert MOD.validate_hosted_fragment_ids(
+        {hosted_target, target2},
+        {hosted_target: hosted_spec, target2: spec2},
+        hosted_good + [owner2, (target2, owner2[1], owner2[2])],
+        {host, hosted_target, host2, target2}) is None
+    assert 'target/spec set mismatch' in MOD.validate_hosted_fragment_ids(
+        {hosted_target, target2}, {hosted_target: hosted_spec},
+        hosted_good, {host, hosted_target})
+    assert MOD.validate_hosted_fragment_ids(
+        {hosted_target}, hosted_specs, [owner], {host},
+        allow_missing_targets=True) is None
+    assert MOD.hosted_fragment_served_targets(
+        {hosted_target}, [owner], {host}) == set()
     assert "requested entry" in MOD.validate_fragment_requested_ids(
         {entry, second + 4}, multi, {entry, second})
     assert "missing from generated C" in MOD.validate_interior_fragment_ids(
@@ -1384,6 +1853,8 @@ def check_interior_fragment_contract():
         "requested-entry-audit: omitted")
     assert not MOD.interior_failure_is_deterministic(
         "fragment cache-key collision/stale pair")
+    assert not MOD.interior_failure_is_deterministic(
+        "candidate-capacity: full")
 
     static_only_job = {
         "static_demands": {entry}, "executed": set(), "forced": set()}
@@ -1455,6 +1926,219 @@ def check_interior_fragment_contract():
     assert static_job["executed"] == set()
     assert static_job["forced"] == set()
 
+    recipient = dict(static_job)
+    recipient['included_reasons'] = {
+        host: {'STATIC_DISCOVERY_ROOT'},
+    }
+    recipient['static_exact_demands'] = {host}
+    recipient['producer_ranges'] = ((LOAD, LOAD + 0x100),)
+    donor = dict(recipient)
+    donor['hosted_donor_demands'] = {hosted_target}
+    donor_recipes = {hosted_target: [donor]}
+    selected = MOD.select_hosted_interior_demands(
+        recipient, donor_recipes, [owner, owner])
+    assert selected == {hosted_target: hosted_spec}, selected
+    local_root_failed = dict(
+        recipient, static_exact_demands={host, hosted_target})
+    assert MOD.select_hosted_interior_demands(
+        local_root_failed, donor_recipes, [owner]) == selected
+    # Alias-only geometry cannot become an owner, nor can an ambiguous overlap.
+    assert MOD.select_hosted_interior_demands(
+        recipient, donor_recipes,
+        [(host, owner[1], [(host + 4, 0x3C)])]) == {}
+    unrelated_overlap = dict(recipient)
+    unrelated_overlap['included_reasons'] = {
+        host: {'STATIC_DISCOVERY_ROOT'},
+        host + 8: {'DISPATCH_ENTRY'},
+    }
+    assert MOD.select_hosted_interior_demands(
+        unrelated_overlap, donor_recipes,
+        [owner, (host + 8, 0x11223344, [(host + 8, 0x30)])]) == {}
+    # Explicit producer partitions prevent a sibling address from attaching to
+    # a host owned by different loaded bytes.
+    split_recipient = dict(recipient)
+    split_recipient['producer_ranges'] = (
+        (LOAD, LOAD + 0x20), (LOAD + 0x20, LOAD + 0x100))
+    assert MOD.select_hosted_interior_demands(
+        split_recipient, donor_recipes, [owner]) == {}
+    changed_donor = dict(donor, data=b'\x01' + donor['data'][1:])
+    # Sibling bytes only nominate the address. Recipient ownership and emitted
+    # identity provide the executable proof, so variant differences are valid.
+    assert MOD.select_hosted_interior_demands(
+        recipient, {hosted_target: [changed_donor]}, [owner]) == selected
+
+    # Apply the recipient cap only after discarding its own donor evidence and
+    # entries that are already native. Neither may displace a later useful
+    # sibling proof.
+    proofs, truncated = MOD.recipient_sibling_proofs(
+        {0: (hosted_target,), 1: (hosted_target + 4,)},
+        recipient_index=0, authority_phys_entries=set(), limit=1)
+    assert proofs == {hosted_target + 4: True} and not truncated
+    proofs, truncated = MOD.recipient_sibling_proofs(
+        {0: (), 1: (hosted_target, hosted_target + 4,
+                     hosted_target + 8)},
+        recipient_index=0,
+        authority_phys_entries={hosted_target & 0x1FFFFFFF}, limit=1)
+    assert proofs == {hosted_target + 4: True} and truncated
+    # Supplemental coverage cannot turn any bounded selection stage into
+    # cross-invocation pagination. Keep the fixed proof window independent of
+    # supplemental coverage; still_needed filters only the already-selected
+    # work at compile time.
+    proofs, truncated = MOD.recipient_sibling_proofs(
+        {0: (), 1: (hosted_target, hosted_target + 4)},
+        recipient_index=0, authority_phys_entries=set(), limit=1)
+    assert proofs == {hosted_target: True} and truncated
+
+    # Optional evidence caps are deterministic safe drops, never uncaught
+    # whole-pipeline failures. Address order defines the retained subset.
+    old_nomination_cap = MOD.HOSTED_NOMINATION_CAP
+    old_host_cap = MOD.HOSTED_SELECTED_HOST_CAP
+    try:
+        MOD.HOSTED_NOMINATION_CAP = 1
+        cap_audit = {}
+        capped = MOD.select_hosted_interior_demands(
+            recipient,
+            {hosted_target: [donor], hosted_target + 4: [donor]},
+            [owner], cap_audit)
+        assert capped == {hosted_target: hosted_spec}
+        assert cap_audit['nomination_cap_dropped'] == 1
+
+        MOD.HOSTED_NOMINATION_CAP = old_nomination_cap
+        MOD.HOSTED_SELECTED_HOST_CAP = 1
+        two_host_recipient = dict(recipient)
+        two_host_recipient['included_reasons'] = {
+            host: {'STATIC_DISCOVERY_ROOT'},
+            host2: {'STATIC_DISPATCH_ENTRY'},
+        }
+        cap_audit = {}
+        capped = MOD.select_hosted_interior_demands(
+            two_host_recipient,
+            {hosted_target: [donor], target2: [donor]},
+            [owner, owner2], cap_audit)
+        assert list(capped) == [hosted_target]
+        assert cap_audit['selected_host_cap_dropped'] == 1
+
+        # Fixed-point regression: once host 1 is published, its supplemental
+        # target must still occupy the stable host-cap slot on run 2. Coverage
+        # is consulted only by the compile-time still_needed predicate, so host
+        # 2 cannot page into the selection and publish on an unchanged rerun.
+        fixed_proofs, _ = MOD.recipient_sibling_proofs(
+            {0: (), 1: (hosted_target, target2)},
+            recipient_index=0, authority_phys_entries=set())
+        run1_selected = MOD.select_hosted_interior_demands(
+            two_host_recipient, fixed_proofs, [owner, owner2])
+        assert list(run1_selected) == [hosted_target]
+        run1_compiles = []
+        assert MOD.compile_batched_hosted_aliases(
+            run1_selected,
+            lambda specs: (run1_compiles.append(sorted(specs)) or
+                           ([owner], 'built')),
+            lambda entries, _ids, _status: set(entries),
+            lambda _entry, status: (_ for _ in ()).throw(
+                AssertionError(status))) == 1
+        assert run1_compiles == [[hosted_target]]
+
+        run2_selected = MOD.select_hosted_interior_demands(
+            two_host_recipient, fixed_proofs, [owner, owner2])
+        assert list(run2_selected) == [hosted_target]
+        run2_compiles = []
+        assert MOD.compile_batched_hosted_aliases(
+            run2_selected,
+            lambda specs: (run2_compiles.append(sorted(specs)) or
+                           ([owner], 'built')),
+            lambda entries, _ids, _status: set(entries),
+            lambda _entry, status: (_ for _ in ()).throw(
+                AssertionError(status)),
+            still_needed=lambda entry: entry != hosted_target) == 0
+        assert run2_compiles == []
+    finally:
+        MOD.HOSTED_NOMINATION_CAP = old_nomination_cap
+        MOD.HOSTED_SELECTED_HOST_CAP = old_host_cap
+
+    # Multi-host batches split conflicting hosts before splitting the aliases
+    # sharing one owner. One bad alias can then fail alone without discarding
+    # its good sibling or another host group.
+    hosted_map = {
+        hosted_target: hosted_spec,
+        hosted_target + 4: hosted_spec,
+        target2: spec2,
+    }
+    compile_calls = []
+    successes = []
+    failures = []
+
+    def fake_compile(specs):
+        compile_calls.append(tuple(sorted(specs)))
+        hosts = {spec['host'] for spec in specs.values()}
+        if len(hosts) > 1:
+            return None, 'hosted-entry-audit: overlapping roots'
+        bad = hosted_target + 4
+        if bad in specs:
+            return None, 'hosted-entry-audit: bad block'
+        return [(entry, 1, [(spec['host'], 4)])
+                for entry, spec in specs.items()], 'built'
+
+    shard_count = MOD.compile_batched_hosted_aliases(
+        hosted_map, fake_compile,
+        lambda entries, _ids, _status: successes.extend(entries),
+        lambda entry, _status: failures.append(entry))
+    assert shard_count == 2
+    assert successes == [hosted_target, target2]
+    assert failures == [hosted_target + 4]
+    assert set(compile_calls[0]) == set(hosted_map)
+    assert any(call == (hosted_target, hosted_target + 4)
+               for call in compile_calls)
+
+    # A successful hosted compile can legitimately emit only a subset of the
+    # requested block leaders. Close that remainder now instead of relying on a
+    # later cache-filtered invocation to shrink the batch.
+    partial_calls = []
+    partial_served = []
+
+    def partial_compile(specs):
+        entries = tuple(sorted(specs))
+        partial_calls.append(entries)
+        emitted = entries[0]
+        return [(emitted, 1, [(specs[emitted]['host'], 4)])], 'built'
+
+    def partial_success(_entries, ids, _status):
+        served = {identity[0] for identity in ids}
+        partial_served.extend(sorted(served))
+        return served
+
+    partial_map = {
+        hosted_target + offset: hosted_spec for offset in (0, 4, 8)
+    }
+    assert MOD.compile_batched_hosted_aliases(
+        partial_map, partial_compile, partial_success,
+        lambda entry, reason: (_ for _ in ()).throw(
+            AssertionError((entry, reason))), attempt_cap=5) == 3
+    assert partial_calls == [
+        (hosted_target, hosted_target + 4, hosted_target + 8),
+        (hosted_target + 4, hosted_target + 8),
+        (hosted_target + 8,),
+    ]
+    assert partial_served == [
+        hosted_target, hosted_target + 4, hosted_target + 8]
+    assert MOD.HOSTED_COMPILE_ATTEMPT_CAP >= \
+        2 * MOD.HOSTED_SELECTED_ALIAS_CAP - 1
+
+    partition_calls = []
+    partition_failures = []
+
+    def reject_every_batch(specs):
+        partition_calls.append(tuple(sorted(specs)))
+        return None, 'hosted-entry-audit: synthetic rejection'
+
+    assert MOD.compile_batched_hosted_aliases(
+        partial_map, reject_every_batch,
+        lambda *_args: (_ for _ in ()).throw(AssertionError('success')),
+        lambda entry, _reason: partition_failures.append(entry),
+        should_bisect=MOD.fragment_batch_failure_is_partitionable,
+        attempt_cap=5) == 0
+    assert len(partition_calls) == 5
+    assert sorted(partition_failures) == sorted(partial_map)
+
     # Same-byte/full-recipe captures union their root evidence into one bounded
     # supplemental job; a byte or producer recipe change remains isolated.
     other = entry + 0x40
@@ -1466,8 +2150,13 @@ def check_interior_fragment_contract():
     assert len(merged) == 1
     assert merged[0]["static_exact_demands"] == {entry, other}
     different_bytes = dict(same_recipe, data=b"x" * len(data))
-    assert len(MOD.merge_fragment_jobs_by_recipe(
-        [static_job, different_bytes])) == 2
+    forward = MOD.merge_fragment_jobs_by_recipe(
+        [static_job, different_bytes])
+    reverse = MOD.merge_fragment_jobs_by_recipe(
+        [different_bytes, static_job])
+    assert len(forward) == 2
+    assert [item['data'] for item in forward] == [
+        item['data'] for item in reverse]
     resident_recipe = dict(
         same_recipe,
         resident_cap={"producer": "bios_resident_manifest",
@@ -1548,6 +2237,8 @@ def check_interior_fragment_contract():
         "compile-error (toolchain unavailable)")
     assert MOD.fragment_batch_failure_is_partitionable(
         "requested-entry-audit: rejected")
+    assert MOD.fragment_batch_failure_is_partitionable(
+        "candidate-capacity: full")
     assert MOD.compile_batched_fragment_roots(
         {entry, other}, toolchain_down,
         lambda *_args: None,
@@ -1577,6 +2268,14 @@ def check_interior_fragment_contract():
         {entry, entry + 4, entry + 8, entry + 12, entry + 16},
         {entry + 4}, {entry + 8}, {entry + 12},
         {(entry + 16) & 0x1FFFFFFF}) == [entry]
+    # Mixed live/forced/interval evidence changes only the failure domain; no
+    # static-exact authority root may be deferred until after donor freezing.
+    batchable, isolated = MOD.partition_strong_root_demands(
+        {entry, entry + 4, entry + 8, entry + 12, entry + 16},
+        {entry + 4}, {entry + 8}, {entry + 12},
+        {(entry + 16) & 0x1FFFFFFF})
+    assert batchable == [entry]
+    assert isolated == [entry + 4, entry + 8, entry + 12]
 
     with tempfile.TemporaryDirectory() as td:
         dll = pathlib.Path(td) / "00010000_fragment.dll"
@@ -1593,7 +2292,7 @@ def check_interior_fragment_contract():
         try:
             MOD._dll_runtime_exports_match = (
                 lambda _path, _abi, expected, entries:
-                expected == pair_id and bool(entries))
+                expected in (pair_id, None) and bool(entries))
             assert MOD.load_shard_entry_set(str(dll)) == {
                 entry & 0x1FFFFFFF}
             assert MOD.load_shard_code_ranges(str(dll)) == [
@@ -1625,6 +2324,70 @@ def check_interior_fragment_contract():
             no_ranges = (f"P {pair_id:016X}\n"
                          f"F {entry:08X} {code_crc:08X}\n")
             ranges.write_text(no_ranges)
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            pairless = (f"F {entry:08X} {code_crc:08X}\n"
+                        f"R {entry:08X} 8\n")
+            ranges.write_text(pairless)
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                entry & 0x1FFFFFFF}
+            ranges.write_text(
+                f"  F {entry:08X} {code_crc:08X}\n\tR {entry:08X} 8  \n")
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                entry & 0x1FFFFFFF}
+            ranges.write_bytes(pairless.replace('\n', '\r\n').encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                entry & 0x1FFFFFFF}
+            f_record = f"F {entry:08X} {code_crc:08X}"
+            padded_128 = f_record + ' ' * (MOD.MANIFEST_LINE_MAX -
+                                            len(f_record))
+            ranges.write_bytes(
+                (padded_128 + f"\r\nR {entry:08X} 8\r\n").encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                entry & 0x1FFFFFFF}
+            ranges.write_bytes(
+                (padded_128 + f" \r\nR {entry:08X} 8\r\n").encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_bytes(pairless.replace('\n', '\r').encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_bytes(
+                (f"F {entry:08X} {code_crc:08X}\0 junk\n"
+                 f"R {entry:08X} 8\n").encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_bytes(("# unknown\0record\n" + pairless).encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_bytes(
+                (pairless + "\x1a\nP ZZZ\n").encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_bytes(
+                (("#\r" + "x" * MOD.MANIFEST_PHYSICAL_LINE_MAX) +
+                 "\n" + pairless).encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_bytes(("P\x1fBAD\n" + pairless).encode('ascii'))
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                entry & 0x1FFFFFFF}
+            ranges.write_text(
+                f"F{entry:08X} {code_crc:08X}\nR{entry:08X} 8\n")
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_text(
+                f"F {entry:08X}\nR {entry:08X} 8\n")
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_text(
+                f"P {pair_id:016X}\nF {entry:08X} {code_crc:08X} junk\n"
+                f"R {entry:08X} 8\n")
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            outside = 0x80200000
+            ranges.write_text(
+                f"P {pair_id:016X}\nF {outside:08X} {code_crc:08X}\n"
+                f"R {outside:08X} 4\n")
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_text(
+                f"F -1 {code_crc:08X}\nR FFFFFFFF 4\n")
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_text(
+                f"F 180010000 {code_crc:08X}\nR 180010000 4\n")
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            ranges.write_text("#" * (MOD.MANIFEST_LINE_MAX + 1) +
+                              "\n" + pairless)
             assert MOD.load_shard_entry_set(str(dll)) == set()
             duplicate = (manifest +
                          f"F {entry:08X} {code_crc ^ 1:08X}\n"
@@ -1811,6 +2574,267 @@ def check_real_batched_fragment_publication(recompiler):
                    for dll in pathlib.Path(td).glob(f'*{extension}'))
 
 
+def check_real_hosted_fragment_publication(recompiler):
+    """Only exact cached-owner identity may authorize a hosted alias pair."""
+    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
+           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
+           else shutil.which('gcc'))
+    if not gcc:
+        return
+    data = bytearray(0x100)
+    host = LOAD
+    target = LOAD + 0x10
+    put(data, 0x00, 0x1480000B)  # bne a0,zero,LOAD+0x30
+    put(data, 0x04, 0)
+    put(data, 0x08, 0x01000008)  # jr t0
+    put(data, 0x0C, 0)
+    put(data, 0x10, 0x24420001)
+    put(data, 0x14, 0x03E00008)
+    put(data, 0x18, 0)
+    put(data, 0x30, 0x03E00008)
+    put(data, 0x34, 0)
+    host2 = LOAD + 0x80
+    target2 = host2 + 0x10
+    put(data, 0x80, 0x1480000B)
+    put(data, 0x84, 0)
+    put(data, 0x88, 0x01000008)
+    put(data, 0x8C, 0)
+    put(data, 0x90, 0x24420002)
+    put(data, 0x94, 0x03E00008)
+    put(data, 0x98, 0)
+    put(data, 0xB0, 0x03E00008)
+    put(data, 0xB4, 0)
+    runtime_include = str(ROOT / 'runtime' / 'include')
+    MOD.load_dispatch_preamble(runtime_include)
+
+    class Args:
+        game_toml = str(ROOT / 'tools' / 'cycle_testrom' / 'game.toml')
+        flavor = 0
+        compiler = 'gcc'
+        tcc = 'tcc'
+        force = False
+        cps = True
+
+    args = Args()
+    args.recompiler = recompiler
+    args.runtime_include = runtime_include
+    args.gcc = gcc
+    env = os.environ.copy()
+    env['PSX_CPS'] = '1'
+    recipe = ((LOAD, LOAD + len(data)),)
+
+    with tempfile.TemporaryDirectory() as td:
+        owner_ids, status = MOD.compile_fragment_batch(
+            {host, host2}, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
+            td, args, env, {}, recipe, ())
+        assert owner_ids and status == 'built'
+        owners = {identity[0]: identity for identity in owner_ids
+                  if identity[0] in (host, host2)}
+        assert set(owners) == {host, host2}
+        assert not ({target, target2} & {
+            entry for entry, _crc, _ranges in owner_ids})
+        owner_dlls = set(pathlib.Path(td).glob(f'*{MOD.overlay_ext()}'))
+        spec = {
+            'host': host,
+            'owner_identity': owners[host],
+            'host_reason': 'STATIC_DISCOVERY_ROOT',
+        }
+        spec2 = {
+            'host': host2,
+            'owner_identity': owners[host2],
+            'host_reason': 'STATIC_DISCOVERY_ROOT',
+        }
+        hosted_ids, status = MOD.compile_fragment_batch(
+            {target, target2}, bytes(data), LOAD, len(data),
+            LOAD & 0x1FFFFFFF, td, args, env, {}, recipe, (),
+            hosted_owners={target: spec, target2: spec2})
+        assert hosted_ids and status == 'built', status
+        by_entry = {
+            entry: (crc, tuple(ranges))
+            for entry, crc, ranges in hosted_ids
+        }
+        assert by_entry[target] == by_entry[host]
+        assert by_entry[target2] == by_entry[host2]
+        hosted_dlls = set(pathlib.Path(td).glob(
+            f'*{MOD.overlay_ext()}')) - owner_dlls
+        assert len(hosted_dlls) == 1
+        hosted_dll = hosted_dlls.pop()
+        assert MOD.HOSTED_MANIFEST_MARKER in \
+            hosted_dll.with_suffix('.ranges').read_text().splitlines()
+        assert MOD.manifest_has_hosted_provenance(
+            MOD.HOSTED_MANIFEST_MARKER + '\n')
+        assert MOD.manifest_has_hosted_provenance(
+            MOD.HOSTED_MANIFEST_MARKER + '\r\n')
+        assert not MOD.manifest_has_hosted_provenance(
+            MOD.HOSTED_MANIFEST_MARKER + '\rjunk\n')
+        assert MOD.manifest_declares_supplemental_provenance(
+            '# psxrecomp overlay provenance unknown-v9\r\n')
+        assert MOD.load_shard_func_ids(
+            str(hosted_dll), 14, include_supplemental=False) == []
+        authority_ids = MOD.load_region_current_variant_func_ids(
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14,
+            include_supplemental=False)
+        assert not ({target, target2} & {
+            entry for entry, _crc, _ranges in authority_ids})
+        coverage_ids = MOD.load_region_current_variant_func_ids(
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14)
+        assert {target, target2} <= {
+            entry for entry, _crc, _ranges in coverage_ids}
+        assert MOD.overlay_pair_id(
+            'same', hosted_ids) != MOD.overlay_pair_id(
+                'same', hosted_ids, MOD.HOSTED_MANIFEST_PROVENANCE)
+        assert MOD.fragment_shard_key(hosted_ids) != \
+            MOD.fragment_shard_key(
+                hosted_ids, MOD.HOSTED_MANIFEST_PROVENANCE)
+        assert hosted_dll.stem.endswith(
+            f'{MOD.fragment_shard_key(hosted_ids, MOD.HOSTED_MANIFEST_PROVENANCE):08X}')
+
+        dll_count = len(list(pathlib.Path(td).glob(f'*{MOD.overlay_ext()}')))
+        cached_ids, cached_status = MOD.compile_fragment_batch(
+            {target, target2}, bytes(data), LOAD, len(data),
+            LOAD & 0x1FFFFFFF, td, args, env, {}, recipe, (),
+            hosted_owners={target: spec, target2: spec2})
+        assert cached_status == 'cached' and cached_ids == hosted_ids
+        assert len(list(pathlib.Path(td).glob(
+            f'*{MOD.overlay_ext()}'))) == dll_count
+        orphan_before = set(pathlib.Path(td).glob(f'*{MOD.overlay_ext()}'))
+        orphan_ids, orphan_status = MOD.compile_interior_fragment(
+            target, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
+            td, args, env, {}, recipe, ())
+        assert orphan_ids and orphan_status == 'built'
+        orphan_dlls = set(pathlib.Path(td).glob(
+            f'*{MOD.overlay_ext()}')) - orphan_before
+        assert len(orphan_dlls) == 1
+        orphan_dll = orphan_dlls.pop()
+        orphan_manifest = orphan_dll.with_suffix('.ranges').read_text()
+        assert MOD.manifest_provenance(orphan_manifest) == \
+            MOD.ORPHAN_MANIFEST_PROVENANCE
+        assert MOD.load_shard_func_ids(
+            str(orphan_dll), 14, include_supplemental=False) == []
+        dll_count += 1
+        bad_spec = dict(spec, owner_identity=(
+            owners[host][0], owners[host][1] ^ 1, owners[host][2]))
+        rejected, reason = MOD.compile_fragment_batch(
+            {target}, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
+            td, args, env, {}, recipe, (), hosted_owners={target: bad_spec})
+        assert rejected is None
+        assert reason.startswith('hosted-entry-audit:'), reason
+        assert len(list(pathlib.Path(td).glob(
+            f'*{MOD.overlay_ext()}'))) == dll_count
+
+
+def check_full_hosted_fixed_point(recompiler):
+    """A clean two-variant CLI build must make its second run a true no-op."""
+    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
+           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
+           else shutil.which('gcc'))
+    if not gcc:
+        return
+    host = LOAD
+    target = LOAD + 0x10
+
+    donor = bytearray(0x100)
+    put(donor, 0x00, 0x03E00008)  # jr ra
+    put(donor, 0x04, 0)
+    put(donor, 0x10, 0x27BDFFF0)  # addiu sp,sp,-16
+    put(donor, 0x14, 0xAFBF000C)  # sw ra,12(sp)
+    put(donor, 0x18, 0x03E00008)  # jr ra
+    put(donor, 0x1C, 0x27BD0010)  # addiu sp,sp,16
+
+    recipient = bytearray(0x100)
+    put(recipient, 0x00, 0x1480000B)  # bne a0,zero,LOAD+0x30
+    put(recipient, 0x04, 0)
+    put(recipient, 0x08, 0x01000008)  # jr t0
+    put(recipient, 0x0C, 0)
+    put(recipient, 0x10, 0x24420001)
+    put(recipient, 0x14, 0x03E00008)
+    put(recipient, 0x18, 0)
+    put(recipient, 0x30, 0x03E00008)
+    put(recipient, 0x34, 0)
+
+    def capture(data, function_entries, dispatch_entries, static_dispatch,
+                static_discovery, executed=()):
+        encoded = MOD.base64.b64encode(bytes(data)).decode('ascii')
+        to_hex = lambda entries: [f'0x{entry:08X}' for entry in entries]
+        return {
+            'schema': 'psxrecomp overlay capture v2',
+            'load_addr': f'0x{LOAD:08X}',
+            'size': len(data),
+            'bytes_b64': encoded,
+            'executed_pcs': to_hex(executed),
+            'dispatch_entry_pcs': to_hex(dispatch_entries),
+            'static_dispatch_entry_pcs': to_hex(static_dispatch),
+            'function_entry_pcs': to_hex(function_entries),
+            'seeds': to_hex(function_entries),
+            'static_discovery_entry_pcs': to_hex(static_discovery),
+        }
+
+    captures = [
+        # Static+executed overlap exercises the pre-freeze singleton path.
+        capture(donor, [target], [target], [target], [target], [target]),
+        # The same address is only an organic block inside this rooted host.
+        capture(recipient, [host], [host], [], [host]),
+    ]
+    runtime_include = str(ROOT / 'runtime' / 'include')
+    game_toml = str(ROOT / 'tools' / 'cycle_testrom' / 'game.toml')
+    script = str(ROOT / 'tools' / 'compile_overlays.py')
+
+    with tempfile.TemporaryDirectory() as td:
+        captures_path = pathlib.Path(td) / 'captures.json'
+        captures_path.write_text(MOD.json.dumps(captures), encoding='utf-8')
+        cache_root = pathlib.Path(td) / 'cache'
+        command = [
+            sys.executable, script,
+            '--captures', str(captures_path),
+            '--game-toml', game_toml,
+            '--recompiler', recompiler,
+            '--runtime-include', runtime_include,
+            '--gcc', gcc,
+            '--out-dir', str(cache_root),
+            '--jobs', '1',
+        ]
+        env = os.environ.copy()
+        env['PATH'] = os.path.dirname(gcc) + os.pathsep + env.get('PATH', '')
+        first = subprocess.run(
+            command, cwd=str(ROOT), env=env, capture_output=True, text=True,
+            timeout=120)
+        assert first.returncode == 0, first.stdout + first.stderr
+        manifests = list(cache_root.rglob('*.ranges'))
+        hosted_manifests = [
+            path for path in manifests
+            if MOD.manifest_has_hosted_provenance(
+                path.read_text(encoding='ascii'))
+        ]
+        assert hosted_manifests, first.stdout
+        alias_found = False
+        for manifest in hosted_manifests:
+            _pair, funcs = MOD.parse_runtime_shard_manifest(
+                manifest.read_text(encoding='ascii'), require_pair=True)
+            for entry, _crc, ranges in funcs:
+                if (entry == target and len(ranges) == 1 and
+                        ranges[0][0] == host):
+                    alias_found = True
+        assert alias_found, first.stdout
+
+        def inventory():
+            return {
+                str(path.relative_to(cache_root)): MOD.hashlib.sha256(
+                    path.read_bytes()).hexdigest()
+                for path in cache_root.rglob('*')
+                if (path.is_file() and
+                    path.suffix in (MOD.overlay_ext(), '.ranges') and
+                    not path.name.startswith('.'))
+            }
+
+        before = inventory()
+        second = subprocess.run(
+            command, cwd=str(ROOT), env=env, capture_output=True, text=True,
+            timeout=120)
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert inventory() == before
+        assert 'PSX_SHARD_RESULT ok=0 failed=0 ' in second.stdout, second.stdout
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -1822,10 +2846,13 @@ def main():
     check_composite_call_boundaries()
     check_bounded_jump_table_discovery()
     check_static_discovery_provenance()
+    check_static_dispatch_provenance()
     check_owned_direct_call_is_interior()
     check_discovered_host_owns_same_round_call_target()
     check_later_discovered_host_retracts_interior_root()
     check_recompiler_discovered_host_ownership(args.recompiler)
+    check_recompiler_explicit_hosted_interior(args.recompiler)
+    check_recompiler_hosted_interior_parser(args.recompiler)
     check_ownership_invalidation_and_producer_boundaries()
     check_recompiler_unreachable_jal_not_alias(args.recompiler)
     check_recomputed_evidence_and_unconditional_branch()
@@ -1838,9 +2865,12 @@ def main():
     check_recompiler_pointer_table_alias(args.recompiler)
     check_retained_alias_contract(args.recompiler)
     check_atomic_dll_publication()
+    check_candidate_capacity_publication()
     check_interior_fragment_contract()
     check_tcc_runtime_define_parity()
     check_real_batched_fragment_publication(args.recompiler)
+    check_real_hosted_fragment_publication(args.recompiler)
+    check_full_hosted_fixed_point(args.recompiler)
 
     data = bytearray(0x200)
 

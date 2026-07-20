@@ -101,9 +101,29 @@ named snapshots are unioned into one live-history denominator.
 PS-X EXE extraction records normal-mode discovery provenance separately from
 generic function-pointer candidates. `compile_overlays.py` promotes only those
 entries that also pass its local callable/CFG proof to trusted `call_root`s.
+Generic static records also preserve scanner and authoritative
+export/header/jump-table targets in optional `static_dispatch_entry_pcs`. The field is always a subset of
+`dispatch_entry_pcs`; runtime captures and prior-manifest enrichment never invent
+it. Callable members retain static provenance for sibling-variant nomination,
+while case labels and mid-function members remain non-root interior aliases.
 When rebuilding identical bytes, prior overlapping alias groups are retained as
 non-root bodies, so stronger new roots add coverage without displacing already
 compiled indirect entries.
+
+Shard publication counts manifest rows rather than deduplicated identities:
+every DLL `F` record consumes one runtime candidate slot. A shared cache-namespace
+lock makes the projected `existing - replaced + staged` count atomic across
+concurrent GCC/TCC publishers, using the same capacity literal as the runtime.
+Capacity rejection is a safe interpreter fallback and never overwrites the
+canonical pair.
+Dynamic compilation serializes canonically sorted recipes under a whole-command
+namespace lock so a full cache has the same accepted subset on every clean run.
+GCC-first basename shadowing matches the loader, and non-growing replacements
+remain legal for repair. Legacy/no-CRC or malformed manifests register no native
+candidates. Runtime and compiler share a strict ASCII LF/CRLF grammar, line and
+range bounds, KSEG0 entry canonicalization, and platform-correct basename casing.
+ABI/pair validation and every manifest-declared `func_*` export are preflighted
+before registration, so a mismatched or partial DLL consumes zero candidate slots.
 Reachable direct branches that cross a sibling-entry hard cap are also promoted
 only after the target passes the same bounded CFG proof. This recovers out-of-line
 switch/state blocks without a blind byte or pointer sweep.
@@ -322,6 +342,48 @@ DLL/manifest pair. A valid concurrent winner is preserved and then revalidated
 for exact manifest, ABI, and pair identity. Deterministic audit rejection of an
 unplayed static candidate is a memoized safe skip; the same rejection is fatal
 once live execution or `--force-interior` makes it an exact demand.
+
+### Cross-variant hosted interior recovery (2026-07-20)
+
+Some overlay byte variants expose a static dispatch entry that another variant's
+normal walk reaches only as an interior CFG block. Sibling evidence may nominate
+that address, but it supplies no executable authority. The compiler first closes
+all strong static roots across every merged byte recipe, then snapshots organic
+donors globally before the hosted pass. That ordering makes a clean invocation
+complete without relying on roots reloaded by a second run. Donors must be
+CRC-valid `F` entries with exactly one positive range rooted at their entry and
+explicit static control-flow provenance. Roots that also carry live, forced, or
+interval evidence close as isolated singletons before the snapshot. Hosted and
+post-snapshot orphan manifests carry pair-consistent non-authority provenance:
+they remain normal runtime coverage, but neither their aliases nor incidental
+rooted callees can become donor/owner authority on a later invocation. The
+recipient must independently provide one unambiguous, rooted, single-range host
+with current-byte CRC/geometry, the same producer, strict containment, and an
+already existing organic block leader. Publication rechecks every requested host
+and alias against the selected identity.
+
+Nomination, host, batch, attempt, and emitted-identity limits are deterministic.
+Per-recipient sibling streams exclude self and fixed authority coverage before a
+cache-independent nomination window is capped. Supplemental coverage remains in
+that fixed universe through owner selection and the alias/host caps, then the
+compile-time `still_needed` guard removes it; repeated invocations therefore
+cannot page through any later selection cap. Partial block-leader successes retry
+their bounded remainder immediately. Cap drops remain safe interpreter fallback.
+Hosted aliases are exact-entry dispatch candidates,
+never CPS range owners: continuation lookup accepts only the candidate rooted at
+the minimum guarded range address, and otherwise interprets.
+
+The current `cg5_06162507` Tomba 1 proof starts from an absent cache and publishes
+189/189 runtime-valid DLL/manifest pairs (`ok=189 failed=0`): 71 authority shards
+plus 118 `hosted-v1` supplements and 11,177 candidate records. Repeating the exact
+command publishes zero shards and leaves all 378 canonical DLL/manifest files
+byte-identical with unchanged timestamps. Independent played-vault recall is
+808/823 entry addresses (98.2%) and 793/867 exact `(entry, code_crc)` variants
+(91.5%); the exact BIOS shard brings combined interval containment to 823/823. A
+no-autocompile runtime smoke reached the village at 60 fps with active native
+dispatch and no candidate/range/manifest overflow. CRC rejected two stale
+candidates safely. Tomba 2, MMX6, and Ape Escape still require regeneration under
+this hash; the results below are the prior common-hash checkpoint.
 
 Tomba 2's clean `cg5_7125d9b5` build produced 53 region shards plus 104 accepted
 continuation fragments (`ok=157 failed=0 skipped=5`). All 12 durable MAIN gaps
