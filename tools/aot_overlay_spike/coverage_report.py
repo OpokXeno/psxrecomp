@@ -2,9 +2,10 @@
 """AOT static-coverage recall report + gap manifest.
 
 Answers both "which played manifest entries did static extraction reproduce?"
-and "which played entry PCs lie in compiled static code ranges?" The latter is
-the effective code-coverage view when the played vault contains fine-grained
-runtime fragments but static extraction emits broader functions.
+and "which played entry PCs lie in any compiled static code interval?" The
+latter is only an address-containment potential metric: it does not prove that
+the containing manifest belongs to the live content variant, passes its whole-
+function CRC guard, or can dispatch at that interior PC.
 
 Two ground-truth "needed" sources:
   * a played/coverage VAULT cache dir (.ranges from a full playthrough) — the most
@@ -14,8 +15,8 @@ Two ground-truth "needed" sources:
 
 Recall is reported at three strengths:
   * entry-level      : same function ENTRY address discovered (did we find it?)
-  * code-range       : played entry PC lies in an R range compiled by static AOT
-  * entry+code_crc   : same entry AND identical bytes (is our shard the real fn?)
+  * interval potential: played entry PC lies in an R range from some static AOT
+  * entry+code_crc    : same entry AND same manifest code CRC candidate
 
 Usage:
   coverage_report.py --static <static-cache-dir> --vault <vault-cache-dir>
@@ -69,7 +70,11 @@ def parse_ranges_dir(d, with_audit=False):
     to quarantine them without needing the original capture bytes: F carries
     the range CRC and its following R carries the exact byte count.
     """
-    ent = {}
+    # One virtual entry can legitimately have several content-keyed overlay
+    # variants.  The runtime retains all of them and selects by the owning
+    # function's whole-range CRC, so collapsing this to entry -> one arbitrary
+    # CRC makes the scoreboard depend on glob traversal order.
+    ent = defaultdict(set)
     intervals = []
     quarantined = set()
     for rf in glob.glob(os.path.join(d, '**', '*.ranges'), recursive=True):
@@ -79,7 +84,7 @@ def parse_ranges_dir(d, with_audit=False):
                 m = re.match(r'F\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
                 if m:
                     if pending is not None:
-                        ent[pending[0]] = pending[1]
+                        ent[pending[0]].add(pending[1])
                     pending = (norm(int(m.group(1), 16)), int(m.group(2), 16))
                     continue
                 m = re.match(r'R\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
@@ -91,12 +96,12 @@ def parse_ranges_dir(d, with_audit=False):
                         quarantined.add((pending[0], pending[1], size))
                     else:
                         if pending is not None:
-                            ent[pending[0]] = pending[1]
+                            ent[pending[0]].add(pending[1])
                         intervals.append((lo, lo + size))
                     pending = None
         if pending is not None:
-            ent[pending[0]] = pending[1]
-    result = (ent, merge_intervals(intervals))
+            ent[pending[0]].add(pending[1])
+    result = (dict(ent), merge_intervals(intervals))
     if not with_audit:
         return result
     audit = [
@@ -398,8 +403,23 @@ def parse_addendum_entries(path):
             audit['verified_snapshots'] += 1
     return entries, audit
 
+def _crc_set(value):
+    """Normalize legacy scalar CRC values and the current variant sets."""
+    if value is None:
+        return set()
+    if isinstance(value, (set, frozenset, list, tuple)):
+        return {int(crc) for crc in value if crc is not None}
+    return {int(value)}
+
+
 def recall(needed_entries, static_ent, static_ranges, needed_crc=None):
-    """needed_entries: set; static_ent: {entry->crc}. Returns dict of metrics."""
+    """Return exact-entry, exact-candidate, and interval-potential metrics.
+
+    ``static_ent`` and ``needed_crc`` map an entry address to every known code
+    CRC variant at that VA.  Scalar values remain accepted for older callers.
+    An R-interval hit is intentionally reported only as unverified potential:
+    ranges from different content variants are merged for this diagnostic.
+    """
     covered = set(static_ent)
     hit = needed_entries & covered
     miss = needed_entries - covered
@@ -412,14 +432,40 @@ def recall(needed_entries, static_ent, static_ranges, needed_crc=None):
     out = {'needed': len(needed_entries), 'covered_here': len(hit),
            'missed': len(miss), 'recall_entry': (len(hit)/len(needed_entries) if needed_entries else 0.0),
            'misses': sorted(miss),
+           'covered_by_interval_potential': len(range_hit),
+           'missed_interval_potential': len(range_miss),
+           'recall_interval_potential': (len(range_hit)/len(needed_entries) if needed_entries else 0.0),
+           'interval_potential_misses': sorted(range_miss),
+           'interval_metric_semantics': 'unverified_address_containment_only',
+           # Backward-compatible JSON aliases.  These do not imply a matching
+           # content variant or a dispatchable CPS continuation.
            'covered_by_code_range': len(range_hit),
            'missed_code_range': len(range_miss),
            'recall_code_range': (len(range_hit)/len(needed_entries) if needed_entries else 0.0),
            'range_misses': sorted(range_miss)}
     if needed_crc is not None:
-        crc_hit = sum(1 for e in hit if static_ent.get(e) == needed_crc.get(e))
-        out['covered_entry_crc'] = crc_hit
-        out['recall_entry_crc'] = (crc_hit/len(needed_entries) if needed_entries else 0.0)
+        needed_candidates = {
+            (entry, crc)
+            for entry in needed_entries
+            for crc in _crc_set(needed_crc.get(entry))
+        }
+        static_candidates = {
+            (entry, crc)
+            for entry, variants in static_ent.items()
+            for crc in _crc_set(variants)
+        }
+        crc_hits = needed_candidates & static_candidates
+        crc_misses = needed_candidates - static_candidates
+        crc_hit_addresses = {entry for entry, _ in crc_hits}
+        out['needed_entry_crc'] = len(needed_candidates)
+        out['covered_entry_crc'] = len(crc_hits)
+        out['missed_entry_crc'] = len(crc_misses)
+        out['recall_entry_crc'] = (
+            len(crc_hits) / len(needed_candidates) if needed_candidates else 0.0)
+        out['covered_entry_crc_addresses'] = len(crc_hit_addresses)
+        out['recall_entry_crc_addresses'] = (
+            len(crc_hit_addresses) / len(needed_entries) if needed_entries else 0.0)
+        out['entry_crc_misses'] = sorted(crc_misses)
     return out
 
 def group_by_region(addrs):
@@ -451,15 +497,21 @@ def main():
     static_ent, static_ranges, static_zero = parse_ranges_dir(
         a.static, with_audit=True)
     report = {'game': a.game, 'static_entries': len(static_ent), 'sources': {}}
+    report['static_entry_crc_candidates'] = sum(
+        len(_crc_set(variants)) for variants in static_ent.values())
     report['static_quarantined_zero_ranges'] = static_zero
-    combined_ent = dict(static_ent)
+    combined_ent = {
+        entry: set(_crc_set(variants))
+        for entry, variants in static_ent.items()
+    }
     combined_ranges = static_ranges
     if a.bios_dispatch:
         try:
             bios_ent, bios_ranges = parse_bios_dispatch(a.bios_dispatch)
         except (OSError, ValueError) as exc:
             ap.error(f'cannot parse --bios-dispatch: {exc}')
-        combined_ent.update({entry: None for entry in bios_ent})
+        for entry in bios_ent:
+            combined_ent.setdefault(entry, set()).add(None)
         combined_ranges = merge_intervals(static_ranges + bios_ranges)
         report['bios_dispatch'] = a.bios_dispatch
         report['bios_static_entries'] = len(bios_ent)
@@ -468,9 +520,12 @@ def main():
     md = []
     md.append(f'# AOT static-coverage recall — {a.game}\n')
     md.append('_How much of the played reference set did the play-free static '
-              'extractor reproduce, and how much lies in compiled static code?_\n')
+              'extractor reproduce, and how much has unverified address overlap '
+              'with a compiled static interval?_\n')
     md.append(f'- Static shard cache: `{a.static}`')
-    md.append(f'- Static manifest entries: **{len(static_ent)}**\n')
+    md.append(f'- Static manifest entry addresses: **{len(static_ent)}**; '
+              f'content-keyed entry+CRC candidates: '
+              f'**{report["static_entry_crc_candidates"]}**\n')
     if static_zero:
         md.append(f'- Quarantined proven all-zero static ranges: '
                   f'**{len(static_zero)}** (excluded as data, not code)\n')
@@ -485,10 +540,14 @@ def main():
         report['vault_quarantined_zero_ranges'] = vault_zero
         r = recall(set(vault_ent), static_ent, static_ranges, vault_ent)
         report['sources']['vault'] = {
-            k: v for k, v in r.items() if k not in ('misses', 'range_misses')}
+            k: v for k, v in r.items()
+            if k not in ('misses', 'range_misses',
+                         'interval_potential_misses', 'entry_crc_misses')}
         report['vault_misses'] = [f'0x{x|0x80000000:08X}' for x in r['misses']]
         report['vault_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in r['range_misses']]
+        report['vault_interval_potential_misses'] = list(
+            report['vault_range_misses'])
         combined = None
         if a.bios_dispatch:
             combined = recall(set(vault_ent), combined_ent, combined_ranges)
@@ -496,6 +555,8 @@ def main():
                 k: v for k, v in combined.items() if k not in ('misses', 'range_misses')}
             report['vault_combined_range_misses'] = [
                 f'0x{x|0x80000000:08X}' for x in combined['range_misses']]
+            report['vault_combined_interval_potential_misses'] = list(
+                report['vault_combined_range_misses'])
         md.append('## vs played vault (most complete needed-set)\n')
         if vault_zero:
             md.append(f'- Quarantined proven all-zero played ranges: '
@@ -503,29 +564,32 @@ def main():
         md.append(f'- Manifest entries in the full-playthrough vault: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
-        md.append(f'- Covered by compiled static code ranges: '
-                  f'**{r["covered_by_code_range"]}** '
-                  f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
-        md.append('  - Code-range recall answers whether the played entry PC is in '
-                  'byte-guarded native code. Exact-entry recall is stricter manifest '
-                  'granularity; runtime fragment caches can contain one entry per '
-                  'instruction, so it substantially understates broad static shards.')
-        md.append(f'- Byte-identical (entry+code_crc): **{r.get("covered_entry_crc",0)}** '
+        md.append(f'- Contained in some compiled static interval (unverified '
+                  f'potential): **{r["covered_by_interval_potential"]}** '
+                  f'(**{r["recall_interval_potential"]*100:.1f}%**)')
+        md.append('  - Interval containment alone does not prove native dispatch: '
+                  'the owning content variant must pass its whole-function CRC guard, '
+                  'and an interior PC must be a valid CPS continuation.')
+        md.append(f'- Exact manifest candidates (entry+code_crc): '
+                  f'**{r.get("covered_entry_crc",0)}/'
+                  f'{r.get("needed_entry_crc",0)}** '
                   f'(**{r.get("recall_entry_crc",0)*100:.1f}%**) '
-                  f'_(cg-version differences lower this vs entry-level)_')
+                  f'_(cg-version differences can lower this vs address-level recall)_')
         md.append(f'- **MISSED exact entries: {r["missed"]}**')
-        md.append(f'- **TRUE CODE-RANGE GAPS: {r["missed_code_range"]}** played '
-                  'entry PCs outside all compiled static ranges\n')
+        md.append(f'- **OUTSIDE ALL STATIC INTERVALS: '
+                  f'{r["missed_interval_potential"]}** played entry PCs '
+                  '(potential gaps; interval membership is not dispatch proof)\n')
         if combined:
             md.append('### Combined with base recompiled BIOS\n')
             md.append(f'- Exact native dispatch entries: **{combined["covered_here"]}** '
                       f'(**{combined["recall_entry"]*100:.1f}%**)')
-            md.append(f'- Covered by native code ranges: '
-                      f'**{combined["covered_by_code_range"]}** '
-                      f'(**{combined["recall_code_range"]*100:.1f}%**)')
-            md.append(f'- **COMBINED CODE-RANGE GAPS: '
-                      f'{combined["missed_code_range"]}**\n')
-            md.append('#### Combined gaps grouped by region\n')
+            md.append(f'- Contained in an overlay/BIOS static interval '
+                      f'(unverified potential): '
+                      f'**{combined["covered_by_interval_potential"]}** '
+                      f'(**{combined["recall_interval_potential"]*100:.1f}%**)')
+            md.append(f'- **OUTSIDE ALL COMBINED STATIC INTERVALS: '
+                      f'{combined["missed_interval_potential"]}**\n')
+            md.append('#### Addresses outside all combined static intervals\n')
             grouped_combined = group_by_region(combined['range_misses'])
             if not grouped_combined:
                 md.append('- None.')
@@ -538,7 +602,7 @@ def main():
                             f'{x|0x80000000:08X}' for x in addrs[i:i+8]))
                     md.append('  ```')
             md.append('')
-        md.append('### Code-range gaps grouped by overlay region\n')
+        md.append('### Addresses outside all static intervals, grouped by region\n')
         for reg, addrs in group_by_region(r['range_misses']).items():
             md.append(f'- region `0x{reg|0x80000000:08X}`: {len(addrs)} misses')
             md.append('  ```')
@@ -566,10 +630,13 @@ def main():
     if live_sources:
         r = recall(live, static_ent, static_ranges)
         report['sources']['live_session'] = {
-            k: v for k, v in r.items() if k not in ('misses', 'range_misses')}
+            k: v for k, v in r.items()
+            if k not in ('misses', 'range_misses', 'interval_potential_misses')}
         report['live_misses'] = [f'0x{x|0x80000000:08X}' for x in r['misses']]
         report['live_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in r['range_misses']]
+        report['live_interval_potential_misses'] = list(
+            report['live_range_misses'])
         combined = None
         if a.bios_dispatch:
             combined = recall(live, combined_ent, combined_ranges)
@@ -577,6 +644,8 @@ def main():
                 k: v for k, v in combined.items() if k not in ('misses', 'range_misses')}
             report['live_combined_range_misses'] = [
                 f'0x{x|0x80000000:08X}' for x in combined['range_misses']]
+            report['live_combined_interval_potential_misses'] = list(
+                report['live_combined_range_misses'])
         md.append('## vs live capture history\n')
         md.append(f'- Sources: **{" + ".join(live_sources)}**')
         if a.addendum and 'live_addendum_audit' in report:
@@ -594,17 +663,17 @@ def main():
         md.append(f'- Dispatch entries exercised: **{r["needed"]}**')
         md.append(f'- Discovered by static: **{r["covered_here"]}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
-        md.append(f'- Covered by compiled static code ranges: '
-                  f'**{r["covered_by_code_range"]}** '
-                  f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
-        md.append(f'- Overlay-only true code-range gaps: '
-                  f'**{r["missed_code_range"]}**')
+        md.append(f'- Contained in some compiled static interval (unverified '
+                  f'potential): **{r["covered_by_interval_potential"]}** '
+                  f'(**{r["recall_interval_potential"]*100:.1f}%**)')
+        md.append(f'- Outside all overlay static intervals (potential gaps): '
+                  f'**{r["missed_interval_potential"]}**')
         if combined:
-            md.append(f'- Including base BIOS native code ranges: '
-                      f'**{combined["covered_by_code_range"]}** '
-                      f'(**{combined["recall_code_range"]*100:.1f}%**)')
-            md.append(f'- Combined true code-range gaps: '
-                      f'**{combined["missed_code_range"]}**')
+            md.append(f'- Including base BIOS static intervals (unverified '
+                      f'potential): **{combined["covered_by_interval_potential"]}** '
+                      f'(**{combined["recall_interval_potential"]*100:.1f}%**)')
+            md.append(f'- Outside all combined static intervals (potential gaps): '
+                      f'**{combined["missed_interval_potential"]}**')
         md.append(f'- Exact-entry misses (diagnostic; may be interior fragments): '
                   f'**{r["missed"]}**\n')
     if a.prior_report:
@@ -636,6 +705,11 @@ def main():
         covered = needed - len(miss)
         r = {'needed': needed, 'covered_here': covered, 'missed': len(miss),
              'recall_entry': (covered/needed if needed else 0.0),
+             'covered_by_interval_potential': needed - len(range_miss),
+             'missed_interval_potential': len(range_miss),
+             'recall_interval_potential': (
+                 (needed - len(range_miss))/needed if needed else 0.0),
+             'interval_metric_semantics': 'unverified_address_containment_only',
              'covered_by_code_range': needed - len(range_miss),
              'missed_code_range': len(range_miss),
              'recall_code_range': ((needed - len(range_miss))/needed if needed else 0.0)}
@@ -648,6 +722,8 @@ def main():
             f'0x{x|0x80000000:08X}' for x in sorted(miss)]
         report[f'{prior_prefix}_range_misses'] = [
             f'0x{x|0x80000000:08X}' for x in sorted(range_miss)]
+        report[f'{prior_prefix}_interval_potential_misses'] = list(
+            report[f'{prior_prefix}_range_misses'])
         combined = None
         if a.bios_dispatch:
             combined_miss = old_miss - set(combined_ent)
@@ -663,6 +739,11 @@ def main():
                 'covered_here': combined_covered,
                 'missed': len(combined_miss),
                 'recall_entry': (combined_covered/needed if needed else 0.0),
+                'covered_by_interval_potential': needed - len(combined_range_miss),
+                'missed_interval_potential': len(combined_range_miss),
+                'recall_interval_potential': (
+                    (needed - len(combined_range_miss))/needed if needed else 0.0),
+                'interval_metric_semantics': 'unverified_address_containment_only',
                 'covered_by_code_range': needed - len(combined_range_miss),
                 'missed_code_range': len(combined_range_miss),
                 'recall_code_range': (
@@ -673,6 +754,8 @@ def main():
             report['sources'][combined_key] = combined
             report[f'{prior_prefix}_combined_range_misses'] = [
                 f'0x{x|0x80000000:08X}' for x in sorted(combined_range_miss)]
+            report[f'{prior_prefix}_combined_interval_potential_misses'] = list(
+                report[f'{prior_prefix}_combined_range_misses'])
         heading = ('## vs pre-history persisted live-session gaps '
                    '(separate monotonic roll-forward)\n' if live_sources else
                    '## vs persisted live-session gaps (monotonic roll-forward)\n')
@@ -684,17 +767,17 @@ def main():
         md.append(f'- Dispatch entries the persisted session exercised: **{needed}**')
         md.append(f'- Discovered by current static: **{covered}** '
                   f'(**{r["recall_entry"]*100:.1f}%** entry-level recall)')
-        md.append(f'- Covered by current static code ranges: '
-                  f'**{r["covered_by_code_range"]}** '
-                  f'(**{r["recall_code_range"]*100:.1f}%** code-range recall)')
-        md.append(f'- Overlay-only true code-range gaps: '
-                  f'**{r["missed_code_range"]}**')
+        md.append(f'- Contained in a current static interval (unverified '
+                  f'potential): **{r["covered_by_interval_potential"]}** '
+                  f'(**{r["recall_interval_potential"]*100:.1f}%**)')
+        md.append(f'- Outside all overlay static intervals (potential gaps): '
+                  f'**{r["missed_interval_potential"]}**')
         if combined:
-            md.append(f'- Including base BIOS native code ranges: '
-                      f'**{combined["covered_by_code_range"]}** '
-                      f'(**{combined["recall_code_range"]*100:.1f}%**)')
-            md.append(f'- Combined true code-range gaps: '
-                      f'**{combined["missed_code_range"]}**')
+            md.append(f'- Including base BIOS static intervals (unverified '
+                      f'potential): **{combined["covered_by_interval_potential"]}** '
+                      f'(**{combined["recall_interval_potential"]*100:.1f}%**)')
+            md.append(f'- Outside all combined static intervals (potential gaps): '
+                      f'**{combined["missed_interval_potential"]}**')
         md.append(f'- Exact-entry misses (diagnostic; may be interior fragments): '
                   f'**{len(miss)}**')
         md.append('- Provenance: caller explicitly asserted that the current static '
@@ -713,7 +796,7 @@ def main():
     for src, m in report['sources'].items():
         print(f'  {src}: recall_entry={m.get("recall_entry",0)*100:.1f}% '
               f'({m.get("covered_here")}/{m.get("needed")}), '
-              f'recall_code_range={m.get("recall_code_range",0)*100:.1f}%, '
+              f'interval_potential={m.get("recall_interval_potential",0)*100:.1f}%, '
               f'missed={m.get("missed")}')
 
 if __name__ == '__main__':

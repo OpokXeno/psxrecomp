@@ -10,6 +10,10 @@ for the full design, findings, and honest coverage numbers.
 pipeline. Disc-container discovery remains engine-specific; unsupported producers
 fail closed instead of being guessed as code.
 
+Coverage reports compare against finite played/live observed sets, not exhaustive
+title inventories. A reported 100% means only 100% of that named observed set under
+the named metric.
+
 ## What each does
 
 - `overlay_determinism.py` — corpus analysis across all games' captured overlays:
@@ -195,19 +199,20 @@ that exact `00106000_0DC32D96` shard and ran the formerly ~14 fps lava-area attr
 demo at 65–67 fps while the runtime process remained BelowNormal. The scene rendered
 correctly, with no range-index or lazy-manifest overflow.
 
-`coverage_report.py` reports both exact manifest-entry recall and compiled
-code-range recall. The distinction matters: runtime/autocompile vaults may contain
-one-entry fragments at consecutive instructions, while static AOT emits one broad
-function with the same PCs in its guarded `R` ranges. Exact-entry parity is retained
-for continuity; code-range recall is the useful uncovered-code roadmap. At the
-current Tomba 2 checkpoint the play-free overlay cache plus the exact-hash
-resident shard covers 97.6% of vault code ranges. Pass the generated base BIOS
+`coverage_report.py` reports three separate bounded metrics: exact entry address;
+exact `(entry, code_crc)` candidate, preserving every observed CRC variant at a
+reused address; and unverified interval containment potential. The distinction
+matters: runtime/autocompile vaults may contain one-entry fragments at consecutive
+instructions, while static AOT emits one broad function with the same PCs in its
+guarded `R` ranges. Interval containment does not prove that the owning variant or
+a valid compiled interior matches live bytes. At the historical Tomba 2 checkpoint,
+the play-free overlay cache plus exact-hash resident shard contained 97.6% of the
+observed vault addresses in static intervals. Pass the generated base BIOS
 dispatcher with `--bios-dispatch generated/SCPH1001_dispatch.c` to report separate
-combined metrics. The base recompiler covers relocated kernel bodies with a
-live-byte guard; including it raises both the full-playthrough vault and the
-verified append-only live-history needed set to **100% native code-range
-coverage**. This avoids generating duplicate overlay shards for code that is
-already native.
+combined metrics. Including it reached 100% interval containment for the named
+finite full-playthrough and verified live-history sets; that is not exhaustive
+title coverage or proof of native dispatch. This avoids generating duplicate
+overlay shards for code already provided by the BIOS producer.
 
 ## Indexed and companion archive recovery (2026-07-18)
 
@@ -228,14 +233,25 @@ generated-C audit or host-compiler rejection retries the exact same bytes with
 direct-call roots only. A rejected recipe never contributes a DLL or a failure
 to the final cache.
 
+The optional indirect-dispatch enrichment is deliberately narrow. A framed root
+must be adjacent to a prior `jr ra`, establish a bounded stack frame, and save `ra`
+in-frame before its first control transfer. A switch must match the canonical
+producer-bounded `sltiu` guard + NOP, `sll`, `lui`+`addiu`, `addu`, `lw`, exact
+`jr` sequence; clobbered or skipped definitions, malformed/foreign tables, and
+invalid targets reject the whole table. Case targets and call continuations are
+dispatch-only interiors, never roots. Python discovery, C++ analysis, and code
+generation share those bounds. Proof metadata is diagnostic; an audit or compiler
+failure strips framed roots, aliases, dispatch PCs, and proof fields before retrying
+the exact bytes with direct-JAL roots only.
+
 The validation compile produced `PSX_SHARD_RESULT ok=31 failed=0 skipped=0`
 (30 members + BIOS resident); unsafe enrichment fell back while clean members
 retained broad ranges. Against the union of 16 legacy MMX6 capture files, overlay
-code-range recall rose from the direct-only **71.8%** baseline to **93.9%**
+interval containment rose from the direct-only **71.8%** baseline to **93.9%**
 (636/677). Every one of the remaining 41 PCs is in the BIOS/kernel window;
 including the separately recompiled, live-byte-guarded base BIOS raises combined
-native code-range recall to **100.0%** (677/677). Validation used only disposable
-`%TEMP%` caches.
+interval containment to **100.0%** (677/677) for that observed set. Validation
+used only disposable `%TEMP%` caches.
 
 Tomba 1's header-table exports require a different conservative retry. Those
 authoritative addresses are commonly switch-case entries in the middle of a
@@ -249,7 +265,7 @@ valid unreferenced frameless leaves. A clean 25-record corpus produces 17 unique
 shards with zero audit failures. Overlay ranges cover **820/823 (99.6%)**
 historical-vault PCs and **410/450 (91.1%)** live-history PCs; every residual is
 in the separately recompiled BIOS/kernel ranges, producing **100.0% combined
-code-range recall and zero true gaps** on both scoreboards. The generated-C audit
+interval containment** on both observed scoreboards. The generated-C audit
 remains the gate: rejected broad discovery is never installed.
 
 Ape Escape's `KKIIDDZZ.HED` encodes contiguous
@@ -267,8 +283,8 @@ retaining its declared `0x80100C84` entry. All decoder-classified interior
 entries remain ordinary candidates, and the extractor serializes their `F/R`
 overlapping alias recipes instead of promoting them to hard call roots. A clean
 Tomba 2 disposable rebuild compiled 53/53 candidates with zero unsupported/bad
-targets and, together with the base BIOS, reproduced **100% code-range coverage**
-against both the full-playthrough vault and 765-entry append-only live history.
+targets and, together with the base BIOS, reached **100% interval containment**
+against the finite full-playthrough vault and 765-entry append-only live history.
 No prior MAIN manifest was present for the two regenerated shards. Position-fixed
 framed scans likewise recover Psy-Q's exact
 `lui R; load ...,off(R); addiu sp,sp,-N` entry after a previous return, replacing
@@ -279,9 +295,9 @@ A fresh Ape validation rebuilt all **47/47** candidates with zero audit or host-
 compiler failures. A full title-to-attract-to-title cycle exercised four overlay
 generations and 107 dispatch PCs. The overlay cache covers all 72 exercised game
 PCs by compiled range; the remaining 35 are BIOS/kernel PCs, and the separately
-generated base BIOS covers them all (**100.0% combined code-range recall, zero
-true gaps**). Live-byte validation rejected 21 stale candidates without executing
-them, while every loaded shard reported zero missing manifests and both loader
+generated base BIOS covers them all (**100.0% combined interval containment** of
+that observed set). Live-byte validation rejected 21 stale candidates without
+executing them, while every loaded shard reported zero missing manifests and both loader
 indexes stayed within capacity. Screenshots verified the rainbow/falling attract
 scene and returned title screen rendered correctly. The dev persistence profile
 produced 21/21 signed immutable snapshots with zero invalid or duplicate records;
@@ -296,9 +312,9 @@ final-named DLL that a later build mistakes for a valid shard, and a failed
 
 The `cg5_060368b2` discovery checkpoint was then regenerated from each disc and
 cross-title checked in disposable caches. Ape GCC-built **47/47** candidates and
-retained **107/107 combined live-history code-range coverage**. MMX6 GCC-built
-**31/31** candidates and retained **677/677 combined coverage**; broad normal-mode
-attempts containing embedded data or an incomplete label graph were rejected and
+retained **107/107 combined live-history interval containment**. MMX6 GCC-built
+**31/31** candidates and retained **677/677 combined interval containment**; broad
+normal-mode attempts containing embedded data or an incomplete label graph were rejected and
 the corresponding shards safely retried with direct seeds. Tomba 2's full set of
 **53/53** candidates passed the generated-C audit with zero unsupported/bad
 targets, and GCC built representative MAIN, large-area, OPN/CRD, and BIOS shards;
@@ -330,7 +346,7 @@ so successful and interrupted compiles leave only final DLL/manifest pairs.
    final historical miss at `0x8010427C`. Stable-round exact discovery absorbs
    call-derived interior aliases into their existing host instead of using them
    as hard caps. Together these changes bring Tomba 1's combined historical and
-   live code-range scoreboards to **100.0% with zero true gaps**.
+   live observed-set scoreboards to **100.0% interval containment**.
 2. ~~Header-table base recovery~~ — DONE (jal-fit, above).
 3. ~~Recover weak-signal A09/A0J/GAME/OPN~~ — DONE. They are ordinary uncompressed
    MIPS, not archives. Counting only callable `jal` targets sharply resolves

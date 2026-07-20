@@ -38,11 +38,45 @@ const PsxNativeStub psx_bios_native_stubs[1] = {
         self.assertEqual(entries, {0xA0, 0x500, 0x1FC00180})
         self.assertEqual(ranges, [(0xA0, 0xB0), (0x500, 0x520)])
 
-    def test_code_range_recall_is_distinct_from_exact_entry_recall(self):
+    def test_interval_potential_is_distinct_from_exact_entry_recall(self):
         result = coverage_report.recall(
-            {0x100, 0x104}, {0x100: 0x1234}, [(0x100, 0x108)])
+            {0x100, 0x104}, {0x100: {0x1234}}, [(0x100, 0x108)])
         self.assertEqual(result['covered_here'], 1)
+        self.assertEqual(result['covered_by_interval_potential'], 2)
         self.assertEqual(result['covered_by_code_range'], 2)
+        self.assertEqual(
+            result['interval_metric_semantics'],
+            'unverified_address_containment_only')
+
+    def test_exact_candidate_recall_preserves_duplicate_va_crc_variants(self):
+        result = coverage_report.recall(
+            {0x100}, {0x100: {0xBBBB, 0xCCCC}}, [(0x100, 0x108)],
+            {0x100: {0xAAAA, 0xBBBB}})
+        self.assertEqual(result['covered_here'], 1)
+        self.assertEqual(result['needed_entry_crc'], 2)
+        self.assertEqual(result['covered_entry_crc'], 1)
+        self.assertEqual(result['missed_entry_crc'], 1)
+        self.assertEqual(result['recall_entry_crc'], 0.5)
+        self.assertEqual(result['entry_crc_misses'], [(0x100, 0xAAAA)])
+
+    def test_interval_containment_does_not_count_as_crc_candidate(self):
+        result = coverage_report.recall(
+            {0x100}, {0x100: {0xBBBB}}, [(0x100, 0x108)],
+            {0x100: {0xAAAA}})
+        self.assertEqual(result['covered_here'], 1)
+        self.assertEqual(result['covered_by_interval_potential'], 1)
+        self.assertEqual(result['covered_entry_crc'], 0)
+        self.assertEqual(result['recall_entry_crc'], 0.0)
+
+    def test_range_parser_retains_all_crc_variants_for_duplicate_va(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'a.ranges'), 'w', encoding='utf-8') as out:
+                out.write('F 80000100 AAAAAAAA\nR 80000100 8\n')
+            with open(os.path.join(tmp, 'b.ranges'), 'w', encoding='utf-8') as out:
+                out.write('F 80000100 BBBBBBBB\nR 80000100 C\n')
+            entries, ranges = coverage_report.parse_ranges_dir(tmp)
+        self.assertEqual(entries, {0x100: {0xAAAAAAAA, 0xBBBBBBBB}})
+        self.assertEqual(ranges, [(0x100, 0x10C)])
 
     def test_all_zero_compiled_range_is_quarantined(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,7 +90,7 @@ const PsxNativeStub psx_bios_native_stubs[1] = {
                 out.write('R 80000100 10\n')
             entries, ranges, audit = coverage_report.parse_ranges_dir(
                 tmp, with_audit=True)
-        self.assertEqual(entries, {0x100: 0x12345678})
+        self.assertEqual(entries, {0x100: {0x12345678}})
         self.assertEqual(ranges, [(0x100, 0x110)])
         self.assertEqual(audit, [{
             'entry': '0x8000EE7C', 'code_crc': '%08X' % zero_crc,
