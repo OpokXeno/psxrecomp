@@ -191,6 +191,15 @@ vxrange_sites = ["0x80012340"]
     check(vxrange_config.ws_cull_vxrange_sites ==
               std::vector<uint32_t>{0x80012340u},
           "parser preserves masked-u16 X-window sites");
+
+    const auto depth = write_config(root, "depth", R"toml(
+[widescreen.cull]
+depth_sites = ["0x80012340"]
+)toml");
+    const auto depth_config = PSXRecompV4::load_game_config(depth);
+    check(depth_config.ws_cull_depth_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves depth-bound sites");
 }
 
 void capture_history_config_tests(const fs::path& root) {
@@ -296,6 +305,23 @@ void codegen_tests() {
         0x24820140u, {}, true, vxrange_config); // addiu v0,a0,0x140
     check(vxrange_overlay_mismatch.find("ws cull masked-u16") == std::string::npos,
           "overlay nonmatching masked-u16 variant remains unchanged");
+
+    PSXRecomp::CodeGenConfig depth_config;
+    depth_config.ws_cull_depth_sites.insert(0x80010000u);
+    const std::string signed_depth = generate_first_instruction(
+        0x28827FFFu, {}, false, depth_config); // slti v0,a0,0x7fff
+    check(signed_depth.find("psx_ws_depth_bound(32767)") != std::string::npos,
+          "codegen emits signed aspect-scaled depth bound");
+
+    const std::string unsigned_depth = generate_first_instruction(
+        0x2C82FFFFu, {}, false, depth_config); // sltiu v0,a0,-1
+    check(unsigned_depth.find("psx_ws_depth_bound(-1)") != std::string::npos,
+          "unsigned depth emit preserves MIPS immediate sign extension");
+
+    const std::string depth_overlay_mismatch = generate_first_instruction(
+        0x24827FFFu, {}, true, depth_config); // addiu v0,a0,0x7fff
+    check(depth_overlay_mismatch.find("ws cull depth") == std::string::npos,
+          "overlay nonmatching depth variant remains unchanged");
 }
 
 void jump_table_producer_codegen_test() {

@@ -1638,6 +1638,10 @@ static void init_callbacks(void) {
             extern void gte_precision_store_word(uint32_t addr, uint8_t reg);
             s_callbacks.gte_precision_store_word = gte_precision_store_word;
         }
+        {
+            extern int32_t psx_ws_depth_bound(int32_t imm);
+            s_callbacks.ws_depth_bound = psx_ws_depth_bound;
+        }
     }
 }
 
