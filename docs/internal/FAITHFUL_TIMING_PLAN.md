@@ -213,6 +213,37 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-19/20 (Tomba 2 warm-cache boot death ROOT-CAUSED + FIXED — overlay
+  alias-body CPS re-entry fall-through):** The splash→title death (host frame
+  ~1374, "execution completed, PC=0") was NEVER an IRQ/event race: production
+  rings proved DeliverEvent(0xF0000003,0x0020) ran and TestEvent consumed it.
+  The game then reloads its whole program image from disc (LBA 24–372 →
+  0x10000–0xBE7FF) and re-enters it; `dispatch(0x80089788)` (the fresh image's
+  ctor thunk) resolved by range to the ALIAS candidate `func_80089770`, whose
+  generated body's continuation switch had `default: break` falling into
+  `switch(entry)` — it ran the ALIAS'S OWN block (the crt0 shim tail: reload
+  $ra, call main-init) instead of the requested PC. Result: a 21-cycle
+  main-init↔alias loop leaking 0x40 of guest SP per round, marching the stack
+  down 1.5 MB until the frames overwrote the thunk's own code and execution
+  died in its own stack garbage. Cold passed because interiors fell to the
+  interpreter. FIX (code_generator.cpp): alias-body continuation switch now
+  emits alias-entry cases + the PR#46 fail-closed default
+  (`cpu->pc=_cont; psx_native_bad_entry(); return`); alias entry-switch default
+  fail-closed; overlay-mode cpu->pc guard now emitted even with an EMPTY
+  continuation set (single-block re-entry hole, both emitters). Codegen hash
+  rolled 6326a16c→7b3e9e15. Validated: fresh-cache reshard run + 2 warm runs
+  boot past the transition to the attract demo at 60 fps (screenshots), all
+  six unit tests + guards PASS. New ALWAYS-ON production observability landed
+  en route: `sp_ring` (stack-domain transitions), `disp_ring` (dispatch tail),
+  `overlay_native_ring` recent[] un-gated, event_ring enabled in production,
+  `psx_fatal_halt` halt-and-serve keyed on listener-live (PSX_EXIT_HALT works
+  on production+PSX_DEBUG_SERVER=1 runs), `debug_server_get_status`
+  implemented (was declared-only). Tooling: launcher autocompile uses explicit
+  Windows Python312; autocompile.c wraps the child line as `cmd.exe /C "…"`
+  (leading-quote mangling made every reshard fail silently). Follow-ups:
+  dirty-interp reserved-instruction abort should raise the guest RI exception;
+  `overlay_loader_bad_entry_stats` still lacks a TCP surface; other titles
+  inherit the emitter fix on next fw bump (regen+reshard per title).
 - **2026-07-11 (Tomba 2 OpenGL full-attract performance + audio acceptance):**
   Resolved the shared renderer/overlay/capture cascade that made Beach, Whoopee
   FMVs, Mines, and Mine Cart slow. OpenGL now avoids mandatory present readback,
