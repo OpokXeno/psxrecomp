@@ -1617,6 +1617,12 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
                             (uint32_t)psx_ws_depth_bound(simm)) ? 1u : 0u;
         else if (psx_ws_is_cull_vxrange_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_vxrange(cpu->gpr[rs], imm);
+        else if (psx_ws_is_cull_range_site(pc)) {
+            /* Explicit world-space classifier widen. The native emitter uses
+             * the same bound transform for configured range_sites. */
+            cpu->gpr[rt] = (cpu->gpr[rs] <
+                            ((uint32_t)simm + 2u * (uint32_t)psx_ws_x_margin())) ? 1u : 0u;
+        }
         else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else

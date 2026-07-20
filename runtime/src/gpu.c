@@ -310,18 +310,25 @@ void gpu_ws_set_cull_guard_pixels(int pixels) {
 #define WS_EXPLICIT_CULL_SITES_MAX 64
 static uint32_t ws_explicit_bias_sites[WS_EXPLICIT_CULL_SITES_MAX];
 static uint32_t ws_explicit_slti_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_range_sites[WS_EXPLICIT_CULL_SITES_MAX];
 static int ws_explicit_bias_n = 0;
 static int ws_explicit_slti_n = 0;
+static int ws_explicit_range_n = 0;
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
-                                    const uint32_t *slti, int nslti) {
+                                    const uint32_t *slti, int nslti,
+                                    const uint32_t *range, int nrange) {
     if (nbias < 0) nbias = 0;
     if (nslti < 0) nslti = 0;
+    if (nrange < 0) nrange = 0;
     if (nbias > WS_EXPLICIT_CULL_SITES_MAX) nbias = WS_EXPLICIT_CULL_SITES_MAX;
     if (nslti > WS_EXPLICIT_CULL_SITES_MAX) nslti = WS_EXPLICIT_CULL_SITES_MAX;
+    if (nrange > WS_EXPLICIT_CULL_SITES_MAX) nrange = WS_EXPLICIT_CULL_SITES_MAX;
     ws_explicit_bias_n = nbias;
     ws_explicit_slti_n = nslti;
+    ws_explicit_range_n = nrange;
     for (int i = 0; i < nbias; i++) ws_explicit_bias_sites[i] = bias[i] & 0x1FFFFFFFu;
     for (int i = 0; i < nslti; i++) ws_explicit_slti_sites[i] = slti[i] & 0x1FFFFFFFu;
+    for (int i = 0; i < nrange; i++) ws_explicit_range_sites[i] = range[i] & 0x1FFFFFFFu;
 }
 static int ws_explicit_site(const uint32_t *sites, int n, uint32_t pc) {
     uint32_t p = pc & 0x1FFFFFFFu;
@@ -379,6 +386,9 @@ int32_t psx_ws_depth_bound(int32_t imm) {
         ? (numerator + denominator / 2) / denominator
         : -((-numerator + denominator / 2) / denominator);
     return (int32_t)result;
+}
+int psx_ws_is_cull_range_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_range_sites, ws_explicit_range_n, pc);
 }
 
 int psx_ws_x_margin(void) {
