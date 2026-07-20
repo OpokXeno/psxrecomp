@@ -182,6 +182,15 @@ negsub_sites = ["0x80012340"]
     check(negsub_config.ws_cull_negsub_sites ==
               std::vector<uint32_t>{0x80012340u},
           "parser preserves negsub cull sites");
+
+    const auto vxrange = write_config(root, "vxrange", R"toml(
+[widescreen.cull]
+vxrange_sites = ["0x80012340"]
+)toml");
+    const auto vxrange_config = PSXRecompV4::load_game_config(vxrange);
+    check(vxrange_config.ws_cull_vxrange_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves masked-u16 X-window sites");
 }
 
 void capture_history_config_tests(const fs::path& root) {
@@ -274,6 +283,19 @@ void codegen_tests() {
         0x00041021u, {}, true, negsub_config); // addu v0,zero,a0
     check(overlay_mismatch.find("ws cull negsub") == std::string::npos,
           "overlay nonmatching negsub variant remains unchanged");
+
+    PSXRecomp::CodeGenConfig vxrange_config;
+    vxrange_config.ws_cull_vxrange_sites.insert(0x80010000u);
+    const std::string vxrange = generate_first_instruction(
+        0x2C820140u, {}, false, vxrange_config); // sltiu v0,a0,0x140
+    check(vxrange.find("cpu->gpr[2] = psx_ws_cull_vxrange(cpu->gpr[4], 320)") !=
+              std::string::npos,
+          "codegen routes masked-u16 X-window sites through shared helper");
+
+    const std::string vxrange_overlay_mismatch = generate_first_instruction(
+        0x24820140u, {}, true, vxrange_config); // addiu v0,a0,0x140
+    check(vxrange_overlay_mismatch.find("ws cull masked-u16") == std::string::npos,
+          "overlay nonmatching masked-u16 variant remains unchanged");
 }
 
 void jump_table_producer_codegen_test() {

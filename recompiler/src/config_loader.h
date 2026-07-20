@@ -516,6 +516,9 @@ struct GameConfig {
     // Horizontal low-edge form `subu rd,zero,rs` -> `-rs-x_margin`.
     // Empty by default; configured sites require regenerated native code.
     std::vector<uint32_t> ws_cull_negsub_sites;
+    // `sltiu rt,rs,imm` where rs is an ANDI-masked 16-bit screen X.
+    // Widens both edges in 16-bit space; empty by default; regen required.
+    std::vector<uint32_t> ws_cull_vxrange_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

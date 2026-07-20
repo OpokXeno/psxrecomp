@@ -1048,6 +1048,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
     std::vector<uint32_t> ws_cull_negsub_sites;
+    std::vector<uint32_t> ws_cull_vxrange_sites;
     int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
@@ -1071,6 +1072,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
             load_sites("negsub_sites", ws_cull_negsub_sites);
+            load_sites("vxrange_sites", ws_cull_vxrange_sites);
             if (cull.contains("guard_pixels")) {
                 ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
                 if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
@@ -1222,6 +1224,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
         /*ws_cull_negsub_sites*/  ws_cull_negsub_sites,
+        /*ws_cull_vxrange_sites*/ ws_cull_vxrange_sites,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,

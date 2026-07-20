@@ -346,6 +346,18 @@ void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites) {
 int psx_ws_is_cull_negsub_site(uint32_t pc) {
     return ws_explicit_site(ws_explicit_negsub_sites, ws_explicit_negsub_n, pc);
 }
+static uint32_t ws_explicit_vxrange_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_vxrange_n = 0;
+void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_vxrange_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_vxrange_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_vxrange_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_vxrange_sites, ws_explicit_vxrange_n, pc);
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
@@ -920,6 +932,12 @@ int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
  * branch predicate. Identity at margin 0 (4:3). */
 int psx_ws_cull_bltz(uint32_t v) {
     return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
+}
+int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
+    int32_t margin = psx_ws_x_margin();
+    uint32_t bound = (uint32_t)(int32_t)(int16_t)(uint16_t)imm;
+    return (((x + (uint32_t)margin) & 0xFFFFu) <
+            (bound + 2u * (uint32_t)margin)) ? 1 : 0;
 }
 
 /* ---- Cull signature configuration ([widescreen.cull] screen_w_imms /
