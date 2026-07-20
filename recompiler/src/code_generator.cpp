@@ -936,6 +936,22 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // overlay variant: addr is different code here — fall through to vanilla.
     }
+    // Explicit horizontal low-edge widen for negate-form classifiers:
+    // `subu rd, zero, rt` computes -bound; subtracting the horizontal margin
+    // moves that bound left. Identity at 4:3.
+    if (config_.ws_cull_negsub_sites.count(addr)) {
+        if (opcode == 0x00 && funct == 0x23 && get_rs(instr) == 0) {
+            uint32_t rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = 0u - {} - (uint32_t)psx_ws_x_margin();"
+                               "  /* ws cull negsub */{}",
+                               reg_name(rd), reg_name(rt), comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] negsub site 0x{:08X} is not "
+                       "subu rD,zero,rT (0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). The
     // site is the `sh rt,off(base)` storing a parallax 2D backdrop layer's
     // final screen-X; squash the stored value around the screen centre so the

@@ -1385,7 +1385,10 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             return 0;
         case 0x22: /* SUB - overflow traps are delegated if they occur. */
         case 0x23: /* SUBU */
-            cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
+            if (rs == 0 && psx_ws_is_cull_negsub_site(pc))
+                cpu->gpr[rd] = 0u - cpu->gpr[rt] - (uint32_t)psx_ws_x_margin();
+            else
+                cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
         case 0x24: /* AND */
