@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import json
+import sys
 import tempfile
 import unittest
 import zlib
@@ -58,6 +59,58 @@ const PsxNativeStub psx_bios_native_stubs[1] = {
         self.assertEqual(result['missed_entry_crc'], 1)
         self.assertEqual(result['recall_entry_crc'], 0.5)
         self.assertEqual(result['entry_crc_misses'], [(0x100, 0xAAAA)])
+
+    def test_exact_candidate_misses_persist_variants_grouped_by_region(self):
+        misses = [(0xA0001234, 0x1AAAAAAAA), (0x1234, 0xBBBBBBBB),
+                  (0x2450, 0xCCCCCCCC)]
+        self.assertEqual(coverage_report.candidate_miss_records(misses), [
+            {'entry': '0x80001234', 'code_crc': 'AAAAAAAA'},
+            {'entry': '0x80001234', 'code_crc': 'BBBBBBBB'},
+            {'entry': '0x80002450', 'code_crc': 'CCCCCCCC'},
+        ])
+        self.assertEqual(
+            coverage_report.group_candidate_misses_by_region(misses), {
+                '0x80001000': [
+                    {'entry': '0x80001234', 'code_crc': 'AAAAAAAA'},
+                    {'entry': '0x80001234', 'code_crc': 'BBBBBBBB'},
+                ],
+                '0x80002000': [
+                    {'entry': '0x80002450', 'code_crc': 'CCCCCCCC'},
+                ],
+            })
+
+    def test_main_persists_and_summarizes_exact_candidate_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            static = os.path.join(tmp, 'static')
+            vault = os.path.join(tmp, 'vault')
+            os.makedirs(static)
+            os.makedirs(vault)
+            with open(os.path.join(static, 'static.ranges'), 'w',
+                      encoding='utf-8') as out:
+                out.write('F 80001234 BBBBBBBB\nR 80001234 8\n')
+            with open(os.path.join(vault, 'vault.ranges'), 'w',
+                      encoding='utf-8') as out:
+                out.write('F 80001234 AAAAAAAA\nR 80001234 8\n')
+                out.write('F 80001234 BBBBBBBB\nR 80001234 8\n')
+            out_md = os.path.join(tmp, 'gaps.md')
+            out_json = os.path.join(tmp, 'gaps.json')
+            argv = [
+                'coverage_report.py', '--static', static, '--vault', vault,
+                '--game', 'TEST', '--out-md', out_md, '--out-json', out_json,
+            ]
+            with mock.patch.object(sys, 'argv', argv):
+                coverage_report.main()
+            with open(out_json, encoding='utf-8') as source:
+                report = json.load(source)
+            with open(out_md, encoding='utf-8') as source:
+                markdown = source.read()
+        expected = [{'entry': '0x80001234', 'code_crc': 'AAAAAAAA'}]
+        self.assertEqual(report['vault_entry_crc_misses'], expected)
+        self.assertEqual(report['vault_entry_crc_misses_by_region'], {
+            '0x80001000': expected,
+        })
+        self.assertIn('`0x80001000`: **1** missing candidate variant(s)',
+                      markdown)
 
     def test_interval_containment_does_not_count_as_crc_candidate(self):
         result = coverage_report.recall(
