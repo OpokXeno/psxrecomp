@@ -1650,6 +1650,15 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (cop_op == 0x10 && fnt == 0x10) { /* RFE */
             uint32_t sr = cpu->cop0[12];
             cpu->cop0[12] = (sr & 0xFFFFFFF0u) | ((sr >> 2) & 0x0Fu);
+            /* Backend contract parity (overlay_api.h v12; the emitter calls
+             * this after every recompiled rfe): inside the synchronous
+             * handler window this arms the host escape taken at the next
+             * committed transfer. Without it an interpreted handler whose
+             * post-RFE EPC lands in dirty RAM keeps interpreting flat inside
+             * psx_check_interrupts' window — in_exception never clears, the
+             * cycle-paced VBlank authority is vetoed forever, and the guest
+             * livelocks in the kernel idle loop (dbg-build boot wedge). */
+            psx_rfe_mark_escape();
             return 0;
         }
         return abort_unsupported(pc, insn, "COP0 op");
@@ -2483,6 +2492,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
                 OV_FPLOG_RET1();
             }
+            /* Trampoline contract parity (full_function_emitter emits this
+             * check after every compiled function return): the transfer that
+             * just committed may be the jr whose delay-slot RFE armed the
+             * host escape — cpu->pc now holds the real EPC, so take the
+             * escape BEFORE local dirty flow can continue interpreting the
+             * resumed code inside the handler's host window. Same-fiber: this
+             * longjmps to the psx_check_interrupts frame that dispatched the
+             * handler (its epilogue restores in_exception and it returns with
+             * cpu->pc = EPC through the existing pump-boundary redirect).
+             * Foreign fiber: declines, and the normal surfacing below applies. */
+            if (g_rfe_escape_pending)
+                psx_rfe_escape_check(cpu);
             uint32_t target = cpu->pc;
             if (target != 0u && dirty_ram_pump_boundary(cpu, target, 1)) {
                 g_dirty_ram_blocks_run++;

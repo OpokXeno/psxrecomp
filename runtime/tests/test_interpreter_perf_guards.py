@@ -97,6 +97,20 @@ def main():
     dispatch_inner = body(interp, "dirty_ram_dispatch_inner")
     if "(!current_page_dirty || next_page != current_page)" not in dispatch_inner:
         raise AssertionError("page fast path does not preserve clean-miss behavior")
+    # RFE backend-contract parity: the recompiled rfe and every overlay shard
+    # (ABI v12) call psx_rfe_mark_escape after popping SR, and the generated
+    # trampoline runs psx_rfe_escape_check after each return. The interpreter
+    # must do BOTH — mark at its RFE case and take the escape at the committed
+    # transfer — or an interpreted handler whose EPC lands in dirty RAM keeps
+    # interpreting inside psx_check_interrupts' window and in_exception never
+    # clears (vblank vetoed forever: the dbg-build boot livelock).
+    if "psx_rfe_mark_escape();" not in interp:
+        raise AssertionError("interpreter RFE does not honor the rfe escape contract")
+    rfe_take = dispatch_inner.find("psx_rfe_escape_check(cpu);")
+    local_flow = dispatch_inner.find("allow_local_dirty_flow && target != 0")
+    if rfe_take < 0 or local_flow < 0 or rfe_take > local_flow:
+        raise AssertionError(
+            "interpreter does not take a pending rfe escape before local dirty flow")
 
     dispatch = body(loader, "overlay_loader_dispatch")
     cached = dispatch.find("lazy_miss_cached(phys)")

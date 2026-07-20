@@ -3,7 +3,13 @@ param(
     [string]$Mode = 'hybrid',
     [switch]$Launch,
     [int]$DebugPort = 4615,
-    [string]$GameRoot = ''
+    [string]$GameRoot = '',
+    # Which isolated build variant to run. 'build-tomba2-interp-iso-rel' is the
+    # production-config measurement (PSX_DEBUG_TOOLS=OFF: no TCP server, FPS
+    # only via the stderr log); 'build-tomba2-interp-iso-dbg' adds the TCP
+    # debug surface (screenshots/telemetry/input) at some hot-path overhead.
+    # Each variant keeps its OWN cache dir, so cold-cache runs stay repeatable.
+    [string]$BuildDir = 'build-tomba2-interp-iso-rel'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +48,7 @@ $GameRoot = (Resolve-Path $GameRoot).Path
 # step is gone because the isolated build dir + isolated exe name make the
 # alias unnecessary; build-tomba2-perf-rel itself is left untouched as
 # evidence of the original shared-checkout measurement.
-$buildDir = Join-Path $repoRoot 'runtime\build-tomba2-interp-iso-rel'
+$buildDir = Join-Path $repoRoot (Join-Path 'runtime' $BuildDir)
 $isolatedExe = Join-Path $buildDir 'Tomba2InterpPerf.exe'
 $gameConfig = Join-Path $GameRoot 'game.toml'
 $bios = Join-Path $workspaceRoot 'psxrecomp\bios\SCPH1001.BIN'
