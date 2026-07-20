@@ -31,6 +31,7 @@
 #include "psx_icache.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern void psx_advance_cycles(uint32_t cycles);
 
@@ -55,6 +56,41 @@ int psx_icache_enabled(void) {
 uint32_t g_psx_icache_tv[1024];
 int g_psx_icache_active = -1;
 
+/* Whole-call shadow: a transactional view of the cache tags so an AOT/diff
+ * shadow replay can evolve the cache from the recorded entry state and then
+ * restore the live view (master's shadow machinery, retargeted at the global
+ * tag array the interpreter fast path exports). */
+static uint32_t s_icache_shadow_entry[1024];
+static uint32_t s_icache_shadow_live[1024];
+static int      s_icache_shadow_state = 0; /* 0 none, 1 recorded, 2 replay */
+
+int psx_icache_shadow_record_begin(void) {
+    if (s_icache_shadow_state != 0) return 0;
+    memcpy(s_icache_shadow_entry, g_psx_icache_tv, sizeof g_psx_icache_tv);
+    s_icache_shadow_state = 1;
+    return 1;
+}
+
+int psx_icache_shadow_replay_begin(void) {
+    if (s_icache_shadow_state != 1) return 0;
+    memcpy(s_icache_shadow_live, g_psx_icache_tv, sizeof g_psx_icache_tv);
+    memcpy(g_psx_icache_tv, s_icache_shadow_entry, sizeof g_psx_icache_tv);
+    s_icache_shadow_state = 2;
+    return 1;
+}
+
+void psx_icache_shadow_replay_end(void) {
+    if (s_icache_shadow_state != 2) return;
+    memcpy(g_psx_icache_tv, s_icache_shadow_live, sizeof g_psx_icache_tv);
+    s_icache_shadow_state = 0;
+}
+
+void psx_icache_shadow_abort(void) {
+    if (s_icache_shadow_state == 2)
+        memcpy(g_psx_icache_tv, s_icache_shadow_live, sizeof g_psx_icache_tv);
+    s_icache_shadow_state = 0;
+}
+
 void psx_icache_reset(void) {
     g_psx_icache_active = psx_icache_enabled();
     for (int i = 0; i < 1024; i++) g_psx_icache_tv[i] = 0x1u;
@@ -63,7 +99,11 @@ void psx_icache_reset(void) {
 /* Charge the fetch cost for the instruction at `addr` and update the cache tags.
  * `addr` is the runtime guest virtual PC (aligned). Gated on PSX_ENABLE_BLOCK_CYCLES. */
 void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
-    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global icache mutation */
+    { extern int g_ls_replay_active;
+      /* Ordinary lockstep replay must not perturb the shared cache. The whole-
+       * call shadow owns a private transactional cache view and may evolve it. */
+      if (g_ls_replay_active && s_icache_shadow_state != 2) return;
+    }
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     if (g_psx_icache_active < 0) g_psx_icache_active = psx_icache_enabled();
     if (!g_psx_icache_active) return;

@@ -33,6 +33,13 @@ void overlay_capture_init(const char *out_dir);
  * overlay_capture_on_dma() and overlay_capture_write_json() are no-ops. */
 void overlay_capture_set_enabled(int enabled);
 
+/* Opt-in durable history. When enabled, every changed coherent latest snapshot
+ * is appended to overlay_captures.addendum.jsonl beside the executable. If
+ * persist_dir is non-empty, the same snapshot is also copied atomically to one
+ * new immutable JSON file there. game_id is used only in safe filenames. */
+void overlay_capture_configure_history(int enabled, const char *persist_dir,
+                                       const char *game_id);
+
 /* Call from dma.c execute_ch3_cdrom() after every forward CH3 transfer with
  * load_start < 0x1C0000 and fntrace_is_game_started().
  * load_addr is the physical RAM destination, size is byte count,
@@ -61,6 +68,8 @@ int overlay_capture_count(void);
  * when [runtime] overlay_autocompile_cmd is configured. */
 void overlay_autocapture_set_enabled(int on);
 void overlay_autocapture_tick(void);
+/* Join any in-flight atomic writer before the final shutdown snapshot. */
+void overlay_autocapture_shutdown(void);
 void overlay_autocapture_get_status(int *enabled, uint32_t *triggers,
                                     uint64_t *last_delta);
 

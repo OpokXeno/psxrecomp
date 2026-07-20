@@ -266,6 +266,8 @@ function(psxrecomp_add_runtime_target target)
     set(oneValueArgs
         GAME_GENERATED_DISPATCH_C
         GAME_OVERLAY_STATIC_C
+        BIOS_GENERATED_FULL_C
+        BIOS_GENERATED_DISPATCH_C
         DEBUG_PORT
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
@@ -310,7 +312,14 @@ function(psxrecomp_add_runtime_target target)
         set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")
     endif()
 
-    set(generated_sources ${PSXRECOMP_BIOS_GENERATED})
+    if(PSXRT_BIOS_GENERATED_FULL_C AND PSXRT_BIOS_GENERATED_DISPATCH_C)
+        set(generated_sources
+            "${PSXRT_BIOS_GENERATED_FULL_C}"
+            "${PSXRT_BIOS_GENERATED_DISPATCH_C}")
+        set_source_files_properties(${generated_sources} PROPERTIES GENERATED TRUE)
+    else()
+        set(generated_sources ${PSXRECOMP_BIOS_GENERATED})
+    endif()
     if(PSXRT_GAME_GENERATED_FULL_C)
         foreach(_full_src IN LISTS PSXRT_GAME_GENERATED_FULL_C)
             set_source_files_properties("${_full_src}" PROPERTIES GENERATED TRUE)

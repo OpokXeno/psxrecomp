@@ -138,6 +138,19 @@ struct RuntimeConfig {
     // overlay bytes to overlay_captures.json for offline compilation.
     bool                  overlay_cache = false;
 
+    // overlay_capture_history: opt-in durable capture history. The runtime
+    // keeps overlay_captures.json as an atomic latest snapshot for the live
+    // compiler and additionally appends every changed coherent snapshot to
+    // overlay_captures.addendum.jsonl beside the executable. A malformed tail
+    // from a hard kill cannot destroy earlier records.
+    bool                  overlay_capture_history = false;
+
+    // overlay_capture_persist_dir: optional DEV-only, project-relative safe
+    // directory for one immutable JSON file per changed snapshot. Absolute
+    // paths and `..` components are rejected. Production normally leaves this
+    // unset and retains only the addendum beside the executable.
+    std::string           overlay_capture_persist_dir;
+
     // turbo_loads: OPT-IN per game. While the game is loading (CD data
     // stream active, XA/FMV excluded, post-BIOS-handoff only) the frontend
     // skips wall-clock pacing so the guest runs at host speed — compressing

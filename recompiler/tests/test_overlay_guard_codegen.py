@@ -71,9 +71,9 @@ def gen_c(recompiler, overlay, tmp):
                          f"{r.stderr or r.stdout}")
     # Overlay mode emits one *_full.c; static mode may shard it as
     # *_full_00.c, *_full_01.c, ... . Inspect the complete generated body in
-    # either representation.
+    # either representation, excluding the dispatch TU.
     full = sorted(f for f in os.listdir(out)
-                  if "_full" in f and f.endswith(".c"))
+                  if "_full" in f and f.endswith(".c") and "_dispatch" not in f)
     if not full:
         raise SystemExit(f"no _full*.c emitted in {out}")
     chunks = []

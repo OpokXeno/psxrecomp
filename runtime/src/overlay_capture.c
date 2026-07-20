@@ -6,7 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
+#include <time.h>
 #include <SDL.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -54,6 +63,16 @@ static SDL_mutex *s_commit_mutex;
 static SDL_atomic_t s_snapshot_seq;
 static uint64_t s_latest_commit_seq;
 
+static int      s_history_enabled = 0;
+static char     s_history_addendum[600];
+static char     s_history_persist_dir[600];
+static char     s_history_game_id[64];
+static char     s_history_session[64];
+static uint32_t s_history_sequence;
+static uint64_t s_history_last_sig;
+static int      s_history_written;
+static SDL_atomic_t s_autocap_write_state; /* 0 idle, 1 writing, 2 complete */
+
 static uint64_t capture_next_sequence(void)
 {
     /* Never contend with the writer's long-held file commit mutex here: this
@@ -63,6 +82,83 @@ static uint64_t capture_next_sequence(void)
 
 static int preserve_snapshot_async(uint32_t scope_lo, uint32_t scope_hi);
 static int preserve_writer_start(void);
+
+static int capture_process_id(void)
+{
+#ifdef _WIN32
+    return _getpid();
+#else
+    return (int)getpid();
+#endif
+}
+
+static void sanitize_filename(char *dst, size_t dst_size, const char *src)
+{
+    size_t out = 0;
+    if (!dst_size) return;
+    while (src && *src && out + 1 < dst_size) {
+        unsigned char c = (unsigned char)*src++;
+        dst[out++] = (char)(isalnum(c) || c == '-' || c == '_' ? c : '_');
+    }
+    dst[out] = '\0';
+}
+
+static int sync_file(FILE *f)
+{
+    if (fflush(f) != 0) return 0;
+#ifdef _WIN32
+    return _commit(_fileno(f)) == 0;
+#else
+    return fsync(fileno(f)) == 0;
+#endif
+}
+
+static int atomic_replace_file(const char *tmp_path, const char *path)
+{
+#ifdef _WIN32
+    return MoveFileExA(tmp_path, path,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(tmp_path, path) == 0;
+#endif
+}
+
+static uint64_t capture_file_sig(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint64_t h = 1469598103934665603ull;
+    unsigned char buf[65536];
+    size_t n, i;
+    if (!f) return 0;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        for (i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+    if (ferror(f)) h = 0;
+    fclose(f);
+    return h;
+}
+
+/* Directory portion of `path` (no trailing separator); "." when `path` has
+ * no separator. Colocates durable-history bookkeeping (the addendum.jsonl
+ * and optional persist_dir copies) with whichever canonical capture manifest
+ * path is currently configured, whether that came from
+ * overlay_capture_set_out_dir or the game-specific overlay_capture_set_path. */
+static void capture_path_dirname(char *dst, size_t dst_size, const char *path)
+{
+    const char *cut = strrchr(path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!cut || bslash > cut)) cut = bslash;
+#endif
+    if (!dst_size) return;
+    if (cut) {
+        size_t len = (size_t)(cut - path);
+        if (len >= dst_size) len = dst_size - 1;
+        memcpy(dst, path, len);
+        dst[len] = '\0';
+    } else {
+        snprintf(dst, dst_size, ".");
+    }
+}
 
 /* ---- Base64 encoder ----------------------------------------------------- */
 
@@ -115,6 +211,50 @@ void overlay_capture_init(const char *out_dir)
 void overlay_capture_set_enabled(int enabled)
 {
     s_enabled = enabled ? 1 : 0;
+}
+
+void overlay_capture_configure_history(int enabled, const char *persist_dir,
+                                       const char *game_id)
+{
+    time_t now;
+    struct tm tm_now;
+    char stamp[32];
+    s_history_enabled = enabled ? 1 : 0;
+    s_history_persist_dir[0] = '\0';
+    s_history_sequence = 0;
+    s_history_last_sig = 0;
+    s_history_written = 0;
+    sanitize_filename(s_history_game_id, sizeof(s_history_game_id),
+                      game_id && game_id[0] ? game_id : "UNKNOWN");
+    if (persist_dir && persist_dir[0]) {
+        snprintf(s_history_persist_dir, sizeof(s_history_persist_dir), "%s",
+                 persist_dir);
+    }
+    {
+        char dir[512];
+        capture_path_dirname(dir, sizeof(dir),
+                             s_capture_path[0] ? s_capture_path
+                                               : "overlay_captures.json");
+        snprintf(s_history_addendum, sizeof(s_history_addendum),
+                 "%s/overlay_captures.addendum.jsonl", dir);
+    }
+
+    now = time(NULL);
+#ifdef _WIN32
+    gmtime_s(&tm_now, &now);
+#else
+    gmtime_r(&now, &tm_now);
+#endif
+    strftime(stamp, sizeof(stamp), "%Y%m%dT%H%M%SZ", &tm_now);
+    snprintf(s_history_session, sizeof(s_history_session), "%s-p%d",
+             stamp, capture_process_id());
+    if (s_history_enabled) {
+        fprintf(stdout,
+                "psxrecomp: durable overlay capture history enabled (%s%s%s)\n",
+                s_history_addendum,
+                s_history_persist_dir[0] ? "; immutable dir=" : "",
+                s_history_persist_dir[0] ? s_history_persist_dir : "");
+    }
 }
 
 void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
@@ -311,7 +451,7 @@ static int write_json_snapshot(const char *path, uint32_t bw,
     uint32_t page_sz;
     int      first_region;
     page_sz = 4096u;
-    f = fopen(path, "w");
+    f = fopen(path, "wb");
     if (!f) return 0;
 
     fprintf(f, "[\n");
@@ -336,27 +476,11 @@ static int write_json_snapshot(const char *path, uint32_t bw,
                       exec_pc_bitmap, ram_base);
 
     fprintf(f, "\n]\n");
-    if (ferror(f) || fflush(f) != 0 || CAPTURE_FSYNC(f) != 0) {
-        fclose(f);
-        remove(path);
-        return 0;
+    {
+        int ok = !ferror(f) && sync_file(f);
+        if (fclose(f) != 0) ok = 0;
+        return ok;
     }
-    if (fclose(f) != 0) { remove(path); return 0; }
-    return 1;
-}
-
-static uint64_t capture_file_sig(const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    uint64_t h = 1469598103934665603ull;
-    unsigned char buf[65536];
-    size_t n, i;
-    if (!f) return 0;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-        for (i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ull; }
-    if (ferror(f)) h = 0;
-    fclose(f);
-    return h;
 }
 
 static int capture_copy_file(const char *src, const char *dst)
@@ -397,22 +521,185 @@ static int capture_files_equal(const char *a, const char *b)
     return equal;
 }
 
-static int capture_replace_file(const char *src, const char *dst)
+static int copy_file_atomic(const char *src_path, const char *dst_path)
 {
-#ifdef _WIN32
-    return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING |
-                       MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    return rename(src, dst) == 0;
-#endif
+    char tmp_path[700];
+    unsigned char buf[65536];
+    FILE *src, *dst;
+    size_t n;
+    int ok = 1;
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp-p%d", dst_path,
+             capture_process_id());
+    src = fopen(src_path, "rb");
+    if (!src) return 0;
+    dst = fopen(tmp_path, "wb");
+    if (!dst) { fclose(src); return 0; }
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) { ok = 0; break; }
+    }
+    if (ferror(src)) ok = 0;
+    fclose(src);
+    if (ok) ok = sync_file(dst);
+    if (fclose(dst) != 0) ok = 0;
+    if (!ok || !atomic_replace_file(tmp_path, dst_path)) {
+        remove(tmp_path);
+        return 0;
+    }
+    return 1;
 }
 
-/* Persist one coherent snapshot twice, for two deliberately different roles:
+/* Append the canonical JSON array as one minified JSONL record. Whitespace is
+ * stripped only outside strings, so bytes_b64 remains byte-for-byte intact.
+ * A crash can damage only the final line; every earlier launch remains a valid
+ * independently parseable record. */
+static int append_history_record(const char *snapshot_path, const char *reason,
+                                 uint64_t sig, uint32_t sequence)
+{
+    FILE *src = fopen(snapshot_path, "rb");
+    FILE *dst, *tail;
+    int c, in_string = 0, escape = 0, ok = 1;
+    int needs_separator = 0;
+    if (!src) return 0;
+    tail = fopen(s_history_addendum, "rb");
+    if (tail) {
+        if (fseek(tail, -1, SEEK_END) == 0) {
+            c = fgetc(tail);
+            needs_separator = c != '\n';
+        }
+        fclose(tail);
+    }
+    dst = fopen(s_history_addendum, "ab");
+    if (!dst) { fclose(src); return 0; }
+    /* Quarantine an incomplete final record from a previous hard kill. */
+    if (needs_separator && fputc('\n', dst) == EOF) ok = 0;
+    if (ok && fprintf(dst,
+            "{\"schema\":\"psxrecomp overlay capture addendum v1\","
+            "\"game\":\"%s\",\"session\":\"%s\",\"sequence\":%u,"
+            "\"reason\":\"%s\",\"fnv64\":\"%016llX\",\"captures\":",
+            s_history_game_id, s_history_session, sequence,
+            reason ? reason : "snapshot", (unsigned long long)sig) < 0) ok = 0;
+    while (ok && (c = fgetc(src)) != EOF) {
+        if (in_string) {
+            if (fputc(c, dst) == EOF) { ok = 0; break; }
+            if (escape) escape = 0;
+            else if (c == '\\') escape = 1;
+            else if (c == '"') in_string = 0;
+        } else {
+            if (c == '"') {
+                in_string = 1;
+                if (fputc(c, dst) == EOF) { ok = 0; break; }
+            } else if (!isspace((unsigned char)c)) {
+                if (fputc(c, dst) == EOF) { ok = 0; break; }
+            }
+        }
+    }
+    if (ferror(src) || in_string) ok = 0;
+    fclose(src);
+    if (ok && fprintf(dst, "}\n") < 0) ok = 0;
+    if (ok) ok = sync_file(dst);
+    if (fclose(dst) != 0) ok = 0;
+    return ok;
+}
+
+static int write_json_string(FILE *dst, const char *value)
+{
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    if (fputc('"', dst) == EOF) return 0;
+    for (; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (fputc('\\', dst) == EOF || fputc(*p, dst) == EOF) return 0;
+        } else if (*p < 0x20) {
+            if (fprintf(dst, "\\u%04X", (unsigned)*p) < 0) return 0;
+        } else if (fputc(*p, dst) == EOF) {
+            return 0;
+        }
+    }
+    return fputc('"', dst) != EOF;
+}
+
+/* Dev persistence already owns an atomically published immutable full JSON
+ * snapshot. Append only a durable reference to it instead of embedding the
+ * same multi-megabyte capture array again every autocap interval. Production
+ * configs without persist_dir continue to use the self-contained v1 record. */
+static int append_history_reference(const char *persist_path, const char *reason,
+                                    uint64_t sig, uint32_t sequence)
+{
+    FILE *dst, *tail;
+    int c, needs_separator = 0, ok = 1;
+    tail = fopen(s_history_addendum, "rb");
+    if (tail) {
+        if (fseek(tail, -1, SEEK_END) == 0) {
+            c = fgetc(tail);
+            needs_separator = c != '\n';
+        }
+        fclose(tail);
+    }
+    dst = fopen(s_history_addendum, "ab");
+    if (!dst) return 0;
+    if (needs_separator && fputc('\n', dst) == EOF) ok = 0;
+    if (ok && fprintf(dst,
+            "{\"schema\":\"psxrecomp overlay capture addendum v2\","
+            "\"game\":\"%s\",\"session\":\"%s\",\"sequence\":%u,"
+            "\"reason\":\"%s\",\"fnv64\":\"%016llX\",\"snapshot\":",
+            s_history_game_id, s_history_session, sequence,
+            reason ? reason : "snapshot", (unsigned long long)sig) < 0) ok = 0;
+    if (ok) ok = write_json_string(dst, persist_path);
+    if (ok && fputs("}\n", dst) == EOF) ok = 0;
+    if (ok) ok = sync_file(dst);
+    if (fclose(dst) != 0) ok = 0;
+    return ok;
+}
+
+static void persist_history_snapshot(const char *snapshot_path,
+                                     const char *reason, uint64_t sig)
+{
+    char persist_path[800];
+    uint32_t sequence;
+    int addendum_saved;
+    int persist_saved = s_history_persist_dir[0] ? 0 : 1;
+    if (!s_history_enabled || !sig) return;
+    if (s_history_written && sig == s_history_last_sig) return;
+    sequence = ++s_history_sequence;
+
+    if (s_history_persist_dir[0]) {
+        snprintf(persist_path, sizeof(persist_path),
+                 "%s/%s_%s_%04u_%016llX.json",
+                 s_history_persist_dir, s_history_game_id, s_history_session,
+                 sequence, (unsigned long long)sig);
+        if (copy_file_atomic(snapshot_path, persist_path)) persist_saved = 1;
+        else fprintf(stderr,
+            "psxrecomp: failed to persist overlay capture snapshot %s\n",
+            persist_path);
+    }
+    if (s_history_persist_dir[0] && persist_saved)
+        addendum_saved = append_history_reference(
+            persist_path, reason, sig, sequence);
+    else
+        addendum_saved = append_history_record(
+            snapshot_path, reason, sig, sequence);
+    if (!addendum_saved)
+        fprintf(stderr, "psxrecomp: failed to append overlay capture history %s\n",
+                s_history_addendum);
+    /* Retry an unchanged snapshot if either configured durable sink failed.
+     * Repeated addendum records or immutable files are harmless: vault merges
+     * are content-keyed and idempotent. */
+    if (addendum_saved && persist_saved) {
+        s_history_last_sig = sig;
+        s_history_written = 1;
+    }
+}
+
+/* Persist one coherent snapshot for three deliberately different roles:
  *   - capture_path is the legacy/latest manifest consumed by existing tools;
- *   - capture_path.d/<content-hash>.json is immutable additive history.
- * compile_overlays.py unions both. Different byte variants at the same load
- * address therefore survive future captures, rebuilds, and regenerations. */
-static uint64_t capture_commit_temp(const char *temp_path, uint64_t sequence)
+ *   - capture_path.d/<content-hash>.json is immutable additive history used
+ *     by compile_overlays.py / the coverage vault;
+ *   - (opt-in) overlay_captures.addendum.jsonl (+ persist_dir) is a durable
+ *     session-tagged history log for auditing/regeneration across restarts.
+ * compile_overlays.py unions the first two. Different byte variants at the
+ * same load address therefore survive future captures, rebuilds, and
+ * regenerations. */
+static uint64_t capture_commit_temp(const char *temp_path, const char *reason,
+                                    uint64_t sequence)
 {
     char contribution_dir[900];
     char contribution[1024];
@@ -446,7 +733,7 @@ static uint64_t capture_commit_temp(const char *temp_path, uint64_t sequence)
         snprintf(contribution_tmp, sizeof(contribution_tmp), "%s.%lu.%llu.tmp",
                  contribution, CAPTURE_PID(), (unsigned long long)sequence);
         if (capture_copy_file(temp_path, contribution_tmp) &&
-            capture_replace_file(contribution_tmp, contribution)) {
+            atomic_replace_file(contribution_tmp, contribution)) {
             history_ok = 1;
         } else {
             remove(contribution_tmp);
@@ -459,7 +746,7 @@ static uint64_t capture_commit_temp(const char *temp_path, uint64_t sequence)
      * allowed to replace the compatibility/latest path. Immutable history is
      * authoritative for additivity and is never discarded by this ordering. */
     if (sequence >= s_latest_commit_seq) {
-        base_ok = capture_replace_file(temp_path, s_capture_path);
+        base_ok = atomic_replace_file(temp_path, s_capture_path);
         if (base_ok) s_latest_commit_seq = sequence;
         else {
             remove(temp_path);
@@ -471,7 +758,12 @@ static uint64_t capture_commit_temp(const char *temp_path, uint64_t sequence)
     }
     if (s_commit_mutex) SDL_UnlockMutex(s_commit_mutex);
     /* A durable immutable contribution is sufficient to advance the evidence
-     * epoch. A failed latest-copy update is noisy but cannot lose that history. */
+     * epoch. A failed latest-copy update is noisy but cannot lose that history.
+     * Persist history from the immutable contribution file (not the racy
+     * "latest" path, which another writer can replace at any time), and
+     * outside the commit lock since durable-history I/O (an optional
+     * persist_dir copy plus a JSONL append) can be comparatively slow. */
+    if (history_ok) persist_history_snapshot(contribution, reason, sig);
     return history_ok ? sig : 0;
 }
 
@@ -480,6 +772,7 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
                                           const uint32_t *dispatch_pc_bitmap,
                                           const uint32_t *exec_pc_bitmap,
                                           const uint8_t *ram_base,
+                                          const char *reason,
                                           uint64_t sequence)
 {
     char temp_path[840];
@@ -488,10 +781,10 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
     if (!write_json_snapshot(temp_path, bw, bitmap, dispatch_pc_bitmap,
                              exec_pc_bitmap, ram_base))
         return 0;
-    return capture_commit_temp(temp_path, sequence);
+    return capture_commit_temp(temp_path, reason, sequence);
 }
 
-static uint64_t overlay_capture_write_current(void)
+static uint64_t overlay_capture_write_current(const char *reason)
 {
     extern uint8_t *memory_get_ram_ptr(void);
     uint32_t bw = dirty_ram_get_bitmap_word_count();
@@ -505,6 +798,7 @@ static uint64_t overlay_capture_write_current(void)
                                     g_dirty_ram_dispatch_pc_bitmap,
                                     g_dirty_ram_exec_pc_bitmap,
                                     memory_get_ram_ptr(),
+                                    reason,
                                     capture_next_sequence());
     free(bitmap);
     return sig;
@@ -512,7 +806,7 @@ static uint64_t overlay_capture_write_current(void)
 
 void overlay_capture_write_json(void)
 {
-    (void)overlay_capture_write_current();
+    (void)overlay_capture_write_current("shutdown-or-manual");
 }
 
 void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
@@ -551,7 +845,7 @@ void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
          * Fall back to a synchronous durable commit rather than let the RAM
          * overwrite bind old evidence to new bytes. If storage itself fails,
          * report the unavoidable loss but still clear the stale association. */
-        if (!overlay_capture_write_current())
+        if (!overlay_capture_write_current("preserve-sync-fallback"))
             fprintf(stderr,
                 "psxrecomp: ERROR: could not preserve outgoing overlay evidence; discarding stale epoch\n");
     }
@@ -637,7 +931,6 @@ typedef struct {
     uint64_t retry_frame;
     unsigned attempts;
 } AutocapWriteJob;
-static SDL_atomic_t s_autocap_write_state; /* 0 idle, 1 writing, 2 complete */
 static SDL_Thread *s_autocap_write_thread;
 static AutocapWriteJob *s_autocap_write_job;
 
@@ -702,7 +995,7 @@ static int autocap_write_thread_main(void *opaque)
     SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
     job->manifest_sig = write_and_commit_snapshot(
         job->bitmap_words, job->bitmap, job->dispatch_pc_bitmap,
-        job->exec_pc_bitmap, job->ram, job->sequence);
+        job->exec_pc_bitmap, job->ram, "autocap", job->sequence);
     SDL_AtomicSet(&s_autocap_write_state, 2);
     return 0;
 }
@@ -881,7 +1174,7 @@ static int preserve_write_thread_main(void *opaque)
         job->snapshot.manifest_sig = write_and_commit_snapshot(
             job->snapshot.bitmap_words, job->snapshot.bitmap,
             job->snapshot.dispatch_pc_bitmap, job->snapshot.exec_pc_bitmap,
-            job->snapshot.ram, job->snapshot.sequence);
+            job->snapshot.ram, "preserve-outgoing", job->snapshot.sequence);
         if (!job->snapshot.manifest_sig) {
             job->attempts++;
             SDL_LockMutex(s_preserve_mutex);
@@ -1076,6 +1369,22 @@ void overlay_capture_wait_pending(void)
         SDL_WaitThread(s_preserve_thread, NULL);
         s_preserve_thread = NULL;
     }
+}
+
+void overlay_autocapture_shutdown(void)
+{
+    int state = SDL_AtomicGet(&s_autocap_write_state);
+    if (state == 0) return;
+    if (s_autocap_write_thread) {
+        SDL_WaitThread(s_autocap_write_thread, NULL);
+        s_autocap_write_thread = NULL;
+    }
+    /* The worker atomically published and durably archived the coherent
+     * snapshot before setting state=2. No compiler request is needed while
+     * shutting down; just release its copied inputs before the final snapshot. */
+    autocap_write_job_free(s_autocap_write_job);
+    s_autocap_write_job = NULL;
+    SDL_AtomicSet(&s_autocap_write_state, 0);
 }
 
 uint32_t overlay_capture_get_region_crc(uint32_t region_start,

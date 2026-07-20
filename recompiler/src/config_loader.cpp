@@ -234,6 +234,25 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("overlay_cache")) {
         rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
     }
+    if (runtime.contains("overlay_capture_history")) {
+        rt.overlay_capture_history =
+            toml::find<bool>(runtime, "overlay_capture_history");
+    }
+    if (runtime.contains("overlay_capture_persist_dir")) {
+        rt.overlay_capture_persist_dir =
+            toml::find<std::string>(runtime, "overlay_capture_persist_dir");
+        const std::filesystem::path persist(rt.overlay_capture_persist_dir);
+        if (persist.is_absolute()) {
+            throw std::runtime_error(
+                "runtime.overlay_capture_persist_dir must be project-relative");
+        }
+        for (const auto& component : persist) {
+            if (component == "..") {
+                throw std::runtime_error(
+                    "runtime.overlay_capture_persist_dir must stay inside the project");
+            }
+        }
+    }
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
     }

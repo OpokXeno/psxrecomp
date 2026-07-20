@@ -985,6 +985,7 @@ static void shutdown_runtime(void) {
      * and before ExitProcess can strand a thread inside the loader lock. */
     autocompile_shutdown();
     memcard_flush_all();
+    overlay_autocapture_shutdown();
     overlay_capture_wait_pending();
     overlay_capture_write_json();
     if (sdl_audio_device) {
@@ -3589,6 +3590,26 @@ int main(int argc, char** argv) {
                 std::fprintf(stdout,
                     "psxrecomp: additive overlay capture store = %s (+ .d history)\n",
                     captures_path.string().c_str());
+                std::string capture_persist_dir;
+                if (gc.runtime.overlay_capture_history &&
+                    !gc.runtime.overlay_capture_persist_dir.empty()) {
+                    std::filesystem::path persist =
+                        gc.project_root / gc.runtime.overlay_capture_persist_dir;
+                    std::error_code persist_ec;
+                    std::filesystem::create_directories(persist, persist_ec);
+                    if (persist_ec) {
+                        std::fprintf(stderr,
+                            "psxrecomp: cannot create overlay capture history %s: %s\n",
+                            persist.string().c_str(), persist_ec.message().c_str());
+                    } else {
+                        capture_persist_dir = persist.string();
+                    }
+                }
+                overlay_capture_configure_history(
+                    gc.runtime.overlay_capture_history ? 1 : 0,
+                    capture_persist_dir.empty() ? nullptr :
+                        capture_persist_dir.c_str(),
+                    game_id.c_str());
                 overlay_loader_init(cache_dir.c_str(), game_id.c_str());
                 for (uint32_t addr : gc.runtime.overlay_native_block) {
                     overlay_loader_native_block_add(addr);

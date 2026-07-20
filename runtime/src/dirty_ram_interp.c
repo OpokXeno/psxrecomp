@@ -2685,6 +2685,8 @@ static int      s_ls_trace_n = 0, s_ls_trace_idx = 0;
 static int      s_ls_overflow = 0, s_ls_mismatch = 0;
 static int      s_ls_replay_done = 0;   /* trace exhausted: stop replay (benign count mismatch) */
 static uint32_t s_ls_cur_pc = 0;          /* pc of the instruction being replayed */
+static int      s_ls_shadow_owner = 0;     /* 0 none, 1 record, 2 replay */
+static int      s_ls_shadow_saw_exception = 0;
 static CPUState s_ls_R0;                   /* register snapshot at block entry     */
 static uint32_t s_ls_block = 0;
 static int      s_ls_prev_valid = 0;
@@ -2739,6 +2741,71 @@ void ls_func_set_record_only(int on) { s_lsf_record_only = on; }
 
 void ls_note_exception_entry(void) {
     if (s_lsf_active) s_lsf_saw_irq = 1;
+    if (s_ls_shadow_owner == 1) s_ls_shadow_saw_exception = 1;
+}
+
+int ls_shadow_record_begin(void) {
+    if (s_ls_shadow_owner || g_ls_mode != 0 || g_ls_replay_active ||
+        s_lsf_active || s_ls_prev_valid)
+        return 0;
+    s_ls_trace_n = 0;
+    s_ls_trace_idx = 0;
+    s_ls_overflow = 0;
+    s_ls_mismatch = 0;
+    s_ls_m_kind = 0;
+    s_ls_replay_done = 0;
+    s_ls_shadow_saw_exception = 0;
+    s_ls_shadow_owner = 1;
+    g_ls_mode = 1;
+    return 1;
+}
+
+int ls_shadow_record_end(uint32_t *ops, int *saw_exception) {
+    if (s_ls_shadow_owner != 1) return 0;
+    g_ls_mode = 0;
+    s_ls_shadow_owner = 0;
+    if (ops) *ops = (uint32_t)s_ls_trace_n;
+    if (saw_exception) *saw_exception = s_ls_shadow_saw_exception;
+    return !s_ls_overflow;
+}
+
+int ls_shadow_replay_begin(void) {
+    if (s_ls_shadow_owner || g_ls_mode != 0 || g_ls_replay_active ||
+        s_ls_overflow)
+        return 0;
+    s_ls_trace_idx = 0;
+    s_ls_mismatch = 0;
+    s_ls_m_kind = 0;
+    s_ls_replay_done = 0;
+    s_ls_shadow_owner = 2;
+    g_ls_replay_active = 1;
+    g_ls_mode = 2;
+    return 1;
+}
+
+int ls_shadow_replay_end(uint32_t *ops, int *mismatch_kind,
+                         uint32_t *pc, uint32_t *addr,
+                         uint32_t *expected, uint32_t *actual) {
+    if (s_ls_shadow_owner != 2) return 0;
+    int complete = !s_ls_mismatch && !s_ls_replay_done &&
+                   s_ls_trace_idx == s_ls_trace_n;
+    g_ls_mode = 0;
+    g_ls_replay_active = 0;
+    s_ls_shadow_owner = 0;
+    if (ops) *ops = (uint32_t)s_ls_trace_idx;
+    if (mismatch_kind) *mismatch_kind = s_ls_m_kind;
+    if (pc) *pc = s_ls_m_pc;
+    if (addr) *addr = s_ls_m_addr;
+    if (expected) *expected = s_ls_m_exp;
+    if (actual) *actual = s_ls_m_act;
+    return complete;
+}
+
+void ls_shadow_abort(void) {
+    g_ls_mode = 0;
+    g_ls_replay_active = 0;
+    s_ls_shadow_owner = 0;
+    s_ls_shadow_saw_exception = 0;
 }
 
 void ls_suppress_begin(void) {
@@ -2753,7 +2820,7 @@ uint32_t ls_read_hook(uint32_t addr, int size, uint32_t real_val) {
     if (g_ls_mode == 2) {                 /* replay: serve from trace */
         if (s_ls_trace_idx >= s_ls_trace_n) { s_ls_replay_done = 1; return 0; }  /* count mismatch: benign block-boundary artifact */
         ls_op_t *o = &s_ls_trace[s_ls_trace_idx];
-        if (o->is_write || o->addr != addr) {
+        if (o->is_write || o->size != (uint8_t)size || o->addr != addr) {
             if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 1; s_ls_m_pc = s_ls_cur_pc;
                                   s_ls_m_addr = addr; s_ls_m_exp = addr; s_ls_m_act = o->addr; }
             return 0;
@@ -2774,7 +2841,7 @@ void ls_write_hook(uint32_t addr, int size, uint32_t val) {
     if (g_ls_mode == 2) {                 /* replay: verify against trace */
         if (s_ls_trace_idx >= s_ls_trace_n) { s_ls_replay_done = 1; return; }  /* count mismatch: benign block-boundary artifact */
         ls_op_t *o = &s_ls_trace[s_ls_trace_idx];
-        if (!o->is_write || o->addr != addr) {
+        if (!o->is_write || o->size != (uint8_t)size || o->addr != addr) {
             if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 2; s_ls_m_pc = s_ls_cur_pc;
                                   s_ls_m_addr = addr; s_ls_m_exp = addr; s_ls_m_act = o->addr; }
             return;

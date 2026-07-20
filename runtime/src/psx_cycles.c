@@ -17,6 +17,26 @@
 #endif
 
 uint64_t psx_cycle_count = 0;
+static int      s_cycle_replay_active = 0;
+static uint64_t s_cycle_replay_live = 0;
+
+int psx_cycle_replay_begin(uint64_t start_cycle) {
+    extern int g_ls_replay_active;
+    if (!g_ls_replay_active || s_cycle_replay_active) return 0;
+    s_cycle_replay_live = psx_cycle_count;
+    psx_cycle_count = start_cycle;
+    s_cycle_replay_active = 1;
+    return 1;
+}
+
+uint64_t psx_cycle_replay_end(void) {
+    uint64_t replay_cycle = psx_cycle_count;
+    if (s_cycle_replay_active) {
+        psx_cycle_count = s_cycle_replay_live;
+        s_cycle_replay_active = 0;
+    }
+    return replay_cycle;
+}
 
 /* Throttle diagnostic checks in debug-tool builds.  Production defines
  * STARVATION_RING_ENABLED=0, so interpreted instructions do not pay two
@@ -103,7 +123,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t best = interrupts_cycles_to_vblank();   /* frame pacing always */
     uint32_t t = timers_cycles_to_irq(0xFFFFFFFFu);  if (t < best) best = t;
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
-    uint32_t d = dma_cycles_to_irq(0xFFFFFFFFu);     if (d < best) best = d;
+    uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
@@ -150,6 +170,18 @@ static void psx_devices_service_to_now(void) {
             uint32_t to_ev = devices_cycles_to_next_internal_event();
             if (to_ev > 0 && to_ev < step) step = to_ev;
             if (step == 0) step = 1;
+            /* Preserve interval causality at an advertised event boundary.
+             * Devices are advanced in a fixed dependency order (CD before DMA,
+             * MDEC input before output). Passing the whole D-cycle interval to
+             * each device lets a state created by an earlier device at cycle D
+             * be treated by a later device as though it existed for all D
+             * cycles. Advance the quiet prefix first, then the boundary cycle:
+             * this is exactly the conservative timeline with O(events), not
+             * O(cycles), host calls. */
+            if (step > 1u && to_ev == step) {
+                advance_devices(step - 1u);
+                step = 1u;
+            }
             advance_devices(step);
             interrupts_service_scheduled_events();
         }
@@ -209,7 +241,15 @@ static void psx_advance_cycles_exact(uint32_t cycles) {
 }
 
 void psx_advance_cycles(uint32_t cycles) {
-    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global cycle/device mutation */
+    { extern int g_ls_replay_active;
+      if (g_ls_replay_active) {
+          /* Replay owns a private-in-time view of the global clock. Advance it
+           * so GTE/muldiv deadlines and memory wait states see the same time as
+           * the authoritative pass, but never service devices or observers. */
+          if (s_cycle_replay_active) psx_cycle_count += (uint64_t)cycles;
+          return;
+      }
+    }
     if (cycles == 0) return;
     uint32_t charged_cycles = cycles;
 #ifdef PSX_COSIM
@@ -346,9 +386,12 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
     extern int psx_get_in_exception(void);
     extern uint64_t g_guest_store_count, g_mmio_access_count;
 
+    /* A speculative replay must not clear or train the authoritative live idle
+     * detector. Its clock/device view is transactional and cannot be skipped. */
+    if (g_ls_replay_active) return;
     if (!idle_skip_on() || g_idle_note_suppress) return;
     if (check_pc == 0 || psx_get_in_exception() || g_psx_call_bail ||
-        g_precise_mode || g_ls_mode != 0 || g_ls_replay_active) {
+        g_precise_mode || g_ls_mode != 0) {
         s_idle_pc = 0;
         s_idle_streak = 0;
         return;

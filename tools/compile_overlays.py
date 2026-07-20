@@ -23,9 +23,10 @@ Each DLL exports:
 import argparse
 import base64
 import binascii
-import hashlib
+from bisect import bisect_left
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import os
 import re
 import struct
@@ -171,6 +172,17 @@ def codegen_ver(runtime_include: str) -> int:
     if not m:
         raise SystemExit(f'PSX_OVERLAY_CODEGEN_VER not found in {hdr}')
     return int(m.group(1))
+
+
+def overlay_abi_tag(runtime_include: str, flavor: int) -> int:
+    """Return the exact ABI/flavor export expected from a cached shard."""
+    hdr = os.path.join(runtime_include, 'overlay_api.h')
+    with open(hdr) as source:
+        match = re.search(
+            r'#define\s+PSX_OVERLAY_ABI_VERSION\s+(\d+)', source.read())
+    if not match:
+        raise SystemExit(f'PSX_OVERLAY_ABI_VERSION not found in {hdr}')
+    return (int(match.group(1)) & 0xFFFF) | ((int(flavor) & 0xFFFF) << 16)
 
 
 def codegen_hash(runtime_include: str) -> int:
@@ -425,6 +437,11 @@ def make_psxexe(load_addr: int, entry_pc: int, data: bytes) -> bytes:
 INCLUDE_REASONS = {
     'DISPATCH_ENTRY',
     'DIRECT_JAL_TARGET',
+    'STATIC_INDIRECT_TARGET',
+    'STATIC_BRANCH_ROOT',
+    # Play-free normal-mode discovery entry that also passes a target-local
+    # callable-boundary/CFG proof. Stronger than a generic captured pointer.
+    'STATIC_DISCOVERY_ROOT',
     'FUNCTION_POINTER_TARGET',
     'TOML_DECLARED_ENTRY',
     # Dispatch-proven PC with no callable boundary (mid-function code reached
@@ -448,6 +465,35 @@ INCLUDE_REASONS = {
     'DISPATCH_ROOT',
 }
 FATAL_SEED_REASONS = {'BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'}
+BIOS_RESIDENT_PRODUCER = 'bios_resident_manifest'
+BIOS_RESIDENT_MARKER = 'psxrecomp bios resident shard v1'
+
+
+def update_bios_resident_marker(dll_path: str, cap: dict) -> None:
+    """Publish/remove the opt-in marker consumed by the runtime preloader.
+
+    Resident BIOS helpers use a synthetic page envelope, so their filename's
+    region key cannot equal the dirty-run start recovered at runtime.  The
+    marker tells the loader to register the shard at cache scan time; normal
+    per-function code-CRC validation remains the execution authority.
+    """
+    marker = os.path.splitext(dll_path)[0] + '.resident'
+    if cap.get('producer') != BIOS_RESIDENT_PRODUCER:
+        try:
+            os.remove(marker)
+        except FileNotFoundError:
+            pass
+        return
+    payload = {
+        'schema': BIOS_RESIDENT_MARKER,
+        'bios_sha256': str(cap.get('bios_sha256', '')),
+        'producer_name': str(cap.get('producer_name', 'BIOS resident code')),
+    }
+    tmp = marker + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp, marker)
 
 
 def _parse_addr(value) -> int:
@@ -464,6 +510,54 @@ def _parse_addr_list(values) -> set[int]:
         except (TypeError, ValueError):
             pass
     return out
+
+
+def optional_enrichment_fallback_capture(cap: dict) -> dict | None:
+    """Return a conservative retry recipe declared by a static extractor.
+
+    The richer recipe is always attempted first.  If its generated C or host
+    compile is rejected, these independently proven roots preserve the safe
+    shard while all optional aliases and normal-mode discoveries are dropped.
+    """
+    key = 'optional_enrichment_fallback_entry_pcs'
+    recipe = cap.get(key, [])
+    fallback = dict(cap)
+    if isinstance(recipe, dict):
+        functions = sorted(_parse_addr_list(
+            recipe.get('function_entry_pcs', [])))
+        dispatch = sorted(_parse_addr_list(
+            recipe.get('dispatch_entry_pcs', [])))
+        static = sorted(_parse_addr_list(
+            recipe.get('static_discovery_entry_pcs', [])))
+        if not (functions or dispatch or static):
+            return None
+        fallback['function_entry_pcs'] = [
+            f'0x{entry:08X}' for entry in functions]
+        fallback['dispatch_entry_pcs'] = [
+            f'0x{entry:08X}' for entry in dispatch]
+        fallback['static_discovery_entry_pcs'] = [
+            f'0x{entry:08X}' for entry in static]
+        fallback['seeds'] = fallback['function_entry_pcs']
+        if 'producer_ranges' in recipe:
+            fallback['producer_ranges'] = recipe['producer_ranges']
+        if 'strict_producer_ranges' in recipe:
+            fallback['strict_producer_ranges'] = bool(
+                recipe['strict_producer_ranges'])
+    else:
+        entries = sorted(_parse_addr_list(recipe))
+        if not entries:
+            return None
+        encoded = [f'0x{entry:08X}' for entry in entries]
+        fallback['function_entry_pcs'] = encoded
+        fallback['dispatch_entry_pcs'] = encoded
+        fallback['static_discovery_entry_pcs'] = encoded
+        fallback['seeds'] = encoded
+    fallback.pop('static_alias_ranges', None)
+    fallback.pop('static_jump_table_proofs', None)
+    fallback.pop('static_call_continuation_pcs', None)
+    fallback.pop('_prior_aliases', None)
+    fallback.pop(key, None)
+    return fallback
 
 
 def _word_at(data: bytes, load_addr: int, addr: int):
@@ -491,8 +585,10 @@ def _is_control_flow(word) -> bool:
         return False
     op = (word >> 26) & 0x3F
     fn = word & 0x3F
-    return op in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                  0x14, 0x15, 0x16, 0x17) or (op == 0 and fn in (0x08, 0x09))
+    return (op in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                   0x14, 0x15, 0x16, 0x17) or
+            (op == 0 and fn in (0x08, 0x09)) or
+            (op in (0x11, 0x12) and ((word >> 21) & 0x1F) == 0x08))
 
 
 def _is_valid_mips_word(word) -> bool:
@@ -549,6 +645,30 @@ def _classify_cf(pc: int, word: int) -> tuple[str, int]:
         return ('j', _jump_target(pc, word))
     if op == 0x03:
         return ('jal', _jump_target(pc, word))
+    rt = (word >> 16) & 0x1F
+    if op in (0x04, 0x14) and rs == rt:
+        return ('j', _branch_target(pc, word))
+    if op == 0x05 and rs == rt:
+        return ('branch_never', 0)
+    if op == 0x15 and rs == rt:
+        return ('branch_never_likely', 0)
+    if op in (0x06, 0x16) and rs == 0:
+        return ('j', _branch_target(pc, word))
+    if op == 0x07 and rs == 0:
+        return ('branch_never', 0)
+    if op == 0x17 and rs == 0:
+        return ('branch_never_likely', 0)
+    if op == 0x01 and rs == 0:
+        if rt in (0x00, 0x10):       # bltz / bltzal
+            return ('branch_never', 0)
+        if rt in (0x02, 0x12):       # bltzl / bltzall
+            return ('branch_never_likely', 0)
+        if rt in (0x01, 0x03):       # bgez / bgezl
+            return ('j', _branch_target(pc, word))
+        if rt in (0x11, 0x13):       # bal / ball aliases: target + continuation
+            return ('jal', _branch_target(pc, word))
+    if op in (0x11, 0x12) and rs == 0x08:
+        return ('branch', _branch_target(pc, word))
     if op in (0x01, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17):
         return ('branch', _branch_target(pc, word))
     return ('normal', 0)
@@ -556,76 +676,216 @@ def _classify_cf(pc: int, word: int) -> tuple[str, int]:
 
 def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
                              entry: int, hard_cap: int,
-                             jr_pc: int, jr_rs: int) -> set[int]:
-    """Recognize the compiler's local jump-table idiom feeding `jr reg`."""
-    lw_base = None
-    lw_offset = 0
-    addu_cand = [None, None]
-    lui_val = None
-    addiu_val = [0, 0]
-    found_addiu = [False, False]
-    table_count = 0
+                             jr_pc: int, jr_rs: int,
+                             producer_range=None, proof_out=None) -> set[int]:
+    """Resolve one tightly bounded canonical ``sltiu``/``jr`` switch.
 
-    for back in range(1, 41):
-        scan_addr = jr_pc - back * 4
-        if scan_addr < entry:
-            break
-        word = _word_at(data, load_addr, scan_addr)
-        if word is None:
-            break
-        op = (word >> 26) & 0x3F
-        rs = (word >> 21) & 0x1F
-        rt = (word >> 16) & 0x1F
-        rd = (word >> 11) & 0x1F
-        fn = word & 0x3F
+    This is deliberately a structural reaching-definition proof, not the old
+    40-word bag-of-opcodes backscan.  The accepted suffix is::
 
-        if op == 0x23 and rt == jr_rs and lw_base is None:
-            lw_base = rs
-            lw_offset = word & 0xFFFF
-            if lw_offset & 0x8000:
-                lw_offset -= 0x10000
-            continue
-        if op == 0x00 and fn == 0x21 and lw_base is not None and rd == lw_base \
-                and addu_cand[0] is None:
-            addu_cand = [rs, rt]
-            continue
-        if op == 0x09 and addu_cand[0] is not None:
-            for i, cand in enumerate(addu_cand):
-                if cand is not None and not found_addiu[i] and rs == cand and rt == cand:
-                    imm = word & 0xFFFF
-                    if imm & 0x8000:
-                        imm -= 0x10000
-                    addiu_val[i] = imm
-                    found_addiu[i] = True
-                    break
-            continue
-        if op == 0x0F and addu_cand[0] is not None and lui_val is None:
-            for i, cand in enumerate(addu_cand):
-                if cand is not None and rt == cand:
-                    lui_val = (word & 0xFFFF) << 16
-                    addiu_val[0] = addiu_val[i] if found_addiu[i] else 0
-                    found_addiu[0] = found_addiu[i]
-                    break
-            continue
-        if op == 0x0B and table_count == 0:
-            table_count = word & 0xFFFF
-            continue
-        if lui_val is not None and table_count:
-            break
+        sltiu guard,index,count; beq guard,zero,reject; nop
+        sll scaled,index,2; addu address,scaled,table_base
+        lw target,offset(address); [nop x 0..1]; jr target
 
-    if lui_val is None or table_count == 0 or table_count >= 512:
-        return set()
-
-    table_base = lui_val + (addiu_val[0] if found_addiu[0] else 0) + lw_offset
+    ``table_base`` must be a nearest-definition LUI, optionally followed by a
+    nearest-definition ADDIU.  The lower instruction may rename the
+    register (``lui v0; addiu s0,v0,lo``), as used by Ape Escape.  Any other
+    control flow between that constant and the suffix, an inbound edge that
+    skips the definition, a register mismatch/clobber, or one non-local table
+    entry rejects the entire candidate.
+    """
     lo = load_addr
     hi = load_addr + size
+    if not (entry <= jr_pc < hard_cap and 0 < jr_rs < 32):
+        return set()
+    jr_word = _word_at(data, load_addr, jr_pc)
+    if jr_word != ((jr_rs << 21) | 0x08):
+        return set()
+
+    # Permit only the compiler's zero-or-one scheduling NOP between LW/JR.
+    lw_pc = jr_pc - 4
+    for _ in range(1):
+        if _word_at(data, load_addr, lw_pc) != 0:
+            break
+        lw_pc -= 4
+    lw_word = _word_at(data, load_addr, lw_pc)
+    if lw_word is None or ((lw_word >> 26) & 0x3F) != 0x23 \
+            or ((lw_word >> 16) & 0x1F) != jr_rs:
+        return set()
+    address_reg = (lw_word >> 21) & 0x1F
+    if not address_reg:
+        return set()
+    lw_offset = lw_word & 0xFFFF
+    if lw_offset & 0x8000:
+        lw_offset -= 0x10000
+
+    addu_pc = lw_pc - 4
+    addu_word = _word_at(data, load_addr, addu_pc)
+    if addu_word is None or ((addu_word >> 26) & 0x3F) != 0 \
+            or (addu_word & 0x3F) != 0x21 \
+            or ((addu_word >> 6) & 0x1F) != 0 \
+            or ((addu_word >> 11) & 0x1F) != address_reg:
+        return set()
+    addu_inputs = ((addu_word >> 21) & 0x1F,
+                   (addu_word >> 16) & 0x1F)
+
+    sll_pc = addu_pc - 4
+    sll_word = _word_at(data, load_addr, sll_pc)
+    if sll_word is None or ((sll_word >> 26) & 0x3F) != 0 \
+            or (sll_word & 0x3F) != 0 \
+            or ((sll_word >> 21) & 0x1F) != 0 \
+            or ((sll_word >> 6) & 0x1F) != 2:
+        return set()
+    scaled_reg = (sll_word >> 11) & 0x1F
+    index_reg = (sll_word >> 16) & 0x1F
+    if not scaled_reg or not index_reg or scaled_reg not in addu_inputs:
+        return set()
+    table_reg = addu_inputs[1] if addu_inputs[0] == scaled_reg else addu_inputs[0]
+    if not table_reg or table_reg == scaled_reg:
+        return set()
+
+    # The bound must guard this exact index on the sole fallthrough into SLL.
+    sltiu_pc = sll_pc - 12
+    branch_pc = sll_pc - 8
+    if _word_at(data, load_addr, sll_pc - 4) != 0:
+        return set()
+    sltiu_word = _word_at(data, load_addr, sltiu_pc)
+    branch_word = _word_at(data, load_addr, branch_pc)
+    if sltiu_word is None or ((sltiu_word >> 26) & 0x3F) != 0x0B \
+            or ((sltiu_word >> 21) & 0x1F) != index_reg:
+        return set()
+    guard_reg = (sltiu_word >> 16) & 0x1F
+    table_count = sltiu_word & 0xFFFF
+    if not guard_reg or not (1 <= table_count < 512):
+        return set()
+    if branch_word is None or ((branch_word >> 26) & 0x3F) != 0x04:
+        return set()
+    branch_rs = (branch_word >> 21) & 0x1F
+    branch_rt = (branch_word >> 16) & 0x1F
+    if {branch_rs, branch_rt} != {0, guard_reg}:
+        return set()
+    reject_target = _branch_target(branch_pc, branch_word)
+    if (not (entry <= reject_target < hard_cap) or
+            sll_pc <= reject_target < jr_pc + 8):
+        return set()
+
+    def nearest_writer(reg: int, before: int):
+        for pc in range(before - 4, max(entry, before - 0x80) - 1, -4):
+            word = _word_at(data, load_addr, pc)
+            if word is None:
+                return None
+            if _instruction_writes_gpr(word, reg):
+                return pc, word
+        return None
+
+    table_writer = nearest_writer(table_reg, addu_pc)
+    if table_writer is None:
+        return set()
+    table_def_pc, table_def_word = table_writer
+    def_op = (table_def_word >> 26) & 0x3F
+    def_rs = (table_def_word >> 21) & 0x1F
+    def_rt = (table_def_word >> 16) & 0x1F
+    if def_op == 0x0F and def_rs == 0 and def_rt == table_reg:
+        constant_pc = table_def_pc
+        table_base = (table_def_word & 0xFFFF) << 16
+    elif def_op == 0x09 and def_rt == table_reg and def_rs:
+        upper_writer = nearest_writer(def_rs, table_def_pc)
+        if upper_writer is None:
+            return set()
+        constant_pc, upper_word = upper_writer
+        if ((upper_word >> 26) & 0x3F) != 0x0F \
+                or ((upper_word >> 21) & 0x1F) != 0 \
+                or ((upper_word >> 16) & 0x1F) != def_rs:
+            return set()
+        low = table_def_word & 0xFFFF
+        upper = (upper_word & 0xFFFF) << 16
+        if low & 0x8000:
+            low -= 0x10000
+        table_base = (upper + low) & 0xFFFFFFFF
+    else:
+        return set()
+
+    # Calls could clobber the proven constant.  Other branches could enter the
+    # suffix through an unproved path.  The one exact bounds branch is allowed.
+    for pc in range(constant_pc + 4, sll_pc, 4):
+        word = _word_at(data, load_addr, pc)
+        if word is None:
+            return set()
+        if _is_control_flow(word) and pc != branch_pc:
+            return set()
+    predecessor = _word_at(data, load_addr, constant_pc - 4)
+    if constant_pc >= entry + 4 and _is_control_flow(predecessor):
+        return set()
+    table_base = (table_base + lw_offset) & 0xFFFFFFFF
+    table_end = table_base + table_count * 4
+    range_lo, range_hi = producer_range or (lo, hi)
+    if (table_base & 3) or not (range_lo <= table_base < table_end <= range_hi):
+        return set()
+
     targets = set()
-    for i in range(table_count):
-        target = _word_at(data, load_addr, table_base + i * 4)
-        if target is None:
+    for index in range(table_count):
+        target = _word_at(data, load_addr, table_base + index * 4)
+        if (target is None or (target & 3) or
+                not (entry <= target < hard_cap) or
+                not (range_lo <= target < range_hi) or
+                not _is_valid_mips_word(_word_at(data, load_addr, target))):
+            return set()
+        targets.add(target)
+
+    # Establish which later sources are themselves reached only after the
+    # proven table dispatch. Such case blocks may safely loop to the suffix
+    # (Ape does this); an arbitrary earlier/later byte sequence may not jump
+    # into the protected definitions and manufacture domination.
+    case_reachable = set()
+    work = deque(targets)
+    while work and len(case_reachable) < 2048:
+        pc = work.popleft()
+        if (pc in case_reachable or not (entry <= pc < hard_cap) or
+                not (range_lo <= pc < range_hi)):
             continue
-        if lo <= target < hi and entry <= target < hard_cap and (target & 3) == 0:
-            targets.add(target)
+        word = _word_at(data, load_addr, pc)
+        if not _is_valid_mips_word(word):
+            continue
+        case_reachable.add(pc)
+        kind, target = _classify_cf(pc, word)
+        delay = pc + 4
+        if kind == 'normal':
+            work.append(pc + 4)
+        elif kind == 'branch':
+            case_reachable.add(delay)
+            work.extend((pc + 8, target))
+        elif kind == 'branch_never':
+            case_reachable.add(delay)
+            work.append(pc + 8)
+        elif kind == 'branch_never_likely':
+            work.append(pc + 8)
+        elif kind == 'j':
+            case_reachable.add(delay)
+            work.append(target)
+        elif kind in ('jal', 'jalr'):
+            case_reachable.add(delay)
+            work.append(pc + 8)
+        elif kind in ('jr', 'jr_ra'):
+            case_reachable.add(delay)
+
+    for source in range(entry, hard_cap, 4):
+        source_word = _word_at(data, load_addr, source)
+        if source_word is None:
+            return set()
+        kind, target = _classify_cf(source, source_word)
+        if (kind in ('branch', 'j', 'jal') and
+                constant_pc < target <= jr_pc and
+                not (constant_pc <= source <= jr_pc) and
+                source not in case_reachable):
+            return set()
+    if proof_out is not None:
+        proof_out.append({
+            'host_entry': entry,
+            'jr_pc': jr_pc,
+            'table_base': table_base,
+            'count': table_count,
+            'targets': sorted(targets),
+        })
     return targets
 
 
@@ -643,24 +903,250 @@ def _callable_legacy_seed(data: bytes, load_addr: int, addr: int) -> bool:
     return _is_addiu_sp_neg(word) and not _is_control_flow(prev)
 
 
+def _dense_local_pointer_table(data: bytes, load_addr: int,
+                               addr: int, count: int = 3) -> bool:
+    """Reject instruction-shaped data at a supposed callable target."""
+    hi = load_addr + len(data)
+    for index in range(count):
+        value = _word_at(data, load_addr, addr + index * 4)
+        if value is None or (value & 3) or not (load_addr <= value < hi):
+            return False
+    return True
+
+
 def _callable_direct_jal_target(data: bytes, load_addr: int, addr: int) -> bool:
     """True only when a direct JAL target has independent boundary evidence."""
-    return _callable_legacy_seed(data, load_addr, addr)
+    return (not _dense_local_pointer_table(data, load_addr, addr) and
+            _callable_legacy_seed(data, load_addr, addr))
+
+
+def _instruction_writes_gpr(word: int, reg: int) -> bool:
+    if not reg:
+        return False
+    op = (word >> 26) & 0x3F
+    rs = (word >> 21) & 0x1F
+    rt = (word >> 16) & 0x1F
+    rd = (word >> 11) & 0x1F
+    fn = word & 0x3F
+    if op == 0:
+        if fn in (0x08, 0x0C, 0x0D, 0x11, 0x13,
+                  0x18, 0x19, 0x1A, 0x1B):
+            return False
+        return rd == reg
+    if op == 0x03:
+        return reg == 31
+    if op == 0x01 and rt in (0x10, 0x11):
+        return reg == 31
+    if op in range(0x08, 0x10) or op in range(0x20, 0x27) \
+            or op in (0x30, 0x32):
+        return rt == reg
+    if op in (0x10, 0x12) and rs in (0, 2):
+        return rt == reg
+    return False
+
+
+def _resolve_constant_transfer(data: bytes, load_addr: int,
+                               entry: int, transfer_pc: int,
+                               target_reg: int):
+    """Resolve a same-basic-block lui + addiu/ori constant feeding jr/jalr."""
+    low = None
+    low_is_addiu = False
+    for count in range(1, 17):
+        pc = transfer_pc - count * 4
+        if pc < entry:
+            break
+        word = _word_at(data, load_addr, pc)
+        if word is None:
+            break
+        op = (word >> 26) & 0x3F
+        rs = (word >> 21) & 0x1F
+        rt = (word >> 16) & 0x1F
+        if low is None and op in (0x09, 0x0D) \
+                and rs == target_reg and rt == target_reg:
+            low = word & 0xFFFF
+            low_is_addiu = op == 0x09
+            continue
+        if op == 0x0F and rt == target_reg:
+            # A LUI in a control-transfer delay slot is not a local reaching
+            # definition for the following suffix. A callee may clobber the
+            # register before returning at LUI+4, while a branch/jump can leave
+            # the linear path entirely. Fail closed without path/call proof.
+            predecessor = _word_at(data, load_addr, pc - 4)
+            if pc >= entry + 4 and _is_control_flow(predecessor):
+                return None
+
+            # Reject a syntactic constant pair when a direct control-flow edge
+            # can enter after this LUI.  Example: `j low; lui; low: addiu;
+            # jalr` never executes the LUI, despite looking like a pair to a
+            # raw backward scan.
+            crossed_inbound_boundary = False
+            for source in range(entry, transfer_pc, 4):
+                source_word = _word_at(data, load_addr, source)
+                if source_word is None:
+                    continue
+                source_kind, source_target = _classify_cf(source, source_word)
+                if (source_kind in ('branch', 'j', 'jal') and
+                        pc < source_target <= transfer_pc):
+                    crossed_inbound_boundary = True
+                    break
+            if crossed_inbound_boundary:
+                return None
+
+            upper = (word & 0xFFFF) << 16
+            if low is None:
+                return upper
+            if low_is_addiu and low & 0x8000:
+                low -= 0x10000
+            return (upper + low) & 0xFFFFFFFF if low_is_addiu else upper | low
+        if _instruction_writes_gpr(word, target_reg) or _is_control_flow(word):
+            break
+    return None
+
+
+def plausible_callable_target(data: bytes, load_addr: int, size: int,
+                              target: int, producer_hi: int) -> bool:
+    """CFG proof for a cross-producer call target without a classic prologue.
+
+    Direct calls are sufficient boundary evidence inside one linked producer.
+    Across a synthetic adjacent-producer envelope, additionally require a
+    bounded, valid CFG with a reachable return and no sequential fallthrough.
+    This retains real frameless exports while rejecting pointer tables/NOP
+    runways that only happen to decode as instructions.
+    """
+    first = _word_at(data, load_addr, target)
+    if first in (None, 0) or not _is_valid_mips_word(first):
+        return False
+    if _dense_local_pointer_table(data, load_addr, target):
+        return False
+    cap = min(load_addr + size, producer_hi, target + 0x4000)
+    work = deque([target])
+    visited = set()
+    saw_return = False
+    bad = False
+
+    def inside(addr: int) -> bool:
+        return target <= addr < cap and (addr & 3) == 0
+
+    def add_delay(pc: int) -> None:
+        nonlocal bad
+        delay = pc + 4
+        if not inside(delay):
+            bad = True
+            return
+        word = _word_at(data, load_addr, delay)
+        if not _is_valid_mips_word(word):
+            bad = True
+        else:
+            visited.add(delay)
+
+    while work and not bad and len(visited) < 2048:
+        pc = work.popleft()
+        if pc in visited:
+            continue
+        if not inside(pc):
+            bad = True  # sequential fallthrough past the bounded probe
+            break
+        word = _word_at(data, load_addr, pc)
+        if not _is_valid_mips_word(word):
+            bad = True
+            break
+        visited.add(pc)
+        kind, branch_target = _classify_cf(pc, word)
+        if kind == 'normal':
+            work.append(pc + 4)
+        elif kind == 'branch':
+            add_delay(pc)
+            work.append(pc + 8)  # conditional fallthrough must remain bounded
+            if inside(branch_target):
+                work.append(branch_target)
+            # An out-of-probe branch target is a shared external code edge.
+        elif kind == 'branch_never':
+            add_delay(pc)
+            work.append(pc + 8)
+        elif kind == 'branch_never_likely':
+            work.append(pc + 8)
+        elif kind in ('jal', 'jalr'):
+            add_delay(pc)
+            work.append(pc + 8)
+        elif kind == 'j':
+            add_delay(pc)
+            if inside(branch_target):
+                work.append(branch_target)
+            # Otherwise this is a bounded tail edge.
+        elif kind == 'jr_ra':
+            add_delay(pc)
+            saw_return = True
+        elif kind == 'jr':
+            add_delay(pc)  # bounded indirect/tail exit
+
+    return saw_return and not bad and not work and len(visited) < 2048
 
 
 def _walk_overlay_function(data: bytes, load_addr: int, size: int,
-                           entry: int, hard_cap: int) -> dict:
+                           entry: int, hard_cap: int,
+                           producer_ranges=(),
+                           allow_cross_producer_calls=True) -> dict:
     lo = load_addr
     hi = load_addr + size
-
-    def in_function(addr: int) -> bool:
-        return lo <= addr < hi and entry <= addr < hard_cap and (addr & 3) == 0
 
     work = deque([entry])
     visited = set()
     direct_jals = set()
+    static_indirect_targets = set()
+    call_continuations = set()
     branch_targets = set()
     jump_table_targets = set()
+    jump_table_proofs = []
+    forward_branch_targets = set()
+    rejected_cross_producer_calls = set()
+    accepted_cross_producer_calls = set()
+
+    def producer_for(addr: int):
+        for range_lo, range_hi in producer_ranges:
+            if range_lo <= addr < range_hi:
+                return range_lo, range_hi
+        return None
+
+    entry_producer = producer_for(entry)
+
+    def in_function(addr: int) -> bool:
+        return (lo <= addr < hi and entry <= addr < hard_cap and
+                (addr & 3) == 0 and
+                (not producer_ranges or
+                 (entry_producer is not None and
+                  producer_for(addr) == entry_producer)))
+
+    def callable_transfer_target(source: int, target: int) -> bool:
+        if _dense_local_pointer_table(data, load_addr, target):
+            rejected_cross_producer_calls.add(target)
+            return False
+        if not producer_ranges:
+            return True
+        source_range = producer_for(source)
+        target_range = producer_for(target)
+        if source_range is None or target_range is None:
+            rejected_cross_producer_calls.add(target)
+            return False
+        if source_range is not None and source_range == target_range:
+            return True
+        if not allow_cross_producer_calls:
+            rejected_cross_producer_calls.add(target)
+            return False
+        # Adjacent-producer composites are a byte envelope, not proof that a
+        # call encoded by producer A is linked to arbitrary bytes at the same
+        # address in every producer-B variant. Cross-boundary calls therefore
+        # need independent local boundary evidence. This keeps real exports
+        # while rejecting pointer/data words that happen to be valid MIPS.
+        if _callable_direct_jal_target(data, load_addr, target):
+            accepted_cross_producer_calls.add(target)
+            return True
+        if (target_range is not None and
+                plausible_callable_target(
+                    data, load_addr, size, target, target_range[1])):
+            accepted_cross_producer_calls.add(target)
+            return True
+        rejected_cross_producer_calls.add(target)
+        return False
 
     while work:
         pc = work.popleft()
@@ -685,20 +1171,39 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             if in_function(target):
                 work.append(target)
                 branch_targets.add(target)
+            elif lo <= target < hi and target >= hard_cap and (target & 3) == 0:
+                # A reachable direct branch may jump across a sibling entry.
+                # Exact-entry partitioning hard-caps the current walk there,
+                # but the target remains mechanically proven code reachability.
+                forward_branch_targets.add(target)
+        elif kind == 'branch_never':
+            if in_function(delay):
+                visited.add(delay)
+            if in_function(pc + 8):
+                work.append(pc + 8)
+                branch_targets.add(pc + 8)
+        elif kind == 'branch_never_likely':
+            if in_function(pc + 8):
+                work.append(pc + 8)
+                branch_targets.add(pc + 8)
         elif kind == 'j':
             if in_function(delay):
                 visited.add(delay)
             if in_function(target):
                 work.append(target)
                 branch_targets.add(target)
+            elif lo <= target < hi and target >= hard_cap and (target & 3) == 0:
+                forward_branch_targets.add(target)
         elif kind == 'jal':
             if in_function(delay):
                 visited.add(delay)
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
+                call_continuations.add(pc + 8)
             if (lo <= target < hi and (target & 3) == 0 and
-                    _callable_direct_jal_target(data, load_addr, target)):
+                    _is_valid_mips_word(_word_at(data, load_addr, target)) and
+                    callable_transfer_target(pc, target)):
                 direct_jals.add(target)
         elif kind == 'jalr':
             if in_function(delay):
@@ -706,16 +1211,34 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
+                call_continuations.add(pc + 8)
+            target_reg = (word >> 21) & 0x1F
+            target = _resolve_constant_transfer(data, load_addr, entry, pc,
+                                                target_reg)
+            if (target is not None and lo <= target < hi and (target & 3) == 0
+                    and callable_transfer_target(pc, target)):
+                static_indirect_targets.add(target)
         elif kind == 'jr':
             if in_function(delay):
                 visited.add(delay)
             jr_rs = (word >> 21) & 0x1F
-            for jt in _find_jump_table_targets(data, load_addr, size,
-                                               entry, hard_cap, pc, jr_rs):
-                jump_table_targets.add(jt)
-                branch_targets.add(jt)
-                if in_function(jt):
-                    work.append(jt)
+            target = _resolve_constant_transfer(data, load_addr, entry, pc, jr_rs)
+            if target is not None and lo <= target < hi and (target & 3) == 0:
+                if in_function(target):
+                    branch_targets.add(target)
+                    work.append(target)
+                elif callable_transfer_target(pc, target):
+                    static_indirect_targets.add(target)
+            else:
+                proofs = []
+                for jt in _find_jump_table_targets(data, load_addr, size,
+                                                   entry, hard_cap, pc, jr_rs,
+                                                   entry_producer, proofs):
+                    jump_table_targets.add(jt)
+                    branch_targets.add(jt)
+                    if in_function(jt):
+                        work.append(jt)
+                jump_table_proofs.extend(proofs)
         elif kind == 'jr_ra':
             if in_function(delay):
                 visited.add(delay)
@@ -723,8 +1246,14 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     return {
         'visited': visited,
         'direct_jals': direct_jals,
+        'static_indirect_targets': static_indirect_targets,
+        'call_continuations': call_continuations,
         'branch_targets': branch_targets,
         'jump_table_targets': jump_table_targets,
+        'jump_table_proofs': jump_table_proofs,
+        'forward_branch_targets': forward_branch_targets,
+        'rejected_cross_producer_calls': rejected_cross_producer_calls,
+        'accepted_cross_producer_calls': accepted_cross_producer_calls,
     }
 
 
@@ -755,6 +1284,60 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     lo = load_addr
     hi = load_addr + size
     region = lambda a: lo <= a < hi and (a & 3) == 0
+    producer_ranges = []
+    for raw_range in cap.get('producer_ranges', []) or []:
+        if not isinstance(raw_range, dict):
+            raise RuntimeError('producer_ranges entries must be objects')
+        try:
+            range_lo = _parse_addr(raw_range['start'])
+            range_hi = _parse_addr(raw_range['end'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f'invalid producer_ranges entry: {raw_range}') from exc
+        if not (lo <= range_lo < range_hi <= hi):
+            raise RuntimeError(
+                f'producer range 0x{range_lo:08X}..0x{range_hi:08X} '
+                f'outside capture 0x{lo:08X}..0x{hi:08X}')
+        producer_ranges.append((range_lo, range_hi))
+    producer_ranges.sort()
+    if any(producer_ranges[i-1][1] > producer_ranges[i][0]
+           for i in range(1, len(producer_ranges))):
+        raise RuntimeError('producer_ranges overlap')
+
+    def capture_producer_for(addr: int):
+        for producer_lo, producer_hi in producer_ranges:
+            if producer_lo <= addr < producer_hi:
+                return producer_lo, producer_hi
+        return None
+
+    static_alias_ranges = set()
+    allow_cross_producer_calls = not bool(cap.get('strict_producer_ranges'))
+    for raw_alias in cap.get('static_alias_ranges', []) or []:
+        if not isinstance(raw_alias, dict):
+            raise RuntimeError('static_alias_ranges entries must be objects')
+        try:
+            entry = _parse_addr(raw_alias['entry'])
+            range_lo = _parse_addr(raw_alias['start'])
+            range_hi = _parse_addr(raw_alias['end'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f'invalid static_alias_ranges entry: {raw_alias}') from exc
+        if not (lo <= range_lo <= entry < range_hi <= hi and
+                (entry & 3) == 0 and (range_lo & 3) == 0 and
+                (range_hi & 3) == 0):
+            raise RuntimeError(
+                f'static alias 0x{entry:08X} -> '
+                f'0x{range_lo:08X}..0x{range_hi:08X} outside/misaligned for '
+                f'capture 0x{lo:08X}..0x{hi:08X}')
+        if producer_ranges:
+            owners = [index for index, (producer_lo, producer_hi) in
+                      enumerate(producer_ranges)
+                      if (producer_lo <= range_lo < producer_hi and
+                          producer_lo <= entry < producer_hi and
+                          producer_lo <= range_hi - 1 < producer_hi)]
+            if not owners:
+                raise RuntimeError(
+                    f'static alias 0x{entry:08X} crosses producer boundary')
+        static_alias_ranges.add((entry, range_lo, range_hi))
 
     schema_keys = {'executed_pcs', 'observed_pcs', 'dispatch_entry_pcs',
                    'function_entry_pcs'}
@@ -766,6 +1349,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                                                     legacy_seeds if not has_split_schema else [])))
     dispatch_entry_pcs = _parse_addr_list(cap.get('dispatch_entry_pcs', []))
     captured_function_entries = _parse_addr_list(cap.get('function_entry_pcs', []))
+    static_discovery_entries = _parse_addr_list(
+        cap.get('static_discovery_entry_pcs', []))
     toml_entries = _collect_toml_overlay_entries(toml_doc, load_addr, crc32)
     legacy_callable_seeds = {a for a in legacy_seeds
                              if region(a) and _callable_legacy_seed(data, load_addr, a)}
@@ -777,14 +1362,17 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     # A dispatch into dirty RAM can land on a jump-table case label. That
     # proves coverage, not a callable function boundary, so discover those
     # labels before promoting dispatch entries to seeds.
-    pre_roots = set(legacy_callable_seeds) | set(captured_function_entries) | set(toml_entries)
+    pre_roots = (set(legacy_callable_seeds) | set(captured_function_entries) |
+                 set(static_discovery_entries) | set(toml_entries))
     pre_roots.update(a for a in dispatch_entry_pcs
                      if region(a) and _callable_legacy_seed(data, load_addr, a))
     jump_table_targets = set()
     pre_roots_sorted = sorted(a for a in pre_roots if region(a))
     for i, entry in enumerate(pre_roots_sorted):
         hard_cap = pre_roots_sorted[i + 1] if i + 1 < len(pre_roots_sorted) else hi
-        walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+        walk = _walk_overlay_function(
+            data, load_addr, size, entry, hard_cap, producer_ranges,
+            allow_cross_producer_calls)
         jump_table_targets.update(walk['jump_table_targets'])
 
     def impossible_entry_start(addr: int) -> bool:
@@ -802,6 +1390,12 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
 
     def include(addr: int, reason: str):
         if not region(addr):
+            excluded[addr] = 'UNKNOWN'
+            return
+        # Composite padding has bytes but no producer identity.  A root there
+        # would otherwise get entry_producer=None and could walk through every
+        # disconnected zero-fill gap as though those gaps shared ownership.
+        if producer_ranges and capture_producer_for(addr) is None:
             excluded[addr] = 'UNKNOWN'
             return
         # Boundary gate: a dispatched-to PC is proof of *code reachability*, not
@@ -823,20 +1417,39 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                     not _callable_legacy_seed(data, load_addr, addr)):
                 included.setdefault(addr, 'DISPATCH_INTERIOR')
                 return
-        elif (reason != 'TOML_DECLARED_ENTRY' and addr in jump_table_targets and
+        elif (reason not in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                             'STATIC_BRANCH_ROOT',
+                             'STATIC_DISCOVERY_ROOT',
+                             'TOML_DECLARED_ENTRY') and
+                addr in jump_table_targets and
                 not _callable_legacy_seed(data, load_addr, addr)):
             excluded[addr] = 'BRANCH_TARGET_ONLY'
             return
         if reason in FATAL_SEED_REASONS:
             raise RuntimeError(f'BUG: refusing to include 0x{addr:08X} as {reason}')
         old = included.get(addr)
-        if old is None or old in ('FUNCTION_POINTER_TARGET', 'DISPATCH_INTERIOR'):
+        if reason in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                      'STATIC_BRANCH_ROOT',
+                      'STATIC_DISCOVERY_ROOT'):
+            # Static call-edge evidence outranks heuristic capture metadata.
+            included[addr] = reason
+        elif old is None or old in ('FUNCTION_POINTER_TARGET', 'DISPATCH_INTERIOR'):
             included[addr] = reason
 
     for addr in dispatch_entry_pcs:
         include(addr, 'DISPATCH_ENTRY')
     for addr in captured_function_entries:
         include(addr, 'FUNCTION_POINTER_TARGET')
+    for addr in static_discovery_entries:
+        if not region(addr):
+            excluded[addr] = 'UNKNOWN'
+        elif (_callable_legacy_seed(data, load_addr, addr) or
+              plausible_callable_target(data, load_addr, size, addr, hi)):
+            include(addr, 'STATIC_DISCOVERY_ROOT')
+        else:
+            # Preserve the weaker classification. Overlay mode will perform
+            # its ordinary boundary recheck and fail closed if needed.
+            include(addr, 'FUNCTION_POINTER_TARGET')
     for addr in toml_entries:
         include(addr, 'TOML_DECLARED_ENTRY')
 
@@ -848,32 +1461,141 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         for addr in legacy_callable_seeds:
             include(addr, 'FUNCTION_POINTER_TARGET')
 
+    # Current-capture alias recipes contribute only an interior ENTRY candidate;
+    # their historical host range is not trusted. Final exact reachability below
+    # must discover a current host or the entry is dropped to the interpreter.
+    for addr, _range_lo, _range_hi in static_alias_ranges:
+        if region(addr):
+            included[addr] = 'DISPATCH_INTERIOR'
+
     # Walk roots: callable entries only. DISPATCH_INTERIOR addresses are NOT
     # roots — as roots they would hard-cap (truncate) the sibling walk that
     # owns them.
     known = {a for a, r in included.items() if r != 'DISPATCH_INTERIOR'}
-    pending = deque(sorted(known))
-    processed = set()
+    initial_known = set(known)
+    derived_reasons = {}
+    promoted_roots = set()
+    suppressed_derived = set()
+    suppression_passes = 0
     all_branch_targets = set()
     kernel_window = (load_addr & 0x1FFFFFFF) < 0x10000
 
     while True:
-        while pending:
-            entry = pending.popleft()
-            if entry in processed:
-                continue
-            processed.add(entry)
+        # Recompute call/branch evidence from the CURRENT partition. Evidence is
+        # not monotonic: a new hard cap can make an old source PC unreachable.
+        # Dropping stale candidates here prevents an old speculative walk from
+        # resurrecting a target in the final shard.
+        discovery_round = 0
+        seen_states = {}
+        state_history = []
+        while True:
+            discovery_round += 1
+            state = (tuple(sorted(known)), tuple(sorted(derived_reasons)))
+            cycle_start = seen_states.get(state)
+            if discovery_round > 64 or cycle_start is not None:
+                unstable = set()
+                if cycle_start is not None:
+                    cycle_states = state_history[cycle_start:]
+                    known_sets = [set(item[0]) for item in cycle_states]
+                    derived_sets = [set(item[1]) for item in cycle_states]
+                    if known_sets:
+                        unstable |= set.union(*known_sets) - set.intersection(*known_sets)
+                    if derived_sets:
+                        unstable |= (set.union(*derived_sets) -
+                                     set.intersection(*derived_sets))
+                unstable_text = ','.join(f'{addr:08X}'
+                                         for addr in sorted(unstable)[:12])
+                unstable -= initial_known | promoted_roots
+                if unstable and suppression_passes < 64:
+                    suppression_passes += 1
+                    suppressed_derived.update(unstable)
+                    print('  WARNING: ownership discovery cycle; suppressing '
+                          f'{len(unstable)} unstable derived roots'
+                          + (f' ({unstable_text})' if unstable_text else ''))
+                    known = initial_known | promoted_roots
+                    derived_reasons = {}
+                    discovery_round = 0
+                    seen_states = {}
+                    state_history = []
+                    continue
+                print('  WARNING: ownership discovery did not converge; '
+                      'falling back to explicit/dispatch roots'
+                      + (f' (cycle={len(state_history) - cycle_start}, '
+                         f'unstable={unstable_text})'
+                         if cycle_start is not None else ' (round limit)'))
+                known = initial_known | promoted_roots
+                derived_reasons = {}
+                break
+            seen_states[state] = len(state_history)
+            state_history.append(state)
+            next_reasons = {}
+            round_branch_targets = set()
             sorted_known = sorted(known)
-            hard_cap = next((x for x in sorted_known if x > entry), hi)
-            walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
-            all_branch_targets.update(walk['branch_targets'])
-            all_branch_targets.update(walk['jump_table_targets'])
-            for target in sorted(walk['direct_jals']):
-                if target not in known:
-                    include(target, 'DIRECT_JAL_TARGET')
-                    if target in included:
-                        known.add(target)
-                        pending.append(target)
+            for index, entry in enumerate(sorted_known):
+                hard_cap = (sorted_known[index + 1]
+                            if index + 1 < len(sorted_known) else hi)
+                walk = _walk_overlay_function(
+                    data, load_addr, size, entry, hard_cap, producer_ranges,
+                    allow_cross_producer_calls)
+                round_branch_targets.update(walk['branch_targets'])
+                round_branch_targets.update(walk['jump_table_targets'])
+                for target in walk['direct_jals']:
+                    if (target not in initial_known and
+                            target not in suppressed_derived):
+                        next_reasons[target] = 'DIRECT_JAL_TARGET'
+                for target in walk['static_indirect_targets']:
+                    if (target not in initial_known and
+                            target not in suppressed_derived):
+                        next_reasons.setdefault(target, 'STATIC_INDIRECT_TARGET')
+                for target in walk['forward_branch_targets']:
+                    source_reason = (included.get(entry) or
+                                     derived_reasons.get(entry) or
+                                     ('DISPATCH_ROOT'
+                                      if entry in promoted_roots else None))
+                    strong_source = source_reason in (
+                        'DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                        'STATIC_BRANCH_ROOT', 'STATIC_DISCOVERY_ROOT',
+                        'TOML_DECLARED_ENTRY', 'DISPATCH_ROOT')
+                    if not strong_source and not _callable_legacy_seed(
+                            data, load_addr, entry):
+                        continue
+                    source_range = next(
+                        ((rlo, rhi) for rlo, rhi in producer_ranges
+                         if rlo <= entry < rhi), None)
+                    target_range = next(
+                        ((rlo, rhi) for rlo, rhi in producer_ranges
+                         if rlo <= target < rhi), None)
+                    if producer_ranges and source_range != target_range:
+                        continue
+                    producer_hi = target_range[1] if target_range else hi
+                    if plausible_callable_target(
+                            data, load_addr, size, target, producer_hi):
+                        if (target not in initial_known and
+                                target not in suppressed_derived):
+                            next_reasons.setdefault(target, 'STATIC_BRANCH_ROOT')
+
+            normalized = initial_known | promoted_roots | set(next_reasons)
+            roots = sorted(normalized)
+            for target in sorted(next_reasons):
+                if target not in normalized:
+                    continue
+                index = bisect_left(roots, target)
+                if index == len(roots) or roots[index] != target or index == 0:
+                    continue
+                owner = roots[index - 1]
+                hard_cap = roots[index + 1] if index + 1 < len(roots) else hi
+                owner_walk = _walk_overlay_function(
+                    data, load_addr, size, owner, hard_cap, producer_ranges,
+                    allow_cross_producer_calls)
+                if target in owner_walk['visited']:
+                    normalized.remove(target)
+                    roots.pop(index)
+
+            if normalized == known and next_reasons == derived_reasons:
+                all_branch_targets = round_branch_targets
+                break
+            known = normalized
+            derived_reasons = next_reasons
 
         if not kernel_window:
             break
@@ -886,7 +1608,9 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         sorted_known = sorted(known)
         for i, entry in enumerate(sorted_known):
             hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
-            walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+            walk = _walk_overlay_function(
+                data, load_addr, size, entry, hard_cap, producer_ranges,
+                allow_cross_producer_calls)
             covered |= walk['visited']
         promoted = sorted(a for a, r in included.items()
                           if r == 'DISPATCH_INTERIOR' and a not in covered
@@ -899,21 +1623,51 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         # that split one real function and hard-cap each other.
         a = promoted[0]
         included[a] = 'DISPATCH_ROOT'
+        promoted_roots.add(a)
         known.add(a)
-        pending.append(a)
 
     # Re-walk with the final function set so the branch-target exclusion count
     # matches the actual compilation boundaries.
     all_branch_targets.clear()
+    rejected_cross_producer_calls = set()
+    accepted_cross_producer_calls = set()
+    final_covered = set()
     sorted_known = sorted(known)
     for i, entry in enumerate(sorted_known):
         hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
-        walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+        walk = _walk_overlay_function(
+            data, load_addr, size, entry, hard_cap, producer_ranges,
+            allow_cross_producer_calls)
         all_branch_targets.update(walk['branch_targets'])
         all_branch_targets.update(walk['jump_table_targets'])
+        all_branch_targets.update(walk['forward_branch_targets'])
+        final_covered.update(walk['visited'])
+        rejected_cross_producer_calls.update(
+            walk['rejected_cross_producer_calls'])
+        accepted_cross_producer_calls.update(
+            walk['accepted_cross_producer_calls'])
+
+    # A DISPATCH_INTERIOR is emitted only when the final partition has a real
+    # CFG host for that exact PC. Reconsider every derived target after all
+    # later roots have settled; stale ownership falls back to a root (when it
+    # remains call-proven) or to the interpreter, never a hostless alias.
+    for addr, reason in sorted(derived_reasons.items()):
+        if addr in known:
+            include(addr, reason)
+        elif addr in final_covered:
+            included[addr] = 'DISPATCH_INTERIOR'
+        else:
+            included.pop(addr, None)
+            excluded[addr] = 'OBSERVED_PC_ONLY'
+    for addr, reason in list(included.items()):
+        if reason == 'DISPATCH_INTERIOR' and addr not in final_covered:
+            del included[addr]
+            excluded[addr] = ('OBSERVED_PC_ONLY'
+                              if addr in executed_pcs else 'UNKNOWN')
 
     candidates = {a for a in (executed_pcs | dispatch_entry_pcs |
-                              captured_function_entries | legacy_seeds | toml_entries)
+                              captured_function_entries | static_discovery_entries |
+                              legacy_seeds | toml_entries)
                   if region(a)}
     for addr in sorted(candidates - set(included)):
         if addr in all_branch_targets or addr in jump_table_targets:
@@ -943,6 +1697,13 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'branch_targets_excluded_count': len(all_branch_targets - set(included)),
         'counts': counts,
         'excluded_counts': excluded_counts,
+        'producer_ranges': producer_ranges,
+        'static_alias_ranges': static_alias_ranges,
+        'rejected_cross_producer_calls': rejected_cross_producer_calls,
+        'accepted_cross_producer_calls': accepted_cross_producer_calls,
+        'static_jump_table_proofs': cap.get('static_jump_table_proofs', []),
+        'static_call_continuation_pcs': _parse_addr_list(
+            cap.get('static_call_continuation_pcs', [])),
     }
     # Interior entries carry the 'interior' marker so the recompiler emits
     # them as overlapping aliases, never as walk roots. Promoted kernel
@@ -954,8 +1715,17 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             return f'interior 0x{addr:08X}'
         if r == 'DISPATCH_ROOT':
             return f'dispatch_root 0x{addr:08X}'
+        if r in ('DIRECT_JAL_TARGET', 'STATIC_INDIRECT_TARGET',
+                 'STATIC_BRANCH_ROOT',
+                 'STATIC_DISCOVERY_ROOT'):
+            return f'call_root 0x{addr:08X}'
         return f'0x{addr:08X}'
-    seeds = [seed_line(addr) for addr in sorted(included)]
+    seeds = []
+    for range_lo, range_hi in producer_ranges:
+        seeds.append(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}')
+    for addr in sorted(accepted_cross_producer_calls):
+        seeds.append(f'cross_call_allow 0x{addr:08X}')
+    seeds.extend(seed_line(addr) for addr in sorted(included))
     return seeds, audit
 
 
@@ -966,10 +1736,19 @@ def print_seed_audit(audit: dict) -> None:
     print(f'dispatch_entry_pcs: {len(audit["dispatch_entry_pcs"])}')
     print(f'function_entry_pcs: {len(audit["function_entry_pcs"])}')
     print(f'direct_jal_targets_included: {audit["counts"].get("DIRECT_JAL_TARGET", 0)}')
+    print(f'static_indirect_targets_included: {audit["counts"].get("STATIC_INDIRECT_TARGET", 0)}')
+    print(f'static_branch_roots_included: '
+          f'{audit["counts"].get("STATIC_BRANCH_ROOT", 0)}')
+    print(f'static_discovery_roots_included: '
+          f'{audit["counts"].get("STATIC_DISCOVERY_ROOT", 0)}')
     print(f'function_pointer_targets_included: {audit["counts"].get("FUNCTION_POINTER_TARGET", 0)}')
     print(f'toml_entries_included: {audit["counts"].get("TOML_DECLARED_ENTRY", 0)}')
     print(f'dispatch_interior_included: {audit["counts"].get("DISPATCH_INTERIOR", 0)}')
     print(f'dispatch_roots_promoted: {audit["counts"].get("DISPATCH_ROOT", 0)}')
+    print(f'cross_producer_calls_rejected: '
+          f'{len(audit["rejected_cross_producer_calls"])}')
+    print(f'cross_producer_calls_accepted: '
+          f'{len(audit["accepted_cross_producer_calls"])}')
     print(f'branch_targets_excluded: {audit["branch_targets_excluded_count"]}')
     print(f'observed_only_excluded: {audit["excluded_counts"].get("OBSERVED_PC_ONLY", 0)}')
     print(f'unknown_excluded: {audit["excluded_counts"].get("UNKNOWN", 0)}')
@@ -1625,20 +2404,56 @@ def audit_func_id_delay_slots(func_ids: list, data: bytes,
     return errors
 
 
-def write_overlay_ranges_from(func_ids: list, out_path: str) -> int:
+def overlay_ranges_text(func_ids: list, pair_id: int | None = None) -> str:
+    """Serialize one loader manifest.
+
+    ``P`` is an optional DLL/manifest publication identity.  Old runtimes
+    ignore the unfamiliar record, while pair-aware runtimes require a matching
+    ``overlay_pair_id`` export whenever it is present.
+    """
+    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
+    if pair_id is not None:
+        out_lines.append(f'P {pair_id & 0xFFFFFFFFFFFFFFFF:016X}\n')
+    for ev, crc, ranges in func_ids:
+        out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
+        for lo, length in ranges:
+            out_lines.append(
+                f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
+    return ''.join(out_lines)
+
+
+def overlay_pair_id(src: str, func_ids: list) -> int:
+    """Bind a newly compiled DLL to the exact C and range manifest it uses."""
+    digest = hashlib.sha256()
+    digest.update(b'psxrecomp overlay pair v1\0')
+    digest.update(src.encode('utf-8'))
+    digest.update(b'\0')
+    digest.update(overlay_ranges_text(func_ids).encode('ascii'))
+    return int.from_bytes(digest.digest()[:8], 'big')
+
+
+def add_overlay_pair_export(src: str, pair_id: int) -> str:
+    """Add the optional v2-pair binding export without changing the shard ABI."""
+    return src + f'''\n
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+uint64_t overlay_pair_id(void) {{ return UINT64_C(0x{pair_id:016X}); }}
+'''
+
+
+def write_overlay_ranges_from(func_ids: list, out_path: str,
+                              pair_id: int | None = None) -> int:
     """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
     parse_overlay_func_ids. Returns the number of functions written.
 
     Manifest v2 line format:
       F <entry_hex> <code_crc_hex>     one per function
       R <lo_hex> <len_hex>             one per coalesced code range"""
-    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
-    for ev, crc, ranges in func_ids:
-        out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
-        for lo, length in ranges:
-            out_lines.append(f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
     with open(out_path, 'w') as f:
-        f.writelines(out_lines)
+        f.write(overlay_ranges_text(func_ids, pair_id))
     return len(func_ids)
 
 
@@ -1651,7 +2466,8 @@ def write_overlay_ranges(src_path: str, out_path: str,
 
 
 def load_region_coverage(cache_dir: str, phys_addr: int, data: bytes,
-                         load_addr: int, size: int) -> set:
+                         load_addr: int, size: int,
+                         expected_abi: int | None = None) -> set:
     """Set of (ev, code_crc) function identities already provided by built DLLs
     for this region_start. The loader content-matches per function across ALL
     DLLs sharing a region_start, so a function is "covered" as soon as ANY
@@ -1674,11 +2490,19 @@ def load_region_coverage(cache_dir: str, phys_addr: int, data: bytes,
         dll_name = name[:-len('.ranges')] + overlay_ext()
         if not bundle_path_is_immutable(dll_name):
             continue
-        if not os.path.isfile(os.path.join(cache_dir, dll_name)):
+        ranges_path = os.path.join(cache_dir, name)
+        dll_path = os.path.join(cache_dir, dll_name)
+        if not os.path.isfile(dll_path):
             continue
-        manifest = os.path.join(cache_dir, name)
+        # Reject a cached DLL baked against a different runtime-header/flavor
+        # ABI even when its content-CRC matches: the cache DIRECTORY is already
+        # namespaced by codegen hash, but --flavor is not part of that hash, so
+        # two flavors can share a cache_dir and must not dedup off each other.
+        if (expected_abi is not None and
+                not _dll_abi_matches(dll_path, expected_abi)):
+            continue
         func_ids = parse_overlay_func_ids(
-            manifest, data, load_addr, size, require_stored_crc=True)
+            ranges_path, data, load_addr, size, require_stored_crc=True)
         if not func_ids or audit_func_id_delay_slots(func_ids, data, load_addr):
             continue
         covered.update((ev, crc) for ev, crc, _ranges in func_ids)
@@ -1697,7 +2521,8 @@ def _addr_in_func_ids(addr: int, func_ids: list) -> bool:
 
 
 def load_region_entry_set(cache_dir: str, phys_addr: int, data: bytes,
-                          load_addr: int, size: int) -> set:
+                          load_addr: int, size: int,
+                          expected_abi: int | None = None) -> set:
     """Set of phys-normalized F-line ENTRY addresses provided by ALL built DLLs
     (region + fragment) for this region_start. This — not range coverage — is
     the dispatchability test: native code is enterable ONLY at F entries, so a
@@ -1718,11 +2543,15 @@ def load_region_entry_set(cache_dir: str, phys_addr: int, data: bytes,
         dll_name = name[:-len('.ranges')] + overlay_ext()
         if not bundle_path_is_immutable(dll_name):
             continue
-        if not os.path.isfile(os.path.join(cache_dir, dll_name)):
+        ranges_path = os.path.join(cache_dir, name)
+        dll_path = os.path.join(cache_dir, dll_name)
+        if not os.path.isfile(dll_path):
             continue
-        manifest = os.path.join(cache_dir, name)
+        if (expected_abi is not None and
+                not _dll_abi_matches(dll_path, expected_abi)):
+            continue
         func_ids = parse_overlay_func_ids(
-            manifest, data, load_addr, size, require_stored_crc=True)
+            ranges_path, data, load_addr, size, require_stored_crc=True)
         if not func_ids or audit_func_id_delay_slots(func_ids, data, load_addr):
             continue
         out.update(ev & 0x1FFFFFFF for ev, _crc, _ranges in func_ids)
@@ -1750,6 +2579,11 @@ INTERIOR_FAIL_MEMO = 'interior_fail_memo.txt'
 
 def _interior_fail_key(phys_addr: int, interior: int, region_crc: int) -> str:
     return f'{phys_addr:08X}_{interior & 0x1FFFFFFF:08X}_{region_crc:08X}'
+
+
+def interior_failure_is_deterministic(reason: str) -> bool:
+    """Only guest-byte/codegen audit verdicts belong in the persistent memo."""
+    return reason.startswith(('generated-c-audit:', 'requested-entry-audit:'))
 
 
 def load_interior_fail_memo(cache_dir: str) -> set:
@@ -1851,9 +2685,75 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         }
 
 
+def validate_interior_fragment_ids(interior: int, frag_ids: list,
+                                   generated_defs: set[int]) -> str | None:
+    """Return a fail-closed reason when a fragment omitted its requested entry.
+
+    A non-empty manifest is not sufficient: the recompiler can emit some other
+    reachable function while rejecting/demoting the exact interior PC.  The
+    loader can also retain at most 16 ranges for one function.  Refuse to
+    publish unless the requested entry has one unambiguous, runtime-representable
+    identity whose guarded bytes include the entry itself.
+    """
+    entry = (interior & 0x1FFFFFFF) | 0x80000000
+    if entry not in generated_defs:
+        return f'requested entry 0x{entry:08X} missing from generated C'
+    matches = [(ev, crc, ranges) for ev, crc, ranges in frag_ids if ev == entry]
+    if len(matches) != 1:
+        return (f'requested entry 0x{entry:08X} has {len(matches)} '
+                'manifest identities (expected exactly 1)')
+    ranges = matches[0][2]
+    if not 1 <= len(ranges) <= 16:
+        return (f'requested entry 0x{entry:08X} has {len(ranges)} ranges '
+                '(runtime supports 1..16)')
+    if not _addr_in_func_ids(entry, matches):
+        return f'requested entry 0x{entry:08X} is outside its guarded ranges'
+    for ev, _crc, ranges in frag_ids:
+        if not 1 <= len(ranges) <= 16:
+            return (f'fragment entry 0x{ev:08X} has {len(ranges)} ranges '
+                    '(runtime supports 1..16)')
+        if any(length <= 0 for _lo, length in ranges):
+            return f'fragment entry 0x{ev:08X} has an empty guarded range'
+    return None
+
+
+def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
+                               data: bytes, seed_audit: dict,
+                               forced_interiors: set[int]) -> dict | None:
+    """Build one explicit fragment job without mutating the shared seed set."""
+    interiors = {
+        a for a, reason in seed_audit['included_reasons'].items()
+        if reason == 'DISPATCH_INTERIOR'
+    }
+    dispatch_roots = {
+        a for a, reason in seed_audit['included_reasons'].items()
+        if reason in ('DISPATCH_ENTRY', 'DISPATCH_ROOT')
+    }
+    executed = set(seed_audit.get('executed_pcs', set()))
+    region_hi = phys_addr + size
+    forced = {
+        a for a in forced_interiors
+        if phys_addr <= (a & 0x1FFFFFFF) < region_hi
+    }
+    if not (((interiors or dispatch_roots) and executed) or forced):
+        return None
+    return {
+        'phys_addr': phys_addr,
+        'load_addr': load_addr,
+        'size': size,
+        'data': data,
+        'candidates': interiors | dispatch_roots | forced,
+        'executed': executed,
+        'forced': forced,
+        'producer_ranges': tuple(seed_audit['producer_ranges']),
+        'cross_call_allow': tuple(seed_audit['accepted_cross_producer_calls']),
+    }
+
+
 def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
                               size: int, phys_addr: int, cache_dir: str,
-                              args, sub_env: dict):
+                              args, sub_env: dict, toml_doc: dict,
+                              producer_ranges=(), cross_call_allow=()):
     """Compile an ISOLATED interior-entry 'island' fragment that ENTERS at an
     executed orphan DISPATCH_INTERIOR PC (a host that static analysis never
     discovered, e.g. an FMV driver reached via a computed jump) and covers the
@@ -1877,6 +2777,10 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             f.write(make_psxexe(load_addr, interior, data))
         seeds_path = os.path.join(tmp, 'seeds.txt')
         with open(seeds_path, 'w') as f:
+            for range_lo, range_hi in producer_ranges:
+                f.write(f'producer_range 0x{range_lo:08X} 0x{range_hi:08X}\n')
+            for target in sorted(set(cross_call_allow)):
+                f.write(f'cross_call_allow 0x{target:08X}\n')
             f.write(f'dispatch_root 0x{interior:08X}\n')
         out_dir_tmp = os.path.join(tmp, 'out')
         os.makedirs(out_dir_tmp)
@@ -1899,7 +2803,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         with open(full_c) as f:
             src = patch_generated_c(f.read(), load_addr, size)
         c_audit = audit_generated_c(src, load_addr, size,
-                                    binascii.crc32(data) & 0xFFFFFFFF, {})
+                                    binascii.crc32(data) & 0xFFFFFFFF, toml_doc)
         if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
             # RETAIN the failed fragment's C for triage. Region shards already
             # keep their _patched.c on audit failure; interior fragments used to
@@ -1938,6 +2842,10 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
             where = f' at 0x{pc:08X}' if pc is not None else ''
             return None, (f'delay-slot-identity-audit: func 0x{entry:08X}'
                           f'{where}: {reason}')
+        identity_error = validate_interior_fragment_ids(
+            interior, frag_ids, c_audit['defs'])
+        if identity_error:
+            return None, f'requested-entry-audit: {identity_error}'
         # Key the fragment DLL by its func-identity SET (dedup like a region
         # bundle); the loader keys DLLs by the region_start filename prefix and
         # content-matches each function, so a fragment is just another DLL for
@@ -2033,6 +2941,19 @@ def _toolchain_env(gcc: str):
 # BOM-stripped copy of the include dirs (used ONLY for tcc's -I; the codegen hash
 # still derives from the real headers, so the cache dir matches the runtime).
 _TCC_BOMFREE_INC = {}   # orig include dir -> bom-stripped temp dir (memoized)
+_TCC_COMPAT_PREFIX = b'''\
+#ifdef __TINYC__
+/* TinyCC 0.9.27 has no GCC __builtin_ctz. Keep this shim local to the
+ * disposable generated source so runtime headers and the codegen hash stay
+ * byte-identical across compilers. */
+static inline unsigned psx_tcc_ctz(unsigned value) {
+    unsigned bit = 0u;
+    while (((value >> bit) & 1u) == 0u) ++bit;
+    return bit;
+}
+#define __builtin_ctz(value) psx_tcc_ctz((unsigned)(value))
+#endif
+'''
 
 def _bom_free_incdir(d: str) -> str:
     d = os.path.abspath(d)
@@ -2053,14 +2974,24 @@ def _bom_free_incdir(d: str) -> str:
 
 def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
                      tcc: str) -> bool:
-    # strip a UTF-8 BOM off the overlay C itself (tcc 0.9.27 chokes on it)
+    # Strip a UTF-8 BOM off the overlay C itself (tcc 0.9.27 chokes on it) and
+    # provide the one GCC builtin used by the shared cycle-model header.
     with open(c_path, 'rb') as f:
         data = f.read()
     if data[:3] == b'\xef\xbb\xbf':
-        with open(c_path, 'wb') as f:
-            f.write(data[3:])
+        data = data[3:]
+    if not data.startswith(_TCC_COMPAT_PREFIX):
+        data = _TCC_COMPAT_PREFIX + data
+    with open(c_path, 'wb') as f:
+        f.write(data)
     cmd = [tcc, '-shared',
            '-DPSX_OVERLAY_DLL_BUILD',
+           # Keep TCC semantically identical to the GCC overlay path. Omitting
+           # these left debug_server_cyc_observe unresolved in release shards
+           # and disabled guest-cycle charging in every successfully linked
+           # TCC shard.
+           '-DPSX_NO_DEBUG_TOOLS',
+           '-DPSX_ENABLE_BLOCK_CYCLES=1',
            f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
            native_path(c_path), '-o', native_path(out_dll)]
     for d in include_dirs:
@@ -2225,6 +3156,36 @@ def compile_and_publish_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 pass
 
 
+def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
+    """Read overlay_abi from one loaded image, then release it immediately.
+
+    Guards the offline dedup/coverage scan against a cached DLL baked against
+    a different runtime-header/flavor ABI even when its content-CRC matches
+    (see load_region_coverage/load_region_entry_set: --flavor is not part of
+    the cg<N>_<hash> cache-directory namespace, so two flavors can share a
+    cache_dir)."""
+    import _ctypes
+    import ctypes
+    library = None
+    try:
+        library = (ctypes.WinDLL(dll_path) if os.name == 'nt'
+                   else ctypes.CDLL(dll_path))
+        abi_fn = library.overlay_abi
+        abi_fn.argtypes = []
+        abi_fn.restype = ctypes.c_int
+        return (abi_fn() & 0xFFFFFFFF) == (expected_abi & 0xFFFFFFFF)
+    except (OSError, AttributeError):
+        return False
+    finally:
+        if library is not None and library._handle:
+            handle = library._handle
+            library._handle = 0
+            if os.name == 'nt':
+                _ctypes.FreeLibrary(handle)
+            else:
+                _ctypes.dlclose(handle)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2255,6 +3216,9 @@ def main():
                     help='TinyCC binary (used when --compiler tcc)')
     ap.add_argument('--force',           action='store_true',
                     help='recompile even if output already exists')
+    ap.add_argument('--only-region', action='append', default=[],
+                    help='compile only captures whose normalized load address '
+                         'matches this value (repeatable; manual validation aid)')
     ap.add_argument('--check',           action='store_true',
                     help='PREFLIGHT: build every shard into a throwaway temp dir '
                          '(implies --force, ignores any injected cache dir, never '
@@ -2291,7 +3255,10 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
-    forced_interiors = {int(v, 0) for v in args.force_interior}
+    forced_interiors = {
+        (int(v, 0) & 0x1FFFFFFF) | 0x80000000
+        for v in args.force_interior
+    }
 
     # ---- Framework-injected cache location wins over CLI flags ----------------
     # The runtime (autocompile.c) exports PSX_OVERLAY_CACHE_DIR / PSX_OVERLAY_CAPTURES
@@ -2372,6 +3339,14 @@ def main():
 
     captures, capture_sources = load_additive_captures(args.captures)
 
+    if args.only_region:
+        only_regions = {int(value, 0) & 0x1FFFFFFF
+                        for value in args.only_region}
+        captures = [cap for cap in captures
+                    if (int(cap['load_addr'], 16) & 0x1FFFFFFF) in only_regions]
+        if not captures:
+            ap.error('--only-region did not match any capture')
+
     print(f'Captures: {len(captures)} overlay variant(s) from '
           f'{len(capture_sources)} additive manifest(s)\n')
 
@@ -2436,7 +3411,10 @@ def main():
         # entries (walk-root eligible); non-callable ones (alias wrappers
         # from a prior build) re-enter as dispatch entries so the classifier
         # re-derives their interior/alias disposition — feeding them back as
-        # roots would truncate their hosts.
+        # roots would truncate their hosts. validated_cached_bundle_ids walks
+        # BOTH the legacy single-file manifest and every immutable bound
+        # bundle for this logical identity, so a prior build's entries are
+        # never missed just because it published under the immutable scheme.
         if not args.static:
             prior_entries = set()
             for (_prior_dll, prior_ranges, prior_ids,
@@ -2472,14 +3450,16 @@ def main():
         # set — the 0x80024548 class), and the fragment pass is the demand-
         # driven recovery path for exactly that.
         if not args.static:
-            _interiors = {a for a, r in seed_audit['included_reasons'].items()
-                          if r == 'DISPATCH_INTERIOR'}
-            _disp_roots = {a for a, r in seed_audit['included_reasons'].items()
-                           if r in ('DISPATCH_ENTRY', 'DISPATCH_ROOT')}
-            _executed = seed_audit.get('executed_pcs', set())
-            if (_interiors or _disp_roots) and _executed:
-                interior_frag_jobs.append((phys_addr, load_addr, size, data,
-                                           _interiors | _disp_roots, _executed))
+            # A manual exact demand must not depend on the capture still
+            # retaining executed_pcs or on today's classifier assigning the PC
+            # DISPATCH_INTERIOR.  That provenance is precisely what
+            # --force-interior restores.  Keep it isolated from the shared
+            # region seed set and queue the fragment directly.
+            fragment_job = make_interior_fragment_job(
+                phys_addr, load_addr, size, data, seed_audit,
+                forced_interiors)
+            if fragment_job is not None:
+                interior_frag_jobs.append(fragment_job)
 
         print(f'Overlay  load=0x{load_addr:08X}  size={size}  crc32=0x{crc32:08X}')
         if args.static:
@@ -2669,6 +3649,13 @@ def main():
                 with open(debug_c, 'w') as f:
                     f.write(src)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
+                    fallback = optional_enrichment_fallback_capture(cap)
+                    if fallback is not None:
+                        print('  OPTIONAL ENRICHMENT AUDIT REJECTED; '
+                              'retrying conservative recipe\n')
+                        _do_capture(fallback, region_coverage_cache,
+                                    interior_frag_jobs, stats)
+                        return
                     print('  GENERATED-C AUDIT FAILED\n')
                     stats.add_fail(_label, 'audit',
                                    f'{len(c_audit["unknown_bad"])} unknown_bad, '
@@ -2703,16 +3690,30 @@ def main():
                     covered = region_coverage_cache.get(phys_addr)
                     if covered is None:
                         covered = load_region_coverage(
-                            cache_dir, phys_addr, data, load_addr, size)
+                            cache_dir, phys_addr, data, load_addr, size,
+                            overlay_abi_tag(args.runtime_include, args.flavor))
                         region_coverage_cache[phys_addr] = covered
                     fully_covered = (bool(this_set) and this_set <= covered
-                                     and not args.force)
+                                     and not args.force
+                                     and cap.get('producer') !=
+                                         BIOS_RESIDENT_PRODUCER)
                 if fully_covered:
                     print(f'  SKIP: all {len(this_set)} function(s) already '
                           f'covered by existing DLL(s) at this region — no new '
                           f'native code to build\n')
                     stats.add_skip()
                     return
+
+                if not this_ids:
+                    print('  WARNING: recompiler emitted no usable _full.ranges -- '
+                          'preserving any prior DLL/ranges pair and leaving this '
+                          'region to the interpreter')
+                    stats.add_fail(_label, 'no_ranges',
+                                   'no usable function identities (DLL not built)')
+                    return
+                # Retained source is the exact source compiled into the DLL.
+                with open(patched_c, 'w') as f:
+                    f.write(src)
 
                 # Compile to DLL
                 include_dirs = [args.runtime_include]
@@ -2728,6 +3729,7 @@ def main():
                     compiler=args.compiler, tcc=args.tcc)
                 if success:
                     if this_ids:
+                        update_bios_resident_marker(dll_path, cap)
                         print(f'  ranges: {nfn} functions in immutable shard bundle')
                         # New identities are now available for this region_start;
                         # keep the warm coverage set current so later captures in
@@ -2750,6 +3752,13 @@ def main():
                         stats.add_fail(_label, 'no_ranges',
                                        'DLL built but no _full.ranges (undispatchable)')
                 else:
+                    fallback = optional_enrichment_fallback_capture(cap)
+                    if fallback is not None:
+                        print('  OPTIONAL ENRICHMENT COMPILE REJECTED; '
+                              'retrying conservative recipe\n')
+                        _do_capture(fallback, region_coverage_cache,
+                                    interior_frag_jobs, stats)
+                        return
                     print(f'  FAILED\n')
                     stats.add_fail(_label, 'compile',
                                    'gcc/tcc compile failed (see COMPILE ERROR above)')
@@ -2774,24 +3783,30 @@ def main():
         fail_memo = load_interior_fail_memo(cache_dir)
         memo_skipped = 0
         for job in interior_frag_jobs:
-            phys_addr, load_addr, size, data, interior_pcs, executed = job
+            phys_addr = job['phys_addr']
+            load_addr = job['load_addr']
+            size = job['size']
+            data = job['data']
+            interior_pcs = set(job['candidates'])
+            executed = job['executed']
+            forced = job['forced']
             region_crc = binascii.crc32(data) & 0xFFFFFFFF
-            region_lo = load_addr & 0x1FFFFFFF
-            region_hi = region_lo + size
-            interior_pcs = set(interior_pcs)
-            interior_pcs.update(
-                a for a in forced_interiors
-                if region_lo <= (a & 0x1FFFFFFF) < region_hi)
             # ENTRY-based orphan test, not range-based: native code is
             # enterable only at manifest F entries, so "inside a compiled
             # range" does NOT make a dispatch target servable — a range-
             # covered PC with no F entry anywhere still interps its whole
             # chain on every dispatch. Demand an entry at exactly this PC.
             covered_entries = load_region_entry_set(
-                cache_dir, phys_addr, data, load_addr, size)
-            orphans = sorted(a for a in interior_pcs
-                             if (a in executed or a in forced_interiors)
-                             and (a & 0x1FFFFFFF) not in covered_entries)
+                cache_dir, phys_addr, data, load_addr, size,
+                overlay_abi_tag(args.runtime_include, args.flavor))
+            orphans = sorted(
+                a for a in interior_pcs
+                # Explicit exact demands are byte-variant-specific.  Do not let
+                # an F entry from some other region-byte variant suppress the
+                # fragment before its own generated identity is known.
+                if (a in forced or
+                    (a in executed and
+                     (a & 0x1FFFFFFF) not in covered_entries)))
             if not orphans:
                 continue
             built = 0
@@ -2805,7 +3820,9 @@ def main():
                     stats.add_skip()
                     continue
                 frag_ids, status = compile_interior_fragment(
-                    a, data, load_addr, size, phys_addr, cache_dir, args, frag_env)
+                    a, data, load_addr, size, phys_addr, cache_dir, args,
+                    frag_env, toml, job['producer_ranges'],
+                    job['cross_call_allow'])
                 if frag_ids:
                     built += 1
                     if status == 'cached':
@@ -2817,14 +3834,17 @@ def main():
                 else:
                     # An executed orphan interior that would NOT build is a real
                     # coverage hole: that PC's whole dispatch chain runs
-                    # interpreted forever. Tally it loudly with the reason, and
-                    # memoize it so later cycles don't re-walk the same doomed bytes.
+                    # interpreted forever. Tally it loudly with the reason.
+                    # Persist only deterministic generated-code audit verdicts;
+                    # compiler/spawn errors and cache-pair mismatches depend on
+                    # mutable external state and must remain retryable.
                     stats.add_fail(f'interior 0x{a:08X} @region 0x{phys_addr:08X}',
                                    'fragment', status)
-                    fail_memo.add(key)
-                    append_interior_fail_memo(cache_dir, key, status)
+                    if interior_failure_is_deterministic(status):
+                        fail_memo.add(key)
+                        append_interior_fail_memo(cache_dir, key, status)
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
-                  f'executed orphan interior(s) -> isolated island shards')
+                  f'exact-demand orphan interior(s) -> isolated island shards')
         if memo_skipped:
             print(f'  interior fail-memo: skipped {memo_skipped} known-doomed '
                   f'interior(s) (data-as-code from identical bytes; '

@@ -1,9 +1,115 @@
 # AOT Overlay Sharding — Spike Findings & Plan (Tomba-first)
 
-Status: SPIKE / DESIGN (2026-07-17). Not yet executed.
+Status: ENHANCEMENT SPIKE (2026-07-17). Foundation executed and live-proven.
 Author: investigation via 4 parallel agents + adversarial source verification.
 Scope: can we move overlay sharding from *runtime discovery* to *build-time (AOT)*,
 starting with Tomba (SCUS-94236)?
+
+Current Tomba 2 checkpoint: generic play-free extraction emits 29 base/raw regions
+plus exact adjacent-producer composites (52 capture records total). The 29 base/raw
+shards and the live A01 composite audit with zero unsupported instructions or bad
+targets under `cg5_d0a05489`. Direct/constant-register call discovery, raw/cross-file
+base recovery, and padded-return frameless-boundary retention raised full-playthrough
+vault exact-address recall from 1113/1856 (60.0%) to 1270/1856 (68.4%). Those
+historical figures predate duplicate-VA CRC accounting; current reports separately
+count unique entry addresses and exact `(entry, code_crc)` candidates, preserving
+every observed code variant at a reused address. Exact-entry parity is intentionally
+no longer treated as the uncovered-code count: the runtime vault contains
+fine-grained fragments, including consecutive instruction entries, while static AOT
+emits broad functions. Historical interval containment was 1811/1856 (97.6%), with
+45 observed addresses outside every static interval, all in the game-independent
+kernel/low-memory region. Interval containment is unverified potential, not proof
+that the matching code variant can dispatch natively. Runtime static-only validation
+loaded the richer MAIN shard at 60 fps with `stale_blocked=0`, no range/manifest
+overflow, and byte-matching candidates. The clean static-only attract soak then loaded the
+459-function A01 composite and ran the formerly ~14 fps lava demo at 65–67 fps at
+BelowNormal priority, with correct rendering and no range/manifest overflow. Misses
+continue to fail safely to the interpreter.
+
+---
+
+## 2026-07-19: strict indirect-dispatch enrichment and scoreboard contract
+
+- A framed-root candidate is accepted only at a return-adjacent boundary with a
+  bounded stack frame and an in-frame `ra` save before its first control transfer.
+- Indirect switch recovery accepts only the canonical bounded form: `sltiu` guard
+  plus delay-slot NOP, `sll index,2`, producer-owned `lui`+`addiu` table address,
+  `addu`, `lw`, and the exact `jr`. A clobber, skipped definition, malformed or
+  foreign table, or invalid target rejects the whole table. Case targets and call
+  continuations remain dispatch-only interiors, never roots. Python discovery,
+  C++ analysis, and code generation use the same matcher and producer bounds.
+- The emitted proof metadata is diagnostic. If generated-C audit or host compilation
+  rejects an enriched recipe, compilation strips framed roots, aliases, dispatch
+  PCs, and proof fields, then retries the exact producer bytes with direct-JAL roots
+  only.
+- The scoreboard reports three distinct bounded metrics: exact entry address; exact
+  `(entry, code_crc)` candidate, retaining multiple variants per address; and
+  unverified interval containment potential. Vaults and capture histories are finite
+  observed needed sets, never exhaustive title inventories. A reported 100% means
+  only 100% of the named observed set under the named metric.
+
+---
+
+## 2026-07-18: byte-proven archive producers
+
+- The generic extractor now recognizes strict 0x800-aligned `{id,size}` member
+  archives (MMX6 `ROCK_X6.BIN`) and companion HED sector tables spanning DAT/BNS
+  payload namespaces (Ape Escape `KKIIDDZZ.*`).
+- Link bases are not guessed from title constants. Multiple independent members
+  must anchor one sharp jal/prologue consensus; a sibling then needs at least two
+  votes for that exact trusted base.
+- Mixed archive members keep locally callable direct-JAL targets as a conservative
+  retry recipe. Normal-mode entries and exact aliases are optional enrichment:
+  generated-C audit or GCC rejection automatically retries the same byte-proven
+  member with direct roots only. The final disposable MMX6 build compiled all 30
+  members plus the BIOS resident shard (`ok=31 failed=0 skipped=0`). Across 16
+  legacy capture files it contains 636/677 observed entries in overlay intervals
+  (93.9%); all 41 observed addresses outside those intervals are BIOS/kernel PCs,
+  and the separately recompiled base BIOS raises combined interval containment to
+  677/677 (100.0%) for that observed set.
+- Ape's two PS-X EXE mirrors are deduplicated in favor of the self-describing EXE
+  producer. Its remaining 44 HED/BNS members plus two minigame EXEs and the BIOS
+  recipe are also audit-clean in a disposable cache.
+- A fresh 47/47 clean Ape rebuild then completed a title-to-attract-to-title
+  soak across four overlay generations. All 72 exercised game PCs lie in static
+  compiled ranges; the other 35 PCs are covered by the separately generated
+  BIOS/kernel ranges, yielding 107/107 combined interval containment for that
+  observed set. Live-byte guards safely rejected 21 stale candidates, visuals
+  remained correct, and the dev history recorded 21 verified immutable snapshots
+  with no invalid or duplicate references.
+- Normal PS-X discovery now exports its exact overlapping `F/R` alias recipes.
+  Clean overlay builds therefore preserve decoder-proven indirect entries without
+  promoting every entry to a hard root or borrowing a previous cache manifest.
+  T2 compiled 53/53 disposable candidates with zero audit failures and restored
+  100% combined BIOS interval containment for both observed sets.
+- Large archive reads are now linear rather than quadratic sector concatenation.
+  These validations wrote only `%TEMP%` caches; title caches remain untouched.
+- DLL publication is now atomic: compilers target a unique sibling temporary,
+  successful non-empty output replaces the final cache name, and cache reuse
+  requires its non-empty range manifest. Interrupted compiles can no longer
+  poison later runs or overwrite a prior good shard during `--force`.
+- Tomba 1 header exports are authoritative mid-function dispatch entries rather
+  than callable roots. Their conservative retry uses the nearest preceding
+  prologue host, stable-round call discovery prevents interior callees from
+  truncating that host, and dense local pointer tables are rejected as code.
+  Bounded return-to-return scanning also recovers unreferenced frameless leaves.
+  The clean 25-record corpus produces 17 unique shards with zero audit failures.
+  Overlay ranges cover 820/823 historical-vault PCs and 410/450 live-history PCs;
+  every residual is in the separately recompiled BIOS/kernel ranges, yielding
+  **100.0% combined interval containment** for both observed scoreboards.
+- The resulting `cg5_060368b2` checkpoint was re-extracted from disc and tested
+  against disposable caches on the other producers. Ape rebuilt 47/47 GCC shards
+  and retained 107/107 combined live-history interval containment. MMX6 rebuilt 31/31;
+  two unsafe broad-discovery attempts failed their audit/compile gates and fell
+  back to conservative seeds, retaining 677/677 combined interval containment. Tomba 2
+  audited all 53 candidates with zero unsupported/bad targets, TCC-built the full
+  53/53 set, and GCC-built 11 representative shards including MAIN, large area
+  variants, OPN/CRD, and BIOS.
+- TCC overlay compilation now receives the same release/debug and cycle-model
+  defines as GCC. A TCC-only generated-source shim supplies `__builtin_ctz`
+  without changing the hashed runtime headers. The packaged TinyCC 0.9.27
+  toolchain compiles the complete T2 corpus, and atomic publication now removes
+  its staged `.def` sidecars after both success and failure.
 
 ---
 
@@ -107,10 +213,73 @@ executed_pcs[], dispatch_entry_pcs[], function_entry_pcs[], seeds[]
 (`g_dirty_ram_pc_table`, `g_dirty_ram_exec_pc_table`) — **execution-verified**, not
 disassembly guesses.
 
+#### Durable capture history (opt-in)
+
+`overlay_captures.json` remains the canonical latest snapshot consumed by the live
+compiler, but it is published through a same-directory temporary file plus atomic
+replace so readers never observe a half-written manifest. Games may additionally
+set `overlay_capture_history = true` to append each changed coherent snapshot as
+an independent JSONL record to `overlay_captures.addendum.jsonl` beside the
+executable. Without a persist directory the v1 record embeds the full snapshot.
+With dev immutable persistence enabled, a compact v2 record references the
+atomically published JSON and vault merge verifies its FNV signature before use;
+this avoids repeatedly embedding multi-megabyte base64 snapshots. A hard kill can
+damage only the last line; the next append quarantines that tail, and
+`tools/coverage_vault.py merge --addendum ...` ignores malformed records while
+additively merging every valid snapshot.
+
+Development configs may also set a project-relative
+`overlay_capture_persist_dir`. This creates one atomically published, immutable
+JSON snapshot per changed capture. Absolute paths and `..` components are rejected.
+Production configs normally omit this key and retain only the naive executable-
+local addendum. Both history modes are off by default and contain game-derived
+bytes, so their outputs remain private/gitignored artifacts.
+Previously embedded development histories can be converted to verified compact
+references with `coverage_vault.py compact-addendum --addendum ...
+--persist-dir ...`. The tool verifies every valid record against its exact
+immutable snapshot before atomically replacing the addendum, and leaves the
+source untouched if any snapshot is missing or mismatched.
+`coverage_report.py --addendum ...` streams those verified history snapshots and
+unions their dispatch/function entries into the live scoreboard, preserving
+cross-launch recall without loading their game bytes into the static needed set.
+
+The recall scoreboard can roll a persisted live gap set forward after a verified
+monotonic static expansion with
+`coverage_report.py --prior-report <old.json> --assume-static-superset`. The
+explicit assertion is required because an old gap
+manifest stores misses, not every previously covered entry; silently assuming
+monotonicity would make a regressed static set look healthier than it is.
+
+All scoreboard inputs are finite observed needed sets. Reports distinguish exact
+entry-address recall, exact `(entry, code_crc)` candidate recall (including multiple
+CRC variants at one address), and interval containment potential. The last metric
+does not prove that the owning variant or a valid compiled interior matches live
+bytes; no vault result is evidence of an exhaustive title inventory.
+
+The base BIOS recompiler is a separate static producer. When its generated
+dispatcher is available, pass `--bios-dispatch <SCPHxxxx_dispatch.c>` so the
+scoreboard preserves overlay-cache-only metrics and also reports combined exact
+candidate and interval metrics from the dispatch table plus guarded relocated-kernel
+body ranges. Do not
+manufacture overlay shards merely to duplicate those already-native BIOS bodies.
+
+Boot-installed RAM helpers that are not contiguous ROM relocations use a separate
+exact-hash recipe (`tools/aot_overlay_spike/bios_resident_code.json`). The generic
+extractor emits only the listed code words/entries when the supplied BIOS SHA-256
+matches. `compile_overlays.py` adds a `.resident` sidecar, and the runtime preloads
+only explicitly marked resident shards. Preload is registration, not trust: every
+entry still passes the same live code-range CRC before native execution. The
+current SCPH-1001 recipe is exactly `0x8000DF80-0x8000DFF0`; it deliberately omits
+page fill and the `0x8000DFFC` callback-pointer data. This closes the six durable
+Tomba 2 kernel gaps without turning adjacent zeros/data into code.
+
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
    `_walk_overlay_function`) with a strict callable-prologue gate; interior/
    jump-table PCs become aliases, never walk roots.
+   Optional enrichment admits only return-adjacent framed roots and the canonical,
+   producer-bounded switch sequence described above. Its proof fields are persisted
+   for diagnosis, not treated as runtime trust.
 2. Captured bytes wrapped in a **synthetic PS-X EXE** (`make_psxexe`, `:266-274`) and
    handed to the *same* recompiler binary the main EXE uses:
    `psxrecomp-game <fake.psx> --seeds seeds.txt --overlay --ws-config game.toml`.
@@ -121,6 +290,17 @@ disassembly guesses.
 4. Per-function identity = CRC32 over its exact compiled code ranges. Output:
    `<phys>_<region_crc>.dll` + a `.ranges` manifest (`F <entry> <code_crc>` /
    `R <entry> <len>`).
+   Rebuilding identical region bytes also imports prior overlapping alias groups
+   as non-root `retained_alias` bodies. This makes discovery additive: newly
+   proven frameless roots cannot hard-cap and erase an older indirect-entry body.
+   A reachable direct branch that crosses a sibling-entry hard cap may add its
+   target as a static root only when a bounded target-local CFG reaches a return
+   without invalid words or sequential escape.
+   If audit or host compilation rejects enrichment, the tool retries the same bytes
+   after removing framed roots, aliases, dispatch PCs, and proof fields; only
+   direct-JAL roots remain.
+   Exact-hash BIOS resident captures additionally receive a `.resident` sidecar;
+   ordinary captures actively remove a stale sidecar for the same output stem.
 5. `--static` mode instead namespaces the C and folds variants into
    `overlays_static.c` linked directly into the binary, dispatched via a generated
    `psx_overlay_dispatch()` — **this is already an AOT delivery path**; it moves
@@ -136,6 +316,10 @@ disassembly guesses.
   `:595`). Cache is **additive** — every variant ever seen for an address stays
   loaded; per-dispatch CRC picks the one that currently matches (`:1844`). This is
   how one address (`0x800E7xxx`) hosts village vs overworld safely.
+- Marked BIOS-resident shards are registered during cache scan because their exact
+  compact code envelope is not the runtime's page-coalesced kernel region key.
+  They begin invalid while boot RAM differs, then revalidate after the BIOS writes
+  the expected bytes. Unmarked shards retain lazy region loading.
 
 ---
 
