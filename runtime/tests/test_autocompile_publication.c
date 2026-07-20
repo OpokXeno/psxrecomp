@@ -70,12 +70,16 @@ static DWORD WINAPI feed_thread(void *opaque) {
 int main(void) {
     enum { ITEM_COUNT = 300 };
     s_main_thread = GetCurrentThreadId();
+    /* The shared runtime polls every title. A title with overlay autocompile
+     * disabled must not touch the publication lock before configuration. */
+    autocompile_poll_main();
     autocompile_configure("unused", ".");
 
     size_t capacity = (size_t)ITEM_COUNT * 96u;
     char *text = (char *)malloc(capacity);
     if (!text) return 1;
-    int length = 0;
+    int length = snprintf(text, capacity,
+        "PSX_SHARD_RESULT ok=17 failed=0 skipped=4\n");
     for (unsigned i = 0; i < ITEM_COUNT; ++i) {
         length += snprintf(text + length, capacity - (size_t)length,
             "PSX_SHARD_PUBLISHED C:\\cache\\00010000_DEADBEEF_%08X.dll\n", i);
@@ -99,7 +103,22 @@ int main(void) {
         fprintf(stderr, "FAIL: preparer did not exit\n");
         return 1;
     }
+    /* Finalize the synthetic run.  The 300 publication lines are well over
+     * AC_OUT_CAP, so the result marker at the beginning is no longer present
+     * in output_tail.  Its counters must nevertheless survive streaming. */
+    autocompile_poll_main();
     free(text);
+
+    char status[2048];
+    autocompile_status_json(status, sizeof(status));
+    if (!strstr(status, "\"shard_ok\":17") ||
+        !strstr(status, "\"shard_fail\":0") ||
+        !strstr(status, "\"shard_skipped\":4") ||
+        !strstr(status, "\"shard_result_seen\":1")) {
+        fprintf(stderr, "FAIL: streamed shard result was lost after tail eviction: %s\n",
+                status);
+        return 1;
+    }
 
     if (s_prepared != ITEM_COUNT || s_committed != ITEM_COUNT ||
         autocompile_test_ready_count() != 0 ||

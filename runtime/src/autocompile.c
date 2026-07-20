@@ -101,7 +101,31 @@ static char s_child_line[1024];
 static int  s_child_line_len = 0;
 static int  s_child_line_overflow = 0;
 
-static void publish_line_locked(void) {
+/* Parse result markers while stdout is streaming, not from s_out after exit.
+ * The configured child command may chain post-processing after
+ * compile_overlays.py (coverage_vault.py is the production example).  That
+ * output can exceed AC_OUT_CAP and evict the shard result from the diagnostic
+ * tail even though the marker was complete and valid when it arrived.  Keep
+ * the last valid result here; poll_main accounts it exactly once after both
+ * child-output workers have joined. */
+static int shard_result_line_locked(const char *line) {
+    unsigned ok = 0, failed = 0, skipped = 0;
+    int consumed = 0;
+    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u %n",
+               &ok, &failed, &skipped, &consumed) != 3)
+        return 0;
+    for (const char *tail = line + consumed; *tail; tail++) {
+        if (*tail != ' ' && *tail != '\t' && *tail != '\r') return 0;
+    }
+    s_shard_ok = ok;
+    s_shard_fail = failed;
+    s_shard_skipped = skipped;
+    s_shard_result_seen = 1;
+    return 1;
+}
+
+static void child_line_locked(void) {
+    if (shard_result_line_locked(s_child_line)) return;
     static const char marker[] = "PSX_SHARD_PUBLISHED ";
     if (strncmp(s_child_line, marker, sizeof(marker) - 1) != 0) return;
     const char *path = s_child_line + sizeof(marker) - 1;
@@ -131,7 +155,7 @@ static void publish_parse_locked(const char *buf, int n) {
             if (s_child_line_overflow)
                 s_publish_parse_fail_run++;
             else
-                publish_line_locked();
+                child_line_locked();
             s_child_line_len = 0;
             s_child_line_overflow = 0;
         } else if (s_child_line_len < (int)sizeof(s_child_line) - 1) {
@@ -691,7 +715,6 @@ static int parse_shard_result(void) {
     s_shard_ok      = ok;
     s_shard_fail    = failed;
     s_shard_skipped = skipped;
-    if (failed) s_shard_fail_total += failed;
     return 1;
 #else
     return 0;
@@ -703,6 +726,10 @@ void autocompile_poll_main(void) {
      * mapped-but-uninitialized images; callback wiring, validation, and
      * candidate registration remain single-threaded here. */
 #ifdef _WIN32
+    /* Titles without overlay autocompile never call autocompile_configure(),
+     * so their publication lock does not exist. Poll is still called by the
+     * shared maintenance path; keep that unconfigured path a strict no-op. */
+    if (!s_out_lock_init) return;
     PublishItem *published = publish_ready_pop();
     if (published) {
         if (overlay_loader_commit_published(published->image) <= 0)
@@ -737,8 +764,14 @@ void autocompile_poll_main(void) {
         s_job = NULL;
     }
 #endif
+    /* Streaming parsing survives arbitrarily large chained post-processing
+     * output.  Retain the tail scan as a compatibility fallback for output
+     * injected by older/test paths that bypass the line parser. */
+    if (!s_shard_result_seen)
+        s_shard_result_seen = parse_shard_result();
+    if (s_shard_result_seen && s_shard_fail)
+        s_shard_fail_total += s_shard_fail;
     ac_state_store(AC_IDLE);
-    s_shard_result_seen = parse_shard_result();
     /* Direct markers minimize handoff latency, then one idempotent batch-end
      * rescan makes every successfully published artifact visible to additive
      * cache queries and the lazy manifest index. This is intentionally once per
