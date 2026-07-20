@@ -224,6 +224,7 @@ class ShardStats:
         self._lock = threading.Lock()
         self.ok = 0
         self.skipped = 0
+        self.capacity_fastpath = 0
         self.fail_by_class = Counter()
         self.failures = []          # [(label, cls, detail), ...] (detail truncated)
 
@@ -234,6 +235,10 @@ class ShardStats:
     def add_skip(self, n=1):
         with self._lock:
             self.skipped += n
+
+    def add_capacity_fastpath(self, n=1):
+        with self._lock:
+            self.capacity_fastpath += n
 
     def add_fail(self, label, cls, detail=''):
         # Print immediately AND record, so the failure is visible in the live
@@ -255,7 +260,11 @@ class ShardStats:
             fail = sum(self.fail_by_class.values())
             print('\n=== SHARD BUILD SUMMARY ===')
             print(f'  built OK : {self.ok}')
-            print(f'  skipped  : {self.skipped}  (data-only / already-covered)')
+            print(f'  skipped  : {self.skipped}  '
+                  '(cached / data-only / safe coverage loss)')
+            if self.capacity_fastpath:
+                print(f'  cap-fast : {self.capacity_fastpath} cache recipe '
+                      'job(s) skipped at an already-full fixed point')
             print(f'  FAILED   : {fail}')
             for cls, n in sorted(self.fail_by_class.items()):
                 print(f'    - {cls}: {n}')
@@ -265,7 +274,9 @@ class ShardStats:
                 print(f'    ... {len(self.failures) - 40} more')
             # Stable, grep-able result line the runtime (autocompile.c) parses to
             # surface shard_ok / shard_fail without depending on the exit code.
-            print(f'PSX_SHARD_RESULT ok={self.ok} failed={fail} skipped={self.skipped}')
+            print(f'PSX_SHARD_RESULT ok={self.ok} failed={fail} '
+                  f'skipped={self.skipped} '
+                  f'capacity_fastpath={self.capacity_fastpath}')
         return fail
 
 
@@ -435,11 +446,17 @@ def update_bios_resident_marker(dll_path: str, cap: dict) -> None:
         'bios_sha256': str(cap.get('bios_sha256', '')),
         'producer_name': str(cap.get('producer_name', 'BIOS resident code')),
     }
+    serialized = json.dumps(payload, sort_keys=True) + '\n'
+    try:
+        with open(marker, 'r', encoding='utf-8') as f:
+            if f.read(len(serialized) + 1) == serialized:
+                return
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
     tmp = f'{marker}.tmp.{uuid.uuid4().hex}'
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, sort_keys=True)
-            f.write('\n')
+            f.write(serialized)
         os.replace(tmp, marker)
     finally:
         _best_effort_unlink(tmp)
@@ -3377,7 +3394,8 @@ def compile_batched_hosted_aliases(hosted: dict, compile_one, on_success,
                                    still_needed=lambda _entry: True,
                                    should_bisect=lambda _status: True,
                                    on_batch_failure=None,
-                                   attempt_cap=HOSTED_COMPILE_ATTEMPT_CAP) -> int:
+                                   attempt_cap=HOSTED_COMPILE_ATTEMPT_CAP,
+                                   stop_requested=lambda: False) -> int:
     """Compile bounded host groups, splitting hosts before their targets.
 
     Multiple host roots can repartition one another. Exact identity validation
@@ -3422,6 +3440,8 @@ def compile_batched_hosted_aliases(hosted: dict, compile_one, on_success,
 
     def run(group_batch):
         nonlocal attempts
+        if stop_requested():
+            return 0
         filtered = []
         for key, targets in group_batch:
             needed = [entry for entry in targets if still_needed(entry)]
@@ -3491,11 +3511,54 @@ def compile_batched_hosted_aliases(hosted: dict, compile_one, on_success,
                 on_singleton_failure(target, status)
         return 0
 
-    return sum(run(chunk_groups) for chunk_groups in chunks)
+    built = 0
+    for chunk_groups in chunks:
+        if stop_requested():
+            break
+        built += run(chunk_groups)
+    return built
+
+
+def hosted_entries_still_missing(hosted: dict, current_phys_entries,
+                                 rejected_entries=()) -> list[int]:
+    """Return nominated aliases that still need capacity accounting."""
+    covered = {int(entry) & 0x1FFFFFFF for entry in current_phys_entries}
+    rejected = {_canonical_guest_addr(entry) for entry in rejected_entries}
+    return sorted({
+        _canonical_guest_addr(entry)
+        for entry in hosted
+        if ((int(entry) & 0x1FFFFFFF) not in covered and
+            _canonical_guest_addr(entry) not in rejected)
+    })
+
+
+def fragment_capacity_allows_entry(saturated: bool, repair_all: bool,
+                                   forced_entries, entry: int) -> bool:
+    """Whether capacity policy permits one fragment compile attempt.
+
+    A saturated namespace cannot admit ordinary growth.  ``--force`` still
+    has to reach the transactional publisher because replacing the same shard
+    can be capacity-neutral.  ``--force-interior`` grants that exception only
+    to the explicitly named entry.
+    """
+    return (not saturated or repair_all or
+            _canonical_guest_addr(entry) in {
+                _canonical_guest_addr(forced)
+                for forced in forced_entries
+            })
+
+
+def fragment_capacity_fastpath_eligible(saturated: bool, repair_all: bool,
+                                        jobs) -> bool:
+    """Whether an already-full invocation may bypass fragment owner analysis."""
+    return (saturated and not repair_all and
+            not any(job.get('forced') for job in jobs))
 
 
 def fragment_batch_failure_is_partitionable(reason: str) -> bool:
     """Whether retrying smaller root sets can change this failure verdict."""
+    if reason.startswith('candidate-capacity: full'):
+        return False
     return reason.startswith((
         'generated-c-audit:', 'requested-entry-audit:',
         'hosted-entry-audit:',
@@ -3711,7 +3774,13 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                                args.runtime_include),
                            manifest_provenance=manifest_provenance):
             if publication.get('capacity_error'):
-                return None, 'candidate-capacity: ' + publication['capacity_error']
+                capacity_error = publication['capacity_error']
+                match = re.search(
+                    r'(\d+) existing -> \d+ projected .* > (\d+);',
+                    capacity_error)
+                if match and int(match.group(1)) >= int(match.group(2)):
+                    return None, 'candidate-capacity: full; ' + capacity_error
+                return None, 'candidate-capacity: ' + capacity_error
             return None, 'compile-error (see COMPILE ERROR above)'
         if not publication.get('published', True):
             # Another process won the content-key publication race. It is a
@@ -4147,6 +4216,33 @@ def _candidate_capacity_namespace(dll_path: str) -> tuple[str, list[str]]:
         return (os.path.join(game_dir, '.overlay-candidate-capacity.lock'),
                 tier_dirs)
     return (os.path.join(leaf, '.overlay-candidate-capacity.lock'), [leaf])
+
+
+def cache_candidate_capacity_snapshot(
+        dll_path: str, expected_abi: int | None) -> tuple[int, dict]:
+    """Read one recovered candidate namespace under its publication lock."""
+    capacity_lock, cache_dirs = _candidate_capacity_namespace(dll_path)
+    with _exclusive_file_lock(capacity_lock):
+        recover_candidate_namespace(cache_dirs)
+        return cache_candidate_inventory(cache_dirs, expected_abi)
+
+
+def cache_candidate_capacity_full(dll_path: str, expected_abi: int | None,
+                                  candidate_cap: int) -> tuple[bool, int]:
+    """Read one serialized namespace inventory and report a saturated cache."""
+    total, _counts = cache_candidate_capacity_snapshot(dll_path, expected_abi)
+    return total >= candidate_cap, total
+
+
+def candidate_capacity_saturated_in_tier(total: int, counts: dict,
+                                         candidate_cap: int,
+                                         cache_dir: str) -> bool:
+    """Whether every counted candidate belongs to one saturated active tier."""
+    active = os.path.normcase(os.path.abspath(cache_dir))
+    return (total >= candidate_cap and bool(counts) and all(
+        os.path.normcase(os.path.abspath(os.path.dirname(path))) == active
+        for path in counts
+    ))
 
 
 def cache_candidate_inventory(cache_dirs: list[str],
@@ -5198,6 +5294,16 @@ def main():
         memo_skipped = 0
         variant_coverage_cache = {}
         expected_abi = overlay_abi_tag(args.runtime_include, args.flavor)
+        runtime_candidate_cap = overlay_candidate_cap(args.runtime_include)
+        capacity_probe = os.path.join(
+            cache_dir, f'00000000_00000000{overlay_ext()}')
+        candidate_capacity_exhausted, existing_candidates = \
+            cache_candidate_capacity_full(
+                capacity_probe, expected_abi, runtime_candidate_cap)
+        if candidate_capacity_exhausted:
+            print(f'  overlay candidate capacity already full: '
+                  f'{existing_candidates}/{runtime_candidate_cap}; '
+                  'new fragments stay interpreted')
         invocation_recipe = (
             expected_abi, int(args.flavor), bool(args.cps), args.compiler,
             hashlib.sha256(json.dumps(
@@ -5209,6 +5315,54 @@ def main():
         if len(merged_jobs) != len(interior_frag_jobs):
             print(f'  fragment recipes: merged {len(interior_frag_jobs)} capture '
                   f'job(s) into {len(merged_jobs)} byte-variant recipe(s)')
+
+        # A namespace that is already saturated cannot admit ordinary fragment
+        # growth.  Avoid the expensive cross-variant donor/owner proof at this
+        # true fixed point, but preserve the only failure semantics that do not
+        # require that proof: a required executed demand already memoized as a
+        # deterministic compile failure remains loud.  --force and explicit
+        # --force-interior work bypass this shortcut because a same-basename
+        # replacement can be capacity-neutral.
+        if fragment_capacity_fastpath_eligible(
+                candidate_capacity_exhausted, args.force, merged_jobs):
+            for job in merged_jobs:
+                memo_entries = {}
+                for entry in sorted(job['candidates']):
+                    key = _interior_fail_key(
+                        job['phys_addr'], entry, job['data'],
+                        job['load_addr'], job['size'],
+                        job['producer_ranges'], job['cross_call_allow'],
+                        expected_abi, args.cps, toml)
+                    if key in fail_memo:
+                        memo_entries[entry] = fail_memo[key]
+                if not memo_entries:
+                    continue
+                current_entries, _current_ranges = \
+                    load_region_current_variant_coverage(
+                        cache_dir, job['phys_addr'], job['data'],
+                        job['load_addr'], job['size'], expected_abi)
+                for entry, reason in memo_entries.items():
+                    if (entry & 0x1FFFFFFF) in current_entries:
+                        continue
+                    memo_action = interior_fail_memo_action(
+                        entry, job, args.force)
+                    if memo_action == 'skip':
+                        memo_skipped += 1
+                        stats.add_skip()
+                    else:
+                        stats.add_fail(
+                            f'interior 0x{entry:08X} @region '
+                            f'0x{job["phys_addr"]:08X}',
+                            'fragment_memo', reason)
+            stats.add_capacity_fastpath(len(merged_jobs))
+            print(f'  fragment capacity fixed point: skipped donor/owner '
+                  f'analysis for {len(merged_jobs)} byte-variant recipe job(s); '
+                  'the exact unserved hosted-demand count was intentionally '
+                  'not recomputed')
+            if memo_skipped:
+                print(f'  interior fail-memo: skipped {memo_skipped} '
+                      'known-doomed optional interior(s)')
+            return
 
         # Global phase 1: publish every strong play-free root before freezing
         # sibling donor authority.  Freezing first deferred these roots until a
@@ -5262,6 +5416,32 @@ def main():
                 else:
                     batch_pending.append(entry)
 
+            if candidate_capacity_exhausted:
+                capacity_pending = [
+                    entry for entry in batch_pending + isolated_pending
+                    if not fragment_capacity_allows_entry(
+                        True, args.force, job['forced'], entry)
+                ]
+                if capacity_pending:
+                    print(f'  strong-root supplement @0x{phys_addr:08X}: '
+                          f'{len(capacity_pending)} demand(s) left to '
+                          'interpreter: candidate capacity full')
+                    strong_handled.update(capacity_pending)
+                    for _entry in capacity_pending:
+                        stats.add_skip()
+                capacity_pending_set = set(capacity_pending)
+                batch_pending = [
+                    entry for entry in batch_pending
+                    if entry not in capacity_pending_set
+                ]
+                isolated_pending = [
+                    entry for entry in isolated_pending
+                    if entry not in capacity_pending_set
+                ]
+                if not batch_pending and not isolated_pending:
+                    strong_handled_by_job.append(strong_handled)
+                    continue
+
             def compile_strong_batch(entries):
                 return compile_fragment_batch(
                     entries, data, load_addr, size, phys_addr, cache_dir,
@@ -5290,8 +5470,11 @@ def main():
                         fragment_dll, job['resident_cap'], status == 'built')
 
             def strong_singleton_failure(entry, status):
+                nonlocal candidate_capacity_exhausted
                 strong_handled.add(entry)
                 if status.startswith('candidate-capacity:'):
+                    if status.startswith('candidate-capacity: full'):
+                        candidate_capacity_exhausted = True
                     print(f'  fragment 0x{entry:08X} skipped safely: '
                           f'{status}')
                     stats.add_skip()
@@ -5315,7 +5498,11 @@ def main():
                     append_interior_fail_memo(cache_dir, key, status)
 
             def strong_batch_failure(entries, status):
+                nonlocal candidate_capacity_exhausted
                 if status.startswith('candidate-capacity:'):
+                    strong_handled.update(entries)
+                    if status.startswith('candidate-capacity: full'):
+                        candidate_capacity_exhausted = True
                     for _entry in entries:
                         stats.add_skip()
                     print(f'  strong-root batch: {len(entries)} demand(s) '
@@ -5338,6 +5525,13 @@ def main():
             # historical singleton failure domain, but still closes before the
             # donor snapshot. A successful batch may incidentally cover it.
             for entry in isolated_pending:
+                if not fragment_capacity_allows_entry(
+                        candidate_capacity_exhausted, args.force,
+                        job['forced'], entry):
+                    if entry not in strong_handled:
+                        strong_handled.add(entry)
+                        stats.add_skip()
+                    continue
                 if (entry & 0x1FFFFFFF) in current_variant_entries:
                     strong_handled.add(entry)
                     continue
@@ -5352,6 +5546,20 @@ def main():
                       f'{len(strong_candidates)} demand(s) -> '
                       f'{strong_shards} batched shard(s)')
             strong_handled_by_job.append(strong_handled)
+
+        # A strong-root publication can consume the last Candidate slots.
+        # Re-probe under the shared namespace lock before hosted admission.
+        # The outer invocation lock excludes cooperating writers for the rest
+        # of this pass; an uncoordinated external deletion can only cause safe
+        # coverage loss until the next invocation.
+        was_capacity_exhausted = candidate_capacity_exhausted
+        candidate_capacity_exhausted, existing_candidates = \
+            cache_candidate_capacity_full(
+                capacity_probe, expected_abi, runtime_candidate_cap)
+        if candidate_capacity_exhausted and not was_capacity_exhausted:
+            print(f'  overlay candidate capacity reached after strong-root '
+                  f'closure: {existing_candidates}/{runtime_candidate_cap}; '
+                  'new fragments stay interpreted')
 
         # Global phase 2: snapshot native coverage and authority separately.
         # Coverage includes prior hosted shards so a valid alias is not rebuilt.
@@ -5377,7 +5585,6 @@ def main():
         # coverage.  The recipient heap-merge below applies the final cap only
         # after excluding self evidence and already native entries.
         hosted_donors_by_region = {}
-        runtime_candidate_cap = overlay_candidate_cap(args.runtime_include)
         initial_entry_bound_by_region = Counter()
         for index, indexed_job in enumerate(merged_jobs):
             initial_entry_bound_by_region[indexed_job['phys_addr']] = max(
@@ -5462,7 +5669,10 @@ def main():
                         fragment_dll, job['resident_cap'], status == 'built')
 
             def record_fragment_failure(entry, status):
+                nonlocal candidate_capacity_exhausted
                 if status.startswith('candidate-capacity:'):
+                    if status.startswith('candidate-capacity: full'):
+                        candidate_capacity_exhausted = True
                     print(f'  fragment 0x{entry:08X} skipped safely: {status}')
                     stats.add_skip()
                     return
@@ -5515,9 +5725,15 @@ def main():
                     args, frag_env, toml, job['producer_ranges'],
                     job['cross_call_allow'], hosted_owners=specs)
 
+            hosted_rejected = set()
+            hosted_published = False
+
             def hosted_success(batch, frag_ids, status):
+                nonlocal hosted_published
                 record_fragment_success(
                     frag_ids, status, HOSTED_MANIFEST_PROVENANCE)
+                if status == 'built':
+                    hosted_published = True
                 emitted = {
                     _canonical_guest_addr(entry)
                     for entry, _crc, _ranges in frag_ids
@@ -5530,8 +5746,15 @@ def main():
                 return set(batch) - set(missing)
 
             def hosted_singleton_failure(entry, status):
+                nonlocal candidate_capacity_exhausted
                 print(f'  hosted interior 0x{entry:08X} rejected safely: '
                       f'{status}')
+                if status.startswith('candidate-capacity: full'):
+                    candidate_capacity_exhausted = True
+                    if args.force:
+                        stats.add_skip()
+                    return
+                hosted_rejected.add(_canonical_guest_addr(entry))
                 if status.startswith((
                         'generated-c-audit:', 'hosted-entry-audit:',
                         'hosted-no-target:', 'candidate-capacity:',
@@ -5544,6 +5767,17 @@ def main():
                         'hosted_fragment', status)
 
             def hosted_batch_failure(batch, status):
+                nonlocal candidate_capacity_exhausted
+                if status.startswith('candidate-capacity: full'):
+                    candidate_capacity_exhausted = True
+                    print(f'  hosted batch: 0/{len(batch)} target(s) passed '
+                          'recipient CFG proof; candidate capacity full')
+                    if args.force:
+                        for _entry in batch:
+                            stats.add_skip()
+                    return
+                hosted_rejected.update(
+                    _canonical_guest_addr(entry) for entry in batch)
                 if status.startswith((
                         'hosted-no-target:',
                         'hosted-entry-audit: compile attempt cap',
@@ -5565,7 +5799,33 @@ def main():
                 lambda entry: ((entry & 0x1FFFFFFF) not in
                                current_variant_entries),
                 fragment_batch_failure_is_partitionable,
-                hosted_batch_failure)
+                hosted_batch_failure,
+                stop_requested=lambda: (
+                    candidate_capacity_exhausted and not args.force))
+            if hosted_published:
+                was_capacity_exhausted = candidate_capacity_exhausted
+                candidate_capacity_exhausted, existing_candidates = \
+                    cache_candidate_capacity_full(
+                        capacity_probe, expected_abi, runtime_candidate_cap)
+                if (candidate_capacity_exhausted and
+                        not was_capacity_exhausted):
+                    print(f'  overlay candidate capacity reached after '
+                          f'hosted closure: {existing_candidates}/'
+                          f'{runtime_candidate_cap}; ordinary fragments stay '
+                          'interpreted')
+            hosted_capacity_skipped = set()
+            if candidate_capacity_exhausted and not args.force:
+                already_accounted = hosted_rejected | {
+                    _canonical_guest_addr(entry) for entry in strong_handled
+                }
+                capacity_missing = hosted_entries_still_missing(
+                    hosted, current_variant_entries, already_accounted)
+                if capacity_missing:
+                    hosted_capacity_skipped.update(capacity_missing)
+                    hosted_audit['candidate_capacity_full'] = \
+                        len(capacity_missing)
+                    for _entry in capacity_missing:
+                        stats.add_skip()
             if sibling_proofs:
                 print(f'  cross-variant hosted supplement @0x{phys_addr:08X}: '
                       f'{len(hosted)}/{len(sibling_proofs)} sibling-proven '
@@ -5578,11 +5838,40 @@ def main():
                 static_interval_demands, current_variant_entries,
                 current_variant_ranges)
             orphans = [entry for entry in orphans
-                       if entry not in strong_handled]
+                       if (entry not in strong_handled and
+                           _canonical_guest_addr(entry) not in
+                           hosted_capacity_skipped)]
             if not orphans:
                 continue
+            capacity_orphans = [
+                entry for entry in orphans
+                if not fragment_capacity_allows_entry(
+                    candidate_capacity_exhausted, args.force,
+                    job['forced'], entry)
+            ]
+            if capacity_orphans:
+                print(f'  orphan fragments: {len(capacity_orphans)} '
+                      'demand(s) left to interpreter: candidate capacity full')
+                for _entry in capacity_orphans:
+                    stats.add_skip()
+                capacity_orphan_set = set(capacity_orphans)
+                orphans = [
+                    entry for entry in orphans
+                    if entry not in capacity_orphan_set
+                ]
+                if not orphans:
+                    continue
             built = 0
             for a in orphans:
+                # A preceding orphan can consume the final slot or receive the
+                # first authoritative full verdict.  Stop ordinary toolchain
+                # work immediately while still allowing a later explicit
+                # capacity-neutral repair candidate.
+                if not fragment_capacity_allows_entry(
+                        candidate_capacity_exhausted, args.force,
+                        job['forced'], a):
+                    stats.add_skip()
+                    continue
                 key = _interior_fail_key(
                     phys_addr, a, data, load_addr, size,
                     job['producer_ranges'], job['cross_call_allow'],
@@ -5639,24 +5928,91 @@ def main():
         # recipes and serialize whole compiler invocations in this namespace;
         # a mutex around only the final rename would still admit whichever
         # worker happened to arrive first at cap-minus-N.
-        captures.sort(key=lambda cap: (
-            int(cap['load_addr'], 16) & 0x1FFFFFFF,
-            binascii.crc32(base64.b64decode(cap['bytes_b64'])) & 0xFFFFFFFF,
-            hashlib.sha256(json.dumps(
-                cap, sort_keys=True, separators=(',', ':'),
-                default=str).encode('utf-8')).digest(),
-        ))
-        if args.jobs > 1:
-            print('Deterministic candidate-cap admission: region recipes run '
-                  'in canonical order (parallel publication disabled)\n')
         capacity_lock, _tier_dirs = _candidate_capacity_namespace(
             os.path.join(cache_dir, f'00000000_00000000{overlay_ext()}'))
         invocation_lock = capacity_lock + '.invocation'
         with _exclusive_file_lock(invocation_lock, timeout=None):
-            for cap in captures:
-                _do_capture(
-                    cap, region_coverage_cache, interior_frag_jobs, stats)
-            _do_frags(interior_frag_jobs, stats)
+            expected_abi = overlay_abi_tag(
+                args.runtime_include, args.flavor)
+            runtime_candidate_cap = overlay_candidate_cap(
+                args.runtime_include)
+            capacity_probe = os.path.join(
+                cache_dir, f'00000000_00000000{overlay_ext()}')
+            existing_candidates, candidate_counts = \
+                cache_candidate_capacity_snapshot(
+                    capacity_probe, expected_abi)
+            saturated_single_tier = candidate_capacity_saturated_in_tier(
+                existing_candidates, candidate_counts,
+                runtime_candidate_cap, cache_dir)
+            capacity_fixedpoint = (
+                saturated_single_tier and not args.force and
+                not forced_interiors)
+            captures_to_process = captures
+            if capacity_fixedpoint:
+                # At a single-tier full namespace, ordinary compilation cannot
+                # publish growth and there is no lower compiler tier to promote
+                # with a capacity-neutral basename replacement.  This is an
+                # intentionally coarse fixed-point result: coverage_report is
+                # the exact gap authority, while this invocation avoids decoding
+                # and sorting a potentially gigabyte-scale capture collection.
+                # BIOS resident bundles are the exception: normal policy lets a
+                # richer capture replace its canonical bundle without --force,
+                # and that replacement can be capacity-neutral. Process only
+                # these tiny captures, then re-probe before suppressing the
+                # gigabyte-scale ordinary collection.
+                resident_captures = [
+                    cap for cap in captures
+                    if cap.get('producer') == BIOS_RESIDENT_PRODUCER
+                ]
+                resident_captures.sort(key=lambda cap: (
+                    int(cap['load_addr'], 16) & 0x1FFFFFFF,
+                    binascii.crc32(base64.b64decode(
+                        cap['bytes_b64'])) & 0xFFFFFFFF,
+                    hashlib.sha256(json.dumps(
+                        cap, sort_keys=True, separators=(',', ':'),
+                        default=str).encode('utf-8')).digest(),
+                ))
+                for cap in resident_captures:
+                    _do_capture(
+                        cap, region_coverage_cache, interior_frag_jobs, stats)
+                resident_ids = {id(cap) for cap in resident_captures}
+                captures_to_process = [
+                    cap for cap in captures if id(cap) not in resident_ids
+                ]
+                existing_candidates, candidate_counts = \
+                    cache_candidate_capacity_snapshot(
+                        capacity_probe, expected_abi)
+                capacity_fixedpoint = candidate_capacity_saturated_in_tier(
+                    existing_candidates, candidate_counts,
+                    runtime_candidate_cap, cache_dir)
+                if capacity_fixedpoint:
+                    stats.add_capacity_fastpath(len(captures_to_process))
+                    print(f'Overlay candidate fixed point: '
+                          f'{existing_candidates}/{runtime_candidate_cap} '
+                          f'candidates in the active compiler tier; processed '
+                          f'{len(resident_captures)} BIOS resident recipe(s) '
+                          f'and skipped {len(captures_to_process)} ordinary '
+                          'capture recipe(s) before byte decode. Use --force or '
+                          '--force-interior for capacity-neutral repair '
+                          'attempts; coverage_report remains the exact gap '
+                          'authority.\n')
+            if not capacity_fixedpoint:
+                captures_to_process.sort(key=lambda cap: (
+                    int(cap['load_addr'], 16) & 0x1FFFFFFF,
+                    binascii.crc32(base64.b64decode(
+                        cap['bytes_b64'])) & 0xFFFFFFFF,
+                    hashlib.sha256(json.dumps(
+                        cap, sort_keys=True, separators=(',', ':'),
+                        default=str).encode('utf-8')).digest(),
+                ))
+                if args.jobs > 1:
+                    print('Deterministic candidate-cap admission: region '
+                          'recipes run in canonical order '
+                          '(parallel publication disabled)\n')
+                for cap in captures_to_process:
+                    _do_capture(
+                        cap, region_coverage_cache, interior_frag_jobs, stats)
+                _do_frags(interior_frag_jobs, stats)
 
     # B-2: write combined static C file
     if args.static and static_parts:

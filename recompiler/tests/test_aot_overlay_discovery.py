@@ -1551,6 +1551,13 @@ def check_candidate_capacity_publication():
             assert MOD.publish_shard_pair(
                 staged, staged_ranges, third, candidate_cap=4)
             assert MOD.cache_candidate_inventory([tmp], None)[0] == 4
+            assert MOD.cache_candidate_capacity_full(third, None, 4) == \
+                (True, 4)
+            total, counts = MOD.cache_candidate_capacity_snapshot(third, None)
+            assert MOD.candidate_capacity_saturated_in_tier(
+                total, counts, 4, tmp)
+            assert not MOD.candidate_capacity_saturated_in_tier(
+                total, counts, 5, tmp)
             cache_hit = os.path.join(tmp, '.cache-hit.dll')
             cache_hit_ranges = os.path.join(tmp, '.cache-hit.ranges')
             pair(cache_hit, 1, 30, LOAD + 0x200)
@@ -1581,6 +1588,8 @@ def check_candidate_capacity_publication():
             assert MOD.publish_shard_pair(
                 replacement, replacement_ranges, third, candidate_cap=4)
             assert MOD.cache_candidate_inventory([tmp], None)[0] == 3
+            assert MOD.cache_candidate_capacity_full(third, None, 4) == \
+                (False, 3)
             old_dll = pathlib.Path(third).read_bytes()
             old_ranges = pathlib.Path(third).with_suffix('.ranges').read_text()
             growth = os.path.join(tmp, '.growth.dll')
@@ -1652,6 +1661,17 @@ def check_candidate_capacity_publication():
             total, counts = MOD.cache_candidate_inventory(tier_dirs, None)
             assert total == 2 and counts[gcc_pair] == 2
             assert tcc_pair not in counts
+            assert MOD.candidate_capacity_saturated_in_tier(
+                total, counts, 2, str(gcc_dir))
+            lower_unique = str(tcc_dir / '00010000_00000002.dll')
+            pair(lower_unique, 1, 14, LOAD + 0x80)
+            total, counts = MOD.cache_candidate_inventory(tier_dirs, None)
+            assert total == 3 and counts[lower_unique] == 1
+            assert not MOD.candidate_capacity_saturated_in_tier(
+                total, counts, 3, str(gcc_dir))
+            pathlib.Path(lower_unique).unlink()
+            pathlib.Path(lower_unique).with_suffix('.ranges').unlink()
+            total, counts = MOD.cache_candidate_inventory(tier_dirs, None)
             assert MOD.projected_cache_candidate_count(
                 total, counts, tier_dirs, tcc_pair, 4) == 2
             assert MOD.projected_cache_candidate_count(
@@ -2139,6 +2159,56 @@ def check_interior_fragment_contract():
     assert len(partition_calls) == 5
     assert sorted(partition_failures) == sorted(partial_map)
 
+    # Saturation is global for the invocation: once one chunk reports a full
+    # Candidate table, do not invoke the toolchain for later chunks.
+    full_calls = []
+    capacity_full = [False]
+    many_targets = {
+        hosted_target + 0x100 + index * 4: hosted_spec
+        for index in range(MOD.HOSTED_BATCH_ALIAS_CAP + 1)
+    }
+
+    def full_compile(specs):
+        full_calls.append(tuple(sorted(specs)))
+        return None, 'candidate-capacity: full; synthetic'
+
+    def full_batch_failure(_entries, status):
+        assert status.startswith('candidate-capacity: full')
+        capacity_full[0] = True
+
+    assert MOD.compile_batched_hosted_aliases(
+        many_targets, full_compile,
+        lambda *_args: (_ for _ in ()).throw(AssertionError('success')),
+        lambda *_args: (_ for _ in ()).throw(AssertionError('singleton')),
+        should_bisect=MOD.fragment_batch_failure_is_partitionable,
+        on_batch_failure=full_batch_failure,
+        stop_requested=lambda: capacity_full[0]) == 0
+    assert len(full_calls) == 1
+
+    covered_target = hosted_target
+    rejected_target = hosted_target + 4
+    missing_target = hosted_target + 8
+    assert MOD.hosted_entries_still_missing(
+        {covered_target: hosted_spec, rejected_target: hosted_spec,
+         missing_target: hosted_spec},
+        {covered_target & 0x1FFFFFFF}, {rejected_target}) == [missing_target]
+
+    forced = {missing_target}
+    assert MOD.fragment_capacity_allows_entry(False, False, (), covered_target)
+    assert MOD.fragment_capacity_allows_entry(True, True, (), covered_target)
+    assert MOD.fragment_capacity_allows_entry(
+        True, False, forced, missing_target)
+    assert not MOD.fragment_capacity_allows_entry(
+        True, False, forced, covered_target)
+    assert MOD.fragment_capacity_fastpath_eligible(
+        True, False, [{'forced': set()}])
+    assert not MOD.fragment_capacity_fastpath_eligible(
+        False, False, [{'forced': set()}])
+    assert not MOD.fragment_capacity_fastpath_eligible(
+        True, True, [{'forced': set()}])
+    assert not MOD.fragment_capacity_fastpath_eligible(
+        True, False, [{'forced': forced}])
+
     # Same-byte/full-recipe captures union their root evidence into one bounded
     # supplemental job; a byte or producer recipe change remains isolated.
     other = entry + 0x40
@@ -2237,7 +2307,7 @@ def check_interior_fragment_contract():
         "compile-error (toolchain unavailable)")
     assert MOD.fragment_batch_failure_is_partitionable(
         "requested-entry-audit: rejected")
-    assert MOD.fragment_batch_failure_is_partitionable(
+    assert not MOD.fragment_batch_failure_is_partitionable(
         "candidate-capacity: full")
     assert MOD.compile_batched_fragment_roots(
         {entry, other}, toolchain_down,
@@ -2249,6 +2319,24 @@ def check_interior_fragment_contract():
     assert calls == [(entry, other)]
     assert batch_failures == [
         ((entry, other), "compile-error (toolchain unavailable)")]
+
+    calls.clear()
+    batch_failures.clear()
+
+    def capacity_full(roots):
+        calls.append(tuple(roots))
+        return None, "candidate-capacity: full; 4 existing >= 4"
+
+    assert MOD.compile_batched_fragment_roots(
+        {entry, other}, capacity_full,
+        lambda *_args: None,
+        lambda root, status: failures.append((root, status)),
+        should_bisect=MOD.fragment_batch_failure_is_partitionable,
+        on_batch_failure=lambda roots, status: batch_failures.append(
+            (tuple(roots), status))) == 0
+    assert calls == [(entry, other)]
+    assert batch_failures == [
+        ((entry, other), "candidate-capacity: full; 4 existing >= 4")]
 
     # Static exact demand is variant-specific: another variant's F entry does
     # not suppress it. Alias demand is narrower and only fills interval holes.
@@ -2835,6 +2923,158 @@ def check_full_hosted_fixed_point(recompiler):
         assert 'PSX_SHARD_RESULT ok=0 failed=0 ' in second.stdout, second.stdout
 
 
+def check_full_candidate_cli_fastpath(recompiler):
+    """An already-full single-tier cache must bypass every compile recipe."""
+    gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
+           if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
+           else shutil.which('gcc'))
+    if not gcc:
+        return
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        runtime_include = tmp / 'include'
+        shutil.copytree(ROOT / 'runtime' / 'include', runtime_include)
+        api = runtime_include / 'overlay_api.h'
+        api_text = api.read_text(encoding='utf-8')
+        assert '#define PSX_OVERLAY_CANDIDATE_CAP 32768' in api_text
+        api.write_text(api_text.replace(
+            '#define PSX_OVERLAY_CANDIDATE_CAP 32768',
+            '#define PSX_OVERLAY_CANDIDATE_CAP 1'), encoding='utf-8')
+
+        game_toml = ROOT / 'tools' / 'cycle_testrom' / 'game.toml'
+        cache_root = tmp / 'cache'
+        leaf = (cache_root / 'CYCT-00101' / 'gcc' / MOD.cache_arch_abi() /
+                f'cg{MOD.codegen_ver(str(runtime_include))}_'
+                f'{MOD.codegen_hash(str(runtime_include)):08x}')
+        leaf.mkdir(parents=True)
+        pair_id = 0x123456789ABCDEF0
+        captured_bytes = b'\x08\x00\xE0\x03'
+        code_crc = MOD.binascii.crc32(captured_bytes) & 0xFFFFFFFF
+        ext = MOD.overlay_ext()
+        dll = leaf / f'00010000_{code_crc:08X}{ext}'
+        source = tmp / 'prefill.c'
+        abi = MOD.overlay_abi_tag(str(runtime_include), 0)
+        export = ('__declspec(dllexport)'
+                  if os.name == 'nt' else
+                  '__attribute__((visibility("default")))')
+        source.write_text(
+            '#include <stdint.h>\n'
+            f'#define EX {export}\n'
+            f'EX int overlay_abi(void){{return {abi};}}\n'
+            f'EX uint64_t overlay_pair_id(void){{return UINT64_C('
+            f'0x{pair_id:016X});}}\n'
+            'EX void overlay_init(const void*p){(void)p;}\n'
+            'EX void overlay_flush_cycles(void){}\n'
+            'EX void func_80010000(void*p){(void)p;}\n',
+            encoding='utf-8')
+        subprocess.run(
+            [gcc, '-shared', str(source), '-o', str(dll)],
+            check=True, capture_output=True, text=True)
+        manifest = dll.with_suffix('.ranges')
+        manifest.write_text(MOD.overlay_ranges_text([
+            (LOAD, code_crc, ((LOAD, 4),)),
+        ], pair_id), encoding='ascii')
+        assert len(MOD.load_shard_func_ids(str(dll), abi)) == 1
+
+        capture_path = tmp / 'captures.json'
+        capture = {
+            'schema': 'psxrecomp overlay capture v2',
+            'load_addr': f'0x{LOAD:08X}',
+            'size': 4,
+            'bytes_b64': MOD.base64.b64encode(captured_bytes).decode(),
+            'executed_pcs': [f'0x{LOAD:08X}'],
+            'dispatch_entry_pcs': [f'0x{LOAD:08X}'],
+            'function_entry_pcs': [f'0x{LOAD:08X}'],
+            'seeds': [f'0x{LOAD:08X}'],
+        }
+        resident_capture = dict(capture)
+        resident_capture.update({
+            'producer': MOD.BIOS_RESIDENT_PRODUCER,
+            'producer_name': 'synthetic resident fixed-point test',
+            'bios_sha256': '71af94d1',
+        })
+        capture_path.write_text(
+            MOD.json.dumps([resident_capture, capture]), encoding='utf-8')
+        before = {
+            path.name: (MOD.hashlib.sha256(path.read_bytes()).hexdigest(),
+                        path.stat().st_mtime_ns)
+            for path in (dll, manifest)
+        }
+        command = [
+            sys.executable, str(ROOT / 'tools' / 'compile_overlays.py'),
+            '--captures', str(capture_path),
+            '--game-toml', str(game_toml),
+            '--recompiler', recompiler,
+            '--runtime-include', str(runtime_include),
+            '--gcc', gcc,
+            '--out-dir', str(cache_root),
+            '--jobs', '1',
+        ]
+        env = os.environ.copy()
+        env.pop('PSX_OVERLAY_CACHE_DIR', None)
+        env.pop('PSX_OVERLAY_CAPTURES', None)
+        env['PATH'] = os.path.dirname(gcc) + os.pathsep + env.get('PATH', '')
+        run = subprocess.run(
+            command, cwd=str(ROOT), env=env, capture_output=True, text=True,
+            timeout=30)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert 'Overlay candidate fixed point: 1/1' in run.stdout, run.stdout
+        assert ('processed 1 BIOS resident recipe(s) and skipped 1 ordinary '
+                'capture recipe(s)') in run.stdout, run.stdout
+        assert ('PSX_SHARD_RESULT ok=0 failed=0 skipped=1 '
+                'capacity_fastpath=1') in run.stdout, run.stdout
+        assert '  compile:' not in run.stdout
+        after = {
+            path.name: (MOD.hashlib.sha256(path.read_bytes()).hexdigest(),
+                        path.stat().st_mtime_ns)
+            for path in (dll, manifest)
+        }
+        assert after == before
+        marker = dll.with_suffix('.resident')
+        marker_bytes = marker.read_bytes()
+        assert MOD.json.loads(marker_bytes.decode('utf-8'))['schema'] == \
+            MOD.BIOS_RESIDENT_MARKER
+        sentinel_ns = 946684800_000_000_000
+        os.utime(marker, ns=(sentinel_ns, sentinel_ns))
+        marker_mtime = marker.stat().st_mtime_ns
+        rerun = subprocess.run(
+            command, cwd=str(ROOT), env=env, capture_output=True, text=True,
+            timeout=30)
+        assert rerun.returncode == 0, rerun.stdout + rerun.stderr
+        assert marker.read_bytes() == marker_bytes
+        assert marker.stat().st_mtime_ns == marker_mtime
+
+
+def check_resident_marker_fixed_point():
+    with tempfile.TemporaryDirectory() as td:
+        dll = pathlib.Path(td) / '0000DF80_4EE6AC69.dll'
+        dll.write_bytes(b'dll')
+        cap = {
+            'producer': MOD.BIOS_RESIDENT_PRODUCER,
+            'producer_name': 'SCPH-1001 resident helper',
+            'bios_sha256': '71af94d1',
+        }
+        MOD.update_bios_resident_marker(str(dll), cap)
+        marker = dll.with_suffix('.resident')
+        first_bytes = marker.read_bytes()
+        parsed = MOD.json.loads(first_bytes.decode('utf-8'))
+        assert parsed['schema'] == MOD.BIOS_RESIDENT_MARKER
+        assert parsed['producer_name'] == cap['producer_name']
+        sentinel_ns = 946684800_000_000_000
+        os.utime(marker, ns=(sentinel_ns, sentinel_ns))
+        first_mtime = marker.stat().st_mtime_ns
+        MOD.update_bios_resident_marker(str(dll), cap)
+        assert marker.read_bytes() == first_bytes
+        assert marker.stat().st_mtime_ns == first_mtime
+
+        marker.write_text('{malformed', encoding='utf-8')
+        MOD.update_bios_resident_marker(str(dll), cap)
+        assert marker.read_bytes() == first_bytes
+
+        MOD.update_bios_resident_marker(str(dll), {'producer': 'ordinary'})
+        assert not marker.exists()
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -2871,6 +3111,8 @@ def main():
     check_real_batched_fragment_publication(args.recompiler)
     check_real_hosted_fragment_publication(args.recompiler)
     check_full_hosted_fixed_point(args.recompiler)
+    check_full_candidate_cli_fastpath(args.recompiler)
+    check_resident_marker_fixed_point()
 
     data = bytearray(0x200)
 
