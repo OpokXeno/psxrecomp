@@ -301,8 +301,26 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
             "    \"code\": \"0x%08lX\",\n"
             "    \"address\": \"%p\",\n"
             "    \"access\": \"%s\",\n"
-            "    \"fault_addr\": \"0x%p\",\n",
-            code, addr, kind, (void *)fault_addr);
+            "    \"fault_addr\": \"0x%p\",\n"
+            "    \"rip\": \"0x%llX\",\n"
+            "    \"rsp\": \"0x%llX\",\n"
+            "    \"stack_base\": \"0x%llX\",\n"
+            "    \"stack_limit\": \"0x%llX\",\n",
+            code, addr, kind, (void *)fault_addr,
+            (unsigned long long)info->ContextRecord->Rip,
+            (unsigned long long)info->ContextRecord->Rsp,
+            (unsigned long long)__readgsqword(0x08),
+            (unsigned long long)__readgsqword(0x10));
+        append_fmt(buf, sizeof(buf), &pos,
+            "    \"thread_id\": %lu,\n"
+            "    \"registers\": {\"rax\":\"0x%llX\",\"rcx\":\"0x%llX\","
+            "\"rdx\":\"0x%llX\",\"r8\":\"0x%llX\",\"r9\":\"0x%llX\"},\n",
+            GetCurrentThreadId(),
+            (unsigned long long)info->ContextRecord->Rax,
+            (unsigned long long)info->ContextRecord->Rcx,
+            (unsigned long long)info->ContextRecord->Rdx,
+            (unsigned long long)info->ContextRecord->R8,
+            (unsigned long long)info->ContextRecord->R9);
 
         /* Module-relative location of the faulting instruction, so the
          * address survives ASLR and feeds straight into addr2line. */
@@ -646,9 +664,14 @@ static void psx_atexit_handler(void) {
 }
 
 void psx_crash_trace_install_handlers(void) {
+#ifndef _WIN32
     signal(SIGSEGV, psx_signal_handler);
+#endif
     signal(SIGABRT, psx_signal_handler);
 #ifdef _WIN32
+    /* Let access violations reach the SEH filter with their faulting CONTEXT.
+     * MinGW's SIGSEGV bridge discards EXCEPTION_POINTERS, reducing the report
+     * to "signal_11" with no native instruction or accessed address. */
     SetUnhandledExceptionFilter(psx_seh_handler);
     /* Suppress Windows error dialog so SEH unwinds straight to our
      * filter and we can write the report without the user having to
