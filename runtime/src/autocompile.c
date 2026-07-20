@@ -532,9 +532,16 @@ int autocompile_request(void) {
     SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
-     * paths in the configured line (cwd = project root). */
+     * paths in the configured line (cwd = project root). The WHOLE command is
+     * wrapped in one extra pair of quotes: when the line after /C BEGINS with
+     * a quote and contains further quotes (a quoted interpreter path plus
+     * quoted args), cmd.exe strips the first and last quote characters and
+     * mangles the line ("The filename, directory name, or volume label syntax
+     * is incorrect" — every autocompile run failed and the reshard silently
+     * never happened). With the outer quotes cmd strips exactly those two and
+     * executes the inner command verbatim. */
     char full[4200];
-    snprintf(full, sizeof(full), "cmd.exe /C %s", s_cmd);
+    snprintf(full, sizeof(full), "cmd.exe /C \"%s\"", s_cmd);
 
     STARTUPINFOA si;
     memset(&si, 0, sizeof(si));

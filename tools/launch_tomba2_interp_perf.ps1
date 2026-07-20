@@ -85,8 +85,16 @@ foreach ($dir in @($stateDir, (Split-Path $capturePath -Parent), $runDir, $logDi
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
+# Windows Python EXPLICITLY (never unqualified 'python'): the game process
+# inherits whatever PATH the launching shell had, and an MSYS python first on
+# PATH cannot open the Windows-style script path — every autocompile run then
+# fails with "can't open file" and the reshard silently never happens.
+$windowsPython = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+if (-not (Test-Path -LiteralPath $windowsPython -PathType Leaf)) {
+    throw "Windows Python not found at $windowsPython (required for autocompile)."
+}
 $autoCompile = @(
-    'python', (Quote-ProcessArgument $compileTool),
+    (Quote-ProcessArgument $windowsPython), (Quote-ProcessArgument $compileTool),
     '--captures', (Quote-ProcessArgument $capturePath),
     '--game-toml', (Quote-ProcessArgument $gameConfig),
     '--recompiler', (Quote-ProcessArgument $recompiler),
