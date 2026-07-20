@@ -81,6 +81,23 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
+    const auto print_usage = [&]() {
+        fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
+        fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
+        fmt::print("Example: {} SCUS_942.36 --seeds seeds/functions.txt --out-dir generated --strict\n", argv[0]);
+    };
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        }
+    }
+    if (argc < 2) {
+        print_usage();
+        return 0;
+    }
+
     /* --codegen-hash: print the baked emitter-source hash and exit. Handled
      * before the banner so the output is machine-parseable (one hex line).
      * compile_overlays.py compares this to the hash from --runtime-include and
@@ -213,13 +230,6 @@ int main(int argc, char** argv) {
             fmt::print("  ws_tag_funcs= {}\n", ws_tag_funcs.size());
         fmt::print("\n");
     } else {
-        if (argc < 2) {
-            fmt::print("Usage: {} --config <game.toml>                  # going-forward\n", argv[0]);
-            fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
-            fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
-            return 0;
-        }
-
         exe_path = argv[1];
         for (int i = 2; i < argc; i++) {
             std::string arg = argv[i];

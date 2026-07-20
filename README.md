@@ -12,6 +12,76 @@ Background on the original prototype:
 
 [![PSXRecomp demo](https://img.youtube.com/vi/CID9oVhgCyY/maxresdefault.jpg)](https://www.youtube.com/watch?v=CID9oVhgCyY)
 
+## How to use PSXRecomp
+
+PSXRecomp takes a PlayStation disc image and BIOS and creates a recompilation
+project containing C source and build scripts.
+
+### Generate a project with the released CLI
+
+1. Download `psxrecomp-cli-windows-x86_64.zip` from
+   [Releases](https://github.com/mstan/psxrecomp/releases/latest).
+2. Extract the whole zip to a folder. Keep its contents together.
+3. Open PowerShell in that folder and run:
+
+```powershell
+.\psxrecomp.exe build `
+  --disc "C:\Games\My Game\game.cue" `
+  --bios "C:\BIOS\SCPH1001.BIN" `
+  --output "C:\Projects\MyGameRecomp"
+```
+
+Use the `.cue` file when a game has one, and keep its `.bin` track files beside
+it. Single-file `.bin` and `.iso` images are also accepted.
+
+The output folder contains:
+
+- generated C source for the game and BIOS;
+- `game.toml`, which you can edit for game-specific settings;
+- `CMakeLists.txt` and build scripts; and
+- a local copy of the PSXRecomp runtime source needed by the project.
+
+The downloaded CLI is self-contained. You do not need to install Python or
+build this repository to generate a project.
+
+### Build the generated project
+
+Install CMake, Ninja, a C/C++ compiler, and SDL2 development files. Then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Projects\MyGameRecomp\build.ps1"
+```
+
+The generated project also includes a shell build script for macOS and Linux:
+
+```sh
+sh /path/to/MyGameRecomp/build.sh
+```
+
+The ready-made CLI release is currently for 64-bit Windows. You can build the
+CLI from source on another operating system using the instructions below.
+
+The generated project is a practical starting point, not a promise that every
+game works without game-specific fixes. PSX games can load extra code and use
+hardware in ways that require additional configuration or development.
+
+Use only disc and BIOS files you obtained legally. PSXRecomp does not include
+them. Generated game and BIOS source is derived from those files, so do not
+redistribute it.
+
+### Build the CLI from source
+
+You need Git, Python 3, CMake, Ninja, and a C++20 compiler.
+
+```sh
+git clone --recurse-submodules https://github.com/mstan/psxrecomp.git
+cd psxrecomp
+python tools/build_cli.py release
+```
+
+The ready-to-use CLI archive is written to `dist/`. To package debug binaries
+instead, run `python tools/build_cli.py debug`.
+
 > **Where the project is headed.** Development so far has been **breadth-first**:
 > stand up as many games as possible and get them into a playable alpha, proving
 > the framework generalizes. That phase has largely delivered — seven titles now
