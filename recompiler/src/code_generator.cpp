@@ -707,21 +707,23 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
 
-    // REGIMM branches (bltz, bgez, bltzal, bgezal)
+    // REGIMM branches. R3000A hardware decodes EVERY rt value here, not just
+    // the four assembler mnemonics: the branch sense is rt bit 0 (0 = bltz,
+    // 1 = bgez) and the link register is written iff (rt & 0x1E) == 0x10 —
+    // Beetle cpu.cpp op_BCOND: result = (int32)(rs ^ (rt<<31)) < 0,
+    // link = ((rt & 0x1E) == 0x10). Undefined rt values appear when discovery
+    // sweeps data-as-code into a function; emitting the hardware decode keeps
+    // the regen alive AND matches the oracle if the word is ever executed.
     if (opcode == 0x01) {
         uint32_t regimm_op = (instr >> 16) & 0x1F;
-        if (regimm_op == 0x00) { // bltz
+        if ((regimm_op & 0x01u) == 0x00u) { // bltz family (incl. bltzal + undefined mirrors)
             // Classified LEFT-edge funnel bltz (auto_screen_x, signed idioms):
             // reject only past the revealed margin. Identity at 4:3 (margin 0).
-            if (ws_cull_bltz_pcs_.count(addr))
+            if (regimm_op == 0x00 && ws_cull_bltz_pcs_.count(addr))
                 return fmt::format("psx_ws_cull_bltz({}) /* ws auto screen-x cull (left edge) */",
                                    reg_name(rs));
             return fmt::format("(int32_t){} < 0", reg_name(rs));
-        } else if (regimm_op == 0x01) { // bgez
-            return fmt::format("(int32_t){} >= 0", reg_name(rs));
-        } else if (regimm_op == 0x10) { // bltzal
-            return fmt::format("(int32_t){} < 0", reg_name(rs));
-        } else if (regimm_op == 0x11) { // bgezal
+        } else {                            // bgez family (incl. bgezal + undefined mirrors)
             return fmt::format("(int32_t){} >= 0", reg_name(rs));
         }
     }
@@ -1521,18 +1523,38 @@ std::string CodeGenerator::translate_basic_block(
 
                 const uint32_t branch_opcode =
                     (block.exit_instr.instruction >> 26) & 0x3Fu;
-                const uint32_t branch_rt =
-                    (block.exit_instr.instruction >> 16) & 0x1Fu;
                 if (branch_opcode >= 0x14u && branch_opcode <= 0x17u) {
-                    throw std::runtime_error(fmt::format(
-                        "cannot emit reserved R3000A branch-likely opcode at 0x{:08X}",
-                        addr));
-                }
-                if (branch_opcode == 0x01u &&
-                    branch_rt != 0x00u && branch_rt != 0x01u &&
-                    branch_rt != 0x10u && branch_rt != 0x11u) {
-                    throw std::runtime_error(fmt::format(
-                        "cannot emit unsupported REGIMM branch at 0x{:08X}", addr));
+                    /* Opcodes 0x14-0x17 (the MIPS-II branch-likely family) are
+                     * RESERVED on the R3000A: real hardware raises the Reserved
+                     * Instruction exception at this PC (Beetle cpu.cpp opcode
+                     * table row 0x10: op_ILL). Discovery can sweep data-as-code
+                     * into a function body; aborting the WHOLE regen here (the
+                     * old throw) broke "every title regenerates at tip" over one
+                     * bogus word, and emitting the word as a real branch would
+                     * be unfaithful. Emit the architectural RI raise inline —
+                     * ABI-neutral: the dispatch trampoline (and the CPS exit
+                     * contract in overlay mode) re-dispatches cpu->pc after the
+                     * return, exactly like any other guest control transfer. If
+                     * the word is data (never executed) nothing happens; if the
+                     * guest really reaches it, the kernel handler sees the same
+                     * exception hardware would deliver. */
+                    fmt::print("  WARNING: reserved opcode 0x{:08X} at 0x{:08X} "
+                               "— emitting guest RI exception raise\n",
+                               block.exit_instr.instruction, addr);
+                    ss << config_.indent
+                       << fmt::format("{{ /* reserved opcode 0x{:08X}: architectural RI exception */\n",
+                                      block.exit_instr.instruction);
+                    ss << config_.indent << "  uint32_t psx_ri_sr = cpu->cop0[12];\n";
+                    ss << config_.indent
+                       << fmt::format("  cpu->cop0[14] = 0x{:08X}u;  /* EPC = faulting PC, BD=0 */\n", addr);
+                    ss << config_.indent
+                       << "  cpu->cop0[13] = (cpu->cop0[13] & ~0x8000007Cu) | (10u << 2);  /* Cause: RI */\n";
+                    ss << config_.indent
+                       << "  cpu->cop0[12] = (psx_ri_sr & ~0x3Fu) | ((psx_ri_sr & 0x0Fu) << 2);  /* SR push */\n";
+                    ss << config_.indent
+                       << "  cpu->pc = (psx_ri_sr & 0x00400000u) ? 0xBFC00180u : 0x80000080u;\n";
+                    ss << config_.indent << "  return; }\n";
+                    break;  /* block ends at the raise; nothing after is reachable */
                 }
 
                 // Per-instruction interlock ORDER (Beetle): the branch's §1+deps+DO_LDS
