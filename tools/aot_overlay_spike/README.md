@@ -119,8 +119,11 @@ six observed dispatch entries for BIOS SHA-256
 
 `extract_generic.py` automatically appends the matching recipe when the framework
 BIOS exists (or `--bios` / `PSXRECOMP_BIOS_ROM` names it). A different/missing BIOS
-emits no resident record. `--only-bios-resident` materializes just these shared
-recipes without scanning a game disc. The capture contains the code bytes only:
+emits no resident record in diagnostic mode. Release extraction should pass an
+explicit `--bios` together with `--require-bios-resident`; it exits nonzero when
+the file is missing or its exact hash has no recipe. `--only-bios-resident`
+materializes just these shared recipes without scanning a game disc. The capture
+contains the code bytes only:
 no page padding, no adjacent callback-pointer data, and no synthetic execution
 claims. Its sole producer range is `DF80-DFF0`.
 
@@ -290,6 +293,38 @@ framed scans likewise recover Psy-Q's exact
 `lui R; load ...,off(R); addiu sp,sp,-N` entry after a previous return, replacing
 the old root eight bytes late. This closes Tomba 1's historical `0x80110E30` gap
 in the clean X00 variant without minting overlapping functions.
+
+### Play-free isolated continuation recovery (2026-07-19)
+
+Normal-mode discovery can prove a function-pointer or overlapping alias entry
+whose body the stricter exact-entry partition cannot safely own. These entries
+are not promoted into the shared region: doing so can hard-cap a sibling and
+recreate the mid-function truncation/softlock class. After the shared DLL is
+published, `compile_overlays.py` now schedules strong play-free gaps through the
+existing isolated `dispatch_root` fragment path. Missing normal-mode
+function-pointer entries are exact-entry demands; current-byte alias recipes are
+attempted only when the entry lies outside every guarded interval in that
+capture's runtime-valid, CRC-matching shard set. Coverage from another byte
+variant, a mismatched DLL/manifest pair, or a missing DLL export cannot suppress
+a current-variant attempt.
+
+Every fragment remains a separate failure domain and is published only when the
+requested C definition exists, exactly one 1..16-range identity contains the
+entry, generated C has no unsupported/bad target, the host compiler succeeds,
+and the DLL/manifest pair is atomic. Deterministic audit rejection of an unplayed
+static candidate is a memoized safe skip; the same rejection is fatal once live
+execution or `--force-interior` makes it an exact demand.
+
+Tomba 2's clean `cg5_7125d9b5` build produced 53 region shards plus 104 accepted
+continuation fragments (`ok=157 failed=0 skipped=5`). All 12 durable MAIN gaps
+reproduced their historical `(entry, code_crc)` identities exactly, and the
+resident shard added its six entries. Against the verified 888-entry append-only
+history, combined overlay+base-BIOS interval containment rose from 870/888 to
+888/888. This is finite-set interval containment, not exhaustive or exact-entry
+coverage: exact native recall is 158/888 and remains the next resume-entry
+target. A matching-hash static-only attract run passed the former sign and ledge
+freezes, returned to title at approximately 60 fps, and recorded about 95.3%
+native dispatch.
 
 A fresh Ape validation rebuilt all **47/47** candidates with zero audit or host-
 compiler failures. A full title-to-attract-to-title cycle exercised four overlay

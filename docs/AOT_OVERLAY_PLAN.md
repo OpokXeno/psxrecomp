@@ -272,6 +272,8 @@ entry still passes the same live code-range CRC before native execution. The
 current SCPH-1001 recipe is exactly `0x8000DF80-0x8000DFF0`; it deliberately omits
 page fill and the `0x8000DFFC` callback-pointer data. This closes the six durable
 Tomba 2 kernel gaps without turning adjacent zeros/data into code.
+Release extraction passes an explicit ROM with `--require-bios-resident --bios`;
+missing or unsupported hashes then fail instead of silently reducing coverage.
 
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
@@ -299,8 +301,16 @@ Tomba 2 kernel gaps without turning adjacent zeros/data into code.
    If audit or host compilation rejects enrichment, the tool retries the same bytes
    after removing framed roots, aliases, dispatch PCs, and proof fields; only
    direct-JAL roots remain.
-   Exact-hash BIOS resident captures additionally receive a `.resident` sidecar;
-   ordinary captures actively remove a stale sidecar for the same output stem.
+   Exact-hash BIOS resident captures additionally receive a `.resident` sidecar.
+   Resident evidence is monotonic for an identical canonical region identity:
+   ordinary concurrent writers cannot erase it, and a later resident pass
+   repairs a crash between pair publication and sidecar publication.
+   Strong play-free entries that the shared partition cannot publish are retried
+   only as isolated `dispatch_root` fragments. Normal-mode function-pointer
+   targets require an exact F entry; current-byte alias recipes are retried only
+   when outside every guarded interval in that region variant. Static-only
+   deterministic audit rejects publish nothing and become memoized skips, while
+   executed or operator-forced rejects remain hard failures.
 5. `--static` mode instead namespaces the C and folds variants into
    `overlays_static.c` linked directly into the binary, dispatched via a generated
    `psx_overlay_dispatch()` — **this is already an AOT delivery path**; it moves

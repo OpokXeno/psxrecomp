@@ -325,6 +325,7 @@ INCLUDE_REASONS = {
     # would walk garbage.
     'DISPATCH_ROOT',
 }
+EXACT_FRAGMENT_REASONS = INCLUDE_REASONS - {'DISPATCH_INTERIOR'}
 FATAL_SEED_REASONS = {'BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'}
 BIOS_RESIDENT_PRODUCER = 'bios_resident_manifest'
 BIOS_RESIDENT_MARKER = 'psxrecomp bios resident shard v1'
@@ -350,11 +351,31 @@ def update_bios_resident_marker(dll_path: str, cap: dict) -> None:
         'bios_sha256': str(cap.get('bios_sha256', '')),
         'producer_name': str(cap.get('producer_name', 'BIOS resident code')),
     }
-    tmp = marker + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, sort_keys=True)
-        f.write('\n')
-    os.replace(tmp, marker)
+    tmp = f'{marker}.tmp.{uuid.uuid4().hex}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, sort_keys=True)
+            f.write('\n')
+        os.replace(tmp, marker)
+    finally:
+        _best_effort_unlink(tmp)
+
+
+def reconcile_bios_resident_marker(dll_path: str, cap: dict,
+                                   published: bool) -> None:
+    """Keep the winner's residency, while letting resident evidence self-heal.
+
+    A losing ordinary writer must not remove a resident winner's sidecar. A
+    resident capture may always ensure the marker: identical region bytes make
+    the preserved shard equally safe to preload, and this repairs a crash
+    between pair publication and sidecar publication.
+    """
+    # Once this exact canonical region identity has verified resident evidence,
+    # retaining the marker is safe even if an ordinary capture won the compile
+    # race: every function still passes the live per-range CRC guard. Never let
+    # an ordinary writer race a resident writer by removing that evidence.
+    if cap.get('producer') == BIOS_RESIDENT_PRODUCER:
+        update_bios_resident_marker(dll_path, cap)
 
 
 def _parse_addr(value) -> int:
@@ -1560,6 +1581,22 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'excluded_counts': excluded_counts,
         'producer_ranges': producer_ranges,
         'static_alias_ranges': static_alias_ranges,
+        # Every strong walk root is an exact-entry demand. These roots come from
+        # decoder/control-flow, callable-boundary, explicit TOML, or dispatch
+        # proof rather than an arbitrary observed PC. If a shared-region build
+        # (or a concurrent poorer winner) lacks its F entry, the post-pass can
+        # safely retry it in the isolated-fragment failure domain.
+        'static_exact_fragment_demands': {
+            addr for addr, reason in included.items()
+            if reason in EXACT_FRAGMENT_REASONS
+        },
+        # Alias recipes describe entry labels inside a normal-mode host.  They
+        # need an isolated body only when the stricter shared analysis leaves
+        # the label outside every current code interval; aliases already inside
+        # a guarded body remain candidates for the future exact-resume pass.
+        'static_interval_fragment_demands': {
+            entry for entry, _lo, _hi in static_alias_ranges
+        },
         'rejected_cross_producer_calls': rejected_cross_producer_calls,
         'accepted_cross_producer_calls': accepted_cross_producer_calls,
         'static_jump_table_proofs': cap.get('static_jump_table_proofs', []),
@@ -1619,6 +1656,23 @@ def print_seed_audit(audit: dict) -> None:
         reason = audit['excluded_reasons'][addr]
         if reason in ('BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'):
             print(f'  {addr:08X}  excluded: {reason}')
+
+
+def walk_root_seed_entries(seeds: list[str]) -> set[int]:
+    """Exact F entries demanded by recompiler walk-root seed records."""
+    entries = set()
+    for seed in seeds:
+        parts = seed.split()
+        if not parts:
+            continue
+        if (parts[0] not in ('call_root', 'dispatch_root') and
+                not parts[0].startswith('0x')):
+            continue
+        try:
+            entries.add((int(parts[-1], 16) & 0x1FFFFFFF) | 0x80000000)
+        except ValueError:
+            pass
+    return entries
 
 
 def _game_text_range(toml_doc: dict) -> tuple[int, int]:
@@ -2223,32 +2277,12 @@ def load_region_coverage(cache_dir: str, phys_addr: int,
     for name in names:
         if not (name.startswith(prefix) and name.endswith('.ranges')):
             continue
-        ranges_path = os.path.join(cache_dir, name)
-        dll_path = os.path.splitext(ranges_path)[0] + overlay_ext()
-        try:
-            # Keep recovery, DLL validation, and the entire manifest snapshot
-            # under one OS lock. Otherwise a publisher can remove/replace one
-            # half between the existence check and F-record parsing.
-            with _shard_pair_lock(dll_path):
-                _recover_shard_pair_locked(dll_path)
-                if (not os.path.isfile(dll_path) or
-                        os.path.getsize(dll_path) == 0 or
-                        not os.path.isfile(ranges_path) or
-                        os.path.getsize(ranges_path) == 0):
-                    continue
-                if (expected_abi is not None and
-                        not _dll_abi_matches(dll_path, expected_abi)):
-                    continue
-                with open(ranges_path) as f:
-                    for ln in f:
-                        p = ln.split()
-                        if len(p) >= 3 and p[0] == 'F':
-                            try:
-                                covered.add((int(p[1], 16), int(p[2], 16)))
-                            except ValueError:
-                                pass
-        except OSError:
-            pass
+        dll_path = os.path.join(
+            cache_dir, os.path.splitext(name)[0] + overlay_ext())
+        covered.update(
+            (entry, code_crc)
+            for entry, code_crc, _ranges in load_shard_func_ids(
+                dll_path, expected_abi))
     return covered
 
 
@@ -2273,39 +2307,158 @@ def load_region_entry_set(cache_dir: str, phys_addr: int,
     2026-07-06: 80% of Tomba2 attract interp residue was two range-covered,
     entry-less interior PCs that the range-based orphan test refused to
     fragment, while the region compile skipped as 'already covered')."""
-    out = set()
+    return {
+        entry & 0x1FFFFFFF
+        for entry, _crc in load_region_coverage(
+            cache_dir, phys_addr, expected_abi)
+    }
+
+
+def parse_runtime_shard_manifest(manifest: str) -> tuple[int | None, list]:
+    """Parse only identities representable by the runtime manifest contract."""
+    pair_ids = []
+    funcs = []
+    current = None
+    for line in manifest.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) >= 2 and parts[0] == 'P':
+            try:
+                pair_ids.append(int(parts[1], 16))
+            except ValueError:
+                return None, []
+        elif len(parts) >= 3 and parts[0] == 'F':
+            try:
+                current = [int(parts[1], 16), int(parts[2], 16), []]
+            except ValueError:
+                return None, []
+            funcs.append(current)
+        elif len(parts) >= 3 and parts[0] == 'R' and current is not None:
+            try:
+                current[2].append((int(parts[1], 16), int(parts[2], 16)))
+            except ValueError:
+                return None, []
+    if len(pair_ids) != 1 or not funcs:
+        return None, []
+    entries = [entry & 0x1FFFFFFF for entry, _crc, _ranges in funcs]
+    if len(set(entries)) != len(entries):
+        return None, []
+    for entry, _crc, ranges in funcs:
+        entry_phys = entry & 0x1FFFFFFF
+        if (not 1 <= len(ranges) <= 16 or
+                any(length <= 0 for _start, length in ranges) or
+                not any((start & 0x1FFFFFFF) <= entry_phys <
+                        (start & 0x1FFFFFFF) + length
+                        for start, length in ranges)):
+            return None, []
+    return pair_ids[0], [tuple(func) for func in funcs]
+
+
+def load_shard_func_ids(dll_path: str,
+                        expected_abi: int | None = None) -> list:
+    """Read one runtime-valid shard manifest as ``(entry, crc, ranges)``.
+
+    A nonempty DLL and manifest are not enough: the pair-aware runtime rejects
+    a manifest whose ``P`` identity does not match the DLL export.  Discovery
+    must apply the same validity rule before allowing a cached shard to
+    suppress a needed fragment.
+    """
+    ranges_path = os.path.splitext(dll_path)[0] + '.ranges'
+    try:
+        with _shard_pair_lock(dll_path):
+            _recover_shard_pair_locked(dll_path)
+            if (not os.path.isfile(dll_path) or
+                    os.path.getsize(dll_path) == 0 or
+                    not os.path.isfile(ranges_path) or
+                    os.path.getsize(ranges_path) == 0):
+                return []
+            with open(ranges_path) as f:
+                manifest = f.read()
+            pair_id, valid_funcs = parse_runtime_shard_manifest(manifest)
+            if (pair_id is None or not _dll_runtime_exports_match(
+                    dll_path, expected_abi, pair_id,
+                    {entry for entry, _crc, _ranges in valid_funcs})):
+                return []
+    except OSError:
+        return []
+    return valid_funcs
+
+
+def load_shard_entry_set(dll_path: str,
+                         expected_abi: int | None = None) -> set:
+    """Phys-normalized F entries from one runtime-valid shard pair."""
+    return {
+        entry & 0x1FFFFFFF
+        for entry, _crc, _ranges in load_shard_func_ids(dll_path, expected_abi)
+    }
+
+
+def load_shard_code_ranges(dll_path: str,
+                           expected_abi: int | None = None) -> list:
+    """Phys-normalized guarded R intervals from one runtime-valid shard pair."""
+    return [
+        (start & 0x1FFFFFFF, (start & 0x1FFFFFFF) + length)
+        for _entry, _crc, ranges in load_shard_func_ids(dll_path, expected_abi)
+        for start, length in ranges if length > 0
+    ]
+
+
+def load_region_current_variant_coverage(cache_dir: str, phys_addr: int,
+                                         data: bytes, load_addr: int,
+                                         size: int,
+                                         expected_abi: int | None = None
+                                         ) -> tuple[set, list]:
+    """Return exact entries/ranges whose manifest CRC matches ``data``.
+
+    Shards for different byte variants share a region-start namespace.  An F
+    entry from another variant cannot satisfy the current capture: the runtime
+    will reject it by code CRC.  Recompute each cached function identity over
+    the current bytes and expose only identities the runtime can actually call.
+    """
+    entries = set()
+    ranges_out = []
     prefix = f'{phys_addr:08X}_'
     try:
         names = os.listdir(cache_dir)
     except OSError:
-        return out
+        return entries, ranges_out
     for name in names:
         if not (name.startswith(prefix) and name.endswith('.ranges')):
             continue
-        ranges_path = os.path.join(cache_dir, name)
-        dll_path = os.path.splitext(ranges_path)[0] + overlay_ext()
-        try:
-            with _shard_pair_lock(dll_path):
-                _recover_shard_pair_locked(dll_path)
-                if (not os.path.isfile(dll_path) or
-                        os.path.getsize(dll_path) == 0 or
-                        not os.path.isfile(ranges_path) or
-                        os.path.getsize(ranges_path) == 0):
-                    continue
-                if (expected_abi is not None and
-                        not _dll_abi_matches(dll_path, expected_abi)):
-                    continue
-                with open(ranges_path) as f:
-                    for ln in f:
-                        p = ln.split()
-                        if len(p) >= 2 and p[0] == 'F':
-                            try:
-                                out.add(int(p[1], 16) & 0x1FFFFFFF)
-                            except ValueError:
-                                pass
-        except OSError:
-            pass
-    return out
+        dll_path = os.path.join(
+            cache_dir, os.path.splitext(name)[0] + overlay_ext())
+        shard_entries, shard_ranges = current_variant_func_id_coverage(
+            load_shard_func_ids(dll_path, expected_abi),
+            data, load_addr, size)
+        entries.update(shard_entries)
+        ranges_out.extend(shard_ranges)
+    return entries, ranges_out
+
+
+def current_variant_func_id_coverage(func_ids: list, data: bytes,
+                                     load_addr: int,
+                                     size: int) -> tuple[set, list]:
+    """Filter parsed identities to those callable for these captured bytes."""
+    entries = set()
+    ranges_out = []
+    ov_lo = load_addr & 0x1FFFFFFF
+    ov_hi = ov_lo + size
+    for entry, expected_crc, ranges in func_ids:
+        crc = 0
+        normalized_ranges = []
+        valid = True
+        for start, length in ranges:
+            lo = start & 0x1FFFFFFF
+            if length <= 0 or lo < ov_lo or lo + length > ov_hi:
+                valid = False
+                break
+            crc = binascii.crc32(data[lo - ov_lo:lo - ov_lo + length], crc)
+            normalized_ranges.append((lo, lo + length))
+        if valid and (crc & 0xFFFFFFFF) == (expected_crc & 0xFFFFFFFF):
+            entries.add(entry & 0x1FFFFFFF)
+            ranges_out.extend(normalized_ranges)
+    return entries, ranges_out
 
 
 # ---------------------------------------------------------------------------
@@ -2327,8 +2480,28 @@ def load_region_entry_set(cache_dir: str, phys_addr: int,
 INTERIOR_FAIL_MEMO = 'interior_fail_memo.txt'
 
 
-def _interior_fail_key(phys_addr: int, interior: int, region_crc: int) -> str:
-    return f'{phys_addr:08X}_{interior & 0x1FFFFFFF:08X}_{region_crc:08X}'
+def _interior_fail_key(phys_addr: int, interior: int, data: bytes,
+                       load_addr: int, size: int, producer_ranges,
+                       cross_call_allow, expected_abi: int, cps: bool,
+                       toml_doc: dict) -> str:
+    """Stable identity of every input to deterministic fragment generation."""
+    recipe = {
+        'schema': 'psxrecomp fragment fail key v2',
+        'phys_addr': phys_addr,
+        'interior': interior & 0x1FFFFFFF,
+        'load_addr': load_addr,
+        'size': size,
+        'data_sha256': hashlib.sha256(data).hexdigest(),
+        'producer_ranges': [list(pair) for pair in producer_ranges],
+        'cross_call_allow': sorted(set(cross_call_allow)),
+        'overlay_abi': expected_abi,
+        'cps': bool(cps),
+        'toml': toml_doc,
+    }
+    digest = hashlib.sha256(json.dumps(
+        recipe, sort_keys=True, separators=(',', ':'),
+        default=str).encode('utf-8')).hexdigest()[:24]
+    return f'{phys_addr:08X}_{interior & 0x1FFFFFFF:08X}_{digest}'
 
 
 def interior_failure_is_deterministic(reason: str) -> bool:
@@ -2336,14 +2509,46 @@ def interior_failure_is_deterministic(reason: str) -> bool:
     return reason.startswith(('generated-c-audit:', 'requested-entry-audit:'))
 
 
-def load_interior_fail_memo(cache_dir: str) -> set:
-    memo = set()
+def optional_static_fragment_rejection(entry: int, job: dict,
+                                       reason: str) -> bool:
+    """Whether an unplayed speculative candidate failed safely.
+
+    Publishing nothing is the correct outcome for a static-only candidate that
+    fails a deterministic byte/codegen audit.  Execution evidence or an
+    explicit operator demand turns the same rejection into a real coverage
+    failure and therefore remains fatal.
+    """
+    return (entry in job.get('static_demands', set()) and
+            entry not in job.get('executed', set()) and
+            entry not in job.get('forced', set()) and
+            interior_failure_is_deterministic(reason))
+
+
+def interior_fail_memo_action(entry: int, job: dict, force: bool) -> str:
+    """Choose ``retry``, ``fail``, or ``skip`` for a deterministic miss.
+
+    Required executed/forced demands remain loud without repeating an
+    expensive deterministic data-as-code walk. ``--force`` explicitly retries
+    it; an unplayed speculative demand remains a safe skip.
+    """
+    if force:
+        return 'retry'
+    if (entry in job.get('executed', set()) or
+            entry in job.get('forced', set())):
+        return 'fail'
+    return 'skip'
+
+
+def load_interior_fail_memo(cache_dir: str) -> dict:
+    memo = {}
     try:
         with open(os.path.join(cache_dir, INTERIOR_FAIL_MEMO)) as f:
             for ln in f:
                 ln = ln.strip()
                 if ln and not ln.startswith('#'):
-                    memo.add(ln.split()[0])
+                    key, _sep, reason = ln.partition('#')
+                    memo[key.strip()] = (reason.strip() or
+                                         'known deterministic failure')
     except OSError:
         pass
     return memo
@@ -2433,6 +2638,23 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         }
 
 
+def validate_overlay_func_ids(func_ids: list,
+                              label: str = 'shard') -> str | None:
+    """Validate identities against the runtime's fixed manifest contract."""
+    entries = [entry & 0x1FFFFFFF for entry, _crc, _ranges in func_ids]
+    if len(set(entries)) != len(entries):
+        return f'{label} contains duplicate function entries'
+    for entry, _crc, ranges in func_ids:
+        if not 1 <= len(ranges) <= 16:
+            return (f'{label} entry 0x{entry:08X} has {len(ranges)} ranges '
+                    '(runtime supports 1..16)')
+        if any(length <= 0 for _lo, length in ranges):
+            return f'{label} entry 0x{entry:08X} has an empty guarded range'
+        if not _addr_in_func_ids(entry, [(entry, 0, ranges)]):
+            return f'{label} entry 0x{entry:08X} is outside its guarded ranges'
+    return None
+
+
 def validate_interior_fragment_ids(interior: int, frag_ids: list,
                                    generated_defs: set[int]) -> str | None:
     """Return a fail-closed reason when a fragment omitted its requested entry.
@@ -2450,24 +2672,18 @@ def validate_interior_fragment_ids(interior: int, frag_ids: list,
     if len(matches) != 1:
         return (f'requested entry 0x{entry:08X} has {len(matches)} '
                 'manifest identities (expected exactly 1)')
-    ranges = matches[0][2]
-    if not 1 <= len(ranges) <= 16:
-        return (f'requested entry 0x{entry:08X} has {len(ranges)} ranges '
-                '(runtime supports 1..16)')
+    contract_error = validate_overlay_func_ids(frag_ids, 'fragment')
+    if contract_error:
+        return contract_error
     if not _addr_in_func_ids(entry, matches):
         return f'requested entry 0x{entry:08X} is outside its guarded ranges'
-    for ev, _crc, ranges in frag_ids:
-        if not 1 <= len(ranges) <= 16:
-            return (f'fragment entry 0x{ev:08X} has {len(ranges)} ranges '
-                    '(runtime supports 1..16)')
-        if any(length <= 0 for _lo, length in ranges):
-            return f'fragment entry 0x{ev:08X} has an empty guarded range'
     return None
 
 
 def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
                                data: bytes, seed_audit: dict,
-                               forced_interiors: set[int]) -> dict | None:
+                               forced_interiors: set[int],
+                               capture: dict | None = None) -> dict | None:
     """Build one explicit fragment job without mutating the shared seed set."""
     interiors = {
         a for a, reason in seed_audit['included_reasons'].items()
@@ -2478,24 +2694,62 @@ def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
         if reason in ('DISPATCH_ENTRY', 'DISPATCH_ROOT')
     }
     executed = set(seed_audit.get('executed_pcs', set()))
+    static_exact_demands = set(
+        seed_audit.get('static_exact_fragment_demands', set()))
+    static_interval_demands = set(
+        seed_audit.get('static_interval_fragment_demands', set()))
+    static_demands = static_exact_demands | static_interval_demands
     region_hi = phys_addr + size
     forced = {
         a for a in forced_interiors
         if phys_addr <= (a & 0x1FFFFFFF) < region_hi
     }
-    if not (((interiors or dispatch_roots) and executed) or forced):
+    if not (((interiors or dispatch_roots) and executed) or
+            static_demands or forced):
         return None
     return {
         'phys_addr': phys_addr,
         'load_addr': load_addr,
         'size': size,
         'data': data,
-        'candidates': interiors | dispatch_roots | forced,
+        'candidates': interiors | dispatch_roots | static_demands | forced,
         'executed': executed,
+        'static_demands': static_demands,
+        'static_exact_demands': static_exact_demands,
+        'static_interval_demands': static_interval_demands,
         'forced': forced,
         'producer_ranges': tuple(seed_audit['producer_ranges']),
         'cross_call_allow': tuple(seed_audit['accepted_cross_producer_calls']),
+        'resident_cap': ({
+            'producer': BIOS_RESIDENT_PRODUCER,
+            'bios_sha256': capture.get('bios_sha256', ''),
+            'producer_name': capture.get('producer_name', 'BIOS resident code'),
+        } if capture and capture.get('producer') == BIOS_RESIDENT_PRODUCER
+            else None),
     }
+
+
+def select_fragment_orphans(candidates: set[int], executed: set[int],
+                            forced: set[int], static_exact: set[int],
+                            static_interval: set[int],
+                            current_variant_entries: set[int],
+                            current_variant_ranges: list) -> list[int]:
+    """Select exact demands that the relevant current artifacts cannot serve."""
+    def current_region_contains(addr):
+        phys = addr & 0x1FFFFFFF
+        return any(start <= phys < end for start, end in current_variant_ranges)
+
+    return sorted(
+            addr for addr in candidates
+        # Every exact demand is byte-variant-specific. A same-address F from a
+        # different region variant cannot satisfy it because the runtime's CRC
+        # guard will reject that identity against the current bytes.
+        if (addr in forced or
+            (addr in static_exact and
+             (addr & 0x1FFFFFFF) not in current_variant_entries) or
+            (addr in static_interval and not current_region_contains(addr)) or
+            (addr in executed and
+             (addr & 0x1FFFFFFF) not in current_variant_entries)))
 
 
 def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
@@ -2594,9 +2848,7 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
         # bundle); the loader keys DLLs by the region_start filename prefix and
         # content-matches each function, so a fragment is just another DLL for
         # this region_start.
-        key = binascii.crc32(b''.join(
-            struct.pack('<II', ev, crc)
-            for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
+        key = fragment_shard_key(frag_ids)
         dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
         if not args.force:
             cache_status = cached_shard_manifest_status(
@@ -2634,6 +2886,13 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
                            func_ids=frag_ids, pair_id=pair_id):
             return None, 'compile-error (see COMPILE ERROR above)'
         return frag_ids, 'built'
+
+
+def fragment_shard_key(func_ids: list) -> int:
+    """Filename identity shared by fragment publication and sidecars."""
+    return binascii.crc32(b''.join(
+        struct.pack('<II', entry, code_crc)
+        for entry, code_crc, _ranges in sorted(func_ids))) & 0xFFFFFFFF
 
 
 def _toolchain_env(gcc: str):
@@ -2816,7 +3075,10 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 gcc: str = 'gcc', flavor: int = 0,
                 compiler: str = 'gcc', tcc: str = 'tcc',
                 func_ids: list | None = None,
-                pair_id: int | None = None) -> bool:
+                pair_id: int | None = None,
+                preserve_existing_pair: bool = False,
+                expected_existing_abi: int | None = None,
+                publication_result: dict | None = None) -> bool:
     """Publish a shard only after all of its artifacts are complete.
 
     GCC and tcc write their output incrementally. If the process is interrupted
@@ -2850,6 +3112,8 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
             return False
         if func_ids is None:
             os.replace(staged, final_out)
+            if publication_result is not None:
+                publication_result['published'] = True
             return True
         if not func_ids or pair_id is None:
             print('  COMPILE ERROR: paired shard requires non-empty ranges and pair ID')
@@ -2859,7 +3123,12 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
             print('  COMPILE ERROR: range manifest staging produced no output')
             return False
         try:
-            publish_shard_pair(staged, staged_ranges, final_out)
+            published = publish_shard_pair(
+                staged, staged_ranges, final_out,
+                preserve_existing=preserve_existing_pair,
+                expected_existing_abi=expected_existing_abi)
+            if publication_result is not None:
+                publication_result['published'] = published
         except Exception as exc:
             print(f'  COMPILE ERROR: could not publish DLL/ranges pair: {exc}')
             try:
@@ -3044,9 +3313,35 @@ def recover_shard_pair(dll_path: str) -> None:
         _recover_shard_pair_locked(dll_path)
 
 
+def _runtime_valid_shard_pair_locked(dll: str, ranges: str,
+                                     expected_abi: int | None) -> bool:
+    """Mirror the pair-aware loader's minimum acceptance checks."""
+    if (not os.path.isfile(dll) or os.path.getsize(dll) == 0 or
+            not os.path.isfile(ranges) or os.path.getsize(ranges) == 0):
+        return False
+    try:
+        with open(ranges) as f:
+            manifest = f.read()
+        pair_id, funcs = parse_runtime_shard_manifest(manifest)
+    except OSError:
+        return False
+    return (pair_id is not None and _dll_runtime_exports_match(
+        dll, expected_abi, pair_id,
+        {entry for entry, _crc, _ranges in funcs}))
+
+
 def publish_shard_pair(staged_dll: str, staged_ranges: str,
-                       final_dll: str) -> None:
-    """Commit staged DLL/ranges under an interprocess transaction lock."""
+                       final_dll: str, preserve_existing: bool = False,
+                       expected_existing_abi: int | None = None) -> bool:
+    """Commit a staged pair, optionally preserving a valid concurrent winner.
+
+    Region DLL names are keyed only by whole-region CRC. Two processes can
+    compile the same bytes with different discovery evidence; the later,
+    poorer writer must not overwrite a richer pair after that richer process
+    has used its own result to suppress fragment repair. First valid publisher
+    wins, while each process's post-pass re-reads the actual winner and emits
+    any exact-demand fragments it still lacks.
+    """
     dll, ranges, _lock, journal_path = _shard_pair_paths(final_dll)
     token = uuid.uuid4().hex
     backup_dll = f'{dll}.pair-txn.{token}.old-dll'
@@ -3054,6 +3349,9 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
 
     with _shard_pair_lock(dll):
         _recover_shard_pair_locked(dll)
+        if (preserve_existing and _runtime_valid_shard_pair_locked(
+                dll, ranges, expected_existing_abi)):
+            return False
         txn = {
             'schema': 'psxrecomp shard pair transaction v1',
             'token': token,
@@ -3080,6 +3378,7 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
         except BaseException:
             _recover_shard_pair_locked(dll)
             raise
+    return True
 
 
 def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
@@ -3088,8 +3387,10 @@ def _dll_abi_matches(dll_path: str, expected_abi: int) -> bool:
     import ctypes
     library = None
     try:
-        library = (ctypes.WinDLL(dll_path) if os.name == 'nt'
-                   else ctypes.CDLL(dll_path))
+        # Shards are generated as ordinary C (cdecl). ctypes.WinDLL selects
+        # stdcall and can corrupt a 32-bit Windows caller's stack; CDLL is the
+        # correct loader on every supported host (x64 merely masks the error).
+        library = ctypes.CDLL(dll_path)
         abi_fn = library.overlay_abi
         abi_fn.argtypes = []
         abi_fn.restype = ctypes.c_int
@@ -3112,8 +3413,7 @@ def _dll_pair_id_matches(dll_path: str, expected_pair_id: int) -> bool:
     import ctypes
     library = None
     try:
-        library = (ctypes.WinDLL(dll_path) if os.name == 'nt'
-                   else ctypes.CDLL(dll_path))
+        library = ctypes.CDLL(dll_path)
         pair_fn = library.overlay_pair_id
         pair_fn.argtypes = []
         pair_fn.restype = ctypes.c_uint64
@@ -3130,20 +3430,59 @@ def _dll_pair_id_matches(dll_path: str, expected_pair_id: int) -> bool:
                 _ctypes.dlclose(handle)
 
 
+def _dll_runtime_exports_match(dll_path: str, expected_abi: int | None,
+                               expected_pair_id: int,
+                               entries: set[int]) -> bool:
+    """Validate the exports the runtime needs in one library mapping."""
+    import _ctypes
+    import ctypes
+    library = None
+    try:
+        library = ctypes.CDLL(dll_path)
+        abi_fn = library.overlay_abi
+        abi_fn.argtypes = []
+        abi_fn.restype = ctypes.c_int
+        if (expected_abi is not None and
+                (abi_fn() & 0xFFFFFFFF) != (expected_abi & 0xFFFFFFFF)):
+            return False
+        pair_fn = library.overlay_pair_id
+        pair_fn.argtypes = []
+        pair_fn.restype = ctypes.c_uint64
+        if pair_fn() != (expected_pair_id & 0xFFFFFFFFFFFFFFFF):
+            return False
+        getattr(library, 'overlay_init')
+        getattr(library, 'overlay_flush_cycles')
+        for entry in entries:
+            virt = (entry & 0x1FFFFFFF) | 0x80000000
+            getattr(library, f'func_{virt:08X}')
+        return True
+    except (OSError, AttributeError):
+        return False
+    finally:
+        if library is not None and library._handle:
+            handle = library._handle
+            library._handle = 0
+            if os.name == 'nt':
+                _ctypes.FreeLibrary(handle)
+            else:
+                _ctypes.dlclose(handle)
+
+
 def compiled_shard_complete(dll_path: str,
                             expected_abi: int | None = None) -> bool:
-    """Check pair completeness and optional ABI/flavor under one OS lock."""
+    """Whether the pair satisfies the runtime's manifest/export contract."""
+    return bool(load_shard_func_ids(dll_path, expected_abi))
+
+
+def shard_pair_files_complete(dll_path: str) -> bool:
+    """Filesystem-only completeness used by crash-transaction tests."""
     ranges = os.path.splitext(dll_path)[0] + '.ranges'
     with _shard_pair_lock(dll_path):
         _recover_shard_pair_locked(dll_path)
-        complete = (os.path.isfile(dll_path) and
-                    os.path.getsize(dll_path) > 0 and
-                    os.path.isfile(ranges) and
-                    os.path.getsize(ranges) > 0)
-        if not complete:
-            return False
-        return (expected_abi is None or
-                _dll_abi_matches(dll_path, expected_abi))
+        return (os.path.isfile(dll_path) and
+                os.path.getsize(dll_path) > 0 and
+                os.path.isfile(ranges) and
+                os.path.getsize(ranges) > 0)
 
 
 def cached_shard_manifest_status(dll_path: str, expected_abi: int | None,
@@ -3159,16 +3498,30 @@ def cached_shard_manifest_status(dll_path: str, expected_abi: int | None,
                     os.path.getsize(ranges) > 0)
         if not complete:
             return 'missing'
-        if (expected_abi is not None and
-                not _dll_abi_matches(dll_path, expected_abi)):
-            return 'missing'
-        if (expected_pair_id is not None and
-                not _dll_pair_id_matches(dll_path, expected_pair_id)):
-            return 'mismatch'
         try:
             with open(ranges) as f:
                 actual_manifest = f.read()
         except OSError:
+            return 'missing'
+        if expected_pair_id is not None:
+            if (expected_abi is not None and
+                    not _dll_abi_matches(dll_path, expected_abi)):
+                # A stale flavor/ABI is replaceable, not an identity collision.
+                return 'missing'
+            try:
+                entries = {
+                    int(parts[1], 16)
+                    for parts in (line.split()
+                                  for line in actual_manifest.splitlines())
+                    if len(parts) >= 3 and parts[0] == 'F'
+                }
+            except ValueError:
+                return 'mismatch'
+            if (not entries or not _dll_runtime_exports_match(
+                    dll_path, None, expected_pair_id, entries)):
+                return 'mismatch'
+        elif (expected_abi is not None and
+              not _dll_abi_matches(dll_path, expected_abi)):
             return 'missing'
         return 'match' if actual_manifest == expected_manifest else 'mismatch'
 
@@ -3434,7 +3787,7 @@ def main():
             # region seed set and queue the fragment directly.
             fragment_job = make_interior_fragment_job(
                 phys_addr, load_addr, size, data, seed_audit,
-                forced_interiors)
+                forced_interiors, cap)
             if fragment_job is not None:
                 interior_frag_jobs.append(fragment_job)
 
@@ -3448,18 +3801,46 @@ def main():
             print(f'  seeds: {len(seeds)}  dll: {dll_path}')
         print_seed_audit(seed_audit)
 
-        root_seeds = [s for s in seeds if not s.startswith('interior')]
+        demanded_root_entries = walk_root_seed_entries(seeds)
+        root_seeds = [
+            seed for seed in seeds
+            if ((seed.split()[0] in ('call_root', 'dispatch_root')) or
+                seed.split()[0].startswith('0x'))
+        ]
         if not root_seeds:
             print('  SKIP: no walk-root seeds (data-only region)\n')
             stats.add_skip()
             return
 
-        if (not args.static and compiled_shard_complete(
-                dll_path, overlay_abi_tag(args.runtime_include, args.flavor)) and
-                not args.force):
-            print('  SKIP: DLL already exists (use --force to recompile)\n')
-            stats.add_skip()
-            return
+        # Cheap evidence-aware cache gate. A valid existing pair is not enough:
+        # a later capture can add roots for identical bytes. Skip reanalysis only
+        # when runtime-callable identities matching THIS byte variant already
+        # serve every current walk-root demand. The fragment job was queued
+        # above and still repairs any exact interior/static demand independently.
+        if not args.static and not args.force:
+            expected_abi = overlay_abi_tag(
+                args.runtime_include, args.flavor)
+            if cap.get('producer') == BIOS_RESIDENT_PRODUCER:
+                # A resident fast-path needs one canonical preloadable bundle;
+                # aggregate fragment coverage is insufficient because the
+                # sidecar names exactly one DLL stem.
+                current_entries, _current_ranges = (
+                    current_variant_func_id_coverage(
+                        load_shard_func_ids(dll_path, expected_abi),
+                        data, load_addr, size))
+            else:
+                current_entries, _current_ranges = (
+                    load_region_current_variant_coverage(
+                        cache_dir, phys_addr, data, load_addr, size,
+                        expected_abi))
+            if demanded_root_entries <= {
+                    (entry & 0x1FFFFFFF) | 0x80000000
+                    for entry in current_entries}:
+                reconcile_bios_resident_marker(dll_path, cap, False)
+                print(f'  SKIP: runtime-valid current-byte cache serves all '
+                      f'{len(demanded_root_entries)} walk-root demand(s)\n')
+                stats.add_skip()
+                return
 
         with tempfile.TemporaryDirectory() as tmp:
             # Write fake PS-EXE. The header entry PC becomes a walk root in the
@@ -3653,6 +4034,27 @@ def main():
                     stats.add_fail(_label, 'no_ranges',
                                    'no usable function identities (DLL not built)')
                     return
+                missing_exports = {
+                    entry for entry, _crc, _ranges in this_ids
+                    if entry not in c_audit['defs']
+                }
+                if missing_exports:
+                    detail = ', '.join(
+                        f'0x{entry:08X}' for entry in sorted(missing_exports))
+                    print('  GENERATED-C/MANIFEST EXPORT AUDIT FAILED: '
+                          f'{detail}\n')
+                    stats.add_fail(
+                        _label, 'manifest_exports',
+                        f'{len(missing_exports)} manifest entries lack C definitions')
+                    return
+                representability_error = validate_overlay_func_ids(
+                    this_ids, 'region')
+                if representability_error:
+                    print('  RANGE MANIFEST AUDIT FAILED: '
+                          f'{representability_error}\n')
+                    stats.add_fail(
+                        _label, 'manifest_ranges', representability_error)
+                    return
                 pair_id = overlay_pair_id(src, this_ids)
                 src = add_overlay_pair_export(src, pair_id)
                 # Retained source is the exact source compiled into the DLL.
@@ -3667,11 +4069,19 @@ def main():
                     if os.path.isdir(p):
                         include_dirs.append(p)
 
+                publication = {}
                 success = compile_dll(patched_c, dll_path, include_dirs,
                                       gcc=args.gcc, flavor=args.flavor,
                                       compiler=args.compiler, tcc=args.tcc,
                                       func_ids=this_ids,
-                                      pair_id=pair_id)
+                                      pair_id=pair_id,
+                                      preserve_existing_pair=(
+                                          not args.force and
+                                          cap.get('producer') !=
+                                          BIOS_RESIDENT_PRODUCER),
+                                      expected_existing_abi=overlay_abi_tag(
+                                          args.runtime_include, args.flavor),
+                                      publication_result=publication)
                 if success:
                     # compile_dll transactionally published the per-entry range
                     # manifest beside the DLL from the same func-id list used by
@@ -3679,7 +4089,9 @@ def main():
                     ranges_out = os.path.splitext(dll_path)[0] + '.ranges'
                     if this_ids:
                         nfn = len(this_ids)
-                        update_bios_resident_marker(dll_path, cap)
+                        published = publication.get('published', True)
+                        reconcile_bios_resident_marker(
+                            dll_path, cap, published)
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
                         # New identities are now available for this region_start;
                         # keep the warm coverage set current so later captures in
@@ -3690,9 +4102,17 @@ def main():
                         # matches every function by (entry, code_crc) across all
                         # DLLs at a region.)
                         with cov_lock:
-                            covered |= this_set
-                        print(f'  OK -> {dll_path}\n')
-                        stats.add_ok()
+                            covered |= load_region_coverage(
+                                cache_dir, phys_addr,
+                                overlay_abi_tag(
+                                    args.runtime_include, args.flavor))
+                        if published:
+                            print(f'  OK -> {dll_path}\n')
+                            stats.add_ok()
+                        else:
+                            print(f'  PRESERVED concurrent valid pair -> '
+                                  f'{dll_path}\n')
+                            stats.add_skip()
                     else:
                         print('  WARNING: recompiler emitted no _full.ranges — '
                               'loader will leave this region to the interpreter')
@@ -3732,6 +4152,8 @@ def main():
         # every cycle. --force ignores the skip (re-attempts) for triage/debug.
         fail_memo = load_interior_fail_memo(cache_dir)
         memo_skipped = 0
+        variant_coverage_cache = {}
+        expected_abi = overlay_abi_tag(args.runtime_include, args.flavor)
         for job in interior_frag_jobs:
             phys_addr = job['phys_addr']
             load_addr = job['load_addr']
@@ -3739,6 +4161,8 @@ def main():
             data = job['data']
             interior_pcs = set(job['candidates'])
             executed = job['executed']
+            static_exact_demands = job['static_exact_demands']
+            static_interval_demands = job['static_interval_demands']
             forced = job['forced']
             region_crc = binascii.crc32(data) & 0xFFFFFFFF
             # ENTRY-based orphan test, not range-based: native code is
@@ -3746,28 +4170,38 @@ def main():
             # range" does NOT make a dispatch target servable — a range-
             # covered PC with no F entry anywhere still interps its whole
             # chain on every dispatch. Demand an entry at exactly this PC.
-            covered_entries = load_region_entry_set(
-                cache_dir, phys_addr,
-                overlay_abi_tag(args.runtime_include, args.flavor))
-            orphans = sorted(
-                a for a in interior_pcs
-                # Explicit exact demands are byte-variant-specific.  Do not let
-                # an F entry from some other region-byte variant suppress the
-                # fragment before its own generated identity is known.
-                if (a in forced or
-                    (a in executed and
-                     (a & 0x1FFFFFFF) not in covered_entries)))
+            coverage_key = (phys_addr, hashlib.sha256(data).digest(),
+                            load_addr, size)
+            current_coverage = variant_coverage_cache.get(coverage_key)
+            if current_coverage is None:
+                current_coverage = load_region_current_variant_coverage(
+                    cache_dir, phys_addr, data, load_addr, size, expected_abi)
+                variant_coverage_cache[coverage_key] = current_coverage
+            current_variant_entries, current_variant_ranges = current_coverage
+            orphans = select_fragment_orphans(
+                interior_pcs, executed, forced, static_exact_demands,
+                static_interval_demands, current_variant_entries,
+                current_variant_ranges)
             if not orphans:
                 continue
             built = 0
             for a in orphans:
-                key = _interior_fail_key(phys_addr, a, region_crc)
-                if key in fail_memo and not args.force:
+                key = _interior_fail_key(
+                    phys_addr, a, data, load_addr, size,
+                    job['producer_ranges'], job['cross_call_allow'],
+                    expected_abi, args.cps, toml)
+                memo_action = interior_fail_memo_action(a, job, args.force)
+                if key in fail_memo and memo_action != 'retry':
                     # Deterministically doomed from these exact bytes — skip the
                     # ~16k-word data walk. NOT a fresh failure (already counted
                     # when first memoized); count as a skip so the summary is honest.
-                    memo_skipped += 1
-                    stats.add_skip()
+                    if memo_action == 'skip':
+                        memo_skipped += 1
+                        stats.add_skip()
+                    else:
+                        stats.add_fail(
+                            f'interior 0x{a:08X} @region 0x{phys_addr:08X}',
+                            'fragment_memo', fail_memo[key])
                     continue
                 frag_ids, status = compile_interior_fragment(
                     a, data, load_addr, size, phys_addr, cache_dir, args,
@@ -3779,8 +4213,20 @@ def main():
                         stats.add_skip()
                     else:
                         stats.add_ok()
-                    for ev, _cc, _ranges in frag_ids:
-                        covered_entries.add(ev & 0x1FFFFFFF)
+                    for ev, _cc, ranges in frag_ids:
+                        current_variant_entries.add(ev & 0x1FFFFFFF)
+                        current_variant_ranges.extend(
+                            ((start & 0x1FFFFFFF),
+                             (start & 0x1FFFFFFF) + length)
+                            for start, length in ranges)
+                    if job.get('resident_cap'):
+                        fragment_dll = os.path.join(
+                            cache_dir,
+                            f'{phys_addr:08X}_{fragment_shard_key(frag_ids):08X}'
+                            f'{overlay_ext()}')
+                        reconcile_bios_resident_marker(
+                            fragment_dll, job['resident_cap'],
+                            status == 'built')
                 else:
                     # An executed orphan interior that would NOT build is a real
                     # coverage hole: that PC's whole dispatch chain runs
@@ -3788,10 +4234,18 @@ def main():
                     # Persist only deterministic generated-code audit verdicts;
                     # compiler/spawn errors and cache-pair mismatches depend on
                     # mutable external state and must remain retryable.
-                    stats.add_fail(f'interior 0x{a:08X} @region 0x{phys_addr:08X}',
-                                   'fragment', status)
+                    optional_reject = optional_static_fragment_rejection(
+                        a, job, status)
+                    if optional_reject:
+                        print(f'  static fragment 0x{a:08X} rejected safely: '
+                              f'{status}')
+                        stats.add_skip()
+                    else:
+                        stats.add_fail(
+                            f'interior 0x{a:08X} @region 0x{phys_addr:08X}',
+                            'fragment', status)
                     if interior_failure_is_deterministic(status):
-                        fail_memo.add(key)
+                        fail_memo[key] = status
                         append_interior_fail_memo(cache_dir, key, status)
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
                   f'exact-demand orphan interior(s) -> isolated island shards')

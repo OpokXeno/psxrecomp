@@ -114,8 +114,10 @@ def check_bounded_jump_table_discovery():
     }
     seeds, audit = MOD.classify_overlay_seeds(
         cap, bytes(data), LOAD, len(data), 0, {})
+    assert entry in audit['static_exact_fragment_demands']
     for addr in cases | {continuation}:
         assert audit['included_reasons'][addr] == 'DISPATCH_INTERIOR'
+        assert addr not in audit['static_exact_fragment_demands']
         assert f'interior 0x{addr:08X}' in seeds
         assert f'call_root 0x{addr:08X}' not in seeds
 
@@ -767,6 +769,7 @@ def check_static_alias_recipe():
     assert LOAD + 0x20 not in audit['included_reasons']
     assert audit['static_alias_ranges'] == {
         (LOAD + 0x20, LOAD, LOAD + 0x2C)}
+    assert audit['static_interval_fragment_demands'] == {LOAD + 0x20}
 
 
 def check_optional_enrichment_fallback():
@@ -1002,6 +1005,7 @@ def check_retained_alias_contract(recompiler):
 def check_atomic_dll_publication():
     original = MOD._compile_dll_direct
     original_replace = MOD.os.replace
+    original_pair_valid = MOD._runtime_valid_shard_pair_locked
     try:
         with tempfile.TemporaryDirectory() as tmp:
             final = os.path.join(tmp, "shard.dll")
@@ -1024,7 +1028,7 @@ def check_atomic_dll_publication():
                 assert built.read() == b"old-good-shard"
             assert pathlib.Path(ranges).read_text() == "OLD-RANGES\n"
             assert not list(pathlib.Path(tmp).glob(".*.tmp.*"))
-            assert MOD.compiled_shard_complete(final)
+            assert MOD.shard_pair_files_complete(final)
 
             def good_compile(_src, staged, _includes, **_kwargs):
                 with open(staged, "wb") as out:
@@ -1047,8 +1051,47 @@ def check_atomic_dll_publication():
             manifest = pathlib.Path(ranges).read_text()
             assert f"P {pair_id:016X}\n" in manifest
             assert "F 80010000 DEADBEEF\nR 80010000 10\n" in manifest
-            assert MOD.compiled_shard_complete(final)
+            assert MOD.shard_pair_files_complete(final)
             assert not list(pathlib.Path(tmp).glob(".*.tmp.*"))
+
+        # A valid first publisher owns the canonical region-CRC name. A later
+        # process with different discovery evidence reports preservation and
+        # cannot overwrite the winner with its independently generated pair.
+        with tempfile.TemporaryDirectory() as tmp:
+            final = os.path.join(tmp, "00010000_DEADBEEF.dll")
+            ranges = os.path.splitext(final)[0] + ".ranges"
+            pathlib.Path(final).write_bytes(b"first-winner")
+            pathlib.Path(ranges).write_text("FIRST-MANIFEST\n")
+            MOD._compile_dll_direct = good_compile
+            MOD._runtime_valid_shard_pair_locked = (
+                lambda _dll, _ranges, _abi: True)
+            publication = {}
+            assert MOD.compile_dll(
+                "ignored.c", final, [], func_ids=func_ids, pair_id=pair_id,
+                preserve_existing_pair=True,
+                publication_result=publication)
+            assert publication == {"published": False}
+            assert pathlib.Path(final).read_bytes() == b"first-winner"
+            assert pathlib.Path(ranges).read_text() == "FIRST-MANIFEST\n"
+            resident_cap = {
+                "producer": MOD.BIOS_RESIDENT_PRODUCER,
+                "bios_sha256": "ab" * 32,
+                "producer_name": "test resident",
+            }
+            marker = pathlib.Path(final).with_suffix('.resident')
+            MOD.reconcile_bios_resident_marker(final, resident_cap, True)
+            resident_payload = marker.read_text()
+            MOD.reconcile_bios_resident_marker(
+                final, {"producer": "ordinary"}, False)
+            assert marker.read_text() == resident_payload
+            marker.unlink()
+            MOD.reconcile_bios_resident_marker(final, resident_cap, False)
+            assert marker.exists()  # crash-after-pair self-heal
+            MOD.reconcile_bios_resident_marker(
+                final, {"producer": "ordinary"}, True)
+            assert marker.read_text() == resident_payload
+            assert not list(pathlib.Path(tmp).glob(".*.tmp.*"))
+            MOD._runtime_valid_shard_pair_locked = original_pair_valid
 
         # Kill a separate writer process AFTER each durable rename. This tests
         # real kernel lock release and recovery, including the hardest point:
@@ -1197,10 +1240,12 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                 assert os.path.exists(paused), "publisher did not reach pause point"
                 started = time.monotonic()
                 if reader == 'complete':
-                    assert MOD.compiled_shard_complete(final)
+                    assert MOD.shard_pair_files_complete(final)
                 else:
-                    assert MOD.load_region_coverage(tmp, 0x10000) == {
-                        (0x80010000, 0xDEADBEEF)}
+                    # Both synthetic DLLs are intentionally unloadable; the
+                    # coverage reader must still block through publication and
+                    # then reject the completed invalid winner.
+                    assert MOD.load_region_coverage(tmp, 0x10000) == set()
                 elapsed = time.monotonic() - started
                 assert elapsed >= 0.6, f'{reader} escaped pair lock in {elapsed:.3f}s'
                 assert writer.wait(timeout=10) == 0
@@ -1224,16 +1269,21 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                 pair_source.write_text(
                     '#include <stdint.h>\n' +
                     '__declspec(dllexport) int overlay_abi(void) { return 14; }\n' +
+                    '__declspec(dllexport) void overlay_init(const void *p) {(void)p;}\n' +
+                    '__declspec(dllexport) void overlay_flush_cycles(void) {}\n' +
+                    '__declspec(dllexport) void func_80010000(void *p) {(void)p;}\n' +
                     MOD.add_overlay_pair_export('', pair_id))
                 subprocess.run([gcc, '-shared', str(pair_source), '-o', pair_dll],
                                check=True, capture_output=True, text=True)
+                pair_func_ids = [(0x80010000, 0xDEADBEEF,
+                                  [(0x80010000, 0x10)])]
                 pathlib.Path(pair_dll).with_suffix('.ranges').write_text(
-                    MOD.overlay_ranges_text([], pair_id))
+                    MOD.overlay_ranges_text(pair_func_ids, pair_id))
                 pair_lib = ctypes.WinDLL(pair_dll)
                 pair_fn = pair_lib.overlay_pair_id
                 pair_fn.restype = ctypes.c_uint64
                 assert pair_fn() == pair_id
-                manifest = MOD.overlay_ranges_text([], pair_id)
+                manifest = MOD.overlay_ranges_text(pair_func_ids, pair_id)
                 assert f'P {pair_fn():016X}\n' in manifest
                 pair_handle = pair_lib._handle
                 pair_lib._handle = 0
@@ -1243,6 +1293,8 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                     pair_dll, 14 | (1 << 16))  # same cg dir, stale flavor
                 assert MOD.cached_shard_manifest_status(
                     pair_dll, 14, manifest, pair_id) == 'match'
+                assert MOD.cached_shard_manifest_status(
+                    pair_dll, 14 | (1 << 16), manifest, pair_id) == 'missing'
                 assert MOD.cached_shard_manifest_status(
                     pair_dll, 14, manifest, pair_id ^ 1) == 'mismatch'
 
@@ -1275,15 +1327,25 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
             ranges.write_text("F 80010000 DEADBEEF\nR 80010000 10\n")
             assert MOD.load_region_coverage(tmp, 0x10000) == set()
             ranges.with_suffix(MOD.overlay_ext()).write_bytes(b"DLL")
-            assert MOD.load_region_coverage(tmp, 0x10000) == {
-                (0x80010000, 0xDEADBEEF)}
+            # A nonempty but unpaired/non-loadable cache artifact must never
+            # suppress recompilation; the runtime would reject it too.
+            assert MOD.load_region_coverage(tmp, 0x10000) == set()
     finally:
         MOD.os.replace = original_replace
         MOD._compile_dll_direct = original
+        MOD._runtime_valid_shard_pair_locked = original_pair_valid
 
 
 def check_interior_fragment_contract():
     entry = LOAD + 0x20
+    assert MOD.walk_root_seed_entries([
+        f"producer_range 0x{LOAD:08X} 0x{LOAD + 0x100:08X}",
+        f"cross_call_allow 0x{LOAD + 0x200:08X}",
+        f"interior 0x{entry:08X}",
+        f"call_root 0x{LOAD:08X}",
+        f"dispatch_root 0x{LOAD + 4:08X}",
+        f"0x{LOAD + 8:08X}",
+    ]) == {LOAD, LOAD + 4, LOAD + 8}
     good = [(entry, 0x12345678, [(entry, 8)])]
     assert MOD.validate_interior_fragment_ids(entry, good, {entry}) is None
     assert "missing from generated C" in MOD.validate_interior_fragment_ids(
@@ -1306,6 +1368,9 @@ def check_interior_fragment_contract():
     assert "empty guarded range" in MOD.validate_interior_fragment_ids(
         entry, good + [(entry + 0x40, 0, [(entry + 0x40, 0)])],
         {entry, entry + 0x40})
+    assert "region entry" in MOD.validate_overlay_func_ids(
+        [(entry, 0, [(entry + i * 4, 4) for i in range(17)])],
+        "region")
     assert MOD.interior_failure_is_deterministic(
         "generated-c-audit: unsupported")
     assert MOD.interior_failure_is_deterministic(
@@ -1313,9 +1378,42 @@ def check_interior_fragment_contract():
     assert not MOD.interior_failure_is_deterministic(
         "fragment cache-key collision/stale pair")
 
+    static_only_job = {
+        "static_demands": {entry}, "executed": set(), "forced": set()}
+    assert MOD.optional_static_fragment_rejection(
+        entry, static_only_job, "generated-c-audit: unsupported")
+    assert not MOD.optional_static_fragment_rejection(
+        entry, dict(static_only_job, executed={entry}),
+        "generated-c-audit: unsupported")
+    assert not MOD.optional_static_fragment_rejection(
+        entry, dict(static_only_job, forced={entry}),
+        "requested-entry-audit: omitted")
+    assert not MOD.optional_static_fragment_rejection(
+        entry, static_only_job, "compile-error")
+    assert MOD.interior_fail_memo_action(
+        entry, static_only_job, False) == "skip"
+    assert MOD.interior_fail_memo_action(
+        entry, dict(static_only_job, executed={entry}), False) == "fail"
+    assert MOD.interior_fail_memo_action(
+        entry, dict(static_only_job, forced={entry}), False) == "fail"
+    assert MOD.interior_fail_memo_action(
+        entry, dict(static_only_job, executed={entry}), True) == "retry"
+    memo_key = MOD._interior_fail_key(
+        LOAD & 0x1FFFFFFF, entry, bytes(0x100), LOAD, 0x100,
+        ((LOAD, LOAD + 0x100),), (), 14, False, {"game": {}})
+    assert memo_key != MOD._interior_fail_key(
+        LOAD & 0x1FFFFFFF, entry, bytes(0x100), LOAD, 0x100,
+        ((LOAD, LOAD + 0x80),), (), 14, False, {"game": {}})
+    assert memo_key != MOD._interior_fail_key(
+        LOAD & 0x1FFFFFFF, entry, bytes(0x100), LOAD, 0x100,
+        ((LOAD, LOAD + 0x100),), (), 14 | (1 << 16), False,
+        {"game": {}})
+
     audit = {
         "included_reasons": {},
         "executed_pcs": set(),
+        "static_exact_fragment_demands": set(),
+        "static_interval_fragment_demands": set(),
         "producer_ranges": [(LOAD, LOAD + 0x100)],
         "accepted_cross_producer_calls": {LOAD + 0x200},
     }
@@ -1328,16 +1426,99 @@ def check_interior_fragment_contract():
     assert job["candidates"] == {entry}
     assert job["forced"] == {entry}
     assert job["executed"] == set()
+    assert job["static_demands"] == set()
+    assert job["static_exact_demands"] == set()
+    assert job["static_interval_demands"] == set()
     assert job["producer_ranges"] == ((LOAD, LOAD + 0x100),)
     assert job["cross_call_allow"] == (LOAD + 0x200,)
     assert MOD.make_interior_fragment_job(
         LOAD & 0x1FFFFFFF, LOAD, len(data), data, audit,
         {LOAD + 0x200}) is None
 
+    # Strong current-byte static provenance schedules the same isolated,
+    # fail-closed fragment path without requiring a played capture.
+    static_audit = dict(audit, static_exact_fragment_demands={entry})
+    static_job = MOD.make_interior_fragment_job(
+        LOAD & 0x1FFFFFFF, LOAD, len(data), data, static_audit, set())
+    assert static_job is not None
+    assert static_job["candidates"] == {entry}
+    assert static_job["static_demands"] == {entry}
+    assert static_job["static_exact_demands"] == {entry}
+    assert static_job["static_interval_demands"] == set()
+    assert static_job["executed"] == set()
+    assert static_job["forced"] == set()
+
+    # Static exact demand is variant-specific: another variant's F entry does
+    # not suppress it. Alias demand is narrower and only fills interval holes.
+    alias = entry + 0x20
+    assert MOD.select_fragment_orphans(
+        {entry, alias}, set(), set(), {entry}, {alias},
+        set(), []) == [entry, alias]
+    assert MOD.select_fragment_orphans(
+        {entry, alias}, set(), set(), {entry}, {alias},
+        {entry & 0x1FFFFFFF},
+        [(alias & 0x1FFFFFFF, (alias & 0x1FFFFFFF) + 8)]) == []
+    # A same-address F from another byte variant is deliberately absent from
+    # current_variant_entries and therefore cannot suppress executed demand.
+    assert MOD.select_fragment_orphans(
+        {entry}, {entry}, set(), set(), set(), set(), []) == [entry]
+
     with tempfile.TemporaryDirectory() as td:
-        dll = pathlib.Path(td) / "fragment.dll"
-        ranges = pathlib.Path(td) / "fragment.ranges"
+        dll = pathlib.Path(td) / "00010000_fragment.dll"
+        ranges = pathlib.Path(td) / "00010000_fragment.ranges"
+        pair_id = 0x123456789ABCDEF0
+        payload = bytes(0x100)
+        code_crc = MOD.binascii.crc32(payload[0x20:0x28]) & 0xFFFFFFFF
+        manifest = (f"P {pair_id:016X}\n"
+                    f"F {entry:08X} {code_crc:08X}\n"
+                    f"R {entry:08X} 8\n")
         dll.write_bytes(b"DLL")
+        ranges.write_text(manifest)
+        old_exports_match = MOD._dll_runtime_exports_match
+        try:
+            MOD._dll_runtime_exports_match = (
+                lambda _path, _abi, expected, entries:
+                expected == pair_id and bool(entries))
+            assert MOD.load_shard_entry_set(str(dll)) == {
+                entry & 0x1FFFFFFF}
+            assert MOD.load_shard_code_ranges(str(dll)) == [
+                (entry & 0x1FFFFFFF, (entry & 0x1FFFFFFF) + 8)]
+            entries, code_ranges = MOD.load_region_current_variant_coverage(
+                td, LOAD & 0x1FFFFFFF, payload, LOAD, len(payload))
+            assert entries == {entry & 0x1FFFFFFF}
+            assert code_ranges == [
+                (entry & 0x1FFFFFFF, (entry & 0x1FFFFFFF) + 8)]
+            canonical = pathlib.Path(td) / "00010000_DEADBEEF.dll"
+            assert MOD.current_variant_func_id_coverage(
+                MOD.load_shard_func_ids(str(canonical)), payload,
+                LOAD, len(payload)) == (set(), [])
+            changed = bytearray(payload)
+            changed[0x20] = 1
+            assert MOD.load_region_current_variant_coverage(
+                td, LOAD & 0x1FFFFFFF, bytes(changed), LOAD,
+                len(changed)) == (set(), [])
+            ranges.write_text(manifest.replace(
+                f"P {pair_id:016X}", "P 0000000000000001"))
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            too_many = (f"P {pair_id:016X}\n"
+                        f"F {entry:08X} {code_crc:08X}\n" +
+                        "".join(
+                            f"R {entry + i * 4:08X} 4\n"
+                            for i in range(17)))
+            ranges.write_text(too_many)
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            no_ranges = (f"P {pair_id:016X}\n"
+                         f"F {entry:08X} {code_crc:08X}\n")
+            ranges.write_text(no_ranges)
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+            duplicate = (manifest +
+                         f"F {entry:08X} {code_crc ^ 1:08X}\n"
+                         f"R {entry:08X} 8\n")
+            ranges.write_text(duplicate)
+            assert MOD.load_shard_entry_set(str(dll)) == set()
+        finally:
+            MOD._dll_runtime_exports_match = old_exports_match
+
         ranges.write_text("EXPECTED\n")
         assert MOD.cached_shard_manifest_status(
             str(dll), None, "EXPECTED\n") == "match"

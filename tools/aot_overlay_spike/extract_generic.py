@@ -858,6 +858,15 @@ def bios_resident_records(bios_path=None, manifest_path=None):
         records.append(record)
     return records
 
+def enforce_bios_resident_policy(required, disabled, records):
+    """Fail loudly when a release extraction requires resident coverage."""
+    if required and disabled:
+        raise ValueError('--require-bios-resident conflicts with '
+                         '--no-bios-resident')
+    if required and not records:
+        raise ValueError('--require-bios-resident found no recipe matching the '
+                         'resolved BIOS ROM (missing file or unsupported hash)')
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--game-toml')
@@ -871,13 +880,28 @@ def main():
                     help='resident-code recipe JSON (default: bundled manifest)')
     ap.add_argument('--no-bios-resident', action='store_true',
                     help='omit exact-hash BIOS-installed RAM code captures')
+    ap.add_argument('--require-bios-resident', action='store_true',
+                    help='fail if no exact-hash BIOS resident recipe is emitted')
     ap.add_argument('--only-bios-resident', action='store_true',
                     help='emit only exact-hash BIOS-installed RAM code captures')
     a=ap.parse_args()
+    if a.require_bios_resident and a.no_bios_resident:
+        ap.error('--require-bios-resident conflicts with --no-bios-resident')
+    if a.only_bios_resident and a.no_bios_resident:
+        ap.error('--only-bios-resident conflicts with --no-bios-resident')
+    resident_preflight=None
+    if a.require_bios_resident:
+        resident_preflight=bios_resident_records(
+            a.bios, a.bios_resident_manifest)
+    try:
+        enforce_bios_resident_policy(
+            a.require_bios_resident, a.no_bios_resident,
+            resident_preflight or [])
+    except ValueError as error:
+        ap.error(str(error))
     if a.only_bios_resident:
-        if a.no_bios_resident:
-            ap.error('--only-bios-resident conflicts with --no-bios-resident')
-        records=bios_resident_records(a.bios, a.bios_resident_manifest)
+        records=(resident_preflight if resident_preflight is not None else
+                 bios_resident_records(a.bios, a.bios_resident_manifest))
         with open(a.out, 'w') as f:
             json.dump(records, f)
         print(f"BIOS resident: {len(records)} regions -> {a.out}")
@@ -1149,7 +1173,8 @@ def main():
                   f"seeds={len(seeds)}")
     nb=0
     if not a.no_bios_resident:
-        resident=bios_resident_records(a.bios, a.bios_resident_manifest)
+        resident=(resident_preflight if resident_preflight is not None else
+                  bios_resident_records(a.bios, a.bios_resident_manifest))
         records.extend(resident)
         nb=len(resident)
         for record in resident:
