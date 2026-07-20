@@ -1559,7 +1559,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
          * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
-        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+        if (psx_ws_is_cull_vxrange_site(pc))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_vxrange(cpu->gpr[rs], imm);
+        else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;

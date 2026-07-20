@@ -100,6 +100,11 @@ struct CodeGenConfig {
     // Identity at 4:3; empty by default.
     std::set<uint32_t> ws_cull_negsub_sites;
 
+    // Explicit masked-16-bit screen-X window sites ([widescreen.cull]
+    // vxrange_sites). The configured sltiu is routed through the shared
+    // runtime helper so native and interpreted overlays use identical math.
+    std::set<uint32_t> ws_cull_vxrange_sites;
+
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
     // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).
