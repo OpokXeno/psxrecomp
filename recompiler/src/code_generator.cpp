@@ -2197,7 +2197,12 @@ GeneratedFunction CodeGenerator::generate_function(
     // into the owning block. Emitted BEFORE the entry hooks so a continuation
     // re-entry bypasses debug_server_log_call_entry / widescreen entry hooks
     // (those must run only on a true function entry, cpu->pc == 0).
-    if (cps_enabled_ && !cps_cur_continuations_.empty()) {
+    // Overlay mode must emit the cpu->pc guard even when the continuation set
+    // is EMPTY: a range re-entry can still request an interior PC of a
+    // single-block function, and without the guard the body runs from its top
+    // regardless of the requested PC — the same corrupting-fall-through this
+    // switch's fail-closed default exists to prevent.
+    if (cps_enabled_ && (!cps_cur_continuations_.empty() || config_.overlay_mode)) {
         std::set<uint32_t> seen;
         body_ss << config_.indent << "if (cpu->pc != 0u) {\n";
         body_ss << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
@@ -2497,7 +2502,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // the `entry` arg. The dispatch routes a continuation by calling the first
     // alias wrapper with cpu->pc set (entry is then ignored). Owner =
     // aliases[0]->start_addr.
-    if (cps_enabled_ && !cps_cur_continuations_.empty()) {
+    if (cps_enabled_ && (!cps_cur_continuations_.empty() || config_.overlay_mode)) {
         std::set<uint32_t> seen;
         body << config_.indent << "if (cpu->pc != 0u) {\n";
         body << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
@@ -2508,7 +2513,34 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
                  << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
             cps_continuation_owner_[c] = aliases[0]->start_addr;
         }
-        body << config_.indent << "        default: break;\n";
+        if (config_.overlay_mode) {
+            // Alias entry PCs are excluded from cps_cur_continuations_ (they
+            // dispatch as function entries with cpu->pc == 0), but a RANGE
+            // re-entry can still request one with cpu->pc set — route it to
+            // its block, exactly as the entry switch below would.
+            for (const Function* a : aliases) {
+                if (!seen.insert(a->start_addr).second) continue;
+                body << config_.indent
+                     << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n",
+                                    a->start_addr, a->start_addr);
+            }
+            // FAIL CLOSED on any other interior PC (same contract as
+            // generate_function's overlay entry switch, PR #46). The old
+            // `default: break` fell through to `switch (entry)` and ran the
+            // ALIAS'S OWN block for a PC it does not own — the Tomba 2
+            // splash→title reload death: dispatch(0x80089788) resolved to the
+            // alias func_80089770, which re-ran the crt0 shim tail (reload
+            // $ra, call main-init) in an infinite loop, leaking 0x40 of guest
+            // stack per iteration until the frames overwrote the freshly
+            // loaded module code itself. Restore the requested PC and signal
+            // the overlay dispatch to route it to the dirty-RAM interpreter.
+            body << config_.indent
+                 << fmt::format("        default: cpu->pc = _cont; "
+                                "psx_native_bad_entry(cpu, 0x{:08X}u, _cont); return;\n",
+                                aliases[0]->start_addr);
+        } else {
+            body << config_.indent << "        default: break;\n";
+        }
         body << config_.indent << "    }\n";
         body << config_.indent << "}\n";
     }
@@ -2518,7 +2550,16 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
              << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n",
                             a->start_addr, a->start_addr);
     }
-    body << config_.indent << "    default: return;\n";
+    if (config_.overlay_mode) {
+        // A dispatched entry outside the alias set must not silently no-op:
+        // the loader would count it as executed. Fail closed to the interp.
+        body << config_.indent
+             << fmt::format("    default: cpu->pc = entry; "
+                            "psx_native_bad_entry(cpu, 0x{:08X}u, entry); return;\n",
+                            aliases[0]->start_addr);
+    } else {
+        body << config_.indent << "    default: return;\n";
+    }
     body << config_.indent << "}\n";
 
     body << blocks_buf.str();
