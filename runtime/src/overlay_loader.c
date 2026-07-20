@@ -2957,7 +2957,10 @@ retry_candidates:
 #endif
                 }
                 if (_probe) s_cps_probe_outcome = 2;
-#ifndef PSX_NO_DEBUG_TOOLS
+                /* Native-call ring: ALWAYS-ON (production too). Each entry names
+                 * the requested PC and the candidate CRC that claimed it — the
+                 * only record that can attribute a wrong-variant native run on
+                 * a production binary (Tomba 2 splash reload loop). */
                 uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
                 s_nring[slot].addr = addr;
                 s_nring[slot].crc  = c->crc_code;
@@ -2966,7 +2969,6 @@ retry_candidates:
                 s_nring[slot].returned = 0;
                 uint32_t prev_inprogress = s_native_inprogress;
                 s_native_inprogress = c->addr;
-#endif
                 s_native_calls_total++;
                 native_hot_note(c->addr);
                 if (s_active_depth < (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
@@ -2983,10 +2985,8 @@ retry_candidates:
                 }
                 overlay_post_dispatch_irq_pump(cpu);
                 if (s_active_depth > 0) s_active_depth--;
-#ifndef PSX_NO_DEBUG_TOOLS
                 s_nring[slot].returned = 1;
                 s_native_inprogress = prev_inprogress;
-#endif
                 if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
                     g_native_bad_entry = 0;
                     s_disp_native--; s_disp_interp++;
@@ -3098,7 +3098,7 @@ retry_candidates:
 
             /* Record into the always-on ring BEFORE the call; mark in-progress
              * so a freeze inside this fn is visible at dump time. */
-#ifndef PSX_NO_DEBUG_TOOLS
+            /* Native-call ring: ALWAYS-ON (see the range-chain site). */
             uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
             s_nring[slot].addr = c->addr;
             s_nring[slot].crc  = c->crc_code;
@@ -3107,7 +3107,6 @@ retry_candidates:
             s_nring[slot].returned = 0;
             uint32_t prev_inprogress = s_native_inprogress;
             s_native_inprogress = c->addr;
-#endif
             s_native_calls_total++;
             native_hot_note(c->addr);
 
@@ -3135,10 +3134,8 @@ retry_candidates:
 #endif
             if (s_active_depth > 0) s_active_depth--;
 
-#ifndef PSX_NO_DEBUG_TOOLS
             s_nring[slot].returned = 1;
             s_native_inprogress = prev_inprogress;   /* restore (nested calls) */
-#endif
             if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
                 g_native_bad_entry = 0;
                 s_disp_native--; s_disp_interp++;

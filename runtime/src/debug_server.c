@@ -95,6 +95,7 @@ extern void     psx_write_byte(uint32_t addr, uint8_t val);
 static sock_t s_listen  = SOCK_INVALID;
 static sock_t s_client  = SOCK_INVALID;
 static int    s_port    = DEFAULT_DEBUG_PORT;
+static int    s_listen_err = 0;   /* platform socket error captured by init */
 
 #define RECV_BUF_SIZE 8192
 static char s_recv_buf[RECV_BUF_SIZE];
@@ -8767,6 +8768,69 @@ static void handle_irqctx_ring(int id, const char *json)
     free(buf);
 }
 
+/* sp_ring — dump the always-on stack-domain transition ring (fntrace.c).
+ * One entry per dispatch whose guest SP crossed a 64 KB domain: the
+ * provenance record for "who installed this stack pointer". */
+static void handle_sp_ring(int id, const char *json)
+{
+    extern SpDomainEntry g_spdom_ring[]; extern uint64_t g_spdom_seq;
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > (int)SPDOM_RING_CAP) count = (int)SPDOM_RING_CAP;
+    uint64_t total = g_spdom_seq;
+    uint32_t avail = total < SPDOM_RING_CAP ? (uint32_t)total : SPDOM_RING_CAP;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 256u + (size_t)n * 200u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 256; i++) {
+        uint64_t idx = total - n + i;
+        SpDomainEntry *e = &g_spdom_ring[idx % SPDOM_RING_CAP];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,"
+            "\"prev_sp\":\"0x%08X\",\"new_sp\":\"0x%08X\","
+            "\"target\":\"0x%08X\",\"ra\":\"0x%08X\",\"tcb\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            e->frame, e->prev_sp, e->new_sp, e->target, e->ra, e->tcb);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+/* disp_ring — dump the always-on dispatch tail ring (fntrace.c). */
+static void handle_disp_ring(int id, const char *json)
+{
+    extern DispTailEntry g_disp_tail[]; extern uint64_t g_disp_tail_seq;
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > (int)DISP_TAIL_CAP) count = (int)DISP_TAIL_CAP;
+    uint64_t total = g_disp_tail_seq;
+    uint32_t avail = total < DISP_TAIL_CAP ? (uint32_t)total : DISP_TAIL_CAP;
+    uint32_t n = (uint32_t)count < avail ? (uint32_t)count : avail;
+    size_t BUF_SZ = 256u + (size_t)n * 130u;
+    char *buf = (char *)malloc(BUF_SZ); if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < BUF_SZ - 200; i++) {
+        uint64_t idx = total - n + i;
+        DispTailEntry *e = &g_disp_tail[idx % DISP_TAIL_CAP];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"target\":\"0x%08X\","
+            "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)idx, (unsigned long long)e->cycle,
+            e->target, e->ra, e->sp);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_freeze_check(int id, const char *json)
 {
     int window = json_get_int(json, "window", 256);
@@ -12191,6 +12255,8 @@ static const CmdEntry s_commands[] = {
     { "freeze_check",      handle_freeze_check },
     { "d44_ring",          handle_d44_ring },
     { "irqctx_ring",       handle_irqctx_ring },
+    { "sp_ring",           handle_sp_ring },
+    { "disp_ring",         handle_disp_ring },
     { "cyc_watch",         handle_cyc_watch },
     { "cyc_watch_dump",    handle_cyc_watch_dump },
     { "cyc_watch_clear",   handle_cyc_watch_clear },
@@ -12394,6 +12460,7 @@ void debug_server_init(int port)
 
     s_listen = socket(AF_INET, SOCK_STREAM, 0);
     if (s_listen == SOCK_INVALID) {
+        s_listen_err = sock_error();
         fprintf(stdout, "psxrecomp: debug server socket() FAILED\n");
         return;
     }
@@ -12408,6 +12475,7 @@ void debug_server_init(int port)
     addr.sin_port = htons((uint16_t)s_port);
 
     if (bind(s_listen, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        s_listen_err = sock_error();
         fprintf(stdout, "psxrecomp: debug server bind(%d) FAILED\n", s_port);
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
@@ -12829,6 +12897,13 @@ static int io_thread_main(void *arg)
         sock_close(c);
     }
     return 0;
+}
+
+void debug_server_get_status(int *listening, int *port, int *error)
+{
+    if (listening) *listening = (s_listen != SOCK_INVALID);
+    if (port)      *port      = s_port;
+    if (error)     *error     = s_listen_err;
 }
 
 void debug_server_poll(void)
