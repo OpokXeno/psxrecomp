@@ -95,6 +95,20 @@ struct CodeGenConfig {
     // the auto-detector cannot qualify (X-only test, no height compare).
     std::set<uint32_t> ws_cull_slti_sites;
 
+    // Explicit low-edge widen sites for the negate idiom ([widescreen.cull]
+    // negsub_sites): `subu rd, zero, rs` → rd = -rs - margin. Classifiers that
+    // test the revealed left/top edge as `-param < coord` widen on the low
+    // side here; pair with bias_sites on the matching high-edge addiu.
+    // Identity at 4:3 (margin 0).
+    std::set<uint32_t> ws_cull_negsub_sites;
+    // [widescreen.cull] vxrange_sites — per-vertex unsigned X reject
+    // (sltiu rt,rs,imm → (rs + margin) <u (imm + 2*margin)): window [-m, imm+m).
+    // See config_loader.h for the idiom description.
+    std::set<uint32_t> ws_cull_vxrange_sites;
+    // [widescreen.cull] depth_sites — signed far/draw-distance bound compares
+    // (slti rt,rs,imm → rs < psx_ws_depth_bound(imm)): aspect-scaled far bound.
+    std::set<uint32_t> ws_cull_depth_sites;
+
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
     // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).

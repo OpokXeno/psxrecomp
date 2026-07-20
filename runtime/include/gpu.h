@@ -142,9 +142,36 @@ int  gpu_ws_present_native_43(void);
 int  psx_ws_x_margin(void);
 void gpu_ws_set_cull_guard_pixels(int pixels);
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
-                                    const uint32_t *slti, int nslti);
+                                    const uint32_t *slti, int nslti,
+                                    const uint32_t *range, int nrange);
+/* [widescreen.cull] negsub_sites — low-edge widen for the negate idiom
+ * (`subu rd, zero, rs` → rd = -rs - margin). Separate setter so the existing
+ * 3-list call/ABI is untouched. */
+void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites);
+/* [widescreen.cull] vxrange_sites — per-vertex unsigned X reject
+ * (sltiu rt,rs,imm → (rs + margin) <u (imm + 2*margin)): window [-m, imm+m). */
+void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
+/* [widescreen.cull] xclip_globals — guest-RAM u32 addresses holding the
+ * per-primitive off-right X reject bound. Replaced with INT32_MAX while the
+ * wide margins are revealed; restored to the game's value at 4:3. */
+void gpu_ws_set_xclip_globals(const uint32_t *addrs, int naddrs);
+/* [[widescreen.cull.poke]] — generic guarded RAM writes applied while the
+ * margins are revealed and restored at 4:3 (bespoke patches; see
+ * config_loader.h WidescreenPokeSite). Runtime/interp only. */
+void gpu_ws_set_poke_sites(const uint32_t *addrs, const uint32_t *expected,
+                           const uint32_t *values, int nsites);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
+int  psx_ws_is_cull_range_site(uint32_t pc);
+int  psx_ws_is_cull_negsub_site(uint32_t pc);
+int  psx_ws_is_cull_vxrange_site(uint32_t pc);
+/* [widescreen.cull] depth_sites — signed far/draw-distance bound compares
+ * (slti rt,rs,imm → rs < psx_ws_depth_bound(imm)): the bound scales by the
+ * aspect factor (3*num/(4*den)) while the margins are revealed so the vanilla
+ * off-frame draw-distance pop stays off-frame (fog hides it). Identity at 4:3. */
+void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
+int  psx_ws_is_cull_depth_site(uint32_t pc);
+int32_t psx_ws_depth_bound(int32_t imm);
 /* Scale a signed Q16 horizontal gameplay limit into the active native-wide
  * game field. Identity at 4:3 / menus / FMV. */
 int32_t psx_ws_player_x_bound(int32_t vanilla);

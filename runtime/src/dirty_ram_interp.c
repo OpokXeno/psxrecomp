@@ -1385,7 +1385,14 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             return 0;
         case 0x22: /* SUB - overflow traps are delegated if they occur. */
         case 0x23: /* SUBU */
-            cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
+            /* [widescreen.cull] negsub_sites — explicit low-edge widen for the
+             * negate idiom `subu rd, zero, rt` (classifier lower bound -param):
+             * compute -rt - margin so the revealed left/top margin also passes.
+             * Identity at 4:3 (margin 0). */
+            if (rs == 0 && psx_ws_is_cull_negsub_site(pc)) {
+                cpu->gpr[rd] = 0u - cpu->gpr[rt] - (uint32_t)psx_ws_x_margin();
+            } else
+                cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
         case 0x24: /* AND */
@@ -1541,10 +1548,17 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
+        if (psx_ws_is_cull_depth_site(pc)) {
+            /* [widescreen.cull] depth_sites — far/draw-distance bound:
+             * scale the bound by the aspect factor while the margins are
+             * revealed so the vanilla off-frame draw-distance pop stays
+             * off-frame. Identity at 4:3. */
+            cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < psx_ws_depth_bound(simm)) ? 1u : 0u;
+        }
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
-        if (psx_ws_is_cull_slti_site(pc) ||
+        else if (psx_ws_is_cull_slti_site(pc) ||
             (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
@@ -1552,11 +1566,40 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[0] = 0;
         return 0;
     case 0x0B: /* SLTIU */
+        if (psx_ws_is_cull_depth_site(pc)) {
+            /* [widescreen.cull] depth_sites (unsigned variant) — per-prim
+             * far bound (e.g. ground/tri renderers culling at maxSZ <u far):
+             * aspect-scaled while the margins are revealed. Identity at 4:3. */
+            cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)psx_ws_depth_bound(imm)) ? 1u : 0u;
+            cpu->gpr[0] = 0;
+            return 0;
+        }
         /* Widescreen render-funnel cull widening (auto_screen_x): apply the
          * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
-        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+        if (psx_ws_is_cull_vxrange_site(pc)) {
+            /* [widescreen.cull] vxrange_sites — per-vertex unsigned X reject:
+             * rs is the ANDI-masked
+             * 16-bit SXY x (0..65535), so off-left vertices read as 655xx
+             * WITHOUT 32-bit sign extension — a plain (rs + margin) does not
+             * wrap and the left margin never passes. Compare in 16-bit space
+             * instead: ((rs + margin) & 0xFFFF) <u (imm + 2*margin) → window
+             * [-m, imm+m). Identity at 4:3 (margin 0). */
+            cpu->gpr[rt] = (((cpu->gpr[rs] + (uint32_t)psx_ws_x_margin()) & 0xFFFFu) <
+                            ((uint32_t)imm + 2u * (uint32_t)psx_ws_x_margin())) ? 1u : 0u;
+        }
+        else if (psx_ws_is_cull_range_site(pc)) {
+            /* [widescreen.cull] range_sites — explicit per-PC world-space
+             * classifier widen (Tomba idiom: (objX-camX+bias) <u range; the
+             * recompiler emits the same transform for native code, this is the
+             * interp path for overlay-resident classifiers). Extends the bound
+             * by 2*margin; the paired bias site shifts the window. Identity at
+             * 4:3 (margin 0). */
+            cpu->gpr[rt] = (cpu->gpr[rs] <
+                            ((uint32_t)imm + 2u * (uint32_t)psx_ws_x_margin())) ? 1u : 0u;
+        }
+        else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;

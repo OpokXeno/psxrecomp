@@ -310,18 +310,27 @@ void gpu_ws_set_cull_guard_pixels(int pixels) {
 #define WS_EXPLICIT_CULL_SITES_MAX 64
 static uint32_t ws_explicit_bias_sites[WS_EXPLICIT_CULL_SITES_MAX];
 static uint32_t ws_explicit_slti_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_range_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static uint32_t ws_explicit_negsub_sites[WS_EXPLICIT_CULL_SITES_MAX];
 static int ws_explicit_bias_n = 0;
 static int ws_explicit_slti_n = 0;
+static int ws_explicit_range_n = 0;
+static int ws_explicit_negsub_n = 0;
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
-                                    const uint32_t *slti, int nslti) {
+                                    const uint32_t *slti, int nslti,
+                                    const uint32_t *range, int nrange) {
     if (nbias < 0) nbias = 0;
     if (nslti < 0) nslti = 0;
+    if (nrange < 0) nrange = 0;
     if (nbias > WS_EXPLICIT_CULL_SITES_MAX) nbias = WS_EXPLICIT_CULL_SITES_MAX;
     if (nslti > WS_EXPLICIT_CULL_SITES_MAX) nslti = WS_EXPLICIT_CULL_SITES_MAX;
+    if (nrange > WS_EXPLICIT_CULL_SITES_MAX) nrange = WS_EXPLICIT_CULL_SITES_MAX;
     ws_explicit_bias_n = nbias;
     ws_explicit_slti_n = nslti;
+    ws_explicit_range_n = nrange;
     for (int i = 0; i < nbias; i++) ws_explicit_bias_sites[i] = bias[i] & 0x1FFFFFFFu;
     for (int i = 0; i < nslti; i++) ws_explicit_slti_sites[i] = slti[i] & 0x1FFFFFFFu;
+    for (int i = 0; i < nrange; i++) ws_explicit_range_sites[i] = range[i] & 0x1FFFFFFFu;
 }
 static int ws_explicit_site(const uint32_t *sites, int n, uint32_t pc) {
     uint32_t p = pc & 0x1FFFFFFFu;
@@ -334,17 +343,138 @@ int psx_ws_is_cull_bias_site(uint32_t pc) {
 int psx_ws_is_cull_slti_site(uint32_t pc) {
     return ws_explicit_site(ws_explicit_slti_sites, ws_explicit_slti_n, pc);
 }
+int psx_ws_is_cull_range_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_range_sites, ws_explicit_range_n, pc);
+}
+void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_negsub_n = nsites;
+    for (int i = 0; i < nsites; i++) ws_explicit_negsub_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_negsub_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_negsub_sites, ws_explicit_negsub_n, pc);
+}
+/* [widescreen.cull] vxrange_sites — see gpu.h. */
+static uint32_t ws_explicit_vxrange_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_vxrange_n = 0;
+void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_vxrange_n = nsites;
+    for (int i = 0; i < nsites; i++) ws_explicit_vxrange_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_vxrange_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_vxrange_sites, ws_explicit_vxrange_n, pc);
+}
+/* [widescreen.cull] depth_sites — see gpu.h. */
+static uint32_t ws_explicit_depth_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_depth_n = 0;
+void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_depth_n = nsites;
+    for (int i = 0; i < nsites; i++) ws_explicit_depth_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_depth_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_depth_sites, ws_explicit_depth_n, pc);
+}
+int32_t psx_ws_depth_bound(int32_t imm) {
+    if (psx_ws_x_margin() <= 0) return imm;
+    /* Aspect factor relative to 4:3: 3*num/(4*den) (16:9 -> 4/3),
+     * round-to-nearest. */
+    int64_t n = (int64_t)imm * 3 * ws_cfg_num;
+    int64_t d = 4 * ws_cfg_den;
+    if (d <= 0) return imm;
+    int64_t q = (n >= 0) ? (n + d / 2) / d : -((-n + d / 2) / d);
+    return (int32_t)q;
+}
+
+/* [widescreen.cull] xclip_globals — guest-RAM u32 addresses holding a game's
+ * per-primitive off-right X reject bound (e.g. `sltu t0, x, *bound` shared by
+ * every prim family). While the wide margins are revealed,
+ * replace the bound with INT32_MAX so margin prims are submitted (the wide
+ * surface scissor clips the overflow, and wrapped off-left coords pass too);
+ * restore the game's original value at 4:3. No code patched. */
+#define WS_XCLIP_GLOBALS_MAX 16
+static uint32_t ws_xclip_globals[WS_XCLIP_GLOBALS_MAX];
+static int32_t  ws_xclip_orig[WS_XCLIP_GLOBALS_MAX];
+static int      ws_xclip_globals_n = 0;
+static int      ws_xclip_orig_valid = 0;
+extern uint8_t *memory_get_ram_ptr(void);
+void gpu_ws_set_xclip_globals(const uint32_t *addrs, int naddrs) {
+    if (naddrs < 0) naddrs = 0;
+    if (naddrs > WS_XCLIP_GLOBALS_MAX) naddrs = WS_XCLIP_GLOBALS_MAX;
+    ws_xclip_globals_n = naddrs;
+    for (int i = 0; i < naddrs; i++) ws_xclip_globals[i] = addrs[i] & 0x1FFFFFFFu;
+    ws_xclip_orig_valid = 0;
+}
+/* [[widescreen.cull.poke]] — see gpu.h. */
+#define WS_POKE_SITES_MAX 32
+static uint32_t ws_poke_addr[WS_POKE_SITES_MAX];
+static uint32_t ws_poke_expected[WS_POKE_SITES_MAX];
+static uint32_t ws_poke_value[WS_POKE_SITES_MAX];
+static int      ws_poke_n = 0;
+
+static void ws_xclip_update(int margin) {
+    if (ws_xclip_globals_n <= 0 && ws_poke_n <= 0) return;
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    if (!ws_xclip_orig_valid) {
+        /* Capture AFTER game init overwrote the EXE-image default: the first
+         * margin() call happens with the cull sites live, i.e. post-boot. */
+        for (int i = 0; i < ws_xclip_globals_n; i++)
+            memcpy(&ws_xclip_orig[i], ram + ws_xclip_globals[i], sizeof(int32_t));
+        ws_xclip_orig_valid = 1;
+    }
+    for (int i = 0; i < ws_xclip_globals_n; i++) {
+        int32_t want = (margin > 0) ? 0x7FFFFFFF : ws_xclip_orig[i];
+        memcpy(ram + ws_xclip_globals[i], &want, sizeof(int32_t));
+    }
+    for (int i = 0; i < ws_poke_n; i++) {
+        /* [[widescreen.cull.poke]] — guarded bespoke patch: write `value`
+         * while the margins are revealed (only when current == expected or
+         * already == value), restore `expected` at 4:3. */
+        uint32_t cur;
+        memcpy(&cur, ram + ws_poke_addr[i], sizeof(uint32_t));
+        if (margin > 0) {
+            if (cur == ws_poke_expected[i]) {
+                memcpy(ram + ws_poke_addr[i], &ws_poke_value[i], sizeof(uint32_t));
+            }
+        } else {
+            if (cur == ws_poke_value[i]) {
+                memcpy(ram + ws_poke_addr[i], &ws_poke_expected[i], sizeof(uint32_t));
+            }
+        }
+    }
+}
+
+/* [[widescreen.cull.poke]] — setter; state lives above ws_xclip_update. */
+void gpu_ws_set_poke_sites(const uint32_t *addrs, const uint32_t *expected,
+                           const uint32_t *values, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_POKE_SITES_MAX) nsites = WS_POKE_SITES_MAX;
+    ws_poke_n = nsites;
+    for (int i = 0; i < nsites; i++) {
+        ws_poke_addr[i]     = addrs[i] & 0x1FFFFFFFu;
+        ws_poke_expected[i] = expected[i];
+        ws_poke_value[i]    = values[i];
+    }
+}
 
 int psx_ws_x_margin(void) {
+    int m;
     if (ws_margin_override >= 0) return ws_margin_override;
     /* Native-wide: widen the world-space draw cull by the per-side reveal
      * (== the centering OFFSET in screen px) so the game SUBMITS the geometry
      * that previously fell outside the 4:3 cull window; the wide compositor then
      * rasterizes it into the revealed margins. Same recompiler emit sites as the
      * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
-    if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
-    if (!ws_active()) return 0;
-    return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+    if (ws_native_wide_active()) m = ws_nw_offset() + ws_cull_guard_pixels;
+    else if (!ws_active()) m = 0;
+    else m = (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+    ws_xclip_update(m);
+    return m;
 }
 
 int32_t psx_ws_player_x_bound(int32_t vanilla)
@@ -1928,6 +2058,11 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
 
 void gpu_vblank_tick(void) {
     lcf ^= 1;
+    /* Per-frame cull poke refresh: the lazily-triggered update inside
+     * psx_ws_x_margin() only runs where a [widescreen.cull] site fires;
+     * scenes with no instrumented culls would otherwise never get their
+     * guarded RAM pokes applied. */
+    ws_xclip_update(psx_ws_x_margin());
     /* snapshot per-frame draw-offset-Y range for the strobe instrumentation */
     if (g_doff_cnt_this) {
         g_doff_min_last = g_doff_min_this;

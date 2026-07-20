@@ -43,6 +43,20 @@ struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI instruction
 };
+// [[widescreen.cull.poke]] — generic guarded RAM write applied while the
+// widescreen margins are revealed (psx_ws_x_margin() > 0) and restored to
+// `expected` at 4:3. The write happens ONLY when the current u32 equals
+// `expected` (or already equals `value`), so an overlay slot reused by
+// another module is never corrupted. Used for bespoke patches (e.g. NOP-ing
+// a trim-to-4:3 visibility merge, or replacing a frustum-plane constant load
+// inside a tile-visibility function).
+// NOTE: runtime/interp only — a code-word poke does not affect recompiled
+// native shards.
+struct WidescreenPokeSite {
+    uint32_t address = 0;
+    uint32_t expected = 0;
+    uint32_t value = 0;
+};
 // Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
 // "digital" (case-insensitive) and returns `fallback` for anything else.
 int         pad_mode_from_string(const std::string& s, int fallback);
@@ -513,6 +527,37 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // [widescreen.cull] negsub_sites — explicit low-edge widen sites for the
+    // negate idiom (`subu rd, zero, rs` → rd = -rs - margin): classifiers that
+    // test the revealed left/top edge as `-param < coord`. Pair with
+    // bias_sites on the matching `addiu rt,rs,+W` high edge. Empty by default;
+    // identity at 4:3; regen.
+    std::vector<uint32_t> ws_cull_negsub_sites;
+    // [widescreen.cull] vxrange_sites — per-vertex OR'd off-right/off-left
+    // reject idiom (`andi t,sxy,0xffff; sltiu t,t,W` per vertex, drop the
+    // primitive when none passes).
+    // The unsigned compare drops BOTH margins (left wraps huge). Transform:
+    // sltiu rt,rs,imm → (rs + margin) <u (imm + 2*margin), i.e. window
+    // [-m, imm+m) — no paired bias site needed. Identity at 4:3 (margin 0).
+    std::vector<uint32_t> ws_cull_vxrange_sites;
+    // [widescreen.cull] depth_sites — signed far-bound compares
+    // (`slti rt, rs, imm` where rs is a view-space depth / draw-distance
+    // value, e.g. a model renderer's far-SZ gate). At 4:3
+    // the draw-distance pop happens off-frame at the sides; in the 16:9 reveal
+    // it lands on-screen. The bound is scaled by the aspect factor
+    // (3*num/(4*den)) while the margins are revealed so the pop stays
+    // fog-hidden off-frame. Identity at 4:3.
+    std::vector<uint32_t> ws_cull_depth_sites;
+    // [widescreen.cull] xclip_globals — RAM u32 addresses holding a game's
+    // per-primitive off-right X reject bound (e.g. `min(x) > *bound → reject
+    // prim`, with every prim family reading the same RAM global). While the
+    // wide margins are revealed the runtime
+    // replaces the bound with INT32_MAX (the wide surface scissor clips the
+    // overflow) and restores the game's original value at 4:3. Empty by
+    // default; no code is patched, identity at 4:3.
+    std::vector<uint32_t> ws_cull_xclip_globals;
+    // [[widescreen.cull.poke]] guarded bespoke patches; see WidescreenPokeSite.
+    std::vector<WidescreenPokeSite> ws_cull_poke_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

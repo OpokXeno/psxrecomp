@@ -79,6 +79,48 @@ the RTPS preamble stores the anchor SXY to scratchpad `0x1F800070`.
 **Changing `sprite_tag_funcs` requires a game regen** (the tag callback is
 emitted into the generated C). Everything else is runtime-only.
 
+### `[widescreen.cull]` — per-game cull widening (runtime-only)
+
+```toml
+[widescreen.cull]
+auto_screen_x = true        # interp pattern-scan widen hooks (opt-in per game)
+guard_pixels = 64           # extra world-space margin, px/side
+bias_sites    = [...]       # addiu/addi funnel bias PCs (+= margin)
+negsub_sites  = [...]       # `subu rd,zero,rt` negate-lower-bound PCs
+range_sites   = [...]       # sltiu classifier range PCs (bound += 2*margin)
+vxrange_sites = [...]       # sltiu per-vertex X reject PCs (16-bit SXY space:
+                            #   ((x+m)&0xFFFF) <u imm+2m  == [-m, imm+m) )
+slti_sites    = [...]       # signed slti quad/sprite X test PCs (right edge += m)
+depth_sites   = [...]       # slti/sltiu draw-distance bound PCs (aspect-scaled)
+xclip_globals = [...]       # RAM per-prim reject bound (INT32_MAX while revealed)
+[[widescreen.cull.poke]]               # guarded bespoke patch (repeatable)
+address = "0x80........."  expected = "0x........."  value = "0x........."
+```
+
+All sites are runtime/interp-only (no regen) and **identity at 4:3**: widens
+engage only while the side margins are revealed; pokes restore `expected` at
+4:3. TOML pitfall: every scalar key of `[widescreen.cull]` must sit **above**
+all `[[widescreen.cull.*]]` array-of-tables blocks — anything below belongs to
+the last array element and silently loads empty.
+
+Usage guidance:
+
+- **Widen the compare, not the data.** If the value a cull reads is recomputed
+  every frame (e.g. frustum plane dots derived per-frame via a GTE transform),
+  poking that RAM location can never work — poke the *instruction* that loads
+  or compares it instead (`[[widescreen.cull.poke]]` rewrites code words in
+  RAM, interp path only).
+- **Plane-geometry culls** of the form `sign(nx*px + nz*pz)` (sign test, no
+  bound) widen by *reducing* the X normal component: the half-angle goes as
+  `atan(nz/nx)`, so for an aspect factor `f` use `nx' = nx / f` (16:9 →
+  `nx·3/4`), giving `atan(f·tan θ)` exactly.
+- **`depth_sites` caution:** only widen draw-distance bounds that are pure
+  visibility gates. A far bound coupled to ordering-table bucket indexing or
+  a primitive-buffer capacity must not be scaled — the renderer then runs out
+  of buckets/prims and aborts mid-scene.
+- **Not every screen-extent compare is a cull** (camera smoothing, lighting
+  clamps, proximity predicates). Verify the consumer before flagging a site.
+
 ---
 
 ## Strategic direction: native-wide rendering (explored 2026-06-13, shelved)

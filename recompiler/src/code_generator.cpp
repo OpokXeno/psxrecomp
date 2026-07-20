@@ -834,6 +834,52 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // overlay variant: addr is different code here — fall through to vanilla.
     }
+    // Per-vertex unsigned X reject widen ([widescreen.cull] vxrange_sites):
+    // `sltiu rt, rs, imm` gating one vertex of a ground/water cell poly, with
+    // rs the ANDI-masked 16-bit SXY x — off-left reads as 655xx without 32-bit
+    // sign extension, so the widen must compare in 16-bit space:
+    // ((rs + margin) & 0xFFFF) <u (imm + 2*margin) → window [-m, imm+m).
+    // Identity at 4:3.
+    if (config_.ws_cull_vxrange_sites.count(addr)) {
+        if (opcode == 0x0B) {  // sltiu
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ((({} + (uint32_t)psx_ws_x_margin()) & 0xFFFFu) < "
+                               "(uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;"
+                               "  /* ws cull vxrange */{}",
+                               reg_name(rt), reg_name(rs), imm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] vxrange site 0x{:08X} is not "
+                       "sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // overlay variant: addr is different code here — fall through to vanilla.
+    }
+    // Far/draw-distance bound widen ([widescreen.cull] depth_sites):
+    // `slti rt, rs, imm` gating on view-space depth (e.g. a model renderer's
+    // far-SZ gate). The vanilla draw-distance pop lands on-screen in the 16:9
+    // reveal; scale the bound by the aspect factor so it stays fog-hidden.
+    // Identity at 4:3.
+    if (config_.ws_cull_depth_sites.count(addr)) {
+        if (opcode == 0x0A) {  // slti
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ((int32_t){} < psx_ws_depth_bound({})) ? 1 : 0;"
+                               "  /* ws cull depth */{}",
+                               reg_name(rt), reg_name(rs), imm, comment);
+        } else if (opcode == 0x0B) {  // sltiu
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t imm = get_imm16_u(instr);
+            return fmt::format("{} = ((uint32_t){} < (uint32_t)psx_ws_depth_bound({})) ? 1 : 0;"
+                               "  /* ws cull depth (u) */{}",
+                               reg_name(rt), reg_name(rs), (int)imm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] depth site 0x{:08X} is not "
+                       "slti/sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // overlay variant: addr is different code here — fall through to vanilla.
+    }
     if (config_.ws_cull_range_sites.count(addr)) {
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
@@ -932,6 +978,24 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] slti site 0x{:08X} is not "
                        "slti (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // overlay variant: addr is different code here — fall through to vanilla.
+    }
+    // Explicit low-edge widen site for the negate idiom ([widescreen.cull]
+    // negsub_sites): `subu rd, zero, rs` computes the classifier's negated
+    // lower bound (-param); emit rd = -rs - margin so the revealed left/top
+    // margin also passes. Identity at 4:3 (margin 0). Instruction shape is
+    // verified; a mismatch is a loud build error outside overlay mode.
+    if (config_.ws_cull_negsub_sites.count(addr)) {
+        if (opcode == 0x00 && funct == 0x23 && get_rs(instr) == 0) {  // subu rd, zero, rt
+            uint32_t rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = 0u - {} - (uint32_t)psx_ws_x_margin();"
+                               "  /* ws cull negsub (low edge) */{}",
+                               reg_name(rd), reg_name(rt), comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] negsub site 0x{:08X} is not "
+                       "subu rD,zero,rT (0x{:08X})\n", addr, instr);
             std::exit(1);
         }
         // overlay variant: addr is different code here — fall through to vanilla.

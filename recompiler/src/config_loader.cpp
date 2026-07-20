@@ -1045,8 +1045,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
+    std::vector<uint32_t> ws_cull_negsub_sites;
+    std::vector<uint32_t> ws_cull_vxrange_sites;
+    std::vector<uint32_t> ws_cull_depth_sites;
     std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
+    std::vector<uint32_t> ws_cull_xclip_globals;
+    std::vector<WidescreenPokeSite> ws_cull_poke_sites;
     int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
@@ -1067,8 +1072,29 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("bias_sites",  ws_cull_bias_sites);
             load_sites("range_sites", ws_cull_range_sites);
             load_sites("a1_sites",    ws_cull_a1_sites);
+            load_sites("negsub_sites", ws_cull_negsub_sites);
+            load_sites("vxrange_sites", ws_cull_vxrange_sites);
+            load_sites("depth_sites", ws_cull_depth_sites);
             load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
+            load_sites("xclip_globals", ws_cull_xclip_globals);
+            if (cull.contains("poke")) {
+                std::set<uint32_t> seen;
+                for (const auto& item : toml::find<toml::array>(cull, "poke")) {
+                    WidescreenPokeSite site;
+                    site.address = parse_hex(toml::find<std::string>(item, "address"),
+                                             "widescreen.cull.poke.address");
+                    site.expected = (uint32_t)std::stoull(
+                        toml::find<std::string>(item, "expected"), nullptr, 0);
+                    site.value = (uint32_t)std::stoull(
+                        toml::find<std::string>(item, "value"), nullptr, 0);
+                    if (!seen.insert(site.address & 0x1FFFFFFFu).second)
+                        throw std::runtime_error(fmt::format(
+                            "{}: duplicate [[widescreen.cull.poke]] address 0x{:08X}",
+                            config_path.string(), site.address));
+                    ws_cull_poke_sites.push_back(site);
+                }
+            }
             if (cull.contains("guard_pixels")) {
                 ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
                 if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
@@ -1219,6 +1245,11 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
         /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_negsub_sites*/  ws_cull_negsub_sites,
+        /*ws_cull_vxrange_sites*/ ws_cull_vxrange_sites,
+        /*ws_cull_depth_sites*/   ws_cull_depth_sites,
+        /*ws_cull_xclip_globals*/ ws_cull_xclip_globals,
+        /*ws_cull_poke_sites*/    ws_cull_poke_sites,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,

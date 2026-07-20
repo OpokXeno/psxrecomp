@@ -3160,7 +3160,29 @@ int main(int argc, char** argv) {
             gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
             gpu_ws_set_explicit_cull_sites(
                 gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
-                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
+                gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size(),
+                gc.ws_cull_range_sites.data(), (int)gc.ws_cull_range_sites.size());
+            gpu_ws_set_negsub_cull_sites(
+                gc.ws_cull_negsub_sites.data(), (int)gc.ws_cull_negsub_sites.size());
+            gpu_ws_set_vxrange_cull_sites(
+                gc.ws_cull_vxrange_sites.data(), (int)gc.ws_cull_vxrange_sites.size());
+            gpu_ws_set_depth_cull_sites(
+                gc.ws_cull_depth_sites.data(), (int)gc.ws_cull_depth_sites.size());
+            gpu_ws_set_xclip_globals(
+                gc.ws_cull_xclip_globals.data(), (int)gc.ws_cull_xclip_globals.size());
+            {
+                std::vector<uint32_t> addresses, expected, values;
+                addresses.reserve(gc.ws_cull_poke_sites.size());
+                expected.reserve(gc.ws_cull_poke_sites.size());
+                values.reserve(gc.ws_cull_poke_sites.size());
+                for (const auto& site : gc.ws_cull_poke_sites) {
+                    addresses.push_back(site.address);
+                    expected.push_back(site.expected);
+                    values.push_back(site.value);
+                }
+                gpu_ws_set_poke_sites(addresses.data(), expected.data(),
+                                      values.data(), (int)addresses.size());
+            }
             gte_ws_configure_dome_sites(
                 gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
