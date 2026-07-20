@@ -16,6 +16,29 @@ SPEC.loader.exec_module(MOD)
 
 
 class CoverageVaultHistoryTests(unittest.TestCase):
+    def test_capture_merge_preserves_static_dispatch_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = os.path.join(tmp, 'captures.json')
+            base = {
+                'load_addr': '0x80010000', 'size': 4,
+                'bytes_b64': 'AAAAAA==',
+                'dispatch_entry_pcs': ['0x80010000'],
+            }
+            with open(vault, 'w', encoding='utf-8') as out:
+                json.dump([base], out)
+            enriched = dict(
+                base,
+                dispatch_entry_pcs=['0x80010000', '0x80010004'],
+                static_dispatch_entry_pcs=['0x80010004'])
+            self.assertEqual(
+                MOD.merge_capture_regions(vault, [enriched]), (0, 0))
+            with open(vault, encoding='utf-8') as source:
+                merged = json.load(source)[0]
+            self.assertEqual(merged['dispatch_entry_pcs'],
+                             ['0x80010000', '0x80010004'])
+            self.assertEqual(merged['static_dispatch_entry_pcs'],
+                             ['0x80010004'])
+
     def test_cache_merge_preserves_resident_sidecar(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, 'source')

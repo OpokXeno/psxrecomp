@@ -227,7 +227,14 @@ def bounded_dispatch_fallback(data, base, entries):
         return None
     return {
         'function_entry_pcs':[f"0x{addr:08X}" for addr in sorted(hosts)],
-        'dispatch_entry_pcs':[f"0x{addr:08X}" for addr in sorted(dispatch)],
+        # The prologue hosts and the exported interior targets are both
+        # statically established dispatch candidates. Keep the ordinary dispatch
+        # field as the complete authority set so the more-specific static
+        # provenance below remains a strict subset by construction.
+        'dispatch_entry_pcs':[
+            f"0x{addr:08X}" for addr in sorted(hosts | dispatch)],
+        'static_dispatch_entry_pcs':[
+            f"0x{addr:08X}" for addr in sorted(hosts | dispatch)],
         'static_discovery_entry_pcs':[],
         'producer_ranges':[
             {'start':f"0x{lo:08X}",'end':f"0x{hi:08X}"}
@@ -729,14 +736,22 @@ def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
         jump_table_proofs=None, call_continuations=None):
     # function_entry_pcs = prologue-scanned function starts (walk roots).
     # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
-    # overlay's own export table). compile_overlays promotes clean starts to
-    # entries and mid-function dispatch targets to DISPATCH_INTERIOR aliases
-    # (impossible_entry_start guards garbage), so passing the game's authoritative
-    # dispatch table here recovers indirect-only entries a prologue scan misses.
-    disp = sorted(set(seeds) | set(dispatch_extra or ()))
+    # overlay's own export table). static_dispatch_entry_pcs records this full
+    # extractor-proven dispatch set (both scanner roots and table targets).
+    # Keeping the provenance separate lets
+    # compile_overlays nominate an address in sibling byte variants without
+    # granting the same authority to a runtime-observed dispatch PC.
+    # compile_overlays promotes clean starts to entries and mid-function
+    # dispatch targets to DISPATCH_INTERIOR aliases (impossible_entry_start
+    # guards garbage), so passing the game's authoritative dispatch table here
+    # recovers indirect-only entries a prologue scan misses.
+    static_dispatch = sorted(set(seeds) | set(dispatch_extra or ()))
+    disp = static_dispatch
     out={"schema":"psxrecomp overlay capture v2","load_addr":f"0x{load_addr:08X}",
          "size":len(data),"bytes_b64":base64.b64encode(data).decode(),
          "executed_pcs":[],"dispatch_entry_pcs":[f"0x{a:08X}" for a in disp],
+         "static_dispatch_entry_pcs":[
+             f"0x{a:08X}" for a in static_dispatch],
          "function_entry_pcs":[f"0x{a:08X}" for a in seeds],
          "seeds":[f"0x{a:08X}" for a in seeds]}
     if producer_ranges:
@@ -858,6 +873,15 @@ def bios_resident_records(bios_path=None, manifest_path=None):
         records.append(record)
     return records
 
+def enforce_bios_resident_policy(required, disabled, records):
+    """Fail loudly when a release extraction requires resident coverage."""
+    if required and disabled:
+        raise ValueError('--require-bios-resident conflicts with '
+                         '--no-bios-resident')
+    if required and not records:
+        raise ValueError('--require-bios-resident found no recipe matching the '
+                         'resolved BIOS ROM (missing file or unsupported hash)')
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--game-toml')
@@ -871,13 +895,28 @@ def main():
                     help='resident-code recipe JSON (default: bundled manifest)')
     ap.add_argument('--no-bios-resident', action='store_true',
                     help='omit exact-hash BIOS-installed RAM code captures')
+    ap.add_argument('--require-bios-resident', action='store_true',
+                    help='fail if no exact-hash BIOS resident recipe is emitted')
     ap.add_argument('--only-bios-resident', action='store_true',
                     help='emit only exact-hash BIOS-installed RAM code captures')
     a=ap.parse_args()
+    if a.require_bios_resident and a.no_bios_resident:
+        ap.error('--require-bios-resident conflicts with --no-bios-resident')
+    if a.only_bios_resident and a.no_bios_resident:
+        ap.error('--only-bios-resident conflicts with --no-bios-resident')
+    resident_preflight=None
+    if a.require_bios_resident:
+        resident_preflight=bios_resident_records(
+            a.bios, a.bios_resident_manifest)
+    try:
+        enforce_bios_resident_policy(
+            a.require_bios_resident, a.no_bios_resident,
+            resident_preflight or [])
+    except ValueError as error:
+        ap.error(str(error))
     if a.only_bios_resident:
-        if a.no_bios_resident:
-            ap.error('--only-bios-resident conflicts with --no-bios-resident')
-        records=bios_resident_records(a.bios, a.bios_resident_manifest)
+        records=(resident_preflight if resident_preflight is not None else
+                 bios_resident_records(a.bios, a.bios_resident_manifest))
         with open(a.out, 'w') as f:
             json.dump(records, f)
         print(f"BIOS resident: {len(records)} regions -> {a.out}")
@@ -1149,7 +1188,8 @@ def main():
                   f"seeds={len(seeds)}")
     nb=0
     if not a.no_bios_resident:
-        resident=bios_resident_records(a.bios, a.bios_resident_manifest)
+        resident=(resident_preflight if resident_preflight is not None else
+                  bios_resident_records(a.bios, a.bios_resident_manifest))
         records.extend(resident)
         nb=len(resident)
         for record in resident:

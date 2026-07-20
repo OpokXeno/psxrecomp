@@ -838,6 +838,42 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // overlay variant: addr is different code here — fall through to vanilla.
     }
+    if (config_.ws_cull_vxrange_sites.count(addr)) {
+        if (opcode == 0x0B) {  // sltiu
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t imm = get_imm16_u(instr);
+            return fmt::format("{} = psx_ws_cull_vxrange({}, {});"
+                               "  /* ws cull masked-u16 X window */{}",
+                               reg_name(rt), reg_name(rs), (unsigned)imm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] vxrange site 0x{:08X} is not "
+                       "sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
+    if (config_.ws_cull_depth_sites.count(addr)) {
+        if (opcode == 0x0A) {  // slti
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ((int32_t){} < psx_ws_depth_bound({})) ? 1 : 0;"
+                               "  /* ws cull depth */{}",
+                               reg_name(rt), reg_name(rs), (int)imm, comment);
+        }
+        if (opcode == 0x0B) {  // sltiu: MIPS sign-extends its immediate
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ((uint32_t){} < (uint32_t)psx_ws_depth_bound({})) ? 1 : 0;"
+                               "  /* ws cull depth unsigned */{}",
+                               reg_name(rt), reg_name(rs), (int)imm, comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] depth site 0x{:08X} is not "
+                       "slti/sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
     if (config_.ws_cull_range_sites.count(addr)) {
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
@@ -939,6 +975,22 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             std::exit(1);
         }
         // overlay variant: addr is different code here — fall through to vanilla.
+    }
+    // Explicit horizontal low-edge widen for negate-form classifiers:
+    // `subu rd, zero, rt` computes -bound; subtracting the horizontal margin
+    // moves that bound left. Identity at 4:3.
+    if (config_.ws_cull_negsub_sites.count(addr)) {
+        if (opcode == 0x00 && funct == 0x23 && get_rs(instr) == 0) {
+            uint32_t rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = 0u - {} - (uint32_t)psx_ws_x_margin();"
+                               "  /* ws cull negsub */{}",
+                               reg_name(rd), reg_name(rt), comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] negsub site 0x{:08X} is not "
+                       "subu rD,zero,rT (0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
     }
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). The
     // site is the `sh rt,off(base)` storing a parallax 2D backdrop layer's
@@ -2683,6 +2735,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
+    ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";

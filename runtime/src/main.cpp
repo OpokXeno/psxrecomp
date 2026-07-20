@@ -3500,6 +3500,12 @@ int main(int argc, char** argv) {
             gpu_ws_set_explicit_cull_sites(
                 gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
                 gc.ws_cull_slti_sites.data(), (int)gc.ws_cull_slti_sites.size());
+            gpu_ws_set_negsub_cull_sites(
+                gc.ws_cull_negsub_sites.data(), (int)gc.ws_cull_negsub_sites.size());
+            gpu_ws_set_vxrange_cull_sites(
+                gc.ws_cull_vxrange_sites.data(), (int)gc.ws_cull_vxrange_sites.size());
+            gpu_ws_set_depth_cull_sites(
+                gc.ws_cull_depth_sites.data(), (int)gc.ws_cull_depth_sites.size());
             gte_ws_configure_dome_sites(
                 gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the

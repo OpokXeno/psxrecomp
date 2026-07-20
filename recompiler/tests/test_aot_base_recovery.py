@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -67,6 +68,10 @@ def main():
     recipe = MOD.bounded_dispatch_fallback(
         bounded, 0x80100000, [0x80100024, 0x80100050])
     assert recipe['function_entry_pcs'] == ['0x80100010', '0x80100040']
+    assert recipe['dispatch_entry_pcs'] == [
+        '0x80100010', '0x80100024', '0x80100040', '0x80100050']
+    assert set(recipe['static_dispatch_entry_pcs']) <= set(
+        recipe['dispatch_entry_pcs'])
     assert recipe['producer_ranges'] == [
         {'start': '0x80100010', 'end': '0x80100040'},
         {'start': '0x80100040', 'end': '0x80100070'},
@@ -269,6 +274,10 @@ def main():
         assert '0x801382B8' in capture['dispatch_entry_pcs']
         assert '0x80138354' in capture['dispatch_entry_pcs']
         assert '0x80138368' in capture['dispatch_entry_pcs']
+        assert '0x801382B8' in capture['static_dispatch_entry_pcs']
+        assert '0x80138354' in capture['static_dispatch_entry_pcs']
+        assert '0x80138368' in capture['static_dispatch_entry_pcs']
+        assert '0x8013829C' in capture['static_dispatch_entry_pcs']
         assert capture['static_jump_table_proofs'][0]['host_entry'] == (
             '0x8013829C')
         assert capture['static_jump_table_proofs'][0]['jr_pc'] == '0x801382DC'
@@ -330,6 +339,7 @@ def main():
         }), encoding='utf-8')
         resident = MOD.bios_resident_records(str(bios), str(manifest))
         assert len(resident) == 1
+        MOD.enforce_bios_resident_policy(True, False, resident)
         capture = resident[0]
         decoded = __import__('base64').b64decode(capture['bytes_b64'])
         assert struct.unpack_from('<I', decoded, 0)[0] == 0x03E00008
@@ -337,7 +347,61 @@ def main():
         assert capture['producer_ranges'] == [{
             'start': '0x8000DF80', 'end': '0x8000DF88'}]
         bios.write_bytes(b'different bios')
-        assert MOD.bios_resident_records(str(bios), str(manifest)) == []
+        no_match = MOD.bios_resident_records(str(bios), str(manifest))
+        assert no_match == []
+        try:
+            MOD.enforce_bios_resident_policy(True, False, no_match)
+            assert False, 'required missing BIOS recipe was accepted'
+        except ValueError as exc:
+            assert 'no recipe matching' in str(exc)
+        try:
+            MOD.enforce_bios_resident_policy(True, True, resident)
+            assert False, 'required+disabled BIOS policy was accepted'
+        except ValueError as exc:
+            assert 'conflicts' in str(exc)
+
+        # Exercise the actual CLI contract: explicit BIOS resolution, required
+        # success, fail-closed mismatch, output preservation, and flag errors
+        # that are reported before any manifest/BIOS preflight.
+        script = str(ROOT / 'tools' / 'aot_overlay_spike' /
+                     'extract_generic.py')
+        out = td / 'captures.json'
+        bios.write_bytes(b'test bios')
+        result = subprocess.run([
+            sys.executable, script, '--out', str(out), '--bios', str(bios),
+            '--bios-resident-manifest', str(manifest),
+            '--only-bios-resident', '--require-bios-resident',
+        ], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert len(json.loads(out.read_text())) == 1
+
+        out.write_text('preserve-me', encoding='utf-8')
+        bios.write_bytes(b'different bios')
+        result = subprocess.run([
+            sys.executable, script, '--out', str(out), '--bios', str(bios),
+            '--bios-resident-manifest', str(manifest),
+            '--only-bios-resident', '--require-bios-resident',
+        ], capture_output=True, text=True)
+        assert result.returncode == 2
+        assert 'no recipe matching' in result.stderr
+        assert out.read_text() == 'preserve-me'
+
+        result = subprocess.run([
+            sys.executable, script, '--out', str(out),
+            '--bios-resident-manifest', str(td / 'must-not-be-read.json'),
+            '--require-bios-resident', '--no-bios-resident',
+        ], capture_output=True, text=True)
+        assert result.returncode == 2
+        assert '--require-bios-resident conflicts' in result.stderr
+        assert out.read_text() == 'preserve-me'
+
+        result = subprocess.run([
+            sys.executable, script, '--out', str(out),
+            '--only-bios-resident', '--no-bios-resident',
+        ], capture_output=True, text=True)
+        assert result.returncode == 2
+        assert '--only-bios-resident conflicts' in result.stderr
+        assert out.read_text() == 'preserve-me'
 
     print("ALL PASS")
 

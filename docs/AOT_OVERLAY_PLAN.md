@@ -5,6 +5,30 @@ Author: investigation via 4 parallel agents + adversarial source verification.
 Scope: can we move overlay sharding from *runtime discovery* to *build-time (AOT)*,
 starting with Tomba (SCUS-94236)?
 
+Current final-hash checkpoint (`cg5_06162507`, 2026-07-20): cross-variant hosted
+interiors recover sibling-proven entries only through a unique current-byte owner
+and recipient CFG block-leader proof. A clean Tomba 1 invocation published 189/189
+runtime-valid pairs (`ok=189 failed=0`): 71 organic-authority shards plus 118
+`hosted-v1` non-authority supplements, totaling 11,177 manifest candidates. An
+unchanged second invocation published nothing (`ok=0 failed=0`) and preserved the
+complete 378-file DLL/manifest inventory byte-for-byte and timestamp-for-timestamp.
+Played-vault recall is 808/823 exact entry addresses (98.2%) and 793/867 exact
+`(entry, code_crc)` variants (91.5%); combined overlay+BIOS interval containment is
+823/823, though containment is not exact native-dispatch proof. A no-autocompile
+runtime smoke reached the village with correct rendering at 60 fps, active native
+dispatch, and no candidate, range-index, or lazy-manifest overflow. Two current-RAM
+CRC mismatches were blocked safely and fell back instead of executing stale code.
+
+The prior cross-title checkpoint (`cg5_7125d9b5`, 2026-07-19) remains the latest
+common-hash evidence for Tomba 2, MMX6, and Ape Escape and must be regenerated under
+`cg5_06162507`. At that checkpoint, bounded strong-root batching replaced the
+pathological one-DLL-per-root prototype without weakening generated-C, manifest,
+ABI, pair, or live-byte gates. MMX6 published 107/107 runtime-valid pairs and covered
+588/701 historical observations by exact entry address (83.9%), or 595/701 with the
+exact BIOS resident shard (84.9%). Its 17,506 raw, pre-dedup manifest identities
+motivated the reviewed 32,768 runtime candidate ceiling with durable overflow
+telemetry and fail-closed one-shot bundle suppression.
+
 Current Tomba 2 checkpoint: generic play-free extraction emits 29 base/raw regions
 plus exact adjacent-producer composites (52 capture records total). The 29 base/raw
 shards and the live A01 composite audit with zero unsupported instructions or bad
@@ -209,6 +233,83 @@ dirty run (`overlay_capture.c:200-233`):
 load_addr, size, bytes_b64 (LIVE post-fixup RAM),
 executed_pcs[], dispatch_entry_pcs[], function_entry_pcs[], seeds[]
 ```
+Play-free static extractors may add the optional
+`static_dispatch_entry_pcs[]` field. It is a strict subset of
+`dispatch_entry_pcs[]` naming entries derived by the play-free scanner or read
+from an authoritative on-disc export/header/jump table. It never changes the
+local dispatch set and is never
+synthesized from runtime rings or prior manifests. The compiler uses this
+provenance only to nominate the same address in sibling byte variants; recipient
+bytes must independently prove a current CRC-valid owner, CFG block leader, and
+exact emitted identity before an alias can be published.
+
+Cross-variant compilation closes every strong exact root for every byte recipe
+before freezing sibling donor/owner authority. Roots that overlap live, forced,
+or interval evidence retain singleton failure isolation but still close in that
+pre-freeze phase. Hosted aliases and later generic orphan fragments carry atomic
+manifest provenance included in their pair and filename identities: the runtime
+still loads them as ordinary CRC-guarded coverage, while later compiler runs exclude
+the entire supplemental shard from authority, including incidental rooted callees.
+The bounded nomination window depends only on frozen authority; supplemental cache
+hits remain in that fixed universe through owner selection and every alias/host
+cap, then are removed by the compile-time `still_needed` guard. This prevents
+repeated invocations from paging into new targets at any later cap. Partial hosted
+successes retry their fixed remainder immediately.
+
+Offline publication is also bounded by the loader's real resource model. The
+shared `PSX_OVERLAY_CANDIDATE_CAP` counts every `F` candidate from one
+representative of each distinct complete generated pair per compiler tier.
+Deduplication is deliberately whole-pair only: the `P` identifier, same
+normalized provenance class (unmarked authority, `hosted-v1`, or `orphan-v1`),
+and exact ordered, physical-address-normalized `F`/`R` semantics must all match.
+Legacy/no-`P`, unknown, malformed, cross-tier, or partially different pairs
+remain distinct.
+The runtime fully preflights a later physical twin, closes its redundant handle
+before initialization, and reuses the canonical pair's candidates and flush
+owner. `overlay_loader_status.pair_aliases` counts these validated physical
+twins. CRC dispatch validation is unchanged.
+
+The other publication-gating physical lazy/cache-index resources do not
+deduplicate. Every selected physical pair still contributes its raw `F` rows,
+unique 4 KiB range-page links per `F`, and cache-index file. Before committing a
+pair, the compiler locks the game/architecture/codegen cache namespace,
+inventories the exact GCC-first runtime selection, subtracts the pair being
+replaced, and independently projects four bounds: candidates at
+`PSX_OVERLAY_CANDIDATE_CAP`, raw lazy `F` rows at twice that cap, lazy range-page
+links at eight times the raw-row cap, and 4096 selected files. Exact cache hits
+and replacements that do not grow any already-exceeded independent budget remain
+legal; crossing or worsening any one bound rejects that optional coverage to the
+interpreter. The loaded-candidate range index has its own bounded fallback scan
+and is not part of offline publication accounting.
+
+Near a saturated namespace, each attempted repair still performs the complete
+authoritative projection. To keep that tail practical, the publisher memoizes
+only successful ABI/export/manifest validation for unchanged physical pairs,
+keyed by expected ABI plus replacement-sensitive DLL and manifest file identity.
+Changed pairs revalidate, and negative loader results are never memoized because
+they may be transient. Transaction recovery and the locked projection remain on
+every publication path; the memo only avoids remapping hundreds of unchanged
+DLLs for each rejected optional shard. Once generated `F/R/P` metadata proves
+a shard cannot fit, the compiler applies that same locked projection before
+invoking the native linker; admitted shards are still projected again after
+linking at authoritative publication. A concurrent deletion can therefore only
+defer optional coverage to the next invocation, never admit an over-cap pair.
+An earlier over-cap snapshot may be reused only when it still proves rejection;
+anything that appears admissible forces a fresh locked inventory. This avoids
+even the directory scan in a saturated fixed-point tail without turning stale
+state into admission authority.
+Dynamic recipes are processed in a canonical order under a whole-invocation
+namespace lock. This makes the accepted subset reproducible even at the hard
+capacity boundary instead of allowing worker scheduling to choose the winner.
+The runtime rejects legacy/no-CRC and malformed range manifests, keeping its
+registration contract identical to the inventory parser.
+That shared contract is deliberately narrow: ASCII records, LF/CRLF physical
+lines, bounded line widths, canonical KSEG0 entries, one authoritative CRC,
+1..16 in-RAM ranges containing the entry, and no duplicate physical `F` entry.
+GCC/TCC tier filenames use the host filesystem's case rules. A DLL is accepted
+atomically only when its ABI, optional pair id, and every manifest-declared
+`func_*` export agree; a partial-export bundle registers zero candidates.
+
 `executed_pcs`/`dispatch_entry_pcs` come from always-on interpreter ring tables
 (`g_dirty_ram_pc_table`, `g_dirty_ram_exec_pc_table`) — **execution-verified**, not
 disassembly guesses.
@@ -272,6 +373,8 @@ entry still passes the same live code-range CRC before native execution. The
 current SCPH-1001 recipe is exactly `0x8000DF80-0x8000DFF0`; it deliberately omits
 page fill and the `0x8000DFFC` callback-pointer data. This closes the six durable
 Tomba 2 kernel gaps without turning adjacent zeros/data into code.
+Release extraction passes an explicit ROM with `--require-bios-resident --bios`;
+missing or unsupported hashes then fail instead of silently reducing coverage.
 
 ### 1.3 Compile (offline, `tools/compile_overlays.py`)
 1. Python does function-boundary discovery from the seeds (`classify_overlay_seeds`,
@@ -299,8 +402,16 @@ Tomba 2 kernel gaps without turning adjacent zeros/data into code.
    If audit or host compilation rejects enrichment, the tool retries the same bytes
    after removing framed roots, aliases, dispatch PCs, and proof fields; only
    direct-JAL roots remain.
-   Exact-hash BIOS resident captures additionally receive a `.resident` sidecar;
-   ordinary captures actively remove a stale sidecar for the same output stem.
+   Exact-hash BIOS resident captures additionally receive a `.resident` sidecar.
+   Resident evidence is monotonic for an identical canonical region identity:
+   ordinary concurrent writers cannot erase it, and a later resident pass
+   repairs a crash between pair publication and sidecar publication.
+   Strong play-free entries that the shared partition cannot publish are retried
+   only as isolated `dispatch_root` fragments. Normal-mode function-pointer
+   targets require an exact F entry; current-byte alias recipes are retried only
+   when outside every guarded interval in that region variant. Static-only
+   deterministic audit rejects publish nothing and become memoized skips, while
+   executed or operator-forced rejects remain hard failures.
 5. `--static` mode instead namespaces the C and folds variants into
    `overlays_static.c` linked directly into the binary, dispatched via a generated
    `psx_overlay_dispatch()` — **this is already an AOT delivery path**; it moves

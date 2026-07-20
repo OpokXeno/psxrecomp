@@ -101,9 +101,58 @@ named snapshots are unioned into one live-history denominator.
 PS-X EXE extraction records normal-mode discovery provenance separately from
 generic function-pointer candidates. `compile_overlays.py` promotes only those
 entries that also pass its local callable/CFG proof to trusted `call_root`s.
+Generic static records also preserve scanner and authoritative
+export/header/jump-table targets in optional `static_dispatch_entry_pcs`. The field is always a subset of
+`dispatch_entry_pcs`; runtime captures and prior-manifest enrichment never invent
+it. Callable members retain static provenance for sibling-variant nomination,
+while case labels and mid-function members remain non-root interior aliases.
 When rebuilding identical bytes, prior overlapping alias groups are retained as
 non-root bodies, so stronger new roots add coverage without displacing already
 compiled indirect entries.
+
+Shard publication counts every `F` candidate from one representative of each
+distinct complete generated pair inside one compiler tier. A pair must have the
+same `P` identifier, the same normalized provenance class (unmarked authority,
+`hosted-v1`, or `orphan-v1`), and exact ordered physical-address-normalized `F`/`R`
+semantics. Legacy/no-`P`, unknown, malformed, cross-tier, or partially different
+pairs remain distinct. The runtime fully preflights each later physical twin, then
+closes its redundant handle before initialization and reuses the canonical
+pair's candidates and cycle-flush owner. The runtime exposes the number of
+validated physical twins as `overlay_loader_status.pair_aliases`. CRC dispatch
+validation is unchanged.
+
+Raw manifest rows, per-`F` unique 4 KiB range-page links, and selected physical
+cache files do not deduplicate. A shared cache-namespace lock makes the projected
+`existing - replaced + staged` usage atomic across concurrent GCC/TCC publishers
+for all four independent bounds: candidates at
+`PSX_OVERLAY_CANDIDATE_CAP`, raw lazy manifest rows at twice that cap, lazy
+range-page links at eight times the raw-row cap, and the 4096-file cache index.
+A replacement is legal in an already-over-budget namespace only when it does not
+grow that budget and crosses no other bound. Capacity rejection is a safe
+interpreter fallback and never overwrites the canonical pair.
+Repeated near-cap projections memoize only successful validation of unchanged
+physical pairs, using the expected ABI and replacement-sensitive identities of
+both the DLL and manifest. A changed pair revalidates, while negative DLL-loader
+results always retry because they may be transient. Transaction recovery and the
+locked authoritative projection still run for every publication. Generated
+manifest metadata also gets a conservative locked preflight before GCC/TCC, so
+an already-impossible near-cap repair is rejected without paying native-link
+cost; every admitted result is reprojected after linking before publication.
+An over-cap snapshot is also retained as a rejection-only witness: a possible
+admission always rescans under lock, while stale deletion can at worst postpone
+optional coverage to the next command.
+`runtime/tests/test_overlay_pair_dedup_runtime.py` compiles the real loader at a
+four-slot test cap plus real shared-library fixtures, and behaviorally covers an
+exact alias at capacity, handle/init/flush ownership, staged rescan idempotence,
+manifest/provenance/tier negatives, and partial-export non-authority.
+Dynamic compilation serializes canonically sorted recipes under a whole-command
+namespace lock so a full cache has the same accepted subset on every clean run.
+GCC-first basename shadowing matches the loader, and non-growing replacements
+remain legal for repair. Legacy/no-CRC or malformed manifests register no native
+candidates. Runtime and compiler share a strict ASCII LF/CRLF grammar, line and
+range bounds, KSEG0 entry canonicalization, and platform-correct basename casing.
+ABI/pair validation and every manifest-declared `func_*` export are preflighted
+before registration, so a mismatched or partial DLL consumes zero candidate slots.
 Reachable direct branches that cross a sibling-entry hard cap are also promoted
 only after the target passes the same bounded CFG proof. This recovers out-of-line
 switch/state blocks without a blind byte or pointer sweep.
@@ -119,8 +168,11 @@ six observed dispatch entries for BIOS SHA-256
 
 `extract_generic.py` automatically appends the matching recipe when the framework
 BIOS exists (or `--bios` / `PSXRECOMP_BIOS_ROM` names it). A different/missing BIOS
-emits no resident record. `--only-bios-resident` materializes just these shared
-recipes without scanning a game disc. The capture contains the code bytes only:
+emits no resident record in diagnostic mode. Release extraction should pass an
+explicit `--bios` together with `--require-bios-resident`; it exits nonzero when
+the file is missing or its exact hash has no recipe. `--only-bios-resident`
+materializes just these shared recipes without scanning a game disc. The capture
+contains the code bytes only:
 no page padding, no adjacent callback-pointer data, and no synthetic execution
 claims. Its sole producer range is `DF80-DFF0`.
 
@@ -290,6 +342,114 @@ framed scans likewise recover Psy-Q's exact
 `lui R; load ...,off(R); addiu sp,sp,-N` entry after a previous return, replacing
 the old root eight bytes late. This closes Tomba 1's historical `0x80110E30` gap
 in the clean X00 variant without minting overlapping functions.
+
+### Play-free isolated continuation recovery (2026-07-19)
+
+Normal-mode discovery can prove a function-pointer or overlapping alias entry
+whose body the stricter exact-entry partition cannot safely own. These entries
+are not promoted into the shared region: doing so can hard-cap a sibling and
+recreate the mid-function truncation/softlock class. After the shared DLL is
+published, `compile_overlays.py` now schedules strong play-free gaps through the
+existing isolated `dispatch_root` fragment path. Missing normal-mode
+function-pointer entries are exact-entry demands; current-byte alias recipes are
+attempted only when the entry lies outside every guarded interval in that
+capture's runtime-valid, CRC-matching shard set. Coverage from another byte
+variant, a mismatched DLL/manifest pair, or a missing DLL export cannot suppress
+a current-variant attempt.
+
+Strong missing roots that share the complete byte/recompiler recipe are compiled
+as one supplemental multi-root shard rather than one DLL per root. Partitionable
+generated-C/requested-entry/no-output/no-identity/cache-collision failures are
+recursively bisected; after each successful half, the remaining roots are
+filtered against the newly published coverage so the other half cannot duplicate
+entries already reached. Compiler/toolchain failures stop that recipe once
+instead of triggering an O(N) retry storm. Executed/forced roots and
+static-interval recovery remain singleton failure domains. Every published batch
+still requires every requested C definition, exactly one 1..16-range identity per
+root, zero unsupported/bad targets, a successful host compile, and an atomic
+DLL/manifest pair. A valid concurrent winner is preserved and then revalidated
+for exact manifest, ABI, and pair identity. Deterministic audit rejection of an
+unplayed static candidate is a memoized safe skip; the same rejection is fatal
+once live execution or `--force-interior` makes it an exact demand.
+
+### Cross-variant hosted interior recovery (2026-07-20)
+
+Some overlay byte variants expose a static dispatch entry that another variant's
+normal walk reaches only as an interior CFG block. Sibling evidence may nominate
+that address, but it supplies no executable authority. The compiler first closes
+all strong static roots across every merged byte recipe, then snapshots organic
+donors globally before the hosted pass. That ordering makes a clean invocation
+complete without relying on roots reloaded by a second run. Donors must be
+CRC-valid `F` entries with exactly one positive range rooted at their entry and
+explicit static control-flow provenance. Roots that also carry live, forced, or
+interval evidence close as isolated singletons before the snapshot. Hosted and
+post-snapshot orphan manifests carry pair-consistent non-authority provenance:
+they remain normal runtime coverage, but neither their aliases nor incidental
+rooted callees can become donor/owner authority on a later invocation. The
+recipient must independently provide one unambiguous, rooted, single-range host
+with current-byte CRC/geometry, the same producer, strict containment, and an
+already existing organic block leader. Publication rechecks every requested host
+and alias against the selected identity.
+
+Nomination, host, batch, attempt, and emitted-identity limits are deterministic.
+Per-recipient sibling streams exclude self and fixed authority coverage before a
+cache-independent nomination window is capped. Supplemental coverage remains in
+that fixed universe through owner selection and the alias/host caps, then the
+compile-time `still_needed` guard removes it; repeated invocations therefore
+cannot page through any later selection cap. Partial block-leader successes retry
+their bounded remainder immediately. Cap drops remain safe interpreter fallback.
+Hosted aliases are exact-entry dispatch candidates,
+never CPS range owners: continuation lookup accepts only the candidate rooted at
+the minimum guarded range address, and otherwise interprets.
+
+The current `cg5_06162507` Tomba 1 proof starts from an absent cache and publishes
+189/189 runtime-valid DLL/manifest pairs (`ok=189 failed=0`): 71 authority shards
+plus 118 `hosted-v1` supplements and 11,177 candidate records. Repeating the exact
+command publishes zero shards and leaves all 378 canonical DLL/manifest files
+byte-identical with unchanged timestamps. Independent played-vault recall is
+808/823 entry addresses (98.2%) and 793/867 exact `(entry, code_crc)` variants
+(91.5%); the exact BIOS shard brings combined interval containment to 823/823. A
+no-autocompile runtime smoke reached the village at 60 fps with active native
+dispatch and no candidate/range/manifest overflow. CRC rejected two stale
+candidates safely. Tomba 2, MMX6, and Ape Escape still require regeneration under
+this hash; the results below are the prior common-hash checkpoint.
+
+Tomba 2's clean `cg5_7125d9b5` build produced 53 region shards plus 104 accepted
+continuation fragments (`ok=157 failed=0 skipped=5`). All 12 durable MAIN gaps
+reproduced their historical `(entry, code_crc)` identities exactly, and the
+resident shard added its six entries. Against the verified 888-entry append-only
+history, combined overlay+base-BIOS interval containment rose from 870/888 to
+888/888. This is finite-set interval containment, not exhaustive or exact-entry
+coverage: exact native recall is 158/888 and remains the next resume-entry
+target. A matching-hash static-only attract run passed the former sign and ledge
+freezes, returned to title at approximately 60 fps, and recorded about 95.3%
+native dispatch.
+
+The bounded batching checkpoint was then rebuilt cleanly under the same final
+`cg5_7125d9b5` hash. MMX6 produced 107/107 runtime-valid DLL/manifest pairs with
+zero final failures and only 81 duplicate instances among 17,425 unique
+`(entry, code_crc)` identities. Against 701 verified historical observations it
+provides 588 exact entry addresses (83.9%), 595 with the exact BIOS resident
+shard (84.9%), 94.2% overlay interval containment, and 100% combined interval
+containment. Tomba 1 produced 74/74 runtime-valid pairs; its played-vault exact
+entry-address recall is 808/823 (98.2%), while exact `(entry, code_crc)` recall is
+778/867 (89.7%). Overlay interval containment is 820/823 (99.6%), and the exact
+BIOS shard brings combined interval containment to 823/823. Interval containment
+remains potential compiled-byte ownership, not proof of exact native dispatch at
+an interior resume PC.
+
+MMX6's full clean cache contained 17,506 raw manifest identities. Before
+whole-pair deduplication, that physical-row total exceeded the runtime's old
+16,384 process-lifetime candidate ceiling and motivated raising the table to
+32,768, with all dependent hash/manifest/range tables scaled consistently. A
+durable `candidate_overflow` status counter, loud loader message, and one-shot
+per-bundle suppression make any future exhaustion explicit and fail closed to
+the interpreter without repeated DLL loads. An adversarial lifecycle review and
+the structural capacity regression test cover partial loads, zero-candidate
+cleanup on both platforms, and speculative Windows image-map cancellation.
+The deliberate desktop memory cost is +11.375 MiB of static BSS in the MinGW
+`overlay_loader` object (37.297 to 48.672 MiB), mostly from the proportionally
+scaled lazy indexes; non-desktop ports should account for this fixed allocation.
 
 A fresh Ape validation rebuilt all **47/47** candidates with zero audit or host-
 compiler failures. A full title-to-attract-to-title cycle exercised four overlay

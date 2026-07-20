@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -154,6 +155,9 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_cull_slti;         // [widescreen.cull] slti_sites
+    std::set<uint32_t>    ws_cull_negsub;       // [widescreen.cull] negsub_sites
+    std::set<uint32_t>    ws_cull_vxrange;      // [widescreen.cull] vxrange_sites
+    std::set<uint32_t>    ws_cull_depth;        // [widescreen.cull] depth_sites
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
     std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };   // [widescreen.cull] screen_h_imms
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
@@ -194,6 +198,9 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(cfg.ws_cull_screen_x_sites.begin(), cfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(cfg.ws_cull_slti_sites.begin(), cfg.ws_cull_slti_sites.end());
+        ws_cull_negsub.insert(cfg.ws_cull_negsub_sites.begin(), cfg.ws_cull_negsub_sites.end());
+        ws_cull_vxrange.insert(cfg.ws_cull_vxrange_sites.begin(), cfg.ws_cull_vxrange_sites.end());
+        ws_cull_depth.insert(cfg.ws_cull_depth_sites.begin(), cfg.ws_cull_depth_sites.end());
         ws_cull_w_imms = cfg.ws_cull_w_imms;
         ws_cull_h_imms = cfg.ws_cull_h_imms;
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
@@ -267,6 +274,9 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(wscfg.ws_cull_screen_x_sites.begin(), wscfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(wscfg.ws_cull_slti_sites.begin(), wscfg.ws_cull_slti_sites.end());
+        ws_cull_negsub.insert(wscfg.ws_cull_negsub_sites.begin(), wscfg.ws_cull_negsub_sites.end());
+        ws_cull_vxrange.insert(wscfg.ws_cull_vxrange_sites.begin(), wscfg.ws_cull_vxrange_sites.end());
+        ws_cull_depth.insert(wscfg.ws_cull_depth_sites.begin(), wscfg.ws_cull_depth_sites.end());
         ws_cull_w_imms = wscfg.ws_cull_w_imms;
         ws_cull_h_imms = wscfg.ws_cull_h_imms;
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
@@ -435,7 +445,12 @@ int main(int argc, char** argv) {
 
     /* Load extra function addresses from a file (one hex address per line).
      * Lines of the form `interior 0xXXXXXXXX` mark dispatch-proven interior
-     * addresses: alias candidates, never walk roots. Lines of the form
+     * addresses: alias candidates, never walk roots. `hosted_interior TARGET
+     * HOST` is a narrow cross-variant identity assertion: TARGET may alias only
+     * the explicitly rooted HOST, and only when TARGET is a syntactic block
+     * leader in HOST's current-byte range. The shard publisher additionally
+     * requires both emitted identities to match a previously CRC-validated host
+     * exactly before the result can reach the runtime. Lines of the form
      * `dispatch_root 0xXXXXXXXX` mark classifier-proven dispatch roots
      * WITHOUT a callable boundary (the kernel install-slot class, e.g. RAM
      * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
@@ -451,6 +466,10 @@ int main(int argc, char** argv) {
      * valid seeds. */
     std::vector<uint32_t> file_seeds;
     std::vector<uint32_t> interior_seeds;
+    std::map<uint32_t, uint32_t> hosted_interior_seeds;
+    std::set<uint32_t> hosted_interior_hosts;
+    constexpr size_t kHostedInteriorTargetCap = 4096;
+    constexpr size_t kHostedInteriorHostCap = 512;
     std::set<uint32_t>    trusted_root_seeds;
     std::set<uint32_t>    trusted_call_root_seeds;
     std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
@@ -493,6 +512,55 @@ int main(int argc, char** argv) {
                 if (line.rfind("retained_alias", 0) == 0) {
                     fmt::print("  ignoring legacy retained_alias; old host "
                                "ranges are never reused: {}\n", line);
+                    continue;
+                }
+                if (line.rfind("hosted_interior", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, target_text, host_text, trailing;
+                    in >> tag >> target_text >> host_text >> trailing;
+                    auto parse_hex_u32 = [](const std::string& text,
+                                            uint32_t& value) -> bool {
+                        if (text.empty()) return false;
+                        char* end = nullptr;
+                        errno = 0;
+                        unsigned long long parsed =
+                            std::strtoull(text.c_str(), &end, 16);
+                        if (errno != 0 || end == text.c_str() || *end != '\0' ||
+                            parsed > 0xFFFFFFFFull) return false;
+                        value = static_cast<uint32_t>(parsed);
+                        return true;
+                    };
+                    uint32_t target = 0, host = 0;
+                    if (tag != "hosted_interior" || !trailing.empty() ||
+                        !parse_hex_u32(target_text, target) ||
+                        !parse_hex_u32(host_text, host) ||
+                        (target & 3u) != 0u || (host & 3u) != 0u ||
+                        target < seed_lo || target >= seed_hi ||
+                        host < seed_lo || host >= seed_hi || target == host) {
+                        fmt::print(stderr, "ERROR: invalid hosted_interior: {}\n", line);
+                        return 1;
+                    }
+                    auto prior = hosted_interior_seeds.find(target);
+                    if (prior != hosted_interior_seeds.end() &&
+                        prior->second != host) {
+                        fmt::print(stderr, "ERROR: conflicting hosted_interior "
+                                   "hosts for 0x{:08X}\n", target);
+                        return 1;
+                    }
+                    hosted_interior_seeds.emplace(target, host);
+                    hosted_interior_hosts.insert(host);
+                    if (hosted_interior_seeds.size() >
+                            kHostedInteriorTargetCap ||
+                        hosted_interior_hosts.size() >
+                            kHostedInteriorHostCap) {
+                        fmt::print(stderr, "ERROR: hosted_interior capacity "
+                                   "exceeded (targets {} / {}, hosts {} / {})\n",
+                                   hosted_interior_seeds.size(),
+                                   kHostedInteriorTargetCap,
+                                   hosted_interior_hosts.size(),
+                                   kHostedInteriorHostCap);
+                        return 1;
+                    }
                     continue;
                 }
                 bool interior = false;
@@ -544,10 +612,12 @@ int main(int argc, char** argv) {
                 }
             }
             fmt::print("Loaded {} extra function addresses ({} interior, "
-                       "{} dispatch-root, {} call-root, {} producer ranges, "
+                       "{} hosted-interior, {} dispatch-root, {} call-root, {} producer ranges, "
                        "{} cross-call allows) from {}\n",
-                       file_seeds.size() + interior_seeds.size(),
-                       interior_seeds.size(), trusted_root_seeds.size(),
+                       file_seeds.size() + interior_seeds.size() +
+                           hosted_interior_seeds.size(),
+                       interior_seeds.size(), hosted_interior_seeds.size(),
+                       trusted_root_seeds.size(),
                        trusted_call_root_seeds.size(),
                        producer_ranges.size(), cross_call_allow.size(),
                        extra_funcs_path);
@@ -607,8 +677,15 @@ int main(int argc, char** argv) {
 
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
+        std::set<uint32_t> hosted_targets;
+        for (const auto& seed : hosted_interior_seeds)
+            hosted_targets.insert(seed.first);
         for (uint32_t a : exact_entries) {
-            if (reachable_discovery && a == exe->header.initial_pc) {
+            if (hosted_targets.count(a)) {
+                // A fragment PS-X header needs one initial PC, but a trusted
+                // hosted interior must never become a walk root through it.
+                continue;
+            } else if (reachable_discovery && a == exe->header.initial_pc) {
                 // The PS-X EXE header is direct execution evidence for the
                 // main entry even when it uses a nonstandard prologue.
                 roots.insert(a);
@@ -665,6 +742,50 @@ int main(int argc, char** argv) {
             } else {
                 fmt::print("  WARNING: interior seed 0x{:08X} has no host "
                            "function — left to the interpreter\n", a);
+            }
+        }
+
+        // Cross-variant propagation never guesses a new walk. The caller names
+        // a current-byte host that was already CRC-valid in the cache, and the
+        // recompiler requires that exact root plus a syntactic block boundary
+        // in the host's current-byte range. This block test alone is NOT proof
+        // of reachability: the publisher must compare the emitted host+alias
+        // CRC/range identities with the preselected cached owner before use.
+        PSXRecomp::ControlFlowAnalyzer hosted_cfg_analyzer(*exe);
+        std::map<uint32_t, PSXRecomp::ControlFlowGraph> hosted_cfgs;
+        for (const auto& seed : hosted_interior_seeds) {
+            uint32_t target = seed.first;
+            uint32_t requested_host = seed.second;
+            const PSXRecomp::Function* host = nullptr;
+            for (const auto& function : analysis_result.functions) {
+                if (function.start_addr == requested_host) {
+                    host = &function;
+                    break;
+                }
+            }
+            bool explicitly_rooted = roots.count(requested_host) != 0;
+            bool producer_ok = host &&
+                (host->producer_lo == 0 ||
+                 (target >= host->producer_lo && target < host->producer_hi));
+            bool block_ok = false;
+            if (host && producer_ok && target > host->start_addr &&
+                target < host->end_addr) {
+                auto inserted = hosted_cfgs.emplace(
+                    host->start_addr, PSXRecomp::ControlFlowGraph{});
+                if (inserted.second)
+                    inserted.first->second = hosted_cfg_analyzer.analyze_function(*host);
+                block_ok = inserted.first->second.blocks.count(target) != 0;
+            }
+            if (host && explicitly_rooted && producer_ok && block_ok) {
+                if (alias_seen.insert(target).second)
+                    alias_entries.push_back(
+                        {target, host->start_addr, host->end_addr});
+            } else {
+                fmt::print("  WARNING: hosted interior 0x{:08X} rejected for "
+                           "host 0x{:08X} (host={}, rooted={}, producer={}, block={})\n",
+                           target, requested_host, host ? "yes" : "no",
+                           explicitly_rooted ? "yes" : "no",
+                           producer_ok ? "yes" : "no", block_ok ? "yes" : "no");
             }
         }
 
@@ -923,6 +1044,9 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
     codegen_config.ws_cull_screen_x_sites = ws_cull_screen_x;
     codegen_config.ws_cull_slti_sites  = ws_cull_slti;
+    codegen_config.ws_cull_negsub_sites = ws_cull_negsub;
+    codegen_config.ws_cull_vxrange_sites = ws_cull_vxrange;
+    codegen_config.ws_cull_depth_sites = ws_cull_depth;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;

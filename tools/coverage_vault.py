@@ -9,7 +9,8 @@ safe, ADDITIVE vault OUTSIDE any build dir: every merge UNIONS new coverage in
 and never drops what's already there.
 
   - captures: union by VARIANT (load_addr + hash of the captured bytes). Same
-    variant => union its executed_pcs / dispatch_entry_pcs. Distinct variants
+    variant => union its executed_pcs / dispatch_entry_pcs and preserve the
+    extractor-only static_dispatch_entry_pcs provenance subset. Distinct variants
     (same address, different scene's overlay) are all kept.
   - cache: filenames are content-keyed (<addr>_<crc>.dll/.ranges), so a copy-if-
     absent (or newer) is a safe additive union.
@@ -318,6 +319,7 @@ def merge_capture_regions(vault_json, src):
             else:
                 tgt = index[k]
                 for fld in ("executed_pcs", "dispatch_entry_pcs",
+                            "static_dispatch_entry_pcs",
                             "function_entry_pcs", "seeds"):
                     cur = set(tgt.get(fld, []))
                     add = set(r.get(fld, []))

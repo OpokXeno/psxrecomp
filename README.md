@@ -20,7 +20,7 @@ project containing C source and build scripts.
 ### Generate a project with the released CLI
 
 1. Download `psxrecomp-cli-windows-x86_64.zip` from
-   [Releases](https://github.com/mstan/psxrecomp/releases/latest).
+   [Releases](https://github.com/mstan/psxrecomp/releases).
 2. Extract the whole zip to a folder. Keep its contents together.
 3. Open PowerShell in that folder and run:
 

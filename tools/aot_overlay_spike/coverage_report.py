@@ -473,6 +473,27 @@ def group_by_region(addrs):
     for a in addrs: g[region_of(a)].append(a)
     return {r: sorted(v) for r, v in sorted(g.items())}
 
+
+def candidate_miss_records(misses):
+    """Stable JSON records for strict content-variant coverage gaps."""
+    return [
+        {'entry': f'0x{entry | 0x80000000:08X}',
+         'code_crc': f'{crc:08X}'}
+        for entry, crc in sorted(
+            (norm(entry), crc & 0xFFFFFFFF) for entry, crc in misses)
+    ]
+
+
+def group_candidate_misses_by_region(misses):
+    """Group strict ``(entry, code_crc)`` gaps without losing variants."""
+    grouped = defaultdict(list)
+    for entry, crc in sorted(misses):
+        grouped[region_of(entry)].append((entry, crc))
+    return {
+        f'0x{region | 0x80000000:08X}': candidate_miss_records(values)
+        for region, values in sorted(grouped.items())
+    }
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--static', required=True, help='static shard cache dir (.ranges)')
@@ -548,6 +569,10 @@ def main():
             f'0x{x|0x80000000:08X}' for x in r['range_misses']]
         report['vault_interval_potential_misses'] = list(
             report['vault_range_misses'])
+        report['vault_entry_crc_misses'] = candidate_miss_records(
+            r['entry_crc_misses'])
+        report['vault_entry_crc_misses_by_region'] = \
+            group_candidate_misses_by_region(r['entry_crc_misses'])
         combined = None
         if a.bios_dispatch:
             combined = recall(set(vault_ent), combined_ent, combined_ranges)
@@ -575,13 +600,23 @@ def main():
                   f'{r.get("needed_entry_crc",0)}** '
                   f'(**{r.get("recall_entry_crc",0)*100:.1f}%**) '
                   f'_(cg-version differences can lower this vs address-level recall)_')
+        if r['entry_crc_misses']:
+            md.append('#### Exact manifest-candidate gaps by region\n')
+            for region, records in group_candidate_misses_by_region(
+                    r['entry_crc_misses']).items():
+                unique_addresses = len({record['entry'] for record in records})
+                md.append(f'- `{region}`: **{len(records)}** missing '
+                          f'candidate variant(s) at **{unique_addresses}** '
+                          'entry address(es)')
+            md.append('')
         md.append(f'- **MISSED exact entries: {r["missed"]}**')
         md.append(f'- **OUTSIDE ALL STATIC INTERVALS: '
                   f'{r["missed_interval_potential"]}** played entry PCs '
                   '(potential gaps; interval membership is not dispatch proof)\n')
         if combined:
             md.append('### Combined with base recompiled BIOS\n')
-            md.append(f'- Exact native dispatch entries: **{combined["covered_here"]}** '
+            md.append(f'- Exact entry addresses present in overlay/BIOS static '
+                      f'dispatch sets: **{combined["covered_here"]}** '
                       f'(**{combined["recall_entry"]*100:.1f}%**)')
             md.append(f'- Contained in an overlay/BIOS static interval '
                       f'(unverified potential): '

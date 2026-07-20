@@ -59,7 +59,8 @@ void write_word(PSXRecomp::PS1Executable& exe, uint32_t address,
 
 std::string generate_first_instruction(uint32_t first_word,
                                        std::vector<RecompilerPatch> patches,
-                                       bool overlay_mode) {
+                                       bool overlay_mode,
+                                       PSXRecomp::CodeGenConfig config = {}) {
     constexpr uint32_t base = 0x80010000u;
     PSXRecomp::PS1Executable exe{};
     exe.header.load_address = base;
@@ -82,7 +83,6 @@ std::string generate_first_instruction(uint32_t first_word,
 
     PSXRecomp::ControlFlowAnalyzer analyzer(exe);
     const auto cfg = analyzer.analyze_function(function);
-    PSXRecomp::CodeGenConfig config;
     config.overlay_mode = overlay_mode;
     PSXRecomp::CodeGenerator generator(exe, config);
     return generator.generate_function(function, cfg).full_code;
@@ -174,6 +174,33 @@ replacement = "0x24020001"
 )toml");
     check_throws([&] { (void)PSXRecompV4::load_game_config(unaligned); },
                  "instruction-aligned", "parser rejects unaligned sites");
+
+    const auto negsub = write_config(root, "negsub", R"toml(
+[widescreen.cull]
+negsub_sites = ["0x80012340"]
+)toml");
+    const auto negsub_config = PSXRecompV4::load_game_config(negsub);
+    check(negsub_config.ws_cull_negsub_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves negsub cull sites");
+
+    const auto vxrange = write_config(root, "vxrange", R"toml(
+[widescreen.cull]
+vxrange_sites = ["0x80012340"]
+)toml");
+    const auto vxrange_config = PSXRecompV4::load_game_config(vxrange);
+    check(vxrange_config.ws_cull_vxrange_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves masked-u16 X-window sites");
+
+    const auto depth = write_config(root, "depth", R"toml(
+[widescreen.cull]
+depth_sites = ["0x80012340"]
+)toml");
+    const auto depth_config = PSXRecompV4::load_game_config(depth);
+    check(depth_config.ws_cull_depth_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves depth-bound sites");
 }
 
 void capture_history_config_tests(const fs::path& root) {
@@ -253,6 +280,49 @@ void codegen_tests() {
         },
         "conflicting recompiler patches",
         "config merge rejects cross-config ID conflicts");
+
+    PSXRecomp::CodeGenConfig negsub_config;
+    negsub_config.ws_cull_negsub_sites.insert(0x80010000u);
+    const std::string negsub = generate_first_instruction(
+        0x00041023u, {}, false, negsub_config); // subu v0,zero,a0
+    check(negsub.find("cpu->gpr[2] = 0u - cpu->gpr[4] - "
+                      "(uint32_t)psx_ws_x_margin()") != std::string::npos,
+          "codegen emits configured negsub horizontal low-edge widen");
+
+    const std::string overlay_mismatch = generate_first_instruction(
+        0x00041021u, {}, true, negsub_config); // addu v0,zero,a0
+    check(overlay_mismatch.find("ws cull negsub") == std::string::npos,
+          "overlay nonmatching negsub variant remains unchanged");
+
+    PSXRecomp::CodeGenConfig vxrange_config;
+    vxrange_config.ws_cull_vxrange_sites.insert(0x80010000u);
+    const std::string vxrange = generate_first_instruction(
+        0x2C820140u, {}, false, vxrange_config); // sltiu v0,a0,0x140
+    check(vxrange.find("cpu->gpr[2] = psx_ws_cull_vxrange(cpu->gpr[4], 320)") !=
+              std::string::npos,
+          "codegen routes masked-u16 X-window sites through shared helper");
+
+    const std::string vxrange_overlay_mismatch = generate_first_instruction(
+        0x24820140u, {}, true, vxrange_config); // addiu v0,a0,0x140
+    check(vxrange_overlay_mismatch.find("ws cull masked-u16") == std::string::npos,
+          "overlay nonmatching masked-u16 variant remains unchanged");
+
+    PSXRecomp::CodeGenConfig depth_config;
+    depth_config.ws_cull_depth_sites.insert(0x80010000u);
+    const std::string signed_depth = generate_first_instruction(
+        0x28827FFFu, {}, false, depth_config); // slti v0,a0,0x7fff
+    check(signed_depth.find("psx_ws_depth_bound(32767)") != std::string::npos,
+          "codegen emits signed aspect-scaled depth bound");
+
+    const std::string unsigned_depth = generate_first_instruction(
+        0x2C82FFFFu, {}, false, depth_config); // sltiu v0,a0,-1
+    check(unsigned_depth.find("psx_ws_depth_bound(-1)") != std::string::npos,
+          "unsigned depth emit preserves MIPS immediate sign extension");
+
+    const std::string depth_overlay_mismatch = generate_first_instruction(
+        0x24827FFFu, {}, true, depth_config); // addiu v0,a0,0x7fff
+    check(depth_overlay_mismatch.find("ws cull depth") == std::string::npos,
+          "overlay nonmatching depth variant remains unchanged");
 }
 
 void gte_codegen_classification_tests() {

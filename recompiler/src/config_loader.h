@@ -513,6 +513,15 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // Horizontal low-edge form `subu rd,zero,rs` -> `-rs-x_margin`.
+    // Empty by default; configured sites require regenerated native code.
+    std::vector<uint32_t> ws_cull_negsub_sites;
+    // `sltiu rt,rs,imm` where rs is an ANDI-masked 16-bit screen X.
+    // Widens both edges in 16-bit space; empty by default; regen required.
+    std::vector<uint32_t> ws_cull_vxrange_sites;
+    // Aspect-scaled slti/sltiu far-bound sites. Empty by default; use only for
+    // pure visibility gates. Configured sites require regenerated native code.
+    std::vector<uint32_t> ws_cull_depth_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

@@ -205,6 +205,12 @@ int psx_ws_cull_slti(uint32_t sx, uint32_t imm) {
 int psx_ws_cull_bltz(uint32_t v) {
     return ((int32_t)v < -psx_ws_x_margin()) ? 1 : 0;
 }
+int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
+    int32_t margin = psx_ws_x_margin();
+    uint32_t bound = (uint32_t)(int32_t)(int16_t)(uint16_t)imm;
+    return (((x + (uint32_t)margin) & 0xFFFFu) <
+            (bound + 2u * (uint32_t)margin)) ? 1 : 0;
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
@@ -222,6 +228,9 @@ uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
  * 4:3 behavior) if the host predates the callback. */
 int32_t psx_ws_player_x_bound(int32_t vanilla) {
     return g_cbs.ws_player_x_bound ? g_cbs.ws_player_x_bound(vanilla) : vanilla;
+}
+int32_t psx_ws_depth_bound(int32_t imm) {
+    return g_cbs.ws_depth_bound ? g_cbs.ws_depth_bound(imm) : imm;
 }
 /* Sub-pixel GTE precision-store tracker (ABI v14). The emitter emits a direct
  * gte_precision_store_word() call for every swc2 (GTE store-word), including in

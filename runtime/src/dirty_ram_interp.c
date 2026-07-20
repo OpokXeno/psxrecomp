@@ -1432,7 +1432,10 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
             return 0;
         case 0x22: /* SUB - overflow traps are delegated if they occur. */
         case 0x23: /* SUBU */
-            cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
+            if (rs == 0 && psx_ws_is_cull_negsub_site(pc))
+                cpu->gpr[rd] = 0u - cpu->gpr[rt] - (uint32_t)psx_ws_x_margin();
+            else
+                cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
         case 0x24: /* AND */
@@ -1592,10 +1595,12 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
         cpu->gpr[0] = 0;
         return 0;
     case 0x0A: /* SLTI */
+        if (psx_ws_is_cull_depth_site(pc))
+            cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < psx_ws_depth_bound(simm)) ? 1u : 0u;
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
-        if (psx_ws_is_cull_slti_site(pc) ||
+        else if (psx_ws_is_cull_slti_site(pc) ||
             (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
         else
@@ -1607,7 +1612,12 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
          * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
-        if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
+        if (psx_ws_is_cull_depth_site(pc))
+            cpu->gpr[rt] = (cpu->gpr[rs] <
+                            (uint32_t)psx_ws_depth_bound(simm)) ? 1u : 0u;
+        else if (psx_ws_is_cull_vxrange_site(pc))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_vxrange(cpu->gpr[rs], imm);
+        else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
         else
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
