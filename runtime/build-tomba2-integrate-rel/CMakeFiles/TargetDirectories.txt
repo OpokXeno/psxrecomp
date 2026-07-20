@@ -1,4 +1,0 @@
-F:/Projects/psxrecomp/_wt-interp-hotpath-master/runtime/build-tomba2-integrate-rel/CMakeFiles/psx-runtime.dir
-F:/Projects/psxrecomp/_wt-interp-hotpath-master/runtime/build-tomba2-integrate-rel/CMakeFiles/psxrecomp_codegen_hash.dir
-F:/Projects/psxrecomp/_wt-interp-hotpath-master/runtime/build-tomba2-integrate-rel/CMakeFiles/edit_cache.dir
-F:/Projects/psxrecomp/_wt-interp-hotpath-master/runtime/build-tomba2-integrate-rel/CMakeFiles/rebuild_cache.dir
