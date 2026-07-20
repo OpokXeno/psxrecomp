@@ -29,6 +29,10 @@ struct Function {
     // emitter generate ONE shared body per host with an entry switch instead
     // of duplicating the host's blocks per alias.
     std::vector<uint32_t> alias_group_entries;
+    // Exact-entry composites retain the source producer that owns this code.
+    // Zero means an ordinary single-image function.
+    uint32_t producer_lo = 0;
+    uint32_t producer_hi = 0;
 };
 
 struct AbsorbedEntry {
@@ -59,6 +63,36 @@ struct FunctionAnalysisResult {
     // function's coarse [start,end) envelope or an unreachable data hole.
     std::set<uint32_t> exact_reachable_pcs;
 };
+
+// A canonical, bounds-checked MIPS jump table recovered from a jr $rN site.
+// `table_base` and each pair's first value are the runtime addresses stored by
+// the guest; the pair's second value is the corresponding address in the
+// active executable image (normally identical, except for BIOS shell remaps).
+struct ExactJumpTable {
+    uint32_t table_base = 0;
+    uint32_t table_count = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> targets;
+};
+
+using ExactAddressMapper = uint32_t (*)(uint32_t, const PS1Executable&);
+
+// Recognize only the canonical bounded-switch dependency chain:
+// sltiu/beq guard -> sll index,2 -> addu table address -> lw target -> jr.
+// The table constant may use either same-register or cross-register
+// `lui source; addiu base,source,lo`. `producer_lo/producer_hi` bound both
+// table storage and case code for composite images; zero/zero means the full
+// executable. Every dependency, table word, and target must pass the hard
+// safety checks; otherwise the whole table is rejected.
+bool resolve_exact_bounded_jump_table(
+    const PS1Executable& exe,
+    uint32_t entry,
+    uint32_t hard_cap,
+    uint32_t jr_pc,
+    uint32_t jr_rs,
+    ExactJumpTable& table,
+    ExactAddressMapper runtime_to_image = nullptr,
+    uint32_t producer_lo = 0,
+    uint32_t producer_hi = 0);
 
 class FunctionAnalyzer {
 public:

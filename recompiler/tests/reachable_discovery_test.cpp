@@ -54,6 +54,54 @@ std::set<uint32_t> starts(const PSXRecomp::FunctionAnalysisResult& result) {
     return out;
 }
 
+struct ApeSwitchFixture {
+    std::vector<uint8_t> image;
+    uint32_t entry = kLoad + 0x500u;
+    uint32_t jr_pc = kLoad + 0x528u;
+    uint32_t table = kLoad + 0xA00u;
+    std::vector<uint32_t> cases = {
+        kLoad + 0x540u, kLoad + 0x550u, kLoad + 0x560u};
+};
+
+ApeSwitchFixture make_ape_switch() {
+    ApeSwitchFixture f;
+    f.image = make_exe_buffer(0x1000u, f.entry);
+    const size_t text = 2048u;
+    put32(f.image, text + 0x500, 0x3C088001u); // lui t0,0x8001
+    put32(f.image, text + 0x504, 0x25100A00u); // addiu s0,t0,0x0a00
+    put32(f.image, text + 0x508, 0x00000000u);
+    put32(f.image, text + 0x50C, 0x2C620003u); // sltiu v0,v1,3
+    put32(f.image, text + 0x510, 0x1040001Bu); // beq v0,zero,+0x580
+    put32(f.image, text + 0x514, 0x00000000u);
+    put32(f.image, text + 0x518, 0x00031080u); // sll v0,v1,2
+    put32(f.image, text + 0x51C, 0x00501021u); // addu v0,v0,s0
+    put32(f.image, text + 0x520, 0x8C420000u); // lw v0,0(v0)
+    put32(f.image, text + 0x524, 0x00000000u);
+    put32(f.image, text + 0x528, 0x00400008u); // jr v0
+    put32(f.image, text + 0x52C, 0x00000000u);
+    for (size_t i = 0; i < f.cases.size(); i++) {
+        size_t off = static_cast<size_t>(f.cases[i] - kLoad);
+        put32(f.image, text + off, 0x24020001u + static_cast<uint32_t>(i));
+        put32(f.image, text + off + 4u, 0x03E00008u);
+        put32(f.image, text + off + 8u, 0x00000000u);
+        put32(f.image, text + 0xA00u + i * 4u, f.cases[i]);
+    }
+    put32(f.image, text + 0x580, 0x03E00008u);
+    put32(f.image, text + 0x584, 0x00000000u);
+    return f;
+}
+
+bool resolves_ape_switch(const ApeSwitchFixture& f,
+                         uint32_t entry,
+                         uint32_t producer_lo = kLoad,
+                         uint32_t producer_hi = kLoad + 0x1000u) {
+    auto exe = parse(f.image);
+    PSXRecomp::ExactJumpTable table;
+    return PSXRecomp::resolve_exact_bounded_jump_table(
+        exe, entry, kLoad + 0x1000u, f.jr_pc, 2u, table,
+        nullptr, producer_lo, producer_hi);
+}
+
 } // namespace
 
 int main() {
@@ -487,6 +535,127 @@ int main() {
     CHECK(call_delay.count(kLoad + 0x300) &&
           !call_delay.count(kLoad + 0x400),
           "indirect resolver rejects a LUI in a call delay slot");
+
+    // Ape Escape's save-screen dispatcher builds its table base across
+    // registers (lui t0; addiu s0,t0,lo). Prove the complete bounded switch,
+    // then make every adversarial mutation fail closed as one whole table.
+    auto ape_switch = make_ape_switch();
+    auto ape_switch_exe = parse(ape_switch.image);
+    PSXRecomp::ExactJumpTable ape_table;
+    CHECK(PSXRecomp::resolve_exact_bounded_jump_table(
+              ape_switch_exe, ape_switch.entry, kLoad + 0x1000u,
+              ape_switch.jr_pc, 2u, ape_table) &&
+          ape_table.table_base == ape_switch.table &&
+          ape_table.table_count == ape_switch.cases.size() &&
+          ape_table.targets.size() == ape_switch.cases.size(),
+          "Ape cross-register bounded switch resolves exactly");
+    PSXRecomp::FunctionAnalyzer ape_switch_analyzer(ape_switch_exe);
+    const auto ape_result = ape_switch_analyzer.analyze_exact_entries(
+        {ape_switch.entry});
+    bool all_ape_cases_reachable = true;
+    for (uint32_t target : ape_switch.cases)
+        all_ape_cases_reachable &= ape_result.exact_reachable_pcs.count(target) != 0;
+    CHECK(all_ape_cases_reachable,
+          "exact reachable discovery follows every validated Ape case");
+
+    auto ori_switch = make_ape_switch();
+    put32(ori_switch.image, text + 0x504, 0x35100A00u); // ori s0,t0,0x0a00
+    CHECK(!resolves_ape_switch(ori_switch, ori_switch.entry),
+          "unproven ORI table constants fail closed");
+
+    auto no_lw_nop_switch = make_ape_switch();
+    no_lw_nop_switch.jr_pc = kLoad + 0x524u;
+    put32(no_lw_nop_switch.image, text + 0x524, 0x00400008u);
+    put32(no_lw_nop_switch.image, text + 0x528, 0x00000000u);
+    CHECK(resolves_ape_switch(no_lw_nop_switch, no_lw_nop_switch.entry),
+          "zero-NOP LW-to-JR schedule matches Python parity");
+
+    auto two_lw_nop_switch = make_ape_switch();
+    two_lw_nop_switch.jr_pc = kLoad + 0x52Cu;
+    put32(two_lw_nop_switch.image, text + 0x528, 0x00000000u);
+    put32(two_lw_nop_switch.image, text + 0x52C, 0x00400008u);
+    CHECK(!resolves_ape_switch(two_lw_nop_switch,
+                               two_lw_nop_switch.entry),
+          "two-NOP LW-to-JR schedule fails closed");
+
+    auto wrong_jr_switch = make_ape_switch();
+    put32(wrong_jr_switch.image, text + 0x528,
+          0x00400808u); // reserved rd field makes this noncanonical JR
+    CHECK(!resolves_ape_switch(wrong_jr_switch, wrong_jr_switch.entry),
+          "jump-table proof checks the exact JR encoding");
+
+    auto noncanonical_lui_switch = make_ape_switch();
+    put32(noncanonical_lui_switch.image, text + 0x500,
+          0x3C288001u); // LUI's reserved rs field is nonzero
+    CHECK(!resolves_ape_switch(noncanonical_lui_switch,
+                               noncanonical_lui_switch.entry),
+          "jump-table proof rejects noncanonical LUI reserved fields");
+
+    auto cross_producer_switch = make_ape_switch();
+    CHECK(!resolves_ape_switch(cross_producer_switch,
+                               cross_producer_switch.entry,
+                               kLoad + 0x400u, kLoad + 0x900u),
+          "producer A cannot borrow table slots from adjacent producer B");
+
+    auto producer_case_escape = make_ape_switch();
+    put32(producer_case_escape.image, text + 0x540,
+          0x08000000u | (((kLoad + 0xB20u) >> 2) & 0x03FFFFFFu));
+    put32(producer_case_escape.image, text + 0x544, 0x00000000u);
+    put32(producer_case_escape.image, text + 0xB20,
+          0x08000000u | (((kLoad + 0x518u) >> 2) & 0x03FFFFFFu));
+    put32(producer_case_escape.image, text + 0xB24, 0x00000000u);
+    CHECK(!resolves_ape_switch(producer_case_escape,
+                               producer_case_escape.entry,
+                               kLoad + 0x400u, kLoad + 0xA20u),
+          "case walk cannot escape through an adjacent producer");
+    auto cross_producer_exe = parse(cross_producer_switch.image);
+    PSXRecomp::FunctionAnalyzer cross_producer_analyzer(cross_producer_exe);
+    const auto cross_producer_result =
+        cross_producer_analyzer.analyze_exact_entries(
+            {cross_producer_switch.entry},
+            {{kLoad + 0x400u, kLoad + 0x900u},
+             {kLoad + 0x900u, kLoad + 0x1000u}});
+    CHECK(!cross_producer_result.exact_reachable_pcs.count(kLoad + 0x540u),
+          "reachable discovery rejects a cross-producer table");
+    CHECK(!cross_producer_result.functions.empty() &&
+          cross_producer_result.functions.front().producer_lo ==
+              kLoad + 0x400u &&
+          cross_producer_result.functions.front().producer_hi ==
+              kLoad + 0x900u,
+          "exact functions retain producer bounds for code generation");
+
+    auto invalid_target_switch = make_ape_switch();
+    put32(invalid_target_switch.image, text + 0x550, 0xFFFFFFFFu);
+    CHECK(!resolves_ape_switch(invalid_target_switch,
+                               invalid_target_switch.entry),
+          "one invalid target instruction rejects the entire table");
+
+    auto clobbered_switch = make_ape_switch();
+    put32(clobbered_switch.image, text + 0x508,
+          0x24100000u); // addiu s0,zero,0
+    CHECK(!resolves_ape_switch(clobbered_switch, clobbered_switch.entry),
+          "table-base clobber rejects the bounded switch");
+
+    auto skipped_def_switch = make_ape_switch();
+    put32(skipped_def_switch.image, text + 0x700,
+          0x08000000u |
+              (((kLoad + 0x504u) >> 2) & 0x03FFFFFFu));
+    put32(skipped_def_switch.image, text + 0x704, 0x00000000u);
+    CHECK(!resolves_ape_switch(skipped_def_switch,
+                               skipped_def_switch.entry),
+          "later host bytes cannot jump into and skip a protected definition");
+
+    auto bad_bound_switch = make_ape_switch();
+    put32(bad_bound_switch.image, text + 0x50C,
+          0x2C820003u); // sltiu v0,a0,3: wrong index dependency
+    CHECK(!resolves_ape_switch(bad_bound_switch, bad_bound_switch.entry),
+          "unrelated SLTIU bound cannot validate a jump table");
+
+    auto outside_target_switch = make_ape_switch();
+    put32(outside_target_switch.image, text + 0xA04, kLoad + 0x2000u);
+    CHECK(!resolves_ape_switch(outside_target_switch,
+                               outside_target_switch.entry),
+          "one out-of-image table target rejects the entire table");
 
     // A packed BIOS thunk is also a backward-scan boundary.  The frameless
     // leaf after its delay slot must not be swallowed into the thunk run.

@@ -414,6 +414,8 @@ def optional_enrichment_fallback_capture(cap: dict) -> dict | None:
         fallback['static_discovery_entry_pcs'] = encoded
         fallback['seeds'] = encoded
     fallback.pop('static_alias_ranges', None)
+    fallback.pop('static_jump_table_proofs', None)
+    fallback.pop('static_call_continuation_pcs', None)
     fallback.pop('_prior_aliases', None)
     fallback.pop(key, None)
     return fallback
@@ -535,13 +537,217 @@ def _classify_cf(pc: int, word: int) -> tuple[str, int]:
 
 def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
                              entry: int, hard_cap: int,
-                             jr_pc: int, jr_rs: int) -> set[int]:
-    """Fail closed until JR-table register/control dependence is proven.
+                             jr_pc: int, jr_rs: int,
+                             producer_range=None, proof_out=None) -> set[int]:
+    """Resolve one tightly bounded canonical ``sltiu``/``jr`` switch.
 
-    The former 40-word raw backscan could combine unrelated loads, constants,
-    and bounds checks across basic blocks into a synthetic table.
+    This is deliberately a structural reaching-definition proof, not the old
+    40-word bag-of-opcodes backscan.  The accepted suffix is::
+
+        sltiu guard,index,count; beq guard,zero,reject; nop
+        sll scaled,index,2; addu address,scaled,table_base
+        lw target,offset(address); [nop x 0..1]; jr target
+
+    ``table_base`` must be a nearest-definition LUI, optionally followed by a
+    nearest-definition ADDIU.  The lower instruction may rename the
+    register (``lui v0; addiu s0,v0,lo``), as used by Ape Escape.  Any other
+    control flow between that constant and the suffix, an inbound edge that
+    skips the definition, a register mismatch/clobber, or one non-local table
+    entry rejects the entire candidate.
     """
-    return set()
+    lo = load_addr
+    hi = load_addr + size
+    if not (entry <= jr_pc < hard_cap and 0 < jr_rs < 32):
+        return set()
+    jr_word = _word_at(data, load_addr, jr_pc)
+    if jr_word != ((jr_rs << 21) | 0x08):
+        return set()
+
+    # Permit only the compiler's zero-or-one scheduling NOP between LW/JR.
+    lw_pc = jr_pc - 4
+    for _ in range(1):
+        if _word_at(data, load_addr, lw_pc) != 0:
+            break
+        lw_pc -= 4
+    lw_word = _word_at(data, load_addr, lw_pc)
+    if lw_word is None or ((lw_word >> 26) & 0x3F) != 0x23 \
+            or ((lw_word >> 16) & 0x1F) != jr_rs:
+        return set()
+    address_reg = (lw_word >> 21) & 0x1F
+    if not address_reg:
+        return set()
+    lw_offset = lw_word & 0xFFFF
+    if lw_offset & 0x8000:
+        lw_offset -= 0x10000
+
+    addu_pc = lw_pc - 4
+    addu_word = _word_at(data, load_addr, addu_pc)
+    if addu_word is None or ((addu_word >> 26) & 0x3F) != 0 \
+            or (addu_word & 0x3F) != 0x21 \
+            or ((addu_word >> 6) & 0x1F) != 0 \
+            or ((addu_word >> 11) & 0x1F) != address_reg:
+        return set()
+    addu_inputs = ((addu_word >> 21) & 0x1F,
+                   (addu_word >> 16) & 0x1F)
+
+    sll_pc = addu_pc - 4
+    sll_word = _word_at(data, load_addr, sll_pc)
+    if sll_word is None or ((sll_word >> 26) & 0x3F) != 0 \
+            or (sll_word & 0x3F) != 0 \
+            or ((sll_word >> 21) & 0x1F) != 0 \
+            or ((sll_word >> 6) & 0x1F) != 2:
+        return set()
+    scaled_reg = (sll_word >> 11) & 0x1F
+    index_reg = (sll_word >> 16) & 0x1F
+    if not scaled_reg or not index_reg or scaled_reg not in addu_inputs:
+        return set()
+    table_reg = addu_inputs[1] if addu_inputs[0] == scaled_reg else addu_inputs[0]
+    if not table_reg or table_reg == scaled_reg:
+        return set()
+
+    # The bound must guard this exact index on the sole fallthrough into SLL.
+    sltiu_pc = sll_pc - 12
+    branch_pc = sll_pc - 8
+    if _word_at(data, load_addr, sll_pc - 4) != 0:
+        return set()
+    sltiu_word = _word_at(data, load_addr, sltiu_pc)
+    branch_word = _word_at(data, load_addr, branch_pc)
+    if sltiu_word is None or ((sltiu_word >> 26) & 0x3F) != 0x0B \
+            or ((sltiu_word >> 21) & 0x1F) != index_reg:
+        return set()
+    guard_reg = (sltiu_word >> 16) & 0x1F
+    table_count = sltiu_word & 0xFFFF
+    if not guard_reg or not (1 <= table_count < 512):
+        return set()
+    if branch_word is None or ((branch_word >> 26) & 0x3F) != 0x04:
+        return set()
+    branch_rs = (branch_word >> 21) & 0x1F
+    branch_rt = (branch_word >> 16) & 0x1F
+    if {branch_rs, branch_rt} != {0, guard_reg}:
+        return set()
+    reject_target = _branch_target(branch_pc, branch_word)
+    if (not (entry <= reject_target < hard_cap) or
+            sll_pc <= reject_target < jr_pc + 8):
+        return set()
+
+    def nearest_writer(reg: int, before: int):
+        for pc in range(before - 4, max(entry, before - 0x80) - 1, -4):
+            word = _word_at(data, load_addr, pc)
+            if word is None:
+                return None
+            if _instruction_writes_gpr(word, reg):
+                return pc, word
+        return None
+
+    table_writer = nearest_writer(table_reg, addu_pc)
+    if table_writer is None:
+        return set()
+    table_def_pc, table_def_word = table_writer
+    def_op = (table_def_word >> 26) & 0x3F
+    def_rs = (table_def_word >> 21) & 0x1F
+    def_rt = (table_def_word >> 16) & 0x1F
+    if def_op == 0x0F and def_rs == 0 and def_rt == table_reg:
+        constant_pc = table_def_pc
+        table_base = (table_def_word & 0xFFFF) << 16
+    elif def_op == 0x09 and def_rt == table_reg and def_rs:
+        upper_writer = nearest_writer(def_rs, table_def_pc)
+        if upper_writer is None:
+            return set()
+        constant_pc, upper_word = upper_writer
+        if ((upper_word >> 26) & 0x3F) != 0x0F \
+                or ((upper_word >> 21) & 0x1F) != 0 \
+                or ((upper_word >> 16) & 0x1F) != def_rs:
+            return set()
+        low = table_def_word & 0xFFFF
+        upper = (upper_word & 0xFFFF) << 16
+        if low & 0x8000:
+            low -= 0x10000
+        table_base = (upper + low) & 0xFFFFFFFF
+    else:
+        return set()
+
+    # Calls could clobber the proven constant.  Other branches could enter the
+    # suffix through an unproved path.  The one exact bounds branch is allowed.
+    for pc in range(constant_pc + 4, sll_pc, 4):
+        word = _word_at(data, load_addr, pc)
+        if word is None:
+            return set()
+        if _is_control_flow(word) and pc != branch_pc:
+            return set()
+    predecessor = _word_at(data, load_addr, constant_pc - 4)
+    if constant_pc >= entry + 4 and _is_control_flow(predecessor):
+        return set()
+    table_base = (table_base + lw_offset) & 0xFFFFFFFF
+    table_end = table_base + table_count * 4
+    range_lo, range_hi = producer_range or (lo, hi)
+    if (table_base & 3) or not (range_lo <= table_base < table_end <= range_hi):
+        return set()
+
+    targets = set()
+    for index in range(table_count):
+        target = _word_at(data, load_addr, table_base + index * 4)
+        if (target is None or (target & 3) or
+                not (entry <= target < hard_cap) or
+                not (range_lo <= target < range_hi) or
+                not _is_valid_mips_word(_word_at(data, load_addr, target))):
+            return set()
+        targets.add(target)
+
+    # Establish which later sources are themselves reached only after the
+    # proven table dispatch. Such case blocks may safely loop to the suffix
+    # (Ape does this); an arbitrary earlier/later byte sequence may not jump
+    # into the protected definitions and manufacture domination.
+    case_reachable = set()
+    work = deque(targets)
+    while work and len(case_reachable) < 2048:
+        pc = work.popleft()
+        if (pc in case_reachable or not (entry <= pc < hard_cap) or
+                not (range_lo <= pc < range_hi)):
+            continue
+        word = _word_at(data, load_addr, pc)
+        if not _is_valid_mips_word(word):
+            continue
+        case_reachable.add(pc)
+        kind, target = _classify_cf(pc, word)
+        delay = pc + 4
+        if kind == 'normal':
+            work.append(pc + 4)
+        elif kind == 'branch':
+            case_reachable.add(delay)
+            work.extend((pc + 8, target))
+        elif kind == 'branch_never':
+            case_reachable.add(delay)
+            work.append(pc + 8)
+        elif kind == 'branch_never_likely':
+            work.append(pc + 8)
+        elif kind == 'j':
+            case_reachable.add(delay)
+            work.append(target)
+        elif kind in ('jal', 'jalr'):
+            case_reachable.add(delay)
+            work.append(pc + 8)
+        elif kind in ('jr', 'jr_ra'):
+            case_reachable.add(delay)
+
+    for source in range(entry, hard_cap, 4):
+        source_word = _word_at(data, load_addr, source)
+        if source_word is None:
+            return set()
+        kind, target = _classify_cf(source, source_word)
+        if (kind in ('branch', 'j', 'jal') and
+                constant_pc < target <= jr_pc and
+                not (constant_pc <= source <= jr_pc) and
+                source not in case_reachable):
+            return set()
+    if proof_out is not None:
+        proof_out.append({
+            'host_entry': entry,
+            'jr_pc': jr_pc,
+            'table_base': table_base,
+            'count': table_count,
+            'targets': sorted(targets),
+        })
+    return targets
 
 
 def _callable_legacy_seed(data: bytes, load_addr: int, addr: int) -> bool:
@@ -748,8 +954,10 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
     visited = set()
     direct_jals = set()
     static_indirect_targets = set()
+    call_continuations = set()
     branch_targets = set()
     jump_table_targets = set()
+    jump_table_proofs = []
     forward_branch_targets = set()
     rejected_cross_producer_calls = set()
     accepted_cross_producer_calls = set()
@@ -853,6 +1061,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
+                call_continuations.add(pc + 8)
             if (lo <= target < hi and (target & 3) == 0 and
                     _is_valid_mips_word(_word_at(data, load_addr, target)) and
                     callable_transfer_target(pc, target)):
@@ -863,6 +1072,7 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
             if in_function(pc + 8):
                 work.append(pc + 8)
                 branch_targets.add(pc + 8)
+                call_continuations.add(pc + 8)
             target_reg = (word >> 21) & 0x1F
             target = _resolve_constant_transfer(data, load_addr, entry, pc,
                                                 target_reg)
@@ -881,12 +1091,15 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
                 elif callable_transfer_target(pc, target):
                     static_indirect_targets.add(target)
             else:
+                proofs = []
                 for jt in _find_jump_table_targets(data, load_addr, size,
-                                                   entry, hard_cap, pc, jr_rs):
+                                                   entry, hard_cap, pc, jr_rs,
+                                                   entry_producer, proofs):
                     jump_table_targets.add(jt)
                     branch_targets.add(jt)
                     if in_function(jt):
                         work.append(jt)
+                jump_table_proofs.extend(proofs)
         elif kind == 'jr_ra':
             if in_function(delay):
                 visited.add(delay)
@@ -895,8 +1108,10 @@ def _walk_overlay_function(data: bytes, load_addr: int, size: int,
         'visited': visited,
         'direct_jals': direct_jals,
         'static_indirect_targets': static_indirect_targets,
+        'call_continuations': call_continuations,
         'branch_targets': branch_targets,
         'jump_table_targets': jump_table_targets,
+        'jump_table_proofs': jump_table_proofs,
         'forward_branch_targets': forward_branch_targets,
         'rejected_cross_producer_calls': rejected_cross_producer_calls,
         'accepted_cross_producer_calls': accepted_cross_producer_calls,
@@ -1347,6 +1562,9 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'static_alias_ranges': static_alias_ranges,
         'rejected_cross_producer_calls': rejected_cross_producer_calls,
         'accepted_cross_producer_calls': accepted_cross_producer_calls,
+        'static_jump_table_proofs': cap.get('static_jump_table_proofs', []),
+        'static_call_continuation_pcs': _parse_addr_list(
+            cap.get('static_call_continuation_pcs', [])),
     }
     # Interior entries carry the 'interior' marker so the recompiler emits
     # them as overlapping aliases, never as walk roots. Promoted kernel

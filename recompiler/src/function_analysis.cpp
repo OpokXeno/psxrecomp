@@ -759,6 +759,353 @@ static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
 
 } // namespace
 
+bool resolve_exact_bounded_jump_table(
+    const PS1Executable& exe,
+    uint32_t entry,
+    uint32_t hard_cap,
+    uint32_t jr_pc,
+    uint32_t jr_rs,
+    ExactJumpTable& table,
+    ExactAddressMapper runtime_to_image,
+    uint32_t producer_lo,
+    uint32_t producer_hi) {
+    table = {};
+    if (entry >= hard_cap || jr_pc < entry || jr_pc >= hard_cap ||
+        (entry & 3u) != 0u || (hard_cap & 3u) != 0u ||
+        (jr_pc & 3u) != 0u || jr_rs == 0u || jr_rs == 31u) {
+        return false;
+    }
+
+    auto read = [&](uint32_t pc) { return exe.read_word(pc); };
+    auto mapped = [&](uint32_t addr) {
+        return runtime_to_image ? runtime_to_image(addr, exe) : addr;
+    };
+    if (producer_lo == 0u && producer_hi == 0u) {
+        producer_lo = exe.header.load_address;
+        producer_hi = exe.end_address();
+    }
+    if (producer_lo >= producer_hi || (producer_lo & 3u) != 0u ||
+        (producer_hi & 3u) != 0u) {
+        return false;
+    }
+    auto jr_word = read(jr_pc);
+    if (!jr_word.has_value() ||
+        *jr_word != ((jr_rs & 0x1Fu) << 21u | 0x08u)) {
+        return false;
+    }
+    auto is_control = [&](uint32_t pc, uint32_t instr) {
+        (void)pc;
+        return exact_classify_cf(pc, instr).kind != ExactCfKind::Normal;
+    };
+    auto in_delay_slot = [&](uint32_t pc) {
+        if (pc < entry + 4u) return false;
+        auto prev = read(pc - 4u);
+        return prev.has_value() && is_control(pc - 4u, *prev);
+    };
+    auto has_call_between = [&](uint32_t lo, uint32_t hi) {
+        for (uint32_t pc = lo; pc < hi; pc += 4u) {
+            auto word = read(pc);
+            if (!word.has_value()) return true;
+            ExactCf cf = exact_classify_cf(pc, *word);
+            if (cf.kind == ExactCfKind::Jal ||
+                cf.kind == ExactCfKind::Jalr) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto writes_between = [&](uint32_t lo, uint32_t hi, uint32_t reg) {
+        for (uint32_t pc = lo; pc < hi; pc += 4u) {
+            auto word = read(pc);
+            if (!word.has_value() || exact_instruction_writes_gpr(*word, reg))
+                return true;
+        }
+        return false;
+    };
+    // Reject a definition that a direct edge from before it can skip. Edges
+    // originating after the definition are harmless: that path has already
+    // executed the definition (Ape's self-looping out-of-range guard does this).
+    auto inbound_skips = [&](uint32_t def_pc, uint32_t use_pc) {
+        for (uint32_t source = entry; source < def_pc; source += 4u) {
+            auto word = read(source);
+            if (!word.has_value()) return true;
+            ExactCf cf = exact_classify_cf(source, *word);
+            bool direct = cf.kind == ExactCfKind::Branch ||
+                          cf.kind == ExactCfKind::Jump ||
+                          cf.kind == ExactCfKind::Jal;
+            if (direct && cf.target > def_pc && cf.target <= use_pc)
+                return true;
+        }
+        return false;
+    };
+
+    // Keep this in parity with compile_overlays.py: the canonical scheduling
+    // form permits zero or one NOP between LW and JR, never a raw window.
+    uint32_t lw_pc = jr_pc - 4u, lw_base = 0;
+    int32_t lw_offset = 0;
+    if (lw_pc < entry) return false;
+    auto lw_word = read(lw_pc);
+    if (!lw_word.has_value()) return false;
+    if (*lw_word == 0u) {
+        if (lw_pc < entry + 4u) return false;
+        lw_pc -= 4u;
+        lw_word = read(lw_pc);
+    }
+    if (!lw_word.has_value()) return false;
+    uint32_t lw_op = (*lw_word >> 26) & 0x3Fu;
+    lw_base = (*lw_word >> 21) & 0x1Fu;
+    uint32_t lw_rt = (*lw_word >> 16) & 0x1Fu;
+    if (lw_op != 0x23u || lw_rt != jr_rs || lw_base == 0u ||
+        lw_pc < entry + 8u || in_delay_slot(lw_pc)) {
+        return false;
+    }
+    lw_offset = static_cast<int32_t>(
+        static_cast<int16_t>(*lw_word & 0xFFFFu));
+
+    // The address add and index scale must be the two instructions immediately
+    // before the load. This deliberately excludes raw-window coincidences.
+    uint32_t addu_pc = lw_pc - 4u;
+    uint32_t sll_pc = addu_pc - 4u;
+    auto addu_word = read(addu_pc);
+    auto sll_word = read(sll_pc);
+    if (!addu_word.has_value() || !sll_word.has_value()) return false;
+    uint32_t addu_op = (*addu_word >> 26) & 0x3Fu;
+    uint32_t addu_rs = (*addu_word >> 21) & 0x1Fu;
+    uint32_t addu_rt = (*addu_word >> 16) & 0x1Fu;
+    uint32_t addu_rd = (*addu_word >> 11) & 0x1Fu;
+    uint32_t addu_shamt = (*addu_word >> 6) & 0x1Fu;
+    uint32_t addu_fn = *addu_word & 0x3Fu;
+    uint32_t sll_op = (*sll_word >> 26) & 0x3Fu;
+    uint32_t sll_rs = (*sll_word >> 21) & 0x1Fu;
+    uint32_t index_reg = (*sll_word >> 16) & 0x1Fu;
+    uint32_t scaled_reg = (*sll_word >> 11) & 0x1Fu;
+    uint32_t sll_shamt = (*sll_word >> 6) & 0x1Fu;
+    uint32_t sll_fn = *sll_word & 0x3Fu;
+    if (addu_op != 0u || addu_fn != 0x21u || addu_shamt != 0u ||
+        addu_rd != lw_base ||
+        sll_op != 0u || sll_fn != 0u || sll_rs != 0u || sll_shamt != 2u ||
+        index_reg == 0u || scaled_reg == 0u ||
+        (scaled_reg != addu_rs && scaled_reg != addu_rt)) {
+        return false;
+    }
+    uint32_t base_reg = scaled_reg == addu_rs ? addu_rt : addu_rs;
+    if (base_reg == 0u || base_reg == scaled_reg ||
+        in_delay_slot(addu_pc)) {
+        return false;
+    }
+
+    // Exact canonical guard: sltiu; beq; nop; sll. This is the same accepted
+    // suffix as the Python capture verifier and excludes unrelated bounds.
+    if (sll_pc < entry + 12u) return false;
+    uint32_t guard_pc = sll_pc - 8u;
+    uint32_t bound_pc = sll_pc - 12u;
+    auto guard_word_opt = read(guard_pc);
+    auto bound_word = read(bound_pc);
+    auto guard_delay = read(sll_pc - 4u);
+    if (!guard_word_opt.has_value() || !bound_word.has_value() ||
+        !guard_delay.has_value() || *guard_delay != 0u) {
+        return false;
+    }
+    uint32_t guard_word = *guard_word_opt;
+    uint32_t guard_op = (guard_word >> 26) & 0x3Fu;
+    uint32_t guard_rs = (guard_word >> 21) & 0x1Fu;
+    uint32_t guard_rt = (guard_word >> 16) & 0x1Fu;
+    uint32_t bound_reg = guard_rs == 0u ? guard_rt : guard_rs;
+    if (guard_op != 0x04u || bound_reg == 0u ||
+        (guard_rs != 0u && guard_rt != 0u)) {
+        return false;
+    }
+    uint32_t bound_op = (*bound_word >> 26) & 0x3Fu;
+    uint32_t bound_rs = (*bound_word >> 21) & 0x1Fu;
+    uint32_t bound_rt = (*bound_word >> 16) & 0x1Fu;
+    uint32_t count = *bound_word & 0xFFFFu;
+    if (bound_op != 0x0Bu || bound_rs != index_reg ||
+        bound_rt != bound_reg || count == 0u || count >= 512u ||
+        in_delay_slot(bound_pc)) {
+        return false;
+    }
+    uint32_t guard_target = exact_branch_target(guard_pc, guard_word);
+    if ((guard_target & 3u) != 0u || guard_target < entry ||
+        guard_target >= hard_cap ||
+        (guard_target >= sll_pc && guard_target < jr_pc + 8u)) {
+        return false;
+    }
+
+    // Resolve the table-base reaching definition. Cross-register constants
+    // (`lui rA; addiu rB,rA,lo`) are valid, but both definitions must be local,
+    // unskippable, outside delay slots, and unclobbered before use.
+    uint32_t low_pc = 0, source_reg = base_reg;
+    int16_t low = 0;
+    uint32_t lui_pc = 0, upper = 0;
+    for (uint32_t back = 1; back <= 32u; back++) {
+        if (addu_pc < entry + back * 4u) break;
+        uint32_t pc = addu_pc - back * 4u;
+        auto word = read(pc);
+        if (!word.has_value()) return false;
+        if (!exact_instruction_writes_gpr(*word, base_reg)) continue;
+        uint32_t op = (*word >> 26) & 0x3Fu;
+        uint32_t rs = (*word >> 21) & 0x1Fu;
+        uint32_t rt = (*word >> 16) & 0x1Fu;
+        if (op == 0x09u && rt == base_reg && rs != 0u) {
+            low_pc = pc;
+            source_reg = rs;
+            low = static_cast<int16_t>(*word & 0xFFFFu);
+        } else if (op == 0x0Fu && rs == 0u && rt == base_reg) {
+            lui_pc = pc;
+            upper = (*word & 0xFFFFu) << 16;
+        } else {
+            return false;
+        }
+        break;
+    }
+    if (low_pc != 0u) {
+        for (uint32_t back = 1; back <= 32u; back++) {
+            if (low_pc < entry + back * 4u) break;
+            uint32_t pc = low_pc - back * 4u;
+            auto word = read(pc);
+            if (!word.has_value()) return false;
+            if (!exact_instruction_writes_gpr(*word, source_reg)) continue;
+            uint32_t op = (*word >> 26) & 0x3Fu;
+            uint32_t rs = (*word >> 21) & 0x1Fu;
+            uint32_t rt = (*word >> 16) & 0x1Fu;
+            if (op != 0x0Fu || rs != 0u || rt != source_reg) return false;
+            lui_pc = pc;
+            upper = (*word & 0xFFFFu) << 16;
+            break;
+        }
+    }
+    if (lui_pc == 0u || in_delay_slot(lui_pc) ||
+        (low_pc != 0u && in_delay_slot(low_pc)) ||
+        inbound_skips(lui_pc, addu_pc) ||
+        (low_pc != 0u && inbound_skips(low_pc, addu_pc)) ||
+        has_call_between(lui_pc, addu_pc)) {
+        return false;
+    }
+    // No other control transfer may intervene between the proven constant and
+    // the canonical suffix. The bounds BEQ is the sole exception.
+    for (uint32_t pc = lui_pc + 4u; pc < sll_pc; pc += 4u) {
+        auto word = read(pc);
+        if (!word.has_value() ||
+            (pc != guard_pc && is_control(pc, *word))) {
+            return false;
+        }
+    }
+    uint32_t base_def_end = low_pc != 0u ? low_pc + 4u : lui_pc + 4u;
+    if (writes_between(base_def_end, addu_pc, base_reg) ||
+        (low_pc != 0u &&
+         writes_between(lui_pc + 4u, low_pc, source_reg))) {
+        return false;
+    }
+
+    int64_t base64 = static_cast<int64_t>(upper);
+    if (low_pc != 0u) base64 += static_cast<int32_t>(low);
+    base64 += lw_offset;
+    if (base64 < 0 || base64 > 0xFFFFFFFFll ||
+        (static_cast<uint32_t>(base64) & 3u) != 0u) {
+        return false;
+    }
+    uint32_t runtime_base = static_cast<uint32_t>(base64);
+    uint64_t runtime_end = static_cast<uint64_t>(runtime_base) +
+                           static_cast<uint64_t>(count) * 4u;
+    if (runtime_end > 0x100000000ull) return false;
+
+    ExactJumpTable resolved;
+    resolved.table_base = runtime_base;
+    resolved.table_count = count;
+    resolved.targets.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t runtime_slot = runtime_base + i * 4u;
+        uint32_t image_slot = mapped(runtime_slot);
+        if (image_slot < producer_lo || image_slot >= producer_hi ||
+            producer_hi - image_slot < 4u) {
+            return false;
+        }
+        auto target_word = read(image_slot);
+        if (!target_word.has_value() || (*target_word & 3u) != 0u)
+            return false;
+        uint32_t runtime_target = *target_word;
+        uint32_t image_target = mapped(runtime_target);
+        if (image_target < entry || image_target >= hard_cap ||
+            image_target < producer_lo || image_target >= producer_hi ||
+            (image_target & 3u) != 0u) {
+            return false;
+        }
+        auto target_first = read(image_target);
+        if (!target_first.has_value() ||
+            !exact_is_valid_mips_word(*target_first)) {
+            return false;
+        }
+        resolved.targets.emplace_back(runtime_target, image_target);
+    }
+
+    // Later case blocks may legitimately loop to the dispatch suffix (Ape
+    // Escape does), but arbitrary later bytes must not create an inbound edge
+    // that skips the reaching definitions. Prove the exemption by walking
+    // only from the table's validated case targets.
+    std::set<uint32_t> case_reachable;
+    std::queue<uint32_t> case_work;
+    for (const auto& target_pair : resolved.targets)
+        case_work.push(target_pair.second);
+    while (!case_work.empty() && case_reachable.size() < 2048u) {
+        uint32_t pc = case_work.front();
+        case_work.pop();
+        if (case_reachable.count(pc) || pc < entry || pc >= hard_cap ||
+            pc < producer_lo || pc >= producer_hi) {
+            continue;
+        }
+        auto word = read(pc);
+        if (!word.has_value() || !exact_is_valid_mips_word(*word)) continue;
+        case_reachable.insert(pc);
+        ExactCf cf = exact_classify_cf(pc, *word);
+        uint32_t delay = pc + 4u;
+        switch (cf.kind) {
+        case ExactCfKind::Normal:
+            case_work.push(pc + 4u);
+            break;
+        case ExactCfKind::Branch:
+            case_reachable.insert(delay);
+            case_work.push(pc + 8u);
+            case_work.push(cf.target);
+            break;
+        case ExactCfKind::BranchNever:
+            case_reachable.insert(delay);
+            case_work.push(pc + 8u);
+            break;
+        case ExactCfKind::BranchNeverLikely:
+            case_work.push(pc + 8u);
+            break;
+        case ExactCfKind::Jump:
+            case_reachable.insert(delay);
+            case_work.push(cf.target);
+            break;
+        case ExactCfKind::Jal:
+        case ExactCfKind::Jalr:
+            case_reachable.insert(delay);
+            case_work.push(pc + 8u);
+            break;
+        case ExactCfKind::JrRa:
+        case ExactCfKind::JrOther:
+            case_reachable.insert(delay);
+            break;
+        }
+    }
+    for (uint32_t source = entry; source < hard_cap; source += 4u) {
+        auto word = read(source);
+        if (!word.has_value()) return false;
+        ExactCf cf = exact_classify_cf(source, *word);
+        bool direct = cf.kind == ExactCfKind::Branch ||
+                      cf.kind == ExactCfKind::Jump ||
+                      cf.kind == ExactCfKind::Jal;
+        if (direct && cf.target > lui_pc && cf.target <= jr_pc &&
+            (source < lui_pc || source > jr_pc) &&
+            !case_reachable.count(source)) {
+            return false;
+        }
+    }
+    table = std::move(resolved);
+    return true;
+}
+
 FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     const std::vector<uint32_t>& entries,
     const std::vector<std::pair<uint32_t, uint32_t>>& producer_ranges,
@@ -819,89 +1166,6 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         if (source_producer == target_producer)
             return true;
         return cross_call_allow.count(addr) != 0;
-    };
-
-    [[maybe_unused]] auto find_jump_table_targets = [&](uint32_t entry, uint32_t hard_cap,
-                                       uint32_t jr_pc, uint32_t jr_rs) {
-        std::vector<uint32_t> targets;
-        uint32_t lw_base = 0xFFu;
-        int32_t lw_offset = 0;
-        uint32_t addu_cand[2] = {0xFFu, 0xFFu};
-        uint32_t lui_val = 0;
-        int16_t addiu_val[2] = {0, 0};
-        bool found_addiu[2] = {false, false};
-        bool found_lui = false;
-        uint32_t table_count = 0;
-
-        for (int back = 1; back <= 40; back++) {
-            uint32_t scan_addr = jr_pc - static_cast<uint32_t>(back * 4);
-            if (scan_addr < entry) break;
-            auto scan_opt = exe_.read_word(scan_addr);
-            if (!scan_opt.has_value()) break;
-
-            uint32_t instr = *scan_opt;
-            uint32_t op = (instr >> 26) & 0x3Fu;
-            uint32_t rs = (instr >> 21) & 0x1Fu;
-            uint32_t rt = (instr >> 16) & 0x1Fu;
-            uint32_t rd = (instr >> 11) & 0x1Fu;
-            uint32_t fn = instr & 0x3Fu;
-
-            if (op == 0x23u && rt == jr_rs && lw_base == 0xFFu) {
-                lw_base = rs;
-                lw_offset = static_cast<int32_t>(static_cast<int16_t>(instr & 0xFFFFu));
-                continue;
-            }
-            if (op == 0x00u && fn == 0x21u && rd == lw_base && lw_base != 0xFFu &&
-                addu_cand[0] == 0xFFu) {
-                addu_cand[0] = rs;
-                addu_cand[1] = rt;
-                continue;
-            }
-            if (op == 0x09u && addu_cand[0] != 0xFFu) {
-                for (int c = 0; c < 2; c++) {
-                    if (!found_addiu[c] && addu_cand[c] != 0xFFu &&
-                        rs == addu_cand[c] && rt == addu_cand[c]) {
-                        addiu_val[c] = static_cast<int16_t>(instr & 0xFFFFu);
-                        found_addiu[c] = true;
-                        break;
-                    }
-                }
-                continue;
-            }
-            if (op == 0x0Fu && addu_cand[0] != 0xFFu && !found_lui) {
-                for (int c = 0; c < 2; c++) {
-                    if (addu_cand[c] != 0xFFu && rt == addu_cand[c]) {
-                        lui_val = (instr & 0xFFFFu) << 16;
-                        if (!found_addiu[c]) addiu_val[c] = 0;
-                        addiu_val[0] = addiu_val[c];
-                        found_addiu[0] = found_addiu[c];
-                        found_lui = true;
-                        break;
-                    }
-                }
-                continue;
-            }
-            if (op == 0x0Bu && table_count == 0) {
-                table_count = instr & 0xFFFFu;
-                continue;
-            }
-            if (found_lui && table_count != 0) break;
-        }
-
-        if (!found_lui || table_count == 0 || table_count >= 512) return targets;
-
-        uint32_t table_base = lui_val +
-            (found_addiu[0] ? static_cast<uint32_t>(static_cast<int32_t>(addiu_val[0])) : 0u) +
-            static_cast<uint32_t>(lw_offset);
-        for (uint32_t i = 0; i < table_count; i++) {
-            auto entry_opt = exe_.read_word(table_base + i * 4u);
-            if (!entry_opt.has_value()) continue;
-            uint32_t target = *entry_opt;
-            if (target >= entry && target < hard_cap && in_exe(target)) {
-                targets.push_back(target);
-            }
-        }
-        return targets;
     };
 
     auto walk = [&](uint32_t entry, uint32_t hard_cap) {
@@ -999,10 +1263,32 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                                 std::make_pair(pc, true));
                         }
                     } else {
-                        // Fail closed: the former 40-word raw backscan could
-                        // combine unrelated loads/constants into a synthetic
-                        // jump table. Unresolved JR cases stay interpreted until
-                        // register/control dependence is proven.
+                        ExactJumpTable table;
+                        uint32_t producer_lo = exe_.header.load_address;
+                        uint32_t producer_hi = exe_.end_address();
+                        if (entry_producer >= 0) {
+                            producer_lo = producer_ranges[entry_producer].first;
+                            producer_hi = producer_ranges[entry_producer].second;
+                        }
+                        if (resolve_exact_bounded_jump_table(
+                                exe_, entry, hard_cap, pc, jr_rs, table,
+                                nullptr, producer_lo, producer_hi)) {
+                            bool all_owned = std::all_of(
+                                table.targets.begin(), table.targets.end(),
+                                [&](const auto& target_pair) {
+                                    return in_function(target_pair.second);
+                                });
+                            if (all_owned) {
+                                for (const auto& target_pair : table.targets) {
+                                    uint32_t target_pc = target_pair.second;
+                                    wr.jump_table_targets.insert(target_pc);
+                                    work.push(target_pc);
+                                }
+                            }
+                        }
+                        // Otherwise fail closed. Unresolved JR cases remain
+                        // interpreted until the complete dependency chain and
+                        // every table entry are proven.
                     }
                 }
                 break;
@@ -1117,6 +1403,11 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         if (func.end_addr <= func.start_addr) func.end_addr = func.start_addr + 4u;
         func.size = func.end_addr - func.start_addr;
         func.name = fmt::format("func_{:08X}", func.start_addr);
+        if (producer_for(entry) >= 0) {
+            const auto& producer = producer_ranges[producer_for(entry)];
+            func.producer_lo = producer.first;
+            func.producer_hi = producer.second;
+        }
 
         auto first_instr = exe_.read_word(func.start_addr);
         if (first_instr.has_value()) {
@@ -1558,72 +1849,17 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
         };
         return valid[(instr >> 26) & 0x3Fu];
     };
-    // Resolve a `jr $rN` jump table by the standard Psy-Q pattern
-    // (sltiu bound; sll idx,2; lui/addiu base; addu; lw target; jr). Returns
-    // true and fills `targets` (in-function entries) when a table is
-    // recognized; false when the indirect jump is unresolved.
+    // Mirror exact-entry discovery's strict bounded-switch recognizer so the
+    // final extent cannot disagree about which JR targets are code.
     auto resolve_jt_p3 = [&](uint32_t entry, uint32_t hard_cap, uint32_t jr_pc,
                              uint32_t jr_rs, std::vector<uint32_t>& targets) -> bool {
-        uint32_t lw_base = 0xFFu; int32_t lw_offset = 0;
-        uint32_t addu_cand[2] = {0xFFu, 0xFFu};
-        uint32_t lui_val = 0; int16_t addiu_val[2] = {0, 0};
-        bool found_addiu[2] = {false, false};
-        bool found_lui = false; uint32_t table_count = 0;
-        for (int back = 1; back <= 40; back++) {
-            uint32_t scan_addr = jr_pc - static_cast<uint32_t>(back * 4);
-            if (scan_addr < entry) break;
-            auto scan_opt = exe_.read_word(scan_addr);
-            if (!scan_opt.has_value()) break;
-            uint32_t instr = *scan_opt;
-            uint32_t op = (instr >> 26) & 0x3Fu;
-            uint32_t rs = (instr >> 21) & 0x1Fu;
-            uint32_t rt = (instr >> 16) & 0x1Fu;
-            uint32_t rd = (instr >> 11) & 0x1Fu;
-            uint32_t fn = instr & 0x3Fu;
-            if (op == 0x23u && rt == jr_rs && lw_base == 0xFFu) {
-                lw_base = rs;
-                lw_offset = static_cast<int32_t>(static_cast<int16_t>(instr & 0xFFFFu));
-                continue;
-            }
-            if (op == 0x00u && fn == 0x21u && rd == lw_base && lw_base != 0xFFu &&
-                addu_cand[0] == 0xFFu) {
-                addu_cand[0] = rs; addu_cand[1] = rt; continue;
-            }
-            if (op == 0x09u && addu_cand[0] != 0xFFu) {
-                for (int c = 0; c < 2; c++) {
-                    if (!found_addiu[c] && addu_cand[c] != 0xFFu &&
-                        rs == addu_cand[c] && rt == addu_cand[c]) {
-                        addiu_val[c] = static_cast<int16_t>(instr & 0xFFFFu);
-                        found_addiu[c] = true; break;
-                    }
-                }
-                continue;
-            }
-            if (op == 0x0Fu && addu_cand[0] != 0xFFu && !found_lui) {
-                for (int c = 0; c < 2; c++) {
-                    if (addu_cand[c] != 0xFFu && rt == addu_cand[c]) {
-                        lui_val = (instr & 0xFFFFu) << 16;
-                        if (!found_addiu[c]) addiu_val[c] = 0;
-                        addiu_val[0] = addiu_val[c];
-                        found_addiu[0] = found_addiu[c];
-                        found_lui = true; break;
-                    }
-                }
-                continue;
-            }
-            if (op == 0x0Bu && table_count == 0) { table_count = instr & 0xFFFFu; continue; }
-            if (found_lui && table_count != 0) break;
+        ExactJumpTable table;
+        if (!resolve_exact_bounded_jump_table(
+                exe_, entry, hard_cap, jr_pc, jr_rs, table)) {
+            return false;
         }
-        if (!found_lui || table_count == 0 || table_count >= 512) return false;
-        uint32_t table_base = lui_val +
-            (found_addiu[0] ? static_cast<uint32_t>(static_cast<int32_t>(addiu_val[0])) : 0u) +
-            static_cast<uint32_t>(lw_offset);
-        for (uint32_t k = 0; k < table_count; k++) {
-            auto entry_opt = exe_.read_word(table_base + k * 4u);
-            if (!entry_opt.has_value()) continue;
-            uint32_t target = *entry_opt;
-            if (target >= entry && target < hard_cap && in_exe_p3(target)) targets.push_back(target);
-        }
+        for (const auto& target_pair : table.targets)
+            targets.push_back(target_pair.second);
         return true;
     };
     struct ExtentP3 { uint32_t terminus; bool clean_code; bool hit_invalid; bool resolved_jt; bool unresolved_indirect; };

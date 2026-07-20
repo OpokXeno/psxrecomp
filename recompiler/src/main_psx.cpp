@@ -48,6 +48,15 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
         by_host[ae.host_start].push_back(&ae);
     }
     for (const auto& [host_start, group] : by_host) {
+        uint32_t producer_lo = 0;
+        uint32_t producer_hi = 0;
+        for (const auto& function : result.functions) {
+            if (function.start_addr == host_start) {
+                producer_lo = function.producer_lo;
+                producer_hi = function.producer_hi;
+                break;
+            }
+        }
         std::vector<uint32_t> entries;
         for (const AliasEntry* ae : group) entries.push_back(ae->addr);
         for (const AliasEntry* ae : group) {
@@ -62,6 +71,8 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
             af.is_data_section = false;
             af.alias_walk_lo = ae->host_start;
             af.alias_group_entries = entries;
+            af.producer_lo = producer_lo;
+            af.producer_hi = producer_hi;
             result.functions.push_back(af);
         }
     }

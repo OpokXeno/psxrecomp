@@ -38,6 +38,182 @@ def make_psxexe(entry, data):
     return bytes(header) + data
 
 
+def make_bounded_switch():
+    """Ape-shaped cross-register table base and post-JR case bodies."""
+    data = bytearray(0x300)
+    entry = LOAD + 0x30
+    table = LOAD + 0x200
+    cases = (LOAD + 0x68, LOAD + 0x88, LOAD + 0x68, LOAD + 0x78)
+    put(data, 0x30, 0x27BDFFE0)  # addiu sp,sp,-0x20
+    put(data, 0x34, 0xAFBF0018)  # sw ra,0x18(sp)
+    put(data, 0x38, 0x3C028001)  # lui v0,0x8001
+    put(data, 0x3C, 0x24500200)  # addiu s0,v0,0x200 (register rename)
+    put(data, 0x40, 0x24030000)  # addiu v1,zero,0
+    put(data, 0x44, 0x2C620004)  # sltiu v0,v1,4
+    put(data, 0x48, 0x1040FFFF)  # beq v0,zero,0x48 (reject loop)
+    put(data, 0x4C, 0x00000000)
+    put(data, 0x50, 0x00031080)  # sll v0,v1,2
+    put(data, 0x54, 0x00501021)  # addu v0,v0,s0
+    put(data, 0x58, 0x8C420000)  # lw v0,0(v0)
+    put(data, 0x5C, 0x00000000)
+    put(data, 0x60, 0x00400008)  # jr v0
+    put(data, 0x64, 0x00000000)
+    put(data, 0x68, 0x03E00008)
+    put(data, 0x6C, 0x00000000)
+    put(data, 0x78, 0x03E00008)
+    put(data, 0x7C, 0x00000000)
+    put(data, 0x88, jal(0x80008000))  # external call
+    put(data, 0x8C, 0x00000000)
+    put(data, 0x90, 0x03E00008)       # call continuation
+    put(data, 0x94, 0x00000000)
+    for index, target in enumerate(cases):
+        put(data, 0x200 + index * 4, target)
+    return data, entry, table, set(cases), LOAD + 0x90
+
+
+def check_bounded_jump_table_discovery():
+    data, entry, table, cases, continuation = make_bounded_switch()
+    found = MOD._find_jump_table_targets(
+        bytes(data), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2)
+    assert found == cases
+    zero_nops = bytearray(data)
+    put(zero_nops, 0x5C, 0x00400008)
+    assert MOD._find_jump_table_targets(
+        bytes(zero_nops), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x5C, 2) == cases
+    two_nops = bytearray(data)
+    put(two_nops, 0x60, 0x00000000)
+    put(two_nops, 0x64, 0x00400008)
+    assert MOD._find_jump_table_targets(
+        bytes(two_nops), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x64, 2) == set()
+    three_nops = bytearray(two_nops)
+    put(three_nops, 0x64, 0x00000000)
+    put(three_nops, 0x68, 0x00400008)
+    assert MOD._find_jump_table_targets(
+        bytes(three_nops), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x68, 2) == set()
+    walk = MOD._walk_overlay_function(
+        bytes(data), LOAD, len(data), entry, LOAD + 0x100,
+        ((LOAD, LOAD + len(data)),), False)
+    assert walk['jump_table_targets'] == cases
+    assert cases <= walk['visited']
+    assert continuation in walk['call_continuations']
+    assert continuation in walk['visited']
+
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'function_entry_pcs': [f'0x{entry:08X}'],
+        'dispatch_entry_pcs': [
+            f'0x{addr:08X}' for addr in sorted(cases | {continuation})],
+        'producer_ranges': [{
+            'start': f'0x{LOAD:08X}',
+            'end': f'0x{LOAD + len(data):08X}',
+        }],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    for addr in cases | {continuation}:
+        assert audit['included_reasons'][addr] == 'DISPATCH_INTERIOR'
+        assert f'interior 0x{addr:08X}' in seeds
+        assert f'call_root 0x{addr:08X}' not in seeds
+
+    # Every relationship is mandatory; opcode proximity or repeated pointers
+    # alone cannot manufacture a switch.
+    mismatched_index = bytearray(data)
+    put(mismatched_index, 0x44, 0x2C820004)  # sltiu v0,a0,4
+    assert MOD._find_jump_table_targets(
+        bytes(mismatched_index), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    clobbered_base = bytearray(data)
+    put(clobbered_base, 0x40, 0x26100004)  # addiu s0,s0,4
+    assert MOD._find_jump_table_targets(
+        bytes(clobbered_base), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    noncanonical_jr = bytearray(data)
+    put(noncanonical_jr, 0x60, 0x00410008)  # reserved rt field is nonzero
+    assert MOD._find_jump_table_targets(
+        bytes(noncanonical_jr), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    zero_lw_base = bytearray(data)
+    put(zero_lw_base, 0x58, 0x8C020000)  # lw v0,0(zero)
+    assert MOD._find_jump_table_targets(
+        bytes(zero_lw_base), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    zero_addu_dest = bytearray(data)
+    put(zero_addu_dest, 0x54, 0x00500021)  # addu zero,v0,s0
+    assert MOD._find_jump_table_targets(
+        bytes(zero_addu_dest), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    noncanonical_addu = bytearray(data)
+    put(noncanonical_addu, 0x54, 0x00501061)  # nonzero reserved shamt
+    assert MOD._find_jump_table_targets(
+        bytes(noncanonical_addu), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    noncanonical_sll = bytearray(data)
+    put(noncanonical_sll, 0x50, 0x00231080)  # SLL's reserved rs is nonzero
+    assert MOD._find_jump_table_targets(
+        bytes(noncanonical_sll), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    noncanonical_lui = bytearray(data)
+    put(noncanonical_lui, 0x38, 0x3C228001)  # LUI's reserved rs is nonzero
+    assert MOD._find_jump_table_targets(
+        bytes(noncanonical_lui), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    # A validated case in producer A cannot use producer B as a trampoline
+    # back into the protected suffix. Otherwise B's bytes would manufacture a
+    # false domination proof for A's table-base and bounds definitions.
+    producer_escape = bytearray(data)
+    producer_b = LOAD + 0x260
+    put(producer_escape, 0x68,
+        0x08000000 | ((producer_b >> 2) & 0x03FFFFFF))
+    put(producer_escape, 0x6C, 0x00000000)
+    put(producer_escape, 0x260,
+        0x08000000 | (((LOAD + 0x50) >> 2) & 0x03FFFFFF))
+    put(producer_escape, 0x264, 0x00000000)
+    assert MOD._find_jump_table_targets(
+        bytes(producer_escape), LOAD, len(data), entry, LOAD + 0x300,
+        LOAD + 0x60, 2, (LOAD, LOAD + 0x240)) == set()
+
+    ori_base = bytearray(data)
+    put(ori_base, 0x3C, 0x34500200)  # ori s0,v0,0x200 is outside grammar
+    assert MOD._find_jump_table_targets(
+        bytes(ori_base), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    skipped_constant = bytearray(data)
+    put(skipped_constant, 0x34, 0x08000000 |
+        (((LOAD + 0x40) >> 2) & 0x03FFFFFF))
+    assert MOD._find_jump_table_targets(
+        bytes(skipped_constant), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    later_inbound = bytearray(data)
+    put(later_inbound, 0xA0, 0x08000000 |
+        (((LOAD + 0x50) >> 2) & 0x03FFFFFF))
+    assert MOD._find_jump_table_targets(
+        bytes(later_inbound), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+
+    foreign_target = bytearray(data)
+    put(foreign_target, table - LOAD, LOAD + 0x180)
+    assert MOD._find_jump_table_targets(
+        bytes(foreign_target), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2) == set()
+    assert MOD._find_jump_table_targets(
+        bytes(data), LOAD, len(data), entry, LOAD + 0x100,
+        LOAD + 0x60, 2, (LOAD, LOAD + 0x180)) == set()
+
+
 def check_composite_call_boundaries():
     data = bytearray(0x100)
     cross_target = LOAD + 0x50
@@ -487,7 +663,7 @@ def check_recomputed_evidence_and_unconditional_branch():
     assert MOD._classify_cf(LOAD, (0x17 << 26) | 0x1F) == (
         'branch_never_likely', 0)
 
-    # Unresolved JR-table inference is disabled until dependence is proven.
+    # A non-canonical collection of branch-shaped words remains unresolved.
     assert MOD._find_jump_table_targets(
         bytes(branch), LOAD, len(branch), LOAD, LOAD + len(branch),
         LOAD + 0x20, 8) == set()
@@ -607,6 +783,8 @@ def check_optional_enrichment_fallback():
             'end': f'0x{LOAD + 0x2C:08X}',
         }],
         '_prior_aliases': [(direct, LOAD, LOAD + 0x2C)],
+        'static_jump_table_proofs': [{'host_entry': f'0x{LOAD:08X}'}],
+        'static_call_continuation_pcs': [f'0x{LOAD + 0x10:08X}'],
         'optional_enrichment_fallback_entry_pcs': [f'0x{direct:08X}'],
     }
     fallback = MOD.optional_enrichment_fallback_capture(cap)
@@ -616,6 +794,8 @@ def check_optional_enrichment_fallback():
     assert fallback['static_discovery_entry_pcs'] == encoded
     assert fallback['seeds'] == encoded
     assert 'static_alias_ranges' not in fallback
+    assert 'static_jump_table_proofs' not in fallback
+    assert 'static_call_continuation_pcs' not in fallback
     assert '_prior_aliases' not in fallback
     assert 'optional_enrichment_fallback_entry_pcs' not in fallback
     assert MOD.optional_enrichment_fallback_capture(fallback) is None
@@ -1246,6 +1426,7 @@ def main():
         raise SystemExit(f"recompiler not found: {args.recompiler}")
 
     check_composite_call_boundaries()
+    check_bounded_jump_table_discovery()
     check_static_discovery_provenance()
     check_owned_direct_call_is_interior()
     check_discovered_host_owns_same_round_call_target()

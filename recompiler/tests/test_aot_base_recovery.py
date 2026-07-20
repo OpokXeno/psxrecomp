@@ -182,6 +182,104 @@ def main():
     assert {x['base'] for x in recovered} == {archive_base}
     assert all(len(x['direct_seeds']) == 8 for x in recovered)
 
+    # Ape HED member 0186 shape: the switch host is not directly called, but a
+    # return-adjacent framed prologue proves its real root. Its bounded table
+    # labels and reachable JAL continuation are dispatch evidence only.
+    ape_base = 0x80136000
+    ape_members = []
+    anchor_offsets = (0x80, 0x94, 0xB0, 0xD8,
+                      0x110, 0x154, 0x1A8, 0x210)
+    table_values = ([ape_base + 0x22E4, ape_base + 0x2354,
+                     ape_base + 0x22F4, ape_base + 0x22B8] +
+                    [ape_base + 0x2354] * 2 +
+                    [ape_base + 0x2304, ape_base + 0x2354,
+                     ape_base + 0x2314, ape_base + 0x2354,
+                     ape_base + 0x2334, ape_base + 0x2354,
+                     ape_base + 0x2344, ape_base + 0x2354] +
+                    [ape_base + 0x22B8, ape_base + 0x2354,
+                     ape_base + 0x2354, ape_base + 0x2324] +
+                    [ape_base + 0x22B8] * 28)
+    assert len(table_values) == 46
+    for ident in range(1, 5):
+        body = bytearray(0x5000)
+        for index, target_off in enumerate(anchor_offsets):
+            target = ape_base + target_off
+            struct.pack_into('<I', body, index * 4, 0x0C000000 |
+                             ((target >> 2) & 0x03FFFFFF))
+            struct.pack_into('<I', body, target_off, 0x27BDFFF0)
+        struct.pack_into('<I', body, 0x2294, 0x03E00008)  # prior jr ra
+        struct.pack_into('<I', body, 0x2298, 0x27BD0010)  # delay slot
+        switch_words = {
+            0x229C: 0x27BDFFE0, 0x22A0: 0xAFB10014,
+            0x22A4: 0x3C118014, 0x22A8: 0x3C028014,
+            0x22AC: 0xAFB00010, 0x22B0: 0x2450ABD8,
+            0x22B4: 0xAFBF0018, 0x22B8: 0x8623AF56,
+            0x22BC: 0x00000000, 0x22C0: 0x2C62002E,
+            0x22C4: 0x1040FFFF, 0x22C8: 0x00000000,
+            0x22CC: 0x00031080, 0x22D0: 0x00501021,
+            0x22D4: 0x8C420000, 0x22D8: 0x00000000,
+            0x22DC: 0x00400008, 0x22E0: 0x00000000,
+        }
+        for offset, word in switch_words.items():
+            struct.pack_into('<I', body, offset, word)
+        for offset in (0x22E4, 0x22F4, 0x2304, 0x2314,
+                       0x2324, 0x2334, 0x2344):
+            struct.pack_into('<I', body, offset, 0x03E00008)
+            struct.pack_into('<I', body, offset + 4, 0x00000000)
+        struct.pack_into('<I', body, 0x2354, 0x0C004000)  # jal 0x80010000
+        struct.pack_into('<I', body, 0x2358, 0x00000000)
+        struct.pack_into('<I', body, 0x235C, 0x24040004)
+        struct.pack_into('<I', body, 0x2360, 0x0C004000)
+        struct.pack_into('<I', body, 0x2364, 0x00000000)
+        struct.pack_into('<I', body, 0x2368, 0x0804E0AE)  # j 0x801382B8
+        struct.pack_into('<I', body, 0x236C, 0x00000000)
+        for index, target in enumerate(table_values):
+            struct.pack_into('<I', body, 0x4BD8 + index * 4, target)
+        ape_members.append((ident, ident * 0x5000, bytes(body)))
+    ape_recovered = MOD.recover_consensus_members(
+        ape_members, 0x80100000, 0x80200000)
+    assert len(ape_recovered) == 4
+    for member in ape_recovered:
+        assert ape_base + 0x229C in member['return_framed_seeds']
+        assert ape_base + 0x229C in member['seeds']
+        assert ape_base + 0x22B8 in member['static_dispatch_pcs']
+        assert ape_base + 0x2354 in member['static_dispatch_pcs']
+        assert ape_base + 0x2368 in member['static_dispatch_pcs']
+        proof = next(proof for proof in member['jump_table_proofs']
+                     if proof['jr_pc'] == ape_base + 0x22DC)
+        assert proof == {
+            'host_entry': ape_base + 0x229C,
+            'jr_pc': ape_base + 0x22DC,
+            'table_base': ape_base + 0x4BD8,
+            'count': 46,
+            'targets': sorted(set(table_values)),
+        }
+        assert ape_base + 0x2368 in member['call_continuation_pcs']
+        capture = MOD.rec(
+            ape_base, member['data'], member['seeds'],
+            dispatch_extra=member['static_dispatch_pcs'],
+            producer_ranges=((ape_base, ape_base + len(member['data'])),),
+            static_discovery=member['direct_seeds'],
+            jump_table_proofs=member['jump_table_proofs'],
+            call_continuations=member['call_continuation_pcs'])
+        assert '0x8013829C' in capture['function_entry_pcs']
+        assert '0x801382B8' not in capture['function_entry_pcs']
+        assert '0x80138354' not in capture['function_entry_pcs']
+        assert '0x80138368' not in capture['function_entry_pcs']
+        assert '0x801382B8' in capture['dispatch_entry_pcs']
+        assert '0x80138354' in capture['dispatch_entry_pcs']
+        assert '0x80138368' in capture['dispatch_entry_pcs']
+        assert capture['static_jump_table_proofs'][0]['host_entry'] == (
+            '0x8013829C')
+        assert capture['static_jump_table_proofs'][0]['jr_pc'] == '0x801382DC'
+        assert capture['static_jump_table_proofs'][0]['table_base'] == (
+            '0x8013ABD8')
+        assert capture['static_jump_table_proofs'][0]['count'] == 46
+        assert '0x80138368' in capture['static_call_continuation_pcs']
+        MOD.add_consensus_fallback(capture, member)
+        assert capture['optional_enrichment_fallback_entry_pcs'] == [
+            f'0x{addr:08X}' for addr in member['direct_seeds']]
+
     # Companion HED tables may address a logical sector namespace spanning DAT
     # then BNS. Runs are discovered independently across zero-filled table gaps.
     hed = bytearray(0x800)

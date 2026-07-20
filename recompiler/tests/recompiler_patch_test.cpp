@@ -47,6 +47,15 @@ void append_word(std::vector<uint8_t>& bytes, uint32_t word) {
     bytes.push_back(static_cast<uint8_t>(word >> 24));
 }
 
+void write_word(PSXRecomp::PS1Executable& exe, uint32_t address,
+                uint32_t word) {
+    const size_t offset = static_cast<size_t>(address - exe.header.load_address);
+    exe.code_data[offset + 0] = static_cast<uint8_t>(word);
+    exe.code_data[offset + 1] = static_cast<uint8_t>(word >> 8);
+    exe.code_data[offset + 2] = static_cast<uint8_t>(word >> 16);
+    exe.code_data[offset + 3] = static_cast<uint8_t>(word >> 24);
+}
+
 std::string generate_first_instruction(uint32_t first_word,
                                        std::vector<RecompilerPatch> patches,
                                        bool overlay_mode) {
@@ -245,6 +254,99 @@ void codegen_tests() {
         "config merge rejects cross-config ID conflicts");
 }
 
+void jump_table_producer_codegen_test() {
+    constexpr uint32_t base = 0x80010000u;
+    constexpr uint32_t entry = base + 0x500u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = base;
+    exe.header.initial_pc = entry;
+    exe.header.file_size = 0x1000u;
+    exe.code_data.resize(0x1000u, 0u);
+
+    write_word(exe, base + 0x500u, 0x3C088001u); // lui t0,0x8001
+    write_word(exe, base + 0x504u, 0x25100A00u); // addiu s0,t0,0x0a00
+    write_word(exe, base + 0x50Cu, 0x2C620003u); // sltiu v0,v1,3
+    write_word(exe, base + 0x510u, 0x1040001Bu); // beq v0,zero,+0x580
+    write_word(exe, base + 0x518u, 0x00031080u); // sll v0,v1,2
+    write_word(exe, base + 0x51Cu, 0x00501021u); // addu v0,v0,s0
+    write_word(exe, base + 0x520u, 0x8C420000u); // lw v0,0(v0)
+    write_word(exe, base + 0x528u, 0x00400008u); // jr v0
+    const uint32_t cases[] = {
+        base + 0x540u, base + 0x550u, base + 0x560u};
+    for (size_t i = 0; i < 3u; i++) {
+        write_word(exe, cases[i], 0x24020001u + static_cast<uint32_t>(i));
+        write_word(exe, cases[i] + 4u, 0x03E00008u);
+        write_word(exe, base + 0xA00u + static_cast<uint32_t>(i * 4u),
+                   cases[i]);
+    }
+    write_word(exe, base + 0x580u, 0x03E00008u);
+    write_word(exe, base + 0x590u,
+               0x08000000u | ((entry >> 2) & 0x03FFFFFFu));
+
+    PSXRecomp::Function function{};
+    function.start_addr = entry;
+    function.end_addr = base + 0x588u;
+    function.size = function.end_addr - function.start_addr;
+    function.name = "producer_switch";
+    function.producer_lo = base + 0x400u;
+    function.producer_hi = base + 0x900u; // table belongs to adjacent producer
+
+    PSXRecomp::ControlFlowAnalyzer analyzer(exe);
+    const auto bounded_cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenerator bounded_generator(exe);
+    const std::string bounded =
+        bounded_generator.generate_function(function, bounded_cfg).full_code;
+    check(bounded.find("/* jump table") == std::string::npos,
+          "codegen cannot resurrect an adjacent-producer jump table");
+
+    function.producer_lo = 0u;
+    function.producer_hi = 0u;
+    const auto single_image_cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenerator single_image_generator(exe);
+    const std::string single_image = single_image_generator
+        .generate_function(function, single_image_cfg).full_code;
+    check(single_image.find("/* jump table") != std::string::npos,
+          "codegen still emits the same table for a single owned image");
+
+    // Exercise the actual overlapping-alias emitter path. The alias begins at
+    // a later block which jumps back through the host's complete table setup,
+    // so an unbounded alias really would expose the adjacent producer bytes.
+    // Producer ownership must survive Function -> alias CFG -> shared body.
+    PSXRecomp::Function alias = function;
+    alias.start_addr = base + 0x590u;
+    alias.end_addr = base + 0x598u;
+    alias.size = alias.end_addr - alias.start_addr;
+    alias.name = "producer_switch_alias";
+    alias.alias_walk_lo = entry;
+    alias.alias_group_entries = {alias.start_addr};
+    alias.producer_lo = base + 0x400u;
+    alias.producer_hi = base + 0x900u;
+
+    const auto alias_cfg = analyzer.analyze_function(alias);
+    check(alias_cfg.producer_lo == alias.producer_lo &&
+          alias_cfg.producer_hi == alias.producer_hi,
+          "alias CFG retains its host producer bounds");
+    PSXRecomp::CodeGenerator alias_generator(exe);
+    const auto alias_generated = alias_generator.generate_alias_group(
+        {&alias}, alias_cfg, "");
+    check(!alias_generated.empty() &&
+          alias_generated.front().full_code.find("/* jump table") ==
+              std::string::npos,
+          "alias emitter cannot expose an adjacent producer jump table");
+
+    alias.producer_lo = 0u;
+    alias.producer_hi = 0u;
+    const auto unbounded_alias_cfg = analyzer.analyze_function(alias);
+    PSXRecomp::CodeGenerator unbounded_alias_generator(exe);
+    const auto unbounded_alias_generated =
+        unbounded_alias_generator.generate_alias_group(
+            {&alias}, unbounded_alias_cfg, "");
+    check(!unbounded_alias_generated.empty() &&
+          unbounded_alias_generated.front().full_code.find("/* jump table") !=
+              std::string::npos,
+          "alias regression fixture reaches the table when ownership is absent");
+}
+
 } // namespace
 
 int main() {
@@ -257,6 +359,7 @@ int main() {
         parser_tests(root);
         capture_history_config_tests(root);
         codegen_tests();
+        jump_table_producer_codegen_test();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

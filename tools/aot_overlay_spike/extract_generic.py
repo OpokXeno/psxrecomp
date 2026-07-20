@@ -382,14 +382,92 @@ def split_indexed_archive(data, alignment=0x800):
         return None
     return members
 
+def return_adjacent_framed_entries(data, base):
+    """Strong framed roots immediately following a completed function.
+
+    Mixed archive members may contain prologue-shaped data, so a stack-frame
+    instruction alone is insufficient. Require a preceding ``jr ra`` and its
+    arbitrary architectural delay slot, at most six alignment NOPs, plus an
+    in-frame save of ``ra`` before the new function's first control transfer.
+    Every stack-relative word save observed in that prefix must fit the frame.
+    """
+    entries=set()
+    for off in prologue_offsets(data):
+        word=_word(data,off)
+        frame_imm=word&0xFFFF
+        frame_size=0x10000-frame_imm
+        if not (8 <= frame_size <= 0x400 and (frame_size&3)==0):
+            continue
+        boundary=False
+        for padding in range(7):
+            jr_off=off-8-padding*4
+            if _word(data,jr_off)!=0x03E00008:
+                continue
+            if all(_word(data,p)==0 for p in range(jr_off+8,off,4)):
+                boundary=True
+                break
+        if not boundary:
+            continue
+        saved_ra=False
+        consistent=True
+        for pc in range(off+4,min(len(data),off+4+12*4),4):
+            candidate=_word(data,pc)
+            if candidate is None:
+                consistent=False
+                break
+            if _is_control_flow_word(candidate):
+                break
+            op=(candidate>>26)&0x3F
+            rs=(candidate>>21)&0x1F
+            rt=(candidate>>16)&0x1F
+            if op==0x2B and rs==29:
+                displacement=candidate&0xFFFF
+                if displacement&0x8000:
+                    displacement-=0x10000
+                if displacement<0 or displacement+4>frame_size or displacement&3:
+                    consistent=False
+                    break
+                if rt==31:
+                    saved_ra=True
+        if consistent and saved_ra:
+            entries.add(base+off)
+    return sorted(entries)
+
+def _is_control_flow_word(word):
+    """Use the shared overlay decoder without exposing another public API."""
+    return co._is_control_flow(word)
+
+def reachable_static_dispatches(data,base,roots):
+    """Dispatch-only PCs plus inspectable indirect-jump provenance."""
+    roots=sorted({root for root in roots
+                  if base <= root < base+len(data) and (root&3)==0})
+    targets=set()
+    continuations=set()
+    proofs=[]
+    producer=((base,base+len(data)),)
+    for index,entry in enumerate(roots):
+        hard_cap=roots[index+1] if index+1<len(roots) else base+len(data)
+        walk=co._walk_overlay_function(
+            data,base,len(data),entry,hard_cap,producer,False)
+        targets.update(walk['jump_table_targets'])
+        continuations.update(walk['call_continuations'])
+        proofs.extend(walk['jump_table_proofs'])
+    return {
+        'dispatch_pcs':sorted(targets|continuations),
+        'jump_table_proofs':proofs,
+        'call_continuation_pcs':sorted(continuations),
+    }
+
 def recover_consensus_members(members, base_lo, base_hi=0x80200000):
     """Recover linked code from members that independently vote shared bases.
 
     An anchor member needs >=8 agreeing jal/prologue pairs and a 2x vote peak.
     A base becomes trusted only when at least two independent members anchor it.
-    Other members may reuse that exact consensus with >=2 agreeing pairs.  Only
-    locally callable direct-JAL targets become roots; pointer tables and apparent
-    prologues are deliberately insufficient inside a mixed code/data archive.
+    Other members may reuse that exact consensus with >=2 agreeing pairs.
+    Locally callable direct-JAL targets and return-adjacent framed functions are
+    roots. Computed-switch destinations are retained separately as dispatch-only
+    evidence; generic pointer tables and arbitrary prologues remain insufficient
+    inside a mixed code/data archive.
     """
     from collections import Counter
     if not members:
@@ -417,12 +495,18 @@ def recover_consensus_members(members, base_lo, base_hi=0x80200000):
         if score < 2 or score < runner*2:
             continue
         direct=direct_jal_roots(body,base)
-        seeds=list(direct)
         if len(direct) < 2:
             continue
+        framed=return_adjacent_framed_entries(body,base)
+        seeds=sorted(set(direct)|set(framed))
+        static_dispatch=reachable_static_dispatches(body,base,seeds)
         recovered.append({
             'id':ident, 'file_offset':off, 'data':body, 'base':base,
             'score':score, 'runner':runner, 'direct_seeds':direct,
+            'return_framed_seeds':framed,
+            'static_dispatch_pcs':static_dispatch['dispatch_pcs'],
+            'jump_table_proofs':static_dispatch['jump_table_proofs'],
+            'call_continuation_pcs':static_dispatch['call_continuation_pcs'],
             'seeds':seeds,
         })
     return recovered
@@ -609,13 +693,15 @@ def filter_full_discovery_seeds(body, base, candidates, declared_entry):
 def enrich_positioned_member(member, recompiler, tmp):
     """Add normal-mode entries/aliases to a consensus-positioned member.
 
-    Direct JAL targets established the member's link base and remain its only
-    hard roots. Normal mode contributes decoder-classified candidates and exact
-    overlapping alias recipes; the unproven image-start fallback is removed.
+    Direct JAL targets established the member's link base. Those targets plus
+    strict return-adjacent framed roots remain the hard-root fallback. Normal
+    mode contributes decoder-classified candidates and exact overlapping alias
+    recipes; the unproven image-start fallback is removed.
     Downstream overlay compilation still re-walks and audits every emitted byte.
     """
     body=member['data']; base=member['base']
     direct=member['direct_seeds']
+    roots=member['seeds']
     if not direct:
         return member
     wrapped=make_psx_exe(body,base,direct[0])
@@ -631,15 +717,16 @@ def enrich_positioned_member(member, recompiler, tmp):
              if base <= alias[0] < hi and
              base <= alias[1] < alias[2] <= hi and
              alias[0] != base and
-             not any(alias[1] < root < alias[2] for root in direct)]
+             not any(alias[1] < root < alias[2] for root in roots)]
     out=dict(member)
-    out['seeds']=sorted(set(discovered)|set(direct))
+    out['seeds']=sorted(set(discovered)|set(roots))
     out['static_alias_ranges']=sorted(set(aliases))
     out['normal_seed_count']=len(discovered)
     return out
 
 def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
-        static_discovery=None, static_alias_ranges=None):
+        static_discovery=None, static_alias_ranges=None,
+        jump_table_proofs=None, call_continuations=None):
     # function_entry_pcs = prologue-scanned function starts (walk roots).
     # dispatch_entry_pcs = those PLUS any extra dispatch targets (e.g. the
     # overlay's own export table). compile_overlays promotes clean starts to
@@ -664,7 +751,27 @@ def rec(load_addr, data, seeds, dispatch_extra=None, producer_ranges=None,
             {"entry":f"0x{entry:08X}", "start":f"0x{lo:08X}",
              "end":f"0x{hi:08X}"}
             for entry,lo,hi in sorted(set(static_alias_ranges))]
+    if jump_table_proofs:
+        out['static_jump_table_proofs']=[{
+            'host_entry':f"0x{proof['host_entry']:08X}",
+            'jr_pc':f"0x{proof['jr_pc']:08X}",
+            'table_base':f"0x{proof['table_base']:08X}",
+            'count':proof['count'],
+            'targets':[f"0x{target:08X}" for target in proof['targets']],
+        } for proof in jump_table_proofs]
+    if call_continuations:
+        out['static_call_continuation_pcs']=[
+            f"0x{addr:08X}" for addr in sorted(set(call_continuations))]
     return out
+
+def add_consensus_fallback(record,member):
+    """Fail closed to base-proving direct calls if enrichment is rejected."""
+    if (member.get('normal_seed_count') or
+            member.get('return_framed_seeds') or
+            member.get('static_dispatch_pcs')):
+        record['optional_enrichment_fallback_entry_pcs'] = [
+            f"0x{addr:08X}" for addr in member['direct_seeds']]
+    return record
 
 def bios_resident_records(bios_path=None, manifest_path=None):
     """Build guarded captures for BIOS-installed RAM code known by exact hash.
@@ -956,12 +1063,13 @@ def main():
             producer_lo=max(base,page_base)
             record=rec(
                 page_base,region,member['seeds'],
+                dispatch_extra=member.get('static_dispatch_pcs'),
                 producer_ranges=((producer_lo,base+len(body)),),
                 static_discovery=member['direct_seeds'],
-                static_alias_ranges=member.get('static_alias_ranges'))
-            if member.get('normal_seed_count'):
-                record['optional_enrichment_fallback_entry_pcs'] = [
-                    f"0x{addr:08X}" for addr in member['direct_seeds']]
+                static_alias_ranges=member.get('static_alias_ranges'),
+                jump_table_proofs=member.get('jump_table_proofs'),
+                call_continuations=member.get('call_continuation_pcs'))
+            add_consensus_fallback(record,member)
             record['producer_name']=(
                 f"{p}:member_{member['id']:04X}@{member['file_offset']:08X}")
             records.append(record)
@@ -971,6 +1079,8 @@ def main():
                   f"@0x{base:08X}, region@0x{page_base:08X}, "
                   f"trusted-fit={member['score']}:{member['runner']}, "
                   f"direct seeds={len(member['direct_seeds'])}, "
+                  f"framed roots={len(member.get('return_framed_seeds',()))}, "
+                  f"static dispatch={len(member.get('static_dispatch_pcs',()))}, "
                   f"normal seeds={member.get('normal_seed_count',0)}, "
                   f"aliases={len(member.get('static_alias_ranges',()))}, "
                   f"normal reject={member.get('normal_rejected','none')}, "
@@ -990,8 +1100,12 @@ def main():
             producer_lo=max(base,page_base)
             record=rec(
                 page_base,region,member['seeds'],
+                dispatch_extra=member.get('static_dispatch_pcs'),
                 producer_ranges=((producer_lo,base+len(body)),),
-                static_discovery=member['direct_seeds'])
+                static_discovery=member['direct_seeds'],
+                jump_table_proofs=member.get('jump_table_proofs'),
+                call_continuations=member.get('call_continuation_pcs'))
+            add_consensus_fallback(record,member)
             record['producer_name']=(
                 f"{group['hed_path']}:entry_{member['id']:04X}"
                 f"@logical_{member['file_offset']:08X}")
@@ -1002,7 +1116,9 @@ def main():
                   f"logical+0x{member['file_offset']:X} @0x{base:08X}, "
                   f"region@0x{page_base:08X}, "
                   f"trusted-fit={member['score']}:{member['runner']}, "
-                  f"direct seeds={len(member['direct_seeds'])}")
+                  f"direct seeds={len(member['direct_seeds'])}, "
+                  f"framed roots={len(member.get('return_framed_seeds',()))}, "
+                  f"static dispatch={len(member.get('static_dispatch_pcs',()))}")
 
     # Runtime dirty-page capture coalesces directly adjacent producers into one
     # region keyed by the earlier page. Emit each provable two-file composition
