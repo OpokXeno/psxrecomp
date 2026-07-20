@@ -104,20 +104,40 @@ def main() -> int:
         elif "mandatory delay slot" not in combined:
             failures.append("truncated generation failed without the delay-slot diagnostic")
 
-        likely, _ = run_codegen(
+        likely, likely_out = run_codegen(
             args.recompiler, True, root, branch_word=0x50800008,
             case_name="reserved_branch_likely")
         likely_output = (likely.stderr or "") + (likely.stdout or "")
-        if likely.returncode == 0:
-            failures.append("reserved R3000A branch-likely opcode generated native code")
-        elif "branch-likely" not in likely_output:
-            failures.append("branch-likely rejection omitted its diagnostic")
+        if likely.returncode != 0:
+            failures.append("reserved R3000A opcode aborted generation: " + likely_output)
+        else:
+            likely_c = next((name for name in os.listdir(likely_out)
+                             if name.endswith("_full.c")), None)
+            if not likely_c:
+                failures.append("reserved R3000A opcode generation omitted C output")
+            else:
+                with open(os.path.join(likely_out, likely_c), encoding="utf-8") as f:
+                    likely_source = f.read()
+                ri_markers = (
+                    "reserved opcode 0x50800008: architectural RI exception",
+                    "cpu->cop0[14] = 0x80010FFCu",
+                    "(10u << 2)",
+                    "cpu->pc = (psx_ri_sr & 0x00400000u)",
+                    "return;",
+                )
+                missing = [marker for marker in ri_markers if marker not in likely_source]
+                if missing:
+                    failures.append("reserved R3000A opcode omitted RI raise markers: " +
+                                    ", ".join(missing))
+            if "emitting guest RI exception raise" not in likely_output:
+                failures.append("reserved R3000A opcode omitted its RI diagnostic")
 
     if failures:
         for failure in failures:
             print("FAIL:", failure)
         return 1
-    print("PASS: cross-page delay slot is emitted, identity-hashed, and truncation fails closed")
+    print("PASS: cross-page delay slot is emitted and hashed, truncation fails closed, "
+          "and reserved opcodes emit RI")
     return 0
 
 
