@@ -69,11 +69,15 @@ def gen_c(recompiler, overlay, tmp):
     if r.returncode != 0:
         raise SystemExit(f"recompiler failed ({'overlay' if overlay else 'static'}):\n"
                          f"{r.stderr or r.stdout}")
-    full = [f for f in os.listdir(out) if f.endswith("_full.c")]
+    full = [f for f in os.listdir(out)
+            if "_full" in f and f.endswith(".c") and "_dispatch" not in f]
     if not full:
-        raise SystemExit(f"no _full.c emitted in {out}")
-    with open(os.path.join(out, full[0])) as f:
-        return f.read()
+        raise SystemExit(f"no _full*.c emitted in {out}")
+    chunks = []
+    for name in sorted(full):
+        with open(os.path.join(out, name)) as f:
+            chunks.append(f.read())
+    return "\n".join(chunks)
 
 
 def main():

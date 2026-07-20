@@ -1749,89 +1749,15 @@ std::string CodeGenerator::translate_basic_block(
                     //   P1: lui $R,hi; addiu $R,$R,lo; addu $D,$idx,$R; lw $D,0($D)
                     //   P2: lui $R,hi;                 addu $D,$R,$idx; lw $D,off($D)
                     // table_base = lui_val + addiu_val + lw_offset
-                    uint32_t table_base  = 0;
-                    uint32_t table_count = 0;
-                    {
-                        uint32_t lw_base_reg   = 0xFF;   // base reg in the LW
-                        int32_t  lw_offset     = 0;      // offset in the LW instruction
-                        uint32_t addu_cand[2]  = {0xFF, 0xFF}; // rs, rt of ADDU
-                        uint32_t table_reg     = 0xFF;   // candidate for table base reg
-                        uint32_t lui_val       = 0;
-                        int16_t  addiu_val[2]  = {0, 0}; // per-candidate ADDIU
-                        bool     found_addiu[2]= {false, false};
-                        bool     found_lui     = false;
-
-                        for (int back = 1; back <= 40; back++) {
-                            uint32_t sa = block.exit_instr.address - (uint32_t)(back * 4);
-                            if (sa < cfg.function_start) break;
-                            auto sopt = exe_.read_word(sa);
-                            if (!sopt) break;
-                            uint32_t si   = *sopt;
-                            uint32_t s_op = (si >> 26) & 0x3F;
-                            uint32_t s_rs = (si >> 21) & 0x1F;
-                            uint32_t s_rt = (si >> 16) & 0x1F;
-                            uint32_t s_rd = (si >> 11) & 0x1F;
-                            uint32_t s_fn = si & 0x3F;
-
-                            // LW $jr_reg, offset($base)
-                            if (s_op == 0x23 && s_rt == jr_rs && lw_base_reg == 0xFF) {
-                                lw_base_reg = s_rs;
-                                lw_offset   = (int32_t)(int16_t)(si & 0xFFFF);
-                                continue;
-                            }
-                            // ADDU $lw_base, $a, $b  — save both operands as candidates
-                            if (s_op == 0x00 && s_fn == 0x21 &&
-                                s_rd == lw_base_reg && lw_base_reg != 0xFF &&
-                                addu_cand[0] == 0xFF) {
-                                addu_cand[0] = s_rs;
-                                addu_cand[1] = s_rt;
-                                table_reg    = s_rt;  // initial guess; may flip on LUI match
-                                continue;
-                            }
-                            // ADDIU $cand, $cand, imm  (scanning back → before LUI)
-                            if (s_op == 0x09 && addu_cand[0] != 0xFF) {
-                                for (int c = 0; c < 2; c++) {
-                                    if (!found_addiu[c] && addu_cand[c] != 0xFF &&
-                                        s_rs == addu_cand[c] && s_rt == addu_cand[c]) {
-                                        addiu_val[c]   = (int16_t)(si & 0xFFFF);
-                                        found_addiu[c] = true;
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            // LUI $cand, hi  — determines which candidate is the table base
-                            if (s_op == 0x0F && addu_cand[0] != 0xFF && !found_lui) {
-                                for (int c = 0; c < 2; c++) {
-                                    if (addu_cand[c] != 0xFF && s_rt == addu_cand[c]) {
-                                        lui_val   = ((uint32_t)(si & 0xFFFF)) << 16;
-                                        table_reg = addu_cand[c];
-                                        // carry over the ADDIU for this candidate
-                                        if (!found_addiu[c]) { addiu_val[c] = 0; }
-                                        // store addiu in slot 0 for convenience
-                                        addiu_val[0]   = addiu_val[c];
-                                        found_addiu[0] = found_addiu[c];
-                                        found_lui      = true;
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            // SLTIU — table entry count
-                            if (s_op == 0x0B && table_count == 0) {
-                                table_count = si & 0xFFFF;
-                                continue;
-                            }
-                            if (found_lui && table_count != 0) break;
-                        }
-
-                        if (found_lui && table_count > 0 && table_count < 512) {
-                            uint32_t base = lui_val +
-                                (found_addiu[0] ? (uint32_t)(int32_t)addiu_val[0] : 0u);
-                            table_base = base + (uint32_t)lw_offset;
-                        }
-                    }
-
+                    ExactJumpTable exact_table;
+                    bool have_exact_table = resolve_exact_bounded_jump_table(
+                        exe_, cfg.function_start, cfg.function_end,
+                        block.exit_instr.address, jr_rs, exact_table,
+                        ram_to_rom, cfg.producer_lo, cfg.producer_hi);
+                    uint32_t table_base = have_exact_table
+                        ? exact_table.table_base : 0u;
+                    uint32_t table_count = have_exact_table
+                        ? exact_table.table_count : 0u;
                     // If we found a valid table, read entries and emit switch.
                     // table_base may be a RAM address (BIOS shell code copies
                     // ROM 0xBFC18000+ to RAM 0x80030000+).  Translate to ROM
@@ -1842,11 +1768,8 @@ std::string CodeGenerator::translate_basic_block(
                         uint32_t rom_table_base = ram_to_rom(table_base, exe_);
                         std::set<uint32_t>    seen;
                         std::vector<std::pair<uint32_t,uint32_t>> targets; // {runtime_addr, rom_addr}
-                        for (uint32_t i = 0; i < table_count; i++) {
-                            auto eopt = exe_.read_word(rom_table_base + i * 4);
-                            if (!eopt) continue;
-                            uint32_t runtime_addr = *eopt;
-                            uint32_t rom_addr = ram_to_rom(runtime_addr, exe_);
+                        for (const auto& [runtime_addr, rom_addr] :
+                             exact_table.targets) {
                             if (seen.insert(rom_addr).second &&
                                 (cfg.blocks.count(rom_addr) || extra_labels_.count(rom_addr))) {
                                 targets.push_back({runtime_addr, rom_addr});
@@ -2323,33 +2246,18 @@ void CodeGenerator::scan_jr_tables(
     for (const auto& [baddr, blk] : cfg.blocks) {
         if (blk.exit_instr.type != ControlFlowType::JumpRegister) continue;
         uint32_t jr_r = get_rs(blk.exit_instr.instruction);
-        // Run same backward scan as translate_basic_block to find table_base/count
-        uint32_t tb = 0, tc = 0;
-        {
-            uint32_t lw_base = 0xFF; int32_t lw_off = 0;
-            uint32_t ac[2] = {0xFF,0xFF}; uint32_t lui_v = 0;
-            int16_t av[2] = {0,0}; bool fa[2] = {false,false}, fl = false;
-            for (int b = 1; b <= 40; b++) {
-                uint32_t sa = blk.exit_instr.address - (uint32_t)(b*4);
-                if (sa < cfg.function_start) break;
-                auto so = exe_.read_word(sa); if (!so) break;
-                uint32_t si=*so, s_op=(si>>26)&0x3F, s_rs=(si>>21)&0x1F,
-                         s_rt=(si>>16)&0x1F, s_rd=(si>>11)&0x1F, s_fn=si&0x3F;
-                if (s_op==0x23 && s_rt==jr_r && lw_base==0xFF) { lw_base=s_rs; lw_off=(int32_t)(int16_t)(si&0xFFFF); continue; }
-                if (s_op==0x00 && s_fn==0x21 && s_rd==lw_base && lw_base!=0xFF && ac[0]==0xFF) { ac[0]=s_rs; ac[1]=s_rt; continue; }
-                if (s_op==0x09 && ac[0]!=0xFF) { for(int c=0;c<2;c++){if(!fa[c]&&ac[c]!=0xFF&&s_rs==ac[c]&&s_rt==ac[c]){av[c]=(int16_t)(si&0xFFFF);fa[c]=true;break;}} continue; }
-                if (s_op==0x0F && ac[0]!=0xFF && !fl) { for(int c=0;c<2;c++){if(ac[c]!=0xFF&&s_rt==ac[c]){lui_v=((uint32_t)(si&0xFFFF))<<16;if(!fa[c]){av[c]=0;}av[0]=av[c];fa[0]=fa[c];fl=true;break;}} continue; }
-                if (s_op==0x0B && tc==0) { tc=si&0xFFFF; continue; }
-                if (fl && tc!=0) break;
-            }
-            if (fl && tc>0 && tc<512) tb = (lui_v+(fa[0]?(uint32_t)(int32_t)av[0]:0u)) + (uint32_t)lw_off;
+        ExactJumpTable exact_table;
+        if (!resolve_exact_bounded_jump_table(
+                exe_, cfg.function_start, cfg.function_end,
+                blk.exit_instr.address, jr_r, exact_table, ram_to_rom,
+                cfg.producer_lo, cfg.producer_hi)) {
+            continue;
         }
+        uint32_t tb = exact_table.table_base;
+        uint32_t tc = exact_table.table_count;
         if (tb==0 || tc==0) continue;
-        uint32_t rom_tb = ram_to_rom(tb, exe_);
-        for (uint32_t i = 0; i < tc; i++) {
-            auto eopt = exe_.read_word(rom_tb + i*4);
-            if (!eopt) continue;
-            uint32_t t = ram_to_rom(*eopt, exe_);
+        for (const auto& target_pair : exact_table.targets) {
+            uint32_t t = target_pair.second;
             if (t >= cfg.function_start && t < cfg.function_end) {
                 out_edges[baddr].push_back(t);
                 if (!cfg.blocks.count(t))

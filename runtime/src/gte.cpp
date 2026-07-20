@@ -185,6 +185,7 @@ static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
 extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
+static int s_gte_replay_sandbox = 0;
 
 /* Optional visual-only geometry precision cache. The PS1-visible SXY FIFO
  * remains integer and fully faithful; this side cache retains the discarded
@@ -243,6 +244,7 @@ extern "C" void gte_precision_tracking_set(int enabled) {
 }
 
 extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
+    if (s_gte_replay_sandbox) return;
     if (!s_precision_tracking || reg < 12 || reg > 15) return;
     int index = reg == 15 ? 2 : (int)reg - 12;
     const PreciseProjection &projection = s_precise_sxy[index];
@@ -256,6 +258,7 @@ extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
 }
 
 extern "C" void gte_precision_invalidate_word(uint32_t addr) {
+    if (s_gte_replay_sandbox) return;
     if (!s_precision_tracking) return;
     uint32_t physical;
     if (!precision_ram_address(addr, &physical)) return;
@@ -312,6 +315,7 @@ extern "C" int gte_geometry_correction_lookup(uint32_t packed,
 }
 
 static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
+    if (s_gte_replay_sandbox) return;
     if (!s_geom_enabled) return;
     /* Saturated off-screen projections are unsuitable for subpixel recovery. */
     int32_t x = (int16_t)(packed & 0xFFFFu);
@@ -408,6 +412,7 @@ extern "C" void gte_dome_probe(int on, int thr) {
     if (on) for (int i = 0; i < DOME_PROBE_SLOTS; i++) { s_dome_probe[i].func = 0; s_dome_probe[i].count = 0; s_dome_probe[i].max_sz = 0; }
 }
 static inline void dome_probe_note(int32_t sz) {
+    if (s_gte_replay_sandbox) return;
     if (!s_dome_probe_on || sz < s_dome_probe_thr) return;
     /* Tally the guest RA (the GAME fn that jal'd to libgte for this projection),
      * NOT g_debug_current_func_addr (which is the libgte leaf 0x80000F40). */
@@ -475,6 +480,7 @@ static inline int gte_sxx(int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x1000
 static inline int gte_syy(int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; }
 
 static void gte_rtp_record(const GTEState* g, uint32_t cmd) {
+    if (s_gte_replay_sandbox) return;
     if (!s_gte_rtp_ring) {
         s_gte_rtp_ring = (GteRtpRec*)calloc(GTE_RTP_RING_CAP, sizeof(GteRtpRec));
         if (!s_gte_rtp_ring) return;
@@ -553,6 +559,7 @@ static uint64_t     s_gte_intpl_seq  = 0;
 
 static void gte_intpl_record(const GTEState* g,
                              const int16_t pre_ir[4], const int32_t pre_fc[3]) {
+    if (s_gte_replay_sandbox) return;
     if (!s_gte_intpl_ring) {
         s_gte_intpl_ring = (GteIntplRec*)calloc(GTE_INTPL_RING_CAP, sizeof(GteIntplRec));
         if (!s_gte_intpl_ring) return;
@@ -769,10 +776,15 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
         /* Depth-gated: un-squash only FAR geometry (the backdrop); keep near
          * props squashed so they stay aligned. Record SZ stats for tuning. */
         int32_t sz = gte->SZ[3];
-        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
-        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
-        s_ws_sz_n++;
-        if (sz >= s_ws_far_threshold) { do_squash = false; s_ws_sz_far++; }
+        if (!s_gte_replay_sandbox) {
+            if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+            if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+            s_ws_sz_n++;
+        }
+        if (sz >= s_ws_far_threshold) {
+            do_squash = false;
+            if (!s_gte_replay_sandbox) s_ws_sz_far++;
+        }
     }
     if (do_squash)
         xterm = xterm * s_ws_xnum / s_ws_xden;
@@ -780,12 +792,14 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
              !gpu_ws_present_native_43()) {
         int32_t sz = gte->SZ[3];
-        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
-        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
-        s_ws_sz_n++;
+        if (!s_gte_replay_sandbox) {
+            if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+            if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+            s_ws_sz_n++;
+        }
         if (sz >= s_ws_far_threshold) {
             xterm = xterm * s_ws_dome_num / s_ws_dome_den;
-            s_ws_sz_far++;
+            if (!s_gte_replay_sandbox) s_ws_sz_far++;
         }
     }
     dome_probe_note(gte->SZ[3]);   /* locate the dome draw fn (far-vertex tally) */
@@ -794,14 +808,16 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     int64_t sx = sx16 >> 16;
     int64_t sy = sy16 >> 16;
     gte->push_sxy(sx, sy);
-    s_precise_sxy[0] = s_precise_sxy[1];
-    s_precise_sxy[1] = s_precise_sxy[2];
-    s_precise_sxy[2].packed = (uint32_t)gte->SXY[2];
-    s_precise_sxy[2].x16 = (int32_t)sx16;
-    s_precise_sxy[2].y16 = (int32_t)sy16;
-    s_precise_sxy[2].z = gte->SZ[3];
-    s_precise_sxy[2].valid = gte->SZ[3] != 0;
-    s_precise_sxy[3] = s_precise_sxy[2];
+    if (!s_gte_replay_sandbox) {
+        s_precise_sxy[0] = s_precise_sxy[1];
+        s_precise_sxy[1] = s_precise_sxy[2];
+        s_precise_sxy[2].packed = (uint32_t)gte->SXY[2];
+        s_precise_sxy[2].x16 = (int32_t)sx16;
+        s_precise_sxy[2].y16 = (int32_t)sy16;
+        s_precise_sxy[2].z = gte->SZ[3];
+        s_precise_sxy[2].valid = gte->SZ[3] != 0;
+        s_precise_sxy[3] = s_precise_sxy[2];
+    }
     geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
@@ -1426,10 +1442,24 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
 // ---------------------------------------------------------------------------
 static uint64_t s_gte_exec_count = 0;
 extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
+static uint32_t s_gte_replay_saved_caller_ra = 0;
+extern "C" int gte_replay_side_effects_begin(void) {
+    using namespace PSXRecomp::GTE;
+    if (s_gte_replay_sandbox) return 0;
+    s_gte_replay_saved_caller_ra = s_gte_caller_ra;
+    s_gte_replay_sandbox = 1;
+    return 1;
+}
+extern "C" void gte_replay_side_effects_end(void) {
+    using namespace PSXRecomp::GTE;
+    if (!s_gte_replay_sandbox) return;
+    s_gte_caller_ra = s_gte_replay_saved_caller_ra;
+    s_gte_replay_sandbox = 0;
+}
 
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
-    s_gte_exec_count++;
+    if (!s_gte_replay_sandbox) s_gte_exec_count++;
     s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
 
     GTEState gte;
@@ -1445,7 +1475,7 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every
      * perspective projection so gpu.c can stamp real 3D frames as gameplay
      * (no-op unless the game opts in — early-out on the config flag). */
-    if (func == 0x01 || func == 0x30)
+    if (!s_gte_replay_sandbox && (func == 0x01 || func == 0x30))
         psx_ws_note_gte_project(func == 0x30 ? 3 : 1);
     /* INTPL ring: snapshot inputs before the op mutates IR (outputs recorded
      * after the switch). */
@@ -1533,7 +1563,7 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
     GTEState gte;
     gte_load_data(gte, cpu);
     gte_mtc2(&gte, reg, val);
-    if (reg >= 12 && reg <= 15)
+    if (!s_gte_replay_sandbox && reg >= 12 && reg <= 15)
         for (int i = 0; i < 4; i++) s_precise_sxy[i].valid = 0;
     for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
     for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);

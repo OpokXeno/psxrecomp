@@ -41,6 +41,7 @@ sdl2-msvc/
 # Diagnostic dumps & smoke logs (transient)
 *.log
 *.jsonl
+/.aot_capture_history/
 
 # Build-generated codegen-hash header (hash_codegen.cmake): folds an emitter
 # content hash into the overlay cache path; regenerated each build, never committed.

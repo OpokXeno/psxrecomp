@@ -2008,6 +2008,10 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined be
 volatile uint32_t g_psx_last_fn_entry = 0;
 
 void debug_server_log_call_entry(uint32_t func_addr) {
+    /* Whole-call native replay is diagnostic and must not double-consume or
+     * overwrite live trace/stack-watch state. Architectural CPU state is
+     * compared by the caller; these observers are intentionally inert. */
+    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }
     g_psx_last_fn_entry = func_addr;
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;

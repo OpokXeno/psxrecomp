@@ -62,7 +62,12 @@
  * site fails to LINK (undefined psx_ws_player_x_bound) and runs interpreted
  * forever — the rfe/gte_read_ctrl class again. Identity fallback (vanilla)
  * on a NULL host pointer keeps a v13 DLL correct (4:3) on an older host. */
-#define PSX_OVERLAY_ABI_VERSION 13
+/* v14: gte_precision_store_word forwarder — the emitter emits a direct call for
+ *      every swc2 (GTE store-word); stateful runtime code (gte.cpp) so the DLL
+ *      must forward or fail to LINK. Surfaced by full static overlay coverage
+ *      (play-captured shards rarely compiled a swc2). Appended last; ABI bump
+ *      to 14 rejects any pre-shim DLL. */
+#define PSX_OVERLAY_ABI_VERSION 14
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -221,6 +226,16 @@ typedef struct {
      * psx_ws_player_x_bound). Appended last; may be NULL on a host that
      * predates it — the DLL glue falls back to the vanilla constant (4:3). */
     int32_t  (*ws_player_x_bound)(int32_t vanilla);
+    /* Sub-pixel GTE precision-store tracker (ABI v14; see version-history note
+     * above). The emitter emits a direct gte_precision_store_word() call for
+     * every swc2 (GTE store-word); it is stateful runtime code (gte.cpp) so the
+     * DLL must forward. Without the shim any shard containing a swc2 fails to
+     * LINK (undefined gte_precision_store_word) and runs interpreted forever —
+     * the rfe/gte_read_ctrl class again. Surfaced by full static overlay
+     * coverage (play-captured shards rarely compiled a swc2). Appended last;
+     * may be NULL on a host that predates it — the shim no-ops (precision
+     * tracking is a widescreen enhancement, off by default). */
+    void     (*gte_precision_store_word)(uint32_t addr, uint8_t reg);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

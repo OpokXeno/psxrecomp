@@ -48,6 +48,15 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
         by_host[ae.host_start].push_back(&ae);
     }
     for (const auto& [host_start, group] : by_host) {
+        uint32_t producer_lo = 0;
+        uint32_t producer_hi = 0;
+        for (const auto& function : result.functions) {
+            if (function.start_addr == host_start) {
+                producer_lo = function.producer_lo;
+                producer_hi = function.producer_hi;
+                break;
+            }
+        }
         std::vector<uint32_t> entries;
         for (const AliasEntry* ae : group) entries.push_back(ae->addr);
         for (const AliasEntry* ae : group) {
@@ -62,6 +71,8 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
             af.is_data_section = false;
             af.alias_walk_lo = ae->host_start;
             af.alias_group_entries = entries;
+            af.producer_lo = producer_lo;
+            af.producer_hi = producer_hi;
             result.functions.push_back(af);
         }
     }
@@ -420,7 +431,9 @@ int main(int argc, char** argv) {
      * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
      * exactly these PCs, so they are real execution roots even though no
      * prologue / preceding jr $ra exists. They are trusted walk roots and
-     * exempt from the overlay-mode boundary re-check below.
+         * exempt from the overlay-mode boundary re-check below.  Lines of the
+         * form `call_root 0xXXXXXXXX` carry the same mechanical trust for a
+         * statically proven direct or constant-register call/tail-call target.
      *
      * Seeds are accepted within the loaded image's own bounds — overlay mode
      * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
@@ -429,6 +442,9 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> file_seeds;
     std::vector<uint32_t> interior_seeds;
     std::set<uint32_t>    trusted_root_seeds;
+    std::set<uint32_t>    trusted_call_root_seeds;
+    std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
+    std::set<uint32_t> cross_call_allow;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
@@ -437,8 +453,41 @@ int main(int argc, char** argv) {
             std::string line;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
+                if (line.rfind("producer_range", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, lo_text, hi_text;
+                    in >> tag >> lo_text >> hi_text;
+                    uint32_t lo = static_cast<uint32_t>(
+                        std::strtoul(lo_text.c_str(), nullptr, 16));
+                    uint32_t hi = static_cast<uint32_t>(
+                        std::strtoul(hi_text.c_str(), nullptr, 16));
+                    if (lo_text.empty() || hi_text.empty() ||
+                        lo < seed_lo || lo >= hi || hi > seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid producer_range: {}\n", line);
+                        return 1;
+                    }
+                    producer_ranges.emplace_back(lo, hi);
+                    continue;
+                }
+                if (line.rfind("cross_call_allow", 0) == 0) {
+                    const char* p = line.c_str() + 16;
+                    uint32_t addr = static_cast<uint32_t>(
+                        std::strtoul(p, nullptr, 16));
+                    if (addr < seed_lo || addr >= seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid cross_call_allow: {}\n", line);
+                        return 1;
+                    }
+                    cross_call_allow.insert(addr);
+                    continue;
+                }
+                if (line.rfind("retained_alias", 0) == 0) {
+                    fmt::print("  ignoring legacy retained_alias; old host "
+                               "ranges are never reused: {}\n", line);
+                    continue;
+                }
                 bool interior = false;
                 bool trusted_root = false;
+                bool trusted_call_root = false;
                 const char* p = line.c_str();
                 if (line.rfind("interior", 0) == 0) {
                     interior = true;
@@ -446,6 +495,9 @@ int main(int argc, char** argv) {
                 } else if (line.rfind("dispatch_root", 0) == 0) {
                     trusted_root = true;
                     p += 13;
+                } else if (line.rfind("call_root", 0) == 0) {
+                    trusted_call_root = true;
+                    p += 9;
                 }
                 uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
                 if (addr >= seed_lo && addr < seed_hi) {
@@ -453,15 +505,41 @@ int main(int argc, char** argv) {
                         interior_seeds.push_back(addr);
                     } else {
                         if (trusted_root) trusted_root_seeds.insert(addr);
+                        if (trusted_call_root) trusted_call_root_seeds.insert(addr);
                         file_seeds.push_back(addr);
                         exact_entries.push_back(addr);
                     }
                 }
             }
+            std::sort(producer_ranges.begin(), producer_ranges.end());
+            for (size_t i = 1; i < producer_ranges.size(); i++) {
+                if (producer_ranges[i - 1].second > producer_ranges[i].first) {
+                    fmt::print(stderr, "ERROR: overlapping producer_range entries\n");
+                    return 1;
+                }
+            }
+            for (uint32_t addr : cross_call_allow) {
+                bool contained = false;
+                for (const auto& range : producer_ranges) {
+                    if (addr >= range.first && addr < range.second) {
+                        contained = true;
+                        break;
+                    }
+                }
+                if (!contained) {
+                    fmt::print(stderr,
+                               "ERROR: cross_call_allow 0x{:08X} is outside "
+                               "producer ranges\n", addr);
+                    return 1;
+                }
+            }
             fmt::print("Loaded {} extra function addresses ({} interior, "
-                       "{} dispatch-root) from {}\n",
+                       "{} dispatch-root, {} call-root, {} producer ranges, "
+                       "{} cross-call allows) from {}\n",
                        file_seeds.size() + interior_seeds.size(),
                        interior_seeds.size(), trusted_root_seeds.size(),
+                       trusted_call_root_seeds.size(),
+                       producer_ranges.size(), cross_call_allow.size(),
                        extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
@@ -482,11 +560,35 @@ int main(int argc, char** argv) {
             auto w = exe->read_word(a);
             return w.has_value() ? *w : 0u;
         };
+        auto dense_local_pointer_table = [&](uint32_t a) -> bool {
+            for (uint32_t i = 0; i < 3u; i++) {
+                auto value = exe->read_word(a + i * 4u);
+                if (!value.has_value() || (*value & 3u) != 0u ||
+                    *value < exe_lo || *value >= exe->end_address()) {
+                    return false;
+                }
+            }
+            return true;
+        };
         auto callable_boundary = [&](uint32_t a) -> bool {
             uint32_t w = read_w(a);
             if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
             if (a == exe_lo) return true;
             if (a >= exe_lo + 8 && read_w(a - 8) == 0x03E00008u) return true;
+            // Normal-mode discovery already skips alignment padding after a
+            // return when it infers a frameless function start. Preserve that
+            // evidence here. Requiring the next entry to be exactly jr-ra+8
+            // demoted legitimate Psy-Q leaf routines separated by one to six
+            // padding NOPs to orphan interiors, so exact-entry analysis emitted
+            // no function at all. The delay slot (jr+4) may be non-NOP; only
+            // words after it and before the proposed entry must be padding.
+            bool padding_only = true;
+            for (uint32_t back = 12; back <= 32 && a >= exe_lo + back;
+                 back += 4) {
+                if (read_w(a - back + 8) != 0u) padding_only = false;
+                if (!padding_only) break;
+                if (read_w(a - back) == 0x03E00008u) return true;
+            }
             int32_t frame = 0;
             return PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
                    !(a >= exe_lo + 4 &&
@@ -506,6 +608,11 @@ int main(int argc, char** argv) {
                  * execution root despite having no callable boundary. */
                 fmt::print("  seed 0x{:08X} accepted as dispatch root "
                            "(install-slot class, no boundary evidence)\n", a);
+                roots.insert(a);
+            } else if (trusted_call_root_seeds.count(a) &&
+                       !dense_local_pointer_table(a)) {
+                fmt::print("  seed 0x{:08X} accepted as static call root "
+                           "(direct/constant-register target)\n", a);
                 roots.insert(a);
             } else if (callable_boundary(a)) {
                 roots.insert(a);
@@ -533,7 +640,8 @@ int main(int argc, char** argv) {
         {
             PSXRecomp::FunctionAnalyzer analyzer(*exe);
             std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
-            analysis_result = analyzer.analyze_exact_entries(roots_vec);
+            analysis_result = analyzer.analyze_exact_entries(
+                roots_vec, producer_ranges, cross_call_allow);
         }
 
         std::vector<AliasEntry> alias_entries;
@@ -541,7 +649,7 @@ int main(int argc, char** argv) {
         for (uint32_t a : interior) {
             const PSXRecomp::Function* host = containing(a);
             if (host && a == host->start_addr) continue;  // became a real entry
-            if (host) {
+            if (host && analysis_result.exact_reachable_pcs.count(a)) {
                 if (alias_seen.insert(a).second)
                     alias_entries.push_back({a, host->start_addr, host->end_addr});
             } else {
@@ -550,47 +658,19 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Range-ownership completeness (B): a DIRECT CALL (jal) whose target
-        // lands strictly INSIDE an already-discovered function is a separate
-        // routine the host's discovered range absorbed (e.g. via a break/trap
-        // fall-through in discovery — the crt0 `jal main; break` that swallowed
-        // the next function, the Tomba 2 FMV-freeze root cause). Register every
-        // such target as an ALIAS entry so the host's entry-switch routes a
-        // dispatch of that PC to the correct interior block (running the absorbed
-        // routine natively) instead of failing closed to the interpreter. This is
-        // derived purely from static jal evidence in the discovered code, so it
-        // does not depend on the PC having been captured/executed. jal encodes a
-        // code target, so this never mints code from data.
-        size_t jal_alias_added = 0;
-        {
-            std::set<uint32_t> known_starts;
-            for (const auto& f : analysis_result.functions)
-                known_starts.insert(f.start_addr);
-            std::set<uint32_t> jal_targets;
-            for (const auto& f : analysis_result.functions) {
-                for (uint32_t a = f.start_addr; a + 4 <= f.end_addr; a += 4) {
-                    uint32_t w = read_w(a);
-                    if ((w >> 26) == 0x03u) {  // jal
-                        uint32_t tgt = (a & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
-                        jal_targets.insert(tgt);
-                    }
-                }
-            }
-            for (uint32_t t : jal_targets) {
-                if (known_starts.count(t)) continue;          // already a real entry
-                if (!alias_seen.count(t)) {
-                    const PSXRecomp::Function* host = containing(t);
-                    if (host && t != host->start_addr) {
-                        alias_seen.insert(t);
-                        alias_entries.push_back({t, host->start_addr, host->end_addr});
-                        jal_alias_added++;
-                    }
-                }
-            }
+        // Range-ownership completeness uses only analyzer-proven transfers from
+        // reachable instructions. The analyzer also revalidates each target's
+        // host against the final root partition and producer boundaries.
+        size_t proven_alias_added = 0;
+        for (const auto& absorbed : analysis_result.absorbed_entries) {
+            if (!alias_seen.insert(absorbed.addr).second) continue;
+            alias_entries.push_back(
+                {absorbed.addr, absorbed.host_start, absorbed.host_end});
+            proven_alias_added++;
         }
-        if (jal_alias_added)
-            fmt::print("  +{} in-function jal-target alias entries "
-                       "(range-ownership completeness)\n", jal_alias_added);
+        if (proven_alias_added)
+            fmt::print("  +{} analyzer-proven absorbed alias entries "
+                       "(final range ownership)\n", proven_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
@@ -927,7 +1007,22 @@ int main(int argc, char** argv) {
     // the on-disk representation changes. Function bodies are byte-identical
     // to what full_c_code would have contained; see
     // CodeGenerator::last_gen_funcs() / build_shared_decls_header().
-    {
+    if (overlay_mode) {
+        // Overlays are single small TUs consumed by compile_overlays.py, which
+        // reads <stem>_full.c directly. Emit the monolith; the split path below
+        // would delete _full.c and leave only shards, breaking overlay compile
+        // (no_output). Splitting a small overlay TU has no parallel-compile
+        // benefit anyway.
+        std::ofstream full_file(output_filename);
+        if (full_file.is_open()) {
+            full_file << full_c_code;
+            full_file.close();
+            fmt::print("✓ Saved overlay monolith to {}\n", output_filename.string());
+        } else {
+            fmt::print(stderr, "⚠ Failed to write overlay monolith {}\n\n",
+                       output_filename.string());
+        }
+    } else {
         // 1. Remove stale outputs: the old monolith and any previously
         //    written shards (a shard count shrink must not leave orphans).
         std::error_code rm_ec;
