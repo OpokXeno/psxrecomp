@@ -12393,7 +12393,10 @@ void debug_server_init(int port)
 #endif
 
     s_listen = socket(AF_INET, SOCK_STREAM, 0);
-    if (s_listen == SOCK_INVALID) return;
+    if (s_listen == SOCK_INVALID) {
+        fprintf(stdout, "psxrecomp: debug server socket() FAILED\n");
+        return;
+    }
 
     int yes = 1;
     setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
@@ -12405,6 +12408,7 @@ void debug_server_init(int port)
     addr.sin_port = htons((uint16_t)s_port);
 
     if (bind(s_listen, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stdout, "psxrecomp: debug server bind(%d) FAILED\n", s_port);
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
         return;
@@ -12416,6 +12420,8 @@ void debug_server_init(int port)
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
     listen(s_listen, 16);
+    fprintf(stdout, "psxrecomp: debug server LISTENING on 127.0.0.1:%d\n",
+            s_port);
 
     /* Always-on wall-time phase sampler (phase_profile). Own thread: the
      * server pumps on the main thread, so sampling must not live there. */

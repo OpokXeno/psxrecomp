@@ -21,6 +21,7 @@
 #include "overlay_loader.h"
 #include "autocompile.h"
 #include "code_provider.h"
+extern "C" void psx_event_step_conservative_env_init(void);
 #include "overlay_backend.h"
 #include "gpu.h"
 #include "present_ring.h"
@@ -4367,6 +4368,7 @@ int main(int argc, char** argv) {
     timers_init();
     interrupts_init();
     sio_init();
+    psx_event_step_conservative_env_init();
     /* Seed per-player device routing from the resolved [controller] config.
      * SDL controller handles are opened later (after SDL_Init); here we only
      * set the PSX-visible connection + pad type so the BIOS sees the right
@@ -4447,7 +4449,24 @@ int main(int argc, char** argv) {
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_init(debug_port);
 #else
-    (void)debug_port;
+    /* Observability without perturbation: debug_server.c is compiled into
+     * EVERY build (its per-instruction recorders no-op under
+     * PSX_NO_DEBUG_TOOLS and the emu-thread pump sites early-out on a null
+     * check), so the production hot path is byte-identical whether or not
+     * the LISTENER runs. PSX_DEBUG_SERVER=1 opts the listener in so
+     * measurement runs (screenshots / status JSON / input injection) observe
+     * the REAL production behavior instead of an instrumented build whose
+     * shifted IRQ-delivery sites diverge from it (the Tomba 2 frame-1385
+     * family). Releases never set it: no port is ever opened. */
+    { const char *dbg_srv = std::getenv("PSX_DEBUG_SERVER");
+      if (dbg_srv && dbg_srv[0] == '1') {
+          std::fprintf(stdout,
+              "psxrecomp: debug server OPT-IN (PSX_DEBUG_SERVER=1), port %d\n",
+              debug_port);
+          debug_server_init(debug_port);
+      } else {
+          (void)debug_port;
+      } }
 #endif
 #ifdef PSX_COSIM
     cosim_init();  /* first-divergence oracle server */

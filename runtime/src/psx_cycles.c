@@ -40,6 +40,15 @@ static uint32_t s_pc_sample_throttle = 0;
  * real fix is a due-cycle event scheduler (run-to-next-event), not this. */
 int g_event_step_conservative = 0;
 
+/* Env opt-in (PSX_EVENT_STEP_CONSERVATIVE=1) so the diagnostic is reachable in
+ * production builds too, where the TCP setter doesn't exist — the determinism
+ * A/B ("do the fast-limit and conservative paths present the same guest event
+ * timeline?") needs the production binary to run BOTH ways. */
+void psx_event_step_conservative_env_init(void) {
+    const char *e = getenv("PSX_EVENT_STEP_CONSERVATIVE");
+    if (e && e[0] == '1') g_event_step_conservative = 1;
+}
+
 static void advance_devices(uint32_t c) {
     psx_cycle_count += (uint64_t)c;
     sio_advance(c);
