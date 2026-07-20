@@ -358,6 +358,28 @@ void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites) {
 int psx_ws_is_cull_vxrange_site(uint32_t pc) {
     return ws_explicit_site(ws_explicit_vxrange_sites, ws_explicit_vxrange_n, pc);
 }
+static uint32_t ws_explicit_depth_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_depth_n = 0;
+void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_depth_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_depth_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_depth_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_depth_sites, ws_explicit_depth_n, pc);
+}
+int32_t psx_ws_depth_bound(int32_t imm) {
+    if (psx_ws_x_margin() <= 0) return imm;
+    int64_t numerator = (int64_t)imm * 3 * ws_cfg_num;
+    int64_t denominator = 4 * ws_cfg_den;
+    if (denominator <= 0) return imm;
+    int64_t result = numerator >= 0
+        ? (numerator + denominator / 2) / denominator
+        : -((-numerator + denominator / 2) / denominator);
+    return (int32_t)result;
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;

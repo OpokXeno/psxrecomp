@@ -229,6 +229,9 @@ uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
 int32_t psx_ws_player_x_bound(int32_t vanilla) {
     return g_cbs.ws_player_x_bound ? g_cbs.ws_player_x_bound(vanilla) : vanilla;
 }
+int32_t psx_ws_depth_bound(int32_t imm) {
+    return g_cbs.ws_depth_bound ? g_cbs.ws_depth_bound(imm) : imm;
+}
 /* Sub-pixel GTE precision-store tracker (ABI v14). The emitter emits a direct
  * gte_precision_store_word() call for every swc2 (GTE store-word), including in
  * overlay-resident code, so the DLL must define it or the shard fails to link
