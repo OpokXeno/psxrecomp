@@ -99,6 +99,7 @@ int      overlay_loader_range_link_count(void);
 int      overlay_loader_range_index_overflow(void);
 int      overlay_loader_lazy_manifest_count(void);
 int      overlay_loader_lazy_manifest_overflow(void);
+uint64_t overlay_loader_candidate_overflow(void);
 int      overlay_loader_dump_lazy_at(uint32_t addr, char *out, int cap);
 
 #ifdef __cplusplus

@@ -88,7 +88,12 @@ typedef struct {
  * kept) and never executes native live. */
 #define OVERLAY_DIFF_BUDGET 32u
 
-#define CAND_CAP   16384
+/* MMX6's clean play-free cache now carries 17,506 on-disk manifest identities
+ * across observed byte variants, above the old 16,384 lifetime ceiling. Lazy
+ * loading means this is a potential long-session population, not proof that one
+ * observed run loaded all of them; every encountered variant does remain loaded.
+ * Keep enough headroom that coverage cannot silently become interpreter-only. */
+#define CAND_CAP   32768
 static Candidate s_cand[CAND_CAP];
 static int       s_cand_n = 0;
 
@@ -151,7 +156,7 @@ int g_psx_cps_mode = 0;
 
 /* Open-addressed index: phys entry addr -> head candidate index (-1 sentinel
  * stored as chain terminator on each Candidate). addr 0 = empty slot. */
-#define IDX_CAP  32768u
+#define IDX_CAP  (CAND_CAP * 2u)
 #define IDX_MASK (IDX_CAP - 1u)
 typedef struct { uint32_t addr; int head; } IdxSlot;
 static IdxSlot s_idx[IDX_CAP];
@@ -399,6 +404,7 @@ static uint64_t s_diffgate_interp = 0;  /* CPS interior re-entries sent to the  
                                         /* still inside the diff verify budget  */
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
+static uint64_t s_cand_overflow  = 0;   /* registrations dropped at CAND_CAP  */
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
@@ -614,8 +620,11 @@ static ManFn *man_find(ManFn *arr, int n, uint32_t entry) {
 /* ---- Candidate registration -------------------------------------------- */
 
 static void loader_log(const char *fmt, ...);   /* defined below */
-static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
-    if (s_cand_n >= CAND_CAP) return;
+static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
+    if (s_cand_n >= CAND_CAP) {
+        s_cand_overflow++;
+        return 0;
+    }
     int idx = s_cand_n++;
     Candidate *c = &s_cand[idx];
     c->addr    = phys;
@@ -653,6 +662,7 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     /* (sljit removed 2026-07-15: the gcc-DLL-obsoletes-older-sljit-shard block
      * lived here. With no sljit shards ever registered (dll == -1), there is
      * nothing to obsolete; the normal content-keyed chain dispatch stands.) */
+    return 1;
 }
 
 /* (sljit removed 2026-07-15: register_sljit_candidate, the JIT-on-miss memo,
@@ -691,10 +701,40 @@ typedef struct {
     int func_count;
     int indexed_func_count;
     int resident;
+    int capacity_suppressed;
     char path[768];
 } CacheEntry;
 static CacheEntry s_cache_idx[CACHE_IDX_CAP];
 static int        s_cache_idx_count = 0;
+static int        s_capacity_warm_dropped = 0;
+static void overlay_image_warm_drop_all(void);
+
+/* Candidates are process-lifetime objects, so reaching CAND_CAP is permanent.
+ * Suppress each not-yet-loaded bundle once instead of repeatedly mapping and
+ * unmapping it on every dispatch miss. The durable overflow count includes the
+ * manifest identities that this short-circuit prevents from registering. */
+static int cache_entry_suppress_at_capacity(int ci) {
+    if (ci < 0 || ci >= s_cache_idx_count) return 0;
+    CacheEntry *e = &s_cache_idx[ci];
+    if (e->capacity_suppressed) return 1;
+    if (s_cand_n < CAND_CAP) return 0;
+    if (!s_capacity_warm_dropped) {
+        /* No further DLL can ever register in this process. Release every
+         * speculative image-map reference, including bundles never dispatched. */
+        overlay_image_warm_drop_all();
+        s_capacity_warm_dropped = 1;
+    }
+    e->capacity_suppressed = 1;
+    uint64_t dropped = (uint64_t)(e->indexed_func_count > 0
+        ? e->indexed_func_count : e->func_count);
+    if (dropped == 0) dropped = 1;
+    s_cand_overflow += dropped;
+    loader_log("*** CANDIDATE TABLE FULL (%d): suppressing %s (%llu manifest "
+               "candidate(s)); native coverage is falling back to the "
+               "interpreter. Raise CAND_CAP.", CAND_CAP, e->path,
+               (unsigned long long)dropped);
+    return 1;
+}
 
 #ifdef _WIN32
 /* Image-only, bounded mapping for small recovery/fragment DLLs. Windows can
@@ -765,7 +805,10 @@ static void overlay_image_warm_init(void) {
 }
 
 static void overlay_image_warm_queue(const int *indices, int count) {
-    if (!s_image_warm_enabled || count <= 0) return;
+    /* Candidate storage is process-lifetime. Once full, no warmed image can
+     * ever be registered, including a queue attempted later during init. */
+    if (!s_image_warm_enabled || s_capacity_warm_dropped ||
+        s_cand_n >= CAND_CAP || count <= 0) return;
     size_t bytes = sizeof(ImageWarmBatch) +
                    (size_t)(count - 1) * sizeof(ImageWarmJob);
     ImageWarmBatch *batch = (ImageWarmBatch *)malloc(bytes);
@@ -808,6 +851,12 @@ static void overlay_image_warm_release(int ci) {
     InterlockedExchange(&s_image_warm[ci].state, 0);
     if (h) FreeLibrary(h); /* load_overlay_dll retained its own reference */
 }
+static void overlay_image_warm_drop_all(void) {
+    for (int ci = 0; ci < s_cache_idx_count; ci++) {
+        overlay_image_warm_cancel(ci);
+        overlay_image_warm_release(ci);
+    }
+}
 #else
 long g_overlay_image_warm_loaded = 0;
 long g_overlay_image_warm_pending = 0;
@@ -816,6 +865,7 @@ static void overlay_image_warm_queue(const int *indices, int count)
     { (void)indices; (void)count; }
 static void overlay_image_warm_cancel(int ci) { (void)ci; }
 static void overlay_image_warm_release(int ci) { (void)ci; }
+static void overlay_image_warm_drop_all(void) {}
 #endif
 
 static void overlay_image_warm_seed_boot_text(void);
@@ -825,7 +875,7 @@ static void overlay_image_warm_seed_boot_text(void);
  * variant. This is the scalable alternative to trial-loading hundreds of DLLs
  * that share one reused RAM region. */
 #define LAZY_MAN_CAP (CAND_CAP * 2)
-#define LAZY_ENTRY_CAP 32768u
+#define LAZY_ENTRY_CAP (CAND_CAP * 2u)
 #define LAZY_ENTRY_MASK (LAZY_ENTRY_CAP - 1u)
 #define LAZY_RANGE_LINK_CAP (LAZY_MAN_CAP * 8)
 typedef struct {
@@ -1022,6 +1072,7 @@ static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
     e->func_count = 0;
     e->indexed_func_count = 0;
     e->resident = cache_path_is_bios_resident(file->path);
+    e->capacity_suppressed = 0;
     snprintf(e->path, sizeof(e->path), "%s", file->path);
     return 0;
 }
@@ -1059,6 +1110,7 @@ static void scan_one_cache_dir(const char *dir) {
                    (uint64_t)fd.ftLastWriteTime.dwLowDateTime;
         e->func_count = 0;
         e->indexed_func_count = 0;
+        e->capacity_suppressed = 0;
         snprintf(e->path, sizeof(e->path), "%s", full);
         e->resident = cache_path_is_bios_resident(full);
     } while (FindNextFileA(h, &fd));
@@ -1716,6 +1768,7 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     DWORD *funcs    = (DWORD *)(base + exp->AddressOfFunctions);
 
     int registered = 0;
+    uint64_t overflow_before = s_cand_overflow;
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char *name = (const char *)(base + names[i]);
         if (strncmp(name, "func_", 5) != 0) continue;
@@ -1731,11 +1784,24 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
          * the interpreter rather than registered with a guessed extent. */
         ManFn *m = man_find(man, man_n, addr);
         if (!m || m->n == 0) { s_no_manifest++; continue; }
-        cand_register(addr & 0x1FFFFFFFu, fn, m, dll);
-        registered++;
+        registered += cand_register(addr & 0x1FFFFFFFu, fn, m, dll);
     }
-    loader_log("loaded %s -> %d candidates (%u no-manifest)",
-               dll_path, registered, s_no_manifest);
+    if (s_cand_overflow != overflow_before)
+        loader_log("*** CANDIDATE TABLE FULL (%d): loaded %s -> %d registered, "
+                   "%llu dropped; native coverage is falling back to the "
+                   "interpreter. Raise CAND_CAP.", CAND_CAP, dll_path,
+                   registered,
+                   (unsigned long long)(s_cand_overflow - overflow_before));
+    else
+        loader_log("loaded %s -> %d candidates (%u no-manifest)",
+                   dll_path, registered, s_no_manifest);
+    if (registered == 0) {
+        /* load_one_dll deliberately leaves a zero-candidate path retryable.  Do
+         * not leak a LoadLibrary reference on every retry after CAND_CAP is
+         * exhausted (or when every export lacks a usable manifest record). */
+        s_dll_flush[dll] = NULL;
+        FreeLibrary(h);
+    }
     return registered;
 }
 #else
@@ -1790,15 +1856,22 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
      * callable entries. Missing symbols stay interpreted rather than acquiring
      * a guessed extent. */
     int registered = 0;
+    uint64_t overflow_before = s_cand_overflow;
     for (int i = 0; i < man_n; i++) {
         ManFn *m = &man[i];
         if (m->entry == 0 || m->n == 0) continue;
         OverlayFn fn = (OverlayFn)psx_overlay_posix_library_entry(h, m->entry);
         if (!fn) continue;
-        cand_register(m->entry & 0x1FFFFFFFu, fn, m, dll);
-        registered++;
+        registered += cand_register(m->entry & 0x1FFFFFFFu, fn, m, dll);
     }
-    loader_log("loaded %s -> %d manifest candidates", dll_path, registered);
+    if (s_cand_overflow != overflow_before)
+        loader_log("*** CANDIDATE TABLE FULL (%d): loaded %s -> %d registered, "
+                   "%llu dropped; native coverage is falling back to the "
+                   "interpreter. Raise CAND_CAP.", CAND_CAP, dll_path,
+                   registered,
+                   (unsigned long long)(s_cand_overflow - overflow_before));
+    else
+        loader_log("loaded %s -> %d manifest candidates", dll_path, registered);
     if (registered == 0) {
         s_dll_flush[dll] = NULL;
         psx_overlay_posix_library_close(h);
@@ -1821,8 +1894,9 @@ static int load_bios_resident_shards(void) {
         CacheEntry *e = &s_cache_idx[i];
         if (!e->resident || e->func_count <= 0 ||
             e->indexed_func_count != e->func_count ||
-            dll_already_loaded(e->path))
+            e->capacity_suppressed || dll_already_loaded(e->path))
             continue;
+        if (cache_entry_suppress_at_capacity(i)) continue;
         int loaded = load_one_dll(e->path);
         if (loaded > 0) { bundles++; functions += loaded; }
     }
@@ -2003,6 +2077,14 @@ static int dll_already_loaded(const char *path) {
 }
 
 static int load_one_dll(const char *dll_path) {
+    /* Central guard as well as the lazy/resident caller checks: no path may
+     * reach LoadLibrary/dlopen after the permanent process-lifetime cap fills. */
+    for (int ci = 0; ci < s_cache_idx_count; ci++) {
+        if (strcmp(s_cache_idx[ci].path, dll_path) == 0) {
+            if (cache_entry_suppress_at_capacity(ci)) return 0;
+            break;
+        }
+    }
 #ifdef _WIN32
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);
@@ -2129,6 +2211,7 @@ static int lazy_is_loadable(int li, uint32_t region_start, uint32_t phys) {
     int ci = lm->cache_idx;
     if (ci < 0 || ci >= s_cache_idx_count) return 0;
     return s_cache_idx[ci].region_start == region_start &&
+        !s_cache_idx[ci].capacity_suppressed &&
         !dll_already_loaded(s_cache_idx[ci].path) &&
         lazy_man_contains(&lm->fn, phys) && lazy_man_matches(lm);
 }
@@ -2147,6 +2230,7 @@ static int lazy_load_selected(int li) {
     if (li < 0 || li >= s_lazy_man_n) return 0;
     int ci = s_lazy_man[li].cache_idx;
     if (ci < 0 || ci >= s_cache_idx_count ||
+        s_cache_idx[ci].capacity_suppressed ||
         dll_already_loaded(s_cache_idx[ci].path) ||
         s_cache_idx[ci].func_count <= 0) return 0;
     /* If proactive warming has not reached this fragment yet, prefer the
@@ -2757,6 +2841,7 @@ int overlay_loader_range_link_count(void) { return s_range_link_n; }
 int overlay_loader_range_index_overflow(void) { return s_range_index_overflow; }
 int overlay_loader_lazy_manifest_count(void) { return s_lazy_man_n; }
 int overlay_loader_lazy_manifest_overflow(void) { return s_lazy_man_overflow; }
+uint64_t overlay_loader_candidate_overflow(void) { return s_cand_overflow; }
 
 /* (sljit removed 2026-07-15: overlay_loader_sljit_obsoleted and the
  * overlay_loader_sljit_probe one-shot JIT helper lived here.) */
