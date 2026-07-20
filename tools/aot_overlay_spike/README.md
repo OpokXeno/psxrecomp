@@ -110,12 +110,41 @@ When rebuilding identical bytes, prior overlapping alias groups are retained as
 non-root bodies, so stronger new roots add coverage without displacing already
 compiled indirect entries.
 
-Shard publication counts manifest rows rather than deduplicated identities:
-every DLL `F` record consumes one runtime candidate slot. A shared cache-namespace
-lock makes the projected `existing - replaced + staged` count atomic across
-concurrent GCC/TCC publishers, using the same capacity literal as the runtime.
-Capacity rejection is a safe interpreter fallback and never overwrites the
-canonical pair.
+Shard publication counts every `F` candidate from one representative of each
+distinct complete generated pair inside one compiler tier. A pair must have the
+same `P` identifier, the same normalized provenance class (unmarked authority,
+`hosted-v1`, or `orphan-v1`), and exact ordered physical-address-normalized `F`/`R`
+semantics. Legacy/no-`P`, unknown, malformed, cross-tier, or partially different
+pairs remain distinct. The runtime fully preflights each later physical twin, then
+closes its redundant handle before initialization and reuses the canonical
+pair's candidates and cycle-flush owner. The runtime exposes the number of
+validated physical twins as `overlay_loader_status.pair_aliases`. CRC dispatch
+validation is unchanged.
+
+Raw manifest rows, per-`F` unique 4 KiB range-page links, and selected physical
+cache files do not deduplicate. A shared cache-namespace lock makes the projected
+`existing - replaced + staged` usage atomic across concurrent GCC/TCC publishers
+for all four independent bounds: candidates at
+`PSX_OVERLAY_CANDIDATE_CAP`, raw lazy manifest rows at twice that cap, lazy
+range-page links at eight times the raw-row cap, and the 4096-file cache index.
+A replacement is legal in an already-over-budget namespace only when it does not
+grow that budget and crosses no other bound. Capacity rejection is a safe
+interpreter fallback and never overwrites the canonical pair.
+Repeated near-cap projections memoize only successful validation of unchanged
+physical pairs, using the expected ABI and replacement-sensitive identities of
+both the DLL and manifest. A changed pair revalidates, while negative DLL-loader
+results always retry because they may be transient. Transaction recovery and the
+locked authoritative projection still run for every publication. Generated
+manifest metadata also gets a conservative locked preflight before GCC/TCC, so
+an already-impossible near-cap repair is rejected without paying native-link
+cost; every admitted result is reprojected after linking before publication.
+An over-cap snapshot is also retained as a rejection-only witness: a possible
+admission always rescans under lock, while stale deletion can at worst postpone
+optional coverage to the next command.
+`runtime/tests/test_overlay_pair_dedup_runtime.py` compiles the real loader at a
+four-slot test cap plus real shared-library fixtures, and behaviorally covers an
+exact alias at capacity, handle/init/flush ownership, staged rescan idempotence,
+manifest/provenance/tier negatives, and partial-export non-authority.
 Dynamic compilation serializes canonically sorted recipes under a whole-command
 namespace lock so a full cache has the same accepted subset on every clean run.
 GCC-first basename shadowing matches the loader, and non-growing replacements
@@ -409,8 +438,9 @@ BIOS shard brings combined interval containment to 823/823. Interval containment
 remains potential compiled-byte ownership, not proof of exact native dispatch at
 an interior resume PC.
 
-MMX6's full clean cache contains 17,506 manifest identities, above the runtime's
-old 16,384 process-lifetime candidate ceiling. The candidate table is therefore
+MMX6's full clean cache contained 17,506 raw manifest identities. Before
+whole-pair deduplication, that physical-row total exceeded the runtime's old
+16,384 process-lifetime candidate ceiling and motivated raising the table to
 32,768, with all dependent hash/manifest/range tables scaled consistently. A
 durable `candidate_overflow` status counter, loud loader message, and one-shot
 per-bundle suppression make any future exhaustion explicit and fail closed to

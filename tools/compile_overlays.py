@@ -4029,6 +4029,25 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     final_out = os.path.abspath(out_dll)
     out_dir = os.path.dirname(final_out)
     os.makedirs(out_dir, exist_ok=True)
+    if func_ids is not None and (not func_ids or pair_id is None):
+        print('  COMPILE ERROR: paired shard requires non-empty ranges and pair ID')
+        return False
+    if func_ids is not None and candidate_cap is not None:
+        try:
+            capacity_error = preflight_shard_candidate_capacity(
+                final_out, func_ids, pair_id, manifest_provenance,
+                expected_existing_abi, candidate_cap)
+        except Exception as exc:
+            # A failed optimization must not replace the authoritative locked
+            # projection after linking.  Compile normally and let publication
+            # either admit or reject the staged pair.
+            print(f'  capacity preflight unavailable: {exc}')
+            capacity_error = None
+        if capacity_error is not None:
+            if publication_result is not None:
+                publication_result['capacity_error'] = capacity_error
+            print(f'  COMPILE SKIP (preflight): {capacity_error}')
+            return False
     suffix = os.path.splitext(final_out)[1] or overlay_ext()
     fd, staged = tempfile.mkstemp(
         prefix=f'.{os.path.basename(final_out)}.tmp.', suffix=suffix,
@@ -4049,9 +4068,6 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
             if publication_result is not None:
                 publication_result['published'] = True
             return True
-        if not func_ids or pair_id is None:
-            print('  COMPILE ERROR: paired shard requires non-empty ranges and pair ID')
-            return False
         write_overlay_ranges_from(
             func_ids, staged_ranges, pair_id, manifest_provenance)
         if not os.path.isfile(staged_ranges) or os.path.getsize(staged_ranges) == 0:
@@ -4230,33 +4246,221 @@ def cache_candidate_capacity_snapshot(
 def cache_candidate_capacity_full(dll_path: str, expected_abi: int | None,
                                   candidate_cap: int) -> tuple[bool, int]:
     """Read one serialized namespace inventory and report a saturated cache."""
-    total, _counts = cache_candidate_capacity_snapshot(dll_path, expected_abi)
-    return total >= candidate_cap, total
+    total, counts = cache_candidate_capacity_snapshot(dll_path, expected_abi)
+    return (total >= candidate_cap or
+            getattr(counts, 'raw_total', sum(counts.values())) >=
+            2 * candidate_cap or
+            getattr(counts, 'range_link_total', 0) >=
+            2 * candidate_cap * 8 or
+            getattr(counts, 'file_total', len(counts)) >=
+            RUNTIME_CACHE_FILE_CAP), total
 
 
 def candidate_capacity_saturated_in_tier(total: int, counts: dict,
                                          candidate_cap: int,
                                          cache_dir: str) -> bool:
-    """Whether every counted candidate belongs to one saturated active tier."""
+    """Whether one active tier has reached any physical/runtime capacity."""
     active = os.path.normcase(os.path.abspath(cache_dir))
-    return (total >= candidate_cap and bool(counts) and all(
+    saturated = (total >= candidate_cap or
+                 getattr(counts, 'raw_total', sum(counts.values())) >=
+                 2 * candidate_cap or
+                 getattr(counts, 'range_link_total', 0) >=
+                 2 * candidate_cap * 8 or
+                 getattr(counts, 'file_total', len(counts)) >=
+                 RUNTIME_CACHE_FILE_CAP)
+    return (saturated and bool(counts) and all(
         os.path.normcase(os.path.abspath(os.path.dirname(path))) == active
         for path in counts
     ))
 
 
+class CandidateInventory(dict):
+    """Per-selected-path counts plus the metadata needed for safe projection.
+
+    Keep the historical ``path -> F count`` mapping API: several fixed-point
+    callers use its keys to decide which compiler tier owns the inventory.  The
+    extra fields distinguish the deduplicated process-lifetime candidate cost
+    from physical F-row, range-link, and file costs, none of which may dedup.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.identities = {}
+        self.raw_counts = {}
+        self.range_link_counts = {}
+        self.raw_total = 0
+        self.range_link_total = 0
+        self.file_total = 0
+
+
+RUNTIME_CACHE_FILE_CAP = 4096
+
+
+def _runtime_manifest_range_link_count(funcs: list) -> int:
+    """Mirror LazyMan's unique 4 KiB RAM-page links for parsed F records."""
+    page_count = PSX_RAM_SIZE // 4096
+    total = 0
+    for _entry, _crc, ranges in funcs:
+        seen_pages = set()
+        for start, length in ranges:
+            lo = start & 0x1FFFFFFF
+            hi = lo + length - 1
+            p0, p1 = lo >> 12, hi >> 12
+            if p0 >= page_count:
+                continue
+            p1 = min(p1, page_count - 1)
+            seen_pages.update(range(p0, p1 + 1))
+        total += len(seen_pages)
+    return total
+
+
+def _normalized_runtime_manifest_identity(manifest: str, pair_id: int | None,
+                                          funcs: list):
+    """Return a conservative whole-pair identity, or ``None`` if ambiguous.
+
+    Runtime address aliases are normalized, but F and R ordering is retained:
+    range order participates in the guarded CRC calculation.  Compiler-owned
+    provenance is part of the identity.  Unknown/malformed provenance and
+    legacy manifests without P remain unique rather than being guessed equal.
+    """
+    if pair_id is None:
+        return None
+    provenance = manifest_provenance(manifest)
+    if (manifest_declares_supplemental_provenance(manifest) and
+            provenance is None):
+        return None
+    normalized_funcs = tuple(
+        (entry & 0x1FFFFFFF, crc,
+         tuple((start & 0x1FFFFFFF, length) for start, length in ranges))
+        for entry, crc, ranges in funcs
+    )
+    return pair_id, provenance, normalized_funcs
+
+
+def _candidate_group_identity(cache_dir: str, manifest_identity):
+    if manifest_identity is None:
+        return None
+    return os.path.normcase(os.path.abspath(cache_dir)), manifest_identity
+
+
+_candidate_validation_cache_lock = threading.Lock()
+_candidate_abi_cache = {}
+_candidate_record_cache = {}
+_candidate_rejection_witness_cache = {}
+
+
+def _candidate_file_fingerprint(path: str):
+    """Return the replacement-sensitive identity of one cache artifact.
+
+    Cache publication uses atomic replacement, so a new pair receives a new
+    file identity even when its size and timestamps happen to match.  Keep the
+    timestamps as defense for in-place test/repair writes.  Callers still scan
+    the namespace and perform the authoritative capacity projection every time;
+    this cache only avoids repeatedly mapping unchanged DLLs and reparsing their
+    unchanged manifests near the candidate ceiling.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
+            getattr(stat, 'st_ctime_ns', None))
+
+
+def _candidate_cached_abi_matches(dll: str, expected_abi: int) -> bool:
+    path = os.path.normcase(os.path.abspath(dll))
+    fingerprint = (
+        expected_abi, _dll_abi_matches,
+        _candidate_file_fingerprint(dll),
+    )
+    with _candidate_validation_cache_lock:
+        cached = _candidate_abi_cache.get(path)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+    matched = _dll_abi_matches(dll, expected_abi)
+    # Do not memoize across an uncooperative in-place writer. Cooperating cache
+    # publishers are already excluded by the namespace lock held by callers.
+    if matched and fingerprint[2] == _candidate_file_fingerprint(dll):
+        with _candidate_validation_cache_lock:
+            _candidate_abi_cache[path] = (fingerprint, matched)
+    return matched
+
+
+def _load_candidate_inventory_record(dll: str,
+                                     expected_abi: int | None):
+    """Return valid rows, identity, raw F count, and raw range-link count."""
+    ranges_path = os.path.splitext(dll)[0] + '.ranges'
+    path = os.path.normcase(os.path.abspath(dll))
+
+    def fingerprint():
+        return (
+            expected_abi, _dll_runtime_exports_match,
+            _candidate_file_fingerprint(dll),
+            _candidate_file_fingerprint(ranges_path),
+        )
+
+    # A positive cached record is immutable under the cooperating publisher's
+    # atomic-replacement contract. Double-stat it before reuse; a changed or
+    # transaction-hidden artifact falls through to locked recovery below.
+    observed = fingerprint()
+    with _candidate_validation_cache_lock:
+        cached = _candidate_record_cache.get(path)
+    if (cached is not None and cached[0] == observed and
+            observed == fingerprint()):
+        return cached[1]
+    try:
+        with _shard_pair_lock(dll):
+            _recover_shard_pair_locked(dll)
+            if (not os.path.isfile(dll) or os.path.getsize(dll) == 0 or
+                    not os.path.isfile(ranges_path) or
+                    os.path.getsize(ranges_path) == 0):
+                return [], None, 0, 0
+            observed = fingerprint()
+            with _candidate_validation_cache_lock:
+                cached = _candidate_record_cache.get(path)
+                if cached is not None and cached[0] == observed:
+                    return cached[1]
+            with open(ranges_path, encoding='ascii', newline='') as source:
+                manifest = source.read()
+            pair_id, funcs = parse_runtime_shard_manifest(
+                manifest, require_pair=False)
+            raw_count = len(funcs)
+            range_link_count = _runtime_manifest_range_link_count(funcs)
+            if (not funcs or not _dll_runtime_exports_match(
+                    dll, expected_abi, pair_id,
+                    {entry for entry, _crc, _ranges in funcs})):
+                record = ([], None, raw_count, range_link_count)
+            else:
+                identity = _normalized_runtime_manifest_identity(
+                    manifest, pair_id, funcs)
+                record = (
+                    funcs,
+                    _candidate_group_identity(os.path.dirname(dll), identity),
+                    raw_count, range_link_count)
+            stable = observed == fingerprint()
+            # Boolean DLL validation currently conflates deterministic export
+            # mismatch with transient LoadLibrary failure. Cache successes only
+            # so a one-off loader failure cannot suppress a pair indefinitely.
+            if stable and record[0]:
+                with _candidate_validation_cache_lock:
+                    _candidate_record_cache[path] = (observed, record)
+            return record
+    except (OSError, UnicodeError):
+        return [], None, 0, 0
+
+
 def cache_candidate_inventory(cache_dirs: list[str],
                               expected_abi: int | None) -> tuple[int, dict]:
-    """Count every runtime-valid manifest F record without identity dedup.
+    """Inventory runtime-selected pairs with conservative whole-pair dedup.
 
-    Equal entries in different DLLs consume distinct ``Candidate`` slots.  The
-    The per-path map includes the runtime-selected higher-tier path (with count
-    zero when invalid) so replacement projection can mirror basename shadowing.
+    Only a non-legacy P identity with the exact normalized manifest semantics
+    and provenance may share candidate cost, and only inside one compiler-tier
+    leaf. Raw manifest rows, per-F page links, and files remain undeduped.
     """
     ext = overlay_ext()
     canonical = re.compile(
         rf'^[0-9A-Fa-f]{{8}}_[0-9A-Fa-f]{{8}}{re.escape(ext)}$')
-    counts = {}
+    counts = CandidateInventory()
     seen_basenames = set()
     ordered_dirs = []
     for path in cache_dirs:
@@ -4273,7 +4477,7 @@ def cache_candidate_inventory(cache_dirs: list[str],
                 continue
             dll = os.path.abspath(os.path.join(cache_dir, name))
             if (expected_abi is not None and
-                    not _dll_abi_matches(dll, expected_abi)):
+                    not _candidate_cached_abi_matches(dll, expected_abi)):
                 # Runtime's ABI preflight removes this path from the index
                 # before scanning the next compiler tier, so it cannot shadow
                 # a valid lower-tier basename.
@@ -4285,9 +4489,24 @@ def cache_candidate_inventory(cache_dirs: list[str],
             # basename even when the selected higher-tier pair later fails ABI
             # validation. Mirror that exact candidate population here.
             seen_basenames.add(basename)
-            funcs = load_shard_func_ids(dll, expected_abi)
+            funcs, identity, raw_count, range_link_count = \
+                _load_candidate_inventory_record(dll, expected_abi)
             counts[dll] = len(funcs)
-    return sum(counts.values()), counts
+            counts.identities[dll] = identity
+            counts.raw_counts[dll] = raw_count
+            counts.range_link_counts[dll] = range_link_count
+    counts.raw_total = sum(counts.raw_counts.values())
+    counts.range_link_total = sum(counts.range_link_counts.values())
+    counts.file_total = len(counts)
+    seen_identities = set()
+    total = 0
+    for path, count in counts.items():
+        identity = counts.identities[path]
+        if identity is None or identity not in seen_identities:
+            total += count
+        if identity is not None:
+            seen_identities.add(identity)
+    return total, counts
 
 
 def recover_candidate_namespace(cache_dirs: list[str]) -> None:
@@ -4309,10 +4528,12 @@ def recover_candidate_namespace(cache_dirs: list[str]) -> None:
                 recover_shard_pair(os.path.join(cache_dir, dll_name))
 
 
-def projected_cache_candidate_count(total: int, counts: dict,
+def _projected_cache_capacity_usage(total: int, counts: dict,
                                     cache_dirs: list[str], final_dll: str,
-                                    staged_count: int) -> int:
-    """Model runtime gcc-first basename selection after one publication."""
+                                    staged_count: int, staged_identity=None,
+                                    staged_range_links: int = 0
+                                    ) -> tuple[int, int, int, int]:
+    """Model candidate, lazy-F, range-link, and file usage."""
     final_dll = os.path.abspath(final_dll)
     final_dir = os.path.normcase(os.path.dirname(final_dll))
     ranks = {
@@ -4325,15 +4546,141 @@ def projected_cache_candidate_count(total: int, counts: dict,
         path for path in counts
         if os.path.normcase(os.path.basename(path)) == basename
     ), None)
-    if selected_path is None:
-        return total + staged_count
-    selected_rank = ranks.get(
-        os.path.normcase(os.path.dirname(selected_path)), 0)
-    if final_rank <= selected_rank:
-        return total - counts[selected_path] + staged_count
-    # A lower-tier publication is invisible while a same-basename higher tier
-    # exists, including a stale/invalid higher pair that runtime indexed first.
-    return total
+    records = [(path, count,
+                getattr(counts, 'identities', {}).get(path),
+                getattr(counts, 'raw_counts', {}).get(path, count),
+                getattr(counts, 'range_link_counts', {}).get(path, 0))
+               for path, count in counts.items()]
+    if selected_path is not None:
+        selected_rank = ranks.get(
+            os.path.normcase(os.path.dirname(selected_path)), 0)
+        if final_rank > selected_rank:
+            # A lower-tier publication is invisible while a same-basename
+            # higher tier exists.
+            return (total, getattr(counts, 'raw_total', sum(counts.values())),
+                    getattr(counts, 'range_link_total', 0),
+                    getattr(counts, 'file_total', len(counts)))
+        records = [record for record in records if record[0] != selected_path]
+    group_identity = _candidate_group_identity(final_dir, staged_identity)
+    records.append((final_dll, staged_count, group_identity, staged_count,
+                    staged_range_links))
+
+    projected = 0
+    seen_identities = set()
+    for _path, count, identity, _raw_count, _range_links in records:
+        if identity is None or identity not in seen_identities:
+            projected += count
+        if identity is not None:
+            seen_identities.add(identity)
+    return (projected,
+            sum(raw_count for _path, _count, _identity, raw_count, _links
+                in records),
+            sum(links for _path, _count, _identity, _raw, links in records),
+            len(records))
+
+
+def projected_cache_candidate_usage(total: int, counts: dict,
+                                    cache_dirs: list[str], final_dll: str,
+                                    staged_count: int,
+                                    staged_identity=None) -> tuple[int, int, int]:
+    """Compatibility API for candidate, lazy-F, and file usage."""
+    projected, raw, _range_links, files = _projected_cache_capacity_usage(
+        total, counts, cache_dirs, final_dll, staged_count, staged_identity)
+    return projected, raw, files
+
+
+def projected_cache_candidate_count(total: int, counts: dict,
+                                    cache_dirs: list[str], final_dll: str,
+                                    staged_count: int,
+                                    staged_identity=None) -> int:
+    """Compatibility wrapper returning process-lifetime candidate usage."""
+    return projected_cache_candidate_usage(
+        total, counts, cache_dirs, final_dll, staged_count,
+        staged_identity)[0]
+
+
+def _candidate_capacity_projection_error(
+        total: int, counts: dict, projected: int, projected_raw: int,
+        projected_range_links: int, projected_files: int,
+        staged_count: int, candidate_cap: int) -> str | None:
+    """Return the same fail-closed capacity verdict before or after linking."""
+    raw_total = getattr(counts, 'raw_total', sum(counts.values()))
+    range_link_total = getattr(counts, 'range_link_total', 0)
+    file_total = getattr(counts, 'file_total', len(counts))
+    if projected > candidate_cap and projected > total:
+        return ('overlay candidate capacity would be exceeded: '
+                f'{total} existing -> {projected} projected with '
+                f'{staged_count} staged > {candidate_cap}; canonical '
+                'pair preserved')
+    if projected_raw > 2 * candidate_cap and projected_raw > raw_total:
+        return ('overlay lazy-manifest capacity would be exceeded: '
+                f'{raw_total} existing -> {projected_raw} projected > '
+                f'{2 * candidate_cap}; canonical pair preserved')
+    if (projected_range_links > 2 * candidate_cap * 8 and
+            projected_range_links > range_link_total):
+        return ('overlay lazy range-link capacity would be exceeded: '
+                f'{range_link_total} existing -> '
+                f'{projected_range_links} projected > '
+                f'{2 * candidate_cap * 8}; canonical pair preserved')
+    if (projected_files > RUNTIME_CACHE_FILE_CAP and
+            projected_files > file_total):
+        return ('overlay cache file capacity would be exceeded: '
+                f'{file_total} existing -> {projected_files} projected > '
+                f'{RUNTIME_CACHE_FILE_CAP}; canonical pair preserved')
+    return None
+
+
+def preflight_shard_candidate_capacity(
+        final_dll: str, func_ids: list, pair_id: int,
+        manifest_provenance: str | None, expected_abi: int | None,
+        candidate_cap: int) -> str | None:
+    """Reject an impossible publication before invoking the native linker.
+
+    The locked publication check remains authoritative.  This early check is
+    deliberately one-sided: a concurrent deletion after the snapshot can only
+    defer safe coverage until the next invocation, while an admitted shard is
+    still reprojected under the namespace lock after it has been compiled.
+    """
+    final_dll = os.path.abspath(final_dll)
+    capacity_lock, cache_dirs = _candidate_capacity_namespace(final_dll)
+    manifest = overlay_ranges_text(
+        func_ids, pair_id, manifest_provenance)
+    staged_identity = _normalized_runtime_manifest_identity(
+        manifest, pair_id, func_ids)
+    staged_range_links = _runtime_manifest_range_link_count(func_ids)
+    with _exclusive_file_lock(capacity_lock):
+        cache_dirs_key = tuple(
+            os.path.normcase(os.path.abspath(path)) for path in cache_dirs)
+        witness_key = (
+            os.path.normcase(os.path.abspath(capacity_lock)), cache_dirs_key,
+            expected_abi, candidate_cap, _dll_abi_matches,
+            _dll_runtime_exports_match,
+        )
+        with _candidate_validation_cache_lock:
+            witness = _candidate_rejection_witness_cache.get(witness_key)
+        if witness is not None:
+            witness_total, witness_counts = witness
+            witness_usage = _projected_cache_capacity_usage(
+                witness_total, witness_counts, cache_dirs, final_dll,
+                len(func_ids), staged_identity, staged_range_links)
+            witness_error = _candidate_capacity_projection_error(
+                witness_total, witness_counts, *witness_usage,
+                len(func_ids), candidate_cap)
+            if witness_error is not None:
+                # Reuse only a proof of impossibility. Added pairs make the
+                # bound stronger; deletion/replacement can merely defer safe
+                # optional coverage until the next command. An apparent
+                # admission always falls through to a fresh locked inventory.
+                return witness_error
+        recover_candidate_namespace(cache_dirs)
+        total, counts = cache_candidate_inventory(cache_dirs, expected_abi)
+        with _candidate_validation_cache_lock:
+            _candidate_rejection_witness_cache[witness_key] = (total, counts)
+        usage = _projected_cache_capacity_usage(
+            total, counts, cache_dirs, final_dll, len(func_ids),
+            staged_identity, staged_range_links)
+        return _candidate_capacity_projection_error(
+            total, counts, *usage, len(func_ids), candidate_cap)
 
 
 def _cleanup_old_pair_debris(dll_path: str) -> None:
@@ -4452,8 +4799,9 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
         if candidate_cap is not None:
             try:
                 with open(staged_ranges, encoding='ascii', newline='') as source:
-                    _staged_pair, staged_funcs = (
-                        parse_runtime_shard_manifest(source.read()))
+                    staged_manifest = source.read()
+                    staged_pair, staged_funcs = (
+                        parse_runtime_shard_manifest(staged_manifest))
             except (OSError, UnicodeError) as exc:
                 raise RuntimeError(
                     f'cannot read staged range manifest: {exc}') from exc
@@ -4464,20 +4812,25 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
             recover_candidate_namespace(cache_dirs)
             total, counts = cache_candidate_inventory(
                 cache_dirs, expected_existing_abi)
-            projected = projected_cache_candidate_count(
-                total, counts, cache_dirs, dll, staged_count)
+            staged_identity = _normalized_runtime_manifest_identity(
+                staged_manifest, staged_pair, staged_funcs)
+            staged_range_links = _runtime_manifest_range_link_count(staged_funcs)
+            (projected, projected_raw, projected_range_links,
+             projected_files) = _projected_cache_capacity_usage(
+                    total, counts, cache_dirs, dll, staged_count,
+                    staged_identity, staged_range_links)
         with _shard_pair_lock(dll):
             _recover_shard_pair_locked(dll)
             if (preserve_existing and _runtime_valid_shard_pair_locked(
                     dll, ranges, expected_existing_abi)):
                 return False
-            if (candidate_cap is not None and projected > candidate_cap and
-                    projected > total):
-                raise ShardCandidateCapacityError(
-                    'overlay candidate capacity would be exceeded: '
-                    f'{total} existing -> {projected} projected with '
-                    f'{staged_count} staged > {candidate_cap}; canonical '
-                    'pair preserved')
+            if candidate_cap is not None:
+                capacity_error = _candidate_capacity_projection_error(
+                    total, counts, projected, projected_raw,
+                    projected_range_links, projected_files, staged_count,
+                    candidate_cap)
+                if capacity_error is not None:
+                    raise ShardCandidateCapacityError(capacity_error)
             txn = {
                 'schema': 'psxrecomp shard pair transaction v1',
                 'token': token,

@@ -1515,7 +1515,7 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
 
 
 def check_candidate_capacity_publication():
-    """Compiler accounting must match the loader's per-manifest-row cost."""
+    """Candidate accounting dedups only exact, same-tier whole pairs."""
     original_exports = MOD._dll_runtime_exports_match
     original_abi = MOD._dll_abi_matches
     try:
@@ -1529,16 +1529,260 @@ def check_candidate_capacity_publication():
                 for index in range(count)
             ]
 
-        def pair(path, count, pair_id, base=LOAD):
+        def pair(path, count, pair_id, base=LOAD, provenance=None):
             pathlib.Path(path).write_bytes(b'DLL')
             pathlib.Path(path).with_suffix('.ranges').write_text(
-                MOD.overlay_ranges_text(funcs(count, base), pair_id))
+                MOD.overlay_ranges_text(
+                    funcs(count, base), pair_id, provenance))
+
+        def pair_records(path, records, pair_id, provenance=None):
+            pathlib.Path(path).write_bytes(b'DLL')
+            pathlib.Path(path).with_suffix('.ranges').write_text(
+                MOD.overlay_ranges_text(records, pair_id, provenance))
+
+        def staged_identity(path):
+            manifest = pathlib.Path(path).with_suffix('.ranges').read_text()
+            pair_id, manifest_funcs = MOD.parse_runtime_shard_manifest(
+                manifest, require_pair=False)
+            return MOD._normalized_runtime_manifest_identity(
+                manifest, pair_id, manifest_funcs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            duplicate = os.path.join(tmp, '00010000_00000002.dll')
+            pair(first, 2, 0x100)
+            pair(duplicate, 2, 0x100)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 2
+            assert counts == {first: 2, duplicate: 2}
+            assert counts.raw_total == 4 and counts.file_total == 2
+            assert counts.range_link_total == 4
+
+            # Same F rows with a distinct P are not the same compiled pair.
+            different_pair = os.path.join(tmp, '00010000_00000003.dll')
+            pair(different_pair, 2, 0x101)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 4
+
+            # Nor does P alone override an exact manifest mismatch.
+            different_manifest = os.path.join(tmp, '00010000_00000004.dll')
+            pair(different_manifest, 1, 0x100, LOAD + 0x40)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 5
+
+            # Provenance is safety-significant even when P/F/R match.
+            supplemental = os.path.join(tmp, '00010000_00000005.dll')
+            pair(supplemental, 2, 0x100,
+                 provenance=MOD.HOSTED_MANIFEST_PROVENANCE)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 7
+
+            # Legacy/no-P pairs remain unique.
+            legacy_a = os.path.join(tmp, '00010000_00000006.dll')
+            legacy_b = os.path.join(tmp, '00010000_00000007.dll')
+            pair(legacy_a, 1, None, LOAD + 0x80)
+            pair(legacy_b, 1, None, LOAD + 0x80)
+            assert MOD.cache_candidate_inventory([tmp], None)[0] == 9
+
+            # Directory enumeration and caller tier order cannot change the
+            # inventory or its deterministic representative ordering.
+            forward = MOD.cache_candidate_inventory([tmp, tmp], None)
+            reverse = MOD.cache_candidate_inventory([tmp], None)
+            assert forward[0] == reverse[0] == 9
+            assert list(forward[1]) == list(reverse[1]) == sorted(forward[1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid = os.path.join(tmp, '00010000_00000001.dll')
+            pair(invalid, 2, 0x180)
+            MOD._dll_runtime_exports_match = (
+                lambda _path, _abi, _pair, _entries: False)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 0 and counts[invalid] == 0
+            assert counts.raw_total == 2 and counts.file_total == 1
+            assert counts.range_link_total == 2
+            MOD._dll_runtime_exports_match = (
+                lambda _path, _abi, _pair, entries: bool(entries))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Repeated near-cap projections must not map and validate every
+            # unchanged DLL again. File identity, manifest identity, expected
+            # ABI, and validation callback changes each invalidate only the
+            # affected cached result.
+            calls = {'abi': 0, 'exports': 0}
+
+            def counted_abi(_path, _abi):
+                calls['abi'] += 1
+                return True
+
+            def counted_exports(_path, _abi, _pair, entries):
+                calls['exports'] += 1
+                return bool(entries)
+
+            MOD._dll_abi_matches = counted_abi
+            MOD._dll_runtime_exports_match = counted_exports
+            cached = os.path.join(tmp, '00010000_00000001.dll')
+            pair(cached, 2, 0x190)
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 2
+            assert calls == {'abi': 1, 'exports': 1}
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 2
+            assert calls == {'abi': 1, 'exports': 1}
+
+            manifest_path = pathlib.Path(cached).with_suffix('.ranges')
+            manifest_path.write_text(MOD.overlay_ranges_text(
+                funcs(2), 0x190, MOD.HOSTED_MANIFEST_PROVENANCE))
+            manifest_stat = manifest_path.stat()
+            os.utime(manifest_path, ns=(manifest_stat.st_atime_ns,
+                                       manifest_stat.st_mtime_ns + 1000000000))
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 2
+            assert calls == {'abi': 1, 'exports': 2}
+
+            dll_stat = os.stat(cached)
+            os.utime(cached, ns=(dll_stat.st_atime_ns,
+                                 dll_stat.st_mtime_ns + 1000000000))
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 2
+            assert calls == {'abi': 2, 'exports': 3}
+
+            # Atomic replacement must invalidate even when an adversarial
+            # publisher preserves the old sizes and mtimes: the file identity
+            # (and on Windows change time) still changes.
+            replacement = os.path.join(tmp, '.replacement.dll')
+            pair(replacement, 1, 0x192, LOAD + 0x100)
+            replacement_ranges = pathlib.Path(replacement).with_suffix(
+                '.ranges')
+            old_dll_stat = os.stat(cached)
+            old_ranges_stat = manifest_path.stat()
+            os.utime(replacement, ns=(old_dll_stat.st_atime_ns,
+                                      old_dll_stat.st_mtime_ns))
+            os.utime(replacement_ranges,
+                     ns=(old_ranges_stat.st_atime_ns,
+                         old_ranges_stat.st_mtime_ns))
+            os.replace(replacement, cached)
+            os.replace(replacement_ranges, manifest_path)
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 1
+            assert calls == {'abi': 3, 'exports': 4}
+            assert MOD.cache_candidate_inventory([tmp], 15)[0] == 1
+            assert calls == {'abi': 4, 'exports': 5}
+            MOD._dll_abi_matches = original_abi
+            MOD._dll_runtime_exports_match = (
+                lambda _path, _abi, _pair, entries: bool(entries))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A boolean validation failure may be a transient loader error, so
+            # neither ABI nor full-export negative results may be memoized.
+            calls = {'abi': 0, 'exports': 0}
+
+            def transient_abi(_path, _abi):
+                calls['abi'] += 1
+                return calls['abi'] > 1
+
+            def transient_exports(_path, _abi, _pair, entries):
+                calls['exports'] += 1
+                return bool(entries) and calls['exports'] > 1
+
+            transient = os.path.join(tmp, '00010000_00000001.dll')
+            pair(transient, 2, 0x191)
+            MOD._dll_abi_matches = transient_abi
+            MOD._dll_runtime_exports_match = transient_exports
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 0
+            assert calls == {'abi': 1, 'exports': 0}
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 0
+            assert calls == {'abi': 2, 'exports': 1}
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 2
+            assert calls == {'abi': 2, 'exports': 2}
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 2
+            assert calls == {'abi': 2, 'exports': 2}
+            MOD._dll_abi_matches = original_abi
+            MOD._dll_runtime_exports_match = (
+                lambda _path, _abi, _pair, entries: bool(entries))
 
         with tempfile.TemporaryDirectory() as tmp:
             first = os.path.join(tmp, '00010000_00000001.dll')
             second = os.path.join(tmp, '00010000_00000002.dll')
-            # Deliberately repeat the exact identity in two DLLs. Runtime
-            # registration consumes two Candidate slots, never one set member.
+            third = os.path.join(tmp, '00010000_00000003.dll')
+            pair(first, 2, 0x200)
+            pair(second, 2, 0x200)
+            pair(third, 2, 0x200)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 2 and counts.raw_total == 6
+
+            replacement = os.path.join(tmp, '.replacement.dll')
+            pair(replacement, 1, 0x201, LOAD + 0x40)
+            usage = MOD.projected_cache_candidate_usage(
+                total, counts, [tmp], first, 1,
+                staged_identity(replacement))
+            # Replacing one of three references keeps the old group's cost.
+            assert usage == (3, 5, 3)
+            same_usage = MOD.projected_cache_candidate_usage(
+                total, counts, [tmp], first, 2, staged_identity(second))
+            assert same_usage == (2, 6, 3)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            duplicate = os.path.join(tmp, '00010000_00000002.dll')
+            overlapping = [(
+                LOAD + 0x100, 0x500,
+                ((LOAD, 0x900), (LOAD + 0x800, 0x900)))
+            ]
+            pair_records(first, overlapping, 0x280)
+            pair_records(duplicate, overlapping, 0x280)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            # Each physical F touches pages 0 and 1. The overlapping page 0 is
+            # linked once per F, while the duplicate physical pair costs again.
+            assert total == 1 and counts.raw_total == 2
+            assert counts.range_link_counts == {first: 2, duplicate: 2}
+            assert counts.range_link_total == 4
+
+            replacement = os.path.join(tmp, '.range-replacement.dll')
+            replacement_records = [(
+                LOAD + 0x100, 0x501, ((LOAD + 0x100, 4),))]
+            pair_records(replacement, replacement_records, 0x281)
+            replacement_links = MOD._runtime_manifest_range_link_count(
+                replacement_records)
+            usage = MOD._projected_cache_capacity_usage(
+                total, counts, [tmp], first, 1,
+                staged_identity(replacement), replacement_links)
+            assert usage == (2, 2, 3, 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            wide = [(LOAD, 0x600, ((LOAD, 9 * 4096),))]
+            pair_records(first, wide, 0x290)
+            staged = os.path.join(tmp, '.range-overflow.dll')
+            pair_records(staged, wide, 0x290)
+            try:
+                MOD.publish_shard_pair(
+                    staged, pathlib.Path(staged).with_suffix('.ranges'),
+                    os.path.join(tmp, '00010000_00000002.dll'),
+                    candidate_cap=1)
+            except MOD.ShardCandidateCapacityError as exc:
+                assert 'lazy range-link capacity' in str(exc)
+            else:
+                raise AssertionError('lazy range-link cap was not enforced')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            second = os.path.join(tmp, '00010000_00000002.dll')
+            wide = [(LOAD, 0x700, ((LOAD, 17 * 4096),))]
+            pair_records(first, wide, 0x2A0)
+            pair_records(second, wide, 0x2A0)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 1 and counts.range_link_total == 34
+            assert MOD.cache_candidate_capacity_full(first, None, 2) == \
+                (True, 1)
+            assert MOD.candidate_capacity_saturated_in_tier(
+                total, counts, 2, tmp)
+            shrinking = os.path.join(tmp, '.range-shrink.dll')
+            pair_records(shrinking, [(
+                LOAD, 0x701, ((LOAD, 4),))], 0x2A1)
+            # The namespace starts over its 32-link bound. A replacement that
+            # reduces physical range-link use remains a legal repair.
+            assert MOD.publish_shard_pair(
+                shrinking, pathlib.Path(shrinking).with_suffix('.ranges'),
+                first, candidate_cap=2)
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 2 and counts.range_link_total == 18
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            second = os.path.join(tmp, '00010000_00000002.dll')
+            # Deliberately repeat F while changing P: no pair dedup is legal.
             pair(first, 1, 1)
             pair(second, 1, 2)
             total, counts = MOD.cache_candidate_inventory([tmp], None)
@@ -1607,6 +1851,107 @@ def check_candidate_capacity_publication():
                 old_ranges
 
         with tempfile.TemporaryDirectory() as tmp:
+            # An already-impossible pair must be rejected from its generated
+            # manifest before the expensive native linker runs. The normal
+            # locked publication projection remains in place for admissions.
+            existing = os.path.join(tmp, '00010000_00000001.dll')
+            pair(existing, 2, 0x310)
+            assert MOD.preflight_shard_candidate_capacity(
+                existing, funcs(2, LOAD + 0x40), 0x312, None, None, 2
+            ) is None
+            final = os.path.join(tmp, '00010000_00000002.dll')
+            attempted_link = []
+            original_compile = MOD._compile_dll_direct
+
+            def unexpected_link(*_args, **_kwargs):
+                attempted_link.append(True)
+                return False
+
+            MOD._compile_dll_direct = unexpected_link
+            try:
+                publication = {}
+                assert not MOD.compile_dll(
+                    'unused.c', final, [], func_ids=funcs(1, LOAD + 0x80),
+                    pair_id=0x311, publication_result=publication,
+                    candidate_cap=2)
+                assert not attempted_link
+                assert 'capacity would be exceeded' in \
+                    publication['capacity_error']
+            finally:
+                MOD._compile_dll_direct = original_compile
+
+            # A stable impossible projection becomes a rejection-only witness;
+            # repeated near-cap repairs do not enumerate every cache file.
+            MOD._candidate_rejection_witness_cache.clear()
+            original_inventory = MOD.cache_candidate_inventory
+            inventory_calls = []
+
+            def counted_inventory(*args, **kwargs):
+                inventory_calls.append(True)
+                return original_inventory(*args, **kwargs)
+
+            MOD.cache_candidate_inventory = counted_inventory
+            try:
+                assert MOD.preflight_shard_candidate_capacity(
+                    final, funcs(1, LOAD + 0x80), 0x313, None, None, 2)
+                assert MOD.preflight_shard_candidate_capacity(
+                    os.path.join(tmp, '00010000_00000003.dll'),
+                    funcs(1, LOAD + 0xC0), 0x314, None, None, 2)
+                assert len(inventory_calls) == 1
+            finally:
+                MOD.cache_candidate_inventory = original_inventory
+                MOD._candidate_rejection_witness_cache.clear()
+
+            # A stale witness that appears admissible is not authority: it must
+            # force a fresh inventory before deciding whether to accept.
+            capacity_lock, cache_dirs = MOD._candidate_capacity_namespace(final)
+            cache_dirs_key = tuple(
+                os.path.normcase(os.path.abspath(path))
+                for path in cache_dirs)
+            witness_key = (
+                os.path.normcase(os.path.abspath(capacity_lock)),
+                cache_dirs_key, None, 2, MOD._dll_abi_matches,
+                MOD._dll_runtime_exports_match)
+            MOD._candidate_rejection_witness_cache[witness_key] = (
+                0, MOD.CandidateInventory())
+            inventory_calls = []
+            MOD.cache_candidate_inventory = counted_inventory
+            try:
+                assert MOD.preflight_shard_candidate_capacity(
+                    final, funcs(1, LOAD + 0x80), 0x315, None, None, 2)
+                assert len(inventory_calls) == 1
+            finally:
+                MOD.cache_candidate_inventory = original_inventory
+                MOD._candidate_rejection_witness_cache.clear()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Growth after an admitted preflight is caught by the unchanged
+            # authoritative projection after linking.
+            existing = os.path.join(tmp, '00010000_00000001.dll')
+            racer = os.path.join(tmp, '00010000_00000003.dll')
+            final = os.path.join(tmp, '00010000_00000002.dll')
+            pair(existing, 1, 0x320)
+            original_compile = MOD._compile_dll_direct
+
+            def racing_link(_source, staged, *_args, **_kwargs):
+                pathlib.Path(staged).write_bytes(b'DLL')
+                pair(racer, 1, 0x321, LOAD + 0x40)
+                return True
+
+            MOD._compile_dll_direct = racing_link
+            try:
+                publication = {}
+                assert not MOD.compile_dll(
+                    'unused.c', final, [], func_ids=funcs(1, LOAD + 0x80),
+                    pair_id=0x322, publication_result=publication,
+                    candidate_cap=2)
+                assert 'capacity would be exceeded' in \
+                    publication['capacity_error']
+                assert not os.path.exists(final)
+            finally:
+                MOD._compile_dll_direct = original_compile
+
+        with tempfile.TemporaryDirectory() as tmp:
             hidden = os.path.join(tmp, '00010000_00000001.dll')
             other = os.path.join(tmp, '00010000_00000002.dll')
             pair(other, 1, 40)
@@ -1663,6 +2008,15 @@ def check_candidate_capacity_publication():
             assert tcc_pair not in counts
             assert MOD.candidate_capacity_saturated_in_tier(
                 total, counts, 2, str(gcc_dir))
+            gcc_exact = str(gcc_dir / '00010000_00000002.dll')
+            tcc_exact = str(tcc_dir / '00010000_00000003.dll')
+            pair(gcc_exact, 1, 15, LOAD + 0x40)
+            pair(tcc_exact, 1, 15, LOAD + 0x40)
+            total, counts = MOD.cache_candidate_inventory(tier_dirs, None)
+            assert total == 4 and counts[gcc_exact] == counts[tcc_exact] == 1
+            for exact in (gcc_exact, tcc_exact):
+                pathlib.Path(exact).unlink()
+                pathlib.Path(exact).with_suffix('.ranges').unlink()
             lower_unique = str(tcc_dir / '00010000_00000002.dll')
             pair(lower_unique, 1, 14, LOAD + 0x80)
             total, counts = MOD.cache_candidate_inventory(tier_dirs, None)
@@ -1715,13 +2069,62 @@ def check_candidate_capacity_publication():
             assert MOD.publish_shard_pair(
                 shrinking, shrinking_ranges, first, candidate_cap=2)
             assert MOD.cache_candidate_inventory([tmp], None)[0] == 3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, '00010000_00000001.dll')
+            pair(first, 2, 0x300)
+            for suffix in (2, 3):
+                staged = os.path.join(tmp, f'.raw-{suffix}.dll')
+                pair(staged, 2, 0x300)
+                final = os.path.join(tmp, f'00010000_{suffix:08X}.dll')
+                if suffix == 2:
+                    assert MOD.publish_shard_pair(
+                        staged, pathlib.Path(staged).with_suffix('.ranges'),
+                        final, candidate_cap=2)
+                else:
+                    try:
+                        MOD.publish_shard_pair(
+                            staged, pathlib.Path(staged).with_suffix('.ranges'),
+                            final, candidate_cap=2)
+                    except MOD.ShardCandidateCapacityError as exc:
+                        assert 'lazy-manifest capacity' in str(exc)
+                    else:
+                        raise AssertionError('raw lazy F cap was not enforced')
+            total, counts = MOD.cache_candidate_inventory([tmp], None)
+            assert total == 2 and counts.raw_total == 4
+            assert MOD.candidate_capacity_saturated_in_tier(
+                total, counts, 2, tmp)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_file_cap = MOD.RUNTIME_CACHE_FILE_CAP
+            MOD.RUNTIME_CACHE_FILE_CAP = 2
+            try:
+                for suffix in (1, 2):
+                    final = os.path.join(tmp, f'00010000_{suffix:08X}.dll')
+                    pair(final, 1, 0x400 + suffix, LOAD + suffix * 4)
+                staged = os.path.join(tmp, '.file-cap.dll')
+                pair(staged, 1, 0x403, LOAD + 0x20)
+                try:
+                    MOD.publish_shard_pair(
+                        staged, pathlib.Path(staged).with_suffix('.ranges'),
+                        os.path.join(tmp, '00010000_00000003.dll'),
+                        candidate_cap=10)
+                except MOD.ShardCandidateCapacityError as exc:
+                    assert 'cache file capacity' in str(exc)
+                else:
+                    raise AssertionError('selected physical file cap not enforced')
+                total, counts = MOD.cache_candidate_inventory([tmp], None)
+                assert MOD.candidate_capacity_saturated_in_tier(
+                    total, counts, 10, tmp)
+            finally:
+                MOD.RUNTIME_CACHE_FILE_CAP = original_file_cap
     finally:
         MOD._dll_runtime_exports_match = original_exports
         MOD._dll_abi_matches = original_abi
 
     if os.name == 'nt':
-        # Distinct output names race on the namespace lock, not merely their
-        # own pair locks. At cap-1 exactly one process may commit.
+        # Exact pairs racing to distinct names may both commit: the namespace
+        # lock makes the second writer observe the first pair's dedup identity.
         gcc = r'C:\msys64\mingw64\bin\gcc.exe'
         assert os.path.isfile(gcc)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1768,9 +2171,47 @@ except m.ShardCandidateCapacityError:
                     sys.executable, '-c', child_script, module_path,
                     str(staged), str(staged_ranges), str(final)]))
             codes = sorted(writer.wait(timeout=30) for writer in writers)
+            assert codes == [0, 0], codes
+            total, counts = MOD.cache_candidate_inventory([tmp], 14)
+            assert total == 1 and counts.raw_total == 2
+
+        # Distinct pairs still compete at cap-1; exactly one may commit.
+        with tempfile.TemporaryDirectory() as tmp:
+            module_path = str(ROOT / 'tools' / 'compile_overlays.py')
+            child_script = r'''
+import importlib.util, sys
+s=importlib.util.spec_from_file_location("co",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+try:
+    m.publish_shard_pair(sys.argv[2],sys.argv[3],sys.argv[4],expected_existing_abi=14,candidate_cap=1)
+except m.ShardCandidateCapacityError:
+    raise SystemExit(23)
+'''
+            writers = []
+            for index, pair_id in enumerate(
+                    (0x1020304050607080, 0x1020304050607081)):
+                source = pathlib.Path(tmp) / f'distinct-{index}.c'
+                template = pathlib.Path(tmp) / f'.distinct-{index}.dll'
+                source.write_text(
+                    '#include <stdint.h>\n'
+                    '__declspec(dllexport) int overlay_abi(void){return 14;}\n'
+                    '__declspec(dllexport) uint64_t overlay_pair_id(void){'
+                    f'return UINT64_C(0x{pair_id:016X});' '}\n'
+                    '__declspec(dllexport) void overlay_init(const void*p){(void)p;}\n'
+                    '__declspec(dllexport) void overlay_flush_cycles(void){}\n'
+                    '__declspec(dllexport) void func_80010000(void*p){(void)p;}\n')
+                subprocess.run(
+                    [gcc, '-shared', str(source), '-o', str(template)],
+                    check=True, capture_output=True, text=True)
+                staged_ranges = pathlib.Path(tmp) / f'.distinct-{index}.ranges'
+                staged_ranges.write_text(MOD.overlay_ranges_text(
+                    [(LOAD, 1, ((LOAD, 4),))], pair_id))
+                final = pathlib.Path(tmp) / f'00010000_{index + 1:08X}.dll'
+                writers.append(subprocess.Popen([
+                    sys.executable, '-c', child_script, module_path,
+                    str(template), str(staged_ranges), str(final)]))
+            codes = sorted(writer.wait(timeout=30) for writer in writers)
             assert codes == [0, 23], codes
-            total, _counts = MOD.cache_candidate_inventory([tmp], 14)
-            assert total == 1
+            assert MOD.cache_candidate_inventory([tmp], 14)[0] == 1
 
 
 def check_interior_fragment_contract():
@@ -2610,15 +3051,17 @@ def check_real_batched_fragment_publication(recompiler):
     args.recompiler = recompiler
     args.runtime_include = runtime_include
     args.gcc = gcc
+    expected_abi = MOD.overlay_abi_tag(runtime_include, args.flavor)
     env = os.environ.copy()
     env['PSX_CPS'] = '1'
     recipe = ((LOAD, LOAD + len(data)),)
+    initial_recipe = ((LOAD, LOAD + 0x40),)
     extension = MOD.overlay_ext()
 
     with tempfile.TemporaryDirectory() as td:
         ids, status = MOD.compile_fragment_batch(
             {first}, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
-            td, args, env, {}, recipe, ())
+            td, args, env, {}, initial_recipe, ())
         assert ids and status == 'built'
         initial_dlls = list(pathlib.Path(td).glob(f'*{extension}'))
         assert len(initial_dlls) == 1
@@ -2627,7 +3070,8 @@ def check_real_batched_fragment_publication(recompiler):
         initial_pair = (initial_dll.read_bytes(), initial_ranges.read_bytes())
 
         current_entries, _ranges = MOD.load_region_current_variant_coverage(
-            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14)
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data),
+            expected_abi)
         assert current_entries == {first & 0x1FFFFFFF}
         requested_batches = []
 
@@ -2653,12 +3097,13 @@ def check_real_batched_fragment_publication(recompiler):
         assert len(final_dlls) == 2
         supplemental = next(dll for dll in final_dlls if dll != initial_dll)
         assert {second & 0x1FFFFFFF, third & 0x1FFFFFFF} <= \
-            MOD.load_shard_entry_set(str(supplemental), 14)
+            MOD.load_shard_entry_set(str(supplemental), expected_abi)
         final_entries, _ranges = MOD.load_region_current_variant_coverage(
-            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14)
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data),
+            expected_abi)
         assert {first & 0x1FFFFFFF, second & 0x1FFFFFFF,
                 third & 0x1FFFFFFF} <= final_entries
-        assert all(MOD.compiled_shard_complete(str(dll), 14)
+        assert all(MOD.compiled_shard_complete(str(dll), expected_abi)
                    for dll in pathlib.Path(td).glob(f'*{extension}'))
 
 
@@ -2707,6 +3152,7 @@ def check_real_hosted_fragment_publication(recompiler):
     args.recompiler = recompiler
     args.runtime_include = runtime_include
     args.gcc = gcc
+    expected_abi = MOD.overlay_abi_tag(runtime_include, args.flavor)
     env = os.environ.copy()
     env['PSX_CPS'] = '1'
     recipe = ((LOAD, LOAD + len(data)),)
@@ -2758,14 +3204,16 @@ def check_real_hosted_fragment_publication(recompiler):
         assert MOD.manifest_declares_supplemental_provenance(
             '# psxrecomp overlay provenance unknown-v9\r\n')
         assert MOD.load_shard_func_ids(
-            str(hosted_dll), 14, include_supplemental=False) == []
+            str(hosted_dll), expected_abi,
+            include_supplemental=False) == []
         authority_ids = MOD.load_region_current_variant_func_ids(
-            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14,
-            include_supplemental=False)
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data),
+            expected_abi, include_supplemental=False)
         assert not ({target, target2} & {
             entry for entry, _crc, _ranges in authority_ids})
         coverage_ids = MOD.load_region_current_variant_func_ids(
-            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data), 14)
+            td, LOAD & 0x1FFFFFFF, bytes(data), LOAD, len(data),
+            expected_abi)
         assert {target, target2} <= {
             entry for entry, _crc, _ranges in coverage_ids}
         assert MOD.overlay_pair_id(

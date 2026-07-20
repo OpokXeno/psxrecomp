@@ -25,9 +25,9 @@ common-hash evidence for Tomba 2, MMX6, and Ape Escape and must be regenerated u
 pathological one-DLL-per-root prototype without weakening generated-C, manifest,
 ABI, pair, or live-byte gates. MMX6 published 107/107 runtime-valid pairs and covered
 588/701 historical observations by exact entry address (83.9%), or 595/701 with the
-exact BIOS resident shard (84.9%). Its 17,506 manifest identities motivated the
-reviewed 32,768 runtime candidate ceiling with durable overflow telemetry and
-fail-closed one-shot bundle suppression.
+exact BIOS resident shard (84.9%). Its 17,506 raw, pre-dedup manifest identities
+motivated the reviewed 32,768 runtime candidate ceiling with durable overflow
+telemetry and fail-closed one-shot bundle suppression.
 
 Current Tomba 2 checkpoint: generic play-free extraction emits 29 base/raw regions
 plus exact adjacent-producer composites (52 capture records total). The 29 base/raw
@@ -257,13 +257,47 @@ repeated invocations from paging into new targets at any later cap. Partial host
 successes retry their fixed remainder immediately.
 
 Offline publication is also bounded by the loader's real resource model. The
-shared `PSX_OVERLAY_CANDIDATE_CAP` counts every accepted manifest `F` record,
-including identical identities repeated by different DLLs. Before committing a
-pair, the compiler locks the game/architecture/codegen cache namespace, inventories
-all runtime-valid compiler-tier pairs, subtracts the pair being replaced, and
-rejects any positive delta that would exceed the process-lifetime table. Exact
-cache hits and non-growing replacements remain legal at capacity; rejected
-optional coverage stays interpreted.
+shared `PSX_OVERLAY_CANDIDATE_CAP` counts every `F` candidate from one
+representative of each distinct complete generated pair per compiler tier.
+Deduplication is deliberately whole-pair only: the `P` identifier, same
+normalized provenance class (unmarked authority, `hosted-v1`, or `orphan-v1`),
+and exact ordered, physical-address-normalized `F`/`R` semantics must all match.
+Legacy/no-`P`, unknown, malformed, cross-tier, or partially different pairs
+remain distinct.
+The runtime fully preflights a later physical twin, closes its redundant handle
+before initialization, and reuses the canonical pair's candidates and flush
+owner. `overlay_loader_status.pair_aliases` counts these validated physical
+twins. CRC dispatch validation is unchanged.
+
+The other publication-gating physical lazy/cache-index resources do not
+deduplicate. Every selected physical pair still contributes its raw `F` rows,
+unique 4 KiB range-page links per `F`, and cache-index file. Before committing a
+pair, the compiler locks the game/architecture/codegen cache namespace,
+inventories the exact GCC-first runtime selection, subtracts the pair being
+replaced, and independently projects four bounds: candidates at
+`PSX_OVERLAY_CANDIDATE_CAP`, raw lazy `F` rows at twice that cap, lazy range-page
+links at eight times the raw-row cap, and 4096 selected files. Exact cache hits
+and replacements that do not grow any already-exceeded independent budget remain
+legal; crossing or worsening any one bound rejects that optional coverage to the
+interpreter. The loaded-candidate range index has its own bounded fallback scan
+and is not part of offline publication accounting.
+
+Near a saturated namespace, each attempted repair still performs the complete
+authoritative projection. To keep that tail practical, the publisher memoizes
+only successful ABI/export/manifest validation for unchanged physical pairs,
+keyed by expected ABI plus replacement-sensitive DLL and manifest file identity.
+Changed pairs revalidate, and negative loader results are never memoized because
+they may be transient. Transaction recovery and the locked projection remain on
+every publication path; the memo only avoids remapping hundreds of unchanged
+DLLs for each rejected optional shard. Once generated `F/R/P` metadata proves
+a shard cannot fit, the compiler applies that same locked projection before
+invoking the native linker; admitted shards are still projected again after
+linking at authoritative publication. A concurrent deletion can therefore only
+defer optional coverage to the next invocation, never admit an over-cap pair.
+An earlier over-cap snapshot may be reused only when it still proves rejection;
+anything that appears admissible forces a fresh locked inventory. This avoids
+even the directory scan in a saturated fixed-point tail without turning stale
+state into admission authority.
 Dynamic recipes are processed in a canonical order under a whole-invocation
 namespace lock. This makes the accepted subset reproducible even at the hard
 capacity boundary instead of allowing worker scheduling to choose the winner.

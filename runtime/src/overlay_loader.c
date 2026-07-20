@@ -94,7 +94,14 @@ typedef struct {
  * loading means this is a potential long-session population, not proof that one
  * observed run loaded all of them; every encountered variant does remain loaded.
  * Keep enough headroom that coverage cannot silently become interpreter-only. */
+/* Executable loader tests need a tiny table to prove alias-at-cap behavior.
+ * Keep the override private to this translation unit: changing overlay_api.h
+ * would roll the production shard codegen hash and its publisher contract. */
+#ifdef PSX_OVERLAY_TEST_CANDIDATE_CAP
+#define CAND_CAP   PSX_OVERLAY_TEST_CANDIDATE_CAP
+#else
 #define CAND_CAP   PSX_OVERLAY_CANDIDATE_CAP
+#endif
 static Candidate s_cand[CAND_CAP];
 static int       s_cand_n = 0;
 
@@ -406,6 +413,7 @@ static uint64_t s_diffgate_interp = 0;  /* CPS interior re-entries sent to the  
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint64_t s_cand_overflow  = 0;   /* registrations dropped at CAND_CAP  */
+static uint64_t s_pair_aliases   = 0;   /* validated complete pairs deduped    */
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
@@ -564,6 +572,13 @@ typedef struct {
 #define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
 #define MANIFEST_LINE_MAX 128u
 #define MANIFEST_PHYSICAL_LINE_MAX 159u
+#define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
+enum {
+    MANIFEST_PROVENANCE_AMBIGUOUS = -1,
+    MANIFEST_PROVENANCE_AUTHORITY = 0,
+    MANIFEST_PROVENANCE_HOSTED = 1,
+    MANIFEST_PROVENANCE_ORPHAN = 2
+};
 
 static int manifest_is_space(unsigned char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f';
@@ -600,14 +615,17 @@ static int manifest_record_end(const char *cursor) {
 
 static ManFn *parse_manifest(const char *path, int *out_n,
                              uint64_t *out_pair_id,
-                             int *out_has_pair_id) {
+                             int *out_has_pair_id,
+                             int *out_provenance) {
     *out_n = 0;
     if (out_pair_id) *out_pair_id = 0;
     if (out_has_pair_id) *out_has_pair_id = 0;
+    if (out_provenance) *out_provenance = MANIFEST_PROVENANCE_AUTHORITY;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     int cap = 1024, n = 0;
-    int invalid = 0, pair_seen = 0;
+    int invalid = 0, pair_seen = 0, provenance_seen = 0;
+    int provenance = MANIFEST_PROVENANCE_AUTHORITY;
     ManFn *arr = (ManFn *)malloc(sizeof(ManFn) * cap);
     if (!arr) { fclose(f); return NULL; }
     char line[MANIFEST_PHYSICAL_LINE_MAX + 1u];
@@ -621,6 +639,26 @@ static ManFn *parse_manifest(const char *path, int *out_n,
         }
         if (ch == EOF && line_len == 0 && !too_long) break;
         line[line_len] = '\0';
+        size_t semantic_len = line_len;
+        if (semantic_len > 0 && line[semantic_len - 1] == '\r')
+            semantic_len--;
+        size_t provenance_prefix_len = strlen(MANIFEST_PROVENANCE_PREFIX);
+        if (semantic_len >= provenance_prefix_len &&
+            memcmp(line, MANIFEST_PROVENANCE_PREFIX,
+                   provenance_prefix_len) == 0) {
+            const char *value = line + provenance_prefix_len;
+            size_t value_len = semantic_len - provenance_prefix_len;
+            int parsed_provenance = MANIFEST_PROVENANCE_AMBIGUOUS;
+            if (value_len == strlen("hosted-v1") &&
+                memcmp(value, "hosted-v1", value_len) == 0)
+                parsed_provenance = MANIFEST_PROVENANCE_HOSTED;
+            else if (value_len == strlen("orphan-v1") &&
+                     memcmp(value, "orphan-v1", value_len) == 0)
+                parsed_provenance = MANIFEST_PROVENANCE_ORPHAN;
+            provenance_seen++;
+            provenance = provenance_seen == 1
+                ? parsed_provenance : MANIFEST_PROVENANCE_AMBIGUOUS;
+        }
         const char *record = manifest_skip_space(line);
         int recognized = ((*record == 'P' || *record == 'F' || *record == 'R') &&
                           (record[1] == '\0' ||
@@ -701,6 +739,7 @@ static ManFn *parse_manifest(const char *path, int *out_n,
         free(arr);
         return NULL;
     }
+    if (out_provenance) *out_provenance = provenance;
     *out_n = n;
     return arr;
 }
@@ -709,6 +748,75 @@ static ManFn *man_find(ManFn *arr, int n, uint32_t entry) {
     for (int i = 0; i < n; i++)
         if (arr[i].entry == entry) return &arr[i];
     return NULL;
+}
+
+/* Complete-pair deduplication.  A generated P record binds the DLL source,
+ * manifest provenance, and normalized F/R records.  The pair id alone is not
+ * enough for aliasing: retain the canonical parsed manifest and require exact
+ * semantic equality as collision defense.  Compiler tiers remain separate so
+ * a gcc image never silently stands in for a tcc image (or vice versa).
+ *
+ * Only a fully registered pair enters this table.  Its DLL handle, function
+ * pointers, and cycle-flush callback remain the sole owners for process life;
+ * a later identical physical cache pair is preflighted, closed, and recorded
+ * as a satisfied path without consuming Candidate slots. */
+#define LOADED_PAIR_CAP 4096
+#define LOAD_PAIR_ALIAS (-1)
+typedef struct {
+    uint64_t pair_id;
+    ManFn   *man;
+    int      man_n;
+    int      tier;
+    int      provenance;
+} LoadedPair;
+static LoadedPair s_loaded_pairs[LOADED_PAIR_CAP];
+static int s_loaded_pair_n = 0;
+
+static int manifest_pair_equal(const ManFn *a, int a_n,
+                               const ManFn *b, int b_n) {
+    if (!a || !b || a_n != b_n) return 0;
+    for (int i = 0; i < a_n; i++) {
+        if (a[i].entry != b[i].entry || a[i].crc != b[i].crc ||
+            a[i].has_crc != b[i].has_crc || a[i].n != b[i].n)
+            return 0;
+        for (int r = 0; r < a[i].n; r++)
+            if ((a[i].lo[r] & 0x1FFFFFFFu) !=
+                    (b[i].lo[r] & 0x1FFFFFFFu) ||
+                a[i].len[r] != b[i].len[r])
+                return 0;
+    }
+    return 1;
+}
+
+static int loaded_pair_find(int tier, int provenance, uint64_t pair_id,
+                            const ManFn *man, int man_n) {
+    if (provenance == MANIFEST_PROVENANCE_AMBIGUOUS) return -1;
+    for (int i = 0; i < s_loaded_pair_n; i++) {
+        const LoadedPair *p = &s_loaded_pairs[i];
+        if (p->tier == tier && p->provenance == provenance &&
+            p->pair_id == pair_id &&
+            manifest_pair_equal(p->man, p->man_n, man, man_n))
+            return i;
+    }
+    return -1;
+}
+
+static void loaded_pair_commit(int tier, int provenance, uint64_t pair_id,
+                               const ManFn *man, int man_n) {
+    if (!man || man_n <= 0 ||
+        provenance == MANIFEST_PROVENANCE_AMBIGUOUS ||
+        s_loaded_pair_n >= LOADED_PAIR_CAP ||
+        loaded_pair_find(tier, provenance, pair_id, man, man_n) >= 0)
+        return;
+    ManFn *copy = (ManFn *)malloc(sizeof(*copy) * (size_t)man_n);
+    if (!copy) return; /* Safe fallback: later twins register independently. */
+    memcpy(copy, man, sizeof(*copy) * (size_t)man_n);
+    LoadedPair *p = &s_loaded_pairs[s_loaded_pair_n++];
+    p->pair_id = pair_id;
+    p->man = copy;
+    p->man_n = man_n;
+    p->tier = tier;
+    p->provenance = provenance;
 }
 
 /* ---- Candidate registration -------------------------------------------- */
@@ -790,6 +898,7 @@ typedef struct {
     uint64_t mtime;
     int func_count;
     int indexed_func_count;
+    int tier;              /* 0=gcc, 1=tcc; pair aliases never cross tiers */
     int resident;
     int capacity_suppressed;
     char path[768];
@@ -797,7 +906,34 @@ typedef struct {
 static CacheEntry s_cache_idx[CACHE_IDX_CAP];
 static int        s_cache_idx_count = 0;
 static int        s_capacity_warm_dropped = 0;
+static void overlay_image_warm_cancel(int ci);
+static void overlay_image_warm_release(int ci);
 static void overlay_image_warm_drop_all(void);
+
+static int cache_entry_suppress_for_shortfall(int ci, int needed) {
+    if (ci < 0 || ci >= s_cache_idx_count || needed <= 0) return 0;
+    CacheEntry *e = &s_cache_idx[ci];
+    if (e->capacity_suppressed) return 1;
+    if (needed <= CAND_CAP - s_cand_n) return 0;
+    if (s_cand_n >= CAND_CAP && !s_capacity_warm_dropped) {
+        /* No further DLL can ever register in this process. Release every
+         * speculative image-map reference, including bundles never dispatched. */
+        overlay_image_warm_drop_all();
+        s_capacity_warm_dropped = 1;
+    } else {
+        /* Smaller bundles may still fit. Release only this impossible image
+         * and leave warming enabled for candidates within the remaining cap. */
+        overlay_image_warm_cancel(ci);
+        overlay_image_warm_release(ci);
+    }
+    e->capacity_suppressed = 1;
+    s_cand_overflow += (uint64_t)needed;
+    loader_log("*** CANDIDATE TABLE SHORTFALL (%d): suppressing %s (%d "
+               "manifest candidates, %d slots remain); native coverage is "
+               "falling back to the interpreter", CAND_CAP, e->path, needed,
+               CAND_CAP - s_cand_n);
+    return 1;
+}
 
 /* Candidates are process-lifetime objects, so reaching CAND_CAP is permanent.
  * Suppress each not-yet-loaded bundle once instead of repeatedly mapping and
@@ -808,22 +944,10 @@ static int cache_entry_suppress_at_capacity(int ci) {
     CacheEntry *e = &s_cache_idx[ci];
     if (e->capacity_suppressed) return 1;
     if (s_cand_n < CAND_CAP) return 0;
-    if (!s_capacity_warm_dropped) {
-        /* No further DLL can ever register in this process. Release every
-         * speculative image-map reference, including bundles never dispatched. */
-        overlay_image_warm_drop_all();
-        s_capacity_warm_dropped = 1;
-    }
-    e->capacity_suppressed = 1;
-    uint64_t dropped = (uint64_t)(e->indexed_func_count > 0
-        ? e->indexed_func_count : e->func_count);
+    int dropped = e->indexed_func_count > 0
+        ? e->indexed_func_count : e->func_count;
     if (dropped == 0) dropped = 1;
-    s_cand_overflow += dropped;
-    loader_log("*** CANDIDATE TABLE FULL (%d): suppressing %s (%llu manifest "
-               "candidate(s)); native coverage is falling back to the "
-               "interpreter. Raise CAND_CAP.", CAND_CAP, e->path,
-               (unsigned long long)dropped);
-    return 1;
+    return cache_entry_suppress_for_shortfall(ci, dropped);
 }
 
 #ifdef _WIN32
@@ -907,6 +1031,7 @@ static void overlay_image_warm_queue(const int *indices, int count) {
     for (int i = 0; i < count; i++) {
         int ci = indices[i];
         if (ci < 0 || ci >= s_cache_idx_count) continue;
+        if (s_cache_idx[ci].capacity_suppressed) continue;
         if (InterlockedCompareExchange(&s_image_warm[ci].state, 1, 0) != 0)
             continue;
         ImageWarmJob *job = &batch->jobs[batch->count++];
@@ -1010,7 +1135,7 @@ static void rebuild_lazy_manifest_index(void) {
         snprintf(path + n - OVERLAY_SHARED_EXT_LEN,
                  sizeof(path) - (n - OVERLAY_SHARED_EXT_LEN), ".ranges");
         int man_n = 0;
-        ManFn *man = parse_manifest(path, &man_n, NULL, NULL);
+        ManFn *man = parse_manifest(path, &man_n, NULL, NULL, NULL);
         if (!man) continue;
         s_cache_idx[ci].func_count = man_n;
         s_cache_idx[ci].indexed_func_count = 0;
@@ -1156,7 +1281,7 @@ const char *overlay_loader_arch_abi(void) { return PSX_OVERLAY_ARCH_ABI; }
 
 #ifndef _WIN32
 static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
-    (void)opaque;
+    int tier = (int)(intptr_t)opaque;
     if (s_cache_idx_count >= CACHE_IDX_CAP) {
         loader_log("*** CACHE INDEX FULL (%d): further DLLs near %s are being "
                    "IGNORED — their regions will run interpreted. Raise "
@@ -1169,6 +1294,7 @@ static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
     e->mtime = file->mtime;
     e->func_count = 0;
     e->indexed_func_count = 0;
+    e->tier = tier;
     e->resident = cache_path_is_bios_resident(file->path);
     e->capacity_suppressed = 0;
     snprintf(e->path, sizeof(e->path), "%s", file->path);
@@ -1178,7 +1304,7 @@ static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
 
 /* Scan one directory for <addr8>_<crc8>.dll cache entries into the index.
  * `dir` is a full directory path. Idempotent (skips already-indexed paths). */
-static void scan_one_cache_dir(const char *dir) {
+static void scan_one_cache_dir(const char *dir, int tier) {
 #ifdef _WIN32
     char pattern[768];
     snprintf(pattern, sizeof(pattern), "%s/*_*.dll", dir);
@@ -1208,13 +1334,15 @@ static void scan_one_cache_dir(const char *dir) {
                    (uint64_t)fd.ftLastWriteTime.dwLowDateTime;
         e->func_count = 0;
         e->indexed_func_count = 0;
+        e->tier = tier;
         e->capacity_suppressed = 0;
         snprintf(e->path, sizeof(e->path), "%s", full);
         e->resident = cache_path_is_bios_resident(full);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    psx_overlay_posix_scan_cache_dir(dir, add_posix_cache_file, NULL);
+    psx_overlay_posix_scan_cache_dir(
+        dir, add_posix_cache_file, (void *)(intptr_t)tier);
 #endif
 }
 
@@ -1416,12 +1544,12 @@ static void scan_cache_dir(void) {
     snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d_%08x",
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
-    scan_one_cache_dir(dir);
+    scan_one_cache_dir(dir, 0);
     abi_preflight_sweep(dir);
     snprintf(dir, sizeof(dir), "%s/%s/tcc/%s/cg%d_%08x",
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
-    scan_one_cache_dir(dir);
+    scan_one_cache_dir(dir, 1);
     abi_preflight_sweep(dir);
 
     refresh_bios_resident_flags();
@@ -1800,7 +1928,8 @@ static void init_callbacks(void) {
 #ifdef _WIN32
 static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll,
                             uint64_t manifest_pair_id,
-                            int manifest_has_pair_id) {
+                            int manifest_has_pair_id,
+                            int manifest_provenance, int tier) {
     HMODULE h = LoadLibraryA(dll_path);
     if (!h) {
         loader_log("LoadLibrary(%s) failed: %lu", dll_path, GetLastError());
@@ -1852,14 +1981,42 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
             return 0;
         }
     }
-    init_fn(&s_callbacks);
-    OverlayFlushFn flush_fn = (OverlayFlushFn)GetProcAddress(h, "overlay_flush_cycles");
-    if (!flush_fn || dll < 0 || dll >= (int)(sizeof(s_dll_flush) / sizeof(s_dll_flush[0]))) {
+    OverlayFlushFn flush_fn =
+        (OverlayFlushFn)GetProcAddress(h, "overlay_flush_cycles");
+    if (!flush_fn) {
         loader_log("no ABI-v11 cycle flush export in %s", dll_path);
         FreeLibrary(h);
         return 0;
     }
-    s_dll_flush[dll] = flush_fn;
+
+    /* Validate the whole physical pair before treating it as an alias.  The
+     * canonical pair already owns its initialized handle and callbacks, so the
+     * redundant image must never run overlay_init or publish function pointers. */
+    if (manifest_has_pair_id && loaded_pair_find(
+            tier, manifest_provenance, manifest_pair_id, man, man_n) >= 0) {
+        s_pair_aliases++;
+        loader_log("validated duplicate overlay pair in %s -- reusing canonical "
+                   "candidate bundle", dll_path);
+        FreeLibrary(h);
+        return LOAD_PAIR_ALIAS;
+    }
+    if (dll < 0 || dll >= (int)(sizeof(s_dll_flush) / sizeof(s_dll_flush[0]))) {
+        loader_log("overlay DLL owner table full for %s", dll_path);
+        FreeLibrary(h);
+        return 0;
+    }
+
+    /* Candidate publication is all-or-nothing for pair dedup authority.  The
+     * offline publisher normally makes this impossible; fail closed if an
+     * externally modified cache would leave only part of a bundle resident. */
+    if (man_n > CAND_CAP - s_cand_n) {
+        s_cand_overflow += (uint64_t)man_n;
+        loader_log("*** CANDIDATE TABLE SHORTFALL (%d): rejecting complete %s "
+                   "pair (%d manifest candidates); native coverage is falling "
+                   "back to the interpreter", CAND_CAP, dll_path, man_n);
+        FreeLibrary(h);
+        return 0;
+    }
 
     BYTE *base = (BYTE *)h;
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
@@ -1871,6 +2028,8 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         FreeLibrary(h);
         return 0;
     }
+    init_fn(&s_callbacks);
+    s_dll_flush[dll] = flush_fn;
     IMAGE_EXPORT_DIRECTORY *exp =
         (IMAGE_EXPORT_DIRECTORY *)(base + exp_dd->VirtualAddress);
     DWORD *names    = (DWORD *)(base + exp->AddressOfNames);
@@ -1896,6 +2055,9 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         if (!m || m->n == 0) { s_no_manifest++; continue; }
         registered += cand_register(addr & 0x1FFFFFFFu, fn, m, dll);
     }
+    if (registered == man_n && manifest_has_pair_id)
+        loaded_pair_commit(tier, manifest_provenance,
+                           manifest_pair_id, man, man_n);
     if (s_cand_overflow != overflow_before)
         loader_log("*** CANDIDATE TABLE FULL (%d): loaded %s -> %d registered, "
                    "%llu dropped; native coverage is falling back to the "
@@ -1917,7 +2079,8 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
 #else
 static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll,
                             uint64_t manifest_pair_id,
-                            int manifest_has_pair_id) {
+                            int manifest_has_pair_id,
+                            int manifest_provenance, int tier) {
     char error[256] = {0};
     void *h = psx_overlay_posix_library_open(dll_path, error, sizeof(error));
     if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, error); return 0; }
@@ -1959,14 +2122,35 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
             return 0;
         }
     }
-    init_fn(&s_callbacks);
     OverlayFlushFn flush_fn = (OverlayFlushFn)psx_overlay_posix_library_symbol(
         h, "overlay_flush_cycles");
-    if (!flush_fn || dll < 0 || dll >= (int)(sizeof(s_dll_flush) / sizeof(s_dll_flush[0]))) {
+    if (!flush_fn) {
         loader_log("no ABI-v11 cycle flush export in %s", dll_path);
         psx_overlay_posix_library_close(h);
         return 0;
     }
+    if (manifest_has_pair_id && loaded_pair_find(
+            tier, manifest_provenance, manifest_pair_id, man, man_n) >= 0) {
+        s_pair_aliases++;
+        loader_log("validated duplicate overlay pair in %s -- reusing canonical "
+                   "candidate bundle", dll_path);
+        psx_overlay_posix_library_close(h);
+        return LOAD_PAIR_ALIAS;
+    }
+    if (dll < 0 || dll >= (int)(sizeof(s_dll_flush) / sizeof(s_dll_flush[0]))) {
+        loader_log("overlay DLL owner table full for %s", dll_path);
+        psx_overlay_posix_library_close(h);
+        return 0;
+    }
+    if (man_n > CAND_CAP - s_cand_n) {
+        s_cand_overflow += (uint64_t)man_n;
+        loader_log("*** CANDIDATE TABLE SHORTFALL (%d): rejecting complete %s "
+                   "pair (%d manifest candidates); native coverage is falling "
+                   "back to the interpreter", CAND_CAP, dll_path, man_n);
+        psx_overlay_posix_library_close(h);
+        return 0;
+    }
+    init_fn(&s_callbacks);
     s_dll_flush[dll] = flush_fn;
 
     /* ELF/Mach-O do not expose a portable export-table walker. The range
@@ -1982,6 +2166,9 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         if (!fn) continue;
         registered += cand_register(m->entry & 0x1FFFFFFFu, fn, m, dll);
     }
+    if (registered == man_n && manifest_has_pair_id)
+        loaded_pair_commit(tier, manifest_provenance,
+                           manifest_pair_id, man, man_n);
     if (s_cand_overflow != overflow_before)
         loader_log("*** CANDIDATE TABLE FULL (%d): loaded %s -> %d registered, "
                    "%llu dropped; native coverage is falling back to the "
@@ -2014,7 +2201,6 @@ static int load_bios_resident_shards(void) {
             e->indexed_func_count != e->func_count ||
             e->capacity_suppressed || dll_already_loaded(e->path))
             continue;
-        if (cache_entry_suppress_at_capacity(i)) continue;
         int loaded = load_one_dll(e->path);
         if (loaded > 0) { bundles++; functions += loaded; }
     }
@@ -2195,11 +2381,12 @@ static int dll_already_loaded(const char *path) {
 }
 
 static int load_one_dll(const char *dll_path) {
-    /* Central guard as well as the lazy/resident caller checks: no path may
-     * reach LoadLibrary/dlopen after the permanent process-lifetime cap fills. */
+    int cache_idx = -1;
+    int tier = -1;
     for (int ci = 0; ci < s_cache_idx_count; ci++) {
         if (strcmp(s_cache_idx[ci].path, dll_path) == 0) {
-            if (cache_entry_suppress_at_capacity(ci)) return 0;
+            cache_idx = ci;
+            tier = s_cache_idx[ci].tier;
             break;
         }
     }
@@ -2219,17 +2406,34 @@ static int load_one_dll(const char *dll_path) {
     int man_n = 0;
     uint64_t manifest_pair_id = 0;
     int manifest_has_pair_id = 0;
+    int manifest_provenance = MANIFEST_PROVENANCE_AUTHORITY;
     ManFn *man = parse_manifest(ranges_path, &man_n,
                                 &manifest_pair_id,
-                                &manifest_has_pair_id);
+                                &manifest_has_pair_id,
+                                &manifest_provenance);
     if (!man || man_n == 0) {
         loader_log("no/empty manifest %s — DLL left to interpreter", ranges_path);
         free(man);
         return 0;
     }
+    /* A complete known pair remains a zero-slot operation even when no new
+     * bundle of this size can fit. Parse and compare before durably suppressing
+     * the cache entry; otherwise safe aliases become unreachable at the cap. */
+    int known_alias = manifest_has_pair_id && loaded_pair_find(
+        tier, manifest_provenance, manifest_pair_id, man, man_n) >= 0;
+    if (cache_idx >= 0 && !known_alias) {
+        int suppressed = s_cand_n >= CAND_CAP
+            ? cache_entry_suppress_at_capacity(cache_idx)
+            : cache_entry_suppress_for_shortfall(cache_idx, man_n);
+        if (suppressed) {
+            free(man);
+            return 0;
+        }
+    }
     int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls,
                                       manifest_pair_id,
-                                      manifest_has_pair_id);
+                                      manifest_has_pair_id,
+                                      manifest_provenance, tier);
 #ifdef _WIN32
     QueryPerformanceCounter(&q1);
     QueryPerformanceFrequency(&qf);
@@ -2240,14 +2444,14 @@ static int load_one_dll(const char *dll_path) {
     if (elapsed_us > s_load_max_us) s_load_max_us = elapsed_us;
 #endif
     free(man);
-    if (registered <= 0) return 0;
+    if (registered == 0) return 0;
 
     if (s_nloaded_paths < MAX_LOADED_DLLS) {
         strncpy(s_loaded_paths[s_nloaded_paths], dll_path, 767);
         s_loaded_paths[s_nloaded_paths][767] = '\0';
         s_nloaded_paths++;
     }
-    s_ndlls++;
+    if (registered > 0) s_ndlls++;
     return registered;
 }
 
@@ -2315,6 +2519,7 @@ static void overlay_image_warm_seed_boot_text(void) {
     int count = 0;
     for (int ci = 0; ci < s_cache_idx_count; ci++) {
         if (s_cache_idx[ci].region_start != DIRTY_RAM_KERNEL_WINDOW_END ||
+            s_cache_idx[ci].capacity_suppressed ||
             s_cache_idx[ci].func_count <= 0 ||
             s_cache_idx[ci].func_count > 8)
             continue;
@@ -2356,7 +2561,7 @@ static int lazy_load_selected(int li) {
      * the interpreter. The worker drops its speculative reference safely. */
     overlay_image_warm_cancel(ci);
     s_last_file_found = 1;
-    int loaded = load_one_dll(s_cache_idx[ci].path) > 0;
+    int loaded = load_one_dll(s_cache_idx[ci].path) != 0;
     overlay_image_warm_release(ci);
     return loaded;
 }
@@ -2968,6 +3173,7 @@ int overlay_loader_range_index_overflow(void) { return s_range_index_overflow; }
 int overlay_loader_lazy_manifest_count(void) { return s_lazy_man_n; }
 int overlay_loader_lazy_manifest_overflow(void) { return s_lazy_man_overflow; }
 uint64_t overlay_loader_candidate_overflow(void) { return s_cand_overflow; }
+uint64_t overlay_loader_pair_aliases(void) { return s_pair_aliases; }
 
 /* (sljit removed 2026-07-15: overlay_loader_sljit_obsoleted and the
  * overlay_loader_sljit_probe one-shot JIT helper lived here.) */

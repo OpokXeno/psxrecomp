@@ -86,6 +86,28 @@ def main() -> int:
             "cand_register must report successful registration")
     require(r"c->crc_code\s*=\s*m->crc", register,
             "candidate CRC must always come from an authoritative manifest")
+    require(r"#define\s+LOADED_PAIR_CAP\s+4096", source,
+            "whole-pair registry must cover every indexed cache file")
+    pair_equal = function_body(source, "manifest_pair_equal")
+    for field in ("entry", "crc", "has_crc", "n", "lo", "len"):
+        require(rf"\.{field}\b", pair_equal,
+                f"pair equivalence must compare manifest {field}")
+    pair_find = function_body(source, "loaded_pair_find")
+    require(r"p->tier\s*==\s*tier", pair_find,
+            "whole-pair aliases must never cross compiler tiers")
+    require(r"p->provenance\s*==\s*provenance", pair_find,
+            "whole-pair aliases must preserve authority/hosted/orphan provenance")
+    require(r"p->pair_id\s*==\s*pair_id", pair_find,
+            "whole-pair aliases must require the bound P identity")
+    require(r"manifest_pair_equal", pair_find,
+            "whole-pair aliases must require exact normalized manifest identity")
+    require(r"MANIFEST_PROVENANCE_AMBIGUOUS", pair_find,
+            "malformed/ambiguous provenance must never authorize dedup")
+    pair_commit = function_body(source, "loaded_pair_commit")
+    require(r"malloc", pair_commit,
+            "canonical pair identity must be retained independently of mutable files")
+    require(r"memcpy", pair_commit,
+            "canonical pair identity must be copied at complete registration")
     require(r"!arr\[i\]\.has_crc\s*\|\|\s*arr\[i\]\.n\s*<=\s*0", source,
             "runtime must reject legacy no-CRC/empty-range manifests")
     require(r"contains_entry", source,
@@ -120,22 +142,47 @@ def main() -> int:
     suppress = function_body(source, "cache_entry_suppress_at_capacity")
     require(r"s_cand_n\s*<\s*CAND_CAP", suppress,
             "capacity suppression must occur only at the permanent full state")
-    require(r"e->capacity_suppressed\s*=\s*1", suppress,
-            "full bundles must be memoized to prevent per-dispatch loader churn")
-    require(r"overlay_image_warm_drop_all\s*\(\)", suppress,
+    require(r"cache_entry_suppress_for_shortfall", suppress,
+            "full-cap suppression must share the durable shortfall path")
+    shortfall = function_body(source, "cache_entry_suppress_for_shortfall")
+    require(r"needed\s*<=\s*CAND_CAP\s*-\s*s_cand_n", shortfall,
+            "a bundle must be suppressed only when it cannot fit atomically")
+    require(r"e->capacity_suppressed\s*=\s*1", shortfall,
+            "oversized bundles must be memoized to prevent loader retry churn")
+    require(r"overlay_image_warm_drop_all\s*\(\)", shortfall,
             "permanent capacity exhaustion must release speculative DLL mappings")
+    require(r"overlay_image_warm_cancel\s*\(ci\)", shortfall,
+            "near-cap shortfall must cancel that bundle's speculative mapping")
+    require(r"overlay_image_warm_release\s*\(ci\)", shortfall,
+            "near-cap shortfall must release that bundle's speculative mapping")
     warm_queue = function_body(source, "overlay_image_warm_queue")
     require(r"s_capacity_warm_dropped\s*\|\|\s*"
             r"s_cand_n\s*>=\s*CAND_CAP", warm_queue,
             "warm queue must stay disabled after permanent capacity exhaustion")
-    require(r"s_cand_overflow\s*\+=\s*dropped", suppress,
+    require(r"s_cache_idx\[ci\]\.capacity_suppressed", warm_queue,
+            "near-cap suppressed bundles must never be re-warmed")
+    require(r"s_cand_overflow\s*\+=\s*\(uint64_t\)needed", shortfall,
             "suppressed manifest identities must remain visible in telemetry")
 
     load_one = function_body(source, "load_one_dll")
+    parse_pos = load_one.find("parse_manifest")
     guard_pos = load_one.find("cache_entry_suppress_at_capacity")
     load_pos = load_one.find("load_overlay_dll")
-    if guard_pos < 0 or load_pos < 0 or guard_pos > load_pos:
-        raise AssertionError("capacity guard must run before platform DLL loading")
+    if (parse_pos < 0 or guard_pos < 0 or load_pos < 0 or
+            parse_pos > guard_pos or guard_pos > load_pos):
+        raise AssertionError(
+            "capacity guard must parse aliases before platform DLL loading")
+    require(r"manifest_has_pair_id\s*&&\s*loaded_pair_find", load_one,
+            "known zero-slot pair aliases must bypass full-cap suppression")
+    alias_pos = load_one.find("known_alias")
+    shortfall_pos = load_one.find("cache_entry_suppress_for_shortfall")
+    if alias_pos < 0 or shortfall_pos < 0 or alias_pos > shortfall_pos:
+        raise AssertionError(
+            "alias lookup must precede durable near/full-cap suppression")
+    require(r"registered\s*==\s*0", load_one,
+            "rejected loads must remain retryable")
+    require(r"registered\s*>\s*0\)\s*s_ndlls\+\+", load_one,
+            "pair aliases must not claim a DLL owner/flush slot")
 
     range_match = function_body(source, "range_candidate_matches")
     require(r"first_range_lo\s*=\s*UINT32_MAX", range_match,
@@ -171,11 +218,34 @@ def main() -> int:
             posix_preflight > posix_register):
         raise AssertionError(
             "POSIX must reject a partial-export manifest before registration")
+    for platform, body, close in (
+            ("Windows", windows, "FreeLibrary"),
+            ("POSIX", posix, "psx_overlay_posix_library_close")):
+        alias = body.find("loaded_pair_find")
+        init = body.find("init_fn(&s_callbacks)")
+        register_pos = body.find("cand_register")
+        if alias < 0 or init < 0 or register_pos < 0 or not (
+                alias < init < register_pos):
+            raise AssertionError(
+                f"{platform} aliases must close before init/registration")
+        require(r"man_n\s*>\s*CAND_CAP\s*-\s*s_cand_n", body,
+                f"{platform} new pairs must reject partial capacity atomically")
+        require(r"registered\s*==\s*man_n\s*&&\s*manifest_has_pair_id\)\s*"
+                r"loaded_pair_commit", body,
+                f"{platform} must authorize aliases only after complete registration")
+        require(rf"LOAD_PAIR_ALIAS[^;]*;", body,
+                f"{platform} must return a distinct satisfied-alias result")
+        require(rf"{close}\(h\)", body,
+                f"{platform} alias validation must release its redundant handle")
 
     require(r'\\"candidate_overflow\\":%llu', debug,
             "debug status JSON must expose candidate overflow")
     require(r"overlay_loader_candidate_overflow\(\)", debug,
             "debug status must source candidate overflow from the loader getter")
+    require(r'\\"pair_aliases\\":%llu', debug,
+            "debug status JSON must expose validated whole-pair aliases")
+    require(r"overlay_loader_pair_aliases\(\)", debug,
+            "debug status must source pair aliases from the loader getter")
 
     print("PASS: overlay candidate capacity is bounded, visible, and fail-closed")
     return 0
