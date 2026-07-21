@@ -7,12 +7,10 @@
  */
 #include "psx_icache.h"
 #include "cpu_state.h"
-#include "psx_icache.h"
+#include "psx_cycles.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-extern void psx_advance_cycles(uint32_t cycles);
 
 int psx_icache_enabled(void) {
     static int s = -1;
@@ -60,6 +58,11 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
 #endif
 }
 
+void psx_icache_fetch_fn(CPUState* cpu, uint32_t addr) {
+    psx_icache_fetch(cpu, addr);
+}
+
+/* Out-of-line entry for overlay CPS function pointers. */
 void psx_icache_fetch_fn(CPUState* cpu, uint32_t addr) {
     psx_icache_fetch(cpu, addr);
 }

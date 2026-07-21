@@ -234,6 +234,14 @@ static void psx_advance_cycles_exact(uint32_t cycles) {
     psx_next_service_cycle = 0;
 }
 
+void psx_cycles_watchdog_fire(void) {
+    starvation_watchdog_check();
+}
+
+void psx_cycles_pc_sample_fire(void) {
+    starvation_ring_pc_sample();
+}
+
 /* Slow path for the inlined psx_advance_cycles (COSIM / lockstep / conservative). */
 void psx_advance_cycles_slow(uint32_t cycles) {
     { extern int g_ls_replay_active;
