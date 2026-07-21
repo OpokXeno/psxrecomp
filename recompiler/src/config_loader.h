@@ -537,6 +537,13 @@ struct GameConfig {
     // aspect factor (4*den)/(3*num) while revealed, which widens the plane
     // cone by exactly atan((3*num)/(4*den)*tan(theta)); identity at 4:3.
     std::vector<uint32_t> ws_cull_plane_nx_sites;
+
+    // `lw rt,off(rs)` sites loading a per-primitive X-reject bound that is
+    // compared (sltu) against ANDI-masked u16 screen X. While the margins are
+    // revealed the load yields INT32_MAX (reject disabled; the wide-surface
+    // scissor clips the overflow and wrapped off-left coords pass); the
+    // vanilla loaded value at 4:3. Empty by default; regen required.
+    std::vector<uint32_t> ws_cull_xclip_load_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

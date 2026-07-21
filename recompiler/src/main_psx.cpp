@@ -159,6 +159,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_vxrange;      // [widescreen.cull] vxrange_sites
     std::set<uint32_t>    ws_cull_depth;        // [widescreen.cull] depth_sites
     std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
+    std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
     std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };   // [widescreen.cull] screen_h_imms
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
@@ -203,6 +204,7 @@ int main(int argc, char** argv) {
         ws_cull_vxrange.insert(cfg.ws_cull_vxrange_sites.begin(), cfg.ws_cull_vxrange_sites.end());
         ws_cull_depth.insert(cfg.ws_cull_depth_sites.begin(), cfg.ws_cull_depth_sites.end());
         ws_cull_plane_nx.insert(cfg.ws_cull_plane_nx_sites.begin(), cfg.ws_cull_plane_nx_sites.end());
+        ws_cull_xclip_load.insert(cfg.ws_cull_xclip_load_sites.begin(), cfg.ws_cull_xclip_load_sites.end());
         ws_cull_w_imms = cfg.ws_cull_w_imms;
         ws_cull_h_imms = cfg.ws_cull_h_imms;
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
@@ -280,6 +282,7 @@ int main(int argc, char** argv) {
         ws_cull_vxrange.insert(wscfg.ws_cull_vxrange_sites.begin(), wscfg.ws_cull_vxrange_sites.end());
         ws_cull_depth.insert(wscfg.ws_cull_depth_sites.begin(), wscfg.ws_cull_depth_sites.end());
         ws_cull_plane_nx.insert(wscfg.ws_cull_plane_nx_sites.begin(), wscfg.ws_cull_plane_nx_sites.end());
+        ws_cull_xclip_load.insert(wscfg.ws_cull_xclip_load_sites.begin(), wscfg.ws_cull_xclip_load_sites.end());
         ws_cull_w_imms = wscfg.ws_cull_w_imms;
         ws_cull_h_imms = wscfg.ws_cull_h_imms;
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
@@ -1051,6 +1054,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_vxrange_sites = ws_cull_vxrange;
     codegen_config.ws_cull_depth_sites = ws_cull_depth;
     codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
+    codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;

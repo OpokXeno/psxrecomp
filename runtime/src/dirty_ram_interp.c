@@ -1749,6 +1749,9 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
             /* Side-plane normal-X: inverse-aspect scale while revealed. */
             cpu->gpr[rt] = (uint32_t)psx_ws_plane_nx(
                 (int32_t)psx_cyc_load_word(cpu, addr, rt, 1u << rs));
+        else if (psx_ws_is_cull_xclip_load_site(pc))
+            /* Per-prim X-reject bound: INT32_MAX while revealed (gpu.c). */
+            cpu->gpr[rt] = psx_ws_xclip_bound(psx_cyc_load_word(cpu, addr, rt, 1u << rs));
         else
             cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;

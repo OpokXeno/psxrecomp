@@ -418,6 +418,26 @@ int32_t psx_ws_plane_nx(int32_t nx) {
     return (int32_t)result;
 }
 
+static uint32_t ws_explicit_xclip_load_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_xclip_load_n = 0;
+void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_xclip_load_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_xclip_load_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_xclip_load_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_xclip_load_sites, ws_explicit_xclip_load_n, pc);
+}
+/* Per-primitive X-reject bound ([widescreen.cull] xclip_load_sites). While
+ * the margins are revealed the reject is disabled (INT32_MAX passes every
+ * ANDI-masked u16 screen X, including wrapped off-left coords at 655xx); the
+ * wide-surface scissor clips the overflow. Vanilla loaded value at 4:3. */
+uint32_t psx_ws_xclip_bound(uint32_t vanilla) {
+    return psx_ws_x_margin() > 0 ? 0x7FFFFFFFu : vanilla;
+}
+
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
     /* Native-wide: widen the world-space draw cull by the per-side reveal
