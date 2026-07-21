@@ -261,7 +261,9 @@ extern "C" uint16_t psx_guest_read_half(uint32_t addr);
 extern "C" uint8_t  psx_guest_read_byte(uint32_t addr);
 
 /* ---- SDL state ---- */
-static SDL_Window*   sdl_window;
+extern "C" {
+SDL_Window* sdl_window = nullptr;
+}
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
 /* Per-player input device routing (PSX ports 1 & 2). Seeded from the
@@ -284,6 +286,25 @@ static PlayerInput g_players[2];
  * 640*scale x 512*scale. Allocated once the supersampling scale is known
  * (sized for the native 640x512 when supersampling is off). */
 static uint32_t*     sdl_pixel_buf = nullptr;
+
+typedef void (*ModFrameHook)(void);
+
+static std::vector<ModFrameHook>& mod_frame_hooks() {
+    static std::vector<ModFrameHook> hooks;
+    return hooks;
+}
+
+/* Statically linked mod code can register per-frame callbacks here. Hooks run
+ * after normal input sampling and before presentation/widescreen frame work. */
+extern "C" void mod_register_frame_hook(ModFrameHook hook) {
+    if (hook) mod_frame_hooks().push_back(hook);
+}
+
+static void mod_call_frame_hooks() {
+    auto& hooks = mod_frame_hooks();
+    const size_t count = hooks.size();
+    for (size_t i = 0; i < count; i++) hooks[i]();
+}
 
 /* Presentation-only interpolation for software-rendered content that repeats
  * each guest image for two vblanks. This never changes guest or audio timing. */
@@ -2926,6 +2947,9 @@ static void sdl_vblank_present(void) {
         sample_pad_into_sio(override);
         latency_ring_restamp_input();
     }
+
+    /* Mod hooks. Run after all normal input sampling. */
+    mod_call_frame_hooks();
 
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
     if (!g_ws_engaged) {
