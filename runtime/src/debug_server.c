@@ -123,6 +123,22 @@ static size_t s_resp_len = 0, s_resp_cap = 0;
 static int    s_resp_overflow = 0;
 static int    s_in_command = 0;            /* 1 while emu runs process_command  */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
+static volatile int s_fmv_quiet = 0;
+
+void debug_server_set_fmv_quiet(int quiet)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PSX_DEBUG_FMV_QUIET");
+        enabled = (!env || env[0] != '0') ? 1 : 0;
+    }
+    s_fmv_quiet = enabled && quiet;
+}
+
+int debug_server_fmv_quiet(void)
+{
+    return s_fmv_quiet ? 1 : 0;
+}
 
 /* ---- Frame counter (set by record_frame caller) ---- */
 /* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
@@ -2019,6 +2035,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
 #ifndef PSX_NO_DEBUG_TOOLS
+    if (s_fmv_quiet) return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
@@ -2232,6 +2249,7 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     (void)block_leader_phys;
     return;
 #else
+    if (s_fmv_quiet) return;
     cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
     /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
      * on the armed frame window; ~free (one branch) when disarmed. */
@@ -2245,6 +2263,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     (void)func_addr;
     return;
 #endif
+    if (s_fmv_quiet) return;
     ls_suppress_begin();
     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
      * (normalized) block leader. Sampled before the block runs. */
@@ -8399,6 +8418,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     (void)phys; (void)old_val; (void)new_val; (void)width;
     return;
 #endif
+    if (s_fmv_quiet) return;
     if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
     fp_record_write(phys, new_val, g_debug_last_store_pc);
     {
@@ -8427,6 +8447,7 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     (void)addr; (void)val; (void)width;
     return;
 #endif
+    if (s_fmv_quiet) return;
     /* First-divergence fingerprint + frame recorder also see device writes. */
     fp_record_mmio(addr, val, g_debug_last_store_pc);
     rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
@@ -8470,12 +8491,13 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
  * livelock that polls them. `val` is the value the CPU actually loaded. */
 void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
 {
-    rec_event(REC_KIND_MMIO_R, addr, val, g_debug_last_store_pc,
-              debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)addr; (void)val; (void)width;
     return;
 #endif
+    if (s_fmv_quiet) return;
+    rec_event(REC_KIND_MMIO_R, addr, val, g_debug_last_store_pc,
+              debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
     if (!s_mmio_rtrace || s_mmio_rtrace_range_count == 0) return;
     if (capture_frozen()) return;
     uint32_t phys = addr & 0x1FFFFFFFu;
@@ -12949,6 +12971,11 @@ void debug_server_poll(void)
 
 void debug_server_record_frame(void)
 {
+    if (s_fmv_quiet) {
+        s_history_count = s_frame_count + 1;
+        s_frame_count++;
+        return;
+    }
     if (!s_frame_history) return;
     if (!s_cpu) return;
 
@@ -13041,6 +13068,7 @@ void debug_server_wait_if_paused(void)
 
 void debug_server_check_watchpoints(void)
 {
+    if (s_fmv_quiet) return;
     if (s_client == SOCK_INVALID) return;
 
     for (int i = 0; i < MAX_WATCHPOINTS; i++) {
