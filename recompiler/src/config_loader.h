@@ -761,10 +761,12 @@ struct UserSettings {
     bool has_fast_boot      = false; bool fast_boot      = false;
     // HLE BIOS tier toggle (see RuntimeConfig::bios_hle). Overrides game.toml.
     bool has_bios_hle       = false; bool bios_hle       = false;
-    // [video] fullscreen: launch the game window in desktop fullscreen (the
-    // launcher's "Fullscreen on launch" toggle; the in-game F11 / Alt+Enter
-    // hotkey still toggles it live). false => windowed (default).
-    bool has_fullscreen     = false; bool fullscreen     = false;
+    // [video] fullscreen: universal tri-state (matches every recomp-ui console's
+    // launcher control). 0 = windowed (default), 1 = borderless desktop
+    // fullscreen, 2 = exclusive fullscreen (real display-mode change). The
+    // in-game Alt+Enter / Cmd+Ctrl+F hotkey toggles live between windowed and
+    // whichever of these is configured.
+    bool has_fullscreen     = false; int  fullscreen     = 0;
     // Low-latency present knobs. low_latency_input re-samples the pad after the
     // wall-clock pacer (just before present) so the next CPU frame reads fresh
     // input instead of input ~one frame stale (the dominant input->photon cost

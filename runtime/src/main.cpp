@@ -404,7 +404,8 @@ static int           g_video_scale = 1;     /* internal-resolution SSAA factor *
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
-static int           g_fullscreen     = 0;  /* launch the game window in desktop fullscreen */
+static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
+                                              * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -438,6 +439,15 @@ static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
 static double        g_host_refresh_hz = 0.0;
+
+/* Map the configured tri-state fullscreen mode (g_fullscreen) to the SDL
+ * window-fullscreen flag: used both to open the window in that mode and to
+ * pick the hotkey's fullscreen target. */
+static Uint32 psx_fullscreen_flag_for_mode(int mode) {
+    if (mode == 2) return SDL_WINDOW_FULLSCREEN;         /* exclusive */
+    if (mode == 1) return SDL_WINDOW_FULLSCREEN_DESKTOP; /* borderless */
+    return 0;                                            /* windowed */
+}
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -2677,15 +2687,28 @@ static void sdl_vblank_present(void) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();
                 }
-                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. FULLSCREEN_DESKTOP
-                 * keeps the desktop resolution; the renderer's logical size
-                 * letterboxes the 640x480 image. */
+                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. Toggles between
+                 * windowed and the CONFIGURED tri-state mode (g_fullscreen: 1
+                 * borderless desktop fullscreen keeping the desktop resolution
+                 * and letterboxing the image, or 2 exclusive fullscreen — a
+                 * real display-mode change). SDL_WINDOW_FULLSCREEN's bit is
+                 * set in both SDL_WINDOW_FULLSCREEN and
+                 * SDL_WINDOW_FULLSCREEN_DESKTOP, so testing just that bit
+                 * detects "currently fullscreen, either mode". */
                 else if ((ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
                          (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
                     Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                                   SDL_WINDOW_FULLSCREEN_DESKTOP;
-                    SDL_SetWindowFullscreen(sdl_window,
-                        is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                                   SDL_WINDOW_FULLSCREEN;
+                    if (is_fs) {
+                        SDL_SetWindowFullscreen(sdl_window, 0);
+                    } else {
+                        /* If the configured mode is "off", the hotkey still
+                         * needs a mode to switch INTO — default to borderless,
+                         * matching the historical (pre-tri-state) behaviour. */
+                        Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
+                        if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
+                        SDL_SetWindowFullscreen(sdl_window, target);
+                    }
                 }
             }
         }
@@ -3796,7 +3819,7 @@ int main(int argc, char** argv) {
         if (us.has_turbo_loads)    g_turbo_loads_enabled = us.turbo_loads ? 1 : 0;
         if (us.has_fast_boot)      fast_boot = us.fast_boot;
         if (us.has_bios_hle)       bios_hle  = us.bios_hle;
-        if (us.has_fullscreen)     g_fullscreen      = us.fullscreen ? 1 : 0;
+        if (us.has_fullscreen)     g_fullscreen      = us.fullscreen;
         if (us.has_aspect_ratio) {
             g_video_aspect_num = us.aspect_num;
             g_video_aspect_den = us.aspect_den;
@@ -3965,7 +3988,7 @@ int main(int argc, char** argv) {
             seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
-            seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
+            seed.fullscreen = g_fullscreen;                seed.has_fullscreen = true;
             seed.frame_interpolation = (g_frame_interpolation != 0);
             seed.has_frame_interpolation = true;
             seed.frame_interpolation_fps = g_frame_interpolation_fps;
@@ -4008,7 +4031,7 @@ int main(int argc, char** argv) {
             RecompLauncherCSettings ls{};
             ls.output_method  = 2;  /* OpenGL */
             ls.window_scale   = std::max(1, std::min(4, g_video_win_w / 320));
-            ls.fullscreen     = seed.fullscreen ? 1 : 0;
+            ls.fullscreen     = seed.fullscreen;
             ls.ignore_aspect  = 0;
             ls.linear_filter  = (seed.texture_filter != 0) ? 1 : 0;
             ls.widescreen     = (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
@@ -4152,7 +4175,7 @@ int main(int argc, char** argv) {
                     seed.disc_path = rui_out_disc;
                     seed.has_disc_path = true;
                 }
-                seed.fullscreen    = ls.fullscreen != 0;      seed.has_fullscreen = true;
+                seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
                 /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
                  * legacy ls.widescreen bool (still set above for older callers). */
@@ -4265,7 +4288,7 @@ int main(int argc, char** argv) {
                 g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
-                g_fullscreen      = seed.fullscreen ? 1 : 0;
+                g_fullscreen      = seed.fullscreen;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
@@ -4573,10 +4596,11 @@ int main(int argc, char** argv) {
         win_flags |= SDL_WINDOW_OPENGL;
     }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
-    /* Fullscreen on launch (launcher "Fullscreen on launch" toggle). DESKTOP
-     * fullscreen keeps the desktop resolution and letterboxes the image, matching
-     * the in-game F11 / Alt+Enter hotkey behaviour. */
-    if (g_fullscreen) win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
+     * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
+     * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
+     * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
+    win_flags |= psx_fullscreen_flag_for_mode(g_fullscreen);
     /* Open at the user-chosen window size (default 1280 wide) instead of the
      * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
      * height follows the configured display aspect (4:3 native, wider for the
