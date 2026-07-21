@@ -115,6 +115,11 @@ struct CodeGenConfig {
     // (inverse-aspect scale while revealed, identity at 4:3).
     std::set<uint32_t> ws_cull_plane_nx_sites;
 
+    // Per-primitive X-reject bound load sites ([widescreen.cull]
+    // xclip_load_sites). The configured lw routes through the runtime helper
+    // (INT32_MAX while revealed, vanilla at 4:3); empty by default.
+    std::set<uint32_t> ws_cull_xclip_load_sites;
+
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
     // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).

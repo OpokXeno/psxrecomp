@@ -2270,6 +2270,10 @@ static void init_callbacks(void) {
             extern int32_t psx_ws_plane_nx(int32_t nx);
             s_callbacks.ws_plane_nx = psx_ws_plane_nx;
         }
+        {
+            extern uint32_t psx_ws_xclip_bound(uint32_t vanilla);
+            s_callbacks.ws_xclip_bound = psx_ws_xclip_bound;
+        }
     }
 }
 

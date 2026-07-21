@@ -148,6 +148,7 @@ void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_plane_nx_sites(const uint32_t *sites, int nsites);
+void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
 int  psx_ws_is_cull_negsub_site(uint32_t pc);
@@ -157,6 +158,8 @@ int32_t psx_ws_depth_bound(int32_t imm);
 int  psx_ws_is_cull_range_site(uint32_t pc);
 int  psx_ws_is_cull_plane_nx_site(uint32_t pc);
 int32_t  psx_ws_plane_nx(int32_t nx);
+int  psx_ws_is_cull_xclip_load_site(uint32_t pc);
+uint32_t psx_ws_xclip_bound(uint32_t vanilla);
 /* Scale a signed Q16 horizontal gameplay limit into the active native-wide
  * game field. Identity at 4:3 / menus / FMV. */
 int32_t psx_ws_player_x_bound(int32_t vanilla);
