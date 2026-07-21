@@ -1724,18 +1724,40 @@ static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t si
 #endif
 }
 
-/* Slow path for non-main-RAM / lockstep / data-shard loads (inlined helper falls here). */
+/* Production value-read fast path for the overwhelmingly common main-RAM
+ * load. Timing has already run before this helper is consulted, so a device
+ * deadline (and any DMA it services) remains ordered before the value read.
+ *
+ * Keep this host-local: generated overlay DLLs flush their pending cycles
+ * before entering psx_cyc_load_* and must not depend on runtime globals. Every
+ * mode with observable read-side instrumentation falls back to psx_read_*.
+ * The physical-range test is done before the 2 MiB mirror fold so MMIO, BIOS,
+ * scratchpad, KSEG2/cache-control and open-bus behavior remain canonical. */
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
+static inline int psx_cyc_main_ram_fast_addr(uint32_t addr, uint32_t width,
+                                             uint32_t *phys_out) {
+    if (g_ls_mode != 0 || g_ls_replay_active || g_ds_recording ||
+        g_ram_read_watch_active ||
+        g_dma_exec_depth > 0 || addr >= 0xC0000000u)
+        return 0;
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= 0x00800000u) return 0;
+    phys &= (uint32_t)(RAM_SIZE - 1);
+    /* Aligned guest loads cannot cross this boundary, but fail closed for a
+     * malformed/unaligned caller instead of introducing a host OOB read. */
+    if (phys > (uint32_t)RAM_SIZE - width) return 0;
+    *phys_out = phys;
+    return 1;
+}
+#endif
+
+/* Slow paths for the inlined helpers in psx_cyc.h (MMIO / lockstep / shards). */
 uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
-    if (g_ls_mode == 0 && !g_ds_recording) return psx_read_word_raw(addr);
     return psx_read_word(addr);
 }
 uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
-    if (g_ls_mode == 0 && !g_ds_recording) {
-        /* mirror psx_read_half_raw path for production */
-        return psx_read_half(addr);
-    }
     return psx_read_half(addr);
 }
 void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
