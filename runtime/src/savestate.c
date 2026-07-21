@@ -26,6 +26,8 @@ static int      s_configured   = 0;
 static int      s_save_pending = -1;   /* slot, or -1 */
 static int      s_load_pending = -1;
 static int      s_load_completed = 0;
+static uint64_t s_load_cooldown_until_frame = 0;
+static int      s_load_cooldown_notice = 0;
 
 extern int psx_hle_scheduler_enabled(void);
 extern uint64_t s_frame_count;
@@ -134,8 +136,10 @@ int savestate_write_slot(int slot, const void* data, size_t size) {
     return 1;
 }
 
-static int netplay_guest_user_blocked(void) {
-    return psx_netplay_active() && !psx_netplay_is_host();
+static int netplay_savestate_blocked(void) {
+    if (!psx_netplay_active()) return 0;
+    fprintf(stderr, "savestate: disabled during netplay\n");
+    return 1;
 }
 
 static int request_save_inner(int slot) {
@@ -167,20 +171,22 @@ static int request_load_inner(int slot) {
 }
 
 int savestate_request_save(int slot) {
-    if (netplay_guest_user_blocked()) return 0;
+    if (netplay_savestate_blocked()) return 0;
     return request_save_inner(slot);
 }
 
 int savestate_request_load(int slot) {
-    if (netplay_guest_user_blocked()) return 0;
+    if (netplay_savestate_blocked()) return 0;
     return request_load_inner(slot);
 }
 
 int savestate_request_save_protocol(int slot) {
+    if (netplay_savestate_blocked()) return 0;
     return request_save_inner(slot);
 }
 
 int savestate_request_load_protocol(int slot) {
+    if (netplay_savestate_blocked()) return 0;
     return request_load_inner(slot);
 }
 

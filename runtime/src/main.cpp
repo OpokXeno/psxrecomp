@@ -3818,6 +3818,7 @@ int main(int argc, char** argv) {
     int         cli_debug_port = -1;
     int         cli_renderer   = -1;   /* 0=software 1=opengl 2=vulkan */
     const char* cli_window_title = nullptr;  /* label windows in a fleet */
+    const char* cli_memcard_dir = nullptr;   /* isolate writable state in a fleet */
     PsxNetplayConfig net_cfg;
     psx_netplay_config_defaults(&net_cfg);
     psx_netplay_apply_env(&net_cfg);  /* CLI flags below win over env */

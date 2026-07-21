@@ -21,6 +21,24 @@ uint32_t g_psx_cyc_batch = 0;
 static int      s_cycle_replay_active = 0;
 static uint64_t s_cycle_replay_live = 0;
 
+int psx_cycle_replay_begin(uint64_t start_cycle) {
+    extern int g_ls_replay_active;
+    if (!g_ls_replay_active || s_cycle_replay_active) return 0;
+    s_cycle_replay_live = psx_cycle_count;
+    psx_cycle_count = start_cycle;
+    s_cycle_replay_active = 1;
+    return 1;
+}
+
+uint64_t psx_cycle_replay_end(void) {
+    uint64_t replay_cycle = psx_cycle_count;
+    if (s_cycle_replay_active) {
+        psx_cycle_count = s_cycle_replay_live;
+        s_cycle_replay_active = 0;
+    }
+    return replay_cycle;
+}
+
 /* Throttle watchdog check to once per ~64K cycles (header hot path). */
 uint32_t psx_watchdog_throttle = 0;
 uint32_t psx_pc_sample_throttle = 0;
@@ -503,15 +521,6 @@ void psx_cycles_resync_after_restore(void) {
     s_devices_synced_cycle = psx_cycle_count;
     psx_next_service_cycle = 0;   /* recompute on next charge */
     psx_in_device_service  = 0;
-}
-
-void psx_cycles_reset_for_boot(void) {
-    psx_cycle_count        = 0;
-    s_devices_synced_cycle = 0;
-    psx_next_service_cycle = 0;
-    psx_in_device_service  = 0;
-    s_next_watchdog        = 0;
-    s_next_pc_sample       = 0;
 }
 
 void psx_cycles_reset_for_boot(void) {

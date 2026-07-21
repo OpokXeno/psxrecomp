@@ -998,6 +998,9 @@ int psx_netplay_request_save(int slot)
 {
     if (!psx_netplay_active() || !rnet_session_is_running(g_np.session))
         return 0;
+    printf("psxrecomp: netplay savestates are disabled\n");
+    fflush(stdout);
+    return 1;
     if (g_np.local_slot != 0)
         return 1; /* guest: host-only; ignore */
     if (np_xfer_busy() || !g_np.mc_sync_done)
@@ -1023,6 +1026,9 @@ int psx_netplay_request_load(int slot)
     uint32_t size = 0, crc = 0;
     if (!psx_netplay_active() || !rnet_session_is_running(g_np.session))
         return 0;
+    printf("psxrecomp: netplay savestates are disabled\n");
+    fflush(stdout);
+    return 1;
     if (g_np.local_slot != 0)
         return 1;
     if (np_xfer_busy() || !g_np.mc_sync_done)
