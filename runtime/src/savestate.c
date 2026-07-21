@@ -1,4 +1,4 @@
-/* savestate.c — user save states (F1-F12 / Shift+F1-F12). See savestate.h.
+/* savestate.c — user save states (Shift+F1-F12 save, F1-F12 load). See savestate.h.
  *
  * Wraps boot_state.c's full-machine serializer. Requests are staged by the SDL
  * key handler / debug server and executed by savestate_poll at a block-leader
@@ -18,8 +18,13 @@ static uint32_t s_entry_pc;
 static int      s_configured   = 0;
 static int      s_save_pending = -1;   /* slot, or -1 */
 static int      s_load_pending = -1;
+static uint64_t s_load_cooldown_until_frame = 0;
+static int      s_load_cooldown_notice = 0;
 
 extern int psx_hle_scheduler_enabled(void);
+extern uint64_t s_frame_count;
+
+#define SAVESTATE_LOAD_COOLDOWN_FRAMES 60u
 
 void savestate_configure(const char* dir, uint32_t bios_checksum, uint32_t entry_pc) {
     if (dir && dir[0]) {
@@ -52,6 +57,13 @@ int savestate_request_save(int slot) {
 int savestate_request_load(int slot) {
     if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
     if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
+    if (s_frame_count < s_load_cooldown_until_frame) {
+        if (!s_load_cooldown_notice) {
+            fprintf(stderr, "savestate: load ignored during restore cooldown\n");
+            s_load_cooldown_notice = 1;
+        }
+        return 1;
+    }
     if (!psx_hle_scheduler_enabled()) {
         /* LLE (host-fiber) mode: the restore longjmp target lives on the
          * scheduler fiber; cross-fiber unwind is unsafe. HLE is the default. */
@@ -88,6 +100,9 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         if (!slot_path(slot, path, sizeof(path))) return;
         if (boot_state_load(path, s_bios_checksum, s_entry_pc, cpu)) {
             psx_cycles_resync_after_restore();
+            s_load_cooldown_until_frame =
+                s_frame_count + SAVESTATE_LOAD_COOLDOWN_FRAMES;
+            s_load_cooldown_notice = 0;
             fprintf(stderr, "savestate: LOADED slot %d -> resuming pc=0x%08X\n",
                     slot, (unsigned)cpu->pc);
             /* Unwind to the scheduler and re-dispatch the restored PC. Never

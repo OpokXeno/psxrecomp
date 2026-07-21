@@ -195,7 +195,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         if (len != sizeof(CpuRegs)) return 0;
         const CpuRegs* c = (const CpuRegs*)p;
         memcpy(cpu->gpr,      c->gpr,      sizeof cpu->gpr);
-        cpu->pc = entry_pc;   /* always enter at the game entry, never a mid-PC */
+        (void)entry_pc;       /* validated by the header; CPU section owns resume PC */
+        cpu->pc = c->pc;
         cpu->hi = c->hi; cpu->lo = c->lo;
         memcpy(cpu->cop0,     c->cop0,     sizeof cpu->cop0);
         memcpy(cpu->gte_data, c->gte_data, sizeof cpu->gte_data);
@@ -204,6 +205,11 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
          * words noncanonical.  Repair once at the raw restore boundary so
          * native direct reads and interpreter helpers remain tier-identical. */
         gte_canonicalize_cpu_state(cpu);
+        /* These absolute guest-cycle deadlines are not serialized in CpuRegs.
+         * If a restore moves psx_cycle_count backward, stale live deadlines can
+         * sit far in the future and stall the next MFLO/MFHI or GTE read. */
+        cpu->muldiv_ts_done = 0;
+        cpu->gte_ts_done    = 0;
         return 1;
     }
     case BS_SEC_RAM:
@@ -318,8 +324,8 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
         return 0;
     }
 
-    fprintf(stdout, "boot_state: complete snapshot restored, entering game at 0x%08X\n",
-            entry_pc);
+    fprintf(stdout, "boot_state: complete snapshot restored, resuming at 0x%08X\n",
+            cpu->pc);
     return 1;
 }
 
