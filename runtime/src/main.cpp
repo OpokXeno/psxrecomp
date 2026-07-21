@@ -54,9 +54,6 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "disc_identity.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
-#if defined(PSX_LAUNCHER)
-#include "launcher.h"
-#endif
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher (prototype) */
 #include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
@@ -3249,8 +3246,7 @@ static void sdl_vblank_present(void) {
 #if defined(RECOMP_LAUNCHER)
 // Host verification/inspection callbacks for the shared recomp-ui launcher.
 // The launcher re-runs these on every disc/memory-card change so the "Disc
-// verified" verdict + memcard block grids reflect the REAL images (parity with
-// the old RmlUi launcher, which computed the same facts inline). The expected
+// verified" verdict + memcard block grids reflect the REAL images. The expected
 // serial/CRC are passed via these file-scope statics (set just before
 // recomp_launcher_run_window) because the C-ABI callback can't capture locals.
 namespace {
@@ -3268,7 +3264,7 @@ namespace {
         std::snprintf(out->serial, sizeof(out->serial), "%s", serial.c_str());
         std::snprintf(out->region, sizeof(out->region), "%s", id.region.c_str());
         out->iso_ok = id.has_header ? 1 : 0;
-        // Verdict, mirroring the RmlUi launcher's state machine.
+        // Verdict state consumed by the launcher UI.
         if (!id.opened || !id.has_header)                            out->verdict = 3; // bad
         else if (id.expected_serial_given && !id.serial_matches)     out->verdict = 3; // wrong disc
         else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) out->verdict = 2; // warn
@@ -3432,6 +3428,7 @@ int main(int argc, char** argv) {
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
     bool ws_ultrawide_offered = false;
+    bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
@@ -3603,6 +3600,7 @@ int main(int argc, char** argv) {
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
             ws_ultrawide_offered = gc.ws_ultrawide_offered;
+            vulkan_offered = gc.vulkan_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -3870,7 +3868,16 @@ int main(int argc, char** argv) {
                 "again from the launcher (a fresh settings.toml will be written).");
         }
         if (us.has_skip_launcher)  skip_launcher_setting = us.skip_launcher;
-        if (us.has_renderer)       g_video_renderer  = us.renderer;
+        if (us.has_renderer) {
+            if (us.renderer == 2 && !vulkan_offered) {
+                g_video_renderer = 1;
+                std::fprintf(stdout,
+                    "psxrecomp: settings requested Vulkan, but this game does not "
+                    "offer Vulkan in the launcher; using OpenGL.\n");
+            } else {
+                g_video_renderer = us.renderer;
+            }
+        }
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
@@ -4024,8 +4031,8 @@ int main(int argc, char** argv) {
         }
     }
 
-#if defined(PSX_LAUNCHER)
-    /* Integrated launcher: shown in its own GL window before the emulator
+#if defined(RECOMP_LAUNCHER)
+    /* Integrated recomp-ui launcher: shown in its own GL window before the emulator
      * boots. Seeded with the effective settings (game.toml ∪ settings.toml);
      * on LAUNCH the user's choices are persisted to settings.toml and applied.
      * The launcher window/context is fully torn down before the emulator's own
@@ -4075,16 +4082,8 @@ int main(int argc, char** argv) {
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
 
-#if defined(RECOMP_LAUNCHER)
-            /* ---- recomp-ui (Dear ImGui) launcher path — PROTOTYPE ----------
-             * Runs the shared, console-agnostic recomp-ui launcher (see
-             * F:\Projects\recomp-ui) INSTEAD OF the RmlUi launcher above. Unlike
-             * psx_launcher::run, recomp_launcher_run_window() creates + owns its
-             * own SDL2/GL window internally, so there is no lwin/lctx to manage
-             * here and no GL-attribute pre-configuration needed. The result is
-             * funneled into the same `seed` / `lr` locals the shared
-             * post-launcher block below (Quit / Launch handling + settings.toml
-             * persistence) already consumes, so that code needs no changes. */
+            /* recomp-ui creates + owns its SDL2/GL window internally, so there
+             * is no launcher window/context to manage here. */
             std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
             std::string rui_initial_disc = resolved_disc.string();
             std::string rui_title = (game_name.empty() ? std::string("PSX") : game_name)
@@ -4121,6 +4120,8 @@ int main(int argc, char** argv) {
              * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
             ls.window_width      = seed.window_width;
             ls.renderer           = seed.renderer;
+            if (ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1))
+                ls.renderer = 1;
             ls.supersampling      = seed.supersampling;
             ls.antialiasing       = seed.antialiasing ? 1 : 0;
             ls.texture_filter     = seed.texture_filter;
@@ -4132,8 +4133,7 @@ int main(int argc, char** argv) {
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
              * (match by code; games with no [runtime].languages list leave
-             * lang_menu_options empty and this stays 0 / unused), mirroring
-             * lang_index_for() in launcher.cpp (RmlUi path, below). */
+             * lang_menu_options empty and this stays 0 / unused). */
             ls.language_index = 0;
             for (size_t li = 0; li < lang_menu_options.size(); li++) {
                 if (lang_menu_options[li].code == resolved_language) {
@@ -4168,8 +4168,7 @@ int main(int argc, char** argv) {
             const std::string rui_region =
                 !game_region.empty() ? game_region : region_label_from_serial(game_id);
 
-            /* Localization: parallels the RmlUi ginfo.languages push_back loop
-             * below (#else arm) — one C-string array pointing at lang_menu_options'
+            /* Localization: one C-string array pointing at lang_menu_options'
              * own storage (that vector outlives this call, it's a main()-scope
              * local), so no separate copy is needed. Empty when the game declares
              * no [runtime].languages -> Localization stays hidden (num_languages=0). */
@@ -4178,6 +4177,11 @@ int main(int argc, char** argv) {
             for (const auto& lo : lang_menu_options) rui_lang_labels.push_back(lo.label.c_str());
 
             RecompLauncherCGameInfo gi{};
+            static const char* const kPsxRendererLabels[] = {
+                "Software",
+                "OpenGL (Recommended)",
+                "Vulkan"
+            };
             /* System identity + full PS1 settings-surface capability set (theme,
              * platform label, rom_noun, pad-mode support, aspect mask base, and
              * all has_* deep-settings flags) — one profile call keeps them from
@@ -4193,18 +4197,16 @@ int main(int argc, char** argv) {
             gi.num_players          = game_players;
             gi.msu1_supported       = 0;
             gi.sram_path            = nullptr;   /* PSX uses memory cards, not SRAM -> hide SAVES */
-            /* Pad-mode + aspect capabilities, sourced the same way the RmlUi
-             * launcher path (psx_launcher::GameInfo, below in the #else arm)
-             * sources ginfo.allow_hybrid/lock_mode/locked_mode/lock_device/
-             * ws_offered/ws_ultrawide_offered — from game.toml [controller]/
-             * [widescreen] via GameConfig. PSX always has pad modes. */
+            /* Pad-mode + aspect capabilities sourced from game.toml
+             * [controller]/[widescreen] via GameConfig. PSX always has pad modes. */
             gi.pad_mode_selectable  = ctrl_lock_mode ? 0 : 1;
             gi.allow_hybrid         = ctrl_allow_hybrid ? 1 : 0;
             gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
             gi.lock_device          = ctrl_lock_device ? 1 : 0;
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
-            /* Localization menu: shown only when the game declares languages
-             * (mirrors the RmlUi ginfo.languages parity below). */
+            gi.renderer_labels      = kPsxRendererLabels;
+            gi.num_renderers        = vulkan_offered ? 3 : 2;
+            /* Localization menu: shown only when the game declares languages. */
             if (!rui_lang_labels.empty()) {
                 gi.language_labels = rui_lang_labels.data();
                 gi.num_languages   = (int)rui_lang_labels.size();
@@ -4213,7 +4215,7 @@ int main(int argc, char** argv) {
             /* Real disc-verify + memcard-inspect (identify_disc / memcard_summary_path
              * via the ae_* callbacks). The launcher re-runs these whenever the
              * user changes the disc or a memory card, so the verdict + block
-             * grids reflect the actual images — parity with the RmlUi launcher.
+             * grids reflect the actual images.
              * The expected serial/CRC ride on file-scope statics (the C-ABI
              * callback can't capture these locals). */
             g_lnch_expected_serial = game_id;
@@ -4227,12 +4229,9 @@ int main(int argc, char** argv) {
                 rui_title.c_str(), &ls, &gi, assets_dir_str.c_str(),
                 rui_initial_disc.c_str(), rui_out_disc, sizeof(rui_out_disc));
 
-            psx_launcher::Result lr =
-                (rui_rc == 0) ? psx_launcher::Result::Launch :
-                (rui_rc == 1) ? psx_launcher::Result::Quit :
-                                 psx_launcher::Result::Unavailable;
+            int lr = rui_rc; /* 0=Launch, 1=Quit, other=Unavailable */
 
-            if (lr == psx_launcher::Result::Launch) {
+            if (lr == 0) {
                 if (rui_out_disc[0]) {
                     seed.disc_path = rui_out_disc;
                     seed.has_disc_path = true;
@@ -4284,63 +4283,19 @@ int main(int argc, char** argv) {
 
                 /* Localization: persist the chosen language code (only meaningful
                  * when the game declared a menu; otherwise leave seed.language
-                 * untouched) -- mirrors launcher.cpp's io.language write-back
-                 * (RmlUi path, below) exactly, down to the bounds check. */
+                 * untouched. */
                 if (!lang_menu_options.empty() && ls.language_index >= 0 &&
                     ls.language_index < (int)lang_menu_options.size()) {
                     seed.language = lang_menu_options[ls.language_index].code;
                     seed.has_language = true;
                 }
             }
-#else
-            configure_core_gl_context_attributes();
 
-            /* Launcher opens at the same 4:3 size the game will, so there's no
-             * jarring resize on LAUNCH. The dense dashboard needs a usable
-             * minimum, so the launcher floor is 1280 wide even if the game
-             * window is set smaller. */
-            int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
-            int lwin_h = 0;
-            clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
-            std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                     + " \xE2\x80\x94 Launcher";
-            SDL_Window* lwin = SDL_CreateWindow(
-                lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-            psx_launcher::Result lr = psx_launcher::Result::Unavailable;
-            if (lwin) {
-                SDL_GLContext lctx = SDL_GL_CreateContext(lwin);
-                if (lctx) {
-                    SDL_GL_MakeCurrent(lwin, lctx);
-                    SDL_GL_SetSwapInterval(1);
-                    std::string assets = exe_dir_from_argv(argv[0]).string();
-                    psx_launcher::GameInfo ginfo;
-                    ginfo.name             = game_name.empty() ? nullptr : game_name.c_str();
-                    ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
-                    ginfo.expected_crc     = game_disc_crc;
-                    ginfo.has_expected_crc = game_has_disc_crc;
-                    ginfo.allow_hybrid     = ctrl_allow_hybrid;
-                    ginfo.lock_mode        = ctrl_lock_mode;
-                    ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
-                    ginfo.lock_device      = ctrl_lock_device;
-                    ginfo.ws_offered       = ws_offered;
-                    ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
-                    for (const auto& lo : lang_menu_options)
-                        ginfo.languages.push_back({ lo.code, lo.label });
-                    lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
-                    SDL_GL_DeleteContext(lctx);
-                }
-                SDL_DestroyWindow(lwin);
-            }
-            /* Reset GL attributes so the emulator window starts from defaults. */
-            SDL_GL_ResetAttributes();
-#endif
-
-            if (lr == psx_launcher::Result::Quit) {
+            if (lr == 1) {
                 std::fprintf(stdout, "psxrecomp: launcher closed; exiting.\n");
                 return 0;
             }
-            if (lr == psx_launcher::Result::Launch) {
+            if (lr == 0) {
                 g_video_renderer  = seed.renderer;
                 g_video_scale     = seed.supersampling;
                 g_video_aa        = seed.antialiasing;
