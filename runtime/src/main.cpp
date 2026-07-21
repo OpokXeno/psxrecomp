@@ -2656,9 +2656,12 @@ static void sdl_vblank_present(void) {
                          fps_base_title.c_str(), fps, speed);
                 SDL_SetWindowTitle(sdl_window, title);
             }
-            std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
-                         fps, speed, (unsigned long long)s_frame_count);
-            std::fflush(stderr);
+            if (const char *fps_log = std::getenv("PSX_FPS_LOG");
+                fps_log && fps_log[0] && fps_log[0] != '0') {
+                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
+                             fps, speed, (unsigned long long)s_frame_count);
+                std::fflush(stderr);
+            }
             fps_last_time = now;
             fps_last_frame = s_frame_count;
         }
@@ -3560,6 +3563,8 @@ int main(int argc, char** argv) {
                 gc.ws_cull_vxrange_sites.data(), (int)gc.ws_cull_vxrange_sites.size());
             gpu_ws_set_depth_cull_sites(
                 gc.ws_cull_depth_sites.data(), (int)gc.ws_cull_depth_sites.size());
+            gpu_ws_set_plane_nx_sites(
+                gc.ws_cull_plane_nx_sites.data(), (int)gc.ws_cull_plane_nx_sites.size());
             gte_ws_configure_dome_sites(
                 gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the

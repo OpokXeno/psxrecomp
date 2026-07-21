@@ -874,6 +874,30 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // Overlay variant at the same address: leave nonmatching code unchanged.
     }
+    // Side frustum-plane normal-X load: `lw rt,off(rs)` reads the nx of a
+    // plane sign-tested per corner (dot = nx*px + nz*pz). The helper scales
+    // nx by the inverse aspect factor (4*den)/(3*num) while revealed, which
+    // widens the cone by exactly atan((3*num)/(4*den)*tan(theta)); identity
+    // at 4:3.
+    if (config_.ws_cull_plane_nx_sites.count(addr)) {
+        if (opcode == 0x23) {  // lw
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t offset = get_imm16(instr);
+            std::string laddr = (offset == 0)
+                ? reg_name(rs)
+                : fmt::format("{} + {}", reg_name(rs), (int)offset);
+            uint32_t mask = 1u << rs;
+            return fmt::format("{} = (uint32_t)psx_ws_plane_nx((int32_t)psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                               "  /* ws cull plane nx load */{}",
+                               reg_name(rt), laddr, rt, mask, comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] plane_nx site 0x{:08X} is not "
+                       "lw (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
     if (config_.ws_cull_range_sites.count(addr)) {
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
@@ -2737,6 +2761,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
+    ss << "extern int32_t psx_ws_plane_nx(int32_t nx);                /* ws side-plane normal-X scale (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";

@@ -390,6 +390,33 @@ int32_t psx_ws_depth_bound(int32_t imm) {
 int psx_ws_is_cull_range_site(uint32_t pc) {
     return ws_explicit_site(ws_explicit_range_sites, ws_explicit_range_n, pc);
 }
+static uint32_t ws_explicit_plane_nx_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_plane_nx_n = 0;
+void gpu_ws_set_plane_nx_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_plane_nx_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_plane_nx_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_plane_nx_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_plane_nx_sites, ws_explicit_plane_nx_n, pc);
+}
+/* Side frustum-plane normal-X scale ([widescreen.cull] plane_nx_sites). The
+ * plane half-angle goes as atan(nz/nx), so widening the cone by the aspect
+ * ratio means scaling nx by the INVERSE factor (4*den)/(3*num):
+ * atan(nz/(nx*4*den/(3*num))) == atan((3*num)/(4*den)*tan(theta)). Identity
+ * at 4:3 (margin 0). */
+int32_t psx_ws_plane_nx(int32_t nx) {
+    if (psx_ws_x_margin() <= 0) return nx;
+    int64_t numerator = (int64_t)nx * 4 * ws_cfg_den;
+    int64_t denominator = 3 * ws_cfg_num;
+    if (denominator <= 0) return nx;
+    int64_t result = numerator >= 0
+        ? (numerator + denominator / 2) / denominator
+        : -((-numerator + denominator / 2) / denominator);
+    return (int32_t)result;
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
