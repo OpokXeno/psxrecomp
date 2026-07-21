@@ -39,6 +39,15 @@ namespace PSXRecompV4 {
 //   digital — always present a digital pad (id 0x41); sticks disabled.
 enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
 
+// Renderer IDs shared by game.toml/settings parsing and runtime startup.
+// OpenGL is the default because the Windows software/SDL_Renderer path is slow
+// enough to mask interpreter/AOT performance work and can present as a false
+// 30 FPS regression. Software remains an explicit opt-in fallback.
+inline constexpr int VIDEO_RENDERER_SOFTWARE = 0;
+inline constexpr int VIDEO_RENDERER_OPENGL = 1;
+inline constexpr int VIDEO_RENDERER_VULKAN = 2;
+inline constexpr int DEFAULT_VIDEO_RENDERER = VIDEO_RENDERER_OPENGL;
+
 struct WidescreenSignedBoundSite {
     uint32_t address = 0;
     uint32_t expected = 0; // guarded LUI instruction
@@ -221,10 +230,11 @@ struct RuntimeConfig {
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
 
-    // renderer: "software" (default) | "opengl". Selects the rasterizer/present
+    // renderer: "software" | "opengl" (default). Selects the rasterizer/present
     // backend. The OpenGL backend is a hardware-accelerated alternative; the
-    // software rasterizer remains the fallback. Stored as 0=software, 1=opengl.
-    int                   video_renderer = 0;
+    // software rasterizer remains the explicit fallback. Stored as
+    // VIDEO_RENDERER_*.
+    int                   video_renderer = DEFAULT_VIDEO_RENDERER;
 
     // low_latency_input: re-sample the pad after the wall-clock pacer (just
     // before present) so the next CPU frame reads near-fresh input instead of
