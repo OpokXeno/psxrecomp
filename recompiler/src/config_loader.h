@@ -230,11 +230,15 @@ struct RuntimeConfig {
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
 
-    // renderer: "software" | "opengl" (default). Selects the rasterizer/present
-    // backend. The OpenGL backend is a hardware-accelerated alternative; the
-    // software rasterizer remains the explicit fallback. Stored as
-    // VIDEO_RENDERER_*.
+    // renderer: "software" | "opengl" (default) | "vulkan". Selects the
+    // rasterizer/present backend. The software rasterizer remains the explicit
+    // fallback. Stored as VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
+
+    // offer_vulkan: expose the experimental Vulkan renderer in the launcher.
+    // Defaults false even for Vulkan-enabled builds; developers must opt in per
+    // game once visuals are validated.
+    bool                  video_offer_vulkan = false;
 
     // low_latency_input: re-sample the pad after the wall-clock pacer (just
     // before present) so the next CPU frame reads near-fresh input instead of
@@ -687,6 +691,7 @@ struct GameConfig {
     // 16:9 in settings.toml can never engage the hack. Runtime-only (read at
     // startup; no codegen impact) — no regen required.
     bool ws_offered = true;
+    bool vulkan_offered = false;
 
     // [widescreen] offer_ultrawide — expose a separate experimental 21:9
     // launcher choice for titles that have explicitly tested it. Default off;

@@ -311,6 +311,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] renderer must be \"software\", \"opengl\" or \"vulkan\": {}", mode));
         }
+        if (video.contains("offer_vulkan")) {
+            rt.video_offer_vulkan = toml::find<bool>(video, "offer_vulkan");
+        }
         if (video.contains("crt_filter")) {
             const auto mode = toml::find<std::string>(video, "crt_filter");
             if      (mode == "raw")       rt.video_screen_kind = 0;
@@ -885,7 +888,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_nw_full_mirror = false;
     std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
+    bool vulkan_offered = false;
     bool ws_ultrawide_offered = false;
+    if (cfg.contains("video")) {
+        const toml::value& video = toml::find(cfg, "video");
+        if (video.contains("offer_vulkan"))
+            vulkan_offered = toml::find<bool>(video, "offer_vulkan");
+    }
     // Optional [data_shards] block — memoized pure-function replay hooks.
     std::vector<uint32_t> data_shard_funcs;
     if (cfg.contains("data_shards")) {
@@ -1257,6 +1266,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_nw_full_mirror*/ ws_nw_full_mirror,
         /*ws_signed_x_bound_sites*/ ws_signed_x_bound_sites,
         /*ws_offered*/            ws_offered,
+        /*vulkan_offered*/        vulkan_offered,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,

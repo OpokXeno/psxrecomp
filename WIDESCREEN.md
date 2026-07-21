@@ -27,7 +27,7 @@ overlay DLLs uniformly — and extended well past what emulators ship with
 | Commit | What |
 |---|---|
 | `f8a29e8` | `[video] aspect_ratio = "W:H"` → GTE X-squash (`gte_set_display_aspect`, `runtime/src/gte.cpp`) + aspect-aware letterbox in both renderers + window opens at aspect. Config plumbed through `game.toml`, `settings.toml` (load+save), launcher seed (`recompiler/src/config_loader.{h,cpp}`, `runtime/src/main.cpp`, `runtime/src/gpu_gl_renderer.c`). |
-| `970670b` | Launcher **Aspect ratio** setting: 4:3 (Native) / 16:9 (Widescreen) / 21:9 (Ultrawide). One build does all. (`runtime/launcher/launcher.cpp`, `assets/launcher.rml`) |
+| `970670b` | Launcher **Aspect ratio** setting: 4:3 (Native) / 16:9 (Widescreen) / 21:9 (Ultrawide). One build does all. |
 | `cad8c96` | **Per-prim proportion correction.** Recompiler emits `psx_ws_sprite_tag(cpu)` at the entry of each `[widescreen] sprite_tag_funcs` function; runtime records prim ptr (`$a0`) → GTE-projected anchor and re-squashes tagged prims around their own anchor at GP0 execution, so characters/billboards are NOT stretched. Untagged textured rects (SPRT = screen-space HUD/menus) center-squash. (`recompiler/src/code_generator.cpp`, `runtime/src/gpu.c`) |
 | `0792086` | **FMV 4:3 pillarbox** (24-bit OR streamed 15-bit MDEC video, detected via `mdec_recently_active`), **menu-2D coherence** (lines/flat-rects/mono-sprites squash on full-2D screens so dialog borders match the SPRT boxes; fades exempt), **HUD edge anchoring** (in-game untagged SPRTs pivot by thirds — outer-third elements keep their wide-screen corner position at native proportions). |
 | `5151e5b` | **Authentic 4:3 BIOS boot** — squash held off until game entry PC fires (`fntrace_is_game_started`); Sony/PS logos + shell render 4:3, widescreen engages at game start. |
@@ -213,7 +213,7 @@ title. Documented for Tomba; any new title needs the same investigation.
 - `recompiler/src/code_generator.cpp` — `psx_ws_sprite_tag` emit at tagged fn
   entry. **This is where the cull-widen emit (issue #1) belongs.**
 - `recompiler/src/config_loader.{h,cpp}` — `[widescreen]` parse, `aspect_ratio`.
-- `runtime/launcher/launcher.cpp` + `assets/launcher.rml` — aspect toggle.
+- Launcher aspect control — aspect toggle.
 - `TombaRecomp/tools/capture_game_window.ps1` — window-capture helper for
   visual verification (the VRAM `screenshot_file` shows the pre-stretch frame;
   this shows the post-stretch window).
