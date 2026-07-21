@@ -1373,7 +1373,16 @@ UserSettings load_user_settings(const fs::path& path) {
             s.bios_hle = toml::find<bool>(v, "bios_hle"); s.has_bios_hle = true;
         });
         if (v.contains("fullscreen")) try_get([&]{
-            s.fullscreen = toml::find<bool>(v, "fullscreen"); s.has_fullscreen = true;
+            // Tri-state (0 off / 1 borderless / 2 exclusive). Back-compat: a
+            // settings.toml written before the tri-state migration stores this
+            // as a bool (true meant borderless desktop fullscreen).
+            try {
+                s.fullscreen = toml::find<int>(v, "fullscreen");
+            } catch (const std::exception&) {
+                s.fullscreen = toml::find<bool>(v, "fullscreen") ? 1 : 0;
+            }
+            if (s.fullscreen < 0 || s.fullscreen > 2) s.fullscreen = 0;
+            s.has_fullscreen = true;
         });
         if (v.contains("low_latency_input")) try_get([&]{
             s.low_latency_input = toml::find<bool>(v, "low_latency_input");
@@ -1541,7 +1550,7 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_bios_hle)
         f << "bios_hle          = " << (s.bios_hle ? "true" : "false") << "\n";
     if (s.has_fullscreen)
-        f << "fullscreen        = " << (s.fullscreen ? "true" : "false") << "\n";
+        f << "fullscreen        = " << s.fullscreen << "\n";
     if (s.has_low_latency_input)
         f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
     if (s.has_vsync)
