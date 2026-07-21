@@ -1620,6 +1620,30 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
  * stealing the bus; modeling it needs the live steal count threaded out of the DMA
  * controller, and it can't be isolated by a static ruler. It remains an unmodeled
  * dynamic axis; the per-region device waits below are the static, validatable piece. */
+
+/* Runtime-only production cycle charge for data-load timing.  Overlay DLLs
+ * flush their local pending-cycle accumulator before entering these host
+ * helpers, so this stays on the host side of that ABI boundary. */
+#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
+extern uint64_t g_psx_cycle_fast_limit;
+extern int g_event_step_conservative;
+extern int g_ls_replay_active;
+static inline void psx_load_charge_cycles(uint32_t cycles) {
+    if (g_ls_replay_active || cycles == 0u) return;
+    uint64_t next = psx_cycle_count + (uint64_t)cycles;
+    if (!g_event_step_conservative && g_psx_cycle_fast_limit != 0u &&
+        next >= psx_cycle_count && next <= g_psx_cycle_fast_limit) {
+        psx_cycle_count = next;
+        return;
+    }
+    psx_advance_cycles(cycles);
+}
+#else
+static inline void psx_load_charge_cycles(uint32_t cycles) {
+    psx_advance_cycles(cycles);
+}
+#endif
+
 /* Beetle MemRW device-region READ wait (libretro.cpp:859-1131), the device-dependent
  * part of a load's access cost (added to the timestamp before the +completion). `size`
  * is the access width in bytes (1/2/4) — the SPU and CDC waits are width-dependent.
