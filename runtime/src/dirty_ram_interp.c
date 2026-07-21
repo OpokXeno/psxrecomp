@@ -1443,7 +1443,11 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[0] = 0;
             return 0;
         case 0x25: /* OR */
-            cpu->gpr[rd] = cpu->gpr[rs] | cpu->gpr[rt];
+            if (psx_ws_is_cull_mask_or_site(pc))
+                /* Trim-mask merge: mask operand gated to 0 while revealed. */
+                cpu->gpr[rd] = cpu->gpr[rs] | psx_ws_mask_or(cpu->gpr[rt]);
+            else
+                cpu->gpr[rd] = cpu->gpr[rs] | cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
         case 0x26: /* XOR */

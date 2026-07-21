@@ -110,6 +110,10 @@ struct CodeGenConfig {
     // runtime helper; empty by default.
     std::set<uint32_t> ws_cull_depth_sites;
 
+    // Trim-mask merge sites ([widescreen.cull] mask_or_sites). The configured
+    // `or rd,rs,rt` gates rt to 0 while the margins are revealed.
+    std::set<uint32_t> ws_cull_mask_or_sites;
+
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
     // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).

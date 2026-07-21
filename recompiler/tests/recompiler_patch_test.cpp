@@ -202,6 +202,15 @@ depth_sites = ["0x80012340"]
               std::vector<uint32_t>{0x80012340u},
           "parser preserves depth-bound sites");
 
+    const auto mask_or = write_config(root, "mask-or", R"toml(
+[widescreen.cull]
+mask_or_sites = ["0x80012340"]
+)toml");
+    const auto mask_or_config = PSXRecompV4::load_game_config(mask_or);
+    check(mask_or_config.ws_cull_mask_or_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves trim-mask merge sites");
+
     const auto range = write_config(root, "range-cull", R"toml(
 [widescreen.cull]
 range_sites = ["0x80012340"]
@@ -339,6 +348,19 @@ void codegen_tests() {
         0x2C8201C1u, {}, false, range_config); // sltiu v0,a0,0x1c1
     check(range.find("2*psx_ws_x_margin()") != std::string::npos,
           "native range emit widens by both horizontal margins");
+
+    PSXRecomp::CodeGenConfig mask_or_config;
+    mask_or_config.ws_cull_mask_or_sites.insert(0x80010000u);
+    const std::string mask_or = generate_first_instruction(
+        0x00431025u, {}, false, mask_or_config); // or v0,v0,v1
+    check(mask_or.find("cpu->gpr[2] = cpu->gpr[2] | psx_ws_mask_or(cpu->gpr[3])") !=
+              std::string::npos,
+          "codegen gates trim-mask operand through shared helper");
+
+    const std::string mask_or_overlay_mismatch = generate_first_instruction(
+        0x00431026u, {}, true, mask_or_config); // xor v0,v0,v1
+    check(mask_or_overlay_mismatch.find("ws cull mask-or") == std::string::npos,
+          "overlay nonmatching mask-or variant remains unchanged");
 }
 
 void gte_codegen_classification_tests() {

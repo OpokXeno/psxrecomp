@@ -532,6 +532,11 @@ struct GameConfig {
     // Aspect-scaled slti/sltiu far-bound sites. Empty by default; use only for
     // pure visibility gates. Configured sites require regenerated native code.
     std::vector<uint32_t> ws_cull_depth_sites;
+    // `or rd,rs,rt` sites merging a static trim/clip mask (rt) onto computed
+    // visibility (rs). The merge is suppressed while the margins are revealed
+    // (rt forced to 0) so geometry revealed by the widened planes is not
+    // trimmed back to the 4:3 set; identity at 4:3.
+    std::vector<uint32_t> ws_cull_mask_or_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

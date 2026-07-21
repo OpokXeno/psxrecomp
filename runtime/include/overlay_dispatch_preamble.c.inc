@@ -232,6 +232,9 @@ int32_t psx_ws_player_x_bound(int32_t vanilla) {
 int32_t psx_ws_depth_bound(int32_t imm) {
     return g_cbs.ws_depth_bound ? g_cbs.ws_depth_bound(imm) : imm;
 }
+uint32_t psx_ws_mask_or(uint32_t mask) {
+    return g_cbs.ws_mask_or ? g_cbs.ws_mask_or(mask) : mask;
+}
 /* Sub-pixel GTE precision-store tracker (ABI v14). The emitter emits a direct
  * gte_precision_store_word() call for every swc2 (GTE store-word), including in
  * overlay-resident code, so the DLL must define it or the shard fails to link

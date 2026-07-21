@@ -2266,6 +2266,10 @@ static void init_callbacks(void) {
             extern int32_t psx_ws_depth_bound(int32_t imm);
             s_callbacks.ws_depth_bound = psx_ws_depth_bound;
         }
+        {
+            extern uint32_t psx_ws_mask_or(uint32_t mask);
+            s_callbacks.ws_mask_or = psx_ws_mask_or;
+        }
     }
 }
 

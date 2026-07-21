@@ -874,6 +874,24 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
         // Overlay variant at the same address: leave nonmatching code unchanged.
     }
+    // Static trim-mask merge: `or rd,rs,rt` ORs a conservative clip mask (rt)
+    // onto computed visibility (rs) — a fill-rate optimization that trims to
+    // the 4:3 set. The helper gates rt to 0 while the margins are revealed so
+    // the widened planes decide visibility; identity at 4:3.
+    if (config_.ws_cull_mask_or_sites.count(addr)) {
+        if (opcode == 0x00 && funct == 0x25) {  // or
+            uint32_t rs = get_rs(instr), rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = {} | psx_ws_mask_or({});"
+                               "  /* ws cull mask-or */{}",
+                               reg_name(rd), reg_name(rs), reg_name(rt), comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] mask_or site 0x{:08X} is not "
+                       "or rD,rS,rT (0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
     if (config_.ws_cull_range_sites.count(addr)) {
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
@@ -2737,6 +2755,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
+    ss << "extern uint32_t psx_ws_mask_or(uint32_t mask);             /* ws trim-mask merge gate (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";

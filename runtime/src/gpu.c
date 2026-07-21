@@ -390,6 +390,24 @@ int32_t psx_ws_depth_bound(int32_t imm) {
 int psx_ws_is_cull_range_site(uint32_t pc) {
     return ws_explicit_site(ws_explicit_range_sites, ws_explicit_range_n, pc);
 }
+static uint32_t ws_explicit_mask_or_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_mask_or_n = 0;
+void gpu_ws_set_mask_or_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_mask_or_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_mask_or_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_mask_or_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_mask_or_sites, ws_explicit_mask_or_n, pc);
+}
+/* Trim-mask merge gate ([widescreen.cull] mask_or_sites): the static mask
+ * operand of the configured OR is forced to 0 while the margins are revealed
+ * (the widened planes + per-vertex rejects decide visibility instead). */
+uint32_t psx_ws_mask_or(uint32_t mask) {
+    return psx_ws_x_margin() > 0 ? 0u : mask;
+}
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
