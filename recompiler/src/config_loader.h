@@ -532,6 +532,11 @@ struct GameConfig {
     // Aspect-scaled slti/sltiu far-bound sites. Empty by default; use only for
     // pure visibility gates. Configured sites require regenerated native code.
     std::vector<uint32_t> ws_cull_depth_sites;
+    // `lw rt,off(rs)` sites loading the X component of a side frustum-plane
+    // normal feeding a sign test (dot = nx*px + nz*pz). Scaled by the inverse
+    // aspect factor (4*den)/(3*num) while revealed, which widens the plane
+    // cone by exactly atan((3*num)/(4*den)*tan(theta)); identity at 4:3.
+    std::vector<uint32_t> ws_cull_plane_nx_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

@@ -3560,6 +3560,8 @@ int main(int argc, char** argv) {
                 gc.ws_cull_vxrange_sites.data(), (int)gc.ws_cull_vxrange_sites.size());
             gpu_ws_set_depth_cull_sites(
                 gc.ws_cull_depth_sites.data(), (int)gc.ws_cull_depth_sites.size());
+            gpu_ws_set_plane_nx_sites(
+                gc.ws_cull_plane_nx_sites.data(), (int)gc.ws_cull_plane_nx_sites.size());
             gte_ws_configure_dome_sites(
                 gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the

@@ -2266,6 +2266,10 @@ static void init_callbacks(void) {
             extern int32_t psx_ws_depth_bound(int32_t imm);
             s_callbacks.ws_depth_bound = psx_ws_depth_bound;
         }
+        {
+            extern int32_t psx_ws_plane_nx(int32_t nx);
+            s_callbacks.ws_plane_nx = psx_ws_plane_nx;
+        }
     }
 }
 
