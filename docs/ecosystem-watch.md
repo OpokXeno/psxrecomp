@@ -175,6 +175,14 @@ BIOS-only framework link is reported failing.
   Keep performance/synchronization fixes separate from CRT shaders and debug
   environment flags.
 
+### Follow-up credit
+
+PR #61 reconstructed the reusable Vulkan synchronization, staging-buffer,
+command batching, present-mode, and timing work from Martin Penkava's PR #16
+branch onto current master while leaving Vulkan experimental and hidden by
+default. Martin Penkava (`shaneomac1337`) is the source developer for that
+Vulkan work.
+
 ### Reject or relocate
 
 - `4517bd5` labels the AMD corruption unresolved and carries temporary Vulkan
