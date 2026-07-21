@@ -39,6 +39,7 @@
 #include "psx_scheduler.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <setjmp.h>
 
 /* Event-timeline ring: execution-mode flag owned by dirty_ram_interp.c. The
@@ -744,7 +745,14 @@ void psx_check_interrupts(CPUState* cpu) {
      * observed 1M+ block edges/s this is sub-frame latency. */
     static uint32_t s_fast_maintenance;
     if (g_idle_skip_enabled < 0) (void)psx_idle_skip_is_enabled();
-    if (!in_exception && (i_stat & i_mask) == 0 &&
+    /* COP0 software interrupts (CAUSE.IP0/IP1 vs SR.IM0/IM1, bits 8-9): raised
+     * purely by guest mtc0 to CAUSE, with no INTC involvement. Games use this
+     * as a re-entrant exception-dispatch mechanism (Jackie Chan Stuntmaster's
+     * handler saves SR/EPC, sets CAUSE=0x100 + SR=0x101, and relies on the
+     * immediate sw-int to chain into its second stage; without it the CD INT3
+     * ack never runs and the machine deadlocks with SR.IM2 stripped). */
+    uint32_t sw_pending = cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u;
+    if (!in_exception && (i_stat & i_mask) == 0 && sw_pending == 0 &&
         !s_defer_switch_pending && g_idle_skip_enabled == 0) {
         if ((++s_fast_maintenance & 0x3FFFu) == 0) {
             extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
@@ -883,8 +891,8 @@ void psx_check_interrupts(CPUState* cpu) {
         }
     }
 
-    /* Check if any interrupts are pending. */
-    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
+    /* Check if any interrupts are pending (INTC hardware or COP0 software). */
+    if ((i_stat & i_mask) == 0 && sw_pending == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
     /* Nested delivery (hardware semantics). Real R3000A has no 'in exception'
      * gate — delivery is governed by SR alone. The handler normally runs with
      * IEc=0 (hardware bit-shift on entry), so the SR gates below block
@@ -954,13 +962,19 @@ void psx_check_interrupts(CPUState* cpu) {
 #endif
         PSX_CHECK_INTERRUPTS_RETURN();
     }   /* Interrupts globally disabled */
-    if (!(sr & (1 << 10))) {
+    /* Deliverability per source: the INTC line needs SR.IM2; software
+     * interrupts need only their own IM bit (already folded into sw_pending,
+     * recomputed here against the CURRENT sr — the fast-path snapshot above
+     * may predate an SR write earlier in this same check). */
+    sw_pending = cpu->cop0[COP0_CAUSE] & sr & 0x0300u;
+    int hw_deliverable = ((i_stat & i_mask) != 0) && ((sr & (1 << 10)) != 0);
+    if (!hw_deliverable && sw_pending == 0) {
         irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2, 0);
 #ifdef PSX_COSIM
         COSIM_IRQ_NOTE(5u);
 #endif
         PSX_CHECK_INTERRUPTS_RETURN();
-    } /* Hardware interrupt bit not enabled */
+    } /* No deliverable interrupt source (hw masked and no sw pending) */
 
     /* Architectural take-PC = the resume PC (same selection the async-RFE block
      * below uses): the dirty-interp commits the exact interrupted instruction in
@@ -1006,9 +1020,14 @@ void psx_check_interrupts(CPUState* cpu) {
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
 
-    /* Set COP0 Cause: ExcCode=0 (interrupt), IP2 pending. */
+    /* Set COP0 Cause: ExcCode=0 (interrupt). IP2 reflects the INTC line, so
+     * set it only when the hardware source is what's being delivered; a pure
+     * software interrupt must present the guest-written IP0/IP1 bits
+     * unmodified (the guest's dispatcher discriminates stages by exactly
+     * these bits — see sw_pending rationale at the top of this function). */
     cpu->cop0[COP0_CAUSE] = (cpu->cop0[COP0_CAUSE] & ~0x7C) | (0 << 2);
-    cpu->cop0[COP0_CAUSE] |= (1 << 10);
+    if (hw_deliverable)
+        cpu->cop0[COP0_CAUSE] |= (1 << 10);
 
     /* Push SR exception stack: shift bits [5:0] left by 2. */
     cpu->cop0[COP0_SR] = (sr & ~0x3F) | ((sr & 0x0F) << 2);
@@ -1211,6 +1230,15 @@ void psx_check_interrupts(CPUState* cpu) {
      * ("execution completed" abnormal exit). */
     int saved_dispatch_depth = g_psx_dispatch_depth;
     g_psx_dispatch_depth = 0;
+    /* Nested delivery clobber guard: exception_jmpbuf is a single global, so a
+     * nested exception's setjmp overwrites the OUTER frame's context. The outer
+     * handler's later RFE would then longjmp into the dead inner frame (host
+     * stack corruption — first hit by Jackie Chan Stuntmaster's software-
+     * interrupt dispatcher, which nests by design). Save the armed frame here
+     * and restore it in the epilogue so each nesting level's RFE lands in its
+     * own live frame. */
+    jmp_buf saved_exception_jmpbuf;
+    memcpy(&saved_exception_jmpbuf, &exception_jmpbuf, sizeof(jmp_buf));
     g_exc_setjmp_epoch++;   /* new setjmp frame armed (see decl above) */
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
@@ -1240,6 +1268,10 @@ void psx_check_interrupts(CPUState* cpu) {
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
     g_dirty_interp_active = prev_interp_active;
+    /* Re-arm the OUTER frame's jmpbuf (see save at entry): after a nested
+     * delivery returns, the outer handler is live again and its RFE must land
+     * in the outer setjmp frame, not this exited one. */
+    memcpy(&exception_jmpbuf, &saved_exception_jmpbuf, sizeof(jmp_buf));
     /* Ape memcard fix #3: restore the resume-PC latch cleared at handler entry
      * (see above). Sits with the other post-dispatch-loop restores so an
      * RFE/RestoreState longjmp — which lands in the setjmp loop above — can't
