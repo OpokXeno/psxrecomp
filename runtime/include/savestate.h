@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 /*
- * User save states (F1-F12 save, Shift+F1-F12 load; 12 slots).
+ * User save states (Shift+F1-F12 save, F1-F12 load; 12 slots).
  *
  * A thin wrapper over boot_state.c's complete full-machine serializer
  * (boot_state_save / boot_state_load — CPU/RAM/scratchpad/VRAM/SPU/CDROM/DMA/SIO/
