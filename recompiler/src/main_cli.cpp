@@ -260,10 +260,16 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     size_t cnf_read = disc.ReadFile("SYSTEM.CNF", cnf_bytes.data(), cnf_size);
     std::string boot = parse_boot_path(std::string((char*)cnf_bytes.data(), cnf_read));
     if (boot.empty()) throw std::runtime_error("SYSTEM.CNF does not contain a BOOT executable");
-    size_t exe_size = disc.GetFileSize(boot);
+    // Normalize boot path: convert backslashes to forward slashes so that
+    // std::filesystem::path (which treats '\' as a regular character on Linux)
+    // correctly splits the path into directory and filename components.
+    std::string boot_norm;
+    boot_norm.reserve(boot.size());
+    for (char c : boot) boot_norm += (c == '\\') ? '/' : c;
+    size_t exe_size = disc.GetFileSize(boot_norm);
     if (!exe_size) throw std::runtime_error("boot executable was not found on disc: " + boot);
     std::vector<uint8_t> exe_bytes(exe_size);
-    if (disc.ReadFile(boot, exe_bytes.data(), exe_bytes.size()) != exe_bytes.size())
+    if (disc.ReadFile(boot_norm, exe_bytes.data(), exe_bytes.size()) != exe_bytes.size())
         throw std::runtime_error("failed to read the complete boot executable");
     if (exe_bytes.size() < 2048 || std::string((char*)exe_bytes.data(), 8) != "PS-X EXE")
         throw std::runtime_error("the disc BOOT file is not a PS-X EXE");
@@ -274,7 +280,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     // happens to live inside another checkout.
     write_file(options.output / ".gitignore",
         "build/\ninput/\ngenerated/\nbios-generated/\n*.mcr\nsaves/\n");
-    const std::string boot_file = fs::path(boot).filename().string();
+    const std::string boot_file = fs::path(boot_norm).filename().string();
     const fs::path local_exe = options.output / "input" / boot_file;
     write_bytes(local_exe, exe_bytes);
 
