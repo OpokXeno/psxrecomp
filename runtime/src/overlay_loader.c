@@ -1183,7 +1183,12 @@ static int cache_tier_from_path(const char *path) {
 }
 
 static int cache_name_is_immutable(const char *name) {
-    return name && strlen(name) == 26u + OVERLAY_SHARED_EXT_LEN &&
+    if (!name) return 0;
+    size_t len = strlen(name);
+    /* Current publishers commit a recoverable region/CRC pair. Retain support
+     * for additive artifact-suffixed pairs produced by earlier cache tools. */
+    if (len == 17u + OVERLAY_SHARED_EXT_LEN) return name[8] == '_';
+    return len == 26u + OVERLAY_SHARED_EXT_LEN &&
            name[8] == '_' && name[17] == '_';
 }
 

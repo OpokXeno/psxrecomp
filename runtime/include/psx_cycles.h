@@ -60,7 +60,12 @@ extern uint32_t g_psx_cyc_batch_limit;
  * block. Interrupt/MMIO edges still publish the accumulated guest cycles. */
 extern int g_psx_cyc_bb_defer;
 
-/* Advance guest time. The common production path is inlined: bump the
+/* Advance guest time. Overlay DLLs forward this through their callback shim;
+ * normal runtime/generated code keeps the common production path inlined. */
+#if defined(PSX_OVERLAY_DLL_BUILD)
+void psx_advance_cycles(uint32_t cycles);
+#else
+/* The common production path is inlined: bump the
  * counter and only service devices when the next event deadline is due.
  * Guest-visible timing is unchanged (service_to_now replays exact events).
  *
@@ -110,8 +115,14 @@ static inline void psx_advance_cycles(uint32_t cycles) {
     }
 #endif
 }
+#endif
 
-/* Publish deferred charges (IRQ edge / MMIO / savestate). */
+/* Publish deferred charges (IRQ edge / MMIO / savestate). Overlay DLLs keep
+ * their pending total in the callback shim rather than these host globals. */
+#if defined(PSX_OVERLAY_DLL_BUILD)
+void overlay_flush_cycles(void);
+static inline void psx_cyc_batch_flush(void) { overlay_flush_cycles(); }
+#else
 static inline void psx_cyc_batch_flush(void) {
 #if !defined(PSX_COSIM)
     uint32_t b = g_psx_cyc_batch;
@@ -121,6 +132,7 @@ static inline void psx_cyc_batch_flush(void) {
     psx_advance_cycles(b);
 #endif
 }
+#endif
 
 /* Read accessor for telemetry (includes deferred batch). */
 uint64_t psx_get_cycle_count(void);

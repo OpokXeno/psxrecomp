@@ -45,12 +45,19 @@ extern "C" {
  * state still updates per instruction, and guest totals at barriers match. */
 enum { PSX_CYC_BATCH_SOFT = 64u };
 
+#if defined(PSX_OVERLAY_DLL_BUILD)
+/* The overlay shim already batches cycle charges until a host callback edge. */
+static inline void psx_cyc_bb_defer_begin(void) { }
+static inline void psx_cyc_bb_defer_end(void) { }
+static inline void psx_cyc_bb_defer_flush(void) { overlay_flush_cycles(); }
+#else
 static inline void psx_cyc_bb_defer_begin(void) { g_psx_cyc_bb_defer++; }
 static inline void psx_cyc_bb_defer_end(void) {
     if (g_psx_cyc_bb_defer > 0) g_psx_cyc_bb_defer--;
     if (g_psx_cyc_bb_defer == 0) psx_cyc_batch_flush();
 }
 static inline void psx_cyc_bb_defer_flush(void) { psx_cyc_batch_flush(); }
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 static inline void psx_cyc_bb_defer_cleanup(int *guard) {
@@ -61,6 +68,9 @@ static inline void psx_cyc_bb_defer_cleanup(int *guard) {
 
 static inline void psx_cyc_charge(uint32_t cycles) {
     if (cycles == 0u) return;
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    psx_advance_cycles(cycles);
+#else
 #if defined(__GNUC__) || defined(__clang__)
     if (__builtin_expect(g_ls_replay_active | g_event_step_conservative, 0)) {
 #else
@@ -98,6 +108,7 @@ static inline void psx_cyc_charge(uint32_t cycles) {
     }
 #endif
     psx_advance_cycles(cycles); /* publishes any pending batch first */
+#endif
 }
 
 /* §1 base (Beetle cpu.cpp:795-798). */
@@ -169,6 +180,15 @@ int psx_load_delay_enabled(void);
 uint32_t psx_cyc_load_word_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 
+/* Overlay DLLs route timed loads through the host callback shim so they share
+ * runtime timing and memory state. Normal generated code keeps the main-RAM
+ * fast path inline. */
+#if defined(PSX_OVERLAY_DLL_BUILD)
+uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
+                           uint32_t rt, uint32_t reg_mask);
+uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
+                           uint32_t rt, uint32_t reg_mask);
+#else
 /* CPU data load value+timing. Full Beetle sequence for main RAM is inlined;
  * MMIO / lockstep / data-shard fall through to *_slow in memory.c. */
 static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
@@ -230,6 +250,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
     return psx_read_half(addr);
 #endif
 }
+#endif
 
 extern uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
 

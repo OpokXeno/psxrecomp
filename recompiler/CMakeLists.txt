@@ -292,6 +292,10 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fmv_cycle_batch_codegen.py
                     --recompiler $<TARGET_FILE:psxrecomp-game>)
         add_test(
+            NAME overlay_shim_compile_contract
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_shim_compile.py)
+        add_test(
             NAME dirty_text_continuation_guards
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/tests/test_dirty_text_continuation_guards.py)
