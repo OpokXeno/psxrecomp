@@ -21,6 +21,7 @@
 #endif
 
 #include "fmt/format.h"
+#include "cli_boot_path.h"
 #include "iso_reader.h"
 #include "ps1_exe_parser.h"
 
@@ -80,18 +81,6 @@ std::string parse_boot_path(const std::string& cnf) {
         path += c;
     }
     return path;
-}
-
-std::string serial_from_boot(const std::string& boot) {
-    std::string base = fs::path(boot).filename().string();
-    std::string clean;
-    for (char c : base) {
-        if (std::isalnum((unsigned char)c)) clean += (char)std::toupper((unsigned char)c);
-    }
-    size_t split = 0;
-    while (split < clean.size() && std::isalpha((unsigned char)clean[split])) split++;
-    if (split && split < clean.size()) clean.insert(split, "-");
-    return clean.empty() ? "PSX-GAME" : clean;
 }
 
 std::string safe_stem(std::string value) {
@@ -263,9 +252,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     // Normalize boot path: convert backslashes to forward slashes so that
     // std::filesystem::path (which treats '\' as a regular character on Linux)
     // correctly splits the path into directory and filename components.
-    std::string boot_norm;
-    boot_norm.reserve(boot.size());
-    for (char c : boot) boot_norm += (c == '\\') ? '/' : c;
+    const std::string boot_norm = PSXRecompCLI::normalize_boot_path(boot);
     size_t exe_size = disc.GetFileSize(boot_norm);
     if (!exe_size) throw std::runtime_error("boot executable was not found on disc: " + boot);
     std::vector<uint8_t> exe_bytes(exe_size);
@@ -280,7 +267,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     // happens to live inside another checkout.
     write_file(options.output / ".gitignore",
         "build/\ninput/\ngenerated/\nbios-generated/\n*.mcr\nsaves/\n");
-    const std::string boot_file = fs::path(boot_norm).filename().string();
+    const std::string boot_file = PSXRecompCLI::boot_filename(boot_norm);
     const fs::path local_exe = options.output / "input" / boot_file;
     write_bytes(local_exe, exe_bytes);
 
@@ -288,7 +275,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     auto parsed = PSXRecomp::PS1ExeParser::parse_file(local_exe, parse_error);
     if (!parsed) throw std::runtime_error("failed to parse boot executable: " + parse_error);
     const auto& image = *parsed;
-    const std::string serial = serial_from_boot(boot);
+    const std::string serial = PSXRecompCLI::serial_from_boot(boot_norm);
     const std::string title = options.name.empty()
                                   ? trim(disc.GetVolumeID())
                                   : options.name;
