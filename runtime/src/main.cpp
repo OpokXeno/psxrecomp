@@ -3713,8 +3713,10 @@ static void sdl_vblank_present(void) {
     int dst_w = pin_43 ? 640 * g_video_scale : g_logical_w;
     int dst_h = 480 * g_video_scale;
     SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, dst_h };
-    /* Match GL: short display bands letterbox inside the 4:3 rect. */
-    if (pin_43 && h > 0 && h < 240) {
+    /* Match GL: short display bands letterbox inside the 4:3 rect — FMV only
+     * (depth24), and only genuinely windowed bands (<80% of the field; a
+     * native short display mode like 216/224 fills the rect). */
+    if (pin_43 && depth24_frame && h > 0 && h < 192) {
         int content_h = (dst_h * (int)h) / 240;
         if (content_h < 1) content_h = 1;
         dst.y = (dst_h - content_h) / 2;
