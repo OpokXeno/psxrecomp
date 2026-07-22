@@ -2615,6 +2615,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                         OV_FPLOG_RET1();
                     }
                 }
+#ifdef PSX_HAS_GAME_DISPATCH
+                /* A patched prologue can force entry through the interpreter,
+                 * while the remaining static ranges at a later continuation
+                 * are still safe to run as compiled code. */
+                if (clean_game_text_miss && interp_enter_compiled(cpu, target)) {
+                    g_dirty_ram_native_handoffs++;
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = cpu->pc;
+                    OV_FPLOG_RET1();
+                }
+#endif
                 /* Capture freeze gates ONLY the ring write — never flow. */
 #ifndef PSX_NO_DEBUG_TOOLS
                 if (!g_insn_log_frozen) {
@@ -2648,6 +2660,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             OV_FPLOG_RET1();
         }
         pc = next_pc;
+#ifdef PSX_HAS_GAME_DISPATCH
+        /* Guest call returns advance without transferred set. Re-check the
+         * resume PC so a patched entry can hand its unchanged tail back to
+         * compiled code without adding probes to ordinary dirty overlay runs. */
+        if (clean_game_text_miss && interp_enter_compiled(cpu, pc)) {
+            g_dirty_ram_native_handoffs++;
+            g_dirty_ram_blocks_run++;
+            if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = cpu->pc;
+            OV_FPLOG_RET1();
+        }
+#endif
         /* Straight-line flow reaching the dispatch return contract — exit
          * so the loop returns into the suspended native caller (same
          * hazard as a transfer to stop_addr). */
