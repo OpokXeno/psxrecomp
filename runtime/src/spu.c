@@ -570,6 +570,13 @@ void spu_render(int16_t* out_stereo, int frames) {
     int16_t cd_vol_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
     int16_t cd_vol_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
 
+    int any_voice = 0;
+    if (enabled) {
+        for (int v = 0; v < SPU_VOICE_COUNT; v++) {
+            if (voices[v].active) { any_voice = 1; break; }
+        }
+    }
+
     /* Shadow tap: arm recording for this block if the float SPU shadow is on.
      * Off by default => s_shadow_tap_on stays 0 and the mix loop is unchanged
      * and byte-identical to upstream. */
@@ -580,32 +587,89 @@ void spu_render(int16_t* out_stereo, int frames) {
         memset(s_shadow_tap, 0, (size_t)cap * sizeof(s_shadow_tap[0]));
     }
 
+    /* MotK intro FMV: active_mask stays 0 while XA/CD audio plays. The old
+     * path still walked 24 idle voices and called audio_trace_pcm(VOICES, 1)
+     * per sample (~735 atomics/vblank). Host FPS fell off a cliff when XA
+     * started (60 → ~4) with ~67% wall time in phase "other". */
+    if (enabled && !any_voice && !s_shadow_tap_on) {
+        static int16_t s_voice_silence[2048 * 2];
+        int voice_tap_n = frames;
+        if (voice_tap_n > 2048) voice_tap_n = 2048;
+        memset(s_voice_silence, 0, (size_t)voice_tap_n * 2u * sizeof(int16_t));
+        for (int off = 0; off < frames; ) {
+            int n = frames - off;
+            if (n > 2048) n = 2048;
+            audio_trace_pcm(AUDIO_TAP_VOICES, s_voice_silence, n);
+            off += n;
+        }
+
+        int32_t block_peak = 0;
+        int cd_on = (ctrl & 0x0001u) != 0;
+        for (int f = 0; f < frames; f++) {
+            int32_t mix_l = 0;
+            int32_t mix_r = 0;
+            if (cd_on) {
+                int16_t cd_l = 0;
+                int16_t cd_r = 0;
+                if (cd_audio_pop(&cd_l, &cd_r)) {
+                    mix_l = ((int32_t)cd_l * cd_vol_l) >> 15;
+                    mix_r = ((int32_t)cd_r * cd_vol_r) >> 15;
+                } else if (cd_push_frames != 0) {
+                    cd_underflow_frames++;
+                }
+            }
+            mix_l = (mix_l * main_l) >> 14;
+            mix_r = (mix_r * main_r) >> 14;
+            out_stereo[f * 2 + 0] = clamp16(mix_l);
+            out_stereo[f * 2 + 1] = clamp16(mix_r);
+            int32_t frame_peak = abs32(out_stereo[f * 2 + 0]);
+            int32_t right_peak = abs32(out_stereo[f * 2 + 1]);
+            if (right_peak > frame_peak) frame_peak = right_peak;
+            if (frame_peak) nonzero_frames++;
+            if (frame_peak > block_peak) block_peak = frame_peak;
+        }
+        render_frames += (uint64_t)frames;
+        last_peak = block_peak;
+        if (block_peak > peak) peak = block_peak;
+        spu_shadow_process(out_stereo, frames);
+        audio_trace_pcm(AUDIO_TAP_SPU_OUT, out_stereo, frames);
+        return;
+    }
+
     int32_t block_peak = 0;
+    /* Voice-sum tap is filled once per block (not per sample) — same bytes. */
+    static int16_t s_voice_sum[2048 * 2];
+    int voice_sum_cap = frames < 2048 ? frames : 2048;
+    int voice_sum_pos = 0;
+
     for (int f = 0; f < frames; f++) {
         int32_t mix_l = 0;
         int32_t mix_r = 0;
+        int32_t voice_l = 0;
+        int32_t voice_r = 0;
 
         if (enabled) {
-            for (int v = 0; v < SPU_VOICE_COUNT; v++) {
-                int16_t s = voice_next_sample(v);
-                int16_t vl = direct_volume(voice_reg(v, 0));
-                int16_t vr = direct_volume(voice_reg(v, 1));
-                if (s_shadow_tap_on && f < SPU_SHADOW_TAP_FRAMES) {
-                    SpuShadowVoiceTap *t = &s_shadow_tap[f].voice[v];
-                    /* voice_next_sample already filled s[]/frac/env if active. */
-                    t->vol_l = vl;
-                    t->vol_r = vr;
+            if (any_voice) {
+                for (int v = 0; v < SPU_VOICE_COUNT; v++) {
+                    int16_t s = voice_next_sample(v);
+                    int16_t vl = direct_volume(voice_reg(v, 0));
+                    int16_t vr = direct_volume(voice_reg(v, 1));
+                    if (s_shadow_tap_on && f < SPU_SHADOW_TAP_FRAMES) {
+                        SpuShadowVoiceTap *t = &s_shadow_tap[f].voice[v];
+                        t->vol_l = vl;
+                        t->vol_r = vr;
+                    }
+                    if (!s) continue;
+                    voice_l += ((int32_t)s * vl) >> 14;
+                    voice_r += ((int32_t)s * vr) >> 14;
                 }
-                if (!s) continue;
-                mix_l += ((int32_t)s * vl) >> 14;
-                mix_r += ((int32_t)s * vr) >> 14;
             }
-            {   /* T0 tap: voice sum only (pre CD mix, pre main volume) so the
-                 * final mix can be decomposed source-by-source offline. */
-                int16_t vsum[2];
-                vsum[0] = clamp16(mix_l);
-                vsum[1] = clamp16(mix_r);
-                audio_trace_pcm(AUDIO_TAP_VOICES, vsum, 1);
+            mix_l = voice_l;
+            mix_r = voice_r;
+            if (voice_sum_pos < voice_sum_cap) {
+                s_voice_sum[voice_sum_pos * 2 + 0] = clamp16(voice_l);
+                s_voice_sum[voice_sum_pos * 2 + 1] = clamp16(voice_r);
+                voice_sum_pos++;
             }
             if (ctrl & 0x0001u) {
                 int16_t cd_l = 0;
@@ -634,6 +698,19 @@ void spu_render(int16_t* out_stereo, int frames) {
             s_shadow_tap[f].main_r  = main_r;
             s_shadow_tap[f].enabled = enabled;
             s_shadow_tap_frame = f + 1;
+        }
+    }
+    if (enabled) {
+        /* Flush voice-sum tap; if the block was longer than the staging buf,
+         * emit the remainder as silence (MotK FMV blocks are ≤2048). */
+        if (voice_sum_pos > 0)
+            audio_trace_pcm(AUDIO_TAP_VOICES, s_voice_sum, voice_sum_pos);
+        for (int left = frames - voice_sum_pos; left > 0; ) {
+            static int16_t z[256 * 2];
+            int n = left > 256 ? 256 : left;
+            memset(z, 0, (size_t)n * 2u * sizeof(int16_t));
+            audio_trace_pcm(AUDIO_TAP_VOICES, z, n);
+            left -= n;
         }
     }
     render_frames += (uint64_t)frames;
@@ -859,24 +936,78 @@ void spu_event_reset(void) {
     memset(s_events, 0, sizeof(s_events));
 }
 
-/* ---- boot snapshot: complete SPU register + voice state (see boot_state.h) ---- */
-#define SPU_SNAP_FIELDS(X) \
-    X(spu_regs) X(voices) X(transfer_addr) X(key_on_count) \
-    X(endx_latch) X(kon_latch) X(koff_latch)
-uint32_t spu_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    SPU_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void spu_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    SPU_SNAP_FIELDS(X)
-#undef X
+/* ---- boot snapshot: complete SPU register + voice state (LE field wire) ---- */
+#include "pst_wire.h"
+
+/* SpuVoice host sizeof has padding; wire is packed LE fields (94 bytes). */
+#define SPU_VOICE_WIRE_BYTES ( \
+    4u + 4u + 4u + (28u * 2u) + (3u * 2u) + 4u + 4u + 2u + 2u + 1u + 2u + 4u + 1u)
+
+static int spu_w_voice(PstW *w, const SpuVoice *v) {
+    if (!pst_w_i32(w, (int32_t)v->active) || !pst_w_u32(w, v->cur_addr) ||
+        !pst_w_u32(w, v->repeat_addr))
+        return 0;
+    for (int i = 0; i < SPU_BLOCK_SAMPLES; i++)
+        if (!pst_w_i16(w, v->samples[i])) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!pst_w_i16(w, v->previous_samples[i])) return 0;
+    return pst_w_i32(w, (int32_t)v->sample_idx) && pst_w_u32(w, v->phase) &&
+           pst_w_i16(w, v->hist1) && pst_w_i16(w, v->hist2) && pst_w_u8(w, v->flags) &&
+           pst_w_u16(w, v->env_level) && pst_w_u32(w, v->adsr_divider) &&
+           pst_w_u8(w, v->adsr_phase);
 }
-int spu_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=spu_snapshot_bytes()) return 0;
-#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
-    SPU_SNAP_FIELDS(X)
-#undef X
-    return 1; }
+static int spu_r_voice(PstR *r, SpuVoice *v) {
+    int32_t active = 0, sample_idx = 0;
+    if (!pst_r_i32(r, &active) || !pst_r_u32(r, &v->cur_addr) ||
+        !pst_r_u32(r, &v->repeat_addr))
+        return 0;
+    v->active = (int)active;
+    for (int i = 0; i < SPU_BLOCK_SAMPLES; i++)
+        if (!pst_r_i16(r, &v->samples[i])) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!pst_r_i16(r, &v->previous_samples[i])) return 0;
+    if (!pst_r_i32(r, &sample_idx) || !pst_r_u32(r, &v->phase) ||
+        !pst_r_i16(r, &v->hist1) || !pst_r_i16(r, &v->hist2) ||
+        !pst_r_u8(r, &v->flags) || !pst_r_u16(r, &v->env_level) ||
+        !pst_r_u32(r, &v->adsr_divider) || !pst_r_u8(r, &v->adsr_phase))
+        return 0;
+    v->sample_idx = (int)sample_idx;
+    return 1;
+}
+
+uint32_t spu_snapshot_bytes(void) {
+    return (uint32_t)(SPU_REG_COUNT * 2u) +
+           (SPU_VOICE_COUNT * SPU_VOICE_WIRE_BYTES) + 20u;
+}
+
+void spu_snapshot_write(uint8_t *p) {
+    PstW w;
+    uint32_t n = spu_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    for (uint32_t i = 0; i < SPU_REG_COUNT; i++)
+        pst_w_u16(&w, spu_regs[i]);
+    for (int i = 0; i < SPU_VOICE_COUNT; i++)
+        spu_w_voice(&w, &voices[i]);
+    pst_w_u32(&w, transfer_addr);
+    pst_w_u32(&w, key_on_count);
+    pst_w_u32(&w, endx_latch);
+    pst_w_u32(&w, kon_latch);
+    pst_w_u32(&w, koff_latch);
+}
+
+int spu_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (len != spu_snapshot_bytes()) return 0;
+    pst_r_init(&r, p, len);
+    for (uint32_t i = 0; i < SPU_REG_COUNT; i++)
+        if (!pst_r_u16(&r, &spu_regs[i])) return 0;
+    for (int i = 0; i < SPU_VOICE_COUNT; i++)
+        if (!spu_r_voice(&r, &voices[i])) return 0;
+    if (!pst_r_u32(&r, &transfer_addr) || !pst_r_u32(&r, &key_on_count) ||
+        !pst_r_u32(&r, &endx_latch) || !pst_r_u32(&r, &kon_latch) ||
+        !pst_r_u32(&r, &koff_latch))
+        return 0;
+    return 1;
+}
 uint8_t*  spu_get_ram_ptr(void){ return spu_ram; }
 uint32_t  spu_get_ram_bytes(void){ return (uint32_t)sizeof(spu_ram); }

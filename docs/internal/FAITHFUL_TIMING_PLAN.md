@@ -213,37 +213,462 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
-- **2026-07-19/20 (Tomba 2 warm-cache boot death ROOT-CAUSED + FIXED — overlay
-  alias-body CPS re-entry fall-through):** The splash→title death (host frame
-  ~1374, "execution completed, PC=0") was NEVER an IRQ/event race: production
-  rings proved DeliverEvent(0xF0000003,0x0020) ran and TestEvent consumed it.
-  The game then reloads its whole program image from disc (LBA 24–372 →
-  0x10000–0xBE7FF) and re-enters it; `dispatch(0x80089788)` (the fresh image's
-  ctor thunk) resolved by range to the ALIAS candidate `func_80089770`, whose
-  generated body's continuation switch had `default: break` falling into
-  `switch(entry)` — it ran the ALIAS'S OWN block (the crt0 shim tail: reload
-  $ra, call main-init) instead of the requested PC. Result: a 21-cycle
-  main-init↔alias loop leaking 0x40 of guest SP per round, marching the stack
-  down 1.5 MB until the frames overwrote the thunk's own code and execution
-  died in its own stack garbage. Cold passed because interiors fell to the
-  interpreter. FIX (code_generator.cpp): alias-body continuation switch now
-  emits alias-entry cases + the PR#46 fail-closed default
-  (`cpu->pc=_cont; psx_native_bad_entry(); return`); alias entry-switch default
-  fail-closed; overlay-mode cpu->pc guard now emitted even with an EMPTY
-  continuation set (single-block re-entry hole, both emitters). Codegen hash
-  rolled 6326a16c→7b3e9e15. Validated: fresh-cache reshard run + 2 warm runs
-  boot past the transition to the attract demo at 60 fps (screenshots), all
-  six unit tests + guards PASS. New ALWAYS-ON production observability landed
-  en route: `sp_ring` (stack-domain transitions), `disp_ring` (dispatch tail),
-  `overlay_native_ring` recent[] un-gated, event_ring enabled in production,
-  `psx_fatal_halt` halt-and-serve keyed on listener-live (PSX_EXIT_HALT works
-  on production+PSX_DEBUG_SERVER=1 runs), `debug_server_get_status`
-  implemented (was declared-only). Tooling: launcher autocompile uses explicit
-  Windows Python312; autocompile.c wraps the child line as `cmd.exe /C "…"`
-  (leading-quote mangling made every reshard fail silently). Follow-ups:
-  dirty-interp reserved-instruction abort should raise the guest RI exception;
-  `overlay_loader_bad_entry_stats` still lacks a TCP surface; other titles
-  inherit the emitter fix on next fw bump (regen+reshard per title).
+- **2026-07-21 (VLC load-charge batching — shipped; dual still ~22 ms):**
+  Runtime-only batch: under `psx_next_service_cycle`, `psx_cyc_charge`
+  accumulates into `g_psx_cyc_batch` (no per-insn `psx_cycle_count` store);
+  flush at IRQ check / MMIO sync / savestate / advance-past-deadline.
+  Absorb/fudge still per-insn; guest totals at barriers unchanged; no MotK
+  regen. Dual headless MotK (`PSX_NETPLAY_TIMING=1`, pinned halves): heavy
+  25–50 band host med ≈39.7 fps / guest ≈21.9 ms/f / admit ≈3.1 (guest peer
+  ≈39.8 / 22.5 / 2.8) — same floor as pre-batch (~21 ms / ~40–42). Counter
+  publish was not the dual-peer tax; residual remains load-delay volume /
+  LLC under phase-locked VLC. Next: PGO retrain after hot-path edits, or
+  accept same-machine lockstep FMV floor.
+- **2026-07-21 (MotK FMV host cost — MDEC/IRQ/charge; dual still ~21 ms):**
+  Aimed to cut MotK FMV host work so two lockstep peers fit ~16.7 ms/f.
+  Shipped bit-exact host opts: MDEC MB output reserve (no per-byte
+  ensure_capacity), sparse-column IDCT, ch0 DMA burst feed
+  (`mdec_dma_write_words`), sticky-IRQ undeliverable early-out in
+  `psx_check_interrupts`, `psx_cyc_charge` pre-deadline bump on compiled
+  loads/steps. Dual headless MotK (`PSX_NETPLAY_TIMING=1`, pinned halves):
+  band 25–50 fps still guest ≈21 ms/f / fps ≈40–42 (admit ≈2.5–3) — same
+  floor as before. HARD_CAP 16K→64K tried, no gain (real CD/timer events
+  already shorten the deadline); reverted. Residual is phase-locked dual
+  VLC load-delay volume / LLC contention, not MDEC FIFO or present/admit.
+  Next: emitter-level load-charge batching for VLC leaves, PGO retrain
+  after these hot-path edits, or accept same-machine lockstep FMV floor.
+- **2026-07-21 (netplay FMV — lockstep guest inflation, not present/admit):**
+  User A/B: two windowed offline MotK intros fine; headless netplay FMV still
+  slow vs offline headless. Opt-in `PSX_NETPLAY_TIMING=1` splits the [FPS]
+  line into guest ms/f vs admit ms/f. Heavy FMV (~25–50 fps samples): guest
+  ≈21 ms/f, admit ≈3 ms/f (median) — frame time is dominated by the guest
+  quantum under phase-locked dual MDEC, not Swap and not INPUT_CONFIRM wait.
+  Offline headless same stretch is ~17 ms/f (≈57 fps). Pipelined CONFIRM
+  tried in recomp-net (tip publish, drain next tick) — no FPS gain on
+  localhost (~41→~41.5); reverted. Present-path / half-rate work is a dead
+  end for this regression. Next lever: reduce MotK FMV host cost so two
+  aligned peers fit a 16.7 ms budget (or accept same-machine lockstep floor).
+- **2026-07-21 (netplay FMV — restore present-before-admit):**
+  User confirmed early same-machine netplay FMV was ~50–60 and gameplay
+  under lockstep stays ~60 — so the rematch-safe `finish→admit→pace→present`
+  order was the FMV regression (expensive depth24 CPU present after admit).
+  Restored `finish→present→admit/pace` via RAII `NetplayVblankTail` (admit
+  on every return path; offline still paces before present). Kept half-rate
+  depth24 present skip + UDP `poll()` barrier; no `SDL_Delay(0)`. Verify
+  MotK intro FPS + tick-0 arm after rebuild.
+- **2026-07-21 (netplay FMV — re-land half-rate depth24 present):**
+  Windowed same-machine MotK netplay FMV was back at ~30–40 after the
+  rematch-safe `finish→admit→pace→present` order. Re-landed host-only
+  half-rate depth24 present: after admit, skip pace+Swap every other
+  depth24 vblank (present first, then alternate); admit/barrier unchanged
+  (no `SDL_Delay(0)` / present-before-admit). Offline path untouched.
+  Rebuild MotK `build-release` + verify intro FPS and tick-0 arm.
+- **2026-07-21 (lobby game_version + release pins):**
+  WS lobby now carries `game_version` alongside `game_name` (create/list/join).
+  Server rejects `version_mismatch` / `game_mismatch`; list can filter by either.
+  MotK/MW bake release pins from repo `VERSION` (Release → e.g. `0.1.0`, else
+  `dev`) via `PSX_GAME_VERSION` / `SNESRECOMP_BUILD_VERSION`. Clients send the
+  pin on create/join and filter the lobby browser. Redeploy lobby server for
+  remote matchmaking. Docs: `recomp-net-server/docs/WS_LOBBY.md`.
+- **2026-07-21 (portable .pst / boot_state v3 LE wire):**
+  Savestate / boot_state version → 3: header + section framing and all
+  module snapshots emit little-endian field wires (`pst_wire.h`) — no
+  host-struct padding (TimerRegs, DMA async/delayed, SpuVoice, McSlotState,
+  CDROM Pending/Queued). Netplay host→guest blob transfer is identical on
+  Win/Linux x86_64 and macOS ARM. Old v2 `.pst` files are rejected (recapture).
+
+- **2026-07-20 (netplay match_caps — host settings enforce):**
+  Lobby `create` / `set_match_caps` / `start` carry host sim caps
+  (aspect, turbo_loads, bios_hle, fast_boot, auto_skip_fmv, input_delay,
+  language). Server echoes on join/update/launch; guests apply before boot.
+  recomp-net-server + psx_lobby_client + MotK launcher. SNES mirror:
+  widescreen/hud/ignore_aspect/input_delay/ws_extra via snes_lobby + MW main.
+
+- **2026-07-20 (launcher: persist controller selection immediately):**
+  Device/mode/deadzone now write `settings.toml` on change (not only Launch),
+  so Refresh / Quit / soft-return keep the pad. Refresh falls back to saved
+  GUID if the dropdown index is stale.
+
+- **2026-07-20 (lobby default → public host):**
+  `psx_lobby_default_url` now `ws://netplay.technicallycomputers.ca:8765`
+  (match SNES); override still `PSX_NET_LOBBY_URL`. Synced MotK vendored
+  `psx_lobby_client.{c,h}` + recomp-net `docs/lobby.md`.
+
+- **2026-07-20 (Metal Warriors H2H: top-edge prop pop):**
+  Full-frame present recenters dual cam ~$40 up; spawn/OAM top was only
+  −$70/−$70 so platforms popped at Y=0. Spawn −$A8, OAM CMP −144, present
+  Y wrap peek for −64..0, dist-limit +64 when vert-widen.
+
+- **2026-07-20 (launcher: controller Refresh rescan):**
+  Dashboard Device row (P1 + offline P2) has Refresh — pumps SDL joysticks,
+  re-enumerates gamecontrollers, keeps selection by GUID. Offline + netplay.
+
+- **2026-07-20 (launcher: lobby lock emoji via symbol fallback font):**
+  Password lobbies showed □ for 🔒 — LatoLatin has no emoji. Load bundled
+  `NotoSansSymbols2-Regular.ttf` (system Segoe UI Symbol on Windows) with
+  RmlUi `fallback_face=true` so missing glyphs resolve.
+
+- **2026-07-20 (launcher lobbies: button order + dblclick join):**
+  Lobbies actions: Return to Launcher → Change Player Name → Host Game →
+  Join Lobby. Double-click a lobby row joins (same path as Join Lobby,
+  including password modal).
+
+- **2026-07-20 (launcher: offline↔netplay switch buttons):**
+  Dashboard footer: "Switch to Netplay" beside Launch Game (only when
+  `PSX_HAS_RECOMP_NET`); "Switch to Offline" beside Netplay Lobbies.
+  Home Netplay tile gated the same way; no-netplay builds skip home chooser.
+
+- **2026-07-20 (netplay load — apply freeze after hash match):**
+  Suppressing INPUT at `np_begin_load_apply` deadlocked both peers in
+  `netplay_barrier_admit`: tips stopped → `try_admit` never succeeded →
+  guest never ran → `savestate_poll` never applied. Fix: keep INPUT during
+  APPLYING; suppress only at `np_enter_load_ready` until `hard_resync`+prime.
+
+- **2026-07-20 (netplay load — false peer_disconnect → lobby):**
+  Hash-match apply suppresses INPUT for seconds → `peer_disconnected(1500)`
+  fired → soft-exit to lobby → rematch. Fix: timeout=0 (BYE-only) while
+  `in_load_barrier`; HELLO keepalive every 250 ms during suppress/stall.
+
+- **2026-07-20 (netplay post-load — stale INPUT clobber):**
+  2nd+ loads: correct frame, then ~3–5s frozen while FPS lived. Cause: during
+  LOAD apply/ready the slower peer kept emitting pre-resync INPUT tips; those
+  ticks share ring slots with the new tip (`tick % 128`) and first-wins /
+  overwrite races blocked `remotes_ready_for_sim` after `hard_resync`. Fix:
+  suppress INPUT sends for the load barrier; reject out-of-window remote ticks;
+  host `probe_finish` before sync+prime; re-anchor frame pacer on restore.
+
+- **2026-07-20 (savestate load — force GL present after identical frame):**
+  2nd+ load of the same `.pst` left FPS climbing while the picture stayed
+  frozen: `gl_renderer_present_vram` / wide early-out skipped `SwapWindow`
+  when display rect + present-dirty matched the last swap (common after
+  restoring into an already-shown frame). Fix: `gl_renderer_invalidate_present`
+  marks all present tiles dirty, clears path latches, resets interp history,
+  and forces 8 presents; called from `psx_frontend_on_savestate_loaded`.
+
+- **2026-07-20 (netplay post-load — admit barrier symmetric):**
+  Host dropped `LOAD_READY` before `try_admit` (guest did not) → confirm
+  wait with barrier already down; keeping remotes let stale tip=D
+  first-wins. Fix: both stay in `LOAD_READY` until admit; `hard_resync`
+  clears remotes again; sync+prime at mutual ready only.
+
+- **2026-07-20 (netplay post-load — mutual-ready sync):**
+  `hard_resync`+prime at apply let the later peer wipe the earlier tip
+  (2nd load slower). Sync once at mutual ready. (Remote-keep reverted —
+  see admit-barrier note above.)
+
+- **2026-07-20 (netplay post-load — symmetric ready release):**
+  Guest cleared `LOAD_READY` on READY ACK while host still had
+  `state_stall_sim` → confirm wait / intermittent hitch. Guest now ACKs
+  but stays in `LOAD_READY` until `try_admit` succeeds (pre-sends
+  INPUT_CONFIRM so host can admit on the same poll as `probe_finish`).
+  Ready-probe retransmit 40→8 ms; confirm retransmit 16→4 ms. MotK rebuild.
+
+- **2026-07-20 (netplay post-load resume — frozen picture + FPS):**
+  After load, FPS kept climbing while the window stayed on a stale/blank
+  frame: (1) present blank-latch skipped redraw after restore; (2) delay
+  rings empty after `hard_resync` while peers could still advance during
+  APPLYING. Fix: `hard_resync` resets `sim_tick→0` + `prime_delay_inputs`;
+  stall admit for APPLYING when `!savestate_pending` and all LOAD_READY;
+  `psx_frontend_on_savestate_loaded` forces restage/blank once; skip FPS
+  CLI during load barrier. MotK rebuild.
+
+- **2026-07-20 (netplay host-only save/load commands):**
+  User `savestate_request_*` refused on netplay guest; F-keys / debug TCP /
+  `PSX_LOAD_SLOT` host-only or routed via `psx_netplay_request_*`. Guest
+  follow-host sync uses `savestate_request_*_protocol`.
+
+- **2026-07-20 (netplay load — post-restore lockstep rendezvous):**
+  Hash-match load applied on each peer at different times after early
+  `hard_resync` → rings/ticks drifted → admit hang / starvation. Fix:
+  stage load → apply while admit runs → `hard_resync` only after restore →
+  LOAD size=0 ready probe until both ACK → then resume. Heartbeat in
+  admit barrier. MotK rebuild.
+
+- **2026-07-20 (netplay save hang — coord probe must not stall):**
+  Shift+F1 stalled admit before `savestate_poll` could write → deadlock.
+  Fix: `STATE_PROBE` with `size==0` (coord) leaves admit running; only
+  hash probe (`size!=0`) + chunk transfer stall. Guest retransmit replies
+  without re-staging saves. MotK rebuild after sync.
+
+- **2026-07-20 (netplay host-owned saves — hash probe + chunk transfer):**
+  recomp-net: `RNET_STATE_MAX` → 8 MiB, `STATE_PROBE`/`PROBE_REPLY`, stall
+  admit through probe + transfer; restored `rnet_session_wait_recv`.
+  psx_netplay: guest sandbox `saves/netplay/`, host-only F-keys, match-start
+  memcard probe, save = coord local write → hash-agree → transfer on miss +
+  post-CRC verify; load same pattern + `hard_resync`. MotK `build-release`
+  linked; verify Shift+F1 / F1 across LAN.
+
+- **2026-07-20 (MotK title after FMV — leave-depth24 restage):**
+  On exit from GP1 depth24, GL/VK `depth24_upload_policy` restaged full
+  CPU VRAM as 1555 into the FBO. CPU still held packed RGB888 from MDEC →
+  rainbow/static title background (text/overlays still drew as prims).
+  V2: skip only framebuffer-sized depth24 transfers (keep texture A0s);
+  on leave scissor-clear the skipped FB union (GL) — never blind-restage
+  RGB888-as-1555. Char-select shrink-to-left-center still under probe
+  (OFX=256 @ 512 CRTC looks correct; may be authored layout / separate).
+
+- **2026-07-20 (MotK 2nd intro right-edge stretch):**
+  `depth24_fix_trailing_margin` replicated the last good column when any
+  chroma>40 pixel sat in the trailing 8 cols. On the starfield FMV that
+  smeared stars into an 8-wide flickering strip. Now requires dense chroma
+  (~12% of margin) and black-fills instead of column-replicate. Still no
+  CRTC/content_w crop.
+
+- **2026-07-20 (MotK netplay FMV — lockstep floor, not present path):**
+  A/B: offline headless FMV ~59; two offline headless concurrent ~59; two
+  netplay headless ~38–40. Not dual-CPU contention and not GL present.
+  Lockstep (INPUT_CONFIRM frame barrier + same-tick input rendezvous)
+  keeps both MDEC peaks aligned. Async confirm / peer drift made FMV
+  *worse* (~22–28) via overlapped memory traffic. Barrier now UDP `poll()`
+  (not `SDL_Delay(1)`); localhost peers pin to disjoint CPU halves (~45
+  in A/B). Pipeline admit rewrite hung tick-0 — reverted.
+
+- **2026-07-20 (MotK netplay FMV — restore pre-rematch vblank order):**
+  User: same-machine netplay was 50–60 before rematch playback tweaks.
+  Reverted `NetplayVblankGuard` present-before-admit and half-rate depth24
+  present. Order is again finish→admit→pace→present. Kept: `s_present_w/h`
+  clear (black rematch FMV), depth24 FBO upload skip, trailing-margin
+  in-buffer fix, vsync-off while lockstep armed.
+
+- **2026-07-20 (MotK netplay tick-0 hang — revert admit latency hacks):**
+  After half-rate present, both peers armed lockstep then sat at frame 0
+  until peer_disconnect. Cause: `SDL_Delay(0)` busy-spin starved peer UDP
+  on dual localhost; same-call `try_admit` publish when CONFIRM pre-seen
+  also unsafe. Reverted both.
+
+- **2026-07-20 (MotK FMV netplay FPS — half-rate depth24 present):**
+  Measured: headless dual-peer lockstep holds ~60 guest FPS through intro;
+  windowed dual-peer ~30–40. Bottleneck is two GL CPU-presents serializing
+  before the guest fiber resumes — not admit/guest. Fix: under netplay +
+  depth24, present every other vblank (host-only; admit still every tick).
+
+- **2026-07-20 (MotK FMV netplay FPS — skip depth24 FBO upload queue):**
+  MDEC A0 was still queued as 1555 CPU→FBO uploads (`UP_RECTS_MAX`=16),
+  force-flushing mid-movie. While `gpu_display_is_depth24()`, do not queue
+  GL/VK uploads; on leave, drop queue (no full restage — see leave-depth24
+  log above). Alone did not restore
+  windowed netplay to offline rates (present cost remained).
+
+- **2026-07-20 (netplay FMV host FPS — present/vsync ordering):**
+  Offline MotK intro ~50+; netplay ~30–40 was host path, not guest
+  divergence. Fixes (determinism unchanged): (1) force GL/VK swap
+  interval 0 while lockstep is armed (restore on soft-exit) so driver
+  vsync does not double-block after the wall pacer; (2) move
+  `finish_frame`→present→`admit`+pacer so local Swap overlaps the peer's
+  guest quantum. `turbo_loads` stays off in netplay.
+
+- **2026-07-19 (MotK FMV right-edge — no present-width crop):**
+  Upload-span + `content_w` left-aligned GL crop removed the chroma junk
+  but replaced it with a flickering black pillar (span varied per frame,
+  especially during lighting). Rework: keep full CRTC width always;
+  `depth24_fix_trailing_margin` only replicates the last good column
+  into the last 8 RGB cols when chroma junk is detected — in-buffer,
+  no viewport shrink. Half-texel nearest UV clamp remains.
+
+- **2026-07-19 (MotK FMV right-edge — trailing margin, not CRTC shrink):**
+  Root cause: MotK depth24 crawl is 512×128 CRTC, but ~8 trailing RGB
+  columns are stale/black in VRAM; GL edge sampling flickered that strip
+  as garbage. Fix (no 2/3 width): track A0 upload span
+  (`gpu_depth24_rgb_limit`); blank/crop last 8 cols on short depth24
+  bands (`h<240`); `gl_renderer_present(..., content_w)` left-aligned
+  UV crop + half-texel nearest clamp; screenshot skips `sync_cpu` on
+  depth24 (was clobbering RGB888). MotK release+PGO rebuilt; user-verify
+  2nd intro (Star Wars logo) edge + ~50 FPS.
+
+- **2026-07-19 (MotK FMV right-edge / 2/3 revert):**
+  Tried depth24 width=(CRTC*2)/3 (512→341) for right-edge junk; MotK
+  intros rendered left-shifted with the right of the video clipped —
+  confirms the Jul-18 finding (logo is centered in a 512 RGB line).
+  Reverted 2/3. Kept: depth24→fmv_frame, short-band without force_4_3
+  gate, nearest present on depth24. Right-edge junk needs a different
+  fix (not shrinking CRTC width).
+
+- **2026-07-19 (MotK FMV FPS after rematch patches):**
+  Rematch video fixed; ~30–40 vs prior ~50+ was not a present-path
+  regression. Prior ~50 med was MotK intro PGO (`PSX_PGO=use`); LTO-only
+  baseline is ~39. Mistakenly cleared PGO — restored `PSX_PGO=use` with
+  existing intro `.gcda`. `fmv_frame` restored (depth24 only forces
+  `pin_43` short-band letterbox). Re-train via `scripts/pgo_motk_intro.sh`
+  after large rematch edits if profiles go stale.
+
+- **2026-07-19 (netplay rematch: black FMV = stale present tex size):**
+  Root cause: `s_present_w/h` survived GL context destroy; rematch FMV same
+  size as prior CPU present took `glTexSubImage2D` into a new unallocated
+  `s_present_tex` → black. Cleared on shutdown + init_context. Also dropped
+  per-frame `flush_cpu_uploads` on depth24 (was cutting intro ~50→~30 FPS);
+  depth24 CPU scanout needs neither FBO sync nor upload flush.
+
+- **2026-07-19 (netplay rematch: black FMV, audio OK):**
+  Rematch linked and played, but MotK intros had XA audio with black video
+  (FPS still dipped ~30–40 → MDEC ran). Earlier mis-attribution to sync_cpu;
+  also reset present/FPS/MDEC/iso session statics; `iso_close` before reopen;
+  depth24 forces 4:3 pin for short-band letterbox.
+
+- **2026-07-19 (netplay rematch: sticky I_STAT/I_MASK):**
+  After cycle-reset fix, rematch still starved: dump meta showed
+  `psx_cycle_count=4` with leftover `i_stat=VBlank` + game `i_mask`.
+  `interrupts_init` / `memory_init` now clear I_STAT/I_MASK (+ mem_ctrl);
+  `starvation_ring_reset` on `session_reboot` so dumps are rematch-clean.
+
+- **2026-07-19 (stick→D-Pad axial deadzone again):**
+  Radial+sign for digital stick→D-Pad made left/right fire Up/Down from tiny
+  Y drift (jump/crouch). Stick→button sources use per-axis `controller_deadzone`
+  again; analog `axes_to_pad_pair` / hybrid stick-detect stay radial.
+
+- **2026-07-19 (netplay rematch: stuck `psx_in_device_service`):**
+  Rematch still froze after `lockstep armed`: soft-exit longjmps out of the
+  vblank callback while inside `psx_devices_service_to_now`, leaving
+  `psx_in_device_service=1`. Every later `psx_advance_cycles` then skips
+  device service → no vblanks → hang after tick-0. Fix: clear the guard on
+  every scheduler longjmp escape; `psx_cycles_reset_for_boot()` zeros the
+  guest clock + deadline bookkeeping at `session_reboot`.
+
+- **2026-07-19 (Digital stick→D-Pad radial deadzone):**
+  Stick-as-D-Pad used a per-axis square threshold so centre drift twitched
+  movement even with a large launcher deadzone. Stick axis→button sources now
+  require radial magnitude past `controller_deadzone` (same idea as
+  `axes_to_pad_pair`); triggers stay per-axis. Hybrid stick-detect matches.
+
+- **2026-07-19 (netplay rematch HLE shell-skip latch):**
+  After soft-return rematch both peers linked (`lockstep armed`) then froze:
+  `s_shell_skipped` stayed set from the first match so HLE boot-skip never
+  re-fired and both ran the interactive BIOS shell under netplay.
+  `psx_bios_hle_configure` now clears the latch; `cdrom_init` resets boot
+  disc speed to 1x; lobby launch uses `input_player=-1` (auto) again.
+
+- **2026-07-19 (netplay rematch session_id + endpoint guard):**
+  Rematch HELLO hang: server now allocates a fresh `session_id` on every
+  `start`/`launch` (stale BYE/HELLO from the prior UDP session no longer match)
+  and refuses start when host/guest endpoints are empty. Client refuses
+  `fill_netplay_launch` / `launch_pending` when `peer_hostport` is missing.
+
+- **2026-07-19 (netplay return-to-lobby rematch):**
+  Lobby WS stays up across Launch. Window-close / Escape / peer BYE soft-exits
+  via `PSX_RUN_RETURN_TO_LOBBY` (scheduler longjmp or pre-entry flag) instead of
+  `exit(0)` when the match started from a lobby room. Teardown keeps the WS;
+  launcher resumes on `netplay_room` with ready cleared; rematch Launch
+  re-enters `session_reboot` (re-init guest + netplay). Server clears ready on
+  `start` so both peers must Ready again.
+
+- **2026-07-19 (lobby server → closed-source Rust):**
+  Proprietary `recomp-net-server` (Rust) owns WS lobby + privacy/docs;
+  removed C `servers/lobby` from open `recomp-net`. Client WS helpers
+  vendored at `runtime/src/lobby_ws/`. Default
+  `ws://netplay.technicallycomputers.ca:8765`.
+
+- **2026-07-19 (netplay lobby server + launcher menus):**
+  Lobby WS+JSON owned by proprietary `recomp-net-server` (was C
+  `servers/lobby/` under open recomp-net);
+  `psx_lobby_client` + RmlUi home → Offline / Netplay → lobbies table
+  (host/join/password). Launch hands `PsxNetplayConfig` to
+  `psx_netplay_start` (LAN endpoints from lobby). ICE relay stubbed.
+
+- **2026-07-19 (netplay peer disconnect QoL):**
+  Barrier `SDL_PollEvent` on `SDL_QUIT`/Escape → `shutdown_runtime`+exit.
+  recomp-net `BYE` (pkt 7) + `rnet_session_peer_disconnected(~1.5s)`;
+  `psx_netplay_shutdown` sends BYE. Surviving peer prints and exits instead
+  of spinning in admit.
+
+- **2026-07-19 (netplay latch + INPUT_CONFIRM + exclusive capture):**
+  Host stages one pad per sim tick (`latched_for_tick`); barrier only
+  re-samples via `needs_local_sample`, stalls on `input_desync`
+  (INPUT_CONFIRM hash mismatch). Netplay capture is exclusive to the
+  assigned PlayerInput (no keyboard-all / all-controllers merge) so peer
+  hashes agree. Cleared on `finish_frame` advance. recomp-net: preserve
+  early peer INPUT_CONFIRM when activating (wipe raced slower peer into
+  permanent stall). Smoke: two headless MotK peers both `lockstep armed`,
+  frames advance, no INPUT desync.
+
+- **2026-07-19 (netplay lockstep stall + per-peer input device):**
+  True delay-sync gate: pre-scheduler + each vblank `finish_frame` then
+  blocking `poll_admit` (guest fiber parks; no free-run on admit fail /
+  linking). Auto/`--net-input-player`: host samples P1 device, guest samples
+  P2 when assigned (same-PC C40+keyboard); pad blob deadzone normalize.
+
+- **2026-07-19 (netplay pad ownership — session slots always plugged):**
+  Host local device → net-slot 0 (sim P1); guest local → net-slot 1 (sim P2).
+  While active, SIO is network-only (no local/`override` writes). Both session
+  ports stay connected from `psx_netplay_start` through linking so in-game
+  2P/VS detect works; `refresh_player_devices` no longer clears them.
+
+- **2026-07-19 (delay-sync netplay bring-up — recomp-net LAN):**
+  Wired `recomp-net` into the runtime as CLI/env LAN delay-sync (not GGPO).
+  `psx_netplay.{c,h}` + CMake auto-discover `../recomp-net`; vblank owns
+  `pump`/`try_admit`/`publish`/`advance`; local pads stage only — publish is
+  sole SIO writer while active. Turbo + low-latency re-sample gated off.
+  Lobby UI / ICE server deferred. Smoke: two procs with `--netplay --net-slot`.
+
+- **2026-07-19 (MotK title/char-select — savestate PC + flat GEO batch):**
+  User still saw ~10 FPS after draw-area reject. Real char-select profile:
+  ~30k/s on-screen GP0(68h) starfield dots, `gpu_share`~0.8 (not empty clip).
+  Also: `boot_state_load` forced `pc=entry_pc`, so F1 loads desynced (display
+  off; false ~60 FPS). Restored saved PC; batched flat GEO tris in
+  `gpu_gl_renderer.c`. Char-select Shift+F1: **~60 FPS locked**, gpu_share~0.06.
+
+- **2026-07-19 (MotK title/char-select — GPU draw-area reject re-applied):**
+  Shift+F1 title + Arcade char select were &lt;10 FPS: same OT drain as the
+  inter-movie cliff — GP0(E3/E4)=(0,0)-(0,0) + thousands of clipped `0x68`
+  dots / quads; GL built 2 tris/prim. Re-applied inclusive draw-area reject
+  in `gpu.c` (prior revert blamed a “gap race”; crawl wrap was the separate
+  24bpp present-width bug). Alone insufficient for live starfield menus.
+
+- **2026-07-19 (MotK intro — native/hot/inline + multi-run PGO):**
+  Shipped `-march=native`, `[recompiler] hot_funcs` for VLC
+  `0x8006A9F8`/`0x8006CBE4`, Release-inline `debug_server_log_call_entry`
+  (cpu_state.h), HIT-inline `psx_icache_fetch` (psx_icache.h), multi-run
+  PGO train (`PGO_TRAIN_RUNS`/`PGO_TRAIN_SECS`). Remeasure clean logo still
+  **~51 med** (more mid/high-50 samples; not locked 60). Load-delay cycle
+  volume remains the ceiling. Inter-movie cliff open. No MotK VSync HLE.
+
+- **2026-07-19 (MotK intro — PGO + advance_cycles host cost):**
+  (1) `psx_advance_cycles`: drop per-charge watchdog/PC-sample (moved into
+  `service_to_now`, HARD_CAP cadence); (2) `psx_devices_mmio_sync` recomputes
+  deadline in-place instead of dirtying `next_service=0` (was forcing service
+  on the next insn after every GPU/CD/MDEC MMIO); (3) MotK intro PGO via
+  `scripts/pgo_motk_intro.sh` (`-DPSX_PGO=generate|use`, 311 .gcda). Clean
+  logo (until inter-movie cliff): **~49–51 med** (was ~39 LTO-only). Crawl
+  after gap recovers ~47–50. Inter-movie ~7 FPS GPU cliff still open. No
+  MotK VSync HLE.
+
+- **2026-07-19 (MotK intro — VLC host opts + Release LTO):**
+  Host-side work on MotK VLC (`0x8006A9F8`/`0x8006CBE4`), not disc cache:
+  (1) idle_skip no longer defeats IRQ fast-path; deferred idle GPR snap;
+  (2) IRQ mid-path when bits already pending; (3) `psx_slice_block` header
+  inline when parked; (4) main-RAM `psx_cyc_load_word`/`half` inlined;
+  (5) MotK Release `CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE` (-flto).
+  Logo window: ~34 med → ~39 med (samples mostly 38–40). Still short of 50;
+  load-delay cycle volume remains the ceiling (PSX_LOAD_DELAY=0 → hundreds
+  FPS). Inter-movie ~5–7 FPS GPU cliff open. No MotK VSync HLE.
+
+- **2026-07-18 (MotK intro — FMV pace: inline cycle advance):**
+  Host FPS still short of 50 with real MDEC/XA. Inlined `psx_advance_cycles`
+  (deadline fast path) + merged load fudge/cost into one charge; bit-exact
+  DC-only MDEC IDCT. Release FMV ~33 med / ~39 avg (steadier; was dipping to
+  teens). Gap ~7. Remaining: static VLC `0x8006A9F8`/`0x8006CBE4` + load-delay
+  host cost. Do not revive MotK VSync HLE / HARD_CAP without mdec rising.
+
+- **2026-07-18 (MotK intro — 24bpp CRTC width + short-band present):**
+  MotK FMV CRTC is 512 (X1/X2÷5); logo centered in 512 RGB (~86..431).
+  Reverted blanket 24-bit mode×2/3 (341 cropped the right). Width = GP1(06h)÷
+  dot-clock for 15/24-bit. Short GP1(07h)=128 no longer fills 4:3 — present
+  letterboxes src_h/240 (GL/SDL/VK). Inter-movie GPU cliff still open.
+  CD-only `spu_render` kept.
+
+- **2026-07-18 (MotK intro FMV — false 60 FPS / no video; rollback):**
+  MotK `load_accel.vsync_query` + event-horizon_any / HARD_CAP→564480 /
+  in-exception VBlank chunking produced host FPS ~60 with **no MDEC**
+  (`mdec_decode_count` stayed 0, display disabled) — guest time raced past the
+  STR. A/B: VSync(-1) HLE alone is enough to keep MotK MDEC at 0; disabling
+  it restores decode/XA. Reverted those accelerations for MotK; kept sticky
+  CD IRQ deadline, load-delay coalesce, MDEC DMA bulk/IDCT skips. Real intro
+  with video is again ~30–40 FPS host-bound under load-delay. Do not claim
+  MotK FMV pace wins without `fmv_state.mdec_decode_count` rising.
+
+- **2026-07-18 (earlier same day — sticky CD deadline + load-path host cost):**
+  `cdrom_cycles_to_irq` sticky presented IRQ → 1-cycle deadline after sync;
+  fixed. Load-delay coalesce + inline `psx_advance_cycles`. Necessary but not
+  sufficient for MotK FMV ≥50 with video.
+
 - **2026-07-11 (Tomba 2 OpenGL full-attract performance + audio acceptance):**
   Resolved the shared renderer/overlay/capture cascade that made Beach, Whoopee
   FMVs, Mines, and Mine Cart slow. OpenGL now avoids mandatory present readback,
