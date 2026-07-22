@@ -110,6 +110,7 @@ target_link_libraries(psxrecomp-toml PRIVATE fmt)
 # psxrecomp — user-facing media-to-source project generator.
 add_executable(psxrecomp
     src/main_cli.cpp
+    src/cli_boot_path.cpp
     src/ps1_exe_parser.cpp
     ../runtime/src/iso_reader.cpp
 )
@@ -245,6 +246,13 @@ target_include_directories(l2_structural_test PRIVATE
 target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
 
 if(BUILD_TESTING)
+    add_executable(cli_boot_path_test
+        tests/cli_boot_path_test.cpp
+        src/cli_boot_path.cpp
+    )
+    target_include_directories(cli_boot_path_test PRIVATE src)
+    add_test(NAME cli_boot_path_test COMMAND cli_boot_path_test)
+
     add_executable(recompiler_patch_test
         tests/recompiler_patch_test.cpp
         src/ps1_exe_parser.cpp

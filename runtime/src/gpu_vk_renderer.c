@@ -2187,10 +2187,13 @@ static void vkb_set_texture_filter(int b) { s_texfilter = b ? 1 : 0; }
 static int  vkb_texture_filter(void) { return s_texfilter; }
 
 static void vkb_set_draw_area(int x1, int y1, int x2, int y2) {
-    /* scissor is per-batch (one render pass uses one scissor), so flush any
-     * pending geometry before the clip rect changes. */
-    if (x1 != s_da_x1 || y1 != s_da_y1 || x2 != s_da_x2 || y2 != s_da_y2)
+    /* Scissor is per-batch (one render pass uses one scissor), so drain both
+     * independent geometry batches before the clip rect changes. Otherwise
+     * earlier textured GP0 primitives render with the next draw area's scissor. */
+    if (x1 != s_da_x1 || y1 != s_da_y1 || x2 != s_da_x2 || y2 != s_da_y2) {
+        flush_tex_batch();
         flush_geometry();
+    }
     s_da_x1 = x1; s_da_y1 = y1; s_da_x2 = x2; s_da_y2 = y2;
 }
 static void vkb_get_draw_area(int *x1, int *y1, int *x2, int *y2) {

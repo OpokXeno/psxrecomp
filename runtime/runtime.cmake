@@ -573,11 +573,11 @@ function(psxrecomp_add_runtime_target target)
     # We need only the Vulkan HEADERS at compile time, plus glslc to build SPIR-V.
     # Both ship with the Vulkan SDK ($VULKAN_SDK) or a Vulkan-Headers package.
     #
-    # Build-EXCLUDED by default (silent WIP): the real Vulkan path compiles only
-    # with -DPSX_ENABLE_VULKAN=ON. When OFF, gpu_vk_renderer.c builds as the inert
-    # stub and the exe behaves exactly as the GL/software build — no SDK/glslc
-    # dependency, regardless of whether $VULKAN_SDK is present on the machine.
-    option(PSX_ENABLE_VULKAN "Build the experimental Vulkan renderer backend (WIP)" OFF)
+    # Build Vulkan when its SDK tools are available so release binaries can offer
+    # it without game projects opting in individually. This does not select the
+    # runtime renderer: OpenGL remains the default in config_loader.h. Builders
+    # can still use -DPSX_ENABLE_VULKAN=OFF to produce the inert stub explicitly.
+    option(PSX_ENABLE_VULKAN "Build the Vulkan renderer backend when SDK tools are available" ON)
     if(PSX_ENABLE_VULKAN)
     set(_vk_inc "")
     if(DEFINED ENV{VULKAN_SDK})
