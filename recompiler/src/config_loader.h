@@ -807,6 +807,7 @@ struct UserSettings {
     // [netplay] — display name for lobby browser / room. Prompted once on first
     // Netplay Lobbies visit; Change Player Name updates it.
     bool has_netplay_player_name = false; std::string netplay_player_name;
+    bool has_netplay_lobby_url = false; std::string netplay_lobby_url;
     bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
                                      int  aspect_den     = 3; // (4:3 = native)
     // [audio]

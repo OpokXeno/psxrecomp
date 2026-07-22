@@ -59,7 +59,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(RECOMP_LAUNCHER)
-#include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher (prototype) */
+#include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher */
 #include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
 #endif
 #include <SDL.h>
@@ -85,6 +85,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <commdlg.h>
 #endif
@@ -3753,7 +3755,7 @@ static void sdl_vblank_present(void) {
 #if defined(RECOMP_LAUNCHER)
 // Host verification/inspection callbacks for the shared recomp-ui launcher.
 // The launcher re-runs these on every disc/memory-card change so the "Disc
-// verified" verdict + memcard block grids reflect the REAL images. The expected
+// verified" verdict + memcard block grids reflect the real images. The expected
 // serial/CRC are passed via these file-scope statics (set just before
 // recomp_launcher_run_window) because the C-ABI callback can't capture locals.
 namespace {
@@ -3771,7 +3773,7 @@ namespace {
         std::snprintf(out->serial, sizeof(out->serial), "%s", serial.c_str());
         std::snprintf(out->region, sizeof(out->region), "%s", id.region.c_str());
         out->iso_ok = id.has_header ? 1 : 0;
-        // Verdict state consumed by the launcher UI.
+        // Verdict shown by the launcher.
         if (!id.opened || !id.has_header)                            out->verdict = 3; // bad
         else if (id.expected_serial_given && !id.serial_matches)     out->verdict = 3; // wrong disc
         else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) out->verdict = 2; // warn
@@ -3788,6 +3790,454 @@ namespace {
         for (int i = 0; i < 15; ++i) out->block_used[i] = s.block_used[i];
         return 1;
     }
+
+    std::string g_lnch_netplay_game_name;
+    std::filesystem::path g_lnch_settings_path;
+    std::string g_lnch_lobby_url;
+    RecompLauncherCNetplayLaunch g_lnch_pending_direct_launch{};
+    bool g_lnch_hosting_lan = false;
+    bool g_lnch_joined_lan = false;
+    std::string g_lnch_lan_endpoint;
+
+    struct AeLanLobbyState {
+        std::string name;
+        std::string game;
+        std::string endpoint;
+        std::string host_name;
+        std::string joiner_name;
+        std::string password;
+        bool started = false;
+        int host_slot = 0;
+    };
+
+    std::filesystem::path ae_np_lan_file() {
+        return std::filesystem::current_path() / "netplay_lan_lobby.txt";
+    }
+
+    bool ae_np_read_lan_state(AeLanLobbyState* state) {
+        if (!state) return false;
+        std::ifstream f(ae_np_lan_file());
+        if (!f) return false;
+        std::string started, host_slot;
+        std::getline(f, state->name);
+        std::getline(f, state->game);
+        std::getline(f, state->endpoint);
+        std::getline(f, state->host_name);
+        std::getline(f, state->joiner_name);
+        std::getline(f, started);
+        std::getline(f, host_slot);
+        std::getline(f, state->password);
+        state->started = started == "1";
+        state->host_slot = host_slot == "1" ? 1 : 0;
+        return !state->endpoint.empty();
+    }
+
+    bool ae_np_write_lan_state(const AeLanLobbyState& state) {
+        std::ofstream f(ae_np_lan_file(), std::ios::trunc);
+        if (!f) return false;
+        f << state.name << "\n"
+          << state.game << "\n"
+          << state.endpoint << "\n"
+          << state.host_name << "\n"
+          << state.joiner_name << "\n"
+          << (state.started ? "1" : "0") << "\n"
+          << state.host_slot << "\n"
+          << state.password << "\n";
+        return (bool)f;
+    }
+
+    void ae_np_write_lan_lobby(const char* name, const char* endpoint,
+                               const char* password) {
+        AeLanLobbyState state;
+        state.name = name && name[0] ? name : "LAN Lobby";
+        state.game = g_lnch_netplay_game_name.empty() ? "PSX" : g_lnch_netplay_game_name;
+        state.endpoint = endpoint && endpoint[0] ? endpoint : "127.0.0.1:7777";
+        state.host_name = psx_lobby_display_name();
+        if (state.host_name.empty()) state.host_name = "Host";
+        state.password = password ? password : "";
+        ae_np_write_lan_state(state);
+        g_lnch_hosting_lan = true;
+        g_lnch_joined_lan = false;
+        g_lnch_lan_endpoint = state.endpoint;
+    }
+
+    int ae_np_read_lan_lobby(RecompLauncherCNetplayLobby* out) {
+        if (!out) return 0;
+        AeLanLobbyState state;
+        if (!ae_np_read_lan_state(&state)) return 0;
+        std::snprintf(out->lobby_id, sizeof(out->lobby_id), "lan:%s", state.endpoint.c_str());
+        std::snprintf(out->name, sizeof(out->name), "LAN - %s",
+                      state.name.empty() ? "Lobby" : state.name.c_str());
+        std::snprintf(out->game_name, sizeof(out->game_name), "%s",
+                      state.game.empty() ? "PSX" : state.game.c_str());
+        out->player_count = state.joiner_name.empty() ? 1 : 2;
+        out->max_slots = 2;
+        out->has_password = state.password.empty() ? 0 : 1;
+        return 1;
+    }
+
+    PsxLobbyMatchCaps ae_netplay_caps_from_settings(const RecompLauncherCSettings* s) {
+        PsxLobbyMatchCaps caps{};
+        caps.valid = 1;
+        switch (s ? s->aspect_index : 0) {
+            case 2:  caps.aspect_num = 21; caps.aspect_den = 9; break;
+            case 1:  caps.aspect_num = 16; caps.aspect_den = 9; break;
+            default: caps.aspect_num = 4;  caps.aspect_den = 3; break;
+        }
+        caps.turbo_loads   = s ? (s->turbo_loads != 0) : 0;
+        caps.auto_skip_fmv = s ? (s->auto_skip_fmv != 0) : 0;
+        caps.input_delay   = 2;
+        return caps;
+    }
+
+    const char* ae_np_default_url(void*) {
+        return g_lnch_lobby_url.empty() ? psx_lobby_default_url() : g_lnch_lobby_url.c_str();
+    }
+
+    void ae_np_save_identity(const char* player_name, const char* lobby_url) {
+        if (g_lnch_settings_path.empty()) return;
+        PSXRecompV4::UserSettings settings =
+            PSXRecompV4::load_user_settings(g_lnch_settings_path);
+        if (settings.parse_error) return;
+        if (player_name && player_name[0]) {
+            settings.netplay_player_name = player_name;
+            settings.has_netplay_player_name = true;
+        }
+        if (lobby_url && lobby_url[0]) {
+            settings.netplay_lobby_url = lobby_url;
+            settings.has_netplay_lobby_url = true;
+        }
+        PSXRecompV4::save_user_settings(g_lnch_settings_path, settings);
+    }
+
+    void ae_np_set_lobby_url(void*, const char* url) {
+        g_lnch_lobby_url = url && url[0] ? url : psx_lobby_default_url();
+        ae_np_save_identity(nullptr, g_lnch_lobby_url.c_str());
+    }
+
+    int ae_np_connect(void*) {
+        psx_lobby_set_game_identity(g_lnch_netplay_game_name.c_str(), PSX_GAME_VERSION);
+        return psx_lobby_connect(ae_np_default_url(nullptr));
+    }
+
+    int ae_np_connected(void*) {
+        return psx_lobby_connected();
+    }
+
+    void ae_np_pump(void*) {
+        psx_lobby_pump();
+    }
+
+    void ae_np_set_player_name(void*, const char* name) {
+        psx_lobby_set_display_name(name && name[0] ? name : "Player");
+        if (name && name[0]) ae_np_save_identity(name, nullptr);
+    }
+
+    const char* ae_np_player_name(void*) {
+        return psx_lobby_display_name();
+    }
+
+    void ae_np_request_list(void*) {
+        psx_lobby_request_list();
+    }
+
+    int ae_np_list_count(void*) {
+        RecompLauncherCNetplayLobby lan{};
+        return psx_lobby_list_count() + (ae_np_read_lan_lobby(&lan) ? 1 : 0);
+    }
+
+    int ae_np_list_get(void*, int index, RecompLauncherCNetplayLobby* out) {
+        if (!out) return 0;
+        const int remote_count = psx_lobby_list_count();
+        if (index >= remote_count)
+            return ae_np_read_lan_lobby(out);
+        PsxLobbyRow row{};
+        if (!psx_lobby_list_get(index, &row)) return 0;
+        std::snprintf(out->lobby_id, sizeof(out->lobby_id), "%s", row.lobby_id);
+        std::snprintf(out->name, sizeof(out->name), "%s", row.name);
+        std::snprintf(out->game_name, sizeof(out->game_name), "%s", row.game_name);
+        std::snprintf(out->game_version, sizeof(out->game_version), "%s", row.game_version);
+        out->player_count = row.player_count;
+        out->max_slots = row.max_slots;
+        out->has_password = row.has_password;
+        return 1;
+    }
+
+    int ae_np_local_ip(void*, char* out, size_t out_len) {
+        if (!out || out_len == 0) return 0;
+#ifdef _WIN32
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) return 0;
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(80);
+        inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
+        if (connect(s, (sockaddr*)&dst, sizeof(dst)) == SOCKET_ERROR) {
+            closesocket(s);
+            return 0;
+        }
+        sockaddr_in local{};
+        int len = sizeof(local);
+        if (getsockname(s, (sockaddr*)&local, &len) == SOCKET_ERROR) {
+            closesocket(s);
+            return 0;
+        }
+        char buf[64] = {};
+        const char* ip = inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf));
+        closesocket(s);
+        if (!ip || !buf[0]) return 0;
+        std::snprintf(out, out_len, "%s", buf);
+        return 1;
+#else
+        std::snprintf(out, out_len, "Unavailable");
+        return 0;
+#endif
+    }
+
+    int ae_np_external_ip(void*, char* out, size_t out_len) {
+        if (!out || out_len == 0) return 0;
+#ifdef _WIN32
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (getaddrinfo("api.ipify.org", "80", &hints, &res) != 0 || !res)
+            return 0;
+        SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (s == INVALID_SOCKET) {
+            freeaddrinfo(res);
+            return 0;
+        }
+        int ok = 0;
+        if (connect(s, res->ai_addr, (int)res->ai_addrlen) != SOCKET_ERROR) {
+            const char req[] =
+                "GET / HTTP/1.1\r\n"
+                "Host: api.ipify.org\r\n"
+                "Connection: close\r\n\r\n";
+            (void)send(s, req, (int)strlen(req), 0);
+            char resp[1024];
+            int n = recv(s, resp, sizeof(resp) - 1, 0);
+            if (n > 0) {
+                resp[n] = '\0';
+                char* body = strstr(resp, "\r\n\r\n");
+                body = body ? body + 4 : resp;
+                char ip[64] = {};
+                int j = 0;
+                for (int i = 0; body[i] && j < (int)sizeof(ip) - 1; ++i) {
+                    if ((body[i] >= '0' && body[i] <= '9') || body[i] == '.')
+                        ip[j++] = body[i];
+                    else if (j > 0)
+                        break;
+                }
+                if (j > 0) {
+                    std::snprintf(out, out_len, "%s", ip);
+                    ok = 1;
+                }
+            }
+        }
+        closesocket(s);
+        freeaddrinfo(res);
+        return ok;
+#else
+        std::snprintf(out, out_len, "Unavailable");
+        return 0;
+#endif
+    }
+
+    int ae_np_create(void*, const char* lobby_name, const char* host_port,
+                     const char* password,
+                     const RecompLauncherCSettings* settings) {
+        PsxLobbyMatchCaps caps = ae_netplay_caps_from_settings(settings);
+        const char* endpoint = host_port && host_port[0] ? host_port : "0.0.0.0:7777";
+        ae_np_write_lan_lobby(lobby_name, endpoint, password);
+        return psx_lobby_create(lobby_name && lobby_name[0] ? lobby_name : "Netplay Lobby",
+                                g_lnch_netplay_game_name.c_str(), PSX_GAME_VERSION,
+                                password ? password : "", endpoint, &caps);
+    }
+
+    int ae_np_join(void*, const char* lobby_id, const char* password) {
+        if (lobby_id && strncmp(lobby_id, "lan:", 4) == 0) {
+            AeLanLobbyState state;
+            if (!ae_np_read_lan_state(&state) || !state.joiner_name.empty()) return -1;
+            if (state.password != (password ? password : "")) return -2;
+            state.joiner_name = psx_lobby_display_name();
+            if (state.joiner_name.empty()) state.joiner_name = "Player";
+            state.started = false;
+            if (!ae_np_write_lan_state(state)) return -1;
+            g_lnch_hosting_lan = false;
+            g_lnch_joined_lan = true;
+            g_lnch_lan_endpoint = state.endpoint;
+            return 0;
+        }
+        return psx_lobby_join(lobby_id, password ? password : "", "0.0.0.0:0");
+    }
+
+    int ae_np_leave(void*) {
+        if (g_lnch_hosting_lan) {
+            std::error_code ec;
+            std::filesystem::remove(ae_np_lan_file(), ec);
+            g_lnch_hosting_lan = false;
+        } else if (g_lnch_joined_lan) {
+            AeLanLobbyState state;
+            if (ae_np_read_lan_state(&state)) {
+                state.joiner_name.clear();
+                state.started = false;
+                ae_np_write_lan_state(state);
+            }
+        }
+        g_lnch_joined_lan = false;
+        g_lnch_lan_endpoint.clear();
+        g_lnch_pending_direct_launch = {};
+        return psx_lobby_leave();
+    }
+    int ae_np_in_lobby(void*) {
+        return g_lnch_hosting_lan || g_lnch_joined_lan || psx_lobby_in_lobby();
+    }
+    int ae_np_is_host(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) return g_lnch_hosting_lan ? 1 : 0;
+        return psx_lobby_is_host();
+    }
+    int ae_np_member_count(void*) {
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) return 2;
+        return psx_lobby_member_count();
+    }
+
+    int ae_np_member_get(void*, int index, RecompLauncherCNetplayMember* out) {
+        if (!out) return 0;
+        if (g_lnch_hosting_lan || g_lnch_joined_lan) {
+            if (index < 0 || index > 1) return 0;
+            AeLanLobbyState state;
+            if (!ae_np_read_lan_state(&state)) return 0;
+            const bool host = index == 0;
+            out->slot = host ? state.host_slot : 1 - state.host_slot;
+            const std::string& name = host ? state.host_name : state.joiner_name;
+            std::snprintf(out->display_name, sizeof(out->display_name), "%s", name.c_str());
+            out->ready = !name.empty();
+            out->is_host = host ? 1 : 0;
+            return 1;
+        }
+        PsxLobbyMember mem{};
+        if (!psx_lobby_member_get(index, &mem)) return 0;
+        out->slot = mem.slot;
+        std::snprintf(out->display_name, sizeof(out->display_name), "%s", mem.display_name);
+        out->ready = mem.ready;
+        out->is_host = mem.slot == 0;
+        return 1;
+    }
+
+    int ae_np_move_member(void*, int from_slot, int to_slot) {
+        if (!g_lnch_hosting_lan || from_slot < 0 || from_slot > 1 ||
+            to_slot < 0 || to_slot > 1 || from_slot == to_slot) return -1;
+        AeLanLobbyState state;
+        if (!ae_np_read_lan_state(&state)) return -1;
+        state.host_slot = 1 - state.host_slot;
+        state.started = false;
+        return ae_np_write_lan_state(state) ? 0 : -1;
+    }
+
+    int ae_np_local_ready(void*) { return psx_lobby_local_ready(); }
+    int ae_np_all_ready(void*) { return psx_lobby_all_ready(); }
+    int ae_np_set_ready(void*, int ready) { return psx_lobby_set_ready(ready); }
+
+    int ae_np_request_start(void*, const RecompLauncherCSettings* settings) {
+        if (g_lnch_hosting_lan) {
+            AeLanLobbyState state;
+            if (!ae_np_read_lan_state(&state) || state.joiner_name.empty()) return -1;
+            state.started = true;
+            return ae_np_write_lan_state(state) ? 0 : -1;
+        }
+        PsxLobbyMatchCaps caps = ae_netplay_caps_from_settings(settings);
+        return psx_lobby_request_start(&caps);
+    }
+
+    int ae_np_launch_pending(void*) {
+        if ((g_lnch_hosting_lan || g_lnch_joined_lan) &&
+            !g_lnch_pending_direct_launch.enabled) {
+            AeLanLobbyState state;
+            if (ae_np_read_lan_state(&state) && state.started) {
+                g_lnch_pending_direct_launch = {};
+                g_lnch_pending_direct_launch.enabled = 1;
+                g_lnch_pending_direct_launch.local_slot = g_lnch_hosting_lan
+                    ? state.host_slot : 1 - state.host_slot;
+                g_lnch_pending_direct_launch.input_player = 0;
+                g_lnch_pending_direct_launch.session_id = 1;
+                g_lnch_pending_direct_launch.input_delay = 2;
+                if (g_lnch_hosting_lan) {
+                    const size_t colon = state.endpoint.rfind(':');
+                    const char* port = colon == std::string::npos
+                        ? "7777" : state.endpoint.c_str() + colon + 1;
+                    std::snprintf(g_lnch_pending_direct_launch.bind_hostport,
+                                  sizeof(g_lnch_pending_direct_launch.bind_hostport),
+                                  "0.0.0.0:%s", port);
+                } else {
+                    std::snprintf(g_lnch_pending_direct_launch.bind_hostport,
+                                  sizeof(g_lnch_pending_direct_launch.bind_hostport), "0.0.0.0:0");
+                    std::snprintf(g_lnch_pending_direct_launch.peer_hostport,
+                                  sizeof(g_lnch_pending_direct_launch.peer_hostport), "%s",
+                                  state.endpoint.c_str());
+                }
+            }
+        }
+        return g_lnch_pending_direct_launch.enabled || psx_lobby_launch_pending();
+    }
+    void ae_np_clear_launch_pending(void*) {
+        g_lnch_pending_direct_launch = {};
+        psx_lobby_clear_launch_pending();
+    }
+
+    int ae_np_fill_launch(void*, RecompLauncherCNetplayLaunch* out) {
+        if (!out) return 0;
+        if (g_lnch_pending_direct_launch.enabled) {
+            *out = g_lnch_pending_direct_launch;
+            return 1;
+        }
+        const PsxLobbyJoinInfo* ji = psx_lobby_join_info();
+        if (!ji || !ji->ok) return 0;
+        const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+        out->enabled = 1;
+        out->local_slot = ji->local_slot;
+        out->input_player = 0;
+        std::snprintf(out->bind_hostport, sizeof(out->bind_hostport), "%s", ji->bind_hostport);
+        std::snprintf(out->peer_hostport, sizeof(out->peer_hostport), "%s", ji->peer_hostport);
+        out->session_id = ji->session_id;
+        out->input_delay = (caps && caps->valid) ? caps->input_delay : 2;
+        return 1;
+    }
+
+    RecompLauncherCNetplayCallbacks g_lnch_netplay_callbacks = {
+        nullptr,
+        ae_np_default_url,
+        ae_np_set_lobby_url,
+        ae_np_connect,
+        ae_np_connected,
+        ae_np_pump,
+        ae_np_set_player_name,
+        ae_np_player_name,
+        ae_np_request_list,
+        ae_np_list_count,
+        ae_np_list_get,
+        ae_np_local_ip,
+        ae_np_external_ip,
+        ae_np_create,
+        ae_np_join,
+        ae_np_leave,
+        ae_np_in_lobby,
+        ae_np_is_host,
+        ae_np_member_count,
+        ae_np_member_get,
+        ae_np_move_member,
+        ae_np_local_ready,
+        ae_np_all_ready,
+        ae_np_set_ready,
+        ae_np_request_start,
+        ae_np_launch_pending,
+        ae_np_clear_launch_pending,
+        ae_np_fill_launch,
+    };
 }  // namespace
 #endif
 
@@ -4384,6 +4834,9 @@ int main(int argc, char** argv) {
     {
         std::filesystem::path settings_path =
             exe_dir_from_argv(argv[0]) / "settings.toml";
+#if defined(RECOMP_LAUNCHER)
+        g_lnch_settings_path = settings_path;
+#endif
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
         if (us.parse_error) {
@@ -4422,6 +4875,10 @@ int main(int argc, char** argv) {
             netplay_player_name = us.netplay_player_name;
             has_netplay_player_name = true;
         }
+#if defined(RECOMP_LAUNCHER)
+        if (us.has_netplay_lobby_url && !us.netplay_lobby_url.empty())
+            g_lnch_lobby_url = us.netplay_lobby_url;
+#endif
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
@@ -4589,9 +5046,9 @@ int main(int argc, char** argv) {
     const bool want_launcher =
         force_launcher ||
         (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
-    psx_launcher::NetplayLaunch launcher_netplay{};
     if (want_launcher) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
+            int lr = 2; /* 0 = launch, 1 = quit, 2 = unavailable */
             PSXRecompV4::UserSettings seed;
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
@@ -4614,6 +5071,10 @@ int main(int argc, char** argv) {
             if (has_netplay_player_name) {
                 seed.netplay_player_name = netplay_player_name;
                 seed.has_netplay_player_name = true;
+            }
+            if (!g_lnch_lobby_url.empty()) {
+                seed.netplay_lobby_url = g_lnch_lobby_url;
+                seed.has_netplay_lobby_url = true;
             }
             if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
             if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
@@ -4659,6 +5120,8 @@ int main(int argc, char** argv) {
             ls.skip_launcher  = seed.skip_launcher ? 1 : 0;
             ls.msu1_enabled   = 0;
             ls.msu1_dir[0]    = '\0';
+            std::snprintf(ls.netplay_player_name, sizeof(ls.netplay_player_name), "%s",
+                          has_netplay_player_name ? netplay_player_name.c_str() : "");
             ls.pad_mode[0]    = seed.p1_mode;
             ls.pad_mode[1]    = seed.p2_mode;
             /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
@@ -4772,15 +5235,22 @@ int main(int argc, char** argv) {
             g_lnch_has_crc         = game_has_disc_crc;
             gi.disc_verify     = ae_disc_verify;
             gi.memcard_inspect = ae_memcard_inspect;
+#if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+            g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;
+            gi.netplay_supported = (game_players == 2) ? 1 : 0;
+            gi.netplay = &g_lnch_netplay_callbacks;
+#endif
 
             char rui_out_disc[1024] = {0};
             int rui_rc = recomp_launcher_run_window(
                 rui_title.c_str(), &ls, &gi, assets_dir_str.c_str(),
                 rui_initial_disc.c_str(), rui_out_disc, sizeof(rui_out_disc));
 
-            int lr = rui_rc; /* 0=Launch, 1=Quit, other=Unavailable */
+            lr = rui_rc;
 
             if (lr == 0) {
+                seed.netplay_player_name = ls.netplay_player_name;
+                seed.has_netplay_player_name = true;
                 if (rui_out_disc[0]) {
                     seed.disc_path = rui_out_disc;
                     seed.has_disc_path = true;
@@ -4838,6 +5308,24 @@ int main(int argc, char** argv) {
                     seed.language = lang_menu_options[ls.language_index].code;
                     seed.has_language = true;
                 }
+#if defined(PSX_HAS_LOBBY_CLIENT)
+                if (ls.netplay_launch.enabled) {
+                    const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
+                    if (caps && caps->valid) {
+                        seed.aspect_num = caps->aspect_num ? caps->aspect_num : seed.aspect_num;
+                        seed.aspect_den = caps->aspect_den ? caps->aspect_den : seed.aspect_den;
+                        seed.has_aspect_ratio = true;
+                        seed.turbo_loads = caps->turbo_loads != 0;
+                        seed.has_turbo_loads = true;
+                        seed.auto_skip_fmv = caps->auto_skip_fmv != 0;
+                        seed.has_auto_skip_fmv = true;
+                        if (caps->language[0]) {
+                            seed.language = caps->language;
+                            seed.has_language = true;
+                        }
+                    }
+                }
+#endif
             }
 
             if (lr == 1) {
@@ -4845,6 +5333,25 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (lr == 0) {
+                if (ls.netplay_launch.enabled) {
+                    net_cfg.enabled = 1;
+                    net_cfg.local_slot = ls.netplay_launch.local_slot;
+                    net_cfg.input_player = ls.netplay_launch.input_player;
+                    net_cfg.session_id = ls.netplay_launch.session_id;
+                    net_cfg.input_delay = ls.netplay_launch.input_delay;
+                    std::snprintf(net_cfg.bind_hostport, sizeof(net_cfg.bind_hostport), "%s",
+                                  ls.netplay_launch.bind_hostport);
+                    std::snprintf(net_cfg.peer_hostport, sizeof(net_cfg.peer_hostport), "%s",
+                                  ls.netplay_launch.peer_hostport);
+                    g_netplay_from_lobby = 1;
+                    std::fprintf(stdout,
+                        "psxrecomp: launcher netplay slot=%d bind=%s peer=%s session=%u\n",
+                        net_cfg.local_slot, net_cfg.bind_hostport, net_cfg.peer_hostport,
+                        (unsigned)net_cfg.session_id);
+                    std::fflush(stdout);
+                } else {
+                    g_netplay_from_lobby = 0;
+                }
                 g_video_renderer  = seed.renderer;
                 g_video_scale     = seed.supersampling;
                 g_video_aa        = seed.antialiasing;
@@ -5338,9 +5845,12 @@ session_reboot:
      * Must start after SDL so local pad capture has devices; before the guest
      * fiber so the first vblanks already pump HELLO/START. */
     if (net_cfg.enabled) {
-        if (!net_cfg.peer_hostport[0] || !net_cfg.bind_hostport[0]) {
+        /* Transport role and gameplay slot are independent. An empty peer
+         * means this process listens for the first peer, even when the lobby
+         * owner was reordered into gameplay slot 1 (Player 2). */
+        if (!net_cfg.bind_hostport[0]) {
             std::fprintf(stderr,
-                "psxrecomp: netplay refused — empty bind/peer "
+                "psxrecomp: netplay refused — empty bind "
                 "(bind='%s' peer='%s' session=%u)\n",
                 net_cfg.bind_hostport, net_cfg.peer_hostport,
                 (unsigned)net_cfg.session_id);
@@ -5686,118 +6196,10 @@ session_reboot:
     return 0;
 
 soft_return_lobby:
-    /* Netplay soft-exit: tear down the match window, keep lobby WS, reopen room. */
+    /* Netplay soft-exit: tear down the match window. Lobby resume will be
+     * restored through recomp-ui. */
     teardown_game_session_keep_lobby();
-#if defined(PSX_LAUNCHER)
-    {
-        configure_core_gl_context_attributes();
-        int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
-        int lwin_h = 0;
-        clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
-        std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                 + " \xE2\x80\x94 Lobby";
-        SDL_Window* lwin = SDL_CreateWindow(
-            lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-        if (!lwin) {
-            std::fprintf(stderr, "psxrecomp: resume lobby window failed: %s\n",
-                         SDL_GetError());
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 1;
-        }
-        SDL_GLContext lctx = SDL_GL_CreateContext(lwin);
-        if (!lctx) {
-            std::fprintf(stderr, "psxrecomp: resume lobby GL context failed: %s\n",
-                         SDL_GetError());
-            SDL_DestroyWindow(lwin);
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 1;
-        }
-        SDL_GL_MakeCurrent(lwin, lctx);
-        SDL_GL_SetSwapInterval(1);
-
-        PSXRecompV4::UserSettings seed;
-        seed.renderer = g_video_renderer;             seed.has_renderer = true;
-        seed.supersampling = g_video_scale;           seed.has_supersampling = true;
-        seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
-        seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
-        seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
-        seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
-        seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
-        seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
-        seed.frame_interpolation = (g_frame_interpolation != 0);
-        seed.has_frame_interpolation = true;
-        seed.frame_interpolation_fps = g_frame_interpolation_fps;
-        seed.has_frame_interpolation_fps = true;
-        seed.aspect_num = g_video_aspect_num;
-        seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
-        seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
-        seed.bios_path = bios_path_str;               seed.has_bios_path = true;
-        if (!disc_path_str.empty()) {
-            seed.disc_path = disc_path_str;           seed.has_disc_path = true;
-        }
-        seed.memcard_dir = memcard_dir;               seed.has_memcard_dir = true;
-        seed.p1_device = p1_device; seed.has_p1_device = true;
-        seed.p2_device = p2_device; seed.has_p2_device = true;
-        seed.p1_mode = p1_mode; seed.has_p1_mode = true;
-        seed.p2_mode = p2_mode; seed.has_p2_mode = true;
-        if (has_netplay_player_name) {
-            seed.netplay_player_name = netplay_player_name;
-            seed.has_netplay_player_name = true;
-        }
-
-        psx_launcher::GameInfo ginfo;
-        ginfo.name             = game_name.empty() ? nullptr : game_name.c_str();
-        ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
-        ginfo.expected_crc     = game_disc_crc;
-        ginfo.has_expected_crc = game_has_disc_crc;
-        ginfo.allow_hybrid     = ctrl_allow_hybrid;
-        ginfo.lock_mode        = ctrl_lock_mode;
-        ginfo.locked_mode      = p1_mode;
-        ginfo.lock_device      = ctrl_lock_device;
-        ginfo.ws_offered       = ws_offered;
-        ginfo.ws_ultrawide_offered = ws_ultrawide_offered;
-        for (const auto& lo : lang_menu_options)
-            ginfo.languages.push_back({ lo.code, lo.label });
-
-        psx_launcher::NetplayLaunch resume_net{};
-        psx_launcher::RunOptions ropts;
-        ropts.resume_netplay_room = true;
-        std::string assets = exe_dir_from_argv(argv[0]).string();
-        psx_launcher::Result lr = psx_launcher::run(
-            lwin, lctx, seed, ginfo, assets.c_str(), &resume_net, ropts);
-
-        SDL_GL_DeleteContext(lctx);
-        SDL_DestroyWindow(lwin);
-        SDL_GL_ResetAttributes();
-
-        if (lr == psx_launcher::Result::Quit) {
-            std::fprintf(stdout, "psxrecomp: lobby closed after match; exiting.\n");
-            psx_lobby_disconnect();
-            SDL_Quit();
-            return 0;
-        }
-        if (lr == psx_launcher::Result::Launch && resume_net.enabled) {
-            net_cfg = resume_net.cfg;
-            net_cfg.enabled = 1;
-            g_netplay_from_lobby = 1;
-            std::fprintf(stdout,
-                "psxrecomp: rematch netplay slot=%d bind=%s peer=%s session=%u\n",
-                net_cfg.local_slot, net_cfg.bind_hostport, net_cfg.peer_hostport,
-                (unsigned)net_cfg.session_id);
-            std::fflush(stdout);
-            goto session_reboot;
-        }
-        std::fprintf(stdout, "psxrecomp: resume lobby ended without rematch; exiting.\n");
-        psx_lobby_disconnect();
-        SDL_Quit();
-        return 0;
-    }
-#else
     psx_lobby_disconnect();
     SDL_Quit();
     return 0;
-#endif
 }

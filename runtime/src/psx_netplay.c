@@ -30,7 +30,7 @@ void psx_netplay_config_defaults(PsxNetplayConfig *cfg)
     cfg->input_delay = 2;
     cfg->session_id = 1;
     strncpy(cfg->bind_hostport, "0.0.0.0:7777", sizeof(cfg->bind_hostport) - 1);
-    strncpy(cfg->peer_hostport, "127.0.0.1:7778", sizeof(cfg->peer_hostport) - 1);
+    cfg->peer_hostport[0] = '\0';
 }
 
 static unsigned env_u(const char *name, unsigned def)

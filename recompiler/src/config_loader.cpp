@@ -1457,6 +1457,10 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto v = toml::find<std::string>(n, "player_name");
             if (!v.empty()) { s.netplay_player_name = v; s.has_netplay_player_name = true; }
         });
+        if (n.contains("lobby_url")) try_get([&]{
+            const auto v = toml::find<std::string>(n, "lobby_url");
+            if (!v.empty()) { s.netplay_lobby_url = v; s.has_netplay_lobby_url = true; }
+        });
     }
     if (doc.contains("bios")) {
         const toml::value& b = toml::find(doc, "bios");
@@ -1601,8 +1605,14 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
     if (s.has_skip_launcher)
         f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
-    if (s.has_netplay_player_name && !s.netplay_player_name.empty())
-        f << "\n[netplay]\nplayer_name = \"" << s.netplay_player_name << "\"\n";
+    if ((s.has_netplay_player_name && !s.netplay_player_name.empty()) ||
+        (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())) {
+        f << "\n[netplay]\n";
+        if (s.has_netplay_player_name && !s.netplay_player_name.empty())
+            f << "player_name = \"" << s.netplay_player_name << "\"\n";
+        if (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())
+            f << "lobby_url = \"" << s.netplay_lobby_url << "\"\n";
+    }
     if (s.has_bios_path)
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
     if (s.has_disc_path)

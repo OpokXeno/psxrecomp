@@ -18,7 +18,8 @@ extern "C" {
  *
  * Input ownership:
  *   - Each peer stages one local device sample; recomp-net maps it onto
- *     that peer's local_slot (host 0 = sim P1, guest 1 = sim P2).
+ *     that peer's local_slot (slot 0 = sim P1, slot 1 = sim P2). Transport
+ *     host/client role is determined by peer_hostport, not by local_slot.
  *   - input_player selects which host PlayerInput (0/1) to sample; -1 = auto
  *     (prefer g_players[local_slot] if assigned, else player 0).
  *   - While active, publish / release_pads is the sole SIO writer.

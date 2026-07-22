@@ -95,10 +95,8 @@ else()
     option(PSX_STATIC_RUNTIME "Statically link SDL2 + libgcc/libstdc++ for a self-contained exe" OFF)
 endif()
 
-# PSX_LAUNCHER remains a game-level opt-in used by downstream game CMake files
-# to include recomp-ui. Targets gain launcher code only when recomp-ui defines
-# RECOMP_LAUNCHER on that target.
-option(PSX_LAUNCHER "Allow downstream game projects to wire recomp-ui launcher support" ON)
+# PSX_RECOMP_UI: build the shared Dear ImGui launcher from lib/recomp-ui.
+option(PSX_RECOMP_UI "Build the shared recomp-ui Dear ImGui launcher" ON)
 
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
@@ -281,6 +279,7 @@ function(psxrecomp_add_runtime_target target)
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
         DEFAULT_GAME_CONFIG_PATH
+        LAUNCHER_BOXART
         EXE_NAME
         GAME_VERSION
     )
@@ -531,6 +530,24 @@ function(psxrecomp_add_runtime_target target)
     # run) are driven in cycle-lockstep by tools/cosim.py.
     if(PSXRT_COSIM)
         target_compile_definitions(${target} PRIVATE PSX_COSIM=1 PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # Shared recomp-ui Dear ImGui launcher (not in the oracle build — that's headless).
+    if(PSX_RECOMP_UI AND NOT PSXRT_ORACLE)
+        if(NOT EXISTS "${PSXRECOMP_ROOT}/lib/recomp-ui/recomp_ui.cmake")
+            message(FATAL_ERROR
+                "PSX_RECOMP_UI=ON but lib/recomp-ui is missing. "
+                "Run: git submodule update --init --recursive")
+        endif()
+        set(RECOMP_UI_ROOT "${PSXRECOMP_ROOT}/lib/recomp-ui" CACHE PATH
+            "Root directory of recomp-ui" FORCE)
+        include("${PSXRECOMP_ROOT}/lib/recomp-ui/recomp_ui.cmake")
+
+        set(_psx_recomp_ui_args)
+        if(PSXRT_LAUNCHER_BOXART)
+            list(APPEND _psx_recomp_ui_args BOXART "${PSXRT_LAUNCHER_BOXART}")
+        endif()
+        recomp_target_launcher_ui(${target} ${_psx_recomp_ui_args})
     endif()
 
     if(WIN32 OR MINGW)
