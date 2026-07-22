@@ -2046,6 +2046,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
+    if (s_fmv_quiet) return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
