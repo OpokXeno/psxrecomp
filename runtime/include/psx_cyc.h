@@ -28,6 +28,7 @@
 #define PSX_CYC_H
 
 #include <stdint.h>
+#include <string.h>
 #if defined(_MSC_VER)
 #include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
 #endif
@@ -38,10 +39,26 @@
 extern "C" {
 #endif
 
-/* Load-charge batching (MotK VLC): under the published deadline, accumulate
- * into g_psx_cyc_batch instead of storing psx_cycle_count every insn. Flush
- * at IRQ edges / MMIO (psx_cyc_batch_flush). Absorb/fudge state still updates
- * per insn — only the host counter publish is deferred. */
+/* Load-charge batching (MotK VLC): cache the nearer of the next device
+ * deadline or a 64-cycle soft publication limit once per batch. Generated
+ * GCC/Clang blocks may defer to their IRQ edge; MMIO also flushes. Pipeline
+ * state still updates per instruction, and guest totals at barriers match. */
+enum { PSX_CYC_BATCH_SOFT = 64u };
+
+static inline void psx_cyc_bb_defer_begin(void) { g_psx_cyc_bb_defer++; }
+static inline void psx_cyc_bb_defer_end(void) {
+    if (g_psx_cyc_bb_defer > 0) g_psx_cyc_bb_defer--;
+    if (g_psx_cyc_bb_defer == 0) psx_cyc_batch_flush();
+}
+static inline void psx_cyc_bb_defer_flush(void) { psx_cyc_batch_flush(); }
+
+#if defined(__GNUC__) || defined(__clang__)
+static inline void psx_cyc_bb_defer_cleanup(int *guard) {
+    (void)guard;
+    psx_cyc_bb_defer_end();
+}
+#endif
+
 static inline void psx_cyc_charge(uint32_t cycles) {
     if (cycles == 0u) return;
 #if defined(__GNUC__) || defined(__clang__)
@@ -56,14 +73,30 @@ static inline void psx_cyc_charge(uint32_t cycles) {
         psx_cycle_count += (uint64_t)cycles;
         return;
     }
-    uint64_t next = psx_cycle_count + (uint64_t)g_psx_cyc_batch + (uint64_t)cycles;
-    if (psx_next_service_cycle != 0u && next < psx_next_service_cycle) {
-        uint32_t sum = g_psx_cyc_batch + cycles;
-        if (sum >= g_psx_cyc_batch) { /* no uint32 wrap */
-            g_psx_cyc_batch = sum;
-            return;
+#if !defined(PSX_COSIM)
+    {
+        uint32_t prior = g_psx_cyc_batch;
+        uint32_t sum = prior + cycles;
+        if (sum >= prior) { /* no uint32 wrap */
+            if (g_psx_cyc_bb_defer > 0) {
+                g_psx_cyc_batch = sum;
+                return;
+            }
+            if (prior == 0u) {
+                uint64_t room = 0u;
+                if (psx_next_service_cycle > psx_cycle_count)
+                    room = psx_next_service_cycle - psx_cycle_count;
+                g_psx_cyc_batch_limit = room == 0u ? 1u :
+                    (room < (uint64_t)PSX_CYC_BATCH_SOFT
+                        ? (uint32_t)room : (uint32_t)PSX_CYC_BATCH_SOFT);
+            }
+            if (sum < g_psx_cyc_batch_limit) {
+                g_psx_cyc_batch = sum;
+                return;
+            }
         }
     }
+#endif
     psx_advance_cycles(cycles); /* publishes any pending batch first */
 }
 
@@ -79,6 +112,16 @@ static inline void psx_cyc_base(CPUState* cpu) {
  * save/restore of ReadAbsorb[0]). */
 static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
     reg_mask &= 0xFFFFFFFEu;   /* never touch ReadAbsorb[0] */
+    if (reg_mask && (reg_mask & (reg_mask - 1u)) == 0u) {
+#if defined(_MSC_VER)
+        unsigned long n;
+        _BitScanForward(&n, reg_mask);
+        cpu->read_absorb[(unsigned)n] = 0u;
+#else
+        cpu->read_absorb[(unsigned)__builtin_ctz(reg_mask)] = 0u;
+#endif
+        return;
+    }
     while (reg_mask) {
 #if defined(_MSC_VER)
         unsigned long _psx_ctz_idx;
@@ -146,11 +189,9 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             psx_cyc_charge(fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
-        uint32_t off = phys & 0x1FFFFFu;
-        return (uint32_t)g_psx_ram[off]
-             | ((uint32_t)g_psx_ram[off + 1] << 8)
-             | ((uint32_t)g_psx_ram[off + 2] << 16)
-             | ((uint32_t)g_psx_ram[off + 3] << 24);
+        uint32_t value;
+        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        return value;
     }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
 #else
@@ -178,9 +219,9 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             psx_cyc_charge(fudge + 5u);
             cpu->ld_which_t = (uint8_t)rt;
         }
-        uint32_t off = phys & 0x1FFFFFu;
-        return (uint16_t)((uint32_t)g_psx_ram[off]
-                        | ((uint32_t)g_psx_ram[off + 1] << 8));
+        uint16_t value;
+        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        return value;
     }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);
 #else

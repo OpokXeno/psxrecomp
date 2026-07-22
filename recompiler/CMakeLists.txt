@@ -286,6 +286,11 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_cross_page_delay_codegen.py
                     --recompiler $<TARGET_FILE:psxrecomp-game>)
+        add_test(
+            NAME fmv_cycle_batch_codegen
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fmv_cycle_batch_codegen.py
+                    --recompiler $<TARGET_FILE:psxrecomp-game>)
     endif()
 endif()
 
