@@ -1958,11 +1958,15 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
  * bit, COP0 IEc + IM2 set, and not already inside the exception handler. */
 static int precise_irq_deliverable(CPUState *cpu) {
     extern uint32_t i_stat;
-    if ((i_stat & i_mask) == 0) return 0;
-    if (psx_get_in_exception()) return 0;
     uint32_t sr = cpu->cop0[12];
+    /* COP0 software interrupts (CAUSE.IP0/IP1 & SR.IM0/IM1): guest-raised via
+     * mtc0 to CAUSE, independent of the INTC line (see psx_check_interrupts). */
+    uint32_t sw_pending = cpu->cop0[13] & sr & 0x0300u;
+    if ((i_stat & i_mask) == 0 && sw_pending == 0) return 0;
+    if (psx_get_in_exception()) return 0;
     if (!(sr & 0x1u))        return 0;   /* IEc: interrupts globally enabled */
-    if (!(sr & (1u << 10)))  return 0;   /* IM2: hardware interrupt mask bit */
+    /* INTC needs IM2; a pending software interrupt is deliverable without it. */
+    if (!(sr & (1u << 10)) && sw_pending == 0)  return 0;
     return 1;
 }
 
@@ -2507,6 +2511,29 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         }
         g_dirty_ram_insns_run++;
         insns_executed++;
+        /* COP0 software-interrupt latency: an MTC0 to CAUSE or SR that makes a
+         * software interrupt deliverable (CAUSE.IP0/IP1 & SR.IM0/IM1 & IEc)
+         * must be taken IMMEDIATELY — real hardware vectors within the next
+         * instruction. Waiting for the next block boundary opens a window in
+         * which another hardware IRQ can re-enter the guest's (single-slot,
+         * legitimately non-reentrant) dispatcher and destroy its saved SR:
+         * Jackie Chan Stuntmaster's stage-1 handler does exactly
+         * `mtc0 CAUSE,0x100; mtc0 SR,0x101` and relies on the instant sw-int
+         * to reach its stage-2 before anything else runs. Same nested-delivery
+         * machinery as the entry poll above; EPC = the committed next pc. */
+        if ((insn & 0xFFE00000u) == 0x40800000u) { /* MTC0 */
+            uint32_t sw_rd = (insn >> 11) & 0x1Fu;
+            if ((sw_rd == 12u || sw_rd == 13u) &&
+                (cpu->cop0[13] & cpu->cop0[12] & 0x0300u) != 0u &&
+                (cpu->cop0[12] & 0x1u) != 0u) {
+                extern uint32_t g_dirty_safe_resume_pc;
+                uint32_t saved_resume = g_dirty_safe_resume_pc;
+                cpu->pc = next_pc ? next_pc : pc + 4u;
+                g_dirty_safe_resume_pc = cpu->pc;
+                psx_check_interrupts(cpu);
+                g_dirty_safe_resume_pc = saved_resume;
+            }
+        }
         if (transferred) {
             if (g_psx_call_bail) {
                 /* A bail unwind began inside a surfaced call: stop the interp
