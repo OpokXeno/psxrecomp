@@ -83,6 +83,18 @@ cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build runtime/build --target psx-runtime
 ```
 
+On Linux/macOS, `tools/setup_dev.sh` performs the same source-checkout setup:
+
+```sh
+sh tools/setup_dev.sh
+```
+
+It checks for the native toolchain and SDL2 development package, builds the CLI
+and recompiler tools, refreshes generated BIOS C when `bios/SCPH1001.BIN` is
+present, and builds the BIOS-only runtime when BIOS/generated sources are
+available. It does not create per-game runtime targets; use the CLI generator
+for game projects.
+
 On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generator
 (e.g. `-G "Unix Makefiles"`); everything else is identical.
 

@@ -82,6 +82,16 @@ python tools/build_cli.py release
 The ready-to-use CLI archive is written to `dist/`. To package debug binaries
 instead, run `python tools/build_cli.py debug`.
 
+On Linux/macOS source checkouts, the same development setup can be driven by:
+
+```sh
+sh tools/setup_dev.sh
+```
+
+That script builds the CLI/recompiler tools and, when BIOS/generated sources are
+available, the BIOS-only runtime. Game projects should still be generated with
+`psxrecomp build` and built from their generated `build.sh`.
+
 > **Where the project is headed.** Development so far has been **breadth-first**:
 > stand up as many games as possible and get them into a playable alpha, proving
 > the framework generalizes. That phase has largely delivered — seven titles now
