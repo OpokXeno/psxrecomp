@@ -1066,6 +1066,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
     std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
+    std::vector<uint32_t> ws_cull_bltz_sites;
     std::vector<uint32_t> ws_cull_negsub_sites;
     std::vector<uint32_t> ws_cull_vxrange_sites;
     std::vector<uint32_t> ws_cull_depth_sites;
@@ -1093,6 +1094,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("a1_sites",    ws_cull_a1_sites);
             load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
+            load_sites("bltz_sites",  ws_cull_bltz_sites);
             load_sites("negsub_sites", ws_cull_negsub_sites);
             load_sites("vxrange_sites", ws_cull_vxrange_sites);
             load_sites("depth_sites", ws_cull_depth_sites);
@@ -1250,6 +1252,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
         /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_bltz_sites*/    ws_cull_bltz_sites,
         /*ws_cull_negsub_sites*/  ws_cull_negsub_sites,
         /*ws_cull_vxrange_sites*/ ws_cull_vxrange_sites,
         /*ws_cull_depth_sites*/   ws_cull_depth_sites,
