@@ -352,7 +352,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
         "set(CMAKE_C_STANDARD 99)\n"
         "set(CMAKE_CXX_STANDARD 17)\n"
         "set(PSXRECOMP_ROOT \"${{CMAKE_CURRENT_SOURCE_DIR}}/psxrecomp\")\n"
-        "set(PSX_LAUNCHER OFF CACHE BOOL \"\" FORCE)\n"
+        "set(PSX_RECOMP_UI OFF CACHE BOOL \"\" FORCE)\n"
         "include(\"${{PSXRECOMP_ROOT}}/runtime/runtime.cmake\")\n"
         "file(GLOB GAME_FULL CONFIGURE_DEPENDS\n"
         "  \"${{CMAKE_CURRENT_SOURCE_DIR}}/generated/*_full.c\"\n"
@@ -372,7 +372,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
     write_file(options.output / "build.ps1",
         "$ErrorActionPreference = 'Stop'\n"
         "$Root = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
-        "cmake -S $Root -B (Join-Path $Root 'build') -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_LAUNCHER=OFF\n"
+        "cmake -S $Root -B (Join-Path $Root 'build') -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_RECOMP_UI=OFF\n"
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
         "cmake --build (Join-Path $Root 'build') --config Release --parallel\n"
         "exit $LASTEXITCODE\n");
@@ -380,7 +380,7 @@ int build_project(const Options& options, const fs::path& exe_dir) {
         "#!/usr/bin/env sh\n"
         "set -eu\n"
         "ROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
-        "cmake -S \"$ROOT\" -B \"$ROOT/build\" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_LAUNCHER=OFF\n"
+        "cmake -S \"$ROOT\" -B \"$ROOT/build\" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_RECOMP_UI=OFF\n"
         "cmake --build \"$ROOT/build\" --config Release --parallel\n");
     write_file(options.output / ".gitignore",
         "build/\ninput/\ngenerated/\nbios-generated/\n*.mcr\nsaves/\n");

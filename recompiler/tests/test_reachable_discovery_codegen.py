@@ -119,8 +119,12 @@ def main():
                 failures.append("target beyond analysis bound was emitted")
             if "phys < 0x00011000u" not in dispatch:
                 failures.append("dispatch text range did not use verified bound")
-            if "dirty_ram_text_native_ok_ranges(" not in dispatch:
+            if "dirty_ram_text_native_ok_ranges_from(" not in dispatch:
                 failures.append("exact static-range dispatch guard was lost")
+            if "uint32_t count, uint32_t exec_pc" not in dispatch:
+                failures.append("dispatch guard does not accept a continuation PC")
+            if dispatch.count("entry->range_count, addr)") != 2:
+                failures.append("dispatch guards do not validate from their resume PC")
             if "psx_native_bad_entry(" in full:
                 failures.append("reachable main image incorrectly used overlay codegen")
             if "=== Exact-Entry Function Analysis ===" not in output:

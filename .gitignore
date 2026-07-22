@@ -108,3 +108,4 @@ runtime/tests/*.exe
 
 # transient split-gen build dirs
 recompiler/build-splitgen/
+recompiler/build-*/

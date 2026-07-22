@@ -2158,28 +2158,27 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
     g_exec_phase = prev_phase;
 }
 
-/* Block-leader slice guard, called by the emitted prologue of every compiled
- * block BEFORE it charges cycles / runs its body:
- *     if (psx_slice_block(cpu, <block_addr>, <bcyc>, <side_effects>)) return;
+/* Precise-slice gate (PARKED default OFF). Hot callers use the cpu_state.h
+ * inline which returns 0 when this is 0 — no out-of-line call. Opt in with
+ * PSX_PRECISE_SLICE=1 (same binary A/B). */
+int g_psx_precise_slice = 0;
+
+void psx_precise_slice_init_from_env(void) {
+    const char *e = getenv("PSX_PRECISE_SLICE");
+    g_psx_precise_slice = (e && e[0] == '1') ? 1 : 0;
+}
+
+/* Block-leader slice guard impl. Emitted code calls the inline wrapper
+ * psx_slice_block(); overlay CPS callbacks point here directly.
  * Returns 1 if it sliced (ran the block — and possibly more — through the precise
  * interpreter and left cpu->pc at a dispatchable resume point; the caller MUST
  * `return` so its compiled body does not re-execute the same instructions).
  * Returns 0 if the whole block is provably safe to run as fast compiled C. */
-int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
-    /* Runtime A/B toggle (diagnostic, stays in the build): PSX_PRECISE_SLICE=0
-     * disables precise slicing entirely so the SAME binary can be run slice-on vs
-     * slice-off to isolate the first divergence the slice introduces. Read once. */
+int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
     /* PARKED (PRECISE_IRQ_SLICE.md): precise take-point slicing is a later
      * correctness upgrade, NOT the current FMV blocker (that is the -8 cycle
-     * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1).
-     * Default OFF so the runtime boots on the baseline; opt in with
-     * PSX_PRECISE_SLICE=1 to continue the block-leader-continuation work. */
-    static int s_slice_enabled = -1;
-    if (s_slice_enabled < 0) {
-        const char *e = getenv("PSX_PRECISE_SLICE");
-        s_slice_enabled = (e && e[0] == '1') ? 1 : 0;
-    }
-    if (!s_slice_enabled) return 0;
+     * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1). */
+    if (!g_psx_precise_slice) return 0;
 
     /* No nested slicing: a handler dispatched from inside precise-mode, and any
      * block executed while in_exception, run compiled (interrupts are gated during
@@ -2616,6 +2615,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                         OV_FPLOG_RET1();
                     }
                 }
+#ifdef PSX_HAS_GAME_DISPATCH
+                /* A patched prologue can force entry through the interpreter,
+                 * while the remaining static ranges at a later continuation
+                 * are still safe to run as compiled code. */
+                if (clean_game_text_miss && interp_enter_compiled(cpu, target)) {
+                    g_dirty_ram_native_handoffs++;
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = cpu->pc;
+                    OV_FPLOG_RET1();
+                }
+#endif
                 /* Capture freeze gates ONLY the ring write — never flow. */
 #ifndef PSX_NO_DEBUG_TOOLS
                 if (!g_insn_log_frozen) {
@@ -2649,6 +2660,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             OV_FPLOG_RET1();
         }
         pc = next_pc;
+#ifdef PSX_HAS_GAME_DISPATCH
+        /* Guest call returns advance without transferred set. Re-check the
+         * resume PC so a patched entry can hand its unchanged tail back to
+         * compiled code without adding probes to ordinary dirty overlay runs. */
+        if (clean_game_text_miss && interp_enter_compiled(cpu, pc)) {
+            g_dirty_ram_native_handoffs++;
+            g_dirty_ram_blocks_run++;
+            if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = cpu->pc;
+            OV_FPLOG_RET1();
+        }
+#endif
         /* Straight-line flow reaching the dispatch return contract — exit
          * so the loop returns into the suspended native caller (same
          * hazard as a transfer to stop_addr). */

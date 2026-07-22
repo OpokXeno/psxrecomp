@@ -598,6 +598,13 @@ void interrupts_init(void) {
     exception_entries_total = 0;
     exception_reentry_blocks = 0;
     cycles_since_vblank = 0;
+    /* Rematch / session_reboot re-enters bring-up without process exit.
+     * Stale I_STAT/I_MASK from the prior match (e.g. VBlank pending + game
+     * mask) makes boot take a phantom IRQ at ~cycle 4 and wedge under
+     * netplay lockstep. Cold boot also wants zeros (BSS already is). */
+    i_stat = 0;
+    i_mask = 0;
+    g_vblank_raise_count = 0;
     last_sio_seq_seen = sio_get_seq();
     last_sio_progress_cycle = psx_get_cycle_count();
 }
@@ -724,6 +731,7 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 }
 
 void psx_check_interrupts(CPUState* cpu) {
+    psx_cyc_batch_flush();
     extern int g_ls_suppress_record;
 #define PSX_CHECK_INTERRUPTS_RETURN() do { if (g_ls_suppress_record > 0) g_ls_suppress_record--; return; } while (0)
 #ifdef PSX_COSIM
@@ -731,6 +739,24 @@ void psx_check_interrupts(CPUState* cpu) {
 #define COSIM_IRQ_TAKE_PC() (g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc)
 #define COSIM_IRQ_NOTE(kind_) cosim_irq_note(cpu, (kind_), COSIM_IRQ_TAKE_PC(), g_dirty_safe_resume_pc, s_compiled_interrupt_resume_pc, cpu->cop0[COP0_SR])
 #endif
+
+    /* MotK VLC / FMV hot edge: sticky unmasked I_STAT (CD/VBlank) while
+     * IEc or IM2 is clear — no architectural delivery possible. Skip the
+     * mid-path bookkeeping / irq_deliver_eval that used to run every BB.
+     * Guest-visible timing unchanged (same non-delivery). LTO can collapse
+     * this into the VLC call sites. */
+    static uint32_t s_fast_maintenance;
+    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+        uint32_t sr = cpu->cop0[COP0_SR];
+        if (!(sr & 0x01u) || !(sr & (1u << 10))) {
+            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+                extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                debug_server_poll();
+            }
+            return;
+        }
+    }
 
     /* Genuine entry fast paths. Generated resident code calls this at every
      * basic-block edge, which can mean tens of millions of calls inside an FMV
@@ -740,10 +766,17 @@ void psx_check_interrupts(CPUState* cpu) {
      * savestate_poll, making a harmless callback expensive enough to reduce
      * Tomba 2's Whoopee FMV to ~1 guest fps.
      *
+     * Idle-skip used to force the slow path on every edge so
+     * psx_idle_note_check could observe poll PCs. That made MotK's VLC
+     * (branchy, changing resume PCs, idle_skip=true) pay full IRQ bookkeeping
+     * millions of times per second for zero skips. Keep the fast path; run the
+     * idle note here when enabled, then re-check I_STAT in case a skip raised
+     * an event. Guest timing is unchanged — skip still advances via
+     * psx_advance_cycles.
+     *
      * Poll host maintenance periodically so save/load and the debug socket stay
      * responsive even when the guest spends a long time in this path. At the
      * observed 1M+ block edges/s this is sub-frame latency. */
-    static uint32_t s_fast_maintenance;
     if (g_idle_skip_enabled < 0) (void)psx_idle_skip_is_enabled();
     /* COP0 software interrupts (CAUSE.IP0/IP1 vs SR.IM0/IM1, bits 8-9): raised
      * purely by guest mtc0 to CAUSE, with no INTC involvement. Games use this
@@ -753,15 +786,44 @@ void psx_check_interrupts(CPUState* cpu) {
      * ack never runs and the machine deadlocks with SR.IM2 stripped). */
     uint32_t sw_pending = cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u;
     if (!in_exception && (i_stat & i_mask) == 0 && sw_pending == 0 &&
-        !s_defer_switch_pending && g_idle_skip_enabled == 0) {
-        if ((++s_fast_maintenance & 0x3FFFu) == 0) {
-            extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
-            savestate_poll(cpu, s_compiled_interrupt_resume_pc);
-            debug_server_poll();
+        !s_defer_switch_pending) {
+        if (g_idle_skip_enabled > 0) {
+            uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                       : s_compiled_interrupt_resume_pc;
+            s_last_interrupt_check_pc = check_pc;
+            s_last_interrupt_check_cycle = psx_get_cycle_count();
+            psx_idle_note_check(cpu, check_pc);
         }
-        return;
+        if ((i_stat & i_mask) == 0 && sw_pending == 0) {
+            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+                extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                debug_server_poll();
+            }
+            return;
+        }
+        /* Idle skip advanced time and a device raised I_STAT — deliver below. */
     }
     if (in_exception && !(cpu->cop0[COP0_SR] & 0x01u)) return;
+
+    /* Mid path: unmasked IRQ already pending, ordinary compiled edge.
+     * MotK VLC / FMV spend most BB edges here (sticky CD/VBlank bits).
+     * Devices are already caught up via psx_advance_cycles, so skip
+     * service/idle/savestate housekeeping and go straight to delivery. */
+    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+        uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                   : s_compiled_interrupt_resume_pc;
+        s_last_interrupt_check_pc = check_pc;
+        s_last_interrupt_check_cycle = psx_get_cycle_count();
+        g_ls_suppress_record++;
+        total_checks++;
+        if ((total_checks & 0x3FFFu) == 0) {
+            extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+            savestate_poll(cpu, check_pc);
+            debug_server_poll();
+        }
+        goto irq_deliver_eval;
+    }
 
     {
         uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
@@ -790,9 +852,11 @@ void psx_check_interrupts(CPUState* cpu) {
      * next internal device event in whole loop quanta. Runs BEFORE the
      * deliverability evaluation below so an event raised by the skip is
      * delivered in this same check, exactly at the boundary real execution
-     * would have taken it. No-ops in exception context / precise mode /
-     * lockstep (gated inside). */
-    psx_idle_note_check(cpu, s_last_interrupt_check_pc);
+     * would have taken it. Skip when an unmasked IRQ is already pending —
+     * that is not an idle poll (FMV/VLC edges with sticky CD/VBlank bits),
+     * and the fast path already noted when I_STAT was clear. */
+    if ((i_stat & i_mask) == 0)
+        psx_idle_note_check(cpu, s_last_interrupt_check_pc);
 
     /* User save states: this is a block-leader boundary with a known resume PC;
      * only act outside the exception handler so a restore's stack-unwind can't
@@ -891,6 +955,7 @@ void psx_check_interrupts(CPUState* cpu) {
         }
     }
 
+irq_deliver_eval:
     /* Check if any interrupts are pending (INTC hardware or COP0 software). */
     if ((i_stat & i_mask) == 0 && sw_pending == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
     /* Nested delivery (hardware semantics). Real R3000A has no 'in exception'
@@ -1566,7 +1631,7 @@ void psx_check_interrupts(CPUState* cpu) {
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     uint32_t prev = s_compiled_interrupt_resume_pc;
     s_compiled_interrupt_resume_pc = resume_pc;
-    psx_check_interrupts(cpu);
+    psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
     s_compiled_interrupt_resume_pc = prev;
 }
 
