@@ -110,7 +110,7 @@ On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generato
 |---|---|---|
 | `PSX_DEBUG_TOOLS` | ON for Debug/RelWithDebInfo, OFF for Release | TCP debug server + heartbeat + per-block recording |
 | `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL2 + libgcc/libstdc++) |
-| `PSX_LAUNCHER` | ON | Allow downstream game projects to wire recomp-ui launcher support |
+| `PSX_RECOMP_UI` | ON | Wire a downstream game's pinned recomp-ui launcher; set OFF for headless/generated builds |
 | `PSX_ENABLE_VULKAN` | OFF | Build the experimental Vulkan renderer |
 | `PSX_BUILD_COSIM` | OFF | Build the first-divergence co-sim oracle target |
 
