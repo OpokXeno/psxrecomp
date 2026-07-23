@@ -731,7 +731,9 @@ static uint64_t g_legacy_underruns = 0;
 int g_audio_unmute_resync = 0;
 /* Actual device rate the host opened at (bridge mode may differ from 44100;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
-extern "C" int g_audio_host_rate = 44100;
+extern "C" {
+int g_audio_host_rate = 44100;
+}
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
@@ -4208,7 +4210,10 @@ namespace {
                                 password ? password : "", endpoint, &caps);
     }
 
-    int ae_np_join(void*, const char* lobby_id, const char* password) {
+    /* guest_bind is in/out (capacity >= 64). recomp-ui fills a real UDP port
+     * (prefer 7778); never advertise :0 to the lobby. */
+    int ae_np_join(void*, const char* lobby_id, const char* password,
+                   char* guest_bind) {
         if (lobby_id && strncmp(lobby_id, "lan:", 4) == 0) {
             AeLanLobbyState state;
             if (!ae_np_read_lan_state(&state) || !state.joiner_name.empty()) return -1;
@@ -4222,7 +4227,18 @@ namespace {
             g_lnch_lan_endpoint = state.endpoint;
             return 0;
         }
-        return psx_lobby_join(lobby_id, password ? password : "", "0.0.0.0:0");
+        char bind_buf[64];
+        const char* bind = guest_bind;
+        const char* colon = (bind && bind[0]) ? std::strrchr(bind, ':') : nullptr;
+        const unsigned port = (colon && colon[1])
+            ? static_cast<unsigned>(std::strtoul(colon + 1, nullptr, 10)) : 0u;
+        if (!bind || !bind[0] || port == 0u) {
+            std::snprintf(bind_buf, sizeof(bind_buf), "0.0.0.0:7778");
+            bind = bind_buf;
+            if (guest_bind)
+                std::snprintf(guest_bind, 64, "%s", bind_buf);
+        }
+        return psx_lobby_join(lobby_id, password ? password : "", bind);
     }
 
     int ae_np_leave(void*) {
