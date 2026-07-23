@@ -2998,36 +2998,23 @@ static void load_transition_note(int read_active, int load_active,
     prev_turbo = turbo_active;
 }
 
-/* Depth24 FMV: last ~8 RGB columns can be stale/chroma junk while CRTC width
- * stays full (e.g. MotK 512). Present width is never shrunk — cropping the
- * GL/SDL rect left a flickering black pillar when upload coverage varied.
+/* Depth24 FMV: trailing RGB columns can be stale while CRTC width stays full
+ * (MotK 512). Present width is never shrunk — cropping the GL/SDL rect left a
+ * flickering black pillar when upload coverage varied.
  *
- * Do NOT replicate the last good column: on MotK's starfield intro that turns
- * a single tinted edge pixel into an 8-wide horizontal streak (flickering
- * stretch into the pillar). Black-fill the margin instead. Require a dense
- * chroma signal so sparse stars never trip the repair. */
-static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!buf || w < 24u || h == 0u) return;
-    const uint32_t margin = 8u;
-    const uint32_t edge = w - margin;
-    const uint32_t total = margin * h;
-    uint32_t junk_px = 0;
-    for (uint32_t x = edge; x < w; x++) {
-        for (uint32_t y = 0; y < h; y++) {
-            uint32_t p = buf[y * w + x];
-            int r = (int)((p >> 16) & 255u);
-            int g = (int)((p >> 8) & 255u);
-            int b = (int)(p & 255u);
-            int m = (r + g + b) / 3;
-            int ch = (r > m ? r - m : m - r) + (g > m ? g - m : m - g) +
-                     (b > m ? b - m : m - b);
-            if (ch > 40) junk_px++;
-        }
-    }
-    /* ~12% of margin texels — sparse stars stay; dense chroma fringe cleans. */
-    if (total == 0u || junk_px * 100u < total * 12u) return;
+ * Always black-fill the last 8 RGB cols. Also blank beyond the tracked FB A0
+ * span when it falls short of the CRTC (movie cut / partial cover). Do NOT
+ * replicate the last good column — that smeared MotK's starfield into an
+ * 8-wide streak. */
+static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
+                                          uint32_t display_x) {
+    if (!buf || w < 8u || h == 0u) return;
+    uint32_t start = w - 8u;
+    uint32_t lim = gpu_depth24_rgb_limit(display_x, w);
+    if (lim > 0u && lim < w && lim < start)
+        start = lim;
     for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = edge; x < w; x++)
+        for (uint32_t x = start; x < w; x++)
             buf[y * w + x] = 0xFF000000u;
     }
 }
@@ -3437,6 +3424,11 @@ static void sdl_vblank_present(void) {
     /* Mod hooks. Run after all normal input sampling. */
     mod_call_frame_hooks();
 
+    /* Depth24 GP1(07h) retarget (MotK intro→crawl): keep the prior Swap for a
+     * few vblanks so stale trailing VRAM never flashes on the right edge. */
+    if (gpu_depth24_present_hold_tick())
+        return;
+
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
     if (!g_ws_engaged) {
         extern int fntrace_is_game_started(void);
@@ -3576,9 +3568,10 @@ static void sdl_vblank_present(void) {
                     for (uint32_t x = 0; x < present_w; x++)
                         sdl_pixel_buf[y * present_w + x] =
                             gpu_display_pixel_argb(&di, x, y);
-                /* Trailing margin: replicate last good column into junk cols
-                 * inside the full-width buffer — never shrink present width. */
-                depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h);
+                /* Trailing margin: blank junk cols inside the full-width
+                 * buffer — never shrink present width. */
+                depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h,
+                                             di.display_x);
                 vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w, (int)h,
                                         0 /* nearest */, fmv_frame ? 1 : 0);
             } else if (wide_present &&
@@ -3640,11 +3633,12 @@ static void sdl_vblank_present(void) {
             }
         }
 
-        /* Depth24 trailing margin: MotK CRTC is 512 RGB but the last ~8 cols
+        /* Depth24 trailing margin: MotK CRTC is 512 RGB but trailing cols
          * can be stale. Fix pixels in-place at full present_w — never crop the
          * GL/SDL draw width (that caused a flickering black pillar). */
         if (di.depth24 && active_scale == 1 && !wide_present)
-            depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h);
+            depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h,
+                                         di.display_x);
 
         smooth_60_present(sdl_pixel_buf,
                           present_w * (uint32_t)active_scale,
