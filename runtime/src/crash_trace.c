@@ -647,6 +647,17 @@ static void psx_signal_handler(int sig) {
     raise(sig);
 }
 
+#ifndef _WIN32
+/* Default SIGINT/SIGTERM terminate without running atexit, so GCC never
+ * flushes -fprofile-generate .gcda (PGO train scripts use kill). Route
+ * those signals through exit(0) so __gcov_exit runs. Not async-signal-safe;
+ * acceptable for intentional train/Ctrl+C stop. */
+static void psx_soft_exit_handler(int sig) {
+    (void)sig;
+    exit(0);
+}
+#endif
+
 #ifdef _WIN32
 static LONG WINAPI psx_seh_handler(EXCEPTION_POINTERS *info) {
     psx_crash_trace_dump("seh", info);
@@ -666,6 +677,9 @@ static void psx_atexit_handler(void) {
 void psx_crash_trace_install_handlers(void) {
 #ifndef _WIN32
     signal(SIGSEGV, psx_signal_handler);
+    signal(SIGINT, psx_soft_exit_handler);
+    signal(SIGTERM, psx_soft_exit_handler);
+    signal(SIGUSR1, psx_soft_exit_handler);
 #endif
     signal(SIGABRT, psx_signal_handler);
 #ifdef _WIN32
