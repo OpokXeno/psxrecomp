@@ -2350,12 +2350,32 @@ static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
  * prim (gpu_share ~0.9, host FPS ~5–10). Skip the host rasterizer when the
  * post-offset bbox cannot touch the draw area. Side effects that must still
  * run (texpage latch, oversize reject) happen before these checks. */
+/* Native-wide: the reveal lives in the renderer's wide mirror surface, where a
+ * guest prim maps to local_x = x - draw_area_left + offset and is clipped by
+ * the surface scissor at [0, disp_w + 2*offset). The early-out window below is
+ * widened by exactly that visible range, so margin prims submitted through the
+ * widened game culls are not rejected at the door. The offset is 0 whenever
+ * native-wide is inactive (4:3 / squash / FMV), which reduces the window to
+ * the authored draw area — byte-identical to the original check. */
+static inline void draw_area_cull_window(int32_t *xl, int32_t *xr) {
+    int32_t off = ws_nw_offset();
+    int32_t right = (int32_t)draw_area_right;
+    if (off > 0) {
+        int32_t wide_right = (int32_t)draw_area_left + ws_disp_w();
+        if (wide_right > right) right = wide_right;
+    }
+    *xl = (int32_t)draw_area_left - off;
+    *xr = right + off;
+}
+
 static inline int draw_area_out_point(int32_t x, int32_t y) {
-    return x < (int32_t)draw_area_left || x > (int32_t)draw_area_right
+    int32_t xl, xr; draw_area_cull_window(&xl, &xr);
+    return x < xl || x > xr
         || y < (int32_t)draw_area_top  || y > (int32_t)draw_area_bottom;
 }
 
 static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n) {
+    int32_t xl, xr; draw_area_cull_window(&xl, &xr);
     int32_t minx = vx[0], maxx = vx[0], miny = vy[0], maxy = vy[0];
     for (int i = 1; i < n; i++) {
         if (vx[i] < minx) minx = vx[i];
@@ -2363,14 +2383,15 @@ static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n
         if (vy[i] < miny) miny = vy[i];
         if (vy[i] > maxy) maxy = vy[i];
     }
-    return maxx < (int32_t)draw_area_left || minx > (int32_t)draw_area_right
+    return maxx < xl || minx > xr
         || maxy < (int32_t)draw_area_top  || miny > (int32_t)draw_area_bottom;
 }
 
 static inline int draw_area_out_rect(int32_t x, int32_t y, int w, int h) {
     if (w <= 0 || h <= 0) return 1;
-    return (x + w - 1) < (int32_t)draw_area_left
-        || x > (int32_t)draw_area_right
+    int32_t xl, xr; draw_area_cull_window(&xl, &xr);
+    return (x + w - 1) < xl
+        || x > xr
         || (y + h - 1) < (int32_t)draw_area_top
         || y > (int32_t)draw_area_bottom;
 }
