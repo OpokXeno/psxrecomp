@@ -700,6 +700,12 @@ struct GameConfig {
     bool ws_offered = true;
     bool vulkan_offered = false;
 
+    // [widescreen] adaptive_view — let the user opt into a live, resize-driven
+    // aspect instead of selecting only fixed 4:3/16:9/21:9 modes. The fixed
+    // aspect remains the initial window shape; the live view is clamped to the
+    // widest aspect this title offers.
+    bool ws_adaptive_view = false;
+
     // [widescreen] offer_ultrawide — expose a separate experimental 21:9
     // launcher choice for titles that have explicitly tested it. Default off;
     // ordinary widescreen offer remains the independent 16:9 choice.
@@ -810,6 +816,7 @@ struct UserSettings {
     bool has_netplay_lobby_url = false; std::string netplay_lobby_url;
     bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
                                      int  aspect_den     = 3; // (4:3 = native)
+    bool has_adaptive_view  = false; bool adaptive_view  = false;
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
     // [bios] / [disc] / [memcard]

@@ -82,6 +82,7 @@ static int      ws_hud_sprt = 0;             /* edge-anchor untagged HUD SPRTs *
  * in native-wide mode. */
 static int      ws_mode    = 0;
 static int      ws_cfg_num = 4, ws_cfg_den = 3;
+static void ws_nw_sync_target(void);
 
 #define WS_TAG_BUCKETS 4096                  /* power of two */
 #define WS_TAG_PROBES  8
@@ -279,13 +280,22 @@ static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43
 int ws_native_wide_active(void) {
     return ws_mode == 2 && !gpu_ws_present_native_43();
 }
+/* Cull/spawn setup often runs while a scene is loading, before the first GTE
+ * frame can classify it as gameplay.  Keep that pre-render setup aware of the
+ * configured native-wide viewport; presentation itself remains gated by
+ * ws_native_wide_active(). */
+static int ws_native_wide_configured(void) {
+    return ws_mode == 2 && ws_cfg_num * 3 > ws_cfg_den * 4;
+}
+static int ws_nw_configured_offset(void) {
+    if (!ws_native_wide_configured()) return 0;
+    int numr = 3 * ws_cfg_num - 4 * ws_cfg_den;
+    int w = (int)ws_disp_w();
+    return (w * numr + 4 * ws_cfg_den) / (8 * ws_cfg_den);
+}
 static int ws_nw_offset(void) {
     if (!ws_native_wide_active()) return 0;
-    int numr = 3 * ws_cfg_num - 4 * ws_cfg_den;   /* > 0 for aspects wider than 4:3 */
-    if (numr <= 0) return 0;
-    int w = (int)ws_disp_w();
-    int v = (w * numr + 4 * ws_cfg_den) / (8 * ws_cfg_den);   /* round-to-nearest */
-    return v;
+    return ws_nw_configured_offset();
 }
 int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
 
@@ -446,7 +456,12 @@ int psx_ws_x_margin(void) {
      * that previously fell outside the 4:3 cull window; the wide compositor then
      * rasterizes it into the revealed margins. Same recompiler emit sites as the
      * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
-    if (ws_native_wide_active()) return ws_nw_offset() + ws_cull_guard_pixels;
+    /* Unlike rendering/presentation, do not wait for game-mode detection here.
+     * Tomba 2 builds its terrain-cell and actor spawn lists during scene load;
+     * returning zero until the first 3D frame permanently bakes a 4:3 frustum
+     * into those lists. */
+    if (ws_native_wide_configured())
+        return ws_nw_configured_offset() + ws_cull_guard_pixels;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
@@ -1261,6 +1276,10 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
     }
     ws_anchor_addr = sprite_anchor_addr;
     ws_hud_sprt    = hud_sprt_squash;
+    /* Adaptive view can change mode/extent without the guest reissuing E3/E4
+     * immediately. Keep the active mirror target and its scissor in lockstep
+     * with the new live aspect instead of waiting for another draw-env packet. */
+    ws_nw_sync_target();
 }
 
 /* Called from generated code at the entry of each [widescreen]
@@ -2349,9 +2368,44 @@ static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
  * clips those for free; our GL path was building two triangles per clipped
  * prim (gpu_share ~0.9, host FPS ~5–10). Skip the host rasterizer when the
  * post-offset bbox cannot touch the draw area. Side effects that must still
- * run (texpage latch, oversize reject) happen before these checks. */
+ * run (texpage latch, oversize reject) happen before these checks.
+ *
+ * Native-wide is intentionally different in X: the mirror renderer translates
+ * canonical framebuffer coordinates by the live reveal offset and scissors to
+ * the FULL wide surface, not GP0(E3/E4)'s 4:3 X range. Commit 31015ce originally
+ * compared every primitive only with the guest draw area here, rejecting the
+ * margin geometry before the mirror renderer could see it. Match the mirror's
+ * exact X extent while its framebuffer target is active; Y remains the guest
+ * draw area because native-wide does not extend vertically. At 4:3, in FMV/
+ * menus, in squash mode, and for offscreen texture targets, margin is zero and
+ * this remains the original fast reject byte-for-byte.
+ *
+ * OpokXeno independently identified the same host-side regression on Xenogears
+ * and contributed the original generalized fix in psxrecomp PR #73:
+ * https://github.com/mstan/psxrecomp/pull/73
+ * Keep that credit with this guarded framebuffer-target variant. */
+static inline int32_t draw_area_wide_x_margin(void) {
+    if (!ws_native_wide_active() || !ws_is_fb_base(draw_area_left)) return 0;
+    return (int32_t)ws_nw_offset();
+}
+
+static inline void draw_area_host_x_bounds(int32_t *left, int32_t *right) {
+    int32_t margin = draw_area_wide_x_margin();
+    if (margin > 0) {
+        /* ws_nw_sync_target uses draw_area_left as the framebuffer base and
+         * configures a surface ws_disp_w()+2*margin pixels wide. */
+        *left  = (int32_t)draw_area_left - margin;
+        *right = (int32_t)draw_area_left + (int32_t)ws_disp_w() + margin - 1;
+    } else {
+        *left  = (int32_t)draw_area_left;
+        *right = (int32_t)draw_area_right;
+    }
+}
+
 static inline int draw_area_out_point(int32_t x, int32_t y) {
-    return x < (int32_t)draw_area_left || x > (int32_t)draw_area_right
+    int32_t left, right;
+    draw_area_host_x_bounds(&left, &right);
+    return x < left || x > right
         || y < (int32_t)draw_area_top  || y > (int32_t)draw_area_bottom;
 }
 
@@ -2363,14 +2417,18 @@ static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n
         if (vy[i] < miny) miny = vy[i];
         if (vy[i] > maxy) maxy = vy[i];
     }
-    return maxx < (int32_t)draw_area_left || minx > (int32_t)draw_area_right
+    int32_t left, right;
+    draw_area_host_x_bounds(&left, &right);
+    return maxx < left || minx > right
         || maxy < (int32_t)draw_area_top  || miny > (int32_t)draw_area_bottom;
 }
 
 static inline int draw_area_out_rect(int32_t x, int32_t y, int w, int h) {
     if (w <= 0 || h <= 0) return 1;
-    return (x + w - 1) < (int32_t)draw_area_left
-        || x > (int32_t)draw_area_right
+    int32_t left, right;
+    draw_area_host_x_bounds(&left, &right);
+    return (x + w - 1) < left
+        || x > right
         || (y + h - 1) < (int32_t)draw_area_top
         || y > (int32_t)draw_area_bottom;
 }
