@@ -387,6 +387,15 @@ static void flush_pending(void)
     g_lc.pending_n = 0;
 }
 
+static int endpoint_port_is_zero(const char *ep)
+{
+    const char *colon;
+    if (!ep || !ep[0]) return 1;
+    colon = strrchr(ep, ':');
+    if (!colon || !colon[1]) return 1;
+    return (int)strtoul(colon + 1, NULL, 10) == 0;
+}
+
 static void fill_peer_bind_from_join(void)
 {
     PsxLobbyJoinInfo *j = &g_lc.join;
@@ -394,7 +403,12 @@ static void fill_peer_bind_from_join(void)
     memset(j->peer_hostport, 0, sizeof(j->peer_hostport));
     if (g_lc.is_host) {
         strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
-        strncpy(j->peer_hostport, j->guest_endpoint, sizeof(j->peer_hostport) - 1);
+        /* Online guests join with 0.0.0.0:0 (ephemeral). The lobby rewrites
+         * that to peer_ip:0, which rnet rejects as a dial target. Leave peer
+         * empty so the host learns the guest from the first HELLO (guest
+         * dials host_endpoint). Fixed guest ports still dial normally. */
+        if (j->guest_endpoint[0] && !endpoint_port_is_zero(j->guest_endpoint))
+            strncpy(j->peer_hostport, j->guest_endpoint, sizeof(j->peer_hostport) - 1);
     } else {
         strncpy(j->bind_hostport, g_lc.my_bind, sizeof(j->bind_hostport) - 1);
         strncpy(j->peer_hostport, j->host_endpoint, sizeof(j->peer_hostport) - 1);
@@ -673,9 +687,12 @@ static void handle_server_json(const char *json)
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
         parse_slots_array(json);
-        /* Rematch/join without a peer endpoint would hang forever in HELLO. */
-        if (!g_lc.join.peer_hostport[0] || !g_lc.join.host_endpoint[0] ||
-            (g_lc.is_host && !g_lc.join.guest_endpoint[0])) {
+        /* Guest must know host:port. Host may leave peer empty (accept-first)
+         * when the guest advertised an ephemeral :0 bind. */
+        if (!g_lc.join.host_endpoint[0] ||
+            (g_lc.is_host && !g_lc.join.guest_endpoint[0]) ||
+            (!g_lc.is_host && (!g_lc.join.peer_hostport[0] ||
+                              endpoint_port_is_zero(g_lc.join.peer_hostport)))) {
             strncpy(g_lc.join.last_error, "missing_endpoints",
                     sizeof(g_lc.join.last_error) - 1);
             g_lc.launch_pending = 0;
