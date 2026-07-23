@@ -33,6 +33,12 @@ psxrecomp_add_runtime_target(psx-runtime
 )
 
 if(BUILD_TESTING)
+    add_executable(launcher_device_roundtrip_test
+        tests/test_launcher_device_roundtrip.cpp)
+    target_include_directories(launcher_device_roundtrip_test PRIVATE include)
+    add_test(NAME launcher_device_roundtrip_test
+             COMMAND launcher_device_roundtrip_test)
+
     add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
     target_include_directories(psx_cyc_batch_test PRIVATE include)
     target_compile_definitions(psx_cyc_batch_test PRIVATE

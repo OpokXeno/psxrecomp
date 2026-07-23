@@ -57,6 +57,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "crc32.h"
 #include "disc_identity.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
+#include "launcher_device.h" /* recomp-ui controller-source round-trip */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher */
@@ -87,8 +88,17 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <commdlg.h>
+#else
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #ifndef PSX_DEFAULT_BIOS_PATH
@@ -547,6 +557,12 @@ extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
  * in config_loader.h). */
 static int           g_video_aspect_num = 4;
 static int           g_video_aspect_den = 3;
+/* Resize-driven widescreen. The user's fixed aspect is still used to shape the
+ * initial window; after the game window exists these values follow its live
+ * aspect, clamped to 4:3..the widest mode offered by the title. */
+static bool          g_ws_adaptive_view = false;
+static int           g_ws_adaptive_max_num = 16;
+static int           g_ws_adaptive_max_den = 9;
 /* [widescreen] per-game hooks (see config_loader.h): anchor scratch addr for
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
@@ -582,6 +598,53 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     }
     *w = width;
     *h = width * den / num;
+}
+
+static int aspect_gcd(int a, int b) {
+    while (b) { int t = a % b; a = b; b = t; }
+    return a > 0 ? a : 1;
+}
+
+/* Follow the host window without feeding its absolute pixel size into guest
+ * rendering. Only the ratio matters: gpu_ws_configure derives the PSX-native
+ * sidecar width from it, just as the fixed 16:9/21:9 modes do. */
+static void update_adaptive_widescreen() {
+    if (!g_ws_adaptive_view || !sdl_window) return;
+
+    int width = 0, height = 0;
+    SDL_GetWindowSize(sdl_window, &width, &height);
+    if (width <= 0 || height <= 0) return;
+
+    int num = width, den = height;
+    if ((int64_t)width * 3 <= (int64_t)height * 4) {
+        num = 4; den = 3;
+    } else if ((int64_t)width * g_ws_adaptive_max_den >=
+               (int64_t)height * g_ws_adaptive_max_num) {
+        num = g_ws_adaptive_max_num;
+        den = g_ws_adaptive_max_den;
+    } else {
+        int divisor = aspect_gcd(num, den);
+        num /= divisor;
+        den /= divisor;
+    }
+    if (num == g_video_aspect_num && den == g_video_aspect_den) return;
+
+    g_video_aspect_num = num;
+    g_video_aspect_den = den;
+    gl_renderer_set_display_aspect(num, den);
+    if (sdl_renderer) {
+        g_logical_w = 480 * num * g_video_scale / den;
+        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
+    }
+
+    if (g_ws_engaged) {
+        const bool wide = num * 3 != den * 4;
+        const int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
+        gte_set_display_aspect(mode == 1 ? num : 4,
+                               mode == 1 ? den : 3);
+        gpu_ws_configure(num, den, g_ws_anchor_addr,
+                         g_ws_hud_sprt ? 1 : 0, mode);
+    }
 }
 
 /* SDL GL attributes are global inputs to the next context creation.  Set the
@@ -669,7 +732,9 @@ static uint64_t g_legacy_underruns = 0;
 int g_audio_unmute_resync = 0;
 /* Actual device rate the host opened at (bridge mode may differ from 44100;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
-extern "C" int g_audio_host_rate = 44100;
+extern "C" {
+int g_audio_host_rate = 44100;
+}
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
@@ -2989,36 +3054,23 @@ static void load_transition_note(int read_active, int load_active,
     prev_turbo = turbo_active;
 }
 
-/* Depth24 FMV: last ~8 RGB columns can be stale/chroma junk while CRTC width
- * stays full (e.g. MotK 512). Present width is never shrunk — cropping the
- * GL/SDL rect left a flickering black pillar when upload coverage varied.
+/* Depth24 FMV: trailing RGB columns can be stale while CRTC width stays full
+ * (MotK 512). Present width is never shrunk — cropping the GL/SDL rect left a
+ * flickering black pillar when upload coverage varied.
  *
- * Do NOT replicate the last good column: on MotK's starfield intro that turns
- * a single tinted edge pixel into an 8-wide horizontal streak (flickering
- * stretch into the pillar). Black-fill the margin instead. Require a dense
- * chroma signal so sparse stars never trip the repair. */
-static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h) {
-    if (!buf || w < 24u || h == 0u) return;
-    const uint32_t margin = 8u;
-    const uint32_t edge = w - margin;
-    const uint32_t total = margin * h;
-    uint32_t junk_px = 0;
-    for (uint32_t x = edge; x < w; x++) {
-        for (uint32_t y = 0; y < h; y++) {
-            uint32_t p = buf[y * w + x];
-            int r = (int)((p >> 16) & 255u);
-            int g = (int)((p >> 8) & 255u);
-            int b = (int)(p & 255u);
-            int m = (r + g + b) / 3;
-            int ch = (r > m ? r - m : m - r) + (g > m ? g - m : m - g) +
-                     (b > m ? b - m : m - b);
-            if (ch > 40) junk_px++;
-        }
-    }
-    /* ~12% of margin texels — sparse stars stay; dense chroma fringe cleans. */
-    if (total == 0u || junk_px * 100u < total * 12u) return;
+ * Always black-fill the last 8 RGB cols. Also blank beyond the tracked FB A0
+ * span when it falls short of the CRTC (movie cut / partial cover). Do NOT
+ * replicate the last good column — that smeared MotK's starfield into an
+ * 8-wide streak. */
+static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
+                                          uint32_t display_x) {
+    if (!buf || w < 8u || h == 0u) return;
+    uint32_t start = w - 8u;
+    uint32_t lim = gpu_depth24_rgb_limit(display_x, w);
+    if (lim > 0u && lim < w && lim < start)
+        start = lim;
     for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = edge; x < w; x++)
+        for (uint32_t x = start; x < w; x++)
             buf[y * w + x] = 0xFF000000u;
     }
 }
@@ -3428,12 +3480,26 @@ static void sdl_vblank_present(void) {
     /* Mod hooks. Run after all normal input sampling. */
     mod_call_frame_hooks();
 
+    /* Resize-driven mode updates the pending aspect during BIOS boot too, but
+     * the actual wide compositor remains disengaged until game entry. */
+    update_adaptive_widescreen();
+
+    /* Resize-driven mode updates the pending aspect during BIOS boot too, but
+     * the actual wide compositor remains disengaged until game entry. */
+    update_adaptive_widescreen();
+
+    /* Depth24 GP1(07h) retarget (MotK intro→crawl): keep the prior Swap for a
+     * few vblanks so stale trailing VRAM never flashes on the right edge. */
+    if (gpu_depth24_present_hold_tick())
+        return;
+
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
     if (!g_ws_engaged) {
         extern int fntrace_is_game_started(void);
         if (fntrace_is_game_started()) {
             g_ws_engaged = true;
-            int mode = g_ws_native_wide ? 2 : 1;
+            const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
+            int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
             /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
              * (identity squash). Squash mode: feed the real wide aspect. */
             gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
@@ -3567,9 +3633,10 @@ static void sdl_vblank_present(void) {
                     for (uint32_t x = 0; x < present_w; x++)
                         sdl_pixel_buf[y * present_w + x] =
                             gpu_display_pixel_argb(&di, x, y);
-                /* Trailing margin: replicate last good column into junk cols
-                 * inside the full-width buffer — never shrink present width. */
-                depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h);
+                /* Trailing margin: blank junk cols inside the full-width
+                 * buffer — never shrink present width. */
+                depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h,
+                                             di.display_x);
                 vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w, (int)h,
                                         0 /* nearest */, fmv_frame ? 1 : 0);
             } else if (wide_present &&
@@ -3631,11 +3698,12 @@ static void sdl_vblank_present(void) {
             }
         }
 
-        /* Depth24 trailing margin: MotK CRTC is 512 RGB but the last ~8 cols
+        /* Depth24 trailing margin: MotK CRTC is 512 RGB but trailing cols
          * can be stale. Fix pixels in-place at full present_w — never crop the
          * GL/SDL draw width (that caused a flickering black pillar). */
         if (di.depth24 && active_scale == 1 && !wide_present)
-            depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h);
+            depth24_fix_trailing_margin(sdl_pixel_buf, present_w, h,
+                                         di.display_x);
 
         smooth_60_present(sdl_pixel_buf,
                           present_w * (uint32_t)active_scale,
@@ -3800,6 +3868,7 @@ namespace {
     bool g_lnch_hosting_lan = false;
     bool g_lnch_joined_lan = false;
     std::string g_lnch_lan_endpoint;
+    std::string g_lnch_lan_guest_bind;
 
     struct AeLanLobbyState {
         std::string name;
@@ -3861,6 +3930,7 @@ namespace {
         g_lnch_hosting_lan = true;
         g_lnch_joined_lan = false;
         g_lnch_lan_endpoint = state.endpoint;
+        g_lnch_lan_guest_bind.clear();
     }
 
     int ae_np_read_lan_lobby(RecompLauncherCNetplayLobby* out) {
@@ -3965,37 +4035,96 @@ namespace {
         return 1;
     }
 
-    int ae_np_local_ip(void*, char* out, size_t out_len) {
-        if (!out || out_len == 0) return 0;
+    /* Collect non-loopback IPv4 addresses for Host Lobby IP dropdown. */
+    static void ae_np_collect_local_addresses(
+        std::vector<RecompLauncherCNetplayLocalAddress>* out) {
+        if (!out) return;
+        out->clear();
+        auto push = [&](const char* ip, const char* label) {
+            if (!ip || !ip[0]) return;
+            if (std::strcmp(ip, "0.0.0.0") == 0 ||
+                std::strcmp(ip, "127.0.0.1") == 0)
+                return;
+            for (const auto& existing : *out) {
+                if (std::strcmp(existing.address, ip) == 0) return;
+            }
+            RecompLauncherCNetplayLocalAddress entry{};
+            std::snprintf(entry.address, sizeof(entry.address), "%s", ip);
+            if (label && label[0])
+                std::snprintf(entry.label, sizeof(entry.label), "%s", label);
+            out->push_back(entry);
+        };
 #ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
-        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s == INVALID_SOCKET) return 0;
-        sockaddr_in dst{};
-        dst.sin_family = AF_INET;
-        dst.sin_port = htons(80);
-        inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
-        if (connect(s, (sockaddr*)&dst, sizeof(dst)) == SOCKET_ERROR) {
-            closesocket(s);
-            return 0;
+        ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                      GAA_FLAG_SKIP_DNS_SERVER;
+        ULONG buf_len = 16 * 1024;
+        std::vector<unsigned char> buf(buf_len);
+        IP_ADAPTER_ADDRESSES* addrs =
+            reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        ULONG rc = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &buf_len);
+        if (rc == ERROR_BUFFER_OVERFLOW) {
+            buf.resize(buf_len);
+            addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+            rc = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &buf_len);
         }
-        sockaddr_in local{};
-        int len = sizeof(local);
-        if (getsockname(s, (sockaddr*)&local, &len) == SOCKET_ERROR) {
-            closesocket(s);
-            return 0;
+        if (rc != NO_ERROR) return;
+        for (IP_ADAPTER_ADDRESSES* a = addrs; a; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp) continue;
+            if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            char label[64] = {};
+            if (a->FriendlyName) {
+                WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, label,
+                                    (int)sizeof(label), nullptr, nullptr);
+            }
+            for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u;
+                 u = u->Next) {
+                if (!u->Address.lpSockaddr ||
+                    u->Address.lpSockaddr->sa_family != AF_INET)
+                    continue;
+                auto* sin = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
+                char ip[64] = {};
+                if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+                push(ip, label);
+            }
         }
-        char buf[64] = {};
-        const char* ip = inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf));
-        closesocket(s);
-        if (!ip || !buf[0]) return 0;
-        std::snprintf(out, out_len, "%s", buf);
-        return 1;
 #else
-        std::snprintf(out, out_len, "Unavailable");
-        return 0;
+        struct ifaddrs* ifa = nullptr;
+        if (getifaddrs(&ifa) != 0 || !ifa) return;
+        for (struct ifaddrs* i = ifa; i; i = i->ifa_next) {
+            if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+            if (!(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK)) continue;
+            auto* sin = reinterpret_cast<sockaddr_in*>(i->ifa_addr);
+            char ip[64] = {};
+            if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+            push(ip, i->ifa_name ? i->ifa_name : "");
+        }
+        freeifaddrs(ifa);
 #endif
+    }
+
+    int ae_np_local_address_get(void*, int index,
+                                RecompLauncherCNetplayLocalAddress* out) {
+        if (!out || index < 0) return 0;
+        std::memset(out, 0, sizeof(*out));
+        std::vector<RecompLauncherCNetplayLocalAddress> addrs;
+        ae_np_collect_local_addresses(&addrs);
+        if (index >= (int)addrs.size()) return 0;
+        *out = addrs[(size_t)index];
+        return out->address[0] ? 1 : 0;
+    }
+
+    int ae_np_local_ip(void*, char* out, size_t out_len) {
+        if (!out || out_len == 0) return 0;
+        std::vector<RecompLauncherCNetplayLocalAddress> addrs;
+        ae_np_collect_local_addresses(&addrs);
+        if (addrs.empty()) {
+            std::snprintf(out, out_len, "Unavailable");
+            return 0;
+        }
+        std::snprintf(out, out_len, "%s", addrs[0].address);
+        return 1;
     }
 
     int ae_np_external_ip(void*, char* out, size_t out_len) {
@@ -4050,18 +4179,58 @@ namespace {
 #endif
     }
 
-    int ae_np_create(void*, const char* lobby_name, const char* host_port,
+    /* host_endpoint is in/out (capacity >= 64). recomp-ui applies UDP port
+     * policy before calling. lan_only: local registry only; else lobby server. */
+    int ae_np_create(void*, const char* lobby_name, char* host_endpoint,
                      const char* password,
-                     const RecompLauncherCSettings* settings) {
+                     const RecompLauncherCSettings* settings,
+                     int lan_only) {
         PsxLobbyMatchCaps caps = ae_netplay_caps_from_settings(settings);
-        const char* endpoint = host_port && host_port[0] ? host_port : "0.0.0.0:7777";
-        ae_np_write_lan_lobby(lobby_name, endpoint, password);
+        char endpoint[96];
+        if (host_endpoint && host_endpoint[0])
+            std::snprintf(endpoint, sizeof(endpoint), "%s", host_endpoint);
+        else
+            std::snprintf(endpoint, sizeof(endpoint), "0.0.0.0:7777");
+
+        if (lan_only) {
+            if (psx_lobby_in_lobby())
+                (void)psx_lobby_leave();
+            ae_np_write_lan_lobby(lobby_name, endpoint, password);
+            if (host_endpoint)
+                std::snprintf(host_endpoint, 96, "%s", endpoint);
+            return 0;
+        }
+
+        if (g_lnch_hosting_lan) {
+            std::error_code ec;
+            std::filesystem::remove(ae_np_lan_file(), ec);
+            g_lnch_hosting_lan = false;
+        }
+        g_lnch_joined_lan = false;
+        g_lnch_lan_endpoint.clear();
+        g_lnch_lan_guest_bind.clear();
+        if (host_endpoint)
+            std::snprintf(host_endpoint, 96, "%s", endpoint);
         return psx_lobby_create(lobby_name && lobby_name[0] ? lobby_name : "Netplay Lobby",
                                 g_lnch_netplay_game_name.c_str(), PSX_GAME_VERSION,
                                 password ? password : "", endpoint, &caps);
     }
 
-    int ae_np_join(void*, const char* lobby_id, const char* password) {
+    /* guest_bind is in/out (capacity >= 64). recomp-ui fills a real UDP port
+     * (prefer 7778); never advertise :0 to the lobby. */
+    int ae_np_join(void*, const char* lobby_id, const char* password,
+                   char* guest_bind) {
+        char bind_buf[64];
+        const char* bind = guest_bind;
+        const char* colon = (bind && bind[0]) ? std::strrchr(bind, ':') : nullptr;
+        const unsigned port = (colon && colon[1])
+            ? static_cast<unsigned>(std::strtoul(colon + 1, nullptr, 10)) : 0u;
+        if (!bind || !bind[0] || port == 0u) {
+            std::snprintf(bind_buf, sizeof(bind_buf), "0.0.0.0:7778");
+            bind = bind_buf;
+            if (guest_bind)
+                std::snprintf(guest_bind, 64, "%s", bind_buf);
+        }
         if (lobby_id && strncmp(lobby_id, "lan:", 4) == 0) {
             AeLanLobbyState state;
             if (!ae_np_read_lan_state(&state) || !state.joiner_name.empty()) return -1;
@@ -4073,9 +4242,10 @@ namespace {
             g_lnch_hosting_lan = false;
             g_lnch_joined_lan = true;
             g_lnch_lan_endpoint = state.endpoint;
+            g_lnch_lan_guest_bind = bind;
             return 0;
         }
-        return psx_lobby_join(lobby_id, password ? password : "", "0.0.0.0:0");
+        return psx_lobby_join(lobby_id, password ? password : "", bind);
     }
 
     int ae_np_leave(void*) {
@@ -4093,6 +4263,7 @@ namespace {
         }
         g_lnch_joined_lan = false;
         g_lnch_lan_endpoint.clear();
+        g_lnch_lan_guest_bind.clear();
         g_lnch_pending_direct_launch = {};
         return psx_lobby_leave();
     }
@@ -4177,7 +4348,9 @@ namespace {
                                   "0.0.0.0:%s", port);
                 } else {
                     std::snprintf(g_lnch_pending_direct_launch.bind_hostport,
-                                  sizeof(g_lnch_pending_direct_launch.bind_hostport), "0.0.0.0:0");
+                                  sizeof(g_lnch_pending_direct_launch.bind_hostport), "%s",
+                                  g_lnch_lan_guest_bind.empty()
+                                      ? "0.0.0.0:0" : g_lnch_lan_guest_bind.c_str());
                     std::snprintf(g_lnch_pending_direct_launch.peer_hostport,
                                   sizeof(g_lnch_pending_direct_launch.peer_hostport), "%s",
                                   state.endpoint.c_str());
@@ -4210,6 +4383,16 @@ namespace {
         return 1;
     }
 
+    const char* ae_np_last_error(void*) {
+        const PsxLobbyJoinInfo* ji = psx_lobby_join_info();
+        return (ji && ji->last_error[0]) ? ji->last_error : nullptr;
+    }
+
+    void ae_np_clear_last_error(void*) {
+        PsxLobbyJoinInfo* ji = const_cast<PsxLobbyJoinInfo*>(psx_lobby_join_info());
+        if (ji) ji->last_error[0] = '\0';
+    }
+
     RecompLauncherCNetplayCallbacks g_lnch_netplay_callbacks = {
         nullptr,
         ae_np_default_url,
@@ -4239,6 +4422,10 @@ namespace {
         ae_np_launch_pending,
         ae_np_clear_launch_pending,
         ae_np_fill_launch,
+        ae_np_local_address_get,
+        nullptr, /* kick_member — optional */
+        ae_np_last_error,
+        ae_np_clear_last_error,
     };
 }  // namespace
 #endif
@@ -4417,6 +4604,7 @@ int main(int argc, char** argv) {
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
     bool ws_ultrawide_offered = false;
+    bool ws_adaptive_view_supported = false;
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
@@ -4590,6 +4778,7 @@ int main(int argc, char** argv) {
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
             ws_ultrawide_offered = gc.ws_ultrawide_offered;
+            ws_adaptive_view_supported = gc.ws_adaptive_view;
             vulkan_offered = gc.vulkan_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
@@ -4895,6 +5084,7 @@ int main(int argc, char** argv) {
             g_video_aspect_num = us.aspect_num;
             g_video_aspect_den = us.aspect_den;
         }
+        if (us.has_adaptive_view) g_ws_adaptive_view = us.adaptive_view;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
         if (us.has_bios_path && !bios_from_cli) {
             settings_bios_storage = us.bios_path.string();
@@ -4953,6 +5143,9 @@ int main(int argc, char** argv) {
         g_video_aspect_num = ws_offered ? 16 : 4;
         g_video_aspect_den = ws_offered ? 9 : 3;
     }
+    if (!ws_adaptive_view_supported) g_ws_adaptive_view = false;
+    g_ws_adaptive_max_num = ws_ultrawide_offered ? 21 : 16;
+    g_ws_adaptive_max_den = 9;
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
@@ -5068,6 +5261,7 @@ int main(int argc, char** argv) {
             seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
+            seed.adaptive_view = g_ws_adaptive_view;      seed.has_adaptive_view = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             if (has_netplay_player_name) {
@@ -5112,8 +5306,20 @@ int main(int argc, char** argv) {
             ls.enable_audio   = 1;
             ls.audio_freq     = 44100;
             ls.volume         = 100;
-            ls.player_src[0]  = (p1_device == "keyboard") ? 1 : (p1_device == "none") ? 0 : 2;
-            ls.player_src[1]  = (p2_device == "keyboard") ? 1 : (p2_device == "none") ? 0 : 2;
+            ls.player_src[0]  = PSXRecompV4::launcher_source_from_device(p1_device);
+            ls.player_src[1]  = PSXRecompV4::launcher_source_from_device(p2_device);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID)
+            if (ls.player_src[0] == 2) {
+                std::snprintf(ls.player_gamepad_guid[0],
+                              sizeof(ls.player_gamepad_guid[0]), "%s",
+                              p1_device.c_str());
+            }
+            if (ls.player_src[1] == 2) {
+                std::snprintf(ls.player_gamepad_guid[1],
+                              sizeof(ls.player_gamepad_guid[1]), "%s",
+                              p2_device.c_str());
+            }
+#endif
             {
                 int rui_deadzone_pct = seed.deadzone * 100 / 32767;
                 ls.deadzone[0] = rui_deadzone_pct;
@@ -5126,9 +5332,13 @@ int main(int argc, char** argv) {
                           has_netplay_player_name ? netplay_player_name.c_str() : "");
             ls.pad_mode[0]    = seed.p1_mode;
             ls.pad_mode[1]    = seed.p2_mode;
-            /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
-            ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
-                                 (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
+            /* Adaptive is part of the aspect vocabulary, not a second toggle.
+             * It follows 21:9 when ultrawide is offered, otherwise 16:9. */
+            const int adaptive_aspect_index = ws_ultrawide_offered ? 3 : 2;
+            ls.aspect_index   = seed.adaptive_view ? adaptive_aspect_index :
+                                (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
+                                (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
+            ls.adaptive_view  = seed.adaptive_view ? 1 : 0;
 
             /* ---- deeper PSX-style settings (capability-gated via launcher_profile
              * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
@@ -5196,6 +5406,17 @@ int main(int argc, char** argv) {
                 "OpenGL (Recommended)",
                 "Vulkan"
             };
+            static const char* const kAdaptiveAspectLabels[] = {
+                "4:3 (Native)",
+                "16:9 (Widescreen)",
+                "21:9 (Ultrawide)",
+                "Adaptive"
+            };
+            static const char* const kAdaptiveAspectLabelsNoUltrawide[] = {
+                "4:3 (Native)",
+                "16:9 (Widescreen)",
+                "Adaptive"
+            };
             /* System identity + full PS1 settings-surface capability set (theme,
              * platform label, rom_noun, pad-mode support, aspect mask base, and
              * all has_* deep-settings flags) — one profile call keeps them from
@@ -5218,6 +5439,12 @@ int main(int argc, char** argv) {
             gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
             gi.lock_device          = ctrl_lock_device ? 1 : 0;
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
+            if (ws_adaptive_view_supported) {
+                gi.aspect_labels = ws_ultrawide_offered
+                    ? kAdaptiveAspectLabels : kAdaptiveAspectLabelsNoUltrawide;
+                gi.num_aspect_labels = ws_ultrawide_offered ? 4 : 3;
+                gi.aspect_experimental = 1;
+            }
             gi.renderer_labels      = kPsxRendererLabels;
             gi.num_renderers        = vulkan_offered ? 3 : 2;
             /* Localization menu: shown only when the game declares languages. */
@@ -5259,21 +5486,38 @@ int main(int argc, char** argv) {
                 }
                 seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
-                /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
-                 * legacy ls.widescreen bool (still set above for older callers). */
-                switch (ls.aspect_index) {
-                    case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
-                    case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
-                    default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
+                /* Adaptive preserves the previous fixed aspect as the initial
+                 * window shape. Selecting a fixed entry turns adaptation off. */
+                if (ws_adaptive_view_supported &&
+                    ls.aspect_index == adaptive_aspect_index) {
+                    seed.adaptive_view = true;
+                } else {
+                    seed.adaptive_view = false;
+                    switch (ls.aspect_index) {
+                        case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
+                        case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
+                        default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
+                    }
                 }
                 seed.has_aspect_ratio = true;
+                seed.has_adaptive_view = true;
                 /* has_texture_filter is on (PSX profile) so the launcher edits
                  * ls.texture_filter directly (0=nearest,1=bilinear); ls.linear_filter
                  * is the legacy fallback field for consoles without the cap and is
                  * left unused here. */
                 seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
-                p1_device = (ls.player_src[0] == 1) ? "keyboard" : (ls.player_src[0] == 0) ? "none" : p1_device;
-                p2_device = (ls.player_src[1] == 1) ? "keyboard" : (ls.player_src[1] == 0) ? "none" : p2_device;
+                std::string p1_launcher_device = p1_device;
+                std::string p2_launcher_device = p2_device;
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID)
+                if (ls.player_gamepad_guid[0][0])
+                    p1_launcher_device = ls.player_gamepad_guid[0];
+                if (ls.player_gamepad_guid[1][0])
+                    p2_launcher_device = ls.player_gamepad_guid[1];
+#endif
+                p1_device = PSXRecompV4::launcher_device_from_source(
+                    ls.player_src[0], p1_launcher_device);
+                p2_device = PSXRecompV4::launcher_device_from_source(
+                    ls.player_src[1], p2_launcher_device);
                 seed.p1_device = p1_device; seed.has_p1_device = true;
                 seed.p2_device = p2_device; seed.has_p2_device = true;
                 seed.deadzone = ls.deadzone[0] * 32767 / 100; seed.has_deadzone = true;
@@ -5368,6 +5612,7 @@ int main(int argc, char** argv) {
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
+                g_ws_adaptive_view = seed.adaptive_view;
                 g_audio_spu_hq    = seed.spu_hq;
                 skip_launcher_setting = seed.skip_launcher;
                 if (seed.has_bios_path) {
@@ -5487,17 +5732,18 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
-    if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+    if (g_video_aspect_num * 3 != g_video_aspect_den * 4 || g_ws_adaptive_view) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
         g_ws_engaged = false;
         std::fprintf(stdout,
-                     "psxrecomp: widescreen %d:%d (%s%s%s; engages at game entry)\n",
+                     "psxrecomp: widescreen %d:%d (%s%s%s%s; engages at game entry)\n",
                      g_video_aspect_num, g_video_aspect_den,
                      g_ws_native_wide ? "native-wide, present 1:1"
                                       : "GTE X-squash + stretched present",
                      g_ws_anchor_addr ? " + sprite tags" : "",
-                     g_ws_hud_sprt ? " + HUD squash" : "");
+                     g_ws_hud_sprt ? " + HUD squash" : "",
+                     g_ws_adaptive_view ? " + adaptive view" : "");
     }
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */

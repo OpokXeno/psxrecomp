@@ -534,6 +534,13 @@ struct GameConfig {
     // auto-detector cannot qualify (e.g. an X-only test with no height compare
     // in the same function — Ape Escape 0x8004AB64). Empty by default; regen.
     std::vector<uint32_t> ws_cull_slti_sites;
+    // [widescreen.cull] bltz_sites — explicit signed LEFT-edge widen sites
+    // (`bltz rs, reject` -> psx_ws_cull_bltz), the counterpart to slti_sites.
+    // detect_cull_bltz_sites only classifies left-edge bltz for functions
+    // auto_screen_x qualified, so an X-only funnel wired through explicit
+    // slti_sites has no left-edge widen without this. Empty by default;
+    // identity at 4:3; regen required.
+    std::vector<uint32_t> ws_cull_bltz_sites;
     // Horizontal low-edge form `subu rd,zero,rs` -> `-rs-x_margin`.
     // Empty by default; configured sites require regenerated native code.
     std::vector<uint32_t> ws_cull_negsub_sites;
@@ -700,6 +707,12 @@ struct GameConfig {
     bool ws_offered = true;
     bool vulkan_offered = false;
 
+    // [widescreen] adaptive_view — let the user opt into a live, resize-driven
+    // aspect instead of selecting only fixed 4:3/16:9/21:9 modes. The fixed
+    // aspect remains the initial window shape; the live view is clamped to the
+    // widest aspect this title offers.
+    bool ws_adaptive_view = false;
+
     // [widescreen] offer_ultrawide — expose a separate experimental 21:9
     // launcher choice for titles that have explicitly tested it. Default off;
     // ordinary widescreen offer remains the independent 16:9 choice.
@@ -810,6 +823,7 @@ struct UserSettings {
     bool has_netplay_lobby_url = false; std::string netplay_lobby_url;
     bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
                                      int  aspect_den     = 3; // (4:3 = native)
+    bool has_adaptive_view  = false; bool adaptive_view  = false;
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
     // [bios] / [disc] / [memcard]

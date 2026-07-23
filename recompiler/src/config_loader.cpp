@@ -889,6 +889,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
     bool vulkan_offered = false;
+    bool ws_adaptive_view = false;
     bool ws_ultrawide_offered = false;
     if (cfg.contains("video")) {
         const toml::value& video = toml::find(cfg, "video");
@@ -1060,12 +1061,15 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_offered = toml::find<bool>(ws, "offer");
         if (ws.contains("offer_ultrawide"))
             ws_ultrawide_offered = toml::find<bool>(ws, "offer_ultrawide");
+        if (ws.contains("adaptive_view"))
+            ws_adaptive_view = toml::find<bool>(ws, "adaptive_view");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
     std::vector<uint32_t> ws_cull_screen_x_sites;
     std::vector<uint32_t> ws_cull_slti_sites;
+    std::vector<uint32_t> ws_cull_bltz_sites;
     std::vector<uint32_t> ws_cull_negsub_sites;
     std::vector<uint32_t> ws_cull_vxrange_sites;
     std::vector<uint32_t> ws_cull_depth_sites;
@@ -1093,6 +1097,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("a1_sites",    ws_cull_a1_sites);
             load_sites("screen_x_sites", ws_cull_screen_x_sites);
             load_sites("slti_sites",  ws_cull_slti_sites);
+            load_sites("bltz_sites",  ws_cull_bltz_sites);
             load_sites("negsub_sites", ws_cull_negsub_sites);
             load_sites("vxrange_sites", ws_cull_vxrange_sites);
             load_sites("depth_sites", ws_cull_depth_sites);
@@ -1250,6 +1255,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
         /*ws_cull_screen_x_sites*/ ws_cull_screen_x_sites,
         /*ws_cull_slti_sites*/    ws_cull_slti_sites,
+        /*ws_cull_bltz_sites*/    ws_cull_bltz_sites,
         /*ws_cull_negsub_sites*/  ws_cull_negsub_sites,
         /*ws_cull_vxrange_sites*/ ws_cull_vxrange_sites,
         /*ws_cull_depth_sites*/   ws_cull_depth_sites,
@@ -1279,6 +1285,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_signed_x_bound_sites*/ ws_signed_x_bound_sites,
         /*ws_offered*/            ws_offered,
         /*vulkan_offered*/        vulkan_offered,
+        /*ws_adaptive_view*/      ws_adaptive_view,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
@@ -1437,6 +1444,10 @@ UserSettings load_user_settings(const fs::path& path) {
             if (parse_aspect_ratio(m, &n, &d)) {
                 s.aspect_num = n; s.aspect_den = d; s.has_aspect_ratio = true;
             }
+        });
+        if (v.contains("adaptive_view")) try_get([&]{
+            s.adaptive_view = toml::find<bool>(v, "adaptive_view");
+            s.has_adaptive_view = true;
         });
     }
     if (doc.contains("audio")) {
@@ -1600,6 +1611,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "frame_interpolation_fps = " << s.frame_interpolation_fps << "\n";
     if (s.has_aspect_ratio)
         f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
+    if (s.has_adaptive_view)
+        f << "adaptive_view     = " << (s.adaptive_view ? "true" : "false") << "\n";
     f << "\n[audio]\n";
     if (s.has_spu_hq)
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
