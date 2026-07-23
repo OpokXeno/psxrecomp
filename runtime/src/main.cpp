@@ -556,6 +556,12 @@ extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
  * in config_loader.h). */
 static int           g_video_aspect_num = 4;
 static int           g_video_aspect_den = 3;
+/* Resize-driven widescreen. The user's fixed aspect is still used to shape the
+ * initial window; after the game window exists these values follow its live
+ * aspect, clamped to 4:3..the widest mode offered by the title. */
+static bool          g_ws_adaptive_view = false;
+static int           g_ws_adaptive_max_num = 16;
+static int           g_ws_adaptive_max_den = 9;
 /* [widescreen] per-game hooks (see config_loader.h): anchor scratch addr for
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
@@ -591,6 +597,53 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     }
     *w = width;
     *h = width * den / num;
+}
+
+static int aspect_gcd(int a, int b) {
+    while (b) { int t = a % b; a = b; b = t; }
+    return a > 0 ? a : 1;
+}
+
+/* Follow the host window without feeding its absolute pixel size into guest
+ * rendering. Only the ratio matters: gpu_ws_configure derives the PSX-native
+ * sidecar width from it, just as the fixed 16:9/21:9 modes do. */
+static void update_adaptive_widescreen() {
+    if (!g_ws_adaptive_view || !sdl_window) return;
+
+    int width = 0, height = 0;
+    SDL_GetWindowSize(sdl_window, &width, &height);
+    if (width <= 0 || height <= 0) return;
+
+    int num = width, den = height;
+    if ((int64_t)width * 3 <= (int64_t)height * 4) {
+        num = 4; den = 3;
+    } else if ((int64_t)width * g_ws_adaptive_max_den >=
+               (int64_t)height * g_ws_adaptive_max_num) {
+        num = g_ws_adaptive_max_num;
+        den = g_ws_adaptive_max_den;
+    } else {
+        int divisor = aspect_gcd(num, den);
+        num /= divisor;
+        den /= divisor;
+    }
+    if (num == g_video_aspect_num && den == g_video_aspect_den) return;
+
+    g_video_aspect_num = num;
+    g_video_aspect_den = den;
+    gl_renderer_set_display_aspect(num, den);
+    if (sdl_renderer) {
+        g_logical_w = 480 * num * g_video_scale / den;
+        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
+    }
+
+    if (g_ws_engaged) {
+        const bool wide = num * 3 != den * 4;
+        const int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
+        gte_set_display_aspect(mode == 1 ? num : 4,
+                               mode == 1 ? den : 3);
+        gpu_ws_configure(num, den, g_ws_anchor_addr,
+                         g_ws_hud_sprt ? 1 : 0, mode);
+    }
 }
 
 /* SDL GL attributes are global inputs to the next context creation.  Set the
@@ -3424,6 +3477,14 @@ static void sdl_vblank_present(void) {
     /* Mod hooks. Run after all normal input sampling. */
     mod_call_frame_hooks();
 
+    /* Resize-driven mode updates the pending aspect during BIOS boot too, but
+     * the actual wide compositor remains disengaged until game entry. */
+    update_adaptive_widescreen();
+
+    /* Resize-driven mode updates the pending aspect during BIOS boot too, but
+     * the actual wide compositor remains disengaged until game entry. */
+    update_adaptive_widescreen();
+
     /* Depth24 GP1(07h) retarget (MotK intro→crawl): keep the prior Swap for a
      * few vblanks so stale trailing VRAM never flashes on the right edge. */
     if (gpu_depth24_present_hold_tick())
@@ -3434,7 +3495,8 @@ static void sdl_vblank_present(void) {
         extern int fntrace_is_game_started(void);
         if (fntrace_is_game_started()) {
             g_ws_engaged = true;
-            int mode = g_ws_native_wide ? 2 : 1;
+            const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
+            int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
             /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
              * (identity squash). Squash mode: feed the real wide aspect. */
             gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
@@ -4516,6 +4578,7 @@ int main(int argc, char** argv) {
     int  ctrl_locked_p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ws_offered = true; /* game.toml [widescreen] offer; false hides the launcher toggle + clamps 4:3 */
     bool ws_ultrawide_offered = false;
+    bool ws_adaptive_view_supported = false;
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     /* Localization: the effective language (game.toml default -> settings.toml ->
@@ -4689,6 +4752,7 @@ int main(int argc, char** argv) {
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             ws_offered = gc.ws_offered;
             ws_ultrawide_offered = gc.ws_ultrawide_offered;
+            ws_adaptive_view_supported = gc.ws_adaptive_view;
             vulkan_offered = gc.vulkan_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
@@ -4994,6 +5058,7 @@ int main(int argc, char** argv) {
             g_video_aspect_num = us.aspect_num;
             g_video_aspect_den = us.aspect_den;
         }
+        if (us.has_adaptive_view) g_ws_adaptive_view = us.adaptive_view;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
         if (us.has_bios_path && !bios_from_cli) {
             settings_bios_storage = us.bios_path.string();
@@ -5052,6 +5117,9 @@ int main(int argc, char** argv) {
         g_video_aspect_num = ws_offered ? 16 : 4;
         g_video_aspect_den = ws_offered ? 9 : 3;
     }
+    if (!ws_adaptive_view_supported) g_ws_adaptive_view = false;
+    g_ws_adaptive_max_num = ws_ultrawide_offered ? 21 : 16;
+    g_ws_adaptive_max_den = 9;
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
@@ -5167,6 +5235,7 @@ int main(int argc, char** argv) {
             seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
+            seed.adaptive_view = g_ws_adaptive_view;      seed.has_adaptive_view = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             if (has_netplay_player_name) {
@@ -5225,9 +5294,13 @@ int main(int argc, char** argv) {
                           has_netplay_player_name ? netplay_player_name.c_str() : "");
             ls.pad_mode[0]    = seed.p1_mode;
             ls.pad_mode[1]    = seed.p2_mode;
-            /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
-            ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
-                                 (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
+            /* Adaptive is part of the aspect vocabulary, not a second toggle.
+             * It follows 21:9 when ultrawide is offered, otherwise 16:9. */
+            const int adaptive_aspect_index = ws_ultrawide_offered ? 3 : 2;
+            ls.aspect_index   = seed.adaptive_view ? adaptive_aspect_index :
+                                (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
+                                (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
+            ls.adaptive_view  = seed.adaptive_view ? 1 : 0;
 
             /* ---- deeper PSX-style settings (capability-gated via launcher_profile
              * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
@@ -5295,6 +5368,17 @@ int main(int argc, char** argv) {
                 "OpenGL (Recommended)",
                 "Vulkan"
             };
+            static const char* const kAdaptiveAspectLabels[] = {
+                "4:3 (Native)",
+                "16:9 (Widescreen)",
+                "21:9 (Ultrawide)",
+                "Adaptive"
+            };
+            static const char* const kAdaptiveAspectLabelsNoUltrawide[] = {
+                "4:3 (Native)",
+                "16:9 (Widescreen)",
+                "Adaptive"
+            };
             /* System identity + full PS1 settings-surface capability set (theme,
              * platform label, rom_noun, pad-mode support, aspect mask base, and
              * all has_* deep-settings flags) — one profile call keeps them from
@@ -5317,6 +5401,12 @@ int main(int argc, char** argv) {
             gi.locked_pad_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
             gi.lock_device          = ctrl_lock_device ? 1 : 0;
             gi.aspect_mask          = 0x1 | (ws_offered ? 0x2 : 0) | (ws_ultrawide_offered ? 0x4 : 0);
+            if (ws_adaptive_view_supported) {
+                gi.aspect_labels = ws_ultrawide_offered
+                    ? kAdaptiveAspectLabels : kAdaptiveAspectLabelsNoUltrawide;
+                gi.num_aspect_labels = ws_ultrawide_offered ? 4 : 3;
+                gi.aspect_experimental = 1;
+            }
             gi.renderer_labels      = kPsxRendererLabels;
             gi.num_renderers        = vulkan_offered ? 3 : 2;
             /* Localization menu: shown only when the game declares languages. */
@@ -5358,14 +5448,21 @@ int main(int argc, char** argv) {
                 }
                 seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
-                /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
-                 * legacy ls.widescreen bool (still set above for older callers). */
-                switch (ls.aspect_index) {
-                    case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
-                    case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
-                    default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
+                /* Adaptive preserves the previous fixed aspect as the initial
+                 * window shape. Selecting a fixed entry turns adaptation off. */
+                if (ws_adaptive_view_supported &&
+                    ls.aspect_index == adaptive_aspect_index) {
+                    seed.adaptive_view = true;
+                } else {
+                    seed.adaptive_view = false;
+                    switch (ls.aspect_index) {
+                        case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
+                        case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
+                        default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
+                    }
                 }
                 seed.has_aspect_ratio = true;
+                seed.has_adaptive_view = true;
                 /* has_texture_filter is on (PSX profile) so the launcher edits
                  * ls.texture_filter directly (0=nearest,1=bilinear); ls.linear_filter
                  * is the legacy fallback field for consoles without the cap and is
@@ -5467,6 +5564,7 @@ int main(int argc, char** argv) {
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
+                g_ws_adaptive_view = seed.adaptive_view;
                 g_audio_spu_hq    = seed.spu_hq;
                 skip_launcher_setting = seed.skip_launcher;
                 if (seed.has_bios_path) {
@@ -5586,17 +5684,18 @@ session_reboot:
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
-    if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+    if (g_video_aspect_num * 3 != g_video_aspect_den * 4 || g_ws_adaptive_view) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
         g_ws_engaged = false;
         std::fprintf(stdout,
-                     "psxrecomp: widescreen %d:%d (%s%s%s; engages at game entry)\n",
+                     "psxrecomp: widescreen %d:%d (%s%s%s%s; engages at game entry)\n",
                      g_video_aspect_num, g_video_aspect_den,
                      g_ws_native_wide ? "native-wide, present 1:1"
                                       : "GTE X-squash + stretched present",
                      g_ws_anchor_addr ? " + sprite tags" : "",
-                     g_ws_hud_sprt ? " + HUD squash" : "");
+                     g_ws_hud_sprt ? " + HUD squash" : "",
+                     g_ws_adaptive_view ? " + adaptive view" : "");
     }
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
