@@ -133,12 +133,16 @@ bool FullFunctionEmitter::emit_function(
         return e == nullptr || e[0] != '0';
     }();
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
-        return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
-                                    bios_runtime_pc(resume_pc));
+        return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+               "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
+                           bios_runtime_pc(resume_pc));
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
-        return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+        return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+               "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
         return "#ifdef PSX_COSIM\n" + indent +
@@ -199,6 +203,20 @@ bool FullFunctionEmitter::emit_function(
         if (all_function_entries_norm.count(cross_norm)) continue;
         block_leaders.insert(cross);
         local_continuations.push_back({cross, cross_norm, norm});
+    }
+
+    // FAITHFUL_TIMING_PLAN P5 / game code_generator.cpp parity: every basic-block
+    // leader must be a dispatchable CPS continuation. psx_check_interrupts_at
+    // publishes ANY leader as an async-RFE resume PC; without a dispatch key the
+    // trampoline falls into dirty_ram_interp. MotK measured ~1300 dirty blocks/frame
+    // dominated by kernel poll-loop leaders 0x45FC/0x4614 inside func_00004498 —
+    // both had labels/gotos but no dispatch entries (only jal+8 conts were registered).
+    // Entry block is already a function dispatch key; skip it. Dedup later.
+    for (uint32_t leader : block_leaders) {
+        if (!addr_to_raw.count(leader)) continue;
+        uint32_t leader_norm = normalize_address(leader);
+        if (all_function_entries_norm.count(leader_norm)) continue;
+        local_continuations.push_back({leader, leader_norm, norm});
     }
 
     // Helper: find which function (in all_function_entries_norm) contains a
@@ -1135,6 +1153,12 @@ bool FullFunctionEmitter::emit_function(
 
     // Emit function header.
     out += fmt::format("void func_{:08X}(CPUState* cpu) {{\n", norm);
+    out += "#if defined(PSX_ENABLE_BLOCK_CYCLES) && "
+           "(defined(__GNUC__) || defined(__clang__))\n"
+           "    __attribute__((cleanup(psx_cyc_bb_defer_cleanup))) "
+           "int _psx_cyc_bb_guard = 1;\n"
+           "    psx_cyc_bb_defer_begin();\n"
+           "#endif\n";
     // Direct-call entry hook: captures into fn_entry ring (gated by
     // fn_filter at runtime).  Lets us see direct-jal call paths that
     // never go through psx_dispatch.
@@ -1782,13 +1806,13 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
-    full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
     full_c += "#ifdef PSX_COSIM\n";
     full_c += "extern void cosim_block(uint32_t block_leader_phys);\n";
     full_c += "extern void cosim_instr(uint32_t pc);\n";
     full_c += "#endif\n";
     full_c += "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
     full_c += "#endif\n";
     full_c += "extern uint32_t g_debug_last_store_pc;\n";

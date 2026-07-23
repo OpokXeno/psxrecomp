@@ -39,6 +39,7 @@
 #include "psx_scheduler.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <setjmp.h>
 
 /* Event-timeline ring: execution-mode flag owned by dirty_ram_interp.c. The
@@ -597,6 +598,13 @@ void interrupts_init(void) {
     exception_entries_total = 0;
     exception_reentry_blocks = 0;
     cycles_since_vblank = 0;
+    /* Rematch / session_reboot re-enters bring-up without process exit.
+     * Stale I_STAT/I_MASK from the prior match (e.g. VBlank pending + game
+     * mask) makes boot take a phantom IRQ at ~cycle 4 and wedge under
+     * netplay lockstep. Cold boot also wants zeros (BSS already is). */
+    i_stat = 0;
+    i_mask = 0;
+    g_vblank_raise_count = 0;
     last_sio_seq_seen = sio_get_seq();
     last_sio_progress_cycle = psx_get_cycle_count();
 }
@@ -723,6 +731,7 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 }
 
 void psx_check_interrupts(CPUState* cpu) {
+    psx_cyc_batch_flush();
     extern int g_ls_suppress_record;
 #define PSX_CHECK_INTERRUPTS_RETURN() do { if (g_ls_suppress_record > 0) g_ls_suppress_record--; return; } while (0)
 #ifdef PSX_COSIM
@@ -730,6 +739,24 @@ void psx_check_interrupts(CPUState* cpu) {
 #define COSIM_IRQ_TAKE_PC() (g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc)
 #define COSIM_IRQ_NOTE(kind_) cosim_irq_note(cpu, (kind_), COSIM_IRQ_TAKE_PC(), g_dirty_safe_resume_pc, s_compiled_interrupt_resume_pc, cpu->cop0[COP0_SR])
 #endif
+
+    /* MotK VLC / FMV hot edge: sticky unmasked I_STAT (CD/VBlank) while
+     * IEc or IM2 is clear — no architectural delivery possible. Skip the
+     * mid-path bookkeeping / irq_deliver_eval that used to run every BB.
+     * Guest-visible timing unchanged (same non-delivery). LTO can collapse
+     * this into the VLC call sites. */
+    static uint32_t s_fast_maintenance;
+    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+        uint32_t sr = cpu->cop0[COP0_SR];
+        if (!(sr & 0x01u) || !(sr & (1u << 10))) {
+            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+                extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                debug_server_poll();
+            }
+            return;
+        }
+    }
 
     /* Genuine entry fast paths. Generated resident code calls this at every
      * basic-block edge, which can mean tens of millions of calls inside an FMV
@@ -739,21 +766,64 @@ void psx_check_interrupts(CPUState* cpu) {
      * savestate_poll, making a harmless callback expensive enough to reduce
      * Tomba 2's Whoopee FMV to ~1 guest fps.
      *
+     * Idle-skip used to force the slow path on every edge so
+     * psx_idle_note_check could observe poll PCs. That made MotK's VLC
+     * (branchy, changing resume PCs, idle_skip=true) pay full IRQ bookkeeping
+     * millions of times per second for zero skips. Keep the fast path; run the
+     * idle note here when enabled, then re-check I_STAT in case a skip raised
+     * an event. Guest timing is unchanged — skip still advances via
+     * psx_advance_cycles.
+     *
      * Poll host maintenance periodically so save/load and the debug socket stay
      * responsive even when the guest spends a long time in this path. At the
      * observed 1M+ block edges/s this is sub-frame latency. */
-    static uint32_t s_fast_maintenance;
     if (g_idle_skip_enabled < 0) (void)psx_idle_skip_is_enabled();
-    if (!in_exception && (i_stat & i_mask) == 0 &&
-        !s_defer_switch_pending && g_idle_skip_enabled == 0) {
-        if ((++s_fast_maintenance & 0x3FFFu) == 0) {
-            extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
-            savestate_poll(cpu, s_compiled_interrupt_resume_pc);
-            debug_server_poll();
+    /* COP0 software interrupts (CAUSE.IP0/IP1 vs SR.IM0/IM1, bits 8-9): raised
+     * purely by guest mtc0 to CAUSE, with no INTC involvement. Games use this
+     * as a re-entrant exception-dispatch mechanism (Jackie Chan Stuntmaster's
+     * handler saves SR/EPC, sets CAUSE=0x100 + SR=0x101, and relies on the
+     * immediate sw-int to chain into its second stage; without it the CD INT3
+     * ack never runs and the machine deadlocks with SR.IM2 stripped). */
+    uint32_t sw_pending = cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u;
+    if (!in_exception && (i_stat & i_mask) == 0 && sw_pending == 0 &&
+        !s_defer_switch_pending) {
+        if (g_idle_skip_enabled > 0) {
+            uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                       : s_compiled_interrupt_resume_pc;
+            s_last_interrupt_check_pc = check_pc;
+            s_last_interrupt_check_cycle = psx_get_cycle_count();
+            psx_idle_note_check(cpu, check_pc);
         }
-        return;
+        if ((i_stat & i_mask) == 0 && sw_pending == 0) {
+            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+                extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                debug_server_poll();
+            }
+            return;
+        }
+        /* Idle skip advanced time and a device raised I_STAT — deliver below. */
     }
     if (in_exception && !(cpu->cop0[COP0_SR] & 0x01u)) return;
+
+    /* Mid path: unmasked IRQ already pending, ordinary compiled edge.
+     * MotK VLC / FMV spend most BB edges here (sticky CD/VBlank bits).
+     * Devices are already caught up via psx_advance_cycles, so skip
+     * service/idle/savestate housekeeping and go straight to delivery. */
+    if (!in_exception && !s_defer_switch_pending && (i_stat & i_mask) != 0) {
+        uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                   : s_compiled_interrupt_resume_pc;
+        s_last_interrupt_check_pc = check_pc;
+        s_last_interrupt_check_cycle = psx_get_cycle_count();
+        g_ls_suppress_record++;
+        total_checks++;
+        if ((total_checks & 0x3FFFu) == 0) {
+            extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+            savestate_poll(cpu, check_pc);
+            debug_server_poll();
+        }
+        goto irq_deliver_eval;
+    }
 
     {
         uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
@@ -782,9 +852,11 @@ void psx_check_interrupts(CPUState* cpu) {
      * next internal device event in whole loop quanta. Runs BEFORE the
      * deliverability evaluation below so an event raised by the skip is
      * delivered in this same check, exactly at the boundary real execution
-     * would have taken it. No-ops in exception context / precise mode /
-     * lockstep (gated inside). */
-    psx_idle_note_check(cpu, s_last_interrupt_check_pc);
+     * would have taken it. Skip when an unmasked IRQ is already pending —
+     * that is not an idle poll (FMV/VLC edges with sticky CD/VBlank bits),
+     * and the fast path already noted when I_STAT was clear. */
+    if ((i_stat & i_mask) == 0)
+        psx_idle_note_check(cpu, s_last_interrupt_check_pc);
 
     /* User save states: this is a block-leader boundary with a known resume PC;
      * only act outside the exception handler so a restore's stack-unwind can't
@@ -883,8 +955,9 @@ void psx_check_interrupts(CPUState* cpu) {
         }
     }
 
-    /* Check if any interrupts are pending. */
-    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
+irq_deliver_eval:
+    /* Check if any interrupts are pending (INTC hardware or COP0 software). */
+    if ((i_stat & i_mask) == 0 && sw_pending == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
     /* Nested delivery (hardware semantics). Real R3000A has no 'in exception'
      * gate — delivery is governed by SR alone. The handler normally runs with
      * IEc=0 (hardware bit-shift on entry), so the SR gates below block
@@ -954,13 +1027,19 @@ void psx_check_interrupts(CPUState* cpu) {
 #endif
         PSX_CHECK_INTERRUPTS_RETURN();
     }   /* Interrupts globally disabled */
-    if (!(sr & (1 << 10))) {
+    /* Deliverability per source: the INTC line needs SR.IM2; software
+     * interrupts need only their own IM bit (already folded into sw_pending,
+     * recomputed here against the CURRENT sr — the fast-path snapshot above
+     * may predate an SR write earlier in this same check). */
+    sw_pending = cpu->cop0[COP0_CAUSE] & sr & 0x0300u;
+    int hw_deliverable = ((i_stat & i_mask) != 0) && ((sr & (1 << 10)) != 0);
+    if (!hw_deliverable && sw_pending == 0) {
         irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2, 0);
 #ifdef PSX_COSIM
         COSIM_IRQ_NOTE(5u);
 #endif
         PSX_CHECK_INTERRUPTS_RETURN();
-    } /* Hardware interrupt bit not enabled */
+    } /* No deliverable interrupt source (hw masked and no sw pending) */
 
     /* Architectural take-PC = the resume PC (same selection the async-RFE block
      * below uses): the dirty-interp commits the exact interrupted instruction in
@@ -1006,9 +1085,14 @@ void psx_check_interrupts(CPUState* cpu) {
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
 
-    /* Set COP0 Cause: ExcCode=0 (interrupt), IP2 pending. */
+    /* Set COP0 Cause: ExcCode=0 (interrupt). IP2 reflects the INTC line, so
+     * set it only when the hardware source is what's being delivered; a pure
+     * software interrupt must present the guest-written IP0/IP1 bits
+     * unmodified (the guest's dispatcher discriminates stages by exactly
+     * these bits — see sw_pending rationale at the top of this function). */
     cpu->cop0[COP0_CAUSE] = (cpu->cop0[COP0_CAUSE] & ~0x7C) | (0 << 2);
-    cpu->cop0[COP0_CAUSE] |= (1 << 10);
+    if (hw_deliverable)
+        cpu->cop0[COP0_CAUSE] |= (1 << 10);
 
     /* Push SR exception stack: shift bits [5:0] left by 2. */
     cpu->cop0[COP0_SR] = (sr & ~0x3F) | ((sr & 0x0F) << 2);
@@ -1211,6 +1295,15 @@ void psx_check_interrupts(CPUState* cpu) {
      * ("execution completed" abnormal exit). */
     int saved_dispatch_depth = g_psx_dispatch_depth;
     g_psx_dispatch_depth = 0;
+    /* Nested delivery clobber guard: exception_jmpbuf is a single global, so a
+     * nested exception's setjmp overwrites the OUTER frame's context. The outer
+     * handler's later RFE would then longjmp into the dead inner frame (host
+     * stack corruption — first hit by Jackie Chan Stuntmaster's software-
+     * interrupt dispatcher, which nests by design). Save the armed frame here
+     * and restore it in the epilogue so each nesting level's RFE lands in its
+     * own live frame. */
+    jmp_buf saved_exception_jmpbuf;
+    memcpy(&saved_exception_jmpbuf, &exception_jmpbuf, sizeof(jmp_buf));
     g_exc_setjmp_epoch++;   /* new setjmp frame armed (see decl above) */
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
@@ -1240,6 +1333,10 @@ void psx_check_interrupts(CPUState* cpu) {
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
     g_dirty_interp_active = prev_interp_active;
+    /* Re-arm the OUTER frame's jmpbuf (see save at entry): after a nested
+     * delivery returns, the outer handler is live again and its RFE must land
+     * in the outer setjmp frame, not this exited one. */
+    memcpy(&exception_jmpbuf, &saved_exception_jmpbuf, sizeof(jmp_buf));
     /* Ape memcard fix #3: restore the resume-PC latch cleared at handler entry
      * (see above). Sits with the other post-dispatch-loop restores so an
      * RFE/RestoreState longjmp — which lands in the setjmp loop above — can't
@@ -1534,7 +1631,7 @@ void psx_check_interrupts(CPUState* cpu) {
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     uint32_t prev = s_compiled_interrupt_resume_pc;
     s_compiled_interrupt_resume_pc = resume_pc;
-    psx_check_interrupts(cpu);
+    psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
     s_compiled_interrupt_resume_pc = prev;
 }
 

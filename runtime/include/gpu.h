@@ -32,9 +32,21 @@ typedef struct {
 } GpuDisplayInfo;
 
 void gpu_get_display_info(GpuDisplayInfo* out);
+/* GP1(08h) bit4 — 24-bit display. Renderers skip FBO upload queues while set:
+ * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
+ * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
+int  gpu_display_is_depth24(void);
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b);
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y);
+/* Depth24: RGB columns covered by CPU→VRAM uploads since the last reset.
+ * Returns crtc_w when unknown / full coverage. Present uses this to blank a
+ * trailing margin without shrinking the CRTC-derived width globally. */
+uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w);
+void     gpu_depth24_upload_span_reset(void);
+/* GP1(06h)/GP1(07h)/GP1(08h) fields for debug (gpu_state). */
+void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
+                        uint32_t *hres1_out, uint32_t *hres2_out);
 uint64_t gpu_get_gp0_count(void);  /* Total GP0 writes since init */
 void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw, uint64_t* env, uint64_t* copy);
 
@@ -147,6 +159,8 @@ void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
 void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
+void gpu_ws_set_plane_nx_sites(const uint32_t *sites, int nsites);
+void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
 int  psx_ws_is_cull_negsub_site(uint32_t pc);
@@ -154,6 +168,10 @@ int  psx_ws_is_cull_vxrange_site(uint32_t pc);
 int  psx_ws_is_cull_depth_site(uint32_t pc);
 int32_t psx_ws_depth_bound(int32_t imm);
 int  psx_ws_is_cull_range_site(uint32_t pc);
+int  psx_ws_is_cull_plane_nx_site(uint32_t pc);
+int32_t  psx_ws_plane_nx(int32_t nx);
+int  psx_ws_is_cull_xclip_load_site(uint32_t pc);
+uint32_t psx_ws_xclip_bound(uint32_t vanilla);
 /* Scale a signed Q16 horizontal gameplay limit into the active native-wide
  * game field. Identity at 4:3 / menus / FMV. */
 int32_t psx_ws_player_x_bound(int32_t vanilla);

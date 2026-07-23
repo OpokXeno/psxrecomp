@@ -202,6 +202,24 @@ depth_sites = ["0x80012340"]
               std::vector<uint32_t>{0x80012340u},
           "parser preserves depth-bound sites");
 
+    const auto plane_nx = write_config(root, "plane-nx", R"toml(
+[widescreen.cull]
+plane_nx_sites = ["0x80012340"]
+)toml");
+    const auto plane_nx_config = PSXRecompV4::load_game_config(plane_nx);
+    check(plane_nx_config.ws_cull_plane_nx_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves side-plane nx load sites");
+
+    const auto xclip_load = write_config(root, "xclip-load", R"toml(
+[widescreen.cull]
+xclip_load_sites = ["0x80012340"]
+)toml");
+    const auto xclip_load_config = PSXRecompV4::load_game_config(xclip_load);
+    check(xclip_load_config.ws_cull_xclip_load_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves per-prim bound-load sites");
+
     const auto range = write_config(root, "range-cull", R"toml(
 [widescreen.cull]
 range_sites = ["0x80012340"]
@@ -339,6 +357,31 @@ void codegen_tests() {
         0x2C8201C1u, {}, false, range_config); // sltiu v0,a0,0x1c1
     check(range.find("2*psx_ws_x_margin()") != std::string::npos,
           "native range emit widens by both horizontal margins");
+
+    PSXRecomp::CodeGenConfig plane_nx_config;
+    plane_nx_config.ws_cull_plane_nx_sites.insert(0x80010000u);
+    const std::string plane_nx = generate_first_instruction(
+        0x8C84C828u, {}, false, plane_nx_config); // lw a0,-0x37d8(a0)
+    check(plane_nx.find("psx_ws_plane_nx((int32_t)psx_cyc_load_word") !=
+              std::string::npos,
+          "codegen routes side-plane nx loads through shared helper");
+
+    const std::string plane_nx_overlay_mismatch = generate_first_instruction(
+        0x9484C828u, {}, true, plane_nx_config); // lhu a0,-0x37d8(a0)
+    check(plane_nx_overlay_mismatch.find("ws cull plane nx") == std::string::npos,
+          "overlay nonmatching plane-nx variant remains unchanged");
+
+    PSXRecomp::CodeGenConfig xclip_config;
+    xclip_config.ws_cull_xclip_load_sites.insert(0x80010000u);
+    const std::string xclip = generate_first_instruction(
+        0x8C6200F8u, {}, false, xclip_config); // lw v0,0xf8(v1)
+    check(xclip.find("psx_ws_xclip_bound(psx_cyc_load_word") != std::string::npos,
+          "codegen routes per-prim bound loads through shared helper");
+
+    const std::string xclip_overlay_mismatch = generate_first_instruction(
+        0x246200F8u, {}, true, xclip_config); // addiu v0,v1,0xf8
+    check(xclip_overlay_mismatch.find("ws cull xclip") == std::string::npos,
+          "overlay nonmatching xclip variant remains unchanged");
 }
 
 void gte_codegen_classification_tests() {

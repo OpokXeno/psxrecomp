@@ -61,6 +61,10 @@ struct CodeGenConfig {
     // See docs/DATA_SHARDS.md. Empty = no hooks (default).
     std::set<uint32_t> data_shard_funcs;
 
+    // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
+    // addresses (MotK VLC leaves, etc.). Host locality hint only.
+    std::set<uint32_t> hot_funcs;
+
     // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
     // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
     // guest RAM VBlank counter returned by that query path.  Empty = inert.
@@ -109,6 +113,16 @@ struct CodeGenConfig {
     // depth_sites). Configured slti/sltiu instructions route through the
     // runtime helper; empty by default.
     std::set<uint32_t> ws_cull_depth_sites;
+
+    // Side frustum-plane normal-X load sites ([widescreen.cull]
+    // plane_nx_sites). The configured lw routes through the runtime helper
+    // (inverse-aspect scale while revealed, identity at 4:3).
+    std::set<uint32_t> ws_cull_plane_nx_sites;
+
+    // Per-primitive X-reject bound load sites ([widescreen.cull]
+    // xclip_load_sites). The configured lw routes through the runtime helper
+    // (INT32_MAX while revealed, vanilla at 4:3); empty by default.
+    std::set<uint32_t> ws_cull_xclip_load_sites;
 
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the

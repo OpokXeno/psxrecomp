@@ -230,11 +230,15 @@ struct RuntimeConfig {
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
 
-    // renderer: "software" | "opengl" (default). Selects the rasterizer/present
-    // backend. The OpenGL backend is a hardware-accelerated alternative; the
-    // software rasterizer remains the explicit fallback. Stored as
-    // VIDEO_RENDERER_*.
+    // renderer: "software" | "opengl" (default) | "vulkan". Selects the
+    // rasterizer/present backend. The software rasterizer remains the explicit
+    // fallback. Stored as VIDEO_RENDERER_*.
     int                   video_renderer = DEFAULT_VIDEO_RENDERER;
+
+    // offer_vulkan: expose the experimental Vulkan renderer in the launcher.
+    // Defaults false even for Vulkan-enabled builds; developers must opt in per
+    // game once visuals are validated.
+    bool                  video_offer_vulkan = false;
 
     // low_latency_input: re-sample the pad after the wall-clock pacer (just
     // before present) so the next CPU frame reads near-fresh input instead of
@@ -484,6 +488,10 @@ struct GameConfig {
     // out to be impure only costs a poisoned capture, never a wrong replay.
     std::vector<uint32_t> data_shard_funcs;
 
+    // [recompiler] hot_funcs: guest addresses that get __attribute__((hot))
+    // on their generated C bodies (profile/host locality; no guest semantics).
+    std::vector<uint32_t> hot_funcs;
+
     // [load_accel.vsync_query] opt-in for a byte-verified PsyQ VSync(mode)
     // implementation.  mode=-1 returns vsync_counter_addr while bypassing two
     // unused MMIO reads; every other mode executes the original function.
@@ -499,6 +507,9 @@ struct GameConfig {
     // Separately togglable second tier for additional verified loops, allowing
     // per-feature A/B without disabling the accepted base site set.
     std::vector<uint32_t> vsync_event_horizon_extra_sites;
+    // When true, any VSync(-1) may event-horizon while CD load/read is busy
+    // (not only listed return PCs). For titles whose FMV polls many sites.
+    bool                  vsync_event_horizon_any = false;
 
     // Cull-margin widening. The game's per-object draw classifier compares
     // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
@@ -532,6 +543,18 @@ struct GameConfig {
     // Aspect-scaled slti/sltiu far-bound sites. Empty by default; use only for
     // pure visibility gates. Configured sites require regenerated native code.
     std::vector<uint32_t> ws_cull_depth_sites;
+    // `lw rt,off(rs)` sites loading the X component of a side frustum-plane
+    // normal feeding a sign test (dot = nx*px + nz*pz). Scaled by the inverse
+    // aspect factor (4*den)/(3*num) while revealed, which widens the plane
+    // cone by exactly atan((3*num)/(4*den)*tan(theta)); identity at 4:3.
+    std::vector<uint32_t> ws_cull_plane_nx_sites;
+
+    // `lw rt,off(rs)` sites loading a per-primitive X-reject bound that is
+    // compared (sltu) against ANDI-masked u16 screen X. While the margins are
+    // revealed the load yields INT32_MAX (reject disabled; the wide-surface
+    // scissor clips the overflow and wrapped off-left coords pass); the
+    // vanilla loaded value at 4:3. Empty by default; regen required.
+    std::vector<uint32_t> ws_cull_xclip_load_sites;
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 
@@ -675,6 +698,7 @@ struct GameConfig {
     // 16:9 in settings.toml can never engage the hack. Runtime-only (read at
     // startup; no codegen impact) — no regen required.
     bool ws_offered = true;
+    bool vulkan_offered = false;
 
     // [widescreen] offer_ultrawide — expose a separate experimental 21:9
     // launcher choice for titles that have explicitly tested it. Default off;
@@ -780,6 +804,10 @@ struct UserSettings {
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
     bool has_skip_launcher  = false; bool skip_launcher  = false;
+    // [netplay] — display name for lobby browser / room. Prompted once on first
+    // Netplay Lobbies visit; Change Player Name updates it.
+    bool has_netplay_player_name = false; std::string netplay_player_name;
+    bool has_netplay_lobby_url = false; std::string netplay_lobby_url;
     bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
                                      int  aspect_den     = 3; // (4:3 = native)
     // [audio]

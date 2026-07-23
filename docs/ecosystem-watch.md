@@ -76,10 +76,9 @@ and Crash Bash diagnostics.
 
 ### Keep under review
 
-- The self-contained stb launcher removes RmlUi and adds persisted UI scaling.
-  It remains blocked by the missing GL loader and visual/layout review, as the PR
-  itself records. Continue on the existing branch only after those prerequisites
-  are explicit; do not use its runtime changes to justify merging the launcher.
+- The older in-tree launcher replacement remains blocked by missing GL loader
+  and visual/layout review prerequisites. Do not use its runtime changes to
+  justify merging launcher code.
 - `a39ab37` contains Linux shared-library overlay discovery, ABI preflight, and
   cache loading work. Re-derive the smallest useful parts on top of master's
   newer exact overlay dispatch (`b39387e`) and test save/load plus stale-cache
@@ -175,6 +174,14 @@ BIOS-only framework link is reported failing.
   presentation work may be useful after the known AMD corruption is resolved.
   Keep performance/synchronization fixes separate from CRT shaders and debug
   environment flags.
+
+### Follow-up credit
+
+PR #61 reconstructed the reusable Vulkan synchronization, staging-buffer,
+command batching, present-mode, and timing work from Martin Penkava's PR #16
+branch onto current master while leaving Vulkan experimental and hidden by
+default. Martin Penkava (`shaneomac1337`) is the source developer for that
+Vulkan work.
 
 ### Reject or relocate
 

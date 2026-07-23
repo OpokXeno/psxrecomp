@@ -245,19 +245,20 @@ static int ws_2d_only_scene(void) {
     return (uint32_t)s_frame_count - ws_sust_ovh_stamp > WS_2D_SCENE_HYSTERESIS;
 }
 
+static uint32_t s_ws_fmv_frame_cache = 0xFFFFFFFFu;
+static int      s_ws_fmv_cached = 0;
+
 int gpu_ws_present_native_43(void) {
     if (!ws_engaged()) return 0;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
     if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
-    static uint32_t fmv_frame_cache = 0xFFFFFFFFu;
-    static int      fmv_cached = 0;
     uint32_t f = (uint32_t)s_frame_count;
-    if (f != fmv_frame_cache) {
-        fmv_frame_cache = f;
+    if (f != s_ws_fmv_frame_cache) {
+        s_ws_fmv_frame_cache = f;
         GpuDisplayInfo di; gpu_get_display_info(&di);
-        fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
+        s_ws_fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
     }
-    return fmv_cached;
+    return s_ws_fmv_cached;
 }
 
 /* Squash applies only when configured AND the frame is being stretched. */
@@ -389,6 +390,53 @@ int32_t psx_ws_depth_bound(int32_t imm) {
 }
 int psx_ws_is_cull_range_site(uint32_t pc) {
     return ws_explicit_site(ws_explicit_range_sites, ws_explicit_range_n, pc);
+}
+static uint32_t ws_explicit_plane_nx_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_plane_nx_n = 0;
+void gpu_ws_set_plane_nx_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_plane_nx_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_plane_nx_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_plane_nx_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_plane_nx_sites, ws_explicit_plane_nx_n, pc);
+}
+/* Side frustum-plane normal-X scale ([widescreen.cull] plane_nx_sites). The
+ * plane half-angle goes as atan(nz/nx), so widening the cone by the aspect
+ * ratio means scaling nx by the INVERSE factor (4*den)/(3*num):
+ * atan(nz/(nx*4*den/(3*num))) == atan((3*num)/(4*den)*tan(theta)). Identity
+ * at 4:3 (margin 0). */
+int32_t psx_ws_plane_nx(int32_t nx) {
+    if (psx_ws_x_margin() <= 0) return nx;
+    int64_t numerator = (int64_t)nx * 4 * ws_cfg_den;
+    int64_t denominator = 3 * ws_cfg_num;
+    if (denominator <= 0) return nx;
+    int64_t result = numerator >= 0
+        ? (numerator + denominator / 2) / denominator
+        : -((-numerator + denominator / 2) / denominator);
+    return (int32_t)result;
+}
+
+static uint32_t ws_explicit_xclip_load_sites[WS_EXPLICIT_CULL_SITES_MAX];
+static int ws_explicit_xclip_load_n = 0;
+void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites) {
+    if (nsites < 0) nsites = 0;
+    if (nsites > WS_EXPLICIT_CULL_SITES_MAX) nsites = WS_EXPLICIT_CULL_SITES_MAX;
+    ws_explicit_xclip_load_n = nsites;
+    for (int i = 0; i < nsites; i++)
+        ws_explicit_xclip_load_sites[i] = sites[i] & 0x1FFFFFFFu;
+}
+int psx_ws_is_cull_xclip_load_site(uint32_t pc) {
+    return ws_explicit_site(ws_explicit_xclip_load_sites, ws_explicit_xclip_load_n, pc);
+}
+/* Per-primitive X-reject bound ([widescreen.cull] xclip_load_sites). While
+ * the margins are revealed the reject is disabled (INT32_MAX passes every
+ * ANDI-masked u16 screen X, including wrapped off-left coords at 655xx); the
+ * wide-surface scissor clips the overflow. Vanilla loaded value at 4:3. */
+uint32_t psx_ws_xclip_bound(uint32_t vanilla) {
+    return psx_ws_x_margin() > 0 ? 0x7FFFFFFFu : vanilla;
 }
 
 int psx_ws_x_margin(void) {
@@ -1604,6 +1652,11 @@ static uint32_t vram_write_remaining;          /* words remaining */
  * until this payload is complete. Maximum PS1 transfer = full VRAM (1 MiB). */
 static uint16_t vram_write_pixels[1024 * 512];
 
+/* Depth24 CPU→VRAM upload span (halfwords, exclusive end). See
+ * gpu_depth24_rgb_limit — declared early so gpu_reset_state can clear it. */
+static uint32_t s_d24_upload_x1 = 0;
+static void depth24_note_upload(uint32_t x, uint32_t w);
+
 static void gp0_commit_cpu_to_vram(void) {
     for (uint32_t row = 0; row < vram_write_h; row++)
         for (uint32_t col = 0; col < vram_write_w; col++)
@@ -1612,6 +1665,7 @@ static void gp0_commit_cpu_to_vram(void) {
                      ((vram_write_x + col) & 1023u)];
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
+    depth24_note_upload(vram_write_x, vram_write_w);
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
@@ -1835,6 +1889,9 @@ static void gpu_reset_state(int clear_vram) {
 
     gpuread_latch = 0;
     gpustat_poll_count = 0;
+    s_ws_fmv_frame_cache = 0xFFFFFFFFu;
+    s_ws_fmv_cached = 0;
+    s_d24_upload_x1 = 0;
 }
 
 void gpu_init(void) {
@@ -2011,6 +2068,31 @@ static uint8_t gpu_vram_byte(uint32_t byte_x, uint32_t y) {
     return (byte_x & 1u) ? (uint8_t)(hw >> 8) : (uint8_t)hw;
 }
 
+/* Depth24: note/query/reset the CPU→VRAM upload span tracked above. Used to
+ * hide trailing RGB columns when a movie blit doesn't fill the full CRTC
+ * width — MotK's Star Wars crawl leaves ~8px of stale VRAM on the right. */
+static void depth24_note_upload(uint32_t x, uint32_t w) {
+    if (!(display_depth & 1u) || w == 0u) return;
+    uint32_t x1 = x + w;
+    if (x1 > 1024u) x1 = 1024u;
+    if (x1 > s_d24_upload_x1) s_d24_upload_x1 = x1;
+}
+
+uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w) {
+    if (!(display_depth & 1u) || s_d24_upload_x1 == 0u || crtc_w == 0u)
+        return crtc_w;
+    uint32_t dx = display_x & 1023u;
+    if (s_d24_upload_x1 <= dx) return crtc_w;
+    uint32_t hw = s_d24_upload_x1 - dx;
+    uint32_t rgb = (hw * 2u) / 3u;
+    if (rgb == 0u || rgb >= crtc_w) return crtc_w;
+    return rgb;
+}
+
+void gpu_depth24_upload_span_reset(void) {
+    s_d24_upload_x1 = 0;
+}
+
 /* ---- Present-time screen-colour LUT (verified-enhancement, opt-in) -------
  *
  * PRESENT-TIME ONLY. This sits on the 15-bit-scanout -> RGB888 conversion that
@@ -2077,6 +2159,13 @@ void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
     if (di->depth24) {
         uint32_t byte_x = ((di->display_x & 1023u) * 2u) + x * 3u;
         uint32_t vy = (di->display_y + y) & 511u;
+        /* No horizontal wrap for 24-bit DAC scanout: bytes past the 2048-byte
+         * VRAM row are blank on hardware / accurate emulators, not sheared
+         * from X=0. Wrapping here produced a flickering right-edge strip. */
+        if (byte_x + 2u >= 2048u) {
+            *r = *g = *b = 0;
+            return;
+        }
         *r = gpu_vram_byte(byte_x + 0u, vy);
         *g = gpu_vram_byte(byte_x + 1u, vy);
         *b = gpu_vram_byte(byte_x + 2u, vy);
@@ -2094,29 +2183,47 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
     return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
+int gpu_display_is_depth24(void) {
+    return (int)(display_depth & 1u);
+}
+
 void gpu_get_display_info(GpuDisplayInfo* out) {
     out->display_x = display_area_x;
     out->display_y = display_area_y;
     out->depth24   = (int)(display_depth & 1u);
     out->disabled  = (int)display_disabled;
 
-    /* Derive pixel width from horizontal display range and resolution mode.
-     * The BIOS typically sets 256x240 or 320x240 NTSC. */
-    uint32_t dots = (h_display_x2 > h_display_x1) ? (h_display_x2 - h_display_x1) : 0;
-
-    /* Horizontal resolution in pixels depends on hres1/hres2 bits.
-     * Common: hres1=0 → 256, hres1=1 → 320, hres1=2 → 512, hres1=3 → 640
-     *         hres2=1 → 368 */
-    uint32_t w;
+    /* Dot-clock divider from GP1(08h) hres (psx-spx / DuckStation). */
+    uint32_t cycles;
+    uint32_t mode_w;
     if (hres2) {
-        w = 368;
+        cycles = 7;
+        mode_w = 368;
     } else {
+        static const uint32_t cyc_lut[4] = { 10, 8, 5, 4 };
         static const uint32_t hres_lut[4] = { 256, 320, 512, 640 };
-        w = hres_lut[hres1 & 3];
+        cycles = cyc_lut[hres1 & 3];
+        mode_w = hres_lut[hres1 & 3];
+    }
+
+    /* Visible pixel width from GP1(06h): (((X2-X1)/cycles)+2) & ~3 (psx-spx).
+     * Fall back to the mode width when the range is unset/degenerate. */
+    uint32_t dots = (h_display_x2 > h_display_x1) ? (h_display_x2 - h_display_x1) : 0;
+    uint32_t w = mode_w;
+    if (dots > 0u && cycles > 0u) {
+        w = ((dots / cycles) + 2u) & ~3u;
+        if (w == 0u) w = 4u;
     }
 
     uint32_t h = (v_display_y2 > v_display_y1) ? (v_display_y2 - v_display_y1) : 240;
     if (vres) h *= 2; /* 480i */
+
+    /* 24-bit scanout uses the same CRTC pixel width as 15-bit (DuckStation /
+     * Beetle: coordinates stay 16-bit-based; W RGB occupies W*3/2 halfwords).
+     * MotK FMV: GP1(06h) yields 512; the logo is centered in that RGB line.
+     * A blanket (W*2)/3 (512→341) left-shifts the frame and clips the right
+     * of the video — do not reintroduce it. Right-edge junk is a separate
+     * present/filter issue, not a reason to shrink CRTC width. */
 
     /* Clamp to sane maximums */
     if (w > 640) w = 640;
@@ -2124,6 +2231,17 @@ void gpu_get_display_info(GpuDisplayInfo* out) {
 
     out->width  = w;
     out->height = h;
+}
+
+/* Debug accessors for GP1 display-range / mode (TCP gpu_state). */
+void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
+                        uint32_t *hres1_out, uint32_t *hres2_out) {
+    if (x1) *x1 = h_display_x1;
+    if (x2) *x2 = h_display_x2;
+    if (y1) *y1 = v_display_y1;
+    if (y2) *y2 = v_display_y2;
+    if (hres1_out) *hres1_out = hres1;
+    if (hres2_out) *hres2_out = hres2;
 }
 
 void gpu_set_vblank_callback(gpu_vblank_cb cb) {
@@ -2224,6 +2342,39 @@ static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
     vram[idx] = color | (set_mask_bit ? 0x8000u : 0u);
 }
 
+/* Inclusive draw-area reject (same predicate as raster_pixel / hardware clip).
+ *
+ * MotK inter-movie / title / char-select OT drains often set GP0(E3/E4) to
+ * (0,0)-(0,0) then submit thousands of 1x1 dots and shaded quads. Real GPU
+ * clips those for free; our GL path was building two triangles per clipped
+ * prim (gpu_share ~0.9, host FPS ~5–10). Skip the host rasterizer when the
+ * post-offset bbox cannot touch the draw area. Side effects that must still
+ * run (texpage latch, oversize reject) happen before these checks. */
+static inline int draw_area_out_point(int32_t x, int32_t y) {
+    return x < (int32_t)draw_area_left || x > (int32_t)draw_area_right
+        || y < (int32_t)draw_area_top  || y > (int32_t)draw_area_bottom;
+}
+
+static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n) {
+    int32_t minx = vx[0], maxx = vx[0], miny = vy[0], maxy = vy[0];
+    for (int i = 1; i < n; i++) {
+        if (vx[i] < minx) minx = vx[i];
+        if (vx[i] > maxx) maxx = vx[i];
+        if (vy[i] < miny) miny = vy[i];
+        if (vy[i] > maxy) maxy = vy[i];
+    }
+    return maxx < (int32_t)draw_area_left || minx > (int32_t)draw_area_right
+        || maxy < (int32_t)draw_area_top  || miny > (int32_t)draw_area_bottom;
+}
+
+static inline int draw_area_out_rect(int32_t x, int32_t y, int w, int h) {
+    if (w <= 0 || h <= 0) return 1;
+    return (x + w - 1) < (int32_t)draw_area_left
+        || x > (int32_t)draw_area_right
+        || (y + h - 1) < (int32_t)draw_area_top
+        || y > (int32_t)draw_area_bottom;
+}
+
 /* Rasterize a flat-shaded triangle using DDA scanline fill.
  * Vertices are in screen coordinates (draw offset already applied). */
 static void raster_triangle(int32_t x0, int32_t y0,
@@ -2320,6 +2471,7 @@ static void gp0_exec_mono_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 3)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[2], gp0_cmd_buf[3],
                              vx, vy);
@@ -2364,6 +2516,7 @@ static void gp0_exec_mono_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 4)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     if (!rej_a) {
         int32_t tx[3] = { vx[0], vx[1], vx[2] };
@@ -2397,6 +2550,7 @@ static void gp0_exec_shaded_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 3)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
                              vx, vy);
@@ -2431,6 +2585,7 @@ static void gp0_exec_shaded_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 4)) return;
     /* Capture vertex data when armed. */
     if (sq_cap_armed && sq_cap_count < SQ_CAP_MAX) {
         GpuSqCapEntry* e = &sq_cap_buf[sq_cap_count++];
@@ -2521,6 +2676,7 @@ static void gp0_exec_textured_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 3)) return;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
     prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[3], gp0_cmd_buf[5],
@@ -2572,6 +2728,7 @@ static void gp0_exec_textured_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 4)) return;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
 
@@ -2654,6 +2811,7 @@ static void gp0_exec_shaded_textured_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 3)) return;
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(gp0_cmd_buf[1], gp0_cmd_buf[4], gp0_cmd_buf[7],
@@ -2700,6 +2858,7 @@ static void gp0_exec_shaded_textured_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
+    if (draw_area_out_bbox(vx, vy, 4)) return;
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     if (!rej_a) {
@@ -2739,6 +2898,10 @@ static void gp0_exec_mono_line(void) {
     x0 = vx[0]; x1 = vx[1];
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
+    {
+        int32_t lx[2] = { x0, x1 }, ly[2] = { y0, y1 };
+        if (draw_area_out_bbox(lx, ly, 2)) return;
+    }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_line(x0, y0, x1, y1, color);
 }
@@ -2757,6 +2920,10 @@ static void gp0_exec_shaded_line(void) {
     x0 = vx[0]; x1 = vx[1];
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
+    {
+        int32_t lx[2] = { x0, x1 }, ly[2] = { y0, y1 };
+        if (draw_area_out_bbox(lx, ly, 2)) return;
+    }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_shaded_line(x0, y0, c0, x1, y1, c1);
 }
@@ -2774,6 +2941,7 @@ static void gp0_exec_mono_rect(void) {
     ws_expand_fullscreen_rect(&x0, y0, &w, h);
     x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
+    if (draw_area_out_rect(x0, y0, w, h)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, w, h, color);
 }
@@ -2812,6 +2980,10 @@ static void gp0_exec_textured_rect(void) {
     x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
 
     x0 += draw_offset_x; y0 += draw_offset_y;
+    {
+        int dw = (ws_w && ws_w != w) ? ws_w : w;
+        if (draw_area_out_rect(x0, y0, dw, h)) return;
+    }
     setup_textured_draw(color24, semi_trans, raw_texture);
     if (ws_w && ws_w != w)
         gr_draw_textured_rect_scaled(x0, y0, ws_w, h, u0, v0, u0 + w, v0 + h,
@@ -2828,6 +3000,7 @@ static void gp0_exec_mono_dot(void) {
     parse_vertex(gp0_cmd_buf[1], &x, &y);
     x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
+    if (draw_area_out_point(x, y)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x, y, 1, 1, color);
 }
@@ -2842,6 +3015,10 @@ static void gp0_exec_textured_8x8(void) {
     int ws_w = ws_sprt_fixed_transform(&x0, 8);
     x0 += ws_nw_hud_shift(x0, 8);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
+    {
+        int dw = (ws_w && ws_w != 8) ? ws_w : 8;
+        if (draw_area_out_rect(x0, y0, dw, 8)) return;
+    }
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
@@ -2864,6 +3041,7 @@ static void gp0_exec_mono_8x8(void) {
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += ws_nw_hud_shift(x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
+    if (draw_area_out_rect(x0, y0, 8, 8)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, 8, 8, color);
 }
@@ -2892,6 +3070,10 @@ static void gp0_exec_textured_16x16(void) {
         gpu_ws_mmx6_bg_record(gp0_cmd_source_addr, clut, current_texpage(),
                               color24, (int)semi_transparency, raw_texture);
 
+    {
+        int dw = (ws_w && ws_w != 16) ? ws_w : 16;
+        if (draw_area_out_rect(x0, y0, dw, 16)) return;
+    }
     setup_textured_draw(color24, semi_trans, raw_texture);
     if (ws_w && ws_w != 16)
         gr_draw_textured_rect_scaled(x0, y0, ws_w, 16, u0, v0, u0 + 16, v0 + 16,
@@ -4134,26 +4316,84 @@ void gpu_write_gp1(uint32_t val) {
     X(vram_write_col) X(vram_write_row) X(vram_write_remaining) \
     X(vram_read_active) X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h) \
     X(vram_read_col) X(vram_read_row)
-uint32_t gpu_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    GPU_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void gpu_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    GPU_SNAP_FIELDS(X)
-#undef X
+#include "pst_wire.h"
+
+/* GPU snap fields are scalars / u32 arrays — emit as LE u32/i32 (no struct pad). */
+static int gpu_snap_emit(PstW *w) {
+#define WU(f) do { if (!pst_w_u32(w, (uint32_t)(f))) return 0; } while (0)
+#define WI(f) do { if (!pst_w_i32(w, (int32_t)(f))) return 0; } while (0)
+#define WH(f) do { if (!pst_w_u16(w, (uint16_t)(f))) return 0; } while (0)
+    WU(texpage_x); WU(texpage_y); WU(semi_transparency); WU(texpage_colors);
+    WU(dither_enabled); WU(draw_to_display); WU(texture_disable); WU(texture_window_value);
+    WU(set_mask_bit); WU(check_mask_bit);
+    WU(interlace_field); WU(reverse_flag);
+    WU(draw_area_left); WU(draw_area_top); WU(draw_area_right); WU(draw_area_bottom);
+    WI(draw_offset_x); WI(draw_offset_y);
+    WU(hres1); WU(hres2); WU(vres); WU(video_mode); WU(display_depth); WU(vertical_interlace);
+    WU(display_disabled); WU(irq1_flag); WU(dma_direction); WU(lcf);
+    WU(display_area_x); WU(display_area_y);
+    WU(h_display_x1); WU(h_display_x2); WU(v_display_y1); WU(v_display_y2);
+    WU(gpuread_latch);
+    WU((uint32_t)gp0_state);
+    for (int i = 0; i < 16; i++) WU(gp0_cmd_buf[i]);
+    WI(gp0_words_collected); WI(gp0_words_needed);
+    WU(gp0_next_source_addr); WU(gp0_cmd_source_addr);
+    WH(polyline_color); WI(polyline_prev_x); WI(polyline_prev_y); WH(polyline_prev_c);
+    WI(polyline_semi_trans); WI(polyline_has_prev);
+    WH(vram_write_x); WH(vram_write_y); WH(vram_write_w); WH(vram_write_h);
+    WH(vram_write_col); WH(vram_write_row); WU(vram_write_remaining);
+    WI(vram_read_active); WH(vram_read_x); WH(vram_read_y); WH(vram_read_w); WH(vram_read_h);
+    WH(vram_read_col); WH(vram_read_row);
+#undef WU
+#undef WI
+#undef WH
+    return 1;
 }
-uint32_t gpu_cosim_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    GPU_COSIM_SNAP_FIELDS(X)
-#undef X
-    return n; }
-void gpu_cosim_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
-    GPU_COSIM_SNAP_FIELDS(X)
-#undef X
+static int gpu_snap_parse(PstR *r) {
+    uint32_t u; int32_t i; uint16_t h;
+#define RU(f) do { if (!pst_r_u32(r, &u)) return 0; (f) = u; } while (0)
+#define RI(f) do { if (!pst_r_i32(r, &i)) return 0; (f) = i; } while (0)
+#define RH(f) do { if (!pst_r_u16(r, &h)) return 0; (f) = h; } while (0)
+    RU(texpage_x); RU(texpage_y); RU(semi_transparency); RU(texpage_colors);
+    RU(dither_enabled); RU(draw_to_display); RU(texture_disable); RU(texture_window_value);
+    RU(set_mask_bit); RU(check_mask_bit);
+    RU(interlace_field); RU(reverse_flag);
+    RU(draw_area_left); RU(draw_area_top); RU(draw_area_right); RU(draw_area_bottom);
+    RI(draw_offset_x); RI(draw_offset_y);
+    RU(hres1); RU(hres2); RU(vres); RU(video_mode); RU(display_depth); RU(vertical_interlace);
+    RU(display_disabled); RU(irq1_flag); RU(dma_direction); RU(lcf);
+    RU(display_area_x); RU(display_area_y);
+    RU(h_display_x1); RU(h_display_x2); RU(v_display_y1); RU(v_display_y2);
+    RU(gpuread_latch);
+    if (!pst_r_u32(r, &u)) return 0;
+    gp0_state = (Gp0State)u;
+    for (int k = 0; k < 16; k++) RU(gp0_cmd_buf[k]);
+    RI(gp0_words_collected); RI(gp0_words_needed);
+    RU(gp0_next_source_addr); RU(gp0_cmd_source_addr);
+    RH(polyline_color); RI(polyline_prev_x); RI(polyline_prev_y); RH(polyline_prev_c);
+    RI(polyline_semi_trans); RI(polyline_has_prev);
+    RH(vram_write_x); RH(vram_write_y); RH(vram_write_w); RH(vram_write_h);
+    RH(vram_write_col); RH(vram_write_row); RU(vram_write_remaining);
+    RI(vram_read_active); RH(vram_read_x); RH(vram_read_y); RH(vram_read_w); RH(vram_read_h);
+    RH(vram_read_col); RH(vram_read_row);
+#undef RU
+#undef RI
+#undef RH
+    return 1;
 }
+
+uint32_t gpu_snapshot_bytes(void) {
+    PstW w; pst_w_init(&w, NULL, 0);
+    (void)gpu_snap_emit(&w);
+    return (uint32_t)w.written;
+}
+void gpu_snapshot_write(uint8_t *p) {
+    PstW w; uint32_t n = gpu_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    (void)gpu_snap_emit(&w);
+}
+uint32_t gpu_cosim_snapshot_bytes(void) { return gpu_snapshot_bytes(); }
+void gpu_cosim_snapshot_write(uint8_t *p) { gpu_snapshot_write(p); }
 void gpu_cosim_dump(char *out, int cap) {
     if (!out || cap <= 0) return;
     char *p = out;
@@ -4193,10 +4433,17 @@ void gpu_cosim_dump(char *out, int cap) {
     APPEND("%s", "\n");
 #undef APPEND
 }
-int gpu_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=gpu_snapshot_bytes()) return 0;
-#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
-    GPU_SNAP_FIELDS(X)
-#undef X
-    return 1; }
+int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (len != gpu_snapshot_bytes()) return 0;
+    pst_r_init(&r, p, len);
+    if (!gpu_snap_parse(&r)) return 0;
+    /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
+     * on a stale draw area after savestate load. */
+    gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
+                     (int)draw_area_right, (int)draw_area_bottom);
+    ws_nw_sync_target();
+    return 1;
+}
 uint16_t* gpu_get_vram_ptr(void){ return vram; }
 uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }

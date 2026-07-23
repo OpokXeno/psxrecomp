@@ -1745,7 +1745,15 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x23: { /* LW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
+        if (psx_ws_is_cull_plane_nx_site(pc))
+            /* Side-plane normal-X: inverse-aspect scale while revealed. */
+            cpu->gpr[rt] = (uint32_t)psx_ws_plane_nx(
+                (int32_t)psx_cyc_load_word(cpu, addr, rt, 1u << rs));
+        else if (psx_ws_is_cull_xclip_load_site(pc))
+            /* Per-prim X-reject bound: INT32_MAX while revealed (gpu.c). */
+            cpu->gpr[rt] = psx_ws_xclip_bound(psx_cyc_load_word(cpu, addr, rt, 1u << rs));
+        else
+            cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -1950,11 +1958,15 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
  * bit, COP0 IEc + IM2 set, and not already inside the exception handler. */
 static int precise_irq_deliverable(CPUState *cpu) {
     extern uint32_t i_stat;
-    if ((i_stat & i_mask) == 0) return 0;
-    if (psx_get_in_exception()) return 0;
     uint32_t sr = cpu->cop0[12];
+    /* COP0 software interrupts (CAUSE.IP0/IP1 & SR.IM0/IM1): guest-raised via
+     * mtc0 to CAUSE, independent of the INTC line (see psx_check_interrupts). */
+    uint32_t sw_pending = cpu->cop0[13] & sr & 0x0300u;
+    if ((i_stat & i_mask) == 0 && sw_pending == 0) return 0;
+    if (psx_get_in_exception()) return 0;
     if (!(sr & 0x1u))        return 0;   /* IEc: interrupts globally enabled */
-    if (!(sr & (1u << 10)))  return 0;   /* IM2: hardware interrupt mask bit */
+    /* INTC needs IM2; a pending software interrupt is deliverable without it. */
+    if (!(sr & (1u << 10)) && sw_pending == 0)  return 0;
     return 1;
 }
 
@@ -2146,28 +2158,27 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
     g_exec_phase = prev_phase;
 }
 
-/* Block-leader slice guard, called by the emitted prologue of every compiled
- * block BEFORE it charges cycles / runs its body:
- *     if (psx_slice_block(cpu, <block_addr>, <bcyc>, <side_effects>)) return;
+/* Precise-slice gate (PARKED default OFF). Hot callers use the cpu_state.h
+ * inline which returns 0 when this is 0 — no out-of-line call. Opt in with
+ * PSX_PRECISE_SLICE=1 (same binary A/B). */
+int g_psx_precise_slice = 0;
+
+void psx_precise_slice_init_from_env(void) {
+    const char *e = getenv("PSX_PRECISE_SLICE");
+    g_psx_precise_slice = (e && e[0] == '1') ? 1 : 0;
+}
+
+/* Block-leader slice guard impl. Emitted code calls the inline wrapper
+ * psx_slice_block(); overlay CPS callbacks point here directly.
  * Returns 1 if it sliced (ran the block — and possibly more — through the precise
  * interpreter and left cpu->pc at a dispatchable resume point; the caller MUST
  * `return` so its compiled body does not re-execute the same instructions).
  * Returns 0 if the whole block is provably safe to run as fast compiled C. */
-int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
-    /* Runtime A/B toggle (diagnostic, stays in the build): PSX_PRECISE_SLICE=0
-     * disables precise slicing entirely so the SAME binary can be run slice-on vs
-     * slice-off to isolate the first divergence the slice introduces. Read once. */
+int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
     /* PARKED (PRECISE_IRQ_SLICE.md): precise take-point slicing is a later
      * correctness upgrade, NOT the current FMV blocker (that is the -8 cycle
-     * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1).
-     * Default OFF so the runtime boots on the baseline; opt in with
-     * PSX_PRECISE_SLICE=1 to continue the block-leader-continuation work. */
-    static int s_slice_enabled = -1;
-    if (s_slice_enabled < 0) {
-        const char *e = getenv("PSX_PRECISE_SLICE");
-        s_slice_enabled = (e && e[0] == '1') ? 1 : 0;
-    }
-    if (!s_slice_enabled) return 0;
+     * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1). */
+    if (!g_psx_precise_slice) return 0;
 
     /* No nested slicing: a handler dispatched from inside precise-mode, and any
      * block executed while in_exception, run compiled (interrupts are gated during
@@ -2499,6 +2510,29 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         }
         g_dirty_ram_insns_run++;
         insns_executed++;
+        /* COP0 software-interrupt latency: an MTC0 to CAUSE or SR that makes a
+         * software interrupt deliverable (CAUSE.IP0/IP1 & SR.IM0/IM1 & IEc)
+         * must be taken IMMEDIATELY — real hardware vectors within the next
+         * instruction. Waiting for the next block boundary opens a window in
+         * which another hardware IRQ can re-enter the guest's (single-slot,
+         * legitimately non-reentrant) dispatcher and destroy its saved SR:
+         * Jackie Chan Stuntmaster's stage-1 handler does exactly
+         * `mtc0 CAUSE,0x100; mtc0 SR,0x101` and relies on the instant sw-int
+         * to reach its stage-2 before anything else runs. Same nested-delivery
+         * machinery as the entry poll above; EPC = the committed next pc. */
+        if ((insn & 0xFFE00000u) == 0x40800000u) { /* MTC0 */
+            uint32_t sw_rd = (insn >> 11) & 0x1Fu;
+            if ((sw_rd == 12u || sw_rd == 13u) &&
+                (cpu->cop0[13] & cpu->cop0[12] & 0x0300u) != 0u &&
+                (cpu->cop0[12] & 0x1u) != 0u) {
+                extern uint32_t g_dirty_safe_resume_pc;
+                uint32_t saved_resume = g_dirty_safe_resume_pc;
+                cpu->pc = next_pc ? next_pc : pc + 4u;
+                g_dirty_safe_resume_pc = cpu->pc;
+                psx_check_interrupts(cpu);
+                g_dirty_safe_resume_pc = saved_resume;
+            }
+        }
         if (transferred) {
             if (g_psx_call_bail) {
                 /* A bail unwind began inside a surfaced call: stop the interp
@@ -2581,6 +2615,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                         OV_FPLOG_RET1();
                     }
                 }
+#ifdef PSX_HAS_GAME_DISPATCH
+                /* A patched prologue can force entry through the interpreter,
+                 * while the remaining static ranges at a later continuation
+                 * are still safe to run as compiled code. */
+                if (clean_game_text_miss && interp_enter_compiled(cpu, target)) {
+                    g_dirty_ram_native_handoffs++;
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = cpu->pc;
+                    OV_FPLOG_RET1();
+                }
+#endif
                 /* Capture freeze gates ONLY the ring write — never flow. */
 #ifndef PSX_NO_DEBUG_TOOLS
                 if (!g_insn_log_frozen) {
@@ -2614,6 +2660,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             OV_FPLOG_RET1();
         }
         pc = next_pc;
+#ifdef PSX_HAS_GAME_DISPATCH
+        /* Guest call returns advance without transferred set. Re-check the
+         * resume PC so a patched entry can hand its unchanged tail back to
+         * compiled code without adding probes to ordinary dirty overlay runs. */
+        if (clean_game_text_miss && interp_enter_compiled(cpu, pc)) {
+            g_dirty_ram_native_handoffs++;
+            g_dirty_ram_blocks_run++;
+            if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = cpu->pc;
+            OV_FPLOG_RET1();
+        }
+#endif
         /* Straight-line flow reaching the dispatch return contract — exit
          * so the loop returns into the suspended native caller (same
          * hazard as a transfer to stop_addr). */

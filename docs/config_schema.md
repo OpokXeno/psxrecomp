@@ -186,6 +186,21 @@ turbo_audio_sink = true
 the guest SPU timeline advancing but discards accelerated samples before host
 playback, then fades normal output back in.
 
+## Video Block
+
+Runtime video defaults live in `[video]`:
+
+```toml
+[video]
+renderer = "opengl"       # "software", "opengl", or "vulkan"
+offer_vulkan = false      # show Vulkan in the launcher only after game validation
+```
+
+`renderer = "vulkan"` remains an experimental runtime choice and still requires
+a build compiled with Vulkan support. `offer_vulkan` controls launcher
+visibility only; it defaults to false so game projects must explicitly expose
+Vulkan after validating their visuals and stability.
+
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc
 - `default_game_root` — for sibling-junction setups

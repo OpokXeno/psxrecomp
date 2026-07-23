@@ -114,12 +114,16 @@ std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
 
 std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
                                                 const std::string& indent) const {
-    return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+    return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+           "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+           fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
 }
 
 std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_pc_expr,
                                                      const std::string& indent) const {
-    return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+    return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
+           "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
+           fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {
@@ -870,6 +874,54 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] depth site 0x{:08X} is not "
                        "slti/sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
+    // Side frustum-plane normal-X load: `lw rt,off(rs)` reads the nx of a
+    // plane sign-tested per corner (dot = nx*px + nz*pz). The helper scales
+    // nx by the inverse aspect factor (4*den)/(3*num) while revealed, which
+    // widens the cone by exactly atan((3*num)/(4*den)*tan(theta)); identity
+    // at 4:3.
+    if (config_.ws_cull_plane_nx_sites.count(addr)) {
+        if (opcode == 0x23) {  // lw
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t offset = get_imm16(instr);
+            std::string laddr = (offset == 0)
+                ? reg_name(rs)
+                : fmt::format("{} + {}", reg_name(rs), (int)offset);
+            uint32_t mask = 1u << rs;
+            return fmt::format("{} = (uint32_t)psx_ws_plane_nx((int32_t)psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                               "  /* ws cull plane nx load */{}",
+                               reg_name(rt), laddr, rt, mask, comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] plane_nx site 0x{:08X} is not "
+                       "lw (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        // Overlay variant at the same address: leave nonmatching code unchanged.
+    }
+
+    // Per-primitive X-reject bound load: `lw rt,off(rs)` reads the bound a
+    // masked-u16 screen X is sltu-compared against. While the margins are
+    // revealed the helper yields INT32_MAX (reject disabled; the wide-surface
+    // scissor clips the overflow); identity at 4:3.
+    if (config_.ws_cull_xclip_load_sites.count(addr)) {
+        if (opcode == 0x23) {  // lw
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t offset = get_imm16(instr);
+            std::string laddr = (offset == 0)
+                ? reg_name(rs)
+                : fmt::format("{} + {}", reg_name(rs), (int)offset);
+            uint32_t mask = 1u << rs;
+            return fmt::format("{} = psx_ws_xclip_bound(psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                               "  /* ws cull xclip bound load */{}",
+                               reg_name(rt), laddr, rt, mask, comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] xclip_load site 0x{:08X} is not "
+                       "lw (opcode 0x{:02X})\n", addr, opcode);
             std::exit(1);
         }
         // Overlay variant at the same address: leave nonmatching code unchanged.
@@ -1936,6 +1988,11 @@ std::string CodeGenerator::translate_basic_block(
                         // continuation; the callee's jr $ra publishes cpu->pc =
                         // $ra and the flat trampoline dispatches back into this
                         // function's entry-switch. No host nesting.
+                        // Only register a LOCAL switch case when the return PC
+                        // lives in this piece (has a block label). When the
+                        // delay/return was split out, successors is empty — the
+                        // mid-function pre-pass promotes addr+8 to its own
+                        // dispatch entry (do not emit goto block_<foreign>).
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
@@ -1980,8 +2037,8 @@ std::string CodeGenerator::translate_basic_block(
 
                     if (cps_enabled_) {
                         // The target and link were committed before the delay
-                        // slot above. Register the continuation and tail-transfer
-                        // using the latched target.
+                        // slot above. Register a local continuation only when
+                        // the return PC is in this piece (see jal).
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
@@ -2126,7 +2183,16 @@ GeneratedFunction CodeGenerator::generate_function(
 
     GeneratedFunction result;
     result.function_name = func.name;
-    result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+    {
+        std::string sig;
+        if (config_.hot_funcs.count(func.start_addr)) {
+            sig += "#if defined(__GNUC__) || defined(__clang__)\n"
+                   "__attribute__((hot))\n"
+                   "#endif\n";
+        }
+        sig += fmt::format("void {}(CPUState* cpu)", func.name);
+        result.signature = std::move(sig);
+    }
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
     // translate_instruction widens this function's width compares. Cleared for
@@ -2188,6 +2254,13 @@ GeneratedFunction CodeGenerator::generate_function(
 
     std::stringstream body_ss;
     body_ss << "{\n";
+    body_ss << "#if defined(PSX_ENABLE_BLOCK_CYCLES) && "
+               "(defined(__GNUC__) || defined(__clang__))\n"
+            << config_.indent
+            << "__attribute__((cleanup(psx_cyc_bb_defer_cleanup))) "
+               "int _psx_cyc_bb_guard = 1;\n"
+            << config_.indent << "psx_cyc_bb_defer_begin();\n"
+            << "#endif\n";
 
     // CPS entry-switch: when the unified flat trampoline dispatches a
     // continuation address (a callee published cpu->pc = $ra back to us), route
@@ -2717,8 +2790,10 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
 }
 
 void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
-    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    /* Release inlines debug_server_log_call_entry via debug_server.h
+     * (included from psx_runtime.h). Debug builds need the extern. */
     ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     ss << "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
     ss << "#endif\n";
     ss << "#ifdef PSX_COSIM\n";
@@ -2737,6 +2812,8 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
+    ss << "extern int32_t psx_ws_plane_nx(int32_t nx);                /* ws side-plane normal-X scale (gpu.c) */\n";
+    ss << "extern uint32_t psx_ws_xclip_bound(uint32_t vanilla);      /* ws per-prim X reject bound load (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";
@@ -2923,6 +3000,13 @@ std::string CodeGenerator::generate_file(
                         check_target(block.exit_instr.address + 8);
                     } else if (block.exit_instr.type == ControlFlowType::Jump) {
                         check_target(block.exit_instr.target);
+                    } else if (block.exit_instr.type == ControlFlowType::JumpLink ||
+                               block.exit_instr.type == ControlFlowType::JumpLinkReg) {
+                        // CPS jal/jalr publishes $ra = addr+8. When the delay slot
+                        // was split into another piece, that return PC is often a
+                        // mid-block address (not a function start / block leader) and
+                        // was never registered — MotK 0x8001E7F0 fell to dirty_ram.
+                        check_target(block.exit_instr.address + 8);
                     }
                 }
             };

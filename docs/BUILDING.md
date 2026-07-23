@@ -26,8 +26,6 @@ legally-obtained **disc image**. This project ships none of those.
 | Dependency | How it's provided | Used for |
 |---|---|---|
 | **SDL2** | System. Windows/MSVC: prebuilt pack auto-found at `../sdl2-msvc/SDL2-*`. Windows/MinGW + macOS + Linux: found via pkg-config. | Window, input, GL/Vulkan context, audio, threads |
-| **RmlUi** | **git submodule** `lib/RmlUi` (static) | The launcher UI |
-| **FreeType** | **git submodule** `lib/freetype` (static) | RmlUi's font engine |
 | **fmt** 9.1.0 | vendored `recompiler/lib/fmt` | String formatting (runtime uses it header-only) |
 | **toml11** | vendored `recompiler/lib/toml11` | Parsing `game.toml` / configs |
 | **ELFIO** | vendored `recompiler/lib/ELFIO` | ELF parsing (recompiler only) |
@@ -40,14 +38,12 @@ legally-obtained **disc image**. This project ships none of those.
 Developers building overlays locally just need `gcc` on `PATH` (the `gcc` tier);
 the bundled `tcc` matters only for end-user release packages.
 
-### Get the source (with submodules)
+### Get the source
 
-RmlUi and FreeType are submodules, so clone recursively (or init after the fact):
+This repository has no required git submodules:
 
 ```sh
-git clone --recurse-submodules https://github.com/mstan/psxrecomp.git
-# or, in an existing clone:
-git submodule update --init --recursive
+git clone https://github.com/mstan/psxrecomp.git
 ```
 
 ## Per-platform prerequisites
@@ -87,6 +83,18 @@ cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build runtime/build --target psx-runtime
 ```
 
+On Linux/macOS, `tools/setup_dev.sh` performs the same source-checkout setup:
+
+```sh
+sh tools/setup_dev.sh
+```
+
+It checks for the native toolchain and SDL2 development package, builds the CLI
+and recompiler tools, refreshes generated BIOS C when `bios/SCPH1001.BIN` is
+present, and builds the BIOS-only runtime when BIOS/generated sources are
+available. It does not create per-game runtime targets; use the CLI generator
+for game projects.
+
 On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generator
 (e.g. `-G "Unix Makefiles"`); everything else is identical.
 
@@ -102,7 +110,7 @@ On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generato
 |---|---|---|
 | `PSX_DEBUG_TOOLS` | ON for Debug/RelWithDebInfo, OFF for Release | TCP debug server + heartbeat + per-block recording |
 | `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL2 + libgcc/libstdc++) |
-| `PSX_LAUNCHER` | ON | Build the RmlUi launcher UI |
+| `PSX_LAUNCHER` | ON | Allow downstream game projects to wire recomp-ui launcher support |
 | `PSX_ENABLE_VULKAN` | OFF | Build the experimental Vulkan renderer |
 | `PSX_BUILD_COSIM` | OFF | Build the first-divergence co-sim oracle target |
 

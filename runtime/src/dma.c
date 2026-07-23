@@ -547,20 +547,43 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
         g_dma_cur_ch = 1; g_dma_cur_bcr = channels[1].bcr;
         g_dma_initiator_pc = s_dma_ch_initiator_pc[1];
     }
-    while (a->remaining_words > 0 && words_budget > 0) {
-        if (ch == 0) {
+    /* Contiguous +4 ch0 (RAM→MDEC): feed via LE burst helper. Guest halfwords
+     * + decode triggers match the per-word loop; wraps / decrementing MADR
+     * and ch1 (needs psx_write_word watchers) stay on the word path. */
+    if (ch == 0 && addr_step == 4) {
+        extern uint8_t *memory_get_ram_ptr(void);
+        uint8_t *ram = memory_get_ram_ptr();
+        while (a->remaining_words > 0 && words_budget > 0) {
             if (!mdec_dma_write_ready()) break;
-            mdec_dma_write_word(psx_read_word(addr));
-        } else {
-            if (!mdec_dma_read_ready()) break;
-            g_dma_cur_madr = addr;
-            psx_write_word(addr, mdec_dma_read_word());
+            uint32_t n = a->remaining_words < words_budget
+                       ? a->remaining_words : words_budget;
+            uint32_t max_by_ram = (0x200000u - addr) / 4u;
+            if (max_by_ram == 0) break;
+            if (n > max_by_ram) n = max_by_ram;
+            uint32_t got =
+                mdec_dma_write_words((const uint32_t *)(ram + addr), n);
+            if (got == 0) break;
+            addr = (addr + got * 4u) & 0x1FFFFCu;
+            a->remaining_words -= got;
+            words_budget -= got;
+            moved += got;
         }
+    } else {
+        while (a->remaining_words > 0 && words_budget > 0) {
+            if (ch == 0) {
+                if (!mdec_dma_write_ready()) break;
+                mdec_dma_write_word(psx_read_word(addr));
+            } else {
+                if (!mdec_dma_read_ready()) break;
+                g_dma_cur_madr = addr;
+                psx_write_word(addr, mdec_dma_read_word());
+            }
 
-        addr = (addr + addr_step) & 0x1FFFFCu;
-        a->remaining_words--;
-        words_budget--;
-        moved++;
+            addr = (addr + addr_step) & 0x1FFFFCu;
+            a->remaining_words--;
+            words_budget--;
+            moved++;
+        }
     }
     if (mdec_writes_ram) { g_dma_cur_ch = -1; g_dma_exec_depth--; }
 
@@ -584,9 +607,22 @@ static void execute_ch0_mdec_in(void) {
 
     if (direction != 0) {
         mdec_debug_dma_in_start(addr, total_words);
-        for (uint32_t i = 0; i < total_words; i++) {
-            mdec_dma_write_word(psx_read_word(addr));
-            addr = (addr + addr_step) & 0x1FFFFCu;
+        if (addr_step == 4 && total_words > 0 &&
+            addr + total_words * 4u <= 0x200000u) {
+            extern uint8_t *memory_get_ram_ptr(void);
+            uint32_t got = mdec_dma_write_words(
+                (const uint32_t *)(memory_get_ram_ptr() + addr), total_words);
+            addr = (addr + got * 4u) & 0x1FFFFCu;
+            /* If the FIFO stalled mid-burst, finish any remainder word-wise. */
+            for (uint32_t i = got; i < total_words; i++) {
+                mdec_dma_write_word(psx_read_word(addr));
+                addr = (addr + 4u) & 0x1FFFFCu;
+            }
+        } else {
+            for (uint32_t i = 0; i < total_words; i++) {
+                mdec_dma_write_word(psx_read_word(addr));
+                addr = (addr + addr_step) & 0x1FFFFCu;
+            }
         }
         mdec_debug_dma_in_end(addr, total_words);
         channels[0].madr = addr;
@@ -1178,25 +1214,67 @@ void dma_debug_get_state(DMADebugState* out) {
     }
 }
 
-/* ---- boot snapshot: complete DMA hardware state (see boot_state.h) ---- */
-#define DMA_SNAP_FIELDS(X) \
-    X(channels) X(dpcr) X(dicr) X(mdec_async) X(cdrom_async) X(delayed_complete)
-uint32_t dma_snapshot_bytes(void) {
-    uint32_t n = 0;
-#define X(f) n += (uint32_t)sizeof(f);
-    DMA_SNAP_FIELDS(X)
-#undef X
-    return n;
+/* ---- boot snapshot: complete DMA hardware state (LE field wire; see boot_state.h) ---- */
+#include "pst_wire.h"
+
+/* DMAChannel = 3×u32 (no pad). Async/delayed structs have host padding — field LE. */
+#define DMA_ASYNC_WIRE (1u + 1u + 4u + 4u + 4u + 4u) /* 18 */
+#define DMA_DELAY_WIRE (1u + 4u + 4u)                 /* 9 */
+#define DMA_SNAP_WIRE_BYTES ( \
+    (7u * 12u) + 4u + 4u + (2u * DMA_ASYNC_WIRE) + DMA_ASYNC_WIRE + (7u * DMA_DELAY_WIRE))
+
+static int dma_w_async(PstW *w, const DMAAsyncChannel *a) {
+    return pst_w_u8(w, a->active) && pst_w_u8(w, a->debug_started) &&
+           pst_w_u32(w, a->total_words) && pst_w_u32(w, a->remaining_words) &&
+           pst_w_u32(w, a->cycles_accum) && pst_w_u32(w, a->start_addr);
 }
+static int dma_r_async(PstR *r, DMAAsyncChannel *a) {
+    return pst_r_u8(r, &a->active) && pst_r_u8(r, &a->debug_started) &&
+           pst_r_u32(r, &a->total_words) && pst_r_u32(r, &a->remaining_words) &&
+           pst_r_u32(r, &a->cycles_accum) && pst_r_u32(r, &a->start_addr);
+}
+static int dma_w_delay(PstW *w, const DMADelayedComplete *d) {
+    return pst_w_u8(w, d->active) && pst_w_u32(w, d->total_words) &&
+           pst_w_u32(w, d->cycles_remaining);
+}
+static int dma_r_delay(PstR *r, DMADelayedComplete *d) {
+    return pst_r_u8(r, &d->active) && pst_r_u32(r, &d->total_words) &&
+           pst_r_u32(r, &d->cycles_remaining);
+}
+
+uint32_t dma_snapshot_bytes(void) { return DMA_SNAP_WIRE_BYTES; }
+
 void dma_snapshot_write(uint8_t *p) {
-#define X(f) memcpy(p, &(f), sizeof(f)); p += sizeof(f);
-    DMA_SNAP_FIELDS(X)
-#undef X
+    PstW w;
+    pst_w_init(&w, p, DMA_SNAP_WIRE_BYTES);
+    for (int i = 0; i < 7; i++) {
+        pst_w_u32(&w, channels[i].madr);
+        pst_w_u32(&w, channels[i].bcr);
+        pst_w_u32(&w, channels[i].chcr);
+    }
+    pst_w_u32(&w, dpcr);
+    pst_w_u32(&w, dicr);
+    dma_w_async(&w, &mdec_async[0]);
+    dma_w_async(&w, &mdec_async[1]);
+    dma_w_async(&w, &cdrom_async);
+    for (int i = 0; i < 7; i++)
+        dma_w_delay(&w, &delayed_complete[i]);
 }
+
 int dma_snapshot_read(const uint8_t *p, uint32_t len) {
-    if (len != dma_snapshot_bytes()) return 0;
-#define X(f) memcpy(&(f), p, sizeof(f)); p += sizeof(f);
-    DMA_SNAP_FIELDS(X)
-#undef X
+    PstR r;
+    if (len != DMA_SNAP_WIRE_BYTES) return 0;
+    pst_r_init(&r, p, len);
+    for (int i = 0; i < 7; i++) {
+        if (!pst_r_u32(&r, &channels[i].madr) || !pst_r_u32(&r, &channels[i].bcr) ||
+            !pst_r_u32(&r, &channels[i].chcr))
+            return 0;
+    }
+    if (!pst_r_u32(&r, &dpcr) || !pst_r_u32(&r, &dicr)) return 0;
+    if (!dma_r_async(&r, &mdec_async[0]) || !dma_r_async(&r, &mdec_async[1]) ||
+        !dma_r_async(&r, &cdrom_async))
+        return 0;
+    for (int i = 0; i < 7; i++)
+        if (!dma_r_delay(&r, &delayed_complete[i])) return 0;
     return 1;
 }

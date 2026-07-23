@@ -213,7 +213,7 @@ Findings (tracked for the next work cycle):
   (launcher.cpp:347/776); PSX_ENABLE_VULKAN defaults OFF (runtime.cmake:484);
   runtime downgrades renderer=vulkan -> opengl when not compiled (main.cpp:2463).
   Vulkan stays a dev/CLI-only backend (--renderer vulkan on a VK-enabled build).
-- Widescreen carries an EXPERIMENTAL tag in the RmlUi launcher (launcher.rml:362).
+- Widescreen carries an EXPERIMENTAL tag in the launcher.
 
 **MERGED to master 2026-07-03** (runtime-only; codegen hash unchanged, no regen).
 Game pins bumped to the new psxrecomp master. No release builds cut (user directive).

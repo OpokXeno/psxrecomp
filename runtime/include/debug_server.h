@@ -91,6 +91,12 @@ void debug_server_get_status(int *listening, int *port, int *error);
  * Call once per vblank. */
 void debug_server_poll(void);
 
+/* FMV quiet mode suppresses high-frequency trace rings while MDEC video is
+ * active. The TCP command pump stays live; expensive per-dispatch/per-frame
+ * recording backs off so debug builds can still play FMVs at speed. */
+void debug_server_set_fmv_quiet(int quiet);
+int  debug_server_fmv_quiet(void);
+
 /* TCP serve-stall telemetry: cumulative main-thread ms spent inside
  * bounded TCP sends, and clients dropped for exceeding the send budget.
  * Surfaced in the freeze heartbeat / wedge dumps so a TCP-throttled run
@@ -132,12 +138,15 @@ void debug_server_trace_dispatch(uint32_t func_addr);
 void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState *cpu);
 
 /* Direct-call entry hook — emitted by the recompiler at the top of every
- * generated function so we can see direct-jal targets that never go through
- * psx_dispatch.  Logs into the fn_entry ring (subject to fn_filter) without
- * touching the shadow stack — the native C call/return discipline already
- * handles unwinding for direct calls. */
+ * generated function. Release (PSX_NO_DEBUG_TOOLS): inlined in cpu_state.h
+ * (stamp g_psx_last_fn_entry). Debug builds use the out-of-line ring path. */
+extern volatile uint32_t g_psx_last_fn_entry;
+#ifndef PSX_NO_DEBUG_TOOLS
 void debug_server_log_call_entry(uint32_t func_addr);
+#endif
 void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);
+/* Addressable stub for overlay CPS callbacks (always out-of-line). */
+void debug_server_log_call_entry_fn(uint32_t func_addr);
 
 /* Last store instruction PC — set by the recompiler before every memory
  * store (sb/sh/sw/swl/swr/swc2).  Read by SIO/MMIO write handlers to

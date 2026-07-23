@@ -311,6 +311,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] renderer must be \"software\", \"opengl\" or \"vulkan\": {}", mode));
         }
+        if (video.contains("offer_vulkan")) {
+            rt.video_offer_vulkan = toml::find<bool>(video, "offer_vulkan");
+        }
         if (video.contains("crt_filter")) {
             const auto mode = toml::find<std::string>(video, "crt_filter");
             if      (mode == "raw")       rt.video_screen_kind = 0;
@@ -885,7 +888,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_nw_full_mirror = false;
     std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
+    bool vulkan_offered = false;
     bool ws_ultrawide_offered = false;
+    if (cfg.contains("video")) {
+        const toml::value& video = toml::find(cfg, "video");
+        if (video.contains("offer_vulkan"))
+            vulkan_offered = toml::find<bool>(video, "offer_vulkan");
+    }
     // Optional [data_shards] block — memoized pure-function replay hooks.
     std::vector<uint32_t> data_shard_funcs;
     if (cfg.contains("data_shards")) {
@@ -896,6 +905,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 data_shard_funcs.push_back(parse_hex(a, "data_shards.funcs"));
         }
     }
+    // Optional [recompiler] hot_funcs — __attribute__((hot)) on emitted C.
+    std::vector<uint32_t> hot_funcs;
+    if (recomp.contains("hot_funcs")) {
+        const auto& arr = toml::find<std::vector<std::string>>(recomp, "hot_funcs");
+        for (const auto& a : arr)
+            hot_funcs.push_back(parse_hex(a, "recompiler.hot_funcs"));
+    }
     uint32_t vsync_query_func = 0;
     uint32_t vsync_counter_addr = 0;
     uint32_t vsync_gpustat_ptr_addr = 0;
@@ -903,6 +919,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     uint32_t vsync_timer1_cache_addr = 0;
     std::vector<uint32_t> vsync_event_horizon_sites;
     std::vector<uint32_t> vsync_event_horizon_extra_sites;
+    bool vsync_event_horizon_any = false;
     if (cfg.contains("load_accel")) {
         const toml::value& lav = toml::find(cfg, "load_accel");
         if (lav.contains("vsync_query")) {
@@ -949,6 +966,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                         vsync_event_horizon_extra_sites.push_back(parse_hex(
                             a, "load_accel.vsync_query.event_horizon_extra_sites"));
                 }
+                if (vq.contains("event_horizon_any"))
+                    vsync_event_horizon_any = toml::find<bool>(vq, "event_horizon_any");
             }
         }
     }
@@ -1050,6 +1069,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_negsub_sites;
     std::vector<uint32_t> ws_cull_vxrange_sites;
     std::vector<uint32_t> ws_cull_depth_sites;
+    std::vector<uint32_t> ws_cull_plane_nx_sites;
+    std::vector<uint32_t> ws_cull_xclip_load_sites;
     int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
@@ -1075,6 +1096,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("negsub_sites", ws_cull_negsub_sites);
             load_sites("vxrange_sites", ws_cull_vxrange_sites);
             load_sites("depth_sites", ws_cull_depth_sites);
+            load_sites("plane_nx_sites", ws_cull_plane_nx_sites);
+            load_sites("xclip_load_sites", ws_cull_xclip_load_sites);
             if (cull.contains("guard_pixels")) {
                 ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
                 if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
@@ -1213,6 +1236,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
         /*data_shard_funcs*/      data_shard_funcs,
+        /*hot_funcs*/             hot_funcs,
         /*vsync_query_func*/      vsync_query_func,
         /*vsync_counter_addr*/    vsync_counter_addr,
         /*vsync_gpustat_ptr_addr*/ vsync_gpustat_ptr_addr,
@@ -1220,6 +1244,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*vsync_timer1_cache_addr*/ vsync_timer1_cache_addr,
         /*vsync_event_horizon_sites*/ vsync_event_horizon_sites,
         /*vsync_event_horizon_extra_sites*/ vsync_event_horizon_extra_sites,
+        /*vsync_event_horizon_any*/   vsync_event_horizon_any,
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
@@ -1228,6 +1253,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_negsub_sites*/  ws_cull_negsub_sites,
         /*ws_cull_vxrange_sites*/ ws_cull_vxrange_sites,
         /*ws_cull_depth_sites*/   ws_cull_depth_sites,
+        /*ws_cull_plane_nx_sites*/ ws_cull_plane_nx_sites,
+        /*ws_cull_xclip_load_sites*/ ws_cull_xclip_load_sites,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,
@@ -1251,6 +1278,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_nw_full_mirror*/ ws_nw_full_mirror,
         /*ws_signed_x_bound_sites*/ ws_signed_x_bound_sites,
         /*ws_offered*/            ws_offered,
+        /*vulkan_offered*/        vulkan_offered,
         /*ws_ultrawide_offered*/  ws_ultrawide_offered,
         /*ws_bg2d_count_site*/    ws_bg2d_count_site,
         /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
@@ -1423,6 +1451,17 @@ UserSettings load_user_settings(const fs::path& path) {
             s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
         });
     }
+    if (doc.contains("netplay")) {
+        const toml::value& n = toml::find(doc, "netplay");
+        if (n.contains("player_name")) try_get([&]{
+            const auto v = toml::find<std::string>(n, "player_name");
+            if (!v.empty()) { s.netplay_player_name = v; s.has_netplay_player_name = true; }
+        });
+        if (n.contains("lobby_url")) try_get([&]{
+            const auto v = toml::find<std::string>(n, "lobby_url");
+            if (!v.empty()) { s.netplay_lobby_url = v; s.has_netplay_lobby_url = true; }
+        });
+    }
     if (doc.contains("bios")) {
         const toml::value& b = toml::find(doc, "bios");
         if (b.contains("path")) try_get([&]{
@@ -1566,6 +1605,14 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
     if (s.has_skip_launcher)
         f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
+    if ((s.has_netplay_player_name && !s.netplay_player_name.empty()) ||
+        (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())) {
+        f << "\n[netplay]\n";
+        if (s.has_netplay_player_name && !s.netplay_player_name.empty())
+            f << "player_name = \"" << s.netplay_player_name << "\"\n";
+        if (s.has_netplay_lobby_url && !s.netplay_lobby_url.empty())
+            f << "lobby_url = \"" << s.netplay_lobby_url << "\"\n";
+    }
     if (s.has_bios_path)
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
     if (s.has_disc_path)

@@ -434,7 +434,7 @@ the top of `psx_dispatch_impl` **after** the BIOS-HLE hook, gated by a lock-free
   of the existing renderer/aspect/FMV/turbo keys; `settings.toml` overrides
   `game.toml`, CLI overrides both — per the project's settings precedence).
   `"jp"`/`"off"` = passthrough (no translation).
-- **RmlUi launcher:** a "Language" dropdown populated from the table's `langs`
+- **Launcher:** a "Language" dropdown populated from the table's `langs`
   list; writes the choice to `game_options.toml`. Runtime switch = reselect →
   the module reloads the active language column (no restart needed; hot-reload
   already covers table edits).

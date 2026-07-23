@@ -33,6 +33,12 @@ psxrecomp_add_runtime_target(psx-runtime
 )
 
 if(BUILD_TESTING)
+    add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
+    target_include_directories(psx_cyc_batch_test PRIVATE include)
+    target_compile_definitions(psx_cyc_batch_test PRIVATE
+        PSX_ENABLE_BLOCK_CYCLES=1)
+    add_test(NAME psx_cyc_batch_test COMMAND psx_cyc_batch_test)
+
     add_executable(psx_icache_fastpath_test
         tests/test_psx_icache_fastpath.c
         src/psx_icache.c

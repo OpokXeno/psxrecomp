@@ -521,15 +521,8 @@ discovery seeds). Either way, then close Issue #3 alongside.
 
 ### Symptom
 
-The launcher dashboard art (disc / controllers / memory cards / logo)
-is cropped out of the design mockup and background-knocked-out to
-transparent by `tools/crop_launcher_assets.ps1`. The **memory-card and
-controller cutouts look rough / jaggy around the edges** — a hard
-luminance threshold in the edge flood-fill leaves a 1–2px aliased
-fringe (and the anti-aliased boundary pixels that sit just above the
-threshold are kept, so the silhouette is stair-stepped). The disc reads
-cleaner because its silver rim contrasts more strongly with the dark
-background.
+This issue tracked cosmetic problems in the removed in-tree launcher asset
+pipeline. It is retained only as historical context.
 
 ### Cause
 
@@ -554,11 +547,8 @@ fringe on them.
 
 ### Notes
 
-Tooling: `tools/crop_launcher_assets.ps1` (crop + knockout),
-`tools/gen_launcher_assets.ps1` (procedural check/verdict icons),
-`tools/shot_launcher.ps1` (screenshot the GL launcher window). Mockup
-source: a local mockup PNG (1448×1086). Pure-cosmetic; does not block
-Phase 4/5 wiring.
+Tooling: this historical note referred to the removed in-tree launcher asset
+pipeline. The active launcher path is downstream `recomp-ui`.
 
 ---
 
