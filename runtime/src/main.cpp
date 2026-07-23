@@ -57,6 +57,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "crc32.h"
 #include "disc_identity.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
+#include "launcher_device.h" /* recomp-ui controller-source round-trip */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher */
@@ -3865,6 +3866,7 @@ namespace {
     bool g_lnch_hosting_lan = false;
     bool g_lnch_joined_lan = false;
     std::string g_lnch_lan_endpoint;
+    std::string g_lnch_lan_guest_bind;
 
     struct AeLanLobbyState {
         std::string name;
@@ -3926,6 +3928,7 @@ namespace {
         g_lnch_hosting_lan = true;
         g_lnch_joined_lan = false;
         g_lnch_lan_endpoint = state.endpoint;
+        g_lnch_lan_guest_bind.clear();
     }
 
     int ae_np_read_lan_lobby(RecompLauncherCNetplayLobby* out) {
@@ -4203,6 +4206,7 @@ namespace {
         }
         g_lnch_joined_lan = false;
         g_lnch_lan_endpoint.clear();
+        g_lnch_lan_guest_bind.clear();
         if (host_endpoint)
             std::snprintf(host_endpoint, 96, "%s", endpoint);
         return psx_lobby_create(lobby_name && lobby_name[0] ? lobby_name : "Netplay Lobby",
@@ -4214,6 +4218,17 @@ namespace {
      * (prefer 7778); never advertise :0 to the lobby. */
     int ae_np_join(void*, const char* lobby_id, const char* password,
                    char* guest_bind) {
+        char bind_buf[64];
+        const char* bind = guest_bind;
+        const char* colon = (bind && bind[0]) ? std::strrchr(bind, ':') : nullptr;
+        const unsigned port = (colon && colon[1])
+            ? static_cast<unsigned>(std::strtoul(colon + 1, nullptr, 10)) : 0u;
+        if (!bind || !bind[0] || port == 0u) {
+            std::snprintf(bind_buf, sizeof(bind_buf), "0.0.0.0:7778");
+            bind = bind_buf;
+            if (guest_bind)
+                std::snprintf(guest_bind, 64, "%s", bind_buf);
+        }
         if (lobby_id && strncmp(lobby_id, "lan:", 4) == 0) {
             AeLanLobbyState state;
             if (!ae_np_read_lan_state(&state) || !state.joiner_name.empty()) return -1;
@@ -4225,18 +4240,8 @@ namespace {
             g_lnch_hosting_lan = false;
             g_lnch_joined_lan = true;
             g_lnch_lan_endpoint = state.endpoint;
+            g_lnch_lan_guest_bind = bind;
             return 0;
-        }
-        char bind_buf[64];
-        const char* bind = guest_bind;
-        const char* colon = (bind && bind[0]) ? std::strrchr(bind, ':') : nullptr;
-        const unsigned port = (colon && colon[1])
-            ? static_cast<unsigned>(std::strtoul(colon + 1, nullptr, 10)) : 0u;
-        if (!bind || !bind[0] || port == 0u) {
-            std::snprintf(bind_buf, sizeof(bind_buf), "0.0.0.0:7778");
-            bind = bind_buf;
-            if (guest_bind)
-                std::snprintf(guest_bind, 64, "%s", bind_buf);
         }
         return psx_lobby_join(lobby_id, password ? password : "", bind);
     }
@@ -4256,6 +4261,7 @@ namespace {
         }
         g_lnch_joined_lan = false;
         g_lnch_lan_endpoint.clear();
+        g_lnch_lan_guest_bind.clear();
         g_lnch_pending_direct_launch = {};
         return psx_lobby_leave();
     }
@@ -4340,7 +4346,9 @@ namespace {
                                   "0.0.0.0:%s", port);
                 } else {
                     std::snprintf(g_lnch_pending_direct_launch.bind_hostport,
-                                  sizeof(g_lnch_pending_direct_launch.bind_hostport), "0.0.0.0:0");
+                                  sizeof(g_lnch_pending_direct_launch.bind_hostport), "%s",
+                                  g_lnch_lan_guest_bind.empty()
+                                      ? "0.0.0.0:0" : g_lnch_lan_guest_bind.c_str());
                     std::snprintf(g_lnch_pending_direct_launch.peer_hostport,
                                   sizeof(g_lnch_pending_direct_launch.peer_hostport), "%s",
                                   state.endpoint.c_str());
@@ -5296,8 +5304,20 @@ int main(int argc, char** argv) {
             ls.enable_audio   = 1;
             ls.audio_freq     = 44100;
             ls.volume         = 100;
-            ls.player_src[0]  = (p1_device == "keyboard") ? 1 : (p1_device == "none") ? 0 : 2;
-            ls.player_src[1]  = (p2_device == "keyboard") ? 1 : (p2_device == "none") ? 0 : 2;
+            ls.player_src[0]  = PSXRecompV4::launcher_source_from_device(p1_device);
+            ls.player_src[1]  = PSXRecompV4::launcher_source_from_device(p2_device);
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID)
+            if (ls.player_src[0] == 2) {
+                std::snprintf(ls.player_gamepad_guid[0],
+                              sizeof(ls.player_gamepad_guid[0]), "%s",
+                              p1_device.c_str());
+            }
+            if (ls.player_src[1] == 2) {
+                std::snprintf(ls.player_gamepad_guid[1],
+                              sizeof(ls.player_gamepad_guid[1]), "%s",
+                              p2_device.c_str());
+            }
+#endif
             {
                 int rui_deadzone_pct = seed.deadzone * 100 / 32767;
                 ls.deadzone[0] = rui_deadzone_pct;
@@ -5484,8 +5504,18 @@ int main(int argc, char** argv) {
                  * is the legacy fallback field for consoles without the cap and is
                  * left unused here. */
                 seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
-                p1_device = (ls.player_src[0] == 1) ? "keyboard" : (ls.player_src[0] == 0) ? "none" : p1_device;
-                p2_device = (ls.player_src[1] == 1) ? "keyboard" : (ls.player_src[1] == 0) ? "none" : p2_device;
+                std::string p1_launcher_device = p1_device;
+                std::string p2_launcher_device = p2_device;
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_GAMEPAD_GUID)
+                if (ls.player_gamepad_guid[0][0])
+                    p1_launcher_device = ls.player_gamepad_guid[0];
+                if (ls.player_gamepad_guid[1][0])
+                    p2_launcher_device = ls.player_gamepad_guid[1];
+#endif
+                p1_device = PSXRecompV4::launcher_device_from_source(
+                    ls.player_src[0], p1_launcher_device);
+                p2_device = PSXRecompV4::launcher_device_from_source(
+                    ls.player_src[1], p2_launcher_device);
                 seed.p1_device = p1_device; seed.has_p1_device = true;
                 seed.p2_device = p2_device; seed.has_p2_device = true;
                 seed.deadzone = ls.deadzone[0] * 32767 / 100; seed.has_deadzone = true;
