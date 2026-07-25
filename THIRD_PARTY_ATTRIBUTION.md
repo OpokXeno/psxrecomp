@@ -44,3 +44,11 @@ engine-agnostic pieces originally authored by Jrickey in
 - The tap plumbing in `runtime/src/spu.c` and `runtime/include/spu.h`.
 
 All reuse keeps the original copyright and dual MIT/Apache-2.0 license.
+
+## pugixml — light-weight XML processing library (v1.14)
+
+Source: https://github.com/zeux/pugixml (vendored unmodified:
+`runtime/src/third_party/pugixml/{pugixml.hpp,pugixml.cpp}`).
+License: **MIT** (see `runtime/src/third_party/pugixml/LICENSE.md`).
+Used by the developer debug overlay (`PSX_DEBUG_OVERLAY`, debug builds only)
+to parse its XML data tables (map/character/event/address books).
