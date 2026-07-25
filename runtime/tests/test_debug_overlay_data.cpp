@@ -50,7 +50,7 @@ int main(int argc, char **argv)
     std::printf("fields=%d chars=%d gears=%d events=%d flagVars=%d addrs=%d watches=%d\n",
                 nf, nc, ng, ne, nfv, na, nw);
 
-    if (nf != 712) { std::printf("FAIL: fields count %d != 712\n", nf);  return 1; }
+    if (nf != 730) { std::printf("FAIL: fields count %d != 730\n", nf);  return 1; }
     if (nc != 11)  { std::printf("FAIL: chars count %d != 11\n", nc);    return 1; }
 
     const char *n1   = dbg_data_field_name(1);
