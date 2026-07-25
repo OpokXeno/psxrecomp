@@ -108,6 +108,20 @@ if(PSX_RECOMP_UI AND (NOT RECOMP_UI_ROOT OR RECOMP_UI_ROOT STREQUAL ""))
     endif()
 endif()
 
+# PSX_DEBUG_OVERLAY: in-game developer overlay (Dear ImGui, toggled with Ctrl+F3).
+# Depends on the shared recomp-ui ImGui launcher (it is the only ImGui surface
+# the runtime already links in), and on PSX_DEBUG_TOOLS being on (overlay is a
+# developer convenience, never shipped in a Release cut). Both conditions met
+# by default for Debug / RelWithDebInfo (PSX_DEBUG_TOOLS default) and when
+# PSX_RECOMP_UI=ON (the standard game-repo layout); either can be overridden
+# explicitly with -DPSX_DEBUG_OVERLAY=ON/OFF regardless of build type.
+if(PSX_DEBUG_TOOLS AND PSX_RECOMP_UI)
+    set(_psx_debug_overlay_default ON)
+else()
+    set(_psx_debug_overlay_default OFF)
+endif()
+option(PSX_DEBUG_OVERLAY "Build the in-game developer debug overlay (ImGui, Ctrl+F3)" ${_psx_debug_overlay_default})
+
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
@@ -523,6 +537,30 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # PSX_DEBUG_OVERLAY: pull the overlay TU into the target and define the
+    # guard the header uses to inline the API to no-ops in Release. Empty in
+    # Release (no symbols, no code) and only when both the ImGui launcher and
+    # PSX_DEBUG_TOOLS are on (see option block above).
+    if(PSX_DEBUG_OVERLAY)
+        target_compile_definitions(${target} PRIVATE PSX_DEBUG_OVERLAY=1)
+        target_sources(${target} PRIVATE
+            ${PSXRECOMP_ROOT}/runtime/src/debug_overlay.cpp
+            ${PSXRECOMP_ROOT}/runtime/src/debug_overlay_data.cpp
+            ${PSXRECOMP_ROOT}/runtime/src/third_party/pugixml/pugixml.cpp)
+        # Stage the in-game data dir (fonts / shaders / binding JSON) next to
+        # the exe on every build. The dir does not exist yet; the EXISTS
+        # guard keeps this a silent no-op today so a sibling task can drop
+        # files in later without touching this file.
+        if(EXISTS "${CMAKE_SOURCE_DIR}/debug_overlay/data")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CMAKE_SOURCE_DIR}/debug_overlay/data"
+                    "$<TARGET_FILE_DIR:${target}>/debug_overlay/data"
+                COMMENT "Staging debug_overlay/data -> $<TARGET_FILE_DIR:${target}>/debug_overlay/data"
+                VERBATIM)
+        endif()
     endif()
 
     if(PSXRECOMP_HAS_RECOMP_NET)
