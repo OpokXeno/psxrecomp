@@ -279,6 +279,7 @@ static int      s_event_filter_sel   = -1;
 static char     s_event_filter[64]   = {0};
 static int      s_event_jump_status_frames = 0;
 static char     s_event_jump_status[128] = {0};
+static bool     s_allow_unverified_events = false;
 
 /* ---- small helpers ------------------------------------------------------ */
 
@@ -1553,6 +1554,10 @@ static void draw_event_jump_section(void)
     if (!field_module_active()) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
             "Field module NOT active — Jump buttons will be refused.");
+    ImGui::Checkbox("Allow unverified events##ej", &s_allow_unverified_events);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable Jump for events whose status is not verified.");
+    }
     }
 
     if (ImGui::BeginTable("events", 5,
@@ -1584,7 +1589,7 @@ static void draw_event_jump_section(void)
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("%d", e.id);
             ImGui::TableSetColumnIndex(1);
-            if (!e.verified) {
+            if (!e.verified && !s_allow_unverified_events) {
                 ImGui::TextDisabled("%s", e.name ? e.name : "");
             } else {
                 ImGui::Text("%s", e.name ? e.name : "");
@@ -1610,7 +1615,8 @@ static void draw_event_jump_section(void)
             }
             ImGui::TableSetColumnIndex(4);
             ImGui::PushID(i);
-            bool can_jump = e.verified && field_module_active();
+            bool can_jump = (e.verified || s_allow_unverified_events) &&
+                            field_module_active();
             if (!can_jump) ImGui::BeginDisabled();
             if (ImGui::SmallButton("Jump")) {
                 int rc = psx_debug_overlay_event_jump(e.id);
@@ -1628,7 +1634,8 @@ static void draw_event_jump_section(void)
                 s_event_jump_status_frames = 120;
             }
             if (!can_jump) ImGui::EndDisabled();
-            if (!e.verified && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (!e.verified && !s_allow_unverified_events &&
+                ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 ImGui::SetTooltip("Unverified: status != \"verified\" in events.xml. "
                                   "Greyed out until Ghidra validation.");
             } else if (!field_module_active() &&
