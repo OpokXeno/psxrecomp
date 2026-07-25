@@ -41,6 +41,7 @@
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
 #include "lockstep.h"
+#include "debug_overlay.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +91,9 @@ extern uint32_t psx_read_word(uint32_t addr);
 extern void     psx_write_word(uint32_t addr, uint32_t val);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern void     psx_write_byte(uint32_t addr, uint8_t val);
+
+/* Guest function invocation (generated dispatch code) */
+extern void     psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t return_addr);
 
 /* ---- Server state ---- */
 static sock_t s_listen  = SOCK_INVALID;
@@ -4223,6 +4227,17 @@ static uint32_t hex_to_u32(const char *s)
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
+/* Inverse of the read_ram nibble table.  Returns the hex value of c, or -1
+ * if c is not a hex digit.  Used by handle_write_ram to decode the "hex"
+ * parameter. */
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 /* ---- Send helpers ---- */
 
 /* TCP serve-stall telemetry. The server is pumped on the main thread, so
@@ -4638,17 +4653,81 @@ static void handle_read_ram(int id, const char *json)
 
 static void handle_write_ram(int id, const char *json)
 {
-    char addr_str[32], val_str[32];
+    char addr_str[32];
+    char hex_str[0x2004];   /* 0x1000 bytes = 0x2000 hex chars + NUL + slack */
+    char val_str[32];
+    int hex_len;
+    int nbytes;
+    int i;
     if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
         send_err(id, "missing addr"); return;
     }
+    uint32_t addr = hex_to_u32(addr_str);
+
+    /* Multi-byte form: "hex" carries raw bytes as a hex string.  Even length,
+     * ≥ 2 chars (1 byte), ≤ 0x1000 bytes.  Missing "hex" falls through to
+     * the legacy single-byte "val" path below. */
+    if (json_get_str(json, "hex", hex_str, sizeof(hex_str))) {
+        hex_len = (int)strlen(hex_str);
+        nbytes = hex_len / 2;
+        if ((hex_len & 1) || hex_len < 2) {
+            send_err(id, "hex length must be even and at least 2");
+            return;
+        }
+        if (nbytes > 0x1000) {
+            send_err(id, "hex too long (max 0x1000 bytes)");
+            return;
+        }
+        for (i = 0; i < nbytes; i++) {
+            int hi = hex_nibble(hex_str[i * 2]);
+            int lo = hex_nibble(hex_str[i * 2 + 1]);
+            if (hi < 0 || lo < 0) {
+                send_err(id, "non-hex character in hex");
+                return;
+            }
+            psx_write_byte(addr + (uint32_t)i, (uint8_t)((hi << 4) | lo));
+        }
+        send_ok(id);
+        return;
+    }
+
+    /* Legacy single-byte form: "val" carries one byte. */
     if (!json_get_str(json, "val", val_str, sizeof(val_str))) {
         send_err(id, "missing val"); return;
     }
-    uint32_t addr = hex_to_u32(addr_str);
     uint8_t val = (uint8_t)hex_to_u32(val_str);
     psx_write_byte(addr, val);
     send_ok(id);
+}
+
+/* "call_func" invokes a recompiled/interpreted guest function synchronously
+ * from the emu thread at the vblank safe point, using the same dispatch
+ * contract the HLE tier uses (bios_hle.c): $ra is pointed at the kernel
+ * return sentinel KADDR_DELIVER_RET (0x80001720) so the callee returns to
+ * the host through psx_dispatch_call, and the caller's $ra is restored
+ * afterwards.  Params: addr (guest function), optional a0..a3 (hex).
+ * Answers with v0.  Intended for debug tooling (e.g. module_switch teleport
+ * experiments) — the callee really runs; nothing is simulated. */
+static void handle_call_func(int id, const char *json)
+{
+    char addr_str[32];
+    char arg_str[4][32];
+    static const char *const arg_names[4] = { "a0", "a1", "a2", "a3" };
+    int i;
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr"); return;
+    }
+    if (!s_cpu) { send_err(id, "no cpu"); return; }
+    uint32_t addr = hex_to_u32(addr_str);
+    for (i = 0; i < 4; i++) {
+        if (json_get_str(json, arg_names[i], arg_str[i], sizeof(arg_str[i])))
+            s_cpu->gpr[4 + i] = hex_to_u32(arg_str[i]);
+    }
+    uint32_t saved_ra = s_cpu->gpr[31];
+    s_cpu->gpr[31] = 0x80001720u;   /* KADDR_DELIVER_RET (bios_hle.c) */
+    psx_dispatch_call(s_cpu, addr, 0x80001720u);
+    s_cpu->gpr[31] = saved_ra;
+    send_fmt("{\"id\":%d,\"ok\":true,\"v0\":\"0x%08X\"}", id, s_cpu->gpr[2]);
 }
 
 static void handle_gpu_state(int id, const char *json)
@@ -6985,15 +7064,30 @@ static void handle_gl_wide_fast(int id, const char *json)
 }
 
 /* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
- * ws_aspect num=<n> den=<d> calls gte_set_display_aspect at runtime so we can
- * compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a relaunch. */
+ * ws_aspect num=<n> den=<d> calls gte_set_display_aspect_ex at runtime so
+ * we can compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a
+ * relaunch. Uses _ex (the sidecar-update variant) so the round-trip
+ * getter (handle_ws_aspect_get) reflects the new value. */
 extern void gte_set_display_aspect(int num, int den);
+extern void gte_set_display_aspect_ex(int num, int den);
+extern void gte_get_display_aspect(int *num, int *den);
 static void handle_ws_aspect(int id, const char *json)
 {
     int num = json_get_int(json, "num", -1);
     int den = json_get_int(json, "den", -1);
     if (num <= 0 || den <= 0) { send_err(id, "need num>0 den>0 (4 3 = squash off)"); return; }
-    gte_set_display_aspect(num, den);
+    gte_set_display_aspect_ex(num, den);
+    send_fmt("{\"id\":%d,\"ok\":true,\"num\":%d,\"den\":%d}", id, num, den);
+}
+
+/* ws_aspect_get: pure read for the GTE's display aspect. The setter
+ * (ws_aspect) is required to update a sidecar so this round-trip
+ * returns the user-friendly (num, den) the widget set. */
+static void handle_ws_aspect_get(int id, const char *json)
+{
+    (void)json;
+    int num = 0, den = 0;
+    gte_get_display_aspect(&num, &den);
     send_fmt("{\"id\":%d,\"ok\":true,\"num\":%d,\"den\":%d}", id, num, den);
 }
 
@@ -7948,6 +8042,23 @@ static void handle_wide_shot(int id, const char *json)
     if (!ok) { send_err(id, "png encode failed"); return; }
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
              id, path, W, H);
+}
+
+/* window_shot: capture the COMPOSITED window (game + overlay, if visible)
+ * to a PNG. Unlike screenshot/wide_shot — which dump the PS1 display buffer
+ * or the wide compositor surface — this captures the default framebuffer
+ * after the renderer has drawn the game AND the overlay's pre_swap hook has
+ * drawn the ImGui frame. The shot is a one-shot arm: the readback runs on
+ * the next main-thread pre_swap (next vblank), so the file appears one
+ * frame after this command returns. Tests must poll for the file. */
+static void handle_window_shot(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "window_shot.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    psx_debug_overlay_window_shot_arm(path);
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"armed\":true}\n", id, path);
 }
 
 /* wide_full: dump the ENTIRE active wide compositor surface (both double-buffer
@@ -12132,12 +12243,109 @@ static void handle_warm_cd_route(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, body);
 }
 
+/* overlay_state: query the in-game debug overlay visibility. Exists so tests
+ * can read the flag without key injection; on Release builds the header
+ * inline is a no-op that returns false, so the command compiles and answers
+ * harmlessly without any extra #ifdef. */
+static void handle_overlay_state(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"visible\":%s}\n",
+             id, psx_debug_overlay_is_visible() ? "true" : "false");
+}
+
+/* overlay_toggle: flip the in-game debug overlay visibility. Same Release
+ * behavior as overlay_state — the no-op inline compiles and answers ok. */
+static void handle_overlay_toggle(int id, const char *json)
+{
+    (void)json;
+    psx_debug_overlay_toggle();
+    send_fmt("{\"id\":%d,\"ok\":true,\"visible\":%s}\n",
+             id, psx_debug_overlay_is_visible() ? "true" : "false");
+}
+
+/* overlay_capture_state: read-only snapshot of the three flags the
+ * pad-mask path depends on (visibility, io.WantCaptureKeyboard, the
+ * "swallow_keyboard" boolean the sampler consults). The TCP test needs
+ * this because injecting SDL keyboard events over TCP is not possible —
+ * the SDL event pump runs in-process, but the focused-window keyboard
+ * state is not addressable from a remote client. When PSX_DEBUG_OVERLAY
+ * is OFF the header inline answers all zeros (overlay is a permanent
+ * no-op) so the command compiles and answers cleanly in every config. */
+static void handle_overlay_capture_state(int id, const char *json)
+{
+    (void)json;
+    int visible = 0, want_capture = 0, swallow = 0;
+    psx_debug_overlay_capture_state(&visible, &want_capture, &swallow);
+    send_fmt("{\"id\":%d,\"ok\":true,\"visible\":%s,\"want_capture_keyboard\":%s,"
+             "\"swallow_keyboard\":%s}\n",
+             id,
+             visible      ? "true" : "false",
+             want_capture ? "true" : "false",
+             swallow      ? "true" : "false");
+}
+
+/* overlay_force_capture [on=0|1]: flip the in-window "force text capture"
+ * checkbox from the debug server. The next pre_swap draws a permanent
+ * InputText so ImGui reports WantCaptureKeyboard=WantTextInput=true.
+ * The TCP test uses this to assert the active-mask path — it can arm
+ * the mask deterministically without clicking the checkbox on a focused
+ * window. `on` < 0 (the default, "no `on` in payload") means report the
+ * current state without changing it. */
+static void handle_overlay_force_capture(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    int result = psx_debug_overlay_set_force_capture(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"force_capture\":%d}\n", id, result);
+}
+
+/* overlay_widget_action [name=<str>] [value=<int>] [value2=<int>]: invoke
+ * one of the in-window widget's action functions (the same code path a
+ * checkbox/button/slider click would call). The TCP test uses this to
+ * assert the TOGGLES section is wired to the real runtime setters:
+ * flipping a widget value over TCP must change the matching TCP getter.
+ * A remote client cannot synthesize real mouse clicks, so this command
+ * is the legitimate automation equivalent — it does NOT bypass the
+ * action path; it calls the same function the widget calls.
+ *
+ * Accepted names (full set in TCP_COMMANDS.md; mirrored by
+ * psx_debug_overlay_widget_action in debug_overlay.{h,cpp}):
+ *   read-only/toggle actions: texfilter, native_wide, aspect_set,
+ *     bd_stretch_on, bd_stretch_pct, interp.
+ *   ring dumps: dump_event_ring, dump_latency_ring, dump_starv_ring.
+ *   write actions (N13 panels): teleport, party_slot, party_bitfield,
+ *     gold, write_var, read_field_id. Every write goes through
+ *     psx_write_byte to the verified addrs.xml addresses; the field
+ *     module guard is enforced on teleport. */
+static void handle_overlay_widget_action(int id, const char *json)
+{
+    char name[64] = {0};
+    if (!json_get_str(json, "name", name, sizeof(name))) {
+        send_err(id, "missing name");
+        return;
+    }
+    int value  = json_get_int(json, "value",  0);
+    int value2 = json_get_int(json, "value2", 0);
+    int rc = psx_debug_overlay_widget_action(name, value, value2);
+    if (rc < 0) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"unknown name\"}\n", id);
+    } else {
+        send_fmt("{\"id\":%d,\"ok\":true,\"name\":\"%s\",\"value\":%d,"
+                 "\"value2\":%d,\"rc\":%d}\n", id, name, value, value2, rc);
+    }
+}
+
 static const CmdEntry s_commands[] = {
     { "phase_profile",     handle_phase_profile },
     { "starv_ring",        handle_starv_ring },
     { "data_shards",       handle_data_shards },
     { "vsync_query_hle",   handle_vsync_query_hle },
     { "warm_cd_route",     handle_warm_cd_route },
+    { "overlay_state",     handle_overlay_state },
+    { "overlay_toggle",    handle_overlay_toggle },
+    { "overlay_capture_state", handle_overlay_capture_state },
+    { "overlay_force_capture", handle_overlay_force_capture },
+    { "overlay_widget_action", handle_overlay_widget_action },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
     { "lockstep",          handle_lockstep },
@@ -12164,11 +12372,13 @@ static const CmdEntry s_commands[] = {
     { "read_ram",          handle_read_ram },
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
+    { "call_func",         handle_call_func },
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
     { "ws_hud_mode",       handle_ws_hud_mode },
     { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },
+    { "ws_aspect_get",     handle_ws_aspect_get },
     { "ws_nw",             handle_ws_nw },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
@@ -12354,6 +12564,7 @@ static const CmdEntry s_commands[] = {
     { "dump_buffer",       handle_dump_buffer },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
+    { "window_shot",       handle_window_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },
