@@ -260,3 +260,7 @@ void color_lut_map555(const ColorLut* lut, uint16_t bgr555,
   *g = lut->table[idx][1];
   *b = lut->table[idx][2];
 }
+
+const uint8_t* color_lut_table_rgb(const ColorLut* lut) {
+  return lut ? &lut->table[0][0] : NULL;
+}

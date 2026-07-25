@@ -77,6 +77,12 @@ bool      color_lut_is_passthrough(const ColorLut* lut);
 void color_lut_map555(const ColorLut* lut, uint16_t bgr555,
                       uint8_t* r, uint8_t* g, uint8_t* b);
 
+/* Raw baked table, 32768 entries x {R,G,B} bytes, indexed by BGR555 — the
+ * GL renderer uploads it as a 256x128 RGB8 texture to grade the 15-bit
+ * present paths in-shader (same table the CPU scanout consults). NULL for
+ * passthrough/raw. */
+const uint8_t* color_lut_table_rgb(const ColorLut* lut);
+
 #ifdef __cplusplus
 }
 #endif
