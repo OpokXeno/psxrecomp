@@ -775,6 +775,22 @@ extern "C" void gte_set_display_aspect(int num, int den) {
     s_ws_xden = d / a;
 }
 
+/* Round-trip getters/setters for the display aspect (the squash factor the
+ * GTE applies is the gcd-reduced 4*den/(3*num, so we keep a sidecar of
+ * the last user (num, den) to recover it). The overlay widget and the
+ * test_overlay_widgets.py live test both rely on this round-trip. */
+static int  s_ws_aspect_num_in = 4;
+static int  s_ws_aspect_den_in = 3;
+extern "C" void gte_set_display_aspect_ex(int num, int den) {
+    s_ws_aspect_num_in = num;
+    s_ws_aspect_den_in = den;
+    gte_set_display_aspect(num, den);
+}
+extern "C" void gte_get_display_aspect(int *num, int *den) {
+    if (num) *num = s_ws_aspect_num_in;
+    if (den) *den = s_ws_aspect_den_in;
+}
+
 // ---------------------------------------------------------------------------
 // RTPS — Perspective Transformation (internal, operates on given vertex V)
 // ---------------------------------------------------------------------------
