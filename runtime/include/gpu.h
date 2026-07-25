@@ -108,6 +108,11 @@ void gpu_set_vblank_callback(gpu_vblank_cb cb);
  * 1=crt, 2=composite, 3=trinitron). Config/launcher-driven; the PSX_SCREEN
  * env var, if set, overrides this. Default 0 (raw) is byte-identical. */
 void gpu_set_screen_kind(int kind);
+/* Present-time screen LUT for the GL renderer: fills *table_out with the
+ * baked 32768x{R,G,B} BGR555 table (NULL when raw/passthrough) and returns
+ * a generation counter that bumps on every gpu_set_screen_kind change, so
+ * callers can re-upload only on change. */
+int gpu_screen_lut_snapshot(const uint8_t** table_out);
 
 /* Widescreen proportion correction (active only when aspect != 4:3 and the
  * game's [widescreen] block opts in — see config_loader.h). Tagged

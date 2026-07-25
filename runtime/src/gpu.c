@@ -2152,6 +2152,7 @@ int gpu_depth24_present_hold_tick(void) {
  * settings plumb yet. The raw fast-path below is preserved verbatim so the
  * default never even consults the LUT. */
 static ColorLut* s_screen_lut = NULL;
+static int       s_screen_lut_gen = 0;  /* bumped by gpu_set_screen_kind */
 static int       s_screen_lut_init = 0;
 static int       s_screen_kind_cfg = SCREEN_RAW;  /* config/launcher-set; env overrides */
 
@@ -2160,6 +2161,7 @@ void gpu_set_screen_kind(int kind) {
     if (kind == s_screen_kind_cfg) return;
     s_screen_kind_cfg = kind;
     s_screen_lut_init = 0;  /* rebuild on next scanout */
+    s_screen_lut_gen++;     /* GL renderer re-uploads its LUT texture */
 }
 
 static void screen_lut_ensure(void) {
@@ -2185,6 +2187,13 @@ static void screen_lut_ensure(void) {
         color_lut_destroy(s_screen_lut);
         s_screen_lut = NULL;
     }
+}
+
+int gpu_screen_lut_snapshot(const uint8_t** table_out) {
+    screen_lut_ensure();
+    if (table_out)
+        *table_out = s_screen_lut ? color_lut_table_rgb(s_screen_lut) : NULL;
+    return s_screen_lut_gen;
 }
 
 static void gpu_rgb555_to_rgb888(uint16_t c, uint8_t* r, uint8_t* g, uint8_t* b) {
