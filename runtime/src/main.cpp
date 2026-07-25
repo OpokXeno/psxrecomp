@@ -54,6 +54,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
 #include "game_options.h"
+#include "debug_overlay.h"
 #include "crc32.h"
 #include "disc_identity.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
@@ -494,6 +495,37 @@ static int           g_video_win_w    = 1280; /* window width (height follows as
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
 static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
+
+/* Live setters for the launcher-equivalent video/audio options, consumed by
+ * the debug overlay's Toggles section (and reachable over TCP widget_action).
+ * C linkage, matching the g_turbo_loads_enabled pattern. All take effect
+ * live: antialiasing (present-path filter), screen model (LUT rebuild on
+ * next scanout), turbo loads (load poll), SPU HQ (lazy SPU-shadow
+ * re-resolution), supersampling (renderer raster rebuild at next present —
+ * glb_set_scale arms s_scale_apply_pending). */
+extern "C" {
+int  psx_video_get_supersampling(void)  { return g_video_scale; }
+void psx_video_set_supersampling(int s) {
+    if (s < 1) s = 1;
+    if (s > 8) s = 8;
+    g_video_scale = s;
+    gr_set_scale(s);
+}
+int  psx_video_get_antialiasing(void)   { return g_video_aa ? 1 : 0; }
+void psx_video_set_antialiasing(int on) { g_video_aa = (on != 0); }
+int  psx_video_get_screen_model(void)   { return g_video_screen; }
+void psx_video_set_screen_model(int k)  {
+    if (k < 0) k = 0;
+    if (k > 3) k = 3;
+    g_video_screen = k;
+    gpu_set_screen_kind(k);
+}
+int  psx_audio_get_spu_hq(void)         { return g_audio_spu_hq ? 1 : 0; }
+void psx_audio_set_spu_hq(int on)       {
+    g_audio_spu_hq = (on != 0);
+    spu_shadow_set_enabled(on);
+}
+}
 /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
  * movie's per-movie total minus 3; writing the current movie's total down to
@@ -598,6 +630,21 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     }
     *w = width;
     *h = width * den / num;
+}
+
+/* Window-resolution setter for the debug overlay (launcher parity: the
+ * launcher stores window_width; height follows the configured aspect).
+ * Live: every present path re-reads the drawable size per frame. */
+extern "C" int psx_video_get_window_width(void) { return g_video_win_w; }
+extern "C" void psx_video_set_window_width(int w) {
+    if (w < 640) w = 640;
+    if (w > 7680) w = 7680;
+    g_video_win_w = w;
+    if (sdl_window) {
+        int ww = w, hh = 0;
+        clamp_window_aspect(&ww, &hh, g_video_aspect_num, g_video_aspect_den);
+        SDL_SetWindowSize(sdl_window, ww, hh);
+    }
 }
 
 static int aspect_gcd(int a, int b) {
@@ -1210,6 +1257,7 @@ static void shutdown_runtime(void) {
     }
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
+    psx_debug_overlay_shutdown();
     debug_server_shutdown();
 }
 
@@ -2294,6 +2342,13 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
  * (arrows=d-pad, X/S/Z/A=Cross/Circle/Square/Triangle, Q/W/E/R=L1/R1/L2/R2,
  * Return=Start, RShift=Select) plus T/Y=L3/R3 stick clicks. */
 static uint16_t pad_from_keyboard(int player) {
+    /* Overlay mask: when the overlay is open AND ImGui wants the keyboard
+     * (text input or keyboard nav), ImGui's WantCaptureKeyboard does NOT
+     * stop this POLLING sampler — only SDL text events are rerouted. We
+     * must return the active-low "all released" word (0xFFFF, same value
+     * the controller-not-connected path already uses) so the game sees no
+     * keys while the user is typing in the overlay. */
+    if (psx_debug_overlay_swallow_keyboard()) return (uint16_t)0xFFFF;
     const Uint8* keys = SDL_GetKeyboardState(NULL);
     return psx_keybinds_pad_word(keys, player);
 }
@@ -2390,7 +2445,12 @@ static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], boo
     if (p.kind == 1) {
         /* Keyboard analog: the configurable left/right stick-direction binds
          * (default = arrow keys on the LEFT stick; RIGHT stick unbound), so the
-         * old keyboard analog behaviour is preserved unless the user rebinds. */
+         * old keyboard analog behaviour is preserved unless the user rebinds.
+         * Overlay mask: when the overlay is open and wants the keyboard, leave
+         * the sticks centred (the out[] init above) so arrow keys typed into a
+         * text field don't push the analog stick — mirrors the pad_from_keyboard
+         * mask one frame earlier. */
+        if (psx_debug_overlay_swallow_keyboard()) return;
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         psx_keybinds_sticks(keys, player, out);
         return;
@@ -2431,6 +2491,13 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always)
             return true;
     }
     if (p.kind == 1 || kb_always) {
+        /* Overlay mask: when the overlay is open and wants the keyboard,
+         * return false so the HYBRID mode doesn't drop to digital just
+         * because the user pressed an arrow key inside an ImGui widget —
+         * mirrors the pad_from_keyboard and pad_sticks_for keyboard masks
+         * so the keyboard contributes NOTHING to the pad while the overlay
+         * is capturing. */
+        if (psx_debug_overlay_swallow_keyboard()) return false;
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         if (psx_keybinds_dpad_active(keys, player)) return true;
     }
@@ -3175,6 +3242,12 @@ static void sdl_vblank_present(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            /* Hand the event to the in-game debug overlay first. When the
+             * overlay consumes it (e.g. Ctrl+F3 toggles visibility), skip
+             * the rest of the loop body — plain F3 must still fall through
+             * to the savestate block below, but Ctrl+F3 must NOT also
+             * load slot 2, so the gate sits ahead of every F1-F12 check. */
+            if (psx_debug_overlay_process_event(&ev)) continue;
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
                     netplay_soft_exit("sdl_window_close");
@@ -6088,6 +6161,13 @@ session_reboot:
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
+
+    /* Wire the in-game debug overlay. The GL context is owned by
+     * gpu_gl_renderer.c (created above in g_video_renderer==1) and is not
+     * directly reachable from this site; T12 reads the renderer-owned
+     * context to do the real ImGui init, so we pass NULL for ctx here.
+     * The header guarantees the API is a no-op on a null context. */
+    psx_debug_overlay_init(sdl_window, nullptr);
 
     /* Delay-sync LAN (recomp-net). Menu/lobby UI is later work — CLI/env only.
      * Must start after SDL so local pad capture has devices; before the guest
