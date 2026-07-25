@@ -225,7 +225,9 @@ static char     s_teleport_filter[64] = {0};
 static char     s_teleport_status[96] = {0};
 static int      s_teleport_status_frames = 0;
 static int      s_last_teleport_id   = -1;
-static int      s_last_teleport_tick = 0;
+static uint32_t s_teleport_source_context = 0u;
+static uint64_t s_teleport_ready_ms = 0u;
+static constexpr uint64_t kTeleportSettleMs = 10000u;
 
 static int      s_party_slot[3]      = {0, 1, 2};
 static int      s_party_bitfield     = 0x07FF;
@@ -277,9 +279,9 @@ static char     s_camera_status[64]  = {0};
  * Jump button; unverified events are shown but disabled. */
 static int      s_event_filter_sel   = -1;
 static char     s_event_filter[64]   = {0};
+static bool     s_allow_unverified_events = false;
 static int      s_event_jump_status_frames = 0;
 static char     s_event_jump_status[128] = {0};
-static bool     s_allow_unverified_events = false;
 
 /* ---- small helpers ------------------------------------------------------ */
 
@@ -744,6 +746,9 @@ static constexpr uint32_t kAddr_teleportArm         = 0x800ADBC4u;
 static constexpr uint32_t kAddr_teleportGateMusic   = 0x8004F308u;
 static constexpr uint32_t kAddr_teleportGateAnim    = 0x800ADB90u;
 static constexpr uint32_t kAddr_fieldEntryPointU16  = 0x8006EF66u;
+static constexpr uint32_t kAddr_fieldPositionX      = 0x8006EF82u;
+static constexpr uint32_t kAddr_fieldPositionZ      = 0x8006EF84u;
+static constexpr uint32_t kAddr_fieldPositionY      = 0x8006EF86u;
 /* currentParty in gameState (0x8006F368) is a per-frame COPY: the field
  * kernel's sync routine (0x800A3200, runs every frame) reloads it from the
  * kernel party slots at 0x80062590 (3 x u32, low byte = char id,
@@ -794,6 +799,13 @@ static void write_u16_le(uint32_t addr, uint16_t val)
     psx_write_byte(addr + 1, (uint8_t)((val >> 8) & 0xFFu));
 }
 
+static void reset_teleport_position(void)
+{
+    write_u16_le(kAddr_fieldPositionX, 0u);
+    write_u16_le(kAddr_fieldPositionZ, 0u);
+    write_u16_le(kAddr_fieldPositionY, 0u);
+}
+
 static uint16_t read_u16_le(uint32_t addr)
 {
     return (uint16_t)((uint32_t)psx_read_byte(addr) |
@@ -832,15 +844,19 @@ int psx_debug_overlay_teleport(int fieldId, int entryPoint)
     if (!field_module_active()) {
         return 1;
     }
+    if (s_teleport_source_context != 0u || s_teleport_ready_ms != 0u) {
+        return 2;
+    }
+    s_teleport_source_context = read_u32_le(kAddr_fieldContextPtr);
     write_u32_le(kAddr_teleportGate1,        0u);
     write_u32_le(kAddr_fieldChangePrevented, 0u);
     write_u32_le(kAddr_fieldMapNumber,      (uint32_t)fieldId);
     write_u16_le(kAddr_fieldEntryPointU16,  (uint16_t)((unsigned)entryPoint & 0xFFFFu));
+    reset_teleport_position();
     write_u32_le(kAddr_teleportGateMusic,    0u);
     write_u32_le(kAddr_teleportGateAnim,     0u);
     write_u32_le(kAddr_teleportArm,          0xFFu);
     s_last_teleport_id = fieldId;
-    s_last_teleport_tick = 0;
     return 0;
 }
 
@@ -1109,7 +1125,6 @@ static void draw_teleport_section(void)
         ImGui::EndChild();
     }
 
-    if (s_last_teleport_tick >= 0) s_last_teleport_tick++;
 }
 
 /* ---- Party editor UI --------------------------------------------------- */
@@ -1539,6 +1554,10 @@ static void draw_event_jump_section(void)
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Substring match on event name or id (decimal).");
     }
+    ImGui::Checkbox("Allow unverified events##ej", &s_allow_unverified_events);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable Jump for events whose status is not verified.");
+    }
 
     int n_verified = 0;
     for (int i = 0; i < ne; i++) if (evs[i].verified) n_verified++;
@@ -1554,10 +1573,6 @@ static void draw_event_jump_section(void)
     if (!field_module_active()) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
             "Field module NOT active — Jump buttons will be refused.");
-    ImGui::Checkbox("Allow unverified events##ej", &s_allow_unverified_events);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Enable Jump for events whose status is not verified.");
-    }
     }
 
     if (ImGui::BeginTable("events", 5,
@@ -1946,6 +1961,18 @@ void psx_debug_overlay_pre_swap(void)
             std::snprintf(path, sizeof(path), "debug_overlay/data");
         }
         (void)dbg_data_load_all(path);
+    }
+
+    if (s_teleport_source_context != 0u) {
+        uint32_t field_context = read_u32_le(kAddr_fieldContextPtr);
+        if (field_context != 0u && field_context != s_teleport_source_context) {
+            s_teleport_source_context = 0u;
+            s_teleport_ready_ms = SDL_GetTicks64() + kTeleportSettleMs;
+        }
+    }
+    if (s_teleport_ready_ms != 0u && SDL_GetTicks64() >= s_teleport_ready_ms) {
+        s_last_teleport_id = -1;
+        s_teleport_ready_ms = 0u;
     }
 
     /* Step 1c: free-camera per-frame write. Runs BEFORE the ImGui
