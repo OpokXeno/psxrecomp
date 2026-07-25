@@ -68,6 +68,7 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
 #include "latency_ring.h"
+#include "debug_overlay.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -117,7 +118,10 @@
 
 #define VRAM_W 1024
 #define VRAM_H 512
-#define GL_MAX_INTERNAL_SCALE 4
+/* User-facing cap. x8 = 8192x4096 — inside every
+ * modern driver's GL_MAX_TEXTURE_SIZE. The live-rebuild fallback in
+ * gl_maybe_apply_scale still restores the previous scale if refused. */
+#define GL_MAX_INTERNAL_SCALE 8
 
 /* ---- Loaded modern-GL entry points ------------------------------------- */
 typedef GLuint (APIENTRY *PFN_glCreateShader)(GLenum);
@@ -132,6 +136,9 @@ typedef void   (APIENTRY *PFN_glLinkProgram)(GLuint);
 typedef void   (APIENTRY *PFN_glGetProgramiv)(GLuint, GLenum, GLint *);
 typedef void   (APIENTRY *PFN_glGetProgramInfoLog)(GLuint, GLsizei, GLsizei *, char *);
 typedef void   (APIENTRY *PFN_glUseProgram)(GLuint);
+typedef void   (APIENTRY *PFN_glDeleteProgram)(GLuint);
+typedef void   (APIENTRY *PFN_glDeleteBuffers)(GLsizei, const GLuint *);
+typedef void   (APIENTRY *PFN_glDeleteVertexArrays)(GLsizei, const GLuint *);
 typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
@@ -197,6 +204,9 @@ static PFN_glLinkProgram       p_glLinkProgram;
 static PFN_glGetProgramiv      p_glGetProgramiv;
 static PFN_glGetProgramInfoLog p_glGetProgramInfoLog;
 static PFN_glUseProgram        p_glUseProgram;
+static PFN_glDeleteProgram     p_glDeleteProgram;
+static PFN_glDeleteBuffers     p_glDeleteBuffers;
+static PFN_glDeleteVertexArrays p_glDeleteVertexArrays;
 static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform1f         p_glUniform1f;
@@ -256,6 +266,8 @@ static int load_modern_gl(void) {
     LOAD(p_glCreateProgram, "glCreateProgram"); LOAD(p_glAttachShader, "glAttachShader");
     LOAD(p_glLinkProgram, "glLinkProgram");     LOAD(p_glGetProgramiv, "glGetProgramiv");
     LOAD(p_glGetProgramInfoLog, "glGetProgramInfoLog"); LOAD(p_glUseProgram, "glUseProgram");
+    LOAD(p_glDeleteProgram, "glDeleteProgram"); LOAD(p_glDeleteBuffers, "glDeleteBuffers");
+    LOAD(p_glDeleteVertexArrays, "glDeleteVertexArrays");
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
     LOAD(p_glUniform1f, "glUniform1f");
     LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4i, "glUniform4i");
@@ -303,11 +315,21 @@ static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) *
 
 static int           s_scale = 1;          /* internal-res scale (hr FBO) */
 static int           s_req_scale = 1;      /* requested before context init */
+static int           s_scale_apply_pending = 0; /* set by glb_set_scale; consumed at next present */
 
 static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) */
 static int           s_present_w = 0, s_present_h = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
 static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
+static GLint         s_present_uLut = -1, s_present_uLutOn = -1;
+/* Present-time screen LUT (CRT/composite/trinitron color grade): the baked
+ * gpu.c table as a 256x128 RGB8 texture, re-uploaded only when the
+ * generation counter bumps. Applied on the 15-bit game present paths
+ * (present_target_quad callers); the 24-bit FMV/CPU path keeps it off,
+ * mirroring the documented CPU-path semantics. */
+static GLuint        s_lut_tex = 0;
+static int           s_lut_gen_seen = -1;
+static int           s_lut_on = 0;
 static GLuint        s_interp_prog = 0, s_interp_tex[3];
 static GLsync        s_interp_fence[3];
 static GLsync        s_interp_draw_fence = NULL;
@@ -734,8 +756,19 @@ static const char *PRESENT_VS =
     "  gl_Position = vec4(p*2.0-1.0,0.0,1.0); }\n";
 static const char *PRESENT_FS =
     "#version 330\n"
-    "in vec2 v_uv; uniform sampler2D u_tex; out vec4 frag;\n"
-    "void main(){ frag = texture(u_tex, v_uv); }\n";
+    "in vec2 v_uv; uniform sampler2D u_tex; uniform sampler2D u_screenlut;\n"
+    "uniform int u_screenlut_on; out vec4 frag;\n"
+    "void main(){\n"
+    "    frag = texture(u_tex, v_uv);\n"
+    "    if (u_screenlut_on == 1) {\n"
+    /* Quantize back to the exact source 5-bit channels (both the <<3 and
+     * the <<3|>>2 expansions recover exactly under >>3), index the baked
+     * BGR555 screen LUT (256x128 RGB8 upload of the CPU scanout table). */
+    "        ivec3 q = ivec3(clamp(frag.rgb, 0.0, 1.0) * 255.0 + 0.5) >> 3;\n"
+    "        int idx = (q.b << 10) | (q.g << 5) | q.r;\n"
+    "        frag.rgb = texelFetch(u_screenlut, ivec2(idx & 255, idx >> 8), 0).rgb;\n"
+    "    }\n"
+    "}\n";
 static const char *INTERP_FS =
     "#version 330\n"
     "in vec2 v_uv; uniform sampler2D u_prev; uniform sampler2D u_curr;\n"
@@ -2004,6 +2037,9 @@ static void glb_set_scale(int s) {
     if (s < 1) s = 1;
     if (s > GL_MAX_INTERNAL_SCALE) s = GL_MAX_INTERNAL_SCALE;
     s_req_scale = s;
+    /* Applied at the next present (context current, no draw in flight) via
+     * gl_maybe_apply_scale — callers may be on threads without GL. */
+    s_scale_apply_pending = 1;
     sw_renderer_set_scale(1);
 }
 static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (was a stub 1; the
@@ -2420,6 +2456,58 @@ static int init_gpu_raster(void) {
     return 1;
 }
 
+/* Tear down everything init_gpu_raster created (programs, textures, hr
+ * renderbuffer, FBOs, VAOs/VBOs, s_conv). The GL context itself and the
+ * lazily-created surfaces (s_present_tex, wide compositor surfaces) are
+ * untouched. Used by the live internal-scale change path. */
+static void destroy_gpu_raster(void) {
+    if (s_geo_prog)     { p_glDeleteProgram(s_geo_prog);     s_geo_prog = 0; }
+    if (s_tex_prog)     { p_glDeleteProgram(s_tex_prog);     s_tex_prog = 0; }
+    if (s_blit_prog)    { p_glDeleteProgram(s_blit_prog);    s_blit_prog = 0; }
+    if (s_pack_prog)    { p_glDeleteProgram(s_pack_prog);    s_pack_prog = 0; }
+    if (s_stencil_prog) { p_glDeleteProgram(s_stencil_prog); s_stencil_prog = 0; }
+    if (s_hr_tex)      { glDeleteTextures(1, &s_hr_tex);      s_hr_tex = 0; }
+    if (s_scratch_tex) { glDeleteTextures(1, &s_scratch_tex); s_scratch_tex = 0; }
+    if (s_up_tex)      { glDeleteTextures(1, &s_up_tex);      s_up_tex = 0; }
+    if (s_raw_tex)     { glDeleteTextures(1, &s_raw_tex);     s_raw_tex = 0; }
+    if (s_hr_rb)       { p_glDeleteRenderbuffers(1, &s_hr_rb); s_hr_rb = 0; }
+    if (s_hr_fbo)      { p_glDeleteFramebuffers(1, &s_hr_fbo);      s_hr_fbo = 0; }
+    if (s_raw_fbo)     { p_glDeleteFramebuffers(1, &s_raw_fbo);     s_raw_fbo = 0; }
+    if (s_scratch_fbo) { p_glDeleteFramebuffers(1, &s_scratch_fbo); s_scratch_fbo = 0; }
+    if (s_geo_vbo)     { p_glDeleteBuffers(1, &s_geo_vbo);   s_geo_vbo = 0; }
+    if (s_tex_vbo)     { p_glDeleteBuffers(1, &s_tex_vbo);   s_tex_vbo = 0; }
+    if (s_blit_vbo)    { p_glDeleteBuffers(1, &s_blit_vbo);  s_blit_vbo = 0; }
+    if (s_geo_vao)     { p_glDeleteVertexArrays(1, &s_geo_vao);   s_geo_vao = 0; }
+    if (s_tex_vao)     { p_glDeleteVertexArrays(1, &s_tex_vao);   s_tex_vao = 0; }
+    if (s_blit_vao)    { p_glDeleteVertexArrays(1, &s_blit_vao);  s_blit_vao = 0; }
+    if (s_empty_vao)   { p_glDeleteVertexArrays(1, &s_empty_vao); s_empty_vao = 0; }
+    free(s_conv); s_conv = NULL;
+    s_raster_ok = 0;
+}
+
+/* Apply a pending internal-scale change: full raster rebuild at the new
+ * scale. Called at the top of every present path — the one place where the
+ * GL context is guaranteed current and no draw is in flight. Cheap no-op
+ * when nothing is pending. */
+static void gl_maybe_apply_scale(void) {
+    if (!s_scale_apply_pending) return;
+    s_scale_apply_pending = 0;
+    if (!s_ctx || !s_raster_ok || s_scale == s_req_scale) return;
+    int prev = s_scale;
+    destroy_gpu_raster();
+    if (!init_gpu_raster()) {
+        /* Rebuild failed at the new scale; restore the previous one (same
+         * context + shaders that already linked once, so this is the
+         * certain-good configuration). */
+        s_req_scale = prev;
+        if (!init_gpu_raster()) {
+            fprintf(stderr, "psxrecomp: GL raster rebuild failed at %dx "
+                    "and at restore %dx — GL path dead, software mirror "
+                    "authoritative\n", s_req_scale, prev);
+        }
+    }
+}
+
 int gl_renderer_init_context(SDL_Window *win) {
     s_win = win;
     s_present_w = 0;
@@ -2456,6 +2544,12 @@ int gl_renderer_init_context(SDL_Window *win) {
             p_glGenVertexArrays(1, &s_present_vao);
             s_present_uTex = p_glGetUniformLocation(s_present_prog, "u_tex");
             s_present_uUvRect = p_glGetUniformLocation(s_present_prog, "u_uv_rect");
+            s_present_uLut = p_glGetUniformLocation(s_present_prog, "u_screenlut");
+            s_present_uLutOn = p_glGetUniformLocation(s_present_prog, "u_screenlut_on");
+            p_glUseProgram(s_present_prog);
+            p_glUniform1i(s_present_uLut, 1);  /* LUT texture lives on unit 1 */
+            p_glUniform1i(s_present_uLutOn, 0);
+            p_glUseProgram(0);
             s_interp_uPrev = p_glGetUniformLocation(s_interp_prog, "u_prev");
             s_interp_uCurr = p_glGetUniformLocation(s_interp_prog, "u_curr");
             s_interp_uAlpha = p_glGetUniformLocation(s_interp_prog, "u_alpha");
@@ -2539,6 +2633,7 @@ void gl_renderer_shutdown(void) {
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w) {
     if (!s_ctx) return;
+    gl_maybe_apply_scale();
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
@@ -2577,6 +2672,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, linear);
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
+    p_glUniform1i(s_present_uLutOn, 0);  /* 24-bit/FMV frames: LUT off (documented semantics) */
     if (crop) {
         p_glUniform4f(s_present_uUvRect, 0.f, 0.f, uv_x1, 1.f);
     } else if (!linear && src_w > 0 && src_h > 0) {
@@ -2590,6 +2686,14 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
+    /* Pre-swap hook. The renderer's draw left the default framebuffer
+     * implicit (no explicit FBO 0 bind on this path), so defensively
+     * rebind FBO 0 to both DRAW and READ before the hook — the overlay
+     * init/ImGui/window_shot readback expects to operate on the default
+     * framebuffer. */
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -2599,11 +2703,19 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
+    gl_maybe_apply_scale();
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
+    /* Pre-swap hook on the blank path. No draw happens on this path, so
+     * the back buffer is whatever the previous frame left (or the clear
+     * above) — defensive FBO-0 rebind keeps the hook operating on the
+     * default framebuffer regardless of the path's prior state. */
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3052,6 +3164,12 @@ static void gl_perf_init(void) {
 #ifdef PSX_NO_DEBUG_TOOLS
     return;
 #else
+    /* Idempotent: init_gpu_raster calls this on every (re)build — the live
+     * scale-change path re-enters, and re-GenQuery'ing would leak query
+     * objects in the live context. */
+    static int s_pf_done = 0;
+    if (s_pf_done) return;
+    s_pf_done = 1;
     /* Timer queries are intentionally available in diagnostics builds, but a
      * driver may serialize command submission while collecting them.  Keep an
      * escape hatch so frame cadence can be A/B tested without rebuilding or
@@ -3480,17 +3598,46 @@ static int interp_thread_main(void *opaque) {
     return 0;
 }
 
+/* Re-upload the screen LUT texture only when gpu.c's generation bumps.
+ * Cheap per-present no-op otherwise. */
+static void update_screen_lut(void) {
+    const uint8_t *tab = NULL;
+    int gen = gpu_screen_lut_snapshot(&tab);
+    if (gen == s_lut_gen_seen) return;
+    s_lut_gen_seen = gen;
+    if (!tab) { s_lut_on = 0; return; }
+    if (!s_lut_tex) {
+        glGenTextures(1, &s_lut_tex);
+        glBindTexture(GL_TEXTURE_2D, s_lut_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_lut_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 256, 128, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, tab);
+    s_lut_on = 1;
+}
+
 static void present_target_quad(GLuint tex, int tex_w, int tex_h,
                                 int x, int y, int w, int h, int linear,
                                 int lx, int ly, int lw, int lh) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glViewport(lx, ly, lw, lh);
+    update_screen_lut();
+    if (s_lut_on) {
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, s_lut_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+    }
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
+    p_glUniform1i(s_present_uLutOn, s_lut_on);
     /* Half-texel inset: with GL_LINEAR, corner-mapped UVs make the outermost
      * dest pixels blend the border texel with VRAM outside the content rect
      * (visible edge stripe with AA on). Center-mapped UVs keep edge samples
@@ -3507,6 +3654,7 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
+    gl_maybe_apply_scale();
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
@@ -3549,6 +3697,11 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
+    /* Pre-swap hook. present_target_quad already bound FBO 0 (DRAW only)
+     * for its own draw at the top of this function; rebind READ too so
+     * the hook's readback targets the default framebuffer's back buffer. */
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3601,6 +3754,7 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
+    gl_maybe_apply_scale();
     GLuint fbo = 0, tex = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) {
@@ -3645,6 +3799,12 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     present_target_quad(tex, g_wide_w, VRAM_H,
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
+    /* Pre-swap hook on the wide FBO path. present_target_quad bound FBO 0
+     * (DRAW) for its own blit earlier; rebind READ here so the readback in
+     * the hook targets the default framebuffer's back buffer, not whatever
+     * FBO wide_blit_center left bound. */
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
