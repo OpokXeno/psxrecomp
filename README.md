@@ -250,6 +250,31 @@ Running this repository's runtime without a game is useful for **BIOS-only
 memory-card management**; to build and play a title, use its game repo from the
 [Games](#games) table.
 
+## Do I need a PlayStation BIOS?
+
+**Usually not.** Builds include **OpenBIOS** — a free, open-source PlayStation
+BIOS from the [PCSX-Redux](https://github.com/grumpycoders/pcsx-redux) project
+that we're allowed to distribute. If you don't choose a BIOS, that's what runs.
+Bring a game disc image and play.
+
+**If you'd rather use your own BIOS**, pick your dumped `SCPH1001.BIN` in
+settings and it will be used instead. Clear that choice to go back to OpenBIOS.
+
+Two things worth knowing:
+
+- It has to be the *exact* image the build was made for — the game code is
+  compiled against it, so a different dump can't be swapped in. If yours doesn't
+  match, the game says which one it expects, and you can carry on with OpenBIOS.
+- **Save files work either way.** Memory cards are shared. *Savestates* are not:
+  one made with OpenBIOS won't load under your own BIOS, or the other way round,
+  so the game won't let you mix them.
+
+A few games don't run correctly on OpenBIOS. Those builds ask for a real BIOS
+and say so up front.
+
+> Developers: see [`docs/BIOS_SELECTION.md`](docs/BIOS_SELECTION.md) for the
+> `[runtime] openbios` setting and the selection rules.
+
 ## Release Package
 
 **This repository's release is BIOS-only** — it is the framework runtime, not a
@@ -258,17 +283,21 @@ release from the [Games](#games) table.
 
 1. Download `PSXRecomp-v*-windows-x64.zip` from Releases.
 2. Extract it and run `PSXRecomp.exe`.
-3. Select your legally obtained `SCPH1001.BIN` BIOS when prompted.
+3. It boots on the bundled OpenBIOS. To use your own dump instead, pick it in
+   settings.
 
-The package does not include a PS1 BIOS, game disc image, generated game code,
-or save data. The selected BIOS path is saved next to the executable as
-`bios.cfg`; delete that file to pick a different BIOS later.
+The package includes `bios/openbios.bin` and its MIT notice at
+`bios/OpenBIOS.LICENSE`, but no retail PS1 BIOS, game disc image, generated game
+code, or save data. If you choose your own BIOS, that path is remembered next
+to the executable as `bios.cfg`; clear the choice (or delete that file) to go
+back to OpenBIOS.
 
 The game recomp projects use the same runtime picker contract but ship a
-**Dear ImGui launcher**: on first run it prompts for your legally obtained BIOS
-and game disc image, then lets you configure video, controls, and per-game
-settings before launching. Keyboard/controller mappings live in each game's repo
-and launcher, not here.
+**Dear ImGui launcher**: on first run it asks for the game disc image and uses
+OpenBIOS automatically. The optional BIOS row lets you select your own verified
+retail dump or clear that choice to return to OpenBIOS. The launcher also
+configures video, controls, and per-game settings. Keyboard/controller mappings
+live in each game's repo and launcher, not here.
 
 ## Setup
 
@@ -284,7 +313,9 @@ prerequisites in [`docs/BUILDING.md`](docs/BUILDING.md)):
 - A C/C++ toolchain: MSVC or MinGW/MSYS2 (Windows), Apple Clang (macOS),
   Clang/GCC (Linux). CMake 3.20+; on macOS/Linux also `ninja` and `pkg-config`.
 - SDL2 (system / bundled).
-- A legally obtained `SCPH1001.BIN` BIOS dump. Not included.
+- A PS1 BIOS is **optional** — builds ship OpenBIOS. Supply a legally obtained
+  `SCPH1001.BIN` dump only if you want to run on the retail BIOS instead
+  (see [Do I need a PlayStation BIOS?](#do-i-need-a-playstation-bios)).
 - For game projects, a legally obtained game disc/EXE dump. Not included.
 
 Build the framework (recompiler tool + BIOS-only runtime):
@@ -293,7 +324,7 @@ Build the framework (recompiler tool + BIOS-only runtime):
 git clone --recurse-submodules https://github.com/mstan/psxrecomp.git && cd psxrecomp
 
 cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build recompiler/build
-cmake -S runtime    -B runtime/build    -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build runtime/build --target psx-runtime
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_RECOMP_UI=OFF && cmake --build runtime/build --target psx-runtime
 ```
 
 On Windows swap `-G Ninja` for your generator if you prefer (e.g.
@@ -396,13 +427,14 @@ discussion happens in the **R.A.I.D.** Discord (invite below).
 
 PolyForm Noncommercial 1.0.0. See `LICENSE`.
 
-The PSX BIOS and game disc images remain copyrighted by their respective
-owners. This project distributes no BIOS images, no disc images, and no
-game assets — those are always supplied by the user from their own
-collection. Release executables (and per-game overlay caches) contain
-statically recompiled (machine-translated) builds of the original code,
-the same distribution model used by other static recompilation projects
-such as N64: Recompiled.
+Retail PS1 BIOS images and game disc images remain copyrighted by their
+respective owners and are not distributed. This project does distribute the
+from-scratch, MIT-licensed OpenBIOS image under the notice in
+[`bios/OpenBIOS.LICENSE`](bios/OpenBIOS.LICENSE). Game assets and disc data are
+always supplied by the user from their own collection. Release executables (and
+per-game overlay caches) contain statically recompiled (machine-translated)
+builds of the original code, the same distribution model used by other static
+recompilation projects such as N64: Recompiled.
 
 ---
 

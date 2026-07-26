@@ -6,6 +6,8 @@
  */
 
 #include "cpu_state.h"
+#include "psx_bios_image.h"    /* the active BIOS's self-description */
+#include "psx_bios_backend.h"  /* routing to whichever BIOS was selected */
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
 #include "parity_trace.h"    /* general two-process control-flow parity ring */
 #include "device_trace.h"    /* general two-process device-event cycle ring */
@@ -57,6 +59,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "debug_overlay.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "disc_path.h"
+#include "bios_rom_alias.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "launcher_device.h" /* recomp-ui controller-source round-trip */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
@@ -909,13 +913,25 @@ static void launcher_info(const char* title, const std::string& msg) {
  * config loads, before any interactive file resolution. */
 static std::string s_picker_game_name = "PSXRecomp";
 
+/* BIOS selection state (docs/BIOS_SELECTION.md). s_openbios_allowed is the
+ * game's [runtime] openbios; s_bundled_bios_rel is where the shipped
+ * redistributable image lives relative to the executable. */
+static bool        s_openbios_allowed  = true;
+#ifdef PSX_BUNDLED_BIOS_PATH
+static std::string s_bundled_bios_rel  = PSX_BUNDLED_BIOS_PATH;
+#else
+static std::string s_bundled_bios_rel  = "bios/openbios.bin";
+#endif
+
 static bool pick_runtime_file(const char* title, const char* filter,
-                              std::filesystem::path& out) {
+                              std::filesystem::path& out, const char* cli_flag) {
     // Headless: never open an interactive file dialog (it blocks). Fail the
     // resolve so boot aborts cleanly with the stderr message the caller printed.
     if (g_headless) {
-        std::fprintf(stderr, "psxrecomp: headless — cannot prompt for '%s'; "
-                             "supply it via game.toml / --disc / --bios.\n", title);
+        std::fprintf(stderr,
+            "psxrecomp: headless — cannot prompt for '%s'.\n"
+            "  Supply it on the command line:  %s <path>   (or set it in game.toml).\n",
+            title, cli_flag);
         return false;
     }
 #ifdef _WIN32
@@ -938,7 +954,16 @@ static bool pick_runtime_file(const char* title, const char* filter,
 #else
     (void)filter;
     (void)out;
-    std::fprintf(stderr, "psxrecomp: %s requires a command-line path on this platform.\n", title);
+    // No native GUI file picker on this platform (macOS/Linux): the file must be
+    // named on the command line. Tell the user the exact flag + a full example
+    // instead of a dead-end "requires a command-line path".
+    std::fprintf(stderr,
+        "psxrecomp: no graphical file picker on this platform — '%s'\n"
+        "  must be supplied on the command line:  %s <path>\n"
+        "  Example:  ./<game-exe> --game game.toml "
+        "--bios /path/to/SCPH1001.BIN --disc /path/to/game.cue\n"
+        "  (or set the path in game.toml). See the game's README, \"Building From Source\".\n",
+        title, cli_flag);
     return false;
 #endif
 }
@@ -1015,87 +1040,155 @@ static bool validate_disc_for_launch(const std::filesystem::path& path,
     return true;
 }
 
+// Canonicalize whichever member of a dump the user pointed us at. Picking the
+// .cue and picking the .bin must both mount and both verify — see
+// runtime/include/disc_path.h for the preference rules. This used to swap a
+// .cue for its same-named .bin unconditionally, which silently discarded the
+// cue's table of contents (and with it every CD-DA track and pregap) on
+// single-file multi-track dumps.
+// Pure: no dialog here. Every caller feeds the result to
+// validate_disc_for_launch(), whose detail text already carries the resolver's
+// note (identify_disc surfaces it), so a broken dump is reported exactly once
+// instead of popping a modal on every boot.
 static std::filesystem::path normalize_disc_path_for_launch(const std::filesystem::path& path) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::path p = fs::absolute(path, ec);
-    if (ec) p = path;
-
-    if (uppercase_ascii(p.extension().string()) == ".CUE") {
-        fs::path bin = p;
-        bin.replace_extension(".bin");
-        if (fs::exists(bin, ec)) {
-            fs::path abs = fs::absolute(bin, ec);
-            return ec ? bin : abs;
-        }
-        ec.clear();
-        bin.replace_extension(".BIN");
-        if (fs::exists(bin, ec)) {
-            fs::path abs = fs::absolute(bin, ec);
-            return ec ? bin : abs;
-        }
-    }
-
-    return p;
+    return PSXRecompV4::resolve_disc_path(path).mount;
 }
 
-static bool validate_bios_for_launch(const std::filesystem::path& path) {
+/* Which compiled-in backend, if any, was recompiled from THIS file?
+ *
+ * The chosen file is only ever DATA: the code that executes is the statically
+ * recompiled C of one specific image, so running it against another image's
+ * bytes is a guaranteed wild jump. Identity therefore decides WHICH backend
+ * may run, not merely whether to warn. Null = no linked image matches.
+ */
+static const PsxBiosBackend* bios_backend_for_file(const std::filesystem::path& path,
+                                                   uint32_t* out_crc,
+                                                   uint64_t* out_size) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return false;
+    if (!f.is_open()) return nullptr;
     const std::streamoff size = f.tellg();
-    if (size != 512 * 1024) {
-        launcher_warning("BIOS Warning",
-            "The selected BIOS is not 512 KiB. Please select SCPH1001.BIN.");
-        return false;
-    }
+    if (out_size) *out_size = (uint64_t)size;
+    if (size <= 0) return nullptr;
     std::vector<uint8_t> data((size_t)size);
-    if (!read_at(f, 0, data.data(), data.size())) return false;
+    if (!read_at(f, 0, data.data(), data.size())) return nullptr;
     const uint32_t crc = crc32_compute(data.data(), data.size());
-    if (crc != 0x37157331u) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-            "The selected BIOS CRC32 is %08X, but this build was validated with SCPH1001.BIN CRC32 37157331.\n\n"
-            "The runtime will try it anyway, but boot may fail.", crc);
-        launcher_warning("BIOS Warning", buf);
+    if (out_crc) *out_crc = crc;
+    for (uint32_t i = 0; i < psx_bios_registry_count; i++) {
+        const PsxBiosBackend* b = psx_bios_registry[i];
+        if (!b || !b->image) continue;
+        if ((uint64_t)size == (uint64_t)b->image->image_size &&
+            crc == b->image->image_crc32)
+            return b;
     }
-    return true;
+    return nullptr;
+}
+
+/* What a player may supply, for mismatch and picker copy. The bundled image is
+ * excluded: it is never something to go and find. */
+static std::string bios_accepted_images() {
+    std::string s;
+    for (uint32_t i = 0; i < psx_bios_registry_count; i++) {
+        const PsxBiosBackend* b = psx_bios_registry[i];
+        if (!b || !b->image || b->image->image_bundled) continue;
+        if (!s.empty()) s += ", ";
+        s += b->image->image_id;
+        s += " (" + std::to_string(b->image->image_size / 1024u) + " KB)";
+    }
+    return s.empty() ? std::string("(this build ships its own BIOS)") : s;
+}
+
+/* Identity-gate a player-chosen BIOS and activate its backend on success. */
+static bool validate_bios_for_launch(const std::filesystem::path& path) {
+    uint32_t crc = 0; uint64_t size = 0;
+    const PsxBiosBackend* b = bios_backend_for_file(path, &crc, &size);
+    if (b) return psx_bios_activate(b) != 0;
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "That BIOS (%llu bytes, CRC32 %08X) is not an image this build was "
+        "compiled from.\n\nThis build accepts: %s\n\nThe compiled-in code "
+        "would execute against mismatched data and crash.",
+        (unsigned long long)size, crc, bios_accepted_images().c_str());
+    launcher_warning("BIOS Mismatch", buf);
+    return false;
 }
 
 static std::filesystem::path resolve_bios_path(const char* requested, const char* argv0);
 
+/* Resolve which BIOS image file to load, and activate its backend.
+ *
+ * Policy (docs/BIOS_SELECTION.md):
+ *   no explicit player choice  -> bundled OpenBIOS, silently
+ *   explicit choice, matching  -> that image
+ *   explicit choice, mismatched-> explained; falls back to OpenBIOS if allowed
+ *   openbios disabled for this title -> a retail image is required
+ *
+ * "Explicit" means --bios or a remembered launcher/settings pick. Finding a
+ * file on disk deliberately does NOT count: discovery used to adopt whatever
+ * happened to sit near the executable, so two players with the same build
+ * could end up on different BIOSes.
+ */
 static std::filesystem::path resolve_bios_for_runtime(const char* requested,
-                                                      const char* argv0) {
-    std::filesystem::path resolved = resolve_bios_path(requested, argv0);
-    if (!resolved.empty() && std::filesystem::exists(resolved) &&
-        validate_bios_for_launch(resolved)) {
-        return resolved;
+                                                      const char* argv0,
+                                                      bool requested_is_explicit) {
+    const bool openbios_allowed = s_openbios_allowed;
+    const PsxBiosBackend* bundled = psx_bios_bundled();
+
+    /* 1. An explicit choice: --bios, else a remembered pick. */
+    std::filesystem::path chosen;
+    if (requested_is_explicit && requested && requested[0]) {
+        /* --bios, or a BIOS named in settings.toml. NOT the compile-time
+         * default: that is a build constant, not something the player asked
+         * for, and treating it as a choice made a stray file near the exe
+         * produce a "BIOS Mismatch" dialog before the bundled image was even
+         * considered. */
+        chosen = resolve_bios_path(requested, argv0);
+    } else {
+        std::filesystem::path cached = read_cached_path(argv0, "bios.cfg");
+        if (!cached.empty() && std::filesystem::exists(cached)) chosen = cached;
+    }
+    if (!chosen.empty() && std::filesystem::exists(chosen)) {
+        if (validate_bios_for_launch(chosen)) return chosen;   /* activates it */
+        /* Mismatched. With OpenBIOS available this is recoverable, so say so
+         * and carry on rather than dead-ending on a file they chose once. */
+        if (!(openbios_allowed && bundled)) return {};
     }
 
-    std::filesystem::path cached = read_cached_path(argv0, "bios.cfg");
-    if (!cached.empty() && std::filesystem::exists(cached) &&
-        validate_bios_for_launch(cached)) {
-        return cached;
+    /* 2. No usable explicit choice -> bundled OpenBIOS, if this title allows it. */
+    if (openbios_allowed && bundled) {
+        std::filesystem::path img = resolve_bios_path(
+            s_bundled_bios_rel.empty() ? nullptr : s_bundled_bios_rel.c_str(), argv0);
+        if (!img.empty() && std::filesystem::exists(img) &&
+            bios_backend_for_file(img, nullptr, nullptr) == bundled &&
+            psx_bios_activate(bundled)) {
+            return img;
+        }
+        launcher_warning("Bundled BIOS Missing",
+            std::string("This build ships its own BIOS (") +
+            bundled->image->image_id + "), but the bundled image is missing "
+            "or does not match.\n\nExpected next to the executable:\n" +
+            (s_bundled_bios_rel.empty() ? "(default path)" : s_bundled_bios_rel) +
+            "\n\nReinstall or rebuild.");
+        return {};
     }
 
-    /* Interactive pick. Be explicit about WHICH of the two user-supplied
-     * files is being requested — first-time users see two pickers in a
-     * row and the difference between "BIOS" and "disc image" is not
-     * obvious to non-technical players. */
+    /* 3. This title requires a retail BIOS: ask for one. */
+    const std::string accepted = bios_accepted_images();
     launcher_info((s_picker_game_name + " — PlayStation BIOS needed").c_str(),
-        s_picker_game_name + " does not include any Sony or game files.\n\n"
+        s_picker_game_name + " requires a PlayStation BIOS.\n\n"
         "Step 1 of 2 — PlayStation BIOS\n\n"
-        "In the next window, select your PlayStation BIOS dump. The file is "
-        "usually named SCPH1001.BIN and is exactly 512 KB. You must dump it "
-        "from your own console or otherwise legally obtain it.\n\n"
-        "(This is NOT the game disc — that is asked for next.)");
+        "In the next window, select your PlayStation BIOS dump. This build "
+        "requires the exact image it was compiled from: " + accepted + ". "
+        "You must dump it from your own console or otherwise legally obtain "
+        "it.\n\n(This is NOT the game disc — that is asked for next.)");
     std::string bios_title =
-        s_picker_game_name + " — Step 1 of 2: select PlayStation BIOS (SCPH1001.BIN)";
+        s_picker_game_name + " — Step 1 of 2: select PlayStation BIOS (" + accepted + ")";
     for (;;) {
         std::filesystem::path picked;
         if (!pick_runtime_file(
                 bios_title.c_str(),
                 "PlayStation BIOS (*.bin)\0*.bin\0All Files (*.*)\0*.*\0",
-                picked)) {
+                picked, "--bios")) {
             return {};
         }
         if (validate_bios_for_launch(picked)) {
@@ -1154,7 +1247,7 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         if (!pick_runtime_file(
                 disc_title.c_str(),
                 "PS1 Disc Images (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All Files (*.*)\0*.*\0",
-                picked)) {
+                picked, "--disc")) {
             return {};
         }
         picked = normalize_disc_path_for_launch(picked);
@@ -1173,11 +1266,26 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
         fs::path abs = fs::absolute(p, ec);
         return ec ? p : abs;
     }
+    // Either BIOS filename convention is acceptable: a dump folder holding
+    // "US-PSX-SCPH1001.BIN" satisfies a request for "SCPH1001.BIN" and vice
+    // versa (see recompiler/include/bios_rom_alias.h).
+    if (fs::path aliased = PSXRecompV4::resolve_bios_rom(p); aliased != p) {
+        fs::path abs = fs::absolute(aliased, ec);
+        return ec ? aliased : abs;
+    }
     if (p.is_absolute()) return p;
 
     // Anchor on the exe directory — never cwd (see exe_dir_from_argv).
     fs::path found = find_upward(exe_dir_from_argv(argv0), p);
     if (!found.empty()) return found / p;
+    // Same walk, accepting the other naming convention at each rung: the
+    // literal name is absent but a region-qualified sibling may be present.
+    for (fs::path dir = fs::absolute(exe_dir_from_argv(argv0), ec);
+         !dir.empty(); dir = dir.parent_path()) {
+        const fs::path aliased = PSXRecompV4::resolve_bios_rom(dir / p);
+        if (aliased != dir / p && fs::exists(aliased, ec)) return aliased;
+        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
+    }
 
     // Dev-checkout rung: game projects keep the framework at
     // <game root>/psxrecomp-v4 (junction/worktree), so a relative default like
@@ -4518,6 +4626,10 @@ int main(int argc, char** argv) {
     const char* game_config_path = nullptr;
     const char* disc_override_path = nullptr;
     bool        bios_from_cli = false;  /* CLI --bios/positional wins over settings.toml */
+    /* Did the PLAYER choose this BIOS (CLI or settings), as opposed to it
+     * being the compile-time default? Only a real choice overrides the
+     * bundled OpenBIOS — see docs/BIOS_SELECTION.md. */
+    bool        bios_explicit = false;
     /* Launcher overrides (mirrors snesrecomp): --launcher forces the GUI back on
      * even when [launcher] skip_launcher = true is set; --no-launcher (and the
      * PSX_NO_LAUNCHER env) forces it off. --launcher wins if both are given. */
@@ -4558,6 +4670,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
             bios_path = argv[++i];
             bios_from_cli = true;
+            bios_explicit = true;
         } else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc) {
             game_config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
@@ -4608,6 +4721,8 @@ int main(int argc, char** argv) {
             if (!bios_from_cli) {
                 bios_path = argv[i];
                 bios_from_cli = true;
+                bios_explicit = true;
+            bios_explicit = true;
             } else {
                 std::fprintf(stderr,
                     "psxrecomp: ignoring unexpected positional argument after BIOS selection: %s\n",
@@ -4886,6 +5001,9 @@ int main(int argc, char** argv) {
             fast_boot     = gc.runtime.fast_boot;
             bios_hle      = gc.runtime.bios_hle;
             bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
+            /* Developer compatibility finding, applied before BIOS selection.
+             * Not exposed to settings.toml on purpose — see BIOS_SELECTION.md. */
+            s_openbios_allowed  = gc.runtime.openbios;
             /* Let the dispatch layer distinguish "dirty because text was
              * loaded" from "diverged because runtime wrote different code over
              * the original EXE image". Packed/self-modifying games can rewrite
@@ -5150,7 +5268,14 @@ int main(int argc, char** argv) {
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         if (us.has_turbo_loads)    g_turbo_loads_enabled = us.turbo_loads ? 1 : 0;
-        if (us.has_fast_boot)      fast_boot = us.fast_boot;
+        /* fast_boot is deliberately NOT restored from settings.toml: the
+         * launcher exposes no control for it, so the persisted row can only
+         * echo whatever game.toml said on some EARLIER run — a write-only
+         * latch that silently overrode a later config change (flipping
+         * game.toml fast_boot=false still skipped the boot animation).
+         * Config + env own it until a launcher toggle exists; if one is
+         * added, restore this line together with the UI. The seed write
+         * below still persists the effective value for inspection. */
         if (us.has_bios_hle)       bios_hle  = us.bios_hle;
         if (us.has_fullscreen)     g_fullscreen      = us.fullscreen;
         if (us.has_aspect_ratio) {
@@ -5159,9 +5284,24 @@ int main(int argc, char** argv) {
         }
         if (us.has_adaptive_view) g_ws_adaptive_view = us.adaptive_view;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
-        if (us.has_bios_path && !bios_from_cli) {
+        /* Bundled BIOS: ignore any persisted bios_path (same clamp-as-well-
+         * as-hide treatment as lock_mode / ws_offered below) so a stale
+         * settings.toml or launcher-less build can never point a bundled
+         * build at a foreign image. The identity gate is the backstop. */
+        /* A non-empty BIOS in settings.toml is the player's choice, made in
+         * the launcher's SYSTEM row, and is honoured on every build — that row
+         * is the only way to opt into a retail image now that bundled builds
+         * no longer prompt. An EMPTY value is equally meaningful: it is the
+         * launcher's Clear, i.e. "go back to the bundled BIOS", so it must NOT
+         * be adopted as a path.
+         *
+         * The identity gate is what protects a bundled build from a stale or
+         * foreign path here — previously this was guarded by refusing to read
+         * the setting at all, which would now silently ignore the player. */
+        if (us.has_bios_path && !bios_from_cli && !us.bios_path.empty()) {
             settings_bios_storage = us.bios_path.string();
             bios_path = settings_bios_storage.c_str();
+            bios_explicit = true;
         }
         if (us.has_disc_path && !disc_override_path)
             resolved_disc = normalize_disc_path_for_launch(us.disc_path);
@@ -5183,6 +5323,14 @@ int main(int argc, char** argv) {
         if (us.has_frame_interpolation_fps)
             g_frame_interpolation_fps = us.frame_interpolation_fps;
     }
+
+    /* The launcher must inspect the same explicit disc override that the
+     * runtime will validate and mount. Applying --disc only in the later
+     * resolve_disc_for_runtime() pass left the launcher showing game.toml's
+     * path, which may not exist in a build/worktree even though the CLI path
+     * is valid. */
+    if (disc_override_path && disc_override_path[0])
+        resolved_disc = normalize_disc_path_for_launch(disc_override_path);
 
     /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
      * digital-only — X4's pre-DualShock libpad silently discards input from a
@@ -5366,7 +5514,7 @@ int main(int argc, char** argv) {
             std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
             std::string rui_initial_disc = resolved_disc.string();
             std::string rui_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                     + " \xE2\x80\x94 Launcher";
+                                     + " - Launcher";
 
             RecompLauncherCSettings ls{};
             ls.output_method  = 2;  /* OpenGL */
@@ -5496,6 +5644,15 @@ int main(int argc, char** argv) {
              * drifting apart across PSX titles. Per-game specifics below override
              * only what the profile can't know. */
             launcher_profile_apply("psx", &gi);
+            /* Show the SYSTEM module's BIOS row whenever this build can
+             * actually use a player-supplied image — i.e. some linked backend
+             * is not the bundled one. Bundled builds used to hide the row
+             * entirely, which under the current model would strand the player:
+             * with OpenBIOS AND a retail image linked, choosing retail (and
+             * clearing back to bundled) is exactly what the row is for.
+             * Asks the registry rather than psx_bios_image, which is not
+             * populated until a backend is activated. */
+            gi.has_bios             = psx_bios_has_selectable();
             gi.name                 = game_name.empty() ? nullptr : game_name.c_str();
             gi.region               = rui_region.empty() ? nullptr : rui_region.c_str();
             gi.has_expected_crc     = 0;      /* the launcher's simple file-CRC doesn't fit
@@ -5609,7 +5766,11 @@ int main(int argc, char** argv) {
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
                 seed.auto_skip_fmv         = ls.auto_skip_fmv != 0;    seed.has_auto_skip_fmv         = true;
                 seed.turbo_loads           = ls.turbo_loads != 0;      seed.has_turbo_loads           = true;
-                if (ls.bios_path[0]) {
+                /* Bundled-BIOS builds ignore any launcher-supplied path (the
+                 * picker is hidden, but a stale settings file could still
+                 * carry one) — resolve_bios_for_runtime would reject it and
+                 * the identity gate makes it meaningless. */
+                if (ls.bios_path[0] && !psx_bios_image.image_bundled) {
                     seed.bios_path = ls.bios_path;
                     seed.has_bios_path = true;
                 }
@@ -5733,7 +5894,8 @@ int main(int argc, char** argv) {
         memcard2_path.clear();
     }
 
-    std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
+    std::filesystem::path resolved_bios =
+        resolve_bios_for_runtime(bios_path, argv[0], bios_explicit);
     if (resolved_bios.empty()) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
         return 1;
@@ -5856,6 +6018,29 @@ session_reboot:
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+
+    /* A disc was requested but nothing mounted. cdrom_init() is non-fatal here
+     * (BIOS-only targets run with an empty drive on purpose), so without this
+     * check the game would boot into an empty drive and render NOTHING -- the
+     * "black screen on a .cue that works as a .bin" symptom. The earlier
+     * validate_disc_for_launch() pass cannot catch it: identify_disc() reads
+     * the data track FILE directly, so a cue whose sheet the mounting reader
+     * rejects still shows a green "Disc verified" badge. Report the actual
+     * failure instead of leaving the player staring at black. */
+    if (!disc_path_str.empty() && !cdrom_has_disc()) {
+        const PSXRecompV4::DiscPathResolution r =
+            PSXRecompV4::resolve_disc_path(disc_path_str);
+        std::string detail =
+            "The disc image was found and verified, but the CD-ROM drive could "
+            "not mount it, so the game would boot with an empty drive.\n\n"
+            "Selected:\n" + disc_path_str;
+        if (r.mount != r.picked) detail += "\nMounted as:\n" + r.mount.string();
+        if (!r.note.empty())     detail += "\n\n" + r.note;
+        detail += "\n\nIf this is a .cue, check that every FILE line it names "
+                  "exists next to it; selecting the .bin directly also works.";
+        launcher_warning("Disc Could Not Be Mounted", detail);
+        return 1;
+    }
     for (const auto& route : warm_cd_routes) {
         cdrom_register_warm_route(route.arm_lba, route.lbas.data(),
                                   (int)route.lbas.size(),
@@ -6245,6 +6430,21 @@ session_reboot:
             bios_hle = (e[0] && e[0] != '0');
         if (const char* e = std::getenv("PSX_BIOS_HLE_KEEP_INTRO"))
             bios_hle_keep_intro = (e[0] && e[0] != '0');
+        /* HLE is a per-image capability, not just a preference: its kernel
+         * service semantics were validated against the SCPH1001 kernel, and
+         * a profile that exports no HLE anchors (psx_bios_image
+         * deliver_event_ret == 0, e.g. OpenBIOS until validated) declares
+         * the tier STRUCTURALLY UNAVAILABLE. Config/env cannot turn it on
+         * for such a BIOS — servicing B0 events with mismatched semantics
+         * wedges the guest in event waits (OpenBIOS bring-up: the shell
+         * menu hung in a CD-event wait under HLE, booted the game under
+         * LLE). The boot skip is separately anchor-gated in bios_hle.c. */
+        if (bios_hle && psx_bios_image.deliver_event_ret == 0) {
+            std::fprintf(stdout,
+                "psxrecomp: bios_hle requested but %s exports no HLE "
+                "anchors; forcing LLE\n", psx_bios_image.image_id);
+            bios_hle = false;
+        }
         const bool boot_skip =
             (bios_hle && !bios_hle_keep_intro) || fast_boot;
         psx_bios_hle_configure(bios_hle ? 1 : 0,

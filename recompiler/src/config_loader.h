@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "bios_address_model.h"   // BiosAddrCopy (BiosConfig::address_copies)
 #include "recompiler_patch.h"
 
 namespace PSXRecompV4 {
@@ -131,6 +132,16 @@ struct RuntimeConfig {
     // to LLE. Implies the HLE boot shell-skip unless bios_hle_keep_intro.
     // PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env override at launch.
     // Runtime: runtime/src/bios_hle.c.
+    // openbios: may this title run on the bundled, redistributable OpenBIOS?
+    // Default true — a player who chooses no BIOS gets OpenBIOS and never has
+    // to find one (docs/BIOS_SELECTION.md). Set false ONLY for a title with a
+    // verified OpenBIOS incompatibility; a retail image is then required and
+    // the player is prompted for it.
+    //
+    // Deliberately NOT overridable by a player's settings.toml: this records a
+    // developer's compatibility finding, not a preference.
+    bool                  openbios = true;
+
     bool                  bios_hle = true;
     bool                  bios_hle_keep_intro = false;
 
@@ -404,6 +415,15 @@ struct BiosConfig {
     uint32_t              entry_pc;
     uint32_t              text_size;
 
+    // [program.image] block (optional): declared image identity. When
+    // sha256 is present the recompiler REFUSES to emit from a ROM whose
+    // computed sha doesn't match — regenerating from the wrong image is a
+    // build defect, not a warning. redistributable=true marks a BIOS that
+    // ships WITH the game (OpenBIOS): the runtime then hides the whole
+    // BIOS-selection surface (couriered via psx_bios_image.image_bundled).
+    std::string           image_sha256;         // empty = unchecked
+    bool                  image_redistributable = false;
+
     // [recompiler] block
     std::filesystem::path seeds_path;    // absolute path to seeds JSON
     std::filesystem::path out_dir;       // absolute path to output dir
@@ -411,6 +431,21 @@ struct BiosConfig {
     std::string           out_stem;      // derived if not explicit
     std::vector<BiosVectorTable> bios_vectors; // optional vector dispatch tables
     std::vector<BiosAlias>       bios_aliases; // optional fixed-target trampolines
+
+    // [recompiler.address_model] block: the BIOS's boot-time ROM->RAM code
+    // copies, semantic validation and consumption in BiosAddressModel
+    // (bios_address_model.h). Empty = the BIOS runs entirely from ROM.
+    std::vector<BiosAddrCopy> address_copies;
+    // [[recompiler.install_slots]]: kernel-RAM PCs the BIOS overwrites with
+    // dispatch stubs at runtime (see docs/dynamic_handler_install.md).
+    std::vector<uint32_t>     install_slots;
+
+    // [recompiler.runtime_exports]: per-image anchors the emitter couriers
+    // into the generated C (psx_bios_image, runtime/include/psx_bios_image.h)
+    // for the runtime's HLE tier. 0 = this BIOS has no such anchor — the
+    // consumer treats the feature as structurally unavailable.
+    uint32_t shell_entry_phys  = 0;  // HLE boot-skip trigger (bios_hle.c)
+    uint32_t deliver_event_ret = 0;  // $ra after the kernel DeliverEvent jalr
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;
@@ -451,6 +486,9 @@ struct GameConfig {
     // [recompiler] block
     std::filesystem::path seeds_path;     // absolute path to seeds (text or json)
     std::filesystem::path bios_thunks_path; // optional; empty if not set
+    // [recompiler] bios_config — BIOS profile this game builds against
+    // (empty = main_psx resolves the SCPH1001 profile default).
+    std::filesystem::path bios_config_path;
     std::filesystem::path out_dir;
     bool                  strict;
     std::string           discovery;     // "whole-image" (default) or "reachable"

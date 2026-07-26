@@ -180,6 +180,7 @@ int main(int argc, char** argv) {
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
     uint32_t              configured_text_size = 0;
+    std::filesystem::path bios_profile_path;   // [recompiler] bios_config
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
@@ -188,6 +189,7 @@ int main(int argc, char** argv) {
         reachable_discovery  = cfg.discovery == "reachable";
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
+        bios_profile_path    = cfg.bios_config_path;
         out_dir              = cfg.out_dir;
         instruction_patches  = cfg.recompiler_patches;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
@@ -302,6 +304,60 @@ int main(int argc, char** argv) {
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
+    }
+
+    /* Resolve the BIOS profile this game builds against and activate its
+     * address model for codegen (jump tables inside relocated BIOS code
+     * windows fold through it — see code_generator.cpp ram_to_rom). Order:
+     * explicit [recompiler] bios_config; else the SCPH1001 profile in-repo
+     * (framework checkout) or under the psxrecomp/ submodule (game repo).
+     * No profile -> fatal: there are no built-in windows. */
+    static PSXRecompV4::BiosAddressModel s_bios_model;
+    {
+        std::filesystem::path prof = bios_profile_path;
+        /* An explicit bios_config that does not resolve is a different failure
+         * from having none at all — say which, or the message sends you looking
+         * for an unset key that is in fact set. */
+        if (!prof.empty() && !std::filesystem::exists(prof)) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: [recompiler] bios_config = '{}' does "
+                "not exist (path is relative to the game project root)\n",
+                prof.string());
+            return 1;
+        }
+        if (prof.empty()) {
+            if (std::filesystem::exists("bios/SCPH1001.toml")) {
+                prof = "bios/SCPH1001.toml";          /* framework checkout */
+            } else {
+                /* Game repo vendoring the framework. Do NOT assume the
+                 * directory is named "psxrecomp": ApeEscapeRecomp vendors it as
+                 * "psxrecomp-v4", and hardcoding the name made regeneration
+                 * fail outright there. Probe one level for any vendored
+                 * framework, sorted so the pick is deterministic. */
+                std::vector<std::filesystem::path> found;
+                std::error_code ec;
+                for (const auto& de :
+                         std::filesystem::directory_iterator(".", ec)) {
+                    if (ec) break;
+                    if (!de.is_directory(ec) || ec) continue;
+                    auto cand = de.path() / "bios" / "SCPH1001.toml";
+                    if (std::filesystem::exists(cand)) found.push_back(cand);
+                }
+                std::sort(found.begin(), found.end());
+                if (!found.empty()) prof = found.front();
+            }
+        }
+        if (prof.empty()) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: no BIOS profile found (set "
+                "[recompiler] bios_config in game.toml, or run from a root "
+                "containing bios/SCPH1001.toml or <framework>/bios/"
+                "SCPH1001.toml)\n");
+            return 1;
+        }
+        const auto bios_cfg = PSXRecompV4::load_bios_config(prof);
+        s_bios_model = PSXRecompV4::BiosAddressModel::from_config(bios_cfg);
+        PSXRecomp::CodeGenerator::set_bios_address_model(&s_bios_model);
     }
 
     // Parse the PS1-EXE file

@@ -8,8 +8,11 @@ Silicon & Intel), and **Linux**. There are two things you can build:
 - a **game** — done from that game's own repository, which links this framework
   in as a submodule (see [Linking the framework](#linking-the-framework)).
 
-You always supply your own **`SCPH1001.BIN` BIOS** and, for a game, your own
-legally-obtained **disc image**. This project ships none of those.
+For the retail **`SCPH1001.BIN` BIOS** you supply your own dump; the
+MIT-licensed **OpenBIOS** alternative is bundled (`bios/openbios.bin`, see
+[Regenerating BIOS backends](#regenerating-bios-backends)). For a
+game you always supply your own legally-obtained **disc image** — this
+project ships no game data.
 
 ## Toolchain requirements
 
@@ -74,12 +77,15 @@ Two CMake trees: the recompiler (a tool) and the runtime (the engine).
 cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build recompiler/build
 
-# 2. (Optional) regenerate the BIOS C from your SCPH1001.BIN
-#    Requires bios/SCPH1001.BIN to be present.
-bash tools/regen_bios.sh
+# 2. (Optional) regenerate either statically recompiled BIOS backend.
+#    OpenBIOS can always be regenerated from the tracked image. Regenerating
+#    the retail backend requires your own bios/SCPH1001.BIN dump.
+bash tools/regen_bios.sh --config bios/OpenBIOS.toml
+bash tools/regen_bios.sh --config bios/SCPH1001.toml
 
 # 3. Runtime → produces psx-runtime (BIOS-only for this repo)
-cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DPSX_RECOMP_UI=OFF
 cmake --build runtime/build --target psx-runtime
 ```
 
@@ -124,9 +130,13 @@ for TombaRecomp:
 # Extract the game's PS-X EXE from your disc (helper included in the game repo):
 python3 tools/extract_psx_exe.py tomba/tomba.bin SCUS_942.36 tomba/SCUS_942.36
 
-# Regenerate the game's C from the disc/EXE (game repos invoke the recompiler
-# binary directly with their config):
-../psxrecomp/recompiler/build/psxrecomp-game --config game.toml
+# Regenerate the game's C from the disc/EXE. The framework is a submodule at
+# psxrecomp/ inside the game repo, so build its recompiler once, then run it.
+# (Game repos also ship tools/regen.sh (macOS/Linux) / tools/regen.ps1 (Windows)
+# that wrap this command.)
+cmake -S psxrecomp/recompiler -B psxrecomp/recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build psxrecomp/recompiler/build
+psxrecomp/recompiler/build/psxrecomp-game --config game.toml
 
 # Configure + build the game runtime:
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -187,3 +197,30 @@ pack beside the repo at `../sdl2-msvc/SDL2-*`. Use the MSYS2/MinGW toolchain
 **Overlays never compile / stay slow.** In development you need `gcc` on `PATH`
 for the `gcc` tier; otherwise areas stay in the interpreter. See
 [`EXECUTION_MODEL.md`](EXECUTION_MODEL.md).
+
+## Regenerating BIOS backends
+
+Every normal runtime links both statically recompiled BIOS backends. OpenBIOS
+symbols and retail SCPH-1001 symbols are namespaced so they coexist in one
+executable; the active backend is selected at launch:
+
+```bash
+# OpenBIOS (tracked and redistributable)
+tools/regen_bios.sh --config bios/OpenBIOS.toml
+
+# Retail SCPH-1001 (requires your own local dump)
+tools/regen_bios.sh --config bios/SCPH1001.toml
+```
+
+`PSXRECOMP_BIOS_STEMS` defaults to `OpenBIOS;SCPH1001`. The runtime build
+automatically stages `bios/openbios.bin` and `bios/OpenBIOS.LICENSE` beside
+every native executable. A release packager must copy that `bios/` directory
+unchanged.
+
+At runtime, no explicit player choice means OpenBIOS. A retail BIOS selected
+with the launcher, `settings.toml`, or `--bios` wins after its exact identity is
+verified. `[runtime] openbios = false` is reserved for a title with a verified
+OpenBIOS incompatibility. See [`BIOS_SELECTION.md`](BIOS_SELECTION.md).
+
+OpenBIOS seeds come from its ELF symbol tables (no Ghidra pass needed):
+see the pin + regeneration recipe in `bios/OpenBIOS.toml`.
