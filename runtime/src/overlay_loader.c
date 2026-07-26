@@ -1954,7 +1954,7 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
 
 extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra);
 extern void psx_check_interrupts(CPUState *cpu);
-extern void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc);
+extern int psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc);
 extern int psx_interrupt_delivery_needed(const CPUState *cpu);
 extern void gte_execute(CPUState *cpu, uint32_t cmd);
 extern int psx_syscall(CPUState *cpu, uint32_t code);
@@ -2101,28 +2101,29 @@ static int overlay_idle_note_is_internal_or_return(const CPUState *cpu,
     return 0;
 }
 
-static void overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
+static int overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
     /* Defer while inside a nested call unit (see g_call_unit_depth): suspending
      * here would save resume_pc at the callee's block leader while the enclosing
      * dirty caller expects an atomic unit — the resume-desync bug. */
-    if (g_call_unit_depth > 0) return;
-    if (overlay_irq_suppressed_now()) return;
-    if ((i_stat & i_mask) == 0) return;
-    if ((cpu->cop0[12] & ((1u << 10) | 1u)) != ((1u << 10) | 1u)) return;
-    if (!psx_interrupt_delivery_needed(cpu)) return;
+    if (g_call_unit_depth > 0) return 0;
+    if (overlay_irq_suppressed_now()) return 0;
+    if ((i_stat & i_mask) == 0) return 0;
+    if ((cpu->cop0[12] & ((1u << 10) | 1u)) != ((1u << 10) | 1u)) return 0;
+    if (!psx_interrupt_delivery_needed(cpu)) return 0;
     extern int g_idle_note_suppress;
     int suppress_idle_note = overlay_idle_note_is_internal_or_return(cpu, resume_pc);
     if (suppress_idle_note) g_idle_note_suppress++;
     if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
         uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
         i_stat &= ~(1u << IRQ_CDROM);
-        psx_check_interrupts_at(cpu, resume_pc);
+        int redirected = psx_check_interrupts_at(cpu, resume_pc);
         i_stat |= saved_cd;
         if (suppress_idle_note) g_idle_note_suppress--;
-        return;
+        return redirected;
     }
-    psx_check_interrupts_at(cpu, resume_pc);
+    int redirected = psx_check_interrupts_at(cpu, resume_pc);
     if (suppress_idle_note) g_idle_note_suppress--;
+    return redirected;
 }
 
 static int overlay_irq_budget_blocks_now(void) {

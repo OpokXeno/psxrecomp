@@ -38,6 +38,7 @@ void func_80010000(CPUState *cpu) {
     cpu->gpr[3] = psx_cyc_load_half(cpu, cpu->gpr[5], 3u, 0u);
     psx_cyc_bb_defer_flush();
     psx_cyc_bb_defer_end();
+    if (psx_check_interrupts_at(cpu, 0x80010004u)) return;
     if (psx_slice_block(cpu, 0x80010000u, 1u, 0)) return;
     debug_server_log_call_entry(0x80010000u);
 }

@@ -61,8 +61,8 @@ void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
     (void)cpu; (void)addr; (void)ra;
 }
 void psx_check_interrupts(CPUState *cpu) { (void)cpu; }
-void psx_check_interrupts_at(CPUState *cpu, uint32_t pc) {
-    (void)cpu; (void)pc;
+int psx_check_interrupts_at(CPUState *cpu, uint32_t pc) {
+    (void)cpu; (void)pc; return 0;
 }
 int psx_interrupt_delivery_needed(const CPUState *cpu) { (void)cpu; return 0; }
 int psx_get_in_exception(void) { return 0; }

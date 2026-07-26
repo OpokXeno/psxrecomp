@@ -52,10 +52,9 @@ void psx_check_interrupts(CPUState *cpu) {
     overlay_flush_cycles();
     g_cbs.check_interrupts(cpu);
 }
-void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc) {
+int psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc) {
     overlay_flush_cycles();
-    if (g_cbs.check_interrupts_at) g_cbs.check_interrupts_at(cpu, resume_pc);
-    else g_cbs.check_interrupts(cpu);
+    return g_cbs.check_interrupts_at(cpu, resume_pc);
 }
 void psx_advance_cycles(uint32_t cycles) {
     if (cycles > UINT32_MAX - s_pending_cycles) overlay_flush_cycles();
