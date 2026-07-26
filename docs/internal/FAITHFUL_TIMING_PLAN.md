@@ -243,6 +243,26 @@ on a fixed region -> next.
   resume=P+4.
   The unrelated existing absolute capture-history assertion in
   `recompiler_patch_test` remains RED.
+- **2026-07-26 (GL forensic-readback ordering defect, fixed):**
+  Default-on `disp_ring_capture()` invokes `gl_renderer_fbo_peek()` on every
+  present. The old peek/diff paths called `flush_cpu_upload()` then
+  `pack_flush()` without draining queued flat/textured primitives. Packing
+  could clear dirty ownership before queued work reached the authoritative FBO,
+  leaving `s_raw_tex` stale for later texture/CLUT sampling. The hidden SDL/
+  OpenGL scale-2 regression queued a white flat dot after a black upload:
+  expected `0x7fff`, deterministically got stale `0x0000` twice. Removing only
+  the fix hunk made the peek test RED while the mask test remained GREEN;
+  restoring it and relinking made both GREEN. The fix calls
+  `flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();` before
+  pack/readback in both `gl_renderer_fbo_peek()` and `gl_renderer_vram_diff()`.
+- **2026-07-26 (OpenGL GP0(E6) delayed-batch ordering defect, fixed):**
+  Delayed GL flat/textured batches captured mask-set but consumed the live
+  mask-check value, so an E6 transition could execute earlier polygons under
+  later state. `gpu_gl_mask_order_test` was deterministically RED: flat
+  expected `0x7fff`, got `0x8000`; textured expected `0x8000`, got `0x7fff`.
+  The reverse-toggle case was also RED. Minimal fix: drain flat and textured
+  queues only when mask-check changes, land pending uploads, and rebuild
+  stencils only on enable. The test is now GREEN.
 - **2026-07-21 (VLC load-charge batching — shipped; dual still ~22 ms):**
   Runtime-only batch: under `psx_next_service_cycle`, `psx_cyc_charge`
   accumulates into `g_psx_cyc_batch` (no per-insn `psx_cycle_count` store);
