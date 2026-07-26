@@ -5989,12 +5989,12 @@ static void handle_spu_events(int id, const char *json)
         const SpuEvent *e = &evs[i];
         const char *kn = (e->kind <= 4) ? kind_names[e->kind] : "?";
         n = snprintf(out + off, cap - off,
-            "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"v\":%d,"
+            "%s{\"seq\":%llu,\"frame\":%u,\"pc\":\"0x%08X\",\"func\":\"0x%08X\",\"kind\":\"%s\",\"v\":%d,"
             "\"pitch\":\"0x%04X\",\"addr\":\"0x%05X\","
             "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
             "\"vol_l\":\"0x%04X\",\"vol_r\":\"0x%04X\"}",
             i == 0 ? "" : ",",
-            (unsigned long long)e->seq, e->frame, kn, (int)e->voice,
+            (unsigned long long)e->seq, e->frame, e->pc, e->func, kn, (int)e->voice,
             e->pitch, e->addr,
             e->adsr_lo, e->adsr_hi,
             e->vol_l, e->vol_r);

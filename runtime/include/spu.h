@@ -29,6 +29,8 @@ typedef struct SpuDebugInfo {
 } SpuDebugInfo;
 
 void spu_debug_info(SpuDebugInfo* out);
+void spu_debug_music_quarantine_begin(void);
+void spu_debug_music_quarantine_end(void);
 
 /* ---- Per-voice register snapshot. Mirrors the fields the Beetle oracle
  * exposes via PS_SPU::GetRegister(GSREG_V0_*) so both backends produce a
@@ -82,6 +84,8 @@ typedef enum {
 typedef struct SpuEvent {
     uint64_t seq;
     uint32_t frame;
+    uint32_t pc;
+    uint32_t func;
     uint8_t  kind;
     uint8_t  voice;
     uint16_t pitch;

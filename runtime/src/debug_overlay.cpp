@@ -103,6 +103,7 @@ extern "C" {
 #include "starvation_ring.h"    /* starvation_ring_total, starvation_ring_get,
                                    starvation_ring_dump */
 #include "cpu_state.h"          /* gte_set_display_aspect */
+#include "spu.h"
 
 /* Memory read accessor — used by the RAM Inspector section. */
 extern uint8_t psx_read_byte(uint32_t addr);
@@ -848,6 +849,7 @@ int psx_debug_overlay_teleport(int fieldId, int entryPoint)
         return 2;
     }
     s_teleport_source_context = read_u32_le(kAddr_fieldContextPtr);
+    spu_debug_music_quarantine_begin();
     write_u32_le(kAddr_teleportGate1,        0u);
     write_u32_le(kAddr_fieldChangePrevented, 0u);
     write_u32_le(kAddr_fieldMapNumber,      (uint32_t)fieldId);
@@ -1969,6 +1971,9 @@ void psx_debug_overlay_pre_swap(void)
             s_teleport_source_context = 0u;
             s_teleport_ready_ms = SDL_GetTicks64() + kTeleportSettleMs;
         }
+    }
+    if (read_u32_le(kAddr_teleportGateMusic) != 0u) {
+        spu_debug_music_quarantine_end();
     }
     if (s_teleport_ready_ms != 0u && SDL_GetTicks64() >= s_teleport_ready_ms) {
         s_last_teleport_id = -1;

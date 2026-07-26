@@ -40,8 +40,16 @@ static uint32_t endx_latch;
 static uint32_t kon_latch;
 static uint32_t koff_latch;
 
+/* Debug teleports bypass the source field's authored music teardown. Keep
+ * Xenogears' BGM voices (0-15) in release and reject stale KEYONs until the
+ * destination asks the guest music state machine to load a track. */
+#define SPU_DEBUG_MUSIC_VOICE_MASK 0x0000FFFFu
+static uint32_t s_debug_music_quarantine_mask;
+
 /* External vblank counter (debug_server.c) used as event timestamp. */
 extern uint64_t s_frame_count;
+extern uint32_t g_debug_current_func_addr;
+extern uint32_t g_debug_last_store_pc;
 
 /* ---- Always-on event ring -------------------------------------------- */
 /* 1M entries × ~32B = 32 MB. Power of 2 so wrap is a mask. Beetle peaks at
@@ -92,6 +100,8 @@ static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
     SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
     e->seq      = s_event_seq++;
     e->frame    = (uint32_t)s_frame_count;
+    e->pc       = g_debug_last_store_pc;
+    e->func     = g_debug_current_func_addr;
     e->kind     = kind;
     e->voice    = (uint8_t)voice;
     e->pitch    = spu_regs[(uint32_t)voice * 8u + 2u];
@@ -538,6 +548,16 @@ static void key_off(uint32_t mask) {
     }
 }
 
+void spu_debug_music_quarantine_begin(void) {
+    s_debug_music_quarantine_mask = SPU_DEBUG_MUSIC_VOICE_MASK;
+    koff_latch = (koff_latch & 0xFFFF0000u) | SPU_DEBUG_MUSIC_VOICE_MASK;
+    key_off(SPU_DEBUG_MUSIC_VOICE_MASK);
+}
+
+void spu_debug_music_quarantine_end(void) {
+    s_debug_music_quarantine_mask = 0;
+}
+
 void spu_init(void) {
     memset(spu_ram, 0, sizeof(spu_ram));
     memset(spu_regs, 0, sizeof(spu_regs));
@@ -552,6 +572,7 @@ void spu_init(void) {
     endx_latch = 0;
     kon_latch = 0;
     koff_latch = 0;
+    s_debug_music_quarantine_mask = 0;
     s_event_idx = 0;
     s_event_seq = 0;
     spu_cd_audio_reset();
@@ -824,11 +845,11 @@ void spu_write(uint32_t addr, uint32_t value) {
 
             if (addr == 0x1F801D88u) {
                 kon_latch = (kon_latch & 0xFFFF0000u) | (uint32_t)(uint16_t)value;
-                key_on((uint32_t)(uint16_t)value);
+                key_on((uint32_t)(uint16_t)value & ~s_debug_music_quarantine_mask);
             }
             if (addr == 0x1F801D8Au) {
                 kon_latch = (kon_latch & 0x0000FFFFu) | ((uint32_t)(uint16_t)value << 16);
-                key_on((uint32_t)(uint16_t)value << 16);
+                key_on(((uint32_t)(uint16_t)value << 16) & ~s_debug_music_quarantine_mask);
             }
             if (addr == 0x1F801D8Cu) {
                 koff_latch = (koff_latch & 0xFFFF0000u) | (uint32_t)(uint16_t)value;
