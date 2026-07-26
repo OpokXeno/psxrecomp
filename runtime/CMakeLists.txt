@@ -144,6 +144,57 @@ if(BUILD_TESTING)
         add_test(NAME autocompile_publication_test
                  COMMAND autocompile_publication_test)
     endif()
+
+    add_executable(gpu_gl_mask_order_test
+        tests/test_gpu_gl_mask_order.c
+        src/color_lut.c
+        src/gpu.c
+        src/gpu_sw_renderer.c
+        src/gpu_render.c
+        src/gpu_gl_renderer.c)
+    target_include_directories(gpu_gl_mask_order_test PRIVATE
+        include ${SDL2_INCLUDE_DIRS})
+    target_compile_definitions(gpu_gl_mask_order_test PRIVATE
+        SDL_MAIN_HANDLED=1
+        PSX_NO_DEBUG_TOOLS=1)
+    target_link_libraries(gpu_gl_mask_order_test PRIVATE ${SDL2_LIBRARIES})
+    if(WIN32 OR MINGW)
+        target_link_libraries(gpu_gl_mask_order_test PRIVATE opengl32)
+        add_test(NAME gpu_gl_mask_order_test COMMAND gpu_gl_mask_order_test)
+    else()
+        find_package(OpenGL REQUIRED)
+        find_program(XVFB_RUN_EXECUTABLE xvfb-run REQUIRED)
+        target_link_libraries(gpu_gl_mask_order_test PRIVATE
+            ${CMAKE_DL_LIBS} OpenGL::GL m)
+        add_test(NAME gpu_gl_mask_order_test
+                 COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:gpu_gl_mask_order_test>)
+    endif()
+
+    add_executable(gpu_gl_peek_order_test
+        tests/test_gpu_gl_peek_order.c
+        src/color_lut.c
+        src/gpu.c
+        src/gpu_sw_renderer.c
+        src/gpu_render.c
+        src/gpu_gl_renderer.c)
+    target_include_directories(gpu_gl_peek_order_test PRIVATE
+        include ${SDL2_INCLUDE_DIRS})
+    target_compile_definitions(gpu_gl_peek_order_test PRIVATE
+        SDL_MAIN_HANDLED=1
+        PSX_NO_DEBUG_TOOLS=1)
+    target_link_libraries(gpu_gl_peek_order_test PRIVATE ${SDL2_LIBRARIES})
+    if(WIN32 OR MINGW)
+        target_link_libraries(gpu_gl_peek_order_test PRIVATE opengl32)
+        add_test(NAME gpu_gl_peek_order_test COMMAND gpu_gl_peek_order_test)
+    else()
+        find_package(OpenGL REQUIRED)
+        find_program(XVFB_RUN_EXECUTABLE xvfb-run REQUIRED)
+        target_link_libraries(gpu_gl_peek_order_test PRIVATE
+            ${CMAKE_DL_LIBS} OpenGL::GL m)
+        add_test(NAME gpu_gl_peek_order_test
+                 COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:gpu_gl_peek_order_test>)
+    endif()
+
 endif()
 
 if(NOT MSVC)

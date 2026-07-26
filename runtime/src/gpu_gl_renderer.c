@@ -2052,11 +2052,12 @@ static int  glb_texture_filter(void) { return s_tex_filter; }
 static void glb_set_semi_transparency(int e, int m) { s_semi_en = e; s_semi_mode = m & 3; sw_set_semi_transparency(e, m); }
 static void glb_set_mask_bits(int s, int c) {
     int next_check = c ? 1 : 0;
-    if (next_check && !s_mask_check) {
-        /* Land all alpha-authoritative work before deriving stencil from it. */
+    if (next_check != s_mask_check) {
+        flush_flat_batch();
         flush_tex_batch();
         flush_cpu_upload();
-        rebuild_mask_stencils();
+        if (next_check)
+            rebuild_mask_stencils();
     }
     s_mask_set = s ? 1 : 0;
     s_mask_check = next_check;
@@ -2751,6 +2752,8 @@ int gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out) {
     if (!s_raster_ok || !s_ctx) return 0;
     if (x < 0 || y < 0 || w < 1 || h < 1 ||
         x + w > VRAM_W || y + h > VRAM_H) return 0;
+    flush_flat_batch();
+    flush_tex_batch();
     flush_cpu_upload();
     rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
     pack_flush();
@@ -2773,6 +2776,8 @@ int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
     if (!s_raster_ok || !s_ctx) return 0;
     uint16_t *tmp = (uint16_t *)malloc((size_t)VRAM_W * VRAM_H * 2);
     if (!tmp) return 0;
+    flush_flat_batch();
+    flush_tex_batch();
     flush_cpu_upload();
     /* Force a full pack: the diff must read FBO truth even where the
      * raw-mirror invariant (raw == FBO outside s_pack_dirty) is broken —
