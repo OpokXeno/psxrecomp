@@ -58,6 +58,26 @@ static inline uint32_t psx_phys_addr(uint32_t addr) {
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
+int psx_fetch_instruction_word_raw(uint32_t addr, uint32_t *instruction) {
+    if (addr >= 0xC0000000u || (addr & 3u) != 0u || instruction == NULL)
+        return 0;
+
+    uint32_t phys = psx_phys_addr(addr);
+    const uint8_t *source;
+    if (phys < RAM_SIZE) {
+        source = ram + phys;
+    } else if (phys >= 0x1F800000u && phys <= 0x1F8003FCu) {
+        source = scratchpad + (phys - 0x1F800000u);
+    } else if (phys >= 0x1FC00000u && phys <= 0x1FC7FFFCu) {
+        source = bios_rom + (phys - 0x1FC00000u);
+    } else {
+        return 0;
+    }
+
+    memcpy(instruction, source, sizeof(*instruction));
+    return 1;
+}
+
 void memory_clear_low_boot_scratch(void) {
     memset(ram, 0, 0x10u);
 }

@@ -36,6 +36,8 @@
 #include "event_ring.h"
 #include "lockstep.h"
 #include "psx_cycles.h"
+#include "psx_icache.h"
+#include "psx_instr_cost.h"
 #include "psx_scheduler.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +49,8 @@
  * handler dispatch (see psx_check_interrupts). */
 extern int g_dirty_interp_active;
 extern uint32_t g_dirty_safe_resume_pc;
+extern int psx_fetch_instruction_word_raw(uint32_t addr, uint32_t *instruction);
+extern void gte_execute(CPUState *cpu, uint32_t command);
 
 /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt; dumped via `irqctx_ring`). */
 #define IRQCTX_RING_CAP 4096u
@@ -1046,12 +1050,21 @@ irq_deliver_eval:
      * g_dirty_safe_resume_pc; compiled code passes its block-entry PC via
      * psx_check_interrupts_at -> s_compiled_interrupt_resume_pc. Combined with the
      * event's `mode`, this is the take-point for the cross-backend diff. */
-    {
-        extern uint32_t g_dirty_safe_resume_pc;
-        uint32_t take_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
-                                                  : s_compiled_interrupt_resume_pc;
-        irq_record_outcome(EV_IRQ_DELIVER, 0, take_pc);
+    uint32_t take_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                              : s_compiled_interrupt_resume_pc;
+    uint32_t take_insn;
+    if (take_pc != 0u && psx_fetch_instruction_word_raw(take_pc, &take_insn) &&
+        (take_insn & 0xFE000000u) == 0x4A000000u) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_icache_fetch(cpu, take_pc);
+        psx_cyc_step(cpu, psx_cyc_dep_res_mask(take_insn));
+        psx_cyc_batch_flush();
+#endif
+        gte_execute(cpu, take_insn & 0x01FFFFFFu);
     }
+    sr = cpu->cop0[COP0_SR];
+    hw_deliverable = ((i_stat & i_mask) != 0) && ((sr & (1u << 10)) != 0);
+    irq_record_outcome(EV_IRQ_DELIVER, 0, take_pc);
     g_irq_deliver_count++;
     if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
     if ((i_stat & i_mask) & (1u << IRQ_CDROM))  g_cdrom_deliver_count++;
@@ -1628,11 +1641,14 @@ irq_deliver_eval:
  * interrupts via psx_check_interrupts (cpu->pc / scratch sentinel). Forwarding
  * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
  * current generated code on the good baseline for instrumented comparison. */
-void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+int psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     uint32_t prev = s_compiled_interrupt_resume_pc;
+    uint64_t deliveries_before = g_irq_deliver_count;
     s_compiled_interrupt_resume_pc = resume_pc;
     psx_check_interrupts(cpu); /* flushes load-charge batch on entry */
     s_compiled_interrupt_resume_pc = prev;
+    return g_irq_deliver_count != deliveries_before && cpu->pc != 0u &&
+           !same_guest_pc(cpu->pc, resume_pc);
 }
 
 int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc) {
@@ -1640,9 +1656,9 @@ int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc) {
            same_guest_pc(s_last_interrupt_check_pc, resume_pc);
 }
 
-void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc) {
+int psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc) {
     if (psx_interrupts_checked_at_current_cycle(resume_pc)) {
-        return;
+        return 0;
     }
-    psx_check_interrupts_at(cpu, resume_pc);
+    return psx_check_interrupts_at(cpu, resume_pc);
 }

@@ -45,12 +45,12 @@ void psx_interrupt_delivery_diag(uint64_t *need_defer, uint64_t *need_irq,
                                  uint64_t *skip_cooldown, uint64_t *skip_nested);
 /* Interrupt check with the compiled guest PC to resume if a game-installed
  * handler later RFEs to the sentinel outside the synchronous host window. */
-void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
+int psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
 int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc);
 /* Dispatch-entry check for re-enterable compiled PCs. De-dupes an immediately
  * preceding check at the same guest PC/cycle so generated transfers can keep
  * their explicit checks while dirty/interp-to-static entries get a boundary. */
-void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_pc);
+int psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_pc);
 
 /* Accumulate emitted PSX cycles toward the next VBlank trigger.
  * Called from psx_advance_cycles() so the VBlank rate is gated on

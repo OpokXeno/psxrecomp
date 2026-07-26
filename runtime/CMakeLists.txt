@@ -65,6 +65,29 @@ if(BUILD_TESTING)
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
 
+    add_executable(irq_cop2_boundary_test
+        tests/test_irq_cop2_boundary.c
+        tests/test_irq_cop2_boundary_stubs.c
+        src/interrupts.c
+        src/gte.cpp)
+    target_include_directories(irq_cop2_boundary_test PRIVATE include)
+    target_compile_definitions(irq_cop2_boundary_test PRIVATE
+        PSX_NO_DEBUG_TOOLS=1
+        PSX_ENABLE_BLOCK_CYCLES=1)
+    if(MSVC)
+        target_compile_options(irq_cop2_boundary_test PRIVATE /Gy)
+        target_link_options(irq_cop2_boundary_test PRIVATE /OPT:REF)
+    elseif(APPLE)
+        target_compile_options(irq_cop2_boundary_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(irq_cop2_boundary_test PRIVATE -Wl,-dead_strip)
+    else()
+        target_compile_options(irq_cop2_boundary_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(irq_cop2_boundary_test PRIVATE -Wl,--gc-sections)
+    endif()
+    add_test(NAME irq_cop2_boundary_test COMMAND irq_cop2_boundary_test)
+
     add_executable(psx_instr_cost_test tests/test_psx_instr_cost.cpp)
     target_include_directories(psx_instr_cost_test PRIVATE include)
     add_test(NAME psx_instr_cost_test COMMAND psx_instr_cost_test)
