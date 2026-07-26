@@ -213,6 +213,36 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-26 (IRQ/COP2 post-stall deliverability refresh):**
+  Oracle review found that issue-on-take could serialize behind a busy GTE and
+  service a device deadline after `hw_deliverable` had been snapshotted. A new
+  software-interrupt entry test starts with clear I_STAT, stalls NCLIP until
+  cycle 10, raises an unmasked hardware IRQ at cycle 5, and was RED with
+  `Cause=0x00000100`. Re-reading SR and recomputing hardware deliverability
+  immediately after the COP2 issue sequence makes Cause.IP2 visible to the
+  handler while retaining IP0, exactly one NCLIP, MAC0=19, EPC=P, resume=P+4,
+  issue cycle 10, and deadline 17. The focused cycle tests, generated emitter
+  and overlay contracts, executable overlay-loader test, direct regression,
+  and `build-dbg` `psx-runtime` link are GREEN.
+  Live slot-8 causal replay independently toggled only issue-on-take: pre-fix
+  A1 had 4 determinant/MAC0 mismatches in 65,536 branch records; fixed B had
+  0/6,295 across four AC-to-B0 IRQ returns; A2 with issue-on-take disabled
+  recreated 1/6,295 (`det=46`, stale `MAC0=-28501042`); restored final B had
+  0/6,307 across two AC-to-B0 IRQ returns. Final runtime SHA-256 is
+  `7c4ae8e325635773a5f7bccb150d42d3b7f4306c969b79143c2c76db8b2e4246`.
+- **2026-07-26 (IRQ/COP2 boundary issue-on-take, RED -> GREEN):**
+  A deliverable interrupt whose selected EPC contains a COP2 command-class
+  instruction now issues that command through the shared fetch/interlock/GTE
+  timing path before exception state is pushed, while COP0.EPC remains the
+  original address. The BIOS's documented COP2 EPC+4 rule is unchanged. The
+  internal compiled-check callback now returns a redirect flag; both emitters,
+  generated dispatch-entry checks, overlay ABI v19, and codegen namespace cg9
+  return to the dispatcher instead of falling through after EPC+4. The focused
+  regression covers dirty site-1 and compiled-style paths: NCLIP publishes
+  MAC0=19 exactly once at cycle 1, handler-visible GTE deadline=8, EPC=P, and
+  resume=P+4.
+  The unrelated existing absolute capture-history assertion in
+  `recompiler_patch_test` remains RED.
 - **2026-07-21 (VLC load-charge batching — shipped; dual still ~22 ms):**
   Runtime-only batch: under `psx_next_service_cycle`, `psx_cyc_charge`
   accumulates into `g_psx_cyc_batch` (no per-insn `psx_cycle_count` store);
