@@ -393,7 +393,7 @@ static int ds_verify(const DsShard* s) {
     return 1;
 }
 
-static void ds_apply(CPUState* cpu, DsShard* s) {
+static int ds_apply(CPUState* cpu, DsShard* s) {
     uint32_t off = 0;
     for (uint32_t r = 0; r < s->nwr; r++) {
         uint32_t idx = s->wr[r].idx, len = s->wr[r].len;
@@ -419,13 +419,18 @@ static void ds_apply(CPUState* cpu, DsShard* s) {
      * events and IRQ delivery land at their authentic guest cycles. */
     uint32_t ra = cpu->gpr[31];
     uint64_t remaining = s->cyc_cost;
+    int redirected = 0;
     while (remaining) {
         uint32_t chunk = remaining > 2048u ? 2048u : (uint32_t)remaining;
         psx_advance_cycles(chunk);
         remaining -= chunk;
-        psx_check_interrupts_at(cpu, ra);
+        if (psx_check_interrupts_at(cpu, ra)) {
+            redirected = 1;
+            break;
+        }
     }
-    s_st.cyc_credited += s->cyc_cost;
+    s_st.cyc_credited += s->cyc_cost - remaining;
+    return redirected;
 }
 
 /* ---------- gen-time hooks ---------- */
@@ -448,8 +453,9 @@ int psx_datashard_enter(CPUState* cpu, uint32_t key) {
             s->args[2] != cpu->gpr[6] || s->args[3] != cpu->gpr[7]) continue;
         if (ds_verify(s)) {
             s->hits++; s_st.replays++;
-            ds_apply(cpu, s);
-            cpu->pc = cpu->gpr[31];   /* CPS: publish $ra, caller resumes */
+            int redirected = ds_apply(cpu, s);
+            if (!redirected)
+                cpu->pc = cpu->gpr[31];   /* CPS: publish $ra, caller resumes */
             return 1;
         }
         s_st.verify_fail++;
