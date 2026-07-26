@@ -207,7 +207,7 @@ int psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func,
     VQ_STEP(cpu, 0xCu); cpu->gpr[2] -= cpu->gpr[3];                 /* +34 subu */
     VQ_STEP(cpu, 0x10u);                                           /* +38 bgez a0 */
     VQ_STEP(cpu, 0x20004u); cpu->gpr[17] = cpu->gpr[2] & 0xFFFFu;  /* +3C */
-    psx_check_interrupts_at(cpu, func + 0x40u);
+    if (psx_check_interrupts_at(cpu, func + 0x40u)) return 1;
 
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     psx_icache_fetch(cpu, func + 0x40u);
@@ -216,7 +216,7 @@ int psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func,
     cpu->gpr[2] = psx_cyc_load_word(cpu, counter_addr, 2u, 0x4u);   /* +44 counter */
     VQ_STEP(cpu, 0x0u);                                            /* +48 j epilogue */
     VQ_STEP(cpu, 0x1u);                                            /* +4C nop */
-    psx_check_interrupts_at(cpu, func + 0x130u);
+    if (psx_check_interrupts_at(cpu, func + 0x130u)) return 1;
 
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     psx_icache_fetch(cpu, func + 0x130u);
@@ -232,7 +232,7 @@ int psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func,
         uint32_t ra = cpu->gpr[31];
         VQ_STEP(cpu, 0x80000001u);                                 /* jr ra */
         VQ_STEP(cpu, 0x1u);                                        /* delay nop */
-        psx_check_interrupts_at(cpu, ra);
+        if (psx_check_interrupts_at(cpu, ra)) return 1;
         cpu->pc = ra;
     }
     return 1;
