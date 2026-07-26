@@ -235,9 +235,34 @@ vs `beetle-psx/mednafen/psx/<file>:line` (oracle).
   mode 0. Fixed in `gpu.c set_tpage_from_poly()`, called by all four textured
   poly handlers; all backends inherit via `gr_set_semi_transparency`.
 
+### D13 — GL delayed-batch mask-check ordering across GP0(E6), FIXED 2026-07-26
+- **Defect**: delayed GL flat/textured batches captured mask-set but consumed
+  the live mask-check value, so an E6 transition could execute earlier polygons
+  under later state.
+- **Evidence**: `gpu_gl_mask_order_test` was deterministically RED: flat
+  expected `0x7fff`, got `0x8000`; textured expected `0x8000`, got `0x7fff`.
+  The reverse-toggle case was also RED; the final test is GREEN after the fix.
+- **Fix**: drain flat and textured queues only when mask-check changes, land
+  pending uploads, and rebuild stencils only on enable.
+
+### D14: GL forensic-readback ordering cleared queued primitive ownership, FIXED 2026-07-26
+- **Defect**: default-on `disp_ring_capture()` invokes
+  `gl_renderer_fbo_peek()` on every present. The old peek/diff paths called
+  `flush_cpu_upload()` then `pack_flush()` without draining queued flat/textured
+  primitives. Packing could clear dirty ownership before queued work reached the
+  authoritative FBO, leaving `s_raw_tex` stale for later texture/CLUT sampling.
+- **Evidence**: the hidden SDL/OpenGL scale-2 regression queued a white flat dot
+  after a black upload. It expected `0x7fff` but deterministically returned the
+  stale `0x0000` twice. Removing only this hunk made the peek test RED while the
+  mask test remained GREEN; restoring and relinking made both GREEN.
+- **Fix and scope**: call `flush_flat_batch(); flush_tex_batch();
+  flush_cpu_upload();` before pack/readback in both `gl_renderer_fbo_peek()` and
+  `gl_renderer_vram_diff()`.
+
 ### Items that are FAITHFUL (no action)
 - Semi-transparency 4-mode selection + STP-bit gating (SW and GL).
-- Mask set/check including in copies (SW and GL).
+- Mask set/check including in copies (SW and GL); GL delayed-batch E6 ordering
+  is fixed in D13.
 - Texture window AND/OR formula; CLUT 4/8/15-bpp addressing; texel-0
   transparency.
 - Color modulation ×2-around-0x80 rule.
