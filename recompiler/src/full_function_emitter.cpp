@@ -135,14 +135,14 @@ bool FullFunctionEmitter::emit_function(
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
+               fmt::format("if (psx_check_interrupts_at(cpu, 0x{:08X}u)) return;\n",
                            bios_runtime_pc(resume_pc));
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
         return std::string("#ifdef PSX_ENABLE_BLOCK_CYCLES\n") + indent +
                "psx_cyc_bb_defer_flush();\n#endif\n" + indent +
-               fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+               fmt::format("if (psx_check_interrupts_at(cpu, {})) return;\n", resume_pc_expr);
     };
     auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
         return "#ifdef PSX_COSIM\n" + indent +
@@ -831,7 +831,7 @@ bool FullFunctionEmitter::emit_function(
                 "     * After the stub's jalr returns, ra=RAM 0x{:08X} routes\n"
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
-                "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
+                "        if (psx_check_interrupts_at(cpu, 0x{:08X}u)) return;\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
                 addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
@@ -1235,7 +1235,7 @@ void FullFunctionEmitter::emit_dispatch(
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
-    out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
+    out += "extern int psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
@@ -1801,7 +1801,7 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_dispatch(CPUState* cpu, uint32_t addr);\n";
     full_c += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
-    full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
+    full_c += "extern int psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";

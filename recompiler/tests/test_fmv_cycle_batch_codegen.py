@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -75,7 +76,10 @@ def main():
     if guarded_begin not in source:
         failures.append("basic-block defer is not wholly GCC/Clang guarded")
     flush = "psx_cyc_bb_defer_flush();\n#endif\n"
-    if flush not in source or "psx_check_interrupts_at(cpu," not in source:
+    redirect_check = re.search(
+        r"if \(psx_check_interrupts_at\(cpu, [^)]+\)\) return;", source
+    )
+    if flush not in source or redirect_check is None:
         failures.append("generated interrupt edges do not flush deferred cycles")
     if failures:
         for failure in failures:
