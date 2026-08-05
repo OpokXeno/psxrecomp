@@ -15,6 +15,7 @@
 #include <string.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #else
 #include <sys/stat.h>
 #endif
@@ -207,7 +208,16 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         int slot = s_save_pending;
         s_save_pending = -1;
         char path[600];
-        if (savestate_slot_path(slot, path, sizeof(path))) {
+        if (resume_pc == 0) {
+            /* 0 is never a legitimate resume address (see psx_is_dispatchable) —
+             * writing it would produce a savestate that hangs forever on load
+             * instead of failing loudly. All resume_pc call sites are expected
+             * to resolve a real block-leader/interpreter-safe PC; refuse rather
+             * than persist a bad one. */
+            fprintf(stderr,
+                "savestate: SAVE REFUSED slot %d (resume_pc=0x00000000 — no "
+                "valid resume point at this poll)\n", slot);
+        } else if (savestate_slot_path(slot, path, sizeof(path))) {
             /* Save the exact resume PC (cpu->pc is 0 mid-block; resume_pc is the
              * block leader the interrupt path would resume at). */
             CPUState snap = *cpu;
@@ -224,7 +234,69 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         char path[600];
         if (!savestate_slot_path(slot, path, sizeof(path))) return;
         if (boot_state_load(path, s_bios_checksum, s_entry_pc, cpu)) {
+            if (cpu->pc == 0) {
+                /* Never a valid resume address (psx_is_dispatchable rejects it
+                 * too) — this state was written by the resume_pc==0 save bug.
+                 * Resuming anyway hangs forever (frame counter frozen, no
+                 * fail-fast) instead of failing loudly, which reads as a mystery
+                 * "crash" to a player. Refuse and say why. */
+                fprintf(stderr,
+                    "savestate: LOAD REFUSED slot %d (saved resume pc=0x00000000 — "
+                    "this state was captured with no valid resume point and "
+                    "cannot be resumed; re-save from live gameplay)\n", slot);
+                return;
+            }
             psx_cycles_resync_after_restore();
+            /* Re-seed interrupt-delivery resume bookkeeping to the fresh
+             * load target — it lives outside CPUState/RAM so boot_state_load
+             * never touches it, and stale pre-load values (from whatever
+             * context F1 was pressed in) crash the very first interrupt
+             * after resume almost immediately. See
+             * psx_interrupt_resume_bookkeeping_reset in interrupts.c and
+             * ISSUES.md #10. Also clear the dirty-RAM interpreter's own
+             * stale safe-resume latch for the same reason. */
+            {
+                extern void psx_interrupt_resume_bookkeeping_reset(uint32_t resume_pc);
+                extern uint32_t g_dirty_safe_resume_pc;
+                extern uint32_t g_async_rfe_resume_pc;
+                psx_interrupt_resume_bookkeeping_reset(cpu->pc);
+                g_dirty_safe_resume_pc = 0;
+                /* g_async_rfe_resume_pc (dirty_ram_interp.c, "Tomba 2 frame-1997
+                 * fix") is explicitly documented there as PERSISTENT — unlike
+                 * g_dirty_safe_resume_pc it survives across the gap between an
+                 * interrupt and the game's later ReturnFromException, by design,
+                 * for games whose handler drives RFE asynchronously. That same
+                 * persistence makes it exactly the ISSUES.md #10 bug shape: it
+                 * lives outside CPUState/RAM, so a load leaves it holding
+                 * whatever it was in the pre-load LIVE session — not even
+                 * something the save captured. If the live session happened to
+                 * have a pending async RFE at the moment F1 was pressed, the
+                 * resumed guest's next sentinel-gated dispatch redirects to that
+                 * stale, no-longer-meaningful address instead of resolving
+                 * normally, and keeps re-landing there every time the sentinel
+                 * fires — an infinite (or very long) loop with completely normal
+                 * per-frame timing, which is why it presented as a "freeze that
+                 * gets worse" rather than a crash: frame pacing/presentation
+                 * never stalls, only guest logical progress does. Zero means "no
+                 * async RFE pending", the same state a cold boot starts in. */
+                g_async_rfe_resume_pc = 0;
+            }
+            /* MULT/DIV and GTE completion-stall deadlines (cpu->muldiv_ts_done /
+             * cpu->gte_ts_done — absolute guest-cycle numbers, psx_cycles.c) are
+             * fields on CPUState but write_cpu_section() never serializes them
+             * (BS_SEC_CPU only covers gpr/pc/hi/lo/cop0/gte_data/gte_ctrl), so
+             * boot_state_load leaves them holding whatever they were in the
+             * pre-load live session — almost always far ABOVE the freshly
+             * restored (lower) psx_cycle_count. The first MFLO/MFHI or GTE op
+             * after resume sees "deadline > now" and stalls for the entire
+             * stale gap via psx_advance_cycles(), which psx_devices_service_to_now()
+             * then has to replay event-by-event: a freeze that gets worse the
+             * longer the game ran before this particular load (measured:
+             * resume-to-first-check grew ~180ms per 10s of prior runtime).
+             * Zero means "nothing pending", the same state a cold boot starts
+             * in. */
+            cpu->muldiv_ts_done = 0;
+            cpu->gte_ts_done    = 0;
             s_load_cooldown_until_frame =
                 s_frame_count + SAVESTATE_LOAD_COOLDOWN_FRAMES;
             s_load_cooldown_notice = 0;
@@ -235,6 +307,14 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             /* Restage FBO/present latch so the restored frame is visible
              * immediately (avoids disabled-display blank latch + stale smooth). */
             psx_frontend_on_savestate_loaded();
+            /* Bounded grace window (ISSUES.md #10): if the resumed guest walks
+             * into an undiscovered dispatch target within the next few thousand
+             * dispatch checks, survive it loudly instead of crashing the whole
+             * process. See psx_post_load_grace_arm in traps.c. */
+            {
+                extern void psx_post_load_grace_arm(void);
+                psx_post_load_grace_arm();
+            }
             /* Unwind to the scheduler and re-dispatch the restored PC. Never
              * returns; abandons the suspended CPS frames on the current stack. */
             psx_scheduler_resume_at(cpu->pc);

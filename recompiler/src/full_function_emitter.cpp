@@ -1507,7 +1507,38 @@ bool FullFunctionEmitter::emit_function(
     // If there are continuation labels, prepend an entry-switch so the
     // dispatch loop can route to internal labels when called from a
     // continuation wrapper.
+    //
+    // Two independent sources feed this switch, checked in two separate
+    // blocks rather than folded into one condition:
+    //   - g_psx_resume_seed: a one-shot external resume request (currently
+    //     only psx_scheduler_resume_at, savestate load). Checked FIRST and
+    //     unconditionally consumed (zeroed) the instant it's read, whether
+    //     or not it names one of THIS function's labels, so a miss can never
+    //     leak into some later, unrelated function's check.
+    //   - cpu->pc: the existing tail-call/self-continuation signal. psx_dispatch_impl
+    //     (the shared trampoline) always zeroes this immediately before calling
+    //     dispatch_table[mid].func(cpu), specifically so it can tell "the callee
+    //     returned" (still 0 after the call) apart from "the callee tail-called
+    //     elsewhere" (now holds the new target) — a plain `jr $ra` return is
+    //     emitted as bare `return;` and never touches cpu->pc itself, so that
+    //     zero is load-bearing. Consequently cpu->pc is ALWAYS 0 by the time any
+    //     dispatch-table-invoked function's body runs, making this branch dead
+    //     for that call path (kept for whatever non-trampoline direct-call
+    //     pattern historically relied on it; g_psx_resume_seed is what actually
+    //     carries a mid-function resume request now).
     if (!local_continuations.empty()) {
+        out += "    extern uint32_t g_psx_resume_seed;\n";
+        out += "    if (g_psx_resume_seed != 0) {\n";
+        out += "        uint32_t _cont = g_psx_resume_seed;\n";
+        out += "        g_psx_resume_seed = 0;\n";
+        out += "        switch (_cont) {\n";
+        for (const auto& cl : local_continuations) {
+            out += fmt::format("            case 0x{:08X}u: goto label_{:08X};\n",
+                               cl.rom_addr, cl.rom_addr);
+        }
+        out += "            default: break;\n";
+        out += "        }\n";
+        out += "    }\n";
         out += "    if (cpu->pc != 0) {\n";
         out += "        uint32_t _cont = cpu->pc;\n";
         out += "        cpu->pc = 0;\n";

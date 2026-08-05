@@ -454,6 +454,40 @@ static uint32_t s_compiled_interrupt_resume_pc = 0;
 static uint32_t s_last_interrupt_check_pc = 0;
 static uint64_t s_last_interrupt_check_cycle = UINT64_MAX;
 
+/* Savestate load (ISSUES.md #10 follow-up): this bookkeeping is guest-
+ * session state but lives outside CPUState/RAM, so boot_state_load never
+ * touches it — after a load it still holds whatever this process's PRE-load
+ * context last set it to (main menu vs. mid-gameplay give wildly different
+ * stale values). The very first interrupt after resume uses it to pick a
+ * resume PC; stale, it points into a completely unrelated call context and
+ * crashes almost immediately. Re-seed it to the freshly-loaded resume PC so
+ * the first post-load interrupt has something real to fall back to. */
+void psx_interrupt_resume_bookkeeping_reset(uint32_t resume_pc) {
+    s_compiled_interrupt_resume_pc = resume_pc;
+    s_last_interrupt_check_pc = resume_pc;
+    s_last_interrupt_check_cycle = UINT64_MAX;
+    /* Same stale-state bug shape, different field (growing-freeze follow-up):
+     * post_exception_cooldown_until is an ABSOLUTE psx_cycle_count deadline
+     * armed by the unclaimed-interrupt path (psx_check_interrupts, "generous
+     * window" comment) against whatever cycle count the PRE-load live session
+     * was at. A load rewinds psx_cycle_count to the (usually far lower) value
+     * baked into the save, but this global isn't part of CPUState/RAM, so it
+     * keeps pointing at the old, now-enormous absolute cycle number. Every
+     * interrupt check after resume sees "cycle count < cooldown deadline" and
+     * bails out without delivering anything — including VBlank — until real
+     * elapsed cycles organically climb back past that stale target. That can
+     * take anywhere from instant to many real seconds/minutes depending on how
+     * long the live session had run before the load, which is exactly the
+     * reported "F1 freezes, then loads, and gets worse the more you play
+     * before pressing it again" — a genuine deadlock-shaped stall, not a
+     * performance issue, with completely normal frame pacing throughout
+     * (confirmed live: last-interrupt-check-cycle tracks the current cycle
+     * count in lockstep the whole time, proving checks run continuously and
+     * simply never clear the gate). Zero means "no cooldown pending", the
+     * same state interrupts_init() starts a cold boot in. */
+    post_exception_cooldown_until = 0;
+}
+
 /* Deferred cooperative thread switch from nested exception delivery.
  *
  * A genuine in-exception ChangeThread (kind-30, escape site below) must be
@@ -736,6 +770,7 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 
 void psx_check_interrupts(CPUState* cpu) {
     psx_cyc_batch_flush();
+    { extern void psx_post_load_grace_tick(void); psx_post_load_grace_tick(); }
     extern int g_ls_suppress_record;
 #define PSX_CHECK_INTERRUPTS_RETURN() do { if (g_ls_suppress_record > 0) g_ls_suppress_record--; return; } while (0)
 #ifdef PSX_COSIM
@@ -755,7 +790,13 @@ void psx_check_interrupts(CPUState* cpu) {
         if (!(sr & 0x01u) || !(sr & (1u << 10))) {
             if ((++s_fast_maintenance & 0x3FFFu) == 0) {
                 extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
-                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                /* Same g_dirty_safe_resume_pc preference as every other call
+                 * site below — s_compiled_interrupt_resume_pc alone is stale
+                 * (often 0) while execution is in the dirty-RAM interpreter,
+                 * and this fast path used to save that stale value verbatim,
+                 * producing an unresumable pc=0 savestate. */
+                savestate_poll(cpu, g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                           : s_compiled_interrupt_resume_pc);
                 debug_server_poll();
             }
             return;
@@ -801,7 +842,10 @@ void psx_check_interrupts(CPUState* cpu) {
         if ((i_stat & i_mask) == 0 && sw_pending == 0) {
             if ((++s_fast_maintenance & 0x3FFFu) == 0) {
                 extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
-                savestate_poll(cpu, s_compiled_interrupt_resume_pc);
+                /* Same g_dirty_safe_resume_pc preference as the rest of this
+                 * function — see the earlier fast path's comment. */
+                savestate_poll(cpu, g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                           : s_compiled_interrupt_resume_pc);
                 debug_server_poll();
             }
             return;
