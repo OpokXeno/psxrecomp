@@ -1234,6 +1234,18 @@ static void raster_flat_rect(const RTarget *t, int x, int y, int w, int h,
     }
 }
 
+extern int gpu_ws_margin_darken_pct(void);   /* gpu.c: [widescreen] nw_margin_darken_pct */
+
+/* Scale a BGR555 colour's channels by pct% (0-100), independently per
+ * channel, rounding to nearest. Mirrors gpu_gl_renderer.c's
+ * ws_scale_color15 — see [widescreen] nw_margin_darken_pct in
+ * config_loader.h for the rationale. */
+static uint16_t ws_scale_color15(uint16_t c, int pct) {
+    int r = (c & 0x1F), g = (c >> 5) & 0x1F, b = (c >> 10) & 0x1F;
+    r = (r * pct + 50) / 100; g = (g * pct + 50) / 100; b = (b * pct + 50) / 100;
+    return (uint16_t)((c & 0x8000) | (b << 10) | (g << 5) | r);
+}
+
 void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
     RTarget n = rt_native();
     raster_flat_rect(&n, x, y, w, h, color);
@@ -1256,13 +1268,82 @@ void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
         int native_w = g_wide_w - 2 * g_wide_off;
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         WideBd bd = wide_bd_get();
-        if (native_w > 0 && lx <= 0 && rx >= native_w)
-            raster_flat_rect(&wt, 0, y*s, g_wide_w*s, h*s, color);
+        if (native_w > 0 && lx <= 0 && rx >= native_w) {
+            int pct = gpu_ws_margin_darken_pct();
+            if (pct >= 100 || g_wide_off <= 0) {
+                raster_flat_rect(&wt, 0, y*s, g_wide_w*s, h*s, color);
+            } else {
+                /* [widescreen] nw_margin_darken_pct: centre keeps the exact,
+                 * unscaled colour; margins get a colour scaled by pct% (see
+                 * gpu_gl_renderer.c's mirror of this for the full rationale). */
+                uint16_t c_soft = ws_scale_color15(color, pct);
+                raster_flat_rect(&wt, 0, y*s, g_wide_off*s, h*s, c_soft);
+                raster_flat_rect(&wt, g_wide_off*s, y*s, native_w*s, h*s, color);
+                raster_flat_rect(&wt, (g_wide_off+native_w)*s, y*s,
+                                 (g_wide_w-g_wide_off-native_w)*s, h*s, c_soft);
+            }
+        }
         else if (bd.on) {
             int xl = wide_bd_x(&bd, x), xr = wide_bd_x(&bd, x + w);
             raster_flat_rect(&wt, (xl+dx)*s, y*s, (xr-xl)*s, h*s, color);
         } else
             raster_flat_rect(&wt, (x+dx)*s, y*s, w*s, h*s, color);
+    }
+}
+
+/* Rect with a vertical-only Gouraud gradient: color_top at row y, color_bottom
+ * at row y+h-1, constant across each row (horizontal component is flat).
+ * Faithfully reproduces the interpolation raster_gouraud_triangle would have
+ * produced for two triangles sharing top-row/bottom-row vertex colors. */
+static void raster_gouraud_rect(const RTarget *t, int x, int y, int w, int h,
+                                uint16_t color_top, uint16_t color_bottom) {
+    if (h <= 0) return;
+    int r0 = (color_top    >>  0) & 0x1F, g0 = (color_top    >>  5) & 0x1F, b0 = (color_top    >> 10) & 0x1F;
+    int r1 = (color_bottom >>  0) & 0x1F, g1 = (color_bottom >>  5) & 0x1F, b1 = (color_bottom >> 10) & 0x1F;
+    for (int row = 0; row < h; row++) {
+        int py = y + row;
+        if (py < t->cy1 || py > t->cy2) continue;
+
+        float alpha = (h > 1) ? (float)row / (float)h : 0.0f;
+        int r = r0 + (int)((float)(r1 - r0) * alpha);
+        int g = g0 + (int)((float)(g1 - g0) * alpha);
+        int b = b0 + (int)((float)(b1 - b0) * alpha);
+        uint16_t color = (uint16_t)(r | (g << 5) | (b << 10));
+
+        int sx = max_i(x, t->cx1);
+        int ex = min_i(x + w - 1, t->cx2);
+        for (int px = sx; px <= ex; px++) {
+            put_opaque(t, px, py, color);
+        }
+    }
+}
+
+void sw_draw_gouraud_rect(int x, int y, int w, int h,
+                          uint16_t color_top, uint16_t color_bottom) {
+    RTarget n = rt_native();
+    raster_gouraud_rect(&n, x, y, w, h, color_top, color_bottom);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_gouraud_rect(&hr, x*s, y*s, w*s, h*s, color_top, color_bottom);
+    }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        /* Same full-screen-overlay detection as sw_draw_flat_rect: a shaded
+         * (Gouraud) quad spanning the whole 4:3 framebuffer — e.g. a gradient
+         * cutscene fade/flash — must cover the whole wide surface too, else
+         * the revealed 16:9 margins are left undimmed/unfaded. */
+        int native_w = g_wide_w - 2 * g_wide_off;
+        int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
+        WideBd bd = wide_bd_get();
+        if (native_w > 0 && lx <= 0 && rx >= native_w)
+            raster_gouraud_rect(&wt, 0, y*s, g_wide_w*s, h*s, color_top, color_bottom);
+        else if (bd.on) {
+            int xl = wide_bd_x(&bd, x), xr = wide_bd_x(&bd, x + w);
+            raster_gouraud_rect(&wt, (xl+dx)*s, y*s, (xr-xl)*s, h*s, color_top, color_bottom);
+        } else
+            raster_gouraud_rect(&wt, (x+dx)*s, y*s, w*s, h*s, color_top, color_bottom);
     }
 }
 
@@ -1317,8 +1398,19 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
+        /* Same full-screen-overlay detection as sw_draw_flat_rect: a textured
+         * rect spanning the whole 4:3 framebuffer (haze/distortion masks,
+         * environmental filters) must cover the whole wide surface too, else
+         * the revealed 16:9 margins are left untouched. raster_textured_rect's
+         * 1:1 sampler already wraps u/v mod 256 per PSX texel addressing, so
+         * widening the destination naturally tiles a tileable overlay texture
+         * across the extra width — no separate stretch needed. */
+        int native_w = g_wide_w - 2 * g_wide_off;
+        int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         WideBd bd = wide_bd_get();
-        if (bd.on) {
+        if (native_w > 0 && lx <= 0 && rx >= native_w)
+            raster_textured_rect(&wt, 0, y*s, g_wide_w*s, h*s, u, v, clut_x, clut_y, texpage);
+        else if (bd.on) {
             /* Stretch about screen centre: widen the destination span and map the
              * native texel footprint across it via the SCALED rasterizer (the
              * 1:1 sampler would TILE a widened rect instead of stretching it). */

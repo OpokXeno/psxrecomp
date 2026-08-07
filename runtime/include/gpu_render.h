@@ -61,6 +61,12 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw_texture);
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t color);
+/* Axis-aligned rect with a vertical-only Gouraud gradient (top color at y,
+ * bottom color at y+h). Used for full-screen shaded-quad overlays (gradient
+ * fades/flashes) so native-wide can extend them across the revealed 16:9
+ * margins the same way gr_draw_flat_rect already does for flat overlays. */
+void gr_draw_gouraud_rect(int x, int y, int w, int h,
+                          uint16_t color_top, uint16_t color_bottom);
 void gr_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,
@@ -140,6 +146,8 @@ typedef struct GpuRenderBackend {
                                           uint16_t clut_x, uint16_t clut_y,
                                           uint16_t texpage, int raw_texture);
     void (*draw_flat_rect)(int x, int y, int w, int h, uint16_t color);
+    void (*draw_gouraud_rect)(int x, int y, int w, int h,
+                              uint16_t color_top, uint16_t color_bottom);
     void (*draw_textured_rect)(int x, int y, int w, int h, int u, int v,
                                uint16_t clut_x, uint16_t clut_y,
                                uint16_t texpage);

@@ -237,6 +237,12 @@ struct RuntimeConfig {
     // Defaults to true.
     bool                  video_antialiasing = true;
 
+    // pgxp: enable PGXP-style precision correction (GTE sub-pixel vertex
+    // shadow + perspective-correct UV). Off by default. Currently only
+    // visibly reduces polygon jitter when video_supersampling > 1 — native
+    // 1x rendering is unaffected (known follow-up, not this pass).
+    bool                  video_pgxp = false;
+
     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
@@ -798,6 +804,70 @@ struct GameConfig {
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
     uint32_t ws_bg2d_packet_cap       = 1000;
+
+    // [widescreen] nw_margin_darken_pct — in native-wide, scale the colour of
+    // any full-screen-overlay flat rect (gpu_flat_rect's `overlay` path in
+    // gpu_gl_renderer.c/gpu_sw_renderer.c — mood-lighting/vignette/fade
+    // layers already detected and widened to cover the whole surface) by
+    // this percentage ONLY in the revealed side margins; the native 4:3
+    // centre always gets the full, unscaled colour (byte-identical to a
+    // non-widescreen build). 100 = unchanged (faithful default). Lower
+    // values soften an aggressive darken/subtract-mode overlay in the
+    // margin specifically, where the game's own compensating bright layers
+    // (particle effects, foreground detail) were only ever authored densely
+    // enough to cover the original 4:3 frame and don't reach the margin to
+    // counteract it. Runtime-only — no regen required.
+    int ws_nw_margin_darken_pct = 100;
+
+    // [widescreen] nw_shimmer_duplicate — redraw small semi-transparent
+    // textured prims (heat-haze/spark/ember particles) N extra times at
+    // additional x-offsets in the native-wide mirror pass only, scattering
+    // real copies of the existing particles further into both margins. See
+    // gpu_gl_renderer.c's shimmer_prim_gate / nw_shimmer_duplicate handling.
+    // Runtime-only; 0 = off (default; broad shape, other titles may use
+    // small semi quads for effects that shouldn't scatter).
+    int ws_nw_shimmer_duplicate = 0;
+
+    // [widescreen] nw_shimmer_min_src_addr — floor on GP0 command source
+    // address for a prim to be eligible for nw_shimmer_duplicate; below this
+    // a small semi-transparent untagged prim is treated as a fixed UI
+    // decoration, not a particle. 0 = no filter (default). Confirm the real
+    // split for a title via ws_census (frame-persistence + position) before
+    // setting this — do not guess.
+    uint32_t ws_nw_shimmer_min_src_addr = 0;
+
+    // [widescreen] nw_shimmer_max_px — screen-space bounding-box cap (px, both
+    // axes) for a prim to be eligible for nw_shimmer_duplicate. 48 (default)
+    // matches the original heuristic (small particle quads, e.g. Tomba's
+    // ~20-30px heat-haze/embers). A title whose particle system is a 3D-
+    // projected streak (e.g. near-camera rain drawn as an elongated quad
+    // whose perspective-projected bbox is large, even saturating to the
+    // screen-coord limit) needs this raised — confirm via ws_census that the
+    // large-bbox population is really the same semi-transparent particle
+    // family (not terrain/architecture) before raising it, same evidentiary
+    // bar as nw_shimmer_min_src_addr.
+    int ws_nw_shimmer_max_px = 48;
+
+    // [widescreen] clear_reveal_per_frame — stronger, generic alternative to
+    // clear_reveal for fully-3D titles with no 2D background persistence
+    // contract: clears one native-wide margin band whenever the guest flips
+    // its display buffer (GP1(05h)), instead of only on the display-enable
+    // OFF->ON edge. See the declaration comment on gpu.c's
+    // ws_clear_reveal_per_frame for the full rationale (NOT a substitute for
+    // clear_reveal on a 2D title like MMX6 -- that title's background tiles
+    // are meant to persist across ordinary frames without being resubmitted
+    // every frame). Runtime-only. Off by default.
+    bool ws_clear_reveal_per_frame = false;
+
+    // [widescreen] nw_margin_mist_src_lo/hi + nw_margin_mist_pct — soften a
+    // specific address range's blend-mode vertex-colour tint in the native-
+    // wide margin mirror draw only. See gpu_gl_renderer.c's mist_prim_gate
+    // for the full rationale. 0,0 range = disabled (default). pct: 100 =
+    // faithful/unchanged (default), toward 0 fades the tint toward neutral
+    // (never toward black).
+    uint32_t ws_nw_mist_src_lo = 0;
+    uint32_t ws_nw_mist_src_hi = 0;
+    int ws_nw_margin_mist_pct = 100;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.
@@ -827,6 +897,7 @@ struct UserSettings {
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
+    bool has_pgxp           = false; bool pgxp           = false; // PGXP precision toggle (launcher-set)
     // Turbo through in-game load screens: while the CD data stream is active, run
     // the guest unpaced (host speed) to compress load wall-time. All guest timing
     // (VBlanks/callbacks/sectors) is preserved and audio plays through. Default ON

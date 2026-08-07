@@ -7079,6 +7079,25 @@ static void handle_gl_ws_ablate(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
 }
 
+/* ws_canon_suppress mask=<0-7>: live centre-degradation ablation (no
+ * rebuild). Suppresses the CANONICAL (4:3 centre) draw for specific content
+ * classes, leaving the native-wide margin mirror completely untouched, so
+ * the centre can be selectively degraded toward the margin's current
+ * appearance -- whatever bit makes the centre start looking like the margin
+ * is exactly the content class the margin is missing. Bits: 1=mist
+ * (blend-mode rain/atmosphere), 2=warm (the specific wall CLUT),
+ * 4=small-opaque (detail geometry, independent of nw_margin_detail_
+ * duplicate). No mask= just reports. Purely visual -- never touches guest
+ * RAM/game state; revert with mask=0 or a state reload/process restart. */
+static void handle_ws_canon_suppress(int id, const char *json)
+{
+    extern int g_ws_canon_suppress_mask;
+    extern void gpu_ws_set_canon_suppress(int mask);
+    int mask = json_get_int(json, "mask", -1);
+    if (mask >= 0) gpu_ws_set_canon_suppress(mask);
+    send_fmt("{\"id\":%d,\"ok\":true,\"mask\":%d}", id, g_ws_canon_suppress_mask);
+}
+
 static void handle_gl_interp(int id, const char *json)
 {
     (void)json;
@@ -7146,6 +7165,206 @@ static void handle_ws_nw(int id, const char *json)
     gpu_ws_get_debug(&ws);
     send_fmt("{\"id\":%d,\"ok\":true,\"native_wide\":%d,\"mode\":%d,\"nw_extra\":%d}",
              id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
+}
+
+/* ws_fb_bases: live native-wide framebuffer-base learner state (see
+ * draw_area_wide_x_margin in gpu.c) — the current guest draw_area_left,
+ * whether it's a recognized display buffer, the resulting X-margin, and the
+ * up-to-4 learned bases. Diagnoses titles/scenes whose draw target pattern
+ * the learner hasn't seen (margin silently drops to 0, culling the revealed
+ * 16:9 margins even though native-wide is otherwise engaged). */
+static void handle_ws_fb_bases(int id, const char *json)
+{
+    (void)json;
+    extern void gpu_ws_debug_fb_bases(uint32_t *out_bases, int *out_n, int cap,
+                                      uint32_t *out_draw_area_left, int *out_is_known,
+                                      int32_t *out_margin);
+    uint32_t bases[4]; int n = 0;
+    uint32_t draw_area_left = 0; int is_known = 0; int32_t margin = 0;
+    gpu_ws_debug_fb_bases(bases, &n, 4, &draw_area_left, &is_known, &margin);
+    char buf[512];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"ok\":true,\"draw_area_left\":%u,\"is_known_base\":%d,"
+        "\"margin\":%d,\"bases\":[", id, draw_area_left, is_known, margin);
+    for (int i = 0; i < n; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "%s%u", i ? "," : "", bases[i]);
+    snprintf(buf + pos, sizeof(buf) - (size_t)pos, "]}");
+    debug_server_send_line(buf);
+}
+
+/* ws_reject_stats: how many polygon bboxes draw_area_out_bbox rejected purely
+ * for sitting entirely right of the (margin-widened) draw area since the last
+ * query, and how close the nearest reject's left edge sits to that boundary.
+ * Resets on read so each query reflects the interval since the last one. */
+static void handle_ws_reject_stats(int id, const char *json)
+{
+    (void)json;
+    extern uint32_t g_ws_reject_right_count;
+    extern int32_t  g_ws_reject_right_min_minx;
+    extern int32_t  g_ws_reject_right_bound;
+    uint32_t count = g_ws_reject_right_count;
+    int32_t  min_minx = g_ws_reject_right_min_minx;
+    int32_t  bound = g_ws_reject_right_bound;
+    g_ws_reject_right_count = 0;
+    g_ws_reject_right_min_minx = 0x7FFFFFFF;
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%u,\"min_minx\":%d,\"bound\":%d,\"gap\":%d}",
+             id, count, min_minx, bound, (count > 0) ? (min_minx - bound) : 0);
+}
+
+/* ws_mirror_stats: live counters (reset on read) of how many GL textured-batch
+ * flushes ran the native-wide mirror pass vs. were skipped, and why. Isolates
+ * whether margin-reaching content ever reaches the mirror decision, and
+ * whether the "center-only" fast-path skip is misfiring for it. GL only
+ * (undefined/0 on other backends — the game's active renderer this session
+ * is OpenGL). */
+static void handle_ws_mirror_stats(int id, const char *json)
+{
+    (void)json;
+    extern uint32_t g_ws_mirror_tex_total;
+    extern uint32_t g_ws_mirror_tex_ran;
+    extern uint32_t g_ws_mirror_tex_skip_center;
+    extern uint32_t g_ws_mirror_tex_skip_other;
+    uint32_t total = g_ws_mirror_tex_total;
+    uint32_t ran = g_ws_mirror_tex_ran;
+    uint32_t skip_center = g_ws_mirror_tex_skip_center;
+    uint32_t skip_other = g_ws_mirror_tex_skip_other;
+    g_ws_mirror_tex_total = 0;
+    g_ws_mirror_tex_ran = 0;
+    g_ws_mirror_tex_skip_center = 0;
+    g_ws_mirror_tex_skip_other = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"ran\":%u,\"skip_center\":%u,\"skip_other\":%u}",
+             id, total, ran, skip_center, skip_other);
+}
+
+/* ws_mirror_probe: one-shot capture of live GL state around the ACTUAL
+ * native-wide mirror glDrawArrays call for a textured batch whose vertex
+ * range overlaps an armed screen-X band (draw-space, same units as
+ * ws_census xmin/xmax). ws_mirror_stats proves the mirror pass runs for
+ * margin-reaching content; this checks whether that draw call's real GL
+ * state (viewport/scissor/blend/stencil/depth/target FBO, glGetError)
+ * could explain content not showing up, instead of re-deriving it from
+ * code reading. {"cmd":"ws_mirror_probe","action":"arm","lo":N,"hi":N} to
+ * arm; {"cmd":"ws_mirror_probe"} (or action "dump") to read back. */
+static void handle_ws_mirror_probe(int id, const char *json)
+{
+    extern void gpu_ws_mirror_probe_arm2(int lo, int hi, int nverts_max, int semi_only);
+    extern void gpu_ws_mirror_probe_dump(char *out, size_t cap);
+    extern void gpu_ws_mirror_probe_set_samples(const int *xs, const int *ys, int n);
+    char act[16] = {0};
+    json_get_str(json, "action", act, sizeof(act));
+    if (strcmp(act, "arm") == 0) {
+        int lo = json_get_int(json, "lo", 0);
+        int hi = json_get_int(json, "hi", -1);
+        /* nverts_max: 0 = match any batch size (usually catches the huge
+         * coalesced opaque-terrain batch first, since it flushes constantly).
+         * Set e.g. nverts_max=12 to skip past it and target the small
+         * ISOLATED semi-transparent batches instead (shimmer/haze particles
+         * -- semi prims get one batch each to preserve paint order, so a
+         * single textured quad is nverts=6). semi_only=1 additionally
+         * requires the batch to actually be blended (semi>=0). */
+        int nverts_max = json_get_int(json, "nverts_max", 0);
+        int semi_only = json_get_int(json, "semi_only", 0);
+        /* Up to 4 sample points (unscaled draw-space, pre-shift): sx0/sy0..sx3/sy3. */
+        int sxs[4], sys[4], n = 0;
+        char key[8];
+        for (int i = 0; i < 4; i++) {
+            snprintf(key, sizeof(key), "sx%d", i);
+            int sx = json_get_int(json, key, INT32_MIN);
+            if (sx == INT32_MIN) break;
+            snprintf(key, sizeof(key), "sy%d", i);
+            sxs[n] = sx; sys[n] = json_get_int(json, key, 0); n++;
+        }
+        gpu_ws_mirror_probe_set_samples(sxs, sys, n);
+        gpu_ws_mirror_probe_arm2(lo, hi, nverts_max, semi_only);
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":true,\"lo\":%d,\"hi\":%d,"
+                 "\"nverts_max\":%d,\"semi_only\":%d,\"samples\":%d}",
+                 id, lo, hi, nverts_max, semi_only, n);
+        return;
+    }
+    char body[768];
+    gpu_ws_mirror_probe_dump(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* ws_overlay_log: every full-screen-overlay flat rect (gpu_flat_rect's
+ * `overlay` branch in gpu_gl_renderer.c) since the last clear -- geometry,
+ * 5-bit RGB colour, and blend mode. Built to identify the specific
+ * full-screen darkening rect suspected of over-darkening the native-wide
+ * margins relative to the 4:3 centre. action="clear" resets the ring;
+ * default dumps it. */
+static void handle_ws_overlay_log(int id, const char *json)
+{
+    extern void gpu_ws_overlay_log_dump(char *out, size_t cap);
+    extern void gpu_ws_overlay_log_clear(void);
+    char act[16] = {0};
+    json_get_str(json, "action", act, sizeof(act));
+    if (strcmp(act, "clear") == 0) {
+        gpu_ws_overlay_log_clear();
+        send_fmt("{\"id\":%d,\"ok\":true,\"cleared\":true}", id);
+        return;
+    }
+    char body[1536];
+    gpu_ws_overlay_log_dump(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* ws_shimmer_dup_stats: exact per-side count of nw_shimmer_duplicate's extra
+ * draws since the last reset -- built to replace inferring the left/right
+ * split from noisy pixel-brightness sampling (frame-to-frame rain particle
+ * animation swamps a single-capture brightness diff) with a precise count of
+ * what the duplicate loop in flush_tex_batch actually did. action="clear"
+ * resets both counters; default dumps them. */
+static void handle_ws_shimmer_dup_stats(int id, const char *json)
+{
+    extern uint64_t g_ws_shimmer_dup_left, g_ws_shimmer_dup_right;
+    extern void gpu_ws_shimmer_dup_stats_reset(void);
+    char act[16] = {0};
+    json_get_str(json, "action", act, sizeof(act));
+    if (strcmp(act, "clear") == 0) {
+        gpu_ws_shimmer_dup_stats_reset();
+        send_fmt("{\"id\":%d,\"ok\":true,\"cleared\":true}", id);
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"left\":%llu,\"right\":%llu}", id,
+              (unsigned long long)g_ws_shimmer_dup_left,
+              (unsigned long long)g_ws_shimmer_dup_right);
+}
+
+/* ws_shimmer_diag: per-batch log of every shimmer-classified (rain) textured
+ * batch's own bbox and whether ws_center_only excluded it from the margin
+ * mirror -- built to answer "does rain content itself get excluded" directly
+ * from the exact gate decision, instead of inferring it from screenshots.
+ * action="clear" resets the ring; default dumps it. */
+static void handle_ws_shimmer_diag(int id, const char *json)
+{
+    extern void gpu_ws_shimmer_diag_clear(void);
+    extern void gpu_ws_shimmer_diag_dump(char *out, size_t cap);
+    char act[16] = {0};
+    json_get_str(json, "action", act, sizeof(act));
+    if (strcmp(act, "clear") == 0) {
+        gpu_ws_shimmer_diag_clear();
+        send_fmt("{\"id\":%d,\"ok\":true,\"cleared\":true}", id);
+        return;
+    }
+    size_t cap = 512 * 1024;
+    char *body = (char *)malloc(cap);
+    if (!body) { send_err(id, "oom"); return; }
+    gpu_ws_shimmer_diag_dump(body, cap);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+    free(body);
+}
+
+/* ws_copy_debug: live-toggleable (no rebuild) diagnostic to test whether a
+ * specific VRAM->VRAM copy-rect sequence is the source of a visual effect.
+ * {"cmd":"ws_copy_debug","min_x":N} skips any copy whose destination x >= N;
+ * min_x=-1 (or omitted) disables (normal behaviour). See
+ * docs/burndown/010-widescreen-battle.md round 7. */
+static void handle_ws_copy_debug(int id, const char *json)
+{
+    extern void gpu_ws_copy_skip_dst_x(int min_x);
+    int min_x = json_get_int(json, "min_x", -1);
+    gpu_ws_copy_skip_dst_x(min_x);
+    send_fmt("{\"id\":%d,\"ok\":true,\"min_x\":%d}", id, min_x);
 }
 
 /* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
@@ -7887,6 +8106,73 @@ static void handle_display_ring_aux(int id, const char *json)
     fclose(fp);
     send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"path\":\"%s\","
              "\"vram_words\":%u}", id, f, path, (unsigned)n1);
+}
+
+/* clut_read x=<vram_x> y=<vram_y> [n=<count, default 16, max 256]: dump raw
+ * 16-bit VRAM texels starting at (x,y) as decoded RGB555 -- ground truth for
+ * a CLUT's actual palette entries (16 consecutive halfwords = one CLUT row),
+ * no rendering/filtering/lighting noise. Built for [widescreen] nw_margin_
+ * warm_boost tuning: read the target (cool) CLUT's raw colours and a
+ * reference (warm) CLUT's raw colours directly, compute the exact per-
+ * channel ratio needed instead of guessing a multiplier from screenshots. */
+static void handle_clut_read(int id, const char *json)
+{
+    int x = json_get_int(json, "x", -1);
+    int y = json_get_int(json, "y", -1);
+    int n = json_get_int(json, "n", 16);
+    if (x < 0 || y < 0) { send_err(id, "missing x/y"); return; }
+    if (n < 1) n = 1;
+    if (n > 256) n = 256;
+    char buf[8192];
+    int p = snprintf(buf, sizeof buf, "{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"entries\":[",
+                     id, x, y);
+    for (int i = 0; i < n && p < (int)sizeof(buf) - 64; i++) {
+        uint16_t px = gpu_vram_peek(x + i, y);
+        int r = (px & 0x1F) * 255 / 31, g = ((px >> 5) & 0x1F) * 255 / 31, b = ((px >> 10) & 0x1F) * 255 / 31;
+        p += snprintf(buf + p, sizeof(buf) - (size_t)p, "%s{\"raw\":\"0x%04X\",\"r\":%d,\"g\":%d,\"b\":%d}",
+                      i ? "," : "", px, r, g, b);
+    }
+    snprintf(buf + p, sizeof(buf) - (size_t)p, "]}");
+    debug_server_send_line(buf);
+}
+
+/* clut_write x=<vram_x> y=<vram_y> [n=<count, default 16>] [rgb555=<hex>]:
+ * flood-fill N consecutive VRAM halfwords starting at (x,y) with one raw
+ * RGB555 value (default bright red, 0x001F -- deliberately extreme so the
+ * effect is unmistakable) and push it to the active renderer's texture.
+ * Read-only diagnostics (clut_read + rendered screenshots) can misattribute
+ * a primitive to the wrong CLUT if the sampled screen pixel doesn't
+ * actually belong to the primitive whose vertex position was used to guess
+ * it (same trap the project's own history recorded for census-derived
+ * single-pixel sampling). Overwriting a CLUT with an impossible-to-miss
+ * colour and re-screenshotting removes that ambiguity entirely: whatever
+ * turns that exact colour really does sample this CLUT, nothing else does.
+ * VRAM data only -- never touches guest RAM / game simulation state, so
+ * (unlike a live RAM patch) there is no crash/corruption risk; the next
+ * savestate load or process restart fully reverts it. */
+static void handle_clut_write(int id, const char *json)
+{
+    extern uint16_t* gpu_get_vram_ptr(void);   /* debug-only; not in gpu.h's ABI surface */
+    extern void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data);
+    int x = json_get_int(json, "x", -1);
+    int y = json_get_int(json, "y", -1);
+    int n = json_get_int(json, "n", 16);
+    char rgb_str[16];
+    uint16_t fill = 0x001F;   /* pure red, RGB555 */
+    if (json_get_str(json, "rgb555", rgb_str, sizeof(rgb_str)))
+        fill = (uint16_t)hex_to_u32(rgb_str);
+    if (x < 0 || y < 0) { send_err(id, "missing x/y"); return; }
+    if (n < 1) n = 1;
+    if (n > 256) n = 256;
+    uint16_t *vram = gpu_get_vram_ptr();
+    uint16_t row[256];
+    for (int i = 0; i < n; i++) {
+        vram[((uint32_t)y & 511u) * 1024u + (((uint32_t)x + (uint32_t)i) & 1023u)] = fill;
+        row[i] = fill;
+    }
+    gr_vram_transfer_in(x, y, n, 1, row);
+    send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"n\":%d,\"rgb555\":\"0x%04X\"}",
+             id, x, y, n, fill);
 }
 
 static void handle_display_ring_stats(int id, const char *json)
@@ -12527,6 +12813,14 @@ static const CmdEntry s_commands[] = {
     { "ws_aspect",         handle_ws_aspect },
     { "ws_aspect_get",     handle_ws_aspect_get },
     { "ws_nw",             handle_ws_nw },
+    { "ws_fb_bases",       handle_ws_fb_bases },
+    { "ws_reject_stats",   handle_ws_reject_stats },
+    { "ws_mirror_stats",   handle_ws_mirror_stats },
+    { "ws_mirror_probe",   handle_ws_mirror_probe },
+    { "ws_overlay_log",    handle_ws_overlay_log },
+    { "ws_shimmer_dup_stats", handle_ws_shimmer_dup_stats },
+    { "ws_shimmer_diag",   handle_ws_shimmer_diag },
+    { "ws_copy_debug",     handle_ws_copy_debug },
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
@@ -12706,6 +13000,9 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "clut_read",         handle_clut_read },
+    { "clut_write",        handle_clut_write },
+    { "ws_canon_suppress", handle_ws_canon_suppress },
     { "display_ring_get",  handle_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },
     { "display_ring_stats", handle_display_ring_stats },

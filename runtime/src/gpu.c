@@ -122,6 +122,33 @@ static int g_mmx6_void_sides = 0;
 static uint32_t g_mmx6_void_generation = 1;
 void gpu_ws_set_clear_reveal(int on) { ws_clear_reveal = on ? 1 : 0; }
 
+/* [widescreen] clear_reveal_per_frame — a stronger, generic alternative to
+ * clear_reveal for fully-3D titles. The native-wide margins have no guest-
+ * VRAM backing and (per clear_reveal's design, see gp1_display_enable) are
+ * only invalidated on the guest's display-enable OFF->ON edge — correct for
+ * a 2D title like MMX6 whose background tiles are meant to persist across
+ * ordinary frames without being redrawn every frame, but wrong for a fully-
+ * 3D title with no such persistence contract: every visible surface is
+ * ordinarily resubmitted every frame by the game itself, so a margin column
+ * with genuinely no content this frame is supposed to be empty, not showing
+ * whatever last happened to land there (observed live: a flat sky-coloured
+ * patch surviving unchanged across an in-scene camera cut, because nothing
+ * in the new camera angle's geometry happens to redraw that exact column).
+ *
+ * The clear is triggered by the game's own GP1(05h) display-area-start call
+ * (gp1_display_area_start) flipping which double-buffer band is shown, NOT
+ * by a periodic vblank tick: the vblank IRQ fires before the game reacts to
+ * it with its own flip, so a fixed per-vblank clear races the frame that's
+ * still being presented and can wipe it before it's ever shown (tried,
+ * regressed the whole margin to solid black live — see the docs/burndown
+ * session log for this bug). Tying the clear to the actual flip event and
+ * scoping it to just the ONE band that's retiring from display (about to
+ * become the draw target) avoids both problems: the currently-displayed
+ * band is never touched while it's still on screen, and the currently-drawn
+ * band is never touched while the game may still be mid-draw into it. */
+static int ws_clear_reveal_per_frame = 0;
+void gpu_ws_set_clear_reveal_per_frame(int on) { ws_clear_reveal_per_frame = on ? 1 : 0; }
+
 /* GTE-activity gameplay detector ([widescreen] gte_game_mode) — the generic
  * 3D-title analog of the sprite-tag stamp. A fully-3D game (e.g. Ape Escape)
  * has no per-prim tag helper to hook, but every gameplay frame projects a
@@ -1461,6 +1488,14 @@ int psx_ws_prim_in_backdrop(void) {
     return psx_ws_prim_is_tagged();
 }
 
+/* Source RAM address of the GP0 command currently being drawn (0xFFFFFFFF =
+ * none/unknown). Exposed so a renderer backend can classify a prim by WHERE
+ * it was submitted from — round 6 of docs/burndown/010-widescreen-battle.md
+ * found this is the only reliable signal separating a screen-space UI
+ * decoration from a world-space particle effect when both happen to share
+ * the same GP0 opcode, size, blend mode, and (untagged) sprite-tag state. */
+uint32_t gpu_current_source_addr(void) { return gp0_cmd_source_addr; }
+
 int psx_ws_prim_is_tagged(void) {
     if (!ws_engaged() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
     uint32_t now = (uint32_t)s_frame_count;
@@ -1631,6 +1666,20 @@ static void ws_nw_hud_shift_vertices(int32_t *vx, int count) {
  * Transforms vx[0..3] IN PLACE (pre-draw_offset); returns 1 if it applied. */
 static int ws_nw_backdrop = 0;
 void gpu_ws_set_nw_backdrop(int on) { ws_nw_backdrop = on ? 1 : 0; }
+
+/* ---- Native-wide margin darken-pass softening ([widescreen] nw_margin_darken_pct) ---
+ * See config_loader.h for the full rationale. 100 = faithful/unchanged (the
+ * default); a lower value scales the colour of a detected full-screen-overlay
+ * flat rect ONLY for the portion of the draw that lands in the revealed side
+ * margins (gpu_flat_rect's `overlay` branch in the GL/SW renderer backends
+ * reads this via gpu_ws_margin_darken_pct()) — the native 4:3 centre keeps
+ * the exact, unscaled colour. */
+static int ws_nw_margin_darken_pct = 100;
+void gpu_ws_set_nw_margin_darken_pct(int pct) {
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    ws_nw_margin_darken_pct = pct;
+}
+int gpu_ws_margin_darken_pct(void) { return ws_nw_margin_darken_pct; }
 static int ws_nw_flat_backdrop = 0;
 void gpu_ws_set_nw_flat_backdrop(int on) { ws_nw_flat_backdrop = on ? 1 : 0; }
 int gpu_ws_nw_flat_backdrop_enabled(void) { return ws_nw_flat_backdrop; }
@@ -1811,6 +1860,16 @@ static void ws_nw_sync_target(void) {
 static void ws_clear_all_reveal_margins(void) {
     for (int i = 0; i < ws_fb_n; i++)
         gr_wide_clear_margins((int)ws_fb_base[i], 0, 512, 0, 3);
+}
+
+/* [widescreen] clear_reveal_per_frame's actual clear: one double-buffer BAND
+ * (256 VRAM rows -- the observed y=0/y=256 band spacing) at a specific
+ * (base_x, y), not the whole 512-row surface. See gp1_display_area_start for
+ * why this must be band-scoped and triggered off the real flip event rather
+ * than a periodic vblank tick. */
+static void ws_clear_reveal_margins_band(uint32_t base_x, uint32_t y) {
+    if (!ws_is_fb_base(base_x)) return;
+    gr_wide_clear_margins((int)base_x, (int)y, 256, 0, 3);
 }
 
 /* Stage-init already clears both synthetic margins once. Do not keep clearing
@@ -2342,6 +2401,10 @@ void gpu_texture_correction_set(int enabled) {
     gte_precision_tracking_set(enabled);
 }
 
+int gpu_texture_correction_enabled(void) {
+    return s_texture_correction_enabled;
+}
+
 uint32_t gpu_texture_correction_hits(void) {
     return sw_perspective_triangle_count();
 }
@@ -2437,6 +2500,20 @@ static inline int32_t draw_area_wide_x_margin(void) {
     return (int32_t)ws_nw_offset();
 }
 
+/* Debug exposure for `ws_fb_bases` TCP command: live fb-base learner state +
+ * the current margin decision, to diagnose titles whose battle/menu draw
+ * target pattern the learner may not recognize (see draw_area_wide_x_margin
+ * above). */
+void gpu_ws_debug_fb_bases(uint32_t *out_bases, int *out_n, int cap,
+                           uint32_t *out_draw_area_left, int *out_is_known,
+                           int32_t *out_margin) {
+    *out_n = ws_fb_n < cap ? ws_fb_n : cap;
+    for (int i = 0; i < *out_n; i++) out_bases[i] = ws_fb_base[i];
+    *out_draw_area_left = draw_area_left;
+    *out_is_known = ws_is_fb_base(draw_area_left);
+    *out_margin = draw_area_wide_x_margin();
+}
+
 static inline void draw_area_host_x_bounds(int32_t *left, int32_t *right) {
     int32_t margin = draw_area_wide_x_margin();
     *left  = (int32_t)draw_area_left;
@@ -2459,6 +2536,15 @@ static inline int draw_area_out_point(int32_t x, int32_t y) {
         || y < (int32_t)draw_area_top  || y > (int32_t)draw_area_bottom;
 }
 
+/* Diagnostic-only counters for the ws_reject_stats debug command: how many
+ * polygon bboxes get rejected purely because they sit entirely right of the
+ * (margin-widened) draw area this frame, and how close the nearest such
+ * reject's left edge sits to the margin boundary (small gap = real content
+ * is being clipped just past the reveal; large gap = nothing there to miss). */
+uint32_t g_ws_reject_right_count = 0;
+int32_t  g_ws_reject_right_min_minx = 0x7FFFFFFF;
+int32_t  g_ws_reject_right_bound = 0;
+
 static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n) {
     int32_t minx = vx[0], maxx = vx[0], miny = vy[0], maxy = vy[0];
     for (int i = 1; i < n; i++) {
@@ -2469,6 +2555,11 @@ static inline int draw_area_out_bbox(const int32_t *vx, const int32_t *vy, int n
     }
     int32_t left, right;
     draw_area_host_x_bounds(&left, &right);
+    if (minx > right && maxy >= (int32_t)draw_area_top && miny <= (int32_t)draw_area_bottom) {
+        g_ws_reject_right_count++;
+        g_ws_reject_right_bound = right;
+        if (minx < g_ws_reject_right_min_minx) g_ws_reject_right_min_minx = minx;
+    }
     return maxx < left || minx > right
         || maxy < (int32_t)draw_area_top  || miny > (int32_t)draw_area_bottom;
 }
@@ -2687,6 +2778,33 @@ static void gp0_exec_shaded_quad(void) {
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
+
+    /* Full-screen gradient filters (cutscene fade/flash) are commonly encoded
+     * as an axis-aligned shaded quad whose color only varies vertically (top
+     * row vs bottom row, e.g. C0==C1 and C2==C3) — the same authoring pattern
+     * gp0_exec_mono_quad already special-cases for solid-color overlays. The
+     * generic wide mirror below reproduces this quad at its translated
+     * position via per-vertex world-space squash, which is correct for
+     * ordinary geometry but leaves the revealed 16:9 margins uncovered for a
+     * screen-space overlay. Detect it and route through the same
+     * expand-to-full-width path flat overlays use. */
+    if (vx[0] == vx[2] && vx[1] == vx[3] &&
+        vy[0] == vy[1] && vy[2] == vy[3] &&
+        vx[1] > vx[0] && vy[2] > vy[0] &&
+        vx[0] <= 0 && vx[1] >= ws_disp_w() &&
+        vy[0] <= 0 && vy[2] >= ws_disp_h() &&
+        c[0] == c[1] && c[2] == c[3]) {
+        int32_t x = vx[0];
+        int32_t y = vy[0];
+        int w = (int)(vx[1] - vx[0]);
+        int h = (int)(vy[2] - vy[0]);
+        ws_expand_fullscreen_rect(&x, y, &w, h);
+        x += draw_offset_x;
+        y += draw_offset_y;
+        gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+        gr_draw_gouraud_rect(x, y, w, h, c[0], c[2]);
+        return;
+    }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
     ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
@@ -2828,6 +2946,32 @@ static void gp0_exec_textured_quad(void) {
         int32_t ws_ax;
         if (ws_tagged_anchor(&ws_ax))
             for (int i = 0; i < 4; i++) vx[i] = ws_scale_about(vx[i], ws_ax);
+    }
+
+    /* Full-screen textured overlays covering the whole native display (haze/
+     * distortion masks, environmental filters) get the same expand-to-full-
+     * width treatment gp0_exec_mono_quad already applies to flat overlays,
+     * so the revealed 16:9 margins keep the effect instead of showing bare
+     * geometry underneath. Only the simple 1:1 (unscaled) texture mapping —
+     * the scaled/stretched case falls through to the general path below. */
+    if (vx[0] == vx[2] && vx[1] == vx[3] &&
+        vy[0] == vy[1] && vy[2] == vy[3] &&
+        vx[1] > vx[0] && vy[2] > vy[0] &&
+        vx[0] <= 0 && vx[1] >= ws_disp_w() &&
+        vy[0] <= 0 && vy[2] >= ws_disp_h() &&
+        u[0] == u[2] && u[1] == u[3] && v[0] == v[1] && v[2] == v[3] &&
+        (u[1] - u[0]) == (vx[1] - vx[0]) && (v[2] - v[0]) == (vy[2] - vy[0])) {
+        int32_t x = vx[0];
+        int32_t y = vy[0];
+        int w = (int)(vx[1] - vx[0]);
+        int h = (int)(vy[2] - vy[0]);
+        ws_expand_fullscreen_rect(&x, y, &w, h);
+        x += draw_offset_x;
+        y += draw_offset_y;
+        if (draw_area_out_rect(x, y, w, h)) return;
+        setup_textured_draw(color24, semi_trans, raw_texture);
+        gr_draw_textured_rect(x, y, w, h, u[0], v[0], clut_x, clut_y, tpage);
+        return;
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop image stretch (no-op else) */
     ws_nw_hud_shift_vertices(vx, 4);
@@ -3070,6 +3214,26 @@ static void gp0_exec_textured_rect(void) {
     int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
+
+    /* Full-screen textured overlays (haze/distortion masks, environmental
+     * filters) are commonly authored as a 320x240 SPRT — the textured
+     * counterpart of the full-screen TILE fades gp0_exec_mono_rect already
+     * expands. An untagged, non-HUD rect that covers the whole native
+     * display gets the same expand-to-full-width treatment instead of the
+     * tagged/HUD squash below, so the revealed 16:9 margins keep the effect
+     * (the renderer tiles the texture into the extra width via normal PSX
+     * texel wrapping). */
+    int32_t fs_tag_ax;
+    if (w > 0 && x0 <= 0 && x0 + w >= ws_disp_w() &&
+        y0 <= 0 && y0 + h >= ws_disp_h() &&
+        !ws_tagged_anchor(&fs_tag_ax) && !ws_hud_sprt) {
+        ws_expand_fullscreen_rect(&x0, y0, &w, h);
+        x0 += draw_offset_x; y0 += draw_offset_y;
+        if (draw_area_out_rect(x0, y0, w, h)) return;
+        setup_textured_draw(color24, semi_trans, raw_texture);
+        gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
+        return;
+    }
 
     /* Widescreen: tagged sprite parts squash around their projected anchor;
      * untagged SPRTs are screen-space 2D (HUD/menus) and squash around the
@@ -4283,8 +4447,27 @@ static void gp1_display_area_start(uint32_t val) {
     /* GP1(05h): Start of display area in VRAM
      * bits 0-9: X (in halfwords, 0-1023)
      * bits 10-18: Y (0-511) */
-    display_area_x = val & 0x3FF;
-    display_area_y = (val >> 10) & 0x1FF;
+    uint32_t new_x = val & 0x3FF;
+    uint32_t new_y = (val >> 10) & 0x1FF;
+    /* [widescreen] clear_reveal_per_frame: this call is the game switching
+     * which double-buffer band is on screen. The OLD (display_area_x,
+     * display_area_y) band -- what was JUST being shown -- is exactly the
+     * band the game is about to draw its next frame into (the standard PS1
+     * "flip, then draw the other buffer" loop), so its margins are safe to
+     * clear right here: nothing has drawn into it yet for the frame that's
+     * about to start, and it will never be shown again in its current
+     * (possibly stale) state. This must NOT be the currently-drawn band
+     * (would erase content about to be displayed) and must NOT be a fixed
+     * periodic tick (a vblank IRQ fires before the game reacts to it with
+     * its own flip, so a vblank-tied clear races the still-being-presented
+     * frame -- tried, regressed the whole margin to black live, see
+     * docs/burndown session log). Only fires on a REAL flip (new_y !=
+     * display_area_y): redundant same-value GP1(05h) calls are common and
+     * must not re-clear a band the game may already be mid-draw into. */
+    if (ws_clear_reveal_per_frame && new_y != display_area_y && ws_native_wide_active())
+        ws_clear_reveal_margins_band(display_area_x, display_area_y);
+    display_area_x = new_x;
+    display_area_y = new_y;
     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
 }
 

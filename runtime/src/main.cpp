@@ -26,6 +26,128 @@
 #include "autocompile.h"
 #include "code_provider.h"
 extern "C" void psx_event_step_conservative_env_init(void);
+
+/* ---- TEMPORARY diagnostic: allocation-site leak tracker ----------------
+ * Investigating a continuous ~2-2.5MB/s leak reproducing with no savestate
+ * activity at all (see psxrecomp/ISSUES.md #10 follow-up). Throwaway code,
+ * only compiled in with -DPSX_LEAK_TRACK and linked with
+ * -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc. Tracks
+ * allocations >= 512B in a bounded table and periodically dumps
+ * outstanding bytes grouped by caller return address to stderr. Remove
+ * once the leak is found. */
+#if defined(PSX_LEAK_TRACK)
+#include <cstdlib>
+#include <cstdio>
+extern "C" void* __real_malloc(size_t);
+extern "C" void  __real_free(void*);
+extern "C" void* __real_calloc(size_t, size_t);
+extern "C" void* __real_realloc(void*, size_t);
+
+#define LEAK_TRACK_MIN_SIZE 512u
+#define LEAK_TRACK_CAP 200000
+
+struct LeakEntry { void* ptr; size_t size; void* retaddr; };
+static LeakEntry s_leak_table[LEAK_TRACK_CAP];
+static int s_leak_count = 0;
+static unsigned long long s_leak_total_tracked = 0;
+static unsigned long long s_leak_overflow = 0;
+
+static void leak_track_add(void* ptr, size_t size, void* retaddr) {
+    if (!ptr || size < LEAK_TRACK_MIN_SIZE) return;
+    if (s_leak_count < LEAK_TRACK_CAP) {
+        s_leak_table[s_leak_count].ptr = ptr;
+        s_leak_table[s_leak_count].size = size;
+        s_leak_table[s_leak_count].retaddr = retaddr;
+        s_leak_count++;
+        s_leak_total_tracked += size;
+    } else {
+        s_leak_overflow++;
+    }
+}
+static void leak_track_remove(void* ptr) {
+    if (!ptr) return;
+    for (int i = 0; i < s_leak_count; i++) {
+        if (s_leak_table[i].ptr == ptr) {
+            s_leak_total_tracked -= s_leak_table[i].size;
+            s_leak_table[i] = s_leak_table[s_leak_count - 1];
+            s_leak_count--;
+            return;
+        }
+    }
+}
+
+extern "C" void leak_track_dump(void) {
+    struct Agg { void* addr; unsigned long long bytes; int count; };
+    static Agg agg[512];
+    int nagg = 0;
+    for (int i = 0; i < s_leak_count; i++) {
+        void* ra = s_leak_table[i].retaddr;
+        int found = -1;
+        for (int j = 0; j < nagg; j++) if (agg[j].addr == ra) { found = j; break; }
+        if (found < 0 && nagg < 512) {
+            found = nagg++;
+            agg[found].addr = ra; agg[found].bytes = 0; agg[found].count = 0;
+        }
+        if (found >= 0) { agg[found].bytes += s_leak_table[i].size; agg[found].count++; }
+    }
+    static Agg by_bytes[512];
+    for (int i = 0; i < nagg; i++) by_bytes[i] = agg[i];
+    for (int i = 0; i < nagg; i++) {
+        int best = i;
+        for (int j = i + 1; j < nagg; j++) if (by_bytes[j].bytes > by_bytes[best].bytes) best = j;
+        if (best != i) { Agg t = by_bytes[i]; by_bytes[i] = by_bytes[best]; by_bytes[best] = t; }
+    }
+    static Agg by_count[512];
+    for (int i = 0; i < nagg; i++) by_count[i] = agg[i];
+    for (int i = 0; i < nagg; i++) {
+        int best = i;
+        for (int j = i + 1; j < nagg; j++) if (by_count[j].count > by_count[best].count) best = j;
+        if (best != i) { Agg t = by_count[i]; by_count[i] = by_count[best]; by_count[best] = t; }
+    }
+    std::fprintf(stderr, "=== LEAK TRACK DUMP: %d tracked (>=512B), %llu bytes total, overflow=%llu ===\n",
+                 s_leak_count, s_leak_total_tracked, s_leak_overflow);
+    int show = nagg < 15 ? nagg : 15;
+    std::fprintf(stderr, " -- top by outstanding bytes --\n");
+    for (int i = 0; i < show; i++) {
+        std::fprintf(stderr, "  retaddr=%p  outstanding=%llu bytes  count=%d\n",
+                     by_bytes[i].addr, by_bytes[i].bytes, by_bytes[i].count);
+    }
+    std::fprintf(stderr, " -- top by REPEAT COUNT (the real per-frame-leak signal) --\n");
+    for (int i = 0; i < show; i++) {
+        std::fprintf(stderr, "  retaddr=%p  outstanding=%llu bytes  count=%d\n",
+                     by_count[i].addr, by_count[i].bytes, by_count[i].count);
+    }
+    std::fflush(stderr);
+}
+
+static unsigned long long s_leak_call_count = 0;
+
+extern "C" void* __wrap_malloc(size_t sz) {
+    void* p = __real_malloc(sz);
+    if (s_leak_call_count == 0) {
+        std::fprintf(stderr, "LEAK TRACK: __wrap_malloc is active (first call, size=%zu)\n", sz);
+        std::fflush(stderr);
+    }
+    leak_track_add(p, sz, __builtin_return_address(0));
+    if ((++s_leak_call_count % 2000ull) == 0) leak_track_dump();
+    return p;
+}
+extern "C" void __wrap_free(void* p) {
+    leak_track_remove(p);
+    __real_free(p);
+}
+extern "C" void* __wrap_calloc(size_t n, size_t sz) {
+    void* p = __real_calloc(n, sz);
+    leak_track_add(p, n * sz, __builtin_return_address(0));
+    return p;
+}
+extern "C" void* __wrap_realloc(void* old, size_t sz) {
+    leak_track_remove(old);
+    void* p = __real_realloc(old, sz);
+    leak_track_add(p, sz, __builtin_return_address(0));
+    return p;
+}
+#endif /* PSX_LEAK_TRACK */
 #include "overlay_backend.h"
 #include "gpu.h"
 #include "present_ring.h"
@@ -499,6 +621,21 @@ static int           g_video_win_w    = 1280; /* window width (height follows as
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
 static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
+static int           g_pgxp           = 0;   /* PGXP-style precision correction (see [video] pgxp) */
+
+/* PGXP-style precision correction (gte.cpp / gpu.c). Currently only visibly
+ * reduces polygon jitter when video_supersampling > 1 — see [video] pgxp
+ * in config_loader.h. */
+extern "C" void gte_geometry_correction_set(int enabled);
+extern "C" int  gte_geometry_correction_enabled(void);
+extern "C" void gpu_texture_correction_set(int enabled);
+extern "C" int  gpu_texture_correction_enabled(void);
+
+static void psx_pgxp_apply(int enabled) {
+    g_pgxp = enabled ? 1 : 0;
+    gte_geometry_correction_set(g_pgxp);
+    gpu_texture_correction_set(g_pgxp);
+}
 
 /* Live setters for the launcher-equivalent video/audio options, consumed by
  * the debug overlay's Toggles section (and reachable over TCP widget_action).
@@ -529,6 +666,8 @@ void psx_audio_set_spu_hq(int on)       {
     g_audio_spu_hq = (on != 0);
     spu_shadow_set_enabled(on);
 }
+int  psx_video_get_pgxp(void)           { return g_pgxp; }
+void psx_video_set_pgxp(int on)         { psx_pgxp_apply(on); }
 }
 /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
@@ -606,6 +745,7 @@ static bool          g_ws_hud_sprt = false;
 /* Runtime-only transition cleanup; kept out of gpu.h because generated game
  * units include that ABI header and do not need this frontend-only setter. */
 extern "C" void gpu_ws_set_clear_reveal(int on);
+extern "C" void gpu_ws_set_clear_reveal_per_frame(int on);
 extern "C" void gpu_ws_set_nw_textured_edges(int on, int scale_pct);
 extern "C" void gpu_ws_set_signed_x_bound_sites(const uint32_t*, const uint32_t*, int);
 /* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
@@ -4916,6 +5056,25 @@ int main(int argc, char** argv) {
                                                 gc.ws_nw_left_hud_packet_hi);
             /* [widescreen] nw_backdrop — stretch full-frame 2D sky backdrop. */
             gpu_ws_set_nw_backdrop(gc.ws_nw_backdrop ? 1 : 0);
+            /* [widescreen] nw_margin_darken_pct — soften full-screen-overlay
+             * darken/fade rects in the revealed margins only; centre unaffected. */
+            gpu_ws_set_nw_margin_darken_pct(gc.ws_nw_margin_darken_pct);
+            /* [widescreen] nw_shimmer_duplicate — scatter extra copies of
+             * small semi-transparent particle prims into the margins
+             * (mirror-pass only). */
+            gpu_ws_set_shimmer_dup_count(gc.ws_nw_shimmer_duplicate);
+            /* [widescreen] nw_shimmer_min_src_addr — floor separating real
+             * particles from a same-shaped fixed UI decoration. */
+            gpu_ws_set_shimmer_min_addr(gc.ws_nw_shimmer_min_src_addr);
+            /* [widescreen] nw_shimmer_max_px — per-game bbox cap override for
+             * particle systems with a large projected extent (e.g. rain streaks). */
+            gpu_ws_set_shimmer_max_px(gc.ws_nw_shimmer_max_px);
+            /* [widescreen] nw_mist_src_lo/hi + nw_margin_mist_pct — soften a
+             * specific address range's vertex-colour tint in the margin
+             * mirror draw only (atmosphere/mist content that legitimately
+             * reaches the margin but reads as a flat wash there). */
+            gpu_ws_set_mist_range(gc.ws_nw_mist_src_lo, gc.ws_nw_mist_src_hi);
+            gpu_ws_set_mist_pct(gc.ws_nw_margin_mist_pct);
             /* [widescreen] nw_flat_backdrop — stretch flat sky/backdrop prims
              * in the native-wide mirror, preserving the canonical 4:3 image. */
             gpu_ws_set_nw_flat_backdrop(gc.ws_nw_flat_backdrop ? 1 : 0);
@@ -4939,6 +5098,10 @@ int main(int argc, char** argv) {
             /* [widescreen] clear_reveal — enable opted-in scene/map-boundary
              * cleanup of synthetic native-wide margins. */
             gpu_ws_set_clear_reveal(gc.ws_clear_reveal ? 1 : 0);
+            /* [widescreen] clear_reveal_per_frame — stronger per-vblank margin
+             * clear for fully-3D titles with no 2D background persistence
+             * contract (see gpu.c declaration comment). */
+            gpu_ws_set_clear_reveal_per_frame(gc.ws_clear_reveal_per_frame ? 1 : 0);
             gpu_ws_set_cull_guard_pixels(gc.ws_cull_guard_pixels);
             gpu_ws_set_explicit_cull_sites(
                 gc.ws_cull_bias_sites.data(), (int)gc.ws_cull_bias_sites.size(),
@@ -4977,6 +5140,7 @@ int main(int argc, char** argv) {
                                           (int)gc.ws_backdrop_x_sites.size());
             g_audio_spu_hq     = gc.runtime.audio_spu_hq;
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
+            psx_pgxp_apply(gc.runtime.video_pgxp ? 1 : 0);
             /* [controller] game-declared input defaults (settings.toml/launcher
              * still override below). */
             if (gc.runtime.has_default_mode) {
@@ -5267,6 +5431,7 @@ int main(int argc, char** argv) {
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
+        if (us.has_pgxp)           psx_pgxp_apply(us.pgxp ? 1 : 0);
         if (us.has_turbo_loads)    g_turbo_loads_enabled = us.turbo_loads ? 1 : 0;
         /* fast_boot is deliberately NOT restored from settings.toml: the
          * launcher exposes no control for it, so the persisted row can only
@@ -5472,6 +5637,7 @@ int main(int argc, char** argv) {
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
+            seed.pgxp = (g_pgxp != 0);                     seed.has_pgxp = true;
             seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
@@ -5575,6 +5741,7 @@ int main(int argc, char** argv) {
             ls.frame_interp_fps   = seed.frame_interpolation_fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
+            ls.pgxp               = seed.pgxp ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
              * (match by code; games with no [runtime].languages list leave
@@ -5765,6 +5932,7 @@ int main(int argc, char** argv) {
                 seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
                 seed.auto_skip_fmv         = ls.auto_skip_fmv != 0;    seed.has_auto_skip_fmv         = true;
+                seed.pgxp                  = ls.pgxp != 0;              seed.has_pgxp                  = true;
                 seed.turbo_loads           = ls.turbo_loads != 0;      seed.has_turbo_loads           = true;
                 /* Bundled-BIOS builds ignore any launcher-supplied path (the
                  * picker is hidden, but a stale settings file could still
@@ -5838,6 +6006,7 @@ int main(int argc, char** argv) {
                 g_video_texfilter = seed.texture_filter;
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
+                psx_pgxp_apply(seed.pgxp ? 1 : 0);
                 g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;

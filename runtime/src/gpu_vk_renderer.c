@@ -2579,6 +2579,61 @@ static void wide_overlay_rect(int y, int h, uint16_t c, int semi) {
     end_oneshot(cb);
 }
 
+/* Full-screen-overlay wide pass for a vertical-only Gouraud gradient (gradient
+ * cutscene fade/flash authored as a shaded quad): draw a rect covering the
+ * FULL wide width [0, wide_w) x [y, y+h) directly into the active wide
+ * surface, with color_top at the top edge and color_bottom at the bottom
+ * edge. Mirrors wide_overlay_rect but with per-vertex colors. */
+static void wide_overlay_gouraud_rect(int y, int h, uint16_t c_top, uint16_t c_bot, int semi) {
+    if (s_wide_cur < 0 || !s_ready) return;
+    ensure_room(6);
+    float top3[3], bot3[3]; col555(c_top, top3); col555(c_bot, bot3);
+    uint32_t base = s_vbase + s_vcount;   /* == s_vbase (batches drained) */
+    float x0 = 0.0f, x1 = (float)s_wide_w, fy0 = (float)y, fy1 = (float)(y + h);
+    push_vert(x0, fy0, top3); push_vert(x1, fy0, top3); push_vert(x1, fy1, bot3);
+    push_vert(x0, fy0, top3); push_vert(x1, fy1, bot3); push_vert(x0, fy1, bot3);
+    s_vbase += s_vcount; s_vcount = 0;    /* consume privately */
+    int blend = (semi < 0) ? 0 : (semi + 1);
+    int S = s_scale;
+    VkCommandBuffer cb = begin_oneshot();
+    wide_pass_begin(cb);
+    /* Overlay covers the whole surface: override the band scissor. */
+    VkRect2D sc = { { 0, 0 }, { (uint32_t)(s_wide_w * S), (uint32_t)(VRAM_H * S) } };
+    p_vkCmdSetScissor(cb, 0, 1, &sc);
+    bind_masked(cb, 0, 0, blend, s_mask_check, s_mask_set);
+    GeoPush gp = { px_shift(), 0.0f, (float)s_wide_w / 2.0f };
+    p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
+    VkDeviceSize off = 0;
+    p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
+    p_vkCmdDraw(cb, 6, 1, base, 0);
+    p_vkCmdEndRenderPass(cb);
+    end_oneshot(cb);
+}
+
+static void vkb_draw_gouraud_rect(int x,int y,int w,int h,uint16_t c_top,uint16_t c_bot){
+    /* Same detection as vkb_draw_flat_rect: a full-screen shaded-quad overlay
+     * must not mirror 1:1 (it would cover only the translated 4:3 span) —
+     * suppress the batch mirror and emit one full-wide-width gradient rect
+     * instead, so the revealed margins are faded too. */
+    int overlay = 0;
+    if (s_wide_cur >= 0) {
+        int native_w = s_wide_w - 2 * s_wide_offset;
+        int lx = x - s_wide_cur_base, rx = x + w - s_wide_cur_base;
+        overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+    }
+    if (overlay) { flush_tex_batch(); flush_geometry(); }
+    geo_prim_begin();
+    float top3[3], bot3[3]; col555(c_top, top3); col555(c_bot, bot3);
+    if (overlay) s_geo_mirror_suppress = 1;
+    tri3((float)x,(float)y,top3, (float)(x+w),(float)y,top3, (float)x,(float)(y+h),bot3);
+    tri3((float)(x+w),(float)y,top3, (float)x,(float)(y+h),bot3, (float)(x+w),(float)(y+h),bot3);
+    if (overlay) {
+        int semi = s_semi_en ? s_semi_mode : -1;
+        flush_geometry();                  /* canonical only (mirror suppressed) */
+        wide_overlay_gouraud_rect(y, h, c_top, c_bot, semi);
+    }
+}
+
 static void vkb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
     /* Full-screen 2D overlay under native-wide: the canonical rect must NOT
      * mirror 1:1 (it would cover only the translated 4:3 span) — suppress the
@@ -2677,7 +2732,7 @@ static void flush_tex_batch(void) {
         p_vkCmdDraw(cb, n, 1, base, 0);
     }
     p_vkCmdEndRenderPass(cb);
-    if (s_wide_cur >= 0) {                 /* native-wide mirror pass (same CB) */
+    if (s_wide_cur >= 0 && !s_geo_mirror_suppress) {   /* native-wide mirror pass (same CB) */
         wide_pass_begin(cb);
         tp.xoff = (float)wide_dx(); tp.xhalf = (float)s_wide_w / 2.0f;
         if (semi < 0) {
@@ -2781,23 +2836,126 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     s_gpu_dirty = 1;
 }
 
+/* Draw a textured rect DIRECTLY into the active wide surface at wide-space
+ * coords [wx, wx+ww) x [y, y+h), sampling texels starting at (u0,v0) and
+ * continuing linearly at 1 texel/pixel. Widening the destination this way
+ * crosses a 256-texel page boundary, which psx_uv_rect_limits already
+ * detects (gpu_uv.h) by disabling the sampling clamp and widening the
+ * bounds to the full page — so a tileable overlay texture (haze/distortion
+ * mask) repeats across the revealed margins exactly like real PSX texel
+ * wrapping. Used only by the full-screen-overlay path; mirrors
+ * wide_overlay_rect/wide_overlay_gouraud_rect but samples a texture instead
+ * of interpolating a flat/gradient color, and the native-wide mirror pass
+ * of flush_tex_batch but targets a private, immediately-consumed vertex
+ * range instead of the open batch. */
+static void wide_textured_rect_direct(int wx, int y, int ww, int h,
+                                      int u0, int v0,
+                                      uint16_t clut_x, uint16_t clut_y,
+                                      uint16_t tp, int semi) {
+    if (s_wide_cur < 0 || !s_ready || ww <= 0 || h <= 0) return;
+    if (s_tbase + 6 > VK_TBUF_VERTS) gpu_sync();   /* buffer exhausted: wait idle, cursors recycle */
+    int base_x = (tp & 0xF) * 64;
+    int base_y = ((tp >> 4) & 1) * 256;
+    int depth  = (tp >> 7) & 3; if (depth > 2) depth = 2;
+    float mr = s_mod_r/255.0f, mg = s_mod_g/255.0f, mb = s_mod_b/255.0f;
+    int u1 = u0 + ww, v1 = v0 + h;
+    int lim[4];
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    float xs[6] = { (float)wx, (float)(wx+ww), (float)wx, (float)(wx+ww), (float)wx, (float)(wx+ww) };
+    float ys[6] = { (float)y,  (float)y,       (float)(y+h), (float)y,   (float)(y+h), (float)(y+h) };
+    float us[6] = { (float)u0, (float)u1, (float)u0, (float)u1, (float)u0, (float)u1 };
+    float vs[6] = { (float)v0, (float)v0, (float)v1, (float)v0, (float)v1, (float)v1 };
+    uint32_t base = s_tbase;
+    for (int i = 0; i < 6; i++) {
+        float *vp = s_tmap[base + i].v;
+        vp[0] = xs[i];  vp[1] = ys[i];  vp[2] = us[i];  vp[3] = vs[i];
+        vp[4] = mr;     vp[5] = mg;     vp[6] = mb;     vp[7] = 1.0f;
+        vp[8]  = (float)base_x; vp[9]  = (float)base_y;
+        vp[10] = (float)clut_x; vp[11] = (float)clut_y;
+        vp[12] = (float)depth;  vp[13] = (float)s_mod_raw;
+        vp[14] = (float)lim[0]; vp[15] = (float)lim[1];
+        vp[16] = (float)lim[2]; vp[17] = (float)lim[3];
+    }
+    s_tbase += 6;   /* consumed privately — never joins a canonical batch */
+
+    int blend = (semi < 0) ? 0 : (semi + 1);
+    int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    wide_pass_begin(cb);
+    /* Overlay covers the whole surface: override the band scissor (same as
+     * wide_overlay_rect/wide_overlay_gouraud_rect). */
+    int S = s_scale;
+    VkRect2D sc = { { 0, 0 }, { (uint32_t)(s_wide_w * S), (uint32_t)(VRAM_H * S) } };
+    p_vkCmdSetScissor(cb, 0, 1, &sc);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_tex, 0, 1, &s_ds_tex, 0, NULL);
+    VkDeviceSize off = 0;
+    p_vkCmdBindVertexBuffers(cb, 0, 1, &s_tbuf, &off);
+    TexPush tp_push = {0};
+    tp_push.shift = px_shift(); tp_push.xoff = 0.0f; tp_push.xhalf = (float)s_wide_w / 2.0f;
+    tp_push.maskset = s_mask_set; tp_push.filter = s_texfilter;
+    tp_push.twin[0] = twx; tp_push.twin[1] = twy; tp_push.twin[2] = tox; tp_push.twin[3] = toy;
+    if (semi < 0) {
+        bind_masked(cb, 1, 0, 0, s_mask_check, s_mask_set);
+        tp_push.semipass = 0;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp_push, &tp_push);
+        p_vkCmdDraw(cb, 6, 1, base, 0);
+        bind_masked_stencil_only(cb, 1, 0, s_mask_check, 1);
+        tp_push.semipass = 2;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp_push, &tp_push);
+        p_vkCmdDraw(cb, 6, 1, base, 0);
+    } else {
+        bind_masked(cb, 1, 0, 0, s_mask_check, s_mask_set);
+        tp_push.semipass = 1;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp_push, &tp_push);
+        p_vkCmdDraw(cb, 6, 1, base, 0);
+        bind_masked(cb, 1, 0, blend, s_mask_check, 1);
+        tp_push.semipass = 2;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp_push, &tp_push);
+        p_vkCmdDraw(cb, 6, 1, base, 0);
+    }
+    p_vkCmdEndRenderPass(cb);
+    vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    end_oneshot(cb);
+    s_gpu_dirty = 1;
+}
+
 static void gpu_textured_rect(int x,int y,int w,int h, int u0,int v0,int u1,int v1,
                               uint16_t clut_x,uint16_t clut_y,uint16_t tp,int semi) {
     if (w <= 0 || h <= 0) return;
     float mr = s_mod_r/255.0f, mg = s_mod_g/255.0f, mb = s_mod_b/255.0f;
     float col[9] = { mr,mg,mb, mr,mg,mb, mr,mg,mb };
+    /* Full-screen textured overlay (haze/distortion masks, environmental
+     * filters): a 1:1-mapped rect spanning the whole 4:3 framebuffer must
+     * cover the whole wide surface too, else the revealed 16:9 margins are
+     * left untouched. Same detection as vkb_draw_flat_rect/gouraud_rect;
+     * restricted to the 1:1 case (u1-u0==w) since wide_textured_rect_direct
+     * assumes a constant 1 texel/pixel step. */
+    int overlay = 0;
+    if (s_wide_cur >= 0 && (u1 - u0) == w) {
+        int native_w = s_wide_w - 2 * s_wide_offset;
+        int lx = x - s_wide_cur_base, rx = x + w - s_wide_cur_base;
+        overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+    }
     /* Mirrored quads arrive here as scaled rects with u0>u1 / v0>v1 (see
      * the GL backend): exact bounds from the original corners, then the
      * mirror bump (gpu_uv.h). */
     int lim[4];
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
     psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
+    if (overlay) { flush_tex_batch(); s_geo_mirror_suppress = 1; }
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
     gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
     int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
     int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
     gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
+    if (overlay) {
+        flush_tex_batch();
+        s_geo_mirror_suppress = 0;
+        wide_textured_rect_direct(0, y, s_wide_w, h, u0, v0, clut_x, clut_y, tp, semi);
+    }
 }
 
 static void vkb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,
@@ -3039,6 +3197,7 @@ static const GpuRenderBackend VK_BACKEND = {
     .draw_textured_triangle        = vkb_draw_textured_triangle,
     .draw_shaded_textured_triangle = vkb_draw_shaded_textured_triangle,
     .draw_flat_rect                = vkb_draw_flat_rect,
+    .draw_gouraud_rect             = vkb_draw_gouraud_rect,
     .draw_textured_rect            = vkb_draw_textured_rect,
     .draw_textured_rect_scaled     = vkb_draw_textured_rect_scaled,
     .draw_line                     = vkb_draw_line,

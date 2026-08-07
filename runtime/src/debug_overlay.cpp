@@ -71,13 +71,25 @@
 #  include <GL/gl.h>
 #endif
 extern "C" {
-    void glBindFramebuffer(GLenum target, GLuint framebuffer);
     void glReadBuffer(GLenum mode);
     void glDrawBuffer(GLenum mode);
     void glPixelStorei(GLenum pname, GLint param);
     void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
                       GLenum format, GLenum type, void *pixels);
     GLenum glGetError(void);
+}
+
+/* Unlike the GL 1.1 functions above (statically exported by opengl32.dll on
+ * every Windows driver), glBindFramebuffer is GL 3.0+/ARB_framebuffer_object
+ * and Windows' opengl32.lib is frozen at 1.1 — it must be resolved through
+ * the driver via SDL_GL_GetProcAddress like the GL3 backends already do. */
+typedef void (APIENTRYP PSXDBG_PFNGLBINDFRAMEBUFFERPROC)(GLenum target, GLuint framebuffer);
+static PSXDBG_PFNGLBINDFRAMEBUFFERPROC psxdbg_glBindFramebuffer = nullptr;
+static void psxdbg_ensure_gl_loaded(void) {
+    if (!psxdbg_glBindFramebuffer) {
+        psxdbg_glBindFramebuffer =
+            (PSXDBG_PFNGLBINDFRAMEBUFFERPROC)SDL_GL_GetProcAddress("glBindFramebuffer");
+    }
 }
 
 #include <cstdint>
@@ -134,6 +146,8 @@ extern "C" int  psx_audio_get_spu_hq(void);
 extern "C" void psx_audio_set_spu_hq(int on);
 extern "C" int  psx_video_get_window_width(void);
 extern "C" void psx_video_set_window_width(int w);
+extern "C" int  psx_video_get_pgxp(void);
+extern "C" void psx_video_set_pgxp(int on);
 extern "C" int  g_turbo_loads_enabled;
 }
 
@@ -304,8 +318,9 @@ static uint8_t *capture_window_rgb(int *out_w, int *out_h)
      * FBO in native-wide mode). Bind both DRAW and READ to 0 so
      * glReadPixels reads the default framebuffer's back buffer, and so
      * the ImGui frame path that follows (if visible) draws into the same. */
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    psxdbg_ensure_gl_loaded();
+    psxdbg_glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    psxdbg_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     /* The back buffer is the natural read target. On drivers that have
      * already presented (shouldn't happen at pre_swap but defensive), the
      * front buffer is also readable. */
@@ -601,6 +616,15 @@ static void draw_toggles_section(void)
     bool aa = psx_video_get_antialiasing() != 0;
     if (ImGui::Checkbox("Antialiasing (present filter)", &aa)) {
         psx_video_set_antialiasing(aa ? 1 : 0);
+    }
+
+    bool pgxp = psx_video_get_pgxp() != 0;
+    if (ImGui::Checkbox("PGXP precision correction", &pgxp)) {
+        psx_video_set_pgxp(pgxp ? 1 : 0);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("GTE sub-pixel vertex + perspective UV correction."
+                          " Currently only visible when Supersampling > 1.");
     }
 
     static const char *kScreenModels[] = {
@@ -2172,6 +2196,10 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     }
     if (std::strcmp(name, "antialiasing") == 0) {
         psx_video_set_antialiasing(value ? 1 : 0);
+        return 0;
+    }
+    if (std::strcmp(name, "pgxp") == 0) {
+        psx_video_set_pgxp(value ? 1 : 0);
         return 0;
     }
     if (std::strcmp(name, "screen_model") == 0) {

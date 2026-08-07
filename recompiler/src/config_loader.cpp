@@ -300,6 +300,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("antialiasing")) {
             rt.video_antialiasing = toml::find<bool>(video, "antialiasing");
         }
+        if (video.contains("pgxp")) {
+            rt.video_pgxp = toml::find<bool>(video, "pgxp");
+        }
         if (video.contains("texture_filtering")) {
             const auto mode = toml::find<std::string>(video, "texture_filtering");
             if (mode == "nearest")       rt.video_texture_filter = 0;
@@ -996,6 +999,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_nw_textured_edges = false;
     int ws_nw_textured_edge_scale = 0;
     bool ws_nw_full_mirror = false;
+    int ws_nw_margin_darken_pct = 100;
+    int ws_nw_shimmer_duplicate = 0;
+    uint32_t ws_nw_shimmer_min_src_addr = 0;
+    int ws_nw_shimmer_max_px = 48;
+    bool ws_clear_reveal_per_frame = false;
+    uint32_t ws_nw_mist_src_lo = 0;
+    uint32_t ws_nw_mist_src_hi = 0;
+    int ws_nw_margin_mist_pct = 100;
     std::vector<WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool ws_offered = true;
     bool vulkan_offered = false;
@@ -1132,6 +1143,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_backdrop = toml::find<bool>(ws, "nw_backdrop");
         if (ws.contains("clear_reveal"))
             ws_clear_reveal = toml::find<bool>(ws, "clear_reveal");
+        if (ws.contains("clear_reveal_per_frame"))
+            ws_clear_reveal_per_frame = toml::find<bool>(ws, "clear_reveal_per_frame");
         if (ws.contains("nw_flat_backdrop"))
             ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
         if (ws.contains("nw_phase_backdrop"))
@@ -1166,6 +1179,49 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                         config_path.string(), site.address));
                 ws_signed_x_bound_sites.push_back(site);
             }
+        }
+        if (ws.contains("nw_margin_darken_pct")) {
+            ws_nw_margin_darken_pct = toml::find<int>(ws, "nw_margin_darken_pct");
+            if (ws_nw_margin_darken_pct < 0 || ws_nw_margin_darken_pct > 100)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_margin_darken_pct must be in [0, 100]",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_shimmer_duplicate")) {
+            ws_nw_shimmer_duplicate = toml::find<int>(ws, "nw_shimmer_duplicate");
+            if (ws_nw_shimmer_duplicate < 0 || ws_nw_shimmer_duplicate > 8)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_shimmer_duplicate must be in [0, 8]",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_shimmer_min_src_addr")) {
+            ws_nw_shimmer_min_src_addr = parse_hex(
+                toml::find<std::string>(ws, "nw_shimmer_min_src_addr"),
+                "widescreen.nw_shimmer_min_src_addr");
+        }
+        if (ws.contains("nw_shimmer_max_px")) {
+            ws_nw_shimmer_max_px = toml::find<int>(ws, "nw_shimmer_max_px");
+            if (ws_nw_shimmer_max_px < 1 || ws_nw_shimmer_max_px > 2048)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_shimmer_max_px must be in [1, 2048]",
+                    config_path.string()));
+        }
+        if (ws.contains("nw_mist_src_lo")) {
+            ws_nw_mist_src_lo = parse_hex(
+                toml::find<std::string>(ws, "nw_mist_src_lo"),
+                "widescreen.nw_mist_src_lo");
+        }
+        if (ws.contains("nw_mist_src_hi")) {
+            ws_nw_mist_src_hi = parse_hex(
+                toml::find<std::string>(ws, "nw_mist_src_hi"),
+                "widescreen.nw_mist_src_hi");
+        }
+        if (ws.contains("nw_margin_mist_pct")) {
+            ws_nw_margin_mist_pct = toml::find<int>(ws, "nw_margin_mist_pct");
+            if (ws_nw_margin_mist_pct < 0 || ws_nw_margin_mist_pct > 100)
+                throw std::runtime_error(fmt::format(
+                    "{}: [widescreen] nw_margin_mist_pct must be in [0, 100]",
+                    config_path.string()));
         }
         if (ws.contains("offer"))
             ws_offered = toml::find<bool>(ws, "offer");
@@ -1414,6 +1470,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
+        /*ws_nw_margin_darken_pct*/ ws_nw_margin_darken_pct,
+        /*ws_nw_shimmer_duplicate*/ ws_nw_shimmer_duplicate,
+        /*ws_nw_shimmer_min_src_addr*/ ws_nw_shimmer_min_src_addr,
+        /*ws_nw_shimmer_max_px*/  ws_nw_shimmer_max_px,
+        /*ws_clear_reveal_per_frame*/ ws_clear_reveal_per_frame,
+        /*ws_nw_mist_src_lo*/     ws_nw_mist_src_lo,
+        /*ws_nw_mist_src_hi*/     ws_nw_mist_src_hi,
+        /*ws_nw_margin_mist_pct*/ ws_nw_margin_mist_pct,
     };
 }
 
@@ -1508,6 +1572,9 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("auto_skip_fmv")) try_get([&]{
             s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
+        });
+        if (v.contains("pgxp")) try_get([&]{
+            s.pgxp = toml::find<bool>(v, "pgxp"); s.has_pgxp = true;
         });
         if (v.contains("turbo_loads")) try_get([&]{
             s.turbo_loads = toml::find<bool>(v, "turbo_loads"); s.has_turbo_loads = true;
@@ -1704,6 +1771,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     }
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
+    if (s.has_pgxp)
+        f << "pgxp              = " << (s.pgxp ? "true" : "false") << "\n";
     if (s.has_turbo_loads)
         f << "turbo_loads       = " << (s.turbo_loads ? "true" : "false") << "\n";
     if (s.has_fast_boot)

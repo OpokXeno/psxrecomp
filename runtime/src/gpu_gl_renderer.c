@@ -111,6 +111,7 @@
 #define PSXGL_SRC1_ALPHA            0x8589
 #define PSXGL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define PSXGL_TIMEOUT_IGNORED       0xFFFFFFFFFFFFFFFFull
+#define PSXGL_FRAMEBUFFER_BINDING  0x8CA6
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -395,6 +396,11 @@ static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
  * prim each frame). 1.0 / 0.0 => no-op, so the canonical pass stays identical. */
 static GLint s_geo_uXscale = -1, s_geo_uXcenter = -1;
 static GLint s_tex_uXscale = -1, s_tex_uXcenter = -1;
+/* [widescreen] nw_margin_mist_pct uniform (textured batches only -- the mist
+ * layer this targets is always blend-mode textured, never flat/gouraud
+ * geometry). 1.0 = faithful (canonical draws always; margin draws too unless
+ * a mist-classified batch and pct < 100). See mist_prim_gate. */
+static GLint s_tex_uColscale = -1;
 /* Runtime controls (ws_backdrop_stretch debug command). */
 int g_ws_bd_stretch_on   = 1;   /* feature on (gated by native-wide + per-prim gate) */
 int g_ws_bd_stretch_pct  = 0;   /* 0 = auto (g_wide_w/native_w); else pct/100 */
@@ -403,6 +409,43 @@ int g_ws_bd_phase_thresh = 24;  /* "narrow" margin (px): a prim overhanging the 
                                  * widened GTE geometry and NOT stretched */
 int g_ws_bd_phase_mode   = 1;   /* (retained for the debug command; unused since the
                                  * gate is now per-prim !tagged && narrow) */
+
+/* [widescreen] nw_shimmer_duplicate — small semi-transparent textured prims
+ * (heat-haze / spark / ember particle effects) are genuine GTE-projected 3D
+ * content: round 5/6's investigation (docs/burndown/010-widescreen-battle.md)
+ * found no cull and no hardcoded range gating them out of the margin — they
+ * are just naturally denser near their emission point, which usually sits in
+ * the original 4:3 centre, and thin out with distance exactly like any
+ * particle system. Reverse-engineering the actual emitter to spawn more
+ * (attempted — see the doc's account of the live RAM-patch attempt that
+ * froze the game by overrunning an array whose true allocated size was
+ * never confirmed) is unsafe without static proof of that size, which
+ * wasn't found. First attempt at a render-only fix (nw_shimmer_stretch:
+ * reuse nw_backdrop's stretch-about-centre machinery) ALSO failed — a
+ * linear stretch barely moves content already near the stretch centre, so
+ * a tight cluster near mid-screen doesn't spread no matter the factor.
+ *
+ * This is the third approach: duplicate, not reposition. In the mirror pass
+ * only (canonical 4:3 is never touched — this only ever runs inside
+ * flush_tex_batch's margin-revealing branch), redraw a shimmer-classified
+ * batch a few extra times at ADDITIONAL x-offsets beyond the normal mirror
+ * shift, scattering real copies of the existing particles' actual texture/
+ * colour further into both margins. Anything that lands outside the wide
+ * surface is simply clipped by the existing scissor — never garbage, never
+ * touches game state. Opt-in and off by default (same broad-shape caveat as
+ * the stretch attempt). Gate helper defined below bd_prim_gate, once
+ * g_wide_w is in scope. */
+int g_ws_shimmer_dup_count = 0;    /* 0 = off; N = draw N extra scattered copies */
+void gpu_ws_set_shimmer_dup_count(int n) { g_ws_shimmer_dup_count = n < 0 ? 0 : n; }
+/* [widescreen] diagnostic: real per-frame left/right split of shimmer extra-
+ * copy draws, queried via the ws_shimmer_dup_stats debug command -- built to
+ * replace inferring the split from noisy pixel-brightness sampling (frame-to
+ * -frame particle animation swamps a single-capture brightness diff) with an
+ * exact count of what the duplicate loop actually did. */
+uint64_t g_ws_shimmer_dup_left = 0, g_ws_shimmer_dup_right = 0;
+void gpu_ws_shimmer_dup_stats_reset(void) {
+    g_ws_shimmer_dup_left = 0; g_ws_shimmer_dup_right = 0;
+}
 /* Per-prim 2D-backdrop gate (replaces the old draw-order phase): a prim is
  * stretched iff native-wide + feature on + NOT sprite-tagged (foreground chars/
  * HUD are tagged) + NARROW (the GTE far-parallax/3D extend into the margins).
@@ -410,6 +453,27 @@ int g_ws_bd_phase_mode   = 1;   /* (retained for the debug command; unused since
  * batch's gate (batch flushes when a prim's gate differs, so a batch is uniform). */
 static int s_bd_gate = 0;
 static int s_tb_gate = 0;
+static int s_tb_force_mirror = 0;   /* [widescreen] shimmer: force ws_center_only=false, but
+                                        never feeds s_bd_gate/the stretch -- see gpu_textured_triangle. */
+static int s_tb_shimmer = 0;   /* [widescreen] nw_shimmer_duplicate: this batch is shimmer-classified */
+static int s_tb_mist = 0;      /* [widescreen] nw_margin_mist_pct: this batch is mist-classified */
+
+/* 2026-08-07 diagnostic: see the log site in flush_tex_batch for why. */
+typedef struct { int xlo, xhi, nverts, center_only, gate, base, native_w; } WsShimmerDiagEntry;
+#define WS_SHIMMER_DIAG_CAP 4096
+static WsShimmerDiagEntry g_ws_shimmer_diag[WS_SHIMMER_DIAG_CAP];
+static int g_ws_shimmer_diag_n = 0;
+void gpu_ws_shimmer_diag_clear(void) { g_ws_shimmer_diag_n = 0; }
+void gpu_ws_shimmer_diag_dump(char *out, size_t cap) {
+    int pos = snprintf(out, cap, "\"n\":%d,\"entries\":[", g_ws_shimmer_diag_n);
+    for (int i = 0; i < g_ws_shimmer_diag_n && pos < (int)cap - 128; i++) {
+        WsShimmerDiagEntry *e = &g_ws_shimmer_diag[i];
+        pos += snprintf(out + pos, cap - (size_t)pos,
+            "%s{\"xlo\":%d,\"xhi\":%d,\"nverts\":%d,\"center_only\":%d,\"gate\":%d,\"base\":%d,\"native_w\":%d}",
+            i ? "," : "", e->xlo, e->xhi, e->nverts, e->center_only, e->gate, e->base, e->native_w);
+    }
+    if (pos < (int)cap) snprintf(out + pos, cap - (size_t)pos, "]");
+}
 /* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
 int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
 int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
@@ -871,6 +935,12 @@ static const char *TEX_FS =
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
+    "uniform float u_colscale; /* [widescreen] nw_margin_mist_pct: 1.0 = faithful\n"
+    "  vertex-colour tint (canonical draws, or margin at pct=100); toward 0.0 =\n"
+    "  fade the tint toward neutral (vec3(0.5), the *2.0 identity) so a dark/\n"
+    "  saturated blend-mode tint (e.g. rain-mist blue) doesn't crush the raw\n"
+    "  texture -- NOT a fade toward black, which is wrong for what a softened\n"
+    "  tint should look like. Mirror-pass-only; 1.0 always for canonical draws. */\n"
     "int vram_at(int x, int y){\n"
     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
     "}\n"
@@ -930,7 +1000,10 @@ static const char *TEX_FS =
     "  }\n"
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
-    "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  if (v_raw == 0) {\n"
+    "    vec3 vcol_eff = mix(vec3(0.5), v_col.rgb, u_colscale);\n"
+    "    rgb = clamp(rgb * vcol_eff * 2.0, 0.0, 1.0);\n"
+    "  }\n"
     "  float dst_factor = 0.0;\n"
     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
@@ -1394,6 +1467,128 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
     return 1;
 }
 
+/* [widescreen] nw_shimmer_duplicate classifier — see the flag's definition
+ * above. Small + semi-transparent (opaque prims are terrain/geometry, not
+ * particle effects) was the WHOLE heuristic in the first cut — wrong,
+ * confirmed live: it also matches the dialogue box's small semi-transparent
+ * corner decorations (screen-space UI). Adding a sprite-tag exclusion did
+ * NOT fix it either — confirmed live a second time — because that UI
+ * decoration is itself UNTAGGED (round 1 already documented dialogue
+ * portraits/text as untagged textured sprites, which is exactly why
+ * hud_sprt_squash targets "every untagged textured-rect": untagged does not
+ * mean "world content" in this game). The only signal that actually
+ * separated them (checked live via ws_census, frame-persistence + position):
+ * the UI decoration's GP0 source address is a low, near-constant address
+ * (~0x136E34, present almost every single frame — a fixed UI slot), while
+ * real shimmer particles live in a distinctly higher, rotating per-frame
+ * range (~0x19xxxx and up). nw_shimmer_min_src_addr is an opt-in per-game
+ * floor: 0 = no filter (only use this once you've confirmed a real address
+ * split for the title via ws_census, same as this one required — do not
+ * guess a value). Deliberately independent of bd_prim_gate so this can't
+ * perturb existing nw_backdrop behaviour for other titles. */
+/* round 2: haze/shimmer quads measured ~20-30px. Some titles' particle system
+ * is a near-camera, 3D-projected streak (e.g. rain) whose perspective bbox is
+ * much larger (even screen-coord-saturating) despite being the same kind of
+ * semi-transparent particle content -- per-game via [widescreen]
+ * nw_shimmer_max_px (confirm via ws_census before raising, same bar as
+ * nw_shimmer_min_src_addr). */
+static int g_ws_shimmer_max_px = 48;
+uint32_t g_ws_shimmer_min_addr = 0;   /* 0 = no address floor */
+void gpu_ws_set_shimmer_min_addr(uint32_t addr) { g_ws_shimmer_min_addr = addr; }
+void gpu_ws_set_shimmer_max_px(int px) { g_ws_shimmer_max_px = px > 0 ? px : 48; }
+
+/* [widescreen] nw_margin_mist_pct classifier. Ghidra/live-evidenced 2026-08-07
+ * (F4/slot3 village rain scene, docs/burndown session log): a cluster of
+ * blend-mode textured quads (GP0 0x2E, src 0x001A2F18-0x001B74A0) carries a
+ * consistent blue-weighted vertex-colour tint (e.g. (30,80,110)/255,
+ * (60,110,140)/255 -- B > G > R in every sample). This is real, correctly-
+ * positioned rain-mist/atmosphere geometry. 2026-08-08 CORRECTION: an
+ * earlier version of this comment claimed shimmer_prim_gate excludes this
+ * range because "its own vertices already reach the margin, no duplication
+ * needed" -- live-verified WRONG (see shimmer_prim_gate's own comment for
+ * the full account): most of this content's margin coverage actually comes
+ * FROM nw_shimmer_duplicate, not from unassisted natural reach. The two
+ * mechanisms are designed to compound now: shimmer supplies the extra
+ * duplicate draws, mist recolours all of them (original + duplicates
+ * alike). The margin looks like a flat blue wash not because this tint is
+ * wrong, but because in the native 4:3 centre it's diluted by everything else
+ * authored to fill that frame (wall detail, character, dialogue box,
+ * splatter) while in the margin it's one of the few things that reaches that
+ * far, so it dominates unbalanced -- the same content-coverage-gap shape as
+ * docs/burndown/010-widescreen-battle.md's Round 5 shimmer/haze finding for a
+ * different scene. nw_margin_mist_pct softens ONLY this address range's tint
+ * contribution in the margin mirror draw (never the canonical centre),
+ * fading toward the *neutral* multiplier (identity, i.e. shows the
+ * underlying texture at natural brightness) rather than toward black -- a
+ * straight colour-scale-to-zero would just make the margin go dark instead
+ * of looking like unmisted geometry. */
+uint32_t g_ws_mist_lo = 0, g_ws_mist_hi = 0;   /* 0,0 = disabled (default) */
+int g_ws_mist_pct = 100;                        /* 100 = faithful/unchanged */
+void gpu_ws_set_mist_range(uint32_t lo, uint32_t hi) { g_ws_mist_lo = lo; g_ws_mist_hi = hi; }
+void gpu_ws_set_mist_pct(int pct) { g_ws_mist_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct); }
+static int mist_prim_gate(int semi) {
+    if (g_ws_mist_hi <= g_ws_mist_lo || semi < 0) return 0;
+    uint32_t addr = gpu_current_source_addr() & 0x1FFFFFFFu;
+    return addr >= g_ws_mist_lo && addr < g_ws_mist_hi;
+}
+
+static int shimmer_prim_gate(const int *xs, const int *ys, int n, int semi) {
+    /* 2026-08-07: this classification has THREE consumers with very
+     * different risk profiles, which earlier attempts kept conflating:
+     *   1. The duplicate-copy loop (nw_shimmer_duplicate) -- causes a seam,
+     *      user-rejected, stays off (g_ws_shimmer_dup_count == 0).
+     *   2. The continuous backdrop stretch (wide_set_bd_scale) -- caused
+     *      live flicker AND is structurally incapable of being seamless
+     *      against an unstretched centre (see xenogears_widescreen_rain_
+     *      margin memory). Must NEVER see this classification -- fixed at
+     *      the call site (gpu_textured_triangle) by no longer OR'ing
+     *      shimmer/detail into the value that feeds s_bd_gate.
+     *   3. The ws_center_only FORCE-MIRROR override -- makes a batch that
+     *      wouldn't otherwise qualify (small droplets whose own bbox never
+     *      leaves the centre) still get mirrored. This is safe (no stretch,
+     *      no duplicate jump) and is the ONLY thing rain margin coverage
+     *      actually needs.
+     * This function used to gate ALL THREE on g_ws_shimmer_dup_count > 0 --
+     * a leftover from when classification existed solely to feed #1. With
+     * nw_shimmer_duplicate correctly left at 0 (user-mandated, #1 is bad),
+     * that short-circuit was ALSO silently killing #3, which is harmless
+     * and necessary -- confirmed live via ws_shimmer_diag logging zero
+     * shimmer-classified batches at dup_count==0. Decoupled for good: this
+     * function no longer checks the duplicate count. #1's own loop already
+     * separately checks g_ws_shimmer_dup_count > 0 before adding copies,
+     * and #2 no longer reads this classification at all (see call site). */
+    if (g_wide_w <= 0 || semi < 0) return 0;
+    if (psx_ws_prim_is_tagged()) return 0;   /* screen-space UI/HUD, not a particle */
+    if (g_ws_shimmer_min_addr != 0 &&
+        (gpu_current_source_addr() & 0x1FFFFFFFu) < g_ws_shimmer_min_addr)
+        return 0;   /* below the confirmed particle range -> a fixed UI slot */
+    /* 2026-08-08 CORRECTION: this used to return 0 (exclude) for anything
+     * mist-classified, on the assumption that mist-matched content's own
+     * real geometry already reaches the margin without duplication. Live-
+     * verified WRONG: widening nw_mist_src_lo/hi to correctly cover this
+     * scene's full rain population (fixing a real over-duplication bug for
+     * the 16 addresses that had been slipping past the old, too-narrow
+     * range) made ALL 544 rain particles mist-classified -- which excluded
+     * all of them from shimmer_prim_gate at once, removing nearly all rain
+     * from the margin (confirmed live: user reported rain vanished from the
+     * margins entirely). Shimmer duplication turns out to be THE mechanism
+     * providing margin coverage for most of this content; mist only
+     * recolours draws that already happen, it adds no coverage of its own.
+     * The two are not mutually exclusive: a batch can be both shimmer-
+     * classified (gets extra duplicate draws for coverage) AND mist-
+     * classified (gets its colour scaled via u_colscale on every one of
+     * those draws, original + duplicates alike, since u_colscale is set
+     * once before and reset once after the whole draw-plus-duplicates
+     * bracket in flush_tex_batch). Let both apply together. */
+    int xlo = xs[0], xhi = xs[0], ylo = ys[0], yhi = ys[0];
+    for (int i = 1; i < n; i++) {
+        if (xs[i] < xlo) xlo = xs[i]; if (xs[i] > xhi) xhi = xs[i];
+        if (ys[i] < ylo) ylo = ys[i]; if (ys[i] > yhi) yhi = ys[i];
+    }
+    return (xhi - xlo <= g_ws_shimmer_max_px) && (yhi - ylo <= g_ws_shimmer_max_px);
+}
+
+
 /* ---- native-wide FAST path (skip redundant center mirror) ----------------- *
  * The wide surface's CENTRE columns [g_wide_off, g_wide_off+native_w) are, by
  * construction, identical to the canonical 4:3 framebuffer. So instead of
@@ -1419,6 +1614,7 @@ static int mirror_x_center_only(int lo, int hi) {
     if (native_w <= 0) return 0;
     return (lo >= base) && (hi < base + native_w);
 }
+
 static int mirror_geo_center_only(const int *xs, int n) {
     if (!s_wide_fast) return 0;
     int lo = xs[0], hi = xs[0];
@@ -1566,6 +1762,248 @@ static int mirror_batch_center_only(int nverts) {
     return mirror_x_center_only(lo, hi);
 }
 
+/* Diagnostic-only counters for the ws_mirror_stats debug command: how many
+ * textured-batch flushes ran the native-wide mirror pass vs. were skipped
+ * (either "center-only" fast-path, or the other gates: no wide surface /
+ * suppressed / ablated). Distinguishes "geometry never reaches the mirror
+ * decision" from "the mirror decision skips it incorrectly". */
+uint32_t g_ws_mirror_tex_total = 0;
+uint32_t g_ws_mirror_tex_ran = 0;
+uint32_t g_ws_mirror_tex_skip_center = 0;
+uint32_t g_ws_mirror_tex_skip_other = 0;
+
+/* ---- Mirror-draw GL-state probe (diagnostic, opt-in, one-shot) -----------
+ * ws_mirror_stats proves the mirror pass RUNS for margin-reaching content;
+ * it does not prove the draw actually lands a visible pixel. Arm with a
+ * screen-X band (draw-space, pre-translate, same units as ws_census
+ * xmin/xmax); the next textured-batch mirror draw whose vertex range
+ * overlaps that band captures the live GL state around the actual
+ * glDrawArrays call (viewport/scissor/blend/stencil/depth/target FBO +
+ * glGetError), so "mirror ran but nothing shows up" can be checked against
+ * real draw state instead of re-derived from code reading. One-shot: stays
+ * armed until it captures once, then holds that capture until re-armed. */
+static int      s_ws_probe_armed = 0;
+static int      s_ws_probe_lo = 0, s_ws_probe_hi = -1;
+/* nverts filter: 0 = no filter. Lets the arm caller target either the huge
+ * coalesced opaque-terrain batch (unfiltered -- it's usually first/biggest)
+ * or the small ISOLATED semi-transparent batches (shimmer/haze particles;
+ * each semi prim gets its own batch to preserve paint order, so a shimmer
+ * quad is nverts==6). Without this, an unfiltered arm almost always catches
+ * the terrain batch first, since it flushes constantly and is huge. */
+static int      s_ws_probe_nverts_max = 0;
+static int      s_ws_probe_semi_only = 0;  /* 1 = only match batches with semi>=0 */
+static int      s_ws_probe_hit = 0;
+static uint32_t s_ws_probe_frame = 0;
+static int      s_ws_probe_dx = 0, s_ws_probe_xmin = 0, s_ws_probe_xmax = 0;
+static int      s_ws_probe_nverts = 0, s_ws_probe_semi = -2;
+static GLint    s_ws_probe_viewport[4] = {0,0,0,0};
+static GLint    s_ws_probe_scissor[4]  = {0,0,0,0};
+static int      s_ws_probe_scissor_on = 0, s_ws_probe_blend_on = 0;
+static int      s_ws_probe_stencil_on = 0;
+static GLint    s_ws_probe_stencil_func = 0, s_ws_probe_stencil_ref = 0;
+static int      s_ws_probe_depth_on = 0;
+static GLint    s_ws_probe_fbo = 0;
+static int      s_ws_probe_expect_fbo = 0;
+static int      s_ws_probe_err_before = 0, s_ws_probe_err_after = 0;
+/* Pixel-sample readback: prove-or-disprove "the draw wrote real color" without
+ * reasoning about GL state indirectly. Sample points are unscaled draw-space
+ * (pre-dx-shift) coordinates the caller knows should be covered by margin
+ * geometry (from a ws_census cross-reference); this file applies +dx and the
+ * internal-res scale itself, then glReadPixels's the wide FBO (still bound)
+ * right after the draw. */
+#define WS_PROBE_SAMPLES 4
+static int      s_ws_probe_sample_x[WS_PROBE_SAMPLES];
+static int      s_ws_probe_sample_y[WS_PROBE_SAMPLES];
+static int      s_ws_probe_sample_n = 0;
+static uint8_t  s_ws_probe_sample_rgba[WS_PROBE_SAMPLES][4];
+
+void gpu_ws_mirror_probe_set_samples(const int *xs, const int *ys, int n) {
+    if (n > WS_PROBE_SAMPLES) n = WS_PROBE_SAMPLES;
+    for (int i = 0; i < n; i++) { s_ws_probe_sample_x[i] = xs[i]; s_ws_probe_sample_y[i] = ys[i]; }
+    s_ws_probe_sample_n = n;
+}
+
+/* Region scan: instead of betting on one exact pixel (fragile -- a triangle's
+ * first vertex from ws_census is not proof of coverage at that exact texel),
+ * read back the WHOLE right-margin rect right after this draw and report
+ * whether ANY non-transparent pixel exists in it. Robust to "which pixel". */
+typedef struct { int nonzero, total, bright, bbox[4]; uint8_t sample[4]; } WsProbeRegionResult;
+static WsProbeRegionResult s_ws_probe_region;         /* scanned mid-frame, right after our draw */
+static WsProbeRegionResult s_ws_probe_region_present;  /* scanned again at present time */
+static int s_ws_probe_present_pending = 0;   /* 1 once mid-frame hit, until present scan runs */
+static int s_ws_probe_present_done = 0;
+
+/* Scan the right-margin rect of the CURRENTLY BOUND read framebuffer for any
+ * non-zero (non-transparent-black) pixel. Reusable for both the mid-frame
+ * capture (right after the mirror draw, wide FBO already bound) and a second
+ * scan at present time (explicit bind by the caller) -- comparing the two
+ * answers "does something ERASE the margin between the draw and the swap,
+ * or is the draw itself never producing visible content". */
+static void ws_probe_scan_right_margin_into(WsProbeRegionResult *out) {
+    out->nonzero = 0; out->total = 0; out->bright = 0;
+    out->bbox[0] = out->bbox[1] = out->bbox[2] = out->bbox[3] = -1;
+    memset(out->sample, 0, 4);
+    int native_w = g_wide_w - 2 * g_wide_off;
+    if (native_w <= 0 || g_wide_w <= 0) return;
+    int x0 = (g_wide_off + native_w) * s_scale, x1 = g_wide_w * s_scale;
+    int y0 = s_area_y1 * s_scale, y1 = (s_area_y2 + 1) * s_scale;
+    if (x0 < 0) x0 = 0; if (x1 > g_wide_w * s_scale) x1 = g_wide_w * s_scale;
+    if (y0 < 0) y0 = 0;
+    int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0 || (long long)w * h > 4000000) return;
+    uint8_t *buf = (uint8_t *)malloc((size_t)w * (size_t)h * 4);
+    if (!buf) { out->nonzero = -1; return; }
+    glReadPixels(x0, y0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    int nz = 0;
+    int bx0 = -1, by0 = -1, bx1 = -1, by1 = -1;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            uint8_t *px = &buf[(size_t)(y * w + x) * 4];
+            if (px[0] || px[1] || px[2] || px[3]) {
+                if (nz == 0) memcpy(out->sample, px, 4);
+                nz++;
+                if ((int)px[0] + px[1] + px[2] > 24) out->bright++;  /* perceptible vs. noise-floor */
+                int gx = x0 + x, gy = y0 + y;
+                if (bx0 < 0 || gx < bx0) bx0 = gx;
+                if (by0 < 0 || gy < by0) by0 = gy;
+                if (gx > bx1) bx1 = gx;
+                if (gy > by1) by1 = gy;
+            }
+        }
+    }
+    free(buf);
+    out->nonzero = nz; out->total = w * h;
+    out->bbox[0] = bx0; out->bbox[1] = by0; out->bbox[2] = bx1; out->bbox[3] = by1;
+}
+
+/* Called from gl_renderer_present_wide_fbo, right after wide_blit_center, for
+ * the first present following a mid-frame probe hit. fbo is the wide surface
+ * about to be presented (already holds this frame's mirror draws + the
+ * just-blitted canonical centre). */
+static void gpu_ws_mirror_probe_scan_present(GLuint fbo) {
+    if (!s_ws_probe_present_pending || s_ws_probe_present_done) return;
+    GLint prev_read = 0;
+    glGetIntegerv(PSXGL_FRAMEBUFFER_BINDING, &prev_read);   /* draw==read here; fine to restore both */
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+    ws_probe_scan_right_margin_into(&s_ws_probe_region_present);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, (GLuint)prev_read);
+    s_ws_probe_present_done = 1;
+}
+
+void gpu_ws_mirror_probe_arm2(int lo, int hi, int nverts_max, int semi_only) {
+    s_ws_probe_lo = lo; s_ws_probe_hi = hi;
+    s_ws_probe_nverts_max = nverts_max; s_ws_probe_semi_only = semi_only;
+    s_ws_probe_armed = 1; s_ws_probe_hit = 0;
+    s_ws_probe_present_pending = 0; s_ws_probe_present_done = 0;
+}
+
+void gpu_ws_mirror_probe_arm(int lo, int hi) {
+    gpu_ws_mirror_probe_arm2(lo, hi, 0, 0);
+}
+
+void gpu_ws_mirror_probe_dump(char *out, size_t cap) {
+    if (!s_ws_probe_hit) {
+        snprintf(out, cap, "\"armed\":%d,\"hit\":false,\"lo\":%d,\"hi\":%d",
+                 s_ws_probe_armed, s_ws_probe_lo, s_ws_probe_hi);
+        return;
+    }
+    int pos = snprintf(out, cap,
+        "\"hit\":true,\"frame\":%u,\"dx\":%d,\"xmin\":%d,\"xmax\":%d,"
+        "\"nverts\":%d,\"semi\":%d,"
+        "\"viewport\":[%d,%d,%d,%d],\"scissor\":[%d,%d,%d,%d],\"scissor_on\":%d,"
+        "\"blend_on\":%d,\"stencil_on\":%d,\"stencil_func\":%d,\"stencil_ref\":%d,"
+        "\"depth_test_on\":%d,\"fbo\":%d,\"expect_fbo\":%d,"
+        "\"err_before\":%d,\"err_after\":%d,\"samples\":[",
+        s_ws_probe_frame, s_ws_probe_dx, s_ws_probe_xmin, s_ws_probe_xmax,
+        s_ws_probe_nverts, s_ws_probe_semi,
+        (int)s_ws_probe_viewport[0], (int)s_ws_probe_viewport[1],
+        (int)s_ws_probe_viewport[2], (int)s_ws_probe_viewport[3],
+        (int)s_ws_probe_scissor[0], (int)s_ws_probe_scissor[1],
+        (int)s_ws_probe_scissor[2], (int)s_ws_probe_scissor[3],
+        s_ws_probe_scissor_on, s_ws_probe_blend_on, s_ws_probe_stencil_on,
+        (int)s_ws_probe_stencil_func, (int)s_ws_probe_stencil_ref,
+        s_ws_probe_depth_on, (int)s_ws_probe_fbo, s_ws_probe_expect_fbo,
+        s_ws_probe_err_before, s_ws_probe_err_after);
+    for (int i = 0; i < s_ws_probe_sample_n && pos < (int)cap; i++) {
+        pos += snprintf(out + pos, cap - (size_t)pos,
+            "%s{\"x\":%d,\"y\":%d,\"rgba\":\"%02X%02X%02X%02X\"}",
+            i ? "," : "", s_ws_probe_sample_x[i], s_ws_probe_sample_y[i],
+            s_ws_probe_sample_rgba[i][0], s_ws_probe_sample_rgba[i][1],
+            s_ws_probe_sample_rgba[i][2], s_ws_probe_sample_rgba[i][3]);
+    }
+    if (pos < (int)cap) pos += snprintf(out + pos, cap - (size_t)pos, "]");
+    if (pos < (int)cap) {
+        pos += snprintf(out + pos, cap - (size_t)pos,
+            ",\"region_scan_mid_frame\":{\"nonzero\":%d,\"bright\":%d,\"total\":%d,\"bbox\":[%d,%d,%d,%d],"
+            "\"first_nonzero_rgba\":\"%02X%02X%02X%02X\"}",
+            s_ws_probe_region.nonzero, s_ws_probe_region.bright, s_ws_probe_region.total,
+            s_ws_probe_region.bbox[0], s_ws_probe_region.bbox[1],
+            s_ws_probe_region.bbox[2], s_ws_probe_region.bbox[3],
+            s_ws_probe_region.sample[0], s_ws_probe_region.sample[1],
+            s_ws_probe_region.sample[2], s_ws_probe_region.sample[3]);
+    }
+    if (pos < (int)cap) {
+        pos += snprintf(out + pos, cap - (size_t)pos,
+            ",\"region_scan_at_present\":{\"scanned\":%d,\"nonzero\":%d,\"bright\":%d,\"total\":%d,"
+            "\"bbox\":[%d,%d,%d,%d],\"first_nonzero_rgba\":\"%02X%02X%02X%02X\"}",
+            s_ws_probe_present_done,
+            s_ws_probe_region_present.nonzero, s_ws_probe_region_present.bright,
+            s_ws_probe_region_present.total,
+            s_ws_probe_region_present.bbox[0], s_ws_probe_region_present.bbox[1],
+            s_ws_probe_region_present.bbox[2], s_ws_probe_region_present.bbox[3],
+            s_ws_probe_region_present.sample[0], s_ws_probe_region_present.sample[1],
+            s_ws_probe_region_present.sample[2], s_ws_probe_region_present.sample[3]);
+    }
+}
+
+/* Called from flush_tex_batch's mirror branch, wrapping the actual mirror
+ * draw when armed and this batch's vertex range overlaps the armed band.
+ * Captures state immediately after the draw (blend/stencil are set INSIDE
+ * tex_batch_draw_passes per `semi`, so pre-draw state wouldn't reflect what
+ * the draw actually used). */
+static void ws_probe_capture_and_draw(int nverts, int semi, int dx) {
+    glGetError();  /* clear any stale error so err_after is attributable */
+    tex_batch_draw_passes(nverts, semi);
+    s_ws_probe_err_after = (int)glGetError();
+    s_ws_probe_err_before = 0;
+    s_ws_probe_hit = 1;
+    s_ws_probe_frame = (uint32_t)s_frame_count;
+    s_ws_probe_dx = dx;
+    s_ws_probe_nverts = nverts;
+    s_ws_probe_semi = semi;
+    glGetIntegerv(GL_VIEWPORT, s_ws_probe_viewport);
+    glGetIntegerv(GL_SCISSOR_BOX, s_ws_probe_scissor);
+    s_ws_probe_scissor_on = glIsEnabled(GL_SCISSOR_TEST);
+    s_ws_probe_blend_on   = glIsEnabled(GL_BLEND);
+    s_ws_probe_stencil_on = glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_STENCIL_FUNC, &s_ws_probe_stencil_func);
+    glGetIntegerv(GL_STENCIL_REF,  &s_ws_probe_stencil_ref);
+    s_ws_probe_depth_on = glIsEnabled(GL_DEPTH_TEST);
+    glGetIntegerv(PSXGL_FRAMEBUFFER_BINDING, &s_ws_probe_fbo);
+    s_ws_probe_expect_fbo = (int)g_wide_cur;
+    for (int i = 0; i < s_ws_probe_sample_n; i++) {
+        int px = (s_ws_probe_sample_x[i] + dx) * s_scale;
+        int py = s_ws_probe_sample_y[i] * s_scale;
+        uint8_t px_out[4] = {0, 0, 0, 0};
+        glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px_out);
+        memcpy(s_ws_probe_sample_rgba[i], px_out, 4);
+    }
+    ws_probe_scan_right_margin_into(&s_ws_probe_region);
+    s_ws_probe_present_pending = 1;
+    s_ws_probe_present_done = 0;
+}
+
+/* Debug-only live ablation (no rebuild): suppress specific content classes
+ * from the CANONICAL (centre) draw only -- the margin mirror below is
+ * completely untouched -- so the centre can be selectively degraded toward
+ * the margin's current appearance to find out, by direct A/B, exactly what
+ * content class the margin structurally lacks (user-proposed methodology,
+ * 2026-08-08). Bitmask: 1=mist-classified (blend-mode rain/atmosphere).
+ * 0 = off (default/faithful, always). ws_canon_suppress {"mask":N}
+ * debug-server command. */
+int g_ws_canon_suppress_mask = 0;
+void gpu_ws_set_canon_suppress(int mask) { g_ws_canon_suppress_mask = mask; }
+
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
@@ -1585,23 +2023,138 @@ static void flush_tex_batch(void) {
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
 
-    tex_batch_draw_passes(nverts, semi);
+    int canon_suppress = 0;
+    if (g_ws_canon_suppress_mask) {
+        if ((g_ws_canon_suppress_mask & 1) && s_tb_mist) canon_suppress = 1;
+    }
+    if (!canon_suppress) tex_batch_draw_passes(nverts, semi);
 
     /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
      * centre content comes from the present-time canonical blit; nothing to add
      * to the margins). A backdrop-stretched batch (s_tb_gate) widens past the
      * frame, so it is never treated as centre-only. */
-    if (g_wide_cur && s_ws_ablate != 1 &&
-        !(s_tb_gate == 0 && mirror_batch_center_only(nverts))) {   /* native-wide mirror */
+    g_ws_mirror_tex_total++;
+    int ws_center_only = (!s_tb_force_mirror && s_tb_gate == 0 && mirror_batch_center_only(nverts));
+    /* 2026-08-07 diagnostic: the user directly confirmed live (looking at the
+     * actual window, not a screenshot) that ZERO rain reaches the margins,
+     * contradicting an earlier screenshot misread. Log shimmer-classified
+     * (s_tb_shimmer) batches specifically -- their own bbox and whether
+     * ws_center_only excluded them -- to settle definitively whether rain
+     * content itself is being excluded by this gate, instead of inferring it
+     * from pixels again. */
+    if (s_tb_shimmer && g_ws_shimmer_diag_n < WS_SHIMMER_DIAG_CAP) {
+        int xlo = (int)s_tb[0], xhi = (int)s_tb[0];
+        for (int vi = 1; vi < nverts; vi++) {
+            int vx = (int)s_tb[vi * TEXV];
+            if (vx < xlo) xlo = vx;
+            if (vx > xhi) xhi = vx;
+        }
+        WsShimmerDiagEntry *e = &g_ws_shimmer_diag[g_ws_shimmer_diag_n++];
+        e->xlo = xlo; e->xhi = xhi; e->nverts = nverts;
+        e->center_only = ws_center_only; e->gate = s_tb_gate;
+        e->base = g_wide_cur_base; e->native_w = g_wide_w - 2 * g_wide_off;
+    }
+    if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 && !ws_center_only) {   /* native-wide mirror */
+        g_ws_mirror_tex_ran++;
         int dx = wide_dx();
         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        if (s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
+        /* [widescreen] nw_margin_mist_pct: soften this batch's vertex-colour
+         * tint for the margin mirror draw ONLY (the canonical draw above,
+         * tex_batch_draw_passes at the top of this function, already ran
+         * with u_colscale left at its default 1.0). Reset after so later
+         * batches in this same mirror pass aren't affected. */
+        if (s_tb_mist) p_glUniform1f(s_tex_uColscale, (float)g_ws_mist_pct / 100.0f);
+        if (s_ws_ablate != 2) {
+            int probe_match = 0;
+            if (s_ws_probe_armed && !s_ws_probe_hit && s_ws_probe_lo <= s_ws_probe_hi &&
+                (s_ws_probe_nverts_max <= 0 || nverts <= s_ws_probe_nverts_max) &&
+                (!s_ws_probe_semi_only || semi >= 0)) {
+                int blo = (int)s_tb[0], bhi = (int)s_tb[0];
+                for (int vi = 1; vi < nverts; vi++) {
+                    int vx = (int)s_tb[vi * TEXV];
+                    if (vx < blo) blo = vx;
+                    if (vx > bhi) bhi = vx;
+                }
+                probe_match = (bhi >= s_ws_probe_lo && blo <= s_ws_probe_hi);
+                if (probe_match) { s_ws_probe_xmin = blo; s_ws_probe_xmax = bhi; }
+            }
+            if (probe_match) ws_probe_capture_and_draw(nverts, semi, dx);
+            else              tex_batch_draw_passes(nverts, semi);
+            /* [widescreen] nw_shimmer_duplicate: redraw this shimmer-classified
+             * batch a few extra times at additional x-offsets, alternating
+             * sides and stepping outward by one margin-width each pair, so
+             * real copies of the existing particles' texture/colour scatter
+             * further into BOTH margins. Still inside the wide-target bracket
+             * (FBO/viewport/scissor from wide_target_begin above already
+             * apply); only the x-offset uniform changes per extra draw.
+             * Anything landing outside the wide surface is clipped by the
+             * existing scissor — never garbage, never touches game state.
+             *
+             * 2026-08-07: `side` for k=1 used to be hardcoded +1 (right).
+             * With g_ws_shimmer_dup_count==1 (the live-tuned value — see
+             * nw_shimmer_duplicate) only k=1 ever runs, so EVERY shimmer
+             * particle's one extra copy went right, never left — confirmed
+             * live via user report + code read: the right margin got a
+             * reinforcing copy of all ~544 particles/frame, the left got
+             * none, despite this comment's own "into BOTH margins" claim
+             * (only true once the count reaches 2+). Fixed using the
+             * batch's own real screen position, not a guessed constant:
+             * scan its native-space x-extent and start the alternation on
+             * whichever side the particle is already closer to, so a
+             * particle nearer the left
+             * edge extends further left and one nearer the right extends
+             * further right. Averaged across the frame's particles (roughly
+             * evenly spread, per the ws_census address-range finding above)
+             * this balances real per-frame duplicate density between both
+             * margins instead of favoring one by construction.
+             *
+             * 2026-08-07: a bbox-width skip for batches whose own width
+             * already >= one margin width was tried here (to stop
+             * reinforcing streaks that already self-cover a margin) and
+             * immediately REVERTED live -- confirmed by the user as
+             * "glitchy... vertical seams appearing and disappearing super
+             * fast". Root cause: a hard threshold on a per-frame-computed
+             * bbox that naturally oscillates near that threshold as a
+             * streak animates (moves/foreshortens) flips the batch between
+             * skip/duplicate frame to frame, blinking that copy in and out
+             * -- worse than the redundant-overlap problem it was meant to
+             * fix. Do not reintroduce a hard per-frame threshold here
+             * without hysteresis (e.g. keyed to something stable like the
+             * batch's source address, not its animated screen-space bbox). */
+            if (s_tb_shimmer && g_ws_shimmer_dup_count > 0 && g_wide_off > 0) {
+                int xlo = (int)s_tb[0], xhi = (int)s_tb[0];
+                for (int vi = 1; vi < nverts; vi++) {
+                    int vx = (int)s_tb[vi * TEXV];
+                    if (vx < xlo) xlo = vx;
+                    if (vx > xhi) xhi = vx;
+                }
+                {
+                    int native_w = g_wide_w - 2 * g_wide_off;
+                    int frame_mid = g_wide_cur_base + native_w / 2;
+                    int first_side = ((xlo + xhi) / 2 < frame_mid) ? -1 : 1;
+                    for (int k = 1; k <= g_ws_shimmer_dup_count; k++) {
+                        int side = (k & 1) ? first_side : -first_side;
+                        int mag = (k + 1) / 2;
+                        int extra_dx = dx + side * mag * g_wide_off;
+                        if (side < 0) g_ws_shimmer_dup_left++; else g_ws_shimmer_dup_right++;
+                        p_glUniform1f(s_tex_uXoff, (float)extra_dx);
+                        tex_batch_draw_passes(nverts, semi);
+                    }
+                }
+                p_glUniform1f(s_tex_uXoff, (float)dx);
+            }
+        }
+        if (s_tb_mist) p_glUniform1f(s_tex_uColscale, 1.0f);
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
+    } else if (ws_center_only) {
+        g_ws_mirror_tex_skip_center++;
+    } else {
+        g_ws_mirror_tex_skip_other++;
     }
     hr_end();
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
@@ -1778,7 +2331,21 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     {
         flush_flat_batch();   /* painter order: flat GEO before textured */
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
-        int gate = bd_prim_gate(xs, 3, 1); /* backdrop-stretch gate is also a batch key */
+        int shimmer = shimmer_prim_gate(xs, ys, 3, semi);
+        int mist = mist_prim_gate(semi);
+        /* 2026-08-07: `gate` used to be bd_prim_gate(...) || shimmer, feeding
+         * BOTH wide_set_bd_scale's stretch AND the ws_center_only force-
+         * mirror override from one value. Split for good: shimmer must NEVER
+         * reach the stretch (confirmed live -- flicker, and structurally
+         * can't be seamless against an unstretched centre, see
+         * xenogears_widescreen_rain_margin memory) but DOES need to force
+         * the mirror pass for batches that wouldn't otherwise geometrically
+         * qualify (small droplets whose own bbox never leaves the centre).
+         * gate (-> s_tb_gate -> s_bd_gate, the stretch) is bd_prim_gate only.
+         * force_mirror (-> s_tb_force_mirror) is shimmer only, consumed
+         * solely by ws_center_only's override in flush_tex_batch. */
+        int gate = bd_prim_gate(xs, 3, 1);
+        int force_mirror = shimmer;
         /* With mask checking off, opaque and mode-0 semi primitives use the
          * same dual-source blend state. The per-vertex a_semi flag selects
          * replace vs half-blend without breaking painter order. */
@@ -1807,6 +2374,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (s_mask_set != s_tb_mask) reason = 2;
             else if (s_tex_filter != s_tb_filter) reason = 3;
             else if (gate != s_tb_gate) reason = 4;
+            else if (force_mirror != s_tb_force_mirror) reason = 4;
+            else if (shimmer != s_tb_shimmer) reason = 4;  /* same gate value can mean bd vs shimmer */
+            else if (mist != s_tb_mist) reason = 4;         /* ...or mist */
             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
                      tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
         }
@@ -1817,6 +2387,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
+            s_tb_force_mirror = force_mirror;
+            s_tb_shimmer = shimmer; s_tb_mist = mist;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
@@ -1841,6 +2413,16 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
  * overlay path; positions are already in wide space so u_xoff stays 0. Mirrors
  * raster_flat_rect(&wt, ...) in sw_draw_flat_rect. Caller stays inside
  * hr_begin/hr_end. */
+/* Scale a BGR555 colour's channels by pct% (0-100), independently per
+ * channel, rounding to nearest. Used to soften a full-screen-overlay flat
+ * rect's colour in the revealed margins only ([widescreen]
+ * nw_margin_darken_pct) — the centre always keeps the exact original colour. */
+static uint16_t ws_scale_color15(uint16_t c, int pct) {
+    int r = (c & 0x1F), g = (c >> 5) & 0x1F, b = (c >> 10) & 0x1F;
+    r = (r * pct + 50) / 100; g = (g * pct + 50) / 100; b = (b * pct + 50) / 100;
+    return (uint16_t)((c & 0x8000) | (b << 10) | (g << 5) | r);
+}
+
 static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int semi) {
     if (ww <= 0 || h <= 0) return;
     float r = ((c & 0x1F) << 3) / 255.0f;
@@ -1872,6 +2454,39 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
+
+/* Diagnostic ring: every full-screen-overlay flat rect this frame (the
+ * `overlay` branch below) -- who it is (colour/semi/geometry), not just that
+ * SOMETHING fired. Built to identify a specific dark full-screen rect
+ * suspected of over-darkening the native-wide margins relative to the 4:3
+ * centre (the centre gets exactly one blend application via wide_blit_center
+ * overwriting it from canonical each present; the margin gets exactly one
+ * application too, from wide_flat_rect_direct -- but against whatever the
+ * wide surface held at THAT moment, which can differ from canonical's
+ * blend chain if draw order/coverage isn't actually equivalent). */
+#define WS_OVERLAY_LOG_CAP 16
+typedef struct { uint32_t frame; int x,y,w,h; uint16_t color; int semi; } WsOverlayLogEntry;
+static WsOverlayLogEntry s_ws_overlay_log[WS_OVERLAY_LOG_CAP];
+static int s_ws_overlay_log_n = 0;
+static uint64_t s_ws_overlay_log_total = 0;
+
+void gpu_ws_overlay_log_dump(char *out, size_t cap) {
+    int pos = snprintf(out, cap, "\"total\":%llu,\"entries\":[",
+                       (unsigned long long)s_ws_overlay_log_total);
+    for (int i = 0; i < s_ws_overlay_log_n && pos < (int)cap; i++) {
+        WsOverlayLogEntry *e = &s_ws_overlay_log[i];
+        uint16_t c = e->color;
+        pos += snprintf(out + pos, cap - (size_t)pos,
+            "%s{\"frame\":%u,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"semi\":%d,"
+            "\"r5\":%d,\"g5\":%d,\"b5\":%d}",
+            i ? "," : "", e->frame, e->x, e->y, e->w, e->h, e->semi,
+            c & 0x1F, (c >> 5) & 0x1F, (c >> 10) & 0x1F);
+    }
+    if (pos < (int)cap) snprintf(out + pos, cap - (size_t)pos, "]");
+}
+
+void gpu_ws_overlay_log_clear(void) { s_ws_overlay_log_n = 0; s_ws_overlay_log_total = 0; }
+
 static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
     if (w <= 0 || h <= 0) return;
     /* Full-screen 2D overlay (pause gray-filter / load fade): a flat rect
@@ -1890,7 +2505,15 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
     }
-    if (overlay) s_wide_suppress = 1;
+    if (overlay) {
+        s_wide_suppress = 1;
+        s_ws_overlay_log_total++;
+        if (s_ws_overlay_log_n < WS_OVERLAY_LOG_CAP) {
+            WsOverlayLogEntry *e = &s_ws_overlay_log[s_ws_overlay_log_n++];
+            e->frame = (uint32_t)s_frame_count; e->x = x; e->y = y; e->w = w; e->h = h;
+            e->color = c; e->semi = semi;
+        }
+    }
     gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
     gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
     if (overlay) {
@@ -1902,11 +2525,171 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
         if (s_ws_ablate != 1) {
             hr_begin(0);
             gl_perf_mirror_begin();
-            wide_flat_rect_direct(0, y, g_wide_w, h, c, semi);
+            int pct = gpu_ws_margin_darken_pct();
+            int native_w = g_wide_w - 2 * g_wide_off;
+            if (pct >= 100 || native_w <= 0 || g_wide_off <= 0) {
+                wide_flat_rect_direct(0, y, g_wide_w, h, c, semi);
+            } else {
+                /* [widescreen] nw_margin_darken_pct: centre keeps the exact,
+                 * unscaled colour (byte-identical to a non-widescreen
+                 * build's rect); margins get a flat colour scaled by pct%,
+                 * softening an aggressive darken/subtract-mode overlay
+                 * where the game's own compensating bright layers don't
+                 * reach the revealed margin to counteract it (see doc).
+                 * 2026-08-08: tried ramping this to the exact centre colour
+                 * at the boundary (a horizontal-gradient rect, since removed)
+                 * to remove the flat-fill's hard seam -- confirmed live it
+                 * looks WORSE: the ramp reads as a visible dark band right
+                 * at the boundary, because the centre's brightness there
+                 * comes partly from OTHER compensating content that doesn't
+                 * ramp in alongside the darken colour. Reverted to flat --
+                 * do not re-attempt a boundary-matching gradient here
+                 * without a capped, non-100% target. */
+                uint16_t c_soft = ws_scale_color15(c, pct);
+                wide_flat_rect_direct(0, y, g_wide_off, h, c_soft, semi);
+                wide_flat_rect_direct(g_wide_off, y, native_w, h, c, semi);
+                wide_flat_rect_direct(g_wide_off + native_w, y,
+                                      g_wide_w - g_wide_off - native_w, h, c_soft, semi);
+            }
             gl_perf_mirror_end();
             hr_end();
         }
     }
+}
+
+/* Draw a rect with a vertical-only Gouraud gradient (c_top at y, c_bot at
+ * y+h) DIRECTLY into the active wide surface at wide-space coords
+ * [wx, wx+ww) x [y, y+h). Used only by the full-screen-overlay path; mirrors
+ * wide_flat_rect_direct but with per-vertex top/bottom colors instead of a
+ * uniform color. */
+static void wide_gouraud_rect_direct(int wx, int y, int ww, int h,
+                                     uint16_t c_top, uint16_t c_bot, int semi) {
+    if (ww <= 0 || h <= 0) return;
+    float r0 = ((c_top & 0x1F) << 3) / 255.0f;
+    float g0 = (((c_top >> 5) & 0x1F) << 3) / 255.0f;
+    float b0 = (((c_top >> 10) & 0x1F) << 3) / 255.0f;
+    float r1 = ((c_bot & 0x1F) << 3) / 255.0f;
+    float g1 = (((c_bot >> 5) & 0x1F) << 3) / 255.0f;
+    float b1 = (((c_bot >> 10) & 0x1F) << 3) / 255.0f;
+    float a = s_mask_set ? 1.0f : 0.0f;
+    float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
+    float verts[6 * 6] = {
+        fx0,fy0,r0,g0,b0,a,  fx1,fy0,r0,g0,b0,a,  fx0,fy1,r1,g1,b1,a,
+        fx1,fy0,r0,g0,b0,a,  fx0,fy1,r1,g1,b1,a,  fx1,fy1,r1,g1,b1,a,
+    };
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+    glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+    mask_stencil(s_mask_set);
+    p_glUseProgram(s_geo_prog);
+    p_glUniform1f(s_geo_uXoff, 0.0f);
+    p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
+    p_glBindVertexArray(s_geo_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    p_glUniform1f(s_geo_uXoff, 0.0f);
+    p_glUniform1f(s_geo_uXhalf, 512.0f);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+}
+
+/* Full-screen shaded (Gouraud) overlay: same detection/expansion strategy as
+ * gpu_flat_rect, but for gradient fades/flashes authored as a shaded quad
+ * whose color only varies vertically (top row / bottom row). Without this,
+ * the per-vertex wide mirror would place the same 320-wide gradient at its
+ * translated position, leaving the revealed 16:9 margins uncovered. */
+static void gpu_gouraud_rect(int x,int y,int w,int h,uint16_t c_top,uint16_t c_bot,int semi) {
+    if (w <= 0 || h <= 0) return;
+    int overlay = 0;
+    if (g_wide_cur) {
+        int native_w = g_wide_w - 2 * g_wide_off;
+        int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
+        overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+    }
+    if (overlay) s_wide_suppress = 1;
+    gpu_triangle(x,   y,   c_top, x+w, y,   c_top, x,   y+h, c_bot, semi);
+    gpu_triangle(x+w, y,   c_top, x,   y+h, c_bot, x+w, y+h, c_bot, semi);
+    if (overlay) {
+        s_wide_suppress = 0;
+        if (s_ws_ablate != 1) {
+            hr_begin(0);
+            gl_perf_mirror_begin();
+            wide_gouraud_rect_direct(0, y, g_wide_w, h, c_top, c_bot, semi);
+            gl_perf_mirror_end();
+            hr_end();
+        }
+    }
+}
+
+/* Draw a textured rect DIRECTLY into the active wide surface at wide-space
+ * coords [wx, wx+ww) x [y, y+h), sampling texels starting at (u0,v0) and
+ * continuing linearly at 1 texel/pixel. Widening the destination this way
+ * crosses a 256-texel page boundary, which psx_uv_rect_limits already
+ * detects (see gpu_uv.h) by disabling the sampling clamp and widening the
+ * bounds to the full page — so a tileable overlay texture (haze/distortion
+ * mask) repeats across the revealed margins exactly like real PSX texel
+ * wrapping. Used only by the full-screen-overlay path; mirrors
+ * wide_flat_rect_direct/wide_gouraud_rect_direct but samples a texture
+ * instead of interpolating a flat color. */
+static void wide_textured_rect_direct(int wx, int y, int ww, int h,
+                                      int u0, int v0,
+                                      uint16_t clut_x, uint16_t clut_y,
+                                      uint16_t tp, int semi) {
+    if (ww <= 0 || h <= 0) return;
+    int base_x = (tp & 0xF) * 64;
+    int base_y = ((tp >> 4) & 1) * 256;
+    int depth  = (tp >> 7) & 3; if (depth > 2) depth = 2;
+    float mr = s_mod_r/255.0f, mg = s_mod_g/255.0f, mb = s_mod_b/255.0f;
+    int u1 = u0 + ww, v1 = v0 + h;
+    int lim[4];
+    psx_uv_rect_limits(u0, v0, u1, v1, lim);
+    float fx0=(float)wx, fy0=(float)y, fx1=(float)(wx+ww), fy1=(float)(y+h);
+    float fu0=(float)u0, fv0=(float)v0, fu1=(float)u1, fv1=(float)v1;
+    float semi_code = semi >= 0 ? (float)(semi + 1) : 0.0f;
+    float bxf=(float)base_x, byf=(float)base_y, cxf=(float)clut_x, cyf=(float)clut_y;
+    float df=(float)depth, rf=(float)s_mod_raw;
+    float l0=(float)lim[0], l1=(float)lim[1], l2=(float)lim[2], l3=(float)lim[3];
+    float verts[6 * TEXV] = {
+        fx0,fy0,fu0,fv0, mr,mg,mb,1.0f, bxf,byf, cxf,cyf, df,rf, l0,l1,l2,l3, semi_code,
+        fx1,fy0,fu1,fv0, mr,mg,mb,1.0f, bxf,byf, cxf,cyf, df,rf, l0,l1,l2,l3, semi_code,
+        fx0,fy1,fu0,fv1, mr,mg,mb,1.0f, bxf,byf, cxf,cyf, df,rf, l0,l1,l2,l3, semi_code,
+        fx1,fy0,fu1,fv0, mr,mg,mb,1.0f, bxf,byf, cxf,cyf, df,rf, l0,l1,l2,l3, semi_code,
+        fx0,fy1,fu0,fv1, mr,mg,mb,1.0f, bxf,byf, cxf,cyf, df,rf, l0,l1,l2,l3, semi_code,
+        fx1,fy1,fu1,fv1, mr,mg,mb,1.0f, bxf,byf, cxf,cyf, df,rf, l0,l1,l2,l3, semi_code,
+    };
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+    glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    p_glUseProgram(s_tex_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+    p_glUniform1i(s_uVram, 0);
+    p_glUniform4i(s_uTwin, s_tw_mask_x, s_tw_mask_y, s_tw_off_x, s_tw_off_y);
+    p_glUniform1i(s_uMaskset, s_mask_set);
+    p_glUniform1i(s_uFilter, s_tex_filter);
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    int saved_tb_mask = s_tb_mask;
+    s_tb_mask = s_mask_set;
+    /* [widescreen] nw_margin_mist_pct: this is the full-screen-overlay mirror
+     * path (haze/atmosphere masks stretched to cover the whole wide surface,
+     * see the caller's "overlay" detection) -- a SEPARATE draw call from
+     * gpu_textured_triangle's normal per-primitive mirror, so it never went
+     * through mist_prim_gate/u_colscale even though it uses the same shader
+     * program. A full-screen rect is definitionally large/flat/uniform, so
+     * if the game's rain-mist effect is implemented as one of these (rather
+     * than the many small quads mist_prim_gate was built for), THIS is where
+     * its color needs softening too. */
+    int mist_ov = mist_prim_gate(semi);
+    if (mist_ov) p_glUniform1f(s_tex_uColscale, (float)g_ws_mist_pct / 100.0f);
+    tex_batch_draw_passes(6, semi);
+    if (mist_ov) p_glUniform1f(s_tex_uColscale, 1.0f);
+    s_tb_mask = saved_tb_mask;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
 static void gpu_textured_rect(int x,int y,int w,int h,
@@ -1915,6 +2698,19 @@ static void gpu_textured_rect(int x,int y,int w,int h,
     if (w <= 0 || h <= 0) return;
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
+    /* Full-screen textured overlay (haze/distortion masks, environmental
+     * filters): a 1:1-mapped rect spanning the whole 4:3 framebuffer must
+     * cover the whole wide surface too, else the revealed 16:9 margins are
+     * left untouched. Same detection as gpu_flat_rect/gpu_gouraud_rect;
+     * restricted to the 1:1 case (u1-u0==w) since wide_textured_rect_direct
+     * assumes a constant 1 texel/pixel step. Mirrored rects (u0>u1) never
+     * reach here as a full-screen overlay so the sign check is enough. */
+    int overlay = 0;
+    if (g_wide_cur && (u1 - u0) == w) {
+        int native_w = g_wide_w - 2 * g_wide_off;
+        int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
+        overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+    }
     /* gpu.c routes axis-aligned MIRRORED quads (X/Y-flipped 2D sprites,
      * e.g. right-facing MMX entities) through THIS path as scaled rects
      * with u0>u1 / v0>v1 — they never reach the poly path. Exact bounds
@@ -1922,12 +2718,24 @@ static void gpu_textured_rect(int x,int y,int w,int h,
     int lim[4];
     psx_uv_rect_limits(u0, v0, u1, v1, lim);
     psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
+    if (overlay) { flush_tex_batch(); s_wide_suppress = 1; }
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
     gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
     int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
     int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
     gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
+    if (overlay) {
+        flush_tex_batch();
+        s_wide_suppress = 0;
+        if (s_ws_ablate != 1) {
+            hr_begin(0);
+            gl_perf_mirror_begin();
+            wide_textured_rect_direct(0, y, g_wide_w, h, u0, v0, clut_x, clut_y, tp, semi);
+            gl_perf_mirror_end();
+            hr_end();
+        }
+    }
 }
 
 /* GP0(02h) fill: writes color with bit15=0, ignoring draw area, mask and
@@ -1972,8 +2780,18 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
 /* VRAM->VRAM copy: blit the source region to the scratch texture (resolves
  * overlap), then draw it back at the destination through the BLIT program so
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
+/* Diagnostic-only, live-toggleable via the ws_copy_debug debug command (no
+ * rebuild needed): skip any VRAM->VRAM copy whose DESTINATION x is >= this
+ * value. -1 = disabled (normal behaviour). Built to test causally whether a
+ * specific copy-rect sequence is the source of a visual effect, before
+ * writing any real fix — see docs/burndown/010-widescreen-battle.md round 7
+ * (the heat-haze investigation). */
+int g_ws_copy_skip_dst_x_min = -1;
+void gpu_ws_copy_skip_dst_x(int min_x) { g_ws_copy_skip_dst_x_min = min_x; }
+
 static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
+    if (g_ws_copy_skip_dst_x_min >= 0 && dx >= g_ws_copy_skip_dst_x_min) return;
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
@@ -2020,6 +2838,14 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
     mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
     hr_end();
+
+    /* [widescreen] round 7 tried mirroring full-width VRAM->VRAM publishes
+     * into the wide surface here (docs/burndown/010-widescreen-battle.md).
+     * REVERTED — confirmed live it broke alignment between the margins and
+     * the centre (visible seam/mismatch) without fixing the actual heat-haze
+     * effect the user was after (turned out to be a full-scene per-vertex
+     * warp, not something this copy publishes — see the doc). Do not
+     * re-attempt this exact approach without re-reading that account. */
 
     rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
     s_gpu_dirty = 1;
@@ -2111,6 +2937,10 @@ static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32
 static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
     if (!s_raster_ok) { sw_draw_flat_rect(x,y,w,h,c); return; }
     gpu_flat_rect(x,y,w,h,c, s_semi_en?s_semi_mode:-1);
+}
+static void glb_draw_gouraud_rect(int x,int y,int w,int h,uint16_t c_top,uint16_t c_bot){
+    if (!s_raster_ok) { sw_draw_gouraud_rect(x,y,w,h,c_top,c_bot); return; }
+    gpu_gouraud_rect(x,y,w,h,c_top,c_bot, s_semi_en?s_semi_mode:-1);
 }
 static void glb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){
     if (!s_raster_ok) { sw_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp); return; }
@@ -2356,12 +3186,14 @@ static int init_gpu_raster(void) {
     s_geo_uXcenter = p_glGetUniformLocation(s_geo_prog, "u_xcenter");
     s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
     s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
+    s_tex_uColscale = p_glGetUniformLocation(s_tex_prog, "u_colscale");
     /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
      * otherwise zero them, collapsing all x to 0. */
     p_glUseProgram(s_geo_prog);
     p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
     p_glUseProgram(s_tex_prog);
     p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
+    p_glUniform1f(s_tex_uColscale, 1.0f);
 
     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
      * for the lifetime of the pipeline). Backed off by 1/64 native px so
@@ -3783,6 +4615,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
+    gpu_ws_mirror_probe_scan_present(fbo);
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
@@ -3832,7 +4665,8 @@ static const GpuRenderBackend GL_BACKEND = {
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
     .draw_textured_triangle = glb_draw_textured_triangle,
     .draw_shaded_textured_triangle = glb_draw_shaded_textured_triangle,
-    .draw_flat_rect = glb_draw_flat_rect, .draw_textured_rect = glb_draw_textured_rect,
+    .draw_flat_rect = glb_draw_flat_rect, .draw_gouraud_rect = glb_draw_gouraud_rect,
+    .draw_textured_rect = glb_draw_textured_rect,
     .draw_textured_rect_scaled = glb_draw_textured_rect_scaled,
     .draw_line = glb_draw_line, .draw_shaded_line = glb_draw_shaded_line,
     .render_display = glb_render_display, .render_display_hires = glb_render_display_hires,

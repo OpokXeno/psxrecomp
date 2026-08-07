@@ -70,6 +70,10 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw_texture);
 void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color);
+/* Axis-aligned rect with a vertical-only Gouraud gradient (color_top at y,
+ * color_bottom at y+h, constant across each row). See gr_draw_gouraud_rect. */
+void sw_draw_gouraud_rect(int x, int y, int w, int h,
+                          uint16_t color_top, uint16_t color_bottom);
 void sw_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,

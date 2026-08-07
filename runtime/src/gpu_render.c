@@ -32,6 +32,7 @@ static const GpuRenderBackend SW_BACKEND = {
     .draw_textured_triangle        = sw_draw_textured_triangle,
     .draw_shaded_textured_triangle = sw_draw_shaded_textured_triangle,
     .draw_flat_rect                = sw_draw_flat_rect,
+    .draw_gouraud_rect             = sw_draw_gouraud_rect,
     .draw_textured_rect            = sw_draw_textured_rect,
     .draw_textured_rect_scaled     = sw_draw_textured_rect_scaled,
     .draw_line                     = sw_draw_line,
@@ -125,6 +126,9 @@ void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c
                                        x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
 }
 void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
+void gr_draw_gouraud_rect(int x, int y, int w, int h, uint16_t c_top, uint16_t c_bot) {
+    g_b->draw_gouraud_rect(x, y, w, h, c_top, c_bot);
+}
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
     g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);

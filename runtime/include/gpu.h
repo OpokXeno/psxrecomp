@@ -232,6 +232,42 @@ void gpu_ws_begin_linked_list(void);
  * gradient / backdrop image) to fill the wide frame, so it no longer
  * pillarboxes at the reveal margins. Runtime-only. Off by default. */
 void gpu_ws_set_nw_backdrop(int on);
+/* Native-wide margin darken-pass softening ([widescreen] nw_margin_darken_pct):
+ * scale a full-screen-overlay flat rect's colour by this percentage ONLY in
+ * the revealed side margins (the native 4:3 centre always gets the full,
+ * unscaled colour). 100 = unchanged/faithful (default). Runtime-only. */
+void gpu_ws_set_nw_margin_darken_pct(int pct);
+int  gpu_ws_margin_darken_pct(void);
+/* Native-wide shimmer/haze particle scatter ([widescreen]
+ * nw_shimmer_duplicate): redraw small semi-transparent textured prims
+ * (heat-haze/spark/ember particles) a few extra times at additional
+ * x-offsets in the mirror pass only, scattering real copies of the existing
+ * particles further into both margins. Native 4:3 untouched. Runtime-only.
+ * 0 = off (default). */
+void gpu_ws_set_shimmer_dup_count(int n);
+/* [widescreen] nw_shimmer_min_src_addr — floor on GP0 command source address
+ * for a prim to be eligible for nw_shimmer_duplicate. 0 = no filter. See
+ * gpu_gl_renderer.c's shimmer_prim_gate for why this is needed (a fixed UI
+ * decoration can share opcode/size/blend/tag-state with a real particle;
+ * only source address reliably tells them apart, confirmed per-game via
+ * ws_census — never guess a value without that evidence). */
+void gpu_ws_set_shimmer_min_addr(uint32_t addr);
+/* [widescreen] nw_shimmer_max_px — screen-space bbox cap (px, both axes) for
+ * nw_shimmer_duplicate eligibility. Default 48 (small-particle heuristic);
+ * raise per-game for titles whose particle system is a 3D-projected streak
+ * with a large perspective-projected bbox (confirm via ws_census first). */
+void gpu_ws_set_shimmer_max_px(int px);
+/* [widescreen] nw_margin_mist_src_lo/hi + nw_margin_mist_pct — soften a
+ * specific address range's blend-mode vertex-colour tint in the native-wide
+ * margin mirror draw only (never the canonical centre). For a title whose
+ * atmosphere/mist layer legitimately reaches the margin but reads as a flat
+ * wash there because the 4:3-authored content that normally dilutes it
+ * doesn't. See gpu_gl_renderer.c's mist_prim_gate for the full rationale and
+ * how this differs from nw_shimmer_duplicate (never guess the address range
+ * — confirm via a raw GP0 command dump, same evidentiary bar as the shimmer
+ * knobs). 100 = faithful/unchanged (default). */
+void gpu_ws_set_mist_range(uint32_t lo, uint32_t hi);
+void gpu_ws_set_mist_pct(int pct);
 /* Native-wide flat-polygon backdrop stretch ([widescreen] nw_flat_backdrop):
  * stretch untextured primitives in the wide mirror without changing the
  * canonical 4:3 framebuffer. Intended for flat-colour sky/water backdrops. */
@@ -278,6 +314,10 @@ extern int g_ws_bd_from_interp;
  * (a character / Tomba / HUD element). The GL 2D-backdrop stretch uses this to
  * EXCLUDE foreground sprites (only the untagged 2D backdrop is stretched). */
 int psx_ws_prim_is_tagged(void);
+
+/* Source RAM address of the GP0 command currently being drawn (0xFFFFFFFF =
+ * none/unknown). See gpu.c's definition for why this exists. */
+uint32_t gpu_current_source_addr(void);
 
 /* Flower-field backdrop data-structure address range + a predicate matching the
  * prim being drawn against it (gp0_cmd_source_addr ∈ [lo,hi]). The dirty-RAM
