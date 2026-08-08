@@ -28,6 +28,16 @@
 
 namespace input_replay {
 namespace {
+bool destination_exists(const char* path) {
+#ifdef _WIN32
+    struct _stat destination {};
+    return _stat(path, &destination) == 0 || errno != ENOENT;
+#else
+    struct stat destination {};
+    return lstat(path, &destination) == 0 || errno != ENOENT;
+#endif
+}
+
 struct Pad {
     std::vector<std::string> buttons;
     std::array<int16_t, SDL_CONTROLLER_AXIS_MAX> axes{};
@@ -970,8 +980,7 @@ bool record_begin_impl(const char* path, uint16_t stop_field,
         if (error) *error = "invalid input record request";
         return false;
     }
-    struct stat destination {};
-    if (lstat(path, &destination) == 0 || errno != ENOENT) {
+    if (destination_exists(path)) {
         if (error) *error = "input record destination must not exist";
         return false;
     }
@@ -1049,8 +1058,7 @@ bool write_record_evidence(const char* path, std::string* error) {
         if (error) *error = "input record is not complete";
         return false;
     }
-    struct stat destination {};
-    if (lstat(path, &destination) == 0 || errno != ENOENT) {
+    if (destination_exists(path)) {
         if (error) *error = "record evidence destination must not exist";
         return false;
     }
