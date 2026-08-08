@@ -8,6 +8,8 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+find_package(Threads REQUIRED)
+
 # Default to an optimized build. The recompiled game is a huge (~270 MB) block of
 # generated C; with no CMAKE_BUILD_TYPE the compiler emits it at -O0 and the game
 # runs at a small fraction of full speed (terrible framerate). A naive
@@ -626,6 +628,7 @@ function(psxrecomp_add_runtime_target target)
     else()
         target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
     endif()
+    target_link_libraries(${target} PRIVATE Threads::Threads)
 
     # Build identity: stamp the psxrecomp commit into the binary so a crash report
     # can be correlated to an exact build (issue #1 user reports had no version).

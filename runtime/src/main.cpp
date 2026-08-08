@@ -3737,7 +3737,6 @@ static void sdl_vblank_present(void) {
 
     /* Turbo-active test shared by the pacing/present gate below. */
     int turbo_loads_active = 0;
-    extern int fntrace_is_game_started(void);
     int logical_load_active = fntrace_is_game_started() && cdrom_load_in_progress();
     int load_run_value = 0;
     static int load_run = 0;
@@ -3936,7 +3935,6 @@ static void sdl_vblank_present(void) {
 
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
     if (!g_ws_engaged) {
-        extern int fntrace_is_game_started(void);
         if (fntrace_is_game_started()) {
             g_ws_engaged = true;
             const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
@@ -4500,10 +4498,12 @@ static void sdl_vblank_present(void) {
         const Uint64 present_ms = (t1 >= t0 && freq) ? ((t1 - t0) * 1000u) / freq : 0;
         if (!g_present_vsync_disabled && present_ms > 250) {
             g_present_slow_count++;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
             if (g_present_slow_count >= 3 &&
                 SDL_RenderSetVSync(sdl_renderer, 0) == 0) {
                 g_present_vsync_disabled = 1;
             }
+#endif
         }
     }
     }
