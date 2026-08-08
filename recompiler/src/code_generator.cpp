@@ -2764,6 +2764,49 @@ GeneratedFunction CodeGenerator::generate_function(
     // switch's fail-closed default exists to prevent.
     if (cps_enabled_ && (!cps_cur_continuations_.empty() || config_.overlay_mode)) {
         std::set<uint32_t> seen;
+        // g_psx_resume_seed: a one-shot external resume request (currently only
+        // psx_scheduler_resume_at, savestate load), checked and unconditionally
+        // consumed BEFORE the existing cpu->pc-based switch below, and kept
+        // entirely separate from it. psx_dispatch_impl (the shared call
+        // trampoline) unconditionally zeroes cpu->pc immediately before invoking
+        // dispatch_table[mid].func(cpu) -- that's how it tells "the callee
+        // returned" (still 0 after the call) apart from "the callee tail-called
+        // elsewhere" (now holds the new target), and it must: a plain `jr $ra`
+        // return is emitted as bare `return;` and never touches cpu->pc itself,
+        // so the trampoline's own zero is the only thing that makes that
+        // detection correct. That means cpu->pc is ALWAYS 0 by the time this
+        // function's body runs for any call arriving through the normal
+        // dispatch table, which makes the cpu->pc switch below dead for that
+        // path (a plain `jal`/`jalr` doesn't need it either -- it always
+        // targets a function's true entry, never an interior label). The one
+        // real consumer that needs to land on an interior label -- resuming a
+        // savestate captured mid-call -- was therefore silently defeated:
+        // g_psx_resume_seed is the fix, a channel the trampoline never touches
+        // and an ordinary return never touches, so a resume request survives
+        // to be read here. Concretely: a save made mid-call inside a small
+        // helper (e.g. a scripted cutscene's wait-loop blocked on it) used to
+        // re-enter that helper from scratch on load, with whatever registers
+        // the snapshot held rather than the ones live at the real resume
+        // point -- which could cascade into a wild jump a few iterations
+        // later. Every other PC class is unaffected; this is purely additive. */
+        body_ss << config_.indent << "{\n";
+        body_ss << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
+        body_ss << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
+        body_ss << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
+        body_ss << config_.indent << "        g_psx_resume_seed = 0;\n";
+        body_ss << config_.indent << "        switch (_rcont) {\n";
+        {
+            std::set<uint32_t> seen_resume;
+            for (uint32_t c : cps_cur_continuations_) {
+                if (!seen_resume.insert(c).second) continue;
+                body_ss << config_.indent
+                        << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            }
+        }
+        body_ss << config_.indent << "            default: break;\n";
+        body_ss << config_.indent << "        }\n";
+        body_ss << config_.indent << "    }\n";
+        body_ss << config_.indent << "}\n";
         body_ss << config_.indent << "if (cpu->pc != 0u) {\n";
         body_ss << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
         body_ss << config_.indent << "    switch (_cont) {\n";
@@ -3091,6 +3134,29 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // aliases[0]->start_addr.
     if (cps_enabled_ && (!cps_cur_continuations_.empty() || config_.overlay_mode)) {
         std::set<uint32_t> seen;
+        // g_psx_resume_seed pre-check — same fix and same rationale as
+        // generate_function's entry switch above (savestate resume into a
+        // mid-function label was silently defeated by the trampoline's
+        // unconditional cpu->pc zeroing; this is a separate, always-safe
+        // channel the trampoline and an ordinary return never touch).
+        body << config_.indent << "{\n";
+        body << config_.indent << "    extern uint32_t g_psx_resume_seed;\n";
+        body << config_.indent << "    if (g_psx_resume_seed != 0u) {\n";
+        body << config_.indent << "        uint32_t _rcont = g_psx_resume_seed;\n";
+        body << config_.indent << "        g_psx_resume_seed = 0;\n";
+        body << config_.indent << "        switch (_rcont) {\n";
+        {
+            std::set<uint32_t> seen_resume;
+            for (uint32_t c : cps_cur_continuations_) {
+                if (!seen_resume.insert(c).second) continue;
+                body << config_.indent
+                     << fmt::format("            case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            }
+        }
+        body << config_.indent << "            default: break;\n";
+        body << config_.indent << "        }\n";
+        body << config_.indent << "    }\n";
+        body << config_.indent << "}\n";
         body << config_.indent << "if (cpu->pc != 0u) {\n";
         body << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
         body << config_.indent << "    switch (_cont) {\n";

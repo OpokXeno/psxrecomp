@@ -697,3 +697,127 @@ post-dispatch IRQ pump shadow guard (already in tree).
   deferred_exception_longjmp + psx_rfe_escape_check.
 - `traps.c`: fixup call at the deferred-honor longjmp site.
 - All inert when diff mode is off; normal play unaffected. Builds clean.
+
+---
+
+## Issue #10 — Savestate resume corrupted guest state: growing freezes and crashes on load
+
+**Status:** RESOLVED
+**Date:** 2026-08-01 to 2026-08-05
+**Phase:** runtime (savestate subsystem) / platform (recompiler code generation)
+
+### Symptom
+
+Two separately-reported bugs, both triggered only by loading a savestate
+(F1), never by ordinary play:
+
+1. Repeated loads got progressively slower, eventually freezing for tens of
+   seconds before resuming, with completely normal frame pacing throughout —
+   the window never became unresponsive, it just looked like gameplay had
+   stalled.
+2. A savestate captured while the guest was mid-call inside a small helper
+   function (most reliably triggered by saving during a scripted cutscene)
+   crashed a few dispatch cycles after resuming.
+
+Both trace back to the same underlying class of bug: **state the resume path
+depends on, but that doesn't live in `CPUState`/RAM, so `boot_state_load()`
+never touches it and it survives a load holding a value from the pre-load
+live session instead.**
+
+### Bug 1 — stale unclaimed-interrupt cooldown deadline (the freeze)
+
+`psx_check_interrupts()` (`interrupts.c`) arms `post_exception_cooldown_until`
+— an absolute `psx_cycle_count` deadline — whenever it delivers an interrupt
+the handler doesn't claim, to guarantee the main thread gets forward progress
+before the same interrupt re-fires immediately. The deadline is computed
+against whatever `psx_cycle_count` happens to be in the *live* session at
+delivery time.
+
+A savestate load rewinds `psx_cycle_count` to the (usually much lower) value
+captured in the save file, but `post_exception_cooldown_until` isn't part of
+`CPUState`/RAM, so it survives the load holding its old, now much larger
+absolute value. Every interrupt check after resume — including VBlank — then
+sees `psx_cycle_count < post_exception_cooldown_until` and bails without
+delivering anything, until real elapsed cycles climb back past the stale
+target. That gap scales with how long the live session had run before the
+load, which is exactly the reported "gets slower every time" symptom.
+Confirmed live via direct instrumentation: during the stall,
+`s_last_interrupt_check_cycle` tracked the current cycle count in lockstep
+(interrupt checks were running continuously), while `cop0_epc` never
+changed — nothing was ever actually delivered.
+
+**Fix:** `psx_interrupt_resume_bookkeeping_reset()` — already called by
+`savestate.c` on every load specifically to scrub this class of stale
+state — now also resets `post_exception_cooldown_until = 0`.
+
+Also fixed in the same pass, same bug shape: `cpu->muldiv_ts_done` /
+`cpu->gte_ts_done` (MULT/DIV and GTE pipeline-stall deadlines, `psx_cycles.c`)
+and the idle-skip detector's snapshot state, both reset in `savestate.c`'s
+load path / `psx_cycles_resync_after_restore()`. `g_async_rfe_resume_pc`
+(`dirty_ram_interp.c`) gets the same treatment for the same reason, though it
+turned out not to be the cause of either reported symptom — just the same
+latent gap in a neighboring field.
+
+### Bug 2 — mid-function resume defeated by the dispatch trampoline (the crash)
+
+`psx_scheduler_resume_at()` — the savestate-load resume path — bare-jumps
+into `psx_dispatch(cpu, resume_pc)`. Every recompiler-generated function has
+its own "resume here" switch at the top
+(`if (cpu->pc != 0) { switch(cpu->pc) { case <label>: goto block_<label>; ... } }`)
+specifically to support landing mid-function instead of at the true entry.
+
+That switch is unreachable through the normal dispatch path.
+`psx_dispatch_impl` — the shared call trampoline emitted once per BIOS/game —
+unconditionally zeroes `cpu->pc` immediately before calling
+`dispatch_table[mid].func(cpu)`, because that zero is how it distinguishes
+"the callee returned" (still 0 after the call) from "the callee tail-called
+elsewhere" (now holds a new target); a plain `jr $ra` return is emitted as a
+bare `return;` and never touches `cpu->pc` itself, so the trampoline's own
+zero is load-bearing for every ordinary call. The side effect: by the time
+any dispatch-table-invoked function's body runs, `cpu->pc` is always 0, so
+its own resume-switch always falls through to `default:` — the function
+restarts from its true entry, silently, with whatever registers happened to
+be live rather than the ones the interrupted call actually had.
+
+This is invisible during ordinary play — a plain `jal`/`jalr` always targets
+a function's true entry anyway, so restarting from the top is exactly
+correct there. It only matters for the one caller that specifically needs a
+mid-function landing: savestate resume. A save captured while the guest was
+inside a `jal`'d helper (e.g. a cutscene script blocked on a wait-loop)
+resumed with the helper re-entered from scratch and the wrong argument,
+which cascaded a few iterations later into a jump through a garbage function
+pointer.
+
+**Fix:** a new one-shot global, `g_psx_resume_seed`, set by
+`psx_scheduler_resume_at()` before dispatching and checked by every
+generated function *before* its existing `cpu->pc`-based switch — entirely
+independent of `cpu->pc`, so it can't interfere with the trampoline's
+tail-call/return detection. Patched in both recompiler code-generation paths
+that emit this switch: `full_function_emitter.cpp` (BIOS) and
+`code_generator.cpp` (game — both the plain-function and overlapping-alias
+emitters). Requires regenerating BIOS + game C output after applying;
+regeneration also changes `PSX_OVERLAY_CODEGEN_HASH`, which invalidates
+every savestate captured against the prior build (by design — the
+checksum's job is to refuse exactly that).
+
+**Verification:** reproduced the exact reported crash live via the TCP debug
+server (loaded the crashing save, confirmed the fault), applied the fix,
+confirmed it resolved that exact save, then ran 30 additional save→load
+cycles hitting a wide variety of mid-function resume points with zero
+crashes or hangs — including `0x801D4F0C`, an address named in an earlier,
+separate "FAIL-FAST unknown dispatch" investigation into savestate-resume
+crashes that was left open with three walked-back hypotheses. Given the
+identical trigger shape (bare-jump resume into a mid-function compiled-code
+label), this fix likely resolves that report too, as the same root cause.
+
+### Note for future maintainers
+
+This is the fourth distinct field to hit this exact bug shape in
+`interrupts.c`/`psx_cycles.c` alone (`muldiv_ts_done`, `gte_ts_done`, the
+idle-skip snapshot, `post_exception_cooldown_until`), plus a fifth in a
+different subsystem (`g_psx_resume_seed`'s absence, `dirty_ram_interp.c` /
+codegen). Any new global that models in-flight guest timing or dispatch
+state — not part of `CPUState` or guest RAM — needs an explicit reset in the
+savestate load path, or it will silently carry live-session values into a
+resumed state that never produced them.
+</content>

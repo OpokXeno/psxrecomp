@@ -519,12 +519,36 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
  * would try to replay a bogus gap. Re-anchor devices at the restored cycle and
  * force a fresh deadline on the next charge. */
 void psx_cycles_resync_after_restore(void) {
+    extern uint64_t g_guest_store_count, g_mmio_access_count;
     g_psx_cyc_batch        = 0;
     g_psx_cyc_batch_limit  = 0;
     g_psx_cyc_bb_defer     = 0;
     s_devices_synced_cycle = psx_cycle_count;
     psx_next_service_cycle = 0;   /* recompute on next charge */
     psx_in_device_service  = 0;
+
+    /* Idle-loop skip detector (ISSUES.md #10 follow-up): s_idle_last_cycle/
+     * s_idle_pc/s_idle_have_snap etc. live outside CPUState/RAM, same as the
+     * interrupt-resume bookkeeping this function already re-anchors above,
+     * and boot_state_load never touches them either. Left stale across a
+     * load, the next psx_idle_note_check() (when idle_skip is enabled —
+     * off by default for this game, but a per-game/env opt-in) would compare
+     * the fresh (rewound) psx_cycle_count against s_idle_last_cycle (still
+     * the pre-load, larger value): the subtraction underflows, s_idle_quantum
+     * becomes a bogus huge value, and the idle skip advances psx_cycle_count
+     * by a huge amount in one step. Not the mechanism behind the
+     * reproduced progressive-load-freeze (that was cpu->gte_ts_done /
+     * muldiv_ts_done, see savestate.c's load path), but the same latent bug
+     * shape, so it gets the same defensive reset here. */
+    s_idle_pc             = 0;
+    s_idle_quantum        = 0;
+    s_idle_streak         = 0;
+    s_idle_have_snap      = 0;
+    s_idle_progress_reg   = -2;
+    s_idle_progress_delta = 0;
+    s_idle_last_cycle     = psx_cycle_count;
+    s_idle_last_stores    = g_guest_store_count;
+    s_idle_last_mmio      = g_mmio_access_count;
 }
 
 void psx_cycles_reset_for_boot(void) {

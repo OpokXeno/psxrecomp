@@ -695,6 +695,64 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
  * on the old stack (safe: the restored state is complete in CPUState/RAM/devices
  * and every block leader is re-enterable). MUST be called on the scheduler fiber
  * (HLE mode, default) at a block-leader boundary with in_exception == 0. */
+/* Post-savestate-load grace window (psxrecomp/ISSUES.md #10): a resumed
+ * savestate can walk into a dispatch target the recompiler never
+ * discovered, moments after resuming, for reasons still unresolved as of
+ * this writing (three hypotheses explored and disproven — see the issue).
+ * This is intentionally NARROW and does not relax the project's normal
+ * fail-loud discovery-gap policy below: the standard unconditional
+ * fail-fast (traps.c psx_unknown_dispatch) stays exactly as strict as
+ * before for every dispatch miss during ordinary play. The grace window
+ * only covers a bounded number of dispatch checks immediately after an
+ * explicit F1-style load, converting JUST that narrow case from a hard
+ * process-ending crash into a loud, ring-logged survive — using the same
+ * "absorb the miss, cpu->pc=0" fallback already used elsewhere for
+ * corrupt/uninitialized callback pointers, not a new behavior. */
+#define PSX_POST_LOAD_GRACE_TICKS 4096
+static int g_post_load_grace_ticks = 0;
+
+void psx_post_load_grace_arm(void) {
+    g_post_load_grace_ticks = PSX_POST_LOAD_GRACE_TICKS;
+}
+
+int psx_post_load_grace_active(void) {
+    return g_post_load_grace_ticks > 0;
+}
+
+void psx_post_load_grace_tick(void) {
+    if (g_post_load_grace_ticks > 0) g_post_load_grace_ticks--;
+}
+
+/* One-shot resume seed, consumed by a generated function's own continuation
+ * switch (full_function_emitter.cpp / code_generator.cpp emit a check for
+ * this alongside their existing `if (cpu->pc != 0)` one). Deliberately kept
+ * SEPARATE from cpu->pc: psx_dispatch_impl (the shared call trampoline,
+ * generated once per BIOS/game) unconditionally zeroes cpu->pc immediately
+ * before invoking dispatch_table[mid].func(cpu), because that zero is how it
+ * tells "callee returned normally" (cpu->pc still 0 after the call) apart
+ * from "callee tail-called elsewhere" (cpu->pc now holds the new target) —
+ * essential, since a plain `jr $ra` return is emitted as bare `return;` and
+ * never touches cpu->pc itself. Feeding a mid-function resume target through
+ * cpu->pc therefore can't work: the trampoline erases it before the callee's
+ * own switch ever runs, so every generated function's continuation-label
+ * switch was unreachable via psx_dispatch — exercised only by
+ * psx_scheduler_resume_at, and always silently defeated, falling through to
+ * a FRESH call at the function's true entry instead of the intended
+ * mid-function point. Concretely: resuming a savestate captured mid-call
+ * inside a small helper (e.g. while a scripted cutscene's wait-loop was
+ * blocked on it) re-entered that helper from scratch with whatever register
+ * values the snapshot happened to hold rather than the ones live at the
+ * actual resume point, which could cascade into a wild jump a few
+ * iterations later — the exact crash reported for a save made during the
+ * intro's 3D scene. This global is the fix: unlike cpu->pc it is never
+ * touched by the trampoline or by an ordinary return, so a generated
+ * function can check it independently and safely, with no risk to the
+ * existing cpu->pc-based tail-call/return contract. Zero means "no resume
+ * pending" (the default, and what every function's check restores it to
+ * immediately upon reading, whether or not it matched one of its own
+ * labels — one-shot, consumed exactly once). */
+uint32_t g_psx_resume_seed = 0;
+
 void psx_scheduler_resume_at(uint32_t resume_pc)
 {
     if (!psx_is_dispatchable(resume_pc)) {
@@ -704,6 +762,7 @@ void psx_scheduler_resume_at(uint32_t resume_pc)
         trap_crash(b);
         return;
     }
+    g_psx_resume_seed         = resume_pc;
     g_sched_escape.target_tcb = 0;
     g_sched_escape.resume_pc  = resume_pc;
     g_sched_escape.reason     = PSX_RUN_RESUME_CURRENT;
@@ -1344,6 +1403,28 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             s_fail_fast = (e && *e == '0') ? 0 : 1;
         }
         if (s_fail_fast) {
+            extern int psx_post_load_grace_active(void);
+            if (psx_post_load_grace_active()) {
+                /* See psx_post_load_grace_arm / ISSUES.md #10. Narrow,
+                 * loud survive: a savestate load walked into an
+                 * undiscovered dispatch target within the grace window.
+                 * Absorb this ONE miss (same fallback already used for
+                 * corrupt callback pointers elsewhere in this function)
+                 * instead of crashing the whole process, but say so
+                 * loudly — this is not the normal fail-fast policy. */
+                fprintf(stderr,
+                    "WARNING: unknown dispatch addr=0x%08X phys=0x%08X ra=0x%08X "
+                    "shortly after a savestate load — this save cannot be "
+                    "resumed correctly (see psxrecomp/ISSUES.md #10, still "
+                    "unresolved). Survived instead of crashing, but game "
+                    "state past this point may be unreliable — recommend "
+                    "reloading from a memory-card save, not this savestate "
+                    "slot, once you can.\n",
+                    addr, phys, cpu->gpr[31]);
+                g_pc0_reason = PSX_PC0_DISPATCH_MISS;
+                cpu->pc = 0;
+                return;
+            }
             extern void psx_crash_trace_dump(const char *reason, void *seh_info);
             psx_crash_trace_dump("fail_fast_unknown_dispatch", NULL);
             char msg[256];
