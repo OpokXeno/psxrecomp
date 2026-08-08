@@ -108,6 +108,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     const toml::value& runtime = toml::find(cfg, "runtime");
     if (runtime.contains("language"))  // [runtime].language convenience alias
         rt.language = toml::find<std::string>(runtime, "language");
+    if (runtime.contains("render_mode")) {
+        rt.render_mode = toml::find<std::string>(runtime, "render_mode");
+        for (char& c : rt.render_mode) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (rt.render_mode != "original" && rt.render_mode != "shadow" &&
+            rt.render_mode != "native")
+            rt.render_mode = "original";
+    }
 
     if (runtime.contains("debug_port")) {
         const auto port = toml::find<int64_t>(runtime, "debug_port");
@@ -246,14 +255,28 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.overlay_capture_persist_dir =
             toml::find<std::string>(runtime, "overlay_capture_persist_dir");
         const std::filesystem::path persist(rt.overlay_capture_persist_dir);
-        if (persist.is_absolute()) {
+        const std::string& persist_text = rt.overlay_capture_persist_dir;
+        const auto is_separator = [](char value) {
+            return value == '/' || value == '\\';
+        };
+        const bool has_windows_drive = persist_text.size() >= 3u &&
+            std::isalpha(static_cast<unsigned char>(persist_text[0])) &&
+            persist_text[1] == ':' && is_separator(persist_text[2]);
+        if (persist.is_absolute() ||
+            (!persist_text.empty() && is_separator(persist_text[0])) ||
+            has_windows_drive) {
             throw std::runtime_error(
                 "runtime.overlay_capture_persist_dir must be project-relative");
         }
-        for (const auto& component : persist) {
-            if (component == "..") {
-                throw std::runtime_error(
-                    "runtime.overlay_capture_persist_dir must stay inside the project");
+        size_t component_start = 0u;
+        for (size_t index = 0u; index <= persist_text.size(); ++index) {
+            if (index == persist_text.size() || is_separator(persist_text[index])) {
+                if (persist_text.substr(component_start,
+                                        index - component_start) == "..") {
+                    throw std::runtime_error(
+                        "runtime.overlay_capture_persist_dir must stay inside the project");
+                }
+                component_start = index + 1u;
             }
         }
     }
@@ -1185,6 +1208,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_cull_depth_sites;
     std::vector<uint32_t> ws_cull_plane_nx_sites;
     std::vector<uint32_t> ws_cull_xclip_load_sites;
+    std::vector<uint32_t> ws_cull_semantic_screen_bias_sites;
+    std::vector<uint32_t> ws_cull_semantic_world_range_sites;
+    std::vector<uint32_t> ws_cull_semantic_left_edge_sites;
+    std::vector<uint32_t> ws_cull_semantic_masked_screen_x_sites;
+    std::vector<uint32_t> ws_cull_semantic_frustum_plane_x_sites;
+    std::vector<uint32_t> ws_cull_semantic_signed_screen_x_sites;
+    std::vector<uint32_t> ws_cull_semantic_depth_bound_sites;
+    std::vector<uint32_t> ws_cull_semantic_xclip_bound_sites;
     int ws_cull_guard_pixels = 0;
     // Cull-signature immediates (screen_w_imms / screen_h_imms). Defaults are
     // the original Tomba signature (320-display: 0x140/0x141 + 0xE0/0xF1); a
@@ -1213,6 +1244,33 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("depth_sites", ws_cull_depth_sites);
             load_sites("plane_nx_sites", ws_cull_plane_nx_sites);
             load_sites("xclip_load_sites", ws_cull_xclip_load_sites);
+            if (cull.contains("semantic")) {
+                const toml::value& semantic = toml::find(cull, "semantic");
+                auto load_semantic_sites = [&](const char* key,
+                                               std::vector<uint32_t>& out) {
+                    if (!semantic.contains(key)) return;
+                    for (const auto& a : toml::find<std::vector<std::string>>(
+                             semantic, key))
+                        out.push_back(parse_hex(
+                            a, fmt::format("widescreen.cull.semantic.{}", key)));
+                };
+                load_semantic_sites("screen_bias_sites",
+                                    ws_cull_semantic_screen_bias_sites);
+                load_semantic_sites("world_range_sites",
+                                    ws_cull_semantic_world_range_sites);
+                load_semantic_sites("left_edge_sites",
+                                    ws_cull_semantic_left_edge_sites);
+                load_semantic_sites("masked_screen_x_sites",
+                                    ws_cull_semantic_masked_screen_x_sites);
+                load_semantic_sites("frustum_plane_x_sites",
+                                    ws_cull_semantic_frustum_plane_x_sites);
+                load_semantic_sites("signed_screen_x_sites",
+                                    ws_cull_semantic_signed_screen_x_sites);
+                load_semantic_sites("depth_bound_sites",
+                                    ws_cull_semantic_depth_bound_sites);
+                load_semantic_sites("xclip_bound_load_sites",
+                                    ws_cull_semantic_xclip_bound_sites);
+            }
             if (cull.contains("guard_pixels")) {
                 ws_cull_guard_pixels = toml::find<int>(cull, "guard_pixels");
                 if (ws_cull_guard_pixels < 0 || ws_cull_guard_pixels > 256)
@@ -1372,6 +1430,22 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_depth_sites*/   ws_cull_depth_sites,
         /*ws_cull_plane_nx_sites*/ ws_cull_plane_nx_sites,
         /*ws_cull_xclip_load_sites*/ ws_cull_xclip_load_sites,
+        /*ws_cull_semantic_screen_bias_sites*/
+            ws_cull_semantic_screen_bias_sites,
+        /*ws_cull_semantic_world_range_sites*/
+            ws_cull_semantic_world_range_sites,
+        /*ws_cull_semantic_left_edge_sites*/
+            ws_cull_semantic_left_edge_sites,
+        /*ws_cull_semantic_masked_screen_x_sites*/
+            ws_cull_semantic_masked_screen_x_sites,
+        /*ws_cull_semantic_frustum_plane_x_sites*/
+            ws_cull_semantic_frustum_plane_x_sites,
+        /*ws_cull_semantic_signed_screen_x_sites*/
+            ws_cull_semantic_signed_screen_x_sites,
+        /*ws_cull_semantic_depth_bound_sites*/
+            ws_cull_semantic_depth_bound_sites,
+        /*ws_cull_semantic_xclip_bound_sites*/
+            ws_cull_semantic_xclip_bound_sites,
         /*ws_cull_guard_pixels*/  ws_cull_guard_pixels,
         /*ws_cull_w_imms*/        ws_cull_w_imms,
         /*ws_cull_h_imms*/        ws_cull_h_imms,

@@ -33,6 +33,11 @@
 #define BIOS_ROM_SIZE   (512 * 1024)
 
 static uint8_t ram[RAM_SIZE];
+extern void psx_xg_render_auth_capture_clear_tile(CPUState *cpu);
+extern void psx_xg_render_auth_capture_logo_sprite(
+    uint32_t command_address, uint8_t color);
+extern void psx_xg_render_auth_capture_tile_write(
+    CPUState *cpu, uint32_t command_address, uint32_t writer_pc, uint8_t color);
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 
@@ -663,11 +668,14 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
         uint32_t bitmap_word = pg * (4096u / 4u / 32u);
         memset(&g_dirty_ram_exec_pc_bitmap[bitmap_word], 0,
                (4096u / 4u / 32u) * sizeof(uint32_t));
+        memset(&g_dirty_ram_exec_pc_counts[pg * (4096u / 4u)], 0,
+               (4096u / 4u) * sizeof(uint32_t));
         memset(&g_dirty_ram_dispatch_pc_bitmap[bitmap_word], 0,
                (4096u / 4u / 32u) * sizeof(uint32_t));
         g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
     }
     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
+        const uint32_t previous_generation = overlay_page_gen[pg];
         overlay_page_gen[pg]++;
         /* Also invalidate generation-aware negative overlay lookups: bytes in
          * a manifested code page may now match a previously absent variant.
@@ -676,6 +684,10 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
          * data write. */
         extern void overlay_loader_note_code_write(void);
         overlay_loader_note_code_write();
+        extern void psx_xg_render_auth_note_code_write(uint64_t, uint64_t,
+                                                        uint32_t, uint32_t);
+        psx_xg_render_auth_note_code_write(previous_generation,
+                                           overlay_page_gen[pg], phys, size);
         /* Self-modification of a currently-executing native entry cannot be
          * recovered lazily (the next dispatch is too late) — the loader
          * blacklists that entry. Everything else is handled at dispatch. */
@@ -806,6 +818,7 @@ extern void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
                                               uint32_t new_val, uint8_t width);
 extern CPUState *debug_cpu_ptr;
 extern uint32_t g_debug_last_store_pc;
+extern uint32_t g_debug_current_func_addr;
 
 /* Parity last-writer provenance (parity_trace.c): note every main-RAM write so
  * the watch-word last-writer table tracks the exact producing store. No-op
@@ -1007,11 +1020,22 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     }
     /* GPU GP0: 0x1F801810, GP1: 0x1F801814 */
     if (addr == 0x1F801810u) {
+        if (!gpu_render_transaction_observation_guard(
+                GUEST_RENDER_TRANSACTION_OBSERVATION_LATE_MMIO))
+            return;
         uint32_t src = addr;
-        if (g_debug_last_store_pc == 0xBFC38B1Cu && debug_cpu_ptr) {
+        static uint64_t mmio_word_ordinal;
+        GpuRenderOracleSource source = {
+            GPU_RENDER_ORACLE_SOURCE_MMIO, addr, mmio_word_ordinal++, addr / 4u
+        };
+        if (g_debug_last_store_pc == 0x800465D4u && debug_cpu_ptr) {
             src = (debug_cpu_ptr->gpr[4] - 4u) & 0x1FFFFCu;
+            source.word_address = src;
+        } else if (g_debug_last_store_pc == 0xBFC38B1Cu && debug_cpu_ptr) {
+            src = (debug_cpu_ptr->gpr[4] - 4u) & 0x1FFFFCu;
+            source.word_address = src;
         }
-        gpu_set_gp0_source(src);
+        gpu_set_gp0_source(&source);
         gpu_write_gp0(val);
         return;
     }
@@ -1487,6 +1511,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
                 return;
             }
         }
+        const uint32_t writer_pc = effective_store_pc();
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         parity_trace_note_write(phys, 4, effective_store_pc());
@@ -1501,6 +1526,8 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
         ram[phys + 3] = (uint8_t)(val >> 24);
+        if (writer_pc == 0x80045F80u && debug_cpu_ptr)
+            psx_xg_render_auth_capture_clear_tile(debug_cpu_ptr);
         return;
     }
     /* Expansion 1: 0x1F000000..0x1F7FFFFF — ignore writes */
@@ -1902,6 +1929,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
+        const uint32_t writer_pc = effective_store_pc();
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
         parity_trace_note_write(phys, 1, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 1);
@@ -1912,6 +1940,15 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }
 #endif
         ram[phys] = val;
+        if (writer_pc == 0x800797D0u && (phys & 3u) == 0u)
+            psx_xg_render_auth_capture_tile_write(
+                debug_cpu_ptr, phys, writer_pc, val);
+        if (writer_pc == 0x8007DBB4u && (phys & 3u) == 2u)
+            psx_xg_render_auth_capture_tile_write(
+                debug_cpu_ptr, phys - 2u, writer_pc, val);
+        if ((writer_pc == 0x80019E74u || writer_pc == 0x80019EBCu) &&
+            (phys & 3u) == 2u)
+            psx_xg_render_auth_capture_logo_sprite(phys - 2u, val);
         return;
     }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;

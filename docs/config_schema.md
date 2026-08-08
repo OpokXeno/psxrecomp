@@ -113,6 +113,7 @@ does not sweep arbitrary bytes for prologues or return-shaped words. Unresolved
 interpretation; add an evidence-backed seed (or a `dispatch_root` seed for a
 proven nonstandard boundary) when they should be compiled.
 
+
 When `game.text_size` is smaller than the PS-X EXE header size, recompilation
 uses it as a static-analysis bound. The value must be nonzero, instruction- and
 4 KiB-aligned, retain `entry_pc`, and not extend past PS1 RAM. The original EXE
@@ -208,6 +209,28 @@ Vulkan after validating their visuals and stability.
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc
 - `default_game_root` — for sibling-junction setups
+
+## Widescreen guest-cull semantics
+
+The optional semantic cull table classifies guest visibility predicates by
+meaning. The same classes are emitted by the static recompiler and applied by
+the dirty-RAM interpreter; the addresses identify verified instruction sites,
+but the renderer policy is selected by the semantic class.
+
+```toml
+[widescreen.cull.semantic]
+screen_bias_sites       = ["0x800..."]  # object/camera horizontal bias
+world_range_sites       = ["0x800..."]  # unsigned horizontal range
+left_edge_sites         = ["0x800..."]  # negated left reject edge
+masked_screen_x_sites   = ["0x800..."]  # masked 16-bit screen X
+frustum_plane_x_sites   = ["0x800..."]  # side-plane normal X load
+signed_screen_x_sites   = ["0x800..."]  # signed right-edge screen X
+depth_bound_sites       = ["0x800..."]  # signed/unsigned depth bound
+xclip_bound_load_sites  = ["0x800..."]  # per-primitive X bound load
+```
+
+These helpers are identity at 4:3 and use the active Native guest-cull view at
+wide aspects. A site must belong to exactly one semantic class.
 
 ## Audit block
 

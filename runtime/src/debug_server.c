@@ -23,8 +23,11 @@
 #include "overlay_backend.h"
 #include "cpu_state.h"
 #include "dma.h"
+#include "native_render_baseline.h"
+#include "guest_render_native_stream.h"
 #include "gpu.h"
 #include "present_ring.h"
+#include "xg_render_auth_runtime.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"
@@ -40,6 +43,7 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "gte_attribution.h"
 #include "lockstep.h"
 #include "debug_overlay.h"
 
@@ -399,6 +403,41 @@ static int s_wtrace_boot_range_count = 0;
 #define WTRACE_MAX_RANGES 64
 static struct { uint32_t lo, hi; } s_wtrace_ranges[WTRACE_MAX_RANGES];
 static int s_wtrace_range_count = 0;
+#define WTRACE_RAM_PAGE_COUNT (0x200000u >> 12)
+static uint32_t s_wtrace_page_bitmap[WTRACE_RAM_PAGE_COUNT / 32u];
+static int s_wtrace_scratch_page;
+
+static void wtrace_rebuild_page_filter(void)
+{
+    memset(s_wtrace_page_bitmap, 0, sizeof(s_wtrace_page_bitmap));
+    s_wtrace_scratch_page = 0;
+    for (int i = 0; i < s_wtrace_range_count; ++i) {
+        uint32_t lo = s_wtrace_ranges[i].lo;
+        uint32_t hi = s_wtrace_ranges[i].hi;
+
+        if (lo >= hi) continue;
+        if (lo < 0x00200000u) {
+            uint32_t end = hi < 0x00200000u ? hi : 0x00200000u;
+            uint32_t first = lo >> 12;
+            uint32_t last = (end - 1u) >> 12;
+
+            for (uint32_t page = first; page <= last; ++page)
+                s_wtrace_page_bitmap[page >> 5] |= 1u << (page & 31u);
+        }
+        if (lo < 0x1F800400u && hi > 0x1F800000u)
+            s_wtrace_scratch_page = 1;
+    }
+}
+
+static int wtrace_page_maybe_matches(uint32_t phys)
+{
+    if (phys < 0x00200000u) {
+        uint32_t page = phys >> 12;
+        return (s_wtrace_page_bitmap[page >> 5] >> (page & 31u)) & 1u;
+    }
+    return s_wtrace_scratch_page &&
+           phys >= 0x1F800000u && phys < 0x1F800400u;
+}
 
 /* ---- wtrace_all ring (ALWAYS-ON; no filter; lean fields) ----
  * Parity with psx-beetle's s_wtrace_all. Every recompiled-code write
@@ -421,6 +460,42 @@ typedef struct {
 static WriteTraceAllEntry *s_wtrace_all = NULL;
 static uint64_t s_wtrace_all_seq  = 0;
 static uint32_t s_wtrace_all_head = 0;
+
+/* The provenance observer asks for the latest writer of aligned guest words.
+ * Keep that exact subset indexed so a normal lookup does not rescan the hot
+ * catch-all ring. Non-aligned or non-RAM addresses still use the ring below. */
+#define LAST_RAM_WRITER_MAIN_RAM_WORDS (0x200000u / 4u)
+#define LAST_RAM_WRITER_SCRATCHPAD_WORDS (0x400u / 4u)
+typedef struct {
+    uint32_t pc;
+    uint32_t ra;
+    uint8_t valid;
+    uint8_t pad[3];
+} LastRamWriterEntry;
+static LastRamWriterEntry *s_last_ram_writer = NULL;
+static LastRamWriterEntry
+    s_last_scratchpad_writer[LAST_RAM_WRITER_SCRATCHPAD_WORDS];
+
+static LastRamWriterEntry *last_ram_writer_slot(uint32_t phys)
+{
+    if ((phys & 3u) != 0u) return NULL;
+    if (phys < 0x200000u) {
+        return s_last_ram_writer != NULL
+            ? &s_last_ram_writer[phys >> 2u] : NULL;
+    }
+    if (phys >= 0x1F800000u && phys < 0x1F800400u)
+        return &s_last_scratchpad_writer[(phys - 0x1F800000u) >> 2u];
+    return NULL;
+}
+
+static void last_ram_writer_reset(void)
+{
+    if (s_last_ram_writer != NULL)
+        memset(s_last_ram_writer, 0,
+               LAST_RAM_WRITER_MAIN_RAM_WORDS * sizeof(*s_last_ram_writer));
+    memset(s_last_scratchpad_writer, 0,
+           sizeof(s_last_scratchpad_writer));
+}
 
 /* ---- wtrace_transition ring (ALWAYS-ON; selected ranges; value changes only)
  * The catch-all write ring intentionally records every write, but hot paths can
@@ -987,7 +1062,7 @@ static uint64_t s_dispatch_seq = 0;
  * Always-on log of every psx_dispatch target that doesn't resolve to a
  * generated function AND doesn't match any trampoline pattern in
  * traps.c. Used to identify functions the recompiler missed.
- * 64K entries × 32 bytes = 2 MB. Replaces the prior file-based log. */
+ * 64K entries × 44 bytes = 2.75 MB. Replaces the prior file-based log. */
 #define UNKNOWN_DISPATCH_CAP (1 << 16)
 typedef struct {
     uint64_t seq;
@@ -997,7 +1072,9 @@ typedef struct {
     uint32_t a0;
     uint32_t a1;
     uint32_t frame;
-    uint32_t pad;
+    uint32_t last_fn_entry;
+    uint32_t dispatch_func;
+    uint32_t last_store_pc;
 } UnknownDispatchEntry;
 static UnknownDispatchEntry s_unknown_ring[UNKNOWN_DISPATCH_CAP];
 static uint64_t s_unknown_seq = 0;
@@ -1026,6 +1103,9 @@ void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
     e->a0    = a0;
     e->a1    = a1;
     e->frame = (uint32_t)s_frame_count;
+    e->last_fn_entry = g_psx_last_fn_entry;
+    e->dispatch_func = g_debug_current_func_addr;
+    e->last_store_pc = g_debug_last_store_pc;
     /* Per-target count (linear probe). */
     uint32_t idx = (phys >> 2) % UNKNOWN_UNIQUE_CAP;
     for (int i = 0; i < UNKNOWN_UNIQUE_CAP; i++) {
@@ -3208,10 +3288,12 @@ static void handle_unknown_dispatch_log(int id, const char *json)
             pos += snprintf(out + pos, BUF_SZ - pos,
                             "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"phys\":\"0x%08X\","
                             "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
-                            "\"frame\":%u}",
+                            "\"frame\":%u,\"last_fn_entry\":\"0x%08X\","
+                            "\"dispatch_func\":\"0x%08X\",\"last_store_pc\":\"0x%08X\"}",
                             i == 0 ? "" : ",",
                             (unsigned long long)e->seq,
-                            e->addr, e->phys, e->ra, e->a0, e->a1, e->frame);
+                            e->addr, e->phys, e->ra, e->a0, e->a1, e->frame,
+                            e->last_fn_entry, e->dispatch_func, e->last_store_pc);
         }
         pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
         debug_server_send_line(out);
@@ -5563,8 +5645,8 @@ static void handle_gpu_frame_dump(int id, const char *json)
 
     int n = gpu_gp0_ring_dump_frame((uint32_t)target, entries, max_entries);
 
-    /* ~190 bytes base + up to ~90 for the copy builder chain; budget conservatively. */
-    size_t buf_sz = 256 + (size_t)n * 400u;
+    /* Budget for the command, provenance, environment, and copy builder chain. */
+    size_t buf_sz = 512 + (size_t)n * 800u;
     char *buf = (char *)malloc(buf_sz);
     if (!buf) { free(entries); send_err(id, "alloc failed"); return; }
 
@@ -5587,6 +5669,30 @@ static void handle_gpu_frame_dump(int id, const char *json)
                 "%s\"0x%08X\"", k ? "," : "", e->cmd[k]);
         }
         pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]");
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            ",\"env\":{\"tpage\":\"0x%04X\",\"clut_x\":%u,\"clut_y\":%u,"
+            "\"textured\":%u,\"raw_texture\":%u,\"semi_transparent\":%u,"
+            "\"shading\":%u,\"draw\":{\"texture_page_x\":%u,"
+            "\"texture_page_y\":%u,\"semi_transparency\":%u,"
+            "\"texture_depth\":%u,\"dither\":%u,\"texture_window_mask_x\":%u,"
+            "\"texture_window_mask_y\":%u,\"texture_window_offset_x\":%u,"
+            "\"texture_window_offset_y\":%u,\"draw_area_left\":%u,"
+            "\"draw_area_top\":%u,\"draw_area_right\":%u,"
+            "\"draw_area_bottom\":%u,\"offset_x\":%d,\"offset_y\":%d,"
+            "\"mask_set\":%u,\"mask_check\":%u}}",
+            e->env.tpage, e->env.clut_x, e->env.clut_y,
+            e->env.textured, e->env.raw_texture, e->env.semi_transparent,
+            e->env.shading, e->env.draw.texture_page_x,
+            e->env.draw.texture_page_y, e->env.draw.semi_transparency,
+            e->env.draw.texture_depth, e->env.draw.dither,
+            e->env.draw.texture_window_mask_x,
+            e->env.draw.texture_window_mask_y,
+            e->env.draw.texture_window_offset_x,
+            e->env.draw.texture_window_offset_y,
+            e->env.draw.draw_area_left, e->env.draw.draw_area_top,
+            e->env.draw.draw_area_right, e->env.draw.draw_area_bottom,
+            e->env.draw.offset_x, e->env.draw.offset_y,
+            e->env.draw.mask_set, e->env.draw.mask_check);
         if (e->opcode == 0x80) {
             pos += (size_t)snprintf(buf + pos, buf_sz - pos,
                 ",\"csp\":\"0x%08X\",\"bld\":[", e->csp);
@@ -5601,6 +5707,128 @@ static void handle_gpu_frame_dump(int id, const char *json)
     debug_server_send_line(buf);
     free(buf);
     free(entries);
+}
+
+static const char *dma_ot_trace_status_name(uint32_t status) {
+    switch (status) {
+    case NATIVE_RENDER_BASELINE_OT_VALID: return "valid";
+    case NATIVE_RENDER_BASELINE_OT_INVALID: return "invalid";
+    case NATIVE_RENDER_BASELINE_OT_CYCLIC: return "cyclic";
+    default: return "unknown";
+    }
+}
+
+static void handle_ot_frame_dump(int id, const char *json) {
+    const int target = json_get_int(json, "frame", -1);
+    int max_lists = json_get_int(json, "list_count", 256);
+    int max_nodes = json_get_int(json, "node_count", 65536);
+    const uint64_t list_total = dma_debug_get_ot_list_total();
+    const uint64_t node_total = dma_debug_get_ot_node_total();
+    const uint64_t list_oldest = list_total > DMA_OT_TRACE_LIST_CAP
+        ? list_total - DMA_OT_TRACE_LIST_CAP : 0u;
+    char *buf;
+    size_t buf_sz;
+    size_t pos;
+    int emitted_lists = 0;
+    int emitted_nodes = 0;
+    int first_list = 1;
+    int complete = 1;
+    int truncated = 0;
+
+    if (target < 0) {
+        send_err(id, "missing frame");
+        return;
+    }
+    if (max_lists < 1) max_lists = 1;
+    if (max_lists > 4096) max_lists = 4096;
+    if (max_nodes < 1) max_nodes = 1;
+    if (max_nodes > 131072) max_nodes = 131072;
+    buf_sz = 2048u + (size_t)max_lists * 768u +
+             (size_t)max_nodes * 192u;
+    if (buf_sz > (size_t)64 * 1024 * 1024)
+        buf_sz = (size_t)64 * 1024 * 1024;
+    buf = (char *)malloc(buf_sz);
+    if (!buf) {
+        send_err(id, "alloc failed");
+        return;
+    }
+    pos = (size_t)snprintf(
+        buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%d,"
+        "\"list_total\":%llu,\"node_total\":%llu,\"lists\":[",
+        id, target, (unsigned long long)list_total,
+        (unsigned long long)node_total);
+
+    for (uint64_t seq = list_oldest;
+         seq < list_total && emitted_lists < max_lists; ++seq) {
+        DMAOtTraceList list;
+        uint64_t node_end;
+
+        if (!dma_debug_get_ot_list(seq, &list)) {
+            complete = 0;
+            continue;
+        }
+        if (list.frame != (uint32_t)target) continue;
+        if (pos >= buf_sz - 1024u) {
+            truncated = 1;
+            break;
+        }
+        pos += (size_t)snprintf(
+            buf + pos, buf_sz - pos,
+            "%s{\"seq\":%llu,\"frame\":%u,\"start\":\"0x%08X\","
+            "\"node_start_seq\":%llu,\"node_count\":%u,"
+            "\"actual_words\":%u,\"func\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"mode\":%u,\"status\":\"%s\",\"nodes\":[",
+            first_list ? "" : ",", (unsigned long long)list.seq,
+            list.frame, list.start_addr,
+            (unsigned long long)list.node_start_seq, list.node_count,
+            list.actual_words, list.func, list.pc, list.ra, list.mode,
+            dma_ot_trace_status_name(list.status));
+        first_list = 0;
+        node_end = list.node_start_seq > UINT64_MAX - list.node_count
+            ? UINT64_MAX : list.node_start_seq + list.node_count;
+        int first_node = 1;
+        int emitted_this_list = 0;
+        for (uint64_t node_seq = list.node_start_seq;
+             node_seq < node_end; ++node_seq) {
+            DMAOtTraceNode node;
+            if (emitted_nodes >= max_nodes || pos >= buf_sz - 512u) {
+                truncated = 1;
+                break;
+            }
+            if (!dma_debug_get_ot_node(node_seq, &node) ||
+                node.list_seq != list.seq) {
+                complete = 0;
+                continue;
+            }
+            pos += (size_t)snprintf(
+                buf + pos, buf_sz - pos,
+                "%s{\"seq\":%llu,\"list_seq\":%llu,\"frame\":%u,"
+                "\"addr\":\"0x%08X\",\"next\":\"0x%08X\","
+                "\"packet_words\":%u,\"ordinal\":%u}",
+                first_node ? "" : ",", (unsigned long long)node.seq,
+                (unsigned long long)node.list_seq, node.frame,
+                node.node_addr, node.next_node_addr, node.packet_words,
+                node.final_ordinal);
+            first_node = 0;
+            ++emitted_nodes;
+            ++emitted_this_list;
+        }
+        if (node_end > list.node_start_seq + (uint64_t)emitted_this_list)
+            complete = 0;
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]}");
+        ++emitted_lists;
+    }
+    if (emitted_lists == max_lists) truncated = 1;
+    pos += (size_t)snprintf(
+        buf + pos, buf_sz - pos,
+        "],\"emitted_lists\":%d,\"emitted_nodes\":%d,"
+        "\"complete\":%s,\"truncated\":%s}",
+        emitted_lists, emitted_nodes, complete ? "true" : "false",
+        truncated ? "true" : "false");
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_capture_quads(int id, const char *json)
@@ -5650,6 +5878,105 @@ static void handle_gte_state(int id, const char *json)
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     send_fmt("%s", buf);
+}
+
+static void handle_gte_attribution(int id, const char *json)
+{
+    GteAttributionSnapshot summary = {0};
+    GteAttributionContextCounter *contexts = NULL;
+    GteAttributionSiteCounter *sites = NULL;
+    int offset = json_get_int(json, "offset", 0);
+    int count = json_get_int(json, "count", 128);
+    GteAttributionResult result;
+
+    if (offset < 0) offset = 0;
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    result = gte_attribution_snapshot(&summary, NULL, 0u, NULL, 0u);
+    if (result != GTE_ATTRIBUTION_OK &&
+        result != GTE_ATTRIBUTION_INSUFFICIENT_CAPACITY) {
+        send_err(id, "gte attribution snapshot failed");
+        return;
+    }
+    if (summary.context_count != 0u)
+        contexts = (GteAttributionContextCounter *)calloc(
+            summary.context_count, sizeof(*contexts));
+    if (summary.site_count != 0u)
+        sites = (GteAttributionSiteCounter *)calloc(
+            summary.site_count, sizeof(*sites));
+    if ((summary.context_count != 0u && contexts == NULL) ||
+        (summary.site_count != 0u && sites == NULL)) {
+        free(contexts);
+        free(sites);
+        send_err(id, "oom");
+        return;
+    }
+    if (gte_attribution_snapshot(
+            &summary, contexts, summary.context_count,
+            sites, summary.site_count) != GTE_ATTRIBUTION_OK) {
+        free(contexts);
+        free(sites);
+        send_err(id, "gte attribution snapshot changed");
+        return;
+    }
+
+    size_t first = (size_t)offset;
+    size_t emitted;
+    size_t capacity;
+    char *reply;
+    int pos;
+    if (first > summary.site_count) first = summary.site_count;
+    emitted = summary.site_count - first;
+    if (emitted > (size_t)count) emitted = (size_t)count;
+    capacity = 768u + emitted * 384u;
+    reply = (char *)malloc(capacity);
+    if (reply == NULL) {
+        free(contexts);
+        free(sites);
+        send_err(id, "oom");
+        return;
+    }
+    pos = snprintf(
+        reply, capacity,
+        "{\"id\":%d,\"ok\":true,\"total_count\":\"%llu\","
+        "\"inside_producer_count\":\"%llu\","
+        "\"outside_producer_count\":\"%llu\","
+        "\"context_count\":%zu,\"site_count\":%zu,\"offset\":%zu,"
+        "\"emitted\":%zu,\"overflow_reason\":%u,\"blocked\":%s,"
+        "\"sites\":[",
+        id, (unsigned long long)summary.total_count,
+        (unsigned long long)summary.inside_producer_count,
+        (unsigned long long)summary.outside_producer_count,
+        summary.context_count, summary.site_count, first, emitted,
+        (unsigned)summary.overflow_reason, summary.blocked ? "true" : "false");
+    for (size_t index = 0u; index < emitted; ++index) {
+        const GteAttributionSiteCounter *counter = &sites[first + index];
+        pos += snprintf(
+            reply + pos, capacity - (size_t)pos,
+            "%s{\"inside_producer\":%s,\"tier\":%u,\"producer_id\":%u,"
+            "\"scene_epoch\":\"%llu\",\"state_sequence\":\"%llu\","
+            "\"guest_pc_known\":%s,\"guest_pc\":\"0x%08X\","
+            "\"caller_known\":%s,\"caller\":\"0x%08X\","
+            "\"command_known\":%s,\"command\":\"0x%08X\","
+            "\"count\":\"%llu\"}",
+            index == 0u ? "" : ",",
+            counter->context.inside_producer ? "true" : "false",
+            (unsigned)counter->context.tier, counter->context.producer_id,
+            (unsigned long long)counter->context.visual_state_id.scene_epoch,
+            (unsigned long long)counter->context.visual_state_id.state_sequence,
+            counter->site.guest_pc_known ? "true" : "false",
+            counter->site.guest_pc,
+            counter->site.caller_known ? "true" : "false",
+            counter->site.caller,
+            counter->site.command_known ? "true" : "false",
+            counter->site.command,
+            (unsigned long long)counter->count);
+    }
+    snprintf(reply + pos, capacity - (size_t)pos, "]}");
+    debug_server_send_line(reply);
+    free(reply);
+    free(contexts);
+    free(sites);
 }
 
 /* Dump recent GTE RTPS/RTPT projections (inputs + outputs) from the always-on
@@ -7987,10 +8314,8 @@ static void handle_screenshot_file(int id, const char *json)
              id, path, w, h);
 }
 
-/* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
- * PNG, regardless of what the game currently displays. Used to inspect BOTH
- * double-buffer halves (y=0 and y=256) coherently in one call to see whether a
- * strobing character is present in one buffer only. */
+/* dump_buffer: dump a raw VRAM region to a PNG, regardless of what the game
+ * currently displays. The default remains the 512x240 double-buffer view. */
 static void handle_dump_buffer(int id, const char *json)
 {
     extern void gl_renderer_sync_cpu(void);
@@ -7998,17 +8323,25 @@ static void handle_dump_buffer(int id, const char *json)
     extern void vk_renderer_sync_cpu(void);
     vk_renderer_sync_cpu();
 
+    int x0 = json_get_int(json, "x", 0);
     int y0 = json_get_int(json, "y", 0);
+    int width = json_get_int(json, "width", 512);
+    int height = json_get_int(json, "height", 240);
+    if (x0 < 0 || y0 < 0 || width <= 0 || height <= 0 ||
+        x0 + width > 1024 || y0 + height > 512) {
+        send_err(id, "VRAM region is out of bounds");
+        return;
+    }
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
         strncpy(path, "psx_buffer.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
     GpuDisplayInfo di;
-    di.display_x = 0; di.display_y = (uint32_t)y0; di.depth24 = 0;
-    di.disabled = 0; di.width = 512; di.height = 240;
+    di.display_x = (uint32_t)x0; di.display_y = (uint32_t)y0; di.depth24 = 0;
+    di.disabled = 0; di.width = (uint32_t)width; di.height = (uint32_t)height;
 
-    uint32_t w = 512, h = 240;
+    uint32_t w = (uint32_t)width, h = (uint32_t)height;
     FILE *f = fopen(path, "wb");
     if (!f) { send_err(id, "cannot open file"); return; }
     uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
@@ -8023,7 +8356,129 @@ static void handle_dump_buffer(int id, const char *json)
     int ok = png_write_rgb(f, rgb, w, h);
     free(rgb); fclose(f);
     if (!ok) { send_err(id, "png encode failed"); return; }
-    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"y\":%d}", id, path, y0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"x\":%d,\"y\":%d,\"width\":%u,\"height\":%u}",
+             id, path, x0, y0, w, h);
+}
+
+static void handle_native_semantic_last(int id, const char *json)
+{
+    char value[64];
+    char response[64 * 1024];
+    size_t used;
+    uint64_t command_id;
+    GpuRenderTransactionId visual_id;
+    GpuRenderSemantic semantic;
+
+    if (!json_get_str(json, "command_id", value, sizeof(value))) {
+        send_err(id, "missing command_id");
+        return;
+    }
+    command_id = strtoull(value, NULL, 0);
+    if (!guest_render_native_stream_last_consumed_command(
+            command_id, &visual_id, &semantic)) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"found\":false}\n", id);
+        return;
+    }
+    used = (size_t)snprintf(response, sizeof(response),
+             "{\"id\":%d,\"ok\":true,\"found\":true,"
+             "\"command_id\":\"0x%llX\",\"visual\":[%llu,%llu],"
+             "\"topology\":%u,\"screen_space_2d\":%u,"
+             "\"triangle_count\":%u,\"line_count\":%u,"
+             "\"material\":{\"tpage\":%u,\"page_x\":%u,\"page_y\":%u,"
+             "\"clut_x\":%u,\"clut_y\":%u,\"area\":[%u,%u,%u,%u],"
+             "\"offset\":[%d,%d],\"depth\":%u,\"blend\":%u,"
+             "\"shading\":%u,\"textured\":%u,\"raw\":%u,\"semi\":%u,"
+             "\"dither\":%u,\"mask_set\":%u,\"mask_check\":%u},"
+             "\"triangles\":[",
+             id, (unsigned long long)command_id,
+             (unsigned long long)visual_id.scene_epoch,
+             (unsigned long long)visual_id.state_sequence,
+             semantic.topology, semantic.screen_space_2d,
+             semantic.triangle_count, semantic.line_count,
+             semantic.material.tpage, semantic.material.texture_page_x,
+             semantic.material.texture_page_y, semantic.material.clut_x,
+             semantic.material.clut_y, semantic.material.draw_area_left,
+             semantic.material.draw_area_top, semantic.material.draw_area_right,
+             semantic.material.draw_area_bottom,
+             semantic.material.draw_offset_x, semantic.material.draw_offset_y,
+             semantic.material.texture_depth, semantic.material.blend_mode,
+             semantic.material.shading, semantic.material.textured,
+             semantic.material.raw_texture, semantic.material.semi_transparent,
+             semantic.material.dither, semantic.material.mask_set,
+             semantic.material.mask_check);
+    if (used >= sizeof(response)) {
+        send_err(id, "semantic response overflow");
+        return;
+    }
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle) {
+        const GpuRenderSemanticTriangle *item = &semantic.triangles[triangle];
+        int written = snprintf(response + used, sizeof(response) - used,
+            "%s{\"split\":[%u,%u],\"vertices\":[",
+            triangle == 0u ? "" : ",", item->split_index, item->split_count);
+        if (written < 0 || (size_t)written >= sizeof(response) - used) {
+            send_err(id, "semantic response overflow");
+            return;
+        }
+        used += (size_t)written;
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            const GpuRenderSemanticVertex *v = &item->vertices[vertex];
+            written = snprintf(response + used, sizeof(response) - used,
+                "%s[%d,%d,%d,%d,%u,%u,%u,%d,%d,%u]",
+                vertex == 0u ? "" : ",", v->x, v->y, v->u, v->v,
+                v->r, v->g, v->b, v->native_view_x, v->native_view_y,
+                v->native_view_position);
+            if (written < 0 || (size_t)written >= sizeof(response) - used) {
+                send_err(id, "semantic response overflow");
+                return;
+            }
+            used += (size_t)written;
+        }
+        written = snprintf(response + used, sizeof(response) - used, "]}");
+        if (written < 0 || (size_t)written >= sizeof(response) - used) {
+            send_err(id, "semantic response overflow");
+            return;
+        }
+        used += (size_t)written;
+    }
+    if (used + 3u > sizeof(response)) {
+        send_err(id, "semantic response overflow");
+        return;
+    }
+    memcpy(response + used, "]}", 3u);
+    send_fmt("%s", response);
+}
+
+static void handle_xg_projected_state(int id, const char *json)
+{
+    PsxXgRenderProjectedLifecycleSnapshot snapshot = {0};
+
+    (void)json;
+    psx_xg_render_auth_projected_lifecycle_snapshot(&snapshot);
+    send_fmt(
+        "{\"id\":%d,\"ok\":true,\"frame\":%llu,"
+        "\"initializer_begins\":%llu,\"initializer_registrations\":%llu,"
+        "\"cutover_attempts\":%llu,\"cutover_successes\":%llu,"
+        "\"native_primitives\":%llu,\"source_misses\":%llu,"
+        "\"source_blocked\":%llu,\"pending_resets\":%llu,"
+        "\"disable_resets\":%llu,\"code_write_resets\":%llu,"
+        "\"loader_resets\":%llu,\"last_registered_object\":\"0x%08X\","
+        "\"last_source_success_object\":\"0x%08X\","
+        "\"last_source_miss_object\":\"0x%08X\"}",
+        id, (unsigned long long)s_frame_count,
+        (unsigned long long)snapshot.initializer_begin_count,
+        (unsigned long long)snapshot.initializer_registration_count,
+        (unsigned long long)snapshot.cutover_attempt_count,
+        (unsigned long long)snapshot.cutover_success_count,
+        (unsigned long long)snapshot.primitive_count,
+        (unsigned long long)snapshot.source_miss_count,
+        (unsigned long long)snapshot.source_blocked_count,
+        (unsigned long long)snapshot.pending_reset_count,
+        (unsigned long long)snapshot.disable_reset_count,
+        (unsigned long long)snapshot.code_write_reset_count,
+        (unsigned long long)snapshot.loader_reset_count,
+        snapshot.last_registered_object,
+        snapshot.last_source_success_object,
+        snapshot.last_source_miss_object);
 }
 
 /* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
@@ -8461,6 +8916,13 @@ static void wtrace_boot_record(uint32_t phys, uint32_t old_val,
 /* Always-on catch-all recorder.  Lean record (no register window). */
 static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
 {
+    LastRamWriterEntry *latest = last_ram_writer_slot(phys);
+
+    if (latest != NULL) {
+        latest->pc = g_debug_last_store_pc;
+        latest->ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+        latest->valid = 1u;
+    }
     if (!s_wtrace_all) return;
     WriteTraceAllEntry *e = &s_wtrace_all[s_wtrace_all_head];
     e->seq     = s_wtrace_all_seq++;
@@ -8471,6 +8933,48 @@ static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
     e->frame   = (uint32_t)s_frame_count;
     e->w       = width;
     s_wtrace_all_head = (s_wtrace_all_head + 1) % WRITE_TRACE_ALL_CAP;
+}
+
+int debug_server_find_last_ram_writer(uint32_t phys, uint32_t *out_pc,
+                                      uint32_t *out_ra)
+{
+    LastRamWriterEntry *cached;
+
+    if (!out_pc || !out_ra) return 0;
+    cached = last_ram_writer_slot(phys);
+    if (cached != NULL && cached->valid) {
+        *out_pc = cached->pc;
+        *out_ra = cached->ra;
+        return 1;
+    }
+
+    /* A packet source is normally written shortly before its DMA transfer.
+     * Bound the reverse scan so this diagnostic cannot turn a malformed source
+     * address into an unbounded cost on the emulation thread. */
+    enum { LOOKUP_WINDOW = 131072 };
+    uint64_t total;
+    uint32_t available;
+    uint32_t newest;
+
+    if (!s_wtrace_all) return 0;
+    total = s_wtrace_all_seq;
+    available = total < WRITE_TRACE_ALL_CAP
+        ? (uint32_t)total : WRITE_TRACE_ALL_CAP;
+    if (available > LOOKUP_WINDOW) available = LOOKUP_WINDOW;
+    if (available == 0u) return 0;
+
+    newest = (s_wtrace_all_head + WRITE_TRACE_ALL_CAP - 1u) %
+        WRITE_TRACE_ALL_CAP;
+    for (uint32_t age = 0u; age < available; ++age) {
+        const WriteTraceAllEntry *entry =
+            &s_wtrace_all[(newest + WRITE_TRACE_ALL_CAP - age) %
+                          WRITE_TRACE_ALL_CAP];
+        if (entry->addr != phys) continue;
+        *out_pc = entry->pc;
+        *out_ra = entry->ra;
+        return 1;
+    }
+    return 0;
 }
 
 static void wtrace_transition_record(uint32_t phys, uint32_t old_val,
@@ -8590,7 +9094,7 @@ static void handle_card_trace_dump(int id, const char *json)
 }
 
 /* Multi-range check called from memory.c write paths.
- * Iterates up to 8 ranges; records if any match.
+ * Iterates up to 64 ranges; records if any match.
  * The always-on catch-all ring is recorded UNCONDITIONALLY first so
  * late-connecting probes can still see recent writes without arming. */
 void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
@@ -8613,7 +9117,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     wtrace_all_record(phys, new_val, width);
     wtrace_transition_record(phys, old_val, new_val, width);
     wtrace_boot_record(phys, old_val, new_val, width);
-    if (s_wtrace_range_count == 0) return;
+    if (s_wtrace_range_count == 0 || !wtrace_page_maybe_matches(phys)) return;
     for (int i = 0; i < s_wtrace_range_count; i++) {
         if (phys >= s_wtrace_ranges[i].lo && phys < s_wtrace_ranges[i].hi) {
             wtrace_record(phys, old_val, new_val, width);
@@ -8723,6 +9227,7 @@ static void handle_wtrace_range(int id, const char *json)
     s_wtrace_ranges[0].lo = lo;
     s_wtrace_ranges[0].hi = hi;
     s_wtrace_range_count = (lo != hi) ? 1 : 0;
+    wtrace_rebuild_page_filter();
     send_fmt("{\"id\":%d,\"ok\":true,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
              id, lo, hi);
 }
@@ -8738,6 +9243,7 @@ static void handle_wtrace_add(int id, const char *json)
     int slot = s_wtrace_range_count++;
     s_wtrace_ranges[slot].lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
     s_wtrace_ranges[slot].hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+    wtrace_rebuild_page_filter();
     send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
              id, slot, s_wtrace_ranges[slot].lo, s_wtrace_ranges[slot].hi);
 }
@@ -8752,6 +9258,7 @@ static void handle_wtrace_del(int id, const char *json)
     for (int i = slot; i < s_wtrace_range_count - 1; i++)
         s_wtrace_ranges[i] = s_wtrace_ranges[i + 1];
     s_wtrace_range_count--;
+    wtrace_rebuild_page_filter();
     send_ok(id);
 }
 
@@ -8761,6 +9268,7 @@ static void handle_wtrace_disarm_all(int id, const char *json)
 {
     (void)json;
     s_wtrace_range_count = 0;
+    wtrace_rebuild_page_filter();
     send_ok(id);
 }
 
@@ -9586,6 +10094,7 @@ static void handle_wtrace_all_reset(int id, const char *json)
     if (s_wtrace_all)
         memset(s_wtrace_all, 0,
                (size_t)WRITE_TRACE_ALL_CAP * sizeof(WriteTraceAllEntry));
+    last_ram_writer_reset();
     send_ok(id);
 }
 
@@ -11948,6 +12457,15 @@ static void handle_stack_profile(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"sp\":%s}", id, buf);
 }
 
+static void handle_input_replay_status(int id, const char *json)
+{
+    (void)json;
+    extern int input_replay_status_json(char *out, int cap);
+    char buf[256];
+    input_replay_status_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"input_replay\":%s}", id, buf);
+}
+
 /* Live boundary control-flow flight recorder (RECURSION_BUG.md §18): per-frame
  * crossing/depth summary + per-crossing onset detail. Read while responsive to
  * see whether the interp<->compiled recursion accumulates across frames or
@@ -12507,6 +13025,7 @@ static const CmdEntry s_commands[] = {
     { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },
     { "stack_profile",     handle_stack_profile },
+    { "input_replay_status", handle_input_replay_status },
     { "xprobe",            handle_xprobe },
     { "xprobe_arm",        handle_xprobe_arm },
     { "ce_profile",        handle_ce_profile },
@@ -12710,17 +13229,21 @@ static const CmdEntry s_commands[] = {
     { "display_ring_aux",  handle_display_ring_aux },
     { "display_ring_stats", handle_display_ring_stats },
     { "dump_buffer",       handle_dump_buffer },
+    { "native_semantic_last", handle_native_semantic_last },
+    { "xg_projected_state", handle_xg_projected_state },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "window_shot",       handle_window_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },
+    { "ot_frame_dump",     handle_ot_frame_dump },
     { "a0_history",        handle_a0_history },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
+    { "gte_attribution",   handle_gte_attribution },
     { "gte_ring_dump",     handle_gte_ring_dump },
     { "gte_intpl_dump",    handle_gte_intpl_dump },
     { "gte_frame_stats",   handle_gte_frame_stats },
@@ -12900,6 +13423,7 @@ void debug_server_init(int port)
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
     listen(s_listen, 16);
+    set_nonblocking(s_listen);
     fprintf(stdout, "psxrecomp: debug server LISTENING on 127.0.0.1:%d\n",
             s_port);
 
@@ -12947,6 +13471,11 @@ void debug_server_init(int port)
         s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP,
                                                     sizeof(WriteTraceAllEntry));
     }
+    if (!s_last_ram_writer) {
+        s_last_ram_writer = (LastRamWriterEntry *)calloc(
+            LAST_RAM_WRITER_MAIN_RAM_WORDS, sizeof(*s_last_ram_writer));
+    }
+    last_ram_writer_reset();
     s_wtrace_all_seq  = 0;
     s_wtrace_all_head = 0;
 
@@ -13207,6 +13736,7 @@ void debug_server_init(int port)
     s_wtrace_trans_ranges[9].hi = 0x00097430u;
     s_wtrace_trans_range_count = 10;
 #endif
+    wtrace_rebuild_page_filter();
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {

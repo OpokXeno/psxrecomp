@@ -227,8 +227,9 @@ overlap the cycle axis or each other (different files), so they parallelize.
   analog-ON (→ frame-length misparse after a flip). Fixing both lets the
   `g_pad_legacy_cfg` Tomba hack be DELETED. P1: analog-mode lock (`0x44`); P2: `0x4D`
   rumble echo + cycle-paced pad ACK. Validate: `sio_trace` diff on `0x43`/`0x45`.
-- **`accuracy/axis5_gpu.md`.** P1: dithering ENTIRELY MISSING in both renderers (decoded
-  but never forwarded) — largest systematic banding divergence. P2: SW rasterizer uses
+- **`accuracy/axis5_gpu.md`.** P1: OpenGL polygon dithering is fixed (Original GP0 and
+  semantic transactions share one exact matrix/modulate/quantize path); software and
+  line dithering remain. P2: SW rasterizer uses
   float + inclusive spans vs HW fixed-point half-open DDA w/ top-left bias → shared-edge
   double-draw + 1px over-fill. P3: sprite FlipX/FlipY unmodeled; mono-rect size mask
   wrong. FAITHFUL: all 4 semi-transparency modes, mask set/check, texture-window, CLUT

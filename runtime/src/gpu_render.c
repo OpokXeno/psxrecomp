@@ -11,9 +11,16 @@
  * so the software path is byte-for-byte unchanged. */
 
 #include "gpu_render.h"
+#ifndef GPU_RENDER_TRANSACTION_TESTING
 #include "gpu_sw_renderer.h"
+#endif
 #include <stdio.h>
 
+#ifdef GPU_RENDER_TRANSACTION_TESTING
+static const GpuRenderBackend SW_BACKEND = {
+    .name = "software-test"
+};
+#else
 static const GpuRenderBackend SW_BACKEND = {
     .name                          = "software",
     .init                          = sw_renderer_init,
@@ -53,6 +60,7 @@ static const GpuRenderBackend SW_BACKEND = {
     .render_wide_display           = sw_render_wide_display,
     .wide_dump_full                = sw_wide_dump_full,
 };
+#endif
 
 /* Supplied by gpu_gl_renderer.c; returns NULL until the GL backend is ready. */
 extern const GpuRenderBackend *gl_backend_get(void);
@@ -63,7 +71,96 @@ extern const GpuRenderBackend *vk_backend_get(void);
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
 
+typedef enum GrTransactionPhase {
+    GR_TRANSACTION_IDLE = 0,
+    GR_TRANSACTION_OPEN,
+    GR_TRANSACTION_FAILED
+} GrTransactionPhase;
+
+static struct {
+    GpuRenderTransactionId id;
+    GrTransactionPhase phase;
+    int barrier_seen;
+    int draw_since_barrier;
+} g_transaction;
+
+static struct {
+    unsigned int depth;
+    int poisoned;
+} g_draw_suppression;
+
+static int transaction_id_equal(GpuRenderTransactionId left,
+                                GpuRenderTransactionId right) {
+    return left.scene_epoch == right.scene_epoch &&
+           left.state_sequence == right.state_sequence;
+}
+
+static void transaction_clear(void) {
+    g_transaction.id.scene_epoch = 0u;
+    g_transaction.id.state_sequence = 0u;
+    g_transaction.phase = GR_TRANSACTION_IDLE;
+    g_transaction.barrier_seen = 0;
+    g_transaction.draw_since_barrier = 0;
+}
+
+#ifdef GPU_RENDER_TRANSACTION_TESTING
+static void draw_suppression_clear(void) {
+    g_draw_suppression.depth = 0u;
+    g_draw_suppression.poisoned = 0;
+}
+#endif
+
+static int transaction_callbacks_present(void) {
+    return g_b->transaction_begin != NULL &&
+           g_b->ordering_barrier != NULL &&
+           g_b->draw_semantic != NULL &&
+           g_b->commit_validate != NULL &&
+           g_b->rollback != NULL;
+}
+
+static int deferred_transaction_callbacks_present(void) {
+    return transaction_callbacks_present() &&
+           g_b->deferred_candidate_capture != NULL &&
+           g_b->deferred_candidate_discard != NULL &&
+           g_b->deferred_transaction_begin != NULL;
+}
+
+static GpuRenderTransactionStatus normalize_backend_status(
+        GpuRenderTransactionStatus status) {
+    switch (status) {
+        case GPU_RENDER_TRANSACTION_OK:
+        case GPU_RENDER_TRANSACTION_READY:
+        case GPU_RENDER_TRANSACTION_UNSUPPORTED:
+        case GPU_RENDER_TRANSACTION_INVALID_ARGUMENT:
+        case GPU_RENDER_TRANSACTION_INVALID_TRANSITION:
+        case GPU_RENDER_TRANSACTION_ORDER_REJECTED:
+        case GPU_RENDER_TRANSACTION_STATE_REJECTED:
+        case GPU_RENDER_TRANSACTION_VALIDATION_FAILED:
+        case GPU_RENDER_TRANSACTION_BACKEND_ERROR:
+        case GPU_RENDER_TRANSACTION_CONTEXT_LOST:
+            return status;
+        default:
+            return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    }
+}
+
+static GpuRenderTransactionStatus require_open_transaction(
+        GpuRenderTransactionId transaction_id) {
+    if (g_transaction.phase == GR_TRANSACTION_IDLE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!transaction_id_equal(g_transaction.id, transaction_id)) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    }
+    if (g_transaction.phase != GR_TRANSACTION_OPEN)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
 void gr_set_backend(GrBackend backend) {
+    /* The selector is documented as pre-init. Never orphan an open checkpoint
+     * if a caller violates that ordering. */
+    if (g_transaction.phase != GR_TRANSACTION_IDLE) return;
     if (backend == GR_BACKEND_OPENGL) {
         const GpuRenderBackend *gl = gl_backend_get();
         if (gl) {
@@ -91,6 +188,259 @@ void gr_set_backend(GrBackend backend) {
 
 GrBackend gr_backend(void) { return g_effective; }
 
+GpuRenderDrawSuppressionStatus gr_draw_suppression_begin(void) {
+    if (g_draw_suppression.poisoned)
+        return GPU_RENDER_DRAW_SUPPRESSION_POISONED;
+    if (g_draw_suppression.depth == GPU_RENDER_DRAW_SUPPRESSION_MAX_DEPTH) {
+        g_draw_suppression.poisoned = 1;
+        return GPU_RENDER_DRAW_SUPPRESSION_OVERFLOW;
+    }
+    g_draw_suppression.depth++;
+    return GPU_RENDER_DRAW_SUPPRESSION_OK;
+}
+
+GpuRenderDrawSuppressionStatus gr_draw_suppression_end(void) {
+    if (g_draw_suppression.poisoned)
+        return GPU_RENDER_DRAW_SUPPRESSION_POISONED;
+    if (g_draw_suppression.depth == 0u) {
+        g_draw_suppression.poisoned = 1;
+        return GPU_RENDER_DRAW_SUPPRESSION_UNDERFLOW;
+    }
+    g_draw_suppression.depth--;
+    return GPU_RENDER_DRAW_SUPPRESSION_OK;
+}
+
+int gr_draw_suppression_active(void) {
+    return g_draw_suppression.poisoned || g_draw_suppression.depth != 0u;
+}
+
+#ifdef GPU_RENDER_TRANSACTION_TESTING
+void gr_test_inject_backend(const GpuRenderBackend *backend) {
+    g_b = backend ? backend : &SW_BACKEND;
+    g_effective = GR_BACKEND_SOFTWARE;
+    transaction_clear();
+    draw_suppression_clear();
+}
+#endif
+
+GpuRenderTransactionStatus gr_transaction_begin(
+        GpuRenderTransactionId transaction_id,
+        uint64_t vram_mutation_serial) {
+    GpuRenderTransactionStatus status;
+
+    if (g_transaction.phase != GR_TRANSACTION_IDLE) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    }
+    if (!transaction_callbacks_present())
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = normalize_backend_status(
+        g_b->transaction_begin(transaction_id, vram_mutation_serial));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    g_transaction.id = transaction_id;
+    g_transaction.phase = GR_TRANSACTION_OPEN;
+    g_transaction.barrier_seen = 0;
+    g_transaction.draw_since_barrier = 0;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+GpuRenderTransactionStatus gr_ordering_barrier(
+        GpuRenderTransactionId transaction_id) {
+    GpuRenderTransactionStatus status =
+        require_open_transaction(transaction_id);
+
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    if (g_b->ordering_barrier == NULL) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+    status = normalize_backend_status(g_b->ordering_barrier(transaction_id));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        status = GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (status != GPU_RENDER_TRANSACTION_OK) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return status;
+    }
+    g_transaction.barrier_seen = 1;
+    g_transaction.draw_since_barrier = 0;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+GpuRenderTransactionStatus gr_draw_semantic(
+        GpuRenderTransactionId transaction_id,
+        const GpuRenderSemantic *semantic) {
+    GpuRenderTransactionStatus status =
+        require_open_transaction(transaction_id);
+
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    if (semantic == NULL) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    }
+    if (!g_transaction.barrier_seen) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_ORDER_REJECTED;
+    }
+    if (g_b->draw_semantic == NULL) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+    status = normalize_backend_status(
+        g_b->draw_semantic(transaction_id, semantic));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        status = GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (status != GPU_RENDER_TRANSACTION_OK) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return status;
+    }
+    g_transaction.draw_since_barrier = 1;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+GpuRenderTransactionStatus gr_commit_validate(
+        GpuRenderTransactionId transaction_id,
+        uint64_t current_vram_mutation_serial,
+        const GpuRenderPresent *present) {
+    GpuRenderTransactionStatus status =
+        require_open_transaction(transaction_id);
+
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    if (present == NULL) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    }
+    if (g_transaction.draw_since_barrier) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_ORDER_REJECTED;
+    }
+    if (g_b->commit_validate == NULL) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+    status = normalize_backend_status(g_b->commit_validate(
+        transaction_id, current_vram_mutation_serial, present));
+    if (status == GPU_RENDER_TRANSACTION_READY) {
+        transaction_clear();
+        return GPU_RENDER_TRANSACTION_READY;
+    }
+    g_transaction.phase = GR_TRANSACTION_FAILED;
+    if (status == GPU_RENDER_TRANSACTION_OK)
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    return status;
+}
+
+GpuRenderTransactionStatus gr_rollback(
+        GpuRenderTransactionId transaction_id) {
+    GpuRenderTransactionStatus status;
+
+    if (g_transaction.phase == GR_TRANSACTION_IDLE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!transaction_id_equal(g_transaction.id, transaction_id)) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    }
+    if (g_b->rollback == NULL) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+    status = normalize_backend_status(g_b->rollback(transaction_id));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        status = GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (status == GPU_RENDER_TRANSACTION_OK) transaction_clear();
+    else g_transaction.phase = GR_TRANSACTION_FAILED;
+    return status;
+}
+
+GpuRenderTransactionStatus gr_deferred_candidate_capture(
+        GpuRenderTransactionId transaction_id,
+        GpuRenderDeferredCandidateToken *out_candidate_token) {
+    GpuRenderTransactionStatus status =
+        require_open_transaction(transaction_id);
+
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    if (!out_candidate_token)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    *out_candidate_token = GPU_RENDER_DEFERRED_CANDIDATE_NONE;
+    if (!deferred_transaction_callbacks_present())
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = normalize_backend_status(g_b->deferred_candidate_capture(
+        transaction_id, out_candidate_token));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        status = GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (status != GPU_RENDER_TRANSACTION_OK)
+        *out_candidate_token = GPU_RENDER_DEFERRED_CANDIDATE_NONE;
+    return status;
+}
+
+GpuRenderTransactionStatus gr_deferred_candidate_discard(
+        GpuRenderDeferredCandidateToken candidate_token) {
+    GpuRenderTransactionStatus status;
+
+    if (candidate_token == GPU_RENDER_DEFERRED_CANDIDATE_NONE)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (!deferred_transaction_callbacks_present())
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = normalize_backend_status(
+        g_b->deferred_candidate_discard(candidate_token));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    return status;
+}
+
+GpuRenderTransactionStatus gr_deferred_transaction_begin(
+        GpuRenderTransactionId transaction_id,
+        uint64_t vram_mutation_serial,
+        GpuRenderDeferredCandidateToken candidate_token) {
+    GpuRenderTransactionStatus status;
+
+    if (g_transaction.phase != GR_TRANSACTION_IDLE) {
+        g_transaction.phase = GR_TRANSACTION_FAILED;
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    }
+    if (candidate_token == GPU_RENDER_DEFERRED_CANDIDATE_NONE)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (!deferred_transaction_callbacks_present())
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = normalize_backend_status(g_b->deferred_transaction_begin(
+        transaction_id, vram_mutation_serial, candidate_token));
+    if (status == GPU_RENDER_TRANSACTION_READY)
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    g_transaction.id = transaction_id;
+    g_transaction.phase = GR_TRANSACTION_OPEN;
+    g_transaction.barrier_seen = 1;
+    g_transaction.draw_since_barrier = 0;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+GpuRenderTransactionStatus gr_stream_barrier(void) {
+    GpuRenderTransactionStatus status;
+
+    if (g_transaction.phase != GR_TRANSACTION_IDLE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (g_b->stream_barrier == NULL)
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = normalize_backend_status(g_b->stream_barrier());
+    return status == GPU_RENDER_TRANSACTION_READY
+        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
+}
+
+GpuRenderTransactionStatus gr_draw_semantic_immediate(
+        const GpuRenderSemantic *semantic) {
+    GpuRenderTransactionStatus status;
+
+    if (semantic == NULL) return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (g_transaction.phase != GR_TRANSACTION_IDLE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (g_b->draw_semantic_immediate == NULL)
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = normalize_backend_status(g_b->draw_semantic_immediate(semantic));
+    return status == GPU_RENDER_TRANSACTION_READY
+        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
+}
+
 /* ---- Dispatch wrappers (one line each; forward to the active backend) ---- */
 void gr_init(uint16_t *vram)                         { g_b->init(vram); }
 void gr_set_scale(int scale)                         { g_b->set_scale(scale); }
@@ -101,40 +451,104 @@ void gr_set_semi_transparency(int e, int m)          { g_b->set_semi_transparenc
 void gr_set_mask_bits(int s, int c)                  { g_b->set_mask_bits(s, c); }
 void gr_set_texture_window(uint32_t raw)             { g_b->set_texture_window(raw); }
 void gr_set_color_modulation(int r, int g, int b, int raw) { g_b->set_color_modulation(r, g, b, raw); }
-void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
-void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }
+void gr_set_dither(int enabled) {
+    if (g_b->set_dither) g_b->set_dither(enabled);
+}
+void gr_fill_rect(int x, int y, int w, int h, uint16_t c) {
+    if (!gr_draw_suppression_active()) g_b->fill_rect(x, y, w, h, c);
+}
+void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
+    if (!gr_draw_suppression_active()) g_b->copy_rect(sx, sy, dx, dy, w, h);
+}
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
-    g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c);
+    if (!gr_draw_suppression_active())
+        g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c);
 }
 void gr_draw_gouraud_triangle(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1,
                               int x2, int y2, uint16_t c2) {
-    g_b->draw_gouraud_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2);
+    if (!gr_draw_suppression_active())
+        g_b->draw_gouraud_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2);
+}
+static uint16_t rgb888_to_rgb555(uint32_t color) {
+    return (uint16_t)(((color >> 3) & UINT32_C(0x001f)) |
+                      ((color >> 6) & UINT32_C(0x03e0)) |
+                      ((color >> 9) & UINT32_C(0x7c00)));
+}
+void gr_draw_flat_triangle_rgb888(int x0, int y0, int x1, int y1,
+                                  int x2, int y2, uint32_t color) {
+    if (gr_draw_suppression_active()) return;
+    if (g_b->draw_flat_triangle_rgb888) {
+        g_b->draw_flat_triangle_rgb888(x0, y0, x1, y1, x2, y2, color);
+    } else {
+        g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2,
+                                rgb888_to_rgb555(color));
+    }
+}
+void gr_draw_gouraud_triangle_rgb888(int x0, int y0, uint32_t c0,
+                                     int x1, int y1, uint32_t c1,
+                                     int x2, int y2, uint32_t c2) {
+    if (gr_draw_suppression_active()) return;
+    if (g_b->draw_gouraud_triangle_rgb888) {
+        g_b->draw_gouraud_triangle_rgb888(x0, y0, c0, x1, y1, c1,
+                                          x2, y2, c2);
+    } else {
+        g_b->draw_gouraud_triangle(x0, y0, rgb888_to_rgb555(c0),
+                                   x1, y1, rgb888_to_rgb555(c1),
+                                   x2, y2, rgb888_to_rgb555(c2));
+    }
 }
 void gr_draw_textured_triangle(int x0, int y0, int u0, int v0, int x1, int y1, int u1, int v1,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1, x2, y2, u2, v2,
-                                clut_x, clut_y, texpage);
+    if (!gr_draw_suppression_active())
+        g_b->draw_textured_triangle(x0, y0, u0, v0, x1, y1, u1, v1,
+                                    x2, y2, u2, v2, clut_x, clut_y, texpage);
 }
 void gr_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0, uint32_t c0,
                                       int x1, int y1, int u1, int v1, uint32_t c1,
                                       int x2, int y2, int u2, int v2, uint32_t c2,
                                       uint16_t clut_x, uint16_t clut_y,
                                       uint16_t texpage, int raw) {
-    g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0, x1, y1, u1, v1, c1,
-                                       x2, y2, u2, v2, c2, clut_x, clut_y, texpage, raw);
+    if (!gr_draw_suppression_active())
+        g_b->draw_shaded_textured_triangle(x0, y0, u0, v0, c0,
+                                           x1, y1, u1, v1, c1,
+                                           x2, y2, u2, v2, c2,
+                                           clut_x, clut_y, texpage, raw);
 }
-void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) { g_b->draw_flat_rect(x, y, w, h, c); }
+void gr_draw_flat_rect(int x, int y, int w, int h, uint16_t c) {
+    if (!gr_draw_suppression_active()) g_b->draw_flat_rect(x, y, w, h, c);
+}
 void gr_draw_textured_rect(int x, int y, int w, int h, int u, int v,
                            uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
+    if (!gr_draw_suppression_active())
+        g_b->draw_textured_rect(x, y, w, h, u, v, clut_x, clut_y, texpage);
 }
 void gr_draw_textured_rect_scaled(int x, int y, int w, int h, int u0, int v0, int u1, int v1,
                                   uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
-    g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1, clut_x, clut_y, texpage);
+    if (!gr_draw_suppression_active())
+        g_b->draw_textured_rect_scaled(x, y, w, h, u0, v0, u1, v1,
+                                       clut_x, clut_y, texpage);
 }
-void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) { g_b->draw_line(x0, y0, x1, y1, c); }
+void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t c) {
+    if (!gr_draw_suppression_active()) g_b->draw_line(x0, y0, x1, y1, c);
+}
 void gr_draw_shaded_line(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c1) {
+    if (!gr_draw_suppression_active())
+        g_b->draw_shaded_line(x0, y0, c0, x1, y1, c1);
+}
+void gr_native_fill_rect(int x, int y, int w, int h, uint16_t c) {
+    if (g_b->native_fill_rect) g_b->native_fill_rect(x, y, w, h, c);
+    else g_b->fill_rect(x, y, w, h, c);
+}
+void gr_native_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
+    if (g_b->native_copy_rect) g_b->native_copy_rect(sx, sy, dx, dy, w, h);
+    else g_b->copy_rect(sx, sy, dx, dy, w, h);
+}
+void gr_native_draw_line(int x0, int y0, int x1, int y1, uint16_t c) {
+    g_b->draw_line(x0, y0, x1, y1, c);
+}
+void gr_native_draw_shaded_line(int x0, int y0, uint16_t c0,
+                                int x1, int y1, uint16_t c1) {
     g_b->draw_shaded_line(x0, y0, c0, x1, y1, c1);
 }
 int gr_render_display(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
@@ -142,6 +556,29 @@ int gr_render_display(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
 }
 int gr_render_display_hires(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
     return g_b->render_display_hires(o, p, dx, dy, dw, dh);
+}
+int gr_present_vram(int dx, int dy, int dw, int dh, int linear, int force_4_3) {
+    if (!g_b->present_vram) return 0;
+    return g_b->present_vram(dx, dy, dw, dh, linear, force_4_3);
+}
+int gr_present_cpu_frame(const uint32_t *pixels, int src_w, int src_h,
+                        int linear, int force_4_3, int content_w) {
+    if (!g_b->present_cpu_frame) return 0;
+    return g_b->present_cpu_frame(pixels, src_w, src_h, linear, force_4_3,
+                                  content_w);
+}
+int gr_present_native_cpu_frame(const uint32_t *pixels, int src_w, int src_h,
+                                int linear, int force_4_3, int content_w) {
+    if (!g_b->present_native_cpu_frame) return 0;
+    return g_b->present_native_cpu_frame(pixels, src_w, src_h, linear,
+                                         force_4_3, content_w);
+}
+int gr_canonical_framebuffer_digest(int display_x, int display_y,
+                                    int display_width, int display_height,
+                                    uint64_t *out_digest) {
+    if (!out_digest || !g_b->canonical_framebuffer_digest) return 0;
+    return g_b->canonical_framebuffer_digest(
+        display_x, display_y, display_width, display_height, out_digest);
 }
 void gr_vram_write(int x, int y, uint16_t pixel)     { g_b->vram_write(x, y, pixel); }
 uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, y); }

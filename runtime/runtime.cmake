@@ -124,18 +124,28 @@ endif()
 option(PSX_DEBUG_OVERLAY "Build the in-game developer debug overlay (ImGui, Ctrl+F3)" ${_psx_debug_overlay_default})
 
 set(PSXRECOMP_RUNTIME_SOURCES
-    ${PSXRECOMP_ROOT}/runtime/src/main.cpp
-    ${PSXRECOMP_ROOT}/runtime/src/memory.c
+ ${PSXRECOMP_ROOT}/runtime/src/main.cpp
+ ${PSXRECOMP_ROOT}/runtime/src/game_identity.c
+  ${PSXRECOMP_ROOT}/runtime/src/input_replay.cpp
+  ${PSXRECOMP_ROOT}/runtime/src/native_render_baseline.c
+  ${PSXRECOMP_ROOT}/runtime/src/native_render_baseline_runtime.c
+ ${PSXRECOMP_ROOT}/runtime/src/host_input_snapshot.cpp
+ ${PSXRECOMP_ROOT}/runtime/src/host_input_mapping.cpp
+ ${PSXRECOMP_ROOT}/runtime/src/memory.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
-    ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
-    ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_render_oracle.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
     ${PSXRECOMP_ROOT}/runtime/src/timers.c
     ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_pacing.c
+    ${PSXRECOMP_ROOT}/runtime/src/game_fps_meter.c
+    ${PSXRECOMP_ROOT}/runtime/src/xenogears_timing.c
+    ${PSXRECOMP_ROOT}/runtime/src/xenogears_field_hook.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_ROOT}/runtime/src/sio.c
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
@@ -155,6 +165,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/gte_attribution.cpp
     ${PSXRECOMP_ROOT}/runtime/src/crc32.c
     ${PSXRECOMP_ROOT}/runtime/src/disc_identity.cpp
     ${PSXRECOMP_ROOT}/runtime/src/cue_sheet.cpp
@@ -182,8 +193,12 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/overlay_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
     ${PSXRECOMP_ROOT}/runtime/src/code_provider.c
-    ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
-    ${PSXRECOMP_ROOT}/runtime/src/game_options.c
+      ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
+      ${PSXRECOMP_ROOT}/runtime/src/guest_render_bridge.c
+      ${PSXRECOMP_ROOT}/runtime/src/guest_render_native_stream.c
+      ${PSXRECOMP_ROOT}/runtime/src/guest_render_transaction.c
+      ${PSXRECOMP_ROOT}/runtime/src/native_render_mode_control.c
+      ${PSXRECOMP_ROOT}/runtime/src/game_options.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_keybinds.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_bios_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_netplay.c
@@ -376,8 +391,10 @@ function(psxrecomp_add_runtime_target target)
         DEFAULT_BIOS_PATH
         DEFAULT_GAME_CONFIG_PATH
         LAUNCHER_BOXART
-        EXE_NAME
-        GAME_VERSION
+         EXE_NAME
+         GAME_VERSION
+         GAME_EXTRA_IDENTITY_SHA256
+         GAME_MANIFEST_DIGEST_SHA256
     )
     # GAME_GENERATED_FULL_C is a list (not a single value): the split-TU build
     # writes the recompiled game as N full_NN.c shards instead of one
@@ -415,6 +432,14 @@ function(psxrecomp_add_runtime_target target)
     endif()
     if(NOT DEFINED PSXRT_DEFAULT_GAME_CONFIG_PATH)
         set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")
+    endif()
+    string(LENGTH "${PSXRT_GAME_EXTRA_IDENTITY_SHA256}" _psxrt_extra_identity_length)
+    if(NOT _psxrt_extra_identity_length EQUAL 64 OR NOT PSXRT_GAME_EXTRA_IDENTITY_SHA256 MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR "${target}: GAME_EXTRA_IDENTITY_SHA256 must be a lowercase 32-byte SHA-256 hex value")
+    endif()
+    string(LENGTH "${PSXRT_GAME_MANIFEST_DIGEST_SHA256}" _psxrt_manifest_digest_length)
+    if(NOT _psxrt_manifest_digest_length EQUAL 64 OR NOT PSXRT_GAME_MANIFEST_DIGEST_SHA256 MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR "${target}: GAME_MANIFEST_DIGEST_SHA256 must be a lowercase 32-byte SHA-256 hex value")
     endif()
 
     if(PSXRT_BIOS_GENERATED_FULL_C AND PSXRT_BIOS_GENERATED_DISPATCH_C)
@@ -633,6 +658,8 @@ function(psxrecomp_add_runtime_target target)
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
         PSX_BUILD_REV="${PSX_GIT_REV}"
         PSX_GAME_VERSION="${PSXRT_GAME_VERSION}"
+        PSX_GAME_EXTRA_IDENTITY_SHA256="${PSXRT_GAME_EXTRA_IDENTITY_SHA256}"
+        PSX_GAME_MANIFEST_DIGEST_SHA256="${PSXRT_GAME_MANIFEST_DIGEST_SHA256}"
         FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )

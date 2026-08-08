@@ -64,6 +64,10 @@ struct RuntimeConfig {
     bool                  has_debug_port = false;
     uint16_t              debug_port     = 0;
 
+    // Requested native-render axis. Independent of guest timing and immutable
+    // after startup. Invalid values fail closed to "original".
+    std::string           render_mode = "original";
+
     // Localization / on-the-fly string translation (docs/STRING_TRANSLATION.md).
     // language selects the translations/*.toml column; "jp"/"off"/"" disables
     // APPLY (capture still runs). From [localization].language or [runtime].
@@ -600,6 +604,19 @@ struct GameConfig {
     // scissor clips the overflow and wrapped off-left coords pass); the
     // vanilla loaded value at 4:3. Empty by default; regen required.
     std::vector<uint32_t> ws_cull_xclip_load_sites;
+
+    // [widescreen.cull.semantic] guest visibility predicates. These are the
+    // semantic Xenogears/native policy inputs; the recompiler emits typed
+    // helpers and the interpreter receives the same PC-to-class table.
+    std::vector<uint32_t> ws_cull_semantic_screen_bias_sites;
+    std::vector<uint32_t> ws_cull_semantic_world_range_sites;
+    std::vector<uint32_t> ws_cull_semantic_left_edge_sites;
+    std::vector<uint32_t> ws_cull_semantic_masked_screen_x_sites;
+    std::vector<uint32_t> ws_cull_semantic_frustum_plane_x_sites;
+    std::vector<uint32_t> ws_cull_semantic_signed_screen_x_sites;
+    std::vector<uint32_t> ws_cull_semantic_depth_bound_sites;
+    std::vector<uint32_t> ws_cull_semantic_xclip_bound_sites;
+
     // Extra per-side actor overdraw beyond the visible widescreen edge.
     int                   ws_cull_guard_pixels = 0;
 

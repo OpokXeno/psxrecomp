@@ -1,5 +1,6 @@
 #include "cpu_state.h"
 #include "interrupts.h"
+#include "overlay_api.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -20,8 +21,23 @@ static const uint32_t kCop2Pc = 0x80012000u;
 static const uint32_t kNclipInsn = 0x4A000006u;
 static const uint32_t kStaleMac0 = 0x13579BDFu;
 static const uint32_t kExpectedMac0 = 19u;
+static const uint32_t kField5Swc2Pc = 0x80076858u;
+static const uint32_t kField5Swc2Insn = 0xE8590000u;
+static const uint32_t kField5CallPc = 0x800769C8u;
+static const uint32_t kField5CallInsn = 0x0C0129EFu;
+static const uint32_t kField5ReadPc = 0x800769E4u;
+static const uint32_t kField5ReadInsn = 0x8C630100u;
+static const uint32_t kField5BucketPc = 0x800769ECu;
+static const uint32_t kField5BucketInsn = 0x00621007u;
+static const uint32_t kField5WritePc = 0x80076A08u;
+static const uint32_t kField5WriteInsn = 0xAE040020u;
+static const uint32_t kModelPostSwc2Pc = 0x8004A1ACu;
+static const uint32_t kModelPostSwc2Insn = 0xE8B60000u;
+static const uint32_t kSourcePreHook = PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE;
+static const uint32_t kSourceCommitHook = PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT;
 
-static uint8_t s_ram[2u * 1024u * 1024u];
+uint8_t g_irq_cop2_test_ram[2u * 1024u * 1024u];
+#define s_ram g_irq_cop2_test_ram
 static uint32_t s_handler_epc;
 static uint32_t s_handler_gte_issue_count;
 static uint32_t s_bios_saved_epc;
@@ -29,6 +45,19 @@ static uint32_t s_gte_issue_count;
 static uint64_t s_gte_issue_cycle;
 static uint64_t s_handler_gte_deadline;
 static uint32_t s_handler_cause;
+
+extern uint32_t g_xg_render_auth_cold_hook_count;
+extern uint32_t g_xg_render_auth_cold_hook_kind;
+extern uint32_t g_xg_render_auth_cold_hook_pc;
+extern uint32_t g_xg_render_auth_cold_hook_words[8];
+extern uint32_t g_xg_render_auth_cold_hook_delays[8];
+extern uint32_t g_xg_render_auth_cold_hook_kinds[8];
+extern uint32_t g_xg_render_auth_cold_hook_pcs[8];
+extern uint32_t g_xg_render_auth_source_operations[8];
+extern uint32_t g_xg_render_auth_source_widths[8];
+extern uint32_t g_xg_render_native_cutover_post_pc;
+extern uint32_t g_xg_render_native_cutover_call_count;
+extern uint32_t g_xg_render_native_cutover_observed_word;
 
 uint64_t g_irq_cop2_test_device_edge_cycle = UINT64_MAX;
 uint32_t g_irq_cop2_test_device_edge_bit;
@@ -143,6 +172,237 @@ static void prepare_irq_case(CPUState *cpu) {
     cpu->pc = kCop2Pc;
 }
 
+static int test_compiled_return_emits_auth_hook(void) {
+    CPUState cpu = {0};
+    uint32_t next_pc = 0;
+
+    g_xg_render_auth_cold_hook_count = 0u;
+    g_xg_render_auth_cold_hook_kind = 0u;
+    g_xg_render_auth_cold_hook_pc = 0u;
+    (void)psx_check_interrupts_at(&cpu, kCop2Pc + 8u);
+    cpu.pc = 0x80001234u;
+
+    if (dirty_ram_finish_call_return(&cpu, kCop2Pc + 8u, &next_pc) != 0) {
+        fprintf(stderr, "HARNESS FAIL: compiled return seam reported failure\n");
+        return 0;
+    }
+    if (g_xg_render_auth_cold_hook_count != 1u ||
+        g_xg_render_auth_cold_hook_kind != PSX_XG_RENDER_AUTH_HOOK_RETURN ||
+        g_xg_render_auth_cold_hook_pc != kCop2Pc + 8u ||
+        next_pc != kCop2Pc + 8u || cpu.pc != 0x80001234u) {
+        fprintf(stderr,
+                "FAIL: return hook count=%u kind=%u pc=%08X next=%08X cpu=%08X\n",
+                g_xg_render_auth_cold_hook_count,
+                g_xg_render_auth_cold_hook_kind,
+                g_xg_render_auth_cold_hook_pc,
+                next_pc,
+                cpu.pc);
+        return 0;
+    }
+    return 1;
+}
+
+static void reset_source_observations(void) {
+    g_xg_render_auth_cold_hook_count = 0u;
+    memset(g_xg_render_auth_cold_hook_words, 0,
+           sizeof(g_xg_render_auth_cold_hook_words));
+    memset(g_xg_render_auth_cold_hook_delays, 0,
+           sizeof(g_xg_render_auth_cold_hook_delays));
+    memset(g_xg_render_auth_cold_hook_kinds, 0,
+           sizeof(g_xg_render_auth_cold_hook_kinds));
+    memset(g_xg_render_auth_cold_hook_pcs, 0,
+           sizeof(g_xg_render_auth_cold_hook_pcs));
+    memset(g_xg_render_auth_source_operations, 0,
+           sizeof(g_xg_render_auth_source_operations));
+    memset(g_xg_render_auth_source_widths, 0,
+           sizeof(g_xg_render_auth_source_widths));
+}
+
+static void prepare_source_cpu(CPUState *cpu) {
+    memset(cpu, 0, sizeof(*cpu));
+    g_psx_ram = s_ram;
+    cpu->read_word = test_read_word;
+    cpu->write_word = test_write_word;
+    cpu->read_half = test_read_half;
+    cpu->write_half = test_write_half;
+    cpu->read_byte = test_read_byte;
+    cpu->write_byte = test_write_byte;
+}
+
+static int test_field5_operations_emit_exact_source_observation_pairs(void) {
+    CPUState cpu = {0};
+    uint32_t next_pc = 0u;
+    const uint32_t read_address = 0x80010100u;
+    const uint32_t write_address = 0x80010220u;
+    const uint32_t swc2_address = 0x80010300u;
+    const uint32_t bucket_result = 0xC0000000u;
+
+    memset(s_ram, 0, sizeof(s_ram));
+    prepare_source_cpu(&cpu);
+    reset_source_observations();
+
+    cpu.gpr[3] = 0x80010000u;
+    test_write_word(read_address, 0x80020000u);
+    if (exec_one_fetched_observed(&cpu, kField5ReadPc & 0x1fffffffu,
+                                  kField5ReadInsn, &next_pc) != 0 ||
+        cpu.gpr[3] != 0x80020000u) {
+        fprintf(stderr, "HARNESS FAIL: selected read did not execute\n");
+        return 0;
+    }
+
+    cpu.gpr[16] = 0x80010200u;
+    cpu.gpr[4] = 0x12345678u;
+    if (exec_one_fetched_observed(&cpu, kField5WritePc, kField5WriteInsn,
+                                  &next_pc) != 0 ||
+        test_read_word(write_address) != 0x12345678u) {
+        fprintf(stderr, "HARNESS FAIL: selected write did not execute\n");
+        return 0;
+    }
+
+    cpu.gpr[2] = swc2_address;
+    cpu.gte_data[25] = 0x11223344u;
+    if (exec_one_fetched_observed(&cpu, kField5Swc2Pc, kField5Swc2Insn,
+                                  &next_pc) != 0 ||
+        test_read_word(swc2_address) != gte_read_data(&cpu, 25u)) {
+        fprintf(stderr, "HARNESS FAIL: selected SWC2 did not execute\n");
+        return 0;
+    }
+
+    cpu.gpr[2] = 0x80000000u;
+    cpu.gpr[3] = 1u;
+    if (exec_one_fetched_observed(&cpu, kField5BucketPc, kField5BucketInsn,
+                                  &next_pc) != 0 || cpu.gpr[2] != bucket_result) {
+        fprintf(stderr, "HARNESS FAIL: selected bucket instruction did not execute\n");
+        return 0;
+    }
+
+    if (exec_one_fetched_observed(&cpu, kField5ReadPc + 0x100u,
+                                  kField5ReadInsn, &next_pc) != 0) {
+        fprintf(stderr, "HARNESS FAIL: foreign read did not execute\n");
+        return 0;
+    }
+
+    const uint32_t expected_pcs[] = {
+        kField5ReadPc, kField5ReadPc,
+        kField5WritePc, kField5WritePc,
+        kField5Swc2Pc, kField5Swc2Pc,
+        kField5BucketPc, kField5BucketPc,
+    };
+    const uint32_t expected_instructions[] = {
+        kField5ReadInsn, kField5ReadInsn,
+        kField5WriteInsn, kField5WriteInsn,
+        kField5Swc2Insn, kField5Swc2Insn,
+        kField5BucketInsn, kField5BucketInsn,
+    };
+    const uint32_t expected_auxiliaries[] = {
+        read_address, read_address,
+        write_address, write_address,
+        swc2_address, swc2_address,
+        0u, bucket_result,
+    };
+    const uint32_t expected_operations[] = {
+        PSX_XG_RENDER_SOURCE_OPERATION_READ,
+        PSX_XG_RENDER_SOURCE_OPERATION_READ,
+        PSX_XG_RENDER_SOURCE_OPERATION_WRITE,
+        PSX_XG_RENDER_SOURCE_OPERATION_WRITE,
+        PSX_XG_RENDER_SOURCE_OPERATION_SWC2,
+        PSX_XG_RENDER_SOURCE_OPERATION_SWC2,
+        PSX_XG_RENDER_SOURCE_OPERATION_BUCKET,
+        PSX_XG_RENDER_SOURCE_OPERATION_BUCKET,
+    };
+    const uint32_t expected_widths[] = {4u, 4u, 4u, 4u, 4u, 4u, 0u, 0u};
+    if (g_xg_render_auth_cold_hook_count != 8u) {
+        fprintf(stderr, "FAIL: selected operations emitted %u source hooks, expected 8\n",
+                g_xg_render_auth_cold_hook_count);
+        return 0;
+    }
+    for (uint32_t index = 0u; index < 8u; ++index) {
+        const uint32_t expected_hook =
+            (index & 1u) == 0u ? kSourcePreHook : kSourceCommitHook;
+        if (g_xg_render_auth_cold_hook_kinds[index] != expected_hook ||
+            g_xg_render_auth_cold_hook_pcs[index] != expected_pcs[index] ||
+            g_xg_render_auth_cold_hook_words[index] != expected_instructions[index] ||
+            g_xg_render_auth_cold_hook_delays[index] != expected_auxiliaries[index] ||
+            g_xg_render_auth_source_operations[index] != expected_operations[index] ||
+            g_xg_render_auth_source_widths[index] != expected_widths[index]) {
+            fprintf(stderr, "FAIL: source event %u metadata mismatch\n", index);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int test_field5_call_preserves_pre_capture_delay_commit_order(void) {
+    CPUState cpu = {0};
+    uint32_t next_pc = 0u;
+    const int saved_precise_mode = g_precise_mode;
+
+    prepare_source_cpu(&cpu);
+    reset_source_observations();
+    test_write_word(kField5CallPc + 4u, 0u);
+    g_precise_mode = 1;
+    const int transferred = exec_one_fetched_observed(
+        &cpu, kField5CallPc, kField5CallInsn, &next_pc);
+    g_precise_mode = saved_precise_mode;
+
+    if (transferred != 1 || cpu.gpr[31] != kField5CallPc + 8u ||
+        g_xg_render_auth_cold_hook_count != 3u ||
+        g_xg_render_auth_cold_hook_kinds[0] != kSourcePreHook ||
+        g_xg_render_auth_cold_hook_kinds[1] !=
+            PSX_XG_RENDER_AUTH_HOOK_CAPTURE ||
+        g_xg_render_auth_cold_hook_kinds[2] != kSourceCommitHook ||
+        g_xg_render_auth_cold_hook_pcs[0] != kField5CallPc ||
+        g_xg_render_auth_cold_hook_pcs[1] != kField5CallPc ||
+        g_xg_render_auth_cold_hook_pcs[2] != kField5CallPc ||
+        g_xg_render_auth_cold_hook_delays[0] != 0u ||
+        g_xg_render_auth_cold_hook_delays[2] != 0u ||
+        g_xg_render_auth_source_operations[0] !=
+            PSX_XG_RENDER_SOURCE_OPERATION_CALL ||
+        g_xg_render_auth_source_operations[2] !=
+            PSX_XG_RENDER_SOURCE_OPERATION_CALL) {
+        fprintf(stderr, "FAIL: selected call did not preserve PRE/capture/delay/COMMIT ordering\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int test_observe_after_sees_store_and_skips_lockstep_replay(void) {
+    CPUState cpu = {0};
+    uint32_t next_pc = 0u;
+    const uint32_t packet_word = 0x80010400u;
+
+    memset(s_ram, 0, sizeof(s_ram));
+    prepare_source_cpu(&cpu);
+    cpu.gpr[5] = packet_word;
+    cpu.gte_data[22] = UINT32_C(0x11223344);
+    g_xg_render_native_cutover_post_pc = kModelPostSwc2Pc;
+    g_xg_render_native_cutover_call_count = 0u;
+    g_xg_render_native_cutover_observed_word = 0u;
+    if (exec_one_fetched_observed(
+            &cpu, kModelPostSwc2Pc, kModelPostSwc2Insn, &next_pc) != 0 ||
+        test_read_word(packet_word) != UINT32_C(0x11223344) ||
+        g_xg_render_native_cutover_call_count != 1u ||
+        g_xg_render_native_cutover_observed_word != UINT32_C(0x11223344)) {
+        fprintf(stderr, "FAIL: observe-after did not see the committed SWC2 store\n");
+        return 0;
+    }
+
+    test_write_word(kModelPostSwc2Pc, kModelPostSwc2Insn);
+    test_write_word(packet_word, 0u);
+    cpu.gte_data[22] = UINT32_C(0x55667788);
+    g_ls_replay_active = 1;
+    const int replay_result = exec_one(&cpu, kModelPostSwc2Pc, &next_pc);
+    g_ls_replay_active = 0;
+    if (replay_result != 0 ||
+        test_read_word(packet_word) != UINT32_C(0x55667788) ||
+        g_xg_render_native_cutover_call_count != 1u) {
+        fprintf(stderr, "FAIL: lockstep replay repeated observe-after\n");
+        return 0;
+    }
+    g_xg_render_native_cutover_post_pc = 0u;
+    return 1;
+}
+
 int main(void) {
     /* Given: NCLIP inputs with determinant 19 and a distinct stale MAC0. */
     CPUState control = {0};
@@ -184,6 +444,11 @@ int main(void) {
                 (unsigned long long)s_handler_gte_deadline);
         return 1;
     }
+
+    if (!test_compiled_return_emits_auth_hook()) return 1;
+    if (!test_field5_operations_emit_exact_source_observation_pairs()) return 1;
+    if (!test_field5_call_preserves_pre_capture_delay_commit_order()) return 1;
+    if (!test_observe_after_sees_store_and_skips_lockstep_replay()) return 1;
 
     prepare_irq_case(&cpu);
     int fell_through = 0;

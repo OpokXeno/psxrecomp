@@ -19,12 +19,14 @@ extern "C" int overlay_capture_test_provider_pending(void);
 
 extern "C" {
 uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS]{};
+uint32_t g_dirty_ram_exec_pc_counts[DIRTY_RAM_EXEC_WORD_COUNT]{};
 uint32_t g_dirty_ram_dispatch_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS]{};
 uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS]{};
 uint64_t g_dirty_ram_insns_run = 0;
 uint64_t g_dirty_window_dispatches = 0;
 uint64_t s_frame_count = 0;
 uint32_t g_overlay_region_floor = 0x00010000u;
+uint32_t g_render_auth_dma_count = 0;
 }
 
 namespace {
@@ -108,8 +110,16 @@ extern "C" uint32_t dirty_ram_get_bitmap_word(uint32_t index) {
 }
 extern "C" int cdrom_load_in_progress(void) { return 0; }
 extern "C" int fntrace_is_game_started(void) { return 1; }
+extern "C" void psx_xenogears_field_resident_dma(uint32_t, uint32_t) {}
+extern "C" void psx_xg_render_auth_note_code_write(
+    uint64_t previous_generation, uint64_t current_generation,
+    uint32_t address, uint32_t size) {
+    if (previous_generation == 0u && current_generation == 1u &&
+        address == 0x10000u && size == 4u)
+        ++g_render_auth_dma_count;
+}
 extern "C" void overlay_loader_check_cache(uint32_t, uint32_t,
-                                             const uint8_t *) {}
+                                              const uint8_t *) {}
 extern "C" int overlay_loader_registered_count(void) { return 0; }
 extern "C" const CodeProvider *code_provider_active(void) { return &kProvider; }
 extern "C" uint32_t crc32_compute(const uint8_t *data, size_t size) {
@@ -129,14 +139,22 @@ int main() {
         ("psxrecomp-capture-retry-" + std::to_string(
             static_cast<unsigned long long>(SDL_GetPerformanceCounter())));
     const auto capture = root / "overlay_captures.json";
+    const auto private_snapshot = root / "load-time-ram.bin";
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
+
+    SDL_setenv("PSX_OVERLAY_CAPTURE_REPLAY", "1", 1);
+    SDL_setenv("PSX_OVERLAY_PRIVATE_EXEC_PC", "0x80010000", 1);
+    SDL_setenv("PSX_OVERLAY_PRIVATE_EXEC_SNAPSHOT",
+               private_snapshot.string().c_str(), 1);
 
     overlay_capture_set_path(capture.string().c_str());
     overlay_capture_set_enabled(1);
     overlay_autocapture_set_enabled(1);
     g_ram[0x10000] = 0x11;
     overlay_capture_on_dma(0x10000u, 4u, &g_ram[0x10000]);
+    if (g_render_auth_dma_count != 1u)
+        return fail("DMA code mutation was not forwarded to render auth", root);
     set_exec(0x10000u);
     g_dirty_window_dispatches = 128u;
     g_dirty_ram_insns_run = 100000u;
@@ -152,6 +170,14 @@ int main() {
      * the immutable old snapshot. */
     set_exec(0x10004u);
     std::filesystem::create_directories(root);
+    g_ram[0x10000] = 0x22;
+    overlay_capture_private_note_execution(0x80010000u);
+    {
+        std::ifstream snapshot(private_snapshot, std::ios::binary);
+        snapshot.seekg(0x10000);
+        if (snapshot.get() != 0x11)
+            return fail("private replay snapshot did not retain load-time RAM", root);
+    }
     s_frame_count = 1000u;
     overlay_autocapture_tick();
     if (!wait_for_provider_pending())

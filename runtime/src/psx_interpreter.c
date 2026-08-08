@@ -384,7 +384,8 @@ static void exec_one(CPUState* cpu) {
         default:
             if (cop_op & 0x10) {
                 /* COP2 command */
-                gte_execute(cpu, insn & 0x1FFFFFFu);
+                gte_execute_at_tier(cpu, insn & 0x1FFFFFFu, pc,
+                                    GTE_ATTRIBUTION_TIER_COLD);
             } else {
                 fprintf(stderr, "INTERP: unknown COP2 op 0x%02X at PC=0x%08X\n", cop_op, pc);
             }

@@ -7,7 +7,13 @@
 #ifndef PSXRECOMP_GPU_H
 #define PSXRECOMP_GPU_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include "gpu_render_oracle.h"
+#include "guest_render_transaction.h"
+#include "ws_cull_policy.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,7 +24,41 @@ uint32_t gpu_read_gpustat(void);   /* 0x1F801814 read */
 uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
 void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */
-void     gpu_set_gp0_source(uint32_t addr); /* diagnostic source for next GP0 word */
+void     gpu_set_submission_hook(void (*hook)(void));
+void     gpu_prepare_submission(void);
+int      gpu_gp0_command_word_count(uint8_t opcode);
+bool     gpu_gp0_parser_is_idle(void);
+uint64_t gpu_render_vram_mutation_serial(void);
+bool     gpu_render_vram_mutation_overflowed(void);
+bool gpu_render_material_capture_begin(void);
+bool gpu_render_material_capture_end(GpuRenderMaterial *out_material,
+                                     bool *out_observed);
+bool gpu_render_transaction_checkpoint_begin(
+    GpuRenderTransactionId visual_id, uint64_t vram_mutation_serial,
+    void *user_data);
+bool gpu_render_transaction_checkpoint_rollback(
+    GpuRenderTransactionId visual_id, uint64_t vram_mutation_serial,
+    void *user_data);
+bool gpu_render_transaction_checkpoint_commit(
+    GpuRenderTransactionId visual_id, uint64_t vram_mutation_serial,
+    void *user_data);
+/* Returns false without performing the observation when transaction recovery
+ * cannot be completed. On true, the caller performs its operation once. */
+bool gpu_render_transaction_observation_guard(
+    GuestRenderTransactionObservationReason reason);
+typedef struct {
+    GpuRenderOracleSourceKind kind;
+    uint32_t word_address;
+    uint64_t word_ordinal;
+    uint64_t container_ordinal;
+} GpuRenderOracleSource;
+#define GPU_RENDER_ORACLE_SOURCE_CONTRACT 1
+void     gpu_set_gp0_source(const GpuRenderOracleSource *source);
+GpuRenderOracleResult gpu_render_oracle_capture_begin(void);
+GpuRenderOracleResult gpu_render_oracle_capture_end(void);
+GpuRenderOracleResult gpu_render_oracle_capture_snapshot(GpuRenderOracleSnapshot *out);
+GpuRenderOracleResult gpu_render_oracle_capture_read_event(uint64_t index,
+                                                            GpuRenderOracleEvent *out);
 void     gpu_vblank_tick(void);        /* Toggle LCF, called at each simulated vblank */
 
 /* Display presentation accessors (Phase 3). */
@@ -52,6 +92,7 @@ int      gpu_depth24_present_hold_tick(void);
 void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
                         uint32_t *hres1_out, uint32_t *hres2_out);
 uint64_t gpu_get_gp0_count(void);  /* Total GP0 writes since init */
+uint64_t gpu_get_gp1_count(void);
 void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw, uint64_t* env, uint64_t* copy);
 
 typedef struct {
@@ -59,7 +100,82 @@ typedef struct {
     int32_t offset_x, offset_y;
 } GpuDrawArea;
 void gpu_get_draw_area(GpuDrawArea* out);
+typedef struct {
+    uint16_t left, top, right, bottom;
+    int16_t offset_x, offset_y;
+    uint8_t texture_window_mask_x, texture_window_mask_y;
+    uint8_t texture_window_offset_x, texture_window_offset_y;
+    uint8_t dither, mask_set, mask_check;
+} GpuDrawState;
+void gpu_get_draw_state(GpuDrawState* out);
 uint16_t gpu_vram_peek(int x, int y);
+
+typedef struct {
+    GpuDrawState draw;
+    uint16_t tpage;
+} GpuNativeDrawEnvironment;
+
+/* Build the backend-neutral semantic equivalent of one complete GP0 draw
+ * packet without mutating GPU state. Return 1 for a supported draw, 0 for a
+ * non-draw command, and -1 for a draw class that cannot be represented by the
+ * semantic triangle IR. */
+int gpu_native_semantic_from_gp0(const uint32_t *words, int word_count,
+                                 const GpuNativeDrawEnvironment *environment,
+                                 GpuRenderSemantic *out);
+/* Build the backend-neutral semantic equivalent of one complete GP0 line or
+ * polyline packet without mutating GPU state. */
+int gpu_native_line_semantic_from_gp0(
+    const uint32_t *words, size_t word_count,
+    const GpuNativeDrawEnvironment *environment, GpuRenderSemantic *out);
+void gpu_native_environment_get(GpuNativeDrawEnvironment *out);
+void gpu_native_environment_apply(const uint32_t *words, int word_count,
+                                  GpuNativeDrawEnvironment *environment);
+/* Execute one complete packet through the producer-first OpenGL Native path.
+ * This updates GPU environment/transfer state but never enters gpu_write_gp0()
+ * or the canonical GP0 command parser. A non-NULL bound semantic is preferred;
+ * NULL translates a supported unbound draw directly from its packet. Native
+ * draw submission fails closed unless OpenGL is the effective backend. */
+int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
+                                 const GpuRenderSemantic *bound_semantic,
+                                 const GpuRenderOracleSource *source);
+int gpu_native_preflight_gp0_packet(const uint32_t *words, size_t word_count,
+                                    const GpuRenderOracleSource *source);
+int gpu_native_submit_gp0_word(uint32_t word,
+                               const GpuRenderOracleSource *source);
+void gpu_native_packet_stream_reset(void);
+typedef struct GpuNativePacketStreamSnapshot {
+    GpuRenderOracleSource source;
+    size_t count;
+    size_t expected;
+    uint8_t opcode;
+    bool active;
+    uint8_t reservation_phase;
+    uint8_t reservation_consume_status;
+    size_t reservation_count;
+    size_t reservation_consumed;
+    uint64_t reserved_command_id;
+    uint64_t actual_command_id;
+    uint64_t reserved_container_id;
+    uint64_t actual_container_id;
+    size_t reserved_word_count;
+    size_t actual_word_count;
+    uint64_t reserved_packet_hash;
+    uint64_t actual_packet_hash;
+    uint8_t reserved_source_kind;
+    uint8_t actual_source_kind;
+    uint8_t reserved_opcode;
+    uint8_t actual_opcode;
+    size_t stream_reserve_candidates;
+    size_t stream_reserve_active;
+    size_t stream_reserve_available;
+    GpuRenderTransactionId stream_reserve_visual_id;
+} GpuNativePacketStreamSnapshot;
+int gpu_native_packet_stream_snapshot(GpuNativePacketStreamSnapshot *out);
+int gpu_native_preflight_pending_gp0_words(const uint32_t *words,
+                                           size_t word_count);
+int gpu_native_preflight_reservation_begin(void);
+int gpu_native_preflight_reservation_seal(void);
+void gpu_native_preflight_reservation_abort(void);
 
 /* Shaded quad vertex capture (Phase 4.5 debug). */
 typedef struct {
@@ -86,6 +202,20 @@ typedef struct {
     uint8_t  n_words;       /* total command length; >MAX means truncated */
     uint16_t pad;
     uint32_t cmd[GPU_GP0_RING_MAX_WORDS];
+    /* Effective draw environment for the packet. The environment is sampled
+     * before the command executes; for draw packets this is the exact state
+     * consumed by the rasterizer. Packet-local CLUT/tpage attributes and
+     * primitive flags are stored alongside the global draw state. */
+    struct {
+        GpuRenderOracleDrawState draw;
+        uint16_t tpage;
+        uint16_t clut_x;
+        uint16_t clut_y;
+        uint8_t textured;
+        uint8_t raw_texture;
+        uint8_t semi_transparent;
+        uint8_t shading;
+    } env;
     /* Builder attribution (populated only for VRAM->VRAM copies, op 0x80):
      * bounded guest-stack unwind of validated return addresses, innermost
      * first. Lets a caller skip the libgpu funnel band and name the game-level
@@ -159,8 +289,14 @@ int  ws_nw_extra(void);
  * pixel-native. The present path uses the same predicate to pillarbox. */
 int  gpu_ws_present_native_43(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
- * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
+ * cull immediates by the recompiler ([widescreen.cull]); native rendering can
+ * enable this without enabling the legacy GTE/compositor widescreen mode. */
 int  psx_ws_x_margin(void);
+/* Configure only the upstream game culling view for the producer-driven
+ * Native renderer. This deliberately does not change gpu_ws_configure(), the
+ * GTE projection, or the legacy wide compositor. */
+void gpu_ws_configure_native_cull(int enabled, int aspect_num, int aspect_den,
+                                  int canonical_width, int canonical_height);
 void gpu_ws_set_cull_guard_pixels(int pixels);
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
                                     const uint32_t *slti, int nslti,
@@ -170,6 +306,9 @@ void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_plane_nx_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
+void gpu_ws_set_semantic_cull_sites(const uint32_t *addresses,
+                                    const uint8_t *semantics, int count);
+PsxWsCullSemantic psx_ws_semantic_cull_site(uint32_t pc);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
 int  psx_ws_is_cull_negsub_site(uint32_t pc);
@@ -232,6 +371,7 @@ void gpu_ws_begin_linked_list(void);
  * gradient / backdrop image) to fill the wide frame, so it no longer
  * pillarboxes at the reveal margins. Runtime-only. Off by default. */
 void gpu_ws_set_nw_backdrop(int on);
+int  gpu_ws_nw_backdrop_enabled(void);
 /* Native-wide flat-polygon backdrop stretch ([widescreen] nw_flat_backdrop):
  * stretch untextured primitives in the wide mirror without changing the
  * canonical 4:3 framebuffer. Intended for flat-colour sky/water backdrops. */
@@ -242,9 +382,10 @@ void gpu_ws_set_nw_phase_backdrop(int on);
 
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the
- * widescreen squash; the recompiler emits this on each backdrop handler's
- * final screenX store to squash it around the screen centre (identity at 4:3).
- * Pulls far backdrop pieces in from past the 320px edge to cover the 16:9 FOV. */
+ * widescreen projection; the recompiler emits this on each backdrop handler's
+ * final screenX store to transform it around the screen centre (identity at
+ * 4:3). The helper supports both the legacy wide compositor and the
+ * independent Native view. */
 int  psx_ws_backdrop_x(int x);
 
 /* Backdrop PRELOAD ([widescreen.cull] auto_backdrop). psx_ws_backdrop_preload()
@@ -331,6 +472,13 @@ void gpu_ws_set_nw_hud_tag_rects(int on);
 int      gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path);
 void     gpu_ws_census_set(int on);
 uint64_t gpu_ws_census_seq(void);
+
+#ifdef GPU_RENDER_TRANSACTION_TESTING
+uint32_t gpu_render_transaction_test_opcode_count(uint8_t opcode);
+uint32_t gpu_render_transaction_test_gpustat_poll_count(void);
+void gpu_render_transaction_test_source(GpuRenderOracleSource *out);
+bool gpu_render_transaction_test_checkpoint_open(void);
+#endif
 
 #ifdef __cplusplus
 }

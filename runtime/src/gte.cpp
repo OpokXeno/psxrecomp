@@ -1,5 +1,6 @@
 #include "gte.h"
 #include "cpu_state.h"
+#include "gte_attribution.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -1502,10 +1503,12 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
 } // namespace PSXRecomp
 
 // ---------------------------------------------------------------------------
-// gte_execute — C-linkage bridge called from generated code
+// GTE execution bridges
 // ---------------------------------------------------------------------------
 static uint64_t s_gte_exec_count = 0;
-extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
+extern "C" uint64_t gte_get_exec_count(void) {
+    return s_gte_exec_count;
+}
 static uint32_t s_gte_replay_saved_caller_ra = 0;
 extern "C" int gte_replay_side_effects_begin(void) {
     using namespace PSXRecomp::GTE;
@@ -1710,12 +1713,24 @@ static void gte_run_command(PSXRecomp::GTE::GTEState* gte, uint32_t cmd) {
     }
 }
 
-extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
+static void gte_execute_impl(CPUState* cpu, uint32_t cmd,
+                             bool guest_pc_known, uint32_t guest_pc,
+                             GteAttributionExecutionTier tier) {
     using namespace PSXRecomp::GTE;
-#ifndef PSX_NO_DEBUG_TOOLS
-    if (!s_gte_replay_sandbox) s_gte_exec_count++;
+    if (!s_gte_replay_sandbox) {
+        ++s_gte_exec_count;
+        if (g_gte_attribution_enabled) {
+            GteAttributionSite site = {};
+            site.guest_pc_known = guest_pc_known;
+            site.guest_pc = guest_pc_known ? guest_pc : 0u;
+            site.caller_known = cpu->gpr[31] != 0u;
+            site.caller = cpu->gpr[31];
+            site.command = cmd;
+            site.command_known = true;
+            (void)gte_attribution_record_execute_in_tier(&site, tier);
+        }
+    }
     s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
-#endif
 
     GTEState gte;
     gte_import_cpu_state(&gte, cpu);
@@ -1749,10 +1764,24 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     /* Faithful GTE command completion-stall: arm the per-command deadline
      * (serializing back-to-back ops). Any later COP2 register access stalls to
-     * it. Single shared site for BOTH backends (compiled + dirty interp both
-     * route GTE commands through gte_execute). */
+     * it. Single shared site for every execution backend. */
     psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
 #endif
+}
+
+extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
+    gte_execute_impl(cpu, cmd, false, 0u, GTE_ATTRIBUTION_TIER_UNKNOWN);
+}
+
+extern "C" void gte_execute_at(CPUState* cpu, uint32_t cmd,
+                                uint32_t guest_pc) {
+    gte_execute_impl(cpu, cmd, true, guest_pc, GTE_ATTRIBUTION_TIER_STATIC);
+}
+
+extern "C" void gte_execute_at_tier(CPUState* cpu, uint32_t cmd,
+                                     uint32_t guest_pc,
+                                     GteAttributionExecutionTier tier) {
+    gte_execute_impl(cpu, cmd, true, guest_pc, tier);
 }
 
 #ifdef PSX_GTE_REGISTER_TEST

@@ -110,6 +110,11 @@ uint8_t  sio_peek_rx_data(void);
 int sio_get_pad_connected(int slot);
 int sio_get_pad_analog(int slot);
 void sio_get_pad_sticks(int slot, uint8_t out[4]);
+typedef struct {
+    uint64_t polls;
+    uint8_t slot, id, ack, buttons_low, buttons_high, analog;
+} SioPadReceipt;
+void sio_get_pad_receipt(SioPadReceipt *out);
 
 /* ---- SIO byte-level trace ring buffer ----
  * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */

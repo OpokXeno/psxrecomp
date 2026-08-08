@@ -60,9 +60,9 @@ void psx_advance_cycles(uint32_t cycles) {
     if (cycles > UINT32_MAX - s_pending_cycles) overlay_flush_cycles();
     s_pending_cycles += cycles;
 }
-void gte_execute(CPUState *cpu, uint32_t cmd) {
+void gte_execute_at(CPUState *cpu, uint32_t cmd, uint32_t guest_pc) {
     overlay_flush_cycles();
-    g_cbs.gte_execute(cpu, cmd);
+    g_cbs.gte_execute_at(cpu, cmd, guest_pc);
 }
 int psx_syscall(CPUState *cpu, uint32_t code) {
     overlay_flush_cycles();
@@ -210,6 +210,42 @@ int psx_ws_cull_vxrange(uint32_t x, uint32_t imm) {
     return (((x + (uint32_t)margin) & 0xFFFFu) <
             (bound + 2u * (uint32_t)margin)) ? 1 : 0;
 }
+int32_t psx_ws_depth_bound(int32_t imm);
+uint32_t psx_ws_xclip_bound(uint32_t vanilla);
+/* Semantic guest-cull helpers. Overlay shards carry the same semantic
+ * classification as the static emitter, while this preamble supplies the
+ * host-independent implementation and ABI forwards. */
+uint32_t psx_ws_guest_cull_screen_bias(uint32_t value, int32_t immediate) {
+    return value + (uint32_t)immediate + (uint32_t)psx_ws_x_margin();
+}
+int psx_ws_guest_cull_world_range(uint32_t value, int32_t immediate) {
+    return value < (uint32_t)((int64_t)immediate +
+                              2 * (int64_t)psx_ws_x_margin());
+}
+uint32_t psx_ws_guest_cull_left_edge(uint32_t bound) {
+    return 0u - bound - (uint32_t)psx_ws_x_margin();
+}
+int psx_ws_guest_cull_masked_screen_x(uint32_t x, uint32_t bound_word) {
+    const uint32_t margin = (uint32_t)psx_ws_x_margin();
+    const uint32_t bound =
+        (uint32_t)(int32_t)(int16_t)(uint16_t)bound_word;
+    return (((x + margin) & 0xFFFFu) < bound + 2u * margin) ? 1 : 0;
+}
+int32_t psx_ws_guest_cull_frustum_plane_x(int32_t nx) {
+    return g_cbs.ws_plane_nx ? g_cbs.ws_plane_nx(nx) : nx;
+}
+int psx_ws_guest_cull_signed_screen_x(int32_t value, int32_t immediate) {
+    return value < immediate + psx_ws_x_margin();
+}
+int psx_ws_guest_cull_depth_signed(int32_t value, int32_t immediate) {
+    return value < psx_ws_depth_bound(immediate);
+}
+int psx_ws_guest_cull_depth_unsigned(uint32_t value, int32_t immediate) {
+    return value < (uint32_t)psx_ws_depth_bound(immediate);
+}
+uint32_t psx_ws_guest_cull_xclip_bound(uint32_t vanilla) {
+    return psx_ws_xclip_bound(vanilla);
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
@@ -246,5 +282,23 @@ uint32_t psx_ws_xclip_bound(uint32_t vanilla) {
  * behavior is unaffected). */
 void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
+}
+int32_t psx_xenogears_field_frame_step(uint32_t site_pc, uint32_t instruction_word,
+                                        int32_t original_step, uint32_t frame_token,
+                                        uint32_t tier) {
+    overlay_flush_cycles();
+    return g_cbs.xg_field_frame_step
+        ? g_cbs.xg_field_frame_step(site_pc, instruction_word, original_step, frame_token, tier)
+        : original_step;
+}
+void psx_xg_render_auth(CPUState *cpu, uint32_t hook, uint32_t pc,
+                        uint32_t instruction_word, uint32_t delay_slot_word) {
+    if (g_cbs.xg_render_auth)
+        g_cbs.xg_render_auth(cpu, hook, pc, instruction_word, delay_slot_word);
+}
+bool psx_xg_render_native_ft4_bypass(CPUState *cpu, uint32_t pc,
+                                      uint32_t instruction_word) {
+    return g_cbs.xg_render_native_ft4_bypass &&
+           g_cbs.xg_render_native_ft4_bypass(cpu, pc, instruction_word);
 }
 /* ----------------------------------------------------------------------- */

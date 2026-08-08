@@ -18,12 +18,16 @@
 # overlay-cache hazard (same class as the "ws emission not in cg hash" gap).
 set(PSXRECOMP_CODEGEN_HASH_SRCS
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/code_generator.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/include/code_generator.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/mips_decoder.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/control_flow.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/basic_block.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_analysis.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/recompiler_patch.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/recompiler_patch.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/source_observation_plan.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/include/source_observation_plan.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/main_psx.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.cpp

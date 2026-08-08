@@ -82,6 +82,41 @@ typedef struct DMATraceEntry {
 #define DMA_CDROM_HISTORY_CAP (1 << 13)
 #define DMA_CDROM_HISTORY_WORDS 16
 
+/* Read-only ordering-table census. Each linked-list execution records the
+ * exact head and every node before the node's GP0 words are submitted. The
+ * GPU ring supplies the command payloads keyed by their source addresses. */
+#define DMA_OT_TRACE_LIST_CAP (1u << 12)
+#define DMA_OT_TRACE_NODE_CAP (1u << 17)
+
+typedef enum DMAOtTraceMode {
+    DMA_OT_TRACE_ORIGINAL = 0,
+    DMA_OT_TRACE_JOURNAL = 1,
+} DMAOtTraceMode;
+
+typedef struct DMAOtTraceList {
+    uint64_t seq;
+    uint32_t frame;
+    uint32_t start_addr;
+    uint64_t node_start_seq;
+    uint32_t node_count;
+    uint32_t actual_words;
+    uint32_t func;
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t mode;
+    uint32_t status;
+} DMAOtTraceList;
+
+typedef struct DMAOtTraceNode {
+    uint64_t seq;
+    uint64_t list_seq;
+    uint32_t frame;
+    uint32_t node_addr;
+    uint32_t next_node_addr;
+    uint32_t packet_words;
+    uint32_t final_ordinal;
+} DMAOtTraceNode;
+
 typedef struct DMACDROMHistoryEntry {
     uint64_t seq;
     uint32_t frame_start;
@@ -118,6 +153,11 @@ void dma_debug_clear_trace(void);
 void dma_debug_get_state(DMADebugState* out);
 uint64_t dma_debug_get_cdrom_history(const DMACDROMHistoryEntry** out_entries);
 void dma_debug_clear_cdrom_history(void);
+uint64_t dma_debug_get_ot_list_total(void);
+uint64_t dma_debug_get_ot_node_total(void);
+int dma_debug_get_ot_list(uint64_t seq, DMAOtTraceList *out);
+int dma_debug_get_ot_node(uint64_t seq, DMAOtTraceNode *out);
+void dma_debug_clear_ot_trace(void);
 
 #ifdef __cplusplus
 }

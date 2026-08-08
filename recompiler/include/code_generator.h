@@ -13,6 +13,7 @@
 #include "control_flow.h"
 #include "../src/annotations.hpp"
 #include "../src/config_loader.h"
+#include "../../runtime/include/ws_cull_policy.h"
 
 namespace PSXRecompV4 { class BiosAddressModel; }
 
@@ -36,6 +37,48 @@ struct CPUState {
 
 // Code generation configuration
 struct CodeGenConfig {
+    enum class SourceObservationOperation : uint8_t {
+        Read,
+        Write,
+        Swc2,
+        Call,
+        Bucket,
+    };
+    enum class SourceObservationAuxiliary : uint8_t {
+        EffectiveAddress,
+        None,
+        ResultRegister,
+    };
+    struct SourceObservationSite {
+        uint32_t pc;
+        uint32_t instruction;
+        SourceObservationOperation operation;
+        uint8_t width;
+        SourceObservationAuxiliary auxiliary;
+    };
+    enum class NativeCutoverTransfer : uint8_t {
+        Local,
+        Observe,
+        ObserveAfter,
+        Return,
+    };
+    struct NativeCutoverSite {
+        uint32_t pc;
+        uint32_t instruction;
+        NativeCutoverTransfer transfer;
+        uint32_t continuation;
+    };
+    enum class RenderLifecycleRole : uint8_t {
+        Entry,
+        Capture,
+        Return,
+    };
+    struct RenderLifecycleSite {
+        uint32_t pc;
+        uint32_t instruction;
+        RenderLifecycleRole role;
+        uint32_t delay_instruction;
+    };
     bool emit_comments;           // Include MIPS instruction comments
     bool emit_line_numbers;       // Include original address as comments
     bool optimize_zero_reg;       // Optimize away $zero assignments
@@ -131,6 +174,10 @@ struct CodeGenConfig {
     // (INT32_MAX while revealed, vanilla at 4:3); empty by default.
     std::set<uint32_t> ws_cull_xclip_load_sites;
 
+    // Semantic guest visibility policy. Each address is classified once and
+    // emitted through the typed helper shared with the dirty-RAM interpreter.
+    std::map<uint32_t, PsxWsCullSemantic> ws_cull_semantic_sites;
+
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
     // Tomba signature; Ape Escape uses 0x181 (+ 0xF1 height).
@@ -184,6 +231,9 @@ struct CodeGenConfig {
     // session overrides the default at initialization (issue #5). Identity when
     // nothing is persisted, so a fresh install is byte-identical. Empty=default.
     std::set<uint32_t> persist_init_store_sites;
+    std::vector<SourceObservationSite> source_observation_sites;
+    std::vector<NativeCutoverSite> native_cutover_sites;
+    std::vector<RenderLifecycleSite> render_lifecycle_sites;
 
     CodeGenConfig()
         : emit_comments(true)
@@ -325,6 +375,8 @@ private:
     // Continuations (return points) collected during the CURRENT function's
     // block translation; consumed by generate_function to emit the entry-switch.
     std::vector<uint32_t> cps_cur_continuations_;
+    std::set<uint32_t> cps_cur_direct_jal_continuations_;
+    std::set<uint32_t> cps_pass_direct_jal_continuations_;
     // Global map: continuation address -> owning function entry, for the game
     // dispatch table (psx_dispatch_game_compiled) to route a returned-to
     // continuation into its function's entry-switch.
@@ -359,6 +411,7 @@ private:
     // per function alongside ws_auto_cull_func_; generate_branch_condition
     // emits a listed bltz through psx_ws_cull_bltz. Cleared per function.
     std::set<uint32_t> ws_cull_bltz_pcs_;
+    bool xg_static_auth_hooks_active_ = false;
 
     // True iff the function's instruction stream contains both a screen-width
     // reject (`sltiu …,0x140` or `…,0x141`) and a screen-height reject
@@ -379,6 +432,7 @@ private:
     // Populate ws_cull_bltz_pcs_ (LEFT-edge funnel bltz addresses) for the
     // current function; no-op unless ws_auto_cull_func_ is set.
     int detect_cull_bltz_sites(const ControlFlowGraph& cfg);
+    bool static_auth_sites_are_valid() const;
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);

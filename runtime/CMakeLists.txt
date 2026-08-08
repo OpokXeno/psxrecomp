@@ -26,12 +26,7 @@ endif()
 set(PSXRECOMP_ROOT "${CMAKE_SOURCE_DIR}/..")
 include("${CMAKE_SOURCE_DIR}/runtime.cmake")
 
-psxrecomp_add_runtime_target(psx-runtime
-    DEBUG_PORT 4370
-    WINDOW_TITLE "psxrecomp - BIOS"
-    DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
-    EXE_NAME "PSXRecomp"
-)
+include("${CMAKE_CURRENT_LIST_DIR}/runtime_bios_only_targets.cmake")
 
 if(BUILD_TESTING)
     add_executable(launcher_device_roundtrip_test
@@ -52,12 +47,14 @@ if(BUILD_TESTING)
     )
     target_include_directories(psx_icache_fastpath_test PRIVATE include)
     target_compile_definitions(psx_icache_fastpath_test PRIVATE
-        PSX_ENABLE_BLOCK_CYCLES=1)
+        PSX_ENABLE_BLOCK_CYCLES=1
+        PSX_OVERLAY_DLL_BUILD=1)
     add_test(NAME psx_icache_fastpath_test COMMAND psx_icache_fastpath_test)
 
     add_executable(gte_register_access_test
         tests/test_gte_register_access.cpp
         src/gte.cpp
+        src/gte_attribution.cpp
     )
     target_include_directories(gte_register_access_test PRIVATE include)
     target_compile_definitions(gte_register_access_test PRIVATE
@@ -66,11 +63,24 @@ if(BUILD_TESTING)
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
 
+    add_executable(gte_attribution_test
+        tests/test_gte_attribution.cpp
+        src/gte.cpp
+        src/gte_attribution.cpp)
+    target_include_directories(gte_attribution_test PRIVATE include)
+    target_compile_definitions(gte_attribution_test PRIVATE
+        PSX_NO_DEBUG_TOOLS=1
+        GTE_ATTRIBUTION_CONTEXT_CAPACITY=3
+        GTE_ATTRIBUTION_SITE_CAPACITY=4
+        GTE_ATTRIBUTION_COUNTER_MAX=4)
+    add_test(NAME gte_attribution_test COMMAND gte_attribution_test)
+
     add_executable(irq_cop2_boundary_test
         tests/test_irq_cop2_boundary.c
         tests/test_irq_cop2_boundary_stubs.c
         src/interrupts.c
-        src/gte.cpp)
+        src/gte.cpp
+        src/gte_attribution.cpp)
     target_include_directories(irq_cop2_boundary_test PRIVATE include)
     target_compile_definitions(irq_cop2_boundary_test PRIVATE
         PSX_NO_DEBUG_TOOLS=1
@@ -92,6 +102,34 @@ if(BUILD_TESTING)
     add_executable(psx_instr_cost_test tests/test_psx_instr_cost.cpp)
     target_include_directories(psx_instr_cost_test PRIVATE include)
     add_test(NAME psx_instr_cost_test COMMAND psx_instr_cost_test)
+
+    add_executable(game_identity_test
+        tests/test_game_identity.c
+        src/game_identity.c
+        src/boot_state.c)
+    target_include_directories(game_identity_test PRIVATE include)
+    target_compile_definitions(game_identity_test PRIVATE
+        PSX_GAME_EXTRA_IDENTITY_SHA256="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        PSX_GAME_MANIFEST_DIGEST_SHA256="202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+    add_test(NAME game_identity_test COMMAND game_identity_test)
+
+    add_executable(game_identity_unconfigured_test
+        tests/test_game_identity_unconfigured.c
+        src/game_identity.c)
+    target_include_directories(game_identity_unconfigured_test PRIVATE include)
+    add_test(NAME game_identity_unconfigured_test
+             COMMAND game_identity_unconfigured_test)
+
+    add_executable(native_render_baseline_test
+        tests/test_native_render_baseline.c
+        src/native_render_baseline.c
+        src/native_render_baseline_runtime.c
+        src/gte_attribution.cpp)
+    target_include_directories(native_render_baseline_test PRIVATE include)
+    target_compile_definitions(native_render_baseline_test PRIVATE
+        PSX_NATIVE_RENDER_BASELINE_TEST=1
+        GTE_ATTRIBUTION_COUNTER_MAX=4)
+    add_test(NAME native_render_baseline_test COMMAND native_render_baseline_test)
 
     add_executable(overlay_capture_retry_test
         tests/test_overlay_capture_retry.cpp
@@ -145,10 +183,22 @@ if(BUILD_TESTING)
                  COMMAND autocompile_publication_test)
     endif()
 
+    add_executable(gpu_render_transaction_test
+        tests/test_gpu_render_transaction.c
+        src/gpu_render.c)
+    target_include_directories(gpu_render_transaction_test PRIVATE include)
+    target_compile_definitions(gpu_render_transaction_test PRIVATE
+        GPU_RENDER_TRANSACTION_TESTING=1)
+    add_test(NAME gpu_render_transaction COMMAND gpu_render_transaction_test)
+
     add_executable(gpu_gl_mask_order_test
         tests/test_gpu_gl_mask_order.c
+        tests/native_render_baseline_gpu_test_double.c
         src/color_lut.c
         src/gpu.c
+        src/gpu_render_oracle.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/gpu_render.c
         src/gpu_gl_renderer.c)
@@ -172,8 +222,12 @@ if(BUILD_TESTING)
 
     add_executable(gpu_gl_peek_order_test
         tests/test_gpu_gl_peek_order.c
+        tests/native_render_baseline_gpu_test_double.c
         src/color_lut.c
         src/gpu.c
+        src/gpu_render_oracle.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/gpu_render.c
         src/gpu_gl_renderer.c)
@@ -195,15 +249,203 @@ if(BUILD_TESTING)
                  COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:gpu_gl_peek_order_test>)
     endif()
 
-endif()
+    add_executable(xg_render_gl_transaction_test
+        tests/test_xg_render_gl_transaction.c
+        tests/native_render_baseline_gpu_test_double.c
+        src/color_lut.c
+        src/gpu.c
+        src/gpu_render_oracle.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
+        src/gpu_sw_renderer.c
+        src/gpu_render.c
+        src/gpu_gl_renderer.c)
+    target_include_directories(xg_render_gl_transaction_test PRIVATE
+        include ${SDL2_INCLUDE_DIRS})
+    target_compile_definitions(xg_render_gl_transaction_test PRIVATE
+        SDL_MAIN_HANDLED=1
+        PSX_NO_DEBUG_TOOLS=1
+        PSX_DEBUG_OVERLAY=1
+        PSX_GL_TRANSACTION_TESTING=1)
+    target_link_libraries(xg_render_gl_transaction_test PRIVATE ${SDL2_LIBRARIES})
+    if(WIN32 OR MINGW)
+        target_link_libraries(xg_render_gl_transaction_test PRIVATE opengl32)
+        add_test(NAME xg_render_gl_transaction
+                 COMMAND xg_render_gl_transaction_test)
+    else()
+        target_link_libraries(xg_render_gl_transaction_test PRIVATE
+            ${CMAKE_DL_LIBS} OpenGL::GL m)
+        add_test(NAME xg_render_gl_transaction
+                 COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:xg_render_gl_transaction_test>)
+    endif()
 
-if(NOT MSVC)
-    psxrecomp_add_runtime_target(psx-oracle
-        ORACLE
-        DEBUG_PORT 4371
-        WINDOW_TITLE "psxrecomp - Oracle"
-        DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
-    )
+    add_executable(guest_render_bridge_test
+        tests/test_guest_render_bridge.c
+        src/guest_render_bridge.c)
+    target_include_directories(guest_render_bridge_test PRIVATE
+        include ${SDL2_INCLUDE_DIRS})
+    target_compile_definitions(guest_render_bridge_test PRIVATE
+        GUEST_RENDER_BRIDGE_TESTING=1)
+    target_link_libraries(guest_render_bridge_test PRIVATE ${SDL2_LIBRARIES})
+    add_test(NAME guest_render_bridge COMMAND guest_render_bridge_test)
+
+    add_executable(native_render_mode_control_test
+        tests/test_native_render_mode_control.c
+        src/native_render_mode_control.c)
+    target_include_directories(native_render_mode_control_test PRIVATE include)
+    add_test(NAME native_render_mode_control
+             COMMAND native_render_mode_control_test)
+
+    add_executable(guest_render_transaction_test
+        tests/test_guest_render_transaction.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c)
+    target_include_directories(guest_render_transaction_test PRIVATE include)
+    target_compile_definitions(guest_render_transaction_test PRIVATE
+        GUEST_RENDER_TRANSACTION_TESTING=1
+        GUEST_RENDER_TRANSACTION_COMMAND_CAPACITY=4
+        GUEST_RENDER_TRANSACTION_WORD_CAPACITY=16
+        GUEST_RENDER_TRANSACTION_BINDING_CAPACITY=2
+        GUEST_RENDER_TRANSACTION_PENDING_CAPACITY=2)
+    add_test(NAME guest_render_transaction COMMAND guest_render_transaction_test)
+
+    add_executable(guest_render_native_stream_test
+        tests/test_guest_render_native_stream.c
+        src/guest_render_native_stream.c)
+    target_include_directories(guest_render_native_stream_test PRIVATE include)
+    target_compile_definitions(guest_render_native_stream_test PRIVATE
+        GUEST_RENDER_NATIVE_STREAM_TESTING=1
+        GUEST_RENDER_NATIVE_STREAM_CAPACITY=4)
+    add_test(NAME guest_render_native_stream
+             COMMAND guest_render_native_stream_test)
+
+    add_executable(xg_render_oracle_core_test
+        tests/test_gpu_render_oracle.c
+        src/gpu_render_oracle.c)
+    target_include_directories(xg_render_oracle_core_test PRIVATE include)
+    target_compile_definitions(xg_render_oracle_core_test PRIVATE
+        GPU_RENDER_ORACLE_TESTING=1)
+    add_test(NAME xg_render_oracle_core COMMAND xg_render_oracle_core_test)
+
+    add_executable(xg_render_oracle_integration_test
+        tests/test_gpu_render_oracle_integration.c
+        tests/gpu_render_oracle_integration_stubs.c
+        src/color_lut.c
+        src/dma.c
+        src/gpu.c
+        src/gpu_render.c
+        src/gpu_render_oracle.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
+        src/gpu_sw_renderer.c
+        src/memory.c)
+    target_include_directories(xg_render_oracle_integration_test PRIVATE
+        include src ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(xg_render_oracle_integration_test PRIVATE ${SDL2_LIBRARIES})
+    if(MSVC)
+        target_compile_options(xg_render_oracle_integration_test PRIVATE /Gy)
+        target_link_options(xg_render_oracle_integration_test PRIVATE /OPT:REF)
+    elseif(APPLE)
+        target_compile_options(xg_render_oracle_integration_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(xg_render_oracle_integration_test PRIVATE -Wl,-dead_strip)
+    else()
+        target_compile_options(xg_render_oracle_integration_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(xg_render_oracle_integration_test PRIVATE -Wl,--gc-sections)
+        target_link_libraries(xg_render_oracle_integration_test PRIVATE m)
+    endif()
+    add_test(NAME xg_render_oracle_integration
+             COMMAND xg_render_oracle_integration_test)
+
+    add_executable(gpu_atomic_checkpoint_test
+        tests/test_gpu_atomic_checkpoint.c
+        tests/gpu_render_oracle_integration_stubs.c
+        src/color_lut.c
+        src/dma.c
+        src/gpu.c
+        src/gpu_render.c
+        src/gpu_render_oracle.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
+        src/gpu_sw_renderer.c
+        src/memory.c)
+    target_include_directories(gpu_atomic_checkpoint_test PRIVATE
+        include src ${SDL2_INCLUDE_DIRS})
+    target_compile_definitions(gpu_atomic_checkpoint_test PRIVATE
+        GPU_RENDER_TRANSACTION_TESTING=1
+        GUEST_RENDER_TRANSACTION_TESTING=1
+        GPU_ATOMIC_CHECKPOINT_TESTING=1)
+    target_link_libraries(gpu_atomic_checkpoint_test PRIVATE ${SDL2_LIBRARIES})
+    if(MSVC)
+        target_compile_options(gpu_atomic_checkpoint_test PRIVATE /Gy)
+        target_link_options(gpu_atomic_checkpoint_test PRIVATE /OPT:REF)
+    elseif(APPLE)
+        target_compile_options(gpu_atomic_checkpoint_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(gpu_atomic_checkpoint_test PRIVATE -Wl,-dead_strip)
+    else()
+        target_compile_options(gpu_atomic_checkpoint_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(gpu_atomic_checkpoint_test PRIVATE -Wl,--gc-sections)
+        target_link_libraries(gpu_atomic_checkpoint_test PRIVATE m)
+    endif()
+    add_test(NAME gpu_atomic_checkpoint COMMAND gpu_atomic_checkpoint_test)
+
+    add_executable(xg_render_slot_substitution_test
+        tests/test_xg_render_slot_substitution.c
+        tests/gpu_render_oracle_integration_stubs.c
+        src/color_lut.c
+        src/dma.c
+        src/gpu.c
+        src/gpu_render.c
+        src/gpu_render_oracle.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
+        src/gpu_sw_renderer.c
+        src/memory.c)
+    target_include_directories(xg_render_slot_substitution_test PRIVATE
+        include src ${SDL2_INCLUDE_DIRS})
+    set_target_properties(xg_render_slot_substitution_test PROPERTIES
+        C_STANDARD 99
+        C_STANDARD_REQUIRED YES
+        C_EXTENSIONS YES)
+    target_compile_definitions(xg_render_slot_substitution_test PRIVATE
+        GPU_RENDER_TRANSACTION_TESTING=1
+        GUEST_RENDER_TRANSACTION_TESTING=1
+        GPU_ATOMIC_CHECKPOINT_TESTING=1
+        GUEST_RENDER_TRANSACTION_COMMAND_CAPACITY=4
+        GUEST_RENDER_TRANSACTION_WORD_CAPACITY=64
+        GUEST_RENDER_TRANSACTION_BINDING_CAPACITY=4
+        GUEST_RENDER_TRANSACTION_PENDING_CAPACITY=4
+        DMA2_LINKED_LIST_MAX_NODES=8)
+    target_link_libraries(xg_render_slot_substitution_test PRIVATE
+        ${SDL2_LIBRARIES})
+    if(MSVC)
+        target_compile_options(xg_render_slot_substitution_test PRIVATE
+            /W4 /WX /Gy)
+        target_link_options(xg_render_slot_substitution_test PRIVATE /OPT:REF)
+    elseif(APPLE)
+        target_compile_options(xg_render_slot_substitution_test PRIVATE
+            -Wall -Wextra -Werror
+            -Wno-error=unused-function -Wno-error=unused-variable
+            -Wno-error=misleading-indentation -Wno-error=comment
+            -ffunction-sections -fdata-sections)
+        target_link_options(xg_render_slot_substitution_test PRIVATE
+            -Wl,-dead_strip)
+    else()
+        target_compile_options(xg_render_slot_substitution_test PRIVATE
+            -Wall -Wextra -Werror
+            -Wno-error=unused-function -Wno-error=unused-variable
+            -Wno-error=misleading-indentation -Wno-error=comment
+            -ffunction-sections -fdata-sections)
+        target_link_options(xg_render_slot_substitution_test PRIVATE
+            -Wl,--gc-sections)
+        target_link_libraries(xg_render_slot_substitution_test PRIVATE m)
+    endif()
+    add_test(NAME xg_render_slot_substitution
+             COMMAND xg_render_slot_substitution_test)
+
 endif()
 
 # ---- psx-beetle target (Beetle PSX libretro standalone, MinGW) ----

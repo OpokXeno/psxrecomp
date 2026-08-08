@@ -45,6 +45,12 @@ void gl_renderer_runtime_diag(uint64_t out[6]);
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w);
 
+/* Independent Native FMV surface. This path has its own upload surface and
+ * draw operation and never calls gl_renderer_present(). */
+int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
+                                         int src_h, int linear, int force_4_3,
+                                         int content_w);
+
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
@@ -67,14 +73,44 @@ void gl_renderer_invalidate_present(void);
 /* THE present path for 15-bit frames: blit the display region straight from
  * the authoritative VRAM FBO into a letterboxed rect (no readback).
  * Deterministic — used for every 15-bit frame. linear = filter on scale.
- * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
-void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
-                              int force_4_3);
+ * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect).
+ * A live transaction is rejected without being consumed; READY transactions
+ * may be presented only by gl_renderer_swap_ready_transaction. */
+int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+                             int force_4_3);
+
+typedef enum GlRendererTransactionSwapStatus {
+    GL_RENDERER_TRANSACTION_SWAP_NOT_READY = 0,
+    GL_RENDERER_TRANSACTION_SWAP_SUCCESS = 1,
+} GlRendererTransactionSwapStatus;
+
+/* Consume a transaction only after gr_commit_validate returned READY. On the
+ * READY path the first SDL/GL/window operation is SDL_GL_SwapWindow; all
+ * renderer publication and checkpoint disposal follow the call. SDL exposes
+ * no swap result, so SUCCESS means the call returned under the context/window
+ * ownership validated by commit. NOT_READY performs no SDL/GL/window operation
+ * and leaves any open pre-READY checkpoint rollbackable. */
+GlRendererTransactionSwapStatus gl_renderer_swap_ready_transaction(void);
+
+/* Fail-closed recovery for the otherwise unreachable case where commit
+ * returned READY but the explicit swap operation cannot consume it. Restores
+ * and discards the backend checkpoint without swapping. Returns non-zero when
+ * a READY transaction was consumed. */
+int gl_renderer_cancel_ready_transaction(void);
 
 /* GPU-direct native-wide present: blit the displayed buffer's wide FBO (key =
  * disp_x) straight to the window, no CPU readback. Returns 0 if no wide surface
  * exists for disp_x (caller falls back to the CPU readout path). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear);
+
+/* Producer-driven Native widescreen. This is independent from gpu_ws_* and the
+ * legacy wide mirror; only Native semantic draws populate these surfaces. */
+int gl_renderer_configure_native_view(int enabled, int aspect_num,
+                                      int aspect_den, int canonical_width,
+                                      int canonical_height);
+int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
+                                    int linear);
+int gl_renderer_native_view_width(void);
 
 /* Display aspect for the present letterbox (default 4:3). A wide aspect
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
@@ -91,6 +127,8 @@ void gl_renderer_shutdown(void);
  * array; report coherency flags + dirty rects. fbo_peek returns 0 when the
  * GL pipeline is inactive. */
 int  gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out);
+int  gl_renderer_native_view_peek(int base_x, int x, int y,
+                                  int w, int h, uint16_t *out);
 void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]);
 
 /* Always-on coherency event ring (debug server "gl_coh_ring"): every upload
@@ -176,6 +214,37 @@ uint64_t gl_renderer_perf_prim_split(double *out_tex_frac);
 /* Cumulative textured-batch diagnostics: total, then flushes caused by
  * isolation, blend-mode, mask, filter, backdrop-gate, texture-window, capacity. */
 void gl_renderer_batch_diag(uint64_t out[8]);
+
+#ifdef PSX_GL_TRANSACTION_TESTING
+enum {
+    GL_TRANSACTION_FAULT_NONE = 0,
+    GL_TRANSACTION_FAULT_POST_COMPOSITION,
+    GL_TRANSACTION_FAULT_FINAL_VALIDATION,
+    GL_TRANSACTION_FAULT_FINAL_BLIT,
+};
+
+typedef struct GlRendererTransactionTestDiag {
+    uint64_t commits_ready;
+    uint64_t staging_compositions;
+    uint64_t default_writes_before_final_blit;
+    uint64_t final_blits;
+    uint64_t swaps;
+    uint64_t publications;
+    uint64_t phase_failures;
+    uint64_t forced_original_presents;
+    uint64_t operations_after_final_validation;
+    uint64_t deferred_candidate_captures;
+    uint64_t deferred_candidate_discards;
+    uint64_t deferred_transaction_begins;
+    int pending_commit;
+    int deferred_candidate_active;
+    int last_fault_phase;
+} GlRendererTransactionTestDiag;
+
+void gl_renderer_transaction_test_reset(void);
+void gl_renderer_transaction_test_inject_fault(int phase);
+void gl_renderer_transaction_test_diag(GlRendererTransactionTestDiag *out);
+#endif
 
 #ifdef __cplusplus
 }

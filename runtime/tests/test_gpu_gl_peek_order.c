@@ -39,6 +39,8 @@ enum {
     WHITE_1555 = 0x7fff,
     DOT_X = 300,
     DOT_Y = 300,
+    DEPTH24_ENTER_X = 340,
+    DEPTH24_EXIT_X = 342,
 };
 
 static int failures;
@@ -91,6 +93,27 @@ static void test_fbo_peek_lands_prior_gp0_primitives(void) {
                  "FBO peek lands all GP0 work before reading the destination");
 }
 
+static void test_depth24_transitions_land_pending_uploads(void) {
+    uint16_t pixel = 0;
+
+    reset_gpu_for_case();
+    gr_vram_write(DEPTH24_ENTER_X, DOT_Y, WHITE_1555);
+    gpu_write_gp1(0x08000010u);
+    gr_vram_write(DEPTH24_ENTER_X + 1, DOT_Y, BLACK_1555);
+    expect_true(gl_renderer_fbo_peek(DEPTH24_ENTER_X, DOT_Y, 1, 1, &pixel),
+                "depth24 entry result reads the OpenGL FBO");
+    expect_pixel(pixel, WHITE_1555,
+                 "depth24 entry lands the pending 15-bit upload");
+
+    gr_vram_write(DEPTH24_EXIT_X, DOT_Y, WHITE_1555);
+    gpu_write_gp1(0x08000000u);
+    gr_vram_write(DEPTH24_EXIT_X + 1, DOT_Y, BLACK_1555);
+    expect_true(gl_renderer_fbo_peek(DEPTH24_EXIT_X, DOT_Y, 1, 1, &pixel),
+                "depth24 exit result reads the OpenGL FBO");
+    expect_pixel(pixel, WHITE_1555,
+                 "depth24 exit lands the pending upload");
+}
+
 int main(void) {
     SDL_Window *window;
 
@@ -118,13 +141,15 @@ int main(void) {
     gr_set_texture_filter(0);
     expect_true(gl_renderer_init_context(window), "OpenGL raster pipeline initializes");
     expect_true(gr_backend() == GR_BACKEND_OPENGL, "OpenGL backend remains selected");
-    if (!failures)
+    if (!failures) {
         test_fbo_peek_lands_prior_gp0_primitives();
+        test_depth24_transitions_land_pending_uploads();
+    }
 
     gl_renderer_shutdown();
     SDL_DestroyWindow(window);
     SDL_Quit();
     if (failures) return 1;
-    puts("PASS: OpenGL FBO peek preserves GP0 primitive ordering");
+    puts("PASS: OpenGL FBO peeks preserve GP0 and depth24 transition ordering");
     return 0;
 }

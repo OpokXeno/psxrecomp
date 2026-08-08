@@ -1,5 +1,6 @@
 #include "overlay_loader.h"
 #include "overlay_api.h"
+#include "game_identity.h"
 #include "overlay_path_canon.h"
 #include "code_provider.h"
 #include "overlay_backend.h"
@@ -9,7 +10,9 @@
 #include "debug_server.h"
 #include "psx_cycles.h"
 #include "lockstep.h"
+#include "native_render_baseline.h"
 #include "overlay_posix.h"
+#include "xg_render_auth_runtime.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +71,16 @@ typedef void (*OverlayFlushFn)(void);
 enum { ENTRY_VALID = 0, ENTRY_INVALID = 1, ENTRY_BLACKLIST = 2 };
 
 typedef struct {
+    PsxGameIdentity identity;
+    uint64_t pair_id;
+    uint32_t artifact_base;
+    uint32_t artifact_size;
+    uint32_t artifact_crc32;
+    uint8_t authority_provenance;
+    uint8_t pair_bound;
+} RendererProvenance;
+
+typedef struct {
     uint32_t  addr;                      /* phys entry address                 */
     OverlayFn fn;
     uint32_t  range_lo[MAX_CODE_RANGES]; /* phys code-range starts             */
@@ -81,8 +94,9 @@ typedef struct {
     int       next;                      /* next candidate at same addr, -1 end*/
     uint32_t  diff_passes;               /* clean same-state diffs (verify budget)*/
     int       device_touch;              /* 1 = touches MMIO; never run its shard,
-                                          * always interp (shadow diff can't safely
-                                          * double-execute device I/O). */
+                                           * always interp (shadow diff can't safely
+                                           * double-execute device I/O). */
+    RendererProvenance renderer_provenance;
 #ifndef PSX_NO_DEBUG_TOOLS
     uint32_t  native_rank;                /* first-seen identity rank for bisection */
 #endif
@@ -219,6 +233,43 @@ static void idx_set_head(uint32_t phys, int head) {
 /* Active native-entry stack (self-modification detection, §8.5). */
 static int s_active_stack[64];
 static int s_active_depth = 0;
+static uint8_t s_active_page_refs[RANGE_PAGE_COUNT];
+
+static int active_stack_push(int ci) {
+    Candidate *c;
+
+    if (s_active_depth >=
+        (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
+        return 0;
+    c = &s_cand[ci];
+    s_active_stack[s_active_depth++] = ci;
+    for (int r = 0; r < c->nranges; ++r) {
+        uint32_t first = c->range_lo[r] >> 12;
+        uint32_t last = (c->range_lo[r] + c->range_len[r] - 1u) >> 12;
+
+        if (first >= RANGE_PAGE_COUNT) continue;
+        if (last >= RANGE_PAGE_COUNT) last = RANGE_PAGE_COUNT - 1u;
+        for (uint32_t page = first; page <= last; ++page)
+            ++s_active_page_refs[page];
+    }
+    return 1;
+}
+
+static void active_stack_pop(int pushed) {
+    Candidate *c;
+
+    if (!pushed) return;
+    c = &s_cand[s_active_stack[--s_active_depth]];
+    for (int r = 0; r < c->nranges; ++r) {
+        uint32_t first = c->range_lo[r] >> 12;
+        uint32_t last = (c->range_lo[r] + c->range_len[r] - 1u) >> 12;
+
+        if (first >= RANGE_PAGE_COUNT) continue;
+        if (last >= RANGE_PAGE_COUNT) last = RANGE_PAGE_COUNT - 1u;
+        for (uint32_t page = first; page <= last; ++page)
+            --s_active_page_refs[page];
+    }
+}
 
 /* ---- Observability (recomp-debug: measure, don't eyeball) -------------- */
 /* Always-on ring of native overlay calls, so the FIRST divergence / last
@@ -263,6 +314,7 @@ static uint32_t s_bad_entry_pc = 0;    /* the illegal entry PC */
 static uint64_t s_bad_entry_count = 0;
 void psx_native_bad_entry(CPUState *cpu, uint32_t owner, uint32_t pc) {
     (void)cpu;
+    psx_xg_render_auth_native_bad_entry(owner, pc);
     g_native_bad_entry = 1;
     s_bad_entry_owner = owner;
     s_bad_entry_pc = pc;
@@ -403,6 +455,50 @@ static int cand_range_contains(const Candidate *c, uint32_t phys) {
         if (phys >= c->range_lo[r] && phys < c->range_lo[r] + c->range_len[r])
             return 1;
     return 0;
+}
+
+static void note_render_auth_candidate(const Candidate *c,
+                                       uint32_t dispatch_pc,
+                                       int producer_dispatch) {
+    uint32_t physical_dispatch_pc = dispatch_pc & 0x1FFFFFFFu;
+    for (int r = 0; r < c->nranges; r++) {
+        uint32_t range_start = c->range_lo[r];
+        uint32_t range_size = c->range_len[r];
+        if (physical_dispatch_pc < range_start ||
+            physical_dispatch_pc >= range_start + range_size)
+            continue;
+        PsxXgRenderAuthCandidate candidate = {
+                .producer_entry = c->addr,
+                .range_start = range_start,
+                .range_size = range_size,
+                .dispatch_pc = dispatch_pc,
+                .identity = c->renderer_provenance.identity,
+                .pair_id = c->renderer_provenance.pair_id,
+                .artifact_base = c->renderer_provenance.artifact_base,
+                .artifact_size = c->renderer_provenance.artifact_size,
+                .artifact_crc32 = c->renderer_provenance.artifact_crc32,
+                .authority_provenance =
+                    c->renderer_provenance.authority_provenance != 0u,
+                .pair_bound = c->renderer_provenance.pair_bound != 0u,
+            };
+        if (producer_dispatch)
+            psx_xg_render_auth_note_candidate_dispatch(&candidate);
+        else
+            psx_xg_render_auth_note_artifact_candidate(&candidate);
+        return;
+    }
+    if (producer_dispatch)
+        psx_xg_render_auth_note_candidate_dispatch(NULL);
+}
+
+static void note_render_auth_artifact_candidate(const Candidate *c,
+                                                uint32_t dispatch_pc) {
+    note_render_auth_candidate(c, dispatch_pc, 0);
+}
+
+static void note_render_auth_candidate_dispatch(const Candidate *c,
+                                                uint32_t dispatch_pc) {
+    note_render_auth_candidate(c, dispatch_pc, 1);
 }
 
 static int cand_ranges_overlap(const Candidate *a, const Candidate *b) {
@@ -637,10 +733,18 @@ typedef struct {
     int      n;
 } ManFn;
 
+typedef struct {
+    uint32_t base;
+    uint32_t size;
+    uint32_t crc32;
+    int present;
+} ManifestArtifact;
+
 #define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
-#define MANIFEST_LINE_MAX 128u
+#define MANIFEST_LINE_MAX 160u
 #define MANIFEST_PHYSICAL_LINE_MAX 159u
 #define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
+#define MANIFEST_IDENTITY 'I'
 enum {
     MANIFEST_PROVENANCE_AMBIGUOUS = -1,
     MANIFEST_PROVENANCE_AUTHORITY = 0,
@@ -706,19 +810,46 @@ static int manifest_record_end(const char *cursor) {
     return *manifest_skip_space(cursor) == '\0';
 }
 
+static int manifest_sha256_field(const char **cursor,
+                                 uint8_t output[PSX_GAME_IDENTITY_SHA256_BYTES]) {
+    const char *value = manifest_skip_space(*cursor);
+    for (size_t index = 0; index < PSX_GAME_IDENTITY_SHA256_BYTES; index++) {
+        const char high = value[index * 2u];
+        const char low = value[index * 2u + 1u];
+        const int high_value = high >= '0' && high <= '9' ? high - '0' :
+                               high >= 'A' && high <= 'F' ? high - 'A' + 10 : -1;
+        const int low_value = low >= '0' && low <= '9' ? low - '0' :
+                              low >= 'A' && low <= 'F' ? low - 'A' + 10 : -1;
+        if (high_value < 0 || low_value < 0) return 0;
+        output[index] = (uint8_t)((high_value << 4) | low_value);
+    }
+    value += PSX_GAME_IDENTITY_SHA256_BYTES * 2u;
+    if (*value && !manifest_is_space((unsigned char)*value)) return 0;
+    *cursor = value;
+    return 1;
+}
+
 static ManFn *parse_manifest(const char *path, int *out_n,
-                             uint64_t *out_pair_id,
-                             int *out_has_pair_id,
-                             int *out_provenance) {
+                              uint64_t *out_pair_id,
+                              int *out_has_pair_id,
+                              int *out_provenance,
+                              PsxGameIdentity *out_identity,
+                              ManifestArtifact *out_artifact) {
     *out_n = 0;
     if (out_pair_id) *out_pair_id = 0;
     if (out_has_pair_id) *out_has_pair_id = 0;
     if (out_provenance) *out_provenance = MANIFEST_PROVENANCE_AUTHORITY;
+    if (out_identity) memset(out_identity, 0, sizeof(*out_identity));
+    if (out_artifact) memset(out_artifact, 0, sizeof(*out_artifact));
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     int cap = 1024, n = 0;
-    int invalid = 0, pair_seen = 0, provenance_seen = 0;
+    int invalid = 0, pair_seen = 0, artifact_seen = 0, provenance_seen = 0, identity_seen = 0;
     int provenance = MANIFEST_PROVENANCE_AUTHORITY;
+    PsxGameIdentity identity;
+    ManifestArtifact artifact;
+    memset(&identity, 0, sizeof(identity));
+    memset(&artifact, 0, sizeof(artifact));
     ManFn *arr = (ManFn *)malloc(sizeof(ManFn) * cap);
     if (!arr) { fclose(f); return NULL; }
     char line[MANIFEST_PHYSICAL_LINE_MAX + 1u];
@@ -753,7 +884,8 @@ static ManFn *parse_manifest(const char *path, int *out_n,
                 ? parsed_provenance : MANIFEST_PROVENANCE_AMBIGUOUS;
         }
         const char *record = manifest_skip_space(line);
-        int recognized = ((*record == 'P' || *record == 'F' || *record == 'R') &&
+        int recognized = ((*record == 'A' || *record == 'P' || *record == MANIFEST_IDENTITY ||
+                           *record == 'F' || *record == 'R') &&
                           (record[1] == '\0' ||
                            manifest_is_space((unsigned char)record[1])));
         int embedded_nul = memchr(line, '\0', line_len) != NULL;
@@ -769,7 +901,30 @@ static ManFn *parse_manifest(const char *path, int *out_n,
             continue;
         }
         if (!recognized) continue;
-        if (*record == 'P') {
+        if (*record == MANIFEST_IDENTITY) {
+            const char *cursor = record + 1;
+            if (!manifest_sha256_field(&cursor, identity.game_sha256) ||
+                !manifest_sha256_field(&cursor, identity.manifest_sha256) ||
+                !manifest_record_end(cursor) || identity_seen++) {
+                invalid = 1;
+            }
+        } else if (*record == 'A') {
+            const char *cursor = record + 1;
+            uint64_t parsed_base = 0, parsed_size = 0, parsed_crc = 0;
+            if (manifest_hex_field(&cursor, 8, &parsed_base) &&
+                manifest_hex_field(&cursor, 8, &parsed_size) &&
+                manifest_hex_field(&cursor, 8, &parsed_crc) &&
+                manifest_record_end(cursor) && !artifact_seen++ &&
+                (parsed_base & 0xFFE00000u) == 0x80000000u &&
+                parsed_size > 0 &&
+                (parsed_base & 0x1FFFFFFFu) < OVERLAY_RAM_SIZE &&
+                parsed_size <= OVERLAY_RAM_SIZE - (parsed_base & 0x1FFFFFFFu)) {
+                artifact.base = (uint32_t)parsed_base;
+                artifact.size = (uint32_t)parsed_size;
+                artifact.crc32 = (uint32_t)parsed_crc;
+                artifact.present = 1;
+            } else invalid = 1;
+        } else if (*record == 'P') {
             const char *cursor = record + 1;
             uint64_t parsed = 0;
             if (manifest_hex_field(&cursor, 16, &parsed) &&
@@ -810,7 +965,7 @@ static ManFn *parse_manifest(const char *path, int *out_n,
             } else invalid = 1;
         }
     }
-    if (!invalid && (n == 0 || !cur || !man_structurally_valid(cur))) invalid = 1;
+    if (!invalid && (identity_seen != 1 || n == 0 || !cur || !man_structurally_valid(cur))) invalid = 1;
     fclose(f);
     for (int i = 0; i < n; i++) {
         uint32_t entry = arr[i].entry & 0x1FFFFFFFu;
@@ -834,6 +989,8 @@ static ManFn *parse_manifest(const char *path, int *out_n,
         return NULL;
     }
     if (out_provenance) *out_provenance = provenance;
+    if (out_identity) *out_identity = identity;
+    if (out_artifact) *out_artifact = artifact;
     *out_n = n;
     return arr;
 }
@@ -929,7 +1086,9 @@ static int ranges_delay_slots_hashed(const uint32_t *lo_list,
 #define LOAD_PAIR_ALIAS (-1)
 typedef struct {
     uint64_t pair_id;
+    PsxGameIdentity identity;
     ManFn   *man;
+    ManifestArtifact artifact;
     int      man_n;
     int      tier;
     int      provenance;
@@ -938,7 +1097,7 @@ static LoadedPair s_loaded_pairs[LOADED_PAIR_CAP];
 static int s_loaded_pair_n = 0;
 
 static int manifest_pair_equal(const ManFn *a, int a_n,
-                               const ManFn *b, int b_n) {
+                                const ManFn *b, int b_n) {
     if (!a || !b || a_n != b_n) return 0;
     for (int i = 0; i < a_n; i++) {
         if (a[i].entry != b[i].entry || a[i].crc != b[i].crc ||
@@ -953,6 +1112,15 @@ static int manifest_pair_equal(const ManFn *a, int a_n,
     return 1;
 }
 
+static int manifest_artifact_equal(const ManifestArtifact *left,
+                                   const ManifestArtifact *right) {
+    return left != NULL && right != NULL &&
+           left->present == right->present &&
+           (!left->present ||
+            ((left->base & 0x1FFFFFFFu) == (right->base & 0x1FFFFFFFu) &&
+             left->size == right->size && left->crc32 == right->crc32));
+}
+
 static int man_delay_slots_hashed(const ManFn *m) {
     return ranges_delay_slots_hashed(m->lo, m->len, m->n);
 }
@@ -962,31 +1130,40 @@ static int cand_delay_slots_hashed(const Candidate *c) {
 }
 
 static int loaded_pair_find(int tier, int provenance, uint64_t pair_id,
-                            const ManFn *man, int man_n) {
+                            const PsxGameIdentity *identity,
+                            const ManFn *man, int man_n,
+                            const ManifestArtifact *artifact) {
     if (provenance == MANIFEST_PROVENANCE_AMBIGUOUS) return -1;
     for (int i = 0; i < s_loaded_pair_n; i++) {
         const LoadedPair *p = &s_loaded_pairs[i];
         if (p->tier == tier && p->provenance == provenance &&
             p->pair_id == pair_id &&
-            manifest_pair_equal(p->man, p->man_n, man, man_n))
+            psx_game_identity_equal(&p->identity, identity) &&
+            manifest_pair_equal(p->man, p->man_n, man, man_n) &&
+            manifest_artifact_equal(&p->artifact, artifact))
             return i;
     }
     return -1;
 }
 
 static void loaded_pair_commit(int tier, int provenance, uint64_t pair_id,
-                               const ManFn *man, int man_n) {
+                               const PsxGameIdentity *identity,
+                               const ManFn *man, int man_n,
+                               const ManifestArtifact *artifact) {
     if (!man || man_n <= 0 ||
         provenance == MANIFEST_PROVENANCE_AMBIGUOUS ||
         s_loaded_pair_n >= LOADED_PAIR_CAP ||
-        loaded_pair_find(tier, provenance, pair_id, man, man_n) >= 0)
+        loaded_pair_find(tier, provenance, pair_id, identity, man, man_n,
+                         artifact) >= 0)
         return;
     ManFn *copy = (ManFn *)malloc(sizeof(*copy) * (size_t)man_n);
     if (!copy) return; /* Safe fallback: later twins register independently. */
     memcpy(copy, man, sizeof(*copy) * (size_t)man_n);
     LoadedPair *p = &s_loaded_pairs[s_loaded_pair_n++];
     p->pair_id = pair_id;
+    p->identity = *identity;
     p->man = copy;
+    if (artifact != NULL) p->artifact = *artifact;
     p->man_n = man_n;
     p->tier = tier;
     p->provenance = provenance;
@@ -996,7 +1173,8 @@ static void loaded_pair_commit(int tier, int provenance, uint64_t pair_id,
 
 static void loader_log(const char *fmt, ...);   /* defined below */
 static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
-                         int tier) {
+                          int tier,
+                          const RendererProvenance *renderer_provenance) {
     if (s_cand_n >= CAND_CAP) {
         s_cand_overflow++;
         return 0;
@@ -1009,6 +1187,9 @@ static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
     c->dll     = dll;
     c->tier    = (uint8_t)tier;
     c->state   = ENTRY_VALID;
+    memset(&c->renderer_provenance, 0, sizeof(c->renderer_provenance));
+    if (renderer_provenance != NULL)
+        c->renderer_provenance = *renderer_provenance;
     c->nranges = 0;
     for (int i = 0; i < m->n && c->nranges < MAX_CODE_RANGES; i++) {
         c->range_lo[c->nranges]  = m->lo[i] & 0x1FFFFFFFu;
@@ -1064,6 +1245,7 @@ static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll,
 
 static char s_cache_dir[512];
 static char s_game_id[64];
+static char s_identity_namespace[PSX_GAME_IDENTITY_CACHE_NAMESPACE_BYTES];
 static int  s_active = 0;
 
 /* Canonical (filesystem-resolved) form of s_cache_dir, computed lazily on the
@@ -1114,6 +1296,15 @@ static int        s_capacity_warm_dropped = 0;
 static void overlay_image_warm_cancel(int ci);
 static void overlay_image_warm_release(int ci);
 static void overlay_image_warm_drop_all(void);
+
+static int cache_artifact_matches(const CacheEntry *entry,
+                                  const ManifestArtifact *artifact) {
+    return entry != NULL && artifact != NULL && artifact->present &&
+           artifact->size != 0u &&
+           (entry->region_start & 0x1FFFFFFFu) ==
+               (artifact->base & 0x1FFFFFFFu) &&
+           entry->logical_crc == artifact->crc32;
+}
 
 static int cache_entry_suppress_for_shortfall(int ci, int needed) {
     if (ci < 0 || ci >= s_cache_idx_count || needed <= 0) return 0;
@@ -1463,8 +1654,20 @@ static void rebuild_lazy_manifest_index(void) {
         snprintf(path + n - OVERLAY_SHARED_EXT_LEN,
                  sizeof(path) - (n - OVERLAY_SHARED_EXT_LEN), ".ranges");
         int man_n = 0;
-        ManFn *man = parse_manifest(path, &man_n, NULL, NULL, NULL);
-        if (!man) continue;
+        PsxGameIdentity identity;
+        ManFn *man = parse_manifest(path, &man_n, NULL, NULL, NULL, &identity,
+                                    NULL);
+        if (!man) {
+            loader_log("invalid overlay manifest %s (cache entry %s)", path,
+                       s_cache_idx[ci].path);
+            free(man);
+            continue;
+        }
+        if (!psx_game_identity_gate(&identity)) {
+            loader_log("overlay manifest identity mismatch %s", path);
+            free(man);
+            continue;
+        }
         s_cache_idx[ci].manifest_ok = 1;
         s_cache_idx[ci].func_count = man_n;
         for (int mi = 0; mi < man_n; mi++) {
@@ -1698,8 +1901,8 @@ static void scan_one_cache_dir(const char *dir, int tier) {
 static void warn_on_cgtag_mismatch(const char *tier) {
 #ifdef _WIN32
     char base[768], pattern[900];
-    snprintf(base, sizeof base, "%s/%s/%s/%s",
-             s_cache_dir, s_game_id, tier, PSX_OVERLAY_ARCH_ABI);
+    snprintf(base, sizeof base, "%s/%s/%s/%s/%s",
+             s_cache_dir, s_game_id, s_identity_namespace, tier, PSX_OVERLAY_ARCH_ABI);
     char expect[64];
     snprintf(expect, sizeof expect, "cg%d_%08x",
              PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
@@ -1726,8 +1929,8 @@ static void warn_on_cgtag_mismatch(const char *tier) {
     FindClose(h);
 #else
     char base[768], expect[64], found[256];
-    snprintf(base, sizeof base, "%s/%s/%s/%s",
-             s_cache_dir, s_game_id, tier, PSX_OVERLAY_ARCH_ABI);
+    snprintf(base, sizeof base, "%s/%s/%s/%s/%s",
+             s_cache_dir, s_game_id, s_identity_namespace, tier, PSX_OVERLAY_ARCH_ABI);
     snprintf(expect, sizeof expect, "cg%d_%08x",
              PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     if (psx_overlay_posix_find_other_cache_tag(base, expect, found,
@@ -1878,13 +2081,13 @@ static void scan_cache_dir(void) {
     /* Index both tiers and every immutable artifact. Runtime selection prefers
      * usable GCC over TCC; an invalid GCC artifact cannot suppress a valid TCC
      * fallback merely because its filename was enumerated first. */
-    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d_%08x",
-             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
+    snprintf(dir, sizeof(dir), "%s/%s/%s/gcc/%s/cg%d_%08x",
+             s_cache_dir, s_game_id, s_identity_namespace, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir, CACHE_TIER_GCC);
     abi_preflight_sweep(dir);
-    snprintf(dir, sizeof(dir), "%s/%s/tcc/%s/cg%d_%08x",
-             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
+    snprintf(dir, sizeof(dir), "%s/%s/%s/tcc/%s/cg%d_%08x",
+             s_cache_dir, s_game_id, s_identity_namespace, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir, CACHE_TIER_TCC);
     abi_preflight_sweep(dir);
@@ -1956,12 +2159,26 @@ extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra);
 extern void psx_check_interrupts(CPUState *cpu);
 extern int psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc);
 extern int psx_interrupt_delivery_needed(const CPUState *cpu);
-extern void gte_execute(CPUState *cpu, uint32_t cmd);
+extern void gte_execute_at(CPUState *cpu, uint32_t cmd, uint32_t guest_pc);
 extern int psx_syscall(CPUState *cpu, uint32_t code);
 extern void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys);
 extern void debug_server_log_call_entry_fn(uint32_t func_addr);
 
 static OverlayCallbacks s_callbacks;
+
+static void overlay_gte_execute_at(CPUState *cpu, uint32_t cmd,
+                                   uint32_t guest_pc) {
+    gte_execute_at_tier(cpu, cmd, guest_pc, GTE_ATTRIBUTION_TIER_WARM);
+}
+
+static void overlay_log_call_entry(uint32_t func_addr) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    debug_server_log_call_entry_fn(func_addr);
+#endif
+    if (!s_in_shadow)
+        native_render_baseline_note_execution(
+            func_addr, NATIVE_RENDER_BASELINE_NATIVE);
+}
 
 /* Timing-hypothesis probe: native overlay code calls psx_check_interrupts at
  * EVERY block (up to ~100x/function), whereas the dirty-RAM interpreter checks
@@ -2172,17 +2389,11 @@ static void init_callbacks(void) {
     s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
     /* Address of the header inline → out-of-line copy in this TU (host side). */
     s_callbacks.advance_cycles     = psx_advance_cycles;
-    s_callbacks.gte_execute          = gte_execute;
+    s_callbacks.gte_execute_at       = overlay_gte_execute_at;
     s_callbacks.psx_syscall          = psx_syscall;
     s_callbacks.psx_native_bad_entry = psx_native_bad_entry;
     s_callbacks.psx_unknown_dispatch = psx_unknown_dispatch;
-#ifdef PSX_NO_DEBUG_TOOLS
-    /* Generated DLLs NULL-check this callback. Avoid a production call/return
-     * at every guest function entry when the callee would immediately no-op. */
-    s_callbacks.log_call_entry       = NULL;
-#else
-    s_callbacks.log_call_entry       = debug_server_log_call_entry_fn;
-#endif
+    s_callbacks.log_call_entry       = overlay_log_call_entry;
     s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
     /* Return-from-exception mark (ABI v12): overlay `rfe` ops forward here. */
     s_callbacks.rfe_mark_escape          = psx_rfe_mark_escape;
@@ -2282,6 +2493,14 @@ static void init_callbacks(void) {
             extern uint32_t psx_ws_xclip_bound(uint32_t vanilla);
             s_callbacks.ws_xclip_bound = psx_ws_xclip_bound;
         }
+        {
+            extern int32_t psx_xenogears_field_frame_step(
+                uint32_t, uint32_t, int32_t, uint32_t, uint32_t);
+            s_callbacks.xg_field_frame_step = psx_xenogears_field_frame_step;
+        }
+        s_callbacks.xg_render_auth = psx_xg_render_auth_warm_hook;
+        s_callbacks.xg_render_native_ft4_bypass =
+            psx_xg_render_auth_native_ft4_bypass;
     }
 }
 
@@ -2303,7 +2522,10 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
                             OverlayLibraryHandle prepared,
                             uint64_t manifest_pair_id,
                             int manifest_has_pair_id,
-                            int manifest_provenance, int tier) {
+                            int manifest_provenance, const PsxGameIdentity *manifest_identity,
+                            int tier,
+                            const RendererProvenance *renderer_provenance,
+                            const ManifestArtifact *manifest_artifact) {
     HMODULE h = prepared ? prepared : LoadLibraryA(dll_path);
     if (!h) {
         loader_log("LoadLibrary(%s) failed: %lu", dll_path, GetLastError());
@@ -2322,6 +2544,15 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
                    "without pathname deletion", dll_path, abi,
                    PSX_OVERLAY_ABI_TAG);
+        FreeLibrary(h);
+        return 0;
+    }
+    typedef const PsxGameIdentity *(*IdentityFn)(void);
+    IdentityFn identity_fn = (IdentityFn)GetProcAddress(h, "overlay_game_identity");
+    const PsxGameIdentity *dll_identity = identity_fn ? identity_fn() : NULL;
+    if (!dll_identity || !psx_game_identity_equal(dll_identity, manifest_identity) ||
+        !psx_game_identity_gate(dll_identity)) {
+        loader_log("DLL/manifest game identity mismatch in %s -- rejecting", dll_path);
         FreeLibrary(h);
         return 0;
     }
@@ -2367,7 +2598,8 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
      * canonical pair already owns its initialized handle and callbacks, so the
      * redundant image must never run overlay_init or publish function pointers. */
     if (manifest_has_pair_id && loaded_pair_find(
-            tier, manifest_provenance, manifest_pair_id, man, man_n) >= 0) {
+            tier, manifest_provenance, manifest_pair_id, manifest_identity, man, man_n,
+            manifest_artifact) >= 0) {
         s_pair_aliases++;
         loader_log("validated duplicate overlay pair in %s -- reusing canonical "
                    "candidate bundle", dll_path);
@@ -2427,11 +2659,13 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
          * the interpreter rather than registered with a guessed extent. */
         ManFn *m = man_find(man, man_n, addr);
         if (!m || m->n == 0) { s_no_manifest++; continue; }
-        registered += cand_register(addr & 0x1FFFFFFFu, fn, m, dll, tier);
+        registered += cand_register(addr & 0x1FFFFFFFu, fn, m, dll, tier,
+                                    renderer_provenance);
     }
     if (registered == man_n && manifest_has_pair_id)
         loaded_pair_commit(tier, manifest_provenance,
-                           manifest_pair_id, man, man_n);
+                           manifest_pair_id, manifest_identity, man, man_n,
+                           manifest_artifact);
     if (s_cand_overflow != overflow_before)
         loader_log("*** CANDIDATE TABLE FULL (%d): loaded %s -> %d registered, "
                    "%llu dropped; native coverage is falling back to the "
@@ -2455,7 +2689,10 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
                             OverlayLibraryHandle prepared,
                             uint64_t manifest_pair_id,
                             int manifest_has_pair_id,
-                            int manifest_provenance, int tier) {
+                            int manifest_provenance, const PsxGameIdentity *manifest_identity,
+                            int tier,
+                            const RendererProvenance *renderer_provenance,
+                            const ManifestArtifact *manifest_artifact) {
     char error[256] = {0};
     void *h = prepared ? prepared
                        : psx_overlay_posix_library_open(dll_path, error,
@@ -2469,6 +2706,16 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
                    "without pathname deletion", dll_path, abi,
                    PSX_OVERLAY_ABI_TAG);
+        psx_overlay_posix_library_close(h);
+        return 0;
+    }
+    typedef const PsxGameIdentity *(*IdentityFn)(void);
+    IdentityFn identity_fn = (IdentityFn)psx_overlay_posix_library_symbol(
+        h, "overlay_game_identity");
+    const PsxGameIdentity *dll_identity = identity_fn ? identity_fn() : NULL;
+    if (!dll_identity || !psx_game_identity_equal(dll_identity, manifest_identity) ||
+        !psx_game_identity_gate(dll_identity)) {
+        loader_log("DLL/manifest game identity mismatch in %s -- rejecting", dll_path);
         psx_overlay_posix_library_close(h);
         return 0;
     }
@@ -2507,7 +2754,8 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         return 0;
     }
     if (manifest_has_pair_id && loaded_pair_find(
-            tier, manifest_provenance, manifest_pair_id, man, man_n) >= 0) {
+            tier, manifest_provenance, manifest_pair_id, manifest_identity, man, man_n,
+            manifest_artifact) >= 0) {
         s_pair_aliases++;
         loader_log("validated duplicate overlay pair in %s -- reusing canonical "
                    "candidate bundle", dll_path);
@@ -2541,11 +2789,13 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
         if (m->entry == 0 || m->n == 0) continue;
         OverlayFn fn = (OverlayFn)psx_overlay_posix_library_entry(h, m->entry);
         if (!fn) continue;
-        registered += cand_register(m->entry & 0x1FFFFFFFu, fn, m, dll, tier);
+        registered += cand_register(m->entry & 0x1FFFFFFFu, fn, m, dll, tier,
+                                    renderer_provenance);
     }
     if (registered == man_n && manifest_has_pair_id)
         loaded_pair_commit(tier, manifest_provenance,
-                           manifest_pair_id, man, man_n);
+                           manifest_pair_id, manifest_identity, man, man_n,
+                           manifest_artifact);
     if (s_cand_overflow != overflow_before)
         loader_log("*** CANDIDATE TABLE FULL (%d): loaded %s -> %d registered, "
                    "%llu dropped; native coverage is falling back to the "
@@ -2602,6 +2852,13 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
         s_range_pc_cache[i].cand = -1;
     strncpy(s_cache_dir, cache_dir, sizeof(s_cache_dir) - 1);
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
+    const PsxGameIdentity *identity = psx_game_identity_runtime();
+    if (!identity || !psx_game_identity_bind_static(identity) ||
+        !psx_game_identity_cache_namespace(s_identity_namespace,
+                                           sizeof(s_identity_namespace))) {
+        loader_log("overlay cache identity is unavailable -- native shards disabled");
+        return;
+    }
     s_cache_root_canon_ok = 0;   /* re-resolve for the (re)assigned root */
     /* data shards persist under the same unified cache root (data_shards.c) */
     { extern void ds_init(const char*, const char*); ds_init(cache_dir, game_id); }
@@ -2849,10 +3106,14 @@ static int load_one_dll(const char *dll_path,
     uint64_t manifest_pair_id = 0;
     int manifest_has_pair_id = 0;
     int manifest_provenance = MANIFEST_PROVENANCE_AUTHORITY;
+    PsxGameIdentity manifest_identity;
+    ManifestArtifact manifest_artifact;
     ManFn *man = parse_manifest(ranges_path, &man_n,
-                                &manifest_pair_id,
-                                &manifest_has_pair_id,
-                                &manifest_provenance);
+                                 &manifest_pair_id,
+                                 &manifest_has_pair_id,
+                                 &manifest_provenance,
+                                 &manifest_identity,
+                                 &manifest_artifact);
     if (!man || man_n == 0) {
         loader_log("no/empty manifest %s — DLL left to interpreter", ranges_path);
         free(man);
@@ -2863,7 +3124,8 @@ static int load_one_dll(const char *dll_path,
      * bundle of this size can fit. Parse and compare before durably suppressing
      * the cache entry; otherwise safe aliases become unreachable at the cap. */
     int known_alias = manifest_has_pair_id && loaded_pair_find(
-        tier, manifest_provenance, manifest_pair_id, man, man_n) >= 0;
+        tier, manifest_provenance, manifest_pair_id, &manifest_identity, man, man_n,
+        &manifest_artifact) >= 0;
     if (cache_idx >= 0 && !known_alias) {
         int suppressed = s_cand_n >= CAND_CAP
             ? cache_entry_suppress_at_capacity(cache_idx)
@@ -2874,10 +3136,24 @@ static int load_one_dll(const char *dll_path,
             return 0;
         }
     }
+    RendererProvenance renderer_provenance = { 0 };
+    if (cache_idx >= 0 &&
+        manifest_provenance == MANIFEST_PROVENANCE_AUTHORITY &&
+        manifest_has_pair_id && manifest_pair_id != 0u &&
+        cache_artifact_matches(&s_cache_idx[cache_idx], &manifest_artifact)) {
+        renderer_provenance.identity = manifest_identity;
+        renderer_provenance.pair_id = manifest_pair_id;
+        renderer_provenance.artifact_base = manifest_artifact.base;
+        renderer_provenance.artifact_size = manifest_artifact.size;
+        renderer_provenance.artifact_crc32 = manifest_artifact.crc32;
+        renderer_provenance.authority_provenance = 1u;
+        renderer_provenance.pair_bound = 1u;
+    }
     int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls, prepared,
-                                      manifest_pair_id,
-                                      manifest_has_pair_id,
-                                      manifest_provenance, tier);
+                                       manifest_pair_id,
+                                       manifest_has_pair_id,
+                                       manifest_provenance, &manifest_identity, tier,
+                                       &renderer_provenance, &manifest_artifact);
 #ifdef _WIN32
     QueryPerformanceCounter(&q1);
     QueryPerformanceFrequency(&qf);
@@ -3326,6 +3602,7 @@ static int range_candidate_matches(int i, uint32_t phys) {
         c->state = ENTRY_INVALID;
     }
     s_stale_blocked++;
+    psx_xg_render_auth_loader_mismatch(c->addr);
     return 0;
 }
 
@@ -3463,6 +3740,8 @@ retry_candidates:
             if (_probe) s_cps_probe_matched = matched;
             if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
+                if (!s_in_shadow)
+                    note_render_auth_artifact_candidate(c, addr);
                 if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
                 /* Diff instrument — same contract as the entry chain's want_diff
                  * gate below. A continuation re-entry must NOT run native blind
@@ -3488,7 +3767,15 @@ retry_candidates:
                         s_disp_interp++;
                         return 0;
                     }
-                    if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
+                    if (!s_native_exec) {
+                        if (!s_in_shadow)
+                            note_render_auth_candidate_dispatch(c, addr);
+                        if (_probe) s_cps_probe_outcome = 4;
+                        s_would_run_native++;
+                        s_disp_interp++;
+                        return 0;
+                    }
+                    if (overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
                                            { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
 #ifndef PSX_NO_DEBUG_TOOLS
                     if (!native_rank_allows(c, addr))
@@ -3510,20 +3797,21 @@ retry_candidates:
                 s_native_inprogress = c->addr;
                 s_native_calls_total++;
                 native_hot_note(c->addr);
-                if (s_active_depth < (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
-                    s_active_stack[s_active_depth++] = ci;
+                int active_pushed = active_stack_push(ci);
                 s_disp_native++;
                 cpu->pc = addr;          /* route the func's entry-switch to the block */
                 {
                     int prev_phase = g_exec_phase;
                     OverlayFlushFn prev_flush = overlay_flush_enter(c);
                     g_exec_phase = 2;
+                    if (!s_in_shadow)
+                        note_render_auth_candidate_dispatch(c, addr);
                     c->fn(cpu);
                     overlay_flush_leave(prev_flush);
                     g_exec_phase = prev_phase;
                 }
                 overlay_post_dispatch_irq_pump(cpu);
-                if (s_active_depth > 0) s_active_depth--;
+                active_stack_pop(active_pushed);
                 s_nring[slot].returned = 1;
                 s_native_inprogress = prev_inprogress;
                 if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
@@ -3578,6 +3866,8 @@ retry_candidates:
                 s_revalidations++;              /* reload-on-return */
                 s_valid_count++;
             }
+            if (!s_in_shadow)
+                note_render_auth_artifact_candidate(c, addr);
             /* Device-touching functions never run their shard: the shadow diff
              * can't safely double-execute MMIO/SIO/DMA to validate them, so they
              * always fall to the interpreter (the authoritative single path). */
@@ -3629,7 +3919,14 @@ retry_candidates:
              * candidate matched (byte-exact) but we DON'T run native — interp
              * handles it. The per-function blocklist forces the same interp
              * routing for one function only (bisection localization). */
-            if (!s_native_exec || overlay_native_blocked(c->addr))
+            if (!s_native_exec) {
+                if (!s_in_shadow)
+                    note_render_auth_candidate_dispatch(c, addr);
+                s_would_run_native++;
+                s_disp_interp++;
+                return 0;
+            }
+            if (overlay_native_blocked(c->addr))
                 { s_would_run_native++; s_disp_interp++; return 0; }
 #ifndef PSX_NO_DEBUG_TOOLS
             if (!native_rank_allows(c, addr))
@@ -3650,8 +3947,7 @@ retry_candidates:
             s_native_calls_total++;
             native_hot_note(c->addr);
 
-            if (s_active_depth < (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
-                s_active_stack[s_active_depth++] = i;
+            int active_pushed = active_stack_push(i);
             s_disp_native++;
             /* Delimit this native execution in the interp insn ring (native code
              * emits no per-insn entries; markers keep the timeline alignable). */
@@ -3664,6 +3960,8 @@ retry_candidates:
                 int prev_phase = g_exec_phase;
                 OverlayFlushFn prev_flush = overlay_flush_enter(c);
                 g_exec_phase = 2;
+                if (!s_in_shadow)
+                    note_render_auth_candidate_dispatch(c, addr);
                 c->fn(cpu);
                 overlay_flush_leave(prev_flush);
                 g_exec_phase = prev_phase;
@@ -3672,7 +3970,7 @@ retry_candidates:
 #ifndef PSX_NO_DEBUG_TOOLS
             dirty_ram_log_marker(c->addr, mtag, 1);
 #endif
-            if (s_active_depth > 0) s_active_depth--;
+            active_stack_pop(active_pushed);
 
             s_nring[slot].returned = 1;
             s_native_inprogress = prev_inprogress;   /* restore (nested calls) */
@@ -3692,6 +3990,7 @@ retry_candidates:
                 c->state = ENTRY_INVALID;
             }
             s_stale_blocked++;
+            psx_xg_render_auth_loader_mismatch(c->addr);
         }
     }
 
@@ -3718,6 +4017,9 @@ retry_candidates:
 void overlay_loader_active_write_check(uint32_t phys, uint32_t size) {
     extern uint32_t g_debug_last_store_pc;
     uint32_t p = phys & 0x1FFFFFFFu;
+    uint32_t page = p >> 12;
+
+    if (page >= RANGE_PAGE_COUNT || s_active_page_refs[page] == 0u) return;
     for (int d = 0; d < s_active_depth; d++) {
         Candidate *c = &s_cand[s_active_stack[d]];
         for (int i = 0; i < c->nranges; i++) {

@@ -406,6 +406,19 @@ int main(int argc, char** argv) {
                          PSXRecompGTERegisters::data_read_needs_helper(reg), "SWC2", reg);
     }
 
+    ++total;
+    const TranslateResult gte_command = StrictTranslator::translate(
+        MipsDecoder::decode(0x4A000006u, 0xBFC01234u));
+    if (gte_command.supported &&
+        gte_command.c_code ==
+            "gte_execute_at(cpu, 0x0000006, 0xBFC01234u);") {
+        ++pass;
+    } else {
+        ++fail;
+        fmt::print("  FAIL  strict GTE command lacks exact PC: {}\n",
+                   gte_command.c_code);
+    }
+
     fmt::print("\nL2 structural: {}/{} ok", pass, total);
     if (fail > 0) fmt::print(" ({} failures)", fail);
     fmt::print("\n");

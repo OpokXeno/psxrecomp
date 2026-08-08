@@ -176,6 +176,10 @@ extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 #define DIRTY_RAM_EXEC_WORD_COUNT   ((2u * 1024u * 1024u) / 4u)
 #define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
 extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+/* Exact retired-instruction counts for the same coherent capture epoch. The
+ * capture writer snapshots these beside the bitmap so runtime observations can
+ * be bound to the complete bytes that were resident when a PC executed. */
+extern uint32_t g_dirty_ram_exec_pc_counts[DIRTY_RAM_EXEC_WORD_COUNT];
 /* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
  * guard; they clear that page's capture bits rather than serializing from the
  * universal store hot path. */

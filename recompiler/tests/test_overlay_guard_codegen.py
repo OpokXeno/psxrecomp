@@ -19,7 +19,12 @@ run psxrecomp-game in BOTH --overlay and static mode, and assert:
 Usage:  python test_overlay_guard_codegen.py [--recompiler <psxrecomp-game.exe>]
 Exit 0 = PASS.
 """
-import argparse, os, struct, subprocess, sys, tempfile
+import argparse
+import os
+import struct
+import subprocess
+import sys
+import tempfile
 
 LOAD = 0x80010000
 
@@ -53,6 +58,10 @@ def build_exe():
     return make_psxexe(LOAD, bytes(body))
 
 
+GAME_SHA256 = "12" * 32
+MANIFEST_SHA256 = "34" * 32
+
+
 def gen_c(recompiler, overlay, tmp):
     psx = os.path.join(tmp, "t.psx")
     seeds = os.path.join(tmp, "seeds.txt")
@@ -62,7 +71,9 @@ def gen_c(recompiler, overlay, tmp):
         f.write(build_exe())
     with open(seeds, "w") as f:
         f.write("0x80010000\n0x80010020\n")
-    cmd = [recompiler, psx, "--seeds", seeds, "--out-dir", out]
+    cmd = [recompiler, psx, "--seeds", seeds, "--out-dir", out,
+           "--game-identity-sha256", GAME_SHA256,
+           "--manifest-digest-sha256", MANIFEST_SHA256]
     if overlay:
         cmd.append("--overlay")
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -80,7 +91,12 @@ def gen_c(recompiler, overlay, tmp):
     for name in full:
         with open(os.path.join(out, name)) as f:
             chunks.append(f.read())
-    return "\n".join(chunks)
+    dispatch = next((name for name in os.listdir(out)
+                     if name.endswith("_dispatch.c")), None)
+    if not dispatch:
+        raise SystemExit(f"no _dispatch.c emitted in {out}")
+    with open(os.path.join(out, dispatch)) as f:
+        return "\n".join(chunks), f.read()
 
 
 def main():
@@ -95,8 +111,8 @@ def main():
 
     fails = []
     with tempfile.TemporaryDirectory() as tmp:
-        ov = gen_c(args.recompiler, True, tmp)
-        st = gen_c(args.recompiler, False, tmp)
+        ov, _ov_dispatch = gen_c(args.recompiler, True, tmp)
+        st, st_dispatch = gen_c(args.recompiler, False, tmp)
 
     if "psx_native_bad_entry(" not in ov:
         fails.append("OVERLAY codegen is MISSING the fail-closed guard "
@@ -110,6 +126,18 @@ def main():
                      "the guard must be overlay-scoped (config_.overlay_mode).")
     else:
         print("PASS: static codegen keeps the legacy fall-through (no guard).")
+
+    if "static const PsxGameIdentity" not in st_dispatch:
+        fails.append("STATIC dispatch is missing fixed-width game identity arrays.")
+    if "psx_game_identity_gate" not in st_dispatch:
+        fails.append("STATIC dispatch is missing the fail-closed identity gate.")
+    else:
+        dispatch_body = st_dispatch[st_dispatch.index("int psx_dispatch_game_compiled"):]
+        gate = dispatch_body.index("psx_game_identity_gate")
+        dirty = dispatch_body.index("dirty_ram_text_native_ok_ranges_from")
+        call = dispatch_body.index("entry->fn(cpu)")
+        if not gate < dirty < call:
+            fails.append("STATIC dispatch identity gate must precede dirty-RAM and native calls.")
 
     if fails:
         for m in fails:

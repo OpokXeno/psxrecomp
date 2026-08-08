@@ -40,6 +40,7 @@ void func_80010000(CPUState *cpu) {
     psx_cyc_bb_defer_end();
     if (psx_check_interrupts_at(cpu, 0x80010004u)) return;
     if (psx_slice_block(cpu, 0x80010000u, 1u, 0)) return;
+    gte_execute_at(cpu, 0x0000006u, 0x80010008u);
     debug_server_log_call_entry(0x80010000u);
 }
 '''

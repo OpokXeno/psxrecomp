@@ -130,6 +130,13 @@ extern uint32_t g_debug_current_func_addr;
 void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                     uint32_t new_val, uint8_t width);
 
+/* Look up the most recent RAM write to a source word. Native GP0 packets
+ * arriving through DMA are issued by the DMA initiator, so the ordinary
+ * store-PC stamp identifies the transfer rather than the producer that built
+ * the packet. The catch-all write ring retains the producer-side provenance. */
+int debug_server_find_last_ram_writer(uint32_t phys, uint32_t *out_pc,
+                                      uint32_t *out_ra);
+
 /* MMIO write trace — separate ring buffer for 0x1F801xxx writes. */
 void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 

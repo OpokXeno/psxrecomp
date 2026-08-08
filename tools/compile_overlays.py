@@ -10,6 +10,8 @@ Usage:
   python3 tools/compile_overlays.py \\
       --captures  build-dev/overlay_captures.json \\
       --game-toml game.toml \\
+      --game-identity-sha256 <lowercase-sha256> \\
+      --manifest-identity-sha256 <lowercase-sha256> \\
       --recompiler psxrecomp/recompiler/build/psxrecomp-game.exe \\
       --runtime-include psxrecomp/runtime/include \\
       --out-dir   build-dev/cache
@@ -23,6 +25,7 @@ Each DLL exports:
 import argparse
 import base64
 import binascii
+from dataclasses import dataclass
 from bisect import bisect_left
 from collections import Counter, deque
 from contextlib import contextmanager, nullcontext
@@ -52,6 +55,54 @@ except ImportError:
 import json
 import platform
 import re
+
+
+@dataclass(frozen=True)
+class GameIdentity:
+    game_sha256: bytes
+    manifest_sha256: bytes
+
+
+def parse_game_identity(game_sha256: str, manifest_sha256: str) -> GameIdentity:
+    values = (game_sha256, manifest_sha256)
+    if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in values):
+        raise ValueError("game and manifest identities must be lowercase SHA-256 hex")
+    return GameIdentity(bytes.fromhex(game_sha256), bytes.fromhex(manifest_sha256))
+
+
+def identity_cache_namespace(identity: GameIdentity) -> str:
+    return f"game_{identity.game_sha256.hex()}/manifest_{identity.manifest_sha256.hex()}"
+
+
+def static_identity_metadata(identity: GameIdentity) -> str:
+    return (
+        "/* psxrecomp static identity v1\n"
+        f" * game-sha256 {identity.game_sha256.hex()}\n"
+        f" * manifest-sha256 {identity.manifest_sha256.hex()}\n"
+        " */\n"
+    )
+
+
+def static_output_identity_matches(path: os.PathLike[str] | str,
+                                   identity: GameIdentity) -> bool:
+    try:
+        with open(path, encoding='ascii') as output:
+            prefix = output.read(256)
+    except (OSError, UnicodeError):
+        return False
+    match = re.match(
+        r'\A/\* psxrecomp static identity v1\n'
+        r' \* game-sha256 ([0-9a-f]{64})\n'
+        r' \* manifest-sha256 ([0-9a-f]{64})\n'
+        r' \*/\n',
+        prefix)
+    if not match:
+        return False
+    try:
+        actual = parse_game_identity(match.group(1), match.group(2))
+    except ValueError:
+        return False
+    return actual == identity
 
 
 def codegen_ver(runtime_include: str) -> int:
@@ -368,7 +419,7 @@ HOSTED_BATCH_ALIAS_CAP = 256
 # resume an attempt-capped suffix.
 HOSTED_COMPILE_ATTEMPT_CAP = 2 * HOSTED_SELECTED_ALIAS_CAP - 1
 HOSTED_EMITTED_IDENTITY_CAP = 1024
-MANIFEST_LINE_MAX = 128
+MANIFEST_LINE_MAX = 160
 MANIFEST_PHYSICAL_LINE_MAX = 159
 MANIFEST_ASCII_WHITESPACE = ' \t\r\v\f'
 HOSTED_MANIFEST_PROVENANCE = 'hosted-v1'
@@ -2165,7 +2216,7 @@ def add_cps_resume_case(src: str, host_symbol: str,
     return src[:definition.end()] + prologue_text + src[definition.end():], True
 
 
-def generate_overlay_dispatch(variants: list) -> str:
+def generate_overlay_dispatch(variants: list, identity: GameIdentity) -> str:
     """Generate byte-validated dispatch for all static overlay variants."""
     unique = []
     seen = set()
@@ -2186,9 +2237,18 @@ def generate_overlay_dispatch(variants: list) -> str:
         variant['range_symbol'] = f'psx_ov_static_ranges_{index:05d}'
         by_addr.setdefault(variant['addr'], []).append(variant)
 
+    game_identity = ', '.join(f'0x{value:02X}u'
+                              for value in identity.game_sha256)
+    manifest_identity = ', '.join(f'0x{value:02X}u'
+                                  for value in identity.manifest_sha256)
     lines = [
         '',
         '/* Auto-generated, content-validated overlay dispatch -- do not edit. */',
+        '#include "game_identity.h"',
+        'static const PsxGameIdentity k_psx_overlay_static_identity = {',
+        f'    {{{game_identity}}},',
+        f'    {{{manifest_identity}}}',
+        '};',
         'extern int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,',
         '                                           uint32_t count,',
         '                                           uint32_t expected_crc);',
@@ -2218,6 +2278,8 @@ def generate_overlay_dispatch(variants: list) -> str:
         '}',
         '',
         'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
+        '    if (!psx_game_identity_bind_static(&k_psx_overlay_static_identity) ||',
+        '        !psx_game_identity_gate(&k_psx_overlay_static_identity)) return 0;',
         '    const uint32_t key = (addr & 0x1FFFFFFFu) | 0x80000000u;',
         '    switch (key) {',
     ]
@@ -2388,7 +2450,9 @@ def audit_func_id_delay_slots(func_ids: list, data: bytes,
 
 
 def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
-                        provenance: str | None = None) -> str:
+                         provenance: str | None = None,
+                         identity: GameIdentity | None = None,
+                         artifact: tuple[int, int, int] | None = None) -> str:
     """Serialize one loader manifest.
 
     ``P`` is an optional DLL/manifest publication identity.  Old runtimes
@@ -2401,6 +2465,17 @@ def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
     out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
     if provenance is not None:
         out_lines.append(f'# psxrecomp overlay provenance {provenance}\n')
+    if identity is not None:
+        out_lines.append(f'I {identity.game_sha256.hex().upper()} '
+                         f'{identity.manifest_sha256.hex().upper()}\n')
+    if artifact is not None:
+        artifact_base, artifact_size, artifact_crc32 = artifact
+        artifact_phys = artifact_base & 0x1FFFFFFF
+        if (artifact_size <= 0 or artifact_phys >= PSX_RAM_SIZE or
+                artifact_size > PSX_RAM_SIZE - artifact_phys):
+            raise ValueError('invalid overlay artifact tuple')
+        out_lines.append(f'A {(artifact_phys | 0x80000000):08X} '
+                         f'{artifact_size:X} {artifact_crc32 & 0xFFFFFFFF:08X}\n')
     if pair_id is not None:
         out_lines.append(f'P {pair_id & 0xFFFFFFFFFFFFFFFF:016X}\n')
     for ev, crc, ranges in func_ids:
@@ -2412,15 +2487,37 @@ def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
 
 
 def overlay_pair_id(src: str, func_ids: list,
-                    provenance: str | None = None) -> int:
+                    provenance: str | None = None,
+                    identity: GameIdentity | None = None,
+                    artifact: tuple[int, int, int] | None = None) -> int:
     """Bind a newly compiled DLL to the exact C and range manifest it uses."""
     digest = hashlib.sha256()
     digest.update(b'psxrecomp overlay pair v1\0')
     digest.update(src.encode('utf-8'))
     digest.update(b'\0')
     digest.update(overlay_ranges_text(
-        func_ids, provenance=provenance).encode('ascii'))
+        func_ids, provenance=provenance, identity=identity,
+        artifact=artifact).encode('ascii'))
     return int.from_bytes(digest.digest()[:8], 'big')
+
+
+def add_overlay_identity_export(src: str, identity: GameIdentity) -> str:
+    game = ', '.join(f'0x{value:02X}u' for value in identity.game_sha256)
+    manifest = ', '.join(f'0x{value:02X}u' for value in identity.manifest_sha256)
+    return src + f'''\n#include "game_identity.h"
+static const uint8_t k_psx_overlay_game_sha256[32] = {{{game}}};
+static const uint8_t k_psx_overlay_manifest_sha256[32] = {{{manifest}}};
+static const PsxGameIdentity k_psx_overlay_identity = {{
+    {{{game}}},
+    {{{manifest}}}
+}};
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+const PsxGameIdentity *overlay_game_identity(void) {{ return &k_psx_overlay_identity; }}
+'''
 
 
 def add_overlay_pair_export(src: str, pair_id: int) -> str:
@@ -2437,7 +2534,9 @@ uint64_t overlay_pair_id(void) {{ return UINT64_C(0x{pair_id:016X}); }}
 
 def write_overlay_ranges_from(func_ids: list, out_path: str,
                               pair_id: int | None = None,
-                              provenance: str | None = None) -> int:
+                              provenance: str | None = None,
+                              identity: GameIdentity | None = None,
+                              artifact: tuple[int, int, int] | None = None) -> int:
     """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
     parse_overlay_func_ids. Returns the number of functions written.
 
@@ -2445,7 +2544,8 @@ def write_overlay_ranges_from(func_ids: list, out_path: str,
       F <entry_hex> <code_crc_hex>     one per function
       R <lo_hex> <len_hex>             one per coalesced code range"""
     with open(out_path, 'w') as f:
-        f.write(overlay_ranges_text(func_ids, pair_id, provenance))
+        f.write(overlay_ranges_text(func_ids, pair_id, provenance, identity,
+                                    artifact))
     return len(func_ids)
 
 
@@ -2512,8 +2612,9 @@ def load_region_entry_set(cache_dir: str, phys_addr: int,
 
 
 def parse_runtime_shard_manifest(manifest: str,
-                                 require_pair: bool = True
-                                 ) -> tuple[int | None, list]:
+                                  require_pair: bool = True,
+                                  include_artifact: bool = False
+                                  ) -> tuple[int | None, list] | tuple[int | None, list, tuple[int, int, int] | None]:
     """Parse only identities representable by the runtime manifest contract."""
     def hex_field(token: str, max_digits: int) -> int:
         if not re.fullmatch(rf'[0-9A-Fa-f]{{1,{max_digits}}}', token):
@@ -2521,20 +2622,23 @@ def parse_runtime_shard_manifest(manifest: str,
         return int(token, 16)
 
     pair_ids = []
+    artifacts = []
+    identities = []
     funcs = []
     current = None
+    invalid_result = (None, [], None) if include_artifact else (None, [])
     if '\0' in manifest:
-        return None, []
+        return invalid_result
     # Runtime reads physical records with fgets(), so only LF terminates a
     # record. A trailing CR in CRLF is ordinary whitespace; a bare CR between
     # directives is not a second record and must therefore fail identically.
     for line in manifest.split('\n'):
         if len(line) > MANIFEST_PHYSICAL_LINE_MAX:
-            return None, []
+            return invalid_result
         cr = line.find('\r')
         record_width = len(line) if cr < 0 else cr
         if record_width > MANIFEST_LINE_MAX:
-            return None, []
+            return invalid_result
         stripped = line.strip(MANIFEST_ASCII_WHITESPACE)
         parts = (re.split(r'[ \t\r\v\f]+', stripped)
                  if stripped else [])
@@ -2542,34 +2646,58 @@ def parse_runtime_shard_manifest(manifest: str,
             continue
         if parts[0] == 'P':
             if len(parts) != 2:
-                return None, []
+                return invalid_result
             try:
                 pair_ids.append(hex_field(parts[1], 16))
             except ValueError:
-                return None, []
+                return invalid_result
+        elif parts[0] == 'A':
+            if len(parts) != 4:
+                return invalid_result
+            try:
+                base = hex_field(parts[1], 8)
+                size = hex_field(parts[2], 8)
+                crc32 = hex_field(parts[3], 8)
+            except ValueError:
+                return invalid_result
+            physical_base = base & 0x1FFFFFFF
+            if (base & 0xFFE00000) != 0x80000000 or size <= 0 or \
+                    physical_base >= PSX_RAM_SIZE or \
+                    size > PSX_RAM_SIZE - physical_base:
+                return invalid_result
+            artifacts.append((base, size, crc32))
+        elif parts[0] == 'I':
+            if len(parts) != 3:
+                return invalid_result
+            try:
+                identities.append(parse_game_identity(parts[1].lower(), parts[2].lower()))
+            except ValueError:
+                return invalid_result
         elif parts[0] == 'F':
             if len(parts) != 3:
-                return None, []
+                return invalid_result
             try:
                 current = [((hex_field(parts[1], 8) & 0x1FFFFFFF) |
                             0x80000000),
                            hex_field(parts[2], 8), []]
             except ValueError:
-                return None, []
+                return invalid_result
             funcs.append(current)
         elif parts[0] == 'R' and current is not None:
             if len(parts) != 3:
-                return None, []
+                return invalid_result
             try:
                 current[2].append((hex_field(parts[1], 8),
                                    hex_field(parts[2], 8)))
             except ValueError:
-                return None, []
-    if len(pair_ids) > 1 or (require_pair and len(pair_ids) != 1) or not funcs:
-        return None, []
+                return invalid_result
+    if (len(pair_ids) > 1 or len(artifacts) > 1 or
+            (require_pair and len(pair_ids) != 1) or
+            len(identities) != 1 or not funcs):
+        return invalid_result
     entries = [entry & 0x1FFFFFFF for entry, _crc, _ranges in funcs]
     if len(set(entries)) != len(entries):
-        return None, []
+        return invalid_result
     for entry, _crc, ranges in funcs:
         entry_phys = entry & 0x1FFFFFFF
         if (not 1 <= len(ranges) <= 16 or
@@ -2580,9 +2708,12 @@ def parse_runtime_shard_manifest(manifest: str,
                 not any((start & 0x1FFFFFFF) <= entry_phys <
                         (start & 0x1FFFFFFF) + length
                         for start, length in ranges)):
-            return None, []
-    return (pair_ids[0] if pair_ids else None,
-            [tuple(func) for func in funcs])
+            return invalid_result
+    parsed_pair = pair_ids[0] if pair_ids else None
+    parsed_funcs = [tuple(func) for func in funcs]
+    if include_artifact:
+        return parsed_pair, parsed_funcs, artifacts[0] if artifacts else None
+    return parsed_pair, parsed_funcs
 
 
 def load_shard_func_ids(dll_path: str,
@@ -2850,7 +2981,9 @@ def generate_interior_fragment_static(interior: int, data: bytes,
         os.makedirs(out_dir_tmp)
         cmd = [args.recompiler, psx, '--seeds', seeds_path,
                '--out-dir', out_dir_tmp, '--overlay',
-               '--ws-config', os.path.abspath(args.game_toml)]
+               '--ws-config', os.path.abspath(args.game_toml),
+               '--game-identity-sha256', args.game_identity_sha256,
+               '--manifest-digest-sha256', args.manifest_identity_sha256]
         sub_env = dict(os.environ)
         if args.cps:
             sub_env['PSX_CPS'] = '1'
@@ -3715,7 +3848,9 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
         os.makedirs(out_dir_tmp)
         cmd = [args.recompiler, psx, '--seeds', seeds_path,
                '--out-dir', out_dir_tmp, '--overlay',
-               '--ws-config', os.path.abspath(args.game_toml)]
+               '--ws-config', os.path.abspath(args.game_toml),
+               '--game-identity-sha256', args.game_identity_sha256,
+               '--manifest-digest-sha256', args.manifest_identity_sha256]
         r = subprocess.run(cmd, capture_output=True, text=True,
                            cwd=os.path.dirname(os.path.abspath(args.game_toml)),
                            env=sub_env)
@@ -3798,7 +3933,10 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                 return None, ('hosted-entry-audit: conflicting manifest '
                               'provenance')
             manifest_provenance = HOSTED_MANIFEST_PROVENANCE
-        pair_id = overlay_pair_id(src, frag_ids, manifest_provenance)
+        src = add_overlay_identity_export(src, args.identity)
+        artifact = (load_addr, size, binascii.crc32(data) & 0xFFFFFFFF)
+        pair_id = overlay_pair_id(src, frag_ids, manifest_provenance,
+                                  args.identity, artifact)
         src = add_overlay_pair_export(src, pair_id)
         # Key the fragment DLL by its func-identity SET (dedup like a region
         # bundle); the loader keys DLLs by the region_start filename prefix and
@@ -3810,7 +3948,8 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
             cache_status = cached_shard_manifest_status(
                 dll_path, overlay_abi_tag(args.runtime_include, args.flavor),
                 overlay_ranges_text(
-                    frag_ids, pair_id, manifest_provenance), pair_id)
+                    frag_ids, pair_id, manifest_provenance, args.identity,
+                    artifact), pair_id)
             if cache_status == 'match':
                 return frag_ids, 'cached'   # exact identity already built
             if cache_status == 'mismatch':
@@ -3846,9 +3985,10 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                            expected_existing_abi=overlay_abi_tag(
                                args.runtime_include, args.flavor),
                            publication_result=publication,
-                           candidate_cap=overlay_candidate_cap(
-                               args.runtime_include),
-                           manifest_provenance=manifest_provenance):
+                            candidate_cap=overlay_candidate_cap(
+                                args.runtime_include),
+                            manifest_provenance=manifest_provenance,
+                            identity=args.identity, artifact=artifact):
             if publication.get('capacity_error'):
                 capacity_error = publication['capacity_error']
                 match = re.search(
@@ -3866,7 +4006,8 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
             cache_status = cached_shard_manifest_status(
                 dll_path, overlay_abi_tag(args.runtime_include, args.flavor),
                 overlay_ranges_text(
-                    frag_ids, pair_id, manifest_provenance), pair_id)
+                    frag_ids, pair_id, manifest_provenance, args.identity,
+                    artifact), pair_id)
             if cache_status != 'match':
                 return None, ('fragment cache-key collision/concurrent pair: '
                               'preserved manifest does not match generated identity')
@@ -4087,8 +4228,10 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 preserve_existing_pair: bool = False,
                 expected_existing_abi: int | None = None,
                 publication_result: dict | None = None,
-                candidate_cap: int | None = None,
-                manifest_provenance: str | None = None) -> bool:
+                 candidate_cap: int | None = None,
+                 manifest_provenance: str | None = None,
+                 identity: GameIdentity | None = None,
+                 artifact: tuple[int, int, int] | None = None) -> bool:
     """Publish a shard only after all of its artifacts are complete.
 
     GCC and tcc write their output incrementally. If the process is interrupted
@@ -4112,7 +4255,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         try:
             capacity_error = preflight_shard_candidate_capacity(
                 final_out, func_ids, pair_id, manifest_provenance,
-                expected_existing_abi, candidate_cap)
+                expected_existing_abi, candidate_cap, artifact)
         except Exception as exc:
             # A failed optimization must not replace the authoritative locked
             # projection after linking.  Compile normally and let publication
@@ -4145,7 +4288,8 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 publication_result['published'] = True
             return True
         write_overlay_ranges_from(
-            func_ids, staged_ranges, pair_id, manifest_provenance)
+            func_ids, staged_ranges, pair_id, manifest_provenance, identity,
+            artifact)
         if not os.path.isfile(staged_ranges) or os.path.getsize(staged_ranges) == 0:
             print('  COMPILE ERROR: range manifest staging produced no output')
             return False
@@ -4391,7 +4535,8 @@ def _runtime_manifest_range_link_count(funcs: list) -> int:
 
 
 def _normalized_runtime_manifest_identity(manifest: str, pair_id: int | None,
-                                          funcs: list):
+                                           funcs: list,
+                                           artifact: tuple[int, int, int] | None = None):
     """Return a conservative whole-pair identity, or ``None`` if ambiguous.
 
     Runtime address aliases are normalized, but F and R ordering is retained:
@@ -4410,7 +4555,7 @@ def _normalized_runtime_manifest_identity(manifest: str, pair_id: int | None,
          tuple((start & 0x1FFFFFFF, length) for start, length in ranges))
         for entry, crc, ranges in funcs
     )
-    return pair_id, provenance, normalized_funcs
+    return pair_id, provenance, artifact, normalized_funcs
 
 
 def _candidate_group_identity(cache_dir: str, manifest_identity):
@@ -4498,8 +4643,8 @@ def _load_candidate_inventory_record(dll: str,
                     return cached[1]
             with open(ranges_path, encoding='ascii', newline='') as source:
                 manifest = source.read()
-            pair_id, funcs = parse_runtime_shard_manifest(
-                manifest, require_pair=False)
+            pair_id, funcs, artifact = parse_runtime_shard_manifest(
+                manifest, require_pair=False, include_artifact=True)
             raw_count = len(funcs)
             range_link_count = _runtime_manifest_range_link_count(funcs)
             if (not funcs or not _dll_runtime_exports_match(
@@ -4508,7 +4653,7 @@ def _load_candidate_inventory_record(dll: str,
                 record = ([], None, raw_count, range_link_count)
             else:
                 identity = _normalized_runtime_manifest_identity(
-                    manifest, pair_id, funcs)
+                    manifest, pair_id, funcs, artifact)
                 record = (
                     funcs,
                     _candidate_group_identity(os.path.dirname(dll), identity),
@@ -4709,7 +4854,8 @@ def _candidate_capacity_projection_error(
 def preflight_shard_candidate_capacity(
         final_dll: str, func_ids: list, pair_id: int,
         manifest_provenance: str | None, expected_abi: int | None,
-        candidate_cap: int) -> str | None:
+        candidate_cap: int,
+        artifact: tuple[int, int, int] | None = None) -> str | None:
     """Reject an impossible publication before invoking the native linker.
 
     The locked publication check remains authoritative.  This early check is
@@ -4720,9 +4866,9 @@ def preflight_shard_candidate_capacity(
     final_dll = os.path.abspath(final_dll)
     capacity_lock, cache_dirs = _candidate_capacity_namespace(final_dll)
     manifest = overlay_ranges_text(
-        func_ids, pair_id, manifest_provenance)
+        func_ids, pair_id, manifest_provenance, artifact=artifact)
     staged_identity = _normalized_runtime_manifest_identity(
-        manifest, pair_id, func_ids)
+        manifest, pair_id, func_ids, artifact)
     staged_range_links = _runtime_manifest_range_link_count(func_ids)
     with _exclusive_file_lock(capacity_lock):
         cache_dirs_key = tuple(
@@ -4876,8 +5022,9 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
             try:
                 with open(staged_ranges, encoding='ascii', newline='') as source:
                     staged_manifest = source.read()
-                    staged_pair, staged_funcs = (
-                        parse_runtime_shard_manifest(staged_manifest))
+                    staged_pair, staged_funcs, staged_artifact = (
+                        parse_runtime_shard_manifest(
+                            staged_manifest, include_artifact=True))
             except (OSError, UnicodeError) as exc:
                 raise RuntimeError(
                     f'cannot read staged range manifest: {exc}') from exc
@@ -4889,7 +5036,7 @@ def publish_shard_pair(staged_dll: str, staged_ranges: str,
             total, counts = cache_candidate_inventory(
                 cache_dirs, expected_existing_abi)
             staged_identity = _normalized_runtime_manifest_identity(
-                staged_manifest, staged_pair, staged_funcs)
+                staged_manifest, staged_pair, staged_funcs, staged_artifact)
             staged_range_links = _runtime_manifest_range_link_count(staged_funcs)
             (projected, projected_raw, projected_range_links,
              projected_files) = _projected_cache_capacity_usage(
@@ -5102,6 +5249,10 @@ def main():
                          'for manual/offline invocation.')
     ap.add_argument('--game-toml',       required=True,
                     help='game.toml (for game_id)')
+    ap.add_argument('--game-identity-sha256', required=True,
+                    help='lowercase 32-byte SHA-256 of the compiled game image')
+    ap.add_argument('--manifest-identity-sha256', required=True,
+                    help='lowercase 32-byte SHA-256 of the game manifest')
     ap.add_argument('--recompiler',      required=True,
                     help='path to psxrecomp-game.exe')
     ap.add_argument('--runtime-include', required=True,
@@ -5153,6 +5304,11 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
+    try:
+        args.identity = parse_game_identity(args.game_identity_sha256,
+                                            args.manifest_identity_sha256)
+    except ValueError as exc:
+        ap.error(str(exc))
     forced_interiors = {
         (int(v, 0) & 0x1FFFFFFF) | 0x80000000
         for v in args.force_interior
@@ -5219,9 +5375,17 @@ def main():
 
     if args.static:
         static_out = os.path.join(args.out_dir, 'overlays_static.c')
-        if os.path.exists(static_out) and not args.force:
-            print(f'SKIP: {static_out} already exists (use --force to recompile)')
-            return
+        if os.path.exists(static_out):
+            identity_matches = static_output_identity_matches(
+                static_out, args.identity)
+            if identity_matches and not args.force:
+                print(f'SKIP: {static_out} already exists with matching identity '
+                      '(use --force to recompile)')
+                return
+            if not identity_matches:
+                print(f'REGENERATE: {static_out} has missing or mismatched '
+                      'identity metadata')
+                os.remove(static_out)
         os.makedirs(args.out_dir, exist_ok=True)
     else:
         # Namespaced + versioned gcc cache: <game_id>/gcc/<arch-abi>/cg<N>/
@@ -5230,8 +5394,9 @@ def main():
         # overlay_loader.c scan_cache_dir(). Pre-1.0: no legacy fallback.
         cg = codegen_ver(args.runtime_include)
         ch = codegen_hash(args.runtime_include)
-        cache_dir = os.path.join(args.out_dir, game_id, args.compiler, cache_arch_abi(),
-                                 f'cg{cg}_{ch:08x}')
+        cache_dir = os.path.join(args.out_dir, game_id, identity_cache_namespace(args.identity),
+                                 args.compiler, cache_arch_abi(),
+                                  f'cg{cg}_{ch:08x}')
         os.makedirs(cache_dir, exist_ok=True)
         print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x})')
 
@@ -5436,7 +5601,9 @@ def main():
                    # emits (backdrop screenX squash, and any sprite-tag/cull
                    # sites that resolve into overlay code) are applied. --ws-config
                    # only adopts the widescreen lists, not the game's exe/paths.
-                   '--ws-config', os.path.abspath(args.game_toml)]
+                    '--ws-config', os.path.abspath(args.game_toml),
+                    '--game-identity-sha256', args.game_identity_sha256,
+                    '--manifest-digest-sha256', args.manifest_identity_sha256]
             print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
             sub_env = dict(os.environ)
@@ -5626,7 +5793,10 @@ def main():
                     stats.add_fail(
                         _label, 'manifest_ranges', representability_error)
                     return
-                pair_id = overlay_pair_id(src, this_ids)
+                src = add_overlay_identity_export(src, args.identity)
+                artifact = (load_addr, size, binascii.crc32(data) & 0xFFFFFFFF)
+                pair_id = overlay_pair_id(src, this_ids, identity=args.identity,
+                                          artifact=artifact)
                 src = add_overlay_pair_export(src, pair_id)
                 # Retained source is the exact source compiled into the DLL.
                 with open(patched_c, 'w') as f:
@@ -5652,9 +5822,11 @@ def main():
                                           BIOS_RESIDENT_PRODUCER),
                                       expected_existing_abi=overlay_abi_tag(
                                           args.runtime_include, args.flavor),
-                                      publication_result=publication,
-                                      candidate_cap=overlay_candidate_cap(
-                                          args.runtime_include))
+                                        publication_result=publication,
+                                        candidate_cap=overlay_candidate_cap(
+                                            args.runtime_include),
+                                        identity=args.identity,
+                                        artifact=artifact)
                 if success:
                     # compile_dll transactionally published the per-entry range
                     # manifest beside the DLL from the same func-id list used by
@@ -6539,13 +6711,14 @@ def main():
                                'captured dispatch entry with no compiled body/owner')
 
         all_variants = []
-        combined = '/* Auto-generated overlay dispatch — do not edit.\n'
+        combined = static_identity_metadata(args.identity)
+        combined += '/* Auto-generated overlay dispatch — do not edit.\n'
         combined += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
         combined += ' */\n'
         for part in static_parts:
             combined += part['src']
             all_variants.extend(part['variants'])
-        combined += generate_overlay_dispatch(all_variants)
+        combined += generate_overlay_dispatch(all_variants, args.identity)
         with open(static_out, 'w') as f:
             f.write(combined)
         print(f'Static output: {static_out}  '

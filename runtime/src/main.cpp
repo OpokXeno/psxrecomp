@@ -23,19 +23,30 @@
 #include "savestate.h"
 #include "overlay_capture.h"
 #include "overlay_loader.h"
+#include "game_identity.h"
 #include "autocompile.h"
 #include "code_provider.h"
 extern "C" void psx_event_step_conservative_env_init(void);
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "mdec.h"
 #include "present_ring.h"
 #include "load_transition_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_vk_renderer.h"
+#include "guest_render_bridge.h"
+#include "guest_render_native_stream.h"
+#include "guest_render_transaction.h"
+#include "native_render_mode_control.h"
+#include "native_render_baseline.h"
+#include "xg_render_auth_runtime.h"
 #include "frame_pacing.h"
+#include "xenogears_timing.h"
 #include "latency_ring.h"
+#include "input_replay.h"
+#include "host_input_mapping.h"
 #include "sio.h"
 #include "psx_netplay.h"
 #include "psx_lobby_client.h"
@@ -83,6 +94,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -104,6 +117,23 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
+
+#ifndef PSX_NO_DEBUG_TOOLS
+static bool native_source_writer_observer(
+        uint32_t source_word_address,
+        GuestRenderNativeSourceWriter *out_writer) {
+    uint32_t pc = 0u;
+    uint32_t ra = 0u;
+
+    if (!out_writer || !debug_server_find_last_ram_writer(
+            source_word_address, &pc, &ra))
+        return false;
+    out_writer->pc = pc;
+    out_writer->function = 0u;
+    out_writer->return_address = ra;
+    return true;
+}
 #endif
 
 #ifndef PSX_DEFAULT_BIOS_PATH
@@ -141,6 +171,7 @@ extern "C" {
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);
 extern "C" uint32_t memory_get_bios_checksum(void);
+extern "C" void     overlay_watch_set_range(uint32_t phys, uint32_t len);
 extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
                                                   const uint8_t *bytes,
                                                   uint32_t len);
@@ -300,6 +331,7 @@ struct PlayerInput {
     SDL_JoystickID      instance = -1;
 };
 static PlayerInput g_players[2];
+static std::string s_input_replay_evidence_path;
 /* ARGB8888 staging buffer. Sized for the active internal resolution:
  * 640*scale x 512*scale. Allocated once the supersampling scale is known
  * (sized for the native 640x512 when supersampling is off). */
@@ -327,6 +359,8 @@ static void mod_call_frame_hooks() {
 /* Presentation-only interpolation for software-rendered content that repeats
  * each guest image for two vblanks. This never changes guest or audio timing. */
 static std::atomic<int> g_smooth_60fps{0};
+static std::atomic<int> g_smooth_60fps_requested{0};
+static NativeRenderModeControl g_native_render_mode_control{};
 
 struct Smooth60State {
     std::vector<uint32_t> previous_source;
@@ -354,6 +388,7 @@ static int      s_fmv_skip_present_skip = 0;
 static int      s_netplay_depth24_present_skip = 0;
 static uint32_t s_fmv_skip_last_mdec = 0;
 static int      s_fmv_skip_hold = 0;
+static bool     s_native_wide_gameplay_started = false;
 
 static void smooth_60_reset(void) {
     g_smooth_60_state.previous_source.clear();
@@ -376,6 +411,7 @@ static void present_session_reset(void) {
     s_netplay_depth24_present_skip = 0;
     s_fmv_skip_last_mdec = 0;
     s_fmv_skip_hold = 0;
+    s_native_wide_gameplay_started = false;
     smooth_60_reset();
 }
 
@@ -383,6 +419,9 @@ static void present_session_reset(void) {
  * longjmp). Clears present latches and forces the next vblank to show the
  * restored VRAM — including a blank if display was disabled in the snapshot. */
 extern "C" void psx_frontend_on_savestate_loaded(void) {
+    extern void psx_xenogears_field_resident_invalidate(void);
+    psx_xenogears_timing_on_savestate_loaded();
+    psx_xenogears_field_resident_invalidate();
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
     smooth_60_reset();
@@ -479,7 +518,14 @@ static void smooth_60_present(uint32_t* pixels, uint32_t width, uint32_t height,
 }
 
 extern "C" void psx_smooth_60fps_set(int enabled) {
-    g_smooth_60fps.store(enabled ? 1 : 0, std::memory_order_release);
+    const bool requested = enabled != 0;
+    g_smooth_60fps_requested.store(requested ? 1 : 0,
+                                   std::memory_order_release);
+    native_render_mode_control_set_smooth(&g_native_render_mode_control,
+                                          requested);
+    if (!g_native_render_mode_control.initialized)
+        g_smooth_60fps.store(requested ? 1 : 0,
+                             std::memory_order_release);
 }
 #if defined(PSX_WEB)
 extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
@@ -559,6 +605,12 @@ static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
 static double        g_host_refresh_hz = 0.0;
 
+extern "C" void psx_frame_interpolation_set(int enabled) {
+    g_frame_interpolation = enabled ? 1 : 0;
+    native_render_mode_control_set_interpolation(
+        &g_native_render_mode_control, g_frame_interpolation != 0);
+}
+
 /* Map the configured tri-state fullscreen mode (g_fullscreen) to the SDL
  * window-fullscreen flag: used both to open the window in that mode and to
  * pick the hotkey's fullscreen target. */
@@ -616,6 +668,9 @@ static bool          g_ws_engaged = true;
  * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
  * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
 static int           g_ws_native_wide = 1;
+/* Producer-driven Native widescreen. This keeps every legacy gpu_ws/GTE patch
+ * inert and renders only through the OpenGL Native semantic surface. */
+static bool          g_native_render_widescreen = false;
 /* Logical present width for the SDL_Renderer (software) path; 640*scale at
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
@@ -688,13 +743,24 @@ static void update_adaptive_widescreen() {
         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
     }
 
+    const bool wide = num * 3 != den * 4;
+    if (g_native_render_widescreen)
+        gpu_ws_configure_native_cull(wide, num, den, 320, 240);
+
     if (g_ws_engaged) {
-        const bool wide = num * 3 != den * 4;
-        const int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
+        const int mode = wide && !g_native_render_widescreen
+            ? (g_ws_native_wide ? 2 : 1) : 0;
         gte_set_display_aspect(mode == 1 ? num : 4,
                                mode == 1 ? den : 3);
-        gpu_ws_configure(num, den, g_ws_anchor_addr,
-                         g_ws_hud_sprt ? 1 : 0, mode);
+        gpu_ws_configure(mode != 0 ? num : 4, mode != 0 ? den : 3,
+                          g_ws_anchor_addr,
+                          g_ws_hud_sprt ? 1 : 0, mode);
+        if (g_native_render_widescreen) {
+            (void)psx_xg_render_auth_configure_native_view(
+                wide, (uint16_t)num, (uint16_t)den, 320u, 240u);
+            (void)gl_renderer_configure_native_view(
+                wide ? 1 : 0, num, den, 320, 240);
+        }
     }
 }
 
@@ -713,6 +779,7 @@ static void configure_core_gl_context_attributes() {
  * Re-engages with the chosen mode in place if widescreen is already running. */
 extern "C" void psx_ws_set_native_wide(int on) {
     g_ws_native_wide = on ? 1 : 0;
+    if (g_native_render_widescreen) return;
     if (g_ws_engaged && g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         int mode = g_ws_native_wide ? 2 : 1;
         gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
@@ -729,6 +796,65 @@ static bool          g_vk_active = false;    /* Vulkan context live -> VK presen
  * to force the software readout path instead — a diagnostic/fallback that also
  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
 static int           g_gl_fbo_present = 1;
+
+extern "C" void psx_frame_interpolation_set_suspended(int suspended) {
+    if (g_gl_active)
+        gl_renderer_set_interpolation_suspended(
+            (g_native_render_mode_control.snapshot.quiesced || suspended) ? 1 : 0);
+}
+
+static bool native_render_opengl_effective(void *) {
+    return g_video_renderer == PSXRecompV4::VIDEO_RENDERER_OPENGL &&
+           g_gl_active;
+}
+
+static void native_render_set_interpolation_effective(bool enabled, void *) {
+    if (g_gl_active)
+        gl_renderer_set_interpolation(enabled ? 1 : 0, g_host_refresh_hz,
+                                      (double)g_frame_interpolation_fps);
+}
+
+static void native_render_set_interpolation_suspended(bool suspended, void *) {
+    if (g_gl_active)
+        gl_renderer_set_interpolation_suspended(suspended ? 1 : 0);
+}
+
+static void native_render_set_smooth_effective(bool enabled, void *) {
+    g_smooth_60fps.store(enabled ? 1 : 0, std::memory_order_release);
+}
+
+static void native_render_clear_histories(void *) {
+    smooth_60_reset();
+    if (g_gl_active) gl_renderer_set_interpolation_suspended(1);
+}
+
+static uint32_t native_render_history_count(void *) {
+    int interpolation_history = 0;
+
+    if (g_gl_active)
+        gl_renderer_interpolation_diag(nullptr, nullptr,
+                                       &interpolation_history, nullptr,
+                                       nullptr, nullptr);
+    return (uint32_t)std::max(interpolation_history, 0) +
+           (g_smooth_60_state.have_source ? 1u : 0u);
+}
+
+static bool native_render_presentation_gate(
+    GuestRenderRenderMode requested_mode,
+    NativeRenderPresentationSnapshot *out_snapshot,
+    void *) {
+    return native_render_mode_control_boundary(
+        &g_native_render_mode_control, requested_mode, out_snapshot);
+}
+
+extern "C" int g_exec_phase;
+
+static int native_render_exchange_exec_phase(int phase) {
+    const int previous = g_exec_phase;
+
+    g_exec_phase = phase;
+    return previous;
+}
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -1365,6 +1491,21 @@ static void shutdown_runtime(void) {
     }
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
+    if (input_replay::recording()) {
+        std::string record_error;
+        if (!input_replay::record_close(&record_error))
+            input_replay::record_abort();
+    }
+    if (input_replay::record_complete() &&
+        !s_input_replay_evidence_path.empty()) {
+        std::string evidence_error;
+        (void)input_replay::write_record_evidence(
+            s_input_replay_evidence_path.c_str(), &evidence_error);
+    }
+    if (input_replay::active()) {
+        SDL_GameController* replay_players[2] = { nullptr, nullptr };
+        input_replay::detach(replay_players);
+    }
     psx_debug_overlay_shutdown();
     debug_server_shutdown();
 }
@@ -1966,27 +2107,12 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
 #define PAD_CROSS    (1 << 14)
 #define PAD_SQUARE   (1 << 15)
 
-struct ControllerSource {
-    enum class Kind {
-        None,
-        Button,
-        AxisPositive,
-        AxisNegative,
-    };
-
-    Kind kind = Kind::None;
-    int id = -1;
-};
-
-struct PsxButtonMap {
-    uint16_t bit;
-    const char* ini_name;
-    std::vector<ControllerSource> sources;
-};
+using ControllerSource = host_input::ControllerSource;
+using PsxButtonMap = host_input::ControllerMapEntry;
 
 static int controller_device_index = 0;
 static int controller_deadzone = 12000;
-static std::array<PsxButtonMap, 16> controller_map = {{
+static host_input::ControllerMap controller_map = {{
     { PAD_UP,       "up",       {} },
     { PAD_DOWN,     "down",     {} },
     { PAD_LEFT,     "left",     {} },
@@ -2530,6 +2656,7 @@ static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby)
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
  * 1 or 2 — selects which keybinds.ini section drives a keyboard port. */
 static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_stick_axes) {
+    if (input_replay::active()) input_replay::note_mapping();
     if (p.kind == 1) return pad_from_keyboard(player);
     if (p.kind == 2) return controller_pad_buttons(p.handle, suppress_stick_axes);
     return 0xFFFF;
@@ -2632,6 +2759,7 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always)
  * downgrade. Controlled by PSX_DEV_INPUT (default ON for the dev workflow); set
  * PSX_DEV_INPUT=0 to restore strict single-device-per-port routing. */
 static bool dev_any_input_enabled() {
+    if (input_replay::active()) return false;
     static int cached = -1;
     if (cached < 0) {
         const char* e = std::getenv("PSX_DEV_INPUT");
@@ -2724,9 +2852,8 @@ static void apply_input_override_to_sio(int override_word) {
     sio_request_pad_type(0, eff_analog);
 }
 
-/* Capture one SIO slot's host pad into a netplay/local blob. Returns 1 if a
- * device (or dev-any P1) is present; 0 leaves *out as released/disconnected. */
-static int capture_pad_slot(int s, PsxNetPad* out) {
+static int capture_pad_slot_live(int s, PsxNetPad* out) {
+    if (input_replay::active()) input_replay::note_capture(s);
     if (!out) return 0;
     out->buttons = 0xFFFFu;
     out->lx = out->ly = out->rx = out->ry = 0x80u;
@@ -2808,6 +2935,49 @@ static int capture_pad_slot(int s, PsxNetPad* out) {
     return 1;
 }
 
+static std::optional<host_input::HostInputSnapshot> s_vblank_host_input_snapshot;
+
+static int capture_pad_slot(const host_input::HostInputSnapshot& snapshot, int s,
+                            PsxNetPad* out) {
+    if (input_replay::active()) input_replay::note_capture(s);
+    PlayerInput& player = g_players[s];
+    host_input::PlayerRoute route{
+        static_cast<uint8_t>(player.kind), player.mode, player.hybrid_analog, player.instance};
+    const host_input::MappingOptions options{
+        controller_map, controller_deadzone, psx_debug_overlay_swallow_keyboard(),
+        dev_any_input_enabled() && s == 0};
+    const int captured = host_input::capture_pad_slot(snapshot, s, &route, options, out);
+    player.hybrid_analog = route.hybrid_analog;
+    if (input_replay::active() && captured) input_replay::note_mapping();
+    return captured;
+}
+
+static const host_input::HostInputSnapshot& capture_vblank_input_snapshot() {
+    s_vblank_host_input_snapshot.emplace(host_input::HostInputSnapshot::capture());
+    return *s_vblank_host_input_snapshot;
+}
+
+static void sync_input_replay_slots() {
+    for (int slot = 0; slot < 2; ++slot) {
+        bool connected = false;
+        input_replay::PadMode mode = input_replay::PadMode::Digital;
+        if (!input_replay::current_pad_config(slot, &connected, &mode)) continue;
+        PlayerInput& player = g_players[slot];
+        player = PlayerInput{};
+        player.kind = connected ? 2 : 0;
+        player.mode = mode == input_replay::PadMode::Hybrid ? PSXRecompV4::PAD_MODE_HYBRID :
+                      mode == input_replay::PadMode::Analog ? PSXRecompV4::PAD_MODE_ANALOG :
+                                                              PSXRecompV4::PAD_MODE_DIGITAL;
+        player.handle = connected ? input_replay::controller(slot) : nullptr;
+        if (player.handle) {
+            SDL_Joystick* joystick = SDL_GameControllerGetJoystick(player.handle);
+            player.instance = joystick ? SDL_JoystickInstanceID(joystick) : -1;
+        }
+        sio_set_pad_connected(slot, connected ? 1 : 0);
+        sio_set_pad_config_capable(slot, mode != input_replay::PadMode::Digital);
+    }
+}
+
 /* Netplay-only capture: assigned PlayerInput for this slot only. Never merges
  * keyboard-all / all-controllers (dev_any_input). Same pad-mode / stick rules
  * as capture_pad_slot otherwise. */
@@ -2853,6 +3023,7 @@ static int capture_pad_slot_exclusive(int s, PsxNetPad* out) {
 }
 
 static void apply_pad_slot_to_sio(int s, const PsxNetPad& pad) {
+    if (input_replay::active()) input_replay::note_sio();
     sio_set_pad_state_slot(s, pad.buttons);
     sio_set_pad_sticks(s, pad.lx, pad.ly, pad.rx, pad.ry);
     sio_request_pad_type(s, pad.analog ? 1 : 0);
@@ -3024,14 +3195,27 @@ static void netplay_barrier_admit(int override) {
     }
 }
 
-static void sample_pad_into_sio(int override) {
+static std::array<PsxNetPad, 2> capture_frame_pads(
+        const host_input::HostInputSnapshot& snapshot) {
+    std::array<PsxNetPad, 2> pads{};
+    for (int slot = 0; slot < 2; ++slot) {
+        if (capture_pad_slot(snapshot, slot, &pads[slot])) continue;
+        pads[slot].buttons = 0xFFFFu;
+        pads[slot].lx = pads[slot].ly = pads[slot].rx = pads[slot].ry = 0x80u;
+        pads[slot].analog = 0;
+        pads[slot].connected = 0;
+    }
+    return pads;
+}
+
+static void sample_pad_into_sio(const std::array<PsxNetPad, 2>& pads, int override) {
     if (override >= 0) {
         apply_input_override_to_sio(override);
         return;
     }
     for (int s = 0; s < 2; s++) {
-        PsxNetPad pad;
-        if (!capture_pad_slot(s, &pad)) continue;  /* no device in this port */
+        const PsxNetPad& pad = pads[s];
+        if (!pad.connected) continue;
         /* Push sticks every frame; request the pad type (digital/analog) through
          * the coherent channel so a hybrid stick<->d-pad flip is applied only at
          * an idle, non-config bus boundary (never mid-poll / mid-handshake). This
@@ -3252,6 +3436,9 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+    input_replay::note_guest_vblank();
+    input_replay::record_note_guest_vblank();
+    psx_xenogears_timing_vblank_boundary(mdec_recently_active(2));
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
@@ -3261,7 +3448,7 @@ static void sdl_vblank_present(void) {
     debug_server_check_watchpoints();
 
     /* Check debug server input override. */
-    int override = debug_server_get_input_override();
+    int override = input_replay::active() ? -1 : debug_server_get_input_override();
 #else
     /* Production: skip debug server. Still need to advance frame counter
      * locally so anything else that reads it continues to work. */
@@ -3459,12 +3646,89 @@ static void sdl_vblank_present(void) {
         }
     } netplay_tail(override);
 
+    if (input_replay::active() || input_replay::recording()) {
+        XgTimingScene scene;
+        SioPadReceipt receipt;
+        CDROMDebugState cd{};
+        int overlay_active = 0, overlay_registered = 0, overlay_regions_checked = 0;
+        int overlay_file_found = 0;
+        psx_xenogears_timing_read_scene(&scene);
+        sio_get_pad_receipt(&receipt);
+        cdrom_debug_snapshot(&cd);
+        const int fmv_active = mdec_recently_active(2);
+        const int xa_streaming = cdrom_xa_stream_active();
+        overlay_loader_get_status(&overlay_active, &overlay_registered,
+                                  &overlay_regions_checked, nullptr, 0, nullptr, 0,
+                                  nullptr, 0, nullptr, nullptr, &overlay_file_found);
+        input_replay::note_snapshot({scene.field_context, scene.requested_module,
+                                     scene.active_module, scene.module_pointer,
+                                     scene.raw_field_id, scene.masked_field_id,
+                                     scene.game_progress, scene.valid_field != 0});
+        input_replay::record_note_scene({scene.field_context, scene.requested_module,
+                                         scene.active_module, scene.module_pointer,
+                                         scene.raw_field_id, scene.masked_field_id,
+                                         scene.game_progress, scene.valid_field != 0},
+                                        {cd.has_disc, cd.reading, cd.sector_available,
+                                         cd.pending_pending, cd.pending_cmd, cd.queued_cmd,
+                                         overlay_active, overlay_registered,
+                                         overlay_regions_checked, overlay_file_found});
+        input_replay::note_media_state({fmv_active != 0, xa_streaming != 0,
+                                        mdec_get_decode_count()});
+        input_replay::note_loader_state({cd.has_disc, cd.reading, cd.sector_available,
+                                         cd.pending_pending, cd.pending_cmd, cd.queued_cmd,
+                                         overlay_active, overlay_registered,
+                                         overlay_regions_checked, overlay_file_found});
+        input_replay::note_sio_receipt({receipt.polls, receipt.slot, receipt.id,
+                                        receipt.ack, receipt.buttons_low,
+                                        receipt.buttons_high, receipt.analog != 0});
+    }
+    if (input_replay::active() && !input_replay::latch_vblank()) {
+        const char* backend = gr_backend() == GR_BACKEND_OPENGL ? "opengl" :
+                              gr_backend() == GR_BACKEND_VULKAN ? "vulkan" : "software";
+        overlay_capture_wait_pending();
+        overlay_capture_write_json();
+        input_replay::write_evidence(s_input_replay_evidence_path.c_str(), 0, backend);
+        shutdown_runtime();
+        std::exit(3);
+    }
+    if (input_replay::active()) sync_input_replay_slots();
     if (psx_netplay_active()) {
         psx_netplay_finish_frame();
     } else if (g_headless) {
         sample_headless_pad_into_sio(override);
     } else {
-        sample_pad_into_sio(override);
+        const host_input::HostInputSnapshot& snapshot = capture_vblank_input_snapshot();
+        const std::array<PsxNetPad, 2> pads = capture_frame_pads(snapshot);
+        if (input_replay::recording()) {
+            std::string record_error;
+            if (!input_replay::record_snapshot(snapshot, pads, &record_error)) {
+                input_replay::record_abort();
+                shutdown_runtime();
+                std::exit(3);
+            }
+        }
+        sample_pad_into_sio(pads, override);
+    }
+    if (input_replay::record_complete()) {
+        shutdown_runtime();
+        std::exit(0);
+    }
+    if (input_replay::active()) {
+        uint32_t address = 0;
+        uint16_t expected = 0;
+        if (input_replay::checkpoint(&address, &expected)) {
+            const uint16_t field_id = psx_read_half(address);
+            input_replay::observe_checkpoint(field_id);
+            if (input_replay::finished()) {
+                const char* backend = gr_backend() == GR_BACKEND_OPENGL ? "opengl" :
+                                      gr_backend() == GR_BACKEND_VULKAN ? "vulkan" : "software";
+                overlay_capture_wait_pending();
+                overlay_capture_write_json();
+                input_replay::write_evidence(s_input_replay_evidence_path.c_str(), field_id, backend);
+                shutdown_runtime();
+                std::exit(input_replay::stop_reason() == input_replay::StopReason::CheckpointReached ? 0 : 3);
+            }
+        }
     }
 
     /* Latency ring: open this present cycle's slot, stamping when input was
@@ -3646,14 +3910,10 @@ static void sdl_vblank_present(void) {
         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
         latency_ring_mark(LAT_PACED);
 
-        /* Low-latency input: the early sample above is now ~one pacer-wait old.
-         * Refresh the device state and re-sample right before present so the next
-         * CPU frame reads near-fresh input (the dominant input->photon cost on a
-         * vsync-light box). Re-stamp the ring's input mark to measure from here. */
-        if (g_low_latency_input) {
-            SDL_GameControllerUpdate();  /* refresh pad state after the wait */
-            SDL_PumpEvents();            /* refresh keyboard state */
-            sample_pad_into_sio(override);
+        if (g_low_latency_input && s_vblank_host_input_snapshot) {
+            const std::array<PsxNetPad, 2> pads =
+                capture_frame_pads(*s_vblank_host_input_snapshot);
+            sample_pad_into_sio(pads, override);
             latency_ring_restamp_input();
         }
     }
@@ -3680,13 +3940,18 @@ static void sdl_vblank_present(void) {
         if (fntrace_is_game_started()) {
             g_ws_engaged = true;
             const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
-            int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
+            int mode = wide && !g_native_render_widescreen
+                ? (g_ws_native_wide ? 2 : 1) : 0;
             /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
              * (identity squash). Squash mode: feed the real wide aspect. */
             gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
                                    mode == 1 ? g_video_aspect_den : 3);
-            gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
+            gpu_ws_configure(mode != 0 ? g_video_aspect_num : 4,
+                             mode != 0 ? g_video_aspect_den : 3,
                              g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
+            gpu_ws_configure_native_cull(
+                g_native_render_widescreen && wide,
+                g_video_aspect_num, g_video_aspect_den, 320, 240);
         }
     }
 
@@ -3698,6 +3963,13 @@ static void sdl_vblank_present(void) {
     bool pin_43    = false;  /* pillarbox this present (FMV, or a native-wide
                                 game frame that could not present wide) */
     bool depth24_frame = false;
+    bool native_fmv_active = false;
+    const uint32_t *native_fmv_pixels = nullptr;
+    uint32_t native_fmv_width = 0;
+    uint32_t native_fmv_height = 0;
+    int native_fmv_depth24 = 0;
+    uint64_t native_fmv_generation = 0;
+    bool native_fmv_frame_available = false;
     if (s_force_present_after_load && g_gl_active)
         gl_renderer_flush_cpu_uploads();
     {
@@ -3705,6 +3977,18 @@ static void sdl_vblank_present(void) {
         gpu_get_display_info(&di);
         depth24_frame = di.depth24 != 0;
         if (di.disabled || di.width == 0 || di.height == 0) {
+            GuestRenderTransactionSnapshot transaction = {};
+            if (!guest_render_native_stream_enabled())
+                guest_render_transaction_invalidate_deferred();
+            if (!guest_render_native_stream_enabled() &&
+                guest_render_transaction_snapshot(&transaction) ==
+                    GUEST_RENDER_TRANSACTION_OK &&
+                transaction.phase == GUEST_RENDER_TRANSACTION_ACTIVE) {
+                (void)guest_render_transaction_abort_before_observation(
+                    GUEST_RENDER_TRANSACTION_OBSERVATION_CALLER_ABORT);
+                guest_render_bridge_force_original(
+                    GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+            }
             smooth_60_present(nullptr, 0, 0, false);
             present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
                                 (uint16_t)di.height, 0);
@@ -3738,13 +4022,18 @@ static void sdl_vblank_present(void) {
          * locked: we squash IFF we stretch. depth24 always classifies as FMV
          * even if the ws layer is not engaged yet (4:3 titles). */
         fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* MDEC output reaches the display through guest DMA and VRAM. Do not
+         * reconstruct a host frame from one decode command: movies may submit
+         * partial fields or use a geometry that cannot be inferred from that
+         * command alone. The authoritative VRAM scanout handles every FMV. */
+        native_fmv_active = false;
         /* MDEC movies are already decoded at their authored cadence and are
          * CPU/upload heavy. High-refresh crossfades only contend with decoding
          * and can starve audio, so present native-4:3/MDEC phases directly.
          * The classification catches the transition frame before the first
          * decode; the activity stamp also covers authentic 4:3 configurations. */
         if (g_gl_active)
-            gl_renderer_set_interpolation_suspended(
+            psx_frame_interpolation_set_suspended(
                 fmv_frame || mdec_recently_active(2));
 
         /* Canonical present width. Native-wide does NOT widen the canonical read
@@ -3752,19 +4041,89 @@ static void sdl_vblank_present(void) {
          * wide surface and presents from there instead (see gpu wide compositor). */
         present_w = w;
 
-        /* Native-wide present: on a game frame, if the active backend has the
-         * wide compositor, present the wider surface (canonical width + EXTRA)
-         * from the displayed buffer's surface. FMV/menu frames stay 4:3. */
-        bool wide_present = (!fmv_frame && !di.depth24 && g_ws_engaged &&
-                             ws_native_wide_active() && gr_wide_supported());
-        if (wide_present) present_w = w + (uint32_t)ws_nw_extra();
+        /* Native-wide present: on a game frame, Native View is the only valid
+         * presentation path. FMV/menu frames stay 4:3, but gameplay must never
+         * silently fall back to the canonical VRAM present. */
+        const bool native_stream_enabled = guest_render_native_stream_enabled();
+        if (g_native_render_widescreen && g_ws_engaged && native_stream_enabled)
+            s_native_wide_gameplay_started = true;
+        const bool native_view_present =
+            g_native_render_widescreen && native_stream_enabled &&
+            !fmv_frame && !di.depth24 && g_gl_active &&
+            gl_renderer_native_view_width() > 0;
+        const bool native_wide_game_frame =
+            g_native_render_widescreen && s_native_wide_gameplay_started &&
+            !fmv_frame && !di.depth24 && !native_fmv_active;
+        if (native_wide_game_frame &&
+            (!native_view_present || !g_gl_active || !g_gl_fbo_present)) {
+            psx_fatal_halt(
+                "Native-wide gameplay present invariant failed; refusing 4:3 fallback");
+            return;
+        }
+        bool wide_present = native_view_present ||
+            (!fmv_frame && !di.depth24 && g_ws_engaged &&
+             ws_native_wide_active() && gr_wide_supported());
+        if (native_view_present)
+            present_w = (uint32_t)gl_renderer_native_view_width();
+        else if (wide_present)
+            present_w = w + (uint32_t)ws_nw_extra();
 
         /* Native-wide invariant: canonical (320-wide) content is NEVER
-         * stretched across the wide window — a game frame that cannot present
-         * wide (compositor unsupported, or the surface fallback below)
-         * pillarboxes 4:3 like FMV/menus instead. Only squash mode (1) may
-         * stretch: its canonical content is pre-squashed FOR the stretch. */
-        const bool nw_pin = g_ws_engaged && g_ws_native_wide;
+         * stretched across the wide window. Native gameplay has already been
+         * checked above and cannot reach a canonical fallback. Only squash mode
+         * (1), and explicitly authored FMV/menu frames, may use 4:3 present. */
+        const bool nw_pin = (g_ws_engaged && g_ws_native_wide) ||
+                            g_native_render_widescreen;
+
+        GuestRenderTransactionSnapshot transaction = {};
+        GuestRenderTransactionDeferredSnapshot deferred = {};
+        GuestRenderCompletedState completed = {};
+        GpuRenderTransactionId current_id = {};
+        bool current_id_valid = false;
+        bool transaction_active =
+            !guest_render_native_stream_enabled() &&
+            guest_render_transaction_snapshot(&transaction) ==
+                GUEST_RENDER_TRANSACTION_OK &&
+            transaction.phase == GUEST_RENDER_TRANSACTION_ACTIVE;
+        const bool deferred_ready =
+            !guest_render_native_stream_enabled() &&
+            guest_render_transaction_deferred_snapshot(&deferred) ==
+                GUEST_RENDER_TRANSACTION_OK && deferred.sealed;
+        const bool transaction_present_supported =
+            g_gl_active && g_gl_fbo_present && !di.depth24 && !wide_present;
+        if (deferred_ready) {
+            if (transaction_present_supported &&
+                guest_render_bridge_present(&completed) == GUEST_RENDER_OK) {
+                current_id.scene_epoch = completed.id.scene_epoch;
+                current_id.state_sequence = completed.id.state_sequence;
+                current_id_valid = true;
+                if (guest_render_transaction_begin_deferred(
+                        current_id, gpu_render_vram_mutation_serial()) ==
+                    GUEST_RENDER_TRANSACTION_OK) {
+                    transaction_active =
+                        guest_render_transaction_snapshot(&transaction) ==
+                            GUEST_RENDER_TRANSACTION_OK &&
+                        transaction.phase == GUEST_RENDER_TRANSACTION_ACTIVE;
+                } else {
+                    guest_render_bridge_force_original(
+                        GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+                }
+            } else {
+                guest_render_transaction_invalidate_deferred();
+            }
+        }
+        if (transaction_active && !current_id_valid &&
+            guest_render_bridge_present(&completed) == GUEST_RENDER_OK) {
+            current_id.scene_epoch = completed.id.scene_epoch;
+            current_id.state_sequence = completed.id.state_sequence;
+            current_id_valid = true;
+        }
+        if (transaction_active && !transaction_present_supported) {
+            (void)guest_render_transaction_abort_before_observation(
+                GUEST_RENDER_TRANSACTION_OBSERVATION_CALLER_ABORT);
+            guest_render_bridge_force_original(
+                GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+        }
 
         /* Ring the classification now that it's final (only the software/CPU
          * wide path below can still fall back — it amends this entry). A
@@ -3782,7 +4141,8 @@ static void sdl_vblank_present(void) {
          * do NOT flush_cpu_uploads (MDEC already wrote the CPU mirror; forcing
          * FBO uploads every frame cut MotK intro from ~50 to ~30 FPS). */
 #ifndef PSX_SDL_NO_RENDER
-        if (g_gl_active && g_gl_fbo_present && !di.depth24) {
+        if (g_gl_active && g_gl_fbo_present && !di.depth24 &&
+            !native_fmv_active) {
             if (wide_present) {
                 /* GPU-direct native-wide present: blit the displayed buffer's
                  * wide FBO straight to the window (GPU-side, like the canonical
@@ -3791,14 +4151,124 @@ static void sdl_vblank_present(void) {
                  * GL-only slowdown (SW's wide path is pure CPU, no GPU sync, so
                  * SW stayed smooth). Falls through to the CPU readout path only if
                  * the wide surface for this buffer doesn't exist yet. */
-                if (gl_renderer_present_wide_fbo((int)di.display_x, (int)di.display_y,
-                                                 (int)h, g_video_aa ? 1 : 0))
+                const int native_presented = native_view_present
+                    ? gl_renderer_present_native_view(
+                          (int)di.display_x, (int)di.display_y,
+                          (int)h, g_video_aa ? 1 : 0)
+                    : gl_renderer_present_wide_fbo(
+                          (int)di.display_x, (int)di.display_y,
+                          (int)h, g_video_aa ? 1 : 0);
+                if (!native_presented && native_wide_game_frame) {
+                    psx_fatal_halt(
+                        "Native-wide gameplay surface present failed; refusing 4:3 fallback");
                     return;
+                }
+                if (native_presented) {
+                    if (native_render_baseline_host_framebuffer_capture_due()) {
+                        uint64_t canonical_digest = 0u;
+                        if (gr_canonical_framebuffer_digest(
+                                (int)di.display_x, (int)di.display_y,
+                                (int)w, (int)h, &canonical_digest))
+                            native_render_baseline_note_host_framebuffer_digest(
+                                canonical_digest);
+                    }
+                    if (guest_render_native_stream_enabled())
+                        guest_render_native_stream_note_independent_vram_present();
+                    return;
+                }
             } else {
-                gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
-                                         (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                         (fmv_frame || nw_pin) ? 1 : 0);
-                return;
+                if (transaction_active && transaction_present_supported) {
+                    GpuRenderPresent transaction_present = {};
+                    uint64_t canonical_digest = 0u;
+                    bool canonical_digest_valid = false;
+
+                    transaction_present.path = GPU_RENDER_PRESENT_CANONICAL;
+                    transaction_present.display_x = (int32_t)di.display_x;
+                    transaction_present.display_y = (int32_t)di.display_y;
+                    transaction_present.display_width = (int32_t)present_w;
+                    transaction_present.display_height = (int32_t)h;
+                    transaction_present.scale = (uint32_t)gr_scale();
+                    transaction_present.surface_width =
+                        1024u * transaction_present.scale;
+                    transaction_present.surface_height =
+                        512u * transaction_present.scale;
+                    transaction_present.linear_filter = g_video_aa ? 1u : 0u;
+                    transaction_present.force_4_3 =
+                        (fmv_frame || nw_pin) ? 1u : 0u;
+                    if (native_render_baseline_host_framebuffer_capture_due())
+                        canonical_digest_valid =
+                            gr_canonical_framebuffer_digest(
+                                (int)di.display_x, (int)di.display_y,
+                                (int)present_w, (int)h,
+                                &canonical_digest) != 0;
+
+                    if (guest_render_transaction_present(
+                            current_id,
+                            gpu_render_vram_mutation_serial(),
+                            &transaction_present) ==
+                        GUEST_RENDER_TRANSACTION_READY) {
+                        if (gl_renderer_swap_ready_transaction() ==
+                            GL_RENDERER_TRANSACTION_SWAP_SUCCESS) {
+                            const GuestRenderTransactionStatus post_swap_status =
+                                guest_render_transaction_post_swap_success();
+                            if (post_swap_status ==
+                                GUEST_RENDER_TRANSACTION_OK) {
+                                if (canonical_digest_valid)
+                                    native_render_baseline_note_host_framebuffer_digest(
+                                        canonical_digest);
+                            } else {
+                                guest_render_bridge_force_original(
+                                    GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+                            }
+                        } else {
+                            (void)gl_renderer_cancel_ready_transaction();
+                            (void)guest_render_transaction_post_swap_failure(false);
+                            guest_render_bridge_force_original(
+                                GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+                        }
+                        return;
+                    } else {
+                        guest_render_bridge_force_original(
+                            GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+                    }
+                }
+                bool presented = false;
+                if (guest_render_native_stream_enabled() && !wide_present) {
+                    gl_renderer_sync_cpu();
+                    for (uint32_t y = 0; y < h; y++)
+                        for (uint32_t x = 0; x < present_w; x++)
+                            sdl_pixel_buf[y * present_w + x] =
+                                gpu_display_pixel_argb(&di, x, y);
+                    presented = gr_present_native_cpu_frame(
+                        sdl_pixel_buf, (int)present_w, (int)h,
+                        g_video_aa ? 1 : 0, (fmv_frame || nw_pin) ? 1 : 0,
+                        0) != 0;
+                    if (presented)
+                        guest_render_native_stream_note_independent_vram_present();
+                } else {
+                    presented = gr_present_vram(
+                        (int)di.display_x, (int)di.display_y,
+                        (int)present_w, (int)h, g_video_aa ? 1 : 0,
+                        (fmv_frame || nw_pin) ? 1 : 0) != 0;
+                }
+                if (presented) {
+                    if (native_render_baseline_host_framebuffer_capture_due()) {
+                        uint64_t canonical_digest = 0u;
+                        if (gr_canonical_framebuffer_digest(
+                                (int)di.display_x, (int)di.display_y,
+                                (int)present_w, (int)h, &canonical_digest))
+                            native_render_baseline_note_host_framebuffer_digest(
+                                canonical_digest);
+                    }
+                    if (native_fmv_active)
+                        guest_render_native_stream_note_shared_fmv_present(w, h, false);
+                    if (!guest_render_native_stream_enabled())
+                        guest_render_native_stream_note_shared_vram_present();
+                    return;
+                }
+                if (native_fmv_active)
+                    guest_render_bridge_force_original(
+                        GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
             }
         }
         if (g_gl_active && !di.depth24) gl_renderer_sync_cpu();
@@ -3807,7 +4277,15 @@ static void sdl_vblank_present(void) {
          * 24-bit (FMV) frames go through the CPU present (Phase 3). The Vulkan
          * window has no SDL_Renderer, so we must never fall through below. */
         if (g_vk_active) {
-            if (di.depth24) {
+            if (native_fmv_active && native_fmv_frame_available) {
+                vk_renderer_present_cpu(native_fmv_pixels,
+                                        (int)native_fmv_width,
+                                        (int)native_fmv_height,
+                                        0, 1);
+                guest_render_native_stream_note_independent_fmv_present(
+                    native_fmv_width, native_fmv_height,
+                    native_fmv_depth24 != 0);
+            } else if (di.depth24) {
                 /* 24-bit (FMV): packed RGB lives in the CPU mirror — do NOT
                  * sync_cpu (FBO readback clobbers RGB888). */
                 for (uint32_t y = 0; y < h; y++)
@@ -3822,8 +4300,19 @@ static void sdl_vblank_present(void) {
                                         0 /* nearest */, fmv_frame ? 1 : 0);
             } else if (wide_present &&
                        vk_renderer_present_wide((int)di.display_x, (int)di.display_y,
-                                                (int)h, g_video_aa ? 1 : 0)) {
+                                                 (int)h, g_video_aa ? 1 : 0)) {
                 /* presented wide */
+                if (guest_render_native_stream_enabled())
+                    guest_render_native_stream_note_independent_vram_present();
+            } else if (guest_render_native_stream_enabled()) {
+                vk_renderer_sync_cpu();
+                for (uint32_t y = 0; y < h; y++)
+                    for (uint32_t x = 0; x < present_w; x++)
+                        sdl_pixel_buf[y * present_w + x] =
+                            gpu_display_pixel_argb(&di, x, y);
+                vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w,
+                                        (int)h, 0, fmv_frame ? 1 : 0);
+                guest_render_native_stream_note_independent_vram_present();
             } else {
                 vk_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
@@ -3947,9 +4436,27 @@ static void sdl_vblank_present(void) {
          * still owns timing. 24-bit (FMV) frames pin to native 4:3. */
         /* FMV: nearest present — linear filtering fringes the right edge of
          * low-res 24-bit scanouts into adjacent (often garbage) texels. */
-        gl_renderer_present(sdl_pixel_buf, src_w, src_h,
-                            (g_video_aa && !depth24_frame) ? 1 : 0,
-                            pin_43 ? 1 : 0, 0 /* full width */);
+        if (native_fmv_active) {
+            if (native_fmv_frame_available && gr_present_native_cpu_frame(
+                    native_fmv_pixels, (int)native_fmv_width,
+                    (int)native_fmv_height,
+                    (g_video_aa && !depth24_frame) ? 1 : 0,
+                    1 /* FMV is always authored 4:3 */, 0 /* full width */)) {
+                guest_render_native_stream_note_independent_fmv_present(
+                    native_fmv_width, native_fmv_height,
+                    native_fmv_depth24 != 0);
+            } else {
+                guest_render_bridge_force_original(
+                    GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+                gl_renderer_present(sdl_pixel_buf, src_w, src_h,
+                                    (g_video_aa && !depth24_frame) ? 1 : 0,
+                                    pin_43 ? 1 : 0, 0 /* full width */);
+            }
+        } else {
+            gl_renderer_present(sdl_pixel_buf, src_w, src_h,
+                                (g_video_aa && !depth24_frame) ? 1 : 0,
+                                pin_43 ? 1 : 0, 0 /* full width */);
+        }
     } else {
     SDL_Rect src = { 0, 0, src_w, src_h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
@@ -4643,6 +5150,17 @@ int main(int argc, char** argv) {
     int         cli_renderer   = -1;   /* 0=software 1=opengl 2=vulkan */
     const char* cli_window_title = nullptr;  /* label windows in a fleet */
     const char* cli_memcard_dir = nullptr;   /* isolate writable state in a fleet */
+    const char* cli_runtime_state = nullptr;
+    const char* cli_input_replay = nullptr;
+    const char* cli_evidence_out = nullptr;
+    const char* cli_input_record = nullptr;
+    const char* cli_render_mode = nullptr;
+    bool        cli_record_on_close = false;
+    uint16_t    cli_record_stop_field = 0;
+    uint64_t    cli_record_max_vblanks = 0;
+    NativeFpsStartupPolicy native_fps_policy = {
+        NATIVE_FPS_MODE_ORIGINAL, NATIVE_FPS_STARTUP_ORIGINAL_DEFAULT, 0
+    };
     PsxNetplayConfig net_cfg;
     psx_netplay_config_defaults(&net_cfg);
     psx_netplay_apply_env(&net_cfg);  /* CLI flags below win over env */
@@ -4654,6 +5172,8 @@ int main(int argc, char** argv) {
      *   --debug-port <n>    override the TCP debug-server port (multi-instance)
      *   --memcard-dir <path> override card/save/options state (multi-instance)
      *   --renderer <name>   override the renderer: software|opengl|vulkan
+     *   --render-mode <mode> original|shadow|native (independent of timing)
+     *   --record-on-close    publish --input-record when the window closes
      *   --launcher          force the GUI launcher (overrides skip_launcher)
      *   --no-launcher       skip the GUI launcher (boot straight in)
      *   --headless          skip SDL window/audio; use TCP screenshots/state
@@ -4679,6 +5199,28 @@ int main(int argc, char** argv) {
             cli_debug_port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
             cli_memcard_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--runtime-state") == 0 && i + 1 < argc) {
+            cli_runtime_state = argv[++i];
+        } else if (std::strcmp(argv[i], "--input-replay") == 0 && i + 1 < argc) {
+            cli_input_replay = argv[++i];
+        } else if (std::strcmp(argv[i], "--evidence-out") == 0 && i + 1 < argc) {
+            cli_evidence_out = argv[++i];
+        } else if (std::strcmp(argv[i], "--input-record") == 0 && i + 1 < argc) {
+            cli_input_record = argv[++i];
+        } else if (std::strcmp(argv[i], "--record-on-close") == 0) {
+            cli_record_on_close = true;
+        } else if (std::strcmp(argv[i], "--record-stop-field") == 0 && i + 1 < argc) {
+            const unsigned long parsed = std::strtoul(argv[++i], nullptr, 0);
+            if (parsed <= UINT16_MAX) cli_record_stop_field = static_cast<uint16_t>(parsed);
+        } else if (std::strcmp(argv[i], "--record-max-vblanks") == 0 && i + 1 < argc) {
+            cli_record_max_vblanks = std::strtoull(argv[++i], nullptr, 0);
+        } else if (std::strcmp(argv[i], "--native-fps") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            native_fps_policy.requested_mode = std::strcmp(mode, "native_59_94") == 0
+                ? NATIVE_FPS_MODE_NATIVE_59_94 : NATIVE_FPS_MODE_ORIGINAL;
+            native_fps_policy.startup_reason = NATIVE_FPS_STARTUP_EXPLICIT;
+        } else if (std::strcmp(argv[i], "--render-mode") == 0 && i + 1 < argc) {
+            cli_render_mode = argv[++i];
         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
             const char* r = argv[++i];
             if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
@@ -4730,10 +5272,63 @@ int main(int argc, char** argv) {
             }
         }
     }
+    psx_xenogears_timing_set_startup_policy(&native_fps_policy);
+    psx_xenogears_timing_reset(XG_TIMING_REASON_BOOT);
     if (const char *e = std::getenv("PSX_HEADLESS")) {
         if (e[0] && e[0] != '0') {
             g_headless = 1;
             force_no_launcher = true;
+        }
+    }
+    if ((cli_input_replay && !cli_evidence_out) ||
+        (cli_evidence_out && !cli_input_replay && !cli_input_record)) {
+        std::fprintf(stderr, "psxrecomp: --evidence-out requires input replay or recording, and replay requires evidence\n");
+        return 1;
+    }
+    if (cli_input_replay && cli_input_record) {
+        std::fprintf(stderr, "psxrecomp: input replay and input record are mutually exclusive\n");
+        return 1;
+    }
+    if (cli_input_record) {
+        if (cli_record_stop_field != 5u || !cli_record_max_vblanks || net_cfg.enabled || g_headless) {
+            std::fprintf(stderr, "psxrecomp: input record requires Field 5, a VBlank bound, and local video\n");
+            return 1;
+        }
+        std::string record_error;
+        const bool record_started = cli_record_on_close
+            ? input_replay::record_begin_until_close(
+                  cli_input_record, cli_record_stop_field,
+                  cli_record_max_vblanks, &record_error)
+            : input_replay::record_begin(
+                  cli_input_record, cli_record_stop_field,
+                  cli_record_max_vblanks, &record_error);
+        if (!record_started) {
+            std::fprintf(stderr, "psxrecomp: cannot start input record: %s\n", record_error.c_str());
+            return 1;
+        }
+        std::atexit(input_replay::record_abort);
+    }
+    if (cli_input_replay) {
+        std::string replay_error;
+        if (!input_replay::load(cli_input_replay, &replay_error)) {
+            std::fprintf(stderr, "psxrecomp: invalid input replay: %s\n", replay_error.c_str());
+            return 1;
+        }
+        if (net_cfg.enabled || g_headless) {
+            std::fprintf(stderr, "psxrecomp: input replay refuses netplay and headless modes\n");
+            return 1;
+        }
+    }
+    if (cli_evidence_out) s_input_replay_evidence_path = cli_evidence_out;
+    std::filesystem::path runtime_state_dir;
+    if (cli_runtime_state) {
+        runtime_state_dir = std::filesystem::path(cli_runtime_state);
+        if (runtime_state_dir.is_relative()) runtime_state_dir = exe_dir_from_argv(argv[0]) / runtime_state_dir;
+        std::error_code state_ec;
+        std::filesystem::create_directories(runtime_state_dir, state_ec);
+        if (state_ec) {
+            std::fprintf(stderr, "psxrecomp: cannot create --runtime-state %s\n", runtime_state_dir.string().c_str());
+            return 1;
         }
     }
 
@@ -4821,6 +5416,7 @@ int main(int argc, char** argv) {
      * path is resolved (arm_text_image_guard). */
     std::string text_guard_exe_path;
     uint32_t    text_guard_load_addr = 0;
+    std::string config_render_mode = "original";
 
     if (game_config_path) {
         try {
@@ -4831,6 +5427,7 @@ int main(int argc, char** argv) {
             game_players = gc.players;
             game_has_disc_crc = gc.has_disc_crc;
             game_disc_crc     = gc.disc_crc;
+            config_render_mode = gc.runtime.render_mode;
             if (!gc.discs.empty()) resolved_disc = gc.discs.front();
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
@@ -4952,9 +5549,51 @@ int main(int argc, char** argv) {
                 gc.ws_cull_depth_sites.data(), (int)gc.ws_cull_depth_sites.size());
             gpu_ws_set_plane_nx_sites(
                 gc.ws_cull_plane_nx_sites.data(), (int)gc.ws_cull_plane_nx_sites.size());
-            gpu_ws_set_xclip_load_sites(
-                gc.ws_cull_xclip_load_sites.data(), (int)gc.ws_cull_xclip_load_sites.size());
-            gte_ws_configure_dome_sites(
+             gpu_ws_set_xclip_load_sites(
+                 gc.ws_cull_xclip_load_sites.data(), (int)gc.ws_cull_xclip_load_sites.size());
+             {
+                 std::map<uint32_t, uint8_t> semantic_sites;
+                 auto add_semantic_sites = [&](const std::vector<uint32_t>& sites,
+                                               PsxWsCullSemantic semantic) {
+                     for (uint32_t address : sites)
+                         semantic_sites[address] = (uint8_t)semantic;
+                 };
+                 add_semantic_sites(
+                     gc.ws_cull_semantic_screen_bias_sites,
+                     PSX_WS_CULL_SEMANTIC_SCREEN_BIAS);
+                 add_semantic_sites(
+                     gc.ws_cull_semantic_world_range_sites,
+                     PSX_WS_CULL_SEMANTIC_WORLD_RANGE);
+                 add_semantic_sites(
+                     gc.ws_cull_semantic_left_edge_sites,
+                     PSX_WS_CULL_SEMANTIC_LEFT_EDGE);
+                 add_semantic_sites(
+                     gc.ws_cull_semantic_masked_screen_x_sites,
+                     PSX_WS_CULL_SEMANTIC_MASKED_SCREEN_X);
+                  add_semantic_sites(
+                      gc.ws_cull_semantic_frustum_plane_x_sites,
+                      PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X);
+                  add_semantic_sites(
+                      gc.ws_cull_semantic_signed_screen_x_sites,
+                      PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X);
+                  add_semantic_sites(
+                      gc.ws_cull_semantic_depth_bound_sites,
+                      PSX_WS_CULL_SEMANTIC_DEPTH_BOUND);
+                  add_semantic_sites(
+                      gc.ws_cull_semantic_xclip_bound_sites,
+                      PSX_WS_CULL_SEMANTIC_XCLIP_BOUND);
+                 std::vector<uint32_t> addresses;
+                 std::vector<uint8_t> semantics;
+                 addresses.reserve(semantic_sites.size());
+                 semantics.reserve(semantic_sites.size());
+                 for (const auto& entry : semantic_sites) {
+                     addresses.push_back(entry.first);
+                     semantics.push_back(entry.second);
+                 }
+                 gpu_ws_set_semantic_cull_sites(
+                     addresses.data(), semantics.data(), (int)addresses.size());
+             }
+             gte_ws_configure_dome_sites(
                 gc.ws_dome_call_sites.data(), (int)gc.ws_dome_call_sites.size());
             /* [widescreen.cull] per-game gates + signature immediates for the
              * pattern-scanned interp widen hooks. A title that never opted in
@@ -4985,6 +5624,12 @@ int main(int argc, char** argv) {
             }
             ctrl_locked_p1_mode = gc.runtime.default_p1_mode;
             ctrl_locked_p2_mode = gc.runtime.default_p2_mode;
+            if (gc.runtime.has_controller) {
+                const int mode = gc.runtime.controller == "digital"
+                    ? PSXRecompV4::PAD_MODE_DIGITAL : PSXRecompV4::PAD_MODE_ANALOG;
+                p1_mode = p2_mode = mode;
+                ctrl_locked_p1_mode = ctrl_locked_p2_mode = mode;
+            }
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
             ctrl_lock_device  = gc.runtime.controller_lock_device;
@@ -5121,6 +5766,18 @@ int main(int argc, char** argv) {
                         std::filesystem::path tk = xd / "overlay_toolchain";
                         std::filesystem::path py = tk / "python" / "python.exe";
                         if (std::filesystem::exists(py)) {
+                            const PsxGameIdentity *runtime_identity =
+                                psx_game_identity_runtime();
+                            char game_identity_sha256[
+                                PSX_GAME_IDENTITY_SHA256_HEX_BYTES];
+                            char manifest_identity_sha256[
+                                PSX_GAME_IDENTITY_SHA256_HEX_BYTES];
+                            if (!psx_game_identity_format_hex(
+                                    runtime_identity, game_identity_sha256,
+                                    manifest_identity_sha256)) {
+                                throw std::runtime_error(
+                                    "overlay autocompile requires complete game and manifest identities");
+                            }
                             auto cmd_quote = [](const std::string& s) {
                                 return std::string("\"") + s + "\"";
                             };
@@ -5130,6 +5787,8 @@ int main(int argc, char** argv) {
                                 " --captures " + cmd_quote(captures_path.string()) +
                                 " --game-toml " + cmd_quote(std::string(
                                     game_config_path ? game_config_path : "game.toml")) +
+                                " --game-identity-sha256 " + game_identity_sha256 +
+                                " --manifest-identity-sha256 " + manifest_identity_sha256 +
                                 " --recompiler " + cmd_quote((tk / "psxrecomp-game.exe").string()) +
                                 " --runtime-include " + cmd_quote((tk / "include").string()) +
                                 " --out-dir " + cmd_quote((xd / "cache").string()) +
@@ -5214,8 +5873,9 @@ int main(int argc, char** argv) {
     std::string netplay_player_name;     /* [netplay] player_name from settings.toml */
     bool has_netplay_player_name = false;
     {
-        std::filesystem::path settings_path =
-            exe_dir_from_argv(argv[0]) / "settings.toml";
+        std::filesystem::path settings_path = runtime_state_dir.empty()
+            ? exe_dir_from_argv(argv[0]) / "settings.toml"
+            : runtime_state_dir / "settings.toml";
 #if defined(RECOMP_LAUNCHER)
         g_lnch_settings_path = settings_path;
 #endif
@@ -5385,6 +6045,11 @@ int main(int argc, char** argv) {
     /* Apply writable-state isolation before game-options and launcher setup,
      * not with the later renderer/port overrides. Explicit slot paths from a
      * shared settings.toml must not escape the isolated directory. */
+    if (!runtime_state_dir.empty()) {
+        memcard_dir = runtime_state_dir / "memcards";
+        memcard1_path.clear();
+        memcard2_path.clear();
+    }
     if (cli_memcard_dir) {
         memcard_dir = std::filesystem::path(cli_memcard_dir);
         if (memcard_dir.is_relative())
@@ -5893,6 +6558,17 @@ int main(int argc, char** argv) {
         memcard1_path.clear();
         memcard2_path.clear();
     }
+    if (input_replay::active() || input_replay::recording()) {
+        g_turbo_loads_enabled = 0;
+        g_auto_skip_fmv = 0;
+        g_frame_interpolation = 0;
+    }
+    if (input_replay::active()) {
+        const char* capture_replay = std::getenv("PSX_OVERLAY_CAPTURE_REPLAY");
+        if (!capture_replay || std::strcmp(capture_replay, "1") != 0)
+            overlay_capture_set_enabled(0);
+        overlay_autocapture_set_enabled(0);
+    }
 
     std::filesystem::path resolved_bios =
         resolve_bios_for_runtime(bios_path, argv[0], bios_explicit);
@@ -6101,6 +6777,8 @@ session_reboot:
         std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
+        guest_render_native_stream_set_source_writer_observer(
+            native_source_writer_observer);
 #else
         (void)debug_port;
 #endif
@@ -6145,12 +6823,30 @@ session_reboot:
             return 1;
         }
     }
-    load_input_config(argv[0]);
+    if (input_replay::active()) {
+        set_default_controller_mapping();
+    } else {
+        load_input_config(argv[0]);
+    }
     /* The launcher / settings.toml / game.toml deadzone (when set) is the
      * user-facing authority; apply it over the input.ini value here, after
      * load_input_config has read input.ini. */
     if (resolved_deadzone >= 0)
         controller_deadzone = std::max(0, std::min(32767, resolved_deadzone));
+    if (input_replay::active()) {
+        SDL_GameController* replay_players[2] = { nullptr, nullptr };
+        std::string replay_error;
+        if (!input_replay::attach(replay_players, &replay_error)) {
+            std::fprintf(stderr, "psxrecomp: cannot create replay controller: %s\n", replay_error.c_str());
+            return 1;
+        }
+        g_players[0].kind = 2;
+        g_players[0].mode = ctrl_locked_p1_mode;
+        g_players[0].handle = replay_players[0];
+        SDL_Joystick* joystick = SDL_GameControllerGetJoystick(replay_players[0]);
+        g_players[0].instance = joystick ? SDL_JoystickInstanceID(joystick) : -1;
+        g_players[1] = PlayerInput{};
+    }
     refresh_player_devices();  /* open SDL handles to match the player config */
 #ifndef PSX_SDL_NO_AUDIO
     audio_trace_init();
@@ -6249,8 +6945,6 @@ session_reboot:
          * (which uses gr_scale()) matches it — otherwise sdl_pixel_buf is
          * undersized and the wide readback overflows it. */
         g_video_scale = gr_scale();
-        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
-                                      (double)g_frame_interpolation_fps);
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
@@ -6263,6 +6957,58 @@ session_reboot:
     }
     latency_ring_set_backend(g_vk_active ? "vulkan" : g_gl_active ? "opengl" : "software");
     latency_ring_set_present_mode(g_video_vsync);
+    {
+        const NativeRenderPresentationOps presentation_ops = {
+            native_render_opengl_effective,
+            native_render_set_interpolation_effective,
+            native_render_set_interpolation_suspended,
+            native_render_set_smooth_effective,
+            native_render_clear_histories,
+            native_render_history_count,
+        };
+        const GuestRenderRenderMode render_mode = native_render_mode_resolve(
+            config_render_mode.c_str(), std::getenv("PSX_NATIVE_RENDER_MODE"),
+            cli_render_mode);
+        const bool wide_requested =
+            g_video_aspect_num * 3 != g_video_aspect_den * 4;
+        const GuestRenderTimingMode timing_mode =
+            native_fps_policy.requested_mode == NATIVE_FPS_MODE_NATIVE_59_94
+                ? GUEST_RENDER_TIMING_NATIVE_59_94
+                : GUEST_RENDER_TIMING_ORIGINAL;
+
+        if (!native_render_mode_control_init(
+                &g_native_render_mode_control, &presentation_ops, nullptr,
+                g_frame_interpolation != 0,
+                g_smooth_60fps_requested.load(std::memory_order_acquire) != 0)) {
+            std::fprintf(stderr,
+                         "psxrecomp: native render presentation gate initialization failed\n");
+            return 1;
+        }
+        psx_xg_render_auth_register_code_watches(overlay_watch_set_range);
+        psx_xg_render_auth_set_exec_phase_exchange(
+            native_render_exchange_exec_phase);
+        gpu_set_submission_hook(psx_xg_render_auth_before_gpu_submission);
+        guest_render_native_stream_set_enabled(false);
+        (void)psx_xg_render_auth_configure(
+            timing_mode, render_mode, native_render_presentation_gate, nullptr);
+        g_native_render_widescreen =
+            render_mode == GUEST_RENDER_RENDER_NATIVE && wide_requested &&
+            g_gl_active;
+        if (!psx_xg_render_auth_configure_native_view(
+                g_native_render_widescreen,
+                (uint16_t)g_video_aspect_num, (uint16_t)g_video_aspect_den,
+                320u, 240u) ||
+            !gl_renderer_configure_native_view(
+                g_native_render_widescreen ? 1 : 0,
+                g_video_aspect_num, g_video_aspect_den, 320, 240)) {
+            std::fprintf(stderr,
+                         "psxrecomp: Native widescreen initialization failed\n");
+            return 1;
+        }
+        gpu_ws_configure_native_cull(
+            g_native_render_widescreen && wide_requested,
+            g_video_aspect_num, g_video_aspect_den, 320, 240);
+    }
     /* Title bar shows the clean game title (set at window creation); the active
      * renderer is reported via the debug server / config, not appended here. */
 

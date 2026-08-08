@@ -6,6 +6,8 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <set>
 #include <vector>
 
@@ -14,6 +16,7 @@
 #include "function_analysis.h"
 #include "control_flow.h"
 #include "code_generator.h"
+#include "source_observation_plan.h"
 #include "annotations.hpp"
 #include "config_loader.h"
 #include "rabbitizer.hpp"
@@ -37,6 +40,35 @@
 namespace {
 
 struct AliasEntry { uint32_t addr, host_start, host_end; };
+
+struct GameIdentityInput {
+    std::array<uint8_t, 32> game_sha256;
+    std::array<uint8_t, 32> manifest_sha256;
+};
+
+bool decode_sha256(const std::string& value, std::array<uint8_t, 32>& output) {
+    if (value.size() != output.size() * 2u) return false;
+    for (size_t index = 0; index < output.size(); index++) {
+        const unsigned char high_char = static_cast<unsigned char>(value[index * 2u]);
+        const unsigned char low_char = static_cast<unsigned char>(value[index * 2u + 1u]);
+        if (!std::islower(high_char) && !std::isdigit(high_char)) return false;
+        if (!std::islower(low_char) && !std::isdigit(low_char)) return false;
+        const int high = std::isdigit(high_char) ? high_char - '0' : high_char - 'a' + 10;
+        const int low = std::isdigit(low_char) ? low_char - '0' : low_char - 'a' + 10;
+        if (high < 0 || high > 15 || low < 0 || low > 15) return false;
+        output[index] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
+std::string identity_initializer(const std::array<uint8_t, 32>& bytes) {
+    std::ostringstream out;
+    for (size_t index = 0; index < bytes.size(); index++) {
+        if (index) out << ", ";
+        out << fmt::format("0x{:02X}u", bytes[index]);
+    }
+    return out.str();
+}
 
 // Materialize alias entries as overlapping functions, grouped by host. Each
 // group shares one emitted body (entry switch + host-range blocks); every
@@ -84,7 +116,7 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 int main(int argc, char** argv) {
     const auto print_usage = [&]() {
         fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
-        fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
+        fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--overlay] [--source-observation-plan <file>] [--strict] [--inspect]\n", argv[0]);
         fmt::print("Example: {} SCUS_942.36 --seeds seeds/functions.txt --out-dir generated --strict\n", argv[0]);
     };
     for (int i = 1; i < argc; ++i) {
@@ -117,12 +149,15 @@ int main(int argc, char** argv) {
     // If --config is provided, all paths come from the TOML and other
     // CLI flags are ignored. Positional form below stays for back-compat.
     std::filesystem::path config_path;
+    std::string game_identity_hex;
+    std::string manifest_digest_hex;
     // --ws-config <path>: load ONLY the [widescreen] site lists from this TOML
     // without treating it as the full game config. Used by compile_overlays.py
     // so overlay compilation gets the widescreen emits (sprite-tag / cull /
     // backdrop) whose addresses live in overlay code — the overlay path is
     // positional (no --config), so this is the channel for those sites.
     std::filesystem::path ws_config_path;
+    std::filesystem::path source_observation_plan_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc) {
@@ -135,11 +170,41 @@ int main(int argc, char** argv) {
         }
     }
     for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "--game-identity-sha256" && i + 1 < argc) {
+            game_identity_hex = argv[++i];
+        } else if (argument.rfind("--game-identity-sha256=", 0) == 0) {
+            game_identity_hex = argument.substr(23);
+        } else if (argument == "--manifest-digest-sha256" && i + 1 < argc) {
+            manifest_digest_hex = argv[++i];
+        } else if (argument.rfind("--manifest-digest-sha256=", 0) == 0) {
+            manifest_digest_hex = argument.substr(25);
+        }
+    }
+    for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--ws-config" && i + 1 < argc) { ws_config_path = argv[i + 1]; break; }
         if (a.rfind("--ws-config=", 0) == 0) {
             ws_config_path = a.substr(std::string("--ws-config=").size());
             break;
+        }
+    }
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "--source-observation-plan") {
+            if (i + 1 >= argc) {
+                fmt::print(stderr,
+                           "psxrecomp-game: FATAL: --source-observation-plan requires a path\n");
+                return 1;
+            }
+            source_observation_plan_path = argv[++i];
+        } else if (argument.rfind("--source-observation-plan=", 0) == 0) {
+            source_observation_plan_path = argument.substr(26);
+            if (source_observation_plan_path.empty()) {
+                fmt::print(stderr,
+                           "psxrecomp-game: FATAL: --source-observation-plan requires a path\n");
+                return 1;
+            }
         }
     }
 
@@ -162,6 +227,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_depth;        // [widescreen.cull] depth_sites
     std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
     std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
+    std::map<uint32_t, PsxWsCullSemantic> ws_cull_semantic;
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
     std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };   // [widescreen.cull] screen_h_imms
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
@@ -211,6 +277,32 @@ int main(int argc, char** argv) {
         ws_cull_depth.insert(cfg.ws_cull_depth_sites.begin(), cfg.ws_cull_depth_sites.end());
         ws_cull_plane_nx.insert(cfg.ws_cull_plane_nx_sites.begin(), cfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(cfg.ws_cull_xclip_load_sites.begin(), cfg.ws_cull_xclip_load_sites.end());
+        auto add_semantic_sites = [&](const std::vector<uint32_t>& sites,
+                                      PsxWsCullSemantic semantic) {
+            for (uint32_t address : sites) {
+                auto [it, inserted] = ws_cull_semantic.emplace(address, semantic);
+                if (!inserted && it->second != semantic)
+                    throw std::runtime_error(
+                        fmt::format("conflicting semantic cull classes at 0x{:08X}",
+                                    address));
+            }
+        };
+        add_semantic_sites(cfg.ws_cull_semantic_screen_bias_sites,
+                           PSX_WS_CULL_SEMANTIC_SCREEN_BIAS);
+        add_semantic_sites(cfg.ws_cull_semantic_world_range_sites,
+                           PSX_WS_CULL_SEMANTIC_WORLD_RANGE);
+        add_semantic_sites(cfg.ws_cull_semantic_left_edge_sites,
+                           PSX_WS_CULL_SEMANTIC_LEFT_EDGE);
+        add_semantic_sites(cfg.ws_cull_semantic_masked_screen_x_sites,
+                           PSX_WS_CULL_SEMANTIC_MASKED_SCREEN_X);
+         add_semantic_sites(cfg.ws_cull_semantic_frustum_plane_x_sites,
+                            PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X);
+         add_semantic_sites(cfg.ws_cull_semantic_signed_screen_x_sites,
+                            PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X);
+         add_semantic_sites(cfg.ws_cull_semantic_depth_bound_sites,
+                            PSX_WS_CULL_SEMANTIC_DEPTH_BOUND);
+         add_semantic_sites(cfg.ws_cull_semantic_xclip_bound_sites,
+                            PSX_WS_CULL_SEMANTIC_XCLIP_BOUND);
         ws_cull_w_imms = cfg.ws_cull_w_imms;
         ws_cull_h_imms = cfg.ws_cull_h_imms;
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
@@ -270,6 +362,36 @@ int main(int argc, char** argv) {
         }
     }
 
+#if defined(PSX_GAME_EXTRA_IDENTITY_SHA256) && defined(PSX_GAME_MANIFEST_DIGEST_SHA256)
+    if (game_identity_hex.empty()) game_identity_hex = PSX_GAME_EXTRA_IDENTITY_SHA256;
+    if (manifest_digest_hex.empty()) manifest_digest_hex = PSX_GAME_MANIFEST_DIGEST_SHA256;
+#endif
+    const bool identity_required = !config_path.empty() || overlay_mode ||
+                                   !game_identity_hex.empty() || !manifest_digest_hex.empty();
+    GameIdentityInput game_identity{};
+    if (identity_required &&
+        (!decode_sha256(game_identity_hex, game_identity.game_sha256) ||
+         !decode_sha256(manifest_digest_hex, game_identity.manifest_sha256))) {
+        fmt::print(stderr,
+                   "psxrecomp-game: FATAL: game and manifest identities must each be lowercase 32-byte SHA-256 hex values\n");
+        return 1;
+    }
+    std::vector<PSXRecomp::CodeGenConfig::SourceObservationSite>
+        source_observation_sites;
+    std::vector<PSXRecomp::CodeGenConfig::NativeCutoverSite>
+        native_cutover_sites;
+    std::vector<PSXRecomp::CodeGenConfig::RenderLifecycleSite>
+        render_lifecycle_sites;
+    if (!source_observation_plan_path.empty()) {
+        std::string plan_error;
+        if (!PSXRecomp::load_source_observation_plan(
+                source_observation_plan_path, source_observation_sites,
+                native_cutover_sites, render_lifecycle_sites, plan_error)) {
+            fmt::print(stderr, "psxrecomp-game: FATAL: {}\n", plan_error);
+            return 1;
+        }
+    }
+
     // --ws-config: merge the [widescreen] site lists from a side config WITHOUT
     // adopting its exe/paths. The overlay path is positional (no --config), so
     // this is how overlay compilation receives the widescreen emits whose
@@ -290,6 +412,32 @@ int main(int argc, char** argv) {
         ws_cull_depth.insert(wscfg.ws_cull_depth_sites.begin(), wscfg.ws_cull_depth_sites.end());
         ws_cull_plane_nx.insert(wscfg.ws_cull_plane_nx_sites.begin(), wscfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(wscfg.ws_cull_xclip_load_sites.begin(), wscfg.ws_cull_xclip_load_sites.end());
+        auto merge_semantic_sites = [&](const std::vector<uint32_t>& sites,
+                                        PsxWsCullSemantic semantic) {
+            for (uint32_t address : sites) {
+                auto [it, inserted] = ws_cull_semantic.emplace(address, semantic);
+                if (!inserted && it->second != semantic)
+                    throw std::runtime_error(
+                        fmt::format("conflicting semantic cull classes at 0x{:08X}",
+                                    address));
+            }
+        };
+        merge_semantic_sites(wscfg.ws_cull_semantic_screen_bias_sites,
+                             PSX_WS_CULL_SEMANTIC_SCREEN_BIAS);
+        merge_semantic_sites(wscfg.ws_cull_semantic_world_range_sites,
+                             PSX_WS_CULL_SEMANTIC_WORLD_RANGE);
+        merge_semantic_sites(wscfg.ws_cull_semantic_left_edge_sites,
+                             PSX_WS_CULL_SEMANTIC_LEFT_EDGE);
+        merge_semantic_sites(wscfg.ws_cull_semantic_masked_screen_x_sites,
+                             PSX_WS_CULL_SEMANTIC_MASKED_SCREEN_X);
+        merge_semantic_sites(wscfg.ws_cull_semantic_frustum_plane_x_sites,
+                             PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X);
+        merge_semantic_sites(wscfg.ws_cull_semantic_signed_screen_x_sites,
+                             PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X);
+        merge_semantic_sites(wscfg.ws_cull_semantic_depth_bound_sites,
+                             PSX_WS_CULL_SEMANTIC_DEPTH_BOUND);
+        merge_semantic_sites(wscfg.ws_cull_semantic_xclip_bound_sites,
+                             PSX_WS_CULL_SEMANTIC_XCLIP_BOUND);
         ws_cull_w_imms = wscfg.ws_cull_w_imms;
         ws_cull_h_imms = wscfg.ws_cull_h_imms;
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
@@ -393,6 +541,63 @@ int main(int argc, char** argv) {
     // control-flow instructions cannot disagree with the generated graph.
     PSXRecompV4::apply_recompiler_patches_to_executable(
         *exe, instruction_patches, overlay_mode);
+
+    for (const auto& site : source_observation_sites) {
+        const auto word = exe->read_word(site.pc);
+        if (!word.has_value() || *word != site.instruction) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: source observation site 0x{:08X} expects 0x{:08X}, observed {}\n",
+                site.pc, site.instruction,
+                word.has_value() ? fmt::format("0x{:08X}", *word) :
+                                   std::string{"unmapped"});
+            return 1;
+        }
+    }
+    for (const auto& cutover : native_cutover_sites) {
+        const auto word = exe->read_word(cutover.pc);
+        if (!word.has_value() || *word != cutover.instruction) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: native cutover site 0x{:08X} expects 0x{:08X}, observed {}\n",
+                cutover.pc, cutover.instruction,
+                word.has_value() ? fmt::format("0x{:08X}", *word) :
+                                   std::string{"unmapped"});
+            return 1;
+        }
+        if (cutover.transfer ==
+                PSXRecomp::CodeGenConfig::NativeCutoverTransfer::ObserveAfter) {
+            const auto previous = exe->read_word(cutover.pc - 4u);
+            if (PSXRecomp::ControlFlowAnalyzer::is_control_flow(*word) ||
+                (previous.has_value() &&
+                 PSXRecomp::ControlFlowAnalyzer::is_control_flow(*previous))) {
+                fmt::print(stderr,
+                    "psxrecomp-game: FATAL: observe-after site 0x{:08X} cannot be control flow or a delay slot\n",
+                    cutover.pc);
+                return 1;
+            }
+        }
+    }
+    for (const auto& site : render_lifecycle_sites) {
+        const auto word = exe->read_word(site.pc);
+        if (!word.has_value() || *word != site.instruction) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: lifecycle site 0x{:08X} expects 0x{:08X}, observed {}\n",
+                site.pc, site.instruction,
+                word.has_value() ? fmt::format("0x{:08X}", *word) :
+                                   std::string{"unmapped"});
+            return 1;
+        }
+        if (site.role == PSXRecomp::CodeGenConfig::RenderLifecycleRole::Capture) {
+            const auto delay = exe->read_word(site.pc + 4u);
+            if (!delay.has_value() || *delay != site.delay_instruction) {
+                fmt::print(stderr,
+                    "psxrecomp-game: FATAL: lifecycle capture 0x{:08X} delay expects 0x{:08X}, observed {}\n",
+                    site.pc, site.delay_instruction,
+                    delay.has_value() ? fmt::format("0x{:08X}", *delay) :
+                                        std::string{"unmapped"});
+                return 1;
+            }
+        }
+    }
 
     fmt::print("✓ Successfully parsed PS1-EXE!\n\n");
 
@@ -1118,6 +1323,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_depth_sites = ws_cull_depth;
     codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
     codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
+    codegen_config.ws_cull_semantic_sites = ws_cull_semantic;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
@@ -1132,6 +1338,9 @@ int main(int argc, char** argv) {
     codegen_config.ws_bg2d_stream_right_site = ws_bg2d_stream_right_site;
     codegen_config.ws_bg2d_bufbase_site = ws_bg2d_bufbase_site;
     codegen_config.ws_bg2d_cap_site     = ws_bg2d_cap_site;
+    codegen_config.source_observation_sites = source_observation_sites;
+    codegen_config.native_cutover_sites = native_cutover_sites;
+    codegen_config.render_lifecycle_sites = render_lifecycle_sites;
     if (ws_bg2d_count_site || ws_bg2d_startcol_site || ws_bg2d_startx_site)
         fmt::print("  ws_bg2d 2D-background widen = ON (count=0x{:08X} startcol=0x{:08X} startx=0x{:08X})\n",
                    ws_bg2d_count_site, ws_bg2d_startcol_site, ws_bg2d_startx_site);
@@ -1324,6 +1533,7 @@ int main(int argc, char** argv) {
         std::ostringstream ds;
         ds << "/* Generated by PSXRecomp - dynamic dispatch table */\n";
         ds << "#include \"psx_runtime.h\"\n\n";
+        ds << "#include \"game_identity.h\"\n\n";
         ds << "extern int psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges_from(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc);\n\n";
 
@@ -1436,6 +1646,13 @@ int main(int argc, char** argv) {
         ds << "};\n\n";
 
         ds << "typedef void (*PsxGameDispatchFn)(CPUState* cpu);\n";
+        ds << "static const PsxGameIdentity k_psx_game_identity = {\n";
+        ds << "    {" << identity_initializer(game_identity.game_sha256) << "},\n";
+        ds << "    {" << identity_initializer(game_identity.manifest_sha256) << "}\n";
+        ds << "};\n";
+        ds << "static int psx_game_identity_ready(void) {\n";
+        ds << "    return psx_game_identity_bind_static(&k_psx_game_identity);\n";
+        ds << "}\n\n";
         ds << "typedef struct {\n";
         ds << "    uint32_t addr;\n";
         ds << "    uint32_t resume_pc;\n";
@@ -1465,6 +1682,7 @@ int main(int argc, char** argv) {
 
         ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";
         ds << "int psx_game_text_native_ok(uint32_t addr) {\n";
+        ds << "    if (!psx_game_address_in_text(addr)) return 0;\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
         ds << "    return dirty_ram_text_native_ok_ranges_from(\n";
@@ -1475,6 +1693,7 @@ int main(int argc, char** argv) {
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
         ds << "    if (!entry) return 0;\n";
+        ds << "    if (!psx_game_identity_ready() || !psx_game_identity_gate(&k_psx_game_identity)) return 0;\n";
         ds << "    if (entry->range_count == 0 || !dirty_ram_text_native_ok_ranges_from(\n";
         ds << "            &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr)) return 0;\n";
         ds << "    if (psx_check_interrupts_dispatch_entry(cpu, addr)) return 1;\n";

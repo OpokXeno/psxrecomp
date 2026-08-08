@@ -1586,7 +1586,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
     out += "extern int psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
-    out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
+    out += "extern void gte_execute_at(CPUState* cpu, uint32_t cmd, uint32_t guest_pc);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
@@ -2233,7 +2233,7 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
     full_c += "extern int psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
-    full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
+    full_c += "extern void gte_execute_at(CPUState* cpu, uint32_t cmd, uint32_t guest_pc);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";

@@ -35,7 +35,8 @@ Columns: **N** = native, **D** = DuckStation oracle.
 
 | Command | N | D | Params | Description |
 |---|---|---|---|---|
-| `ping` / `frame` | ✓ | ✓ | — | Heartbeat + current frame number |
+| `ping` | ✓ | ✓ | — | Heartbeat. Native answers immediately from the I/O thread as `{"id":0,"ok":true,"pong":true,"io_thread":true}`; it does not include the current frame |
+| `frame` | ✓ | ✓ | — | Current frame number |
 | `get_registers` (`regs`) | ✓ | ✓ | — | All 32 GPRs + PC + HI + LO (native also: COP0 SR/Cause/EPC, I_STAT, I_MASK) |
 | `read_ram` | ✓ | ✓ | `addr`, `len` | Read bytes from PS1 address space as hex string — up to the full 2 MB in ONE response line. `dump_ram` is an alias (the old chunked multi-line variant is gone: it broke the one-request/one-response protocol and wedged the server) |
 | `write_ram` | ✓ | ✓ | `addr`, `hex` | Write bytes to PS1 address space. `hex` = even-length hex string (handler cap 0x1000 bytes; the ~8 KB request line limits the effective payload to ~4 KB — larger requests are rejected). Legacy single-byte form `addr`+`val` (one byte) still accepted |
@@ -58,10 +59,10 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `clear_input` | ✓ | ✓ | — | Remove input and analog axis overrides |
 | `turbo` | ✓ |   | `enabled` | Enable/disable TCP-controlled frontend turbo for fast-forward validation |
 | `turbo_state` | ✓ |   | — | Query TCP-controlled turbo state |
-| `pause` | ✓ | ✓ | — | Pause emulation |
-| `continue` (`c`) | ✓ | ✓ | — | Resume emulation |
-| `step` | ✓ | ✓ | `[count]` | Step N frames (default 1) |
-| `run_to_frame` | ✓ | ✓ | `frame` | Run until frame number, then pause |
+| `pause` |   | ✓ | — | DuckStation only. Native returns an error; query its continuous ring buffers instead |
+| `continue` (`c`) |   | ✓ | — | DuckStation only. Native pause/resume was removed |
+| `step` |   | ✓ | `[count]` | DuckStation only. Native returns an error; query its continuous ring buffers instead |
+| `run_to_frame` |   | ✓ | `frame` | DuckStation only. Native returns an error; use `frame_range` / `read_frame_ram` |
 | `history` | ✓ | ✓ | — | Ring buffer stats (frames available) |
 | `get_frame` | ✓ | ✓ | `frame` | Full frame record from ring buffer |
 | `frame_range` | ✓ | ✓ | `start`, `end` | Range query, max 200 frames |

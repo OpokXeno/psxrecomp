@@ -667,7 +667,6 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 }
             }
         }
-
         for (int col = 0; col < w; col++) {
             int dx = (dst_x + col) & (VRAM_WIDTH - 1);
             uint16_t pix = row_buf[col];

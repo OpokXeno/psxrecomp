@@ -72,7 +72,8 @@ extern uint64_t crash_trace_dispatch_seq_get(void);
  * UnknownDispatchEntry. Accessor wrappers exported by debug_server.c. */
 typedef struct {
     uint64_t seq;
-    uint32_t addr, phys, ra, a0, a1, frame, pad;
+    uint32_t addr, phys, ra, a0, a1, frame;
+    uint32_t last_fn_entry, dispatch_func, last_store_pc;
 } UnknownDispatchEntry;
 #define UNKNOWN_DISPATCH_CAP (1 << 16)
 extern UnknownDispatchEntry crash_trace_unknown_get(uint64_t seq);
@@ -563,10 +564,12 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
             append_fmt(buf, sizeof(buf), &pos,
                 "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"phys\":\"0x%08X\","
                 "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
-                "\"frame\":%u}",
+                "\"frame\":%u,\"last_fn_entry\":\"0x%08X\","
+                "\"dispatch_func\":\"0x%08X\",\"last_store_pc\":\"0x%08X\"}",
                 i == 0 ? "" : ",",
                 (unsigned long long)e.seq, e.addr, e.phys,
-                e.ra, e.a0, e.a1, e.frame);
+                e.ra, e.a0, e.a1, e.frame,
+                e.last_fn_entry, e.dispatch_func, e.last_store_pc);
         }
         append_str(buf, sizeof(buf), &pos, "]\n  },\n");
     }

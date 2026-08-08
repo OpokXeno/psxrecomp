@@ -25,6 +25,14 @@ int mdec_dma_read_ready(void);
  * and get no GTE squash to compensate the stretch). */
 int mdec_recently_active(uint32_t within_frames);
 
+/* Snapshot of the most recently completed colour decode in display-ready
+ * ARGB8888 form. The buffer is owned by MDEC and remains valid until the next
+ * decode or mdec_init(). Native FMV presentation consumes this surface instead
+ * of reconstructing the frame from guest VRAM. */
+int mdec_native_frame_snapshot(const uint32_t **pixels, uint32_t *width,
+                              uint32_t *height, int *depth24,
+                              uint64_t *generation);
+
 typedef struct MDECDebugState {
     uint32_t command;
     uint32_t expected_halfwords;

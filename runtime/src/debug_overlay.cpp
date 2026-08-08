@@ -12,9 +12,11 @@
  *                             gpu_gl_renderer.c and is not reachable here,
  *                             so init only stores the window. ImGui
  *                             context creation is lazy.
- *   psx_debug_overlay_pre_swap — called by gpu_gl_renderer.c on the main
- *                             thread at the bottom of each present path,
- *                             BEFORE SDL_GL_SwapWindow. On the first call
+ *   psx_debug_overlay_pre_swap_target — called by gpu_gl_renderer.c on the
+ *                             main thread at the bottom of each present path,
+ *                             BEFORE SDL_GL_SwapWindow. The normal wrapper
+ *                             supplies FBO 0; transactional staging supplies
+ *                             its private drawable-sized FBO. On the first call
  *                             it does the lazy ImGui init (captures the
  *                             current GL context via SDL_GL_GetCurrentContext,
  *                             which is the main thread's). Subsequent calls
@@ -35,6 +37,7 @@
 
 #include "debug_overlay.h"
 #include "debug_overlay_data.h"
+#include "overlay_capture.h"
 
 /* The vendored Dear ImGui lives at recomp-ui/src/third_party/imgui. Its
  * include dirs are applied target-wide by recomp-ui/recomp_ui.cmake, so
@@ -104,6 +107,8 @@ extern "C" {
                                    starvation_ring_dump */
 #include "cpu_state.h"          /* gte_set_display_aspect */
 #include "spu.h"
+
+extern void psx_frame_interpolation_set(int enabled);
 
 /* Memory read accessor — used by the RAM Inspector section. */
 extern uint8_t psx_read_byte(uint32_t addr);
@@ -286,12 +291,21 @@ static char     s_event_jump_status[128] = {0};
 
 /* ---- small helpers ------------------------------------------------------ */
 
-/* Read the back buffer of the current default framebuffer to a top-down
- * RGB uint8_t* buffer (caller frees with std::free). On any GL error, the
- * returned buffer is empty (size 0) and the caller is expected to skip the
- * PNG write. The path was deliberately implemented as a freestanding helper
- * so the hidden+armed path can use it without dragging in ImGui. */
-static uint8_t *capture_window_rgb(int *out_w, int *out_h)
+static void bind_overlay_target(GLuint target_fbo)
+{
+    const GLenum buffer = target_fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target_fbo);
+    glReadBuffer(buffer);
+    glDrawBuffer(buffer);
+}
+
+/* Read the selected drawable-sized framebuffer to a top-down RGB uint8_t*
+ * buffer (caller frees with std::free). On any GL error, the returned buffer
+ * is empty and the caller skips the PNG write. The hidden+armed path can use
+ * this helper without creating an ImGui frame. */
+static uint8_t *capture_window_rgb(GLuint target_fbo, int *out_w, int *out_h)
 {
     *out_w = 0;
     *out_h = 0;
@@ -299,28 +313,33 @@ static uint8_t *capture_window_rgb(int *out_w, int *out_h)
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (ww <= 0 || wh <= 0) return nullptr;
 
-    /* Defensive rebind: every present path leaves some FBO bound, so the
-     * readback would otherwise target the last-bound FBO (e.g. the wide
-     * FBO in native-wide mode). Bind both DRAW and READ to 0 so
-     * glReadPixels reads the default framebuffer's back buffer, and so
-     * the ImGui frame path that follows (if visible) draws into the same. */
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    /* The back buffer is the natural read target. On drivers that have
-     * already presented (shouldn't happen at pre_swap but defensive), the
-     * front buffer is also readable. */
-    glReadBuffer(GL_BACK);
+    bind_overlay_target(target_fbo);
 
     const size_t row_bytes = (size_t)ww * 3;
     uint8_t *rgb = (uint8_t *)std::malloc(row_bytes * (size_t)wh);
-    if (!rgb) return nullptr;
+    if (!rgb) {
+        bind_overlay_target(target_fbo);
+        return nullptr;
+    }
     /* GL_PACK_ALIGNMENT=1 prevents row padding for our tight RGB rows. */
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
     GLenum err = glGetError();
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    bind_overlay_target(target_fbo);
     if (err != GL_NO_ERROR) {
         std::free(rgb);
         return nullptr;
+    }
+    for (int y = 0; y < wh / 2; y++) {
+        uint8_t *top = rgb + (size_t)y * row_bytes;
+        uint8_t *bottom = rgb + (size_t)(wh - 1 - y) * row_bytes;
+
+        for (size_t x = 0; x < row_bytes; x++) {
+            const uint8_t value = top[x];
+            top[x] = bottom[x];
+            bottom[x] = value;
+        }
     }
     *out_w = ww;
     *out_h = wh;
@@ -928,6 +947,8 @@ int psx_debug_overlay_write_var(int var, int value)
 int psx_debug_overlay_force_battle(int value)
 {
     if (value < 0 || value > 0xFFFF) return -1;
+    overlay_capture_before_debug_write(
+        kAddr_encounterTrigger, sizeof(uint32_t));
     write_u32_le(kAddr_encounterTrigger, (uint32_t)value);
     return 0;
 }
@@ -1887,17 +1908,19 @@ int psx_debug_overlay_set_force_capture(int on)
  *      with the context current).
  *   2. If the overlay is visible: draw the minimal "Xenogears Debug" window.
  *      The ImGui GL3 backend handles its own program/VAO/texture/enable
- *      save+restore, but NOT the FBO binding — hence the defensive rebind
- *      in capture_window_rgb (which the visible path also calls for any
- *      pending window_shot — see below).
- *   3. If window_shot is armed: read the back buffer (composited, with
+ *      save+restore, but NOT the FBO binding, so this hook binds the supplied
+ *      target immediately before and after RenderDrawData.
+ *   3. If window_shot is armed: read the selected target (composited, with
  *      overlay if visible) and write the PNG. Done AFTER RenderDrawData
  *      so the shot includes the overlay's pixels.
  *
- * Hidden + unarmed = pure no-op (zero GL work, zero state leak).
+ * Hidden + unarmed performs no target binding or rendering; lazy init and the
+ * existing per-attempt guest preparation retain their prior policy.
  */
-void psx_debug_overlay_pre_swap(void)
+void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
 {
+    const GLuint target_fbo = (GLuint)framebuffer;
+
     /* Step 1: lazy init. */
     if (!s_imgui_ready) {
         if (!s_win) return; /* not initialized at all — try next frame */
@@ -2091,7 +2114,9 @@ void psx_debug_overlay_pre_swap(void)
         }
 
         ImGui::Render();
+        bind_overlay_target(target_fbo);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        bind_overlay_target(target_fbo);
     } else if (s_text_input_started) {
         /* Hidden mid-text-input (Ctrl+F3 while typing): the Start call lives
          * inside the visible branch, so a toggle-while-typing leaves the
@@ -2104,12 +2129,11 @@ void psx_debug_overlay_pre_swap(void)
     /* Step 3: window_shot readback. Always runs when armed (works hidden
      * too — captures the game-only frame in that case). Must run AFTER
      * RenderDrawData when visible so the overlay's pixels are in the back
-     * buffer. capture_window_rgb() defensively rebinds FBO 0 / sets
-     * GL_READ_BUFFER, which restores the readback target even after the
-     * ImGui frame may have left some state set. */
+     * buffer. capture_window_rgb() binds and leaves only the caller-selected
+     * target, even if the ImGui frame changed unrelated GL state. */
     if (s_window_shot_armed) {
         int w = 0, h = 0;
-        uint8_t *rgb = capture_window_rgb(&w, &h);
+        uint8_t *rgb = capture_window_rgb(target_fbo, &w, &h);
         if (rgb) {
             write_rgb_png(s_window_shot_path, rgb, w, h);
             std::free(rgb);
@@ -2117,6 +2141,11 @@ void psx_debug_overlay_pre_swap(void)
         s_window_shot_armed = false;
         s_window_shot_path[0] = '\0';
     }
+}
+
+void psx_debug_overlay_pre_swap(void)
+{
+    psx_debug_overlay_pre_swap_target(0u);
 }
 
 /* ---- widget action hook (debug-only, TCP-driven) ----------------------- */
@@ -2159,11 +2188,7 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         return 0;
     }
     if (std::strcmp(name, "interp") == 0) {
-        int en = 0, sus = 0, hist = 0;
-        double hh = 0.0, th = 0.0;
-        uint64_t swaps = 0;
-        gl_renderer_interpolation_diag(&en, &sus, &hist, &hh, &th, &swaps);
-        gl_renderer_set_interpolation(value ? 1 : 0, hh, th);
+        psx_frame_interpolation_set(value ? 1 : 0);
         return 0;
     }
     if (std::strcmp(name, "supersampling") == 0) {

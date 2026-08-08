@@ -213,6 +213,749 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-07 (Native stream family hint):** Added a bounded command-ID to
+  resolver-family hint table in `native_renderer/src/xg_render_auth_runtime.c`.
+  Hints are keyed by the current producer-resource generation, cleared during
+  runtime reset, and fall back to the original family precedence chain when a
+  cached family misses. The first implementation used a generic family-dispatch
+  helper and was rejected after `perf-v7` showed that helper at `2.10%`; the
+  final implementation uses direct hit dispatch and direct fallback calls.
+  Release rebuilt successfully. The exact `--no-launcher` replay completed all
+  `4,856` VBlanks (`4799` reported frames), retained the same evidence counts
+  (`363112` staged, `316181` consumed, `1096275` Native packets, `72` opcode
+  `0x40` unbound, zero unsupported), and reproduced the existing `FAIL` evidence
+  caused by missing writer provenance/final `effective_render_mode=original`.
+  `perf-v8.data` has `42579` samples and zero lost samples; resolver self time
+  moved from roughly `1.7--1.9%` in `perf-v6` to `1.2--1.4%`. Added a bounded
+  command-ID index with duplicate counting to
+  `guest_render_native_stream_reserve_exact()` and centralized entry-removal
+  bookkeeping so swaps, reservations, compaction, and visual abandonment keep
+  the index valid. The post-index full replay (`runtime-evidence-v10.json`)
+  retains the same evidence counts and reaches `4846` reported frames; combat
+  still falls to `38.7--51.4` FPS. A follow-up `perf-v11.data` capture has
+  `42553` samples with zero lost samples; `native_stream_resolve` is down to
+  `1.12--1.24%` self overhead and `reserve_exact` is below the `0.5%` report
+  threshold. The current diagnostic build passes `54/54` CTest; CMake still
+  warns that BIOS generated sources are stale and that ccache is unavailable.
+  The remaining material cost is the native miss/resolver path plus interpreted
+  instruction work, not exact reservation lookup or evidence policy.
+
+- **2026-08-07 (Native replay performance pass, provenance retained):** The
+  visual regression was traced to the test launch using an isolated memcard
+  directory; the corrected replay uses
+  `--memcard-dir /home/pc/xenogears-port/XenogearsRecomp` (`card1.mcd` and
+  `card2.mcd`) and has no graphical glitches. Replaced the hot reverse scan in
+  `debug_server_find_last_ram_writer()` with an exact aligned main-RAM/
+  scratchpad cache, retaining the bounded ring scan for non-indexable addresses.
+  Then changed Native-auth resource invalidation to logical count/valid clears
+  and an epoch-based FT4 table invalidation; no debug/provenance hooks were
+  disabled. The same 3,200-VBlank replay retained `228,187` packets,
+  `201,653` bound, `12,480` unbound, and zero unsupported packets. CTest is
+  `54/54`. Valid `perf` sample duration improved from `73.56 s` (debug baseline)
+  to `60.39 s` after the writer cache, `55.59 s` after logical invalidation,
+  and `52.39 s` after FT4 epochs; the final run stayed at roughly `59.5–60.8`
+  FPS through frame 3,175. Final evidence:
+  `/tmp/opencode/xg-perf-epoch-record/runtime-evidence.json`; its `FAIL` status
+  is expected because the temporary 3,200-VBlank trace does not reach the
+  4,856-VBlank checkpoint. Remaining profile cost is pacing
+  (`__vdso_clock_gettime`, `20.25%`), overlay write watching (`7.47%`), and
+  diagnostic write tracing (`2.62%`), not the prior writer lookup or bulk
+  Native-auth invalidation.
+
+- **2026-08-07 (Release full replay):** Rebuilt `/tmp/opencode/xg-perf-release-build`
+  as `RelWithDebInfo` with `PSX_DEBUG_TOOLS=OFF` and `PSX_DEBUG_OVERLAY=OFF`,
+  then ran the complete `4,856`-VBlank combat trace with
+  `--memcard-dir /home/pc/xenogears-port/XenogearsRecomp`; no early timeout or
+  interruption was used. Replay completion is proven by `trace_index=4856/4856`,
+  `checkpoint_seen_vblank=1747`, and `stop_reason=CheckpointReached`. The
+  evidence is `FAIL` only because the Release build has no writer-provenance
+  observer: `72` opcode-`0x40` packets remain unbound, one forced-Original
+  fallback is recorded, and final `effective_render_mode=original`. The full
+  Release `perf` capture has `77K` samples, `0` lost, and `119.35 s` sample
+  duration. The combat slowdown is now attributed to Native miss resolution,
+  not debug tooling: `native_stream_resolve.part.0` is `34.22%` inclusive,
+  `guest_render_native_stream_resolve_active_miss` `6.66%`, and the FT3/field
+  sprite/residual template linear searches dominate that path. FPS is near 60
+  through frame ~3,500, drops to ~10–15 around frames 3,850–4,200, then stays
+  below 50 through the combat tail. Evidence:
+  `/tmp/opencode/xg-perf-release-full-record/runtime-evidence.json` and
+  `/tmp/opencode/xg-perf-release-full-record/perf.data`.
+
+- **2026-08-07 (Performance build correction and visual rollback):** The prior
+  `build-dbg` was a true CMake `Debug` build (`-g`, no optimization). Its
+  pre-rollback performance window `3800:4200` measured `131206.052 ms` wall
+  time for 400 frames, with `130878.979 ms` in `guest_work`; pacer, capture,
+  provider polling, and GL work were negligible by comparison. Reconfigured
+  the same diagnostic-capable build as `RelWithDebInfo` (`-O2 -g -DNDEBUG`,
+  `PSX_DEBUG_TOOLS=ON`, `PSX_DEBUG_OVERLAY=ON`) and rebuilt successfully. Per
+  user direction, no post-rollback replay was run. The shared-binding
+  deduplication and scene-epoch relaxation from the previous entry were
+  rolled back after the graphical regression; exact GP0 line/polyline
+  semantics and the no-gates shared fallback remain active. CTest is `54/54`.
+
+- **2026-08-07 (Native no-gates shared-packet closure):** The renderer-auth
+   strict path is the default when `PSX_OVERLAY_NO_GATES` is absent or `0`;
+   setting it to `1` explicitly enables the no-gates diagnostic path. The unsafe overlay-loader
+  live-code-CRC bypass remains removed, so native overlay dispatch still
+  requires byte identity. The earlier v18/v19 replay reached all `4,856`
+  trace states with zero unbound packets, but that result belongs to the
+  deduplication variant and is historical, not the current post-rollback
+  state. The diagnostic JSON still reported `auth_proof=OBSERVED`,
+   `effective_render_mode=original`, and one `forced_original` telemetry
+   transition; this pre-existing visual path is not being changed. Exact GP0
+   line/polyline semantics and no-gates shared fallback remain active; strict
+   mode keeps the original ambiguity rejection.
+
+- **2026-08-08 (Battle fader Native capture):** The battle transition fader at
+  `0x800B3878` constructs an overscanned semitransparent `POLY_F4`
+  (`-32..320`, `-32..240`) and inserts it into the battle OT. Capture its
+  completed packet at `0x800B393C`, before `addPrim`, and resolve it through
+  the existing authenticated F4 Native stream path. This avoids the unsafe
+  generic shared-packet fallback while ensuring the fader is not omitted from
+  Native rendering.
+
+- **2026-08-06 (Overlay artifact authorization generalized):** Separated the
+  identity-bound resident runtime descriptor from overlay artifact authority.
+  Overlay candidates now require loader-provided authority/pair provenance,
+  an in-artifact function range, and a seam declared in
+  `xg_render_overlay_ranges.toml`; no Field 5 scene/checkpoint is used as the
+  overlay authorization condition. Added code-range invalidation for the
+  authenticated overlay candidate and a focused regression test proving an
+  `0x801B2000` overlay candidate is accepted without the Field 5 artifact.
+  Focused CTest is 3/3 and overlay-range/runtime-variant Python tests are 9/9.
+  Full replay remains open: the current offline cache registers 1,467 overlay
+  candidates, so the strict packet gate is not yet evidence of complete overlay
+  coverage.
+
+- **2026-08-06 (Native widescreen packet-faithful closure, Native-only proof):**
+  Completed shared Native-view projection and widened host culling across the
+  compatible field/world producer families, including the remaining model FT3
+  path. The OpenGL Native compositor now preserves packet-order fills, uploads,
+  lines and VRAM copies, including X/Y wrap; retained surfaces reseed before
+  presentation when invalidated and framebuffer bases that cross VRAM X=1023
+  seed and mirror their wrapped columns correctly. An independent read-only
+  subagent audit was completed before end-to-end replay; its savestate and live
+  supersampling findings were explicitly left out of this scope. Focused Native
+  verification passes: `gpu_gl_mask_order_test`, `xg_host_3d_math`,
+  `xg_model_ft4_raw`, `xg_render_auth`, and 29 replay-tool tests. One direct
+  Native-only Field 5 replay (no Original/Shadow/Native matrix) passes with
+  282,767 Native packets, 30,129 bound, 20,991 state, 231,647 unbound,
+  3,296 independent Native VRAM presents, and zero fallback, unsupported,
+  Original draws, or parser replay commands. Evidence:
+  `/tmp/opencode/xg-native-wide-complete-v8/runtime-evidence.json`. A separate
+  Native-only live capture passes at frame 4015, 853x480 (16:9), SHA-256
+  `d3ce2dbb5d014f4ca2bb9b083c4bdc957e62ec7a4e2db2a5e5efd447c9802283`;
+  manifest: `/tmp/opencode/xg-native-wide-complete-v8/capture/manifest.json`.
+  The replay validator now requires at least one independent Native VRAM
+  present for command-stream completion and its single-run baseline path no
+  longer imposes a contradictory post-checkpoint Cross input on the trace's
+  declared neutral observation tail.
+
+- **2026-08-06 (Native widescreen foundation and first source-space slice):**
+  Added a producer-driven `XgNativeView` independent from every legacy
+  `gpu_ws_*`, GTE-squash, culling rewrite, HUD heuristic, and mirrored-wide
+  surface. The shared IR and `GpuRenderSemantic` can now carry an optional
+  Native-view position while preserving canonical guest coordinates for packet
+  comparison and VRAM. OpenGL owns separate Native-view FBOs, seeds their 4:3
+  centre before the first semantic draw, renders Native semantics into the wide
+  target, and presents it directly. Packet-derived draws without source-space
+  data remain centred safely; they are not stretched.
+
+  `World Horizon` is the first adapter to the generic contract. It projects the
+  authenticated source vertices a second time through the shared view, while
+  leaving its guest packets, OT links, canonical projection, and material
+  untouched. This is a validation slice, not per-producer widescreen logic; all
+  later 3D families will populate the same IR fields. The OpenGL test proves a
+  source-derived position appears only at its wide coordinate, canonical VRAM
+  remains unchanged, and the Native surface swaps directly. Focused CTest is
+  9/9, replay Python is 61/61, and the cold 4,528-VBlank Original/Shadow/Native
+  regression matrix remains `PASS` with zero Native unsupported, Original, or
+  parser-replay commands. Evidence:
+  `/tmp/opencode/xg-native-view-regression-v1/evidence.json`.
+
+- **2026-08-06 (Producer-first packet-faithful Native contract):** Native keeps
+  authenticated producer semantics as its preferred source, but a complete
+  supported GP0 draw without a binding now translates directly to
+  `GpuRenderSemantic` and renders through the OpenGL Native backend. The packet
+  path never enters `gpu_write_gp0_body()`, `gp0_exec_*`, or parser replay.
+  Preflight and submission both reject packet-derived draws unless OpenGL is the
+  effective backend; software and Vulkan cannot rasterize this Native path.
+  Evidence labels a zero-unbound stream `independent` and a successfully
+  translated nonzero-unbound stream `packet-faithful`. Unsupported packets,
+  Original draws, parser replay, not-found bindings, and staging failures remain
+  hard failures. Focused software rejection, hidden-context OpenGL raster, and
+  replay-validator tests pass. The canonical cold OpenGL matrix runs 4,528
+  VBlanks per row and reports `status=PASS`; its Native row contains 30,129
+  producer-bound packets, 20,991 ordered state packets, 231,647 packet-faithful
+  draws, and zero unsupported/Original/parser-replay/not-found/stage failures.
+  Evidence: `/tmp/opencode/xg-native-packet-faithful-matrix-v1/evidence.json`.
+
+- **2026-08-05 (Field target/status `0x48` polylines):** Recovered and
+  authenticated `RenderFieldTargetPolylines` at
+  `0x801CFB48..0x801CFF60` from the runtime Field 5 artifact. The routine
+  iterates 32 actor slots, skips slots 15/31 and disabled groups, chooses the
+  red/green status color, projects two independent three-vertex source-vector
+  sets through `RotTransPers3`, and links both preinitialized monochrome
+  polyline packets into OT bucket `+0x80` with `AddPrim`. The contract captures
+  GTE projection state and all six source `SVECTOR`s at entry, derives the two
+  polylines without consuming guest packet semantics, and publishes only after
+  the return seam validates tag length, command/color, all XY words, and the
+  variable-length terminator. `GpuRenderSemantic` now has first-class line-list
+  topology; bound line commands consume the supplied semantic instead of the
+  removed generic guest-packet line decoder. The exact function bytes are
+  independently authenticated by SHA-256
+  `4a437e0b9997a056107bc06a49e5f978562829128c8eb67be707dac0052dc66a`.
+  The unrestricted retail-BIOS Native replay records 909 entry observations,
+  688 emitting invocations, 41,280 Native polylines, 82,560 Native line
+  segments, and 41,280/41,280 exact comparisons with zero mismatches, blockers,
+  or staging failures. Opcode `0x48` unbound falls from 41,280 to zero.
+  Evidence: `/tmp/opencode/xg-line48-native-v3/runtime-evidence.json`.
+  Focused CTest is 3/3, focused Python tests are 29/29, and `git diff --check`
+  passes. Global evidence remains red because Native producer coverage is
+  incomplete; no timing-core behavior changed in this pass.
+
+- **2026-08-04 (Field 5 sprite FT4 packet builder):** Authenticated
+  `BuildFieldSpriteFt4Packets` at `0x8002675C..0x800269CC` for overlay caller
+  returns `0x801CFA14`, `0x801CFA48`, and `0x801D23F4`. The producer derives
+  XY, UV, CLUT, TPAGE, material state, and double-buffered packet addresses
+  from its source descriptors without consuming guest packet semantics. Native
+  publication occurs only after the return hook validates every generated
+  packet. The contract is producer-scoped rather than field-scoped: the same
+  authenticated builder also runs in attract field 490 and remains eligible
+  there. The earlier Field-5-only gate was removed because replay checkpoint
+  identity is not rendering authority. The unrestricted retail-BIOS replay
+  reaches Field 5 and records 2,568 cutovers, 3,848 Native primitives, and
+  3,848/3,848 exact builder comparisons with zero mismatches, blockers, or
+  staging failures. Of those bindings, 3,843 are consumed and five remain
+  pending at the final evidence cutoff; opcode `0x2D` unbound falls from 22,920
+  to 19,077. Evidence:
+  `/tmp/opencode/xg-field-sprite-unrestricted-final/runtime-evidence.json`.
+  Focused CTest is 2/2, replay Python tests are 61/61, and `git diff --check`
+  passes. Global evidence remains red because Native producer coverage is
+  incomplete; no timing-core behavior changed in this pass.
+
+- **2026-08-05 (Resident sprite FT4 and expanded field builder):** Closed the
+  resident raw FT4 producer through wrapper `0x8001E298`, inner producer
+  `0x8001E3D8`, validation seams `0x8001E874`/`0x8001E8D8`, wrapper commit
+  `0x8001E2C0`, and direct return `0x8001E988`. Semantics come from the sprite
+  descriptor, source vertices, GTE state, and draw state; guest packets are
+  comparison-only. Direct invocations publish through standalone submissions,
+  while wrapper-scoped invocations stage against the producer's OT bucket
+  before the guest transaction becomes active. The unrestricted retail-BIOS
+  Native replay records 3,915 invocations, 16,201/16,201 exact comparisons,
+  2,793 cutovers, and 16,201 Native primitives with zero mismatches, blockers,
+  or staging failures. Opcode `0x2C` unbound falls from 24,837 to 8,742; the
+  residual matches the separately identified overlay producer family.
+  `BuildFieldSpriteFt4Packets` is now accepted for every invocation of the
+  resident producer. A previously unseen flipped descriptor proved that the
+  guest decrements UV width/height when a negative pre-flip origin is clamped;
+  reproducing that behavior yields 4,066/4,066 exact comparisons, 2,764
+  cutovers, and 4,066 Native primitives with zero mismatches or blockers.
+  Opcode `0x2D` unbound falls from 20,324 in the pre-fix replay to 18,978.
+  Evidence: `/tmp/opencode/xg-parallel-producers-v13/runtime-evidence.json`.
+
+- **2026-08-05 (Overlay FT4 `0x2C`/`0x2E` and zoom closure):** Closed both
+  residual raw FT4 opcode families with full-image and producer-scoped
+  authority. The `0x2C` image at base `0x801B2000`, size `270340`, SHA-256
+  `6b9f505b5ea77f3bb7222e78d2b2550f038fb319db399b7d862b4bd236bb2dbe`
+  authenticates producer `0x801E927C..0x801E92C4`, its ten callers, and the
+  later semantic writers `0x801E73FC`, `0x801E9218`, and `0x8004A768`.
+  Rectangle, static-quad, dynamic-UV, projected-GTE, glyph, material, and OT
+  insertion contracts derive exclusively from caller inputs, globals, source
+  vectors, GTE state, and `AddPrim` arguments. The integrated cold replay emits
+  4,272 direct, 267 rectangle, and 4,203 projected Native primitives, exactly
+  covering the 8,742-command overlay residual; combined with the resident
+  16,201-primitives contract, opcode `0x2C` unbound is zero.
+
+  Opcode `0x2E` uses two independently authenticated overlay images. The
+  projected image SHA-256
+  `75c675f9736365dded5373bbd851b4a8c763ba34c167ef223c47032e8068f69f`
+  supplies 4,188 Native primitives through material, `RotTransPers4`, and
+  `AddPrim` seams. The Field-5 image above supplies another 4,134 through
+  authenticated field-template builders and their OT insertions. The zoom
+  sidecar derives five templates across two buffers from initializer
+  `0x800A663C..0x800A68F0`, updates RGB source-side, and emits 325 primitives
+  through normal invocation seams. A late-attach resolver covers the remaining
+  290 DMA replays by matching only the ten initializer-derived packet source
+  addresses; it never reads template tags or payload. Opcode `0x2E` unbound is
+  therefore zero. The unrestricted retail-BIOS cold replay runs 4,528 VBlanks,
+  reaches Field 5, records zero substitution blockers and staging failures, and
+  retains `status=FAIL` only because other opcode families remain uncovered.
+  Evidence: `/tmp/opencode/xg-overlay-producers-integrated-v26/runtime-evidence.json`.
+  Focused CTest is 4/4, focused Python tests are 34/34, and `git diff --check`
+  passes.
+
+- **2026-08-05 (FT4 replay, GP0 state, and control closure):** Closed the
+  remaining 18,996 opcode `0x2D` commands by retaining a source-side semantic
+  sidecar for `BuildFieldSpriteFt4Packets` and resolving later DMA replays by
+  exact physical `packet + 4` identity. The replay path never reads packet
+  payload and invalidates entries when producer authority or material family
+  changes. The integrated replay records 3,970/3,970 exact template
+  comparisons, zero blockers, and opcode `0x2D` unbound at zero.
+
+  GP0 state commands are now a first-class ordered Native state stream rather
+  than fake draw bindings: 7,286 E1 draw-mode, 6,463 E2 texture-window, 1,741
+  each E3/E4/E5 draw-area/offset, and 2,497 E6 mask-bit commands, 21,469 total.
+  GP0 `00` NOP, `01` cache clear, and `A0` CPU-to-VRAM transfer remain in the
+  canonical GP0 machine with their ordering and VRAM side effects, but no
+  longer count as missing geometry. Their previous 6,986, 3,781, and 3,760
+  unbound counts respectively fall to zero. The unrestricted integrated cold
+  replay reaches Field 5 over 4,528 VBlanks with zero stage failures; residual
+  unbound is reduced to 3,492 genuine draw commands. Evidence:
+  `/tmp/opencode/xg-native-integrated-v28/runtime-evidence.json`. Full CTest is
+  54/54, focused Python is 34/34, and `git diff --check` passes.
+
+- **2026-08-05 (Field-5 Native stream complete):** Closed the final 3,492
+  genuine draw commands. FT3 producer material now propagates through the
+  authenticated `memcpy` path and captures GTE geometry at `0x8002E1B4`,
+  reducing residual textured polygons `0x27` (1,090) and `0x28` (221) to zero
+  while preserving 37,386/37,386 exact FT3 comparisons. Producer-scoped
+  sidecars cover gouraud quads `0x38`/`0x3A`, tiles `0x60`/`0x62`, and sprite
+  `0x64` from their pre-projection vertices, colors, rectangle inputs, and OT
+  insertion arguments. The last 1,402 opcode `0x2A` commands derive from the
+  fullscreen producer at `0x801C6F70` and projected producer at `0x801CF550`,
+  with DMA replay resolved by exact source identity. No contract decodes guest
+  packet payload as semantic authority.
+
+  The replay evidence gate now treats final-frame bindings as valid in-flight
+  work only when the lossless accounting identity holds:
+  `total_staged = consumed + superseded + staged_count`. It still rejects any
+  unbound, unsupported, not-found, Original draw, stage failure, or accounting
+  imbalance; no binding is drained or discarded to pass. The unrestricted
+  retail-BIOS cold replay runs 4,528 VBlanks, reaches Field 5, remains effective
+  Native with claim `independent`, and reports `status=PASS`: 267,484 bound
+  packets, 21,469 ordered state packets, zero unbound/unsupported/original/
+  not-found/stage failures, and exact staging accounting
+  `229287 = 228398 + 838 + 51`. Evidence:
+  `/tmp/opencode/xg-native-integrated-v31/state/run-1/runtime-evidence.json`.
+  Full CTest is 54/54, focused Python is 34/34, and `git diff --check` passes.
+
+- **2026-08-04 (Field-model raw FT3 farthest producer):** Authenticated model
+  row 5 through constructor `0x8002D984`, post-constructor material seam
+  `0x8002DA00`, mode-2 geometry entry `0x8002E484`, and geometry store
+  `0x8002E5EC`. The semantic producer derives topology, model vertices,
+  transform matrix, UV/CLUT/TPAGE material, maximum `SZ1..SZ3` depth, culling,
+  packet cursor, counter, tag, and OT insertion without consuming guest packet
+  semantics. A cold Native replay records 4,464 cutovers, 18,972 Native
+  primitives, and 37,386/37,386 semantic comparisons with zero payload,
+  geometry, tag, OT, cursor, or counter mismatches, zero blockers/staging
+  failures, and opcode `0x25` unbound reduced to zero. It separately records
+  558 changes to the low RGB bytes, which GP0 raw-texture opcode `0x25` ignores;
+  opcode/UV/TPAGE/CLUT remain exact. Evidence:
+  `/tmp/opencode/xg-native-ft3-final/runtime-evidence.json`. Focused CTest is
+  4/4, replay Python tests are 61/61, and `git diff --check` passes. No
+  timing-core behavior changed in this pass.
+
+- **2026-08-04 (Field-model raw FT4 farthest producer):** Authenticated the
+  resident `0x8002C700` dispatcher path from Field 5 caller return
+  `0x8007519C`, including its caller-local transform matrix at `sp+0x58`, and
+  added the `0x8002E688` farthest-depth FT4 seam. Ghidra and the instruction
+  sequence at `0x8002E82C..0x8002E888` prove selector 2 takes the maximum of
+  `SZ0..SZ3` before the `(ordering_shift + 2)` OT lookup. A cold Native replay
+  records 10,602 dispatcher begins, 11,160 cutovers, 114,308 Native
+  primitives, and 193,626/193,626 exact payload/geometry/tag/OT comparisons
+  with zero mismatches, blockers, or staging failures. Opcode `0x2D` unbound
+  falls from 132,255 to 22,920 (109,335 packets, 82.7%). Evidence:
+  `/tmp/opencode/xg-native-ft4-farthest/runtime-evidence.json`. Focused CTest
+  is 5/5 and replay Python tests are 61/61; the pre-existing full
+  `xg_render_static_auth` synthetic-trace expectation remains independently
+  red. No timing-core behavior changed in this pass.
+
+- **2026-08-04 (Native direct-stream gate green):** Corrected the Native
+  receipt accounting so superseded bindings count as replacements rather than
+  unconsumed commands (`total_staged = total_consumed + total_superseded`).
+  The Native DMA2 walker now records OT topology for the requested baseline as
+  read-only observation while continuing to render through the direct packet
+  path. A fresh Disc 1 Field 5 replay with root memcards reports
+  `status=PASS`, `effective_render_mode=native`, `native_claim=independent`,
+  baseline completeness `2047/2047`, `16674 = 16654 + 20` staged/consumed/
+  superseded, zero pending/not-found/stage failures, zero parser replay,
+  guest GP0, UI OT adapter, Original draws, or shared presents, 258
+  independent FMV frames at `320x224`, and 3,746 independent VRAM presents.
+  This is a route-level Native proof; the 272,299 unbound packets still come
+  from the guest DMA/OT stream, so independent game-side 3D/2D producers and
+  visual equivalence remain open. Focused CTest is `4/4` and the replay Python
+  suite is `50 passed`.
+
+- **2026-08-04 (Native independence correction):** The earlier P0/P13 receipts
+  were route-level proofs, not proof of an independent Native renderer. Their
+  zero-Original-draw result did not exclude generic GP0 executor replay, and
+  the first FMV implementation only called the existing presenter through a
+  facade. The stream contract now labels parser replay, shared FMV
+  presentation, independent FMV presentation, and the UI OT adapter
+  separately; a Native receipt cannot pass with parser replay or shared FMV.
+  Generic GP0 packets now convert through `gpu_native_semantic_from_gp0()` and
+  render through `gr_draw_semantic_immediate()` without re-entering `gp0_exec_*`.
+  Fills, copies, and lines use direct backend calls. OpenGL FMV Native now has
+  a separate upload surface and presentation operation. The UI OT route remains
+  an explicit semantic adapter, not an independent game-side UI producer, and
+  is counted separately. The prior v24/v25 receipts are superseded for the
+  strict Native claim. A single live replay using the repository-root
+  Xenogears memcards now correctly fails the strict renderer gate: the runtime
+  reports `status=FAIL`, `effective_render_mode=original`, and
+  `native_claim=hybrid`. It records 167,334 staged, 167,284 consumed, 30 still
+  staged, 119,712 unbound packets, 286,996 guest GP0 command headers, 4,168
+  shared VRAM presents, 5,229 UI OT adapter calls, and 104 independent FMV
+  presentation frames. It has zero parser-replay commands, zero Original
+  draws, and zero staging failures, which proves only that the current Native
+  raster path is fail-closed, not that the whole renderer is independent. The
+  run deliberately omitted only the separate post-checkpoint SIO-tail
+  assertion; no full matrix was repeated.
+
+- **2026-08-04 (native-render FMV proof replay):** The existing Field 5 replay
+  `/tmp/opencode/xg-baseline-p0-v25-native-fmv.json` was rerun with Disc 1,
+  repository-root memory cards, and the former Native FMV path. Its old Native
+  row passed the route-level gate and recorded 258 real MDEC FMV presentations
+  at `320x216` depth24, covering 17,832,960 pixels, but that receipt is not
+  valid evidence for the strict Native claim because it used the shared
+  presenter and generic GP0 replay. The required Original/Shadow comparison
+  remains useful; the optional visual/VRAM digest differences remain open.
+
+- **2026-08-04 (native-render FMV presentation):** The superseded
+  implementation added Native-facing callbacks but still delegated to the
+  existing OpenGL presenter. It preserved the canonical guest MDEC decode,
+  DMA, GP0(A0), RAM, and VRAM mutations and did not inject host video, but it
+  was only a shared presentation route. It is retained as historical context;
+  the strict replacement is recorded above and uses a separate Native FMV
+  upload surface and draw operation.
+
+- **2026-08-04 (native-render P0 pre-GTE gate):** The GP0 Native environment
+  fixes now keep raw semantic coordinates, latch `tpage` only for textured
+  primitives (using the flat/Gouraud word positions), and observe generic
+  Native material submissions under draw suppression. The two-run P0 matrix
+  `/tmp/opencode/xg-baseline-p0-v24-pre-gte.json` passes its required
+  Original/Shadow comparison and is deterministic for Native. Native reaches
+  `complete=true` with field mask `2047`, zero fallback count, zero stage
+  failures, 167,304 staged commands, 167,284 consumed commands, and 20
+  superseded commands across 600 VBlanks; it records 35,743 material samples.
+  GTE attribution remains in the evidence but is diagnostic-only because this
+  Native milestone is explicitly pre-GTE. The optional Original/Native visual,
+  VRAM, and framebuffer differences remain open; no visual-equivalence or
+  production cutover claim is made. The full Debug CTest suite passes 53/53,
+  and the Native replay/Python validation suite passes 60 tests. Root memory
+  cards were used explicitly and remain outside the replay mutation surface.
+
+- **2026-08-04 (native-render cold UI OT authority):** The replay launcher now
+  passes the repository `game.toml` explicitly, so `bios_hle=true` activates the
+  authenticated boot-shell skip even when the executable lives in an external
+  build directory. Native receipts no longer accept a clean scene reset as
+  `effective_render_mode=original`: after zero fallback, zero staging failures,
+  nonzero Native staging/consumption, and zero Original draws, the completed
+  scene is reported as `native`. The cold overlay interpreter now treats only the
+  exact UI `DrawOTag` call sites as relevant `INTERNAL_OBSERVATION` hooks; the
+  `CAPTURE` enum alias is handled explicitly. The Field 5 matrix
+  `/tmp/opencode/p13-dialogue-native-v17-matrix.json` passes
+  Original/Shadow/Native. Its Native row reports 225,502 staged, 225,482
+  consumed, 20 superseded, 141,407 generic Native draws, zero Original draws,
+  zero stage failures, and `ui_ot.prepare_count=847` with 219,988 candidates and
+  219,988 staged UI packets. The receipt carries metadata-only UI OT counters
+  and deterministic hashes for OT nodes, packets, semantic payloads, GPU
+  environment, and VRAM serial. The second UI DrawOTag site is
+  `0x800759CC` (not `0x800759C8`). No UI manifest cutover or FMV Native route was
+  added; MDEC/DMA/24-bit presentation remains Original pending a dedicated proof
+  replay. The P0 two-repetition command was correctly blocked for this trace
+  because it does not request a baseline (`baseline.requested=false`); no visual
+  equivalence claim is made from the Task 15 receipt.
+
+- **2026-08-04 (native-render GP0 Native closure, superseded):** The previous
+  generic dispatch at GP0 ingress counted a draw-suppressed parser pass followed
+  by a second call into `gp0_exec_*` as Native. Its receipt and matrix remain
+  useful for packet coverage, but do not prove independent rendering and are
+  superseded by the semantic/direct-backend implementation recorded above.
+
+- **2026-08-04 (native-render P13 replay matrix):** The authenticated retail
+  replay now passes the complete Original/Shadow/Native matrix with explicit
+  `SCPH1001.BIN`, repository-root memory cards, and Disc 1. Shadow clean scene
+  closure is correctly distinguished from fallback after the bridge resets its
+  effective mode to Original. Native records 5,514 staged commands, 5,494
+  consumed, 20 superseded, and zero stage failures; the matrix receipt is
+  `/tmp/opencode/p13-dialogue-task15-v3-matrix-20260804.json`. Task 15 validation
+  now gates Native on a complete semantic stream rather than requiring legacy
+  transaction substitutions. This remains a route-level P13 UI/2D proof only;
+  no manifest or production cutover was added.
+
+- **2026-08-03 (native-render P13 UI/2D census):** Ghidra closes the
+  productive field-dialogue family at `FUN_8007554C`/`FUN_80075910` ->
+  `FUN_8008004C` -> `DrawOTag` (`0x80044BD0`). `FUN_8008004C` updates the four
+  `FieldTextBox` slots, links the background/border/arrow/cursor/portrait
+  packets from `FUN_8007E1C0`, and invokes resident `FUN_80034888` for string
+  entry packets. The former `0x8003700C` candidate is confirmed as Kernel Menu
+  debug/font output and is not a production UI producer. Static evidence is
+  now sufficient to define the packet contract, but runtime OT order,
+  packet-address binding, effective GPU environment, and full Native stream
+  coverage are not captured yet. No P13 cutover was added; the census and
+  proof gate are recorded in `NATIVE_RENDER_P13_UI_2D_CENSUS.md`.
+
+- **2026-08-03 (native-render P13 runtime census):** Extended the always-on GP0
+  ring with per-command effective GPU environment and added
+  `tools/native_render_p13_census.py`. A real route reached Field 5 at frame
+  1858; its first draw frame had 119 GP0 commands but no TILE/SPRT packets and
+  no hits for the text-box producer family, while GP0 provenance remained the
+  resident `0x00000F40` GPU leaf. The packet-state observability gap is closed,
+  but the replay did not exercise active dialogue. A second Field 5 recording
+  reaches the checkpoint at its final frame with no drawable tail. P13 remains
+   blocked pending a replay with active text-box slots and packet-address
+   binding; no manifest or production cutover was added.
+
+- **2026-08-03 (native-render P13 interactive retail replay):** The new
+  `/tmp/opencode/xg-field5-dialogue-menu-20260803.toml` replay uses the retail
+  BIOS, reaches Field 5 at frame 1937, and covers dialogue plus menu/submenu
+  input through its 4906-VBlank budget. The dialogue census captures frame
+  3810 with 326 GP0 commands, including TILE, SPRT, and FT4-family packets,
+  and records 39 calls to resident `FUN_80034888` with arguments from the
+  active string-entry slots. Each call returns to `0x8008044C`, which Ghidra
+  identifies as the instruction after the call inside `FUN_8008004C`; this is
+  the runtime call-site binding even though the function-entry ring does not
+  emit a separate `FUN_8008004C` entry. The menu census records a TILE command
+  and 19 string-entry calls. P13 still lacks complete OT-head/packet-address
+  coverage and Native authority, so no manifest or production cutover was
+  added. The census tool now emits the derived call-site relationship.
+
+- **2026-08-03 (native-render P13 late UI window):** A focused replay census at
+  frames 4029-4035 is stable at 111 GP0 commands per frame, including 64
+  `0x2D`, 24 `0x2E`, one `0x2A`, one `0x2C`, and two `0x3A` commands. It has no
+  `FUN_80034888` entries or target function entries. The replay input places
+  the window after menu interaction, but there is not yet enough function
+  attribution to call it a specific submenu renderer. It is retained as a
+  packet candidate only; P13 remains without OT-head/packet-address coverage
+  and Native authority.
+
+- **2026-08-03 (native-render P12 performance control):** Route193 preserves
+  the authoritative Native stream totals (476,478 staged, 476,442 consumed, 32
+  superseded, four pending, zero stage failures and zero scene fallback) after
+  removing per-primitive GL drains. The wall-time sampler now brackets World
+  cutover bodies as Native instead of inheriting their guest hook's static
+  phase. Its measured World window is 81.84% static guest, 13.17% interpreter,
+  3.88% Native cutover, and 0.80% GP0/GPU. A retail-BIOS, identical-card
+  Original control reaches Field 5 at the same VBlank 1859 and reproduces the
+  same approximately 35-41 FPS trough, proving it is not a Native-stream
+  regression. Direct packet indexing and removal of the remaining fail-hard
+  stream barrier produced no measurable improvement and were removed. The full
+  root suite passes 52/52, the focused runtime stream/OpenGL suite passes 2/2,
+  and the replay Python suite passes 27/27; global auth remains BLOCKED by the
+  existing trace overflow/final-context gate.
+- **2026-08-03 (native-render P12 auth-proof closure):** Route196
+  (`/tmp/opencode/replay196-route32-checkpoint-binding.json`) reruns the same
+  retail-BIOS route after separating the first observed gameplay checkpoint
+  snapshot from the final replay context. The receipt is `PASS` with
+  `effective_render_mode=native`, 476,478 staged, 476,442 consumed, 32
+  superseded, four pending, zero stage failures, and zero scene fallback. The
+  auth proof is `OBSERVED` with runtime `accepted=true`, tier `cold`,
+  `native_permitted=true`, no rejection, 349 exact entry/capture/return
+  sequences, 349 completed-proof publications, and `trace_overflowed=false`.
+  Field 5 is bound at checkpoint VBlank 1859 and remains valid at evidence
+  VBlank 4623 even though the final diagnostic context is 1024. The root CTest
+  suite passes 52/52 after the fix. This closes the route-level P12 proof
+  regression; it does not close the Disc 1 residual P10 or Native-only P15
+  gates.
+- **2026-08-03 (native-render P9 coverage clarification):** Rebuilt the actual
+  `build-dbg/XenogearsRecomp` target and reran the route with the explicit retail
+  BIOS `game/SCPH1001.BIN`, rather than the bundled OpenBIOS. Route199 (cold
+  overlay override) and Route200 (no cold override) both reach Field 5 with
+  `status=PASS`, `effective_render_mode=native`, zero scene fallback delta,
+  and the same authoritative stream totals. Both receipts report
+  `world_execution.observed_mask=0x3EF` and family 4 (Clouds) at zero. A
+  matching Shadow diagnostic Route201 also reports family 4 at zero, so the
+  current route does not exercise Clouds; this is a dynamic-coverage gap, not
+  evidence of a failed Clouds cutover. The older Route55 receipt is not
+  promoted because it is `FAIL` and predates the rebuilt runtime. Cards retain
+  their repository-root hashes.
+- **2026-08-03 (native-render P9 Clouds waiver):** Per explicit user direction,
+  the fail-closed Clouds Native implementation is accepted as complete for
+  migration progress based on its authenticated prepare/commit path and green
+  unit tests, despite the absence of a natural route receipt. The missing
+  dynamic exercise remains documented as a non-blocking limitation and is not
+  reclassified as a global P15 certification result. Work therefore advances
+  to the P13 UI/2D census.
+- **2026-08-02 (native-render P9 remaining World central cutovers):** Wired
+  Terrain/Water `0x8009932C`, Entity Shadows `0x800747DC`, Decorations
+  `0x8008615C`, and World Models `0x800848F4` as authenticated pre-body return
+  cutovers, plus Actor Sprites at the authenticated resident seam
+  `0x8001E2B4`. Each path uses its sealed value preparation, preflights every
+  packet/OT/scratch/count/global target, stages the complete semantic set, and
+  publishes compatibility state only after accounting succeeds. World Models
+  now has a 17-family semantic template sidecar seeded by the authenticated
+  `0x8002C8CC` initializer, including exact dispatch-table validation and GTE
+  color-store observations; unsafe fallback or artifact mutation invalidates
+  it. Actor world-entry/resident stack/RA context and epilogue closure are
+  authenticated without replacing the outer loop. Replay JSON now exposes
+  Native cutover/primitive counts for all five families. Overlay/resident plans
+  were updated for the productive transfers and observations. The central
+  integration harness now requires nonempty Native publication for Terrain
+  (128 FT3), Entity Shadows (3 FT4), Decorations (1 FT4), all 17 World Model
+  primitive families, and Actor body plus shadow (2 FT4), with wrong-caller
+  fail-before-write checks and exact replay-counter serialization. The Models
+  fixture validates all 17 initializer rows and all four authenticated GTE
+  color-store observation sites before its productive cutover. The complete
+  Debug build including `psx-runtime` and 51/51 CTests pass; the overlay-range
+  pytest is now part of CTest. No game executable or external replay was run.
+- **2026-08-02 (native-render P9 World Models Native preparation):** Added a
+  sealed, fail-closed preparation/build/finalize boundary for World Models
+  producer `0x800848F4` and all four authenticated callers. Ghidra confirms the
+  resident `0x8002C700` table has 17 primitive rows, modes 0/2/3/4/5, mode-5
+  farthest-depth selection, DPCS source RGB `0x80059598`, and cull mode 3's
+  corner/center plus edge-midpoint bounds probes. The implementation captures
+  records, transform-chain writebacks, model/group/material/vertex sources, and
+  authenticated packet semantic sidecars; reproduces partial packet writes,
+  DPCS/raw-command behavior, environment UV generation, counter/cursor/global
+  effects, and dynamic OT-link authority; and refuses finalize until semantic
+  and packet-side-effect staging are complete. Resident protection now covers
+  bounds and environment-template helpers, and the overlay ledger authenticates
+  each call-plus-delay pair. Central runtime sidecar observation, transaction
+  publication, and return cutover remain unwired because
+  `xg_render_auth_runtime.c` was explicitly out of scope. No build, CTest,
+  pytest, replay, or other test command was run.
+- **2026-08-02 (native-render P9 World Actor Sprite preparation):** Added the
+  authenticated local preparation boundary at resident `0x8001E2B4`, after
+  the Original matrix preparation and before body `0x8001E3D8` plus optional
+  ground-shadow `0x8001E9BC`, with continuation `0x8001E2E0`. The value builder
+  now models per-part translation and the shadow producer's X/Z source plane,
+  and emits exact masked FT4 payloads. The sealed per-invocation API validates
+  actor/data/descriptor/part/context ranges, prepared matrix and OT provenance,
+  independent body/shadow packet-capacity gates, packet/OT destinations,
+  cursor output, and family-specific scratch halfword effects before exposing
+  records. Actor caller authority and all resident body/shadow dependencies are
+  in the ledgers. Central runtime transaction publication remains to be wired;
+  per user direction, no build, CTest, pytest, replay, or other test command was
+  run in this preparation pass.
+- **2026-08-02 (native-render P9 Terrain/Water Native preparation):** Added a
+  sealed, fail-closed full-body preparation for `FUN_8009932C` without wiring
+  the central runtime cutover. Ghidra confirms entry `0x8009932C`, epilogue
+  `0x800996D4`, returns `0x80071B38`/`0x80076AEC`/`0x80077A1C`/`0x80078A18`,
+  0x20-byte FT3 slots with 7-word tags, full-word OT replacement, a per-cell
+  `count < 0x7FE` gate that can finish at `0x7FF`, final count `0x8009D7DC`,
+  and masked scratch effects through `0x1F80038F`. The API now
+  authenticates the context OT/packet arguments, validates all output ranges
+  and record chains, and returns records plus an exact scratch value/write-mask
+  ledger and continuation. Terrain Shadow gained fail-closed Native cutover
+  accounting. Focused preparation/accounting tests were added but intentionally
+  not run per the all-families-before-tests requirement; no build, CTest,
+  pytest, or replay was run.
+- **2026-08-02 (native-render P9 route32 Shadow closure):** Corrected the final
+  Clouds payload mismatch: Ghidra confirms that `FUN_80086798` writes UV2/UV3
+  with halfword stores, so their non-semantic upper halves are preserved from
+  the destination packet rather than zeroed by the Shadow writeback model. A
+  focused regression now seeds nonzero upper halves. The comparable route32
+  environment is explicitly retail `game/SCPH1001.BIN`, HLE shell skip, HLE
+  deterministic scheduler, and `16:9`; an OpenBIOS/LLE run and a default-4:3
+  run were discarded because they do not reproduce the recorded boot/culling.
+  `replay38-route32-shadow.json` closes 368/368 Clouds invocations and
+  12,486/12,486 FT4 with zero packet, payload, geometry, tag, OT, cursor,
+  position, scratch, anchor, or unexpected-write mismatch. Terrain remains
+  exact at 434,583/434,583 FT3 and all other World snapshots are byte-identical
+  to replay35. The complete build and 50/50 CTests pass; root card hashes remain
+  unchanged. The receipt is family-level Shadow evidence, not a global PASS:
+  the legacy P7 source aggregator still reports collector blocker 7 and
+  overflow on this multi-scene route.
+- **2026-08-02 (native-render P9 Terrain/Entity source correction):** World
+  Terrain capture now authenticates the 25-entry active-tile table at
+  `0x8009D618` and skips the pointer/edge/geometry reads that guest
+  `FUN_8009932C` skips for `0xFFFF` entries. Entity terrain-normal capture now
+  uses a new exact SF=0 `OuterProduct0` host operation for the guest call at
+  `0x80093740 -> 0x8004A4D8`; the previous SF=1 operation shifted the small
+  terrain cross product by 12 before `VectorNormal`, explaining the observed
+  local-matrix divergence. The later Entity frame-building cross products
+  remain SF=1, matching their `OuterProduct12` call at `0x8004A480`. Added
+  read-only Entity diagnostics for pending coordinates, chunk/cell addresses,
+  and five terrain height samples. Full build, 50/50 CTests, the three overlay
+  range tests, and `git diff --check` pass. Replays 25-30 are diagnostic only:
+  after rebuilding the previously stale runtime executable, the 4,757-VBlank
+  route no longer transitions from Field 5 to Field 1/World under current HLE;
+  pure LLE and HLE-with-real-intro also miss the route checkpoint. All attempts
+  retained the repository-root memory-card hashes. No new Shadow evidence was
+  promoted; the route must be recaptured against the current runtime before
+  these fixes can receive natural World certification.
+- **2026-08-02 (native-render P9 World atomic cutovers):** Raised the productive
+  render transaction to 4096 commands/bindings/pending bindings and 32768
+  journal words. Effects now performs complete source/target preflight, stages
+  up to 256 exact FT4 bindings, publishes payload/tag/OT compatibility effects,
+  and returns before its Original GTE producer; the integrated saturation test
+  closes 256/256 bindings and the complete OT chain. Horizon now stages both
+  FT4 while retaining SET/RESET DR_TWIN as compatibility commands in the same
+  atomic OT journal, preserving `SET_WINDOW -> FT4 -> FT4 -> RESET_WINDOW`.
+  Both cutovers preserve COP2, HI/LO, and transient deadlines and fail before
+  guest writes on malformed targets. Full build and 38/38 CTests pass. A Shadow
+  replay using the repository-root card1/card2 unchanged closed 428/428 Horizon
+  and 428/428 Effects invocations with zero component divergence, but its global
+  receipt ended FAIL on a later `scene_reset`; that receipt was not promoted.
+  Natural Native certification remains blocked by earlier Field/global fallback.
+- **2026-08-02 (native-render P9 World Horizon Shadow closure):** Added the
+  value-only two-FT4 Horizon builder, bounded authenticated source capture, full
+  body/table/epilogue range authority, and a Shadow comparator for geometry,
+  payload, tags, OT, and both DR_TWIN commands. The first natural mismatch
+  proved that World inherits projection controls across scene boundaries;
+  Horizon now snapshots the GTE input controls OFX/OFY/H at its authenticated
+  entry while remaining independent of every GTE result register. The final
+  deterministic Field 5 -> Field 1 -> Overworld -> Battle receipt closes
+  212/212 invocations and 424 primitives with zero divergences or capture
+  failures. Generated resident C was refreshed and the full build plus 37/37
+  CTests pass. At this checkpoint Native substitution still lacked one atomic
+  FT4+DR_TWIN transaction. P9 Effects also gained authenticated caller/initializer/update/
+  body/tables, bounded value-only capture, and host rotation/scale/projection.
+  The final route closes 212/212 Effects invocations and 559/559 FT4 with zero
+  count, geometry, payload, tag, or OT divergence and no GTE-result/packet
+  source dependency. At this checkpoint Effects Native still exceeded the
+  original 64-binding transaction capacity; the subsequent entry closes it.
+- **2026-08-02 (native-render instrumented route capture):** Input recording now
+  has an explicit close-completion mode that atomically publishes a replay on
+  normal SDL shutdown while retaining the incomplete-only crash path and the
+  existing stable-Field-5 certification mode. Recording no longer disables
+  additive overlay capture, debug encounter-gate writes preserve the pristine
+  executable-page snapshot first, and shutdown can emit a closed P7 model-FT4 /
+  P8 sprite-FT4 Shadow comparison receipt. The full Debug build and all 36
+  CTests pass; live Field 5 -> Field 1 -> Overworld -> Battle evidence is next.
+- **2026-08-01 (native-render P7 Field particles):** Added source-observation
+  plan v4 with an observe-only transfer, so warm and dirty-RAM cold execution
+  can capture value-only inputs at `FieldInitializeParticlePrimitive` while
+  still executing the Original initializer. An authenticated 128-record sidecar
+  now supplies particle vertices/material to a full pre-GTE return cutover at
+  `FieldParticleRender`; host code reproduces `CompMatrix`, scaling,
+  `RotAverage4`, bucket selection, RGB/XY/tag/OT side effects, and semantic FT4
+  staging without reading packet payload or mutating GTE state. Focused tests
+  cover exact projection/material, code-write invalidation, missing-sidecar
+  fallback, warm plan emission, and authenticated descriptor bytes. The current
+  Field capture has no active particle controller, so natural replay validation
+  remains pending without blocking the fail-closed static implementation.
+- **2026-08-01 (native-render P0 GTE provenance wiring):** Production GTE
+  execution now records an explicit backend tier at every PC-aware call:
+  generated/static calls default to `STATIC`, dirty and oracle interpreter calls
+  use `COLD`, and overlay callback calls use `WARM`. The authenticated Xenogears
+  producer entry opens a visual-state/producer context only after the entry hook
+  is accepted; successful continuation, rejection, scene reset, and test reset
+  all close it. Production attribution bounds now cover the observed P0 producer
+  volume while reduced-capacity tests retain fail-closed overflow coverage. A
+  single Release Original/cold replay passed with 972,350 total GTE executions,
+  117,055 inside authenticated producers, zero `UNKNOWN` tier hits, and no
+  attribution overflow. The six-run P0 matrix remains intentionally deferred
+  until the remaining P0 changes are grouped.
+- **2026-07-31 (native-render baseline production evidence, schema v2):**
+  Replaced test-injected material digests with typed material observations
+  carrying canonical OT/DMA/MMIO provenance, source/container ordinals, final
+  submission order, word count, and the complete effective draw material.
+  Original GP0 draws publish only outside suppressed semantic side-effect
+  replay; mixed Original/semantic observations publish in command order only
+  after post-swap checkpoint commit. Deferred retries retain both candidate and
+  Original-replay streams and publish only the authoritative winner. Added a
+  backend-neutral canonical framebuffer digest and an
+  OpenGL implementation that hashes top-down RGBA8 from the authoritative
+  `s_hr_fbo` or deferred candidate while normalizing the hidden mask alpha.
+  Capture is due on the final auto-finalize frame and is published only after a
+  successful canonical present/swap. Runtime JSON and public replay evidence
+  now close over every baseline-v2 field; focused runtime, root replay, and
+  Python schema suites are green.
+- **2026-07-31 (OpenGL semantic PS1 dither parity, RED -> GREEN):**
+  Removed the transactional semantic dither rejection and established one
+  OpenGL PS1 dither/15-bit endpoint for both Original GP0 and semantic draws.
+  RGB888 flat/Gouraud polygon APIs prevent pre-GL truncation; GP0(E1) and the
+  semantic material feed the same batch-keyed dither state. Geometry and
+  textured fragment shaders consume one literal 4x4 matrix/quantizer;
+  modulated textures use the oracle integer `(texel5 * color8) >> 4` order,
+  and quantization remains before the existing blend/mask/STP passes. The
+  scale-2 hidden-GL regression byte-compares raw VRAM across flat, Gouraud,
+  modulated-textured, and STP-semitransparent triangles at offsets `(0,0)` and
+  `(3,-2)`, including draw-area clipping and GP0(E6) mask set/check. It and the
+  GL mask-order, forensic-readback, and renderer-transaction tests are GREEN
+  under `xvfb`.
 - **2026-07-26 (IRQ/COP2 post-stall deliverability refresh):**
   Oracle review found that issue-on-take could serialize behind a busy GTE and
   service a device deadline after `hw_deliverable` had been snapshotted. A new

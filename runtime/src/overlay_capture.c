@@ -63,6 +63,13 @@ static SDL_mutex *s_commit_mutex;
 static SDL_atomic_t s_snapshot_seq;
 static uint64_t s_latest_commit_seq;
 
+static uint8_t *s_private_replay_load_ram;
+static uint32_t s_private_replay_exec_pc;
+static char s_private_replay_snapshot_path[768];
+static int s_private_replay_initialized;
+static int s_private_replay_load_valid;
+static int s_private_replay_complete;
+
 static int      s_history_enabled = 0;
 static char     s_history_addendum[600];
 static char     s_history_persist_dir[600];
@@ -82,6 +89,58 @@ static uint64_t capture_next_sequence(void)
 
 static int preserve_snapshot_async(uint32_t scope_lo, uint32_t scope_hi);
 static int preserve_writer_start(void);
+
+static void private_replay_initialize(void)
+{
+    const char *capture_replay;
+    const char *watched;
+    const char *snapshot_path;
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (s_private_replay_initialized) return;
+    s_private_replay_initialized = 1;
+    capture_replay = getenv("PSX_OVERLAY_CAPTURE_REPLAY");
+    watched = getenv("PSX_OVERLAY_PRIVATE_EXEC_PC");
+    snapshot_path = getenv("PSX_OVERLAY_PRIVATE_EXEC_SNAPSHOT");
+    if (!capture_replay || strcmp(capture_replay, "1") != 0 ||
+        !watched || !watched[0] || !snapshot_path || !snapshot_path[0] ||
+        strlen(snapshot_path) >= sizeof(s_private_replay_snapshot_path))
+        return;
+    parsed = strtoul(watched, &end, 0);
+    if (!end || *end != '\0' || parsed == 0u || parsed > UINT32_MAX) return;
+    s_private_replay_load_ram = (uint8_t *)malloc(2u * 1024u * 1024u);
+    if (!s_private_replay_load_ram) return;
+    s_private_replay_exec_pc = (uint32_t)parsed;
+    snprintf(s_private_replay_snapshot_path,
+             sizeof(s_private_replay_snapshot_path), "%s", snapshot_path);
+}
+
+void overlay_capture_private_note_execution(uint32_t pc)
+{
+    FILE *snapshot;
+    const size_t ram_size = 2u * 1024u * 1024u;
+
+    private_replay_initialize();
+    if (!s_private_replay_load_valid && s_private_replay_load_ram &&
+        ((pc ^ s_private_replay_exec_pc) & 0x1ffff000u) == 0u) {
+        extern uint8_t *memory_get_ram_ptr(void);
+        /* CPU-decompressed overlays have no DMA spanning their final address.
+         * First execution in the watched page is the coherent post-loader,
+         * pre-producer boundary. */
+        memcpy(s_private_replay_load_ram, memory_get_ram_ptr(), ram_size);
+        s_private_replay_load_valid = 1;
+    }
+    if (s_private_replay_complete || !s_private_replay_load_valid ||
+        (pc & 0x1fffffffu) != (s_private_replay_exec_pc & 0x1fffffffu))
+        return;
+    s_private_replay_complete = 1;
+    snapshot = fopen(s_private_replay_snapshot_path, "wb");
+    if (!snapshot) return;
+    int ok = fwrite(s_private_replay_load_ram, 1, ram_size, snapshot) == ram_size;
+    if (fclose(snapshot) != 0) ok = 0;
+    if (!ok) remove(s_private_replay_snapshot_path);
+}
 
 static int capture_process_id(void)
 {
@@ -263,6 +322,12 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
     int i;
     OvEntry *e;
     extern int fntrace_is_game_started(void);
+    extern void psx_xenogears_field_resident_dma(uint32_t, uint32_t);
+    extern void psx_xg_render_auth_note_code_write(uint64_t, uint64_t,
+                                                    uint32_t, uint32_t);
+
+    psx_xenogears_field_resident_dma(load_addr, size);
+    psx_xg_render_auth_note_code_write(0u, 1u, load_addr, size);
 
     if (!s_enabled) return;   /* overlay cache disabled in config */
     if (size == 0) return;
@@ -271,6 +336,24 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
     if (!s_active) {
         if (!fntrace_is_game_started()) return;
         s_active = 1;
+    }
+
+    private_replay_initialize();
+    if (s_private_replay_load_ram) {
+        extern uint8_t *memory_get_ram_ptr(void);
+        const uint32_t ram_size = 2u * 1024u * 1024u;
+        const uint32_t lo = load_addr & 0x1fffffffu;
+        uint32_t hi = lo + size;
+        const uint32_t watched = s_private_replay_exec_pc & 0x1fffffffu;
+        if (hi < lo || hi > ram_size) hi = ram_size;
+        if (!s_private_replay_load_valid && lo <= watched && watched < hi) {
+            memcpy(s_private_replay_load_ram, memory_get_ram_ptr(), ram_size);
+            s_private_replay_load_valid = 1;
+        } else if (s_private_replay_load_valid && lo < hi) {
+            /* Keep a DMA-authored shadow. Later guest stores must not leak back
+             * into the retained load image between sector transfers. */
+            memcpy(s_private_replay_load_ram + lo, bytes, hi - lo);
+        }
     }
 
     /* This table reconstructs only the CURRENT DMA image for the legacy CRC
@@ -324,6 +407,7 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
                               const uint32_t *bitmap,
                               const uint32_t *dispatch_pc_bitmap,
                               const uint32_t *exec_pc_bitmap,
+                              const uint32_t *exec_pc_counts,
                               const uint8_t *ram_base)
 {
     uint32_t page_sz = 4096u;
@@ -411,6 +495,17 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
             }
             fprintf(f, "],\n");
 
+            fprintf(f, "    \"executed_pc_counts\": {");
+            int emitted_count = 0;
+            for (uint32_t ep = phys; ep < phys + size; ep += 4u) {
+                uint32_t wi = ep >> 2;
+                if (exec_pc_counts[wi] == 0u) continue;
+                if (emitted_count++) fprintf(f, ", ");
+                fprintf(f, "\"0x%08X\": %u", 0x80000000u | ep,
+                        exec_pc_counts[wi]);
+            }
+            fprintf(f, "},\n");
+
             fprintf(f, "    \"dispatch_entry_pcs\": [");
             int emitted_dispatch = 0;
             for (uint32_t ep = phys; ep < phys + size; ep += 4u) {
@@ -445,6 +540,7 @@ static int write_json_snapshot(const char *path, uint32_t bw,
                                const uint32_t *bitmap,
                                const uint32_t *dispatch_pc_bitmap,
                                const uint32_t *exec_pc_bitmap,
+                               const uint32_t *exec_pc_counts,
                                const uint8_t *ram_base)
 {
     FILE    *f;
@@ -467,13 +563,15 @@ static int write_json_snapshot(const char *path, uint32_t bw,
      * are unchanged). */
     write_json_window(f, 0u,
                       DIRTY_RAM_KERNEL_WINDOW_END / page_sz, &first_region,
-                      bitmap, dispatch_pc_bitmap, exec_pc_bitmap, ram_base);
+                      bitmap, dispatch_pc_bitmap, exec_pc_bitmap,
+                      exec_pc_counts, ram_base);
     write_json_window(f, DIRTY_RAM_KERNEL_WINDOW_END / page_sz,
                       OVERLAY_REGION_FLOOR / page_sz, &first_region,
-                      bitmap, dispatch_pc_bitmap, exec_pc_bitmap, ram_base);
+                      bitmap, dispatch_pc_bitmap, exec_pc_bitmap,
+                      exec_pc_counts, ram_base);
     write_json_window(f, OVERLAY_REGION_FLOOR / page_sz, bw * 32u,
                       &first_region, bitmap, dispatch_pc_bitmap,
-                      exec_pc_bitmap, ram_base);
+                      exec_pc_bitmap, exec_pc_counts, ram_base);
 
     fprintf(f, "\n]\n");
     {
@@ -771,6 +869,7 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
                                           const uint32_t *bitmap,
                                           const uint32_t *dispatch_pc_bitmap,
                                           const uint32_t *exec_pc_bitmap,
+                                          const uint32_t *exec_pc_counts,
                                           const uint8_t *ram_base,
                                           const char *reason,
                                           uint64_t sequence)
@@ -779,7 +878,7 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
     snprintf(temp_path, sizeof(temp_path), "%s.%lu.%llu.tmp", s_capture_path,
              CAPTURE_PID(), (unsigned long long)sequence);
     if (!write_json_snapshot(temp_path, bw, bitmap, dispatch_pc_bitmap,
-                             exec_pc_bitmap, ram_base))
+                             exec_pc_bitmap, exec_pc_counts, ram_base))
         return 0;
     return capture_commit_temp(temp_path, reason, sequence);
 }
@@ -790,13 +889,19 @@ static uint64_t overlay_capture_write_current(const char *reason)
     uint32_t bw = dirty_ram_get_bitmap_word_count();
     uint32_t *bitmap;
     uint64_t sig;
-    if (!s_active) return 0;
+    /* Data-shard and restored-state loads can execute dirty RAM without a
+     * post-handoff CD DMA. The execution bitmap is authoritative; do not drop
+     * that coherent final image merely because the legacy DMA gate stayed off. */
+    if (!s_enabled) return 0;
     bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
     if (!bitmap) return 0;
-    for (uint32_t i = 0; i < bw; i++) bitmap[i] = dirty_ram_get_bitmap_word(i);
+    for (uint32_t i = 0; i < bw; i++)
+        bitmap[i] = dirty_ram_get_bitmap_word(i) |
+                    g_dirty_ram_exec_page_bitmap[i];
     sig = write_and_commit_snapshot(bw, bitmap,
                                     g_dirty_ram_dispatch_pc_bitmap,
                                     g_dirty_ram_exec_pc_bitmap,
+                                    g_dirty_ram_exec_pc_counts,
                                     memory_get_ram_ptr(),
                                     reason,
                                     capture_next_sequence());
@@ -806,6 +911,19 @@ static uint64_t overlay_capture_write_current(const char *reason)
 
 void overlay_capture_write_json(void)
 {
+    const char *private_ram_path = getenv("PSX_OVERLAY_PRIVATE_RAM_SNAPSHOT");
+    if (private_ram_path && private_ram_path[0]) {
+        extern uint8_t *memory_get_ram_ptr(void);
+        FILE *private_ram = fopen(private_ram_path, "wb");
+        if (private_ram) {
+            const size_t ram_size = 2u * 1024u * 1024u;
+            int ok = fwrite(memory_get_ram_ptr(), 1, ram_size, private_ram) ==
+                     ram_size;
+            if (ok) ok = sync_file(private_ram);
+            if (fclose(private_ram) != 0) ok = 0;
+            if (!ok) remove(private_ram_path);
+        }
+    }
     (void)overlay_capture_write_current("shutdown-or-manual");
 }
 
@@ -853,10 +971,17 @@ void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
     uint32_t bitmap_words = (last_word - first_word) >> 5;
     memset(&g_dirty_ram_exec_pc_bitmap[first_bitmap_word], 0,
            (size_t)bitmap_words * sizeof(uint32_t));
+    memset(&g_dirty_ram_exec_pc_counts[first_word], 0,
+           (size_t)(last_word - first_word) * sizeof(uint32_t));
     memset(&g_dirty_ram_dispatch_pc_bitmap[first_bitmap_word], 0,
            (size_t)bitmap_words * sizeof(uint32_t));
     for (uint32_t page = first_page; page <= last_page; page++)
         g_dirty_ram_exec_page_bitmap[page >> 5] &= ~(1u << (page & 31u));
+}
+
+void overlay_capture_before_debug_write(uint32_t address, uint32_t size)
+{
+    overlay_capture_before_dma(address, size);
 }
 
 int overlay_capture_count(void)
@@ -924,6 +1049,7 @@ typedef struct {
     uint8_t *ram;
     uint32_t *dispatch_pc_bitmap;
     uint32_t *exec_pc_bitmap;
+    uint32_t *exec_pc_counts;
     uint32_t *bitmap;
     uint32_t bitmap_words;
     uint64_t manifest_sig;
@@ -986,6 +1112,7 @@ static void autocap_write_job_free(AutocapWriteJob *job)
 {
     if (!job) return;
     free(job->ram); free(job->dispatch_pc_bitmap); free(job->exec_pc_bitmap);
+    free(job->exec_pc_counts);
     free(job->bitmap); free(job);
 }
 
@@ -995,7 +1122,8 @@ static int autocap_write_thread_main(void *opaque)
     SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
     job->manifest_sig = write_and_commit_snapshot(
         job->bitmap_words, job->bitmap, job->dispatch_pc_bitmap,
-        job->exec_pc_bitmap, job->ram, "autocap", job->sequence);
+        job->exec_pc_bitmap, job->exec_pc_counts, job->ram, "autocap",
+        job->sequence);
     SDL_AtomicSet(&s_autocap_write_state, 2);
     return 0;
 }
@@ -1077,9 +1205,10 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
     job->dispatch_pc_bitmap = (uint32_t *)malloc(
         sizeof(g_dirty_ram_dispatch_pc_bitmap));
     job->exec_pc_bitmap = (uint32_t *)malloc(sizeof(g_dirty_ram_exec_pc_bitmap));
+    job->exec_pc_counts = (uint32_t *)malloc(sizeof(g_dirty_ram_exec_pc_counts));
     job->bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
     if (!job->ram || !job->dispatch_pc_bitmap ||
-        !job->exec_pc_bitmap || !job->bitmap) {
+        !job->exec_pc_bitmap || !job->exec_pc_counts || !job->bitmap) {
         autocap_write_job_free(job); return NULL;
     }
     memcpy(job->ram, memory_get_ram_ptr(), ram_size);
@@ -1087,6 +1216,8 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
            sizeof(g_dirty_ram_dispatch_pc_bitmap));
     memcpy(job->exec_pc_bitmap, g_dirty_ram_exec_pc_bitmap,
            sizeof(g_dirty_ram_exec_pc_bitmap));
+    memcpy(job->exec_pc_counts, g_dirty_ram_exec_pc_counts,
+           sizeof(g_dirty_ram_exec_pc_counts));
     if (scoped) {
         memset(job->bitmap, 0, (size_t)bw * sizeof(uint32_t));
         uint32_t first_page = scope_lo >> 12;
@@ -1174,7 +1305,8 @@ static int preserve_write_thread_main(void *opaque)
         job->snapshot.manifest_sig = write_and_commit_snapshot(
             job->snapshot.bitmap_words, job->snapshot.bitmap,
             job->snapshot.dispatch_pc_bitmap, job->snapshot.exec_pc_bitmap,
-            job->snapshot.ram, "preserve-outgoing", job->snapshot.sequence);
+            job->snapshot.exec_pc_counts, job->snapshot.ram,
+            "preserve-outgoing", job->snapshot.sequence);
         if (!job->snapshot.manifest_sig) {
             job->attempts++;
             SDL_LockMutex(s_preserve_mutex);
@@ -1335,6 +1467,8 @@ void overlay_autocapture_tick(void)
          * jobs remain queued and retry; normal shutdown drains them. */
         memset(g_dirty_ram_exec_pc_bitmap, 0,
                sizeof(g_dirty_ram_exec_pc_bitmap));
+        memset(g_dirty_ram_exec_pc_counts, 0,
+               sizeof(g_dirty_ram_exec_pc_counts));
         memset(g_dirty_ram_dispatch_pc_bitmap, 0,
                sizeof(g_dirty_ram_dispatch_pc_bitmap));
         memset(g_dirty_ram_exec_page_bitmap, 0,

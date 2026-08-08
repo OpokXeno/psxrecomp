@@ -17,7 +17,10 @@
 #include "crash_trace.h"
 #include "dirty_ram_interp.h"
 #include "gpu.h"
+#include "guest_render_bridge.h"
+#include "guest_render_native_stream.h"
 #include "mdec.h"
+#include "native_render_baseline.h"
 #include "overlay_capture.h"
 #include "spu.h"
 #include "audio_trace.h"
@@ -37,7 +40,9 @@ extern uint32_t i_stat;
 extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
+extern uint32_t debug_guest_ra(void);
 extern uint64_t s_frame_count;
+extern void psx_fatal_halt(const char *reason);
 
 /* ---- Per-channel registers ---- */
 
@@ -48,6 +53,31 @@ typedef struct {
 } DMAChannel;
 
 static DMAChannel channels[7];
+static char dma2_native_failure_reason[512];
+
+static void dma2_native_note_failure(const char *kind, uint32_t address,
+                                     uint8_t opcode) {
+    GpuNativePacketStreamSnapshot pending = {0};
+
+    (void)gpu_native_packet_stream_snapshot(&pending);
+    snprintf(dma2_native_failure_reason,
+             sizeof(dma2_native_failure_reason),
+             "Native packet %s at 0x%08X opcode 0x%02X pending=0x%02X/%zu/%zu source=0x%08X reservation=%u/%u/%zu/%zu reserved=0x%08llX/0x%08llX/%u/0x%02X/%zu/0x%016llX actual=0x%08llX/0x%08llX/%u/0x%02X/%zu/0x%016llX",
+             kind, address, opcode, pending.opcode, pending.count,
+             pending.expected, pending.source.word_address,
+             pending.reservation_phase, pending.reservation_consume_status,
+             pending.reservation_count, pending.reservation_consumed,
+             (unsigned long long)pending.reserved_command_id,
+             (unsigned long long)pending.reserved_container_id,
+             pending.reserved_source_kind, pending.reserved_opcode,
+             pending.reserved_word_count,
+             (unsigned long long)pending.reserved_packet_hash,
+             (unsigned long long)pending.actual_command_id,
+             (unsigned long long)pending.actual_container_id,
+             pending.actual_source_kind, pending.actual_opcode,
+             pending.actual_word_count,
+             (unsigned long long)pending.actual_packet_hash);
+}
 
 typedef struct {
     uint8_t active;
@@ -145,6 +175,10 @@ static uint32_t dicr;  /* 0x1F8010F4: DMA interrupt control */
 
 static DMATraceEntry dma_trace[DMA_TRACE_CAP];
 static uint64_t dma_trace_seq;
+static DMAOtTraceList ot_trace_lists[DMA_OT_TRACE_LIST_CAP];
+static DMAOtTraceNode ot_trace_nodes[DMA_OT_TRACE_NODE_CAP];
+static uint64_t ot_trace_list_seq;
+static uint64_t ot_trace_node_seq;
 static DMACDROMHistoryEntry cdrom_dma_history[DMA_CDROM_HISTORY_CAP];
 static uint64_t cdrom_dma_history_seq;
 static DMACDROMHistoryEntry cdrom_dma_active_entry;
@@ -197,6 +231,47 @@ static void trace_dma_reg_write(uint32_t addr, uint32_t val, uint32_t mask,
     e->i_stat_after = i_stat;
     e->func = g_debug_current_func_addr;
     e->pc = g_debug_last_store_pc;
+}
+
+static uint64_t ot_trace_begin(uint32_t start_addr, DMAOtTraceMode mode) {
+    const uint64_t seq = ot_trace_list_seq++;
+    DMAOtTraceList *entry = &ot_trace_lists[seq % DMA_OT_TRACE_LIST_CAP];
+    memset(entry, 0, sizeof(*entry));
+    entry->seq = seq;
+    entry->frame = (uint32_t)s_frame_count;
+    entry->start_addr = start_addr;
+    entry->node_start_seq = ot_trace_node_seq;
+    entry->func = g_debug_current_func_addr;
+    entry->pc = g_debug_last_store_pc;
+    entry->ra = debug_guest_ra();
+    entry->mode = (uint32_t)mode;
+    return seq;
+}
+
+static void ot_trace_node(uint64_t list_seq, uint32_t node_addr,
+                          uint32_t next_node_addr, uint32_t packet_words,
+                          uint32_t final_ordinal) {
+    const uint64_t seq = ot_trace_node_seq++;
+    DMAOtTraceNode *entry = &ot_trace_nodes[seq % DMA_OT_TRACE_NODE_CAP];
+    DMAOtTraceList *list = &ot_trace_lists[list_seq % DMA_OT_TRACE_LIST_CAP];
+    memset(entry, 0, sizeof(*entry));
+    entry->seq = seq;
+    entry->list_seq = list_seq;
+    entry->frame = (uint32_t)s_frame_count;
+    entry->node_addr = node_addr;
+    entry->next_node_addr = next_node_addr;
+    entry->packet_words = packet_words;
+    entry->final_ordinal = final_ordinal;
+    if (list->seq == list_seq && list->node_count != UINT32_MAX)
+        ++list->node_count;
+}
+
+static void ot_trace_end(uint64_t list_seq, uint32_t actual_words,
+                         NativeRenderBaselineOtStatus status) {
+    DMAOtTraceList *entry = &ot_trace_lists[list_seq % DMA_OT_TRACE_LIST_CAP];
+    if (entry->seq != list_seq) return;
+    entry->actual_words = actual_words;
+    entry->status = (uint32_t)status;
 }
 
 /* ---- Helpers ---- */
@@ -342,6 +417,12 @@ static uint32_t transfer_word_count(int ch) {
  * (the node walker has its own MAX_NODES cycle cap). */
 #define DMA_MAX_TRANSFER_WORDS 0x80000u
 
+#ifndef DMA2_LINKED_LIST_MAX_NODES
+#define DMA2_LINKED_LIST_MAX_NODES 0x40000u
+#endif
+
+#define DMA2_RAM_WORD_MASK 0x1FFFFCu
+
 static void validate_transfer_length(int ch) {
     uint32_t sync_mode = (channels[ch].chcr >> 9) & 3u;
     if (ch == 2 && sync_mode == 2) return;
@@ -411,6 +492,23 @@ static void schedule_delayed_complete(int ch, uint32_t total_words,
     event_ring_record_aux(EV_DMA_SCHED, (uint8_t)ch, channels[ch].chcr);
 }
 
+static bool dma2_observation_guard(
+        GuestRenderTransactionObservationReason reason) {
+    GuestRenderTransactionSnapshot snapshot;
+
+    if (!gpu_render_transaction_observation_guard(reason) ||
+        guest_render_transaction_snapshot(&snapshot) !=
+            GUEST_RENDER_TRANSACTION_OK)
+        return false;
+    if (snapshot.phase != GUEST_RENDER_TRANSACTION_ROLLED_BACK) return true;
+    /* The coordinator can replay Original even when backend rollback failed.
+     * That is diagnosable recovery, not permission to expose a DMA effect. */
+    return snapshot.rollback_status == GPU_RENDER_TRANSACTION_OK &&
+           snapshot.last_status !=
+               GUEST_RENDER_TRANSACTION_CHECKPOINT_ROLLBACK_FAILURE &&
+           snapshot.last_status != GUEST_RENDER_TRANSACTION_REPLAY_FAILURE;
+}
+
 static void advance_delayed_complete(int ch, uint32_t cycles) {
     DMADelayedComplete *d = &delayed_complete[ch];
     if (!d->active) return;
@@ -418,6 +516,10 @@ static void advance_delayed_complete(int ch, uint32_t cycles) {
         d->cycles_remaining -= cycles;
         return;
     }
+
+    if (ch == 2 && !dma2_observation_guard(
+            GUEST_RENDER_TRANSACTION_OBSERVATION_DELAYED_COMPLETION))
+        return;
 
     d->active = 0;
     d->total_words = 0;
@@ -652,12 +754,954 @@ static void execute_ch1_mdec_out(void) {
     complete_transfer(1);
 }
 
+typedef enum DMA2JournalBuildStatus {
+    DMA2_JOURNAL_OK = 0,
+    DMA2_JOURNAL_EMPTY,
+    DMA2_JOURNAL_CAPACITY,
+    DMA2_JOURNAL_CYCLE,
+    DMA2_JOURNAL_MAX_NODES,
+    DMA2_JOURNAL_OVERFLOW,
+    DMA2_JOURNAL_MALFORMED_LINK,
+    DMA2_JOURNAL_UNSUPPORTED_STREAM,
+} DMA2JournalBuildStatus;
+
+typedef struct DMA2JournalStorage {
+    GuestRenderTransactionCommandMetadata
+        commands[GUEST_RENDER_TRANSACTION_COMMAND_CAPACITY];
+    uint32_t words[GUEST_RENDER_TRANSACTION_WORD_CAPACITY];
+    GuestRenderTransactionJournal journal;
+    uint32_t actual_words;
+    uint32_t final_madr;
+} DMA2JournalStorage;
+
+static void dma2_feed_journal_command(
+        const GuestRenderTransactionCommandMetadata *metadata,
+        const uint32_t *words, size_t word_count) {
+    uint32_t word_addr = (uint32_t)metadata->command_id;
+    const bool linked =
+        metadata->source == GUEST_RENDER_TRANSACTION_SOURCE_OT;
+    uint32_t container_addr = (uint32_t)metadata->container_id;
+
+    for (size_t i = 0u; i < word_count; ++i) {
+        GpuRenderOracleSource source = {
+            linked ? GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST
+                   : GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK,
+            word_addr, word_addr / 4u, container_addr / 4u
+        };
+        gpu_set_gp0_source(&source);
+        gpu_write_gp0(words[i]);
+        word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+    }
+}
+
+static bool dma2_compatibility_callback(
+        const GuestRenderTransactionCommandMetadata *metadata,
+        const uint32_t *words, size_t word_count,
+        GpuRenderMaterial *out_material, bool *out_has_material,
+        void *user_data) {
+    (void)user_data;
+    if (!metadata || !words || word_count != metadata->word_count ||
+        !out_material || !out_has_material ||
+        !gpu_render_material_capture_begin())
+        return false;
+    dma2_feed_journal_command(metadata, words, word_count);
+    return gpu_render_material_capture_end(out_material, out_has_material);
+}
+
+static bool dma2_target_side_effects_callback(
+        const GuestRenderTransactionCommandMetadata *metadata,
+        const uint32_t *words, size_t word_count, void *user_data) {
+    GpuRenderDrawSuppressionStatus begin_status;
+    GpuRenderDrawSuppressionStatus end_status;
+
+    (void)user_data;
+    if (!metadata || !words || word_count != metadata->word_count)
+        return false;
+    begin_status = gr_draw_suppression_begin();
+    if (begin_status != GPU_RENDER_DRAW_SUPPRESSION_OK) return false;
+    dma2_feed_journal_command(metadata, words, word_count);
+    end_status = gr_draw_suppression_end();
+    return end_status == GPU_RENDER_DRAW_SUPPRESSION_OK;
+}
+
+static void dma2_material_observation_callback(
+        const GuestRenderTransactionCommandMetadata *metadata,
+        const GpuRenderMaterial *material, void *user_data) {
+    NativeRenderBaselineMaterialObservation observation = {0};
+
+    (void)user_data;
+    if (!metadata || !material || metadata->command_id > UINT32_MAX) return;
+    observation.material = *material;
+    observation.provenance = metadata->source == GUEST_RENDER_TRANSACTION_SOURCE_OT
+        ? NATIVE_RENDER_BASELINE_MATERIAL_OT
+        : metadata->source == GUEST_RENDER_TRANSACTION_SOURCE_DMA
+            ? NATIVE_RENDER_BASELINE_MATERIAL_DMA
+            : NATIVE_RENDER_BASELINE_MATERIAL_MMIO;
+    observation.command_address = (uint32_t)metadata->command_id;
+    observation.source_word_ordinal = metadata->command_id / 4u;
+    observation.container_ordinal = metadata->container_id / 4u;
+    observation.submission_ordinal = metadata->ordinal;
+    observation.word_count = metadata->word_count;
+    native_render_baseline_note_material(&observation);
+}
+
+static bool dma2_replay_callback(
+        const GuestRenderTransactionReplayJournal *journal,
+        void *user_data) {
+    const bool capture_materials =
+        guest_render_transaction_replay_material_capture_active();
+
+    (void)user_data;
+    if (!journal || !journal->commands || !journal->words) return false;
+    for (size_t i = 0u; i < journal->command_count; ++i) {
+        const GuestRenderTransactionCommandMetadata *metadata =
+            &journal->commands[i];
+        GpuRenderMaterial material;
+        bool has_material = false;
+
+        if (metadata->word_offset > journal->word_count ||
+            metadata->word_count > journal->word_count - metadata->word_offset ||
+            (capture_materials && !gpu_render_material_capture_begin()))
+            return false;
+        dma2_feed_journal_command(
+            metadata, &journal->words[metadata->word_offset],
+            metadata->word_count);
+        if (capture_materials &&
+            (!gpu_render_material_capture_end(&material, &has_material) ||
+             (has_material &&
+              !guest_render_transaction_note_replay_material(metadata,
+                                                             &material))))
+            return false;
+    }
+    return true;
+}
+
+static DMA2JournalBuildStatus dma2_gp0_command_word_count(
+        const uint32_t *words, size_t available_words,
+        size_t *out_command_words) {
+    uint8_t opcode;
+    int fixed_words;
+    size_t command_words;
+
+    if (!words || !out_command_words || available_words == 0u)
+        return DMA2_JOURNAL_UNSUPPORTED_STREAM;
+    opcode = (uint8_t)(words[0] >> 24u);
+    fixed_words = gpu_gp0_command_word_count(opcode);
+    if (fixed_words < 0) {
+        command_words = 1u;
+        while (command_words < available_words &&
+               (words[command_words] & UINT32_C(0xf000f000)) !=
+                   UINT32_C(0x50005000))
+            ++command_words;
+        if (command_words == available_words)
+            return DMA2_JOURNAL_UNSUPPORTED_STREAM;
+        ++command_words;
+    } else if (fixed_words == 0) {
+        return DMA2_JOURNAL_UNSUPPORTED_STREAM;
+    } else {
+        command_words = (size_t)fixed_words;
+        if ((opcode & UINT8_C(0xe0)) == UINT8_C(0xa0)) {
+            uint64_t width;
+            uint64_t height;
+
+            if (available_words < 3u)
+                return DMA2_JOURNAL_UNSUPPORTED_STREAM;
+            width = words[2] & UINT32_C(0x3ff);
+            height = (words[2] >> 16u) & UINT32_C(0x1ff);
+            if (width == 0u) width = UINT64_C(0x400);
+            if (height == 0u) height = UINT64_C(0x200);
+            command_words += (size_t)((width * height + 1u) / 2u);
+        }
+    }
+    if (command_words > available_words)
+        return DMA2_JOURNAL_UNSUPPORTED_STREAM;
+    *out_command_words = command_words;
+    return DMA2_JOURNAL_OK;
+}
+
+static bool dma2_native_submit_sequence(
+        const uint32_t *words, size_t word_count, uint32_t start_addr,
+        int32_t addr_step, GpuRenderOracleSourceKind source_kind,
+        uint32_t container_addr, size_t *out_command_count) {
+    size_t word_offset;
+
+    if (!words || word_count == 0u) return false;
+    for (word_offset = 0u; word_offset < word_count; ++word_offset) {
+        const uint32_t command_addr =
+            (uint32_t)((int64_t)start_addr +
+                       (int64_t)word_offset * addr_step) & DMA2_RAM_WORD_MASK;
+        GpuRenderOracleSource source;
+        source.kind = source_kind;
+        source.word_address = command_addr;
+        source.word_ordinal = command_addr / 4u;
+        source.container_ordinal = container_addr / 4u;
+        if (!gpu_native_submit_gp0_word(words[word_offset], &source)) {
+            dma2_native_note_failure(
+                "render", command_addr,
+                (uint8_t)(words[word_offset] >> 24u));
+            gpu_native_preflight_reservation_abort();
+            return false;
+        }
+    }
+    if (out_command_count) *out_command_count = word_count;
+    return true;
+}
+
+static bool dma2_native_preflight_sequence(
+        const uint32_t *words, size_t word_count, uint32_t start_addr,
+        int32_t addr_step, GpuRenderOracleSourceKind source_kind,
+        uint32_t container_addr) {
+    size_t word_offset = 0u;
+    GpuNativePacketStreamSnapshot pending = {0};
+
+    if (!gpu_native_packet_stream_snapshot(&pending)) return false;
+    if (pending.active) {
+        size_t continuation_words;
+
+        if (pending.expected == 0u || pending.count >= pending.expected)
+            return false;
+        continuation_words = pending.expected - pending.count;
+        if (continuation_words > word_count)
+            continuation_words = word_count;
+        if (!gpu_native_preflight_pending_gp0_words(
+                words, continuation_words))
+            return false;
+        word_offset = continuation_words;
+    }
+
+    while (word_offset < word_count) {
+        size_t command_words;
+        const uint32_t command_addr = (uint32_t)(
+            (int64_t)start_addr + (int64_t)word_offset * addr_step) &
+            DMA2_RAM_WORD_MASK;
+        const GpuRenderOracleSource source = {
+            source_kind, command_addr, command_addr / 4u,
+            container_addr / 4u,
+        };
+
+        if (dma2_gp0_command_word_count(
+                &words[word_offset], word_count - word_offset,
+                &command_words) != DMA2_JOURNAL_OK) {
+            dma2_native_note_failure(
+                "preflight decode", command_addr,
+                (uint8_t)(words[word_offset] >> 24u));
+            return false;
+        }
+        if (!gpu_native_preflight_gp0_packet(
+                &words[word_offset], command_words, &source)) {
+            dma2_native_note_failure(
+                "preflight binding", command_addr,
+                (uint8_t)(words[word_offset] >> 24u));
+            return false;
+        }
+        word_offset += command_words;
+    }
+    return true;
+}
+
+static bool dma2_native_preflight_block(
+        uint32_t start_addr, uint32_t total_words, int32_t addr_step,
+        GpuRenderOracleSourceKind source_kind, uint32_t container_addr) {
+    uint32_t *words;
+    bool valid;
+
+    if (total_words == 0u || !gpu_native_preflight_reservation_begin())
+        return false;
+    words = (uint32_t *)malloc((size_t)total_words * sizeof(*words));
+    if (!words) {
+        gpu_native_preflight_reservation_abort();
+        return false;
+    }
+    for (uint32_t index = 0u; index < total_words; ++index) {
+        const uint32_t address = (uint32_t)(
+            (int64_t)start_addr + (int64_t)index * addr_step) &
+            DMA2_RAM_WORD_MASK;
+        words[index] = psx_read_word(address);
+    }
+    valid = dma2_native_preflight_sequence(
+        words, total_words, start_addr, addr_step, source_kind,
+        container_addr);
+    free(words);
+    if (!valid || !gpu_native_preflight_reservation_seal()) {
+        gpu_native_preflight_reservation_abort();
+        return false;
+    }
+    return true;
+}
+
+static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
+    uint32_t addr = start_addr;
+    uint32_t cycle_anchor = addr;
+    uint32_t cycle_power = 1u;
+    uint32_t cycle_length = 0u;
+    bool result = false;
+
+    if (!gpu_native_preflight_reservation_begin()) return false;
+
+    for (uint32_t safety = 0u; safety < DMA2_LINKED_LIST_MAX_NODES; ++safety) {
+        const uint32_t header = psx_read_word(addr);
+        const uint32_t num_words = header >> 24u;
+        const uint32_t next = header & UINT32_C(0x00ffffff);
+        uint32_t words[UINT8_MAX];
+        bool valid = true;
+
+        if (num_words != 0u) {
+            for (uint32_t index = 0u; index < num_words; ++index)
+                words[index] = psx_read_word(
+                    (addr + 4u + index * 4u) & DMA2_RAM_WORD_MASK);
+            valid = dma2_native_preflight_sequence(
+                words, num_words, (addr + 4u) & DMA2_RAM_WORD_MASK, 4,
+                GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, addr);
+        }
+        if (!valid) goto done;
+        if (next == UINT32_C(0x00ffffff)) {
+            result = true;
+            break;
+        }
+        if ((next & 3u) != 0u || next > DMA2_RAM_WORD_MASK) goto done;
+        addr = next;
+        ++cycle_length;
+        if (addr == cycle_anchor) goto done;
+        if (cycle_length == cycle_power) {
+            cycle_anchor = addr;
+            if (cycle_power <= UINT32_MAX / 2u) cycle_power *= 2u;
+            cycle_length = 0u;
+        }
+    }
+done:
+    if (!result || !gpu_native_preflight_reservation_seal()) {
+        gpu_native_preflight_reservation_abort();
+        return false;
+    }
+    return true;
+}
+
+static bool dma2_native_read_block(
+        uint32_t start_addr, uint32_t total_words, int32_t addr_step,
+        GpuRenderOracleSourceKind source_kind, uint32_t container_addr,
+        uint32_t *out_actual_words) {
+    uint32_t *words;
+    size_t command_count = 0u;
+
+    if (total_words == 0u || !out_actual_words) {
+        gpu_native_preflight_reservation_abort();
+        return false;
+    }
+    words = (uint32_t *)malloc((size_t)total_words * sizeof(*words));
+    if (!words) {
+        gpu_native_preflight_reservation_abort();
+        return false;
+    }
+    for (uint32_t index = 0u; index < total_words; ++index) {
+        const uint32_t address = (uint32_t)((int64_t)start_addr +
+                                            (int64_t)index * addr_step) &
+                                 DMA2_RAM_WORD_MASK;
+        words[index] = psx_read_word(address);
+    }
+    if (!dma2_native_submit_sequence(
+            words, total_words, start_addr, addr_step, source_kind,
+            container_addr, &command_count)) {
+        free(words);
+        return false;
+    }
+    free(words);
+    *out_actual_words = total_words;
+    return true;
+}
+
+static uint32_t dma2_execute_linked_list_native(uint32_t start_addr) {
+    uint32_t addr = start_addr;
+    uint32_t actual_words = 0u;
+    uint32_t safety = 0u;
+    uint32_t cycle_anchor = addr;
+    uint32_t cycle_power = 1u;
+    uint32_t cycle_length = 0u;
+    uint32_t result = 0u;
+    const bool collect_baseline = native_render_baseline_is_armed();
+    NativeRenderBaselineOtStatus baseline_status =
+        NATIVE_RENDER_BASELINE_OT_VALID;
+
+    dma2_native_failure_reason[0] = '\0';
+    /* Baseline OT accounting is observation-only. Native still submits every
+     * packet through its direct backend path below; this records the guest
+     * producer topology without invoking the Original walker. */
+    if (collect_baseline) native_render_baseline_ot_begin(start_addr);
+    guest_render_native_stream_note_native_list();
+    for (;;) {
+        uint32_t header;
+        uint32_t num_words;
+        uint32_t next;
+        uint32_t words[UINT8_MAX];
+        uint32_t word_addr;
+        size_t command_count = 0u;
+
+        if (safety++ >= DMA2_LINKED_LIST_MAX_NODES) {
+            baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
+            break;
+        }
+        header = psx_read_word(addr);
+        num_words = header >> 24u;
+        next = header & UINT32_C(0x00ffffff);
+        if (actual_words > UINT32_MAX - num_words - 1u) {
+            baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
+            break;
+        }
+        actual_words += 1u + num_words;
+        if (collect_baseline) {
+            const NativeRenderBaselineOtNode node = {
+                addr, next, num_words, safety - 1u
+            };
+            native_render_baseline_ot_node(&node);
+        }
+        word_addr = (addr + 4u) & DMA2_RAM_WORD_MASK;
+        for (uint32_t index = 0u; index < num_words; ++index) {
+            words[index] = psx_read_word(word_addr);
+            word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+        }
+        if (num_words != 0u && !dma2_native_submit_sequence(
+                 words, num_words, (addr + 4u) & DMA2_RAM_WORD_MASK, 4,
+                 GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, addr,
+                 &command_count)) {
+            baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
+            break;
+        }
+        if (next == UINT32_C(0x00ffffff)) {
+            channels[2].madr = UINT32_C(0x00ffffff);
+            result = actual_words;
+            break;
+        }
+        if ((next & 3u) != 0u || next > DMA2_RAM_WORD_MASK) {
+            baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
+            break;
+        }
+        addr = next;
+        ++cycle_length;
+        if (addr == cycle_anchor) {
+            baseline_status = NATIVE_RENDER_BASELINE_OT_CYCLIC;
+            break;
+        }
+        if (cycle_length == cycle_power) {
+            cycle_anchor = addr;
+            if (cycle_power <= UINT32_MAX / 2u) cycle_power *= 2u;
+            cycle_length = 0u;
+        }
+    }
+    if (collect_baseline)
+        native_render_baseline_ot_end(baseline_status);
+    return result;
+}
+
+static DMA2JournalBuildStatus dma2_append_journal_command(
+        DMA2JournalStorage *storage, GuestRenderTransactionSource source,
+        uint32_t list_addr, uint32_t container_addr, uint32_t command_addr,
+        size_t word_offset, size_t command_words, size_t *command_count) {
+    GuestRenderTransactionCommandMetadata *metadata;
+
+    if (*command_count >= guest_render_transaction_command_capacity())
+        return DMA2_JOURNAL_CAPACITY;
+    metadata = &storage->commands[*command_count];
+    metadata->source = source;
+    metadata->list_id = list_addr;
+    metadata->command_id = command_addr;
+    metadata->container_id = container_addr;
+    metadata->predecessor_command_id = *command_count == 0u
+        ? GUEST_RENDER_TRANSACTION_NO_COMMAND
+        : storage->commands[*command_count - 1u].command_id;
+    metadata->successor_command_id = GUEST_RENDER_TRANSACTION_NO_COMMAND;
+    metadata->ordinal = *command_count;
+    metadata->word_offset = word_offset;
+    metadata->word_count = command_words;
+    if (*command_count != 0u)
+        storage->commands[*command_count - 1u].successor_command_id =
+            metadata->command_id;
+    ++*command_count;
+    return DMA2_JOURNAL_OK;
+}
+
+static DMA2JournalBuildStatus dma2_build_linked_list_journal(
+        uint32_t start_addr, DMA2JournalStorage *storage) {
+    uint32_t addr = start_addr;
+    uint32_t safety = 0u;
+    uint32_t cycle_anchor = addr;
+    uint32_t cycle_power = 1u;
+    uint32_t cycle_length = 0u;
+    size_t command_count = 0u;
+    size_t word_count = 0u;
+
+    /* This entire pass is read-only. No GP0 word is visible until every tag,
+     * link, command boundary, and copied payload has passed validation. */
+    memset(storage, 0, sizeof(*storage));
+    storage->final_madr = start_addr;
+    for (;;) {
+        uint32_t header;
+        uint32_t num_words;
+        uint32_t next;
+
+        if (safety++ >= DMA2_LINKED_LIST_MAX_NODES)
+            return DMA2_JOURNAL_MAX_NODES;
+        header = psx_read_word(addr);
+        num_words = header >> 24;
+        if (storage->actual_words == UINT32_MAX ||
+            num_words > UINT32_MAX - storage->actual_words - 1u)
+            return DMA2_JOURNAL_OVERFLOW;
+        storage->actual_words += 1u + num_words;
+
+        if (num_words != 0u) {
+            uint32_t word_addr = (addr + 4u) & DMA2_RAM_WORD_MASK;
+            const size_t node_word_start = word_count;
+            size_t node_word_offset = node_word_start;
+            size_t node_word_end;
+
+            if (num_words >
+                    guest_render_transaction_word_capacity() - word_count)
+                return DMA2_JOURNAL_CAPACITY;
+            for (uint32_t i = 0u; i < num_words; ++i) {
+                storage->words[word_count++] = psx_read_word(word_addr);
+                word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+            }
+            node_word_end = word_count;
+            while (node_word_offset < node_word_end) {
+                size_t command_words;
+                size_t payload_index = node_word_offset - node_word_start;
+                uint32_t command_addr =
+                    (addr + 4u + (uint32_t)payload_index * 4u) &
+                    DMA2_RAM_WORD_MASK;
+                DMA2JournalBuildStatus status =
+                    dma2_gp0_command_word_count(
+                        &storage->words[node_word_offset],
+                        node_word_end - node_word_offset, &command_words);
+
+                if (status != DMA2_JOURNAL_OK) return status;
+                status = dma2_append_journal_command(
+                    storage, GUEST_RENDER_TRANSACTION_SOURCE_OT,
+                    start_addr, addr, command_addr, node_word_offset,
+                    command_words, &command_count);
+                if (status != DMA2_JOURNAL_OK) return status;
+                node_word_offset += command_words;
+            }
+        }
+
+        next = header & 0xFFFFFFu;
+        if (next == 0xFFFFFFu) {
+            storage->final_madr = 0x00FFFFFFu;
+            break;
+        }
+        if ((next & 3u) != 0u || next > DMA2_RAM_WORD_MASK)
+            return DMA2_JOURNAL_MALFORMED_LINK;
+        addr = next;
+        storage->final_madr = addr;
+        ++cycle_length;
+        if (addr == cycle_anchor) return DMA2_JOURNAL_CYCLE;
+        if (cycle_length == cycle_power) {
+            cycle_anchor = addr;
+            if (cycle_power <= UINT32_MAX / 2u) cycle_power *= 2u;
+            cycle_length = 0u;
+        }
+    }
+
+    if (command_count == 0u) return DMA2_JOURNAL_EMPTY;
+    storage->journal.list_id = start_addr;
+    storage->journal.commands = storage->commands;
+    storage->journal.command_count = command_count;
+    storage->journal.words = storage->words;
+    storage->journal.word_count = word_count;
+    storage->journal.complete = true;
+    return DMA2_JOURNAL_OK;
+}
+
+static DMA2JournalBuildStatus dma2_build_block_journal(
+        uint32_t start_addr, uint32_t total_words,
+        DMA2JournalStorage *storage) {
+    size_t command_count = 0u;
+    size_t word_offset = 0u;
+
+    if (!storage || total_words == 0u)
+        return DMA2_JOURNAL_EMPTY;
+    if (total_words > guest_render_transaction_word_capacity())
+        return DMA2_JOURNAL_CAPACITY;
+    memset(storage, 0, sizeof(*storage));
+    storage->actual_words = total_words;
+    storage->final_madr =
+        (start_addr + total_words * 4u) & DMA2_RAM_WORD_MASK;
+    for (size_t index = 0u; index < total_words; ++index)
+        storage->words[index] = psx_read_word(
+            (start_addr + (uint32_t)index * 4u) & DMA2_RAM_WORD_MASK);
+
+    while (word_offset < total_words) {
+        size_t command_words;
+        DMA2JournalBuildStatus status = dma2_gp0_command_word_count(
+            &storage->words[word_offset], total_words - word_offset,
+            &command_words);
+
+        if (status != DMA2_JOURNAL_OK) return status;
+        status = dma2_append_journal_command(
+            storage, GUEST_RENDER_TRANSACTION_SOURCE_DMA, start_addr,
+            start_addr,
+            (start_addr + (uint32_t)word_offset * 4u) & DMA2_RAM_WORD_MASK,
+            word_offset, command_words, &command_count);
+        if (status != DMA2_JOURNAL_OK) return status;
+        word_offset += command_words;
+    }
+
+    storage->journal.list_id = start_addr;
+    storage->journal.commands = storage->commands;
+    storage->journal.command_count = command_count;
+    storage->journal.words = storage->words;
+    storage->journal.word_count = total_words;
+    storage->journal.complete = true;
+    return DMA2_JOURNAL_OK;
+}
+
+static void dma2_record_valid_baseline(uint32_t start_addr) {
+    uint32_t addr = start_addr;
+    uint32_t ordinal = 0u;
+
+    /* Defer accounting until preflight succeeds so a fallback can run the
+     * original walker without double-counting a partial first pass. */
+    if (!native_render_baseline_is_armed()) return;
+    native_render_baseline_ot_begin(start_addr);
+    for (;;) {
+        uint32_t header = psx_read_word(addr);
+        uint32_t next = header & 0xFFFFFFu;
+        NativeRenderBaselineOtNode node = {
+            addr, next, header >> 24, ordinal++
+        };
+        native_render_baseline_ot_node(&node);
+        if (next == 0xFFFFFFu) break;
+        addr = next;
+    }
+    native_render_baseline_ot_end(NATIVE_RENDER_BASELINE_OT_VALID);
+}
+
+static uint32_t dma2_execute_linked_list_original(uint32_t start_addr) {
+    uint32_t addr = start_addr;
+    uint32_t actual_words = 0u;
+    uint32_t safety = 0u;
+    const uint64_t ot_trace_seq =
+        ot_trace_begin(start_addr, DMA_OT_TRACE_ORIGINAL);
+    const int collect_baseline = native_render_baseline_is_armed();
+    uint32_t cycle_anchor = addr;
+    uint32_t cycle_power = 1u;
+    uint32_t cycle_length = 0u;
+    NativeRenderBaselineOtStatus ot_status = NATIVE_RENDER_BASELINE_OT_VALID;
+
+    if (collect_baseline) native_render_baseline_ot_begin(start_addr);
+    for (;;) {
+        if (safety++ > DMA2_LINKED_LIST_MAX_NODES) {
+            ot_status = NATIVE_RENDER_BASELINE_OT_INVALID;
+            break;
+        }
+
+        uint32_t header = psx_read_word(addr);
+        uint32_t num_words = (header >> 24) & 0xFFu;
+        uint32_t next = header & 0xFFFFFFu;
+        uint32_t word_addr = (addr + 4u) & DMA2_RAM_WORD_MASK;
+        actual_words += 1u;
+        ot_trace_node(ot_trace_seq, addr, next, num_words, safety - 1u);
+        if (collect_baseline) {
+            NativeRenderBaselineOtNode node = {
+                addr, next, num_words, safety - 1u
+            };
+            native_render_baseline_ot_node(&node);
+        }
+        for (uint32_t i = 0u; i < num_words; ++i) {
+            uint32_t word = psx_read_word(word_addr);
+            GpuRenderOracleSource source = {
+                GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, word_addr,
+                word_addr / 4u, addr / 4u
+            };
+            gpu_set_gp0_source(&source);
+            gpu_write_gp0(word);
+            word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+        }
+        actual_words += num_words;
+
+        if (next == 0xFFFFFFu) {
+            channels[2].madr = 0x00FFFFFFu;
+            break;
+        }
+        addr = next & DMA2_RAM_WORD_MASK;
+        if (collect_baseline) {
+            ++cycle_length;
+            if (addr == cycle_anchor) {
+                ot_status = NATIVE_RENDER_BASELINE_OT_CYCLIC;
+                break;
+            }
+            if (cycle_length == cycle_power) {
+                cycle_anchor = addr;
+                if (cycle_power <= UINT32_MAX / 2u) cycle_power *= 2u;
+                cycle_length = 0u;
+            }
+        }
+    }
+    if (ot_status != NATIVE_RENDER_BASELINE_OT_VALID)
+        channels[2].madr = addr;
+    ot_trace_end(ot_trace_seq, actual_words, ot_status);
+    if (collect_baseline) native_render_baseline_ot_end(ot_status);
+    return actual_words;
+}
+
+static bool dma2_status_replayed_original(GuestRenderTransactionStatus status) {
+    /* These statuses are emitted only after execute_preflighted has invoked
+     * the coordinator's whole-journal rollback/replay path. */
+    switch (status) {
+    case GUEST_RENDER_TRANSACTION_BACKEND_FAILURE:
+    case GUEST_RENDER_TRANSACTION_COMPATIBILITY_FAILURE:
+    case GUEST_RENDER_TRANSACTION_TARGET_SIDE_EFFECTS_FAILURE:
+    case GUEST_RENDER_TRANSACTION_CHECKPOINT_BEGIN_FAILURE:
+    case GUEST_RENDER_TRANSACTION_CHECKPOINT_ROLLBACK_FAILURE:
+    case GUEST_RENDER_TRANSACTION_REPLAY_FAILURE:
+    case GUEST_RENDER_TRANSACTION_BACKEND_ROLLBACK_FAILURE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool dma2_native_submission_authoritative(void) {
+    return guest_render_native_stream_enabled();
+}
+
+static uint32_t dma2_execute_linked_list(void) {
+    uint32_t start_addr = channels[2].madr & DMA2_RAM_WORD_MASK;
+    uint32_t actual_words = 0u;
+    GuestRenderTransactionPendingSnapshot pending = {0};
+    DMA2JournalStorage storage;
+    DMA2JournalBuildStatus build_status;
+    GuestRenderTransactionStatus pending_status;
+    uint64_t begin_vram_serial = 0u;
+
+    gpu_prepare_submission();
+    if (dma2_native_submission_authoritative()) {
+        if (!gpu_gp0_parser_is_idle() ||
+            !dma2_native_preflight_linked_list(start_addr)) {
+            psx_fatal_halt("Native OT preflight rejected an unauthenticated command");
+            return 0u;
+        }
+        gpu_ws_begin_linked_list();
+        actual_words = dma2_execute_linked_list_native(start_addr);
+        if (actual_words == 0u) {
+            psx_fatal_halt(dma2_native_failure_reason[0] != '\0'
+                ? dma2_native_failure_reason
+                : "Native packet producer rejected an OT list");
+            return 0u;
+        }
+        return actual_words;
+    }
+    guest_render_transaction_invalidate_deferred();
+    pending_status = guest_render_transaction_pending_snapshot(&pending);
+    if (pending_status == GUEST_RENDER_TRANSACTION_OK &&
+        pending.binding_count != 0u)
+        begin_vram_serial = gpu_render_vram_mutation_serial();
+    gpu_ws_begin_linked_list();
+    if (pending_status != GUEST_RENDER_TRANSACTION_OK) {
+        guest_render_transaction_clear_pending();
+        return dma2_execute_linked_list_original(start_addr);
+    }
+    if (pending.binding_count == 0u)
+        return dma2_execute_linked_list_original(start_addr);
+    if (!gpu_gp0_parser_is_idle()) {
+        guest_render_transaction_clear_pending();
+        return dma2_execute_linked_list_original(start_addr);
+    }
+
+    build_status = dma2_build_linked_list_journal(start_addr, &storage);
+    if (build_status != DMA2_JOURNAL_OK) {
+        guest_render_transaction_clear_pending();
+        return dma2_execute_linked_list_original(start_addr);
+    }
+
+    storage.journal.visual_id = pending.visual_id;
+    storage.journal.vram_mutation_serial = begin_vram_serial;
+    dma2_record_valid_baseline(start_addr);
+    {
+        GuestRenderTransactionPendingExecuteRequest request = {0};
+        GuestRenderTransactionStatus status;
+
+        request.journal = &storage.journal;
+        request.current_visual_id = pending.visual_id;
+        request.current_vram_mutation_serial =
+            gpu_render_vram_mutation_serial();
+        request.compatibility_callback = dma2_compatibility_callback;
+        request.target_side_effects_callback =
+            dma2_target_side_effects_callback;
+        request.material_observation_callback =
+            dma2_material_observation_callback;
+        request.begin_checkpoint = gpu_render_transaction_checkpoint_begin;
+        request.rollback_checkpoint =
+            gpu_render_transaction_checkpoint_rollback;
+        request.commit_checkpoint = gpu_render_transaction_checkpoint_commit;
+        request.replay_callback = dma2_replay_callback;
+        status = guest_render_transaction_execute_pending(&request);
+        if (status == GUEST_RENDER_TRANSACTION_TARGET_NOT_FOUND) {
+            GuestRenderTransactionReplayJournal replay = {
+                storage.journal.visual_id,
+                storage.journal.vram_mutation_serial,
+                storage.journal.list_id,
+                storage.journal.commands,
+                storage.journal.command_count,
+                storage.journal.words,
+                storage.journal.word_count,
+            };
+            (void)dma2_replay_callback(&replay, NULL);
+        } else if (status != GUEST_RENDER_TRANSACTION_OK) {
+            guest_render_bridge_force_original(
+                GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+            guest_render_transaction_clear_pending();
+            if (!dma2_status_replayed_original(status)) {
+                GuestRenderTransactionReplayJournal replay = {
+                    storage.journal.visual_id,
+                    storage.journal.vram_mutation_serial,
+                    storage.journal.list_id,
+                    storage.journal.commands,
+                    storage.journal.command_count,
+                    storage.journal.words,
+                    storage.journal.word_count,
+                };
+                (void)dma2_replay_callback(&replay, NULL);
+            }
+        }
+    }
+    channels[2].madr = storage.final_madr;
+    return storage.actual_words;
+}
+
+static uint32_t dma2_execute_block_original(
+        uint32_t start_addr, uint32_t total_words, int32_t addr_step) {
+    uint32_t addr = start_addr;
+    const uint64_t container_ordinal = start_addr / 4u;
+
+    for (uint32_t index = 0u; index < total_words; ++index) {
+        const uint32_t word = psx_read_word(addr);
+        const GpuRenderOracleSource source = {
+            GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, addr, addr / 4u,
+            container_ordinal,
+        };
+
+        gpu_set_gp0_source(&source);
+        gpu_write_gp0(word);
+        addr = (addr + addr_step) & DMA2_RAM_WORD_MASK;
+    }
+    channels[2].madr = addr;
+    return total_words;
+}
+
+static uint32_t dma2_execute_block(
+        uint32_t start_addr, uint32_t total_words, int32_t addr_step) {
+    GuestRenderTransactionPendingSnapshot pending = {0};
+    DMA2JournalStorage storage;
+    DMA2JournalBuildStatus build_status;
+    GuestRenderTransactionStatus pending_status;
+    uint64_t begin_vram_serial;
+
+    gpu_prepare_submission();
+    if (dma2_native_submission_authoritative()) {
+        dma2_native_failure_reason[0] = '\0';
+        if (!gpu_gp0_parser_is_idle() ||
+            !dma2_native_preflight_block(
+                start_addr, total_words, addr_step,
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, start_addr)) {
+            psx_fatal_halt(dma2_native_failure_reason[0] != '\0'
+                ? dma2_native_failure_reason
+                : "Native DMA block preflight rejected an unauthenticated command");
+            return 0u;
+        }
+        dma2_native_failure_reason[0] = '\0';
+        if (!dma2_native_read_block(
+                start_addr, total_words, addr_step,
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, start_addr,
+                &total_words)) {
+            psx_fatal_halt(dma2_native_failure_reason[0] != '\0'
+                ? dma2_native_failure_reason
+                : "Native packet producer rejected a DMA block");
+            return 0u;
+        }
+        channels[2].madr = (uint32_t)((int64_t)start_addr +
+                                      (int64_t)total_words * addr_step) &
+                           DMA2_RAM_WORD_MASK;
+        return total_words;
+    }
+    guest_render_transaction_invalidate_deferred();
+    pending_status = guest_render_transaction_pending_snapshot(&pending);
+    if (pending_status != GUEST_RENDER_TRANSACTION_OK ||
+        pending.binding_count == 0u)
+        return dma2_execute_block_original(start_addr, total_words, addr_step);
+    if (addr_step != 4 || !gpu_gp0_parser_is_idle())
+        return dma2_execute_block_original(start_addr, total_words, addr_step);
+
+    begin_vram_serial = gpu_render_vram_mutation_serial();
+    build_status = dma2_build_block_journal(start_addr, total_words, &storage);
+    if (build_status != DMA2_JOURNAL_OK) {
+        guest_render_transaction_clear_pending();
+        return dma2_execute_block_original(start_addr, total_words, addr_step);
+    }
+    storage.journal.visual_id = pending.visual_id;
+    storage.journal.vram_mutation_serial = begin_vram_serial;
+    {
+        GuestRenderTransactionPendingExecuteRequest request = {0};
+        GuestRenderTransactionStatus status;
+
+        request.journal = &storage.journal;
+        request.current_visual_id = pending.visual_id;
+        request.current_vram_mutation_serial =
+            gpu_render_vram_mutation_serial();
+        request.compatibility_callback = dma2_compatibility_callback;
+        request.target_side_effects_callback =
+            dma2_target_side_effects_callback;
+        request.material_observation_callback =
+            dma2_material_observation_callback;
+        request.begin_checkpoint = gpu_render_transaction_checkpoint_begin;
+        request.rollback_checkpoint =
+            gpu_render_transaction_checkpoint_rollback;
+        request.commit_checkpoint = gpu_render_transaction_checkpoint_commit;
+        request.replay_callback = dma2_replay_callback;
+        status = guest_render_transaction_execute_pending(&request);
+        if (status == GUEST_RENDER_TRANSACTION_TARGET_NOT_FOUND) {
+            GuestRenderTransactionReplayJournal replay = {
+                storage.journal.visual_id,
+                storage.journal.vram_mutation_serial,
+                storage.journal.list_id,
+                storage.journal.commands,
+                storage.journal.command_count,
+                storage.journal.words,
+                storage.journal.word_count,
+            };
+            (void)dma2_replay_callback(&replay, NULL);
+        } else if (status != GUEST_RENDER_TRANSACTION_OK) {
+            guest_render_bridge_force_original(
+                GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+            guest_render_transaction_clear_pending();
+            if (!dma2_status_replayed_original(status)) {
+                GuestRenderTransactionReplayJournal replay = {
+                    storage.journal.visual_id,
+                    storage.journal.vram_mutation_serial,
+                    storage.journal.list_id,
+                    storage.journal.commands,
+                    storage.journal.command_count,
+                    storage.journal.words,
+                    storage.journal.word_count,
+                };
+                (void)dma2_replay_callback(&replay, NULL);
+            }
+        }
+    }
+    channels[2].madr = storage.final_madr;
+    return storage.actual_words;
+}
+
 static uint32_t execute_ch2_gpu(void) {
+    extern int g_exec_phase;
+    const int previous_exec_phase = g_exec_phase;
     uint32_t chcr = channels[2].chcr;
     uint32_t direction = chcr & 1;           /* 0=to RAM, 1=from RAM (to device) */
     uint32_t step = (chcr >> 1) & 1;         /* 0=forward(+4), 1=backward(-4) */
     uint32_t sync_mode = (chcr >> 9) & 3;    /* 0=burst, 1=block, 2=linked-list */
     uint32_t actual_words = 0;
+
+    /* Native DMA submits GP0 words directly instead of passing through
+     * gpu_write_gp0(), so bracket the entire channel-2 device operation here
+     * for phase_profile attribution. */
+    g_exec_phase = 4;
 
     if (direction == 0) {
         /* GPU → RAM (VRAM read): read pixel data via GPUREAD.
@@ -676,6 +1720,7 @@ static uint32_t execute_ch2_gpu(void) {
             channels[2].madr = addr;
             actual_words = total_words;
         }
+        g_exec_phase = previous_exec_phase;
         return actual_words;
     }
 
@@ -688,72 +1733,62 @@ static uint32_t execute_ch2_gpu(void) {
         uint32_t addr = channels[2].madr & 0x1FFFFCu; /* mask to RAM, word-aligned */
         int32_t  addr_step = step ? -4 : 4;
 
-        for (uint32_t i = 0; i < total_words; i++) {
-            uint32_t word = psx_read_word(addr);
-            gpu_set_gp0_source(addr);
-            gpu_write_gp0(word);
-            addr = (addr + addr_step) & 0x1FFFFCu;
-        }
-        channels[2].madr = addr;
-        actual_words = total_words;
+        actual_words = dma2_execute_block(addr, total_words, addr_step);
     } else if (sync_mode == 2) {
-        /* Linked-list mode: follow ordering table in RAM.
-         * Each node: bits 24-31 = number of words following header,
-         *            bits 0-23  = next node address (0xFFFFFF = end).
-         * The words following the header are sent to GP0. */
-        gpu_ws_begin_linked_list();
-        uint32_t addr = channels[2].madr & 0x1FFFFCu;
-        uint32_t safety = 0;
-        const uint32_t MAX_NODES = 0x40000; /* prevent infinite loops */
-
-        for (;;) {
-            if (safety++ > MAX_NODES) {
-                /* Abort this transfer — linked list has a cycle or is corrupt.
-                 * Don't crash; the shell may recover on the next frame. */
-                break;
-            }
-
-            uint32_t header = psx_read_word(addr);
-            uint32_t num_words = (header >> 24) & 0xFF;
-            uint32_t word_addr = (addr + 4) & 0x1FFFFCu;
-            actual_words += 1u;
-
-            for (uint32_t i = 0; i < num_words; i++) {
-                uint32_t word = psx_read_word(word_addr);
-                gpu_set_gp0_source(word_addr);
-                gpu_write_gp0(word);
-                word_addr = (word_addr + 4) & 0x1FFFFCu;
-            }
-            actual_words += num_words;
-
-            /* Next node */
-            uint32_t next = header & 0xFFFFFFu;
-            if (next == 0xFFFFFFu) {
-                channels[2].madr = 0x00FFFFFFu;
-                break; /* end of list */
-            }
-            addr = next & 0x1FFFFCu;
-        }
-        if (safety > MAX_NODES) {
-            channels[2].madr = addr;
-        }
+        actual_words = dma2_execute_linked_list();
     } else {
         /* Burst mode (sync_mode == 0) */
         uint32_t word_count = channels[2].bcr & 0xFFFF;
         if (word_count == 0) word_count = 0x10000; /* 0 means 0x10000 */
         uint32_t addr = channels[2].madr & 0x1FFFFCu;
+        uint64_t container_ordinal = addr / 4u;
         int32_t  addr_step = step ? -4 : 4;
+        const bool native_authoritative =
+            dma2_native_submission_authoritative();
 
-        for (uint32_t i = 0; i < word_count; i++) {
-            uint32_t word = psx_read_word(addr);
-            gpu_set_gp0_source(addr);
-            gpu_write_gp0(word);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+        if (native_authoritative) {
+            if (!gpu_gp0_parser_is_idle() ||
+                !dma2_native_preflight_block(
+                    addr, word_count, addr_step,
+                    GPU_RENDER_ORACLE_SOURCE_DMA2_BURST,
+                    (uint32_t)container_ordinal * 4u)) {
+                psx_fatal_halt("Native DMA burst preflight rejected an unauthenticated command");
+                g_exec_phase = previous_exec_phase;
+                return 0u;
+            }
+            dma2_native_failure_reason[0] = '\0';
+            if (!dma2_native_read_block(
+                    addr, word_count, addr_step,
+                    GPU_RENDER_ORACLE_SOURCE_DMA2_BURST,
+                    (uint32_t)container_ordinal * 4u, &actual_words)) {
+                psx_fatal_halt(dma2_native_failure_reason[0] != '\0'
+                    ? dma2_native_failure_reason
+                    : "Native packet producer rejected a DMA burst");
+                g_exec_phase = previous_exec_phase;
+                return 0u;
+            }
+        } else {
+            for (uint32_t i = 0; i < word_count; i++) {
+                uint32_t word = psx_read_word(addr);
+                GpuRenderOracleSource source = {
+                    GPU_RENDER_ORACLE_SOURCE_DMA2_BURST, addr, addr / 4u,
+                    container_ordinal
+                };
+                gpu_set_gp0_source(&source);
+                gpu_write_gp0(word);
+                addr = (addr + addr_step) & 0x1FFFFCu;
+            }
+            actual_words = word_count;
         }
         channels[2].madr = addr;
-        actual_words = word_count;
+        if (native_authoritative) {
+            addr = (uint32_t)((int64_t)(channels[2].madr & 0x1ffffcu) +
+                              (int64_t)word_count * addr_step) & 0x1ffffcu;
+            channels[2].madr = addr;
+        }
     }
 
+    g_exec_phase = previous_exec_phase;
     return actual_words;
 }
 
@@ -832,6 +1867,19 @@ static void try_execute(int ch) {
     /* Transfer starts when bit 24 (start/busy) is set AND channel is enabled in DPCR */
     if (!((chcr >> 24) & 1)) return;
     if (!channel_enabled(ch)) return;
+
+    if (ch == 2) {
+        uint32_t direction = chcr & 1u;
+        uint32_t sync_mode = (chcr >> 9) & 3u;
+        GuestRenderTransactionObservationReason reason = direction == 0u ?
+            GUEST_RENDER_TRANSACTION_OBSERVATION_DMA2_GPU_TO_RAM_C0 :
+            (sync_mode == 2u ?
+                GUEST_RENDER_TRANSACTION_OBSERVATION_SECOND_LIST :
+                GUEST_RENDER_TRANSACTION_OBSERVATION_LATE_COMMAND);
+        if (!dma2_observation_guard(reason)) return;
+        if (direction == 0u || sync_mode == 0u)
+            guest_render_transaction_clear_pending();
+    }
 
     channels[ch].chcr &= ~(1u << 28);
     trace_dma('S', ch, transfer_word_count(ch), dicr, i_stat);
@@ -1062,6 +2110,7 @@ void dma_init(void) {
     dicr = 0;
     dma_debug_clear_trace();
     dma_debug_clear_cdrom_history();
+    dma_debug_clear_ot_trace();
 }
 
 uint32_t dma_read(uint32_t addr) {
@@ -1189,6 +2238,39 @@ void dma_debug_clear_cdrom_history(void) {
     memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
     cdrom_dma_history_seq = 0;
     cdrom_dma_history_active = 0;
+}
+
+uint64_t dma_debug_get_ot_list_total(void) {
+    return ot_trace_list_seq;
+}
+
+uint64_t dma_debug_get_ot_node_total(void) {
+    return ot_trace_node_seq;
+}
+
+int dma_debug_get_ot_list(uint64_t seq, DMAOtTraceList *out) {
+    if (!out || seq >= ot_trace_list_seq) return 0;
+    if (ot_trace_list_seq - seq > DMA_OT_TRACE_LIST_CAP) return 0;
+    const DMAOtTraceList *entry = &ot_trace_lists[seq % DMA_OT_TRACE_LIST_CAP];
+    if (entry->seq != seq) return 0;
+    *out = *entry;
+    return 1;
+}
+
+int dma_debug_get_ot_node(uint64_t seq, DMAOtTraceNode *out) {
+    if (!out || seq >= ot_trace_node_seq) return 0;
+    if (ot_trace_node_seq - seq > DMA_OT_TRACE_NODE_CAP) return 0;
+    const DMAOtTraceNode *entry = &ot_trace_nodes[seq % DMA_OT_TRACE_NODE_CAP];
+    if (entry->seq != seq) return 0;
+    *out = *entry;
+    return 1;
+}
+
+void dma_debug_clear_ot_trace(void) {
+    memset(ot_trace_lists, 0, sizeof(ot_trace_lists));
+    memset(ot_trace_nodes, 0, sizeof(ot_trace_nodes));
+    ot_trace_list_seq = 0;
+    ot_trace_node_seq = 0;
 }
 
 void dma_debug_get_state(DMADebugState* out) {

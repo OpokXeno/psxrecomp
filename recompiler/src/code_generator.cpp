@@ -9,9 +9,11 @@
 #include "../../runtime/include/ws_backdrop_detect.h"
 #include "../../runtime/include/ws_cull_detect.h"
 #include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp) */
+#include "../../runtime/include/overlay_api.h"
 #include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -37,6 +39,108 @@ static bool codegen_cycle_per_insn() {
  * BIOS property here — jump tables inside relocated BIOS code windows —
  * so the window comes from the profile, never from a constant. */
 static const ::PSXRecompV4::BiosAddressModel* g_game_bios_model = nullptr;
+
+static constexpr uint32_t XG_STATIC_AUTH_PRODUCER_ENTRY = 0x80075B44u;
+static constexpr uint32_t XG_STATIC_AUTH_CALLER_SITE = 0x800781BCu;
+static constexpr uint32_t XG_STATIC_AUTH_CALLEE_ENTRY = 0x8004B54Cu;
+static constexpr uint32_t XG_STATIC_AUTH_RETURN_SITE = 0x800781C4u;
+static constexpr uint32_t XG_RESIDENT_FT4_FIRST_STORE = 0x8004A7E8u;
+static constexpr uint32_t XG_RESIDENT_FT4_SECOND_STORE = 0x8004A814u;
+static constexpr uint32_t XG_RESIDENT_FT4_FIRST_INSTRUCTION = 0xE90C0000u;
+static constexpr uint32_t XG_RESIDENT_FT4_SECOND_INSTRUCTION = 0xE90E0000u;
+
+static bool is_static_auth_control_transfer(uint32_t instruction) {
+    const uint32_t opcode = instruction >> 26u;
+    const uint32_t funct = instruction & 0x3Fu;
+
+    return opcode == 0x01u || opcode == 0x02u || opcode == 0x03u ||
+           (opcode >= 0x04u && opcode <= 0x07u) ||
+           (opcode >= 0x14u && opcode <= 0x17u) ||
+           (opcode == 0u && (funct == 0x08u || funct == 0x09u));
+}
+
+static const CodeGenConfig::SourceObservationSite *source_observation_site(
+    const CodeGenConfig& config, uint32_t pc, uint32_t instruction) {
+    const uint32_t normalized_pc = (pc & 0x1fffffffu) | 0x80000000u;
+    for (const auto& site : config.source_observation_sites) {
+        if (site.pc == normalized_pc && site.instruction == instruction)
+            return &site;
+    }
+    return nullptr;
+}
+
+static const CodeGenConfig::NativeCutoverSite *native_cutover_site(
+    const CodeGenConfig& config, uint32_t pc, uint32_t instruction) {
+    const uint32_t normalized_pc = (pc & 0x1fffffffu) | 0x80000000u;
+    for (const auto& site : config.native_cutover_sites) {
+        if (site.pc == normalized_pc && site.instruction == instruction)
+            return &site;
+    }
+    return nullptr;
+}
+
+static const CodeGenConfig::RenderLifecycleSite *render_lifecycle_site(
+    const CodeGenConfig& config, uint32_t pc) {
+    const uint32_t normalized_pc = (pc & 0x1fffffffu) | 0x80000000u;
+    for (const auto& site : config.render_lifecycle_sites) {
+        if (site.pc == normalized_pc) return &site;
+    }
+    return nullptr;
+}
+
+static std::string render_lifecycle_hook(
+    const CodeGenConfig::RenderLifecycleSite& site) {
+    const char* hook = nullptr;
+    switch (site.role) {
+    case CodeGenConfig::RenderLifecycleRole::Entry:
+        hook = "PSX_XG_RENDER_AUTH_HOOK_ENTRY";
+        break;
+    case CodeGenConfig::RenderLifecycleRole::Capture:
+        hook = "PSX_XG_RENDER_AUTH_HOOK_CAPTURE";
+        break;
+    case CodeGenConfig::RenderLifecycleRole::Return:
+        hook = "PSX_XG_RENDER_AUTH_HOOK_RETURN";
+        break;
+    }
+    return fmt::format(
+        "psx_xg_render_auth(cpu, {}, 0x{:08X}u, 0x{:08X}u, 0x{:08X}u);",
+        hook, site.pc, site.instruction, site.delay_instruction);
+}
+
+static std::optional<std::string> overlay_continuation_hook(
+    const CodeGenConfig& config, uint32_t pc) {
+    const auto* lifecycle = render_lifecycle_site(config, pc);
+    if (lifecycle != nullptr) {
+        if (lifecycle->role == CodeGenConfig::RenderLifecycleRole::Return)
+            return render_lifecycle_hook(*lifecycle);
+        return std::string{};
+    }
+    return fmt::format(
+        "psx_xg_render_auth(cpu, PSX_XG_RENDER_AUTH_HOOK_CONTINUATION, "
+        "0x{:08X}u, 0u, 0u);", pc);
+}
+
+static const char *native_cutover_callback(const CodeGenConfig& config) {
+    return config.overlay_mode ? "psx_xg_render_native_ft4_bypass"
+                               : "psx_xg_render_auth_native_ft4_bypass";
+}
+
+static std::string xg_render_source_observation_hook(
+    const char* hook, uint32_t pc, uint32_t instruction,
+    const CodeGenConfig::SourceObservationSite *site) {
+    std::string auxiliary = "0u";
+    if (site != nullptr &&
+        site->auxiliary == CodeGenConfig::SourceObservationAuxiliary::EffectiveAddress) {
+        auxiliary = fmt::format("(cpu->gpr[{}] + (uint32_t)(int32_t)(int16_t)0x{:04X}u)",
+                                (instruction >> 21u) & 0x1fu, instruction & 0xffffu);
+    } else if (site != nullptr &&
+               site->auxiliary == CodeGenConfig::SourceObservationAuxiliary::ResultRegister &&
+               std::string(hook) == "PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT") {
+        auxiliary = fmt::format("cpu->gpr[{}]", (instruction >> 11u) & 0x1fu);
+    }
+    return fmt::format("psx_xg_render_auth(cpu, {}, 0x{:08X}u, 0x{:08X}u, {});",
+                       hook, (pc & 0x1fffffffu) | 0x80000000u, instruction, auxiliary);
+}
 
 void CodeGenerator::set_bios_address_model(const PSXRecompV4::BiosAddressModel* m) {
     g_game_bios_model = m;
@@ -783,6 +887,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     }
 
     std::string code;
+    std::string static_auth_hook;
+
+    if (xg_static_auth_hooks_active_ && addr == XG_STATIC_AUTH_RETURN_SITE) {
+        static_auth_hook =
+            "psx_xg_render_static_auth_return(0x800781C4u, cpu->gpr[31]); ";
+    }
+
+    if ((addr & 0x1FFFFFFFu) == 0x000758E4u && instr == 0x24630002u) {
+        return fmt::format(
+            "{} = {} + (uint32_t)psx_xenogears_field_frame_step("
+            "0x800758E4u, 0x24630002u, 2, cpu->gpr[17], 1u);{}",
+            reg_name(get_rt(instr)), reg_name(get_rs(instr)), comment);
+    }
 
     for (const auto& site : config_.ws_signed_x_bound_sites) {
         if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
@@ -836,6 +953,150 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                        addr, opcode, funct);
             std::exit(1);
         }
+    }
+
+    // Semantic guest-cull policy. The address is only discovery evidence; the
+    // emitted operation is named by what the predicate means, so generated
+    // code and the dirty-RAM interpreter share one policy vocabulary.
+    const auto semantic_site = config_.ws_cull_semantic_sites.find(addr);
+    if (semantic_site != config_.ws_cull_semantic_sites.end()) {
+        const PsxWsCullSemantic semantic = semantic_site->second;
+        switch (semantic) {
+        case PSX_WS_CULL_SEMANTIC_SCREEN_BIAS:
+            if (opcode == 0x08 || opcode == 0x09) {  // addi / addiu
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t imm = get_imm16(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_screen_bias({}, {});"
+                    "  /* semantic guest cull: screen bias */{}",
+                    reg_name(rt), reg_name(rs), (int)imm, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic screen_bias site 0x{:08X} is not addi/addiu\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_WORLD_RANGE:
+            if (opcode == 0x0B) {  // sltiu
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t imm = get_imm16(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_world_range({}, {});"
+                    "  /* semantic guest cull: world range */{}",
+                    reg_name(rt), reg_name(rs), (int)imm, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic world_range site 0x{:08X} is not sltiu\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_LEFT_EDGE:
+            if (opcode == 0x00 && get_funct(instr) == 0x23 &&
+                get_rs(instr) == 0) {  // subu rd,zero,rt
+                uint32_t rt = get_rt(instr), rd = get_rd(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_left_edge({});"
+                    "  /* semantic guest cull: left edge */{}",
+                    reg_name(rd), reg_name(rt), comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic left_edge site 0x{:08X} is not subu rd,zero,rt\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_MASKED_SCREEN_X:
+            if (opcode == 0x0B) {  // sltiu
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                uint16_t imm = get_imm16_u(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_masked_screen_x({}, {});"
+                    "  /* semantic guest cull: masked screen X */{}",
+                    reg_name(rt), reg_name(rs), (unsigned)imm, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic masked_screen_x site 0x{:08X} is not sltiu\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X:
+            if (opcode == 0x23) {  // lw
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t offset = get_imm16(instr);
+                std::string laddr = offset == 0
+                    ? reg_name(rs)
+                    : fmt::format("{} + {}", reg_name(rs), (int)offset);
+                uint32_t mask = 1u << rs;
+                return fmt::format(
+                    "{} = (uint32_t)psx_ws_guest_cull_frustum_plane_x("
+                    "(int32_t)psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                    "  /* semantic guest cull: frustum plane X */{}",
+                    reg_name(rt), laddr, rt, mask, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic frustum_plane_x site 0x{:08X} is not lw\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X:
+            if (opcode == 0x0A) {  // slti
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t imm = get_imm16(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_signed_screen_x((int32_t){}, {});"
+                    "  /* semantic guest cull: signed screen X */{}",
+                    reg_name(rt), reg_name(rs), (int)imm, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic signed_screen_x site 0x{:08X} is not slti\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_DEPTH_BOUND:
+            if (opcode == 0x0A) {  // slti
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t imm = get_imm16(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_depth_signed((int32_t){}, {});"
+                    "  /* semantic guest cull: signed depth bound */{}",
+                    reg_name(rt), reg_name(rs), (int)imm, comment);
+            }
+            if (opcode == 0x0B) {  // sltiu
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t imm = get_imm16(instr);
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_depth_unsigned({}, {});"
+                    "  /* semantic guest cull: unsigned depth bound */{}",
+                    reg_name(rt), reg_name(rs), (int)imm, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic depth_bound site 0x{:08X} is not slti/sltiu\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_XCLIP_BOUND:
+            if (opcode == 0x23) {  // lw
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t offset = get_imm16(instr);
+                std::string laddr = offset == 0
+                    ? reg_name(rs)
+                    : fmt::format("{} + {}", reg_name(rs), (int)offset);
+                uint32_t mask = 1u << rs;
+                return fmt::format(
+                    "{} = psx_ws_guest_cull_xclip_bound(psx_cyc_load_word(cpu, {}, {}, 0x{:X}u));"
+                    "  /* semantic guest cull: X clip bound */{}",
+                    reg_name(rt), laddr, rt, mask, comment);
+            }
+            if (!config_.overlay_mode)
+                fmt::print(stderr,
+                           "ERROR: semantic xclip_bound site 0x{:08X} is not lw\n",
+                           addr);
+            break;
+        case PSX_WS_CULL_SEMANTIC_NONE:
+        default:
+            break;
+        }
+        if (semantic != PSX_WS_CULL_SEMANTIC_NONE && !config_.overlay_mode)
+            std::exit(1);
     }
 
     // Widescreen cull-margin widening ([widescreen.cull] sites). Emit the
@@ -1356,8 +1617,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                         }
                     } else if ((cop_op & 0x10) != 0) { // GTE command (bit 25 set)
                         uint32_t gte_cmd = instr & 0x1FFFFFF;
-                        // Route ALL GTE commands through gte_execute() for correct behavior
-                        code = fmt::format("gte_execute(cpu, 0x{:07X});  /* gte cmd 0x{:02X} */", gte_cmd, gte_cmd & 0x3F);
+                        code = fmt::format(
+                            "gte_execute_at(cpu, 0x{:07X}, 0x{:08X}u);  /* gte cmd 0x{:02X} */",
+                            gte_cmd, addr, gte_cmd & 0x3F);
                     } else {
                         code = fmt::format("/* cop2: 0x{:08X} */", instr);
                     }
@@ -1419,16 +1681,28 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     std::string value = PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rt))
                         ? fmt::format("gte_read_data(cpu, {})", rt)
                         : fmt::format("cpu->gte_data[{}]", rt);
+                    const bool resident_ft4_store = !config_.overlay_mode &&
+                        ((addr == XG_RESIDENT_FT4_FIRST_STORE &&
+                          instr == XG_RESIDENT_FT4_FIRST_INSTRUCTION) ||
+                         (addr == XG_RESIDENT_FT4_SECOND_STORE &&
+                          instr == XG_RESIDENT_FT4_SECOND_INSTRUCTION));
+                    const std::string resident_pre = resident_ft4_store
+                        ? fmt::format("psx_xg_render_auth_resident_ft4_observe(cpu, 0u, 0x{:08X}u, 0x{:08X}u); ", addr, instr)
+                        : "";
+                    const std::string resident_commit = resident_ft4_store
+                        ? fmt::format(" psx_xg_render_auth_resident_ft4_observe(cpu, 1u, 0x{:08X}u, 0x{:08X}u);", addr, instr)
+                        : "";
                     std::string swc2_store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
                     if (offset == 0) {
-                        code = gte_stall + swc2_store_pc + fmt::format(
-                            "psx_store_cycle_barrier(); cpu->write_word({}, {}); gte_precision_store_word({}, {});  /* swc2 gte[{}], ({}) */",
-                            reg_name(rs), value, reg_name(rs), rt, rt, reg_name(rs));
+                        code = gte_stall + resident_pre + swc2_store_pc + fmt::format(
+                            "psx_store_cycle_barrier(); cpu->write_word({}, {}); gte_precision_store_word({}, {});{}  /* swc2 gte[{}], ({}) */",
+                            reg_name(rs), value, reg_name(rs), rt,
+                            resident_commit, rt, reg_name(rs));
                     } else {
-                        code = gte_stall + swc2_store_pc + fmt::format(
-                            "psx_store_cycle_barrier(); cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
+                        code = gte_stall + resident_pre + swc2_store_pc + fmt::format(
+                            "psx_store_cycle_barrier(); cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});{}  /* swc2 gte[{}], {}({}) */",
                             reg_name(rs), offset, value, reg_name(rs), offset, rt,
-                            rt, offset, reg_name(rs));
+                            resident_commit, rt, offset, reg_name(rs));
                     }
                 }
                 break;
@@ -1437,7 +1711,17 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
     }
 
-    return config_.indent + code + comment;
+    const auto *source_site = source_observation_site(config_, addr, instr);
+    if (config_.overlay_mode && source_site != nullptr) {
+        return config_.indent + static_auth_hook +
+               xg_render_source_observation_hook(
+                   "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE", addr, instr, source_site) + " " +
+               code + " " +
+               xg_render_source_observation_hook(
+                   "PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT", addr, instr, source_site) + comment;
+    }
+
+    return config_.indent + static_auth_hook + code + comment;
 }
 
 std::string CodeGenerator::translate_basic_block(
@@ -1633,15 +1917,101 @@ std::string CodeGenerator::translate_basic_block(
         }
 
         if (!is_cf) {
+            const auto *cutover = native_cutover_site(config_, addr, instr);
+            const bool observe_after = cutover != nullptr &&
+                cutover->transfer ==
+                    CodeGenConfig::NativeCutoverTransfer::ObserveAfter;
+            if (cutover != nullptr) {
+                const char *callback = native_cutover_callback(config_);
+                if (cutover->transfer ==
+                        CodeGenConfig::NativeCutoverTransfer::Local &&
+                    !cfg.blocks.count(cutover->continuation)) {
+                    throw std::runtime_error(fmt::format(
+                        "native cutover at 0x{:08X} has non-local continuation 0x{:08X}",
+                        addr, cutover->continuation));
+                }
+                if (cutover->transfer ==
+                    CodeGenConfig::NativeCutoverTransfer::Local) {
+                    ss << config_.indent
+                       << fmt::format(
+                               "if ({}(cpu, "
+                               "0x{:08X}u, 0x{:08X}u)) {{ cpu->pc = 0u; "
+                                "goto block_{:08X}; }}\n",
+                                callback, addr, instr, cutover->continuation);
+                } else if (cutover->transfer ==
+                           CodeGenConfig::NativeCutoverTransfer::Observe) {
+                    ss << config_.indent
+                       << fmt::format(
+                               "(void){}(cpu, "
+                               "0x{:08X}u, 0x{:08X}u);\n",
+                               callback, addr, instr);
+                } else if (cutover->transfer ==
+                           CodeGenConfig::NativeCutoverTransfer::ObserveAfter) {
+                    /* Emitted after the translated instruction so SWC2 observers
+                     * see the post-interlock register and committed store. */
+                } else if (cps_enabled_) {
+                    ss << config_.indent
+                       << fmt::format(
+                               "if ({}(cpu, "
+                               "0x{:08X}u, 0x{:08X}u)) {{ cpu->pc = "
+                               "cpu->gpr[31]; return; }}\n",
+                               callback, addr, instr);
+                } else {
+                    ss << config_.indent
+                       << fmt::format(
+                               "if ({}(cpu, "
+                               "0x{:08X}u, 0x{:08X}u)) return;\n",
+                               callback, addr, instr);
+                }
+            }
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
             ss << translate_instruction(addr, instr) << "\n";
+            if (observe_after) {
+                ss << config_.indent
+                   << fmt::format(
+                          "(void){}(cpu, 0x{:08X}u, 0x{:08X}u);\n",
+                          native_cutover_callback(config_), addr, instr);
+            }
             emit_cosim_instr(addr, config_.indent);
         } else {
             // Control flow is handled at block exit
             if (addr == exit_branch_addr) {
                 std::string delay_saved_cond;    // branch condition captured before delay
                 std::string delay_saved_target;  // JR/JALR target captured before delay
+
+                const auto *cutover = native_cutover_site(config_, addr, instr);
+                if (cutover != nullptr) {
+                    const char *callback = native_cutover_callback(config_);
+                    if (cutover->transfer ==
+                            CodeGenConfig::NativeCutoverTransfer::Local &&
+                        !cfg.blocks.count(cutover->continuation)) {
+                        throw std::runtime_error(fmt::format(
+                            "native cutover at 0x{:08X} has non-local continuation 0x{:08X}",
+                            addr, cutover->continuation));
+                    }
+                    if (cutover->transfer ==
+                        CodeGenConfig::NativeCutoverTransfer::Local) {
+                        ss << config_.indent
+                           << fmt::format(
+                                  "if ({}(cpu, "
+                                  "0x{:08X}u, 0x{:08X}u)) {{ cpu->pc = 0u; "
+                                  "goto block_{:08X}; }}\n",
+                                  callback, addr, instr,
+                                  cutover->continuation);
+                    } else if (cutover->transfer ==
+                               CodeGenConfig::NativeCutoverTransfer::Observe) {
+                        ss << config_.indent
+                           << fmt::format(
+                                  "(void){}(cpu, "
+                                  "0x{:08X}u, 0x{:08X}u);\n",
+                                  callback, addr, instr);
+                    } else {
+                        throw std::runtime_error(fmt::format(
+                            "post/return native cutover at control flow 0x{:08X} is unsupported",
+                            addr));
+                    }
+                }
 
                 const uint32_t branch_opcode =
                     (block.exit_instr.instruction >> 26) & 0x3Fu;
@@ -1702,10 +2072,38 @@ std::string CodeGenerator::translate_basic_block(
                 }
 
                 if (block.exit_instr.type == ControlFlowType::JumpLink) {
+                    const auto *source_site = source_observation_site(
+                        config_, addr, block.exit_instr.instruction);
+                    if (config_.overlay_mode && source_site != nullptr) {
+                        ss << config_.indent
+                           << xg_render_source_observation_hook(
+                                   "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE", addr,
+                                   block.exit_instr.instruction, source_site)
+                           << "\n";
+                        if (source_site->operation ==
+                            CodeGenConfig::SourceObservationOperation::Call) {
+                            ss << config_.indent
+                               << fmt::format(
+                                      "bool _xg_native_bypass_{:08X} = "
+                                      "psx_xg_render_native_ft4_bypass(cpu, "
+                                      "0x{:08X}u, 0x{:08X}u);\n",
+                                      addr, addr,
+                                      block.exit_instr.instruction);
+                        }
+                    }
                     ss << config_.indent
                        << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
                                       addr + 8);
                 } else if (block.exit_instr.type == ControlFlowType::JumpLinkReg) {
+                    const auto *source_site = source_observation_site(
+                        config_, addr, block.exit_instr.instruction);
+                    if (config_.overlay_mode && source_site != nullptr) {
+                        ss << config_.indent
+                           << xg_render_source_observation_hook(
+                                  "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE", addr,
+                                  block.exit_instr.instruction, source_site)
+                           << "\n";
+                    }
                     uint32_t rd = get_rd(block.exit_instr.instruction);
                     if (rd != 0) {
                         ss << config_.indent
@@ -1746,6 +2144,23 @@ std::string CodeGenerator::translate_basic_block(
                     {
                         uint32_t delay_instr = *delay_instr_opt;
 
+                        if (config_.overlay_mode &&
+                            block.exit_instr.type == ControlFlowType::JumpLink) {
+                            const auto* lifecycle = render_lifecycle_site(config_, addr);
+                            if (lifecycle != nullptr &&
+                                lifecycle->role == CodeGenConfig::RenderLifecycleRole::Capture &&
+                                lifecycle->instruction == block.exit_instr.instruction) {
+                                ss << config_.indent << render_lifecycle_hook(*lifecycle) << "\n";
+                            } else {
+                                ss << config_.indent
+                                   << fmt::format("psx_xg_render_auth(cpu, "
+                                                  "PSX_XG_RENDER_AUTH_HOOK_INTERNAL_OBSERVATION, "
+                                                  "0x{:08X}u, 0x{:08X}u, 0x{:08X}u);\n",
+                                                  addr, block.exit_instr.instruction,
+                                                  delay_instr);
+                            }
+                        }
+
                         // For branch-likely variants, delay slot is conditional
                         if (block.exit_instr.is_likely) {
                             ss << config_.indent << "/* delay slot (likely) - conditional execution */\n";
@@ -1776,6 +2191,15 @@ std::string CodeGenerator::translate_basic_block(
                 }
 
                 // Now emit the branch/jump
+                const auto *source_site = source_observation_site(
+                    config_, addr, block.exit_instr.instruction);
+                if (config_.overlay_mode && source_site != nullptr) {
+                    ss << config_.indent
+                       << xg_render_source_observation_hook(
+                              "PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT", addr,
+                              block.exit_instr.instruction, source_site)
+                       << "\n";
+                }
                 if (block.exit_instr.type == ControlFlowType::Branch) {
                     // Conditional branch - use pre-captured condition if available
                     std::string condition = delay_saved_cond.empty()
@@ -2000,6 +2424,20 @@ std::string CodeGenerator::translate_basic_block(
                 } else if (block.exit_instr.type == ControlFlowType::JumpLink) {
                     uint32_t target   = block.exit_instr.target;
                     uint32_t cont_addr = block.exit_instr.address + 8;
+                    const bool has_native_bypass = config_.overlay_mode &&
+                        source_site != nullptr &&
+                        source_site->operation ==
+                            CodeGenConfig::SourceObservationOperation::Call;
+                    const std::string native_bypass =
+                        fmt::format("_xg_native_bypass_{:08X}", addr);
+                    if (xg_static_auth_hooks_active_ && addr == XG_STATIC_AUTH_CALLER_SITE) {
+                        const uint32_t delay = *exe_.read_word(addr + 4u);
+                        ss << config_.indent
+                           << fmt::format(
+                               "psx_xg_render_static_auth_capture(0x800781BCu, "
+                               "0x8004B54Cu, 0x800781C4u, 0x{:08X}u, 0x{:08X}u);\n",
+                               block.exit_instr.instruction, delay);
+                    }
                     if (cps_enabled_) {
                         // CPS: tail-transfer to the callee. Set $ra to the
                         // return point and register it as a dispatchable
@@ -2014,6 +2452,15 @@ std::string CodeGenerator::translate_basic_block(
                         if (!block.successors.empty()) {
                             cps_cur_continuations_.push_back(cont_addr);
                         }
+                        if (config_.overlay_mode) {
+                            cps_cur_direct_jal_continuations_.insert(cont_addr);
+                        }
+                        if (has_native_bypass) {
+                            ss << config_.indent << "if (" << native_bypass
+                               << ") { cpu->pc = "
+                               << fmt::format("0x{:08X}u", cont_addr)
+                               << "; return; }\n";
+                        }
                         ss << emit_interrupt_check(target, config_.indent);
                         ss << config_.indent
                            << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS jal -> 0x{:08X} */\n",
@@ -2022,6 +2469,9 @@ std::string CodeGenerator::translate_basic_block(
                     // Function call (jal).  The call contract (Bug D family)
                     // guards the continuation: it may only run if the guest
                     // actually returned here with the caller's $sp.
+                    if (has_native_bypass)
+                        ss << config_.indent << "if (!" << native_bypass
+                           << ") {\n";
                     ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
                     ss << emit_interrupt_check(target, config_.indent);
                     if (known_functions_.count(target) > 0) {
@@ -2032,6 +2482,13 @@ std::string CodeGenerator::translate_basic_block(
                         /* psx_dispatch_call validated the (ra, sp) contract;
                          * only propagate an active bail unwind here. */
                         ss << config_.indent << "if (g_psx_call_bail) return; (void)_csp; }\n";
+                    }
+                    if (has_native_bypass)
+                        ss << config_.indent << "}\n";
+                    if (config_.overlay_mode) {
+                        const auto hook = overlay_continuation_hook(config_, cont_addr);
+                        if (hook.has_value() && !hook->empty())
+                            ss << config_.indent << *hook << "\n";
                     }
                     if (!block.successors.empty()) {
                         ss << config_.indent
@@ -2143,6 +2600,17 @@ bool CodeGenerator::func_has_screen_extent_cull(const ControlFlowGraph& cfg) con
     return false;
 }
 
+bool CodeGenerator::static_auth_sites_are_valid() const {
+    const auto call = exe_.read_word(XG_STATIC_AUTH_CALLER_SITE);
+    const auto delay = exe_.read_word(XG_STATIC_AUTH_CALLER_SITE + 4u);
+
+    return call.has_value() && delay.has_value() &&
+           (*call >> 26u) == 0x03u &&
+           ((XG_STATIC_AUTH_CALLER_SITE & 0xF0000000u) |
+            ((*call & 0x03FFFFFFu) << 2u)) == XG_STATIC_AUTH_CALLEE_ENTRY &&
+           !is_static_auth_control_transfer(*delay);
+}
+
 int CodeGenerator::detect_cull_bltz_sites(const ControlFlowGraph& cfg) {
     // Populate ws_cull_bltz_pcs_ with the function's LEFT-edge funnel bltz
     // addresses (ws_cull_detect.h idioms 2/3). Only meaningful when the
@@ -2201,6 +2669,9 @@ GeneratedFunction CodeGenerator::generate_function(
 
     GeneratedFunction result;
     result.function_name = func.name;
+    xg_static_auth_hooks_active_ = !config_.overlay_mode &&
+                                   func.start_addr == XG_STATIC_AUTH_PRODUCER_ENTRY &&
+                                   static_auth_sites_are_valid();
     {
         std::string sig;
         if (config_.hot_funcs.count(func.start_addr)) {
@@ -2241,6 +2712,7 @@ GeneratedFunction CodeGenerator::generate_function(
     // blocks are translated, so the entry-switch below can route a dispatched
     // continuation address into the right block.
     cps_cur_continuations_.clear();
+    cps_cur_direct_jal_continuations_.clear();
 
     // Translate blocks into a temp buffer first: the CPS entry-switch is emitted
     // at the top (before the entry hooks) and must know every continuation.
@@ -2297,10 +2769,26 @@ GeneratedFunction CodeGenerator::generate_function(
         body_ss << config_.indent << "    switch (_cont) {\n";
         for (uint32_t c : cps_cur_continuations_) {
             if (!seen.insert(c).second) continue;
+            const bool direct_jal_continuation =
+                config_.overlay_mode &&
+                (cps_cur_direct_jal_continuations_.count(c) != 0u ||
+                 cps_pass_direct_jal_continuations_.count(c) != 0u);
             if (partial_block_cycle_count(c, cfg) != 0) {
                 body_ss << config_.indent << fmt::format("        case 0x{:08X}u:\n", c);
+                if (direct_jal_continuation) {
+                    const auto hook = overlay_continuation_hook(config_, c);
+                    if (hook.has_value() && !hook->empty())
+                        body_ss << config_.indent << "            " << *hook << "\n";
+                }
                 body_ss << emit_mid_block_cycle_charge(c, cfg, config_.indent + "            ");
                 body_ss << config_.indent << fmt::format("            goto block_{:08X};\n", c);
+            } else if (direct_jal_continuation) {
+                body_ss << config_.indent << fmt::format("        case 0x{:08X}u:\n", c);
+                const auto hook = overlay_continuation_hook(config_, c);
+                if (hook.has_value() && !hook->empty())
+                    body_ss << config_.indent << "            " << *hook << "\n";
+                body_ss << config_.indent
+                        << fmt::format("            goto block_{:08X};\n", c);
             } else {
                 body_ss << config_.indent
                         << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
@@ -2318,9 +2806,18 @@ GeneratedFunction CodeGenerator::generate_function(
             // dispatch to route it to the sanctioned dirty-RAM interpreter
             // (psx_native_bad_entry). NEVER run from the top.
             if (seen.insert(func.start_addr).second) {
-                body_ss << config_.indent
-                        << fmt::format("        case 0x{:08X}u: break;  /* entry at prologue */\n",
-                                       func.start_addr);
+                if (cps_pass_direct_jal_continuations_.count(func.start_addr) != 0u) {
+                    body_ss << config_.indent
+                            << fmt::format("        case 0x{:08X}u:\n", func.start_addr);
+                    const auto hook = overlay_continuation_hook(config_, func.start_addr);
+                    if (hook.has_value() && !hook->empty())
+                        body_ss << config_.indent << "            " << *hook << "\n";
+                    body_ss << config_.indent << "            break;\n";
+                } else {
+                    body_ss << config_.indent
+                            << fmt::format("        case 0x{:08X}u: break;  /* entry at prologue */\n",
+                                           func.start_addr);
+                }
             }
             body_ss << config_.indent
                     << fmt::format("        default: cpu->pc = _cont; "
@@ -2340,6 +2837,21 @@ GeneratedFunction CodeGenerator::generate_function(
     body_ss << config_.indent
             << fmt::format("debug_server_log_call_entry(0x{:08X}u);\n",
                           func.start_addr);
+    if (config_.overlay_mode) {
+        const auto* lifecycle = render_lifecycle_site(config_, func.start_addr);
+        if (lifecycle != nullptr &&
+            lifecycle->role == CodeGenConfig::RenderLifecycleRole::Entry) {
+            body_ss << config_.indent << render_lifecycle_hook(*lifecycle) << "\n";
+        } else {
+            body_ss << config_.indent
+                    << fmt::format("psx_xg_render_auth(cpu, PSX_XG_RENDER_AUTH_HOOK_PRODUCER_ENTRY, "
+                                   "0x{:08X}u, 0u, 0u);\n", func.start_addr);
+        }
+    }
+    if (xg_static_auth_hooks_active_) {
+        body_ss << config_.indent
+                << "psx_xg_render_static_auth_entry(0x80075B44u);\n";
+    }
     {
         const auto vq = config_.vsync_query_hle_funcs.find(func.start_addr);
         if (vq != config_.vsync_query_hle_funcs.end()) {
@@ -2477,6 +2989,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
 
     std::vector<GeneratedFunction> results;
     if (aliases.empty()) return results;
+    xg_static_auth_hooks_active_ = false;
     uint32_t host = aliases[0]->alias_walk_lo;
 
     // Widescreen auto cull (gated): set per-group so a stale value from the last
@@ -2503,6 +3016,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // translation (also prevents a stale list from leaking into the next
     // generate_function call).
     cps_cur_continuations_.clear();
+    cps_cur_direct_jal_continuations_.clear();
 
     // Union of blocks reachable from any alias entry. Edges are
     // BasicBlock::successors plus jump-table targets (mapped to their
@@ -2582,8 +3096,21 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         body << config_.indent << "    switch (_cont) {\n";
         for (uint32_t c : cps_cur_continuations_) {
             if (!seen.insert(c).second) continue;
-            body << config_.indent
-                 << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            const bool direct_jal_continuation =
+                config_.overlay_mode &&
+                (cps_cur_direct_jal_continuations_.count(c) != 0u ||
+                 cps_pass_direct_jal_continuations_.count(c) != 0u);
+            if (direct_jal_continuation) {
+                body << config_.indent << fmt::format("        case 0x{:08X}u:\n", c);
+                const auto hook = overlay_continuation_hook(config_, c);
+                if (hook.has_value() && !hook->empty())
+                    body << config_.indent << "            " << *hook << "\n";
+                body << config_.indent
+                     << fmt::format("            goto block_{:08X};\n", c);
+            } else {
+                body << config_.indent
+                     << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            }
             cps_continuation_owner_[c] = aliases[0]->start_addr;
         }
         if (config_.overlay_mode) {
@@ -2593,9 +3120,19 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
             // its block, exactly as the entry switch below would.
             for (const Function* a : aliases) {
                 if (!seen.insert(a->start_addr).second) continue;
-                body << config_.indent
-                     << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n",
-                                    a->start_addr, a->start_addr);
+                if (cps_pass_direct_jal_continuations_.count(a->start_addr) != 0u) {
+                    body << config_.indent
+                         << fmt::format("        case 0x{:08X}u:\n", a->start_addr);
+                    const auto hook = overlay_continuation_hook(config_, a->start_addr);
+                    if (hook.has_value() && !hook->empty())
+                        body << config_.indent << "            " << *hook << "\n";
+                    body << config_.indent
+                         << fmt::format("            goto block_{:08X};\n", a->start_addr);
+                } else {
+                    body << config_.indent
+                         << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n",
+                                        a->start_addr, a->start_addr);
+                }
             }
             // FAIL CLOSED on any other interior PC (same contract as
             // generate_function's overlay entry switch, PR #46). The old
@@ -2686,6 +3223,19 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
     // game dispatch table (psx_dispatch_game_compiled) reflects exactly the
     // functions emitted here (the final generate_file pass is authoritative).
     cps_continuation_owner_.clear();
+    cps_pass_direct_jal_continuations_.clear();
+    if (cps_enabled_ && config_.overlay_mode) {
+        for (const auto& [function_addr, cfg] : cfgs) {
+            (void)function_addr;
+            for (const auto& [block_addr, block] : cfg.blocks) {
+                (void)block_addr;
+                if (block.exit_instr.type == ControlFlowType::JumpLink) {
+                    cps_pass_direct_jal_continuations_.insert(
+                        block.exit_instr.address + 8u);
+                }
+            }
+        }
+    }
     alias_body_decls_.clear();
 
     fmt::print("\n=== C Code Generation ===\n\n");
@@ -2804,6 +3354,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
     fmt::print("✓ Generated {} functions\n", results.size());
     fmt::print("✓ Total C code: {} lines\n\n", total_lines);
 
+    cps_pass_direct_jal_continuations_.clear();
     return results;
 }
 
@@ -2821,10 +3372,19 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
+    if (!config_.overlay_mode) {
+        ss << "extern void psx_xg_render_static_auth_entry(uint32_t producer_entry);\n";
+        ss << "extern void psx_xg_render_static_auth_capture(uint32_t caller_site, uint32_t callee_entry, uint32_t return_site, uint32_t instruction_word, uint32_t delay_slot_word);\n";
+        ss << "extern void psx_xg_render_static_auth_return(uint32_t return_site, uint32_t return_address);\n";
+        ss << "extern bool psx_xg_render_auth_resident_ft4_observe(CPUState* cpu, uint32_t stage, uint32_t pc, uint32_t instruction_word);\n";
+        if (!config_.native_cutover_sites.empty())
+            ss << "extern bool psx_xg_render_auth_native_ft4_bypass(CPUState* cpu, uint32_t pc, uint32_t instruction_word);\n";
+    }
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int32_t psx_ws_player_x_bound(int32_t vanilla);  /* typed gameplay X bound */\n";
+    ss << "extern int32_t psx_xenogears_field_frame_step(uint32_t, uint32_t, int32_t, uint32_t, uint32_t);\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
@@ -2832,6 +3392,15 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
     ss << "extern int32_t psx_ws_plane_nx(int32_t nx);                /* ws side-plane normal-X scale (gpu.c) */\n";
     ss << "extern uint32_t psx_ws_xclip_bound(uint32_t vanilla);      /* ws per-prim X reject bound load (gpu.c) */\n";
+    ss << "extern uint32_t psx_ws_guest_cull_screen_bias(uint32_t value, int32_t immediate);\n";
+    ss << "extern int  psx_ws_guest_cull_world_range(uint32_t value, int32_t immediate);\n";
+    ss << "extern uint32_t psx_ws_guest_cull_left_edge(uint32_t bound);\n";
+     ss << "extern int  psx_ws_guest_cull_masked_screen_x(uint32_t x, uint32_t bound);\n";
+     ss << "extern int32_t psx_ws_guest_cull_frustum_plane_x(int32_t nx);\n";
+     ss << "extern int  psx_ws_guest_cull_signed_screen_x(int32_t value, int32_t immediate);\n";
+     ss << "extern int  psx_ws_guest_cull_depth_signed(int32_t value, int32_t immediate);\n";
+     ss << "extern int  psx_ws_guest_cull_depth_unsigned(uint32_t value, int32_t immediate);\n";
+     ss << "extern uint32_t psx_ws_guest_cull_xclip_bound(uint32_t vanilla);\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";

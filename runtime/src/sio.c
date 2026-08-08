@@ -62,6 +62,7 @@ static uint8_t analog_mode_locked[2] = { 0, 0 };
 
 /* Which slots have devices connected */
 static uint8_t pad_connected = 0;
+static SioPadReceipt sio_pad_receipt;
 
 /* Pad communication state machine */
 typedef enum {
@@ -799,6 +800,13 @@ static void pad_process_byte(uint8_t tx_byte) {
             pad_response[1] = 0x5A;
             pad_response[2] = (uint8_t)(btn & 0xFF);
             pad_response[3] = (uint8_t)(btn >> 8);
+            sio_pad_receipt.polls++;
+            sio_pad_receipt.slot = (uint8_t)selected_slot;
+            sio_pad_receipt.id = cur_id;
+            sio_pad_receipt.ack = 0x5A;
+            sio_pad_receipt.buttons_low = pad_response[2];
+            sio_pad_receipt.buttons_high = pad_response[3];
+            sio_pad_receipt.analog = pad_analog[selected_slot];
             if (pad_analog[selected_slot] || pad_in_config[selected_slot]) {
                 pad_response[4] = pad_stick[selected_slot][2]; /* right X */
                 pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
@@ -978,6 +986,10 @@ static void pad_process_byte(uint8_t tx_byte) {
 
     sio_stat |= SIO_STAT_RX_RDY;
     sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+}
+
+void sio_get_pad_receipt(SioPadReceipt *out) {
+    if (out) *out = sio_pad_receipt;
 }
 
 static void mc_process_byte(uint8_t tx_byte) {

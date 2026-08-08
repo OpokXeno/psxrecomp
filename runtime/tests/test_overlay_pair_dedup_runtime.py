@@ -20,6 +20,8 @@ TESTS = RUNTIME / "tests"
 GAME = "PAIR-TEST"
 PAIR = 0x1020304050607080
 RESIDENT = "psxrecomp bios resident shard v1\n"
+GAME_SHA256 = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+MANIFEST_SHA256 = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
 
 
 def codegen_leaf() -> str:
@@ -38,6 +40,10 @@ def codegen_leaf() -> str:
         if match:
             code_hash = match.group(1).lower()
     return f"cg{version}_{code_hash}"
+
+
+def identity_namespace() -> str:
+    return f"game_{GAME_SHA256}/manifest_{MANIFEST_SHA256}"
 
 
 def arch_abi() -> str:
@@ -68,11 +74,20 @@ def run(command: list[str], *, cwd: pathlib.Path | None = None) -> None:
         print(result.stdout.strip())
 
 
-def manifest(entries: list[tuple[int, int]], provenance: str | None = None) -> str:
+def manifest(entries: list[tuple[int, int]], provenance: str | None = None,
+              artifact: tuple[int, int, int] = (0x80010000, 16, 0x11111111),
+              include_identity: bool = True,
+              lowercase_identity: bool = False) -> str:
     lines = []
     if provenance:
         lines.append(f"# psxrecomp overlay provenance {provenance}\n")
     lines.append(f"P {PAIR:016X}\n")
+    if include_identity:
+        game_identity = GAME_SHA256.lower() if lowercase_identity else GAME_SHA256.upper()
+        manifest_identity = (MANIFEST_SHA256.lower()
+                             if lowercase_identity else MANIFEST_SHA256.upper())
+        lines.append(f"I {game_identity} {manifest_identity}\n")
+    lines.append(f"A {artifact[0]:08X} {artifact[1]:08X} {artifact[2]:08X}\n")
     for entry, length in entries:
         crc = zlib.crc32(bytes(length)) & 0xFFFFFFFF
         lines.append(f"F {entry:08X} {crc:08X}\n")
@@ -99,12 +114,17 @@ def compile_harness(gcc: str, out: pathlib) -> None:
         "-DPSX_NO_DEBUG_TOOLS",
         "-DPSX_OVERLAY_DLL_BUILD",
         "-DPSX_OVERLAY_TEST_CANDIDATE_CAP=4", f"-I{RUNTIME / 'include'}",
+        f"-I{ROOT.parent / 'native_renderer' / 'include'}",
         *platform_defines,
         str(RUNTIME / "src" / "overlay_loader.c"),
+        str(RUNTIME / "src" / "native_render_baseline.c"),
+        str(RUNTIME / "src" / "game_identity.c"),
         str(RUNTIME / "src" / "overlay_path_canon.c"),
         str(RUNTIME / "src" / "overlay_posix.c"),
         str(RUNTIME / "src" / "crc32.c"),
         str(TESTS / "overlay_pair_dedup_harness.c"), "-o", str(out),
+        f'-DPSX_GAME_EXTRA_IDENTITY_SHA256="{GAME_SHA256}"',
+        f'-DPSX_GAME_MANIFEST_DIGEST_SHA256="{MANIFEST_SHA256}"',
     ]
     if platform.system() != "Windows":
         command += ["-ldl", "-pthread"]
@@ -112,8 +132,11 @@ def compile_harness(gcc: str, out: pathlib) -> None:
 
 
 def publish(cache: pathlib.Path, tier: str, filename: str, library: pathlib.Path,
-            text: str, *, pending: bool = False) -> pathlib.Path:
-    leaf = cache / GAME / tier / arch_abi() / codegen_leaf()
+            text: str, *, pending: bool = False, namespaced: bool = True) -> pathlib.Path:
+    leaf = cache / GAME
+    if namespaced:
+        leaf /= identity_namespace()
+    leaf /= pathlib.Path(tier) / arch_abi() / codegen_leaf()
     leaf.mkdir(parents=True, exist_ok=True)
     target = leaf / filename
     disk_target = pathlib.Path(f"{target}.pending") if pending else target
@@ -140,21 +163,30 @@ def scenario(tmp: pathlib.Path, harness: pathlib.Path, full_first: pathlib.Path,
     first_manifest = manifest(four if name == "alias-at-cap" else two)
     second_manifest = first_manifest
     first_library = partial if name == "partial-first" else full_first
+    rejects = name in ("missing-identity", "lowercase-identity", "flat-cache")
+    if name == "missing-identity":
+        first_manifest = manifest(two, include_identity=False)
+        second_manifest = first_manifest
+    if name == "lowercase-identity":
+        first_manifest = manifest(two, lowercase_identity=True)
+        second_manifest = first_manifest
     if name == "manifest-mismatch":
         second_manifest = manifest([(0x80010000, 8), (0x80010004, 4)])
     elif name == "provenance-mismatch":
         second_manifest = manifest(two, "hosted-v1")
+    elif name == "artifact-mismatch":
+        second_manifest = manifest(two, artifact=(0x80011000, 16, 0x22222222))
 
-    # Exercise the current transaction-bound name and the legacy additive name.
-    first = publish(cache, first_tier, f"00010000_11111111{ext}",
-                    first_library, first_manifest)
+    first = publish(cache, first_tier, f"00010000_11111111_AAAAAAAA{ext}",
+                    first_library, first_manifest, namespaced=name != "flat-cache")
     second = publish(cache, second_tier, f"00011000_22222222_BBBBBBBB{ext}",
-                     full_second, second_manifest, pending=True)
+                     full_second, second_manifest, pending=True,
+                     namespaced=name != "flat-cache")
     trace = tmp / f"trace-{name}.log"
     os.environ["PSX_PAIR_TEST_TRACE"] = str(trace)
     run([str(harness), str(cache), name, str(first), str(second)])
-    observed = trace.read_text(encoding="ascii").splitlines()
-    expected = (["init 1", "call 1", "flush 1"] if name == "alias-at-cap"
+    observed = trace.read_text(encoding="ascii").splitlines() if trace.exists() else []
+    expected = ([] if rejects else ["init 1", "call 1", "flush 1"] if name == "alias-at-cap"
                 else ["init 2"] if name == "partial-first"
                 else ["init 1", "init 2"])
     if observed != expected:
@@ -182,7 +214,9 @@ def main() -> int:
         compile_fixture(args.gcc, partial, instance=1, partial=True)
         compile_harness(args.gcc, harness)
         for name in ("alias-at-cap", "manifest-mismatch",
-                     "provenance-mismatch", "cross-tier", "partial-first"):
+                       "provenance-mismatch", "artifact-mismatch", "cross-tier",
+                       "partial-first", "missing-identity", "lowercase-identity",
+                       "flat-cache"):
             scenario(tmp, harness, full_first, full_second, partial, name)
     print("PASS: executable overlay whole-pair dedup behavior")
     return 0

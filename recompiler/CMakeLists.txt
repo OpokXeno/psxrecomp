@@ -4,6 +4,21 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 
+set(PSX_GAME_EXTRA_IDENTITY_SHA256 "" CACHE STRING
+    "Full SHA-256 identity for the game image emitted by psxrecomp-game")
+set(PSX_GAME_MANIFEST_DIGEST_SHA256 "" CACHE STRING
+    "Full SHA-256 digest for the game manifest emitted by psxrecomp-game")
+string(LENGTH "${PSX_GAME_EXTRA_IDENTITY_SHA256}" PSX_GAME_EXTRA_IDENTITY_SHA256_LENGTH)
+string(LENGTH "${PSX_GAME_MANIFEST_DIGEST_SHA256}" PSX_GAME_MANIFEST_DIGEST_SHA256_LENGTH)
+if(PSX_GAME_EXTRA_IDENTITY_SHA256 OR PSX_GAME_MANIFEST_DIGEST_SHA256)
+    if(NOT PSX_GAME_EXTRA_IDENTITY_SHA256_LENGTH EQUAL 64 OR NOT PSX_GAME_EXTRA_IDENTITY_SHA256 MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR "PSX_GAME_EXTRA_IDENTITY_SHA256 must be a lowercase 32-byte SHA-256 hex value")
+    endif()
+    if(NOT PSX_GAME_MANIFEST_DIGEST_SHA256_LENGTH EQUAL 64 OR NOT PSX_GAME_MANIFEST_DIGEST_SHA256 MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR "PSX_GAME_MANIFEST_DIGEST_SHA256 must be a lowercase 32-byte SHA-256 hex value")
+    endif()
+endif()
+
 add_subdirectory(lib/fmt)
 
 # Vendored fmt 9.1.0 enables its `consteval` format-string check on Apple
@@ -75,6 +90,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/annotations.cpp
     src/config_loader.cpp
     src/recompiler_patch.cpp
+    src/source_observation_plan.cpp
     src/main_psx.cpp
 )
 
@@ -88,6 +104,11 @@ target_include_directories(psxrecomp-game PRIVATE
     lib/ELFIO
 )
 target_link_libraries(psxrecomp-game PRIVATE fmt rabbitizer)
+if(PSX_GAME_EXTRA_IDENTITY_SHA256 AND PSX_GAME_MANIFEST_DIGEST_SHA256)
+    target_compile_definitions(psxrecomp-game PRIVATE
+        PSX_GAME_EXTRA_IDENTITY_SHA256="${PSX_GAME_EXTRA_IDENTITY_SHA256}"
+        PSX_GAME_MANIFEST_DIGEST_SHA256="${PSX_GAME_MANIFEST_DIGEST_SHA256}")
+endif()
 if(MINGW)
     target_link_options(psxrecomp-game PRIVATE -Wl,--stack,16777216)
 elseif(MSVC)
@@ -267,6 +288,8 @@ target_include_directories(l2_structural_test PRIVATE
 target_link_libraries(l2_structural_test PRIVATE fmt rabbitizer)
 
 if(BUILD_TESTING)
+    add_test(NAME l2_structural_test COMMAND l2_structural_test)
+
     add_executable(cli_boot_path_test
         tests/cli_boot_path_test.cpp
         src/cli_boot_path.cpp
@@ -297,6 +320,76 @@ if(BUILD_TESTING)
     )
     target_link_libraries(recompiler_patch_test PRIVATE fmt rabbitizer)
     add_test(NAME recompiler_patch_test COMMAND recompiler_patch_test)
+
+    add_executable(static_provenance_codegen_test
+        tests/static_provenance_codegen_test.cpp
+        src/ps1_exe_parser.cpp
+        src/mips_decoder.cpp
+        src/control_flow.cpp
+        src/function_analysis.cpp
+        src/code_generator.cpp
+        src/annotations.cpp
+        src/bios_address_model.cpp
+        src/config_loader.cpp
+    )
+    target_include_directories(static_provenance_codegen_test PRIVATE
+        include
+        src
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+        lib/toml11
+        lib/ELFIO
+    )
+    target_link_libraries(static_provenance_codegen_test PRIVATE fmt rabbitizer)
+    add_test(NAME static_provenance_codegen_test COMMAND static_provenance_codegen_test)
+
+    add_executable(gte_exact_pc_codegen_test
+        tests/gte_exact_pc_codegen_test.cpp
+        src/ps1_exe_parser.cpp
+        src/mips_decoder.cpp
+        src/control_flow.cpp
+        src/function_analysis.cpp
+        src/code_generator.cpp
+        src/annotations.cpp
+        src/bios_address_model.cpp
+        src/config_loader.cpp
+    )
+    target_include_directories(gte_exact_pc_codegen_test PRIVATE
+        include
+        src
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+        lib/toml11
+        lib/ELFIO
+    )
+    target_link_libraries(gte_exact_pc_codegen_test PRIVATE fmt rabbitizer)
+    add_test(NAME gte_exact_pc_codegen_test COMMAND gte_exact_pc_codegen_test)
+
+    add_executable(overlay_auth_continuation_codegen_test
+        tests/overlay_auth_continuation_codegen_test.cpp
+        src/ps1_exe_parser.cpp
+        src/mips_decoder.cpp
+        src/control_flow.cpp
+        src/function_analysis.cpp
+        src/code_generator.cpp
+        src/annotations.cpp
+        src/bios_address_model.cpp
+        src/config_loader.cpp
+    )
+    target_include_directories(overlay_auth_continuation_codegen_test PRIVATE
+        include
+        src
+        lib/rabbitizer/include
+        lib/rabbitizer/cplusplus/include
+        lib/fmt/include
+        lib/toml11
+        lib/ELFIO
+    )
+    target_link_libraries(overlay_auth_continuation_codegen_test PRIVATE fmt rabbitizer)
+    add_test(NAME overlay_auth_continuation_codegen_test
+             COMMAND overlay_auth_continuation_codegen_test)
 
     add_executable(recompiler_patch_cxx17_header_test
         tests/recompiler_patch_cxx17_header_test.cpp

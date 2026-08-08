@@ -228,6 +228,36 @@ range_sites = ["0x80012340"]
     check(range_config.ws_cull_range_sites ==
               std::vector<uint32_t>{0x80012340u},
           "parser preserves explicit range cull sites");
+
+    const auto semantic = write_config(root, "semantic-cull", R"toml(
+[widescreen.cull.semantic]
+screen_bias_sites = ["0x80012340"]
+world_range_sites = ["0x80012344"]
+left_edge_sites = ["0x80012348"]
+masked_screen_x_sites = ["0x8001234C"]
+frustum_plane_x_sites = ["0x80012350"]
+signed_screen_x_sites = ["0x80012354"]
+depth_bound_sites = ["0x80012358"]
+xclip_bound_load_sites = ["0x8001235C"]
+)toml");
+    const auto semantic_config = PSXRecompV4::load_game_config(semantic);
+    check(semantic_config.ws_cull_semantic_screen_bias_sites ==
+              std::vector<uint32_t>{0x80012340u} &&
+              semantic_config.ws_cull_semantic_world_range_sites ==
+                  std::vector<uint32_t>{0x80012344u} &&
+              semantic_config.ws_cull_semantic_left_edge_sites ==
+                  std::vector<uint32_t>{0x80012348u} &&
+              semantic_config.ws_cull_semantic_masked_screen_x_sites ==
+              std::vector<uint32_t>{0x8001234Cu} &&
+              semantic_config.ws_cull_semantic_frustum_plane_x_sites ==
+                  std::vector<uint32_t>{0x80012350u} &&
+              semantic_config.ws_cull_semantic_signed_screen_x_sites ==
+                  std::vector<uint32_t>{0x80012354u} &&
+              semantic_config.ws_cull_semantic_depth_bound_sites ==
+                  std::vector<uint32_t>{0x80012358u} &&
+              semantic_config.ws_cull_semantic_xclip_bound_sites ==
+                  std::vector<uint32_t>{0x8001235Cu},
+          "parser preserves semantic guest-cull classes");
 }
 
 void capture_history_config_tests(const fs::path& root) {
@@ -356,7 +386,77 @@ void codegen_tests() {
     const std::string range = generate_first_instruction(
         0x2C8201C1u, {}, false, range_config); // sltiu v0,a0,0x1c1
     check(range.find("2*psx_ws_x_margin()") != std::string::npos,
-          "native range emit widens by both horizontal margins");
+           "native range emit widens by both horizontal margins");
+
+    PSXRecomp::CodeGenConfig semantic_codegen;
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_SCREEN_BIAS},
+    };
+    const std::string semantic_bias = generate_first_instruction(
+        0x24820020u, {}, false, semantic_codegen); // addiu v0,a0,0x20
+    check(semantic_bias.find("psx_ws_guest_cull_screen_bias") != std::string::npos,
+          "semantic codegen emits typed screen-bias helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_WORLD_RANGE},
+    };
+    const std::string semantic_range = generate_first_instruction(
+        0x2C820140u, {}, false, semantic_codegen); // sltiu v0,a0,0x140
+    check(semantic_range.find("psx_ws_guest_cull_world_range") != std::string::npos,
+          "semantic codegen emits typed world-range helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_LEFT_EDGE},
+    };
+    const std::string semantic_left = generate_first_instruction(
+        0x00041023u, {}, false, semantic_codegen); // subu v0,zero,a0
+    check(semantic_left.find("psx_ws_guest_cull_left_edge") != std::string::npos,
+          "semantic codegen emits typed left-edge helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_MASKED_SCREEN_X},
+    };
+    const std::string semantic_masked = generate_first_instruction(
+        0x2C820140u, {}, false, semantic_codegen); // sltiu v0,a0,0x140
+    check(semantic_masked.find("psx_ws_guest_cull_masked_screen_x") !=
+              std::string::npos,
+          "semantic codegen emits typed masked-screen-X helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X},
+    };
+    const std::string semantic_plane = generate_first_instruction(
+        0x8C84C828u, {}, false, semantic_codegen); // lw a0,-0x37d8(a0)
+    check(semantic_plane.find("psx_ws_guest_cull_frustum_plane_x") !=
+              std::string::npos,
+          "semantic codegen emits typed frustum-plane helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X},
+    };
+    const std::string semantic_signed_screen = generate_first_instruction(
+        0x28820020u, {}, false, semantic_codegen); // slti v0,a0,0x20
+    check(semantic_signed_screen.find("psx_ws_guest_cull_signed_screen_x") !=
+              std::string::npos,
+          "semantic codegen emits typed signed-screen-X helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_DEPTH_BOUND},
+    };
+    const std::string semantic_depth = generate_first_instruction(
+        0x28827FFFu, {}, false, semantic_codegen); // slti v0,a0,0x7fff
+    check(semantic_depth.find("psx_ws_guest_cull_depth_signed") !=
+              std::string::npos,
+          "semantic codegen emits typed depth-bound helper");
+
+    semantic_codegen.ws_cull_semantic_sites = {
+        {0x80010000u, PSX_WS_CULL_SEMANTIC_XCLIP_BOUND},
+    };
+    const std::string semantic_xclip = generate_first_instruction(
+        0x8C84C828u, {}, false, semantic_codegen); // lw a0,-0x37d8(a0)
+    check(semantic_xclip.find("psx_ws_guest_cull_xclip_bound") !=
+              std::string::npos,
+          "semantic codegen emits typed X-clip-bound helper");
 
     PSXRecomp::CodeGenConfig plane_nx_config;
     plane_nx_config.ws_cull_plane_nx_sites.insert(0x80010000u);

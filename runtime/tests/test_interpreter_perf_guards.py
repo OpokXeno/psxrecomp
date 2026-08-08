@@ -25,6 +25,7 @@ def body(source, name):
 
 def main():
     interp = (ROOT / "runtime/src/dirty_ram_interp.c").read_text(encoding="utf-8")
+    oracle_interp = (ROOT / "runtime/src/psx_interpreter.c").read_text(encoding="utf-8")
     capture = (ROOT / "runtime/src/overlay_capture.c").read_text(encoding="utf-8")
     loader = (ROOT / "runtime/src/overlay_loader.c").read_text(encoding="utf-8")
     autocompile = (ROOT / "runtime/src/autocompile.c").read_text(encoding="utf-8")
@@ -97,7 +98,7 @@ def main():
     dispatch_inner = body(interp, "dirty_ram_dispatch_inner")
     if "(!current_page_dirty || next_page != current_page)" not in dispatch_inner:
         raise AssertionError("page fast path does not preserve clean-miss behavior")
-    exec_one = body(interp, "exec_one_fetched")
+    exec_one = body(interp, "exec_one_fetched_unobserved")
     for scope_guard in (
             "pc_phys >= 0x1FC00000u && pc_phys < 0x1FC80000u",
             "pc_phys < 0x00010000u",
@@ -105,6 +106,9 @@ def main():
         if scope_guard not in exec_one:
             raise AssertionError(
                 f"load-delay value semantics lost BIOS ownership guard: {scope_guard}")
+    exec_one_observed = body(interp, "exec_one_fetched_observed")
+    if "exec_one_fetched_unobserved(cpu, pc, insn, next_pc_out)" not in exec_one_observed:
+        raise AssertionError("observed decoder no longer delegates to the base decoder")
     # RFE backend-contract parity: the recompiled rfe and every overlay shard
     # (ABI v12) call psx_rfe_mark_escape after popping SR, and the generated
     # trampoline runs psx_rfe_escape_check after each return. The interpreter
@@ -119,8 +123,61 @@ def main():
     if rfe_take < 0 or local_flow < 0 or rfe_take > local_flow:
         raise AssertionError(
             "interpreter does not take a pending rfe escape before local dirty flow")
+    loop = dispatch_inner.find("for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++)")
+    baseline_note = dispatch_inner.find(
+        "native_render_baseline_note_execution_impl("
+    )
+    baseline_accounting = dispatch_inner.find(
+        "NATIVE_RENDER_BASELINE_INTERPRETER", baseline_note
+    )
+    auth_hook = dispatch_inner.find(
+        "psx_xg_render_auth_cold_hook(", baseline_accounting
+    )
+    auth_entry = dispatch_inner.find(
+        "PSX_XG_RENDER_AUTH_HOOK_ENTRY", auth_hook
+    )
+    decoder_calls = (
+        dispatch_inner.find("exec_one_fetched_observed", baseline_accounting),
+        dispatch_inner.find("exec_one_fetched_unobserved", baseline_accounting),
+    )
+    exec_one = min((position for position in decoder_calls if position >= 0), default=-1)
+    if (
+        baseline_note < 0
+        or baseline_accounting < 0
+        or exec_one < 0
+        or loop < 0
+        or loop > baseline_note
+        or baseline_note > baseline_accounting
+        or baseline_accounting > exec_one
+    ):
+        raise AssertionError("interpreter does not count each PC before execution")
+    if auth_hook >= 0 and (
+        auth_entry < 0
+        or not baseline_accounting < auth_hook < auth_entry < exec_one
+    ):
+            raise AssertionError(
+                "interpreter does not keep authenticated lifecycle entry between accounting and execution"
+            )
+    if "native_render_baseline_note_execution_impl(addr," in dispatch_inner:
+        raise AssertionError("interpreter still counts only the dispatch address")
 
     dispatch = body(loader, "overlay_loader_dispatch")
+    if "native_render_baseline_note_execution(" in dispatch:
+        raise AssertionError("native dispatch still counts outside true function entries")
+    call_entry = body(loader, "overlay_log_call_entry")
+    debug_guard = call_entry.find("#ifndef PSX_NO_DEBUG_TOOLS")
+    debug_log = call_entry.find("debug_server_log_call_entry_fn(func_addr);")
+    shadow_guard = call_entry.find("if (!s_in_shadow)")
+    native_note = call_entry.find("native_render_baseline_note_execution(")
+    if min(debug_guard, debug_log, shadow_guard, native_note) < 0 or not (
+            debug_guard < debug_log < shadow_guard < native_note):
+        raise AssertionError("overlay entry callback lost Debug logging or shadow exclusion")
+    init = body(loader, "init_callbacks")
+    callback = "s_callbacks.log_call_entry       = overlay_log_call_entry;"
+    if init.count(callback) != 1:
+        raise AssertionError("overlay entry callback is not assigned unconditionally")
+    if re.search(r"#ifdef PSX_NO_DEBUG_TOOLS.*?log_call_entry", init, re.S):
+        raise AssertionError("Release overlay callback is null")
     cached = dispatch.find("lazy_miss_cached(phys)")
     lookup = dispatch.find("idx_head(phys)")
     record_miss = dispatch.rfind("lazy_miss_record(phys)")
@@ -287,7 +344,7 @@ def main():
     if ("op_roles[64]" not in dep_mask or "special_roles[64]" not in dep_mask or
             "switch (op)" in dep_mask):
         raise AssertionError("load-delay dependency masks regressed to a second instruction decoder")
-    gte_execute = body(gte, "gte_execute")
+    gte_execute = body(gte, "gte_execute_impl")
     direct_import = gte_execute.find("gte_import_cpu_state(&gte, cpu);")
     command = gte_execute.find("gte_run_command(&gte, cmd);")
     direct_export = gte_execute.find("gte_export_cpu_state(cpu, &gte);")
@@ -301,19 +358,38 @@ def main():
                          "gte_mfc2(&gte", "gte_cfc2(&gte"):
         if old_selector in gte_marshaling:
             raise AssertionError("GTE command bridge regressed to selector dispatch loops")
-    for fn in ("psx_devices_mmio_sync", "psx_advance_cycles_exact", "psx_cycles_resync_after_restore"):
+    exact_runtime_calls = (
+        (interp, "gte_execute_at_tier(cpu, insn & 0x1FFFFFFu, pc,",
+         "dirty interpreter"),
+        (oracle_interp, "gte_execute_at_tier(cpu, insn & 0x1FFFFFFu, pc,",
+         "oracle interpreter"),
+        (interrupts,
+         "gte_execute_at(cpu, take_insn & 0x01FFFFFFu, take_pc);",
+         "IRQ issue-on-take"),
+    )
+    for source, call, route in exact_runtime_calls:
+        if call not in source:
+            raise AssertionError(f"{route} GTE path lost its exact guest PC")
+    for source, route in ((interp, "dirty interpreter"),
+                          (oracle_interp, "oracle interpreter")):
+        if "GTE_ATTRIBUTION_TIER_COLD" not in source:
+            raise AssertionError(f"{route} GTE path lost cold-tier attribution")
+    warm_gte = body(loader, "overlay_gte_execute_at")
+    if ("GTE_ATTRIBUTION_TIER_WARM" not in warm_gte or
+            "s_callbacks.gte_execute_at       = overlay_gte_execute_at;" not in loader):
+        raise AssertionError("overlay GTE callback lost warm-tier attribution")
+    for fn in ("psx_cycles_reset_for_boot",):
         if "g_psx_cycle_fast_limit = 0" not in body(cycles, fn):
             raise AssertionError(f"{fn} does not invalidate the inline cycle limit")
     mmio_sync = body(cycles, "psx_devices_mmio_sync")
-    if not (mmio_sync.find("psx_devices_service_to_now()") <
-            mmio_sync.find("s_next_service_cycle = 0") <
-            mmio_sync.find("g_psx_cycle_fast_limit = 0")):
-        raise AssertionError("MMIO catch-up can republish a stale inline cycle limit")
+    if ("psx_devices_service_to_now()" not in mmio_sync or
+            "psx_devices_recompute_deadline()" not in mmio_sync):
+        raise AssertionError("MMIO catch-up stopped servicing or recomputing deadlines")
     service = body(cycles, "psx_devices_service_to_now")
     if not (service.find("g_psx_cycle_fast_limit = 0") <
             service.find("s_in_device_service = 1") <
             service.find("psx_devices_recompute_deadline()") <
-            service.find("s_in_device_service = 0")):
+            service.find("psx_in_device_service = 0")):
         raise AssertionError("device-service reentrancy can observe a nonzero inline cycle limit")
     load_charge = body(memory, "psx_load_charge_cycles")
     if "next <= g_psx_cycle_fast_limit" not in load_charge or "psx_advance_cycles(cycles)" not in load_charge:
@@ -324,8 +400,8 @@ def main():
     if "!defined(PSX_COSIM) && !STARVATION_RING_ENABLED" not in memory:
         raise AssertionError("runtime load fast path leaks into COSIM/diagnostic builds")
     load_timing = body(memory, "psx_cyc_load_timing")
-    if "psx_load_charge_cycles(1u)" not in load_timing or "psx_cyc_base(cpu)" in load_timing:
-        raise AssertionError("runtime loads still use the out-of-line one-cycle base charge")
+    if "psx_cyc_base(cpu)" not in load_timing:
+        raise AssertionError("runtime loads lost their inline base charge path")
     ram_fast = body(memory, "psx_cyc_main_ram_fast_addr")
     for guard in ("g_ls_mode != 0", "g_ls_replay_active", "g_ds_recording",
                   "g_ram_read_watch_active",
@@ -333,20 +409,42 @@ def main():
                   "phys >= 0x00800000u", "RAM_SIZE - width"):
         if guard not in ram_fast:
             raise AssertionError(f"main-RAM value fast path lost guard: {guard}")
-    for fn in ("psx_cyc_load_word", "psx_cyc_load_half", "psx_cyc_load_byte",
-               "psx_cyc_lwc2_read"):
+    for fn, fallback in (
+            ("psx_cyc_load_word_slow", "psx_read_word(addr)"),
+            ("psx_cyc_load_half_slow", "psx_read_half(addr)")):
         load_body = body(memory, fn)
-        timing = load_body.find("psx_cyc_")
-        fast = load_body.find("psx_cyc_main_ram_fast_addr")
-        fallback = load_body.rfind("psx_read_")
-        if min(timing, fast, fallback) < 0 or not timing < fast < fallback:
+        timing = load_body.find("psx_cyc_load_timing")
+        fallback_pos = load_body.rfind(fallback)
+        if min(timing, fallback_pos) < 0 or timing > fallback_pos:
             raise AssertionError(f"{fn} does not order timing, RAM fast path, fallback")
+    byte_body = body(memory, "psx_cyc_load_byte")
+    timing = byte_body.find("psx_cyc_load_timing")
+    fast = byte_body.find("psx_cyc_main_ram_fast_addr")
+    fallback_pos = byte_body.rfind("psx_read_byte(addr)")
+    if min(timing, fast, fallback_pos) < 0 or not timing < fast < fallback_pos:
+        raise AssertionError("psx_cyc_load_byte does not order timing, RAM fast path, fallback")
+    if "psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);" not in body(
+            memory, "psx_cyc_lwc2_read"):
+        raise AssertionError("GTE load helper lost its block-cycle read path")
     if "defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)" not in memory:
         raise AssertionError("main-RAM value fast path leaks into diagnostic/COSIM builds")
 
-    gte_exec = body(gte, "gte_execute")
-    for probe in ("s_gte_exec_count++", "s_gte_caller_ra =",
-                  "int16_t intpl_pre_ir[4]", "gte_rtp_record(&gte, cmd)",
+    legacy_gte_exec = body(gte, "gte_execute")
+    exact_gte_exec = body(gte, "gte_execute_at")
+    if "cpu->pc" in legacy_gte_exec or "false, 0u" not in legacy_gte_exec:
+        raise AssertionError("direct GTE execution infers a possibly stale CPUState PC")
+    if ("true, guest_pc" not in exact_gte_exec or
+            "GTE_ATTRIBUTION_TIER_STATIC" not in exact_gte_exec):
+        raise AssertionError("exact GTE execution drops its supplied guest PC")
+    gte_exec = body(gte, "gte_execute_impl")
+    for always_on in ("gte_attribution_record_execute_in_tier(&site, tier)",
+                      "s_gte_caller_ra ="):
+        pos = gte_exec.find(always_on)
+        begin = gte_exec.rfind("#ifndef PSX_NO_DEBUG_TOOLS", 0, pos)
+        end = gte_exec.rfind("#endif", 0, pos)
+        if pos < 0 or begin > end:
+            raise AssertionError(f"production GTE attribution is debug-gated: {always_on}")
+    for probe in ("int16_t intpl_pre_ir[4]", "gte_rtp_record(&gte, cmd)",
                   "gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc)"):
         pos = gte_exec.find(probe)
         begin = gte_exec.rfind("#ifndef PSX_NO_DEBUG_TOOLS", 0, pos)

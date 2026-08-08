@@ -1,4 +1,5 @@
 #include "boot_state.h"
+#include "game_identity.h"
 #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
 #include "gpu_render.h"    /* gr_vram_transfer_in / gr_vram_transfer_out          */
 #include "psx_cycles.h"
@@ -73,6 +74,8 @@ static int write_header_le(FILE* f, const BootStateHeader* h) {
         !pst_w_u32(&w, h->codegen_hash) ||
         !pst_w_i32(&w, h->abi_tag) ||
         !pst_w_u32(&w, h->codegen_ver) ||
+        !pst_w_bytes(&w, h->game_sha256, sizeof(h->game_sha256)) ||
+        !pst_w_bytes(&w, h->manifest_sha256, sizeof(h->manifest_sha256)) ||
         !pst_w_u32(&w, h->section_count) ||
         !pst_w_u32(&w, h->reserved) ||
         w.written != BOOT_STATE_HEADER_WIRE_BYTES)
@@ -93,6 +96,8 @@ static int read_header_le(FILE* f, BootStateHeader* h) {
         !pst_r_u32(&r, &h->codegen_hash) ||
         !pst_r_i32(&r, &h->abi_tag) ||
         !pst_r_u32(&r, &h->codegen_ver) ||
+        !pst_r_bytes(&r, h->game_sha256, sizeof(h->game_sha256)) ||
+        !pst_r_bytes(&r, h->manifest_sha256, sizeof(h->manifest_sha256)) ||
         !pst_r_u32(&r, &h->section_count) ||
         !pst_r_u32(&r, &h->reserved))
         return 0;
@@ -178,6 +183,14 @@ int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
+    const PsxGameIdentity *identity = psx_game_identity_runtime();
+    if (!identity) {
+        fclose(f);
+        remove(path);
+        return 0;
+    }
+    memcpy(h.game_sha256, identity->game_sha256, sizeof(h.game_sha256));
+    memcpy(h.manifest_sha256, identity->manifest_sha256, sizeof(h.manifest_sha256));
     h.section_count = 14;
 
     int ok = write_header_le(f, &h);
@@ -383,13 +396,18 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
     BootStateHeader h;
     if (!read_header_le(f, &h)) { fclose(f); return 0; }
 
-    if (h.magic         != BOOT_STATE_MAGIC               ||
+    const PsxGameIdentity *identity = psx_game_identity_runtime();
+    if (!identity ||
+        h.magic         != BOOT_STATE_MAGIC               ||
         h.version       != BOOT_STATE_VERSION             ||
         h.bios_checksum != bios_checksum                  ||
         h.entry_pc      != entry_pc                       ||
         h.codegen_hash  != (uint32_t)PSX_OVERLAY_CODEGEN_HASH ||
         h.abi_tag       != (int32_t)PSX_OVERLAY_ABI_TAG   ||
-        h.codegen_ver   != (uint32_t)PSX_OVERLAY_CODEGEN_VER) {
+        h.codegen_ver   != (uint32_t)PSX_OVERLAY_CODEGEN_VER ||
+        memcmp(h.game_sha256, identity->game_sha256, sizeof(h.game_sha256)) != 0 ||
+        memcmp(h.manifest_sha256, identity->manifest_sha256,
+               sizeof(h.manifest_sha256)) != 0) {
         fclose(f);
         return 0;
     }

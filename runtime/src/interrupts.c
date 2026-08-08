@@ -31,6 +31,7 @@
 #include "gpu.h"
 #include "cdrom.h"
 #include "dma.h"
+#include "native_render_baseline.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "event_ring.h"
@@ -328,6 +329,7 @@ static void fire_vblank_edge(void) {
     g_vblank_raise_count++;
     event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
     gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
+    native_render_baseline_observe_vblank();
 #ifndef PSX_ENABLE_BLOCK_CYCLES
     timers_tick(33868); /* ~1 NTSC frame worth of cycles */
     cdrom_tick();      /* Process pending CDROM responses */
@@ -1060,7 +1062,7 @@ irq_deliver_eval:
         psx_cyc_step(cpu, psx_cyc_dep_res_mask(take_insn));
         psx_cyc_batch_flush();
 #endif
-        gte_execute(cpu, take_insn & 0x01FFFFFFu);
+        gte_execute_at(cpu, take_insn & 0x01FFFFFFu, take_pc);
     }
     sr = cpu->cop0[COP0_SR];
     hw_deliverable = ((i_stat & i_mask) != 0) && ((sr & (1u << 10)) != 0);

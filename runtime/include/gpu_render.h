@@ -23,6 +23,159 @@ typedef enum {
     GR_BACKEND_VULKAN   = 2
 } GrBackend;
 
+enum {
+    GPU_RENDER_FIXED_FRACTION_BITS = 16,
+    GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY = 2,
+    GPU_RENDER_SEMANTIC_LINE_CAPACITY = 2,
+    GPU_RENDER_DRAW_SUPPRESSION_MAX_DEPTH = 64
+};
+
+typedef int32_t GpuRenderFixed16_16;
+
+typedef enum GpuRenderTransactionStatus {
+    GPU_RENDER_TRANSACTION_OK = 0,
+    GPU_RENDER_TRANSACTION_READY,
+    GPU_RENDER_TRANSACTION_UNSUPPORTED,
+    GPU_RENDER_TRANSACTION_INVALID_ARGUMENT,
+    GPU_RENDER_TRANSACTION_INVALID_TRANSITION,
+    GPU_RENDER_TRANSACTION_ORDER_REJECTED,
+    GPU_RENDER_TRANSACTION_STATE_REJECTED,
+    GPU_RENDER_TRANSACTION_VALIDATION_FAILED,
+    GPU_RENDER_TRANSACTION_BACKEND_ERROR,
+    GPU_RENDER_TRANSACTION_CONTEXT_LOST
+} GpuRenderTransactionStatus;
+
+typedef enum GpuRenderDrawSuppressionStatus {
+    GPU_RENDER_DRAW_SUPPRESSION_OK = 0,
+    GPU_RENDER_DRAW_SUPPRESSION_UNDERFLOW,
+    GPU_RENDER_DRAW_SUPPRESSION_OVERFLOW,
+    GPU_RENDER_DRAW_SUPPRESSION_POISONED
+} GpuRenderDrawSuppressionStatus;
+
+typedef enum GpuRenderTextureDepth {
+    GPU_RENDER_TEXTURE_4_BIT = 0,
+    GPU_RENDER_TEXTURE_8_BIT,
+    GPU_RENDER_TEXTURE_15_BIT
+} GpuRenderTextureDepth;
+
+typedef enum GpuRenderBlendMode {
+    GPU_RENDER_BLEND_AVERAGE = 0,
+    GPU_RENDER_BLEND_ADD,
+    GPU_RENDER_BLEND_SUBTRACT,
+    GPU_RENDER_BLEND_ADD_QUARTER
+} GpuRenderBlendMode;
+
+typedef enum GpuRenderShading {
+    GPU_RENDER_SHADING_FLAT = 0,
+    GPU_RENDER_SHADING_GOURAUD
+} GpuRenderShading;
+
+typedef enum GpuRenderPresentPath {
+    GPU_RENDER_PRESENT_CANONICAL = 0,
+    GPU_RENDER_PRESENT_HIRES,
+    GPU_RENDER_PRESENT_WIDE
+} GpuRenderPresentPath;
+
+/* A visual-state identity is opaque to the renderer. The facade only uses it
+ * to reject calls that do not belong to the currently open transaction. */
+typedef struct GpuRenderTransactionId {
+    uint64_t scene_epoch;
+    uint64_t state_sequence;
+} GpuRenderTransactionId;
+
+typedef uint64_t GpuRenderDeferredCandidateToken;
+
+#define GPU_RENDER_DEFERRED_CANDIDATE_NONE UINT64_C(0)
+
+typedef struct GpuRenderMaterial {
+    uint16_t tpage;
+    uint16_t texture_page_x;
+    uint16_t texture_page_y;
+    uint16_t clut_x;
+    uint16_t clut_y;
+    uint16_t draw_area_left;
+    uint16_t draw_area_top;
+    uint16_t draw_area_right;
+    uint16_t draw_area_bottom;
+    int16_t draw_offset_x;
+    int16_t draw_offset_y;
+    GpuRenderTextureDepth texture_depth;
+    uint8_t texture_window_mask_x;
+    uint8_t texture_window_mask_y;
+    uint8_t texture_window_offset_x;
+    uint8_t texture_window_offset_y;
+    GpuRenderShading shading;
+    uint8_t textured;
+    uint8_t raw_texture;
+    uint8_t semi_transparent;
+    GpuRenderBlendMode blend_mode;
+    uint8_t dither;
+    uint8_t mask_set;
+    uint8_t mask_check;
+} GpuRenderMaterial;
+
+typedef struct GpuRenderSemanticVertex {
+    GpuRenderFixed16_16 x;
+    GpuRenderFixed16_16 y;
+    GpuRenderFixed16_16 u;
+    GpuRenderFixed16_16 v;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    /* Optional producer-derived position for a host Native view. Canonical
+     * coordinates remain authoritative for guest VRAM and packet comparison. */
+    GpuRenderFixed16_16 native_view_x;
+    GpuRenderFixed16_16 native_view_y;
+    uint8_t native_view_position;
+} GpuRenderSemanticVertex;
+
+typedef struct GpuRenderSemanticTriangle {
+    uint8_t split_index;
+    uint8_t split_count;
+    GpuRenderSemanticVertex vertices[3];
+} GpuRenderSemanticTriangle;
+
+typedef enum GpuRenderSemanticTopology {
+    GPU_RENDER_SEMANTIC_TRIANGLES = 0,
+    GPU_RENDER_SEMANTIC_LINES = 1,
+} GpuRenderSemanticTopology;
+
+typedef struct GpuRenderSemanticLine {
+    GpuRenderSemanticVertex vertices[2];
+} GpuRenderSemanticLine;
+
+/* Backend-neutral native primitive. The fixed capacity and 16.16 coordinates
+ * directly cover a triangle or a quad split into two ordered triangles. A
+ * producer may additionally provide a source-derived Native-view position. */
+typedef struct GpuRenderSemantic {
+    GpuRenderMaterial material;
+    GpuRenderSemanticTopology topology;
+    /* Canonical screen-space geometry that should fill the host aspect.
+     * Mutually exclusive with producer-provided native_view_position vertices. */
+    uint8_t screen_space_2d;
+    uint8_t triangle_count;
+    GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];
+    uint8_t line_count;
+    GpuRenderSemanticLine lines[GPU_RENDER_SEMANTIC_LINE_CAPACITY];
+} GpuRenderSemantic;
+
+/* Describes the final composition without exposing a backend surface handle.
+ * The backend owns the transaction's offscreen surface and its storage. */
+typedef struct GpuRenderPresent {
+    GpuRenderPresentPath path;
+    int32_t display_x;
+    int32_t display_y;
+    int32_t display_width;
+    int32_t display_height;
+    uint32_t surface_width;
+    uint32_t surface_height;
+    int32_t wide_base_x;
+    uint32_t scale;
+    uint8_t linear_filter;
+    uint8_t force_4_3;
+    uint8_t reserved[2];
+} GpuRenderPresent;
+
 void      gr_set_backend(GrBackend backend);  /* call before gr_init() */
 GrBackend gr_backend(void);                   /* effective backend after init */
 
@@ -38,8 +191,15 @@ void gr_set_semi_transparency(int enabled, int mode);
 void gr_set_mask_bits(int set_bit, int check_bit);
 void gr_set_texture_window(uint32_t raw);
 void gr_set_color_modulation(int r, int g, int b, int raw_texture);
+void gr_set_dither(int enabled);
 
 /* Primitives */
+/* Nest-safe suppression for canonical parser raster side effects. Underflow or
+ * overflow poisons the scope and keeps draws suppressed for fail-closed safety. */
+GpuRenderDrawSuppressionStatus gr_draw_suppression_begin(void);
+GpuRenderDrawSuppressionStatus gr_draw_suppression_end(void);
+int gr_draw_suppression_active(void);
+
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
 void gr_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2,
@@ -47,6 +207,14 @@ void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2,
 void gr_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
                               int x1, int y1, uint16_t c1,
                               int x2, int y2, uint16_t c2);
+/* RGB888 polygon entry points preserve the GP0/semantic color precision until
+ * the backend's PS1 dither + 15-bit quantization stage. Backends without an
+ * exact high-precision path fall back to the legacy RGB555 callbacks. */
+void gr_draw_flat_triangle_rgb888(int x0, int y0, int x1, int y1,
+                                  int x2, int y2, uint32_t color);
+void gr_draw_gouraud_triangle_rgb888(int x0, int y0, uint32_t c0,
+                                     int x1, int y1, uint32_t c1,
+                                     int x2, int y2, uint32_t c2);
 void gr_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                int x1, int y1, int u1, int v1,
                                int x2, int y2, int u2, int v2,
@@ -73,11 +241,44 @@ void gr_draw_line(int x0, int y0, int x1, int y1, uint16_t color);
 void gr_draw_shaded_line(int x0, int y0, uint16_t c0,
                          int x1, int y1, uint16_t c1);
 
+/* Direct Native backend entry points for operations that do not use the
+ * semantic triangle stream. These deliberately bypass the canonical parser
+ * suppression scope and never invoke the GP0 parser again. */
+void gr_native_fill_rect(int x, int y, int w, int h, uint16_t color);
+void gr_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
+                         int w, int h);
+void gr_native_draw_line(int x0, int y0, int x1, int y1, uint16_t color);
+void gr_native_draw_shaded_line(int x0, int y0, uint16_t c0,
+                                int x1, int y1, uint16_t c1);
+
+/* Authoritative Native stream operations. Unlike the legacy transaction API,
+ * these mutate the active backend surface immediately in GP0 ingress order. */
+GpuRenderTransactionStatus gr_stream_barrier(void);
+GpuRenderTransactionStatus gr_draw_semantic_immediate(
+    const GpuRenderSemantic *semantic);
+
 /* Display readout (present path) */
 int gr_render_display(uint32_t *out_pixels, int out_pitch,
                       int disp_x, int disp_y, int disp_w, int disp_h);
 int gr_render_display_hires(uint32_t *out_pixels, int out_pitch,
                             int disp_x, int disp_y, int disp_w, int disp_h);
+/* Native presentation paths. The CPU frame path is used for packed RGB888
+ * MDEC output; it uploads the already-decoded frame without bypassing the
+ * guest MDEC/DMA/VRAM state. */
+int gr_present_vram(int disp_x, int disp_y, int disp_w, int disp_h,
+                    int linear, int force_4_3);
+int gr_present_cpu_frame(const uint32_t *pixels, int src_w, int src_h,
+                         int linear, int force_4_3, int content_w);
+/* Independent Native FMV presentation. This is deliberately a separate
+ * backend operation, not a wrapper around the legacy CPU present path. */
+int gr_present_native_cpu_frame(const uint32_t *pixels, int src_w, int src_h,
+                                int linear, int force_4_3, int content_w);
+/* Hashes the displayed rectangle of the active backend's canonical RGBA8
+ * render source in top-down order. Returns zero when no authoritative host
+ * surface exists or the rectangle is invalid. */
+int gr_canonical_framebuffer_digest(int display_x, int display_y,
+                                    int display_width, int display_height,
+                                    uint64_t *out_digest);
 
 /* VRAM transfers */
 void gr_vram_write(int x, int y, uint16_t pixel);
@@ -104,6 +305,40 @@ int  gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base
 int  gr_render_wide_display(uint32_t *out, int pitch, int base_x,
                             int disp_y, int disp_h);
 
+/* Atomic semantic-render transaction. A successful commit returns READY, not
+ * OK. Once READY is returned, the caller must immediately perform the backend
+ * presentation operation. Any other open-transaction failure requires
+ * gr_rollback() with the original transaction id. A barrier is required before
+ * the first semantic draw and after the last semantic draw before commit. */
+GpuRenderTransactionStatus gr_transaction_begin(
+    GpuRenderTransactionId transaction_id,
+    uint64_t vram_mutation_serial);
+GpuRenderTransactionStatus gr_ordering_barrier(
+    GpuRenderTransactionId transaction_id);
+GpuRenderTransactionStatus gr_draw_semantic(
+    GpuRenderTransactionId transaction_id,
+    const GpuRenderSemantic *semantic);
+GpuRenderTransactionStatus gr_commit_validate(
+    GpuRenderTransactionId transaction_id,
+    uint64_t current_vram_mutation_serial,
+    const GpuRenderPresent *present);
+GpuRenderTransactionStatus gr_rollback(
+    GpuRenderTransactionId transaction_id);
+
+/* A deferred candidate is a backend-owned, full-frame color surface captured
+ * from an open transaction before strict guest-observation rollback. The token
+ * is opaque, process-local, and single-use. Only a distinct deferred
+ * transaction may consume it; software and Vulkan leave these unsupported. */
+GpuRenderTransactionStatus gr_deferred_candidate_capture(
+    GpuRenderTransactionId transaction_id,
+    GpuRenderDeferredCandidateToken *out_candidate_token);
+GpuRenderTransactionStatus gr_deferred_candidate_discard(
+    GpuRenderDeferredCandidateToken candidate_token);
+GpuRenderTransactionStatus gr_deferred_transaction_begin(
+    GpuRenderTransactionId transaction_id,
+    uint64_t vram_mutation_serial,
+    GpuRenderDeferredCandidateToken candidate_token);
+
 /* ---- Backend vtable -----------------------------------------------------
  * A backend supplies the same set of functions.  gpu_gl_renderer.c (Phase 2)
  * provides gl_backend_get(); until it does, requesting OpenGL falls back to
@@ -119,6 +354,7 @@ typedef struct GpuRenderBackend {
     void (*set_mask_bits)(int set_bit, int check_bit);
     void (*set_texture_window)(uint32_t raw);
     void (*set_color_modulation)(int r, int g, int b, int raw_texture);
+    void (*set_dither)(int enabled);
     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
     void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,
@@ -126,6 +362,11 @@ typedef struct GpuRenderBackend {
     void (*draw_gouraud_triangle)(int x0, int y0, uint16_t c0,
                                   int x1, int y1, uint16_t c1,
                                   int x2, int y2, uint16_t c2);
+    void (*draw_flat_triangle_rgb888)(int x0, int y0, int x1, int y1,
+                                      int x2, int y2, uint32_t color);
+    void (*draw_gouraud_triangle_rgb888)(int x0, int y0, uint32_t c0,
+                                         int x1, int y1, uint32_t c1,
+                                         int x2, int y2, uint32_t c2);
     void (*draw_textured_triangle)(int x0, int y0, int u0, int v0,
                                    int x1, int y1, int u1, int v1,
                                    int x2, int y2, int u2, int v2,
@@ -150,10 +391,27 @@ typedef struct GpuRenderBackend {
     void (*draw_line)(int x0, int y0, int x1, int y1, uint16_t color);
     void (*draw_shaded_line)(int x0, int y0, uint16_t c0,
                              int x1, int y1, uint16_t c1);
+    void (*native_fill_rect)(int x, int y, int w, int h, uint16_t color);
+    void (*native_copy_rect)(int src_x, int src_y, int dst_x, int dst_y,
+                             int w, int h);
+    GpuRenderTransactionStatus (*stream_barrier)(void);
+    GpuRenderTransactionStatus (*draw_semantic_immediate)(
+        const GpuRenderSemantic *semantic);
     int  (*render_display)(uint32_t *out, int pitch,
                            int dx, int dy, int dw, int dh);
     int  (*render_display_hires)(uint32_t *out, int pitch,
-                                 int dx, int dy, int dw, int dh);
+                                  int dx, int dy, int dw, int dh);
+    int  (*present_vram)(int dx, int dy, int dw, int dh,
+                         int linear, int force_4_3);
+    int  (*present_cpu_frame)(const uint32_t *pixels, int src_w, int src_h,
+                              int linear, int force_4_3, int content_w);
+    int  (*present_native_cpu_frame)(const uint32_t *pixels, int src_w,
+                                     int src_h, int linear, int force_4_3,
+                                     int content_w);
+    int  (*canonical_framebuffer_digest)(int display_x, int display_y,
+                                         int display_width,
+                                         int display_height,
+                                         uint64_t *out_digest);
     void (*vram_write)(int x, int y, uint16_t pixel);
     uint16_t (*vram_read)(int x, int y);
     void (*vram_transfer_in)(int x, int y, int w, int h, const uint16_t *data);
@@ -176,7 +434,37 @@ typedef struct GpuRenderBackend {
      * pixel count, writes width/height to ow/oh. NULL if unsupported. */
     int  (*wide_dump_full)(uint32_t *out, int cap_pixels, int *ow, int *oh,
                            int base_x);
+    /* The first five callbacks form the base transaction group. */
+    GpuRenderTransactionStatus (*transaction_begin)(
+        GpuRenderTransactionId transaction_id,
+        uint64_t vram_mutation_serial);
+    GpuRenderTransactionStatus (*ordering_barrier)(
+        GpuRenderTransactionId transaction_id);
+    GpuRenderTransactionStatus (*draw_semantic)(
+        GpuRenderTransactionId transaction_id,
+        const GpuRenderSemantic *semantic);
+    GpuRenderTransactionStatus (*commit_validate)(
+        GpuRenderTransactionId transaction_id,
+        uint64_t current_vram_mutation_serial,
+        const GpuRenderPresent *present);
+    GpuRenderTransactionStatus (*rollback)(
+        GpuRenderTransactionId transaction_id);
+    /* Optional deferred-presentation group. All three must be present. */
+    GpuRenderTransactionStatus (*deferred_candidate_capture)(
+        GpuRenderTransactionId transaction_id,
+        GpuRenderDeferredCandidateToken *out_candidate_token);
+    GpuRenderTransactionStatus (*deferred_candidate_discard)(
+        GpuRenderDeferredCandidateToken candidate_token);
+    GpuRenderTransactionStatus (*deferred_transaction_begin)(
+        GpuRenderTransactionId transaction_id,
+        uint64_t vram_mutation_serial,
+        GpuRenderDeferredCandidateToken candidate_token);
 } GpuRenderBackend;
+
+#ifdef GPU_RENDER_TRANSACTION_TESTING
+/* Replaces the active backend and clears facade transaction state. Tests only. */
+void gr_test_inject_backend(const GpuRenderBackend *backend);
+#endif
 
 #ifdef __cplusplus
 }

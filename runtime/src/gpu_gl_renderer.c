@@ -53,9 +53,9 @@
  * Known divergences from the software rasterizer (accepted, documented):
  *   - GL triangle/line coverage rules differ from the PS1 DDA by ±1px on
  *     edges; lines use GL_LINES (width S) instead of Bresenham.
- *   - No dithering (the software path doesn't dither either).
- *   - Gouraud interpolation happens at 8-bit precision instead of 5-bit
- *     (smoother gradients; readback re-quantizes to 5-bit).
+ *   - Gouraud interpolation uses GL noperspective interpolation rather than the
+ *     PS1 fixed-point DDA. Dither and 15-bit quantization after interpolation
+ *     are exact and shared by Original GP0 and semantic draws.
  *   - VRAM-wrapping draws are clamped, except GP0(02h) fills which split
  *     into wrapped segments. Wrapping copies/draws are unused by real SDKs.
  *
@@ -72,6 +72,7 @@
 
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -319,6 +320,8 @@ static int           s_scale_apply_pending = 0; /* set by glb_set_scale; consume
 
 static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) */
 static int           s_present_w = 0, s_present_h = 0;
+static GLuint        s_native_present_tex = 0; /* independent Native FMV surface */
+static int           s_native_present_w = 0, s_native_present_h = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
 static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
 static GLint         s_present_uLut = -1, s_present_uLutOn = -1;
@@ -360,6 +363,8 @@ static int           s_raster_ok = 0;      /* full GPU pipeline available */
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
+static uint8_t       *s_canonical_digest_pixels = NULL;
+static size_t         s_canonical_digest_capacity = 0u;
 /* Native raw-1555 sampling mirror + readback source. */
 static GLuint        s_raw_tex = 0, s_raw_fbo = 0;
 /* CPU->VRAM upload staging (native RGBA8). */
@@ -380,6 +385,8 @@ static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
 static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
+static GLint s_geo_uDither = -1, s_geo_uScale = -1;
+static GLint s_tex_uDither = -1, s_tex_uScale = -1;
 static GLint s_uLimits = -1;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
@@ -423,6 +430,7 @@ PrimRec g_ptrace[PTRACE_CAP]; int g_ptrace_n = 0;   /* snapshot (extern) */
 /* BLIT program uniforms. */
 static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
 static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
+static GLint s_uBlitTargetSize = -1;
 /* PACK program uniforms. */
 static GLint s_uPackHr = -1, s_uPackScale = -1;
 static GLint s_uStencilSrc = -1;
@@ -433,6 +441,8 @@ static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
 /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
 typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
 static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror */
+static void native_view_mirror_canonical_rects(const DirtyRect *rects,
+                                                int rect_count);
 
 /* CPU writes not yet in the FBO — an EXACT rect list, NOT a single union.
  *
@@ -474,6 +484,7 @@ static int s_off_x = 0, s_off_y = 0;
 static int s_area_x1 = 0, s_area_y1 = 0, s_area_x2 = VRAM_W - 1, s_area_y2 = VRAM_H - 1;
 static int s_semi_en = 0, s_semi_mode = 0;
 static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
+static int s_dither = 0;
 static int s_mask_set = 0, s_mask_check = 0;
 static int s_tw_mask_x = 0, s_tw_mask_y = 0, s_tw_off_x = 0, s_tw_off_y = 0;
 static int s_tex_filter = 0;
@@ -507,6 +518,27 @@ static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
  * gpu_geometry wide mirror is skipped and the flat path emits its own
  * full-wide-width pass instead (mirrors sw_draw_flat_rect). */
 static int    s_wide_suppress = 0;
+
+/* Producer-driven Native view. Unlike the legacy wide mirror, these surfaces
+ * receive only Native semantic draws and may use source-derived positions. */
+#define NATIVE_VIEW_MAX_SURF 4
+static GLuint s_native_view_tex[NATIVE_VIEW_MAX_SURF];
+static GLuint s_native_view_fbo[NATIVE_VIEW_MAX_SURF];
+static GLuint s_native_view_rb[NATIVE_VIEW_MAX_SURF];
+static int s_native_view_base[NATIVE_VIEW_MAX_SURF] = { -1, -1, -1, -1 };
+static int s_native_view_seeded[NATIVE_VIEW_MAX_SURF];
+static int s_native_view_enabled;
+static int s_native_view_width;
+static int s_native_view_offset;
+static int s_native_view_canonical_width = 320;
+static int s_native_view_canonical_height = 240;
+static int s_native_view_pass;
+static GLuint s_native_view_pass_fbo;
+static int s_native_view_pass_base;
+static int s_native_view_expand_x;
+static int s_native_view_scale_2d;
+static void wide_free_all(void);
+static void native_view_free_all(void);
 
 /* X-translation (native px) from canonical VRAM space into the active wide
  * surface: local_x = vram_x - base_x + OFFSET. Same as SW wide_dx(). */
@@ -635,6 +667,104 @@ static int s_last_dx, s_last_dy, s_last_dw, s_last_dh;
  * (and FPS) keep advancing — especially on a 2nd+ load of the same slot. */
 static int s_force_present_remaining = 0;
 
+/* A transaction renders into canonical VRAM while retaining one bounded
+ * rollback checkpoint. READY keeps that checkpoint through private staging and
+ * the one final default-framebuffer blit; non-canonical presents fail closed. */
+typedef struct GlTransactionCheckpoint {
+    GpuRenderTransactionId id;
+    uint64_t vram_serial;
+    int committed;
+    GpuRenderPresent present;
+    GLuint staging_tex, staging_fbo;
+    int staging_w, staging_h;
+    int aspect_num, aspect_den;
+    GlPresEvent staged_present_event;
+    uint16_t vram[VRAM_W * VRAM_H];
+
+    int off_x, off_y;
+    int area_x1, area_y1, area_x2, area_y2;
+    int semi_en, semi_mode;
+    int mod_r, mod_g, mod_b, mod_raw, dither;
+    int mask_set, mask_check;
+    int tw_mask_x, tw_mask_y, tw_off_x, tw_off_y;
+    int tex_filter;
+    int stencil_valid;
+
+    int gpu_dirty;
+    DirtyRect pack_dirty;
+    DirtyRect up_rects[UP_RECTS_MAX];
+    int up_nrects;
+    int depth24_skip_up;
+    DirtyRect d24_skip_fb;
+
+    uint64_t present_dirty[PRES_ROWS];
+    int last_present_path;
+    int last_dx, last_dy, last_dw, last_dh;
+    int force_present_remaining;
+
+    uint64_t coh_seq;
+    uint64_t rt_up_diag[6];
+    uint64_t scene_prims, scene_prims_tex;
+    uint64_t batch_total, batch_reason[7];
+    int bd_gate, tb_gate, wide_suppress;
+    int bdg_applied, bdg_prims, bdg_clearx;
+    PrimRec ptrace[PTRACE_CAP];
+    int ptrace_n;
+    int tb_semi, tb_mask, tb_filter, tb_dither, tb_twin[4];
+    int fb_semi, fb_mask, fb_dither;
+    double cw_flush_ms, cw_wide_ms;
+    int cw_batches, cw_wide_sets, cw_wide_cfgs, cw_wide_clears;
+    int cw_fbo_creates, cw_flush_depth;
+    GpuRenderDeferredCandidateToken deferred_candidate_token;
+} GlTransactionCheckpoint;
+
+typedef struct GlDeferredCandidate {
+    GpuRenderDeferredCandidateToken token;
+    GpuRenderTransactionId visual_id;
+    GLuint texture;
+    GLuint framebuffer;
+    int width;
+    int height;
+    int scale;
+} GlDeferredCandidate;
+
+static GlTransactionCheckpoint *s_transaction = NULL;
+static GlDeferredCandidate s_deferred_candidate;
+static GpuRenderDeferredCandidateToken s_deferred_candidate_next_token = 1u;
+static int s_transaction_force_original = 0;
+static GLuint s_transaction_deferred_staging_tex = 0;
+static GLuint s_transaction_deferred_staging_fbo = 0;
+static int glb_transaction_context_ready(void);
+static void glb_transaction_discard_checkpoint(void);
+static void glb_transaction_cleanup_deferred_staging(void);
+static void glb_deferred_candidate_discard_owned(void);
+static int glb_transaction_prepare_original_present(void);
+static void glb_transaction_original_presented(void);
+static int glb_transaction_abort_pending(int force_original);
+static int glb_transaction_reject_other_present(void);
+
+#ifdef PSX_GL_TRANSACTION_TESTING
+static GlRendererTransactionTestDiag s_transaction_test_diag;
+static int s_transaction_test_fault;
+
+void gl_renderer_transaction_test_reset(void) {
+    memset(&s_transaction_test_diag, 0, sizeof(s_transaction_test_diag));
+    s_transaction_test_fault = GL_TRANSACTION_FAULT_NONE;
+}
+
+void gl_renderer_transaction_test_inject_fault(int phase) {
+    s_transaction_test_fault = phase;
+}
+
+void gl_renderer_transaction_test_diag(GlRendererTransactionTestDiag *out) {
+    if (!out) return;
+    *out = s_transaction_test_diag;
+    out->pending_commit = s_transaction && s_transaction->committed;
+    out->deferred_candidate_active =
+        s_deferred_candidate.token != GPU_RENDER_DEFERRED_CANDIDATE_NONE;
+}
+#endif
+
 static void present_dirty_rect(int x0, int y0, int x1, int y1, int set) {
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 >= VRAM_W) x1 = VRAM_W - 1; if (y1 >= VRAM_H) y1 = VRAM_H - 1;
@@ -691,16 +821,22 @@ int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out) {
 static GlPresEvent s_pres_ring[GL_PRES_RING_CAP];
 static uint64_t    s_pres_seq = 0;
 
-static void pres_record(int path, int dx, int dy, int w, int h,
-                        int lx, int ly, int lw, int lh) {
-    /* The ring metadata stays always-on, but pixel probing must not: each
-     * glReadPixels synchronously drains queued GPU work. Two probes per frame
-     * were enough to make Tomba 2 miss its frame budget. */
+static int pres_probe_pixels_enabled(void) {
     static int probe_pixels = -1;
+
     if (probe_pixels < 0) {
         const char *cfg = getenv("PSX_GL_PRESENT_PROBE");
         probe_pixels = (cfg && cfg[0] == '1') ? 1 : 0;
     }
+    return probe_pixels;
+}
+
+static void pres_record(int path, int dx, int dy, int w, int h,
+                         int lx, int ly, int lw, int lh) {
+    /* The ring metadata stays always-on, but pixel probing must not: each
+     * glReadPixels synchronously drains queued GPU work. Two probes per frame
+     * were enough to make Tomba 2 miss its frame budget. */
+    int probe_pixels = pres_probe_pixels_enabled();
     GlPresEvent *e = &s_pres_ring[s_pres_seq % GL_PRES_RING_CAP];
     e->frame = (uint32_t)s_frame_count;
     e->t_ms  = (uint32_t)SDL_GetTicks();
@@ -734,6 +870,50 @@ static void pres_record(int path, int dx, int dy, int w, int h,
         e->src_valid = 1;
     }
     e->src_r = sp[0]; e->src_g = sp[1]; e->src_b = sp[2];
+    s_pres_seq++;
+}
+
+/* Transactional presentation gathers any opt-in pixel probes from staging,
+ * but does not make the ring entry visible until after SwapWindow succeeds. */
+static void pres_prepare_staged(GlPresEvent *event, GLuint staging_fbo,
+                                int dx, int dy, int w, int h,
+                                int lx, int ly, int lw, int lh) {
+    int probe_pixels = pres_probe_pixels_enabled();
+    uint8_t px[3] = { 0, 0, 0 };
+    uint8_t sp[3] = { 0, 0, 0 };
+
+    memset(event, 0, sizeof(*event));
+    event->path = GL_PRES_VRAM;
+    event->dx = (int16_t)dx; event->dy = (int16_t)dy;
+    event->w = (int16_t)w; event->h = (int16_t)h;
+    event->lx = (int16_t)lx; event->ly = (int16_t)ly;
+    event->lw = (int16_t)lw; event->lh = (int16_t)lh;
+    if (probe_pixels && lw > 0 && lh > 0) {
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, staging_fbo);
+        glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(lx + lw / 2, ly + lh / 2, 1, 1,
+                     GL_RGB, GL_UNSIGNED_BYTE, px);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    }
+    event->px_r = px[0]; event->px_g = px[1]; event->px_b = px[2];
+    if (probe_pixels && w > 0 && h > 0 && s_hr_fbo) {
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels((dx + w / 2) * s_scale, (dy + h / 2) * s_scale,
+                     1, 1, GL_RGB, GL_UNSIGNED_BYTE, sp);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        event->src_valid = 1;
+    }
+    event->src_r = sp[0]; event->src_g = sp[1]; event->src_b = sp[2];
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, staging_fbo);
+}
+
+static void pres_publish_staged(GlPresEvent *event) {
+    event->frame = (uint32_t)s_frame_count;
+    event->t_ms = (uint32_t)SDL_GetTicks();
+    event->glerr = 0;
+    s_pres_ring[s_pres_seq % GL_PRES_RING_CAP] = *event;
     s_pres_seq++;
 }
 
@@ -806,10 +986,30 @@ static const char *GEO_VS =
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
     "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
     "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+
+/* One literal PS1 color endpoint for both geometry programs. Inputs are in the
+ * GPU's pre-quantization integer domain: RGB888 for untextured shading, and
+ * (texel5 * modulation8) >> 4 for modulated textures. gl_FragCoord is the final
+ * VRAM destination, so the matrix phase includes GP0(E5) draw offset exactly. */
+#define PSX_DITHER_QUANTIZE_GLSL \
+    "const int PSX_DITHER[16] = int[16](\n" \
+    "  -4, 0,-3, 1,  2,-2, 3,-1, -3, 1,-4, 0,  3,-1, 2,-2);\n" \
+    "ivec3 psx_quantize(ivec3 color, int dither_on){\n" \
+    "  ivec2 p = ivec2(gl_FragCoord.xy) / u_scale;\n" \
+    "  int d = dither_on != 0 ? PSX_DITHER[((p.y & 3) << 2) | (p.x & 3)] : 0;\n" \
+    "  return clamp((color + ivec3(d)) >> 3, ivec3(0), ivec3(31));\n" \
+    "}\n" \
+    "vec3 psx_expand5(ivec3 color5){ return vec3(color5 << 3) / 255.0; }\n"
+
 static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; out vec4 frag;\n"
-    "void main(){ frag = v_col; }\n";
+    "uniform int u_dither; uniform int u_scale;\n"
+    PSX_DITHER_QUANTIZE_GLSL
+    "void main(){\n"
+    "  ivec3 color8 = ivec3(clamp(v_col.rgb * 255.0 + 0.5, 0.0, 255.0));\n"
+    "  frag = vec4(psx_expand5(psx_quantize(color8, u_dither)), v_col.a);\n"
+    "}\n";
 
 /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
  * texture window, optional bilinear, texel-0 discard, STP-split discard,
@@ -871,6 +1071,9 @@ static const char *TEX_FS =
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
+    "uniform int u_dither;   /* effective per-primitive GP0(E1) dither */\n"
+    "uniform int u_scale;    /* HR samples per native VRAM pixel */\n"
+    PSX_DITHER_QUANTIZE_GLSL
     "int vram_at(int x, int y){\n"
     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
     "}\n"
@@ -892,15 +1095,18 @@ static const char *TEX_FS =
     "  }\n"
     "  return vram_at(v_tpage.x + u, v_tpage.y + v);\n"
     "}\n"
+    "ivec3 col5i(int raw){\n"
+    "  return ivec3(raw & 31, (raw >> 5) & 31, (raw >> 10) & 31);\n"
+    "}\n"
     "vec3 col5(int raw){\n"
-    "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
+    "  return vec3(col5i(raw)) / 31.0;\n"
     "}\n"
     "void main(){\n"
-    "  int stp; vec3 rgb;\n"
+    "  int stp; vec3 rgb = vec3(0.0); ivec3 nearest5 = ivec3(0);\n"
     "  if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(v_uv.x)), int(floor(v_uv.y)));\n"
     "    if (raw == 0) discard;\n"
-    "    rgb = col5(raw);\n"
+    "    nearest5 = col5i(raw);\n"
     "    stp = (raw >> 15) & 1;\n"
     "  } else {\n"
     "    /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base\n"
@@ -930,7 +1136,19 @@ static const char *TEX_FS =
     "  }\n"
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
-    "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  ivec3 color5;\n"
+    "  if (u_filter == 0) {\n"
+    "    if (v_raw != 0) color5 = nearest5;\n"
+    "    else {\n"
+    "      ivec3 color8 = ivec3(clamp(v_col.rgb * 255.0 + 0.5, 0.0, 255.0));\n"
+    "      color5 = psx_quantize((nearest5 * color8) >> 4, u_dither);\n"
+    "    }\n"
+    "  } else {\n"
+    "    if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "    ivec3 color8 = ivec3(clamp(rgb * 255.0 + 0.5, 0.0, 255.0));\n"
+    "    color5 = psx_quantize(color8, v_raw == 0 ? u_dither : 0);\n"
+    "  }\n"
+    "  rgb = psx_expand5(color5);\n"
     "  float dst_factor = 0.0;\n"
     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
@@ -940,6 +1158,8 @@ static const char *TEX_FS =
     "  blend_factor = vec4(0.0, 0.0, 0.0, dst_factor);\n"
     "}\n";
 
+#undef PSX_DITHER_QUANTIZE_GLSL
+
 /* Quad blit: used for CPU->VRAM upload flushes and VRAM->VRAM copies.
  * Samples an RGBA8 source (alpha = bit15), splits by STP for the stencil
  * write, optionally ORs set-mask into the output alpha. */
@@ -947,8 +1167,10 @@ static const char *BLIT_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;   /* native VRAM px */\n"
     "uniform float u_shift;\n"
+    "uniform ivec2 u_target_size;\n"
     "void main(){\n"
-    "  gl_Position = vec4((a_pos.x+u_shift)/512.0 - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  vec2 half_size = vec2(u_target_size) * 0.5;\n"
+    "  gl_Position = vec4((a_pos+u_shift)/half_size - 1.0, 0.0, 1.0); }\n";
 static const char *BLIT_FS =
     "#version 330\n"
     "out vec4 frag;\n"
@@ -1086,13 +1308,69 @@ static void apply_psx_blend(int mode) {
 
 /* ---- hr FBO render-state bracket ---------------------------------------- */
 static void hr_begin(int clip_to_draw_area) {
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
-    glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,
+                        s_native_view_pass ? s_native_view_pass_fbo : s_hr_fbo);
+    glViewport(0, 0,
+               (s_native_view_pass ? s_native_view_width : VRAM_W) * s_scale,
+               VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
     if (clip_to_draw_area) {
-        int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
+        int sx = s_area_x1;
+        int sw = s_area_x2 - s_area_x1 + 1;
+        int sh = s_area_y2 - s_area_y1 + 1;
+        if (s_native_view_pass) {
+            if (s_native_view_scale_2d) {
+                const int local_left = s_area_x1 - s_native_view_pass_base;
+                const int local_right = s_area_x2 -
+                                        s_native_view_pass_base + 1;
+                const int64_t left =
+                    (int64_t)local_left * s_native_view_width;
+                const int64_t right =
+                    (int64_t)local_right * s_native_view_width;
+
+                sx = left >= 0
+                    ? (int)(left / s_native_view_canonical_width)
+                    : -(int)((-left + s_native_view_canonical_width - 1) /
+                             s_native_view_canonical_width);
+                {
+                    const int scaled_right = right >= 0
+                        ? (int)((right + s_native_view_canonical_width - 1) /
+                               s_native_view_canonical_width)
+                        : -(int)((-right) / s_native_view_canonical_width);
+                    sw = scaled_right - sx;
+                }
+                if (sx < 0) {
+                    sw += sx;
+                    sx = 0;
+                }
+                if (sx + sw > s_native_view_width)
+                    sw = s_native_view_width - sx;
+            } else if (s_native_view_expand_x) {
+                sx = 0;
+                sw = s_native_view_width;
+            } else {
+                const int base_right = s_native_view_pass_base +
+                                       s_native_view_canonical_width - 1;
+
+                if (s_area_x1 <= s_native_view_pass_base &&
+                    s_area_x2 >= base_right) {
+                    sx = 0;
+                    sw = s_native_view_width;
+                } else {
+                    const int right = s_area_x2 - s_native_view_pass_base +
+                                      s_native_view_offset;
+
+                    sx = s_area_x1 - s_native_view_pass_base +
+                         s_native_view_offset;
+                    if (sx < 0) sx = 0;
+                    sw = right - sx + 1;
+                    if (sx + sw > s_native_view_width)
+                        sw = s_native_view_width - sx;
+                }
+            }
+        }
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
-        glScissor(s_area_x1 * s_scale, s_area_y1 * s_scale,
+        glScissor(sx * s_scale, s_area_y1 * s_scale,
                   sw * s_scale, sh * s_scale);
     }
 }
@@ -1168,6 +1446,7 @@ static void flush_cpu_upload(void) {
     p_glUniform1i(s_uBlitMaskset, 0);
     p_glUniform1i(s_uBlitSrcDiv, s_scale);
     p_glUniform2i(s_uBlitSrcOff, 0, 0);
+    p_glUniform2i(s_uBlitTargetSize, VRAM_W, VRAM_H);
     p_glBindVertexArray(s_blit_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
     for (int i = 0; i < nrects; i++) {
@@ -1185,6 +1464,7 @@ static void flush_cpu_upload(void) {
         plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
     }
     hr_end();
+    native_view_mirror_canonical_rects(rects, nrects);
     if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
 }
 
@@ -1228,6 +1508,11 @@ static void rebuild_mask_stencils(void) {
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         if (s_wide_fbo[i])
             rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_scale, hh);
+    }
+    for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i) {
+        if (s_native_view_fbo[i])
+            rebuild_target_stencil(s_native_view_fbo[i],
+                                   s_native_view_width * s_scale, hh);
     }
     s_stencil_valid = 1;
 }
@@ -1308,6 +1593,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
         if (xs[i] < x0) x0 = xs[i]; if (xs[i] > x1) x1 = xs[i];
         if (ys[i] < y0) y0 = ys[i]; if (ys[i] > y1) y1 = ys[i];
     }
+    if (s_native_view_pass) return;
     s_bdg_prims++;   /* dbg: prims seen this frame (gate is now per-prim, see bd_prim_gate) */
     if (s_ptrace_n < PTRACE_CAP) {
         PrimRec *p = &s_ptrace[s_ptrace_n++];
@@ -1364,6 +1650,12 @@ static void wide_target_end(GLint uXoff, GLint uXhalf) {
     p_glUniform1f(uXhalf, 512.0f);
     if (s_ws_ablate != 3)
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+}
+
+static void native_view_projection_uniforms(GLint uXoff, GLint uXhalf) {
+    p_glUniform1f(uXoff, 0.0f);
+    p_glUniform1f(uXhalf, s_native_view_pass
+        ? (float)s_native_view_width / 2.0f : 512.0f);
 }
 
 extern int psx_ws_prim_is_tagged(void);   /* gpu.c: is the current GP0 prim sprite-tagged? */
@@ -1468,7 +1760,7 @@ static void wide_clear_bd_scale(GLint uScale, GLint uCenter) {
 static float s_tb[TEXBATCH_MAXV * TEXV];
 static int   s_tb_n = 0;                    /* verts queued */
 static int   s_tb_semi = -2;
-static int   s_tb_mask = 0, s_tb_filter = 0;
+static int   s_tb_mask = 0, s_tb_filter = 0, s_tb_dither = 0;
 static int   s_tb_twin[4] = {0, 0, 0, 0};
 static uint64_t s_batch_total = 0, s_batch_reason[7];
 
@@ -1575,12 +1867,15 @@ static void flush_tex_batch(void) {
 
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
+    native_view_projection_uniforms(s_tex_uXoff, s_tex_uXhalf);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
     p_glUniform1i(s_uVram, 0);
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
+    p_glUniform1i(s_tex_uDither, s_tb_dither);
+    p_glUniform1i(s_tex_uScale, s_scale);
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -1614,7 +1909,7 @@ static void flush_tex_batch(void) {
 static float s_fb[FLATBATCH_MAXV * 6];
 static int   s_fb_n = 0;
 static int   s_fb_semi = -2;
-static int   s_fb_mask = -1;
+static int   s_fb_mask = -1, s_fb_dither = 0;
 
 static int mirror_flat_batch_center_only(int nverts) {
     if (!s_wide_fast || nverts <= 0) return 0;
@@ -1635,6 +1930,9 @@ static void flush_flat_batch(void) {
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
     p_glUseProgram(s_geo_prog);
+    native_view_projection_uniforms(s_geo_uXoff, s_geo_uXhalf);
+    p_glUniform1i(s_geo_uDither, s_fb_dither);
+    p_glUniform1i(s_geo_uScale, s_scale);
     p_glBindVertexArray(s_geo_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * 6 * sizeof(float)),
@@ -1660,7 +1958,7 @@ static void flush_flat_batch(void) {
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
  * or GL_LINES; verts are (x, y, r, g, b, a) tuples with colors as 1555. */
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
-                         const uint16_t *cs, int n, int semi) {
+                         const uint32_t *cs, int n, int semi, int dither) {
     flush_tex_batch();   /* flat prim: drain textured draws first (order + program) */
     flush_cpu_upload();  /* also drains flat batch if an upload was pending */
     mark_prim_dirty(xs, ys, n, 0 /* flat */);
@@ -1673,9 +1971,9 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         for (int i = 0; i < n; i++) {
             verts[i*6+0] = (float)xs[i];
             verts[i*6+1] = (float)ys[i];
-            verts[i*6+2] = ((cs[i] & 0x1F) << 3) / 255.0f;
-            verts[i*6+3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
-            verts[i*6+4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
+            verts[i*6+2] = (cs[i] & 0xFF) / 255.0f;
+            verts[i*6+3] = ((cs[i] >> 8) & 0xFF) / 255.0f;
+            verts[i*6+4] = ((cs[i] >> 16) & 0xFF) / 255.0f;
             verts[i*6+5] = mask_a;
         }
         hr_begin(1);
@@ -1683,6 +1981,9 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         mask_stencil(s_mask_set);
         if (mode == GL_LINES) glLineWidth((float)s_scale);
         p_glUseProgram(s_geo_prog);
+        native_view_projection_uniforms(s_geo_uXoff, s_geo_uXhalf);
+        p_glUniform1i(s_geo_uDither, dither);
+        p_glUniform1i(s_geo_uScale, s_scale);
         p_glBindVertexArray(s_geo_vao);
         p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
         p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(n * 6 * sizeof(float)),
@@ -1704,37 +2005,40 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         return;
     }
 
-    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set))
+    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set ||
+                       s_fb_dither != dither))
         flush_flat_batch();
     if (s_fb_n + n > FLATBATCH_MAXV)
         flush_flat_batch();
     s_fb_semi = semi;
     s_fb_mask = (int)s_mask_set;
+    s_fb_dither = dither;
 
     float mask_a = s_mask_set ? 1.0f : 0.0f;
     for (int i = 0; i < n; i++) {
         float *v = &s_fb[s_fb_n * 6];
         v[0] = (float)xs[i];
         v[1] = (float)ys[i];
-        v[2] = ((cs[i] & 0x1F) << 3) / 255.0f;
-        v[3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
-        v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
+        v[2] = (cs[i] & 0xFF) / 255.0f;
+        v[3] = ((cs[i] >> 8) & 0xFF) / 255.0f;
+        v[4] = ((cs[i] >> 16) & 0xFF) / 255.0f;
         v[5] = mask_a;
         s_fb_n++;
     }
 }
 
-static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
-                         int x2,int y2,uint16_t c2, int semi) {
+static void gpu_triangle(int x0,int y0,uint32_t c0, int x1,int y1,uint32_t c1,
+                         int x2,int y2,uint32_t c2, int semi, int dither) {
     int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
-    uint16_t cs[3] = {c0, c1, c2};
-    gpu_geometry(GL_TRIANGLES, xs, ys, cs, 3, semi);
+    uint32_t cs[3] = {c0, c1, c2};
+    gpu_geometry(GL_TRIANGLES, xs, ys, cs, 3, semi, dither);
 }
 
-static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int semi) {
+static void gpu_line(int x0,int y0,uint32_t c0,int x1,int y1,uint32_t c1,int semi,
+                     int dither) {
     int xs[2] = {x0, x1}, ys[2] = {y0, y1};
-    uint16_t cs[2] = {c0, c1};
-    gpu_geometry(GL_LINES, xs, ys, cs, 2, semi);
+    uint32_t cs[2] = {c0, c1};
+    gpu_geometry(GL_LINES, xs, ys, cs, 2, semi, dither);
 }
 
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
@@ -1749,7 +2053,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const int *us, const int *vs,
                                   const float *col, uint16_t texpage,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
-                                  int semi, const int *lim) {
+                                  int semi, int dither, const int *lim) {
     int lim_buf[4];
     int uv_buf[6];
     if (!lim) {
@@ -1808,7 +2112,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (s_tex_filter != s_tb_filter) reason = 3;
             else if (gate != s_tb_gate) reason = 4;
             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
-                     tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
+                      tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
+            else if (dither != s_tb_dither) reason = 5;
         }
         if (reason >= 0) {
             s_batch_reason[reason]++;
@@ -1816,7 +2121,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         }
         if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
-            s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
+            s_tb_semi = batch_semi; s_tb_mask = s_mask_set;
+            s_tb_filter = s_tex_filter; s_tb_dither = dither;
+            s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
@@ -1861,6 +2168,8 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(s_mask_set);
     p_glUseProgram(s_geo_prog);
+    p_glUniform1i(s_geo_uDither, 0);
+    p_glUniform1i(s_geo_uScale, s_scale);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
     p_glBindVertexArray(s_geo_vao);
@@ -1890,15 +2199,24 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
         overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
     }
-    if (overlay) s_wide_suppress = 1;
-    gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
-    gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+    /* Flat geometry is batched. Drain preceding geometry before changing the
+     * wide-mirror policy, then drain this overlay while its suppression is
+     * active. Otherwise a deferred flush sees suppression cleared and blends
+     * the wide margins a second time. */
     if (overlay) {
+        flush_flat_batch();
+        s_wide_suppress = 1;
+    }
+    uint32_t c24 = ((uint32_t)(c & 0x1f) << 3) |
+                   ((uint32_t)(c & 0x03e0) << 6) |
+                   ((uint32_t)(c & 0x7c00) << 9);
+    gpu_triangle(x,   y,   c24, x+w, y,   c24, x,   y+h, c24, semi, 0);
+    gpu_triangle(x+w, y,   c24, x,   y+h, c24, x+w, y+h, c24, semi, 0);
+    if (overlay) {
+        flush_flat_batch();
         s_wide_suppress = 0;
-        /* The two canonical triangles drew into the hr FBO already (each
-         * gpu_triangle ran its own hr_begin/hr_end). Re-open the bracket just
-         * for the full-width wide pass so blend/scissor/program state is
-         * clean. */
+        /* Re-open the bracket just for the full-width wide pass so
+         * blend/scissor/program state is clean. */
         if (s_ws_ablate != 1) {
             hr_begin(0);
             gl_perf_mirror_begin();
@@ -1924,10 +2242,12 @@ static void gpu_textured_rect(int x,int y,int w,int h,
     psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
-    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
+    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,
+                          s_mod_raw,semi,0,lim);
     int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
     int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
-    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
+    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,
+                          s_mod_raw,semi,0,lim);
 }
 
 /* GP0(02h) fill: writes color with bit15=0, ignoring draw area, mask and
@@ -1973,27 +2293,54 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
  * overlap), then draw it back at the destination through the BLIT program so
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
 static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+    const int native_target = s_native_view_pass;
+    const int target_width = native_target ? s_native_view_width : VRAM_W;
+    int logical_y;
+    int S;
+
     if (w <= 0 || h <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
-    /* Clamp to bounds (the software path wraps; wrapping copies are unused
-     * in practice — see the file header). */
-    if (sx < 0) sx = 0; if (sy < 0) sy = 0;
-    if (dx < 0) dx = 0; if (dy < 0) dy = 0;
-    if (sx + w > VRAM_W) w = VRAM_W - sx;
-    if (dx + w > VRAM_W) w = VRAM_W - dx;
-    if (sy + h > VRAM_H) h = VRAM_H - sy;
-    if (dy + h > VRAM_H) h = VRAM_H - dy;
-    if (w <= 0 || h <= 0) return;
+    sx &= VRAM_W - 1;
+    sy &= VRAM_H - 1;
+    dx = native_target ? dx : dx & (VRAM_W - 1);
+    dy &= VRAM_H - 1;
+    if (w > VRAM_W) w = VRAM_W;
+    if (h > VRAM_H) h = VRAM_H;
+    if (native_target && (dx < 0 || dx >= target_width)) return;
+    if (native_target && dx + w > target_width) w = target_width - dx;
+    if (w <= 0) return;
 
-    int S = s_scale;
+    S = s_scale;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
-                        sx*S, sy*S, (sx+w)*S, (sy+h)*S,
-                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    logical_y = 0;
+    while (logical_y < h) {
+        const int source_y = (sy + logical_y) & (VRAM_H - 1);
+        const int copy_h = h - logical_y < VRAM_H - source_y
+            ? h - logical_y : VRAM_H - source_y;
+        int logical_x = 0;
+
+        while (logical_x < w) {
+            const int source_x = (sx + logical_x) & (VRAM_W - 1);
+            const int copy_w = w - logical_x < VRAM_W - source_x
+                ? w - logical_x : VRAM_W - source_x;
+
+            p_glBlitFramebuffer(
+                source_x * S, source_y * S,
+                (source_x + copy_w) * S, (source_y + copy_h) * S,
+                logical_x * S, logical_y * S,
+                (logical_x + copy_w) * S, (logical_y + copy_h) * S,
+                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (!native_target)
+                coh_record(GL_COH_COPY_SRC, source_x, source_y,
+                           source_x + copy_w - 1, source_y + copy_h - 1);
+            logical_x += copy_w;
+        }
+        logical_y += copy_h;
+    }
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 
@@ -2005,30 +2352,71 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     glBindTexture(GL_TEXTURE_2D, s_scratch_tex);
     p_glUniform1i(s_uBlitSrc, 0);
     p_glUniform1i(s_uBlitMaskset, s_mask_set);
-    /* Scratch holds the source at its own hr coords: texel = frag + (src-dst)*S. */
     p_glUniform1i(s_uBlitSrcDiv, 1);
-    p_glUniform2i(s_uBlitSrcOff, (sx - dx) * S, (sy - dy) * S);
-    float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
-    float verts[6 * 2] = {
-        fx0, fy0,  fx1, fy0,  fx0, fy1,
-        fx1, fy0,  fx0, fy1,  fx1, fy1,
-    };
+    p_glUniform2i(s_uBlitTargetSize,
+                  target_width, VRAM_H);
     p_glBindVertexArray(s_blit_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
-    /* Two passes split by source bit15 so stencil tracks the copied mask. */
-    mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
-    mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
+    logical_y = 0;
+    while (logical_y < h) {
+        const int destination_y = (dy + logical_y) & (VRAM_H - 1);
+        const int copy_h = h - logical_y < VRAM_H - destination_y
+            ? h - logical_y : VRAM_H - destination_y;
+        int logical_x = 0;
+
+        while (logical_x < w) {
+            const int destination_x = native_target
+                ? dx + logical_x
+                : (dx + logical_x) & (VRAM_W - 1);
+            const int copy_w = native_target
+                ? w - logical_x
+                : (w - logical_x < VRAM_W - destination_x
+                       ? w - logical_x : VRAM_W - destination_x);
+            const float fx0 = (float)destination_x;
+            const float fy0 = (float)destination_y;
+            const float fx1 = (float)(destination_x + copy_w);
+            const float fy1 = (float)(destination_y + copy_h);
+            const float verts[6 * 2] = {
+                fx0, fy0,  fx1, fy0,  fx0, fy1,
+                fx1, fy0,  fx0, fy1,  fx1, fy1,
+            };
+
+            glScissor(destination_x * S, destination_y * S,
+                      copy_w * S, copy_h * S);
+            p_glUniform2i(s_uBlitSrcOff,
+                          (logical_x - destination_x) * S,
+                          (logical_y - destination_y) * S);
+            p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts,
+                           PSXGL_STREAM_DRAW);
+            mask_stencil(s_mask_set);
+            p_glUniform1i(s_uBlitPass, 1);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            mask_stencil(1);
+            p_glUniform1i(s_uBlitPass, 2);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            if (!native_target) {
+                rect_add(&s_pack_dirty, destination_x, destination_y,
+                         destination_x + copy_w - 1,
+                         destination_y + copy_h - 1);
+                coh_record(GL_COH_COPY, destination_x, destination_y,
+                           destination_x + copy_w - 1,
+                           destination_y + copy_h - 1);
+            }
+            logical_x += copy_w;
+        }
+        logical_y += copy_h;
+    }
     hr_end();
 
-    rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
-    s_gpu_dirty = 1;
-    coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
-    coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+    if (!native_target) s_gpu_dirty = 1;
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
-static void glb_init(uint16_t *vram) { s_vram = vram; sw_renderer_init(vram); }
+static void glb_init(uint16_t *vram) {
+    s_vram = vram;
+    s_dither = 0;
+    sw_renderer_init(vram);
+}
 
 /* Under GL the internal-resolution scale lives in the hr FBO; the CPU-side
  * (software mirror, readbacks, screenshots) stays native, so the reported
@@ -2071,20 +2459,64 @@ static void glb_set_texture_window(uint32_t r) {
     sw_set_texture_window(r);
 }
 static void glb_set_color_modulation(int r,int g,int b,int raw) { s_mod_r=r; s_mod_g=g; s_mod_b=b; s_mod_raw=raw; sw_set_color_modulation(r,g,b,raw); }
+static void glb_set_dither(int enabled) {
+    int next = enabled ? 1 : 0;
+    if (next != s_dither) {
+        flush_flat_batch();
+        flush_tex_batch();
+    }
+    s_dither = next;
+}
 static void glb_set_draw_area(int x1,int y1,int x2,int y2) { flush_flat_batch(); flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
 static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
 static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_batch(); s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
+
+static uint32_t glb_rgb555_to_rgb888(uint16_t color) {
+    return ((uint32_t)(color & 0x001f) << 3) |
+           ((uint32_t)(color & 0x03e0) << 6) |
+           ((uint32_t)(color & 0x7c00) << 9);
+}
 
 /* Pre-context draws (s_raster_ok == 0) fall back to the software rasterizer
  * over CPU VRAM; the initial full-VRAM upload at context init folds them in.
  * Post-init, the GPU pipeline is all-or-nothing — no per-prim fallback. */
 static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
     if (!s_raster_ok) { sw_draw_flat_triangle(x0,y0,x1,y1,x2,y2,col); return; }
-    gpu_triangle(x0,y0,col, x1,y1,col, x2,y2,col, s_semi_en?s_semi_mode:-1);
+    uint32_t color = glb_rgb555_to_rgb888(col);
+    gpu_triangle(x0,y0,color, x1,y1,color, x2,y2,color,
+                 s_semi_en?s_semi_mode:-1, 0);
 }
 static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int x2,int y2,uint16_t c2) {
     if (!s_raster_ok) { sw_draw_gouraud_triangle(x0,y0,c0,x1,y1,c1,x2,y2,c2); return; }
-    gpu_triangle(x0,y0,c0, x1,y1,c1, x2,y2,c2, s_semi_en?s_semi_mode:-1);
+    gpu_triangle(x0,y0,glb_rgb555_to_rgb888(c0),
+                 x1,y1,glb_rgb555_to_rgb888(c1),
+                 x2,y2,glb_rgb555_to_rgb888(c2),
+                 s_semi_en?s_semi_mode:-1, s_dither);
+}
+static void glb_draw_flat_triangle_rgb888(int x0,int y0,int x1,int y1,
+                                           int x2,int y2,uint32_t color) {
+    if (!s_raster_ok) {
+        sw_draw_flat_triangle(x0,y0,x1,y1,x2,y2,
+                              (uint16_t)(((color >> 3) & 0x1f) |
+                              ((color >> 6) & 0x03e0) |
+                              ((color >> 9) & 0x7c00)));
+        return;
+    }
+    gpu_triangle(x0,y0,color, x1,y1,color, x2,y2,color,
+                 s_semi_en?s_semi_mode:-1, 0);
+}
+static void glb_draw_gouraud_triangle_rgb888(int x0,int y0,uint32_t c0,
+                                              int x1,int y1,uint32_t c1,
+                                              int x2,int y2,uint32_t c2) {
+    if (!s_raster_ok) {
+        sw_draw_gouraud_triangle(
+            x0,y0,(uint16_t)(((c0 >> 3) & 0x1f) | ((c0 >> 6) & 0x03e0) | ((c0 >> 9) & 0x7c00)),
+            x1,y1,(uint16_t)(((c1 >> 3) & 0x1f) | ((c1 >> 6) & 0x03e0) | ((c1 >> 9) & 0x7c00)),
+            x2,y2,(uint16_t)(((c2 >> 3) & 0x1f) | ((c2 >> 6) & 0x03e0) | ((c2 >> 9) & 0x7c00)));
+        return;
+    }
+    gpu_triangle(x0,y0,c0, x1,y1,c1, x2,y2,c2,
+                 s_semi_en?s_semi_mode:-1, s_dither);
 }
 static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
     if (!s_raster_ok) { sw_fill_rect(x,y,w,h,c); return; }
@@ -2099,14 +2531,18 @@ static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1
     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
-    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1, NULL);
+    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw,
+                          s_semi_en?s_semi_mode:-1,
+                          s_dither && !s_mod_raw, NULL);
 }
 static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){
     if (!s_raster_ok) { sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw); return; }
     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
     uint32_t cc[3]={c0,c1,c2}; float col[9];
     for (int i=0;i<3;i++){ col[i*3+0]=(cc[i]&0xFF)/255.0f; col[i*3+1]=((cc[i]>>8)&0xFF)/255.0f; col[i*3+2]=((cc[i]>>16)&0xFF)/255.0f; }
-    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1, NULL);
+    gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw,
+                          s_semi_en?s_semi_mode:-1,
+                          s_dither && !raw, NULL);
 }
 static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
     if (!s_raster_ok) { sw_draw_flat_rect(x,y,w,h,c); return; }
@@ -2122,11 +2558,14 @@ static void glb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,
 }
 static void glb_draw_line(int x0,int y0,int x1,int y1,uint16_t c){
     if (!s_raster_ok) { sw_draw_line(x0,y0,x1,y1,c); return; }
-    gpu_line(x0,y0,c, x1,y1,c, s_semi_en?s_semi_mode:-1);
+    uint32_t color = glb_rgb555_to_rgb888(c);
+    gpu_line(x0,y0,color, x1,y1,color, s_semi_en?s_semi_mode:-1, s_dither);
 }
 static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1){
     if (!s_raster_ok) { sw_draw_shaded_line(x0,y0,c0,x1,y1,c1); return; }
-    gpu_line(x0,y0,c0, x1,y1,c1, s_semi_en?s_semi_mode:-1);
+    gpu_line(x0,y0,glb_rgb555_to_rgb888(c0),
+             x1,y1,glb_rgb555_to_rgb888(c1),
+             s_semi_en?s_semi_mode:-1, s_dither);
 }
 static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display(o,p,dx,dy,dw,dh); }
 static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
@@ -2182,16 +2621,18 @@ static void depth24_clear_skipped_fb(void) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     rect_add(&s_pack_dirty, x0, y0, x1, y1);
     present_dirty_rect(x0, y0, x1, y1, 1);
+    for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i)
+        s_native_view_seeded[i] = 0;
     rect_clear(&s_d24_skip_fb);
 }
 
 static void depth24_upload_policy(void) {
     int d24 = gpu_display_is_depth24();
     if (d24 && !s_depth24_skip_up) {
-        s_up_nrects = 0;
+        flush_cpu_upload();
         rect_clear(&s_d24_skip_fb);
     } else if (!d24 && s_depth24_skip_up) {
-        s_up_nrects = 0;
+        flush_cpu_upload();
         depth24_clear_skipped_fb();
         gpu_depth24_upload_span_reset();
     }
@@ -2199,15 +2640,15 @@ static void depth24_upload_policy(void) {
 }
 
 static void glb_vram_write(int x,int y,uint16_t px){
-    sw_vram_write(x,y,px);
     depth24_upload_policy();
+    sw_vram_write(x,y,px);
     /* Point pokes are never MDEC frames — always stage to FBO. */
     up_add(x & (VRAM_W-1), y & (VRAM_H-1), x & (VRAM_W-1), y & (VRAM_H-1));
 }
 static uint16_t glb_vram_read(int x,int y){ ensure_cpu(); return sw_vram_read(x,y); }
 static void glb_vram_transfer_in(int x,int y,int w,int h,const uint16_t *d){
-    sw_vram_transfer_in(x,y,w,h,d);
     depth24_upload_policy();
+    sw_vram_transfer_in(x,y,w,h,d);
     if (s_depth24_skip_up && depth24_is_fb_transfer(w, h)) {
         int x0 = x & (VRAM_W - 1), y0 = y & (VRAM_H - 1);
         rect_add(&s_d24_skip_fb, x0, y0, x0 + w - 1, y0 + h - 1);
@@ -2233,6 +2674,26 @@ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear)
         s_present_w = w; s_present_h = h;
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+    }
+}
+
+static void upload_native_present_tex(const uint32_t *pixels, int w, int h,
+                                      int linear) {
+    glBindTexture(GL_TEXTURE_2D, s_native_present_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                   linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                   linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (w != s_native_present_w || h != s_native_present_h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA,
+                     GL_UNSIGNED_BYTE, pixels);
+        s_native_present_w = w;
+        s_native_present_h = h;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA,
+                        GL_UNSIGNED_BYTE, pixels);
     }
 }
 
@@ -2339,12 +2800,17 @@ static int init_gpu_raster(void) {
     s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
+    s_geo_uDither = p_glGetUniformLocation(s_geo_prog, "u_dither");
+    s_geo_uScale = p_glGetUniformLocation(s_geo_prog, "u_scale");
+    s_tex_uDither = p_glGetUniformLocation(s_tex_prog, "u_dither");
+    s_tex_uScale = p_glGetUniformLocation(s_tex_prog, "u_scale");
     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
     s_uBlitSrcDiv  = p_glGetUniformLocation(s_blit_prog, "u_src_div");
     s_uBlitSrcOff  = p_glGetUniformLocation(s_blit_prog, "u_src_off");
+    s_uBlitTargetSize = p_glGetUniformLocation(s_blit_prog, "u_target_size");
     s_uPackHr    = p_glGetUniformLocation(s_pack_prog, "u_hr");
     s_uPackScale = p_glGetUniformLocation(s_pack_prog, "u_scale");
     s_uStencilSrc = p_glGetUniformLocation(s_stencil_prog, "u_src");
@@ -2360,8 +2826,10 @@ static int init_gpu_raster(void) {
      * otherwise zero them, collapsing all x to 0. */
     p_glUseProgram(s_geo_prog);
     p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
+    p_glUniform1i(s_geo_uDither, 0); p_glUniform1i(s_geo_uScale, s_scale);
     p_glUseProgram(s_tex_prog);
     p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
+    p_glUniform1i(s_tex_uDither, 0); p_glUniform1i(s_tex_uScale, s_scale);
 
     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
      * for the lifetime of the pipeline). Backed off by 1/64 native px so
@@ -2462,6 +2930,11 @@ static int init_gpu_raster(void) {
  * lazily-created surfaces (s_present_tex, wide compositor surfaces) are
  * untouched. Used by the live internal-scale change path. */
 static void destroy_gpu_raster(void) {
+    if (s_transaction) (void)glb_transaction_abort_pending(1);
+    glb_deferred_candidate_discard_owned();
+    glb_transaction_cleanup_deferred_staging();
+    wide_free_all();
+    native_view_free_all();
     if (s_geo_prog)     { p_glDeleteProgram(s_geo_prog);     s_geo_prog = 0; }
     if (s_tex_prog)     { p_glDeleteProgram(s_tex_prog);     s_tex_prog = 0; }
     if (s_blit_prog)    { p_glDeleteProgram(s_blit_prog);    s_blit_prog = 0; }
@@ -2513,6 +2986,8 @@ int gl_renderer_init_context(SDL_Window *win) {
     s_win = win;
     s_present_w = 0;
     s_present_h = 0;
+    s_native_present_w = 0;
+    s_native_present_h = 0;
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     s_ctx = SDL_GL_CreateContext(win);
@@ -2536,7 +3011,11 @@ int gl_renderer_init_context(SDL_Window *win) {
     int ok = load_modern_gl();
     if (ok) {
         glGenTextures(1, &s_present_tex);
+        glGenTextures(1, &s_native_present_tex);
         glBindTexture(GL_TEXTURE_2D, s_present_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, s_native_present_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         s_present_prog = build_program(PRESENT_VS, PRESENT_FS);
@@ -2587,6 +3066,10 @@ void gl_renderer_set_swap_interval(int interval) {
 }
 
 void gl_renderer_shutdown(void) {
+    if (s_ctx) SDL_GL_MakeCurrent(s_win, s_ctx);
+    if (s_transaction) (void)glb_transaction_abort_pending(0);
+    glb_deferred_candidate_discard_owned();
+    glb_transaction_cleanup_deferred_staging();
     if (s_interp_thread) {
         SDL_AtomicSet(&s_interp_thread_run, 0);
         SDL_WaitThread(s_interp_thread, NULL);
@@ -2609,19 +3092,28 @@ void gl_renderer_shutdown(void) {
             }
         }
         ensure_cpu();
+        native_view_free_all();
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
     }
+    s_transaction_deferred_staging_fbo = 0;
+    s_transaction_deferred_staging_tex = 0;
+    s_transaction_force_original = 0;
     if (s_interp_mutex) {
         SDL_DestroyMutex(s_interp_mutex);
         s_interp_mutex = NULL;
     }
     free(s_conv); s_conv = NULL;
+    free(s_canonical_digest_pixels);
+    s_canonical_digest_pixels = NULL;
+    s_canonical_digest_capacity = 0u;
     s_raster_ok = 0;
     /* New context regenerates s_present_tex empty; a stale size makes
      * upload_present_tex take glTexSubImage2D into an unallocated texture
      * (rematch 24-bit FMV → black picture, audio still runs). */
     s_present_w = 0;
     s_present_h = 0;
+    s_native_present_w = 0;
+    s_native_present_h = 0;
     s_depth24_skip_up = 0;
     rect_clear(&s_d24_skip_fb);
 }
@@ -2632,8 +3124,13 @@ void gl_renderer_shutdown(void) {
  * FMVs are authored 4:3 and have no GTE squash to compensate a stretch, so
  * widescreen presents them pillarboxed instead of distorted. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
-                         int force_4_3, int content_w) {
+                          int force_4_3, int content_w) {
+    if (s_transaction) {
+        (void)glb_transaction_reject_other_present();
+        return;
+    }
     if (!s_ctx) return;
+    if (!glb_transaction_prepare_original_present()) return;
     gl_maybe_apply_scale();
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -2700,10 +3197,84 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     latency_ring_mark(LAT_SWAP_END);
     present_force_consumed();
     s_last_present_path = GL_PRES_CPU;
+    glb_transaction_original_presented();
+}
+
+/* Independent Native FMV presentation. This is intentionally not a wrapper
+ * around gl_renderer_present(): Native owns a separate upload surface and
+ * publishes it directly through the backend. The guest MDEC/DMA path still
+ * supplies the pixels; this function only owns the host-side presentation. */
+int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
+                                         int src_h, int linear, int force_4_3,
+                                         int content_w) {
+    int ww, wh, lx, ly, lw, lh;
+    float uv_x1 = 1.f;
+    int crop;
+
+    if (s_transaction || !s_ctx || !s_native_present_tex || !pixels ||
+        src_w <= 0 || src_h <= 0)
+        return 0;
+    gl_maybe_apply_scale();
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return 0;
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (force_4_3)
+        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+    else
+        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    if (src_h < 192) {
+        int content_h = (lh * src_h) / 240;
+        if (content_h < 1) content_h = 1;
+        ly += (lh - content_h) / 2;
+        lh = content_h;
+    }
+    crop = content_w > 0 && content_w < src_w;
+    if (crop) {
+        uv_x1 = (float)content_w / (float)src_w;
+        lw = (lw * content_w) / src_w;
+        if (lw < 1) lw = 1;
+    }
+    glViewport(lx, ly, lw, lh);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    upload_native_present_tex(pixels, src_w, src_h, linear);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glUniform1i(s_present_uLutOn, 0);
+    if (crop) {
+        p_glUniform4f(s_present_uUvRect, 0.f, 0.f, uv_x1, 1.f);
+    } else if (!linear) {
+        float u0 = 0.5f / (float)src_w;
+        float v0 = 0.5f / (float)src_h;
+        p_glUniform4f(s_present_uUvRect, u0, v0, 1.f - u0, 1.f - v0);
+    } else {
+        p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    }
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
+    latency_ring_mark(LAT_SWAP_BEGIN);
+    SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
+    present_force_consumed();
+    s_last_present_path = GL_PRES_CPU;
+    return 1;
 }
 
 void gl_renderer_present_blank(void) {
+    if (s_transaction) {
+        (void)glb_transaction_reject_other_present();
+        return;
+    }
     if (!s_ctx) return;
+    if (!glb_transaction_prepare_original_present()) return;
     gl_maybe_apply_scale();
     interp_reset_history();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -2722,6 +3293,7 @@ void gl_renderer_present_blank(void) {
     latency_ring_mark(LAT_SWAP_END);
     present_force_consumed();
     s_last_present_path = GL_PRES_BLANK;
+    glb_transaction_original_presented();
 }
 
 /* Sync the authoritative FBO down into CPU VRAM (no-op when current).
@@ -2732,6 +3304,8 @@ void gl_renderer_sync_cpu(void) {
 
 void gl_renderer_invalidate_present(void) {
     for (int i = 0; i < PRES_ROWS; i++) s_present_dirty[i] = ~0ull;
+    for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i)
+        s_native_view_seeded[i] = 0;
     s_last_present_path = -1;
     s_force_present_remaining = 8;
     interp_reset_history();
@@ -3394,8 +3968,6 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
     if (active)
         fprintf(stdout, "psxrecomp: GL frame interpolation enabled: %.1f FPS "
                 "target on %.1f Hz display\n", effective_hz, host_hz);
-    else
-        fprintf(stdout, "psxrecomp: GL frame interpolation disabled (host %.1f Hz)\n", host_hz);
 }
 
 void gl_renderer_set_interpolation_suspended(int suspended) {
@@ -3625,10 +4197,11 @@ static void update_screen_lut(void) {
     s_lut_on = 1;
 }
 
-static void present_target_quad(GLuint tex, int tex_w, int tex_h,
+static void present_target_quad(GLuint target_fbo,
+                                GLuint tex, int tex_w, int tex_h,
                                 int x, int y, int w, int h, int linear,
                                 int lx, int ly, int lw, int lh) {
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, target_fbo);
     glViewport(lx, ly, lw, lh);
     update_screen_lut();
     if (s_lut_on) {
@@ -3656,9 +4229,14 @@ static void present_target_quad(GLuint tex, int tex_w, int tex_h,
     p_glUseProgram(0);
 }
 
-void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
-                              int force_4_3) {
-    if (!s_ctx || !s_raster_ok) return;
+int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+                             int force_4_3) {
+    if (s_transaction) {
+        (void)glb_transaction_reject_other_present();
+        return 0;
+    }
+    if (!s_ctx || !s_raster_ok) return 0;
+    if (!glb_transaction_prepare_original_present()) return 0;
     gl_maybe_apply_scale();
     flush_flat_batch();
     flush_tex_batch();
@@ -3670,7 +4248,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1)) {
         gl_perf_present_enter();
         gl_perf_present_exit(0);
-        return;
+        return 1;
     }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -3689,17 +4267,18 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
-    int interp_pair = interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
-                                     linear, force_4_3, GL_PRES_VRAM);
+    int interp_pair = s_transaction_force_original ? 0 :
+        interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
+                       linear, force_4_3, GL_PRES_VRAM);
     if (interp_pair) {
         gl_perf_present_exit(0);
         present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
         present_force_consumed();
         s_last_present_path = GL_PRES_VRAM;
         s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
-        return;
+        return 1;
     }
-    present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
+    present_target_quad(0, s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     /* Pre-swap hook. present_target_quad already bound FBO 0 (DRAW only)
@@ -3716,6 +4295,410 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     s_last_present_path = GL_PRES_VRAM;
     s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
+    glb_transaction_original_presented();
+    return 1;
+}
+
+static void native_view_free_all(void) {
+    for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i) {
+        if (s_native_view_fbo[i])
+            p_glDeleteFramebuffers(1, &s_native_view_fbo[i]);
+        if (s_native_view_tex[i]) glDeleteTextures(1, &s_native_view_tex[i]);
+        if (s_native_view_rb[i])
+            p_glDeleteRenderbuffers(1, &s_native_view_rb[i]);
+        s_native_view_fbo[i] = 0;
+        s_native_view_tex[i] = 0;
+        s_native_view_rb[i] = 0;
+        s_native_view_base[i] = -1;
+        s_native_view_seeded[i] = 0;
+    }
+    s_native_view_pass = 0;
+    s_native_view_pass_fbo = 0;
+    s_native_view_pass_base = 0;
+    s_native_view_expand_x = 0;
+    s_native_view_scale_2d = 0;
+}
+
+static int native_view_surface_slot(int base_x, int create) {
+    for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i) {
+        if (s_native_view_fbo[i] && s_native_view_base[i] == base_x) return i;
+    }
+    if (!create || !s_native_view_enabled || s_native_view_width <= 0) return -1;
+    for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i) {
+        if (!s_native_view_fbo[i]) {
+            const int width = s_native_view_width * s_scale;
+            const int height = VRAM_H * s_scale;
+
+            s_native_view_tex[i] = make_tex(
+                GL_RGBA8, width, height, GL_RGBA, GL_UNSIGNED_BYTE);
+            p_glGenRenderbuffers(1, &s_native_view_rb[i]);
+            p_glBindRenderbuffer(PSXGL_RENDERBUFFER, s_native_view_rb[i]);
+            p_glRenderbufferStorage(
+                PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, width, height);
+            if (!make_fbo(&s_native_view_fbo[i], s_native_view_tex[i],
+                          s_native_view_rb[i])) {
+                if (s_native_view_tex[i])
+                    glDeleteTextures(1, &s_native_view_tex[i]);
+                if (s_native_view_rb[i])
+                    p_glDeleteRenderbuffers(1, &s_native_view_rb[i]);
+                s_native_view_tex[i] = 0;
+                s_native_view_rb[i] = 0;
+                s_native_view_fbo[i] = 0;
+                return -1;
+            }
+            s_native_view_base[i] = base_x;
+            return i;
+        }
+    }
+    return -1;
+}
+
+int gl_renderer_configure_native_view(int enabled, int aspect_num,
+                                      int aspect_den, int canonical_width,
+                                      int canonical_height) {
+    int width;
+
+    if (!s_raster_ok || !s_ctx) return enabled ? 0 : 1;
+    flush_flat_batch();
+    flush_tex_batch();
+    native_view_free_all();
+    s_native_view_enabled = 0;
+    s_native_view_width = 0;
+    s_native_view_offset = 0;
+    s_native_view_canonical_height = 240;
+    if (!enabled) return 1;
+    if (aspect_num <= 0 || aspect_den <= 0 || canonical_width <= 0 ||
+        canonical_height <= 0 ||
+        aspect_num * canonical_height <= aspect_den * canonical_width)
+        return 0;
+    width = (canonical_height * aspect_num + aspect_den / 2) / aspect_den;
+    if (width <= canonical_width || width > VRAM_W) return 0;
+    s_native_view_width = width;
+    s_native_view_offset = (width - canonical_width) / 2;
+    s_native_view_canonical_width = canonical_width;
+    s_native_view_canonical_height = canonical_height;
+    s_native_view_enabled = 1;
+    return 1;
+}
+
+int gl_renderer_native_view_width(void) {
+    return s_native_view_enabled ? s_native_view_width : 0;
+}
+
+static int native_view_prepare_surface(int base_x) {
+    int slot;
+    const int width = s_native_view_width * s_scale;
+    const int height = VRAM_H * s_scale;
+    int logical_x;
+
+    base_x &= VRAM_W - 1;
+    slot = native_view_surface_slot(base_x, 1);
+    if (slot < 0) return -1;
+    if (s_native_view_seeded[slot]) return slot;
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_native_view_fbo[slot]);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClearStencil(0);
+    glStencilMask(0xff);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_native_view_fbo[slot]);
+    logical_x = 0;
+    while (logical_x < s_native_view_canonical_width) {
+        const int source_x = (base_x + logical_x) & (VRAM_W - 1);
+        const int copy_w = s_native_view_canonical_width - logical_x <
+                VRAM_W - source_x
+            ? s_native_view_canonical_width - logical_x
+            : VRAM_W - source_x;
+        const int destination_x = s_native_view_offset + logical_x;
+
+        p_glBlitFramebuffer(
+            source_x * s_scale, 0,
+            (source_x + copy_w) * s_scale, height,
+            destination_x * s_scale, 0,
+            (destination_x + copy_w) * s_scale, height,
+            GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+        logical_x += copy_w;
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, width, height);
+    s_native_view_seeded[slot] = 1;
+    return slot;
+}
+
+static void native_view_mirror_canonical_rects(const DirtyRect *rects,
+                                                 int rect_count) {
+    const int scale = s_scale;
+
+    if (!s_native_view_enabled || !rects || rect_count <= 0) return;
+    for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot) {
+        const int base_x = s_native_view_base[slot];
+
+        if (!s_native_view_fbo[slot] || !s_native_view_seeded[slot]) continue;
+        for (int index = 0; index < rect_count; ++index) {
+            const int y0 = rects[index].y0;
+            const int y1 = rects[index].y1;
+            int logical_x = 0;
+
+            while (logical_x < s_native_view_canonical_width) {
+                const int source_x = (base_x + logical_x) & (VRAM_W - 1);
+                const int span_w = s_native_view_canonical_width - logical_x <
+                        VRAM_W - source_x
+                    ? s_native_view_canonical_width - logical_x
+                    : VRAM_W - source_x;
+                int x0 = rects[index].x0 > source_x
+                    ? rects[index].x0 : source_x;
+                int x1 = rects[index].x1 < source_x + span_w - 1
+                    ? rects[index].x1 : source_x + span_w - 1;
+
+                if (x0 <= x1 && y0 <= y1) {
+                    const int destination_x = s_native_view_offset + logical_x +
+                                              x0 - source_x;
+                    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+                    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,
+                                        s_native_view_fbo[slot]);
+                    glDisable(GL_SCISSOR_TEST);
+                    p_glBlitFramebuffer(
+                        x0 * scale, y0 * scale,
+                        (x1 + 1) * scale, (y1 + 1) * scale,
+                        destination_x * scale, y0 * scale,
+                        (destination_x + x1 - x0 + 1) * scale,
+                        (y1 + 1) * scale,
+                        GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
+                        GL_NEAREST);
+                }
+                logical_x += span_w;
+            }
+        }
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
+
+static void native_view_fill_local_rect(int slot, int local_x, int y,
+                                        int local_w, int h, uint16_t color) {
+    float red;
+    float green;
+    float blue;
+
+    if (slot < 0 || !s_native_view_fbo[slot] || local_w <= 0 || h <= 0)
+        return;
+    if (local_x < 0) {
+        local_w += local_x;
+        local_x = 0;
+    }
+    if (local_x + local_w > s_native_view_width)
+        local_w = s_native_view_width - local_x;
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (y + h > VRAM_H) h = VRAM_H - y;
+    if (local_w <= 0 || h <= 0) return;
+    red = (color & 0x1f) / 31.0f;
+    green = ((color >> 5) & 0x1f) / 31.0f;
+    blue = ((color >> 10) & 0x1f) / 31.0f;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_native_view_fbo[slot]);
+    glViewport(0, 0, s_native_view_width * s_scale, VRAM_H * s_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(local_x * s_scale, y * s_scale,
+              local_w * s_scale, h * s_scale);
+    glClearColor(red, green, blue, 0.0f);
+    glClearStencil(0);
+    glStencilMask(0xff);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+}
+
+static void native_view_fill_local_wrapped_y(int slot, int local_x, int y,
+                                             int w, int h, uint16_t color) {
+    int first_height;
+
+    if (h <= 0) return;
+    y &= VRAM_H - 1;
+    if (h > VRAM_H) h = VRAM_H;
+    first_height = h < VRAM_H - y ? h : VRAM_H - y;
+    native_view_fill_local_rect(slot, local_x, y, w, first_height, color);
+    if (first_height < h)
+        native_view_fill_local_rect(slot, local_x, 0, w,
+                                    h - first_height, color);
+}
+
+static void native_view_ensure_destination_surfaces(int x, int w) {
+    int remaining;
+    int segment_x;
+
+    if (!s_native_view_enabled || w <= 0) return;
+    segment_x = x & (VRAM_W - 1);
+    remaining = w > VRAM_W ? VRAM_W : w;
+    while (remaining > 0) {
+        const int segment_w = remaining < VRAM_W - segment_x
+            ? remaining : VRAM_W - segment_x;
+        const int segment_end = segment_x + segment_w;
+        int base_x = (segment_x / s_native_view_canonical_width) *
+                     s_native_view_canonical_width;
+
+        while (base_x < segment_end) {
+            (void)native_view_prepare_surface(base_x);
+            base_x += s_native_view_canonical_width;
+        }
+        remaining -= segment_w;
+        segment_x = 0;
+    }
+}
+
+static void glb_native_fill_rect(int x, int y, int w, int h, uint16_t color) {
+    const int operation_x = x & (VRAM_W - 1);
+    const int operation_w = w > VRAM_W ? VRAM_W : w;
+
+    if (!s_raster_ok) {
+        sw_fill_rect(x, y, w, h, color);
+        return;
+    }
+    gpu_fill(x, y, w, h, color);
+    if (!s_native_view_enabled || w <= 0) return;
+    native_view_ensure_destination_surfaces(operation_x, operation_w);
+    for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot) {
+        const int base_x = s_native_view_base[slot];
+        const int base_distance = (base_x - operation_x) & (VRAM_W - 1);
+        int operation_logical_x = 0;
+
+        if (!s_native_view_fbo[slot] || !s_native_view_seeded[slot]) continue;
+        if (operation_w == VRAM_W ||
+                base_distance + s_native_view_canonical_width <= operation_w) {
+            native_view_fill_local_wrapped_y(
+                slot, 0, y, s_native_view_width, h, color);
+            continue;
+        }
+        while (operation_logical_x < operation_w) {
+            const int destination_x =
+                (operation_x + operation_logical_x) & (VRAM_W - 1);
+            const int destination_w = operation_w - operation_logical_x <
+                    VRAM_W - destination_x
+                ? operation_w - operation_logical_x : VRAM_W - destination_x;
+            int surface_logical_x = 0;
+
+            while (surface_logical_x < s_native_view_canonical_width) {
+                const int surface_x =
+                    (base_x + surface_logical_x) & (VRAM_W - 1);
+                const int surface_w = s_native_view_canonical_width -
+                            surface_logical_x < VRAM_W - surface_x
+                    ? s_native_view_canonical_width - surface_logical_x
+                    : VRAM_W - surface_x;
+                const int overlap_x = destination_x > surface_x
+                    ? destination_x : surface_x;
+                const int overlap_end = destination_x + destination_w <
+                            surface_x + surface_w
+                    ? destination_x + destination_w : surface_x + surface_w;
+
+                if (overlap_x < overlap_end)
+                    native_view_fill_local_wrapped_y(
+                        slot,
+                        s_native_view_offset + surface_logical_x +
+                            overlap_x - surface_x,
+                        y, overlap_end - overlap_x, h, color);
+                surface_logical_x += surface_w;
+            }
+            operation_logical_x += destination_w;
+        }
+    }
+}
+
+static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
+                                 int w, int h) {
+    if (!s_raster_ok) {
+        sw_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+        return;
+    }
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    if (s_native_view_enabled && w > 0) {
+        const int operation_x = dst_x & (VRAM_W - 1);
+        const int operation_w = w > VRAM_W ? VRAM_W : w;
+
+        native_view_ensure_destination_surfaces(operation_x, operation_w);
+        for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot) {
+            const int base_x = s_native_view_base[slot];
+            int operation_logical_x = 0;
+
+            if (!s_native_view_fbo[slot] || !s_native_view_seeded[slot])
+                continue;
+            while (operation_logical_x < operation_w) {
+                const int destination_x =
+                    (operation_x + operation_logical_x) & (VRAM_W - 1);
+                const int destination_w = operation_w - operation_logical_x <
+                        VRAM_W - destination_x
+                    ? operation_w - operation_logical_x
+                    : VRAM_W - destination_x;
+                int surface_logical_x = 0;
+
+                while (surface_logical_x < s_native_view_canonical_width) {
+                    const int surface_x =
+                        (base_x + surface_logical_x) & (VRAM_W - 1);
+                    const int surface_w = s_native_view_canonical_width -
+                                surface_logical_x < VRAM_W - surface_x
+                        ? s_native_view_canonical_width - surface_logical_x
+                        : VRAM_W - surface_x;
+                    const int overlap_x = destination_x > surface_x
+                        ? destination_x : surface_x;
+                    const int overlap_end = destination_x + destination_w <
+                                surface_x + surface_w
+                        ? destination_x + destination_w
+                        : surface_x + surface_w;
+
+                    if (overlap_x < overlap_end) {
+                        s_native_view_pass = 1;
+                        s_native_view_pass_fbo = s_native_view_fbo[slot];
+                        s_native_view_pass_base = base_x;
+                        gpu_copy_rect(
+                            src_x + operation_logical_x + overlap_x -
+                                destination_x,
+                            src_y,
+                            s_native_view_offset + surface_logical_x +
+                                overlap_x - surface_x,
+                            dst_y, overlap_end - overlap_x, h);
+                        s_native_view_pass = 0;
+                        s_native_view_pass_fbo = 0;
+                        s_native_view_pass_base = 0;
+                    }
+                    surface_logical_x += surface_w;
+                }
+                operation_logical_x += destination_w;
+            }
+        }
+        dst_x = operation_x;
+        w = operation_w;
+    }
+    gpu_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+}
+
+/* Native presentation wrappers. The frame data still came through the
+ * canonical guest MDEC/DMA/VRAM path; these wrappers only select the active
+ * OpenGL backend's presentation operation instead of the legacy main.cpp
+ * presentation call site. */
+static int glb_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+                            int force_4_3) {
+    return gl_renderer_present_vram(disp_x, disp_y, w, h, linear, force_4_3);
+}
+
+static int glb_present_cpu_frame(const uint32_t *pixels, int src_w, int src_h,
+                                 int linear, int force_4_3, int content_w) {
+    if (!s_ctx || s_transaction) return 0;
+    gl_renderer_present(pixels, src_w, src_h, linear, force_4_3, content_w);
+    return 1;
+}
+
+static int glb_present_native_cpu_frame(const uint32_t *pixels, int src_w,
+                                        int src_h, int linear, int force_4_3,
+                                        int content_w) {
+    return gl_renderer_present_native_cpu_frame(
+        pixels, src_w, src_h, linear, force_4_3, content_w);
 }
 
 /* Native-wide fast path: authoritatively copy the canonical 4:3 framebuffer
@@ -3758,7 +4741,12 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * bottom-origin → window top). Returns 0 if there's no wide surface for base_x
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
+    if (s_transaction) {
+        (void)glb_transaction_reject_other_present();
+        return 1;
+    }
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
+    if (!glb_transaction_prepare_original_present()) return 1;
     gl_maybe_apply_scale();
     GLuint fbo = 0, tex = 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
@@ -3790,8 +4778,9 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
-    int interp_pair = interp_capture(fbo, 0, disp_y, g_wide_w, disp_h,
-                                     linear, 0, GL_PRES_WIDE);
+    int interp_pair = s_transaction_force_original ? 0 :
+        interp_capture(fbo, 0, disp_y, g_wide_w, disp_h,
+                       linear, 0, GL_PRES_WIDE);
     if (interp_pair) {
         gl_perf_present_exit(1);
         present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
@@ -3801,7 +4790,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         s_last_dw = g_wide_w; s_last_dh = disp_h;
         return 1;
     }
-    present_target_quad(tex, g_wide_w, VRAM_H,
+    present_target_quad(0, tex, g_wide_w, VRAM_H,
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     /* Pre-swap hook on the wide FBO path. present_target_quad bound FBO 0
@@ -3819,7 +4808,1495 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     s_last_present_path = GL_PRES_WIDE;
     s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = g_wide_w; s_last_dh = disp_h;
     coh_record(GL_COH_PRESENT, 0, disp_y, g_wide_w - 1, disp_y + disp_h - 1);
+    glb_transaction_original_presented();
     return 1;
+}
+
+int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
+                                    int linear) {
+    int slot;
+    int ww, wh, lx, ly, lw, lh;
+
+    if (s_transaction) {
+        (void)glb_transaction_reject_other_present();
+        return 1;
+    }
+    if (!s_ctx || !s_raster_ok || !s_native_view_enabled) return 0;
+    if (!glb_transaction_prepare_original_present()) return 1;
+    gl_maybe_apply_scale();
+    slot = native_view_prepare_surface(disp_x);
+    if (slot < 0) return 0;
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    gl_perf_present_enter();
+    ww = wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, ww, wh);
+    if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    present_target_quad(0, s_native_view_tex[slot], s_native_view_width, VRAM_H,
+                        0, disp_y, s_native_view_width, disp_h,
+                        linear, lx, ly, lw, lh);
+    pres_record(GL_PRES_WIDE, disp_x, disp_y, s_native_view_width, disp_h,
+                lx, ly, lw, lh);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
+    latency_ring_mark(LAT_SWAP_BEGIN);
+    SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
+    gl_perf_present_exit(1);
+    present_force_consumed();
+    s_last_present_path = GL_PRES_WIDE;
+    s_last_dx = disp_x;
+    s_last_dy = disp_y;
+    s_last_dw = s_native_view_width;
+    s_last_dh = disp_h;
+    coh_record(GL_COH_PRESENT, 0, disp_y, s_native_view_width - 1,
+               disp_y + disp_h - 1);
+    glb_transaction_original_presented();
+    return 1;
+}
+
+int gl_renderer_native_view_peek(int base_x, int x, int y,
+                                  int w, int h, uint16_t *out) {
+    int slot;
+    const int physical_w = w * s_scale;
+    const int physical_h = h * s_scale;
+    uint32_t *pixels;
+
+    if (!out || x < 0 || y < 0 || w <= 0 || h <= 0 ||
+        x + w > s_native_view_width || y + h > VRAM_H)
+        return 0;
+    slot = native_view_surface_slot(base_x, 0);
+    if (slot < 0) return 0;
+    flush_flat_batch();
+    flush_tex_batch();
+    pixels = (uint32_t *)malloc(
+        (size_t)physical_w * physical_h * sizeof(*pixels));
+    if (!pixels) return 0;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_native_view_fbo[slot]);
+    glReadPixels(x * s_scale, y * s_scale, physical_w, physical_h,
+                 GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    for (int row = 0; row < h; ++row) {
+        for (int column = 0; column < w; ++column) {
+            const uint32_t pixel = pixels[
+                (size_t)(row * s_scale) * physical_w + column * s_scale];
+            const uint32_t red = (pixel >> 16u) & 0xffu;
+            const uint32_t green = (pixel >> 8u) & 0xffu;
+            const uint32_t blue = pixel & 0xffu;
+
+            out[row * w + column] = (uint16_t)(
+                (red >> 3u) | ((green >> 3u) << 5u) |
+                ((blue >> 3u) << 10u) | ((pixel >> 16u) & 0x8000u));
+        }
+    }
+    free(pixels);
+    return 1;
+}
+
+static uint64_t canonical_digest_byte(uint64_t hash, uint8_t value) {
+    return (hash ^ value) * UINT64_C(1099511628211);
+}
+
+static uint64_t canonical_digest_u32(uint64_t hash, uint32_t value) {
+    for (unsigned int byte = 0u; byte < 4u; ++byte)
+        hash = canonical_digest_byte(hash, (uint8_t)(value >> (byte * 8u)));
+    return hash;
+}
+
+static int glb_canonical_framebuffer_digest(int display_x, int display_y,
+                                            int display_width,
+                                            int display_height,
+                                            uint64_t *out_digest) {
+    GLuint source_fbo = s_hr_fbo;
+    size_t width;
+    size_t height;
+    size_t read_x;
+    size_t read_y;
+    size_t byte_count;
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    if (!out_digest || !glb_transaction_context_ready() || !source_fbo ||
+        display_x < 0 || display_y < 0 || display_width <= 0 ||
+        display_height <= 0 || display_x > VRAM_W - display_width ||
+        display_y > VRAM_H - display_height || s_scale <= 0)
+        return 0;
+    read_x = (size_t)display_x * (size_t)s_scale;
+    read_y = (size_t)display_y * (size_t)s_scale;
+    width = (size_t)display_width * (size_t)s_scale;
+    height = (size_t)display_height * (size_t)s_scale;
+    if (width > SIZE_MAX / height / 4u) return 0;
+    if (s_transaction && s_transaction->deferred_candidate_token !=
+            GPU_RENDER_DEFERRED_CANDIDATE_NONE) {
+        if (s_deferred_candidate.token !=
+                s_transaction->deferred_candidate_token ||
+            !s_deferred_candidate.framebuffer)
+            return 0;
+        source_fbo = s_deferred_candidate.framebuffer;
+    } else {
+        flush_flat_batch();
+        flush_tex_batch();
+        flush_cpu_upload();
+    }
+    byte_count = width * height * 4u;
+    if (byte_count > s_canonical_digest_capacity) {
+        uint8_t *pixels = (uint8_t *)realloc(
+            s_canonical_digest_pixels, byte_count);
+        if (!pixels) return 0;
+        s_canonical_digest_pixels = pixels;
+        s_canonical_digest_capacity = byte_count;
+    }
+
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels((GLint)read_x, (GLint)read_y,
+                 (GLsizei)width, (GLsizei)height,
+                 GL_RGBA, GL_UNSIGNED_BYTE, s_canonical_digest_pixels);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    if (!glb_transaction_context_ready()) return 0;
+
+    /* GL's bottom row is the canonical PS1 top scanline in this FBO. Alpha is
+     * the hidden PS1 mask bit, so normalize it to opaque host RGBA8. */
+    hash = canonical_digest_u32(hash, UINT32_C(0x58475246));
+    hash = canonical_digest_u32(hash, (uint32_t)width);
+    hash = canonical_digest_u32(hash, (uint32_t)height);
+    hash = canonical_digest_u32(hash, UINT32_C(0x52474241));
+    for (size_t pixel = 0u; pixel < width * height; ++pixel) {
+        const uint8_t *rgba = &s_canonical_digest_pixels[pixel * 4u];
+        hash = canonical_digest_byte(hash, rgba[0]);
+        hash = canonical_digest_byte(hash, rgba[1]);
+        hash = canonical_digest_byte(hash, rgba[2]);
+        hash = canonical_digest_byte(hash, UINT8_C(0xff));
+    }
+    *out_digest = hash;
+    return 1;
+}
+
+/* ---- atomic semantic-render transaction -------------------------------- */
+
+static int glb_transaction_id_equal(GpuRenderTransactionId left,
+                                    GpuRenderTransactionId right) {
+    return left.scene_epoch == right.scene_epoch &&
+           left.state_sequence == right.state_sequence;
+}
+
+static int glb_transaction_context_ready(void) {
+    return s_ctx != NULL && s_win != NULL && s_raster_ok && s_vram != NULL &&
+           SDL_GL_GetCurrentContext() == s_ctx &&
+           SDL_GL_GetCurrentWindow() == s_win;
+}
+
+static int glb_transaction_prepare_original_present(void) {
+    if (!s_transaction_force_original) return 1;
+    if (!glb_transaction_context_ready()) return 0;
+    glb_transaction_cleanup_deferred_staging();
+    return 1;
+}
+
+static void glb_transaction_original_presented(void) {
+    if (!s_transaction_force_original) return;
+    s_transaction_force_original = 0;
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.forced_original_presents++;
+#endif
+}
+
+static int glb_transaction_interpolation_quiesced(void) {
+    int quiesced;
+
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    quiesced = !s_interp_enabled && s_interp_valid == 0;
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+    return quiesced;
+}
+
+static int glb_transaction_consume_gl_errors(void) {
+    int saw_error = 0;
+
+    while (glGetError() != GL_NO_ERROR) saw_error = 1;
+    return saw_error;
+}
+
+static GpuRenderTransactionStatus glb_transaction_drain(void) {
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    pack_flush();
+    glFlush();
+    return glb_transaction_consume_gl_errors()
+        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR
+        : GPU_RENDER_TRANSACTION_OK;
+}
+
+/* A Native fallback or UI producer can submit the PS1 transition filter as a
+ * flat, untextured 320x224/240 quad. The canonical pass remains unchanged, but
+ * the Native-view pass must extend that quad into both revealed columns;
+ * centering the original coordinates would otherwise leave the margins
+ * unfaded. */
+static int glb_native_view_fullscreen_flat_quad(
+        const GpuRenderSemantic *semantic) {
+    int min_x = INT_MAX, max_x = INT_MIN;
+    int min_y = INT_MAX, max_y = INT_MIN;
+    int fullscreen_height;
+    GpuDisplayInfo display = {0};
+
+    if (!semantic || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count != 2u || semantic->line_count != 0u ||
+        semantic->material.textured || semantic->material.raw_texture ||
+        semantic->material.shading != GPU_RENDER_SHADING_FLAT)
+        return 0;
+    for (uint8_t triangle_index = 0u;
+         triangle_index < semantic->triangle_count; ++triangle_index) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+            int x;
+            int y;
+
+            if (vertex->native_view_position) return 0;
+            x = vertex->x / INT32_C(65536) + semantic->material.draw_offset_x -
+                s_native_view_pass_base;
+            y = vertex->y / INT32_C(65536) + semantic->material.draw_offset_y;
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+    }
+    fullscreen_height = s_native_view_canonical_height;
+    gpu_get_display_info(&display);
+    if (display.height > 0u &&
+        display.height < (uint32_t)fullscreen_height)
+        fullscreen_height = (int)display.height;
+    /* PS1 games commonly draw their full-screen filters in the 224-line
+     * active band while leaving the CRTC in its 240-line mode. Both 224 and
+     * 240 are complete display bands, so do not center a 320x224 transition
+     * merely because the current CRTC range reports 240 lines. */
+    if (fullscreen_height > 224)
+        fullscreen_height = 224;
+    return min_x <= 0 && max_x >= s_native_view_canonical_width &&
+           min_y <= 0 && max_y >= fullscreen_height;
+}
+
+/* Native semantic equivalent of ws_nw_backdrop_stretch_quad(). The legacy
+ * path sees GP0 vertices directly; Native receives two triangles, so classify
+ * their combined bounds before mapping the horizontal edges to the wide view. */
+static int glb_native_view_backdrop_quad(const GpuRenderSemantic *semantic) {
+    enum { EDGE = 24 };
+    int min_x = INT_MAX, max_x = INT_MIN;
+    int min_y = INT_MAX, max_y = INT_MIN;
+
+    if (!semantic || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count != 2u || semantic->line_count != 0u)
+        return 0;
+    for (uint8_t triangle_index = 0u;
+         triangle_index < semantic->triangle_count; ++triangle_index) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+            const int x = vertex->x / INT32_C(65536) +
+                semantic->material.draw_offset_x - s_native_view_pass_base;
+            const int y = vertex->y / INT32_C(65536) +
+                semantic->material.draw_offset_y;
+
+            if (vertex->native_view_position) return 0;
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+    }
+    if (min_x > EDGE || max_x < s_native_view_canonical_width - EDGE ||
+        max_y - min_y < 64)
+        return 0;
+    for (uint8_t triangle_index = 0u;
+         triangle_index < semantic->triangle_count; ++triangle_index) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+            const int x = vertex->x / INT32_C(65536) +
+                semantic->material.draw_offset_x - s_native_view_pass_base;
+            const int y = vertex->y / INT32_C(65536) +
+                semantic->material.draw_offset_y;
+
+            if (!((x - min_x <= EDGE || max_x - x <= EDGE) &&
+                  (y - min_y <= EDGE || max_y - y <= EDGE)))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static int glb_native_view_semantic_target_base(
+        const GpuRenderSemantic *semantic) {
+    const GpuRenderMaterial *material;
+    int minimum_x = INT_MAX;
+    int maximum_x = INT_MIN;
+
+    if (!semantic || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count == 0u)
+        return 0;
+    material = &semantic->material;
+    for (uint8_t triangle_index = 0u;
+         triangle_index < semantic->triangle_count; ++triangle_index) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const int x = triangle->vertices[vertex_index].x /
+                              INT32_C(65536) + material->draw_offset_x;
+
+            if (x < minimum_x) minimum_x = x;
+            if (x > maximum_x) maximum_x = x;
+        }
+    }
+    if (minimum_x < material->draw_area_left)
+        minimum_x = material->draw_area_left;
+    if (maximum_x > material->draw_area_right)
+        maximum_x = material->draw_area_right;
+    if (minimum_x > maximum_x)
+        minimum_x = material->draw_area_left;
+    return ((minimum_x / s_native_view_canonical_width) *
+            s_native_view_canonical_width) & (VRAM_W - 1);
+}
+
+static int glb_native_view_semantic_reaches_reveal(
+        const GpuRenderSemantic *semantic) {
+    if (!semantic || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES)
+        return 0;
+    for (uint8_t triangle_index = 0u;
+         triangle_index < semantic->triangle_count; ++triangle_index) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+            const int x = (vertex->native_view_position
+                               ? vertex->native_view_x : vertex->x) /
+                    INT32_C(65536) + semantic->material.draw_offset_x -
+                s_native_view_pass_base;
+
+            if (x < 0 || x >= s_native_view_canonical_width) return 1;
+        }
+    }
+    return 0;
+}
+
+static int glb_native_view_overlay_x(int canonical_x, int fullscreen_overlay) {
+    const int local_x = canonical_x - s_native_view_pass_base;
+    int mapped_x;
+
+    if (!fullscreen_overlay) {
+        mapped_x = local_x + s_native_view_offset;
+        if (local_x == s_native_view_canonical_width +
+                           s_native_view_offset - 1)
+            return s_native_view_width;
+        return mapped_x;
+    }
+    if (local_x <= 0) return local_x;
+    if (local_x >= s_native_view_canonical_width)
+        return s_native_view_width;
+    return local_x + s_native_view_offset;
+}
+
+static int glb_native_view_screen_2d_x(int canonical_x) {
+    const int local_x = canonical_x - s_native_view_pass_base;
+    const int64_t scaled = (int64_t)local_x * s_native_view_width;
+
+    return scaled >= 0
+        ? (int)(scaled / s_native_view_canonical_width)
+        : -(int)((-scaled + s_native_view_canonical_width - 1) /
+                 s_native_view_canonical_width);
+}
+
+static void glb_transaction_snapshot(GlTransactionCheckpoint *checkpoint) {
+    memcpy(checkpoint->vram, s_vram, sizeof(checkpoint->vram));
+
+    checkpoint->off_x = s_off_x; checkpoint->off_y = s_off_y;
+    checkpoint->area_x1 = s_area_x1; checkpoint->area_y1 = s_area_y1;
+    checkpoint->area_x2 = s_area_x2; checkpoint->area_y2 = s_area_y2;
+    checkpoint->semi_en = s_semi_en; checkpoint->semi_mode = s_semi_mode;
+    checkpoint->mod_r = s_mod_r; checkpoint->mod_g = s_mod_g;
+    checkpoint->mod_b = s_mod_b; checkpoint->mod_raw = s_mod_raw;
+    checkpoint->dither = s_dither;
+    checkpoint->mask_set = s_mask_set; checkpoint->mask_check = s_mask_check;
+    checkpoint->tw_mask_x = s_tw_mask_x; checkpoint->tw_mask_y = s_tw_mask_y;
+    checkpoint->tw_off_x = s_tw_off_x; checkpoint->tw_off_y = s_tw_off_y;
+    checkpoint->tex_filter = s_tex_filter;
+    checkpoint->stencil_valid = s_stencil_valid;
+
+    checkpoint->gpu_dirty = s_gpu_dirty;
+    checkpoint->pack_dirty = s_pack_dirty;
+    checkpoint->up_nrects = s_up_nrects;
+    memcpy(checkpoint->up_rects, s_up_rects, sizeof(checkpoint->up_rects));
+    checkpoint->depth24_skip_up = s_depth24_skip_up;
+    checkpoint->d24_skip_fb = s_d24_skip_fb;
+
+    memcpy(checkpoint->present_dirty, s_present_dirty,
+           sizeof(checkpoint->present_dirty));
+    checkpoint->last_present_path = s_last_present_path;
+    checkpoint->last_dx = s_last_dx; checkpoint->last_dy = s_last_dy;
+    checkpoint->last_dw = s_last_dw; checkpoint->last_dh = s_last_dh;
+    checkpoint->force_present_remaining = s_force_present_remaining;
+
+    checkpoint->coh_seq = s_coh_seq;
+    memcpy(checkpoint->rt_up_diag, s_rt_up_diag,
+           sizeof(checkpoint->rt_up_diag));
+    checkpoint->scene_prims = s_scene_prims;
+    checkpoint->scene_prims_tex = s_scene_prims_tex;
+    checkpoint->batch_total = s_batch_total;
+    memcpy(checkpoint->batch_reason, s_batch_reason,
+           sizeof(checkpoint->batch_reason));
+    checkpoint->bd_gate = s_bd_gate; checkpoint->tb_gate = s_tb_gate;
+    checkpoint->wide_suppress = s_wide_suppress;
+    checkpoint->bdg_applied = s_bdg_applied;
+    checkpoint->bdg_prims = s_bdg_prims;
+    checkpoint->bdg_clearx = s_bdg_clearx;
+    memcpy(checkpoint->ptrace, s_ptrace, sizeof(checkpoint->ptrace));
+    checkpoint->ptrace_n = s_ptrace_n;
+    checkpoint->tb_semi = s_tb_semi; checkpoint->tb_mask = s_tb_mask;
+    checkpoint->tb_filter = s_tb_filter; checkpoint->tb_dither = s_tb_dither;
+    memcpy(checkpoint->tb_twin, s_tb_twin, sizeof(checkpoint->tb_twin));
+    checkpoint->fb_semi = s_fb_semi; checkpoint->fb_mask = s_fb_mask;
+    checkpoint->fb_dither = s_fb_dither;
+    checkpoint->cw_flush_ms = s_cw_flush_ms;
+    checkpoint->cw_wide_ms = s_cw_wide_ms;
+    checkpoint->cw_batches = s_cw_batches;
+    checkpoint->cw_wide_sets = s_cw_wide_sets;
+    checkpoint->cw_wide_cfgs = s_cw_wide_cfgs;
+    checkpoint->cw_wide_clears = s_cw_wide_clears;
+    checkpoint->cw_fbo_creates = s_cw_fbo_creates;
+    checkpoint->cw_flush_depth = s_cw_flush_depth;
+}
+
+static void glb_transaction_restore_draw_state(
+        const GlTransactionCheckpoint *checkpoint, int ensure_stencil) {
+    if (ensure_stencil && checkpoint->mask_check && !s_stencil_valid)
+        rebuild_mask_stencils();
+
+    s_off_x = checkpoint->off_x; s_off_y = checkpoint->off_y;
+    s_area_x1 = checkpoint->area_x1; s_area_y1 = checkpoint->area_y1;
+    s_area_x2 = checkpoint->area_x2; s_area_y2 = checkpoint->area_y2;
+    s_semi_en = checkpoint->semi_en; s_semi_mode = checkpoint->semi_mode;
+    s_mod_r = checkpoint->mod_r; s_mod_g = checkpoint->mod_g;
+    s_mod_b = checkpoint->mod_b; s_mod_raw = checkpoint->mod_raw;
+    s_dither = checkpoint->dither;
+    s_mask_set = checkpoint->mask_set; s_mask_check = checkpoint->mask_check;
+    s_tw_mask_x = checkpoint->tw_mask_x;
+    s_tw_mask_y = checkpoint->tw_mask_y;
+    s_tw_off_x = checkpoint->tw_off_x;
+    s_tw_off_y = checkpoint->tw_off_y;
+    s_tex_filter = checkpoint->tex_filter;
+
+    sw_set_draw_area(checkpoint->area_x1, checkpoint->area_y1,
+                     checkpoint->area_x2, checkpoint->area_y2);
+    sw_set_draw_offset(checkpoint->off_x, checkpoint->off_y);
+    sw_set_semi_transparency(checkpoint->semi_en, checkpoint->semi_mode);
+    sw_set_mask_bits(checkpoint->mask_set, checkpoint->mask_check);
+    sw_set_texture_window((uint32_t)checkpoint->tw_mask_x |
+                          ((uint32_t)checkpoint->tw_mask_y << 5) |
+                          ((uint32_t)checkpoint->tw_off_x << 10) |
+                          ((uint32_t)checkpoint->tw_off_y << 15));
+    sw_set_color_modulation(checkpoint->mod_r, checkpoint->mod_g,
+                            checkpoint->mod_b, checkpoint->mod_raw);
+    sw_set_texture_filter(checkpoint->tex_filter);
+}
+
+static void glb_transaction_restore_snapshot_state(
+        const GlTransactionCheckpoint *checkpoint) {
+    glb_transaction_restore_draw_state(checkpoint, 0);
+    s_stencil_valid = checkpoint->stencil_valid;
+
+    s_gpu_dirty = checkpoint->gpu_dirty;
+    s_pack_dirty = checkpoint->pack_dirty;
+    s_up_nrects = checkpoint->up_nrects;
+    memcpy(s_up_rects, checkpoint->up_rects, sizeof(checkpoint->up_rects));
+    s_depth24_skip_up = checkpoint->depth24_skip_up;
+    s_d24_skip_fb = checkpoint->d24_skip_fb;
+
+    memcpy(s_present_dirty, checkpoint->present_dirty,
+           sizeof(checkpoint->present_dirty));
+    s_last_present_path = checkpoint->last_present_path;
+    s_last_dx = checkpoint->last_dx; s_last_dy = checkpoint->last_dy;
+    s_last_dw = checkpoint->last_dw; s_last_dh = checkpoint->last_dh;
+    s_force_present_remaining = checkpoint->force_present_remaining;
+
+    s_coh_seq = checkpoint->coh_seq;
+    memcpy(s_rt_up_diag, checkpoint->rt_up_diag,
+           sizeof(checkpoint->rt_up_diag));
+    s_scene_prims = checkpoint->scene_prims;
+    s_scene_prims_tex = checkpoint->scene_prims_tex;
+    s_batch_total = checkpoint->batch_total;
+    memcpy(s_batch_reason, checkpoint->batch_reason,
+           sizeof(checkpoint->batch_reason));
+    s_bd_gate = checkpoint->bd_gate; s_tb_gate = checkpoint->tb_gate;
+    s_wide_suppress = checkpoint->wide_suppress;
+    s_bdg_applied = checkpoint->bdg_applied;
+    s_bdg_prims = checkpoint->bdg_prims;
+    s_bdg_clearx = checkpoint->bdg_clearx;
+    memcpy(s_ptrace, checkpoint->ptrace, sizeof(checkpoint->ptrace));
+    s_ptrace_n = checkpoint->ptrace_n;
+    s_tb_n = 0; s_tb_semi = checkpoint->tb_semi;
+    s_tb_mask = checkpoint->tb_mask; s_tb_filter = checkpoint->tb_filter;
+    s_tb_dither = checkpoint->tb_dither;
+    memcpy(s_tb_twin, checkpoint->tb_twin, sizeof(checkpoint->tb_twin));
+    s_fb_n = 0; s_fb_semi = checkpoint->fb_semi;
+    s_fb_mask = checkpoint->fb_mask; s_fb_dither = checkpoint->fb_dither;
+    s_cw_flush_ms = checkpoint->cw_flush_ms;
+    s_cw_wide_ms = checkpoint->cw_wide_ms;
+    s_cw_batches = checkpoint->cw_batches;
+    s_cw_wide_sets = checkpoint->cw_wide_sets;
+    s_cw_wide_cfgs = checkpoint->cw_wide_cfgs;
+    s_cw_wide_clears = checkpoint->cw_wide_clears;
+    s_cw_fbo_creates = checkpoint->cw_fbo_creates;
+    s_cw_flush_depth = checkpoint->cw_flush_depth;
+}
+
+static void glb_transaction_discard_checkpoint(void) {
+    const GpuRenderDeferredCandidateToken candidate_token = s_transaction
+        ? s_transaction->deferred_candidate_token
+        : GPU_RENDER_DEFERRED_CANDIDATE_NONE;
+
+    if (s_transaction && s_ctx && SDL_GL_GetCurrentContext() == s_ctx) {
+        glb_transaction_cleanup_deferred_staging();
+        if (s_transaction->staging_fbo && p_glDeleteFramebuffers)
+            p_glDeleteFramebuffers(1, &s_transaction->staging_fbo);
+        if (s_transaction->staging_tex)
+            glDeleteTextures(1, &s_transaction->staging_tex);
+    } else if (s_transaction) {
+        s_transaction_deferred_staging_fbo = s_transaction->staging_fbo;
+        s_transaction_deferred_staging_tex = s_transaction->staging_tex;
+    }
+    free(s_transaction);
+    s_transaction = NULL;
+    if (candidate_token != GPU_RENDER_DEFERRED_CANDIDATE_NONE &&
+        s_deferred_candidate.token == candidate_token)
+        glb_deferred_candidate_discard_owned();
+}
+
+/* READY proves that the renderer still owns the current context. The explicit
+ * swap API preserves that ownership contract and must not query it after SDL's
+ * void SwapWindow call merely to decide how to release private staging. */
+static void glb_transaction_discard_checkpoint_owned(void) {
+    GlTransactionCheckpoint *checkpoint = s_transaction;
+    GpuRenderDeferredCandidateToken candidate_token;
+
+    if (!checkpoint) return;
+    candidate_token = checkpoint->deferred_candidate_token;
+    if (checkpoint->staging_fbo && p_glDeleteFramebuffers)
+        p_glDeleteFramebuffers(1, &checkpoint->staging_fbo);
+    if (checkpoint->staging_tex)
+        glDeleteTextures(1, &checkpoint->staging_tex);
+    free(checkpoint);
+    s_transaction = NULL;
+    if (candidate_token != GPU_RENDER_DEFERRED_CANDIDATE_NONE &&
+        s_deferred_candidate.token == candidate_token)
+        glb_deferred_candidate_discard_owned();
+}
+
+static void glb_transaction_cleanup_deferred_staging(void) {
+    if (!s_ctx || SDL_GL_GetCurrentContext() != s_ctx) return;
+    if (s_transaction_deferred_staging_fbo && p_glDeleteFramebuffers)
+        p_glDeleteFramebuffers(1, &s_transaction_deferred_staging_fbo);
+    if (s_transaction_deferred_staging_tex)
+        glDeleteTextures(1, &s_transaction_deferred_staging_tex);
+    s_transaction_deferred_staging_fbo = 0;
+    s_transaction_deferred_staging_tex = 0;
+}
+
+static GpuRenderTransactionStatus glb_validate_semantic(
+        const GpuRenderSemantic *semantic) {
+    const GpuRenderMaterial *material;
+    uint16_t encoded_depth;
+
+    if (!semantic) return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (semantic->screen_space_2d > 1u)
+        return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+    material = &semantic->material;
+    switch (material->texture_depth) {
+    case GPU_RENDER_TEXTURE_4_BIT:
+    case GPU_RENDER_TEXTURE_8_BIT:
+    case GPU_RENDER_TEXTURE_15_BIT:
+        break;
+    default:
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+    switch (material->blend_mode) {
+    case GPU_RENDER_BLEND_AVERAGE:
+    case GPU_RENDER_BLEND_ADD:
+    case GPU_RENDER_BLEND_SUBTRACT:
+    case GPU_RENDER_BLEND_ADD_QUARTER:
+        break;
+    default:
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+    switch (material->shading) {
+    case GPU_RENDER_SHADING_FLAT:
+    case GPU_RENDER_SHADING_GOURAUD:
+        break;
+    default:
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    }
+
+    encoded_depth = (uint16_t)((material->tpage >> 7) & 3u);
+    if (material->tpage > UINT16_C(0x01ff) || encoded_depth == 3u ||
+        material->texture_page_x != (material->tpage & UINT16_C(0x000f)) ||
+        material->texture_page_y != ((material->tpage >> 4) & 1u) ||
+        material->blend_mode !=
+            (GpuRenderBlendMode)((material->tpage >> 5) & 3u) ||
+        material->texture_depth != (GpuRenderTextureDepth)encoded_depth ||
+        material->clut_x > 1023u || (material->clut_x & 15u) != 0u ||
+        material->clut_y > 511u ||
+        material->draw_area_left > material->draw_area_right ||
+        material->draw_area_top > material->draw_area_bottom ||
+        material->draw_area_right > 1023u ||
+        material->draw_area_bottom > 1023u ||
+        material->draw_offset_x < -1024 || material->draw_offset_x > 1023 ||
+        material->draw_offset_y < -1024 || material->draw_offset_y > 1023 ||
+        material->texture_window_mask_x > 31u ||
+        material->texture_window_mask_y > 31u ||
+        material->texture_window_offset_x > 31u ||
+        material->texture_window_offset_y > 31u ||
+        material->textured > 1u || material->raw_texture > 1u ||
+        material->semi_transparent > 1u || material->dither > 1u ||
+        material->mask_set > 1u ||
+        material->mask_check > 1u ||
+        (material->raw_texture && !material->textured))
+        return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+
+    if (semantic->topology == GPU_RENDER_SEMANTIC_LINES) {
+        if (semantic->screen_space_2d || material->textured ||
+            material->raw_texture ||
+            semantic->triangle_count != 0u || semantic->line_count == 0u ||
+            semantic->line_count > GPU_RENDER_SEMANTIC_LINE_CAPACITY)
+            return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+        for (uint8_t line_index = 0u;
+             line_index < semantic->line_count; line_index++) {
+            for (int vertex_index = 0; vertex_index < 2; vertex_index++) {
+                const GpuRenderSemanticVertex *vertex =
+                    &semantic->lines[line_index].vertices[vertex_index];
+
+                if (((uint32_t)vertex->x & UINT32_C(0xffff)) != 0u ||
+                    ((uint32_t)vertex->y & UINT32_C(0xffff)) != 0u ||
+                    ((uint32_t)vertex->u & UINT32_C(0xffff)) != 0u ||
+                    ((uint32_t)vertex->v & UINT32_C(0xffff)) != 0u)
+                    return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+                if (vertex->native_view_position > 1u ||
+                    (!vertex->native_view_position &&
+                     (vertex->native_view_x != 0 || vertex->native_view_y != 0)))
+                    return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+                if (material->shading == GPU_RENDER_SHADING_FLAT &&
+                    vertex_index != 0 &&
+                    (vertex->r != semantic->lines[line_index].vertices[0].r ||
+                     vertex->g != semantic->lines[line_index].vertices[0].g ||
+                     vertex->b != semantic->lines[line_index].vertices[0].b))
+                    return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+            }
+        }
+        return GPU_RENDER_TRANSACTION_OK;
+    }
+    if (semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->line_count != 0u || semantic->triangle_count == 0u ||
+        semantic->triangle_count > GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY)
+        return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+
+    for (uint8_t triangle_index = 0;
+         triangle_index < semantic->triangle_count; triangle_index++) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+
+        if (triangle->split_index != triangle_index ||
+            triangle->split_count != semantic->triangle_count)
+            return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+        for (int vertex_index = 0; vertex_index < 3; vertex_index++) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+
+            if (((uint32_t)vertex->x & UINT32_C(0xffff)) != 0u ||
+                ((uint32_t)vertex->y & UINT32_C(0xffff)) != 0u ||
+                ((uint32_t)vertex->u & UINT32_C(0xffff)) != 0u ||
+                ((uint32_t)vertex->v & UINT32_C(0xffff)) != 0u)
+                return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+            if (vertex->native_view_position > 1u ||
+                (semantic->screen_space_2d && vertex->native_view_position) ||
+                (!vertex->native_view_position &&
+                 (vertex->native_view_x != 0 || vertex->native_view_y != 0)))
+                return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+            if (material->shading == GPU_RENDER_SHADING_FLAT &&
+                vertex_index != 0 &&
+                (vertex->r != triangle->vertices[0].r ||
+                 vertex->g != triangle->vertices[0].g ||
+                 vertex->b != triangle->vertices[0].b))
+                return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+        }
+    }
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+static uint32_t glb_semantic_rgb888(const GpuRenderSemanticVertex *vertex) {
+    return (uint32_t)vertex->r | ((uint32_t)vertex->g << 8) |
+           ((uint32_t)vertex->b << 16);
+}
+
+static uint16_t glb_semantic_rgb555(const GpuRenderSemanticVertex *vertex) {
+    return (uint16_t)((vertex->r >> 3u) | ((vertex->g >> 3u) << 5u) |
+                      ((vertex->b >> 3u) << 10u));
+}
+
+static GpuRenderTransactionStatus glb_transaction_begin(
+        GpuRenderTransactionId transaction_id,
+        uint64_t vram_mutation_serial) {
+    GlTransactionCheckpoint *checkpoint;
+    GpuRenderTransactionStatus status;
+
+    if (s_transaction) return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (s_transaction_force_original)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (s_scale_apply_pending) {
+        if (s_scale != s_req_scale)
+            return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+        s_scale_apply_pending = 0;
+    }
+    if (gpu_display_is_depth24() || s_depth24_skip_up)
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    if (g_wide_w != 0 || g_wide_cur != 0)
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    if (glb_transaction_consume_gl_errors())
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    checkpoint = (GlTransactionCheckpoint *)malloc(sizeof(*checkpoint));
+    if (!checkpoint) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    memset(checkpoint, 0, sizeof(*checkpoint));
+
+    status = glb_transaction_drain();
+    if (status != GPU_RENDER_TRANSACTION_OK) {
+        free(checkpoint);
+        return status;
+    }
+    ensure_cpu();
+    glFinish();
+    if (glb_transaction_consume_gl_errors() || s_fb_n != 0 || s_tb_n != 0 ||
+        s_up_nrects != 0 || s_pack_dirty.set || s_gpu_dirty) {
+        free(checkpoint);
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    }
+
+    checkpoint->id = transaction_id;
+    checkpoint->vram_serial = vram_mutation_serial;
+    glb_transaction_snapshot(checkpoint);
+    s_transaction = checkpoint;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+static void glb_deferred_candidate_discard_owned(void) {
+    if (s_deferred_candidate.framebuffer && p_glDeleteFramebuffers &&
+        s_ctx && SDL_GL_GetCurrentContext() == s_ctx)
+        p_glDeleteFramebuffers(1, &s_deferred_candidate.framebuffer);
+    if (s_deferred_candidate.texture && s_ctx &&
+        SDL_GL_GetCurrentContext() == s_ctx)
+        glDeleteTextures(1, &s_deferred_candidate.texture);
+#ifdef PSX_GL_TRANSACTION_TESTING
+    if (s_deferred_candidate.token != GPU_RENDER_DEFERRED_CANDIDATE_NONE)
+        s_transaction_test_diag.deferred_candidate_discards++;
+#endif
+    memset(&s_deferred_candidate, 0, sizeof(s_deferred_candidate));
+}
+
+static GpuRenderTransactionStatus glb_deferred_candidate_capture(
+        GpuRenderTransactionId transaction_id,
+        GpuRenderDeferredCandidateToken *out_candidate_token) {
+    GpuRenderTransactionStatus status;
+    GLuint texture = 0;
+    GLuint framebuffer = 0;
+    GLsync fence;
+    int width;
+    int height;
+    int context_ok;
+    int saw_error;
+
+    if (!out_candidate_token) return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    *out_candidate_token = GPU_RENDER_DEFERRED_CANDIDATE_NONE;
+    if (!s_transaction || s_transaction->committed)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_id_equal(s_transaction->id, transaction_id))
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (s_deferred_candidate.token != GPU_RENDER_DEFERRED_CANDIDATE_NONE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced() || s_scale_apply_pending ||
+        gpu_display_is_depth24() || s_depth24_skip_up ||
+        g_wide_w != 0 || g_wide_cur != 0)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+
+    status = glb_transaction_drain();
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    width = VRAM_W * s_scale;
+    height = VRAM_H * s_scale;
+    texture = make_tex(GL_RGBA8, width, height,
+                       GL_RGBA, GL_UNSIGNED_BYTE);
+    if (!texture || !make_fbo(&framebuffer, texture, 0)) {
+        if (framebuffer && p_glDeleteFramebuffers)
+            p_glDeleteFramebuffers(1, &framebuffer);
+        if (texture) glDeleteTextures(1, &texture);
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    }
+
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, framebuffer);
+    p_glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    glFinish();
+    if (fence) p_glDeleteSync(fence);
+    context_ok = glb_transaction_context_ready();
+    saw_error = context_ok ? glb_transaction_consume_gl_errors() : 0;
+    if (!context_ok || !fence || saw_error) {
+        if (framebuffer && p_glDeleteFramebuffers)
+            p_glDeleteFramebuffers(1, &framebuffer);
+        if (texture) glDeleteTextures(1, &texture);
+        return context_ok ? GPU_RENDER_TRANSACTION_BACKEND_ERROR
+                          : GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    }
+
+    if (s_deferred_candidate_next_token ==
+        GPU_RENDER_DEFERRED_CANDIDATE_NONE)
+        s_deferred_candidate_next_token = 1u;
+    s_deferred_candidate.token = s_deferred_candidate_next_token++;
+    s_deferred_candidate.visual_id = transaction_id;
+    s_deferred_candidate.texture = texture;
+    s_deferred_candidate.framebuffer = framebuffer;
+    s_deferred_candidate.width = width;
+    s_deferred_candidate.height = height;
+    s_deferred_candidate.scale = s_scale;
+    *out_candidate_token = s_deferred_candidate.token;
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.deferred_candidate_captures++;
+#endif
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+static GpuRenderTransactionStatus glb_deferred_candidate_discard(
+        GpuRenderDeferredCandidateToken candidate_token) {
+    if (candidate_token == GPU_RENDER_DEFERRED_CANDIDATE_NONE)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (s_deferred_candidate.token != candidate_token)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    glb_deferred_candidate_discard_owned();
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+static GpuRenderTransactionStatus glb_deferred_transaction_begin(
+        GpuRenderTransactionId transaction_id,
+        uint64_t vram_mutation_serial,
+        GpuRenderDeferredCandidateToken candidate_token) {
+    GpuRenderTransactionStatus status;
+
+    if (candidate_token == GPU_RENDER_DEFERRED_CANDIDATE_NONE ||
+        s_deferred_candidate.token != candidate_token ||
+        !glb_transaction_id_equal(s_deferred_candidate.visual_id,
+                                  transaction_id) ||
+        s_deferred_candidate.scale != s_scale ||
+        s_deferred_candidate.width != VRAM_W * s_scale ||
+        s_deferred_candidate.height != VRAM_H * s_scale)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    status = glb_transaction_begin(transaction_id, vram_mutation_serial);
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    s_transaction->deferred_candidate_token = candidate_token;
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.deferred_transaction_begins++;
+#endif
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+static GpuRenderTransactionStatus glb_ordering_barrier(
+        GpuRenderTransactionId transaction_id) {
+    if (!s_transaction) return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_id_equal(s_transaction->id, transaction_id))
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    return glb_transaction_drain();
+}
+
+static GpuRenderTransactionStatus glb_draw_semantic_contents(
+        const GpuRenderSemantic *semantic, int immediate, int native_view) {
+    GpuRenderTransactionStatus status;
+    const GpuRenderMaterial *material;
+    const int fullscreen_overlay = native_view &&
+        (glb_native_view_fullscreen_flat_quad(semantic) ||
+         (gpu_ws_nw_backdrop_enabled() &&
+          glb_native_view_backdrop_quad(semantic)));
+    const int scale_screen_2d = native_view && semantic->screen_space_2d;
+    uint32_t texture_window;
+
+    status = glb_validate_semantic(semantic);
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    material = &semantic->material;
+    texture_window = (uint32_t)material->texture_window_mask_x |
+                     ((uint32_t)material->texture_window_mask_y << 5) |
+                     ((uint32_t)material->texture_window_offset_x << 10) |
+                     ((uint32_t)material->texture_window_offset_y << 15);
+
+    glb_set_draw_area(material->draw_area_left, material->draw_area_top,
+                      material->draw_area_right, material->draw_area_bottom);
+    glb_set_draw_offset(material->draw_offset_x, material->draw_offset_y);
+    glb_set_texture_window(texture_window);
+    glb_set_mask_bits(material->mask_set, material->mask_check);
+    glb_set_semi_transparency(material->semi_transparent,
+                              material->blend_mode);
+    glb_set_dither(material->dither);
+    if (semantic->topology == GPU_RENDER_SEMANTIC_LINES) {
+        for (uint8_t line_index = 0u;
+             line_index < semantic->line_count; line_index++) {
+            const GpuRenderSemanticLine *line = &semantic->lines[line_index];
+            const GpuRenderSemanticVertex *first = &line->vertices[0];
+            const GpuRenderSemanticVertex *second = &line->vertices[1];
+            const int x0 = native_view && first->native_view_position
+                ? first->native_view_x / INT32_C(65536) +
+                      material->draw_offset_x - s_native_view_pass_base
+                : first->x / INT32_C(65536) + material->draw_offset_x +
+                      (native_view
+                           ? s_native_view_offset - s_native_view_pass_base
+                           : 0);
+            const int y0 = (native_view && first->native_view_position
+                                ? first->native_view_y : first->y) /
+                           INT32_C(65536) + material->draw_offset_y;
+            const int x1 = native_view && second->native_view_position
+                ? second->native_view_x / INT32_C(65536) +
+                      material->draw_offset_x - s_native_view_pass_base
+                : second->x / INT32_C(65536) + material->draw_offset_x +
+                      (native_view
+                           ? s_native_view_offset - s_native_view_pass_base
+                           : 0);
+            const int y1 = (native_view && second->native_view_position
+                                ? second->native_view_y : second->y) /
+                           INT32_C(65536) + material->draw_offset_y;
+
+            if (material->shading == GPU_RENDER_SHADING_GOURAUD) {
+                glb_draw_shaded_line(
+                    x0, y0, glb_semantic_rgb555(&line->vertices[0]),
+                    x1, y1, glb_semantic_rgb555(&line->vertices[1]));
+            } else {
+                glb_draw_line(x0, y0, x1, y1,
+                              glb_semantic_rgb555(&line->vertices[0]));
+            }
+            if (!immediate) {
+                status = glb_transaction_drain();
+                if (status != GPU_RENDER_TRANSACTION_OK) return status;
+            }
+        }
+        return GPU_RENDER_TRANSACTION_OK;
+    }
+
+    glb_set_color_modulation(semantic->triangles[0].vertices[0].r,
+                             semantic->triangles[0].vertices[0].g,
+                             semantic->triangles[0].vertices[0].b,
+                             material->raw_texture);
+
+    for (uint8_t triangle_index = 0;
+         triangle_index < semantic->triangle_count; triangle_index++) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+        int x[3], y[3], u[3], v[3];
+        uint32_t color24[3];
+
+        for (int vertex_index = 0; vertex_index < 3; vertex_index++) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+
+            if (native_view && vertex->native_view_position) {
+                x[vertex_index] = vertex->native_view_x / INT32_C(65536) +
+                                  material->draw_offset_x -
+                                  s_native_view_pass_base;
+                if (x[vertex_index] == s_native_view_width - 1)
+                    x[vertex_index] = s_native_view_width;
+                y[vertex_index] = vertex->native_view_y / INT32_C(65536) +
+                                  material->draw_offset_y;
+            } else {
+                const int canonical_x = vertex->x / INT32_C(65536) +
+                                         material->draw_offset_x;
+                x[vertex_index] = native_view
+                    ? (scale_screen_2d
+                           ? glb_native_view_screen_2d_x(canonical_x)
+                           : glb_native_view_overlay_x(canonical_x,
+                                                       fullscreen_overlay))
+                    : canonical_x;
+                y[vertex_index] = vertex->y / INT32_C(65536) +
+                                  material->draw_offset_y;
+            }
+            u[vertex_index] = vertex->u / INT32_C(65536);
+            v[vertex_index] = vertex->v / INT32_C(65536);
+            color24[vertex_index] = glb_semantic_rgb888(vertex);
+        }
+
+        if (material->textured) {
+            if (material->shading == GPU_RENDER_SHADING_GOURAUD) {
+                glb_draw_shaded_textured_triangle(
+                    x[0], y[0], u[0], v[0], color24[0],
+                    x[1], y[1], u[1], v[1], color24[1],
+                    x[2], y[2], u[2], v[2], color24[2],
+                    material->clut_x, material->clut_y, material->tpage,
+                    material->raw_texture);
+            } else {
+                glb_set_color_modulation(triangle->vertices[0].r,
+                                         triangle->vertices[0].g,
+                                         triangle->vertices[0].b,
+                                         material->raw_texture);
+                glb_draw_textured_triangle(
+                    x[0], y[0], u[0], v[0],
+                    x[1], y[1], u[1], v[1],
+                    x[2], y[2], u[2], v[2],
+                    material->clut_x, material->clut_y, material->tpage);
+            }
+        } else if (material->shading == GPU_RENDER_SHADING_GOURAUD) {
+            glb_draw_gouraud_triangle_rgb888(x[0], y[0], color24[0],
+                                             x[1], y[1], color24[1],
+                                             x[2], y[2], color24[2]);
+        } else {
+            glb_draw_flat_triangle_rgb888(x[0], y[0], x[1], y[1],
+                                          x[2], y[2], color24[0]);
+        }
+
+        /* Atomic oracle transactions drain each split before checkpoint
+         * validation. The authoritative stream uses the ordinary PS1 batches,
+         * whose insertion order and state-change flushes preserve draw order. */
+        if (!immediate) {
+            status = glb_transaction_drain();
+            if (status != GPU_RENDER_TRANSACTION_OK) return status;
+        }
+    }
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+static GpuRenderTransactionStatus glb_draw_semantic(
+        GpuRenderTransactionId transaction_id,
+        const GpuRenderSemantic *semantic) {
+    if (!s_transaction) return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_id_equal(s_transaction->id, transaction_id))
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    return glb_draw_semantic_contents(semantic, 0, 0);
+}
+
+static GpuRenderTransactionStatus glb_stream_barrier(void) {
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    return glb_transaction_consume_gl_errors()
+        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR
+        : GPU_RENDER_TRANSACTION_OK;
+}
+
+static GpuRenderTransactionStatus glb_draw_semantic_immediate(
+        const GpuRenderSemantic *semantic) {
+    GpuRenderTransactionStatus status;
+    int base_x;
+    int slot;
+
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    slot = -1;
+    base_x = 0;
+    if (s_native_view_enabled) {
+        flush_flat_batch();
+        flush_tex_batch();
+        flush_cpu_upload();
+        if (semantic->material.mask_check && !s_stencil_valid)
+            rebuild_mask_stencils();
+        base_x = glb_native_view_semantic_target_base(semantic);
+        slot = native_view_prepare_surface(base_x);
+        if (slot < 0) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    }
+    status = glb_draw_semantic_contents(semantic, 1, 0);
+    if (status != GPU_RENDER_TRANSACTION_OK || !s_native_view_enabled)
+        return status;
+    flush_flat_batch();
+    flush_tex_batch();
+    s_native_view_pass = 1;
+    s_native_view_pass_fbo = s_native_view_fbo[slot];
+    s_native_view_pass_base = base_x;
+    s_native_view_expand_x =
+        glb_native_view_fullscreen_flat_quad(semantic) ||
+        (gpu_ws_nw_backdrop_enabled() &&
+         glb_native_view_backdrop_quad(semantic)) ||
+        glb_native_view_semantic_reaches_reveal(semantic);
+    s_native_view_scale_2d = semantic->screen_space_2d;
+    status = glb_draw_semantic_contents(semantic, 1, 1);
+    flush_flat_batch();
+    flush_tex_batch();
+    s_native_view_scale_2d = 0;
+    s_native_view_expand_x = 0;
+    s_native_view_pass = 0;
+    s_native_view_pass_fbo = 0;
+    s_native_view_pass_base = 0;
+    return status;
+}
+
+static GpuRenderTransactionStatus glb_validate_present(
+        const GpuRenderPresent *present) {
+    int64_t right, bottom;
+    uint32_t expected_width, expected_height;
+
+    if (!present) return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (present->path == GPU_RENDER_PRESENT_HIRES ||
+        present->path == GPU_RENDER_PRESENT_WIDE)
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    if (present->path != GPU_RENDER_PRESENT_CANONICAL)
+        return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+    right = (int64_t)present->display_x + present->display_width;
+    bottom = (int64_t)present->display_y + present->display_height;
+    expected_width = (uint32_t)VRAM_W * (uint32_t)s_scale;
+    expected_height = (uint32_t)VRAM_H * (uint32_t)s_scale;
+    if (present->display_x < 0 || present->display_y < 0 ||
+        present->display_width <= 0 || present->display_height <= 0 ||
+        right > VRAM_W || bottom > VRAM_H ||
+        present->surface_width != expected_width ||
+        present->surface_height != expected_height ||
+        present->scale != (uint32_t)s_scale || present->wide_base_x != 0 ||
+        present->linear_filter > 1u || present->force_4_3 > 1u ||
+        present->reserved[0] != 0u || present->reserved[1] != 0u)
+        return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
+    return GPU_RENDER_TRANSACTION_OK;
+}
+
+enum {
+    GLB_TRANSACTION_FAULT_POST_COMPOSITION = 1,
+    GLB_TRANSACTION_FAULT_FINAL_VALIDATION,
+    GLB_TRANSACTION_FAULT_FINAL_BLIT,
+};
+
+static int glb_transaction_fault(int phase) {
+#ifdef PSX_GL_TRANSACTION_TESTING
+    if (s_transaction_test_fault == phase) {
+        s_transaction_test_fault = GL_TRANSACTION_FAULT_NONE;
+        s_transaction_test_diag.phase_failures++;
+        s_transaction_test_diag.last_fault_phase = phase;
+        return 1;
+    }
+#else
+    (void)phase;
+#endif
+    return 0;
+}
+
+static int glb_transaction_create_staging(GlTransactionCheckpoint *checkpoint,
+                                          int width, int height) {
+    checkpoint->staging_tex = make_tex(GL_RGBA8, width, height,
+                                       GL_RGBA, GL_UNSIGNED_BYTE);
+    if (!checkpoint->staging_tex) return 0;
+    if (!make_fbo(&checkpoint->staging_fbo, checkpoint->staging_tex, 0))
+        return 0;
+    checkpoint->staging_w = width;
+    checkpoint->staging_h = height;
+    return 1;
+}
+
+static GpuRenderTransactionStatus glb_commit_validate(
+        GpuRenderTransactionId transaction_id,
+        uint64_t current_vram_mutation_serial,
+        const GpuRenderPresent *present) {
+    GlTransactionCheckpoint *checkpoint;
+    GpuRenderTransactionStatus status;
+    GLsync fence;
+    int context_ok, saw_error;
+    int drawable_w = 0, drawable_h = 0;
+    int lx, ly, lw, lh;
+    GLuint composition_texture;
+
+    if (!s_transaction) return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (s_transaction->committed)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_id_equal(s_transaction->id, transaction_id))
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced() || s_scale_apply_pending)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (current_vram_mutation_serial != s_transaction->vram_serial)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (g_wide_w != 0 || g_wide_cur != 0)
+        return GPU_RENDER_TRANSACTION_UNSUPPORTED;
+    status = glb_validate_present(present);
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    checkpoint = s_transaction;
+    composition_texture = s_hr_tex;
+    if (checkpoint->deferred_candidate_token !=
+        GPU_RENDER_DEFERRED_CANDIDATE_NONE) {
+        if (s_deferred_candidate.token !=
+                checkpoint->deferred_candidate_token ||
+            !glb_transaction_id_equal(s_deferred_candidate.visual_id,
+                                      transaction_id) ||
+            s_deferred_candidate.scale != s_scale ||
+            s_deferred_candidate.width != VRAM_W * s_scale ||
+            s_deferred_candidate.height != VRAM_H * s_scale)
+            return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+        composition_texture = s_deferred_candidate.texture;
+    }
+    SDL_GL_GetDrawableSize(s_win, &drawable_w, &drawable_h);
+    if (drawable_w <= 0 || drawable_h <= 0)
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    checkpoint->aspect_num = s_aspect_num;
+    checkpoint->aspect_den = s_aspect_den;
+    if (checkpoint->staging_tex || checkpoint->staging_fbo)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_create_staging(checkpoint, drawable_w, drawable_h))
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    status = glb_transaction_drain();
+    if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    glb_transaction_restore_draw_state(checkpoint, 1);
+
+    fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    glFinish();
+    if (fence) p_glDeleteSync(fence);
+    context_ok = glb_transaction_context_ready();
+    saw_error = context_ok ? glb_transaction_consume_gl_errors() : 0;
+    if (!context_ok) return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!fence || saw_error)
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    if (present->force_4_3)
+        letterbox_rect_aspect(drawable_w, drawable_h, 4, 3,
+                              &lx, &ly, &lw, &lh);
+    else
+        letterbox_rect(drawable_w, drawable_h, &lx, &ly, &lw, &lh);
+
+    /* Compose the complete present target privately. The overlay hook receives
+     * the staging FBO and cannot make the transaction observable through the
+     * default framebuffer. */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, checkpoint->staging_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glViewport(0, 0, drawable_w, drawable_h);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    present_target_quad(checkpoint->staging_fbo,
+                        composition_texture, VRAM_W, VRAM_H,
+                        present->display_x, present->display_y,
+                        present->display_width, present->display_height,
+                        present->linear_filter, lx, ly, lw, lh);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, checkpoint->staging_fbo);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, checkpoint->staging_fbo);
+    psx_debug_overlay_pre_swap_target((unsigned int)checkpoint->staging_fbo);
+    pres_prepare_staged(&checkpoint->staged_present_event,
+                        checkpoint->staging_fbo,
+                        present->display_x, present->display_y,
+                        present->display_width, present->display_height,
+                        lx, ly, lw, lh);
+    glDisable(GL_SCISSOR_TEST);
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.staging_compositions++;
+#endif
+    if (glb_transaction_fault(GLB_TRANSACTION_FAULT_POST_COMPOSITION))
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    glFinish();
+    if (fence) p_glDeleteSync(fence);
+    context_ok = glb_transaction_context_ready();
+    saw_error = context_ok ? glb_transaction_consume_gl_errors() : 0;
+    if (!context_ok) return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!fence || saw_error) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    if (glb_transaction_fault(GLB_TRANSACTION_FAULT_FINAL_VALIDATION))
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    SDL_GL_GetDrawableSize(s_win, &drawable_w, &drawable_h);
+    if (drawable_w != checkpoint->staging_w ||
+        drawable_h != checkpoint->staging_h ||
+        (!present->force_4_3 &&
+         (s_aspect_num != checkpoint->aspect_num ||
+          s_aspect_den != checkpoint->aspect_den)))
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (glb_transaction_fault(GLB_TRANSACTION_FAULT_FINAL_BLIT))
+        return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    /* The transaction's first and only default-framebuffer write. */
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    p_glBlitFramebuffer(0, 0, drawable_w, drawable_h,
+                        0, 0, drawable_w, drawable_h,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.final_blits++;
+#endif
+
+    fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    glFinish();
+    if (fence) p_glDeleteSync(fence);
+    context_ok = glb_transaction_context_ready();
+    saw_error = context_ok ? glb_transaction_consume_gl_errors() : 0;
+    if (!context_ok) return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!fence || saw_error) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    checkpoint->present = *present;
+    checkpoint->committed = 1;
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.commits_ready++;
+#endif
+    return GPU_RENDER_TRANSACTION_READY;
+}
+
+static int glb_transaction_restore_contents(void) {
+    GlTransactionCheckpoint *checkpoint = s_transaction;
+    int saw_error = 0;
+
+    if (!checkpoint) return 0;
+    if (glb_transaction_context_ready()) {
+        saw_error = glb_transaction_consume_gl_errors();
+        flush_flat_batch();
+        flush_tex_batch();
+        flush_cpu_upload();
+        pack_flush();
+        saw_error |= glb_transaction_consume_gl_errors();
+
+        memcpy(s_vram, checkpoint->vram, sizeof(checkpoint->vram));
+        s_fb_n = 0;
+        s_tb_n = 0;
+        s_up_nrects = 0;
+        rect_clear(&s_pack_dirty);
+        s_gpu_dirty = 0;
+        s_stencil_valid = 1;
+        up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+        flush_cpu_upload();
+        glFinish();
+        saw_error |= glb_transaction_consume_gl_errors();
+    } else {
+        memcpy(s_vram, checkpoint->vram, sizeof(checkpoint->vram));
+        saw_error = 1;
+    }
+
+    glb_transaction_restore_snapshot_state(checkpoint);
+    if (saw_error) {
+        /* The CPU checkpoint is authoritative even if GL restoration could not
+         * complete. Make the next Original present retry a complete upload. */
+        s_up_nrects = 0;
+        rect_clear(&s_pack_dirty);
+        s_gpu_dirty = 0;
+        up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+    }
+    return saw_error;
+}
+
+static int glb_transaction_abort_pending(int force_original) {
+    int committed;
+    int saw_error;
+
+    if (!s_transaction) return 0;
+    committed = s_transaction->committed;
+    saw_error = glb_transaction_restore_contents();
+    glb_transaction_discard_checkpoint();
+    if (force_original && committed) {
+        if (s_force_present_remaining < 1) s_force_present_remaining = 1;
+        s_last_present_path = -1;
+        s_transaction_force_original = 1;
+    }
+    return saw_error;
+}
+
+static int glb_transaction_reject_other_present(void) {
+    return s_transaction != NULL;
+}
+
+GlRendererTransactionSwapStatus gl_renderer_swap_ready_transaction(void) {
+    GlTransactionCheckpoint *checkpoint = s_transaction;
+
+    if (!checkpoint || !checkpoint->committed)
+        return GL_RENDERER_TRANSACTION_SWAP_NOT_READY;
+
+    /* Commit's final glGetError established the context/window contract. Keep
+     * this as the literal first SDL/GL/window operation after READY. */
+    SDL_GL_SwapWindow(s_win);
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.swaps++;
+#endif
+
+    pres_publish_staged(&checkpoint->staged_present_event);
+    present_dirty_rect(checkpoint->present.display_x,
+                       checkpoint->present.display_y,
+                       checkpoint->present.display_x +
+                           checkpoint->present.display_width - 1,
+                       checkpoint->present.display_y +
+                           checkpoint->present.display_height - 1,
+                       0);
+    present_force_consumed();
+    s_last_present_path = GL_PRES_VRAM;
+    s_last_dx = checkpoint->present.display_x;
+    s_last_dy = checkpoint->present.display_y;
+    s_last_dw = checkpoint->present.display_width;
+    s_last_dh = checkpoint->present.display_height;
+    coh_record(GL_COH_PRESENT,
+               checkpoint->present.display_x,
+               checkpoint->present.display_y,
+               checkpoint->present.display_x +
+                   checkpoint->present.display_width - 1,
+               checkpoint->present.display_y +
+                   checkpoint->present.display_height - 1);
+#ifdef PSX_GL_TRANSACTION_TESTING
+    s_transaction_test_diag.publications++;
+#endif
+    glb_transaction_discard_checkpoint_owned();
+    return GL_RENDERER_TRANSACTION_SWAP_SUCCESS;
+}
+
+int gl_renderer_cancel_ready_transaction(void) {
+    if (!s_transaction || !s_transaction->committed) return 0;
+    (void)glb_transaction_abort_pending(1);
+    return 1;
+}
+
+static GpuRenderTransactionStatus glb_rollback(
+        GpuRenderTransactionId transaction_id) {
+    int saw_error;
+
+    if (!s_transaction) return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!glb_transaction_id_equal(s_transaction->id, transaction_id))
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+
+    saw_error = glb_transaction_restore_contents();
+    if (saw_error) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+
+    glb_transaction_discard_checkpoint();
+    return GPU_RENDER_TRANSACTION_OK;
 }
 
 static const GpuRenderBackend GL_BACKEND = {
@@ -3828,14 +6305,25 @@ static const GpuRenderBackend GL_BACKEND = {
     .set_texture_filter = glb_set_texture_filter, .texture_filter = glb_texture_filter,
     .set_semi_transparency = glb_set_semi_transparency, .set_mask_bits = glb_set_mask_bits,
     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
+    .set_dither = glb_set_dither,
     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
+    .draw_flat_triangle_rgb888 = glb_draw_flat_triangle_rgb888,
+    .draw_gouraud_triangle_rgb888 = glb_draw_gouraud_triangle_rgb888,
     .draw_textured_triangle = glb_draw_textured_triangle,
     .draw_shaded_textured_triangle = glb_draw_shaded_textured_triangle,
     .draw_flat_rect = glb_draw_flat_rect, .draw_textured_rect = glb_draw_textured_rect,
     .draw_textured_rect_scaled = glb_draw_textured_rect_scaled,
     .draw_line = glb_draw_line, .draw_shaded_line = glb_draw_shaded_line,
-    .render_display = glb_render_display, .render_display_hires = glb_render_display_hires,
+    .native_fill_rect = glb_native_fill_rect,
+    .native_copy_rect = glb_native_copy_rect,
+    .stream_barrier = glb_stream_barrier,
+     .draw_semantic_immediate = glb_draw_semantic_immediate,
+      .render_display = glb_render_display, .render_display_hires = glb_render_display_hires,
+      .present_vram = glb_present_vram,
+      .present_cpu_frame = glb_present_cpu_frame,
+      .present_native_cpu_frame = glb_present_native_cpu_frame,
+      .canonical_framebuffer_digest = glb_canonical_framebuffer_digest,
     .vram_write = glb_vram_write, .vram_read = glb_vram_read,
     .vram_transfer_in = glb_vram_transfer_in, .vram_transfer_out = glb_vram_transfer_out,
     .set_draw_area = glb_set_draw_area, .get_draw_area = glb_get_draw_area,
@@ -3847,6 +6335,14 @@ static const GpuRenderBackend GL_BACKEND = {
     .wide_clear_margins = glb_wide_clear_margins,
     .render_wide_display = glb_render_wide_display,
     .wide_dump_full = glb_wide_dump_full,
+    .transaction_begin = glb_transaction_begin,
+    .ordering_barrier = glb_ordering_barrier,
+    .draw_semantic = glb_draw_semantic,
+    .commit_validate = glb_commit_validate,
+    .rollback = glb_rollback,
+    .deferred_candidate_capture = glb_deferred_candidate_capture,
+    .deferred_candidate_discard = glb_deferred_candidate_discard,
+    .deferred_transaction_begin = glb_deferred_transaction_begin,
 };
 
 const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }

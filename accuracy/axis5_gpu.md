@@ -78,21 +78,24 @@ Our files:
 Ordered roughly by player-visible impact. Citations: `gpu_*.c:line` (ours)
 vs `beetle-psx/mednafen/psx/<file>:line` (oracle).
 
-### D1 — Dithering is completely absent (both renderers) — and the enable bit is decoded but dropped
+### D1 — OpenGL dithering fixed 2026-07-31; software renderer still missing it
 - **Oracle**: 4×4 signed dither matrix `{{-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},
   {3,-1,2,-2}}` (gpu.cpp:79-85), applied (then `>>3` + clamp to 5-bit) to
   Gouraud polygons, modulated-textured polygons, and lines whenever
   `DitherEnabled` (`dtd` = GP0 E1 bit 9) (gpu.cpp:644-665; gpu_polygon.cpp:
   184-211; gpu_line.cpp:145-154). Sprites & raw copies are never dithered.
-- **Ours**: `dither_enabled` is parsed from GP0(E1) (gpu.c:2071) and surfaced
-  in GPUSTAT bit 9 (gpu.c:1244) **but is never forwarded to either renderer.**
-  `gpu_sw_renderer.c` has no dither term anywhere; Gouraud/modulated colors
-  are truncated `>>3` with no matrix add. The GL backend likewise has no
-  dither (confirmed; documented "the software path doesn't dither either").
-- **Effect**: visible color banding on Gouraud-shaded surfaces and gradients
-  (skies, lighting ramps, shadows) versus hardware; every dithered frame
-  byte-diffs against the oracle. This is the single largest systematic SW/GL
-  vs hardware divergence.
+- **OpenGL (fixed)**: GP0(E1) now forwards `dither_enabled`; RGB888 polygon
+  colors reach one shared GLSL dither/quantize literal used by geometry and
+  textured programs. It applies the oracle matrix at final destination VRAM
+  coordinates, after exact integer texture modulation and before blending.
+  Original GP0 and transactional semantic draws call the same RGB888 polygon
+  and textured draw functions. A scale-2 hidden-GL regression byte-compares
+  their raw 15-bit VRAM for flat, Gouraud, modulated-textured, and STP-semi
+  triangles at two draw offsets, with clipping and mask set/check enabled.
+- **Software (open)**: `gpu_sw_renderer.c` still has no dither term;
+  Gouraud/modulated colors are truncated `>>3` with no matrix add.
+- **Remaining effect**: the software backend still bands and byte-diffs on
+  dithered gradients. The OpenGL D1 gap is closed.
 
 ### D2 — SW triangle rasterizer uses float interpolation + inclusive spans, not the PSX fixed-point half-open fill rule
 - **Oracle**: 64-bit fixed-point edges (`MakePolyXFP` adds `(1<<32) - (1<<11)`
@@ -124,7 +127,7 @@ vs `beetle-psx/mednafen/psx/<file>:line` (oracle).
   span (sw:795-833 gouraud, sw:937-942 textured). UV truncated `(int)fu & 0xFF`
   (sw:942). No `+0.5` seed, no fixed-point step.
 - **Effect**: color/texel values drift by up to a few LSB across a polygon vs
-  hardware; combined with D1 (no dither) gradients look both banded and
+  hardware; combined with D1 on software, gradients look both banded and
   slightly mis-sloped. Texture sampling can pick a neighboring texel at span
   edges. Lower impact than D1/D2 but contributes to per-pixel diffs.
 
@@ -273,13 +276,11 @@ vs `beetle-psx/mednafen/psx/<file>:line` (oracle).
 
 ## 3. Prioritized fix list (player-visible impact first)
 
-**P1 — Implement dithering (D1).** Add the 4×4 signed matrix and the
-`dtd`-gated apply (Gouraud + modulated-textured + lines; not sprites/copies)
-to BOTH renderers. Plumb `dither_enabled` from `gp0_exec_draw_mode` into
-`gr_set_*` (it is already decoded; just unused). SW: add `matrix[y&3][x&3]`
-before the `>>3` truncation in the gouraud/textured span writers. GL: add the
-matrix in the fragment shader before the 5-bit pack. Highest visual payoff;
-removes the largest systematic oracle diff.
+**P1 — Finish software dithering (D1); OpenGL complete.** OpenGL now has the
+4×4 matrix and `dtd`-gated Gouraud/modulated-texture path, shared literally by
+Original and semantic draws. SW still needs `matrix[y&3][x&3]` before the
+`>>3` truncation in Gouraud/textured span writers. Lines remain outside the
+new RGB888 polygon API and should be completed with the SW work.
 
 **P2 — Fix SW rasterizer fill convention (D2 + D5 + D3).** Replace the float
 scanline rasterizer with the PSX fixed-point edge DDA: half-open X spans

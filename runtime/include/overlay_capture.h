@@ -51,6 +51,17 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
  * executed code, journal the coherent outgoing bytes/evidence first. */
 void overlay_capture_before_dma(uint32_t load_addr, uint32_t size);
 
+/* Preserve executable-page evidence before an explicit debug-tool RAM write.
+ * This prevents developer controls from replacing the pristine DMA image in
+ * additive capture history. */
+void overlay_capture_before_debug_write(uint32_t address, uint32_t size);
+
+/* Private replay-only identity probe. When PSX_OVERLAY_CAPTURE_REPLAY=1 and
+ * PSX_OVERLAY_PRIVATE_EXEC_PC matches pc, writes the complete RAM image retained
+ * after the most recent CD DMA to PSX_OVERLAY_PRIVATE_EXEC_SNAPSHOT. The
+ * retained image is diagnostic-only and never participates in dispatch. */
+void overlay_capture_private_note_execution(uint32_t pc);
+
 /* Write overlay_captures.json to the directory supplied at init time.
  * Safe to call even if no overlays were captured (writes nothing).
  * Called from shutdown_runtime() in main.cpp. */

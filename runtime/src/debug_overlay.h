@@ -47,9 +47,12 @@ bool psx_debug_overlay_is_visible(void);
  * if the overlay consumed the event (game must not see it). */
 bool psx_debug_overlay_process_event(const SDL_Event *ev);
 
-/* Render the overlay on top of the framebuffer. Called once per frame,
- * after the GPU has finished drawing the game and BEFORE SDL_GL_SwapWindow
- * (so the swap carries the overlay pixels). */
+/* Render/capture against a caller-selected framebuffer. A nonzero target is a
+ * drawable-sized color FBO; zero selects the default back buffer. The hook
+ * never binds framebuffer 0 while a nonzero target is supplied. */
+void psx_debug_overlay_pre_swap_target(unsigned int framebuffer);
+
+/* Default-framebuffer wrapper retained for the normal present paths. */
 void psx_debug_overlay_pre_swap(void);
 
 /* True when the overlay is visible AND wants exclusive keyboard focus
@@ -57,13 +60,12 @@ void psx_debug_overlay_pre_swap(void);
  * dispatch for as long as this is true. */
 bool psx_debug_overlay_swallow_keyboard(void);
 
-/* Arm a one-shot capture of the composited window (game + overlay) to a PNG
- * at `path`. The capture runs on the next pre_swap() (next vblank), because
- * pre_swap is the only point where the GL back buffer is composed but not
- * yet presented. The PNG is RGB, top-down, drawable-window-sized. If `path`
- * is NULL or empty, the runtime writes "window_shot.png" next to the exe.
- * Safe to call from the debug server thread (flag is racy in the harmless
- * "one-shot delayed by a frame" sense). */
+/* Arm a one-shot capture of the next pre-swap composited target (game +
+ * overlay) to a PNG. The default wrapper captures the GL back buffer; a
+ * target-aware transactional call captures its staging FBO. The PNG is RGB,
+ * top-down, drawable-window-sized. If `path` is NULL or empty, the runtime
+ * writes "window_shot.png" next to the exe. Safe to call from the debug server
+ * thread (flag is racy in the harmless "one-shot delayed by a frame" sense). */
 void psx_debug_overlay_window_shot_arm(const char *path);
 
 /* Read-only snapshot of the keyboard-capture state — exposed for the
@@ -167,7 +169,8 @@ static inline void psx_debug_overlay_shutdown(void) {}
 static inline void psx_debug_overlay_toggle(void) {}
 static inline bool psx_debug_overlay_is_visible(void) { return false; }
 static inline bool psx_debug_overlay_process_event(const SDL_Event *e) { (void)e; return false; }
-static inline void psx_debug_overlay_pre_swap(void) {}
+static inline void psx_debug_overlay_pre_swap_target(unsigned int f) { (void)f; }
+static inline void psx_debug_overlay_pre_swap(void) { psx_debug_overlay_pre_swap_target(0u); }
 static inline bool psx_debug_overlay_swallow_keyboard(void) { return false; }
 static inline void psx_debug_overlay_window_shot_arm(const char *p) { (void)p; }
 static inline void psx_debug_overlay_capture_state(int *v, int *wc, int *sw) { (void)v; (void)wc; (void)sw; }

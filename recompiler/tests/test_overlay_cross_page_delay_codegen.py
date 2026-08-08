@@ -17,6 +17,8 @@ from typing import Optional
 LOAD = 0x80010FF0
 BRANCH_PC = 0x80010FFC
 DELAY_PC = 0x80011000
+GAME_SHA256 = "12" * 32
+MANIFEST_SHA256 = "34" * 32
 
 
 def make_psxexe(data: bytes) -> bytes:
@@ -47,7 +49,9 @@ def run_codegen(recompiler: str, include_delay: bool, root: str,
     with open(seeds, "w", encoding="ascii") as f:
         f.write(f"dispatch_root 0x{LOAD:08X}\n")
     proc = subprocess.run(
-        [recompiler, psx, "--seeds", seeds, "--out-dir", out_dir, "--overlay"],
+        [recompiler, psx, "--seeds", seeds, "--out-dir", out_dir, "--overlay",
+         "--game-identity-sha256", GAME_SHA256,
+         "--manifest-digest-sha256", MANIFEST_SHA256],
         capture_output=True,
         text=True,
     )

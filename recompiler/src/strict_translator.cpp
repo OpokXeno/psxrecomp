@@ -1379,8 +1379,8 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             uint32_t gte_cmd = d.raw & 0x1FFFFFF;
             r.supported = true;
             r.c_code = fmt::format(
-                "gte_execute(cpu, 0x{:07X});",
-                gte_cmd);
+                "gte_execute_at(cpu, 0x{:07X}, 0x{:08X}u);",
+                gte_cmd, d.address);
             r.comment = fmt::format("gte cmd 0x{:02X}", gte_cmd & 0x3F);
             return r;
         }

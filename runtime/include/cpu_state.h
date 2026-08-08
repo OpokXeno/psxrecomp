@@ -12,6 +12,8 @@
 #ifndef PSXRECOMP_CPU_STATE_H
 #define PSXRECOMP_CPU_STATE_H
 
+#include "gte_attribution.h"
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -180,8 +182,13 @@ static inline int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t b
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
 
-/* GTE (COP2) — defined in runtime/src/gte.cpp */
+/* GTE (COP2) -- defined in runtime/src/gte.cpp. Direct host/test calls have no
+ * guest-PC attribution; production command paths provide the exact PC. */
 extern void     gte_execute(CPUState* cpu, uint32_t cmd);
+extern void     gte_execute_at(CPUState* cpu, uint32_t cmd, uint32_t guest_pc);
+extern void     gte_execute_at_tier(CPUState* cpu, uint32_t cmd,
+                                    uint32_t guest_pc,
+                                    GteAttributionExecutionTier tier);
 /* Widescreen X-squash: display aspect num:den (4,3 = identity/off). Scales
  * RTPS/RTPT screen-X around the game's OFX so a 4:3 frame stretched to the
  * wide aspect shows a wider field of view. */

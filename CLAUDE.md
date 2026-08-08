@@ -3,14 +3,19 @@
 This file is the constitution for v4. Read it at the start of every
 session before doing any work.
 
+- Use Luna Max for threads
+- Do not preserve backward compatibility.
+- Choose the simplest implementation that fully meets the current requirements.
+- Unit tests have zero authority.
+
 ---
 
 ## ⛔ RULE -1: BUILD THE FAITHFUL CORE — NO HACKS, NO PRESERVATION
 
 This ecosystem is being BUILT, not maintained. There is nothing to preserve.
 
-- The correct fix is ALWAYS the faithful, hardware-accurate, class-level core.
-  NEVER a surgical per-game patch, a symptom workaround, a `game.toml` hack
+- The correct fix is almost ALWAYS the faithful, hardware-accurate, class-level core.
+  almost NEVER a surgical per-game patch (unless xenogears game-specific), a symptom workaround, a `game.toml` hack
   (e.g. `overlay_native_block`), or "make native agree with interp even if both
   are fake."
 - When a narrow patch and a general faithfulness fix both exist, the
@@ -32,7 +37,7 @@ This supersedes any pressure to ship fast. Completeness is absolute here.
 
 **Scope (refined 2026-06-29 — faithfulness is the FOUNDATION, not the
 destination).** The rule above governs FOUNDATION work — building the faithful
-core — and forbids per-game patches / symptom-workarounds / `game.toml` hacks
+core — and forbids per-game patches (Unless Xenogears needs it) / symptom-workarounds / `game.toml` hacks
 *as a way to fake faithfulness*. It does NOT forbid them forever: once the
 faithful core is proven, per-game shims/hacks are the legitimate tool of the
 *enhancement* phase — accelerated load times (toward 0), widescreen, etc. (see
@@ -240,7 +245,17 @@ At the start of every session, before any code change:
    concrete milestone is.
 3. Verify `docs/psx_bios_disasm.txt` exists (primary reference).
 4. Verify Ghidra MCP is reachable. If not, stop and ask.
-5. State out loud: "Architecture A is locked. No interpreter. No stubs.
+5. If a overlay cannot be identified, inspect every
+   `build*/overlay_captures.json` and optional `.d/` records before
+   concluding it is absent. Locate the capture by runtime load base/range,
+   confirm its metadata proves load address, size, and executed PCs, then
+   cross-check the offsets in Ghidra. Use local byte equality only to verify
+   identity, without printing or storing payload bytes.
+6. A capture record alone is not a byte-identical `overlays/` artifact. If
+   no capture-to-local-artifact match exists, mark the result **BLOCKED**.
+   Never select by filename, size, CRC, or address alone, and never guess a
+   mismatch or convert it into an authenticated manifest.
+7. State out loud: "Architecture A is locked. No interpreter. No stubs.
    LLE default + oracle; HLE only per the §0 amendments (opt-in tier,
    LLE fallback, no fakes). BIOS first. Game never until Phase 5."
 

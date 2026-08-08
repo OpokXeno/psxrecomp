@@ -1,4 +1,5 @@
 #include "mdec.h"
+#include "gpu.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -97,6 +98,13 @@ typedef struct MDECState {
 
 static MDECState mdec;
 
+static uint32_t *mdec_native_frame;
+static uint32_t mdec_native_frame_capacity;
+static uint32_t mdec_native_frame_width;
+static uint32_t mdec_native_frame_height;
+static int mdec_native_frame_depth24;
+static uint64_t mdec_native_frame_generation;
+
 #define MDEC_TRACE_CAP 4096u
 static MDECDebugEvent mdec_trace[MDEC_TRACE_CAP];
 static uint64_t mdec_trace_seq;
@@ -175,6 +183,89 @@ static void append_byte(uint8_t value) {
 static uint8_t *output_reserve(uint32_t bytes) {
     if (!ensure_output_capacity(mdec.output_size + bytes)) return NULL;
     return mdec.output + mdec.output_size;
+}
+
+static uint32_t native_frame_width(uint32_t bytes_per_pixel,
+                                   uint32_t output_size) {
+    static const uint32_t fallbacks[] = { 320u, 256u, 368u, 512u, 640u,
+                                          160u };
+    GpuDisplayInfo display = { 0 };
+    uint32_t width;
+
+    gpu_get_display_info(&display);
+    width = display.width;
+    if (width != 0u && width % 16u == 0u &&
+        output_size % (width * bytes_per_pixel) == 0u)
+        return width;
+    for (size_t index = 0u; index < sizeof(fallbacks) / sizeof(fallbacks[0]);
+         ++index) {
+        width = fallbacks[index];
+        if (output_size % (width * bytes_per_pixel) == 0u)
+            return width;
+    }
+    return 0u;
+}
+
+static void publish_native_frame(void) {
+    const uint32_t bytes_per_pixel = mdec.output_depth == 3u ? 2u : 3u;
+    const uint32_t width = native_frame_width(bytes_per_pixel,
+                                              mdec.output_size);
+    const uint32_t height = width == 0u ? 0u :
+        mdec.output_size / (width * bytes_per_pixel);
+    const uint32_t macroblocks = width == 0u ? 0u : width / 16u;
+    const uint32_t macroblock_rows = height / 16u;
+    const uint64_t pixels = (uint64_t)width * height;
+
+    if (width == 0u || height == 0u || (height & 15u) != 0u ||
+        macroblocks == 0u || macroblock_rows == 0u ||
+        pixels > UINT32_MAX)
+        return;
+    if (pixels > mdec_native_frame_capacity) {
+        uint32_t capacity = mdec_native_frame_capacity != 0u
+            ? mdec_native_frame_capacity : 4096u;
+        while (capacity < pixels) {
+            if (capacity > UINT32_MAX / 2u) return;
+            capacity *= 2u;
+        }
+        uint32_t *frame = (uint32_t *)realloc(
+            mdec_native_frame, (size_t)capacity * sizeof(*frame));
+        if (!frame) return;
+        mdec_native_frame = frame;
+        mdec_native_frame_capacity = capacity;
+    }
+
+    for (uint32_t block = 0u; block < mdec.decode_macroblocks; ++block) {
+        const uint32_t block_x = block % macroblocks;
+        const uint32_t block_y = block / macroblocks;
+        if (block_y >= macroblock_rows) break;
+        for (uint32_t py = 0u; py < 16u; ++py) {
+            for (uint32_t px = 0u; px < 16u; ++px) {
+                const uint32_t source_pixel = block * 256u + py * 16u + px;
+                const uint32_t destination =
+                    (block_y * 16u + py) * width + block_x * 16u + px;
+                if (mdec.output_depth == 3u) {
+                    const uint16_t packed =
+                        (uint16_t)mdec.output[source_pixel * 2u] |
+                        ((uint16_t)mdec.output[source_pixel * 2u + 1u] << 8u);
+                    mdec_native_frame[destination] =
+                        0xff000000u |
+                        ((uint32_t)((packed >> 0u) & 0x1fu) << 19u) |
+                        ((uint32_t)((packed >> 5u) & 0x1fu) << 11u) |
+                        ((uint32_t)((packed >> 10u) & 0x1fu) << 3u);
+                } else {
+                    const uint32_t source = source_pixel * 3u;
+                    mdec_native_frame[destination] = 0xff000000u |
+                        ((uint32_t)mdec.output[source] << 16u) |
+                        ((uint32_t)mdec.output[source + 1u] << 8u) |
+                        mdec.output[source + 2u];
+                }
+            }
+        }
+    }
+    mdec_native_frame_width = width;
+    mdec_native_frame_height = height;
+    mdec_native_frame_depth24 = mdec.output_depth != 3u;
+    ++mdec_native_frame_generation;
 }
 
 static uint8_t input_byte(uint32_t byte_index) {
@@ -465,6 +556,7 @@ static void execute_decode(void) {
     /* FMV detector: stamp colour (15/24-bit) decodes only — streamed video.
      * The 4/8-bit luma path above is texture decompression, not video. */
     mdec_last_color_decode_frame = s_frame_count;
+    publish_native_frame();
     trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
 }
 
@@ -547,7 +639,29 @@ int mdec_recently_active(uint32_t within_frames) {
     return (uint64_t)(s_frame_count - mdec_last_color_decode_frame) <= within_frames;
 }
 
+int mdec_native_frame_snapshot(const uint32_t **pixels, uint32_t *width,
+                              uint32_t *height, int *depth24,
+                              uint64_t *generation) {
+    if (!pixels || !width || !height || !depth24 || !generation ||
+        !mdec_native_frame || mdec_native_frame_width == 0u ||
+        mdec_native_frame_height == 0u)
+        return 0;
+    *pixels = mdec_native_frame;
+    *width = mdec_native_frame_width;
+    *height = mdec_native_frame_height;
+    *depth24 = mdec_native_frame_depth24;
+    *generation = mdec_native_frame_generation;
+    return 1;
+}
+
 void mdec_init(void) {
+    free(mdec_native_frame);
+    mdec_native_frame = NULL;
+    mdec_native_frame_capacity = 0u;
+    mdec_native_frame_width = 0u;
+    mdec_native_frame_height = 0u;
+    mdec_native_frame_depth24 = 0;
+    mdec_native_frame_generation = 0u;
     memset(&mdec, 0, sizeof(mdec));
     memset(mdec_trace, 0, sizeof(mdec_trace));
     mdec_trace_seq = 0;

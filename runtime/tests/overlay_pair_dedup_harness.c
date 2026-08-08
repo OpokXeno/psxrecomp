@@ -1,5 +1,8 @@
 #define PSX_OVERLAY_DLL_BUILD 1
 #include "overlay_loader.h"
+#include "game_identity.h"
+#include "native_render_baseline.h"
+#include "xg_render_auth_runtime.h"
 #undef PSX_OVERLAY_DLL_BUILD
 
 #include <stdint.h>
@@ -22,6 +25,18 @@ _Static_assert(PSX_OVERLAY_TEST_CANDIDATE_CAP == 4,
 
 static uint8_t s_ram[RAM_SIZE];
 static uint8_t s_scratch[1024];
+static PsxXgRenderAuthCandidate s_renderer_candidate;
+static uint32_t s_renderer_candidate_calls;
+static const PsxGameIdentity s_fixture_identity = {
+    {0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u,
+     0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu,
+     0x10u, 0x11u, 0x12u, 0x13u, 0x14u, 0x15u, 0x16u, 0x17u,
+     0x18u, 0x19u, 0x1Au, 0x1Bu, 0x1Cu, 0x1Du, 0x1Eu, 0x1Fu},
+    {0x20u, 0x21u, 0x22u, 0x23u, 0x24u, 0x25u, 0x26u, 0x27u,
+     0x28u, 0x29u, 0x2Au, 0x2Bu, 0x2Cu, 0x2Du, 0x2Eu, 0x2Fu,
+     0x30u, 0x31u, 0x32u, 0x33u, 0x34u, 0x35u, 0x36u, 0x37u,
+     0x38u, 0x39u, 0x3Au, 0x3Bu, 0x3Cu, 0x3Du, 0x3Eu, 0x3Fu},
+};
 
 uint32_t g_debug_current_func_addr;
 uint32_t g_debug_last_store_pc;
@@ -35,6 +50,35 @@ uint64_t g_psx_bail_first, g_psx_bail_resolved;
 uint64_t s_frame_count;
 int g_shadow_mmio_watch;
 uint64_t g_shadow_mmio_hits;
+
+void native_render_baseline_runtime_reset(void) {}
+void native_render_baseline_runtime_arm(void) {}
+NativeRenderBaselineReason native_render_baseline_runtime_observe(
+        NativeRenderBaselineSnapshot *snapshot) {
+    (void)snapshot;
+    return NATIVE_RENDER_BASELINE_COMPLETE;
+}
+
+void psx_xg_render_auth_native_bad_entry(uint32_t owner, uint32_t pc) {
+    (void)owner;
+    (void)pc;
+}
+void psx_xg_render_auth_note_candidate_dispatch(
+        const PsxXgRenderAuthCandidate *candidate) {
+    if (candidate == NULL) return;
+    s_renderer_candidate = *candidate;
+    s_renderer_candidate_calls++;
+}
+void psx_xg_render_auth_warm_hook(CPUState *cpu, uint32_t hook, uint32_t pc,
+                                  uint32_t instruction_word,
+                                  uint32_t delay_slot_word) {
+    (void)cpu;
+    (void)hook;
+    (void)pc;
+    (void)instruction_word;
+    (void)delay_slot_word;
+}
+void psx_xg_render_auth_loader_mismatch(uint32_t pc) { (void)pc; }
 
 uint8_t *memory_get_ram_ptr(void) { return s_ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return s_scratch; }
@@ -78,6 +122,18 @@ void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
 
 void psx_advance_cycles(uint32_t cycles) { (void)cycles; }
 uint64_t psx_get_cycle_count(void) { return 0; }
+int32_t psx_xenogears_field_frame_step(uint32_t site_pc,
+                                       uint32_t instruction_word,
+                                       int32_t immediate,
+                                       uint32_t register_value,
+                                       uint32_t frame_count) {
+    (void)site_pc;
+    (void)instruction_word;
+    (void)immediate;
+    (void)register_value;
+    (void)frame_count;
+    return immediate;
+}
 int psx_cycle_replay_begin(uint64_t cycle) { (void)cycle; return 1; }
 uint64_t psx_cycle_replay_end(void) { return 0; }
 uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr, uint32_t rt,
@@ -128,7 +184,16 @@ int psx_slice_block_impl(CPUState *cpu, uint32_t addr, uint32_t cycles,
     return psx_slice_block(cpu, addr, cycles, side_effects);
 }
 
-void gte_execute(CPUState *cpu, uint32_t cmd) { (void)cpu; (void)cmd; }
+void gte_execute_at(CPUState *cpu, uint32_t cmd, uint32_t guest_pc) {
+    (void)cpu;
+    (void)cmd;
+    (void)guest_pc;
+}
+void gte_execute_at_tier(CPUState *cpu, uint32_t cmd, uint32_t guest_pc,
+                         GteAttributionExecutionTier tier) {
+    (void)tier;
+    gte_execute_at(cpu, cmd, guest_pc);
+}
 uint32_t gte_read_data(CPUState *cpu, uint8_t reg) {
     (void)cpu; (void)reg; return 0;
 }
@@ -286,45 +351,93 @@ int main(int argc, char **argv) {
 
     int alias = strcmp(scenario, "alias-at-cap") == 0;
     int partial = strcmp(scenario, "partial-first") == 0;
+    int rejected = strcmp(scenario, "missing-identity") == 0 ||
+                   strcmp(scenario, "lowercase-identity") == 0 ||
+                   strcmp(scenario, "flat-cache") == 0;
     int ok = 1;
+    const PsxGameIdentity *identity = psx_game_identity_runtime();
+    ok &= expect_int("runtime identity", identity != NULL, 1);
+    ok &= expect_int("bound runtime identity", psx_game_identity_gate(identity), 1);
 
     /* Only the first physical pair exists at init. This pins canonical order,
      * then makes rescan responsible for discovering the staged second pair. */
     ok &= expect_int("pre-rescan registered", overlay_loader_registered_count(),
-                     partial ? 0 : (alias ? 4 : 2));
+                     rejected || partial ? 0 : (alias ? 4 : 2));
     ok &= expect_int("pre-rescan aliases",
                      (long long)overlay_loader_pair_aliases(), 0);
-    ok &= expect_int("pre-rescan owners", loader_owner_count(), partial ? 0 : 1);
+    ok &= expect_int("pre-rescan owners", loader_owner_count(),
+                     rejected || partial ? 0 : 1);
     ok &= expect_int("pre-rescan first init",
-                     counter_value(first, "test_init_count"), partial ? 0 : 1);
+                     counter_value(first, "test_init_count"),
+                     rejected || partial ? 0 : 1);
     ok &= expect_int("pre-rescan first retained", module_is_loaded(first),
-                     partial ? 0 : 1);
+                     rejected || partial ? 0 : 1);
     if (!reveal_second_pair(second)) return 3;
     overlay_loader_rescan();
 
     ok &= expect_int("registered", overlay_loader_registered_count(),
-                     alias ? 4 : (partial ? 2 : 4));
+                     rejected ? 0 : (alias ? 4 : (partial ? 2 : 4)));
     ok &= expect_int("pair aliases", (long long)overlay_loader_pair_aliases(),
                      alias ? 1 : 0);
     ok &= expect_int("candidate overflow",
                      (long long)overlay_loader_candidate_overflow(), 0);
     ok &= expect_int("loader owners", loader_owner_count(),
-                     alias || partial ? 1 : 2);
+                     rejected ? 0 : (alias || partial ? 1 : 2));
     ok &= expect_int("first init", counter_value(first, "test_init_count"),
-                     partial ? 0 : 1);
+                     rejected || partial ? 0 : 1);
     ok &= expect_int("second init", counter_value(second, "test_init_count"),
-                     alias ? 0 : 1);
+                     rejected || alias ? 0 : 1);
 
     int first_loaded = module_is_loaded(first);
     int second_loaded = module_is_loaded(second);
-    ok &= expect_int("first retained", first_loaded, partial ? 0 : 1);
-    ok &= expect_int("second retained", second_loaded, alias ? 0 : 1);
+    ok &= expect_int("first retained", first_loaded, rejected || partial ? 0 : 1);
+    ok &= expect_int("second retained", second_loaded, rejected || alias ? 0 : 1);
 
     if (alias) {
         CPUState cpu;
+        NativeRenderBaselineConfig config;
+        NativeRenderBaselineSnapshot baseline;
         memset(&cpu, 0, sizeof(cpu));
+        memset(&config, 0, sizeof(config));
+        config.authenticated_producer_address = 0x80010000u;
+        config.game_digest = 1u;
+        config.max_vblanks = 1u;
+        ok &= expect_int("baseline arm", native_render_baseline_arm(&config), 1);
         ok &= expect_int("canonical dispatch",
                          overlay_loader_dispatch(&cpu, 0x80010000u), 1);
+        native_render_baseline_snapshot(&baseline);
+        ok &= expect_int("native producer count",
+                          (long long)baseline.native_calls, 1);
+        ok &= expect_int("renderer candidate calls",
+                          s_renderer_candidate_calls, 1);
+        ok &= expect_int("renderer authority provenance",
+                          s_renderer_candidate.authority_provenance, 1);
+        ok &= expect_int("renderer pair binding",
+                          s_renderer_candidate.pair_bound, 1);
+        ok &= expect_int("renderer pair id",
+                          (long long)s_renderer_candidate.pair_id,
+                          (long long)UINT64_C(0x1020304050607080));
+        ok &= expect_int("renderer identity",
+                          memcmp(&s_renderer_candidate.identity,
+                                 &s_fixture_identity,
+                                 sizeof(s_fixture_identity)), 0);
+        ok &= expect_int("renderer artifact base",
+                          s_renderer_candidate.artifact_base & 0x1FFFFFFFu,
+                          0x00010000u);
+        ok &= expect_int("renderer artifact size",
+                          s_renderer_candidate.artifact_size, 16);
+        ok &= expect_int("renderer artifact crc",
+                          s_renderer_candidate.artifact_crc32, 0x11111111u);
+        ok &= expect_int("renderer producer entry",
+                          s_renderer_candidate.producer_entry & 0x1FFFFFFFu,
+                          0x00010000u);
+        ok &= expect_int("renderer dispatch pc",
+                          s_renderer_candidate.dispatch_pc & 0x1FFFFFFFu,
+                          0x00010000u);
+        ok &= expect_int("renderer function range start",
+                          s_renderer_candidate.range_start, 0x00010000u);
+        ok &= expect_int("renderer function range size",
+                          s_renderer_candidate.range_size, 4);
         ok &= expect_int("canonical marker", cpu.gpr[2], TEST_MARKER);
         ok &= expect_int("canonical call count",
                          counter_value(first, "test_call_count"), 1);
@@ -340,11 +453,11 @@ int main(int argc, char **argv) {
      * another owner/candidate set for an already satisfied physical path. */
     overlay_loader_rescan();
     ok &= expect_int("idempotent registered", overlay_loader_registered_count(),
-                     alias ? 4 : (partial ? 2 : 4));
+                     rejected ? 0 : (alias ? 4 : (partial ? 2 : 4)));
     ok &= expect_int("idempotent aliases",
                      (long long)overlay_loader_pair_aliases(), alias ? 1 : 0);
     ok &= expect_int("idempotent owners", loader_owner_count(),
-                     alias || partial ? 1 : 2);
+                     rejected ? 0 : (alias || partial ? 1 : 2));
 
     if (!ok) {
         fprintf(stderr, "loader: %s; lazy=%d overflow=%d\n",

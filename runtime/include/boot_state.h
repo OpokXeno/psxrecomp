@@ -36,8 +36,9 @@ extern "C" {
 
 #define BOOT_STATE_MAGIC   0x50535842u  /* "PSXB" */
 /* v1 = incomplete RAM-only; v2 = full machine but host-struct memcpy (padding);
- * v3 = little-endian field wire (portable Win/Linux/macOS ARM). */
-#define BOOT_STATE_VERSION 3u
+ * v3 = little-endian field wire (portable Win/Linux/macOS ARM);
+ * v4 = exact game and manifest SHA-256 identities. */
+#define BOOT_STATE_VERSION 4u
 
 /*
  * On-disk header (v3): nine little-endian uint32 fields at offset 0 (36 bytes),
@@ -53,12 +54,15 @@ typedef struct {
     uint32_t codegen_hash;   /* PSX_OVERLAY_CODEGEN_HASH (auto-gen by cmake)      */
     int32_t  abi_tag;        /* PSX_OVERLAY_ABI_TAG (abi version | flavor<<16)    */
     uint32_t codegen_ver;    /* PSX_OVERLAY_CODEGEN_VER                           */
+    uint8_t  game_sha256[32];
+    uint8_t  manifest_sha256[32];
     /* ---- layout ---- */
     uint32_t section_count;  /* number of sections that follow                    */
     uint32_t reserved;       /* 0                                                 */
 } BootStateHeader;
 
-#define BOOT_STATE_HEADER_WIRE_BYTES 36u
+#define BOOT_STATE_GAME_IDENTITY_OFFSET 36u
+#define BOOT_STATE_HEADER_WIRE_BYTES 100u
 
 /*
  * Section stream (v3): section_count records, each laid out as
