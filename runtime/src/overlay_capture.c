@@ -69,6 +69,7 @@ static char s_private_replay_snapshot_path[768];
 static int s_private_replay_initialized;
 static int s_private_replay_load_valid;
 static int s_private_replay_complete;
+int g_overlay_capture_private_execution_enabled;
 
 static int      s_history_enabled = 0;
 static char     s_history_addendum[600];
@@ -112,6 +113,7 @@ static void private_replay_initialize(void)
     s_private_replay_load_ram = (uint8_t *)malloc(2u * 1024u * 1024u);
     if (!s_private_replay_load_ram) return;
     s_private_replay_exec_pc = (uint32_t)parsed;
+    g_overlay_capture_private_execution_enabled = 1;
     snprintf(s_private_replay_snapshot_path,
              sizeof(s_private_replay_snapshot_path), "%s", snapshot_path);
 }
@@ -264,6 +266,7 @@ int overlay_capture_set_path(const char *path)
 
 void overlay_capture_init(const char *out_dir)
 {
+    private_replay_initialize();
     overlay_capture_set_out_dir(out_dir);
 }
 

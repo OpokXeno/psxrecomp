@@ -246,7 +246,8 @@ static inline void exec_pc_table_record(uint32_t pc) {
             uint32_t page = phys >> 12;
             g_dirty_ram_exec_page_bitmap[page >> 5] |= 1u << (page & 31u);
         }
-        overlay_capture_private_note_execution(pc);
+        if (__builtin_expect(g_overlay_capture_private_execution_enabled, 0))
+            overlay_capture_private_note_execution(pc);
     }
 }
 
@@ -1335,11 +1336,15 @@ static int exec_one_fetched_unobserved(CPUState *cpu, uint32_t pc,
                                        uint32_t *next_pc_out);
 static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
                                      uint32_t insn,
+                                     uint32_t cold_flags,
                                      uint32_t *next_pc_out);
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     const uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
-    return g_psx_xg_render_auth_cold_enabled && !g_ls_replay_active
-        ? exec_one_fetched_observed(cpu, pc, insn, next_pc_out)
+    const uint32_t cold_flags =
+        g_psx_xg_render_auth_cold_enabled && !g_ls_replay_active
+            ? psx_xg_render_auth_cold_instruction_flags(pc, insn) : 0u;
+    return cold_flags != 0u
+        ? exec_one_fetched_observed(cpu, pc, insn, cold_flags, next_pc_out)
         : exec_one_fetched_unobserved(cpu, pc, insn, next_pc_out);
 }
 
@@ -1364,8 +1369,12 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
         return;
     }
     uint32_t dummy_next = 0;
-    if (g_psx_xg_render_auth_cold_enabled && !g_ls_replay_active)
-        (void)exec_one_fetched_observed(cpu, pc, insn, &dummy_next);
+    const uint32_t cold_flags =
+        g_psx_xg_render_auth_cold_enabled && !g_ls_replay_active
+            ? psx_xg_render_auth_cold_instruction_flags(pc, insn) : 0u;
+    if (cold_flags != 0u)
+        (void)exec_one_fetched_observed(
+            cpu, pc, insn, cold_flags, &dummy_next);
     else
         (void)exec_one_fetched_unobserved(cpu, pc, insn, &dummy_next);
     g_dirty_ram_insns_run++;
@@ -1380,6 +1389,7 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
  * still writes gpr[rt] eagerly, and we roll that write back by one instruction
  * so the delay-slot instruction observes the architecturally-correct value. */
 static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+                                  uint32_t cold_flags,
                                   uint32_t *next_pc_out);
 
 static int exec_one_fetched_unobserved(CPUState *cpu, uint32_t pc,
@@ -1435,7 +1445,7 @@ static int exec_one_fetched_unobserved(CPUState *cpu, uint32_t pc,
                            (ld_op >= 0x20u && ld_op <= 0x26u) &&
                            (ld_rt != 0u);
     const uint32_t ld_before = is_ld ? cpu->gpr[ld_rt] : 0u;
-    const int rv = exec_one_fetched_inner(cpu, pc, insn, next_pc_out);
+    const int rv = exec_one_fetched_inner(cpu, pc, insn, 0u, next_pc_out);
 
     if (is_ld) {
         const uint32_t loaded = cpu->gpr[ld_rt];
@@ -1460,6 +1470,7 @@ static int exec_one_fetched_unobserved(CPUState *cpu, uint32_t pc,
 
 static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
                                       uint32_t insn,
+                                      uint32_t cold_flags,
                                       uint32_t *next_pc_out) {
     const uint32_t opcode = op_field(insn);
     const int source_observation_control =
@@ -1467,20 +1478,20 @@ static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
         (opcode == 0x00u && funct_field(insn) == 0x09u);
     XgRenderSourceExecution source_observation = {0};
     const int native_cutover_post =
-        psx_xg_render_auth_native_cutover_post_pc_relevant(pc);
+        (cold_flags & PSX_XG_RENDER_COLD_NATIVE_POST) != 0u;
 
-    if ((psx_xg_render_auth_native_cutover_pc_relevant(pc) ||
-         psx_xg_render_auth_overlay_cutover_relevant(pc, insn)) &&
+    if ((cold_flags & (PSX_XG_RENDER_COLD_NATIVE_PRE |
+                       PSX_XG_RENDER_COLD_OVERLAY)) != 0u &&
         psx_xg_render_auth_native_ft4_bypass(cpu, pc, insn)) {
         *next_pc_out = cpu->pc;
         return 1;
     }
     if (!source_observation_control &&
-        psx_xg_render_auth_cold_source_pc_relevant(pc))
+        (cold_flags & PSX_XG_RENDER_COLD_SOURCE) != 0u)
         source_observation =
             xg_render_source_observation_begin(cpu, pc, insn);
     const int rv =
-        exec_one_fetched_unobserved(cpu, pc, insn, next_pc_out);
+        exec_one_fetched_inner(cpu, pc, insn, cold_flags, next_pc_out);
     if (native_cutover_post)
         (void)psx_xg_render_auth_native_ft4_bypass(cpu, pc, insn);
     if (!source_observation_control)
@@ -1489,6 +1500,7 @@ static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
 }
 
 static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
+                                  uint32_t cold_flags,
                                   uint32_t *next_pc_out) {
     exec_pc_table_record(pc);
     uint32_t opc  = op_field(insn);
@@ -1626,7 +1638,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         }
         case 0x09: { /* JALR rd, rs */
             const bool observe_render_source =
-                g_psx_xg_render_auth_cold_enabled;
+                (cold_flags & PSX_XG_RENDER_COLD_SOURCE) != 0u;
             XgRenderSourceExecution source_observation = {0};
             if (observe_render_source)
                 source_observation =
@@ -1818,20 +1830,15 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x03: { /* JAL target */
         const bool observe_render_source =
-            g_psx_xg_render_auth_cold_enabled;
+            (cold_flags & PSX_XG_RENDER_COLD_SOURCE) != 0u;
         XgRenderSourceExecution source_observation = {0};
-        bool xg_native_ft4_bypass = false;
-        if (observe_render_source) {
+        if (observe_render_source)
             source_observation =
                 xg_render_source_observation_begin(cpu, pc, insn);
-            xg_native_ft4_bypass =
-                psx_xg_render_auth_native_ft4_bypass(cpu, pc, insn);
-        }
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
-            if (observe_render_source && psx_xg_render_auth_cold_hook_relevant(
-                PSX_XG_RENDER_AUTH_HOOK_CAPTURE, pc, insn))
+        if ((cold_flags & PSX_XG_RENDER_COLD_CAPTURE) != 0u)
             psx_xg_render_auth_cold_hook(
                 cpu, PSX_XG_RENDER_AUTH_HOOK_CAPTURE, pc, insn,
                 fetch_word((pc + 4) & 0x1FFFFFFFu));
@@ -1839,8 +1846,6 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (observe_render_source)
             xg_render_source_observation_commit(cpu, &source_observation);
         cosim_exec_one_transfer_hook(pc + 4);
-        if (xg_native_ft4_bypass)
-            return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
 #ifndef PSX_NO_DEBUG_TOOLS
         int xw = g_xprobe_watch(target);  /* record RESOLUTION path for watched targets */
@@ -1969,13 +1974,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                             (uint32_t)psx_ws_x_margin() : 0u);
         cpu->gpr[0] = 0;
         return 0;
-    case 0x0A: /* SLTI */
-        if (psx_ws_semantic_cull_site(pc) ==
+    case 0x0A: { /* SLTI */
+        const PsxWsCullSemantic semantic = psx_ws_semantic_cull_site(pc);
+        if (semantic ==
             PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_signed_screen_x(
                 (int32_t)cpu->gpr[rs], simm);
-        else if (psx_ws_semantic_cull_site(pc) ==
-                 PSX_WS_CULL_SEMANTIC_DEPTH_BOUND)
+        else if (semantic == PSX_WS_CULL_SEMANTIC_DEPTH_BOUND)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_depth_signed(
                 (int32_t)cpu->gpr[rs], simm);
         else if (psx_ws_is_cull_depth_site(pc))
@@ -1990,21 +1995,21 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
         cpu->gpr[0] = 0;
         return 0;
-    case 0x0B: /* SLTIU */
+    }
+    case 0x0B: { /* SLTIU */
+        const PsxWsCullSemantic semantic = psx_ws_semantic_cull_site(pc);
         /* Widescreen render-funnel cull widening (auto_screen_x): apply the
          * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
          * code path serves both aspects (no widescreen-specific caching). */
-        if (psx_ws_semantic_cull_site(pc) ==
+        if (semantic ==
             PSX_WS_CULL_SEMANTIC_MASKED_SCREEN_X)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_masked_screen_x(
                 cpu->gpr[rs], imm);
-        else if (psx_ws_semantic_cull_site(pc) ==
-                 PSX_WS_CULL_SEMANTIC_WORLD_RANGE)
+        else if (semantic == PSX_WS_CULL_SEMANTIC_WORLD_RANGE)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_world_range(
                 cpu->gpr[rs], simm);
-        else if (psx_ws_semantic_cull_site(pc) ==
-                 PSX_WS_CULL_SEMANTIC_DEPTH_BOUND)
+        else if (semantic == PSX_WS_CULL_SEMANTIC_DEPTH_BOUND)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_depth_unsigned(
                 cpu->gpr[rs], simm);
         else if (psx_ws_is_cull_depth_site(pc))
@@ -2024,6 +2029,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
         cpu->gpr[0] = 0;
         return 0;
+    }
     case 0x0C: /* ANDI */
         cpu->gpr[rt] = cpu->gpr[rs] & imm;
         cpu->gpr[0] = 0;
@@ -2141,12 +2147,12 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x23: { /* LW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        if (psx_ws_semantic_cull_site(pc) ==
+        const PsxWsCullSemantic semantic = psx_ws_semantic_cull_site(pc);
+        if (semantic ==
             PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_frustum_plane_x(
                 (int32_t)psx_cyc_load_word(cpu, addr, rt, 1u << rs));
-        else if (psx_ws_semantic_cull_site(pc) ==
-                 PSX_WS_CULL_SEMANTIC_XCLIP_BOUND)
+        else if (semantic == PSX_WS_CULL_SEMANTIC_XCLIP_BOUND)
             cpu->gpr[rt] = psx_ws_guest_cull_xclip_bound(
                 psx_cyc_load_word(cpu, addr, rt, 1u << rs));
         else if (psx_ws_is_cull_plane_nx_site(pc))
@@ -2883,16 +2889,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         cosim_exec_one_begin();
         int transferred;
         if (observe_native_render) {
+            const uint32_t cold_flags = observe_render_source
+                ? psx_xg_render_auth_cold_instruction_flags(pc, insn) : 0u;
             if (collect_render_baseline)
                 native_render_baseline_note_execution_impl(
                     pc, NATIVE_RENDER_BASELINE_INTERPRETER);
-            if (observe_render_source &&
-                psx_xg_render_auth_cold_hook_relevant(
-                    PSX_XG_RENDER_AUTH_HOOK_ENTRY, pc, insn))
+            if ((cold_flags & PSX_XG_RENDER_COLD_ENTRY) != 0u)
                 psx_xg_render_auth_cold_hook(
                     cpu, PSX_XG_RENDER_AUTH_HOOK_ENTRY, pc, 0u, 0u);
-            transferred = observe_render_source
-                ? exec_one_fetched_observed(cpu, pc, insn, &next_pc)
+            transferred = cold_flags != 0u
+                ? exec_one_fetched_observed(
+                    cpu, pc, insn, cold_flags, &next_pc)
                 : exec_one_fetched_unobserved(cpu, pc, insn, &next_pc);
         } else {
             transferred =

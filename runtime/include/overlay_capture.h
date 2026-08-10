@@ -61,6 +61,7 @@ void overlay_capture_before_debug_write(uint32_t address, uint32_t size);
  * after the most recent CD DMA to PSX_OVERLAY_PRIVATE_EXEC_SNAPSHOT. The
  * retained image is diagnostic-only and never participates in dispatch. */
 void overlay_capture_private_note_execution(uint32_t pc);
+extern int g_overlay_capture_private_execution_enabled;
 
 /* Write overlay_captures.json to the directory supplied at init time.
  * Safe to call even if no overlays were captured (writes nothing).

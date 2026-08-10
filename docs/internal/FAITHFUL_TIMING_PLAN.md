@@ -213,6 +213,24 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-10 (Interpreted native-observation hot path):** The complete
+  4,464-VBlank Xenogears world-map replay established that fully interpreted
+  execution itself sustains `59.5--60.1` FPS in original render mode, while
+  native mode fell to `47.9--53.2` FPS because each interpreted instruction
+  crossed the runtime/native-renderer boundary for multiple cold-auth
+  relevance queries. Added one side-effect-free per-instruction classifier for
+  ENTRY/CAPTURE/SOURCE/native PRE/native POST/overlay sites and threaded its
+  flags through the observed decoder, preserving PRE/body/POST ordering and
+  delay-slot ownership. Also gated the disabled private-capture callback and
+  removed duplicate widescreen semantic lookups. The native-mode replay now
+  holds `58.5--60.8` FPS in the formerly sustained slow window (frames
+  `4155..4407`) and remains approximately 60 FPS through the earlier FMV and
+  transitions. No cycle, IRQ, load-delay, or memory behavior changed. Debug and
+  Release builds succeed; `53/54` CTests pass in both. The sole failure is the
+  existing private-artifact test whose local identity input is absent
+  (`identity could not read local input`). Interpreter structural perf guards
+  and `git diff --check` pass.
+
 - **2026-08-07 (Native stream family hint):** Added a bounded command-ID to
   resolver-family hint table in `native_renderer/src/xg_render_auth_runtime.c`.
   Hints are keyed by the current producer-resource generation, cleared during

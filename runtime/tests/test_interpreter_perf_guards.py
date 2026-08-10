@@ -107,8 +107,9 @@ def main():
             raise AssertionError(
                 f"load-delay value semantics lost BIOS ownership guard: {scope_guard}")
     exec_one_observed = body(interp, "exec_one_fetched_observed")
-    if "exec_one_fetched_unobserved(cpu, pc, insn, next_pc_out)" not in exec_one_observed:
-        raise AssertionError("observed decoder no longer delegates to the base decoder")
+    if "exec_one_fetched_inner(cpu, pc, insn, cold_flags, next_pc_out)" not in exec_one_observed:
+        raise AssertionError(
+            "observed decoder does not reuse the base decoder with preclassified hooks")
     # RFE backend-contract parity: the recompiled rfe and every overlay shard
     # (ABI v12) call psx_rfe_mark_escape after popping SR, and the generated
     # trampoline runs psx_rfe_escape_check after each return. The interpreter
