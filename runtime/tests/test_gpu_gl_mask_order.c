@@ -216,7 +216,7 @@ static void test_native_semantic_vertices_keep_raw_coordinates(void) {
                 "rectangle primitives are classified as screen-space 2D");
 }
 
-static void test_native_portrait_material_classification(void) {
+static void test_native_portrait_uses_canonical_position(void) {
     const GpuNativeDrawEnvironment environment = {0};
     uint32_t portrait[9] = {
         0x2c808080u,
@@ -229,15 +229,104 @@ static void test_native_portrait_material_classification(void) {
 
     expect_true(gpu_native_semantic_from_gp0(
                     portrait, 9, &environment, &semantic) == 1 &&
-                    semantic.screen_space_2d ==
-                        GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE,
-                "dialogue portrait preserves size in screen-space 2D");
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "dialogue portrait stays with the canonical dialogue box");
+
+    portrait[2] = 0x38000000u;
+    expect_true(gpu_native_semantic_from_gp0(
+                    portrait, 9, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "first portrait CLUT row stays in canonical screen space");
+
+    portrait[2] = 0x3bc00000u;
+    expect_true(gpu_native_semantic_from_gp0(
+                    portrait, 9, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "last portrait CLUT row stays in canonical screen space");
 
     portrait[2] = 0x38c10000u;
     expect_true(gpu_native_semantic_from_gp0(
                     portrait, 9, &environment, &semantic) == 1 &&
                     semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
-                "non-portrait CLUT does not classify a textured FT4 as screen-space");
+                "non-portrait CLUT X does not classify a textured FT4 as screen-space");
+
+    portrait[2] = 0x3c000000u;
+    expect_true(gpu_native_semantic_from_gp0(
+                    portrait, 9, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "out-of-range CLUT row does not classify a textured FT4 as screen-space");
+}
+
+static void test_dialogue_text_is_centered_with_its_box(void) {
+    GpuNativeDrawEnvironment environment = {0};
+    uint32_t box_fill[] = {
+        0x62000000u, gp0_xy(21, 19), gp0_xy(129, 52),
+    };
+    uint32_t text_sprite[] = {
+        0x65808080u, gp0_xy(28, 24), 0x7c000000u, gp0_xy(88, 13),
+    };
+    const uint32_t border_sprite[] = {
+        0x66808080u, gp0_xy(20, 18), 0x3d100000u, gp0_xy(64, 8),
+    };
+    const uint32_t continue_sprite[] = {
+        0x64808080u, gp0_xy(42, 64), 0x3d900000u, gp0_xy(12, 8),
+    };
+    GpuRenderSemantic semantic = {0};
+
+    expect_true(gpu_native_semantic_from_gp0(
+                    box_fill, 3, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "system text fill keeps its canonical width");
+
+    box_fill[0] = 0x62406080u;
+    box_fill[2] = gp0_xy(128, 56);
+    expect_true(gpu_native_semantic_from_gp0(
+                    box_fill, 3, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "field window body keeps its canonical width");
+
+    environment.tpage = 0x001cu;
+    expect_true(gpu_native_semantic_from_gp0(
+                    text_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "field dialogue text remains centered while its line sprite grows");
+
+    text_sprite[3] = gp0_xy(92, 13);
+    expect_true(gpu_native_semantic_from_gp0(
+                    text_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "revealing another field-dialogue glyph keeps the same mapping");
+
+    environment.tpage = 0x001eu;
+    expect_true(gpu_native_semantic_from_gp0(
+                    text_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "combat dialogue text remains centered with its polygon box");
+
+    environment.tpage = 0x001fu;
+    expect_true(gpu_native_semantic_from_gp0(
+                    text_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_STRETCH,
+                "unrelated screen-space sprite keeps widescreen stretching");
+
+    box_fill[0] = 0x62000000u;
+    box_fill[2] = gp0_xy(128, 52);
+    expect_true(gpu_native_semantic_from_gp0(
+                    box_fill, 3, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_STRETCH,
+                "unrelated translucent rectangle keeps widescreen stretching");
+
+    environment.tpage = 0x005au;
+    expect_true(gpu_native_semantic_from_gp0(
+                    border_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "field dialogue border sprite keeps its canonical position");
+
+    environment.tpage = 0x001au;
+    expect_true(gpu_native_semantic_from_gp0(
+                    continue_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "dialogue continue indicator stays attached to the box");
 }
 
 static void test_untextured_native_semantic_latches_ordered_blend(void) {
@@ -934,7 +1023,8 @@ int main(void) {
     test_native_cull_view_is_independent_of_legacy_wide_mode();
     test_semantic_guest_cull_policy();
     test_native_semantic_vertices_keep_raw_coordinates();
-    test_native_portrait_material_classification();
+    test_native_portrait_uses_canonical_position();
+    test_dialogue_text_is_centered_with_its_box();
     if (failures) return 1;
 
     SDL_SetMainReady();

@@ -4789,20 +4789,85 @@ static void native_semantic_quad(
     }
 }
 
-/* Xenogears dialogue portraits use GetTPage(1, 0, 0x2c0, 0x100) and
- * GetClut(0, 0xe3), independent of the scene that submits the OT. */
 enum {
-    XG_DIALOGUE_PORTRAIT_TPAGE = 0x009b,
-    XG_DIALOGUE_PORTRAIT_CLUT_X = 0x0000,
-    XG_DIALOGUE_PORTRAIT_CLUT_Y = 0x00e3,
+    XG_FIELD_DIALOGUE_FONT_TPAGE = 0x001c,
+    XG_COMBAT_DIALOGUE_FONT_TPAGE = 0x001e,
+    XG_DIALOGUE_CONTINUE_TPAGE = 0x001a,
+    XG_DIALOGUE_CONTINUE_CLUT_X = 0x0100,
+    XG_DIALOGUE_CONTINUE_CLUT_Y = 0x00f6,
+    XG_DIALOGUE_CONTINUE_WIDTH = 12,
+    XG_DIALOGUE_CONTINUE_HEIGHT = 8,
+    XG_DIALOGUE_BORDER_TPAGE = 0x005a,
+    XG_DIALOGUE_BORDER_CLUT_X = 0x0100,
+    XG_DIALOGUE_BORDER_CLUT_Y = 0x00f4,
+    XG_DIALOGUE_FONT_HEIGHT = 13,
 };
 
-static int native_semantic_is_portrait(uint8_t opcode,
-                                       const GpuRenderSemantic *semantic) {
-    if (semantic == NULL || opcode < 0x2cu || opcode > 0x2fu ||
-        semantic->material.tpage != XG_DIALOGUE_PORTRAIT_TPAGE ||
-        semantic->material.clut_x != XG_DIALOGUE_PORTRAIT_CLUT_X ||
-        semantic->material.clut_y != XG_DIALOGUE_PORTRAIT_CLUT_Y)
+static int native_semantic_is_dialogue_text(
+        uint8_t opcode, const GpuRenderSemantic *semantic) {
+    int32_t minimum_y = INT32_MAX;
+    int32_t maximum_y = INT32_MIN;
+
+    /* The system-string renderer grows one 13-pixel-high line sprite as glyphs
+     * are uploaded. Field and combat allocate those lines on pages 0x1c/0x1e. */
+    if (semantic == NULL || opcode < 0x64u || opcode > 0x67u ||
+        (semantic->material.tpage != XG_FIELD_DIALOGUE_FONT_TPAGE &&
+         semantic->material.tpage != XG_COMBAT_DIALOGUE_FONT_TPAGE))
+        return 0;
+    for (uint8_t triangle = 0u; triangle < semantic->triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            const GpuRenderSemanticVertex *item =
+                &semantic->triangles[triangle].vertices[vertex];
+            if (item->native_view_position) return 0;
+            if (item->y < minimum_y) minimum_y = item->y;
+            if (item->y > maximum_y) maximum_y = item->y;
+        }
+    return maximum_y - minimum_y ==
+        XG_DIALOGUE_FONT_HEIGHT * INT32_C(65536);
+}
+
+static int native_semantic_is_dialogue_box_fill(
+        uint8_t opcode, const GpuRenderSemantic *semantic) {
+    int32_t minimum_x = INT32_MAX;
+    int32_t maximum_x = INT32_MIN;
+    int32_t minimum_y = INT32_MAX;
+    int32_t maximum_y = INT32_MIN;
+    int black = 1;
+
+    /* FUN_80032f54 emits a black RECT sized odd_columns * 4 + 13 by
+     * lines * 14 + 10. FUN_8007e1c0 emits the colored window body sized
+     * columns * 4 + 16 by lines * 14 + 14. */
+    if (semantic == NULL || opcode != 0x62u || semantic->material.textured ||
+        !semantic->material.semi_transparent)
+        return 0;
+    for (uint8_t triangle = 0u; triangle < semantic->triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            const GpuRenderSemanticVertex *item =
+                &semantic->triangles[triangle].vertices[vertex];
+            if (item->native_view_position) return 0;
+            if (item->r != 0u || item->g != 0u || item->b != 0u) black = 0;
+            if (item->x < minimum_x) minimum_x = item->x;
+            if (item->x > maximum_x) maximum_x = item->x;
+            if (item->y < minimum_y) minimum_y = item->y;
+            if (item->y > maximum_y) maximum_y = item->y;
+        }
+    {
+        const int32_t width = (maximum_x - minimum_x) / INT32_C(65536);
+        const int32_t height = (maximum_y - minimum_y) / INT32_C(65536);
+        const int system_text_fill = black && width >= 17 && (width & 7) == 1 &&
+            height >= 24 && height % 14 == 10;
+        const int field_window_fill = width >= 16 && width % 4 == 0 &&
+            height >= 14 && height % 14 == 0;
+        return system_text_fill || field_window_fill;
+    }
+}
+
+static int native_semantic_is_dialogue_border(
+        uint8_t opcode, const GpuRenderSemantic *semantic) {
+    if (semantic == NULL || opcode < 0x64u || opcode > 0x67u ||
+        semantic->material.tpage != XG_DIALOGUE_BORDER_TPAGE ||
+        semantic->material.clut_x != XG_DIALOGUE_BORDER_CLUT_X ||
+        semantic->material.clut_y != XG_DIALOGUE_BORDER_CLUT_Y)
         return 0;
     for (uint8_t triangle = 0u; triangle < semantic->triangle_count; ++triangle)
         for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
@@ -4811,10 +4876,41 @@ static int native_semantic_is_portrait(uint8_t opcode,
     return 1;
 }
 
+static int native_semantic_is_dialogue_continue_indicator(
+        uint8_t opcode, const GpuRenderSemantic *semantic) {
+    int32_t minimum_x = INT32_MAX;
+    int32_t maximum_x = INT32_MIN;
+    int32_t minimum_y = INT32_MAX;
+    int32_t maximum_y = INT32_MIN;
+
+    if (semantic == NULL || opcode < 0x64u || opcode > 0x67u ||
+        semantic->material.tpage != XG_DIALOGUE_CONTINUE_TPAGE ||
+        semantic->material.clut_x != XG_DIALOGUE_CONTINUE_CLUT_X ||
+        semantic->material.clut_y != XG_DIALOGUE_CONTINUE_CLUT_Y)
+        return 0;
+    for (uint8_t triangle = 0u; triangle < semantic->triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            const GpuRenderSemanticVertex *item =
+                &semantic->triangles[triangle].vertices[vertex];
+            if (item->native_view_position) return 0;
+            if (item->x < minimum_x) minimum_x = item->x;
+            if (item->x > maximum_x) maximum_x = item->x;
+            if (item->y < minimum_y) minimum_y = item->y;
+            if (item->y > maximum_y) maximum_y = item->y;
+        }
+    return maximum_x - minimum_x ==
+            XG_DIALOGUE_CONTINUE_WIDTH * INT32_C(65536) &&
+        maximum_y - minimum_y ==
+            XG_DIALOGUE_CONTINUE_HEIGHT * INT32_C(65536);
+}
+
 static uint8_t native_semantic_screen_space_mode(
         uint8_t opcode, const GpuRenderSemantic *semantic) {
-    if (native_semantic_is_portrait(opcode, semantic))
-        return GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE;
+    if (native_semantic_is_dialogue_text(opcode, semantic) ||
+        native_semantic_is_dialogue_box_fill(opcode, semantic) ||
+        native_semantic_is_dialogue_border(opcode, semantic) ||
+        native_semantic_is_dialogue_continue_indicator(opcode, semantic))
+        return GPU_RENDER_SCREEN_SPACE_2D_NONE;
     return opcode >= 0x60u ? GPU_RENDER_SCREEN_SPACE_2D_STRETCH
                            : GPU_RENDER_SCREEN_SPACE_2D_NONE;
 }
@@ -5073,7 +5169,6 @@ int gpu_native_semantic_from_gp0(
                                   clut_x, clut_y, textured, raw_texture,
                                   semi_transparent, shading))
         return -1;
-    out->screen_space_2d = native_semantic_screen_space_mode(opcode, out);
     if (opcode >= 0x20u && opcode <= 0x27u) {
         out->triangle_count = 1u;
         native_semantic_triangle(&out->triangles[0], 0u, x, y, u, v, color);
@@ -5083,6 +5178,7 @@ int gpu_native_semantic_from_gp0(
     } else {
         native_semantic_quad(out, x, y, u, v, color);
     }
+    out->screen_space_2d = native_semantic_screen_space_mode(opcode, out);
     return 1;
 }
 
