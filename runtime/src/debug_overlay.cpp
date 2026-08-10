@@ -63,18 +63,17 @@
  * GL_VERSION_3_0 to be defined. Rather than rely on the system's
  * version-guard maze (which differs between distros and breaks as soon
  * as the driver exposes a newer core version), we declare the six
- * functions we need ourselves. The symbols come from libGL.so on Linux,
- * opengl32.dll on Windows, OpenGL.framework on macOS — all already
- * linked by the runtime target. ImGui's GL3 backend has its own
- * (private) loader and is unaffected. */
+ * functions we need ourselves. OpenGL 3 entry points are resolved through
+ * SDL: Windows' opengl32.dll exports only OpenGL 1.1. ImGui's GL3 backend has
+ * its own private loader and is unaffected. */
 #include <SDL_opengl.h>
 #if defined(__APPLE__)
 #  include <OpenGL/gl.h>
 #else
 #  include <GL/gl.h>
 #endif
+#if !defined(_WIN32)
 extern "C" {
-    void glBindFramebuffer(GLenum target, GLuint framebuffer);
     void glReadBuffer(GLenum mode);
     void glDrawBuffer(GLenum mode);
     void glPixelStorei(GLenum pname, GLint param);
@@ -82,8 +81,13 @@ extern "C" {
                       GLenum format, GLenum type, void *pixels);
     GLenum glGetError(void);
 }
+#endif
+
+typedef void (APIENTRYP PfnDebugBindFramebuffer)(GLenum, GLuint);
+static PfnDebugBindFramebuffer s_bind_framebuffer = nullptr;
 
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -291,14 +295,20 @@ static char     s_event_jump_status[128] = {0};
 
 /* ---- small helpers ------------------------------------------------------ */
 
-static void bind_overlay_target(GLuint target_fbo)
+static bool bind_overlay_target(GLuint target_fbo)
 {
     const GLenum buffer = target_fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK;
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target_fbo);
+    if (!s_bind_framebuffer) {
+        s_bind_framebuffer = reinterpret_cast<PfnDebugBindFramebuffer>(
+            SDL_GL_GetProcAddress("glBindFramebuffer"));
+    }
+    if (!s_bind_framebuffer) return false;
+    s_bind_framebuffer(GL_READ_FRAMEBUFFER, target_fbo);
+    s_bind_framebuffer(GL_DRAW_FRAMEBUFFER, target_fbo);
     glReadBuffer(buffer);
     glDrawBuffer(buffer);
+    return true;
 }
 
 /* Read the selected drawable-sized framebuffer to a top-down RGB uint8_t*
@@ -313,12 +323,12 @@ static uint8_t *capture_window_rgb(GLuint target_fbo, int *out_w, int *out_h)
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (ww <= 0 || wh <= 0) return nullptr;
 
-    bind_overlay_target(target_fbo);
+    if (!bind_overlay_target(target_fbo)) return nullptr;
 
     const size_t row_bytes = (size_t)ww * 3;
     uint8_t *rgb = (uint8_t *)std::malloc(row_bytes * (size_t)wh);
     if (!rgb) {
-        bind_overlay_target(target_fbo);
+        (void)bind_overlay_target(target_fbo);
         return nullptr;
     }
     /* GL_PACK_ALIGNMENT=1 prevents row padding for our tight RGB rows. */
@@ -326,7 +336,7 @@ static uint8_t *capture_window_rgb(GLuint target_fbo, int *out_w, int *out_h)
     glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
     GLenum err = glGetError();
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    bind_overlay_target(target_fbo);
+    (void)bind_overlay_target(target_fbo);
     if (err != GL_NO_ERROR) {
         std::free(rgb);
         return nullptr;
@@ -1780,6 +1790,7 @@ void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
     s_imgui_ready = false;
     s_window_shot_armed = false;
     s_window_shot_path[0] = '\0';
+    s_bind_framebuffer = nullptr;
     (void)ctx; /* ctx is NULL by design — see file header */
 }
 
@@ -1792,6 +1803,7 @@ void psx_debug_overlay_shutdown(void)
         s_imgui_ready = false;
     }
     s_win = nullptr;
+    s_bind_framebuffer = nullptr;
     s_window_shot_armed = false;
 }
 
@@ -2114,9 +2126,10 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
         }
 
         ImGui::Render();
-        bind_overlay_target(target_fbo);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        bind_overlay_target(target_fbo);
+        if (bind_overlay_target(target_fbo)) {
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            (void)bind_overlay_target(target_fbo);
+        }
     } else if (s_text_input_started) {
         /* Hidden mid-text-input (Ctrl+F3 while typing): the Start call lives
          * inside the visible branch, so a toggle-while-typing leaves the

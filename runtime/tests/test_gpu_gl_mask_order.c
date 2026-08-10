@@ -651,6 +651,145 @@ static void test_native_view_expands_fullscreen_fade(void) {
                 "fullscreen fade Native view disables independently");
 }
 
+static void test_native_view_expands_gouraud_and_textured_overlays(void) {
+    const uint32_t gouraud_quad[] = {
+        0x38ffffffu, gp0_xy(0, 0),
+        0x00ffffffu, gp0_xy(320, 0),
+        0x00ffffffu, gp0_xy(0, 224),
+        0x00ffffffu, gp0_xy(320, 224),
+    };
+    const uint16_t tpage = UINT16_C(0x0101);
+    const uint32_t textured_quad[] = {
+        0x2dffffffu,
+        gp0_xy(0, 0), 0u,
+        gp0_xy(320, 0), (uint32_t)tpage << 16u | 1u,
+        gp0_xy(0, 224), 0x00000100u,
+        gp0_xy(320, 224), 0x00000101u,
+    };
+    const GpuRenderOracleSource source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, 0x1c84u, 0x711u, 0x710u,
+    };
+    uint16_t left = 0;
+    uint16_t right = 0;
+
+    reset_gpu_for_case();
+    gpu_write_gp0(0xe3000000u);
+    gpu_write_gp0(0xe4037d3eu);
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "Gouraud fullscreen Native view configures");
+    expect_true(gpu_native_submit_gp0_packet(
+                    gouraud_quad,
+                    sizeof(gouraud_quad) / sizeof(gouraud_quad[0]),
+                    NULL, &source) == 1,
+                "Gouraud fullscreen overlay reaches the Native semantic path");
+    expect_true(gl_renderer_native_view_peek(0, 2, 100, 1, 1, &left) &&
+                gl_renderer_native_view_peek(0, 425, 100, 1, 1, &right),
+                "Gouraud fullscreen Native margins are readable");
+    expect_pixel(left, WHITE_1555,
+                 "Gouraud fullscreen overlay covers the left Native margin");
+    expect_pixel(right, WHITE_1555,
+                 "Gouraud fullscreen overlay covers the right Native margin");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "Gouraud fullscreen Native view resets");
+
+    reset_gpu_for_case();
+    gpu_write_gp0(0xe3000000u);
+    gpu_write_gp0(0xe4037d3eu);
+    gr_vram_write(64, 0, WHITE_1555);
+    gr_vram_write(65, 0, WHITE_1555);
+    gr_vram_write(64, 1, WHITE_1555);
+    gr_vram_write(65, 1, WHITE_1555);
+    gl_renderer_flush_cpu_uploads();
+    gpu_ws_set_nw_backdrop(0);
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "textured fullscreen Native view configures");
+    expect_true(gpu_native_submit_gp0_packet(
+                    textured_quad,
+                    sizeof(textured_quad) / sizeof(textured_quad[0]),
+                    NULL, &source) == 1,
+                "textured fullscreen overlay reaches the Native semantic path");
+    left = right = 0;
+    expect_true(gl_renderer_native_view_peek(0, 2, 100, 1, 1, &left) &&
+                gl_renderer_native_view_peek(0, 425, 100, 1, 1, &right),
+                "textured fullscreen Native margins are readable");
+    expect_pixel(left, WHITE_1555,
+                 "textured fullscreen overlay covers the left Native margin");
+    expect_pixel(right, WHITE_1555,
+                 "textured fullscreen overlay covers the right Native margin");
+    gpu_ws_set_nw_backdrop(1);
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "textured fullscreen Native view disables independently");
+}
+
+static void test_native_view_flip_clears_only_retired_margins(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 10), gp0_xy(18, 10), gp0_xy(10, 18),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    uint16_t margin = 0;
+    uint16_t center = 0;
+
+    reset_gpu_for_case();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "flip invalidation Native view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]),
+                    &environment, &semantic) == 1,
+                "flip invalidation builds semantic geometry");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle) {
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x;
+            position->native_view_y = position->y;
+            position->native_view_position = 1u;
+        }
+    }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "flip invalidation paints canonical and Native surfaces");
+    expect_true(gl_renderer_native_view_peek(0, 11, 11, 1, 1, &margin) &&
+                gl_renderer_native_view_peek(0, 64, 11, 1, 1, &center),
+                "flip invalidation setup pixels are readable");
+    expect_pixel(margin, WHITE_1555,
+                 "source-derived primitive initially paints the Native margin");
+    expect_pixel(center, WHITE_1555,
+                 "canonical seed remains visible in the Native center");
+
+    gpu_write_gp1(0x05000000u | (256u << 10u));
+    margin = center = 0;
+    expect_true(gl_renderer_native_view_peek(0, 11, 11, 1, 1, &margin) &&
+                gl_renderer_native_view_peek(0, 64, 11, 1, 1, &center),
+                "retired Native band remains readable after the flip");
+    expect_pixel(margin, 0,
+                 "real framebuffer flip clears the retired synthetic margin");
+    expect_pixel(center, WHITE_1555,
+                 "real framebuffer flip preserves the retired canonical center");
+
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle) {
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->y += 10 * INT32_C(65536);
+            position->native_view_y += 10 * INT32_C(65536);
+        }
+    }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "retired band accepts the next frame's Native draw");
+    gpu_write_gp1(0x05000000u | (256u << 10u));
+    margin = 0;
+    expect_true(gl_renderer_native_view_peek(0, 11, 21, 1, 1, &margin),
+                "redundant-flip Native margin remains readable");
+    expect_pixel(margin, WHITE_1555,
+                 "redundant GP1 display start does not clear an active draw band");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "flip invalidation Native view disables independently");
+}
+
 static void test_native_view_uses_effective_draw_destination(void) {
     const uint32_t offset[] = { 0xe5000140u };
     const uint32_t quad[] = {
@@ -1058,6 +1197,8 @@ int main(void) {
         test_native_view_scales_screen_space_rectangles();
         test_native_view_preserves_screen_space_primitive_size();
         test_native_view_expands_fullscreen_fade();
+        test_native_view_expands_gouraud_and_textured_overlays();
+        test_native_view_flip_clears_only_retired_margins();
         test_native_view_uses_effective_draw_destination();
         test_native_view_backdrop_right_edge_coverage();
         test_native_view_tracks_ordered_packet_mutations();

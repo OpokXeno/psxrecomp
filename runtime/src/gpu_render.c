@@ -606,6 +606,12 @@ void gr_wide_clear_margins(int base_x, int y, int h, uint16_t color, int sides) 
     if (g_b->wide_clear_margins)
         g_b->wide_clear_margins(base_x, y, h, color, sides);
 }
+
+void gr_native_view_clear_margins(int base_x, int y, int h, uint16_t color) {
+    if (g_b->native_view_clear_margins)
+        g_b->native_view_clear_margins(base_x, y, h, color);
+}
+
 int gr_render_wide_display(uint32_t *out, int pitch, int base_x,
                            int disp_y, int disp_h) {
     if (g_b->render_wide_display)

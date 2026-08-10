@@ -6879,8 +6879,23 @@ static void gp1_display_area_start(uint32_t val) {
     /* GP1(05h): Start of display area in VRAM
      * bits 0-9: X (in halfwords, 0-1023)
      * bits 10-18: Y (0-511) */
-    display_area_x = val & 0x3FF;
-    display_area_y = (val >> 10) & 0x1FF;
+    uint32_t new_x = val & 0x3FF;
+    uint32_t new_y = (val >> 10) & 0x1FF;
+
+    /* The old display band retires at a real framebuffer flip and becomes the
+     * next draw target. Its Native-view side columns have no guest-VRAM backing,
+     * so clear them before the next frame can inherit synthetic pixels. Never
+     * clear on a redundant GP1(05h): the game may already be drawing there. */
+    if (new_x != display_area_x || new_y != display_area_y) {
+        GpuDisplayInfo display;
+        gpu_get_display_info(&display);
+        if (display.height > 0u)
+            gr_native_view_clear_margins(
+                (int)display_area_x, (int)display_area_y,
+                (int)display.height, 0);
+    }
+    display_area_x = new_x;
+    display_area_y = new_y;
     ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
 }
 

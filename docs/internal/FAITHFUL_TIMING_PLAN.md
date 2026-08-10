@@ -213,6 +213,16 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-11 (Native-wide PR salvage):** Adapted the production-safe pieces
+  of PR #2 to the producer-driven Native renderer without restoring legacy
+  mirror heuristics or diagnostics. GP1(05h) real framebuffer changes now clear
+  only the retiring Native surface's synthetic side columns; redundant writes
+  preserve an active draw band. Axis-aligned fullscreen Native semantics now
+  expand flat, Gouraud, and textured two-triangle filters to both revealed
+  columns while leaving canonical geometry unchanged. The debug overlay resolves
+  `glBindFramebuffer` through SDL for Windows OpenGL 3 compatibility. The
+  OpenGL Native mask/order test covers margin invalidation and Gouraud/textured
+  edge coverage; Release and debug-tools runtime builds pass.
 - **2026-08-11 (Cross-platform live overlay toolchain):** POSIX runtimes now
   spawn overlay compilation asynchronously, retain child output in memory, and
   rescan the native cache on the emulation thread after completion. Source

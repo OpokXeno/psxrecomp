@@ -4599,6 +4599,29 @@ static void native_view_fill_local_wrapped_y(int slot, int local_x, int y,
                                     h - first_height, color);
 }
 
+static void glb_native_view_clear_margins(int base_x, int y, int h,
+                                          uint16_t color) {
+    int slot;
+    int right_x;
+
+    if (!s_native_view_enabled || s_native_view_width <= 0 || h <= 0 ||
+        !s_ctx || SDL_GL_GetCurrentContext() != s_ctx || s_transaction)
+        return;
+    slot = native_view_surface_slot(base_x & (VRAM_W - 1), 0);
+    if (slot < 0 || !s_native_view_seeded[slot]) return;
+
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+    if (s_native_view_offset > 0)
+        native_view_fill_local_wrapped_y(
+            slot, 0, y, s_native_view_offset, h, color);
+    right_x = s_native_view_offset + s_native_view_canonical_width;
+    if (right_x < s_native_view_width)
+        native_view_fill_local_wrapped_y(
+            slot, right_x, y, s_native_view_width - right_x, h, color);
+}
+
 static void native_view_ensure_destination_surfaces(int x, int w) {
     int remaining;
     int segment_x;
@@ -5107,22 +5130,20 @@ static GpuRenderTransactionStatus glb_transaction_drain(void) {
         : GPU_RENDER_TRANSACTION_OK;
 }
 
-/* A Native fallback or UI producer can submit the PS1 transition filter as a
- * flat, untextured 320x224/240 quad. The canonical pass remains unchanged, but
- * the Native-view pass must extend that quad into both revealed columns;
- * centering the original coordinates would otherwise leave the margins
- * unfaded. */
-static int glb_native_view_fullscreen_flat_quad(
+/* A Native fallback or UI producer can submit a PS1 transition/filter as an
+ * axis-aligned 320x224/240 quad. Flat, Gouraud, and textured filters all cover
+ * the complete display; the canonical pass remains unchanged while the Native
+ * pass maps only the outer horizontal edges to the revealed columns. */
+static int glb_native_view_fullscreen_quad(
         const GpuRenderSemantic *semantic) {
     int min_x = INT_MAX, max_x = INT_MIN;
     int min_y = INT_MAX, max_y = INT_MIN;
     int fullscreen_height;
+    unsigned corner_mask = 0u;
     GpuDisplayInfo display = {0};
 
     if (!semantic || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
-        semantic->triangle_count != 2u || semantic->line_count != 0u ||
-        semantic->material.textured || semantic->material.raw_texture ||
-        semantic->material.shading != GPU_RENDER_SHADING_FLAT)
+        semantic->triangle_count != 2u || semantic->line_count != 0u)
         return 0;
     for (uint8_t triangle_index = 0u;
          triangle_index < semantic->triangle_count; ++triangle_index) {
@@ -5155,8 +5176,33 @@ static int glb_native_view_fullscreen_flat_quad(
      * merely because the current CRTC range reports 240 lines. */
     if (fullscreen_height > 224)
         fullscreen_height = 224;
-    return min_x <= 0 && max_x >= s_native_view_canonical_width &&
-           min_y <= 0 && max_y >= fullscreen_height;
+    if (min_x > 0 || max_x < s_native_view_canonical_width ||
+        min_y > 0 || max_y < fullscreen_height)
+        return 0;
+
+    /* Bounds alone also match unrelated two-triangle geometry. Require every
+     * submitted vertex to be one of the four rectangle corners and require all
+     * four corners to occur across the split. */
+    for (uint8_t triangle_index = 0u;
+         triangle_index < semantic->triangle_count; ++triangle_index) {
+        const GpuRenderSemanticTriangle *triangle =
+            &semantic->triangles[triangle_index];
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const GpuRenderSemanticVertex *vertex =
+                &triangle->vertices[vertex_index];
+            const int x = vertex->x / INT32_C(65536) +
+                semantic->material.draw_offset_x - s_native_view_pass_base;
+            const int y = vertex->y / INT32_C(65536) +
+                semantic->material.draw_offset_y;
+            unsigned corner;
+
+            if ((x != min_x && x != max_x) || (y != min_y && y != max_y))
+                return 0;
+            corner = (x == max_x ? 1u : 0u) | (y == max_y ? 2u : 0u);
+            corner_mask |= 1u << corner;
+        }
+    }
+    return corner_mask == 0x0fu;
 }
 
 /* Native semantic equivalent of ws_nw_backdrop_stretch_quad(). The legacy
@@ -5844,7 +5890,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_contents(
     GpuRenderTransactionStatus status;
     const GpuRenderMaterial *material;
     const int fullscreen_overlay = native_view &&
-        (glb_native_view_fullscreen_flat_quad(semantic) ||
+        (glb_native_view_fullscreen_quad(semantic) ||
          (gpu_ws_nw_backdrop_enabled() &&
           glb_native_view_backdrop_quad(semantic)));
     const int screen_space_2d_mode = native_view
@@ -6049,7 +6095,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
     s_native_view_pass_fbo = s_native_view_fbo[slot];
     s_native_view_pass_base = base_x;
     s_native_view_expand_x =
-        glb_native_view_fullscreen_flat_quad(semantic) ||
+        glb_native_view_fullscreen_quad(semantic) ||
         (gpu_ws_nw_backdrop_enabled() &&
          glb_native_view_backdrop_quad(semantic)) ||
         glb_native_view_semantic_reaches_reveal(semantic);
@@ -6441,6 +6487,7 @@ static const GpuRenderBackend GL_BACKEND = {
     .wide_disable_target = glb_wide_disable_target,
     .wide_clear = glb_wide_clear,
     .wide_clear_margins = glb_wide_clear_margins,
+    .native_view_clear_margins = glb_native_view_clear_margins,
     .render_wide_display = glb_render_wide_display,
     .wide_dump_full = glb_wide_dump_full,
     .transaction_begin = glb_transaction_begin,
