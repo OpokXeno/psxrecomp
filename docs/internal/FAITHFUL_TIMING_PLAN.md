@@ -213,6 +213,25 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-11 (Cross-platform live overlay toolchain):** POSIX runtimes now
+  spawn overlay compilation asynchronously, retain child output in memory, and
+  rescan the native cache on the emulation thread after completion. Source
+  checkouts synthesize the GCC/Python command automatically. Linux and Windows
+  release packaging now stages pinned Python 3.11.9 + TinyCC 0.9.27, the
+  platform-native hash-matched recompiler, runtime headers, and licenses under
+  `overlay_toolchain/`; the archive verifier requires that contract. Linux
+  staging and relocated TCC compilation were exercised in the glibc 2.31 image;
+  the Windows recompiler was cross-built and verified to import only system
+  DLLs.
+- **2026-08-11 (Live compile frame isolation):** Runtime-triggered overlay
+  builds now force one region worker and inherit low OS priority. Successful
+  shards emit a flushed publication marker, allowing POSIX and Windows runtimes
+  to prepare each image off-thread and commit it on the emulation thread instead
+  of waiting for the whole capture batch. Live builds discard successful/cached
+  generated C while retaining failed sources for triage; in the observed
+  world-map cache those sources accounted for 108 MB of 142 MB. The result
+  parser now accepts its documented optional `capacity_fastpath` field. The
+  assertion-enabled POSIX publication test and full Linux runtime build pass.
 - **2026-08-10 (Real-time Debug execution):** A complete 4,464-VBlank
   Xenogears world-map replay with the project memcard isolated the Debug loss:
   GCC's default `-O0` produced `28--31 FPS` in the fully interpreted tail,

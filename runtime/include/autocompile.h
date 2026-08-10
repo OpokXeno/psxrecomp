@@ -27,11 +27,10 @@ int  autocompile_configured(void);
 void autocompile_set_cache_paths(const char *cache_dir, const char *captures);
 
 /* Probe whether a C compiler is actually reachable on PATH (gcc/cc/clang) — the
- * REAL "developer machine" signal, distinct from autocompile_configured() which
- * only reports that a command STRING is set (the shipped game.toml always sets
- * one). overlay_backend_resolve uses this so `auto` picks gcc only when the
- * toolchain can really build a shard, else tcc (toolchain-less production).
- * Memoized; safe to call repeatedly. */
+ * developer-machine signal. overlay_backend_resolve uses this together with a
+ * configured or source-discovered pipeline so `auto` picks gcc only when it can
+ * really build a shard, else tcc (toolchain-less production). Memoized; safe to
+ * call repeatedly. */
 int  autocompile_toolchain_available(void);
 
 /* 1 while a compile process is running. */
@@ -44,11 +43,9 @@ int  autocompile_request(void);
  * Must be called from the same thread that owns the overlay loader. */
 void autocompile_poll_main(void);
 
-/* Process-shutdown teardown, emu thread only: stops the publication pipeline,
- * kills the compiler process tree (job object), and JOINS the watcher and
- * preparer threads — waiting out any in-flight LoadLibrary rather than
- * abandoning a thread inside the Windows loader lock (which can deadlock
- * ExitProcess). Safe to call in any state, including mid-run; idempotent. */
+/* Process-shutdown teardown, emu thread only: kills the compiler process tree
+ * (Windows job object or POSIX process group) and joins all watcher/preparer
+ * threads. Safe to call in any state, including mid-run; idempotent. */
 void autocompile_shutdown(void);
 
 /* JSON status blob for the debug server: state, run/fail counters, last

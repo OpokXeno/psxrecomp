@@ -20,7 +20,8 @@ project ships no game data.
   - **Windows:** MSYS2 MinGW-w64 (`mingw-w64-x86_64` toolchain) *or* MSVC.
   - **macOS:** Apple Clang (Xcode command-line tools).
   - **Linux:** GCC or Clang.
-- **CMake ≥ 3.20**. On macOS/Linux also **Ninja** and **pkg-config**.
+- **CMake ≥ 3.20** and **Python 3.11+**. On macOS/Linux also **Ninja** and
+  **pkg-config**.
 - Language standards used: recompiler is **C++20**; runtime is **C99 + C++17**.
 - `ccache` is auto-detected and used if present (optional, speeds rebuilds).
 
@@ -34,12 +35,15 @@ project ships no game data.
 | **ELFIO** | vendored `recompiler/lib/ELFIO` | ELF parsing (recompiler only) |
 | **rabbitizer** | vendored `recompiler/lib/rabbitizer` | MIPS instruction decoding (recompiler only) |
 | **TinyCC (TCC) 0.9.27** | Not in this repo — downloaded at release-packaging time and bundled beside the game exe in `overlay_toolchain/`. | Toolchain-free overlay compilation for players (run as a subprocess) |
-| **Python 3** | System (development) or an embedded copy bundled in releases | Runs `tools/compile_overlays.py` in the overlay pipeline |
+| **Python 3.11+** | System (development) or a pinned embedded copy bundled in releases | Runs `tools/compile_overlays.py` in the overlay pipeline |
 | **OpenGL** | System (`opengl32` on Windows; `find_package(OpenGL)` elsewhere) | The GL renderer |
 | **Vulkan** | Headers only, optional, **off by default** (`PSX_ENABLE_VULKAN=OFF`); loaded dynamically via SDL. Shader compilation needs `glslc` from the Vulkan SDK. | The experimental Vulkan renderer |
 
-Developers building overlays locally just need `gcc` on `PATH` (the `gcc` tier);
-the bundled `tcc` matters only for end-user release packages.
+Developers building overlays locally need `python3` and `gcc` on `PATH` (the
+`gcc` tier). A game runtime launched from its source checkout discovers the
+recompiler, script, and headers automatically. Public release archives instead
+carry embedded Python, TinyCC, the matching recompiler, runtime headers, and
+their licenses under `overlay_toolchain/`, so players need no development tools.
 
 ### Get the source
 

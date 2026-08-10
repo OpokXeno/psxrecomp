@@ -1,6 +1,4 @@
-/* autocompile.c — see autocompile.h. Windows-first (the project's dev
- * platform); on other hosts the spawn is a graceful no-op and the manual
- * compile_overlays.py flow still works. */
+/* autocompile.c — see autocompile.h. */
 #include "autocompile.h"
 #include "overlay_loader.h"
 
@@ -12,6 +10,16 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#else
+#  include <errno.h>
+#  include <pthread.h>
+#  include <signal.h>
+#  include <stdatomic.h>
+#  include <sys/resource.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <time.h>
+#  include <unistd.h>
 #endif
 
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
@@ -34,10 +42,10 @@ static void ac_state_store(int value) {
     InterlockedExchange(&s_state, (LONG)value);
 }
 #else
-static int s_state     = AC_IDLE;
-static int s_exit_code = -1;
-static int ac_state_load(void) { return s_state; }
-static void ac_state_store(int value) { s_state = value; }
+static _Atomic int s_state     = AC_IDLE;
+static _Atomic int s_exit_code = -1;
+static int ac_state_load(void) { return atomic_load(&s_state); }
+static void ac_state_store(int value) { atomic_store(&s_state, value); }
 #endif
 static uint32_t     s_runs      = 0;
 static uint32_t     s_fails     = 0;
@@ -54,6 +62,31 @@ static uint32_t     s_shard_fail       = 0;   /* last run */
 static uint32_t     s_shard_skipped    = 0;   /* last run */
 static uint32_t     s_shard_fail_total = 0;   /* accumulated across all runs */
 static int          s_shard_result_seen = 0;  /* did we parse a result line? */
+
+static int parse_shard_result_line(const char *line) {
+    unsigned ok = 0, failed = 0, skipped = 0, capacity_fastpath = 0;
+    int consumed = 0;
+    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u %n",
+               &ok, &failed, &skipped, &consumed) != 3)
+        return 0;
+    const char *tail = line + consumed;
+    if (strncmp(tail, "capacity_fastpath=", 18) == 0) {
+        int extra = 0;
+        if (sscanf(tail, "capacity_fastpath=%u %n",
+                   &capacity_fastpath, &extra) != 1)
+            return 0;
+        tail += extra;
+    }
+    for (; *tail; tail++) {
+        if (*tail != ' ' && *tail != '\t' && *tail != '\r') return 0;
+    }
+    (void)capacity_fastpath;
+    s_shard_ok = ok;
+    s_shard_fail = failed;
+    s_shard_skipped = skipped;
+    s_shard_result_seen = 1;
+    return 1;
+}
 
 /* Child-output tail ring. Watcher thread writes, TCP reads — guarded by a
  * critical section on Windows. Holds the TAIL (newest bytes win). */
@@ -109,19 +142,7 @@ static int  s_child_line_overflow = 0;
  * the last valid result here; poll_main accounts it exactly once after both
  * child-output workers have joined. */
 static int shard_result_line_locked(const char *line) {
-    unsigned ok = 0, failed = 0, skipped = 0;
-    int consumed = 0;
-    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u %n",
-               &ok, &failed, &skipped, &consumed) != 3)
-        return 0;
-    for (const char *tail = line + consumed; *tail; tail++) {
-        if (*tail != ' ' && *tail != '\t' && *tail != '\r') return 0;
-    }
-    s_shard_ok = ok;
-    s_shard_fail = failed;
-    s_shard_skipped = skipped;
-    s_shard_result_seen = 1;
-    return 1;
+    return parse_shard_result_line(line);
 }
 
 static void child_line_locked(void) {
@@ -454,6 +475,147 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
 }
 #endif /* _WIN32 */
 
+#ifndef _WIN32
+static pthread_mutex_t s_out_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t s_watch_thread;
+static int s_watch_thread_valid;
+static pid_t s_proc = -1;
+
+typedef struct PosixPublishItem {
+    struct PosixPublishItem *next;
+    OverlayPreparedImage *image;
+} PosixPublishItem;
+static PosixPublishItem *s_posix_publish_head, *s_posix_publish_tail;
+static unsigned s_posix_publish_count, s_posix_publish_highwater;
+static unsigned s_posix_prepare_count, s_posix_prepare_fail;
+static unsigned s_posix_prepare_retry, s_posix_prepare_giveup;
+static uint64_t s_posix_prepare_total_us, s_posix_prepare_max_us;
+static uint64_t s_posix_prepare_last_us;
+static char s_posix_child_line[1024];
+static int s_posix_child_line_len, s_posix_child_line_overflow;
+
+typedef struct { int read_pipe; pid_t proc; } WatchCtx;
+
+static uint64_t posix_monotonic_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static void posix_prepare_published(const char *path) {
+    enum { AC_PREPARE_ATTEMPTS = 3, AC_PREPARE_RETRY_US = 100000 };
+    OverlayPreparedImage *image = NULL;
+    uint64_t start = posix_monotonic_us();
+    int attempts = 0;
+    while (!image && attempts++ < AC_PREPARE_ATTEMPTS) {
+        image = overlay_loader_prepare_published(path);
+        if (!image && attempts < AC_PREPARE_ATTEMPTS) {
+            pthread_mutex_lock(&s_out_lock);
+            s_posix_prepare_retry++;
+            pthread_mutex_unlock(&s_out_lock);
+            usleep(AC_PREPARE_RETRY_US);
+        }
+    }
+    uint64_t elapsed = posix_monotonic_us() - start;
+    PosixPublishItem *item = image
+        ? (PosixPublishItem *)calloc(1, sizeof(*item)) : NULL;
+    pthread_mutex_lock(&s_out_lock);
+    s_posix_prepare_count++;
+    s_posix_prepare_last_us = elapsed;
+    s_posix_prepare_total_us += elapsed;
+    if (elapsed > s_posix_prepare_max_us) s_posix_prepare_max_us = elapsed;
+    if (!image || !item) {
+        s_posix_prepare_fail++;
+        s_posix_prepare_giveup++;
+        s_publish_load_fail_run++;
+        if (!item && image) s_publish_drops_run++;
+        pthread_mutex_unlock(&s_out_lock);
+        if (image) overlay_loader_discard_prepared(image);
+        return;
+    }
+    item->image = image;
+    if (s_posix_publish_tail) s_posix_publish_tail->next = item;
+    else s_posix_publish_head = item;
+    s_posix_publish_tail = item;
+    s_posix_publish_count++;
+    if (s_posix_publish_count > s_posix_publish_highwater)
+        s_posix_publish_highwater = s_posix_publish_count;
+    pthread_mutex_unlock(&s_out_lock);
+}
+
+static void posix_parse_publications(const char *buf, int n) {
+    static const char marker[] = "PSX_SHARD_PUBLISHED ";
+    for (int i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\r') continue;
+        if (c != '\n') {
+            if (s_posix_child_line_len < (int)sizeof(s_posix_child_line) - 1)
+                s_posix_child_line[s_posix_child_line_len++] = c;
+            else
+                s_posix_child_line_overflow = 1;
+            continue;
+        }
+        s_posix_child_line[s_posix_child_line_len] = '\0';
+        if (s_posix_child_line_overflow) {
+            pthread_mutex_lock(&s_out_lock);
+            s_publish_parse_fail_run++;
+            pthread_mutex_unlock(&s_out_lock);
+        } else if (strncmp(s_posix_child_line, marker,
+                           sizeof(marker) - 1) == 0) {
+            const char *path = s_posix_child_line + sizeof(marker) - 1;
+            if (path[0]) posix_prepare_published(path);
+        }
+        s_posix_child_line_len = 0;
+        s_posix_child_line_overflow = 0;
+    }
+}
+
+static void out_append(const char *buf, int n) {
+    pthread_mutex_lock(&s_out_lock);
+    if (n >= AC_OUT_CAP) {
+        memcpy(s_out, buf + (n - AC_OUT_CAP), AC_OUT_CAP);
+        s_out_len = AC_OUT_CAP;
+    } else {
+        if (s_out_len + n > AC_OUT_CAP) {
+            int keep = AC_OUT_CAP - n;
+            memmove(s_out, s_out + (s_out_len - keep), (size_t)keep);
+            s_out_len = keep;
+        }
+        memcpy(s_out + s_out_len, buf, (size_t)n);
+        s_out_len += n;
+    }
+    pthread_mutex_unlock(&s_out_lock);
+    posix_parse_publications(buf, n);
+}
+
+static void *watch_thread(void *arg) {
+    WatchCtx *ctx = (WatchCtx *)arg;
+    char buf[1024];
+    ssize_t got;
+    while ((got = read(ctx->read_pipe, buf, sizeof(buf))) > 0)
+        out_append(buf, (int)got);
+    close(ctx->read_pipe);
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(ctx->proc, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    int code = -1;
+    if (waited == ctx->proc) {
+        if (WIFEXITED(status)) code = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
+    }
+    pthread_mutex_lock(&s_out_lock);
+    if (s_proc == ctx->proc) s_proc = -1;
+    pthread_mutex_unlock(&s_out_lock);
+    free(ctx);
+    atomic_store(&s_exit_code, code);
+    ac_state_store(AC_DONE);
+    return NULL;
+}
+#endif
+
 void autocompile_configure(const char *cmd, const char *cwd) {
     snprintf(s_cmd, sizeof(s_cmd), "%s", cmd ? cmd : "");
     snprintf(s_cwd, sizeof(s_cwd), "%s", cwd ? cwd : "");
@@ -474,11 +636,10 @@ void autocompile_set_cache_paths(const char *cache_dir, const char *captures) {
 int autocompile_configured(void) { return s_cmd[0] != '\0'; }
 int autocompile_busy(void)       { return ac_state_load() != AC_IDLE; }
 
-/* Probe PATH for a real C compiler (gcc/cc/clang). A configured command STRING
- * (autocompile_configured) is not enough: the shipped game.toml always carries
- * overlay_autocompile_cmd, so it can't tell a dev box from a toolchain-less
- * player. This opens each candidate exe in each PATH dir — the actual "can we
- * compile a shard" signal. Memoized (PATH doesn't change mid-run). */
+/* Probe PATH for a real C compiler (gcc/cc/clang). A configured command string
+ * alone cannot tell a developer checkout from a toolchain-less player. This
+ * opens each candidate executable in each PATH directory. Memoized because PATH
+ * does not change mid-run. */
 int autocompile_toolchain_available(void) {
     static int s_cached = -1;
     if (s_cached >= 0) return s_cached;
@@ -670,7 +831,90 @@ int autocompile_request(void) {
     }
     return 1;
 #else
-    return 0;  /* non-Windows hosts: manual compile flow only */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        s_fails++;
+        return 0;
+    }
+
+    pthread_mutex_lock(&s_out_lock);
+    PosixPublishItem *stale = s_posix_publish_head;
+    s_posix_publish_head = NULL;
+    s_posix_publish_tail = NULL;
+    s_posix_publish_count = 0;
+    s_posix_publish_highwater = 0;
+    s_posix_prepare_count = s_posix_prepare_fail = 0;
+    s_posix_prepare_retry = s_posix_prepare_giveup = 0;
+    s_posix_prepare_total_us = s_posix_prepare_max_us = 0;
+    s_posix_prepare_last_us = 0;
+    s_posix_child_line_len = s_posix_child_line_overflow = 0;
+    s_publish_drops_run = 0;
+    s_publish_load_fail_run = s_publish_parse_fail_run = 0;
+    s_out_len = 0;
+    s_shard_ok = s_shard_fail = s_shard_skipped = 0;
+    s_shard_result_seen = 0;
+    atomic_store(&s_exit_code, -1);
+    pthread_mutex_unlock(&s_out_lock);
+    while (stale) {
+        PosixPublishItem *next = stale->next;
+        overlay_loader_discard_prepared(stale->image);
+        free(stale);
+        stale = next;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipefd[0]);
+        (void)setpgid(0, 0);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+                dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+        (void)setpriority(PRIO_PROCESS, 0, 10);
+        if (s_cwd[0] && chdir(s_cwd) != 0) _exit(127);
+        if (s_cache_dir[0]) setenv("PSX_OVERLAY_CACHE_DIR", s_cache_dir, 1);
+        if (s_captures[0]) setenv("PSX_OVERLAY_CAPTURES", s_captures, 1);
+        setenv("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1", 1);
+        execl("/bin/sh", "sh", "-c", s_cmd, (char *)NULL);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    if (pid < 0) {
+        close(pipefd[0]);
+        s_fails++;
+        return 0;
+    }
+    (void)setpgid(pid, pid);
+
+    WatchCtx *ctx = (WatchCtx *)malloc(sizeof(*ctx));
+    if (!ctx) {
+        kill(-pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        close(pipefd[0]);
+        s_fails++;
+        return 0;
+    }
+    ctx->read_pipe = pipefd[0];
+    ctx->proc = pid;
+    pthread_mutex_lock(&s_out_lock);
+    s_proc = pid;
+    pthread_mutex_unlock(&s_out_lock);
+    ac_state_store(AC_RUNNING);
+    if (pthread_create(&s_watch_thread, NULL, watch_thread, ctx) != 0) {
+        kill(-pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        close(pipefd[0]);
+        free(ctx);
+        pthread_mutex_lock(&s_out_lock);
+        s_proc = -1;
+        pthread_mutex_unlock(&s_out_lock);
+        ac_state_store(AC_IDLE);
+        s_fails++;
+        return 0;
+    }
+    s_watch_thread_valid = 1;
+    s_runs++;
+    return 1;
 #endif
 }
 
@@ -678,15 +922,21 @@ int autocompile_request(void) {
  * skipped=K" line and record the counts. Returns 1 if a result line was found.
  * Called from autocompile_poll_main (emu thread) after the child exits. */
 static int parse_shard_result(void) {
-#ifdef _WIN32
     char buf[AC_OUT_CAP + 1];
     int n = 0;
+#ifdef _WIN32
     if (s_out_lock_init) {
         EnterCriticalSection(&s_out_lock);
         n = s_out_len;
         memcpy(buf, s_out, (size_t)n);
         LeaveCriticalSection(&s_out_lock);
     }
+#else
+    pthread_mutex_lock(&s_out_lock);
+    n = s_out_len;
+    memcpy(buf, s_out, (size_t)n);
+    pthread_mutex_unlock(&s_out_lock);
+#endif
     buf[n] = '\0';
     /* Find the LAST occurrence (a run may print more than once over its life). */
     const char *marker = "PSX_SHARD_RESULT";
@@ -698,27 +948,13 @@ static int parse_shard_result(void) {
         p = q + 1;
     }
     if (!hit) return 0;
-    unsigned ok = 0, failed = 0, skipped = 0;
     const char *ln_end = strchr(hit, '\n');
     size_t span = ln_end ? (size_t)(ln_end - hit) : strlen(hit);
     char line[256];
     size_t cp = span < sizeof(line) - 1 ? span : sizeof(line) - 1;
     memcpy(line, hit, cp);
     line[cp] = '\0';
-    int consumed = 0;
-    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u %n",
-               &ok, &failed, &skipped, &consumed) != 3)
-        return 0;
-    for (const char *tail = line + consumed; *tail; tail++) {
-        if (*tail != ' ' && *tail != '\t' && *tail != '\r') return 0;
-    }
-    s_shard_ok      = ok;
-    s_shard_fail    = failed;
-    s_shard_skipped = skipped;
-    return 1;
-#else
-    return 0;
-#endif
+    return parse_shard_result_line(line);
 }
 
 void autocompile_poll_main(void) {
@@ -737,6 +973,26 @@ void autocompile_poll_main(void) {
         published->image = NULL; /* commit consumed it on every path */
         free(published);
         publish_commit_finished();
+        s_rescans++;
+    }
+    if (ac_state_load() == AC_RUNNING) return;
+#else
+    PosixPublishItem *published = NULL;
+    pthread_mutex_lock(&s_out_lock);
+    published = s_posix_publish_head;
+    if (published) {
+        s_posix_publish_head = published->next;
+        if (!s_posix_publish_head) s_posix_publish_tail = NULL;
+        s_posix_publish_count--;
+    }
+    pthread_mutex_unlock(&s_out_lock);
+    if (published) {
+        if (overlay_loader_commit_published(published->image) <= 0) {
+            pthread_mutex_lock(&s_out_lock);
+            s_publish_load_fail_run++;
+            pthread_mutex_unlock(&s_out_lock);
+        }
+        free(published);
         s_rescans++;
     }
     if (ac_state_load() == AC_RUNNING) return;
@@ -762,6 +1018,15 @@ void autocompile_poll_main(void) {
          * job only reaps any grandchild the tree left behind. */
         CloseHandle(s_job);
         s_job = NULL;
+    }
+#else
+    pthread_mutex_lock(&s_out_lock);
+    int publish_pending = s_posix_publish_head != NULL;
+    pthread_mutex_unlock(&s_out_lock);
+    if (publish_pending) return;
+    if (s_watch_thread_valid) {
+        pthread_join(s_watch_thread, NULL);
+        s_watch_thread_valid = 0;
     }
 #endif
     /* Streaming parsing survives arbitrarily large chained post-processing
@@ -826,6 +1091,30 @@ void autocompile_shutdown(void) {
      * preparing or committing: the discard cannot be refused. */
     (void)publish_discard_all();
     ac_state_store(AC_IDLE);
+#else
+    pthread_mutex_lock(&s_out_lock);
+    pid_t proc = s_proc;
+    pthread_mutex_unlock(&s_out_lock);
+    if (proc > 0) kill(-proc, SIGTERM);
+    if (s_watch_thread_valid) {
+        pthread_join(s_watch_thread, NULL);
+        s_watch_thread_valid = 0;
+    }
+    pthread_mutex_lock(&s_out_lock);
+    PosixPublishItem *published = s_posix_publish_head;
+    s_posix_publish_head = s_posix_publish_tail = NULL;
+    s_posix_publish_count = 0;
+    pthread_mutex_unlock(&s_out_lock);
+    while (published) {
+        PosixPublishItem *next = published->next;
+        overlay_loader_discard_prepared(published->image);
+        free(published);
+        published = next;
+    }
+    pthread_mutex_lock(&s_out_lock);
+    s_proc = -1;
+    pthread_mutex_unlock(&s_out_lock);
+    ac_state_store(AC_IDLE);
 #endif
 }
 
@@ -878,6 +1167,21 @@ int autocompile_status_json(char *out, int cap) {
         publish_prepare_last_us = s_publish_prepare_last_us;
         LeaveCriticalSection(&s_out_lock);
     }
+#else
+    pthread_mutex_lock(&s_out_lock);
+    int take = s_out_len < 900 ? s_out_len : 900;
+    tn = json_escape_into(tail, sizeof(tail),
+                           s_out + (s_out_len - take), take);
+    publish_ready = s_posix_publish_count;
+    publish_ready_highwater = s_posix_publish_highwater;
+    publish_prepare_count = s_posix_prepare_count;
+    publish_prepare_fail = s_posix_prepare_fail;
+    publish_prepare_retry = s_posix_prepare_retry;
+    publish_prepare_giveup = s_posix_prepare_giveup;
+    publish_prepare_total_us = s_posix_prepare_total_us;
+    publish_prepare_max_us = s_posix_prepare_max_us;
+    publish_prepare_last_us = s_posix_prepare_last_us;
+    pthread_mutex_unlock(&s_out_lock);
 #endif
     (void)tn;
     return snprintf(out, cap,

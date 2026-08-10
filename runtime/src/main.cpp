@@ -5661,8 +5661,24 @@ int main(int argc, char** argv) {
                  * interp. */
                 const char *cfg_backend = gc.runtime.overlay_backend.empty()
                         ? nullptr : gc.runtime.overlay_backend.c_str();
-                int gcc_avail = gc.runtime.has_overlay_autocompile_cmd
-                                && autocompile_toolchain_available();
+                std::filesystem::path dev_script =
+                    gc.project_root / "psxrecomp" / "tools" / "compile_overlays.py";
+                std::filesystem::path dev_recompiler = gc.project_root /
+                    "psxrecomp" / "recompiler" / "build" /
+#ifdef _WIN32
+                    "psxrecomp-game.exe";
+#else
+                    "psxrecomp-game";
+#endif
+                std::filesystem::path dev_include =
+                    gc.project_root / "psxrecomp" / "runtime" / "include";
+                bool dev_pipeline_available =
+                    std::filesystem::exists(dev_script) &&
+                    std::filesystem::exists(dev_recompiler) &&
+                    std::filesystem::exists(dev_include);
+                int gcc_avail = autocompile_toolchain_available() &&
+                    (gc.runtime.has_overlay_autocompile_cmd ||
+                     dev_pipeline_available);
                 OverlayBackend eff = overlay_backend_resolve(cfg_backend, gcc_avail);
                 /* gcc and tcc run the IDENTICAL recompiler->C->DLL->load pipeline;
                  * only the compiler binary differs. Wire the autocompile spawn with
@@ -5671,6 +5687,7 @@ int main(int argc, char** argv) {
                  * (the loader is compiler-blind), so a tcc box uses shipped gcc
                  * shards first and fills the rest with tcc. */
                 std::string built_tcc_cmd;  /* runtime-constructed bundled tcc cmd */
+                std::string built_gcc_cmd; /* source-checkout developer fallback */
                 std::string env_ac_cmd;
                 const std::string *ac_cmd = nullptr;
                 if (eff == OVERLAY_BACKEND_TCC) {
@@ -5685,7 +5702,12 @@ int main(int argc, char** argv) {
                         extern int g_psx_cps_mode;
                         std::filesystem::path xd = exe_dir_from_argv(argv[0]);
                         std::filesystem::path tk = xd / "overlay_toolchain";
-                        std::filesystem::path py = tk / "python" / "python.exe";
+                        std::filesystem::path py = tk / "python" /
+#ifdef _WIN32
+                            "python.exe";
+#else
+                            "bin" / "python3";
+#endif
                         if (std::filesystem::exists(py)) {
                             const PsxGameIdentity *runtime_identity =
                                 psx_game_identity_runtime();
@@ -5710,12 +5732,24 @@ int main(int argc, char** argv) {
                                     game_config_path ? game_config_path : "game.toml")) +
                                 " --game-identity-sha256 " + game_identity_sha256 +
                                 " --manifest-identity-sha256 " + manifest_identity_sha256 +
-                                " --recompiler " + cmd_quote((tk / "psxrecomp-game.exe").string()) +
+                                " --recompiler " + cmd_quote((tk /
+#ifdef _WIN32
+                                    "psxrecomp-game.exe"
+#else
+                                    "psxrecomp-game"
+#endif
+                                    ).string()) +
                                 " --runtime-include " + cmd_quote((tk / "include").string()) +
                                 " --out-dir " + cmd_quote((xd / "cache").string()) +
                                 (g_psx_cps_mode ? " --cps" : "") +
                                 " --compiler tcc --tcc " +
-                                cmd_quote((tk / "tcc" / "tcc.exe").string());
+                                cmd_quote((tk / "tcc" /
+#ifdef _WIN32
+                                    "tcc.exe"
+#else
+                                    "tcc"
+#endif
+                                    ).string());
                             ac_cmd = &built_tcc_cmd;
                             std::fprintf(stdout,
                                 "psxrecomp: tcc tier using bundled toolchain (%s)\n",
@@ -5729,6 +5763,38 @@ int main(int argc, char** argv) {
                 } else {
                     if (gc.runtime.has_overlay_autocompile_cmd)
                         ac_cmd = &gc.runtime.overlay_autocompile_cmd;
+                    else if (dev_pipeline_available && gcc_avail) {
+                        const PsxGameIdentity *runtime_identity =
+                            psx_game_identity_runtime();
+                        char game_identity_sha256[
+                            PSX_GAME_IDENTITY_SHA256_HEX_BYTES];
+                        char manifest_identity_sha256[
+                            PSX_GAME_IDENTITY_SHA256_HEX_BYTES];
+                        if (!psx_game_identity_format_hex(
+                                runtime_identity, game_identity_sha256,
+                                manifest_identity_sha256)) {
+                            throw std::runtime_error(
+                                "overlay autocompile requires complete game and manifest identities");
+                        }
+                        auto cmd_quote = [](const std::string& s) {
+                            return std::string("\"") + s + "\"";
+                        };
+                        extern int g_psx_cps_mode;
+                        built_gcc_cmd = "python3 " + cmd_quote(dev_script.string()) +
+                            " --captures " + cmd_quote(captures_path.string()) +
+                            " --game-toml " + cmd_quote(std::string(
+                                game_config_path ? game_config_path : "game.toml")) +
+                            " --game-identity-sha256 " + game_identity_sha256 +
+                            " --manifest-identity-sha256 " + manifest_identity_sha256 +
+                            " --recompiler " + cmd_quote(dev_recompiler.string()) +
+                            " --runtime-include " + cmd_quote(dev_include.string()) +
+                            " --out-dir " + cmd_quote(cache_dir) +
+                            (g_psx_cps_mode ? " --cps" : "") +
+                            " --compiler gcc";
+                        ac_cmd = &built_gcc_cmd;
+                        std::fprintf(stdout,
+                            "psxrecomp: gcc tier using source-checkout toolchain\n");
+                    }
                 }
                 /* A developer may run a game config from one checkout against a
                  * runtime/recompiler built in another worktree. Let the launch

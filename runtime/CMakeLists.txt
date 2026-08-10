@@ -181,6 +181,13 @@ if(BUILD_TESTING)
             PSX_AUTOCOMPILE_TEST=1)
         add_test(NAME autocompile_publication_test
                  COMMAND autocompile_publication_test)
+    else()
+        add_executable(autocompile_posix_test
+            tests/test_autocompile_posix.c
+            src/autocompile.c)
+        target_include_directories(autocompile_posix_test PRIVATE include)
+        target_link_libraries(autocompile_posix_test PRIVATE Threads::Threads)
+        add_test(NAME autocompile_posix_test COMMAND autocompile_posix_test)
     endif()
 
     add_executable(gpu_render_transaction_test

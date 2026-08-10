@@ -327,8 +327,24 @@ class ShardStats:
             # surface shard_ok / shard_fail without depending on the exit code.
             print(f'PSX_SHARD_RESULT ok={self.ok} failed={fail} '
                   f'skipped={self.skipped} '
-                  f'capacity_fastpath={self.capacity_fastpath}')
+                  f'capacity_fastpath={self.capacity_fastpath}', flush=True)
         return fail
+
+
+def publish_live_shard(path: str):
+    """Tell the live runtime that a transactionally complete shard is ready."""
+    if os.environ.get('PSX_OVERLAY_LIVE_AUTOCOMPILE') == '1':
+        print(f'PSX_SHARD_PUBLISHED {os.path.abspath(path)}', flush=True)
+
+
+def cleanup_live_source(path: str):
+    """Successful live builds need artifacts, not retained generated C."""
+    if os.environ.get('PSX_OVERLAY_LIVE_AUTOCOMPILE') != '1':
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -3944,6 +3960,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
         # this region_start.
         key = fragment_shard_key(frag_ids, manifest_provenance)
         dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
+        retained_c = os.path.join(cache_dir, f'{key:08X}_fragment_patched.c')
         if not args.force:
             cache_status = cached_shard_manifest_status(
                 dll_path, overlay_abi_tag(args.runtime_include, args.flavor),
@@ -3951,6 +3968,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                     frag_ids, pair_id, manifest_provenance, args.identity,
                     artifact), pair_id)
             if cache_status == 'match':
+                cleanup_live_source(retained_c)
                 return frag_ids, 'cached'   # exact identity already built
             if cache_status == 'mismatch':
                 return None, ('fragment cache-key collision/stale pair: existing '
@@ -3963,7 +3981,6 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
         # native/interpreter differential finds a timing or device mismatch;
         # deleting their only C representation with the temp directory made
         # the responsible lowering impossible to inspect after compilation.
-        retained_c = os.path.join(cache_dir, f'{key:08X}_fragment_patched.c')
         with open(retained_c, 'w') as f:
             f.write(src)
         include_dirs = [args.runtime_include]
@@ -4012,6 +4029,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                 return None, ('fragment cache-key collision/concurrent pair: '
                               'preserved manifest does not match generated identity')
             return frag_ids, 'cached'
+        cleanup_live_source(retained_c)
         return frag_ids, 'built'
 
 
@@ -5304,6 +5322,11 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
+    if os.environ.get('PSX_OVERLAY_LIVE_AUTOCOMPILE') == '1':
+        # Live compilation is opportunistic background work. Offline builds can
+        # still use every core, but the game must never compete with a compiler
+        # pool assembled from the host CPU count.
+        args.jobs = 1
     try:
         args.identity = parse_game_identity(args.game_identity_sha256,
                                             args.manifest_identity_sha256)
@@ -5759,6 +5782,7 @@ def main():
                                      and cap.get('producer') !=
                                          BIOS_RESIDENT_PRODUCER)
                 if fully_covered:
+                    cleanup_live_source(debug_c)
                     print(f'  SKIP: all {len(this_set)} function(s) already '
                           f'covered by existing DLL(s) at this region — no new '
                           f'native code to build\n')
@@ -5852,9 +5876,12 @@ def main():
                                 overlay_abi_tag(
                                     args.runtime_include, args.flavor))
                         if published:
+                            cleanup_live_source(debug_c)
                             print(f'  OK -> {dll_path}\n')
+                            publish_live_shard(dll_path)
                             stats.add_ok()
                         else:
+                            cleanup_live_source(debug_c)
                             print(f'  PRESERVED concurrent valid pair -> '
                                   f'{dll_path}\n')
                             stats.add_skip()
@@ -6063,6 +6090,11 @@ def main():
                 if status == 'cached':
                     stats.add_skip()
                 else:
+                    fragment_dll = os.path.join(
+                        cache_dir,
+                        f'{phys_addr:08X}_{fragment_shard_key(frag_ids):08X}'
+                        f'{overlay_ext()}')
+                    publish_live_shard(fragment_dll)
                     stats.add_ok()
                 for ev, _cc, ranges in frag_ids:
                     current_variant_entries.add(ev & 0x1FFFFFFF)
@@ -6261,6 +6293,12 @@ def main():
                 if status == 'cached':
                     stats.add_skip()
                 else:
+                    fragment_dll = os.path.join(
+                        cache_dir,
+                        f'{phys_addr:08X}_'
+                        f'{fragment_shard_key(frag_ids, provenance):08X}'
+                        f'{overlay_ext()}')
+                    publish_live_shard(fragment_dll)
                     stats.add_ok()
                 for ev, _cc, ranges in frag_ids:
                     current_variant_entries.add(ev & 0x1FFFFFFF)
