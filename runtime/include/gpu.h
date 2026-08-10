@@ -76,6 +76,11 @@ void gpu_get_display_info(GpuDisplayInfo* out);
  * packed RGB888 lives in the CPU mirror; treating A0 rects as 1555 FBO uploads
  * both wastes bandwidth and force-flushes when UP_RECTS_MAX is hit (MotK FMV). */
 int  gpu_display_is_depth24(void);
+/* Convert a VRAM region (raw halfword coords) still holding packed 24-bit
+ * RGB888 bytes into an equivalent 15-bit image in place. Always applies the
+ * 24-bit interpretation regardless of the current depth24 flag. */
+void gpu_depth24_convert_region_to_15bit(uint32_t vram_x0, uint32_t vram_y0,
+                                          uint32_t half_w, uint32_t h);
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b);
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y);

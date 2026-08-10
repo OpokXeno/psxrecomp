@@ -441,9 +441,6 @@ static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
 /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
 typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
 static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror */
-/* Sticky record of the last depth24-exit clear's FBO region — see
- * depth24_clear_skipped_fb() / glb_copy_rect() below. */
-static DirtyRect s_d24_stale_fbo;
 static void native_view_mirror_canonical_rects(const DirtyRect *rects,
                                                 int rect_count);
 
@@ -1861,31 +1858,11 @@ static int mirror_batch_center_only(int nverts) {
     return mirror_x_center_only(lo, hi);
 }
 
-/* Raw, format-agnostic resync of s_raw_tex for the region a depth24-exit
- * clear (depth24_clear_skipped_fb) blacked out without ever having real
- * content uploaded there (framebuffer-sized MDEC transfers are skipped
- * during playback for performance — see s_d24_skip_fb / s_d24_stale_fbo).
- * A textured draw sampling that region (e.g. a game grabbing the frozen
- * last movie frame as a texture for a zoom/fade transition) would otherwise
- * read the black clear. Mirrors flush_cpu_upload's raw-mirror upload
- * exactly: R16UI/GL_UNSIGNED_SHORT is a verbatim copy of s_vram, safe
- * regardless of what color depth the bytes represent — unlike the RGBA8
- * s_up_tex path, which would misinterpret 24-bit packed data as 1555
- * pixels (the documented cause of the prior MotK rainbow/static
- * regression, see depth24_clear_skipped_fb's comment). Left sticky (not
- * cleared here) so every consumer gets a correct read until the next
- * depth24 session starts. */
-static void depth24_resync_stale_raw_tex(void) {
-    if (!s_d24_stale_fbo.set) return;
-    int x = s_d24_stale_fbo.x0, y = s_d24_stale_fbo.y0;
-    int w = s_d24_stale_fbo.x1 - x + 1, h = s_d24_stale_fbo.y1 - y + 1;
-    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
-                    PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                    s_vram + (size_t)y * VRAM_W + x);
-    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
-}
+/* fwd: depth24_upload_policy is defined below; flush_tex_batch calls it to
+ * close a gap where a textured draw — not a VRAM write/transfer — is the
+ * first thing to touch the screen after depth24 exits (see the big comment
+ * on depth24_upload_policy for the full rationale). */
+static void depth24_upload_policy(void);
 
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
@@ -1894,7 +1871,7 @@ static void flush_tex_batch(void) {
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
-    depth24_resync_stale_raw_tex();
+    depth24_upload_policy();
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
     native_view_projection_uniforms(s_tex_uXoff, s_tex_uXhalf);
@@ -2553,23 +2530,16 @@ static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
     gpu_fill(x,y,w,h,c);
 }
 static void glb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
+    /* Close the same gap as flush_tex_batch: a copy can be the first thing
+     * to touch the screen after depth24 exits, and its SOURCE may be a
+     * region that was never really uploaded to the FBO (skipped as a
+     * framebuffer-sized MDEC transfer during playback — see
+     * depth24_upload_policy). Running the transition here guarantees the
+     * FBO already holds real content by the time the read below happens,
+     * so this can always go through the normal GPU-side copy path (correct
+     * masking, command ordering, and no stale-CPU-mirror special case). */
+    depth24_upload_policy();
     if (!s_raster_ok) { sw_copy_rect(sx,sy,dx,dy,w,h); return; }
-    if (w > 0 && h > 0) {
-        int sx0 = sx & (VRAM_W - 1), sy0 = sy & (VRAM_H - 1);
-        int cw = w < VRAM_W ? w : VRAM_W, ch = h < VRAM_H ? h : VRAM_H;
-        if (rect_intersects(&s_d24_stale_fbo, sx0, sy0, sx0 + cw - 1, sy0 + ch - 1)) {
-            /* Source overlaps a region the depth24-exit clear blacked out in
-             * the GL FBO without ever having real content uploaded there
-             * (skipped as a framebuffer-sized MDEC transfer during playback).
-             * s_vram always has the true pixels (sw_vram_transfer_in runs
-             * unconditionally), so copy through the CPU mirror instead of
-             * reading the stale FBO, and mark the destination dirty so the
-             * next flush uploads the correct result for real. */
-            sw_copy_rect(sx,sy,dx,dy,w,h);
-            up_add_transfer(dx,dy,w,h);
-            return;
-        }
-    }
     gpu_copy_rect(sx,sy,dx,dy,w,h);
 }
 static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp){
@@ -2620,16 +2590,12 @@ static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int 
  * MDEC A0 rects hits UP_RECTS_MAX (16) and force-flushes mid-movie (MotK intro
  * ~50→~30 FPS). Skip ONLY framebuffer-sized transfers (RGB888); still upload
  * smaller texture A0s so post-FMV menus keep VRAM pages coherent.
- * On leave: clear the skipped FB union in the FBO — do NOT restage CPU RGB888
- * as 1555 (that painted MotK title rainbow/static). */
+ * On leave: depth24_clear_skipped_fb repaints the skipped FB union with its
+ * real, correctly-converted content — see that function for why restaging
+ * the STILL-PACKED 24-bit bytes as 1555 directly (without converting first)
+ * is a different, historically-broken idea (MotK title rainbow/static). */
 static int s_depth24_skip_up = 0;
 static DirtyRect s_d24_skip_fb; /* union of skipped MDEC FB rects (VRAM halfwords) */
-/* s_d24_stale_fbo (declared earlier, near s_pack_dirty): sticky copy of
- * s_d24_skip_fb's last union, surviving the rect_clear below. A VRAM->VRAM
- * copy_rect (e.g. a game grabbing the frozen last movie frame for a
- * zoom/fade transition) reads its source from this same GL FBO —
- * glb_copy_rect checks this to avoid reading back the black clear instead
- * of the real frame. */
 
 static int depth24_is_fb_transfer(int w, int h) {
     if (!gpu_display_is_depth24() || w <= 0 || h <= 0) return 0;
@@ -2645,46 +2611,73 @@ static int depth24_is_fb_transfer(int w, int h) {
     return 0;
 }
 
+/* Repaint the skipped-FB region with its real content instead of black-
+ * clearing it and hoping a later draw covers it (that left a black/stale
+ * hole visible until something unrelated happened to redraw over it — the
+ * original right-half-black bug). The bytes there are still the packed
+ * 24-bit RGB888 the movie last wrote (never uploaded to the FBO — that's
+ * what "skipped" means), so gpu_depth24_convert_region_to_15bit unpacks
+ * them into real RGB555 pixels IN s_vram first; only THEN do we restage
+ * through the normal CPU-upload path. This is NOT the same as restaging
+ * the still-packed bytes directly (the historical MotK rainbow/static
+ * bug, see the comment above s_depth24_skip_up) — the conversion happens
+ * first, so flush_cpu_upload's 1555->RGBA8 step operates on already-
+ * correct data.
+ *
+ * ensure_cpu() guards the source: if s_gpu_dirty is set (some GPU-side
+ * draw is ahead of the CPU mirror), s_vram could be stale for this region
+ * without it — sync first so the repaint can't silently drop pending GPU
+ * writes.
+ *
+ * Painting happens exactly once, synchronously, right here — no sticky
+ * "stale region" tracking afterward. The FBO is correct immediately, so
+ * nothing needs to keep re-checking or re-uploading around it on a later,
+ * unrelated hot path (that re-upload was overwriting legitimately newer
+ * GPU-rendered content for as long as it stayed sticky). */
 static void depth24_clear_skipped_fb(void) {
     if (!s_raster_ok || !s_d24_skip_fb.set) return;
     flush_flat_batch();
     flush_tex_batch();
+    ensure_cpu();
     int x0 = s_d24_skip_fb.x0, y0 = s_d24_skip_fb.y0;
     int x1 = s_d24_skip_fb.x1, y1 = s_d24_skip_fb.y1;
     int rw = x1 - x0 + 1, rh = y1 - y0 + 1;
     int S = s_scale;
+
+    gpu_depth24_convert_region_to_15bit((uint32_t)x0, (uint32_t)y0,
+                                        (uint32_t)rw, (uint32_t)rh);
+    up_add(x0, y0, x1, y1);
+    flush_cpu_upload();
+
+    /* Stencil bookkeeping only — color content is already correct above. */
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glDisable(GL_BLEND);
     glDisable(GL_STENCIL_TEST);
     glEnable(GL_SCISSOR_TEST);
     glViewport(0, 0, VRAM_W * S, VRAM_H * S);
     glScissor(x0 * S, y0 * S, rw * S, rh * S);
-    glClearColor(0.f, 0.f, 0.f, 0.f);
     glClearStencil(0);
     glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    if (s_raw_fbo) {
-        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
-        glViewport(0, 0, VRAM_W, VRAM_H);
-        glScissor(x0, y0, rw, rh);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
+    glClear(GL_STENCIL_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     rect_add(&s_pack_dirty, x0, y0, x1, y1);
     present_dirty_rect(x0, y0, x1, y1, 1);
     for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i)
         s_native_view_seeded[i] = 0;
-    rect_add(&s_d24_stale_fbo, x0, y0, x1, y1);
     rect_clear(&s_d24_skip_fb);
 }
 
+/* Runs the depth24 skip-tracking enter/exit transition. Called from every
+ * VRAM write/transfer (below) AND from flush_tex_batch/glb_copy_rect above
+ * — a copy or textured draw can be the first thing to touch the screen
+ * after depth24 exits, and without calling this there too, the repaint
+ * above would never run in time for it to read correct data. */
 static void depth24_upload_policy(void) {
     int d24 = gpu_display_is_depth24();
     if (d24 && !s_depth24_skip_up) {
         flush_cpu_upload();
         rect_clear(&s_d24_skip_fb);
-        rect_clear(&s_d24_stale_fbo);
     } else if (!d24 && s_depth24_skip_up) {
         flush_cpu_upload();
         depth24_clear_skipped_fb();

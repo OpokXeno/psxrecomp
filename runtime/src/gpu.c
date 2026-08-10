@@ -2406,11 +2406,32 @@ static uint8_t gpu_vram_byte(uint32_t byte_x, uint32_t y) {
 /* Depth24: note/query/reset the CPU→VRAM upload span tracked above. Used to
  * hide trailing RGB columns when a movie blit doesn't fill the full CRTC
  * width — MotK's Star Wars crawl leaves ~8px of stale VRAM on the right.
- * Only FB-class A0s (w >= 256 halfwords) grow the span; texture uploads must
- * not collapse it. During present-hold, ignore updates entirely. */
+ *
+ * Classifies "is this transfer part of the current movie frame" by
+ * POSITION — does it start within the frame's own expected on-screen
+ * halfword span — rather than a blunt absolute size cutoff. The previous
+ * `w >= 256 halfwords` threshold assumed a frame arrives as one large
+ * blit; it silently dropped every chunk narrower than that. Confirmed via
+ * runtime capture on Xenogears' boot-logo movie: its real frame data
+ * streams in as many small (~64-halfword) chunks that collectively span
+ * the full on-screen width, while the only transfer ever large enough to
+ * pass the old filter landed off-screen (MDEC's own decode-staging area,
+ * well past the visible frame) — leaving the watermark stuck far short of
+ * real coverage and blanking most of the right side of the display for as
+ * long as the frame held still (the right-half-black regression). A
+ * transfer starting outside the expected span (e.g. that off-screen
+ * staging write) still can't grow it, so this stays no more permissive
+ * than the old filter was meant to be against unrelated writes — just
+ * correct about what "unrelated" means. During present-hold, ignore
+ * updates entirely. */
 static void depth24_note_upload(uint32_t x, uint32_t w) {
-    if (!(display_depth & 1u) || w < 256u) return;
+    if (!(display_depth & 1u) || w == 0u) return;
     if (s_d24_present_hold > 0) return;
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    uint32_t dx = di.display_x & 1023u;
+    uint32_t fb_w = (di.width * 3u + 1u) / 2u;   /* RGB width -> halfwords */
+    if (fb_w == 0u || x < dx || x >= dx + fb_w) return;
     uint32_t x1 = x + w;
     if (x1 > 1024u) x1 = 1024u;
     if (x1 > s_d24_upload_x1) s_d24_upload_x1 = x1;
@@ -2538,6 +2559,34 @@ uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y
 
 int gpu_display_is_depth24(void) {
     return (int)(display_depth & 1u);
+}
+
+/* Convert a VRAM region still holding packed 24-bit RGB888 movie bytes into
+ * an equivalent 15-bit RGB555 image, written in place at the exact halfword
+ * positions a normal (non-depth24) reader will use. Takes the region in raw
+ * VRAM halfword coordinates (not display coordinates) and always applies the
+ * 24-bit interpretation regardless of the CURRENT depth24 flag — callers use
+ * this specifically because the flag may have already flipped by the time
+ * they run, even though the bytes are still packed either way (see
+ * gpu_gl_renderer.c's depth24_clear_skipped_fb). */
+void gpu_depth24_convert_region_to_15bit(uint32_t vram_x0, uint32_t vram_y0,
+                                          uint32_t half_w, uint32_t h) {
+    GpuDisplayInfo di;
+    memset(&di, 0, sizeof(di));
+    di.depth24 = 1;
+    di.display_x = vram_x0;
+    di.display_y = vram_y0;
+    uint32_t rgb_w = (half_w * 2u) / 3u;
+    for (uint32_t y = 0; y < h; y++) {
+        uint32_t vy = (vram_y0 + y) & 511u;
+        for (uint32_t x = 0; x < rgb_w; x++) {
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+            uint32_t vx = (vram_x0 + x) & 1023u;
+            vram[vy * 1024u + vx] =
+                (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+        }
+    }
 }
 
 void gpu_get_display_info(GpuDisplayInfo* out) {
