@@ -150,7 +150,7 @@ static bool semantic_is_valid(const GpuRenderSemantic *semantic) {
     uint16_t encoded_depth;
     size_t triangle_index;
 
-    if (semantic->screen_space_2d > 1u ||
+    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE ||
         (material->texture_depth != GPU_RENDER_TEXTURE_4_BIT &&
         material->texture_depth != GPU_RENDER_TEXTURE_8_BIT &&
         material->texture_depth != GPU_RENDER_TEXTURE_15_BIT))

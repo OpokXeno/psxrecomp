@@ -4740,6 +4740,36 @@ static void native_semantic_quad(
     }
 }
 
+/* Xenogears dialogue portraits use GetTPage(1, 0, 0x2c0, 0x100) and
+ * GetClut(0, 0xe3), independent of the scene that submits the OT. */
+enum {
+    XG_DIALOGUE_PORTRAIT_TPAGE = 0x009b,
+    XG_DIALOGUE_PORTRAIT_CLUT_X = 0x0000,
+    XG_DIALOGUE_PORTRAIT_CLUT_Y = 0x00e3,
+};
+
+static int native_semantic_is_portrait(uint8_t opcode,
+                                       const GpuRenderSemantic *semantic) {
+    if (semantic == NULL || opcode < 0x2cu || opcode > 0x2fu ||
+        semantic->material.tpage != XG_DIALOGUE_PORTRAIT_TPAGE ||
+        semantic->material.clut_x != XG_DIALOGUE_PORTRAIT_CLUT_X ||
+        semantic->material.clut_y != XG_DIALOGUE_PORTRAIT_CLUT_Y)
+        return 0;
+    for (uint8_t triangle = 0u; triangle < semantic->triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            if (semantic->triangles[triangle].vertices[vertex].native_view_position)
+                return 0;
+    return 1;
+}
+
+static uint8_t native_semantic_screen_space_mode(
+        uint8_t opcode, const GpuRenderSemantic *semantic) {
+    if (native_semantic_is_portrait(opcode, semantic))
+        return GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE;
+    return opcode >= 0x60u ? GPU_RENDER_SCREEN_SPACE_2D_STRETCH
+                           : GPU_RENDER_SCREEN_SPACE_2D_NONE;
+}
+
 static void native_semantic_parse_position(const GpuNativeDrawEnvironment *environment,
                                            uint32_t word, int32_t *x,
                                            int32_t *y) {
@@ -4994,7 +5024,7 @@ int gpu_native_semantic_from_gp0(
                                   clut_x, clut_y, textured, raw_texture,
                                   semi_transparent, shading))
         return -1;
-    out->screen_space_2d = opcode >= 0x60u;
+    out->screen_space_2d = native_semantic_screen_space_mode(opcode, out);
     if (opcode >= 0x20u && opcode <= 0x27u) {
         out->triangle_count = 1u;
         native_semantic_triangle(&out->triangles[0], 0u, x, y, u, v, color);
@@ -5780,7 +5810,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         native_packet_latch_polygon_tpage(words, word_count, opcode);
         if (bound_semantic) {
             semantic = *bound_semantic;
-            semantic.screen_space_2d = opcode >= 0x60u;
+            semantic.screen_space_2d =
+                native_semantic_screen_space_mode(opcode, &semantic);
             native_semantic_apply_raster_state(&semantic);
             if (native_packet_bound_visual_valid)
                 guest_render_native_stream_note_rasterized(
@@ -5797,7 +5828,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         }
         if (supported && effective_bound_semantic != NULL) {
             semantic = *effective_bound_semantic;
-            semantic.screen_space_2d = opcode >= 0x60u;
+            semantic.screen_space_2d =
+                native_semantic_screen_space_mode(opcode, &semantic);
             native_semantic_apply_raster_state(&semantic);
         }
         if (supported && semantic.triangle_count != 0u) {

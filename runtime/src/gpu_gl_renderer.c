@@ -537,6 +537,7 @@ static GLuint s_native_view_pass_fbo;
 static int s_native_view_pass_base;
 static int s_native_view_expand_x;
 static int s_native_view_scale_2d;
+static int s_native_view_preserve_2d_translation_x;
 static void wide_free_all(void);
 static void native_view_free_all(void);
 
@@ -1319,7 +1320,8 @@ static void hr_begin(int clip_to_draw_area) {
         int sw = s_area_x2 - s_area_x1 + 1;
         int sh = s_area_y2 - s_area_y1 + 1;
         if (s_native_view_pass) {
-            if (s_native_view_scale_2d) {
+            if (s_native_view_scale_2d ==
+                    GPU_RENDER_SCREEN_SPACE_2D_STRETCH) {
                 const int local_left = s_area_x1 - s_native_view_pass_base;
                 const int local_right = s_area_x2 -
                                         s_native_view_pass_base + 1;
@@ -1345,6 +1347,26 @@ static void hr_begin(int clip_to_draw_area) {
                 }
                 if (sx + sw > s_native_view_width)
                     sw = s_native_view_width - sx;
+            } else if (s_native_view_scale_2d ==
+                           GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE) {
+                const int base_right = s_native_view_pass_base +
+                                       s_native_view_canonical_width - 1;
+
+                if (s_area_x1 <= s_native_view_pass_base &&
+                    s_area_x2 >= base_right) {
+                    sx = 0;
+                    sw = s_native_view_width;
+                } else {
+                    sx = s_area_x1 +
+                         s_native_view_preserve_2d_translation_x;
+                    sw = s_area_x2 - s_area_x1 + 1;
+                    if (sx < 0) {
+                        sw += sx;
+                        sx = 0;
+                    }
+                    if (sx + sw > s_native_view_width)
+                        sw = s_native_view_width - sx;
+                }
             } else if (s_native_view_expand_x) {
                 sx = 0;
                 sw = s_native_view_width;
@@ -4317,6 +4339,7 @@ static void native_view_free_all(void) {
     s_native_view_pass_base = 0;
     s_native_view_expand_x = 0;
     s_native_view_scale_2d = 0;
+    s_native_view_preserve_2d_translation_x = 0;
 }
 
 static int native_view_surface_slot(int base_x, int create) {
@@ -5226,6 +5249,32 @@ static int glb_native_view_screen_2d_x(int canonical_x) {
                  s_native_view_canonical_width);
 }
 
+static int glb_native_view_preserve_2d_translation_x(
+        const GpuRenderSemantic *semantic) {
+    int min_x = INT_MAX;
+    int max_x = INT_MIN;
+
+    for (uint8_t triangle = 0u;
+         triangle < semantic->triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            const int x = semantic->triangles[triangle].vertices[vertex].x /
+                              INT32_C(65536) +
+                          semantic->material.draw_offset_x;
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+        }
+    if (min_x > max_x) return 0;
+    {
+        const int center_x = min_x + (max_x - min_x) / 2;
+        const int canonical_center_x = s_native_view_pass_base +
+                                       s_native_view_canonical_width / 2;
+        const int anchor_x = center_x < canonical_center_x ? min_x
+                           : center_x > canonical_center_x ? max_x
+                                                          : center_x;
+        return glb_native_view_screen_2d_x(anchor_x) - anchor_x;
+    }
+}
+
 static void glb_transaction_snapshot(GlTransactionCheckpoint *checkpoint) {
     memcpy(checkpoint->vram, s_vram, sizeof(checkpoint->vram));
 
@@ -5427,7 +5476,7 @@ static GpuRenderTransactionStatus glb_validate_semantic(
     uint16_t encoded_depth;
 
     if (!semantic) return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
-    if (semantic->screen_space_2d > 1u)
+    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE)
         return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
     material = &semantic->material;
     switch (material->texture_depth) {
@@ -5751,7 +5800,8 @@ static GpuRenderTransactionStatus glb_draw_semantic_contents(
         (glb_native_view_fullscreen_flat_quad(semantic) ||
          (gpu_ws_nw_backdrop_enabled() &&
           glb_native_view_backdrop_quad(semantic)));
-    const int scale_screen_2d = native_view && semantic->screen_space_2d;
+    const int screen_space_2d_mode = native_view
+        ? semantic->screen_space_2d : GPU_RENDER_SCREEN_SPACE_2D_NONE;
     uint32_t texture_window;
 
     status = glb_validate_semantic(semantic);
@@ -5841,10 +5891,15 @@ static GpuRenderTransactionStatus glb_draw_semantic_contents(
                 const int canonical_x = vertex->x / INT32_C(65536) +
                                          material->draw_offset_x;
                 x[vertex_index] = native_view
-                    ? (scale_screen_2d
+                    ? (screen_space_2d_mode ==
+                               GPU_RENDER_SCREEN_SPACE_2D_STRETCH
                            ? glb_native_view_screen_2d_x(canonical_x)
-                           : glb_native_view_overlay_x(canonical_x,
-                                                       fullscreen_overlay))
+                           : screen_space_2d_mode ==
+                                     GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE
+                               ? canonical_x +
+                                     s_native_view_preserve_2d_translation_x
+                               : glb_native_view_overlay_x(
+                                     canonical_x, fullscreen_overlay))
                     : canonical_x;
                 y[vertex_index] = vertex->y / INT32_C(65536) +
                                   material->draw_offset_y;
@@ -5952,10 +6007,16 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
          glb_native_view_backdrop_quad(semantic)) ||
         glb_native_view_semantic_reaches_reveal(semantic);
     s_native_view_scale_2d = semantic->screen_space_2d;
+    s_native_view_preserve_2d_translation_x =
+        semantic->screen_space_2d ==
+                GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE
+            ? glb_native_view_preserve_2d_translation_x(semantic)
+            : 0;
     status = glb_draw_semantic_contents(semantic, 1, 1);
     flush_flat_batch();
     flush_tex_batch();
     s_native_view_scale_2d = 0;
+    s_native_view_preserve_2d_translation_x = 0;
     s_native_view_expand_x = 0;
     s_native_view_pass = 0;
     s_native_view_pass_fbo = 0;

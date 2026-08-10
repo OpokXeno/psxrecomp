@@ -672,7 +672,8 @@ static bool semantic_is_valid(const GpuRenderSemantic *semantic) {
     uint16_t encoded_depth;
 
     if (!semantic) return false;
-    if (semantic->screen_space_2d > 1u) return false;
+    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE)
+        return false;
     material = &semantic->material;
     if (material->texture_depth != GPU_RENDER_TEXTURE_4_BIT &&
         material->texture_depth != GPU_RENDER_TEXTURE_8_BIT &&

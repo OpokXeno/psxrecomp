@@ -140,6 +140,12 @@ typedef enum GpuRenderSemanticTopology {
     GPU_RENDER_SEMANTIC_LINES = 1,
 } GpuRenderSemanticTopology;
 
+typedef enum GpuRenderScreenSpace2dMode {
+    GPU_RENDER_SCREEN_SPACE_2D_NONE = 0,
+    GPU_RENDER_SCREEN_SPACE_2D_STRETCH = 1,
+    GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE = 2,
+} GpuRenderScreenSpace2dMode;
+
 typedef struct GpuRenderSemanticLine {
     GpuRenderSemanticVertex vertices[2];
 } GpuRenderSemanticLine;
@@ -150,8 +156,9 @@ typedef struct GpuRenderSemanticLine {
 typedef struct GpuRenderSemantic {
     GpuRenderMaterial material;
     GpuRenderSemanticTopology topology;
-    /* Canonical screen-space geometry that should fill the host aspect.
-     * Mutually exclusive with producer-provided native_view_position vertices. */
+    /* Canonical screen-space geometry mapped into the host aspect. Preserve-size
+     * maps the nearest outer horizontal edge while retaining canonical dimensions.
+     * Both modes are mutually exclusive with native_view_position vertices. */
     uint8_t screen_space_2d;
     uint8_t triangle_count;
     GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];

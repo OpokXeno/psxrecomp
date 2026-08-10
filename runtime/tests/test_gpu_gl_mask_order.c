@@ -211,8 +211,33 @@ static void test_native_semantic_vertices_keep_raw_coordinates(void) {
                 "polygon semantics remain unclassified 3D geometry");
     expect_true(gpu_native_semantic_from_gp0(
                     rectangle, 3, &environment, &semantic) == 1 &&
-                    semantic.screen_space_2d,
+                    semantic.screen_space_2d ==
+                        GPU_RENDER_SCREEN_SPACE_2D_STRETCH,
                 "rectangle primitives are classified as screen-space 2D");
+}
+
+static void test_native_portrait_material_classification(void) {
+    const GpuNativeDrawEnvironment environment = {0};
+    uint32_t portrait[9] = {
+        0x2c808080u,
+        gp0_xy(10, 20), 0x38c00000u,
+        gp0_xy(74, 20), 0x009b0010u,
+        gp0_xy(10, 116), 0x00000070u,
+        gp0_xy(74, 116), 0x00000080u,
+    };
+    GpuRenderSemantic semantic = {0};
+
+    expect_true(gpu_native_semantic_from_gp0(
+                    portrait, 9, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d ==
+                        GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE,
+                "dialogue portrait preserves size in screen-space 2D");
+
+    portrait[2] = 0x38c10000u;
+    expect_true(gpu_native_semantic_from_gp0(
+                    portrait, 9, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "non-portrait CLUT does not classify a textured FT4 as screen-space");
 }
 
 static void test_untextured_native_semantic_latches_ordered_blend(void) {
@@ -372,6 +397,94 @@ static void test_native_view_scales_screen_space_rectangles(void) {
                  "screen-space rectangle is not centered as 3D fallback");
     expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
                 "screen-space 2D Native view disables independently");
+}
+
+static void test_native_view_preserves_screen_space_primitive_size(void) {
+    const uint32_t left_quad[] = {
+        0x28ffffffu,
+        gp0_xy(10, 30), gp0_xy(74, 30), gp0_xy(10, 38), gp0_xy(74, 38),
+    };
+    const uint32_t right_quad[] = {
+        0x28ffffffu,
+        gp0_xy(246, 50), gp0_xy(310, 50), gp0_xy(246, 58), gp0_xy(310, 58),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    uint16_t outside_left = 0;
+    uint16_t left = 0;
+    uint16_t right = 0;
+    uint16_t outside_right = 0;
+    int translated_left;
+    int translated_right;
+    int native_width;
+
+    reset_gpu_for_case();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "preserve-size Native view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    left_quad, sizeof(left_quad) / sizeof(left_quad[0]),
+                    &environment, &semantic) == 1,
+                "left preserve-size test builds canonical semantic geometry");
+    semantic.screen_space_2d = GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE;
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "left preserve-size semantic reaches canonical and Native views");
+    gl_renderer_flush_cpu_uploads();
+
+    native_width = gl_renderer_native_view_width();
+    translated_left = 10 * native_width / 320;
+    translated_right = translated_left + 64;
+    expect_true(gl_renderer_native_view_peek(
+                    0, translated_left - 1, 31, 1, 1, &outside_left) &&
+                gl_renderer_native_view_peek(
+                    0, translated_left, 31, 1, 1, &left) &&
+                gl_renderer_native_view_peek(
+                    0, translated_right - 1, 31, 1, 1, &right) &&
+                gl_renderer_native_view_peek(
+                    0, translated_right, 31, 1, 1, &outside_right),
+                "preserve-size Native view pixels are readable");
+    expect_pixel(outside_left, 0,
+                 "preserve-size primitive leaves its left neighbor untouched");
+    expect_pixel(left, WHITE_1555,
+                 "left preserve-size primitive retains its stretched left edge");
+    expect_pixel(right, WHITE_1555,
+                 "preserve-size primitive retains its canonical width");
+    expect_pixel(outside_right, 0,
+                 "preserve-size primitive does not stretch past its right edge");
+
+    expect_true(gpu_native_semantic_from_gp0(
+                    right_quad, sizeof(right_quad) / sizeof(right_quad[0]),
+                    &environment, &semantic) == 1,
+                "right preserve-size test builds canonical semantic geometry");
+    semantic.screen_space_2d = GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE;
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "right preserve-size semantic reaches canonical and Native views");
+    gl_renderer_flush_cpu_uploads();
+
+    translated_right = 310 * native_width / 320;
+    translated_left = translated_right - 64;
+    outside_left = left = right = outside_right = 0;
+    expect_true(gl_renderer_native_view_peek(
+                    0, translated_left - 1, 51, 1, 1, &outside_left) &&
+                gl_renderer_native_view_peek(
+                    0, translated_left, 51, 1, 1, &left) &&
+                gl_renderer_native_view_peek(
+                    0, translated_right - 1, 51, 1, 1, &right) &&
+                gl_renderer_native_view_peek(
+                    0, translated_right, 51, 1, 1, &outside_right),
+                "right preserve-size Native view pixels are readable");
+    expect_pixel(outside_left, 0,
+                 "right preserve-size primitive starts at canonical width");
+    expect_pixel(left, WHITE_1555,
+                 "right preserve-size primitive retains its canonical width");
+    expect_pixel(right, WHITE_1555,
+                 "right preserve-size primitive retains its stretched right edge");
+    expect_pixel(outside_right, 0,
+                 "right preserve-size primitive leaves its right neighbor untouched");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "preserve-size Native view disables independently");
 }
 
 static void test_native_view_expands_fullscreen_fade(void) {
@@ -821,6 +934,7 @@ int main(void) {
     test_native_cull_view_is_independent_of_legacy_wide_mode();
     test_semantic_guest_cull_policy();
     test_native_semantic_vertices_keep_raw_coordinates();
+    test_native_portrait_material_classification();
     if (failures) return 1;
 
     SDL_SetMainReady();
@@ -852,6 +966,7 @@ int main(void) {
         test_unbound_gp0_packet_rasterizes_natively();
         test_native_view_uses_semantic_wide_positions();
         test_native_view_scales_screen_space_rectangles();
+        test_native_view_preserves_screen_space_primitive_size();
         test_native_view_expands_fullscreen_fade();
         test_native_view_uses_effective_draw_destination();
         test_native_view_backdrop_right_edge_coverage();
