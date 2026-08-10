@@ -2108,6 +2108,7 @@ void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
+extern volatile int g_debug_cyc_watch_armed;
 
 /* Last guest function ENTERED, fed unconditionally at every compiled entry
  * (one u32 store). The wall-time sampler's static histogram keys on THIS, not
@@ -2140,6 +2141,12 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
     if (s_fmv_quiet) return;
+    if (!g_debug_cyc_watch_armed && !s_synth_recurse_armed &&
+        !fn_trace_in_filter(func_addr) &&
+        !card_mgr_trace_target(func_addr) &&
+        !sreg_trace_focus_func(func_addr) &&
+        (!s_call_focus || !call_focus_target(func_addr)))
+        return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
@@ -2154,9 +2161,12 @@ void debug_server_log_call_entry(uint32_t func_addr) {
         ls_suppress_end();
         return;
     }
-    card_mgr_trace_record(func_addr, 0);
-    sreg_trace_record(func_addr);
-    call_focus_record(func_addr);
+    if (card_mgr_trace_target(func_addr))
+        card_mgr_trace_record(func_addr, 0);
+    if (sreg_trace_focus_func(func_addr))
+        sreg_trace_record(func_addr);
+    if (s_call_focus && call_focus_target(func_addr))
+        call_focus_record(func_addr);
     if (!s_fn_entry) { ls_suppress_end(); return; }
     if (!fn_trace_in_filter(func_addr)) { ls_suppress_end(); return; }
     s_fn_direct_filtered++;
@@ -2259,7 +2269,7 @@ typedef struct {
     uint64_t psx_cycle_count; /* absolute guest cycles at block entry */
 } CycWatchEntry;
 static CycWatchEntry s_cyc_watch_ring[CYC_WATCH_RING_CAP];
-static volatile int s_cyc_watch_armed = 0; /* 1 = recording active */
+volatile int g_debug_cyc_watch_armed = 0; /* 1 = recording active */
 static uint32_t s_cyc_watch_anchor_phys = 0; /* armed anchor (A / start), masked to phys */
 static uint32_t s_cyc_watch_anchor_raw = 0;  /* armed anchor as supplied (for echo) */
 static uint32_t s_cyc_watch_max_hits = 16;   /* stop after this many hits */
@@ -2286,7 +2296,7 @@ static uint64_t s_cyc_watch_last_cycle = 0xFFFFFFFFFFFFFFFFull;
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys)
 {
-    if (!s_cyc_watch_armed) return;                 /* disarmed: no cost */
+    if (!g_debug_cyc_watch_armed) return;           /* disarmed: no cost */
 
     /* DEDUPE the double-fire: a block reached via the dispatcher is observed
      * BOTH by debug_server_trace_dispatch (routing) AND by the function's own
@@ -2316,14 +2326,14 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys)
             e->psx_cycle_count = cyc_now - s_cyc_watch_region_start;  /* Δ(B-A) */
             s_cyc_watch_hits++;
             s_cyc_watch_in_region = 0;
-            if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+            if (s_cyc_watch_hits >= s_cyc_watch_max_hits) g_debug_cyc_watch_armed = 0;
         }
         return;
     }
 
     if (block_leader_phys != s_cyc_watch_anchor_phys) return;  /* ── single-anchor ── */
     if (s_cyc_watch_hits >= s_cyc_watch_max_hits) {
-        s_cyc_watch_armed = 0;                      /* full: stop sampling */
+        g_debug_cyc_watch_armed = 0;                /* full: stop sampling */
         return;
     }
     CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
@@ -2331,7 +2341,7 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys)
     e->pc              = block_leader_phys;
     e->psx_cycle_count = cyc_now;
     s_cyc_watch_hits++;
-    if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+    if (s_cyc_watch_hits >= s_cyc_watch_max_hits) g_debug_cyc_watch_armed = 0;
 }
 
 /* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
@@ -9105,7 +9115,8 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     return;
 #endif
     if (s_fmv_quiet) return;
-    if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
+    if (phys < 0x0000E0ECu && is_card_critical_addr(phys))
+        card_trace_record(phys, old_val, new_val, width);
     fp_record_write(phys, new_val, g_debug_last_store_pc);
     {
         uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
@@ -9313,7 +9324,7 @@ static void handle_cyc_watch(int id, const char *json)
     uint32_t end_raw = json_get_str(json, "end", endbuf, sizeof(endbuf)) ? hex_to_u32(endbuf) : 0u;
 
     /* Disarm first so the hot path can't sample mid-reset. */
-    s_cyc_watch_armed = 0;
+    g_debug_cyc_watch_armed = 0;
     s_cyc_watch_anchor_raw  = raw;
     s_cyc_watch_anchor_phys = raw & 0x1FFFFFFFu;
     s_cyc_watch_end_raw     = end_raw;
@@ -9325,7 +9336,7 @@ static void handle_cyc_watch(int id, const char *json)
     s_cyc_watch_last_phys   = 0xFFFFFFFFu;   /* reset dedupe state per arm */
     s_cyc_watch_last_cycle  = 0xFFFFFFFFFFFFFFFFull;
     memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
-    s_cyc_watch_armed = 1;
+    g_debug_cyc_watch_armed = 1;
 
     send_fmt("{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
              "\"anchor_phys\":\"0x%08X\",\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\","
@@ -9348,7 +9359,7 @@ static void handle_cyc_watch_dump(int id, const char *json)
              id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
              s_cyc_watch_end_raw, s_cyc_watch_end_phys,
              (s_cyc_watch_end_phys != 0u) ? 1 : 0,
-             s_cyc_watch_armed ? 1 : 0, s_cyc_watch_max_hits,
+             g_debug_cyc_watch_armed ? 1 : 0, s_cyc_watch_max_hits,
              s_cyc_watch_hits);
     send_line(buf);
     for (uint32_t i = 0; i < s_cyc_watch_hits; i++) {
@@ -9367,7 +9378,7 @@ static void handle_cyc_watch_dump(int id, const char *json)
 static void handle_cyc_watch_clear(int id, const char *json)
 {
     (void)json;
-    s_cyc_watch_armed = 0;
+    g_debug_cyc_watch_armed = 0;
     s_cyc_watch_hits  = 0;
     s_cyc_watch_anchor_phys = 0;
     s_cyc_watch_anchor_raw  = 0;

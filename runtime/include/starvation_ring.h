@@ -20,11 +20,7 @@ extern "C" {
 #endif
 
 #ifndef STARVATION_RING_ENABLED
-#  ifdef PSX_NO_DEBUG_TOOLS
-#    define STARVATION_RING_ENABLED 0
-#  else
-#    define STARVATION_RING_ENABLED 1
-#  endif
+#  define STARVATION_RING_ENABLED 0
 #endif
 
 #define STARVATION_RING_CAP (1 << 14)  /* 16K entries */

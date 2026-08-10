@@ -1708,7 +1708,7 @@ static uint8_t psx_read_byte_raw(uint32_t addr) {
 /* Runtime-only production cycle charge for data-load timing.  Overlay DLLs
  * flush their local pending-cycle accumulator before entering these host
  * helpers, so this stays on the host side of that ABI boundary. */
-#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
+#if !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
 extern uint64_t g_psx_cycle_fast_limit;
 extern int g_event_step_conservative;
 extern int g_ls_replay_active;

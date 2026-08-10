@@ -23,6 +23,20 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
                    "(optimized). Use -DCMAKE_BUILD_TYPE=RelWithDebInfo/Debug to override.")
 endif()
 
+# The runtime's generated code and dirty-RAM interpreter are too large and hot
+# for an unoptimized Debug build to run in real time. Keep Debug semantics,
+# symbols, assertions, and PSX_DEBUG_TOOLS, but optimize the executable just as
+# aggressively as Release. Disable this option when source-level stepping of
+# unoptimized code is specifically required.
+option(PSX_OPTIMIZED_DEBUG "Optimize Debug runtime code while retaining debug facilities" ON)
+if(PSX_OPTIMIZED_DEBUG)
+    if(MSVC)
+        add_compile_options($<$<CONFIG:Debug>:/O2>)
+    else()
+        add_compile_options($<$<CONFIG:Debug>:-O3>)
+    endif()
+endif()
+
 # Content-addressed compiler cache (ccache). git branch operations (checkout /
 # merge / new branch) rewrite working-tree file mtimes, which makes ninja treat
 # the ~279 MB generated-C objects as stale and recompile them (~15 min) even when

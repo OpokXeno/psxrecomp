@@ -213,6 +213,18 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-10 (Real-time Debug execution):** A complete 4,464-VBlank
+  Xenogears world-map replay with the project memcard isolated the Debug loss:
+  GCC's default `-O0` produced `28--31 FPS` in the fully interpreted tail,
+  `-Og` produced `41--45`, and `-O2/-O3` produced `51--58` with
+  `PSX_DEBUG_TOOLS=ON`. The identical `-O3` build with tools compiled out held
+  `59--61 FPS`, proving the remaining cost was dormant instrumentation rather
+  than guest semantics. Debug now retains symbols, assertions, the TCP server,
+  and all armable observers while compiling runtime code at `-O3`; disarmed
+  cycle/lockstep and function-entry observers take an aggregate fast path.
+  Follow-up `perf` passes made the temporary starvation/xprobe diagnostics
+  opt-in and cached invariant native-render cutover classification. The final
+  interpreted tail measures about `49--59 FPS`, depending on host load.
 - **2026-08-10 (Interpreted native-observation hot path):** The complete
   4,464-VBlank Xenogears world-map replay established that fully interpreted
   execution itself sustains `59.5--60.1` FPS in original render mode, while

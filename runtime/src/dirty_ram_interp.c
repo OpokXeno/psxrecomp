@@ -86,7 +86,7 @@ extern int g_ls_replay_active;     /* defined in the lockstep section; used by e
 /* Interpreter-only production fast path.  Do not put this in psx_cyc.h:
  * generated overlay DLLs deliberately batch psx_advance_cycles() through a
  * DLL-local accumulator and must never bind directly to runtime cycle state. */
-#if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
+#if !defined(PSX_COSIM) && !STARVATION_RING_ENABLED
 extern uint64_t g_psx_cycle_fast_limit;
 extern int g_event_step_conservative;
 
@@ -1166,7 +1166,11 @@ void dirty_ram_xprobe_call_note(CPUState *cpu, uint32_t target, uint32_t ra, uin
                  phase ? cpu->gpr[2] : cpu->gpr[4], cpu->gpr[29], cpu->gpr[31], 1);
 }
 static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t target,
-                         uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail) {
+                          uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail) {
+    xprobe_env_init();
+    if (g_xprobe_frame_trip <= 0 && g_xprobe_stk_kb <= 0 &&
+        !g_xprobe_watch(target))
+        return;
     uint32_t f = (uint32_t)s_frame_count;
     if (f != s_xf_frame) {
         xprobe_flush_frame();
@@ -1192,7 +1196,6 @@ static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t tar
         e->op = op; e->site = site;
     }
 
-    xprobe_env_init();
     if (!s_xprobe_tripped && f >= (uint32_t)g_xprobe_warmup &&
         ((g_xprobe_frame_trip > 0 && (int)s_xf_crossings > g_xprobe_frame_trip) ||
          (g_xprobe_stk_kb     > 0 && (int)stk            > g_xprobe_stk_kb))) {
@@ -2835,6 +2838,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         observe_render_source || collect_render_baseline;
 #ifndef PSX_NO_DEBUG_TOOLS
     extern void debug_server_cyc_observe(uint32_t block_leader_phys);
+    extern volatile int g_debug_cyc_watch_armed;
+    extern int g_ls_observers_armed;
 #endif
     /* Async-interrupt latency fix. A guest wait loop that lives ENTIRELY in
      * dirty RAM (e.g. libcd's CdSync spin, as in Kula World) re-enters this
@@ -2864,9 +2869,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         /* Interp-path cycle ruler: make every interpreted PC anchorable by
          * cyc_watch (parity with the compiled emitter's block-leader observe).
          * Early-returns when cyc_watch is disarmed → ~free in normal runs. */
-        g_ls_dirty_observe = 1;
-        debug_server_cyc_observe(pc & 0x1FFFFFFFu);
-        g_ls_dirty_observe = 0;
+        if (g_debug_cyc_watch_armed || g_ls_observers_armed) {
+            g_ls_dirty_observe = 1;
+            debug_server_cyc_observe(pc & 0x1FFFFFFFu);
+            g_ls_dirty_observe = 0;
+        }
 #endif
 #ifdef PSX_COSIM
         { extern void cosim_block(uint32_t); cosim_block(pc); }
@@ -3236,6 +3243,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 int g_ls_mode = 0;
 int g_ls_replay_active = 0;
 int g_ls_suppress_record = 0;
+int g_ls_observers_armed = 0;
 
 static uint32_t s_ls_frame_lo = 0, s_ls_frame_hi = 0;   /* hi==0 => disabled */
 
@@ -3295,9 +3303,17 @@ static struct {
 static ls_op_t s_lsf_div_trace[48];
 static int     s_lsf_div_trace_n = 0, s_lsf_div_idx = 0;
 
-void ls_set_window(uint32_t lo, uint32_t hi) { s_ls_frame_lo = lo; s_ls_frame_hi = hi; }
+void ls_set_window(uint32_t lo, uint32_t hi) {
+    s_ls_frame_lo = lo;
+    s_ls_frame_hi = hi;
+    g_ls_observers_armed = s_ls_frame_hi != 0u || s_lsf_frame_hi != 0u;
+}
 void ls_set_record_only(int on) { s_ls_record_only = on; }
-void ls_func_set_window(uint32_t lo, uint32_t hi) { s_lsf_frame_lo = lo; s_lsf_frame_hi = hi; }
+void ls_func_set_window(uint32_t lo, uint32_t hi) {
+    s_lsf_frame_lo = lo;
+    s_lsf_frame_hi = hi;
+    g_ls_observers_armed = s_ls_frame_hi != 0u || s_lsf_frame_hi != 0u;
+}
 void ls_func_set_record_only(int on) { s_lsf_record_only = on; }
 
 void ls_note_exception_entry(void) {
