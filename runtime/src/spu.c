@@ -13,6 +13,7 @@
 #include "audio_trace.h"
 #include "psx_cycles.h"
 
+#include <SDL_atomic.h>
 #include <string.h>
 
 #define SPU_RAM_SIZE       (512 * 1024)
@@ -95,6 +96,13 @@ typedef struct {
 } SpuVoice;
 
 static SpuVoice voices[SPU_VOICE_COUNT];
+static SDL_SpinLock s_spu_lock;
+
+static void spu_lock(void) { SDL_AtomicLock(&s_spu_lock); }
+static void spu_unlock(void) { SDL_AtomicUnlock(&s_spu_lock); }
+
+void spu_state_lock(void) { spu_lock(); }
+void spu_state_unlock(void) { spu_unlock(); }
 
 static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
     SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
@@ -263,7 +271,7 @@ static inline int16_t cd_input_volume(uint16_t raw) {
     return (int16_t)raw;
 }
 
-void spu_cd_audio_reset(void) {
+static void spu_cd_audio_reset_unlocked(void) {
     memset(cd_ring, 0, sizeof(cd_ring));
     cd_read_pos = 0;
     cd_write_pos = 0;
@@ -273,7 +281,13 @@ void spu_cd_audio_reset(void) {
     cd_underflow_frames = 0;
 }
 
-void spu_cd_audio_push(const int16_t* stereo, int frames) {
+void spu_cd_audio_reset(void) {
+    spu_lock();
+    spu_cd_audio_reset_unlocked();
+    spu_unlock();
+}
+
+static void spu_cd_audio_push_unlocked(const int16_t* stereo, int frames) {
     if (!stereo || frames <= 0) return;
 
     uint32_t in_frames = (uint32_t)frames;
@@ -306,6 +320,12 @@ void spu_cd_audio_push(const int16_t* stereo, int frames) {
     audio_trace_pcm(AUDIO_TAP_CD_IN, stereo, (int)in_frames);
     audio_trace_event(AUDIO_EV_CD_PUSH, (uint32_t)psx_get_cycle_count(),
                       cd_frame_count);
+}
+
+void spu_cd_audio_push(const int16_t* stereo, int frames) {
+    spu_lock();
+    spu_cd_audio_push_unlocked(stereo, frames);
+    spu_unlock();
 }
 
 static int cd_audio_pop(int16_t* left, int16_t* right) {
@@ -549,16 +569,21 @@ static void key_off(uint32_t mask) {
 }
 
 void spu_debug_music_quarantine_begin(void) {
+    spu_lock();
     s_debug_music_quarantine_mask = SPU_DEBUG_MUSIC_VOICE_MASK;
     koff_latch = (koff_latch & 0xFFFF0000u) | SPU_DEBUG_MUSIC_VOICE_MASK;
     key_off(SPU_DEBUG_MUSIC_VOICE_MASK);
+    spu_unlock();
 }
 
 void spu_debug_music_quarantine_end(void) {
+    spu_lock();
     s_debug_music_quarantine_mask = 0;
+    spu_unlock();
 }
 
 void spu_init(void) {
+    spu_lock();
     memset(spu_ram, 0, sizeof(spu_ram));
     memset(spu_regs, 0, sizeof(spu_regs));
     memset(voices, 0, sizeof(voices));
@@ -575,13 +600,14 @@ void spu_init(void) {
     s_debug_music_quarantine_mask = 0;
     s_event_idx = 0;
     s_event_seq = 0;
-    spu_cd_audio_reset();
+    spu_cd_audio_reset_unlocked();
     s_shadow_tap_on = 0;
     s_shadow_tap_frame = 0;
     spu_shadow_reset();
+    spu_unlock();
 }
 
-void spu_render(int16_t* out_stereo, int frames) {
+static void spu_render_unlocked(int16_t* out_stereo, int frames) {
     if (!out_stereo || frames <= 0) return;
 
     uint16_t ctrl = spu_regs[reg_index(0x1F801DAAu)];
@@ -750,8 +776,15 @@ void spu_render(int16_t* out_stereo, int frames) {
     audio_trace_pcm(AUDIO_TAP_SPU_OUT, out_stereo, frames);
 }
 
+void spu_render(int16_t* out_stereo, int frames) {
+    spu_lock();
+    spu_render_unlocked(out_stereo, frames);
+    spu_unlock();
+}
+
 void spu_debug_info(SpuDebugInfo* out) {
     if (!out) return;
+    spu_lock();
     memset(out, 0, sizeof(*out));
     out->ctrl = spu_regs[reg_index(0x1F801DAAu)];
     out->main_l = direct_volume(spu_regs[reg_index(0x1F801D80u)]);
@@ -770,9 +803,10 @@ void spu_debug_info(SpuDebugInfo* out) {
     out->cd_push_frames = cd_push_frames;
     out->cd_overflow_frames = cd_overflow_frames;
     out->cd_underflow_frames = cd_underflow_frames;
+    spu_unlock();
 }
 
-uint32_t spu_read(uint32_t addr) {
+static uint32_t spu_read_unlocked(uint32_t addr) {
     if (addr >= 0x1F801C00u && addr <= 0x1F801DFFu) {
         uint32_t idx = reg_index(addr);
         if (idx < SPU_REG_COUNT) {
@@ -817,7 +851,15 @@ uint32_t spu_read(uint32_t addr) {
     return 0;
 }
 
-void spu_write(uint32_t addr, uint32_t value) {
+uint32_t spu_read(uint32_t addr) {
+    uint32_t value;
+    spu_lock();
+    value = spu_read_unlocked(addr);
+    spu_unlock();
+    return value;
+}
+
+static void spu_write_unlocked(uint32_t addr, uint32_t value) {
     if (addr >= 0x1F801C00u && addr <= 0x1F801DFFu) {
         uint32_t idx = reg_index(addr);
         if (idx < SPU_REG_COUNT) {
@@ -876,7 +918,13 @@ void spu_write(uint32_t addr, uint32_t value) {
     }
 }
 
-void spu_dma_write(uint32_t word) {
+void spu_write(uint32_t addr, uint32_t value) {
+    spu_lock();
+    spu_write_unlocked(addr, value);
+    spu_unlock();
+}
+
+static void spu_dma_write_unlocked(uint32_t word) {
     if (transfer_addr + 3 < SPU_RAM_SIZE) {
         spu_ram[transfer_addr]     = (uint8_t)(word & 0xFF);
         spu_ram[transfer_addr + 1] = (uint8_t)((word >> 8) & 0xFF);
@@ -884,6 +932,12 @@ void spu_dma_write(uint32_t word) {
         spu_ram[transfer_addr + 3] = (uint8_t)((word >> 24) & 0xFF);
     }
     transfer_addr = (transfer_addr + 4) % SPU_RAM_SIZE;
+}
+
+void spu_dma_write(uint32_t word) {
+    spu_lock();
+    spu_dma_write_unlocked(word);
+    spu_unlock();
 }
 
 int spu_dma_ready(void) {
@@ -894,10 +948,30 @@ const uint8_t* spu_get_ram(void) {
     return spu_ram;
 }
 
+void spu_ram_copy_out(uint8_t *out, uint32_t len) {
+    if (!out) return;
+    if (len > SPU_RAM_SIZE) len = SPU_RAM_SIZE;
+    spu_lock();
+    memcpy(out, spu_ram, len);
+    spu_unlock();
+}
+
+int spu_ram_copy_in(const uint8_t *in, uint32_t len) {
+    if (!in || len != SPU_RAM_SIZE) return 0;
+    spu_lock();
+    memcpy(spu_ram, in, len);
+    spu_unlock();
+    return 1;
+}
+
 void spu_get_voice_state(int idx, SpuVoiceState* out) {
     if (!out) return;
+    spu_lock();
     memset(out, 0, sizeof(*out));
-    if (idx < 0 || idx >= SPU_VOICE_COUNT) return;
+    if (idx < 0 || idx >= SPU_VOICE_COUNT) {
+        spu_unlock();
+        return;
+    }
     SpuVoice *v = &voices[idx];
     out->active      = v->active;
     out->vol_ctrl_l  = voice_reg(idx, 0);
@@ -914,18 +988,22 @@ void spu_get_voice_state(int idx, SpuVoiceState* out) {
     out->phase       = (uint16_t)v->phase;
     out->env_level   = v->env_level;
     out->adsr_phase  = v->adsr_phase;
+    spu_unlock();
 }
 
 /* Debug peek into SPU RAM (spu_ram TCP command). Returns bytes copied. */
 uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len) {
     if (!out || addr >= SPU_RAM_SIZE) return 0;
     if (len > SPU_RAM_SIZE - addr) len = SPU_RAM_SIZE - addr;
+    spu_lock();
     memcpy(out, spu_ram + addr, len);
+    spu_unlock();
     return len;
 }
 
 void spu_get_global_state(SpuGlobalState* out) {
     if (!out) return;
+    spu_lock();
     memset(out, 0, sizeof(*out));
     out->ctrl       = spu_regs[reg_index(0x1F801DAAu)];
     out->main_vol_l = spu_regs[reg_index(0x1F801D80u)];
@@ -943,12 +1021,20 @@ void spu_get_global_state(SpuGlobalState* out) {
     for (int i = 0; i < SPU_VOICE_COUNT; i++)
         if (voices[i].active) am |= (1u << i);
     out->active_mask = am;
+    spu_unlock();
 }
 
-uint64_t spu_event_total(void) { return s_event_seq; }
+uint64_t spu_event_total(void) {
+    uint64_t result;
+    spu_lock();
+    result = s_event_seq;
+    spu_unlock();
+    return result;
+}
 
 uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
     if (!out || max_count == 0) return 0;
+    spu_lock();
     uint64_t avail = s_event_seq < (uint64_t)SPU_EVENT_CAP
                      ? s_event_seq : (uint64_t)SPU_EVENT_CAP;
     if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
@@ -957,13 +1043,16 @@ uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
     for (uint32_t i = 0; i < max_count; i++) {
         out[i] = s_events[(start + i) & (SPU_EVENT_CAP - 1u)];
     }
+    spu_unlock();
     return max_count;
 }
 
 void spu_event_reset(void) {
+    spu_lock();
     s_event_idx = 0;
     s_event_seq = 0;
     memset(s_events, 0, sizeof(s_events));
+    spu_unlock();
 }
 
 /* ---- boot snapshot: complete SPU register + voice state (LE field wire) ---- */
@@ -1011,6 +1100,7 @@ uint32_t spu_snapshot_bytes(void) {
 }
 
 void spu_snapshot_write(uint8_t *p) {
+    spu_lock();
     PstW w;
     uint32_t n = spu_snapshot_bytes();
     pst_w_init(&w, p, n);
@@ -1023,20 +1113,31 @@ void spu_snapshot_write(uint8_t *p) {
     pst_w_u32(&w, endx_latch);
     pst_w_u32(&w, kon_latch);
     pst_w_u32(&w, koff_latch);
+    spu_unlock();
 }
 
 int spu_snapshot_read(const uint8_t *p, uint32_t len) {
     PstR r;
     if (len != spu_snapshot_bytes()) return 0;
+    spu_lock();
     pst_r_init(&r, p, len);
     for (uint32_t i = 0; i < SPU_REG_COUNT; i++)
-        if (!pst_r_u16(&r, &spu_regs[i])) return 0;
+        if (!pst_r_u16(&r, &spu_regs[i])) {
+            spu_unlock();
+            return 0;
+        }
     for (int i = 0; i < SPU_VOICE_COUNT; i++)
-        if (!spu_r_voice(&r, &voices[i])) return 0;
+        if (!spu_r_voice(&r, &voices[i])) {
+            spu_unlock();
+            return 0;
+        }
     if (!pst_r_u32(&r, &transfer_addr) || !pst_r_u32(&r, &key_on_count) ||
         !pst_r_u32(&r, &endx_latch) || !pst_r_u32(&r, &kon_latch) ||
-        !pst_r_u32(&r, &koff_latch))
+        !pst_r_u32(&r, &koff_latch)) {
+        spu_unlock();
         return 0;
+    }
+    spu_unlock();
     return 1;
 }
 uint8_t*  spu_get_ram_ptr(void){ return spu_ram; }

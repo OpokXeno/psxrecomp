@@ -108,6 +108,13 @@ void spu_write(uint32_t addr, uint32_t value);
 void spu_dma_write(uint32_t word);
 int spu_dma_ready(void);
 
+/* Protect direct SPU-RAM pointer access while the real-time audio worker may
+ * be decoding a block. Prefer the copy/snapshot APIs when possible. */
+void spu_state_lock(void);
+void spu_state_unlock(void);
+void spu_ram_copy_out(uint8_t *out, uint32_t len);
+int  spu_ram_copy_in(const uint8_t *in, uint32_t len);
+
 /* CD-ROM XA/CDDA input path. Samples are stereo 44.1 kHz PCM entering the
  * SPU CD input bus; SPU control bit 0 and CD volume registers gate output. */
 void spu_cd_audio_push(const int16_t* stereo, int frames);

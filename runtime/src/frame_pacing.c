@@ -27,17 +27,13 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
 /* Bounded catch-up window, in periods. A transient stall (heavy frame, CD
  * burst) leaves next_deadline in the past; KEEPING that debt and running
  * unpaced until it is repaid preserves the long-term rate at exactly one
- * period per frame — which the audio pipeline depends on (the SPU produces
- * 768 guest cycles per output sample; every re-anchor that forgives debt
- * permanently starves the audio ring by the forgiven amount. Measured on
- * MMX5: forgiving all >1-period debt averaged 59.80 Hz against a 59.94
- * target = -0.4% chronic audio underrun). Only debt beyond this window —
- * sustained sub-realtime emulation, not a hiccup — is forgiven, else the
- * pacer would demand unbounded catch-up. */
+ * period per frame — preserving the guest/video cadence after a transient
+ * stall. Only debt beyond this window — sustained sub-realtime emulation, not
+ * a hiccup — is forgiven, else the pacer would demand unbounded catch-up. */
 /* Vigilante 8's streamed FMV transitions have measured host stalls near
  * 140 ms. Eight 60 Hz periods are only 133.3 ms, so the old bound classified
  * those finite transitions as sustained slowness and permanently forgave the
- * guest/audio debt. Keep a bounded 12-period (200 ms at 60 Hz) window: enough
+ * guest/video debt. Keep a bounded 12-period (200 ms at 60 Hz) window: enough
  * to repay the observed transition without turning a real hang, suspend, or
  * sub-realtime workload into an unbounded catch-up burst. */
 #define FRAME_PACER_CATCHUP_MAX_PERIODS 12u

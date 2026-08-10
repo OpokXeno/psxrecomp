@@ -53,6 +53,7 @@ uint32_t audio_trace_tap_rate(int tap)
 
 static AudioTraceEvent  s_events[EV_RING_CAP];
 static _Atomic uint64_t s_event_head;
+static atomic_flag s_event_lock = ATOMIC_FLAG_INIT;
 
 static _Atomic uint32_t s_noted_frame;
 
@@ -114,6 +115,7 @@ void audio_trace_pcm(int tap, const int16_t *stereo, int frames)
 
 void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b)
 {
+    while (atomic_flag_test_and_set_explicit(&s_event_lock, memory_order_acquire)) {}
     uint64_t seq = atomic_load_explicit(&s_event_head, memory_order_relaxed);
     AudioTraceEvent *e = &s_events[(uint32_t)(seq & EV_RING_MASK)];
     e->seq        = seq;
@@ -138,6 +140,7 @@ void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b)
     case AUDIO_EV_UNMUTE:    s_unmute_events++; break;
     default: break;
     }
+    atomic_flag_clear_explicit(&s_event_lock, memory_order_release);
 }
 
 void audio_trace_get_stats(AudioTraceStats *out)

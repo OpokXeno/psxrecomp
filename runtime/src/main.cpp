@@ -55,8 +55,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "spu_shadow.h"
 
 /* Shared clock-domain bridge: band-limited polyphase resampler + P-only DRC.
- * The SPU renders at a fixed 44100/60 per wall-clock frame while the host
- * consumes on its own crystal; with no resampling/DRC the queue slowly drifts
+ * The audio worker renders the SPU at a fixed 44100 Hz wall-clock rate while
+ * the host consumes on its own crystal; with no resampling/DRC the queue drifts
  * to underrun (silence gaps). The bridge resamples ~1:1 with a <=+/-0.5% ratio
  * trim to hold the ring near target -- no gaps. See recomp_audio_drc.h. */
 #define RECOMP_AUDIO_DRC_IMPL
@@ -98,6 +98,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -873,7 +874,7 @@ int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
 int      g_turbo_audio_sink_enabled = 0;
 int      g_turbo_audio_sink_active = 0;
-uint64_t g_turbo_audio_sink_frames = 0; /* guest SPU frames advanced, not queued */
+uint64_t g_turbo_audio_sink_frames = 0; /* SPU frames rendered and discarded */
 }
 /* The CD predicate already excludes XA and holds across ordinary inter-file
  * gaps. A short engage debounce rejects a one-frame controller blip without
@@ -884,13 +885,16 @@ uint64_t g_turbo_audio_sink_frames = 0; /* guest SPU frames advanced, not queued
 #define TURBO_LOADS_ENGAGE_FRAMES  4
 #define TURBO_LOADS_RELEASE_FRAMES 6
 static SDL_AudioDeviceID sdl_audio_device;
-static int16_t       sdl_audio_buf[2048 * 2];
 
-/* DRC bridge. Producer (sdl_audio_pump) runs on the main loop thread under
- * SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
- * thread. */
+/* DRC bridge. Producer (sdl_audio_worker_main) owns SPU rendering and pushes
+ * under SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
+ * thread. Rendering and presentation never share the producer's clock. */
 static rab_bridge s_drc;
 static bool       s_drc_ready = false;
+static std::thread s_audio_worker;
+static std::atomic<bool> s_audio_worker_stop{false};
+static std::atomic<bool> s_audio_hard_mute{false};
+static std::atomic<bool> s_audio_turbo_sink{false};
 
 /* Observability + A/B. PSXRECOMP_AUDIO_LEGACY=1 keeps the historical push model
  * (SDL_QueueAudio, no bridge) so the underrun baseline can be measured against
@@ -904,14 +908,14 @@ static bool audio_legacy_mode(void) {
 /* Legacy-mode underrun counter: incremented when the SDL queue is found empty
  * at pump time (the device was silence-filling = an audible gap). */
 static uint64_t g_legacy_underruns = 0;
-/* Set at unmute so the pump resyncs its bridge-underrun baseline past the
- * intentional mute-drain instead of reporting it as gaps. */
-int g_audio_unmute_resync = 0;
 /* Actual device rate the host opened at (bridge mode may differ from 44100;
  * the T3 tap ring runs at this rate and its WAV dump must say so). */
 extern "C" {
 int g_audio_host_rate = 44100;
 }
+
+static void sdl_audio_worker_start(void);
+static void sdl_audio_worker_stop(void);
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
@@ -1484,6 +1488,7 @@ static void shutdown_runtime(void) {
     overlay_autocapture_shutdown();
     overlay_capture_wait_pending();
     overlay_capture_write_json();
+    sdl_audio_worker_stop();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
         SDL_CloseAudioDevice(sdl_audio_device);   /* stops the pull callback */
@@ -1516,6 +1521,7 @@ static void teardown_game_session_keep_lobby(void) {
     netplay_host_present_restore();
     psx_netplay_shutdown();
     memcard_flush_all();
+    sdl_audio_worker_stop();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
         SDL_CloseAudioDevice(sdl_audio_device);
@@ -1540,144 +1546,9 @@ static void teardown_game_session_keep_lobby(void) {
     psx_clear_return_to_lobby();
 }
 
-/* Linear gain ramp g0 -> g1 across a block of interleaved stereo frames. */
-static void sdl_audio_gain_ramp(int16_t* buf, int frames, float g0, float g1) {
-    if (frames <= 0) return;
-    const float step = (g1 - g0) / (float)frames;
-    float g = g0;
-    for (int f = 0; f < frames; f++, g += step) {
-        buf[f * 2 + 0] = (int16_t)((float)buf[f * 2 + 0] * g);
-        buf[f * 2 + 1] = (int16_t)((float)buf[f * 2 + 1] * g);
-    }
-}
-
-/* Fade-in state: samples of rising ramp still to apply after an unmute.
- * Consumed by sdl_audio_pump across however many pump calls it spans.
- * MUST fit sdl_audio_buf (2048 frames): the fade-out tail renders this many
- * frames in one spu_render call. 1764 frames = 40 ms. */
-static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
-static int       sdl_audio_fadein_left  = 0;
-
-static void sdl_audio_pump(bool discard_output = false) {
-    if (!sdl_audio_device) return;
-
-    const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
-    const bool legacy = audio_legacy_mode();
-    static int had_audio = 0;
-    uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
-    if (discard_output) {
-        /* Host-only sink: skip all queue/bridge interaction, but continue to
-         * the guest-cycle sample budget and spu_render below. */
-    } else if (legacy) {
-        /* Historical push model + baseline measurement: a drained (==0) queue
-         * means the device was silence-filling since the last pump = a gap.
-         * Only meaningful after the first audio has been queued. */
-        const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-        queued = SDL_GetQueuedAudioSize(sdl_audio_device);
-        if (queued == 0 && had_audio) {
-            g_legacy_underruns++;
-            audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
-        }
-        if (queued > max_queue_bytes) {
-            audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
-            return;
-        }
-    } else {
-        /* No host-queue backpressure check: the bridge's ring + DRC hold the
-         * fill near target, so we always render this frame and push it. */
-        if (!s_drc_ready) return;
-        /* Surface bridge underruns (counted on the SDL audio thread) into the
-         * event ring from this thread — the event ring is single-writer.
-         * Across a turbo mute the ring intentionally runs dry (the pump stops
-         * while the callback keeps pulling); those dry pulls are the mute,
-         * not gaps — resync past them instead of reporting them. */
-        rab_stats st;
-        rab_get_stats(&s_drc, &st);
-        static uint64_t prev_underruns = 0;
-        extern int g_audio_unmute_resync;
-        if (g_audio_unmute_resync) {
-            prev_underruns = st.underrun_events;
-            g_audio_unmute_resync = 0;
-        } else if (st.underrun_events > prev_underruns) {
-            audio_trace_event(AUDIO_EV_UNDERRUN,
-                              (uint32_t)(st.underrun_events - prev_underruns), 1);
-            prev_underruns = st.underrun_events;
-        }
-        queued = (uint32_t)st.last_fill_ms;
-    }
-
-    /* Faithful sample budget: the SPU is clocked by the GUEST, not by host
-     * presents. 33.8688 MHz / 44100 Hz = exactly 768 guest cycles per output
-     * frame, so production tracks guest time precisely — including the real
-     * NTSC 59.94 Hz vblank — instead of assuming 60.00 Hz per present, which
-     * built in a systematic -0.1% production deficit (measured: 43950/s
-     * produced vs 44100/s consumed = recurring ring underruns no +/-0.5%
-     * DRC trim could absorb during jitter spikes). */
-    extern uint64_t psx_cycle_count;
-    static uint64_t last_cycles = 0;
-    static uint64_t cycle_carry = 0;
-    const uint64_t now_cycles = psx_cycle_count;
-    if (last_cycles == 0) last_cycles = now_cycles;
-    uint64_t delta = (now_cycles - last_cycles) + cycle_carry;
-    last_cycles = now_cycles;
-    int frames = (int)(delta / 768u);
-    cycle_carry = delta % 768u;
-    if (frames <= 0) return;
-    if (frames > 2048) {
-        /* A burst beyond one buffer (e.g. right after an unmute or a long
-         * stall): render one full buffer and DROP the remainder of the debt —
-         * same semantic as the mute model (voice positions freeze across the
-         * gap) rather than time-compressing a backlog into garble. */
-        frames = 2048;
-        cycle_carry = 0;
-    }
-
-    audio_trace_event(AUDIO_EV_RENDER, (uint32_t)frames, queued);
-    spu_render(sdl_audio_buf, frames);
-    if (discard_output) {
-        g_turbo_audio_sink_frames += (uint64_t)frames;
-        audio_trace_event(AUDIO_EV_SINK_DROP, (uint32_t)frames, 0);
-        return;
-    }
-    if (sdl_audio_fadein_left > 0) {
-        const float g0 = 1.0f - (float)sdl_audio_fadein_left
-                                / (float)sdl_audio_fade_samples;
-        int ramp = sdl_audio_fadein_left < frames ? sdl_audio_fadein_left : frames;
-        const float g1 = 1.0f - (float)(sdl_audio_fadein_left - ramp)
-                                / (float)sdl_audio_fade_samples;
-        sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
-        sdl_audio_fadein_left -= ramp;
-    }
-    if (legacy) {
-        /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
-        audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
-        SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                       (uint32_t)frames * bytes_per_frame);
-        had_audio = 1;
-    } else {
-        /* Hand to the bridge (band-limited resample + DRC) instead of
-         * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
-         * The T3 tap moves to sdl_drc_callback: what the device actually
-         * receives is the bridge's device-rate output, not this buffer. */
-        SDL_LockAudioDevice(sdl_audio_device);
-        rab_push(&s_drc, sdl_audio_buf, frames);
-        SDL_UnlockAudioDevice(sdl_audio_device);
-    }
-}
-
-/* Audio gating across turbo-loads transitions.
- *
- * The mute model stays: during turbo the guest runs at host speed, so
- * rendered SPU audio is time-compressed garble — we stop pumping, the queue
- * drains, voice positions freeze, and music resumes in place afterward.
- * What changes is the EDGES:
- *   - entering turbo: render one short tail of the current voice state,
- *     ramp it to silence, and queue it — the drain ends in a fade instead
- *     of a hard cut;
- *   - leaving turbo: hold the mute for a short hangover first (loads often
- *     re-trigger within a few frames; without the debounce the mute would
- *     flicker audibly), then resume pumping with a rising ramp applied
- *     across the first ~50 ms of samples (sdl_audio_pump above). */
+/* Audio gating across turbo-loads transitions. The worker keeps ownership of
+ * SPU advancement; the vblank callback only publishes the current gate state.
+ * This prevents frontend stalls from changing the audio clock. */
 /* Bridge/legacy output health, surfaced through the audio_stats TCP command
  * (debug_server.c) — no stderr probe; rule 3. */
 extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
@@ -1697,7 +1568,9 @@ extern "C" int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
         return sdl_audio_device != 0;
     }
     rab_stats st;
+    SDL_LockAudioDevice(sdl_audio_device);
     rab_get_stats(&s_drc, &st);
+    SDL_UnlockAudioDevice(sdl_audio_device);
     *fill_ms = st.last_fill_ms;
     *underruns = st.underrun_events;
     *overflow_drops = st.overflow_drops;
@@ -2023,64 +1896,112 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
         extern uint64_t s_frame_count;
         audio_trace_note_frame((uint32_t)s_frame_count);
     }
-    const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
-    static int muted = 0;
-    static int hangover = 0;
-    static int sink_was_active = 0;
+    s_audio_hard_mute.store(hard_mute_active != 0, std::memory_order_release);
+    s_audio_turbo_sink.store(turbo_sink_active != 0, std::memory_order_release);
+    g_turbo_audio_sink_active = turbo_sink_active != 0;
+}
 
-    if (hard_mute_active) {
-        if (!muted) {
-            int tail = sdl_audio_fade_samples;
-            const int buf_cap = (int)(sizeof(sdl_audio_buf) / (2 * sizeof(int16_t)));
-            if (tail > buf_cap) tail = buf_cap;
-            /* An unmute ramp may still be in progress; start the down-ramp
-             * from its current gain so the edge stays continuous. */
-            const float g0 = 1.0f - (float)sdl_audio_fadein_left
-                                    / (float)sdl_audio_fade_samples;
-            sdl_audio_fadein_left = 0;
-            spu_render(sdl_audio_buf, tail);
-            sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
-            audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
-            if (audio_legacy_mode()) {
-                audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
-                SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
-                               (uint32_t)tail * sizeof(int16_t) * 2u);
-            } else if (s_drc_ready) {
-                SDL_LockAudioDevice(sdl_audio_device);
-                rab_push(&s_drc, sdl_audio_buf, tail);
-                SDL_UnlockAudioDevice(sdl_audio_device);
+static void sdl_audio_worker_main(void) {
+    constexpr int chunk_frames = 256; /* <= 5.8 ms SPU lock hold */
+    int16_t buffer[chunk_frames * 2];
+    const uint64_t frequency = SDL_GetPerformanceFrequency();
+    const uint64_t chunk_ticks = frequency
+        ? (frequency * (uint64_t)chunk_frames) / 44100u : 0;
+    uint64_t next_deadline = SDL_GetPerformanceCounter();
+    bool legacy_had_audio = false;
+    bool was_muted = false;
+    bool was_sink = false;
+
+    while (!s_audio_worker_stop.load(std::memory_order_acquire)) {
+        if (!sdl_audio_device) break;
+
+        const bool muted = s_audio_hard_mute.load(std::memory_order_acquire);
+        const bool sink = s_audio_turbo_sink.load(std::memory_order_acquire);
+        if (muted) {
+            if (!was_muted) {
+                audio_trace_event(AUDIO_EV_MUTE, 0, 0);
+                was_muted = true;
             }
-            muted = 1;
+            next_deadline = SDL_GetPerformanceCounter();
+            SDL_Delay(2);
+            continue;
         }
-        hangover = HANGOVER_FRAMES;
-        return;
-    }
-    if (muted) {
-        if (hangover > 0) { hangover--; return; }
-        muted = 0;
-        sdl_audio_fadein_left = sdl_audio_fade_samples;
-        audio_trace_event(AUDIO_EV_UNMUTE, (uint32_t)sdl_audio_fadein_left, 0);
-        extern int g_audio_unmute_resync;
-        g_audio_unmute_resync = 1;
-    }
-    if (turbo_sink_active) {
-        if (!sink_was_active) {
-            sink_was_active = 1;
-            audio_trace_event(AUDIO_EV_MUTE, 0, 2); /* b=2: discard-only sink */
+        if (was_muted) {
+            was_muted = false;
+            audio_trace_event(AUDIO_EV_UNMUTE, 0, 0);
         }
-        g_turbo_audio_sink_active = 1;
-        sdl_audio_pump(true);
-        return;
+        if (sink != was_sink) {
+            audio_trace_event(sink ? AUDIO_EV_MUTE : AUDIO_EV_UNMUTE, 0, 2);
+            was_sink = sink;
+        }
+
+        if (!sink && !audio_legacy_mode() && s_drc_ready) {
+            SDL_LockAudioDevice(sdl_audio_device);
+            const double fill_ms = rab_fill_ms(&s_drc);
+            const double target_ms = s_drc.cfg.target_ms;
+            SDL_UnlockAudioDevice(sdl_audio_device);
+            if (fill_ms >= target_ms + 20.0) {
+                SDL_Delay(2);
+                continue;
+            }
+        } else if (!sink && audio_legacy_mode()) {
+            const uint32_t queued = SDL_GetQueuedAudioSize(sdl_audio_device);
+            const uint32_t max_queue = 44100u * sizeof(int16_t) * 2u / 5u;
+            if (queued > max_queue) {
+                SDL_Delay(2);
+                continue;
+            }
+            if (queued == 0 && legacy_had_audio) {
+                g_legacy_underruns++;
+                audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
+            }
+        }
+
+        const uint64_t now = SDL_GetPerformanceCounter();
+        if (frequency && now < next_deadline) {
+            const uint64_t remaining = next_deadline - now;
+            const uint32_t delay_ms = (uint32_t)((remaining * 1000u) / frequency);
+            SDL_Delay(delay_ms > 0 ? delay_ms : 1);
+            continue;
+        }
+        if (frequency && now > next_deadline + frequency / 2u)
+            next_deadline = now;
+        if (frequency) next_deadline += chunk_ticks;
+
+        spu_render(buffer, chunk_frames);
+        audio_trace_event(AUDIO_EV_RENDER, chunk_frames, 0);
+        if (sink) {
+            g_turbo_audio_sink_frames += (uint64_t)chunk_frames;
+            audio_trace_event(AUDIO_EV_SINK_DROP, chunk_frames, 0);
+            continue;
+        }
+
+        if (audio_legacy_mode()) {
+            audio_trace_pcm(AUDIO_TAP_HOST, buffer, chunk_frames);
+            SDL_QueueAudio(sdl_audio_device, buffer,
+                           (uint32_t)chunk_frames * sizeof(int16_t) * 2u);
+            legacy_had_audio = true;
+        } else if (s_drc_ready) {
+            SDL_LockAudioDevice(sdl_audio_device);
+            rab_push(&s_drc, buffer, chunk_frames);
+            SDL_UnlockAudioDevice(sdl_audio_device);
+        }
     }
+}
+
+static void sdl_audio_worker_start(void) {
+    if (s_audio_worker.joinable()) return;
+    s_audio_worker_stop.store(false, std::memory_order_release);
+    s_audio_hard_mute.store(false, std::memory_order_release);
+    s_audio_turbo_sink.store(false, std::memory_order_release);
     g_turbo_audio_sink_active = 0;
-    if (sink_was_active) {
-        sink_was_active = 0;
-        sdl_audio_fadein_left = sdl_audio_fade_samples;
-        audio_trace_event(AUDIO_EV_UNMUTE,
-                          (uint32_t)sdl_audio_fadein_left, 2);
-        g_audio_unmute_resync = 1;
-    }
-    sdl_audio_pump(false);
+    s_audio_worker = std::thread(sdl_audio_worker_main);
+}
+
+static void sdl_audio_worker_stop(void) {
+    if (!s_audio_worker.joinable()) return;
+    s_audio_worker_stop.store(true, std::memory_order_release);
+    s_audio_worker.join();
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
@@ -6874,6 +6795,7 @@ session_reboot:
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
             SDL_PauseAudioDevice(sdl_audio_device, 0);
+            sdl_audio_worker_start();
         }
     }
 #endif

@@ -42,6 +42,7 @@ extern void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
 extern uint32_t gpu_cosim_snapshot_bytes(void); extern void gpu_cosim_snapshot_write(uint8_t*);
 extern uint32_t spu_snapshot_bytes(void);   extern void spu_snapshot_write(uint8_t*);
 extern uint8_t* spu_get_ram_ptr(void);      extern uint32_t spu_get_ram_bytes(void);
+extern void spu_state_lock(void);            extern void spu_state_unlock(void);
 extern uint32_t cdrom_snapshot_bytes(void); extern void cdrom_snapshot_write(uint8_t*);
 extern uint32_t dma_snapshot_bytes(void);   extern void dma_snapshot_write(uint8_t*);
 extern uint32_t sio_snapshot_bytes(void);   extern void sio_snapshot_write(uint8_t*);
@@ -199,7 +200,9 @@ uint64_t cosim_state_hash(CosimSubHashes *sub) {
 
     s.gpu   = blob_hash(FNV_OFF, gpu_cosim_snapshot_bytes, gpu_cosim_snapshot_write);
     s.spu   = blob_hash(FNV_OFF, spu_snapshot_bytes,   spu_snapshot_write);
+    spu_state_lock();
     s.spu   = fnv(s.spu, spu_get_ram_ptr(), spu_get_ram_bytes());
+    spu_state_unlock();
     s.cdrom = blob_hash(FNV_OFF, cdrom_snapshot_bytes, cdrom_snapshot_write);
     s.dma   = blob_hash(FNV_OFF, dma_snapshot_bytes,   dma_snapshot_write);
     s.sio   = blob_hash(FNV_OFF, sio_snapshot_bytes,   sio_snapshot_write);

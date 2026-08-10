@@ -37,8 +37,9 @@ extern int      gpu_snapshot_read(const uint8_t* p, uint32_t len);
 extern uint32_t spu_snapshot_bytes(void);
 extern void     spu_snapshot_write(uint8_t* p);
 extern int      spu_snapshot_read(const uint8_t* p, uint32_t len);
-extern uint8_t* spu_get_ram_ptr(void);
 extern uint32_t spu_get_ram_bytes(void);
+extern void     spu_ram_copy_out(uint8_t* out, uint32_t len);
+extern int      spu_ram_copy_in(const uint8_t* in, uint32_t len);
 extern uint32_t cdrom_snapshot_bytes(void);
 extern void     cdrom_snapshot_write(uint8_t* p);
 extern int      cdrom_snapshot_read(const uint8_t* p, uint32_t len);
@@ -235,7 +236,16 @@ int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
         }
     }
     if (ok) ok = write_module_section(f, BS_SEC_SPU, spu_snapshot_bytes, spu_snapshot_write);
-    if (ok) ok = write_section(f, BS_SEC_SPURAM, spu_get_ram_ptr(), spu_get_ram_bytes());
+    if (ok) {
+        const uint32_t bytes = spu_get_ram_bytes();
+        uint8_t* copy = (uint8_t*)malloc(bytes);
+        if (!copy) ok = 0;
+        else {
+            spu_ram_copy_out(copy, bytes);
+            ok = write_section(f, BS_SEC_SPURAM, copy, bytes);
+            free(copy);
+        }
+    }
     if (ok) ok = write_module_section(f, BS_SEC_CDROM, cdrom_snapshot_bytes, cdrom_snapshot_write);
     if (ok) ok = write_module_section(f, BS_SEC_DMA,   dma_snapshot_bytes,   dma_snapshot_write);
     if (ok) ok = write_module_section(f, BS_SEC_SIO,   sio_snapshot_bytes,   sio_snapshot_write);
@@ -356,8 +366,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return spu_snapshot_read(p, len);
     case BS_SEC_SPURAM:
         if (len != spu_get_ram_bytes()) return 0;
-        memcpy(spu_get_ram_ptr(), p, len);
-        return 1;
+        return spu_ram_copy_in(p, len);
     case BS_SEC_CDROM:
         return cdrom_snapshot_read(p, len);
     case BS_SEC_DMA:
