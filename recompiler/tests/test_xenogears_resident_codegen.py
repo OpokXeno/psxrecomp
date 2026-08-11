@@ -34,7 +34,7 @@ def generate(recompiler: str, word: int, overlay: bool, root: str, site: int = S
     command = [recompiler, psx, "--seeds", seeds, "--out-dir", out]
     if cutover_transfer is not None:
         plan = os.path.join(root, f"plan-{site:08X}-{cutover_transfer}.txt")
-        with open(plan, "w", encoding="ascii") as stream:
+        with open(plan, "w", encoding="ascii", newline="\n") as stream:
             stream.write("psxrecomp-source-observation-plan-v5\n")
             stream.write(
                 f"cutover {site:08X} {word:08X} {cutover_transfer} 00000000\n")
