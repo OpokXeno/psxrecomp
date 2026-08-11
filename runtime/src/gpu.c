@@ -4791,6 +4791,7 @@ static void native_semantic_quad(
 
 enum {
     XG_FIELD_DIALOGUE_FONT_TPAGE = 0x001c,
+    XG_OPENING_TEXT_FONT_TPAGE = 0x001d,
     XG_COMBAT_DIALOGUE_FONT_TPAGE = 0x001e,
     XG_DIALOGUE_CONTINUE_TPAGE = 0x001a,
     XG_DIALOGUE_CONTINUE_CLUT_X = 0x0100,
@@ -4809,9 +4810,11 @@ static int native_semantic_is_dialogue_text(
     int32_t maximum_y = INT32_MIN;
 
     /* The system-string renderer grows one 13-pixel-high line sprite as glyphs
-     * are uploaded. Field and combat allocate those lines on pages 0x1c/0x1e. */
+     * are uploaded. Field, opening, and combat allocate those lines on the
+     * consecutive pages 0x1c..0x1e. */
     if (semantic == NULL || opcode < 0x64u || opcode > 0x67u ||
         (semantic->material.tpage != XG_FIELD_DIALOGUE_FONT_TPAGE &&
+         semantic->material.tpage != XG_OPENING_TEXT_FONT_TPAGE &&
          semantic->material.tpage != XG_COMBAT_DIALOGUE_FONT_TPAGE))
         return 0;
     for (uint8_t triangle = 0u; triangle < semantic->triangle_count; ++triangle)

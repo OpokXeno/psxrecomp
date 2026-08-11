@@ -254,7 +254,7 @@ static void test_native_portrait_uses_canonical_position(void) {
     expect_true(gpu_native_semantic_from_gp0(
                     portrait, 9, &environment, &semantic) == 1 &&
                     semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
-                "out-of-range CLUT row does not classify a textured FT4 as screen-space");
+                 "out-of-range CLUT row does not classify a textured FT4 as screen-space");
 }
 
 static void test_dialogue_text_is_centered_with_its_box(void) {
@@ -302,6 +302,12 @@ static void test_dialogue_text_is_centered_with_its_box(void) {
                     text_sprite, 4, &environment, &semantic) == 1 &&
                     semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
                 "combat dialogue text remains centered with its polygon box");
+
+    environment.tpage = 0x001du;
+    expect_true(gpu_native_semantic_from_gp0(
+                    text_sprite, 4, &environment, &semantic) == 1 &&
+                    semantic.screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE,
+                "opening text remains centered while its line sprite grows");
 
     environment.tpage = 0x001fu;
     expect_true(gpu_native_semantic_from_gp0(
@@ -485,7 +491,7 @@ static void test_native_view_scales_screen_space_rectangles(void) {
     expect_pixel(centered, 0,
                  "screen-space rectangle is not centered as 3D fallback");
     expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
-                "screen-space 2D Native view disables independently");
+                 "screen-space 2D Native view disables independently");
 }
 
 static void test_native_view_preserves_screen_space_primitive_size(void) {
@@ -841,13 +847,93 @@ static void test_native_view_uses_effective_draw_destination(void) {
                 "effective-destination Native view disables independently");
 }
 
+static void test_native_view_expands_offset_fullscreen_filter(void) {
+    const uint32_t draw_area_top[] = {
+        0xe3000000u | (256u << 10u),
+    };
+    const uint32_t draw_area_bottom[] = {
+        0xe4000000u | 319u | (479u << 10u),
+    };
+    const uint32_t draw_offset[] = {
+        0xe5000000u | (256u << 11u),
+    };
+    const uint32_t draw_mode[] = { 0xe1000040u };
+    const uint32_t opaque_quad[] = {
+        0x28ffffffu,
+        gp0_xy(0, 0), gp0_xy(320, 0), gp0_xy(0, 224), gp0_xy(320, 224),
+    };
+    const uint32_t filter[] = {
+        0x6264a073u, gp0_xy(0, 0), gp0_xy(320, 224),
+    };
+    const GpuRenderOracleSource source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, 0x1d64u, 0x759u, 0x758u,
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    uint16_t center = 0;
+    uint16_t left_margin = 0;
+    uint16_t right_margin = 0;
+
+    reset_gpu_for_case();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "offset-filter Native view configures");
+    expect_true(gpu_native_submit_gp0_packet(
+                    draw_area_top, 1, NULL, &source) == 1 &&
+                    gpu_native_submit_gp0_packet(
+                        draw_area_bottom, 1, NULL, &source) == 1 &&
+                    gpu_native_submit_gp0_packet(
+                        draw_offset, 1, NULL, &source) == 1,
+                "offset-filter draw target state applies in order");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    opaque_quad, sizeof(opaque_quad) / sizeof(opaque_quad[0]),
+                    &environment, &semantic) == 1,
+                "offset-filter fixture builds its opaque base");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle) {
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            const int x = position->x / INT32_C(65536);
+
+            position->native_view_x =
+                (x == 0 ? 0 : 427) * INT32_C(65536);
+            position->native_view_y = position->y;
+            position->native_view_position = 1u;
+        }
+    }
+    expect_true(gpu_native_submit_gp0_packet(
+                    opaque_quad, sizeof(opaque_quad) / sizeof(opaque_quad[0]),
+                    &semantic, &source) == 1 &&
+                    gpu_native_submit_gp0_packet(
+                        draw_mode, 1, NULL, &source) == 1 &&
+                    gpu_native_submit_gp0_packet(
+                        filter, sizeof(filter) / sizeof(filter[0]),
+                        NULL, &source) == 1,
+                "offset fullscreen filter reaches the Native semantic path");
+    expect_true(gl_renderer_native_view_peek(
+                    0, 160, 356, 1, 1, &center) &&
+                    gl_renderer_native_view_peek(
+                        0, 2, 356, 1, 1, &left_margin) &&
+                    gl_renderer_native_view_peek(
+                        0, 425, 356, 1, 1, &right_margin),
+                "offset fullscreen filter pixels are readable");
+    expect_true(center != WHITE_1555,
+                "offset fullscreen filter modifies the Native center");
+    expect_pixel(left_margin, center,
+                 "offset fullscreen filter covers the left Native margin");
+    expect_pixel(right_margin, center,
+                 "offset fullscreen filter covers the right Native margin");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "offset-filter Native view disables independently");
+}
+
 static void test_native_view_backdrop_right_edge_coverage(void) {
     const uint32_t textured_quad[] = {
         0x2dffffffu,
         gp0_xy(0, 100), 0u,
         gp0_xy(372, 100), (0x0100u << 16u) | 1u,
-        gp0_xy(0, 110), 0x00000100u,
-        gp0_xy(372, 110), (0x0100u << 16u) | 0x00000101u,
+        gp0_xy(0, 200), 0x00000100u,
+        gp0_xy(372, 200), (0x0100u << 16u) | 0x00000101u,
     };
     const GpuRenderOracleSource source = {
         GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, 0x1d04u, 0x741u, 0x740u,
@@ -1200,6 +1286,7 @@ int main(void) {
         test_native_view_expands_gouraud_and_textured_overlays();
         test_native_view_flip_clears_only_retired_margins();
         test_native_view_uses_effective_draw_destination();
+        test_native_view_expands_offset_fullscreen_filter();
         test_native_view_backdrop_right_edge_coverage();
         test_native_view_tracks_ordered_packet_mutations();
         test_flat_batch_uses_submission_mask_check();
