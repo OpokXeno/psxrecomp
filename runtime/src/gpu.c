@@ -4802,7 +4802,31 @@ enum {
     XG_DIALOGUE_BORDER_CLUT_X = 0x0100,
     XG_DIALOGUE_BORDER_CLUT_Y = 0x00f4,
     XG_DIALOGUE_FONT_HEIGHT = 13,
+    XG_FIELD_DIALOGUE_WINDOW_COMMAND = 0x000c2778,
+    XG_FIELD_DIALOGUE_WINDOW_SLOT_STRIDE = 0x0498,
+    XG_FIELD_DIALOGUE_WINDOW_BUFFER_STRIDE = 0x0010,
+    XG_FIELD_DIALOGUE_WINDOW_SLOT_COUNT = 4,
 };
+
+static int native_semantic_is_field_dialogue_window_source(
+        const GpuRenderOracleSource *source) {
+    uint32_t address;
+    uint32_t offset;
+    uint32_t slot_offset;
+
+    if (source == NULL ||
+        source->kind != GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST)
+        return 0;
+    address = source->word_address & UINT32_C(0x001ffffc);
+    if (address < XG_FIELD_DIALOGUE_WINDOW_COMMAND) return 0;
+    offset = address - XG_FIELD_DIALOGUE_WINDOW_COMMAND;
+    if (offset / XG_FIELD_DIALOGUE_WINDOW_SLOT_STRIDE >=
+        XG_FIELD_DIALOGUE_WINDOW_SLOT_COUNT)
+        return 0;
+    slot_offset = offset % XG_FIELD_DIALOGUE_WINDOW_SLOT_STRIDE;
+    return slot_offset == 0u ||
+        slot_offset == XG_FIELD_DIALOGUE_WINDOW_BUFFER_STRIDE;
+}
 
 static int native_semantic_is_dialogue_text(
         uint8_t opcode, const GpuRenderSemantic *semantic) {
@@ -4830,7 +4854,8 @@ static int native_semantic_is_dialogue_text(
 }
 
 static int native_semantic_is_dialogue_box_fill(
-        uint8_t opcode, const GpuRenderSemantic *semantic) {
+        uint8_t opcode, const GpuRenderSemantic *semantic,
+        const GpuRenderOracleSource *source) {
     int32_t minimum_x = INT32_MAX;
     int32_t maximum_x = INT32_MIN;
     int32_t minimum_y = INT32_MAX;
@@ -4838,8 +4863,10 @@ static int native_semantic_is_dialogue_box_fill(
     int black = 1;
 
     /* FUN_80032f54 emits a black RECT sized odd_columns * 4 + 13 by
-     * lines * 14 + 10. FUN_8007e1c0 emits the colored window body sized
-     * columns * 4 + 16 by lines * 14 + 14. */
+     * lines * 14 + 10. FUN_8007e1c0 emits the colored window body from the
+     * packet family above; its opening animation interpolates both dimensions
+     * from a 16-pixel minimum before reaching columns * 4 + 16 by
+     * lines * 14 + 14. */
     if (semantic == NULL || opcode != 0x62u || semantic->material.textured ||
         !semantic->material.semi_transparent)
         return 0;
@@ -4861,7 +4888,8 @@ static int native_semantic_is_dialogue_box_fill(
             height >= 24 && height % 14 == 10;
         const int field_window_fill = width >= 16 && width % 4 == 0 &&
             height >= 14 && height % 14 == 0;
-        return system_text_fill || field_window_fill;
+        return system_text_fill || field_window_fill ||
+            native_semantic_is_field_dialogue_window_source(source);
     }
 }
 
@@ -4908,9 +4936,10 @@ static int native_semantic_is_dialogue_continue_indicator(
 }
 
 static uint8_t native_semantic_screen_space_mode(
-        uint8_t opcode, const GpuRenderSemantic *semantic) {
+        uint8_t opcode, const GpuRenderSemantic *semantic,
+        const GpuRenderOracleSource *source) {
     if (native_semantic_is_dialogue_text(opcode, semantic) ||
-        native_semantic_is_dialogue_box_fill(opcode, semantic) ||
+        native_semantic_is_dialogue_box_fill(opcode, semantic, source) ||
         native_semantic_is_dialogue_border(opcode, semantic) ||
         native_semantic_is_dialogue_continue_indicator(opcode, semantic))
         return GPU_RENDER_SCREEN_SPACE_2D_NONE;
@@ -5181,7 +5210,7 @@ int gpu_native_semantic_from_gp0(
     } else {
         native_semantic_quad(out, x, y, u, v, color);
     }
-    out->screen_space_2d = native_semantic_screen_space_mode(opcode, out);
+    out->screen_space_2d = native_semantic_screen_space_mode(opcode, out, NULL);
     return 1;
 }
 
@@ -5959,7 +5988,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         if (bound_semantic) {
             semantic = *bound_semantic;
             semantic.screen_space_2d =
-                native_semantic_screen_space_mode(opcode, &semantic);
+                native_semantic_screen_space_mode(opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
             if (native_packet_bound_visual_valid)
                 guest_render_native_stream_note_rasterized(
@@ -5970,6 +5999,9 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             gpu_native_environment_get(&environment);
             supported = gpu_native_semantic_from_gp0(
                 words, (int)word_count, &environment, &semantic) == 1;
+            if (supported)
+                semantic.screen_space_2d =
+                    native_semantic_screen_space_mode(opcode, &semantic, source);
             if (supported &&
                 guest_render_native_stream_shared_packet_bindings_enabled())
                 effective_bound_semantic = &semantic;
@@ -5977,7 +6009,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         if (supported && effective_bound_semantic != NULL) {
             semantic = *effective_bound_semantic;
             semantic.screen_space_2d =
-                native_semantic_screen_space_mode(opcode, &semantic);
+                native_semantic_screen_space_mode(opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
         }
         if (supported && semantic.triangle_count != 0u) {

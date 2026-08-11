@@ -494,6 +494,59 @@ static void test_native_view_scales_screen_space_rectangles(void) {
                  "screen-space 2D Native view disables independently");
 }
 
+static void test_native_view_centers_animated_dialogue_window(void) {
+    const uint32_t rectangle[] = {
+        0x62406080u, gp0_xy(10, 100), gp0_xy(37, 23),
+    };
+    const uint32_t unrelated_rectangle[] = {
+        0x62406080u, gp0_xy(10, 150), gp0_xy(37, 23),
+    };
+    const GpuRenderOracleSource dialogue_source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+        0x000c2778u, 0x000c2778u / 4u, 0x600u,
+    };
+    const GpuRenderOracleSource unrelated_source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+        0x000c2798u, 0x000c2798u / 4u, 0x600u,
+    };
+    uint16_t scaled = 0;
+    uint16_t centered = 0;
+
+    reset_gpu_for_case();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "animated dialogue Native view configures");
+    expect_true(gpu_native_submit_gp0_packet(
+                    rectangle, sizeof(rectangle) / sizeof(rectangle[0]),
+                    NULL, &dialogue_source) == 1,
+                "animated dialogue body reaches the Native semantic path");
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_native_view_peek(0, 14, 101, 1, 1, &scaled),
+                "animated dialogue stretched coordinate is readable");
+    expect_true(gl_renderer_native_view_peek(0, 64, 101, 1, 1, &centered),
+                "animated dialogue centered coordinate is readable");
+    expect_pixel(scaled, 0,
+                 "animated dialogue body is not stretched to widescreen");
+    expect_true(centered != 0,
+                "animated dialogue body stays in the centered 4:3 plane");
+
+    scaled = centered = 0;
+    expect_true(gpu_native_submit_gp0_packet(
+                    unrelated_rectangle,
+                    sizeof(unrelated_rectangle) /
+                        sizeof(unrelated_rectangle[0]),
+                    NULL, &unrelated_source) == 1,
+                "nearby unrelated rectangle reaches the Native semantic path");
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_native_view_peek(0, 14, 151, 1, 1, &scaled) &&
+                    gl_renderer_native_view_peek(
+                        0, 64, 151, 1, 1, &centered),
+                "nearby unrelated rectangle coordinates are readable");
+    expect_true(scaled != 0 && centered == 0,
+                "only the static dialogue packet family stays centered");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "animated dialogue Native view disables independently");
+}
+
 static void test_native_view_preserves_screen_space_primitive_size(void) {
     const uint32_t left_quad[] = {
         0x28ffffffu,
@@ -1281,6 +1334,7 @@ int main(void) {
         test_unbound_gp0_packet_rasterizes_natively();
         test_native_view_uses_semantic_wide_positions();
         test_native_view_scales_screen_space_rectangles();
+        test_native_view_centers_animated_dialogue_window();
         test_native_view_preserves_screen_space_primitive_size();
         test_native_view_expands_fullscreen_fade();
         test_native_view_expands_gouraud_and_textured_overlays();
