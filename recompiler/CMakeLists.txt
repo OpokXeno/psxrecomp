@@ -26,11 +26,9 @@ add_subdirectory(lib/fmt)
 # block tries to exclude Apple toolchains — and Apple clang 21 then rejects
 # fmt's own literal format strings ("call to consteval function is not a
 # constant expression"). Force FMT_CONSTEVAL empty to take fmt's
-# non-consteval compile-time-check path. Scoped to non-MSVC so Windows is
-# untouched.
-if(NOT MSVC)
-    target_compile_definitions(fmt PUBLIC FMT_CONSTEVAL=)
-endif()
+# non-consteval compile-time-check path. Recent MSVC-compatible frontends,
+# including clang-cl, reject fmt 9.1.1's consteval path.
+target_compile_definitions(fmt PUBLIC FMT_CONSTEVAL=)
 
 # Rabbitizer MIPS decoder
 add_library(rabbitizer STATIC)

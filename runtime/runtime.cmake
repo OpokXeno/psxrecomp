@@ -743,6 +743,7 @@ function(psxrecomp_add_runtime_target target)
         PSX_GAME_MANIFEST_DIGEST_SHA256="${PSXRT_GAME_MANIFEST_DIGEST_SHA256}"
         PSX_OVERLAY_PLAN_HASH=0x${PSXRT_OVERLAY_PLAN_HASH}u
         FMT_HEADER_ONLY=1
+        $<$<PLATFORM_ID:Windows>:NOMINMAX>
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
 
