@@ -177,6 +177,11 @@ typedef enum GpuRenderScreenSpace2dMode {
     GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE = 2,
 } GpuRenderScreenSpace2dMode;
 
+typedef enum GpuRenderNativeViewEffect {
+    GPU_RENDER_NATIVE_VIEW_EFFECT_NONE = 0,
+    GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID = 1,
+} GpuRenderNativeViewEffect;
+
 typedef struct GpuRenderSemanticLine {
     GpuRenderSemanticVertex vertices[2];
 } GpuRenderSemanticLine;
@@ -191,6 +196,12 @@ typedef struct GpuRenderSemantic {
      * maps the nearest outer horizontal edge while retaining canonical dimensions.
      * Both modes are mutually exclusive with native_view_position vertices. */
     uint8_t screen_space_2d;
+    /* Source-authenticated host effect. Canonical geometry and guest VRAM remain
+     * unchanged; the Native renderer extends the effect into revealed margins. */
+    uint8_t native_view_effect;
+    /* Producer-local packet index for effects whose topology is stable while
+     * linked-list order and per-frame geometry are not. */
+    uint16_t native_view_effect_index;
     uint8_t triangle_count;
     GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];
     uint8_t line_count;

@@ -619,40 +619,55 @@ static GLuint s_midpoint_pass_fbo;
 static int s_midpoint_copy_pass;
 static int s_native_view_copy_self;
 static GLuint s_native_view_copy_source_fbo;
-#define NATIVE_VIEW_WAVE_ROW_TILES 20
-#define NATIVE_VIEW_WAVE_PRESENT_ROWS 32
-#define NATIVE_VIEW_WAVE_CURRENT_VARIANT NATIVE_INTERPOLATION_MAX_PHASES
-#define NATIVE_VIEW_WAVE_PRESENT_VARIANTS (NATIVE_INTERPOLATION_MAX_PHASES + 1u)
-typedef struct NativeViewWavePresentRow {
-    int boundaries[NATIVE_VIEW_WAVE_ROW_TILES + 1];
-    int source_top;
-    int source_bottom;
+#define NATIVE_CURRENT_VARIANT NATIVE_INTERPOLATION_MAX_PHASES
+#define NATIVE_VIEW_WAVE_COLUMNS 20
+#define NATIVE_VIEW_WAVE_ROWS 17
+#define NATIVE_VIEW_WAVE_PACKET_COUNT \
+    (NATIVE_VIEW_WAVE_COLUMNS * NATIVE_VIEW_WAVE_ROWS)
+#define NATIVE_VIEW_WAVE_VARIANTS (NATIVE_INTERPOLATION_MAX_PHASES + 1u)
+typedef struct NativeViewWaveRow {
+    int boundaries[NATIVE_VIEW_WAVE_COLUMNS + 1];
+    int left_source_top;
+    int left_source_bottom;
+    int right_source_top;
+    int right_source_bottom;
+    int left_top;
+    int left_bottom;
+    int right_top;
+    int right_bottom;
+} NativeViewWaveRow;
+typedef struct NativeViewWaveTile {
+    int left;
+    int right;
     int top;
     int bottom;
-} NativeViewWavePresentRow;
+    int texture_x;
+    int texture_y;
+    int u;
+    int v;
+    int draw_top;
+    int framebuffer_height;
+} NativeViewWaveTile;
 typedef struct NativeViewWaveState {
-    GpuRenderSemantic row[NATIVE_VIEW_WAVE_ROW_TILES];
-    GpuRenderSemantic midpoint_row[NATIVE_VIEW_WAVE_ROW_TILES];
-    GpuRenderSemantic extra_phase_row[NATIVE_INTERPOLATION_MAX_PHASES - 1u]
-                                           [NATIVE_VIEW_WAVE_ROW_TILES];
-    NativeViewWavePresentRow
-        present_rows[NATIVE_VIEW_WAVE_PRESENT_VARIANTS][2]
-                    [NATIVE_VIEW_WAVE_PRESENT_ROWS];
-    int row_count;
-    int present_row_count[NATIVE_VIEW_WAVE_PRESENT_VARIANTS][2];
-    int present_slot[NATIVE_VIEW_WAVE_PRESENT_VARIANTS][2];
-    int vertical_anchor_source[NATIVE_VIEW_WAVE_PRESENT_VARIANTS][2];
-    int packed_vertical_offset[NATIVE_VIEW_WAVE_PRESENT_VARIANTS][2];
+    NativeViewWaveTile tiles[NATIVE_VIEW_WAVE_VARIANTS]
+                            [NATIVE_VIEW_WAVE_PACKET_COUNT];
+    NativeViewWaveRow rows[NATIVE_VIEW_WAVE_VARIANTS]
+                            [NATIVE_VIEW_WAVE_ROWS];
+    uint8_t tile_seen[NATIVE_VIEW_WAVE_PACKET_COUNT];
+    int packet_count;
+    int present_row_count[NATIVE_VIEW_WAVE_VARIANTS];
+    int vertical_anchor_source[NATIVE_VIEW_WAVE_VARIANTS][2];
+    int packed_vertical_offset[NATIVE_VIEW_WAVE_VARIANTS][2][2];
     int base_x;
     int slot;
-    int top;
-    int bottom;
-    int previous_left;
-    int effect_active;
+    int recording;
+    int ready;
 } NativeViewWaveState;
 static NativeViewWaveState s_native_view_wave;
-static GLuint s_native_view_wave_present_tex;
-static GLuint s_native_view_wave_present_fbo;
+static GlRendererNativeWaveDiagnostics s_native_view_wave_diag;
+static int s_native_view_wave_authenticated;
+static int s_native_view_wave_authenticated_base_x;
+static int s_native_view_wave_authenticated_slot = -1;
 #define NATIVE_HOST_QUEUE_CAP GPU_SEMANTIC_WORKLOAD_CAPACITY
 typedef struct NativeHostQueuedSemantic {
     GpuRenderSemantic current;
@@ -700,10 +715,13 @@ static size_t s_producer_diag_previous_order[NATIVE_HOST_QUEUE_CAP];
 static void wide_free_all(void);
 static void native_view_free_all(void);
 static int native_view_surface_slot(int base_x, int create);
-static GLuint native_view_wave_present_texture(int slot, GLuint source_fbo,
-                                                 int disp_y, int disp_h,
-                                                 unsigned int variant);
-static GpuRenderTransactionStatus native_view_wave_flush_pending(void);
+static void native_view_wave_reset(void);
+static void native_view_wave_record(
+    const GpuRenderSemantic *semantic,
+    const GpuRenderSemantic *phase_semantics, int base_x, int slot);
+static int native_view_wave_apply_copy(
+    int slot, int base_x, int src_x, int src_y,
+    int dst_x, int dst_y, int w, int h);
 static GpuRenderTransactionStatus native_host_queue_flush(void);
 static GpuRenderTransactionStatus native_host_queue_prepare_present(
     int use_midpoint);
@@ -3969,11 +3987,6 @@ static int native_scale_restore_views(const GLuint *framebuffers,
     return 1;
 }
 
-static int native_scale_remap_slot(int old_slot, const int *restored_slots) {
-    if (old_slot < 0 || old_slot >= NATIVE_VIEW_MAX_SURF) return -1;
-    return restored_slots[old_slot];
-}
-
 /* Apply a pending internal-scale change: full raster rebuild at the new
  * scale. Native semantic paths call this after swapping their completed
  * old-scale frame; other paths call it before collecting their present image. */
@@ -3982,7 +3995,6 @@ static void gl_maybe_apply_scale(void) {
     GLuint preserved_fbo[NATIVE_VIEW_MAX_SURF] = {0};
     int preserved_base[NATIVE_VIEW_MAX_SURF] = {0};
     int restored_slots[NATIVE_VIEW_MAX_SURF];
-    NativeViewWaveState preserved_wave = s_native_view_wave;
     int preserved_ok = 1;
     int restored_ok = 0;
     int old_native_width = 0;
@@ -4042,18 +4054,7 @@ static void gl_maybe_apply_scale(void) {
                 old_native_height, restored_slots);
         }
     }
-    if (restored_ok) {
-        s_native_view_wave = preserved_wave;
-        s_native_view_wave.slot = native_scale_remap_slot(
-            preserved_wave.slot, restored_slots);
-        for (unsigned int variant = 0u;
-             variant < NATIVE_VIEW_WAVE_PRESENT_VARIANTS; ++variant)
-            for (int page = 0; page < 2; ++page)
-                s_native_view_wave.present_slot[variant][page] =
-                    native_scale_remap_slot(
-                        preserved_wave.present_slot[variant][page],
-                        restored_slots);
-    } else {
+    if (!restored_ok) {
         destroy_gpu_raster();
         fprintf(stderr, "psxrecomp: GL raster rebuild/restore failed at %dx "
                 "and at restore %dx — GL path dead, software mirror "
@@ -6091,22 +6092,12 @@ static int native_midpoint_snapshot_current(int disp_x, int disp_y,
         0, 0, canonical_width, height,
         GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
     for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot) {
-        GLuint source_fbo = s_native_view_fbo[slot];
-        int composite_source = 0;
-
         if (!s_native_view_seeded[slot] || !s_native_view_fbo[slot] ||
             !s_native_midpoint_fbo[slot])
             continue;
         if (native_view &&
-            s_native_view_base[slot] == (disp_x & (VRAM_W - 1))) {
-                if (native_view_wave_present_texture(
-                    slot, source_fbo, disp_y, disp_h,
-                    NATIVE_VIEW_WAVE_CURRENT_VARIANT) != 0) {
-                source_fbo = s_native_view_wave_present_fbo;
-                composite_source = 1;
-            }
+            s_native_view_base[slot] == (disp_x & (VRAM_W - 1)))
             pending_slot = slot;
-        }
         p_glBindFramebuffer(
             PSXGL_READ_FRAMEBUFFER, s_native_view_fbo[slot]);
         p_glBindFramebuffer(
@@ -6115,18 +6106,6 @@ static int native_midpoint_snapshot_current(int disp_x, int disp_y,
             0, 0, native_width, height,
             0, 0, native_width, height,
             GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
-        if (!composite_source) {
-            s_native_midpoint_seeded[slot] = 1;
-            continue;
-        }
-        p_glBindFramebuffer(
-            PSXGL_READ_FRAMEBUFFER, source_fbo);
-        p_glBindFramebuffer(
-            PSXGL_DRAW_FRAMEBUFFER, s_native_midpoint_fbo[slot]);
-        p_glBlitFramebuffer(
-            0, 0, native_width, height,
-            0, 0, native_width, height,
-            GL_COLOR_BUFFER_BIT, GL_NEAREST);
         s_native_midpoint_seeded[slot] = 1;
     }
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -6278,24 +6257,21 @@ static void native_midpoint_seed_canonical(void) {
         gl_renderer_native_midpoint_cancel();
 }
 
-static void native_view_free_all(void) {
-    gl_renderer_native_midpoint_reset_for_reason(
-        GL_NATIVE_MIDPOINT_RESET_VIEW_FREE);
+static void native_view_wave_reset(void) {
     memset(&s_native_view_wave, 0, sizeof(s_native_view_wave));
     s_native_view_wave.slot = -1;
     for (unsigned int variant = 0u;
-         variant < NATIVE_VIEW_WAVE_PRESENT_VARIANTS; ++variant) {
-        s_native_view_wave.present_slot[variant][0] = -1;
-        s_native_view_wave.present_slot[variant][1] = -1;
-        s_native_view_wave.vertical_anchor_source[variant][0] = -1;
-        s_native_view_wave.vertical_anchor_source[variant][1] = -1;
-    }
-    if (s_native_view_wave_present_fbo)
-        p_glDeleteFramebuffers(1, &s_native_view_wave_present_fbo);
-    if (s_native_view_wave_present_tex)
-        glDeleteTextures(1, &s_native_view_wave_present_tex);
-    s_native_view_wave_present_fbo = 0;
-    s_native_view_wave_present_tex = 0;
+         variant < NATIVE_VIEW_WAVE_VARIANTS; ++variant)
+        for (int page = 0; page < 2; ++page)
+            s_native_view_wave.vertical_anchor_source[variant][page] = -1;
+}
+
+static void native_view_free_all(void) {
+    gl_renderer_native_midpoint_reset_for_reason(
+        GL_NATIVE_MIDPOINT_RESET_VIEW_FREE);
+    native_view_wave_reset();
+    s_native_view_wave_authenticated = 0;
+    s_native_view_wave_authenticated_slot = -1;
     for (int i = 0; i < NATIVE_VIEW_MAX_SURF; ++i) {
         if (s_native_view_fbo[i])
             p_glDeleteFramebuffers(1, &s_native_view_fbo[i]);
@@ -6652,7 +6628,7 @@ static void native_view_fill_slot_wrapped_y(int slot, int local_x, int y,
 }
 
 static void glb_native_view_clear_margins(int base_x, int y, int h,
-                                            uint16_t color) {
+                                             uint16_t color) {
     int slot;
 
     if (!s_native_view_enabled || s_native_view_width <= 0 || h <= 0 ||
@@ -6660,9 +6636,12 @@ static void glb_native_view_clear_margins(int base_x, int y, int h,
         return;
     slot = native_view_surface_slot(base_x & (VRAM_W - 1), 0);
     if (slot < 0 || !s_native_view_seeded[slot]) return;
-    if (native_view_wave_flush_pending() != GPU_RENDER_TRANSACTION_OK) {
-        gl_renderer_native_midpoint_cancel();
-        return;
+    s_native_view_wave_diag.margin_clears++;
+    if (y == 0 || y == 256) {
+        const int page = y / 256;
+
+        s_native_view_wave_diag.margin_clears_by_page[page]++;
+        s_native_view_wave_diag.wave_valid_by_page[page] = 0;
     }
     if (native_host_queue_push_margin_clear(
             slot, y, h, color,
@@ -6759,6 +6738,177 @@ static void glb_native_fill_rect(int x, int y, int w, int h, uint16_t color) {
     }
 }
 
+static int native_view_wave_displacement(
+        const int boundaries[NATIVE_VIEW_WAVE_COLUMNS + 1], int x) {
+    int wrapped = x % s_native_view_canonical_width;
+    int index;
+    int fraction;
+    int first;
+    int second;
+
+    if (wrapped < 0) wrapped += s_native_view_canonical_width;
+    index = wrapped / 16;
+    fraction = wrapped - index * 16;
+    first = boundaries[index] - index * 16;
+    second = boundaries[index + 1] - (index + 1) * 16;
+    return (first * (16 - fraction) + second * fraction + 8) / 16;
+}
+
+static void native_view_wave_blit_row(const NativeViewWaveRow *row) {
+    const int scale = s_scale;
+    const int center_right = s_native_view_offset +
+                             s_native_view_canonical_width;
+
+    if (s_native_view_offset > 0) {
+        glScissor(0, row->left_top * scale, s_native_view_offset * scale,
+                  (row->left_bottom - row->left_top) * scale);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        for (int source_right = s_native_view_offset;
+             source_right > 0; source_right -= 16) {
+            const int source_left = source_right > 16
+                ? source_right - 16 : 0;
+            const int canonical_left = source_left - s_native_view_offset;
+            const int canonical_right = source_right - s_native_view_offset;
+            int destination_left = source_left +
+                native_view_wave_displacement(
+                    row->boundaries, canonical_left);
+            int destination_right = source_right +
+                native_view_wave_displacement(
+                    row->boundaries, canonical_right);
+
+            if (source_left == 0) destination_left = 0;
+            if (source_right == s_native_view_offset)
+                destination_right = s_native_view_offset;
+            if (destination_right > destination_left)
+                p_glBlitFramebuffer(
+                    source_left * scale, row->left_source_top * scale,
+                    source_right * scale, row->left_source_bottom * scale,
+                    destination_left * scale, row->left_top * scale,
+                    destination_right * scale, row->left_bottom * scale,
+                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+    if (center_right < s_native_view_width) {
+        glScissor(center_right * scale, row->right_top * scale,
+                  (s_native_view_width - center_right) * scale,
+                  (row->right_bottom - row->right_top) * scale);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        for (int source_left = center_right;
+             source_left < s_native_view_width; source_left += 16) {
+            const int source_right = source_left + 16 < s_native_view_width
+                ? source_left + 16 : s_native_view_width;
+            const int canonical_left = source_left - s_native_view_offset;
+            const int canonical_right = source_right - s_native_view_offset;
+            int destination_left = source_left +
+                native_view_wave_displacement(
+                    row->boundaries, canonical_left);
+            int destination_right = source_right +
+                native_view_wave_displacement(
+                    row->boundaries, canonical_right);
+
+            if (source_left == center_right)
+                destination_left = center_right;
+            if (source_right == s_native_view_width)
+                destination_right = s_native_view_width;
+            if (destination_right > destination_left)
+                p_glBlitFramebuffer(
+                    source_left * scale, row->right_source_top * scale,
+                    source_right * scale, row->right_source_bottom * scale,
+                    destination_left * scale, row->right_top * scale,
+                    destination_right * scale, row->right_bottom * scale,
+                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+}
+
+static int native_view_wave_apply_variant(
+        GLuint target_fbo, unsigned int variant) {
+    const int width = s_native_view_width * s_scale;
+    const int height = VRAM_H * s_scale;
+    const int row_count = variant < NATIVE_VIEW_WAVE_VARIANTS
+        ? s_native_view_wave.present_row_count[variant] : 0;
+
+    if (!target_fbo || !s_scratch_fbo ||
+        variant >= NATIVE_VIEW_WAVE_VARIANTS ||
+        row_count <= 0 || row_count > NATIVE_VIEW_WAVE_ROWS)
+        return 0;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, target_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_scratch_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, target_fbo);
+    glEnable(GL_SCISSOR_TEST);
+    for (int index = 0; index < row_count; ++index) {
+        const NativeViewWaveRow *row =
+            &s_native_view_wave.rows[variant][index];
+
+        native_view_wave_blit_row(row);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    s_stencil_valid = 0;
+    return native_midpoint_gl_ok(GL_NATIVE_MIDPOINT_GL_WAVE_COPY);
+}
+
+static int native_view_wave_apply_copy(
+        int slot, int base_x, int src_x, int src_y,
+        int dst_x, int dst_y, int w, int h) {
+    int applied = 0;
+
+    if (!s_native_view_wave_authenticated ||
+        slot != s_native_view_wave_authenticated_slot ||
+        base_x != s_native_view_wave_authenticated_base_x ||
+        w != s_native_view_canonical_width ||
+        (src_x & (VRAM_W - 1)) != base_x ||
+        (dst_x & (VRAM_W - 1)) != base_x || src_y != dst_y + 32 || h != 192 ||
+        s_mask_set || s_mask_check)
+        return 0;
+    s_native_view_wave_diag.matching_copies++;
+    s_native_view_wave_diag.last_copy_dst_y = dst_y;
+    s_native_view_wave_diag.last_copy_packet_count =
+        s_native_view_wave.packet_count;
+    s_native_view_wave_diag.last_copy_row_count =
+        s_native_view_wave.present_row_count[NATIVE_CURRENT_VARIANT];
+    if (s_native_view_wave.recording && s_native_view_wave.ready) {
+        s_native_view_wave_diag.ready_copies++;
+        applied = native_view_wave_apply_variant(
+            s_native_view_fbo[slot], NATIVE_CURRENT_VARIANT);
+        if (applied)
+            s_native_view_wave_diag.apply_successes++;
+        else
+            s_native_view_wave_diag.apply_failures++;
+        for (unsigned int phase = 0u;
+             phase < s_native_interpolation_phase_count; ++phase) {
+            if (!native_view_wave_apply_variant(
+                    native_view_phase_fbo(slot, phase), phase)) {
+                gl_renderer_native_midpoint_cancel();
+                break;
+            }
+        }
+    } else {
+        s_native_view_wave_diag.partial_copies++;
+    }
+    if (dst_y == 0 || dst_y == 256) {
+        const int page = dst_y / 256;
+
+        if (s_native_view_wave.recording && s_native_view_wave.ready) {
+            s_native_view_wave_diag.ready_copies_by_page[page]++;
+            s_native_view_wave_diag.wave_valid_by_page[page] = applied != 0;
+        } else {
+            s_native_view_wave_diag.partial_copies_by_page[page]++;
+            s_native_view_wave_diag.wave_valid_by_page[page] = 0;
+        }
+    }
+    s_native_view_wave.recording = 0;
+    s_native_view_wave_authenticated = 0;
+    return 1;
+}
+
 static int native_view_copy_full_width(GLuint target_fbo, int src_y,
                                         int dst_y, int h) {
     const int width = s_native_view_width * s_scale;
@@ -6825,16 +6975,18 @@ static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
         for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot) {
             const int base_x = s_native_view_base[slot];
             int operation_logical_x = 0;
+            int wave_applied;
 
             if (!s_native_view_fbo[slot] || !s_native_view_seeded[slot])
                 continue;
+            wave_applied = native_view_wave_apply_copy(
+                slot, base_x, src_x, src_y, dst_x, dst_y, w, h);
             /* A same-X copy covering the canonical framebuffer is a
              * postprocess step, so replay it across the complete Native view. */
-            if (operation_w == s_native_view_canonical_width &&
+            if (!wave_applied &&
+                operation_w == s_native_view_canonical_width &&
                 operation_x == base_x &&
                 (src_x & (VRAM_W - 1)) == base_x &&
-                !(s_native_view_wave.effect_active &&
-                  src_y == dst_y + 32 && h == 192) &&
                 !s_mask_set && !s_mask_check &&
                 native_view_copy_full_width(
                     s_native_view_fbo[slot], src_y, dst_y, h)) {
@@ -6876,16 +7028,24 @@ static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
                         : surface_x + surface_w;
 
                     if (overlap_x < overlap_end) {
+                        const int copy_width = overlap_end - overlap_x;
                         const int copy_src_x =
                             src_x + operation_logical_x + overlap_x -
                                 destination_x;
                         const int copy_dst_x =
                             s_native_view_offset + surface_logical_x +
                                 overlap_x - surface_x;
+                        const int phase_source_distance =
+                            (copy_src_x - base_x) & (VRAM_W - 1);
+                        const int phase_source_in_view =
+                            phase_source_distance + copy_width <=
+                                s_native_view_canonical_width;
+                        const int phase_src_x = s_native_view_offset +
+                            phase_source_distance;
                         native_view_copy_to_target(
                             s_native_view_fbo[slot], base_x,
                             copy_src_x, src_y, copy_dst_x, dst_y,
-                            overlap_end - overlap_x, h, 0, 0);
+                            copy_width, h, 0, 0);
                         if (s_native_midpoint_diag.frame_open &&
                             !s_native_midpoint_current_pending &&
                             s_native_midpoint_diag.frame_valid) {
@@ -6894,9 +7054,12 @@ static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
                                  ++phase)
                                 native_view_copy_to_target(
                                     native_view_phase_fbo(slot, phase), base_x,
-                                    copy_src_x, src_y, copy_dst_x, dst_y,
-                                    overlap_end - overlap_x, h, 0,
-                                    native_phase_fbo(phase));
+                                    phase_source_in_view
+                                        ? phase_src_x : copy_src_x,
+                                    src_y, copy_dst_x, dst_y,
+                                    copy_width, h, phase_source_in_view,
+                                    phase_source_in_view
+                                        ? 0 : native_phase_fbo(phase));
                             if (!native_midpoint_gl_ok(
                                     GL_NATIVE_MIDPOINT_GL_COPY_VIEW))
                                 gl_renderer_native_midpoint_cancel();
@@ -6925,143 +7088,6 @@ static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
         s_native_midpoint_diag.nonsemantic_copies++;
     }
     gpu_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
-}
-
-static int native_view_wave_present_displacement(
-        const int boundaries[NATIVE_VIEW_WAVE_ROW_TILES + 1], int x) {
-    int wrapped = x % s_native_view_canonical_width;
-    int index;
-    int fraction;
-    int first;
-    int second;
-
-    if (wrapped < 0) wrapped += s_native_view_canonical_width;
-    index = wrapped / 16;
-    fraction = wrapped - index * 16;
-    first = boundaries[index] - index * 16;
-    second = boundaries[index + 1] - (index + 1) * 16;
-    return (first * (16 - fraction) + second * fraction + 8) / 16;
-}
-
-static void native_view_wave_present_row(
-        const NativeViewWavePresentRow *row) {
-    const int scale = s_scale;
-    const int center_right = s_native_view_offset +
-                             s_native_view_canonical_width;
-
-    if (s_native_view_offset > 0) {
-        glScissor(0, row->top * scale, s_native_view_offset * scale,
-                  (row->bottom - row->top) * scale);
-        glClearColor(0.f, 0.f, 0.f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        for (int source_right = s_native_view_offset;
-             source_right > 0; source_right -= 16) {
-            const int source_left = source_right > 16
-                ? source_right - 16 : 0;
-            const int canonical_left = source_left - s_native_view_offset;
-            const int canonical_right = source_right - s_native_view_offset;
-            int destination_left = source_left +
-                native_view_wave_present_displacement(
-                    row->boundaries, canonical_left);
-            int destination_right = source_right +
-                native_view_wave_present_displacement(
-                    row->boundaries, canonical_right);
-
-            if (source_left == 0) destination_left = 0;
-            if (source_right == s_native_view_offset)
-                destination_right = s_native_view_offset;
-
-            if (destination_right > destination_left)
-                p_glBlitFramebuffer(
-                    source_left * scale, row->source_top * scale,
-                    source_right * scale, row->source_bottom * scale,
-                    destination_left * scale, row->top * scale,
-                    destination_right * scale, row->bottom * scale,
-                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        }
-    }
-    if (center_right < s_native_view_width) {
-        glScissor(center_right * scale, row->top * scale,
-                  (s_native_view_width - center_right) * scale,
-                  (row->bottom - row->top) * scale);
-        glClearColor(0.f, 0.f, 0.f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        for (int source_left = center_right;
-             source_left < s_native_view_width; source_left += 16) {
-            const int source_right = source_left + 16 < s_native_view_width
-                ? source_left + 16 : s_native_view_width;
-            const int canonical_left = source_left - s_native_view_offset;
-            const int canonical_right = source_right - s_native_view_offset;
-            int destination_left = source_left +
-                native_view_wave_present_displacement(
-                    row->boundaries, canonical_left);
-            int destination_right = source_right +
-                native_view_wave_present_displacement(
-                    row->boundaries, canonical_right);
-
-            if (source_left == center_right)
-                destination_left = center_right;
-            if (source_right == s_native_view_width)
-                destination_right = s_native_view_width;
-
-            if (destination_right > destination_left)
-                p_glBlitFramebuffer(
-                    source_left * scale, row->source_top * scale,
-                    source_right * scale, row->source_bottom * scale,
-                    destination_left * scale, row->top * scale,
-                    destination_right * scale, row->bottom * scale,
-                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        }
-    }
-}
-
-static GLuint native_view_wave_present_texture(int slot, GLuint source_fbo,
-                                                 int disp_y, int disp_h,
-                                                 unsigned int variant) {
-    const int page = disp_y >= 256 ? 1 : 0;
-    const int width = s_native_view_width * s_scale;
-    const int height = VRAM_H * s_scale;
-
-    if ((!s_native_view_wave.effect_active &&
-         !s_native_midpoint_current_pending) ||
-        slot < 0 || !source_fbo ||
-        variant >= NATIVE_VIEW_WAVE_PRESENT_VARIANTS ||
-        s_native_view_wave.present_slot[variant][page] != slot ||
-        s_native_view_wave.present_row_count[variant][page] <= 0)
-        return 0;
-    if (!s_native_view_wave_present_tex) {
-        s_native_view_wave_present_tex = make_tex(
-            GL_RGBA8, width, height, GL_RGBA, GL_UNSIGNED_BYTE);
-        if (!s_native_view_wave_present_tex ||
-            !make_fbo(&s_native_view_wave_present_fbo,
-                      s_native_view_wave_present_tex, 0)) {
-            if (s_native_view_wave_present_tex)
-                glDeleteTextures(1, &s_native_view_wave_present_tex);
-            s_native_view_wave_present_tex = 0;
-            s_native_view_wave_present_fbo = 0;
-            return 0;
-        }
-    }
-
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source_fbo);
-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,
-                        s_native_view_wave_present_fbo);
-    glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
-                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glEnable(GL_SCISSOR_TEST);
-    for (int index = 0;
-         index < s_native_view_wave.present_row_count[variant][page]; ++index) {
-        const NativeViewWavePresentRow *row =
-            &s_native_view_wave.present_rows[variant][page][index];
-
-        if (row->bottom > disp_y && row->top < disp_y + disp_h)
-            native_view_wave_present_row(row);
-    }
-    glDisable(GL_SCISSOR_TEST);
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
-    return s_native_view_wave_present_tex;
 }
 
 /* Native presentation wrappers. The frame data still came through the
@@ -7293,9 +7319,9 @@ int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
                 disp_x, disp_y, w, h, linear, ww, wh, lx, ly, lw, lh,
                 GL_PRES_NATIVE_CURRENT, 0u, 0u,
                 s_pending_canonical_geometry_hash
-                    [NATIVE_VIEW_WAVE_CURRENT_VARIANT],
+                    [NATIVE_CURRENT_VARIANT],
                 s_pending_canonical_geometry_count
-                    [NATIVE_VIEW_WAVE_CURRENT_VARIANT] != 0u,
+                    [NATIVE_CURRENT_VARIANT] != 0u,
                 emitted + 1u == subframes);
             last_path = GL_PRES_NATIVE_CURRENT;
             ++emitted;
@@ -7329,8 +7355,8 @@ int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
                 source_x, source_y, w, h,
                 disp_x, disp_y, w, h, linear, ww, wh, lx, ly, lw, lh,
                 GL_PRES_NATIVE_CURRENT, 0u, 0u,
-                s_canonical_geometry_hash[NATIVE_VIEW_WAVE_CURRENT_VARIANT],
-                s_canonical_geometry_count[NATIVE_VIEW_WAVE_CURRENT_VARIANT] != 0u,
+                s_canonical_geometry_hash[NATIVE_CURRENT_VARIANT],
+                s_canonical_geometry_count[NATIVE_CURRENT_VARIANT] != 0u,
                 subframe == 0u);
         }
     }
@@ -7374,14 +7400,19 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
     }
     if (!s_ctx || !s_raster_ok || !s_native_view_enabled) return 0;
     if (!glb_transaction_prepare_original_present()) return 1;
-    if (native_view_wave_flush_pending() != GPU_RENDER_TRANSACTION_OK) {
-        gl_renderer_native_midpoint_cancel();
-        return 0;
-    }
     slot = native_view_prepare_surface(disp_x);
     if (slot < 0) {
         gl_renderer_native_midpoint_cancel();
         return 0;
+    }
+    s_native_view_wave_diag.presents++;
+    s_native_view_wave_diag.last_present_y = disp_y;
+    if (disp_y == 0 || disp_y == 256) {
+        const int page = disp_y / 256;
+
+        s_native_view_wave_diag.presents_by_page[page]++;
+        if (s_native_view_wave_diag.wave_valid_by_page[page])
+            s_native_view_wave_diag.presents_with_wave_by_page[page]++;
     }
     flush_flat_batch();
     flush_tex_batch();
@@ -7440,21 +7471,12 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
         next_pending_phase = s_native_interpolation_phase_count;
         for (unsigned int phase = s_native_midpoint_pending_phase;
              phase < s_native_interpolation_phase_count; ++phase) {
-            GLuint present_tex;
-            GLuint present_fbo;
-
             native_present_wait_next(period, frequency);
-            present_tex = native_view_wave_present_texture(
-                source_slot, native_view_phase_fbo(source_slot, phase),
-                source_y, disp_h,
-                phase);
-            present_fbo = present_tex ? s_native_view_wave_present_fbo
-                                      : native_view_phase_fbo(source_slot, phase);
-            if (!present_tex)
-                present_tex = native_view_phase_tex(source_slot, phase);
             native_present_swap_texture(
-                present_tex, s_native_view_width, VRAM_H,
-                present_fbo, native_view_phase_fbo(source_slot, phase),
+                native_view_phase_tex(source_slot, phase),
+                s_native_view_width, VRAM_H,
+                native_view_phase_fbo(source_slot, phase),
+                native_view_phase_fbo(source_slot, phase),
                 0, source_y, s_native_view_width, disp_h,
                 disp_x, disp_y, s_native_view_canonical_width, disp_h, linear,
                 ww, wh, lx, ly, lw, lh, GL_PRES_NATIVE_MIDPOINT,
@@ -7473,9 +7495,9 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
                 disp_x, disp_y, s_native_view_canonical_width, disp_h, linear,
                 ww, wh, lx, ly, lw, lh, GL_PRES_NATIVE_CURRENT, 0u, 0u,
                 s_pending_native_view_geometry_hash
-                    [NATIVE_VIEW_WAVE_CURRENT_VARIANT],
+                    [NATIVE_CURRENT_VARIANT],
                 s_pending_native_view_geometry_count
-                    [NATIVE_VIEW_WAVE_CURRENT_VARIANT] != 0u,
+                    [NATIVE_CURRENT_VARIANT] != 0u,
                 emitted + 1u == subframes);
             last_path = GL_PRES_NATIVE_CURRENT;
             ++emitted;
@@ -7485,21 +7507,12 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
             s_native_interpolation_denominator / 2u;
 
         for (unsigned int phase = 0u; phase < first_half; ++phase) {
-            GLuint present_tex;
-            GLuint present_fbo;
-
             native_present_wait_next(period, frequency);
-            present_tex = native_view_wave_present_texture(
-                source_slot, native_view_phase_fbo(source_slot, phase),
-                source_y, disp_h,
-                phase);
-            present_fbo = present_tex ? s_native_view_wave_present_fbo
-                                      : native_view_phase_fbo(source_slot, phase);
-            if (!present_tex)
-                present_tex = native_view_phase_tex(source_slot, phase);
             native_present_swap_texture(
-                present_tex, s_native_view_width, VRAM_H,
-                present_fbo, native_view_phase_fbo(source_slot, phase),
+                native_view_phase_tex(source_slot, phase),
+                s_native_view_width, VRAM_H,
+                native_view_phase_fbo(source_slot, phase),
+                native_view_phase_fbo(source_slot, phase),
                 0, source_y, s_native_view_width, disp_h,
                 disp_x, disp_y, s_native_view_canonical_width, disp_h, linear,
                 ww, wh, lx, ly, lw, lh, GL_PRES_NATIVE_MIDPOINT,
@@ -7510,25 +7523,19 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
         last_path = GL_PRES_NATIVE_MIDPOINT;
         next_pending_phase = first_half;
     } else {
-        GLuint present_tex = native_view_wave_present_texture(
-            slot, s_native_view_fbo[slot], source_y, disp_h,
-            NATIVE_VIEW_WAVE_CURRENT_VARIANT);
-        GLuint present_fbo = present_tex ? s_native_view_wave_present_fbo
-                                         : s_native_view_fbo[slot];
         const unsigned int subframes = s_native_midpoint_diag.suspended
             ? 1u : s_native_interpolation_denominator / 2u;
 
-        if (!present_tex) present_tex = s_native_view_tex[slot];
         for (unsigned int subframe = 0u; subframe < subframes; ++subframe) {
             native_present_wait_next(period, frequency);
             native_present_swap_texture(
-                present_tex, s_native_view_width, VRAM_H,
-                present_fbo, s_native_view_fbo[slot],
+                s_native_view_tex[slot], s_native_view_width, VRAM_H,
+                s_native_view_fbo[slot], s_native_view_fbo[slot],
                 0, source_y, s_native_view_width, disp_h,
                 disp_x, disp_y, s_native_view_canonical_width, disp_h, linear,
                 ww, wh, lx, ly, lw, lh, GL_PRES_NATIVE_CURRENT, 0u, 0u,
-                s_native_view_geometry_hash[NATIVE_VIEW_WAVE_CURRENT_VARIANT],
-                s_native_view_geometry_count[NATIVE_VIEW_WAVE_CURRENT_VARIANT] != 0u,
+                s_native_view_geometry_hash[NATIVE_CURRENT_VARIANT],
+                s_native_view_geometry_count[NATIVE_CURRENT_VARIANT] != 0u,
                 subframe == 0u);
         }
     }
@@ -7547,7 +7554,6 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
         had_work ? current_x : disp_x, had_work ? current_y : disp_y,
         disp_y, s_native_view_width, disp_h, 1,
         next_pending_phase);
-    s_native_view_wave.effect_active = 0;
     /* Preserve the completed Native surface for this swap, then rebuild before
      * collecting the next source frame at the requested scale. */
     gl_maybe_apply_scale();
@@ -8258,7 +8264,14 @@ static GpuRenderTransactionStatus glb_validate_semantic(
     const int midpoint_pass = s_midpoint_pass_fbo != 0;
 
     if (!semantic) return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
-    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE)
+    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE ||
+        semantic->native_view_effect >
+            GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID ||
+        (semantic->native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_NONE &&
+         semantic->native_view_effect_index != 0u) ||
+        (semantic->native_view_effect ==
+             GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
+         semantic->native_view_effect_index >= NATIVE_VIEW_WAVE_PACKET_COUNT))
         return GPU_RENDER_TRANSACTION_VALIDATION_FAILED;
     material = &semantic->material;
     switch (material->texture_depth) {
@@ -8952,16 +8965,19 @@ static int native_view_wave_tile(
         top_left->v != top_right->v || bottom_left->v != bottom_right->v)
         return 0;
 
-    const GpuRenderSemanticVertex *vertices[4] = {
-        top_left, top_right, bottom_left, bottom_right
-    };
-    for (int index = 0; index < 4; ++index) {
-        if (vertices[index]->native_view_position ||
-            vertices[index]->r != 128u || vertices[index]->g != 128u ||
-            vertices[index]->b != 128u || vertices[index]->x % unit != 0 ||
-            vertices[index]->y % unit != 0 || vertices[index]->u % unit != 0 ||
-            vertices[index]->v % unit != 0)
-            return 0;
+    {
+        const GpuRenderSemanticVertex *vertices[4] = {
+            top_left, top_right, bottom_left, bottom_right
+        };
+
+        for (int index = 0; index < 4; ++index) {
+            if (vertices[index]->native_view_position ||
+                vertices[index]->r != 128u || vertices[index]->g != 128u ||
+                vertices[index]->b != 128u || vertices[index]->x % unit != 0 ||
+                vertices[index]->y % unit != 0 || vertices[index]->u % unit != 0 ||
+                vertices[index]->v % unit != 0)
+                return 0;
+        }
     }
 
     *left = top_left->x / unit + semantic->material.draw_offset_x - base_x;
@@ -8971,139 +8987,421 @@ static int native_view_wave_tile(
     return 1;
 }
 
-static const GpuRenderSemantic *native_view_wave_variant_row(
-        unsigned int variant) {
-    if (variant == NATIVE_VIEW_WAVE_CURRENT_VARIANT)
-        return s_native_view_wave.row;
-    if (variant == 0u) return s_native_view_wave.midpoint_row;
-    return s_native_view_wave.extra_phase_row[variant - 1u];
+static int32_t native_view_wave_vertex_x(
+        const GpuRenderSemanticVertex *vertex) {
+    return vertex->native_view_position ? vertex->native_view_x : vertex->x;
 }
 
-static int native_view_wave_record_present_row(unsigned int variant) {
-    const GpuRenderSemantic *variant_row =
-        native_view_wave_variant_row(variant);
-    const GpuRenderSemantic *left_tile =
-        &variant_row[NATIVE_VIEW_WAVE_ROW_TILES - 1];
-    const GpuRenderSemanticVertex *top_left =
-        &left_tile->triangles[0].vertices[0];
-    const int texture_x = left_tile->material.texture_page_x * 64;
-    const int texture_y = left_tile->material.texture_page_y * 256;
-    const int u = top_left->u / INT32_C(65536);
-    const int v = top_left->v / INT32_C(65536);
-    const int draw_top = left_tile->material.draw_area_top;
-    const int framebuffer_height =
-        left_tile->material.draw_area_bottom - draw_top + 1;
-    const int page = draw_top >= 256 ? 1 : 0;
-    const int canonical_source =
-        texture_x + u >= s_native_view_wave.base_x &&
-        texture_x + u < s_native_view_wave.base_x +
-                            s_native_view_canonical_width;
-    NativeViewWavePresentRow *present_row;
+static int32_t native_view_wave_vertex_y(
+        const GpuRenderSemanticVertex *vertex) {
+    return vertex->native_view_position ? vertex->native_view_y : vertex->y;
+}
+
+static int native_view_wave_fixed_round(int64_t value) {
+    return value >= 0
+        ? (int)((value + INT64_C(32768)) / INT64_C(65536))
+        : -(int)((-value + INT64_C(32768)) / INT64_C(65536));
+}
+
+static int native_view_wave_phase_tile(
+        const GpuRenderSemantic *semantic, int base_x,
+        int *left, int *right, int *top, int *bottom) {
+    const int32_t unit = INT32_C(65536);
+    const GpuRenderSemanticVertex *top_left;
+    const GpuRenderSemanticVertex *top_right;
+    const GpuRenderSemanticVertex *bottom_left;
+    const GpuRenderSemanticVertex *bottom_right;
+    int32_t top_left_x, top_left_y;
+    int32_t top_right_x, top_right_y;
+    int32_t bottom_left_x, bottom_left_y;
+    int32_t bottom_right_x, bottom_right_y;
+
+    if (!semantic || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count != 2u || !semantic->material.textured ||
+        semantic->material.raw_texture || semantic->material.semi_transparent ||
+        semantic->material.texture_depth != GPU_RENDER_TEXTURE_15_BIT ||
+        semantic->material.shading != GPU_RENDER_SHADING_FLAT ||
+        semantic->material.texture_window_mask_x != 0u ||
+        semantic->material.texture_window_mask_y != 0u ||
+        semantic->material.draw_area_left > base_x ||
+        semantic->material.draw_area_right <
+            base_x + s_native_view_canonical_width - 1)
+        return 0;
+
+    top_left = &semantic->triangles[0].vertices[0];
+    top_right = &semantic->triangles[0].vertices[1];
+    bottom_left = &semantic->triangles[0].vertices[2];
+    bottom_right = &semantic->triangles[1].vertices[2];
+    top_left_x = native_view_wave_vertex_x(top_left);
+    top_left_y = native_view_wave_vertex_y(top_left);
+    top_right_x = native_view_wave_vertex_x(top_right);
+    top_right_y = native_view_wave_vertex_y(top_right);
+    bottom_left_x = native_view_wave_vertex_x(bottom_left);
+    bottom_left_y = native_view_wave_vertex_y(bottom_left);
+    bottom_right_x = native_view_wave_vertex_x(bottom_right);
+    bottom_right_y = native_view_wave_vertex_y(bottom_right);
+    if (native_view_wave_vertex_x(&semantic->triangles[1].vertices[0]) !=
+            bottom_left_x ||
+        native_view_wave_vertex_y(&semantic->triangles[1].vertices[0]) !=
+            bottom_left_y ||
+        native_view_wave_vertex_x(&semantic->triangles[1].vertices[1]) !=
+            top_right_x ||
+        native_view_wave_vertex_y(&semantic->triangles[1].vertices[1]) !=
+            top_right_y ||
+        top_right_x - top_left_x < 8 * unit ||
+        top_right_x - top_left_x > 24 * unit ||
+        bottom_right_x - bottom_left_x != top_right_x - top_left_x ||
+        top_left_x != bottom_left_x || top_right_x != bottom_right_x ||
+        top_left_y != top_right_y || bottom_left_y != bottom_right_y ||
+        top_right->u - top_left->u != 16 * unit ||
+        bottom_right->u - bottom_left->u != 16 * unit ||
+        top_left->u != bottom_left->u || top_right->u != bottom_right->u ||
+        bottom_left->v - top_left->v != 16 * unit ||
+        bottom_right->v - top_right->v != 16 * unit ||
+        top_left->v != top_right->v || bottom_left->v != bottom_right->v)
+        return 0;
+
+    {
+        const GpuRenderSemanticVertex *vertices[4] = {
+            top_left, top_right, bottom_left, bottom_right
+        };
+
+        for (int index = 0; index < 4; ++index) {
+            if (vertices[index]->r != 128u || vertices[index]->g != 128u ||
+                vertices[index]->b != 128u || vertices[index]->u % unit != 0 ||
+                vertices[index]->v % unit != 0)
+                return 0;
+        }
+    }
+
+    *left = native_view_wave_fixed_round(
+        (int64_t)top_left_x +
+        (int64_t)semantic->material.draw_offset_x * unit) - base_x;
+    *right = native_view_wave_fixed_round(
+        (int64_t)top_right_x +
+        (int64_t)semantic->material.draw_offset_x * unit) - base_x;
+    *top = native_view_wave_fixed_round(
+        (int64_t)top_left_y +
+        (int64_t)semantic->material.draw_offset_y * unit);
+    *bottom = native_view_wave_fixed_round(
+        (int64_t)bottom_left_y +
+        (int64_t)semantic->material.draw_offset_y * unit);
+    return 1;
+}
+
+static int native_view_wave_capture_tile(
+        const GpuRenderSemantic *semantic, int base_x,
+        NativeViewWaveTile *captured, int phase) {
+    const GpuRenderSemanticVertex *top_left;
+    int left, right, top, bottom;
+
+    if (!(phase
+            ? native_view_wave_phase_tile(
+                semantic, base_x, &left, &right, &top, &bottom)
+            : native_view_wave_tile(
+                semantic, base_x, &left, &right, &top, &bottom)))
+        return 0;
+    top_left = &semantic->triangles[0].vertices[0];
+    *captured = (NativeViewWaveTile){
+        .left = left,
+        .right = right,
+        .top = top,
+        .bottom = bottom,
+        .texture_x = semantic->material.texture_page_x * 64,
+        .texture_y = semantic->material.texture_page_y * 256,
+        .u = top_left->u / INT32_C(65536),
+        .v = top_left->v / INT32_C(65536),
+        .draw_top = semantic->material.draw_area_top,
+        .framebuffer_height = semantic->material.draw_area_bottom -
+                              semantic->material.draw_area_top + 1,
+    };
+    return 1;
+}
+
+typedef struct NativeViewWaveGroup {
+    int count;
+    int packet[NATIVE_VIEW_WAVE_COLUMNS];
+} NativeViewWaveGroup;
+
+static void native_view_wave_sort_group(
+        const NativeViewWaveTile tiles[NATIVE_VIEW_WAVE_PACKET_COUNT],
+        NativeViewWaveGroup *group) {
+    for (int index = 1; index < group->count; ++index) {
+        const int packet = group->packet[index];
+        int insertion = index;
+
+        while (insertion > 0 &&
+               tiles[group->packet[insertion - 1]].left > tiles[packet].left) {
+            group->packet[insertion] = group->packet[insertion - 1];
+            --insertion;
+        }
+        group->packet[insertion] = packet;
+    }
+}
+
+static int native_view_wave_group_is_canonical(
+        const NativeViewWaveTile tiles[NATIVE_VIEW_WAVE_PACKET_COUNT],
+        const NativeViewWaveGroup *group) {
+    const NativeViewWaveTile *left_tile = &tiles[group->packet[0]];
+
+    return left_tile->texture_x + left_tile->u >= s_native_view_wave.base_x &&
+        left_tile->texture_x + left_tile->u < s_native_view_wave.base_x +
+                                              s_native_view_canonical_width;
+}
+
+static int native_view_wave_clip_vertical(
+        int *source_top, int *source_bottom,
+        int *destination_top, int *destination_bottom) {
+    const int source_height = *source_bottom - *source_top;
+    const int destination_height = *destination_bottom - *destination_top;
+
+    if (source_height <= 0 || destination_height <= 0) return 0;
+    if (*destination_top < 0) {
+        const int clipped = -*destination_top;
+
+        *source_top +=
+            (clipped * source_height + destination_height - 1) /
+                destination_height;
+        *destination_top = 0;
+    }
+    if (*destination_bottom > VRAM_H) {
+        const int clipped = *destination_bottom - VRAM_H;
+
+        *source_bottom -=
+            (clipped * source_height + destination_height - 1) /
+                destination_height;
+        *destination_bottom = VRAM_H;
+    }
+    return *source_top >= 0 && *source_bottom <= VRAM_H &&
+        *source_bottom > *source_top &&
+        *destination_bottom > *destination_top;
+}
+
+static int native_view_wave_append_group(
+        unsigned int variant,
+        const NativeViewWaveTile tiles[NATIVE_VIEW_WAVE_PACKET_COUNT],
+        const NativeViewWaveGroup *group, int canonical_source) {
+    const NativeViewWaveTile *left_tile = &tiles[group->packet[0]];
+    const NativeViewWaveTile *left_destination = NULL;
+    const NativeViewWaveTile *right_destination = NULL;
+    const int page = left_tile->draw_top >= 256 ? 1 : 0;
+    NativeViewWaveRow *present_row;
     int source_top;
     int source_bottom;
-    int top = s_native_view_wave.top;
-    int bottom = s_native_view_wave.bottom;
+    int left_top;
+    int left_bottom;
+    int right_top;
+    int right_bottom;
+    int left_source_top;
+    int left_source_bottom;
+    int right_source_top;
+    int right_source_bottom;
 
-    if (!s_native_view_wave.effect_active ||
-        s_native_view_wave.present_slot[variant][page] !=
-            s_native_view_wave.slot) {
-        s_native_view_wave.present_row_count[variant][page] = 0;
-        s_native_view_wave.present_slot[variant][page] =
-            s_native_view_wave.slot;
-        s_native_view_wave.vertical_anchor_source[variant][page] = -1;
-        s_native_view_wave.packed_vertical_offset[variant][page] = 0;
+    if (variant >= NATIVE_VIEW_WAVE_VARIANTS ||
+        s_native_view_wave.present_row_count[variant] >= NATIVE_VIEW_WAVE_ROWS)
+        return 0;
+    for (int column = 0; column < NATIVE_VIEW_WAVE_COLUMNS; ++column) {
+        const NativeViewWaveTile *tile = &tiles[group->packet[column]];
+
+        if (tile->bottom > tile->top) {
+            right_destination = tile;
+            break;
+        }
     }
+    for (int column = NATIVE_VIEW_WAVE_COLUMNS - 1; column >= 0; --column) {
+        const NativeViewWaveTile *tile = &tiles[group->packet[column]];
 
-    for (int column = 0; column < NATIVE_VIEW_WAVE_ROW_TILES; ++column) {
-        const GpuRenderSemantic *tile =
-            &variant_row[NATIVE_VIEW_WAVE_ROW_TILES - 1 - column];
-        int left, right, tile_top, tile_bottom;
-
-        if (!native_view_wave_tile(tile, s_native_view_wave.base_x,
-                                   &left, &right, &tile_top, &tile_bottom) ||
-            tile_top != s_native_view_wave.top ||
-            tile_bottom != s_native_view_wave.bottom)
-            return 0;
+        if (tile->bottom > tile->top) {
+            left_destination = tile;
+            break;
+        }
     }
+    if (left_destination == NULL || right_destination == NULL) return 1;
+    left_top = left_destination->top;
+    left_bottom = left_destination->bottom;
+    right_top = right_destination->top;
+    right_bottom = right_destination->bottom;
     if (canonical_source) {
-        source_top = texture_y + v;
+        source_top = left_tile->texture_y + left_tile->v;
         source_bottom = source_top + 16;
-        top -= 32;
-        bottom -= 32;
+        left_top -= 32;
+        left_bottom -= 32;
+        right_top -= 32;
+        right_bottom -= 32;
         if (source_top >
             s_native_view_wave.vertical_anchor_source[variant][page]) {
             s_native_view_wave.vertical_anchor_source[variant][page] =
                 source_top;
-            s_native_view_wave.packed_vertical_offset[variant][page] =
-                top - source_top;
+            s_native_view_wave.packed_vertical_offset[variant][page][0] =
+                left_top - source_top;
+            s_native_view_wave.packed_vertical_offset[variant][page][1] =
+                right_top - source_top;
         }
     } else {
         const int packed_row_span = 5 * 16;
 
-        if (v < 0 || v > 2 * packed_row_span || v % packed_row_span != 0)
+        if (left_tile->v < 0 || left_tile->v > 2 * packed_row_span ||
+            left_tile->v % packed_row_span != 0)
             return 0;
-        source_top = draw_top + framebuffer_height - 3 * 16 +
-                     (v / packed_row_span) * 16;
+        source_top = left_tile->draw_top + left_tile->framebuffer_height -
+                     3 * 16 + (left_tile->v / packed_row_span) * 16;
         source_bottom = source_top + 16;
         if (s_native_view_wave.vertical_anchor_source[variant][page] >= 0) {
-            top = source_top +
-                  s_native_view_wave.packed_vertical_offset[variant][page];
-            bottom = source_bottom +
-                     s_native_view_wave.packed_vertical_offset[variant][page];
+            left_top = source_top +
+                s_native_view_wave.packed_vertical_offset[variant][page][0];
+            left_bottom = source_bottom +
+                s_native_view_wave.packed_vertical_offset[variant][page][0];
+            right_top = source_top +
+                s_native_view_wave.packed_vertical_offset[variant][page][1];
+            right_bottom = source_bottom +
+                s_native_view_wave.packed_vertical_offset[variant][page][1];
         }
     }
-    if (source_top < 0 || source_bottom > VRAM_H || top < 0 ||
-        bottom > VRAM_H || source_bottom <= source_top || bottom <= top)
+    if (source_top < 0 || source_bottom > VRAM_H ||
+        source_bottom <= source_top)
+        return 0;
+    left_source_top = source_top;
+    left_source_bottom = source_bottom;
+    right_source_top = source_top;
+    right_source_bottom = source_bottom;
+    if (!native_view_wave_clip_vertical(
+            &left_source_top, &left_source_bottom,
+            &left_top, &left_bottom) ||
+        !native_view_wave_clip_vertical(
+            &right_source_top, &right_source_bottom,
+            &right_top, &right_bottom))
         return 0;
 
-    if (s_native_view_wave.present_row_count[variant][page] >=
-        NATIVE_VIEW_WAVE_PRESENT_ROWS)
-        return 0;
-    present_row = &s_native_view_wave.present_rows[variant][page]
-        [s_native_view_wave.present_row_count[variant][page]++];
-    present_row->source_top = source_top;
-    present_row->source_bottom = source_bottom;
-    present_row->top = top;
-    present_row->bottom = bottom;
-    for (int column = 0; column < NATIVE_VIEW_WAVE_ROW_TILES; ++column) {
-        const GpuRenderSemantic *tile =
-            &variant_row[NATIVE_VIEW_WAVE_ROW_TILES - 1 - column];
-        int left, right, tile_top, tile_bottom;
+    present_row = &s_native_view_wave.rows[variant]
+        [s_native_view_wave.present_row_count[variant]++];
+    present_row->left_source_top = left_source_top;
+    present_row->left_source_bottom = left_source_bottom;
+    present_row->right_source_top = right_source_top;
+    present_row->right_source_bottom = right_source_bottom;
+    present_row->left_top = left_top;
+    present_row->left_bottom = left_bottom;
+    present_row->right_top = right_top;
+    present_row->right_bottom = right_bottom;
+    for (int column = 0; column < NATIVE_VIEW_WAVE_COLUMNS; ++column) {
+        const NativeViewWaveTile *tile = &tiles[group->packet[column]];
 
-        (void)native_view_wave_tile(tile, s_native_view_wave.base_x,
-                                    &left, &right, &tile_top, &tile_bottom);
-        if (column == 0) present_row->boundaries[0] = left;
-        present_row->boundaries[column + 1] = right;
+        if (column == 0) present_row->boundaries[0] = tile->left;
+        present_row->boundaries[column + 1] = tile->right;
     }
     return 1;
 }
 
-static GpuRenderTransactionStatus native_view_wave_flush_pending(void) {
-    GpuRenderTransactionStatus status = GPU_RENDER_TRANSACTION_OK;
+static int native_view_wave_build_variant(unsigned int variant) {
+    NativeViewWaveGroup groups[NATIVE_VIEW_WAVE_ROWS] = {0};
+    const NativeViewWaveTile *tiles = s_native_view_wave.tiles[variant];
 
-    if (s_native_host_queue_midpoint_rendered) {
-        status = native_host_queue_flush();
-        if (status != GPU_RENDER_TRANSACTION_OK) return status;
+    for (int group = 0; group < NATIVE_VIEW_WAVE_ROWS; ++group) {
+        for (int column = 0; column < NATIVE_VIEW_WAVE_COLUMNS; ++column)
+            groups[group].packet[groups[group].count++] =
+                group * NATIVE_VIEW_WAVE_COLUMNS + column;
+        native_view_wave_sort_group(tiles, &groups[group]);
     }
-    for (int index = 0; index < s_native_view_wave.row_count; ++index) {
-        GpuRenderSemantic phases[NATIVE_INTERPOLATION_MAX_PHASES];
 
-        phases[0] = s_native_view_wave.midpoint_row[index];
-        for (unsigned int phase = 1u;
-             phase < s_native_interpolation_phase_count; ++phase)
-            phases[phase] =
-                s_native_view_wave.extra_phase_row[phase - 1u][index];
-        status = native_host_queue_push(
-            &s_native_view_wave.row[index],
-            s_native_midpoint_diag.frame_open &&
-                    !s_native_midpoint_current_pending &&
-                    s_native_midpoint_diag.frame_valid
-                ? phases : NULL,
-            s_native_view_wave.base_x, s_native_view_wave.slot);
-        if (status != GPU_RENDER_TRANSACTION_OK) break;
+    /* Canonical rows establish each page's source-to-destination offset. The
+     * three packed rows can then be placed independently of linked-list order. */
+    for (int source_kind = 0; source_kind < 2; ++source_kind) {
+        for (int group = 0; group < NATIVE_VIEW_WAVE_ROWS; ++group) {
+            const int canonical =
+                native_view_wave_group_is_canonical(tiles, &groups[group]);
+
+            if (canonical != (source_kind == 0))
+                continue;
+            if (!native_view_wave_append_group(
+                    variant, tiles, &groups[group], canonical))
+                return 0;
+        }
     }
-    s_native_view_wave.row_count = 0;
-    return status;
+    return s_native_view_wave.present_row_count[variant] > 0;
+}
+
+static void native_view_wave_record(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderSemantic *phase_semantics, int base_x, int slot) {
+    const int phase_valid = phase_semantics != NULL;
+    uint16_t packet;
+
+    if (semantic == NULL || semantic->native_view_effect !=
+            GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID)
+        return;
+    s_native_view_wave_authenticated = 1;
+    s_native_view_wave_authenticated_base_x = base_x;
+    s_native_view_wave_authenticated_slot = slot;
+    packet = semantic->native_view_effect_index;
+    if (!s_native_view_wave.recording || s_native_view_wave.ready) {
+        native_view_wave_reset();
+        s_native_view_wave_diag.starts++;
+        s_native_view_wave.recording = 1;
+        s_native_view_wave.base_x = base_x;
+        s_native_view_wave.slot = slot;
+    }
+    if (s_native_view_wave.base_x != base_x ||
+        s_native_view_wave.slot != slot) {
+        s_native_view_wave_diag.target_resets++;
+        native_view_wave_reset();
+        return;
+    }
+    if (packet >= NATIVE_VIEW_WAVE_PACKET_COUNT ||
+        s_native_view_wave.tile_seen[packet] ||
+        !native_view_wave_capture_tile(
+            semantic, base_x,
+            &s_native_view_wave.tiles[NATIVE_CURRENT_VARIANT]
+                                     [packet], 0)) {
+        s_native_view_wave_diag.invalid_row_resets++;
+        native_view_wave_reset();
+        return;
+    }
+    s_native_view_wave_diag.semantics++;
+    for (unsigned int phase = 0u;
+         phase < s_native_interpolation_phase_count; ++phase) {
+        const GpuRenderSemantic *phase_semantic =
+            phase_valid ? &phase_semantics[phase] : semantic;
+
+        if (!native_view_wave_capture_tile(
+                phase_semantic, base_x,
+                &s_native_view_wave.tiles[phase]
+                                         [packet], 1)) {
+            s_native_view_wave_diag.invalid_row_resets++;
+            native_view_wave_reset();
+            return;
+        }
+    }
+    s_native_view_wave.tile_seen[packet] = 1u;
+    ++s_native_view_wave.packet_count;
+    if (s_native_view_wave.packet_count < NATIVE_VIEW_WAVE_PACKET_COUNT) return;
+
+    for (unsigned int phase = 0u;
+         phase < s_native_interpolation_phase_count; ++phase) {
+        if (!native_view_wave_build_variant(phase)) {
+            s_native_view_wave_diag.invalid_row_resets++;
+            native_view_wave_reset();
+            return;
+        }
+    }
+    if (!native_view_wave_build_variant(NATIVE_CURRENT_VARIANT)) {
+        s_native_view_wave_diag.invalid_row_resets++;
+        native_view_wave_reset();
+        return;
+    }
+    s_native_view_wave.ready = 1;
+    s_native_view_wave_diag.completed++;
+}
+
+void gl_renderer_native_wave_diag(
+        GlRendererNativeWaveDiagnostics *out_diagnostics) {
+    if (out_diagnostics == NULL) return;
+    *out_diagnostics = s_native_view_wave_diag;
+    out_diagnostics->current_packet_count = s_native_view_wave.packet_count;
+    out_diagnostics->current_row_count =
+        s_native_view_wave.packet_count / NATIVE_VIEW_WAVE_COLUMNS;
+    out_diagnostics->current_base_x = s_native_view_wave.base_x;
+    out_diagnostics->current_slot = s_native_view_wave.slot;
+    out_diagnostics->current_recording = s_native_view_wave.recording;
+    out_diagnostics->current_ready = s_native_view_wave.ready;
 }
 
 static uint64_t native_view_geometry_mix(uint64_t hash, uint64_t value) {
@@ -9121,6 +9419,8 @@ static uint64_t native_view_geometry_semantic_hash(
     hash = native_view_geometry_mix(hash, (uint64_t)(value))
     MIX_GEOMETRY(semantic->topology);
     MIX_GEOMETRY(semantic->screen_space_2d);
+    MIX_GEOMETRY(semantic->native_view_effect);
+    MIX_GEOMETRY(semantic->native_view_effect_index);
     MIX_GEOMETRY(semantic->triangle_count);
     MIX_GEOMETRY(semantic->line_count);
     MIX_GEOMETRY(material->draw_offset_x);
@@ -9667,10 +9967,7 @@ static GpuRenderTransactionStatus native_host_queue_prepare_present(
 }
 
 static GpuRenderTransactionStatus native_host_pending_flush(void) {
-    GpuRenderTransactionStatus status = native_view_wave_flush_pending();
-
-    return status == GPU_RENDER_TRANSACTION_OK
-        ? native_host_queue_flush() : status;
+    return native_host_queue_flush();
 }
 
 static GpuRenderTransactionStatus native_host_pending_flush_reason(
@@ -9971,92 +10268,6 @@ size_t gl_renderer_semantic_producer_items(
     return emitted;
 }
 
-static int native_view_wave_begin_row(
-        const GpuRenderSemantic *semantic,
-        const GpuRenderSemantic *phase_semantics, int base_x, int slot,
-        int left, int right, int top, int bottom) {
-    if (right != s_native_view_canonical_width || left < 0) return 0;
-    s_native_view_wave.row_count = 1;
-    s_native_view_wave.row[0] = *semantic;
-    s_native_view_wave.midpoint_row[0] = phase_semantics != NULL
-        ? phase_semantics[0] : *semantic;
-    for (unsigned int phase = 1u;
-         phase < s_native_interpolation_phase_count; ++phase)
-        s_native_view_wave.extra_phase_row[phase - 1u][0] =
-            phase_semantics != NULL ? phase_semantics[phase] : *semantic;
-    s_native_view_wave.base_x = base_x;
-    s_native_view_wave.slot = slot;
-    s_native_view_wave.top = top;
-    s_native_view_wave.bottom = bottom;
-    s_native_view_wave.previous_left = left;
-    return 1;
-}
-
-static int native_view_wave_consume(
-        const GpuRenderSemantic *semantic,
-        const GpuRenderSemantic *phase_semantics, int base_x, int slot,
-        GpuRenderTransactionStatus *out_status) {
-    int left, right, top, bottom;
-
-    if (!native_view_wave_tile(
-        semantic, base_x, &left, &right, &top, &bottom)) {
-        *out_status = native_view_wave_flush_pending();
-        s_native_view_wave.effect_active = 0;
-        return 0;
-    }
-    if (s_native_view_wave.row_count == 0)
-        return native_view_wave_begin_row(
-            semantic, phase_semantics, base_x, slot,
-            left, right, top, bottom);
-    if (s_native_view_wave.base_x != base_x ||
-        s_native_view_wave.slot != slot ||
-        s_native_view_wave.top != top ||
-        s_native_view_wave.bottom != bottom ||
-        right < s_native_view_wave.previous_left - 1 ||
-        right > s_native_view_wave.previous_left + 1 ||
-        s_native_view_wave.row_count >= NATIVE_VIEW_WAVE_ROW_TILES) {
-        *out_status = native_view_wave_flush_pending();
-        if (*out_status != GPU_RENDER_TRANSACTION_OK) return 1;
-        return native_view_wave_begin_row(
-            semantic, phase_semantics, base_x, slot,
-            left, right, top, bottom);
-    }
-
-    s_native_view_wave.row[s_native_view_wave.row_count] = *semantic;
-    s_native_view_wave.midpoint_row[s_native_view_wave.row_count] =
-        phase_semantics != NULL ? phase_semantics[0] : *semantic;
-    for (unsigned int phase = 1u;
-         phase < s_native_interpolation_phase_count; ++phase)
-        s_native_view_wave.extra_phase_row[phase - 1u]
-                                          [s_native_view_wave.row_count] =
-            phase_semantics != NULL ? phase_semantics[phase] : *semantic;
-    ++s_native_view_wave.row_count;
-    s_native_view_wave.previous_left = left;
-    if (s_native_view_wave.row_count < NATIVE_VIEW_WAVE_ROW_TILES)
-        return 1;
-    if (left != 0) {
-        *out_status = native_view_wave_flush_pending();
-        s_native_view_wave.effect_active = 0;
-        return 1;
-    }
-    for (unsigned int variant = 0u;
-         variant < s_native_interpolation_phase_count; ++variant)
-        if (!native_view_wave_record_present_row(variant)) {
-            *out_status = native_view_wave_flush_pending();
-            s_native_view_wave.effect_active = 0;
-            return 1;
-        }
-    if (!native_view_wave_record_present_row(
-            NATIVE_VIEW_WAVE_CURRENT_VARIANT)) {
-        *out_status = native_view_wave_flush_pending();
-        s_native_view_wave.effect_active = 0;
-        return 1;
-    }
-    s_native_view_wave.effect_active = 1;
-    *out_status = native_view_wave_flush_pending();
-    return 1;
-}
-
 static GpuRenderTransactionStatus glb_draw_semantic(
         GpuRenderTransactionId transaction_id,
         const GpuRenderSemantic *semantic) {
@@ -10112,7 +10323,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
             phase_semantics, s_native_interpolation_phase_count);
         if (workload_status == GPU_SEMANTIC_WORKLOAD_OK) {
             native_geometry_accumulate(
-                NATIVE_VIEW_WAVE_CURRENT_VARIANT, semantic);
+                NATIVE_CURRENT_VARIANT, semantic);
             for (unsigned int phase = 0u;
                  phase < s_native_interpolation_phase_count; ++phase)
                 native_geometry_accumulate(phase, &phase_semantics[phase]);
@@ -10157,19 +10368,14 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
     }
     if (!s_native_view_enabled)
         return GPU_RENDER_TRANSACTION_OK;
-    if (native_view_wave_consume(
-            semantic,
-            workload_status == GPU_SEMANTIC_WORKLOAD_OK
-                ? phase_semantics : NULL,
-            base_x, slot, &status)) {
-        if (status != GPU_RENDER_TRANSACTION_OK)
-            gl_renderer_native_midpoint_cancel();
-        return status;
-    }
-    if (status != GPU_RENDER_TRANSACTION_OK) {
-        gl_renderer_native_midpoint_cancel();
-        return status;
-    }
+    native_view_wave_record(
+        semantic,
+        s_native_midpoint_diag.frame_open &&
+                !s_native_midpoint_current_pending &&
+                s_native_midpoint_diag.frame_valid &&
+                workload_status == GPU_SEMANTIC_WORKLOAD_OK
+            ? phase_semantics : NULL,
+        base_x, slot);
     status = native_host_queue_push(
         semantic,
         s_native_midpoint_diag.frame_open &&

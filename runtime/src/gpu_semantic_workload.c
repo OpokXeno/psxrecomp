@@ -162,6 +162,14 @@ static int32_t hash_lookup(const int32_t *table,
 }
 
 static bool semantic_valid(const GpuRenderSemantic *semantic) {
+    if (semantic->native_view_effect >
+            GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID ||
+        (semantic->native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_NONE &&
+         semantic->native_view_effect_index != 0u) ||
+        (semantic->native_view_effect ==
+             GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
+         semantic->native_view_effect_index >= 20u * 17u))
+        return false;
     if (semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
         return semantic->triangle_count > 0u &&
                semantic->triangle_count <= GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY &&
@@ -275,6 +283,8 @@ static bool semantic_compatible(const GpuRenderSemantic *a,
     if (!semantic_valid(a) || !semantic_valid(b) ||
         a->topology != b->topology ||
         a->screen_space_2d != b->screen_space_2d ||
+        a->native_view_effect != b->native_view_effect ||
+        a->native_view_effect_index != b->native_view_effect_index ||
         a->triangle_count != b->triangle_count ||
         a->line_count != b->line_count ||
         a->material.textured != b->material.textured ||
@@ -773,6 +783,8 @@ static size_t retrospective_class_hash(const GpuRenderSemantic *semantic) {
     MIX_RETROSPECTIVE(semantic->interpolation_identity.scene_id);
     MIX_RETROSPECTIVE(semantic->topology);
     MIX_RETROSPECTIVE(semantic->screen_space_2d);
+    MIX_RETROSPECTIVE(semantic->native_view_effect);
+    MIX_RETROSPECTIVE(semantic->native_view_effect_index);
     MIX_RETROSPECTIVE(semantic->triangle_count);
     MIX_RETROSPECTIVE(semantic->line_count);
     MIX_RETROSPECTIVE(material->tpage);

@@ -4817,7 +4817,58 @@ enum {
     XG_FIELD_DIALOGUE_WINDOW_SLOT_STRIDE = 0x0498,
     XG_FIELD_DIALOGUE_WINDOW_BUFFER_STRIDE = 0x0010,
     XG_FIELD_DIALOGUE_WINDOW_SLOT_COUNT = 4,
+    XG_FIELD_WAVE_BUFFER_COUNT = 2,
+    XG_FIELD_WAVE_COLUMNS = 20,
+    XG_FIELD_WAVE_ROWS = 17,
+    XG_FIELD_WAVE_PACKET_STRIDE = 0x28,
+    XG_FIELD_WAVE_COMMAND_OFFSET = 4,
 };
+
+#define XG_FIELD_WAVE_ACTIVE UINT32_C(0x800b2078)
+#define XG_FIELD_WAVE_PACKET_BASES UINT32_C(0x800b20bc)
+
+static void native_semantic_classify_native_view_effect(
+        uint8_t opcode, GpuRenderSemantic *semantic,
+        const GpuRenderOracleSource *source) {
+    const uint32_t packet_count =
+        XG_FIELD_WAVE_COLUMNS * XG_FIELD_WAVE_ROWS;
+    uint32_t command_address;
+
+    /* FUN_800a4dac updates a double-buffered 20x17 FT4 mesh in place. Each
+     * DMA command starts four bytes after its 0x28-byte POLY_FT4 record. */
+    if (semantic == NULL) return;
+    semantic->native_view_effect = GPU_RENDER_NATIVE_VIEW_EFFECT_NONE;
+    semantic->native_view_effect_index = 0u;
+    if (opcode != 0x2cu ||
+        semantic->triangle_count != 2u || !semantic->material.textured ||
+        semantic->material.texture_depth != GPU_RENDER_TEXTURE_15_BIT ||
+        source == NULL ||
+        source->kind != GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST ||
+        (psx_read_word(XG_FIELD_WAVE_ACTIVE) & UINT32_C(0xffff)) == 0u)
+        return;
+    command_address = source->word_address & UINT32_C(0x1fffffff);
+    for (uint32_t buffer = 0u; buffer < XG_FIELD_WAVE_BUFFER_COUNT; ++buffer) {
+        const uint32_t packet_base = psx_read_word(
+            XG_FIELD_WAVE_PACKET_BASES + buffer * 4u) &
+            UINT32_C(0x1fffffff);
+        const uint32_t first_command =
+            packet_base + XG_FIELD_WAVE_COMMAND_OFFSET;
+        uint32_t offset;
+
+        if (packet_base >= UINT32_C(0x200000) ||
+            first_command < packet_base || command_address < first_command)
+            continue;
+        offset = command_address - first_command;
+        if (offset < packet_count * XG_FIELD_WAVE_PACKET_STRIDE &&
+            offset % XG_FIELD_WAVE_PACKET_STRIDE == 0u) {
+            semantic->native_view_effect =
+                GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID;
+            semantic->native_view_effect_index =
+                (uint16_t)(offset / XG_FIELD_WAVE_PACKET_STRIDE);
+            return;
+        }
+    }
+}
 
 static int native_semantic_is_field_dialogue_window_source(
         const GpuRenderOracleSource *source) {
@@ -5222,6 +5273,7 @@ int gpu_native_semantic_from_gp0(
         native_semantic_quad(out, x, y, u, v, color);
     }
     out->screen_space_2d = native_semantic_screen_space_mode(opcode, out, NULL);
+    native_semantic_classify_native_view_effect(opcode, out, NULL);
     return 1;
 }
 
@@ -6041,6 +6093,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             semantic = *bound_semantic;
             semantic.screen_space_2d =
                 native_semantic_screen_space_mode(opcode, &semantic, source);
+            native_semantic_classify_native_view_effect(
+                opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
             if (native_packet_bound_visual_valid)
                 guest_render_native_stream_note_rasterized(
@@ -6054,6 +6108,9 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             if (supported)
                 semantic.screen_space_2d =
                     native_semantic_screen_space_mode(opcode, &semantic, source);
+            if (supported)
+                native_semantic_classify_native_view_effect(
+                    opcode, &semantic, source);
             if (supported &&
                 guest_render_native_stream_shared_packet_bindings_enabled())
                 effective_bound_semantic = &semantic;
@@ -6062,6 +6119,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             semantic = *effective_bound_semantic;
             semantic.screen_space_2d =
                 native_semantic_screen_space_mode(opcode, &semantic, source);
+            native_semantic_classify_native_view_effect(
+                opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
         }
         if (supported) native_semantic_stamp_retrospective_scene(&semantic);

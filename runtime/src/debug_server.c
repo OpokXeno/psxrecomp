@@ -9597,6 +9597,57 @@ static void handle_native_midpoint_diag(int id, const char *json)
         diag.previous_usable ? "true" : "false");
 }
 
+static void handle_native_wave_diag(int id, const char *json)
+{
+    GlRendererNativeWaveDiagnostics diag = {0};
+    (void)json;
+    gl_renderer_native_wave_diag(&diag);
+    send_fmt(
+        "{\"id\":%d,\"ok\":true,\"semantics\":%llu,\"starts\":%llu,"
+        "\"completed\":%llu,\"resets\":{\"target\":%llu,\"row\":%llu,"
+        "\"invalid_row\":%llu},\"copies\":{\"matching\":%llu,"
+        "\"ready\":%llu,\"partial\":%llu,\"apply_successes\":%llu,"
+        "\"apply_failures\":%llu,\"ready_by_page\":[%llu,%llu],"
+        "\"partial_by_page\":[%llu,%llu]},\"margin_clears\":{"
+        "\"total\":%llu,\"by_page\":[%llu,%llu]},\"presents\":{"
+        "\"total\":%llu,\"by_page\":[%llu,%llu],"
+        "\"with_wave_by_page\":[%llu,%llu]},\"wave_valid_by_page\":[%s,%s],"
+        "\"last_copy\":{\"dst_y\":%d,\"packets\":%d,\"rows\":%d},"
+        "\"last_present_y\":%d,\"current\":{\"packets\":%d,\"rows\":%d,"
+        "\"base_x\":%d,\"slot\":%d,\"recording\":%s,\"ready\":%s}}",
+        id, (unsigned long long)diag.semantics,
+        (unsigned long long)diag.starts,
+        (unsigned long long)diag.completed,
+        (unsigned long long)diag.target_resets,
+        (unsigned long long)diag.row_resets,
+        (unsigned long long)diag.invalid_row_resets,
+        (unsigned long long)diag.matching_copies,
+        (unsigned long long)diag.ready_copies,
+        (unsigned long long)diag.partial_copies,
+        (unsigned long long)diag.apply_successes,
+        (unsigned long long)diag.apply_failures,
+        (unsigned long long)diag.ready_copies_by_page[0],
+        (unsigned long long)diag.ready_copies_by_page[1],
+        (unsigned long long)diag.partial_copies_by_page[0],
+        (unsigned long long)diag.partial_copies_by_page[1],
+        (unsigned long long)diag.margin_clears,
+        (unsigned long long)diag.margin_clears_by_page[0],
+        (unsigned long long)diag.margin_clears_by_page[1],
+        (unsigned long long)diag.presents,
+        (unsigned long long)diag.presents_by_page[0],
+        (unsigned long long)diag.presents_by_page[1],
+        (unsigned long long)diag.presents_with_wave_by_page[0],
+        (unsigned long long)diag.presents_with_wave_by_page[1],
+        diag.wave_valid_by_page[0] ? "true" : "false",
+        diag.wave_valid_by_page[1] ? "true" : "false",
+        diag.last_copy_dst_y, diag.last_copy_packet_count,
+        diag.last_copy_row_count, diag.last_present_y,
+        diag.current_packet_count, diag.current_row_count,
+        diag.current_base_x, diag.current_slot,
+        diag.current_recording ? "true" : "false",
+        diag.current_ready ? "true" : "false");
+}
+
 static void handle_native_producer_phase_diag(int id, const char *json)
 {
     GlRendererSemanticProducerDiagnostics diagnostics = {0};
@@ -14384,6 +14435,7 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "native_midpoint_diag", handle_native_midpoint_diag },
+    { "native_wave_diag", handle_native_wave_diag },
     { "native_last_motion_diag", handle_native_last_motion_diag },
     { "gl_present_ring",   handle_gl_present_ring },
     { "present_ring",      handle_present_ring },

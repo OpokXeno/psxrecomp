@@ -324,6 +324,38 @@ typedef struct GlRendererNativeMidpointDiagnostics {
     int previous_usable;
 } GlRendererNativeMidpointDiagnostics;
 
+typedef struct GlRendererNativeWaveDiagnostics {
+    uint64_t semantics;
+    uint64_t starts;
+    uint64_t completed;
+    uint64_t target_resets;
+    uint64_t row_resets;
+    uint64_t invalid_row_resets;
+    uint64_t matching_copies;
+    uint64_t ready_copies;
+    uint64_t partial_copies;
+    uint64_t apply_successes;
+    uint64_t apply_failures;
+    uint64_t margin_clears;
+    uint64_t presents;
+    uint64_t ready_copies_by_page[2];
+    uint64_t partial_copies_by_page[2];
+    uint64_t margin_clears_by_page[2];
+    uint64_t presents_by_page[2];
+    uint64_t presents_with_wave_by_page[2];
+    int32_t last_copy_dst_y;
+    int32_t last_copy_packet_count;
+    int32_t last_copy_row_count;
+    int32_t last_present_y;
+    int32_t current_packet_count;
+    int32_t current_row_count;
+    int32_t current_base_x;
+    int32_t current_slot;
+    int wave_valid_by_page[2];
+    int current_recording;
+    int current_ready;
+} GlRendererNativeWaveDiagnostics;
+
 typedef struct GlRendererSemanticProducerDiagnostics {
     uint32_t producer_id;
     uint64_t semantic_count;
@@ -393,6 +425,7 @@ enum {
     GL_NATIVE_MIDPOINT_GL_COPY_CANONICAL,
     GL_NATIVE_MIDPOINT_GL_COPY_VIEW,
     GL_NATIVE_MIDPOINT_GL_SNAPSHOT_CURRENT,
+    GL_NATIVE_MIDPOINT_GL_WAVE_COPY,
 };
 
 /* Native-view midpoint lifecycle. All operations execute on the main GL
@@ -406,6 +439,8 @@ void gl_renderer_native_midpoint_reset_for_reason(
 void gl_renderer_native_midpoint_set_suspended(int suspended);
 void gl_renderer_native_midpoint_diag(
     GlRendererNativeMidpointDiagnostics *out_diagnostics);
+void gl_renderer_native_wave_diag(
+    GlRendererNativeWaveDiagnostics *out_diagnostics);
 void gl_renderer_semantic_producer_diag(
     uint32_t producer_id,
     GlRendererSemanticProducerDiagnostics *out_diagnostics);

@@ -686,7 +686,14 @@ static bool semantic_is_valid(const GpuRenderSemantic *semantic) {
     uint16_t encoded_depth;
 
     if (!semantic) return false;
-    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE)
+    if (semantic->screen_space_2d > GPU_RENDER_SCREEN_SPACE_2D_PRESERVE_SIZE ||
+        semantic->native_view_effect >
+            GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID ||
+        (semantic->native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_NONE &&
+         semantic->native_view_effect_index != 0u) ||
+        (semantic->native_view_effect ==
+             GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
+         semantic->native_view_effect_index >= 20u * 17u))
         return false;
     material = &semantic->material;
     if (material->texture_depth != GPU_RENDER_TEXTURE_4_BIT &&
