@@ -6711,8 +6711,11 @@ session_reboot:
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
      * runs sw_renderer_init). scale==1 is a no-op; >1 allocates the hi-res
      * VRAM mirror. */
+    const int max_internal_scale = gr_backend() == GR_BACKEND_OPENGL
+        ? 8 : SW_MAX_INTERNAL_SCALE;
     if (g_video_scale < 1) g_video_scale = 1;
-    if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
+    if (g_video_scale > max_internal_scale)
+        g_video_scale = max_internal_scale;
     gr_set_scale(g_video_scale);
     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     gr_set_texture_filter(g_video_texfilter);
