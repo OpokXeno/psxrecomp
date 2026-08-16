@@ -57,6 +57,38 @@ static inline void psx_uv_tri_dirs(const int *xs, const int *ys,
     if (area2 < 0) { *du = -*du; *dv = -*dv; }
 }
 
+/* The Native interpolation path rasterizes fractional positions. Classify the
+ * mapping from those positions rather than their truncated integer copies:
+ * truncation can turn a projected mapping into a false axis-aligned mirror. */
+static inline void psx_uv_tri_dirs_f32(const float *xs, const float *ys,
+                                       const int *us, const int *vs,
+                                       int *du, int *dv) {
+    double dudx = -(double)(ys[1]-ys[0])*us[2] -
+                   (double)(ys[2]-ys[1])*us[0] -
+                   (double)(ys[0]-ys[2])*us[1];
+    double dvdx = -(double)(ys[1]-ys[0])*vs[2] -
+                   (double)(ys[2]-ys[1])*vs[0] -
+                   (double)(ys[0]-ys[2])*vs[1];
+    double dudy =  (double)(xs[1]-xs[0])*us[2] +
+                   (double)(xs[2]-xs[1])*us[0] +
+                   (double)(xs[0]-xs[2])*us[1];
+    double dvdy =  (double)(xs[1]-xs[0])*vs[2] +
+                   (double)(xs[2]-xs[1])*vs[0] +
+                   (double)(xs[0]-xs[2])*vs[1];
+    double area2 = (double)(xs[1]-xs[0])*(ys[2]-ys[0]) -
+                   (double)(xs[2]-xs[0])*(ys[1]-ys[0]);
+    if (area2 == 0.0) { *du = 0; *dv = 0; return; }
+    *du = dudx == 0.0 ? (dudy > 0.0 ? 1 : dudy < 0.0 ? -1 : 0)
+                      : dudy == 0.0
+                            ? (dudx > 0.0 ? 1 : -1)
+                            : 0;
+    *dv = dvdx == 0.0 ? (dvdy > 0.0 ? 1 : dvdy < 0.0 ? -1 : 0)
+                      : dvdy == 0.0
+                            ? (dvdx > 0.0 ? 1 : -1)
+                            : 0;
+    if (area2 < 0.0) { *du = -*du; *dv = -*dv; }
+}
+
 /* Pre-wrap one axis' exact sampled range into lim_lo/lim_hi. dir > 0 =
  * forward (hi exclusive), dir < 0 = mirrored (lo exclusive), 0 = diagonal
  * (keep full min..max). */
@@ -84,6 +116,20 @@ static inline void psx_uv_tri_limits(const int *xs, const int *ys,
     psx_uv_axis_limits(lo_v, hi_v, dv, &lim[1], &lim[3]);
 }
 
+static inline void psx_uv_tri_limits_f32(const float *xs, const float *ys,
+                                         const int *us, const int *vs,
+                                         int lim[4]) {
+    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
+    for (int i = 1; i < 3; i++) {
+        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
+        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
+    }
+    int du, dv;
+    psx_uv_tri_dirs_f32(xs, ys, us, vs, &du, &dv);
+    psx_uv_axis_limits(lo_u, hi_u, du, &lim[0], &lim[2]);
+    psx_uv_axis_limits(lo_v, hi_v, dv, &lim[1], &lim[3]);
+}
+
 /* Inclusive sampled uv bounds for a rect prim, from its ORIGINAL uv corners
  * (u0/v0 at the top-left raster corner; u1/v1 at the exclusive corner —
  * u1 < u0 / v1 < v0 means mirrored). */
@@ -101,6 +147,15 @@ static inline void psx_uv_tri_mirror_offset(const int *xs, const int *ys,
                                             int *us, int *vs) {
     long du, dv;
     psx_uv_tri_dirs(xs, ys, us, vs, &du, &dv);
+    if (du < 0) { us[0]++; us[1]++; us[2]++; }
+    if (dv < 0) { vs[0]++; vs[1]++; vs[2]++; }
+}
+
+static inline void psx_uv_tri_mirror_offset_f32(const float *xs,
+                                                const float *ys,
+                                                int *us, int *vs) {
+    int du, dv;
+    psx_uv_tri_dirs_f32(xs, ys, us, vs, &du, &dv);
     if (du < 0) { us[0]++; us[1]++; us[2]++; }
     if (dv < 0) { vs[0]++; vs[1]++; vs[2]++; }
 }

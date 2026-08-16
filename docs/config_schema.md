@@ -199,12 +199,18 @@ Runtime video defaults live in `[video]`:
 [video]
 renderer = "opengl"       # "software", "opengl", or "vulkan"
 offer_vulkan = false      # show Vulkan in the launcher only after game validation
+fps = 30                  # 30 = original cadence; 60 = Native interpolation
 ```
 
 `renderer = "vulkan"` remains an experimental runtime choice and still requires
 a build compiled with Vulkan support. `offer_vulkan` controls launcher
 visibility only; it defaults to false so game projects must explicitly expose
 Vulkan after validating their visuals and stability.
+
+`fps = 30` preserves original PSX presentation cadence. `fps = 60` enables the
+Native interpolation presentation path while preserving guest VBlank, input,
+and audio timing. The launcher persists the same `fps = 30|60` value in
+`settings.toml`; it exposes no separate interpolation toggle.
 
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc

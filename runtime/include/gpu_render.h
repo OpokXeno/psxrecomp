@@ -11,6 +11,7 @@
  * gr_set_backend() BEFORE gr_init(); gr_backend() reports the EFFECTIVE backend
  * (a requested backend that fails to initialize falls back to software). */
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -87,6 +88,14 @@ typedef uint64_t GpuRenderDeferredCandidateToken;
 
 #define GPU_RENDER_DEFERRED_CANDIDATE_NONE UINT64_C(0)
 
+typedef struct GpuRenderInterpolationIdentity {
+    /* Also namespaces address-free retrospective matching when valid is zero. */
+    uint64_t scene_id;
+    uint32_t producer_id;
+    uint32_t primitive_id;
+    uint8_t valid;
+} GpuRenderInterpolationIdentity;
+
 typedef struct GpuRenderMaterial {
     uint16_t tpage;
     uint16_t texture_page_x;
@@ -127,7 +136,29 @@ typedef struct GpuRenderSemanticVertex {
     GpuRenderFixed16_16 native_view_x;
     GpuRenderFixed16_16 native_view_y;
     uint8_t native_view_position;
+    /* Optional pre-divide projection payload for temporal reprojection. */
+    int32_t projective_view_x;
+    int32_t projective_view_y;
+    int32_t projective_view_z;
+    GpuRenderFixed16_16 projective_offset_x;
+    GpuRenderFixed16_16 projective_offset_y;
+    GpuRenderFixed16_16 projective_native_offset_x;
+    GpuRenderFixed16_16 projective_native_offset_y;
+    uint16_t projective_distance;
+    uint8_t projective_position;
+    /* Optional source-mesh identity. Vertices shared by separate primitives
+     * use one temporal position even when primitive appearance snaps. */
+    uint32_t interpolation_group_id;
+    uint32_t interpolation_vertex_id;
+    uint8_t interpolation_vertex_identity_valid;
 } GpuRenderSemanticVertex;
+
+typedef struct GpuRenderInterpolationVertexAnchor {
+    uint64_t scene_id;
+    uint32_t producer_id;
+    GpuRenderMaterial material;
+    GpuRenderSemanticVertex vertex;
+} GpuRenderInterpolationVertexAnchor;
 
 typedef struct GpuRenderSemanticTriangle {
     uint8_t split_index;
@@ -164,6 +195,10 @@ typedef struct GpuRenderSemantic {
     GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];
     uint8_t line_count;
     GpuRenderSemanticLine lines[GPU_RENDER_SEMANTIC_LINE_CAPACITY];
+    /* Stable producer identity used only for retrospective host interpolation.
+     * Packet addresses and draw ordinals are deliberately not identities: PSX
+     * games routinely double-buffer packet arenas and reorder OT contents. */
+    GpuRenderInterpolationIdentity interpolation_identity;
 } GpuRenderSemantic;
 
 /* Describes the final composition without exposing a backend surface handle.
@@ -263,6 +298,8 @@ void gr_native_draw_shaded_line(int x0, int y0, uint16_t c0,
 GpuRenderTransactionStatus gr_stream_barrier(void);
 GpuRenderTransactionStatus gr_draw_semantic_immediate(
     const GpuRenderSemantic *semantic);
+GpuRenderTransactionStatus gr_record_interpolation_anchors(
+    const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
 
 /* Display readout (present path) */
 int gr_render_display(uint32_t *out_pixels, int out_pitch,
@@ -407,6 +444,8 @@ typedef struct GpuRenderBackend {
     GpuRenderTransactionStatus (*stream_barrier)(void);
     GpuRenderTransactionStatus (*draw_semantic_immediate)(
         const GpuRenderSemantic *semantic);
+    GpuRenderTransactionStatus (*record_interpolation_anchors)(
+        const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
     int  (*render_display)(uint32_t *out, int pitch,
                            int dx, int dy, int dw, int dh);
     int  (*render_display_hires)(uint32_t *out, int pitch,

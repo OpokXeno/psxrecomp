@@ -12,7 +12,12 @@
 
 namespace input_replay {
 
-enum class StopReason { None, CheckpointReached, CheckpointNotReached };
+enum class StopReason {
+    None,
+    CheckpointReached,
+    CheckpointNotReached,
+    TraceComplete,
+};
 
 struct Counters {
     uint64_t vblank_latches = 0;
@@ -85,8 +90,8 @@ int status_json(char* out, int cap);
 
 bool record_begin(const char* path, uint16_t stop_field, uint64_t max_vblanks,
                   std::string* error);
-bool record_begin_until_close(const char* path, uint16_t checkpoint_field,
-                              uint64_t max_vblanks, std::string* error);
+bool record_begin_until_close(const char* path, uint64_t max_vblanks,
+                              std::string* error);
 bool recording();
 void record_note_guest_vblank();
 bool record_snapshot(const HostInputSnapshot& snapshot, std::string* error);

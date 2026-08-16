@@ -131,7 +131,7 @@ static int test_modes_are_copied_and_effective_modes_fall_back_independently(voi
     CHECK(modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(modes.requested_render_mode == GUEST_RENDER_RENDER_SHADOW);
     CHECK(modes.effective_render_mode == GUEST_RENDER_RENDER_SHADOW);
-    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.modes.requested_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
@@ -139,9 +139,9 @@ static int test_modes_are_copied_and_effective_modes_fall_back_independently(voi
     CHECK(snapshot.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
-    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(snapshot.last_fallback_reason ==
-          GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+           GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(snapshot.fallback_count == 1u);
     CHECK(snapshot.scene_fallback_count_baseline == 0u);
     CHECK(snapshot.scene_fallback_count_delta == 1u);
@@ -155,6 +155,11 @@ static int test_modes_are_copied_and_effective_modes_fall_back_independently(voi
     CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_ORIGINAL);
     CHECK(snapshot.modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
+    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
+    CHECK(read_snapshot(&snapshot));
+    CHECK(snapshot.modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
+    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
     return 1;
 }
 
@@ -166,14 +171,14 @@ static int test_fallback_telemetry_tracks_scene_and_lifetime_state(void) {
     guest_render_bridge_test_reset();
     guest_render_bridge_test_set_fallback_count_limit(2u);
     CHECK(guest_render_bridge_begin_scene(&config) == GUEST_RENDER_OK);
-    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.fallback_count == 1u);
     CHECK(snapshot.scene_fallback_count_baseline == 0u);
     CHECK(snapshot.scene_fallback_count_delta == 1u);
-    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(snapshot.last_fallback_reason ==
-          GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+           GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(!snapshot.fallback_count_overflowed);
 
     CHECK(guest_render_bridge_begin_scene(&config) == GUEST_RENDER_OK);
@@ -184,7 +189,7 @@ static int test_fallback_telemetry_tracks_scene_and_lifetime_state(void) {
     CHECK(snapshot.scene_fallback_count_delta == 0u);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_NONE);
     CHECK(snapshot.last_fallback_reason ==
-          GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+           GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
 
     guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
     CHECK(read_snapshot(&snapshot));
@@ -196,9 +201,9 @@ static int test_fallback_telemetry_tracks_scene_and_lifetime_state(void) {
           GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
 
     CHECK(guest_render_bridge_begin_scene(&config) == GUEST_RENDER_OK);
-    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_INVALID_ARGUMENT);
     CHECK(read_snapshot(&snapshot));
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_count == 2u);
     CHECK(snapshot.scene_fallback_count_baseline == 2u);
     CHECK(snapshot.scene_fallback_count_delta == 0u);
@@ -209,7 +214,7 @@ static int test_fallback_telemetry_tracks_scene_and_lifetime_state(void) {
     CHECK(guest_render_bridge_begin_scene(&config) ==
           GUEST_RENDER_COUNTER_EXHAUSTED);
     CHECK(read_snapshot(&snapshot));
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_count_overflowed);
     return 1;
 }
@@ -246,7 +251,7 @@ static int test_sequential_producers_no_nesting_and_finalize_order(void) {
           GUEST_RENDER_INVALID_TRANSITION);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.producer_open);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_NESTED_PRODUCER);
 
     guest_render_bridge_test_reset();
@@ -257,7 +262,7 @@ static int test_sequential_producers_no_nesting_and_finalize_order(void) {
           GUEST_RENDER_INVALID_TRANSITION);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.producer_open);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_ACTIVE_PRODUCER);
     return 1;
 }
@@ -364,7 +369,7 @@ static int test_packet_binding_duplicates_fail_closed(void) {
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason ==
           GUEST_RENDER_FALLBACK_DUPLICATE_PACKET_ADDRESS);
 
@@ -379,7 +384,7 @@ static int test_packet_binding_duplicates_fail_closed(void) {
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason ==
           GUEST_RENDER_FALLBACK_DUPLICATE_PRIMITIVE_INDEX);
 
@@ -392,7 +397,7 @@ static int test_packet_binding_duplicates_fail_closed(void) {
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_INVALID_PACKET_ADDRESS);
     return 1;
 }
@@ -424,7 +429,7 @@ static int test_packet_binding_capacity_and_stale_handles_fail_closed(void) {
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_BINDING_CAPACITY);
 
     guest_render_bridge_test_reset();
@@ -489,7 +494,7 @@ static int test_scene_reset_clears_completed_state_and_open_state_falls_back(voi
     CHECK(snapshot.slot_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_SCENE_RESET);
     guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
     CHECK(read_snapshot(&snapshot));
@@ -524,7 +529,7 @@ static int test_scene_reset_and_abort_clear_packet_bindings(void) {
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_SCENE_RESET);
 
     guest_render_bridge_test_reset();
@@ -542,8 +547,8 @@ static int test_scene_reset_and_abort_clear_packet_bindings(void) {
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
-    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
+    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_NONE);
     CHECK(guest_render_bridge_get_completed_binding(completed, 0u, &binding) ==
           GUEST_RENDER_NO_COMPLETED_STATE);
     return 1;
@@ -572,8 +577,8 @@ static int test_abort_scene_clears_all_state_and_requires_new_scene(void) {
     CHECK(snapshot.slot_count == 0u);
     CHECK(snapshot.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
-    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
+    CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_NONE);
     CHECK(guest_render_bridge_present(&completed) ==
           GUEST_RENDER_NO_COMPLETED_STATE);
     CHECK(guest_render_bridge_begin_state(&id) ==
@@ -584,6 +589,11 @@ static int test_abort_scene_clears_all_state_and_requires_new_scene(void) {
     guest_render_bridge_abort_scene(GUEST_RENDER_FALLBACK_SCENE_RESET);
     CHECK(guest_render_bridge_present(&completed) ==
           GUEST_RENDER_NO_COMPLETED_STATE);
+    CHECK(read_snapshot(&snapshot));
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
+    guest_render_bridge_reset_scene();
+    CHECK(read_snapshot(&snapshot));
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     return 1;
 }
 
@@ -610,7 +620,7 @@ static int test_slot_capacity_clears_native_slots(void) {
           GUEST_RENDER_SLOT_CAPACITY_EXCEEDED);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_SLOT_CAPACITY);
     return 1;
 }
@@ -635,7 +645,7 @@ static int test_wrong_id_stale_handle_and_invalid_provenance_fail_closed(void) {
           GUEST_RENDER_INVALID_TRANSITION);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_WRONG_STATE);
 
     guest_render_bridge_test_reset();
@@ -648,7 +658,7 @@ static int test_wrong_id_stale_handle_and_invalid_provenance_fail_closed(void) {
     CHECK(guest_render_bridge_get_slot(handle, &slot) == GUEST_RENDER_STALE_HANDLE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_STALE_HANDLE);
 
     guest_render_bridge_test_reset();
@@ -658,7 +668,7 @@ static int test_wrong_id_stale_handle_and_invalid_provenance_fail_closed(void) {
           GUEST_RENDER_INVALID_PROVENANCE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_INVALID_PROVENANCE);
 
     guest_render_bridge_test_reset();
@@ -669,7 +679,7 @@ static int test_wrong_id_stale_handle_and_invalid_provenance_fail_closed(void) {
           GUEST_RENDER_INVALID_PROVENANCE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_INVALID_PROVENANCE);
     return 1;
 }
@@ -791,7 +801,7 @@ static int test_wrong_thread_poison_does_not_create_a_state(void) {
     CHECK(after.modes.requested_render_mode == before.modes.requested_render_mode);
     CHECK(after.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(after.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(after.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(after.fallback_reason == GUEST_RENDER_FALLBACK_WRONG_THREAD);
     CHECK(guest_render_bridge_begin_state(&id) == GUEST_RENDER_OK);
     CHECK(id.scene_epoch == 1u && id.state_sequence == 0u);
@@ -841,7 +851,7 @@ static int test_wrong_thread_poison_clears_packet_bindings(void) {
     CHECK(snapshot.producer_open);
     CHECK(snapshot.modes.effective_timing_mode ==
           GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
+    CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_WRONG_THREAD);
     return 1;
 }

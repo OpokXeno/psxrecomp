@@ -79,6 +79,7 @@ static bool observe_source_writer(
 
 static GpuRenderSemantic resolver_semantic;
 static GuestRenderNativeStreamMissContext resolver_expected;
+static GuestRenderNativeStreamCommandIdentity resolver_identity;
 
 static bool contextual_resolver(
         const GuestRenderNativeStreamMissContext *context,
@@ -86,6 +87,22 @@ static bool contextual_resolver(
         GpuRenderSemantic *out_semantic) {
     if (context == NULL || out_visual_id == NULL || out_semantic == NULL ||
         memcmp(context, &resolver_expected, sizeof(*context)) != 0)
+        return false;
+    *out_visual_id = context->visual_id;
+    *out_semantic = resolver_semantic;
+    return true;
+}
+
+static bool visual_agnostic_resolver(
+        const GuestRenderNativeStreamMissContext *context,
+        GpuRenderTransactionId *out_visual_id,
+        GpuRenderSemantic *out_semantic) {
+    if (context == NULL || out_visual_id == NULL || out_semantic == NULL ||
+        context->command_id != resolver_identity.command_id ||
+        context->container_id != resolver_identity.container_id ||
+        context->source_kind != resolver_identity.source_kind ||
+        context->opcode != resolver_identity.opcode ||
+        context->word_count != resolver_identity.word_count)
         return false;
     *out_visual_id = context->visual_id;
     *out_semantic = resolver_semantic;
@@ -298,14 +315,57 @@ static int test_exact_match_rejects_wrong_writer_provenance(void) {
     CHECK(guest_render_native_stream_activate_visual(id) ==
           GUEST_RENDER_NATIVE_STREAM_OK);
     CHECK(guest_render_native_stream_reserve_exact(
-              31u, &identity, &matched, &reserved_semantic) ==
-          GUEST_RENDER_NATIVE_STREAM_OK);
+              31u, &identity, &semantic, &matched, &reserved_semantic) ==
+           GUEST_RENDER_NATIVE_STREAM_OK);
     guest_render_native_stream_release_reservation(31u);
-    CHECK(guest_render_native_stream_match_exact(&identity, &matched));
+    CHECK(guest_render_native_stream_match_exact(
+        &identity, &semantic, &matched));
     CHECK(matched.scene_epoch == id.scene_epoch &&
           matched.state_sequence == id.state_sequence);
     identity.command_writer.pc++;
-    CHECK(!guest_render_native_stream_match_exact(&identity, &matched));
+    CHECK(!guest_render_native_stream_match_exact(
+        &identity, &semantic, &matched));
+    return 1;
+}
+
+static int test_packet_semantic_rejects_reused_address(void) {
+    const GpuRenderTransactionId id = {11u, 4u};
+    GpuRenderSemantic staged = make_semantic(64u);
+    GpuRenderSemantic packet;
+    const GuestRenderNativeStreamCommandIdentity identity = {
+        .command_id = 0x00123500u,
+        .container_id = 0x001234fcu,
+        .source_kind = GUEST_RENDER_NATIVE_STREAM_SOURCE_DMA_LINKED_LIST,
+        .opcode = 0x2eu,
+        .word_count = 9u,
+    };
+    GpuRenderTransactionId matched;
+    GpuRenderSemantic reserved;
+
+    staged.material.textured = 1u;
+    staged.material.raw_texture = 1u;
+    packet = staged;
+    packet.material.raw_texture = 0u;
+    packet.material.semi_transparent = 1u;
+    packet.triangles[0].vertices[0].x += INT32_C(16) * INT32_C(65536);
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_stage_exact(
+              id, identity.command_id, &staged) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_activate_visual(id) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_reserve_exact(
+              32u, &identity, &packet, &matched, &reserved) ==
+          GUEST_RENDER_NATIVE_STREAM_NOT_FOUND);
+    CHECK(!guest_render_native_stream_match_exact(
+        &identity, &packet, &matched));
+    CHECK(guest_render_native_stream_has_exact(id, identity.command_id));
+    CHECK(guest_render_native_stream_reserve_exact(
+              33u, &identity, &staged, &matched, &reserved) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    guest_render_native_stream_release_reservation(33u);
     return 1;
 }
 
@@ -494,12 +554,18 @@ static int test_native_packet_coverage_telemetry(void) {
         0x64u, false, false, 0x00123480u);
     guest_render_native_stream_note_native_packet_source(
         0x64u, false, false, 0x00123ffcu);
+    guest_render_native_stream_note_native_draw_source(0x2eu, true);
+    guest_render_native_stream_note_native_draw_source(0x24u, false);
     CHECK(guest_render_native_stream_snapshot(&snapshot) ==
           GUEST_RENDER_NATIVE_STREAM_OK);
     CHECK(snapshot.total_native_packets == 4u);
     CHECK(snapshot.total_native_bound_packets == 1u);
     CHECK(snapshot.total_native_unbound_packets == 3u);
     CHECK(snapshot.total_native_unsupported_packets == 3u);
+    CHECK(snapshot.total_native_producer_bound_draws == 1u);
+    CHECK(snapshot.total_native_packet_derived_draws == 1u);
+    CHECK(snapshot.native_producer_bound_opcode_counts[0x2eu] == 1u);
+    CHECK(snapshot.native_packet_derived_opcode_counts[0x24u] == 1u);
     CHECK(snapshot.first_native_unbound_opcode == 0x64u);
     CHECK(snapshot.last_native_unbound_opcode == 0x64u);
     CHECK(snapshot.first_native_unbound_source == 0x00123400u);
@@ -796,9 +862,11 @@ static int test_preflight_reservation_is_single_consumer_and_abortable(void) {
     CHECK(guest_render_native_stream_activate_visual(id) ==
           GUEST_RENDER_NATIVE_STREAM_OK);
     CHECK(guest_render_native_stream_reserve_exact(
-              41u, &first, &reserved_visual, &reserved_semantic) ==
-          GUEST_RENDER_NATIVE_STREAM_OK);
-    CHECK(!guest_render_native_stream_match_exact(&first, &reserved_visual));
+              41u, &first, &semantic, &reserved_visual,
+              &reserved_semantic) ==
+           GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(!guest_render_native_stream_match_exact(
+        &first, &semantic, &reserved_visual));
     CHECK(guest_render_native_stream_consume_reserved(
               41u, &first, id, &semantic, &reserved_semantic) ==
           GUEST_RENDER_NATIVE_STREAM_OK);
@@ -807,10 +875,66 @@ static int test_preflight_reservation_is_single_consumer_and_abortable(void) {
           GUEST_RENDER_NATIVE_STREAM_NOT_FOUND);
 
     CHECK(guest_render_native_stream_reserve_exact(
-              42u, &second, &reserved_visual, &reserved_semantic) ==
-          GUEST_RENDER_NATIVE_STREAM_OK);
+              42u, &second, &semantic, &reserved_visual,
+              &reserved_semantic) ==
+           GUEST_RENDER_NATIVE_STREAM_OK);
     guest_render_native_stream_release_reservation(42u);
-    CHECK(guest_render_native_stream_match_exact(&second, &reserved_visual));
+    CHECK(guest_render_native_stream_match_exact(
+        &second, &semantic, &reserved_visual));
+    return 1;
+}
+
+static int test_equivalent_active_miss_resolutions_commit_once(void) {
+    const GpuRenderTransactionId older = {20u, 3u};
+    const GpuRenderTransactionId newer = {21u, 1u};
+    const GpuRenderSemantic staged = make_semantic(70u);
+    GpuRenderTransactionId resolved_visual;
+    GpuRenderSemantic resolved_semantic;
+    GuestRenderNativeStreamReserveDiagnostic diagnostic;
+    GuestRenderNativeStreamSnapshot snapshot;
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_stage_exact(older, 0xa00u, &staged) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_activate_visual(older) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_consume_exact(
+              older, 0xa00u, &resolved_semantic) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_stage_exact(newer, 0xb00u, &staged) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_activate_visual(newer) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_consume_exact(
+              newer, 0xb00u, &resolved_semantic) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+
+    resolver_identity = (GuestRenderNativeStreamCommandIdentity){
+        .command_id = 0xc00u,
+        .container_id = 0xbfcu,
+        .source_kind = GUEST_RENDER_NATIVE_STREAM_SOURCE_DMA_LINKED_LIST,
+        .opcode = 0x2cu,
+        .word_count = 9u,
+    };
+    resolver_semantic = make_semantic(88u);
+    guest_render_native_stream_set_miss_resolver(visual_agnostic_resolver);
+    CHECK(guest_render_native_stream_resolve_active_miss(
+        &resolver_identity, &resolver_semantic, &resolved_visual,
+        &resolved_semantic));
+    CHECK(resolved_visual.scene_epoch == newer.scene_epoch);
+    CHECK(resolved_visual.state_sequence == newer.state_sequence);
+    CHECK(resolved_semantic.triangles[0].vertices[0].r == 88u);
+    guest_render_native_stream_reserve_diagnostic(&diagnostic);
+    CHECK(diagnostic.active_count == 2u);
+    CHECK(diagnostic.available_count == 2u);
+    CHECK(guest_render_native_stream_note_resolved_consumed(
+              resolved_visual, resolver_identity.command_id,
+              &resolved_semantic) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(snapshot.total_staged == 3u);
+    CHECK(snapshot.total_consumed == 3u);
     return 1;
 }
 
@@ -821,6 +945,7 @@ int main(void) {
     if (!test_many_resolved_generations_use_bounded_lookup_state()) return 1;
     if (!test_interleaved_visuals_remain_independently_active()) return 1;
     if (!test_exact_match_rejects_wrong_writer_provenance()) return 1;
+    if (!test_packet_semantic_rejects_reused_address()) return 1;
     if (!test_line_semantic()) return 1;
     if (!test_original_draw_telemetry()) return 1;
     if (!test_double_buffer_reuse_preserves_pending_bindings()) return 1;
@@ -837,6 +962,7 @@ int main(void) {
     if (!test_contextual_resolver_rejects_incomplete_identity()) return 1;
     if (!test_suspend_and_reactivate_preserve_exact_visual()) return 1;
     if (!test_preflight_reservation_is_single_consumer_and_abortable()) return 1;
+    if (!test_equivalent_active_miss_resolutions_commit_once()) return 1;
     puts("guest_render_native_stream: all tests passed");
     return 0;
 }

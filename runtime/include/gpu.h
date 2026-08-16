@@ -243,6 +243,9 @@ void gpu_set_vblank_callback(gpu_vblank_cb cb);
  * 1=crt, 2=composite, 3=trinitron). Config/launcher-driven; the PSX_SCREEN
  * env var, if set, overrides this. Default 0 (raw) is byte-identical. */
 void gpu_set_screen_kind(int kind);
+/* Host-only temporal namespace for address-free Native interpolation. */
+void gpu_native_interpolation_scene_boundary(uint64_t scene_id);
+uint64_t gpu_native_interpolation_scene(void);
 /* Present-time screen LUT for the GL renderer: fills *table_out with the
  * baked 32768x{R,G,B} BGR555 table (NULL when raw/passthrough) and returns
  * a generation counter that bumps on every gpu_set_screen_kind change, so
@@ -303,6 +306,7 @@ int  psx_ws_x_margin(void);
 void gpu_ws_configure_native_cull(int enabled, int aspect_num, int aspect_den,
                                   int canonical_width, int canonical_height);
 void gpu_ws_set_cull_guard_pixels(int pixels);
+void gpu_ws_set_temporal_cull_guard_pixels(int pixels);
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
                                     const uint32_t *slti, int nslti,
                                     const uint32_t *range, int nrange);

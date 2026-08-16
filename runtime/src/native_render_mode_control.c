@@ -77,7 +77,12 @@ void native_render_mode_control_set_smooth(
     NativeRenderModeControl *control, bool enabled) {
     if (control == NULL) return;
     control->snapshot.smooth_requested = enabled;
-    if (!control->initialized || control->snapshot.quiesced) return;
+    if (!control->initialized) return;
+    if (control->snapshot.quiesced) {
+        control->ops.set_smooth_effective(false, control->user_data);
+        control->snapshot.smooth_effective = false;
+        return;
+    }
     control->ops.set_smooth_effective(enabled, control->user_data);
     control->snapshot.smooth_effective = enabled;
 }

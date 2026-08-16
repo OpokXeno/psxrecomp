@@ -16,6 +16,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef PSX_OVERLAY_PLAN_HASH
+#define PSX_OVERLAY_PLAN_HASH 0u
+#endif
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -76,8 +80,10 @@ typedef struct {
     uint32_t artifact_base;
     uint32_t artifact_size;
     uint32_t artifact_crc32;
+    uint8_t runtime_variant_identity[PSX_GAME_IDENTITY_SHA256_BYTES];
     uint8_t authority_provenance;
     uint8_t pair_bound;
+    uint8_t runtime_variant_bound;
 } RendererProvenance;
 
 typedef struct {
@@ -477,10 +483,16 @@ static void note_render_auth_candidate(const Candidate *c,
                 .artifact_base = c->renderer_provenance.artifact_base,
                 .artifact_size = c->renderer_provenance.artifact_size,
                 .artifact_crc32 = c->renderer_provenance.artifact_crc32,
+                .runtime_variant_identity = { 0 },
                 .authority_provenance =
                     c->renderer_provenance.authority_provenance != 0u,
                 .pair_bound = c->renderer_provenance.pair_bound != 0u,
+                .runtime_variant_bound =
+                    c->renderer_provenance.runtime_variant_bound != 0u,
             };
+        memcpy(candidate.runtime_variant_identity,
+               c->renderer_provenance.runtime_variant_identity,
+               sizeof(candidate.runtime_variant_identity));
         if (producer_dispatch)
             psx_xg_render_auth_note_candidate_dispatch(&candidate);
         else
@@ -719,6 +731,7 @@ void overlay_loader_static_match_stats(uint64_t *rehashes,
 /* ---- Per-DLL code-range manifest --------------------------------------- */
 /* Strict v2 line format emitted by tools/compile_overlays.py beside each DLL:
  *   P <pair_id_hex>          optional DLL/manifest publication identity
+ *   V <sha256_hex>            optional runtime-variant contract identity
  *   F <entry_hex> <crc_hex>  start a function (entry = virtual export addr)
  *   R <lo_hex> <len_hex>     a code byte-range (virtual addr, byte length)
  * The recompiler's per-function instruction walk yields exactly the executed
@@ -737,7 +750,9 @@ typedef struct {
     uint32_t base;
     uint32_t size;
     uint32_t crc32;
+    uint8_t runtime_variant_identity[PSX_GAME_IDENTITY_SHA256_BYTES];
     int present;
+    int runtime_variant_present;
 } ManifestArtifact;
 
 #define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
@@ -844,7 +859,8 @@ static ManFn *parse_manifest(const char *path, int *out_n,
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     int cap = 1024, n = 0;
-    int invalid = 0, pair_seen = 0, artifact_seen = 0, provenance_seen = 0, identity_seen = 0;
+    int invalid = 0, pair_seen = 0, artifact_seen = 0, variant_seen = 0,
+        provenance_seen = 0, identity_seen = 0;
     int provenance = MANIFEST_PROVENANCE_AUTHORITY;
     PsxGameIdentity identity;
     ManifestArtifact artifact;
@@ -884,7 +900,8 @@ static ManFn *parse_manifest(const char *path, int *out_n,
                 ? parsed_provenance : MANIFEST_PROVENANCE_AMBIGUOUS;
         }
         const char *record = manifest_skip_space(line);
-        int recognized = ((*record == 'A' || *record == 'P' || *record == MANIFEST_IDENTITY ||
+        int recognized = ((*record == 'A' || *record == 'P' || *record == 'V' ||
+                            *record == MANIFEST_IDENTITY ||
                            *record == 'F' || *record == 'R') &&
                           (record[1] == '\0' ||
                            manifest_is_space((unsigned char)record[1])));
@@ -924,6 +941,15 @@ static ManFn *parse_manifest(const char *path, int *out_n,
                 artifact.crc32 = (uint32_t)parsed_crc;
                 artifact.present = 1;
             } else invalid = 1;
+        } else if (*record == 'V') {
+            const char *cursor = record + 1;
+            if (!manifest_sha256_field(
+                    &cursor, artifact.runtime_variant_identity) ||
+                !manifest_record_end(cursor) || variant_seen++) {
+                invalid = 1;
+            } else {
+                artifact.runtime_variant_present = 1;
+            }
         } else if (*record == 'P') {
             const char *cursor = record + 1;
             uint64_t parsed = 0;
@@ -1118,7 +1144,12 @@ static int manifest_artifact_equal(const ManifestArtifact *left,
            left->present == right->present &&
            (!left->present ||
             ((left->base & 0x1FFFFFFFu) == (right->base & 0x1FFFFFFFu) &&
-             left->size == right->size && left->crc32 == right->crc32));
+              left->size == right->size && left->crc32 == right->crc32 &&
+              left->runtime_variant_present == right->runtime_variant_present &&
+              (!left->runtime_variant_present ||
+               memcmp(left->runtime_variant_identity,
+                      right->runtime_variant_identity,
+                      sizeof(left->runtime_variant_identity)) == 0)));
 }
 
 static int man_delay_slots_hashed(const ManFn *m) {
@@ -1276,7 +1307,13 @@ const char *overlay_loader_last_msg(void) { return s_last_msg; }
  * (region ran interpreted forever, no diagnostic). Found by the ABI-sweep
  * negative test. scan_one_cache_dir now shouts if even 4096 is hit. */
 #define CACHE_IDX_CAP 4096
-enum { CACHE_TIER_UNKNOWN = 0, CACHE_TIER_TCC = 1, CACHE_TIER_GCC = 2 };
+enum {
+    CACHE_TIER_UNKNOWN = 0,
+    CACHE_TIER_TCC = 1,
+    CACHE_TIER_PLAN_TCC = 2,
+    CACHE_TIER_GCC = 3,
+    CACHE_TIER_PLAN_GCC = 4,
+};
 typedef struct {
     uint32_t region_start;
     uint32_t logical_crc;
@@ -1885,9 +1922,11 @@ static void scan_one_cache_dir(const char *dir, int tier) {
 #endif
 }
 
-/* Scan the namespaced gcc cache: gcc/<arch-abi>/cg<codegen-ver>/. The codegen
- * version segment means a build with new emitter output reads a FRESH directory
- * and never picks up a stale DLL (old versions coexist on disk, no migration).
+/* Scan the namespaced compiler caches. The ordinary cg tag retains unaffected
+ * code coverage; the current plan-specific sibling contributes additive repairs
+ * at a higher priority. A plan change selects a fresh repair sibling without
+ * invalidating unrelated functions, while prior plan siblings stay invisible.
+ * The codegen version/hash still isolates emitter and ABI changes completely.
  * (Pre-1.0: no legacy fallback — older flat / unversioned caches are simply
  * ignored and regenerated.) */
 /* Hardening (never-again for the silent cg-tag read≠write drift): when the loader
@@ -1904,8 +1943,9 @@ static void warn_on_cgtag_mismatch(const char *tier) {
     snprintf(base, sizeof base, "%s/%s/%s/%s/%s",
              s_cache_dir, s_game_id, s_identity_namespace, tier, PSX_OVERLAY_ARCH_ABI);
     char expect[64];
-    snprintf(expect, sizeof expect, "cg%d_%08x",
-             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    snprintf(expect, sizeof expect, "cg%d_%08x_p%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+             (unsigned)PSX_OVERLAY_PLAN_HASH);
     snprintf(pattern, sizeof pattern, "%s/cg*", base);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
@@ -1931,8 +1971,9 @@ static void warn_on_cgtag_mismatch(const char *tier) {
     char base[768], expect[64], found[256];
     snprintf(base, sizeof base, "%s/%s/%s/%s/%s",
              s_cache_dir, s_game_id, s_identity_namespace, tier, PSX_OVERLAY_ARCH_ABI);
-    snprintf(expect, sizeof expect, "cg%d_%08x",
-             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    snprintf(expect, sizeof expect, "cg%d_%08x_p%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+             (unsigned)PSX_OVERLAY_PLAN_HASH);
     if (psx_overlay_posix_find_other_cache_tag(base, expect, found,
                                                sizeof(found))) {
         loader_log("*** OVERLAY CACHE HASH MISMATCH: this build reads %s/%s but "
@@ -2078,18 +2119,30 @@ static void abi_preflight_sweep(const char *dir) {
 
 static void scan_cache_dir(void) {
     char dir[768];
-    /* Index both tiers and every immutable artifact. Runtime selection prefers
-     * usable GCC over TCC; an invalid GCC artifact cannot suppress a valid TCC
-     * fallback merely because its filename was enumerated first. */
+    /* Index the ordinary cache first, then the current plan repairs. Candidate
+     * ordering prefers plan-GCC > GCC > plan-TCC > TCC while retaining a valid
+     * lower tier whenever a higher-tier candidate fails its live-byte gate. */
     snprintf(dir, sizeof(dir), "%s/%s/%s/gcc/%s/cg%d_%08x",
              s_cache_dir, s_game_id, s_identity_namespace, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir, CACHE_TIER_GCC);
     abi_preflight_sweep(dir);
-    snprintf(dir, sizeof(dir), "%s/%s/%s/tcc/%s/cg%d_%08x",
+    snprintf(dir, sizeof(dir), "%s/%s/%s/gcc/%s/cg%d_%08x_p%08x",
              s_cache_dir, s_game_id, s_identity_namespace, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
-             (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+             (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+             (unsigned)PSX_OVERLAY_PLAN_HASH);
+    scan_one_cache_dir(dir, CACHE_TIER_PLAN_GCC);
+    abi_preflight_sweep(dir);
+    snprintf(dir, sizeof(dir), "%s/%s/%s/tcc/%s/cg%d_%08x",
+             s_cache_dir, s_game_id, s_identity_namespace, PSX_OVERLAY_ARCH_ABI,
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir, CACHE_TIER_TCC);
+    abi_preflight_sweep(dir);
+    snprintf(dir, sizeof(dir), "%s/%s/%s/tcc/%s/cg%d_%08x_p%08x",
+             s_cache_dir, s_game_id, s_identity_namespace, PSX_OVERLAY_ARCH_ABI,
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+             (unsigned)PSX_OVERLAY_PLAN_HASH);
+    scan_one_cache_dir(dir, CACHE_TIER_PLAN_TCC);
     abi_preflight_sweep(dir);
 
     refresh_bios_resident_flags();
@@ -3146,8 +3199,13 @@ static int load_one_dll(const char *dll_path,
         renderer_provenance.artifact_base = manifest_artifact.base;
         renderer_provenance.artifact_size = manifest_artifact.size;
         renderer_provenance.artifact_crc32 = manifest_artifact.crc32;
+        memcpy(renderer_provenance.runtime_variant_identity,
+               manifest_artifact.runtime_variant_identity,
+               sizeof(renderer_provenance.runtime_variant_identity));
         renderer_provenance.authority_provenance = 1u;
         renderer_provenance.pair_bound = 1u;
+        renderer_provenance.runtime_variant_bound =
+            manifest_artifact.runtime_variant_present != 0;
     }
     int registered = load_overlay_dll(dll_path, man, man_n, s_ndlls, prepared,
                                        manifest_pair_id,
@@ -3545,6 +3603,24 @@ static int lazy_has_exact_entry(uint32_t phys) {
     return 0;
 }
 
+static int lazy_has_preferred_exact_entry(uint32_t phys, int loaded_tier) {
+    uint32_t bucket = (phys * 2654435761u) & LAZY_ENTRY_MASK;
+    for (int li = s_lazy_entry_head[bucket]; li >= 0;
+         li = s_lazy_man[li].next_entry) {
+        LazyMan *lm = &s_lazy_man[li];
+        int ci = lm->cache_idx;
+        if ((lm->fn.entry & 0x1FFFFFFFu) != phys ||
+            ci < 0 || ci >= s_cache_idx_count ||
+            s_cache_idx[ci].tier <= loaded_tier ||
+            s_cache_idx[ci].load_failed ||
+            s_cache_idx[ci].capacity_suppressed ||
+            dll_already_loaded(s_cache_idx[ci].path))
+            continue;
+        if (lazy_man_matches(lm)) return 1;
+    }
+    return 0;
+}
+
 /* ---- Dispatch ---------------------------------------------------------- */
 
 /* CPS (§25): find a non-blacklisted candidate whose code range CONTAINS phys —
@@ -3667,6 +3743,12 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * overlay-off + CPS game hit this and wedged at boot before any game code ran
      * (found via Ape Escape, the only overlay-off title). Fail closed here. */
     if (!s_active) return 0;
+    /* Low RAM is the BIOS kernel image plus install-at-runtime handlers. The
+     * byte-verified static BIOS dispatcher owns unchanged kernel functions;
+     * patched/installed code must use the dirty-RAM interpreter. Letting an
+     * overlay-cache shard become a third native owner changes the kernel's
+     * per-block IRQ/load-delay contract (notably OpenBIOS cardfasttrack). */
+    if (phys < DIRTY_RAM_KERNEL_WINDOW_END) return 0;
     if (overlay_cache_window_contains(phys) && lazy_miss_cached(phys)) {
         s_disp_interp++;
         return 0;
@@ -3679,6 +3761,12 @@ retry_candidates:
     int loaded_range_ci = -1;
     int lazy_exact = 0;
     int exact_needs_load = 0;
+    if (head >= 0 && overlay_cache_window_contains(phys) && !lazy_loaded &&
+        lazy_has_preferred_exact_entry(phys, s_cand[head].tier) &&
+        try_load_region(phys)) {
+        lazy_loaded = 1;
+        goto retry_candidates;
+    }
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         lazy_exact = head < 0 && lazy_has_exact_entry(phys);
         /* A CPS continuation is normally not a registered function ENTRY. Its
@@ -3690,8 +3778,7 @@ retry_candidates:
          * their valid cached DLL (Tomba FMV's 0x80106424/0x80106688 case). */
         if (head < 0 && g_psx_cps_mode)
             loaded_range_ci = overlay_find_by_range(phys);
-        exact_needs_load = lazy_exact &&
-            (loaded_range_ci < 0 || s_cand[loaded_range_ci].device_touch);
+        exact_needs_load = lazy_exact;
         if (head < 0 && (loaded_range_ci < 0 || exact_needs_load) &&
             !lazy_loaded && try_load_region(phys)) {
             lazy_loaded = 1;

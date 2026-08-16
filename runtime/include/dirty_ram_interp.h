@@ -50,9 +50,10 @@ void dirty_ram_ld_delay_flush(CPUState* cpu);
  * recompilation, and per-entry-validated native execution (Rule 18 code that
  * does not exist in any compile-time image):
  *
- *   Kernel RAM   [0x00000, 0x10000): the BIOS part-2 image relocated to RAM
- *     plus install-at-runtime stubs (e.g. the SIO data-byte stub at 0xCF0).
- *     Dirty-tracked per CPU store (dirty_ram_mark_kernel_write).
+ *   Kernel RAM   [0x00000, 0x10000): captured for diagnostics and exact byte
+ *     identity, but never executed by an overlay-cache shard. Unchanged BIOS
+ *     functions use the byte-verified static dispatcher; install-at-runtime or
+ *     patched handlers use the dirty-RAM interpreter.
  *   Overlay region [OVERLAY_REGION_FLOOR, RAM_SIZE): game overlays loaded by
  *     CD DMA (dirty_ram_mark_executable_range).
  *
@@ -68,8 +69,8 @@ void dirty_ram_ld_delay_flush(CPUState* cpu);
  * The interpreter's LOCAL-FLOW gates (is_local_dirty_target /
  * phys_is_overlay_flow_region) use DIRTY_RAM_KERNEL_WINDOW_END alone: only
  * the kernel window stays per-block (it runs in exception context where the
- * verified dispatch cadence is delicate). Native coverage for the kernel
- * window comes from the overlay loader, not from interp chaining. */
+ * verified dispatch cadence is delicate). Native coverage for unchanged BIOS
+ * kernel code comes only from the byte-verified static dispatcher. */
 #define DIRTY_RAM_KERNEL_WINDOW_END 0x00010000u
 
 /* The overlay-region floor is the END of THIS game's statically-recompiled

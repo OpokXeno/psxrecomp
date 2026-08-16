@@ -22,6 +22,18 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
     return (uint32_t)(ms - 1);                 /* undershoot; spin covers rest */
 }
 
+#define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
+
+uint64_t frame_pacing_advance_deadline(uint64_t now, uint64_t deadline,
+                                       uint64_t period, int recover_debt) {
+    if (deadline == 0) return now + period;
+    if (now < deadline) return deadline + period;
+    if (recover_debt && now - deadline <
+            period * FRAME_PACER_CATCHUP_MAX_PERIODS)
+        return deadline + period;
+    return now + period;
+}
+
 #ifndef FRAME_PACING_PURE_ONLY
 
 /* Bounded catch-up window, in periods. A transient stall (heavy frame, CD
@@ -36,24 +48,25 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
  * guest/video debt. Keep a bounded 12-period (200 ms at 60 Hz) window: enough
  * to repay the observed transition without turning a real hang, suspend, or
  * sub-realtime workload into an unbounded catch-up burst. */
-#define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
-
-void frame_pacer_wait(FramePacer *p, double period_ms) {
+static void frame_pacer_wait_internal(FramePacer *p, double period_ms,
+                                      int recover_debt) {
     uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t period = (uint64_t)((double)freq * (period_ms / 1000.0));
     uint64_t now = SDL_GetPerformanceCounter();
 
     if (p->next_deadline == 0 ||
-        now >= p->next_deadline + period * FRAME_PACER_CATCHUP_MAX_PERIODS) {
+        (now >= p->next_deadline &&
+         now - p->next_deadline >=
+             period * FRAME_PACER_CATCHUP_MAX_PERIODS)) {
         /* First frame, or sustained slowness beyond the catch-up window:
          * re-anchor (forgive the debt). */
-        p->next_deadline = now + period;
+        p->next_deadline = frame_pacing_advance_deadline(
+            now, p->next_deadline, period, recover_debt);
         return;
     }
     if (now >= p->next_deadline) {
-        /* In debt from a recent stall: run this frame unpaced and advance
-         * the deadline, repaying one period of debt per fast frame. */
-        p->next_deadline += period;
+        p->next_deadline = frame_pacing_advance_deadline(
+            now, p->next_deadline, period, recover_debt);
         return;
     }
 
@@ -67,5 +80,13 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
         /* final sub-ms spin */
     }
     p->next_deadline += period;
+}
+
+void frame_pacer_wait(FramePacer *p, double period_ms) {
+    frame_pacer_wait_internal(p, period_ms, 1);
+}
+
+void frame_pacer_wait_stable(FramePacer *p, double period_ms) {
+    frame_pacer_wait_internal(p, period_ms, 0);
 }
 #endif /* FRAME_PACING_PURE_ONLY */

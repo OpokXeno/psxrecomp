@@ -2562,7 +2562,18 @@ std::string CodeGenerator::translate_basic_block(
                                            block.successors[0]);
     } else if (block.exit_instr.type == ControlFlowType::None) {
         uint32_t next_addr = block.end_addr + 4;
-        if (known_functions_.count(next_addr) > 0) {
+        if (cps_enabled_) {
+            /* A page/capture boundary may truncate an otherwise valid
+             * function before its epilogue. Preserve the architectural
+             * fallthrough through the flat trampoline; the next PC can then
+             * resolve to another native shard or the dirty-RAM interpreter.
+             * A bare C return leaves cpu->pc == 0 and silently drops the live
+             * guest frame, including its un-restored $sp. */
+            ss << emit_interrupt_check(next_addr, config_.indent);
+            ss << config_.indent
+               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS fallthrough beyond captured function */\n",
+                              next_addr);
+        } else if (known_functions_.count(next_addr) > 0) {
             ss << config_.indent
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
                               next_addr);

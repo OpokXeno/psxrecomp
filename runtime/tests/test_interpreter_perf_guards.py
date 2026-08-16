@@ -188,6 +188,10 @@ def main():
         raise AssertionError("cache rescan does not invalidate negative misses")
     if "lazy_miss_invalidate_loader();" not in body(loader, "load_one_dll_prepared"):
         raise AssertionError("DLL publication does not invalidate negative misses")
+    if "exact_needs_load = lazy_exact;" not in dispatch:
+        raise AssertionError(
+            "a loaded broad range owner can still mask an exact manifest entry"
+        )
     lazy_match = body(loader, "lazy_man_matches")
     if "man_delay_slots_hashed(&lm->fn)" not in lazy_match:
         raise AssertionError("legacy manifests can expose unhashed delay slots")

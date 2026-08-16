@@ -88,6 +88,10 @@ typedef struct GuestRenderNativeStreamSnapshot {
     size_t command_generation_count;
     uint64_t total_staged;
     uint64_t total_consumed;
+    uint64_t total_consumed_keyed;
+    uint64_t total_consumed_unkeyed;
+    uint64_t total_rasterized_keyed;
+    uint64_t total_rasterized_unkeyed;
     uint64_t total_not_found;
     uint64_t total_original_draws;
     uint8_t first_original_draw_opcode;
@@ -113,6 +117,8 @@ typedef struct GuestRenderNativeStreamSnapshot {
     uint64_t total_native_bound_packets;
     uint64_t total_native_state_packets;
     uint64_t total_native_unbound_packets;
+    uint64_t total_native_producer_bound_draws;
+    uint64_t total_native_packet_derived_draws;
     uint64_t total_native_unsupported_packets;
     uint64_t total_independent_vram_presents;
     uint8_t first_native_unsupported_opcode;
@@ -130,6 +136,10 @@ typedef struct GuestRenderNativeStreamSnapshot {
     uint64_t native_opcode_counts[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_state_opcode_counts[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_unbound_opcode_counts[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_producer_bound_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_packet_derived_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_unsupported_opcode_counts[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint32_t native_unbound_source_by_opcode[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint32_t native_unbound_pc_by_opcode[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
@@ -219,10 +229,12 @@ bool guest_render_native_stream_has_exact(
         GpuRenderTransactionId visual_id, uint64_t exact_command_id);
 bool guest_render_native_stream_match_exact(
         const GuestRenderNativeStreamCommandIdentity *identity,
+        const GpuRenderSemantic *packet_semantic,
         GpuRenderTransactionId *out_visual_id);
 GuestRenderNativeStreamStatus guest_render_native_stream_reserve_exact(
         uint64_t reservation_id,
         const GuestRenderNativeStreamCommandIdentity *identity,
+        const GpuRenderSemantic *packet_semantic,
         GpuRenderTransactionId *out_visual_id,
         GpuRenderSemantic *out_semantic);
 GuestRenderNativeStreamStatus guest_render_native_stream_consume_reserved(
@@ -236,6 +248,7 @@ void guest_render_native_stream_reserve_diagnostic(
         GuestRenderNativeStreamReserveDiagnostic *out_diagnostic);
 bool guest_render_native_stream_resolve_active_miss(
         const GuestRenderNativeStreamCommandIdentity *identity,
+        const GpuRenderSemantic *packet_semantic,
         GpuRenderTransactionId *out_visual_id,
         GpuRenderSemantic *out_semantic);
 GuestRenderNativeStreamStatus guest_render_native_stream_note_resolved_consumed(
@@ -268,6 +281,8 @@ void guest_render_native_stream_note_native_packet_attribution(
     uint8_t opcode, bool bound, bool supported, uint32_t source_word_address,
     uint32_t source_pc, uint32_t source_function,
     uint32_t source_return_address);
+void guest_render_native_stream_note_native_draw_source(
+    uint8_t opcode, bool producer_bound);
 void guest_render_native_stream_note_native_state(
     const GuestRenderNativeGpuState *state);
 void guest_render_native_stream_note_independent_vram_present(void);

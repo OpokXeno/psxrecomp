@@ -125,6 +125,11 @@ static void set_fallback(GuestRenderFallbackReason reason) {
 }
 
 static void demote_render(GuestRenderFallbackReason reason) {
+    if (bridge.modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE) {
+        if (reason != GUEST_RENDER_FALLBACK_FORCED_ORIGINAL)
+            set_fallback(reason);
+        return;
+    }
     bridge.modes.effective_render_mode = GUEST_RENDER_RENDER_ORIGINAL;
     set_fallback(reason);
 }
@@ -527,8 +532,14 @@ void guest_render_bridge_reset_scene(void) {
     memset(&bridge.active_handle, 0, sizeof(bridge.active_handle));
     memset(&bridge.active_provenance, 0, sizeof(bridge.active_provenance));
     memset(&bridge.completed, 0, sizeof(bridge.completed));
-    bridge.modes.effective_timing_mode = GUEST_RENDER_TIMING_ORIGINAL;
-    bridge.modes.effective_render_mode = GUEST_RENDER_RENDER_ORIGINAL;
+    if (bridge.modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE) {
+        bridge.modes.effective_timing_mode =
+            bridge.modes.requested_timing_mode;
+        bridge.modes.effective_render_mode = GUEST_RENDER_RENDER_NATIVE;
+    } else {
+        bridge.modes.effective_timing_mode = GUEST_RENDER_TIMING_ORIGINAL;
+        bridge.modes.effective_render_mode = GUEST_RENDER_RENDER_ORIGINAL;
+    }
     bridge.fallback_reason = GUEST_RENDER_FALLBACK_NONE;
     bridge.scene_active = false;
     bridge.state_open = false;

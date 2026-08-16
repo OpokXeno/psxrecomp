@@ -7,7 +7,10 @@
  * (gpu_render.h).  SDL_Window is forward-declared (SDL typedefs it from this
  * same struct tag) so this header needs no SDL include. */
 
+#include <stddef.h>
 #include <stdint.h>
+
+#include "gpu_render.h"
 
 struct SDL_Window;
 
@@ -22,6 +25,11 @@ int  gl_renderer_init_context(struct SDL_Window *win);
 /* Set the GL swap interval / vsync mode (1=vsync, 0=immediate, -1=adaptive).
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
+/* Semantic Native interpolation target. Accepted values: 0/default, 60, 120,
+ * 240. Targets above 60 use immediate swaps plus main-context subframe pacing;
+ * Wayland presentation feedback may phase-align that clock to physical retrace. */
+int gl_renderer_set_native_interpolation_fps(int target_fps);
+int gl_renderer_native_interpolation_fps(void);
 
 /* Presentation-only frame interpolation. High-refresh sub-presents blend the
  * two most recent stable display images; guest simulation timing is unchanged. */
@@ -112,6 +120,302 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
                                     int linear);
 int gl_renderer_native_view_width(void);
 
+/* Native semantic-stream canonical presentation. Selects a host-only
+ * midpoint/current FBO and swaps on the main GL context; it never starts the
+ * legacy interpolation thread. */
+int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
+                                        int linear, int force_4_3);
+
+typedef enum GlRendererNativeMidpointCancelReason {
+    GL_NATIVE_MIDPOINT_CANCEL_NONE = 0,
+    GL_NATIVE_MIDPOINT_CANCEL_GENERIC,
+    GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD,
+    GL_NATIVE_MIDPOINT_CANCEL_REASON_COUNT,
+} GlRendererNativeMidpointCancelReason;
+
+typedef enum GlRendererNativeMidpointResetReason {
+    GL_NATIVE_MIDPOINT_RESET_EXPLICIT = 0,
+    GL_NATIVE_MIDPOINT_RESET_INITIALIZE,
+    GL_NATIVE_MIDPOINT_RESET_SCALE_CHANGE,
+    GL_NATIVE_MIDPOINT_RESET_FPS_CHANGE,
+    GL_NATIVE_MIDPOINT_RESET_BLANK_PRESENT,
+    GL_NATIVE_MIDPOINT_RESET_INVALIDATE_PRESENT,
+    GL_NATIVE_MIDPOINT_RESET_SUSPENSION_CHANGE,
+    GL_NATIVE_MIDPOINT_RESET_VIEW_FREE,
+    GL_NATIVE_MIDPOINT_RESET_PENDING_CANONICAL_MISMATCH,
+    GL_NATIVE_MIDPOINT_RESET_PENDING_VIEW_MISMATCH,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_HEADLESS,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_DEBUG_TURBO,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_TURBO_SKIP,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_LOAD_SKIP,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_FMV_SKIP,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NETPLAY_SKIP,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_DEPTH24_HOLD,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM,
+    GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT,
+    GL_NATIVE_MIDPOINT_RESET_REASON_COUNT,
+} GlRendererNativeMidpointResetReason;
+
+typedef struct GlRendererNativeMidpointDiagnostics {
+    uint32_t target_fps;
+    uint32_t phase_count;
+    uint64_t begun_frames;
+    uint64_t sealed_frames;
+    uint64_t midpoint_presents;
+    uint64_t current_presents;
+    uint64_t midpoint_candidates;
+    uint64_t midpoint_duplicate_empty_frames;
+    uint64_t midpoint_duplicate_static_frames;
+    uint64_t midpoint_eligible_without_duplicate_frames;
+    uint64_t midpoint_ineligible_after_duplicate_frames;
+    uint64_t midpoint_ineligible_without_duplicate_frames;
+    uint64_t midpoint_candidate_pending_current;
+    uint64_t midpoint_candidate_canonical_disabled;
+    uint64_t midpoint_candidate_view_unseeded;
+    uint64_t eligibility_complete_frames;
+    uint64_t eligibility_partial_count_mismatch_frames;
+    uint64_t eligibility_partial_incomplete_match_frames;
+    uint64_t eligibility_no_previous_frames;
+    uint64_t eligibility_overflow_frames;
+    uint64_t eligibility_count_mismatch_frames;
+    uint64_t eligibility_incomplete_match_frames;
+    uint64_t eligibility_static_frames;
+    uint64_t deferred_current_frames;
+    uint64_t deferred_current_flushes;
+    uint64_t host_queue_flush_reasons[9];
+    uint64_t reset_count;
+    uint64_t reset_with_previous_count;
+    uint64_t reset_with_pending_count;
+    uint64_t reset_reason_counts[GL_NATIVE_MIDPOINT_RESET_REASON_COUNT];
+    uint64_t reset_with_previous_reason_counts[
+        GL_NATIVE_MIDPOINT_RESET_REASON_COUNT];
+    uint32_t last_reset_reason;
+    uint64_t pending_mismatch_slot_count;
+    uint64_t pending_mismatch_x_count;
+    uint64_t pending_mismatch_y_count;
+    uint64_t pending_mismatch_width_count;
+    uint64_t pending_mismatch_height_count;
+    uint64_t pending_vertical_lag_count;
+    int last_pending_slot;
+    int last_pending_x;
+    int last_pending_y;
+    int last_pending_width;
+    int last_pending_height;
+    int last_present_slot;
+    int last_present_x;
+    int last_present_y;
+    int last_present_width;
+    int last_present_height;
+    uint64_t cancelled_frames;
+    uint64_t cancel_reason_counts[GL_NATIVE_MIDPOINT_CANCEL_REASON_COUNT];
+    uint32_t last_cancel_reason;
+    uint32_t last_cancel_status;
+    uint64_t last_cancel_workload_current;
+    uint64_t last_cancel_identity_scene;
+    uint32_t last_cancel_identity_producer;
+    uint32_t last_cancel_identity_primitive;
+    int last_cancel_identity_valid;
+    uint64_t workload_epoch;
+    uint64_t workload_recorded;
+    uint64_t workload_total_matched;
+    uint64_t workload_total_snapped;
+    uint64_t workload_total_ambiguous;
+    uint64_t workload_total_moved;
+    uint64_t workload_total_unkeyed;
+    uint64_t workload_total_exact_matches;
+    uint64_t workload_total_exact_semitransparent_matches;
+    uint64_t workload_total_source_geometry_matches;
+    uint64_t workload_total_matched_vertices;
+    uint64_t workload_total_position_changed_vertices;
+    uint64_t workload_total_position_delta_fixed;
+    uint64_t workload_max_semantic_position_delta_fixed;
+    uint64_t workload_max_semantic_identity_scene;
+    uint32_t workload_max_semantic_identity_producer;
+    uint32_t workload_max_semantic_identity_primitive;
+    int workload_max_semantic_identity_valid;
+    uint64_t workload_total_unkeyed_moved_matches;
+    uint64_t workload_total_unkeyed_motion_over_32px;
+    uint64_t workload_total_unkeyed_motion_over_64px;
+    uint64_t workload_total_unkeyed_motion_over_128px;
+    uint64_t workload_total_unkeyed_motion_over_192px;
+    uint64_t workload_total_unkeyed_motion_over_240px;
+    uint64_t workload_max_keyed_semantic_position_delta_fixed;
+    uint64_t workload_max_keyed_semantic_identity_scene;
+    uint32_t workload_max_keyed_semantic_identity_producer;
+    uint32_t workload_max_keyed_semantic_identity_primitive;
+    uint64_t workload_total_keyed_moved_matches;
+    uint64_t workload_total_keyed_motion_over_32px;
+    uint64_t workload_total_keyed_motion_over_64px;
+    uint64_t workload_total_keyed_motion_over_128px;
+    uint64_t workload_total_keyed_motion_over_192px;
+    uint64_t workload_total_keyed_motion_over_240px;
+    uint64_t workload_total_midpoint_distinct_vertices;
+    uint64_t workload_total_midpoint_collapsed_vertices;
+    uint64_t workload_total_midpoint_formula_failures;
+    uint64_t workload_total_projective_input_vertices;
+    uint64_t workload_total_projective_valid_input_vertices;
+    uint64_t workload_total_projective_phase_vertices;
+    uint64_t workload_total_previous_unmatched;
+    uint64_t workload_total_previous_unmatched_keyed;
+    uint64_t workload_total_previous_unmatched_projective;
+    uint64_t workload_total_retrospective_semitransparent_rejected;
+    uint64_t workload_total_eligible_frames;
+    uint64_t workload_total_rejected_no_previous_frames;
+    uint64_t workload_total_rejected_overflow_frames;
+    uint64_t workload_total_rejected_count_mismatch_frames;
+    uint64_t workload_total_rejected_incomplete_match_frames;
+    uint64_t workload_total_rejected_static_frames;
+    uint64_t workload_total_partial_count_mismatch_frames;
+    uint64_t workload_total_partial_incomplete_match_frames;
+    uint64_t workload_current;
+    uint64_t workload_previous;
+    uint64_t workload_matched;
+    uint64_t workload_snapped;
+    uint64_t workload_ambiguous;
+    uint64_t workload_moved;
+    uint64_t workload_unkeyed;
+    uint64_t workload_exact_matches;
+    uint64_t workload_exact_semitransparent_matches;
+    uint64_t workload_source_geometry_matches;
+    uint64_t workload_matched_vertices;
+    uint64_t workload_position_changed_vertices;
+    uint64_t workload_position_delta_fixed;
+    uint64_t workload_midpoint_distinct_vertices;
+    uint64_t workload_midpoint_collapsed_vertices;
+    uint64_t workload_midpoint_formula_failures;
+    uint64_t presented_midpoint_matched_vertices;
+    uint64_t presented_midpoint_position_changed_vertices;
+    uint64_t presented_midpoint_distinct_vertices;
+    uint64_t presented_midpoint_collapsed_vertices;
+    uint64_t presented_midpoint_formula_failures;
+    uint64_t presented_midpoint_position_delta_fixed;
+    uint64_t workload_retrospective_candidates;
+    uint64_t workload_retrospective_budget_exhausted;
+    uint64_t workload_retrospective_semitransparent_rejected;
+    uint64_t workload_last_previous;
+    uint64_t workload_last_current;
+    uint64_t workload_last_previous_unkeyed;
+    uint64_t workload_last_current_unkeyed;
+    uint64_t workload_last_matched;
+    uint64_t workload_last_snapped;
+    uint64_t workload_last_ambiguous;
+    uint64_t workload_last_moved;
+    uint64_t workload_last_exact_matches;
+    uint64_t workload_last_exact_semitransparent_matches;
+    uint64_t workload_last_previous_unmatched;
+    uint64_t workload_last_previous_unmatched_keyed;
+    uint64_t workload_last_previous_unmatched_projective;
+    uint32_t workload_last_eligibility;
+    int workload_last_previous_overflowed;
+    int workload_last_current_overflowed;
+    uint64_t nonsemantic_uploads;
+    uint64_t nonsemantic_fills;
+    uint64_t nonsemantic_margin_clears;
+    uint64_t nonsemantic_copies;
+    uint64_t gl_error_count;
+    uint32_t last_gl_error;
+    uint32_t last_gl_operation;
+    int current_pending_present;
+    int frame_open;
+    int frame_valid;
+    int suspended;
+    int previous_usable;
+} GlRendererNativeMidpointDiagnostics;
+
+typedef struct GlRendererSemanticProducerDiagnostics {
+    uint32_t producer_id;
+    uint64_t semantic_count;
+    uint64_t midpoint_semantic_count;
+    uint64_t primitive_count;
+    uint64_t static_primitive_count;
+    uint64_t fully_moving_primitive_count;
+    uint64_t partially_moving_primitive_count;
+    uint64_t matched_order_count;
+    uint64_t previous_order_inversion_count;
+    uint64_t max_previous_order_regression;
+    uint64_t vertex_count;
+    uint64_t duplicate_vertex_count;
+    uint64_t exact_vertex_conflict_count;
+    uint64_t raster_vertex_conflict_count;
+    uint64_t retired_candidates;
+    uint64_t retired_inserted;
+    uint64_t retired_skipped_history;
+    uint64_t retired_skipped_capacity;
+    uint64_t max_midpoint_delta_fixed;
+    uint32_t max_midpoint_primitive_id;
+} GlRendererSemanticProducerDiagnostics;
+
+typedef struct GlRendererSemanticProducerItemDiagnostics {
+    uint64_t frame;
+    uint64_t scene_id;
+    uint32_t producer_id;
+    uint32_t primitive_id;
+    uint32_t identity_valid;
+    uint32_t queue_order;
+    int32_t base_x;
+    int32_t slot;
+    uint32_t current_order;
+    uint32_t previous_order;
+    uint32_t match_kind;
+    uint32_t fallback_kind;
+    uint32_t subprimitive_index;
+    uint32_t topology;
+    uint32_t screen_space_2d;
+    uint32_t tpage;
+    uint32_t clut_x;
+    uint32_t clut_y;
+    int32_t draw_offset_x;
+    int32_t draw_offset_y;
+    uint32_t draw_area[4];
+    uint32_t textured;
+    uint32_t raw_texture;
+    uint32_t semi_transparent;
+    uint32_t moving_vertex_count;
+    uint64_t midpoint_delta_fixed;
+    int64_t current_area;
+    int64_t midpoint_area;
+    int raw_bounds[4];
+    int uv_bounds[4];
+    int current_bounds[4];
+    int midpoint_bounds[4];
+    int previous_order_valid;
+} GlRendererSemanticProducerItemDiagnostics;
+
+enum {
+    GL_NATIVE_MIDPOINT_GL_SEED_CANONICAL = 1,
+    GL_NATIVE_MIDPOINT_GL_SEED_VIEW,
+    GL_NATIVE_MIDPOINT_GL_MIRROR_RECTS,
+    GL_NATIVE_MIDPOINT_GL_DRAW_CANONICAL,
+    GL_NATIVE_MIDPOINT_GL_DRAW_VIEW,
+    GL_NATIVE_MIDPOINT_GL_FILL_VIEW,
+    GL_NATIVE_MIDPOINT_GL_COPY_CANONICAL,
+    GL_NATIVE_MIDPOINT_GL_COPY_VIEW,
+    GL_NATIVE_MIDPOINT_GL_SNAPSHOT_CURRENT,
+};
+
+/* Native-view midpoint lifecycle. All operations execute on the main GL
+ * context; suspension resets history and keeps FMV/depth24 cadence authored. */
+int gl_renderer_native_midpoint_begin(void);
+int gl_renderer_native_midpoint_seal(void);
+void gl_renderer_native_midpoint_cancel(void);
+void gl_renderer_native_midpoint_reset(void);
+void gl_renderer_native_midpoint_reset_for_reason(
+    GlRendererNativeMidpointResetReason reason);
+void gl_renderer_native_midpoint_set_suspended(int suspended);
+void gl_renderer_native_midpoint_diag(
+    GlRendererNativeMidpointDiagnostics *out_diagnostics);
+void gl_renderer_semantic_producer_diag(
+    uint32_t producer_id,
+    GlRendererSemanticProducerDiagnostics *out_diagnostics);
+size_t gl_renderer_semantic_producer_items(
+    uint32_t producer_id, uint64_t frame, size_t offset,
+    GlRendererSemanticProducerItemDiagnostics *out_items, size_t capacity,
+    size_t *out_total, uint64_t *out_frame);
+GpuRenderTransactionStatus gl_renderer_record_interpolation_anchors(
+    const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
+
 /* Display aspect for the present letterbox (default 4:3). A wide aspect
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */
@@ -128,7 +432,13 @@ void gl_renderer_shutdown(void);
  * GL pipeline is inactive. */
 int  gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out);
 int  gl_renderer_native_view_peek(int base_x, int x, int y,
-                                  int w, int h, uint16_t *out);
+                                   int w, int h, uint16_t *out);
+int  gl_renderer_native_view_center_diff(uint32_t *count, int bbox[4],
+                                          int samples[8][2],
+                                          uint16_t samples_px[8][2]);
+int  gl_renderer_native_view_phase_peek(int base_x, unsigned int phase,
+                                        int x, int y, int w, int h,
+                                        uint16_t *out);
 void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]);
 
 /* Always-on coherency event ring (debug server "gl_coh_ring"): every upload
@@ -163,14 +473,19 @@ int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out);
  * including blank (display-disabled) and CPU-quad presents, which the coherency
  * ring does not record — with the path taken, source display rect, letterbox
  * dest rect, a glGetError sample, wall-clock ms, and a backbuffer pixel sampled
- * at the letterbox centre right before the swap (the ground truth for "did this
- * swap present black"). */
+ * at the letterbox centre right before the swap. Each entry is marked completed
+ * only after its exact SDL_GL_SwapWindow call returns. Native semantic swaps
+ * may additionally carry an opt-in full composed-framebuffer hash and Wayland
+ * presentation feedback proving whether the compositor displayed or discarded
+ * that exact surface commit. */
 enum {
     GL_PRES_VRAM  = 0,   /* 15-bit FBO blit present (gl_renderer_present_vram) */
     GL_PRES_WIDE  = 1,   /* native-wide FBO blit present                       */
     GL_PRES_CPU   = 2,   /* CPU-readout quad present (24-bit FMV / forced)     */
     GL_PRES_BLANK = 3,   /* display-disabled black present                     */
     GL_PRES_INTERP = 4,  /* host-refresh interpolation sub-present              */
+    GL_PRES_NATIVE_CURRENT = 5,  /* native semantic stream, current FBO swap   */
+    GL_PRES_NATIVE_MIDPOINT = 6, /* native semantic stream, midpoint FBO swap  */
 };
 
 typedef struct {
@@ -183,10 +498,60 @@ typedef struct {
     int16_t  lx, ly, lw, lh; /* letterbox dest rect (window px)            */
     uint8_t  src_r, src_g, src_b, src_valid; /* blit SOURCE (hr FBO) sample
                                               * at the display-rect centre  */
+    uint8_t  swap_completed; /* set only after SDL_GL_SwapWindow returns   */
+    uint8_t  phase_numerator;   /* 0 for current/non-semantic presents     */
+    uint8_t  phase_denominator; /* 0 for current/non-semantic presents     */
+    uint8_t  framebuffer_hash_valid;
+    uint8_t  presentation_feedback; /* 0=pending/unavailable, 1=presented, 2=discarded */
+    uint16_t reserved;
+    uint64_t framebuffer_hash;
+    uint64_t presentation_time_ns;
+    uint64_t refresh_sequence;
+    uint32_t refresh_ns;
+    uint32_t presentation_flags;
+    uint8_t  source_hash_valid;
+    uint8_t  source_hash_reserved[7];
+    uint64_t source_hash;
+    uint8_t  geometry_hash_valid;
+    uint8_t  geometry_hash_reserved[7];
+    uint64_t geometry_hash;
+    uint8_t  phase_surface_hash_valid;
+    uint8_t  phase_surface_hash_reserved[7];
+    uint64_t phase_surface_hash;
+    uint8_t  phase_vram_hash_valid;
+    uint8_t  phase_vram_hash_reserved[7];
+    uint64_t phase_vram_hash;
+    int16_t  scanout_dx, scanout_dy, scanout_w, scanout_h;
 } GlPresEvent;
 
 uint64_t gl_renderer_pres_total(void);
 int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out);
+
+typedef struct GlRendererPresentationDiagnostics {
+    uint64_t hash_requested;
+    uint64_t hash_completed;
+    uint64_t hash_dropped;
+    uint64_t source_hash_requested;
+    uint64_t source_hash_completed;
+    uint64_t source_hash_dropped;
+    uint64_t phase_surface_hash_requested;
+    uint64_t phase_surface_hash_completed;
+    uint64_t phase_surface_hash_dropped;
+    uint64_t phase_vram_hash_requested;
+    uint64_t phase_vram_hash_completed;
+    uint64_t phase_vram_hash_dropped;
+    uint64_t feedback_requested;
+    uint64_t feedback_presented;
+    uint64_t feedback_discarded;
+    uint64_t feedback_pending;
+    uint32_t presentation_clock_id;
+    int hash_enabled;
+    int wayland_window;
+    int presentation_protocol_available;
+} GlRendererPresentationDiagnostics;
+
+void gl_renderer_presentation_diagnostics(
+    GlRendererPresentationDiagnostics *out_diagnostics);
 
 /* frame_perf: aggregate the per-frame GPU/CPU phase-timing ring (debug server
  * "frame_perf"). wide_filter: -1 = all frames, 0 = 4:3 present, 1 = native-wide.

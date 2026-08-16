@@ -1,6 +1,7 @@
 #include "gpu.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_render.h"
+#include "gpu_semantic_workload.h"
 
 #include <SDL.h>
 
@@ -66,6 +67,24 @@ static uint32_t gp0_xy(int x, int y) {
     return (uint32_t)(x & 0x3ff) | ((uint32_t)(y & 0x1ff) << 16);
 }
 
+static void set_draw_band(int y) {
+    gpu_write_gp0(UINT32_C(0xe3000000) | ((uint32_t)y << 10u));
+    gpu_write_gp0(UINT32_C(0xe4000000) | UINT32_C(319) |
+                  ((uint32_t)(y + 239) << 10u));
+    gpu_write_gp0(UINT32_C(0xe5000000) |
+                  (((uint32_t)y & UINT32_C(0x7ff)) << 11u));
+}
+
+static void set_display_band(int y) {
+    gpu_write_gp1(UINT32_C(0x05000000) | ((uint32_t)y << 10u));
+}
+
+static void semantic_set_draw_band(GpuRenderSemantic *semantic, int y) {
+    semantic->material.draw_area_top = (uint16_t)y;
+    semantic->material.draw_area_bottom = (uint16_t)(y + 239);
+    semantic->material.draw_offset_y = (int16_t)y;
+}
+
 static uint16_t argb8888_to_rgb555(uint32_t pixel) {
     return (uint16_t)(((pixel >> 3u) & 0x1fu) |
                       ((pixel >> 6u) & 0x03e0u) |
@@ -129,6 +148,17 @@ static void test_native_cull_view_is_independent_of_legacy_wide_mode(void) {
                 "disabling Native culling restores canonical backdrop X stores");
     expect_true(psx_ws_depth_bound(0x0d80) == 0x0d80,
                  "disabling Native culling restores the canonical depth gate");
+
+    gpu_ws_set_temporal_cull_guard_pixels(8);
+    expect_true(psx_ws_x_margin() == 8,
+                "temporal cull guard expands the canonical view");
+    gpu_ws_configure_native_cull(1, 16, 9, 320, 240);
+    expect_true(psx_ws_x_margin() == 62,
+                "temporal cull guard extends the Native wide margin");
+    gpu_ws_set_temporal_cull_guard_pixels(0);
+    expect_true(psx_ws_x_margin() == 54,
+                "disabling temporal coverage restores the Native margin");
+    gpu_ws_configure_native_cull(0, 4, 3, 320, 240);
 }
 
 static void test_semantic_guest_cull_policy(void) {
@@ -392,6 +422,1487 @@ static void test_unbound_gp0_packet_rasterizes_natively(void) {
                  "packet-derived Native triangle rasterizes in OpenGL");
 }
 
+static void test_canonical_native_midpoint_policy(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 10), gp0_xy(18, 10), gp0_xy(10, 18),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+
+    reset_gpu_for_case();
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "canonical Native midpoint runs with the wide view disabled");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "canonical midpoint fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 1u, 1u};
+    gl_renderer_native_midpoint_diag(&before);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "first canonical Native source frame rasterizes");
+    expect_true(gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "first canonical Native source frame presents directly");
+    expect_true(gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "empty duplicate VBlank presents current without spanning workload");
+    gr_native_fill_rect(100, 100, 4, 4, 0);
+    gr_native_copy_rect(100, 100, 104, 100, 4, 4);
+    expect_true(gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "discrete GP0-only duplicate VBlank preserves semantic history");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            semantic.triangles[triangle].vertices[vertex].x +=
+                INT32_C(65536);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "second canonical Native source frame rasterizes");
+    expect_true(gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "changed canonical Native source frame presents midpoint directly");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.previous_usable,
+                "canonical path retains a usable previous frame");
+    expect_true(after.midpoint_presents == before.midpoint_presents + 1u,
+                "canonical path presents one changed-frame midpoint");
+    expect_true(after.midpoint_candidates == before.midpoint_candidates + 1u &&
+                    after.midpoint_duplicate_empty_frames ==
+                        before.midpoint_duplicate_empty_frames + 2u,
+                "canonical path records its duplicate-to-candidate cadence");
+    expect_true(after.workload_total_eligible_frames ==
+                        before.workload_total_eligible_frames + 1u &&
+                    after.eligibility_complete_frames ==
+                        before.eligibility_complete_frames + 1u &&
+                    after.eligibility_no_previous_frames ==
+                        before.eligibility_no_previous_frames + 1u &&
+                    after.workload_total_rejected_no_previous_frames ==
+                        before.workload_total_rejected_no_previous_frames + 1u,
+                "canonical path reports complete-frame eligibility reasons");
+    expect_true(after.current_presents == before.current_presents + 3u,
+                "canonical path presents three current frames");
+    expect_true(after.frame_open,
+                "canonical path opens the next source frame");
+
+    /* MDEC/depth24 callers suspend this exact path. It must render current only
+     * and discard history rather than leak a prior midpoint into video cadence. */
+    gl_renderer_native_midpoint_set_suspended(1);
+    semantic.triangles[0].vertices[0].x += 20 * INT32_C(65536);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "suspended Native frame still rasterizes authoritative current output");
+    expect_true(gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "suspended Native frame presents current directly");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.suspended && !after.previous_usable &&
+                    after.midpoint_presents == before.midpoint_presents + 1u &&
+                    after.current_presents == before.current_presents + 4u,
+                "suspension keeps authored frames out of midpoint history");
+    gl_renderer_native_midpoint_set_suspended(0);
+    /* gpu_init resets GP0 state but intentionally preserves the live FBO; leave
+     * the shared test renderer blank for the Native-view seed fixture below. */
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+}
+
+static void test_canonical_native_partial_midpoint(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 30), gp0_xy(18, 30), gp0_xy(10, 38),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic previous_moving = {0};
+    GpuRenderSemantic previous_retired;
+    GpuRenderSemantic current_moving;
+    GpuRenderSemantic current_born;
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+
+    reset_gpu_for_case();
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "partial midpoint runs with the wide view disabled");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &previous_moving) == 1,
+                "partial midpoint fixture builds semantic geometry");
+    previous_moving.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 9u, 1u, 1u};
+    previous_retired = previous_moving;
+    previous_retired.interpolation_identity.primitive_id = 2u;
+    for (uint8_t triangle = 0u;
+         triangle < previous_retired.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            previous_retired.triangles[triangle].vertices[vertex].x +=
+                50 * INT32_C(65536);
+    gl_renderer_native_midpoint_diag(&before);
+    expect_true(gr_draw_semantic_immediate(&previous_moving) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&previous_retired) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1) &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "partial midpoint fixture establishes prior and duplicate frames");
+
+    gr_native_fill_rect(0, 0, 320, 240, 0);
+    current_moving = previous_moving;
+    for (uint8_t triangle = 0u;
+         triangle < current_moving.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            current_moving.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+    current_born = previous_moving;
+    current_born.interpolation_identity.primitive_id = 3u;
+    for (uint8_t triangle = 0u;
+         triangle < current_born.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            current_born.triangles[triangle].vertices[vertex].x +=
+                100 * INT32_C(65536);
+    expect_true(gr_draw_semantic_immediate(&current_moving) ==
+                     GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&current_born) ==
+                     GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "safe moving match presents beside a snapped born primitive");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.midpoint_presents == before.midpoint_presents + 1u &&
+                    after.midpoint_candidates ==
+                        before.midpoint_candidates + 1u &&
+                    after.workload_total_partial_incomplete_match_frames ==
+                          before.workload_total_partial_incomplete_match_frames +
+                              1u &&
+                    after.eligibility_partial_incomplete_match_frames ==
+                        before.eligibility_partial_incomplete_match_frames +
+                            1u &&
+                    after.workload_last_eligibility ==
+                        GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_INCOMPLETE_MATCH &&
+                    after.workload_last_matched == 1u &&
+                    after.workload_last_snapped == 1u &&
+                    after.workload_last_moved == 1u,
+                "partial midpoint reports one safe match and one local snap");
+    expect_true(after.presented_midpoint_matched_vertices ==
+                        before.presented_midpoint_matched_vertices + 3u &&
+                    after.presented_midpoint_position_changed_vertices ==
+                        before.presented_midpoint_position_changed_vertices +
+                            3u &&
+                    after.presented_midpoint_formula_failures ==
+                        before.presented_midpoint_formula_failures,
+                "completed partial midpoint contains only strict matched motion");
+    expect_true(gl_renderer_present_native_midpoint(
+                    0, 0, 320, 240, 0, 1),
+                "partial midpoint drains its authoritative current frame");
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+}
+
+static void make_retirable_native_triangle(
+        GpuRenderSemantic *semantic, uint32_t primitive_id,
+        uint32_t vertex_group) {
+    semantic->interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 0x8009932cu,
+                                         primitive_id, 1u};
+    for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+        GpuRenderSemanticVertex *position =
+            &semantic->triangles[0].vertices[vertex];
+
+        position->native_view_x =
+            position->x + 80 * INT32_C(65536);
+        position->native_view_y = position->y;
+        position->native_view_position = 1u;
+        position->projective_view_x = 0;
+        position->projective_view_y = 0;
+        position->projective_view_z = 1024;
+        position->projective_offset_x = position->x;
+        position->projective_offset_y = position->y;
+        position->projective_native_offset_x = 80 * INT32_C(65536);
+        position->projective_native_offset_y = 0;
+        position->projective_distance = 256u;
+        position->projective_position = 1u;
+        position->interpolation_group_id = vertex_group;
+        position->interpolation_vertex_id = vertex;
+        position->interpolation_vertex_identity_valid = 1u;
+    }
+}
+
+static void shift_native_triangle_x(GpuRenderSemantic *semantic, int pixels) {
+    const int32_t delta = pixels * INT32_C(65536);
+
+    for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+        GpuRenderSemanticVertex *position =
+            &semantic->triangles[0].vertices[vertex];
+
+        position->x += delta;
+        position->native_view_x += delta;
+        position->projective_offset_x += delta;
+    }
+}
+
+static void test_retired_history_mismatch_preserves_native_present(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 30), gp0_xy(18, 30), gp0_xy(10, 38),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic stale_moving = {0};
+    GpuRenderSemantic stale_retired;
+    GpuRenderSemantic previous_moving;
+    GpuRenderSemantic previous_retired;
+    GpuRenderSemantic current_moving;
+    GpuRenderInterpolationVertexAnchor anchors[3];
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "retired history fixture configures Native view");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &stale_moving) == 1,
+                "retired history fixture builds semantic geometry");
+    make_retirable_native_triangle(&stale_moving, 100u, 0x100u);
+    stale_retired = stale_moving;
+    stale_retired.interpolation_identity.primitive_id = 101u;
+    shift_native_triangle_x(&stale_retired, 40);
+    expect_true(gr_draw_semantic_immediate(&stale_moving) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&stale_retired) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "retired history fixture captures stale host history");
+
+    previous_moving = stale_moving;
+    previous_retired = stale_retired;
+    previous_moving.interpolation_identity.primitive_id = 1u;
+    previous_retired.interpolation_identity.primitive_id = 2u;
+    expect_true(gr_draw_semantic_immediate(&previous_moving) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&previous_retired) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "retired history fixture records the next source frame");
+    gr_fill_rect(900, 400, 1, 1, 0);
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "intervening GPU operation presents after flushing host queue");
+
+    current_moving = previous_moving;
+    shift_native_triangle_x(&current_moving, 20);
+    for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+        GpuRenderSemanticVertex current_vertex =
+            previous_retired.triangles[0].vertices[vertex];
+
+        current_vertex.x += 8 * INT32_C(65536);
+        current_vertex.native_view_x += 8 * INT32_C(65536);
+        current_vertex.projective_offset_x += 8 * INT32_C(65536);
+        anchors[vertex] = (GpuRenderInterpolationVertexAnchor){
+            .scene_id = previous_retired.interpolation_identity.scene_id,
+            .producer_id = previous_retired.interpolation_identity.producer_id,
+            .material = previous_retired.material,
+            .vertex = current_vertex,
+        };
+    }
+    gl_renderer_native_midpoint_diag(&before);
+    expect_true(gr_record_interpolation_anchors(anchors, 3u) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&current_moving) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "stale retired history is skipped without rejecting current present");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.cancelled_frames == before.cancelled_frames,
+                "optional retired geometry never cancels authoritative current frame");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "retired history fixture disables Native view");
+}
+
+static void test_canonical_native_midpoint_cancellation(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 10), gp0_xy(18, 10), gp0_xy(10, 18),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "cancellation fixture keeps the wide view disabled");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "cancellation fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 2u, 1u};
+    gl_renderer_native_midpoint_diag(&before);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "cancellation fixture seals its first source frame");
+    gl_renderer_native_midpoint_cancel();
+    expect_true(gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "cancelled source frame presents authoritative current output");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            semantic.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(0, 0, 320, 240, 0, 1),
+                "post-cancel source frame presents directly");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.cancelled_frames == before.cancelled_frames + 1u &&
+                    after.cancel_reason_counts[
+                        GL_NATIVE_MIDPOINT_CANCEL_GENERIC] ==
+                        before.cancel_reason_counts[
+                            GL_NATIVE_MIDPOINT_CANCEL_GENERIC] + 1u &&
+                    after.last_cancel_reason ==
+                        GL_NATIVE_MIDPOINT_CANCEL_GENERIC &&
+                    after.midpoint_presents == before.midpoint_presents &&
+                    after.current_presents == before.current_presents + 3u,
+                "cancelled source cannot become the next midpoint match");
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+}
+
+static void test_canonical_native_midpoint_duplicate_identity(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 10), gp0_xy(18, 10), gp0_xy(10, 18),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GpuRenderSemantic duplicate;
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "duplicate identity fixture keeps the wide view disabled");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "duplicate identity fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 3u, 1u};
+    gl_renderer_native_midpoint_diag(&before);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1) &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "duplicate identity fixture establishes a prior source frame");
+
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            semantic.triangles[triangle].vertices[vertex].x +=
+                INT32_C(65536);
+    duplicate = semantic;
+    for (uint8_t triangle = 0u; triangle < duplicate.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            duplicate.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&duplicate) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "late duplicate identity keeps authoritative current rendering");
+
+    expect_true(gl_renderer_present_native_midpoint(
+                    0, 0, 320, 240, 0, 1),
+                "post-conflict duplicate VBlank cannot restore stale history");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            semantic.triangles[triangle].vertices[vertex].x +=
+                INT32_C(65536);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "first post-conflict source frame presents current directly");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.cancelled_frames == before.cancelled_frames + 1u &&
+                    after.cancel_reason_counts[
+                        GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD] ==
+                        before.cancel_reason_counts[
+                            GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD] + 1u &&
+                    after.last_cancel_reason ==
+                        GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD &&
+                    after.last_cancel_status ==
+                        GPU_SEMANTIC_WORKLOAD_CONFLICT &&
+                    after.last_cancel_workload_current == 2u &&
+                    after.last_cancel_identity_valid &&
+                    after.last_cancel_identity_scene == 1u &&
+                    after.last_cancel_identity_producer == 1u &&
+                    after.last_cancel_identity_primitive == 3u &&
+                    after.midpoint_presents == before.midpoint_presents &&
+                    after.current_presents == before.current_presents + 5u &&
+                    after.previous_usable,
+                "duplicate identity cancels the complete midpoint frame and rebuilds history from current");
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+}
+
+static void test_native_midpoint_reset_flushes_pending_view_draw(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 80), gp0_xy(18, 80), gp0_xy(10, 88),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlRendererNativeMidpointDiagnostics diagnostics = {0};
+    uint16_t pixel = 0;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "pending-reset Native view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "pending-reset fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 4u, 1u};
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "pending-reset fixture queues its Native draw");
+
+    gl_renderer_native_midpoint_reset();
+
+    expect_true(gl_renderer_native_view_peek(0, 64, 81, 1, 1, &pixel),
+                "reset-flushed Native draw is readable");
+    expect_pixel(pixel, WHITE_1555,
+                 "midpoint reset materializes queued Native work before clearing state");
+    gl_renderer_native_midpoint_diag(&diagnostics);
+    expect_true(!diagnostics.frame_open && !diagnostics.frame_valid &&
+                    !diagnostics.current_pending_present,
+                "midpoint reset clears lifecycle state after materialization");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "pending-reset Native view disables independently");
+}
+
+static void test_native_full_width_copy_flushes_pending_view_draw(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 100), gp0_xy(18, 100), gp0_xy(10, 108),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+    uint16_t source = 0;
+    uint16_t destination = 0;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "full-width-copy Native view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "full-width-copy fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 5u, 1u};
+    gl_renderer_native_midpoint_diag(&before);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "full-width-copy fixture queues its Native source draw");
+
+    gr_native_copy_rect(0, 96, 0, 116, 320, 16);
+
+    expect_true(gl_renderer_native_view_peek(0, 64, 101, 1, 1, &source) &&
+                    gl_renderer_native_view_peek(
+                        0, 64, 121, 1, 1, &destination),
+                "full-width Native copy source and destination are readable");
+    expect_pixel(source, WHITE_1555,
+                 "full-width Native copy retains the queued source draw");
+    expect_pixel(destination, WHITE_1555,
+                 "full-width Native copy observes queued draws in submission order");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.host_queue_flush_reasons[5] ==
+                    before.host_queue_flush_reasons[5] + 1u,
+                "full-width Native copy records its pending-queue barrier");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "full-width-copy Native view disables independently");
+}
+
+static void test_native_midpoint_sequence_a_a_b_c(void) {
+    /* This is a missing-duplicate stress case, not the steady 30->60 cadence.
+     * If C arrives before B's duplicate VBlank, B and then C must drain as two
+     * current presents. Normal A,A,B,B source cadence alternates midpoint/current. */
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 140), gp0_xy(18, 140), gp0_xy(10, 148),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after_b = {0};
+    GlRendererNativeMidpointDiagnostics after_c = {0};
+    GlPresEvent present_event = {0};
+    uint64_t presents_before;
+    uint16_t b_pixel = 0;
+    uint16_t c_pixel = 0;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "A,A,B,C Native view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "A,A,B,C fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 6u, 1u};
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x + 100 * INT32_C(65536);
+            position->native_view_y = position->y;
+            position->native_view_position = 1u;
+        }
+    gl_renderer_native_midpoint_diag(&before);
+    presents_before = gl_renderer_pres_total();
+
+    gr_native_fill_rect(0, 0, 320, 240, 0);
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0) &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "A,A,B,C fixture presents A and its duplicate");
+
+    gr_native_fill_rect(0, 0, 320, 240, 0);
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            semantic.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+            semantic.triangles[triangle].vertices[vertex].native_view_x +=
+                20 * INT32_C(65536);
+        }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "A,A,B,C fixture presents the A-to-B midpoint");
+    gl_renderer_native_midpoint_diag(&after_b);
+    expect_true(after_b.midpoint_presents == before.midpoint_presents + 1u &&
+                    after_b.current_presents == before.current_presents + 2u &&
+                    after_b.current_pending_present,
+                "B is saved as current after the A-to-B midpoint");
+    expect_true(
+        after_b.presented_midpoint_position_changed_vertices ==
+                before.presented_midpoint_position_changed_vertices + 3u &&
+            after_b.presented_midpoint_distinct_vertices ==
+                before.presented_midpoint_distinct_vertices + 3u &&
+            after_b.presented_midpoint_collapsed_vertices ==
+                before.presented_midpoint_collapsed_vertices &&
+            after_b.presented_midpoint_formula_failures ==
+                before.presented_midpoint_formula_failures,
+        "completed A-to-B midpoint contains three strict midpoint vertices");
+    expect_true(gl_renderer_pres_get(presents_before, &present_event) &&
+                    present_event.path == GL_PRES_NATIVE_CURRENT &&
+                    present_event.swap_completed &&
+                    gl_renderer_pres_get(presents_before + 1u, &present_event) &&
+                    present_event.path == GL_PRES_NATIVE_CURRENT &&
+                    present_event.swap_completed &&
+                    gl_renderer_pres_get(presents_before + 2u, &present_event) &&
+                    present_event.path == GL_PRES_NATIVE_MIDPOINT &&
+                    present_event.swap_completed,
+                "present ring distinguishes A,A current swaps from the A-to-B midpoint");
+
+    gr_native_fill_rect(0, 0, 320, 240, 0);
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            semantic.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+            semantic.triangles[triangle].vertices[vertex].native_view_x +=
+                20 * INT32_C(65536);
+        }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "C arrival presents saved B before materializing C");
+    expect_true(gl_renderer_native_view_peek(0, 131, 141, 1, 1, &b_pixel) &&
+                    gl_renderer_native_view_peek(
+                        0, 151, 141, 1, 1, &c_pixel),
+                "post-C Native current surface is readable");
+    expect_pixel(b_pixel, 0,
+                 "post-C current surface does not retain the cleared B position");
+    expect_pixel(c_pixel, WHITE_1555,
+                 "C materializes after saved B is selected for presentation");
+    gl_renderer_native_midpoint_diag(&after_c);
+    expect_true(after_c.midpoint_presents == before.midpoint_presents + 1u &&
+                    after_c.current_presents == before.current_presents + 3u &&
+                    after_c.current_pending_present,
+                "A,A,B,C carries exactly one saved-current presentation debt");
+
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "empty VBlank presents saved C after A,A,B,C");
+    gl_renderer_native_midpoint_diag(&after_c);
+    expect_true(after_c.current_presents == before.current_presents + 4u &&
+                    !after_c.current_pending_present && after_c.frame_open,
+                "saved C drains once and opens the next source frame");
+    expect_true(gl_renderer_pres_get(presents_before + 3u, &present_event) &&
+                    present_event.path == GL_PRES_NATIVE_CURRENT &&
+                    present_event.swap_completed &&
+                    gl_renderer_pres_get(presents_before + 4u, &present_event) &&
+                    present_event.path == GL_PRES_NATIVE_CURRENT &&
+                    present_event.swap_completed,
+                "present ring classifies the saved B and C swaps as current");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "A,A,B,C Native view disables independently");
+}
+
+static void test_native_rational_present_sequence(int target_fps,
+                                                  unsigned int denominator) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 180), gp0_xy(18, 180), gp0_xy(10, 188),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlPresEvent event = {0};
+    const unsigned int subframes = denominator / 2u;
+    uint64_t phase_sequences[GPU_SEMANTIC_INTERPOLATION_MAX_PHASES] = {0};
+    uint64_t current_sequence;
+    uint64_t sequence;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_set_native_interpolation_fps(target_fps),
+                "rational Native interpolation target configures");
+    expect_true(gl_renderer_native_interpolation_fps() == target_fps,
+                "rational Native interpolation target reports exactly");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "rational Native interpolation uses canonical view");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "rational Native interpolation builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 7u, 1u};
+
+    current_sequence = gl_renderer_pres_total();
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "rational Native interpolation presents its first current-only VBlank");
+    for (unsigned int subframe = 0u; subframe < subframes; ++subframe) {
+        expect_true(gl_renderer_pres_get(current_sequence++, &event) &&
+                        event.path == GL_PRES_NATIVE_CURRENT &&
+                        event.phase_numerator == 0u &&
+                        event.phase_denominator == 0u &&
+                        event.swap_completed,
+                    "current-only VBlank repeats current at the rational target cadence");
+    }
+    expect_true(current_sequence == gl_renderer_pres_total(),
+                "first current-only VBlank emits exactly one target half-frame");
+
+    current_sequence = gl_renderer_pres_total();
+    expect_true(gl_renderer_present_native_midpoint(
+                    0, 0, 320, 240, 0, 1),
+                "rational Native interpolation presents its duplicate current-only VBlank");
+    for (unsigned int subframe = 0u; subframe < subframes; ++subframe) {
+        expect_true(gl_renderer_pres_get(current_sequence++, &event) &&
+                        event.path == GL_PRES_NATIVE_CURRENT &&
+                        event.phase_numerator == 0u &&
+                        event.phase_denominator == 0u &&
+                        event.swap_completed,
+                    "duplicate current-only VBlank repeats current at the target cadence");
+    }
+    expect_true(current_sequence == gl_renderer_pres_total(),
+                "duplicate current-only VBlank emits exactly one target half-frame");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            semantic.triangles[triangle].vertices[vertex].x +=
+                80 * INT32_C(65536);
+
+    sequence = gl_renderer_pres_total();
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "rational Native interpolation presents first phase half");
+    for (unsigned int numerator = 1u;
+         numerator <= denominator / 2u; ++numerator) {
+        phase_sequences[numerator - 1u] = sequence;
+        expect_true(gl_renderer_pres_get(sequence++, &event) &&
+                        event.path == GL_PRES_NATIVE_MIDPOINT &&
+                        event.phase_numerator == numerator &&
+                        event.phase_denominator == denominator &&
+                        event.swap_completed,
+                    "first VBlank presents each rational phase in order");
+    }
+    expect_true(gl_renderer_present_native_midpoint(
+                    0, 0, 320, 240, 0, 1),
+                "rational Native interpolation presents second phase half");
+    for (unsigned int numerator = denominator / 2u + 1u;
+         numerator < denominator; ++numerator) {
+        phase_sequences[numerator - 1u] = sequence;
+        expect_true(gl_renderer_pres_get(sequence++, &event) &&
+                        event.path == GL_PRES_NATIVE_MIDPOINT &&
+                        event.phase_numerator == numerator &&
+                        event.phase_denominator == denominator &&
+                        event.swap_completed,
+                    "second VBlank presents each rational phase in order");
+    }
+    expect_true(gl_renderer_pres_get(sequence++, &event) &&
+                    event.path == GL_PRES_NATIVE_CURRENT &&
+                    event.phase_numerator == 0u &&
+                    event.phase_denominator == 0u &&
+                    event.swap_completed,
+                "second VBlank ends on current without stale phase metadata");
+    expect_true(sequence == gl_renderer_pres_total(),
+                "rational Native cadence emits no hidden extra swaps");
+    {
+        uint64_t previous_hash = 0u;
+        uint64_t previous_source_hash = 0u;
+        uint64_t previous_geometry_hash = 0u;
+        uint64_t previous_phase_surface_hash = 0u;
+        uint64_t previous_phase_vram_hash = 0u;
+        for (unsigned int numerator = 1u;
+             numerator < denominator; ++numerator) {
+            expect_true(gl_renderer_pres_get(
+                            phase_sequences[numerator - 1u], &event) &&
+                            event.framebuffer_hash_valid &&
+                            event.source_hash_valid &&
+                            event.geometry_hash_valid &&
+                            event.phase_surface_hash_valid &&
+                            event.phase_vram_hash_valid,
+                        "canonical Native phase has geometry, phase-VRAM, visible-source, and final hashes");
+            if (event.framebuffer_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.framebuffer_hash != previous_hash,
+                            "successive rational Native phase framebuffers are distinct");
+                previous_hash = event.framebuffer_hash;
+            }
+            if (event.source_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.source_hash != previous_source_hash,
+                            "successive rational Native phase sources are distinct");
+                previous_source_hash = event.source_hash;
+            }
+            if (event.geometry_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.geometry_hash != previous_geometry_hash,
+                            "successive canonical Native phase geometry is distinct");
+                previous_geometry_hash = event.geometry_hash;
+            }
+            if (event.phase_surface_hash_valid) {
+                expect_true(numerator == 1u || event.phase_surface_hash !=
+                                previous_phase_surface_hash,
+                            "successive canonical Native phase surfaces are distinct");
+                previous_phase_surface_hash = event.phase_surface_hash;
+            }
+            if (event.phase_vram_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.phase_vram_hash != previous_phase_vram_hash,
+                            "successive canonical Native phase VRAM images are distinct");
+                previous_phase_vram_hash = event.phase_vram_hash;
+            }
+        }
+    }
+    expect_true(gl_renderer_set_native_interpolation_fps(60),
+                "rational Native interpolation restores the 60 FPS target");
+}
+
+static void test_native_wide_rational_present_sequence(
+        int target_fps, unsigned int denominator) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 180), gp0_xy(18, 180), gp0_xy(10, 188),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlPresEvent event = {0};
+    uint64_t phase_sequences[GPU_SEMANTIC_INTERPOLATION_MAX_PHASES] = {0};
+    uint64_t current_sequence;
+    uint64_t sequence;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_set_native_interpolation_fps(target_fps),
+                "Native-wide rational interpolation target configures");
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "Native-wide rational interpolation view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "Native-wide rational interpolation builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 8u, 1u};
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x + 100 * INT32_C(65536);
+            position->native_view_y = position->y;
+            position->native_view_position = 1u;
+        }
+
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0) &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "Native-wide rational interpolation establishes A,A history");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            semantic.triangles[triangle].vertices[vertex].x +=
+                80 * INT32_C(65536);
+            semantic.triangles[triangle].vertices[vertex].native_view_x +=
+                80 * INT32_C(65536);
+        }
+
+    sequence = gl_renderer_pres_total();
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "Native-wide rational interpolation presents its first phase half");
+    for (unsigned int numerator = 1u;
+         numerator <= denominator / 2u; ++numerator)
+        phase_sequences[numerator - 1u] = sequence++;
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "Native-wide rational interpolation presents its second phase half");
+    for (unsigned int numerator = denominator / 2u + 1u;
+         numerator < denominator; ++numerator)
+        phase_sequences[numerator - 1u] = sequence++;
+    current_sequence = sequence++;
+    expect_true(sequence == gl_renderer_pres_total(),
+                "Native-wide rational cadence emits no hidden extra swaps");
+    {
+        uint64_t previous_hash = 0u;
+        uint64_t previous_source_hash = 0u;
+        uint64_t previous_geometry_hash = 0u;
+        uint64_t previous_phase_surface_hash = 0u;
+        uint64_t previous_phase_vram_hash = 0u;
+        for (unsigned int numerator = 1u;
+             numerator < denominator; ++numerator) {
+            expect_true(gl_renderer_pres_get(
+                            phase_sequences[numerator - 1u], &event) &&
+                            event.path == GL_PRES_NATIVE_MIDPOINT &&
+                            event.phase_numerator == numerator &&
+                            event.phase_denominator == denominator &&
+                            event.framebuffer_hash_valid &&
+                            event.source_hash_valid &&
+                            event.geometry_hash_valid &&
+                            event.phase_surface_hash_valid &&
+                            event.phase_vram_hash_valid,
+                        "Native-wide phase has ordered geometry, phase-VRAM, visible-source, and final hashes");
+            if (event.framebuffer_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.framebuffer_hash != previous_hash,
+                            "successive Native-wide phase framebuffers are distinct");
+                previous_hash = event.framebuffer_hash;
+            }
+            if (event.source_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.source_hash != previous_source_hash,
+                            "successive Native-wide phase sources are distinct");
+                previous_source_hash = event.source_hash;
+            }
+            if (event.geometry_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.geometry_hash != previous_geometry_hash,
+                            "successive Native-wide phase geometry is distinct");
+                previous_geometry_hash = event.geometry_hash;
+            }
+            if (event.phase_surface_hash_valid) {
+                expect_true(numerator == 1u || event.phase_surface_hash !=
+                                previous_phase_surface_hash,
+                            "successive Native-wide phase surfaces are distinct");
+                previous_phase_surface_hash = event.phase_surface_hash;
+            }
+            if (event.phase_vram_hash_valid) {
+                expect_true(numerator == 1u ||
+                                event.phase_vram_hash != previous_phase_vram_hash,
+                            "successive Native-wide phase VRAM images are distinct");
+                previous_phase_vram_hash = event.phase_vram_hash;
+            }
+        }
+        expect_true(gl_renderer_pres_get(current_sequence, &event) &&
+                        event.path == GL_PRES_NATIVE_CURRENT &&
+                        event.geometry_hash_valid &&
+                        event.geometry_hash != previous_geometry_hash,
+                    "Native-wide current preserves distinct pending-frame geometry");
+    }
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "Native-wide rational interpolation view disables");
+    expect_true(gl_renderer_set_native_interpolation_fps(60),
+                "Native-wide rational interpolation restores 60 FPS");
+}
+
+static void expect_vertical_phase_band(uint64_t sequence, const char *label) {
+    static const unsigned int numerator[4] = {1u, 2u, 3u, 0u};
+    static const unsigned int denominator[4] = {4u, 4u, 4u, 0u};
+    static const int scanout_y[4] = {0, 0, 256, 256};
+
+    for (unsigned int index = 0u; index < 4u; ++index) {
+        GlPresEvent event = {0};
+
+        expect_true(gl_renderer_pres_get(sequence + index, &event) &&
+                        event.dy == 256 && event.h == 240 &&
+                        event.scanout_dy == scanout_y[index] &&
+                        event.scanout_h == 240 &&
+                        event.phase_numerator == numerator[index] &&
+                        event.phase_denominator == denominator[index],
+                    label);
+    }
+}
+
+static void test_canonical_native_vertical_double_buffer(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 180), gp0_xy(18, 180), gp0_xy(10, 188),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    uint64_t sequence;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_set_native_interpolation_fps(120),
+                "canonical vertical-buffer interpolation target configures");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "canonical vertical-buffer view configures");
+    set_draw_band(0);
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "canonical vertical-buffer fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 9u, 1u};
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1) &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "canonical vertical-buffer fixture establishes A,A history");
+
+    set_draw_band(256);
+    semantic_set_draw_band(&semantic, 256);
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            semantic.triangles[triangle].vertices[vertex].x +=
+                80 * INT32_C(65536);
+    sequence = gl_renderer_pres_total();
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_midpoint(
+                        0, 0, 320, 240, 0, 1),
+                "canonical vertical-buffer fixture presents B phase head");
+    set_display_band(256);
+    expect_true(gl_renderer_present_native_midpoint(
+                        0, 256, 320, 240, 0, 1),
+                "canonical vertical-buffer fixture presents B phase tail");
+    expect_vertical_phase_band(
+        sequence,
+        "canonical B phases sample the rendered band before the GP1 flip");
+    expect_true(gl_renderer_set_native_interpolation_fps(60),
+                "canonical vertical-buffer interpolation restores 60 FPS");
+}
+
+static void test_native_wide_vertical_double_buffer(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 180), gp0_xy(18, 180), gp0_xy(10, 188),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    uint64_t sequence;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_set_native_interpolation_fps(120),
+                "Native-wide vertical-buffer interpolation target configures");
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "Native-wide vertical-buffer view configures");
+    set_draw_band(0);
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "Native-wide vertical-buffer fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 10u, 1u};
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x + 100 * INT32_C(65536);
+            position->native_view_y = position->y;
+            position->native_view_position = 1u;
+        }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0) &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "Native-wide vertical-buffer fixture establishes A,A history");
+
+    set_draw_band(256);
+    semantic_set_draw_band(&semantic, 256);
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            semantic.triangles[triangle].vertices[vertex].x +=
+                80 * INT32_C(65536);
+            semantic.triangles[triangle].vertices[vertex].native_view_x +=
+                80 * INT32_C(65536);
+        }
+    sequence = gl_renderer_pres_total();
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "Native-wide vertical-buffer fixture presents B phase head");
+    set_display_band(256);
+    expect_true(gl_renderer_present_native_view(0, 256, 240, 0),
+                "Native-wide vertical-buffer fixture presents B phase tail");
+    expect_vertical_phase_band(
+        sequence,
+        "Native-wide B phases sample the rendered band before the GP1 flip");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "Native-wide vertical-buffer view disables");
+    expect_true(gl_renderer_set_native_interpolation_fps(60),
+                "Native-wide vertical-buffer interpolation restores 60 FPS");
+}
+
+static void test_native_wide_pending_current_precedes_vertical_flip(void) {
+    const uint32_t words[] = {
+        0x20ffffffu,
+        gp0_xy(10, 180), gp0_xy(18, 180), gp0_xy(10, 188),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+    GlPresEvent event = {0};
+    GlRendererNativeMidpointDiagnostics before = {0};
+    GlRendererNativeMidpointDiagnostics after = {0};
+    uint64_t sequence;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "vertical-lag Native view configures");
+    set_draw_band(0);
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "vertical-lag fixture builds semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 11u, 1u};
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x + 100 * INT32_C(65536);
+            position->native_view_y = position->y;
+            position->native_view_position = 1u;
+        }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0) &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "vertical-lag fixture establishes A,A history");
+
+    set_draw_band(256);
+    semantic_set_draw_band(&semantic, 256);
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            semantic.triangles[triangle].vertices[vertex].x +=
+                80 * INT32_C(65536);
+            semantic.triangles[triangle].vertices[vertex].native_view_x +=
+                80 * INT32_C(65536);
+        }
+    gl_renderer_native_midpoint_diag(&before);
+    sequence = gl_renderer_pres_total();
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "vertical-lag fixture presents B midpoint before GP1 flip");
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "vertical-lag fixture presents saved B while scanout still names A");
+    gl_renderer_native_midpoint_diag(&after);
+    expect_true(after.midpoint_presents == before.midpoint_presents + 1u &&
+                    after.current_presents == before.current_presents + 1u &&
+                    after.reset_count == before.reset_count &&
+                    after.pending_vertical_lag_count ==
+                        before.pending_vertical_lag_count + 1u &&
+                    after.previous_usable && !after.current_pending_present,
+                "vertical scanout lag drains saved current without discarding semantic history");
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0) &&
+                    gl_renderer_pres_get(sequence + 2u, &event) &&
+                    event.path == GL_PRES_NATIVE_CURRENT &&
+                    event.dy == 256 && event.scanout_dy == 0,
+                "promoted current remains visible while GP1 still names the old band");
+    set_display_band(256);
+    expect_true(gl_renderer_present_native_view(0, 256, 240, 0) &&
+                    gl_renderer_pres_get(sequence + 3u, &event) &&
+                    event.path == GL_PRES_NATIVE_CURRENT &&
+                    event.dy == 256 && event.scanout_dy == 256,
+                "GP1 catch-up retires the promoted-band override without changing content");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "vertical-lag Native view disables");
+}
+
+static void test_native_wide_current_and_phase_share_subpixel_raster(void) {
+    const uint32_t stationary_words[] = {
+        0x28ffffffu,
+        gp0_xy(20, 20), gp0_xy(28, 20), gp0_xy(20, 28), gp0_xy(28, 28),
+    };
+    const uint32_t moving_words[] = {
+        0x28ffffffu,
+        gp0_xy(180, 20), gp0_xy(188, 20), gp0_xy(180, 28), gp0_xy(188, 28),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic stationary = {0};
+    GpuRenderSemantic moving = {0};
+    uint16_t phase_pixels[24 * 24] = {0};
+    uint16_t current_pixels[24 * 24] = {0};
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "subpixel-raster Native view configures");
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    stationary_words,
+                    sizeof(stationary_words) / sizeof(stationary_words[0]),
+                    &environment, &stationary) == 1 &&
+                    gpu_native_semantic_from_gp0(
+                        moving_words,
+                        sizeof(moving_words) / sizeof(moving_words[0]),
+                        &environment, &moving) == 1,
+                "subpixel-raster fixture builds both quads");
+    stationary.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 12u, 1u};
+    moving.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 13u, 1u};
+    for (uint8_t triangle = 0u; triangle < stationary.triangle_count;
+         ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &stationary.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x +
+                80 * INT32_C(65536) + 3 * INT32_C(16384);
+            position->native_view_y = position->y + 3 * INT32_C(16384);
+            position->native_view_position = 1u;
+        }
+    for (uint8_t triangle = 0u; triangle < moving.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &moving.triangles[triangle].vertices[vertex];
+            position->native_view_x = position->x +
+                80 * INT32_C(65536) + 3 * INT32_C(16384);
+            position->native_view_y = position->y + 3 * INT32_C(16384);
+            position->native_view_position = 1u;
+        }
+    expect_true(gr_draw_semantic_immediate(&stationary) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&moving) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0) &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "subpixel-raster fixture establishes A,A history");
+    for (uint8_t triangle = 0u; triangle < moving.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            moving.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+            moving.triangles[triangle].vertices[vertex].native_view_x +=
+                20 * INT32_C(65536);
+        }
+    expect_true(gr_draw_semantic_immediate(&stationary) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gr_draw_semantic_immediate(&moving) ==
+                    GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_present_native_view(0, 0, 240, 0),
+                "subpixel-raster fixture presents its moving midpoint");
+    expect_true(gl_renderer_native_view_phase_peek(
+                    0, 0u, 92, 12, 24, 24, phase_pixels) &&
+                    gl_renderer_native_view_peek(
+                        0, 92, 12, 24, 24, current_pixels),
+                "subpixel-raster current and midpoint regions are readable");
+    expect_true(memcmp(phase_pixels, current_pixels, sizeof(phase_pixels)) == 0,
+                "stationary non-projective Native geometry keeps stable current and phase coverage");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "subpixel-raster Native view disables");
+}
+
+static void render_native_quad_raster_xy(
+        int32_t fraction_x, int32_t fraction_y,
+        int suspended, int projective,
+        uint16_t current_pixels[24 * 24],
+        uint16_t phase_pixels[24 * 24]) {
+    const uint32_t words[] = {
+        0x28ffffffu,
+        gp0_xy(20, 20), gp0_xy(28, 20), gp0_xy(20, 28), gp0_xy(28, 28),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic = {0};
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "suspended-raster Native view configures");
+    gl_renderer_native_midpoint_set_suspended(suspended);
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    words, sizeof(words) / sizeof(words[0]), &environment,
+                    &semantic) == 1,
+                "suspended-raster fixture builds its quad");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            GpuRenderSemanticVertex *position =
+                &semantic.triangles[triangle].vertices[vertex];
+            position->native_view_x =
+                position->x + 80 * INT32_C(65536) + fraction_x;
+            position->native_view_y = position->y + fraction_y;
+            position->native_view_position = 1u;
+            position->projective_position = projective ? 1u : 0u;
+        }
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                     GPU_RENDER_TRANSACTION_OK &&
+                    gl_renderer_native_view_peek(
+                        0, 92, 0, 24, 24, current_pixels) &&
+                    (phase_pixels == NULL ||
+                     gl_renderer_native_view_phase_peek(
+                          0, 0u, 92, 0, 24, 24, phase_pixels)),
+                "suspended-raster Native current region is readable");
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "suspended-raster Native view disables");
+    gl_renderer_native_midpoint_set_suspended(0);
+}
+
+static void render_native_quad_raster(
+        int32_t fraction, int suspended, int projective,
+        uint16_t current_pixels[24 * 24],
+        uint16_t phase_pixels[24 * 24]) {
+    render_native_quad_raster_xy(
+        fraction, fraction, suspended, projective,
+        current_pixels, phase_pixels);
+}
+
+static void test_native_wide_suspended_current_uses_integer_raster(void) {
+    uint16_t fractional_pixels[24 * 24] = {0};
+    uint16_t integer_pixels[24 * 24] = {0};
+
+    render_native_quad_raster(
+        3 * INT32_C(16384), 1, 0, fractional_pixels, NULL);
+    render_native_quad_raster(0, 1, 0, integer_pixels, NULL);
+    expect_true(memcmp(fractional_pixels, integer_pixels,
+                       sizeof(fractional_pixels)) == 0,
+                "suspended Native current truncates fractional geometry to the authored integer raster");
+}
+
+static void test_native_wide_projective_geometry_uses_integer_raster(void) {
+    uint16_t fractional_current[24 * 24] = {0};
+    uint16_t fractional_phase[24 * 24] = {0};
+    uint16_t integer_current[24 * 24] = {0};
+    uint16_t integer_phase[24 * 24] = {0};
+
+    render_native_quad_raster(
+        3 * INT32_C(16384), 0, 1,
+        fractional_current, fractional_phase);
+    render_native_quad_raster(
+        0, 0, 1, integer_current, integer_phase);
+    expect_true(memcmp(fractional_current, integer_current,
+                       sizeof(fractional_current)) == 0,
+                "projective Native current preserves authored integer coverage");
+    expect_true(memcmp(fractional_phase, integer_phase,
+                       sizeof(fractional_phase)) == 0,
+                "projective Native phase preserves authored integer coverage");
+}
+
+static void test_native_wide_phase_uses_integer_raster(void) {
+    uint16_t fractional_current[24 * 24] = {0};
+    uint16_t fractional_phase[24 * 24] = {0};
+    uint16_t integer_current[24 * 24] = {0};
+    uint16_t integer_phase[24 * 24] = {0};
+
+    render_native_quad_raster(
+        3 * INT32_C(16384), 0, 0,
+        fractional_current, fractional_phase);
+    render_native_quad_raster(
+        0, 0, 0, integer_current, integer_phase);
+    expect_true(memcmp(fractional_current, integer_current,
+                       sizeof(fractional_current)) == 0,
+                "non-projective Native current preserves integer coverage");
+    expect_true(memcmp(fractional_phase, integer_phase,
+                       sizeof(fractional_phase)) == 0,
+                "non-projective Native phase preserves integer coverage");
+}
+
+static void test_native_wide_negative_fixed_positions_floor(void) {
+    uint16_t fractional_pixels[24 * 24] = {0};
+    uint16_t floored_pixels[24 * 24] = {0};
+
+    render_native_quad_raster_xy(
+        0, -20 * INT32_C(65536) - INT32_C(16384),
+        1, 1, fractional_pixels, NULL);
+    render_native_quad_raster_xy(
+        0, -21 * INT32_C(65536),
+        1, 1, floored_pixels, NULL);
+    expect_true(memcmp(fractional_pixels, floored_pixels,
+                       sizeof(fractional_pixels)) == 0,
+                "negative Native 16.16 positions use PS1 floor rounding at the viewport edge");
+}
+
+static void test_native_textured_subpixel_seam_uses_raster_geometry(void) {
+    static const int32_t x[4] = {
+        90 * INT32_C(65536), 100 * INT32_C(65536),
+        90 * INT32_C(65536) + INT32_C(16384),
+        100 * INT32_C(65536),
+    };
+    static const int32_t y[4] = {
+        50 * INT32_C(65536), 50 * INT32_C(65536),
+        60 * INT32_C(65536), 60 * INT32_C(65536),
+    };
+    static const uint8_t split[2][3] = {{0u, 1u, 2u}, {1u, 3u, 2u}};
+    static const int32_t u[2][3] = {
+        {INT32_C(65536), 0, INT32_C(65536)},
+        {0, 0, 0},
+    };
+    GpuRenderSemantic semantic = {0};
+    uint16_t current_region[12 * 12] = {0};
+    uint16_t phase_region[12 * 12] = {0};
+    uint32_t covered = 0u;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gr_vram_write(0, 0, WHITE_1555);
+    gl_renderer_flush_cpu_uploads();
+    gr_set_texture_filter(1);
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "textured-subpixel seam Native view configures");
+
+    semantic.material.tpage = TEXTURE_PAGE_15BPP;
+    semantic.material.texture_depth = GPU_RENDER_TEXTURE_15_BIT;
+    semantic.material.shading = GPU_RENDER_SHADING_FLAT;
+    semantic.material.textured = 1u;
+    semantic.material.raw_texture = 1u;
+    semantic.material.draw_area_right = 319u;
+    semantic.material.draw_area_bottom = 239u;
+    semantic.triangle_count = 2u;
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 14u, 1u};
+    for (uint8_t triangle = 0u; triangle < 2u; ++triangle) {
+        semantic.triangles[triangle].split_index = triangle;
+        semantic.triangles[triangle].split_count = 2u;
+        for (uint8_t vertex_index = 0u; vertex_index < 3u; ++vertex_index) {
+            const uint8_t source = split[triangle][vertex_index];
+            GpuRenderSemanticVertex *vertex =
+                &semantic.triangles[triangle].vertices[vertex_index];
+
+            vertex->x =
+                (x[source] / INT32_C(65536) - 80) * INT32_C(65536);
+            vertex->y = y[source];
+            vertex->u = u[triangle][vertex_index];
+            vertex->v = 0;
+            vertex->r = vertex->g = vertex->b = 0x80u;
+            vertex->native_view_x = x[source];
+            vertex->native_view_y = y[source];
+            vertex->native_view_position = 1u;
+        }
+    }
+
+    expect_true(gr_draw_semantic_immediate(&semantic) ==
+                    GPU_RENDER_TRANSACTION_OK,
+                "fractional adjacent textured triangles rasterize");
+    expect_true(gl_renderer_native_view_peek(
+                    0, 89, 49, 12, 12, current_region) &&
+                    gl_renderer_native_view_phase_peek(
+                        0, 0u, 89, 49, 12, 12, phase_region),
+                "fractional textured phase seam pixels are readable");
+    expect_true(memcmp(current_region, phase_region,
+                       sizeof(current_region)) == 0,
+                "textured current and phase share identical integer edge coverage");
+    for (uint32_t index = 0u; index < 12u * 12u; ++index)
+        covered += phase_region[index] == WHITE_1555;
+    expect_true(covered != 0u,
+                "textured integer phase retains covered triangle pixels");
+
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "textured-subpixel seam Native view disables");
+    gr_set_texture_filter(0);
+}
+
+static void test_native_wide_current_present_sequence(int target_fps,
+                                                      unsigned int denominator) {
+    GlPresEvent event = {0};
+    const unsigned int subframes = denominator / 2u;
+    uint64_t sequence;
+
+    reset_gpu_for_case();
+    gr_fill_rect(0, 0, 1024, 512, 0);
+    gl_renderer_flush_cpu_uploads();
+    expect_true(gl_renderer_set_native_interpolation_fps(target_fps),
+                "Native-wide current cadence target configures");
+    expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
+                "Native-wide current cadence view configures");
+
+    sequence = gl_renderer_pres_total();
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "Native-wide current-only VBlank presents");
+    for (unsigned int subframe = 0u; subframe < subframes; ++subframe) {
+        expect_true(gl_renderer_pres_get(sequence++, &event) &&
+                        event.path == GL_PRES_NATIVE_CURRENT &&
+                        event.phase_numerator == 0u &&
+                        event.phase_denominator == 0u &&
+                        event.swap_completed,
+                    "Native-wide current-only VBlank repeats current at the target cadence");
+    }
+    expect_true(sequence == gl_renderer_pres_total(),
+                "Native-wide current-only VBlank emits exactly one target half-frame");
+
+    gl_renderer_native_midpoint_set_suspended(1);
+    sequence = gl_renderer_pres_total();
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "suspended Native-wide current VBlank presents");
+    expect_true(gl_renderer_pres_get(sequence++, &event) &&
+                    event.path == GL_PRES_NATIVE_CURRENT &&
+                    event.phase_numerator == 0u &&
+                    event.phase_denominator == 0u &&
+                    event.swap_completed &&
+                    sequence == gl_renderer_pres_total(),
+                "suspension preserves one authored current swap per VBlank");
+    gl_renderer_native_midpoint_set_suspended(0);
+
+    expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
+                "Native-wide current cadence view disables");
+    expect_true(gl_renderer_set_native_interpolation_fps(60),
+                "Native-wide current cadence restores the 60 FPS target");
+}
+
 static void test_native_view_uses_semantic_wide_positions(void) {
     const uint32_t clear[] = {
         0x02000000u, gp0_xy(100, 0), gp0_xy(32, 32),
@@ -405,6 +1916,9 @@ static void test_native_view_uses_semantic_wide_positions(void) {
     };
     GpuNativeDrawEnvironment environment;
     GpuRenderSemantic semantic = {0};
+    GlRendererNativeMidpointDiagnostics midpoint_diag = {0};
+    uint64_t midpoint_presents_before;
+    uint64_t current_presents_before;
     uint16_t canonical = 0;
     uint16_t native = 0;
     uint16_t duplicated = 0;
@@ -412,6 +1926,9 @@ static void test_native_view_uses_semantic_wide_positions(void) {
     reset_gpu_for_case();
     expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
                 "producer-driven Native 16:9 surface configures");
+    gl_renderer_native_midpoint_diag(&midpoint_diag);
+    midpoint_presents_before = midpoint_diag.midpoint_presents;
+    current_presents_before = midpoint_diag.current_presents;
     expect_true(gpu_native_submit_gp0_packet(
                     clear, sizeof(clear) / sizeof(clear[0]), NULL, &source) == 1,
                 "Native restore test clears the canonical reseed source");
@@ -419,6 +1936,8 @@ static void test_native_view_uses_semantic_wide_positions(void) {
     expect_true(gpu_native_semantic_from_gp0(
                     words, 4, &environment, &semantic) == 1,
                 "Native view test builds canonical semantic geometry");
+    semantic.interpolation_identity =
+        (GpuRenderInterpolationIdentity){1u, 1u, 3u, 1u};
     for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle) {
         for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
             GpuRenderSemanticVertex *position =
@@ -448,6 +1967,44 @@ static void test_native_view_uses_semantic_wide_positions(void) {
                 "producer-driven Native surface presents directly through OpenGL");
     expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
                 "Native surface presents again without an intervening packet");
+    for (uint8_t triangle = 0u; triangle < semantic.triangle_count; ++triangle)
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex) {
+            semantic.triangles[triangle].vertices[vertex].x +=
+                20 * INT32_C(65536);
+            semantic.triangles[triangle].vertices[vertex].native_view_x +=
+                20 * INT32_C(65536);
+        }
+    expect_true(gpu_native_submit_gp0_packet(
+                    words, 4, &semantic, &source) == 1,
+                "second structural frame records an online midpoint draw");
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "changed source VBlank presents the Native midpoint");
+    gl_renderer_native_midpoint_diag(&midpoint_diag);
+    expect_true(midpoint_diag.previous_usable,
+                "Native midpoint retains a usable previous frame");
+    expect_true(midpoint_diag.midpoint_presents ==
+                    midpoint_presents_before + 1u,
+                "Native midpoint presents one changed frame");
+    expect_true(midpoint_diag.current_presents ==
+                    current_presents_before + 2u,
+                "Native midpoint presents two current frames");
+    expect_true(midpoint_diag.frame_open &&
+                    midpoint_diag.current_pending_present &&
+                    midpoint_diag.deferred_current_frames != 0u &&
+                    midpoint_diag.deferred_current_flushes != 0u,
+                "Native midpoint snapshots the complete current frame for its duplicate VBlank");
+    expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
+                "duplicate VBlank rasterizes and presents the deferred current tail");
+    expect_true(gl_renderer_native_view_peek(0, 132, 11, 1, 1, &native),
+                "deferred current geometry is readable after the duplicate VBlank");
+    expect_pixel(native, WHITE_1555,
+                 "duplicate VBlank rasterizes the authoritative current position");
+    gl_renderer_native_midpoint_diag(&midpoint_diag);
+    expect_true(midpoint_diag.current_presents ==
+                    current_presents_before + 3u &&
+                    !midpoint_diag.current_pending_present &&
+                    midpoint_diag.frame_open,
+                "duplicate VBlank presents the saved current frame and opens the next source frame");
     gl_renderer_invalidate_present();
     expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
                 "invalidated Native surface reseeds before presentation");
@@ -1306,6 +2863,7 @@ int main(void) {
     if (failures) return 1;
 
     SDL_SetMainReady();
+    SDL_setenv("PSX_GL_PRESENT_HASH", "1", 1);
     expect_true(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL video initializes");
     if (failures) return 1;
 
@@ -1315,7 +2873,7 @@ int main(void) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     window = SDL_CreateWindow("gpu_gl_mask_order_test", SDL_WINDOWPOS_UNDEFINED,
-                              SDL_WINDOWPOS_UNDEFINED, 32, 32,
+                              SDL_WINDOWPOS_UNDEFINED, 640, 360,
                               SDL_WINDOW_HIDDEN | SDL_WINDOW_OPENGL);
     expect_true(window != NULL, "hidden SDL OpenGL window is created");
     if (!window) {
@@ -1332,6 +2890,29 @@ int main(void) {
     if (!failures) {
         test_untextured_native_semantic_latches_ordered_blend();
         test_unbound_gp0_packet_rasterizes_natively();
+        test_canonical_native_midpoint_policy();
+        test_canonical_native_partial_midpoint();
+        test_retired_history_mismatch_preserves_native_present();
+        test_canonical_native_midpoint_cancellation();
+        test_canonical_native_midpoint_duplicate_identity();
+        test_native_midpoint_reset_flushes_pending_view_draw();
+        test_native_full_width_copy_flushes_pending_view_draw();
+        test_native_midpoint_sequence_a_a_b_c();
+        test_native_rational_present_sequence(120, 4u);
+        test_native_rational_present_sequence(240, 8u);
+        test_native_wide_rational_present_sequence(120, 4u);
+        test_native_wide_rational_present_sequence(240, 8u);
+        test_canonical_native_vertical_double_buffer();
+        test_native_wide_vertical_double_buffer();
+        test_native_wide_pending_current_precedes_vertical_flip();
+        test_native_wide_current_and_phase_share_subpixel_raster();
+        test_native_wide_suspended_current_uses_integer_raster();
+        test_native_wide_projective_geometry_uses_integer_raster();
+        test_native_wide_phase_uses_integer_raster();
+        test_native_wide_negative_fixed_positions_floor();
+        test_native_textured_subpixel_seam_uses_raster_geometry();
+        test_native_wide_current_present_sequence(120, 4u);
+        test_native_wide_current_present_sequence(240, 8u);
         test_native_view_uses_semantic_wide_positions();
         test_native_view_scales_screen_space_rectangles();
         test_native_view_centers_animated_dialogue_window();

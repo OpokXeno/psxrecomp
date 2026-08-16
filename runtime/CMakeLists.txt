@@ -26,7 +26,44 @@ endif()
 set(PSXRECOMP_ROOT "${CMAKE_SOURCE_DIR}/..")
 include("${CMAKE_SOURCE_DIR}/runtime.cmake")
 
+get_filename_component(XG_GAME_ROOT "${PSXRECOMP_ROOT}/.." ABSOLUTE)
+if(NOT EXISTS "${XG_GAME_ROOT}/native_renderer/CMakeLists.txt")
+    message(FATAL_ERROR
+        "The runtime's Xenogears renderer provider is missing: "
+        "${XG_GAME_ROOT}/native_renderer")
+endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+function(psxrecomp_add_xg_native_renderer)
+    # The renderer remains game-owned and its tests belong to the integrated
+    # game build rather than this standalone framework build.
+    set(BUILD_TESTING OFF)
+    add_subdirectory("${XG_GAME_ROOT}/native_renderer"
+                     "${CMAKE_BINARY_DIR}/native_renderer")
+endfunction()
+psxrecomp_add_xg_native_renderer()
+
 include("${CMAKE_CURRENT_LIST_DIR}/runtime_bios_only_targets.cmake")
+
+target_link_libraries(psx-runtime PRIVATE
+    xg_visual_state
+    xg_render_ir
+    xg_render_static_auth
+    xg_field_character_runtime)
+target_include_directories(psx-runtime PRIVATE
+    "${XG_GAME_ROOT}/native_renderer/include")
+target_sources(psx-runtime PRIVATE
+    "${XG_GAME_ROOT}/native_renderer/src/xg_render_unavailable_metadata.c")
+if(TARGET psx-oracle)
+    target_link_libraries(psx-oracle PRIVATE
+        xg_visual_state
+        xg_render_ir
+        xg_render_static_auth
+        xg_field_character_runtime)
+    target_include_directories(psx-oracle PRIVATE
+        "${XG_GAME_ROOT}/native_renderer/include")
+    target_sources(psx-oracle PRIVATE
+        "${XG_GAME_ROOT}/native_renderer/src/xg_render_unavailable_metadata.c")
+endif()
 
 if(BUILD_TESTING)
     add_executable(launcher_device_roundtrip_test
@@ -198,6 +235,12 @@ if(BUILD_TESTING)
         GPU_RENDER_TRANSACTION_TESTING=1)
     add_test(NAME gpu_render_transaction COMMAND gpu_render_transaction_test)
 
+    add_executable(gpu_semantic_workload_test
+        tests/test_gpu_semantic_workload.c
+        src/gpu_semantic_workload.c)
+    target_include_directories(gpu_semantic_workload_test PRIVATE include)
+    add_test(NAME gpu_semantic_workload COMMAND gpu_semantic_workload_test)
+
     add_executable(gpu_gl_mask_order_test
         tests/test_gpu_gl_mask_order.c
         tests/native_render_baseline_gpu_test_double.c
@@ -208,6 +251,7 @@ if(BUILD_TESTING)
         src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/gpu_render.c
+        src/gpu_semantic_workload.c
         src/gpu_gl_renderer.c)
     target_include_directories(gpu_gl_mask_order_test PRIVATE
         include ${SDL2_INCLUDE_DIRS})
@@ -237,6 +281,7 @@ if(BUILD_TESTING)
         src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/gpu_render.c
+        src/gpu_semantic_workload.c
         src/gpu_gl_renderer.c)
     target_include_directories(gpu_gl_peek_order_test PRIVATE
         include ${SDL2_INCLUDE_DIRS})
@@ -266,6 +311,7 @@ if(BUILD_TESTING)
         src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/gpu_render.c
+        src/gpu_semantic_workload.c
         src/gpu_gl_renderer.c)
     target_include_directories(xg_render_gl_transaction_test PRIVATE
         include ${SDL2_INCLUDE_DIRS})

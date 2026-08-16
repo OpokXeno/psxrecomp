@@ -26,4 +26,13 @@ assert "gi.num_renderers        = vulkan_offered ? 3 : 2;" in main
 assert "ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1)" in main
 assert "settings requested Vulkan, but this game does not" in main
 
+assert "int                   video_fps = 30;" in config_h
+assert 'video.contains("fps")' in config_cpp
+assert '"[video] fps must be 30 or 60"' in config_cpp
+assert "set_video_fps(gc.runtime.video_fps);" in main
+assert "if (us.has_fps) set_video_fps(us.fps);" in main
+assert "seed.fps = g_video_fps" in main
+assert "ls.fps                = seed.fps;" in main
+assert "set_video_fps(seed.fps);" in main
+
 print("Launcher Vulkan-option test passed")

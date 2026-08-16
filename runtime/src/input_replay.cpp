@@ -1,6 +1,7 @@
 #include "input_replay.h"
 #include "guest_render_bridge.h"
 #include "guest_render_native_stream.h"
+#include "gpu_gl_renderer.h"
 #include "native_render_mode_control.h"
 #include "native_render_baseline.h"
 #ifdef PSX_INPUT_REPLAY_XG_BASELINE
@@ -112,6 +113,8 @@ struct Replay {
     StopReason reason = StopReason::None;
     uint8_t latch_failure = 0;
     bool state_config = false;
+    bool checkpoint_configured = false;
+    bool record_on_close = false;
     bool checkpoint_seen = false;
     bool baseline_request = false;
     bool baseline_sample_attempted = false;
@@ -746,11 +749,15 @@ bool write_recording() {
     for (const RecordedRun& run : recorder.runs) budget += run.repeat;
     output << "schema = \"xenogears.native-render-replay/v3\"\n"
            << "complete = true\n"
-           << "vblank_budget = " << budget << "\n"
-           << "record_stop_field = " << recorder.stop_field << "\n"
-           << "record_stable_vblanks = " << kStableFieldVblanks << "\n\n"
-           << "[checkpoint]\nkind = \"u16\"\naddress = \"0x8006F94E\"\nequals = "
-           << recorder.stop_field << "\n";
+           << "vblank_budget = " << budget << "\n";
+    if (recorder.finish_on_close) {
+        output << "record_on_close = true\n";
+    } else {
+        output << "record_stop_field = " << recorder.stop_field << "\n"
+               << "record_stable_vblanks = " << kStableFieldVblanks << "\n\n"
+               << "[checkpoint]\nkind = \"u16\"\naddress = \"0x8006F94E\"\nequals = "
+               << recorder.stop_field << "\n";
+    }
     const std::array<const char*, SDL_CONTROLLER_AXIS_MAX> axes{{"left_x", "left_y", "right_x", "right_y", "trigger_left", "trigger_right"}};
     for (const RecordedRun& run : recorder.runs) {
         output << "\n[[vblank]]\nrepeat = " << run.repeat << "\n";
@@ -836,6 +843,7 @@ bool load(const char* path, std::string* error) {
     bool v2 = false;
     bool v3 = false;
     bool baseline_seen = false;
+    bool record_on_close_seen = false;
     bool v2_complete = false;
     bool v2_stop_field = false;
     uint16_t v2_stop_value = 0;
@@ -903,6 +911,14 @@ bool load(const char* path, std::string* error) {
             replay.baseline_request = true;
             continue;
         }
+        if (key == "record_on_close") {
+            if (!v3 || record_on_close_seen || value != "true") {
+                *error = "invalid close-record completion";
+                return false;
+            }
+            record_on_close_seen = true;
+            continue;
+        }
         if (key == "kind" && value == "\"u16\"") { checkpoint_kind = true; continue; }
         uint64_t parsed = 0;
         if (key == "vblank_budget") { if (!integer(value, &replay.budget) || !replay.budget || replay.budget > kMaxReplayVblanks) { *error = "invalid vblank budget"; return false; } continue; }
@@ -942,9 +958,26 @@ bool load(const char* path, std::string* error) {
         if (!action_min_polls || !action_buttons(current_action, &expected)) { *error = "invalid replay action"; return false; }
         replay.actions.push_back({current_action, expected, action_min_polls, action_max_vblanks, action_repeat_cycles, (uint32_t)action_until_request, action_after_lifecycle, action_until_change});
     }
-    if (!schema_seen || (v2 && (!v2_complete || !v2_stop_field || !v2_stable_vblanks || !checkpoint_kind || v2_stop_value != replay.checkpoint_expected || replay.states.empty() || !neutral_state(replay.states.back()))) || !replay.budget || (!replay.states.empty() && !replay.actions.empty()) ||
-        (replay.states.empty() && replay.actions.empty()) || replay.states.size() > replay.budget ||
-        !replay.checkpoint_address) { *error = "incomplete input replay"; return false; }
+    const bool checkpoint_record = v2 && !record_on_close_seen &&
+        v2_complete && v2_stop_field && v2_stable_vblanks && checkpoint_kind &&
+        v2_stop_value == replay.checkpoint_expected && replay.checkpoint_address != 0u;
+    const bool close_record = v3 && record_on_close_seen && v2_complete &&
+        !v2_stop_field && !v2_stable_vblanks && !checkpoint_kind &&
+        replay.checkpoint_address == 0u && replay.checkpoint_expected == 0u &&
+        !baseline_seen && replay.actions.empty() &&
+        replay.states.size() == replay.budget;
+    if (!schema_seen ||
+        (v2 && !(checkpoint_record || close_record)) ||
+        (!v2 && replay.checkpoint_address == 0u) ||
+        (v2 && (replay.states.empty() || !neutral_state(replay.states.back()))) ||
+        !replay.budget || (!replay.states.empty() && !replay.actions.empty()) ||
+        (replay.states.empty() && replay.actions.empty()) ||
+        replay.states.size() > replay.budget) {
+        *error = "incomplete input replay";
+        return false;
+    }
+    replay.checkpoint_configured = !v2 || checkpoint_record;
+    replay.record_on_close = close_record;
     const char* baseline_env = std::getenv("PSX_INPUT_REPLAY_BASELINE");
     if (!replay.baseline_request && baseline_env && baseline_env[0] == '1')
         replay.baseline_request = true;
@@ -976,7 +1009,8 @@ bool active() { return replay.loaded; }
 bool record_begin_impl(const char* path, uint16_t stop_field,
                        uint64_t max_vblanks, bool finish_on_close,
                        std::string* error) {
-    if (replay.loaded || recorder.active || !path || !*path || !stop_field || !max_vblanks) {
+    if (replay.loaded || recorder.active || !path || !*path || !max_vblanks ||
+        (!finish_on_close && !stop_field)) {
         if (error) *error = "invalid input record request";
         return false;
     }
@@ -996,9 +1030,9 @@ bool record_begin(const char* path, uint16_t stop_field, uint64_t max_vblanks,
                   std::string* error) {
     return record_begin_impl(path, stop_field, max_vblanks, false, error);
 }
-bool record_begin_until_close(const char* path, uint16_t checkpoint_field,
-                              uint64_t max_vblanks, std::string* error) {
-    return record_begin_impl(path, checkpoint_field, max_vblanks, true, error);
+bool record_begin_until_close(const char* path, uint64_t max_vblanks,
+                              std::string* error) {
+    return record_begin_impl(path, 0u, max_vblanks, true, error);
 }
 bool recording() { return recorder.active; }
 void record_note_guest_vblank() {
@@ -1092,8 +1126,12 @@ bool write_record_evidence(const char* path, std::string* error) {
     }
     output << "{\"schema\":\"xenogears.native-render-session-evidence/v2\""
            << ",\"status\":\"" << (model_pass && sprite_pass && mode_pass ? "PASS" : "FAIL") << "\""
-           << ",\"input\":{\"complete\":true,\"vblanks\":" << recorder.guest_vblanks
-           << ",\"checkpoint_field\":" << recorder.stop_field << "}"
+           << ",\"input\":{\"complete\":true,\"vblanks\":" << recorder.guest_vblanks;
+    if (recorder.finish_on_close)
+        output << ",\"completion\":\"record_on_close\"}";
+    else
+        output << ",\"checkpoint_field\":" << recorder.stop_field << "}";
+    output
            << ",\"render\":{\"requested\":\""
            << render_mode_name(mode.modes.requested_render_mode)
            << "\",\"effective\":\""
@@ -1327,8 +1365,14 @@ void detach(SDL_GameController* players[2]) {
 bool latch_vblank() {
     if (replay.index >= replay.budget || (!replay.actions.empty() && replay.action_index >= replay.actions.size()) ||
         (replay.actions.empty() && replay.index >= replay.states.size())) {
-        replay.reason = StopReason::CheckpointNotReached;
-        replay.latch_failure = 1u;
+        if (replay.record_on_close && replay.actions.empty() &&
+            replay.index == replay.budget && replay.index == replay.states.size()) {
+            replay.reason = StopReason::TraceComplete;
+            replay.latch_failure = 0u;
+        } else {
+            replay.reason = StopReason::CheckpointNotReached;
+            replay.latch_failure = 1u;
+        }
         return false;
     }
     const Pad neutral{};
@@ -1523,8 +1567,14 @@ void note_sio_receipt(const SioReceipt& receipt) {
         }
     }
 }
-bool checkpoint(uint32_t* address, uint16_t* expected) { if (!active()) return false; *address = replay.checkpoint_address; *expected = replay.checkpoint_expected; return true; }
+bool checkpoint(uint32_t* address, uint16_t* expected) {
+    if (!active() || !replay.checkpoint_configured) return false;
+    *address = replay.checkpoint_address;
+    *expected = replay.checkpoint_expected;
+    return true;
+}
 void observe_checkpoint(uint16_t value) {
+    if (!replay.checkpoint_configured) return;
     if (!replay.state_config) {
         if (value == replay.checkpoint_expected) replay.reason = StopReason::CheckpointReached;
         return;
@@ -1541,8 +1591,8 @@ StopReason stop_reason() { return replay.reason; }
 Counters counters() { return replay.counters; }
 bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     std::ofstream output(path); if (!output) return false;
-    const uint16_t reported_checkpoint_field = replay.checkpoint_seen
-        ? replay.checkpoint_expected : field_id;
+    const uint16_t reported_checkpoint_field = replay.checkpoint_configured
+        ? (replay.checkpoint_seen ? replay.checkpoint_expected : field_id) : 0u;
     const Counters c = counters();
     NativeRenderBaselineSnapshot baseline{};
     native_render_baseline_finalize();
@@ -1590,7 +1640,72 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     bool render_fallback_count_overflowed = false;
     bool render_bridge_snapshot_valid = false;
     GuestRenderNativeStreamSnapshot native_stream{};
+    GlRendererNativeMidpointDiagnostics native_midpoint{};
+    uint64_t native_rate_midpoint_presents = 0u;
+    uint64_t native_rate_current_presents = 0u;
+    uint64_t native_peak_midpoint_presents = 0u;
+    uint64_t native_peak_current_presents = 0u;
+    uint32_t native_rate_first_ms = 0u;
+    uint32_t native_rate_last_ms = 0u;
+    uint32_t native_peak_window_ms = 0u;
     (void)guest_render_native_stream_snapshot(&native_stream);
+    gl_renderer_native_midpoint_diag(&native_midpoint);
+    {
+        const uint64_t total = gl_renderer_pres_total();
+        const uint64_t first = total > 4096u ? total - 4096u : 0u;
+        std::vector<GlPresEvent> native_events;
+        GlPresEvent last{};
+
+        if (total != 0u && gl_renderer_pres_get(total - 1u, &last)) {
+            native_rate_last_ms = last.t_ms;
+            for (uint64_t sequence = first; sequence < total; ++sequence) {
+                GlPresEvent event{};
+
+                if (!gl_renderer_pres_get(sequence, &event))
+                    continue;
+                if (event.path != GL_PRES_NATIVE_MIDPOINT &&
+                    event.path != GL_PRES_NATIVE_CURRENT)
+                    continue;
+                native_events.push_back(event);
+                if (native_rate_last_ms - event.t_ms > 10000u)
+                    continue;
+                if (native_rate_first_ms == 0u)
+                    native_rate_first_ms = event.t_ms;
+                if (event.path == GL_PRES_NATIVE_MIDPOINT)
+                    native_rate_midpoint_presents++;
+                else
+                    native_rate_current_presents++;
+            }
+            size_t window_begin = 0u;
+            uint64_t window_midpoints = 0u;
+            uint64_t window_currents = 0u;
+            for (size_t window_end = 0u; window_end < native_events.size();
+                 ++window_end) {
+                if (native_events[window_end].path == GL_PRES_NATIVE_MIDPOINT)
+                    window_midpoints++;
+                else
+                    window_currents++;
+                while (window_begin < window_end &&
+                       native_events[window_end].t_ms -
+                               native_events[window_begin].t_ms > 10000u) {
+                    if (native_events[window_begin].path ==
+                        GL_PRES_NATIVE_MIDPOINT)
+                        window_midpoints--;
+                    else
+                        window_currents--;
+                    window_begin++;
+                }
+                const uint32_t window_ms = native_events[window_end].t_ms -
+                    native_events[window_begin].t_ms;
+                if (window_ms >= 9000u &&
+                    window_midpoints > native_peak_midpoint_presents) {
+                    native_peak_midpoint_presents = window_midpoints;
+                    native_peak_current_presents = window_currents;
+                    native_peak_window_ms = window_ms;
+                }
+            }
+        }
+    }
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
     PsxXgRenderProducerFamilySnapshot runtime_producer_family{};
     PsxXgRenderSourceSnapshot runtime_source{};
@@ -1776,7 +1891,10 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            !render_presentation.interpolation_effective &&
            !render_presentation.smooth_effective &&
            render_presentation.history_count == 0u));
-    const bool pass = stop_reason() == StopReason::CheckpointReached &&
+    const bool completion_pass = replay.checkpoint_configured
+        ? stop_reason() == StopReason::CheckpointReached
+        : stop_reason() == StopReason::TraceComplete;
+    const bool pass = completion_pass &&
                         std::string(backend) == "opengl" &&
                         (!replay.baseline_request || baseline.complete) &&
                         producer_family_pass && render_mode_pass;
@@ -1809,10 +1927,13 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     output << "{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\",\"timing_mode\":\""
            << timing_mode_name(render_modes.requested_timing_mode)
            << "\",\"render_mode\":\""
-           << render_mode_name(render_modes.requested_render_mode)
-           << "\",\"checkpoint\":{\"field_id\":"
-           << reported_checkpoint_field
-           << "},\"backend\":\"" << backend
+           << render_mode_name(render_modes.requested_render_mode);
+    if (replay.checkpoint_configured)
+        output << "\",\"checkpoint\":{\"field_id\":"
+               << reported_checkpoint_field << "}";
+    else
+        output << "\",\"completion\":\"trace_complete\",\"checkpoint\":null";
+    output << ",\"backend\":\"" << backend
            << "\",\"native_render\":{\"requested_timing_mode\":\""
            << timing_mode_name(render_modes.requested_timing_mode)
            << "\",\"effective_timing_mode\":\""
@@ -1877,6 +1998,10 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
               << native_stream.total_native_state_packets
               << ",\"total_native_unbound_packets\":"
               << native_stream.total_native_unbound_packets
+              << ",\"total_native_producer_bound_draws\":"
+              << native_stream.total_native_producer_bound_draws
+              << ",\"total_native_packet_derived_draws\":"
+              << native_stream.total_native_packet_derived_draws
               << ",\"total_native_unsupported_packets\":"
               << native_stream.total_native_unsupported_packets
                << ",\"first_native_unsupported_opcode\":"
@@ -1907,16 +2032,24 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
                 << native_stream.total_independent_vram_presents
                 << ",\"native_claim\":\""
                << (native_stream_complete
-                       ? (native_stream.total_native_unbound_packets != 0u
-                              ? "packet-faithful" : "independent")
-                       : "hybrid")
-               << "\"";
+                       ? (native_stream.total_native_packet_derived_draws != 0u
+                               ? "packet-faithful" : "independent")
+                        : "hybrid")
+                << "\""
+                << ",\"native_coverage_contract\":"
+                   "\"eligible-3d-producer\"";
     write_opcode_histogram("native_opcode_counts",
                            native_stream.native_opcode_counts);
     write_opcode_histogram("native_state_opcode_counts",
                            native_stream.native_state_opcode_counts);
     write_opcode_histogram("native_unbound_opcode_counts",
                            native_stream.native_unbound_opcode_counts);
+    write_opcode_histogram(
+        "native_producer_bound_opcode_counts",
+        native_stream.native_producer_bound_opcode_counts);
+    write_opcode_histogram(
+        "native_packet_derived_opcode_counts",
+        native_stream.native_packet_derived_opcode_counts);
     write_opcode_histogram("native_unsupported_opcode_counts",
                            native_stream.native_unsupported_opcode_counts);
     write_opcode_attribution("native_unbound_source_by_opcode",
@@ -2152,7 +2285,168 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << ",\"game_digest\":\"" << digest(baseline.game_digest) << "\""
            << ",\"camera_actor_digest\":\"" << digest(baseline.camera_actor_digest) << "\""
            << ",\"normalized_digest\":\"" << digest(baseline.normalized_digest)
-            << "\"},\"context\":{\"valid\":" << (replay.snapshot.valid_field ? "true" : "false") << ",\"id\":" << replay.snapshot.masked_field_id << ",\"raw_id\":" << replay.snapshot.raw_field_id << ",\"progress\":" << replay.snapshot.game_progress << ",\"requested_module\":" << replay.snapshot.requested_module << ",\"active_module\":" << replay.snapshot.active_module << "},\"media\":{\"fmv_active\":" << (replay.media.fmv_active ? "true" : "false") << ",\"xa_streaming\":" << (replay.media.xa_streaming ? "true" : "false") << ",\"mdec_decode_count\":" << replay.media.mdec_decode_count << "},\"media_observation\":{\"samples\":" << replay.media_samples << ",\"fmv_seen\":" << (replay.fmv_seen ? "true" : "false") << ",\"fmv_active_samples\":" << replay.fmv_active_samples << ",\"fmv_first_vblank\":" << replay.fmv_first_vblank << ",\"fmv_last_vblank\":" << replay.fmv_last_vblank << ",\"xa_seen\":" << (replay.xa_seen ? "true" : "false") << ",\"xa_streaming_samples\":" << replay.xa_streaming_samples << ",\"xa_first_vblank\":" << replay.xa_first_vblank << ",\"xa_last_vblank\":" << replay.xa_last_vblank << ",\"first_mdec_decode_count\":" << replay.first_mdec_decode_count << ",\"max_mdec_decode_count\":" << replay.max_mdec_decode_count << "},\"loader\":{\"active\":" << replay.loader.overlay_active << ",\"registered\":" << replay.loader.overlay_registered << ",\"regions_checked\":" << replay.loader.overlay_regions_checked << ",\"file_found\":" << replay.loader.overlay_file_found << "},\"cd\":{\"has_disc\":" << replay.loader.cd_has_disc << ",\"reading\":" << replay.loader.cd_reading << ",\"sector_available\":" << replay.loader.cd_sector_available << ",\"pending_pending\":" << replay.loader.cd_pending_pending << ",\"pending_cmd\":" << (unsigned)replay.loader.cd_pending_cmd << ",\"queued_cmd\":" << (unsigned)replay.loader.cd_queued_cmd << "},\"semantic_overflow\":" << (replay.semantic_overflow ? "true" : "false") << ",\"semantic_transitions\":[";
+             << "\"},\"native_midpoint\":{\"target_fps\":"
+             << native_midpoint.target_fps
+             << ",\"phase_count\":" << native_midpoint.phase_count
+             << ",\"midpoint_presents\":" << native_midpoint.midpoint_presents
+             << ",\"current_presents\":" << native_midpoint.current_presents
+             << ",\"eligibility_no_previous\":"
+             << native_midpoint.eligibility_no_previous_frames
+             << ",\"rate_window_ms\":"
+             << (native_rate_first_ms != 0u
+                    ? native_rate_last_ms - native_rate_first_ms : 0u)
+             << ",\"rate_midpoint_presents\":"
+             << native_rate_midpoint_presents
+             << ",\"rate_current_presents\":"
+             << native_rate_current_presents
+             << ",\"peak_window_ms\":" << native_peak_window_ms
+             << ",\"peak_midpoint_presents\":"
+             << native_peak_midpoint_presents
+             << ",\"peak_current_presents\":"
+             << native_peak_current_presents
+             << ",\"workload_total_matched\":"
+             << native_midpoint.workload_total_matched
+             << ",\"workload_total_snapped\":"
+             << native_midpoint.workload_total_snapped
+              << ",\"workload_total_ambiguous\":"
+              << native_midpoint.workload_total_ambiguous
+              << ",\"workload_total_moved\":"
+              << native_midpoint.workload_total_moved
+              << ",\"workload_total_unkeyed\":"
+              << native_midpoint.workload_total_unkeyed
+              << ",\"workload_total_source_geometry_matches\":"
+              << native_midpoint.workload_total_source_geometry_matches
+              << ",\"workload_total_matched_vertices\":"
+              << native_midpoint.workload_total_matched_vertices
+              << ",\"workload_total_position_changed_vertices\":"
+              << native_midpoint.workload_total_position_changed_vertices
+              << ",\"workload_total_position_delta_fixed\":"
+              << native_midpoint.workload_total_position_delta_fixed
+              << ",\"workload_max_semantic_position_delta_fixed\":"
+              << native_midpoint.workload_max_semantic_position_delta_fixed
+              << ",\"workload_max_semantic_identity_scene\":"
+              << native_midpoint.workload_max_semantic_identity_scene
+              << ",\"workload_max_semantic_identity_producer\":"
+              << native_midpoint.workload_max_semantic_identity_producer
+              << ",\"workload_max_semantic_identity_primitive\":"
+              << native_midpoint.workload_max_semantic_identity_primitive
+              << ",\"workload_max_semantic_identity_valid\":"
+              << (native_midpoint.workload_max_semantic_identity_valid
+                      ? "true" : "false")
+              << ",\"workload_total_unkeyed_moved_matches\":"
+              << native_midpoint.workload_total_unkeyed_moved_matches
+              << ",\"workload_total_unkeyed_motion_over_32px\":"
+              << native_midpoint.workload_total_unkeyed_motion_over_32px
+              << ",\"workload_total_unkeyed_motion_over_64px\":"
+              << native_midpoint.workload_total_unkeyed_motion_over_64px
+              << ",\"workload_total_unkeyed_motion_over_128px\":"
+              << native_midpoint.workload_total_unkeyed_motion_over_128px
+              << ",\"workload_total_unkeyed_motion_over_192px\":"
+              << native_midpoint.workload_total_unkeyed_motion_over_192px
+              << ",\"workload_total_unkeyed_motion_over_240px\":"
+              << native_midpoint.workload_total_unkeyed_motion_over_240px
+              << ",\"workload_max_keyed_semantic_position_delta_fixed\":"
+              << native_midpoint.workload_max_keyed_semantic_position_delta_fixed
+              << ",\"workload_max_keyed_semantic_identity_scene\":"
+              << native_midpoint.workload_max_keyed_semantic_identity_scene
+              << ",\"workload_max_keyed_semantic_identity_producer\":"
+              << native_midpoint.workload_max_keyed_semantic_identity_producer
+              << ",\"workload_max_keyed_semantic_identity_primitive\":"
+              << native_midpoint.workload_max_keyed_semantic_identity_primitive
+              << ",\"workload_total_keyed_moved_matches\":"
+              << native_midpoint.workload_total_keyed_moved_matches
+              << ",\"workload_total_keyed_motion_over_32px\":"
+              << native_midpoint.workload_total_keyed_motion_over_32px
+              << ",\"workload_total_keyed_motion_over_64px\":"
+              << native_midpoint.workload_total_keyed_motion_over_64px
+              << ",\"workload_total_keyed_motion_over_128px\":"
+              << native_midpoint.workload_total_keyed_motion_over_128px
+              << ",\"workload_total_keyed_motion_over_192px\":"
+              << native_midpoint.workload_total_keyed_motion_over_192px
+              << ",\"workload_total_keyed_motion_over_240px\":"
+              << native_midpoint.workload_total_keyed_motion_over_240px
+              << ",\"presented_midpoint_position_changed_vertices\":"
+              << native_midpoint.presented_midpoint_position_changed_vertices
+              << ",\"presented_midpoint_position_delta_fixed\":"
+              << native_midpoint.presented_midpoint_position_delta_fixed
+              << ",\"workload_total_midpoint_collapsed_vertices\":"
+             << native_midpoint.workload_total_midpoint_collapsed_vertices
+              << ",\"workload_total_midpoint_formula_failures\":"
+              << native_midpoint.workload_total_midpoint_formula_failures
+              << ",\"workload_total_projective_phase_vertices\":"
+              << native_midpoint.workload_total_projective_phase_vertices
+             << ",\"cancelled_frames\":"
+             << native_midpoint.cancelled_frames
+             << ",\"gl_error_count\":" << native_midpoint.gl_error_count
+             << ",\"reset_total\":" << native_midpoint.reset_count
+             << ",\"reset_with_previous\":"
+             << native_midpoint.reset_with_previous_count
+             << ",\"reset_with_pending\":"
+             << native_midpoint.reset_with_pending_count
+             << ",\"last_reset_reason\":" << native_midpoint.last_reset_reason
+             << ",\"reset_reasons\":{\"suspension_change\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_SUSPENSION_CHANGE]
+             << ",\"pending_canonical_mismatch\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_PENDING_CANONICAL_MISMATCH]
+             << ",\"pending_view_mismatch\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_PENDING_VIEW_MISMATCH]
+             << ",\"frontend_transaction\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION]
+             << ",\"frontend_non_native_wide\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE]
+             << ",\"frontend_non_native_stream\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM]
+             << ",\"frontend_cpu_present\":"
+             << native_midpoint.reset_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT]
+             << "},\"reset_with_previous_reasons\":{\"suspension_change\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_SUSPENSION_CHANGE]
+             << ",\"pending_canonical_mismatch\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_PENDING_CANONICAL_MISMATCH]
+             << ",\"pending_view_mismatch\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_PENDING_VIEW_MISMATCH]
+             << ",\"frontend_transaction\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION]
+             << ",\"frontend_non_native_wide\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE]
+             << ",\"frontend_non_native_stream\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM]
+             << ",\"frontend_cpu_present\":"
+             << native_midpoint.reset_with_previous_reason_counts[
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT]
+             << "},\"pending_mismatch_counts\":{\"slot\":"
+             << native_midpoint.pending_mismatch_slot_count
+             << ",\"x\":" << native_midpoint.pending_mismatch_x_count
+             << ",\"y\":" << native_midpoint.pending_mismatch_y_count
+             << ",\"width\":" << native_midpoint.pending_mismatch_width_count
+             << ",\"height\":" << native_midpoint.pending_mismatch_height_count
+             << ",\"accepted_vertical_lag\":"
+             << native_midpoint.pending_vertical_lag_count
+             << "},\"last_pending_rect\":{\"slot\":"
+             << native_midpoint.last_pending_slot
+             << ",\"x\":" << native_midpoint.last_pending_x
+             << ",\"y\":" << native_midpoint.last_pending_y
+             << ",\"width\":" << native_midpoint.last_pending_width
+             << ",\"height\":" << native_midpoint.last_pending_height
+             << "},\"last_present_rect\":{\"slot\":"
+             << native_midpoint.last_present_slot
+             << ",\"x\":" << native_midpoint.last_present_x
+             << ",\"y\":" << native_midpoint.last_present_y
+             << ",\"width\":" << native_midpoint.last_present_width
+             << ",\"height\":" << native_midpoint.last_present_height
+             << "}},\"context\":{\"valid\":" << (replay.snapshot.valid_field ? "true" : "false") << ",\"id\":" << replay.snapshot.masked_field_id << ",\"raw_id\":" << replay.snapshot.raw_field_id << ",\"progress\":" << replay.snapshot.game_progress << ",\"requested_module\":" << replay.snapshot.requested_module << ",\"active_module\":" << replay.snapshot.active_module << "},\"media\":{\"fmv_active\":" << (replay.media.fmv_active ? "true" : "false") << ",\"xa_streaming\":" << (replay.media.xa_streaming ? "true" : "false") << ",\"mdec_decode_count\":" << replay.media.mdec_decode_count << "},\"media_observation\":{\"samples\":" << replay.media_samples << ",\"fmv_seen\":" << (replay.fmv_seen ? "true" : "false") << ",\"fmv_active_samples\":" << replay.fmv_active_samples << ",\"fmv_first_vblank\":" << replay.fmv_first_vblank << ",\"fmv_last_vblank\":" << replay.fmv_last_vblank << ",\"xa_seen\":" << (replay.xa_seen ? "true" : "false") << ",\"xa_streaming_samples\":" << replay.xa_streaming_samples << ",\"xa_first_vblank\":" << replay.xa_first_vblank << ",\"xa_last_vblank\":" << replay.xa_last_vblank << ",\"first_mdec_decode_count\":" << replay.first_mdec_decode_count << ",\"max_mdec_decode_count\":" << replay.max_mdec_decode_count << "},\"loader\":{\"active\":" << replay.loader.overlay_active << ",\"registered\":" << replay.loader.overlay_registered << ",\"regions_checked\":" << replay.loader.overlay_regions_checked << ",\"file_found\":" << replay.loader.overlay_file_found << "},\"cd\":{\"has_disc\":" << replay.loader.cd_has_disc << ",\"reading\":" << replay.loader.cd_reading << ",\"sector_available\":" << replay.loader.cd_sector_available << ",\"pending_pending\":" << replay.loader.cd_pending_pending << ",\"pending_cmd\":" << (unsigned)replay.loader.cd_pending_cmd << ",\"queued_cmd\":" << (unsigned)replay.loader.cd_queued_cmd << "},\"semantic_overflow\":" << (replay.semantic_overflow ? "true" : "false") << ",\"semantic_transitions\":[";
     for (size_t index = 0; index < replay.semantic_transitions.size(); ++index) {
         const SemanticTransition& transition = replay.semantic_transitions[index];
         output << (index ? "," : "") << "{\"vblank\":" << transition.vblank
@@ -2352,6 +2646,29 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << ",\"template_captures\":" << model_shadow.template_capture_count
            << ",\"template_hits\":" << model_shadow.template_hit_count
            << ",\"template_misses\":" << model_shadow.template_miss_count
+           << ",\"guest_pass_observations\":"
+           << model_shadow.guest_pass_observation_count
+           << ",\"guest_pass_projection_disagreements\":"
+           << model_shadow.guest_pass_projection_disagreement_count
+           << ",\"replay_attempts\":" << model_shadow.replay_attempt_count
+           << ",\"replay_resolved\":" << model_shadow.replay_resolved_count
+           << ",\"replay_lookup_misses\":"
+           << model_shadow.replay_lookup_miss_count
+           << ",\"replay_record_rejects\":"
+           << model_shadow.replay_record_reject_count
+           << ",\"replay_container_rejects\":"
+           << model_shadow.replay_container_reject_count
+           << ",\"replay_lifecycle_rejects\":"
+           << model_shadow.replay_lifecycle_reject_count
+           << ",\"replay_translate_rejects\":"
+           << model_shadow.replay_translate_reject_count
+           << ",\"publish_invocations\":"
+           << model_shadow.publish_invocation_count
+           << ",\"publish_sources\":" << model_shadow.publish_source_count
+           << ",\"validation_rejected_sources\":"
+           << model_shadow.validation_rejected_source_count
+           << ",\"framing_rejected_invocations\":"
+           << model_shadow.framing_rejected_invocation_count
            << ",\"first_mismatch_primitive\":" << model_shadow.first_mismatch_primitive
            << ",\"first_mismatch_packet\":" << model_shadow.first_mismatch_packet
            << ",\"last_model_address\":" << model_shadow.last_model_address
@@ -2397,8 +2714,41 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << ",\"template_misses\":" << model_ft3_shadow.template_miss_count
            << ",\"raw_color_differences\":"
            << model_ft3_shadow.raw_color_difference_count
+           << ",\"guest_pass_observations\":"
+           << model_ft3_shadow.guest_pass_observation_count
+           << ",\"guest_pass_projection_disagreements\":"
+           << model_ft3_shadow.guest_pass_projection_disagreement_count
+           << ",\"replay_attempts\":"
+           << model_ft3_shadow.replay_attempt_count
+           << ",\"replay_resolved\":"
+           << model_ft3_shadow.replay_resolved_count
+           << ",\"replay_lookup_misses\":"
+           << model_ft3_shadow.replay_lookup_miss_count
+           << ",\"replay_lookup_invalid\":"
+           << model_ft3_shadow.replay_lookup_invalid_count
+           << ",\"replay_lookup_absent\":"
+           << model_ft3_shadow.replay_lookup_absent_count
+           << ",\"replay_record_rejects\":"
+           << model_ft3_shadow.replay_record_reject_count
+           << ",\"replay_container_rejects\":"
+           << model_ft3_shadow.replay_container_reject_count
+           << ",\"replay_lifecycle_rejects\":"
+           << model_ft3_shadow.replay_lifecycle_reject_count
+           << ",\"replay_translate_rejects\":"
+           << model_ft3_shadow.replay_translate_reject_count
+           << ",\"publish_invocations\":"
+           << model_ft3_shadow.publish_invocation_count
+           << ",\"publish_sources\":"
+           << model_ft3_shadow.publish_source_count
+           << ",\"validation_rejected_sources\":"
+           << model_ft3_shadow.validation_rejected_source_count
+           << ",\"framing_rejected_invocations\":"
+           << model_ft3_shadow.framing_rejected_invocation_count
            << ",\"first_mismatch_packet\":"
            << model_ft3_shadow.first_mismatch_packet
+           << ",\"last_replay_lookup_miss_source\":"
+           << model_ft3_shadow.last_replay_lookup_miss_source
+           << ",\"source_count\":" << model_ft3_shadow.source_count
            << ",\"last_group_count\":" << model_ft3_shadow.last_group_count
            << ",\"last_target_count\":" << model_ft3_shadow.last_target_count
            << ",\"prepare_failure_detail\":"
@@ -2423,6 +2773,22 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << sprite_shadow.native_cutover_count
            << ",\"direct_native_primitives\":"
            << sprite_shadow.native_primitive_count
+           << ",\"resident_publish_sources\":"
+           << sprite_shadow.resident_publish_source_count
+           << ",\"resident_replay_attempts\":"
+           << sprite_shadow.resident_replay_attempt_count
+           << ",\"resident_replay_resolved\":"
+           << sprite_shadow.resident_replay_resolved_count
+           << ",\"resident_replay_lookup_misses\":"
+           << sprite_shadow.resident_replay_lookup_miss_count
+           << ",\"resident_replay_record_rejects\":"
+           << sprite_shadow.resident_replay_record_reject_count
+           << ",\"resident_replay_container_rejects\":"
+           << sprite_shadow.resident_replay_container_reject_count
+           << ",\"resident_replay_lifecycle_rejects\":"
+           << sprite_shadow.resident_replay_lifecycle_reject_count
+           << ",\"resident_replay_translate_rejects\":"
+           << sprite_shadow.resident_replay_translate_reject_count
            << ",\"field_builder_begins\":"
            << sprite_shadow.field_builder_begin_count
            << ",\"field_builder_native_cutovers\":"

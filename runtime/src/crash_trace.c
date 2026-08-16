@@ -33,6 +33,8 @@
 
 #include "cpu_state.h"
 #include "crash_trace.h"
+#include "debug_server.h"
+#include "fntrace.h"
 
 /* Output path — overwritten per dump. */
 static const char *kReportPath = "psx_last_run_report.json";
@@ -48,6 +50,7 @@ static const char *kBuildId = PSX_BUILD_REV " (" __DATE__ " " __TIME__ ")";
 
 /* CPU state pointer (set by debug server at init). */
 extern CPUState *debug_cpu_ptr;
+extern uint8_t *memory_get_ram_ptr(void);
 
 /* Frame counter from debug_server.c (non-static). */
 extern uint64_t s_frame_count;
@@ -78,6 +81,23 @@ typedef struct {
 #define UNKNOWN_DISPATCH_CAP (1 << 16)
 extern UnknownDispatchEntry crash_trace_unknown_get(uint64_t seq);
 extern uint64_t crash_trace_unknown_seq_get(void);
+
+/* Deterministic scheduler save/restore ring (defined in traps.c). */
+typedef struct {
+    uint32_t seq;
+    uint32_t frame;
+    uint8_t op;
+    uint8_t pad0[3];
+    uint32_t tcb;
+    uint32_t resume_pc;
+    uint32_t gpr_29;
+    uint32_t gpr_31;
+    uint32_t cop0_sr;
+    uint32_t cop0_epc;
+} ThreadCtxRingEntry;
+#define THREAD_CTX_RING_CAP 256u
+extern ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP];
+extern uint64_t g_thread_ctx_ring_seq;
 
 /* Dirty-RAM block log (defined in dirty_ram_interp.c). */
 #include "dirty_ram_interp.h"
@@ -266,6 +286,17 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         if (tm) strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tm);
     }
 
+    static char reason_esc[32768];
+    static char exit_origin_esc[256];
+    static char build_esc[1024];
+    static char interp_reason_esc[1024];
+    json_escape(reason ? reason : "(unknown)", reason_esc, sizeof(reason_esc));
+    json_escape(s_exit_origin, exit_origin_esc, sizeof(exit_origin_esc));
+    json_escape(kBuildId, build_esc, sizeof(build_esc));
+    json_escape(g_dirty_ram_last_unsupported_reason
+                    ? g_dirty_ram_last_unsupported_reason : "(none)",
+                interp_reason_esc, sizeof(interp_reason_esc));
+
     append_fmt(buf, sizeof(buf), &pos,
         "{\n"
         "  \"reason\": \"%s\",\n"
@@ -290,9 +321,9 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         "    \"entry_sp\": \"0x%08X\",\n"
         "    \"insns_into_block\": %u\n"
         "  },\n",
-        reason ? reason : "(unknown)",
-        s_exit_origin,
-        kBuildId,
+        reason_esc,
+        exit_origin_esc,
+        build_esc,
         ts,
         (unsigned long long)s_frame_count,
         g_psx_dispatch_depth,
@@ -301,8 +332,7 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         (unsigned long long)g_dirty_ram_unsupported_midblock,
         g_dirty_ram_last_unsupported_pc,
         g_dirty_ram_last_unsupported_insn,
-        g_dirty_ram_last_unsupported_reason
-            ? g_dirty_ram_last_unsupported_reason : "(none)",
+        interp_reason_esc,
         g_dirty_ram_last_unsupported_entry,
         g_dirty_ram_last_unsupported_entry_ra,
         g_dirty_ram_last_unsupported_entry_sp,
@@ -427,6 +457,50 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         append_str(buf, sizeof(buf), &pos, "  \"cpu\": null,\n");
     }
 
+    /* Final guest-stack window with per-word last-writer attribution. This is
+     * intentionally sampled only while serializing a terminal report; the
+     * always-on O(1) writer index is maintained by the existing write trace.
+     * It distinguishes a bad value saved by a prologue from a later overwrite
+     * of the saved-RA slot without adding a new hot-path recorder. */
+    if (debug_cpu_ptr) {
+        enum { STACK_WINDOW_BYTES = 256 };
+        uint32_t sp = debug_cpu_ptr->gpr[29];
+        uint32_t sp_phys = sp & 0x1FFFFFFFu;
+        uint32_t start = sp_phys > STACK_WINDOW_BYTES / 2u
+            ? sp_phys - STACK_WINDOW_BYTES / 2u : 0u;
+        uint32_t end = sp_phys + STACK_WINDOW_BYTES / 2u;
+        uint8_t *ram = memory_get_ram_ptr();
+        if (end > 2u * 1024u * 1024u) end = 2u * 1024u * 1024u;
+        start &= ~3u;
+        end &= ~3u;
+        append_fmt(buf, sizeof(buf), &pos,
+            "  \"stack_provenance\": {\"sp\":\"0x%08X\","
+            "\"start\":\"0x%08X\",\"words\":[",
+            sp, 0x80000000u | start);
+        int emitted = 0;
+        for (uint32_t phys = start; ram && phys + 4u <= end; phys += 4u) {
+            uint32_t value = 0, writer_pc = 0, writer_ra = 0;
+            memcpy(&value, ram + phys, sizeof(value));
+            int have_writer = debug_server_find_last_ram_writer(
+                phys, &writer_pc, &writer_ra);
+            if (have_writer) {
+                append_fmt(buf, sizeof(buf), &pos,
+                    "%s{\"addr\":\"0x%08X\",\"value\":\"0x%08X\","
+                    "\"writer_pc\":\"0x%08X\",\"writer_ra\":\"0x%08X\"}",
+                    emitted++ ? "," : "", 0x80000000u | phys, value,
+                    writer_pc, writer_ra);
+            } else {
+                append_fmt(buf, sizeof(buf), &pos,
+                    "%s{\"addr\":\"0x%08X\",\"value\":\"0x%08X\","
+                    "\"writer_pc\":null,\"writer_ra\":null}",
+                    emitted++ ? "," : "", 0x80000000u | phys, value);
+            }
+        }
+        append_str(buf, sizeof(buf), &pos, "]},\n");
+    } else {
+        append_str(buf, sizeof(buf), &pos, "  \"stack_provenance\": null,\n");
+    }
+
     /* Recursion fingerprint (build-independent GUEST addresses): the func entered
      * when the native stack guard tripped, plus the recent recompiled-function-
      * entry ring — for a runaway, recent_fn's tail repeats the recursing func, so
@@ -527,6 +601,54 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         append_native_stack(buf, sizeof(buf), &pos, sp);
     }
 #endif
+
+    /* Detailed always-on dispatch tail. Unlike dispatch_tail below, this ring
+     * retains the guest $sp and $ra at every trampoline iteration, which makes
+     * a bad restored return distinguishable from a bad call target. */
+    {
+        uint64_t total = g_disp_tail_seq;
+        int count = total < DISP_TAIL_CAP ? (int)total : (int)DISP_TAIL_CAP;
+        append_fmt(buf, sizeof(buf), &pos,
+            "  \"dispatch_state_tail\": {\"total\":%llu,\"entries\":[",
+            (unsigned long long)total);
+        uint64_t start = total - (uint64_t)count;
+        for (int i = 0; i < count; i++) {
+            const DispTailEntry *e =
+                &g_disp_tail[(start + (uint64_t)i) % DISP_TAIL_CAP];
+            append_fmt(buf, sizeof(buf), &pos,
+                "%s{\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
+                "\"sp\":\"0x%08X\",\"cycle\":%llu}",
+                i == 0 ? "" : ",", e->target, e->ra, e->sp,
+                (unsigned long long)e->cycle);
+        }
+        append_str(buf, sizeof(buf), &pos, "]},\n");
+    }
+
+    /* Existing deterministic-scheduler ring: identifies the TCB that owned
+     * each restored guest stack when terminal stack frames overlap. */
+    {
+        uint64_t total = g_thread_ctx_ring_seq;
+        int count = total < THREAD_CTX_RING_CAP
+            ? (int)total : (int)THREAD_CTX_RING_CAP;
+        uint64_t start = total - (uint64_t)count;
+        append_fmt(buf, sizeof(buf), &pos,
+            "  \"thread_ctx_tail\": {\"total\":%llu,\"entries\":[",
+            (unsigned long long)total);
+        for (int i = 0; i < count; i++) {
+            const ThreadCtxRingEntry *e =
+                &g_thread_ctx_ring[(start + (uint64_t)i) &
+                                   (THREAD_CTX_RING_CAP - 1u)];
+            append_fmt(buf, sizeof(buf), &pos,
+                "%s{\"seq\":%u,\"frame\":%u,\"op\":\"%s\","
+                "\"tcb\":\"0x%08X\",\"resume_pc\":\"0x%08X\","
+                "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+                "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\"}",
+                i == 0 ? "" : ",", e->seq, e->frame,
+                e->op == 0 ? "save" : "restore", e->tcb, e->resume_pc,
+                e->gpr_29, e->gpr_31, e->cop0_sr, e->cop0_epc);
+        }
+        append_str(buf, sizeof(buf), &pos, "]},\n");
+    }
 
     /* dispatch_ring tail (last 256) */
     {

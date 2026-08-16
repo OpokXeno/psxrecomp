@@ -262,8 +262,9 @@ struct RuntimeConfig {
     // tear), -1=adaptive. The wall-clock pacer holds 59.94Hz regardless.
     bool                  video_low_latency_input = true;
     int                   video_vsync             = 1;
-    bool                  video_frame_interpolation = false;
-    int                   video_frame_interpolation_fps = 0; // 0 = display refresh
+    // Presentation rate. 30 preserves original PSX cadence; 60 enables the
+    // Native interpolation path. Other rates are intentionally not exposed.
+    int                   video_fps = 30;
 
     // crt_filter: present-time screen-colour model (verified-enhancement LUT).
     // "raw" (default, byte-identical 5->8 passthrough) | "crt" | "composite" |
@@ -866,8 +867,7 @@ struct UserSettings {
     // display latency, may tear), -1=adaptive.
     bool has_low_latency_input = false; bool low_latency_input = true;
     bool has_vsync             = false; int  vsync             = 1;
-    bool has_frame_interpolation = false; bool frame_interpolation = false;
-    bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
+    bool has_fps = false; int fps = 30;
     // [launcher] — when true, boot straight into the game and skip the GUI
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.

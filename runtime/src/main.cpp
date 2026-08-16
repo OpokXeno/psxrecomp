@@ -361,6 +361,9 @@ static void mod_call_frame_hooks() {
  * each guest image for two vblanks. This never changes guest or audio timing. */
 static std::atomic<int> g_smooth_60fps{0};
 static std::atomic<int> g_smooth_60fps_requested{0};
+static bool g_native_render_selected = false;
+static int g_native_interpolation_fps = 60;
+static int g_video_fps = 30;
 static NativeRenderModeControl g_native_render_mode_control{};
 
 struct Smooth60State {
@@ -374,6 +377,14 @@ struct Smooth60State {
 };
 
 static Smooth60State g_smooth_60_state;
+
+static void update_native_temporal_coverage() {
+    const bool enabled = g_native_render_selected &&
+        g_smooth_60fps_requested.load(std::memory_order_acquire);
+
+    gpu_ws_set_temporal_cull_guard_pixels(enabled ? 8 : 0);
+    psx_xg_render_auth_set_terrain_temporal_coverage(enabled);
+}
 
 /* Present-path session state — must reset on rematch (function-local statics
  * survive soft-return and poison FMV/FPS after session_reboot). */
@@ -522,11 +533,18 @@ extern "C" void psx_smooth_60fps_set(int enabled) {
     const bool requested = enabled != 0;
     g_smooth_60fps_requested.store(requested ? 1 : 0,
                                    std::memory_order_release);
+    update_native_temporal_coverage();
     native_render_mode_control_set_smooth(&g_native_render_mode_control,
                                           requested);
     if (!g_native_render_mode_control.initialized)
         g_smooth_60fps.store(requested ? 1 : 0,
                              std::memory_order_release);
+}
+
+static void set_video_fps(int fps) {
+    g_video_fps = fps == 60 ? 60 : 30;
+    g_native_interpolation_fps = 60;
+    psx_smooth_60fps_set(g_video_fps == 60);
 }
 #if defined(PSX_WEB)
 extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
@@ -560,7 +578,7 @@ void psx_video_set_supersampling(int s) {
     if (s < 1) s = 1;
     if (s > 8) s = 8;
     g_video_scale = s;
-    gr_set_scale(s);
+    gr_set_scale(g_video_scale);
 }
 int  psx_video_get_antialiasing(void)   { return g_video_aa ? 1 : 0; }
 void psx_video_set_antialiasing(int on) { g_video_aa = (on != 0); }
@@ -797,6 +815,19 @@ static bool          g_vk_active = false;    /* Vulkan context live -> VK presen
  * to force the software readout path instead — a diagnostic/fallback that also
  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
 static int           g_gl_fbo_present = 1;
+
+static bool native_semantic_subframe_pacing_active() {
+    GpuDisplayInfo display = {};
+
+    if (!g_gl_active ||
+        !g_smooth_60fps_requested.load(std::memory_order_acquire) ||
+        gl_renderer_native_interpolation_fps() <= 60 ||
+        !guest_render_native_stream_enabled() || mdec_recently_active(2))
+        return false;
+    gpu_get_display_info(&display);
+    return !display.disabled && display.width != 0u && display.height != 0u &&
+        !display.depth24;
+}
 
 extern "C" void psx_frame_interpolation_set_suspended(int suspended) {
     if (g_gl_active)
@@ -3360,6 +3391,9 @@ static void sdl_vblank_present(void) {
     input_replay::note_guest_vblank();
     input_replay::record_note_guest_vblank();
     psx_xenogears_timing_vblank_boundary(mdec_recently_active(2));
+    gl_renderer_native_midpoint_set_suspended(
+        !g_smooth_60fps_requested.load(std::memory_order_acquire) ||
+        gpu_display_is_depth24() || mdec_recently_active(2));
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
@@ -3561,7 +3595,13 @@ static void sdl_vblank_present(void) {
             netplay_barrier_admit(override_);
             if (skip_pace_ || psx_return_to_lobby_requested()) return;
             uint64_t perf_start = runtime_perf_section_begin();
-            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+            if (native_semantic_subframe_pacing_active()) {
+                s_frame_pacer = FramePacer{ 0 };
+            } else if (g_smooth_60fps_requested.load(std::memory_order_acquire) &&
+                !gpu_display_is_depth24() && !mdec_recently_active(2))
+                frame_pacer_wait_stable(&s_frame_pacer, g_frame_period_ms);
+            else
+                frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
             runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
             latency_ring_mark(LAT_PACED);
         }
@@ -3609,8 +3649,10 @@ static void sdl_vblank_present(void) {
         overlay_capture_wait_pending();
         overlay_capture_write_json();
         input_replay::write_evidence(s_input_replay_evidence_path.c_str(), 0, backend);
+        const bool trace_complete = input_replay::stop_reason() ==
+            input_replay::StopReason::TraceComplete;
         shutdown_runtime();
-        std::exit(3);
+        std::exit(trace_complete ? 0 : 3);
     }
     if (input_replay::active()) sync_input_replay_slots();
     if (psx_netplay_active()) {
@@ -3745,6 +3787,8 @@ static void sdl_vblank_present(void) {
 #endif
 
     if (g_headless) {
+        gl_renderer_native_midpoint_reset_for_reason(
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_HEADLESS);
         netplay_tail.skip_pace();
         return;
     }
@@ -3754,6 +3798,8 @@ static void sdl_vblank_present(void) {
      * presentation and wall-clock pacing. */
 #ifndef PSX_NO_DEBUG_TOOLS
     if (debug_server_turbo_enabled()) {
+        gl_renderer_native_midpoint_reset_for_reason(
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_DEBUG_TURBO);
         netplay_tail.skip_pace();
         return;
     }
@@ -3771,6 +3817,8 @@ static void sdl_vblank_present(void) {
         if (keys[SDL_SCANCODE_TAB]) {
             turbo_skip = (turbo_skip + 1) % TURBO_PRESENT_EVERY;
             if (turbo_skip != 0) {
+                gl_renderer_native_midpoint_reset_for_reason(
+                    GL_NATIVE_MIDPOINT_RESET_FRONTEND_TURBO_SKIP);
                 netplay_tail.skip_pace();
                 return;  /* skip render this frame */
             }
@@ -3792,6 +3840,8 @@ static void sdl_vblank_present(void) {
         const int TL_PRESENT_EVERY = 30;
         s_turbo_present_skip = (s_turbo_present_skip + 1) % TL_PRESENT_EVERY;
         if (s_turbo_present_skip != 0) {
+            gl_renderer_native_midpoint_reset_for_reason(
+                GL_NATIVE_MIDPOINT_RESET_FRONTEND_LOAD_SKIP);
             netplay_tail.skip_pace();
             return;
         }
@@ -3804,6 +3854,8 @@ static void sdl_vblank_present(void) {
         const int FMV_PRESENT_EVERY = 30;
         s_fmv_skip_present_skip = (s_fmv_skip_present_skip + 1) % FMV_PRESENT_EVERY;
         if (s_fmv_skip_present_skip != 0) {
+            gl_renderer_native_midpoint_reset_for_reason(
+                GL_NATIVE_MIDPOINT_RESET_FRONTEND_FMV_SKIP);
             netplay_tail.skip_pace();
             return;
         }
@@ -3814,6 +3866,8 @@ static void sdl_vblank_present(void) {
     if (psx_netplay_active() && gpu_display_is_depth24()) {
         if (s_netplay_depth24_present_skip) {
             s_netplay_depth24_present_skip = 0;
+            gl_renderer_native_midpoint_reset_for_reason(
+                GL_NATIVE_MIDPOINT_RESET_FRONTEND_NETPLAY_SKIP);
             netplay_tail.skip_pace();
             return;
         }
@@ -3826,7 +3880,13 @@ static void sdl_vblank_present(void) {
      * AFTER present so Swap overlaps the peer's guest quantum. */
     if (!psx_netplay_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
-        frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+        if (native_semantic_subframe_pacing_active()) {
+            s_frame_pacer = FramePacer{ 0 };
+        } else if (g_smooth_60fps_requested.load(std::memory_order_acquire) &&
+            !gpu_display_is_depth24() && !mdec_recently_active(2))
+            frame_pacer_wait_stable(&s_frame_pacer, g_frame_period_ms);
+        else
+            frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
         latency_ring_mark(LAT_PACED);
 
@@ -3851,8 +3911,11 @@ static void sdl_vblank_present(void) {
 
     /* Depth24 GP1(07h) retarget (MotK intro→crawl): keep the prior Swap for a
      * few vblanks so stale trailing VRAM never flashes on the right edge. */
-    if (gpu_depth24_present_hold_tick())
+    if (gpu_depth24_present_hold_tick()) {
+        gl_renderer_native_midpoint_reset_for_reason(
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_DEPTH24_HOLD);
         return;
+    }
 
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
     if (!g_ws_engaged) {
@@ -3896,6 +3959,8 @@ static void sdl_vblank_present(void) {
         gpu_get_display_info(&di);
         depth24_frame = di.depth24 != 0;
         if (di.disabled || di.width == 0 || di.height == 0) {
+            if (g_gl_active)
+                gl_renderer_native_midpoint_set_suspended(1);
             GuestRenderTransactionSnapshot transaction = {};
             if (!guest_render_native_stream_enabled())
                 guest_render_transaction_invalidate_deferred();
@@ -3946,14 +4011,18 @@ static void sdl_vblank_present(void) {
          * partial fields or use a geometry that cannot be inferred from that
          * command alone. The authoritative VRAM scanout handles every FMV. */
         native_fmv_active = false;
-        /* MDEC movies are already decoded at their authored cadence and are
-         * CPU/upload heavy. High-refresh crossfades only contend with decoding
-         * and can starve audio, so present native-4:3/MDEC phases directly.
-         * The classification catches the transition frame before the first
-         * decode; the activity stamp also covers authentic 4:3 configurations. */
-        if (g_gl_active)
+        /* Only MDEC video and depth24 scanout retain authored cadence. `fmv_frame`
+         * also labels ordinary 4:3 menus/UI, which are still native 15-bit game
+         * frames and must remain eligible for the host midpoint path. */
+        if (g_gl_active) {
+            const int native_midpoint_suspended =
+                !g_smooth_60fps_requested.load(std::memory_order_acquire) ||
+                di.depth24 || mdec_recently_active(2);
             psx_frame_interpolation_set_suspended(
-                fmv_frame || mdec_recently_active(2));
+                native_midpoint_suspended);
+            gl_renderer_native_midpoint_set_suspended(
+                native_midpoint_suspended);
+        }
 
         /* Canonical present width. Native-wide does NOT widen the canonical read
          * (that bled across adjacent framebuffers); it composites into a separate
@@ -3980,8 +4049,8 @@ static void sdl_vblank_present(void) {
             return;
         }
         bool wide_present = native_view_present ||
-            (!fmv_frame && !di.depth24 && g_ws_engaged &&
-             ws_native_wide_active() && gr_wide_supported());
+            (!native_stream_enabled && !fmv_frame && !di.depth24 && g_ws_engaged &&
+              ws_native_wide_active() && gr_wide_supported());
         if (native_view_present)
             present_w = (uint32_t)gl_renderer_native_view_width();
         else if (wide_present)
@@ -4070,13 +4139,18 @@ static void sdl_vblank_present(void) {
                  * GL-only slowdown (SW's wide path is pure CPU, no GPU sync, so
                  * SW stayed smooth). Falls through to the CPU readout path only if
                  * the wide surface for this buffer doesn't exist yet. */
-                const int native_presented = native_view_present
-                    ? gl_renderer_present_native_view(
-                          (int)di.display_x, (int)di.display_y,
-                          (int)h, g_video_aa ? 1 : 0)
-                    : gl_renderer_present_wide_fbo(
-                          (int)di.display_x, (int)di.display_y,
-                          (int)h, g_video_aa ? 1 : 0);
+                int native_presented;
+                if (native_view_present) {
+                    native_presented = gl_renderer_present_native_view(
+                        (int)di.display_x, (int)di.display_y,
+                        (int)h, g_video_aa ? 1 : 0);
+                } else {
+                    gl_renderer_native_midpoint_reset_for_reason(
+                        GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE);
+                    native_presented = gl_renderer_present_wide_fbo(
+                        (int)di.display_x, (int)di.display_y,
+                        (int)h, g_video_aa ? 1 : 0);
+                }
                 if (!native_presented && native_wide_game_frame) {
                     psx_fatal_halt(
                         "Native-wide gameplay surface present failed; refusing 4:3 fallback");
@@ -4101,6 +4175,11 @@ static void sdl_vblank_present(void) {
                     uint64_t canonical_digest = 0u;
                     bool canonical_digest_valid = false;
 
+                    /* Transaction composition is intentionally quiesced from the
+                     * immediate semantic stream. Never let its VBlank become a
+                     * hidden interval in midpoint history. */
+                    gl_renderer_native_midpoint_reset_for_reason(
+                        GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION);
                     transaction_present.path = GPU_RENDER_PRESENT_CANONICAL;
                     transaction_present.display_x = (int32_t)di.display_x;
                     transaction_present.display_y = (int32_t)di.display_y;
@@ -4153,18 +4232,22 @@ static void sdl_vblank_present(void) {
                 }
                 bool presented = false;
                 if (guest_render_native_stream_enabled() && !wide_present) {
-                    gl_renderer_sync_cpu();
-                    for (uint32_t y = 0; y < h; y++)
-                        for (uint32_t x = 0; x < present_w; x++)
-                            sdl_pixel_buf[y * present_w + x] =
-                                gpu_display_pixel_argb(&di, x, y);
-                    presented = gr_present_native_cpu_frame(
-                        sdl_pixel_buf, (int)present_w, (int)h,
-                        g_video_aa ? 1 : 0, (fmv_frame || nw_pin) ? 1 : 0,
-                        0) != 0;
-                    if (presented)
-                        guest_render_native_stream_note_independent_vram_present();
+                    /* Native 15-bit source frames stay entirely GPU-side. This
+                     * selects the canonical midpoint/current target and swaps on
+                     * the main GL context, never the legacy interpolation thread. */
+                    presented = gl_renderer_present_native_midpoint(
+                        (int)di.display_x, (int)di.display_y,
+                        (int)present_w, (int)h, g_video_aa ? 1 : 0,
+                        (fmv_frame || nw_pin) ? 1 : 0) != 0;
+                    if (!presented) {
+                        psx_fatal_halt(
+                            "Native canonical midpoint present failed; refusing CPU fallback");
+                        return;
+                    }
+                    guest_render_native_stream_note_independent_vram_present();
                 } else {
+                    gl_renderer_native_midpoint_reset_for_reason(
+                        GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM);
                     presented = gr_present_vram(
                         (int)di.display_x, (int)di.display_y,
                         (int)present_w, (int)h, g_video_aa ? 1 : 0,
@@ -4190,7 +4273,11 @@ static void sdl_vblank_present(void) {
                         GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
             }
         }
-        if (g_gl_active && !di.depth24) gl_renderer_sync_cpu();
+        if (g_gl_active) {
+            gl_renderer_native_midpoint_reset_for_reason(
+                GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT);
+            if (!di.depth24) gl_renderer_sync_cpu();
+        }
         /* Vulkan owns every frame: 15-bit frames present straight from the GPU
          * VRAM image (deterministic blit, no readback), mirroring the GL path;
          * 24-bit (FMV) frames go through the CPU present (Phase 3). The Vulkan
@@ -5211,15 +5298,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (cli_input_record) {
-        if (cli_record_stop_field != 5u || !cli_record_max_vblanks || net_cfg.enabled || g_headless) {
-            std::fprintf(stderr, "psxrecomp: input record requires Field 5, a VBlank bound, and local video\n");
+        const bool close_record = cli_record_on_close;
+        if (!cli_record_max_vblanks || net_cfg.enabled || g_headless ||
+            (close_record ? cli_record_stop_field != 0u
+                          : cli_record_stop_field != 5u)) {
+            std::fprintf(stderr, "psxrecomp: input record requires one completion mode, a VBlank bound, and local video\n");
             return 1;
         }
         std::string record_error;
-        const bool record_started = cli_record_on_close
+        const bool record_started = close_record
             ? input_replay::record_begin_until_close(
-                  cli_input_record, cli_record_stop_field,
-                  cli_record_max_vblanks, &record_error)
+                  cli_input_record, cli_record_max_vblanks, &record_error)
             : input_replay::record_begin(
                   cli_input_record, cli_record_stop_field,
                   cli_record_max_vblanks, &record_error);
@@ -5398,8 +5487,7 @@ int main(int argc, char** argv) {
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             g_video_vsync       = gc.runtime.video_vsync;
-            g_frame_interpolation = gc.runtime.video_frame_interpolation ? 1 : 0;
-            g_frame_interpolation_fps = gc.runtime.video_frame_interpolation_fps;
+            set_video_fps(gc.runtime.video_fps);
             g_fmv_skip_total_table = gc.runtime.video_fmv_skip_total_table;
             g_fmv_skip_movie_id    = gc.runtime.video_fmv_skip_movie_id;
             if (gc.runtime.video_fmv_skip_end_total)
@@ -5965,10 +6053,7 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
-        if (us.has_frame_interpolation)
-            g_frame_interpolation = us.frame_interpolation ? 1 : 0;
-        if (us.has_frame_interpolation_fps)
-            g_frame_interpolation_fps = us.frame_interpolation_fps;
+        if (us.has_fps) set_video_fps(us.fps);
     }
 
     /* The launcher must inspect the same explicit disc override that the
@@ -6016,12 +6101,23 @@ int main(int argc, char** argv) {
     g_ws_adaptive_max_den = 9;
 
     /* Latency knobs: env overrides win over config (for A/B measurement).
-     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
-     * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
+     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive).
+     * The two Native interpolation environment variables remain diagnostic
+     * overrides; normal configuration uses [video] fps = 30|60. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
+    if (const char *e = std::getenv("PSX_NATIVE_INTERPOLATION_FPS")) {
+        const int fps = atoi(e);
+        if (fps == 60 || fps == 120 || fps == 240)
+            g_native_interpolation_fps = fps;
+        else {
+            std::fprintf(stderr,
+                         "psxrecomp: PSX_NATIVE_INTERPOLATION_FPS must be 60, 120, or 240\n");
+            return 1;
+        }
+    }
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
         g_frame_interpolation = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
@@ -6128,10 +6224,7 @@ int main(int argc, char** argv) {
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = g_fullscreen;                seed.has_fullscreen = true;
-            seed.frame_interpolation = (g_frame_interpolation != 0);
-            seed.has_frame_interpolation = true;
-            seed.frame_interpolation_fps = g_frame_interpolation_fps;
-            seed.has_frame_interpolation_fps = true;
+            seed.fps = g_video_fps;                     seed.has_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
             seed.adaptive_view = g_ws_adaptive_view;      seed.has_adaptive_view = true;
@@ -6223,8 +6316,7 @@ int main(int argc, char** argv) {
             ls.antialiasing       = seed.antialiasing ? 1 : 0;
             ls.texture_filter     = seed.texture_filter;
             ls.screen_kind        = seed.screen_kind;
-            ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
-            ls.frame_interp_fps   = seed.frame_interpolation_fps;
+            ls.fps                = seed.fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
@@ -6413,8 +6505,7 @@ int main(int argc, char** argv) {
                 seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
                 seed.antialiasing          = ls.antialiasing != 0;     seed.has_antialiasing          = true;
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
-                seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
-                seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
+                seed.fps                   = ls.fps;                    seed.has_fps                   = true;
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
                 seed.auto_skip_fmv         = ls.auto_skip_fmv != 0;    seed.has_auto_skip_fmv         = true;
                 seed.turbo_loads           = ls.turbo_loads != 0;      seed.has_turbo_loads           = true;
@@ -6494,8 +6585,7 @@ int main(int argc, char** argv) {
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen;
-                g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
-                g_frame_interpolation_fps = seed.frame_interpolation_fps;
+                set_video_fps(seed.fps);
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
                 g_ws_adaptive_view = seed.adaptive_view;
@@ -6926,6 +7016,12 @@ session_reboot:
         gl_renderer_set_swap_interval(g_video_vsync);   /* applied at context init */
         g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
         if (!g_gl_active) gr_set_backend(GR_BACKEND_SOFTWARE);
+        if (g_gl_active && !gl_renderer_set_native_interpolation_fps(
+                g_native_interpolation_fps)) {
+            std::fprintf(stderr,
+                         "psxrecomp: Native interpolation target initialization failed\n");
+            return 1;
+        }
         /* The GL backend establishes its real internal scale HERE (raster init),
          * which is AFTER the earlier `g_video_scale = gr_scale()` sync (that ran
          * before this and so saw the default scale 1). Re-sync now so the staging
@@ -6963,6 +7059,10 @@ session_reboot:
             native_fps_policy.requested_mode == NATIVE_FPS_MODE_NATIVE_59_94
                 ? GUEST_RENDER_TIMING_NATIVE_59_94
                 : GUEST_RENDER_TIMING_ORIGINAL;
+
+        g_native_render_selected =
+            render_mode == GUEST_RENDER_RENDER_NATIVE && g_gl_active;
+        update_native_temporal_coverage();
 
         if (!native_render_mode_control_init(
                 &g_native_render_mode_control, &presentation_ops, nullptr,

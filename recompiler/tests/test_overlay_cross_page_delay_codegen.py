@@ -108,6 +108,26 @@ def main() -> int:
         elif "mandatory delay slot" not in combined:
             failures.append("truncated generation failed without the delay-slot diagnostic")
 
+        fallthrough, fallthrough_out = run_codegen(
+            args.recompiler, False, root, branch_word=0,
+            case_name="captured_fallthrough")
+        if fallthrough.returncode != 0:
+            failures.append("captured fallthrough failed generation: " +
+                            ((fallthrough.stderr or "") + (fallthrough.stdout or "")))
+        else:
+            fallthrough_c = next((name for name in os.listdir(fallthrough_out)
+                                  if name.endswith("_full.c")), None)
+            if not fallthrough_c:
+                failures.append("captured fallthrough omitted C output")
+            else:
+                with open(os.path.join(fallthrough_out, fallthrough_c),
+                          encoding="utf-8") as f:
+                    fallthrough_source = f.read()
+                marker = ("cpu->pc = 0x80011000u; return;  "
+                          "/* CPS fallthrough beyond captured function */")
+                if marker not in fallthrough_source:
+                    failures.append("captured fallthrough does not tail-transfer to its next PC")
+
         likely, likely_out = run_codegen(
             args.recompiler, True, root, branch_word=0x50800008,
             case_name="reserved_branch_likely")
@@ -141,7 +161,7 @@ def main() -> int:
             print("FAIL:", failure)
         return 1
     print("PASS: cross-page delay slot is emitted and hashed, truncation fails closed, "
-          "and reserved opcodes emit RI")
+          "captured fallthrough tail-transfers, and reserved opcodes emit RI")
     return 0
 
 

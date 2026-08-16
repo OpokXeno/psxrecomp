@@ -441,6 +441,22 @@ GpuRenderTransactionStatus gr_draw_semantic_immediate(
         ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
 }
 
+GpuRenderTransactionStatus gr_record_interpolation_anchors(
+        const GpuRenderInterpolationVertexAnchor *anchors, size_t count) {
+    GpuRenderTransactionStatus status;
+
+    if (anchors == NULL && count != 0u)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (g_transaction.phase != GR_TRANSACTION_IDLE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (g_b->record_interpolation_anchors == NULL)
+        return GPU_RENDER_TRANSACTION_OK;
+    status = normalize_backend_status(
+        g_b->record_interpolation_anchors(anchors, count));
+    return status == GPU_RENDER_TRANSACTION_READY
+        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
+}
+
 /* ---- Dispatch wrappers (one line each; forward to the active backend) ---- */
 void gr_init(uint16_t *vram)                         { g_b->init(vram); }
 void gr_set_scale(int scale)                         { g_b->set_scale(scale); }

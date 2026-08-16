@@ -423,6 +423,8 @@ static void draw_gpu_state_section(void)
                     en ? "on" : "off", hh, th,
                     (unsigned long long)swaps);
     }
+    ImGui::Text("Native semantic : %d FPS",
+                gl_renderer_native_interpolation_fps());
 
     {
         /* all[1] is average total_ms per frame; same array the TCP
@@ -638,6 +640,18 @@ static void draw_toggles_section(void)
     int sm = psx_video_get_screen_model();
     if (ImGui::Combo("Screen model", &sm, kScreenModels, 4)) {
         psx_video_set_screen_model(sm);
+    }
+
+    static const char *kNativeInterpolationTargets[] = {
+        "60 FPS", "120 FPS", "240 FPS"
+    };
+    int native_fps = gl_renderer_native_interpolation_fps();
+    int native_fps_index = native_fps == 240 ? 2 : native_fps == 120 ? 1 : 0;
+    if (ImGui::Combo("Native semantic target", &native_fps_index,
+                     kNativeInterpolationTargets, 3)) {
+        static const int targets[] = {60, 120, 240};
+        (void)gl_renderer_set_native_interpolation_fps(
+            targets[native_fps_index]);
     }
 
     bool tl = g_turbo_loads_enabled != 0;
@@ -2203,6 +2217,9 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     if (std::strcmp(name, "interp") == 0) {
         psx_frame_interpolation_set(value ? 1 : 0);
         return 0;
+    }
+    if (std::strcmp(name, "native_interp_fps") == 0) {
+        return gl_renderer_set_native_interpolation_fps(value) ? 0 : -2;
     }
     if (std::strcmp(name, "supersampling") == 0) {
         psx_video_set_supersampling(value);

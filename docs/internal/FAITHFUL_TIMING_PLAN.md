@@ -213,6 +213,423 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-16 (World-map Native Smooth temporal mesh resolved and
+  user-confirmed):** The remaining 4:3 water/terrain holes came from two
+  independent temporal-coverage gaps rather than PS1 rasterization. Native
+  Smooth now expands world-space X culling by the measured minimum 8 pixels and
+  retains all four quadrants of each selected terrain tile; four deterministic
+  margin trials (64/32/16/8) produced the same correction with zero packet-limit
+  stops. The final linear seams were caused by source-mesh anchors being built
+  but never submitted to the semantic workload, while unmatched previous
+  triangles were retired at their stale previous-frame positions. Terrain now
+  submits its global 145x145 vertex anchors in bounded batches; unmatched
+  projective meshes generate each retired phase toward current anchors while
+  retaining prior appearance, and fail closed when any current anchor is
+  absent. Exact frame-3040 evidence observed 1,071,149 valid projective input
+  vertices, 846,280 generated projective phase vertices, and no shared raster
+  vertex conflicts. The full 4,033-VBlank replay passes at 60 FPS with 374
+  midpoint presents, zero cancellations, zero GL errors, and zero packet-limit
+  stops. The user first reported a 99% reduction after anchor submission and
+  accepted the retired-phase result as visually correct. Focused semantic,
+  OpenGL, backend, and terrain tests pass in both diagnostic and clean Release
+  builds. A subsequent playable `field1 -> worldmap` transition exposed a stale
+  host-history edge: a GPU operation can flush the Native queue without
+  replacing its presentation history, so an otherwise valid retired candidate
+  may have no matching host entry. Retirement is optional host synthesis; the
+  renderer now skips only missing/mismatched candidates instead of rejecting
+  the authoritative current surface. A focused three-frame OpenGL regression
+  reproduces the stale-history sequence and passes without cancellation.
+  Evidence:
+  `/tmp/opencode/xg-worldmap-43-temporal-coverage-final-evidence.json`,
+  `/tmp/opencode/xg-worldmap-43-exact-phase-evidence.json`, and
+  `/tmp/opencode/xg-worldmap-43-retired-anchor-phases-evidence.json`.
+
+- **2026-08-15 (Native vertical backbuffer rollback fixed):** A deterministic
+  Load Game capture isolated the reported fast animation across the `accessing
+  memory card...` text, progress bar, and red arrow. The primitives were not
+  independently mis-matched: after an accepted complete-backbuffer-before-GP1
+  vertical lag, Native presented the saved current once and then fell back to
+  the older GP1 scanout band. Every four-VBlank source interval therefore ran
+  midpoint -> future current -> old current instead of advancing monotonically.
+  The present path now retains the already-promoted authored Y band until
+  GP1(05h) catches up; an unrelated display origin clears the override
+  fail-closed. Frames 1665-1704 previously had two distinct current source
+  hashes in every four-VBlank block; all ten blocks now have exactly one
+  midpoint plus three currents sharing one source hash. The complete replay
+  reports PASS with 33 midpoint + 1,039 current presents, a 10,000 ms window of
+  32 midpoint + 568 current presents, 33 accepted vertical lags, and zero
+  cancellations, GL errors, or midpoint formula failures. The exact-frame
+  visual tool now labels its PNG surface as guest VRAM pre-present so it cannot
+  be mistaken for host midpoint output. Focused OpenGL/semantic regressions,
+  the Release and debug builds, and 35 replay/evidence Python tests pass. The
+  user confirmed the corrected load animation visually. Evidence:
+  `/tmp/opencode/xg-load-blink-visual-49/manifest.json` (before),
+  `/tmp/opencode/xg-load-blink-visual-50/manifest.json` (no-midpoint baseline),
+  `/tmp/opencode/xg-load-blink-visual-51/manifest.json` (fixed), and
+  `/tmp/opencode/xg-load-blink-replay-52-evidence.json` (complete replay).
+
+- **2026-08-15 (Dialogue UV snap confirmed; global retirement policy
+  rejected):** Unkeyed textured primitives accepted small UV and shape changes,
+  so a field-dialogue line growing from 88 to 92 pixels rendered the current
+  glyph footprint over intermediate-width geometry. Textured UV footprints now
+  require exact equality; the user confirmed dialogue reveal is visually
+  correct, while a stable-UV unkeyed translation regression retains
+  interpolation. A subsequent attempt to reject every partial midpoint with an
+  unmatched previous primitive was invalid: normal field workloads contain
+  continual primitive churn, so the rule suppressed nearly all 30-to-60 FPS
+  interpolation. That policy and its changed expectations were fully reverted;
+  partial midpoint eligibility remains intact. The load-screen texture cadence
+  remained unresolved at this point and is closed by the later entry above
+  without changing frame-wide eligibility. Focused semantic-workload and
+  OpenGL presentation regressions
+  pass, the full runtime builds, and 35 replay/evidence Python tests pass.
+
+- **2026-08-15 (Field sprite jitter regression fixed and user-confirmed):**
+  Projective temporal metadata had accidentally propagated through the shared
+  projected-quad helper into field-character billboards, sprite FT4s, actor
+  sprites, particles, zoom quads, and minimap markers. Their authored integer
+  screen positions then alternated with reprojected subpixel midpoints, producing
+  the reported constant 1-2 pixel shake. Those sprite/billboard families now
+  retain the established screen-space temporal path (including discrete cel/UV
+  snapping); terrain, water, world models, model FT4s, and polygonal environment
+  producers retain projective metadata. New sprite and integrated particle
+  regressions fail on the accidental propagation and pass after the exclusion.
+  The user confirmed the field-character shake is gone. One Field 5 replay
+  reports PASS, correctly records zero projective phase vertices for this
+  sprite-only workload, sustains a 9,996 ms peak of 299 midpoint + 298 current
+  presents, and has zero formula failures, cancellations, GL errors, prohibited
+  APIs, or accepted movement above 64 pixels. This also corrects the prior
+  interpretation of Field 5's 62,322 projective vertices: they were billboards,
+  not evidence that terrain/worldmap reprojection had executed. Evidence:
+  `/tmp/opencode/xg-native-60fps-projective-sprite-stable-36/runtime-evidence.json`.
+
+- **2026-08-15 (Native temporal projection corrected; visual confirmation
+  pending):** The user confirmed that misplaced terrain, water, and model
+  polygons occur during camera/player motion in both 4:3 and widescreen. That
+  rules out persistent synthetic wide-margin pixels as the common cause. The
+  shared fault was post-projection interpolation: the temporal workload linearly
+  averaged already perspective-divided screen X/Y, which is not the projection
+  of an intermediate 3D position when depth changes. Native 3D producers now
+  preserve bounded pre-divide view X/Y/Z, projection distance and offsets through
+  the IR/backend semantic vertex; each temporal phase interpolates those values
+  and projects afterward, with endpoint reconstruction validation and the prior
+  screen-space path retained for 2D or invalid/missing payloads. A deterministic
+  Z=512 -> Z=1536 regression proves the old midpoint (224,184) differs from the
+  reprojected midpoint (208,168). Refuted terrain-grid identities and midpoint
+  winding-snap heuristics were removed. One OpenBIOS Field 5 replay reports PASS,
+  62,322 projectively generated phase vertices, 757 midpoint + 3,432 current
+  presents, a 9,999 ms peak of 299 midpoint + 298 current presents, zero formula
+  failures, cancellations, GL errors, prohibited APIs, or accepted keyed/unkeyed
+  movement above 64 pixels. Focused C tests and 35 replay/evidence tests pass.
+  Do not mark the visual artifact resolved until the reported camera angles are
+  tested directly. Evidence:
+  `/tmp/opencode/xg-native-60fps-projective-clean-35/runtime-evidence.json`.
+
+- **2026-08-15 (Native selective polygon motion bounded):** A Field 5 visual
+  report clarified that only some terrain polygons appeared to separate and
+  suggested that an individual polygon was moving to the wrong location. New
+  retrospective-motion evidence confirmed the mechanism: unkeyed semantics
+  admitted a maximum aggregate movement of 1,537 pixels (about 256 pixels per
+  vertex) in one source frame, with 759 accepted matches averaging over 64
+  pixels per vertex. Unkeyed matching now fails closed when either centroid,
+  canonical per-vertex, or Native per-vertex movement exceeds 64 pixels; keyed
+  producer identities remain unrestricted. The deterministic replay now has
+  zero accepted unkeyed motions over 64 pixels, maximum aggregate movement 384
+  pixels, 843 midpoint + 3,343 current presents, a 9,991 ms peak window with
+  298 midpoint + 297 current presents, zero cancellations, zero GL errors,
+  zero unsupported packets, and zero Original draws. An independent textured
+  cutout regression also proved and fixed false mirrored-UV classification
+  caused by truncating fractional raster coordinates. Focused renderer tests
+  and 30 replay/evidence tests pass. Visual confirmation of the motion bound is
+  still required; do not mark the terrain artifact resolved yet. Evidence:
+  `/tmp/opencode/xg-native-60fps-motion-histogram-26/runtime-evidence.json` and
+  `/tmp/opencode/xg-native-60fps-unkeyed-vertex-motion-limit-28/runtime-evidence.json`.
+
+- **2026-08-15 (Native 30->60 vertical scanout lag):** Field 5 reset-reason
+  telemetry proved that every successful Native-wide midpoint was followed by
+  a `pending-view-mismatch` reset: 388/388 destructive resets differed only in
+  display Y (saved current Y=0 while GP1 still named Y=224); slot, X, width,
+  and height were identical. The midpoint path now treats that vertical-only
+  difference as the documented complete-backbuffer-before-GP1 lag, presents
+  the saved current from its authored Y, and retains semantic history. Slot,
+  X, and size mismatches remain fail-closed. The OpenBIOS replay with absolute
+  project memcards reports PASS, 766 accepted vertical lags, zero pending
+  mismatch resets, `NO_PREVIOUS` 390->2, and a 9,992 ms moving window
+  containing 295 midpoint + 294 current presents (~29.52 interpolated/s,
+  ~58.95 distinct/s). Focused OpenGL and replay-tool regressions pass.
+  Evidence:
+  `/tmp/opencode/xg-native-60fps-vertical-lag-pass-17/runtime-evidence.json`.
+
+- **2026-08-15 (Native coverage contract corrected):** Replaced the global
+  `unbound=0` objective with an eligible-3D producer contract. Supported GP0
+  draws without a producer sidecar already translate to `GpuRenderSemantic`
+  and rasterize through OpenGL Native; they are packet-derived, not blocked or
+  Original fallback. Runtime evidence now reports producer-bound and
+  packet-derived draw totals/histograms separately while retaining the existing
+  packet-coverage fields. A source audit confirmed Native-view coverage for the
+  active model FT4/FT3, direct sprite, terrain, shadow, decoration, cloud, and
+  world-actor paths; intentional screen-space builders remain packet-derived.
+  Terrain far-depth widening remains deferred because the authenticated OT and
+  `0x7FE` primitive-buffer limits make a simple cull relaxation destructive.
+  The earlier active-visual resolver fix remains the measured improvement
+  (`239593 -> 235060` packet-derived draws); an exact `memcpy` sidecar
+  experiment produced no additional resolved draw and was removed.
+  The canonical replay preserved every prior stream counter exactly and now
+  classifies 622,428 draws as producer-bound and 235,060 as packet-derived,
+  with zero unsupported, Original, or parser draws. It still reports `FAIL`
+  solely through the pre-existing `semantic_overflow` condition. Evidence:
+  `/tmp/opencode/xg-coverage-contract-1/run-1/runtime-evidence.json`.
+
+- **2026-08-13 (Native semantic 120/240 targets):** Generalized the validated
+  Native 30->60 midpoint path to rational phase sets for explicit 60, 120, and
+  240 FPS targets. The semantic matcher now computes overflow-safe weighted
+  phases and has direct 1/4..3/4 and 1/8..7/8 regressions. Canonical and Native-
+  wide OpenGL presentation emit the causal cadence `1/4,2/4 | 3/4,current` or
+  `1/8..4/8 | 5/8..7/8,current`, with one completed-swap ring event per phase
+  carrying its numerator/denominator. Targets above 60 disable driver vsync and
+  use main-context subframe deadlines; guest VBlank, input, audio, and the
+  legacy framebuffer interpolation thread remain unchanged. Phase allocation
+  is failure-atomic, host-only draws restore authoritative GPU state, stencil
+  rebuild covers every active phase, and Native wave displacement metadata is
+  phase-specific. `PSX_NATIVE_INTERPOLATION_FPS=60|120|240`,
+  `[video] native_interpolation_fps`, the debug overlay, and
+  `overlay_widget_action native_interp_fps` expose the target while
+  `PSX_SMOOTH_60FPS` remains a boolean eligibility switch. The semantic and
+  hidden-context OpenGL focused regressions pass; live Wayland 120/240 telemetry
+  remains the next proof step.
+- **2026-08-13 (Strict presented-midpoint coordinate proof):** Clarified that
+  the OpenGL `A,A,B,C` regression is a missing-duplicate stress case, not the
+  steady 30->60 cadence. Its expected
+  `current,current,midpoint,current,current` sequence preserves B and C when C
+  arrives before B's duplicate VBlank. In the real telemetry run, steady
+  eligible intervals alternated `current,midpoint,current,midpoint`; there were
+  3,088 transitions in each direction and zero consecutive midpoints. Added
+  per-vertex midpoint diagnostics that distinguish changed endpoints, a result
+  strictly different from both endpoints, integer-rounding collapse onto an
+  endpoint, and failure of the effective-coordinate formula
+  `(previous + current) / 2`. Added separate totals accumulated only after a
+  midpoint's exact `SDL_GL_SwapWindow` returns. A synthetic regression proves a
+  one-unit 16.16 delta is reported as collapsed, while the existing OpenGL
+  sequence requires three strict presented midpoint vertices and zero formula
+  failures. Both focused tests pass. A second visible Wayland Xenogears run,
+  with no screenshots/readbacks and fresh byte-identical root-memory-card
+  copies, completed 1,181 midpoint swaps. Those swaps matched 3,112,071
+  vertices; 2,513,461 had different endpoint positions, and all 2,513,461 were
+  strictly different from both endpoints. There were zero endpoint collapses,
+  zero midpoint-formula failures, zero cancellations, and zero GL errors. The
+  summed endpoint distance was 3,600,192,307,200 fixed-point units (about 21.86
+  pixels per changed vertex on average). This directly proves that real
+  midpoint swaps contained recalculated intermediate geometry rather than the
+  same endpoint positions. Evidence:
+  `.local/debug-artifacts/20260813-strict-midpoints/`.
+- **2026-08-13 (Native midpoint completed-swap proof):** Rebuilt the Debug
+  runtime with per-swap Native classification and a `swap_completed` marker
+  written only after the exact `SDL_GL_SwapWindow` call returns. The existing
+  `A,A,B,C` OpenGL regression now requires the ring sequence
+  `native-current,native-current,native-midpoint,native-current,native-current`
+  and requires every event to be post-swap complete; it passes. Ran one visible,
+  interactive Wayland instance with `PSX_SMOOTH_60FPS=1`, Native 16:9, OpenGL
+  2x, original game timing, no display ring, no GL pixel probe, no screenshots,
+  and isolated byte-identical copies of the repository-root memory cards. The
+  complete telemetry history contains 7,788 consecutive events with no gaps:
+  4,464 `native-current`, 3,088 `native-midpoint`, 175 CPU, 59 VRAM, and 2 blank.
+  Every event has `swap_completed=1`; every midpoint was preceded and followed
+  by current (3,088 transitions in each direction), with no consecutive
+  midpoints. The active Native interval covered 7,550 swaps in 125.974 seconds
+  (59.925 Hz), 40.9% midpoint overall. It included strict alternating stretches
+  of 1,081 swaps / 18.019 seconds and 1,069 swaps / 17.818 seconds at about
+  59.94 Hz. The workload moved 2,271,106 primitives and changed 10,162,027
+  vertex positions, with zero midpoint cancellations, zero GL errors, and final
+  600-present frame-period p50/p95 of 16.6833/16.6848 ms. This proves the
+  midpoint FBO was selected, composed into the default framebuffer, and its
+  swap completed into the Wayland compositor path; it is not merely an internal
+  interpolation counter. Wayland exposes no physical scanout feedback here, so
+  the evidence deliberately does not claim that every submitted buffer reached
+  the monitor scanout. Evidence: `.local/debug-artifacts/20260813-visible-midpoints/`.
+- **2026-08-13 (Manual side-by-side Native interpolation A/B):** Ran two
+  isolated Wayland instances of the rebuilt Debug executable with identical
+  OpenGL 2x, Native 16:9, original game timing, disc, and root-repository
+  memory-card contents. The control used `PSX_SMOOTH_60FPS=0`; the comparison
+  used `PSX_SMOOTH_60FPS=1`. Both used separate absolute runtime-state,
+  overlay-capture, debug-port, and memory-card paths; the root cards and both
+  copies ended byte-identical. The user closed both normally and reported no
+  perceptible FPS difference. Telemetry only (no image captures used as
+  evidence) proves the control produced 8,218 current and zero midpoint
+  presents, while the comparison produced 5,349 current plus 2,772 midpoint
+  presents (34.1% midpoint), with 648,088 moved primitives, 2,628,089
+  position-changed vertices, zero midpoint cancellations, and zero GL errors.
+  Both final 600-present windows had 16.6834 ms p50; p95 was 16.6845 ms control
+  and 16.6848 ms comparison. This proves midpoint selection and geometry work
+  occurred, but it does NOT establish a perceptible improvement or prove that
+  the final visible pixels differed. The run also exposed an observability gap:
+  `gl_present_ring` serialized the canonical Native enum as `?` and classified
+  every Native-wide swap as `wide`, losing current-vs-midpoint identity. The
+  ring now records `native-current` and `native-midpoint` per swap for both
+  canonical and Native-wide paths. The existing `A,A,B,C` OpenGL regression now
+  requires the exact `current,current,midpoint,current,current` ring sequence;
+  the Debug executable and focused test rebuilt, and the test passes.
+- **2026-08-13 (Manual Native 30->60 visual proof):** Ran the rebuilt Debug
+  executable manually with `PSX_SMOOTH_60FPS=1`, `--native-fps original`,
+  `--render-mode native`, OpenGL, 16:9, and no replay. A parallel TCP observer
+  sampled the existing midpoint/workload, GL-present, and latency rings until
+  the user closed the game at frame 6,993, without enabling the expensive
+  display ring. The final 2,048 consecutive window presents covered frames
+  4,925..6,972 in 34.540 seconds (59.265 presents/s including stalls; 2,048
+  distinct frame IDs), with zero GL errors. The final 600-frame latency window
+  measured frame-period p50 16.683 ms and p95 16.686 ms; isolated Debug/scene
+  transitions produced a 112.715 ms maximum and visible console dips as low as
+  36--57 FPS, so the run was not literally locked at 60 for every instant.
+  Across the full session Native produced 1,812 midpoint and 4,362 current
+  presents. In the sampled motion intervals, midpoint/current counts repeatedly
+  alternated 16--17/16--17 per 32--34 presents; cumulative semantic evidence
+  reached 250,713 matches, 180,324 moved primitives, 791,596 position-changed
+  vertices, and 662,996,189,184 fixed-point position-distance units, with zero
+  midpoint cancellations. A final 1920x1080 post-compositor window capture
+  confirms the observed output was the live Native-wide scene. Evidence is in
+  `.local/debug-artifacts/20260813-034749-interpolation/`; memory-card hashes
+  remained unchanged.
+- **2026-08-13 (CPS partial-overlay stack leak fixed):** Reproduced Xenogears'
+  Native-mode exit near frame 2,130 and extended the terminal report with JSON-
+  safe strings, a 256-byte guest-stack window with existing last-writer
+  attribution, the detailed dispatch `(target, ra, sp, cycle)` tail, and the
+  existing deterministic-TCB save/restore ring. The evidence proved there was
+  no thread switch: the active GCC shard exported `0x80081F80` but authenticated
+  only `0x84` bytes (`0x80081F80..0x80082003`), while the real function epilogue
+  lies at `0x800821D4..0x800821F0`. Its captured final block had no explicit
+  control transfer, and overlay CPS codegen emitted a bare C fallthrough, leaving
+  `cpu->pc=0` and the prologue's `sp -= 0x28` live. Later valid stack locals then
+  overlapped older saved return slots; epilogues restored zero/small values and
+  transferred control into low RAM. CPS codegen now tail-transfers to the next
+  guest PC whenever a captured function ends without explicit control flow, so
+  another native shard or the dirty-RAM interpreter executes the missing suffix
+  and its epilogue. The focused cross-page/partial-capture regression passes;
+  Debug runtime rebuilt with codegen hash `0x6bba225b`, invalidating the faulty
+  cache namespace. Manual play passed the former failure point and remained at
+  about 60 FPS through frame 5,212, when the user closed it. Memory-card hashes
+  remained unchanged. No guest semantics, renderer behavior, or general
+  interpreter fallback changed.
+- **2026-08-12 (Native queue boundary and standalone-link closure):** Added
+  direct OpenGL regressions for pending Native work across midpoint reset, the
+  full-canonical-width copy fast path, and the exact `A,A,B,C` presentation
+  sequence. The tests verify reset materializes the queued current image before
+  clearing lifecycle state, copy reason 5 drains the queue before reading its
+  source, and `A,A,B,C` carries one saved-current debt while C is materialized
+  for the following host slot. Made the game-owned renderer's repository-root
+  dependency explicit so it can be included from the standalone runtime build;
+  BIOS-only runtime/oracle targets receive zeroed, fail-closed Native metadata,
+  while the integrated game target retains its validated generated metadata.
+  Standalone `psx-runtime`, integrated `XenogearsRecomp`, semantic workload,
+  OpenGL mask/order, static-auth, terrain-water, manifest-build, and both
+  repositories' `git diff --check` pass. A live in-game 16:9 visual reproduction
+  remains pending; no guest timing or canonical VRAM semantics changed.
+- **2026-08-12 (Native smooth performance accepted):** Continuous forensic
+  display capture is now strict opt-in through `PSX_DISPLAY_RING=1`; normal
+  runs avoid the two synchronous GL readbacks per VBlank, while
+  `tools/native_render_field490_visual.py` explicitly enables the ring for
+  exact-frame evidence. With the ring disabled, the preserved pre-matcher
+  process measured `total_ms_avg=16.845`, `emu_cpu_ms_avg=16.141`,
+  `prims_avg=2894`, `batches_avg=315.0`, p50 16.684 ms, and p95 17.332 ms; a
+  later stable window reached p95 16.685 ms. The rebuilt process measured
+  `total_ms_avg=16.842`, `emu_cpu_ms_avg=16.740`, `prims_avg=2808`,
+  `batches_avg=305.7`, `cpu_flush_ms_avg=2.020`, p50 16.684 ms, and p95
+  16.685 ms, with zero GL errors and retrospective budget exhaustion. The
+  retrospective appearance check now rejects a candidate immediately once
+  cumulative UV or color distance exceeds its existing limit; equality at
+  the limit remains accepted and boundary regressions cover UV 96/97 and
+  color 576/577. The first rebuilt `perf` capture inherited active
+  `compile_overlays.py`, compiler, and linker children, so it is not valid for
+  assigning an isolated percentage to this early exit. A later live A/B also
+  found the two processes at different scene loads; the display-ring gate was
+  confirmed off in GDB (the old process's `valid=64` statistic was retained
+  ring contents), then overlay autocapture and its active compiler trees were
+  stopped. The user accepted the end-to-end performance result and cancelled
+  further isolated matcher attribution. No guest timing, canonical VRAM, or
+  immediate current/midpoint upload mirror semantics changed.
+- **2026-08-12 (Native resource invalidation and GL batching performance):**
+  Cached authoritative artifact validation and scoped identity to binary/pair/
+  provenance, so same-artifact non-render dispatches retain authority while a
+  real CRC change still fails closed. Added a conservative per-RAM-word resource
+  watch bitmap and replaced the remaining 4,096-slot FT4 packet/descriptor scan
+  with bounded packet-start probes plus a reverse descriptor chain. Packet,
+  descriptor, shared-descriptor, collision/tombstone, and propagated FT3-copy
+  regressions preserve exact invalidation. Native current/midpoint semantic work
+  is now queued until VRAM-coherence boundaries; canonical guest work remains
+  immediate, and wave, upload/copy/fill, present/peek, transaction, and GP0(E6)
+  boundaries drain the queue. In the same manual Native scene, batching reduced
+  `batches_avg` from 1,619.5 to 164--183 and `cpu_flush_ms_avg` from 9.79 to
+  1.08--1.24 ms. The last pre-direct-invalidation sample measured
+  `total_ms_avg=18.575`, `scene_gpu_ms_avg=11.326`,
+  `present_gpu_ms_avg=7.255`, p50 16.685 ms, and p95 25.650 ms; `perf` still
+  attributed 14.7% to `psx_xg_render_auth_note_code_write`, specifically its
+  full FT4 scan. A first bounded-probe profile reduced that symbol to 3.61% but
+  left the two FT4 hash lookups at 1.16% and 1.01%; direct per-RAM-word packet
+  and descriptor maps then removed all three from the final profile's >=0.5%
+  report. In a heavier 3,169--3,495-primitive manual scene, the final build used
+  5.474 s CPU over 8 s and measured `total_ms_avg=17.815`,
+  `scene_gpu_ms_avg=12.989`, `present_gpu_ms_avg=4.848`, p50 16.685 ms, and p95
+  22.513 ms, with zero midpoint cancellations and GL errors. This is valid
+  hot-path evidence but not a GPU comparison to the 1,600-primitive baseline.
+  Profiles: `/tmp/opencode/xg-smooth-ft4-direct.data` and
+  `/tmp/opencode/xg-smooth-ft4-direct-index.data`. Static-auth, semantic
+  workload, GL mask/peek/transaction, frame-pacing, telemetry guards, full
+  runtime link, and `git diff --check` pass.
+- **2026-08-12 (Native midpoint presentation pacing):** Live gameplay telemetry
+  ruled out paired/back-to-back midpoint swaps: the main GL path alternated one
+  midpoint/current present per host slot. Added position-distance diagnostics to
+  the semantic matcher; a five-second gameplay sample reported 892,069 of
+  958,347 matched vertices moving (93.0%) and 401,308,712,960 cumulative 16.16
+  Manhattan units, proving substantial spatial interpolation rather than only
+  color changes. The latency ring instead exposed catch-up pacing: p50 16.68 ms,
+  p95 21.96 ms, and 6.94--27.11 ms extrema. `FramePacer` now exposes a stable
+  policy used only by active smooth non-FMV presentation; late frames re-anchor
+  instead of producing a short debt-repayment interval. Normal emulation and
+  Beetle retain bounded debt recovery. Native pacing keys from the smooth
+  request, not the intentionally quiesced legacy smooth-effective flag. The pure pacer regression test, runtime
+  telemetry structural guard, semantic workload test, OpenGL Native mask/order
+  integration test, and full runtime build pass.
+- **2026-08-12 (Native GP0 provenance hot-path fix):** `perf record` on live
+  smooth gameplay attributed 46.5% of CPU cycles to
+  `debug_server_find_last_ram_writer`, reached once per GP0 packet through DMA2
+  preflight. The intended O(1) writer index only recorded aligned stores, while
+  Xenogears commonly assembles packet words with byte/half stores; misses fell
+  through to a 131,072-entry reverse ring scan. The index now records every word
+  overlapped by each store and indexed empty slots fail definitively in O(1).
+- **2026-08-12 (Native retrospective 30->60 midpoint):** Added fail-closed
+  producer identities and a semantic workload matcher for Native source frames;
+  duplicate VBlanks now present host-only midpoint geometry while guest timing,
+  input, audio, and canonical VRAM remain unchanged. Native and canonical
+  midpoint targets preserve mask/order, uploads, copies, wave composition, and
+  FMV suspension. Smooth presentation keeps the legacy interpolation paths
+  quiescent, respects the configured internal raster scale, and preserves seeded
+  Native surfaces plus wave state across live scale rebuild/rollback. A live
+  slot-3 pass exposed two integration faults. First, POSIX overlay libraries
+  import runtime-owned generated-code ABI symbols, but the executable did not
+  export them; `ENABLE_EXPORTS` now supplies the plugin-host contract and a
+  Linux CTest verifies `g_psx_resume_seed` in the dynamic symbol table. The
+  rebuilt runtime registered 10 functions from 9 loaded images and reached
+  `dispatch_native=77240` by VBlank 1077 (`input_replay.active=false`), replacing
+  the prior 512-library preflight rejection. Second, unkeyed live gameplay
+  recorded 364 primitives per source frame but found zero retrospective
+  candidates because authentication `scene_generation` advanced on ordinary
+  producer-frame boundaries. Interpolation now has a separate temporal scene
+  namespace: auth boundaries preserve it, while relevant code mutation and
+  loader mismatch advance it. The root integration set passes 12/12 and the
+  standalone semantic/GL peek/transaction set passes 4/4. Live semantic capture
+  without replay reached `begun=21163`, `sealed=10581`, and
+  `recorded=2022197`. Manual gameplay from the project-root memory card then
+  exposed two fail-closed midpoint cancellations. GDB live proved that the
+  address-free matcher paired semitransparent fullscreen subtractive overlays
+  across alternating framebuffer offsets; retrospective matching now excludes
+  semitransparent primitives unless they carry an explicit identity. A second
+  live capture proved that interpolation wrote `native_view_x/y` even when
+  `native_view_position=0`, creating invalid phantom Native coordinates; those
+  fields now remain untouched unless the producer explicitly authored them.
+  Optional midpoint GL operations also retain cumulative operation/error
+  diagnostics and cancel only the midpoint frame rather than failing the
+  authoritative Native packet stream. Final no-replay live proof used
+  `--memcard-dir /home/pc/xenogears-port/XenogearsRecomp` and remained healthy
+  through VBlank 3639 with `I_MASK=0x24D`, `cancelled=0`, `gl_error_count=0`,
+  `total_matched=47694`, `total_moved=47694`, and `midpoint_presents=99`.
 - **2026-08-11 (Native-wide PR salvage):** Adapted the production-safe pieces
   of PR #2 to the producer-driven Native renderer without restoring legacy
   mirror heuristics or diagnostics. GP1(05h) real framebuffer changes now clear

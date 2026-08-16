@@ -43,6 +43,7 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "gpu_semantic_workload.h"
 #include "gte_attribution.h"
 #include "lockstep.h"
 #include "debug_overlay.h"
@@ -462,8 +463,10 @@ static uint64_t s_wtrace_all_seq  = 0;
 static uint32_t s_wtrace_all_head = 0;
 
 /* The provenance observer asks for the latest writer of aligned guest words.
- * Keep that exact subset indexed so a normal lookup does not rescan the hot
- * catch-all ring. Non-aligned or non-RAM addresses still use the ring below. */
+ * Index every word TOUCHED by a byte/half/word store: packet builders commonly
+ * assemble GP0 words with partial stores, and indexing only aligned stores made
+ * every source lookup rescan the catch-all ring. Non-aligned or non-RAM queries
+ * still use the ring below. */
 #define LAST_RAM_WRITER_MAIN_RAM_WORDS (0x200000u / 4u)
 #define LAST_RAM_WRITER_SCRATCHPAD_WORDS (0x400u / 4u)
 typedef struct {
@@ -8114,7 +8117,7 @@ static void handle_get_snapshots(int id, const char *json)
  * the old "screenshot" inline-hex-row variant streamed h+1 response lines
  * per request, which violated the one-request/one-response protocol and
  * poisoned every client connection that used it. */
-/* ---- Always-on display ring ----------------------------------------------
+/* ---- Opt-in display ring -------------------------------------------------
  * The last DISP_RING_CAP vblanks' display areas, raw 15-bit VRAM halfwords,
  * captured in debug_server_record_frame (ring-buffer rule: continuous
  * capture, observers query a window after the fact). Purpose: FRAME-EXACT
@@ -8149,13 +8152,12 @@ static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 static void disp_ring_capture(void)
 {
     /* Full-VRAM GL readback is intentionally expensive and can perturb the
-     * performance issue being measured. Keep the forensic ring default-on, but
-     * allow a controlled acceptance run to disable continuous capture while
-     * retaining the TCP server and one-shot screenshot command. */
+     * performance issue being measured. Enable continuous forensic capture
+     * only for tools that explicitly request it. */
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("PSX_DISPLAY_RING");
-        enabled = (!e || !*e || *e != '0') ? 1 : 0;
+        enabled = e && strcmp(e, "1") == 0;
     }
     if (!enabled) return;
     if (!s_disp_ring_px) {
@@ -8394,6 +8396,7 @@ static void handle_native_semantic_last(int id, const char *json)
              "\"command_id\":\"0x%llX\",\"visual\":[%llu,%llu],"
              "\"topology\":%u,\"screen_space_2d\":%u,"
              "\"triangle_count\":%u,\"line_count\":%u,"
+             "\"identity\":[%llu,%u,%u,%u],"
              "\"material\":{\"tpage\":%u,\"page_x\":%u,\"page_y\":%u,"
              "\"clut_x\":%u,\"clut_y\":%u,\"area\":[%u,%u,%u,%u],"
              "\"offset\":[%d,%d],\"depth\":%u,\"blend\":%u,"
@@ -8405,6 +8408,10 @@ static void handle_native_semantic_last(int id, const char *json)
              (unsigned long long)visual_id.state_sequence,
              semantic.topology, semantic.screen_space_2d,
              semantic.triangle_count, semantic.line_count,
+             (unsigned long long)semantic.interpolation_identity.scene_id,
+             semantic.interpolation_identity.producer_id,
+             semantic.interpolation_identity.primitive_id,
+             semantic.interpolation_identity.valid,
              semantic.material.tpage, semantic.material.texture_page_x,
              semantic.material.texture_page_y, semantic.material.clut_x,
              semantic.material.clut_y, semantic.material.draw_area_left,
@@ -8458,6 +8465,442 @@ static void handle_native_semantic_last(int id, const char *json)
     send_fmt("%s", response);
 }
 
+static void handle_native_stream_diag(int id, const char *json)
+{
+    GuestRenderNativeStreamSnapshot stream = {0};
+    PsxXgRenderModelFt4ShadowSnapshot ft4 = {0};
+    PsxXgRenderModelFt3ShadowSnapshot ft3 = {0};
+    PsxXgRenderSpriteFt4ShadowSnapshot sprites = {0};
+    PsxXgRenderWorldTerrainWaterShadowSnapshot terrain = {0};
+    PsxXgRenderAuthInstrumentation auth = {0};
+
+    (void)json;
+    if (guest_render_native_stream_snapshot(&stream) !=
+            GUEST_RENDER_NATIVE_STREAM_OK) {
+        send_err(id, "native stream snapshot unavailable");
+        return;
+    }
+    psx_xg_render_auth_model_ft4_shadow_snapshot(&ft4);
+    psx_xg_render_auth_model_ft3_shadow_snapshot(&ft3);
+    psx_xg_render_auth_sprite_ft4_shadow_snapshot(&sprites);
+    psx_xg_render_auth_world_terrain_water_shadow_snapshot(&terrain);
+    psx_xg_render_auth_instrumentation_snapshot(&auth);
+    send_fmt(
+        "{\"id\":%d,\"ok\":true,"
+        "\"stream\":{\"enabled\":%s,\"staged\":%zu,"
+        "\"total_staged\":%llu,\"total_consumed\":%llu,"
+        "\"consumed_keyed\":%llu,\"consumed_unkeyed\":%llu,"
+        "\"rasterized_keyed\":%llu,\"rasterized_unkeyed\":%llu,"
+        "\"not_found\":%llu,\"original_draws\":%llu,"
+        "\"parser_replay_draws\":%llu,\"ui_ot_calls\":%llu,"
+        "\"native_lists\":%llu,\"native_packets\":%llu,"
+        "\"bound_packets\":%llu,\"unbound_packets\":%llu,"
+        "\"unsupported_packets\":%llu,"
+        "\"first_unbound_opcode\":%u,\"last_unbound_opcode\":%u,"
+        "\"first_unsupported_opcode\":%u,"
+        "\"last_unsupported_opcode\":%u,"
+        "\"last_command_id\":\"0x%llX\"},"
+        "\"model_ft4\":{\"dispatches\":%llu,"
+        "\"average_seams\":%llu,\"farthest_seams\":%llu,"
+        "\"seams_without_context\":%llu,"
+        "\"cutovers\":%llu,\"native_primitives\":%llu,"
+        "\"invocations\":%llu,\"primitives\":%llu,"
+        "\"matches\":%llu,\"mismatches\":%llu,"
+        "\"payload_mismatches\":%llu,\"geometry_mismatches\":%llu,"
+        "\"tag_mismatches\":%llu,\"ot_mismatches\":%llu,"
+        "\"cursor_mismatches\":%llu,\"counter_mismatches\":%llu,"
+        "\"template_hits\":%llu,\"template_misses\":%llu,"
+         "\"prepare_failure\":%u,\"prepare_precondition_mask\":%u,"
+         "\"last_model\":\"0x%08X\","
+         "\"last_groups\":%u,\"last_target\":%u,"
+         "\"guest_pass_observations\":%llu,"
+         "\"guest_pass_projection_disagreements\":%llu,"
+         "\"replay_attempts\":%llu,\"replay_resolved\":%llu,"
+         "\"replay_lookup_misses\":%llu,\"replay_record_rejects\":%llu,"
+         "\"replay_container_rejects\":%llu,"
+         "\"replay_lifecycle_rejects\":%llu,"
+         "\"replay_translate_rejects\":%llu,"
+         "\"publish_invocations\":%llu,\"publish_sources\":%llu,"
+         "\"validation_rejected_sources\":%llu,"
+         "\"framing_rejected_invocations\":%llu,"
+         "\"last_expected_counter_delta\":%u,"
+         "\"last_actual_counter_delta\":%u,"
+         "\"projection_matrix_mismatches\":%llu,"
+         "\"last_projection_matrix_mismatch_mask\":%u,"
+         "\"first_mismatch_primitive\":%u,"
+         "\"first_mismatch_packet\":\"0x%08X\","
+         "\"first_payload_mismatch_bits\":%u,"
+         "\"first_payload_mismatch_packet\":\"0x%08X\","
+         "\"first_payload_mismatch_descriptor\":\"0x%08X\","
+         "\"first_payload_expected_material\":\"0x%08X\","
+         "\"first_payload_actual_material\":\"0x%08X\","
+         "\"first_payload_expected_tpage\":%u,"
+         "\"first_payload_actual_tpage\":%u,"
+         "\"first_payload_expected_clut\":%u,"
+         "\"first_payload_actual_clut\":%u,"
+         "\"blocked\":%s,\"blocker\":%u},"
+        "\"model_ft3\":{\"cutovers\":%llu,\"native_primitives\":%llu,"
+        "\"template_hits\":%llu,\"template_misses\":%llu,"
+        "\"invocations\":%llu,\"matches\":%llu,\"mismatches\":%llu,"
+        "\"replay_attempts\":%llu,\"replay_resolved\":%llu,"
+        "\"replay_lookup_misses\":%llu,\"replay_record_rejects\":%llu,"
+        "\"replay_container_rejects\":%llu,"
+        "\"replay_lifecycle_rejects\":%llu,"
+        "\"replay_translate_rejects\":%llu,"
+        "\"publish_invocations\":%llu,\"publish_sources\":%llu,"
+        "\"validation_rejected_sources\":%llu,"
+         "\"framing_rejected_invocations\":%llu,"
+         "\"cursor_mismatches\":%llu,\"counter_mismatches\":%llu,"
+         "\"counter_actual_greater\":%llu,\"counter_actual_less\":%llu,"
+         "\"last_expected_counter_delta\":%u,"
+         "\"last_actual_counter_delta\":%u,"
+         "\"last_mismatch_expected_counter_delta\":%u,"
+         "\"last_mismatch_actual_counter_delta\":%u,"
+         "\"last_nclip_positive\":%u,"
+         "\"last_guest_screen_accepted\":%u,"
+         "\"last_guest_vertical_accepted\":%u,"
+         "\"last_guest_horizontal_accepted\":%u,"
+         "\"last_projection_flag_negative\":%u,"
+         "\"handler_projection_mismatches\":%llu,"
+         "\"last_handler_projection_mismatch_mask\":%u,"
+         "\"guest_pass_observations\":%llu,"
+         "\"guest_pass_projection_disagreements\":%llu,"
+         "\"last_mismatch_target\":%u,"
+         "\"last_mismatch_nclip_positive\":%u,"
+         "\"last_mismatch_guest_screen_accepted\":%u,"
+         "\"last_mismatch_guest_vertical_accepted\":%u,"
+         "\"last_mismatch_guest_horizontal_accepted\":%u,"
+         "\"last_mismatch_projection_flag_negative\":%u,"
+         "\"last_mismatch_screen_right\":%u,"
+         "\"last_mismatch_screen_bottom\":%u,"
+         "\"prepare_failure\":%u,\"prepare_precondition_mask\":%u,"
+        "\"last_groups\":%u,"
+        "\"last_target\":%u,\"blocked\":%s,\"blocker\":%u},"
+        "\"sprites\":{\"cutovers\":%llu,\"native_primitives\":%llu,"
+        "\"resident_publish_sources\":%llu,"
+        "\"resident_replay_attempts\":%llu,"
+        "\"resident_replay_resolved\":%llu,"
+        "\"resident_replay_lookup_misses\":%llu,"
+        "\"resident_replay_record_rejects\":%llu,"
+        "\"resident_replay_container_rejects\":%llu,"
+        "\"resident_replay_lifecycle_rejects\":%llu,"
+        "\"resident_replay_translate_rejects\":%llu,"
+        "\"projections\":%llu,\"matches\":%llu,\"mismatches\":%llu,"
+        "\"geometry_mismatches\":%llu,\"payload_mismatches\":%llu,"
+        "\"field_cutovers\":%llu,\"field_native_primitives\":%llu,"
+        "\"field_templates\":%u,\"last_sprite\":\"0x%08X\","
+        "\"blocked\":%s,\"blocker\":%u,"
+        "\"field_blocked\":%s,\"field_blocker\":%u,"
+        "\"field_failure\":%u,\"field_last_caller\":\"0x%08X\"},"
+         "\"terrain\":{\"cutovers\":%llu,\"native_primitives\":%llu,"
+         "\"last_caller\":\"0x%08X\",\"blocker_detail\":%u,"
+         "\"capture_result\":%u,\"build_result\":%u,"
+         "\"candidate_count\":%u,\"mesh_duplicates\":%u,"
+         "\"mesh_cross_tile_duplicates\":%u,"
+         "\"mesh_canonical_conflicts\":%u,"
+         "\"mesh_native_conflicts\":%u,"
+         "\"mesh_cross_tile_native_conflicts\":%u,"
+         "\"active_tiles\":%u,\"selected_quadrants\":%u,"
+         "\"rejected_quadrants\":%u,\"considered_triangles\":%u,"
+         "\"projective_vertices\":%u,\"projective_invalid_x\":%u,"
+         "\"projective_invalid_y\":%u,\"projective_invalid_z\":%u,"
+         "\"projective_invalid_near\":%u,"
+         "\"emitted_projective_vertices\":%u,"
+         "\"shared_duplicate_vertices\":%u,"
+         "\"shared_raster_conflicts\":%u,"
+         "\"emitted_triangles\":%u,\"projection_rejects\":%u,"
+         "\"screen_rejects\":%u,\"backface_rejects\":%u,"
+         "\"depth_rejects\":%u,\"packet_limit_stops\":%u,"
+         "\"blocked\":%s,\"blocker\":%u},"
+        "\"auth\":{\"flush_attempts\":%llu,\"flush_failures\":%llu,"
+        "\"first_flush_reason\":%u,\"first_flush_status\":%u,"
+        "\"first_flush_packet\":\"0x%08X\"}}",
+        id, stream.enabled ? "true" : "false", stream.staged_count,
+        (unsigned long long)stream.total_staged,
+        (unsigned long long)stream.total_consumed,
+        (unsigned long long)stream.total_consumed_keyed,
+        (unsigned long long)stream.total_consumed_unkeyed,
+        (unsigned long long)stream.total_rasterized_keyed,
+        (unsigned long long)stream.total_rasterized_unkeyed,
+        (unsigned long long)stream.total_not_found,
+        (unsigned long long)stream.total_original_draws,
+        (unsigned long long)stream.total_parser_replay_draws,
+        (unsigned long long)stream.total_ui_ot_adapter_calls,
+        (unsigned long long)stream.total_native_lists,
+        (unsigned long long)stream.total_native_packets,
+        (unsigned long long)stream.total_native_bound_packets,
+        (unsigned long long)stream.total_native_unbound_packets,
+        (unsigned long long)stream.total_native_unsupported_packets,
+        stream.first_native_unbound_opcode,
+        stream.last_native_unbound_opcode,
+        stream.first_native_unsupported_opcode,
+        stream.last_native_unsupported_opcode,
+        (unsigned long long)stream.last_command_id,
+        (unsigned long long)ft4.dispatch_begin_count,
+        (unsigned long long)ft4.average_seam_count,
+        (unsigned long long)ft4.farthest_seam_count,
+        (unsigned long long)ft4.seam_without_context_count,
+        (unsigned long long)ft4.native_cutover_count,
+        (unsigned long long)ft4.native_primitive_count,
+        (unsigned long long)ft4.invocation_count,
+        (unsigned long long)ft4.primitive_count,
+        (unsigned long long)ft4.match_count,
+        (unsigned long long)ft4.mismatch_count,
+        (unsigned long long)ft4.payload_mismatch_count,
+        (unsigned long long)ft4.geometry_mismatch_count,
+        (unsigned long long)ft4.tag_mismatch_count,
+        (unsigned long long)ft4.ot_mismatch_count,
+        (unsigned long long)ft4.cursor_mismatch_count,
+        (unsigned long long)ft4.counter_mismatch_count,
+        (unsigned long long)ft4.template_hit_count,
+        (unsigned long long)ft4.template_miss_count,
+         ft4.prepare_failure_detail, ft4.prepare_precondition_failure_mask,
+         ft4.last_model_address,
+         ft4.last_group_count, ft4.last_target_count,
+         (unsigned long long)ft4.guest_pass_observation_count,
+         (unsigned long long)ft4.guest_pass_projection_disagreement_count,
+         (unsigned long long)ft4.replay_attempt_count,
+         (unsigned long long)ft4.replay_resolved_count,
+         (unsigned long long)ft4.replay_lookup_miss_count,
+         (unsigned long long)ft4.replay_record_reject_count,
+         (unsigned long long)ft4.replay_container_reject_count,
+         (unsigned long long)ft4.replay_lifecycle_reject_count,
+         (unsigned long long)ft4.replay_translate_reject_count,
+         (unsigned long long)ft4.publish_invocation_count,
+         (unsigned long long)ft4.publish_source_count,
+         (unsigned long long)ft4.validation_rejected_source_count,
+         (unsigned long long)ft4.framing_rejected_invocation_count,
+         ft4.last_expected_counter_delta,
+         ft4.last_actual_counter_delta,
+         (unsigned long long)ft4.projection_matrix_mismatch_count,
+         ft4.last_projection_matrix_mismatch_mask,
+         ft4.first_mismatch_primitive, ft4.first_mismatch_packet,
+         ft4.first_payload_mismatch.field_bits,
+         ft4.first_payload_mismatch.packet_address,
+         ft4.first_payload_mismatch.descriptor_address,
+         ft4.first_payload_mismatch.expected_material_word,
+         ft4.first_payload_mismatch.actual_material_word,
+         ft4.first_payload_mismatch.expected_tpage,
+         ft4.first_payload_mismatch.actual_tpage,
+         ft4.first_payload_mismatch.expected_clut,
+         ft4.first_payload_mismatch.actual_clut,
+         ft4.blocked ? "true" : "false", ft4.blocker,
+        (unsigned long long)ft3.native_cutover_count,
+        (unsigned long long)ft3.native_primitive_count,
+        (unsigned long long)ft3.template_hit_count,
+        (unsigned long long)ft3.template_miss_count,
+        (unsigned long long)ft3.invocation_count,
+        (unsigned long long)ft3.match_count,
+        (unsigned long long)ft3.mismatch_count,
+        (unsigned long long)ft3.replay_attempt_count,
+        (unsigned long long)ft3.replay_resolved_count,
+        (unsigned long long)ft3.replay_lookup_miss_count,
+        (unsigned long long)ft3.replay_record_reject_count,
+        (unsigned long long)ft3.replay_container_reject_count,
+        (unsigned long long)ft3.replay_lifecycle_reject_count,
+        (unsigned long long)ft3.replay_translate_reject_count,
+        (unsigned long long)ft3.publish_invocation_count,
+        (unsigned long long)ft3.publish_source_count,
+        (unsigned long long)ft3.validation_rejected_source_count,
+        (unsigned long long)ft3.framing_rejected_invocation_count,
+         (unsigned long long)ft3.cursor_mismatch_count,
+         (unsigned long long)ft3.counter_mismatch_count,
+         (unsigned long long)ft3.counter_actual_greater_count,
+         (unsigned long long)ft3.counter_actual_less_count,
+         ft3.last_expected_counter_delta,
+         ft3.last_actual_counter_delta,
+         ft3.last_mismatch_expected_counter_delta,
+         ft3.last_mismatch_actual_counter_delta,
+         ft3.last_nclip_positive_count,
+         ft3.last_guest_screen_accepted_count,
+         ft3.last_guest_vertical_accepted_count,
+         ft3.last_guest_horizontal_accepted_count,
+         ft3.last_projection_flag_negative_count,
+         (unsigned long long)ft3.handler_projection_mismatch_count,
+         ft3.last_handler_projection_mismatch_mask,
+         (unsigned long long)ft3.guest_pass_observation_count,
+         (unsigned long long)ft3.guest_pass_projection_disagreement_count,
+         ft3.last_mismatch_target_count,
+         ft3.last_mismatch_nclip_positive_count,
+         ft3.last_mismatch_guest_screen_accepted_count,
+         ft3.last_mismatch_guest_vertical_accepted_count,
+         ft3.last_mismatch_guest_horizontal_accepted_count,
+         ft3.last_mismatch_projection_flag_negative_count,
+         ft3.last_mismatch_screen_right,
+         ft3.last_mismatch_screen_bottom,
+         ft3.prepare_failure_detail, ft3.prepare_precondition_failure_mask,
+        ft3.last_group_count,
+        ft3.last_target_count,
+        ft3.blocked ? "true" : "false", ft3.blocker,
+        (unsigned long long)sprites.native_cutover_count,
+        (unsigned long long)sprites.native_primitive_count,
+        (unsigned long long)sprites.resident_publish_source_count,
+        (unsigned long long)sprites.resident_replay_attempt_count,
+        (unsigned long long)sprites.resident_replay_resolved_count,
+        (unsigned long long)sprites.resident_replay_lookup_miss_count,
+        (unsigned long long)sprites.resident_replay_record_reject_count,
+        (unsigned long long)sprites.resident_replay_container_reject_count,
+        (unsigned long long)sprites.resident_replay_lifecycle_reject_count,
+        (unsigned long long)sprites.resident_replay_translate_reject_count,
+        (unsigned long long)sprites.projection_count,
+        (unsigned long long)sprites.match_count,
+        (unsigned long long)sprites.mismatch_count,
+        (unsigned long long)sprites.geometry_mismatch_count,
+        (unsigned long long)sprites.payload_mismatch_count,
+        (unsigned long long)sprites.field_builder_native_cutover_count,
+        (unsigned long long)sprites.field_builder_native_primitive_count,
+        sprites.field_builder_template_count, sprites.last_sprite_address,
+        sprites.blocked ? "true" : "false", sprites.blocker,
+        sprites.field_builder_blocked ? "true" : "false",
+        sprites.field_builder_blocker, sprites.field_builder_failure_detail,
+        sprites.last_field_builder_caller,
+        (unsigned long long)terrain.native_cutover_count,
+        (unsigned long long)terrain.native_primitive_count,
+        terrain.last_caller_return, terrain.blocker_detail,
+        terrain.last_capture_result, terrain.last_build_result,
+        terrain.last_candidate_count,
+        terrain.mesh_duplicate_vertices,
+        terrain.mesh_cross_tile_duplicate_vertices,
+         terrain.mesh_canonical_raster_conflicts,
+         terrain.mesh_native_raster_conflicts,
+         terrain.mesh_cross_tile_native_raster_conflicts,
+         terrain.build_diagnostics.active_tiles,
+         terrain.build_diagnostics.selected_quadrants,
+         terrain.build_diagnostics.rejected_quadrants,
+         terrain.build_diagnostics.considered_triangles,
+         terrain.build_diagnostics.projective_vertices,
+         terrain.build_diagnostics.projective_invalid_x,
+         terrain.build_diagnostics.projective_invalid_y,
+         terrain.build_diagnostics.projective_invalid_z,
+         terrain.build_diagnostics.projective_invalid_near,
+         terrain.build_diagnostics.emitted_projective_vertices,
+         terrain.build_diagnostics.shared_duplicate_vertices,
+         terrain.build_diagnostics.shared_raster_conflicts,
+         terrain.build_diagnostics.emitted_triangles,
+         terrain.build_diagnostics.projection_rejects,
+         terrain.build_diagnostics.screen_rejects,
+         terrain.build_diagnostics.backface_rejects,
+         terrain.build_diagnostics.depth_rejects,
+         terrain.build_diagnostics.packet_limit_stops,
+         terrain.blocked ? "true" : "false", terrain.blocker,
+        (unsigned long long)auth.native_ir_flush_attempt_count,
+        (unsigned long long)auth.native_ir_flush_failure_count,
+        auth.first_native_ir_flush_failure_reason,
+        auth.first_native_ir_flush_failure_status,
+        auth.first_native_ir_flush_failure_packet);
+}
+
+static void handle_native_stream_attribution(int id, const char *json)
+{
+    enum { TOP_COUNT = 8 };
+    GuestRenderNativeStreamSnapshot stream = {0};
+    GuestRenderNativeSourceHotspot hotspots[TOP_COUNT] = {{0}};
+    uint64_t opcode_counts[TOP_COUNT] = {0};
+    uint8_t opcodes[TOP_COUNT] = {0};
+    char response[32768];
+    size_t offset = 0u;
+
+    (void)json;
+    if (guest_render_native_stream_snapshot(&stream) !=
+            GUEST_RENDER_NATIVE_STREAM_OK) {
+        send_err(id, "native stream snapshot unavailable");
+        return;
+    }
+    for (uint32_t opcode = 0u;
+         opcode < GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT; ++opcode) {
+        const uint64_t count = stream.native_unbound_opcode_counts[opcode];
+
+        for (uint32_t slot = 0u; slot < TOP_COUNT; ++slot) {
+            if (count <= opcode_counts[slot]) continue;
+            for (uint32_t move = TOP_COUNT - 1u; move > slot; --move) {
+                opcode_counts[move] = opcode_counts[move - 1u];
+                opcodes[move] = opcodes[move - 1u];
+            }
+            opcode_counts[slot] = count;
+            opcodes[slot] = (uint8_t)opcode;
+            break;
+        }
+    }
+    for (uint32_t index = 0u;
+         index < GUEST_RENDER_NATIVE_STREAM_HOTSPOT_CAPACITY; ++index) {
+        const GuestRenderNativeSourceHotspot *candidate =
+            &stream.native_unbound_source_hotspots[index];
+
+        for (uint32_t slot = 0u; slot < TOP_COUNT; ++slot) {
+            if (candidate->count <= hotspots[slot].count) continue;
+            for (uint32_t move = TOP_COUNT - 1u; move > slot; --move)
+                hotspots[move] = hotspots[move - 1u];
+            hotspots[slot] = *candidate;
+            break;
+        }
+    }
+
+#define APPEND_RESPONSE(...) do { \
+    int appended = snprintf(response + offset, sizeof(response) - offset, \
+                            __VA_ARGS__); \
+    if (appended < 0 || (size_t)appended >= sizeof(response) - offset) { \
+        send_err(id, "native stream attribution response overflow"); \
+        return; \
+    } \
+    offset += (size_t)appended; \
+} while (0)
+
+    APPEND_RESPONSE("{\"id\":%d,\"ok\":true,\"top_opcodes\":[", id);
+    for (uint32_t slot = 0u; slot < TOP_COUNT; ++slot) {
+        const uint8_t opcode = opcodes[slot];
+
+        if (slot != 0u) APPEND_RESPONSE(",");
+        APPEND_RESPONSE(
+            "{\"opcode\":%u,\"count\":%llu,"
+            "\"source\":\"0x%08X\",\"pc\":\"0x%08X\","
+            "\"return\":\"0x%08X\"}",
+            opcode, (unsigned long long)opcode_counts[slot],
+            stream.native_unbound_source_by_opcode[opcode],
+            stream.native_unbound_pc_by_opcode[opcode],
+            stream.native_unbound_return_address_by_opcode[opcode]);
+    }
+    APPEND_RESPONSE("],\"top_hotspots\":[");
+    for (uint32_t slot = 0u; slot < TOP_COUNT; ++slot) {
+        const GuestRenderNativeSourceHotspot *hotspot = &hotspots[slot];
+
+        if (slot != 0u) APPEND_RESPONSE(",");
+        APPEND_RESPONSE(
+            "{\"opcode\":%u,\"count\":%llu,\"error\":%llu,"
+            "\"region\":\"0x%08X\",\"source\":\"0x%08X\","
+            "\"packet_pc\":\"0x%08X\","
+            "\"packet_function\":\"0x%08X\","
+            "\"packet_return\":\"0x%08X\","
+            "\"writer_pc\":\"0x%08X\","
+            "\"writer_function\":\"0x%08X\","
+            "\"writer_return\":\"0x%08X\",\"payload_writers\":[",
+            hotspot->opcode, (unsigned long long)hotspot->count,
+            (unsigned long long)hotspot->error,
+            hotspot->source_region_start,
+            hotspot->representative_source_address,
+            hotspot->representative_packet_pc,
+            hotspot->representative_packet_function,
+            hotspot->representative_packet_return_address,
+            hotspot->representative_writer_pc,
+            hotspot->representative_writer_function,
+            hotspot->representative_writer_return_address);
+        for (uint32_t writer = 0u;
+             writer < GUEST_RENDER_NATIVE_STREAM_PAYLOAD_WRITER_COUNT;
+             ++writer) {
+            const GuestRenderNativeSourceWriter *payload =
+                &hotspot->representative_payload_writers[writer];
+
+            if (writer != 0u) APPEND_RESPONSE(",");
+            APPEND_RESPONSE(
+                "[\"0x%08X\",\"0x%08X\",\"0x%08X\"]",
+                payload->pc, payload->function, payload->return_address);
+        }
+        APPEND_RESPONSE("]}");
+    }
+    APPEND_RESPONSE("]}");
+#undef APPEND_RESPONSE
+    send_line(response);
+}
+
 static void handle_xg_projected_state(int id, const char *json)
 {
     PsxXgRenderProjectedLifecycleSnapshot snapshot = {0};
@@ -8471,6 +8914,11 @@ static void handle_xg_projected_state(int id, const char *json)
         "\"native_primitives\":%llu,\"source_misses\":%llu,"
         "\"source_blocked\":%llu,\"pending_resets\":%llu,"
         "\"disable_resets\":%llu,\"code_write_resets\":%llu,"
+        "\"code_write_classes\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
+        "\"code_write_class_first\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+        "\"code_write_class_last\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+        "\"first_code_write\":[\"0x%08X\",%u,\"0x%08X\"],"
+        "\"last_code_write\":[\"0x%08X\",%u,\"0x%08X\"],"
         "\"loader_resets\":%llu,\"last_registered_object\":\"0x%08X\","
         "\"last_source_success_object\":\"0x%08X\","
         "\"last_source_miss_object\":\"0x%08X\"}",
@@ -8485,6 +8933,48 @@ static void handle_xg_projected_state(int id, const char *json)
         (unsigned long long)snapshot.pending_reset_count,
         (unsigned long long)snapshot.disable_reset_count,
         (unsigned long long)snapshot.code_write_reset_count,
+        (unsigned long long)snapshot.code_write_class_counts[0],
+        (unsigned long long)snapshot.code_write_class_counts[1],
+        (unsigned long long)snapshot.code_write_class_counts[2],
+        (unsigned long long)snapshot.code_write_class_counts[3],
+        (unsigned long long)snapshot.code_write_class_counts[4],
+        (unsigned long long)snapshot.code_write_class_counts[5],
+        (unsigned long long)snapshot.code_write_class_counts[6],
+        (unsigned long long)snapshot.code_write_class_counts[7],
+        (unsigned long long)snapshot.code_write_class_counts[8],
+        (unsigned long long)snapshot.code_write_class_counts[9],
+        (unsigned long long)snapshot.code_write_class_counts[10],
+        (unsigned long long)snapshot.code_write_class_counts[11],
+        snapshot.code_write_class_first_address[0],
+        snapshot.code_write_class_first_address[1],
+        snapshot.code_write_class_first_address[2],
+        snapshot.code_write_class_first_address[3],
+        snapshot.code_write_class_first_address[4],
+        snapshot.code_write_class_first_address[5],
+        snapshot.code_write_class_first_address[6],
+        snapshot.code_write_class_first_address[7],
+        snapshot.code_write_class_first_address[8],
+        snapshot.code_write_class_first_address[9],
+        snapshot.code_write_class_first_address[10],
+        snapshot.code_write_class_first_address[11],
+        snapshot.code_write_class_last_address[0],
+        snapshot.code_write_class_last_address[1],
+        snapshot.code_write_class_last_address[2],
+        snapshot.code_write_class_last_address[3],
+        snapshot.code_write_class_last_address[4],
+        snapshot.code_write_class_last_address[5],
+        snapshot.code_write_class_last_address[6],
+        snapshot.code_write_class_last_address[7],
+        snapshot.code_write_class_last_address[8],
+        snapshot.code_write_class_last_address[9],
+        snapshot.code_write_class_last_address[10],
+        snapshot.code_write_class_last_address[11],
+        snapshot.first_code_write_address,
+        snapshot.first_code_write_size,
+        snapshot.first_code_write_mask,
+        snapshot.last_code_write_address,
+        snapshot.last_code_write_size,
+        snapshot.last_code_write_mask,
         (unsigned long long)snapshot.loader_reset_count,
         snapshot.last_registered_object,
         snapshot.last_source_success_object,
@@ -8702,6 +9192,729 @@ static void handle_gl_vram_diff(int id, const char *json)
              id, n, bbox[0], bbox[1], bbox[2], bbox[3], gpu_dirty, smp);
 }
 
+static void handle_gl_native_center_diff(int id, const char *json)
+{
+    uint32_t count = 0u;
+    int bbox[4] = {0};
+    int samples[8][2] = {{0}};
+    uint16_t pixels[8][2] = {{0}};
+    char encoded[512];
+    int position = 0;
+    int result;
+
+    (void)json;
+    result = gl_renderer_native_view_center_diff(
+        &count, bbox, samples, pixels);
+    if (result == 0) {
+        send_err(id, "Native center comparison unavailable");
+        return;
+    }
+    encoded[0] = '\0';
+    for (int index = 0; index < result - 1; ++index) {
+        position += snprintf(
+            encoded + position, sizeof(encoded) - (size_t)position,
+            "%s[%d,%d,\"0x%04X\",\"0x%04X\"]",
+            index ? "," : "", samples[index][0], samples[index][1],
+            pixels[index][0], pixels[index][1]);
+    }
+    send_fmt(
+        "{\"id\":%d,\"ok\":true,\"count\":%u,"
+        "\"bbox\":[%d,%d,%d,%d],\"samples\":[%s]}",
+        id, count, bbox[0], bbox[1], bbox[2], bbox[3], encoded);
+}
+
+static const char *native_midpoint_eligibility_name(uint32_t eligibility)
+{
+    switch ((GpuSemanticWorkloadEligibility)eligibility) {
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_ELIGIBLE: return "eligible";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_NO_PREVIOUS: return "no-previous";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_OVERFLOW: return "overflow";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_COUNT_MISMATCH:
+        return "count-mismatch";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_INCOMPLETE_MATCH:
+        return "incomplete-match";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_STATIC: return "static";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_COUNT_MISMATCH:
+        return "partial-count-mismatch";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_INCOMPLETE_MATCH:
+        return "partial-incomplete-match";
+    case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_UNKNOWN:
+    default: return "unknown";
+    }
+}
+
+static const char *native_midpoint_cancel_reason_name(uint32_t reason)
+{
+    switch ((GlRendererNativeMidpointCancelReason)reason) {
+    case GL_NATIVE_MIDPOINT_CANCEL_GENERIC: return "generic";
+    case GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD: return "workload-record";
+    case GL_NATIVE_MIDPOINT_CANCEL_NONE:
+    default: return "none";
+    }
+}
+
+static const char *native_midpoint_reset_reason_name(uint32_t reason)
+{
+    switch ((GlRendererNativeMidpointResetReason)reason) {
+    case GL_NATIVE_MIDPOINT_RESET_INITIALIZE: return "initialize";
+    case GL_NATIVE_MIDPOINT_RESET_SCALE_CHANGE: return "scale-change";
+    case GL_NATIVE_MIDPOINT_RESET_FPS_CHANGE: return "fps-change";
+    case GL_NATIVE_MIDPOINT_RESET_BLANK_PRESENT: return "blank-present";
+    case GL_NATIVE_MIDPOINT_RESET_INVALIDATE_PRESENT: return "invalidate-present";
+    case GL_NATIVE_MIDPOINT_RESET_SUSPENSION_CHANGE: return "suspension-change";
+    case GL_NATIVE_MIDPOINT_RESET_VIEW_FREE: return "view-free";
+    case GL_NATIVE_MIDPOINT_RESET_PENDING_CANONICAL_MISMATCH:
+        return "pending-canonical-mismatch";
+    case GL_NATIVE_MIDPOINT_RESET_PENDING_VIEW_MISMATCH:
+        return "pending-view-mismatch";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_HEADLESS: return "frontend-headless";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_DEBUG_TURBO:
+        return "frontend-debug-turbo";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_TURBO_SKIP:
+        return "frontend-turbo-skip";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_LOAD_SKIP:
+        return "frontend-load-skip";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_FMV_SKIP:
+        return "frontend-fmv-skip";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_NETPLAY_SKIP:
+        return "frontend-netplay-skip";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_DEPTH24_HOLD:
+        return "frontend-depth24-hold";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE:
+        return "frontend-non-native-wide";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION:
+        return "frontend-transaction";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM:
+        return "frontend-non-native-stream";
+    case GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT:
+        return "frontend-cpu-present";
+    case GL_NATIVE_MIDPOINT_RESET_EXPLICIT:
+    default: return "explicit";
+    }
+}
+
+static void handle_native_midpoint_diag(int id, const char *json)
+{
+    GlRendererNativeMidpointDiagnostics diag = {0};
+    (void)json;
+    gl_renderer_native_midpoint_diag(&diag);
+    send_fmt(
+        "{\"id\":%d,\"ok\":true,\"target_fps\":%u,\"phase_count\":%u,"
+        "\"begun\":%llu,\"sealed\":%llu,"
+        "\"midpoint_presents\":%llu,\"current_presents\":%llu,"
+        "\"midpoint_candidates\":%llu,"
+        "\"duplicate_empty_frames\":%llu,"
+        "\"duplicate_static_frames\":%llu,"
+        "\"eligible_without_duplicate_frames\":%llu,"
+        "\"ineligible_after_duplicate_frames\":%llu,"
+        "\"ineligible_without_duplicate_frames\":%llu,"
+        "\"candidate_pending_current\":%llu,"
+        "\"candidate_canonical_disabled\":%llu,"
+        "\"candidate_view_unseeded\":%llu,"
+        "\"eligibility_frames\":{\"complete\":%llu,"
+        "\"partial_count_mismatch\":%llu,"
+        "\"partial_incomplete_match\":%llu,\"no_previous\":%llu,"
+        "\"overflow\":%llu,\"count_mismatch\":%llu,"
+        "\"incomplete_match\":%llu,\"static\":%llu},"
+        "\"deferred_current_frames\":%llu,"
+        "\"deferred_current_flushes\":%llu,"
+        "\"host_queue_flush_reasons\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
+        "\"resets\":{\"total\":%llu,\"with_previous\":%llu,"
+        "\"with_pending\":%llu,\"last\":\"%s\","
+        "\"reasons\":{\"suspension_change\":%llu,"
+        "\"pending_canonical_mismatch\":%llu,"
+        "\"pending_view_mismatch\":%llu,\"frontend_transaction\":%llu,"
+        "\"frontend_non_native_wide\":%llu,"
+        "\"frontend_non_native_stream\":%llu,"
+        "\"frontend_cpu_present\":%llu},"
+        "\"with_previous_reasons\":{\"suspension_change\":%llu,"
+        "\"pending_canonical_mismatch\":%llu,"
+        "\"pending_view_mismatch\":%llu,\"frontend_transaction\":%llu,"
+        "\"frontend_non_native_wide\":%llu,"
+        "\"frontend_non_native_stream\":%llu,"
+        "\"frontend_cpu_present\":%llu}},"
+        "\"cancelled\":%llu,"
+        "\"cancel_reasons\":{\"generic\":%llu,\"workload_record\":%llu},"
+        "\"last_cancel\":{\"reason\":\"%s\",\"status\":%u,"
+        "\"workload_current\":%llu,\"identity\":{\"valid\":%s,"
+        "\"scene\":%llu,\"producer\":%u,\"primitive\":%u}},"
+        "\"recorded\":%llu,\"current\":%llu,"
+        "\"workload_epoch\":%llu,"
+        "\"total_matched\":%llu,\"total_snapped\":%llu,"
+        "\"total_ambiguous\":%llu,\"total_moved\":%llu,"
+        "\"total_unkeyed\":%llu,\"total_exact_matches\":%llu,"
+        "\"total_exact_semitransparent_matches\":%llu,"
+        "\"total_matched_vertices\":%llu,"
+        "\"total_position_changed_vertices\":%llu,"
+        "\"total_position_delta_fixed\":%llu,"
+        "\"max_position_delta_fixed\":%llu,"
+        "\"max_position_identity\":{\"valid\":%s,\"scene\":%llu,"
+        "\"producer\":%u,\"primitive\":%u},"
+        "\"total_keyed_moved_matches\":%llu,"
+        "\"total_keyed_motion_over_32px\":%llu,"
+        "\"total_keyed_motion_over_64px\":%llu,"
+        "\"total_keyed_motion_over_128px\":%llu,"
+        "\"total_keyed_motion_over_192px\":%llu,"
+        "\"total_keyed_motion_over_240px\":%llu,"
+        "\"max_keyed_position_delta_fixed\":%llu,"
+        "\"max_keyed_identity\":{\"scene\":%llu,\"producer\":%u,"
+        "\"primitive\":%u},"
+        "\"total_midpoint_distinct_vertices\":%llu,"
+        "\"total_midpoint_collapsed_vertices\":%llu,"
+        "\"total_midpoint_formula_failures\":%llu,"
+        "\"total_projective_input_vertices\":%llu,"
+        "\"total_projective_valid_input_vertices\":%llu,"
+        "\"total_projective_phase_vertices\":%llu,"
+        "\"total_previous_unmatched\":%llu,"
+        "\"total_previous_unmatched_keyed\":%llu,"
+        "\"total_previous_unmatched_projective\":%llu,"
+        "\"total_retrospective_semitransparent_rejected\":%llu,"
+        "\"eligible_frames\":%llu,"
+        "\"rejected_no_previous_frames\":%llu,"
+        "\"rejected_overflow_frames\":%llu,"
+        "\"rejected_count_mismatch_frames\":%llu,"
+        "\"rejected_incomplete_match_frames\":%llu,"
+        "\"rejected_static_frames\":%llu,"
+        "\"partial_count_mismatch_frames\":%llu,"
+        "\"partial_incomplete_match_frames\":%llu,"
+        "\"last_eligibility\":\"%s\","
+        "\"last_seal\":{\"previous\":%llu,\"current\":%llu,"
+        "\"previous_unkeyed\":%llu,\"current_unkeyed\":%llu,"
+        "\"matched\":%llu,\"snapped\":%llu,\"ambiguous\":%llu,"
+        "\"moved\":%llu,\"exact_matches\":%llu,"
+        "\"exact_semitransparent_matches\":%llu,"
+        "\"previous_unmatched\":%llu,"
+        "\"previous_unmatched_keyed\":%llu,"
+        "\"previous_unmatched_projective\":%llu,"
+        "\"previous_overflowed\":%s,\"current_overflowed\":%s},"
+        "\"previous\":%llu,\"matched\":%llu,\"snapped\":%llu,"
+        "\"ambiguous\":%llu,\"moved\":%llu,\"unkeyed\":%llu,"
+        "\"exact_matches\":%llu,"
+        "\"exact_semitransparent_matches\":%llu,"
+        "\"matched_vertices\":%llu,"
+        "\"position_changed_vertices\":%llu,"
+        "\"position_delta_fixed\":%llu,"
+        "\"midpoint_distinct_vertices\":%llu,"
+        "\"midpoint_collapsed_vertices\":%llu,"
+        "\"midpoint_formula_failures\":%llu,"
+        "\"presented_midpoint_matched_vertices\":%llu,"
+        "\"presented_midpoint_position_changed_vertices\":%llu,"
+        "\"presented_midpoint_distinct_vertices\":%llu,"
+        "\"presented_midpoint_collapsed_vertices\":%llu,"
+        "\"presented_midpoint_formula_failures\":%llu,"
+        "\"presented_midpoint_position_delta_fixed\":%llu,"
+        "\"retrospective_candidates\":%llu,"
+        "\"retrospective_budget_exhausted\":%llu,"
+        "\"retrospective_semitransparent_rejected\":%llu,"
+        "\"nonsemantic_uploads\":%llu,\"nonsemantic_fills\":%llu,"
+        "\"nonsemantic_margin_clears\":%llu,\"nonsemantic_copies\":%llu,"
+        "\"gl_error_count\":%llu,\"last_gl_error\":\"0x%04X\","
+        "\"last_gl_operation\":%u,"
+        "\"frame_open\":%s,\"frame_valid\":%s,\"suspended\":%s,"
+        "\"previous_usable\":%s}",
+        id, diag.target_fps, diag.phase_count,
+        (unsigned long long)diag.begun_frames,
+        (unsigned long long)diag.sealed_frames,
+        (unsigned long long)diag.midpoint_presents,
+        (unsigned long long)diag.current_presents,
+        (unsigned long long)diag.midpoint_candidates,
+        (unsigned long long)diag.midpoint_duplicate_empty_frames,
+        (unsigned long long)diag.midpoint_duplicate_static_frames,
+        (unsigned long long)diag.midpoint_eligible_without_duplicate_frames,
+        (unsigned long long)diag.midpoint_ineligible_after_duplicate_frames,
+        (unsigned long long)diag.midpoint_ineligible_without_duplicate_frames,
+        (unsigned long long)diag.midpoint_candidate_pending_current,
+        (unsigned long long)diag.midpoint_candidate_canonical_disabled,
+        (unsigned long long)diag.midpoint_candidate_view_unseeded,
+        (unsigned long long)diag.eligibility_complete_frames,
+        (unsigned long long)diag.eligibility_partial_count_mismatch_frames,
+        (unsigned long long)diag.eligibility_partial_incomplete_match_frames,
+        (unsigned long long)diag.eligibility_no_previous_frames,
+        (unsigned long long)diag.eligibility_overflow_frames,
+        (unsigned long long)diag.eligibility_count_mismatch_frames,
+        (unsigned long long)diag.eligibility_incomplete_match_frames,
+        (unsigned long long)diag.eligibility_static_frames,
+        (unsigned long long)diag.deferred_current_frames,
+        (unsigned long long)diag.deferred_current_flushes,
+        (unsigned long long)diag.host_queue_flush_reasons[0],
+        (unsigned long long)diag.host_queue_flush_reasons[1],
+        (unsigned long long)diag.host_queue_flush_reasons[2],
+        (unsigned long long)diag.host_queue_flush_reasons[3],
+        (unsigned long long)diag.host_queue_flush_reasons[4],
+        (unsigned long long)diag.host_queue_flush_reasons[5],
+        (unsigned long long)diag.host_queue_flush_reasons[6],
+        (unsigned long long)diag.host_queue_flush_reasons[7],
+        (unsigned long long)diag.host_queue_flush_reasons[8],
+        (unsigned long long)diag.reset_count,
+        (unsigned long long)diag.reset_with_previous_count,
+        (unsigned long long)diag.reset_with_pending_count,
+        native_midpoint_reset_reason_name(diag.last_reset_reason),
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_SUSPENSION_CHANGE],
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_PENDING_CANONICAL_MISMATCH],
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_PENDING_VIEW_MISMATCH],
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION],
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE],
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM],
+        (unsigned long long)diag.reset_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_SUSPENSION_CHANGE],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_PENDING_CANONICAL_MISMATCH],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_PENDING_VIEW_MISMATCH],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_TRANSACTION],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_WIDE],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_NON_NATIVE_STREAM],
+        (unsigned long long)diag.reset_with_previous_reason_counts[
+            GL_NATIVE_MIDPOINT_RESET_FRONTEND_CPU_PRESENT],
+        (unsigned long long)diag.cancelled_frames,
+        (unsigned long long)diag.cancel_reason_counts[
+            GL_NATIVE_MIDPOINT_CANCEL_GENERIC],
+        (unsigned long long)diag.cancel_reason_counts[
+            GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD],
+        native_midpoint_cancel_reason_name(diag.last_cancel_reason),
+        diag.last_cancel_status,
+        (unsigned long long)diag.last_cancel_workload_current,
+        diag.last_cancel_identity_valid ? "true" : "false",
+        (unsigned long long)diag.last_cancel_identity_scene,
+        diag.last_cancel_identity_producer,
+        diag.last_cancel_identity_primitive,
+        (unsigned long long)diag.workload_recorded,
+        (unsigned long long)diag.workload_current,
+        (unsigned long long)diag.workload_epoch,
+        (unsigned long long)diag.workload_total_matched,
+        (unsigned long long)diag.workload_total_snapped,
+        (unsigned long long)diag.workload_total_ambiguous,
+        (unsigned long long)diag.workload_total_moved,
+        (unsigned long long)diag.workload_total_unkeyed,
+        (unsigned long long)diag.workload_total_exact_matches,
+        (unsigned long long)
+            diag.workload_total_exact_semitransparent_matches,
+        (unsigned long long)diag.workload_total_matched_vertices,
+        (unsigned long long)diag.workload_total_position_changed_vertices,
+        (unsigned long long)diag.workload_total_position_delta_fixed,
+        (unsigned long long)diag.workload_max_semantic_position_delta_fixed,
+        diag.workload_max_semantic_identity_valid ? "true" : "false",
+        (unsigned long long)diag.workload_max_semantic_identity_scene,
+        diag.workload_max_semantic_identity_producer,
+        diag.workload_max_semantic_identity_primitive,
+        (unsigned long long)diag.workload_total_keyed_moved_matches,
+        (unsigned long long)diag.workload_total_keyed_motion_over_32px,
+        (unsigned long long)diag.workload_total_keyed_motion_over_64px,
+        (unsigned long long)diag.workload_total_keyed_motion_over_128px,
+        (unsigned long long)diag.workload_total_keyed_motion_over_192px,
+        (unsigned long long)diag.workload_total_keyed_motion_over_240px,
+        (unsigned long long)
+            diag.workload_max_keyed_semantic_position_delta_fixed,
+        (unsigned long long)diag.workload_max_keyed_semantic_identity_scene,
+        diag.workload_max_keyed_semantic_identity_producer,
+        diag.workload_max_keyed_semantic_identity_primitive,
+        (unsigned long long)diag.workload_total_midpoint_distinct_vertices,
+        (unsigned long long)diag.workload_total_midpoint_collapsed_vertices,
+        (unsigned long long)diag.workload_total_midpoint_formula_failures,
+        (unsigned long long)diag.workload_total_projective_input_vertices,
+        (unsigned long long)
+            diag.workload_total_projective_valid_input_vertices,
+        (unsigned long long)diag.workload_total_projective_phase_vertices,
+        (unsigned long long)diag.workload_total_previous_unmatched,
+        (unsigned long long)diag.workload_total_previous_unmatched_keyed,
+        (unsigned long long)diag.workload_total_previous_unmatched_projective,
+        (unsigned long long)
+            diag.workload_total_retrospective_semitransparent_rejected,
+        (unsigned long long)diag.workload_total_eligible_frames,
+        (unsigned long long)
+            diag.workload_total_rejected_no_previous_frames,
+        (unsigned long long)diag.workload_total_rejected_overflow_frames,
+        (unsigned long long)
+            diag.workload_total_rejected_count_mismatch_frames,
+        (unsigned long long)
+            diag.workload_total_rejected_incomplete_match_frames,
+        (unsigned long long)diag.workload_total_rejected_static_frames,
+        (unsigned long long)
+            diag.workload_total_partial_count_mismatch_frames,
+        (unsigned long long)
+            diag.workload_total_partial_incomplete_match_frames,
+        native_midpoint_eligibility_name(diag.workload_last_eligibility),
+        (unsigned long long)diag.workload_last_previous,
+        (unsigned long long)diag.workload_last_current,
+        (unsigned long long)diag.workload_last_previous_unkeyed,
+        (unsigned long long)diag.workload_last_current_unkeyed,
+        (unsigned long long)diag.workload_last_matched,
+        (unsigned long long)diag.workload_last_snapped,
+        (unsigned long long)diag.workload_last_ambiguous,
+        (unsigned long long)diag.workload_last_moved,
+        (unsigned long long)diag.workload_last_exact_matches,
+        (unsigned long long)
+            diag.workload_last_exact_semitransparent_matches,
+        (unsigned long long)diag.workload_last_previous_unmatched,
+        (unsigned long long)diag.workload_last_previous_unmatched_keyed,
+        (unsigned long long)diag.workload_last_previous_unmatched_projective,
+        diag.workload_last_previous_overflowed ? "true" : "false",
+        diag.workload_last_current_overflowed ? "true" : "false",
+        (unsigned long long)diag.workload_previous,
+        (unsigned long long)diag.workload_matched,
+        (unsigned long long)diag.workload_snapped,
+        (unsigned long long)diag.workload_ambiguous,
+        (unsigned long long)diag.workload_moved,
+        (unsigned long long)diag.workload_unkeyed,
+        (unsigned long long)diag.workload_exact_matches,
+        (unsigned long long)diag.workload_exact_semitransparent_matches,
+        (unsigned long long)diag.workload_matched_vertices,
+        (unsigned long long)diag.workload_position_changed_vertices,
+        (unsigned long long)diag.workload_position_delta_fixed,
+        (unsigned long long)diag.workload_midpoint_distinct_vertices,
+        (unsigned long long)diag.workload_midpoint_collapsed_vertices,
+        (unsigned long long)diag.workload_midpoint_formula_failures,
+        (unsigned long long)diag.presented_midpoint_matched_vertices,
+        (unsigned long long)diag.presented_midpoint_position_changed_vertices,
+        (unsigned long long)diag.presented_midpoint_distinct_vertices,
+        (unsigned long long)diag.presented_midpoint_collapsed_vertices,
+        (unsigned long long)diag.presented_midpoint_formula_failures,
+        (unsigned long long)diag.presented_midpoint_position_delta_fixed,
+        (unsigned long long)diag.workload_retrospective_candidates,
+        (unsigned long long)diag.workload_retrospective_budget_exhausted,
+        (unsigned long long)
+            diag.workload_retrospective_semitransparent_rejected,
+        (unsigned long long)diag.nonsemantic_uploads,
+        (unsigned long long)diag.nonsemantic_fills,
+        (unsigned long long)diag.nonsemantic_margin_clears,
+        (unsigned long long)diag.nonsemantic_copies,
+        (unsigned long long)diag.gl_error_count,
+        diag.last_gl_error, diag.last_gl_operation,
+        diag.frame_open ? "true" : "false",
+        diag.frame_valid ? "true" : "false",
+        diag.suspended ? "true" : "false",
+        diag.previous_usable ? "true" : "false");
+}
+
+static void handle_native_producer_phase_diag(int id, const char *json)
+{
+    GlRendererSemanticProducerDiagnostics diagnostics = {0};
+    char producer_text[32];
+    uint32_t producer;
+
+    if (json_get_str(json, "producer", producer_text,
+                     (int)sizeof(producer_text)) == NULL) {
+        send_err(id, "producer required");
+        return;
+    }
+    producer = hex_to_u32(producer_text);
+    gl_renderer_semantic_producer_diag(producer, &diagnostics);
+    send_fmt(
+        "{\"id\":%d,\"ok\":true,\"producer\":\"0x%08X\","
+        "\"semantics\":%llu,\"midpoint_semantics\":%llu,"
+        "\"primitives\":%llu,\"static_primitives\":%llu,"
+        "\"fully_moving_primitives\":%llu,"
+        "\"partially_moving_primitives\":%llu,"
+        "\"matched_order\":%llu,\"previous_order_inversions\":%llu,"
+        "\"max_previous_order_regression\":%llu,"
+        "\"vertices\":%llu,\"duplicate_vertices\":%llu,"
+        "\"exact_vertex_conflicts\":%llu,"
+        "\"raster_vertex_conflicts\":%llu,"
+        "\"retired_candidates\":%llu,\"retired_inserted\":%llu,"
+        "\"retired_skipped_history\":%llu,"
+        "\"retired_skipped_capacity\":%llu,"
+        "\"max_midpoint_delta_fixed\":%llu,"
+        "\"max_midpoint_primitive\":%u}",
+        id, diagnostics.producer_id,
+        (unsigned long long)diagnostics.semantic_count,
+        (unsigned long long)diagnostics.midpoint_semantic_count,
+        (unsigned long long)diagnostics.primitive_count,
+        (unsigned long long)diagnostics.static_primitive_count,
+        (unsigned long long)diagnostics.fully_moving_primitive_count,
+        (unsigned long long)diagnostics.partially_moving_primitive_count,
+        (unsigned long long)diagnostics.matched_order_count,
+        (unsigned long long)diagnostics.previous_order_inversion_count,
+        (unsigned long long)diagnostics.max_previous_order_regression,
+        (unsigned long long)diagnostics.vertex_count,
+        (unsigned long long)diagnostics.duplicate_vertex_count,
+        (unsigned long long)diagnostics.exact_vertex_conflict_count,
+        (unsigned long long)diagnostics.raster_vertex_conflict_count,
+        (unsigned long long)diagnostics.retired_candidates,
+        (unsigned long long)diagnostics.retired_inserted,
+        (unsigned long long)diagnostics.retired_skipped_history,
+        (unsigned long long)diagnostics.retired_skipped_capacity,
+        (unsigned long long)diagnostics.max_midpoint_delta_fixed,
+        diagnostics.max_midpoint_primitive_id);
+}
+
+static const char *native_producer_match_kind_name(uint32_t kind)
+{
+    switch ((GpuSemanticWorkloadMatchKind)kind) {
+    case GPU_SEMANTIC_WORKLOAD_MATCH_IDENTITY: return "identity";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_RETROSPECTIVE: return "retrospective";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SOURCE_GEOMETRY: return "source_geometry";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_NO_PREVIOUS: return "no_previous";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_NOT_FOUND: return "not_found";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_AMBIGUOUS: return "ambiguous";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_ALREADY_USED: return "already_used";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_INCOMPATIBLE: return "incompatible";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_UNKEYED: return "unkeyed";
+    case GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN:
+    default: return "unknown";
+    }
+}
+
+static size_t native_motion_vertex_count(const GpuRenderSemantic *semantic)
+{
+    return semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+        ? (size_t)semantic->triangle_count * 3u
+        : (size_t)semantic->line_count * 2u;
+}
+
+static const GpuRenderSemanticVertex *native_motion_vertex(
+        const GpuRenderSemantic *semantic, size_t index)
+{
+    return semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+        ? &semantic->triangles[index / 3u].vertices[index % 3u]
+        : &semantic->lines[index / 2u].vertices[index % 2u];
+}
+
+static int native_motion_append_semantic(
+        char *buffer, size_t capacity, size_t *position,
+        const char *name, const GpuRenderSemantic *semantic)
+{
+    int written = snprintf(
+        buffer + *position, capacity - *position,
+        "\"%s\":{\"identity\":{\"valid\":%s,\"scene\":%llu,"
+        "\"producer\":%u,\"primitive\":%u},"
+        "\"topology\":%u,\"screen_space_2d\":%u,"
+        "\"triangles\":%u,\"lines\":%u,"
+        "\"material\":{\"tpage\":%u,\"clut\":[%u,%u],"
+        "\"draw_area\":[%u,%u,%u,%u],\"draw_offset\":[%d,%d],"
+        "\"texture_depth\":%u,\"blend_mode\":%u,\"shading\":%u,"
+        "\"textured\":%u,\"raw_texture\":%u,"
+        "\"semi_transparent\":%u},\"vertices\":[",
+        name, semantic->interpolation_identity.valid ? "true" : "false",
+        (unsigned long long)semantic->interpolation_identity.scene_id,
+        semantic->interpolation_identity.producer_id,
+        semantic->interpolation_identity.primitive_id,
+        semantic->topology, semantic->screen_space_2d,
+        semantic->triangle_count, semantic->line_count,
+        semantic->material.tpage, semantic->material.clut_x,
+        semantic->material.clut_y,
+        semantic->material.draw_area_left, semantic->material.draw_area_top,
+        semantic->material.draw_area_right, semantic->material.draw_area_bottom,
+        semantic->material.draw_offset_x, semantic->material.draw_offset_y,
+        semantic->material.texture_depth, semantic->material.blend_mode,
+        semantic->material.shading, semantic->material.textured,
+        semantic->material.raw_texture, semantic->material.semi_transparent);
+    if (written < 0 || (size_t)written >= capacity - *position) return 0;
+    *position += (size_t)written;
+    for (size_t index = 0u; index < native_motion_vertex_count(semantic);
+         ++index) {
+        const GpuRenderSemanticVertex *vertex =
+            native_motion_vertex(semantic, index);
+
+        written = snprintf(
+            buffer + *position, capacity - *position,
+            "%s[%d,%d,%d,%d,%d,%d,%u,%u,%u,%u]",
+            index == 0u ? "" : ",", vertex->x, vertex->y,
+            vertex->native_view_x, vertex->native_view_y,
+            vertex->u, vertex->v, vertex->r, vertex->g, vertex->b,
+            vertex->native_view_position);
+        if (written < 0 || (size_t)written >= capacity - *position) return 0;
+        *position += (size_t)written;
+    }
+    written = snprintf(buffer + *position, capacity - *position, "]}");
+    if (written < 0 || (size_t)written >= capacity - *position) return 0;
+    *position += (size_t)written;
+    return 1;
+}
+
+static void handle_native_last_motion_diag(int id, const char *json)
+{
+    GpuSemanticWorkloadMotionDiagnostics motion = {0};
+    char buffer[16384];
+    size_t position;
+    int written;
+
+    (void)json;
+    if (gpu_semantic_workload_last_motion(&motion) !=
+            GPU_SEMANTIC_WORKLOAD_OK) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"valid\":false}", id);
+        return;
+    }
+    written = snprintf(
+        buffer, sizeof(buffer),
+        "{\"id\":%d,\"ok\":true,\"valid\":true,"
+        "\"epoch\":%llu,\"source_frame\":%llu,\"sequence\":%llu,"
+        "\"match\":\"%s\",\"fallback\":\"%s\","
+        "\"current_order\":%zu,\"previous_order\":%zu,"
+        "\"previous_valid\":%s,\"position_changed_vertices\":%zu,"
+        "\"position_delta_fixed\":%llu,",
+        id, (unsigned long long)motion.epoch,
+        (unsigned long long)motion.source_frame,
+        (unsigned long long)motion.sequence,
+        native_producer_match_kind_name(motion.match_kind),
+        native_producer_match_kind_name(motion.fallback_kind),
+        motion.current_order, motion.previous_order,
+        motion.previous_valid ? "true" : "false",
+        motion.position_changed_vertex_count,
+        (unsigned long long)motion.position_delta_fixed);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        send_err(id, "native motion response overflow");
+        return;
+    }
+    position = (size_t)written;
+    if (!native_motion_append_semantic(
+            buffer, sizeof(buffer), &position, "current", &motion.current)) {
+        send_err(id, "native motion response overflow");
+        return;
+    }
+    if (motion.previous_valid) {
+        if (position + 1u >= sizeof(buffer)) {
+            send_err(id, "native motion response overflow");
+            return;
+        }
+        buffer[position++] = ',';
+        if (!native_motion_append_semantic(
+                buffer, sizeof(buffer), &position,
+                "previous", &motion.previous)) {
+            send_err(id, "native motion response overflow");
+            return;
+        }
+    }
+    if (position + 1u >= sizeof(buffer)) {
+        send_err(id, "native motion response overflow");
+        return;
+    }
+    buffer[position++] = ',';
+    if (!native_motion_append_semantic(
+            buffer, sizeof(buffer), &position, "midpoint", &motion.midpoint) ||
+        position + 2u > sizeof(buffer)) {
+        send_err(id, "native motion response overflow");
+        return;
+    }
+    buffer[position++] = '}';
+    buffer[position] = '\0';
+    send_line(buffer);
+}
+
+static void handle_native_producer_phase_items(int id, const char *json)
+{
+    char producer_text[32];
+    uint32_t producer;
+    int requested_offset = json_get_int(json, "offset", 0);
+    int requested_count = json_get_int(json, "count", 256);
+    int requested_frame = json_get_int(json, "frame", -1);
+    size_t offset;
+    size_t capacity;
+    size_t total = 0u;
+    size_t emitted;
+    uint64_t selected_frame;
+    size_t buffer_capacity;
+    size_t position;
+    GlRendererSemanticProducerItemDiagnostics *items;
+    char *buffer;
+
+    if (json_get_str(json, "producer", producer_text,
+                     (int)sizeof(producer_text)) == NULL) {
+        send_err(id, "producer required");
+        return;
+    }
+    if (requested_offset < 0) requested_offset = 0;
+    if (requested_count < 1) requested_count = 1;
+    if (requested_count > 2048) requested_count = 2048;
+    producer = hex_to_u32(producer_text);
+    offset = (size_t)requested_offset;
+    capacity = (size_t)requested_count;
+    items = (GlRendererSemanticProducerItemDiagnostics *)calloc(
+        capacity, sizeof(*items));
+    if (items == NULL) {
+        send_err(id, "alloc failed");
+        return;
+    }
+    emitted = gl_renderer_semantic_producer_items(
+        producer,
+        requested_frame >= 0 ? (uint64_t)requested_frame : UINT64_MAX,
+        offset, items, capacity, &total, &selected_frame);
+    buffer_capacity = 256u + emitted * 768u;
+    buffer = (char *)malloc(buffer_capacity);
+    if (buffer == NULL) {
+        free(items);
+        send_err(id, "alloc failed");
+        return;
+    }
+    position = (size_t)snprintf(
+        buffer, buffer_capacity,
+        "{\"id\":%d,\"ok\":true,\"producer\":\"0x%08X\","
+        "\"frame\":%llu,\"offset\":%zu,\"total\":%zu,\"items\":[",
+        id, producer, (unsigned long long)selected_frame, offset, total);
+    for (size_t index = 0u; index < emitted; ++index) {
+        const GlRendererSemanticProducerItemDiagnostics *item = &items[index];
+        int written = snprintf(
+            buffer + position, buffer_capacity - position,
+            "%s{\"scene\":%llu,\"producer\":%u,\"primitive\":%u,"
+            "\"identity_valid\":%s,"
+            "\"subprimitive\":%u,\"queue_order\":%u,\"base_x\":%d,"
+            "\"slot\":%d,\"topology\":%u,\"screen_space_2d\":%u,"
+            "\"material\":{\"tpage\":%u,\"clut\":[%u,%u],"
+            "\"draw_offset\":[%d,%d],\"draw_area\":[%u,%u,%u,%u],"
+            "\"textured\":%u,\"raw_texture\":%u,"
+            "\"semi_transparent\":%u},\"current_order\":%u,"
+            "\"previous_order\":%u,\"previous_order_valid\":%s,"
+            "\"match\":\"%s\",\"fallback\":\"%s\","
+            "\"moving_vertices\":%u,\"midpoint_delta_fixed\":%llu,"
+            "\"current_area\":%lld,\"midpoint_area\":%lld,"
+            "\"raw_bounds\":[%d,%d,%d,%d],"
+            "\"uv_bounds\":[%d,%d,%d,%d],"
+            "\"current_bounds\":[%d,%d,%d,%d],"
+            "\"midpoint_bounds\":[%d,%d,%d,%d]}",
+            index == 0u ? "" : ",",
+            (unsigned long long)item->scene_id,
+            item->producer_id, item->primitive_id,
+            item->identity_valid ? "true" : "false",
+            item->subprimitive_index, item->queue_order,
+            item->base_x, item->slot, item->topology,
+            item->screen_space_2d, item->tpage, item->clut_x, item->clut_y,
+            item->draw_offset_x, item->draw_offset_y,
+            item->draw_area[0], item->draw_area[1],
+            item->draw_area[2], item->draw_area[3],
+            item->textured, item->raw_texture, item->semi_transparent,
+            item->current_order,
+            item->previous_order,
+            item->previous_order_valid ? "true" : "false",
+            native_producer_match_kind_name(item->match_kind),
+            native_producer_match_kind_name(item->fallback_kind),
+            item->moving_vertex_count,
+            (unsigned long long)item->midpoint_delta_fixed,
+            (long long)item->current_area,
+            (long long)item->midpoint_area,
+            item->raw_bounds[0], item->raw_bounds[1],
+            item->raw_bounds[2], item->raw_bounds[3],
+            item->uv_bounds[0], item->uv_bounds[1],
+            item->uv_bounds[2], item->uv_bounds[3],
+            item->current_bounds[0], item->current_bounds[1],
+            item->current_bounds[2], item->current_bounds[3],
+            item->midpoint_bounds[0], item->midpoint_bounds[1],
+            item->midpoint_bounds[2], item->midpoint_bounds[3]);
+
+        if (written < 0 || (size_t)written >= buffer_capacity - position) {
+            free(buffer);
+            free(items);
+            send_err(id, "response overflow");
+            return;
+        }
+        position += (size_t)written;
+    }
+    (void)snprintf(buffer + position, buffer_capacity - position,
+                   "],\"emitted\":%zu}", emitted);
+    send_fmt("%s", buffer);
+    free(buffer);
+    free(items);
+}
+
 /* GL-backend coherency event ring: dump the last n events (default 200),
  * optionally only events from frame >= frame_min. Always-on capture; this
  * just reads a window. */
@@ -8758,38 +9971,122 @@ static void handle_gl_coh_ring(int id, const char *json)
  * before the swap. Always-on capture; this just reads a window.
  *   {"cmd":"gl_present_ring","n":600}
  * -> events: [seq, frame, path, t_ms, [dx,dy,w,h], [lx,ly,lw,lh],
- *             [r,g,b], glerr] */
+ *             [r,g,b], glerr, [src_r,src_g,src_b,src_valid], swap_completed,
+ *             phase_numerator, phase_denominator, hash_valid, hash_hex,
+ *             feedback, presentation_time_ns, refresh_sequence, refresh_ns,
+ *             presentation_flags, source_hash_valid, source_hash_hex,
+ *             geometry_hash_valid, geometry_hash_hex,
+ *             phase_surface_hash_valid, phase_surface_hash_hex,
+ *             phase_vram_hash_valid, phase_vram_hash_hex,
+ *             [scanout_x,scanout_y,scanout_w,scanout_h]] */
 extern uint64_t gl_renderer_pres_total(void);
 
 static void handle_gl_present_ring(int id, const char *json)
 {
-    static const char *path_name[5] = { "vram", "wide", "cpu", "blank", "interp" };
+    static const char *path_name[7] = {
+        "vram", "wide", "cpu", "blank", "interp",
+        "native-current", "native-midpoint"
+    };
     int n = json_get_int(json, "n", 300);
     if (n < 1) n = 1;
     if (n > 4096) n = 4096;
     uint64_t total = gl_renderer_pres_total();
+    GlRendererPresentationDiagnostics diag = {0};
+    gl_renderer_presentation_diagnostics(&diag);
     uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
-    int bufsz = 96 + n * 112;
-    char *buf = (char *)malloc((size_t)bufsz);
+    const size_t bufsz = 1024u + (size_t)n * 512u;
+    char *buf = (char *)malloc(bufsz);
     if (!buf) { send_err(id, "alloc failed"); return; }
-    int pos = snprintf(buf, bufsz,
-                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"now_ms\":%u,\"events\":[",
-                       id, (unsigned long long)total, (unsigned)SDL_GetTicks());
+    int written = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"now_ms\":%u,"
+                       "\"hash\":{\"enabled\":%s,\"requested\":%llu,"
+                       "\"completed\":%llu,\"dropped\":%llu,"
+                       "\"source_requested\":%llu,\"source_completed\":%llu,"
+                       "\"source_dropped\":%llu,"
+                       "\"phase_surface_requested\":%llu,"
+                       "\"phase_surface_completed\":%llu,"
+                       "\"phase_surface_dropped\":%llu,"
+                       "\"phase_vram_requested\":%llu,"
+                       "\"phase_vram_completed\":%llu,"
+                       "\"phase_vram_dropped\":%llu},"
+                       "\"presentation\":{\"wayland_window\":%s,"
+                       "\"protocol_available\":%s,\"clock_id\":%u,"
+                       "\"requested\":%llu,\"presented\":%llu,"
+                       "\"discarded\":%llu,\"pending\":%llu},\"events\":[",
+                       id, (unsigned long long)total, (unsigned)SDL_GetTicks(),
+                       diag.hash_enabled ? "true" : "false",
+                       (unsigned long long)diag.hash_requested,
+                       (unsigned long long)diag.hash_completed,
+                       (unsigned long long)diag.hash_dropped,
+                       (unsigned long long)diag.source_hash_requested,
+                       (unsigned long long)diag.source_hash_completed,
+                       (unsigned long long)diag.source_hash_dropped,
+                       (unsigned long long)diag.phase_surface_hash_requested,
+                       (unsigned long long)diag.phase_surface_hash_completed,
+                       (unsigned long long)diag.phase_surface_hash_dropped,
+                       (unsigned long long)diag.phase_vram_hash_requested,
+                       (unsigned long long)diag.phase_vram_hash_completed,
+                       (unsigned long long)diag.phase_vram_hash_dropped,
+                       diag.wayland_window ? "true" : "false",
+                       diag.presentation_protocol_available ? "true" : "false",
+                       diag.presentation_clock_id,
+                       (unsigned long long)diag.feedback_requested,
+                       (unsigned long long)diag.feedback_presented,
+                       (unsigned long long)diag.feedback_discarded,
+                       (unsigned long long)diag.feedback_pending);
+    if (written < 0 || (size_t)written >= bufsz) {
+        free(buf);
+        send_err(id, "response formatting failed");
+        return;
+    }
+    size_t pos = (size_t)written;
     int first = 1;
-    for (uint64_t s = start; s < total && pos < bufsz - 160; s++) {
+    for (uint64_t s = start; s < total && bufsz - pos >= 3u; s++) {
         GlPresEvent e;
+        const size_t event_start = pos;
+
         if (!gl_renderer_pres_get(s, &e)) continue;
-        pos += snprintf(buf + pos, bufsz - pos,
-                        "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u]]",
+        written = snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u],%u,%u,%u,%u,\"%016llx\",%u,%llu,%llu,%u,%u,%u,\"%016llx\",%u,\"%016llx\",%u,\"%016llx\",%u,\"%016llx\",[%d,%d,%d,%d]]",
                         first ? "" : ",", (unsigned long long)s, e.frame,
-                        e.path < 5 ? path_name[e.path] : "?", e.t_ms,
+                        e.path < 7 ? path_name[e.path] : "?", e.t_ms,
                         e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
                         e.px_r, e.px_g, e.px_b, e.glerr,
-                        e.src_r, e.src_g, e.src_b, e.src_valid);
+                        e.src_r, e.src_g, e.src_b, e.src_valid,
+                        e.swap_completed, e.phase_numerator,
+                        e.phase_denominator, e.framebuffer_hash_valid,
+                        (unsigned long long)e.framebuffer_hash,
+                        e.presentation_feedback,
+                        (unsigned long long)e.presentation_time_ns,
+                        (unsigned long long)e.refresh_sequence,
+                        e.refresh_ns, e.presentation_flags,
+                        e.source_hash_valid,
+                        (unsigned long long)e.source_hash,
+                        e.geometry_hash_valid,
+                        (unsigned long long)e.geometry_hash,
+                        e.phase_surface_hash_valid,
+                        (unsigned long long)e.phase_surface_hash,
+                        e.phase_vram_hash_valid,
+                        (unsigned long long)e.phase_vram_hash,
+                        e.scanout_dx, e.scanout_dy,
+                        e.scanout_w, e.scanout_h);
+        if (written < 0 || (size_t)written >= bufsz - event_start) {
+            pos = event_start;
+            buf[pos] = '\0';
+            break;
+        }
+        pos += (size_t)written;
         first = 0;
     }
-    pos += snprintf(buf + pos, bufsz - pos, "]}");
-    send_fmt("%s", buf);
+    if (bufsz - pos < 3u) {
+        free(buf);
+        send_err(id, "response buffer exhausted");
+        return;
+    }
+    buf[pos++] = ']';
+    buf[pos++] = '}';
+    buf[pos] = '\0';
+    send_line(buf);
     free(buf);
 }
 
@@ -8926,20 +10223,27 @@ static void wtrace_boot_record(uint32_t phys, uint32_t old_val,
 /* Always-on catch-all recorder.  Lean record (no register window). */
 static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
 {
-    LastRamWriterEntry *latest = last_ram_writer_slot(phys);
+    const uint32_t writer_pc = g_debug_last_store_pc;
+    const uint32_t writer_ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    const uint64_t end = (uint64_t)phys + (width != 0u ? width : 1u);
+    uint64_t word = phys & ~UINT32_C(3);
 
-    if (latest != NULL) {
-        latest->pc = g_debug_last_store_pc;
-        latest->ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
-        latest->valid = 1u;
+    while (word < end && word <= UINT32_MAX) {
+        LastRamWriterEntry *latest = last_ram_writer_slot((uint32_t)word);
+        if (latest != NULL) {
+            latest->pc = writer_pc;
+            latest->ra = writer_ra;
+            latest->valid = 1u;
+        }
+        word += sizeof(uint32_t);
     }
     if (!s_wtrace_all) return;
     WriteTraceAllEntry *e = &s_wtrace_all[s_wtrace_all_head];
     e->seq     = s_wtrace_all_seq++;
     e->addr    = phys;
     e->new_val = new_val;
-    e->pc      = g_debug_last_store_pc;
-    e->ra      = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    e->pc      = writer_pc;
+    e->ra      = writer_ra;
     e->frame   = (uint32_t)s_frame_count;
     e->w       = width;
     s_wtrace_all_head = (s_wtrace_all_head + 1) % WRITE_TRACE_ALL_CAP;
@@ -8952,10 +10256,16 @@ int debug_server_find_last_ram_writer(uint32_t phys, uint32_t *out_pc,
 
     if (!out_pc || !out_ra) return 0;
     cached = last_ram_writer_slot(phys);
-    if (cached != NULL && cached->valid) {
-        *out_pc = cached->pc;
-        *out_ra = cached->ra;
-        return 1;
+    if (cached != NULL) {
+        if (cached->valid) {
+            *out_pc = cached->pc;
+            *out_ra = cached->ra;
+            return 1;
+        }
+        /* The index is allocated/reset before guest execution and receives
+         * every overlapping RAM write, so an empty indexed slot is a definitive
+         * miss rather than a reason to scan 131k historical writes. */
+        return 0;
     }
 
     /* A packet source is normally written shortly before its DMA transfer.
@@ -10898,11 +12208,14 @@ static void handle_mdec_trace_clear(int id, const char *json)
 
 static void handle_quit(int id, const char *json)
 {
+    SDL_Event event;
+
     (void)json;
     send_ok(id);
     psx_crash_trace_set_exit_origin("tcp_quit");
-    debug_server_shutdown();
-    exit(0);
+    memset(&event, 0, sizeof(event));
+    event.type = SDL_QUIT;
+    SDL_PushEvent(&event);
 }
 
 /* ---- Command dispatch table ---- */
@@ -12987,7 +14300,7 @@ static void handle_overlay_force_capture(int id, const char *json)
  * Accepted names (full set in TCP_COMMANDS.md; mirrored by
  * psx_debug_overlay_widget_action in debug_overlay.{h,cpp}):
  *   read-only/toggle actions: texfilter, native_wide, aspect_set,
- *     bd_stretch_on, bd_stretch_pct, interp.
+ *     bd_stretch_on, bd_stretch_pct, interp, native_interp_fps.
  *   ring dumps: dump_event_ring, dump_latency_ring, dump_starv_ring.
  *   write actions (N13 panels): teleport, party_slot, party_bitfield,
  *     gold, write_var, read_field_id. Every write goes through
@@ -13070,6 +14383,8 @@ static const CmdEntry s_commands[] = {
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
+    { "native_midpoint_diag", handle_native_midpoint_diag },
+    { "native_last_motion_diag", handle_native_last_motion_diag },
     { "gl_present_ring",   handle_gl_present_ring },
     { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },
@@ -13079,6 +14394,7 @@ static const CmdEntry s_commands[] = {
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
+    { "gl_native_center_diff", handle_gl_native_center_diff },
     { "irq_state",         handle_irq_state },
     { "vblank_rate",       handle_vblank_rate },
     { "cycles_to_next_event", handle_cycles_to_next_event },
@@ -13241,6 +14557,10 @@ static const CmdEntry s_commands[] = {
     { "display_ring_stats", handle_display_ring_stats },
     { "dump_buffer",       handle_dump_buffer },
     { "native_semantic_last", handle_native_semantic_last },
+    { "native_stream_diag", handle_native_stream_diag },
+    { "native_producer_phase_diag", handle_native_producer_phase_diag },
+    { "native_producer_phase_items", handle_native_producer_phase_items },
+    { "native_stream_attribution", handle_native_stream_attribution },
     { "xg_projected_state", handle_xg_projected_state },
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
@@ -13963,7 +15283,7 @@ void debug_server_record_frame(void)
     /* Last function */
     strcpy(r->last_func, "(no tracking)");
 
-    /* Always-on display ring: raw display-area pixels for THIS frame number
+    /* Opt-in display ring: raw display-area pixels for THIS frame number
      * (pre-increment, matching what the `frame` command reports right now). */
     disp_ring_capture();
 

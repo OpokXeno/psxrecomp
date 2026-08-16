@@ -91,6 +91,47 @@ if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     endif()
 endif()
 
+set(PSXRECOMP_WAYLAND_PRESENTATION OFF)
+if(UNIX AND NOT APPLE AND NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client)
+    endif()
+    find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner)
+    find_file(WAYLAND_PRESENTATION_TIME_XML
+        NAMES presentation-time.xml
+        PATHS
+            /usr/share/wayland-protocols/stable/presentation-time
+            /usr/local/share/wayland-protocols/stable/presentation-time
+        NO_DEFAULT_PATH)
+    if(WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER_EXECUTABLE AND
+            WAYLAND_PRESENTATION_TIME_XML)
+        set(PSXRECOMP_WAYLAND_PRESENTATION ON)
+        set(PSXRECOMP_WAYLAND_PROTOCOL_DIR
+            "${CMAKE_CURRENT_BINARY_DIR}/wayland-protocols")
+        set(PSXRECOMP_WAYLAND_PRESENTATION_HEADER
+            "${PSXRECOMP_WAYLAND_PROTOCOL_DIR}/presentation-time-client-protocol.h")
+        set(PSXRECOMP_WAYLAND_PRESENTATION_CODE
+            "${PSXRECOMP_WAYLAND_PROTOCOL_DIR}/presentation-time-protocol.c")
+        add_custom_command(
+            OUTPUT
+                "${PSXRECOMP_WAYLAND_PRESENTATION_HEADER}"
+                "${PSXRECOMP_WAYLAND_PRESENTATION_CODE}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "${PSXRECOMP_WAYLAND_PROTOCOL_DIR}"
+            COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" client-header
+                "${WAYLAND_PRESENTATION_TIME_XML}"
+                "${PSXRECOMP_WAYLAND_PRESENTATION_HEADER}"
+            COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" private-code
+                "${WAYLAND_PRESENTATION_TIME_XML}"
+                "${PSXRECOMP_WAYLAND_PRESENTATION_CODE}"
+            DEPENDS "${WAYLAND_PRESENTATION_TIME_XML}"
+            VERBATIM)
+        set_source_files_properties(
+            "${PSXRECOMP_WAYLAND_PRESENTATION_CODE}" PROPERTIES GENERATED TRUE)
+    endif()
+endif()
+
 # PSX_STATIC_RUNTIME: produce a 100% self-contained MinGW exe.
 #
 # A default MinGW build dynamically imports three NON-system DLLs —
@@ -152,7 +193,9 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
      ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
      ${PSXRECOMP_ROOT}/runtime/src/gpu_render_oracle.c
+     ${PSXRECOMP_ROOT}/runtime/src/gpu_semantic_workload.c
      ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+     ${PSXRECOMP_ROOT}/runtime/src/wayland_presentation.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
@@ -411,6 +454,7 @@ function(psxrecomp_add_runtime_target target)
          GAME_VERSION
          GAME_EXTRA_IDENTITY_SHA256
          GAME_MANIFEST_DIGEST_SHA256
+         OVERLAY_PLAN_HASH
     )
     # GAME_GENERATED_FULL_C is a list (not a single value): the split-TU build
     # writes the recompiled game as N full_NN.c shards instead of one
@@ -456,6 +500,15 @@ function(psxrecomp_add_runtime_target target)
     string(LENGTH "${PSXRT_GAME_MANIFEST_DIGEST_SHA256}" _psxrt_manifest_digest_length)
     if(NOT _psxrt_manifest_digest_length EQUAL 64 OR NOT PSXRT_GAME_MANIFEST_DIGEST_SHA256 MATCHES "^[0-9a-f]+$")
         message(FATAL_ERROR "${target}: GAME_MANIFEST_DIGEST_SHA256 must be a lowercase 32-byte SHA-256 hex value")
+    endif()
+    if(NOT PSXRT_OVERLAY_PLAN_HASH)
+        set(PSXRT_OVERLAY_PLAN_HASH "00000000")
+    endif()
+    string(LENGTH "${PSXRT_OVERLAY_PLAN_HASH}" _psxrt_overlay_plan_hash_length)
+    if(NOT _psxrt_overlay_plan_hash_length EQUAL 8 OR
+            NOT PSXRT_OVERLAY_PLAN_HASH MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR
+            "${target}: OVERLAY_PLAN_HASH must be a lowercase 4-byte SHA-256 prefix")
     endif()
 
     if(PSXRT_BIOS_GENERATED_FULL_C AND PSXRT_BIOS_GENERATED_DISPATCH_C)
@@ -513,6 +566,17 @@ function(psxrecomp_add_runtime_target target)
         ${generated_sources}
         ${PSXRT_EXTRAS_SOURCES}
     )
+    if(PSXRECOMP_WAYLAND_PRESENTATION)
+        target_sources(${target} PRIVATE
+            "${PSXRECOMP_WAYLAND_PRESENTATION_CODE}")
+        target_include_directories(${target} PRIVATE
+            "${PSXRECOMP_WAYLAND_PROTOCOL_DIR}"
+            ${WAYLAND_CLIENT_INCLUDE_DIRS})
+        target_link_directories(${target} PRIVATE ${WAYLAND_CLIENT_LIBRARY_DIRS})
+        target_link_libraries(${target} PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+        target_compile_definitions(${target} PRIVATE
+            PSX_WAYLAND_PRESENTATION=1)
+    endif()
 
     # Game-specific executable name. Every title instantiates this function with
     # the same CMake target name ("psx-runtime"), so without this they ALL produce
@@ -677,6 +741,7 @@ function(psxrecomp_add_runtime_target target)
         PSX_GAME_VERSION="${PSXRT_GAME_VERSION}"
         PSX_GAME_EXTRA_IDENTITY_SHA256="${PSXRT_GAME_EXTRA_IDENTITY_SHA256}"
         PSX_GAME_MANIFEST_DIGEST_SHA256="${PSXRT_GAME_MANIFEST_DIGEST_SHA256}"
+        PSX_OVERLAY_PLAN_HASH=0x${PSXRT_OVERLAY_PLAN_HASH}u
         FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
@@ -824,6 +889,16 @@ function(psxrecomp_add_runtime_target target)
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
     else()
+        # Runtime-compiled overlay .so files resolve the generated-code ABI
+        # against globals and callbacks owned by the main executable.
+        set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
+        if(BUILD_TESTING AND NOT APPLE)
+            add_test(NAME ${target}_posix_overlay_host_exports
+                COMMAND ${CMAKE_COMMAND}
+                    -DNM=${CMAKE_NM}
+                    -DRUNTIME=$<TARGET_FILE:${target}>
+                    -P ${PSXRECOMP_ROOT}/runtime/tests/check_posix_overlay_host_exports.cmake)
+        endif()
         if(CMAKE_DL_LIBS)
             target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
         endif()

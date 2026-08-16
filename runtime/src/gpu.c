@@ -370,6 +370,7 @@ static int ws_cull_aspect_den(void) {
  * -1 = normal computed margin. */
 static int ws_margin_override = -1;
 static int ws_cull_guard_pixels = 0;
+static int ws_temporal_cull_guard_pixels = 0;
 void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
 void gpu_ws_configure_native_cull(int enabled, int aspect_num, int aspect_den,
                                   int canonical_width, int canonical_height) {
@@ -406,6 +407,11 @@ void gpu_ws_set_cull_guard_pixels(int pixels) {
     if (pixels < 0) pixels = 0;
     if (pixels > 256) pixels = 256;
     ws_cull_guard_pixels = pixels;
+}
+void gpu_ws_set_temporal_cull_guard_pixels(int pixels) {
+    if (pixels < 0) pixels = 0;
+    if (pixels > 256) pixels = 256;
+    ws_temporal_cull_guard_pixels = pixels;
 }
 
 #define WS_EXPLICIT_CULL_SITES_MAX 64
@@ -604,6 +610,8 @@ uint32_t psx_ws_xclip_bound(uint32_t vanilla) {
 }
 
 int psx_ws_x_margin(void) {
+    int margin;
+
     if (ws_margin_override >= 0) return ws_margin_override;
     /* Native-view culling is independent from the legacy wide compositor. It
      * must be live before the first 3D frame because scene-load code can build
@@ -613,11 +621,14 @@ int psx_ws_x_margin(void) {
      * returning zero until the first 3D frame permanently bakes a 4:3 frustum
      * into those lists. */
     if (ws_native_cull_enabled)
-        return ws_native_cull_margin + ws_cull_guard_pixels;
-    if (ws_native_wide_configured())
-        return ws_nw_configured_offset() + ws_cull_guard_pixels;
-    if (!ws_active()) return 0;
-    return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+        margin = ws_native_cull_margin + ws_cull_guard_pixels;
+    else if (ws_native_wide_configured())
+        margin = ws_nw_configured_offset() + ws_cull_guard_pixels;
+    else if (!ws_active())
+        margin = 0;
+    else
+        margin = (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+    return margin + ws_temporal_cull_guard_pixels;
 }
 
 uint32_t psx_ws_guest_cull_screen_bias(uint32_t value, int32_t immediate) {
@@ -5344,18 +5355,28 @@ int gpu_native_line_semantic_from_gp0(
     return out->line_count != 0u ? 1 : 0;
 }
 
+static int native_packet_semantic_from_gp0(
+        const uint32_t *words, size_t word_count,
+        const GpuNativeDrawEnvironment *environment,
+        GpuRenderSemantic *out_semantic) {
+    const uint8_t opcode = words && word_count != 0u
+        ? (uint8_t)(words[0] >> 24u) : 0u;
+
+    if (opcode >= 0x40u && opcode <= 0x5fu)
+        return gpu_native_line_semantic_from_gp0(
+            words, word_count, environment, out_semantic);
+    return gpu_native_semantic_from_gp0(
+        words, (int)word_count, environment, out_semantic);
+}
+
 static int native_packet_fallback_is_supported(
         const uint32_t *words, size_t word_count,
         const GpuNativeDrawEnvironment *environment) {
     GpuRenderSemantic semantic;
-    const uint8_t opcode = words && word_count != 0u
-        ? (uint8_t)(words[0] >> 24u) : 0u;
 
-    if (gr_backend() != GR_BACKEND_OPENGL) return 0;
-    if (opcode >= 0x40u && opcode <= 0x5fu)
-        return native_packet_line_is_supported(words, word_count);
-    return gpu_native_semantic_from_gp0(
-        words, (int)word_count, environment, &semantic) == 1;
+    return gr_backend() == GR_BACKEND_OPENGL &&
+        native_packet_semantic_from_gp0(
+            words, word_count, environment, &semantic) == 1;
 }
 
 static int native_packet_is_textured_polygon(uint8_t opcode) {
@@ -5455,6 +5476,23 @@ static void native_semantic_apply_raster_state(GpuRenderSemantic *semantic) {
     material->mask_check = draw.mask_check;
 }
 
+static uint64_t native_interpolation_scene = 1u;
+
+void gpu_native_interpolation_scene_boundary(uint64_t scene_id) {
+    native_interpolation_scene = scene_id != 0u ? scene_id : 1u;
+}
+
+uint64_t gpu_native_interpolation_scene(void) {
+    return native_interpolation_scene;
+}
+
+static void native_semantic_stamp_retrospective_scene(
+        GpuRenderSemantic *semantic) {
+    if (semantic != NULL && !semantic->interpolation_identity.valid)
+        semantic->interpolation_identity.scene_id =
+            native_interpolation_scene;
+}
+
 static uint32_t native_packet_rgb555_to_rgb888(uint16_t color) {
     return ((uint32_t)(color & UINT16_C(0x001f)) << 3u) |
            ((uint32_t)(color & UINT16_C(0x03e0)) << 6u) |
@@ -5494,6 +5532,7 @@ static int native_packet_draw_line_segment(
     native_semantic_vertex(
         &semantic.lines[0].vertices[1], x1, y1, 0, 0,
         native_packet_rgb555_to_rgb888(color1));
+    native_semantic_stamp_retrospective_scene(&semantic);
     status = gr_stream_barrier();
     if (status == GPU_RENDER_TRANSACTION_OK)
         status = gr_draw_semantic_immediate(&semantic);
@@ -5643,6 +5682,7 @@ typedef struct GpuNativePreflightReservation {
     GuestRenderNativeStreamCommandIdentity identity;
     GpuRenderTransactionId visual_id;
     GpuRenderSemantic semantic;
+    GpuRenderSemantic packet_semantic;
     uint64_t packet_hash;
     bool resolved_miss;
     bool packet_fallback;
@@ -5753,6 +5793,7 @@ static int native_preflight_reservation_append(
     GpuNativePreflightReservation *entries;
     GpuRenderTransactionId visual_id;
     GpuRenderSemantic semantic;
+    GpuRenderSemantic packet_semantic;
     uint64_t packet_hash;
     GuestRenderNativeStreamStatus reserve_status;
     bool resolved_miss = false;
@@ -5762,11 +5803,18 @@ static int native_preflight_reservation_append(
     native_preflight_reservations.last_reserved_identity = *identity;
     packet_hash = native_packet_hash(words, word_count);
     native_preflight_reservations.last_reserved_hash = packet_hash;
+    if (native_packet_semantic_from_gp0(
+            words, word_count, environment, &packet_semantic) != 1) {
+        native_preflight_reservations.last_consume_status =
+            (uint8_t)(20u + GUEST_RENDER_NATIVE_STREAM_INVALID_ARGUMENT);
+        return 0;
+    }
     reserve_status = guest_render_native_stream_reserve_exact(
-        native_preflight_reservations.id, identity, &visual_id, &semantic);
+        native_preflight_reservations.id, identity, &packet_semantic,
+        &visual_id, &semantic);
     if (reserve_status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND &&
         guest_render_native_stream_resolve_active_miss(
-            identity, &visual_id, &semantic)) {
+            identity, &packet_semantic, &visual_id, &semantic)) {
         reserve_status = GUEST_RENDER_NATIVE_STREAM_OK;
         resolved_miss = true;
     }
@@ -5810,6 +5858,7 @@ int gpu_native_preflight_gp0_packet(
     GpuRenderTransactionId visual_id;
     GuestRenderNativeStreamCommandIdentity identity;
     GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic packet_semantic;
     int fixed_words;
     int result = 1;
     uint8_t opcode;
@@ -5842,10 +5891,12 @@ int gpu_native_preflight_gp0_packet(
                 &native_preflight_reservations.environment);
         } else {
             gpu_native_environment_get(&environment);
-            result = guest_render_native_stream_match_exact(
-                &identity, &visual_id) ||
+            result = native_packet_semantic_from_gp0(
+                words, word_count, &environment, &packet_semantic) == 1 &&
+                (guest_render_native_stream_match_exact(
+                    &identity, &packet_semantic, &visual_id) ||
                 native_packet_fallback_is_supported(
-                    words, word_count, &environment);
+                    words, word_count, &environment));
         }
     }
     if (result && native_preflight_reservations.phase == 1)
@@ -5949,6 +6000,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             semantic = *bound_semantic;
             GpuRenderSemantic render_semantic;
             native_semantic_apply_raster_state(&semantic);
+            native_semantic_stamp_retrospective_scene(&semantic);
             render_semantic = semantic;
             render_semantic.line_count = 0u;
             for (uint8_t index = 0u; index < semantic.line_count; ++index) {
@@ -6012,6 +6064,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                 native_semantic_screen_space_mode(opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
         }
+        if (supported) native_semantic_stamp_retrospective_scene(&semantic);
         if (supported && semantic.triangle_count != 0u) {
             render_status = gr_stream_barrier();
             if (render_status == GPU_RENDER_TRANSACTION_OK)
@@ -6023,6 +6076,9 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         supported = fixed_words > 0 && (size_t)fixed_words == word_count;
     }
 
+    if (supported && native_packet_is_draw(opcode))
+        guest_render_native_stream_note_native_draw_source(
+            opcode, bound_semantic != NULL);
     guest_render_native_stream_note_native_packet_attribution(
         opcode, !native_packet_is_draw(opcode) || effective_bound_semantic != NULL,
         supported != 0,
@@ -6215,8 +6271,10 @@ static int native_preflight_reservation_consume(
 
 static int native_packet_stream_finish(void) {
     GpuRenderSemantic bound_semantic;
+    GpuRenderSemantic packet_semantic;
     GpuRenderTransactionId visual_id;
     GuestRenderNativeStreamCommandIdentity identity;
+    GpuNativeDrawEnvironment environment;
     const GpuRenderSemantic *bound = NULL;
     bool packet_fallback = false;
     int result = 0;
@@ -6241,14 +6299,21 @@ static int native_packet_stream_finish(void) {
                 &bound_semantic, &packet_fallback)) {
             if (!packet_fallback) bound = &bound_semantic;
         }
-    } else if (guest_render_native_stream_match_exact(&identity, &visual_id)) {
-        if (guest_render_native_stream_consume_exact(
-                visual_id, native_packet_stream.source.word_address,
-                &bound_semantic) !=
-            GUEST_RENDER_NATIVE_STREAM_OK)
-            result = 0;
-        else
-            bound = &bound_semantic;
+    } else {
+        gpu_native_environment_get(&environment);
+        if (native_packet_semantic_from_gp0(
+                native_packet_stream.words, native_packet_stream.count,
+                &environment, &packet_semantic) == 1 &&
+            guest_render_native_stream_match_exact(
+                &identity, &packet_semantic, &visual_id)) {
+            if (guest_render_native_stream_consume_exact(
+                    visual_id, native_packet_stream.source.word_address,
+                    &bound_semantic) !=
+                GUEST_RENDER_NATIVE_STREAM_OK)
+                result = 0;
+            else
+                bound = &bound_semantic;
+        }
     }
     if (bound != NULL) {
         native_packet_bound_visual_id = visual_id;
@@ -6643,66 +6708,10 @@ static void native_stream_fail(const char *operation,
     psx_fatal_halt(reason);
 }
 
-static int native_stream_opcode_is_generic(uint8_t opcode) {
-    return opcode == 0x02u ||
-           (opcode >= 0x20u && opcode <= 0x7fu) ||
-           (opcode >= 0x80u && opcode <= 0x9fu);
-}
-
 static int native_stream_begin_command(uint32_t header) {
-    GuestRenderNativeStreamStatus status;
-    GuestRenderNativeStreamCommandIdentity identity;
-    GpuRenderTransactionId visual_id;
-    const uint8_t opcode = (uint8_t)(header >> 24u);
-    const int source_known = gp0_next_source_addr != UINT32_MAX;
-    const int fixed_words = gpu_gp0_command_word_count(opcode);
-
-    if (!guest_render_native_stream_enabled() ||
-        gp0_state != GP0_IDLE || native_stream_command.active)
-        return 1;
-    identity = (GuestRenderNativeStreamCommandIdentity){
-        .command_id = gp0_next_source_addr,
-        .container_id = gp0_next_source.container_ordinal * sizeof(uint32_t),
-        .source_kind = (GuestRenderNativeStreamSourceKind)gp0_next_source.kind,
-        .opcode = opcode,
-        .word_count = fixed_words > 0 ? (size_t)fixed_words : 1u,
-    };
-    identity.command_writer_valid = source_known &&
-        guest_render_native_stream_source_writer(
-            gp0_next_source_addr, &identity.command_writer);
-    identity.container_writer_valid = identity.container_id <= UINT32_MAX &&
-        guest_render_native_stream_source_writer(
-            (uint32_t)identity.container_id, &identity.container_writer);
-    if (!source_known ||
-        !guest_render_native_stream_match_exact(&identity, &visual_id))
-        return 1;
-    guest_render_native_stream_note_guest_gp0_command();
-    status = source_known
-        ? guest_render_native_stream_consume_exact(
-              visual_id, gp0_next_source_addr,
-              &native_stream_command.semantic)
-        : GUEST_RENDER_NATIVE_STREAM_NOT_FOUND;
-    if (status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND) {
-        if (native_stream_opcode_is_generic(opcode)) {
-            native_stream_command.command_id = source_known
-                ? gp0_next_source_addr : (uint64_t)header;
-            native_stream_command.opcode = opcode;
-            native_stream_command.generic = 1;
-            native_stream_command.replaying = 0;
-            native_stream_command.active = 1;
-        }
-        return 1;
-    }
-    if (status != GUEST_RENDER_NATIVE_STREAM_OK) {
-        native_stream_fail("consume", gp0_next_source_addr, status);
-        return 0;
-    }
-    native_stream_command.command_id = gp0_next_source_addr;
-    native_stream_command.visual_id = visual_id;
-    native_stream_command.opcode = opcode;
-    native_stream_command.generic = 0;
-    native_stream_command.replaying = 0;
-    native_stream_command.active = 1;
+    (void)header;
+    /* Native submissions return through gpu_native_submit_gp0_word() above.
+     * The ordinary GP0 parser never has a complete packet at this boundary. */
     return 1;
 }
 
