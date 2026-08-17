@@ -213,6 +213,21 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-17 (Native replay 48 FPS pacing collapse fixed):** A complete
+  11,193-VBlank Release replay proved the 48-52 FPS interval was not host CPU
+  saturation: the emulation thread still spent 320-430 ms/s waiting in the
+  pacer. `frame_pacer_wait_stable` re-anchored after every deadline miss, so
+  repeated sub-frame misses ratcheted the VBlank phase down despite available
+  CPU. Stable pacing now preserves phase for misses below one frame and still
+  re-anchors at a full-frame miss. In the identical slow interval, cadence
+  moved from 47.6-55.8 FPS to predominantly 58.7-60.0 FPS, with isolated
+  56.6-57.3 samples, and the user confirmed playback is now very stable; the
+  10,000-frame window fell from 171.397 to 167.325 seconds. A bounded
+  residual-template lookup also removed the profiled linear
+  invalidation scan, reducing full-run task-clock from 77.443 to 75.408 seconds.
+  Native packet/list/consumption counts remained identical, replay completion
+  stayed `trace_complete`, and frame-pacing, replay-auth, static-auth, and
+  render-auth tests pass.
 - **2026-08-17 (Native replay CPU hot-path pass):** The complete 7,034-VBlank
   16:9/native replay was used to profile the optimized build. The remaining
   `__vdso_clock_gettime` cost is the precision spin in

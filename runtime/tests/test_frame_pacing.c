@@ -72,16 +72,20 @@ int main(void) {
     }
     CHECK(sweep_ok, "tick-by-tick sweep across deadline never exceeds one period");
 
-    /* 7. Normal emulation repays a bounded transient stall to preserve average
-     *    speed; smooth presentation re-anchors and never creates a short frame. */
+    /* 7. Normal emulation repays a bounded transient stall. Smooth presentation
+     *    preserves small phase errors but re-anchors after a full-frame miss. */
     CHECK(frame_pacing_advance_deadline(
               deadline + FREQ / 200, deadline, PERIOD, 1) ==
               deadline + PERIOD,
           "normal pacing preserves bounded catch-up debt");
     CHECK(frame_pacing_advance_deadline(
               deadline + FREQ / 200, deadline, PERIOD, 0) ==
-              deadline + FREQ / 200 + PERIOD,
-          "stable pacing re-anchors after a late frame");
+              deadline + PERIOD,
+          "stable pacing preserves a sub-period phase miss");
+    CHECK(frame_pacing_advance_deadline(
+              deadline + PERIOD, deadline, PERIOD, 0) ==
+              deadline + PERIOD + PERIOD,
+          "stable pacing re-anchors after a full-frame miss");
 
     printf(failures ? "FAILED (%d)\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;

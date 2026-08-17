@@ -28,8 +28,8 @@ uint64_t frame_pacing_advance_deadline(uint64_t now, uint64_t deadline,
                                        uint64_t period, int recover_debt) {
     if (deadline == 0) return now + period;
     if (now < deadline) return deadline + period;
-    if (recover_debt && now - deadline <
-            period * FRAME_PACER_CATCHUP_MAX_PERIODS)
+    if (now - deadline < period * (recover_debt
+            ? FRAME_PACER_CATCHUP_MAX_PERIODS : 1u))
         return deadline + period;
     return now + period;
 }

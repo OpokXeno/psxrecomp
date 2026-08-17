@@ -38,10 +38,10 @@ typedef struct FramePacer {
 uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
                                uint64_t freq, uint64_t period);
 
-/* Advance a deadline after one frame. recover_debt preserves the long-term
- * average rate by shortening later intervals after a transient stall. When it
- * is false, a late frame re-anchors to now so presentation never adds a short
- * catch-up interval after an already-long one. */
+/* Advance a deadline after one frame. recover_debt preserves up to twelve
+ * periods of transient debt. Stable pacing preserves sub-period phase error so
+ * tiny deadline misses cannot ratchet the frame rate down, but re-anchors once
+ * a full frame is late to avoid a burst of catch-up presents. */
 uint64_t frame_pacing_advance_deadline(uint64_t now, uint64_t deadline,
                                        uint64_t period, int recover_debt);
 
@@ -52,8 +52,8 @@ uint64_t frame_pacing_advance_deadline(uint64_t now, uint64_t deadline,
  * period in milliseconds (e.g. 1000.0 / 59.94). */
 void frame_pacer_wait(FramePacer *p, double period_ms);
 
-/* Presentation-stable variant: waits at the same cadence but forgives a late
- * frame immediately instead of repaying its wall-clock debt. */
+/* Presentation-stable variant: waits at the same cadence, preserving phase for
+ * sub-period misses and forgiving debt once a full frame is late. */
 void frame_pacer_wait_stable(FramePacer *p, double period_ms);
 
 #ifdef __cplusplus
