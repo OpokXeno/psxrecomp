@@ -1214,6 +1214,10 @@ static bool interpolate_projective_position(
         return false;
     out->x = (GpuRenderFixed16_16)projected_x;
     out->y = (GpuRenderFixed16_16)projected_y;
+    out->projective_view_x = (int32_t)view_x;
+    out->projective_view_y = (int32_t)view_y;
+    out->projective_view_z = (int32_t)view_z;
+    out->projective_distance = (uint16_t)distance;
     if (out->native_view_position) {
         out->native_view_x = (GpuRenderFixed16_16)native_x;
         out->native_view_y = (GpuRenderFixed16_16)native_y;
@@ -1325,6 +1329,13 @@ static bool interpolate_vertex(GpuRenderSemanticVertex *out,
             out->native_view_y = midpoint >= INT32_MIN && midpoint <= INT32_MAX
                 ? (GpuRenderFixed16_16)midpoint : current_native_y;
         }
+    }
+    if (position_previous->temporal_depth_valid && out->temporal_depth_valid) {
+        midpoint = interpolate_i64(
+            position_previous->temporal_depth, out->temporal_depth,
+            numerator, denominator);
+        if (midpoint >= INT32_MIN && midpoint <= INT32_MAX)
+            out->temporal_depth = (int32_t)midpoint;
     }
     midpoint_present_x = (int64_t)(out->native_view_position
         ? out->native_view_x : out->x) +
@@ -1599,8 +1610,10 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_anchors(
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
-GpuSemanticWorkloadStatus gpu_semantic_workload_record(
-    const GpuRenderSemantic *semantic, GpuRenderSemantic *out_midpoint) {
+static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
+    const GpuRenderSemantic *semantic, GpuRenderSemantic *out_midpoint,
+    bool generate_midpoint) {
+    GpuRenderSemantic endpoint;
     GpuSemanticFrame *building;
     const GpuSemanticFrame *previous;
     size_t index;
@@ -1610,9 +1623,10 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record(
     bool matched_exact = false;
     GpuSemanticWorkloadMatchKind snap_kind;
 
-    if (semantic == NULL || out_midpoint == NULL) {
+    if (semantic == NULL || (generate_midpoint && out_midpoint == NULL)) {
         return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
     }
+    if (out_midpoint == NULL) out_midpoint = &endpoint;
     if (!workload.building) {
         return GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
     }
@@ -1729,41 +1743,43 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record(
         workload.match_kind[index] = semantic->interpolation_identity.valid
             ? GPU_SEMANTIC_WORKLOAD_MATCH_IDENTITY
             : GPU_SEMANTIC_WORKLOAD_MATCH_RETROSPECTIVE;
-        moved = interpolate_semantic(
-            out_midpoint, &previous->items[previous_index], 1u, 2u,
-            &position_changed_vertices, &position_delta_fixed,
-            &midpoint_distinct_vertices, &midpoint_collapsed_vertices,
-            &midpoint_formula_failures);
-        if (moved) {
-            record_motion_diagnostics(
-                index, (size_t)previous_index,
-                &previous->items[previous_index], semantic, out_midpoint,
-                position_changed_vertices, position_delta_fixed);
-            ++workload.diagnostics.moved_count;
-            ++workload.diagnostics.total_moved;
+        if (generate_midpoint) {
+            moved = interpolate_semantic(
+                out_midpoint, &previous->items[previous_index], 1u, 2u,
+                &position_changed_vertices, &position_delta_fixed,
+                &midpoint_distinct_vertices, &midpoint_collapsed_vertices,
+                &midpoint_formula_failures);
+            if (moved) {
+                record_motion_diagnostics(
+                    index, (size_t)previous_index,
+                    &previous->items[previous_index], semantic, out_midpoint,
+                    position_changed_vertices, position_delta_fixed);
+                ++workload.diagnostics.moved_count;
+                ++workload.diagnostics.total_moved;
+            }
+            workload.diagnostics.matched_vertex_count += matched_vertices;
+            workload.diagnostics.position_changed_vertex_count +=
+                position_changed_vertices;
+            workload.diagnostics.position_delta_fixed += position_delta_fixed;
+            workload.diagnostics.midpoint_distinct_vertex_count +=
+                midpoint_distinct_vertices;
+            workload.diagnostics.midpoint_collapsed_vertex_count +=
+                midpoint_collapsed_vertices;
+            workload.diagnostics.midpoint_formula_failure_count +=
+                midpoint_formula_failures;
+            workload.diagnostics.total_matched_vertices += matched_vertices;
+            workload.diagnostics.total_position_changed_vertices +=
+                position_changed_vertices;
+            workload.diagnostics.total_position_delta_fixed +=
+                position_delta_fixed;
+            record_semantic_position_delta(semantic, position_delta_fixed);
+            workload.diagnostics.total_midpoint_distinct_vertices +=
+                midpoint_distinct_vertices;
+            workload.diagnostics.total_midpoint_collapsed_vertices +=
+                midpoint_collapsed_vertices;
+            workload.diagnostics.total_midpoint_formula_failures +=
+                midpoint_formula_failures;
         }
-        workload.diagnostics.matched_vertex_count += matched_vertices;
-        workload.diagnostics.position_changed_vertex_count +=
-            position_changed_vertices;
-        workload.diagnostics.position_delta_fixed += position_delta_fixed;
-        workload.diagnostics.midpoint_distinct_vertex_count +=
-            midpoint_distinct_vertices;
-        workload.diagnostics.midpoint_collapsed_vertex_count +=
-            midpoint_collapsed_vertices;
-        workload.diagnostics.midpoint_formula_failure_count +=
-            midpoint_formula_failures;
-        workload.diagnostics.total_matched_vertices += matched_vertices;
-        workload.diagnostics.total_position_changed_vertices +=
-            position_changed_vertices;
-        workload.diagnostics.total_position_delta_fixed +=
-            position_delta_fixed;
-        record_semantic_position_delta(semantic, position_delta_fixed);
-        workload.diagnostics.total_midpoint_distinct_vertices +=
-            midpoint_distinct_vertices;
-        workload.diagnostics.total_midpoint_collapsed_vertices +=
-            midpoint_collapsed_vertices;
-        workload.diagnostics.total_midpoint_formula_failures +=
-            midpoint_formula_failures;
         ++workload.diagnostics.matched_count;
         ++workload.diagnostics.total_matched;
         if (matched_exact) {
@@ -1784,7 +1800,7 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record(
 
         workload.fallback_kind[index] = snap_kind;
 
-        if (interpolate_source_geometry(
+        if (generate_midpoint && interpolate_source_geometry(
                 out_midpoint, 1u, 2u, &source_geometry_moved,
                 &position_changed_vertices, &position_delta_fixed,
                 &midpoint_distinct_vertices, &midpoint_collapsed_vertices,
@@ -1840,6 +1856,18 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record(
     ++workload.diagnostics.total_recorded;
     workload.diagnostics.current_count = building->count;
     return GPU_SEMANTIC_WORKLOAD_OK;
+}
+
+GpuSemanticWorkloadStatus gpu_semantic_workload_record(
+        const GpuRenderSemantic *semantic,
+        GpuRenderSemantic *out_midpoint) {
+    return gpu_semantic_workload_record_internal(
+        semantic, out_midpoint, true);
+}
+
+GpuSemanticWorkloadStatus gpu_semantic_workload_record_endpoint(
+        const GpuRenderSemantic *semantic) {
+    return gpu_semantic_workload_record_internal(semantic, NULL, false);
 }
 
 GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void) {
@@ -2104,6 +2132,44 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_match_info(
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
+GpuSemanticWorkloadStatus gpu_semantic_workload_current(
+        const GpuRenderInterpolationIdentity *identity,
+        GpuRenderSemantic *out_semantic) {
+    GpuSemanticWorkloadMatchInfo match;
+    const GpuSemanticFrame *current;
+    GpuSemanticWorkloadStatus status;
+
+    if (out_semantic == NULL) return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
+    status = gpu_semantic_workload_match_info(identity, &match);
+    if (status != GPU_SEMANTIC_WORKLOAD_OK) return status;
+    current = &workload.frames[workload.building
+        ? workload.building_index : workload.sealed_index];
+    if (match.current_order >= current->count)
+        return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
+    *out_semantic = current->items[match.current_order];
+    return GPU_SEMANTIC_WORKLOAD_OK;
+}
+
+GpuSemanticWorkloadStatus gpu_semantic_workload_previous(
+        const GpuRenderInterpolationIdentity *identity,
+        GpuRenderSemantic *out_semantic) {
+    const GpuSemanticFrame *previous;
+    int32_t previous_index;
+    bool ambiguous;
+
+    if (identity == NULL || out_semantic == NULL || !identity->valid)
+        return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
+    if (!workload.building || !workload.has_sealed)
+        return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
+    previous = &workload.frames[workload.sealed_index];
+    previous_index = hash_lookup(
+        workload.previous_hash, previous, identity, &ambiguous);
+    if (previous_index < 0 || ambiguous)
+        return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
+    *out_semantic = previous->items[(size_t)previous_index];
+    return GPU_SEMANTIC_WORKLOAD_OK;
+}
+
 GpuSemanticWorkloadStatus gpu_semantic_workload_last_motion(
         GpuSemanticWorkloadMotionDiagnostics *out_motion) {
     if (out_motion == NULL)
@@ -2121,6 +2187,22 @@ static bool material_position_equal(const GpuRenderMaterial *a,
            a->draw_area_bottom == b->draw_area_bottom &&
            a->draw_offset_x == b->draw_offset_x &&
            a->draw_offset_y == b->draw_offset_y;
+}
+
+static bool anchor_producer_scene_present(
+        const GpuSemanticAnchorFrame *anchors,
+        const GpuRenderSemantic *semantic) {
+    for (size_t index = 0u; index < anchors->count; ++index) {
+        const GpuRenderInterpolationVertexAnchor *candidate =
+            &anchors->items[index];
+
+        if (candidate->scene_id ==
+                semantic->interpolation_identity.scene_id &&
+            candidate->producer_id ==
+                semantic->interpolation_identity.producer_id)
+            return true;
+    }
+    return false;
 }
 
 static void copy_material_position(GpuRenderMaterial *target,
@@ -2149,9 +2231,20 @@ static void copy_vertex_position(GpuRenderSemanticVertex *target,
     target->projective_native_offset_y = source->projective_native_offset_y;
     target->projective_distance = source->projective_distance;
     target->projective_position = source->projective_position;
+    target->temporal_depth = source->temporal_depth;
+    target->temporal_depth_valid = source->temporal_depth_valid;
 }
 
-static bool retired_current_geometry(
+typedef enum RetiredCurrentGeometryStatus {
+    RETIRED_CURRENT_GEOMETRY_OK = 0,
+    RETIRED_CURRENT_GEOMETRY_ANCHOR_OVERFLOW,
+    RETIRED_CURRENT_GEOMETRY_SCENE_MISMATCH,
+    RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR,
+    RETIRED_CURRENT_GEOMETRY_POSITION_MODE_MISMATCH,
+    RETIRED_CURRENT_GEOMETRY_MATERIAL_POSITION_MISMATCH,
+} RetiredCurrentGeometryStatus;
+
+static RetiredCurrentGeometryStatus retired_current_geometry_status(
         const GpuRenderSemantic *previous,
         const GpuRenderMaterial **out_position_material) {
     const GpuSemanticAnchorFrame *current_anchors =
@@ -2159,27 +2252,41 @@ static bool retired_current_geometry(
     const GpuRenderMaterial *position_material = NULL;
     const size_t count = semantic_vertex_count(previous);
 
-    if (current_anchors->overflowed) return false;
+    if (current_anchors->overflowed)
+        return RETIRED_CURRENT_GEOMETRY_ANCHOR_OVERFLOW;
     for (size_t index = 0u; index < count; ++index) {
         const GpuRenderSemanticVertex *vertex =
             semantic_vertex_at(previous, index);
         const GpuRenderInterpolationVertexAnchor *anchor;
 
         if (!anchor_lookup(workload.current_anchor_hash, current_anchors,
-                           previous, vertex, &anchor) ||
-            anchor->vertex.native_view_position !=
+                           previous, vertex, &anchor)) {
+            if (!anchor_producer_scene_present(current_anchors, previous) &&
+                current_anchors->count != 0u)
+                return RETIRED_CURRENT_GEOMETRY_SCENE_MISMATCH;
+            return RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR;
+        }
+        if (anchor->vertex.native_view_position !=
                 vertex->native_view_position)
-            return false;
+            return RETIRED_CURRENT_GEOMETRY_POSITION_MODE_MISMATCH;
         if (position_material == NULL)
             position_material = &anchor->material;
         else if (!material_position_equal(position_material,
                                           &anchor->material))
-            return false;
+            return RETIRED_CURRENT_GEOMETRY_MATERIAL_POSITION_MISMATCH;
     }
-    if (position_material == NULL) return false;
+    if (position_material == NULL)
+        return RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR;
     if (out_position_material != NULL)
         *out_position_material = position_material;
-    return true;
+    return RETIRED_CURRENT_GEOMETRY_OK;
+}
+
+static bool retired_current_geometry(
+        const GpuRenderSemantic *previous,
+        const GpuRenderMaterial **out_position_material) {
+    return retired_current_geometry_status(previous, out_position_material) ==
+        RETIRED_CURRENT_GEOMETRY_OK;
 }
 
 static bool interpolate_retired_source_geometry(
@@ -2228,6 +2335,160 @@ size_t gpu_semantic_workload_retired_count(void) {
             semantic_is_retirable_mesh(&previous->items[index]) &&
             retired_current_geometry(&previous->items[index], NULL))
             ++count;
+    return count;
+}
+
+void gpu_semantic_workload_retired_diagnostics(
+        uint32_t producer_id,
+        GpuSemanticWorkloadRetiredDiagnostics *out_diagnostics) {
+    const GpuSemanticFrame *previous;
+    GpuSemanticWorkloadRetiredDiagnostics diagnostics = {0};
+
+    if (out_diagnostics == NULL) return;
+    if (!workload.building && workload.has_sealed) {
+        previous = &workload.frames[workload.sealed_index ^ 1u];
+        for (size_t index = 0u; index < previous->count; ++index) {
+            const GpuRenderSemantic *semantic = &previous->items[index];
+
+            if (workload.previous_corresponded[index] ||
+                !semantic_is_retirable_mesh(semantic) ||
+                semantic->interpolation_identity.producer_id != producer_id)
+                continue;
+            const RetiredCurrentGeometryStatus status =
+                retired_current_geometry_status(semantic, NULL);
+
+            ++diagnostics.unmatched;
+            switch (status) {
+            case RETIRED_CURRENT_GEOMETRY_OK:
+                ++diagnostics.eligible;
+                break;
+            case RETIRED_CURRENT_GEOMETRY_ANCHOR_OVERFLOW:
+                ++diagnostics.anchor_overflow;
+                break;
+            case RETIRED_CURRENT_GEOMETRY_SCENE_MISMATCH:
+                ++diagnostics.scene_mismatch;
+                break;
+            case RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR:
+                if (diagnostics.missing_anchor == 0u) {
+                    const GpuSemanticAnchorFrame *anchors =
+                        &workload.anchor_frames[workload.sealed_index];
+
+                    diagnostics.first_missing_primitive_id =
+                        semantic->interpolation_identity.primitive_id;
+                    for (size_t vertex_index = 0u;
+                         vertex_index < semantic_vertex_count(semantic);
+                         ++vertex_index) {
+                        const GpuRenderSemanticVertex *vertex =
+                            semantic_vertex_at(semantic, vertex_index);
+                        const GpuRenderInterpolationVertexAnchor *anchor;
+
+                        if (anchor_lookup(
+                                workload.current_anchor_hash, anchors,
+                                semantic, vertex, &anchor))
+                            continue;
+                        diagnostics.first_missing_group_id =
+                            vertex->interpolation_group_id;
+                        diagnostics.first_missing_vertex_id =
+                            vertex->interpolation_vertex_id;
+                        break;
+                    }
+                }
+                ++diagnostics.missing_anchor;
+                break;
+            case RETIRED_CURRENT_GEOMETRY_POSITION_MODE_MISMATCH:
+                ++diagnostics.position_mode_mismatch;
+                break;
+            case RETIRED_CURRENT_GEOMETRY_MATERIAL_POSITION_MISMATCH:
+                ++diagnostics.material_position_mismatch;
+                break;
+            }
+        }
+    }
+    *out_diagnostics = diagnostics;
+}
+
+static void append_retired_issue(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderSemanticVertex *vertex, size_t previous_order,
+        GpuSemanticWorkloadRetiredIssueReason reason,
+        GpuSemanticWorkloadRetiredIssue *out_issues, size_t capacity,
+        size_t *in_out_count) {
+    const size_t index = (*in_out_count)++;
+
+    if (out_issues == NULL || index >= capacity) return;
+    out_issues[index] = (GpuSemanticWorkloadRetiredIssue){
+        .scene_id = semantic->interpolation_identity.scene_id,
+        .producer_id = semantic->interpolation_identity.producer_id,
+        .primitive_id = semantic->interpolation_identity.primitive_id,
+        .group_id = vertex != NULL ? vertex->interpolation_group_id : 0u,
+        .vertex_id = vertex != NULL ? vertex->interpolation_vertex_id : 0u,
+        .previous_order = (uint32_t)previous_order,
+        .reason = (uint32_t)reason,
+    };
+}
+
+size_t gpu_semantic_workload_retired_issues(
+        GpuSemanticWorkloadRetiredIssue *out_issues, size_t capacity) {
+    const GpuSemanticFrame *previous;
+    const GpuSemanticAnchorFrame *anchors;
+    size_t count = 0u;
+
+    if (out_issues == NULL && capacity != 0u) return 0u;
+    if (workload.building || !workload.has_sealed) return 0u;
+    previous = &workload.frames[workload.sealed_index ^ 1u];
+    anchors = &workload.anchor_frames[workload.sealed_index];
+    for (size_t previous_order = 0u; previous_order < previous->count;
+         ++previous_order) {
+        const GpuRenderSemantic *semantic = &previous->items[previous_order];
+        const GpuRenderMaterial *position_material = NULL;
+
+        if (workload.previous_corresponded[previous_order] ||
+            !semantic_is_retirable_mesh(semantic))
+            continue;
+        if (anchors->overflowed) {
+            append_retired_issue(
+                semantic, NULL, previous_order,
+                GPU_SEMANTIC_RETIRED_ISSUE_ANCHOR_OVERFLOW,
+                out_issues, capacity, &count);
+            continue;
+        }
+        for (size_t vertex_index = 0u;
+             vertex_index < semantic_vertex_count(semantic); ++vertex_index) {
+            const GpuRenderSemanticVertex *vertex =
+                semantic_vertex_at(semantic, vertex_index);
+            const GpuRenderInterpolationVertexAnchor *anchor;
+
+            if (!anchor_lookup(workload.current_anchor_hash, anchors,
+                               semantic, vertex, &anchor)) {
+                const GpuSemanticWorkloadRetiredIssueReason reason =
+                    !anchor_producer_scene_present(anchors, semantic) &&
+                            anchors->count != 0u
+                        ? GPU_SEMANTIC_RETIRED_ISSUE_SCENE_MISMATCH
+                        : GPU_SEMANTIC_RETIRED_ISSUE_MISSING_ANCHOR;
+                append_retired_issue(
+                    semantic, vertex, previous_order, reason,
+                    out_issues, capacity, &count);
+                continue;
+            }
+            if (anchor->vertex.native_view_position !=
+                    vertex->native_view_position) {
+                append_retired_issue(
+                    semantic, vertex, previous_order,
+                    GPU_SEMANTIC_RETIRED_ISSUE_POSITION_MODE_MISMATCH,
+                    out_issues, capacity, &count);
+                continue;
+            }
+            if (position_material == NULL) {
+                position_material = &anchor->material;
+            } else if (!material_position_equal(
+                           position_material, &anchor->material)) {
+                append_retired_issue(
+                    semantic, vertex, previous_order,
+                    GPU_SEMANTIC_RETIRED_ISSUE_MATERIAL_POSITION_MISMATCH,
+                    out_issues, capacity, &count);
+            }
+        }
+    }
     return count;
 }
 
@@ -2380,7 +2641,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
             uint64_t delta = 0u;
             (void)interpolate_semantic(
                 &out_phases[phase], &previous->items[previous_index],
-                (unsigned int)phase + 1u, denominator, &changed, &delta,
+                (unsigned int)phase + 1u, denominator,
+                &changed, &delta,
                 &distinct, &collapsed, &failures);
         } else if (workload.source_geometry_match[index]) {
             bool moved = false;
@@ -2392,7 +2654,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
 
             (void)interpolate_source_geometry(
                 &out_phases[phase], (unsigned int)phase + 1u, denominator,
-                &moved, &changed, &delta, &distinct, &collapsed, &failures);
+                &moved, &changed, &delta, &distinct, &collapsed,
+                &failures);
         }
     }
     reconcile_phase_vertex_positions(

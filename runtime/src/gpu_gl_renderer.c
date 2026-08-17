@@ -681,8 +681,12 @@ typedef struct NativeHostQueuedSemantic {
     int clear_margins;
     int midpoint_valid;
     int phase_only;
+    int temporal_order_valid;
+    uint8_t phase_visibility_mask;
+    uint32_t phase_order[NATIVE_INTERPOLATION_MAX_PHASES];
 } NativeHostQueuedSemantic;
 static NativeHostQueuedSemantic s_native_host_queue[NATIVE_HOST_QUEUE_CAP];
+static size_t s_native_host_render_order[NATIVE_HOST_QUEUE_CAP];
 static size_t s_native_host_queue_count;
 static size_t s_native_host_queue_last_present_count;
 static int s_native_host_queue_flushing;
@@ -701,6 +705,15 @@ static int s_native_host_semantic_history_valid;
 static GlRendererSemanticProducerItemDiagnostics
     s_native_host_diag_primitives[NATIVE_HOST_DIAG_PRIMITIVE_CAP];
 static uint64_t s_native_host_diag_primitive_total;
+#define RETIRED_FAILURE_EVENT_CAP 131072u
+#define RETIRED_ISSUE_SCRATCH_CAP \
+    (GPU_SEMANTIC_WORKLOAD_CAPACITY * GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY * 3u)
+static GlRendererRetiredFailureEvent
+    s_retired_failure_events[RETIRED_FAILURE_EVENT_CAP];
+static GpuSemanticWorkloadRetiredIssue
+    s_retired_issue_scratch[RETIRED_ISSUE_SCRATCH_CAP];
+static uint64_t s_retired_failure_event_count;
+static uint64_t s_retired_failure_event_overflow;
 #define PRODUCER_DIAG_VERTEX_CAP 32768u
 typedef struct ProducerDiagVertex {
     uint64_t scene_id;
@@ -9495,6 +9508,9 @@ static void native_geometry_accumulate(
     s_native_view_geometry_count[variant]++;
 }
 
+static int native_host_semantic_depth_order(
+        const GpuRenderSemantic *semantic, uint32_t *out_order);
+
 static GpuRenderTransactionStatus native_host_queue_render_pass(
         size_t count, int phase) {
     GpuRenderTransactionStatus status = GPU_RENDER_TRANSACTION_OK;
@@ -9506,20 +9522,81 @@ static GpuRenderTransactionStatus native_host_queue_render_pass(
     int active_preserve_x = 0;
 
     native_draw_state_save(&draw_state);
-    for (size_t index = 0u; index < count; ++index) {
+    for (size_t index = 0u; index < count; ++index)
+        s_native_host_render_order[index] = index;
+    if (phase >= 0 && s_native_interpolation_phase_count > 1u) {
+        for (size_t source = 0u; source < count; ++source) {
+            const NativeHostQueuedSemantic *extra =
+                &s_native_host_queue[source];
+            size_t current_position = 0u;
+            size_t destination = 0u;
+
+            if (!extra->phase_only ||
+                (extra->phase_visibility_mask & (1u << phase)) == 0u)
+                continue;
+            while (current_position < count &&
+                   s_native_host_render_order[current_position] != source)
+                ++current_position;
+            if (current_position == count) continue;
+            memmove(&s_native_host_render_order[current_position],
+                    &s_native_host_render_order[current_position + 1u],
+                    (count - current_position - 1u) *
+                        sizeof(s_native_host_render_order[0]));
+            for (size_t order_index = 0u; order_index + 1u < count;
+                 ++order_index) {
+                const NativeHostQueuedSemantic *queued =
+                    &s_native_host_queue[
+                        s_native_host_render_order[order_index]];
+                const GpuRenderSemantic *ordered_semantic;
+                uint32_t order;
+
+                if (queued->clear_margins ||
+                    (queued->phase_only &&
+                     (queued->phase_visibility_mask & (1u << phase)) == 0u))
+                    continue;
+                if (queued->phase_only) {
+                    order = queued->phase_order[phase];
+                } else {
+                    ordered_semantic = queued->midpoint_valid
+                        ? (phase == 0 ? &queued->midpoint
+                                      : &queued->extra_phases[phase - 1])
+                        : &queued->current;
+                    if (!native_host_semantic_depth_order(
+                            ordered_semantic, &order))
+                        continue;
+                }
+                if (order >= extra->phase_order[phase])
+                    destination = order_index + 1u;
+                else
+                    break;
+            }
+            memmove(&s_native_host_render_order[destination + 1u],
+                    &s_native_host_render_order[destination],
+                    (count - destination - 1u) *
+                        sizeof(s_native_host_render_order[0]));
+            s_native_host_render_order[destination] = source;
+        }
+    }
+    for (size_t draw_index = 0u; draw_index < count; ++draw_index) {
+        const size_t index = s_native_host_render_order[draw_index];
         const NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
-        const GpuRenderSemantic *semantic = phase >= 0
-            ? (phase == 0 ? &queued->midpoint
-                          : &queued->extra_phases[phase - 1])
-            : &queued->current;
+        const GpuRenderSemantic *semantic =
+            phase >= 0 && queued->midpoint_valid
+                ? (phase == 0 ? &queued->midpoint
+                              : &queued->extra_phases[phase - 1])
+                : &queued->current;
         const GLuint target_fbo = phase >= 0
             ? native_view_phase_fbo(queued->slot, (unsigned int)phase)
             : s_native_view_fbo[queued->slot];
         int expand;
         int preserve_x;
 
-        if (phase >= 0 && !queued->midpoint_valid) continue;
+        if (phase >= 0 && !queued->midpoint_valid && queued->clear_margins)
+            continue;
         if (phase < 0 && queued->phase_only) continue;
+        if (phase >= 0 && queued->phase_only &&
+            (queued->phase_visibility_mask & (1u << phase)) == 0u)
+            continue;
         if (!target_fbo) {
             status = GPU_RENDER_TRANSACTION_BACKEND_ERROR;
             break;
@@ -9626,7 +9703,194 @@ static int native_host_diag_fixed_floor(int64_t value) {
         : -(int)((-value + INT64_C(65535)) / INT64_C(65536));
 }
 
+static int native_host_semantic_is_terrain(
+        const GpuRenderSemantic *semantic);
+
+static int native_host_semantic_depth_order(
+        const GpuRenderSemantic *semantic, uint32_t *out_order) {
+    const size_t primitive_count =
+        semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+            ? semantic->triangle_count : semantic->line_count;
+    const size_t vertex_count =
+        semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u;
+    uint32_t max_depth = 0u;
+    int found = 0;
+
+    for (size_t primitive = 0u; primitive < primitive_count; ++primitive)
+        for (size_t vertex = 0u; vertex < vertex_count; ++vertex) {
+            const GpuRenderSemanticVertex *position =
+                native_host_diag_primitive_vertex(
+                    semantic, primitive, vertex);
+
+            if (!position->projective_position ||
+                position->projective_view_z <= 0)
+                continue;
+            if ((uint32_t)position->projective_view_z > max_depth)
+                max_depth = (uint32_t)position->projective_view_z;
+            found = 1;
+        }
+    if (!found) return 0;
+    *out_order = max_depth >> 4u;
+    if (*out_order >= UINT32_C(0xf0))
+        *out_order = UINT32_C(0xef);
+    return 1;
+}
+
+static int native_host_temporal_phase_visible(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderTemporalCullPolicy *policy,
+        uint32_t *out_order) {
+    const size_t primitive_count =
+        semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+            ? semantic->triangle_count : semantic->line_count;
+    const size_t vertex_count =
+        semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u;
+    int64_t min_x = INT64_MAX;
+    int64_t min_y = INT64_MAX;
+    int64_t max_x = INT64_MIN;
+    int64_t max_y = INT64_MIN;
+    int32_t min_depth = INT32_MAX;
+    int32_t max_depth = INT32_MIN;
+    int32_t last_depth = 0;
+    int64_t depth_sum = 0;
+    size_t depth_count = 0u;
+    int found = 0;
+
+    for (size_t primitive = 0u; primitive < primitive_count; ++primitive)
+        for (size_t vertex = 0u; vertex < vertex_count; ++vertex) {
+            const GpuRenderSemanticVertex *position =
+                native_host_diag_primitive_vertex(
+                    semantic, primitive, vertex);
+            int32_t depth;
+
+            if ((policy->flags & GPU_RENDER_TEMPORAL_CULL_PROJECTIVE) != 0u &&
+                (!position->projective_position ||
+                 position->projective_view_z <= 0))
+                return 0;
+            if (position->x < min_x) min_x = position->x;
+            if (position->x > max_x) max_x = position->x;
+            if (position->y < min_y) min_y = position->y;
+            if (position->y > max_y) max_y = position->y;
+            if (position->temporal_depth_valid) {
+                depth = position->temporal_depth;
+            } else if (position->projective_position) {
+                depth = position->projective_view_z;
+            } else if ((policy->flags & GPU_RENDER_TEMPORAL_CULL_DEPTH) != 0u) {
+                return 0;
+            } else {
+                depth = 0;
+            }
+            if (depth < min_depth) min_depth = depth;
+            if (depth > max_depth) max_depth = depth;
+            last_depth = depth;
+            depth_sum += depth;
+            ++depth_count;
+            found = 1;
+        }
+    if (!found) return 0;
+    if ((policy->flags & GPU_RENDER_TEMPORAL_CULL_SCREEN) != 0u &&
+        (max_x < policy->screen_left ||
+         min_x >= policy->screen_right_exclusive ||
+         max_y < policy->screen_top ||
+         min_y >= policy->screen_bottom_exclusive))
+        return 0;
+    if ((policy->flags & GPU_RENDER_TEMPORAL_CULL_FRONT_FACE) != 0u) {
+        const GpuRenderSemanticVertex *a;
+        const GpuRenderSemanticVertex *b;
+        const GpuRenderSemanticVertex *c;
+        int64_t area;
+
+        if (semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+            semantic->triangle_count == 0u)
+            return 0;
+        a = &semantic->triangles[0].vertices[0];
+        b = &semantic->triangles[0].vertices[1];
+        c = &semantic->triangles[0].vertices[2];
+        area = ((int64_t)b->x - a->x) * ((int64_t)c->y - a->y) -
+            ((int64_t)b->y - a->y) * ((int64_t)c->x - a->x);
+        if ((policy->front_face == GPU_RENDER_TEMPORAL_FRONT_POSITIVE &&
+             area <= 0) ||
+            (policy->front_face == GPU_RENDER_TEMPORAL_FRONT_NEGATIVE &&
+             area >= 0))
+            return 0;
+    }
+    if ((policy->flags & GPU_RENDER_TEMPORAL_CULL_DEPTH) != 0u) {
+        const int32_t depth = policy->depth_mode ==
+                GPU_RENDER_TEMPORAL_DEPTH_MINIMUM
+            ? min_depth
+            : (policy->depth_mode == GPU_RENDER_TEMPORAL_DEPTH_AVERAGE
+                ? (int32_t)(depth_sum / (int64_t)depth_count)
+                : (policy->depth_mode ==
+                       GPU_RENDER_TEMPORAL_DEPTH_LAST_VERTEX
+                    ? last_depth : max_depth));
+
+        if (policy->depth_mode == GPU_RENDER_TEMPORAL_DEPTH_NONE ||
+            depth < policy->depth_min_inclusive ||
+            depth >= policy->depth_max_exclusive)
+            return 0;
+        *out_order = (uint32_t)depth >> policy->ordering_depth_shift;
+    } else if (!native_host_semantic_depth_order(semantic, out_order)) {
+        *out_order = 0u;
+    }
+    return 1;
+}
+
+static void native_host_queue_merge_temporal_phases(size_t count) {
+    size_t remaining = 0u;
+
+    for (size_t index = 0u; index < count; ++index)
+        if (s_native_host_queue[index].temporal_order_valid == 1)
+            ++remaining;
+    while (remaining != 0u) {
+        NativeHostQueuedSemantic extra;
+        size_t source = 0u;
+        size_t destination = 0u;
+
+        while (source < count &&
+               s_native_host_queue[source].temporal_order_valid != 1)
+            ++source;
+        if (source == count) break;
+        extra = s_native_host_queue[source];
+        memmove(&s_native_host_queue[source],
+                &s_native_host_queue[source + 1u],
+                (count - source - 1u) * sizeof(s_native_host_queue[0]));
+        for (size_t index = 0u; index + 1u < count; ++index) {
+            uint32_t order;
+
+            if (s_native_host_queue[index].clear_margins ||
+                s_native_host_queue[index].temporal_order_valid != 0 ||
+                !native_host_semantic_depth_order(
+                    &s_native_host_queue[index].current, &order))
+                continue;
+            if (order >= extra.phase_order[0])
+                destination = index + 1u;
+            else
+                break;
+        }
+        memmove(&s_native_host_queue[destination + 1u],
+                &s_native_host_queue[destination],
+                (count - destination - 1u) * sizeof(s_native_host_queue[0]));
+        extra.temporal_order_valid = 2;
+        s_native_host_queue[destination] = extra;
+        --remaining;
+    }
+    for (size_t index = 0u; index < count; ++index)
+        if (s_native_host_queue[index].temporal_order_valid == 2)
+            s_native_host_queue[index].temporal_order_valid = 1;
+}
+
+static int native_host_semantic_is_world_model(
+        const GpuRenderSemantic *semantic);
+static int native_host_semantic_is_terrain(
+        const GpuRenderSemantic *semantic);
+static void native_host_record_retired_failure(
+    GlRendererRetiredFailureReason reason,
+    const GpuRenderSemantic *semantic, size_t previous_order,
+    uint32_t group_id, uint32_t vertex_id, uint32_t auxiliary,
+    int64_t value_a, int64_t value_b);
+
 static void native_host_queue_snapshot_present(size_t count) {
+    memset(s_producer_diag_vertices, 0, sizeof(s_producer_diag_vertices));
     for (size_t queue_index = 0u; queue_index < count; ++queue_index) {
         const NativeHostQueuedSemantic *queued = &s_native_host_queue[queue_index];
         const GpuRenderSemantic *current = &queued->current;
@@ -9667,6 +9931,7 @@ static void native_host_queue_snapshot_present(size_t count) {
                 .subprimitive_index = (uint32_t)primitive,
                 .topology = current->topology,
                 .screen_space_2d = current->screen_space_2d,
+                .world_model = native_host_semantic_is_world_model(current),
                 .tpage = current->material.tpage,
                 .clut_x = current->material.clut_x,
                 .clut_y = current->material.clut_y,
@@ -9687,6 +9952,10 @@ static void native_host_queue_snapshot_present(size_t count) {
             int current_pixel_y[3] = {0};
             int midpoint_pixel_x[3] = {0};
             int midpoint_pixel_y[3] = {0};
+            int64_t current_fixed_x[3] = {0};
+            int64_t current_fixed_y[3] = {0};
+            int64_t midpoint_fixed_x[3] = {0};
+            int64_t midpoint_fixed_y[3] = {0};
             for (size_t vertex = 0u; vertex < vertex_count; ++vertex) {
                 const GpuRenderSemanticVertex *current_vertex =
                     native_host_diag_primitive_vertex(
@@ -9709,6 +9978,10 @@ static void native_host_queue_snapshot_present(size_t count) {
                     native_host_diag_fixed_floor(midpoint_x);
                 midpoint_pixel_y[vertex] =
                     native_host_diag_fixed_floor(midpoint_y);
+                current_fixed_x[vertex] = current_x;
+                current_fixed_y[vertex] = current_y;
+                midpoint_fixed_x[vertex] = midpoint_x;
+                midpoint_fixed_y[vertex] = midpoint_y;
                 if (vertex == 0u) {
                     item->raw_bounds[0] = glb_fixed_floor(current_vertex->x);
                     item->raw_bounds[1] = glb_fixed_floor(current_vertex->y);
@@ -9765,8 +10038,65 @@ static void native_host_queue_snapshot_present(size_t count) {
                 item->midpoint_delta_fixed += current_y >= midpoint_y
                     ? (uint64_t)(current_y - midpoint_y)
                     : (uint64_t)(midpoint_y - current_y);
+                if (queued->midpoint_valid &&
+                    native_host_semantic_is_terrain(current) &&
+                    midpoint_vertex->interpolation_vertex_identity_valid) {
+                    size_t slot =
+                        ((size_t)midpoint->interpolation_identity.scene_id ^
+                         ((size_t)midpoint_vertex->interpolation_group_id << 7u) ^
+                         midpoint_vertex->interpolation_vertex_id) &
+                        (PRODUCER_DIAG_VERTEX_CAP - 1u);
+
+                    for (size_t probe = 0u; probe < PRODUCER_DIAG_VERTEX_CAP;
+                         ++probe) {
+                        ProducerDiagVertex *entry =
+                            &s_producer_diag_vertices[slot];
+
+                        if (!entry->used) {
+                            *entry = (ProducerDiagVertex){
+                                .scene_id = midpoint->interpolation_identity.scene_id,
+                                .group_id = midpoint_vertex->interpolation_group_id,
+                                .vertex_id = midpoint_vertex->interpolation_vertex_id,
+                                .x = midpoint_x,
+                                .y = midpoint_y,
+                                .used = 1,
+                            };
+                            break;
+                        }
+                        if (entry->scene_id ==
+                                midpoint->interpolation_identity.scene_id &&
+                            entry->group_id ==
+                                midpoint_vertex->interpolation_group_id &&
+                            entry->vertex_id ==
+                                midpoint_vertex->interpolation_vertex_id) {
+                            if (entry->x != midpoint_x || entry->y != midpoint_y)
+                                native_host_record_retired_failure(
+                                    GL_RETIRED_FAILURE_MIDPOINT_VERTEX_CONFLICT,
+                                    current,
+                                    match.previous_order_valid
+                                        ? match.previous_order : SIZE_MAX,
+                                    midpoint_vertex->interpolation_group_id,
+                                    midpoint_vertex->interpolation_vertex_id,
+                                    (uint32_t)primitive |
+                                        (queued->phase_only
+                                            ? UINT32_C(0x80000000) : 0u),
+                                    midpoint_x - entry->x,
+                                    midpoint_y - entry->y);
+                            break;
+                        }
+                        slot = (slot + 1u) &
+                            (PRODUCER_DIAG_VERTEX_CAP - 1u);
+                    }
+                }
             }
-            if (current->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
+            if (queued->midpoint_valid &&
+                native_host_semantic_is_terrain(current) &&
+                current->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
+                const GpuRenderSemanticVertex *identity_vertex =
+                    native_host_diag_primitive_vertex(current, primitive, 0u);
+                const size_t previous_order = match.previous_order_valid
+                    ? match.previous_order : SIZE_MAX;
+
                 item->current_area =
                     (int64_t)(current_pixel_x[1] - current_pixel_x[0]) *
                         (current_pixel_y[2] - current_pixel_y[0]) -
@@ -9777,6 +10107,69 @@ static void native_host_queue_snapshot_present(size_t count) {
                         (midpoint_pixel_y[2] - midpoint_pixel_y[0]) -
                     (int64_t)(midpoint_pixel_y[1] - midpoint_pixel_y[0]) *
                         (midpoint_pixel_x[2] - midpoint_pixel_x[0]);
+                const int64_t current_fixed_area =
+                    (current_fixed_x[1] - current_fixed_x[0]) *
+                        (current_fixed_y[2] - current_fixed_y[0]) -
+                    (current_fixed_y[1] - current_fixed_y[0]) *
+                        (current_fixed_x[2] - current_fixed_x[0]);
+                const int64_t midpoint_fixed_area =
+                    (midpoint_fixed_x[1] - midpoint_fixed_x[0]) *
+                        (midpoint_fixed_y[2] - midpoint_fixed_y[0]) -
+                    (midpoint_fixed_y[1] - midpoint_fixed_y[0]) *
+                        (midpoint_fixed_x[2] - midpoint_fixed_x[0]);
+                if (item->current_area != 0 && item->midpoint_area == 0)
+                    native_host_record_retired_failure(
+                        GL_RETIRED_FAILURE_MIDPOINT_ZERO_AREA,
+                        current, previous_order,
+                        identity_vertex->interpolation_group_id,
+                        identity_vertex->interpolation_vertex_id,
+                        (uint32_t)primitive |
+                            (queued->phase_only ? UINT32_C(0x80000000) : 0u),
+                        item->current_area,
+                        item->midpoint_area);
+                if (item->current_bounds[2] > item->current_bounds[0] &&
+                    item->current_bounds[3] > item->current_bounds[1] &&
+                    (item->midpoint_bounds[2] == item->midpoint_bounds[0] ||
+                     item->midpoint_bounds[3] == item->midpoint_bounds[1]))
+                    native_host_record_retired_failure(
+                        GL_RETIRED_FAILURE_MIDPOINT_EXTENT_COLLAPSE,
+                        current, previous_order,
+                        identity_vertex->interpolation_group_id,
+                        identity_vertex->interpolation_vertex_id,
+                        (uint32_t)primitive |
+                            (queued->phase_only ? UINT32_C(0x80000000) : 0u),
+                        item->current_area,
+                        item->midpoint_area);
+                if ((item->current_area < 0 && item->midpoint_area > 0) ||
+                    (item->current_area > 0 && item->midpoint_area < 0))
+                    native_host_record_retired_failure(
+                        GL_RETIRED_FAILURE_MIDPOINT_WINDING_FLIP,
+                        current, previous_order,
+                        identity_vertex->interpolation_group_id,
+                        identity_vertex->interpolation_vertex_id,
+                        (uint32_t)primitive |
+                            (queued->phase_only ? UINT32_C(0x80000000) : 0u),
+                        item->current_area,
+                        item->midpoint_area);
+                if (current_fixed_area != 0 && midpoint_fixed_area == 0)
+                    native_host_record_retired_failure(
+                        GL_RETIRED_FAILURE_MIDPOINT_FIXED_ZERO_AREA,
+                        current, previous_order,
+                        identity_vertex->interpolation_group_id,
+                        identity_vertex->interpolation_vertex_id,
+                        (uint32_t)primitive |
+                            (queued->phase_only ? UINT32_C(0x80000000) : 0u),
+                        current_fixed_area, midpoint_fixed_area);
+                if ((current_fixed_area < 0 && midpoint_fixed_area > 0) ||
+                    (current_fixed_area > 0 && midpoint_fixed_area < 0))
+                    native_host_record_retired_failure(
+                        GL_RETIRED_FAILURE_MIDPOINT_FIXED_WINDING_FLIP,
+                        current, previous_order,
+                        identity_vertex->interpolation_group_id,
+                        identity_vertex->interpolation_vertex_id,
+                        (uint32_t)primitive |
+                            (queued->phase_only ? UINT32_C(0x80000000) : 0u),
+                        current_fixed_area, midpoint_fixed_area);
             }
         }
     }
@@ -9810,81 +10203,363 @@ static void native_host_queue_capture_history(
     }
 }
 
+static int native_host_semantic_is_world_model(
+        const GpuRenderSemantic *semantic) {
+    const GpuRenderSemanticVertex *vertex;
+
+    if (semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count == 0u)
+        return 0;
+    vertex = &semantic->triangles[0].vertices[0];
+    return vertex->interpolation_vertex_identity_valid &&
+        (vertex->interpolation_group_id & UINT32_C(0xff000000)) ==
+            UINT32_C(0x64000000);
+}
+
+static int native_host_semantic_is_terrain(
+        const GpuRenderSemantic *semantic) {
+    const GpuRenderSemanticVertex *vertex;
+
+    if (semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count == 0u)
+        return 0;
+    vertex = &semantic->triangles[0].vertices[0];
+    return vertex->interpolation_vertex_identity_valid &&
+        vertex->interpolation_group_id == UINT32_C(0x63000000);
+}
+
+static void native_host_record_retired_failure(
+        GlRendererRetiredFailureReason reason,
+        const GpuRenderSemantic *semantic, size_t previous_order,
+        uint32_t group_id, uint32_t vertex_id, uint32_t auxiliary,
+        int64_t value_a, int64_t value_b) {
+    GlRendererRetiredFailureEvent event;
+
+    if (semantic == NULL) return;
+    event = (GlRendererRetiredFailureEvent){
+        .frame = s_frame_count,
+        .scene_id = semantic->interpolation_identity.scene_id,
+        .reason = (uint32_t)reason,
+        .producer_id = semantic->interpolation_identity.producer_id,
+        .primitive_id = semantic->interpolation_identity.primitive_id,
+        .group_id = group_id,
+        .vertex_id = vertex_id,
+        .previous_order = (uint32_t)previous_order,
+        .auxiliary = auxiliary,
+        .value_a = value_a,
+        .value_b = value_b,
+    };
+    if (s_retired_failure_event_count < RETIRED_FAILURE_EVENT_CAP) {
+        s_retired_failure_events[s_retired_failure_event_count] = event;
+    } else {
+        ++s_retired_failure_event_overflow;
+    }
+    ++s_retired_failure_event_count;
+}
+
+static void native_host_record_workload_retired_issues(void) {
+    const size_t total = gpu_semantic_workload_retired_issues(
+        s_retired_issue_scratch, RETIRED_ISSUE_SCRATCH_CAP);
+    const size_t count = total < RETIRED_ISSUE_SCRATCH_CAP
+        ? total : RETIRED_ISSUE_SCRATCH_CAP;
+
+    if (total > RETIRED_ISSUE_SCRATCH_CAP)
+        s_retired_failure_event_overflow +=
+            total - RETIRED_ISSUE_SCRATCH_CAP;
+    for (size_t index = 0u; index < count; ++index) {
+        const GpuSemanticWorkloadRetiredIssue *issue =
+            &s_retired_issue_scratch[index];
+        GpuRenderSemantic semantic = {0};
+
+        semantic.interpolation_identity = (GpuRenderInterpolationIdentity){
+            .scene_id = issue->scene_id,
+            .producer_id = issue->producer_id,
+            .primitive_id = issue->primitive_id,
+            .valid = 1u,
+        };
+        native_host_record_retired_failure(
+            (GlRendererRetiredFailureReason)issue->reason,
+            &semantic, issue->previous_order, issue->group_id,
+            issue->vertex_id, 0u, 0, 0);
+    }
+}
+
+static int native_host_retired_context(
+        const NativeHostSemanticHistory *history,
+        const GpuRenderSemantic *semantic, size_t previous_order,
+        size_t current_offset, size_t current_count,
+        int *out_base_x, int *out_slot) {
+    if (s_native_host_semantic_history_valid &&
+        previous_order < NATIVE_HOST_QUEUE_CAP &&
+        history[previous_order].valid &&
+        history[previous_order].semantic.interpolation_identity.scene_id ==
+            semantic->interpolation_identity.scene_id &&
+        history[previous_order].semantic.interpolation_identity.producer_id ==
+            semantic->interpolation_identity.producer_id &&
+        history[previous_order].semantic.interpolation_identity.primitive_id ==
+            semantic->interpolation_identity.primitive_id) {
+        *out_base_x = history[previous_order].base_x;
+        *out_slot = history[previous_order].slot;
+        return 1;
+    }
+    const int terrain = native_host_semantic_is_terrain(semantic);
+    const int world_model = native_host_semantic_is_world_model(semantic);
+    int found = 0;
+
+    if (!terrain && !world_model) return 0;
+    for (size_t current_index = 0u; current_index < current_count;
+         ++current_index) {
+        const size_t queue_index = current_offset + current_index;
+        const NativeHostQueuedSemantic *queued =
+            &s_native_host_queue[queue_index];
+        const GpuRenderSemantic *current = &queued->current;
+
+        if (queued->clear_margins || queued->phase_only ||
+            !current->interpolation_identity.valid ||
+            current->interpolation_identity.scene_id !=
+                semantic->interpolation_identity.scene_id ||
+            current->interpolation_identity.producer_id !=
+                semantic->interpolation_identity.producer_id)
+            continue;
+        if (!found) {
+            *out_base_x = queued->base_x;
+            *out_slot = queued->slot;
+            found = 1;
+        } else if (*out_base_x != queued->base_x ||
+                   *out_slot != queued->slot) {
+            return 0;
+        }
+    }
+    if (found) return 2;
+    if (!world_model) return 0;
+    for (size_t current_index = 0u; current_index < current_count;
+         ++current_index) {
+        const size_t queue_index = current_offset + current_index;
+        const NativeHostQueuedSemantic *queued =
+            &s_native_host_queue[queue_index];
+        const GpuRenderSemantic *current = &queued->current;
+
+        if (queued->clear_margins || queued->phase_only ||
+            !current->interpolation_identity.valid ||
+            current->interpolation_identity.scene_id !=
+                semantic->interpolation_identity.scene_id ||
+            !native_host_semantic_is_world_model(current))
+            continue;
+        if (!found) {
+            *out_base_x = queued->base_x;
+            *out_slot = queued->slot;
+            found = 1;
+        } else if (*out_base_x != queued->base_x ||
+                   *out_slot != queued->slot) {
+            return 0;
+        }
+    }
+    return found ? 3 : 0;
+}
+
 static GpuRenderTransactionStatus native_host_queue_insert_retired(
         size_t *in_out_count) {
     const size_t retired_count = gpu_semantic_workload_retired_count();
+    GpuSemanticWorkloadRetiredDiagnostics terrain = {0};
     const size_t current_count = *in_out_count;
     const size_t available = NATIVE_HOST_QUEUE_CAP - current_count;
     NativeHostSemanticHistory *history =
         s_native_host_semantic_history[
             s_native_host_semantic_history_index];
+    size_t current_positions[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    int retired_base_x[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    int retired_slot[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     size_t insert_count = 0u;
 
-    if (retired_count == 0u || !s_native_host_semantic_history_valid)
-        return GPU_RENDER_TRANSACTION_OK;
+    for (size_t retired_index = 0u; retired_index < retired_count;
+         ++retired_index)
+        current_positions[retired_index] = SIZE_MAX;
+    gpu_semantic_workload_retired_diagnostics(
+        UINT32_C(0x8009932c), &terrain);
+    native_host_record_workload_retired_issues();
+    s_native_midpoint_diag.retired_terrain_unmatched_count +=
+        terrain.unmatched;
+    s_native_midpoint_diag.retired_terrain_eligible_count +=
+        terrain.eligible;
+    s_native_midpoint_diag.retired_terrain_missing_current_geometry_count +=
+        terrain.unmatched - terrain.eligible;
+    s_native_midpoint_diag.retired_terrain_missing_anchor_count +=
+        terrain.missing_anchor;
+    s_native_midpoint_diag.retired_terrain_scene_mismatch_count +=
+        terrain.scene_mismatch;
+    s_native_midpoint_diag.retired_terrain_position_mode_mismatch_count +=
+        terrain.position_mode_mismatch;
+    s_native_midpoint_diag.retired_terrain_material_position_mismatch_count +=
+        terrain.material_position_mismatch;
+    s_native_midpoint_diag.retired_terrain_anchor_overflow_count +=
+        terrain.anchor_overflow;
+    if (terrain.missing_anchor != 0u &&
+        s_native_midpoint_diag.retired_terrain_missing_anchor_count ==
+            terrain.missing_anchor) {
+        s_native_midpoint_diag.first_retired_terrain_missing_primitive =
+            terrain.first_missing_primitive_id;
+        s_native_midpoint_diag.first_retired_terrain_missing_group =
+            terrain.first_missing_group_id;
+        s_native_midpoint_diag.first_retired_terrain_missing_vertex =
+            terrain.first_missing_vertex_id;
+    }
+    if (retired_count == 0u) return GPU_RENDER_TRANSACTION_OK;
+    s_native_midpoint_diag.retired_candidate_count += retired_count;
     for (size_t retired_index = 0u; retired_index < retired_count;
          ++retired_index) {
         GpuRenderSemantic semantic;
         size_t previous_order;
+        int world_model;
+        int terrain;
+        int base_x;
+        int slot;
+        int context_kind;
 
-        if (insert_count == available) break;
         if (gpu_semantic_workload_retired(
                 retired_index, &semantic, &previous_order) !=
-                    GPU_SEMANTIC_WORKLOAD_OK ||
-            previous_order >= NATIVE_HOST_QUEUE_CAP ||
-            !history[previous_order].valid ||
-            history[previous_order].semantic.interpolation_identity.scene_id !=
-                semantic.interpolation_identity.scene_id ||
-            history[previous_order].semantic.interpolation_identity.producer_id !=
-                semantic.interpolation_identity.producer_id ||
-            history[previous_order].semantic.interpolation_identity.primitive_id !=
-                semantic.interpolation_identity.primitive_id)
+                    GPU_SEMANTIC_WORKLOAD_OK)
             continue;
+        world_model = native_host_semantic_is_world_model(&semantic);
+        terrain = native_host_semantic_is_terrain(&semantic);
+        if (world_model)
+            ++s_native_midpoint_diag.retired_world_model_candidate_count;
+        if (terrain)
+            ++s_native_midpoint_diag.retired_terrain_candidate_count;
+        /* Terrain authors its own depth-cull candidates. Generic retirement
+         * rebuilds every missing triangle from anchors, including topology
+         * changes, which opens cracks between otherwise continuous tiles. */
+        if (terrain) continue;
+        context_kind = native_host_retired_context(
+            history, &semantic, previous_order, 0u, current_count,
+            &base_x, &slot);
+        if (context_kind == 0) {
+            ++s_native_midpoint_diag.retired_history_miss_count;
+            s_native_midpoint_diag.last_retired_history_miss_producer =
+                semantic.interpolation_identity.producer_id;
+            s_native_midpoint_diag.last_retired_history_miss_primitive =
+                semantic.interpolation_identity.primitive_id;
+            if (world_model)
+                ++s_native_midpoint_diag.retired_world_model_history_miss_count;
+            if (terrain)
+                ++s_native_midpoint_diag.retired_terrain_history_miss_count;
+            native_host_record_retired_failure(
+                GL_RETIRED_FAILURE_HISTORY_MISS, &semantic, previous_order,
+                0u, 0u, 0u, 0, 0);
+            continue;
+        }
+        if (context_kind == 2) {
+            ++s_native_midpoint_diag.retired_producer_history_recovery_count;
+            if (terrain)
+                ++s_native_midpoint_diag
+                    .retired_terrain_history_recovery_count;
+            if (world_model) {
+                ++s_native_midpoint_diag
+                    .retired_world_model_history_recovery_count;
+                ++s_native_midpoint_diag
+                    .retired_world_model_producer_context_recovery_count;
+            }
+        } else if (context_kind == 3) {
+            ++s_native_midpoint_diag.retired_producer_history_recovery_count;
+            if (world_model) {
+                ++s_native_midpoint_diag
+                    .retired_world_model_history_recovery_count;
+                ++s_native_midpoint_diag
+                    .retired_world_model_class_context_recovery_count;
+            }
+        }
+        if (insert_count == available) {
+            ++s_native_midpoint_diag.retired_capacity_miss_count;
+            native_host_record_retired_failure(
+                GL_RETIRED_FAILURE_CAPACITY, &semantic, previous_order,
+                0u, 0u, 0u, 0, 0);
+            continue;
+        }
+        current_positions[retired_index] = 0u;
+        retired_base_x[retired_index] = base_x;
+        retired_slot[retired_index] = slot;
+        for (size_t current_index = 0u; current_index < current_count;
+             ++current_index) {
+            const NativeHostQueuedSemantic *queued =
+                &s_native_host_queue[current_index];
+            const GpuRenderSemantic *current = &queued->current;
+            GpuSemanticWorkloadMatchInfo current_match = {0};
+
+            if (queued->clear_margins) {
+                current_positions[retired_index] = current_index + 1u;
+                continue;
+            }
+            if (!current->interpolation_identity.valid ||
+                gpu_semantic_workload_match_info(
+                    &current->interpolation_identity, &current_match) !=
+                        GPU_SEMANTIC_WORKLOAD_OK ||
+                !current_match.previous_order_valid ||
+                current_match.previous_order >= previous_order)
+                continue;
+            current_positions[retired_index] = current_index + 1u;
+        }
         ++insert_count;
     }
     if (insert_count == 0u) return GPU_RENDER_TRANSACTION_OK;
     memmove(&s_native_host_queue[insert_count], &s_native_host_queue[0],
             current_count * sizeof(s_native_host_queue[0]));
+    size_t current_index = 0u;
+    size_t retired_index = 0u;
     size_t inserted = 0u;
-    for (size_t retired_index = 0u; retired_index < retired_count;
-         ++retired_index) {
-        GpuRenderSemantic semantic;
-        size_t previous_order;
+    while (current_index <= current_count) {
+        while (retired_index < retired_count) {
+            GpuRenderSemantic semantic;
+            NativeHostQueuedSemantic queued;
+            size_t previous_order;
 
-        if (inserted == insert_count) break;
-        if (gpu_semantic_workload_retired(
-                retired_index, &semantic, &previous_order) !=
-                    GPU_SEMANTIC_WORKLOAD_OK ||
-            previous_order >= NATIVE_HOST_QUEUE_CAP ||
-            !history[previous_order].valid ||
-            history[previous_order].semantic.interpolation_identity.scene_id !=
-                semantic.interpolation_identity.scene_id ||
-            history[previous_order].semantic.interpolation_identity.producer_id !=
-                semantic.interpolation_identity.producer_id ||
-            history[previous_order].semantic.interpolation_identity.primitive_id !=
-                semantic.interpolation_identity.primitive_id)
-            continue;
-        NativeHostQueuedSemantic *queued =
-            &s_native_host_queue[inserted];
-        *queued = (NativeHostQueuedSemantic){
-            .current = semantic,
-            .base_x = history[previous_order].base_x,
-            .slot = history[previous_order].slot,
-            .midpoint_valid = 1,
-            .phase_only = 1,
-        };
-        if (gpu_semantic_workload_retired_phases(
-                retired_index, s_native_interpolation_phase_count + 1u,
-                &queued->midpoint, s_native_interpolation_phase_count,
-                &previous_order) != GPU_SEMANTIC_WORKLOAD_OK)
-            continue;
-        ++inserted;
+            if (current_positions[retired_index] == SIZE_MAX) {
+                ++retired_index;
+                continue;
+            }
+            if (current_positions[retired_index] > current_index) break;
+            if (gpu_semantic_workload_retired(
+                    retired_index, &semantic, &previous_order) !=
+                        GPU_SEMANTIC_WORKLOAD_OK) {
+                ++retired_index;
+                continue;
+            }
+            queued = (NativeHostQueuedSemantic){
+                .current = semantic,
+                .base_x = retired_base_x[retired_index],
+                .slot = retired_slot[retired_index],
+                .midpoint_valid = 1,
+                .phase_only = 1,
+                .phase_visibility_mask = UINT8_MAX,
+            };
+            if (gpu_semantic_workload_retired_phases(
+                    retired_index, s_native_interpolation_phase_count + 1u,
+                    &queued.midpoint, s_native_interpolation_phase_count,
+                    &previous_order) != GPU_SEMANTIC_WORKLOAD_OK) {
+                ++s_native_midpoint_diag.retired_phase_failure_count;
+                s_native_midpoint_diag.last_retired_phase_failure_producer =
+                    semantic.interpolation_identity.producer_id;
+                s_native_midpoint_diag.last_retired_phase_failure_primitive =
+                    semantic.interpolation_identity.primitive_id;
+                native_host_record_retired_failure(
+                    GL_RETIRED_FAILURE_PHASE, &semantic, previous_order,
+                    0u, 0u, 0u, 0, 0);
+                ++retired_index;
+                continue;
+            }
+            s_native_host_queue[current_index + inserted] = queued;
+            if (native_host_semantic_is_world_model(&semantic))
+                ++s_native_midpoint_diag.retired_world_model_inserted_count;
+            if (native_host_semantic_is_terrain(&semantic))
+                ++s_native_midpoint_diag.retired_terrain_inserted_count;
+            ++inserted;
+            ++retired_index;
+        }
+        if (current_index < current_count)
+            s_native_host_queue[current_index + inserted] =
+                s_native_host_queue[insert_count + current_index];
+        ++current_index;
     }
-    if (inserted != insert_count)
-        memmove(&s_native_host_queue[inserted],
-                &s_native_host_queue[insert_count],
-                current_count * sizeof(s_native_host_queue[0]));
     *in_out_count = current_count + inserted;
+    s_native_midpoint_diag.retired_inserted_count += inserted;
     return GPU_RENDER_TRANSACTION_OK;
 }
 
@@ -9927,7 +10602,6 @@ static GpuRenderTransactionStatus native_host_queue_prepare_present(
     if (s_native_host_queue_flushing || count == 0u)
         return GPU_RENDER_TRANSACTION_OK;
     s_native_host_queue_last_present_count = count;
-    native_host_queue_snapshot_present(count);
     native_host_queue_capture_history(count, next_history_index);
     if (use_midpoint) {
         status = native_host_queue_insert_retired(&count);
@@ -9936,7 +10610,10 @@ static GpuRenderTransactionStatus native_host_queue_prepare_present(
             return status;
         }
         s_native_host_queue_count = count;
+        if (s_native_interpolation_phase_count == 1u)
+            native_host_queue_merge_temporal_phases(count);
     }
+    native_host_queue_snapshot_present(count);
     s_native_host_semantic_history_index = next_history_index;
     s_native_host_semantic_history_valid = 1;
     s_native_host_queue_flushing = 1;
@@ -10013,6 +10690,9 @@ static GpuRenderTransactionStatus native_host_queue_push(
     queued->clear_margins = 0;
     queued->midpoint_valid = phase_semantics != NULL;
     queued->phase_only = 0;
+    queued->temporal_order_valid = 0;
+    queued->phase_visibility_mask = 0u;
+    memset(queued->phase_order, 0, sizeof(queued->phase_order));
     return GPU_RENDER_TRANSACTION_OK;
 }
 
@@ -10039,6 +10719,9 @@ static GpuRenderTransactionStatus native_host_queue_push_margin_clear(
     queued->clear_margins = 1;
     queued->midpoint_valid = midpoint_valid;
     queued->phase_only = 0;
+    queued->temporal_order_valid = 0;
+    queued->phase_visibility_mask = 0u;
+    memset(queued->phase_order, 0, sizeof(queued->phase_order));
     return GPU_RENDER_TRANSACTION_OK;
 }
 
@@ -10067,21 +10750,16 @@ void gl_renderer_semantic_producer_diag(
     GlRendererSemanticProducerDiagnostics diagnostics = {
         .producer_id = producer_id,
     };
-    const size_t retired_count = gpu_semantic_workload_retired_count();
+    GpuSemanticWorkloadRetiredDiagnostics retired = {0};
 
     if (out_diagnostics == NULL) return;
+    gpu_semantic_workload_retired_diagnostics(
+        producer_id, &retired);
+    diagnostics.retired_unmatched = retired.unmatched;
+    diagnostics.retired_candidates = retired.eligible;
+    diagnostics.retired_missing_current_geometry =
+        retired.unmatched - retired.eligible;
     memset(s_producer_diag_vertices, 0, sizeof(s_producer_diag_vertices));
-    for (size_t retired_index = 0u; retired_index < retired_count;
-         ++retired_index) {
-        GpuRenderSemantic retired;
-        size_t previous_order;
-
-        if (gpu_semantic_workload_retired(
-                retired_index, &retired, &previous_order) ==
-                    GPU_SEMANTIC_WORKLOAD_OK &&
-            retired.interpolation_identity.producer_id == producer_id)
-            ++diagnostics.retired_candidates;
-    }
     const size_t queue_count = s_native_host_queue_count != 0u
         ? s_native_host_queue_count : s_native_host_queue_last_present_count;
     for (size_t queue_index = 0u; queue_index < queue_count;
@@ -10268,6 +10946,29 @@ size_t gl_renderer_semantic_producer_items(
     return emitted;
 }
 
+size_t gl_renderer_retired_failure_events(
+        GlRendererRetiredFailureEvent *out_events, size_t capacity) {
+    const size_t stored = s_retired_failure_event_count <
+            RETIRED_FAILURE_EVENT_CAP
+        ? (size_t)s_retired_failure_event_count
+        : RETIRED_FAILURE_EVENT_CAP;
+    const size_t count = capacity < stored ? capacity : stored;
+
+    if (out_events == NULL && capacity != 0u) return 0u;
+    if (count != 0u)
+        memcpy(out_events, s_retired_failure_events,
+               count * sizeof(*out_events));
+    return count;
+}
+
+uint64_t gl_renderer_retired_failure_event_total(void) {
+    return s_retired_failure_event_count;
+}
+
+uint64_t gl_renderer_retired_failure_event_overflow(void) {
+    return s_retired_failure_event_overflow;
+}
+
 static GpuRenderTransactionStatus glb_draw_semantic(
         GpuRenderTransactionId transaction_id,
         const GpuRenderSemantic *semantic) {
@@ -10386,6 +11087,109 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
         base_x, slot);
     if (status != GPU_RENDER_TRANSACTION_OK)
         gl_renderer_native_midpoint_cancel();
+    return status;
+}
+
+static GpuRenderTransactionStatus glb_draw_semantic_temporal_candidate(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderTemporalCullPolicy *policy) {
+    GpuRenderSemantic phases[NATIVE_INTERPOLATION_MAX_PHASES];
+    GpuRenderTransactionStatus status;
+    GpuSemanticWorkloadStatus workload_status;
+    uint8_t phase_visibility_mask = 0u;
+    uint32_t phase_order[NATIVE_INTERPOLATION_MAX_PHASES] = {0};
+    GpuSemanticWorkloadDiagnostics workload_diagnostics;
+    GpuRenderSemantic previous;
+    size_t workload_count_before;
+    uint32_t previous_order;
+    int generate_phases;
+    int base_x;
+    int slot;
+
+    if (semantic == NULL || policy == NULL)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    ++s_native_midpoint_diag.temporal_candidate_count;
+    if ((policy->flags & GPU_RENDER_TEMPORAL_FORCE_PHASES) == 0u)
+        return GPU_RENDER_TRANSACTION_OK;
+    if (!glb_transaction_context_ready())
+        return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
+    if (!glb_transaction_interpolation_quiesced())
+        return GPU_RENDER_TRANSACTION_STATE_REJECTED;
+    if (!s_native_view_enabled) return GPU_RENDER_TRANSACTION_OK;
+    if (!s_native_midpoint_diag.frame_open &&
+        !s_native_midpoint_diag.suspended &&
+        !s_native_midpoint_frame_blocked &&
+        !gl_renderer_native_midpoint_begin())
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (!s_native_midpoint_diag.frame_open ||
+        !s_native_midpoint_diag.frame_valid)
+        return GPU_RENDER_TRANSACTION_OK;
+    generate_phases =
+        (policy->flags & GPU_RENDER_TEMPORAL_FORCE_PHASES) != 0u ||
+        (gpu_semantic_workload_previous(
+            &semantic->interpolation_identity, &previous) ==
+                GPU_SEMANTIC_WORKLOAD_OK &&
+        native_host_temporal_phase_visible(
+            &previous, policy, &previous_order));
+    gpu_semantic_workload_diagnostics(&workload_diagnostics);
+    workload_count_before = workload_diagnostics.current_count;
+    workload_status = generate_phases
+        ? gpu_semantic_workload_record_phases(
+            semantic, s_native_interpolation_denominator,
+            phases, s_native_interpolation_phase_count)
+        : gpu_semantic_workload_record_endpoint(semantic);
+    gpu_semantic_workload_diagnostics(&workload_diagnostics);
+    if (workload_diagnostics.current_count >
+        s_native_midpoint_diag.temporal_candidate_peak_workload_count)
+        s_native_midpoint_diag.temporal_candidate_peak_workload_count =
+            workload_diagnostics.current_count;
+    if (workload_status != GPU_SEMANTIC_WORKLOAD_OK) {
+        if (workload_status == GPU_SEMANTIC_WORKLOAD_CONFLICT &&
+            workload_diagnostics.current_count > workload_count_before) {
+            ++s_native_midpoint_diag.temporal_candidate_duplicate_count;
+            ++s_native_midpoint_diag
+                  .temporal_candidate_identity_collision_count;
+        }
+        if (s_native_midpoint_diag.temporal_candidate_record_failure_count ==
+            0u) {
+            s_native_midpoint_diag.temporal_candidate_first_failure_status =
+                (uint32_t)workload_status;
+            s_native_midpoint_diag
+                .temporal_candidate_first_failure_workload_count =
+                    workload_diagnostics.current_count;
+            s_native_midpoint_diag.temporal_candidate_first_failure_producer =
+                semantic->interpolation_identity.producer_id;
+            s_native_midpoint_diag.temporal_candidate_first_failure_primitive =
+                semantic->interpolation_identity.primitive_id;
+        }
+        ++s_native_midpoint_diag.temporal_candidate_record_failure_count;
+        return GPU_RENDER_TRANSACTION_OK;
+    }
+    ++s_native_midpoint_diag.temporal_candidate_recorded_count;
+    if (!generate_phases) return GPU_RENDER_TRANSACTION_OK;
+    for (unsigned int phase = 0u;
+         phase < s_native_interpolation_phase_count; ++phase) {
+        if (!native_host_temporal_phase_visible(
+                &phases[phase], policy, &phase_order[phase]))
+            continue;
+        phase_visibility_mask |= (uint8_t)(1u << phase);
+    }
+    if (phase_visibility_mask == 0u)
+        return GPU_RENDER_TRANSACTION_OK;
+    ++s_native_midpoint_diag.temporal_candidate_visible_count;
+    base_x = glb_native_view_semantic_target_base(semantic);
+    slot = native_view_prepare_surface(base_x);
+    if (slot < 0) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
+    status = native_host_queue_push(semantic, phases, base_x, slot);
+    if (status == GPU_RENDER_TRANSACTION_OK) {
+        NativeHostQueuedSemantic *queued =
+            &s_native_host_queue[s_native_host_queue_count - 1u];
+
+        queued->phase_only = 1;
+        queued->temporal_order_valid = 1;
+        queued->phase_visibility_mask = phase_visibility_mask;
+        memcpy(queued->phase_order, phase_order, sizeof(queued->phase_order));
+    }
     return status;
 }
 
@@ -10744,7 +11548,9 @@ static const GpuRenderBackend GL_BACKEND = {
     .native_fill_rect = glb_native_fill_rect,
     .native_copy_rect = glb_native_copy_rect,
     .stream_barrier = glb_stream_barrier,
-     .draw_semantic_immediate = glb_draw_semantic_immediate,
+       .draw_semantic_immediate = glb_draw_semantic_immediate,
+       .draw_semantic_temporal_candidate =
+           glb_draw_semantic_temporal_candidate,
        .record_interpolation_anchors =
            gl_renderer_record_interpolation_anchors,
       .render_display = glb_render_display, .render_display_hires = glb_render_display_hires,

@@ -39,6 +39,35 @@ bool destination_exists(const char* path) {
 #endif
 }
 
+const char* retired_failure_name(uint32_t reason) {
+    switch ((GlRendererRetiredFailureReason)reason) {
+    case GL_RETIRED_FAILURE_MISSING_ANCHOR: return "missing_anchor";
+    case GL_RETIRED_FAILURE_SCENE_MISMATCH: return "scene_mismatch";
+    case GL_RETIRED_FAILURE_POSITION_MODE_MISMATCH:
+        return "position_mode_mismatch";
+    case GL_RETIRED_FAILURE_MATERIAL_POSITION_MISMATCH:
+        return "material_position_mismatch";
+    case GL_RETIRED_FAILURE_ANCHOR_OVERFLOW: return "anchor_overflow";
+    case GL_RETIRED_FAILURE_HISTORY_MISS: return "history_miss";
+    case GL_RETIRED_FAILURE_CAPACITY: return "capacity";
+    case GL_RETIRED_FAILURE_PHASE: return "phase";
+    case GL_RETIRED_FAILURE_MIDPOINT_ZERO_AREA: return "midpoint_zero_area";
+    case GL_RETIRED_FAILURE_MIDPOINT_EXTENT_COLLAPSE:
+        return "midpoint_extent_collapse";
+    case GL_RETIRED_FAILURE_MIDPOINT_WINDING_FLIP:
+        return "midpoint_winding_flip";
+    case GL_RETIRED_FAILURE_FRONT_ORDER_DISPLACEMENT:
+        return "front_order_displacement";
+    case GL_RETIRED_FAILURE_MIDPOINT_VERTEX_CONFLICT:
+        return "midpoint_vertex_conflict";
+    case GL_RETIRED_FAILURE_MIDPOINT_FIXED_ZERO_AREA:
+        return "midpoint_fixed_zero_area";
+    case GL_RETIRED_FAILURE_MIDPOINT_FIXED_WINDING_FLIP:
+        return "midpoint_fixed_winding_flip";
+    default: return "unknown";
+    }
+}
+
 struct Pad {
     std::vector<std::string> buttons;
     std::array<int16_t, SDL_CONTROLLER_AXIS_MAX> axes{};
@@ -1641,6 +1670,14 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     bool render_bridge_snapshot_valid = false;
     GuestRenderNativeStreamSnapshot native_stream{};
     GlRendererNativeMidpointDiagnostics native_midpoint{};
+    std::vector<GlRendererRetiredFailureEvent> retired_failure_events;
+    std::array<uint64_t,
+               GL_RETIRED_FAILURE_MIDPOINT_FIXED_WINDING_FLIP + 1u>
+        retired_failure_reason_counts{};
+    const uint64_t retired_failure_total =
+        gl_renderer_retired_failure_event_total();
+    const uint64_t retired_failure_overflow =
+        gl_renderer_retired_failure_event_overflow();
     uint64_t native_rate_midpoint_presents = 0u;
     uint64_t native_rate_current_presents = 0u;
     uint64_t native_peak_midpoint_presents = 0u;
@@ -1650,6 +1687,12 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     uint32_t native_peak_window_ms = 0u;
     (void)guest_render_native_stream_snapshot(&native_stream);
     gl_renderer_native_midpoint_diag(&native_midpoint);
+    retired_failure_events.resize((size_t)retired_failure_total);
+    retired_failure_events.resize(gl_renderer_retired_failure_events(
+        retired_failure_events.data(), retired_failure_events.size()));
+    for (const GlRendererRetiredFailureEvent& event : retired_failure_events)
+        if (event.reason < retired_failure_reason_counts.size())
+            ++retired_failure_reason_counts[event.reason];
     {
         const uint64_t total = gl_renderer_pres_total();
         const uint64_t first = total > 4096u ? total - 4096u : 0u;
@@ -2302,9 +2345,76 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
              << ",\"peak_window_ms\":" << native_peak_window_ms
              << ",\"peak_midpoint_presents\":"
              << native_peak_midpoint_presents
-             << ",\"peak_current_presents\":"
-             << native_peak_current_presents
-             << ",\"workload_total_matched\":"
+              << ",\"peak_current_presents\":"
+              << native_peak_current_presents
+              << ",\"retired_candidates\":"
+              << native_midpoint.retired_candidate_count
+              << ",\"retired_inserted\":"
+              << native_midpoint.retired_inserted_count
+              << ",\"retired_history_misses\":"
+              << native_midpoint.retired_history_miss_count
+              << ",\"retired_capacity_misses\":"
+              << native_midpoint.retired_capacity_miss_count
+              << ",\"retired_phase_failures\":"
+              << native_midpoint.retired_phase_failure_count
+              << ",\"retired_producer_history_recoveries\":"
+              << native_midpoint.retired_producer_history_recovery_count
+              << ",\"retired_world_model_candidates\":"
+              << native_midpoint.retired_world_model_candidate_count
+              << ",\"retired_world_model_inserted\":"
+              << native_midpoint.retired_world_model_inserted_count
+              << ",\"retired_world_model_history_misses\":"
+              << native_midpoint.retired_world_model_history_miss_count
+              << ",\"retired_world_model_history_recoveries\":"
+              << native_midpoint.retired_world_model_history_recovery_count
+              << ",\"retired_world_model_producer_context_recoveries\":"
+              << native_midpoint
+                     .retired_world_model_producer_context_recovery_count
+              << ",\"retired_world_model_class_context_recoveries\":"
+              << native_midpoint
+                     .retired_world_model_class_context_recovery_count
+              << ",\"retired_terrain_unmatched\":"
+              << native_midpoint.retired_terrain_unmatched_count
+              << ",\"retired_terrain_eligible\":"
+              << native_midpoint.retired_terrain_eligible_count
+              << ",\"retired_terrain_missing_current_geometry\":"
+              << native_midpoint
+                     .retired_terrain_missing_current_geometry_count
+              << ",\"retired_terrain_missing_anchors\":"
+              << native_midpoint.retired_terrain_missing_anchor_count
+              << ",\"retired_terrain_scene_mismatches\":"
+              << native_midpoint.retired_terrain_scene_mismatch_count
+              << ",\"retired_terrain_position_mode_mismatches\":"
+              << native_midpoint
+                     .retired_terrain_position_mode_mismatch_count
+              << ",\"retired_terrain_material_position_mismatches\":"
+              << native_midpoint
+                     .retired_terrain_material_position_mismatch_count
+              << ",\"retired_terrain_anchor_overflows\":"
+              << native_midpoint.retired_terrain_anchor_overflow_count
+              << ",\"retired_terrain_candidates\":"
+              << native_midpoint.retired_terrain_candidate_count
+              << ",\"retired_terrain_inserted\":"
+              << native_midpoint.retired_terrain_inserted_count
+              << ",\"retired_terrain_history_misses\":"
+              << native_midpoint.retired_terrain_history_miss_count
+              << ",\"retired_terrain_history_recoveries\":"
+              << native_midpoint.retired_terrain_history_recovery_count
+              << ",\"first_retired_terrain_missing_primitive\":"
+              << native_midpoint.first_retired_terrain_missing_primitive
+              << ",\"first_retired_terrain_missing_group\":"
+              << native_midpoint.first_retired_terrain_missing_group
+              << ",\"first_retired_terrain_missing_vertex\":"
+              << native_midpoint.first_retired_terrain_missing_vertex
+              << ",\"last_retired_phase_failure_producer\":"
+              << native_midpoint.last_retired_phase_failure_producer
+              << ",\"last_retired_phase_failure_primitive\":"
+              << native_midpoint.last_retired_phase_failure_primitive
+              << ",\"last_retired_history_miss_producer\":"
+              << native_midpoint.last_retired_history_miss_producer
+              << ",\"last_retired_history_miss_primitive\":"
+              << native_midpoint.last_retired_history_miss_primitive
+              << ",\"workload_total_matched\":"
              << native_midpoint.workload_total_matched
              << ",\"workload_total_snapped\":"
              << native_midpoint.workload_total_snapped
@@ -2372,11 +2482,45 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
               << ",\"workload_total_midpoint_collapsed_vertices\":"
              << native_midpoint.workload_total_midpoint_collapsed_vertices
               << ",\"workload_total_midpoint_formula_failures\":"
-              << native_midpoint.workload_total_midpoint_formula_failures
+             << native_midpoint.workload_total_midpoint_formula_failures
               << ",\"workload_total_projective_phase_vertices\":"
-              << native_midpoint.workload_total_projective_phase_vertices
-             << ",\"cancelled_frames\":"
+             << native_midpoint.workload_total_projective_phase_vertices
+              << ",\"temporal_candidates\":"
+              << native_midpoint.temporal_candidate_count
+              << ",\"temporal_candidates_recorded\":"
+              << native_midpoint.temporal_candidate_recorded_count
+              << ",\"temporal_candidates_visible\":"
+              << native_midpoint.temporal_candidate_visible_count
+              << ",\"temporal_candidate_record_failures\":"
+              << native_midpoint.temporal_candidate_record_failure_count
+              << ",\"temporal_candidate_duplicates\":"
+              << native_midpoint.temporal_candidate_duplicate_count
+              << ",\"temporal_candidate_identity_collisions\":"
+              << native_midpoint.temporal_candidate_identity_collision_count
+              << ",\"temporal_candidate_peak_workload\":"
+              << native_midpoint.temporal_candidate_peak_workload_count
+              << ",\"temporal_candidate_first_failure\":{\"status\":"
+              << native_midpoint.temporal_candidate_first_failure_status
+              << ",\"workload_count\":"
+              << native_midpoint.temporal_candidate_first_failure_workload_count
+              << ",\"producer\":"
+              << native_midpoint.temporal_candidate_first_failure_producer
+              << ",\"primitive\":"
+              << native_midpoint.temporal_candidate_first_failure_primitive
+              << "}"
+              << ",\"cancelled_frames\":"
              << native_midpoint.cancelled_frames
+              << ",\"cancel_reasons\":{\"generic\":"
+              << native_midpoint.cancel_reason_counts[
+                     GL_NATIVE_MIDPOINT_CANCEL_GENERIC]
+              << ",\"workload_record\":"
+              << native_midpoint.cancel_reason_counts[
+                     GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD]
+              << "}"
+              << ",\"last_cancel_status\":"
+              << native_midpoint.last_cancel_status
+              << ",\"last_cancel_workload_current\":"
+              << native_midpoint.last_cancel_workload_current
              << ",\"gl_error_count\":" << native_midpoint.gl_error_count
              << ",\"reset_total\":" << native_midpoint.reset_count
              << ",\"reset_with_previous\":"
@@ -2440,13 +2584,74 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
              << ",\"y\":" << native_midpoint.last_pending_y
              << ",\"width\":" << native_midpoint.last_pending_width
              << ",\"height\":" << native_midpoint.last_pending_height
-             << "},\"last_present_rect\":{\"slot\":"
+              << "},\"last_present_rect\":{\"slot\":"
              << native_midpoint.last_present_slot
              << ",\"x\":" << native_midpoint.last_present_x
              << ",\"y\":" << native_midpoint.last_present_y
              << ",\"width\":" << native_midpoint.last_present_width
-             << ",\"height\":" << native_midpoint.last_present_height
-             << "}},\"context\":{\"valid\":" << (replay.snapshot.valid_field ? "true" : "false") << ",\"id\":" << replay.snapshot.masked_field_id << ",\"raw_id\":" << replay.snapshot.raw_field_id << ",\"progress\":" << replay.snapshot.game_progress << ",\"requested_module\":" << replay.snapshot.requested_module << ",\"active_module\":" << replay.snapshot.active_module << "},\"media\":{\"fmv_active\":" << (replay.media.fmv_active ? "true" : "false") << ",\"xa_streaming\":" << (replay.media.xa_streaming ? "true" : "false") << ",\"mdec_decode_count\":" << replay.media.mdec_decode_count << "},\"media_observation\":{\"samples\":" << replay.media_samples << ",\"fmv_seen\":" << (replay.fmv_seen ? "true" : "false") << ",\"fmv_active_samples\":" << replay.fmv_active_samples << ",\"fmv_first_vblank\":" << replay.fmv_first_vblank << ",\"fmv_last_vblank\":" << replay.fmv_last_vblank << ",\"xa_seen\":" << (replay.xa_seen ? "true" : "false") << ",\"xa_streaming_samples\":" << replay.xa_streaming_samples << ",\"xa_first_vblank\":" << replay.xa_first_vblank << ",\"xa_last_vblank\":" << replay.xa_last_vblank << ",\"first_mdec_decode_count\":" << replay.first_mdec_decode_count << ",\"max_mdec_decode_count\":" << replay.max_mdec_decode_count << "},\"loader\":{\"active\":" << replay.loader.overlay_active << ",\"registered\":" << replay.loader.overlay_registered << ",\"regions_checked\":" << replay.loader.overlay_regions_checked << ",\"file_found\":" << replay.loader.overlay_file_found << "},\"cd\":{\"has_disc\":" << replay.loader.cd_has_disc << ",\"reading\":" << replay.loader.cd_reading << ",\"sector_available\":" << replay.loader.cd_sector_available << ",\"pending_pending\":" << replay.loader.cd_pending_pending << ",\"pending_cmd\":" << (unsigned)replay.loader.cd_pending_cmd << ",\"queued_cmd\":" << (unsigned)replay.loader.cd_queued_cmd << "},\"semantic_overflow\":" << (replay.semantic_overflow ? "true" : "false") << ",\"semantic_transitions\":[";
+              << ",\"height\":" << native_midpoint.last_present_height
+              << "}},\"retired_failures\":{\"total\":"
+              << retired_failure_total
+              << ",\"stored\":" << retired_failure_events.size()
+              << ",\"telemetry_overflow\":" << retired_failure_overflow
+              << ",\"reason_counts\":{\"missing_anchor\":"
+              << retired_failure_reason_counts[GL_RETIRED_FAILURE_MISSING_ANCHOR]
+              << ",\"scene_mismatch\":"
+              << retired_failure_reason_counts[GL_RETIRED_FAILURE_SCENE_MISMATCH]
+              << ",\"position_mode_mismatch\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_POSITION_MODE_MISMATCH]
+              << ",\"material_position_mismatch\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MATERIAL_POSITION_MISMATCH]
+              << ",\"anchor_overflow\":"
+              << retired_failure_reason_counts[GL_RETIRED_FAILURE_ANCHOR_OVERFLOW]
+              << ",\"history_miss\":"
+              << retired_failure_reason_counts[GL_RETIRED_FAILURE_HISTORY_MISS]
+              << ",\"capacity\":"
+              << retired_failure_reason_counts[GL_RETIRED_FAILURE_CAPACITY]
+              << ",\"phase\":"
+              << retired_failure_reason_counts[GL_RETIRED_FAILURE_PHASE]
+              << ",\"midpoint_zero_area\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MIDPOINT_ZERO_AREA]
+              << ",\"midpoint_extent_collapse\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MIDPOINT_EXTENT_COLLAPSE]
+              << ",\"midpoint_winding_flip\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MIDPOINT_WINDING_FLIP]
+              << ",\"front_order_displacement\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_FRONT_ORDER_DISPLACEMENT]
+              << ",\"midpoint_vertex_conflict\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MIDPOINT_VERTEX_CONFLICT]
+              << ",\"midpoint_fixed_zero_area\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MIDPOINT_FIXED_ZERO_AREA]
+              << ",\"midpoint_fixed_winding_flip\":"
+              << retired_failure_reason_counts[
+                     GL_RETIRED_FAILURE_MIDPOINT_FIXED_WINDING_FLIP]
+              << "},\"events\":[";
+    for (size_t index = 0u; index < retired_failure_events.size(); ++index) {
+        const GlRendererRetiredFailureEvent& event =
+            retired_failure_events[index];
+        output << (index != 0u ? "," : "")
+               << "{\"frame\":" << event.frame
+               << ",\"reason\":\"" << retired_failure_name(event.reason)
+               << "\",\"reason_id\":" << event.reason
+               << ",\"scene\":" << event.scene_id
+               << ",\"producer\":" << event.producer_id
+               << ",\"primitive\":" << event.primitive_id
+               << ",\"group\":" << event.group_id
+               << ",\"vertex\":" << event.vertex_id
+               << ",\"previous_order\":" << event.previous_order
+               << ",\"auxiliary\":" << event.auxiliary
+               << ",\"value_a\":" << event.value_a
+               << ",\"value_b\":" << event.value_b << "}";
+    }
+    output << "]},\"context\":{\"valid\":" << (replay.snapshot.valid_field ? "true" : "false") << ",\"id\":" << replay.snapshot.masked_field_id << ",\"raw_id\":" << replay.snapshot.raw_field_id << ",\"progress\":" << replay.snapshot.game_progress << ",\"requested_module\":" << replay.snapshot.requested_module << ",\"active_module\":" << replay.snapshot.active_module << "},\"media\":{\"fmv_active\":" << (replay.media.fmv_active ? "true" : "false") << ",\"xa_streaming\":" << (replay.media.xa_streaming ? "true" : "false") << ",\"mdec_decode_count\":" << replay.media.mdec_decode_count << "},\"media_observation\":{\"samples\":" << replay.media_samples << ",\"fmv_seen\":" << (replay.fmv_seen ? "true" : "false") << ",\"fmv_active_samples\":" << replay.fmv_active_samples << ",\"fmv_first_vblank\":" << replay.fmv_first_vblank << ",\"fmv_last_vblank\":" << replay.fmv_last_vblank << ",\"xa_seen\":" << (replay.xa_seen ? "true" : "false") << ",\"xa_streaming_samples\":" << replay.xa_streaming_samples << ",\"xa_first_vblank\":" << replay.xa_first_vblank << ",\"xa_last_vblank\":" << replay.xa_last_vblank << ",\"first_mdec_decode_count\":" << replay.first_mdec_decode_count << ",\"max_mdec_decode_count\":" << replay.max_mdec_decode_count << "},\"loader\":{\"active\":" << replay.loader.overlay_active << ",\"registered\":" << replay.loader.overlay_registered << ",\"regions_checked\":" << replay.loader.overlay_regions_checked << ",\"file_found\":" << replay.loader.overlay_file_found << "},\"cd\":{\"has_disc\":" << replay.loader.cd_has_disc << ",\"reading\":" << replay.loader.cd_reading << ",\"sector_available\":" << replay.loader.cd_sector_available << ",\"pending_pending\":" << replay.loader.cd_pending_pending << ",\"pending_cmd\":" << (unsigned)replay.loader.cd_pending_cmd << ",\"queued_cmd\":" << (unsigned)replay.loader.cd_queued_cmd << "},\"semantic_overflow\":" << (replay.semantic_overflow ? "true" : "false") << ",\"semantic_transitions\":[";
     for (size_t index = 0; index < replay.semantic_transitions.size(); ++index) {
         const SemanticTransition& transition = replay.semantic_transitions[index];
         output << (index ? "," : "") << "{\"vblank\":" << transition.vblank
@@ -3025,6 +3230,20 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
              << ",\"position_z\":" << terrain_water_shadow.last_position_z
              << ",\"projection_distance\":"
              << terrain_water_shadow.last_projection_distance
+             << ",\"mesh_duplicate_vertices\":"
+             << terrain_water_shadow.mesh_duplicate_vertices
+             << ",\"mesh_cross_tile_duplicate_vertices\":"
+             << terrain_water_shadow.mesh_cross_tile_duplicate_vertices
+             << ",\"mesh_canonical_raster_conflicts\":"
+             << terrain_water_shadow.mesh_canonical_raster_conflicts
+             << ",\"mesh_native_raster_conflicts\":"
+             << terrain_water_shadow.mesh_native_raster_conflicts
+             << ",\"mesh_cross_tile_native_raster_conflicts\":"
+             << terrain_water_shadow.mesh_cross_tile_native_raster_conflicts
+             << ",\"build_shared_duplicate_vertices\":"
+             << terrain_water_shadow.build_diagnostics.shared_duplicate_vertices
+             << ",\"build_shared_raster_conflicts\":"
+             << terrain_water_shadow.build_diagnostics.shared_raster_conflicts
              << ",\"blocker_detail\":" << terrain_water_shadow.blocker_detail
              << ",\"blocker\":" << terrain_water_shadow.blocker
              << ",\"pending\":"
@@ -3348,6 +3567,46 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
               << models_native.native_cutover_count
               << ",\"native_primitives\":"
               << models_native.native_primitive_count
+              << ",\"native_failures\":"
+              << models_native.native_failure_count
+              << ",\"first_failure_stage\":"
+              << models_native.first_failure_stage
+              << ",\"first_failure_detail\":"
+              << models_native.first_failure_detail
+              << ",\"first_anchor_count\":"
+              << models_native.first_anchor_count
+              << ",\"last_failure_stage\":"
+              << models_native.last_failure_stage
+              << ",\"last_failure_detail\":"
+              << models_native.last_failure_detail
+              << ",\"last_anchor_count\":"
+              << models_native.last_anchor_count
+              << ",\"packet_copy_begin_count\":"
+              << models_native.packet_copy_begin_count
+              << ",\"packet_copy_finish_count\":"
+              << models_native.packet_copy_finish_count
+              << ",\"packet_copy_template_count\":"
+              << models_native.packet_copy_template_count
+              << ",\"packet_copy_failure_detail\":"
+              << models_native.packet_copy_failure_detail
+              << ",\"packet_copy_last_destination\":"
+              << models_native.packet_copy_last_destination
+              << ",\"packet_copy_last_source\":"
+              << models_native.packet_copy_last_source
+              << ",\"packet_copy_last_size\":"
+              << models_native.packet_copy_last_size
+              << ",\"packet_copy_range_count\":"
+              << models_native.packet_copy_range_count
+              << ",\"first_missing_model_address\":"
+              << models_native.first_missing_model_address
+              << ",\"first_missing_packet_base\":"
+              << models_native.first_missing_packet_base
+              << ",\"first_missing_packet_address\":"
+              << models_native.first_missing_packet_address
+              << ",\"first_missing_copy_range_kind\":"
+              << models_native.first_missing_copy_range_kind
+              << ",\"first_missing_copy_range_index\":"
+              << models_native.first_missing_copy_range_index
               << "},\"world_actor_sprites\":{\"native_cutovers\":"
               << actor_sprites_native.native_cutover_count
               << ",\"native_primitives\":"

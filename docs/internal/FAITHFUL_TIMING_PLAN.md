@@ -213,6 +213,153 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-17 (Terrain Z-motion polygon gaps fixed without regressing lateral
+  depth culling; user-confirmed):** The forward/back replay exposed gaps between
+  mountain polygons only on generated interpolation frames. Endpoint continuity
+  was clean: the visible and unculled meshes reported zero canonical, Native,
+  cross-tile, and build raster conflicts, with no missing anchors or geometry
+  mismatches. The fault was generic retired-mesh reconstruction: it treated every
+  missing Terrain triangle as retirable and rebuilt it from anchors even though
+  Terrain already authors depth-only temporal candidates. Disabling Terrain
+  insertion in `native_host_queue_insert_retired()` removed the Z gaps; the user
+  then confirmed both the 3,046-VBlank forward/back replay and the lateral replay
+  visually clean. Keep the validated candidate band at `max_depth < 0x0f80` with
+  phase visibility `< 0x0f00`. Do not deduplicate an already-recorded temporal
+  candidate to avoid the observed 76 workload conflicts: that makes conflicted
+  frames seal, exposes invalid temporal coverage, and reproducibly restores the
+  lateral depth-cull artifact. Focused semantic-workload, OpenGL mask/order,
+  Terrain/Water, static-auth, and world-model tests pass. Evidence:
+  `/tmp/opencode/xgr-wave-debug/terrain-z-motion-no-retired-diagnostic.evidence.json`
+  (PASS/trace_complete, 383 Terrain cutovers, zero packet/geometry mismatches,
+  7,766 Terrain retirement candidates and zero inserted) and
+  `/tmp/opencode/xgr-wave-debug/terrain-lateral-no-retired-diagnostic.evidence.json`
+  (visual confirmation; replay process ended early during teardown).
+- **2026-08-17 (World-map mountain midpoint depth-culling fixed and
+  user-confirmed):** The remaining mountain flicker occurred only on generated
+  interpolation phases. Position freezes, invalid-midpoint endpoint fallback,
+  raster area/winding guards, and retired painter-order restoration did not
+  change it. Controlled Terrain/Water culling ablations isolated depth culling:
+  screen-only retained the original defect, backface-only produced unrelated
+  artifacts, while restoring depth-culled primitives removed the original
+  flicker. Drawing a fixed endpoint depth band exposed background polygons over
+  foreground mountains, proving that endpoint eligibility/order was also wrong.
+  The authenticated guest set remains unchanged. Terrain/Water depth-cull
+  candidates just behind the `0x0f00` guest limit are now recorded into the
+  semantic workload as midpoint-only phases; projective interpolation carries
+  `view_x/view_y/view_z/distance`, and OpenGL enqueues a candidate only when its
+  interpolated maximum depth crosses below `0x0f00`, using that phase depth for
+  painter-order insertion. The user confirmed that this removes both the
+  original flicker and the background overlap. The complete 4,402-VBlank replay
+  reports PASS/trace_complete, 897 Terrain/Water cutovers with 1,197,242
+  authenticated primitives, zero packet/geometry mismatches, zero Native model
+  failures, and zero telemetry overflow. Disproven raster/winding fallbacks were
+  removed after confirmation; focused semantic-workload, OpenGL, Terrain/Water,
+  and static-auth tests pass. Evidence:
+  `/tmp/opencode/xgr-wave-debug/terrain-depth-crossing-clean.evidence.json`.
+
+- **2026-08-17 (Retired painter order restored; not the remaining mountain
+  defect):**
+  Exhaustive midpoint diagnostics ruled out geometric degeneration in the
+  remaining mountain defect: across the same 4,402-VBlank boot-skipped replay,
+  retired primitives produced zero midpoint zero-area triangles, extent
+  collapses, or winding flips. The actual failure was queue composition: every
+  retired primitive was prepended ahead of the current queue, displacing 74,066
+  occurrences from their previous painter-order boundary, including 71,204
+  Terrain/Water primitives across 842 frames. Retired insertion now performs a
+  stable merge: it preserves current relative order and places each retired
+  primitive after every current primitive that preceded it in the prior frame.
+  A focused OpenGL regression asserts that boundary directly. The identical
+  post-fix replay inserted all 84,065/84,065 candidates (81,034 Terrain/Water),
+  with zero history misses, missing anchors, capacity failures, phase failures,
+  midpoint geometry failures, front-order displacements, or telemetry overflow.
+  Authoritative cutover totals match the diagnostic run exactly (897
+  Terrain/Water cutovers and 1,197,242 primitives; 897 world-model cutovers and
+  50,957 primitives), with zero packet/geometry mismatches and Native failures.
+  The only 48 events are vertex-level scene-change rejections. Pre/post evidence:
+  `/tmp/opencode/xgr-wave-debug/retired-geometry-order.evidence.json` and
+  `/tmp/opencode/xgr-wave-debug/retired-order-merged.evidence.json`. User visual
+  confirmation subsequently showed the mountain defect was visually unchanged,
+  so painter order is ruled out as its cause. The next diagnostic pass covers
+  matched Terrain/Water midpoint geometry and shared-topology vertex conflicts;
+  the prior zero-area/winding inventory covered retired primitives only.
+
+- **2026-08-17 (All 202 world-model host-history misses closed):** Retired
+  world-model context recovery now uses a fail-closed hierarchy after exact
+  `previous_order` lookup: consensus among current primitives from the same
+  producer, then consensus among all current world-model primitives in the same
+  scene when the retired producer itself was culled. Conflicting `base_x/slot`
+  observations still reject recovery. The exhaustive 4,402-VBlank replay
+  recovered 182 contexts at producer scope and 20 at class scope. All 84,522
+  retired candidates were inserted, with zero history misses, missing anchors,
+  capacity failures, phase failures, or telemetry overflow. The only recorded
+  events are the same 24 world-model vertex occurrences deliberately rejected
+  across scene changes. Evidence:
+  `/tmp/opencode/xgr-wave-debug/world-model-context-consensus.evidence.json`.
+
+- **2026-08-17 (Exhaustive retired-primitive failure inventory):** The replay
+  evidence now records every retired failure occurrence across every producer,
+  with frame, scene, producer, primitive, vertex identity, previous order, and
+  reason. A 131,072-entry bounded store publishes explicit total/stored/overflow
+  closure. The complete 4,402-VBlank replay stored all 226/226 events with zero
+  telemetry overflow: zero same-scene missing anchors, position/material mode
+  mismatches, anchor overflow, capacity failures, or phase failures; 202 host
+  history misses across ten world-model producers; and 24 vertex occurrences
+  from three world-model primitives correctly rejected across scene changes.
+  Terrain/Water contributes no remaining failure event. Evidence:
+  `/tmp/opencode/xgr-wave-debug/all-retired-failures.evidence.json`.
+
+- **2026-08-17 (Mountain provenance corrected to Terrain/Water; complete
+  temporal retirement, visual confirmation pending):** Numeric semantic
+  attribution, without framebuffer capture, proved that the mountain mesh is
+  emitted by `XG_WORLD_TERRAIN_WATER_NATIVE_ENTRY_PC` (`0x8009932C`), not the
+  `world_models` path. The remaining gaps had two independent causes. First,
+  current anchors covered only currently resident terrain tiles; a per-scene
+  cache keyed by the global 9x9 `grid_index` now reprojections cached tile
+  vertices under the current camera and appends only missing identities to the
+  bounded 145x145 anchor set. Second, queue flushes could invalidate the exact
+  `previous_order` host context; Terrain/Water now recovers `base_x/slot` only
+  when every current primitive from the same scene and producer agrees, and
+  otherwise remains fail-closed. The complete 4,402-VBlank replay reports
+  81,489 unmatched Terrain/Water primitives, all 81,489 eligible and inserted,
+  with zero missing current geometry, history misses, capacity failures, or
+  phase failures. Authoritative output remains 898 cutovers and 1,199,877
+  primitives with zero geometry/packet mismatches; world models remain
+  898/50,974 with zero Native failures. Focused Terrain/Water, static-auth,
+  semantic-workload, and OpenGL tests pass. User confirmation at the affected
+  mountain angles remains required. Evidence:
+  `/tmp/opencode/xgr-wave-debug/terrain-complete-retirement.evidence.json`.
+
+- **2026-08-16 (Overlay variant-chain rejection fixed):** The loaded world-map
+  cache reduced world-model Native cutover from 898/50,974 primitives to 6/0.
+  Reused addresses had multiple compiled candidates, but the loader reported a
+  renderer `loader_mismatch` for each stale candidate before checking later
+  variants. A later byte-exact candidate still executed, after the premature
+  rejection had aborted renderer authentication and cleared the pending model
+  workspace. Exact and CPS-range dispatch now defer the rejection across lazy
+  loading and report it once only when the complete candidate chain fails.
+  Executable regressions cover stale-then-live (no rejection) and all-stale
+  (one rejection). The complete 4,402-VBlank replay with 1,680 registered cache
+  entries now matches the cache-free reference exactly: models 898/50,974,
+  terrain/water 898/1,199,877, actor sprites 898/7,176, and zero world-model
+  Native failures. Evidence:
+  `/tmp/opencode/xgr-wave-debug/worldmap-loader-chain-final.evidence.json`.
+
+- **2026-08-16 (World-model endpoint culling covered; visual confirmation
+  pending):** World-map mountain/model polygons had stable primitive and shared
+  topology identities, but unlike terrain they supplied no current-frame vertex
+  anchors. A polygon omitted by current backface/screen culling therefore could
+  not generate a retired interpolation phase and disappeared one phase early.
+  The authenticated world-model commit now deduplicates every processed model
+  instance by topology vertex, translates those vertices to projective anchors,
+  and submits them only after guest packet/OT output validation succeeds. An
+  all-family integration regression reduces 17 primitives to the expected four
+  shared anchors. Sampling ten active world-model producers during the 60 FPS
+  replay observed 197 retired inserts with zero raster vertex conflicts. The
+  complete 4,402-VBlank OpenGL replay reports PASS, and focused world-model,
+  static-auth, semantic-workload, and OpenGL tests pass. User confirmation of
+  the formerly failing midpoint angles is still required. Evidence:
+  `/tmp/opencode/xgr-wave-debug/world-model-fixed-sampled.evidence.json`.
+
 - **2026-08-16 (World-map Native Smooth temporal mesh resolved and
   user-confirmed):** The remaining 4:3 water/terrain holes came from two
   independent temporal-coverage gaps rather than PS1 rasterization. Native

@@ -441,6 +441,24 @@ GpuRenderTransactionStatus gr_draw_semantic_immediate(
         ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
 }
 
+GpuRenderTransactionStatus gr_draw_semantic_temporal_candidate(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderTemporalCullPolicy *policy) {
+    GpuRenderTransactionStatus status;
+
+    if (semantic == NULL || policy == NULL || policy->reserved != 0u ||
+        policy->ordering_depth_shift >= 32u)
+        return GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
+    if (g_transaction.phase != GR_TRANSACTION_IDLE)
+        return GPU_RENDER_TRANSACTION_INVALID_TRANSITION;
+    if (g_b->draw_semantic_temporal_candidate == NULL)
+        return GPU_RENDER_TRANSACTION_OK;
+    status = normalize_backend_status(
+        g_b->draw_semantic_temporal_candidate(semantic, policy));
+    return status == GPU_RENDER_TRANSACTION_READY
+        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
+}
+
 GpuRenderTransactionStatus gr_record_interpolation_anchors(
         const GpuRenderInterpolationVertexAnchor *anchors, size_t count) {
     GpuRenderTransactionStatus status;

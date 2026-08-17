@@ -654,8 +654,13 @@ static void test_retired_history_mismatch_preserves_native_present(void) {
     GpuRenderSemantic previous_retired;
     GpuRenderSemantic current_moving;
     GpuRenderInterpolationVertexAnchor anchors[3];
+    GlRendererSemanticProducerItemDiagnostics items[8];
     GlRendererNativeMidpointDiagnostics before = {0};
     GlRendererNativeMidpointDiagnostics after = {0};
+    size_t item_total = 0u;
+    uint64_t item_frame = 0u;
+    uint32_t current_queue_order = UINT32_MAX;
+    uint32_t retired_queue_order = UINT32_MAX;
 
     reset_gpu_for_case();
     gr_fill_rect(0, 0, 1024, 512, 0);
@@ -667,7 +672,8 @@ static void test_retired_history_mismatch_preserves_native_present(void) {
                     words, sizeof(words) / sizeof(words[0]), &environment,
                     &stale_moving) == 1,
                 "retired history fixture builds semantic geometry");
-    make_retirable_native_triangle(&stale_moving, 100u, 0x100u);
+    make_retirable_native_triangle(
+        &stale_moving, 100u, UINT32_C(0x63000000));
     stale_retired = stale_moving;
     stale_retired.interpolation_identity.primitive_id = 101u;
     shift_native_triangle_x(&stale_retired, 40);
@@ -713,10 +719,22 @@ static void test_retired_history_mismatch_preserves_native_present(void) {
                     gr_draw_semantic_immediate(&current_moving) ==
                     GPU_RENDER_TRANSACTION_OK &&
                     gl_renderer_present_native_view(0, 0, 240, 0),
-                "stale retired history is skipped without rejecting current present");
+                "stale retired history preserves the current present");
     gl_renderer_native_midpoint_diag(&after);
+    const size_t item_count = gl_renderer_semantic_producer_items(
+        UINT32_C(0x8009932c), UINT64_MAX, 0u, items,
+        sizeof(items) / sizeof(items[0]), &item_total, &item_frame);
+    for (size_t index = 0u; index < item_count; ++index) {
+        if (items[index].primitive_id == 1u)
+            current_queue_order = items[index].queue_order;
+        if (items[index].primitive_id == 2u)
+            retired_queue_order = items[index].queue_order;
+    }
     expect_true(after.cancelled_frames == before.cancelled_frames,
-                "optional retired geometry never cancels authoritative current frame");
+                 "optional retired geometry never cancels authoritative current frame");
+    expect_true(item_total >= 2u && item_frame != UINT64_MAX &&
+                    current_queue_order < retired_queue_order,
+                "retired geometry preserves its prior painter-order boundary");
     expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
                 "retired history fixture disables Native view");
 }

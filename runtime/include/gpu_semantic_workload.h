@@ -173,6 +173,8 @@ void gpu_semantic_workload_reset(void);
 GpuSemanticWorkloadStatus gpu_semantic_workload_begin(void);
 GpuSemanticWorkloadStatus gpu_semantic_workload_record(
     const GpuRenderSemantic *semantic, GpuRenderSemantic *out_midpoint);
+GpuSemanticWorkloadStatus gpu_semantic_workload_record_endpoint(
+    const GpuRenderSemantic *semantic);
 /* Records one current semantic and returns every requested retrospective phase.
  * Phase i uses alpha=(i+1)/denominator; phase_count must be denominator-1. */
 GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
@@ -201,9 +203,47 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_previous_order(
 GpuSemanticWorkloadStatus gpu_semantic_workload_match_info(
     const GpuRenderInterpolationIdentity *identity,
     GpuSemanticWorkloadMatchInfo *out_match);
+GpuSemanticWorkloadStatus gpu_semantic_workload_current(
+    const GpuRenderInterpolationIdentity *identity,
+    GpuRenderSemantic *out_semantic);
+GpuSemanticWorkloadStatus gpu_semantic_workload_previous(
+    const GpuRenderInterpolationIdentity *identity,
+    GpuRenderSemantic *out_semantic);
 GpuSemanticWorkloadStatus gpu_semantic_workload_last_motion(
     GpuSemanticWorkloadMotionDiagnostics *out_motion);
 size_t gpu_semantic_workload_retired_count(void);
+typedef struct GpuSemanticWorkloadRetiredDiagnostics {
+    size_t unmatched;
+    size_t eligible;
+    size_t scene_mismatch;
+    size_t missing_anchor;
+    size_t position_mode_mismatch;
+    size_t material_position_mismatch;
+    size_t anchor_overflow;
+    uint32_t first_missing_primitive_id;
+    uint32_t first_missing_group_id;
+    uint32_t first_missing_vertex_id;
+} GpuSemanticWorkloadRetiredDiagnostics;
+typedef enum GpuSemanticWorkloadRetiredIssueReason {
+    GPU_SEMANTIC_RETIRED_ISSUE_MISSING_ANCHOR = 1,
+    GPU_SEMANTIC_RETIRED_ISSUE_SCENE_MISMATCH,
+    GPU_SEMANTIC_RETIRED_ISSUE_POSITION_MODE_MISMATCH,
+    GPU_SEMANTIC_RETIRED_ISSUE_MATERIAL_POSITION_MISMATCH,
+    GPU_SEMANTIC_RETIRED_ISSUE_ANCHOR_OVERFLOW,
+} GpuSemanticWorkloadRetiredIssueReason;
+typedef struct GpuSemanticWorkloadRetiredIssue {
+    uint64_t scene_id;
+    uint32_t producer_id;
+    uint32_t primitive_id;
+    uint32_t group_id;
+    uint32_t vertex_id;
+    uint32_t previous_order;
+    uint32_t reason;
+} GpuSemanticWorkloadRetiredIssue;
+void gpu_semantic_workload_retired_diagnostics(
+    uint32_t producer_id, GpuSemanticWorkloadRetiredDiagnostics *out_diagnostics);
+size_t gpu_semantic_workload_retired_issues(
+    GpuSemanticWorkloadRetiredIssue *out_issues, size_t capacity);
 GpuSemanticWorkloadStatus gpu_semantic_workload_retired(
     size_t retired_index, GpuRenderSemantic *out_semantic,
     size_t *out_previous_order);

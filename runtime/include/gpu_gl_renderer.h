@@ -184,6 +184,37 @@ typedef struct GlRendererNativeMidpointDiagnostics {
     uint64_t eligibility_static_frames;
     uint64_t deferred_current_frames;
     uint64_t deferred_current_flushes;
+    uint64_t retired_candidate_count;
+    uint64_t retired_inserted_count;
+    uint64_t retired_history_miss_count;
+    uint64_t retired_capacity_miss_count;
+    uint64_t retired_phase_failure_count;
+    uint64_t retired_producer_history_recovery_count;
+    uint64_t retired_world_model_candidate_count;
+    uint64_t retired_world_model_inserted_count;
+    uint64_t retired_world_model_history_miss_count;
+    uint64_t retired_world_model_history_recovery_count;
+    uint64_t retired_world_model_producer_context_recovery_count;
+    uint64_t retired_world_model_class_context_recovery_count;
+    uint64_t retired_terrain_unmatched_count;
+    uint64_t retired_terrain_eligible_count;
+    uint64_t retired_terrain_missing_current_geometry_count;
+    uint64_t retired_terrain_missing_anchor_count;
+    uint64_t retired_terrain_scene_mismatch_count;
+    uint64_t retired_terrain_position_mode_mismatch_count;
+    uint64_t retired_terrain_material_position_mismatch_count;
+    uint64_t retired_terrain_anchor_overflow_count;
+    uint64_t retired_terrain_candidate_count;
+    uint64_t retired_terrain_inserted_count;
+    uint64_t retired_terrain_history_miss_count;
+    uint64_t retired_terrain_history_recovery_count;
+    uint32_t first_retired_terrain_missing_primitive;
+    uint32_t first_retired_terrain_missing_group;
+    uint32_t first_retired_terrain_missing_vertex;
+    uint32_t last_retired_phase_failure_producer;
+    uint32_t last_retired_phase_failure_primitive;
+    uint32_t last_retired_history_miss_producer;
+    uint32_t last_retired_history_miss_primitive;
     uint64_t host_queue_flush_reasons[9];
     uint64_t reset_count;
     uint64_t reset_with_previous_count;
@@ -257,6 +288,17 @@ typedef struct GlRendererNativeMidpointDiagnostics {
     uint64_t workload_total_projective_input_vertices;
     uint64_t workload_total_projective_valid_input_vertices;
     uint64_t workload_total_projective_phase_vertices;
+    uint64_t temporal_candidate_count;
+    uint64_t temporal_candidate_recorded_count;
+    uint64_t temporal_candidate_visible_count;
+    uint64_t temporal_candidate_record_failure_count;
+    uint64_t temporal_candidate_duplicate_count;
+    uint64_t temporal_candidate_identity_collision_count;
+    uint64_t temporal_candidate_peak_workload_count;
+    uint64_t temporal_candidate_first_failure_workload_count;
+    uint32_t temporal_candidate_first_failure_status;
+    uint32_t temporal_candidate_first_failure_producer;
+    uint32_t temporal_candidate_first_failure_primitive;
     uint64_t workload_total_previous_unmatched;
     uint64_t workload_total_previous_unmatched_keyed;
     uint64_t workload_total_previous_unmatched_projective;
@@ -372,6 +414,8 @@ typedef struct GlRendererSemanticProducerDiagnostics {
     uint64_t exact_vertex_conflict_count;
     uint64_t raster_vertex_conflict_count;
     uint64_t retired_candidates;
+    uint64_t retired_unmatched;
+    uint64_t retired_missing_current_geometry;
     uint64_t retired_inserted;
     uint64_t retired_skipped_history;
     uint64_t retired_skipped_capacity;
@@ -395,6 +439,7 @@ typedef struct GlRendererSemanticProducerItemDiagnostics {
     uint32_t subprimitive_index;
     uint32_t topology;
     uint32_t screen_space_2d;
+    uint32_t world_model;
     uint32_t tpage;
     uint32_t clut_x;
     uint32_t clut_y;
@@ -414,6 +459,38 @@ typedef struct GlRendererSemanticProducerItemDiagnostics {
     int midpoint_bounds[4];
     int previous_order_valid;
 } GlRendererSemanticProducerItemDiagnostics;
+
+typedef enum GlRendererRetiredFailureReason {
+    GL_RETIRED_FAILURE_MISSING_ANCHOR = 1,
+    GL_RETIRED_FAILURE_SCENE_MISMATCH,
+    GL_RETIRED_FAILURE_POSITION_MODE_MISMATCH,
+    GL_RETIRED_FAILURE_MATERIAL_POSITION_MISMATCH,
+    GL_RETIRED_FAILURE_ANCHOR_OVERFLOW,
+    GL_RETIRED_FAILURE_HISTORY_MISS,
+    GL_RETIRED_FAILURE_CAPACITY,
+    GL_RETIRED_FAILURE_PHASE,
+    GL_RETIRED_FAILURE_MIDPOINT_ZERO_AREA,
+    GL_RETIRED_FAILURE_MIDPOINT_EXTENT_COLLAPSE,
+    GL_RETIRED_FAILURE_MIDPOINT_WINDING_FLIP,
+    GL_RETIRED_FAILURE_FRONT_ORDER_DISPLACEMENT,
+    GL_RETIRED_FAILURE_MIDPOINT_VERTEX_CONFLICT,
+    GL_RETIRED_FAILURE_MIDPOINT_FIXED_ZERO_AREA,
+    GL_RETIRED_FAILURE_MIDPOINT_FIXED_WINDING_FLIP,
+} GlRendererRetiredFailureReason;
+
+typedef struct GlRendererRetiredFailureEvent {
+    uint64_t frame;
+    uint64_t scene_id;
+    uint32_t reason;
+    uint32_t producer_id;
+    uint32_t primitive_id;
+    uint32_t group_id;
+    uint32_t vertex_id;
+    uint32_t previous_order;
+    uint32_t auxiliary;
+    int64_t value_a;
+    int64_t value_b;
+} GlRendererRetiredFailureEvent;
 
 enum {
     GL_NATIVE_MIDPOINT_GL_SEED_CANONICAL = 1,
@@ -448,6 +525,10 @@ size_t gl_renderer_semantic_producer_items(
     uint32_t producer_id, uint64_t frame, size_t offset,
     GlRendererSemanticProducerItemDiagnostics *out_items, size_t capacity,
     size_t *out_total, uint64_t *out_frame);
+size_t gl_renderer_retired_failure_events(
+    GlRendererRetiredFailureEvent *out_events, size_t capacity);
+uint64_t gl_renderer_retired_failure_event_total(void);
+uint64_t gl_renderer_retired_failure_event_overflow(void);
 GpuRenderTransactionStatus gl_renderer_record_interpolation_anchors(
     const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
 

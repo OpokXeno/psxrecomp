@@ -9672,7 +9672,9 @@ static void handle_native_producer_phase_diag(int id, const char *json)
         "\"vertices\":%llu,\"duplicate_vertices\":%llu,"
         "\"exact_vertex_conflicts\":%llu,"
         "\"raster_vertex_conflicts\":%llu,"
-        "\"retired_candidates\":%llu,\"retired_inserted\":%llu,"
+        "\"retired_candidates\":%llu,\"retired_unmatched\":%llu,"
+        "\"retired_missing_current_geometry\":%llu,"
+        "\"retired_inserted\":%llu,"
         "\"retired_skipped_history\":%llu,"
         "\"retired_skipped_capacity\":%llu,"
         "\"max_midpoint_delta_fixed\":%llu,"
@@ -9692,6 +9694,8 @@ static void handle_native_producer_phase_diag(int id, const char *json)
         (unsigned long long)diagnostics.exact_vertex_conflict_count,
         (unsigned long long)diagnostics.raster_vertex_conflict_count,
         (unsigned long long)diagnostics.retired_candidates,
+        (unsigned long long)diagnostics.retired_unmatched,
+        (unsigned long long)diagnostics.retired_missing_current_geometry,
         (unsigned long long)diagnostics.retired_inserted,
         (unsigned long long)diagnostics.retired_skipped_history,
         (unsigned long long)diagnostics.retired_skipped_capacity,
@@ -9910,6 +9914,7 @@ static void handle_native_producer_phase_items(int id, const char *json)
             "\"identity_valid\":%s,"
             "\"subprimitive\":%u,\"queue_order\":%u,\"base_x\":%d,"
             "\"slot\":%d,\"topology\":%u,\"screen_space_2d\":%u,"
+            "\"world_model\":%u,"
             "\"material\":{\"tpage\":%u,\"clut\":[%u,%u],"
             "\"draw_offset\":[%d,%d],\"draw_area\":[%u,%u,%u,%u],"
             "\"textured\":%u,\"raw_texture\":%u,"
@@ -9928,7 +9933,8 @@ static void handle_native_producer_phase_items(int id, const char *json)
             item->identity_valid ? "true" : "false",
             item->subprimitive_index, item->queue_order,
             item->base_x, item->slot, item->topology,
-            item->screen_space_2d, item->tpage, item->clut_x, item->clut_y,
+            item->screen_space_2d, item->world_model,
+            item->tpage, item->clut_x, item->clut_y,
             item->draw_offset_x, item->draw_offset_y,
             item->draw_area[0], item->draw_area[1],
             item->draw_area[2], item->draw_area[3],

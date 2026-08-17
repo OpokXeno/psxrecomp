@@ -146,6 +146,10 @@ typedef struct GpuRenderSemanticVertex {
     GpuRenderFixed16_16 projective_native_offset_y;
     uint16_t projective_distance;
     uint8_t projective_position;
+    /* Scalar temporal depth for screen-space geometry that must not be
+     * projectively reprojected (for example billboards). */
+    int32_t temporal_depth;
+    uint8_t temporal_depth_valid;
     /* Optional source-mesh identity. Vertices shared by separate primitives
      * use one temporal position even when primitive appearance snaps. */
     uint32_t interpolation_group_id;
@@ -211,6 +215,46 @@ typedef struct GpuRenderSemantic {
      * games routinely double-buffer packet arenas and reorder OT contents. */
     GpuRenderInterpolationIdentity interpolation_identity;
 } GpuRenderSemantic;
+
+typedef enum GpuRenderTemporalCullFlags {
+    GPU_RENDER_TEMPORAL_CULL_PROJECTIVE = 1u << 0,
+    GPU_RENDER_TEMPORAL_CULL_SCREEN = 1u << 1,
+    GPU_RENDER_TEMPORAL_CULL_FRONT_FACE = 1u << 2,
+    GPU_RENDER_TEMPORAL_CULL_DEPTH = 1u << 3,
+    GPU_RENDER_TEMPORAL_FORCE_PHASES = 1u << 31,
+} GpuRenderTemporalCullFlags;
+
+typedef enum GpuRenderTemporalDepthMode {
+    GPU_RENDER_TEMPORAL_DEPTH_NONE = 0,
+    GPU_RENDER_TEMPORAL_DEPTH_MINIMUM,
+    GPU_RENDER_TEMPORAL_DEPTH_MAXIMUM,
+    GPU_RENDER_TEMPORAL_DEPTH_AVERAGE,
+    GPU_RENDER_TEMPORAL_DEPTH_LAST_VERTEX,
+} GpuRenderTemporalDepthMode;
+
+typedef enum GpuRenderTemporalFrontFace {
+    GPU_RENDER_TEMPORAL_FRONT_NONE = 0,
+    GPU_RENDER_TEMPORAL_FRONT_POSITIVE,
+    GPU_RENDER_TEMPORAL_FRONT_NEGATIVE,
+} GpuRenderTemporalFrontFace;
+
+/* Visibility contract for geometry omitted by an authored endpoint. Bounds and
+ * depth limits are inclusive/exclusive, matching the guest's usual cull tests.
+ * The backend evaluates this contract independently for every generated phase;
+ * it never adds the candidate to the authoritative current-frame surface. */
+typedef struct GpuRenderTemporalCullPolicy {
+    uint32_t flags;
+    GpuRenderFixed16_16 screen_left;
+    GpuRenderFixed16_16 screen_top;
+    GpuRenderFixed16_16 screen_right_exclusive;
+    GpuRenderFixed16_16 screen_bottom_exclusive;
+    int32_t depth_min_inclusive;
+    int32_t depth_max_exclusive;
+    GpuRenderTemporalDepthMode depth_mode;
+    GpuRenderTemporalFrontFace front_face;
+    uint8_t ordering_depth_shift;
+    uint8_t reserved;
+} GpuRenderTemporalCullPolicy;
 
 /* Describes the final composition without exposing a backend surface handle.
  * The backend owns the transaction's offscreen surface and its storage. */
@@ -309,6 +353,9 @@ void gr_native_draw_shaded_line(int x0, int y0, uint16_t c0,
 GpuRenderTransactionStatus gr_stream_barrier(void);
 GpuRenderTransactionStatus gr_draw_semantic_immediate(
     const GpuRenderSemantic *semantic);
+GpuRenderTransactionStatus gr_draw_semantic_temporal_candidate(
+    const GpuRenderSemantic *semantic,
+    const GpuRenderTemporalCullPolicy *policy);
 GpuRenderTransactionStatus gr_record_interpolation_anchors(
     const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
 
@@ -455,6 +502,9 @@ typedef struct GpuRenderBackend {
     GpuRenderTransactionStatus (*stream_barrier)(void);
     GpuRenderTransactionStatus (*draw_semantic_immediate)(
         const GpuRenderSemantic *semantic);
+    GpuRenderTransactionStatus (*draw_semantic_temporal_candidate)(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderTemporalCullPolicy *policy);
     GpuRenderTransactionStatus (*record_interpolation_anchors)(
         const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
     int  (*render_display)(uint32_t *out, int pitch,

@@ -320,6 +320,7 @@ static int test_projective_midpoint_reprojects_after_view_interpolation(void) {
             208 * INT32_C(65536));
     REQUIRE(phases[0].triangles[0].vertices[2].y ==
             168 * INT32_C(65536));
+    REQUIRE(phases[0].triangles[0].vertices[0].projective_view_z == 1024);
     gpu_semantic_workload_diagnostics(&diagnostics);
     REQUIRE(diagnostics.total_projective_phase_vertices == 3u);
     return 1;
@@ -1476,6 +1477,8 @@ static int test_retired_mesh_follows_current_anchors(void) {
     GpuRenderInterpolationVertexAnchor anchors[3];
     GpuRenderSemantic phases[3];
     size_t previous_order = SIZE_MAX;
+    GpuSemanticWorkloadRetiredDiagnostics retired = {0};
+    GpuSemanticWorkloadRetiredIssue issues[6] = {{0}};
 
     make_projective_mesh(&previous);
     make_projective_mesh(&current);
@@ -1497,6 +1500,11 @@ static int test_retired_mesh_follows_current_anchors(void) {
             GPU_SEMANTIC_WORKLOAD_OK);
     REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
     REQUIRE(gpu_semantic_workload_retired_count() == 1u);
+    gpu_semantic_workload_retired_diagnostics(
+        previous.interpolation_identity.producer_id, &retired);
+    REQUIRE(retired.unmatched == 1u && retired.eligible == 1u &&
+            retired.missing_anchor == 0u);
+    REQUIRE(gpu_semantic_workload_retired_issues(issues, 6u) == 0u);
     REQUIRE(gpu_semantic_workload_retired_phases(
                 0u, 4u, phases, 3u, &previous_order) ==
             GPU_SEMANTIC_WORKLOAD_OK);
@@ -1520,6 +1528,17 @@ static int test_retired_mesh_follows_current_anchors(void) {
             GPU_SEMANTIC_WORKLOAD_OK);
     REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
     REQUIRE(gpu_semantic_workload_retired_count() == 0u);
+    gpu_semantic_workload_retired_diagnostics(
+        previous.interpolation_identity.producer_id, &retired);
+    REQUIRE(retired.unmatched == 1u && retired.eligible == 0u &&
+            retired.missing_anchor == 1u);
+    REQUIRE(gpu_semantic_workload_retired_issues(issues, 6u) == 1u);
+    REQUIRE(issues[0].reason == GPU_SEMANTIC_RETIRED_ISSUE_MISSING_ANCHOR);
+    REQUIRE(issues[0].producer_id ==
+            previous.interpolation_identity.producer_id);
+    REQUIRE(issues[0].primitive_id ==
+            previous.interpolation_identity.primitive_id);
+    REQUIRE(issues[0].vertex_id == ids[2]);
     return 1;
 }
 
