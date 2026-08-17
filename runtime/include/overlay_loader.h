@@ -62,6 +62,10 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc);
 /* Returns number of functions currently registered in the dynamic table. */
 int overlay_loader_registered_count(void);
 
+/* True when the current plan-specific cache contains at least one valid,
+ * indexed function. A zero plan hash needs no separate repair cache. */
+int overlay_loader_current_plan_cache_ready(void);
+
 /* Returns full loader state for TCP diagnostics. */
 void overlay_loader_get_status(int *active, int *registered,
                                int *regions_checked,

@@ -2,6 +2,7 @@
 #include "overlay_loader.h"
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -28,10 +29,18 @@ void overlay_loader_discard_prepared(OverlayPreparedImage *image) {
 }
 
 int main(void) {
+    char captures[] = "/tmp/psx-autocompile-captures-XXXXXX";
+    int capture_fd = mkstemp(captures);
+    assert(capture_fd >= 0);
+    assert(write(capture_fd, "[{}]", 4) == 4);
+    close(capture_fd);
+
     autocompile_configure(
         "printf 'PSX_SHARD_PUBLISHED /tmp/test-shard.so\\n"
         "PSX_SHARD_RESULT ok=2 failed=0 skipped=1 capacity_fastpath=3\\n'", ".");
-    assert(autocompile_request());
+    autocompile_set_cache_paths("/tmp", captures);
+    assert(!autocompile_request_plan_repair(1));
+    assert(autocompile_request_plan_repair(0));
 
     char status[4096];
     for (int i = 0; i < 500 && (rescans == 0 || commits == 0); i++) {
@@ -46,6 +55,8 @@ int main(void) {
     assert(strstr(status, "\"shard_ok\":2"));
     assert(strstr(status, "\"shard_skipped\":1"));
     assert(strstr(status, "PSX_SHARD_RESULT"));
+    unlink(captures);
+    assert(!autocompile_request_plan_repair(0));
     autocompile_shutdown();
     return 0;
 }

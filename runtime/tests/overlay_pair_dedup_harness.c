@@ -1,6 +1,7 @@
 #define PSX_OVERLAY_DLL_BUILD 1
 #include "overlay_loader.h"
 #include "game_identity.h"
+#include "guest_render_native_stream.h"
 #include "native_render_baseline.h"
 #include "xg_render_auth_runtime.h"
 #undef PSX_OVERLAY_DLL_BUILD
@@ -22,11 +23,13 @@
 
 _Static_assert(PSX_OVERLAY_TEST_CANDIDATE_CAP == 4,
                "pair-dedup harness must exercise the exact four-slot cap");
+int overlay_loader_test_force_stale_chain(uint32_t phys, int all);
 
 static uint8_t s_ram[RAM_SIZE];
 static uint8_t s_scratch[1024];
 static PsxXgRenderAuthCandidate s_renderer_candidate;
 static uint32_t s_renderer_candidate_calls;
+static uint32_t s_loader_mismatch_calls;
 static const PsxGameIdentity s_fixture_identity = {
     {0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u,
      0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu,
@@ -69,6 +72,10 @@ void psx_xg_render_auth_note_candidate_dispatch(
     s_renderer_candidate = *candidate;
     s_renderer_candidate_calls++;
 }
+void psx_xg_render_auth_note_artifact_candidate(
+        const PsxXgRenderAuthCandidate *candidate) {
+    (void)candidate;
+}
 void psx_xg_render_auth_warm_hook(CPUState *cpu, uint32_t hook, uint32_t pc,
                                   uint32_t instruction_word,
                                   uint32_t delay_slot_word) {
@@ -78,7 +85,55 @@ void psx_xg_render_auth_warm_hook(CPUState *cpu, uint32_t hook, uint32_t pc,
     (void)instruction_word;
     (void)delay_slot_word;
 }
-void psx_xg_render_auth_loader_mismatch(uint32_t pc) { (void)pc; }
+void psx_xg_render_auth_loader_mismatch(uint32_t pc) {
+    (void)pc;
+    s_loader_mismatch_calls++;
+}
+bool psx_xg_render_auth_native_ft4_bypass(
+        CPUState *cpu, uint32_t pc, uint32_t instruction) {
+    (void)cpu;
+    (void)pc;
+    (void)instruction;
+    return false;
+}
+
+void gte_attribution_set_enabled(bool enabled) { (void)enabled; }
+void gte_attribution_reset(void) {}
+GteAttributionResult gte_attribution_snapshot(
+        GteAttributionSnapshot *out_snapshot,
+        GteAttributionContextCounter *context_counters,
+        size_t context_capacity,
+        GteAttributionSiteCounter *site_counters,
+        size_t site_capacity) {
+    (void)context_counters;
+    (void)context_capacity;
+    (void)site_counters;
+    (void)site_capacity;
+    if (out_snapshot == NULL) return GTE_ATTRIBUTION_INVALID_ARGUMENT;
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    return GTE_ATTRIBUTION_OK;
+}
+GuestRenderStatus guest_render_bridge_snapshot(
+        GuestRenderBridgeSnapshot *out_snapshot) {
+    (void)out_snapshot;
+    return GUEST_RENDER_NO_COMPLETED_STATE;
+}
+GuestRenderStatus guest_render_bridge_present(
+        GuestRenderCompletedState *out_completed) {
+    (void)out_completed;
+    return GUEST_RENDER_NO_COMPLETED_STATE;
+}
+GuestRenderStatus guest_render_bridge_last_completed(
+        GuestRenderBridgeSnapshot *out_snapshot,
+        GuestRenderCompletedState *out_completed) {
+    (void)out_snapshot;
+    (void)out_completed;
+    return GUEST_RENDER_NO_COMPLETED_STATE;
+}
+void guest_render_native_stream_set_material_observer(
+        GuestRenderNativeStreamMaterialObserver observer) {
+    (void)observer;
+}
 
 uint8_t *memory_get_ram_ptr(void) { return s_ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return s_scratch; }
@@ -350,6 +405,8 @@ int main(int argc, char **argv) {
     overlay_loader_init(argv[1], "PAIR-TEST");
 
     int alias = strcmp(scenario, "alias-at-cap") == 0;
+    int variant_chain = strcmp(scenario, "variant-chain") == 0;
+    int all_stale = strcmp(scenario, "all-stale") == 0;
     int partial = strcmp(scenario, "partial-first") == 0;
     int rejected = strcmp(scenario, "missing-identity") == 0 ||
                    strcmp(scenario, "lowercase-identity") == 0 ||
@@ -392,6 +449,12 @@ int main(int argc, char **argv) {
     int second_loaded = module_is_loaded(second);
     ok &= expect_int("first retained", first_loaded, rejected || partial ? 0 : 1);
     ok &= expect_int("second retained", second_loaded, rejected || alias ? 0 : 1);
+
+    if (variant_chain || all_stale)
+        ok &= expect_int("forced stale candidates",
+                         overlay_loader_test_force_stale_chain(
+                             0x00010000u, all_stale),
+                         all_stale ? 2 : 1);
 
     if (alias) {
         CPUState cpu;
@@ -447,6 +510,23 @@ int main(int argc, char **argv) {
                          counter_value(first, "test_flush_count"), 1);
         ok &= expect_int("redundant flush count",
                          counter_value(second, "test_flush_count"), 0);
+    }
+    if (variant_chain || all_stale) {
+        CPUState cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        ok &= expect_int("variant dispatch",
+                         overlay_loader_dispatch(&cpu, 0x80010000u),
+                         variant_chain ? 1 : 0);
+        ok &= expect_int("loader mismatch calls", s_loader_mismatch_calls,
+                         all_stale ? 1 : 0);
+        ok &= expect_int("variant marker", cpu.gpr[2],
+                         variant_chain ? TEST_MARKER : 0);
+        ok &= expect_int("first candidate call count",
+                         counter_value(first, "test_call_count"),
+                         0);
+        ok &= expect_int("fallback candidate call count",
+                         counter_value(second, "test_call_count"),
+                         variant_chain ? 1 : 0);
     }
 
     /* A second rescan must neither reacquire an alias handle nor publish

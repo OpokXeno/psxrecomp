@@ -636,6 +636,26 @@ void autocompile_set_cache_paths(const char *cache_dir, const char *captures) {
 int autocompile_configured(void) { return s_cmd[0] != '\0'; }
 int autocompile_busy(void)       { return ac_state_load() != AC_IDLE; }
 
+static int capture_store_has_records(void) {
+    if (!s_captures[0]) return 0;
+    FILE *capture = fopen(s_captures, "rb");
+    if (!capture) return 0;
+    int first = EOF;
+    int next = EOF;
+    do {
+        first = fgetc(capture);
+    } while (first != EOF &&
+             (first == ' ' || first == '\t' || first == '\r' || first == '\n'));
+    if (first == '[') {
+        do {
+            next = fgetc(capture);
+        } while (next != EOF &&
+                 (next == ' ' || next == '\t' || next == '\r' || next == '\n'));
+    }
+    fclose(capture);
+    return first != EOF && (first != '[' || (next != EOF && next != ']'));
+}
+
 /* Probe PATH for a real C compiler (gcc/cc/clang). A configured command string
  * alone cannot tell a developer checkout from a toolchain-less player. This
  * opens each candidate executable in each PATH directory. Memoized because PATH
@@ -916,6 +936,11 @@ int autocompile_request(void) {
     s_runs++;
     return 1;
 #endif
+}
+
+int autocompile_request_plan_repair(int plan_cache_ready) {
+    if (plan_cache_ready || !capture_store_has_records()) return 0;
+    return autocompile_request();
 }
 
 /* Scan the child-output tail ring for the LAST "PSX_SHARD_RESULT ok=N failed=M

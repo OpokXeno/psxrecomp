@@ -224,6 +224,20 @@ static int idx_head(uint32_t phys) {
     }
     return -1;
 }
+#ifdef PSX_OVERLAY_TEST_CANDIDATE_CAP
+int overlay_loader_test_force_stale_chain(uint32_t phys, int all) {
+    int changed = 0;
+
+    for (int i = idx_head(phys & 0x1FFFFFFFu); i >= 0; i = s_cand[i].next) {
+        s_cand[i].crc_code ^= 1u;
+        s_cand[i].state = ENTRY_INVALID;
+        s_cand[i].val_gen = UINT32_MAX;
+        ++changed;
+        if (!all) break;
+    }
+    return changed;
+}
+#endif
 static void idx_set_head(uint32_t phys, int head) {
     uint32_t h = (phys * 2654435761u) & IDX_MASK;
     for (uint32_t i = 0; i < IDX_CAP; i++) {
@@ -1405,8 +1419,16 @@ static int path_component_eq(const char *path, const char *wanted) {
 }
 
 static int cache_tier_from_path(const char *path) {
-    if (path_component_eq(path, "gcc")) return CACHE_TIER_GCC;
-    if (path_component_eq(path, "tcc")) return CACHE_TIER_TCC;
+    char plan_tag[64];
+    snprintf(plan_tag, sizeof(plan_tag), "cg%d_%08x_p%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+             (unsigned)PSX_OVERLAY_PLAN_HASH);
+    int is_plan = PSX_OVERLAY_PLAN_HASH != 0u &&
+                  path_component_eq(path, plan_tag);
+    if (path_component_eq(path, "gcc"))
+        return is_plan ? CACHE_TIER_PLAN_GCC : CACHE_TIER_GCC;
+    if (path_component_eq(path, "tcc"))
+        return is_plan ? CACHE_TIER_PLAN_TCC : CACHE_TIER_TCC;
     return CACHE_TIER_UNKNOWN;
 }
 
@@ -2171,6 +2193,18 @@ static void scan_cache_dir(void) {
         }
         fflush(stderr);
     }
+}
+
+int overlay_loader_current_plan_cache_ready(void) {
+    if (PSX_OVERLAY_PLAN_HASH == 0u) return 1;
+    for (int i = 0; i < s_cache_idx_count; i++) {
+        const CacheEntry *entry = &s_cache_idx[i];
+        if ((entry->tier == CACHE_TIER_PLAN_GCC ||
+             entry->tier == CACHE_TIER_PLAN_TCC) &&
+            entry->manifest_ok && entry->indexed_func_count > 0)
+            return 1;
+    }
+    return 0;
 }
 
 /* (sljit removed 2026-07-15: the persisted sljit shard cache — blob header,
@@ -3630,7 +3664,8 @@ static int lazy_has_preferred_exact_entry(uint32_t phys, int loaded_tier) {
  * idx_head() (entry-keyed) misses; we re-enter the owning function with
  * cpu->pc = that address so its entry-switch routes to the right block. Returns
  * the candidate index, or -1. */
-static int range_candidate_matches(int i, uint32_t phys) {
+static int range_candidate_matches(int i, uint32_t phys,
+                                   uint32_t *mismatch_addr) {
     Candidate *c = &s_cand[i];
     if (c->state == ENTRY_BLACKLIST) return 0;
     int contains = 0;
@@ -3678,7 +3713,8 @@ static int range_candidate_matches(int i, uint32_t phys) {
         c->state = ENTRY_INVALID;
     }
     s_stale_blocked++;
-    psx_xg_render_auth_loader_mismatch(c->addr);
+    if (mismatch_addr != NULL && *mismatch_addr == 0u)
+        *mismatch_addr = c->addr;
     return 0;
 }
 
@@ -3689,7 +3725,7 @@ static int range_candidate_preferred(int candidate, int current) {
     return candidate > current; /* newest same-tier repair */
 }
 
-static int overlay_find_by_range(uint32_t phys) {
+static int overlay_find_by_range(uint32_t phys, uint32_t *mismatch_addr) {
     /* Definitive guard for the overlay-off case: the range page index
      * (s_range_page_head) is only initialized to -1 by overlay_loader_init,
      * which runs solely when overlay_cache is enabled. With overlay off it is
@@ -3704,20 +3740,20 @@ static int overlay_find_by_range(uint32_t phys) {
         (phys * 2654435761u) & RANGE_PC_CACHE_MASK];
     if (pc->generation == s_range_candidate_generation &&
         pc->cand >= 0 && pc->phys == phys &&
-        range_candidate_matches(pc->cand, phys))
+        range_candidate_matches(pc->cand, phys, mismatch_addr))
         return pc->cand;
 
     int best = -1;
     if (s_range_index_overflow) {
         for (int i = 0; i < s_cand_n; i++)
-            if (range_candidate_matches(i, phys) &&
+            if (range_candidate_matches(i, phys, mismatch_addr) &&
                 range_candidate_preferred(i, best))
                 best = i;
     } else {
         for (int li = s_range_page_head[page]; li >= 0;
              li = s_range_links[li].next) {
             int i = s_range_links[li].cand;
-            if (range_candidate_matches(i, phys) &&
+            if (range_candidate_matches(i, phys, mismatch_addr) &&
                 range_candidate_preferred(i, best))
                 best = i;
         }
@@ -3754,6 +3790,9 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         return 0;
     }
     int lazy_loaded = 0;
+    /* A reused address can have stale and live variants in one chain. Reject
+     * renderer authentication only after loaded and lazy candidates all fail. */
+    uint32_t loader_mismatch_addr = 0u;
 retry_candidates:
     /* Keep the label attached to a statement for pre-C23 C compilers. */
     ;
@@ -3777,7 +3816,8 @@ retry_candidates:
          * manifested entries are different: a broader range owner must not mask
          * their valid cached DLL (Tomba FMV's 0x80106424/0x80106688 case). */
         if (head < 0 && g_psx_cps_mode)
-            loaded_range_ci = overlay_find_by_range(phys);
+            loaded_range_ci = overlay_find_by_range(
+                phys, &loader_mismatch_addr);
         exact_needs_load = lazy_exact;
         if (head < 0 && (loaded_range_ci < 0 || exact_needs_load) &&
             !lazy_loaded && try_load_region(phys)) {
@@ -3798,7 +3838,8 @@ retry_candidates:
      * so they run native directly here; device-touch funcs still go to interp. */
     if (head < 0 && g_psx_cps_mode) {
         int ci = loaded_range_ci >= 0 ? loaded_range_ci
-                                      : overlay_find_by_range(phys);
+                                      : overlay_find_by_range(
+                                            phys, &loader_mismatch_addr);
         int _probe = (s_cps_probe_pc && phys == s_cps_probe_pc);
         if (_probe) {
             s_cps_probe_count++;
@@ -4079,7 +4120,8 @@ retry_candidates:
                 c->state = ENTRY_INVALID;
             }
             s_stale_blocked++;
-            psx_xg_render_auth_loader_mismatch(c->addr);
+            if (loader_mismatch_addr == 0u)
+                loader_mismatch_addr = c->addr;
         }
     }
 
@@ -4092,6 +4134,8 @@ retry_candidates:
         goto retry_candidates;
     }
 
+    if (loader_mismatch_addr != 0u)
+        psx_xg_render_auth_loader_mismatch(loader_mismatch_addr);
     if (overlay_cache_window_contains(phys)) lazy_miss_record(phys);
     s_disp_interp++;
     return 0;

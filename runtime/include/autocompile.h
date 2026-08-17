@@ -39,6 +39,10 @@ int  autocompile_busy(void);
 /* Kick a compile if configured and idle. Returns 1 if started. */
 int  autocompile_request(void);
 
+/* Start the one-time repair for a newly selected overlay plan when captures
+ * already exist but its plan-specific cache has not been populated. */
+int  autocompile_request_plan_repair(int plan_cache_ready);
+
 /* Emu-thread tick: applies a finished compile (cache rescan on success).
  * Must be called from the same thread that owns the overlay loader. */
 void autocompile_poll_main(void);

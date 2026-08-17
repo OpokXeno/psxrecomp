@@ -5925,6 +5925,11 @@ int main(int argc, char** argv) {
                         captures_path.string().c_str());
                 }
                 code_provider_init(cfg_backend, gcc_avail);
+                if (autocompile_request_plan_repair(
+                        overlay_loader_current_plan_cache_ready())) {
+                    std::fprintf(stdout,
+                        "psxrecomp: rebuilding overlay repairs for the current hook plan\n");
+                }
                 /* (sljit removed 2026-07-15: overlay_loader_apply_live_policy was
                  * called here once the backend resolved.) */
             }

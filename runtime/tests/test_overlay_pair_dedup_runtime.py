@@ -159,7 +159,8 @@ def scenario(tmp: pathlib.Path, harness: pathlib.Path, full_first: pathlib.Path,
     two = [(0x80010000, 4), (0x80010004, 4)]
     four = two + [(0x80010008, 4), (0x8001000C, 4)]
     first_tier = "gcc"
-    second_tier = "tcc" if name == "cross-tier" else "gcc"
+    second_tier = "tcc" if name in (
+        "cross-tier", "variant-chain", "all-stale") else "gcc"
     first_manifest = manifest(four if name == "alias-at-cap" else two)
     second_manifest = first_manifest
     first_library = partial if name == "partial-first" else full_first
@@ -187,6 +188,7 @@ def scenario(tmp: pathlib.Path, harness: pathlib.Path, full_first: pathlib.Path,
     run([str(harness), str(cache), name, str(first), str(second)])
     observed = trace.read_text(encoding="ascii").splitlines() if trace.exists() else []
     expected = ([] if rejects else ["init 1", "call 1", "flush 1"] if name == "alias-at-cap"
+                else ["init 1", "init 2", "call 2", "flush 2"] if name == "variant-chain"
                 else ["init 2"] if name == "partial-first"
                 else ["init 1", "init 2"])
     if observed != expected:
@@ -216,7 +218,7 @@ def main() -> int:
         for name in ("alias-at-cap", "manifest-mismatch",
                        "provenance-mismatch", "artifact-mismatch", "cross-tier",
                        "partial-first", "missing-identity", "lowercase-identity",
-                       "flat-cache"):
+                       "flat-cache", "variant-chain", "all-stale"):
             scenario(tmp, harness, full_first, full_second, partial, name)
     print("PASS: executable overlay whole-pair dedup behavior")
     return 0

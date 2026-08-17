@@ -33,6 +33,7 @@ import glob
 import hashlib
 import heapq
 import os
+from pathlib import Path
 import re
 import struct
 import subprocess
@@ -55,6 +56,163 @@ except ImportError:
 import json
 import platform
 import re
+
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+
+
+def _find_xg_repository() -> Path | None:
+    for candidate in (
+        SCRIPT_DIRECTORY,
+        SCRIPT_DIRECTORY.parent,
+        SCRIPT_DIRECTORY.parent.parent,
+    ):
+        if (candidate / 'native_renderer' /
+                'xg_render_overlay_ranges.toml').is_file():
+            return candidate
+    return None
+
+
+XG_REPOSITORY = _find_xg_repository()
+if XG_REPOSITORY is not None:
+    xg_tools = XG_REPOSITORY / 'tools'
+    if not (xg_tools / 'native_render_overlay_codegen.py').is_file():
+        xg_tools = XG_REPOSITORY
+    sys.path.insert(0, str(xg_tools))
+    from native_render_manifest_model import ManifestError
+    from native_render_overlay_codegen import source_observation_plan_for_artifact
+    from native_render_overlay_ranges import (
+        OverlayRangeError,
+        load_overlay_range_variants,
+        merge_source_plans,
+        source_plan_for_overlay_ranges,
+    )
+    from native_render_runtime_variant_model import load_contract
+
+
+OVERLAY_PLAN_TOOL_INPUTS = (
+    'psxrecomp/tools/compile_overlays.py',
+    'tools/native_render_manifest_model.py',
+    'tools/native_render_overlay_codegen.py',
+    'tools/native_render_overlay_ranges.py',
+    'tools/native_render_runtime_variant_model.py',
+)
+
+
+def _overlay_plan_input(name: str) -> Path:
+    if XG_REPOSITORY is None:
+        raise FileNotFoundError(name)
+    source_path = XG_REPOSITORY / name
+    if source_path.is_file():
+        return source_path
+    if name == 'psxrecomp/tools/compile_overlays.py':
+        return Path(__file__).resolve()
+    packaged_path = XG_REPOSITORY / Path(name).name
+    if packaged_path.is_file():
+        return packaged_path
+    raise FileNotFoundError(name)
+
+
+def overlay_plan_hash(runtime_variants_manifest: str,
+                      overlay_ranges_manifest: str) -> int:
+    """Hash every game-side input that can change emitted overlay callbacks."""
+    inputs = (
+        ('native_renderer/xg_render_runtime_variants.toml',
+         Path(runtime_variants_manifest)),
+        ('native_renderer/xg_render_overlay_ranges.toml',
+         Path(overlay_ranges_manifest)),
+        *((name, _overlay_plan_input(name)) for name in OVERLAY_PLAN_TOOL_INPUTS),
+    )
+    aggregate = ''.join(
+        f'{name}={hashlib.sha256(path.read_bytes()).hexdigest()}\n'
+        for name, path in inputs
+    )
+    return int(hashlib.sha256(aggregate.encode('ascii')).hexdigest()[:8], 16)
+
+
+def source_observation_plan(args, data: bytes,
+                            load_address: int) -> str | None:
+    if args.runtime_variant_contract is None:
+        return None
+    return merge_source_plans(
+        source_observation_plan_for_artifact(
+            args.runtime_variant_contract, data, load_address),
+        source_plan_for_overlay_ranges(
+            args.overlay_range_variants, data, load_address),
+    )
+
+
+def add_source_observation_plan(cmd: list[str], plan: str | None,
+                                directory: str) -> None:
+    if plan is None:
+        return
+    path = Path(directory) / 'source-observation.plan'
+    path.write_text(plan, encoding='ascii', newline='\n')
+    cmd.extend(('--source-observation-plan', str(path)))
+
+
+def source_observation_plan_pcs(plan: str | None) -> set[int]:
+    if plan is None:
+        return set()
+    return {
+        (int(parts[1], 16) & 0x1FFFFFFF) | 0x80000000
+        for line in plan.splitlines()[1:]
+        if len(parts := line.split()) >= 2
+        and parts[0] in {'lifecycle', 'cutover', 'site'}
+    }
+
+
+def source_plan_repair_roots(cache_dir: str, plan_hash: int | None,
+                             plan: str | None, data: bytes,
+                             load_addr: int, size: int) -> set[int]:
+    """Recover current-byte canonical roots from the ordinary cache.
+
+    A native caller can reach a newly hooked PC without re-entering the runtime
+    dispatcher. Rebuilding only the hook PC therefore leaves stale internal
+    call paths active. The ordinary cache is identity-namespaced already; its
+    manifests nominate roots, and current_variant_func_ids authenticates every
+    nominated range against this capture before a root containing a current
+    plan PC becomes a repair demand.
+    """
+    if plan is None or plan_hash is None:
+        return set()
+    plan_suffix = f'_p{plan_hash:08x}'
+    if not cache_dir.endswith(plan_suffix):
+        return set()
+    plan_pcs = {
+        pc & 0x1FFFFFFF for pc in source_observation_plan_pcs(plan)
+    }
+    if not plan_pcs:
+        return set()
+    ordinary_dir = cache_dir[:-len(plan_suffix)]
+    try:
+        names = os.listdir(ordinary_dir)
+    except OSError:
+        return set()
+    roots = set()
+    for name in names:
+        if not name.endswith('.ranges'):
+            continue
+        ranges_path = os.path.join(ordinary_dir, name)
+        dll_path = os.path.splitext(ranges_path)[0] + overlay_ext()
+        if not os.path.isfile(dll_path) or os.path.getsize(dll_path) == 0:
+            continue
+        try:
+            with open(ranges_path, encoding='ascii', newline='') as source:
+                _pair_id, func_ids = parse_runtime_shard_manifest(
+                    source.read(), require_pair=False)
+        except (OSError, UnicodeError):
+            continue
+        for entry, _crc, ranges in current_variant_func_ids(
+                func_ids, data, load_addr, size):
+            if (len(ranges) == 1 and
+                    (ranges[0][0] & 0x1FFFFFFF) ==
+                    (entry & 0x1FFFFFFF) and
+                    any((ranges[0][0] & 0x1FFFFFFF) <= pc <
+                        (ranges[0][0] & 0x1FFFFFFF) + ranges[0][1]
+                        for pc in plan_pcs)):
+                roots.add((entry & 0x1FFFFFFF) | 0x80000000)
+    return roots
 
 
 @dataclass(frozen=True)
@@ -3000,6 +3158,8 @@ def generate_interior_fragment_static(interior: int, data: bytes,
                '--ws-config', os.path.abspath(args.game_toml),
                '--game-identity-sha256', args.game_identity_sha256,
                '--manifest-digest-sha256', args.manifest_identity_sha256]
+        add_source_observation_plan(
+            cmd, source_observation_plan(args, data, load_addr), tmp)
         sub_env = dict(os.environ)
         if args.cps:
             sub_env['PSX_CPS'] = '1'
@@ -3210,7 +3370,8 @@ def hosted_fragment_served_targets(requested: set[int], frag_ids: list,
 def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
                                data: bytes, seed_audit: dict,
                                forced_interiors: set[int],
-                               capture: dict | None = None) -> dict | None:
+                               capture: dict | None = None,
+                               source_plan: str | None = None) -> dict | None:
     """Build one explicit fragment job without mutating the shared seed set."""
     interiors = {
         a for a, reason in seed_audit['included_reasons'].items()
@@ -3230,8 +3391,9 @@ def make_interior_fragment_job(phys_addr: int, load_addr: int, size: int,
         seed_audit.get('static_interval_fragment_demands', set()))
     static_demands = static_exact_demands | static_interval_demands
     region_hi = phys_addr + size
+    exact_demands = forced_interiors | source_observation_plan_pcs(source_plan)
     forced = {
-        a for a in forced_interiors
+        a for a in exact_demands
         if phys_addr <= (a & 0x1FFFFFFF) < region_hi
     }
     if not (((interiors or dispatch_roots) and executed) or
@@ -3867,6 +4029,8 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                '--ws-config', os.path.abspath(args.game_toml),
                '--game-identity-sha256', args.game_identity_sha256,
                '--manifest-digest-sha256', args.manifest_identity_sha256]
+        add_source_observation_plan(
+            cmd, source_observation_plan(args, data, load_addr), tmp)
         r = subprocess.run(cmd, capture_output=True, text=True,
                            cwd=os.path.dirname(os.path.abspath(args.game_toml)),
                            env=sub_env)
@@ -5275,6 +5439,18 @@ def main():
                     help='path to psxrecomp-game.exe')
     ap.add_argument('--runtime-include', required=True,
                     help='path to psxrecomp runtime/include dir')
+    ap.add_argument(
+        '--runtime-variants-manifest',
+        default=(str(XG_REPOSITORY / 'native_renderer' /
+                     'xg_render_runtime_variants.toml')
+                 if XG_REPOSITORY is not None else None),
+        help='optional authenticated runtime-variant descriptor')
+    ap.add_argument(
+        '--overlay-ranges-manifest',
+        default=(str(XG_REPOSITORY / 'native_renderer' /
+                     'xg_render_overlay_ranges.toml')
+                 if XG_REPOSITORY is not None else None),
+        help='optional authenticated overlay cutover descriptor')
     ap.add_argument('--out-dir',         default='build-dev/cache',
                     help='cache root dir (default: build-dev/cache)')
     ap.add_argument('--gcc',             default='gcc',
@@ -5332,6 +5508,29 @@ def main():
                                             args.manifest_identity_sha256)
     except ValueError as exc:
         ap.error(str(exc))
+    args.runtime_variant_contract = None
+    args.overlay_range_variants = ()
+    args.overlay_plan_hash = None
+    if ((args.runtime_variants_manifest is None) !=
+            (args.overlay_ranges_manifest is None)):
+        ap.error('runtime-variants and overlay-ranges manifests must be supplied together')
+    if args.runtime_variants_manifest is not None:
+        if XG_REPOSITORY is None:
+            ap.error('authenticated overlay support modules are unavailable')
+        try:
+            args.runtime_variant_contract = load_contract(
+                Path(args.runtime_variants_manifest))
+            args.overlay_range_variants = load_overlay_range_variants(
+                Path(args.overlay_ranges_manifest))
+        except (ManifestError, OverlayRangeError) as error:
+            ap.error(str(error))
+        if (args.runtime_variant_contract.canonical.game_identity !=
+                args.identity.game_sha256 or
+                args.runtime_variant_contract.canonical.manifest_identity !=
+                args.identity.manifest_sha256):
+            ap.error('runtime variant descriptor does not match runtime identities')
+        args.overlay_plan_hash = overlay_plan_hash(
+            args.runtime_variants_manifest, args.overlay_ranges_manifest)
     forced_interiors = {
         (int(v, 0) & 0x1FFFFFFF) | 0x80000000
         for v in args.force_interior
@@ -5417,11 +5616,17 @@ def main():
         # overlay_loader.c scan_cache_dir(). Pre-1.0: no legacy fallback.
         cg = codegen_ver(args.runtime_include)
         ch = codegen_hash(args.runtime_include)
-        cache_dir = os.path.join(args.out_dir, game_id, identity_cache_namespace(args.identity),
-                                 args.compiler, cache_arch_abi(),
-                                  f'cg{cg}_{ch:08x}')
+        cache_tag = f'cg{cg}_{ch:08x}'
+        if args.overlay_plan_hash is not None:
+            cache_tag += f'_p{args.overlay_plan_hash:08x}'
+        cache_dir = os.path.join(args.out_dir, game_id,
+                                 identity_cache_namespace(args.identity),
+                                 args.compiler, cache_arch_abi(), cache_tag)
         os.makedirs(cache_dir, exist_ok=True)
-        print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x})')
+        plan_suffix = (f', plan {args.overlay_plan_hash:08x}'
+                       if args.overlay_plan_hash is not None else '')
+        print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x}'
+              f'{plan_suffix})')
 
     with open(args.captures) as f:
         captures = json.load(f)
@@ -5464,6 +5669,7 @@ def main():
         data      = base64.b64decode(cap['bytes_b64'])
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
         phys_addr = (load_addr & 0x1FFFFFFF)
+        plan      = source_observation_plan(args, data, load_addr)
         _label = f'overlay 0x{load_addr:08X} crc {crc32:08X}'
         if args.static:
             for captured_entry in _parse_addr_list(
@@ -5535,9 +5741,15 @@ def main():
             # DISPATCH_INTERIOR.  That provenance is precisely what
             # --force-interior restores.  Keep it isolated from the shared
             # region seed set and queue the fragment directly.
+            repair_roots = source_plan_repair_roots(
+                cache_dir, args.overlay_plan_hash, plan,
+                data, load_addr, size)
+            if repair_roots:
+                print(f'  plan repair: {len(repair_roots)} current-byte '
+                      'ordinary root(s) promoted')
             fragment_job = make_interior_fragment_job(
                 phys_addr, load_addr, size, data, seed_audit,
-                forced_interiors, cap)
+                forced_interiors | repair_roots, cap, source_plan=plan)
             if fragment_job is not None:
                 interior_frag_jobs.append(fragment_job)
 
@@ -5624,9 +5836,10 @@ def main():
                    # emits (backdrop screenX squash, and any sprite-tag/cull
                    # sites that resolve into overlay code) are applied. --ws-config
                    # only adopts the widescreen lists, not the game's exe/paths.
-                    '--ws-config', os.path.abspath(args.game_toml),
-                    '--game-identity-sha256', args.game_identity_sha256,
-                    '--manifest-digest-sha256', args.manifest_identity_sha256]
+                     '--ws-config', os.path.abspath(args.game_toml),
+                     '--game-identity-sha256', args.game_identity_sha256,
+                     '--manifest-digest-sha256', args.manifest_identity_sha256]
+            add_source_observation_plan(cmd, plan, tmp)
             print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
             sub_env = dict(os.environ)
