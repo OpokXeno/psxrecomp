@@ -213,6 +213,24 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-17 (Live overlay autocompile hitches eliminated; user-confirmed):**
+  A 122-second no-replay `perf` capture correlated the recurring severe FPS
+  drops with compiler-batch completion, not compiler CPU contention. Immediately
+  after the second and third Python compiler roots exited, the emulation thread
+  spent `86.318790..86.469999` (149 sampled ms) and
+  `119.524733..119.702150` (178 sampled ms) in `add_posix_cache_file` while a
+  completion fallback rebuilt the complete lazy cache index. `SCHED_IDLE`, idle
+  I/O priority, and one-E-core affinity could not remove work that still ran on
+  the emulation thread. Live autocompile now only transactionally writes cache
+  artifacts in the background; `dlopen`, manifest parsing, candidate
+  registration, and cache rescans are never performed for those artifacts by
+  the current process. Normal startup discovers and activates them on the next
+  launch. POSIX also retains the streamed shard result beyond the 8 KiB output
+  tail, and `autocompile_status` reports `activation=next_launch` plus deferred
+  publication/failure counters. The user tested `build/` and observed no FPS
+  drop. The POSIX contract test, publication-env check, interpreter perf guards,
+  12-scenario executable loader dedup test, init guard, candidate-capacity guard,
+  and decodable-fallback guard pass.
 - **2026-08-17 (Native replay 48 FPS pacing collapse fixed):** A complete
   11,193-VBlank Release replay proved the 48-52 FPS interval was not host CPU
   saturation: the emulation thread still spent 320-430 ms/s waiting in the

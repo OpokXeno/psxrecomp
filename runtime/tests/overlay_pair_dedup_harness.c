@@ -430,7 +430,16 @@ int main(int argc, char **argv) {
     ok &= expect_int("pre-rescan first retained", module_is_loaded(first),
                      rejected || partial ? 0 : 1);
     if (!reveal_second_pair(second)) return 3;
-    overlay_loader_rescan();
+    if (strcmp(scenario, "live-publication") == 0) {
+        OverlayPreparedImage *image = overlay_loader_prepare_published(second);
+        ok &= expect_int("live publication prepared", image != NULL, 1);
+        ok &= expect_int("live publication committed",
+                         overlay_loader_commit_published(image), 2);
+        ok &= expect_int("live publication lazy index",
+                         overlay_loader_lazy_manifest_count(), 4);
+    } else {
+        overlay_loader_rescan();
+    }
 
     ok &= expect_int("registered", overlay_loader_registered_count(),
                      rejected ? 0 : (alias ? 4 : (partial ? 2 : 4)));

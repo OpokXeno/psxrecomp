@@ -5920,7 +5920,8 @@ int main(int argc, char** argv) {
                     autocompile_configure(ac_cmd->c_str(), ac_cwd.c_str());
                     overlay_autocapture_set_enabled(1);
                     std::fprintf(stdout,
-                        "psxrecomp: overlay autocompile enabled (%s); cache=%s; captures=%s\n",
+                        "psxrecomp: overlay autocompile enabled (%s, activation next launch); "
+                        "cache=%s; captures=%s\n",
                         overlay_backend_name(eff), cache_dir.c_str(),
                         captures_path.string().c_str());
                 }

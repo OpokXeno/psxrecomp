@@ -160,7 +160,7 @@ def scenario(tmp: pathlib.Path, harness: pathlib.Path, full_first: pathlib.Path,
     four = two + [(0x80010008, 4), (0x8001000C, 4)]
     first_tier = "gcc"
     second_tier = "tcc" if name in (
-        "cross-tier", "variant-chain", "all-stale") else "gcc"
+        "live-publication", "cross-tier", "variant-chain", "all-stale") else "gcc"
     first_manifest = manifest(four if name == "alias-at-cap" else two)
     second_manifest = first_manifest
     first_library = partial if name == "partial-first" else full_first
@@ -215,7 +215,7 @@ def main() -> int:
         compile_fixture(args.gcc, full_second, instance=2)
         compile_fixture(args.gcc, partial, instance=1, partial=True)
         compile_harness(args.gcc, harness)
-        for name in ("alias-at-cap", "manifest-mismatch",
+        for name in ("live-publication", "alias-at-cap", "manifest-mismatch",
                        "provenance-mismatch", "artifact-mismatch", "cross-tier",
                        "partial-first", "missing-identity", "lowercase-identity",
                        "flat-cache", "variant-chain", "all-stale"):

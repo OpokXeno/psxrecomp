@@ -30,6 +30,7 @@ extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #else
+#  include <sys/stat.h>
 #  include <unistd.h>
 #endif
 
@@ -1687,6 +1688,68 @@ void overlay_loader_note_code_write(void) {
     }
 }
 
+static void append_lazy_manifest_index(int ci, const ManFn *man, int man_n) {
+    CacheEntry *entry = &s_cache_idx[ci];
+    entry->manifest_ok = 1;
+    entry->func_count = man_n;
+    entry->indexed_func_count = 0;
+    s_lazy_bundle_head[ci] = -1;
+    for (int mi = 0; mi < man_n; mi++) {
+        if (!man[mi].has_crc || man[mi].n <= 0) continue;
+        uint32_t exact = man[mi].entry & 0x1FFFFFFFu;
+        exact_entry_set(exact);
+        uint32_t bucket = (exact * 2654435761u) & LAZY_ENTRY_MASK;
+
+        if (s_lazy_man_n >= LAZY_MAN_CAP) {
+            s_lazy_man_overflow = 1;
+            break;
+        }
+        int li = s_lazy_man_n++;
+        LazyMan *lm = &s_lazy_man[li];
+        lm->cache_idx = ci;
+        lm->fn = man[mi];
+        lm->val_gen = 0;
+        lm->state = 0xFFu;
+        lm->next_bundle = s_lazy_bundle_head[ci];
+        s_lazy_bundle_head[ci] = li;
+        entry->indexed_func_count++;
+        /* Exact-entry chains historically insert at the head, so later cache
+         * entries win. Range ownership stays oldest-first. */
+        lm->next_entry = s_lazy_entry_head[bucket];
+        s_lazy_entry_head[bucket] = li;
+        if (s_lazy_entry_tail[bucket] < 0) s_lazy_entry_tail[bucket] = li;
+
+        uint8_t seen[RANGE_PAGE_COUNT / 8] = {0};
+        for (int r = 0; r < lm->fn.n; r++) {
+            uint32_t lo = lm->fn.lo[r] & 0x1FFFFFFFu;
+            uint32_t hi = lo + lm->fn.len[r] - 1u;
+            /* Unloaded manifests share page generations with registered DLL
+             * candidates, including paths appended by live publication. */
+            overlay_watch_set_range(lo, lm->fn.len[r]);
+            uint32_t p0 = lo >> 12, p1 = hi >> 12;
+            if (p0 >= RANGE_PAGE_COUNT) continue;
+            if (p1 >= RANGE_PAGE_COUNT) p1 = RANGE_PAGE_COUNT - 1u;
+            for (uint32_t p = p0; p <= p1; p++) {
+                uint8_t bit = (uint8_t)(1u << (p & 7u));
+                if (seen[p >> 3] & bit) continue;
+                seen[p >> 3] |= bit;
+                if (s_lazy_range_link_n >= LAZY_RANGE_LINK_CAP) {
+                    s_lazy_man_overflow = 1;
+                    break;
+                }
+                int ri = s_lazy_range_link_n++;
+                s_lazy_range_links[ri].cand = li;
+                s_lazy_range_links[ri].next = -1;
+                if (s_lazy_page_head[p] < 0) s_lazy_page_head[p] = ri;
+                else s_lazy_range_links[s_lazy_page_tail[p]].next = ri;
+                s_lazy_page_tail[p] = ri;
+            }
+            if (s_lazy_man_overflow) break;
+        }
+        if (s_lazy_man_overflow) break;
+    }
+}
+
 static void rebuild_lazy_manifest_index(void) {
     memset(s_exact_entry_bitmap, 0, sizeof(s_exact_entry_bitmap));
     s_lazy_man_n = 0;
@@ -1720,7 +1783,6 @@ static void rebuild_lazy_manifest_index(void) {
         if (!man) {
             loader_log("invalid overlay manifest %s (cache entry %s)", path,
                        s_cache_idx[ci].path);
-            free(man);
             continue;
         }
         if (!psx_game_identity_gate(&identity)) {
@@ -1728,65 +1790,7 @@ static void rebuild_lazy_manifest_index(void) {
             free(man);
             continue;
         }
-        s_cache_idx[ci].manifest_ok = 1;
-        s_cache_idx[ci].func_count = man_n;
-        for (int mi = 0; mi < man_n; mi++) {
-            if (!man[mi].has_crc || man[mi].n <= 0) continue;
-            uint32_t entry = man[mi].entry & 0x1FFFFFFFu;
-            exact_entry_set(entry);
-            uint32_t bucket = (entry * 2654435761u) & LAZY_ENTRY_MASK;
-
-            if (s_lazy_man_n >= LAZY_MAN_CAP) {
-                s_lazy_man_overflow = 1;
-                break;
-            }
-            int li = s_lazy_man_n++;
-            LazyMan *lm = &s_lazy_man[li];
-            lm->cache_idx = ci;
-            lm->fn = man[mi];
-            lm->val_gen = 0;
-            lm->state = 0xFFu;
-            lm->next_bundle = s_lazy_bundle_head[ci];
-            s_lazy_bundle_head[ci] = li;
-            s_cache_idx[ci].indexed_func_count++;
-            /* Exact-entry chains historically insert at the head, so later
-             * cache entries win. Keep that order distinct from range ownership
-             * below, which is oldest-first. */
-            lm->next_entry = s_lazy_entry_head[bucket];
-            s_lazy_entry_head[bucket] = li;
-            if (s_lazy_entry_tail[bucket] < 0) s_lazy_entry_tail[bucket] = li;
-
-            uint8_t seen[RANGE_PAGE_COUNT / 8] = {0};
-            for (int r = 0; r < lm->fn.n; r++) {
-                uint32_t lo = lm->fn.lo[r] & 0x1FFFFFFFu;
-                uint32_t hi = lo + lm->fn.len[r] - 1u;
-                /* Unloaded manifests must participate in the same page
-                 * generations as registered DLL candidates. Otherwise a CPU
-                 * copy can turn INVALID bytes into a match while both the
-                 * LazyMan state and final-miss cache remain stale forever. */
-                overlay_watch_set_range(lo, lm->fn.len[r]);
-                uint32_t p0 = lo >> 12, p1 = hi >> 12;
-                if (p0 >= RANGE_PAGE_COUNT) continue;
-                if (p1 >= RANGE_PAGE_COUNT) p1 = RANGE_PAGE_COUNT - 1u;
-                for (uint32_t p = p0; p <= p1; p++) {
-                    uint8_t bit = (uint8_t)(1u << (p & 7u));
-                    if (seen[p >> 3] & bit) continue;
-                    seen[p >> 3] |= bit;
-                    if (s_lazy_range_link_n >= LAZY_RANGE_LINK_CAP) {
-                        s_lazy_man_overflow = 1;
-                        break;
-                    }
-                    int ri = s_lazy_range_link_n++;
-                    s_lazy_range_links[ri].cand = li;
-                    s_lazy_range_links[ri].next = -1;
-                    if (s_lazy_page_head[p] < 0) s_lazy_page_head[p] = ri;
-                    else s_lazy_range_links[s_lazy_page_tail[p]].next = ri;
-                    s_lazy_page_tail[p] = ri;
-                }
-                if (s_lazy_man_overflow) break;
-            }
-            if (s_lazy_man_overflow) break;
-        }
+        append_lazy_manifest_index(ci, man, man_n);
         free(man);
         if (s_lazy_man_overflow) break;
     }
@@ -1866,6 +1870,45 @@ static void refresh_bios_resident_flags(void) {
 #define PSX_OVERLAY_ARCH_ABI PSX_OL_OS "-" PSX_OL_ARCH
 
 const char *overlay_loader_arch_abi(void) { return PSX_OVERLAY_ARCH_ABI; }
+
+/* Add one canonical live-publication path without walking every cache
+ * directory. Its manifest is appended by load_one_dll after strict parsing, so
+ * direct publication leaves the same additive index that a full rescan would. */
+static int cache_idx_add_published_path(const char *path) {
+    for (int i = 0; i < s_cache_idx_count; i++)
+        if (cache_path_equal(s_cache_idx[i].path, path)) return i;
+    if (s_cache_idx_count >= CACHE_IDX_CAP) {
+        loader_log("*** CACHE INDEX FULL (%d): published DLL %s is not indexed",
+                   CACHE_IDX_CAP, path);
+        return -1;
+    }
+    const char *base = strrchr(path, '/');
+    const char *backslash = strrchr(path, '\\');
+    if (!base || (backslash && backslash > base)) base = backslash;
+    base = base ? base + 1 : path;
+    uint32_t addr = 0, crc = 0;
+    if (!psx_overlay_cache_name_parse(base, &addr, &crc) ||
+        !cache_name_is_immutable(base))
+        return -1;
+
+    CacheEntry *entry = &s_cache_idx[s_cache_idx_count];
+    memset(entry, 0, sizeof(*entry));
+    entry->region_start = addr;
+    entry->logical_crc = crc;
+    entry->tier = (uint8_t)cache_tier_from_path(path);
+    entry->resident = cache_path_is_bios_resident(path);
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &attributes))
+        entry->mtime = ((uint64_t)attributes.ftLastWriteTime.dwHighDateTime << 32) |
+                       (uint64_t)attributes.ftLastWriteTime.dwLowDateTime;
+#else
+    struct stat st;
+    if (stat(path, &st) == 0) entry->mtime = (uint64_t)st.st_mtime;
+#endif
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+    return s_cache_idx_count++;
+}
 
 #ifndef _WIN32
 static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
@@ -3210,6 +3253,9 @@ static int load_one_dll(const char *dll_path,
         overlay_library_close(prepared);
         return 0;
     }
+    if (cache_idx >= 0 && !s_cache_idx[cache_idx].manifest_ok &&
+        psx_game_identity_gate(&manifest_identity))
+        append_lazy_manifest_index(cache_idx, man, man_n);
     /* A complete known pair remains a zero-slot operation even when no new
      * bundle of this size can fit. Parse and compare before durably suppressing
      * the cache entry; otherwise safe aliases become unreachable at the cap. */
@@ -3365,18 +3411,32 @@ OverlayPreparedImage *overlay_loader_prepare_published(const char *dll_path) {
 }
 
 int overlay_loader_commit_published(OverlayPreparedImage *image) {
-    if (!image) return 0;
+    if (!image) return -1;
     OverlayLibraryHandle handle = image->handle;
     image->handle = NULL;
     int loaded = 0;
     char canon[768];
     /* image->path is already canonical (prepare stored the handle-derived
      * form); re-validating is an idempotent freshness check. */
-    if (published_path_valid(image->path, canon, sizeof(canon)) &&
-        !dll_already_loaded(canon))
-        loaded = load_one_dll_prepared(canon, handle);
-    else
+    if (!published_path_valid(image->path, canon, sizeof(canon))) {
         overlay_library_close(handle);
+        free(image);
+        return -1;
+    }
+    if (dll_already_loaded(canon)) {
+        overlay_library_close(handle);
+        free(image);
+        return 0;
+    }
+    if (cache_idx_add_published_path(canon) < 0) {
+        overlay_library_close(handle);
+        free(image);
+        return -1;
+    }
+    /* A valid artifact may add no candidates because its pair is already
+     * represented or capacity is exhausted. Its path is still durably indexed,
+     * so a full directory rebuild cannot improve that result. */
+    loaded = load_one_dll_prepared(canon, handle);
     free(image);
     return loaded;
 }

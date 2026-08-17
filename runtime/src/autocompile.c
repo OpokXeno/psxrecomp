@@ -1,4 +1,7 @@
 /* autocompile.c — see autocompile.h. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "autocompile.h"
 #include "overlay_loader.h"
 
@@ -12,6 +15,11 @@
 #  include <windows.h>
 #else
 #  include <errno.h>
+#  ifdef __linux__
+#    include <limits.h>
+#    include <sched.h>
+#    include <sys/syscall.h>
+#  endif
 #  include <pthread.h>
 #  include <signal.h>
 #  include <stdatomic.h>
@@ -50,6 +58,8 @@ static void ac_state_store(int value) { atomic_store(&s_state, value); }
 static uint32_t     s_runs      = 0;
 static uint32_t     s_fails     = 0;
 static uint32_t     s_rescans   = 0;
+static uint32_t     s_publish_commit_run = 0;
+static uint32_t     s_publish_deferred_run = 0;
 /* Per-shard build accounting, parsed from compile_overlays.py's machine-readable
  * "PSX_SHARD_RESULT ok=N failed=M skipped=K" line. Before this, a compile run
  * that built zero shards because a header change broke EVERY shard compile
@@ -151,20 +161,12 @@ static void child_line_locked(void) {
     if (strncmp(s_child_line, marker, sizeof(marker) - 1) != 0) return;
     const char *path = s_child_line + sizeof(marker) - 1;
     if (!path[0]) return;
-    if (strlen(path) >= sizeof(((PublishItem *)0)->path)) {
-        s_publish_parse_fail_run++;
-        return;
-    }
-    PublishItem *item = (PublishItem *)calloc(1, sizeof(*item));
-    if (!item) {
-        s_publish_drops_run++;
-        return;
-    }
-    snprintf(item->path, sizeof(item->path), "%s", path);
-    if (s_publish_raw_tail) s_publish_raw_tail->next = item;
-    else s_publish_raw_head = item;
-    s_publish_raw_tail = item;
-    WakeConditionVariable(&s_publish_cv);
+    /* Live activation mutates global loader/dispatch tables and can force
+     * synchronous manifest/index work on the emulation thread. The compiler
+     * still publishes transactionally complete cache files, but this process
+     * deliberately leaves them untouched; normal startup discovers them on the
+     * next launch. Count markers from custom/older scripts for diagnostics. */
+    s_publish_deferred_run++;
 }
 
 static void publish_parse_locked(const char *buf, int n) {
@@ -560,10 +562,25 @@ static void posix_parse_publications(const char *buf, int n) {
             pthread_mutex_lock(&s_out_lock);
             s_publish_parse_fail_run++;
             pthread_mutex_unlock(&s_out_lock);
-        } else if (strncmp(s_posix_child_line, marker,
-                           sizeof(marker) - 1) == 0) {
+        } else {
+            int result_seen;
+            pthread_mutex_lock(&s_out_lock);
+            result_seen = parse_shard_result_line(s_posix_child_line);
+            pthread_mutex_unlock(&s_out_lock);
+            if (result_seen) {
+                s_posix_child_line_len = 0;
+                s_posix_child_line_overflow = 0;
+                continue;
+            }
+        }
+        if (!s_posix_child_line_overflow &&
+            strncmp(s_posix_child_line, marker, sizeof(marker) - 1) == 0) {
             const char *path = s_posix_child_line + sizeof(marker) - 1;
-            if (path[0]) posix_prepare_published(path);
+            if (path[0]) {
+                pthread_mutex_lock(&s_out_lock);
+                s_publish_deferred_run++;
+                pthread_mutex_unlock(&s_out_lock);
+            }
         }
         s_posix_child_line_len = 0;
         s_posix_child_line_overflow = 0;
@@ -656,6 +673,58 @@ static int capture_store_has_records(void) {
     return first != EOF && (first != '[' || (next != EOF && next != ']'));
 }
 
+#ifndef _WIN32
+static void posix_set_compile_background_policy(void) {
+    /* The live compiler is opportunistic coverage work, never frame-critical.
+     * nice alone still lets Linux migrate cc1 onto the same performance cores
+     * as the emulation thread. Keep the whole inherited process tree on one
+     * least-capable allowed CPU and let it run only at scheduler/I/O idle
+     * priority. Homogeneous systems simply donate one otherwise-idle CPU. */
+    (void)setpriority(PRIO_PROCESS, 0, 19);
+#ifdef __linux__
+    struct sched_param scheduler = {0};
+    (void)sched_setscheduler(0, SCHED_IDLE, &scheduler);
+#ifdef SYS_ioprio_set
+    enum { IOPRIO_WHO_PROCESS = 1, IOPRIO_CLASS_IDLE = 3,
+           IOPRIO_CLASS_SHIFT = 13 };
+    (void)syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0,
+                  IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT);
+#endif
+
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        int selected = -1;
+        unsigned long selected_max_khz = ULONG_MAX;
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            if (!CPU_ISSET(cpu, &allowed)) continue;
+            char path[128];
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",
+                     cpu);
+            FILE *frequency = fopen(path, "rb");
+            unsigned long max_khz = ULONG_MAX;
+            if (frequency) {
+                if (fscanf(frequency, "%lu", &max_khz) != 1)
+                    max_khz = ULONG_MAX;
+                fclose(frequency);
+            }
+            /* Pick the highest-numbered CPU among equally slow cores. */
+            if (selected < 0 || max_khz <= selected_max_khz) {
+                selected = cpu;
+                selected_max_khz = max_khz;
+            }
+        }
+        if (selected >= 0) {
+            cpu_set_t isolated;
+            CPU_ZERO(&isolated);
+            CPU_SET(selected, &isolated);
+            (void)sched_setaffinity(0, sizeof(isolated), &isolated);
+        }
+    }
+#endif
+}
+#endif
+
 /* Probe PATH for a real C compiler (gcc/cc/clang). A configured command string
  * alone cannot tell a developer checkout from a toolchain-less player. This
  * opens each candidate executable in each PATH directory. Memoized because PATH
@@ -712,6 +781,8 @@ int autocompile_request(void) {
     s_publish_prepare_fail = 0;
     s_publish_prepare_retry = 0;
     s_publish_prepare_giveup = 0;
+    s_publish_commit_run = 0;
+    s_publish_deferred_run = 0;
     s_publish_commit_active = 0;
     s_publish_input_done = 0;
     s_publish_stop = 0;
@@ -735,6 +806,7 @@ int autocompile_request(void) {
     if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
     if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
     SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
+    SetEnvironmentVariableA("PSX_OVERLAY_DEFER_ACTIVATION", "1");
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). The WHOLE command is
@@ -775,11 +847,11 @@ int autocompile_request(void) {
     }
 
     /* Compilation is opportunistic: it must never outrank the interpreter that
-     * keeps the current frame alive. cmd -> python -> gcc inherit below-normal
-     * priority, while the live compile script also defaults to one worker. */
+     * keeps the current frame alive. cmd -> python -> gcc inherit idle priority,
+     * while the live compile script also forces one worker. */
     BOOL ok = CreateProcessA(NULL, full, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS |
-                                 CREATE_SUSPENDED,
+                              CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS |
+                                  CREATE_SUSPENDED,
                              NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
     CloseHandle(wr);
     if (!ok) {
@@ -867,6 +939,8 @@ int autocompile_request(void) {
     s_posix_prepare_retry = s_posix_prepare_giveup = 0;
     s_posix_prepare_total_us = s_posix_prepare_max_us = 0;
     s_posix_prepare_last_us = 0;
+    s_publish_commit_run = 0;
+    s_publish_deferred_run = 0;
     s_posix_child_line_len = s_posix_child_line_overflow = 0;
     s_publish_drops_run = 0;
     s_publish_load_fail_run = s_publish_parse_fail_run = 0;
@@ -890,11 +964,12 @@ int autocompile_request(void) {
                 dup2(pipefd[1], STDERR_FILENO) < 0)
             _exit(127);
         close(pipefd[1]);
-        (void)setpriority(PRIO_PROCESS, 0, 10);
+        posix_set_compile_background_policy();
         if (s_cwd[0] && chdir(s_cwd) != 0) _exit(127);
         if (s_cache_dir[0]) setenv("PSX_OVERLAY_CACHE_DIR", s_cache_dir, 1);
         if (s_captures[0]) setenv("PSX_OVERLAY_CAPTURES", s_captures, 1);
         setenv("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1", 1);
+        setenv("PSX_OVERLAY_DEFER_ACTIVATION", "1", 1);
         execl("/bin/sh", "sh", "-c", s_cmd, (char *)NULL);
         _exit(127);
     }
@@ -993,8 +1068,11 @@ void autocompile_poll_main(void) {
     if (!s_out_lock_init) return;
     PublishItem *published = publish_ready_pop();
     if (published) {
-        if (overlay_loader_commit_published(published->image) <= 0)
+        int result = overlay_loader_commit_published(published->image);
+        if (result < 0)
             publish_note_load_failure();
+        else
+            s_publish_commit_run++;
         published->image = NULL; /* commit consumed it on every path */
         free(published);
         publish_commit_finished();
@@ -1012,11 +1090,12 @@ void autocompile_poll_main(void) {
     }
     pthread_mutex_unlock(&s_out_lock);
     if (published) {
-        if (overlay_loader_commit_published(published->image) <= 0) {
+        int result = overlay_loader_commit_published(published->image);
+        if (result < 0) {
             pthread_mutex_lock(&s_out_lock);
             s_publish_load_fail_run++;
             pthread_mutex_unlock(&s_out_lock);
-        }
+        } else s_publish_commit_run++;
         free(published);
         s_rescans++;
     }
@@ -1062,12 +1141,11 @@ void autocompile_poll_main(void) {
     if (s_shard_result_seen && s_shard_fail)
         s_shard_fail_total += s_shard_fail;
     ac_state_store(AC_IDLE);
-    /* Direct markers minimize handoff latency, then one idempotent batch-end
-     * rescan makes every successfully published artifact visible to additive
-     * cache queries and the lazy manifest index. This is intentionally once per
-     * compiler run, never once per DLL or interpreted instruction. */
-    overlay_loader_rescan();
-    s_rescans++;
+    /* Activation is a next-launch operation. Never enumerate, map, parse, or
+     * register newly compiled artifacts from this process: all of those mutate
+     * loader state and previously produced 150-180 ms emulation-thread stalls.
+     * Startup's ordinary cache scan activates every transactionally published
+     * artifact without any gameplay-time synchronization. */
     /* A run "failed" if the process exited non-zero OR it reported shard
      * failures. compile_overlays.py exits 2 when any shard that should have
      * built failed, so these usually agree; the parsed count is the detail. */
@@ -1221,6 +1299,9 @@ int autocompile_status_json(char *out, int cap) {
         "\"publish_prepare_total_us\":%llu,"
         "\"publish_prepare_max_us\":%llu,"
         "\"publish_prepare_last_us\":%llu,"
+        "\"publish_commit_run\":%u,\"publish_drops_run\":%u,"
+        "\"publish_load_fail_run\":%u,\"publish_parse_fail_run\":%u,"
+        "\"publish_deferred_run\":%u,\"activation\":\"next_launch\","
         "\"output_tail\":\"%s\"}",
         autocompile_configured(), names[ac_state_load() & 3], s_runs, s_fails,
         s_rescans, s_exit_code,
@@ -1231,5 +1312,8 @@ int autocompile_status_json(char *out, int cap) {
         publish_prepare_retry, publish_prepare_giveup,
         (unsigned long long)publish_prepare_total_us,
         (unsigned long long)publish_prepare_max_us,
-        (unsigned long long)publish_prepare_last_us, tail);
+        (unsigned long long)publish_prepare_last_us,
+        s_publish_commit_run, s_publish_drops_run,
+        s_publish_load_fail_run, s_publish_parse_fail_run,
+        s_publish_deferred_run, tail);
 }

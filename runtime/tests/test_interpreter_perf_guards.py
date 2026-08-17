@@ -196,10 +196,13 @@ def main():
     if "man_delay_slots_hashed(&lm->fn)" not in lazy_match:
         raise AssertionError("legacy manifests can expose unhashed delay slots")
     rebuild = body(loader, "rebuild_lazy_manifest_index")
-    if "overlay_watch_set_range(lo, lm->fn.len[r])" not in rebuild:
+    append_index = body(loader, "append_lazy_manifest_index")
+    if "overlay_watch_set_range(lo, lm->fn.len[r])" not in append_index:
         raise AssertionError("unloaded manifest pages are not generation-watched")
-    if "manifest_ok = 1" not in rebuild:
+    if "manifest_ok = 1" not in append_index:
         raise AssertionError("strictly parsed manifests are not marked usable")
+    if "append_lazy_manifest_index(ci, man, man_n);" not in rebuild:
+        raise AssertionError("full cache rebuild bypasses the shared manifest indexer")
     if "cache_idx_has_basename" in loader:
         raise AssertionError("immutable repair artifacts are still deduped by logical name")
     scan_one = body(loader, "scan_one_cache_dir")
@@ -229,11 +232,22 @@ def main():
         if guard not in range_lookup:
             raise AssertionError(f"loaded range selection lost tier/new-artifact ordering: {guard}")
     ac_poll = body(autocompile, "autocompile_poll_main")
-    if "one idempotent batch-end" not in ac_poll or "overlay_loader_rescan();" not in ac_poll:
-        raise AssertionError("direct shard handoff is not reconciled into the additive index")
-    if ("overlay_loader_commit_published(published->image)" not in ac_poll or
-            "overlay_loader_load_published(" in ac_poll):
-        raise AssertionError("emulation thread regressed to first-mapping published DLLs")
+    if "overlay_loader_rescan();" in ac_poll:
+        raise AssertionError("autocompile completion still rescans on the emulation thread")
+    if "Activation is a next-launch operation" not in ac_poll:
+        raise AssertionError("autocompile lost its deferred-activation contract")
+    child_line = body(autocompile, "child_line_locked")
+    posix_parse = body(autocompile, "posix_parse_publications")
+    if ("s_publish_deferred_run++" not in child_line or
+            "s_publish_deferred_run++" not in posix_parse):
+        raise AssertionError("published shards can still enter the live loader pipeline")
+    background = body(autocompile, "posix_set_compile_background_policy")
+    for guard in ("setpriority(PRIO_PROCESS, 0, 19)",
+                  "sched_setscheduler(0, SCHED_IDLE",
+                  "sched_setaffinity(0, sizeof(isolated), &isolated)",
+                  "IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT"):
+        if guard not in background:
+            raise AssertionError(f"POSIX live compiler lost background isolation: {guard}")
     watcher = body(autocompile, "watch_thread")
     preparer = body(autocompile, "publish_prepare_thread_main")
     if "out_append(buf, (int)got);" not in watcher:
@@ -266,6 +280,10 @@ def main():
     if ("load_one_dll_prepared(canon, handle)" not in commit_image or
             "overlay_library_close(handle)" not in commit_image):
         raise AssertionError("prepared image commit does not consume every speculative reference")
+    if "cache_idx_add_published_path(canon)" not in commit_image:
+        raise AssertionError("direct publication does not update the additive cache index")
+    if "return -1" not in commit_image:
+        raise AssertionError("publication commit cannot distinguish unreconciled paths")
     watched_write = body(memory, "overlay_watch_note_write")
     if "g_dirty_ram_exec_page_bitmap" not in watched_write:
         raise AssertionError("RAM writes do not clear stale per-page capture evidence")
@@ -343,7 +361,8 @@ def main():
         raise AssertionError("interpreter cycle fast path does not guard exact diagnostic modes")
     if "g_psx_cycle_fast_limit" in cyc_header:
         raise AssertionError("runtime cycle fast path leaked into the overlay-DLL shared header")
-    if "PSX_NO_DEBUG_TOOLS" not in starvation or "STARVATION_RING_ENABLED 0" not in starvation:
+    if ("#ifndef STARVATION_RING_ENABLED" not in starvation or
+            "STARVATION_RING_ENABLED 0" not in starvation):
         raise AssertionError("production still enables the diagnostic starvation ring")
     dep_mask = body(instr_cost, "psx_cyc_dep_res_mask")
     if ("op_roles[64]" not in dep_mask or "special_roles[64]" not in dep_mask or

@@ -492,6 +492,8 @@ class ShardStats:
 def publish_live_shard(path: str):
     """Tell the live runtime that a transactionally complete shard is ready."""
     if os.environ.get('PSX_OVERLAY_LIVE_AUTOCOMPILE') == '1':
+        if os.environ.get('PSX_OVERLAY_DEFER_ACTIVATION') == '1':
+            return
         print(f'PSX_SHARD_PUBLISHED {os.path.abspath(path)}', flush=True)
 
 

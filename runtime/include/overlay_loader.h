@@ -53,6 +53,9 @@ void overlay_loader_rescan(void);
  * object owns exactly one speculative library reference until commit/discard. */
 typedef struct OverlayPreparedImage OverlayPreparedImage;
 OverlayPreparedImage *overlay_loader_prepare_published(const char *dll_path);
+/* Returns the number of newly registered candidates, 0 when the canonical
+ * artifact was reconciled into the cache index without new candidates, and -1
+ * when it could not be reconciled. Consumes image on every path. */
 int overlay_loader_commit_published(OverlayPreparedImage *image);
 void overlay_loader_discard_prepared(OverlayPreparedImage *image);
 
