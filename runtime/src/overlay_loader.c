@@ -1337,6 +1337,7 @@ typedef struct {
     uint8_t tier;
     uint8_t manifest_ok;
     uint8_t load_failed;
+    uint8_t loaded;
     int resident;
     int capacity_suppressed;
     char path[768];
@@ -1890,6 +1891,7 @@ static int add_posix_cache_file(const PsxOverlayCacheFile *file, void *opaque) {
     e->tier = (uint8_t)tier;
     e->manifest_ok = 0;
     e->load_failed = 0;
+    e->loaded = 0;
     e->resident = cache_path_is_bios_resident(file->path);
     e->capacity_suppressed = 0;
     snprintf(e->path, sizeof(e->path), "%s", file->path);
@@ -1934,6 +1936,7 @@ static void scan_one_cache_dir(const char *dir, int tier) {
         e->tier = (uint8_t)tier;
         e->manifest_ok = 0;
         e->load_failed = 0;
+        e->loaded = 0;
         e->capacity_suppressed = 0;
         snprintf(e->path, sizeof(e->path), "%s", full);
         e->resident = cache_path_is_bios_resident(full);
@@ -2913,7 +2916,7 @@ static int load_bios_resident_shards(void) {
         CacheEntry *e = &s_cache_idx[i];
         if (!e->resident || e->func_count <= 0 ||
             e->indexed_func_count != e->func_count ||
-            e->capacity_suppressed || dll_already_loaded(e->path))
+            e->capacity_suppressed || e->loaded)
             continue;
         int loaded = load_one_dll(e->path, NULL);
         if (loaded > 0) { bundles++; functions += loaded; }
@@ -3258,6 +3261,9 @@ static int load_one_dll(const char *dll_path,
     free(man);
     if (registered == 0) return 0;
 
+    if (cache_idx >= 0 && cache_idx < s_cache_idx_count)
+        s_cache_idx[cache_idx].loaded = 1;
+
     /* The DLL may publish other PCs that were previously negative-cached. */
     lazy_miss_invalidate_loader();
 
@@ -3491,7 +3497,7 @@ static int lazy_is_loadable(int li, uint32_t region_start, uint32_t phys,
             s_cache_idx[ci].region_start == region_start) &&
         !s_cache_idx[ci].load_failed &&
         !s_cache_idx[ci].capacity_suppressed &&
-        !dll_already_loaded(s_cache_idx[ci].path) &&
+        !s_cache_idx[ci].loaded &&
         lazy_man_contains(&lm->fn, phys) && lazy_man_matches(lm);
 }
 
@@ -3511,7 +3517,7 @@ static int lazy_load_selected(int li) {
     if (ci < 0 || ci >= s_cache_idx_count || ci >= CACHE_IDX_CAP ||
         s_cache_idx[ci].load_failed ||
         s_cache_idx[ci].capacity_suppressed ||
-        dll_already_loaded(s_cache_idx[ci].path) ||
+        s_cache_idx[ci].loaded ||
         s_cache_idx[ci].func_count <= 0) return 0;
     /* If proactive warming has not reached this fragment yet, prefer the
      * historical synchronous path over running a potentially hot function in
@@ -3648,7 +3654,7 @@ static int lazy_has_preferred_exact_entry(uint32_t phys, int loaded_tier) {
             s_cache_idx[ci].tier <= loaded_tier ||
             s_cache_idx[ci].load_failed ||
             s_cache_idx[ci].capacity_suppressed ||
-            dll_already_loaded(s_cache_idx[ci].path))
+            s_cache_idx[ci].loaded)
             continue;
         if (lazy_man_matches(lm)) return 1;
     }
@@ -3790,6 +3796,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         return 0;
     }
     int lazy_loaded = 0;
+    int lazy_checked = 0;
     /* A reused address can have stale and live variants in one chain. Reject
      * renderer authentication only after loaded and lazy candidates all fail. */
     uint32_t loader_mismatch_addr = 0u;
@@ -3801,10 +3808,12 @@ retry_candidates:
     int lazy_exact = 0;
     int exact_needs_load = 0;
     if (head >= 0 && overlay_cache_window_contains(phys) && !lazy_loaded &&
-        lazy_has_preferred_exact_entry(phys, s_cand[head].tier) &&
-        try_load_region(phys)) {
-        lazy_loaded = 1;
-        goto retry_candidates;
+        lazy_has_preferred_exact_entry(phys, s_cand[head].tier)) {
+        lazy_checked = 1;
+        if (try_load_region(phys)) {
+            lazy_loaded = 1;
+            goto retry_candidates;
+        }
     }
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         lazy_exact = head < 0 && lazy_has_exact_entry(phys);
@@ -3820,9 +3829,12 @@ retry_candidates:
                 phys, &loader_mismatch_addr);
         exact_needs_load = lazy_exact;
         if (head < 0 && (loaded_range_ci < 0 || exact_needs_load) &&
-            !lazy_loaded && try_load_region(phys)) {
-            lazy_loaded = 1;
-            goto retry_candidates;
+            !lazy_loaded) {
+            lazy_checked = 1;
+            if (try_load_region(phys)) {
+                lazy_loaded = 1;
+                goto retry_candidates;
+            }
         }
         /* (sljit removed 2026-07-15: the JIT-on-miss gap-fill — off-thread
          * enqueue or synchronous compile — ran here. Misses fall to interp.) */
@@ -4128,10 +4140,13 @@ retry_candidates:
     /* Publish at most one cached DLL and retry this same dispatch once. This
      * preserves additive variant coverage without turning one guest transition
      * into an unbounded synchronous LoadLibrary loop. */
-    if (!lazy_loaded && s_active && overlay_cache_window_contains(phys) &&
-        try_load_region(phys)) {
-        lazy_loaded = 1;
-        goto retry_candidates;
+    if (!lazy_loaded && !lazy_checked && s_active &&
+        overlay_cache_window_contains(phys)) {
+        lazy_checked = 1;
+        if (try_load_region(phys)) {
+            lazy_loaded = 1;
+            goto retry_candidates;
+        }
     }
 
     if (loader_mismatch_addr != 0u)
@@ -5100,7 +5115,7 @@ int overlay_loader_dump_lazy_at(uint32_t addr, char *out, int cap) {
             "\"match\":%d,\"contains\":%d}",
             first ? "" : ",", li, ci, s_cache_idx[ci].region_start,
             base, s_cache_idx[ci].func_count, s_cache_idx[ci].indexed_func_count,
-            dll_already_loaded(s_cache_idx[ci].path), lm->fn.crc, live,
+            s_cache_idx[ci].loaded, lm->fn.crc, live,
             live == lm->fn.crc, lazy_man_contains(&lm->fn, phys));
         first = 0;
     }

@@ -271,8 +271,10 @@ static bool phase_has_active_transaction(void) {
 }
 
 static void clear_pending(void) {
-    memset(coordinator.pending_bindings, 0,
-           sizeof(coordinator.pending_bindings));
+    /* The count delimits readable entries, and stage_exact clears each slot
+     * before repopulating it. Clearing all 4096 semantic bindings here made
+     * every native particle cutover pay for an otherwise dead multi-megabyte
+     * write. */
     memset(&coordinator.pending_visual_id, 0,
            sizeof(coordinator.pending_visual_id));
     coordinator.pending_binding_count = 0u;

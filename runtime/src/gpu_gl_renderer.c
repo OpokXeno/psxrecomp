@@ -695,10 +695,11 @@ typedef struct NativeHostSemanticHistory {
     GpuRenderSemantic semantic;
     int base_x;
     int slot;
-    int valid;
+    uint32_t generation;
 } NativeHostSemanticHistory;
 static NativeHostSemanticHistory
     s_native_host_semantic_history[2][NATIVE_HOST_QUEUE_CAP];
+static uint32_t s_native_host_semantic_history_generation[2];
 static unsigned int s_native_host_semantic_history_index;
 static int s_native_host_semantic_history_valid;
 #define NATIVE_HOST_DIAG_PRIMITIVE_CAP (NATIVE_HOST_QUEUE_CAP * 8u)
@@ -5491,8 +5492,8 @@ void gl_renderer_native_midpoint_reset_for_reason(
     s_native_host_queue_last_present_count = 0u;
     s_native_host_queue_flushing = 0;
     s_native_host_queue_midpoint_rendered = 0;
-    memset(s_native_host_semantic_history, 0,
-           sizeof(s_native_host_semantic_history));
+    s_native_host_semantic_history_generation[0] = 0u;
+    s_native_host_semantic_history_generation[1] = 0u;
     s_native_host_semantic_history_index = 0u;
     s_native_host_semantic_history_valid = 0;
     s_native_midpoint_current_pending = 0;
@@ -10179,9 +10180,11 @@ static void native_host_queue_capture_history(
         size_t count, unsigned int history_index) {
     NativeHostSemanticHistory *history =
         s_native_host_semantic_history[history_index];
+    uint32_t generation =
+        ++s_native_host_semantic_history_generation[history_index];
 
-    memset(history, 0,
-           sizeof(s_native_host_semantic_history[history_index]));
+    if (generation == 0u)
+        generation = ++s_native_host_semantic_history_generation[history_index];
     for (size_t queue_index = 0u; queue_index < count; ++queue_index) {
         const NativeHostQueuedSemantic *queued = &s_native_host_queue[queue_index];
         const GpuRenderSemantic *semantic = &queued->current;
@@ -10198,7 +10201,7 @@ static void native_host_queue_capture_history(
             .semantic = *semantic,
             .base_x = queued->base_x,
             .slot = queued->slot,
-            .valid = 1,
+            .generation = generation,
         };
     }
 }
@@ -10291,7 +10294,9 @@ static int native_host_retired_context(
         int *out_base_x, int *out_slot) {
     if (s_native_host_semantic_history_valid &&
         previous_order < NATIVE_HOST_QUEUE_CAP &&
-        history[previous_order].valid &&
+        history[previous_order].generation ==
+            s_native_host_semantic_history_generation[
+                s_native_host_semantic_history_index] &&
         history[previous_order].semantic.interpolation_identity.scene_id ==
             semantic->interpolation_identity.scene_id &&
         history[previous_order].semantic.interpolation_identity.producer_id ==

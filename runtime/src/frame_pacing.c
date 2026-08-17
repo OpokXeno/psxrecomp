@@ -18,8 +18,11 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
     if (freq == 0) return 0;
     /* remaining <= period (~one frame of ticks), so *1000 cannot overflow. */
     uint64_t ms = (remaining * 1000u) / freq;
-    if (ms < 2) return 0;                      /* sub-2ms: spin instead */
-    return (uint32_t)(ms - 1);                 /* undershoot; spin covers rest */
+    if (ms == 0) return 0;                     /* sub-1ms: spin instead */
+    /* A one-millisecond sleep is preferable to burning the whole final
+     * millisecond in the counter-spin. Longer sleeps retain the existing
+     * one-millisecond undershoot for deadline precision. */
+    return ms == 1 ? 1u : (uint32_t)(ms - 1u);
 }
 
 #define FRAME_PACER_CATCHUP_MAX_PERIODS 12u

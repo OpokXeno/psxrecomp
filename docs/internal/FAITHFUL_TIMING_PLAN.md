@@ -213,6 +213,26 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-17 (Native replay CPU hot-path pass):** The complete 7,034-VBlank
+  16:9/native replay was used to profile the optimized build. The remaining
+  `__vdso_clock_gettime` cost is the precision spin in
+  `frame_pacer_wait_internal`, so pacing was intentionally left unchanged;
+  replacing it with a millisecond sleep could trade CPU for late/jittery
+  presents. Full semantic-workload and native-host-history clears were replaced
+  with metadata reset and generation invalidation. The CPU-core profile moved
+  `__memset_avx2_unaligned_erms` from 6.68% to 4.04%; the matching `perf stat`
+  run measured 53.065 seconds task-clock (50.356 user, 2.275 system). Evidence
+  `/tmp/opencode/xg-wide-60-native-memopt-profile-evidence.json` is
+  PASS/trace_complete, native/OpenGL, with zero missing and unsupported packets.
+- **2026-08-17 (Pacing clock experiment; user validation pending):** The final
+  sub-millisecond pacing spin was narrowed to less than 1 ms; when the integer
+  remainder is exactly 1 ms, the pacer sleeps once before the final spin. The
+  one replay was recorded and then reported from the same
+  `/tmp/opencode/xg-wide-60-native-vdso-perf.data` file: CPU-core
+  `__vdso_clock_gettime` fell from 15.34% to 5.53%. The replay evidence remains
+  PASS/trace_complete/native with zero missing or unsupported packets. Do not
+  call this change final until the user confirms that presentation remains
+  smooth outside perf instrumentation.
 - **2026-08-17 (Terrain Z-motion polygon gaps fixed without regressing lateral
   depth culling; user-confirmed):** The forward/back replay exposed gaps between
   mountain polygons only on generated interpolation frames. Endpoint continuity

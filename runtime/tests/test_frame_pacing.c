@@ -47,9 +47,11 @@ int main(void) {
     CHECK(frame_pacing_sleep_ms(deadline - FREQ / 100, deadline, FREQ, PERIOD) == 9,
           "10ms remaining sleeps 9ms");
 
-    /* 3. Sub-2ms remaining -> 0 (caller spins). */
-    CHECK(frame_pacing_sleep_ms(deadline - FREQ / 1000, deadline, FREQ, PERIOD) == 0,
-          "1ms remaining spins (0)");
+    /* 3. A full millisecond is sleepable; only sub-ms remaining spins. */
+    CHECK(frame_pacing_sleep_ms(deadline - FREQ / 1000, deadline, FREQ, PERIOD) == 1,
+          "1ms remaining sleeps 1ms");
+    CHECK(frame_pacing_sleep_ms(deadline - FREQ / 2000, deadline, FREQ, PERIOD) == 0,
+          "0.5ms remaining spins (0)");
 
     /* 4. Deadline absurdly far ahead (corrupt/poisoned state) -> clamped to
      *    one period, never a multi-day sleep. */

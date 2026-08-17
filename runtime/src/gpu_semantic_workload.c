@@ -1494,8 +1494,22 @@ static bool interpolate_source_geometry(
 
 void gpu_semantic_workload_reset(void) {
     if (workload_epoch != UINT64_MAX) ++workload_epoch;
-    memset(&workload, 0, sizeof(workload));
-    workload.diagnostics.epoch = workload_epoch;
+    for (size_t index = 0u; index < 2u; ++index) {
+        workload.frames[index].count = 0u;
+        workload.frames[index].unkeyed_count = 0u;
+        workload.frames[index].overflowed = false;
+        workload.frames[index].conflicted = false;
+        workload.anchor_frames[index].count = 0u;
+        workload.anchor_frames[index].overflowed = false;
+    }
+    workload.sealed_index = 0u;
+    workload.building_index = 0u;
+    workload.has_sealed = false;
+    workload.building = false;
+    workload.diagnostics = (GpuSemanticWorkloadDiagnostics){
+        .epoch = workload_epoch,
+    };
+    workload.last_motion = (GpuSemanticWorkloadMotionDiagnostics){ 0 };
 }
 
 GpuSemanticWorkloadStatus gpu_semantic_workload_begin(void) {
