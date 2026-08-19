@@ -8,8 +8,12 @@
  */
 #if defined(PSX_SDL3)
 
+#ifndef SDL_ENABLE_OLD_NAMES
 #define SDL_ENABLE_OLD_NAMES
+#endif
+#ifndef SDL_FUNCTION_POINTER_IS_VOID_POINTER
 #define SDL_FUNCTION_POINTER_IS_VOID_POINTER
+#endif
 #include <SDL3/SDL.h>
 
 #ifndef SDL_WINDOW_SHOWN
@@ -29,6 +33,12 @@
 #endif
 #ifndef SDL_MUTEX_TIMEDOUT
 #define SDL_MUTEX_TIMEDOUT 1
+#endif
+#ifndef SDL_RELEASED
+#define SDL_RELEASED 0
+#endif
+#ifndef SDL_PRESSED
+#define SDL_PRESSED 1
 #endif
 #ifndef SDL_HINT_RENDER_SCALE_QUALITY
 #define SDL_HINT_RENDER_SCALE_QUALITY "SDL_RENDER_SCALE_QUALITY"
@@ -182,6 +192,12 @@ static inline SDL_JoystickID psx_sdl_joystick_get_device_instance_id(int index)
     return psx_sdl_joystick_id_for_index(index);
 }
 
+static inline int psx_sdl_joystick_set_virtual_button(
+    SDL_Joystick *joystick, int button, Uint8 value)
+{
+    return SDL_SetJoystickVirtualButton(joystick, button, value != 0) ? 0 : -1;
+}
+
 static inline void psx_sdl_joystick_get_guid_string(
     SDL_GUID guid, char *buffer, int buffer_size)
 {
@@ -194,6 +210,11 @@ static inline int psx_sdl_cond_wait_timeout(
     return SDL_WaitConditionTimeout(condition, mutex, timeout_ms)
                ? 0
                : SDL_MUTEX_TIMEDOUT;
+}
+
+static inline SDL_ThreadID psx_sdl_thread_id(void)
+{
+    return SDL_GetCurrentThreadID();
 }
 
 #undef SDL_Init
@@ -230,13 +251,119 @@ static inline int psx_sdl_cond_wait_timeout(
 #define SDL_JoystickGetDeviceGUID psx_sdl_joystick_get_device_guid
 #undef SDL_JoystickGetDeviceInstanceID
 #define SDL_JoystickGetDeviceInstanceID psx_sdl_joystick_get_device_instance_id
+#undef SDL_JoystickSetVirtualButton
+#define SDL_JoystickSetVirtualButton psx_sdl_joystick_set_virtual_button
 #undef SDL_JoystickGetGUIDString
 #define SDL_JoystickGetGUIDString psx_sdl_joystick_get_guid_string
 #undef SDL_CondWaitTimeout
 #define SDL_CondWaitTimeout psx_sdl_cond_wait_timeout
+#define SDL_ThreadID() psx_sdl_thread_id()
+#define SDL_setenv SDL_setenv_unsafe
 
 #else
 
 #include <SDL.h>
 
 #endif
+
+#if defined(PSX_SDL3)
+typedef SDL_JoystickID PsxSdlVirtualJoystickID;
+#define PSX_SDL_INVALID_JOYSTICK_ID 0
+#else
+typedef int PsxSdlVirtualJoystickID;
+#define PSX_SDL_INVALID_JOYSTICK_ID -1
+#endif
+
+static inline PsxSdlVirtualJoystickID psx_sdl_joystick_attach_virtual(
+    SDL_JoystickType type, int naxes, int nbuttons, int nhats)
+{
+#if defined(PSX_SDL3)
+    SDL_VirtualJoystickDesc desc;
+    SDL_INIT_INTERFACE(&desc);
+    desc.type = (Uint16)type;
+    desc.naxes = (Uint16)naxes;
+    desc.nbuttons = (Uint16)nbuttons;
+    desc.nhats = (Uint16)nhats;
+    return SDL_AttachVirtualJoystick(&desc);
+#else
+    return SDL_JoystickAttachVirtual(type, naxes, nbuttons, nhats);
+#endif
+}
+
+static inline bool psx_sdl_virtual_joystick_valid(
+    PsxSdlVirtualJoystickID device)
+{
+#if defined(PSX_SDL3)
+    return device != 0;
+#else
+    return device >= 0;
+#endif
+}
+
+static inline SDL_GameController *psx_sdl_game_controller_open_virtual(
+    PsxSdlVirtualJoystickID device)
+{
+#if defined(PSX_SDL3)
+    return SDL_OpenGamepad(device);
+#else
+    return SDL_GameControllerOpen(device);
+#endif
+}
+
+static inline void psx_sdl_joystick_detach_virtual(
+    PsxSdlVirtualJoystickID device)
+{
+#if defined(PSX_SDL3)
+    (void)SDL_DetachVirtualJoystick(device);
+#else
+    (void)SDL_JoystickDetachVirtual(device);
+#endif
+}
+
+static inline int psx_sdl_joystick_set_virtual_axis(
+    SDL_Joystick *joystick, int axis, Sint16 value)
+{
+#if defined(PSX_SDL3)
+    return SDL_SetJoystickVirtualAxis(joystick, axis, value) ? 0 : -1;
+#else
+    return SDL_JoystickSetVirtualAxis(joystick, axis, value);
+#endif
+}
+
+static inline SDL_Keycode psx_sdl_event_keycode(const SDL_Event *event)
+{
+#if defined(PSX_SDL3)
+    return event->key.key;
+#else
+    return event->key.keysym.sym;
+#endif
+}
+
+static inline SDL_Keymod psx_sdl_event_keymod(const SDL_Event *event)
+{
+#if defined(PSX_SDL3)
+    return event->key.mod;
+#else
+    return (SDL_Keymod)event->key.keysym.mod;
+#endif
+}
+
+static inline void psx_sdl_start_text_input(SDL_Window *window)
+{
+#if defined(PSX_SDL3)
+    (void)SDL_StartTextInput(window);
+#else
+    (void)window;
+    SDL_StartTextInput();
+#endif
+}
+
+static inline void psx_sdl_stop_text_input(SDL_Window *window)
+{
+#if defined(PSX_SDL3)
+    (void)SDL_StopTextInput(window);
+#else
+    (void)window;
+    SDL_StopTextInput();
+#endif
+}

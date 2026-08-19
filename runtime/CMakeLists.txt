@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(PSXRECOMP_ROOT "${CMAKE_SOURCE_DIR}/..")
 include("${CMAKE_SOURCE_DIR}/runtime.cmake")
+if(PSX_SDL3)
+    add_compile_definitions(PSX_SDL3=1)
+endif()
 
 get_filename_component(XG_GAME_ROOT "${PSXRECOMP_ROOT}/.." ABSOLUTE)
 if(NOT EXISTS "${XG_GAME_ROOT}/native_renderer/CMakeLists.txt")
@@ -618,11 +621,11 @@ if(BUILD_TESTING)
         src/ws_ui_group.c
         src/gpu_gl_renderer.c)
     target_include_directories(gpu_gl_mask_order_test PRIVATE
-        include ${SDL2_INCLUDE_DIRS})
+        include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(gpu_gl_mask_order_test PRIVATE
         SDL_MAIN_HANDLED=1
         PSX_NO_DEBUG_TOOLS=1)
-    target_link_libraries(gpu_gl_mask_order_test PRIVATE ${SDL2_LIBRARIES})
+    target_link_libraries(gpu_gl_mask_order_test PRIVATE ${PSX_SDL_LIBRARIES})
     if(WIN32 OR MINGW)
         target_link_libraries(gpu_gl_mask_order_test PRIVATE opengl32)
         add_test(NAME gpu_gl_mask_order_test COMMAND gpu_gl_mask_order_test)
@@ -652,11 +655,11 @@ if(BUILD_TESTING)
         src/ws_ui_group.c
         src/gpu_gl_renderer.c)
     target_include_directories(gpu_gl_peek_order_test PRIVATE
-        include ${SDL2_INCLUDE_DIRS})
+        include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(gpu_gl_peek_order_test PRIVATE
         SDL_MAIN_HANDLED=1
         PSX_NO_DEBUG_TOOLS=1)
-    target_link_libraries(gpu_gl_peek_order_test PRIVATE ${SDL2_LIBRARIES})
+    target_link_libraries(gpu_gl_peek_order_test PRIVATE ${PSX_SDL_LIBRARIES})
     if(WIN32 OR MINGW)
         target_link_libraries(gpu_gl_peek_order_test PRIVATE opengl32)
         add_test(NAME gpu_gl_peek_order_test COMMAND gpu_gl_peek_order_test)
@@ -686,13 +689,13 @@ if(BUILD_TESTING)
         src/ws_ui_group.c
         src/gpu_gl_renderer.c)
     target_include_directories(xg_render_gl_transaction_test PRIVATE
-        include ${SDL2_INCLUDE_DIRS})
+        include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(xg_render_gl_transaction_test PRIVATE
         SDL_MAIN_HANDLED=1
         PSX_NO_DEBUG_TOOLS=1
         PSX_DEBUG_OVERLAY=1
         PSX_GL_TRANSACTION_TESTING=1)
-    target_link_libraries(xg_render_gl_transaction_test PRIVATE ${SDL2_LIBRARIES})
+    target_link_libraries(xg_render_gl_transaction_test PRIVATE ${PSX_SDL_LIBRARIES})
     if(WIN32 OR MINGW)
         target_link_libraries(xg_render_gl_transaction_test PRIVATE opengl32)
         add_test(NAME xg_render_gl_transaction
@@ -708,10 +711,10 @@ if(BUILD_TESTING)
         tests/test_guest_render_bridge.c
         src/guest_render_bridge.c)
     target_include_directories(guest_render_bridge_test PRIVATE
-        include ${SDL2_INCLUDE_DIRS})
+        include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(guest_render_bridge_test PRIVATE
         GUEST_RENDER_BRIDGE_TESTING=1)
-    target_link_libraries(guest_render_bridge_test PRIVATE ${SDL2_LIBRARIES})
+    target_link_libraries(guest_render_bridge_test PRIVATE ${PSX_SDL_LIBRARIES})
     add_test(NAME guest_render_bridge COMMAND guest_render_bridge_test)
 
     add_executable(native_render_mode_control_test
@@ -769,8 +772,8 @@ if(BUILD_TESTING)
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c)
     target_include_directories(xg_render_oracle_integration_test PRIVATE
-        include src ${SDL2_INCLUDE_DIRS})
-    target_link_libraries(xg_render_oracle_integration_test PRIVATE ${SDL2_LIBRARIES})
+        include src ${PSX_SDL_INCLUDE_DIRS})
+    target_link_libraries(xg_render_oracle_integration_test PRIVATE ${PSX_SDL_LIBRARIES})
     if(MSVC)
         target_compile_options(xg_render_oracle_integration_test PRIVATE /Gy)
         target_link_options(xg_render_oracle_integration_test PRIVATE /OPT:REF)
@@ -804,12 +807,12 @@ if(BUILD_TESTING)
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c)
     target_include_directories(gpu_atomic_checkpoint_test PRIVATE
-        include src ${SDL2_INCLUDE_DIRS})
+        include src ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(gpu_atomic_checkpoint_test PRIVATE
         GPU_RENDER_TRANSACTION_TESTING=1
         GUEST_RENDER_TRANSACTION_TESTING=1
         GPU_ATOMIC_CHECKPOINT_TESTING=1)
-    target_link_libraries(gpu_atomic_checkpoint_test PRIVATE ${SDL2_LIBRARIES})
+    target_link_libraries(gpu_atomic_checkpoint_test PRIVATE ${PSX_SDL_LIBRARIES})
     if(MSVC)
         target_compile_options(gpu_atomic_checkpoint_test PRIVATE /Gy)
         target_link_options(gpu_atomic_checkpoint_test PRIVATE /OPT:REF)
@@ -842,7 +845,7 @@ if(BUILD_TESTING)
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c)
     target_include_directories(xg_render_slot_substitution_test PRIVATE
-        include src ${SDL2_INCLUDE_DIRS})
+        include src ${PSX_SDL_INCLUDE_DIRS})
     set_target_properties(xg_render_slot_substitution_test PROPERTIES
         C_STANDARD 99
         C_STANDARD_REQUIRED YES
@@ -857,7 +860,7 @@ if(BUILD_TESTING)
         GUEST_RENDER_TRANSACTION_PENDING_CAPACITY=4
         DMA2_LINKED_LIST_MAX_NODES=8)
     target_link_libraries(xg_render_slot_substitution_test PRIVATE
-        ${SDL2_LIBRARIES})
+        ${PSX_SDL_LIBRARIES})
     if(MSVC)
         target_compile_options(xg_render_slot_substitution_test PRIVATE
             /W4 /WX /Gy)

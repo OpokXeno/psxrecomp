@@ -2340,6 +2340,17 @@ UserSettings load_user_settings(const fs::path& path) {
             s.fps = toml::find<int>(v, "fps");
             if (s.fps == 30 || s.fps == 60) s.has_fps = true;
         });
+        if (v.contains("frame_interpolation")) try_get([&]{
+            s.frame_interpolation = toml::find<bool>(v, "frame_interpolation");
+            s.has_frame_interpolation = true;
+        });
+        if (v.contains("frame_interpolation_fps")) try_get([&]{
+            s.frame_interpolation_fps =
+                toml::find<int>(v, "frame_interpolation_fps");
+            if (s.frame_interpolation_fps == 0 ||
+                s.frame_interpolation_fps >= 90)
+                s.has_frame_interpolation_fps = true;
+        });
         if (v.contains("aspect_ratio")) try_get([&]{
             const auto m = toml::find<std::string>(v, "aspect_ratio");
             int n = 0, d = 0;
@@ -2616,6 +2627,12 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "vsync             = \"" << (s.vsync == 0 ? "immediate" : s.vsync < 0 ? "adaptive" : "on") << "\"\n";
     if (s.has_fps)
         f << "fps               = " << s.fps << "\n";
+    if (s.has_frame_interpolation)
+        f << "frame_interpolation = "
+          << (s.frame_interpolation ? "true" : "false") << "\n";
+    if (s.has_frame_interpolation_fps)
+        f << "frame_interpolation_fps = "
+          << s.frame_interpolation_fps << "\n";
     if (s.has_aspect_ratio)
         f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
     if (s.has_adaptive_view)

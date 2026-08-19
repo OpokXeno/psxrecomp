@@ -3,7 +3,7 @@
 #include "gpu_render.h"
 #include "guest_render_native_stream.h"
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1270,7 +1270,9 @@ int main(void) {
     const GpuRenderBackend *backend;
     SDL_Window *window;
 
+#if !defined(PSX_SDL3)
     SDL_SetMainReady();
+#endif
     SDL_setenv("PSX_GL_PRESENT_PROBE", "1", 1);
     expect_true(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL video initializes");
     if (failures) return 1;

@@ -46,13 +46,14 @@ extern "C" SDL_AudioDeviceID psx_sdl_audio_open(
     }
 
     const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s_audio_stream);
-    SDL_AudioSpec obtained = requested;
-    (void)SDL_GetAudioDeviceFormat(device, &obtained, nullptr);
     if (have) {
         std::memset(have, 0, sizeof(*have));
-        have->freq = obtained.freq;
-        have->format = obtained.format;
-        have->channels = obtained.channels;
+        /* SDL3's device stream converts from the application-side format
+         * supplied above. Callers must generate that format, not the physical
+         * device format that SDL converts to internally. */
+        have->freq = requested.freq;
+        have->format = requested.format;
+        have->channels = requested.channels;
         have->samples = want->samples;
     }
 

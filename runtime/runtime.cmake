@@ -76,30 +76,6 @@ else()
     option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
-if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
-    if(MSVC)
-        file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_ROOT}/../sdl2-msvc/SDL2-*")
-        if(SDL2_MSVC_DIR)
-            set(SDL2_INCLUDE_DIRS "${SDL2_MSVC_DIR}/include")
-            set(SDL2_LIBRARIES "${SDL2_MSVC_DIR}/lib/x64/SDL2.lib")
-            message(STATUS "SDL2 MSVC: ${SDL2_MSVC_DIR}")
-        else()
-            message(FATAL_ERROR "SDL2 MSVC dev package not found")
-        endif()
-    else()
-        get_filename_component(_psxrecomp_compiler_dir "${CMAKE_C_COMPILER}" DIRECTORY)
-        find_program(_psxrecomp_pkg_config pkg-config
-            HINTS "${_psxrecomp_compiler_dir}"
-            NO_DEFAULT_PATH
-        )
-        if(_psxrecomp_pkg_config)
-            set(PKG_CONFIG_EXECUTABLE "${_psxrecomp_pkg_config}" CACHE FILEPATH "pkg-config executable" FORCE)
-        endif()
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(SDL2 REQUIRED sdl2)
-    endif()
-endif()
-
 set(PSXRECOMP_WAYLAND_PRESENTATION OFF)
 if(UNIX AND NOT APPLE AND NOT WIN32)
     find_package(PkgConfig QUIET)
@@ -180,6 +156,7 @@ set(PSX_SDL_INCLUDE_DIRS "")
 set(PSX_SDL_LIBRARY_DIRS "")
 set(PSX_SDL_LIBRARIES "")
 set(PSX_SDL_STATIC_LDFLAGS "")
+set(PSX_SDL_RUNTIME_TARGET "")
 set(PSX_SDL3 OFF)
 
 # Portable cmake-clang-v1 pack roots (wizard / RetComM / CI emitter fetch).
@@ -278,8 +255,26 @@ if(_psx_sdl_backend STREQUAL "SDL3")
     endif()
     if(PSX_STATIC_RUNTIME AND TARGET SDL3::SDL3-static)
         set(PSX_SDL_LIBRARIES SDL3::SDL3-static)
+    elseif(TARGET SDL3::SDL3-shared)
+        set(PSX_SDL_LIBRARIES SDL3::SDL3-shared)
+        set(PSX_SDL_RUNTIME_TARGET SDL3::SDL3-shared)
     else()
         set(PSX_SDL_LIBRARIES SDL3::SDL3)
+        get_target_property(_psx_sdl3_aliased_target
+            SDL3::SDL3 ALIASED_TARGET)
+        if(_psx_sdl3_aliased_target)
+            set(_psx_sdl3_inspect_target "${_psx_sdl3_aliased_target}")
+        else()
+            set(_psx_sdl3_inspect_target SDL3::SDL3)
+        endif()
+        get_target_property(_psx_sdl3_target_type
+            ${_psx_sdl3_inspect_target} TYPE)
+        if(_psx_sdl3_target_type STREQUAL "SHARED_LIBRARY")
+            set(PSX_SDL_RUNTIME_TARGET SDL3::SDL3)
+        endif()
+        unset(_psx_sdl3_aliased_target)
+        unset(_psx_sdl3_inspect_target)
+        unset(_psx_sdl3_target_type)
     endif()
     # Retained fork TUs still include <SDL.h> directly. SDL3 installs that
     # compatibility header one directory below the imported target's normal
@@ -1260,6 +1255,14 @@ function(psxrecomp_add_runtime_target target)
         target_link_libraries(${target} PRIVATE ${PSX_SDL_STATIC_LDFLAGS})
     else()
         target_link_libraries(${target} PRIVATE ${PSX_SDL_LIBRARIES})
+    endif()
+    if(WIN32 AND PSX_SDL_RUNTIME_TARGET)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:${PSX_SDL_RUNTIME_TARGET}>"
+                "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Staging SDL3 runtime DLL"
+            VERBATIM)
     endif()
     target_link_libraries(${target} PRIVATE Threads::Threads)
 

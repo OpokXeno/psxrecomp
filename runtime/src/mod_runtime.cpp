@@ -593,17 +593,33 @@ void copy_text(char* out, size_t capacity, const std::string& value) {
     std::snprintf(out, capacity, "%s", value.c_str());
 }
 
+bool launcher_hides_package(const ModPackage& package) {
+    return package.id == "psx.enhancement.pgxp";
+}
+
 int provider_package_count(void*) {
-    return (int)state().manager.packages().size();
+    int count = 0;
+    for (const auto& [package_id, versions] : state().manager.packages()) {
+        (void)versions;
+        const ModPackage* package = selected_package(package_id);
+        if (package && !launcher_hides_package(*package)) ++count;
+    }
+    return count;
 }
 
 int provider_package_get(void*, int index, RecompLauncherCModPackage* out) {
     if (!out || index < 0) return 0;
-    const auto& packages = state().manager.packages();
-    if ((size_t)index >= packages.size()) return 0;
-    auto item = packages.begin();
-    std::advance(item, index);
-    const ModPackage* package = selected_package(item->first);
+    const ModPackage* package = nullptr;
+    int visible_index = 0;
+    for (const auto& [package_id, versions] : state().manager.packages()) {
+        (void)versions;
+        const ModPackage* candidate = selected_package(package_id);
+        if (!candidate || launcher_hides_package(*candidate)) continue;
+        if (visible_index++ == index) {
+            package = candidate;
+            break;
+        }
+    }
     if (!package) return 0;
     std::memset(out, 0, sizeof(*out));
     copy_text(out->id, sizeof(out->id), package->id);
@@ -675,7 +691,7 @@ bool provider_feature_at(int index, const ModPackage*& package,
     for (const auto& [package_id, versions] : state().manager.packages()) {
         (void)versions;
         const ModPackage* selected = selected_package(package_id);
-        if (!selected) continue;
+        if (!selected || launcher_hides_package(*selected)) continue;
         for (const ModFeature& candidate : selected->features) {
             if (index-- == 0) {
                 package = selected;
@@ -709,7 +725,8 @@ int provider_feature_count(void*) {
     for (const auto& [package_id, versions] : state().manager.packages()) {
         (void)versions;
         const ModPackage* package = selected_package(package_id);
-        if (package) count += (int)package->features.size();
+        if (package && !launcher_hides_package(*package))
+            count += (int)package->features.size();
     }
     return count;
 }

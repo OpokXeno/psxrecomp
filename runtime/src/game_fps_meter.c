@@ -1,6 +1,6 @@
 #include "game_fps_meter.h"
 
-#include <SDL.h>
+#include "psx_sdl.h"
 #include <string.h>
 
 typedef struct {

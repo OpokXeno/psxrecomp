@@ -2,7 +2,7 @@
 #include "gpu_gl_renderer.h"
 #include "gpu_render.h"
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -117,7 +117,9 @@ static void test_depth24_transitions_land_pending_uploads(void) {
 int main(void) {
     SDL_Window *window;
 
+#if !defined(PSX_SDL3)
     SDL_SetMainReady();
+#endif
     expect_true(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL video initializes");
     if (failures) return 1;
 

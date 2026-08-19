@@ -87,7 +87,7 @@ def main() -> int:
     assert ft4_first.count(resident_ft4) == 2
     assert ft4_first.index("psx_gte_stall(cpu)") < ft4_first.index(resident_ft4, ft4_first.index("psx_gte_stall(cpu)"))
     first_pre = ft4_first.index("cpu, 0u, 0x8004A7E8u, 0xE90C0000u")
-    store = ft4_first.index("cpu->write_word(cpu->gpr[8], cpu->gte_data[12])")
+    store = ft4_first.index("cpu->write_word(_pgxa, _pgxv)")
     first_commit = ft4_first.index("cpu, 1u, 0x8004A7E8u, 0xE90C0000u")
     assert first_pre < store < first_commit
     assert resident_ft4 not in ft4_wrong_site
@@ -102,8 +102,7 @@ def main() -> int:
     assert "if (" + model_bypass not in model_observer
     model_post_bypass = (
         "psx_xg_render_auth_native_ft4_bypass(cpu, 0x8004A1ACu, 0xE8B60000u)")
-    model_post_store = (
-        "cpu->write_word(cpu->gpr[5], cpu->gte_data[22])")
+    model_post_store = "cpu->write_word(_pgxa, _pgxv)"
     assert model_post_observer.index(model_post_store) < \
         model_post_observer.index(model_post_bypass)
     assert "if (" + model_post_bypass not in model_post_observer

@@ -6,19 +6,9 @@
  * The whole API is guarded by PSX_DEBUG_OVERLAY: when undefined (Release
  * builds), every call is a static-inline no-op so callers compile to zero
  * code and zero symbols. The flag is set per-target by runtime.cmake only
- * when the build gate PSX_DEBUG_OVERLAY is ON. SDL types are forward-
- * declared to keep this header free of <SDL.h> (so Release callers that
- * never touch the overlay still need SDL for their other work; this header
- * is the only thing that needs to be included to get the no-op inlines). */
+ * when the build gate PSX_DEBUG_OVERLAY is ON. */
 #include <stdbool.h>
-
-/* Forward declarations matching SDL2's tag / typedef pattern.
- *   struct SDL_Window   — declared as `struct SDL_Window` in SDL_video.h
- *   SDL_GLContext       — `typedef void *SDL_GLContext` in SDL_video.h
- *   SDL_Event           — `typedef union SDL_Event SDL_Event` in SDL_events.h */
-struct SDL_Window;
-typedef void* SDL_GLContext;
-typedef union SDL_Event SDL_Event;
+#include "psx_sdl.h"
 
 #ifdef __cplusplus
 extern "C" {

@@ -33,7 +33,7 @@ struct PlayerRoute {
     uint8_t kind = 0;
     int mode = 0;
     bool hybrid_analog = false;
-    SDL_JoystickID instance = -1;
+    SDL_JoystickID instance = PSX_SDL_INVALID_JOYSTICK_ID;
 };
 
 struct MappingOptions {

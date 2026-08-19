@@ -375,7 +375,7 @@ struct PlayerInput {
     bool  hybrid_analog = false;
     int   deadzone = 3277;  /* raw SDL axis units, ~10% default */
     SDL_GameController* handle = nullptr;
-    SDL_JoystickID      instance = -1;
+    SDL_JoystickID      instance = PSX_SDL_INVALID_JOYSTICK_ID;
     uint8_t rumble_small = 0;
     uint8_t rumble_large = 0;
     bool    rumble_known = false;
@@ -1286,6 +1286,10 @@ extern "C" void psx_frame_interpolation_set(int enabled) {
     g_frame_interpolation = enabled ? 1 : 0;
     native_render_mode_control_set_interpolation(
         &g_native_render_mode_control, g_frame_interpolation != 0);
+}
+
+extern "C" int psx_frame_interpolation_enabled(void) {
+    return g_frame_interpolation;
 }
 
 /* Map the configured tri-state fullscreen mode (g_fullscreen) to the SDL
@@ -3132,9 +3136,9 @@ extern "C" int psx_audio_out_stats(double *fill_ms, double *target_ms,
         return sdl_audio_device != 0;
     }
     rab_stats st;
-    SDL_LockAudioDevice(sdl_audio_device);
+    psx_sdl_audio_lock(sdl_audio_device);
     rab_get_stats(&s_drc, &st);
-    SDL_UnlockAudioDevice(sdl_audio_device);
+    psx_sdl_audio_unlock(sdl_audio_device);
     *fill_ms = st.last_fill_ms;
     *target_ms = s_drc.cfg.target_ms;
     *underruns = st.underrun_events;
@@ -3538,16 +3542,16 @@ static void sdl_audio_worker_main(void) {
         }
 
         if (!sink && !audio_legacy_mode() && s_drc_ready) {
-            SDL_LockAudioDevice(sdl_audio_device);
+            psx_sdl_audio_lock(sdl_audio_device);
             const double fill_ms = rab_fill_ms(&s_drc);
             const double target_ms = s_drc.cfg.target_ms;
-            SDL_UnlockAudioDevice(sdl_audio_device);
+            psx_sdl_audio_unlock(sdl_audio_device);
             if (fill_ms >= target_ms + 20.0) {
                 SDL_Delay(2);
                 continue;
             }
         } else if (!sink && audio_legacy_mode()) {
-            const uint32_t queued = SDL_GetQueuedAudioSize(sdl_audio_device);
+            const uint32_t queued = psx_sdl_audio_queued_size(sdl_audio_device);
             const uint32_t max_queue = 44100u * sizeof(int16_t) * 2u / 5u;
             if (queued > max_queue) {
                 SDL_Delay(2);
@@ -3580,13 +3584,13 @@ static void sdl_audio_worker_main(void) {
 
         if (audio_legacy_mode()) {
             audio_trace_pcm(AUDIO_TAP_HOST, buffer, chunk_frames);
-            SDL_QueueAudio(sdl_audio_device, buffer,
-                           (uint32_t)chunk_frames * sizeof(int16_t) * 2u);
+            psx_sdl_audio_queue(sdl_audio_device, buffer,
+                                (uint32_t)chunk_frames * sizeof(int16_t) * 2u);
             legacy_had_audio = true;
         } else if (s_drc_ready) {
-            SDL_LockAudioDevice(sdl_audio_device);
+            psx_sdl_audio_lock(sdl_audio_device);
             rab_push(&s_drc, buffer, chunk_frames);
-            SDL_UnlockAudioDevice(sdl_audio_device);
+            psx_sdl_audio_unlock(sdl_audio_device);
         }
     }
 }
@@ -4085,7 +4089,7 @@ static void close_player(PlayerInput& p) {
             (void)SDL_GameControllerRumble(p.handle, 0, 0, 0);
         SDL_GameControllerClose(p.handle);
         p.handle = nullptr;
-        p.instance = -1;
+        p.instance = PSX_SDL_INVALID_JOYSTICK_ID;
     }
     p.rumble_small = 0;
     p.rumble_large = 0;
@@ -4132,7 +4136,8 @@ static void open_player(PlayerInput& p, int self_slot) {
     p.handle = SDL_GameControllerOpen(chosen);
     if (p.handle) {
         SDL_Joystick* joy = SDL_GameControllerGetJoystick(p.handle);
-        p.instance = joy ? SDL_JoystickInstanceID(joy) : -1;
+        p.instance = joy ? SDL_JoystickInstanceID(joy)
+                         : PSX_SDL_INVALID_JOYSTICK_ID;
         /* Persist the GUID of the pad we actually opened so per-device
          * [mapping.<guid>] lookups match the live hardware (including the
          * first-available fallback when the saved GUID is offline). */
@@ -11051,9 +11056,7 @@ namespace {
             g_rui_config_ini_path.empty() ? nullptr : g_rui_config_ini_path.c_str();
         gi->has_expected_crc = 0;
         gi->num_known_sha256 = 0;
-        /* PSX display-view controls are owned by trusted mods. Do not expose
-         * the generic Display -> View mode launcher row. */
-        gi->widescreen_supported = 0;
+        gi->widescreen_supported = ws_offered_b ? 1 : 0;
         gi->num_players = game_players_n;
         gi->msu1_supported = 0;
         gi->sram_path = nullptr;
@@ -11061,7 +11064,11 @@ namespace {
         gi->pad_mode_selectable = ctrl_lock_mode_b ? 0 : 1;
         gi->locked_pad_mode = locked_pad_mode_i;
         gi->lock_device = ctrl_lock_device_b ? 1 : 0;
-        gi->aspect_mask = 0;
+        gi->aspect_mask = (ws_offered_b || ws_ultrawide_offered_b)
+            ? (0x1 | (ws_offered_b ? 0x2 : 0) |
+               (ws_ultrawide_offered_b ? 0x4 : 0))
+            : 0;
+        gi->aspect_experimental = ws_offered_b ? 1 : 0;
         gi->renderer_labels = kPsxRendererLabels;
         gi->num_renderers = vulkan_offered_b ? 3 : 2;
         gi->settings_bindings = 1;
@@ -11069,7 +11076,8 @@ namespace {
         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
         gi->has_skip_fmv = skip_fmv_offered_b ? 1 : 0;
         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
-        gi->has_geometry_precision = 1;
+        /* PGXP is framework-owned and configured outside the launcher. */
+        gi->has_geometry_precision = 0;
         gi->has_rewind_depth = 1;
         if (language_labels && num_languages > 0) {
             gi->language_labels = language_labels;
@@ -11386,12 +11394,10 @@ int main(int argc, char** argv) {
     }
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
     bool ctrl_lock_device  = false; /* game.toml [controller] lock_device; true hides the Player controller cards entirely */
-    /* Widescreen/View mode and Skip FMVs are mod-owned on PSX. Their legacy
-     * game.toml offer flags remain parseable for old projects but deliberately
-     * cannot expose generic launcher controls or activate the features. Trusted
-     * activation plugins apply them after launcher/settings resolution. */
-    constexpr bool ws_offered = false;
-    constexpr bool ws_ultrawide_offered = false;
+    /* Widescreen is a per-title launcher offer. Frame interpolation and Skip
+     * FMVs remain mod-owned and are intentionally not exposed here. */
+    bool ws_offered = false;
+    bool ws_ultrawide_offered = false;
     constexpr bool frame_interpolation_offered = false;
     constexpr bool skip_fmv_offered = false;
     /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
@@ -11451,6 +11457,8 @@ int main(int argc, char** argv) {
             game_id   = gc.id;
             game_region = gc.region;
             game_players = gc.players;
+            ws_offered = gc.ws_offered;
+            ws_ultrawide_offered = gc.ws_ultrawide_offered;
             /* CTR ND intro: an older workaround (PSX_ND_SIB_FLAP_LAST=1) skipped
              * wide additive 0x36 in OT ranks 1600..2099 to unmask sibling flaps.
              * After the AVSZ3 MAC0 fix (unshifted product → correct MAC0>>17 OT
@@ -12248,6 +12256,10 @@ int main(int argc, char** argv) {
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
         if (us.has_fps) set_video_fps(us.fps);
+        if (us.has_frame_interpolation)
+            g_frame_interpolation = us.frame_interpolation ? 1 : 0;
+        if (us.has_frame_interpolation_fps)
+            g_frame_interpolation_fps = us.frame_interpolation_fps;
     }
 
     /* lock_mode: the game supports exactly ONE pad type (e.g. X4 / Tomba 2 are
@@ -12627,6 +12639,10 @@ int main(int argc, char** argv) {
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = g_fullscreen;                seed.has_fullscreen = true;
             seed.fps = g_video_fps;                     seed.has_fps = true;
+            seed.frame_interpolation = g_frame_interpolation != 0;
+            seed.has_frame_interpolation = frame_interpolation_offered;
+            seed.frame_interpolation_fps = g_frame_interpolation_fps;
+            seed.has_frame_interpolation_fps = frame_interpolation_offered;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
             seed.audio_freq = g_audio_freq;               seed.has_audio_freq = true;
@@ -12786,7 +12802,9 @@ int main(int argc, char** argv) {
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
             ls.screen_kind        = seed.screen_kind;
-            ls.fps                = seed.fps;
+            ls.fps               = seed.fps;
+            ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
+            ls.frame_interp_fps   = seed.frame_interpolation_fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
             ls.rewind_depth      = seed.rewind_depth > 0 ? seed.rewind_depth : 50;
             ls.rewind_interval   = seed.rewind_interval > 0 ? seed.rewind_interval : 15;
@@ -13023,9 +13041,11 @@ int main(int argc, char** argv) {
                 seed.perspective_texturing = ls.perspective_texturing != 0;
                 seed.has_perspective_texturing = true;
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
-                seed.fps                   = ls.fps;                    seed.has_fps                   = true;
-                seed.frame_interpolation   = ls.frame_interp != 0;     seed.has_frame_interpolation   = true;
-                seed.frame_interpolation_fps = ls.frame_interp_fps;    seed.has_frame_interpolation_fps = true;
+                seed.fps                   = ls.fps;                   seed.has_fps                   = true;
+                seed.frame_interpolation   = ls.frame_interp != 0;
+                seed.has_frame_interpolation = frame_interpolation_offered;
+                seed.frame_interpolation_fps = ls.frame_interp_fps;
+                seed.has_frame_interpolation_fps = frame_interpolation_offered;
                 seed.audio_freq            = ls.audio_freq;            seed.has_audio_freq            = true;
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
                 seed.rewind_depth          = ls.rewind_depth > 0 ? ls.rewind_depth : 50;
@@ -13228,6 +13248,10 @@ int main(int argc, char** argv) {
                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
                 g_video_screen    = seed.screen_kind;
+                g_frame_interpolation =
+                    frame_interpolation_offered && seed.frame_interpolation ? 1 : 0;
+                g_frame_interpolation_fps = frame_interpolation_offered
+                    ? seed.frame_interpolation_fps : 0;
                 g_auto_skip_fmv = skip_fmv_offered && seed.auto_skip_fmv ? 1 : 0;
                 g_turbo_loads_enabled =
                     turbo_loads_offered && seed.turbo_loads ? 1 : 0;
@@ -14694,6 +14718,7 @@ soft_return_lobby:
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
         ls.screen_kind = g_video_screen;
+        ls.fps = g_video_fps;
         ls.frame_interp = g_frame_interpolation ? 1 : 0;
         ls.frame_interp_fps = g_frame_interpolation_fps;
         ls.spu_hq = g_audio_spu_hq ? 1 : 0;
@@ -14949,6 +14974,8 @@ soft_return_lobby:
                 us.has_perspective_texturing = true;
                 us.screen_kind = ls.screen_kind;
                 us.has_screen_kind = true;
+                us.fps = ls.fps;
+                us.has_fps = true;
                 us.frame_interpolation = ls.frame_interp != 0;
                 us.has_frame_interpolation = true;
                 us.frame_interpolation_fps = ls.frame_interp_fps;
@@ -15001,6 +15028,7 @@ soft_return_lobby:
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
             g_video_screen = ls.screen_kind;
+            set_video_fps(ls.fps);
             /* Load acceleration and FMV skipping are mod-owned on PSX, and the
              * launcher struct these come from was snapshotted BEFORE
              * mod_runtime_activate_plugins() ran. Applying them here would

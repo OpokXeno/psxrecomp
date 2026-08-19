@@ -1,6 +1,6 @@
 #include "guest_render_bridge.h"
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 #include <stdint.h>
 #include <stddef.h>

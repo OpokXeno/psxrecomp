@@ -1163,6 +1163,8 @@ struct UserSettings {
     bool has_low_latency_input = false; bool low_latency_input = true;
     bool has_vsync             = false; int  vsync             = 1;
     bool has_fps = false; int fps = 30;
+    bool has_frame_interpolation = false; bool frame_interpolation = false;
+    bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
     // [launcher] — when true, boot straight into the game and skip the GUI
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.

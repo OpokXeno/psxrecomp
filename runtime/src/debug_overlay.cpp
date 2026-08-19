@@ -40,12 +40,22 @@
 #include "overlay_capture.h"
 
 /* The vendored Dear ImGui lives at recomp-ui/src/third_party/imgui. Its
- * include dirs are applied target-wide by recomp-ui/recomp_ui.cmake, so
- * the three headers below resolve from this TU. SDL2 headers come from the
- * runtime target (PSXRECOMP_RUNTIME_INCLUDE_DIRS + SDL2_INCLUDE_DIRS). */
-#include <SDL.h>
+ * include dirs are applied target-wide by recomp-ui/recomp_ui.cmake. */
+#include "psx_sdl.h"
 #include <imgui.h>
+#if defined(PSX_SDL3)
+#include <imgui_impl_sdl3.h>
+#define PSX_IMGUI_SDL_INIT_OPENGL ImGui_ImplSDL3_InitForOpenGL
+#define PSX_IMGUI_SDL_NEW_FRAME ImGui_ImplSDL3_NewFrame
+#define PSX_IMGUI_SDL_PROCESS_EVENT ImGui_ImplSDL3_ProcessEvent
+#define PSX_IMGUI_SDL_SHUTDOWN ImGui_ImplSDL3_Shutdown
+#else
 #include <imgui_impl_sdl2.h>
+#define PSX_IMGUI_SDL_INIT_OPENGL ImGui_ImplSDL2_InitForOpenGL
+#define PSX_IMGUI_SDL_NEW_FRAME ImGui_ImplSDL2_NewFrame
+#define PSX_IMGUI_SDL_PROCESS_EVENT ImGui_ImplSDL2_ProcessEvent
+#define PSX_IMGUI_SDL_SHUTDOWN ImGui_ImplSDL2_Shutdown
+#endif
 #include <imgui_impl_opengl3.h>
 
 /* png_write_rgb is the same dependency-free header the debug server uses to
@@ -113,6 +123,7 @@ extern "C" {
 #include "spu.h"
 
 extern void psx_frame_interpolation_set(int enabled);
+extern int psx_frame_interpolation_enabled(void);
 
 /* Memory read accessor — used by the RAM Inspector section. */
 extern uint8_t psx_read_byte(uint32_t addr);
@@ -1812,7 +1823,7 @@ void psx_debug_overlay_shutdown(void)
 {
     if (s_imgui_ready) {
         ImGui_ImplOpenGL3_Shutdown();
-        ImGui_ImplSDL2_Shutdown();
+        PSX_IMGUI_SDL_SHUTDOWN();
         ImGui::DestroyContext();
         s_imgui_ready = false;
     }
@@ -1840,16 +1851,12 @@ void psx_debug_overlay_toggle(void)
                                        &host_hz, &target_hz, &swaps);
         if (enabled && !s_interp_guard_active) {
             s_interp_guard_active = true;
-            gl_renderer_set_interpolation(0, host_hz, target_hz);
+            gl_renderer_set_interpolation(0, host_hz, target_hz, 0);
         }
     } else if (!s_visible && was_visible && s_interp_guard_active) {
         s_interp_guard_active = false;
-        int enabled = 0, suspended = 0, history = 0;
-        double host_hz = 0.0, target_hz = 0.0;
-        uint64_t swaps = 0;
-        gl_renderer_interpolation_diag(&enabled, &suspended, &history,
-                                       &host_hz, &target_hz, &swaps);
-        gl_renderer_set_interpolation(1, host_hz, target_hz);
+        if (psx_frame_interpolation_enabled())
+            psx_frame_interpolation_set(1);
     }
 }
 
@@ -1862,13 +1869,13 @@ bool psx_debug_overlay_process_event(const SDL_Event *ev)
 {
     if (!ev) return false;
 
-    /* Feed every SDL event into ImGui's SDL2 backend so its key state,
+    /* Feed every SDL event into ImGui's SDL backend so its key state,
      * mouse motion, and text-input composition stay current. Gated on
      * s_imgui_ready to avoid touching a dead context; harmless when hidden
      * (ImGui just queues events internally — no render). The Ctrl+F3
      * consume check below is unchanged. */
     if (s_imgui_ready) {
-        ImGui_ImplSDL2_ProcessEvent(ev);
+        PSX_IMGUI_SDL_PROCESS_EVENT(ev);
     }
 
     if (ev->type != SDL_KEYDOWN) return false;
@@ -1876,8 +1883,8 @@ bool psx_debug_overlay_process_event(const SDL_Event *ev)
      * plain F3 is the savestate load slot 2 hotkey in main.cpp, so
      * main.cpp consults this function before its savestate block and
      * skips the rest of the event when we return true. */
-    if (ev->key.keysym.sym == SDLK_F3 &&
-        (ev->key.keysym.mod & KMOD_CTRL)) {
+    if (psx_sdl_event_keycode(ev) == SDLK_F3 &&
+        (psx_sdl_event_keymod(ev) & KMOD_CTRL)) {
         psx_debug_overlay_toggle();
         return true;
     }
@@ -1973,7 +1980,7 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
             ImGui::GetStyle().ScaleAllSizes(1.25f);
         }
 
-        if (!ImGui_ImplSDL2_InitForOpenGL(s_win, ctx)) {
+        if (!PSX_IMGUI_SDL_INIT_OPENGL(s_win, ctx)) {
             /* Init failed — roll back and try again next frame. */
             ImGui::DestroyContext();
             return;
@@ -1981,7 +1988,7 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
         /* "#version 330 core" matches the GL context the runtime creates
          * (gpu_gl_renderer.c creates a core 3.3 context). */
         if (!ImGui_ImplOpenGL3_Init("#version 330 core")) {
-            ImGui_ImplSDL2_Shutdown();
+            PSX_IMGUI_SDL_SHUTDOWN();
             ImGui::DestroyContext();
             return;
         }
@@ -2050,7 +2057,7 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
     /* Step 2: render. Skipped when hidden (zero GL work). */
     if (s_visible) {
         ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL2_NewFrame();
+        PSX_IMGUI_SDL_NEW_FRAME();
         ImGui::NewFrame();
 
         ImGui::SetNextWindowSize(ImVec2(480, 640), ImGuiCond_FirstUseEver);
@@ -2132,10 +2139,10 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
          * state is correct for the NEXT PollEvent cycle. */
         ImGuiIO &io = ImGui::GetIO();
         if (io.WantTextInput && !s_text_input_started) {
-            SDL_StartTextInput();
+            psx_sdl_start_text_input(s_win);
             s_text_input_started = true;
         } else if (!io.WantTextInput && s_text_input_started) {
-            SDL_StopTextInput();
+            psx_sdl_stop_text_input(s_win);
             s_text_input_started = false;
         }
 
@@ -2149,7 +2156,7 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
          * inside the visible branch, so a toggle-while-typing leaves the
          * latch set — release it here to keep SDL text input off across the
          * open/close cycle. */
-        SDL_StopTextInput();
+        psx_sdl_stop_text_input(s_win);
         s_text_input_started = false;
     }
 

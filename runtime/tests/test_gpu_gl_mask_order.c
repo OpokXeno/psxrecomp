@@ -3,7 +3,7 @@
 #include "gpu_render.h"
 #include "gpu_semantic_workload.h"
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -2880,7 +2880,9 @@ int main(void) {
     test_dialogue_text_is_centered_with_its_box();
     if (failures) return 1;
 
+#if !defined(PSX_SDL3)
     SDL_SetMainReady();
+#endif
     SDL_setenv("PSX_GL_PRESENT_HASH", "1", 1);
     expect_true(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL video initializes");
     if (failures) return 1;

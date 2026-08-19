@@ -1,6 +1,6 @@
 #pragma once
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 #include <array>
 #include <cstdint>
@@ -9,7 +9,7 @@
 namespace host_input {
 
 struct ControllerSnapshot {
-    SDL_JoystickID instance = -1;
+    SDL_JoystickID instance = PSX_SDL_INVALID_JOYSTICK_ID;
     std::array<uint8_t, SDL_CONTROLLER_BUTTON_MAX> buttons{};
     std::array<int16_t, SDL_CONTROLLER_AXIS_MAX> axes{};
 };

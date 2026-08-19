@@ -1,7 +1,7 @@
 #ifndef PSX_INPUT_REPLAY_H
 #define PSX_INPUT_REPLAY_H
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 #include <array>
 #include <cstdint>

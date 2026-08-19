@@ -2,8 +2,10 @@
 
 #ifdef PSX_WAYLAND_PRESENTATION
 
-#include <SDL.h>
+#include "psx_sdl.h"
+#if !defined(PSX_SDL3)
 #include <SDL_syswm.h>
+#endif
 #include <wayland-client.h>
 
 #include "presentation-time-client-protocol.h"
@@ -127,6 +129,19 @@ static const struct wl_registry_listener s_registry_listener = {
 int psx_wayland_presentation_init(
         struct SDL_Window *window,
         PsxWaylandPresentationCallback callback, void *opaque) {
+#if defined(PSX_SDL3)
+    SDL_PropertiesID properties;
+
+    psx_wayland_presentation_shutdown();
+    if (!window) return 0;
+    properties = SDL_GetWindowProperties(window);
+    if (!properties) return 0;
+    s_display = (struct wl_display *)SDL_GetPointerProperty(
+        properties, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
+    s_surface = (struct wl_surface *)SDL_GetPointerProperty(
+        properties, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
+    if (!s_display || !s_surface) return 0;
+#else
     SDL_SysWMinfo info;
 
     psx_wayland_presentation_shutdown();
@@ -138,6 +153,7 @@ int psx_wayland_presentation_init(
         return 0;
     s_display = info.info.wl.display;
     s_surface = info.info.wl.surface;
+#endif
     s_callback = callback;
     s_callback_opaque = opaque;
     s_diagnostics.wayland_window = 1;

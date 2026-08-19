@@ -105,7 +105,8 @@ struct Replay {
     uint16_t checkpoint_expected = 0;
     std::vector<State> states;
     std::vector<Action> actions;
-    std::array<int, 2> devices{{-1, -1}};
+    std::array<PsxSdlVirtualJoystickID, 2> devices{{
+        PSX_SDL_INVALID_JOYSTICK_ID, PSX_SDL_INVALID_JOYSTICK_ID}};
     std::array<SDL_GameController*, 2> controllers{{nullptr, nullptr}};
     uint64_t index = 0;
     uint64_t action_index = 0;
@@ -648,7 +649,7 @@ bool update_pad(SDL_GameController* controller, const Pad& pad) {
                 ? INT16_MAX
                 : static_cast<int16_t>(trigger * 2 - 32768);
         }
-        if (SDL_JoystickSetVirtualAxis(joystick, axes[index], value) != 0)
+        if (psx_sdl_joystick_set_virtual_axis(joystick, axes[index], value) != 0)
             return false;
     }
     return true;
@@ -1378,14 +1379,29 @@ bool attach(SDL_GameController* players[2], std::string* error) {
             return state.pads[1].connected;
         });
     for (int slot = 0; slot < (p2_needed ? 2 : 1); ++slot) {
-        replay.devices[slot] = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER, SDL_CONTROLLER_AXIS_MAX, SDL_CONTROLLER_BUTTON_MAX, 0);
-        if (replay.devices[slot] < 0 || !(players[slot] = SDL_GameControllerOpen(replay.devices[slot]))) { *error = SDL_GetError(); detach(players); return false; }
+        replay.devices[slot] = psx_sdl_joystick_attach_virtual(
+            SDL_JOYSTICK_TYPE_GAMECONTROLLER, SDL_CONTROLLER_AXIS_MAX,
+            SDL_CONTROLLER_BUTTON_MAX, 0);
+        if (!psx_sdl_virtual_joystick_valid(replay.devices[slot]) ||
+            !(players[slot] =
+                  psx_sdl_game_controller_open_virtual(replay.devices[slot]))) {
+            *error = SDL_GetError();
+            detach(players);
+            return false;
+        }
         replay.controllers[slot] = players[slot];
     }
     return true;
 }
 void detach(SDL_GameController* players[2]) {
-    for (int slot = 0; slot < 2; ++slot) { if (players[slot]) SDL_GameControllerClose(players[slot]); players[slot] = nullptr; replay.controllers[slot] = nullptr; if (replay.devices[slot] >= 0) SDL_JoystickDetachVirtual(replay.devices[slot]); replay.devices[slot] = -1; }
+    for (int slot = 0; slot < 2; ++slot) {
+        if (players[slot]) SDL_GameControllerClose(players[slot]);
+        players[slot] = nullptr;
+        replay.controllers[slot] = nullptr;
+        if (psx_sdl_virtual_joystick_valid(replay.devices[slot]))
+            psx_sdl_joystick_detach_virtual(replay.devices[slot]);
+        replay.devices[slot] = PSX_SDL_INVALID_JOYSTICK_ID;
+    }
 }
 bool latch_vblank() {
     if (replay.index >= replay.budget || (!replay.actions.empty() && replay.action_index >= replay.actions.size()) ||

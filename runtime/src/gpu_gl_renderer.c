@@ -72,7 +72,7 @@
 #include "debug_overlay.h"
 #include "wayland_presentation.h"
 
-#include <SDL.h>
+#include "psx_sdl.h"
 #include <SDL_opengl.h>
 #include <limits.h>
 #include <stddef.h>

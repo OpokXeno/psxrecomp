@@ -23,7 +23,7 @@
 #include "crc32.h"
 #include "psx_cycles.h"
 
-#include <SDL_atomic.h>
+#include "psx_sdl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,8 +163,20 @@ typedef struct {
 static SpuVoice voices[SPU_VOICE_COUNT];
 static SDL_SpinLock s_spu_lock;
 
-static void spu_lock(void) { SDL_AtomicLock(&s_spu_lock); }
-static void spu_unlock(void) { SDL_AtomicUnlock(&s_spu_lock); }
+static void spu_lock(void) {
+#if defined(PSX_SDL3)
+    SDL_LockSpinlock(&s_spu_lock);
+#else
+    SDL_AtomicLock(&s_spu_lock);
+#endif
+}
+static void spu_unlock(void) {
+#if defined(PSX_SDL3)
+    SDL_UnlockSpinlock(&s_spu_lock);
+#else
+    SDL_AtomicUnlock(&s_spu_lock);
+#endif
+}
 
 void spu_state_lock(void) { spu_lock(); }
 void spu_state_unlock(void) { spu_unlock(); }
