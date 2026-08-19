@@ -8,9 +8,11 @@
 #include "game_identity.h"
 #include "xg_native_render_baseline.h"
 #endif
+#if defined(PSX_INPUT_REPLAY_XG_BASELINE) || defined(PSX_INPUT_REPLAY_XG_AUTH_PROOF)
+#include "xg_render_auth_runtime.h"
+#endif
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
 #include "xg_render_auth.h"
-#include "xg_render_auth_runtime.h"
 #include "xg_render_manifest_generated.h"
 #endif
 
@@ -335,6 +337,7 @@ bool auth_trace_contains_sequence(const XgRenderAuthTraceSnapshot& trace,
 }
 
 void write_auth_proof(std::ostream& output, uint16_t evidence_field_id) {
+    constexpr uint32_t kXenogearsFieldIdAddress = UINT32_C(0x8006f94e);
     XgRenderAuthSnapshot runtime_snapshot{};
     XgRenderAuthTraceSnapshot runtime_trace{};
     PsxXgRenderAuthProvenance provenance{};
@@ -370,10 +373,6 @@ void write_auth_proof(std::ostream& output, uint16_t evidence_field_id) {
         completed_proof.tier == XG_RENDER_AUTH_TIER_COLD_INTERPRETER;
     const bool warm_proof =
         completed_proof.tier == XG_RENDER_AUTH_TIER_WARM_NATIVE;
-    const bool field_binding_valid = replay.checkpoint_expected == 5u &&
-        replay.checkpoint_seen && replay.checkpoint_vblank <=
-            replay.counters.vblank_latches && replay.checkpoint_snapshot.valid_field &&
-        replay.checkpoint_snapshot.masked_field_id == 5u;
     const bool runtime_accepted = completed_proof.available &&
         instrumentation.completed_proof_publication_count > 0u &&
         !completed_proof.blocked &&
@@ -392,12 +391,9 @@ void write_auth_proof(std::ostream& output, uint16_t evidence_field_id) {
             runtime_proof_trace.return_sequence &&
         (cold_proof ||
          (warm_proof && completed_proof.candidate_matched &&
-          completed_proof.candidate_dispatched)) &&
-        field_binding_valid;
-    const bool cold_runtime = completed_proof.available && cold_proof &&
-        field_binding_valid;
-    const bool warm_runtime = completed_proof.available && warm_proof &&
-        field_binding_valid;
+           completed_proof.candidate_dispatched));
+    const bool cold_runtime = completed_proof.available && cold_proof;
+    const bool warm_runtime = completed_proof.available && warm_proof;
     const bool retained_blocked = completed_proof.available &&
         completed_proof.blocked;
     const bool candidate_matched = runtime_accepted
@@ -409,7 +405,7 @@ void write_auth_proof(std::ostream& output, uint16_t evidence_field_id) {
     const PsxXgRenderAuthRejectionReceipt rejection = retained_blocked
         ? completed_proof.blocker_rejection
         : PsxXgRenderAuthRejectionReceipt{};
-    const bool observed = static_accepted && runtime_accepted && field_binding_valid;
+    const bool observed = static_accepted && runtime_accepted;
     const char* reject_reason = xg_render_auth_reason_name(reject_reason_value);
     const char* rejection_source = psx_xg_render_auth_rejection_source_name(
         rejection.source);
@@ -541,7 +537,7 @@ void write_auth_proof(std::ostream& output, uint16_t evidence_field_id) {
 
 constexpr uint32_t kStableFieldVblanks = 4;
 constexpr uint64_t kMaxReplayVblanks = 1000000u;
-constexpr uint64_t kTask5ObservationVblanks = 600u;
+constexpr uint64_t kBaselineObservationVblanks = 600u;
 constexpr size_t kMaxSemanticTransitions = 64u;
 
 #ifdef PSX_INPUT_REPLAY_XG_BASELINE
@@ -1011,9 +1007,9 @@ bool load(const char* path, std::string* error) {
     if (!replay.baseline_request && baseline_env && baseline_env[0] == '1')
         replay.baseline_request = true;
     if (replay.baseline_request &&
-        (!v3 || !v2_stop_field || v2_stop_value != 5u ||
-         replay.checkpoint_expected != 5u)) {
-        *error = "baseline request requires a complete v3 Field 5 trace";
+        (!v3 || !v2_stop_field ||
+         v2_stop_value != replay.checkpoint_expected)) {
+        *error = "baseline request requires a complete checkpoint trace";
         return false;
     }
 #ifndef PSX_INPUT_REPLAY_XG_BASELINE
@@ -1460,27 +1456,32 @@ void note_snapshot(const Snapshot& snapshot) {
     replay.snapshot = snapshot;
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
     if (!replay.auth_instrumentation_started && snapshot.valid_field &&
-        snapshot.field_context != 0u && snapshot.masked_field_id == 5u) {
+        snapshot.field_context != 0u) {
         psx_xg_render_auth_cold_enable(true);
         psx_xg_render_auth_instrumentation_snapshot(
             &replay.auth_instrumentation_start);
         replay.auth_instrumentation_started = true;
     }
     if (replay.producer_family_requested && !replay.producer_family_armed &&
-        snapshot.valid_field && snapshot.field_context != 0u &&
-        snapshot.masked_field_id == 5u) {
+        snapshot.valid_field && snapshot.field_context != 0u) {
         psx_xg_render_auth_producer_family_enable(true);
         replay.producer_family_armed = true;
     }
 #endif
 #ifdef PSX_INPUT_REPLAY_XG_BASELINE
     if (replay.baseline_request && !replay.baseline_armed &&
-        snapshot.valid_field && snapshot.field_context != 0u &&
-        snapshot.masked_field_id == 5u) {
-        if (native_render_baseline_arm(&replay.baseline_config)) {
+        snapshot.valid_field && snapshot.field_context != 0u) {
+        uint32_t authenticated_producer_entry = 0u;
+        if (psx_xg_render_auth_authenticated_producer_entry(
+                &authenticated_producer_entry)) {
+            replay.baseline_config.authenticated_producer_address =
+                authenticated_producer_entry;
+        }
+        if (authenticated_producer_entry != 0u &&
+            native_render_baseline_arm(&replay.baseline_config)) {
             replay.baseline_armed = true;
             native_render_baseline_set_auto_finalize_vblanks(
-                kTask5ObservationVblanks);
+                kBaselineObservationVblanks);
             replay.baseline_sample_attempted = true;
             const XgNativeRenderBaselineResult sample =
                 xg_native_render_baseline_sample(memory_get_ram_ptr(),
@@ -1493,7 +1494,7 @@ void note_snapshot(const Snapshot& snapshot) {
     if (replay.lifecycle_stage == 0u && snapshot.requested_module == 1u) replay.lifecycle_stage = 1u;
     else if (replay.lifecycle_stage == 1u && snapshot.active_module == 1u) replay.lifecycle_stage = 2u;
     else if (replay.lifecycle_stage == 2u && snapshot.requested_module == 0u && snapshot.active_module == UINT32_MAX) replay.lifecycle_stage = 3u;
-    else if (replay.lifecycle_stage == 3u && snapshot.valid_field && snapshot.masked_field_id == 490u) replay.lifecycle_stage = 4u;
+    else if (replay.lifecycle_stage == 3u && snapshot.valid_field) replay.lifecycle_stage = 4u;
     if (!replay.actions.empty() && replay.action_index + 1u < replay.actions.size() &&
         replay.actions[replay.action_index].until_request != 0u &&
         replay.action_polls >= replay.actions[replay.action_index].min_polls &&
@@ -2649,7 +2650,27 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
                << ",\"previous_order\":" << event.previous_order
                << ",\"auxiliary\":" << event.auxiliary
                << ",\"value_a\":" << event.value_a
-               << ",\"value_b\":" << event.value_b << "}";
+               << ",\"value_b\":" << event.value_b
+               << ",\"surface_width\":" << event.surface_width
+               << ",\"base_x\":" << event.base_x
+               << ",\"slot\":" << event.slot
+               << ",\"current_edge_distance\":"
+               << event.current_edge_distance
+               << ",\"midpoint_edge_distance\":"
+               << event.midpoint_edge_distance
+               << ",\"current_x\":[" << event.current_x[0] << ","
+               << event.current_x[1] << "," << event.current_x[2]
+               << "],\"current_y\":[" << event.current_y[0] << ","
+               << event.current_y[1] << "," << event.current_y[2]
+               << "],\"midpoint_x\":[" << event.midpoint_x[0] << ","
+               << event.midpoint_x[1] << "," << event.midpoint_x[2]
+               << "],\"midpoint_y\":[" << event.midpoint_y[0] << ","
+               << event.midpoint_y[1] << "," << event.midpoint_y[2]
+               << "],\"current_z\":[" << event.current_z[0] << ","
+               << event.current_z[1] << "," << event.current_z[2]
+               << "],\"midpoint_z\":[" << event.midpoint_z[0] << ","
+               << event.midpoint_z[1] << "," << event.midpoint_z[2]
+               << "]}";
     }
     output << "]},\"context\":{\"valid\":" << (replay.snapshot.valid_field ? "true" : "false") << ",\"id\":" << replay.snapshot.masked_field_id << ",\"raw_id\":" << replay.snapshot.raw_field_id << ",\"progress\":" << replay.snapshot.game_progress << ",\"requested_module\":" << replay.snapshot.requested_module << ",\"active_module\":" << replay.snapshot.active_module << "},\"media\":{\"fmv_active\":" << (replay.media.fmv_active ? "true" : "false") << ",\"xa_streaming\":" << (replay.media.xa_streaming ? "true" : "false") << ",\"mdec_decode_count\":" << replay.media.mdec_decode_count << "},\"media_observation\":{\"samples\":" << replay.media_samples << ",\"fmv_seen\":" << (replay.fmv_seen ? "true" : "false") << ",\"fmv_active_samples\":" << replay.fmv_active_samples << ",\"fmv_first_vblank\":" << replay.fmv_first_vblank << ",\"fmv_last_vblank\":" << replay.fmv_last_vblank << ",\"xa_seen\":" << (replay.xa_seen ? "true" : "false") << ",\"xa_streaming_samples\":" << replay.xa_streaming_samples << ",\"xa_first_vblank\":" << replay.xa_first_vblank << ",\"xa_last_vblank\":" << replay.xa_last_vblank << ",\"first_mdec_decode_count\":" << replay.first_mdec_decode_count << ",\"max_mdec_decode_count\":" << replay.max_mdec_decode_count << "},\"loader\":{\"active\":" << replay.loader.overlay_active << ",\"registered\":" << replay.loader.overlay_registered << ",\"regions_checked\":" << replay.loader.overlay_regions_checked << ",\"file_found\":" << replay.loader.overlay_file_found << "},\"cd\":{\"has_disc\":" << replay.loader.cd_has_disc << ",\"reading\":" << replay.loader.cd_reading << ",\"sector_available\":" << replay.loader.cd_sector_available << ",\"pending_pending\":" << replay.loader.cd_pending_pending << ",\"pending_cmd\":" << (unsigned)replay.loader.cd_pending_cmd << ",\"queued_cmd\":" << (unsigned)replay.loader.cd_queued_cmd << "},\"semantic_overflow\":" << (replay.semantic_overflow ? "true" : "false") << ",\"semantic_transitions\":[";
     for (size_t index = 0; index < replay.semantic_transitions.size(); ++index) {
@@ -2919,6 +2940,10 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << ",\"template_misses\":" << model_ft3_shadow.template_miss_count
            << ",\"raw_color_differences\":"
            << model_ft3_shadow.raw_color_difference_count
+           << ",\"handler_projection_mismatches\":"
+           << model_ft3_shadow.handler_projection_mismatch_count
+           << ",\"last_handler_projection_mismatch_mask\":"
+           << model_ft3_shadow.last_handler_projection_mismatch_mask
            << ",\"guest_pass_observations\":"
            << model_ft3_shadow.guest_pass_observation_count
            << ",\"guest_pass_projection_disagreements\":"

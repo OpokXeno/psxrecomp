@@ -21,16 +21,16 @@ static const uint32_t kCop2Pc = 0x80012000u;
 static const uint32_t kNclipInsn = 0x4A000006u;
 static const uint32_t kStaleMac0 = 0x13579BDFu;
 static const uint32_t kExpectedMac0 = 19u;
-static const uint32_t kField5Swc2Pc = 0x80076858u;
-static const uint32_t kField5Swc2Insn = 0xE8590000u;
-static const uint32_t kField5CallPc = 0x800769C8u;
-static const uint32_t kField5CallInsn = 0x0C0129EFu;
-static const uint32_t kField5ReadPc = 0x800769E4u;
-static const uint32_t kField5ReadInsn = 0x8C630100u;
-static const uint32_t kField5BucketPc = 0x800769ECu;
-static const uint32_t kField5BucketInsn = 0x00621007u;
-static const uint32_t kField5WritePc = 0x80076A08u;
-static const uint32_t kField5WriteInsn = 0xAE040020u;
+static const uint32_t kVariantSwc2Pc = 0x80076858u;
+static const uint32_t kVariantSwc2Insn = 0xE8590000u;
+static const uint32_t kVariantCallPc = 0x800769C8u;
+static const uint32_t kVariantCallInsn = 0x0C0129EFu;
+static const uint32_t kVariantReadPc = 0x800769E4u;
+static const uint32_t kVariantReadInsn = 0x8C630100u;
+static const uint32_t kVariantBucketPc = 0x800769ECu;
+static const uint32_t kVariantBucketInsn = 0x00621007u;
+static const uint32_t kVariantWritePc = 0x80076A08u;
+static const uint32_t kVariantWriteInsn = 0xAE040020u;
 static const uint32_t kModelPostSwc2Pc = 0x8004A1ACu;
 static const uint32_t kModelPostSwc2Insn = 0xE8B60000u;
 static const uint32_t kSourcePreHook = PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE;
@@ -229,7 +229,7 @@ static void prepare_source_cpu(CPUState *cpu) {
     cpu->write_byte = test_write_byte;
 }
 
-static int test_field5_operations_emit_exact_source_observation_pairs(void) {
+static int test_runtime_operations_emit_exact_source_observation_pairs(void) {
     CPUState cpu = {0};
     uint32_t next_pc = 0u;
     const uint32_t read_address = 0x80010100u;
@@ -243,8 +243,8 @@ static int test_field5_operations_emit_exact_source_observation_pairs(void) {
 
     cpu.gpr[3] = 0x80010000u;
     test_write_word(read_address, 0x80020000u);
-    if (exec_one_fetched_observed(&cpu, kField5ReadPc & 0x1fffffffu,
-                                  kField5ReadInsn, &next_pc) != 0 ||
+    if (exec_one_fetched_observed(&cpu, kVariantReadPc & 0x1fffffffu,
+                                  kVariantReadInsn, &next_pc) != 0 ||
         cpu.gpr[3] != 0x80020000u) {
         fprintf(stderr, "HARNESS FAIL: selected read did not execute\n");
         return 0;
@@ -252,7 +252,7 @@ static int test_field5_operations_emit_exact_source_observation_pairs(void) {
 
     cpu.gpr[16] = 0x80010200u;
     cpu.gpr[4] = 0x12345678u;
-    if (exec_one_fetched_observed(&cpu, kField5WritePc, kField5WriteInsn,
+    if (exec_one_fetched_observed(&cpu, kVariantWritePc, kVariantWriteInsn,
                                   &next_pc) != 0 ||
         test_read_word(write_address) != 0x12345678u) {
         fprintf(stderr, "HARNESS FAIL: selected write did not execute\n");
@@ -261,7 +261,7 @@ static int test_field5_operations_emit_exact_source_observation_pairs(void) {
 
     cpu.gpr[2] = swc2_address;
     cpu.gte_data[25] = 0x11223344u;
-    if (exec_one_fetched_observed(&cpu, kField5Swc2Pc, kField5Swc2Insn,
+    if (exec_one_fetched_observed(&cpu, kVariantSwc2Pc, kVariantSwc2Insn,
                                   &next_pc) != 0 ||
         test_read_word(swc2_address) != gte_read_data(&cpu, 25u)) {
         fprintf(stderr, "HARNESS FAIL: selected SWC2 did not execute\n");
@@ -270,29 +270,29 @@ static int test_field5_operations_emit_exact_source_observation_pairs(void) {
 
     cpu.gpr[2] = 0x80000000u;
     cpu.gpr[3] = 1u;
-    if (exec_one_fetched_observed(&cpu, kField5BucketPc, kField5BucketInsn,
+    if (exec_one_fetched_observed(&cpu, kVariantBucketPc, kVariantBucketInsn,
                                   &next_pc) != 0 || cpu.gpr[2] != bucket_result) {
         fprintf(stderr, "HARNESS FAIL: selected bucket instruction did not execute\n");
         return 0;
     }
 
-    if (exec_one_fetched_observed(&cpu, kField5ReadPc + 0x100u,
-                                  kField5ReadInsn, &next_pc) != 0) {
+    if (exec_one_fetched_observed(&cpu, kVariantReadPc + 0x100u,
+                                  kVariantReadInsn, &next_pc) != 0) {
         fprintf(stderr, "HARNESS FAIL: foreign read did not execute\n");
         return 0;
     }
 
     const uint32_t expected_pcs[] = {
-        kField5ReadPc, kField5ReadPc,
-        kField5WritePc, kField5WritePc,
-        kField5Swc2Pc, kField5Swc2Pc,
-        kField5BucketPc, kField5BucketPc,
+        kVariantReadPc, kVariantReadPc,
+        kVariantWritePc, kVariantWritePc,
+        kVariantSwc2Pc, kVariantSwc2Pc,
+        kVariantBucketPc, kVariantBucketPc,
     };
     const uint32_t expected_instructions[] = {
-        kField5ReadInsn, kField5ReadInsn,
-        kField5WriteInsn, kField5WriteInsn,
-        kField5Swc2Insn, kField5Swc2Insn,
-        kField5BucketInsn, kField5BucketInsn,
+        kVariantReadInsn, kVariantReadInsn,
+        kVariantWriteInsn, kVariantWriteInsn,
+        kVariantSwc2Insn, kVariantSwc2Insn,
+        kVariantBucketInsn, kVariantBucketInsn,
     };
     const uint32_t expected_auxiliaries[] = {
         read_address, read_address,
@@ -332,28 +332,28 @@ static int test_field5_operations_emit_exact_source_observation_pairs(void) {
     return 1;
 }
 
-static int test_field5_call_preserves_pre_capture_delay_commit_order(void) {
+static int test_runtime_call_preserves_pre_capture_delay_commit_order(void) {
     CPUState cpu = {0};
     uint32_t next_pc = 0u;
     const int saved_precise_mode = g_precise_mode;
 
     prepare_source_cpu(&cpu);
     reset_source_observations();
-    test_write_word(kField5CallPc + 4u, 0u);
+    test_write_word(kVariantCallPc + 4u, 0u);
     g_precise_mode = 1;
     const int transferred = exec_one_fetched_observed(
-        &cpu, kField5CallPc, kField5CallInsn, &next_pc);
+        &cpu, kVariantCallPc, kVariantCallInsn, &next_pc);
     g_precise_mode = saved_precise_mode;
 
-    if (transferred != 1 || cpu.gpr[31] != kField5CallPc + 8u ||
+    if (transferred != 1 || cpu.gpr[31] != kVariantCallPc + 8u ||
         g_xg_render_auth_cold_hook_count != 3u ||
         g_xg_render_auth_cold_hook_kinds[0] != kSourcePreHook ||
         g_xg_render_auth_cold_hook_kinds[1] !=
             PSX_XG_RENDER_AUTH_HOOK_CAPTURE ||
         g_xg_render_auth_cold_hook_kinds[2] != kSourceCommitHook ||
-        g_xg_render_auth_cold_hook_pcs[0] != kField5CallPc ||
-        g_xg_render_auth_cold_hook_pcs[1] != kField5CallPc ||
-        g_xg_render_auth_cold_hook_pcs[2] != kField5CallPc ||
+        g_xg_render_auth_cold_hook_pcs[0] != kVariantCallPc ||
+        g_xg_render_auth_cold_hook_pcs[1] != kVariantCallPc ||
+        g_xg_render_auth_cold_hook_pcs[2] != kVariantCallPc ||
         g_xg_render_auth_cold_hook_delays[0] != 0u ||
         g_xg_render_auth_cold_hook_delays[2] != 0u ||
         g_xg_render_auth_source_operations[0] !=
@@ -446,8 +446,8 @@ int main(void) {
     }
 
     if (!test_compiled_return_emits_auth_hook()) return 1;
-    if (!test_field5_operations_emit_exact_source_observation_pairs()) return 1;
-    if (!test_field5_call_preserves_pre_capture_delay_commit_order()) return 1;
+    if (!test_runtime_operations_emit_exact_source_observation_pairs()) return 1;
+    if (!test_runtime_call_preserves_pre_capture_delay_commit_order()) return 1;
     if (!test_observe_after_sees_store_and_skips_lockstep_replay()) return 1;
 
     prepare_irq_case(&cpu);

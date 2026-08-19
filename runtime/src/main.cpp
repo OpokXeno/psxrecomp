@@ -433,6 +433,7 @@ static void present_session_reset(void) {
 extern "C" void psx_frontend_on_savestate_loaded(void) {
     extern void psx_xenogears_field_resident_invalidate(void);
     psx_xenogears_timing_on_savestate_loaded();
+    psx_xg_render_auth_scene_boundary();
     psx_xenogears_field_resident_invalidate();
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
@@ -3388,9 +3389,15 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+    const uint32_t previous_scene_generation =
+        psx_xenogears_timing_scene_generation();
+
     input_replay::note_guest_vblank();
     input_replay::record_note_guest_vblank();
     psx_xenogears_timing_vblank_boundary(mdec_recently_active(2));
+    if (psx_xenogears_timing_scene_generation() !=
+        previous_scene_generation)
+        psx_xg_render_auth_scene_boundary();
     gl_renderer_native_midpoint_set_suspended(
         !g_smooth_60fps_requested.load(std::memory_order_acquire) ||
         gpu_display_is_depth24() || mdec_recently_active(2));
@@ -5301,7 +5308,7 @@ int main(int argc, char** argv) {
         const bool close_record = cli_record_on_close;
         if (!cli_record_max_vblanks || net_cfg.enabled || g_headless ||
             (close_record ? cli_record_stop_field != 0u
-                          : cli_record_stop_field != 5u)) {
+                          : cli_record_stop_field == 0u)) {
             std::fprintf(stderr, "psxrecomp: input record requires one completion mode, a VBlank bound, and local video\n");
             return 1;
         }

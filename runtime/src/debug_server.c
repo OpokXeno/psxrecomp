@@ -8142,8 +8142,10 @@ static void handle_get_snapshots(int id, const char *json)
 typedef struct {
     uint32_t frame;
     uint16_t w, h;
-    uint8_t  depth24, valid;
+    uint16_t native_w, native_h;
+    uint8_t  depth24, valid, native_valid;
     uint16_t *px;                 /* DISP_RING_MAX_W*DISP_RING_MAX_H halfwords */
+    uint16_t *native_px;          /* Native-wide phase surface */
     uint16_t *vram;               /* full 1024x512 */
 } DispRingEntry;
 static DispRingEntry s_disp_ring[DISP_RING_CAP];
@@ -8163,17 +8165,21 @@ static void disp_ring_capture(void)
     if (!s_disp_ring_px) {
         size_t per  = (size_t)DISP_RING_MAX_W * DISP_RING_MAX_H;
         size_t vram = (size_t)1024 * 512;
-        s_disp_ring_px = (uint16_t *)malloc(DISP_RING_CAP * (per + vram) * sizeof(uint16_t));
+        s_disp_ring_px = (uint16_t *)malloc(
+            DISP_RING_CAP * (per * 2u + vram) * sizeof(uint16_t));
         if (!s_disp_ring_px) return;
         for (int i = 0; i < DISP_RING_CAP; i++) {
-            uint16_t *base = s_disp_ring_px + (size_t)i * (per + vram);
+            uint16_t *base =
+                s_disp_ring_px + (size_t)i * (per * 2u + vram);
             s_disp_ring[i].px   = base;
-            s_disp_ring[i].vram = base + per;
+            s_disp_ring[i].native_px = base + per;
+            s_disp_ring[i].vram = base + per * 2u;
         }
     }
     DispRingEntry *e = &s_disp_ring[(uint32_t)(s_frame_count % DISP_RING_CAP)];
     e->frame = (uint32_t)s_frame_count;
     e->valid = 0;
+    e->native_valid = 0;
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) return;
@@ -8196,6 +8202,23 @@ static void disp_ring_capture(void)
             for (uint32_t x = 0; x < w; x++)
                 e->px[y * w + x] =
                     gpu_vram_peek((int)(di.display_x + x), (int)(di.display_y + y));
+    }
+    {
+        extern int gl_renderer_native_view_width(void);
+        extern int gl_renderer_native_view_phase_peek(
+            int base_x, unsigned int phase, int x, int y,
+            int w_, int h_, uint16_t *out);
+        const int native_w = gl_renderer_native_view_width();
+
+        if (!di.depth24 && native_w > 0 && native_w <= DISP_RING_MAX_W &&
+            h <= DISP_RING_MAX_H &&
+            gl_renderer_native_view_phase_peek(
+                (int)di.display_x, 0u, 0, (int)di.display_y,
+                native_w, (int)h, e->native_px)) {
+            e->native_w = (uint16_t)native_w;
+            e->native_h = (uint16_t)h;
+            e->native_valid = 1;
+        }
     }
     /* Full-VRAM aux capture (same GL-truth/CPU-truth split as the display). */
     if (!gl_renderer_fbo_peek(0, 0, 1024, 512, e->vram)) {
@@ -8267,6 +8290,41 @@ static void handle_display_ring_get(int id, const char *json)
         rgb[i * 3 + 0] = (uint8_t)((p & 0x1F) << 3);
         rgb[i * 3 + 1] = (uint8_t)(((p >> 5) & 0x1F) << 3);
         rgb[i * 3 + 2] = (uint8_t)(((p >> 10) & 0x1F) << 3);
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(fp, rgb, w, h);
+    free(rgb);
+    fclose(fp);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%d,\"path\":\"%s\","
+             "\"width\":%u,\"height\":%u}", id, f, path, w, h);
+}
+
+static void handle_native_display_ring_get(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    if (f < 0) { send_err(id, "missing frame"); return; }
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path))) {
+        send_err(id, "missing path"); return;
+    }
+    if (!s_disp_ring_px) { send_err(id, "display ring not started"); return; }
+    DispRingEntry *e = &s_disp_ring[(uint32_t)((uint64_t)f % DISP_RING_CAP)];
+    if (!e->valid || e->frame != (uint32_t)f) {
+        send_err(id, "frame not in display ring"); return;
+    }
+    if (!e->native_valid) {
+        send_err(id, "native phase not in display ring"); return;
+    }
+    uint32_t w = e->native_w, h = e->native_h;
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3u);
+    if (!rgb) { send_err(id, "alloc failed"); return; }
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint16_t p = e->native_px[i];
+        rgb[i * 3u + 0u] = (uint8_t)((p & 0x1F) << 3);
+        rgb[i * 3u + 1u] = (uint8_t)(((p >> 5) & 0x1F) << 3);
+        rgb[i * 3u + 2u] = (uint8_t)(((p >> 10) & 0x1F) << 3);
     }
     FILE *fp = fopen(path, "wb");
     if (!fp) { free(rgb); send_err(id, "cannot open file"); return; }
@@ -14611,6 +14669,7 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
     { "display_ring_get",  handle_display_ring_get },
+    { "native_display_ring_get", handle_native_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },
     { "display_ring_stats", handle_display_ring_stats },
     { "dump_buffer",       handle_dump_buffer },

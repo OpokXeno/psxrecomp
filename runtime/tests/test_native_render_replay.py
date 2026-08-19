@@ -59,6 +59,7 @@ class NativeRenderReplayRecordTests(unittest.TestCase):
                 renderer="opengl",
                 disc=disc,
                 max_vblanks=216000,
+                checkpoint_field=5,
             )
 
             command = MOD.runtime_record_command(request)

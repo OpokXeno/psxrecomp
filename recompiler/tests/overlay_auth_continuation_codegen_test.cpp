@@ -19,20 +19,20 @@ constexpr uint32_t kJumpTarget = 0x80030000u;
 constexpr uint32_t kJal = 0x0C000000u | ((kTarget >> 2u) & 0x03FFFFFFu);
 constexpr uint32_t kJalrT9 = 0x0320F809u;
 constexpr uint32_t kJump = 0x08000000u | ((kJumpTarget >> 2u) & 0x03FFFFFFu);
-constexpr uint32_t kField5ObservationStart = 0x800765B0u;
-constexpr uint32_t kField5ObservationEnd = 0x80076A2Cu;
-constexpr uint32_t kField5UnselectedPc = 0x80076864u;
-constexpr uint32_t kField5UnselectedInstruction = 0x24840001u;
-constexpr uint32_t kField5CutoverPc = 0x800765DCu;
-constexpr uint32_t kField5CutoverInstruction = 0xAFA00028u;
-constexpr uint32_t kField5CutoverContinuation = 0x80076A28u;
+constexpr uint32_t kRuntimeVariantObservationStart = 0x800765B0u;
+constexpr uint32_t kRuntimeVariantObservationEnd = 0x80076A2Cu;
+constexpr uint32_t kRuntimeVariantUnselectedPc = 0x80076864u;
+constexpr uint32_t kRuntimeVariantUnselectedInstruction = 0x24840001u;
+constexpr uint32_t kRuntimeVariantCutoverPc = 0x800765DCu;
+constexpr uint32_t kRuntimeVariantCutoverInstruction = 0xAFA00028u;
+constexpr uint32_t kRuntimeVariantCutoverContinuation = 0x80076A28u;
 
 struct SourceObservationSite {
     uint32_t address;
     uint32_t instruction;
 };
 
-constexpr std::array<SourceObservationSite, 14> kField5ObservationSites = {{
+constexpr std::array<SourceObservationSite, 14> kRuntimeVariantObservationSites = {{
     {0x80076858u, 0x48026000u},
     {0x8007685Cu, 0x48036800u},
     {0x80076860u, 0x48047000u},
@@ -97,24 +97,24 @@ PSXRecomp::PS1Executable make_executable() {
     return executable;
 }
 
-PSXRecomp::PS1Executable make_field5_observation_executable() {
+PSXRecomp::PS1Executable make_runtime_variant_observation_executable() {
     PSXRecomp::PS1Executable executable{};
-    executable.header.load_address = kField5ObservationStart;
-    executable.header.initial_pc = kField5ObservationStart;
-    executable.code_data.assign(kField5ObservationEnd - kField5ObservationStart + 8u,
+    executable.header.load_address = kRuntimeVariantObservationStart;
+    executable.header.initial_pc = kRuntimeVariantObservationStart;
+    executable.code_data.assign(kRuntimeVariantObservationEnd - kRuntimeVariantObservationStart + 8u,
                                 0u);
     executable.header.file_size = static_cast<uint32_t>(executable.code_data.size());
     const uint32_t branch_offset =
-        (kField5CutoverContinuation - (kField5ObservationStart + 4u)) / 4u;
-    write_word(executable, kField5ObservationStart,
+        (kRuntimeVariantCutoverContinuation - (kRuntimeVariantObservationStart + 4u)) / 4u;
+    write_word(executable, kRuntimeVariantObservationStart,
                0x10400000u | (branch_offset & 0xFFFFu));
-    write_word(executable, kField5CutoverPc, kField5CutoverInstruction);
-    write_word(executable, kField5UnselectedPc, kField5UnselectedInstruction);
-    for (const SourceObservationSite& site : kField5ObservationSites) {
+    write_word(executable, kRuntimeVariantCutoverPc, kRuntimeVariantCutoverInstruction);
+    write_word(executable, kRuntimeVariantUnselectedPc, kRuntimeVariantUnselectedInstruction);
+    for (const SourceObservationSite& site : kRuntimeVariantObservationSites) {
         write_word(executable, site.address, site.instruction);
     }
-    write_word(executable, kField5ObservationEnd, 0x03E00008u);
-    write_word(executable, kField5ObservationEnd + 4u, 0u);
+    write_word(executable, kRuntimeVariantObservationEnd, 0x03E00008u);
+    write_word(executable, kRuntimeVariantObservationEnd + 4u, 0u);
     return executable;
 }
 
@@ -173,7 +173,7 @@ std::string generate_function(const PSXRecomp::PS1Executable& executable,
     set_cps(cps);
     PSXRecomp::CodeGenConfig config{};
     config.overlay_mode = true;
-    for (const SourceObservationSite& site : kField5ObservationSites) {
+    for (const SourceObservationSite& site : kRuntimeVariantObservationSites) {
         config.source_observation_sites.push_back({
             site.address, site.instruction,
             site.address == 0x800769C8u
@@ -183,9 +183,9 @@ std::string generate_function(const PSXRecomp::PS1Executable& executable,
         });
     }
     config.native_cutover_sites.push_back({
-        kField5CutoverPc, kField5CutoverInstruction,
+        kRuntimeVariantCutoverPc, kRuntimeVariantCutoverInstruction,
         PSXRecomp::CodeGenConfig::NativeCutoverTransfer::Local,
-        kField5CutoverContinuation,
+        kRuntimeVariantCutoverContinuation,
     });
     if (exact_lifecycle) {
         config.render_lifecycle_sites.push_back({
@@ -518,10 +518,10 @@ void test_cps_direct_jal_state_does_not_leak_between_functions() {
           "direct-JAL continuation state is cleared before the next function");
 }
 
-void test_field5_source_observation_hooks_are_exact_and_paired() {
-    PSXRecomp::PS1Executable executable = make_field5_observation_executable();
+void test_runtime_variant_source_observation_hooks_are_exact_and_paired() {
+    PSXRecomp::PS1Executable executable = make_runtime_variant_observation_executable();
     const PSXRecomp::Function function = make_function(
-        kField5ObservationStart, kField5ObservationEnd + 8u, "field5_observation");
+        kRuntimeVariantObservationStart, kRuntimeVariantObservationEnd + 8u, "runtime_variant_observation");
     const std::string output = generate_function(executable, function, true);
     const std::string non_cps_output = generate_function(executable, function, false);
     const std::string bypass =
@@ -534,19 +534,19 @@ void test_field5_source_observation_hooks_are_exact_and_paired() {
         "if (psx_xg_render_native_ft4_bypass(cpu, 0x800765DCu, "
         "0xAFA00028u)) { cpu->pc = 0u; goto block_80076A28; }";
     const std::string unselected_pre = source_observation_hook(
-        "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE", kField5UnselectedPc,
-        kField5UnselectedInstruction);
+        "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE", kRuntimeVariantUnselectedPc,
+        kRuntimeVariantUnselectedInstruction);
     const std::string unselected_commit = source_observation_hook(
-        "PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT", kField5UnselectedPc,
-        kField5UnselectedInstruction);
+        "PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT", kRuntimeVariantUnselectedPc,
+        kRuntimeVariantUnselectedInstruction);
 
     check(count_occurrences(output, "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE") ==
-              kField5ObservationSites.size(),
-          "each Field 5 descriptor site emits one source-observation pre hook");
+              kRuntimeVariantObservationSites.size(),
+          "each runtime descriptor site emits one source-observation pre hook");
     check(count_occurrences(output, "PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT") ==
-              kField5ObservationSites.size(),
-          "each Field 5 descriptor site emits one source-observation commit hook");
-    for (const SourceObservationSite& site : kField5ObservationSites) {
+              kRuntimeVariantObservationSites.size(),
+          "each runtime descriptor site emits one source-observation commit hook");
+    for (const SourceObservationSite& site : kRuntimeVariantObservationSites) {
         const std::string pre = source_observation_hook(
             "PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE", site.address, site.instruction);
         const std::string commit = source_observation_hook(
@@ -554,18 +554,18 @@ void test_field5_source_observation_hooks_are_exact_and_paired() {
         check(count_occurrences(output, pre) == 1u &&
                   count_occurrences(output, commit) == 1u &&
                   output.find(pre) < output.find(commit),
-              "a Field 5 descriptor site emits its exact pre/commit metadata pair");
+              "a runtime descriptor site emits its exact pre/commit metadata pair");
     }
     check(output.find(unselected_pre) == std::string::npos &&
               output.find(unselected_commit) == std::string::npos,
-          "an unselected Field 5 instruction remains free of source-observation hooks");
+          "an unselected runtime instruction remains free of source-observation hooks");
     check(output.find("cpu->gpr[4] = cpu->gpr[4] + 1;") != std::string::npos,
-          "an unselected Field 5 instruction retains its vanilla translation");
+          "an unselected runtime instruction retains its vanilla translation");
     check(count_occurrences(output, "psx_xg_render_native_ft4_bypass") == 2u &&
               output.find(bypass) != std::string::npos,
-          "the Field 5 descriptor emits exact early and call-boundary bypass queries");
+          "the runtime descriptor emits exact early and call-boundary bypass queries");
     check(output.find(cutover) != std::string::npos,
-          "the authenticated Field 5 cutover skips to the next actor");
+          "the authenticated runtime cutover skips to the next actor");
     check(appears_in_order(output, bypass, "/* delay slot (always executes) */",
                             cps_bypass),
           "CPS evaluates the bypass before the delay slot and transfers at the call boundary");
@@ -612,7 +612,7 @@ int main(int argc, char** argv) {
     test_cps_alias_body_emits_return_in_exact_case();
     test_jr_ra_and_jalr_emit_no_lifecycle_events();
     test_cps_direct_jal_state_does_not_leak_between_functions();
-    test_field5_source_observation_hooks_are_exact_and_paired();
+    test_runtime_variant_source_observation_hooks_are_exact_and_paired();
     test_manifest_lifecycle_suppresses_colliding_generic_return();
     return failures == 0 ? 0 : 1;
 }

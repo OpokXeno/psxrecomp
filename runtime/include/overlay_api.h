@@ -147,7 +147,7 @@
  *  16: authenticated shadow signals use generic producer-entry, internal
  *      observation, continuation, and producer-exit kinds. The runtime only
  *      turns an exact manifest-bound sequence into lifecycle observations.
- *  17: Field 5 source-observation pre/commit pairs at descriptor-selected
+ *  17: Source-observation pre/commit pairs at descriptor-selected
  *      PCs. Reuses the existing auth callback and leaves the ABI unchanged.
  *  18: source-call sites can bypass an authenticated native producer. */
 #define PSX_OVERLAY_CODEGEN_VER 18

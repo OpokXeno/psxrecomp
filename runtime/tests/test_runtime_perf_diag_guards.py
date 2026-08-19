@@ -18,7 +18,7 @@ def main():
     interp = (ROOT / "runtime/src/dirty_ram_interp.c").read_text(encoding="utf-8")
     memory = (ROOT / "runtime/src/memory.c").read_text(encoding="utf-8")
     debug_server = (ROOT / "runtime/src/debug_server.c").read_text(encoding="utf-8")
-    field_visual = (ROOT.parent / "tools/native_render_field490_visual.py").read_text(
+    field_visual = (ROOT.parent / "tools/native_render_visual.py").read_text(
         encoding="utf-8")
 
     require(main_cpp, 'std::getenv("PSX_RUNTIME_PERF_DIAG")',

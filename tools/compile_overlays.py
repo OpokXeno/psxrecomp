@@ -142,6 +142,16 @@ def source_observation_plan(args, data: bytes,
     )
 
 
+def runtime_variant_manifest_identity(
+        args, data: bytes, load_address: int) -> str | None:
+    if (args.runtime_variant_contract is None or
+            source_observation_plan_for_artifact(
+                args.runtime_variant_contract, data, load_address) is None or
+            args.runtime_variant_contract.document_identity is None):
+        return None
+    return bytes(args.runtime_variant_contract.document_identity).hex()
+
+
 def add_source_observation_plan(cmd: list[str], plan: str | None,
                                 directory: str) -> None:
     if plan is None:
@@ -2628,7 +2638,8 @@ def audit_func_id_delay_slots(func_ids: list, data: bytes,
 def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
                          provenance: str | None = None,
                          identity: GameIdentity | None = None,
-                         artifact: tuple[int, int, int] | None = None) -> str:
+                         artifact: tuple[int, int, int] | None = None,
+                         runtime_variant_identity: str | None = None) -> str:
     """Serialize one loader manifest.
 
     ``P`` is an optional DLL/manifest publication identity.  Old runtimes
@@ -2652,6 +2663,12 @@ def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
             raise ValueError('invalid overlay artifact tuple')
         out_lines.append(f'A {(artifact_phys | 0x80000000):08X} '
                          f'{artifact_size:X} {artifact_crc32 & 0xFFFFFFFF:08X}\n')
+    if runtime_variant_identity is not None:
+        if (len(runtime_variant_identity) != 64 or any(
+                character not in '0123456789abcdefABCDEF'
+                for character in runtime_variant_identity)):
+            raise ValueError('runtime variant identity must be a SHA-256 digest')
+        out_lines.append(f'V {runtime_variant_identity.upper()}\n')
     if pair_id is not None:
         out_lines.append(f'P {pair_id & 0xFFFFFFFFFFFFFFFF:016X}\n')
     for ev, crc, ranges in func_ids:
@@ -2665,7 +2682,8 @@ def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
 def overlay_pair_id(src: str, func_ids: list,
                     provenance: str | None = None,
                     identity: GameIdentity | None = None,
-                    artifact: tuple[int, int, int] | None = None) -> int:
+                    artifact: tuple[int, int, int] | None = None,
+                    runtime_variant_identity: str | None = None) -> int:
     """Bind a newly compiled DLL to the exact C and range manifest it uses."""
     digest = hashlib.sha256()
     digest.update(b'psxrecomp overlay pair v1\0')
@@ -2673,7 +2691,8 @@ def overlay_pair_id(src: str, func_ids: list,
     digest.update(b'\0')
     digest.update(overlay_ranges_text(
         func_ids, provenance=provenance, identity=identity,
-        artifact=artifact).encode('ascii'))
+        artifact=artifact,
+        runtime_variant_identity=runtime_variant_identity).encode('ascii'))
     return int.from_bytes(digest.digest()[:8], 'big')
 
 
@@ -2710,9 +2729,10 @@ uint64_t overlay_pair_id(void) {{ return UINT64_C(0x{pair_id:016X}); }}
 
 def write_overlay_ranges_from(func_ids: list, out_path: str,
                               pair_id: int | None = None,
-                              provenance: str | None = None,
-                              identity: GameIdentity | None = None,
-                              artifact: tuple[int, int, int] | None = None) -> int:
+                               provenance: str | None = None,
+                               identity: GameIdentity | None = None,
+                               artifact: tuple[int, int, int] | None = None,
+                               runtime_variant_identity: str | None = None) -> int:
     """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
     parse_overlay_func_ids. Returns the number of functions written.
 
@@ -2721,7 +2741,7 @@ def write_overlay_ranges_from(func_ids: list, out_path: str,
       R <lo_hex> <len_hex>             one per coalesced code range"""
     with open(out_path, 'w') as f:
         f.write(overlay_ranges_text(func_ids, pair_id, provenance, identity,
-                                    artifact))
+                                    artifact, runtime_variant_identity))
     return len(func_ids)
 
 
@@ -3980,6 +4000,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
     })
     if not requested:
         return None, 'no-requested-entries'
+    runtime_identity = runtime_variant_manifest_identity(args, data, load_addr)
     if hosted_owners is not None:
         hosted_specs = {
             _canonical_guest_addr(entry): spec
@@ -4117,8 +4138,9 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
             manifest_provenance = HOSTED_MANIFEST_PROVENANCE
         src = add_overlay_identity_export(src, args.identity)
         artifact = (load_addr, size, binascii.crc32(data) & 0xFFFFFFFF)
-        pair_id = overlay_pair_id(src, frag_ids, manifest_provenance,
-                                  args.identity, artifact)
+        pair_id = overlay_pair_id(
+            src, frag_ids, manifest_provenance, args.identity, artifact,
+            runtime_identity)
         src = add_overlay_pair_export(src, pair_id)
         # Key the fragment DLL by its func-identity SET (dedup like a region
         # bundle); the loader keys DLLs by the region_start filename prefix and
@@ -4132,7 +4154,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                 dll_path, overlay_abi_tag(args.runtime_include, args.flavor),
                 overlay_ranges_text(
                     frag_ids, pair_id, manifest_provenance, args.identity,
-                    artifact), pair_id)
+                    artifact, runtime_identity), pair_id)
             if cache_status == 'match':
                 cleanup_live_source(retained_c)
                 return frag_ids, 'cached'   # exact identity already built
@@ -4168,10 +4190,11 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                            expected_existing_abi=overlay_abi_tag(
                                args.runtime_include, args.flavor),
                            publication_result=publication,
-                            candidate_cap=overlay_candidate_cap(
-                                args.runtime_include),
-                            manifest_provenance=manifest_provenance,
-                            identity=args.identity, artifact=artifact):
+                             candidate_cap=overlay_candidate_cap(
+                                 args.runtime_include),
+                             manifest_provenance=manifest_provenance,
+                             identity=args.identity, artifact=artifact,
+                             runtime_variant_identity=runtime_identity):
             if publication.get('capacity_error'):
                 capacity_error = publication['capacity_error']
                 match = re.search(
@@ -4190,7 +4213,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                 dll_path, overlay_abi_tag(args.runtime_include, args.flavor),
                 overlay_ranges_text(
                     frag_ids, pair_id, manifest_provenance, args.identity,
-                    artifact), pair_id)
+                    artifact, runtime_identity), pair_id)
             if cache_status != 'match':
                 return None, ('fragment cache-key collision/concurrent pair: '
                               'preserved manifest does not match generated identity')
@@ -4413,9 +4436,10 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 expected_existing_abi: int | None = None,
                 publication_result: dict | None = None,
                  candidate_cap: int | None = None,
-                 manifest_provenance: str | None = None,
-                 identity: GameIdentity | None = None,
-                 artifact: tuple[int, int, int] | None = None) -> bool:
+                  manifest_provenance: str | None = None,
+                  identity: GameIdentity | None = None,
+                  artifact: tuple[int, int, int] | None = None,
+                  runtime_variant_identity: str | None = None) -> bool:
     """Publish a shard only after all of its artifacts are complete.
 
     GCC and tcc write their output incrementally. If the process is interrupted
@@ -4439,7 +4463,8 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         try:
             capacity_error = preflight_shard_candidate_capacity(
                 final_out, func_ids, pair_id, manifest_provenance,
-                expected_existing_abi, candidate_cap, artifact)
+                expected_existing_abi, candidate_cap, artifact,
+                runtime_variant_identity)
         except Exception as exc:
             # A failed optimization must not replace the authoritative locked
             # projection after linking.  Compile normally and let publication
@@ -4473,7 +4498,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
             return True
         write_overlay_ranges_from(
             func_ids, staged_ranges, pair_id, manifest_provenance, identity,
-            artifact)
+            artifact, runtime_variant_identity)
         if not os.path.isfile(staged_ranges) or os.path.getsize(staged_ranges) == 0:
             print('  COMPILE ERROR: range manifest staging produced no output')
             return False
@@ -5039,7 +5064,8 @@ def preflight_shard_candidate_capacity(
         final_dll: str, func_ids: list, pair_id: int,
         manifest_provenance: str | None, expected_abi: int | None,
         candidate_cap: int,
-        artifact: tuple[int, int, int] | None = None) -> str | None:
+        artifact: tuple[int, int, int] | None = None,
+        runtime_variant_identity: str | None = None) -> str | None:
     """Reject an impossible publication before invoking the native linker.
 
     The locked publication check remains authoritative.  This early check is
@@ -5050,7 +5076,8 @@ def preflight_shard_candidate_capacity(
     final_dll = os.path.abspath(final_dll)
     capacity_lock, cache_dirs = _candidate_capacity_namespace(final_dll)
     manifest = overlay_ranges_text(
-        func_ids, pair_id, manifest_provenance, artifact=artifact)
+        func_ids, pair_id, manifest_provenance, artifact=artifact,
+        runtime_variant_identity=runtime_variant_identity)
     staged_identity = _normalized_runtime_manifest_identity(
         manifest, pair_id, func_ids, artifact)
     staged_range_links = _runtime_manifest_range_link_count(func_ids)
@@ -5672,6 +5699,8 @@ def main():
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
         phys_addr = (load_addr & 0x1FFFFFFF)
         plan      = source_observation_plan(args, data, load_addr)
+        runtime_identity = runtime_variant_manifest_identity(
+            args, data, load_addr)
         _label = f'overlay 0x{load_addr:08X} crc {crc32:08X}'
         if args.static:
             for captured_entry in _parse_addr_list(
@@ -6034,8 +6063,9 @@ def main():
                     return
                 src = add_overlay_identity_export(src, args.identity)
                 artifact = (load_addr, size, binascii.crc32(data) & 0xFFFFFFFF)
-                pair_id = overlay_pair_id(src, this_ids, identity=args.identity,
-                                          artifact=artifact)
+                pair_id = overlay_pair_id(
+                    src, this_ids, identity=args.identity, artifact=artifact,
+                    runtime_variant_identity=runtime_identity)
                 src = add_overlay_pair_export(src, pair_id)
                 # Retained source is the exact source compiled into the DLL.
                 with open(patched_c, 'w') as f:
@@ -6064,8 +6094,10 @@ def main():
                                         publication_result=publication,
                                         candidate_cap=overlay_candidate_cap(
                                             args.runtime_include),
-                                        identity=args.identity,
-                                        artifact=artifact)
+                                         identity=args.identity,
+                                         artifact=artifact,
+                                         runtime_variant_identity=
+                                             runtime_identity)
                 if success:
                     # compile_dll transactionally published the per-entry range
                     # manifest beside the DLL from the same func-id list used by

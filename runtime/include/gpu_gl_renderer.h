@@ -490,6 +490,17 @@ typedef struct GlRendererRetiredFailureEvent {
     uint32_t auxiliary;
     int64_t value_a;
     int64_t value_b;
+    int32_t current_x[3];
+    int32_t current_y[3];
+    int32_t midpoint_x[3];
+    int32_t midpoint_y[3];
+    int32_t current_z[3];
+    int32_t midpoint_z[3];
+    int32_t current_edge_distance;
+    int32_t midpoint_edge_distance;
+    int32_t surface_width;
+    int32_t base_x;
+    int32_t slot;
 } GlRendererRetiredFailureEvent;
 
 enum {
