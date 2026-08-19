@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHECK(condition) do { \
@@ -51,6 +52,33 @@ void overlay_loader_discard_prepared(OverlayPreparedImage *image) {
 }
 
 int main(void) {
+    char compiler_dir[] = "/tmp/psx-autocompile-compiler-XXXXXX";
+    CHECK(mkdtemp(compiler_dir) != NULL);
+    char compiler_path[512];
+    CHECK(snprintf(compiler_path, sizeof(compiler_path), "%s/gcc",
+                   compiler_dir) > 0);
+    FILE *compiler = fopen(compiler_path, "wb");
+    CHECK(compiler != NULL);
+    CHECK(fputs("#!/bin/sh\nexit 0\n", compiler) >= 0);
+    CHECK(fclose(compiler) == 0);
+    CHECK(chmod(compiler_path, 0700) == 0);
+    const char *saved_path = getenv("PATH");
+    char *saved_path_copy = saved_path ? strdup(saved_path) : NULL;
+    CHECK(setenv("PATH", compiler_dir, 1) == 0);
+    const char *detected_compiler = autocompile_c_compiler();
+    CHECK(detected_compiler != NULL);
+    CHECK(detected_compiler[0] == '/');
+    CHECK(strcmp(detected_compiler, compiler_path) == 0);
+    CHECK(autocompile_toolchain_available());
+    if (saved_path_copy) {
+        CHECK(setenv("PATH", saved_path_copy, 1) == 0);
+        free(saved_path_copy);
+    } else {
+        CHECK(unsetenv("PATH") == 0);
+    }
+    CHECK(unlink(compiler_path) == 0);
+    CHECK(rmdir(compiler_dir) == 0);
+
     char captures[] = "/tmp/psx-autocompile-captures-XXXXXX";
     int capture_fd = mkstemp(captures);
     CHECK(capture_fd >= 0);

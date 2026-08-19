@@ -25,6 +25,7 @@
 #  include <signal.h>
 #  include <stdatomic.h>
 #  include <sys/resource.h>
+#  include <sys/stat.h>
 #  include <sys/types.h>
 #  include <sys/wait.h>
 #  include <time.h>
@@ -1013,37 +1014,56 @@ static void posix_set_compile_background_policy(void) {
  * alone cannot tell a developer checkout from a toolchain-less player. This
  * opens each candidate executable in each PATH directory. Memoized because PATH
  * does not change mid-run. */
-int autocompile_toolchain_available(void) {
+const char *autocompile_c_compiler(void) {
     static int s_cached = -1;
-    if (s_cached >= 0) return s_cached;
-    const char *path = getenv("PATH");
-    int found = 0;
-    if (path && *path) {
+    static char s_compiler[512];
+    if (s_cached >= 0) return s_cached ? s_compiler : NULL;
+    s_compiler[0] = '\0';
 #ifdef _WIN32
-        const char sep = ';';
-        static const char *exes[] = { "gcc.exe", "cc.exe", "clang.exe" };
+    static const char *exes[] = { "gcc.exe", "cc.exe", "clang.exe" };
+    const char *path = getenv("PATH");
+    if (path && *path) {
+        for (size_t k = 0; k < sizeof(exes) / sizeof(exes[0]); k++) {
+            DWORD n = SearchPathA(path, exes[k], NULL,
+                                  (DWORD)sizeof(s_compiler), s_compiler, NULL);
+            if (n > 0 && n < sizeof(s_compiler)) break;
+            s_compiler[0] = '\0';
+        }
+    }
 #else
+    const char *path = getenv("PATH");
+    if (path) {
         const char sep = ':';
         static const char *exes[] = { "gcc", "cc", "clang" };
-#endif
         const char *p = path;
-        while (*p && !found) {
+        while (!s_compiler[0]) {
             const char *e = strchr(p, sep);
             size_t dlen = e ? (size_t)(e - p) : strlen(p);
-            if (dlen > 0 && dlen < 480) {
+            if (dlen < sizeof(s_compiler) - 32) {
                 for (size_t k = 0; k < sizeof(exes) / sizeof(exes[0]); k++) {
                     char cand[512];
-                    snprintf(cand, sizeof(cand), "%.*s/%s", (int)dlen, p, exes[k]);
-                    FILE *f = fopen(cand, "rb");
-                    if (f) { fclose(f); found = 1; break; }
+                    struct stat st;
+                    snprintf(cand, sizeof(cand), "%.*s%s%s", (int)dlen, p,
+                             dlen ? "/" : "", exes[k]);
+                    if (stat(cand, &st) == 0 && S_ISREG(st.st_mode) &&
+                        access(cand, X_OK) == 0 &&
+                        realpath(cand, s_compiler) != NULL) {
+                        break;
+                    }
                 }
             }
             if (!e) break;
             p = e + 1;
+            if (s_compiler[0]) break;
         }
     }
-    s_cached = found;
-    return found;
+#endif
+    s_cached = s_compiler[0] ? 1 : 0;
+    return s_cached ? s_compiler : NULL;
+}
+
+int autocompile_toolchain_available(void) {
+    return autocompile_c_compiler() != NULL;
 }
 
 int autocompile_request(void) {

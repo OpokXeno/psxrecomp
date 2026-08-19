@@ -73,7 +73,7 @@ int main(void) {
     CHECK(sweep_ok, "tick-by-tick sweep across deadline never exceeds one period");
 
     /* 7. Normal emulation repays a bounded transient stall. Smooth presentation
-     *    preserves small phase errors but re-anchors after a full-frame miss. */
+     *    also preserves short heavy-frame clusters, but remains tightly bounded. */
     CHECK(frame_pacing_advance_deadline(
               deadline + FREQ / 200, deadline, PERIOD, 1) ==
               deadline + PERIOD,
@@ -84,8 +84,16 @@ int main(void) {
           "stable pacing preserves a sub-period phase miss");
     CHECK(frame_pacing_advance_deadline(
               deadline + PERIOD, deadline, PERIOD, 0) ==
-              deadline + PERIOD + PERIOD,
-          "stable pacing re-anchors after a full-frame miss");
+              deadline + PERIOD,
+          "stable pacing preserves a one-frame transient miss");
+    CHECK(frame_pacing_advance_deadline(
+              deadline + PERIOD * 29u, deadline, PERIOD, 0) ==
+              deadline + PERIOD,
+          "stable pacing preserves a twenty-nine-frame transient miss");
+    CHECK(frame_pacing_advance_deadline(
+              deadline + PERIOD * 30u, deadline, PERIOD, 0) ==
+              deadline + PERIOD * 31u,
+          "stable pacing re-anchors after a thirty-frame miss");
 
     printf(failures ? "FAILED (%d)\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;

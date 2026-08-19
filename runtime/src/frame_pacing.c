@@ -24,13 +24,15 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
 }
 
 #define FRAME_PACER_CATCHUP_MAX_PERIODS 12u
+#define FRAME_PACER_STABLE_CATCHUP_MAX_PERIODS 30u
 
 uint64_t frame_pacing_advance_deadline(uint64_t now, uint64_t deadline,
                                        uint64_t period, int recover_debt) {
     if (deadline == 0) return now + period;
     if (now < deadline) return deadline + period;
     if (now - deadline < period * (recover_debt
-            ? FRAME_PACER_CATCHUP_MAX_PERIODS : 1u))
+            ? FRAME_PACER_CATCHUP_MAX_PERIODS
+            : FRAME_PACER_STABLE_CATCHUP_MAX_PERIODS))
         return deadline + period;
     return now + period;
 }
@@ -54,11 +56,13 @@ static void frame_pacer_wait_internal(FramePacer *p, double period_ms,
     uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t period = (uint64_t)((double)freq * (period_ms / 1000.0));
     uint64_t now = SDL_GetPerformanceCounter();
+    const uint64_t catchup_periods = recover_debt
+        ? FRAME_PACER_CATCHUP_MAX_PERIODS
+        : FRAME_PACER_STABLE_CATCHUP_MAX_PERIODS;
 
     if (p->next_deadline == 0 ||
         (now >= p->next_deadline &&
-         now - p->next_deadline >=
-             period * FRAME_PACER_CATCHUP_MAX_PERIODS)) {
+         now - p->next_deadline >= period * catchup_periods)) {
         /* First frame, or sustained slowness beyond the catch-up window:
          * re-anchor (forgive the debt). */
         p->next_deadline = frame_pacing_advance_deadline(

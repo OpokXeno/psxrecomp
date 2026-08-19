@@ -213,6 +213,79 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-19 (Xenogears 55 FPS pacing drops fixed):** The valid rerecorded
+  `3000:3500` tail window had enough CPU headroom but repeatedly forgave pacer
+  debt after finite heavy-frame clusters, permanently losing presentation phase.
+  The immediate control ran `500` frames in `8928.413 ms` (about `56.0 FPS`).
+  Stable 60 FPS pacing now preserves transient debt for a bounded
+  30-period/500 ms window to distinguish finite stalls from sustained slowness,
+  while normal pacing retains its existing 12-period bound. The final
+  identical replay window ran in `8332.337 ms` (`60.007 FPS`), with unchanged
+  guest/native counters (`20,500,304` dirty instructions, `72,896` dirty
+  dispatches, `5,581` Native and `4,713` interpreted overlay dispatches).
+  Evidence `/tmp/opencode/xg-pacer-debt30-evidence.json` is
+  `PASS/trace_complete`, Native/OpenGL, with zero unsupported Native packets.
+  No guest timing, render path, generated code, or overlay dispatch changed.
+  The extended pure pacing test passes, Release and Debug builds link, and the
+  full CTest matrix passes `57/57`.
+- **2026-08-19 (overlay compiler portability closed; dispatch regression
+  rejected):** The current rerecorded Xenogears replay disproved the isolated
+  low-Native counter from the prior handoff. The valid `500:3500` Release
+  window ran `3000` frames in `50615.707 ms` (`59.270 FPS`) with `1,876,841`
+  Native overlay dispatches versus `196,467` interpreted dispatches; evidence
+  `/tmp/opencode/xg-portability-final-bench-evidence.json` is
+  `PASS/trace_complete`, Native/OpenGL, with zero unsupported Native packets.
+  No dispatch or timing path was changed. Source-checkout autocompile now passes
+  the actual discovered GCC-compatible compiler to `compile_overlays.py` rather
+  than assuming `gcc`; POSIX discovery requires an executable regular file and
+  canonicalizes it before the compile child changes CWD, while Windows uses
+  `SearchPath`. The focused compiler-probe regression passes, Release and Debug
+  builds link, and the full CTest matrix passes `57/57`.
+- **2026-08-19 (Xenogears v_wait skip rejected):** Ghidra confirmed that
+  `v_wait` at `0x8004B694` reaches the `0x8004B708` checkpoint through a
+  fixed `lw/addiu/sw/lw` loop, so a runtime event-horizon prototype was tested
+  without touching generated code. With the aligned Native cache and the
+  rerecorded `16:9`/`60 FPS` replay, the faithful A/B ran `8870.893 ms` for
+  `500` tail frames, while the prototype ran `8940.935 ms`: it reduced
+  `guest_work_ms` from `5620.747` to `5295.236`, but moved the cost into
+  device servicing/pacing and lowered wall FPS. Both evidence files were
+  `PASS/trace_complete` with identical Native stream counts. The prototype
+  was removed. The restored Release replay is `PASS/trace_complete` at
+  `8907.184 ms`; the remaining profile is dominated by VBlank/pacing, with
+  `ArchiveDataSync` at only about `5.6%`. CTest is back to `57/57` after
+  configuring the build with `BUILD_TESTING=ON`.
+- **2026-08-19 (Native replay target reached):** The same explicit
+  `16:9`/`60 FPS` replay and settings state were rerun with
+  `--memcard-dir /home/pc/xenogears-port/XenogearsRecomp` so the benchmark
+  used the repository-root Xenogears memory cards. Model FT4/FT3 producer
+  invalidation now probes the existing exact-address lookup for only the
+  aligned source candidates covered by the write, instead of scanning both
+  full source arrays. FT3/FT4 shadow cleanup clears only the records used by
+  the previous pass and zeroes each slot when reused. The `[BENCH]` window
+  `1000:6000` completed `5000` frames in `83437.897 ms` (`59.9248 FPS`),
+  with `23386.365 ms` guest work and `54580.095 ms` pacer time. Dirty/auth
+  counters stayed identical (`10,243,036` dirty instructions, `1,318,785`
+  dispatches, `9,757,433` Native calls), and the replay remained
+  `PASS/trace_complete`. The final CPU profile puts auth at `0.70%` core and
+  full shadow memset at `2.32%` core. Release and Debug builds compile and
+  the full CTest matrix passes `57/57`.
+- **2026-08-19 (Native auth code-write CPU path):** The reproducible
+  `16:9`/`60 FPS` Native replay (`/tmp/opencode/xg-input-replay-16-9-60fps-memcards-2026-08-19.toml`, always run with
+  `/tmp/opencode/xg-input-record-16-9-60fps-state/settings.toml`) and a
+  `perf` capture identified `psx_xg_render_auth_note_code_write()` as the
+  dominant CPU path (`35.6%` atom / `42.4%` core before optimization), with
+  descriptor validation and repeated overlap work underneath. The auth path
+  now reuses the already-computed overlap mask, indexes descriptor ranges by
+  protected page, caches immutable descriptor validity, and returns early for
+  unrelated watched writes while preserving completed-proof retirement. Its
+  producer-resource invalidation now tracks exact bytes, avoiding repeated
+  invalidation until a resource is watched again. The same replay remains
+  `PASS/trace_complete` with identical Native/dirty counts; the `1000:6000`
+  benchmark moved from `96.724 s` during the intermediate pass to `89.789 s`
+  (`40.816 s` guest work, approximately `55.68 FPS`), with the final auth
+  hotspot at `19.17%` atom / `22.96%` core. The full CTest matrix passes
+  `57/57` after the final pass. Release builds use `PSX_NO_DEBUG_TOOLS=1`, so
+  auth rings were read through the replay evidence/perf path rather than TCP.
 - **2026-08-19 (4:3 pillarbox no longer consumes drawable rounding):** The
   real `DISPLAY=:0` replay proved that SDL can report a logical `1280x720`
   window with a `1280x724` GL drawable. The old `force_4_3` paths computed

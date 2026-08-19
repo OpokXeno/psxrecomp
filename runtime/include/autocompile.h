@@ -26,11 +26,12 @@ int  autocompile_configured(void);
  * cache location: no per-game config, no drift. */
 void autocompile_set_cache_paths(const char *cache_dir, const char *captures);
 
-/* Probe whether a C compiler is actually reachable on PATH (gcc/cc/clang) — the
- * developer-machine signal. overlay_backend_resolve uses this together with a
- * configured or source-discovered pipeline so `auto` picks gcc only when it can
- * really build a shard, else tcc (toolchain-less production). Memoized; safe to
- * call repeatedly. */
+/* Return the GCC-compatible C compiler actually reachable on PATH (gcc/cc/clang),
+ * or NULL when none is available. The returned path is process-lifetime storage.
+ * The developer-machine signal is used by overlay_backend_resolve so `auto`
+ * picks the native compiler only when it can really build a shard, else TCC.
+ * Memoized; safe to call repeatedly. */
+const char *autocompile_c_compiler(void);
 int  autocompile_toolchain_available(void);
 
 /* 1 while a compile process is running. */

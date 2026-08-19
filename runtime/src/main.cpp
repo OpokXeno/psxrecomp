@@ -12039,7 +12039,17 @@ int main(int argc, char** argv) {
                             return std::string("\"") + s + "\"";
                         };
                         extern int g_psx_cps_mode;
-                        built_gcc_cmd = "python3 " + cmd_quote(dev_script.string()) +
+                        const char *c_compiler = autocompile_c_compiler();
+                        if (!c_compiler) {
+                            throw std::runtime_error(
+                                "overlay autocompile selected GCC tier without a C compiler");
+                        }
+#ifdef _WIN32
+                        const std::string python_cmd = "python ";
+#else
+                        const std::string python_cmd = "python3 ";
+#endif
+                        built_gcc_cmd = python_cmd + cmd_quote(dev_script.string()) +
                             " --captures " + cmd_quote(captures_path.string()) +
                             " --game-toml " + cmd_quote(std::string(
                                 game_config_path ? game_config_path : "game.toml")) +
@@ -12049,7 +12059,7 @@ int main(int argc, char** argv) {
                             " --runtime-include " + cmd_quote(dev_include.string()) +
                             " --out-dir " + cmd_quote(cache_dir) +
                             (g_psx_cps_mode ? " --cps" : "") +
-                            " --compiler gcc";
+                            " --compiler gcc --gcc " + cmd_quote(c_compiler);
                         ac_cmd = &built_gcc_cmd;
                         std::fprintf(stdout,
                             "psxrecomp: gcc tier using source-checkout toolchain\n");
