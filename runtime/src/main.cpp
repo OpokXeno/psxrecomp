@@ -5816,19 +5816,14 @@ static void depth24_cutover_tick(int depth24) {
 
 /* Depth24 FMV: CRTC width stays full (e.g. MotK 512) while MDEC uploads may
  * not cover the right side yet — leftover VRAM read as RGB888 flashes junk.
- * Present width is never shrunk; black-fill only the trailing uncovered cols.
- *
- * Match origin/master's span policy: when upload span is unknown (lim==0),
- * only blank the last ~8 columns. Blanking [0..w) on lim==0 (an older tip
- * path) turned MotK FMV into a permanent black screen after GP1(07h) hold
- * reset the span — hold ticks skip Swap, then the next present saw lim=0
- * and wiped the whole frame every vblank.
+ * Present width is never shrunk; black-fill only a measured uncovered span.
+ * An unknown span cannot justify altering otherwise valid scanout pixels.
  *
  * Optional short cutover blank: full-frame black for 1–2 presents on movie
  * start / long idle resume only (see depth24_cutover_tick). */
 static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
                                           uint32_t display_x) {
-    if (!buf || w < 8u || h == 0u) return;
+    if (!buf || w == 0u || h == 0u) return;
 
     if (s_d24_cutover_blank > 0) {
         s_d24_cutover_blank--;
@@ -5838,14 +5833,10 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
         return;
     }
 
-    /* Default: last 8 columns. If the upload span is known and ends earlier
-     * inside that margin, start blanking from the span edge instead. */
-    uint32_t start = w - 8u;
     uint32_t lim = gpu_depth24_rgb_limit(display_x, w);
-    if (lim > 0u && lim < w && lim < start)
-        start = lim;
+    if (lim == 0u || lim >= w) return;
     for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = start; x < w; x++)
+        for (uint32_t x = lim; x < w; x++)
             buf[y * w + x] = 0xFF000000u;
     }
 }

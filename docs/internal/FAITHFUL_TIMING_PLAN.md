@@ -213,6 +213,16 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-19 (Xenogears FMV fixed right-side black bar):** Depth-24 CPU
+  presentation unconditionally replaced the last eight CRTC columns with black,
+  even when the tracked MDEC upload covered the full scanout. In a 4:3 viewport
+  those pixels were scaled as part of the image, producing a right-side bar and
+  making the movie appear shifted left. `depth24_fix_trailing_margin` now keeps
+  all pixels when upload coverage is complete or unknown and black-fills only a
+  measured partial trailing span (`0 < limit < width`). Present width, centering,
+  aspect ratio, guest state, and VRAM are unchanged. Release and Debug builds
+  link and CTest passes `57/57`; no intro-FMV replay was available for automated
+  pixel validation, so final visual confirmation remains user-observed.
 - **2026-08-19 (Xenogears 55 FPS pacing drops fixed):** The valid rerecorded
   `3000:3500` tail window had enough CPU headroom but repeatedly forgave pacer
   debt after finite heavy-frame clusters, permanently losing presentation phase.

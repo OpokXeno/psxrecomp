@@ -3255,7 +3255,7 @@ static void depth24_note_upload(uint32_t x, uint32_t w) {
 uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w) {
     if (!(display_depth & 1u) || crtc_w == 0u)
         return crtc_w;
-    /* No uploads yet → treat as uncovered (present blanks until first blit). */
+    /* No tracked uploads yet: coverage is unknown, not necessarily empty. */
     if (s_d24_upload_x1 == 0u)
         return 0u;
     uint32_t dx = display_x & 1023u;
