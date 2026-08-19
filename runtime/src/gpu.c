@@ -431,20 +431,21 @@ static int ws_nw_configured_offset(void) {
     int w = (int)ws_disp_w();
     return (w * numr + 4 * ws_cfg_den) / (8 * ws_cfg_den);
 }
-/* Native producer view uses a fixed 320x240 canonical surface and rounds its
- * host width exactly as gl_renderer_configure_native_view(). Keep the guest
+/* Native producer view uses a fixed 320x240 canonical surface and keeps the
+ * synthetic reveal symmetric in integer raster space. Keep the guest
  * backdrop-coordinate transform on that same integer offset; the cull margin
  * is deliberately rounded up and is therefore not suitable for raster coords. */
 static int ws_native_view_offset(void) {
-    int width;
+    int64_t width;
 
     if (!ws_native_cull_enabled || ws_native_cull_num <= 0 ||
         ws_native_cull_den <= 0)
         return 0;
-    width = (240 * ws_native_cull_num + ws_native_cull_den / 2) /
+    width = ((int64_t)240 * ws_native_cull_num + ws_native_cull_den / 2) /
             ws_native_cull_den;
+    if (((width - 320) & 1) != 0) --width;
     if (width <= 320) return 0;
-    return (width - 320) / 2;
+    return (int)((width - 320) / 2);
 }
 static int ws_nw_offset(void) {
     if (!ws_native_wide_active()) return 0;
@@ -495,7 +496,7 @@ void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
 void gpu_ws_configure_native_cull(int enabled, int aspect_num, int aspect_den,
                                   int canonical_width, int canonical_height) {
     uint64_t surface_width;
-    int64_t center_offset;
+    uint64_t center_offset;
 
     ws_native_cull_enabled = 0;
     ws_native_cull_num = 4;
@@ -507,20 +508,24 @@ void gpu_ws_configure_native_cull(int enabled, int aspect_num, int aspect_den,
             (int64_t)aspect_den * canonical_width)
         return;
 
-    /* Match XgNativeView's fixed-point surface calculation exactly. The
-     * resulting margin is rounded up because the host projection also exposes
-     * every partially covered native pixel at the edge. */
-    surface_width = ((uint64_t)canonical_height * (uint64_t)aspect_num << 16u) /
-        (uint64_t)aspect_den;
-    center_offset = ((int64_t)surface_width -
-                     ((int64_t)canonical_width << 16u)) / 2;
-    if (surface_width > UINT32_MAX || center_offset <= 0 ||
-        center_offset > INT32_MAX)
+    /* Match the integer raster surface used by the Native and GL producers.
+     * Keep the reveal symmetric before deriving the cull margin; rounding the
+     * fractional aspect product up here would make culling one pixel wider
+     * than the actual 426-wide surface. */
+    surface_width = ((uint64_t)canonical_height * (uint64_t)aspect_num +
+                     (uint64_t)aspect_den / 2u) / (uint64_t)aspect_den;
+    if (((surface_width - (uint64_t)canonical_width) & 1u) != 0u)
+        --surface_width;
+    if (surface_width > UINT32_MAX ||
+        surface_width <= (uint64_t)canonical_width)
+        return;
+    center_offset = (surface_width - (uint64_t)canonical_width) / 2u;
+    if (center_offset == 0u || center_offset > (uint64_t)INT32_MAX)
         return;
 
     ws_native_cull_num = aspect_num;
     ws_native_cull_den = aspect_den;
-    ws_native_cull_margin = (int)((center_offset + 0xffff) >> 16u);
+    ws_native_cull_margin = (int)center_offset;
     ws_native_cull_enabled = ws_native_cull_margin > 0;
 }
 void gpu_ws_set_cull_guard_pixels(int pixels) {
@@ -7176,8 +7181,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                 opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
         }
-        if (supported) native_semantic_stamp_retrospective_scene(&semantic);
-        if (supported && semantic.triangle_count != 0u) {
+    if (supported) native_semantic_stamp_retrospective_scene(&semantic);
+    if (supported && semantic.triangle_count != 0u) {
             render_status = gr_stream_barrier();
             if (render_status == GPU_RENDER_TRANSACTION_OK)
                 render_status = gr_draw_semantic_immediate(&semantic);

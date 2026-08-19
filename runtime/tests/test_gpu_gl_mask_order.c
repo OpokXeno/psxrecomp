@@ -131,8 +131,8 @@ static void test_native_environment_tpage_latching(void) {
 static void test_native_cull_view_is_independent_of_legacy_wide_mode(void) {
     gpu_ws_configure(4, 3, 0u, 0, 0);
     gpu_ws_configure_native_cull(1, 16, 9, 320, 240);
-    expect_true(psx_ws_x_margin() == 54,
-                "Native cull view exposes the host's 16:9 edge margin");
+    expect_true(psx_ws_x_margin() == 53,
+                "Native cull view matches the host's 426-wide edge margin");
     expect_true(psx_ws_depth_bound(0x0d80) == 0x1200,
                 "Native cull view scales depth gates without enabling mode 2");
     expect_true(psx_ws_plane_nx(4096) == 3072,
@@ -153,10 +153,10 @@ static void test_native_cull_view_is_independent_of_legacy_wide_mode(void) {
     expect_true(psx_ws_x_margin() == 8,
                 "temporal cull guard expands the canonical view");
     gpu_ws_configure_native_cull(1, 16, 9, 320, 240);
-    expect_true(psx_ws_x_margin() == 62,
+    expect_true(psx_ws_x_margin() == 61,
                 "temporal cull guard extends the Native wide margin");
     gpu_ws_set_temporal_cull_guard_pixels(0);
-    expect_true(psx_ws_x_margin() == 54,
+    expect_true(psx_ws_x_margin() == 53,
                 "disabling temporal coverage restores the Native margin");
     gpu_ws_configure_native_cull(0, 4, 3, 320, 240);
 }
@@ -183,12 +183,12 @@ static void test_semantic_guest_cull_policy(void) {
     expect_true(psx_ws_semantic_cull_site(0xA0010000u) ==
                     PSX_WS_CULL_SEMANTIC_SCREEN_BIAS,
                 "semantic cull lookup normalizes physical aliases");
-    expect_true(psx_ws_guest_cull_screen_bias(0u, 0) == 54u,
+    expect_true(psx_ws_guest_cull_screen_bias(0u, 0) == 53u,
                 "semantic screen-bias policy uses the Native margin");
-    expect_true(psx_ws_guest_cull_world_range(427u, 320) == 1 &&
-                    psx_ws_guest_cull_world_range(428u, 320) == 0,
+    expect_true(psx_ws_guest_cull_world_range(425u, 320) == 1 &&
+                    psx_ws_guest_cull_world_range(426u, 320) == 0,
                 "semantic world-range policy widens both sides");
-    expect_true(psx_ws_guest_cull_left_edge(39u) == 0u - 39u - 54u,
+    expect_true(psx_ws_guest_cull_left_edge(39u) == 0u - 39u - 53u,
                 "semantic left-edge policy moves the reject edge");
     expect_true(psx_ws_guest_cull_masked_screen_x(0xffffu, 320u) == 1,
                 "semantic masked-screen-X policy preserves wrapped left reveal");
@@ -196,8 +196,8 @@ static void test_semantic_guest_cull_policy(void) {
                 "semantic frustum-plane policy scales the side normal");
     expect_true(psx_ws_semantic_cull_site(0x80010014u) ==
                     PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X &&
-                    psx_ws_guest_cull_signed_screen_x(373, 0x140) == 1 &&
-                    psx_ws_guest_cull_signed_screen_x(374, 0x140) == 0,
+                    psx_ws_guest_cull_signed_screen_x(372, 0x140) == 1 &&
+                    psx_ws_guest_cull_signed_screen_x(373, 0x140) == 0,
                 "semantic signed-screen-X policy widens the right edge");
     expect_true(psx_ws_guest_cull_depth_signed(0x11ff, 0x0d80) == 1 &&
                     psx_ws_guest_cull_depth_unsigned(0x1200u, 0x0d80) == 0,
@@ -2156,6 +2156,8 @@ static void test_native_view_preserves_screen_space_primitive_size(void) {
     gl_renderer_flush_cpu_uploads();
 
     native_width = gl_renderer_native_view_width();
+    expect_true(native_width == 426,
+                "Native 16:9 surface uses the symmetric even raster width");
     translated_left = 10 * native_width / 320;
     translated_right = translated_left + 64;
     expect_true(gl_renderer_native_view_peek(
@@ -2231,6 +2233,7 @@ static void test_native_view_expands_fullscreen_fade(void) {
     uint16_t margin = 0;
     uint16_t right_margin = 0;
     uint16_t rightmost_margin = 0;
+    int native_width;
 
     reset_gpu_for_case();
     gpu_write_gp1(0x07000000u | 0x10u | (0xf0u << 10u));
@@ -2238,6 +2241,9 @@ static void test_native_view_expands_fullscreen_fade(void) {
     gpu_write_gp0(0xe4037d3eu);
     expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
                 "320x224 fullscreen fade Native view configures");
+    native_width = gl_renderer_native_view_width();
+    expect_true(native_width == 426,
+                "fullscreen fade uses the symmetric Native surface width");
     gpu_native_environment_get(&environment);
     expect_true(gpu_native_semantic_from_gp0(
                     opaque_quad, 5, &environment, &semantic) == 1,
@@ -2248,7 +2254,7 @@ static void test_native_view_expands_fullscreen_fade(void) {
                 &semantic.triangles[triangle].vertices[vertex];
             const int x = position->x / INT32_C(65536);
             position->native_view_x =
-                (x == 0 ? 0 : 426) * INT32_C(65536);
+                (x == 0 ? 0 : native_width) * INT32_C(65536);
             position->native_view_y = position->y;
             position->native_view_position = 1u;
         }
@@ -2265,10 +2271,10 @@ static void test_native_view_expands_fullscreen_fade(void) {
                 "fullscreen fade reads its centered Native pixel");
     expect_true(gl_renderer_native_view_peek(0, 2, 120, 1, 1, &margin),
                 "fullscreen fade reads its revealed-margin pixel");
-    expect_true(gl_renderer_native_view_peek(0, 425, 120, 1, 1,
+    expect_true(gl_renderer_native_view_peek(0, native_width - 2, 120, 1, 1,
                                              &right_margin),
                 "fullscreen fade reads the final Native surface pixel");
-    expect_true(gl_renderer_native_view_peek(0, 426, 120, 1, 1,
+    expect_true(gl_renderer_native_view_peek(0, native_width - 1, 120, 1, 1,
                                              &rightmost_margin),
                 "fullscreen fade reads the rightmost 16:9 Native pixel");
     expect_pixel(margin, center,
@@ -2501,10 +2507,12 @@ static void test_native_view_expands_offset_fullscreen_filter(void) {
     uint16_t center = 0;
     uint16_t left_margin = 0;
     uint16_t right_margin = 0;
+    int native_width;
 
     reset_gpu_for_case();
     expect_true(gl_renderer_configure_native_view(1, 16, 9, 320, 240),
                 "offset-filter Native view configures");
+    native_width = gl_renderer_native_view_width();
     expect_true(gpu_native_submit_gp0_packet(
                     draw_area_top, 1, NULL, &source) == 1 &&
                     gpu_native_submit_gp0_packet(
@@ -2524,7 +2532,7 @@ static void test_native_view_expands_offset_fullscreen_filter(void) {
             const int x = position->x / INT32_C(65536);
 
             position->native_view_x =
-                (x == 0 ? 0 : 427) * INT32_C(65536);
+                (x == 0 ? 0 : native_width) * INT32_C(65536);
             position->native_view_y = position->y;
             position->native_view_position = 1u;
         }
@@ -2543,7 +2551,7 @@ static void test_native_view_expands_offset_fullscreen_filter(void) {
                     gl_renderer_native_view_peek(
                         0, 2, 356, 1, 1, &left_margin) &&
                     gl_renderer_native_view_peek(
-                        0, 425, 356, 1, 1, &right_margin),
+                        0, native_width - 1, 356, 1, 1, &right_margin),
                 "offset fullscreen filter pixels are readable");
     expect_true(center != WHITE_1555,
                 "offset fullscreen filter modifies the Native center");

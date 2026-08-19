@@ -213,6 +213,39 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-19 (4:3 pillarbox no longer consumes drawable rounding):** The
+  real `DISPLAY=:0` replay proved that SDL can report a logical `1280x720`
+  window with a `1280x724` GL drawable. The old `force_4_3` paths computed
+  the 4:3 viewport directly from that raw drawable, alternating the source
+  between `960x720` and `965x724`. The shared GL letterbox helper now computes
+  the configured display rect first and nests the forced 4:3 rect inside it,
+  producing `960x720` in both cases. The enclosing helper also ignores excess
+  drawable rows, and `HOLD_DRAWABLE` reuses that configured envelope instead
+  of recomputing an aspect from a stale composed texture. CPU/FMVs, VRAM,
+  interpolation, hold-last, Native midpoint, and transaction composition all
+  use the same helper. The post-change real-display replay records only
+  `960x720` for 4:3 presents;
+  Debug 4:3 and Release 16:9 replays remain `PASS/trace_complete`, and the
+  full 57-test CTest matrix passes.
+- **2026-08-19 (Native cull geometry and forensic capture aligned):** The
+  frame-exact 16:9 replay showed Native/GL source widths stable at `426` during
+  wide gameplay and `320` only during correctly pillarboxed 4:3 frames; no
+  `427` source appeared. The guest Native cull path nevertheless derived
+  `ceil(53.33)=54` while the integer Native surface and host renderer used
+  margin `53`. `gpu_ws_configure_native_cull()` now shares the rounded-even
+  surface calculation and uses margin `53`. The display forensic ring also
+  falls back to the current Native FBO when 30 FPS has no interpolation phase.
+  Debug and Release 16:9/4:3 replays remain `PASS/trace_complete` with 495
+  independent presents and zero unsupported Native packets.
+- **2026-08-19 (Native-wide integer geometry handoff corrected):** The fresh
+  Debug 16:9/native replay isolated the apparent horizontal shift to the
+  transition from the legacy wide surface (`426 = 320 + 2*53`) to the producer
+  Native surface (`427` with asymmetric `53/54` margins). Native View, GL, and
+  the Xenogears projected-background path now use the same symmetric even
+  raster width policy, giving 426/53 at 16:9. The replay remains
+  `PASS/trace_complete` with effective `render_mode=native`, 495 independent
+  presents, and zero unsupported Native packets; the 4:3 comparison also
+  remains `PASS/trace_complete`.
 - **2026-08-17 (Live overlay autocompile hitches eliminated; user-confirmed):**
   A 122-second no-replay `perf` capture correlated the recurring severe FPS
   drops with compiler-batch completion, not compiler CPU contention. Immediately

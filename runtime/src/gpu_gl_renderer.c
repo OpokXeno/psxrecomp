@@ -3858,17 +3858,45 @@ void gl_renderer_set_display_aspect(int num, int den) {
     s_aspect_num = num; s_aspect_den = den;
 }
 
-/* Letterbox: largest num:den rect centered in the drawable. */
+/* Letterbox: largest num:den rect centered in an enclosing rectangle. */
+static void letterbox_rect_aspect_in(int ox, int oy, int ow, int oh,
+                                     int num, int den,
+                                     int *x, int *y, int *w, int *h) {
+    int dw = ow, dh = (ow * den) / num;
+    if (dh > oh) { dh = oh; dw = (oh * num) / den; }
+    *x = ox + (ow - dw) / 2;
+    *y = oy + (oh - dh) / 2;
+    *w = dw; *h = dh;
+}
 static void letterbox_rect_aspect(int ww, int wh, int num, int den,
                                   int *x, int *y, int *w, int *h) {
-    int dw = ww, dh = (ww * den) / num;
-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
-    *x = (ww - dw) / 2;
-    *y = (wh - dh) / 2;
-    *w = dw; *h = dh;
+    /* SDL/X11 can expose a drawable a few rows taller than the configured
+     * window (1280x724 for a nominal 1280x720 surface).  Do not let those
+     * transient rows change the enclosing aspect rectangle: otherwise a
+     * 4:3 source alternates between 960x720 and 965x724. */
+    int stable_h = wh;
+    if (s_aspect_num > 0 && s_aspect_den > 0 && ww > 0) {
+        int nominal_h = (int)(((int64_t)ww * s_aspect_den) / s_aspect_num);
+        if (nominal_h > 0 && nominal_h < stable_h)
+            stable_h = nominal_h;
+    }
+    letterbox_rect_aspect_in(0, 0, ww, stable_h, num, den, x, y, w, h);
 }
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
+}
+
+/* A forced 4:3 source is pillarboxed inside the configured display aspect,
+ * not directly inside the raw drawable. SDL can report a drawable a few
+ * pixels taller than the logical 16:9 window (for example 1280x724 for a
+ * 1280x720 window); using that extra height would change the source scale. */
+static void letterbox_rect_4_3(int ww, int wh,
+                               int *x, int *y, int *w, int *h) {
+    int outer_x, outer_y, outer_w, outer_h;
+
+    letterbox_rect(ww, wh, &outer_x, &outer_y, &outer_w, &outer_h);
+    letterbox_rect_aspect_in(outer_x, outer_y, outer_w, outer_h,
+                             4, 3, x, y, w, h);
 }
 
 static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
@@ -4538,7 +4566,7 @@ void gl_renderer_shutdown(void) {
 
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
  * diagnostic): full-window clear, then a quad into the letterbox rect.
- * force_4_3 pins the rect to native 4:3 regardless of the display aspect —
+ * force_4_3 pins the source to native 4:3 inside the configured display rect —
  * FMVs are authored 4:3 and have no GTE squash to compensate a stretch, so
  * widescreen presents them pillarboxed instead of distorted. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
@@ -4557,7 +4585,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     int lx, ly, lw, lh;
     if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_4_3(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     /* Short GP1(07h) bands (MotK FMV is 128 lines) only fill a fraction of
@@ -4644,7 +4672,7 @@ int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
     glClearColor(0.f, 0.f, 0.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
     if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_4_3(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     if (src_h < 192) {
@@ -5603,7 +5631,7 @@ static int interp_present(void) {
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (s_interp_force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_4_3(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     glDisable(GL_SCISSOR_TEST);
@@ -5749,22 +5777,11 @@ int gl_renderer_present_hold_last(void) {
         float u1 = 1.f - u0;
         float v1 = 1.f - v0;
 
-        lx = 0;
-        ly = 0;
-        lw = ww;
-        lh = wh;
-        if ((int64_t)s_hold_tw * wh != (int64_t)s_hold_th * ww) {
-            if ((int64_t)ww * s_hold_th >
-                (int64_t)wh * s_hold_tw) {
-                lw = (int)((int64_t)wh * s_hold_tw / s_hold_th);
-                if (lw < 1) lw = 1;
-                lx = (ww - lw) / 2;
-            } else {
-                lh = (int)((int64_t)ww * s_hold_th / s_hold_tw);
-                if (lh < 1) lh = 1;
-                ly = (wh - lh) / 2;
-            }
-        }
+        /* This texture is a complete composed drawable, including its bars.
+         * Recomputing its aspect from the old raw drawable lets a transient
+         * 1280x724 hold become 965x724 on the next 1280x720 present.  Keep the
+         * hold in the same configured present envelope as live frames. */
+        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
         glViewport(lx, ly, lw, lh);
         p_glActiveTexture(PSXGL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_hold_tex);
@@ -5782,7 +5799,7 @@ int gl_renderer_present_hold_last(void) {
         p_glUseProgram(0);
     } else {
         if (s_hold_force_4_3)
-            letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+            letterbox_rect_4_3(ww, wh, &lx, &ly, &lw, &lh);
         else
             letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
         present_target_quad(0, s_hold_tex, s_hold_tw, s_hold_th,
@@ -5826,7 +5843,7 @@ int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_4_3(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     /* No short-band adjustment on the 15-bit FBO path: a game's native short
@@ -6814,7 +6831,7 @@ static int native_view_surface_slot(int base_x, int create) {
 int gl_renderer_configure_native_view(int enabled, int aspect_num,
                                       int aspect_den, int canonical_width,
                                       int canonical_height) {
-    int width;
+    int64_t width;
 
     if (!s_raster_ok || !s_ctx) return enabled ? 0 : 1;
     flush_flat_batch();
@@ -6829,10 +6846,17 @@ int gl_renderer_configure_native_view(int enabled, int aspect_num,
         canonical_height <= 0 ||
         aspect_num * canonical_height <= aspect_den * canonical_width)
         return 0;
-    width = (canonical_height * aspect_num + aspect_den / 2) / aspect_den;
+    /* Keep the synthetic reveal symmetric in integer raster space. An odd
+     * rounded width (427 for 320x240 at 16:9) leaves one extra column on one
+     * side and makes a switch from the legacy 426-wide compositor visibly
+     * translate the scene. The centered raster surface is the shared geometry
+     * contract for the legacy and producer-driven Native paths. */
+    width = ((int64_t)canonical_height * aspect_num + aspect_den / 2) /
+            aspect_den;
+    if (((width - canonical_width) & 1) != 0) --width;
     if (width <= canonical_width || width > VRAM_W) return 0;
-    s_native_view_width = width;
-    s_native_view_offset = (width - canonical_width) / 2;
+    s_native_view_width = (int)width;
+    s_native_view_offset = ((int)width - canonical_width) / 2;
     s_native_view_canonical_width = canonical_width;
     s_native_view_canonical_height = canonical_height;
     s_native_view_enabled = 1;
@@ -7713,7 +7737,7 @@ int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
     gl_perf_present_enter();
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (force_4_3)
-        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        letterbox_rect_4_3(ww, wh, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     frequency = SDL_GetPerformanceFrequency();
@@ -11880,8 +11904,7 @@ static GpuRenderTransactionStatus glb_commit_validate(
         return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
 
     if (present->force_4_3)
-        letterbox_rect_aspect(drawable_w, drawable_h, 4, 3,
-                              &lx, &ly, &lw, &lh);
+        letterbox_rect_4_3(drawable_w, drawable_h, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(drawable_w, drawable_h, &lx, &ly, &lw, &lh);
 

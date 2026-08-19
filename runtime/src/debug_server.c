@@ -8945,6 +8945,8 @@ static void disp_ring_capture(void)
      * software backend's authoritative surface). Runs on the present thread,
      * where the GL context is current. */
     extern int gl_renderer_fbo_peek(int x, int y, int w_, int h_, uint16_t *out);
+    extern int gl_renderer_native_view_peek(
+        int base_x, int x, int y, int w_, int h_, uint16_t *out);
     int got = 0;
     if (di.display_x + w <= 1024 && di.display_y + h <= 512)
         got = gl_renderer_fbo_peek((int)di.display_x, (int)di.display_y,
@@ -8963,13 +8965,22 @@ static void disp_ring_capture(void)
         const int native_w = gl_renderer_native_view_width();
 
         if (!di.depth24 && native_w > 0 && native_w <= DISP_RING_MAX_W &&
-            h <= DISP_RING_MAX_H &&
-            gl_renderer_native_view_phase_peek(
+            h <= DISP_RING_MAX_H) {
+            int native_got = gl_renderer_native_view_phase_peek(
                 (int)di.display_x, 0u, 0, (int)di.display_y,
-                native_w, (int)h, e->native_px)) {
-            e->native_w = (uint16_t)native_w;
-            e->native_h = (uint16_t)h;
-            e->native_valid = 1;
+                native_w, (int)h, e->native_px);
+            /* 30 FPS Native has no interpolation phase surface. The current
+             * Native surface is still the exact presented source and must be
+             * available to the frame-exact forensic ring. */
+            if (!native_got)
+                native_got = gl_renderer_native_view_peek(
+                    (int)di.display_x, 0, (int)di.display_y,
+                    native_w, (int)h, e->native_px);
+            if (native_got) {
+                e->native_w = (uint16_t)native_w;
+                e->native_h = (uint16_t)h;
+                e->native_valid = 1;
+            }
         }
     }
     /* Full-VRAM aux capture (same GL-truth/CPU-truth split as the display). */
@@ -11021,10 +11032,10 @@ static void handle_gl_present_ring(int id, const char *json)
                         (unsigned long long)e.geometry_hash,
                         e.phase_surface_hash_valid,
                         (unsigned long long)e.phase_surface_hash,
-                        e.phase_vram_hash_valid,
-                        (unsigned long long)e.phase_vram_hash,
-                        e.scanout_dx, e.scanout_dy,
-                        e.scanout_w, e.scanout_h);
+                         e.phase_vram_hash_valid,
+                         (unsigned long long)e.phase_vram_hash,
+                         e.scanout_dx, e.scanout_dy,
+                         e.scanout_w, e.scanout_h);
         if (written < 0 || (size_t)written >= bufsz - event_start) {
             pos = event_start;
             buf[pos] = '\0';
