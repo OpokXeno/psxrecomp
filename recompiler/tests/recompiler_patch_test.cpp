@@ -1141,6 +1141,35 @@ void cfg_codegen_load_delay_test() {
           writeback != std::string::npos && deferred < successor &&
           successor < writeback,
           "CFG codegen preserves MIPS-I dependent load-delay value semantics");
+    check(code.find("#endif PGXP_") == std::string::npos,
+          "CFG codegen keeps PGXP hooks off preprocessor directive lines");
+}
+
+void cfg_codegen_pgxp_preprocessor_test() {
+    constexpr uint32_t base = 0x80003600u;
+    PSXRecomp::PS1Executable exe{};
+    exe.header.load_address = base;
+    exe.header.initial_pc = base;
+    exe.header.file_size = 20u;
+    append_word(exe.code_data, 0x00420018u); // mult v0,v0
+    append_word(exe.code_data, 0x24030001u); // addiu v1,zero,1
+    append_word(exe.code_data, 0x03E00008u); // jr ra
+    append_word(exe.code_data, 0x00000000u); // delay-slot nop
+    append_word(exe.code_data, 0x00000000u);
+
+    PSXRecomp::Function function{};
+    function.start_addr = base;
+    function.end_addr = base + 20u;
+    function.size = 20u;
+    function.name = "cfg_pgxp_preprocessor";
+    PSXRecomp::ControlFlowAnalyzer analyzer(exe);
+    const auto cfg = analyzer.analyze_function(function);
+    PSXRecomp::CodeGenerator generator(exe);
+    const std::string code = generator.generate_function(function, cfg).full_code;
+
+    check(code.find("PGXP_MULDIV") != std::string::npos &&
+              code.find("#endif PGXP_") == std::string::npos,
+          "CFG codegen separates PGXP hooks from #endif directives");
 }
 
 } // namespace
@@ -1158,6 +1187,7 @@ int main() {
         gte_codegen_classification_tests();
         jump_table_producer_codegen_test();
         cfg_codegen_load_delay_test();
+        cfg_codegen_pgxp_preprocessor_test();
     } catch (const std::exception& e) {
         fmt::print(stderr, "FAIL  unexpected exception: {}\n", e.what());
         ++failures;

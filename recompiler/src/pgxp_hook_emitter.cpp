@@ -35,6 +35,13 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
     const uint32_t rt = get_rt(instr);
     const uint32_t rd = get_rd(instr);
     const int16_t offset = get_imm16(instr);
+    const auto separate_preprocessor_directive = [&]() {
+        const size_t end = code.find_last_not_of(" \t\r\n");
+        if (end != std::string::npos && end >= 5 &&
+            code.compare(end - 5, 6, "#endif") == 0) {
+            code.push_back('\n');
+        }
+    };
     const auto addr_expr = [&]() {
         return (offset == 0) ? reg_name(rs)
                              : fmt::format("{} + {}", reg_name(rs), offset);
@@ -46,12 +53,14 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         switch (funct) {
         case 0x00: case 0x02: case 0x03:       /* SLL / SRL / SRA             */
             if (rd == 0 || instr == 0) return; /* skip plain nop              */
+            separate_preprocessor_directive();
             code = fmt::format(
                 "{{ uint32_t _pgx1 = {}; {} PGXP_ALU(0x{:08X}u, {}, _pgx1, {}u); }}",
                 reg_name(rt), code, instr, reg_name(rd), (instr >> 6) & 31u);
             return;
         case 0x04: case 0x06: case 0x07:       /* SLLV / SRLV / SRAV          */
             if (rd == 0) return;
+            separate_preprocessor_directive();
             code = fmt::format(
                 "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {} "
                 "PGXP_ALU(0x{:08X}u, {}, _pgx1, _pgx2); }}",
@@ -59,17 +68,20 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
             return;
         case 0x10: case 0x12:                  /* MFHI / MFLO                 */
             if (rd == 0) return;
+            separate_preprocessor_directive();
             code = fmt::format("{} PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
                                code, instr, reg_name(rd),
                                funct == 0x10 ? "cpu->hi" : "cpu->lo");
             return;
         case 0x11: case 0x13:                  /* MTHI / MTLO                 */
+            separate_preprocessor_directive();
             code = fmt::format("{} PGXP_ALU(0x{:08X}u, {}, {}, 0u);",
                                code, instr,
                                funct == 0x11 ? "cpu->hi" : "cpu->lo",
                                funct == 0x11 ? "cpu->hi" : "cpu->lo");
             return;
         case 0x18: case 0x19: case 0x1A: case 0x1B:  /* MULT(U)/DIV(U)        */
+            separate_preprocessor_directive();
             code = fmt::format(
                 "{} PGXP_MULDIV(0x{:08X}u, cpu->hi, cpu->lo, {}, {});",
                 code, instr, reg_name(rs), reg_name(rt));
@@ -77,6 +89,7 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         case 0x20: case 0x21: case 0x22: case 0x23:  /* ADD(U)/SUB(U)         */
         case 0x25:                                   /* OR                    */
             if (rd == 0) return;
+            separate_preprocessor_directive();
             code = fmt::format(
                 "{{ uint32_t _pgx1 = {}; uint32_t _pgx2 = {}; {} "
                 "PGXP_ALU(0x{:08X}u, {}, _pgx1, _pgx2); }}",
@@ -88,6 +101,7 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
     }
     case 0x08: case 0x09:                      /* ADDI / ADDIU                */
         if (rt == 0) return;
+        separate_preprocessor_directive();
         code = fmt::format(
             "{{ uint32_t _pgx1 = {}; {} PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:08X}u); }}",
             reg_name(rs), code, instr, reg_name(rt),
@@ -95,6 +109,7 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         return;
     case 0x0D:                                 /* ORI                         */
         if (rt == 0) return;
+        separate_preprocessor_directive();
         code = fmt::format(
             "{{ uint32_t _pgx1 = {}; {} PGXP_ALU(0x{:08X}u, {}, _pgx1, 0x{:04X}u); }}",
             reg_name(rs), code, instr, reg_name(rt),
@@ -102,25 +117,30 @@ void append_pgxp_hooks(uint32_t instr, std::string& code) {
         return;
     case 0x0F:                                 /* LUI                         */
         if (rt == 0) return;
+        separate_preprocessor_directive();
         code = fmt::format("{} PGXP_ALU(0x{:08X}u, {}, 0u, 0u);",
                            code, instr, reg_name(rt));
         return;
     case 0x12: {                               /* COP2 register transfers     */
         const uint32_t cop_op = (instr >> 21) & 0x1F;
-        if ((cop_op == 0x00 && rt != 0) || cop_op == 0x04)  /* MFC2 / MTC2   */
+        if ((cop_op == 0x00 && rt != 0) || cop_op == 0x04) {  /* MFC2 / MTC2   */
+            separate_preprocessor_directive();
             code = fmt::format("{} PGXP_COP2(0x{:08X}u, {}, 0u);",
                                code, instr, reg_name(rt));
+        }
         return;
     }
     case 0x20: case 0x21: case 0x22: case 0x23:
     case 0x24: case 0x25: case 0x26:           /* loads                       */
         if (rt == 0) return;
+        separate_preprocessor_directive();
         code = fmt::format(
             "{{ uint32_t _pgxa = {}; {} PGXP_LOAD(0x{:08X}u, _pgxa, {}); }}",
             addr_expr(), code, instr, reg_name(rt));
         return;
     case 0x28: case 0x29: case 0x2A: case 0x2B:
     case 0x2E:                                 /* stores                      */
+        separate_preprocessor_directive();
         code = fmt::format(
             "{{ uint32_t _pgxa = {}; {} PGXP_STORE(0x{:08X}u, _pgxa, {}); }}",
             addr_expr(), code, instr, reg_name(rt));

@@ -2241,7 +2241,18 @@ std::string CodeGenerator::translate_basic_block(
                 const size_t pos = emitted.find(lhs);
                 if (pos != std::string::npos) {
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
-                    emitted.replace(pos, lhs.size(), "uint32_t " + temp + " =");
+                    emitted.replace(pos, lhs.size(), temp + " =");
+                    const std::string pgxp_load = fmt::format(
+                        "PGXP_LOAD(0x{:08X}u, _pgxa, {});",
+                        instr, reg_name(static_cast<int>(load_dest)));
+                    const std::string deferred_pgxp_load = fmt::format(
+                        "PGXP_LOAD(0x{:08X}u, _pgxa, {});",
+                        instr, temp);
+                    const size_t pgxp_pos = emitted.find(pgxp_load);
+                    if (pgxp_pos != std::string::npos)
+                        emitted.replace(pgxp_pos, pgxp_load.size(), deferred_pgxp_load);
+                    ss << config_.indent
+                       << fmt::format("uint32_t {} = 0;  /* load-delay temp */\n", temp);
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
                     delayed_load_addr = addr;
                     delayed_load_dest = static_cast<uint32_t>(load_dest);
