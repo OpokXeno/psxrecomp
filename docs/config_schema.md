@@ -26,10 +26,18 @@ psx-runtime                          # boots BIOS discless
 psx-runtime games/tomba/game.toml    # boots BIOS, then loads game
 ```
 
-When both are loaded, keys merge:
+How the two configs relate:
 
-- **Scalar keys (`debug_port`, `window_title`, `memcard_dir`, ...)**: game
-  wins if set, inherit from bios.toml otherwise. Shallow override.
+- **Scalar keys (`debug_port`, `window_title`, `memcard_dir`, ...)**: these come
+  from `game.toml` only. There is **no BIOS→game inheritance.** An earlier
+  version of this document described a shallow override where the game won and
+  otherwise inherited from `bios.toml`; that merge was never implemented.
+  `load_bios_config` (`recompiler/src/config_loader.cpp`) is called only from the
+  recompiler front-ends — `main_bios.cpp`, and `main_psx.cpp` purely to build the
+  `BiosAddressModel` — and never from `runtime/src/main.cpp`. Setting a
+  `[runtime]` scalar in a BIOS toml has no effect on a game run.
+  Runtime precedence is: environment > CLI > `settings.toml` > `game.toml` >
+  compiled-in default.
 - **`[program]` (BIOS) and `[game]` blocks**: NOT merged — they describe
   different programs. Both are visible to the loader.
 - **Generated dispatch tables and C output**: ADDITIVE. BIOS contributes
@@ -45,10 +53,34 @@ When both are loaded, keys merge:
 ```toml
 [program]    # in bios.toml; describes the BIOS
 [game]       # in game.toml; describes the game
+[prepare_disc]  # optional; data-track digests for prepare/verify
+[netplay]       # optional; TOC / cue policy for online
 [recompiler]
 [runtime]
 [audit]
 ```
+
+## Netplay disc mount (`[netplay]`)
+
+Optional. Online play needs the same CD geometry on every peer — data-track
+CRC/SHA alone cannot distinguish a Track-01-only dump from a full Redump
+multi-track cue. The runtime mounts the resolved path, fingerprints the TOC
+(`disc_fp`), and gates Host/Join on `netplay_ok`. Peers also exchange
+`disc_fp` through the lobby (`disc_mismatch` on join).
+
+| Field | Default | Description |
+|---|---|---|
+| `require_cue` | `false` | Require a `.cue` mount (reject bare `.bin` / cue→bin fallback) |
+| `required_tracks` | `0` | Exact `iso_track_count` when > 0 (e.g. MotK Redump = `17`) |
+| `required_leadout_lba` | unset | Exact lead-out LBA when set |
+| `required_disc_fp` | `""` | Exact lowercase hex SHA-256 TOC fingerprint when non-empty |
+
+Offline Play may still launch with a TOC warning; first-run setup Finish and
+online Create/Join require `netplay_ok` (and online also a clean verify +
+non-empty `disc_fp`). Mirror `required_tracks` in the RetComM catalog as
+`rom_identity.track_counts` so the hub library scan rejects Track-01-only dumps.
+Wizard / RetComM / catalog submission accept Redump `.cue` + sibling `.bin`
+tracks only — not `.iso`/`.chd` (cannot reliably expand to multi-track).
 
 ## Program / game block
 
@@ -145,6 +177,121 @@ Patches are build-time inputs, not runtime memory writes or live toggles.
 Regenerate the affected main executable or captured overlays after changing
 them.
 
+### Guarded widescreen participation comparisons
+
+Games may disable a proven object/model cull verdict in widened world views
+without changing true 4:3 behavior:
+
+```toml
+[[widescreen.cull.keep]]
+address = "0x8002B310"
+expected = "0x28A21C01"
+result = 1
+```
+
+- `expected` must encode `SLT`, `SLTU`, `SLTI`, or `SLTIU`.
+- `result` must be 0 or 1.
+- The site identity is the normalized physical address plus the complete
+  32-bit instruction. A nonmatching overlay variant at the same VA is left
+  unchanged.
+- At true 4:3 the original comparison is evaluated. The configured result is
+  forced only when `psx_ws_x_margin() > 0`.
+- Native generated code and the dirty-RAM interpreter implement the same
+  semantics.
+- Regenerate main/overlay native code after changing the list.
+
+Prefer an aspect-derived cone over `keep` when the original predicate is a
+camera-frustum test. `keep` has no queue policy and is appropriate only for a
+separately proven binary verdict.
+
+### Aspect-aware terrain and model participation
+
+Exact terrain-frustum angle loads can follow the live horizontal field:
+
+```toml
+[[widescreen.cull.angle]]
+address = "0x8013F138"
+expected = "0x24020155"
+```
+
+`expected` must be `ADDI`/`ADDIU rt,zero,imm`, with a positive 12-bit angular
+half-extent below one quarter-turn. The helper widens `tan(angle)` by the live
+per-side horizontal extent. It is exact at 4:3 and full-word guarded against
+same-address overlay variants.
+
+A model-list or per-child cosine rejection can use a horizontal-only envelope:
+
+```toml
+[widescreen.cull.aspect_cone]
+forward_addr = "0x1F8000E8" # signed Q12 X/Z/Y halfwords
+object_type_offset = 12
+object_reg = 19
+x_reg = 16
+z_reg = 17
+y_reg = 18
+hysteresis_pixels = 24
+queue_reserve = 4
+queue_count_addrs = ["0x1F800144", "0x1F800150", "0x1F80015C"]
+queue_capacities = [24, 40, 28]
+queue_type_masks = ["0x00000204", "0x00000010", "0x00000020"]
+
+[[widescreen.cull.aspect_cone.sites]]
+address = "0x80077368"
+expected = "0x28620358" # signed SLTI reject predicate
+
+[[widescreen.cull.aspect_cone.sites]]
+address = "0x8002B368"
+expected = "0x0082202A" # signed SLT reject predicate
+cosine_threshold = 856  # required for SLT; Q10
+object_reg = 20         # optional per-site register overrides
+x_reg = 19
+z_reg = 18
+y_reg = 17
+queue_guard = false     # this lower-level predicate appends to no fixed queue
+```
+
+- Sites must be signed `SLTI` or `SLT` reject predicates: zero is the keep
+  path and one is rejection.
+- An `SLTI` site derives its Q10 cosine threshold from the immediate unless
+  `cosine_threshold` is given. An `SLT` site requires it explicitly.
+- A vanilla keep is always preserved. Only a vanilla rejection is retested.
+- Horizontal reach follows the current client aspect. Vertical reach,
+  near/far checks, type dispatch, and the game’s queue-capacity branches are
+  unchanged.
+- `guard_pixels` is the activation guard outside the visible field.
+  `hysteresis_pixels` moves deactivation farther out.
+- For `queue_guard = true`, non-visible guard/hysteresis candidates are
+  rejected at `capacity - queue_reserve`, preserving headroom for candidates
+  intersecting the visible wide field.
+- Use `queue_guard = false` only after proving that the exact predicate does
+  not append to those queues.
+- Site address, instruction, threshold, registers, queue policy, guard size,
+  and enclosing cone/queue metadata all contribute to overlay cache identity.
+- Generated/native overlay code and the dirty-RAM interpreter use the same
+  live helper. Dynamic resizing therefore needs no recompilation.
+
+The debug server’s `ws_aspect_cone_site` command accepts an `address` string
+and reports exact-site identity/keep/reject counters.
+
+Explicit `bias_sites` / `range_sites` may opt into an additional resident
+object lead without widening terrain or render queues:
+
+```toml
+[widescreen.cull]
+guard_pixels = 16
+activation_guard_pixels = 256
+bias_sites = ["0x80069BA8"]
+range_sites = ["0x80069BB0"]
+```
+
+`activation_guard_pixels` is added only to the live margin emitted at those
+two explicit site families, and only while widescreen reveals extra world.
+At true 4:3 it is exactly zero. `guard_pixels` remains the shared
+render/terrain participation guard; keep it small when terrain producers or
+model queues have fixed capacity. Both values are restricted to `[0, 256]`
+and contribute to native-overlay cache identity. Changing the activation
+guard requires regenerating the game and overlay code.
+
 ## Runtime block
 
 Consumed by the cmake macro `psxrecomp_v4_add_runtime_target` (eventually)
@@ -182,14 +329,54 @@ The other load-time accelerators are likewise opt-in:
 
 ```toml
 [runtime]
-turbo_loads = true
 idle_skip = true
 turbo_audio_sink = true
 ```
 
-`turbo_audio_sink` is meaningful only while `turbo_loads` is active. It keeps
+### `turbo_loads` / `offer_turbo_loads` — deprecated and ignored
+
+**Do not use these keys.** Load acceleration is owned by the Mods catalog:
+`psx.enhancement.fast-loading` ("Fast Loading (host pacing)") and
+`psx.enhancement.cd-speed`. Both target `game_id = "*"`, so they ship with every
+title, both default to off, and both expose the multiplier and instant-scheduler
+detail that a single opaque boolean never could. recomp-ui correspondingly draws
+no generic Turbo loads row.
+
+Both keys are still parsed so existing configs load without error, but neither is
+honoured — the runtime logs a deprecation line naming the Fast Loading mod and
+leaves acceleration off. Remove them from `game.toml`.
+
+The same applies to `[video] turbo_loads` in a user's `settings.toml`: it is no
+longer restored at startup, and it is no longer written back out, so the stale
+row disappears on the first save after updating. This is deliberate. Because the
+launcher stopped drawing a control for it, a persisted `true` was simultaneously
+authoritative and unreachable: one run of a build whose `game.toml` said `true`
+latched turbo on permanently, and no later config change could undo it. That
+shipped to players in MegaManX6Recomp v1.0.4/v1.0.5 (MegaManX6Recomp#14). Never
+restore this row without also restoring a UI control for it.
+
+For development, the `turbo_loads` TCP debug command still toggles acceleration
+at runtime.
+
+`turbo_audio_sink` is meaningful only while load acceleration is active. It keeps
 the guest SPU timeline advancing but discards accelerated samples before host
 playback, then fades normal output back in.
+
+## Audio Block
+
+Game projects may choose the host playback cushion after validating their
+audio production cadence:
+
+```toml
+[audio]
+buffer_ms = 60
+```
+
+`buffer_ms` accepts 30–500 milliseconds and defaults to 180. Lower values
+reduce audible input-to-sound delay, but leave less reserve for frames where a
+game temporarily produces no audio and can therefore crackle on affected
+titles. This is deliberately a per-game developer choice; it is not read from
+the player's `settings.toml`.
 
 ## Video Block
 
@@ -200,6 +387,8 @@ Runtime video defaults live in `[video]`:
 renderer = "opengl"       # "software", "opengl", or "vulkan"
 offer_vulkan = false      # show Vulkan in the launcher only after game validation
 fps = 30                  # 30 = original cadence; 60 = Native interpolation
+auto_skip_fmv = false     # legacy Settings/runtime default
+offer_skip_fmv = true     # false when the game exposes this through Mods
 ```
 
 `renderer = "vulkan"` remains an experimental runtime choice and still requires
@@ -211,6 +400,11 @@ Vulkan after validating their visuals and stability.
 Native interpolation presentation path while preserving guest VBlank, input,
 and audio timing. The launcher persists the same `fps = 30|60` value in
 `settings.toml`; it exposes no separate interpolation toggle.
+
+`offer_skip_fmv` defaults to true for compatibility with the shared PSX
+Settings surface. A game migrating Skip FMVs into its built-in mod catalog sets
+it to false. The runtime then hides the Settings row, ignores stale persisted
+values, and leaves activation to the selected trusted plugin.
 
 Reserved future fields:
 - `default_disc_path` — game runtimes can pre-mount a disc

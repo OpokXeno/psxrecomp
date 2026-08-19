@@ -235,10 +235,9 @@ static void hle_deliver_event(CPUState* cpu, uint32_t base, uint32_t n)
             cpu->write_word(ev + EV_STATUS, EVST_READY);
         } else if (mode == EVMD_CALLBACK) {
             uint32_t func = cpu->read_word(ev + EV_FUNC);
-            /* deliver_event_ret == 0 never reaches here: main.cpp forces the
-             * whole HLE tier off when the linked BIOS exports no anchor
-             * (dropping a callback silently is NOT an acceptable fallback,
-             * so the gate lives at tier selection, not per-event). */
+            /* deliver_event_ret == 0 never reaches here: configure() refuses
+             * call-HLE when the linked BIOS exports no anchor (dropping a
+             * callback silently wedges Ape LOAD card EvCBs). */
             if (func != 0 && psx_bios_image.deliver_event_ret != 0) {
                 /* Nested guest call, same shape as any compiled call site.
                  * $ra is the kernel's real post-jalr address so the callback
@@ -331,8 +330,17 @@ static int bios_hle_dispatch(struct CPUState* cpu, uint32_t phys)
 
 void psx_bios_hle_configure(int call_hle, int boot_skip)
 {
-    s_call_hle_on  = call_hle ? 1 : 0;
-    s_boot_skip_on = boot_skip ? 1 : 0;
+    /* IMPORTANT (Ape Escape + OpenBIOS): clamp call-HLE to deliver_event_ret.
+     * OpenBIOS omits the anchor; servicing B0:07 without it silently skips
+     * CALLBACK EvCBs (HwCARD/SwCARD flag handlers at 0x80022930/0x80022980
+     * never run → LOAD phase waits never complete). Plan should already
+     * refuse; this is the runtime backstop. Boot-skip remains independent. */
+    s_call_hle_on  = (call_hle && psx_bios_image.deliver_event_ret != 0) ? 1 : 0;
+    /* Clamp to what THIS image can actually do, so the state the banner and
+     * `hle_dump` report can never claim a skip that bios_hle_dispatch below is
+     * structurally unable to perform. Callers are expected to have gone
+     * through psx_bios_hle_plan(); this is the backstop, not the policy. */
+    s_boot_skip_on = (boot_skip && psx_bios_image.shell_entry_phys != 0) ? 1 : 0;
     /* Rematch / session_reboot re-enters bring-up without process exit; the
      * shell-skip latch must arm again or peers run the interactive shell and
      * appear hung after netplay lockstep. */

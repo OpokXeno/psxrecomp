@@ -5,9 +5,15 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
-#define CHECK(expression) do { if (!(expression)) return 0; } while (0)
+#define CHECK(expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "FAIL:%d: %s\n", __LINE__, #expression); \
+        return 0; \
+    } \
+} while (0)
 
 #ifndef GUEST_RENDER_BRIDGE_INITIAL_CLAIM_ROUNDS
 #define GUEST_RENDER_BRIDGE_INITIAL_CLAIM_ROUNDS 2000u
@@ -985,7 +991,7 @@ static int test_simultaneous_initial_owner_claim_preserves_poison(void) {
                 GUEST_RENDER_TIMING_NATIVE_59_94 ||
             atomic_load_explicit(&race.effective_render[owner_index],
                                  memory_order_relaxed) !=
-                GUEST_RENDER_RENDER_ORIGINAL ||
+                GUEST_RENDER_RENDER_NATIVE ||
             atomic_load_explicit(&race.fallback_reason[owner_index],
                                  memory_order_relaxed) !=
                 GUEST_RENDER_FALLBACK_WRONG_THREAD) {
@@ -1046,24 +1052,31 @@ static int test_fallback_reason_names_are_stable(void) {
 }
 
 int main(void) {
-    if (!test_singleton_owner_and_first_id()) return 1;
-    if (!test_scene_state_uniqueness_and_repeated_present()) return 1;
-    if (!test_modes_are_copied_and_effective_modes_fall_back_independently()) return 1;
-    if (!test_fallback_telemetry_tracks_scene_and_lifetime_state()) return 1;
-    if (!test_sequential_producers_no_nesting_and_finalize_order()) return 1;
-    if (!test_packet_bindings_span_lookup_and_repeated_present()) return 1;
-    if (!test_packet_binding_duplicates_fail_closed()) return 1;
-    if (!test_packet_binding_capacity_and_stale_handles_fail_closed()) return 1;
-    if (!test_scene_reset_clears_completed_state_and_open_state_falls_back()) return 1;
-    if (!test_scene_reset_and_abort_clear_packet_bindings()) return 1;
-    if (!test_abort_scene_clears_all_state_and_requires_new_scene()) return 1;
-    if (!test_slot_capacity_clears_native_slots()) return 1;
-    if (!test_wrong_id_stale_handle_and_invalid_provenance_fail_closed()) return 1;
-    if (!test_counter_exhaustion_never_wraps()) return 1;
-    if (!test_null_arguments_are_rejected()) return 1;
-    if (!test_wrong_thread_poison_does_not_create_a_state()) return 1;
-    if (!test_wrong_thread_poison_clears_packet_bindings()) return 1;
-    if (!test_simultaneous_initial_owner_claim_preserves_poison()) return 1;
-    if (!test_fallback_reason_names_are_stable()) return 1;
+#define RUN_TEST(test) do { \
+    if (!(test)()) { \
+        fprintf(stderr, "FAILED: %s\n", #test); \
+        return 1; \
+    } \
+} while (0)
+    RUN_TEST(test_singleton_owner_and_first_id);
+    RUN_TEST(test_scene_state_uniqueness_and_repeated_present);
+    RUN_TEST(test_modes_are_copied_and_effective_modes_fall_back_independently);
+    RUN_TEST(test_fallback_telemetry_tracks_scene_and_lifetime_state);
+    RUN_TEST(test_sequential_producers_no_nesting_and_finalize_order);
+    RUN_TEST(test_packet_bindings_span_lookup_and_repeated_present);
+    RUN_TEST(test_packet_binding_duplicates_fail_closed);
+    RUN_TEST(test_packet_binding_capacity_and_stale_handles_fail_closed);
+    RUN_TEST(test_scene_reset_clears_completed_state_and_open_state_falls_back);
+    RUN_TEST(test_scene_reset_and_abort_clear_packet_bindings);
+    RUN_TEST(test_abort_scene_clears_all_state_and_requires_new_scene);
+    RUN_TEST(test_slot_capacity_clears_native_slots);
+    RUN_TEST(test_wrong_id_stale_handle_and_invalid_provenance_fail_closed);
+    RUN_TEST(test_counter_exhaustion_never_wraps);
+    RUN_TEST(test_null_arguments_are_rejected);
+    RUN_TEST(test_wrong_thread_poison_does_not_create_a_state);
+    RUN_TEST(test_wrong_thread_poison_clears_packet_bindings);
+    RUN_TEST(test_simultaneous_initial_owner_claim_preserves_poison);
+    RUN_TEST(test_fallback_reason_names_are_stable);
+#undef RUN_TEST
     return 0;
 }

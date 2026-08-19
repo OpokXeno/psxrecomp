@@ -29,7 +29,8 @@ project ships no game data.
 
 | Dependency | How it's provided | Used for |
 |---|---|---|
-| **SDL2** | System. Windows/MSVC: prebuilt pack auto-found at `../sdl2-msvc/SDL2-*`. Windows/MinGW + macOS + Linux: found via pkg-config. | Window, input, GL/Vulkan context, audio, threads |
+| **SDL3 3.4+** | Preferred system package; otherwise SDL 3.4.10 is fetched from the official release archive with a pinned SHA-256. | Window, input, GL/Vulkan context, audio, threads |
+| **SDL2** | Optional explicit fallback (`-DPSX_SDL_BACKEND=SDL2`). Windows/MSVC uses `../sdl2-msvc/SDL2-*`; MinGW/macOS/Linux use pkg-config. | Compatibility and A/B testing |
 | **fmt** 9.1.0 | vendored `recompiler/lib/fmt` | String formatting (runtime uses it header-only) |
 | **toml11** | vendored `recompiler/lib/toml11` | Parsing `game.toml` / configs |
 | **ELFIO** | vendored `recompiler/lib/ELFIO` | ELF parsing (recompiler only) |
@@ -37,7 +38,7 @@ project ships no game data.
 | **TinyCC (TCC) 0.9.27** | Not in this repo — downloaded at release-packaging time and bundled beside the game exe in `overlay_toolchain/`. | Toolchain-free overlay compilation for players (run as a subprocess) |
 | **Python 3.11+** | System (development) or a pinned embedded copy bundled in releases | Runs `tools/compile_overlays.py` in the overlay pipeline |
 | **OpenGL** | System (`opengl32` on Windows; `find_package(OpenGL)` elsewhere) | The GL renderer |
-| **Vulkan** | Headers only, optional, **off by default** (`PSX_ENABLE_VULKAN=OFF`); loaded dynamically via SDL. Shader compilation needs `glslc` from the Vulkan SDK. | The experimental Vulkan renderer |
+| **Vulkan** | Headers only, **on by default** (`PSX_ENABLE_VULKAN=ON`) — built when the SDK tools are available, otherwise skipped; loaded dynamically via SDL. Shader compilation needs `glslc` from the Vulkan SDK. Pass `-DPSX_ENABLE_VULKAN=OFF` to exclude it. | The experimental Vulkan renderer |
 
 Developers building overlays locally need `python3` and `gcc` on `PATH` (the
 `gcc` tier). A game runtime launched from its source checkout discovers the
@@ -47,10 +48,24 @@ their licenses under `overlay_toolchain/`, so players need no development tools.
 
 ### Get the source
 
-This repository has no required git submodules:
+This repository has two submodules, **neither of which is required** for the
+recompiler and runtime builds described below:
+
+| Submodule | Needed when |
+|---|---|
+| `recomp-ui` | `-DPSX_RECOMP_UI=ON` (the launcher UI). Configure **fails** with a `FATAL_ERROR` if this is ON and the submodule is absent. |
+| `lib/recomp-net` | `-DPSX_NETPLAY=ON` (netplay). |
+
+A plain clone is enough to build the recompiler and the runtime:
 
 ```sh
 git clone https://github.com/mstan/psxrecomp.git
+```
+
+Add `--recurse-submodules` if you intend to build the launcher or netplay:
+
+```sh
+git clone --recurse-submodules https://github.com/mstan/psxrecomp.git
 ```
 
 ## Per-platform prerequisites
@@ -59,18 +74,22 @@ git clone https://github.com/mstan/psxrecomp.git
 ```sh
 # In an MSYS2 MinGW64 shell:
 pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
-                   mingw-w64-x86_64-ninja mingw-w64-x86_64-SDL2 mingw-w64-x86_64-ccache
+                   mingw-w64-x86_64-ninja mingw-w64-x86_64-ccache
 ```
 
 **macOS:**
 ```sh
-brew install sdl2 pkg-config ninja cmake
+brew install ninja cmake
 ```
 
 **Linux (Debian/Ubuntu):**
 ```sh
-sudo apt install build-essential cmake ninja-build pkg-config libsdl2-dev
+sudo apt install build-essential cmake ninja-build
 ```
+
+These are the SDL3-default prerequisites. For the SDL2 fallback, additionally
+install `mingw-w64-x86_64-SDL2`, `sdl2`, or `libsdl2-dev` respectively, plus
+`pkg-config` outside MSVC.
 
 ## Build the framework
 
@@ -81,11 +100,19 @@ Two CMake trees: the recompiler (a tool) and the runtime (the engine).
 cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build recompiler/build
 
-# 2. (Optional) regenerate either statically recompiled BIOS backend.
+# 2. REQUIRED before the first runtime build: generate a BIOS backend.
+#    Step 3 configures psx-runtime from generated/OpenBIOS_full.c. If generated/
+#    is empty, CMake does NOT fall back -- it fails at configure time with
+#    "Cannot find source file: .../generated/OpenBIOS_full.c" followed by
+#    "No SOURCES given to target: psx-runtime". Re-run this step whenever the
+#    recompiler emitter changes; a stale generated/ raises a fingerprint-mismatch
+#    warning from runtime.cmake.
+#
 #    OpenBIOS can always be regenerated from the tracked image. Regenerating
-#    the retail backend requires your own bios/SCPH1001.BIN dump.
+#    the retail backend requires your own bios/SCPH1001.BIN dump and is genuinely
+#    optional -- OpenBIOS alone is enough to build and boot.
 bash tools/regen_bios.sh --config bios/OpenBIOS.toml
-bash tools/regen_bios.sh --config bios/SCPH1001.toml
+bash tools/regen_bios.sh --config bios/SCPH1001.toml   # optional, needs your own dump
 
 # 3. Runtime → produces psx-runtime (BIOS-only for this repo)
 cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -99,11 +126,20 @@ On Linux/macOS, `tools/setup_dev.sh` performs the same source-checkout setup:
 sh tools/setup_dev.sh
 ```
 
-It checks for the native toolchain and SDL2 development package, builds the CLI
-and recompiler tools, refreshes generated BIOS C when `bios/SCPH1001.BIN` is
-present, and builds the BIOS-only runtime when BIOS/generated sources are
-available. It does not create per-game runtime targets; use the CLI generator
-for game projects.
+It checks the native toolchain, builds the CLI and recompiler tools, refreshes
+generated BIOS C when `bios/SCPH1001.BIN` is present, and builds the BIOS-only
+runtime when BIOS/generated sources are available. It does not create per-game
+runtime targets; use the CLI generator for game projects.
+
+### Check the build
+
+After step 1 above — no BIOS or disc needed — verify the tree is sane:
+
+```sh
+cd recompiler/build && ctest --output-on-failure
+```
+
+38 tests, under five seconds. See [`TESTING.md`](TESTING.md).
 
 On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generator
 (e.g. `-G "Unix Makefiles"`); everything else is identical.
@@ -119,10 +155,16 @@ On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generato
 | Option | Default | Effect |
 |---|---|---|
 | `PSX_DEBUG_TOOLS` | ON for Debug/RelWithDebInfo, OFF for Release | TCP debug server + heartbeat + per-block recording |
-| `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL2 + libgcc/libstdc++) |
+| `PSX_SDL_BACKEND` | `SDL3` | Host backend. Set `SDL2` explicitly for compatibility or A/B testing. |
+| `PSX_SDL3_FETCH` | ON | Fetch the pinned SDL3 release when a compatible system SDL3 package is unavailable. Set OFF for offline/system-only builds. |
+| `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL + libgcc/libstdc++) |
 | `PSX_RECOMP_UI` | ON | Wire a downstream game's pinned recomp-ui launcher; set OFF for headless/generated builds |
-| `PSX_ENABLE_VULKAN` | OFF | Build the experimental Vulkan renderer |
-| `PSX_BUILD_COSIM` | OFF | Build the first-divergence co-sim oracle target |
+| `PSX_ENABLE_VULKAN` | **ON** | Build the experimental Vulkan renderer when the SDK tools are present (skipped if not). Pass `OFF` to exclude it outright. |
+| `PSX_NETPLAY` | OFF | Link recomp-net + lobby; advertise full netplay UI (multiplayer titles) |
+| `PSX_SETUP_WIZARD` | OFF | Advertise first-run setup wizard + Generate & rebuild in recomp-ui |
+
+See [SDL backends](SDL_BACKENDS.md) for the fallback command and the initial
+SDL3/SDL2 game A/B results.
 
 ## Build and run a game
 
@@ -194,13 +236,47 @@ these files without it). If you hit this on a framework source file, please open
 an issue with your `gcc -v` / `as --version` — the build should apply the flag
 for you.
 
-**`SDL2 MSVC dev package not found`.** The MSVC build expects the prebuilt SDL2
-pack beside the repo at `../sdl2-msvc/SDL2-*`. Use the MSYS2/MinGW toolchain
-(which finds SDL2 via pkg-config) or place the pack there.
+**`SDL3 3.4+ was not found`.** The default build normally downloads the pinned
+release. Check network access, install a system SDL3 package and provide
+`SDL3_DIR`, or re-enable `-DPSX_SDL3_FETCH=ON`.
+
+**`SDL2 MSVC dev package not found`.** This applies only when
+`-DPSX_SDL_BACKEND=SDL2` is selected. Place the prebuilt SDL2 pack beside the
+repo at `../sdl2-msvc/SDL2-*`, or use the MSYS2/MinGW toolchain with SDL2
+available through pkg-config.
 
 **Overlays never compile / stay slow.** In development you need `gcc` on `PATH`
 for the `gcc` tier; otherwise areas stay in the interpreter. See
 [`EXECUTION_MODEL.md`](EXECUTION_MODEL.md).
+
+**`ninja: error: loading 'build.ninja': GetLastError() = 2`, or CMake's
+`Error: could not load cache`.** Both mean the same thing: you ran a *build* in
+a directory that was never successfully *configured*. `CMakeCache.txt` is
+written before the generate step, so a configure that ends in "Configuring
+incomplete, errors occurred!" leaves a cache behind but no `build.ninja` /
+`Makefile` — and the build then fails on the missing generator file rather than
+on the original configure error. Fix the configure error, re-run the same
+`cmake -S ... -B ...` and let it finish; if it keeps failing, delete the build
+directory so a stale cache cannot poison the retry. `tools/regen_bios.sh`
+diagnoses this for the recompiler build directory rather than passing it to
+CMake.
+
+**`No recompiled BIOS backend available` at configure time.** Expected on a
+fresh clone: the recompiled BIOS C is build output and is not tracked. Run
+step 2 of [Build the framework](#build-the-framework)
+(`bash tools/regen_bios.sh --config bios/OpenBIOS.toml`) before configuring the
+runtime or a game. The runtime reads those files from
+`<framework>/generated/<stem>_full.c` and `<stem>_dispatch.c`; that location is
+fixed, and the emitter writes there because `out_dir = "generated"` in
+`bios/<stem>.toml`.
+
+**`regen_bios: no usable recompiler build dir found`.** The script builds the
+BIOS emitter but never configures it, so step 1 of
+[Build the framework](#build-the-framework) has to have run first.
+`PSXRECOMP_BIOS_BUILD` overrides which directory it uses, and is resolved
+**relative to the framework root**, not your shell's working directory — from a
+game project that vendors the framework, that is `recompiler/build`, never
+`psxrecomp/recompiler/build`.
 
 ## Regenerating BIOS backends
 

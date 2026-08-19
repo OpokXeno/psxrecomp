@@ -5,6 +5,7 @@
 #include "autocompile.h"
 #include "overlay_loader.h"
 
+#include <stdarg.h>   /* autocompile_set_degraded takes a format + varargs */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv — declared here; glibc/windows.h leak it, macOS SDK does not */
@@ -60,6 +61,60 @@ static uint32_t     s_fails     = 0;
 static uint32_t     s_rescans   = 0;
 static uint32_t     s_publish_commit_run = 0;
 static uint32_t     s_publish_deferred_run = 0;
+/* Completed failures impose a wall-clock retry gate owned by the provider.
+ * Capture manifests are grow-only and can change every few frames, so capture
+ * signature backoff alone cannot stop a broken command from spawning forever.
+ * Only a fully successful compiler/publication run resets this sequence. */
+static uint32_t     s_consecutive_fails = 0;
+static uint64_t     s_retry_not_before_ms = 0;
+#define AC_RETRY_INITIAL_MS 1000ull
+#define AC_RETRY_MAX_MS   300000ull
+
+static uint64_t autocompile_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+/* Loud-once threshold. One or two failures are ordinary (a shard racing a
+ * capture rewrite, a transient file lock) and self-heal on the next run. A
+ * SUSTAINED failure run means no overlay will ever go native, so the title
+ * runs wholly interpreted — a 10-30x frame-cost difference. That used to be
+ * visible only by querying autocompile_status over TCP and noticing fails ==
+ * runs, which in practice meant it was discovered by someone saying "why is
+ * this slow" (the CWD-relative overlay_autocompile_cmd class of breakage:
+ * every build dir outside the game repo root silently degraded to the
+ * interpreter). Report it on stdout once, with the child's own output. */
+#define AC_LOUD_AFTER_FAILS 3u
+static int s_reported_broken = 0;
+/* Defined below, once the child-output tail ring it reads is declared. */
+static void autocompile_report_broken_once(void);
+#ifndef _WIN32
+/* The compile spawner and its output ring are Windows-only in this file, so
+ * there is no child output to quote off-Windows and nothing to report. */
+static void autocompile_report_broken_once(void) { }
+#endif
+
+static void autocompile_note_failure(void) {
+    s_fails++;
+    if (s_consecutive_fails < 31u) s_consecutive_fails++;
+    unsigned shift = s_consecutive_fails > 1u
+                   ? s_consecutive_fails - 1u : 0u;
+    if (shift > 18u) shift = 18u;
+    uint64_t delay = AC_RETRY_INITIAL_MS << shift;
+    if (delay > AC_RETRY_MAX_MS) delay = AC_RETRY_MAX_MS;
+    s_retry_not_before_ms = autocompile_now_ms() + delay;
+    autocompile_report_broken_once();
+}
+
+static void autocompile_note_success(void) {
+    s_consecutive_fails = 0;
+    s_retry_not_before_ms = 0;
+}
 /* Per-shard build accounting, parsed from compile_overlays.py's machine-readable
  * "PSX_SHARD_RESULT ok=N failed=M skipped=K" line. Before this, a compile run
  * that built zero shards because a header change broke EVERY shard compile
@@ -73,29 +128,35 @@ static uint32_t     s_shard_skipped    = 0;   /* last run */
 static uint32_t     s_shard_fail_total = 0;   /* accumulated across all runs */
 static int          s_shard_result_seen = 0;  /* did we parse a result line? */
 
-static int parse_shard_result_line(const char *line) {
-    unsigned ok = 0, failed = 0, skipped = 0, capacity_fastpath = 0;
-    int consumed = 0;
-    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u %n",
-               &ok, &failed, &skipped, &consumed) != 3)
-        return 0;
-    const char *tail = line + consumed;
-    if (strncmp(tail, "capacity_fastpath=", 18) == 0) {
-        int extra = 0;
-        if (sscanf(tail, "capacity_fastpath=%u %n",
-                   &capacity_fastpath, &extra) != 1)
-            return 0;
-        tail += extra;
-    }
-    for (; *tail; tail++) {
-        if (*tail != ' ' && *tail != '\t' && *tail != '\r') return 0;
-    }
-    (void)capacity_fastpath;
-    s_shard_ok = ok;
-    s_shard_fail = failed;
-    s_shard_skipped = skipped;
-    s_shard_result_seen = 1;
-    return 1;
+/* ---- Degraded-state channel (portable; read by autocompile_status_json) ----
+ *
+ * Every warning in this file goes to stdout, and the shipped runtime links
+ * `-mwindows` — a GUI-subsystem binary with NO console attached. So the careful
+ * diagnostics below are emitted into nothing on exactly the builds people run,
+ * and a broken autocompile presents only as "the game feels slow".
+ *
+ * That is not hypothetical. A fresh worktree ran 100% interpreted for an entire
+ * session — `runs=8 fails=8 shard_ok=0`, `dispatch_native=0` — because
+ * `overlay_autocompile_cmd` named a recompiler path the documented build recipe
+ * does not produce. Nothing surfaced it, and it invalidated a whole performance
+ * comparison before the counters were queried by hand.
+ *
+ * Rule 3 forbids log files and printf debugging, so the fix is not more
+ * printing: record WHY we are degraded in one string that leaves over the TCP
+ * debug server in `autocompile_status`. One queryable field, carrying the
+ * reason, instead of a state that has to be reconstructed from counters. */
+static char s_degraded[600];
+
+static void autocompile_set_degraded(const char *fmt, ...) {
+    if (s_degraded[0]) return;          /* keep the FIRST cause, not the last */
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_degraded, sizeof(s_degraded), fmt, ap);
+    va_end(ap);
+}
+
+const char *autocompile_degraded_reason(void) {
+    return s_degraded[0] ? s_degraded : NULL;
 }
 
 /* Child-output tail ring. Watcher thread writes, TCP reads — guarded by a
@@ -105,6 +166,49 @@ static char s_out[AC_OUT_CAP];
 static int  s_out_len = 0;
 static unsigned s_publish_drops_run = 0;
 static unsigned s_publish_load_fail_run = 0, s_publish_parse_fail_run = 0;
+
+/* Parse result markers while stdout is streaming, not from s_out after exit.
+ * The configured child command may chain post-processing after
+ * compile_overlays.py. Keep the last valid result here before it can age out
+ * of the diagnostic tail. */
+static int shard_result_values(const char *line, unsigned *ok_out,
+                               unsigned *failed_out, unsigned *skipped_out) {
+    unsigned ok = 0, failed = 0, skipped = 0;
+    int consumed = 0;
+    if (sscanf(line, "PSX_SHARD_RESULT ok=%u failed=%u skipped=%u%n",
+               &ok, &failed, &skipped, &consumed) != 3)
+        return 0;
+    /* Producers may append forward-compatible numeric telemetry, currently
+     * `capacity_fastpath=N`. */
+    const char *tail = line + consumed;
+    for (;;) {
+        while (*tail == ' ' || *tail == '\t' || *tail == '\r') tail++;
+        if (!*tail) break;
+        const char *key = tail;
+        while ((*tail >= 'a' && *tail <= 'z') ||
+               (*tail >= 'A' && *tail <= 'Z') ||
+               (*tail >= '0' && *tail <= '9') || *tail == '_')
+            tail++;
+        if (tail == key || *tail++ != '=') return 0;
+        const char *digits = tail;
+        while (*tail >= '0' && *tail <= '9') tail++;
+        if (tail == digits) return 0;
+    }
+    *ok_out = ok;
+    *failed_out = failed;
+    *skipped_out = skipped;
+    return 1;
+}
+
+static int shard_result_line_locked(const char *line) {
+    unsigned ok = 0, failed = 0, skipped = 0;
+    if (!shard_result_values(line, &ok, &failed, &skipped)) return 0;
+    s_shard_ok = ok;
+    s_shard_fail = failed;
+    s_shard_skipped = skipped;
+    s_shard_result_seen = 1;
+    return 1;
+}
 
 #ifdef _WIN32
 static CRITICAL_SECTION s_out_lock;
@@ -144,15 +248,41 @@ static char s_child_line[1024];
 static int  s_child_line_len = 0;
 static int  s_child_line_overflow = 0;
 
-/* Parse result markers while stdout is streaming, not from s_out after exit.
- * The configured child command may chain post-processing after
- * compile_overlays.py (coverage_vault.py is the production example).  That
- * output can exceed AC_OUT_CAP and evict the shard result from the diagnostic
- * tail even though the marker was complete and valid when it arrived.  Keep
- * the last valid result here; poll_main accounts it exactly once after both
- * child-output workers have joined. */
-static int shard_result_line_locked(const char *line) {
-    return parse_shard_result_line(line);
+/* See the forward declaration above for why this is loud. */
+static void autocompile_report_broken_once(void) {
+    if (s_reported_broken || s_consecutive_fails < AC_LOUD_AFTER_FAILS) return;
+    s_reported_broken = 1;
+    autocompile_set_degraded(
+        "overlay autocompile failed %u consecutive runs (last exit %d); "
+        "nothing is being compiled to native code, so overlay execution stays "
+        "in the interpreter. Check [runtime] overlay_autocompile_cmd in "
+        "game.toml: every path in it must resolve from the process working "
+        "directory.",
+        s_consecutive_fails, (int)s_exit_code);
+    char tail[AC_OUT_CAP];
+    int n = 0;
+    if (s_out_lock_init) {
+        EnterCriticalSection(&s_out_lock);
+        n = s_out_len < (int)sizeof tail - 1 ? s_out_len : (int)sizeof tail - 1;
+        if (n > 0) memcpy(tail, s_out + (s_out_len - n), (size_t)n);
+        LeaveCriticalSection(&s_out_lock);
+    }
+    tail[n > 0 ? n : 0] = '\0';
+    fprintf(stdout,
+        "psxrecomp: WARNING: overlay autocompile has failed %u consecutive "
+        "runs (last exit %d).\n"
+        "  Nothing is being compiled to native code, so overlay execution "
+        "stays in the interpreter and\n"
+        "  frame times will be far worse than this build is capable of.\n"
+        "  Check [runtime] overlay_autocompile_cmd in game.toml: every path in "
+        "it must resolve from the\n"
+        "  process working directory, and the recompiler and "
+        "tools/compile_overlays.py it names must exist.\n"
+        "  Last compiler output:\n%s%s",
+        s_consecutive_fails, (int)s_exit_code,
+        n > 0 ? tail : "    (no output captured)\n",
+        (n > 0 && tail[n - 1] != '\n') ? "\n" : "");
+    fflush(stdout);
 }
 
 static void child_line_locked(void) {
@@ -565,7 +695,7 @@ static void posix_parse_publications(const char *buf, int n) {
         } else {
             int result_seen;
             pthread_mutex_lock(&s_out_lock);
-            result_seen = parse_shard_result_line(s_posix_child_line);
+            result_seen = shard_result_line_locked(s_posix_child_line);
             pthread_mutex_unlock(&s_out_lock);
             if (result_seen) {
                 s_posix_child_line_len = 0;
@@ -633,6 +763,156 @@ static void *watch_thread(void *arg) {
 }
 #endif
 
+#ifdef _WIN32
+/* Name the interpreter the spawn will actually run, once, at configure time.
+ * The command line's first token resolves through PATH exactly as cmd.exe /C
+ * will resolve it, and on machines where an MSYS2/Cygwin usr/bin precedes the
+ * Windows Python install, a bare `python` silently binds to the Cygwin build.
+ * That interpreter dies with SIGSEGV (exit 0x0B00) under this file's
+ * job-object spawn BEFORE writing a single byte, so the failure report shows
+ * "(no output captured)" and nothing points at the cause. Resolving and
+ * printing the binding up front turns that class of breakage into a one-line
+ * diagnosis; the msys-2.0.dll/cygwin1.dll sibling check calls it out loudly
+ * before the first compile ever runs. */
+static void autocompile_report_interpreter(void) {
+    char tok[MAX_PATH];
+    size_t n = 0;
+    const char *p = s_cmd;
+    if (*p == '"') {                     /* quoted interpreter path */
+        p++;
+        while (*p && *p != '"' && n + 1 < sizeof(tok)) tok[n++] = *p++;
+    } else {
+        while (*p && *p != ' ' && n + 1 < sizeof(tok)) tok[n++] = *p++;
+    }
+    tok[n] = '\0';
+    if (!tok[0]) return;
+    char resolved[MAX_PATH];
+    /* SearchPathA with .exe mirrors cmd.exe's lookup for extension-less
+     * tokens; a token that already has a path or extension resolves as-is. */
+    DWORD r = SearchPathA(NULL, tok, ".exe", sizeof(resolved), resolved, NULL);
+    if (r == 0 || r >= sizeof(resolved)) {
+        autocompile_set_degraded(
+            "overlay autocompile interpreter \"%s\" does not resolve on PATH; "
+            "every compile run will fail and overlay execution will stay in "
+            "the interpreter.", tok);
+        fprintf(stdout,
+            "psxrecomp: overlay autocompile interpreter '%s' does not resolve "
+            "on PATH — every compile run will fail.\n", tok);
+        fflush(stdout);
+        return;
+    }
+    fprintf(stdout, "psxrecomp: overlay autocompile interpreter: %s\n", resolved);
+    char *slash = strrchr(resolved, '\\');
+    if (!slash) slash = strrchr(resolved, '/');
+    if (slash) {
+        static const char *posix_dlls[] = { "msys-2.0.dll", "cygwin1.dll" };
+        for (size_t k = 0; k < sizeof(posix_dlls) / sizeof(posix_dlls[0]); k++) {
+            char cand[MAX_PATH + 16];
+            snprintf(cand, sizeof(cand), "%.*s\\%s",
+                     (int)(slash - resolved), resolved, posix_dlls[k]);
+            FILE *f = fopen(cand, "rb");
+            if (f) {
+                fclose(f);
+                autocompile_set_degraded(
+                    "overlay autocompile interpreter \"%s\" is an MSYS2/Cygwin "
+                    "build (%s beside it); it crashes under the job spawn "
+                    "before producing output, so every compile fails with no "
+                    "diagnostics. Use \"py -3 ...\" in "
+                    "[runtime] overlay_autocompile_cmd.",
+                    resolved, posix_dlls[k]);
+                fprintf(stdout,
+                    "psxrecomp: WARNING: that interpreter is an MSYS2/Cygwin "
+                    "build (%s beside it).\n"
+                    "  Cygwin-runtime processes crash under the autocompile "
+                    "job spawn before producing output,\n"
+                    "  so every overlay compile will fail with no diagnostics. "
+                    "Use the Windows Python launcher\n"
+                    "  instead: overlay_autocompile_cmd = \"py -3 ...\" in "
+                    "game.toml.\n", posix_dlls[k]);
+                fflush(stdout);
+                break;
+            }
+        }
+    }
+}
+#endif
+
+/* Validate the file arguments the command names, at configure time.
+ *
+ * autocompile_report_interpreter() above resolves the FIRST token (the Python
+ * interpreter). It does not look at the rest of the command line, and the
+ * argument that actually breaks in practice is `--recompiler <path>`: the path
+ * is per-title, hardcoded in game.toml, and does not agree with where the
+ * documented build recipe puts the recompiler.
+ *
+ *   Tomba 2 names psxrecomp-v4/recompiler/build-t2/psxrecomp-game.exe, while
+ *   the recipe builds build-recompiler/ at the worktree root — never matches.
+ *   MMX6 hardcodes an ABSOLUTE path into one checkout, so it works only by
+ *   luck of local layout.
+ *
+ * When the path is wrong every compile fails identically, and because the
+ * failure is only reachable through counters nobody queries, the run silently
+ * degrades to the interpreter. Checking here turns a session-long mystery into
+ * a fact known before the first compile is ever attempted.
+ *
+ * Deliberately advisory: a missing path is recorded and reported, not fatal.
+ * The runtime still runs (interpreted) exactly as before — this only removes
+ * the silence. */
+#ifdef _WIN32
+static void autocompile_check_path_args(void) {
+    static const char *flags[] = { "--recompiler", "--runtime-include" };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        const char *at = strstr(s_cmd, flags[i]);
+        if (!at) continue;
+        const char *p = at + strlen(flags[i]);
+        while (*p == ' ' || *p == '=') p++;
+        char path[MAX_PATH];
+        size_t n = 0;
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"' && n + 1 < sizeof(path)) path[n++] = *p++;
+        } else {
+            while (*p && *p != ' ' && n + 1 < sizeof(path)) path[n++] = *p++;
+        }
+        path[n] = '\0';
+        if (!path[0]) continue;
+
+        /* Relative paths resolve against the child's working directory, which
+         * is s_cwd — not ours. Mirror that, or a correct relative path would
+         * look broken from here. */
+        /* Sized to hold s_cwd + separator + a full MAX_PATH argument, so a long
+         * working directory cannot silently truncate the path we then test. */
+        char full[sizeof(s_cwd) + MAX_PATH + 2];
+        int absolute = (path[0] == '/' || path[0] == '\\' ||
+                        (path[1] == ':' && (path[2] == '\\' || path[2] == '/')));
+        if (absolute || !s_cwd[0])
+            snprintf(full, sizeof(full), "%s", path);
+        else
+            snprintf(full, sizeof(full), "%s\\%s", s_cwd, path);
+
+        DWORD attr = GetFileAttributesA(full);
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            autocompile_set_degraded(
+                "overlay autocompile cannot start: %s \"%s\" does not exist "
+                "(resolved to \"%s\"). Every compile will fail and overlay "
+                "execution will stay in the interpreter. Fix the path in "
+                "[runtime] overlay_autocompile_cmd, or build the recompiler "
+                "where it points.",
+                flags[i], path, full);
+            fprintf(stdout,
+                "psxrecomp: WARNING: overlay autocompile %s \"%s\" does not "
+                "exist (resolved to \"%s\").\n"
+                "  Every overlay compile will fail and execution will stay in "
+                "the interpreter.\n"
+                "  Query the debug server's autocompile_status "
+                "(\"degraded_reason\") to see this without a console.\n",
+                flags[i], path, full);
+            fflush(stdout);
+        }
+    }
+}
+#endif /* _WIN32 */
+
 void autocompile_configure(const char *cmd, const char *cwd) {
     snprintf(s_cmd, sizeof(s_cmd), "%s", cmd ? cmd : "");
     snprintf(s_cwd, sizeof(s_cwd), "%s", cwd ? cwd : "");
@@ -641,6 +921,10 @@ void autocompile_configure(const char *cmd, const char *cwd) {
         InitializeCriticalSection(&s_out_lock);
         InitializeConditionVariable(&s_publish_cv);
         s_out_lock_init = 1;
+    }
+    if (s_cmd[0]) {
+        autocompile_report_interpreter();
+        autocompile_check_path_args();
     }
 #endif
 }
@@ -766,6 +1050,8 @@ int autocompile_request(void) {
     /* DONE owns an unconsumed cache rescan/result. Only the emulation-thread
      * poll may return it to IDLE; never overwrite it with another child. */
     if (!autocompile_configured() || ac_state_load() != AC_IDLE) return 0;
+    if (s_retry_not_before_ms &&
+        autocompile_now_ms() < s_retry_not_before_ms) return 0;
 #ifdef _WIN32
     /* IDLE should imply empty queues; discard defensively so a prior aborted
      * run can never leak a speculative module reference into the next one. */
@@ -857,7 +1143,7 @@ int autocompile_request(void) {
     if (!ok) {
         if (job) CloseHandle(job);
         CloseHandle(rd);
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
@@ -876,7 +1162,7 @@ int autocompile_request(void) {
         CloseHandle(rd);
         CloseHandle(pi.hProcess);
         if (job) CloseHandle(job);   /* reaps any grandchild */
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     ctx->read_pipe = rd;
@@ -896,7 +1182,7 @@ int autocompile_request(void) {
         s_proc = NULL;
         if (s_job) { CloseHandle(s_job); s_job = NULL; }
         ac_state_store(AC_IDLE);
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     s_watch_thread = CreateThread(NULL, 0, watch_thread, ctx, 0, NULL);
@@ -918,14 +1204,14 @@ int autocompile_request(void) {
         s_prepare_thread = NULL;
         if (s_job) { CloseHandle(s_job); s_job = NULL; }
         ac_state_store(AC_IDLE);
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     return 1;
 #else
     int pipefd[2];
     if (pipe(pipefd) != 0) {
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
 
@@ -976,7 +1262,7 @@ int autocompile_request(void) {
     close(pipefd[1]);
     if (pid < 0) {
         close(pipefd[0]);
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     (void)setpgid(pid, pid);
@@ -986,7 +1272,7 @@ int autocompile_request(void) {
         kill(-pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);
         close(pipefd[0]);
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     ctx->read_pipe = pipefd[0];
@@ -1004,7 +1290,7 @@ int autocompile_request(void) {
         s_proc = -1;
         pthread_mutex_unlock(&s_out_lock);
         ac_state_store(AC_IDLE);
-        s_fails++;
+        autocompile_note_failure();
         return 0;
     }
     s_watch_thread_valid = 1;
@@ -1054,7 +1340,7 @@ static int parse_shard_result(void) {
     size_t cp = span < sizeof(line) - 1 ? span : sizeof(line) - 1;
     memcpy(line, hit, cp);
     line[cp] = '\0';
-    return parse_shard_result_line(line);
+    return shard_result_line_locked(line);
 }
 
 void autocompile_poll_main(void) {
@@ -1152,7 +1438,9 @@ void autocompile_poll_main(void) {
     if (s_exit_code != 0 || !s_shard_result_seen || s_shard_fail > 0 ||
         s_publish_drops_run != 0 || s_publish_load_fail_run != 0 ||
         s_publish_parse_fail_run != 0)
-        s_fails++;
+        autocompile_note_failure();
+    else
+        autocompile_note_success();
 }
 
 void autocompile_shutdown(void) {
@@ -1287,9 +1575,24 @@ int autocompile_status_json(char *out, int cap) {
     pthread_mutex_unlock(&s_out_lock);
 #endif
     (void)tn;
+    uint64_t retry_ms = 0;
+    const uint64_t now_ms = autocompile_now_ms();
+    if (s_retry_not_before_ms > now_ms)
+        retry_ms = s_retry_not_before_ms - now_ms;
+    /* Degraded reason first, so it is the first thing a reader sees. This is
+     * the ONLY channel that works on the shipped build: the stdout warnings
+     * elsewhere in this file go nowhere under -mwindows. */
+    char degr[720];
+    degr[0] = '\0';
+    if (s_degraded[0])
+        json_escape_into(degr, (int)sizeof(degr), s_degraded,
+                         (int)strlen(s_degraded));
+
     return snprintf(out, cap,
-        "{\"configured\":%d,\"state\":\"%s\",\"runs\":%u,\"fails\":%u,"
+        "{\"degraded\":%d,\"degraded_reason\":\"%s\","
+        "\"configured\":%d,\"state\":\"%s\",\"runs\":%u,\"fails\":%u,"
         "\"rescans\":%u,\"last_exit\":%d,"
+        "\"consecutive_fails\":%u,\"retry_ms\":%llu,"
         "\"shard_ok\":%u,\"shard_fail\":%u,\"shard_skipped\":%u,"
         "\"shard_fail_total\":%u,\"shard_result_seen\":%d,"
         "\"publish_ready\":%u,\"publish_ready_highwater\":%u,"
@@ -1303,8 +1606,10 @@ int autocompile_status_json(char *out, int cap) {
         "\"publish_load_fail_run\":%u,\"publish_parse_fail_run\":%u,"
         "\"publish_deferred_run\":%u,\"activation\":\"next_launch\","
         "\"output_tail\":\"%s\"}",
+        s_degraded[0] ? 1 : 0, degr,
         autocompile_configured(), names[ac_state_load() & 3], s_runs, s_fails,
-        s_rescans, s_exit_code,
+        s_rescans, (int)s_exit_code, s_consecutive_fails,
+        (unsigned long long)retry_ms,
         s_shard_ok, s_shard_fail, s_shard_skipped,
         s_shard_fail_total, s_shard_result_seen,
         publish_ready, publish_ready_highwater, publish_preparing,

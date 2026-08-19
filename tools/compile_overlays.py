@@ -367,6 +367,30 @@ def verify_recompiler_matches_tag(recompiler: str, tag_hash: int) -> None:
     print(f'recompiler codegen hash verified: {baked} == cg tag hash')
 
 
+def overlay_config_hash(recompiler: str, game_toml: str) -> int:
+    """Ask the recompiler for the canonical hash of config fields that affect
+    generated overlay code. Keeping the serializer in the shared C++ config
+    loader means the runtime and producer cannot disagree about which
+    widescreen/patch settings define a cache namespace."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            [recompiler, '--overlay-config-hash', os.path.abspath(game_toml)],
+            capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        raise SystemExit(
+            f'FATAL: cannot execute {recompiler} for --overlay-config-hash: {e}')
+    line = (out.stdout or '').strip().splitlines()
+    value = line[0].strip() if line else ''
+    if out.returncode != 0 or not re.fullmatch(r'[0-9a-fA-F]{8}', value):
+        detail = (out.stderr or out.stdout or '').strip()
+        raise SystemExit(
+            f'FATAL: {recompiler} could not hash overlay codegen config.\n'
+            f'  This binary may predate --overlay-config-hash; rebuild it.\n'
+            f'  detail: {detail}')
+    return int(value, 16)
+
+
 def is_windows() -> bool:
     """True on native Windows AND under MSYS/Cygwin/MinGW pythons.
     platform.system() there returns 'MSYS_NT-...'/'CYGWIN_NT-...', NOT
@@ -586,6 +610,42 @@ CROSS_VARIANT_DONOR_REASONS = {
 # entry for these bytes and retain one of the classifier's local root reasons.
 HOSTED_OWNER_REASONS = EXACT_FRAGMENT_REASONS - {'DISPATCH_ROOT'}
 FATAL_SEED_REASONS = {'BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'}
+def recompiler_project_root_args(args) -> list:
+    """--project-root arguments for a psxrecomp-game invocation, or [].
+
+    Every recompiler spawn below runs with cwd = dirname(game.toml), because
+    the seeds/captures paths in the config are relative to it. That cwd is
+    also where the recompiler probes for the BIOS profile when the config has
+    no explicit [recompiler] bios_config — and for a PACKAGED game.toml
+    (packaging/release/game.toml) it holds neither bios/SCPH1001.toml nor a
+    vendored framework one level down. Every shard then died with
+    "FATAL: no BIOS profile found" and the cache silently failed to build,
+    which is what the recipe printed by package_release.ps1 used to tell
+    people to run (issue #72).
+
+    Default the root to the framework, derived from the required
+    --runtime-include (<framework>/runtime/include). Derivation is used ONLY
+    when it actually locates a profile, so this can fix a broken invocation
+    but never alter one that already worked.
+
+    Every lookup is defensive: in-process callers (the test suite, the
+    packager's importlib entry) build a lightweight args object that carries
+    only the fields their recipe needs, so a missing attribute must degrade to
+    "pass no flag" — today's behaviour — never raise.
+    """
+    explicit = getattr(args, 'project_root', None)
+    if explicit:
+        return ['--project-root', os.path.abspath(explicit)]
+    runtime_include = getattr(args, 'runtime_include', None)
+    if not runtime_include:
+        return []
+    derived = os.path.abspath(
+        os.path.join(os.path.abspath(runtime_include), '..', '..'))
+    if os.path.isfile(os.path.join(derived, 'bios', 'SCPH1001.toml')):
+        return ['--project-root', derived]
+    return []
+
+
 BIOS_RESIDENT_PRODUCER = 'bios_resident_manifest'
 BIOS_RESIDENT_MARKER = 'psxrecomp bios resident shard v1'
 
@@ -3180,6 +3240,7 @@ def generate_interior_fragment_static(interior: int, data: bytes,
                '--ws-config', os.path.abspath(args.game_toml),
                '--game-identity-sha256', args.game_identity_sha256,
                '--manifest-digest-sha256', args.manifest_identity_sha256]
+        cmd += recompiler_project_root_args(args)
         add_source_observation_plan(
             cmd, source_observation_plan(args, data, load_addr), tmp)
         sub_env = dict(os.environ)
@@ -4052,6 +4113,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                '--ws-config', os.path.abspath(args.game_toml),
                '--game-identity-sha256', args.game_identity_sha256,
                '--manifest-digest-sha256', args.manifest_identity_sha256]
+        cmd += recompiler_project_root_args(args)
         add_source_observation_plan(
             cmd, source_observation_plan(args, data, load_addr), tmp)
         r = subprocess.run(cmd, capture_output=True, text=True,
@@ -4354,6 +4416,9 @@ def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
            '-DPSX_NO_DEBUG_TOOLS',
            '-DPSX_ENABLE_BLOCK_CYCLES=1',
            f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
+           # PGXP flavor bit (overlay_api.h PSX_OVERLAY_FLAVOR_PGXP): arm the
+           # PGXP_*() hook macros the emitter writes into every overlay C.
+           *(['-DPSX_PGXP=1'] if int(flavor) & 2 else []),
            native_path(c_path), '-o', native_path(out_dll)]
     for d in include_dirs:
         cmd.append('-I' + native_path(_bom_free_incdir(d)))
@@ -4402,6 +4467,9 @@ def _compile_dll_direct(c_path: str, out_dll: str, include_dirs: list[str],
         # cache and a base cache can never cross-contaminate even if they share
         # a directory (they key by guest-bytes CRC, which is flavor-blind).
         f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
+        # PGXP flavor bit (overlay_api.h PSX_OVERLAY_FLAVOR_PGXP): arm the
+        # PGXP_*() hook macros the emitter writes into every overlay C.
+        *(['-DPSX_PGXP=1'] if int(flavor) & 2 else []),
         c_path,
         '-o', out_dll,
         *includes,
@@ -4640,25 +4708,33 @@ def _shard_pair_lock(dll_path: str, timeout: float = 120.0):
 def _candidate_capacity_namespace(dll_path: str) -> tuple[str, list[str]]:
     """Return the shared lock and compiler-tier dirs for one cache namespace.
 
-    Normal caches are ``GAME/compiler/arch/cgN_hash``.  The runtime candidate
-    table is process-global, so serialize/count every compiler tier with the
-    same GAME/arch/cg leaf.  Tests and hand-built paths fall back to their
-    containing directory.
+    Normal caches are ``GAME/identity/compiler/arch/cgN_hash_gcCONFIG_fFLAVOR``
+    with an optional plan suffix (legacy tests may still use ``cgN_hash``).
+    The runtime candidate table is process-global, so serialize/count every
+    compiler tier and the ordinary/plan siblings visible to this runtime.
+    Tests and hand-built paths fall back to their containing directory.
     """
     leaf = os.path.dirname(os.path.abspath(dll_path))
     cg_name = os.path.basename(leaf)
     arch_dir = os.path.dirname(leaf)
     compiler_dir = os.path.dirname(arch_dir)
-    game_dir = os.path.dirname(compiler_dir)
+    namespace_dir = os.path.dirname(compiler_dir)
     compiler_name = os.path.basename(compiler_dir)
-    if (re.fullmatch(r'cg\d+_[0-9A-Fa-f]{8}', cg_name) and
+    if (re.fullmatch(
+            r'cg\d+_[0-9A-Fa-f]{8}'
+            r'(?:_gc[0-9A-Fa-f]{8}(?:_f\d+)?)?'
+            r'(?:_p[0-9A-Fa-f]{8})?', cg_name) and
             compiler_name in ('gcc', 'tcc')):
         arch_name = os.path.basename(arch_dir)
+        base_name = re.sub(r'_p[0-9A-Fa-f]{8}$', '', cg_name)
+        cache_names = list(dict.fromkeys((base_name, cg_name)))
         tier_dirs = [
-            os.path.join(game_dir, tier, arch_name, cg_name)
+            os.path.join(namespace_dir, tier, arch_name, cache_name)
             for tier in ('gcc', 'tcc')
+            for cache_name in cache_names
         ]
-        return (os.path.join(game_dir, '.overlay-candidate-capacity.lock'),
+        return (os.path.join(namespace_dir,
+                             '.overlay-candidate-capacity.lock'),
                 tier_dirs)
     return (os.path.join(leaf, '.overlay-candidate-capacity.lock'), [leaf])
 
@@ -5480,6 +5556,14 @@ def main():
                      'xg_render_overlay_ranges.toml')
                  if XG_REPOSITORY is not None else None),
         help='optional authenticated overlay cutover descriptor')
+    ap.add_argument('--project-root',    default=None,
+                    help='root the recompiler resolves the BIOS profile against '
+                         '(bios/SCPH1001.toml, or <framework>/bios/SCPH1001.toml '
+                         'one level down). Defaults to the framework root derived '
+                         'from --runtime-include. Only needed when that '
+                         'derivation is wrong, because we spawn the recompiler '
+                         'with cwd = dirname(game.toml) and a PACKAGED game.toml '
+                          'lives in a directory with no BIOS profile under it.')
     ap.add_argument('--out-dir',         default='build-dev/cache',
                     help='cache root dir (default: build-dev/cache)')
     ap.add_argument('--gcc',             default='gcc',
@@ -5639,13 +5723,15 @@ def main():
                 os.remove(static_out)
         os.makedirs(args.out_dir, exist_ok=True)
     else:
-        # Namespaced + versioned gcc cache: <game_id>/gcc/<arch-abi>/cg<N>/
+        # Namespaced + versioned gcc cache:
+        # <game_id>/gcc/<arch-abi>/cg<N>_<emitter-hash>_gc<config-hash>/
         # (SLJIT.md §4 — no comingling; cg<N> = codegen version so a new emitter
         # build never reuses a stale DLL, old versions coexist). MUST match
         # overlay_loader.c scan_cache_dir(). Pre-1.0: no legacy fallback.
         cg = codegen_ver(args.runtime_include)
         ch = codegen_hash(args.runtime_include)
-        cache_tag = f'cg{cg}_{ch:08x}'
+        gh = overlay_config_hash(args.recompiler, args.game_toml)
+        cache_tag = f'cg{cg}_{ch:08x}_gc{gh:08x}_f{int(args.flavor)}'
         if args.overlay_plan_hash is not None:
             cache_tag += f'_p{args.overlay_plan_hash:08x}'
         cache_dir = os.path.join(args.out_dir, game_id,
@@ -5654,8 +5740,9 @@ def main():
         os.makedirs(cache_dir, exist_ok=True)
         plan_suffix = (f', plan {args.overlay_plan_hash:08x}'
                        if args.overlay_plan_hash is not None else '')
-        print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x}'
-              f'{plan_suffix})')
+        print(f'Cache dir: {cache_dir}  '
+              f'(codegen ver {cg}, emitter {ch:08x}, config {gh:08x}, '
+              f'flavor {int(args.flavor)}{plan_suffix})')
 
     with open(args.captures) as f:
         captures = json.load(f)
@@ -5870,6 +5957,7 @@ def main():
                      '--ws-config', os.path.abspath(args.game_toml),
                      '--game-identity-sha256', args.game_identity_sha256,
                      '--manifest-digest-sha256', args.manifest_identity_sha256]
+            cmd += recompiler_project_root_args(args)
             add_source_observation_plan(cmd, plan, tmp)
             print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))

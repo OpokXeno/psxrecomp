@@ -106,9 +106,18 @@ struct CodeGenConfig {
     // See docs/DATA_SHARDS.md. Empty = no hooks (default).
     std::set<uint32_t> data_shard_funcs;
 
+    // Trusted game-mod entry hooks ([recompiler] mod_function_entry_funcs).
+    // Only explicitly listed guest functions call the runtime dispatcher.
+    std::set<uint32_t> mod_function_entry_funcs;
+
     // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
     // addresses (MotK VLC leaves, etc.). Host locality hint only.
     std::set<uint32_t> hot_funcs;
+
+    // [recompiler] load_charge_batch(_funcs): install a function-local
+    // cycle accumulator so load charges skip deadline probes until IRQ/MMIO
+    // / function exit. Guest totals at those barriers are unchanged.
+    std::set<uint32_t> load_charge_batch_funcs;
 
     // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
     // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
@@ -138,11 +147,17 @@ struct CodeGenConfig {
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
     std::set<uint32_t> ws_cull_screen_x_sites;
+    // Extra lead for bias/range activation windows only. Render/terrain
+    // helpers continue to use psx_ws_x_margin() without this term.
+    int ws_cull_activation_guard_pixels = 0;
 
     // Explicit signed right-edge widen sites ([widescreen.cull] slti_sites):
     // `slti rt, sx, W` emitted through psx_ws_cull_slti for funnel functions
     // the auto-detector cannot qualify (X-only test, no height compare).
     std::set<uint32_t> ws_cull_slti_sites;
+    // Signed lower-bound counterpart: `slti rt,sx,-W` compares against
+    // `-W-x_margin`, preserving the original result at 4:3.
+    std::set<uint32_t> ws_cull_slti_lower_sites;
 
     // `bltz rs, reject` emitted through psx_ws_cull_bltz — the explicit
     // LEFT-edge counterpart to ws_cull_slti_sites ([widescreen.cull]
@@ -177,6 +192,26 @@ struct CodeGenConfig {
     // Semantic guest visibility policy. Each address is classified once and
     // emitted through the typed helper shared with the dirty-RAM interpreter.
     std::map<uint32_t, PsxWsCullSemantic> ws_cull_semantic_sites;
+
+    // Exact `bltz MAC0, reject`-style NCLIP/backface rejects to suppress while
+    // widescreen reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_nclip_keep_sites;
+
+    // Exact branch PCs whose reject target is suppressed while widescreen
+    // reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_branch_keep_sites;
+
+    // Exact, full-word-guarded comparison sites whose result is forced only
+    // while widescreen reveals extra world. 4:3 evaluates the original compare.
+    std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep_sites;
+
+    // Exact `addi[u] rt,zero,imm` 12-bit angular half-extents. The runtime
+    // scales tan(angle) by the current horizontal reveal factor.
+    std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle_sites;
+
+    // Exact model-participation cosine compares that gain a camera-horizontal
+    // aspect envelope while preserving the vanilla vertical cone.
+    PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
 
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
@@ -251,6 +286,10 @@ struct GeneratedFunction {
     std::string body;             // C code body
     std::string full_code;        // signature + body
     int line_count;               // Number of lines generated
+    // False for fail-closed data/untranslatable stubs whose only operation is
+    // psx_unknown_dispatch. They remain emitted for direct diagnostics, but
+    // must not advertise themselves as executable native game entries.
+    bool dispatchable = true;
 };
 
 class CodeGenerator {

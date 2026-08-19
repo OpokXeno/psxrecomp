@@ -7,7 +7,8 @@
 /* FRAME_PACING_PURE_ONLY: tests compile only the SDL-free decision
  * function (tests/test_frame_pacing.c includes this file directly). */
 #ifndef FRAME_PACING_PURE_ONLY
-#include <SDL.h>
+#include "psx_sdl.h"
+#include "host_time.h"
 #endif
 
 uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
@@ -74,7 +75,8 @@ static void frame_pacer_wait_internal(FramePacer *p, double period_ms,
         now = SDL_GetPerformanceCounter();     /* ONE read per iteration */
         uint32_t ms = frame_pacing_sleep_ms(now, p->next_deadline, freq, period);
         if (ms == 0) break;
-        SDL_Delay(ms);
+        /* Waitable timer on Win32; usleep on Unix — not coarse Sleep/SDL_Delay. */
+        psx_host_sleep_ms(ms);
     }
     while (SDL_GetPerformanceCounter() < p->next_deadline) {
         /* final sub-ms spin */

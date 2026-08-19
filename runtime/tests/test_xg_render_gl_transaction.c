@@ -1122,7 +1122,7 @@ static void test_interpolation_history_gate(void) {
 
     gr_vram_write(0, 0, BLACK_1555);
     gl_renderer_flush_cpu_uploads();
-    gl_renderer_set_interpolation(1, 120.0, 120.0);
+    gl_renderer_set_interpolation(1, 120.0, 120.0, 0);
     gl_renderer_present_vram(0, 0, 320, 240, 0, 0);
     gl_renderer_interpolation_diag(&enabled, NULL, &history, NULL, NULL, NULL);
     expect_true(enabled == 1 && history > 0,
@@ -1131,7 +1131,7 @@ static void test_interpolation_history_gate(void) {
                   GPU_RENDER_TRANSACTION_STATE_REJECTED,
                   "active interpolation/history rejects begin");
 
-    gl_renderer_set_interpolation(0, 60.0, 60.0);
+    gl_renderer_set_interpolation(0, 60.0, 60.0, 0);
     gl_renderer_interpolation_diag(&enabled, NULL, &history, NULL, NULL, NULL);
     expect_true(enabled == 0 && history == 0,
                 "disabled interpolation has quiesced history");
@@ -1148,8 +1148,8 @@ static void write_sourced_gp0(uint32_t command_address,
         const GpuRenderOracleSource source = {
             GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
             command_address + (uint32_t)index * 4u,
-            index,
-            0u,
+            command_address / 4u + index,
+            (command_address - 4u) / 4u,
         };
 
         expect_true(gpu_native_submit_gp0_word(words[index], &source),
@@ -1157,27 +1157,32 @@ static void write_sourced_gp0(uint32_t command_address,
     }
 }
 
-static void test_native_stream_replaces_gp0_anchor(void) {
+static void test_native_stream_consumes_gp0_anchor(void) {
     const uint32_t command_address = UINT32_C(0x00102004);
     const uint32_t original_words[] = {
-        UINT32_C(0x640000ff),
-        gp0_xy(500, 350),
-        UINT32_C(0x00000000),
-        gp0_xy(8, 8),
+        UINT32_C(0x20ffffff),
+        gp0_xy(TEST_X, TEST_Y),
+        gp0_xy(TEST_X + 8, TEST_Y),
+        gp0_xy(TEST_X, TEST_Y + 8),
     };
     const GpuRenderTransactionId id = transaction_id(300u);
-    GpuRenderSemantic semantic = flat_triangle();
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic;
     GuestRenderNativeStreamSnapshot snapshot;
 
     gr_vram_write(SAMPLE_X, SAMPLE_Y, BLACK_1555);
-    gr_vram_write(502, 352, BLACK_1555);
+    gr_vram_write(SAMPLE_X + 100, SAMPLE_Y, BLACK_1555);
     gl_renderer_flush_cpu_uploads();
-    semantic.material.draw_area_top = 256u;
-    semantic.material.draw_area_bottom = 511u;
-    semantic.material.draw_offset_y = 256;
     gpu_write_gp0(UINT32_C(0xe3000000));
     gpu_write_gp0(UINT32_C(0xe407ffff));
     gpu_write_gp0(UINT32_C(0xe5000000));
+    gpu_native_environment_get(&environment);
+    expect_true(gpu_native_semantic_from_gp0(
+                    original_words,
+                    sizeof(original_words) / sizeof(original_words[0]),
+                    &environment, &semantic) == 1,
+                "GP0 anchor produces its authenticated Native semantic");
+    semantic.material.draw_offset_x = 100;
     guest_render_native_stream_set_enabled(true);
     guest_render_native_stream_clear();
     expect_true(guest_render_native_stream_stage_exact(
@@ -1190,7 +1195,8 @@ static void test_native_stream_replaces_gp0_anchor(void) {
     {
         const GpuRenderOracleSource source = {
             GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
-            command_address, 0u, 0u,
+            command_address, command_address / 4u,
+            (command_address - 4u) / 4u,
         };
         expect_true(gpu_native_preflight_reservation_begin(),
                     "Native DMA preflight reservation begins");
@@ -1198,7 +1204,7 @@ static void test_native_stream_replaces_gp0_anchor(void) {
                         original_words,
                         sizeof(original_words) / sizeof(original_words[0]),
                         &source),
-                    "FT4 binding resolves once during preflight");
+                    "authenticated GP0 binding resolves once during preflight");
         expect_true(gpu_native_preflight_reservation_seal(),
                     "Native DMA preflight reservation seals atomically");
     }
@@ -1206,8 +1212,8 @@ static void test_native_stream_replaces_gp0_anchor(void) {
                       sizeof(original_words) / sizeof(original_words[0]));
     expect_pixel(WHITE_1555,
                  "Native semantic uses ordered GPU raster state at consumption");
-    expect_pixel_at(502, 352, BLACK_1555,
-                    "bound Original GP0 raster is suppressed");
+    expect_pixel_at(SAMPLE_X + 100, SAMPLE_Y, BLACK_1555,
+                    "stale staged draw offset is not used for Native raster");
     expect_true(guest_render_native_stream_snapshot(&snapshot) ==
                     GUEST_RENDER_NATIVE_STREAM_OK &&
                 snapshot.staged_count == 0u &&
@@ -1321,7 +1327,7 @@ int main(void) {
     if (!failures) test_unsupported_semantic_has_no_partial_draw();
     if (!failures) test_semantic_dither_matches_original_gp0();
     if (!failures) test_immediate_zoom_matches_original_gp0();
-    if (!failures) test_native_stream_replaces_gp0_anchor();
+    if (!failures) test_native_stream_consumes_gp0_anchor();
     if (!failures) test_invalid_present_and_identity_gates();
     if (!failures) test_interpolation_history_gate();
     if (!failures) test_deferred_candidate_commit();

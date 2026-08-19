@@ -1,4 +1,5 @@
 #include "audio_trace.h"
+#include "guest_render_native_stream.h"
 #include "gpu.h"
 #include "native_render_baseline.h"
 #include "spu.h"
@@ -45,6 +46,10 @@ void spu_debug_info(SpuDebugInfo *out) { *out = s_spu; }
 uint64_t psx_get_cycle_count(void) { return s_cycles; }
 void gl_renderer_sync_cpu(void) {}
 void vk_renderer_sync_cpu(void) {}
+void guest_render_native_stream_set_material_observer(
+        GuestRenderNativeStreamMaterialObserver observer) {
+    (void)observer;
+}
 
 GuestRenderStatus guest_render_bridge_snapshot(
         GuestRenderBridgeSnapshot *out) {

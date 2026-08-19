@@ -26,6 +26,50 @@ assert EXTRACT_SPEC.loader is not None
 EXTRACT_SPEC.loader.exec_module(EXTRACT)
 
 LOAD = 0x80010000
+GAME_SHA256 = "12" * 32
+MANIFEST_SHA256 = "34" * 32
+TEST_IDENTITY = MOD.parse_game_identity(GAME_SHA256, MANIFEST_SHA256)
+IDENTITY_LINE = f"I {GAME_SHA256.upper()} {MANIFEST_SHA256.upper()}\n"
+CLI_IDENTITY = TEST_IDENTITY
+if MOD.XG_REPOSITORY is not None:
+    _CLI_CONTRACT = MOD.load_contract(
+        MOD.XG_REPOSITORY / 'native_renderer' /
+        'xg_render_runtime_variants.toml')
+    CLI_IDENTITY = MOD.parse_game_identity(
+        bytes(_CLI_CONTRACT.canonical.game_identity).hex(),
+        bytes(_CLI_CONTRACT.canonical.manifest_identity).hex())
+CLI_GAME_SHA256 = CLI_IDENTITY.game_sha256.hex()
+CLI_MANIFEST_SHA256 = CLI_IDENTITY.manifest_sha256.hex()
+_RUNTIME_EXPORT_SUPPORT = None
+
+
+def recompiler_command(recompiler, *args):
+    return [
+        recompiler, *args,
+        '--game-identity-sha256', GAME_SHA256,
+        '--manifest-digest-sha256', MANIFEST_SHA256,
+    ]
+
+
+def ensure_runtime_export_support(gcc):
+    global _RUNTIME_EXPORT_SUPPORT
+    if os.name == 'nt':
+        return None
+    if _RUNTIME_EXPORT_SUPPORT is not None:
+        return _RUNTIME_EXPORT_SUPPORT[2]
+    import ctypes
+    directory = tempfile.TemporaryDirectory()
+    source = pathlib.Path(directory.name) / 'runtime_exports.c'
+    library = pathlib.Path(directory.name) / 'runtime_exports.so'
+    source.write_text(
+        '#include <stdint.h>\nuint32_t g_psx_resume_seed = 0;\n',
+        encoding='ascii')
+    subprocess.run(
+        [gcc, '-shared', '-fPIC', str(source), '-o', str(library)],
+        check=True, capture_output=True, text=True)
+    handle = ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+    _RUNTIME_EXPORT_SUPPORT = (directory, handle, str(library))
+    return str(library)
 
 
 def put(data, offset, word):
@@ -439,7 +483,9 @@ def check_recompiler_discovered_host_ownership(recompiler):
             f.write(f'0x{LOAD:08X}\n')
             f.write(f'interior 0x{target:08X}\n')
         result = subprocess.run(
-            [recompiler, psx, '--seeds', seeds, '--out-dir', out, '--overlay'],
+            recompiler_command(
+                recompiler, psx, '--seeds', seeds, '--out-dir', out,
+                '--overlay'),
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         full = ''.join(path.read_text()
@@ -485,8 +531,9 @@ def check_recompiler_explicit_hosted_interior(recompiler):
                 f.write(
                     f'hosted_interior 0x{extra_target:08X} 0x{host:08X}\n')
             result = subprocess.run(
-                [recompiler, psx, '--seeds', seeds, '--out-dir', out,
-                 '--overlay'], capture_output=True, text=True)
+                recompiler_command(
+                    recompiler, psx, '--seeds', seeds, '--out-dir', out,
+                    '--overlay'), capture_output=True, text=True)
             assert result.returncode == 0, result.stderr or result.stdout
             ranges_path = next(pathlib.Path(out).glob('*_full.ranges'))
             identities = MOD.parse_overlay_func_ids(
@@ -528,8 +575,9 @@ def check_recompiler_hosted_interior_parser(recompiler):
             with open(seeds, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines) + '\n')
             return subprocess.run(
-                [recompiler, psx, '--seeds', seeds, '--out-dir', out,
-                 '--overlay'], capture_output=True, text=True)
+                recompiler_command(
+                    recompiler, psx, '--seeds', seeds, '--out-dir', out,
+                    '--overlay'), capture_output=True, text=True)
 
     invalid_cases = (
         [f'hosted_interiorXYZ 0x{target:08X} 0x{host:08X}'],
@@ -727,7 +775,9 @@ def check_recompiler_unreachable_jal_not_alias(recompiler):
             f.write(f'0x{LOAD:08X}\n')
             f.write(f'interior 0x{target:08X}\n')
         result = subprocess.run(
-            [recompiler, psx, '--seeds', seeds, '--out-dir', out, '--overlay'],
+            recompiler_command(
+                recompiler, psx, '--seeds', seeds, '--out-dir', out,
+                '--overlay'),
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         full = ''.join(path.read_text()
@@ -880,8 +930,9 @@ def check_t2_shaped_retained_partition_conflict(recompiler):
             f.write(f'retained_alias 0x{old_alias:08X} '
                     f'0x{LOAD:08X} 0x{LOAD + 0x2A8:08X}\n')
         result = subprocess.run(
-            [recompiler, psx, '--seeds', seed_path, '--out-dir', out,
-             '--overlay'], capture_output=True, text=True)
+            recompiler_command(
+                recompiler, psx, '--seeds', seed_path, '--out-dir', out,
+                '--overlay'), capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         ranges = next(pathlib.Path(out).glob('*_full.ranges')).read_text()
         full = ''.join(path.read_text()
@@ -1046,7 +1097,9 @@ def check_padded_return_boundary(recompiler):
         with open(seeds, "w", encoding="utf-8") as f:
             f.write(f"0x{LOAD:08X}\n0x{LOAD + 0x14:08X}\n")
         result = subprocess.run(
-            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            recompiler_command(
+                recompiler, psx, "--seeds", seeds, "--out-dir", out,
+                "--overlay"),
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         full = next(pathlib.Path(out).glob("*_full.c")).read_text()
@@ -1081,7 +1134,9 @@ def check_recompiler_composite_contract(recompiler):
                     f.write(f"cross_call_allow 0x{target:08X}\n")
                 f.write(f"0x{LOAD:08X}\n")
             result = subprocess.run(
-                [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+                recompiler_command(
+                    recompiler, psx, "--seeds", seeds, "--out-dir", out,
+                    "--overlay"),
                 capture_output=True, text=True)
             assert result.returncode == 0, result.stderr or result.stdout
             return ''.join(path.read_text() for path in pathlib.Path(out).glob("*_full*.c"))
@@ -1109,7 +1164,9 @@ def check_recompiler_pointer_table_call_root(recompiler):
         with open(seeds, "w", encoding="utf-8") as f:
             f.write(f"0x{LOAD:08X}\ncall_root 0x{target:08X}\n")
         result = subprocess.run(
-            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            recompiler_command(
+                recompiler, psx, "--seeds", seeds, "--out-dir", out,
+                "--overlay"),
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         full = ''.join(path.read_text()
@@ -1140,7 +1197,9 @@ def check_recompiler_pointer_table_alias(recompiler):
         with open(seeds, "w", encoding="utf-8") as f:
             f.write(f"0x{LOAD:08X}\n")
         result = subprocess.run(
-            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            recompiler_command(
+                recompiler, psx, "--seeds", seeds, "--out-dir", out,
+                "--overlay"),
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         full = ''.join(path.read_text()
@@ -1171,7 +1230,9 @@ def check_retained_alias_contract(recompiler):
                 f"retained_alias 0x{LOAD + 0x20:08X} "
                 f"0x{LOAD:08X} 0x{LOAD + 0x2C:08X}\n")
         result = subprocess.run(
-            [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+            recompiler_command(
+                recompiler, psx, "--seeds", seeds, "--out-dir", out,
+                "--overlay"),
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr or result.stdout
         full = ''.join(path.read_text() for path in pathlib.Path(out).glob("*_full*.c"))
@@ -1218,12 +1279,15 @@ def check_atomic_dll_publication():
             MOD._compile_dll_direct = good_compile
             func_ids = [(0x80010000, 0xDEADBEEF,
                          ((0x80010000, 0x10),))]
-            pair_id = MOD.overlay_pair_id("new source", func_ids)
-            assert pair_id != MOD.overlay_pair_id("changed source", func_ids)
+            pair_id = MOD.overlay_pair_id(
+                "new source", func_ids, identity=TEST_IDENTITY)
+            assert pair_id != MOD.overlay_pair_id(
+                "changed source", func_ids, identity=TEST_IDENTITY)
             bound_source = MOD.add_overlay_pair_export("new source", pair_id)
             assert f"overlay_pair_id(void) {{ return UINT64_C(0x{pair_id:016X}); }}" in bound_source
             assert MOD.compile_dll("ignored.c", final, [],
-                                   func_ids=func_ids, pair_id=pair_id)
+                                   func_ids=func_ids, pair_id=pair_id,
+                                   identity=TEST_IDENTITY)
             with open(final, "rb") as built:
                 assert built.read() == b"new-complete-shard"
             manifest = pathlib.Path(ranges).read_text()
@@ -1247,7 +1311,7 @@ def check_atomic_dll_publication():
             assert MOD.compile_dll(
                 "ignored.c", final, [], func_ids=func_ids, pair_id=pair_id,
                 preserve_existing_pair=True,
-                publication_result=publication)
+                publication_result=publication, identity=TEST_IDENTITY)
             assert publication == {"published": False}
             assert pathlib.Path(final).read_bytes() == b"first-winner"
             assert pathlib.Path(ranges).read_text() == "FIRST-MANIFEST\n"
@@ -1398,7 +1462,8 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
 '''
         for reader in ('complete', 'coverage'):
             with tempfile.TemporaryDirectory() as tmp:
-                final = os.path.join(tmp, "00010000_DEADBEEF.dll")
+                final = os.path.join(
+                    tmp, "00010000_DEADBEEF" + MOD.overlay_ext())
                 ranges = os.path.splitext(final)[0] + '.ranges'
                 staged = os.path.join(tmp, ".new.dll")
                 staged_ranges = os.path.join(tmp, ".new.ranges")
@@ -1456,12 +1521,14 @@ m.publish_shard_pair(sys.argv[2], sys.argv[3], sys.argv[4])
                 pair_func_ids = [(0x80010000, 0xDEADBEEF,
                                   [(0x80010000, 0x10)])]
                 pathlib.Path(pair_dll).with_suffix('.ranges').write_text(
-                    MOD.overlay_ranges_text(pair_func_ids, pair_id))
+                    MOD.overlay_ranges_text(
+                        pair_func_ids, pair_id, identity=TEST_IDENTITY))
                 pair_lib = ctypes.WinDLL(pair_dll)
                 pair_fn = pair_lib.overlay_pair_id
                 pair_fn.restype = ctypes.c_uint64
                 assert pair_fn() == pair_id
-                manifest = MOD.overlay_ranges_text(pair_func_ids, pair_id)
+                manifest = MOD.overlay_ranges_text(
+                    pair_func_ids, pair_id, identity=TEST_IDENTITY)
                 assert f'P {pair_fn():016X}\n' in manifest
                 pair_handle = pair_lib._handle
                 pair_lib._handle = 0
@@ -1518,7 +1585,9 @@ def check_candidate_capacity_publication():
     """Candidate accounting dedups only exact, same-tier whole pairs."""
     original_exports = MOD._dll_runtime_exports_match
     original_abi = MOD._dll_abi_matches
+    original_overlay_ext = MOD.overlay_ext
     try:
+        MOD.overlay_ext = lambda: '.dll'
         MOD._dll_runtime_exports_match = (
             lambda _path, _abi, _pair, entries: bool(entries))
 
@@ -1533,12 +1602,14 @@ def check_candidate_capacity_publication():
             pathlib.Path(path).write_bytes(b'DLL')
             pathlib.Path(path).with_suffix('.ranges').write_text(
                 MOD.overlay_ranges_text(
-                    funcs(count, base), pair_id, provenance))
+                    funcs(count, base), pair_id, provenance,
+                    identity=TEST_IDENTITY))
 
         def pair_records(path, records, pair_id, provenance=None):
             pathlib.Path(path).write_bytes(b'DLL')
             pathlib.Path(path).with_suffix('.ranges').write_text(
-                MOD.overlay_ranges_text(records, pair_id, provenance))
+                MOD.overlay_ranges_text(
+                    records, pair_id, provenance, identity=TEST_IDENTITY))
 
         def staged_identity(path):
             manifest = pathlib.Path(path).with_suffix('.ranges').read_text()
@@ -1546,6 +1617,20 @@ def check_candidate_capacity_publication():
                 manifest, require_pair=False)
             return MOD._normalized_runtime_manifest_identity(
                 manifest, pair_id, manifest_funcs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            leaf = os.path.join(
+                tmp, 'GAME', 'gcc', 'win-x64',
+                'cg9_a3003734_gc76b225b8')
+            final = os.path.join(leaf, '00010000_00000001.dll')
+            capacity_lock, cache_dirs = MOD._candidate_capacity_namespace(final)
+            assert capacity_lock == os.path.join(
+                tmp, 'GAME', '.overlay-candidate-capacity.lock')
+            assert cache_dirs == [
+                os.path.join(tmp, 'GAME', tier, 'win-x64',
+                             'cg9_a3003734_gc76b225b8')
+                for tier in ('gcc', 'tcc')
+            ]
 
         with tempfile.TemporaryDirectory() as tmp:
             first = os.path.join(tmp, '00010000_00000001.dll')
@@ -1626,7 +1711,8 @@ def check_candidate_capacity_publication():
 
             manifest_path = pathlib.Path(cached).with_suffix('.ranges')
             manifest_path.write_text(MOD.overlay_ranges_text(
-                funcs(2), 0x190, MOD.HOSTED_MANIFEST_PROVENANCE))
+                funcs(2), 0x190, MOD.HOSTED_MANIFEST_PROVENANCE,
+                identity=TEST_IDENTITY))
             manifest_stat = manifest_path.stat()
             os.utime(manifest_path, ns=(manifest_stat.st_atime_ns,
                                        manifest_stat.st_mtime_ns + 1000000000))
@@ -1873,7 +1959,7 @@ def check_candidate_capacity_publication():
                 assert not MOD.compile_dll(
                     'unused.c', final, [], func_ids=funcs(1, LOAD + 0x80),
                     pair_id=0x311, publication_result=publication,
-                    candidate_cap=2)
+                    candidate_cap=2, identity=TEST_IDENTITY)
                 assert not attempted_link
                 assert 'capacity would be exceeded' in \
                     publication['capacity_error']
@@ -1944,7 +2030,7 @@ def check_candidate_capacity_publication():
                 assert not MOD.compile_dll(
                     'unused.c', final, [], func_ids=funcs(1, LOAD + 0x80),
                     pair_id=0x322, publication_result=publication,
-                    candidate_cap=2)
+                    candidate_cap=2, identity=TEST_IDENTITY)
                 assert 'capacity would be exceeded' in \
                     publication['capacity_error']
                 assert not os.path.exists(final)
@@ -2121,6 +2207,7 @@ def check_candidate_capacity_publication():
     finally:
         MOD._dll_runtime_exports_match = original_exports
         MOD._dll_abi_matches = original_abi
+        MOD.overlay_ext = original_overlay_ext
 
     if os.name == 'nt':
         # Exact pairs racing to distinct names may both commit: the namespace
@@ -2145,12 +2232,13 @@ def check_candidate_capacity_publication():
             partial_manifest = MOD.overlay_ranges_text([
                 (LOAD, 1, ((LOAD, 4),)),
                 (LOAD + 4, 2, ((LOAD + 4, 4),)),
-            ], pair_id)
+            ], pair_id, identity=TEST_IDENTITY)
             template.with_suffix('.ranges').write_text(partial_manifest)
             assert MOD.load_shard_func_ids(str(template), 14) == []
             template.with_suffix('.ranges').unlink()
             manifest = MOD.overlay_ranges_text(
-                [(LOAD, 1, ((LOAD, 4),))], pair_id)
+                [(LOAD, 1, ((LOAD, 4),))], pair_id,
+                identity=TEST_IDENTITY)
             module_path = str(ROOT / 'tools' / 'compile_overlays.py')
             child_script = r'''
 import importlib.util, sys
@@ -2204,7 +2292,8 @@ except m.ShardCandidateCapacityError:
                     check=True, capture_output=True, text=True)
                 staged_ranges = pathlib.Path(tmp) / f'.distinct-{index}.ranges'
                 staged_ranges.write_text(MOD.overlay_ranges_text(
-                    [(LOAD, 1, ((LOAD, 4),))], pair_id))
+                    [(LOAD, 1, ((LOAD, 4),))], pair_id,
+                    identity=TEST_IDENTITY))
                 final = pathlib.Path(tmp) / f'00010000_{index + 1:08X}.dll'
                 writers.append(subprocess.Popen([
                     sys.executable, '-c', child_script, module_path,
@@ -2807,12 +2896,12 @@ def check_interior_fragment_contract():
     assert isolated == [entry + 4, entry + 8, entry + 12]
 
     with tempfile.TemporaryDirectory() as td:
-        dll = pathlib.Path(td) / "00010000_fragment.dll"
+        dll = pathlib.Path(td) / ("00010000_fragment" + MOD.overlay_ext())
         ranges = pathlib.Path(td) / "00010000_fragment.ranges"
         pair_id = 0x123456789ABCDEF0
         payload = bytes(0x100)
         code_crc = MOD.binascii.crc32(payload[0x20:0x28]) & 0xFFFFFFFF
-        manifest = (f"P {pair_id:016X}\n"
+        manifest = (IDENTITY_LINE + f"P {pair_id:016X}\n"
                     f"F {entry:08X} {code_crc:08X}\n"
                     f"R {entry:08X} 8\n")
         dll.write_bytes(b"DLL")
@@ -2831,7 +2920,8 @@ def check_interior_fragment_contract():
             assert entries == {entry & 0x1FFFFFFF}
             assert code_ranges == [
                 (entry & 0x1FFFFFFF, (entry & 0x1FFFFFFF) + 8)]
-            canonical = pathlib.Path(td) / "00010000_DEADBEEF.dll"
+            canonical = pathlib.Path(td) / (
+                "00010000_DEADBEEF" + MOD.overlay_ext())
             assert MOD.current_variant_func_id_coverage(
                 MOD.load_shard_func_ids(str(canonical)), payload,
                 LOAD, len(payload)) == (set(), [])
@@ -2843,23 +2933,25 @@ def check_interior_fragment_contract():
             ranges.write_text(manifest.replace(
                 f"P {pair_id:016X}", "P 0000000000000001"))
             assert MOD.load_shard_entry_set(str(dll)) == set()
-            too_many = (f"P {pair_id:016X}\n"
+            too_many = (IDENTITY_LINE + f"P {pair_id:016X}\n"
                         f"F {entry:08X} {code_crc:08X}\n" +
                         "".join(
                             f"R {entry + i * 4:08X} 4\n"
                             for i in range(17)))
             ranges.write_text(too_many)
             assert MOD.load_shard_entry_set(str(dll)) == set()
-            no_ranges = (f"P {pair_id:016X}\n"
+            no_ranges = (IDENTITY_LINE + f"P {pair_id:016X}\n"
                          f"F {entry:08X} {code_crc:08X}\n")
             ranges.write_text(no_ranges)
             assert MOD.load_shard_entry_set(str(dll)) == set()
-            pairless = (f"F {entry:08X} {code_crc:08X}\n"
+            pairless = (IDENTITY_LINE +
+                        f"F {entry:08X} {code_crc:08X}\n"
                         f"R {entry:08X} 8\n")
             ranges.write_text(pairless)
             assert MOD.load_shard_entry_set(str(dll)) == {
                 entry & 0x1FFFFFFF}
             ranges.write_text(
+                IDENTITY_LINE +
                 f"  F {entry:08X} {code_crc:08X}\n\tR {entry:08X} 8  \n")
             assert MOD.load_shard_entry_set(str(dll)) == {
                 entry & 0x1FFFFFFF}
@@ -2867,19 +2959,22 @@ def check_interior_fragment_contract():
             assert MOD.load_shard_entry_set(str(dll)) == {
                 entry & 0x1FFFFFFF}
             f_record = f"F {entry:08X} {code_crc:08X}"
-            padded_128 = f_record + ' ' * (MOD.MANIFEST_LINE_MAX -
-                                            len(f_record))
+            padded_max = f_record + ' ' * (
+                MOD.MANIFEST_PHYSICAL_LINE_MAX - 1 - len(f_record))
+            identity_crlf = IDENTITY_LINE.replace('\n', '\r\n')
             ranges.write_bytes(
-                (padded_128 + f"\r\nR {entry:08X} 8\r\n").encode('ascii'))
+                (identity_crlf + padded_max +
+                 f"\r\nR {entry:08X} 8\r\n").encode('ascii'))
             assert MOD.load_shard_entry_set(str(dll)) == {
                 entry & 0x1FFFFFFF}
             ranges.write_bytes(
-                (padded_128 + f" \r\nR {entry:08X} 8\r\n").encode('ascii'))
+                (identity_crlf + padded_max +
+                 f" \r\nR {entry:08X} 8\r\n").encode('ascii'))
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_bytes(pairless.replace('\n', '\r').encode('ascii'))
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_bytes(
-                (f"F {entry:08X} {code_crc:08X}\0 junk\n"
+                (IDENTITY_LINE + f"F {entry:08X} {code_crc:08X}\0 junk\n"
                  f"R {entry:08X} 8\n").encode('ascii'))
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_bytes(("# unknown\0record\n" + pairless).encode('ascii'))
@@ -2895,24 +2990,28 @@ def check_interior_fragment_contract():
             assert MOD.load_shard_entry_set(str(dll)) == {
                 entry & 0x1FFFFFFF}
             ranges.write_text(
+                IDENTITY_LINE +
                 f"F{entry:08X} {code_crc:08X}\nR{entry:08X} 8\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_text(
-                f"F {entry:08X}\nR {entry:08X} 8\n")
+                IDENTITY_LINE + f"F {entry:08X}\nR {entry:08X} 8\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_text(
+                IDENTITY_LINE +
                 f"P {pair_id:016X}\nF {entry:08X} {code_crc:08X} junk\n"
                 f"R {entry:08X} 8\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
             outside = 0x80200000
             ranges.write_text(
+                IDENTITY_LINE +
                 f"P {pair_id:016X}\nF {outside:08X} {code_crc:08X}\n"
                 f"R {outside:08X} 4\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_text(
-                f"F -1 {code_crc:08X}\nR FFFFFFFF 4\n")
+                IDENTITY_LINE + f"F -1 {code_crc:08X}\nR FFFFFFFF 4\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_text(
+                IDENTITY_LINE +
                 f"F 180010000 {code_crc:08X}\nR 180010000 4\n")
             assert MOD.load_shard_entry_set(str(dll)) == set()
             ranges.write_text("#" * (MOD.MANIFEST_LINE_MAX + 1) +
@@ -2941,6 +3040,11 @@ def check_interior_fragment_contract():
     class Args:
         recompiler = "recompiler"
         game_toml = "game.toml"
+        game_identity_sha256 = GAME_SHA256
+        manifest_identity_sha256 = MANIFEST_SHA256
+        identity = TEST_IDENTITY
+        runtime_variant_contract = None
+        overlay_range_variants = ()
 
     class Failed:
         returncode = 1
@@ -3028,6 +3132,7 @@ def check_real_batched_fragment_publication(recompiler):
            else shutil.which('gcc'))
     if not gcc:
         return
+    ensure_runtime_export_support(gcc)
 
     data = bytearray(0x100)
     first = LOAD
@@ -3041,6 +3146,11 @@ def check_real_batched_fragment_publication(recompiler):
 
     class Args:
         game_toml = str(ROOT / 'tools' / 'cycle_testrom' / 'game.toml')
+        game_identity_sha256 = GAME_SHA256
+        manifest_identity_sha256 = MANIFEST_SHA256
+        identity = TEST_IDENTITY
+        runtime_variant_contract = None
+        overlay_range_variants = ()
         flavor = 0
         compiler = 'gcc'
         tcc = 'tcc'
@@ -3062,7 +3172,7 @@ def check_real_batched_fragment_publication(recompiler):
         ids, status = MOD.compile_fragment_batch(
             {first}, bytes(data), LOAD, len(data), LOAD & 0x1FFFFFFF,
             td, args, env, {}, initial_recipe, ())
-        assert ids and status == 'built'
+        assert ids and status == 'built', (ids, status)
         initial_dlls = list(pathlib.Path(td).glob(f'*{extension}'))
         assert len(initial_dlls) == 1
         initial_dll = initial_dlls[0]
@@ -3114,6 +3224,7 @@ def check_real_hosted_fragment_publication(recompiler):
            else shutil.which('gcc'))
     if not gcc:
         return
+    ensure_runtime_export_support(gcc)
     data = bytearray(0x100)
     host = LOAD
     target = LOAD + 0x10
@@ -3142,6 +3253,11 @@ def check_real_hosted_fragment_publication(recompiler):
 
     class Args:
         game_toml = str(ROOT / 'tools' / 'cycle_testrom' / 'game.toml')
+        game_identity_sha256 = GAME_SHA256
+        manifest_identity_sha256 = MANIFEST_SHA256
+        identity = TEST_IDENTITY
+        runtime_variant_contract = None
+        overlay_range_variants = ()
         flavor = 0
         compiler = 'gcc'
         tcc = 'tcc'
@@ -3259,8 +3375,8 @@ def check_real_hosted_fragment_publication(recompiler):
             f'*{MOD.overlay_ext()}'))) == dll_count
 
 
-def check_full_hosted_fixed_point(recompiler):
-    """A clean two-variant CLI build must make its second run a true no-op."""
+def check_full_cli_fixed_point(recompiler):
+    """A clean two-capture CLI build must make its second run a true no-op."""
     gcc = (r'C:\msys64\mingw64\bin\gcc.exe'
            if os.path.isfile(r'C:\msys64\mingw64\bin\gcc.exe')
            else shutil.which('gcc'))
@@ -3323,6 +3439,8 @@ def check_full_hosted_fixed_point(recompiler):
             sys.executable, script,
             '--captures', str(captures_path),
             '--game-toml', game_toml,
+            '--game-identity-sha256', CLI_GAME_SHA256,
+            '--manifest-identity-sha256', CLI_MANIFEST_SHA256,
             '--recompiler', recompiler,
             '--runtime-include', runtime_include,
             '--gcc', gcc,
@@ -3331,26 +3449,24 @@ def check_full_hosted_fixed_point(recompiler):
         ]
         env = os.environ.copy()
         env['PATH'] = os.path.dirname(gcc) + os.pathsep + env.get('PATH', '')
+        support = ensure_runtime_export_support(gcc)
+        if support is not None:
+            prior_preload = env.get('LD_PRELOAD')
+            env['LD_PRELOAD'] = (support if not prior_preload else
+                                 support + os.pathsep + prior_preload)
         first = subprocess.run(
             command, cwd=str(ROOT), env=env, capture_output=True, text=True,
             timeout=120)
         assert first.returncode == 0, first.stdout + first.stderr
         manifests = list(cache_root.rglob('*.ranges'))
-        hosted_manifests = [
-            path for path in manifests
-            if MOD.manifest_has_hosted_provenance(
-                path.read_text(encoding='ascii'))
-        ]
-        assert hosted_manifests, first.stdout
-        alias_found = False
-        for manifest in hosted_manifests:
+        published_entries = set()
+        for manifest in manifests:
             _pair, funcs = MOD.parse_runtime_shard_manifest(
                 manifest.read_text(encoding='ascii'), require_pair=True)
             for entry, _crc, ranges in funcs:
-                if (entry == target and len(ranges) == 1 and
-                        ranges[0][0] == host):
-                    alias_found = True
-        assert alias_found, first.stdout
+                if ranges:
+                    published_entries.add(entry)
+        assert {host, target} <= published_entries, first.stdout
 
         def inventory():
             return {
@@ -3391,9 +3507,27 @@ def check_full_candidate_cli_fastpath(recompiler):
 
         game_toml = ROOT / 'tools' / 'cycle_testrom' / 'game.toml'
         cache_root = tmp / 'cache'
-        leaf = (cache_root / 'CYCT-00101' / 'gcc' / MOD.cache_arch_abi() /
-                f'cg{MOD.codegen_ver(str(runtime_include))}_'
-                f'{MOD.codegen_hash(str(runtime_include)):08x}')
+        # MUST match compile_overlays.py's cache_dir exactly, including the
+        # _gc<config-hash> component — a prefill staged one directory off is
+        # simply not found, and the run then compiles for real instead of
+        # taking the fast path this test exists to assert. This drifted when
+        # the config hash was added to the cache path and went unnoticed
+        # because the test could not get past the BIOS-profile probe to reach
+        # the assertion (issue #72).
+        cache_tag = (
+            f'cg{MOD.codegen_ver(str(runtime_include))}_'
+            f'{MOD.codegen_hash(str(runtime_include)):08x}_'
+            f'gc{MOD.overlay_config_hash(recompiler, str(game_toml)):08x}_f0')
+        if MOD.XG_REPOSITORY is not None:
+            plan_hash = MOD.overlay_plan_hash(
+                str(MOD.XG_REPOSITORY / 'native_renderer' /
+                    'xg_render_runtime_variants.toml'),
+                str(MOD.XG_REPOSITORY / 'native_renderer' /
+                    'xg_render_overlay_ranges.toml'))
+            cache_tag += f'_p{plan_hash:08x}'
+        leaf = (cache_root / 'CYCT-00101' /
+                MOD.identity_cache_namespace(CLI_IDENTITY) / 'gcc' /
+                MOD.cache_arch_abi() / cache_tag)
         leaf.mkdir(parents=True)
         pair_id = 0x123456789ABCDEF0
         captured_bytes = b'\x08\x00\xE0\x03\x00\x00\x00\x00'
@@ -3421,7 +3555,7 @@ def check_full_candidate_cli_fastpath(recompiler):
         manifest = dll.with_suffix('.ranges')
         manifest.write_text(MOD.overlay_ranges_text([
             (LOAD, code_crc, ((LOAD, 8),)),
-        ], pair_id), encoding='ascii')
+        ], pair_id, identity=CLI_IDENTITY), encoding='ascii')
         assert len(MOD.load_shard_func_ids(str(dll), abi)) == 1
 
         capture_path = tmp / 'captures.json'
@@ -3452,8 +3586,17 @@ def check_full_candidate_cli_fastpath(recompiler):
             sys.executable, str(ROOT / 'tools' / 'compile_overlays.py'),
             '--captures', str(capture_path),
             '--game-toml', str(game_toml),
+            '--game-identity-sha256', CLI_GAME_SHA256,
+            '--manifest-identity-sha256', CLI_MANIFEST_SHA256,
             '--recompiler', recompiler,
             '--runtime-include', str(runtime_include),
+            # This fixture stages a SYNTHETIC runtime_include in a temp dir, so
+            # the framework root cannot be derived from it the way a normal
+            # invocation derives it. Naming the root explicitly is exactly what
+            # --project-root is for; without it the recompiler would probe
+            # dirname(game.toml) for the BIOS profile and every shard would die
+            # with "no BIOS profile found" (issue #72).
+            '--project-root', str(ROOT),
             '--gcc', gcc,
             '--out-dir', str(cache_root),
             '--jobs', '1',
@@ -3462,6 +3605,11 @@ def check_full_candidate_cli_fastpath(recompiler):
         env.pop('PSX_OVERLAY_CACHE_DIR', None)
         env.pop('PSX_OVERLAY_CAPTURES', None)
         env['PATH'] = os.path.dirname(gcc) + os.pathsep + env.get('PATH', '')
+        support = ensure_runtime_export_support(gcc)
+        if support is not None:
+            prior_preload = env.get('LD_PRELOAD')
+            env['LD_PRELOAD'] = (support if not prior_preload else
+                                 support + os.pathsep + prior_preload)
         run = subprocess.run(
             command, cwd=str(ROOT), env=env, capture_output=True, text=True,
             timeout=30)
@@ -3523,6 +3671,88 @@ def check_resident_marker_fixed_point():
         assert not marker.exists()
 
 
+def check_packaged_game_toml_resolves_bios_profile(recompiler):
+    """A game.toml OUTSIDE the framework root must still find a BIOS profile.
+
+    Regression for issue #72. compile_overlays.py spawns the recompiler with
+    cwd = dirname(game.toml), and that cwd is also where the recompiler probes
+    for bios/SCPH1001.toml when the config carries no explicit bios_config
+    (--ws-config deliberately does not adopt the config's paths). For a
+    PACKAGED config — packaging/release/game.toml — the directory holds neither
+    a profile nor a vendored framework, so every shard died with
+    "FATAL: no BIOS profile found" and the cache silently failed to build.
+
+    Two assertions, because the fix has two halves:
+      1. --project-root makes the probe search a directory we name.
+      2. compile_overlays.py defaults that root to the framework (derived from
+         the required --runtime-include), so the invocation the packager prints
+         works as written, with no new flag.
+    """
+    profile_rel = pathlib.Path('bios') / 'SCPH1001.toml'
+    assert (ROOT / profile_rel).is_file(), 'framework must ship a BIOS profile'
+
+    with tempfile.TemporaryDirectory() as td:
+        # A directory with no profile under it and no framework one level down:
+        # the packaged-config shape.
+        staged = pathlib.Path(td) / 'packaging' / 'release'
+        staged.mkdir(parents=True)
+        exe = staged / 'frag.psx'
+        exe.write_bytes(b'not-a-ps-x-exe')
+
+        def run(extra):
+            return subprocess.run(
+                recompiler_command(
+                    recompiler, str(exe), '--overlay',
+                    '--out-dir', str(pathlib.Path(td) / 'out')) + extra,
+                cwd=str(staged), capture_output=True, text=True, timeout=60)
+
+        # Without a root, the probe searches the packaged dir and fails — and
+        # the message must NAME that directory, or the cause is invisible.
+        bare = run([])
+        assert 'no BIOS profile found' in bare.stderr, bare.stderr
+        assert str(staged) in bare.stderr.replace('/', os.sep), bare.stderr
+
+        # With the framework as the root, profile resolution succeeds. The run
+        # still fails afterwards (frag.psx is not a real PS-X EXE) — what this
+        # asserts is that it got PAST the profile probe.
+        rooted = run(['--project-root', str(ROOT)])
+        assert 'no BIOS profile found' not in rooted.stderr, rooted.stderr
+
+        # A vendored framework one level down under an arbitrary name (Ape
+        # Escape vendors it as psxrecomp-v4) must also resolve.
+        vendored = pathlib.Path(td) / 'gamerepo'
+        (vendored / 'psxrecomp-v4' / 'bios').mkdir(parents=True)
+        shutil.copy(ROOT / profile_rel, vendored / 'psxrecomp-v4' / profile_rel)
+        nested = run(['--project-root', str(vendored)])
+        assert 'no BIOS profile found' not in nested.stderr, nested.stderr
+
+        # A non-directory root is a caller error and must fail loudly rather
+        # than silently falling back to the cwd probe.
+        bogus = run(['--project-root', str(exe)])
+        assert bogus.returncode == 1, bogus.stderr
+        assert 'is not a directory' in bogus.stderr, bogus.stderr
+
+    # Half 2: the default. compile_overlays.py must derive the framework root
+    # from --runtime-include so no caller has to pass the flag.
+    class _Args:
+        pass
+    args = _Args()
+    args.runtime_include = str(ROOT / 'runtime' / 'include')
+    args.project_root = None
+    derived = MOD.recompiler_project_root_args(args)
+    assert derived == ['--project-root', str(ROOT)], derived
+    # An explicit value wins over the derivation.
+    args.project_root = str(ROOT / 'tools')
+    assert MOD.recompiler_project_root_args(args) == [
+        '--project-root', str(ROOT / 'tools')]
+    # A --runtime-include that does not sit under a framework root yields no
+    # flag at all, so a caller that used to work is never altered.
+    args.project_root = None
+    args.runtime_include = str(pathlib.Path(tempfile.gettempdir()) /
+                               'nonexistent' / 'runtime' / 'include')
+    assert MOD.recompiler_project_root_args(args) == []
+
+
 def main():
     default_recompiler = ROOT / "recompiler" / "build" / "psxrecomp-game.exe"
     parser = argparse.ArgumentParser()
@@ -3558,9 +3788,10 @@ def main():
     check_tcc_runtime_define_parity()
     check_real_batched_fragment_publication(args.recompiler)
     check_real_hosted_fragment_publication(args.recompiler)
-    check_full_hosted_fixed_point(args.recompiler)
+    check_full_cli_fixed_point(args.recompiler)
     check_full_candidate_cli_fastpath(args.recompiler)
     check_resident_marker_fixed_point()
+    check_packaged_game_toml_resolves_bios_profile(args.recompiler)
 
     data = bytearray(0x200)
 

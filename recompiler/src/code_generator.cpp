@@ -1,4 +1,5 @@
 #include "code_generator.h"
+#include "pgxp_hook_emitter.h"
 #include "control_flow.h"
 #include "gte_register_classification.h"
 #include "../src/bios_address_model.h"
@@ -16,9 +17,23 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace PSXRecomp {
+
+/* Reserved MIPS-II branch-likely words often appear when discovery sweeps
+ * ASCII/data as code. Emit the RI raise every time (faithfulness), but do not
+ * spam one WARNING per revisit of the same PC — product Generate was flooding
+ * the setup wizard with hundreds of identical lines. Set
+ * PSXRECOMP_VERBOSE_RI_WARNINGS=1 to print every hit (dev / tests). */
+static bool should_print_reserved_opcode_warning(uint32_t addr) {
+    const char* e = std::getenv("PSXRECOMP_VERBOSE_RI_WARNINGS");
+    if (e != nullptr && e[0] != '\0' && e[0] != '0')
+        return true;
+    static std::unordered_set<uint32_t> seen;
+    return seen.insert(addr).second;
+}
 
 static bool codegen_cycle_per_insn() {
     // DEFAULT ON for the faithful-timing (cycle-audit) branch: each instruction
@@ -827,6 +842,12 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
+    auto keep_branch_if_wide = [&](std::string cond) {
+        if (!config_.ws_cull_branch_keep_sites.count(addr))
+            return cond;
+        return fmt::format("psx_ws_x_margin() > 0 ? 0 : ({}) /* ws branch keep */",
+                           cond);
+    };
 
     // REGIMM branches. R3000A hardware decodes EVERY rt value here, not just
     // the four assembler mnemonics: the branch sense is rt bit 0 (0 = bltz,
@@ -848,9 +869,14 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
                 (ws_cull_bltz_pcs_.count(addr) || config_.ws_cull_bltz_sites.count(addr)))
                 return fmt::format("psx_ws_cull_bltz({}) /* ws cull (left edge) */",
                                    reg_name(rs));
-            return fmt::format("(int32_t){} < 0", reg_name(rs));
+            if (regimm_op == 0x00 && config_.ws_cull_nclip_keep_sites.count(addr))
+                return fmt::format("psx_ws_x_margin() > 0 ? 0 : ((int32_t){} < 0) /* ws nclip keep */",
+                                   reg_name(rs));
+            return keep_branch_if_wide(
+                fmt::format("(int32_t){} < 0", reg_name(rs)));
         } else {                            // bgez family (incl. bgezal + undefined mirrors)
-            return fmt::format("(int32_t){} >= 0", reg_name(rs));
+            return keep_branch_if_wide(
+                fmt::format("(int32_t){} >= 0", reg_name(rs)));
         }
     }
 
@@ -858,22 +884,26 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
     switch (opcode) {
         case 0x04: // beq
         case 0x14: // beql
-            return fmt::format("{} == {}", reg_name(rs), reg_name(rt));
+            return keep_branch_if_wide(
+                fmt::format("{} == {}", reg_name(rs), reg_name(rt)));
 
         case 0x05: // bne
         case 0x15: // bnel
-            return fmt::format("{} != {}", reg_name(rs), reg_name(rt));
+            return keep_branch_if_wide(
+                fmt::format("{} != {}", reg_name(rs), reg_name(rt)));
 
         case 0x06: // blez
         case 0x16: // blezl
-            return fmt::format("(int32_t){} <= 0", reg_name(rs));
+            return keep_branch_if_wide(
+                fmt::format("(int32_t){} <= 0", reg_name(rs)));
 
         case 0x07: // bgtz
         case 0x17: // bgtzl
-            return fmt::format("(int32_t){} > 0", reg_name(rs));
+            return keep_branch_if_wide(
+                fmt::format("(int32_t){} > 0", reg_name(rs)));
     }
 
-    return "0 /* unknown branch condition: defaults to not-taken */";
+    return keep_branch_if_wide("0 /* unknown branch condition: defaults to not-taken */");
 }
 
 std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) {
@@ -901,6 +931,36 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             reg_name(get_rt(instr)), reg_name(get_rs(instr)), comment);
     }
 
+    // Full-word-guarded terrain-frustum half-angle constants. Scaling the
+    // tangent is the geometric counterpart of widening the horizontal
+    // projection; adding screen pixels directly to 12-bit angle units is not.
+    for (const auto& site : config_.ws_cull_angle_sites) {
+        if ((site.address & 0x1FFFFFFFu) !=
+            (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: cull angle expected 0x{:08X} at 0x{:08X}, "
+                       "found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        if ((opcode != 0x08u && opcode != 0x09u) ||
+            get_rs(instr) != 0u) {
+            fmt::print(stderr,
+                       "ERROR: cull angle site 0x{:08X} is not "
+                       "ADDI/ADDIU rt,zero,imm (0x{:08X})\n",
+                       addr, instr);
+            std::exit(1);
+        }
+        const uint32_t dst = get_rt(instr);
+        const int32_t vanilla = (int16_t)(instr & 0xFFFFu);
+        return fmt::format(
+            "{} = psx_ws_angle_widen({}u);"
+            "  /* aspect-scaled terrain frustum half-angle */{}",
+            reg_name(dst), (uint32_t)vanilla, comment);
+    }
+
     for (const auto& site : config_.ws_signed_x_bound_sites) {
         if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
         if (instr != site.expected) {
@@ -914,6 +974,100 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         return fmt::format("{} = (uint32_t)psx_ws_player_x_bound((int32_t)0x{:08X});"
                            "  /* typed native-wide signed X bound */{}",
                            reg_name(get_rt(instr)), (uint32_t)vanilla, comment);
+    }
+
+    // Full-word-guarded, camera-horizontal model-participation cones. The
+    // runtime helper preserves the original compare at 4:3 and every vanilla
+    // keep verdict, adding only the aspect-derived horizontal fringe.
+    for (const auto& site : config_.ws_aspect_cone.sites) {
+        if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: aspect cone expected 0x{:08X} at 0x{:08X}, "
+                       "found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        const bool is_slti = opcode == 0x0A;
+        const bool is_slt =
+            opcode == 0x00 && (instr & 0x3Fu) == 0x2Au &&
+            ((instr >> 6) & 0x1Fu) == 0u;
+        if (!is_slti && !is_slt) {
+            fmt::print(stderr,
+                       "ERROR: aspect cone site 0x{:08X} is not signed "
+                       "SLTI/SLT "
+                       "(0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+        const uint32_t dst = is_slti ? get_rt(instr) : get_rd(instr);
+        const std::string vanilla = is_slti
+            ? fmt::format("((int32_t){} < (int32_t){}) ? 1u : 0u",
+                          reg_name(get_rs(instr)),
+                          (int32_t)(int16_t)(instr & 0xFFFFu))
+            : fmt::format("((int32_t){} < (int32_t){}) ? 1u : 0u",
+                          reg_name(get_rs(instr)), reg_name(get_rt(instr)));
+        const auto effective_reg = [](uint32_t site_reg,
+                                      uint32_t default_reg) {
+            return site_reg == 0xFFFFFFFFu ? default_reg : site_reg;
+        };
+        return fmt::format(
+            "{} = psx_ws_aspect_cone_result(0x{:08X}u, ({}), {}, "
+            "(int32_t)(int16_t){}, (int32_t)(int16_t){}, "
+            "(int32_t)(int16_t){});"
+            "  /* aspect-aware horizontal model participation */{}",
+            reg_name(dst), addr, vanilla,
+            reg_name(effective_reg(
+                site.object_reg, config_.ws_aspect_cone.object_reg)),
+            reg_name(effective_reg(
+                site.x_reg, config_.ws_aspect_cone.x_reg)),
+            reg_name(effective_reg(
+                site.z_reg, config_.ws_aspect_cone.z_reg)),
+            reg_name(effective_reg(
+                site.y_reg, config_.ws_aspect_cone.y_reg)), comment);
+    }
+
+    // Full-word-guarded object/model participation compares. At 4:3 the
+    // helper returns the comparison's vanilla value; when widescreen reveals
+    // extra world it returns the configured keep verdict. Overlay variants
+    // with another instruction at the same VA are deliberately untouched.
+    for (const auto& site : config_.ws_cull_keep_sites) {
+        if ((site.address & 0x1FFFFFFFu) != (addr & 0x1FFFFFFFu)) continue;
+        if (instr != site.expected) {
+            if (config_.overlay_mode) continue;
+            fmt::print(stderr,
+                       "ERROR: cull keep expected 0x{:08X} at 0x{:08X}, found 0x{:08X}\n",
+                       site.expected, addr, instr);
+            std::exit(1);
+        }
+        uint32_t dst = 0;
+        std::string vanilla;
+        if (opcode == 0x0A) { // SLTI
+            dst = get_rt(instr);
+            vanilla = fmt::format("((int32_t){} < {}) ? 1u : 0u",
+                                  reg_name(get_rs(instr)), (int)get_imm16(instr));
+        } else if (opcode == 0x0B) { // SLTIU (sign-extended immediate)
+            dst = get_rt(instr);
+            vanilla = fmt::format("({} < (uint32_t){}) ? 1u : 0u",
+                                  reg_name(get_rs(instr)), (int)get_imm16(instr));
+        } else if (opcode == 0x00 && funct == 0x2A) { // SLT
+            dst = get_rd(instr);
+            vanilla = fmt::format("((int32_t){} < (int32_t){}) ? 1u : 0u",
+                                  reg_name(get_rs(instr)), reg_name(get_rt(instr)));
+        } else if (opcode == 0x00 && funct == 0x2B) { // SLTU
+            dst = get_rd(instr);
+            vanilla = fmt::format("({} < {}) ? 1u : 0u",
+                                  reg_name(get_rs(instr)), reg_name(get_rt(instr)));
+        } else {
+            fmt::print(stderr,
+                       "ERROR: cull keep site 0x{:08X} is not a compare (0x{:08X})\n",
+                       addr, instr);
+            std::exit(1);
+        }
+        return fmt::format(
+            "{} = psx_ws_cull_keep_result(({}), {}u);"
+            "  /* ws maximal object/model participation */{}",
+            reg_name(dst), vanilla, site.result, comment);
     }
 
     // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
@@ -1112,8 +1266,15 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x08 || opcode == 0x09) {  // addi / addiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t imm = get_imm16(instr);
-            return fmt::format("{} = {} + ((int32_t){} + psx_ws_x_margin());{}",
-                               reg_name(rt), reg_name(rs), imm, comment);
+            const std::string margin =
+                config_.ws_cull_activation_guard_pixels > 0
+                    ? fmt::format(
+                          "(psx_ws_x_margin() > 0 ? psx_ws_x_margin() + {} : 0)",
+                          config_.ws_cull_activation_guard_pixels)
+                    : "psx_ws_x_margin()";
+            return fmt::format("{} = {} + ((int32_t){} + {});{}",
+                               reg_name(rt), reg_name(rs), imm, margin,
+                               comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] bias site 0x{:08X} is not "
                        "addi/addiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1209,8 +1370,15 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x0B) {  // sltiu
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t imm = get_imm16(instr);
-            return fmt::format("{} = ({} < (uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;{}",
-                               reg_name(rt), reg_name(rs), imm, comment);
+            const std::string margin =
+                config_.ws_cull_activation_guard_pixels > 0
+                    ? fmt::format(
+                          "(psx_ws_x_margin() > 0 ? psx_ws_x_margin() + {} : 0)",
+                          config_.ws_cull_activation_guard_pixels)
+                    : "psx_ws_x_margin()";
+            return fmt::format(
+                "{} = ({} < (uint32_t)((int32_t){} + 2*{})) ? 1 : 0;{}",
+                reg_name(rt), reg_name(rs), imm, margin, comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] range site 0x{:08X} is not "
                        "sltiu (opcode 0x{:02X})\n", addr, opcode);
@@ -1289,6 +1457,23 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             return fmt::format("{} = psx_ws_cull_slti({}, {});"
                                "  /* ws auto screen-x cull (right edge) */{}",
                                reg_name(rt), reg_name(rs), (int)uimm, comment);
+        }
+    }
+    // Explicit signed lower-bound widen (`slti rt, sx, -W`). Unlike the
+    // min/max right-edge helper below, this moves the immediate left by one
+    // live reveal margin. The helper sign-extends the 16-bit immediate.
+    if (config_.ws_cull_slti_lower_sites.count(addr)) {
+        if (opcode == 0x0A) {  // slti
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t uimm = get_imm16_u(instr);
+            return fmt::format("{} = psx_ws_cull_slti_lower({}, {});"
+                               "  /* ws cull slti lower site */{}",
+                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.cull] slti_lower site "
+                       "0x{:08X} is not slti (opcode 0x{:02X})\n",
+                       addr, opcode);
+            std::exit(1);
         }
     }
     // Explicit signed right-edge widen site ([widescreen.cull] slti_sites) for
@@ -1592,17 +1777,21 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     const std::string gte_read = fmt::format(
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", rt);
                     if (cop_op == 0x00) { // MFC2 - move from COP2 data
-                        if (PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rd))) {
-                            code = gte_read + fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
-                        } else {
-                            code = gte_read + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
-                        }
+                        const std::string value =
+                            PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rd))
+                                ? fmt::format("gte_read_data(cpu, {})", rd)
+                                : fmt::format("cpu->gte_data[{}]", rd);
+                        code = gte_read + (rt == 0
+                            ? fmt::format("(void){};  /* mfc2 to $zero: read preserved, write discarded */", value)
+                            : fmt::format("{} = {};  /* mfc2 */", reg_name(rt), value));
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
-                        if (PSXRecompGTERegisters::ctrl_read_needs_helper(static_cast<uint8_t>(rd))) {
-                            code = gte_read + fmt::format("{} = gte_read_ctrl(cpu, {});  /* cfc2 */", reg_name(rt), rd);
-                        } else {
-                            code = gte_read + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
-                        }
+                        const std::string value =
+                            PSXRecompGTERegisters::ctrl_read_needs_helper(static_cast<uint8_t>(rd))
+                                ? fmt::format("gte_read_ctrl(cpu, {})", rd)
+                                : fmt::format("cpu->gte_ctrl[{}]", rd);
+                        code = gte_read + (rt == 0
+                            ? fmt::format("(void){};  /* cfc2 to $zero: read preserved, write discarded */", value)
+                            : fmt::format("{} = {};  /* cfc2 */", reg_name(rt), value));
                     } else if (cop_op == 0x04) { // MTC2 - move to COP2 data
                         if (PSXRecompGTERegisters::data_write_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_stall + fmt::format("gte_write_data(cpu, {}, {});  /* mtc2 */", rd, reg_name(rt));
@@ -1661,12 +1850,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                         ? reg_name(rs)
                         : fmt::format("{} + {}", reg_name(rs), offset);
                     bool special = PSXRecompGTERegisters::data_write_needs_helper(static_cast<uint8_t>(rt));
+                    /* The raw loaded word is captured for the PGXP hook: the
+                     * register may hold a MASKED value (write helper), and
+                     * the shadow must validate against the word as loaded. */
                     if (special) {
-                        code = gte_stall + fmt::format("gte_write_data(cpu, {}, psx_cyc_lwc2_read(cpu, {}));  /* lwc2 gte[{}] */",
-                                           rt, addr, rt);
+                        code = gte_stall + fmt::format(
+                            "{{ uint32_t _pgxa = {}; uint32_t _pgxv = psx_cyc_lwc2_read(cpu, _pgxa); "
+                            "gte_write_data(cpu, {}, _pgxv); PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}  /* lwc2 gte[{}] */",
+                            addr, rt, instr, rt);
                     } else {
-                        code = gte_stall + fmt::format("cpu->gte_data[{}] = psx_cyc_lwc2_read(cpu, {});  /* lwc2 gte[{}], ({}) */",
-                                          rt, addr, rt, addr);
+                        code = gte_stall + fmt::format(
+                            "{{ uint32_t _pgxa = {}; uint32_t _pgxv = psx_cyc_lwc2_read(cpu, _pgxa); "
+                            "cpu->gte_data[{}] = _pgxv; PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}  /* lwc2 gte[{}], ({}) */",
+                            addr, rt, instr, rt, addr);
                     }
                 }
                 break;
@@ -1693,17 +1889,17 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                         ? fmt::format(" psx_xg_render_auth_resident_ft4_observe(cpu, 1u, 0x{:08X}u, 0x{:08X}u);", addr, instr)
                         : "";
                     std::string swc2_store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
-                    if (offset == 0) {
-                        code = gte_stall + resident_pre + swc2_store_pc + fmt::format(
-                            "psx_store_cycle_barrier(); cpu->write_word({}, {}); gte_precision_store_word({}, {});{}  /* swc2 gte[{}], ({}) */",
-                            reg_name(rs), value, reg_name(rs), rt,
-                            resident_commit, rt, reg_name(rs));
-                    } else {
-                        code = gte_stall + resident_pre + swc2_store_pc + fmt::format(
-                            "psx_store_cycle_barrier(); cpu->write_word({} + {}, {}); gte_precision_store_word({} + {}, {});{}  /* swc2 gte[{}], {}({}) */",
-                            reg_name(rs), offset, value, reg_name(rs), offset, rt,
-                            resident_commit, rt, offset, reg_name(rs));
-                    }
+                    std::string swc2_addr = (offset == 0)
+                        ? reg_name(rs)
+                        : fmt::format("{} + {}", reg_name(rs), offset);
+                    code = gte_stall + resident_pre + swc2_store_pc + fmt::format(
+                        "{{ uint32_t _pgxa = {}; uint32_t _pgxv = {}; "
+                        "psx_store_cycle_barrier(); cpu->write_word(_pgxa, _pgxv); "
+                        "gte_precision_store_word(_pgxa, {}); "
+                        "PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}{}"
+                        "  /* swc2 gte[{}], {}({}) */",
+                        swc2_addr, value, rt, instr, resident_commit,
+                        rt, offset, reg_name(rs));
                 }
                 break;
             default:
@@ -1711,6 +1907,7 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         }
     }
 
+    PSXRecomp::append_pgxp_hooks(instr, code);
     const auto *source_site = source_observation_site(config_, addr, instr);
     if (config_.overlay_mode && source_site != nullptr) {
         return config_.indent + static_auth_hook +
@@ -1887,6 +2084,69 @@ std::string CodeGenerator::translate_basic_block(
         exit_branch_addr = block.end_addr;
     }
 
+    /* MIPS-I load-delay value semantics for ordinary in-block pairs.  The
+     * resident/full-function emitter already models these; overlay/game CFG
+     * emission must do the same.  OpenBIOS's CD/card fasttrack deliberately
+     * uses `lw k0,...; move at,k0`, where the move must observe OLD k0. */
+    auto simple_load_dest = [](uint32_t w) -> int {
+        uint32_t op = w >> 26;
+        if (op == 0x20u || op == 0x21u || op == 0x23u ||
+            op == 0x24u || op == 0x25u) {
+            uint32_t rt = (w >> 16) & 31u;
+            return rt ? static_cast<int>(rt) : -1;
+        }
+        return -1;
+    };
+    auto reads_gpr = [](uint32_t w, uint32_t r) -> bool {
+        if (r == 0u || w == 0u) return false;
+        uint32_t op = w >> 26, rs = (w >> 21) & 31u;
+        uint32_t rt = (w >> 16) & 31u, fn = w & 63u;
+        if (op == 0u) {
+            if (fn == 0x08u || fn == 0x09u) return rs == r;
+            if (fn == 0x0Cu || fn == 0x0Du || fn == 0x10u || fn == 0x12u)
+                return false;
+            return rs == r || rt == r;
+        }
+        if (op == 0x02u || op == 0x03u || op == 0x0Fu) return false;
+        if (op == 0x01u || op == 0x06u || op == 0x07u) return rs == r;
+        if (op == 0x04u || op == 0x05u) return rs == r || rt == r;
+        if (op >= 0x08u && op <= 0x0Eu) return rs == r;
+        if (op == 0x10u) return ((w >> 21) & 31u) == 0x04u && rt == r;
+        if (op == 0x12u) {
+            uint32_t f = (w >> 21) & 31u;
+            return (f == 0x04u || f == 0x06u) && rt == r;
+        }
+        if (op == 0x22u || op == 0x26u ||
+            (op >= 0x28u && op <= 0x2Eu))
+            return rs == r || rt == r;
+        return rs == r;
+    };
+    auto writes_gpr = [](uint32_t w, uint32_t r) -> bool {
+        if (r == 0u || w == 0u) return false;
+        uint32_t op = w >> 26, rt = (w >> 16) & 31u;
+        uint32_t rd = (w >> 11) & 31u, fn = w & 63u;
+        if (op == 0u) {
+            if (fn == 0x08u || fn == 0x0Cu || fn == 0x0Du || fn == 0x0Fu ||
+                fn == 0x11u || fn == 0x13u ||
+                (fn >= 0x18u && fn <= 0x1Bu)) return false;
+            return rd == r;
+        }
+        if (op == 0x03u) return r == 31u;
+        if (op == 0x01u) return (rt == 0x10u || rt == 0x11u) && r == 31u;
+        if (op == 0x02u || (op >= 0x04u && op <= 0x07u) ||
+            (op >= 0x28u && op <= 0x2Eu) || op == 0x32u || op == 0x3Au)
+            return false;
+        if (op == 0x10u) return ((w >> 21) & 31u) == 0u && rt == r;
+        if (op == 0x12u) {
+            uint32_t f = (w >> 21) & 31u;
+            return (f == 0u || f == 2u) && rt == r;
+        }
+        return rt == r;
+    };
+    uint32_t delayed_load_addr = 0u;
+    uint32_t delayed_load_dest = 0u;
+    bool delayed_load_active = false;
+
     while (addr <= block.end_addr) {
         auto instr_opt = exe_.read_word(addr);
         if (!instr_opt.has_value()) {
@@ -1966,12 +2226,47 @@ std::string CodeGenerator::translate_basic_block(
             }
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
-            ss << translate_instruction(addr, instr) << "\n";
+            std::string emitted = translate_instruction(addr, instr);
+            int load_dest = simple_load_dest(instr);
+            bool defer_load = false;
+            if (!delayed_load_active && load_dest > 0 && addr + 4u <= block.end_addr &&
+                !extra_labels_.count(addr + 4u)) {
+                auto next = exe_.read_word(addr + 4u);
+                defer_load = next.has_value() &&
+                    !ControlFlowAnalyzer::is_control_flow(*next) &&
+                    reads_gpr(*next, static_cast<uint32_t>(load_dest));
+            }
+            if (defer_load) {
+                const std::string lhs = fmt::format("cpu->gpr[{}] =", load_dest);
+                const size_t pos = emitted.find(lhs);
+                if (pos != std::string::npos) {
+                    const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
+                    emitted.replace(pos, lhs.size(), "uint32_t " + temp + " =");
+                    ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
+                    delayed_load_addr = addr;
+                    delayed_load_dest = static_cast<uint32_t>(load_dest);
+                    delayed_load_active = true;
+                }
+            }
+            ss << emitted << "\n";
             if (observe_after) {
                 ss << config_.indent
                    << fmt::format(
                           "(void){}(cpu, 0x{:08X}u, 0x{:08X}u);\n",
                           native_cutover_callback(config_), addr, instr);
+            }
+            if (delayed_load_active && addr == delayed_load_addr + 4u) {
+                if (writes_gpr(instr, delayed_load_dest)) {
+                    ss << config_.indent << fmt::format(
+                        "(void)psx_ldd_{:08X};  /* successor write wins */\n",
+                        delayed_load_addr);
+                } else {
+                    ss << config_.indent << fmt::format(
+                        "cpu->gpr[{}] = psx_ldd_{:08X};  /* load-delay writeback */\n",
+                        delayed_load_dest, delayed_load_addr);
+                }
+                ss << config_.indent << "}\n";
+                delayed_load_active = false;
             }
             emit_cosim_instr(addr, config_.indent);
         } else {
@@ -2030,9 +2325,11 @@ std::string CodeGenerator::translate_basic_block(
                      * the word is data (never executed) nothing happens; if the
                      * guest really reaches it, the kernel handler sees the same
                      * exception hardware would deliver. */
-                    fmt::print("  WARNING: reserved opcode 0x{:08X} at 0x{:08X} "
-                               "— emitting guest RI exception raise\n",
-                               block.exit_instr.instruction, addr);
+                    if (should_print_reserved_opcode_warning(addr)) {
+                        fmt::print("  WARNING: reserved opcode 0x{:08X} at 0x{:08X} "
+                                   "— emitting guest RI exception raise\n",
+                                   block.exit_instr.instruction, addr);
+                    }
                     ss << config_.indent
                        << fmt::format("{{ /* reserved opcode 0x{:08X}: architectural RI exception */\n",
                                       block.exit_instr.instruction);
@@ -2760,8 +3057,17 @@ GeneratedFunction CodeGenerator::generate_function(
             << config_.indent
             << "__attribute__((cleanup(psx_cyc_bb_defer_cleanup))) "
                "int _psx_cyc_bb_guard = 1;\n"
-            << config_.indent << "psx_cyc_bb_defer_begin();\n"
-            << "#endif\n";
+            << config_.indent << "psx_cyc_bb_defer_begin();\n";
+    // Declare local-acc AFTER bb_guard so cleanup runs local_end first
+    // (publish), then bb_defer_end (flush). Gated VLC leaves only.
+    if (config_.load_charge_batch_funcs.count(func.start_addr)) {
+        body_ss << config_.indent << "uint32_t _psx_lc_acc = 0;\n"
+                << config_.indent
+                << "__attribute__((cleanup(psx_cyc_local_cleanup))) "
+                   "uint32_t *_psx_lc_guard = &_psx_lc_acc;\n"
+                << config_.indent << "psx_cyc_local_begin(&_psx_lc_acc);\n";
+    }
+    body_ss << "#endif\n";
 
     // CPS entry-switch: when the unified flat trampoline dispatches a
     // continuation address (a callee published cpu->pc = $ra back to us), route
@@ -2927,6 +3233,13 @@ GeneratedFunction CodeGenerator::generate_function(
                 << fmt::format("if (psx_datashard_enter(cpu, 0x{:08X}u)) return;"
                                "  /* data-shard: replay or arm capture */\n",
                                func.start_addr);
+    }
+    if (config_.mod_function_entry_funcs.count(func.start_addr)) {
+        body_ss << config_.indent
+                << fmt::format(
+                       "psx_mod_function_entry(cpu, 0x{:08X}u);"
+                       "  /* trusted opt-in game-mod hook */\n",
+                       func.start_addr);
     }
     if (config_.ws_sprite_tag_funcs.count(func.start_addr)) {
         body_ss << config_.indent
@@ -3366,6 +3679,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
                 func.start_addr, func.start_addr & 0x1FFFFFFFu);
             stub.full_code = stub.signature + "\n" + stub.body;
             stub.line_count = 4;
+            stub.dispatchable = false;
             results.push_back(stub);
             continue;
         }
@@ -3418,6 +3732,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
                     func.start_addr, func.start_addr & 0x1FFFFFFFu);
                 data_stub.full_code = data_stub.signature + "\n" + data_stub.body;
                 data_stub.line_count = 4;
+                data_stub.dispatchable = false;
                 total_lines += data_stub.line_count;
                 results.push_back(std::move(data_stub));
                 continue;
@@ -3447,6 +3762,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void cosim_instr(uint32_t pc);\n";
     ss << "#endif\n";
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
+    ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     if (!config_.overlay_mode) {
@@ -3464,6 +3780,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int32_t psx_xenogears_field_frame_step(uint32_t, uint32_t, int32_t, uint32_t, uint32_t);\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm); /* ws cull signed lower edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_bltz(uint32_t v);                  /* ws cull signed left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm); /* ws masked-u16 X window */\n";
     ss << "extern int32_t psx_ws_depth_bound(int32_t imm);            /* ws aspect-scaled far bound */\n";
@@ -3478,6 +3795,9 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
      ss << "extern int  psx_ws_guest_cull_depth_signed(int32_t value, int32_t immediate);\n";
      ss << "extern int  psx_ws_guest_cull_depth_unsigned(uint32_t value, int32_t immediate);\n";
      ss << "extern uint32_t psx_ws_guest_cull_xclip_bound(uint32_t vanilla);\n";
+    ss << "extern uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced); /* ws guarded keep compare (gpu.c) */\n";
+    ss << "extern uint32_t psx_ws_aspect_cone_result(uint32_t site, uint32_t vanilla, uint32_t object, int32_t x, int32_t z, int32_t y); /* aspect-aware participation cone */\n";
+    ss << "extern uint32_t psx_ws_angle_widen(uint32_t vanilla); /* aspect-scaled 12-bit terrain-frustum half-angle */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_cols(int base);                    /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
     ss << "extern int  psx_ws_bg2d_startcol(int col, unsigned mask);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";

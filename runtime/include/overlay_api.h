@@ -8,6 +8,7 @@
  */
 
 #include "cpu_state.h"
+#include "pgxp_hooks.h"
 #include <stdint.h>
 
 /* ABI version exported by every overlay DLL as `overlay_abi()`.  The loader
@@ -85,6 +86,20 @@
  * v23: authenticated native-render lifecycle callback.
  * v24: GTE execution callback carries the exact executing guest PC.
  * v25: authenticated native FT4 bypass callback. */
+/* v19: ws_cull_keep_result forwarder for full-word-guarded object/model
+ *      participation comparisons. The verdict depends on the host's live
+ *      widescreen margin; NULL preserves the vanilla comparison. */
+/* v20: ws_aspect_cone_result forwarder for camera-horizontal, aspect-aware
+ *      model participation with queue-safe guard/hysteresis policy. */
+/* v21: ws_angle_widen forwarder for exact, aspect-scaled 12-bit terrain
+ *      frustum half-angle constants. */
+/* (PGXP, no version bump): OverlayCallbacks grew an appended-last PGXPHooks
+ *      table pointer (pgxp_hooks.h). Only pgxp-flavour shards (compiled with
+ *      -DPSX_PGXP=1, PSX_OVERLAY_FLAVOR_PGXP set) reference the psx_pgxp_*
+ *      forwarders, and the flavor half of the ABI tag already rejects any
+ *      host/DLL flavor mix — base-flavour DLLs and hosts are untouched, so
+ *      the version stays. The emit-content change (PGXP_*() macros in all
+ *      generated C) is covered by the codegen hash + CODEGEN_VER below. */
 #define PSX_OVERLAY_ABI_VERSION 25
 
 /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
@@ -111,6 +126,12 @@
 #ifndef PSX_OVERLAY_FLAVOR
 #define PSX_OVERLAY_FLAVOR 0
 #endif
+
+/* Flavor bits (compose bitwise; base = 0):
+ *   1 — widescreen variant codegen
+ *   2 — PGXP precision shadowing (-DPSX_PGXP=1 objects; pgxp_hooks.h) */
+#define PSX_OVERLAY_FLAVOR_WIDESCREEN 1
+#define PSX_OVERLAY_FLAVOR_PGXP       2
 
 /* Combined tag exported by overlay_abi() and checked by the loader. */
 #define PSX_OVERLAY_ABI_TAG \
@@ -139,6 +160,9 @@
  *   7: + configured side-plane normal-X (plane_nx) cull emit.
  *   8: + configured per-primitive bound-load (xclip) cull emit.
  *   9: interrupt checks return before a handler-selected redirect can fall through.
+ *  10: PGXP dataflow-shadowing PGXP_*() macro emission at loads/stores/
+ *      COP2 transfers/precision-carrying ALU ops (pgxp_hooks.h; no-ops in
+ *      base-flavour objects, real hooks under -DPSX_PGXP=1).
  *  11: certified Xenogears resident field frame-step hook.
  *  12: resident hook receives the authored-frame token from GPR 17.
  *  13: exact resident hook emits in both static and overlay generated code.
@@ -311,6 +335,27 @@ typedef struct {
                             uint32_t instruction_word, uint32_t delay_slot_word);
     bool (*xg_render_native_ft4_bypass)(CPUState *cpu, uint32_t pc,
                                          uint32_t instruction_word);
+
+    /* Guarded object/model participation comparison helper (ABI v19).
+     * Runtime-state dependent; NULL preserves the vanilla comparison. */
+    uint32_t (*ws_cull_keep_result)(uint32_t vanilla, uint32_t forced);
+
+    /* Aspect-aware model-participation cone helper (ABI v20). */
+    uint32_t (*ws_aspect_cone_result)(uint32_t site, uint32_t vanilla,
+                                      uint32_t object, int32_t x,
+                                      int32_t z, int32_t y);
+
+    /* Aspect-scaled terrain-frustum angle helper (ABI v21). */
+    uint32_t (*ws_angle_widen)(uint32_t vanilla);
+
+    /* PGXP dataflow-shadowing hook table (pgxp_hooks.h). Only pgxp-flavour
+     * shards (PSX_OVERLAY_FLAVOR pgxp bit, compiled with -DPSX_PGXP=1) emit
+     * calls to psx_pgxp_*; their preamble forwards through this table. Base-
+     * flavour shards never reference it. Appended LAST; NULL on an older host
+     * no-ops every hook — precision shadowing is visual-only, never
+     * load-bearing. The ABI version bump that arms this ships with the
+     * emitter change (Phase 2 of ENHANCEMENTS.md G1 value propagation). */
+    const PGXPHooks *pgxp;
 } OverlayCallbacks;
 
 #ifdef __cplusplus

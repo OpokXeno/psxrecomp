@@ -4,19 +4,20 @@
  * The test includes spu.c so it can stage a voice exactly at the block
  * boundary, without exposing emulator internals in the runtime API.
  *
- * Build from runtime/tests:
- *   gcc -std=c99 -I../include -o test_spu_end_without_repeat.exe \
- *       test_spu_end_without_repeat.c
+ * Build/run: ctest -R spu_end_without_repeat_test
  */
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
+#include "psx_sdl.h"
 #include "../src/spu.c"
 
 /* Dependencies owned by the surrounding runtime are inert in this unit test. */
 uint64_t s_frame_count;
+uint32_t g_debug_last_store_pc;
+uint32_t g_debug_current_func_addr;
 
 uint64_t psx_get_cycle_count(void) { return 0; }
 
@@ -30,6 +31,14 @@ void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b) {
     (void)kind;
     (void)a;
     (void)b;
+}
+
+void psx_irq_raise(uint32_t bit, uint32_t detail) { (void)bit; (void)detail; }
+
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+    (void)data;
+    (void)len;
+    return crc;
 }
 
 bool spu_shadow_enabled(void) { return false; }

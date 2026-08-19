@@ -15,6 +15,8 @@
 #include "guest_render_transaction.h"
 #include "ws_cull_policy.h"
 
+typedef struct CPUState CPUState;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -59,6 +61,11 @@ GpuRenderOracleResult gpu_render_oracle_capture_end(void);
 GpuRenderOracleResult gpu_render_oracle_capture_snapshot(GpuRenderOracleSnapshot *out);
 GpuRenderOracleResult gpu_render_oracle_capture_read_event(uint64_t index,
                                                             GpuRenderOracleEvent *out);
+/* Linked-list provenance for the next GP0 words. `word_count == 0` identifies
+ * an ordering-table link node; packet nodes retain the most recently visited
+ * OT rank. This lets diagnostics distinguish front-layer UI packets from
+ * depth-sorted world packets without guessing from primitive shape. */
+void     gpu_set_gp0_linked_list_node(uint32_t addr, uint32_t word_count);
 void     gpu_vblank_tick(void);        /* Toggle LCF, called at each simulated vblank */
 
 /* Display presentation accessors (Phase 3). */
@@ -84,15 +91,24 @@ void gpu_depth24_convert_region_to_15bit(uint32_t vram_x0, uint32_t vram_y0,
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b);
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y);
+/* Batch equivalent of calling gpu_display_pixel_argb(di, x, y) for x in
+ * [0, count) on a depth24 (FMV) scanline — same output, far less per-pixel
+ * overhead. `out` must hold at least `count` uint32_t ARGB entries. */
+void gpu_depth24_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out,
+                             uint32_t count);
 /* Depth24: RGB columns covered by CPU→VRAM uploads since the last reset.
- * Returns crtc_w when unknown / full coverage. Present uses this to blank a
- * trailing margin without shrinking the CRTC-derived width globally. */
+ * Returns 0 when no uploads yet, crtc_w when coverage is full/unknown-beyond,
+ * else the covered RGB width. Present black-fills [limit, crtc_w) without
+ * shrinking the CRTC-derived draw width (avoids a flickering black pillar). */
 uint32_t gpu_depth24_rgb_limit(uint32_t display_x, uint32_t crtc_w);
 void     gpu_depth24_upload_span_reset(void);
 /* MotK intro cuts retarget GP1(07h). While hold > 0, present should skip
  * Swap (keep prior frame) so stale trailing VRAM never flashes. One tick
  * per vblank; returns non-zero while the hold is still active after tick. */
 int      gpu_depth24_present_hold_tick(void);
+/* After savestate restore: clear ephemeral hold so the restored depth24
+ * frame can present immediately (span/prev_h come from the GPU snap). */
+void     gpu_depth24_on_savestate_loaded(void);
 /* GP1(06h)/GP1(07h)/GP1(08h) fields for debug (gpu_state). */
 void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
                         uint32_t *hres1_out, uint32_t *hres2_out);
@@ -113,6 +129,11 @@ typedef struct {
     uint8_t dither, mask_set, mask_check;
 } GpuDrawState;
 void gpu_get_draw_state(GpuDrawState* out);
+/* Non-zero when the frame that just reached vblank used two side-by-side draw
+ * areas. Presentation-only helpers use this to expand a local split-screen
+ * viewport without changing the underlying framebuffer or netplay hashes. */
+int  gpu_last_frame_vertical_split_screen(void);
+void gpu_vertical_split_debug(int *active, int *left_age, int *right_age);
 uint16_t gpu_vram_peek(int x, int y);
 
 typedef struct {
@@ -205,7 +226,7 @@ typedef struct {
     uint32_t ra;            /* guest $ra at issue: direct caller of the leaf GP0 helper */
     uint8_t  opcode;
     uint8_t  n_words;       /* total command length; >MAX means truncated */
-    uint16_t pad;
+    uint16_t ot_rank;       /* linked-list OT rank, 0xFFFF outside/unknown */
     uint32_t cmd[GPU_GP0_RING_MAX_WORDS];
     /* Effective draw environment for the packet. The environment is sampled
      * before the command executes; for draw packets this is the exact state
@@ -235,9 +256,22 @@ uint32_t gpu_gp0_ring_max_words(void);
 int      gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out);
 void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
 
-/* Vblank presentation callback — called from gpu_vblank_tick(). */
+/* Vblank presentation callback — called from gpu_vblank_tick().
+ * Under netplay the callback is deferred to gpu_vblank_flush_present() at
+ * BB / IRQ-check edges so finish_frame digests are not sampled mid-block.
+ * Flush also holds while sio_hold_present_for_card() so native save/load
+ * busy-waits are not interrupted by MotK-style BB-edge commit. */
 typedef void (*gpu_vblank_cb)(void);
 void gpu_set_vblank_callback(gpu_vblank_cb cb);
+void gpu_vblank_flush_present(void);
+void gpu_vblank_clear_deferred_present(void);
+/* Queue one deferred present (netplay RB resume when I_STAT already has
+ * VBlank — snap resync cleared the pending callback). */
+void gpu_vblank_arm_deferred_present(void);
+/* 1 while a netplay deferred present is armed (MotK CD54 VBlank hold). */
+int  gpu_vblank_present_pending(void);
+/* Clear flush_present reentrancy guard before longjmp (flush_resume). */
+void gpu_vblank_release_present_flush_guard(void);
 
 /* Present-time screen-colour model (see color_lut.h ScreenKind: 0=raw,
  * 1=crt, 2=composite, 3=trinitron). Config/launcher-driven; the PSX_SCREEN
@@ -265,6 +299,7 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
 /* [widescreen] full_2d: opt a pure-2D sprite game into the widescreen present
  * path (treat every in-game frame as gameplay, since it never tags 3D prims). */
 void gpu_ws_set_full_2d(int on);
+void gpu_ws_set_auto_ui_squash(int on);
 /* [widescreen.bg2d] Capcom 2D background tile-loop widen — hooked at the renderer's
  * column-count / start-tile-col / start-screen-x instructions. Identity at 4:3
  * and in the engine's 512 hi-res mode. */
@@ -272,13 +307,41 @@ void gpu_ws_bg2d_configure(uint32_t layer_base, uint32_t ring_base,
                            uint32_t map_size_addr, uint32_t layer_stride_addr,
                            uint32_t ring_cols, uint32_t layer_count,
                            uint32_t layer_struct_stride, uint32_t packet_cap);
+/* Some Capcom variants (MMX5/MMX6) can compose a layer's scroll with a parent
+ * selected by byte +0x52. MMX4's streamer always uses each layer's own scroll. */
+void gpu_ws_bg2d_set_parent_links(int on);
 int psx_ws_bg2d_cols(int base);
 int psx_ws_bg2d_startcol(int col, unsigned mask);
 int psx_ws_bg2d_startx(int x);
 int psx_ws_bg2d_stream_left(int x);
 int psx_ws_bg2d_stream_right(int x);
 int psx_ws_bg2d_undercap(int counter, int native_cap);
-/* Compatibility entry points for already-generated MMX6 sources. */
+/* MISNAMED, NOT MMX6-SPECIFIC, AND NOT SAFE TO DELETE (surveyed 2026-07-27).
+ *
+ * These read as "MMX6 compat shims" and the comment here used to say exactly
+ * that. They are not. They are the widescreen-2D entry points that the
+ * recompiler emits for ANY title with a [widescreen.bg2d] block, and live
+ * generated code in several non-MMX6 games links them today:
+ *
+ *   psx_ws_mmx6_bg_cols/startcol/startx/stream_left/stream_right
+ *       -> CrashBashRecomp, MegaManX5Recomp, TsumuRecomp (+ -release)
+ *   psx_ws_mmx6_bg_undercap (below, in gpu.c)
+ *       -> ApeEscapeRecomp, CrashBashRecomp, MegaManX4Recomp,
+ *          MegaManX5Recomp, TsumuRecomp, Vigilante8PSXRecomp, THPS2
+ *
+ * Each one forwards to its psx_ws_bg2d_* twin above, which is the real
+ * implementation. Only the NAME is historical: this began as MMX6 widescreen
+ * work and was generalised without renaming the emitted symbols.
+ *
+ * Deleting or renaming them breaks widescreen in every repo listed above, and
+ * a rename cannot be runtime-only: the names are emitted by
+ * recompiler/src/code_generator.cpp, which is in codegen_hash_sources.cmake,
+ * so changing it rolls the overlay cache tag and forces a regen + reshard of
+ * every title. That is the reason this is still called mmx6 in 2026.
+ *
+ * Verify before touching, don't trust this comment: grep the generated trees
+ * of the game repos for psx_ws_mmx6_bg_undercap and see who turns up.
+ */
 int psx_ws_mmx6_bg_cols(int base);
 int psx_ws_mmx6_bg_startcol(int col);
 int psx_ws_mmx6_bg_startx(int x);
@@ -292,6 +355,10 @@ void psx_ws_sprite_tag(struct CPUState* cpu);
  * by this; 0 when native-wide is inactive). */
 int  ws_native_wide_active(void);
 int  ws_nw_extra(void);
+int  ws_nw_present_width(void);
+void gpu_ws_set_netplay_local_viewport(int enabled, int slot);
+int  gpu_ws_netplay_local_viewport_base_x(void);
+int  gpu_ws_netplay_local_viewport_width(void);
 /* True when the current frame must present at native 4:3 (FMV video or a
  * full-2D menu/title screen), so the squash is suppressed and content drawn
  * pixel-native. The present path uses the same predicate to pillarbox. */
@@ -307,9 +374,14 @@ void gpu_ws_configure_native_cull(int enabled, int aspect_num, int aspect_den,
                                   int canonical_width, int canonical_height);
 void gpu_ws_set_cull_guard_pixels(int pixels);
 void gpu_ws_set_temporal_cull_guard_pixels(int pixels);
+/* Bias/range activation-window margin. This may include an additional
+ * resident-object lead while render/terrain paths retain psx_ws_x_margin(). */
+int  psx_ws_activation_margin(void);
+void gpu_ws_set_activation_guard_pixels(int pixels);
 void gpu_ws_set_explicit_cull_sites(const uint32_t *bias, int nbias,
                                     const uint32_t *slti, int nslti,
                                     const uint32_t *range, int nrange);
+void gpu_ws_set_slti_lower_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_negsub_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_vxrange_cull_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_depth_cull_sites(const uint32_t *sites, int nsites);
@@ -318,8 +390,30 @@ void gpu_ws_set_xclip_load_sites(const uint32_t *sites, int nsites);
 void gpu_ws_set_semantic_cull_sites(const uint32_t *addresses,
                                     const uint8_t *semantics, int count);
 PsxWsCullSemantic psx_ws_semantic_cull_site(uint32_t pc);
+void gpu_ws_set_cull_keep_sites(const uint32_t *addresses,
+                                const uint32_t *expected,
+                                const uint32_t *results, int nsites);
+void gpu_ws_set_angle_sites(const uint32_t *addresses,
+                            const uint32_t *expected, int nsites);
+void gpu_ws_set_aspect_cone(const uint32_t *addresses,
+                            const uint32_t *expected,
+                            const uint32_t *cosine_thresholds,
+                            const uint32_t *object_regs,
+                            const uint32_t *x_regs,
+                            const uint32_t *z_regs,
+                            const uint32_t *y_regs,
+                            const uint32_t *queue_guards,
+                            int nsites,
+                            uint32_t forward_addr,
+                            uint32_t object_type_offset,
+                            uint32_t hysteresis_pixels,
+                            uint32_t queue_reserve,
+                            const uint32_t queue_count_addrs[3],
+                            const uint32_t queue_capacities[3],
+                            const uint32_t queue_type_masks[3]);
 int  psx_ws_is_cull_bias_site(uint32_t pc);
 int  psx_ws_is_cull_slti_site(uint32_t pc);
+int  psx_ws_is_cull_slti_lower_site(uint32_t pc);
 int  psx_ws_is_cull_negsub_site(uint32_t pc);
 int  psx_ws_is_cull_vxrange_site(uint32_t pc);
 int  psx_ws_is_cull_depth_site(uint32_t pc);
@@ -329,6 +423,16 @@ int  psx_ws_is_cull_plane_nx_site(uint32_t pc);
 int32_t  psx_ws_plane_nx(int32_t nx);
 int  psx_ws_is_cull_xclip_load_site(uint32_t pc);
 uint32_t psx_ws_xclip_bound(uint32_t vanilla);
+uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced);
+int psx_ws_cull_keep_site(uint32_t pc, uint32_t instr, uint32_t vanilla,
+                          uint32_t *out);
+uint32_t psx_ws_angle_widen(uint32_t vanilla);
+int psx_ws_angle_site(uint32_t pc, uint32_t instr, uint32_t *out);
+uint32_t psx_ws_aspect_cone_result(uint32_t site, uint32_t vanilla,
+                                   uint32_t object, int32_t x, int32_t z,
+                                   int32_t y);
+int psx_ws_aspect_cone_site(CPUState *cpu, uint32_t pc, uint32_t instr,
+                            uint32_t vanilla, uint32_t *out);
 /* Scale a signed Q16 horizontal gameplay limit into the active native-wide
  * game field. Identity at 4:3 / menus / FMV. */
 int32_t psx_ws_player_x_bound(int32_t vanilla);
@@ -345,6 +449,7 @@ int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
  * ws_cull_detect.h): right-edge widen for `slti v, minSX, W` and left-edge
  * widen for the paired `bltz maxSX` reject. Identity at 4:3. */
 int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);
+int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm);
 int  psx_ws_cull_bltz(uint32_t v);
 int  psx_ws_cull_vxrange(uint32_t x, uint32_t imm);
 /* True if a run of instruction words carries the screen-extent reject signature
@@ -362,11 +467,24 @@ int  psx_ws_is_cull_w_imm(uint32_t imm);
  * never opted in must never have its live code pattern-scanned and rewritten. */
 void gpu_ws_set_auto_hooks(int cull_on, int backdrop_on);
 int  psx_ws_auto_cull_on(void);
+/* Perspective-correct UV interpolation for textured world polygons
+ * ([video] perspective_texturing). Also turns on the SWC2 RAM-provenance
+ * tracking it needs, so a polygon only qualifies when every position word in
+ * its DMA packet was written by a GTE projection store. Default off. */
+void gpu_texture_correction_set(int enabled);
+int gpu_texture_correction_enabled(void);
+/* Triangles drawn with perspective-correct UVs since startup. */
+uint32_t gpu_texture_correction_hits(void);
 /* GTE-activity gameplay detector ([widescreen] gte_game_mode) for 3D titles
  * with no sprite-tag helper: gte.cpp notes every RTPS/RTPT projection; a frame
  * that projects enough vertices is stamped as gameplay. */
 void gpu_ws_set_gte_game_mode(int on);
+void gpu_ws_set_precise_nclip(int on);
 void psx_ws_note_gte_project(int nverts);
+/* Optional authoritative gameplay-state gate. When configured, it replaces
+ * heuristic gameplay classification for native-wide presentation. */
+void gpu_ws_set_gameplay_state_gate(uint32_t addr,
+                                    const uint32_t *values, int nvalues);
 /* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
  * outer-third screen-space HUD primitives out to the true wide-frame corners
  * (they otherwise sit inset by the reveal). Runtime-only. Off by default. */
@@ -375,6 +493,8 @@ void gpu_ws_set_nw_hud_corners(int on);
  * whose ordering-table packet lives in the configured half-open RAM range. */
 void gpu_ws_set_nw_left_hud_packet_range(uint32_t lo, uint32_t hi);
 void gpu_ws_begin_linked_list(void);
+void gpu_ws_end_linked_list(void);
+void gpu_ws_prepass_linked_list(uint32_t start_addr);
 /* Native-wide full-frame 2D backdrop stretch ([widescreen] nw_backdrop):
  * stretch a screen-space quad that covers the whole 4:3 framebuffer (sky
  * gradient / backdrop image) to fill the wide frame, so it no longer
@@ -452,6 +572,7 @@ typedef struct {
     int      game_mode;         /* tagged char/billboard prim within 2 frames */
     int      present_native_43; /* frame presents pillarboxed 4:3 (FMV/full-2D) */
     int      x_margin;          /* psx_ws_x_margin() right now */
+    int      activation_margin; /* psx_ws_activation_margin() right now */
     int      xnum, xden;        /* squash factor */
     int      mode;              /* 0 = off, 1 = squash, 2 = native-wide */
     int      nw_extra;          /* native-wide frame growth (display px), 0 if off */
@@ -463,8 +584,42 @@ typedef struct {
     uint32_t ovh_prims;         /* overhanging polys in the last completed frame */
     uint32_t last_ovh_frame;    /* newest SUSTAINED polygon-overhang frame (the
                                    2D-only-scene classifier's world signal) */
+    int      auto_ui_squash;     /* final-OT grouped UI correction configured */
+    int      auto_ui_dense;      /* current list classified as a dense menu */
+    uint32_t auto_ui_ot_rank;    /* highest populated UI rank in current list */
+    uint64_t auto_ui_candidates;
+    uint64_t auto_ui_transforms;
+    uint64_t aspect_cone_calls;
+    uint64_t aspect_cone_43_identity;
+    uint64_t aspect_cone_vanilla_keep;
+    uint64_t aspect_cone_visible_keep;
+    uint64_t aspect_cone_guard_keep;
+    uint64_t aspect_cone_hysteresis_keep;
+    uint64_t aspect_cone_outside_reject;
+    uint64_t aspect_cone_queue_reject;
+    uint32_t aspect_cone_queue_highwater[3];
+    uint64_t angle_calls;
+    uint64_t angle_43_identity;
+    uint32_t angle_max_vanilla;
+    uint32_t angle_max_widened;
 } GpuWsDebug;
 void gpu_ws_get_debug(GpuWsDebug* out);
+
+typedef struct {
+    uint32_t address;
+    uint64_t calls;
+    uint64_t identity_43;
+    uint64_t vanilla_keep;
+    uint64_t visible_keep;
+    uint64_t guard_keep;
+    uint64_t hysteresis_keep;
+    uint64_t outside_reject;
+    uint64_t queue_reject;
+} GpuWsAspectConeSiteDebug;
+/* Exact-site telemetry for separating actor-list and per-child participation
+ * predicates. Returns zero when address is not configured. */
+int gpu_ws_get_aspect_cone_site_debug(
+    uint32_t address, GpuWsAspectConeSiteDebug* out);
 
 /* Diagnostic: force psx_ws_x_margin() to return v (>=0) regardless of state,
  * or -1 to restore the normal computed margin. For live cull-margin sweeps. */

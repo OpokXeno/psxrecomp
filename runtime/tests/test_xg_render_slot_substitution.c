@@ -632,7 +632,7 @@ static int test_execution_failure_and_failed_guard_do_not_duplicate(void) {
     start_linked_dma(0x1a00u);
     fixture.fail_rollback = 1;
     dma_advance(16u);
-    CHECK(strcmp(fixture.events, "CTCRCCC") == 0);
+    CHECK(strcmp(fixture.events, "CTCR") == 0);
     CHECK(fixture.rollback_calls == 1u);
     CHECK(trace_count('C') == 0u);
     dma_debug_get_state(&dma_state);

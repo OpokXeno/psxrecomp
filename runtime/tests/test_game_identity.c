@@ -29,13 +29,25 @@ uint32_t i_mask;
 uint64_t psx_cycle_count;
 uint32_t g_psx_cyc_batch;
 uint32_t g_psx_cyc_batch_limit;
+uint32_t *g_psx_cyc_local_acc;
 int g_ls_replay_active;
 int g_event_step_conservative;
 int psx_in_device_service;
 uint64_t psx_next_service_cycle;
+uint32_t g_psx_icache_tv[1024];
+int g_psx_vram_dirty_tracking;
+
+static uint32_t s_cycles_since_vblank;
+static const uint64_t s_clean_vram_rows[8];
 
 void psx_devices_service_to_now(void) {}
 void psx_advance_cycles_slow(uint32_t cycles) { (void)cycles; }
+uint32_t interrupts_get_cycles_since_vblank(void) {
+    return s_cycles_since_vblank;
+}
+void interrupts_set_cycles_since_vblank(uint32_t value) {
+    s_cycles_since_vblank = value;
+}
 
 void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
                          uint16_t target[3], int32_t irq_line[3],
@@ -64,6 +76,14 @@ void spu_snapshot_write(uint8_t *out) { (void)out; }
 int spu_snapshot_read(const uint8_t *in, uint32_t len) { (void)in; return len == 0; }
 uint8_t *spu_get_ram_ptr(void) { return s_spuram; }
 uint32_t spu_get_ram_bytes(void) { return sizeof(s_spuram); }
+void spu_ram_copy_out(uint8_t *out, uint32_t len) {
+    if (out && len <= sizeof(s_spuram)) memcpy(out, s_spuram, len);
+}
+int spu_ram_copy_in(const uint8_t *in, uint32_t len) {
+    if (!in || len != sizeof(s_spuram)) return 0;
+    memcpy(s_spuram, in, len);
+    return 1;
+}
 uint32_t cdrom_snapshot_bytes(void) { return 0; }
 void cdrom_snapshot_write(uint8_t *out) { (void)out; }
 int cdrom_snapshot_read(const uint8_t *in, uint32_t len) { (void)in; return len == 0; }
@@ -73,6 +93,23 @@ int dma_snapshot_read(const uint8_t *in, uint32_t len) { (void)in; return len ==
 uint32_t sio_snapshot_bytes(void) { return 0; }
 void sio_snapshot_write(uint8_t *out) { (void)out; }
 int sio_snapshot_read(const uint8_t *in, uint32_t len) { (void)in; return len == 0; }
+uint32_t mdec_snapshot_bytes(void) { return 0; }
+void mdec_snapshot_write(uint8_t *out) { (void)out; }
+int mdec_snapshot_read(const uint8_t *in, uint32_t len) {
+    (void)in;
+    return len == 0;
+}
+
+const uint16_t *gpu_get_vram(void) { return NULL; }
+int gpu_vram_dirty_tracking(void) { return 0; }
+uint32_t gpu_vram_dirty_row_count(void) { return 0; }
+const uint64_t *gpu_vram_dirty_mask(void) { return s_clean_vram_rows; }
+int gpu_vram_dirty_verify_enabled(void) { return 0; }
+void gpu_vram_dirty_clear(void) {}
+
+void overlay_watch_invalidate_after_ram_restore(void) {}
+void gte_canonicalize_cpu_state(CPUState *cpu) { (void)cpu; }
+
 void gr_vram_transfer_in(int x, int y, int width, int height, const uint16_t *pixels) {
     (void)x;
     (void)y;

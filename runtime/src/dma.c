@@ -21,6 +21,7 @@
 #include "guest_render_native_stream.h"
 #include "mdec.h"
 #include "native_render_baseline.h"
+#include "mod_memory.h"
 #include "overlay_capture.h"
 #include "spu.h"
 #include "audio_trace.h"
@@ -790,7 +791,8 @@ static void dma2_feed_journal_command(
         };
         gpu_set_gp0_source(&source);
         gpu_write_gp0(words[i]);
-        word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+        word_addr = linked ? psx_mod_gpu_dma_resolve_address(word_addr + 4u)
+                           : ((word_addr + 4u) & DMA2_RAM_WORD_MASK);
     }
 }
 
@@ -927,9 +929,12 @@ static bool dma2_native_submit_sequence(
 
     if (!words || word_count == 0u) return false;
     for (word_offset = 0u; word_offset < word_count; ++word_offset) {
-        const uint32_t command_addr =
-            (uint32_t)((int64_t)start_addr +
-                       (int64_t)word_offset * addr_step) & DMA2_RAM_WORD_MASK;
+        const uint32_t command_addr = source_kind ==
+                GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST
+            ? psx_mod_gpu_dma_resolve_address((uint32_t)(
+                (int64_t)start_addr + (int64_t)word_offset * addr_step))
+            : (uint32_t)((int64_t)start_addr +
+                         (int64_t)word_offset * addr_step) & DMA2_RAM_WORD_MASK;
         GpuRenderOracleSource source;
         source.kind = source_kind;
         source.word_address = command_addr;
@@ -971,9 +976,12 @@ static bool dma2_native_preflight_sequence(
 
     while (word_offset < word_count) {
         size_t command_words;
-        const uint32_t command_addr = (uint32_t)(
-            (int64_t)start_addr + (int64_t)word_offset * addr_step) &
-            DMA2_RAM_WORD_MASK;
+        const uint32_t command_addr = source_kind ==
+                GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST
+            ? psx_mod_gpu_dma_resolve_address((uint32_t)(
+                (int64_t)start_addr + (int64_t)word_offset * addr_step))
+            : (uint32_t)((int64_t)start_addr +
+                         (int64_t)word_offset * addr_step) & DMA2_RAM_WORD_MASK;
         const GpuRenderOracleSource source = {
             source_kind, command_addr, command_addr / 4u,
             container_addr / 4u,
@@ -1030,7 +1038,7 @@ static bool dma2_native_preflight_block(
 }
 
 static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
-    uint32_t addr = start_addr;
+    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
     uint32_t cycle_anchor = addr;
     uint32_t cycle_power = 1u;
     uint32_t cycle_length = 0u;
@@ -1047,10 +1055,10 @@ static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
 
         if (num_words != 0u) {
             for (uint32_t index = 0u; index < num_words; ++index)
-                words[index] = psx_read_word(
-                    (addr + 4u + index * 4u) & DMA2_RAM_WORD_MASK);
+                words[index] = psx_read_word(psx_mod_gpu_dma_resolve_address(
+                    addr + 4u + index * 4u));
             valid = dma2_native_preflight_sequence(
-                words, num_words, (addr + 4u) & DMA2_RAM_WORD_MASK, 4,
+                words, num_words, psx_mod_gpu_dma_resolve_address(addr + 4u), 4,
                 GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, addr);
         }
         if (!valid) goto done;
@@ -1058,8 +1066,8 @@ static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
             result = true;
             break;
         }
-        if ((next & 3u) != 0u || next > DMA2_RAM_WORD_MASK) goto done;
-        addr = next;
+        if ((next & 3u) != 0u) goto done;
+        addr = psx_mod_gpu_dma_resolve_address(next);
         ++cycle_length;
         if (addr == cycle_anchor) goto done;
         if (cycle_length == cycle_power) {
@@ -1110,7 +1118,7 @@ static bool dma2_native_read_block(
 }
 
 static uint32_t dma2_execute_linked_list_native(uint32_t start_addr) {
-    uint32_t addr = start_addr;
+    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
     uint32_t actual_words = 0u;
     uint32_t safety = 0u;
     uint32_t cycle_anchor = addr;
@@ -1142,6 +1150,7 @@ static uint32_t dma2_execute_linked_list_native(uint32_t start_addr) {
         header = psx_read_word(addr);
         num_words = header >> 24u;
         next = header & UINT32_C(0x00ffffff);
+        gpu_set_gp0_linked_list_node(addr, num_words);
         if (actual_words > UINT32_MAX - num_words - 1u) {
             baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
             break;
@@ -1153,13 +1162,13 @@ static uint32_t dma2_execute_linked_list_native(uint32_t start_addr) {
             };
             native_render_baseline_ot_node(&node);
         }
-        word_addr = (addr + 4u) & DMA2_RAM_WORD_MASK;
+        word_addr = psx_mod_gpu_dma_resolve_address(addr + 4u);
         for (uint32_t index = 0u; index < num_words; ++index) {
             words[index] = psx_read_word(word_addr);
-            word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+            word_addr = psx_mod_gpu_dma_resolve_address(word_addr + 4u);
         }
         if (num_words != 0u && !dma2_native_submit_sequence(
-                 words, num_words, (addr + 4u) & DMA2_RAM_WORD_MASK, 4,
+                 words, num_words, psx_mod_gpu_dma_resolve_address(addr + 4u), 4,
                  GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, addr,
                  &command_count)) {
             baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
@@ -1170,11 +1179,11 @@ static uint32_t dma2_execute_linked_list_native(uint32_t start_addr) {
             result = actual_words;
             break;
         }
-        if ((next & 3u) != 0u || next > DMA2_RAM_WORD_MASK) {
+        if ((next & 3u) != 0u) {
             baseline_status = NATIVE_RENDER_BASELINE_OT_INVALID;
             break;
         }
-        addr = next;
+        addr = psx_mod_gpu_dma_resolve_address(next);
         ++cycle_length;
         if (addr == cycle_anchor) {
             baseline_status = NATIVE_RENDER_BASELINE_OT_CYCLIC;
@@ -1220,7 +1229,7 @@ static DMA2JournalBuildStatus dma2_append_journal_command(
 
 static DMA2JournalBuildStatus dma2_build_linked_list_journal(
         uint32_t start_addr, DMA2JournalStorage *storage) {
-    uint32_t addr = start_addr;
+    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
     uint32_t safety = 0u;
     uint32_t cycle_anchor = addr;
     uint32_t cycle_power = 1u;
@@ -1247,7 +1256,7 @@ static DMA2JournalBuildStatus dma2_build_linked_list_journal(
         storage->actual_words += 1u + num_words;
 
         if (num_words != 0u) {
-            uint32_t word_addr = (addr + 4u) & DMA2_RAM_WORD_MASK;
+            uint32_t word_addr = psx_mod_gpu_dma_resolve_address(addr + 4u);
             const size_t node_word_start = word_count;
             size_t node_word_offset = node_word_start;
             size_t node_word_end;
@@ -1257,15 +1266,14 @@ static DMA2JournalBuildStatus dma2_build_linked_list_journal(
                 return DMA2_JOURNAL_CAPACITY;
             for (uint32_t i = 0u; i < num_words; ++i) {
                 storage->words[word_count++] = psx_read_word(word_addr);
-                word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+                word_addr = psx_mod_gpu_dma_resolve_address(word_addr + 4u);
             }
             node_word_end = word_count;
             while (node_word_offset < node_word_end) {
                 size_t command_words;
                 size_t payload_index = node_word_offset - node_word_start;
-                uint32_t command_addr =
-                    (addr + 4u + (uint32_t)payload_index * 4u) &
-                    DMA2_RAM_WORD_MASK;
+                uint32_t command_addr = psx_mod_gpu_dma_resolve_address(
+                    addr + 4u + (uint32_t)payload_index * 4u);
                 DMA2JournalBuildStatus status =
                     dma2_gp0_command_word_count(
                         &storage->words[node_word_offset],
@@ -1286,9 +1294,9 @@ static DMA2JournalBuildStatus dma2_build_linked_list_journal(
             storage->final_madr = 0x00FFFFFFu;
             break;
         }
-        if ((next & 3u) != 0u || next > DMA2_RAM_WORD_MASK)
+        if ((next & 3u) != 0u)
             return DMA2_JOURNAL_MALFORMED_LINK;
-        addr = next;
+        addr = psx_mod_gpu_dma_resolve_address(next);
         storage->final_madr = addr;
         ++cycle_length;
         if (addr == cycle_anchor) return DMA2_JOURNAL_CYCLE;
@@ -1353,7 +1361,7 @@ static DMA2JournalBuildStatus dma2_build_block_journal(
 }
 
 static void dma2_record_valid_baseline(uint32_t start_addr) {
-    uint32_t addr = start_addr;
+    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
     uint32_t ordinal = 0u;
 
     /* Defer accounting until preflight succeeds so a fallback can run the
@@ -1368,13 +1376,13 @@ static void dma2_record_valid_baseline(uint32_t start_addr) {
         };
         native_render_baseline_ot_node(&node);
         if (next == 0xFFFFFFu) break;
-        addr = next;
+        addr = psx_mod_gpu_dma_resolve_address(next);
     }
     native_render_baseline_ot_end(NATIVE_RENDER_BASELINE_OT_VALID);
 }
 
 static uint32_t dma2_execute_linked_list_original(uint32_t start_addr) {
-    uint32_t addr = start_addr;
+    uint32_t addr = psx_mod_gpu_dma_resolve_address(start_addr);
     uint32_t actual_words = 0u;
     uint32_t safety = 0u;
     const uint64_t ot_trace_seq =
@@ -1395,8 +1403,9 @@ static uint32_t dma2_execute_linked_list_original(uint32_t start_addr) {
         uint32_t header = psx_read_word(addr);
         uint32_t num_words = (header >> 24) & 0xFFu;
         uint32_t next = header & 0xFFFFFFu;
-        uint32_t word_addr = (addr + 4u) & DMA2_RAM_WORD_MASK;
+        uint32_t word_addr = psx_mod_gpu_dma_resolve_address(addr + 4u);
         actual_words += 1u;
+        gpu_set_gp0_linked_list_node(addr, num_words);
         ot_trace_node(ot_trace_seq, addr, next, num_words, safety - 1u);
         if (collect_baseline) {
             NativeRenderBaselineOtNode node = {
@@ -1412,7 +1421,7 @@ static uint32_t dma2_execute_linked_list_original(uint32_t start_addr) {
             };
             gpu_set_gp0_source(&source);
             gpu_write_gp0(word);
-            word_addr = (word_addr + 4u) & DMA2_RAM_WORD_MASK;
+            word_addr = psx_mod_gpu_dma_resolve_address(word_addr + 4u);
         }
         actual_words += num_words;
 
@@ -1420,7 +1429,7 @@ static uint32_t dma2_execute_linked_list_original(uint32_t start_addr) {
             channels[2].madr = 0x00FFFFFFu;
             break;
         }
-        addr = next & DMA2_RAM_WORD_MASK;
+        addr = psx_mod_gpu_dma_resolve_address(next);
         if (collect_baseline) {
             ++cycle_length;
             if (addr == cycle_anchor) {
@@ -1463,7 +1472,7 @@ static bool dma2_native_submission_authoritative(void) {
 }
 
 static uint32_t dma2_execute_linked_list(void) {
-    uint32_t start_addr = channels[2].madr & DMA2_RAM_WORD_MASK;
+    uint32_t start_addr = psx_mod_gpu_dma_resolve_address(channels[2].madr);
     uint32_t actual_words = 0u;
     GuestRenderTransactionPendingSnapshot pending = {0};
     DMA2JournalStorage storage;
@@ -1478,7 +1487,6 @@ static uint32_t dma2_execute_linked_list(void) {
             psx_fatal_halt("Native OT preflight rejected an unauthenticated command");
             return 0u;
         }
-        gpu_ws_begin_linked_list();
         actual_words = dma2_execute_linked_list_native(start_addr);
         if (actual_words == 0u) {
             psx_fatal_halt(dma2_native_failure_reason[0] != '\0'
@@ -1493,7 +1501,6 @@ static uint32_t dma2_execute_linked_list(void) {
     if (pending_status == GUEST_RENDER_TRANSACTION_OK &&
         pending.binding_count != 0u)
         begin_vram_serial = gpu_render_vram_mutation_serial();
-    gpu_ws_begin_linked_list();
     if (pending_status != GUEST_RENDER_TRANSACTION_OK) {
         guest_render_transaction_clear_pending();
         return dma2_execute_linked_list_original(start_addr);
@@ -1735,7 +1742,12 @@ static uint32_t execute_ch2_gpu(void) {
 
         actual_words = dma2_execute_block(addr, total_words, addr_step);
     } else if (sync_mode == 2) {
+        uint32_t start_addr =
+            psx_mod_gpu_dma_resolve_address(channels[2].madr);
+        gpu_ws_begin_linked_list();
+        gpu_ws_prepass_linked_list(start_addr);
         actual_words = dma2_execute_linked_list();
+        gpu_ws_end_linked_list();
     } else {
         /* Burst mode (sync_mode == 0) */
         uint32_t word_count = channels[2].bcr & 0xFFFF;
@@ -1826,10 +1838,19 @@ static uint32_t execute_ch4_spu(void) {
         audio_trace_event(AUDIO_EV_DMA_WRITE, total_words,
                           channels[4].madr & 0x1FFFFCu);
     } else {
+        /* SPU RAM -> CPU RAM. This direction previously zero-filled the
+         * destination, which is not a transfer at all: SPU RAM is readable
+         * memory and games do read it back. Titles that carry state through
+         * SPU RAM across an Exec boundary (a checksummed block surviving an
+         * EXE swap, since SPU RAM is one of the few regions main RAM's reload
+         * does not touch) got zeros, failed their own integrity check, and
+         * fell back to a cold-boot path. */
         for (uint32_t i = 0; i < total_words; i++) {
-            psx_write_word(addr, 0);
+            psx_write_word(addr, spu_dma_read());
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
+        audio_trace_event(AUDIO_EV_DMA_READ, total_words,
+                          channels[4].madr & 0x1FFFFCu);
     }
 
     channels[4].madr = addr;
@@ -1859,6 +1880,36 @@ static void execute_ch6_otc(void) {
     }
 
     complete_transfer(6);
+}
+
+static void execute_ch5_pio(void) {
+    /* PIO (Parallel I/O) — used for expansion port / parallel port transfers.
+     * Very simple: just move words directly to/from RAM with no device interaction.
+     * Direction: 0 = to RAM (read from device), 1 = from RAM (write to device).
+     * For now, we just complete the transfer immediately as PIO devices are
+     * typically slow and the game handles timing via busy-wait on the port. */
+    uint32_t chcr = channels[5].chcr;
+    uint32_t direction = chcr & 1u;
+    uint32_t step = (chcr >> 1) & 1u;
+    uint32_t total_words = transfer_word_count(5);
+    uint32_t addr = channels[5].madr & 0x1FFFFCu;
+    int32_t addr_step = step ? -4 : 4;
+
+    if (direction == 1) {
+        /* from RAM to device: just read and discard */
+        for (uint32_t i = 0; i < total_words; i++) {
+            (void)psx_read_word(addr);
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+    } else {
+        /* to RAM from device: write zeros (device not emulated) */
+        for (uint32_t i = 0; i < total_words; i++) {
+            psx_write_word(addr, 0);
+            addr = (addr + addr_step) & 0x1FFFFCu;
+        }
+    }
+    channels[5].madr = addr;
+    complete_transfer(5);
 }
 
 static void try_execute(int ch) {
@@ -1912,6 +1963,9 @@ static void try_execute(int ch) {
         case 4:
             schedule_delayed_complete(4, execute_ch4_spu(),
                                       DMA_SPU_CYCLES_PER_WORD);
+            break;
+        case 5:
+            execute_ch5_pio();
             break;
         case 6:
             execute_ch6_otc();

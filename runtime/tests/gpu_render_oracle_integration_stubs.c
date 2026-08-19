@@ -244,6 +244,13 @@ void overlay_capture_before_dma(uint32_t load_addr, uint32_t size) {
     (void)size;
 }
 void spu_dma_write(uint32_t word) { (void)word; }
+uint32_t spu_dma_read(void) { return 0u; }
+void sio_card_handoff_on_imask(uint32_t old_mask, uint32_t new_mask) {
+    (void)old_mask;
+    (void)new_mask;
+}
+int sio_card_should_hold_imask_bit7(void) { return 0; }
+void psx_irq_refresh_cause_ip2(void) {}
 void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b) {
     (void)kind;
     (void)a;

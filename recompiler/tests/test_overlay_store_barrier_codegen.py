@@ -15,6 +15,8 @@ import tempfile
 
 
 LOAD = 0x80010000
+GAME_SHA256 = "12" * 32
+MANIFEST_SHA256 = "34" * 32
 
 
 def i_type(op, rs, rt, imm=0):
@@ -53,7 +55,9 @@ def generated_overlay_c(recompiler, tmp):
         f.write(f"0x{LOAD:08X}\n")
 
     result = subprocess.run(
-        [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay"],
+        [recompiler, psx, "--seeds", seeds, "--out-dir", out, "--overlay",
+         "--game-identity-sha256", GAME_SHA256,
+         "--manifest-digest-sha256", MANIFEST_SHA256],
         capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"recompiler failed:\n{result.stderr or result.stdout}")

@@ -36,6 +36,8 @@ static const uint32_t kModelPostSwc2Insn = 0xE8B60000u;
 static const uint32_t kSourcePreHook = PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE;
 static const uint32_t kSourceCommitHook = PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT;
 
+void psx_irq_set_cause_ptr(uint32_t *cause);
+
 uint8_t g_irq_cop2_test_ram[2u * 1024u * 1024u];
 #define s_ram g_irq_cop2_test_ram
 static uint32_t s_handler_epc;
@@ -66,6 +68,177 @@ uint32_t i_stat;
 uint32_t i_mask;
 int g_psx_call_bail;
 uint64_t s_frame_count;
+uint32_t *g_psx_cyc_local_acc;
+int g_overlay_capture_private_execution_enabled;
+
+void overlay_capture_private_note_execution(uint32_t pc) { (void)pc; }
+
+void psx_pgxp_load(CPUState *cpu, uint32_t insn, uint32_t address,
+                   uint32_t value) {
+    (void)cpu;
+    (void)insn;
+    (void)address;
+    (void)value;
+}
+
+void psx_pgxp_store(CPUState *cpu, uint32_t insn, uint32_t address,
+                    uint32_t value) {
+    (void)cpu;
+    (void)insn;
+    (void)address;
+    (void)value;
+}
+
+void psx_pgxp_alu(CPUState *cpu, uint32_t insn, uint32_t result,
+                  uint32_t source1, uint32_t source2) {
+    (void)cpu;
+    (void)insn;
+    (void)result;
+    (void)source1;
+    (void)source2;
+}
+
+void psx_pgxp_muldiv(CPUState *cpu, uint32_t insn, uint32_t hi,
+                     uint32_t lo, uint32_t source1, uint32_t source2) {
+    (void)cpu;
+    (void)insn;
+    (void)hi;
+    (void)lo;
+    (void)source1;
+    (void)source2;
+}
+
+void psx_pgxp_cop2(CPUState *cpu, uint32_t insn, uint32_t value,
+                   uint32_t address) {
+    (void)cpu;
+    (void)insn;
+    (void)value;
+    (void)address;
+}
+
+void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
+                       uint32_t packed) {
+    (void)x16;
+    (void)y16;
+    (void)sz3;
+    (void)packed;
+}
+
+int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16) {
+    (void)index;
+    (void)x16;
+    (void)y16;
+    return 0;
+}
+
+void pgxp_gte_reg_written(int reg, uint32_t value) {
+    (void)reg;
+    (void)value;
+}
+
+void pgxp_store_gte_reg(uint32_t address, uint8_t reg) {
+    (void)address;
+    (void)reg;
+}
+
+int gpu_ws_precise_nclip_enabled(void) { return 0; }
+
+PsxWsCullSemantic psx_ws_semantic_cull_site(uint32_t pc) {
+    (void)pc;
+    return PSX_WS_CULL_SEMANTIC_NONE;
+}
+
+int psx_ws_cull_keep_site(uint32_t pc, uint32_t insn, uint32_t vanilla,
+                          uint32_t *out) {
+    (void)pc;
+    (void)insn;
+    (void)vanilla;
+    (void)out;
+    return 0;
+}
+
+int psx_ws_angle_site(uint32_t pc, uint32_t insn, uint32_t *out) {
+    (void)pc;
+    (void)insn;
+    (void)out;
+    return 0;
+}
+
+int psx_ws_aspect_cone_site(CPUState *cpu, uint32_t pc, uint32_t insn,
+                            uint32_t vanilla, uint32_t *out) {
+    (void)cpu;
+    (void)pc;
+    (void)insn;
+    (void)vanilla;
+    (void)out;
+    return 0;
+}
+
+uint32_t psx_ws_guest_cull_screen_bias(uint32_t value, int32_t immediate) {
+    return value + (uint32_t)immediate;
+}
+
+int psx_ws_guest_cull_world_range(uint32_t value, int32_t immediate) {
+    return value < (uint32_t)immediate;
+}
+
+uint32_t psx_ws_guest_cull_left_edge(uint32_t bound) { return 0u - bound; }
+
+int psx_ws_guest_cull_masked_screen_x(uint32_t x, uint32_t bound) {
+    const uint32_t signed_bound =
+        (uint32_t)(int32_t)(int16_t)(uint16_t)bound;
+    return (x & 0xffffu) < signed_bound;
+}
+
+int32_t psx_ws_guest_cull_frustum_plane_x(int32_t nx) { return nx; }
+
+int psx_ws_guest_cull_signed_screen_x(int32_t value, int32_t immediate) {
+    return value < immediate;
+}
+
+int psx_ws_guest_cull_depth_signed(int32_t value, int32_t immediate) {
+    return value < immediate;
+}
+
+int psx_ws_guest_cull_depth_unsigned(uint32_t value, int32_t immediate) {
+    return value < (uint32_t)immediate;
+}
+
+uint32_t psx_ws_guest_cull_xclip_bound(uint32_t vanilla) { return vanilla; }
+int psx_ws_activation_margin(void) { return 0; }
+int psx_ws_is_cull_slti_lower_site(uint32_t pc) { (void)pc; return 0; }
+int psx_ws_cull_slti_lower(uint32_t value, uint32_t immediate) {
+    return (int32_t)value < (int32_t)(int16_t)(uint16_t)immediate;
+}
+
+uint32_t psx_xg_render_auth_cold_instruction_flags(
+    uint32_t pc, uint32_t instruction) {
+    (void)pc;
+    (void)instruction;
+    return 0u;
+}
+
+void psx_post_load_grace_tick(void) {}
+int psx_netplay_active(void) { return 0; }
+int psx_selfcheck_enabled(void) { return 0; }
+int psx_scheduler_top_level_resume_active(void) { return 0; }
+void gpu_vblank_flush_present(void) {}
+void sio_ape_card_unstick_pump(void) {}
+
+void psx_netplay_poll_snap(CPUState *cpu, uint32_t resume_pc) {
+    (void)cpu;
+    (void)resume_pc;
+}
+
+void psx_selfcheck_poll(CPUState *cpu, uint32_t resume_pc) {
+    (void)cpu;
+    (void)resume_pc;
+}
+
+void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc) {
+    (void)cpu;
+    (void)resume_pc;
+}
 
 static uint32_t test_read_word(uint32_t address) {
     uint32_t physical = address & 0x1FFFFFFFu;
@@ -158,6 +331,7 @@ static void prepare_irq_case(CPUState *cpu) {
     test_write_word(kCop2Pc, kNclipInsn);
 
     interrupts_init();
+    psx_irq_set_cause_ptr(&cpu->cop0[COP0_CAUSE]);
     psx_cycle_count = 0;
     s_gte_issue_count = 0;
     s_gte_issue_cycle = UINT64_MAX;
@@ -244,7 +418,8 @@ static int test_runtime_operations_emit_exact_source_observation_pairs(void) {
     cpu.gpr[3] = 0x80010000u;
     test_write_word(read_address, 0x80020000u);
     if (exec_one_fetched_observed(&cpu, kVariantReadPc & 0x1fffffffu,
-                                  kVariantReadInsn, &next_pc) != 0 ||
+                                  kVariantReadInsn,
+                                  PSX_XG_RENDER_COLD_SOURCE, &next_pc) != 0 ||
         cpu.gpr[3] != 0x80020000u) {
         fprintf(stderr, "HARNESS FAIL: selected read did not execute\n");
         return 0;
@@ -253,7 +428,7 @@ static int test_runtime_operations_emit_exact_source_observation_pairs(void) {
     cpu.gpr[16] = 0x80010200u;
     cpu.gpr[4] = 0x12345678u;
     if (exec_one_fetched_observed(&cpu, kVariantWritePc, kVariantWriteInsn,
-                                  &next_pc) != 0 ||
+                                  PSX_XG_RENDER_COLD_SOURCE, &next_pc) != 0 ||
         test_read_word(write_address) != 0x12345678u) {
         fprintf(stderr, "HARNESS FAIL: selected write did not execute\n");
         return 0;
@@ -262,7 +437,7 @@ static int test_runtime_operations_emit_exact_source_observation_pairs(void) {
     cpu.gpr[2] = swc2_address;
     cpu.gte_data[25] = 0x11223344u;
     if (exec_one_fetched_observed(&cpu, kVariantSwc2Pc, kVariantSwc2Insn,
-                                  &next_pc) != 0 ||
+                                  PSX_XG_RENDER_COLD_SOURCE, &next_pc) != 0 ||
         test_read_word(swc2_address) != gte_read_data(&cpu, 25u)) {
         fprintf(stderr, "HARNESS FAIL: selected SWC2 did not execute\n");
         return 0;
@@ -271,13 +446,15 @@ static int test_runtime_operations_emit_exact_source_observation_pairs(void) {
     cpu.gpr[2] = 0x80000000u;
     cpu.gpr[3] = 1u;
     if (exec_one_fetched_observed(&cpu, kVariantBucketPc, kVariantBucketInsn,
-                                  &next_pc) != 0 || cpu.gpr[2] != bucket_result) {
+                                  PSX_XG_RENDER_COLD_SOURCE, &next_pc) != 0 ||
+        cpu.gpr[2] != bucket_result) {
         fprintf(stderr, "HARNESS FAIL: selected bucket instruction did not execute\n");
         return 0;
     }
 
-    if (exec_one_fetched_observed(&cpu, kVariantReadPc + 0x100u,
-                                  kVariantReadInsn, &next_pc) != 0) {
+    cpu.gpr[3] = 0x80020000u;
+    if (exec_one_fetched_unobserved(&cpu, kVariantReadPc + 0x100u,
+                                    kVariantReadInsn, &next_pc) != 0) {
         fprintf(stderr, "HARNESS FAIL: foreign read did not execute\n");
         return 0;
     }
@@ -342,7 +519,8 @@ static int test_runtime_call_preserves_pre_capture_delay_commit_order(void) {
     test_write_word(kVariantCallPc + 4u, 0u);
     g_precise_mode = 1;
     const int transferred = exec_one_fetched_observed(
-        &cpu, kVariantCallPc, kVariantCallInsn, &next_pc);
+        &cpu, kVariantCallPc, kVariantCallInsn,
+        PSX_XG_RENDER_COLD_SOURCE | PSX_XG_RENDER_COLD_CAPTURE, &next_pc);
     g_precise_mode = saved_precise_mode;
 
     if (transferred != 1 || cpu.gpr[31] != kVariantCallPc + 8u ||
@@ -379,7 +557,8 @@ static int test_observe_after_sees_store_and_skips_lockstep_replay(void) {
     g_xg_render_native_cutover_call_count = 0u;
     g_xg_render_native_cutover_observed_word = 0u;
     if (exec_one_fetched_observed(
-            &cpu, kModelPostSwc2Pc, kModelPostSwc2Insn, &next_pc) != 0 ||
+            &cpu, kModelPostSwc2Pc, kModelPostSwc2Insn,
+            PSX_XG_RENDER_COLD_NATIVE_POST, &next_pc) != 0 ||
         test_read_word(packet_word) != UINT32_C(0x11223344) ||
         g_xg_render_native_cutover_call_count != 1u ||
         g_xg_render_native_cutover_observed_word != UINT32_C(0x11223344)) {

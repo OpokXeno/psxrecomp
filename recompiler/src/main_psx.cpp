@@ -21,6 +21,7 @@
 #include "config_loader.h"
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
+#include "write_if_changed.h"
 
 /* Baked emitter-source hash (recompiler/CMakeLists.txt custom command; same
  * hash_codegen.cmake + canonical source list as the runtime's overlay cache
@@ -118,6 +119,12 @@ int main(int argc, char** argv) {
         fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
         fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--overlay] [--source-observation-plan <file>] [--strict] [--inspect]\n", argv[0]);
         fmt::print("Example: {} SCUS_942.36 --seeds seeds/functions.txt --out-dir generated --strict\n", argv[0]);
+        fmt::print("\n");
+        fmt::print("  --project-root <dir>  Resolve the BIOS profile (bios/SCPH1001.toml, or\n");
+        fmt::print("                        <framework>/bios/SCPH1001.toml one level down) against\n");
+        fmt::print("                        <dir> instead of the CWD. Required whenever the caller\n");
+        fmt::print("                        cannot choose its own CWD — e.g. compile_overlays.py,\n");
+        fmt::print("                        which runs us with cwd = dirname(game.toml).\n");
     };
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -140,6 +147,17 @@ int main(int argc, char** argv) {
             fmt::print("{:08x}\n", (unsigned)PSX_OVERLAY_CODEGEN_HASH);
             return 0;
         }
+        if (std::string(argv[i]) == "--overlay-config-hash" && i + 1 < argc) {
+            try {
+                const auto cfg = PSXRecompV4::load_game_config(argv[i + 1]);
+                fmt::print("{:08x}\n",
+                           (unsigned)PSXRecompV4::overlay_codegen_config_hash(cfg));
+                return 0;
+            } catch (const std::exception& e) {
+                fmt::print(stderr, "overlay config hash failed: {}\n", e.what());
+                return 2;
+            }
+        }
     }
 
     fmt::print("PSXRecomp - PlayStation 1 Static Recompiler\n");
@@ -158,6 +176,15 @@ int main(int argc, char** argv) {
     // positional (no --config), so this is the channel for those sites.
     std::filesystem::path ws_config_path;
     std::filesystem::path source_observation_plan_path;
+    // --project-root <dir>: the directory to resolve the BIOS profile against
+    // when no explicit [recompiler] bios_config is in play. Without it the
+    // probe below uses the process CWD, which is wrong for every caller that
+    // cannot choose its own CWD — notably compile_overlays.py, which spawns us
+    // with cwd = dirname(game.toml). For a PACKAGED config (packaging/release/
+    // game.toml) that directory holds neither bios/SCPH1001.toml nor a vendored
+    // framework, so every shard died with "no BIOS profile found" and the whole
+    // overlay cache silently failed to build (issue #72).
+    std::filesystem::path project_root;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc) {
@@ -207,6 +234,23 @@ int main(int argc, char** argv) {
             }
         }
     }
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--project-root" && i + 1 < argc) { project_root = argv[i + 1]; break; }
+        if (a.rfind("--project-root=", 0) == 0) {
+            project_root = a.substr(std::string("--project-root=").size());
+            break;
+        }
+    }
+    if (!project_root.empty()) {
+        std::error_code prec;
+        if (!std::filesystem::is_directory(project_root, prec)) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: --project-root '{}' is not a directory\n",
+                project_root.string());
+            return 1;
+        }
+    }
 
     std::filesystem::path exe_path;
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
@@ -216,11 +260,14 @@ int main(int argc, char** argv) {
     bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
+    std::set<uint32_t>    mod_entry_funcs;      // trusted game-mod entry hooks
     std::set<uint32_t>    hot_funcs;            // [recompiler] hot_funcs
+    std::set<uint32_t>    load_charge_batch_funcs; // [recompiler] load_charge_batch*
     std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_cull_slti;         // [widescreen.cull] slti_sites
+    std::set<uint32_t>    ws_cull_slti_lower;   // [widescreen.cull] slti_lower_sites
     std::set<uint32_t>    ws_cull_bltz;         // [widescreen.cull] bltz_sites
     std::set<uint32_t>    ws_cull_negsub;       // [widescreen.cull] negsub_sites
     std::set<uint32_t>    ws_cull_vxrange;      // [widescreen.cull] vxrange_sites
@@ -228,6 +275,12 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
     std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
     std::map<uint32_t, PsxWsCullSemantic> ws_cull_semantic;
+    std::set<uint32_t>    ws_cull_nclip_keep;   // [widescreen.cull] nclip_keep_sites
+    std::set<uint32_t>    ws_cull_branch_keep;  // [widescreen.cull] branch_keep_sites
+    std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep;
+    std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle;
+    PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
+    int                   ws_cull_activation_guard_pixels = 0;
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
     std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };   // [widescreen.cull] screen_h_imms
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
@@ -261,7 +314,13 @@ int main(int argc, char** argv) {
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
+        mod_entry_funcs.insert(cfg.mod_function_entry_funcs.begin(),
+                               cfg.mod_function_entry_funcs.end());
         hot_funcs.insert(cfg.hot_funcs.begin(), cfg.hot_funcs.end());
+        if (cfg.load_charge_batch) {
+            load_charge_batch_funcs.insert(cfg.load_charge_batch_funcs.begin(),
+                                           cfg.load_charge_batch_funcs.end());
+        }
         if (cfg.vsync_query_func)
             vsync_query_hle_funcs[cfg.vsync_query_func] = {
                 cfg.vsync_counter_addr, cfg.vsync_gpustat_ptr_addr,
@@ -271,6 +330,8 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(cfg.ws_cull_screen_x_sites.begin(), cfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(cfg.ws_cull_slti_sites.begin(), cfg.ws_cull_slti_sites.end());
+        ws_cull_slti_lower.insert(cfg.ws_cull_slti_lower_sites.begin(),
+                                  cfg.ws_cull_slti_lower_sites.end());
         ws_cull_bltz.insert(cfg.ws_cull_bltz_sites.begin(), cfg.ws_cull_bltz_sites.end());
         ws_cull_negsub.insert(cfg.ws_cull_negsub_sites.begin(), cfg.ws_cull_negsub_sites.end());
         ws_cull_vxrange.insert(cfg.ws_cull_vxrange_sites.begin(), cfg.ws_cull_vxrange_sites.end());
@@ -303,6 +364,13 @@ int main(int argc, char** argv) {
                             PSX_WS_CULL_SEMANTIC_DEPTH_BOUND);
          add_semantic_sites(cfg.ws_cull_semantic_xclip_bound_sites,
                             PSX_WS_CULL_SEMANTIC_XCLIP_BOUND);
+        ws_cull_nclip_keep.insert(cfg.ws_cull_nclip_keep_sites.begin(), cfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_branch_keep.insert(cfg.ws_cull_branch_keep_sites.begin(), cfg.ws_cull_branch_keep_sites.end());
+        ws_cull_keep = cfg.ws_cull_keep_sites;
+        ws_cull_angle = cfg.ws_cull_angle_sites;
+        ws_aspect_cone = cfg.ws_aspect_cone;
+        ws_cull_activation_guard_pixels =
+            cfg.ws_cull_activation_guard_pixels;
         ws_cull_w_imms = cfg.ws_cull_w_imms;
         ws_cull_h_imms = cfg.ws_cull_h_imms;
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
@@ -351,6 +419,11 @@ int main(int argc, char** argv) {
                  * with psxrecomp-bios and project scripts. */
             } else if (arg == "--inspect") {
                 inspect_mode = true;
+            } else if (arg == "--project-root" && i + 1 < argc) {
+                /* Already parsed in the pre-scan above (the BIOS-profile probe
+                 * needs it before this loop runs). Consume the value here so it
+                 * is never mistaken for another flag's argument. */
+                ++i;
             } else if (arg == "--overlay") {
                 /* Overlay-compilation contract: this input is a runtime-captured
                  * overlay with execution evidence, so discovery is evidence-scoped
@@ -401,11 +474,15 @@ int main(int argc, char** argv) {
     if (!ws_config_path.empty()) {
         const auto wscfg = PSXRecompV4::load_game_config(ws_config_path);
         ws_tag_funcs.insert(wscfg.ws_sprite_tag_funcs.begin(), wscfg.ws_sprite_tag_funcs.end());
+        mod_entry_funcs.insert(wscfg.mod_function_entry_funcs.begin(),
+                               wscfg.mod_function_entry_funcs.end());
         ws_cull_bias.insert(wscfg.ws_cull_bias_sites.begin(), wscfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(wscfg.ws_cull_screen_x_sites.begin(), wscfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(wscfg.ws_cull_slti_sites.begin(), wscfg.ws_cull_slti_sites.end());
+        ws_cull_slti_lower.insert(wscfg.ws_cull_slti_lower_sites.begin(),
+                                  wscfg.ws_cull_slti_lower_sites.end());
         ws_cull_bltz.insert(wscfg.ws_cull_bltz_sites.begin(), wscfg.ws_cull_bltz_sites.end());
         ws_cull_negsub.insert(wscfg.ws_cull_negsub_sites.begin(), wscfg.ws_cull_negsub_sites.end());
         ws_cull_vxrange.insert(wscfg.ws_cull_vxrange_sites.begin(), wscfg.ws_cull_vxrange_sites.end());
@@ -438,6 +515,14 @@ int main(int argc, char** argv) {
                              PSX_WS_CULL_SEMANTIC_DEPTH_BOUND);
         merge_semantic_sites(wscfg.ws_cull_semantic_xclip_bound_sites,
                              PSX_WS_CULL_SEMANTIC_XCLIP_BOUND);
+        ws_cull_nclip_keep.insert(wscfg.ws_cull_nclip_keep_sites.begin(), wscfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_branch_keep.insert(wscfg.ws_cull_branch_keep_sites.begin(), wscfg.ws_cull_branch_keep_sites.end());
+        if (ws_cull_keep.empty()) ws_cull_keep = wscfg.ws_cull_keep_sites;
+        if (ws_cull_angle.empty()) ws_cull_angle = wscfg.ws_cull_angle_sites;
+        if (ws_aspect_cone.sites.empty())
+            ws_aspect_cone = wscfg.ws_aspect_cone;
+        ws_cull_activation_guard_pixels =
+            wscfg.ws_cull_activation_guard_pixels;
         ws_cull_w_imms = wscfg.ws_cull_w_imms;
         ws_cull_h_imms = wscfg.ws_cull_h_imms;
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
@@ -462,20 +547,41 @@ int main(int argc, char** argv) {
      * No profile -> fatal: there are no built-in windows. */
     static PSXRecompV4::BiosAddressModel s_bios_model;
     {
+        /* The directory the profile probe walks. --project-root when given,
+         * else the CWD (unchanged legacy behaviour). Named in every failure
+         * below, because "no BIOS profile found" without the directory it
+         * searched sends you looking for an unset key that is in fact set —
+         * or, worse, reads as a config error when it is a CWD error. */
+        const std::filesystem::path search_root =
+            project_root.empty() ? std::filesystem::path(".") : project_root;
+
         std::filesystem::path prof = bios_profile_path;
         /* An explicit bios_config that does not resolve is a different failure
          * from having none at all — say which, or the message sends you looking
-         * for an unset key that is in fact set. */
+         * for an unset key that is in fact set. A relative bios_config is
+         * documented as relative to the game project root, so resolve it there
+         * first when we were told what the root is; fall back to the bare path
+         * so callers that already relied on CWD keep working. */
         if (!prof.empty() && !std::filesystem::exists(prof)) {
-            fmt::print(stderr,
-                "psxrecomp-game: FATAL: [recompiler] bios_config = '{}' does "
-                "not exist (path is relative to the game project root)\n",
-                prof.string());
-            return 1;
+            std::filesystem::path rooted;
+            if (!project_root.empty() && prof.is_relative()) {
+                rooted = project_root / prof;
+            }
+            if (!rooted.empty() && std::filesystem::exists(rooted)) {
+                prof = rooted;
+            } else {
+                fmt::print(stderr,
+                    "psxrecomp-game: FATAL: [recompiler] bios_config = '{}' does "
+                    "not exist (path is relative to the game project root; "
+                    "searched '{}')\n",
+                    prof.string(),
+                    std::filesystem::absolute(search_root).string());
+                return 1;
+            }
         }
         if (prof.empty()) {
-            if (std::filesystem::exists("bios/SCPH1001.toml")) {
-                prof = "bios/SCPH1001.toml";          /* framework checkout */
+            if (std::filesystem::exists(search_root / "bios/SCPH1001.toml")) {
+                prof = search_root / "bios/SCPH1001.toml"; /* framework checkout */
             } else {
                 /* Game repo vendoring the framework. Do NOT assume the
                  * directory is named "psxrecomp": ApeEscapeRecomp vendors it as
@@ -485,7 +591,7 @@ int main(int argc, char** argv) {
                 std::vector<std::filesystem::path> found;
                 std::error_code ec;
                 for (const auto& de :
-                         std::filesystem::directory_iterator(".", ec)) {
+                         std::filesystem::directory_iterator(search_root, ec)) {
                     if (ec) break;
                     if (!de.is_directory(ec) || ec) continue;
                     auto cand = de.path() / "bios" / "SCPH1001.toml";
@@ -497,10 +603,12 @@ int main(int argc, char** argv) {
         }
         if (prof.empty()) {
             fmt::print(stderr,
-                "psxrecomp-game: FATAL: no BIOS profile found (set "
-                "[recompiler] bios_config in game.toml, or run from a root "
-                "containing bios/SCPH1001.toml or <framework>/bios/"
-                "SCPH1001.toml)\n");
+                "psxrecomp-game: FATAL: no BIOS profile found. Searched '{}' "
+                "for bios/SCPH1001.toml and <framework>/bios/SCPH1001.toml. "
+                "Fix by setting [recompiler] bios_config in game.toml, passing "
+                "--project-root <dir> (the framework or game-project root), or "
+                "running from a root that contains one of those paths.\n",
+                std::filesystem::absolute(search_root).string());
             return 1;
         }
         const auto bios_cfg = PSXRecompV4::load_bios_config(prof);
@@ -1309,14 +1417,19 @@ int main(int argc, char** argv) {
     codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
     codegen_config.data_shard_funcs = ds_funcs;
+    codegen_config.mod_function_entry_funcs = mod_entry_funcs;
     codegen_config.hot_funcs = hot_funcs;
+    codegen_config.load_charge_batch_funcs = load_charge_batch_funcs;
     codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
     codegen_config.ws_cull_screen_x_sites = ws_cull_screen_x;
+    codegen_config.ws_cull_activation_guard_pixels =
+        ws_cull_activation_guard_pixels;
     codegen_config.ws_cull_slti_sites  = ws_cull_slti;
+    codegen_config.ws_cull_slti_lower_sites = ws_cull_slti_lower;
     codegen_config.ws_cull_bltz_sites  = ws_cull_bltz;
     codegen_config.ws_cull_negsub_sites = ws_cull_negsub;
     codegen_config.ws_cull_vxrange_sites = ws_cull_vxrange;
@@ -1324,6 +1437,11 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
     codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
     codegen_config.ws_cull_semantic_sites = ws_cull_semantic;
+    codegen_config.ws_cull_nclip_keep_sites = ws_cull_nclip_keep;
+    codegen_config.ws_cull_branch_keep_sites = ws_cull_branch_keep;
+    codegen_config.ws_cull_keep_sites = ws_cull_keep;
+    codegen_config.ws_cull_angle_sites = ws_cull_angle;
+    codegen_config.ws_aspect_cone = ws_aspect_cone;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
@@ -1408,7 +1526,25 @@ int main(int argc, char** argv) {
             pos = hex_pos + 8;
         }
     }
-    if (dispatch_addrs.empty()) {
+    // Data/untranslatable entries are emitted as fail-closed
+    // psx_unknown_dispatch stubs. Do not put those stubs in the callable game
+    // dispatch table: a runtime overlay can legitimately replace the same EXE
+    // address, and a tiny stub range (especially a single NOP) can
+    // coincidentally byte-match the live overlay continuation. Advertising the
+    // stub as native-safe then turns valid dynamic code into a false fail-fast.
+    for (const auto& gen_func : codegen.last_gen_funcs()) {
+        if (gen_func.dispatchable) continue;
+        const std::string prefix = "func_";
+        if (gen_func.function_name.rfind(prefix, 0) != 0 ||
+            gen_func.function_name.size() < prefix.size() + 8) {
+            continue;
+        }
+        const std::string hex =
+            gen_func.function_name.substr(prefix.size(), 8);
+        dispatch_addrs.erase(
+            (uint32_t)std::strtoul(hex.c_str(), nullptr, 16));
+    }
+    if (dispatch_addrs.empty() && codegen.last_gen_funcs().empty()) {
         for (const auto& func : analysis_result.functions) {
             dispatch_addrs.insert(func.start_addr);
         }
@@ -1427,40 +1563,26 @@ int main(int argc, char** argv) {
         // would delete _full.c and leave only shards, breaking overlay compile
         // (no_output). Splitting a small overlay TU has no parallel-compile
         // benefit anyway.
-        std::ofstream full_file(output_filename);
-        if (full_file.is_open()) {
-            full_file << full_c_code;
-            full_file.close();
+        std::filesystem::path full_path(output_filename);
+        if (write_file_if_changed(full_path, full_c_code)) {
             fmt::print("✓ Saved overlay monolith to {}\n", output_filename.string());
         } else {
-            fmt::print(stderr, "⚠ Failed to write overlay monolith {}\n\n",
-                       output_filename.string());
+            fmt::print("✓ Overlay monolith unchanged ({})\n", output_filename.string());
         }
     } else {
-        // 1. Remove stale outputs: the old monolith and any previously
-        //    written shards (a shard count shrink must not leave orphans).
-        std::error_code rm_ec;
-        std::filesystem::remove(output_filename, rm_ec);
-        for (int stale = 0; stale < 256; stale++) {
-            std::filesystem::path stale_shard =
-                out_dir / fmt::format("{}_full_{:02d}.c", exe_stem, stale);
-            std::filesystem::remove(stale_shard, rm_ec);
-        }
-
-        // 2. Shared declarations header.
+        // 1. Shared declarations header (write-if-changed preserves Ninja mtimes).
         std::filesystem::path decls_filename = out_dir / (exe_stem + "_decls.h");
         {
-            std::ofstream decls_file(decls_filename);
-            if (decls_file.is_open()) {
-                decls_file << codegen.build_shared_decls_header(codegen.last_gen_funcs());
-                decls_file.close();
+            const std::string decls =
+                codegen.build_shared_decls_header(codegen.last_gen_funcs());
+            if (write_file_if_changed(decls_filename, decls)) {
                 fmt::print("✓ Saved shared decls header to {}\n", decls_filename.string());
             } else {
-                fmt::print(stderr, "⚠ Failed to write shared decls header\n\n");
+                fmt::print("✓ Shared decls header unchanged ({})\n", decls_filename.string());
             }
         }
 
-        // 3. Bucket generated functions into shards by cumulative line count.
+        // 2. Bucket generated functions into shards by cumulative line count.
         const int SHARD_LINE_BUDGET = 40000;
         const std::vector<PSXRecomp::GeneratedFunction>& gen_funcs_for_shards = codegen.last_gen_funcs();
         std::string decls_basename = exe_stem + "_decls.h";
@@ -1468,23 +1590,22 @@ int main(int argc, char** argv) {
         int shard_index = 0;
         int shard_lines = 0;
         int total_shard_lines = 0;
+        int shards_written = 0;
         std::stringstream shard_buf;
         auto flush_shard = [&]() {
             if (shard_buf.tellp() == std::streampos(0)) return;
             std::filesystem::path shard_filename =
                 out_dir / fmt::format("{}_full_{:02d}.c", exe_stem, shard_index);
-            std::ofstream shard_file(shard_filename);
-            if (shard_file.is_open()) {
-                shard_file << fmt::format(
-                    "/* Generated by PSXRecomp - full.c shard {}. DO NOT EDIT. */\n",
-                    shard_index);
-                shard_file << fmt::format("#include \"{}\"\n\n", decls_basename);
-                shard_file << shard_buf.str();
-                shard_file.close();
+            std::string body = fmt::format(
+                "/* Generated by PSXRecomp - full.c shard {}. DO NOT EDIT. */\n"
+                "#include \"{}\"\n\n{}",
+                shard_index, decls_basename, shard_buf.str());
+            if (write_file_if_changed(shard_filename, body)) {
                 fmt::print("✓ Saved shard {} ({} lines) to {}\n",
                            shard_index, shard_lines, shard_filename.string());
+                ++shards_written;
             } else {
-                fmt::print(stderr, "⚠ Failed to write shard {}\n\n", shard_index);
+                fmt::print("✓ Shard {} unchanged ({} lines)\n", shard_index, shard_lines);
             }
             total_shard_lines += shard_lines;
             shard_index++;
@@ -1502,8 +1623,19 @@ int main(int argc, char** argv) {
         }
         flush_shard();
 
-        fmt::print("✓ Wrote {} shards ({} total lines) for {}\n\n",
-                   shard_index, total_shard_lines, exe_stem);
+        // 3. Drop orphan shards / monolith after emit (shrink must not leave stale TUs).
+        {
+            std::error_code rm_ec;
+            std::filesystem::remove(output_filename, rm_ec);
+            for (int stale = shard_index; stale < 256; stale++) {
+                std::filesystem::path stale_shard =
+                    out_dir / fmt::format("{}_full_{:02d}.c", exe_stem, stale);
+                std::filesystem::remove(stale_shard, rm_ec);
+            }
+        }
+
+        fmt::print("✓ Wrote {} shards ({} total lines, {} updated) for {}\n\n",
+                   shard_index, total_shard_lines, shards_written, exe_stem);
     }
 
     // Per-function code-range manifest (design §8): consumed by the overlay
@@ -1514,11 +1646,11 @@ int main(int argc, char** argv) {
         : codegen.last_ranges_manifest();
     {
         std::filesystem::path ranges_filename = out_dir / (exe_stem + "_full.ranges");
-        std::ofstream rf(ranges_filename);
-        if (rf.is_open()) {
-            rf << ranges_manifest;
-            rf.close();
+        if (write_file_if_changed(ranges_filename, ranges_manifest)) {
             fmt::print("✓ Saved code-range manifest to {}\n\n",
+                      ranges_filename.string());
+        } else {
+            fmt::print("✓ Code-range manifest unchanged ({})\n\n",
                       ranges_filename.string());
         }
     }
@@ -1574,6 +1706,9 @@ int main(int argc, char** argv) {
             const auto& conts = codegen.cps_continuations();
             for (const auto& [cont, owner] : conts) {
                 if (dispatch_addrs.count(cont)) continue;
+                // A continuation owned by a fail-closed stub is no more
+                // executable than the stub entry itself.
+                if (!dispatch_addrs.count(owner)) continue;
                 records.push_back({cont, cont, owner, 0, 0});
             }
         }
@@ -1739,14 +1874,12 @@ int main(int argc, char** argv) {
             ds << "#endif\n";
         }
 
-        std::ofstream dispatch_file(dispatch_filename);
-        if (dispatch_file.is_open()) {
-            dispatch_file << ds.str();
-            dispatch_file.close();
+        if (write_file_if_changed(dispatch_filename, ds.str())) {
             fmt::print("✓ Dispatch table written ({} entries)\n\n",
                        dispatch_addrs.size());
         } else {
-            fmt::print(stderr, "⚠ Failed to write dispatch file\n\n");
+            fmt::print("✓ Dispatch table unchanged ({} entries)\n\n",
+                       dispatch_addrs.size());
         }
     }
 

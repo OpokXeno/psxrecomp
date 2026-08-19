@@ -1673,6 +1673,54 @@ on a fixed region -> next.
   The reverse-toggle case was also RED. Minimal fix: drain flat and textured
   queues only when mask-check changes, land pending uploads, and rebuild
   stencils only on enable. The test is now GREEN.
+- **2026-07-28 (per-game host audio cushion — implemented, parser validated):**
+  Added `[audio] buffer_ms` as a runtime-only developer setting with a guarded
+  30–500 ms range. The compatibility default remains 180 ms, preserving the
+  reserve required by titles with long streamed-stage production gaps; a game
+  may opt into a lower target after validation to reduce audible latency.
+  `audio_stats` and the opt-in runtime cadence report now expose both actual
+  fill and configured target. This changes only the host playback bridge and
+  does not alter guest SPU state, instruction timing, or code generation.
+  Recompiler build and all 33 registered tests pass.
+
+- **2026-07-27 (BIOS boot-skip parity across BIOS images — FIXED, validated):**
+  `bios_hle`'s boot-skip did nothing under the bundled OpenBIOS. Root cause was
+  ordering, not policy: `main.cpp` correctly forced the *kernel-call* tier off
+  when an image exports no `deliver_event_ret`, by assigning `bios_hle = false`,
+  and then derived `boot_skip` from that already-mutated flag. OpenBIOS omits
+  `deliver_event_ret` (B0 semantics unvalidated) but DOES export
+  `shell_entry_phys`, so the skip was structurally available and got cancelled
+  anyway — one player-facing flag meaning two different things depending on a
+  BIOS detail no player can see. Enhancement-phase (load-time) defect; no
+  timing-core change.
+  Fix: the two axes are now decided by one pure, dependency-free function,
+  `psx_bios_hle_plan()` (`runtime/src/bios_hle_plan.c`), which reads the
+  REQUESTED `bios_hle` for the boot decision and gates each axis on only the
+  anchor it actually needs; refusals are reported at startup instead of silently
+  downgrading. `psx_bios_hle_configure()` additionally clamps `boot_skip` to
+  `shell_entry_phys != 0` so the banner and `hle_dump` cannot overstate what can
+  fire. New `bios_hle_plan_test` (16/16 runtime ctest green) pins the matrix,
+  including an exhaustive 64-case sweep asserting the boot decision is
+  independent of `deliver_event_ret` and the call decision independent of
+  `shell_entry_phys`.
+  Validated on Ape Escape (SCUS-94423) built against this framework, both BIOS
+  backends linked, headless: OpenBIOS → `bios_boot=skip to game (shell
+  skipped)`, `hle_dump route=2` shows the one-shot fire at `vec 0x30000`,
+  `ra=0xBFC06EA8` (the exact continuation `bios/OpenBIOS.toml` documents),
+  game running on screen. Retail SCPH-1001 → same banner, same `vec 0x30000`
+  fire at `ra=0xBFC0702C`, game running; differs only in
+  `bios_backend=HLE (LLE fallback)` vs `LLE (recompiled BIOS)`. Negative control
+  `PSX_BIOS_HLE=0` on OpenBIOS → `bios_boot=real intro`, ring total 0 (hook not
+  installed), display 640x478 shell mode: the flag still turns the skip off.
+  Also in this pass: a BIOS profile's `[runtime]` block was parsed into
+  `BiosConfig::runtime` and read by NOTHING, and `bios/OpenBIOS.toml` carried an
+  inert `bios_hle = false` there that read as the reason HLE was off.
+  `load_bios_config` now REJECTS `[runtime]` in a BIOS profile. And
+  `psx_icache_fastpath_test` had been unbuildable ("redefinition of
+  `psx_advance_cycles`" — the test's counting stub vs the header's `static
+  inline`), which blocked every runtime test registered after it; it now builds
+  with `PSX_OVERLAY_DLL_BUILD=1`, the seam `psx_cycles.h` already provides.
+
 - **2026-07-21 (VLC load-charge batching — shipped; dual still ~22 ms):**
   Runtime-only batch: under `psx_next_service_cycle`, `psx_cyc_charge`
   accumulates into `g_psx_cyc_batch` (no per-insn `psx_cycle_count` store);
@@ -1750,7 +1798,7 @@ on a fixed region -> next.
   GUID if the dropdown index is stale.
 
 - **2026-07-20 (lobby default → public host):**
-  `psx_lobby_default_url` now `ws://netplay.technicallycomputers.ca:8765`
+  `psx_lobby_default_url` now `ws://netplay.retcomm.net:8765`
   (match SNES); override still `PSX_NET_LOBBY_URL`. Synced MotK vendored
   `psx_lobby_client.{c,h}` + recomp-net `docs/lobby.md`.
 
@@ -2014,7 +2062,7 @@ on a fixed region -> next.
   Proprietary `recomp-net-server` (Rust) owns WS lobby + privacy/docs;
   removed C `servers/lobby` from open `recomp-net`. Client WS helpers
   vendored at `runtime/src/lobby_ws/`. Default
-  `ws://netplay.technicallycomputers.ca:8765`.
+  `ws://netplay.retcomm.net:8765`.
 
 - **2026-07-19 (netplay lobby server + launcher menus):**
   Lobby WS+JSON owned by proprietary `recomp-net-server` (was C

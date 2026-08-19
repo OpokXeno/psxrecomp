@@ -327,7 +327,16 @@ static int source_textured_triangle_route(Route route, GpuRenderOracleEvent *eve
 static int same_draw_facts(const GpuRenderOracleEvent *left,
                            const GpuRenderOracleEvent *right) {
     return left->kind == right->kind && left->mutation == right->mutation &&
-           memcmp(&left->command, &right->command, sizeof(left->command)) == 0 &&
+           left->command.opcode == right->command.opcode &&
+           left->command.command_class == right->command.command_class &&
+           left->command.flags == right->command.flags &&
+           left->command.word_count == right->command.word_count &&
+           left->command.vertex_count == right->command.vertex_count &&
+           left->command.rectangle_count == right->command.rectangle_count &&
+           left->command.clut_x == right->command.clut_x &&
+           left->command.clut_y == right->command.clut_y &&
+           left->command.texture_page_x == right->command.texture_page_x &&
+           left->command.texture_page_y == right->command.texture_page_y &&
            memcmp(&left->draw, &right->draw, sizeof(left->draw)) == 0;
 }
 

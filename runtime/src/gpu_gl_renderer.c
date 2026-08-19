@@ -329,6 +329,9 @@ static uint16_t     *s_vram = NULL;       /* CPU VRAM array (gpu.c's storage) */
 static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) */
 
 static int           s_scale = 1;          /* internal-res scale (hr FBO) */
+/* Netplay: software VRAM is authoritative while GL mirrors every canonical
+ * draw at the requested presentation scale. */
+static int           s_cpu_auth_dual = 0;
 static int           s_req_scale = 1;      /* requested before context init */
 static int           s_scale_apply_pending = 0; /* set by glb_set_scale; consumed at next present */
 
@@ -352,8 +355,10 @@ static GLsync        s_interp_fence[3];
 static GLsync        s_interp_draw_fence = NULL;
 static GLint         s_interp_uPrev = -1, s_interp_uCurr = -1;
 static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
+static GLint         s_interp_uBlendMode = -1;
 static int           s_interp_enabled = 0, s_interp_valid = 0;
 static int           s_interp_suspended = 0;
+static int           s_interp_blend_mode = 0;
 static int           s_interp_prev = 0, s_interp_cur = 0;
 static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
 static int           s_interp_force_4_3 = 0, s_interp_source_path = -1;
@@ -411,11 +416,18 @@ static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 /* Programs. */
 static GLuint s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
 static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
-/* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
- * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch). */
-#define TEXV 19
+/* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1),
+ * limits(4), semi(1), perspective q(1). q == 0 keeps affine interpolation. */
+#define TEXV 20
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
+
+/* One-shot PGXP overrides for the next legacy triangle. Native semantic draws
+ * carry their precise positions directly and do not use this side channel. */
+static int s_pc_valid;
+static float s_pc_x[3], s_pc_y[3];
+static int s_pq_valid;
+static float s_pq[3];
 
 /* TEX program uniforms. */
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
@@ -977,6 +989,23 @@ static int s_last_dx, s_last_dy, s_last_dw, s_last_dh;
  * (and FPS) keep advancing — especially on a 2nd+ load of the same slot. */
 static int s_force_present_remaining = 0;
 
+/* Rollback/rewind hold-last. A drawable capture already contains the composed
+ * window image; a native capture is an uncomposed guest display band. */
+#define HOLD_NONE     0
+#define HOLD_DRAWABLE 1
+#define HOLD_NATIVE   2
+static int s_hold_kind = HOLD_NONE;
+static GLuint s_hold_tex = 0;
+static GLuint s_hold_fbo = 0;
+static int s_hold_tw = 0, s_hold_th = 0;
+static int s_hold_force_4_3 = 0;
+static int s_hold_linear = 0;
+
+/* Post-load freeze probe counters. */
+static uint64_t s_probe_skip = 0;
+static uint64_t s_probe_swap = 0;
+static uint64_t s_probe_dirty_marks = 0;
+
 /* A transaction renders into canonical VRAM while retaining one bounded
  * rollback checkpoint. READY keeps that checkpoint through private staging and
  * the one final default-framebuffer blit; non-canonical presents fail closed. */
@@ -1011,6 +1040,7 @@ typedef struct GlTransactionCheckpoint {
     int last_present_path;
     int last_dx, last_dy, last_dw, last_dh;
     int force_present_remaining;
+    uint64_t probe_skip, probe_swap, probe_dirty_marks;
 
     uint64_t coh_seq;
     uint64_t rt_up_diag[6];
@@ -1084,6 +1114,7 @@ static void present_dirty_rect(int x0, int y0, int x1, int y1, int set) {
     for (int ty = y0 / PRES_TILE; ty <= y1 / PRES_TILE; ty++) {
         if (set) s_present_dirty[ty] |= mask; else s_present_dirty[ty] &= ~mask;
     }
+    if (set) s_probe_dirty_marks++;
 }
 
 static int present_dirty_test(int x0, int y0, int x1, int y1) {
@@ -1100,6 +1131,77 @@ static int present_dirty_test(int x0, int y0, int x1, int y1) {
 static void present_force_consumed(void) {
     if (s_force_present_remaining > 0)
         s_force_present_remaining--;
+}
+
+static void hold_ensure_tex(int w, int h) {
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (!s_hold_tex) {
+        glGenTextures(1, &s_hold_tex);
+        p_glGenFramebuffers(1, &s_hold_fbo);
+    }
+    if (s_hold_tw == w && s_hold_th == h) return;
+    glBindTexture(GL_TEXTURE_2D, s_hold_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hold_fbo);
+    p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, s_hold_tex, 0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    s_hold_tw = w;
+    s_hold_th = h;
+}
+
+/* Copy a complete composed target. For FBO 0 this snapshots the backbuffer
+ * before SwapWindow; transaction staging can be captured after its swap. */
+static void hold_capture_drawable_target(GLuint source_fbo, int w, int h) {
+    if (!s_ctx || w < 1 || h < 1) return;
+    hold_ensure_tex(w, h);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source_fbo);
+    glReadBuffer(source_fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+    glBindTexture(GL_TEXTURE_2D, s_hold_tex);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    s_hold_kind = HOLD_DRAWABLE;
+    s_hold_force_4_3 = 0;
+    s_hold_linear = 0;
+}
+
+static void hold_capture_drawable(void) {
+    int ww = 0, wh = 0;
+    if (!s_ctx || !s_win) return;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    hold_capture_drawable_target(0, ww, wh);
+}
+
+/* Interpolation may own SwapWindow, so retain the immutable guest display band
+ * instead of attempting to read a concurrently-mutating drawable. */
+static void hold_capture_native_fbo(GLuint source_fbo, int x, int y,
+                                    int w, int h, int force_4_3, int linear) {
+    const int scale = s_scale > 0 ? s_scale : 1;
+    if (!s_ctx || !source_fbo || w < 1 || h < 1) return;
+    hold_ensure_tex(w * scale, h * scale);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_hold_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBlitFramebuffer(x * scale, y * scale,
+                        (x + w) * scale, (y + h) * scale,
+                        0, 0, w * scale, h * scale,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    s_hold_kind = HOLD_NATIVE;
+    s_hold_force_4_3 = force_4_3 ? 1 : 0;
+    s_hold_linear = linear ? 1 : 0;
+}
+
+static void hold_invalidate(void) {
+    s_hold_kind = HOLD_NONE;
 }
 
 static void coh_record(int kind, int x0, int y0, int x1, int y1) {
@@ -1604,8 +1706,18 @@ static const char *PRESENT_FS =
 static const char *INTERP_FS =
     "#version 330\n"
     "in vec2 v_uv; uniform sampler2D u_prev; uniform sampler2D u_curr;\n"
-    "uniform float u_alpha; out vec4 frag;\n"
-    "void main(){ frag=mix(texture(u_prev,v_uv),texture(u_curr,v_uv),u_alpha); }\n";
+    "uniform float u_alpha; uniform int u_blend_mode; out vec4 frag;\n"
+    "void main(){\n"
+    "  vec4 prev=texture(u_prev,v_uv), curr=texture(u_curr,v_uv);\n"
+    "  float alpha=u_alpha;\n"
+    "  if(u_blend_mode==1){\n"
+    "    vec3 d=abs(prev.rgb-curr.rgb);\n"
+    "    float change=max(max(d.r,d.g),d.b);\n"
+    "    float safe_blend=1.0-smoothstep(0.08,0.20,change);\n"
+    "    alpha=mix(step(0.5,u_alpha),u_alpha,safe_blend);\n"
+    "  }\n"
+    "  frag=mix(prev,curr,alpha);\n"
+    "}\n";
 
 /* Geometry: position in VRAM pixels (draw offset already applied by gpu.c),
  * color rgb in 0..1, color a = mask bit (0/1). The clip transform is in
@@ -1685,15 +1797,18 @@ static const char *TEX_VS =
     "layout(location=6) in float a_raw;\n"
     "layout(location=7) in vec4 a_limits;\n"
     "layout(location=8) in float a_semi;\n"
+    "layout(location=9) in float a_q;\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
-    "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
+    "noperspective out vec2 v_uv; smooth out vec2 v_uv_p;\n"
+    "noperspective out vec4 v_col; flat out int v_persp;\n"
     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
-    "void main(){ v_uv = a_uv; v_col = a_col;\n"
+    "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;\n"
+    "  v_persp = a_q > 0.0 ? 1 : 0;\n"
     "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
     "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
     "  v_semi = int(a_semi + 0.5);\n"
@@ -1706,10 +1821,14 @@ static const char *TEX_VS =
     "    float l = u_xcenter - h, r = u_xcenter + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
     "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
-    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  float w = a_q > 0.0 ? 1.0/a_q : 1.0;\n"
+    "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0,\n"
+    "                  (a_pos.y+u_shift)/256.0 - 1.0);\n"
+    "  gl_Position = vec4(ndc*w, 0.0, w); }\n";
 static const char *TEX_FS =
     "#version 330\n"
-    "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+    "noperspective in vec2 v_uv; smooth in vec2 v_uv_p;\n"
+    "noperspective in vec4 v_col; flat in int v_persp;\n"
     "out vec4 frag; out vec4 blend_factor;\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
@@ -1754,9 +1873,10 @@ static const char *TEX_FS =
     "  return vec3(col5i(raw)) / 31.0;\n"
     "}\n"
     "void main(){\n"
+    "  vec2 uv = v_persp != 0 ? v_uv_p : v_uv;\n"
     "  int stp; vec3 rgb = vec3(0.0); ivec3 nearest5 = ivec3(0);\n"
     "  if (u_filter == 0) {\n"
-    "    int raw = fetch_texel(int(floor(v_uv.x)), int(floor(v_uv.y)));\n"
+    "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
     "    if (raw == 0) discard;\n"
     "    nearest5 = col5i(raw);\n"
     "    stp = (raw >> 15) & 1;\n"
@@ -1767,8 +1887,8 @@ static const char *TEX_FS =
     "     * its opacity with the colour renormalised — so prim edges and\n"
     "     * cutout borders keep their colour instead of dissolving into the\n"
     "     * transparent (black) neighbour and discarding whole edge columns. */\n"
-    "    int iu = int(floor(v_uv.x)), iv = int(floor(v_uv.y));\n"
-    "    float fx = v_uv.x - float(iu) - 0.5, fy = v_uv.y - float(iv) - 0.5;\n"
+    "    int iu = int(floor(uv.x)), iv = int(floor(uv.y));\n"
+    "    float fx = uv.x - float(iu) - 0.5, fy = uv.y - float(iv) - 0.5;\n"
     "    int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;\n"
     "    fx = abs(fx); fy = abs(fy);\n"
     "    int c00 = fetch_texel(iu, iv);\n"
@@ -2362,6 +2482,10 @@ static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
 /* ---- coherency: GPU -> CPU readback -------------------------------------- */
 static void ensure_cpu(void) {
     if (!s_raster_ok || !s_gpu_dirty) return;
+    if (s_cpu_auth_dual) {
+        s_gpu_dirty = 0;
+        return;
+    }
     flush_flat_batch();
     flush_tex_batch();   /* realise queued textured draws before reading the FBO back */
     flush_cpu_upload();
@@ -2397,7 +2521,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
     if (x1 > s_area_x2) x1 = s_area_x2;
     if (y1 > s_area_y2) y1 = s_area_y2;
     rect_add(&s_pack_dirty, x0, y0, x1, y1);
-    s_gpu_dirty = 1;
+    if (!s_cpu_auth_dual) s_gpu_dirty = 1;
     coh_record(GL_COH_DRAW, x0, y0, x1, y1);
 }
 
@@ -2974,6 +3098,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
+            vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
@@ -3124,7 +3249,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
     if (w2 && h2) fill_segment(0, 0, w2, h2, r, g, b);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
-    s_gpu_dirty = 1;
+    if (!s_cpu_auth_dual) s_gpu_dirty = 1;
     coh_record(GL_COH_FILL, x, y, x + w - 1, y + h - 1);
 }
 
@@ -3259,7 +3384,8 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     }
     hr_end();
 
-    if (!native_target && !midpoint_target) s_gpu_dirty = 1;
+    if (!native_target && !midpoint_target && !s_cpu_auth_dual)
+        s_gpu_dirty = 1;
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
@@ -3268,6 +3394,8 @@ static void glb_init(uint16_t *vram) {
         GL_NATIVE_MIDPOINT_RESET_INITIALIZE);
     s_vram = vram;
     s_dither = 0;
+    s_pc_valid = 0;
+    s_pq_valid = 0;
     sw_renderer_init(vram);
 }
 
@@ -3316,6 +3444,33 @@ static void glb_set_texture_window(uint32_t r) {
     sw_set_texture_window(r);
 }
 static void glb_set_color_modulation(int r,int g,int b,int raw) { s_mod_r=r; s_mod_g=g; s_mod_b=b; s_mod_raw=raw; sw_set_color_modulation(r,g,b,raw); }
+static void glb_set_precise_triangle(int enabled,
+                                     int32_t x0, int32_t y0,
+                                     int32_t x1, int32_t y1,
+                                     int32_t x2, int32_t y2) {
+    s_pc_valid = enabled ? 1 : 0;
+    if (s_pc_valid) {
+        s_pc_x[0] = (float)x0 / 65536.0f;
+        s_pc_y[0] = (float)y0 / 65536.0f;
+        s_pc_x[1] = (float)x1 / 65536.0f;
+        s_pc_y[1] = (float)y1 / 65536.0f;
+        s_pc_x[2] = (float)x2 / 65536.0f;
+        s_pc_y[2] = (float)y2 / 65536.0f;
+    }
+    sw_set_precise_triangle(enabled, x0, y0, x1, y1, x2, y2);
+}
+static void glb_set_perspective_triangle(int enabled,
+                                         float q0, float q1, float q2) {
+    s_pq_valid = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    s_pq[0] = q0;
+    s_pq[1] = q1;
+    s_pq[2] = q2;
+    sw_set_perspective_triangle(enabled, q0, q1, q2);
+}
+static void glb_precise_consumed(void) {
+    s_pc_valid = 0;
+    s_pq_valid = 0;
+}
 static void glb_set_dither(int enabled) {
     int next = enabled ? 1 : 0;
     if (next != s_dither) {
@@ -3346,49 +3501,92 @@ static uint32_t glb_rgb555_to_rgb888(uint16_t color) {
            ((uint32_t)(color & 0x7c00) << 9);
 }
 
+static int glb_cpu_auth_draw(void) {
+    return s_cpu_auth_dual && !s_native_view_pass && !s_midpoint_pass_fbo;
+}
+
 /* Pre-context draws (s_raster_ok == 0) fall back to the software rasterizer
  * over CPU VRAM; the initial full-VRAM upload at context init folds them in.
  * Post-init, the GPU pipeline is all-or-nothing — no per-prim fallback. */
 static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
-    if (!s_raster_ok) { sw_draw_flat_triangle(x0,y0,x1,y1,x2,y2,col); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_flat_triangle(x0,y0,x1,y1,x2,y2,col);
+    if (!s_raster_ok) {
+        glb_precise_consumed();
+        return;
+    }
     uint32_t color = glb_rgb555_to_rgb888(col);
-    gpu_triangle(x0,y0,color, x1,y1,color, x2,y2,color,
-                 s_semi_en?s_semi_mode:-1, 0);
+    uint32_t colors[3] = { color, color, color };
+    if (s_pc_valid)
+        gpu_triangle_subpixel(s_pc_x, s_pc_y, colors,
+                              s_semi_en?s_semi_mode:-1, 0);
+    else
+        gpu_triangle(x0,y0,color, x1,y1,color, x2,y2,color,
+                     s_semi_en?s_semi_mode:-1, 0);
+    glb_precise_consumed();
 }
 static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int x2,int y2,uint16_t c2) {
-    if (!s_raster_ok) { sw_draw_gouraud_triangle(x0,y0,c0,x1,y1,c1,x2,y2,c2); return; }
-    gpu_triangle(x0,y0,glb_rgb555_to_rgb888(c0),
-                 x1,y1,glb_rgb555_to_rgb888(c1),
-                 x2,y2,glb_rgb555_to_rgb888(c2),
-                 s_semi_en?s_semi_mode:-1, s_dither);
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_gouraud_triangle(x0,y0,c0,x1,y1,c1,x2,y2,c2);
+    if (!s_raster_ok) {
+        glb_precise_consumed();
+        return;
+    }
+    uint32_t colors[3] = { glb_rgb555_to_rgb888(c0),
+                           glb_rgb555_to_rgb888(c1),
+                           glb_rgb555_to_rgb888(c2) };
+    if (s_pc_valid)
+        gpu_triangle_subpixel(s_pc_x, s_pc_y, colors,
+                              s_semi_en?s_semi_mode:-1, s_dither);
+    else
+        gpu_triangle(x0,y0,colors[0], x1,y1,colors[1], x2,y2,colors[2],
+                     s_semi_en?s_semi_mode:-1, s_dither);
+    glb_precise_consumed();
 }
 static void glb_draw_flat_triangle_rgb888(int x0,int y0,int x1,int y1,
                                            int x2,int y2,uint32_t color) {
-    if (!s_raster_ok) {
+    if (glb_cpu_auth_draw() || !s_raster_ok)
         sw_draw_flat_triangle(x0,y0,x1,y1,x2,y2,
                               (uint16_t)(((color >> 3) & 0x1f) |
                               ((color >> 6) & 0x03e0) |
                               ((color >> 9) & 0x7c00)));
+    if (!s_raster_ok) {
+        glb_precise_consumed();
         return;
     }
-    gpu_triangle(x0,y0,color, x1,y1,color, x2,y2,color,
-                 s_semi_en?s_semi_mode:-1, 0);
+    uint32_t colors[3] = { color, color, color };
+    if (s_pc_valid)
+        gpu_triangle_subpixel(s_pc_x, s_pc_y, colors,
+                              s_semi_en?s_semi_mode:-1, 0);
+    else
+        gpu_triangle(x0,y0,color, x1,y1,color, x2,y2,color,
+                     s_semi_en?s_semi_mode:-1, 0);
+    glb_precise_consumed();
 }
 static void glb_draw_gouraud_triangle_rgb888(int x0,int y0,uint32_t c0,
                                               int x1,int y1,uint32_t c1,
                                               int x2,int y2,uint32_t c2) {
-    if (!s_raster_ok) {
+    if (glb_cpu_auth_draw() || !s_raster_ok)
         sw_draw_gouraud_triangle(
             x0,y0,(uint16_t)(((c0 >> 3) & 0x1f) | ((c0 >> 6) & 0x03e0) | ((c0 >> 9) & 0x7c00)),
             x1,y1,(uint16_t)(((c1 >> 3) & 0x1f) | ((c1 >> 6) & 0x03e0) | ((c1 >> 9) & 0x7c00)),
             x2,y2,(uint16_t)(((c2 >> 3) & 0x1f) | ((c2 >> 6) & 0x03e0) | ((c2 >> 9) & 0x7c00)));
+    if (!s_raster_ok) {
+        glb_precise_consumed();
         return;
     }
-    gpu_triangle(x0,y0,c0, x1,y1,c1, x2,y2,c2,
-                 s_semi_en?s_semi_mode:-1, s_dither);
+    uint32_t colors[3] = { c0, c1, c2 };
+    if (s_pc_valid)
+        gpu_triangle_subpixel(s_pc_x, s_pc_y, colors,
+                              s_semi_en?s_semi_mode:-1, s_dither);
+    else
+        gpu_triangle(x0,y0,c0, x1,y1,c1, x2,y2,c2,
+                     s_semi_en?s_semi_mode:-1, s_dither);
+    glb_precise_consumed();
 }
 static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
-    if (!s_raster_ok) { sw_fill_rect(x,y,w,h,c); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok) sw_fill_rect(x,y,w,h,c);
+    if (!s_raster_ok) return;
     gpu_fill(x,y,w,h,c);
 }
 static void glb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
@@ -3401,46 +3599,72 @@ static void glb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
      * so this can always go through the normal GPU-side copy path (correct
      * masking, command ordering, and no stale-CPU-mirror special case). */
     depth24_upload_policy();
-    if (!s_raster_ok) { sw_copy_rect(sx,sy,dx,dy,w,h); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_copy_rect(sx,sy,dx,dy,w,h);
+    if (!s_raster_ok) return;
     gpu_copy_rect(sx,sy,dx,dy,w,h);
 }
 static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp){
-    if (!s_raster_ok) { sw_draw_textured_triangle(x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_textured_triangle(x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp);
+    if (!s_raster_ok) {
+        glb_precise_consumed();
+        return;
+    }
     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
     gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw,
                           s_semi_en?s_semi_mode:-1,
-                          s_dither && !s_mod_raw, NULL, NULL, NULL);
+                          s_dither && !s_mod_raw, NULL,
+                          s_pc_valid ? s_pc_x : NULL,
+                          s_pc_valid ? s_pc_y : NULL);
+    glb_precise_consumed();
 }
 static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){
-    if (!s_raster_ok) { sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw);
+    if (!s_raster_ok) {
+        glb_precise_consumed();
+        return;
+    }
     int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
     uint32_t cc[3]={c0,c1,c2}; float col[9];
     for (int i=0;i<3;i++){ col[i*3+0]=(cc[i]&0xFF)/255.0f; col[i*3+1]=((cc[i]>>8)&0xFF)/255.0f; col[i*3+2]=((cc[i]>>16)&0xFF)/255.0f; }
     gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw,
                           s_semi_en?s_semi_mode:-1,
-                          s_dither && !raw, NULL, NULL, NULL);
+                          s_dither && !raw, NULL,
+                          s_pc_valid ? s_pc_x : NULL,
+                          s_pc_valid ? s_pc_y : NULL);
+    glb_precise_consumed();
 }
 static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
-    if (!s_raster_ok) { sw_draw_flat_rect(x,y,w,h,c); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok) sw_draw_flat_rect(x,y,w,h,c);
+    if (!s_raster_ok) return;
     gpu_flat_rect(x,y,w,h,c, s_semi_en?s_semi_mode:-1);
 }
 static void glb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){
-    if (!s_raster_ok) { sw_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp);
+    if (!s_raster_ok) return;
     gpu_textured_rect(x,y,w,h, u,v, u+w,v+h, cx,cy,tp, s_semi_en?s_semi_mode:-1);
 }
 static void glb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,int u1,int v1,uint16_t cx,uint16_t cy,uint16_t tp){
-    if (!s_raster_ok) { sw_draw_textured_rect_scaled(x,y,w,h,u0,v0,u1,v1,cx,cy,tp); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_textured_rect_scaled(x,y,w,h,u0,v0,u1,v1,cx,cy,tp);
+    if (!s_raster_ok) return;
     gpu_textured_rect(x,y,w,h, u0,v0, u1,v1, cx,cy,tp, s_semi_en?s_semi_mode:-1);
 }
 static void glb_draw_line(int x0,int y0,int x1,int y1,uint16_t c){
-    if (!s_raster_ok) { sw_draw_line(x0,y0,x1,y1,c); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok) sw_draw_line(x0,y0,x1,y1,c);
+    if (!s_raster_ok) return;
     uint32_t color = glb_rgb555_to_rgb888(c);
     gpu_line(x0,y0,color, x1,y1,color, s_semi_en?s_semi_mode:-1, s_dither);
 }
 static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1){
-    if (!s_raster_ok) { sw_draw_shaded_line(x0,y0,c0,x1,y1,c1); return; }
+    if (glb_cpu_auth_draw() || !s_raster_ok)
+        sw_draw_shaded_line(x0,y0,c0,x1,y1,c1);
+    if (!s_raster_ok) return;
     gpu_line(x0,y0,glb_rgb555_to_rgb888(c0),
              x1,y1,glb_rgb555_to_rgb888(c1),
              s_semi_en?s_semi_mode:-1, s_dither);
@@ -3471,6 +3695,24 @@ static int depth24_is_fb_transfer(int w, int h) {
     if (h >= fb_h - 8 && h <= fb_h + 16 && w >= (fb_w * 3) / 4) return 1;
     if ((int64_t)w * (int64_t)h >= ((int64_t)fb_w * fb_h) / 2) return 1;
     return 0;
+}
+
+static void depth24_mark_scanout_band(void) {
+    GpuDisplayInfo display;
+    int fb_w, fb_h, x0, y0, x1, y1;
+    if (!gpu_display_is_depth24()) return;
+    gpu_get_display_info(&display);
+    fb_w = (int)((display.width * 3u + 1u) / 2u);
+    fb_h = (int)display.height;
+    if (fb_w < 8) fb_w = 8;
+    if (fb_h < 1) fb_h = 1;
+    x0 = (int)(display.display_x & (VRAM_W - 1));
+    y0 = (int)(display.display_y & (VRAM_H - 1));
+    x1 = x0 + fb_w - 1;
+    y1 = y0 + fb_h - 1;
+    if (x1 >= VRAM_W) x1 = VRAM_W - 1;
+    if (y1 >= VRAM_H) y1 = VRAM_H - 1;
+    rect_add(&s_d24_skip_fb, x0, y0, x1, y1);
 }
 
 /* Repaint the skipped-FB region with its real content instead of black-
@@ -3884,6 +4126,7 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, st, (void*)(13*sizeof(float))); p_glEnableVertexAttribArray(6); /* raw    */
         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
+        p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* q      */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);
@@ -4136,6 +4379,8 @@ int gl_renderer_init_context(SDL_Window *win) {
             s_interp_uCurr = p_glGetUniformLocation(s_interp_prog, "u_curr");
             s_interp_uAlpha = p_glGetUniformLocation(s_interp_prog, "u_alpha");
             s_interp_uUvRect = p_glGetUniformLocation(s_interp_prog, "u_uv_rect");
+            s_interp_uBlendMode =
+                p_glGetUniformLocation(s_interp_prog, "u_blend_mode");
             glGenTextures(3, s_interp_tex);
             for (int i = 0; i < 3; i++) {
                 glBindTexture(GL_TEXTURE_2D, s_interp_tex[i]);
@@ -4284,6 +4529,11 @@ void gl_renderer_shutdown(void) {
     s_native_present_h = 0;
     s_depth24_skip_up = 0;
     rect_clear(&s_d24_skip_fb);
+    hold_invalidate();
+    s_hold_tex = 0;
+    s_hold_fbo = 0;
+    s_hold_tw = 0;
+    s_hold_th = 0;
 }
 
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
@@ -4360,10 +4610,12 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
      * framebuffer. */
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    hold_capture_drawable();
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(present_sequence);
+    s_probe_swap++;
     latency_ring_mark(LAT_SWAP_END);
     present_force_consumed();
     s_last_present_path = GL_PRES_CPU;
@@ -4430,10 +4682,12 @@ int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
         pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    hold_capture_drawable();
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(present_sequence);
+    s_probe_swap++;
     latency_ring_mark(LAT_SWAP_END);
     present_force_consumed();
     s_last_present_path = GL_PRES_CPU;
@@ -4462,10 +4716,12 @@ void gl_renderer_present_blank(void) {
      * default framebuffer regardless of the path's prior state. */
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    hold_capture_drawable();
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(present_sequence);
+    s_probe_swap++;
     latency_ring_mark(LAT_SWAP_END);
     present_force_consumed();
     s_last_present_path = GL_PRES_BLANK;
@@ -4484,9 +4740,68 @@ void gl_renderer_invalidate_present(void) {
         s_native_view_seeded[i] = 0;
     s_last_present_path = -1;
     s_force_present_remaining = 8;
+    hold_invalidate();
     interp_reset_history();
     gl_renderer_native_midpoint_reset_for_reason(
         GL_NATIVE_MIDPOINT_RESET_INVALIDATE_PRESENT);
+}
+
+void gl_renderer_restage_vram_after_savestate(void) {
+    if (!s_raster_ok || !s_vram) return;
+    s_up_nrects = 0;
+    rect_clear(&s_d24_skip_fb);
+    s_depth24_skip_up = 0;
+    up_add_transfer(0, 0, VRAM_W, VRAM_H);
+    flush_cpu_upload();
+    if (gpu_display_is_depth24()) {
+        s_depth24_skip_up = 1;
+        depth24_mark_scanout_band();
+    }
+    if (s_cpu_auth_dual) s_gpu_dirty = 0;
+}
+
+void gl_renderer_set_cpu_auth_dual(int on) {
+    s_cpu_auth_dual = on ? 1 : 0;
+    if (s_cpu_auth_dual) s_gpu_dirty = 0;
+}
+
+int gl_renderer_cpu_auth_dual(void) {
+    return s_cpu_auth_dual;
+}
+
+void gl_renderer_present_probe_reset(void) {
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    s_probe_skip = 0;
+    s_probe_swap = 0;
+    s_probe_dirty_marks = 0;
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+}
+
+void gl_renderer_present_probe_take(uint64_t *skip_delta,
+                                    uint64_t *swap_delta,
+                                    uint64_t *dirty_mark_delta,
+                                    int *force_remaining) {
+    if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
+    if (skip_delta) {
+        *skip_delta = s_probe_skip;
+        s_probe_skip = 0;
+    }
+    if (swap_delta) {
+        *swap_delta = s_probe_swap;
+        s_probe_swap = 0;
+    }
+    if (dirty_mark_delta) {
+        *dirty_mark_delta = s_probe_dirty_marks;
+        s_probe_dirty_marks = 0;
+    }
+    if (force_remaining) *force_remaining = s_force_present_remaining;
+    if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+}
+
+int gl_renderer_present_rect_dirty(int disp_x, int disp_y, int w, int h) {
+    if (!s_raster_ok || w <= 0 || h <= 0) return 0;
+    return present_dirty_test(disp_x, disp_y,
+                              disp_x + w - 1, disp_y + h - 1);
 }
 
 void gl_renderer_flush_cpu_uploads(void) {
@@ -5110,7 +5425,8 @@ static void interp_reset_history(void) {
     if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
 }
 
-void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz) {
+void gl_renderer_set_interpolation(int enabled, double host_hz,
+                                   double target_hz, int blend_mode) {
     int active = (enabled && host_hz >= 90.0) ? 1 : 0;
     double effective_hz = target_hz >= 90.0 ? target_hz : host_hz;
     const char *diag = getenv("PSX_GL_INTERP_DIAG");
@@ -5140,6 +5456,7 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
     if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
     if (active != s_interp_enabled) interp_reset_history_unlocked();
     s_interp_enabled = active;
+    s_interp_blend_mode = blend_mode == 1 ? 1 : 0;
     s_interp_host_hz = host_hz;
     s_interp_target_hz = active ? effective_hz : 0.0;
     if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
@@ -5262,6 +5579,7 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
     p_glUniform1i(s_interp_uPrev, 0);
     p_glUniform1i(s_interp_uCurr, 1);
     p_glUniform1f(s_interp_uAlpha, alpha);
+    p_glUniform1i(s_interp_uBlendMode, s_interp_blend_mode);
     p_glUniform4f(s_interp_uUvRect, 0.f, 0.f, 1.f, 1.f);
     p_glBindVertexArray(s_interp_thread_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -5303,6 +5621,7 @@ static int interp_present(void) {
                     lx, ly, lw, lh);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(present_sequence);
+    s_probe_swap++;
     s_interp_swaps++;
     return 1;
 }
@@ -5409,6 +5728,79 @@ static void present_target_quad(GLuint target_fbo,
     p_glUseProgram(0);
 }
 
+int gl_renderer_present_hold_last(void) {
+    int ww = 0, wh = 0;
+    int lx, ly, lw, lh;
+
+    if (s_transaction || !s_ctx || !s_win ||
+        s_hold_kind == HOLD_NONE || !s_hold_tex)
+        return 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww < 1 || wh < 1) return 0;
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (s_hold_kind == HOLD_DRAWABLE) {
+        float u0 = 0.5f / (float)s_hold_tw;
+        float v0 = 0.5f / (float)s_hold_th;
+        float u1 = 1.f - u0;
+        float v1 = 1.f - v0;
+
+        lx = 0;
+        ly = 0;
+        lw = ww;
+        lh = wh;
+        if ((int64_t)s_hold_tw * wh != (int64_t)s_hold_th * ww) {
+            if ((int64_t)ww * s_hold_th >
+                (int64_t)wh * s_hold_tw) {
+                lw = (int)((int64_t)wh * s_hold_tw / s_hold_th);
+                if (lw < 1) lw = 1;
+                lx = (ww - lw) / 2;
+            } else {
+                lh = (int)((int64_t)ww * s_hold_th / s_hold_tw);
+                if (lh < 1) lh = 1;
+                ly = (wh - lh) / 2;
+            }
+        }
+        glViewport(lx, ly, lw, lh);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_hold_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        p_glUseProgram(s_present_prog);
+        p_glUniform1i(s_present_uTex, 0);
+        p_glUniform1i(s_present_uLutOn, 0);
+        /* A drawable copy is already screen-oriented; reverse the shader's
+         * normal guest-FBO vertical flip. */
+        p_glUniform4f(s_present_uUvRect, u0, v1, u1, v0);
+        p_glBindVertexArray(s_present_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        p_glBindVertexArray(0);
+        p_glUseProgram(0);
+    } else {
+        if (s_hold_force_4_3)
+            letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+        else
+            letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+        present_target_quad(0, s_hold_tex, s_hold_tw, s_hold_th,
+                            0, 0, s_hold_tw, s_hold_th, s_hold_linear,
+                            lx, ly, lw, lh);
+        hold_capture_drawable();
+    }
+
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_debug_overlay_pre_swap();
+    latency_ring_mark(LAT_SWAP_BEGIN);
+    SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
+    s_probe_swap++;
+    return 1;
+}
+
 int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                              int force_4_3) {
     if (s_transaction) {
@@ -5425,6 +5817,7 @@ int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
         !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1)) {
+        s_probe_skip++;
         gl_perf_present_enter();
         gl_perf_present_exit(0);
         return 1;
@@ -5450,6 +5843,8 @@ int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         interp_capture(s_hr_fbo, disp_x, disp_y, w, h,
                        linear, force_4_3, GL_PRES_VRAM);
     if (interp_pair) {
+        hold_capture_native_fbo(s_hr_fbo, disp_x, disp_y, w, h,
+                                force_4_3, linear);
         gl_perf_present_exit(0);
         present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
         present_force_consumed();
@@ -5465,10 +5860,12 @@ int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      * for its own draw at the top of this function; rebind READ too so
      * the hook's readback targets the default framebuffer's back buffer. */
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    hold_capture_drawable();
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(present_sequence);
+    s_probe_swap++;
     latency_ring_mark(LAT_SWAP_END);
     gl_perf_present_exit(0);
     present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
@@ -6072,6 +6469,7 @@ static uint64_t native_present_swap_texture(
         sequence, scanout_x, scanout_y, scanout_width, scanout_height);
     pres_set_geometry_hash(sequence, geometry_hash, geometry_hash_valid);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    hold_capture_drawable();
     psx_debug_overlay_pre_swap();
     if (hash_framebuffer) {
         pres_phase_vram_hash_issue(sequence, phase_surface_fbo, texture_width);
@@ -6088,6 +6486,7 @@ static uint64_t native_present_swap_texture(
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(sequence);
+    s_probe_swap++;
     latency_ring_mark(LAT_SWAP_END);
     if (path == GL_PRES_NATIVE_MIDPOINT) {
         s_native_midpoint_diag.midpoint_presents++;
@@ -6710,8 +7109,9 @@ static void glb_native_fill_rect(int x, int y, int w, int h, uint16_t color) {
     const int operation_x = x & (VRAM_W - 1);
     const int operation_w = w > VRAM_W ? VRAM_W : w;
 
-    if (!s_raster_ok) {
+    if (s_cpu_auth_dual || !s_raster_ok)
         sw_fill_rect(x, y, w, h, color);
+    if (!s_raster_ok) {
         return;
     }
     gpu_fill(x, y, w, h, color);
@@ -6981,8 +7381,9 @@ static void native_view_copy_to_target(GLuint target_fbo, int base_x,
 
 static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
                                   int w, int h) {
-    if (!s_raster_ok) {
+    if (s_cpu_auth_dual || !s_raster_ok)
         sw_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+    if (!s_raster_ok) {
         return;
     }
     flush_flat_batch();
@@ -7200,6 +7601,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
         !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1)) {
+        s_probe_skip++;
         gl_perf_present_enter();
         gl_perf_present_exit(1);
         return 1;
@@ -7220,6 +7622,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         interp_capture(fbo, 0, disp_y, g_wide_w, disp_h,
                        linear, 0, GL_PRES_WIDE);
     if (interp_pair) {
+        hold_capture_native_fbo(fbo, 0, disp_y, g_wide_w, disp_h, 0, linear);
         gl_perf_present_exit(1);
         present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
         present_force_consumed();
@@ -7237,10 +7640,12 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      * the hook targets the default framebuffer's back buffer, not whatever
      * FBO wide_blit_center left bound. */
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    hold_capture_drawable();
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     pres_mark_swap_completed(present_sequence);
+    s_probe_swap++;
     latency_ring_mark(LAT_SWAP_END);
     gl_perf_present_exit(1);
     present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
@@ -8117,6 +8522,9 @@ static void glb_transaction_snapshot(GlTransactionCheckpoint *checkpoint) {
     checkpoint->last_dx = s_last_dx; checkpoint->last_dy = s_last_dy;
     checkpoint->last_dw = s_last_dw; checkpoint->last_dh = s_last_dh;
     checkpoint->force_present_remaining = s_force_present_remaining;
+    checkpoint->probe_skip = s_probe_skip;
+    checkpoint->probe_swap = s_probe_swap;
+    checkpoint->probe_dirty_marks = s_probe_dirty_marks;
 
     checkpoint->coh_seq = s_coh_seq;
     memcpy(checkpoint->rt_up_diag, s_rt_up_diag,
@@ -8199,6 +8607,9 @@ static void glb_transaction_restore_snapshot_state(
     s_last_dx = checkpoint->last_dx; s_last_dy = checkpoint->last_dy;
     s_last_dw = checkpoint->last_dw; s_last_dh = checkpoint->last_dh;
     s_force_present_remaining = checkpoint->force_present_remaining;
+    s_probe_skip = checkpoint->probe_skip;
+    s_probe_swap = checkpoint->probe_swap;
+    s_probe_dirty_marks = checkpoint->probe_dirty_marks;
 
     s_coh_seq = checkpoint->coh_seq;
     memcpy(s_rt_up_diag, checkpoint->rt_up_diag,
@@ -11623,9 +12034,14 @@ GlRendererTransactionSwapStatus gl_renderer_swap_ready_transaction(void) {
     /* Commit's final glGetError established the context/window contract. Keep
      * this as the literal first SDL/GL/window operation after READY. */
     SDL_GL_SwapWindow(s_win);
+    s_probe_swap++;
 #ifdef PSX_GL_TRANSACTION_TESTING
     s_transaction_test_diag.swaps++;
 #endif
+
+    hold_capture_drawable_target(checkpoint->staging_fbo,
+                                 checkpoint->staging_w,
+                                 checkpoint->staging_h);
 
     pres_publish_staged(&checkpoint->staged_present_event);
     present_dirty_rect(checkpoint->present.display_x,
@@ -11687,6 +12103,8 @@ static const GpuRenderBackend GL_BACKEND = {
     .set_semi_transparency = glb_set_semi_transparency, .set_mask_bits = glb_set_mask_bits,
     .set_texture_window = glb_set_texture_window, .set_color_modulation = glb_set_color_modulation,
     .set_dither = glb_set_dither,
+    .set_precise_triangle = glb_set_precise_triangle,
+    .set_perspective_triangle = glb_set_perspective_triangle,
     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,
     .draw_flat_triangle_rgb888 = glb_draw_flat_triangle_rgb888,

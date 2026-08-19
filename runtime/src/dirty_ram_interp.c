@@ -38,6 +38,7 @@
 #include "starvation_ring.h"
 #include "xenogears_field_hook.h"
 #include "xg_render_auth_runtime.h"
+#include "fntrace.h"  /* fntrace_is_game_started / fntrace_mark_game_started */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -57,6 +58,11 @@ uint64_t g_dirty_ram_native_handoffs = 0;
 uint64_t g_dirty_pump_max_gap_insns = 0;
 uint64_t g_dirty_pump_count         = 0;
 static uint64_t s_last_dirty_irq_pump_insns = 0;
+/* Host-only stride for the no-pending IRQ entry throttle. NOT in the snap —
+ * peers that drifted apart through FMV entered the post-FMV dirty wait with
+ * different phases and forked tip+1 (Win↔Linux ±1 cyc / swapped cores). Reset
+ * on restore; when an IRQ is already deliverable, poll every entry instead. */
+static uint32_t s_interp_entry_poll = 0;
 
 /* EPC de-overload signal (Tomba 2 frame-1997 fix). Set to the committed guest PC
  * immediately around a dirty-pump psx_check_interrupts() call, 0 otherwise. When
@@ -111,6 +117,26 @@ static inline void interp_cyc_step(CPUState *cpu, uint32_t reg_mask) {
     psx_cyc_step(cpu, reg_mask);
 }
 #endif
+
+/* ===== Minimal exception delivery from the interpreter path =====
+ * Sets COP0 registers (BadVAddr, Cause, EPC, Status) and redirects PC to the
+ * hardware exception vector.  Used for alignment errors caught by the
+ * interpreter.  Returns 1 (control transferred). */
+static int interp_exception(CPUState *cpu, uint32_t exc_code,
+                            uint32_t badvaddr, uint32_t epc_pc) {
+    uint32_t sr = cpu->cop0[12];
+    /* BadVAddr */
+    cpu->cop0[8] = badvaddr;
+    /* Cause: ExcCode, clear BD (not tracking delay-slot exception here) */
+    cpu->cop0[13] = (cpu->cop0[13] & ~0x8000007Cu) | (exc_code << 2);
+    /* Push SR exception stack: shift bits [5:0] left by 2 */
+    cpu->cop0[12] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2);
+    /* EPC */
+    cpu->cop0[14] = epc_pc;
+    /* Vector: BEV selects between KSEG1 (BIOS ROM) and KSEG0 (RAM) */
+    cpu->pc = (sr & 0x00400000u) ? 0xBFC00180u : 0x80000080u;
+    return 1;
+}
 
 #ifdef PSX_COSIM
 static int g_cosim_exec_one_hooked = 0;
@@ -322,6 +348,20 @@ void dirty_ram_ld_delay_flush(CPUState *cpu) {
     s_ld_pend_age   = 0;
     if (s_ld_pend_rt != 0u) cpu->gpr[s_ld_pend_rt] = s_ld_pend_val;
     cpu->gpr[0] = 0;
+}
+
+void dirty_ram_ld_delay_discard(void) {
+    s_ld_pend_armed = 0;
+    s_ld_pend_age   = 0;
+    s_ld_pend_rt    = 0;
+    s_ld_pend_val   = 0;
+}
+
+void dirty_ram_irq_ambient_resync_after_restore(void) {
+    /* Re-anchor host-only IRQ pump ambient at the restored timeline so both
+     * peers take the first post-load dirty entry poll from the same phase. */
+    s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+    s_interp_entry_poll = 0;
 }
 
 uint32_t g_insn_gate_lo = 0;       /* extra always-log phys range [lo,hi)      */
@@ -1599,32 +1639,51 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     switch (opc) {
     case 0x00: /* SPECIAL */
         switch (fnt) {
-        case 0x00: /* SLL rd, rt, sh (also nop when all fields are 0) */
-            cpu->gpr[rd] = cpu->gpr[rt] << sh;
+        case 0x00: { /* SLL rd, rt, sh (also nop when all fields are 0) */
+            uint32_t a = cpu->gpr[rt];
+            cpu->gpr[rd] = a << sh;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, sh);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x02: /* SRL */
-            cpu->gpr[rd] = cpu->gpr[rt] >> sh;
+        }
+        case 0x02: { /* SRL */
+            uint32_t a = cpu->gpr[rt];
+            cpu->gpr[rd] = a >> sh;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, sh);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x03: /* SRA */
-            cpu->gpr[rd] = (uint32_t)((int32_t)cpu->gpr[rt] >> sh);
+        }
+        case 0x03: { /* SRA */
+            uint32_t a = cpu->gpr[rt];
+            cpu->gpr[rd] = (uint32_t)((int32_t)a >> sh);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, sh);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x04: /* SLLV */
-            cpu->gpr[rd] = cpu->gpr[rt] << (cpu->gpr[rs] & 31);
+        }
+        case 0x04: { /* SLLV */
+            uint32_t a = cpu->gpr[rt], b = cpu->gpr[rs];
+            cpu->gpr[rd] = a << (b & 31);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x06: /* SRLV */
-            cpu->gpr[rd] = cpu->gpr[rt] >> (cpu->gpr[rs] & 31);
+        }
+        case 0x06: { /* SRLV */
+            uint32_t a = cpu->gpr[rt], b = cpu->gpr[rs];
+            cpu->gpr[rd] = a >> (b & 31);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x07: /* SRAV */
-            cpu->gpr[rd] = (uint32_t)((int32_t)cpu->gpr[rt] >> (cpu->gpr[rs] & 31));
+        }
+        case 0x07: { /* SRAV */
+            uint32_t a = cpu->gpr[rt], b = cpu->gpr[rs];
+            cpu->gpr[rd] = (uint32_t)((int32_t)a >> (b & 31));
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x08: { /* JR rs */
             uint32_t target = cpu->gpr[rs];
+            if (target & 3) return interp_exception(cpu, 4, target, pc);  /* LoadAddressError */
             exec_delay_slot(cpu, pc + 4);
             cosim_exec_one_transfer_hook(pc + 4);
             if (g_psx_xg_render_auth_cold_enabled &&
@@ -1647,6 +1706,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                 source_observation =
                     xg_render_source_observation_begin(cpu, pc, insn);
             uint32_t target = cpu->gpr[rs];
+            if (target & 3) return interp_exception(cpu, 4, target, pc);  /* LoadAddressError */
             uint32_t return_pc = pc + 8;
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
@@ -1714,25 +1774,30 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
 #endif
             cpu->gpr[rd] = cpu->hi;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], cpu->hi, 0);
             cpu->gpr[0] = 0;
             return 0;
         case 0x11: /* MTHI */
             cpu->hi = cpu->gpr[rs];
+            psx_pgxp_alu(cpu, insn, cpu->hi, cpu->hi, 0);
             return 0;
         case 0x12: /* MFLO */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
 #endif
             cpu->gpr[rd] = cpu->lo;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], cpu->lo, 0);
             cpu->gpr[0] = 0;
             return 0;
         case 0x13: /* MTLO */
             cpu->lo = cpu->gpr[rs];
+            psx_pgxp_alu(cpu, insn, cpu->lo, cpu->lo, 0);
             return 0;
         case 0x18: { /* MULT */
             int64_t r = (int64_t)(int32_t)cpu->gpr[rs] * (int64_t)(int32_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)((uint64_t)r >> 32);
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, psx_mult_latency_s(cpu->gpr[rs]));  /* completion deadline */
 #endif
@@ -1742,6 +1807,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             uint64_t r = (uint64_t)cpu->gpr[rs] * (uint64_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)(r >> 32);
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, psx_mult_latency_u(cpu->gpr[rs]));  /* completion deadline */
 #endif
@@ -1760,6 +1826,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                 cpu->lo = (uint32_t)(a / b);
                 cpu->hi = (uint32_t)(a % b);
             }
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, 37u);   /* DIV completion deadline (fixed) */
 #endif
@@ -1773,35 +1840,45 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                 cpu->lo = cpu->gpr[rs] / cpu->gpr[rt];
                 cpu->hi = cpu->gpr[rs] % cpu->gpr[rt];
             }
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, 37u);   /* DIVU completion deadline (fixed) */
 #endif
             return 0;
         case 0x20: /* ADD - overflow traps are delegated if they occur. */
-        case 0x21: /* ADDU rd, rs, rt */
-            cpu->gpr[rd] = cpu->gpr[rs] + cpu->gpr[rt];
+        case 0x21: { /* ADDU rd, rs, rt */
+            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
+            cpu->gpr[rd] = a + b;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x22: /* SUB - overflow traps are delegated if they occur. */
-        case 0x23: /* SUBU */
+        case 0x23: { /* SUBU */
+            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
             if (rs == 0 &&
                 psx_ws_semantic_cull_site(pc) ==
                     PSX_WS_CULL_SEMANTIC_LEFT_EDGE)
-                cpu->gpr[rd] = psx_ws_guest_cull_left_edge(cpu->gpr[rt]);
+                cpu->gpr[rd] = psx_ws_guest_cull_left_edge(b);
             else if (rs == 0 && psx_ws_is_cull_negsub_site(pc))
-                cpu->gpr[rd] = 0u - cpu->gpr[rt] - (uint32_t)psx_ws_x_margin();
+                cpu->gpr[rd] = 0u - b - (uint32_t)psx_ws_x_margin();
             else
-                cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
+                cpu->gpr[rd] = a - b;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x24: /* AND */
             cpu->gpr[rd] = cpu->gpr[rs] & cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
-        case 0x25: /* OR */
-            cpu->gpr[rd] = cpu->gpr[rs] | cpu->gpr[rt];
+        case 0x25: { /* OR */
+            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
+            cpu->gpr[rd] = a | b;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x26: /* XOR */
             cpu->gpr[rd] = cpu->gpr[rs] ^ cpu->gpr[rt];
             cpu->gpr[0] = 0;
@@ -1811,13 +1888,25 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[0] = 0;
             return 0;
         case 0x2A: /* SLT */
-            cpu->gpr[rd] = ((int32_t)cpu->gpr[rs] < (int32_t)cpu->gpr[rt]) ? 1u : 0u;
+        {
+            uint32_t vanilla =
+                ((int32_t)cpu->gpr[rs] < (int32_t)cpu->gpr[rt]) ? 1u : 0u;
+            uint32_t kept = vanilla;
+            if (!psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
+                (void)psx_ws_cull_keep_site(pc, insn, vanilla, &kept);
+            cpu->gpr[rd] = kept;
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x2B: /* SLTU */
-            cpu->gpr[rd] = (cpu->gpr[rs] < cpu->gpr[rt]) ? 1u : 0u;
+        {
+            uint32_t vanilla = (cpu->gpr[rs] < cpu->gpr[rt]) ? 1u : 0u;
+            uint32_t kept = vanilla;
+            (void)psx_ws_cull_keep_site(pc, insn, vanilla, &kept);
+            cpu->gpr[rd] = kept;
             cpu->gpr[0] = 0;
             return 0;
+        }
         default:
             return abort_unsupported(pc, insn, "SPECIAL funct");
         }
@@ -1953,32 +2042,46 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         return 1;
     }
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
-        if (psx_ws_semantic_cull_site(pc) ==
-            PSX_WS_CULL_SEMANTIC_SCREEN_BIAS)
+    {
+        uint32_t widened = 0;
+        uint32_t a = cpu->gpr[rs];
+        if (psx_ws_semantic_cull_site(pc) == PSX_WS_CULL_SEMANTIC_SCREEN_BIAS)
             cpu->gpr[rt] = psx_ws_guest_cull_screen_bias(
-                cpu->gpr[rs], simm);
+                a, simm);
+        else if (psx_ws_angle_site(pc, insn, &widened))
+            cpu->gpr[rt] = widened;
         else
-            cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
-                         + (psx_ws_is_cull_bias_site(pc) ?
-                            (uint32_t)psx_ws_x_margin() : 0u);
+            cpu->gpr[rt] = a + (uint32_t)simm
+                         + (psx_ws_is_cull_bias_site(pc)
+                                ? (uint32_t)psx_ws_activation_margin() : 0u);
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, (uint32_t)simm);
         cpu->gpr[0] = 0;
         return 0;
+    }
     case 0x09: /* ADDIU rt, rs, simm */
+    {
+        uint32_t widened = 0;
+        uint32_t a = cpu->gpr[rs];
         if (pc == 0x800758E4u && insn == 0x24630002u)
             simm = psx_xenogears_field_frame_step(
                 pc, insn, simm, cpu->gpr[17], XG_FIELD_TIER_COLD_INTERPRETER);
-        if (psx_ws_semantic_cull_site(pc) ==
-            PSX_WS_CULL_SEMANTIC_SCREEN_BIAS)
+        if (psx_ws_semantic_cull_site(pc) == PSX_WS_CULL_SEMANTIC_SCREEN_BIAS)
             cpu->gpr[rt] = psx_ws_guest_cull_screen_bias(
-                cpu->gpr[rs], simm);
+                a, simm);
+        else if (psx_ws_angle_site(pc, insn, &widened))
+            cpu->gpr[rt] = widened;
         else
-            cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
-                         + (psx_ws_is_cull_bias_site(pc) ?
-                            (uint32_t)psx_ws_x_margin() : 0u);
+            cpu->gpr[rt] = a + (uint32_t)simm
+                         + (psx_ws_is_cull_bias_site(pc)
+                                ? (uint32_t)psx_ws_activation_margin() : 0u);
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, (uint32_t)simm);
         cpu->gpr[0] = 0;
         return 0;
+    }
     case 0x0A: { /* SLTI */
         const PsxWsCullSemantic semantic = psx_ws_semantic_cull_site(pc);
+        uint32_t vanilla = ((int32_t)cpu->gpr[rs] < simm) ? 1u : 0u;
+        uint32_t kept = vanilla;
         if (semantic ==
             PSX_WS_CULL_SEMANTIC_SIGNED_SCREEN_X)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_signed_screen_x(
@@ -1986,11 +2089,18 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         else if (semantic == PSX_WS_CULL_SEMANTIC_DEPTH_BOUND)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_depth_signed(
                 (int32_t)cpu->gpr[rs], simm);
+        else if (psx_ws_aspect_cone_site(cpu, pc, insn, vanilla, &kept))
+            cpu->gpr[rt] = kept;
+        else if (psx_ws_cull_keep_site(pc, insn, vanilla, &kept))
+            cpu->gpr[rt] = kept;
         else if (psx_ws_is_cull_depth_site(pc))
             cpu->gpr[rt] = ((int32_t)cpu->gpr[rs] < psx_ws_depth_bound(simm)) ? 1u : 0u;
         /* Widescreen render-funnel RIGHT-edge widen (auto_screen_x) for the
          * signed min/max funnel idiom (`slti v, minSX, W`) — the paired left
          * edge is the bltz above. Identity at 4:3 (margin 0). */
+        else if (psx_ws_is_cull_slti_lower_site(pc))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti_lower(
+                cpu->gpr[rs], imm);
         else if (psx_ws_is_cull_slti_site(pc) ||
             (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc)))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_slti(cpu->gpr[rs], imm);
@@ -2001,6 +2111,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x0B: { /* SLTIU */
         const PsxWsCullSemantic semantic = psx_ws_semantic_cull_site(pc);
+        uint32_t vanilla = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
+        uint32_t kept = vanilla;
         /* Widescreen render-funnel cull widening (auto_screen_x): apply the
          * shared helper for a flagged render-cull site — it is byte-identical
          * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
@@ -2015,6 +2127,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         else if (semantic == PSX_WS_CULL_SEMANTIC_DEPTH_BOUND)
             cpu->gpr[rt] = (uint32_t)psx_ws_guest_cull_depth_unsigned(
                 cpu->gpr[rs], simm);
+        else if (psx_ws_cull_keep_site(pc, insn, vanilla, &kept))
+            cpu->gpr[rt] = kept;
         else if (psx_ws_is_cull_depth_site(pc))
             cpu->gpr[rt] = (cpu->gpr[rs] <
                             (uint32_t)psx_ws_depth_bound(simm)) ? 1u : 0u;
@@ -2024,7 +2138,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             /* Explicit world-space classifier widen. The native emitter uses
              * the same bound transform for configured range_sites. */
             cpu->gpr[rt] = (cpu->gpr[rs] <
-                            ((uint32_t)simm + 2u * (uint32_t)psx_ws_x_margin())) ? 1u : 0u;
+                            ((uint32_t)simm + 2u *
+                             (uint32_t)psx_ws_activation_margin())) ? 1u : 0u;
         }
         else if (psx_ws_auto_cull_on() && psx_ws_is_cull_w_imm(imm) && ws_cull_site(pc))
             cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
@@ -2037,10 +2152,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         cpu->gpr[rt] = cpu->gpr[rs] & imm;
         cpu->gpr[0] = 0;
         return 0;
-    case 0x0D: /* ORI */
-        cpu->gpr[rt] = cpu->gpr[rs] | imm;
+    case 0x0D: { /* ORI */
+        uint32_t a = cpu->gpr[rs];
+        cpu->gpr[rt] = a | imm;
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, imm);
         cpu->gpr[0] = 0;
         return 0;
+    }
     case 0x0E: /* XORI */
         cpu->gpr[rt] = cpu->gpr[rs] ^ imm;
         cpu->gpr[0] = 0;
@@ -2050,6 +2168,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (uint32_t)psx_ws_player_x_bound((int32_t)(imm << 16));
         else
             cpu->gpr[rt] = imm << 16;
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], 0, 0);
         cpu->gpr[0] = 0;
         return 0;
     case 0x10: { /* COP0 */
@@ -2063,8 +2182,56 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[0] = 0;
             return 0;
         }
+        if (cop_op == 0x02) { /* CFC0 — identical to MFC0 on PSX */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            cpu->ld_absorb = 0u;
+            cpu->ld_which_t = (uint8_t)rt;
+#endif
+            cpu->gpr[rt] = cpu->cop0[rd];
+            cpu->gpr[0] = 0;
+            return 0;
+        }
         if (cop_op == 0x04) { /* MTC0 */
-            cpu->cop0[rd] = cpu->gpr[rt];
+            uint32_t val = cpu->gpr[rt];
+            if (rd == 13) {
+                /* Cause register: only the software-interrupt pending bits
+                 * [9:8] are writable; hardware IP [15:10], ExcCode [6:2] and
+                 * BD [31] are read-only from software (psx-spx, matches
+                 * PCSX-Redux/Beetle MTC0). */
+                cpu->cop0[13] = (cpu->cop0[13] & ~0x0300u) | (val & 0x0300u);
+            } else {
+                cpu->cop0[rd] = val;
+            }
+            /* psxTestSWInts: after writing Status or Cause, check if a
+             * software interrupt is now deliverable (Cause & Status & 0x0300
+             * with Status.IEc set).  Matches PCSX-Redux's MTC0 path. */
+            if ((rd == 12 /* Status */ || rd == 13 /* Cause */) &&
+                (cpu->cop0[13] & cpu->cop0[12] & 0x0300u) &&
+                (cpu->cop0[12] & 0x1u)) {
+                g_dirty_safe_resume_pc = pc + 4;
+                cpu->pc = pc + 4;
+                psx_check_interrupts(cpu);
+                g_dirty_safe_resume_pc = 0;
+                return (cpu->pc != pc + 4);  /* transferred if exception taken */
+            }
+            return 0;
+        }
+        if (cop_op == 0x06) { /* CTC0 — identical to MTC0 on PSX */
+            uint32_t val = cpu->gpr[rt];
+            if (rd == 13) {
+                cpu->cop0[13] = (cpu->cop0[13] & ~0x0300u) | (val & 0x0300u);
+            } else {
+                cpu->cop0[rd] = val;
+            }
+            if ((rd == 12 || rd == 13) &&
+                (cpu->cop0[13] & cpu->cop0[12] & 0x0300u) &&
+                (cpu->cop0[12] & 0x1u)) {
+                g_dirty_safe_resume_pc = pc + 4;
+                cpu->pc = pc + 4;
+                psx_check_interrupts(cpu);
+                g_dirty_safe_resume_pc = 0;
+                return (cpu->pc != pc + 4);
+            }
             return 0;
         }
         if (cop_op == 0x10 && fnt == 0x10) { /* RFE */
@@ -2092,6 +2259,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_gte_read(cpu, rt);
 #endif
             cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
+            psx_pgxp_cop2(cpu, insn, cpu->gpr[rt], 0);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -2100,6 +2268,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_gte_read(cpu, rt);
 #endif
             cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd);
+            psx_pgxp_cop2(cpu, insn, cpu->gpr[rt], 0);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -2108,6 +2277,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_gte_stall(cpu);
 #endif
             gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]);
+            psx_pgxp_cop2(cpu, insn, cpu->gpr[rt], 0);
             return 0;
         }
         if (cop_op == 0x06) { /* CTC2 */
@@ -2132,12 +2302,15 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x21: { /* LH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2145,11 +2318,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
         cpu->gpr[rt] = lwl_merge(addr, word, cpu->gpr[rt]);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x23: { /* LW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        if (addr & 3) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         const PsxWsCullSemantic semantic = psx_ws_semantic_cull_site(pc);
         if (semantic ==
             PSX_WS_CULL_SEMANTIC_FRUSTUM_PLANE_X)
@@ -2167,18 +2342,22 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = psx_ws_xclip_bound(psx_cyc_load_word(cpu, addr, rt, 1u << rs));
         else
             cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x24: { /* LBU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x25: { /* LHU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = (uint32_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2186,6 +2365,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
         cpu->gpr[rt] = lwr_merge(addr, word, cpu->gpr[rt]);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2193,10 +2373,12 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         cpu->write_byte(addr, (uint8_t)cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt] & 0xFFu);
         return 0;
     }
     case 0x29: { /* SH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        if (addr & 1) return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
         uint16_t val  = (uint16_t)cpu->gpr[rt];
         /* Widescreen backdrop screenX squash on the interpreter path: mirrors
          * the recompiler emit at [widescreen.backdrop] x_sites. Overlay code
@@ -2207,24 +2389,29 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             val = (uint16_t)psx_ws_backdrop_x((int16_t)val);
         g_debug_last_store_pc = pc;
         cpu->write_half(addr, val);
+        psx_pgxp_store(cpu, insn, addr, val);
         return 0;
     }
     case 0x2A: { /* SWL */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         interp_swl(cpu, addr, cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2B: { /* SW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+        if (addr & 3) return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
         g_debug_last_store_pc = pc;
         cpu->write_word(addr, cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2E: { /* SWR */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         interp_swr(cpu, addr, cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x32: { /* LWC2 — §1+DO_LDS charged by exec_one's top step (mask 0) */
@@ -2232,7 +2419,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
 #ifdef PSX_ENABLE_BLOCK_CYCLES
         psx_gte_stall(cpu);   /* COP2 reg write stalls to GTE completion */
 #endif
-        gte_write_data(cpu, (uint8_t)rt, psx_cyc_lwc2_read(cpu, addr));
+        {
+            uint32_t lw2 = psx_cyc_lwc2_read(cpu, addr);
+            gte_write_data(cpu, (uint8_t)rt, lw2);
+            psx_pgxp_cop2(cpu, insn, lw2, addr);
+        }
         return 0;
     }
     case 0x3A: { /* SWC2 */
@@ -2247,8 +2438,12 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             (void)psx_xg_render_auth_resident_ft4_observe(
                 cpu, PSX_XG_RENDER_SOURCE_STAGE_PRE, pc, insn);
         g_debug_last_store_pc = pc;
-        cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt));
-        gte_precision_store_word(addr, (uint8_t)rt);
+        {
+            uint32_t sw2 = gte_read_data(cpu, (uint8_t)rt);
+            cpu->write_word(addr, sw2);
+            gte_precision_store_word(addr, (uint8_t)rt);
+            psx_pgxp_cop2(cpu, insn, sw2, addr);
+        }
         if (xg_resident_ft4_store)
             (void)psx_xg_render_auth_resident_ft4_observe(
                 cpu, PSX_XG_RENDER_SOURCE_STAGE_COMMIT, pc, insn);
@@ -2314,6 +2509,16 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
         psx_fatal_halt("dispatch recursion guard tripped — runaway self-call "
                        "(see dispatch_depth + dirty_block cycle for the recursing PC)");
     }
+    /* Game-start detection for the dirty-RAM interpreter path.
+     * When dispatch_count == 0 (all code runs interpreted), the native
+     * dispatch path's fntrace_record() never fires, so widescreen/mouselook/
+     * CD-speed-switch are never engaged.  This one-shot check closes the gap
+     * with the SAME semantics as the native path: latch only on the exact
+     * game entry PC.  A broader match (any phys >= 0x10000) fires during
+     * BIOS boot — the shell/kernel run relocated RAM code above 0x10000 —
+     * and the handoff's baseline/scratch clears then corrupt the boot
+     * (observed: MoH SLUS-00974 garbage-jump/VBLANK-wedge, 2026-08-06). */
+    fntrace_maybe_mark_game_started(cpu, addr);
     if (addr == 0x8001A954u)      site_note(&g_site_dd954);   /* loop head re-dispatch */
     else if (addr == 0x80046264u) site_note(&g_site_dd264);   /* loop tail re-dispatch */
     int prev = g_dirty_interp_active;
@@ -2847,20 +3052,39 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * per-invocation `(insns_executed & 0xFFF)` gate below can fire — so a
      * pending, IEc+IM2-enabled interrupt is never taken and the loop spins for
      * seconds while the CD IRQ that would set its wait-flag is never serviced.
-     * Poll on a GLOBAL invocation counter so short-block loops still yield to
-     * interrupts (this is the interpreter analogue of a block-leader poll in
-     * static code). psx_check_interrupts runs the handler and returns with
+     * When an IRQ is already deliverable, poll EVERY entry (guest-deterministic;
+     * MotK post-FMV overlay wait @0x80076880 with latched I_STAT.VBlank forked
+     * Win↔Linux on a host-only %%64 stride). Otherwise throttle on the global
+     * invocation counter. psx_check_interrupts runs the handler and returns with
      * registers restored, so continuing the loop afterward is safe. */
     {
-        static uint32_t s_interp_entry_poll = 0;
         static int s_entry_poll_enabled = -1;   /* DIAGNOSTIC toggle (590c236 x kind-30 escape regression hunt) */
         if (s_entry_poll_enabled < 0) {
             const char* e = getenv("PSX_DIRTY_ENTRY_POLL");
             s_entry_poll_enabled = (e && e[0] == '0') ? 0 : 1;
         }
-        if (s_entry_poll_enabled && (++s_interp_entry_poll & 0x3Fu) == 0) {
-            cpu->pc = pc;
-            psx_check_interrupts(cpu);
+        if (s_entry_poll_enabled) {
+            extern uint32_t i_stat;
+            uint32_t sr = cpu->cop0[12];
+            int deliverable =
+                ((i_stat & i_mask) != 0u) &&
+                !psx_get_in_exception() &&
+                (sr & 0x1u) != 0u &&
+                (sr & (1u << 10)) != 0u;
+            if (deliverable || (++s_interp_entry_poll & 0x3Fu) == 0) {
+                cpu->pc = pc;
+                s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+                psx_check_interrupts(cpu);
+                if (cpu->pc != 0u && !dirty_ram_same_pc(cpu->pc, pc)) {
+                    /* Handler resumed elsewhere — surface to dispatch. */
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = cpu->pc;
+                    OV_FPLOG_RET1();
+                }
+                if (cpu->pc == 0u)
+                    cpu->pc = pc;
+            }
         }
     }
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {

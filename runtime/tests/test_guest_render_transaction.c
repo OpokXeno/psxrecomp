@@ -28,6 +28,8 @@
 #define CHECK(expression) do { if (!(expression)) return __LINE__; } while (0)
 #define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
 
+uint64_t s_frame_count;
+
 typedef enum EventKind {
     EVENT_CHECKPOINT_BEGIN = 1,
     EVENT_BEGIN,

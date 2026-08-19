@@ -16,16 +16,20 @@
 #endif
 #include <time.h>
 #include "debug_server.h"
+#include "psx_bss.h"
+#include "nd_intro_ot.h"
 #include "latency_ring.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
 #include "code_provider.h"
 #include "overlay_backend.h"
 #include "cpu_state.h"
+#include "pgxp.h"
 #include "dma.h"
 #include "native_render_baseline.h"
 #include "guest_render_native_stream.h"
 #include "gpu.h"
+#include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "present_ring.h"
 #include "xg_render_auth_runtime.h"
 #include "load_transition_ring.h"
@@ -85,7 +89,7 @@
    static int sock_error(void) { return errno; }
 #endif
 
-#include <SDL.h>
+#include "psx_sdl.h"
 
 /* ---- Externs from runtime ---- */
 extern uint32_t i_stat;
@@ -107,7 +111,7 @@ static int    s_port    = DEFAULT_DEBUG_PORT;
 static int    s_listen_err = 0;   /* platform socket error captured by init */
 
 #define RECV_BUF_SIZE 8192
-static char s_recv_buf[RECV_BUF_SIZE];
+static PSX_BSS char s_recv_buf[RECV_BUF_SIZE];
 static int  s_recv_len = 0;
 
 /* ---- Dedicated TCP I/O thread (keeps the socket queryable under emu load) ----
@@ -118,7 +122,6 @@ static int  s_recv_len = 0;
  * request slot suffices. A lock-free `ping` fast-path on the I/O thread answers
  * even while the emu thread is buried (freeze liveness). See debug_server_poll /
  * io_thread_main. */
-#include <SDL_thread.h>
 enum { IO_IDLE = 0, IO_REQ = 1, IO_RESP = 2 };
 static SDL_Thread *s_io_thread   = NULL;
 static SDL_mutex  *s_io_mutex    = NULL;
@@ -179,7 +182,7 @@ uint64_t g_fp_sp_count   = 0;
 typedef struct { uint32_t frame; uint64_t wr_hash; uint64_t pc_hash; uint64_t wcount;
                  uint64_t mmio_hash; uint64_t mmio_count;
                  uint64_t sp_hash; uint64_t sp_count; uint64_t cyc; } FpEntry;
-static FpEntry  s_fp_ring[FP_RING_CAP];
+static PSX_BSS FpEntry  s_fp_ring[FP_RING_CAP];
 static uint32_t s_fp_head  = 0;
 static uint64_t s_fp_total = 0;
 
@@ -259,7 +262,7 @@ static void fp_snapshot(uint32_t frame)
 #define REC_KIND_MMIO_R  3   /* device-register read  */
 #define REC_KIND_RAM_R   4   /* main-RAM read (targeted watch range only) */
 typedef struct { uint8_t kind; uint32_t addr; uint32_t val; uint32_t pc; uint32_t ra; uint64_t cyc; } RecEntry;
-static RecEntry  s_rec_buf[REC_CAP];
+static PSX_BSS RecEntry  s_rec_buf[REC_CAP];
 static uint32_t  s_rec_count = 0;
 static int64_t   s_rec_frame = -1;       /* target guest frame, -1 = off */
 static uint32_t  s_rec_overflow = 0;
@@ -321,6 +324,23 @@ static int s_input_frames   = 0;
 static int     s_axis_override = 0;
 static uint8_t s_axis_st[4]    = { 0x80, 0x80, 0x80, 0x80 };
 
+/*
+ * Exact guest-VBlank input route. A client queues run-length encoded digital
+ * pad segments while inactive, then starts the route atomically. Consuming the
+ * queue in debug_server_get_input_override() avoids host/TCP timing gaps
+ * between short presses and remains deterministic while turbo loads are active.
+ */
+#define INPUT_ROUTE_MAX_STEPS 4096
+typedef struct {
+    uint32_t frames;
+    uint16_t buttons;
+} InputRouteStep;
+static PSX_BSS InputRouteStep s_input_route[INPUT_ROUTE_MAX_STEPS];
+static uint32_t s_input_route_count = 0;
+static uint32_t s_input_route_index = 0;
+static uint32_t s_input_route_remaining = 0;
+static int      s_input_route_active = 0;
+
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
 
@@ -339,7 +359,7 @@ typedef struct {
     uint8_t  prev_val;
     int      active;
 } Watchpoint;
-static Watchpoint s_watchpoints[MAX_WATCHPOINTS];
+static PSX_BSS Watchpoint s_watchpoints[MAX_WATCHPOINTS];
 
 /* ---- Write trace (Tier 1 reverse debugger) ----
  * Records every RAM write matching one of the configurable address ranges.
@@ -562,7 +582,7 @@ typedef struct {
     uint8_t  width;         /* 1=byte, 2=half, 4=word */
     uint8_t  pad[3];
 } SioPcTraceEntry;
-static SioPcTraceEntry s_sio_pc_trace[SIO_PC_TRACE_CAP];
+static PSX_BSS SioPcTraceEntry s_sio_pc_trace[SIO_PC_TRACE_CAP];
 static uint64_t s_sio_pc_trace_seq = 0;
 
 /* Compact register sidecar for SIO_CTRL writes.  The broad SIO PC ring keeps
@@ -593,7 +613,7 @@ typedef struct {
     uint8_t  counter_7514;
     uint8_t  pad;
 } SioCtrlRegTraceEntry;
-static SioCtrlRegTraceEntry s_sio_ctrl_reg_trace[SIO_CTRL_REG_TRACE_CAP];
+static PSX_BSS SioCtrlRegTraceEntry s_sio_ctrl_reg_trace[SIO_CTRL_REG_TRACE_CAP];
 static uint64_t s_sio_ctrl_reg_trace_seq = 0;
 
 /* RestoreState / exception longjmp trace.  This is intentionally compact:
@@ -628,7 +648,7 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  pad[3];
 } RestoreTraceEntry;
-static RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
+static PSX_BSS RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
 static uint64_t s_restore_trace_seq = 0;
 
 #define THREAD_TRACE_CAP (1 << 16)
@@ -677,7 +697,7 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  pad[3];
 } ThreadTraceEntry;
-static ThreadTraceEntry s_thread_trace[THREAD_TRACE_CAP];
+static PSX_BSS ThreadTraceEntry s_thread_trace[THREAD_TRACE_CAP];
 static uint64_t s_thread_trace_seq = 0;
 
 #define SREG_TRACE_CAP (1 << 18)
@@ -707,7 +727,7 @@ typedef struct {
     int valid;
 } SregLastEntry;
 
-static SregTraceEntry s_sreg_trace[SREG_TRACE_CAP];
+static PSX_BSS SregTraceEntry s_sreg_trace[SREG_TRACE_CAP];
 static uint64_t s_sreg_trace_seq = 0;
 static SregLastEntry s_sreg_last[32];
 
@@ -734,7 +754,7 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  pad[3];
 } ProbeTraceEntry;
-static ProbeTraceEntry s_probe_trace[PROBE_TRACE_CAP];
+static PSX_BSS ProbeTraceEntry s_probe_trace[PROBE_TRACE_CAP];
 static uint64_t s_probe_trace_seq = 0;
 
 void debug_server_log_probe(uint32_t pc, CPUState *cpu)
@@ -1058,7 +1078,7 @@ void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
  * Records every dispatched function address for post-mortem analysis.
  * 64K entries, stack-allocated (256 KB). */
 #define DISPATCH_TRACE_CAP (1 << 16)
-static uint32_t s_dispatch_ring[DISPATCH_TRACE_CAP];
+static PSX_BSS uint32_t s_dispatch_ring[DISPATCH_TRACE_CAP];
 static uint64_t s_dispatch_seq = 0;
 
 /* ---- Unknown-dispatch ring buffer ----
@@ -1079,7 +1099,7 @@ typedef struct {
     uint32_t dispatch_func;
     uint32_t last_store_pc;
 } UnknownDispatchEntry;
-static UnknownDispatchEntry s_unknown_ring[UNKNOWN_DISPATCH_CAP];
+static PSX_BSS UnknownDispatchEntry s_unknown_ring[UNKNOWN_DISPATCH_CAP];
 static uint64_t s_unknown_seq = 0;
 
 /* Crash-trace accessor: returns entry at the given seq number (modulo cap).
@@ -1091,7 +1111,7 @@ uint64_t crash_trace_unknown_seq_get(void) { return s_unknown_seq; }
 /* Per-target hit count — bounded set, ~N unique targets typically. */
 #define UNKNOWN_UNIQUE_CAP 1024
 typedef struct { uint32_t phys; uint64_t count; } UnknownUniqueEntry;
-static UnknownUniqueEntry s_unknown_unique[UNKNOWN_UNIQUE_CAP];
+static PSX_BSS UnknownUniqueEntry s_unknown_unique[UNKNOWN_UNIQUE_CAP];
 static int s_unknown_unique_count = 0;
 
 void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
@@ -1136,7 +1156,7 @@ uint64_t crash_trace_dispatch_seq_get(void) { return s_dispatch_seq; }
 /* Unique dispatch set — tracks every unique function address ever dispatched.
  * Simple hash set with linear probing. */
 #define DISPATCH_UNIQUE_CAP 4096
-static uint32_t s_dispatch_unique[DISPATCH_UNIQUE_CAP];
+static PSX_BSS uint32_t s_dispatch_unique[DISPATCH_UNIQUE_CAP];
 static int s_dispatch_unique_count = 0;
 
 static void dispatch_unique_add(uint32_t addr) {
@@ -1178,7 +1198,7 @@ typedef struct {
     uint32_t flag_7520;       /* mem[0x7520] success flag */
     uint32_t mc_byte_seq;     /* sio_get_seq() for cross-ref */
 } ChainTraceEntry;
-static ChainTraceEntry s_chain_trace[CHAIN_TRACE_CAP];
+static PSX_BSS ChainTraceEntry s_chain_trace[CHAIN_TRACE_CAP];
 static uint64_t s_chain_trace_seq = 0;
 static uint32_t s_prev_dispatch_target = 0;
 
@@ -1335,7 +1355,7 @@ typedef struct {
     uint8_t  source; /* 0 = direct entry hook, 1 = dispatch hook */
     uint8_t  pad[3];
 } CardMgrTraceEntry;
-static CardMgrTraceEntry s_card_mgr_trace[CARD_MGR_TRACE_CAP];
+static PSX_BSS CardMgrTraceEntry s_card_mgr_trace[CARD_MGR_TRACE_CAP];
 static uint64_t s_card_mgr_trace_seq = 0;
 
 /* Shadow call stack: tracks open call frames. */
@@ -1987,7 +2007,7 @@ static int is_chain_epilogue(uint32_t phys) {
  * Defined unconditionally so crash_trace.c can always dump them; only the FEED
  * (and the guard) is gated on PSX_STACK_GUARD. */
 #define PSX_RECENT_FN_CAP 64u
-uint32_t g_psx_recent_fn[PSX_RECENT_FN_CAP];
+PSX_BSS uint32_t g_psx_recent_fn[PSX_RECENT_FN_CAP];
 uint32_t g_psx_recent_fn_i   = 0;
 uint32_t g_psx_recursion_func = 0;
 
@@ -2002,7 +2022,7 @@ uint32_t g_psx_recursion_func = 0;
  * trip are dumped to verify the math). Defined always; fed only under the guard. */
 typedef struct { uint32_t frame; uint32_t entries; uint32_t max_kb; uint32_t max_func; } CeSum;
 #define CE_CAP 512u
-static CeSum    s_ce[CE_CAP];
+static PSX_BSS CeSum    s_ce[CE_CAP];
 static uint64_t s_ce_seq = 0;
 static uint32_t s_ce_frame = 0xFFFFFFFFu, s_ce_entries = 0, s_ce_max_kb = 0, s_ce_max_func = 0;
 /* raw TEB values captured AT the guard trip (sanity-check garbage-read hypothesis) */
@@ -2202,7 +2222,7 @@ typedef struct {
     uint32_t a0, a1, a2, a3; uint32_t ra; uint32_t current_func; uint32_t frame;
     uint8_t in_exception;
 } BiosCallEntry;
-static BiosCallEntry s_bioscall_ring[BIOSCALL_RING_CAP];
+static PSX_BSS BiosCallEntry s_bioscall_ring[BIOSCALL_RING_CAP];
 static uint64_t s_bioscall_seq = 0;
 /* Arm flag for the B0 event/thread-op capture in debug_server_trace_dispatch.
  * OFF by default: recording every IRQ-context DeliverEvent per dispatch floods the
@@ -2211,7 +2231,7 @@ static uint64_t s_bioscall_seq = 0;
 int g_event_hook_armed = 0;
 #define BIOSCALL_UNIQUE_CAP 2048
 typedef struct { uint32_t table_base; uint32_t index; uint64_t count; } BiosCallUnique;
-static BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
+static PSX_BSS BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
 static int s_bioscall_unique_count = 0;
 void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
                          uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t ra)
@@ -2271,7 +2291,7 @@ typedef struct {
     uint32_t pc;              /* matched physical block-leader PC */
     uint64_t psx_cycle_count; /* absolute guest cycles at block entry */
 } CycWatchEntry;
-static CycWatchEntry s_cyc_watch_ring[CYC_WATCH_RING_CAP];
+static PSX_BSS CycWatchEntry s_cyc_watch_ring[CYC_WATCH_RING_CAP];
 volatile int g_debug_cyc_watch_armed = 0; /* 1 = recording active */
 static uint32_t s_cyc_watch_anchor_phys = 0; /* armed anchor (A / start), masked to phys */
 static uint32_t s_cyc_watch_anchor_raw = 0;  /* armed anchor as supplied (for echo) */
@@ -2347,6 +2367,398 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys)
     if (s_cyc_watch_hits >= s_cyc_watch_max_hits) g_debug_cyc_watch_armed = 0;
 }
 
+/* ---- pc_probe: multi-PC block-leader counters + reg samples (default-off) ----
+ * Arm via TCP `pc_probe_arm` or env PSX_PC_PROBE / PSX_ND_INTRO_PROBE.
+ * Samples $t0/$fp/$v0/frame at matched leaders. Disarmed = one branch.
+ * nd_intro=2 also fills mode/depth/ot_base/ot_index from GP + game struct. */
+#define PC_PROBE_MAX_PCS   16
+#define PC_PROBE_SAMPLE_CAP 64
+typedef struct {
+    uint32_t pc;
+    uint64_t count;
+    uint32_t last_t0;
+    uint32_t last_fp;
+    uint32_t last_v0;
+    uint32_t last_mode;
+    uint32_t last_depth;
+    uint32_t last_ot_base;
+    uint32_t last_ot_index;
+    uint32_t last_frame;
+    uint32_t t0_zero;
+    uint32_t t0_nonzero;
+} PcProbeSlot;
+typedef struct {
+    uint32_t pc;
+    uint32_t frame;
+    uint32_t t0;
+    uint32_t fp;
+    uint32_t v0;
+    uint32_t mode;
+    uint32_t depth;
+    uint32_t ot_base;
+    uint32_t ot_index;
+} PcProbeSample;
+static volatile int s_pc_probe_armed = 0;
+static int          s_pc_probe_n = 0;
+static PcProbeSlot  s_pc_probe[PC_PROBE_MAX_PCS];
+static PcProbeSample s_pc_probe_samples[PC_PROBE_SAMPLE_CAP];
+static uint32_t     s_pc_probe_sample_n = 0;
+static uint32_t     s_pc_probe_sample_max = 32;
+
+static void pc_probe_clear_state(void)
+{
+    s_pc_probe_armed = 0;
+    s_pc_probe_n = 0;
+    s_pc_probe_sample_n = 0;
+    memset(s_pc_probe, 0, sizeof(s_pc_probe));
+    memset(s_pc_probe_samples, 0, sizeof(s_pc_probe_samples));
+}
+
+static int pc_probe_add_pc(uint32_t raw)
+{
+    uint32_t phys = raw & 0x1FFFFFFFu;
+    if (phys == 0) return 0;
+    for (int i = 0; i < s_pc_probe_n; i++) {
+        if (s_pc_probe[i].pc == phys) return 1;
+    }
+    if (s_pc_probe_n >= PC_PROBE_MAX_PCS) return 0;
+    s_pc_probe[s_pc_probe_n].pc = phys;
+    s_pc_probe_n++;
+    return 1;
+}
+
+/* Comma/space-separated hex list, e.g. "0x80044D10,0x80044E58". */
+static int pc_probe_parse_list(const char *list)
+{
+    if (!list || !*list) return 0;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", list);
+    int added = 0;
+    for (char *p = tmp, *tok; (tok = strtok(p, ", \t\n")) != NULL; p = NULL) {
+        uint32_t raw = (uint32_t)strtoul(tok, NULL, 0);
+        if (pc_probe_add_pc(raw)) added++;
+    }
+    return added;
+}
+
+static void pc_probe_arm_nd_intro_defaults(void)
+{
+    /* NdIntroMeshDraw post-RTPT funnel (block leaders with cyc_observe). */
+    static const uint32_t k[] = {
+        0x80044580u, /* after dispatch: $fp = v0 OT ptr */
+        0x80044C80u, /* face clip start */
+        0x80044CB0u, /* passed neg outcode */
+        0x80044CDCu, /* passed hi outcode → alloc */
+        0x80044D10u, /* $t0 == 0 ? skip : emit */
+        0x80044D18u, /* emit continue */
+        0x80044DA4u, /* PolyG4 build */
+        0x80044E58u, /* clip skip */
+        0x80044EC8u, /* $t0==0 / OOM skip */
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        pc_probe_add_pc(k[i]);
+}
+
+/* OT/depth leafs of NdIntroDrawDispatch — which path returns the OT slot. */
+static void pc_probe_arm_nd_intro_ot_defaults(void)
+{
+    static const uint32_t k[] = {
+        0x80044580u, /* after jal: v0 → $fp OT slot */
+        0x800440A0u, /* dispatch entry (mode half @ gp+0x4DE) */
+        0x80044120u, /* mode0 depth scale using *(game+0x1D04) */
+        0x80044154u, /* return OT base via *(game+buf*4+0x18C8) */
+        0x800441A8u, /* return *(game+0x25C)+0xFFC (near-ish) */
+        0x800441C0u, /* mode2 entry */
+        0x80044268u, /* mode1/ shared OT-base return */
+        0x80044DA4u, /* PolyG4 emit: confirm $fp sticky */
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        pc_probe_add_pc(k[i]);
+}
+
+/* Textured wood funnel — live path is func_8006A52C (not dead twin 0x8006A6B8). */
+static void pc_probe_arm_nd_intro_wood_defaults(void)
+{
+    static const uint32_t k[] = {
+        0x8006A52Cu, /* NdIntroWoodEmit entry */
+        0x8006A564u, /* RTPT GTE caller_ra (sticky) */
+        0x8006A57Cu, /* post-RTPT face loop */
+        0x8006A590u, /* FLAG read / face setup */
+        0x8006A5B4u, /* NCLIP */
+        0x8006A610u, /* next-face hub (skip + post-emit) */
+        0x8006A69Cu, /* RTPS single-vert return (bgez $0 → loop) */
+        0x8006A6B8u, /* dead twin entry — expect count=0 */
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        pc_probe_add_pc(k[i]);
+}
+
+/* Depth compare: wood OTZ vs digit/glow OT link ptrs vs MeshDraw OtFar.
+ * Only block-leader PCs (cyc_observe); mid-block AddPrim sites never fire. */
+static void pc_probe_arm_nd_intro_depth_defaults(void)
+{
+    static const uint32_t k[] = {
+        0x8006A608u, /* wood jalr emit — GTE OTZ */
+        0x80023094u, /* DigitGt4 entry — $t7 already OT slot */
+        0x80053E10u, /* glow color ori — $a2=prim; OT via game+0x147C later */
+        0x800440A0u, /* DrawDispatch entry — GP mode/depth */
+        0x80044580u, /* MeshDraw after dispatch */
+        0x800441A8u, /* OtFar leaf */
+        0x80052F98u, /* DigitFx entry */
+        0x800444ECu, /* MeshDraw entry — sample $ra */
+        0x80044DA4u, /* PolyG4 emit hub — lighting bytes on stack */
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        pc_probe_add_pc(k[i]);
+}
+
+/* Wood DL / helper selection: batch setup + which emit helper is bound. */
+static void pc_probe_arm_nd_intro_wood_dl_defaults(void)
+{
+    static const uint32_t k[] = {
+        0x8006AAF0u, /* wood batch setup: a0=stream, ra=material desc */
+        0x8006AB58u, /* fallthrough past flag gates (accepted batch) */
+        0x8006ACE0u, /* after lw s5,96(ra) — helper bound */
+        0x8006A52Cu, /* wood emit entry */
+        0x8006A608u, /* wood jalr emit — also GTE OTZ/SXY via wood_ot */
+        0x8006AE90u, /* alt helper — expect 0 in ND */
+        0x8006AD20u, /* wood batch epilogue / next-opcode hub */
+        0x80044580u, /* MeshDraw post-RTPT — compare SX band */
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        pc_probe_add_pc(k[i]);
+}
+
+/* Resolve double-buffered OT base: *(*(0x8008D2AC) + 0x18C8 + (*(+0xC)<<2)). */
+static void pc_probe_ot_context(CPUState *cpu, uint32_t v0_ot,
+                                uint32_t *mode_out, uint32_t *depth_out,
+                                uint32_t *ot_base_out, uint32_t *ot_index_out)
+{
+    uint32_t mode = 0, depth = 0, ot_base = 0, ot_index = 0xFFFFFFFFu;
+    if (cpu) {
+        uint32_t gp = cpu->gpr[28];
+        mode = psx_read_word(gp + 0x4D4u);
+        /* Depth countdown half lives at gp+0x4D8 (signed). */
+        depth = (uint32_t)(int32_t)(int16_t)(psx_read_word(gp + 0x4D8u) & 0xFFFFu);
+        uint32_t game = psx_read_word(0x8008D2ACu);
+        if (game) {
+            uint32_t buf = psx_read_word(game + 0xCu);
+            ot_base = psx_read_word(game + (buf << 2) + 0x18C8u);
+            if (ot_base && v0_ot) {
+                int32_t delta = (int32_t)(v0_ot - ot_base);
+                if ((delta & 3) == 0 && delta >= 0 && delta < (1 << 20))
+                    ot_index = (uint32_t)(delta >> 2);
+            }
+        }
+    }
+    if (mode_out) *mode_out = mode;
+    if (depth_out) *depth_out = depth;
+    if (ot_base_out) *ot_base_out = ot_base;
+    if (ot_index_out) *ot_index_out = ot_index;
+}
+
+static inline void pc_probe_observe(uint32_t block_leader_phys)
+{
+    if (!s_pc_probe_armed || s_pc_probe_n <= 0) return;
+    extern CPUState *debug_cpu_ptr;
+    CPUState *cpu = debug_cpu_ptr;
+    for (int i = 0; i < s_pc_probe_n; i++) {
+        if (s_pc_probe[i].pc != block_leader_phys) continue;
+        PcProbeSlot *s = &s_pc_probe[i];
+        s->count++;
+        if (cpu) {
+            uint32_t t0 = cpu->gpr[8];
+            uint32_t fp = cpu->gpr[30];
+            uint32_t v0 = cpu->gpr[2];
+            uint32_t a1 = cpu->gpr[5];
+            uint32_t a2 = cpu->gpr[6];
+            uint32_t t7 = cpu->gpr[15];
+            uint32_t otz = cpu->gte_data[7] & 0xFFFFu;
+            uint32_t mode = 0, depth = 0, ot_base = 0, ot_index = 0xFFFFFFFFu;
+            /* Wood: a2 is stack-table value (often prim-ish); OT slot ≈ ot_base+OTZ.
+             * Digit GT4 AddPrim @23180: $t7 = OT slot. Glow @53EB8: $a1 = OT head. */
+            int wood_ot = (block_leader_phys == 0x0006A608u ||
+                           block_leader_phys == 0x0006A600u);
+            int digit_ot = (block_leader_phys == 0x00023094u);
+            int glow_ot = (block_leader_phys == 0x00053E10u);
+            int digit_rain_ot = (block_leader_phys == 0x0006AE34u);
+            int dispatch = (block_leader_phys == 0x000440A0u);
+            uint32_t ot_ptr = 0;
+            if (digit_ot)
+                ot_ptr = t7; /* caller-supplied OT slot */
+            else if (digit_rain_ot)
+                ot_ptr = cpu->gpr[11]; /* $t3 OT slot from MAC0>>17 helper */
+            else if (glow_ot) {
+                /* OT head at game+0x147C (same as AddPrim a few insns later). */
+                uint32_t game = psx_read_word(0x8008D2ACu);
+                ot_ptr = game ? psx_read_word(game + 0x147Cu) : 0;
+            } else if (block_leader_phys == 0x00044580u ||
+                       block_leader_phys == 0x000441A8u)
+                ot_ptr = v0; /* dispatch result / OtFar v0 */
+            else if (wood_ot)
+                ot_ptr = 0; /* resolve via OTZ after ot_base known */
+            else
+                ot_ptr = fp ? fp : v0;
+            pc_probe_ot_context(cpu, ot_ptr, &mode, &depth, &ot_base, &ot_index);
+            if (wood_ot) {
+                /* WoodEmit jalr $s5 @0x8006A608: MAC0 already swc2'd to 44($at);
+                 * OT base at 56($at) from model+228. Index = MAC0>>17 (== OTZ>>5). */
+                uint32_t at = cpu->gpr[1];
+                uint32_t mac0 = at ? psx_read_word(at + 44u) : 0;
+                uint32_t wood_base = at ? psx_read_word(at + 56u) : 0;
+                uint32_t widx = mac0 >> 17;
+                if (!widx && otz)
+                    widx = otz >> 5;
+                ot_base = wood_base;
+                ot_index = widx;
+                ot_ptr = wood_base ? (wood_base + (widx << 2)) : 0;
+                t0 = ot_ptr;           /* actual AddPrim OT slot */
+                depth = otz;
+                v0 = cpu->gpr[21];     /* $s5 helper */
+                mode = wood_base;
+                if (wood_base)
+                    psx_nd_note_wood_batch_ot(wood_base);
+            } else if (digit_ot) {
+                t0 = t7;
+                v0 = ot_index;
+            } else if (glow_ot) {
+                t0 = ot_ptr;
+                v0 = ot_index;
+                depth = a2; /* prim ptr */
+            } else if (dispatch) {
+                /* Fresh GP mode/depth before leaf runs; v0 not OT yet. */
+                t0 = mode;
+                v0 = depth;
+            } else if (block_leader_phys == 0x000444ECu) {
+                /* MeshDraw entry: expose caller $ra (no jal-site in EXE). */
+                t0 = cpu->gpr[31];
+                v0 = cpu->gpr[2]; /* entry gate */
+            } else if (block_leader_phys == 0x00044DA4u) {
+                /* PolyG4 emit: sp+0x40/0x41 hold computed shade bytes. */
+                uint32_t sp = cpu->gpr[29];
+                t0 = psx_read_word(sp + 0x40u) & 0xFFFFu;
+                v0 = fp; /* OT link ptr */
+            } else if (block_leader_phys == 0x0006A52Cu) {
+                /* Wood emit entry: $t9=face list, $at=ctx, $s5=emit helper. */
+                t0 = cpu->gpr[25]; /* t9 */
+                v0 = cpu->gpr[1];  /* at */
+                depth = cpu->gpr[21]; /* s5 */
+            } else if (block_leader_phys == 0x0006ACE0u) {
+                /* Post helper-select: $s5 set, $a2=model.
+                 * ra may be clobbered by pre-emit jalr; trust s5 + model. */
+                t0 = cpu->gpr[21]; /* s5 helper */
+                v0 = cpu->gpr[6];  /* a2 model */
+                if (v0) {
+                    mode = psx_read_word(v0 + 184u); /* flags */
+                    /* face-list ptr @a2+200; depth = first face word */
+                    uint32_t faces = psx_read_word(v0 + 200u);
+                    depth = faces ? psx_read_word(faces) : 0;
+                    ot_base = faces;
+                    ot_index = faces ? psx_read_word(faces + 4u) : 0;
+                }
+            } else if (block_leader_phys == 0x0006AAF0u) {
+                /* Wood batch setup: $a0 stream, $ra = model (helpers at +92).
+                 * mode=flags@+184, depth=helper@+96, ot_base=name@+8,
+                 * ot_index=batch OT @+228 (live; model RAM is reused later). */
+                t0 = cpu->gpr[4];  /* a0 */
+                v0 = cpu->gpr[31]; /* model */
+                if (v0) {
+                    mode = psx_read_word(v0 + 184u);  /* draw flags */
+                    depth = psx_read_word(v0 + 96u);  /* s5 helper */
+                    ot_base = psx_read_word(v0 + 8u); /* name/tag */
+                    ot_index = psx_read_word(v0 + 228u); /* batch OT */
+                    if (ot_index)
+                        psx_nd_note_wood_batch_ot_tagged(ot_index, ot_base);
+                }
+            } else if (block_leader_phys == 0x0006AB58u) {
+                /* Fallthrough past flag bne — batch accepted. */
+                t0 = cpu->gpr[6]; /* a2 */
+                v0 = t0 ? psx_read_word(t0 + 184u) : 0;
+                depth = cpu->gpr[31]; /* desc */
+            } else if (block_leader_phys == 0x00044580u) {
+                /* MeshDraw post-dispatch: also pack GTE max SX into mode. */
+                {
+                    int32_t sx_max = -0x8000;
+                    for (int si = 12; si <= 14; si++) {
+                        int32_t sx = (int32_t)(int16_t)(cpu->gte_data[si] & 0xFFFFu);
+                        if (sx > sx_max) sx_max = sx;
+                    }
+                    mode = (uint32_t)sx_max;
+                }
+            } else if (block_leader_phys == 0x000444E8u) {
+                /* True MeshDraw entry: lh gp+0x4DC → v0 gate (observe pre-lh). */
+                t0 = cpu->gpr[28]; /* gp */
+                v0 = cpu->gpr[2];
+            } else if (block_leader_phys == 0x00069BB0u) {
+                /* Sibling matrix/OT setup entry: a1=ctx (s4+360), a0=mesh.
+                 * ot_index = preferred wood batch OT cache.
+                 * mode = CODE model+228, depth = GLOW model+228 when those
+                 * ND intro models are resident (stable addrs from batch stream). */
+                t0 = cpu->gpr[5]; /* a1 */
+                v0 = cpu->gpr[4]; /* a0 */
+                if (t0) {
+                    uint32_t main_ot = psx_read_word(t0 + 244u);
+                    ot_base = main_ot;
+                    /* s4+0xb4 = scene OT bump near WoodEmit batch pools. */
+                    if (t0 > 0xB4u)
+                        psx_nd_note_sibling_ot_hint(psx_read_word(t0 - 0xB4u));
+                }
+                ot_index = psx_nd_wood_batch_ot();
+                {
+                    /* ND intro digit/glow models — confirmed stable during rain. */
+                    const uint32_t code_m = 0x800FF390u;
+                    const uint32_t glow_m = 0x800FF294u;
+                    uint32_t code_tag = psx_read_word(code_m + 8u);
+                    uint32_t glow_tag = psx_read_word(glow_m + 8u);
+                    mode = (code_tag == 0x45444F43u) ? psx_read_word(code_m + 228u) : 0;
+                    depth = (glow_tag == 0x574F4C47u) ? psx_read_word(glow_m + 228u) : 0;
+                    if (mode)
+                        psx_nd_note_wood_batch_ot_tagged(mode, 0x45444F43u);
+                    else if (depth)
+                        psx_nd_note_wood_batch_ot_tagged(depth, 0x574F4C47u);
+                }
+            } else if (block_leader_phys == 0x00069C34u ||
+                       block_leader_phys == 0x00069CC4u) {
+                /* Face-loop jal / entry: a3 = OT origin (last slot). */
+                t0 = cpu->gpr[7]; /* a3 */
+                v0 = cpu->gpr[5]; /* a1 */
+                mode = cpu->gpr[4]; /* a0 mesh */
+                depth = t0;
+                ot_base = (t0 >= 4092u) ? (t0 - 4092u) : 0;
+            } else if (digit_rain_ot) {
+                /* NdIntroDigitRainCode36: $t3 = OT slot; expose vs game ot_base. */
+                t0 = ot_ptr;
+                v0 = ot_index;
+                depth = otz;
+            }
+            s->last_t0 = t0;
+            s->last_fp = fp;
+            s->last_v0 = v0;
+            s->last_mode = mode;
+            s->last_depth = depth;
+            s->last_ot_base = ot_base;
+            s->last_ot_index = ot_index;
+            s->last_frame = (uint32_t)s_frame_count;
+            if (t0 == 0) s->t0_zero++;
+            else s->t0_nonzero++;
+            if (s_pc_probe_sample_n < s_pc_probe_sample_max &&
+                s_pc_probe_sample_n < PC_PROBE_SAMPLE_CAP) {
+                PcProbeSample *sm = &s_pc_probe_samples[s_pc_probe_sample_n++];
+                sm->pc = block_leader_phys;
+                sm->frame = (uint32_t)s_frame_count;
+                sm->t0 = t0;
+                sm->fp = fp;
+                sm->v0 = v0;
+                sm->mode = mode;
+                sm->depth = depth;
+                sm->ot_base = ot_base;
+                sm->ot_index = ot_index;
+            }
+        }
+        return;
+    }
+}
+
 /* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
  * EVERY compiled block leader (under #ifndef PSX_NO_DEBUG_TOOLS, so prod builds
  * emit nothing — zero overhead) so native's cycle observation matches Beetle's
@@ -2360,11 +2772,81 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     return;
 #else
     if (s_fmv_quiet) return;
-    cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
+    uint32_t phys = block_leader_phys & 0x1FFFFFFFu;
+    /* ND debug: PSX_ND_WOOD_CLEAR80=1 clears model+184 bit0x80 at the flag-load
+     * leader so 0x5CF/'cras' models enter NdIntroWoodBatchSetup's textured path.
+     * Fires before lw v1,184(a2) @ AB3C. Default-off. */
+    if (phys == 0x0006AB3Cu) {
+        static int s_clear80 = -1;
+        if (s_clear80 < 0) {
+            const char *e = getenv("PSX_ND_WOOD_CLEAR80");
+            s_clear80 = (e && *e && *e != '0') ? 1 : 0;
+            if (s_clear80)
+                fprintf(stdout, "psxrecomp: PSX_ND_WOOD_CLEAR80 enabled\n");
+        }
+        if (s_clear80 && debug_cpu_ptr) {
+            uint32_t a2 = debug_cpu_ptr->gpr[6];
+            if (a2) {
+                uint32_t fl = psx_read_word(a2 + 184u);
+                if (fl & 0x80u)
+                    psx_write_word(a2 + 184u, fl & ~0x80u);
+            }
+        }
+    }
+    /* Cache WoodEmit batch OT at WoodBatchSetup (runs BEFORE sibling on ND
+     * rain frames) and at scratch load. */
+    if (phys == 0x0006AAF0u && debug_cpu_ptr) {
+        uint32_t model = debug_cpu_ptr->gpr[31]; /* $ra = model */
+        if (model) {
+            uint32_t tag = psx_read_word(model + 8u);
+            uint32_t base = psx_read_word(model + 228u);
+            if (base)
+                psx_nd_note_wood_batch_ot_tagged(base, tag);
+        }
+    }
+    if ((phys == 0x0006ACFCu || phys == 0x0006AD08u) && debug_cpu_ptr) {
+        uint32_t base = 0;
+        if (phys == 0x0006ACFCu) {
+            uint32_t a2 = debug_cpu_ptr->gpr[6];
+            if (a2)
+                base = psx_read_word(a2 + 228u);
+        } else {
+            base = debug_cpu_ptr->gpr[5]; /* a1 after lw model+228 */
+        }
+        if (base)
+            psx_nd_note_wood_batch_ot(base);
+    }
+    /* ND debug: PSX_ND_SIB_OT_LIFT=<n> adds n*4 to $a3 at sibling face-loop
+     * entry 0x80069CC4 (a3 = *(a1+244)+4092 = last OT slot). Sibling PolyFT3
+     * right-flap faces use face_hi≈0 → farthest bucket (drawn before additive
+     * 0x36 glow). Negative n (e.g. -800) moves them nearer in the 1024-entry OT.
+     * Applied once per a3 value. */
+    if (phys == 0x00069CC4u && debug_cpu_ptr) {
+        static int s_sib_lift = -2; /* -2 unset, 0 disabled, else delta */
+        static uint32_t s_sib_lifted_a3 = 0;
+        if (s_sib_lift == -2) {
+            const char *e = getenv("PSX_ND_SIB_OT_LIFT");
+            if (e && *e) {
+                s_sib_lift = atoi(e);
+                fprintf(stdout, "psxrecomp: PSX_ND_SIB_OT_LIFT=%d\n", s_sib_lift);
+            } else {
+                s_sib_lift = 0;
+            }
+        }
+        if (s_sib_lift != 0) {
+            uint32_t a3 = debug_cpu_ptr->gpr[7];
+            if (a3 && a3 != s_sib_lifted_a3) {
+                debug_cpu_ptr->gpr[7] = a3 + (uint32_t)(int32_t)(s_sib_lift * 4);
+                s_sib_lifted_a3 = debug_cpu_ptr->gpr[7];
+            }
+        }
+    }
+    cyc_watch_observe(phys);
+    pc_probe_observe(phys);
     /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
      * on the armed frame window; ~free (one branch) when disarmed. */
     { extern void ls_at_leader(uint32_t, CPUState*); extern CPUState *debug_cpu_ptr;
-      ls_at_leader(block_leader_phys & 0x1FFFFFFFu, debug_cpu_ptr); }
+      ls_at_leader(phys, debug_cpu_ptr); }
 #endif
 }
 
@@ -4868,6 +5350,98 @@ static void handle_call_func(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"v0\":\"0x%08X\"}", id, s_cpu->gpr[2]);
 }
 
+/* geom_correction — is [video] geometry_correction / perspective_texturing
+ * actually doing anything on THIS title?
+ *
+ * Both enhancements are silent no-ops on content they cannot prove is
+ * projected geometry: a vertex whose sub-pixel fraction was never cached, or a
+ * packet whose position words lack full GTE projection provenance, simply draws
+ * the faithful way. So "enabled" alone tells you nothing — these counters are
+ * how you tell an engaged correction from an inert one. Both are free-running
+ * totals; sample twice and diff for a per-window rate. */
+static void handle_geom_correction(int id, const char *json)
+{
+    (void)json;
+    /* The miss split is the diagnostic that matters. The position table is
+     * exact (one slot per reachable SXY, no hashing), so "unrecorded" means no
+     * projection was EVER cached at that screen position — a real coverage gap
+     * in the tracking, not a cache artifact. A high unrecorded share means the
+     * game's vertex path never reaches us in a matchable form, which only
+     * full value propagation can fix; a high ambiguous share instead means
+     * distinct vertices are landing on the same pixel. */
+    uint32_t lookups = 0, hits = 0, unrec = 0, ambig = 0;
+    gte_geometry_correction_stats(&lookups, &hits, &unrec, &ambig);
+    /* PGXP dataflow census (per-vertex): the primary provenance source.
+     * dataflow_hit is the number that had to move — the G1.9 gate is a
+     * dataflow-hit share dramatically above the 5.2% the position table
+     * measured on its own. value_mismatch counts shadows that were present
+     * but described a different word (stale = provenance hole to hunt). */
+    PGXPStats ps;
+    pgxp_get_stats(&ps);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"geometry_correction\":%d,"
+             "\"geometry_vertex_hits\":%u,"
+             "\"perspective_triangles\":%u,"
+             "\"lookups\":%u,\"miss_unrecorded\":%u,\"miss_ambiguous\":%u,"
+             "\"pgxp\":{\"enabled\":%d,\"cpu_mode\":%d,\"tolerance\":%.3f,"
+             "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
+             "\"native\":%llu,\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
+             "\"tolerance_reject\":%llu,\"w_valid\":%llu,"
+             "\"produced\":%llu,\"swc2_stores\":%llu}}",
+             id,
+             gte_geometry_correction_enabled(),
+             (unsigned)hits,
+             (unsigned)gpu_texture_correction_hits(),
+             (unsigned)lookups, (unsigned)unrec, (unsigned)ambig,
+             pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+             (unsigned long long)ps.lookups,
+             (unsigned long long)ps.dataflow_hit,
+             (unsigned long long)ps.fallback_hit,
+             (unsigned long long)ps.native,
+             (unsigned long long)ps.value_mismatch,
+             (unsigned long long)ps.trunc_reject,
+             (unsigned long long)ps.tolerance_reject,
+             (unsigned long long)ps.w_valid,
+             (unsigned long long)ps.produced,
+             (unsigned long long)ps.swc2_stores);
+}
+
+/* pgxp — live-tune the value-propagation engine for one-toggle isolation runs
+ * without a rebuild: {"cmd":"pgxp","cpu_mode":0|1,"tolerance":F}. Fields are
+ * optional; the reply echoes the resulting state (same shape as
+ * geom_correction's "pgxp" object, flattened). */
+static void handle_pgxp(int id, const char *json)
+{
+    /* Live toggles for the one-toggle-at-a-time A/B protocol (ENHANCEMENTS.md
+     * G1.6 method rule): same scene, flip one knob, screenshot_hires. */
+    int geom = json_get_int(json, "geometry", -1);
+    if (geom >= 0)
+        gte_geometry_correction_set(geom != 0);
+    int tex = json_get_int(json, "texture", -1);
+    if (tex >= 0)
+        gpu_texture_correction_set(tex != 0);
+    if (geom >= 0 && tex < 0) {
+        /* keep the engine armed consistently with both flags */
+        gpu_texture_correction_set(gpu_texture_correction_enabled());
+    }
+    int cm = json_get_int(json, "cpu_mode", -1);
+    if (cm >= 0)
+        pgxp_set_cpu_mode(cm != 0);
+    /* tolerance is fractional (sub-pixel), so scan it directly — json_get_int
+     * would truncate 0.5 to 0. */
+    const char *p = strstr(json, "\"tolerance\"");
+    if (p) {
+        p += 11;
+        while (*p == ' ' || *p == ':' || *p == '"') p++;
+        if (*p == '-' || (*p >= '0' && *p <= '9') || *p == '.')
+            pgxp_set_tolerance((float)strtod(p, NULL));
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"cpu_mode\":%d,"
+             "\"tolerance\":%.3f,\"suppress\":%u,\"active\":%d}",
+              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+              (unsigned)pgxp_test_suppress_depth(), pgxp_test_active());
+}
+
 static void handle_gpu_state(int id, const char *json)
 {
     (void)json;
@@ -4881,6 +5455,8 @@ static void handle_gpu_state(int id, const char *json)
     gpu_get_draw_area(&da);
     uint64_t nop, fill, draw, env, copy;
     gpu_get_gp0_stats(&nop, &fill, &draw, &env, &copy);
+    int split_active = 0, split_left_age = 0, split_right_age = 0;
+    gpu_vertical_split_debug(&split_active, &split_left_age, &split_right_age);
     GpuWsDebug ws;
     gpu_ws_get_debug(&ws);
     send_fmt("{\"id\":%d,\"ok\":true,"
@@ -4895,12 +5471,23 @@ static void handle_gpu_state(int id, const char *json)
              "\"gp0_nop\":%llu,\"gp0_fill\":%llu,\"gp0_draw\":%llu,\"gp0_env\":%llu,\"gp0_copy\":%llu,"
              "\"draw_area\":[%u,%u,%u,%u],"
              "\"draw_offset\":[%d,%d],"
+             "\"vertical_split\":{\"active\":%d,\"left_age\":%d,\"right_age\":%d},"
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
-             "\"present_native_43\":%d,\"x_margin\":%d,\"squash\":[%d,%d],"
+             "\"present_native_43\":%d,\"x_margin\":%d,"
+             "\"activation_margin\":%d,\"squash\":[%d,%d],"
              "\"mode\":%d,\"nw_extra\":%d,"
              "\"cur_frame\":%llu,\"last_tag_frame\":%u,\"last_3d_frame\":%u,"
              "\"gte_verts\":%u,\"last_world3d_frame\":%u,"
-             "\"ovh_prims\":%u,\"last_ovh_frame\":%u}}",
+             "\"ovh_prims\":%u,\"last_ovh_frame\":%u,"
+             "\"auto_ui\":{\"configured\":%d,\"dense\":%d,\"ot_rank\":%u,"
+             "\"candidates\":%llu,\"transforms\":%llu},"
+             "\"aspect_cone\":{\"calls\":%llu,\"identity_43\":%llu,"
+             "\"vanilla_keep\":%llu,\"visible_keep\":%llu,"
+             "\"guard_keep\":%llu,\"hysteresis_keep\":%llu,"
+             "\"outside_reject\":%llu,\"queue_reject\":%llu,"
+             "\"queue_highwater\":[%u,%u,%u]},"
+             "\"terrain_angle\":{\"calls\":%llu,\"identity_43\":%llu,"
+             "\"max_vanilla\":%u,\"max_widened\":%u}}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
@@ -4913,12 +5500,59 @@ static void handle_gpu_state(int id, const char *json)
              (unsigned long long)copy,
              da.left, da.top, da.right, da.bottom,
              da.offset_x, da.offset_y,
+             split_active, split_left_age, split_right_age,
              ws.configured, ws.active, ws.game_mode,
-             ws.present_native_43, ws.x_margin, ws.xnum, ws.xden,
+             ws.present_native_43, ws.x_margin, ws.activation_margin,
+             ws.xnum, ws.xden,
              ws.mode, ws.nw_extra,
              (unsigned long long)ws.cur_frame, ws.last_tag_frame,
-             ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
-             ws.ovh_prims, ws.last_ovh_frame);
+              ws.last_3d_frame, ws.gte_verts, ws.last_world3d_frame,
+              ws.ovh_prims, ws.last_ovh_frame,
+              ws.auto_ui_squash, ws.auto_ui_dense, ws.auto_ui_ot_rank,
+              (unsigned long long)ws.auto_ui_candidates,
+              (unsigned long long)ws.auto_ui_transforms,
+              (unsigned long long)ws.aspect_cone_calls,
+             (unsigned long long)ws.aspect_cone_43_identity,
+             (unsigned long long)ws.aspect_cone_vanilla_keep,
+             (unsigned long long)ws.aspect_cone_visible_keep,
+             (unsigned long long)ws.aspect_cone_guard_keep,
+             (unsigned long long)ws.aspect_cone_hysteresis_keep,
+             (unsigned long long)ws.aspect_cone_outside_reject,
+             (unsigned long long)ws.aspect_cone_queue_reject,
+             ws.aspect_cone_queue_highwater[0],
+             ws.aspect_cone_queue_highwater[1],
+             ws.aspect_cone_queue_highwater[2],
+             (unsigned long long)ws.angle_calls,
+             (unsigned long long)ws.angle_43_identity,
+             ws.angle_max_vanilla, ws.angle_max_widened);
+}
+
+static void handle_ws_aspect_cone_site(int id, const char *json)
+{
+    char addr_str[32];
+    if (!json_get_str(json, "address", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing address");
+        return;
+    }
+    GpuWsAspectConeSiteDebug site;
+    if (!gpu_ws_get_aspect_cone_site_debug(hex_to_u32(addr_str), &site)) {
+        send_err(id, "aspect-cone site not configured");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"address\":\"0x%08X\","
+             "\"calls\":%llu,\"identity_43\":%llu,"
+             "\"vanilla_keep\":%llu,\"visible_keep\":%llu,"
+             "\"guard_keep\":%llu,\"hysteresis_keep\":%llu,"
+             "\"outside_reject\":%llu,\"queue_reject\":%llu}",
+             id, site.address,
+             (unsigned long long)site.calls,
+             (unsigned long long)site.identity_43,
+             (unsigned long long)site.vanilla_keep,
+             (unsigned long long)site.visible_keep,
+             (unsigned long long)site.guard_keep,
+             (unsigned long long)site.hysteresis_keep,
+             (unsigned long long)site.outside_reject,
+             (unsigned long long)site.queue_reject);
 }
 
 static void handle_mem_words(int id, const char *json)
@@ -5671,10 +6305,10 @@ static void handle_gpu_frame_dump(int id, const char *json)
         const GpuGp0RingEntry *e = &entries[i];
         pos += (size_t)snprintf(buf + pos, buf_sz - pos,
             "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,"
-            "\"src\":\"0x%08X\",\"pc\":\"0x%08X\","
+            "\"src\":\"0x%08X\",\"ot\":%u,\"pc\":\"0x%08X\","
             "\"func\":\"0x%08X\",\"ra\":\"0x%08X\",\"w\":[",
             i ? "," : "", e->seq, e->opcode, e->n_words,
-            e->src_addr, e->pc, e->func, e->ra);
+            e->src_addr, (unsigned)e->ot_rank, e->pc, e->func, e->ra);
         int show = e->n_words < GPU_GP0_RING_MAX_WORDS
                  ? e->n_words : GPU_GP0_RING_MAX_WORDS;
         for (int k = 0; k < show && pos < buf_sz - 32; k++) {
@@ -6196,6 +6830,13 @@ static void handle_spu_status(int id, const char *json)
     (void)json;
     SpuDebugInfo info;
     spu_debug_info(&info);
+    /* The DSP-fidelity state (issue #103: SPU IRQ, reverb, noise, sweeps) lives
+     * in SpuGlobalState. Surfaced here so the whole SPU can be judged from one
+     * always-on query — without it there is no way to tell whether the reverb
+     * engine is actually stepping, whether the IRQ is armed, or which volume
+     * registers are sweeping. */
+    SpuGlobalState g;
+    spu_get_global_state(&g);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"ctrl\":\"0x%04X\",\"active_mask\":\"0x%06X\","
              "\"main_l\":%d,\"main_r\":%d,"
@@ -6204,7 +6845,15 @@ static void handle_spu_status(int id, const char *json)
              "\"render_frames\":%llu,\"nonzero_frames\":%llu,"
              "\"last_peak\":%d,\"peak\":%d,"
              "\"cd_frames\":%u,\"cd_push_frames\":%llu,"
-             "\"cd_overflow_frames\":%llu,\"cd_underflow_frames\":%llu}",
+             "\"cd_overflow_frames\":%llu,\"cd_underflow_frames\":%llu,"
+             "\"pmon\":\"0x%06X\",\"non\":\"0x%06X\",\"eon\":\"0x%06X\","
+             "\"endx\":\"0x%06X\","
+             "\"irq_flag\":%u,\"irq_addr\":\"0x%05X\","
+             "\"reverb_on\":%u,\"reverb_mbase\":\"0x%05X\","
+             "\"reverb_cur\":\"0x%05X\",\"capture_pos\":\"0x%03X\","
+             "\"noise_lfsr\":\"0x%04X\","
+             "\"sweep_l_mask\":\"0x%06X\",\"sweep_r_mask\":\"0x%06X\","
+             "\"sweep_main\":%u}",
              id,
              info.ctrl & 0xFFFFu,
              info.active_mask & 0xFFFFFFu,
@@ -6220,7 +6869,21 @@ static void handle_spu_status(int id, const char *json)
              info.cd_frames,
              (unsigned long long)info.cd_push_frames,
              (unsigned long long)info.cd_overflow_frames,
-             (unsigned long long)info.cd_underflow_frames);
+             (unsigned long long)info.cd_underflow_frames,
+             g.pmon & 0xFFFFFFu,
+             g.non  & 0xFFFFFFu,
+             g.eon  & 0xFFFFFFu,
+             g.endx & 0xFFFFFFu,
+             (unsigned)g.irq_flag,
+             g.irq_addr & 0xFFFFFu,
+             (unsigned)g.reverb_on,
+             g.reverb_mbase & 0xFFFFFu,
+             g.reverb_cur & 0xFFFFFu,
+             g.capture_pos & 0xFFFu,
+             (unsigned)g.noise_lfsr,
+             g.sweep_l_mask & 0xFFFFFFu,
+             g.sweep_r_mask & 0xFFFFFFu,
+             (unsigned)g.sweep_main);
 }
 
 /* ---- Per-voice SPU snapshot. Mirrors fields the Beetle oracle exposes
@@ -6236,7 +6899,9 @@ static void handle_spu_voices(int id, const char *json)
     SpuGlobalState g;
     spu_get_global_state(&g);
 
-    size_t cap = 8192;
+    /* 24 voices x ~280 chars + header. Headroom matters: snprintf would silently
+     * truncate mid-object and hand the caller unparseable JSON. */
+    size_t cap = 16384;
     char *out = (char *)malloc(cap);
     if (!out) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
     size_t off = 0;
@@ -6265,7 +6930,11 @@ static void handle_spu_voices(int id, const char *json)
             "\"adsr_lo\":\"0x%04X\",\"adsr_hi\":\"0x%04X\","
             "\"cur_addr\":\"0x%05X\",\"repeat_addr\":\"0x%05X\","
             "\"flags\":\"0x%02X\",\"sample_idx\":%d,\"phase\":\"0x%04X\","
-            "\"env\":\"0x%04X\",\"env_phase\":%d}",
+            "\"env\":\"0x%04X\",\"env_phase\":%d,"
+            /* Live effective volumes. For a sweeping register (bit 15 set) the
+             * vol_l/vol_r control words above say nothing about the current
+             * level, so these are the only way to see a sweep actually glide. */
+            "\"vol_cur_l\":%d,\"vol_cur_r\":%d}",
             v == 0 ? "" : ",",
             v, s.active,
             s.vol_ctrl_l, s.vol_ctrl_r,
@@ -6275,7 +6944,8 @@ static void handle_spu_voices(int id, const char *json)
             s.adsr_lo, s.adsr_hi,
             s.cur_addr, s.repeat_addr,
             s.last_flags, s.sample_idx, s.phase,
-            s.env_level, s.adsr_phase);
+            s.env_level, s.adsr_phase,
+            s.vol_cur_l, s.vol_cur_r);
         if (n > 0) off += (size_t)n;
     }
     n = snprintf(out + off, cap - off, "]}");
@@ -6304,7 +6974,7 @@ static void handle_spu_ram(int id, const char *json)
 }
 
 /* ---- SPU event ring dump. Returns the most recent N events
- * (KEYON / KEYOFF / END_STOP / END_LOOP) with frame timestamps. */
+ * (KEYON / KEYOFF / END_STOP / END_LOOP / IRQ) with frame timestamps. */
 static void handle_spu_events(int id, const char *json)
 {
     int count = json_get_int(json, "count", 256);
@@ -6314,7 +6984,12 @@ static void handle_spu_events(int id, const char *json)
     if (!evs) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"alloc\"}", id); return; }
     uint32_t got = spu_event_get(evs, (uint32_t)count);
     uint64_t total = spu_event_total();
-    static const char *kind_names[5] = { "?", "KEYON", "KEYOFF", "END_STOP", "END_LOOP" };
+    /* Index by SpuEventKind (spu.h). IRQ (=5) is not voice-attributable; the
+     * ring stores voice=0xFF for it and `addr` is the byte address that matched
+     * the programmed IRQ address. Keep this table in step with SpuEventKind or
+     * a new kind renders as "?". */
+    static const char *kind_names[6] = { "?", "KEYON", "KEYOFF", "END_STOP",
+                                         "END_LOOP", "IRQ" };
 
     /* Worst case ~200 chars per event; 64 KB is plenty for 4096 events. */
     size_t cap = 256u + (size_t)got * 256u;
@@ -6327,7 +7002,8 @@ static void handle_spu_events(int id, const char *json)
     if (n > 0) off += (size_t)n;
     for (uint32_t i = 0; i < got; i++) {
         const SpuEvent *e = &evs[i];
-        const char *kn = (e->kind <= 4) ? kind_names[e->kind] : "?";
+        const char *kn = (e->kind < sizeof(kind_names) / sizeof(kind_names[0]))
+                         ? kind_names[e->kind] : "?";
         n = snprintf(out + off, cap - off,
             "%s{\"seq\":%llu,\"frame\":%u,\"pc\":\"0x%08X\",\"func\":\"0x%08X\",\"kind\":\"%s\",\"v\":%d,"
             "\"pitch\":\"0x%04X\",\"addr\":\"0x%05X\","
@@ -6363,7 +7039,8 @@ static void handle_spu_events_reset(int id, const char *json)
  *                UNDERRUN/MUTE/UNMUTE/CD_PUSH/DMA), sample-clock stamped.
  * Protocol mirrored on psx-beetle's port 4380 (beetle_debug_server.c). */
 /* Bridge/legacy output health (main.cpp; C linkage). Returns 0 pre-device. */
-extern int psx_audio_out_stats(double *fill_ms, uint64_t *underruns,
+extern int psx_audio_out_stats(double *fill_ms, double *target_ms,
+                               uint64_t *underruns,
                                uint64_t *overflow_drops, double *correction,
                                int *legacy, int *host_rate);
 
@@ -6372,11 +7049,12 @@ static void handle_audio_stats(int id, const char *json)
     (void)json;
     AudioTraceStats st;
     audio_trace_get_stats(&st);
-    double fill_ms = 0.0, correction = 0.0;
+    double fill_ms = 0.0, target_ms = 0.0, correction = 0.0;
     uint64_t out_underruns = 0, overflow_drops = 0;
     int legacy = 1, host_rate = 44100;
-    int out_ok = psx_audio_out_stats(&fill_ms, &out_underruns, &overflow_drops,
-                                     &correction, &legacy, &host_rate);
+    int out_ok = psx_audio_out_stats(&fill_ms, &target_ms, &out_underruns,
+                                     &overflow_drops, &correction, &legacy,
+                                     &host_rate);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"taps\":["
              "{\"name\":\"spu_out\",\"frames\":%llu,\"nonzero\":%llu,"
@@ -6389,7 +7067,8 @@ static void handle_audio_stats(int id, const char *json)
              "\"queue_hiwater\":%u,\"queue_lowater\":%u,"
              "\"mutes\":%llu,\"unmutes\":%llu,\"events_total\":%llu,"
              "\"out\":{\"active\":%d,\"mode\":\"%s\",\"host_rate\":%d,"
-             "\"fill_ms\":%.1f,\"underruns\":%llu,\"overflow_drops\":%llu,"
+             "\"fill_ms\":%.1f,\"target_ms\":%.1f,\"underruns\":%llu,"
+             "\"overflow_drops\":%llu,"
              "\"correction\":%.5f}}",
              id,
              (unsigned long long)st.tap_frames[0],
@@ -6412,7 +7091,7 @@ static void handle_audio_stats(int id, const char *json)
              (unsigned long long)st.unmute_events,
              (unsigned long long)st.events_total,
              out_ok, legacy ? "legacy-push" : "bridge-pull", host_rate,
-             fill_ms,
+             fill_ms, target_ms,
              (unsigned long long)out_underruns,
              (unsigned long long)overflow_drops,
              correction);
@@ -6673,6 +7352,41 @@ static void handle_imask_trace(int id, const char *json)
     send_fmt("]}\n");
 }
 
+/* Post-probe bit7 → TX 0x57 handoff (Ape Escape LOAD). */
+static void handle_card_handoff(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 64);
+    int idx = 0, total = 0;
+    const SioCardHandoffEntry *buf = sio_get_card_handoff(&idx, &total);
+    int cap = sio_card_handoff_cap();
+    int avail = total < cap ? total : cap;
+    if (count > avail) count = avail;
+    if (count < 0) count = 0;
+
+    int start = count ? (idx - count + cap) % cap : 0;
+    static const char *kinds[] = {
+        "?", "probe_abort", "b7_set", "b7_clear", "tx", "card_ack", "unstick",
+        "select_flush_ack", "ack_deferred_istat7", "nest_irq_pulse", "b7_hold"
+    };
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%d,\"count\":%d,\"entries\":[",
+             id, sio_card_handoff_armed(), total, count);
+    for (int i = 0; i < count; i++) {
+        const SioCardHandoffEntry *e = &buf[(start + i) % cap];
+        const char *k = (e->kind < (uint8_t)(sizeof(kinds) / sizeof(kinds[0])))
+                            ? kinds[e->kind] : "?";
+        if (i) send_fmt(",");
+        send_fmt("{\"kind\":\"%s\",\"byte\":\"0x%02X\",\"imask\":\"0x%03X\","
+                 "\"pc\":\"0x%08X\",\"func\":\"0x%08X\","
+                 "\"a6c10\":\"0x%08X\",\"b4e30\":\"0x%08X\",\"b4e38\":\"0x%08X\","
+                 "\"cyc\":%llu}",
+                 k, e->byte, e->imask,
+                 (unsigned)e->pc, (unsigned)e->func,
+                 (unsigned)e->a6c10, (unsigned)e->b4e30, (unsigned)e->b4e38,
+                 (unsigned long long)e->cyc);
+    }
+    send_fmt("]}\n");
+}
+
 static void handle_sio_trace(int id, const char *json)
 {
     int count = json_get_int(json, "count", 64);
@@ -6714,21 +7428,6 @@ static void handle_sio_trace(int id, const char *json)
     }
 
     send_fmt("]}\n");
-}
-
-/* Live get/set of the pad config-SM mode, for A/B testing the LEGACY Tomba
- * Hybrid compatibility path (normally driven per-game by [controller]
- * legacy_pad_config; see sio.c g_pad_legacy_cfg for the full story).
- *   {"cmd":"pad_cfg"}            -> report current mode
- *   {"cmd":"pad_cfg","set":1}   -> legacy pre-98aa688 "always 0xF3" config
- *   {"cmd":"pad_cfg","set":0}   -> modern DualShock config state machine (default) */
-static void handle_pad_cfg(int id, const char *json)
-{
-    int set = json_get_int(json, "set", -1);
-    if (set >= 0) sio_set_legacy_cfg(set);
-    int mode = sio_get_legacy_cfg();
-    send_fmt("{\"id\":%d,\"ok\":true,\"legacy_cfg\":%d,\"mode\":\"%s\"}\n",
-             id, mode, mode ? "legacy-0xF3" : "new-state-machine");
 }
 
 static void handle_sio_trace_window(int id, const char *json)
@@ -7287,11 +7986,82 @@ static void handle_pad_status(int id, const char *json)
 static void handle_clear_input(int id, const char *json)
 {
     (void)json;
+    s_input_route_active = 0;
+    s_input_route_index = 0;
+    s_input_route_remaining = 0;
     s_input_override = -1;
     s_input_frames   = 0;
     s_axis_override  = 0;
     s_axis_st[0] = s_axis_st[1] = s_axis_st[2] = s_axis_st[3] = 0x80;
     send_ok(id);
+}
+
+static void handle_input_route_clear(int id, const char *json)
+{
+    (void)json;
+    s_input_route_active = 0;
+    s_input_route_count = 0;
+    s_input_route_index = 0;
+    s_input_route_remaining = 0;
+    send_ok(id);
+}
+
+static void handle_input_route_append(int id, const char *json)
+{
+    int frames = json_get_int(json, "frames", -1);
+    int buttons = json_get_int(json, "buttons", -1);
+    if (s_input_route_active) {
+        send_err(id, "input route is active"); return;
+    }
+    if (frames <= 0) {
+        send_err(id, "frames must be positive"); return;
+    }
+    if (buttons < 0 || buttons > 0xFFFF) {
+        send_err(id, "buttons must be a 16-bit pad word"); return;
+    }
+    if (s_input_route_count >= INPUT_ROUTE_MAX_STEPS) {
+        send_err(id, "input route is full"); return;
+    }
+    InputRouteStep *step = &s_input_route[s_input_route_count++];
+    step->frames = (uint32_t)frames;
+    step->buttons = (uint16_t)buttons;
+    send_fmt("{\"id\":%d,\"ok\":true,\"steps\":%u}\n",
+             id, (unsigned)s_input_route_count);
+}
+
+static void handle_input_route_start(int id, const char *json)
+{
+    (void)json;
+    if (s_input_route_count == 0) {
+        send_err(id, "input route is empty"); return;
+    }
+    s_input_override = -1;
+    s_input_frames = 0;
+    s_axis_override = 0;
+    s_input_route_index = 0;
+    s_input_route_remaining = s_input_route[0].frames;
+    s_input_route_active = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"steps\":%u,\"start_frame\":%llu}\n",
+             id, (unsigned)s_input_route_count,
+             (unsigned long long)s_frame_count);
+}
+
+static void handle_input_route_stop(int id, const char *json)
+{
+    (void)json;
+    s_input_route_active = 0;
+    s_input_route_remaining = 0;
+    send_ok(id);
+}
+
+static void handle_input_route_status(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":%s,\"steps\":%u,"
+             "\"index\":%u,\"remaining\":%u}\n",
+             id, s_input_route_active ? "true" : "false",
+             (unsigned)s_input_route_count, (unsigned)s_input_route_index,
+             (unsigned)s_input_route_remaining);
 }
 
 /* Live A/B for the native-wide HUD corner gate:
@@ -7330,8 +8100,9 @@ static void handle_ws_margin(int id, const char *json)
     gpu_ws_set_margin_override(v);
     GpuWsDebug ws;
     gpu_ws_get_debug(&ws);
-    send_fmt("{\"id\":%d,\"ok\":true,\"override\":%d,\"x_margin\":%d,\"active\":%d}",
-             id, v, ws.x_margin, ws.active);
+    send_fmt("{\"id\":%d,\"ok\":true,\"override\":%d,\"x_margin\":%d,"
+             "\"activation_margin\":%d,\"active\":%d}",
+             id, v, ws.x_margin, ws.activation_margin, ws.active);
 }
 
 /* frame_perf: per-frame GPU/CPU phase timing (gpu_gl_renderer.c frame_perf ring).
@@ -7649,28 +8420,6 @@ static void handle_ws_census(int id, const char *json)
              id, n, path, (unsigned long long)gpu_ws_census_seq());
 }
 
-static void handle_mmx6_reveal(int id, const char *json)
-{
-    extern void gpu_ws_mmx6_set_hostside(int on);
-    extern int  gpu_ws_mmx6_hostside_get(void);
-    extern int  gpu_ws_mmx6_reveal_is_active(void);
-    extern long gpu_ws_mmx6_emit_tiles(void);
-    extern long gpu_ws_mmx6_emit_calls(void);
-    extern int  gpu_ws_mmx6_clut_count(void);
-    extern void gpu_ws_mmx6_set_reloc(int on);
-    extern int  gpu_ws_mmx6_reloc_get(void);
-    int on = json_get_int(json, "on", -1);
-    if (on >= 0) gpu_ws_mmx6_set_hostside(on);
-    int reloc = json_get_int(json, "reloc", -1);
-    if (reloc >= 0) gpu_ws_mmx6_set_reloc(reloc);
-    (void)gpu_ws_mmx6_reloc_get;
-    send_fmt("{\"id\":%d,\"ok\":true,\"hostside\":%d,\"active\":%d,"
-             "\"clut_cached\":%d,\"last_emit_tiles\":%ld,\"emit_calls\":%ld}",
-             id, gpu_ws_mmx6_hostside_get(), gpu_ws_mmx6_reveal_is_active(),
-             gpu_ws_mmx6_clut_count(), gpu_ws_mmx6_emit_tiles(),
-             gpu_ws_mmx6_emit_calls());
-}
-
 static void handle_mmx6_freshfix(int id, const char *json)
 {
     extern void gpu_ws_mmx6_set_freshfix(int on);
@@ -7686,8 +8435,9 @@ static void handle_mmx6_freshfix(int id, const char *json)
              id, gpu_ws_mmx6_freshfix_get(), gpu_ws_mmx6_refill_cols(), total, bad);
 }
 
-/* Save-state save/load via the debug server (mirrors the F1-F12 / Shift+F1-F12
- * keys) so the flow can be driven headlessly. {"cmd":"savestate","op":"save"|
+/* Save-state save/load via the debug server. Player-facing hotkeys route
+ * through the F7 save-state menu; this command keeps the flow headless.
+ * {"cmd":"savestate","op":"save"|
  * "load","slot":N}. The request is staged and runs at the next block boundary
  * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
 static void handle_savestate(int id, const char *json)
@@ -8111,9 +8861,11 @@ static void handle_get_snapshots(int id, const char *json)
  * — which keeps the self-contained static runtime self-contained. */
 #include "png_write.h"   /* png_write_rgb + zlib/CRC helpers (shared with Beetle) */
 
-/* Unified screenshot: writes an 8-bit RGB PNG of the current display to "path"
- * (default psx_screenshot.png in the runtime cwd) and answers with a single
- * metadata line.  Registered as both "screenshot" and "screenshot_file";
+/* Canonical screenshot: writes an 8-bit RGB PNG of the current PSX display to
+ * "path" (default psx_screenshot.png in the runtime cwd) and answers with a
+ * single metadata line. Registered as "screenshot_file"; the user-facing
+ * "screenshot" command selects the presented native-wide surface when one is
+ * active and falls back to this canonical capture at 4:3.
  * the old "screenshot" inline-hex-row variant streamed h+1 response lines
  * per request, which violated the one-request/one-response protocol and
  * poisoned every client connection that used it. */
@@ -8148,7 +8900,7 @@ typedef struct {
     uint16_t *native_px;          /* Native-wide phase surface */
     uint16_t *vram;               /* full 1024x512 */
 } DispRingEntry;
-static DispRingEntry s_disp_ring[DISP_RING_CAP];
+static PSX_BSS DispRingEntry s_disp_ring[DISP_RING_CAP];
 static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
@@ -8384,8 +9136,81 @@ static void handle_screenshot_file(int id, const char *json)
              id, path, w, h);
 }
 
-/* dump_buffer: dump a raw VRAM region to a PNG, regardless of what the game
- * currently displays. The default remains the 512x240 double-buffer view. */
+/* screenshot_hires — capture the SUPERSAMPLED surface, not native VRAM.
+ *
+ * screenshot_file above reads gpu_display_pixel_rgb, i.e. the native 15-bit
+ * VRAM the PS1 would have produced. That is the right capture for faithfulness
+ * work, but it is BLIND to any enhancement that lives only in the high-
+ * resolution mirror: at [video] supersampling >= 2 the geometry-correction
+ * sub-pixel vertices, the SSAA edges and the perspective UVs are all resolved
+ * in the hi-res surface and are gone by the time pixels are packed back to
+ * native. Verifying those against a native screenshot silently "confirms" a
+ * clean frame while the player is looking at a broken one — which is exactly
+ * how the geometry-correction cracking got mis-reported as fixed.
+ *
+ * This routes the same present path the window uses (gr_render_display_hires),
+ * so what lands in the PNG is what the player sees. Falls back to the native
+ * resolve when no hi-res surface exists (supersampling 1 / software), so the
+ * command always answers with something truthful about the actual output. */
+static void handle_screenshot_hires(int id, const char *json)
+{
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) {
+        send_err(id, "display disabled"); return;
+    }
+    if (di.depth24) { send_err(id, "24bpp scanout (unsupported)"); return; }
+
+    int scale = gr_scale();
+    if (scale < 1) scale = 1;
+    uint32_t w = di.width, h = di.height;
+    if (w > 640) w = 640;
+    if (h > 512) h = 512;
+    uint32_t ow = w * (uint32_t)scale, oh = h * (uint32_t)scale;
+
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_screenshot_hires.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    uint32_t *argb = (uint32_t *)malloc((size_t)ow * oh * sizeof(uint32_t));
+    if (!argb) { send_err(id, "alloc failed"); return; }
+    int got = gr_render_display_hires(argb, (int)ow, (int)di.display_x,
+                                      (int)di.display_y, (int)w, (int)h);
+    if (!got) {
+        /* No hi-res surface (scale 1, or a backend without one): resolve the
+         * native display instead and say so, rather than emitting a blank. */
+        scale = 1; ow = w; oh = h;
+        got = gr_render_display(argb, (int)ow, (int)di.display_x,
+                                (int)di.display_y, (int)w, (int)h);
+        if (!got) { free(argb); send_err(id, "no display surface"); return; }
+    }
+
+    uint8_t *rgb = (uint8_t *)malloc((size_t)ow * oh * 3);
+    if (!rgb) { free(argb); send_err(id, "alloc failed"); return; }
+    for (size_t i = 0; i < (size_t)ow * oh; i++) {
+        uint32_t p = argb[i];
+        rgb[i * 3 + 0] = (uint8_t)((p >> 16) & 0xFF);
+        rgb[i * 3 + 1] = (uint8_t)((p >> 8) & 0xFF);
+        rgb[i * 3 + 2] = (uint8_t)(p & 0xFF);
+    }
+    free(argb);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(f, rgb, ow, oh);
+    free(rgb);
+    fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,"
+             "\"height\":%u,\"scale\":%d}", id, path, ow, oh, scale);
+}
+
+/* dump_buffer: dump a raw 512x240 VRAM region starting at display Y = `y` to a
+ * PNG, regardless of what the game currently displays. Used to inspect BOTH
+ * double-buffer halves (y=0 and y=256) coherently in one call to see whether a
+ * strobing character is present in one buffer only. */
 static void handle_dump_buffer(int id, const char *json)
 {
     extern void gl_renderer_sync_cpu(void);
@@ -9115,6 +9940,21 @@ static void handle_window_shot(int id, const char *json)
     path[sizeof(path) - 1] = '\0';
     psx_debug_overlay_window_shot_arm(path);
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"armed\":true}\n", id, path);
+}
+
+/* screenshot: capture what the player is actually being shown. Native-wide
+ * presentation is wider than the canonical PSX display rectangle, so routing
+ * this command unconditionally through handle_screenshot_file silently omits
+ * precisely the reveal margins that widescreen diagnostics need to inspect.
+ * Keep screenshot_file as the explicit canonical-VRAM probe. */
+static void handle_present_screenshot(int id, const char *json)
+{
+    extern int gr_wide_supported(void);
+    if (gr_wide_supported() && ws_nw_extra() > 0) {
+        handle_wide_shot(id, json);
+        return;
+    }
+    handle_screenshot_file(id, json);
 }
 
 /* wide_full: dump the ENTIRE active wide compositor surface (both double-buffer
@@ -10465,7 +11305,7 @@ typedef struct {
     uint32_t pc; uint32_t cpu_pc; uint32_t ra; uint32_t func; uint32_t frame;
     uint8_t width; uint8_t in_exception;
 } CardTraceEntry;
-static CardTraceEntry s_card_trace[CARD_TRACE_CAP];
+static PSX_BSS CardTraceEntry s_card_trace[CARD_TRACE_CAP];
 static uint64_t s_card_trace_seq = 0;
 static inline int is_card_critical_addr(uint32_t phys) {
     return (phys >= 0x00009F20u && phys < 0x00009F40u) ||
@@ -10815,6 +11655,81 @@ static void handle_cyc_watch_clear(int id, const char *json)
     send_ok(id);
 }
 
+/* pc_probe_arm — {"pcs":"0xA,0xB", "n":32, "nd_intro":1..5} or empty pcs+nd_intro.
+ * 1=PolyG4 clip 2=OT leaves 3=wood 4=depth 5=wood DL/helper bind. */
+static void handle_pc_probe_arm(int id, const char *json)
+{
+    pc_probe_clear_state();
+    int n = json_get_int(json, "n", 32);
+    if (n < 1) n = 1;
+    if (n > PC_PROBE_SAMPLE_CAP) n = PC_PROBE_SAMPLE_CAP;
+    s_pc_probe_sample_max = (uint32_t)n;
+
+    int nd = json_get_int(json, "nd_intro", 0);
+    char pcs[512];
+    const char *have_pcs = json_get_str(json, "pcs", pcs, sizeof(pcs));
+    if (nd == 5) pc_probe_arm_nd_intro_wood_dl_defaults();
+    else if (nd == 4) pc_probe_arm_nd_intro_depth_defaults();
+    else if (nd == 3) pc_probe_arm_nd_intro_wood_defaults();
+    else if (nd == 2) pc_probe_arm_nd_intro_ot_defaults();
+    else if (nd) pc_probe_arm_nd_intro_defaults();
+    if (have_pcs) pc_probe_parse_list(pcs);
+    if (s_pc_probe_n <= 0) {
+        send_err(id, "pc_probe_arm needs pcs=... and/or nd_intro=1..5");
+        return;
+    }
+    s_pc_probe_armed = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"n_pcs\":%d,\"sample_max\":%u,\"nd_intro\":%d}",
+             id, s_pc_probe_n, s_pc_probe_sample_max, nd);
+}
+
+static void handle_pc_probe_dump(int id, const char *json)
+{
+    (void)json;
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"id\":%d,\"ok\":true,\"armed\":%d,\"n_pcs\":%d,\"sample_max\":%u,"
+             "\"samples_n\":%u,\"slots\":[",
+             id, s_pc_probe_armed ? 1 : 0, s_pc_probe_n, s_pc_probe_sample_max,
+             s_pc_probe_sample_n);
+    send_line(buf);
+    for (int i = 0; i < s_pc_probe_n; i++) {
+        const PcProbeSlot *s = &s_pc_probe[i];
+        snprintf(buf, sizeof(buf),
+                 "%s{\"pc\":\"0x%08X\",\"count\":%llu,\"t0_zero\":%u,\"t0_nonzero\":%u,"
+                 "\"last_t0\":\"0x%08X\",\"last_fp\":\"0x%08X\",\"last_v0\":\"0x%08X\","
+                 "\"last_mode\":\"0x%08X\",\"last_depth\":\"0x%08X\","
+                 "\"last_ot_base\":\"0x%08X\",\"last_ot_index\":\"0x%08X\","
+                 "\"last_frame\":%u}",
+                 (i == 0) ? "" : ",",
+                 s->pc, (unsigned long long)s->count, s->t0_zero, s->t0_nonzero,
+                 s->last_t0, s->last_fp, s->last_v0,
+                 s->last_mode, s->last_depth, s->last_ot_base, s->last_ot_index,
+                 s->last_frame);
+        send_line(buf);
+    }
+    send_line("],\"samples\":[");
+    for (uint32_t i = 0; i < s_pc_probe_sample_n; i++) {
+        const PcProbeSample *sm = &s_pc_probe_samples[i];
+        snprintf(buf, sizeof(buf),
+                 "%s{\"pc\":\"0x%08X\",\"frame\":%u,\"t0\":\"0x%08X\","
+                 "\"fp\":\"0x%08X\",\"v0\":\"0x%08X\",\"mode\":\"0x%08X\","
+                 "\"depth\":\"0x%08X\",\"ot_base\":\"0x%08X\",\"ot_index\":\"0x%08X\"}",
+                 (i == 0) ? "" : ",",
+                 sm->pc, sm->frame, sm->t0, sm->fp, sm->v0,
+                 sm->mode, sm->depth, sm->ot_base, sm->ot_index);
+        send_line(buf);
+    }
+    send_line("]}");
+}
+
+static void handle_pc_probe_clear(int id, const char *json)
+{
+    (void)json;
+    pc_probe_clear_state();
+    send_ok(id);
+}
+
 /* Liveness/freeze diagnostic: returns a single snapshot of every counter
  * that distinguishes "stuck in a tight handler loop" from "just slow" or
  * "starved on TCP poll".  Pass {"window":N} (default 256) to also include
@@ -10871,8 +11786,8 @@ static void handle_irqctx_ring(int id, const char *json)
     typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
                      cdrom_active, is_vblank; int dma_depth;
                      uint32_t take_pc, real_epc, exit_pc, exit_reason, same_thread,
-                     restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects,
-                     entry_sp, pump_site; } E;
+                     restored, v0_exit, v0_saved, v1_exit, v1_saved, ra_exit,
+                     ra_saved, redirects, entry_sp, pump_site; } E;
     extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
     /* Ring cap must track IRQCTX_RING_CAP in interrupts.c. */
     uint32_t cap = 4096u;
@@ -10904,6 +11819,7 @@ static void handle_irqctx_ring(int id, const char *json)
             "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
             "\"take_pc\":\"0x%08X\",\"real_epc\":\"0x%08X\",\"exit_pc\":\"0x%08X\","
             "\"exit_reason\":%u,\"same_thread\":%u,\"restored\":%u,"
+            "\"v0_exit\":\"0x%08X\",\"v0_saved\":\"0x%08X\","
             "\"v1_exit\":\"0x%08X\",\"v1_saved\":\"0x%08X\","
             "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u,"
             "\"entry_sp\":\"0x%08X\",\"pump_site\":%u}",
@@ -10911,8 +11827,8 @@ static void handle_irqctx_ring(int id, const char *json)
             e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
             e->sr, e->istat, e->imask,
             e->take_pc, e->real_epc, e->exit_pc, e->exit_reason, e->same_thread,
-            e->restored, e->v1_exit, e->v1_saved, e->ra_exit, e->ra_saved,
-            e->redirects, e->entry_sp, e->pump_site);
+            e->restored, e->v0_exit, e->v0_saved, e->v1_exit, e->v1_saved,
+            e->ra_exit, e->ra_saved, e->redirects, e->entry_sp, e->pump_site);
         emitted++;
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
@@ -14032,13 +14948,13 @@ extern int psx_get_in_exception(void);
 extern uint32_t overlay_loader_native_inprogress(void);
 
 #define PHASE_RING_SECS 64
-static volatile uint32_t s_phase_total [PHASE_RING_SECS];
-static volatile uint32_t s_phase_interp[PHASE_RING_SECS];
-static volatile uint32_t s_phase_native[PHASE_RING_SECS];
-static volatile uint32_t s_phase_static[PHASE_RING_SECS];
-static volatile uint32_t s_phase_gpu   [PHASE_RING_SECS];
-static volatile uint32_t s_phase_exc   [PHASE_RING_SECS];
-static volatile uint64_t s_phase_sec   [PHASE_RING_SECS];
+static PSX_BSS volatile uint32_t s_phase_total [PHASE_RING_SECS];
+static PSX_BSS volatile uint32_t s_phase_interp[PHASE_RING_SECS];
+static PSX_BSS volatile uint32_t s_phase_native[PHASE_RING_SECS];
+static PSX_BSS volatile uint32_t s_phase_static[PHASE_RING_SECS];
+static PSX_BSS volatile uint32_t s_phase_gpu   [PHASE_RING_SECS];
+static PSX_BSS volatile uint32_t s_phase_exc   [PHASE_RING_SECS];
+static PSX_BSS volatile uint64_t s_phase_sec   [PHASE_RING_SECS];
 static volatile uint64_t s_phase_samples_all = 0, s_phase_interp_all = 0;
 
 /* Hot-function histogram: when a sample lands in a native overlay shard,
@@ -14479,6 +15395,9 @@ static const CmdEntry s_commands[] = {
     { "write_ram",         handle_write_ram },
     { "call_func",         handle_call_func },
     { "gpu_state",         handle_gpu_state },
+    { "geom_correction",   handle_geom_correction },
+    { "pgxp",              handle_pgxp },
+    { "ws_aspect_cone_site", handle_ws_aspect_cone_site },
     { "ws_margin",         handle_ws_margin },
     { "ws_hud_mode",       handle_ws_hud_mode },
     { "kernel_bless",      handle_kernel_bless },
@@ -14494,7 +15413,6 @@ static const CmdEntry s_commands[] = {
     { "ws_dome_probe",     handle_ws_dome_probe },
     { "ws_census",         handle_ws_census },
     { "mmx6_freshfix",     handle_mmx6_freshfix },
-    { "mmx6_reveal",       handle_mmx6_reveal },
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
@@ -14544,7 +15462,6 @@ static const CmdEntry s_commands[] = {
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
     { "sio_trace_window",  handle_sio_trace_window },
-    { "pad_cfg",           handle_pad_cfg },
     { "sio_pc_trace",      handle_sio_pc_trace },
     { "sio_pc_window",     handle_sio_pc_window },
     { "sio_ctrl_reg_trace", handle_sio_ctrl_reg_trace },
@@ -14590,6 +15507,7 @@ static const CmdEntry s_commands[] = {
     { "evcb_walk_dump",    handle_evcb_walk_dump },
     { "evcb_walk_stats",   handle_evcb_walk_stats },
     { "imask_trace",       handle_imask_trace },
+    { "card_handoff",      handle_card_handoff },
     { "watch",             handle_watch },
     { "unwatch",           handle_unwatch },
     /* wtrace — normalized verb set (parity contract with psx-beetle).
@@ -14631,6 +15549,9 @@ static const CmdEntry s_commands[] = {
     { "cyc_watch",         handle_cyc_watch },
     { "cyc_watch_dump",    handle_cyc_watch_dump },
     { "cyc_watch_clear",   handle_cyc_watch_clear },
+    { "pc_probe_arm",      handle_pc_probe_arm },
+    { "pc_probe_dump",     handle_pc_probe_dump },
+    { "pc_probe_clear",    handle_pc_probe_clear },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
     { "capture_freeze",    handle_capture_freeze },
@@ -14648,6 +15569,11 @@ static const CmdEntry s_commands[] = {
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
     { "clear_input",       handle_clear_input },
+    { "input_route_clear", handle_input_route_clear },
+    { "input_route_append",handle_input_route_append },
+    { "input_route_start", handle_input_route_start },
+    { "input_route_stop",  handle_input_route_stop },
+    { "input_route_status",handle_input_route_status },
     { "savestate",         handle_savestate },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
@@ -14666,8 +15592,9 @@ static const CmdEntry s_commands[] = {
     { "read_frame_ram",    handle_read_frame_ram },
     { "set_snapshot",      handle_set_snapshot },
     { "get_snapshots",     handle_get_snapshots },
-    { "screenshot",        handle_screenshot_file },
-    { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "screenshot",        handle_present_screenshot },
+    { "screenshot_file",   handle_screenshot_file },
+    { "screenshot_hires",  handle_screenshot_hires },
     { "display_ring_get",  handle_display_ring_get },
     { "native_display_ring_get", handle_native_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },
@@ -14832,6 +15759,29 @@ void debug_server_init(int port)
                 s_rwatch_lo = (uint32_t)strtoul(tmp, NULL, 0);
                 s_rwatch_hi = (uint32_t)strtoul(comma + 1, NULL, 0);
                 if (s_rwatch_hi > s_rwatch_lo) g_ram_read_watch_active = 1;
+            }
+        }
+        /* PSX_ND_INTRO_PROBE=1 PolyG4; =2 OT; =3 wood; =4 depth; =5 wood DL.
+         * PSX_PC_PROBE="0xA,0xB" arms an explicit list (can combine). */
+        {
+            const char *nd = getenv("PSX_ND_INTRO_PROBE");
+            const char *pcs = getenv("PSX_PC_PROBE");
+            if ((nd && *nd && *nd != '0') || (pcs && *pcs)) {
+                pc_probe_clear_state();
+                s_pc_probe_sample_max = 48;
+                if (nd && *nd && *nd != '0') {
+                    int ndv = (int)strtol(nd, NULL, 0);
+                    if (ndv == 5) pc_probe_arm_nd_intro_wood_dl_defaults();
+                    else if (ndv == 4) pc_probe_arm_nd_intro_depth_defaults();
+                    else if (ndv == 3) pc_probe_arm_nd_intro_wood_defaults();
+                    else if (ndv == 2) pc_probe_arm_nd_intro_ot_defaults();
+                    else pc_probe_arm_nd_intro_defaults();
+                }
+                if (pcs && *pcs) pc_probe_parse_list(pcs);
+                if (s_pc_probe_n > 0) {
+                    s_pc_probe_armed = 1;
+                    fprintf(stdout, "psxrecomp: pc_probe armed (%d pcs)\n", s_pc_probe_n);
+                }
             }
         }
     }
@@ -15477,6 +16427,19 @@ int debug_server_is_connected(void)
 
 int debug_server_get_input_override(void)
 {
+    if (s_input_route_active && s_input_route_index < s_input_route_count) {
+        int current = (int)s_input_route[s_input_route_index].buttons;
+        if (s_input_route_remaining > 0 && --s_input_route_remaining == 0) {
+            s_input_route_index++;
+            if (s_input_route_index < s_input_route_count) {
+                s_input_route_remaining =
+                    s_input_route[s_input_route_index].frames;
+            } else {
+                s_input_route_active = 0;
+            }
+        }
+        return current;
+    }
     int current = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
         if (--s_input_frames == 0)

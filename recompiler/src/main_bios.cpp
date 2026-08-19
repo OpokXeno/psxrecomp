@@ -45,6 +45,7 @@
 #include "full_function_emitter.h"
 #include "function_discovery.h"
 #include "mips_decoder.h"
+#include "write_if_changed.h"
 
 namespace fs = std::filesystem;
 
@@ -185,19 +186,8 @@ std::vector<uint8_t> load_file_strict(const fs::path& p, size_t expected_size) {
 }
 
 void write_file(const fs::path& p, const std::string& content) {
-    fs::create_directories(p.parent_path());
-    const fs::path tmp = p.string() + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            throw std::runtime_error(fmt::format("cannot open output file for write: {}", tmp.string()));
-        }
-        f.write(content.data(), static_cast<std::streamsize>(content.size()));
-        if (!f) {
-            throw std::runtime_error(fmt::format("write error on: {}", tmp.string()));
-        }
-    }
-    fs::rename(tmp, p);
+    // Preserve mtime when bytes match (Ninja incremental after regen).
+    (void)write_file_if_changed(p, content);
 }
 
 // ----- Output emission ---------------------------------------------------
@@ -711,6 +701,8 @@ std::string make_unsupported_json_discovery(const PSXRecompV4::DiscoveryResult& 
 
 int run_boot_slice(const fs::path& bios_path, const fs::path& out_dir,
                    const std::optional<std::string>& cc_override) {
+    fs::create_directories(out_dir);
+
     // 1. Load + validate BIOS file.
     const auto rom = load_file_strict(bios_path, kBiosSize);
     const std::string sha = sha256_hex(rom);
@@ -779,6 +771,9 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
                   const std::string& declared_sha = {},
                   const std::vector<PSXRecompV4::BiosVectorTable>& bios_vectors = {},
                   const std::vector<PSXRecompV4::BiosAlias>& bios_aliases = {}) {
+    // Setup zips omit generated/; ensure the out_dir exists before emit.
+    fs::create_directories(out_dir);
+
     // 0. Activate the profile's address model — the single source of truth
     // for every relocation window discovery and the emitter use.
     PSXRecompV4::FullFunctionEmitter::set_address_model(&model);
@@ -857,10 +852,17 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
         dr, sha, out_dir.string(), out_stem, bios_vectors, bios_aliases);
 
     std::fprintf(stdout,
-        "psxrecomp-bios: EMIT OK  emitted=%u  skipped=%u  instructions=%u  "
+        "psxrecomp-bios: EMIT OK  emitted=%u  interpreted=%u  skipped=%u  instructions=%u  "
         "dispatch_entries=%u\n",
-        stats.functions_emitted, stats.functions_skipped,
+        stats.functions_emitted, stats.functions_interpreted, stats.functions_skipped,
         stats.total_instructions, stats.dispatch_entries);
+
+    if (stats.functions_interpreted > 0) {
+        std::fprintf(stdout, "psxrecomp-bios: interpreter fallbacks:\n");
+        for (const auto& [addr, reason] : stats.interpreted) {
+            std::fprintf(stdout, "  0x%08X: %s\n", addr, reason.c_str());
+        }
+    }
 
     if (stats.functions_skipped > 0) {
         std::fprintf(stdout, "psxrecomp-bios: skipped functions:\n");
@@ -877,6 +879,8 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
 int run_discover(const fs::path& bios_path, const fs::path& out_dir,
                  const fs::path& seed_path,
                  const PSXRecompV4::BiosAddressModel& model) {
+    fs::create_directories(out_dir);
+
     // 0. Activate the profile's address model (discovery follows J/JAL
     // targets through its relocation windows).
     PSXRecompV4::FunctionDiscovery::set_address_model(&model);
@@ -943,6 +947,7 @@ int main(int argc, char** argv) {
             if (a == "-h" || a == "--help") {
                 std::fprintf(stdout,
                     "usage: psxrecomp-bios --config <path.toml>\n"
+                    "                      [--rom <bios.bin>] [--out-dir <dir>]\n"
                     "       psxrecomp-bios <bios.bin> <out_dir> [--cc <c-compiler>]\n"
                     "       psxrecomp-bios <bios.bin> <out_dir> --discover <seeds.json>\n"
                     "       psxrecomp-bios <bios.bin> <out_dir> --emit-full <seeds.json>\n");
@@ -954,37 +959,41 @@ int main(int argc, char** argv) {
         // If --config is the first (or only) flag, all paths come from the
         // TOML. This is the going-forward invocation; the positional form
         // below stays for backwards compat.
+        std::optional<fs::path> config_path;
+        std::optional<fs::path> config_rom_override;
+        std::optional<fs::path> config_out_override;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--config" && i + 1 < argc) {
-                const fs::path config_path = argv[i + 1];
-                const auto cfg = PSXRecompV4::load_bios_config(config_path);
-                std::fprintf(stdout,
-                    "psxrecomp-bios: --config %s\n"
-                    "  rom        = %s\n"
-                    "  seeds      = %s\n"
-                    "  out_dir    = %s\n"
-                    "  out_stem   = %s\n",
-                    config_path.string().c_str(),
-                    cfg.rom_path.string().c_str(),
-                    cfg.seeds_path.string().c_str(),
-                    cfg.out_dir.string().c_str(),
-                    cfg.out_stem.c_str());
-                const auto model = PSXRecompV4::BiosAddressModel::from_config(cfg);
-                PSXRecompV4::FullFunctionEmitter::set_bios_profile(&cfg);
-                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path,
-                                     cfg.out_stem, model, cfg.image_sha256,
-                                     cfg.bios_vectors, cfg.bios_aliases);
+                config_path = argv[++i];
+            } else if (a.rfind("--config=", 0) == 0) {
+                config_path = a.substr(std::string("--config=").size());
+            } else if (a == "--rom" && i + 1 < argc) {
+                config_rom_override = fs::absolute(argv[++i]);
+            } else if (a == "--out-dir" && i + 1 < argc) {
+                config_out_override = fs::absolute(argv[++i]);
             }
-            if (a == "--config=" || a.rfind("--config=", 0) == 0) {
-                const fs::path config_path = a.substr(std::string("--config=").size());
-                const auto cfg = PSXRecompV4::load_bios_config(config_path);
-                const auto model = PSXRecompV4::BiosAddressModel::from_config(cfg);
-                PSXRecompV4::FullFunctionEmitter::set_bios_profile(&cfg);
-                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path,
-                                     cfg.out_stem, model, cfg.image_sha256,
-                                     cfg.bios_vectors, cfg.bios_aliases);
-            }
+        }
+        if (config_path) {
+            auto cfg = PSXRecompV4::load_bios_config(*config_path);
+            if (config_rom_override) cfg.rom_path = *config_rom_override;
+            if (config_out_override) cfg.out_dir = *config_out_override;
+            std::fprintf(stdout,
+                "psxrecomp-bios: --config %s\n"
+                "  rom        = %s\n"
+                "  seeds      = %s\n"
+                "  out_dir    = %s\n"
+                "  out_stem   = %s\n",
+                config_path->string().c_str(),
+                cfg.rom_path.string().c_str(),
+                cfg.seeds_path.string().c_str(),
+                cfg.out_dir.string().c_str(),
+                cfg.out_stem.c_str());
+            const auto model = PSXRecompV4::BiosAddressModel::from_config(cfg);
+            PSXRecompV4::FullFunctionEmitter::set_bios_profile(&cfg);
+            return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path,
+                                 cfg.out_stem, model, cfg.image_sha256,
+                                 cfg.bios_vectors, cfg.bios_aliases);
         }
 
         // ── Positional form (legacy) ───────────────────────────────────
