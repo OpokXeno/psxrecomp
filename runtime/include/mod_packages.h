@@ -162,6 +162,14 @@ struct ModPlugin {
     int64_t order = 0;
 };
 
+struct ModFeaturePredicate {
+    std::string package_id;
+    std::string feature_id;
+    bool enabled = true;
+    std::string option_id;
+    std::string option_value;
+};
+
 struct ModIndexedFile {
     std::string feature_id;
     std::string format;
@@ -172,6 +180,9 @@ struct ModIndexedFile {
     std::string expected_sha256;
     uint64_t size = 0;
     std::map<std::string, std::string> when;
+    std::vector<ModFeaturePredicate> when_features;
+    std::vector<std::string> supersedes;
+    std::string compose;
     int64_t order = 0;
 };
 
@@ -283,6 +294,11 @@ struct ModResolution {
         std::string expected_sha256;
         std::string package_id;
         std::string feature_id;
+        std::vector<std::string> supersedes;
+        std::string compose;
+        std::map<std::string, std::string> options;
+        std::filesystem::path source_file;
+        uint64_t payload_size = 0;
     };
     std::vector<IndexedFile> indexed_files;
     struct Diagnostic {
@@ -350,6 +366,7 @@ public:
                                        const std::string& feature_id) const;
     bool feature_enabled(const std::string& package_id,
                          const std::string& feature_id) const;
+    std::string conflict_blocker(const std::string& package_id) const;
     std::string feature_option_value(const std::string& package_id,
                                      const std::string& feature_id,
                                      const std::string& option_id) const;
@@ -365,6 +382,10 @@ private:
     std::filesystem::path root_;
     std::map<std::string, std::map<std::string, ModPackage>> packages_;
     std::map<std::string, ModSelection> selections_;
+
+    void disable_package(const std::string& package_id);
+    void disable_conflicts_with(const ModPackage& package);
+    void reconcile_conflicts();
 };
 
 bool mod_register_builtin_resolver(const std::string& id, ModBuiltinResolver resolver);

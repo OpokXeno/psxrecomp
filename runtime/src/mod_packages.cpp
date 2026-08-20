@@ -15,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <system_error>
+#include <tuple>
 
 namespace fs = std::filesystem;
 
@@ -22,11 +23,11 @@ namespace PSXRecompV4 {
 namespace {
 
 constexpr uint32_t kMinFormatVersion = 1;
-constexpr uint32_t kMaxFormatVersion = 6;
+constexpr uint32_t kMaxFormatVersion = 7;
 constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
-constexpr uint64_t kMaxIndexedPayloadBytes = 128ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxIndexedPayloadBytes = 512ull * 1024ull * 1024ull;
 constexpr uint32_t kMaxArchiveFiles = 4096;
-constexpr const char* kIndexedFileSchemaToken = "indexed-file-v1";
+constexpr const char* kIndexedFileSchemaToken = "indexed-file-v2";
 
 std::map<std::string, ModBuiltinResolver>& builtin_resolvers() {
     static std::map<std::string, ModBuiltinResolver> value;
@@ -800,7 +801,13 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
         out << kIndexedFileSchemaToken << ':' << indexed.format << ':'
             << indexed.index << ':' << indexed.payload_sha256 << ':'
             << indexed.payload.size() << ':' << indexed.expected_sha256 << ':'
-            << indexed.package_id << ':' << indexed.feature_id << '\n';
+            << indexed.package_id << ':' << indexed.feature_id << ':'
+            << indexed.compose << ":supersedes=";
+        std::vector<std::string> supersedes = indexed.supersedes;
+        std::sort(supersedes.begin(), supersedes.end());
+        for (const std::string& package_id : supersedes)
+            out << package_id << ',';
+        out << '\n';
     }
     return out.str();
 }
@@ -1072,6 +1079,46 @@ bool feature_predicate_matches(
         }
     }
     return enabled == predicate.enabled;
+}
+
+bool feature_predicate_matches(
+    const ModFeaturePredicate& predicate,
+    const std::map<std::string, const ModPackage*>& active_packages,
+    const std::map<std::string, ModSelection>& selections) {
+    const auto package_it = active_packages.find(predicate.package_id);
+    if (package_it == active_packages.end()) return !predicate.enabled;
+    const ModPackage& package = *package_it->second;
+    const ModFeature* feature = find_feature(package, predicate.feature_id);
+    if (!feature) return !predicate.enabled;
+    const auto selection_it = selections.find(predicate.package_id);
+    const ModSelection blank;
+    const ModSelection& selection =
+        selection_it == selections.end() ? blank : selection_it->second;
+    const bool enabled = is_feature_enabled(package, selection, *feature);
+    if (enabled != predicate.enabled) return false;
+    return predicate.option_id.empty() ||
+        (enabled && effective_option_value(
+            package, selection, predicate.feature_id,
+            predicate.option_id) == predicate.option_value);
+}
+
+bool feature_predicates_match(
+    const std::vector<ModFeaturePredicate>& predicates,
+    const std::map<std::string, const ModPackage*>& active_packages,
+    const std::map<std::string, ModSelection>& selections) {
+    return std::all_of(
+        predicates.begin(), predicates.end(),
+        [&](const ModFeaturePredicate& predicate) {
+            return feature_predicate_matches(
+                predicate, active_packages, selections);
+        });
+}
+
+bool packages_conflict(const ModPackage& a, const ModPackage& b) {
+    return std::find(a.conflicts.begin(), a.conflicts.end(), b.id) !=
+               a.conflicts.end() ||
+           std::find(b.conflicts.begin(), b.conflicts.end(), a.id) !=
+               b.conflicts.end();
 }
 
 bool valid_option_value(const ModOption& option, const std::string& value);
@@ -1581,8 +1628,11 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
         }
         if (cfg.contains("conflicts"))
             out.conflicts = toml::find<std::vector<std::string>>(cfg, "conflicts");
-        for (const std::string& id : out.conflicts)
-            if (!valid_id(id)) throw std::runtime_error("invalid conflict id");
+        std::set<std::string> conflict_ids;
+        for (const std::string& id : out.conflicts) {
+            if (!valid_id(id) || id == out.id || !conflict_ids.insert(id).second)
+                throw std::runtime_error("invalid, self-referential, or duplicate conflict id");
+        }
 
         const bool feature_style = cfg.contains("feature");
         if (feature_style) {
@@ -2265,7 +2315,9 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                         key != "file" &&
                         key != "sha256" && key != "expected_sha256" &&
                         key != "order" && key != "when" &&
-                        key != "when_option" && key != "when_value")
+                        key != "when_option" && key != "when_value" &&
+                        key != "when_features" && key != "supersedes" &&
+                        key != "compose")
                         throw std::runtime_error(
                             "indexed file has unknown field: " + key);
                 }
@@ -2324,7 +2376,76 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                 indexed.order = toml::find_or<int64_t>(
                     v, "order", static_cast<int64_t>(declaration_index));
                 read_conditions(v, out.options, indexed.feature_id,
-                                indexed.when, "indexed file");
+                                 indexed.when, "indexed file");
+                if (v.contains("when_features")) {
+                    if (out.format_version < 7)
+                        throw std::runtime_error(
+                            "indexed file when_features requires format_version 7");
+                    std::set<std::tuple<std::string, std::string, std::string>>
+                        identities;
+                    std::map<std::pair<std::string, std::string>, bool>
+                        enabled_states;
+                    for (const toml::value& condition :
+                         toml::find(v, "when_features").as_array()) {
+                        for (const auto& [key, unused] : condition.as_table()) {
+                            (void)unused;
+                            if (key != "package" && key != "feature" &&
+                                key != "enabled" && key != "option" &&
+                                key != "value")
+                                throw std::runtime_error(
+                                    "indexed file when_features has unknown field: " +
+                                    key);
+                        }
+                        ModFeaturePredicate predicate;
+                        predicate.package_id =
+                            toml::find<std::string>(condition, "package");
+                        predicate.feature_id =
+                            toml::find<std::string>(condition, "feature");
+                        predicate.enabled =
+                            toml::find_or<bool>(condition, "enabled", true);
+                        predicate.option_id = toml::find_or<std::string>(
+                            condition, "option", "");
+                        predicate.option_value = toml::find_or<std::string>(
+                            condition, "value", "");
+                        const auto identity = std::make_pair(
+                            predicate.package_id, predicate.feature_id);
+                        const auto [state, inserted] =
+                            enabled_states.emplace(identity, predicate.enabled);
+                        if (!valid_id(predicate.package_id) ||
+                            !valid_id(predicate.feature_id) ||
+                            (!inserted && state->second != predicate.enabled) ||
+                            !identities.insert({predicate.package_id,
+                                                predicate.feature_id,
+                                                predicate.option_id}).second)
+                            throw std::runtime_error(
+                                "indexed file when_features has invalid or duplicate identity");
+                        if (predicate.option_id.empty() !=
+                                predicate.option_value.empty() ||
+                            (!predicate.option_id.empty() &&
+                             (!valid_id(predicate.option_id) ||
+                              !predicate.enabled)))
+                            throw std::runtime_error(
+                                "indexed file when_features has an invalid option predicate");
+                        indexed.when_features.push_back(std::move(predicate));
+                    }
+                }
+                if (v.contains("supersedes")) {
+                    if (out.format_version < 7)
+                        throw std::runtime_error(
+                            "indexed file supersedes requires format_version 7");
+                    indexed.supersedes =
+                        toml::find<std::vector<std::string>>(v, "supersedes");
+                    std::set<std::string> unique;
+                    for (const std::string& id : indexed.supersedes)
+                        if (!valid_id(id) || !unique.insert(id).second)
+                            throw std::runtime_error(
+                                "indexed file supersedes has an invalid or duplicate id");
+                }
+                indexed.compose = toml::find_or<std::string>(v, "compose", "");
+                if (!indexed.compose.empty() &&
+                    (out.format_version < 7 || !valid_id(indexed.compose)))
+                    throw std::runtime_error(
+                        "indexed file compose must be a stable id in format_version 7");
                 out.indexed_files.push_back(std::move(indexed));
                 ++declaration_index;
             }
@@ -2418,7 +2539,10 @@ bool ModPackageManager::scan(std::string* error) {
 bool ModPackageManager::load_state(std::string* error) {
     selections_.clear();
     const fs::path path = root_ / "state.toml";
-    if (!fs::exists(path)) return true;
+    if (!fs::exists(path)) {
+        reconcile_conflicts();
+        return true;
+    }
     try {
         const toml::value cfg = toml::parse(path.string());
         const int64_t version = toml::find<int64_t>(cfg, "format_version");
@@ -2479,6 +2603,7 @@ bool ModPackageManager::load_state(std::string* error) {
                     std::move(feature);
             }
         }
+        reconcile_conflicts();
         return true;
     } catch (const std::exception& ex) {
         set_error(error, path.string() + ": " + ex.what());
@@ -2687,6 +2812,7 @@ bool ModPackageManager::set_enabled(const std::string& id, bool enabled, std::st
         return false;
     }
     selections_[id].enabled = enabled;
+    if (enabled) disable_conflicts_with(*package);
     return true;
 }
 
@@ -2698,6 +2824,13 @@ bool ModPackageManager::select_version(const std::string& id, const std::string&
         return false;
     }
     selections_[id].version = version;
+    const ModPackage& selected = pit->second.at(version);
+    const auto selection = selections_.find(id);
+    const ModSelection blank;
+    if (has_enabled_feature(
+            selected,
+            selection == selections_.end() ? blank : selection->second))
+        disable_conflicts_with(selected);
     return true;
 }
 
@@ -2764,6 +2897,7 @@ bool ModPackageManager::set_feature_enabled(const std::string& package_id,
         return false;
     }
     selections_[package_id] = std::move(package_selection);
+    if (enabled) disable_conflicts_with(*package);
     return true;
 }
 
@@ -2825,6 +2959,74 @@ bool ModPackageManager::feature_enabled(const std::string& package_id,
     const ModSelection blank;
     return is_feature_enabled(
         *package, found == selections_.end() ? blank : found->second, *feature);
+}
+
+std::string ModPackageManager::conflict_blocker(
+    const std::string& package_id) const {
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return {};
+    const ModSelection blank;
+    for (const auto& [other_id, versions] : packages_) {
+        (void)versions;
+        if (other_id == package_id) continue;
+        const auto selected = selections_.find(other_id);
+        const ModSelection& selection =
+            selected == selections_.end() ? blank : selected->second;
+        const ModPackage* other = find_selected(packages_, other_id, selection);
+        if (other && has_enabled_feature(*other, selection) &&
+            packages_conflict(*package, *other))
+            return other->name;
+    }
+    return {};
+}
+
+void ModPackageManager::disable_package(const std::string& package_id) {
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return;
+    ModSelection& selection = selections_[package_id];
+    selection.enabled = false;
+    for (const ModFeature& feature : package->features)
+        if (!feature.legacy)
+            set_feature_selected(selection, feature.id, false);
+}
+
+void ModPackageManager::disable_conflicts_with(const ModPackage& package) {
+    std::vector<std::string> conflicts;
+    const ModSelection blank;
+    for (const auto& [other_id, versions] : packages_) {
+        (void)versions;
+        if (other_id == package.id) continue;
+        const auto selected = selections_.find(other_id);
+        const ModSelection& selection =
+            selected == selections_.end() ? blank : selected->second;
+        const ModPackage* other = find_selected(packages_, other_id, selection);
+        if (other && has_enabled_feature(*other, selection) &&
+            packages_conflict(package, *other))
+            conflicts.push_back(other_id);
+    }
+    for (const std::string& id : conflicts) disable_package(id);
+}
+
+void ModPackageManager::reconcile_conflicts() {
+    std::vector<const ModPackage*> active;
+    const ModSelection blank;
+    for (const auto& [id, versions] : packages_) {
+        (void)versions;
+        const auto selected = selections_.find(id);
+        const ModSelection& selection =
+            selected == selections_.end() ? blank : selected->second;
+        const ModPackage* package = find_selected(packages_, id, selection);
+        if (!package || !has_enabled_feature(*package, selection)) continue;
+        const bool blocked = std::any_of(
+            active.begin(), active.end(),
+            [&](const ModPackage* previous) {
+                return packages_conflict(*package, *previous);
+            });
+        if (blocked)
+            disable_package(id);
+        else
+            active.push_back(package);
+    }
 }
 
 std::string ModPackageManager::feature_option_value(
@@ -3267,7 +3469,9 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
             if (!feature ||
                 !is_feature_enabled(*package, selected, *feature) ||
                 !conditions_match(*package, selected,
-                                  indexed.feature_id, indexed.when))
+                                  indexed.feature_id, indexed.when) ||
+                !feature_predicates_match(
+                    indexed.when_features, active, selections_))
                 continue;
             indexed_files.push_back(&indexed);
         }
@@ -3284,73 +3488,32 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
                     indexed->format);
                 continue;
             }
-            const auto previous = std::find_if(
-                result.indexed_files.begin(), result.indexed_files.end(),
-                [&](const ModResolution::IndexedFile& item) {
-                    return item.format == indexed->format &&
-                           item.index == indexed->index;
-                });
-            if (previous != result.indexed_files.end()) {
-                if (previous->payload_sha256 == indexed->sha256 &&
-                    previous->payload.size() == indexed->size &&
-                    previous->expected_sha256 == indexed->expected_sha256) {
-                    std::string payload_error;
-                    if (!verify_file(indexed->file, indexed->size,
-                                     indexed->sha256, &payload_error))
-                        result.errors.push_back(
-                            package->id + "/" + indexed->feature_id +
-                            ": indexed file payload changed after installation");
-                    continue;
-                }
-                ModResolution::IndexedFile conflicting;
-                conflicting.format = indexed->format;
-                conflicting.index = indexed->index;
-                conflicting.payload_sha256 = indexed->sha256;
-                conflicting.expected_sha256 = indexed->expected_sha256;
-                conflicting.package_id = package->id;
-                conflicting.feature_id = indexed->feature_id;
-                result.indexed_files.push_back(std::move(conflicting));
-                continue;
-            }
-            if (indexed->size >
-                kMaxIndexedPayloadBytes - indexed_payload_bytes) {
-                result.errors.push_back(
-                    package->id + "/" + indexed->feature_id +
-                    ": active indexed-file payloads exceed the size limit");
-                continue;
-            }
-            std::vector<uint8_t> payload;
             std::string payload_error;
-            if (!read_file(indexed->file, payload, &payload_error)) {
+            if (!verify_file(
+                    indexed->file, indexed->size, indexed->sha256,
+                    &payload_error)) {
                 result.errors.push_back(
                     package->id + "/" + indexed->feature_id + ": " +
-                    payload_error);
-                continue;
-            }
-            if (payload.empty()) {
-                result.errors.push_back(
-                    package->id + "/" + indexed->feature_id +
-                    ": indexed file payload changed after installation");
-                continue;
-            }
-            const std::string actual = fingerprint_text(std::string(
-                (const char*)payload.data(), payload.size()));
-            if (payload.size() != indexed->size ||
-                actual != indexed->sha256) {
-                result.errors.push_back(
-                    package->id + "/" + indexed->feature_id +
-                    ": indexed file payload changed after installation");
+                    (payload_error.empty()
+                         ? "indexed file payload changed after installation"
+                         : payload_error));
                 continue;
             }
             ModResolution::IndexedFile resolved;
             resolved.format = indexed->format;
             resolved.index = indexed->index;
-            resolved.payload = std::move(payload);
             resolved.payload_sha256 = indexed->sha256;
             resolved.expected_sha256 = indexed->expected_sha256;
             resolved.package_id = package->id;
             resolved.feature_id = indexed->feature_id;
-            indexed_payload_bytes += indexed->size;
+            resolved.supersedes = indexed->supersedes;
+            resolved.compose = indexed->compose;
+            for (const ModOption& option : package->options)
+                if (option.feature_id == indexed->feature_id)
+                    resolved.options[option.id] = effective_option_value(
+                        *package, selected, indexed->feature_id, option.id);
+            resolved.source_file = indexed->file;
+            resolved.payload_size = indexed->size;
             result.indexed_files.push_back(std::move(resolved));
         }
     }
@@ -3394,40 +3557,154 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
     result.plugins = std::move(coalesced_plugins);
     std::vector<ModResolution::IndexedFile> coalesced_indexed_files;
     coalesced_indexed_files.reserve(result.indexed_files.size());
-    for (ModResolution::IndexedFile& indexed : result.indexed_files) {
-        bool claimed = false;
-        for (const ModResolution::IndexedFile& previous :
-             coalesced_indexed_files) {
-            if (indexed.format != previous.format ||
-                indexed.index != previous.index)
+    std::vector<bool> grouped(result.indexed_files.size(), false);
+    for (size_t first = 0; first < result.indexed_files.size(); ++first) {
+        if (grouped[first]) continue;
+        std::vector<size_t> group;
+        for (size_t candidate = first;
+             candidate < result.indexed_files.size(); ++candidate) {
+            if (grouped[candidate] ||
+                result.indexed_files[candidate].format !=
+                    result.indexed_files[first].format ||
+                result.indexed_files[candidate].index !=
+                    result.indexed_files[first].index)
                 continue;
-            if (indexed.payload_sha256 == previous.payload_sha256 &&
-                indexed.payload.size() == previous.payload.size() &&
-                indexed.expected_sha256 == previous.expected_sha256) {
-                claimed = true;
+            grouped[candidate] = true;
+            group.push_back(candidate);
+        }
+        std::vector<bool> superseded(group.size(), false);
+        std::vector<std::vector<size_t>> supersession_edges(group.size());
+        bool supersession_error = false;
+        for (size_t left = 0; left < group.size(); ++left) {
+            const auto& lhs = result.indexed_files[group[left]];
+            for (size_t right = left + 1; right < group.size(); ++right) {
+                const auto& rhs = result.indexed_files[group[right]];
+                if (lhs.expected_sha256 != rhs.expected_sha256) continue;
+                const bool lhs_supersedes = std::find(
+                    lhs.supersedes.begin(), lhs.supersedes.end(),
+                    rhs.package_id) != lhs.supersedes.end();
+                const bool rhs_supersedes = std::find(
+                    rhs.supersedes.begin(), rhs.supersedes.end(),
+                    lhs.package_id) != rhs.supersedes.end();
+                if (lhs_supersedes) supersession_edges[left].push_back(right);
+                if (rhs_supersedes) supersession_edges[right].push_back(left);
+                if (lhs_supersedes && rhs_supersedes) {
+                    const std::string resource =
+                        "indexed_file:" + lhs.format + ":" +
+                        std::to_string(lhs.index);
+                    ModResolution::Diagnostic diagnostic;
+                    diagnostic.resource = resource;
+                    diagnostic.package_id = lhs.package_id;
+                    diagnostic.feature_id = lhs.feature_id;
+                    diagnostic.other_package_id = rhs.package_id;
+                    diagnostic.other_feature_id = rhs.feature_id;
+                    diagnostic.message =
+                        lhs.package_id + "/" + lhs.feature_id +
+                        " and " + rhs.package_id + "/" + rhs.feature_id +
+                        " mutually supersede each other at " + resource;
+                    result.diagnostics.push_back(diagnostic);
+                    result.errors.push_back(diagnostic.message);
+                    supersession_error = true;
+                } else if (lhs_supersedes) {
+                    superseded[right] = true;
+                } else if (rhs_supersedes) {
+                    superseded[left] = true;
+                }
+            }
+        }
+        std::vector<uint8_t> supersession_state(group.size(), 0);
+        std::function<bool(size_t)> has_cycle = [&](size_t node) {
+            if (supersession_state[node] == 1) return true;
+            if (supersession_state[node] == 2) return false;
+            supersession_state[node] = 1;
+            for (size_t next : supersession_edges[node])
+                if (has_cycle(next)) return true;
+            supersession_state[node] = 2;
+            return false;
+        };
+        bool cyclic = false;
+        if (!supersession_error)
+            for (size_t node = 0; node < group.size() && !cyclic; ++node)
+                cyclic = has_cycle(node);
+        if (cyclic) {
+            const auto& indexed = result.indexed_files[group.front()];
+            const std::string message =
+                "indexed-file supersession cycle at indexed_file:" +
+                indexed.format + ":" + std::to_string(indexed.index);
+            result.errors.push_back(message);
+            supersession_error = true;
+        }
+        std::vector<size_t> retained;
+        for (size_t item = 0; item < group.size(); ++item)
+            if (!superseded[item]) retained.push_back(group[item]);
+        std::vector<size_t> unique;
+        for (size_t candidate : retained) {
+            const auto& indexed = result.indexed_files[candidate];
+            bool discard = false;
+            for (size_t previous_index : unique) {
+                const auto& previous = result.indexed_files[previous_index];
+                const bool same_guard =
+                    indexed.expected_sha256 == previous.expected_sha256;
+                const bool identical =
+                    indexed.payload_sha256 == previous.payload_sha256 &&
+                    indexed.payload_size == previous.payload_size && same_guard;
+                if (identical && indexed.compose.empty() &&
+                    previous.compose.empty()) {
+                    discard = true;
+                    break;
+                }
+                if (same_guard && !indexed.compose.empty() &&
+                    indexed.compose == previous.compose)
+                    continue;
+                ModResolution::Diagnostic diagnostic;
+                diagnostic.resource =
+                    "indexed_file:" + indexed.format + ":" +
+                    std::to_string(indexed.index);
+                diagnostic.package_id = indexed.package_id;
+                diagnostic.feature_id = indexed.feature_id;
+                diagnostic.other_package_id = previous.package_id;
+                diagnostic.other_feature_id = previous.feature_id;
+                diagnostic.message =
+                    indexed.package_id + "/" + indexed.feature_id +
+                    (same_guard ? " collides at " :
+                                  " has an incompatible guard at ") +
+                    diagnostic.resource + " with " + previous.package_id + "/" +
+                    previous.feature_id;
+                result.diagnostics.push_back(diagnostic);
+                result.errors.push_back(diagnostic.message);
+                discard = true;
                 break;
             }
-            ModResolution::Diagnostic diagnostic;
-            diagnostic.resource =
-                "indexed_file:" + indexed.format + ":" +
-                std::to_string(indexed.index);
-            diagnostic.package_id = indexed.package_id;
-            diagnostic.feature_id = indexed.feature_id;
-            diagnostic.other_package_id = previous.package_id;
-            diagnostic.other_feature_id = previous.feature_id;
-            diagnostic.message =
-                indexed.package_id + "/" + indexed.feature_id +
-                " collides at " + diagnostic.resource + " with " +
-                previous.package_id + "/" + previous.feature_id;
-            result.diagnostics.push_back(diagnostic);
-            result.errors.push_back(diagnostic.message);
-            claimed = true;
-            break;
+            if (!discard) unique.push_back(candidate);
         }
-        if (!claimed)
-            coalesced_indexed_files.push_back(std::move(indexed));
+        for (size_t item : unique)
+            coalesced_indexed_files.push_back(
+                std::move(result.indexed_files[item]));
     }
     result.indexed_files = std::move(coalesced_indexed_files);
+    indexed_payload_bytes = 0;
+    for (ModResolution::IndexedFile& indexed : result.indexed_files) {
+        if (indexed.payload_size >
+            kMaxIndexedPayloadBytes - indexed_payload_bytes) {
+            result.errors.push_back(
+                "resolved active indexed-file payloads exceed the size limit");
+            break;
+        }
+        std::string payload_error;
+        if (!read_file(indexed.source_file, indexed.payload, &payload_error) ||
+            indexed.payload.size() != indexed.payload_size ||
+            fingerprint_text(std::string(
+                reinterpret_cast<const char*>(indexed.payload.data()),
+                indexed.payload.size())) != indexed.payload_sha256) {
+            result.errors.push_back(
+                indexed.package_id + "/" + indexed.feature_id + ": " +
+                (payload_error.empty()
+                     ? "indexed file payload changed after installation"
+                     : payload_error));
+            continue;
+        }
+        indexed_payload_bytes += indexed.payload_size;
+    }
     std::vector<ModResolution::Write> coalesced;
     coalesced.reserve(result.writes.size());
     for (const ModResolution::Write& write : result.writes) {

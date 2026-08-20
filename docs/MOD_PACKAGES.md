@@ -380,8 +380,9 @@ A multi-disc package uses `disc_sha256` on each disc-specific indexed file so
 one enabled feature resolves correctly when either disc is selected. It may be
 omitted only when the same index, payload, and stock guard apply to every
 declared target.
-The complete active indexed-file plan is limited to 128 MiB of replacement
-payloads. This is independent of the 256 MiB expanded archive limit.
+The complete active indexed-file plan is limited to 512 MiB of replacement
+payloads after format-7 supersession. This is independent of the 256 MiB
+expanded limit for each installed archive.
 
 Indexed files require explicit feature ownership and an exact `disc_sha256` on
 every `[[target]]`. The loader verifies every payload while scanning. Resolution
@@ -411,13 +412,60 @@ reject a mount with trailing audio tracks unless virtual TOC support is
 available. A virtual extension must never overlap or displace a real audio
 track.
 
-The resource identity is `(format, index)`. Claims with the same format, index,
-payload SHA-256, payload size, and expected stock SHA-256 are exact duplicates
-and coalesce. Any differing claim for the same resource makes resolution fail
-and emits a structured diagnostic naming both `(package, feature)` owners. A
-failed resolution clears the complete resolved indexed-file list. Every
-resolved claim, owner, source-disc identity, and the handler schema token
-`indexed-file-v1` participates in the canonical plan fingerprint.
+The resource identity is `(format, index)`. In format 6, claims with the same
+payload SHA-256, payload size, and expected stock SHA-256 coalesce. Any differing
+claim for the same resource makes resolution fail and emits a structured
+diagnostic naming both `(package, feature)` owners. A failed resolution clears
+the complete resolved indexed-file list.
+
+Package format 7 adds authenticated composition metadata:
+
+```toml
+format_version = 7
+
+[[indexed_file]]
+feature = "hybrid"
+format = "example-archive"
+index = 42
+disc_sha256 = "..."
+file = "assets/hybrid-42.bin"
+sha256 = "..."
+expected_sha256 = "..."
+compose = "three-way"
+when_features = [
+  { package = "example.script", feature = "script", enabled = true },
+  { package = "example.balance", feature = "items", enabled = true,
+    option = "variant", value = "revised" },
+]
+supersedes = ["example.script", "example.balance"]
+```
+
+`when_features` is an ANDed list of cross-package feature predicates. An absent
+package counts as disabled. `option` and `value` are an optional pair and are
+valid only for an enabled predicate. This lets a converter select an upstream
+hybrid payload without giving package code execution rights.
+
+`supersedes` explicitly names owners replaced by a payload that preserves their
+combined semantics. Supersession is accepted only when both claims authenticate
+the same stock file. It is not an ordering rule: unnamed owners still collide,
+mutual or cyclic supersession is rejected, and there is no generic
+last-writer-wins fallback. The resolver evaluates supersession for the complete
+resource group before diagnosing remaining collisions, so manifest/package
+order cannot leave a stale collision.
+
+`compose` is a stable compositor ID interpreted by the registered format
+handler. Claims with the same non-empty ID and stock guard are retained together,
+including byte-identical claims whose package options carry distinct semantic
+inputs. Unknown IDs fail in the handler. The standard `three-way` compositor
+compares every claim with the authenticated stock file, preserves disjoint
+changes, and rejects structural changes or any byte changed to different values.
+Game-specific compositors may reproduce an authenticated upstream staging
+algorithm, but must fail on unknown owners, structures, or revisions rather than
+silently choosing an unspecified winner.
+
+Every resolved claim, owner, composition declaration, source-disc identity, and
+the handler schema token `indexed-file-v2` participates in the canonical plan
+fingerprint.
 
 ## Native operations
 
@@ -489,6 +537,15 @@ Before boot, the manager:
 6. coalesces only truly identical target/range/expected/replacement writes,
    overlays, or indexed-file claims; and
 7. produces a canonical SHA-256 plan fingerprint.
+
+Package-level `conflicts = ["other.package", ...]` declarations are symmetric
+mutual exclusions. Enabling a package feature disables every feature in an
+installed conflicting package; the newly enabled package wins. The launcher
+keeps blocked features visible but greyed out and names the active blocker.
+Loading older state that has both sides enabled keeps the first package in
+stable package-id order and disables the later one. Resolution still rejects
+conflicting active packages as a final integrity check for state not produced by
+the manager.
 
 Incompatible overlaps fail before launch. Structured diagnostics identify both
 `(package, feature)` owners and the exact contested target range. The launcher

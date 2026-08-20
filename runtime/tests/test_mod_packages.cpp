@@ -269,11 +269,44 @@ int main() {
     check(reload.scan(&error), error.c_str());
     check(reload.set_enabled("conflict.a", true, &error), error.c_str());
     check(reload.set_enabled("conflict.b", true, &error), error.c_str());
-    check(reload.selections().at("conflict.a").enabled &&
+    check(!reload.selections().at("conflict.a").enabled &&
               reload.selections().at("conflict.b").enabled,
-          "enabling a package must not silently disable another package");
-    check(!reload.resolve("SLUS-TEST").ok,
-          "declared conflicts must fail resolution");
+          "newly enabled package must disable an incompatible package");
+    check(reload.conflict_blocker("conflict.a") == "conflict.b",
+          "disabled package must report its active symmetric blocker");
+    check(reload.resolve("SLUS-TEST").ok,
+          "managed package exclusions must leave a valid resolution");
+    check(reload.set_enabled("conflict.a", true, &error), error.c_str());
+    check(reload.selections().at("conflict.a").enabled &&
+              !reload.selections().at("conflict.b").enabled &&
+              reload.conflict_blocker("conflict.b") == "conflict.a",
+          "one-sided conflict declarations must behave symmetrically");
+    const auto feature_conflict_manifest = [](const std::string& id,
+                                              const std::string& conflicts) {
+        return "format_version=3\nid=\"" + id +
+            "\"\nversion=\"1.0.0\"\nname=\"" + id +
+            "\"\nsave_compatibility=\"shared\"\n" + conflicts +
+            "[[target]]\ngame_id=\"SLUS-TEST\"\n"
+            "[[feature]]\nid=\"main\"\nname=\"Main\"\n";
+    };
+    write_text(
+        root / "packages/feature-conflict.a/1.0.0/manifest.toml",
+        feature_conflict_manifest(
+            "feature-conflict.a",
+            "conflicts=[\"feature-conflict.b\"]\n"));
+    write_text(
+        root / "packages/feature-conflict.b/1.0.0/manifest.toml",
+        feature_conflict_manifest("feature-conflict.b", ""));
+    check(reload.scan(&error), error.c_str());
+    check(reload.set_feature_enabled(
+              "feature-conflict.a", "main", true, &error) &&
+              reload.set_feature_enabled(
+                  "feature-conflict.b", "main", true, &error), error.c_str());
+    check(!reload.feature_enabled("feature-conflict.a", "main") &&
+              reload.feature_enabled("feature-conflict.b", "main") &&
+              reload.conflict_blocker("feature-conflict.a") ==
+                  "feature-conflict.b",
+          "feature-style conflicts must auto-disable and expose their blocker");
 
     write_text(root / "packages/matrix.mod/1.0.0/manifest.toml",
                manifest("matrix.mod", "1.0.0",
@@ -1551,6 +1584,197 @@ int main() {
                           std::string::npos;
                   }),
           "unregistered indexed-file formats must fail resolution closed");
+
+    const fs::path composition_root = root / "composition-root";
+    const fs::path composition_base =
+        composition_root / "packages/compose.base/1.0.0";
+    const fs::path composition_other =
+        composition_root / "packages/compose.other/1.0.0";
+    write_bytes(composition_base / "assets/a.bin", indexed_a);
+    write_bytes(composition_other / "assets/b.bin", indexed_b);
+    write_text(
+        composition_base / "manifest.toml",
+        "format_version=7\nid=\"compose.base\"\nversion=\"1.0.0\"\n"
+        "name=\"Composition Base\"\n[[target]]\ngame_id=\"SLUS-COMPOSE\"\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\n"
+        "[[feature]]\nid=\"main\"\nname=\"Main\"\n"
+        "[[option]]\nfeature=\"main\"\nid=\"variant\"\nlabel=\"Variant\"\n"
+        "type=\"choice\"\ndefault=\"a\"\n"
+        "[[option.choice]]\nvalue=\"a\"\nlabel=\"A\"\n"
+        "[[option.choice]]\nvalue=\"b\"\nlabel=\"B\"\n"
+        "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\nindex=7\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\nfile=\"assets/a.bin\"\n"
+        "sha256=\"" + sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" +
+        expected_a + "\"\ncompose=\"three-way\"\n"
+        "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\nindex=8\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\nfile=\"assets/a.bin\"\n"
+        "sha256=\"" + sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" +
+        expected_a + "\"\n");
+    write_text(
+        composition_other / "manifest.toml",
+        "format_version=7\nid=\"compose.other\"\nversion=\"1.0.0\"\n"
+        "name=\"Composition Other\"\n[[target]]\ngame_id=\"SLUS-COMPOSE\"\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\n"
+        "[[feature]]\nid=\"main\"\nname=\"Main\"\n"
+        "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\nindex=7\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\nfile=\"assets/b.bin\"\n"
+        "sha256=\"" + sha256_hex(indexed_b) + "\"\nexpected_sha256=\"" +
+        expected_a + "\"\ncompose=\"three-way\"\n"
+        "when_features=[{package=\"compose.base\",feature=\"main\",enabled=true,"
+        "option=\"variant\",value=\"a\"}]\n"
+        "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\nindex=8\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\nfile=\"assets/b.bin\"\n"
+        "sha256=\"" + sha256_hex(indexed_b) + "\"\nexpected_sha256=\"" +
+        expected_a + "\"\nsupersedes=[\"compose.base\"]\n");
+    ModPackageManager composition_manager(composition_root);
+    check(composition_manager.scan(&error) &&
+              composition_manager.load_state(&error), error.c_str());
+    check(composition_manager.set_feature_enabled(
+              "compose.other", "main", true, &error), error.c_str());
+    check(composition_manager.resolve(
+              "SLUS-COMPOSE", {}, indexed_disc_hash).indexed_files.size() == 1,
+          "external feature conditions must omit claims while their provider is disabled");
+    check(composition_manager.set_feature_enabled(
+              "compose.base", "main", true, &error), error.c_str());
+    const ModResolution composed_resolution = composition_manager.resolve(
+        "SLUS-COMPOSE", {}, indexed_disc_hash);
+    check(composed_resolution.ok && composed_resolution.indexed_files.size() == 3 &&
+              std::count_if(
+                  composed_resolution.indexed_files.begin(),
+                  composed_resolution.indexed_files.end(),
+                  [](const ModResolution::IndexedFile& item) {
+                      return item.index == 7 && item.compose == "three-way";
+                  }) == 2,
+          "matching format-7 three-way claims must reach the indexed handler together");
+    const auto superseded = std::find_if(
+        composed_resolution.indexed_files.begin(),
+        composed_resolution.indexed_files.end(),
+        [](const ModResolution::IndexedFile& item) { return item.index == 8; });
+    check(superseded != composed_resolution.indexed_files.end() &&
+              superseded->package_id == "compose.other" &&
+              superseded->payload == indexed_b,
+          "an explicit format-7 superseder must replace only its named owner");
+
+    const fs::path supersession_root = root / "supersession-root";
+    const auto write_claim_package = [&](const std::string& id,
+                                         uint32_t index,
+                                         const std::vector<uint8_t>& payload,
+                                         const std::string& metadata) {
+        const fs::path package =
+            supersession_root / "packages" / id / "1.0.0";
+        write_bytes(package / "assets/payload.bin", payload);
+        write_text(
+            package / "manifest.toml",
+            "format_version=7\nid=\"" + id + "\"\nversion=\"1.0.0\"\n"
+            "name=\"Supersession\"\n[[target]]\ngame_id=\"SLUS-COMPOSE\"\n"
+            "disc_sha256=\"" + indexed_disc_hash + "\"\n"
+            "[[feature]]\nid=\"main\"\nname=\"Main\"\n"
+            "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\n"
+            "index=" + std::to_string(index) + "\ndisc_sha256=\"" +
+            indexed_disc_hash + "\"\nfile=\"assets/payload.bin\"\nsha256=\"" +
+            sha256_hex(payload) + "\"\nexpected_sha256=\"" + expected_a +
+            "\"\n" + metadata);
+    };
+    write_claim_package("late.a", 9, indexed_a, "");
+    write_claim_package("late.b", 9, indexed_b, "");
+    write_claim_package(
+        "late.c", 9, {0xC3},
+        "supersedes=[\"late.a\",\"late.b\"]\n");
+    const fs::path self_package =
+        supersession_root / "packages/self.hybrid/1.0.0";
+    write_bytes(self_package / "assets/a.bin", indexed_a);
+    write_text(
+        self_package / "manifest.toml",
+        "format_version=7\nid=\"self.hybrid\"\nversion=\"1.0.0\"\n"
+        "name=\"Self Hybrid\"\n[[target]]\ngame_id=\"SLUS-COMPOSE\"\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\n"
+        "[[feature]]\nid=\"main\"\nname=\"Main\"\n"
+        "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\nindex=10\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\nfile=\"assets/a.bin\"\n"
+        "sha256=\"" + sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" +
+        expected_a + "\"\ncompose=\"three-way\"\n"
+        "[[indexed_file]]\nfeature=\"main\"\nformat=\"test-index\"\nindex=10\n"
+        "disc_sha256=\"" + indexed_disc_hash + "\"\nfile=\"assets/a.bin\"\n"
+        "sha256=\"" + sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" +
+        expected_a + "\"\ncompose=\"three-way\"\n"
+        "supersedes=[\"self.hybrid\",\"self.other\"]\n");
+    write_claim_package("self.other", 10, indexed_b, "compose=\"three-way\"\n");
+    write_claim_package(
+        "mutual.a", 11, indexed_a,
+        "compose=\"three-way\"\nsupersedes=[\"mutual.b\"]\n");
+    write_claim_package(
+        "mutual.b", 11, indexed_b,
+        "compose=\"three-way\"\nsupersedes=[\"mutual.a\"]\n");
+    write_claim_package(
+        "cycle.a", 12, indexed_a,
+        "compose=\"three-way\"\nsupersedes=[\"cycle.b\"]\n");
+    write_claim_package(
+        "cycle.b", 12, indexed_b,
+        "compose=\"three-way\"\nsupersedes=[\"cycle.c\"]\n");
+    write_claim_package(
+        "cycle.c", 12, {0xC3},
+        "compose=\"three-way\"\nsupersedes=[\"cycle.a\"]\n");
+    write_claim_package("cycle.keep", 12, {0xD4}, "compose=\"three-way\"\n");
+    ModPackageManager supersession_manager(supersession_root);
+    check(supersession_manager.scan(&error) &&
+              supersession_manager.load_state(&error), error.c_str());
+    for (const char* id : {"late.a", "late.b", "late.c",
+                           "self.hybrid", "self.other"})
+        check(supersession_manager.set_feature_enabled(
+                  id, "main", true, &error), error.c_str());
+    const ModResolution late_resolution = supersession_manager.resolve(
+        "SLUS-COMPOSE", {}, indexed_disc_hash);
+    check(late_resolution.ok && late_resolution.indexed_files.size() == 2 &&
+              std::any_of(
+                  late_resolution.indexed_files.begin(),
+                  late_resolution.indexed_files.end(),
+                  [](const ModResolution::IndexedFile& item) {
+                      return item.index == 9 && item.package_id == "late.c";
+                  }) &&
+              std::any_of(
+                  late_resolution.indexed_files.begin(),
+                  late_resolution.indexed_files.end(),
+                  [](const ModResolution::IndexedFile& item) {
+                      return item.index == 10 &&
+                          item.package_id == "self.hybrid";
+                  }),
+          "late and identical self-superseders must remove every named base claim");
+    const std::string stable_supersession_fingerprint = late_resolution.fingerprint;
+    write_claim_package(
+        "late.c", 9, {0xC3},
+        "supersedes=[\"late.b\",\"late.a\"]\n");
+    check(supersession_manager.scan(&error), error.c_str());
+    check(supersession_manager.resolve(
+              "SLUS-COMPOSE", {}, indexed_disc_hash).fingerprint ==
+              stable_supersession_fingerprint,
+          "supersedes declaration order must not affect the plan fingerprint");
+    check(supersession_manager.set_feature_enabled(
+              "mutual.a", "main", true, &error) &&
+              supersession_manager.set_feature_enabled(
+                  "mutual.b", "main", true, &error), error.c_str());
+    const ModResolution mutual_resolution = supersession_manager.resolve(
+        "SLUS-COMPOSE", {}, indexed_disc_hash);
+    check(!mutual_resolution.ok && std::any_of(
+              mutual_resolution.errors.begin(), mutual_resolution.errors.end(),
+              [](const std::string& item) {
+                  return item.find("mutually supersede") != std::string::npos;
+              }),
+          "mutual supersession must fail even when compositor IDs agree");
+    check(supersession_manager.set_feature_enabled(
+              "mutual.a", "main", false, &error) &&
+              supersession_manager.set_feature_enabled(
+                  "mutual.b", "main", false, &error), error.c_str());
+    for (const char* id : {"cycle.a", "cycle.b", "cycle.c", "cycle.keep"})
+        check(supersession_manager.set_feature_enabled(
+                  id, "main", true, &error), error.c_str());
+    const ModResolution cyclic_resolution = supersession_manager.resolve(
+        "SLUS-COMPOSE", {}, indexed_disc_hash);
+    check(!cyclic_resolution.ok && std::any_of(
+              cyclic_resolution.errors.begin(), cyclic_resolution.errors.end(),
+              [](const std::string& item) {
+                  return item.find("supersession cycle") != std::string::npos;
+              }),
+          "a supersession cycle must fail even when another claim survives");
 
     const auto reject_indexed_manifest =
         [&](const std::string& name, const std::string& body) {

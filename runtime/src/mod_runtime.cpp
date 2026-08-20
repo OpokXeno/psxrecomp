@@ -920,6 +920,10 @@ int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
     copy_text(out->group, sizeof(out->group), feature->group);
     out->enabled =
         state().manager.feature_enabled(package->id, feature->id) ? 1 : 0;
+    const std::string blocker =
+        state().manager.conflict_blocker(package->id);
+    out->blocked = !out->enabled && !blocker.empty();
+    copy_text(out->blocked_by, sizeof(out->blocked_by), blocker);
     out->option_count =
         (int)provider_feature_options(*package, feature->id).size();
     for (const ModResolution::Diagnostic& diagnostic :
@@ -929,6 +933,9 @@ int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
         copy_text(out->status, sizeof(out->status), diagnostic.message);
         break;
     }
+    if (out->blocked && !out->has_error)
+        copy_text(out->status, sizeof(out->status),
+                  "Unavailable while " + blocker + " is enabled.");
     return 1;
 }
 

@@ -303,7 +303,7 @@ Choose the narrowest mechanism that describes the change:
 | Fixed code or data bytes | Guarded `[[patch]]` on `main_exe`, `disc_raw`, or `disc_user` |
 | A player-selectable boolean, choice, or number | Feature-local `[[option]]` plus `when`, `replace_from`, sparse `fields`, or `when_integer` |
 | Artwork, script, audio, or another large disc asset | Hashed file-backed `[[overlay]]`; do not rebuild the player's stock image |
-| A file reachable only through a game-specific hidden index | Authenticated `[[indexed_file]]` replacement (format 6); requires a statically registered game handler |
+| A file reachable only through a game-specific hidden index | Authenticated `[[indexed_file]]` replacement (format 6), with conditional composition metadata in format 7; requires a statically registered game handler |
 | Host setting or live game behavior | Trusted static `[[plugin]]`, compiled into the game and selected by a stable id |
 | Several features composing one shared table, bitfield, routine, or allocation | Game-owned `resolver = "builtin:<id>"`, only when declarative operations cannot express the composition |
 
