@@ -118,9 +118,18 @@ struct ModPatchField {
     int64_t replace_addend = 0;
 };
 
+struct ModFeaturePredicate {
+    std::string package_id;
+    std::string feature_id;
+    bool enabled = true;
+    std::string option_id;
+    std::string option_value;
+};
+
 struct ModPatch {
     std::string feature_id;
     ModPatchTarget target = ModPatchTarget::MainExe;
+    std::string disc_sha256;
     uint64_t location = 0; /* guest address or canonical disc-stream byte offset */
     std::vector<uint8_t> expected;
     std::vector<uint8_t> replacement;
@@ -132,6 +141,7 @@ struct ModPatch {
     std::string when_option;
     std::string when_value;
     std::map<std::string, std::string> when;
+    std::vector<ModFeaturePredicate> when_features;
     ModIntegerPredicate when_integer;
     std::vector<ModPatchField> fields;
     int64_t order = 0;
@@ -160,14 +170,6 @@ struct ModPlugin {
     std::string id;
     std::map<std::string, std::string> when;
     int64_t order = 0;
-};
-
-struct ModFeaturePredicate {
-    std::string package_id;
-    std::string feature_id;
-    bool enabled = true;
-    std::string option_id;
-    std::string option_value;
 };
 
 struct ModIndexedFile {

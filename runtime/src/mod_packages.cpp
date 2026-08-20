@@ -23,7 +23,7 @@ namespace PSXRecompV4 {
 namespace {
 
 constexpr uint32_t kMinFormatVersion = 1;
-constexpr uint32_t kMaxFormatVersion = 7;
+constexpr uint32_t kMaxFormatVersion = 8;
 constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxIndexedPayloadBytes = 512ull * 1024ull * 1024ull;
 constexpr uint32_t kMaxArchiveFiles = 4096;
@@ -1159,6 +1159,55 @@ void read_conditions(const toml::value& value, const std::vector<ModOption>& opt
     }
 }
 
+void read_feature_predicates(
+    const toml::value& value, const char* field, uint32_t format_version,
+    uint32_t minimum_version, const char* label,
+    std::vector<ModFeaturePredicate>& output) {
+    if (!value.contains(field)) return;
+    if (format_version < minimum_version)
+        throw std::runtime_error(
+            std::string(label) + " " + field + " requires format_version " +
+            std::to_string(minimum_version));
+    std::set<std::tuple<std::string, std::string, std::string>> identities;
+    std::map<std::pair<std::string, std::string>, bool> enabled_states;
+    for (const toml::value& condition : toml::find(value, field).as_array()) {
+        for (const auto& [key, unused] : condition.as_table()) {
+            (void)unused;
+            if (key != "package" && key != "feature" && key != "enabled" &&
+                key != "option" && key != "value")
+                throw std::runtime_error(
+                    std::string(label) + " " + field + " has unknown field: " + key);
+        }
+        ModFeaturePredicate predicate;
+        predicate.package_id = toml::find<std::string>(condition, "package");
+        predicate.feature_id = toml::find<std::string>(condition, "feature");
+        predicate.enabled = toml::find_or<bool>(condition, "enabled", true);
+        predicate.option_id =
+            toml::find_or<std::string>(condition, "option", "");
+        predicate.option_value =
+            toml::find_or<std::string>(condition, "value", "");
+        const auto identity =
+            std::make_pair(predicate.package_id, predicate.feature_id);
+        const auto [state, inserted] =
+            enabled_states.emplace(identity, predicate.enabled);
+        if (!valid_id(predicate.package_id) ||
+            !valid_id(predicate.feature_id) ||
+            (!inserted && state->second != predicate.enabled) ||
+            !identities.insert({predicate.package_id, predicate.feature_id,
+                                predicate.option_id}).second)
+            throw std::runtime_error(
+                std::string(label) + " " + field +
+                " has invalid or duplicate identity");
+        if (predicate.option_id.empty() != predicate.option_value.empty() ||
+            (!predicate.option_id.empty() &&
+             (!valid_id(predicate.option_id) || !predicate.enabled)))
+            throw std::runtime_error(
+                std::string(label) + " " + field +
+                " has an invalid option predicate");
+        output.push_back(std::move(predicate));
+    }
+}
+
 bool ranges_overlap(ModPatchTarget a_target, uint64_t a_location, size_t a_size,
                     ModPatchTarget b_target, uint64_t b_location, size_t b_size);
 
@@ -1864,6 +1913,27 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                     throw std::runtime_error(
                         "patch target must be main_exe, disc_raw, or disc_user");
                 }
+                patch.disc_sha256 =
+                    toml::find_or<std::string>(v, "disc_sha256", "");
+                if (!patch.disc_sha256.empty()) {
+                    if (out.format_version < 8)
+                        throw std::runtime_error(
+                            "patch disc_sha256 requires format_version 8");
+                    if (patch.target != ModPatchTarget::MainExe)
+                        throw std::runtime_error(
+                            "patch disc_sha256 is valid only for main_exe");
+                    if (!valid_sha256(patch.disc_sha256))
+                        throw std::runtime_error(
+                            "patch disc_sha256 must be lowercase SHA-256");
+                    const bool declared = std::any_of(
+                        out.targets.begin(), out.targets.end(),
+                        [&](const ModTarget& target) {
+                            return target.disc_sha256 == patch.disc_sha256;
+                        });
+                    if (!declared)
+                        throw std::runtime_error(
+                            "patch disc_sha256 does not match a package target");
+                }
                 const std::string expected = toml::find<std::string>(v, "expected");
                 if (!parse_hex_bytes(expected, patch.expected) ||
                     patch.expected.empty())
@@ -2124,6 +2194,9 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                 patch.order = toml::find_or<int64_t>(
                     v, "order", (int64_t)declaration_index);
                 read_conditions(v, out.options, patch.feature_id, patch.when, "patch");
+                read_feature_predicates(
+                    v, "when_features", out.format_version, 8, "patch",
+                    patch.when_features);
                 if (!patch.when.empty()) {
                     patch.when_option = patch.when.begin()->first;
                     patch.when_value = patch.when.begin()->second;
@@ -2377,58 +2450,9 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                     v, "order", static_cast<int64_t>(declaration_index));
                 read_conditions(v, out.options, indexed.feature_id,
                                  indexed.when, "indexed file");
-                if (v.contains("when_features")) {
-                    if (out.format_version < 7)
-                        throw std::runtime_error(
-                            "indexed file when_features requires format_version 7");
-                    std::set<std::tuple<std::string, std::string, std::string>>
-                        identities;
-                    std::map<std::pair<std::string, std::string>, bool>
-                        enabled_states;
-                    for (const toml::value& condition :
-                         toml::find(v, "when_features").as_array()) {
-                        for (const auto& [key, unused] : condition.as_table()) {
-                            (void)unused;
-                            if (key != "package" && key != "feature" &&
-                                key != "enabled" && key != "option" &&
-                                key != "value")
-                                throw std::runtime_error(
-                                    "indexed file when_features has unknown field: " +
-                                    key);
-                        }
-                        ModFeaturePredicate predicate;
-                        predicate.package_id =
-                            toml::find<std::string>(condition, "package");
-                        predicate.feature_id =
-                            toml::find<std::string>(condition, "feature");
-                        predicate.enabled =
-                            toml::find_or<bool>(condition, "enabled", true);
-                        predicate.option_id = toml::find_or<std::string>(
-                            condition, "option", "");
-                        predicate.option_value = toml::find_or<std::string>(
-                            condition, "value", "");
-                        const auto identity = std::make_pair(
-                            predicate.package_id, predicate.feature_id);
-                        const auto [state, inserted] =
-                            enabled_states.emplace(identity, predicate.enabled);
-                        if (!valid_id(predicate.package_id) ||
-                            !valid_id(predicate.feature_id) ||
-                            (!inserted && state->second != predicate.enabled) ||
-                            !identities.insert({predicate.package_id,
-                                                predicate.feature_id,
-                                                predicate.option_id}).second)
-                            throw std::runtime_error(
-                                "indexed file when_features has invalid or duplicate identity");
-                        if (predicate.option_id.empty() !=
-                                predicate.option_value.empty() ||
-                            (!predicate.option_id.empty() &&
-                             (!valid_id(predicate.option_id) ||
-                              !predicate.enabled)))
-                            throw std::runtime_error(
-                                "indexed file when_features has an invalid option predicate");
-                        indexed.when_features.push_back(std::move(predicate));
-                    }
-                }
+                read_feature_predicates(
+                    v, "when_features", out.format_version, 7, "indexed file",
+                    indexed.when_features);
                 if (v.contains("supersedes")) {
                     if (out.format_version < 7)
                         throw std::runtime_error(
@@ -3183,8 +3207,12 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
                     find_feature(*package, patch.feature_id);
                 if (!feature ||
                     !is_feature_enabled(*package, selected, *feature) ||
+                    (!patch.disc_sha256.empty() &&
+                     patch.disc_sha256 != disc_sha256) ||
                     !conditions_match(*package, selected,
                                       patch.feature_id, patch.when) ||
+                    !feature_predicates_match(
+                        patch.when_features, active, selections_) ||
                     !integer_predicate_matches(
                         *package, selected, patch.feature_id,
                         patch.when_integer))

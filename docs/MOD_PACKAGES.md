@@ -467,6 +467,30 @@ Every resolved claim, owner, composition declaration, source-disc identity, and
 the handler schema token `indexed-file-v2` participates in the canonical plan
 fingerprint.
 
+Package format 8 adds disc and cross-feature predicates to `[[patch]]`:
+
+```toml
+format_version = 8
+
+[[patch]]
+feature = "controls"
+target = "main_exe"
+address = 0x80041234
+expected = "2a 00 02 24"
+replace = "0e 00 02 24"
+disc_sha256 = "..."
+when_features = [
+  { package = "example.soft-sub", feature = "soft-sub", enabled = true },
+]
+```
+
+Patch `disc_sha256` must match one of the package targets and limits the patch
+to that mounted disc. Patch `when_features` has the same ANDed, absent-is-disabled
+semantics as indexed-file predicates. These fields allow one package to carry
+distinct authenticated guards for multi-disc executables or for an executable
+replaced by another selected feature. They do not establish write ordering;
+active patch guards and collision rules remain unchanged.
+
 ## Native operations
 
 `main_exe` writes use PSX guest virtual addresses. Expected bytes are checked

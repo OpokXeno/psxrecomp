@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -144,7 +145,186 @@ static std::string manifest(const std::string& id, const std::string& version,
         "game_id = \"SLUS-TEST\"\n" + extra;
 }
 
-int main() {
+static int validate_catalog(int argc, char** argv) {
+    const fs::path root =
+        fs::temp_directory_path() / "psxrecomp-mod-catalog-validation";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    mod_indexed_file_format_register("xenogears");
+    ModPackageManager manager(root);
+    std::string error;
+    for (int i = 2; i < argc; ++i) {
+        if (!manager.install_archive(argv[i], nullptr, nullptr, &error)) {
+            std::cerr << "FAIL: " << argv[i] << ": " << error << "\n";
+            fs::remove_all(root, ec);
+            return 1;
+        }
+    }
+    if (manager.packages().size() != static_cast<size_t>(argc - 2)) {
+        std::cerr << "FAIL: catalog package identities are not unique\n";
+        fs::remove_all(root, ec);
+        return 1;
+    }
+
+    const std::string disc1 =
+        "74265236654985f8d5d76f79767ca62a9b2b6ba299c995211ff94588928a6235";
+    const std::string disc2 =
+        "b5fce68b407e9f4ae7474b3487a3d9a35ccd2c98e8b377374dd1fc1060450e30";
+    std::vector<std::string> ids;
+    for (const auto& [id, versions] : manager.packages()) {
+        (void)versions;
+        ids.push_back(id);
+        if (!manager.set_feature_enabled(id, "perfect-works", true, &error)) {
+            std::cerr << "FAIL: enabling " << id << ": " << error << "\n";
+            fs::remove_all(root, ec);
+            return 1;
+        }
+        const ModResolution first = manager.resolve("SLUS-00664", {}, disc1);
+        const ModResolution second = manager.resolve("SLUS-00664", {}, disc2);
+        if (!first.ok || !second.ok) {
+            const ModResolution& failed = first.ok ? second : first;
+            std::cerr << "FAIL: resolving " << id << ": "
+                      << (failed.errors.empty() ? "unknown resolution error"
+                                                : failed.errors.front()) << "\n";
+            fs::remove_all(root, ec);
+            return 1;
+        }
+        manager.set_feature_enabled(id, "perfect-works", false, &error);
+    }
+
+    const std::string prefix = "org.perfectworksbuild.individual.";
+    const std::string story = prefix + "story-mode";
+    const std::set<std::string> story_conflicts = {
+        prefix + "half-encounters", prefix + "exp", prefix + "gold",
+        prefix + "rebalanced-items", prefix + "rebalanced-enemies",
+        prefix + "no-deathblow-levels", prefix + "no-damage-cap",
+        prefix + "arena"};
+    size_t compatible = 0;
+    size_t incompatible = 0;
+    for (size_t first_index = 0; first_index < ids.size(); ++first_index) {
+        for (size_t second_index = first_index + 1;
+             second_index < ids.size(); ++second_index) {
+            const std::string& first_id = ids[first_index];
+            const std::string& second_id = ids[second_index];
+            const bool expected_conflict =
+                (first_id == story && story_conflicts.count(second_id)) ||
+                (second_id == story && story_conflicts.count(first_id));
+            if (!manager.set_feature_enabled(
+                    first_id, "perfect-works", true, &error) ||
+                !manager.set_feature_enabled(
+                    second_id, "perfect-works", true, &error)) {
+                std::cerr << "FAIL: enabling catalog pair: " << error << "\n";
+                fs::remove_all(root, ec);
+                return 1;
+            }
+            const bool both_enabled = manager.feature_enabled(
+                first_id, "perfect-works") && manager.feature_enabled(
+                second_id, "perfect-works");
+            if (expected_conflict) {
+                if (both_enabled) {
+                    std::cerr << "FAIL: declared conflict remained enabled\n";
+                    fs::remove_all(root, ec);
+                    return 1;
+                }
+                ++incompatible;
+            } else {
+                const ModResolution first =
+                    manager.resolve("SLUS-00664", {}, disc1);
+                const ModResolution second =
+                    manager.resolve("SLUS-00664", {}, disc2);
+                if (!both_enabled || !first.ok || !second.ok) {
+                    const ModResolution& failed = first.ok ? second : first;
+                    std::cerr << "FAIL: compatible pair " << first_id << " + "
+                              << second_id << ": "
+                              << (failed.errors.empty()
+                                      ? "unknown resolution error"
+                                      : failed.errors.front()) << "\n";
+                    fs::remove_all(root, ec);
+                    return 1;
+                }
+                ++compatible;
+            }
+            manager.set_feature_enabled(
+                first_id, "perfect-works", false, &error);
+            manager.set_feature_enabled(
+                second_id, "perfect-works", false, &error);
+        }
+    }
+    fs::remove_all(root, ec);
+    if (compatible != 202 || incompatible != 8) {
+        std::cerr << "FAIL: expected 202 compatible and 8 incompatible pairs, got "
+                  << compatible << " and " << incompatible << "\n";
+        return 1;
+    }
+    std::cout << "catalog validation passed: 21 packages, 202 compatible pairs, "
+                 "8 conflicts\n";
+    return 0;
+}
+
+static int install_catalog(int argc, char** argv) {
+    ModPackageManager manager(argv[2]);
+    std::string error;
+    if (!manager.scan(&error)) {
+        std::cerr << "FAIL: catalog install scan: " << error << "\n";
+        return 1;
+    }
+    size_t installed = 0;
+    for (int i = 3; i < argc; ++i) {
+        if (!manager.install_archive(argv[i], nullptr, nullptr, &error)) {
+            std::cerr << "FAIL: " << argv[i] << ": " << error << "\n";
+            return 1;
+        }
+        ++installed;
+    }
+    std::cout << "installed catalog packages: " << installed << "\n";
+    return 0;
+}
+
+static int enable_catalog(const fs::path& root) {
+    ModPackageManager manager(root);
+    std::string error;
+    if (!manager.scan(&error) || !manager.load_state(&error)) {
+        std::cerr << "FAIL: catalog state load: " << error << "\n";
+        return 1;
+    }
+    size_t enabled = 0;
+    for (const auto& [id, versions] : manager.packages()) {
+        (void)versions;
+        if (id.rfind("org.perfectworksbuild.individual.", 0) != 0) continue;
+        const bool active =
+            id != "org.perfectworksbuild.individual.story-mode";
+        if (!manager.set_feature_enabled(
+                id, "perfect-works", active, &error)) {
+            std::cerr << "FAIL: catalog feature state: " << error << "\n";
+            return 1;
+        }
+        enabled += active;
+    }
+    const auto option = [&](const char* package, const char* id,
+                            const char* value) {
+        return manager.set_feature_option(
+            package, "perfect-works", id, value, &error);
+    };
+    if (enabled != 20 ||
+        !option("org.perfectworksbuild.individual.arena", "mode", "expert") ||
+        !option("org.perfectworksbuild.individual.exp", "multiplier", "2x") ||
+        !option("org.perfectworksbuild.individual.gold", "multiplier", "2x") ||
+        !option("org.perfectworksbuild.individual.portraits", "size", "resized") ||
+        !manager.save_state(&error)) {
+        std::cerr << "FAIL: catalog state save: " << error << "\n";
+        return 1;
+    }
+    std::cout << "enabled catalog packages: " << enabled << "\n";
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--enable-catalog")
+        return enable_catalog(argv[2]);
+    if (argc > 3 && std::string(argv[1]) == "--install-catalog")
+        return install_catalog(argc, argv);
+    if (argc > 2 && std::string(argv[1]) == "--catalog")
+        return validate_catalog(argc, argv);
     const fs::path root = fs::temp_directory_path() / "psxrecomp-mod-package-test";
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -1369,6 +1549,63 @@ int main() {
     check(!ModPackageManager::read_manifest(
               root / "wrapped-version.toml", invalid, &error),
           "format versions must be validated before narrowing to uint32");
+
+    const std::string scoped_disc_a(64, 'a');
+    const std::string scoped_disc_b(64, 'b');
+    const auto scoped_manifest = [&](int format_version) {
+        return
+            "format_version=" + std::to_string(format_version) + "\n"
+            "id=\"scoped.patch\"\nversion=\"1.0.0\"\n"
+            "name=\"Scoped Patch\"\n"
+            "[[target]]\ngame_id=\"SLUS-SCOPED\"\ndisc_sha256=\"" +
+            scoped_disc_a + "\"\n"
+            "[[target]]\ngame_id=\"SLUS-SCOPED\"\ndisc_sha256=\"" +
+            scoped_disc_b + "\"\n"
+            "[[feature]]\nid=\"controls\"\nname=\"Controls\"\n"
+            "[[feature]]\nid=\"fmv\"\nname=\"FMV\"\n"
+            "[[patch]]\nfeature=\"controls\"\ntarget=\"main_exe\"\n"
+            "disc_sha256=\"" + scoped_disc_a + "\"\n"
+            "address=0x80001000\nexpected=\"00\"\nreplace=\"01\"\n"
+            "when_features=[{package=\"scoped.patch\",feature=\"fmv\",enabled=false}]\n"
+            "[[patch]]\nfeature=\"controls\"\ntarget=\"main_exe\"\n"
+            "disc_sha256=\"" + scoped_disc_a + "\"\n"
+            "address=0x80001000\nexpected=\"04\"\nreplace=\"01\"\n"
+            "when_features=[{package=\"scoped.patch\",feature=\"fmv\",enabled=true}]\n"
+            "[[patch]]\nfeature=\"controls\"\ntarget=\"main_exe\"\n"
+            "disc_sha256=\"" + scoped_disc_b + "\"\n"
+            "address=0x80001000\nexpected=\"02\"\nreplace=\"03\"\n";
+    };
+    write_text(root / "scoped-v7.toml", scoped_manifest(7));
+    check(!ModPackageManager::read_manifest(
+              root / "scoped-v7.toml", invalid, &error),
+          "disc-scoped and cross-feature patches require format 8");
+    const fs::path scoped_root = root / "scoped-root";
+    write_text(
+        scoped_root / "packages/scoped.patch/1.0.0/manifest.toml",
+        scoped_manifest(8));
+    ModPackageManager scoped_manager(scoped_root);
+    check(scoped_manager.scan(&error) && scoped_manager.load_state(&error),
+          error.c_str());
+    check(scoped_manager.set_feature_enabled(
+              "scoped.patch", "controls", true, &error), error.c_str());
+    const ModResolution scoped_a = scoped_manager.resolve(
+        "SLUS-SCOPED", {}, scoped_disc_a);
+    const ModResolution scoped_b = scoped_manager.resolve(
+        "SLUS-SCOPED", {}, scoped_disc_b);
+    check(scoped_a.ok && scoped_a.writes.size() == 1 &&
+              scoped_a.writes[0].expected == std::vector<uint8_t>{0x00} &&
+              scoped_b.ok && scoped_b.writes.size() == 1 &&
+              scoped_b.writes[0].expected == std::vector<uint8_t>{0x02},
+          "format-8 patches must select guards by mounted disc");
+    check(scoped_manager.set_feature_enabled(
+              "scoped.patch", "fmv", true, &error), error.c_str());
+    const ModResolution scoped_fmv = scoped_manager.resolve(
+        "SLUS-SCOPED", {}, scoped_disc_a);
+    check(scoped_fmv.ok && scoped_fmv.writes.size() == 1 &&
+              scoped_fmv.writes[0].expected ==
+                  std::vector<uint8_t>{0x04} &&
+              scoped_fmv.fingerprint != scoped_a.fingerprint,
+          "format-8 patch feature predicates must select the FMV guard");
 
     const fs::path indexed_root = root / "indexed-root";
     const fs::path indexed_package =

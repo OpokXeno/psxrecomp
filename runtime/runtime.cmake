@@ -1420,18 +1420,19 @@ function(psxrecomp_add_runtime_target target)
     # to; copy_directory merges rather than replacing the tree.
     if(EXISTS "${PSXRECOMP_ROOT}/mods/builtin/packages")
         add_custom_command(TARGET ${target} POST_BUILD
-            # Clear first: copy_directory MERGES, so a mod deleted from source
-            # would otherwise survive in the build output forever and keep
-            # appearing on the Mods page (and inflate the release packagers'
-            # catalog assertions). This runs before the game's own staging, so
-            # both catalogs land on a clean slate.
-            COMMAND ${CMAKE_COMMAND} -E rm -rf
-                "$<TARGET_FILE_DIR:${target}>/mods"
+            # Refresh only framework-owned ids. User-installed packages and
+            # state beside a development executable must survive relinking.
+            COMMAND ${CMAKE_COMMAND}
+                -DSOURCE=${PSXRECOMP_ROOT}/mods/builtin
+                -DDESTINATION=$<TARGET_FILE_DIR:${target}>/mods
+                -P ${PSXRECOMP_ROOT}/runtime/stage_builtin_mods.cmake
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${PSXRECOMP_ROOT}/mods/builtin"
                 "$<TARGET_FILE_DIR:${target}>/mods"
             COMMENT "Staging framework-owned mod catalog (loading speed)"
             VERBATIM)
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
+            "${PSXRECOMP_ROOT}/runtime/stage_builtin_mods.cmake")
     endif()
     endif()
 
