@@ -225,9 +225,9 @@ of independently toggleable **features**, and enabling one never silently
 reconfigures another.
 
 Crucially, your disc image is never rewritten. The player selects a verified
-stock BIN/CUE, and resolution produces guarded native operations and sparse disc
-overlays *over* that image — so the original stays intact and a mod can be
-turned off as easily as it was turned on.
+stock CUE/BIN or CHD mount, and resolution produces guarded native operations
+and sparse disc overlays *over* that image — so the original stays intact and a
+mod can be turned off as easily as it was turned on.
 
 <p align="center">
   <img src="docs/assets/ui/mod-launcher.png" alt="The mods panel in the launcher" width="820">
@@ -260,7 +260,7 @@ save_compatibility = "shared"
 
 [[target]]
 game_id = "SLUS-00000"
-# Replace this with the SHA-256 of the exact supported stock disc image.
+# Replace this with the runtime canonical digest of the supported mounted disc.
 disc_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 [[feature]]
@@ -303,12 +303,22 @@ Choose the narrowest mechanism that describes the change:
 | Fixed code or data bytes | Guarded `[[patch]]` on `main_exe`, `disc_raw`, or `disc_user` |
 | A player-selectable boolean, choice, or number | Feature-local `[[option]]` plus `when`, `replace_from`, sparse `fields`, or `when_integer` |
 | Artwork, script, audio, or another large disc asset | Hashed file-backed `[[overlay]]`; do not rebuild the player's stock image |
+| A file reachable only through a game-specific hidden index | Authenticated `[[indexed_file]]` replacement (format 6); requires a statically registered game handler |
 | Host setting or live game behavior | Trusted static `[[plugin]]`, compiled into the game and selected by a stable id |
 | Several features composing one shared table, bitfield, routine, or allocation | Game-owned `resolver = "builtin:<id>"`, only when declarative operations cannot express the composition |
 
-Format versions 2–4 add bounded integers, ordered constraints, linked MIPS
-`LUI`/`ORI` values, sparse owned fields, and integer predicates. Format 5 adds
-trusted static plugins. The full schemas and resolution rules are in
+Package formats are cumulative:
+
+| Format | Adds |
+|---|---|
+| 1 | Features, typed options, literal guarded patches, overlays, and conditions |
+| 2 | Integer-generated patch bytes |
+| 3 | Ordered integer constraints and linked MIPS `LUI`/`ORI` values |
+| 4 | Sparse owned fields and integer predicates |
+| 5 | Trusted static plugin selectors |
+| 6 | Authenticated replacement of game-specific hidden indexed files |
+
+The full schemas and resolution rules are in
 [`docs/MOD_PACKAGES.md`](docs/MOD_PACKAGES.md).
 
 The enabled feature set is resolved before boot. Changing it may require a

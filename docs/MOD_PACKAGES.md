@@ -8,9 +8,9 @@ installation, version selection, and removal are a secondary management view.
 Feature identity is always `(package_id, feature_id)`. Enabling one feature
 never enables, disables, or reconfigures another feature.
 
-The player selects a verified stock BIN/CUE. Resolution produces guarded native
-operations and sparse disc overlays without rewriting or replacing that stock
-image.
+The player selects a verified stock CUE/BIN or CHD mount. Resolution produces
+guarded native operations and sparse disc overlays without rewriting or
+replacing that stock image.
 
 ## Feature manifest
 
@@ -26,7 +26,7 @@ resolver = "declarative"
 
 [[target]]
 game_id = "SLUS-00000"
-# Required for disc overlays. Use the digest of the supported stock image.
+# Required for disc overlays and indexed files. Use the runtime canonical digest.
 disc_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [[feature]]
@@ -77,6 +77,17 @@ expected_sha256 = "..."
 
 Every `[[option]]`, `[[patch]]`, and `[[overlay]]` in a feature-style manifest
 must name its owning feature. Ambiguous operations are rejected.
+
+`disc_sha256` is the core runtime's canonical digest of the mounted disc, not a
+SHA-256 of the selected path or container bytes. Equivalent CUE/BIN and CHD
+representations of the same mounted disc produce the same identity. Any
+authoring or hash tool that emits `disc_sha256` must consume the canonical
+digest supplied by the runtime; directly hashing a `.cue`, `.bin`, or `.chd`
+does not produce this field.
+
+Every runtime target exposes the authoring command
+`<game-executable> --disc-hash <disc-path>`, which prints only the canonical
+lowercase digest.
 
 Option types are `boolean`, `choice`, and bounded `integer`. Conditions are
 feature-local: `when = { option = "value", ... }` requires every listed option
@@ -308,6 +319,106 @@ bounded instant scheduler. Because this changes interrupt timing, packages
 should label it experimental and make it mutually exclusive with host-only
 load acceleration (normally as choices in one default-off feature).
 
+## Indexed files
+
+Package format 6 adds authenticated files addressed by a format-specific
+32-bit index. This is a plan primitive for game integrations that already have
+a stable indexed-file format. A trusted static handler publishes complete
+virtual raw sectors and an extended leadout; the package cannot select physical
+sectors or provide handler code.
+
+```toml
+format_version = 6
+
+[[target]]
+game_id = "SLUS-00000"
+disc_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[[feature]]
+id = "retranslation"
+name = "Retranslation"
+
+[[option]]
+feature = "retranslation"
+id = "variant"
+label = "Script variant"
+type = "choice"
+default = "original"
+
+[[option.choice]]
+value = "original"
+label = "Original"
+
+[[option.choice]]
+value = "revised"
+label = "Revised"
+
+[[indexed_file]]
+feature = "retranslation"
+format = "example-archive"
+index = 42
+disc_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+file = "assets/script-42.bin"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+expected_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+when = { variant = "revised" }
+order = 10
+```
+
+`feature`, `format`, `index`, `file`, `sha256`, and `expected_sha256` are
+required. `format` is a stable lowercase id using the same syntax as package
+ids. `index` is a nonnegative `uint32`. `disc_sha256` is optional and, when
+present, must equal an exact digest from one of the package's `[[target]]`
+entries. The resolver omits the operation when another declared disc is
+mounted. `file` must be a safe archive-relative path. `sha256` authenticates a
+nonempty package payload;
+`expected_sha256` authenticates the stock file selected by `(format, index)`.
+Both hashes are lowercase SHA-256. `when` is an optional feature-local option
+condition and `order` provides deterministic declaration ordering.
+
+A multi-disc package uses `disc_sha256` on each disc-specific indexed file so
+one enabled feature resolves correctly when either disc is selected. It may be
+omitted only when the same index, payload, and stock guard apply to every
+declared target.
+The complete active indexed-file plan is limited to 128 MiB of replacement
+payloads. This is independent of the 256 MiB expanded archive limit.
+
+Indexed files require explicit feature ownership and an exact `disc_sha256` on
+every `[[target]]`. The loader verifies every payload while scanning. Resolution
+selects enabled and condition-matching entries, loads and verifies their bytes
+again, and rejects an enabled format unless the game has registered its stable
+id with `mod_indexed_file_format_register`. The resolved entries are exposed as
+`ModResolution::indexed_files`; applying their format-specific meaning remains
+the registered game integration's responsibility. Runtime handlers are
+registered with `mod_runtime_register_indexed_file_handler`, which also
+advertises the format to package resolution. A handler receives the retained
+authenticated `ISOReader`, authenticated resolved payloads, and base sector
+count. The same reader is transferred to the CD-ROM runtime after commit.
+It must verify each `expected_sha256` against the indexed stock bytes before
+returning output. Its output is validated before publication, and clearing mods
+for netplay drops the complete virtual-sector plan.
+
+Indexed files are an exclusive disc plan mode. If any indexed file is active,
+resolution rejects every active `disc_raw` or `disc_user` write, `[[overlay]]`,
+or legacy `derived_disc`, including operations from another package and
+operations over disjoint ranges. `main_exe` writes and static plugins are not
+disc operations and may coexist with indexed files.
+
+An indexed-file handler must reject entries visible through the mounted disc's
+ISO9660 filesystem; this primitive is only for a game's hidden index. Because a
+handler extends the data track with virtual sectors, the runtime must also
+reject a mount with trailing audio tracks unless virtual TOC support is
+available. A virtual extension must never overlap or displace a real audio
+track.
+
+The resource identity is `(format, index)`. Claims with the same format, index,
+payload SHA-256, payload size, and expected stock SHA-256 are exact duplicates
+and coalesce. Any differing claim for the same resource makes resolution fail
+and emits a structured diagnostic naming both `(package, feature)` owners. A
+failed resolution clears the complete resolved indexed-file list. Every
+resolved claim, owner, source-disc identity, and the handler schema token
+`indexed-file-v1` participates in the canonical plan fingerprint.
+
 ## Native operations
 
 `main_exe` writes use PSX guest virtual addresses. Expected bytes are checked
@@ -331,6 +442,7 @@ direct indexed lookup rather than scanning every installed mod.
 
 Feature disc overlays require an exact `disc_sha256` on every target entry.
 `expected_sha256` can additionally guard the replaced stock range.
+Disc patches and overlays cannot be active in a plan containing indexed files.
 
 ## State and migration
 
@@ -360,7 +472,8 @@ explicit features.
 The old `derived_disc` VCDIFF mechanism is legacy conversion scaffolding only.
 Feature-style manifests reject it. It is not a product mod primitive, fallback,
 or image-selection workflow; patched discs may be used offline as parity
-oracles while converting known mods to native operations.
+oracles while converting known mods to native operations. A legacy derived disc
+cannot be active in a plan containing indexed files.
 
 ## Resolution and diagnostics
 
@@ -369,11 +482,12 @@ Before boot, the manager:
 1. verifies the selected stock game and revision;
 2. expands only enabled features and their selected options;
 3. orders active packages deterministically by dependencies;
-4. verifies enabled payloads and operation bounds;
+4. verifies enabled payloads, registered indexed-file formats, and operation
+   bounds;
 5. collision-checks the complete owned byte-range plan and guard
    compatibility;
-6. coalesces only truly identical target/range/expected/replacement writes or
-   identical overlays; and
+6. coalesces only truly identical target/range/expected/replacement writes,
+   overlays, or indexed-file claims; and
 7. produces a canonical SHA-256 plan fingerprint.
 
 Incompatible overlaps fail before launch. Structured diagnostics identify both
@@ -396,9 +510,9 @@ belong inside one feature as option values.
 ## Trusted adapters and archive safety
 
 `resolver = "builtin:<id>"` selects a resolver statically registered by the
-game. Format-5 plugin ids likewise select only statically registered
-implementations. Packages cannot load arbitrary native code or select
-arbitrary symbols.
+game. Format-5 plugin ids and format-6 indexed-file format ids likewise select
+only statically registered implementations. Packages cannot load arbitrary
+native code or select arbitrary symbols.
 
 The installer accepts stored or DEFLATE-compressed ZIP entries, validates CRCs,
 rejects encrypted entries and unsafe or absolute paths, limits archives to 4096

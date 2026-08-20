@@ -162,6 +162,19 @@ struct ModPlugin {
     int64_t order = 0;
 };
 
+struct ModIndexedFile {
+    std::string feature_id;
+    std::string format;
+    uint32_t index = 0;
+    std::string disc_sha256;
+    std::filesystem::path file;
+    std::string sha256;
+    std::string expected_sha256;
+    uint64_t size = 0;
+    std::map<std::string, std::string> when;
+    int64_t order = 0;
+};
+
 struct ModDerivedDisc {
     std::string kind = "vcdiff";
     std::filesystem::path patch;
@@ -201,6 +214,7 @@ struct ModPackage {
     std::vector<ModPatch> patches;
     std::vector<ModOverlay> overlays;
     std::vector<ModPlugin> plugins;
+    std::vector<ModIndexedFile> indexed_files;
     std::vector<ModDerivedDisc> derived_discs;
 };
 
@@ -261,6 +275,16 @@ struct ModResolution {
         std::string feature_id;
     };
     std::vector<Plugin> plugins;
+    struct IndexedFile {
+        std::string format;
+        uint32_t index = 0;
+        std::vector<uint8_t> payload;
+        std::string payload_sha256;
+        std::string expected_sha256;
+        std::string package_id;
+        std::string feature_id;
+    };
+    std::vector<IndexedFile> indexed_files;
     struct Diagnostic {
         std::string message;
         std::string resource;
@@ -348,6 +372,8 @@ void mod_clear_builtin_resolvers_for_tests();
 bool mod_register_activation_plugin(const std::string& id, void (*callback)(void));
 bool mod_register_vblank_plugin(const std::string& id, void (*callback)(void));
 bool mod_plugin_registered(const std::string& id);
+bool mod_indexed_file_format_register(const std::string& format);
+bool mod_indexed_file_format_registered(const std::string& format);
 void mod_invoke_activation_plugin(const std::string& id);
 void mod_invoke_vblank_plugin(const std::string& id);
 void mod_clear_plugins_for_tests();

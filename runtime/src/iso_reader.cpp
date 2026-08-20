@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <set>
 
 namespace PS1 {
 
@@ -787,6 +788,27 @@ std::vector<ISOFileEntry> ISOReader::ListFiles(const std::string& path) {
     }
 
     return results;  // Directory not found
+}
+
+std::vector<ISOFileEntry> ISOReader::ListFilesRecursive() {
+    std::vector<ISOFileEntry> results;
+    if (!is_open_ || root_dir_.lba == 0 || root_dir_.size == 0) return results;
+    std::vector<std::pair<uint32_t, uint32_t>> pending = {
+        {root_dir_.lba, root_dir_.size}};
+    std::set<std::pair<uint32_t, uint32_t>> visited;
+    while (!pending.empty()) {
+        const auto directory = pending.back();
+        pending.pop_back();
+        if (!visited.insert(directory).second) continue;
+        std::vector<ISOFileEntry> entries =
+            ListFilesByLBA(directory.first, directory.second);
+        for (const ISOFileEntry& entry : entries) {
+            results.push_back(entry);
+            if (entry.is_directory && entry.lba != 0 && entry.size != 0)
+                pending.emplace_back(entry.lba, entry.size);
+        }
+    }
+    return results;
 }
 
 bool ISOReader::FindFile(const std::string& path, ISOFileEntry& entry) {

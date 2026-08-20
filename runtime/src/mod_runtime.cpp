@@ -16,9 +16,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -63,12 +65,30 @@ struct RuntimeMods {
     std::string disc_sha256;
     std::filesystem::path disc_path;
     std::filesystem::path effective_disc_path;
+    std::filesystem::path verified_mount_path;
+    ModVirtualDisc virtual_disc;
+    std::unique_ptr<PS1::ISOReader> verified_disc;
+    PS1::ISOReader* checked_out_verified_disc = nullptr;
     uint32_t entry_phys = 0;
     bool initialized = false;
     bool main_applied = false;
     bool disc_enabled = false;
     bool disc_guard_failed = false;
+    bool verified_disc_required = false;
+    bool launcher_committed = false;
 };
+
+struct DiscIndexes {
+    std::map<uint32_t, std::vector<size_t>> raw_disc;
+    std::map<uint32_t, std::vector<size_t>> user_disc;
+    std::map<uint32_t, std::vector<size_t>> raw_overlay;
+    std::map<uint32_t, std::vector<size_t>> user_overlay;
+};
+
+std::map<std::string, ModIndexedFileHandler>& indexed_file_handlers() {
+    static std::map<std::string, ModIndexedFileHandler> value;
+    return value;
+}
 
 RuntimeMods& state() {
     static RuntimeMods value;
@@ -123,24 +143,20 @@ bool option_is_disabled(const ModPackage& package, const ModOption& option) {
     return false;
 }
 
-void build_disc_index(RuntimeMods& s) {
-    s.raw_disc_index.clear();
-    s.user_disc_index.clear();
-    s.raw_overlay_index.clear();
-    s.user_overlay_index.clear();
-    for (size_t i = 0; i < s.plan.writes.size(); ++i) {
-        const ModResolution::Write& write = s.plan.writes[i];
+void build_disc_index(const ModResolution& plan, DiscIndexes& indexes) {
+    for (size_t i = 0; i < plan.writes.size(); ++i) {
+        const ModResolution::Write& write = plan.writes[i];
         if (write.target == ModPatchTarget::DiscRaw)
-            s.raw_disc_index[(uint32_t)(write.location / 2352)].push_back(i);
+            indexes.raw_disc[(uint32_t)(write.location / 2352)].push_back(i);
         else if (write.target == ModPatchTarget::DiscUser)
-            s.user_disc_index[(uint32_t)(write.location / 2048)].push_back(i);
+            indexes.user_disc[(uint32_t)(write.location / 2048)].push_back(i);
     }
-    for (size_t i = 0; i < s.plan.overlays.size(); ++i) {
-        const ModResolution::Overlay& overlay = s.plan.overlays[i];
+    for (size_t i = 0; i < plan.overlays.size(); ++i) {
+        const ModResolution::Overlay& overlay = plan.overlays[i];
         const uint64_t sector_size =
             overlay.target == ModPatchTarget::DiscRaw ? 2352 : 2048;
         auto& index = overlay.target == ModPatchTarget::DiscRaw
-            ? s.raw_overlay_index : s.user_overlay_index;
+            ? indexes.raw_overlay : indexes.user_overlay;
         const uint64_t first = overlay.location / sector_size;
         const uint64_t last =
             (overlay.location + overlay.payload.size() - 1) / sector_size;
@@ -274,6 +290,151 @@ bool sha256_file(const std::filesystem::path& path, std::string& out,
         text << std::hex << std::setw(2) << std::setfill('0') << (unsigned)byte;
     out = text.str();
     return true;
+}
+
+void sha256_u32(psx_sha256_ctx& hash, uint32_t value) {
+    const uint8_t bytes[4] = {
+        static_cast<uint8_t>(value),
+        static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value >> 16),
+        static_cast<uint8_t>(value >> 24)};
+    psx_sha256_update(&hash, bytes, sizeof(bytes));
+}
+
+bool sha256_open_disc(PS1::ISOReader& disc, std::string& out,
+                      std::string* error) {
+    static constexpr char domain[] = "psxrecomp-mounted-disc-v1";
+    psx_sha256_ctx hash;
+    psx_sha256_init(&hash);
+    psx_sha256_update(
+        &hash, reinterpret_cast<const uint8_t*>(domain), sizeof(domain) - 1);
+    const int track_count = disc.TrackCount();
+    const uint32_t sector_count = disc.GetSectorCount();
+    if (track_count < 1 || sector_count == 0) {
+        if (error) *error = "mounted disc has no addressable sectors";
+        return false;
+    }
+    sha256_u32(hash, static_cast<uint32_t>(track_count));
+    sha256_u32(hash, sector_count);
+    for (int track = 1; track <= track_count; ++track) {
+        sha256_u32(hash, static_cast<uint32_t>(track));
+        sha256_u32(hash, disc.TrackIsAudio(track) ? 1u : 0u);
+        sha256_u32(hash, disc.TrackStartLBA(track));
+        sha256_u32(hash, disc.TrackPregapLBA(track));
+    }
+    std::array<uint8_t, 2352> raw{};
+    std::array<uint8_t, 2048> user{};
+    for (uint32_t lba = 0; lba < sector_count; ++lba) {
+        if (disc.ReadRawSector(lba, raw.data())) {
+            const uint8_t kind = 1;
+            psx_sha256_update(&hash, &kind, 1);
+            psx_sha256_update(&hash, raw.data(), raw.size());
+        } else if (disc.ReadSector(lba, user.data())) {
+            const uint8_t kind = 0;
+            psx_sha256_update(&hash, &kind, 1);
+            psx_sha256_update(&hash, user.data(), user.size());
+        } else {
+            if (error)
+                *error = "cannot read mounted disc sector " +
+                    std::to_string(lba) + " while computing its identity";
+            return false;
+        }
+    }
+    const uint8_t has_subq_replacements =
+        disc.HasSubChannelReplacements() ? 1 : 0;
+    psx_sha256_update(&hash, &has_subq_replacements, 1);
+    if (has_subq_replacements) {
+        std::array<uint8_t, 12> subq{};
+        for (uint32_t lba = 0; lba < sector_count; ++lba) {
+            bool valid = false;
+            if (!disc.ReadSubChannelQ(lba, subq.data(), &valid)) {
+                if (error)
+                    *error = "cannot read mounted disc subchannel at sector " +
+                        std::to_string(lba);
+                return false;
+            }
+            const uint8_t validity = valid ? 1 : 0;
+            psx_sha256_update(&hash, &validity, 1);
+            psx_sha256_update(&hash, subq.data(), subq.size());
+        }
+    }
+    uint8_t digest[32];
+    psx_sha256_final(&hash, digest);
+    static constexpr char hex[] = "0123456789abcdef";
+    out.assign(64, '0');
+    for (size_t i = 0; i < 32; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    return true;
+}
+
+bool open_verified_disc(const std::filesystem::path& path,
+                        DiscPathResolution& resolved,
+                        std::unique_ptr<PS1::ISOReader>& reader,
+                        std::string& digest, std::string* error) {
+    digest.clear();
+    reader.reset();
+    resolved = resolve_disc_path(path);
+    if (path.empty()) return true;
+    if (resolved.mount.empty()) {
+        if (error) *error = "cannot resolve mounted disc path";
+        return false;
+    }
+    reader = std::make_unique<PS1::ISOReader>();
+    if (!reader->Open(resolved.mount.string())) {
+        if (error) *error = "cannot open mounted disc: " + resolved.mount.string();
+        reader.reset();
+        return false;
+    }
+    if (!sha256_open_disc(*reader, digest, error)) {
+        reader.reset();
+        return false;
+    }
+    return true;
+}
+
+bool same_mount_path(const std::filesystem::path& left,
+                     const std::filesystem::path& right) {
+    std::error_code ec;
+    if (std::filesystem::exists(left, ec) &&
+        std::filesystem::exists(right, ec)) {
+        ec.clear();
+        if (std::filesystem::equivalent(left, right, ec) && !ec) return true;
+    }
+    return left.lexically_normal() == right.lexically_normal();
+}
+
+std::string fingerprint_virtual_disc(const std::string& plan_fingerprint,
+                                     const ModVirtualDisc& disc) {
+    static constexpr char domain[] = "psxrecomp-virtual-disc-v1";
+    psx_sha256_ctx hash;
+    psx_sha256_init(&hash);
+    psx_sha256_update(
+        &hash, reinterpret_cast<const uint8_t*>(domain), sizeof(domain) - 1);
+    psx_sha256_update(
+        &hash, reinterpret_cast<const uint8_t*>(plan_fingerprint.data()),
+        plan_fingerprint.size());
+    sha256_u32(hash, disc.sector_count);
+    sha256_u32(hash, disc.appended_start_lba);
+    sha256_u32(hash, static_cast<uint32_t>(disc.raw_sectors.size()));
+    for (const auto& [lba, sector] : disc.raw_sectors) {
+        sha256_u32(hash, lba);
+        psx_sha256_update(&hash, sector.data(), sector.size());
+    }
+    sha256_u32(
+        hash, static_cast<uint32_t>(disc.appended_raw_sectors.size()));
+    for (const auto& sector : disc.appended_raw_sectors)
+        psx_sha256_update(&hash, sector.data(), sector.size());
+    uint8_t digest[32];
+    psx_sha256_final(&hash, digest);
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out(64, '0');
+    for (size_t i = 0; i < 32; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    return out;
 }
 
 std::filesystem::path raw_image_path(const std::filesystem::path& path,
@@ -503,6 +664,7 @@ bool valid_cached_disc(const std::filesystem::path& path,
 }
 
 bool materialize_derived_disc(RuntimeMods& s, const ModResolution& plan,
+                              const std::filesystem::path& source_disc_path,
                               std::filesystem::path& out, std::string* error) {
     out.clear();
     if (plan.derived_discs.empty()) return true;
@@ -543,7 +705,7 @@ bool materialize_derived_disc(RuntimeMods& s, const ModResolution& plan,
             decoder.string();
         return false;
     }
-    const std::filesystem::path source = raw_image_path(s.disc_path, error);
+    const std::filesystem::path source = raw_image_path(source_disc_path, error);
     if (source.empty()) return false;
 #if defined(_WIN32)
     const unsigned long process_id = GetCurrentProcessId();
@@ -920,6 +1082,7 @@ int mutate(Callback callback) {
         set_error(error);
         return 0;
     }
+    state().launcher_committed = false;
     if (!state().disc_path.empty())
         state().validation = state().manager.resolve(
             state().game_id, state().exe_sha256, state().disc_sha256);
@@ -974,6 +1137,7 @@ int provider_commit(void*, const char* image_path) {
         set_error(error);
         return 0;
     }
+    state().launcher_committed = true;
     state().error.clear();
     return 1;
 }
@@ -1043,11 +1207,17 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
     s.disc_sha256.clear();
     s.disc_path.clear();
     s.effective_disc_path.clear();
+    s.verified_mount_path.clear();
+    s.virtual_disc = {};
+    s.verified_disc.reset();
+    s.checked_out_verified_disc = nullptr;
     s.entry_phys = 0;
     s.initialized = false;
     s.main_applied = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
+    s.verified_disc_required = false;
+    s.launcher_committed = false;
     s.manager.set_root(root);
     s.game_id = game_id;
     s.entry_phys = game_entry_pc & 0x1FFFFFFFu;
@@ -1078,29 +1248,60 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     s.raw_overlay_index.clear();
     s.user_overlay_index.clear();
     s.effective_disc_path.clear();
+    s.verified_mount_path.clear();
+    s.virtual_disc = {};
+    s.verified_disc.reset();
+    s.checked_out_verified_disc = nullptr;
     s.main_applied = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
+    s.verified_disc_required = false;
+    s.launcher_committed = false;
     s.error.clear();
     if (error) error->clear();
     std::fprintf(stdout, "psxrecomp: mods cleared for netplay (vanilla session)\n");
     return true;
 }
 
-bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* error) {
+bool mod_runtime_commit(const std::filesystem::path& disc_path,
+                        std::string* error) try {
     RuntimeMods& s = state();
     if (!s.initialized) return true;
-    if (disc_path != s.disc_path) {
-        std::string hash_error;
-        std::string digest;
-        if (!sha256_file(disc_path, digest, &hash_error)) digest.clear();
-        s.disc_path = disc_path;
-        s.disc_sha256 = std::move(digest);
+    if (s.launcher_committed) {
+        s.launcher_committed = false;
+        const DiscPathResolution previous = resolve_disc_path(s.disc_path);
+        const DiscPathResolution requested = resolve_disc_path(disc_path);
+        if (same_mount_path(previous.mount, requested.mount)) {
+            if (error) error->clear();
+            return true;
+        }
+    }
+    DiscPathResolution resolved;
+    std::unique_ptr<PS1::ISOReader> verified_reader;
+    std::string digest;
+    std::string commit_error;
+    if (!open_verified_disc(
+            disc_path, resolved, verified_reader, digest, &commit_error)) {
+        s.error = commit_error;
+        if (error) *error = commit_error;
+        return false;
+    }
+    if (s.verified_disc_required && digest != s.disc_sha256) {
+        s.raw_disc_index.clear();
+        s.user_disc_index.clear();
+        s.raw_overlay_index.clear();
+        s.user_overlay_index.clear();
+        s.virtual_disc = {};
+        s.verified_disc.reset();
+        s.checked_out_verified_disc = nullptr;
+        s.verified_mount_path.clear();
+        s.verified_disc_required = false;
+        s.disc_enabled = false;
     }
     ModResolution plan =
-        s.manager.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
-    s.validation = plan;
+        s.manager.resolve(s.game_id, s.exe_sha256, digest);
     if (!plan.ok) {
+        s.validation = plan;
         s.error.clear();
         for (const std::string& item : plan.errors) {
             if (!s.error.empty()) s.error += "\n";
@@ -1113,31 +1314,141 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
         if (overlay.expected_sha256.empty()) continue;
         std::string actual;
         if (!sha256_disc_range(
-                s.disc_path, overlay.target, overlay.location,
-                overlay.payload.size(), actual, &s.error) ||
+                disc_path, overlay.target, overlay.location,
+                overlay.payload.size(), actual, &commit_error) ||
             actual != overlay.expected_sha256) {
-            if (s.error.empty())
-                s.error = overlay.package_id + "/" + overlay.feature_id +
+            if (commit_error.empty())
+                commit_error = overlay.package_id + "/" + overlay.feature_id +
                     ": stock overlay range checksum failed";
-            if (error) *error = s.error;
+            s.error = commit_error;
+            if (error) *error = commit_error;
             return false;
         }
     }
+    ModVirtualDisc virtual_disc;
+    if (!plan.indexed_files.empty()) {
+        const bool has_disc_writes = std::any_of(
+            plan.writes.begin(), plan.writes.end(),
+            [](const ModResolution::Write& write) {
+                return write.target != ModPatchTarget::MainExe;
+            });
+        if (has_disc_writes || !plan.overlays.empty() ||
+            !plan.derived_discs.empty()) {
+            s.error = "indexed-file plans cannot be combined with disc "
+                      "patches, overlays, or derived discs";
+            if (error) *error = s.error;
+            return false;
+        }
+        const std::string& format = plan.indexed_files.front().format;
+        if (std::any_of(
+                plan.indexed_files.begin(), plan.indexed_files.end(),
+                [&](const ModResolution::IndexedFile& file) {
+                    return file.format != format;
+                })) {
+            s.error = "more than one indexed-file format is active";
+            if (error) *error = s.error;
+            return false;
+        }
+        const auto handler = indexed_file_handlers().find(format);
+        if (handler == indexed_file_handlers().end()) {
+            s.error = "indexed-file handler is unavailable: " + format;
+            if (error) *error = s.error;
+            return false;
+        }
+        if (!verified_reader) {
+            s.error = "cannot open stock disc for indexed-file resolution";
+            if (error) *error = s.error;
+            return false;
+        }
+        const uint32_t base_sector_count = verified_reader->GetSectorCount();
+        if (verified_reader->TrackCount() > 0 &&
+            verified_reader->TrackIsAudio(verified_reader->TrackCount())) {
+            s.error = "indexed-file virtual extensions require a final data track";
+            if (error) *error = s.error;
+            return false;
+        }
+        if (!handler->second(
+                *verified_reader, plan.indexed_files, base_sector_count,
+                virtual_disc, &commit_error)) {
+            if (commit_error.empty())
+                commit_error = "indexed-file handler failed: " + format;
+            s.error = commit_error;
+            if (error) *error = commit_error;
+            return false;
+        }
+        if (virtual_disc.sector_count < base_sector_count) {
+            s.error = "indexed-file handler shortened the virtual disc";
+            if (error) *error = s.error;
+            return false;
+        }
+        for (const auto& [lba, unused] : virtual_disc.raw_sectors) {
+            (void)unused;
+            if (lba >= base_sector_count || lba >= virtual_disc.sector_count) {
+                s.error = "indexed-file handler emitted an invalid stock override";
+                if (error) *error = s.error;
+                return false;
+            }
+        }
+        const uint64_t extension_size =
+            uint64_t(virtual_disc.sector_count) - base_sector_count;
+        if (extension_size != virtual_disc.appended_raw_sectors.size() ||
+            (extension_size != 0 &&
+             virtual_disc.appended_start_lba != base_sector_count)) {
+            s.error = "indexed-file handler emitted an invalid contiguous extension";
+            if (error) *error = s.error;
+            return false;
+        }
+        plan.fingerprint =
+            fingerprint_virtual_disc(plan.fingerprint, virtual_disc);
+    }
+    /* Indexed payload bytes have been expanded into authenticated raw sectors;
+     * retaining them in both the committed plan and launcher-validation copy
+     * would roughly triple the memory cost of large translation packages. */
+    for (ModResolution::IndexedFile& file : plan.indexed_files) {
+        std::vector<uint8_t>().swap(file.payload);
+    }
     std::filesystem::path effective_disc;
-    if (!materialize_derived_disc(s, plan, effective_disc, &s.error)) {
-        if (error) *error = s.error;
+    if (!materialize_derived_disc(
+            s, plan, disc_path, effective_disc, &commit_error)) {
+        s.error = commit_error;
+        if (error) *error = commit_error;
         return false;
     }
-    if (!s.manager.save_state(&s.error)) {
-        if (error) *error = s.error;
+    DiscIndexes indexes;
+    build_disc_index(plan, indexes);
+    ModResolution validation = plan;
+    std::filesystem::path committed_disc_path = disc_path;
+    std::filesystem::path committed_mount_path =
+        !plan.indexed_files.empty() ? resolved.mount : std::filesystem::path{};
+    if (!s.manager.save_state(&commit_error)) {
+        s.error = commit_error;
+        if (error) *error = commit_error;
         return false;
     }
+    const bool indexed_plan = !plan.indexed_files.empty();
+    s.disc_path = std::move(committed_disc_path);
+    s.disc_sha256 = std::move(digest);
     s.plan = std::move(plan);
-    build_disc_index(s);
+    s.validation = std::move(validation);
+    s.raw_disc_index.swap(indexes.raw_disc);
+    s.user_disc_index.swap(indexes.user_disc);
+    s.raw_overlay_index.swap(indexes.raw_overlay);
+    s.user_overlay_index.swap(indexes.user_overlay);
     s.effective_disc_path = std::move(effective_disc);
+    s.virtual_disc = std::move(virtual_disc);
+    s.verified_mount_path = std::move(committed_mount_path);
+    s.verified_disc = indexed_plan ? std::move(verified_reader) : nullptr;
+    s.checked_out_verified_disc = nullptr;
+    s.verified_disc_required = indexed_plan;
     s.main_applied = false;
+    s.disc_guard_failed = false;
     s.error.clear();
     return true;
+} catch (const std::exception& ex) {
+    RuntimeMods& s = state();
+    s.error = std::string("cannot commit mod plan: ") + ex.what();
+    if (error) *error = s.error;
+    return false;
 }
 
 const std::string& mod_runtime_fingerprint() {
@@ -1146,6 +1457,58 @@ const std::string& mod_runtime_fingerprint() {
 
 const std::filesystem::path& mod_runtime_effective_disc_path() {
     return state().effective_disc_path;
+}
+
+bool mod_runtime_compute_disc_sha256(
+    const std::filesystem::path& disc_path, std::string& digest,
+    std::string* error) try {
+    if (disc_path.empty()) {
+        digest.clear();
+        if (error) *error = "disc path is empty";
+        return false;
+    }
+    DiscPathResolution resolved;
+    std::unique_ptr<PS1::ISOReader> reader;
+    return open_verified_disc(disc_path, resolved, reader, digest, error);
+} catch (const std::exception& ex) {
+    if (error) *error = std::string("cannot identify mounted disc: ") + ex.what();
+    digest.clear();
+    return false;
+}
+
+PS1::ISOReader* mod_runtime_take_verified_disc(
+    const std::filesystem::path& disc_path) try {
+    RuntimeMods& s = state();
+    if (!s.verified_disc_required || !s.verified_disc) return nullptr;
+    const DiscPathResolution resolved = resolve_disc_path(disc_path);
+    if (!same_mount_path(resolved.mount, s.verified_mount_path)) return nullptr;
+    PS1::ISOReader* reader = s.verified_disc.release();
+    s.checked_out_verified_disc = reader;
+    return reader;
+} catch (...) {
+    return nullptr;
+}
+
+bool mod_runtime_requires_verified_disc() {
+    return state().verified_disc_required;
+}
+
+bool mod_runtime_return_verified_disc(PS1::ISOReader* disc) {
+    RuntimeMods& s = state();
+    if (!disc || !s.verified_disc_required || s.verified_disc ||
+        disc != s.checked_out_verified_disc)
+        return false;
+    s.checked_out_verified_disc = nullptr;
+    s.verified_disc.reset(disc);
+    return true;
+}
+
+bool mod_runtime_register_indexed_file_handler(
+    const std::string& format, ModIndexedFileHandler handler) {
+    if (!handler || indexed_file_handlers().count(format) != 0) return false;
+    if (!mod_indexed_file_format_register(format)) return false;
+    indexed_file_handlers()[format] = handler;
+    return true;
 }
 
 #if defined(RECOMP_LAUNCHER)
@@ -1407,4 +1770,30 @@ extern "C" void mod_runtime_patch_disc_sector(uint32_t lba, int raw_sector,
     }
     if (has_mode2_form1_user_data && !s.disc_guard_failed)
         mod_runtime_patch_disc_sector(lba, 0, bytes + 24, 2048);
+}
+
+extern "C" int mod_runtime_read_virtual_raw_sector(
+    uint32_t lba, uint8_t* bytes, uint32_t size) {
+    using namespace PSXRecompV4;
+    RuntimeMods& s = state();
+    if (!s.initialized || !bytes || size < 2352) return 0;
+    const auto sector = s.virtual_disc.raw_sectors.find(lba);
+    if (sector != s.virtual_disc.raw_sectors.end()) {
+        std::memcpy(bytes, sector->second.data(), sector->second.size());
+        return 1;
+    }
+    if (lba < s.virtual_disc.appended_start_lba) return 0;
+    const uint64_t index = uint64_t(lba) - s.virtual_disc.appended_start_lba;
+    if (index >= s.virtual_disc.appended_raw_sectors.size()) return 0;
+    const auto& appended =
+        s.virtual_disc.appended_raw_sectors[static_cast<size_t>(index)];
+    std::memcpy(bytes, appended.data(), appended.size());
+    return 1;
+}
+
+extern "C" uint32_t mod_runtime_effective_sector_count(
+    uint32_t base_sector_count) {
+    using namespace PSXRecompV4;
+    const uint32_t virtual_count = state().virtual_disc.sector_count;
+    return std::max(base_sector_count, virtual_count);
 }

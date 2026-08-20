@@ -1,4 +1,5 @@
 #include "mod_packages.h"
+#include "crc32.h"
 #include "psx_sha256.h"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstdlib>
 
@@ -75,6 +77,49 @@ static void write_deflated_package(const fs::path& path) {
     zip.insert(zip.end(), name.begin(), name.end());
     const uint32_t central_size = (uint32_t)zip.size() - central_offset;
     le32(0x06054b50); le16(0); le16(0); le16(1); le16(1);
+    le32(central_size); le32(central_offset); le16(0);
+    fs::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    out.write((const char*)zip.data(), (std::streamsize)zip.size());
+}
+
+static void write_stored_package(
+    const fs::path& path,
+    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries) {
+    struct CentralEntry {
+        std::string name;
+        uint32_t crc;
+        uint32_t size;
+        uint32_t offset;
+    };
+    std::vector<uint8_t> zip;
+    std::vector<CentralEntry> central;
+    auto le16 = [&](uint16_t v) {
+        zip.push_back((uint8_t)v); zip.push_back((uint8_t)(v >> 8));
+    };
+    auto le32 = [&](uint32_t v) {
+        le16((uint16_t)v); le16((uint16_t)(v >> 16));
+    };
+    for (const auto& [name, data] : entries) {
+        const uint32_t crc = crc32_compute(data.data(), data.size());
+        central.push_back({name, crc, (uint32_t)data.size(), (uint32_t)zip.size()});
+        le32(0x04034b50); le16(20); le16(0); le16(0); le16(0); le16(0);
+        le32(crc); le32((uint32_t)data.size()); le32((uint32_t)data.size());
+        le16((uint16_t)name.size()); le16(0);
+        zip.insert(zip.end(), name.begin(), name.end());
+        zip.insert(zip.end(), data.begin(), data.end());
+    }
+    const uint32_t central_offset = (uint32_t)zip.size();
+    for (const CentralEntry& entry : central) {
+        le32(0x02014b50); le16(20); le16(20); le16(0); le16(0); le16(0); le16(0);
+        le32(entry.crc); le32(entry.size); le32(entry.size);
+        le16((uint16_t)entry.name.size()); le16(0); le16(0); le16(0); le16(0);
+        le32(0); le32(entry.offset);
+        zip.insert(zip.end(), entry.name.begin(), entry.name.end());
+    }
+    const uint32_t central_size = (uint32_t)zip.size() - central_offset;
+    le32(0x06054b50); le16(0); le16(0);
+    le16((uint16_t)central.size()); le16((uint16_t)central.size());
     le32(central_size); le32(central_offset); le16(0);
     fs::create_directories(path.parent_path());
     std::ofstream out(path, std::ios::binary);
@@ -1284,6 +1329,287 @@ int main() {
                "[[target]]\ngame_id=\"SLUS-TEST\"\n");
     check(!ModPackageManager::read_manifest(root / "bad.toml", invalid, &error),
           "unsafe package id must be rejected");
+    write_text(root / "wrapped-version.toml",
+               "format_version=4294967302\nid=\"wrapped.version\"\n"
+               "version=\"1.0.0\"\nname=\"Wrapped\"\n"
+               "[[target]]\ngame_id=\"SLUS-TEST\"\n");
+    check(!ModPackageManager::read_manifest(
+              root / "wrapped-version.toml", invalid, &error),
+          "format versions must be validated before narrowing to uint32");
+
+    const fs::path indexed_root = root / "indexed-root";
+    const fs::path indexed_package =
+        indexed_root / "packages/indexed.mod/1.0.0";
+    const std::vector<uint8_t> indexed_a = {0x10, 0x20, 0x30};
+    const std::vector<uint8_t> indexed_b = {0x40, 0x50};
+    const std::vector<uint8_t> indexed_c = {0x60};
+    const std::string indexed_disc_hash(64, 'a');
+    const std::string indexed_other_disc_hash(64, 'd');
+    const std::string expected_a(64, 'b');
+    const std::string expected_b(64, 'c');
+    write_bytes(indexed_package / "assets/a.bin", indexed_a);
+    write_bytes(indexed_package / "assets/b.bin", indexed_b);
+    write_bytes(indexed_package / "assets/c.bin", indexed_c);
+    const auto indexed_manifest = [&](const std::string& expected) {
+        return
+            "format_version = 6\n"
+            "id = \"indexed.mod\"\n"
+            "version = \"1.0.0\"\n"
+            "name = \"Indexed Files\"\n"
+            "[[target]]\n"
+            "game_id = \"SLUS-INDEXED\"\n"
+            "disc_sha256 = \"" + indexed_disc_hash + "\"\n"
+            "[[target]]\n"
+            "game_id = \"SLUS-INDEXED\"\n"
+            "disc_sha256 = \"" + indexed_other_disc_hash + "\"\n"
+            "[[feature]]\n"
+            "id = \"primary\"\n"
+            "name = \"Primary\"\n"
+            "[[feature]]\n"
+            "id = \"duplicate\"\n"
+            "name = \"Duplicate\"\n"
+            "[[feature]]\n"
+            "id = \"conditional\"\n"
+            "name = \"Conditional\"\n"
+            "[[feature]]\n"
+            "id = \"collision\"\n"
+            "name = \"Collision\"\n"
+            "[[feature]]\n"
+            "id = \"unavailable\"\n"
+            "name = \"Unavailable\"\n"
+            "[[option]]\n"
+            "feature = \"conditional\"\n"
+            "id = \"active\"\n"
+            "label = \"Active\"\n"
+            "type = \"boolean\"\n"
+            "default = \"false\"\n"
+            "[[indexed_file]]\n"
+            "feature = \"primary\"\n"
+            "format = \"test-index\"\n"
+            "index = 7\n"
+            "disc_sha256 = \"" + indexed_disc_hash + "\"\n"
+            "file = \"assets/a.bin\"\n"
+            "sha256 = \"" + sha256_hex(indexed_a) + "\"\n"
+            "expected_sha256 = \"" + expected + "\"\n"
+            "order = 0\n"
+            "[[indexed_file]]\n"
+            "feature = \"duplicate\"\n"
+            "format = \"test-index\"\n"
+            "index = 7\n"
+            "disc_sha256 = \"" + indexed_disc_hash + "\"\n"
+            "file = \"assets/a.bin\"\n"
+            "sha256 = \"" + sha256_hex(indexed_a) + "\"\n"
+            "expected_sha256 = \"" + expected + "\"\n"
+            "[[indexed_file]]\n"
+            "feature = \"conditional\"\n"
+            "format = \"test-index\"\n"
+            "index = 8\n"
+            "disc_sha256 = \"" + indexed_disc_hash + "\"\n"
+            "file = \"assets/c.bin\"\n"
+            "sha256 = \"" + sha256_hex(indexed_c) + "\"\n"
+            "expected_sha256 = \"" + expected_a + "\"\n"
+            "when = { active = \"true\" }\n"
+            "[[indexed_file]]\n"
+            "feature = \"collision\"\n"
+            "format = \"test-index\"\n"
+            "index = 7\n"
+            "disc_sha256 = \"" + indexed_disc_hash + "\"\n"
+            "file = \"assets/b.bin\"\n"
+            "sha256 = \"" + sha256_hex(indexed_b) + "\"\n"
+            "expected_sha256 = \"" + expected + "\"\n"
+            "[[indexed_file]]\n"
+            "feature = \"unavailable\"\n"
+            "format = \"missing-index\"\n"
+            "index = 9\n"
+            "disc_sha256 = \"" + indexed_disc_hash + "\"\n"
+            "file = \"assets/c.bin\"\n"
+            "sha256 = \"" + sha256_hex(indexed_c) + "\"\n"
+            "expected_sha256 = \"" + expected_a + "\"\n";
+    };
+    write_text(indexed_package / "manifest.toml",
+               indexed_manifest(expected_a));
+    ModPackage parsed_indexed;
+    check(ModPackageManager::read_manifest(
+              indexed_package / "manifest.toml", parsed_indexed, &error) &&
+              parsed_indexed.indexed_files.size() == 5 &&
+              parsed_indexed.indexed_files[0].format == "test-index" &&
+              parsed_indexed.indexed_files[0].index == 7 &&
+              parsed_indexed.indexed_files[0].disc_sha256 == indexed_disc_hash &&
+              parsed_indexed.indexed_files[0].size == indexed_a.size(),
+          "format-6 indexed files must parse verified metadata");
+    check(!mod_indexed_file_format_register("Bad Format"),
+          "indexed file registry must reject unstable format ids");
+    check(mod_indexed_file_format_register("test-index") &&
+              mod_indexed_file_format_registered("test-index") &&
+              !mod_indexed_file_format_register("test-index"),
+          "indexed file formats must register once by stable id");
+
+    const std::string install_manifest = indexed_manifest(expected_a);
+    const fs::path indexed_archive = root / "indexed-install.psxmod";
+    write_stored_package(indexed_archive, {
+        {"manifest.toml", std::vector<uint8_t>(
+            install_manifest.begin(), install_manifest.end())},
+        {"assets/a.bin", indexed_a},
+        {"assets/b.bin", indexed_b},
+        {"assets/c.bin", indexed_c},
+    });
+    const fs::path install_root = root / "indexed-install-root";
+    ModPackageManager install_manager(install_root);
+    check(install_manager.install_archive(
+              indexed_archive, nullptr, nullptr, &error), error.c_str());
+    check(install_manager.set_feature_enabled(
+              "indexed.mod", "primary", true, &error), error.c_str());
+    const ModResolution installed_indexed = install_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    const fs::path installed_root =
+        install_root / "packages/indexed.mod/1.0.0";
+    const ModPackage& installed_package =
+        install_manager.packages().at("indexed.mod").at("1.0.0");
+    check(installed_indexed.ok &&
+              installed_indexed.indexed_files.size() == 1 &&
+              installed_indexed.indexed_files[0].payload == indexed_a &&
+              installed_package.root == installed_root &&
+              installed_package.indexed_files[0].file ==
+                  installed_root / "assets/a.bin",
+          "format-6 install must resolve published assets without a scan");
+
+    ModPackageManager indexed_manager(indexed_root);
+    check(indexed_manager.scan(&error), error.c_str());
+    check(indexed_manager.load_state(&error), error.c_str());
+    check(indexed_manager.set_feature_enabled(
+              "indexed.mod", "primary", true, &error), error.c_str());
+    check(indexed_manager.set_feature_enabled(
+              "indexed.mod", "duplicate", true, &error), error.c_str());
+    ModResolution indexed_resolved = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    check(indexed_resolved.ok && indexed_resolved.indexed_files.size() == 1 &&
+              indexed_resolved.indexed_files[0].format == "test-index" &&
+              indexed_resolved.indexed_files[0].index == 7 &&
+              indexed_resolved.indexed_files[0].payload == indexed_a &&
+              indexed_resolved.indexed_files[0].expected_sha256 == expected_a,
+          "exact indexed-file claims must coalesce after payload reverification");
+    const ModResolution indexed_other_disc = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_other_disc_hash);
+    check(indexed_other_disc.ok && indexed_other_disc.indexed_files.empty(),
+          "disc-specific indexed files must be omitted on another declared target");
+    const std::string indexed_fingerprint = indexed_resolved.fingerprint;
+    write_text(indexed_package / "manifest.toml",
+               indexed_manifest(expected_b));
+    check(indexed_manager.scan(&error), error.c_str());
+    ModResolution indexed_semantic_change = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    check(indexed_semantic_change.ok &&
+              indexed_semantic_change.fingerprint != indexed_fingerprint,
+          "indexed-file expected stock hashes must affect the fingerprint");
+    check(indexed_manager.set_feature_enabled(
+              "indexed.mod", "conditional", true, &error), error.c_str());
+    check(indexed_manager.resolve(
+              "SLUS-INDEXED", {}, indexed_disc_hash).indexed_files.size() == 1,
+          "false indexed-file conditions must omit their payload");
+    check(indexed_manager.set_feature_option(
+              "indexed.mod", "conditional", "active", "true", &error),
+          error.c_str());
+    ModResolution indexed_conditional = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    check(indexed_conditional.ok &&
+              indexed_conditional.indexed_files.size() == 2 &&
+              indexed_conditional.fingerprint !=
+                  indexed_semantic_change.fingerprint,
+          "selected indexed-file conditions and claims must affect the plan");
+
+    write_bytes(indexed_package / "assets/a.bin", {0x99});
+    ModResolution indexed_changed_payload = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    check(!indexed_changed_payload.ok &&
+              indexed_changed_payload.indexed_files.empty(),
+          "changed indexed payloads must fail closed and clear the resolved list");
+    write_bytes(indexed_package / "assets/a.bin", indexed_a);
+    check(indexed_manager.set_feature_enabled(
+              "indexed.mod", "collision", true, &error), error.c_str());
+    ModResolution indexed_collision = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    check(!indexed_collision.ok && indexed_collision.indexed_files.empty() &&
+              indexed_collision.diagnostics.size() == 1 &&
+              indexed_collision.diagnostics[0].resource ==
+                  "indexed_file:test-index:7" &&
+              indexed_collision.diagnostics[0].feature_id == "collision" &&
+              indexed_collision.diagnostics[0].other_feature_id == "primary",
+          "differing indexed-file claims must report both owners and clear output");
+    check(indexed_manager.set_feature_enabled(
+              "indexed.mod", "collision", false, &error), error.c_str());
+    check(indexed_manager.set_feature_enabled(
+              "indexed.mod", "unavailable", true, &error), error.c_str());
+    ModResolution indexed_unavailable = indexed_manager.resolve(
+        "SLUS-INDEXED", {}, indexed_disc_hash);
+    check(!indexed_unavailable.ok && indexed_unavailable.indexed_files.empty() &&
+              std::any_of(
+                  indexed_unavailable.errors.begin(),
+                  indexed_unavailable.errors.end(),
+                  [](const std::string& item) {
+                      return item.find(
+                          "indexed file format is unavailable: missing-index") !=
+                          std::string::npos;
+                  }),
+          "unregistered indexed-file formats must fail resolution closed");
+
+    const auto reject_indexed_manifest =
+        [&](const std::string& name, const std::string& body) {
+            const fs::path path = indexed_package / (name + ".toml");
+            write_text(path, body);
+            ModPackage rejected;
+            return !ModPackageManager::read_manifest(path, rejected, &error);
+        };
+    const std::string indexed_prelude =
+        "id=\"bad.indexed\"\nversion=\"1.0.0\"\nname=\"Bad\"\n"
+        "[[target]]\ngame_id=\"SLUS-INDEXED\"\ndisc_sha256=\"" +
+        indexed_disc_hash + "\"\n"
+        "[[feature]]\nid=\"bad\"\nname=\"Bad\"\n";
+    const std::string indexed_entry =
+        "[[indexed_file]]\nfeature=\"bad\"\nformat=\"test-index\"\n"
+        "index=0\nfile=\"assets/a.bin\"\nsha256=\"" +
+        sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" + expected_a +
+        "\"\n";
+    check(reject_indexed_manifest(
+              "indexed-v5", "format_version=5\n" + indexed_prelude +
+                  indexed_entry),
+          "indexed files must require package format 6");
+    check(reject_indexed_manifest(
+              "indexed-negative", "format_version=6\n" + indexed_prelude +
+                  "[[indexed_file]]\nfeature=\"bad\"\n"
+                  "format=\"test-index\"\nindex=-1\n"
+                  "file=\"assets/a.bin\"\nsha256=\"" +
+                  sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" +
+                  expected_a + "\"\n"),
+          "indexed file indexes must reject negative values");
+    check(reject_indexed_manifest(
+              "indexed-unknown-field", "format_version=6\n" +
+                  indexed_prelude + indexed_entry + "whenn={}\n"),
+          "indexed files must reject unknown fields");
+    check(reject_indexed_manifest(
+              "indexed-unknown-disc", "format_version=6\n" +
+                  indexed_prelude +
+                  "[[indexed_file]]\nfeature=\"bad\"\nformat=\"test-index\"\n"
+                  "index=0\ndisc_sha256=\"" + indexed_other_disc_hash +
+                  "\"\nfile=\"assets/a.bin\"\nsha256=\"" +
+                  sha256_hex(indexed_a) + "\"\nexpected_sha256=\"" +
+                  expected_a + "\"\n"),
+          "indexed-file disc guards must name a declared package target");
+    check(reject_indexed_manifest(
+              "indexed-unguarded",
+              "format_version=6\nid=\"bad.indexed\"\n"
+              "version=\"1.0.0\"\nname=\"Bad\"\n"
+              "[[target]]\ngame_id=\"SLUS-INDEXED\"\n"
+              "[[feature]]\nid=\"bad\"\nname=\"Bad\"\n" +
+                  indexed_entry),
+          "indexed files must require exact disc hashes on every target");
+    check(reject_indexed_manifest(
+              "indexed-legacy",
+              "format_version=6\nid=\"bad.indexed\"\n"
+              "version=\"1.0.0\"\nname=\"Bad\"\n"
+              "[[target]]\ngame_id=\"SLUS-INDEXED\"\n"
+              "disc_sha256=\"" + indexed_disc_hash + "\"\n" +
+                  indexed_entry),
+          "indexed files must require explicit feature ownership");
 
     fs::remove_all(root, ec);
     if (failures) {

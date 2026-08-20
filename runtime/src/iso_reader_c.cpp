@@ -6,31 +6,53 @@
 
 #include "iso_reader.h"
 #include "mod_runtime.h"
+#include <array>
+#include <cstring>
 #include <cstdio>
 
 extern "C" {
 
 void* iso_open(const char* path) {
-    auto* reader = new PS1::ISOReader();
-    if (!reader->Open(path)) {
-        delete reader;
+    if (!path) return nullptr;
+    try {
+        if (PS1::ISOReader* verified =
+                PSXRecompV4::mod_runtime_take_verified_disc(path))
+            return verified;
+        if (PSXRecompV4::mod_runtime_requires_verified_disc()) return nullptr;
+        auto* reader = new PS1::ISOReader();
+        if (!reader->Open(path)) {
+            delete reader;
+            return nullptr;
+        }
+        return reader;
+    } catch (...) {
         return nullptr;
     }
-    return reader;
 }
 
 int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size) {
-    if (!handle) return 0;
+    if (!handle || !buffer || size < 2048) return 0;
     auto* reader = static_cast<PS1::ISOReader*>(handle);
-    (void)size; /* ReadSector always reads 2048 bytes */
+    std::array<uint8_t, 2352> raw{};
+    if (mod_runtime_read_virtual_raw_sector(
+            lba, raw.data(), (uint32_t)raw.size())) {
+        mod_runtime_patch_disc_sector(
+            lba, 1, raw.data(), (uint32_t)raw.size());
+        std::memcpy(buffer, raw.data() + 24, 2048);
+        return 1;
+    }
     if (!reader->ReadSector(lba, buffer)) return 0;
     mod_runtime_patch_disc_sector(lba, 0, buffer, 2048);
     return 1;
 }
 
 int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size) {
-    if (!handle || size < 2352) return 0;
+    if (!handle || !buffer || size < 2352) return 0;
     auto* reader = static_cast<PS1::ISOReader*>(handle);
+    if (mod_runtime_read_virtual_raw_sector(lba, buffer, (uint32_t)size)) {
+        mod_runtime_patch_disc_sector(lba, 1, buffer, 2352);
+        return 1;
+    }
     if (!reader->ReadRawSector(lba, buffer)) return 0;
     mod_runtime_patch_disc_sector(lba, 1, buffer, 2352);
     return 1;
@@ -53,7 +75,7 @@ int iso_has_subq_replacements(void* handle) {
 uint32_t iso_sector_count(void* handle) {
     if (!handle) return 0;
     auto* reader = static_cast<PS1::ISOReader*>(handle);
-    return reader->GetSectorCount();
+    return mod_runtime_effective_sector_count(reader->GetSectorCount());
 }
 
 /* CD-track TOC accessors (multi-track / CD-DA support). track is 1-based. */
@@ -80,6 +102,7 @@ int iso_track_is_audio(void* handle, int track) {
 void iso_close(void* handle) {
     if (!handle) return;
     auto* reader = static_cast<PS1::ISOReader*>(handle);
+    if (PSXRecompV4::mod_runtime_return_verified_disc(reader)) return;
     reader->Close();
     delete reader;
 }

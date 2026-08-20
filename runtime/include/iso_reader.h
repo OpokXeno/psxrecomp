@@ -165,6 +165,7 @@ public:
      * @return Vector of ISOFileEntry for all files/subdirectories
      */
     std::vector<ISOFileEntry> ListFiles(const std::string& path = "");
+    std::vector<ISOFileEntry> ListFilesRecursive();
 
     /**
      * Find a file by name in the root directory

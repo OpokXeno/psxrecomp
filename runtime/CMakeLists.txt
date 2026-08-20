@@ -367,6 +367,14 @@ if(BUILD_TESTING)
     target_link_libraries(mod_runtime_test PRIVATE chdr-static)
     add_test(NAME mod_runtime_test COMMAND mod_runtime_test)
 
+    add_executable(iso_reader_virtual_test
+        tests/test_iso_reader_virtual.cpp
+        src/iso_reader.cpp
+        src/cue_sheet.cpp)
+    target_include_directories(iso_reader_virtual_test PRIVATE include)
+    target_link_libraries(iso_reader_virtual_test PRIVATE chdr-static)
+    add_test(NAME iso_reader_virtual_test COMMAND iso_reader_virtual_test)
+
     if(WIN32)
         add_executable(autocompile_publication_test
             tests/test_autocompile_publication.c

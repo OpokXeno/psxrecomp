@@ -11131,6 +11131,7 @@ int main(int argc, char** argv) {
     const char* bios_path = PSX_DEFAULT_BIOS_PATH;
     const char* game_config_path = nullptr;
     const char* disc_override_path = nullptr;
+    const char* cli_disc_hash_path = nullptr;
     bool        bios_from_cli = false;  /* CLI --bios/positional wins over settings.toml */
     /* Did the PLAYER choose this BIOS (CLI or settings), as opposed to it
      * being the compile-time default? Only a real choice overrides the
@@ -11168,6 +11169,7 @@ int main(int argc, char** argv) {
      *   --game <toml>       load a game config (single source of truth for
      *                       disc / memcard / window title / debug port)
      *   --disc <path>       override the game config disc path
+     *   --disc-hash <path>  print the canonical mounted-disc SHA-256 and exit
      *   --debug-port <n>    override the TCP debug-server port (multi-instance)
      *   --memcard-dir <path> override card/save/options state (multi-instance)
      *   --renderer <name>   override the renderer: software|opengl|vulkan
@@ -11194,6 +11196,12 @@ int main(int argc, char** argv) {
             game_config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
             disc_override_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--disc-hash") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "psxrecomp: --disc-hash requires a path\n");
+                return 1;
+            }
+            cli_disc_hash_path = argv[++i];
         } else if (std::strcmp(argv[i], "--debug-port") == 0 && i + 1 < argc) {
             cli_debug_port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
@@ -11269,6 +11277,17 @@ int main(int argc, char** argv) {
                     argv[i]);
             }
         }
+    }
+    if (cli_disc_hash_path) {
+        std::string digest;
+        std::string digest_error;
+        if (!PSXRecompV4::mod_runtime_compute_disc_sha256(
+                cli_disc_hash_path, digest, &digest_error)) {
+            std::fprintf(stderr, "psxrecomp: %s\n", digest_error.c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "%s\n", digest.c_str());
+        return 0;
     }
     psx_xenogears_timing_set_startup_policy(&native_fps_policy);
     psx_xenogears_timing_reset(XG_TIMING_REASON_BOOT);
@@ -12585,6 +12604,16 @@ int main(int argc, char** argv) {
         code_provider_init(cfg_backend, gcc_avail);
     };
 
+    /* An explicit CLI disc is authoritative and must seed the launcher itself;
+     * otherwise its Mods provider would authenticate the configured disc before
+     * the override is applied later in startup. */
+    if (disc_override_path) {
+        resolved_disc = resolve_disc_for_runtime(
+            resolved_disc, disc_override_path, game_id, argv[0]);
+        if (resolved_disc.empty()) return 1;
+        disc_override_path = nullptr;
+    }
+
     if (deferred_overlay_cache) {
         overlay_init_thread = std::thread([&]() {
             try {
@@ -13347,6 +13376,15 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (game_config_path || disc_override_path || !resolved_disc.empty()) {
+        resolved_disc = resolve_disc_for_runtime(
+            resolved_disc, disc_override_path, game_id, argv[0]);
+        if (game_config_path && resolved_disc.empty()) {
+            std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
+            return 1;
+        }
+    }
+
     {
         /* Netplay must stay vanilla: launcher commit_netplay clears the plan,
          * but a following offline-style commit would re-resolve enabled mods
@@ -13439,14 +13477,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
         return 1;
     }
-    if (game_config_path || disc_override_path || !resolved_disc.empty()) {
-        resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
-        if (game_config_path && resolved_disc.empty()) {
-            std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
-            return 1;
-        }
-    }
-
     /* memcard_dir was resolved to its default before the launcher (above). */
 
     std::string bios_path_str    = resolved_bios.string();

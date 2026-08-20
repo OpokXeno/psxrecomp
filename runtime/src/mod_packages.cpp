@@ -22,9 +22,11 @@ namespace PSXRecompV4 {
 namespace {
 
 constexpr uint32_t kMinFormatVersion = 1;
-constexpr uint32_t kMaxFormatVersion = 5;
+constexpr uint32_t kMaxFormatVersion = 6;
 constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxIndexedPayloadBytes = 128ull * 1024ull * 1024ull;
 constexpr uint32_t kMaxArchiveFiles = 4096;
+constexpr const char* kIndexedFileSchemaToken = "indexed-file-v1";
 
 std::map<std::string, ModBuiltinResolver>& builtin_resolvers() {
     static std::map<std::string, ModBuiltinResolver> value;
@@ -38,6 +40,11 @@ struct RegisteredPlugin {
 
 std::map<std::string, RegisteredPlugin>& registered_plugins() {
     static std::map<std::string, RegisteredPlugin> value;
+    return value;
+}
+
+std::set<std::string>& registered_indexed_file_formats() {
+    static std::set<std::string> value;
     return value;
 }
 
@@ -282,6 +289,41 @@ bool read_file(const fs::path& path, std::vector<uint8_t>& out, std::string* err
         return false;
     }
     return true;
+}
+
+bool verify_file(const fs::path& path, uint64_t expected_size,
+                 const std::string& expected_sha256, std::string* error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        set_error(error, "cannot open " + path.string());
+        return false;
+    }
+    psx_sha256_ctx hash;
+    psx_sha256_init(&hash);
+    std::array<uint8_t, 1024 * 1024> bytes{};
+    uint64_t size = 0;
+    while (in) {
+        in.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+        const std::streamsize got = in.gcount();
+        if (got > 0) {
+            size += static_cast<uint64_t>(got);
+            if (size > expected_size) return false;
+            psx_sha256_update(&hash, bytes.data(), static_cast<size_t>(got));
+        }
+    }
+    if (!in.eof()) {
+        set_error(error, "cannot read " + path.string());
+        return false;
+    }
+    uint8_t digest[32];
+    psx_sha256_final(&hash, digest);
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string actual(64, '0');
+    for (size_t i = 0; i < 32; ++i) {
+        actual[i * 2] = hex[digest[i] >> 4];
+        actual[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    return size == expected_size && actual == expected_sha256;
 }
 
 uint16_t le16(const uint8_t* p) {
@@ -680,6 +722,7 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
                                  const std::vector<ModResolution::Overlay>& overlays,
                                  const std::vector<ModResolution::DerivedDisc>& derived_discs,
                                  const std::vector<ModResolution::Plugin>& plugins,
+                                 const std::vector<ModResolution::IndexedFile>& indexed_files,
                                  const std::string& source_disc_sha256) {
     std::ostringstream out;
     out << "source_disc=" << source_disc_sha256 << '\n';
@@ -752,6 +795,12 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
     for (const ModResolution::Plugin& plugin : plugins) {
         out << "plugin:" << plugin.id << ':' << plugin.package_id << ':'
             << plugin.feature_id << '\n';
+    }
+    for (const ModResolution::IndexedFile& indexed : indexed_files) {
+        out << kIndexedFileSchemaToken << ':' << indexed.format << ':'
+            << indexed.index << ':' << indexed.payload_sha256 << ':'
+            << indexed.payload.size() << ':' << indexed.expected_sha256 << ':'
+            << indexed.package_id << ':' << indexed.feature_id << '\n';
     }
     return out.str();
 }
@@ -1422,6 +1471,15 @@ bool mod_plugin_registered(const std::string& id) {
         (found->second.activation || found->second.vblank);
 }
 
+bool mod_indexed_file_format_register(const std::string& format) {
+    return valid_id(format) &&
+        registered_indexed_file_formats().insert(format).second;
+}
+
+bool mod_indexed_file_format_registered(const std::string& format) {
+    return registered_indexed_file_formats().count(format) != 0;
+}
+
 void mod_invoke_activation_plugin(const std::string& id) {
     const auto found = registered_plugins().find(id);
     if (found != registered_plugins().end() && found->second.activation)
@@ -1451,7 +1509,12 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
     try {
         const toml::value cfg = toml::parse(path.string());
         out = {};
-        out.format_version = (uint32_t)toml::find<int64_t>(cfg, "format_version");
+        const int64_t format_version =
+            toml::find<int64_t>(cfg, "format_version");
+        if (format_version < kMinFormatVersion ||
+            format_version > kMaxFormatVersion)
+            throw std::runtime_error("unsupported format_version");
+        out.format_version = static_cast<uint32_t>(format_version);
         out.id = toml::find<std::string>(cfg, "id");
         out.version = toml::find<std::string>(cfg, "version");
         out.name = toml::find<std::string>(cfg, "name");
@@ -1485,9 +1548,6 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
         out.save_compatibility = cfg.contains("save_compatibility")
             ? toml::find<std::string>(cfg, "save_compatibility") : "shared";
         out.root = path.parent_path();
-        if (out.format_version < kMinFormatVersion ||
-            out.format_version > kMaxFormatVersion)
-            throw std::runtime_error("unsupported format_version");
         if (!valid_id(out.id)) throw std::runtime_error("invalid package id");
         if (!parse_semver(out.version).valid) throw std::runtime_error("invalid semantic version");
         if (out.name.empty()) throw std::runtime_error("package name is empty");
@@ -2188,6 +2248,96 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                 ++declaration_index;
             }
         }
+        if (cfg.contains("indexed_file")) {
+            if (!feature_style)
+                throw std::runtime_error(
+                    "indexed files require explicit [[feature]] ownership");
+            if (out.format_version < 6)
+                throw std::runtime_error(
+                    "indexed files require format_version 6");
+            size_t declaration_index = 0;
+            for (const toml::value& v :
+                 toml::find(cfg, "indexed_file").as_array()) {
+                for (const auto& [key, unused] : v.as_table()) {
+                    (void)unused;
+                    if (key != "feature" && key != "format" &&
+                        key != "index" && key != "disc_sha256" &&
+                        key != "file" &&
+                        key != "sha256" && key != "expected_sha256" &&
+                        key != "order" && key != "when" &&
+                        key != "when_option" && key != "when_value")
+                        throw std::runtime_error(
+                            "indexed file has unknown field: " + key);
+                }
+                ModIndexedFile indexed;
+                indexed.feature_id = toml::find<std::string>(v, "feature");
+                if (!find_feature(out, indexed.feature_id))
+                    throw std::runtime_error(
+                        "indexed file references unknown feature");
+                indexed.format = toml::find<std::string>(v, "format");
+                if (!valid_id(indexed.format))
+                    throw std::runtime_error("invalid indexed file format");
+                const int64_t index = toml::find<int64_t>(v, "index");
+                if (index < 0 || static_cast<uint64_t>(index) > UINT32_MAX)
+                    throw std::runtime_error(
+                        "indexed file index must be a nonnegative uint32");
+                indexed.index = static_cast<uint32_t>(index);
+                indexed.disc_sha256 = toml::find_or<std::string>(
+                    v, "disc_sha256", "");
+                if (!indexed.disc_sha256.empty()) {
+                    if (!valid_sha256(indexed.disc_sha256))
+                        throw std::runtime_error(
+                            "indexed file disc_sha256 must be lowercase SHA-256");
+                    const bool declared_target = std::any_of(
+                        out.targets.begin(), out.targets.end(),
+                        [&](const ModTarget& target) {
+                            return target.disc_sha256 == indexed.disc_sha256;
+                        });
+                    if (!declared_target)
+                        throw std::runtime_error(
+                            "indexed file disc_sha256 must match a package target");
+                }
+                const std::string relative_file =
+                    toml::find<std::string>(v, "file");
+                if (!safe_archive_name(relative_file))
+                    throw std::runtime_error("indexed file path is unsafe");
+                indexed.file = out.root / fs::path(relative_file);
+                indexed.sha256 = toml::find<std::string>(v, "sha256");
+                indexed.expected_sha256 =
+                    toml::find<std::string>(v, "expected_sha256");
+                if (!valid_sha256(indexed.sha256) ||
+                    !valid_sha256(indexed.expected_sha256))
+                    throw std::runtime_error(
+                        "indexed file hashes must be lowercase SHA-256");
+                std::vector<uint8_t> payload;
+                std::string file_error;
+                if (!read_file(indexed.file, payload, &file_error))
+                    throw std::runtime_error(file_error);
+                if (payload.empty())
+                    throw std::runtime_error("indexed file payload is empty");
+                const std::string actual = fingerprint_text(std::string(
+                    (const char*)payload.data(), payload.size()));
+                if (actual != indexed.sha256)
+                    throw std::runtime_error(
+                        "indexed file payload checksum failed");
+                indexed.size = payload.size();
+                indexed.order = toml::find_or<int64_t>(
+                    v, "order", static_cast<int64_t>(declaration_index));
+                read_conditions(v, out.options, indexed.feature_id,
+                                indexed.when, "indexed file");
+                out.indexed_files.push_back(std::move(indexed));
+                ++declaration_index;
+            }
+            const bool guarded_stock = std::all_of(
+                out.targets.begin(), out.targets.end(),
+                [](const ModTarget& target) {
+                    return valid_sha256(target.disc_sha256);
+                });
+            if (!out.indexed_files.empty() && !guarded_stock)
+                throw std::runtime_error(
+                    "indexed files require an exact disc_sha256 on every "
+                    "[[target]]");
+        }
         if (cfg.contains("derived_disc")) {
             if (feature_style)
                 throw std::runtime_error(
@@ -2463,10 +2613,14 @@ bool ModPackageManager::install_archive(const fs::path& archive,
         set_error(error, "cannot publish installed package: " + ec.message());
         return false;
     }
-    package.root = destination;
-    packages_[package.id][package.version] = package;
-    if (installed_id) *installed_id = package.id;
-    if (installed_version) *installed_version = package.version;
+    ModPackage published;
+    if (!read_manifest(destination / "manifest.toml", published, error)) {
+        fs::remove_all(destination, ec);
+        return false;
+    }
+    packages_[published.id][published.version] = published;
+    if (installed_id) *installed_id = published.id;
+    if (installed_version) *installed_version = published.version;
     return true;
 }
 
@@ -2689,6 +2843,7 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
                                          const std::string& exe_sha256,
                                          const std::string& disc_sha256) const {
     ModResolution result;
+    uint64_t indexed_payload_bytes = 0;
     std::map<std::string, const ModPackage*> active;
     for (const auto& [id, versions] : packages_) {
         (void)versions;
@@ -3101,6 +3256,103 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
             resolved.feature_id = plugin->feature_id;
             result.plugins.push_back(std::move(resolved));
         }
+        std::vector<const ModIndexedFile*> indexed_files;
+        indexed_files.reserve(package->indexed_files.size());
+        for (const ModIndexedFile& indexed : package->indexed_files) {
+            if (!indexed.disc_sha256.empty() &&
+                indexed.disc_sha256 != disc_sha256)
+                continue;
+            const ModFeature* feature =
+                find_feature(*package, indexed.feature_id);
+            if (!feature ||
+                !is_feature_enabled(*package, selected, *feature) ||
+                !conditions_match(*package, selected,
+                                  indexed.feature_id, indexed.when))
+                continue;
+            indexed_files.push_back(&indexed);
+        }
+        std::stable_sort(
+            indexed_files.begin(), indexed_files.end(),
+            [](const ModIndexedFile* a, const ModIndexedFile* b) {
+                return a->order < b->order;
+            });
+        for (const ModIndexedFile* indexed : indexed_files) {
+            if (!mod_indexed_file_format_registered(indexed->format)) {
+                result.errors.push_back(
+                    package->id + "/" + indexed->feature_id +
+                    ": indexed file format is unavailable: " +
+                    indexed->format);
+                continue;
+            }
+            const auto previous = std::find_if(
+                result.indexed_files.begin(), result.indexed_files.end(),
+                [&](const ModResolution::IndexedFile& item) {
+                    return item.format == indexed->format &&
+                           item.index == indexed->index;
+                });
+            if (previous != result.indexed_files.end()) {
+                if (previous->payload_sha256 == indexed->sha256 &&
+                    previous->payload.size() == indexed->size &&
+                    previous->expected_sha256 == indexed->expected_sha256) {
+                    std::string payload_error;
+                    if (!verify_file(indexed->file, indexed->size,
+                                     indexed->sha256, &payload_error))
+                        result.errors.push_back(
+                            package->id + "/" + indexed->feature_id +
+                            ": indexed file payload changed after installation");
+                    continue;
+                }
+                ModResolution::IndexedFile conflicting;
+                conflicting.format = indexed->format;
+                conflicting.index = indexed->index;
+                conflicting.payload_sha256 = indexed->sha256;
+                conflicting.expected_sha256 = indexed->expected_sha256;
+                conflicting.package_id = package->id;
+                conflicting.feature_id = indexed->feature_id;
+                result.indexed_files.push_back(std::move(conflicting));
+                continue;
+            }
+            if (indexed->size >
+                kMaxIndexedPayloadBytes - indexed_payload_bytes) {
+                result.errors.push_back(
+                    package->id + "/" + indexed->feature_id +
+                    ": active indexed-file payloads exceed the size limit");
+                continue;
+            }
+            std::vector<uint8_t> payload;
+            std::string payload_error;
+            if (!read_file(indexed->file, payload, &payload_error)) {
+                result.errors.push_back(
+                    package->id + "/" + indexed->feature_id + ": " +
+                    payload_error);
+                continue;
+            }
+            if (payload.empty()) {
+                result.errors.push_back(
+                    package->id + "/" + indexed->feature_id +
+                    ": indexed file payload changed after installation");
+                continue;
+            }
+            const std::string actual = fingerprint_text(std::string(
+                (const char*)payload.data(), payload.size()));
+            if (payload.size() != indexed->size ||
+                actual != indexed->sha256) {
+                result.errors.push_back(
+                    package->id + "/" + indexed->feature_id +
+                    ": indexed file payload changed after installation");
+                continue;
+            }
+            ModResolution::IndexedFile resolved;
+            resolved.format = indexed->format;
+            resolved.index = indexed->index;
+            resolved.payload = std::move(payload);
+            resolved.payload_sha256 = indexed->sha256;
+            resolved.expected_sha256 = indexed->expected_sha256;
+            resolved.package_id = package->id;
+            resolved.feature_id = indexed->feature_id;
+            indexed_payload_bytes += indexed->size;
+            result.indexed_files.push_back(std::move(resolved));
+        }
     }
     if (result.derived_discs.size() > 1) {
         std::string providers;
@@ -3140,6 +3392,42 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
         if (!claimed) coalesced_plugins.push_back(plugin);
     }
     result.plugins = std::move(coalesced_plugins);
+    std::vector<ModResolution::IndexedFile> coalesced_indexed_files;
+    coalesced_indexed_files.reserve(result.indexed_files.size());
+    for (ModResolution::IndexedFile& indexed : result.indexed_files) {
+        bool claimed = false;
+        for (const ModResolution::IndexedFile& previous :
+             coalesced_indexed_files) {
+            if (indexed.format != previous.format ||
+                indexed.index != previous.index)
+                continue;
+            if (indexed.payload_sha256 == previous.payload_sha256 &&
+                indexed.payload.size() == previous.payload.size() &&
+                indexed.expected_sha256 == previous.expected_sha256) {
+                claimed = true;
+                break;
+            }
+            ModResolution::Diagnostic diagnostic;
+            diagnostic.resource =
+                "indexed_file:" + indexed.format + ":" +
+                std::to_string(indexed.index);
+            diagnostic.package_id = indexed.package_id;
+            diagnostic.feature_id = indexed.feature_id;
+            diagnostic.other_package_id = previous.package_id;
+            diagnostic.other_feature_id = previous.feature_id;
+            diagnostic.message =
+                indexed.package_id + "/" + indexed.feature_id +
+                " collides at " + diagnostic.resource + " with " +
+                previous.package_id + "/" + previous.feature_id;
+            result.diagnostics.push_back(diagnostic);
+            result.errors.push_back(diagnostic.message);
+            claimed = true;
+            break;
+        }
+        if (!claimed)
+            coalesced_indexed_files.push_back(std::move(indexed));
+    }
+    result.indexed_files = std::move(coalesced_indexed_files);
     std::vector<ModResolution::Write> coalesced;
     coalesced.reserve(result.writes.size());
     for (const ModResolution::Write& write : result.writes) {
@@ -3280,18 +3568,74 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
         if (!claimed) coalesced_overlays.push_back(overlay);
     }
     result.overlays = std::move(coalesced_overlays);
+    if (!result.indexed_files.empty()) {
+        const ModResolution::IndexedFile& indexed = result.indexed_files.front();
+        const auto add_incompatible = [&](const std::string& resource,
+                                          const std::string& other_package,
+                                          const std::string& other_feature,
+                                          const std::string& message) {
+            ModResolution::Diagnostic diagnostic;
+            diagnostic.resource = resource;
+            diagnostic.package_id = indexed.package_id;
+            diagnostic.feature_id = indexed.feature_id;
+            diagnostic.other_package_id = other_package;
+            diagnostic.other_feature_id = other_feature;
+            diagnostic.message = message;
+            result.diagnostics.push_back(std::move(diagnostic));
+            result.errors.push_back(message);
+        };
+        const auto mixed_format = std::find_if(
+            result.indexed_files.begin() + 1, result.indexed_files.end(),
+            [&](const ModResolution::IndexedFile& item) {
+                return item.format != indexed.format;
+            });
+        if (mixed_format != result.indexed_files.end()) {
+            add_incompatible(
+                "indexed_format:" + indexed.format + ":" + mixed_format->format,
+                mixed_format->package_id, mixed_format->feature_id,
+                indexed.package_id + "/" + indexed.feature_id +
+                    " cannot combine indexed-file format " + indexed.format +
+                    " with " + mixed_format->package_id + "/" +
+                    mixed_format->feature_id + " format " + mixed_format->format);
+        }
+        const auto disc_write = std::find_if(
+            result.writes.begin(), result.writes.end(),
+            [](const ModResolution::Write& write) {
+                return write.target != ModPatchTarget::MainExe;
+            });
+        if (disc_write != result.writes.end()) {
+            add_incompatible(
+                "indexed_file:disc_patch", disc_write->package_id,
+                disc_write->feature_id,
+                "indexed-file plans cannot be combined with disc patches, "
+                "overlays, or derived discs");
+        } else if (!result.overlays.empty()) {
+            add_incompatible(
+                "indexed_file:overlay", result.overlays.front().package_id,
+                result.overlays.front().feature_id,
+                "indexed-file plans cannot be combined with disc patches, "
+                "overlays, or derived discs");
+        } else if (!result.derived_discs.empty()) {
+            add_incompatible(
+                "indexed_file:derived_disc",
+                result.derived_discs.front().package_id, "legacy",
+                "indexed-file plans cannot be combined with disc patches, "
+                "overlays, or derived discs");
+        }
+    }
     if (!result.errors.empty()) {
         result.ordered.clear();
         result.writes.clear();
         result.overlays.clear();
         result.derived_discs.clear();
         result.plugins.clear();
+        result.indexed_files.clear();
         return result;
     }
     result.fingerprint = fingerprint_text(
         canonical_resolution(
             result.ordered, selections_, result.writes, result.overlays,
-            result.derived_discs, result.plugins,
+            result.derived_discs, result.plugins, result.indexed_files,
             disc_sha256));
     result.ok = true;
     return result;
