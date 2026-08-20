@@ -13,6 +13,15 @@
 #error "GUEST_RENDER_BRIDGE_BINDING_CAPACITY must be nonzero"
 #endif
 
+#define GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY \
+    (GUEST_RENDER_BRIDGE_BINDING_CAPACITY * 2u)
+
+typedef struct {
+    uint32_t key;
+    uint32_t generation;
+    uint32_t binding_index;
+} GuestRenderBindingIndexEntry;
+
 typedef struct {
     uint64_t scene_epoch;
     uint64_t next_state_sequence;
@@ -31,10 +40,16 @@ typedef struct {
     GuestRenderCompletedState last_completed;
     GuestRenderProducerSlot slots[GUEST_RENDER_BRIDGE_SLOT_CAPACITY];
     GuestRenderPacketBinding bindings[GUEST_RENDER_BRIDGE_BINDING_CAPACITY];
+    GuestRenderBindingIndexEntry packet_index[
+        GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY];
+    GuestRenderBindingIndexEntry primitive_index[
+        GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY];
     bool slot_complete[GUEST_RENDER_BRIDGE_SLOT_CAPACITY];
     size_t slot_count;
     size_t binding_count;
     size_t active_binding_start;
+    uint32_t packet_index_generation;
+    uint32_t primitive_index_generation;
     uint64_t fallback_count;
     uint64_t scene_fallback_count_baseline;
     bool scene_active;
@@ -54,6 +69,58 @@ static GuestRenderBridge bridge = {
 };
 static _Atomic uintptr_t owner_thread;
 static atomic_uint_fast64_t wrong_thread_poison;
+
+static size_t binding_index_hash(uint32_t key) {
+    key ^= key >> 16u;
+    key *= UINT32_C(0x7feb352d);
+    key ^= key >> 15u;
+    key *= UINT32_C(0x846ca68b);
+    key ^= key >> 16u;
+    return (size_t)key % GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY;
+}
+
+static void binding_index_advance(
+        GuestRenderBindingIndexEntry *entries, uint32_t *generation) {
+    ++*generation;
+    if (*generation != 0u) return;
+    memset(entries, 0,
+           GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY * sizeof(*entries));
+    *generation = 1u;
+}
+
+static GuestRenderBindingIndexEntry *binding_index_find(
+        GuestRenderBindingIndexEntry *entries, uint32_t generation,
+        uint32_t key) {
+    const size_t start = binding_index_hash(key);
+
+    for (size_t probe = 0u;
+         probe < GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY; ++probe) {
+        GuestRenderBindingIndexEntry *entry = &entries[
+            (start + probe) % GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY];
+
+        if (entry->generation != generation) return NULL;
+        if (entry->key == key) return entry;
+    }
+    return NULL;
+}
+
+static GuestRenderBindingIndexEntry *binding_index_insert(
+        GuestRenderBindingIndexEntry *entries, uint32_t generation,
+        uint32_t key) {
+    const size_t start = binding_index_hash(key);
+
+    for (size_t probe = 0u;
+         probe < GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY; ++probe) {
+        GuestRenderBindingIndexEntry *entry = &entries[
+            (start + probe) % GUEST_RENDER_BRIDGE_BINDING_INDEX_CAPACITY];
+
+        if (entry->generation == generation) continue;
+        entry->key = key;
+        entry->generation = generation;
+        return entry;
+    }
+    return NULL;
+}
 
 static bool id_is_equal(GuestRenderVisualStateId left,
                         GuestRenderVisualStateId right) {
@@ -91,7 +158,10 @@ static GuestRenderStatus claim_scene_owner(void) {
 static void clear_bindings(void) {
     size_t index;
 
-    memset(bridge.bindings, 0, sizeof(bridge.bindings));
+    binding_index_advance(bridge.packet_index,
+                          &bridge.packet_index_generation);
+    binding_index_advance(bridge.primitive_index,
+                          &bridge.primitive_index_generation);
     bridge.binding_count = 0u;
     bridge.active_binding_start = 0u;
     bridge.completed_valid = false;
@@ -297,6 +367,8 @@ GuestRenderStatus guest_render_bridge_producer_begin(
     bridge.active_handle = handle;
     bridge.active_provenance = *provenance;
     bridge.active_binding_start = bridge.binding_count;
+    binding_index_advance(bridge.primitive_index,
+                          &bridge.primitive_index_generation);
     bridge.producer_open = true;
     *out_handle = handle;
     return GUEST_RENDER_OK;
@@ -332,8 +404,9 @@ GuestRenderStatus guest_render_bridge_bind_packet(
         GuestRenderProducerHandle handle, uint32_t packet_address,
         uint32_t source_primitive_index) {
     GuestRenderPacketBinding *binding;
+    GuestRenderBindingIndexEntry *packet_entry;
+    GuestRenderBindingIndexEntry *primitive_entry;
     uint32_t normalized_address;
-    size_t index;
 
     if (is_wrong_thread()) return GUEST_RENDER_WRONG_THREAD;
     observe_wrong_thread();
@@ -347,19 +420,19 @@ GuestRenderStatus guest_render_bridge_bind_packet(
         demote_render(GUEST_RENDER_FALLBACK_INVALID_PACKET_ADDRESS);
         return GUEST_RENDER_INVALID_ARGUMENT;
     }
-    for (index = 0u; index < bridge.binding_count; ++index) {
-        if (bridge.bindings[index].packet_address == normalized_address) {
-            clear_bindings();
-            demote_render(GUEST_RENDER_FALLBACK_DUPLICATE_PACKET_ADDRESS);
-            return GUEST_RENDER_DUPLICATE_PACKET_ADDRESS;
-        }
+    if (binding_index_find(bridge.packet_index,
+                           bridge.packet_index_generation,
+                           normalized_address) != NULL) {
+        clear_bindings();
+        demote_render(GUEST_RENDER_FALLBACK_DUPLICATE_PACKET_ADDRESS);
+        return GUEST_RENDER_DUPLICATE_PACKET_ADDRESS;
     }
-    for (index = bridge.active_binding_start; index < bridge.binding_count; ++index) {
-        if (bridge.bindings[index].source_primitive_index == source_primitive_index) {
-            clear_bindings();
-            demote_render(GUEST_RENDER_FALLBACK_DUPLICATE_PRIMITIVE_INDEX);
-            return GUEST_RENDER_DUPLICATE_PRIMITIVE_INDEX;
-        }
+    if (binding_index_find(bridge.primitive_index,
+                           bridge.primitive_index_generation,
+                           source_primitive_index) != NULL) {
+        clear_bindings();
+        demote_render(GUEST_RENDER_FALLBACK_DUPLICATE_PRIMITIVE_INDEX);
+        return GUEST_RENDER_DUPLICATE_PRIMITIVE_INDEX;
     }
     if (bridge.binding_count == GUEST_RENDER_BRIDGE_BINDING_CAPACITY) {
         clear_bindings();
@@ -367,6 +440,18 @@ GuestRenderStatus guest_render_bridge_bind_packet(
         return GUEST_RENDER_BINDING_CAPACITY_EXCEEDED;
     }
 
+    packet_entry = binding_index_insert(
+        bridge.packet_index, bridge.packet_index_generation,
+        normalized_address);
+    primitive_entry = binding_index_insert(
+        bridge.primitive_index, bridge.primitive_index_generation,
+        source_primitive_index);
+    if (packet_entry == NULL || primitive_entry == NULL) {
+        clear_bindings();
+        demote_render(GUEST_RENDER_FALLBACK_BINDING_CAPACITY);
+        return GUEST_RENDER_BINDING_CAPACITY_EXCEEDED;
+    }
+    packet_entry->binding_index = (uint32_t)bridge.binding_count;
     binding = &bridge.bindings[bridge.binding_count++];
     binding->handle = bridge.active_handle;
     binding->packet_address = normalized_address;
@@ -470,20 +555,20 @@ GuestRenderStatus guest_render_bridge_find_completed_binding(
         GuestRenderCompletedState completed, uint32_t packet_address,
         GuestRenderPacketBinding *out_binding) {
     uint32_t normalized_address;
-    size_t index;
+    GuestRenderBindingIndexEntry *entry;
 
     if (is_wrong_thread()) return GUEST_RENDER_WRONG_THREAD;
     if (!out_binding || !normalize_packet_address(packet_address, &normalized_address))
         return GUEST_RENDER_INVALID_ARGUMENT;
     observe_wrong_thread();
     if (!completed_is_current(completed)) return GUEST_RENDER_NO_COMPLETED_STATE;
-    for (index = 0u; index < bridge.binding_count; ++index) {
-        if (bridge.bindings[index].packet_address == normalized_address) {
-            *out_binding = bridge.bindings[index];
-            return GUEST_RENDER_OK;
-        }
-    }
-    return GUEST_RENDER_BINDING_NOT_FOUND;
+    entry = binding_index_find(bridge.packet_index,
+                               bridge.packet_index_generation,
+                               normalized_address);
+    if (entry == NULL || entry->binding_index >= bridge.binding_count)
+        return GUEST_RENDER_BINDING_NOT_FOUND;
+    *out_binding = bridge.bindings[entry->binding_index];
+    return GUEST_RENDER_OK;
 }
 
 GuestRenderStatus guest_render_bridge_snapshot(GuestRenderBridgeSnapshot *out_snapshot) {

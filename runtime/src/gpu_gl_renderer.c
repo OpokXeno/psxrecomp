@@ -742,9 +742,10 @@ typedef struct ProducerDiagVertex {
     uint32_t vertex_id;
     int64_t x;
     int64_t y;
-    int used;
+    uint32_t generation;
 } ProducerDiagVertex;
 static ProducerDiagVertex s_producer_diag_vertices[PRODUCER_DIAG_VERTEX_CAP];
+static uint32_t s_producer_diag_generation;
 static size_t s_producer_diag_previous_order[NATIVE_HOST_QUEUE_CAP];
 static void wide_free_all(void);
 static void native_view_free_all(void);
@@ -2678,6 +2679,13 @@ static int   s_tb_n = 0;                    /* verts queued */
 static int   s_tb_semi = -2;
 static int   s_tb_mask = 0, s_tb_filter = 0, s_tb_dither = 0;
 static int   s_tb_twin[4] = {0, 0, 0, 0};
+static int   s_tb_handoff_active = 0;
+static int   s_tb_handoff_area[4];
+static int   s_tb_handoff_semi, s_tb_handoff_mask;
+static int   s_tb_handoff_filter, s_tb_handoff_dither;
+static int   s_tb_handoff_mask_check, s_tb_handoff_scale;
+static int   s_tb_handoff_twin[4];
+static int   s_depth24_skip_up = 0;
 static uint64_t s_batch_total = 0, s_batch_reason[7];
 
 void gl_renderer_batch_diag(uint64_t out[8]) {
@@ -2780,26 +2788,69 @@ static int mirror_batch_center_only(int nverts) {
  * on depth24_upload_policy for the full rationale). */
 static void depth24_upload_policy(void);
 
-static void flush_tex_batch(void) {
-    if (s_tb_n == 0) return;
+static int tex_batch_handoff_matches(void) {
+    return !s_native_view_pass && s_midpoint_pass_fbo != 0 &&
+        s_tb_handoff_area[0] == s_area_x1 &&
+        s_tb_handoff_area[1] == s_area_y1 &&
+        s_tb_handoff_area[2] == s_area_x2 &&
+        s_tb_handoff_area[3] == s_area_y2 &&
+        s_tb_handoff_semi == s_tb_semi &&
+        s_tb_handoff_mask == s_tb_mask &&
+        s_tb_handoff_filter == s_tb_filter &&
+        s_tb_handoff_dither == s_tb_dither &&
+        s_tb_handoff_mask_check == s_mask_check &&
+        s_tb_handoff_scale == s_scale &&
+        memcmp(s_tb_handoff_twin, s_tb_twin, sizeof(s_tb_twin)) == 0;
+}
+
+static void tex_batch_handoff_remember(void) {
+    s_tb_handoff_area[0] = s_area_x1;
+    s_tb_handoff_area[1] = s_area_y1;
+    s_tb_handoff_area[2] = s_area_x2;
+    s_tb_handoff_area[3] = s_area_y2;
+    s_tb_handoff_semi = s_tb_semi;
+    s_tb_handoff_mask = s_tb_mask;
+    s_tb_handoff_filter = s_tb_filter;
+    s_tb_handoff_dither = s_tb_dither;
+    s_tb_handoff_mask_check = s_mask_check;
+    s_tb_handoff_scale = s_scale;
+    memcpy(s_tb_handoff_twin, s_tb_twin, sizeof(s_tb_twin));
+}
+
+static void flush_tex_batch_internal(int handoff) {
+    int continue_render = s_tb_handoff_active && tex_batch_handoff_matches();
+    const int depth24_before = s_depth24_skip_up;
+
+    if (s_tb_n == 0) {
+        if (s_tb_handoff_active) hr_end();
+        s_tb_handoff_active = 0;
+        return;
+    }
     int nverts = s_tb_n, semi = s_tb_semi;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
     depth24_upload_policy();
-    hr_begin(1);
-    p_glUseProgram(s_tex_prog);
-    native_view_projection_uniforms(s_tex_uXoff, s_tex_uXhalf);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-    p_glUniform1i(s_uVram, 0);
-    p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
-    p_glUniform1i(s_uMaskset, s_tb_mask);
-    p_glUniform1i(s_uFilter, s_tb_filter);
-    p_glUniform1i(s_tex_uDither, s_tb_dither);
-    p_glUniform1i(s_tex_uScale, s_scale);
-    p_glBindVertexArray(s_tex_vao);
+    if (depth24_before != s_depth24_skip_up) continue_render = 0;
+    if (continue_render) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_midpoint_pass_fbo);
+    } else {
+        if (s_tb_handoff_active) hr_end();
+        hr_begin(1);
+        p_glUseProgram(s_tex_prog);
+        native_view_projection_uniforms(s_tex_uXoff, s_tex_uXhalf);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+        p_glUniform1i(s_uVram, 0);
+        p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1],
+                      s_tb_twin[2], s_tb_twin[3]);
+        p_glUniform1i(s_uMaskset, s_tb_mask);
+        p_glUniform1i(s_uFilter, s_tb_filter);
+        p_glUniform1i(s_tex_uDither, s_tb_dither);
+        p_glUniform1i(s_tex_uScale, s_scale);
+        p_glBindVertexArray(s_tex_vao);
+    }
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
 
@@ -2820,9 +2871,32 @@ static void flush_tex_batch(void) {
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
+        if (handoff) {
+            int sw = s_area_x2 - s_area_x1 + 1;
+            int sh = s_area_y2 - s_area_y1 + 1;
+
+            if (sw < 0) sw = 0;
+            if (sh < 0) sh = 0;
+            glViewport(0, 0, VRAM_W * s_scale, VRAM_H * s_scale);
+            glScissor(s_area_x1 * s_scale, s_area_y1 * s_scale,
+                      sw * s_scale, sh * s_scale);
+        }
     }
-    hr_end();
+    s_tb_handoff_active = handoff && !s_native_view_pass &&
+        s_midpoint_pass_fbo == 0;
+    if (s_tb_handoff_active)
+        tex_batch_handoff_remember();
+    else
+        hr_end();
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
+}
+
+static void flush_tex_batch(void) {
+    flush_tex_batch_internal(0);
+}
+
+static void flush_tex_batch_handoff(void) {
+    flush_tex_batch_internal(1);
 }
 
 /* Flat / gouraud GEO batch — MotK title/char-select starfields issue ~30k/s
@@ -3680,7 +3754,6 @@ static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int 
  * real, correctly-converted content — see that function for why restaging
  * the STILL-PACKED 24-bit bytes as 1555 directly (without converting first)
  * is a different, historically-broken idea (MotK title rainbow/static). */
-static int s_depth24_skip_up = 0;
 static DirtyRect s_d24_skip_fb; /* union of skipped MDEC FB rects (VRAM halfwords) */
 
 static int depth24_is_fb_transfer(int w, int h) {
@@ -10346,7 +10419,10 @@ static void native_host_record_midpoint_failure(
     int64_t value_a, int64_t value_b);
 
 static void native_host_queue_snapshot_present(size_t count) {
-    memset(s_producer_diag_vertices, 0, sizeof(s_producer_diag_vertices));
+    if (++s_producer_diag_generation == 0u) {
+        memset(s_producer_diag_vertices, 0, sizeof(s_producer_diag_vertices));
+        s_producer_diag_generation = 1u;
+    }
     for (size_t queue_index = 0u; queue_index < count; ++queue_index) {
         const NativeHostQueuedSemantic *queued = &s_native_host_queue[queue_index];
         const GpuRenderSemantic *current = &queued->current;
@@ -10507,14 +10583,15 @@ static void native_host_queue_snapshot_present(size_t count) {
                         ProducerDiagVertex *entry =
                             &s_producer_diag_vertices[slot];
 
-                        if (!entry->used) {
+                        if (entry->generation !=
+                                s_producer_diag_generation) {
                             *entry = (ProducerDiagVertex){
                                 .scene_id = midpoint->interpolation_identity.scene_id,
                                 .group_id = midpoint_vertex->interpolation_group_id,
                                 .vertex_id = midpoint_vertex->interpolation_vertex_id,
                                 .x = midpoint_x,
                                 .y = midpoint_y,
-                                .used = 1,
+                                .generation = s_producer_diag_generation,
                             };
                             break;
                         }
@@ -11347,7 +11424,10 @@ void gl_renderer_semantic_producer_diag(
     diagnostics.retired_candidates = retired.eligible;
     diagnostics.retired_missing_current_geometry =
         retired.unmatched - retired.eligible;
-    memset(s_producer_diag_vertices, 0, sizeof(s_producer_diag_vertices));
+    if (++s_producer_diag_generation == 0u) {
+        memset(s_producer_diag_vertices, 0, sizeof(s_producer_diag_vertices));
+        s_producer_diag_generation = 1u;
+    }
     const size_t queue_count = s_native_host_queue_count != 0u
         ? s_native_host_queue_count : s_native_host_queue_last_present_count;
     for (size_t queue_index = 0u; queue_index < queue_count;
@@ -11437,14 +11517,14 @@ void gl_renderer_semantic_producer_diag(
                  ++probe) {
                 ProducerDiagVertex *entry = &s_producer_diag_vertices[slot];
 
-                if (!entry->used) {
+                if (entry->generation != s_producer_diag_generation) {
                     *entry = (ProducerDiagVertex){
                         .scene_id = midpoint->interpolation_identity.scene_id,
                         .group_id = midpoint_vertex->interpolation_group_id,
                         .vertex_id = midpoint_vertex->interpolation_vertex_id,
                         .x = midpoint_x,
                         .y = midpoint_y,
-                        .used = 1,
+                        .generation = s_producer_diag_generation,
                     };
                     break;
                 }
@@ -11644,7 +11724,10 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
         s_native_midpoint_canonical_enabled &&
         workload_status == GPU_SEMANTIC_WORKLOAD_OK) {
         flush_flat_batch();
-        flush_tex_batch();
+        if (s_native_interpolation_phase_count != 0u)
+            flush_tex_batch_handoff();
+        else
+            flush_tex_batch();
         for (unsigned int phase = 0u;
              phase < s_native_interpolation_phase_count &&
              status == GPU_RENDER_TRANSACTION_OK; ++phase)

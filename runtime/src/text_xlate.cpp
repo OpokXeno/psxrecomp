@@ -417,7 +417,7 @@ std::atomic<int>                         g_msg_sep_pending{0}; // unpatched coun
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
-std::atomic<bool>     g_capture_on{true};     // always-on inventory (default)
+std::atomic<bool>     g_capture_on{false};    // opt-in authoring inventory
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_hits{0};
 std::string           g_lang = "en";
@@ -858,7 +858,7 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
         if (!g_prof->read_record(ram, va, buf, &len, &term)) continue;
         uint64_t key = fnv1a(buf, len);
 
-        // CAPTURE (always-on inventory): ingest each real string ONCE at its
+        // CAPTURE (opt-in authoring inventory): ingest each real string ONCE at its
         // genuine record start, and only if it clears the noise gate. The
         // canonical-start test collapses the partial-offset explosion (the same
         // record was previously re-ingested at every offset a register landed on).
@@ -913,7 +913,8 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
     if (project_root && *project_root)
         g_dir = (fs::path(project_root) / "translations").string();
     const char* capenv = std::getenv("PSX_XLATE_CAPTURE");
-    if (capenv && capenv[0] == '0') g_capture_on.store(false);
+    g_capture_on.store(capenv && capenv[0] && capenv[0] != '0',
+                       std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_mtx);
     load_tables_locked();
 }

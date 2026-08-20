@@ -213,6 +213,84 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-20 (Xenogears widescreen current/midpoint handoff):** The OpenGL
+  textured-batch path can now retain compatible render state from the current
+  phase into the first midpoint phase in Native 16:9. The handoff preserves the
+  widescreen mirror and restores its canonical viewport/scissor before binding
+  the midpoint framebuffer; incompatible material, draw-area, mask, scale,
+  texture-window, Native-view, or depth-24 transitions still take the complete
+  setup path. The authoritative 4529-VBlank replay remains
+  `PASS/trace_complete` at 59.5-60.7 FPS with zero GL errors, missing bindings,
+  original draws, or unsupported Native packets. Its normalized evidence is
+  identical with and without the handoff. Equal-duration `perf` captures
+  measured 181.23 G combined CPU cycles without the handoff and 179.13 G with
+  it, a modest 1.16% reduction; this is retained as a general render-state
+  optimization, not credited for the larger workload correction. Evidence and
+  profiles: `/tmp/opencode/xg-modded-replay2-16x9-handoff-evidence.json`,
+  `/tmp/opencode/xg-modded-replay2-16x9-no-handoff-evidence.json`,
+  `/tmp/opencode/xg-modded-replay2-16x9-handoff-perf.data`, and
+  `/tmp/opencode/xg-modded-replay2-16x9-no-handoff-perf.data`. The final build
+  and all 59 configured tests pass.
+- **2026-08-20 (Xenogears dense-world 53 FPS attribution):** Packet binding
+  duplicate validation no longer scans every state binding and every active
+  producer binding for each packet. Generation-tagged fixed-capacity indices
+  preserve packet-alias normalization, duplicate precedence, fail-closed
+  behavior, and completed-binding lookup while also retiring bindings by count
+  instead of clearing all 4096 records. The focused bridge test and all 59
+  configured tests pass. The complete 4529-VBlank replay with the authoritative
+  `build/settings.toml` and `build/mods/state.toml` remains
+  `PASS/trace_complete`; after excluding the six wall-clock midpoint rate/peak
+  fields, its evidence is byte-identical to the prior reference. Evidence:
+  `/tmp/opencode/xg-modded-replay2-bind-index-settings-evidence.json`.
+  The remaining deterministic dense-world windows measured 55.1/53.1 FPS
+  (53.4/54.5 FPS under sampling), followed by pacer recovery at 67.8-72.5 FPS.
+  A final-build profile of that interval attributes 41.57% of E-core cycles to
+  `glb_draw_semantic_immediate`, 39.28% to `flush_tex_batch`, and 11.49% to
+  `tex_batch_draw_passes`; P-core work includes terrain cutover (3.86%), Native
+  miss resolution (3.14%), semantic recording (3.01%), and terrain
+  build/projection (2.10%). A nearby stable interval spends 20.81% in the pacer.
+  `guest_render_bridge_bind_packet` is down to 0.30% in the dense interval, so
+  the bridge was secondary: the remaining burst is current/midpoint OpenGL
+  target flushing plus the deterministic terrain workload. Profile:
+  `/tmp/opencode/xg-modded-replay2-bind-index-perf.data`.
+- **2026-08-20 (Xenogears fixed-capacity clears generalized):** The dense-world
+  replay audit found the same redundant-clear pattern outside terrain and world
+  models. Semantic workload hashes now clear only touched slots instead of
+  writing 1.12 MiB every frame, and the GL producer diagnostic table uses a
+  generation instead of clearing about 1.25 MiB per present. Field-sprite,
+  direct-sprite, actor-sprite, entity-shadow, overlay, and FT3/FT4 shadow
+  workspaces now retire by count/valid state because their producers fully
+  initialize every published record. Model FT4 direct indices and world-model
+  template/color tables use the existing epoch scheme, with physical clearing
+  retained only for epoch wrap. The complete 4529-VBlank replay remains
+  `PASS/trace_complete`; all Native stream, semantic, midpoint, input, and
+  coverage evidence is identical after excluding wall-clock presentation-rate
+  fields. It holds 59.3-60.8 FPS outside the existing short dense transitions
+  (53.7/53.6 FPS) and all 59 configured tests pass. Evidence:
+  `/tmp/opencode/xg-modded-replay2-generalized-final2-evidence.json`.
+- **2026-08-20 (Xenogears dense-world replay slowdown fixed):** The complete
+  4529-VBlank Perfect Works replay previously fell to 22 FPS while unkeyed
+  semantic matching performed unbounded aggregate retrospective work. The
+  fallback now hashes the full compatibility footprint, avoids duplicate
+  compatibility and endpoint copies, and fails closed to snap after one
+  workload-capacity candidate budget per frame. Native terrain, decoration,
+  and world-model workspaces now clear only live bookkeeping; terrain mesh
+  diagnostics use generations instead of a full array reset. The identical
+  replay is `PASS/trace_complete`, preserves all Native stream and midpoint
+  counters, and runs at 59.4-60.9 FPS outside two short transition windows
+  (55.9 and 53.3 FPS) instead of a sustained collapse. Evidence:
+  `/tmp/opencode/xg-modded-replay2-workspace-evidence.json`. The full runtime
+  build and all 59 configured tests pass with `BUILD_TESTING=ON`.
+- **2026-08-20 (Xenogears modded FMV slowdown fixed):** A complete 6651-VBlank
+  replay with 20 Perfect Works features isolated a late-FMV collapse in the
+  framework translation inventory, not MDEC or guest timing. `perf` showed
+  `sj_read_record` growing from about 1% to 45-62% of CPU while the generic
+  capture hook scanned four possible string pointers at every dispatch, despite
+  Xenogears having no framework translation tables. Translation inventory
+  capture is now an explicit authoring mode (`PSX_XLATE_CAPTURE=1`) and remains
+  off during normal play; configured translation application is unchanged. The
+  identical replay is `PASS/trace_complete` and held 59.5-60.4 FPS under
+  sampling through the entire FMV, with the same mod plan and Native counters.
 - **2026-08-19 (Xenogears FMV fixed right-side black bar):** Depth-24 CPU
   presentation unconditionally replaced the last eight CRTC columns with black,
   even when the tracked MDEC upload covered the full scanout. In a 4:3 viewport

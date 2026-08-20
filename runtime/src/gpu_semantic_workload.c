@@ -35,6 +35,11 @@ typedef struct GpuSemanticAnchorFrame {
 #define GPU_SEMANTIC_MAX_VERTICES \
     (GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY * 3u)
 #define GPU_SEMANTIC_RETROSPECTIVE_CANDIDATE_LIMIT 1024u
+/* Unkeyed matching is a fail-closed visual fallback. Bound aggregate work to
+ * one candidate per maximum-capacity item so dense scenes snap excess
+ * primitives instead of turning a nominally linear frame into quadratic work. */
+#define GPU_SEMANTIC_RETROSPECTIVE_FRAME_CANDIDATE_LIMIT \
+    GPU_SEMANTIC_WORKLOAD_CAPACITY
 #define GPU_SEMANTIC_RETROSPECTIVE_AMBIGUITY_MARGIN 64u
 #define GPU_SEMANTIC_RETROSPECTIVE_TRANSLATION_LIMIT 64u
 
@@ -63,6 +68,22 @@ static struct {
     int32_t previous_anchor_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
     int32_t current_anchor_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
     int32_t phase_vertex_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
+    uint16_t previous_hash_touched[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint16_t current_hash_touched[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint16_t previous_retrospective_touched[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint16_t previous_vertex_hash_touched[GPU_SEMANTIC_MAX_VERTICES *
+                                          GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint16_t previous_anchor_hash_touched[GPU_SEMANTIC_ANCHOR_CAPACITY];
+    uint16_t current_anchor_hash_touched[GPU_SEMANTIC_ANCHOR_CAPACITY];
+    uint16_t phase_vertex_hash_touched[GPU_SEMANTIC_MAX_VERTICES *
+                                       GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    size_t previous_hash_touched_count;
+    size_t current_hash_touched_count;
+    size_t previous_retrospective_touched_count;
+    size_t previous_vertex_hash_touched_count;
+    size_t previous_anchor_hash_touched_count;
+    size_t current_anchor_hash_touched_count;
+    size_t phase_vertex_hash_touched_count;
     GpuSemanticPhasePosition phase_positions
         [GPU_SEMANTIC_INTERPOLATION_MAX_PHASES]
         [GPU_SEMANTIC_WORKLOAD_CAPACITY * GPU_SEMANTIC_MAX_VERTICES];
@@ -80,6 +101,37 @@ static struct {
     GpuSemanticWorkloadMotionDiagnostics last_motion;
 } workload;
 static uint64_t workload_epoch;
+
+static void clear_touched_hash(int32_t *table, const uint16_t *touched,
+                               size_t *count) {
+    for (size_t index = 0u; index < *count; ++index)
+        table[touched[index]] = 0;
+    *count = 0u;
+}
+
+static void clear_workload_hashes(void) {
+    clear_touched_hash(workload.previous_hash,
+                       workload.previous_hash_touched,
+                       &workload.previous_hash_touched_count);
+    clear_touched_hash(workload.current_hash,
+                       workload.current_hash_touched,
+                       &workload.current_hash_touched_count);
+    clear_touched_hash(workload.previous_retrospective_head,
+                       workload.previous_retrospective_touched,
+                       &workload.previous_retrospective_touched_count);
+    clear_touched_hash(workload.previous_vertex_hash,
+                       workload.previous_vertex_hash_touched,
+                       &workload.previous_vertex_hash_touched_count);
+    clear_touched_hash(workload.previous_anchor_hash,
+                       workload.previous_anchor_hash_touched,
+                       &workload.previous_anchor_hash_touched_count);
+    clear_touched_hash(workload.current_anchor_hash,
+                       workload.current_anchor_hash_touched,
+                       &workload.current_anchor_hash_touched_count);
+    clear_touched_hash(workload.phase_vertex_hash,
+                       workload.phase_vertex_hash_touched,
+                       &workload.phase_vertex_hash_touched_count);
+}
 
 static bool identity_equal(const GpuRenderInterpolationIdentity *a,
                            const GpuRenderInterpolationIdentity *b) {
@@ -104,8 +156,9 @@ static size_t hash_entry_index(int32_t entry) {
     return entry > 0 ? (size_t)(entry - 1) : (size_t)(-entry - 1);
 }
 
-static bool hash_insert(int32_t *table, const GpuSemanticFrame *frame,
-                        size_t item_index) {
+static bool hash_insert(int32_t *table, uint16_t *touched,
+                        size_t *touched_count,
+                        const GpuSemanticFrame *frame, size_t item_index) {
     const GpuRenderInterpolationIdentity *identity =
         &frame->items[item_index].interpolation_identity;
     size_t slot;
@@ -117,6 +170,7 @@ static bool hash_insert(int32_t *table, const GpuSemanticFrame *frame,
         const int32_t entry = table[slot];
 
         if (entry == 0) {
+            touched[(*touched_count)++] = (uint16_t)slot;
             table[slot] = (int32_t)item_index + 1;
             return true;
         }
@@ -287,12 +341,8 @@ static bool semantic_compatible(const GpuRenderSemantic *a,
         a->native_view_effect_index != b->native_view_effect_index ||
         a->triangle_count != b->triangle_count ||
         a->line_count != b->line_count ||
-        a->material.textured != b->material.textured ||
-        a->material.raw_texture != b->material.raw_texture ||
-        (a->material.textured &&
-         a->material.texture_depth != b->material.texture_depth) ||
-         !texture_footprint_compatible(a, b) ||
-        !retrospective_material_compatible(&a->material, &b->material)) {
+        !retrospective_material_compatible(&a->material, &b->material) ||
+        !texture_footprint_compatible(a, b)) {
         return false;
     }
 
@@ -480,6 +530,9 @@ static void previous_vertex_hash_insert(const GpuSemanticFrame *frame,
         const int32_t entry = workload.previous_vertex_hash[slot];
 
         if (entry == 0) {
+            workload.previous_vertex_hash_touched[
+                workload.previous_vertex_hash_touched_count++] =
+                    (uint16_t)slot;
             workload.previous_vertex_hash[slot] = (int32_t)flat_index + 1;
             return;
         }
@@ -503,8 +556,8 @@ static void previous_vertex_hash_insert(const GpuSemanticFrame *frame,
 }
 
 static void anchor_hash_insert(
-        int32_t *table, const GpuSemanticAnchorFrame *frame,
-        size_t anchor_index) {
+        int32_t *table, uint16_t *touched, size_t *touched_count,
+        const GpuSemanticAnchorFrame *frame, size_t anchor_index) {
     const GpuRenderInterpolationVertexAnchor *anchor =
         &frame->items[anchor_index];
     size_t slot;
@@ -518,6 +571,7 @@ static void anchor_hash_insert(
         const int32_t entry = table[slot];
 
         if (entry == 0) {
+            touched[(*touched_count)++] = (uint16_t)slot;
             table[slot] = (int32_t)anchor_index + 1;
             return;
         }
@@ -759,13 +813,11 @@ static bool retrospective_appearance_compatible(
 }
 
 static bool retrospective_compatible(const GpuRenderSemantic *current,
-                                     const GpuRenderSemantic *previous) {
+                                      const GpuRenderSemantic *previous) {
     return current->interpolation_identity.scene_id ==
                previous->interpolation_identity.scene_id &&
-           semantic_compatible(current, previous) &&
-           retrospective_material_compatible(&current->material,
-                                              &previous->material) &&
-           retrospective_appearance_compatible(current, previous);
+            semantic_compatible(current, previous) &&
+            retrospective_appearance_compatible(current, previous);
 }
 
 static uint64_t retrospective_hash_mix(uint64_t hash, uint64_t value) {
@@ -805,21 +857,37 @@ static size_t retrospective_class_hash(const GpuRenderSemantic *semantic) {
     MIX_RETROSPECTIVE(material->dither);
     MIX_RETROSPECTIVE(material->mask_set);
     MIX_RETROSPECTIVE(material->mask_check);
+    MIX_RETROSPECTIVE(material->draw_area_right - material->draw_area_left);
+    MIX_RETROSPECTIVE(material->draw_area_bottom - material->draw_area_top);
     if (semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
         for (size_t primitive = 0u; primitive < semantic->triangle_count;
              ++primitive) {
             MIX_RETROSPECTIVE(semantic->triangles[primitive].split_index);
             MIX_RETROSPECTIVE(semantic->triangles[primitive].split_count);
-            for (size_t vertex = 0u; vertex < 3u; ++vertex)
+            for (size_t vertex = 0u; vertex < 3u; ++vertex) {
                 MIX_RETROSPECTIVE(semantic->triangles[primitive]
                                       .vertices[vertex].native_view_position);
+                if (material->textured) {
+                    MIX_RETROSPECTIVE(semantic->triangles[primitive]
+                                          .vertices[vertex].u);
+                    MIX_RETROSPECTIVE(semantic->triangles[primitive]
+                                          .vertices[vertex].v);
+                }
+            }
         }
     } else {
         for (size_t primitive = 0u; primitive < semantic->line_count;
              ++primitive)
-            for (size_t vertex = 0u; vertex < 2u; ++vertex)
+            for (size_t vertex = 0u; vertex < 2u; ++vertex) {
                 MIX_RETROSPECTIVE(semantic->lines[primitive]
                                       .vertices[vertex].native_view_position);
+                if (material->textured) {
+                    MIX_RETROSPECTIVE(semantic->lines[primitive]
+                                          .vertices[vertex].u);
+                    MIX_RETROSPECTIVE(semantic->lines[primitive]
+                                          .vertices[vertex].v);
+                }
+            }
     }
 #undef MIX_RETROSPECTIVE
     hash ^= hash >> 33u;
@@ -834,13 +902,17 @@ static void retrospective_hash_insert(const GpuSemanticFrame *frame,
     const size_t slot = retrospective_class_hash(semantic);
 
     if (semantic->interpolation_identity.valid) return;
+    if (workload.previous_retrospective_head[slot] == 0)
+        workload.previous_retrospective_touched[
+            workload.previous_retrospective_touched_count++] =
+                (uint16_t)slot;
     workload.previous_retrospective_next[item_index] =
         workload.previous_retrospective_head[slot];
     workload.previous_retrospective_head[slot] = (int32_t)item_index + 1;
 }
 
 static bool retrospective_exact_equal(const GpuRenderSemantic *current,
-                                      const GpuRenderSemantic *previous) {
+                                       const GpuRenderSemantic *previous) {
     const int64_t unit = INT64_C(1) << GPU_RENDER_FIXED_FRACTION_BITS;
     const size_t count = semantic_vertex_count(current);
     const int64_t target_delta_x = target_relocation(
@@ -854,8 +926,7 @@ static bool retrospective_exact_equal(const GpuRenderSemantic *current,
         previous->material.draw_area_bottom,
         previous->material.draw_offset_y);
 
-    if (count == 0u || !retrospective_compatible(current, previous))
-        return false;
+    if (count == 0u) return false;
     for (size_t index = 0u; index < count; ++index) {
         const GpuRenderSemanticVertex *a = semantic_vertex_at(current, index);
         const GpuRenderSemanticVertex *b = semantic_vertex_at(previous, index);
@@ -889,7 +960,7 @@ static bool retrospective_exact_equal(const GpuRenderSemantic *current,
                 return false;
         }
     }
-    return true;
+    return retrospective_compatible(current, previous);
 }
 
 /* Exact unkeyed copies are safe even when repeated: every candidate produces
@@ -912,7 +983,9 @@ static int32_t retrospective_exact_match(const GpuSemanticFrame *previous,
         entry = workload.previous_retrospective_next[index];
         ++candidate_count;
         ++workload.diagnostics.retrospective_candidates;
-        if (candidate_count > GPU_SEMANTIC_RETROSPECTIVE_CANDIDATE_LIMIT) {
+        if (candidate_count > GPU_SEMANTIC_RETROSPECTIVE_CANDIDATE_LIMIT ||
+            workload.diagnostics.retrospective_candidates >
+                GPU_SEMANTIC_RETROSPECTIVE_FRAME_CANDIDATE_LIMIT) {
             ++workload.diagnostics.retrospective_budget_exhausted;
             *out_conflict = true;
             return -1;
@@ -1070,7 +1143,9 @@ static int32_t retrospective_match(const GpuSemanticFrame *previous,
         entry = workload.previous_retrospective_next[index];
         ++candidate_count;
         ++workload.diagnostics.retrospective_candidates;
-        if (candidate_count > GPU_SEMANTIC_RETROSPECTIVE_CANDIDATE_LIMIT) {
+        if (candidate_count > GPU_SEMANTIC_RETROSPECTIVE_CANDIDATE_LIMIT ||
+            workload.diagnostics.retrospective_candidates >
+                GPU_SEMANTIC_RETROSPECTIVE_FRAME_CANDIDATE_LIMIT) {
             ++workload.diagnostics.retrospective_budget_exhausted;
             *out_ambiguous = true;
             return -1;
@@ -1493,6 +1568,7 @@ static bool interpolate_source_geometry(
 }
 
 void gpu_semantic_workload_reset(void) {
+    clear_workload_hashes();
     if (workload_epoch != UINT64_MAX) ++workload_epoch;
     for (size_t index = 0u; index < 2u; ++index) {
         workload.frames[index].count = 0u;
@@ -1530,38 +1606,27 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_begin(void) {
     building->conflicted = false;
     building_anchors->count = 0u;
     building_anchors->overflowed = false;
-    memset(workload.previous_hash, 0, sizeof(workload.previous_hash));
-    memset(workload.current_hash, 0, sizeof(workload.current_hash));
-    memset(workload.previous_retrospective_head, 0,
-           sizeof(workload.previous_retrospective_head));
-    memset(workload.previous_retrospective_next, 0,
-           sizeof(workload.previous_retrospective_next));
-    memset(workload.previous_vertex_hash, 0,
-           sizeof(workload.previous_vertex_hash));
-    memset(workload.previous_anchor_hash, 0,
-           sizeof(workload.previous_anchor_hash));
-    memset(workload.current_anchor_hash, 0,
-           sizeof(workload.current_anchor_hash));
-    memset(workload.phase_vertex_hash, 0,
-           sizeof(workload.phase_vertex_hash));
-    memset(workload.previous_used, 0, sizeof(workload.previous_used));
-    memset(workload.previous_corresponded, 0,
-           sizeof(workload.previous_corresponded));
-    memset(workload.source_geometry_match, 0,
-           sizeof(workload.source_geometry_match));
-    memset(workload.match_kind, 0, sizeof(workload.match_kind));
-    memset(workload.fallback_kind, 0, sizeof(workload.fallback_kind));
+    clear_workload_hashes();
     if (workload.has_sealed) {
         const GpuSemanticFrame *previous =
             &workload.frames[workload.sealed_index];
         const GpuSemanticAnchorFrame *previous_anchors =
             &workload.anchor_frames[workload.sealed_index];
 
+        memset(workload.previous_used, 0,
+               previous->count * sizeof(workload.previous_used[0]));
+        memset(workload.previous_corresponded, 0,
+               previous->count * sizeof(workload.previous_corresponded[0]));
         for (size_t index = 0u; index < previous_anchors->count; ++index)
             anchor_hash_insert(
-                workload.previous_anchor_hash, previous_anchors, index);
+                workload.previous_anchor_hash,
+                workload.previous_anchor_hash_touched,
+                &workload.previous_anchor_hash_touched_count,
+                previous_anchors, index);
         for (size_t index = 0u; index < previous->count; ++index) {
-            (void)hash_insert(workload.previous_hash, previous, index);
+            (void)hash_insert(
+                workload.previous_hash, workload.previous_hash_touched,
+                &workload.previous_hash_touched_count, previous, index);
             retrospective_hash_insert(previous, index);
             for (size_t vertex = 0u;
                  vertex < semantic_vertex_count(&previous->items[index]);
@@ -1620,14 +1685,16 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_anchors(
            count * sizeof(*anchors));
     building->count += count;
     for (size_t index = first; index < building->count; ++index)
-        anchor_hash_insert(workload.current_anchor_hash, building, index);
+        anchor_hash_insert(
+            workload.current_anchor_hash,
+            workload.current_anchor_hash_touched,
+            &workload.current_anchor_hash_touched_count, building, index);
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
 static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     const GpuRenderSemantic *semantic, GpuRenderSemantic *out_midpoint,
     bool generate_midpoint) {
-    GpuRenderSemantic endpoint;
     GpuSemanticFrame *building;
     const GpuSemanticFrame *previous;
     size_t index;
@@ -1635,17 +1702,17 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     bool ambiguous = false;
     bool current_identity_unique;
     bool matched_exact = false;
+    bool previous_compatible = false;
     GpuSemanticWorkloadMatchKind snap_kind;
 
     if (semantic == NULL || (generate_midpoint && out_midpoint == NULL)) {
         return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
     }
-    if (out_midpoint == NULL) out_midpoint = &endpoint;
     if (!workload.building) {
         return GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
     }
     building = &workload.frames[workload.building_index];
-    *out_midpoint = *semantic;
+    if (generate_midpoint) *out_midpoint = *semantic;
     if (building->conflicted) return GPU_SEMANTIC_WORKLOAD_CONFLICT;
     if (building->count == GPU_SEMANTIC_WORKLOAD_CAPACITY) {
         building->overflowed = true;
@@ -1666,9 +1733,12 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     index = building->count++;
     building->items[index] = *semantic;
     workload.previous_match[index] = -1;
+    workload.source_geometry_match[index] = false;
     workload.match_kind[index] = GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN;
     workload.fallback_kind[index] = GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN;
-    current_identity_unique = hash_insert(workload.current_hash, building, index);
+    current_identity_unique = hash_insert(
+        workload.current_hash, workload.current_hash_touched,
+        &workload.current_hash_touched_count, building, index);
     previous = workload.has_sealed ? &workload.frames[workload.sealed_index] : NULL;
     snap_kind = previous == NULL || previous->overflowed
         ? GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_NO_PREVIOUS
@@ -1709,7 +1779,6 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
             workload.fallback_kind[match_index] =
                 GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_AMBIGUOUS;
         }
-        memset(workload.previous_used, 0, sizeof(workload.previous_used));
         ++workload.diagnostics.ambiguous_count;
         ++workload.diagnostics.total_ambiguous;
         workload.diagnostics.matched_count = 0u;
@@ -1737,12 +1806,15 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     if (previous_index >= 0 &&
         workload.previous_used[(size_t)previous_index])
         snap_kind = GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_ALREADY_USED;
-    else if (previous_index >= 0 &&
-             !semantic_compatible(semantic, &previous->items[previous_index]))
-        snap_kind = GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_INCOMPATIBLE;
+    else if (previous_index >= 0) {
+        previous_compatible = !semantic->interpolation_identity.valid ||
+            semantic_compatible(semantic, &previous->items[previous_index]);
+        if (!previous_compatible)
+            snap_kind = GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_INCOMPATIBLE;
+    }
     if (previous_index >= 0 &&
         !workload.previous_used[(size_t)previous_index] &&
-        semantic_compatible(semantic, &previous->items[previous_index])) {
+        previous_compatible) {
         const size_t matched_vertices = semantic_vertex_count(semantic);
         size_t position_changed_vertices = 0u;
         uint64_t position_delta_fixed = 0u;
@@ -2574,6 +2646,9 @@ static void reconcile_phase_vertex_positions(
             const int32_t entry = workload.phase_vertex_hash[slot];
 
             if (entry == 0) {
+                workload.phase_vertex_hash_touched[
+                    workload.phase_vertex_hash_touched_count++] =
+                        (uint16_t)slot;
                 workload.phase_vertex_hash[slot] = (int32_t)flat_index + 1;
                 for (size_t phase = 0u; phase < phase_count; ++phase) {
                     const GpuRenderSemanticVertex *phase_vertex =

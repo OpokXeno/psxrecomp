@@ -335,7 +335,7 @@ chokepoint every guest call routes through. Two precedents already hang off it:
 The translation module adds the same two shapes, so it needs **no per-function
 codegen** and works in Release.
 
-### 3.2 Capture subsystem (always-on ring)
+### 3.2 Capture subsystem (opt-in authoring ring)
 
 Add `text_capture_record(cpu, target)` called from `psx_dispatch` right beside
 `fntrace_record` (or fold into it):
@@ -348,16 +348,18 @@ Add `text_capture_record(cpu, target)` called from `psx_dispatch` right beside
      lead+trail, or known control byte. Reject on any non-textish byte (filters
      structs/pointers). Require ≥1 real text char.
 2. Hash the record bytes: **`h = fnv1a64(bytes, len)`**.
-3. Upsert into an **always-on inventory ring** `{h, bytes[≤64 sample], full-len,
+3. With `PSX_XLATE_CAPTURE=1`, upsert into an **authoring inventory ring** `{h, bytes[≤64 sample], full-len,
    src_addr, target_pc, ra, first_frame, count}`; on first sight, append to a
    persistent `tsumu_stringdump.log` (flush immediately — crash-safe, per the
    ring-buffer rule).
 4. `textpc_add(target)` into a lock-free set so the apply hook only scans args on
    proven text PCs.
 
-This runs from boot for every player (no arm gate). "Enumerate every string" =
-drive the game (§6) and read the ever-growing inventory; "find untranslated" =
-query the ring for records with no table entry.
+This runs from boot only in explicit capture sessions. Keeping it disabled during
+normal play avoids scanning four possible string records at every dispatch.
+"Enumerate every string" = drive the game (§6) with `PSX_XLATE_CAPTURE=1` and
+read the ever-growing inventory; "find untranslated" = query the ring for records
+with no table entry.
 
 **Coord/`_Printf` disambiguation:** reuse PMS's precision filters adapted to
 PSX — a coordinate gate (`a0,a1 < 0x1000`) for the class-1 drawer, plus explicit
@@ -610,7 +612,7 @@ the real game (these correct/extend §2, which was written pre-implementation):
   concrete form of the §5.4 "dynamically-composed / struct" risk.
 - **Capture quality gate.** The relaxed reader admits vertex/coordinate binary
   that passes by chance (~20k records). A gate requiring ≥2 hiragana/katakana/
-  fullwidth chars (SJIS lead `0x82`/`0x83`) keeps the always-on inventory a clean
+  fullwidth chars (SJIS lead `0x82`/`0x83`) keeps the authoring inventory a clean
   enumeration (~52 real records). Authoring reads it via TCP `xlate dump/todo`.
 - **Verification.** Framed tutorial hints apply on real draws (hits climb, game
   stays alive, English written little-endian). These particular hints are
