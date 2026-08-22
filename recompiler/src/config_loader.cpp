@@ -599,6 +599,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.video_perspective_texturing =
                 toml::find<bool>(video, "perspective_texturing");
         }
+        if (video.contains("dithering")) {
+            rt.video_dithering = toml::find<bool>(video, "dithering");
+        }
         if (video.contains("pgxp_cpu_mode")) {
             rt.video_pgxp_cpu_mode = toml::find<bool>(video, "pgxp_cpu_mode");
         }
@@ -2292,6 +2295,10 @@ UserSettings load_user_settings(const fs::path& path) {
             s.perspective_texturing = toml::find<bool>(v, "perspective_texturing");
             s.has_perspective_texturing = true;
         });
+        if (v.contains("dithering")) try_get([&]{
+            s.dithering = toml::find<bool>(v, "dithering");
+            s.has_dithering = true;
+        });
         if (v.contains("crt_filter")) try_get([&]{
             const auto m = toml::find<std::string>(v, "crt_filter");
             if (m == "raw")            { s.screen_kind = 0; s.has_screen_kind = true; }
@@ -2603,6 +2610,9 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_perspective_texturing)
         f << "perspective_texturing = "
           << (s.perspective_texturing ? "true" : "false") << "\n";
+    if (s.has_dithering)
+        f << "dithering             = "
+          << (s.dithering ? "true" : "false") << "\n";
     if (s.has_screen_kind) {
         const char* k = s.screen_kind == 1 ? "crt"
                       : s.screen_kind == 2 ? "composite"

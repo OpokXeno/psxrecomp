@@ -475,6 +475,12 @@ void gpu_texture_correction_set(int enabled);
 int gpu_texture_correction_enabled(void);
 /* Triangles drawn with perspective-correct UVs since startup. */
 uint32_t gpu_texture_correction_hits(void);
+/* Master on/off for the PS1's ordered-dither pattern ([video] dithering).
+ * 1 (default) = faithful: the game's own GP0(E1) dither bit decides, per
+ * primitive, exactly as before. 0 = force off everywhere, regardless of
+ * what the game requests. */
+void gpu_dithering_set(int enabled);
+int gpu_dithering_enabled(void);
 /* GTE-activity gameplay detector ([widescreen] gte_game_mode) for 3D titles
  * with no sprite-tag helper: gte.cpp notes every RTPS/RTPT projection; a frame
  * that projects enough vertices is stamped as gameplay. */

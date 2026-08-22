@@ -391,6 +391,12 @@ struct RuntimeConfig {
     // [video] perspective_texturing = true.
     bool                  video_perspective_texturing = false;
 
+    // dithering: master on/off for the PS1's ordered dither pattern. Default
+    // true — the faithful floor, where the game's own GP0(E1) dither bit
+    // decides per primitive exactly as always. Setting this false forces
+    // dithering off everywhere, regardless of what the game requests.
+    bool                  video_dithering = true;
+
     // pgxp_cpu_mode: propagate sub-pixel precision through CPU arithmetic as
     // well as memory moves (the PGXP engine's tier-2 hooks). Off by default —
     // the same default as the reference implementations — because some games
@@ -1134,6 +1140,7 @@ struct UserSettings {
     // Both default off — the faithful floor — and are player-selectable.
     bool has_geometry_correction   = false; bool geometry_correction   = false;
     bool has_perspective_texturing = false; bool perspective_texturing = false;
+    bool has_dithering             = false; bool dithering             = true;
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
     // [video] turbo_loads: DEPRECATED AND IGNORED — the legacy home of the
