@@ -1175,6 +1175,10 @@ static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
  * SXY readback are untouched. Default off = the faithful floor. */
 static int           g_video_geometry_correction   = 0;
 static int           g_video_perspective_texturing = 0;
+/* Master on/off for the PS1's ordered dither pattern ([video] dithering).
+ * 1 (default) = faithful, the game's own GP0(E1) dither bit decides as
+ * always. 0 = force off everywhere. See gpu_dithering_set in gpu.h. */
+static int           g_video_dithering     = 1;
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
@@ -11069,6 +11073,8 @@ namespace {
         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
         /* PGXP is framework-owned and configured outside the launcher. */
         gi->has_geometry_precision = 0;
+        /* Master dithering on/off; a plain renderer toggle, unlike PGXP. */
+        gi->has_dithering = 1;
         gi->has_rewind_depth = 1;
         if (language_labels && num_languages > 0) {
             gi->language_labels = language_labels;
@@ -11552,6 +11558,8 @@ int main(int argc, char** argv) {
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
                 gc.runtime.video_perspective_texturing ? 1 : 0;
+            g_video_dithering =
+                gc.runtime.video_dithering ? 1 : 0;
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
@@ -12206,6 +12214,8 @@ int main(int argc, char** argv) {
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
             g_video_perspective_texturing = us.perspective_texturing ? 1 : 0;
+        if (us.has_dithering)
+            g_video_dithering = us.dithering ? 1 : 0;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         /* turbo_loads is deliberately NOT restored from settings.toml. It is a
@@ -12660,6 +12670,8 @@ int main(int argc, char** argv) {
             seed.has_geometry_correction = true;
             seed.perspective_texturing = (g_video_perspective_texturing != 0);
             seed.has_perspective_texturing = true;
+            seed.dithering = (g_video_dithering != 0);
+            seed.has_dithering = true;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);
             seed.has_auto_skip_fmv = skip_fmv_offered;
@@ -12831,6 +12843,7 @@ int main(int argc, char** argv) {
             ls.texture_filter     = seed.texture_filter;
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
+            ls.dither_force_off = seed.dithering ? 0 : 1;
             ls.screen_kind        = seed.screen_kind;
             ls.fps               = seed.fps;
             ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
@@ -13070,6 +13083,8 @@ int main(int argc, char** argv) {
                 seed.has_geometry_correction = true;
                 seed.perspective_texturing = ls.perspective_texturing != 0;
                 seed.has_perspective_texturing = true;
+                seed.dithering = (ls.dither_force_off == 0);
+                seed.has_dithering = true;
                 seed.screen_kind           = ls.screen_kind;           seed.has_screen_kind           = true;
                 seed.fps                   = ls.fps;                   seed.has_fps                   = true;
                 seed.frame_interpolation   = ls.frame_interp != 0;
@@ -13277,6 +13292,7 @@ int main(int argc, char** argv) {
                 g_video_texfilter = seed.texture_filter;
                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
+                g_video_dithering     = seed.dithering ? 1 : 0;
                 g_video_screen    = seed.screen_kind;
                 g_frame_interpolation =
                     frame_interpolation_offered && seed.frame_interpolation ? 1 : 0;
@@ -13647,10 +13663,13 @@ session_reboot:
         g_video_geometry_correction = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PERSPECTIVE_TEXTURING"))
         g_video_perspective_texturing = (*e && *e != '0') ? 1 : 0;
+    if (const char* e = std::getenv("PSX_DITHERING"))
+        g_video_dithering = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PGXP_CPU_MODE"))
         g_video_pgxp_cpu_mode = (*e && *e != '0') ? 1 : 0;
     gte_geometry_correction_set(g_video_geometry_correction);
     gpu_texture_correction_set(g_video_perspective_texturing);
+    gpu_dithering_set(g_video_dithering);
     pgxp_set_cpu_mode(g_video_pgxp_cpu_mode);
     pgxp_set_tolerance(g_video_pgxp_tolerance);
     if (g_video_geometry_correction || g_video_perspective_texturing) {
@@ -14748,6 +14767,7 @@ soft_return_lobby:
         ls.texture_filter = g_video_texfilter;
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
+        ls.dither_force_off = g_video_dithering ? 0 : 1;
         ls.screen_kind = g_video_screen;
         ls.fps = g_video_fps;
         ls.frame_interp = g_frame_interpolation ? 1 : 0;
@@ -15003,6 +15023,8 @@ soft_return_lobby:
                 us.has_geometry_correction = true;
                 us.perspective_texturing = ls.perspective_texturing != 0;
                 us.has_perspective_texturing = true;
+                us.dithering = (ls.dither_force_off == 0);
+                us.has_dithering = true;
                 us.screen_kind = ls.screen_kind;
                 us.has_screen_kind = true;
                 us.fps = ls.fps;
@@ -15058,6 +15080,7 @@ soft_return_lobby:
             g_video_texfilter = ls.texture_filter;
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
+            g_video_dithering = ls.dither_force_off ? 0 : 1;
             g_video_screen = ls.screen_kind;
             set_video_fps(ls.fps);
             /* Load acceleration and FMV skipping are mod-owned on PSX, and the

@@ -403,6 +403,52 @@ stays, inert + A/B-able). What was learned, so the next attempt starts ahead:
 
 ---
 
+## G2 — Dithering on/off toggle (2026-08-22)
+
+**Status: DONE (GL renderer; software/Vulkan consumption open).**
+
+`[video] dithering` (default **true**, the faithful floor) is a global
+override for the PS1's ordered dither pattern: `true` leaves every
+primitive's behavior exactly as the game's own GP0(E1) dither bit decides,
+unchanged; `false` forces dithering off everywhere.
+
+### Configuration
+
+```toml
+[video]
+dithering = false   # force dithering off everywhere; default true (faithful)
+```
+
+### How it works
+
+`gpu_dithering_set()`/`gpu_dithering_enabled()` (`gpu.h`/`gpu.c`, default
+**on**) are consulted at the two points in `gpu_gl_renderer.c` where the
+dither state actually gets latched for a draw: `glb_set_dither()` (the
+single funnel behind `s_dither`, covering every flat/Gouraud/line/classic-
+textured draw and the semantic path's non-textured triangles) and the
+semantic/transaction path's direct textured-triangle call (which reads
+`material->dither` without going through `s_dither`). With the override on
+(the default), both sites behave exactly as before. With it off, both force
+their dither term to zero regardless of what the game's GP0(E1) bit says.
+
+### Status / next
+
+- **Done:** `[video]` config plumbing (game.toml + settings.toml + env var
+  `PSX_DITHERING` + save round-trip), `gpu.c` facade, OpenGL renderer
+  consumption (both choke points above), the `recomp-ui`
+  `RecompLauncherCSettings.dither_force_off` field (stored inverted so a
+  zero-initialized/legacy host keeps the faithful default) and its
+  `main.cpp` seed/`ls` round-trip, unit test coverage
+  (`video_enhancement_settings_test.cpp`).
+- **Done:** the launcher settings-menu checkbox ("Dithering", Display panel,
+  `recomp-ui`: `GameInfo.has_dithering` capability flag,
+  `LauncherModel.has_dithering`/`launcher_model_toggle_dithering`, the imgui
+  row itself) — gated on its own capability flag rather than reusing
+  `has_geometry_precision` (which xenogears-recomp deliberately keeps off
+  for PGXP). User-validated 2026-08-22 on Xenogears, both directions.
+- **Open:** software and Vulkan renderer consumption (currently GL-only,
+  same as the historical D1 dither gap).
+
 ## G1 — Sub-pixel vertex precision + perspective-correct textures (issue #92)
 
 PS1 polygon jitter ("wobble", "bouncing lines") and warped floor/wall textures

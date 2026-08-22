@@ -1,13 +1,17 @@
 /* video_enhancement_settings_test — [video] geometry_correction /
- * perspective_texturing plumbing.
+ * perspective_texturing / dithering plumbing.
  *
- * These two knobs are the opt-in for the sub-pixel vertex precision and
- * perspective-correct UV enhancements (psxrecomp issue #92). The underlying
- * GTE/GPU machinery has its own unit coverage in the runtime suite; what this
- * test pins is the part that decides whether it is ever switched on:
+ * geometry_correction and perspective_texturing are the opt-in for the
+ * sub-pixel vertex precision and perspective-correct UV enhancements
+ * (psxrecomp issue #92); both default OFF. dithering is the master on/off
+ * for the PS1's ordered dither pattern and defaults ON (the faithful floor —
+ * the game's own GP0(E1) dither bit decides as always); setting it false
+ * forces dithering off everywhere. The underlying GTE/GPU machinery has its
+ * own unit coverage in the runtime suite; what this test pins is the part
+ * that decides whether each is ever switched on:
  *
- *   1. both default OFF (the faithful floor) when game.toml says nothing;
- *   2. game.toml [video] turns them on;
+ *   1. each defaults to its faithful floor when game.toml says nothing;
+ *   2. game.toml [video] can override each;
  *   3. settings.toml (the player's file) parses them;
  *   4. save_user_settings round-trips them — a launcher save must not silently
  *      drop a hand-edited key, which would look like "the setting does nothing".
@@ -72,6 +76,8 @@ static void test_defaults_off() {
           "geometry_correction defaults OFF (known to crack meshes)");
     check(!gc.runtime.video_perspective_texturing,
           "perspective_texturing defaults OFF (faithful floor; opt-in)");
+    check(gc.runtime.video_dithering,
+          "dithering defaults ON (the faithful floor)");
     fs::remove(p);
 }
 
@@ -79,12 +85,15 @@ static void test_game_toml_opt_in() {
     fs::path p = write_game_toml("psxrecomp_pgxp_on.toml",
         "[video]\n"
         "geometry_correction = true\n"
-        "perspective_texturing = true\n");
+        "perspective_texturing = true\n"
+        "dithering = false\n");
     auto gc = PSXRecompV4::load_game_config(p);
     check(gc.runtime.video_geometry_correction,
           "[video] geometry_correction = true is honoured");
     check(gc.runtime.video_perspective_texturing,
           "[video] perspective_texturing = true is honoured");
+    check(!gc.runtime.video_dithering,
+          "[video] dithering = false is honoured");
     fs::remove(p);
 }
 
@@ -123,6 +132,7 @@ static void test_user_settings_read() {
         "[video]\n"
         "geometry_correction = true\n"
         "perspective_texturing = false\n"
+        "dithering = false\n"
         "[audio]\n"
         "frequency = 48000\n");
     auto us = PSXRecompV4::load_user_settings(p);
@@ -131,6 +141,8 @@ static void test_user_settings_read() {
           "settings.toml geometry_correction = true read");
     check(us.has_perspective_texturing && !us.perspective_texturing,
           "settings.toml perspective_texturing = false read (explicit off)");
+    check(us.has_dithering && !us.dithering,
+          "settings.toml dithering = false read (explicit off)");
     check(us.has_audio_freq && us.audio_freq == 48000,
           "settings.toml audio frequency read");
     fs::remove(p);
@@ -147,6 +159,8 @@ static void test_user_settings_absent_key() {
           "absent geometry_correction leaves has_* false");
     check(!us.has_perspective_texturing,
           "absent perspective_texturing leaves has_* false");
+    check(!us.has_dithering,
+          "absent dithering leaves has_* false");
     fs::remove(p);
 }
 
@@ -154,6 +168,7 @@ static void test_user_settings_round_trip() {
     PSXRecompV4::UserSettings out;
     out.geometry_correction = true;   out.has_geometry_correction = true;
     out.perspective_texturing = true; out.has_perspective_texturing = true;
+    out.dithering = false;            out.has_dithering = true;
     out.audio_freq = 48000;           out.has_audio_freq = true;
 
     fs::path p = fs::temp_directory_path() / "psxrecomp_pgxp_roundtrip.toml";
@@ -165,6 +180,8 @@ static void test_user_settings_round_trip() {
           "geometry_correction survives a save/load round trip");
     check(back.has_perspective_texturing && back.perspective_texturing,
           "perspective_texturing survives a save/load round trip");
+    check(back.has_dithering && !back.dithering,
+          "dithering survives a save/load round trip");
     check(back.has_audio_freq && back.audio_freq == 48000,
           "audio frequency survives a save/load round trip");
     fs::remove(p);
@@ -183,7 +200,7 @@ int main() {
                      failures);
         return 1;
     }
-    std::printf("PASS: [video] geometry_correction / perspective_texturing "
-                "plumbing\n");
+    std::printf("PASS: [video] geometry_correction / perspective_texturing / "
+                "dithering plumbing\n");
     return 0;
 }
