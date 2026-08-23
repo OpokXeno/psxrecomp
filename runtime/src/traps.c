@@ -5,6 +5,7 @@
  */
 
 #include "cpu_state.h"
+#include "memory.h"
 #include "psx_bss.h"
 #include "psx_runtime.h"   /* fix B: psx_exc_escape_reason_t + g_exc_escape_reason */
 #include "debug_server.h"
@@ -1121,6 +1122,17 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
 }
 
 void psx_break(CPUState* cpu, uint32_t code, uint32_t pc) {
+    /* Xenogears' developer executables use break 0x400 as a per-frame
+     * debugger marker whenever the 8 MiB development profile is active.
+     * The development environment consumes the marker and continues at the
+     * following instruction. Keep that debugger behavior narrowly scoped to
+     * the explicit developer profile so real guest traps and every other BREAK
+     * code remain fail-loud. */
+    if (code == 0x400u && memory_developer_ram_enabled()) {
+        cpu->pc = pc + 4u;
+        return;
+    }
+
     char buf[128];
     snprintf(buf, sizeof(buf), "BREAK @ PC=0x%08X, code=0x%05X", pc, code);
     trap_crash(buf);

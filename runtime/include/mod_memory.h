@@ -1,6 +1,8 @@
 #ifndef PSXRECOMP_MOD_MEMORY_H
 #define PSXRECOMP_MOD_MEMORY_H
 
+#include "memory.h"
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -29,8 +31,9 @@ static inline int psx_mod_gpu_dma_aperture_offset_for(
 }
 
 /*
- * Preserve the retail DMAC's 2 MiB folding unless the address is inside the
- * portion of the enhancement aperture that has actually been allocated.
+ * Fold ordinary DMA tags through the active main-RAM profile unless the
+ * address is inside the portion of the enhancement aperture that has actually
+ * been allocated.
  */
 static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
     uint32_t address, uint32_t used) {
@@ -38,7 +41,7 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
     if (psx_mod_gpu_dma_aperture_offset_for(
             canonical, 4u, used, (uint32_t *)0))
         return canonical;
-    return canonical & 0x001FFFFCu;
+    return canonical & (g_psx_ram_mask & ~3u);
 }
 
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);

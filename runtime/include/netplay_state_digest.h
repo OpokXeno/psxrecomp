@@ -26,7 +26,7 @@ typedef struct NetplayCoreParts {
     uint32_t cpu;       /* gpr + pc + hi/lo + status/cause/epc + GTE */
     uint32_t clock_irq; /* cycle count + i_stat/i_mask */
     uint32_t timers;    /* timer snapshot */
-    uint32_t ram;       /* 2 MiB main RAM */
+    uint32_t ram;       /* active main RAM bytes + explicit RAM profile */
     uint32_t dirty;     /* dirty-RAM bitmap words */
     uint32_t core;      /* full core (same as netplay_core_digest) */
 } NetplayCoreParts;

@@ -37,6 +37,7 @@
 
 #include "debug_overlay.h"
 #include "debug_overlay_data.h"
+#include "memory.h"
 #include "overlay_capture.h"
 
 /* The vendored Dear ImGui lives at recomp-ui/src/third_party/imgui. Its
@@ -154,6 +155,9 @@ extern "C" int  psx_audio_get_spu_hq(void);
 extern "C" void psx_audio_set_spu_hq(int on);
 extern "C" int  psx_video_get_window_width(void);
 extern "C" void psx_video_set_window_width(int w);
+extern "C" int  psx_input_controller_ports_swapped(void);
+extern "C" int  psx_input_controller_port_swap_available(void);
+extern "C" int  psx_input_swap_controller_ports(void);
 extern "C" int  g_turbo_loads_enabled;
 }
 
@@ -560,6 +564,19 @@ static void draw_ram_inspector_section(void)
 
 /* ---- Toggles ------------------------------------------------------------ */
 
+static bool s_developer_mode_request = false;
+static bool s_kernel_menu_request = false;
+
+static void request_developer_mode(void)
+{
+    s_developer_mode_request = true;
+}
+
+static void request_kernel_menu(void)
+{
+    s_kernel_menu_request = true;
+}
+
 static void draw_toggles_section(void)
 {
     bool tf = gr_texture_filter() != 0;
@@ -654,13 +671,14 @@ static void draw_toggles_section(void)
     }
 
     static const char *kNativeInterpolationTargets[] = {
-        "60 FPS", "120 FPS", "240 FPS"
+        "30 FPS (Original)", "60 FPS", "120 FPS", "240 FPS"
     };
     int native_fps = gl_renderer_native_interpolation_fps();
-    int native_fps_index = native_fps == 240 ? 2 : native_fps == 120 ? 1 : 0;
+    int native_fps_index = native_fps == 240 ? 3 :
+        native_fps == 120 ? 2 : native_fps == 60 ? 1 : 0;
     if (ImGui::Combo("Native semantic target", &native_fps_index,
-                     kNativeInterpolationTargets, 3)) {
-        static const int targets[] = {60, 120, 240};
+                     kNativeInterpolationTargets, 4)) {
+        static const int targets[] = {30, 60, 120, 240};
         (void)gl_renderer_set_native_interpolation_fps(
             targets[native_fps_index]);
     }
@@ -674,6 +692,43 @@ static void draw_toggles_section(void)
     if (ImGui::Checkbox("High-quality SPU (float shadow)", &hq)) {
         psx_audio_set_spu_hq(hq ? 1 : 0);
     }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Game-native debug menu:");
+    const bool ports_swapped = psx_input_controller_ports_swapped() != 0;
+    const bool can_swap_ports = psx_input_controller_port_swap_available() != 0;
+    if (!can_swap_ports) ImGui::BeginDisabled();
+    if (ImGui::Button(ports_swapped
+            ? "Use current controller as Controller 1"
+            : "Use current controller as Controller 2")) {
+        (void)psx_input_swap_controller_ports();
+    }
+    if (!can_swap_ports) ImGui::EndDisabled();
+    ImGui::Text("Current controller route: Controller %d", ports_swapped ? 2 : 1);
+    if (!can_swap_ports)
+        ImGui::TextDisabled("Controller routing is fixed during replay or netplay.");
+
+    const bool developer_ram = memory_developer_ram_enabled() != 0;
+    if (!developer_ram) {
+        if (ImGui::Button("Enable 8 MiB Developer Mode")) {
+            request_developer_mode();
+        }
+    }
+    if (ImGui::Button("Open native Kernel Menu")) {
+        request_kernel_menu();
+    }
+    const uint32_t development_word =
+        (uint32_t)psx_read_byte(0x80010000u) |
+        ((uint32_t)psx_read_byte(0x80010001u) << 8) |
+        ((uint32_t)psx_read_byte(0x80010002u) << 16) |
+        ((uint32_t)psx_read_byte(0x80010003u) << 24);
+    ImGui::Text("RAM profile: %s", developer_ram ? "Developer 8 MiB" : "Retail 2 MiB");
+    ImGui::Text("Development word: 0x%08X", development_word);
+    ImGui::TextWrapped(developer_ram
+        ? "Developer mode is active. Open the Kernel Menu to select Field or "
+          "Battle; their native debug overlays load at 0x80280000."
+        : "Developer Mode enables the 8 MiB development path without leaving "
+          "the current module. The Kernel Menu is available independently.");
 }
 
 /* ---- Rings -------------------------------------------------------------- */
@@ -2203,6 +2258,20 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         psx_ws_set_native_wide(value);
         return 0;
     }
+    if (std::strcmp(name, "developer_mode") == 0) {
+        if (value == 0) return -2;
+        request_developer_mode();
+        return 0;
+    }
+    if (std::strcmp(name, "kernel_menu") == 0) {
+        if (value == 0) return -2;
+        request_kernel_menu();
+        return 0;
+    }
+    if (std::strcmp(name, "swap_controller_ports") == 0) {
+        if (value == 0) return -2;
+        return psx_input_swap_controller_ports() ? 0 : -3;
+    }
     if (std::strcmp(name, "aspect_set") == 0) {
         int num = value  > 0 ? value  : 4;
         int den = value2 > 0 ? value2 : 3;
@@ -2358,6 +2427,20 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         return psx_debug_overlay_event_jump(value);
     }
     return -1;
+}
+
+int psx_debug_overlay_take_developer_mode_request(void)
+{
+    const bool requested = s_developer_mode_request;
+    s_developer_mode_request = false;
+    return requested ? 1 : 0;
+}
+
+int psx_debug_overlay_take_kernel_menu_request(void)
+{
+    const bool requested = s_kernel_menu_request;
+    s_kernel_menu_request = false;
+    return requested ? 1 : 0;
 }
 
 #endif /* PSX_DEBUG_OVERLAY */

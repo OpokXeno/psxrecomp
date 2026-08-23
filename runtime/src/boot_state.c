@@ -7,6 +7,7 @@
 #include "gpu_vram_dirty.h"
 #include "cpu_state.h"     /* gte_canonicalize_cpu_state after CPU wire restore   */
 #include "interrupts.h"
+#include "memory.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
 #include "pst_wire.h"
@@ -38,15 +39,12 @@ static double boot_state_mono_ms(void) {
 /* Compress payloads at/above this size (RAM/VRAM/SPU/dirty dominate I/O). */
 #define BOOT_STATE_ZLIB_MIN 256u
 
-#define RAM_SIZE   (2u * 1024u * 1024u)
 #define SPAD_SIZE  (1024u)
 #define VRAM_W     1024
 #define VRAM_H     512
 #define VRAM_SIZE  ((uint32_t)(VRAM_W * VRAM_H * 2))  /* 1 MB, 16bpp */
 
 /* ---- core accessors (existing runtime modules) ---- */
-extern uint8_t*  memory_get_ram_ptr(void);
-extern uint8_t*  memory_get_scratchpad_ptr(void);
 extern uint32_t  i_stat;
 extern uint32_t  i_mask;
 extern uint64_t  psx_cycle_count;
@@ -84,6 +82,14 @@ extern int      mdec_snapshot_read(const uint8_t* p, uint32_t len);
 #define CPU_REGS_WIRE_BYTES (524u)
 /* Timer wire: 3*u16 + 3*u32 + 3*u16 + 3*i32 + 3*u32 = 48 bytes (no pad holes). */
 #define TIMER_REGS_WIRE_BYTES (48u)
+#define BOOT_STATE_MAX_BYTES (128u * 1024u * 1024u)
+
+static uint32_t active_ram_profile(void)
+{
+    return memory_developer_ram_enabled()
+        ? BOOT_STATE_RAM_PROFILE_DEVELOPER
+        : BOOT_STATE_RAM_PROFILE_RETAIL;
+}
 
 /* ---- deferred capture state (armed before first boot, fired at handoff) ---- */
 static char     s_capture_path[512];
@@ -229,7 +235,8 @@ static int write_header_le(BsOut* o, const BootStateHeader* h) {
         !pst_w_i32(&w, h->abi_tag) ||
         !pst_w_u32(&w, h->codegen_ver) ||
         !pst_w_u32(&w, h->section_count) ||
-        !pst_w_u32(&w, h->reserved) ||
+        !pst_w_u32(&w, h->ram_size) ||
+        !pst_w_u32(&w, h->ram_profile) ||
         !pst_w_bytes(&w, h->game_sha256, sizeof(h->game_sha256)) ||
         !pst_w_bytes(&w, h->manifest_sha256, sizeof(h->manifest_sha256)) ||
         w.written != BOOT_STATE_HEADER_WIRE_BYTES)
@@ -374,6 +381,13 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
+    h.ram_size      = memory_get_ram_size();
+    h.ram_profile   = active_ram_profile();
+    if ((h.ram_profile == BOOT_STATE_RAM_PROFILE_RETAIL &&
+         h.ram_size != PSX_MAIN_RAM_RETAIL_SIZE) ||
+        (h.ram_profile == BOOT_STATE_RAM_PROFILE_DEVELOPER &&
+         h.ram_size != PSX_MAIN_RAM_DEVELOPER_SIZE))
+        return 0;
     const PsxGameIdentity *identity = psx_game_identity_runtime();
     if (!identity) return 0;
     memcpy(h.game_sha256, identity->game_sha256, sizeof(h.game_sha256));
@@ -383,7 +397,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     ok = write_header_le(o, &h);
 
     if (ok) ok = write_cpu_section(o, cpu);
-    if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        RAM_SIZE);
+    if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(), h.ram_size);
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
@@ -502,8 +516,9 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
     *out_len = 0;
     memset(&o, 0, sizeof o);
     o.no_zlib = no_zlib ? 1 : 0;
-    /* Compressed MotK ~1.3–1.5 MiB; raw ~3.5–4 MiB (RAM+VRAM+SPU). */
-    o.cap = no_zlib ? (5u * 1024u * 1024u) : (2u * 1024u * 1024u);
+    /* Raw state is active RAM plus roughly 2 MiB of VRAM/SPU/device state. */
+    o.cap = no_zlib ? (size_t)memory_get_ram_size() + (3u * 1024u * 1024u)
+                    : (2u * 1024u * 1024u);
     o.data = (uint8_t*)malloc(o.cap);
     if (!o.data) return 0;
     if (!boot_state_save_to(&o, cpu, bios_checksum, entry_pc)) {
@@ -556,11 +571,11 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return 1;
     }
     case BS_SEC_RAM:
-        if (len != RAM_SIZE) return 0;
-        memcpy(memory_get_ram_ptr(), p, RAM_SIZE);
+        if (len != memory_get_ram_size()) return 0;
+        memcpy(memory_get_ram_ptr(), p, len);
         {
             extern void psx_kernel_bless_note_range(uint32_t phys, uint32_t l);
-            psx_kernel_bless_note_range(0, RAM_SIZE);
+            psx_kernel_bless_note_range(0, len);
         }
         return 1;
     case BS_SEC_SPAD:
@@ -666,11 +681,13 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
     case BS_SEC_MDEC:
         return mdec_snapshot_read(p, len);
     case BS_SEC_DIRTY: {
-        uint32_t wc;
+        uint32_t wc, expected_wc;
         uint32_t* words;
         PstR r;
         if (len % 4u) return 0;
         wc = len / 4u;
+        expected_wc = dirty_ram_get_bitmap_word_count();
+        if (wc != expected_wc) return 0;
         words = (uint32_t*)malloc(len ? len : 1);
         if (!words) return 0;
         pst_r_init(&r, p, len);
@@ -701,7 +718,7 @@ static int boot_state_parse_header(const uint8_t* file, size_t file_len,
                                    BootStateHeader* h_out) {
     PstR hr;
     if (!file || !h_out || file_len < BOOT_STATE_HEADER_WIRE_BYTES ||
-        file_len > 64u * 1024u * 1024u) {
+        file_len > BOOT_STATE_MAX_BYTES) {
         return 0;
     }
     pst_r_init(&hr, file, BOOT_STATE_HEADER_WIRE_BYTES);
@@ -714,7 +731,8 @@ static int boot_state_parse_header(const uint8_t* file, size_t file_len,
         !pst_r_i32(&hr, &h_out->abi_tag) ||
         !pst_r_u32(&hr, &h_out->codegen_ver) ||
         !pst_r_u32(&hr, &h_out->section_count) ||
-        !pst_r_u32(&hr, &h_out->reserved) ||
+        !pst_r_u32(&hr, &h_out->ram_size) ||
+        !pst_r_u32(&hr, &h_out->ram_profile) ||
         !pst_r_bytes(&hr, h_out->game_sha256, sizeof(h_out->game_sha256)) ||
         !pst_r_bytes(&hr, h_out->manifest_sha256, sizeof(h_out->manifest_sha256))) {
         return 0;
@@ -751,7 +769,7 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
         boot_state_append_reason(reason, reason_cap, "missing_or_truncated");
         return 0;
     }
-    if (file_len > 64u * 1024u * 1024u) {
+    if (file_len > BOOT_STATE_MAX_BYTES) {
         boot_state_append_reason(reason, reason_cap, "too_large");
         return 0;
     }
@@ -796,6 +814,16 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
     if (h.codegen_ver != (uint32_t)PSX_OVERLAY_CODEGEN_VER) {
         snprintf(part, sizeof(part), "codegen_ver=%u(want %u)",
                  (unsigned)h.codegen_ver, (unsigned)PSX_OVERLAY_CODEGEN_VER);
+        boot_state_append_reason(reason, reason_cap, part);
+    }
+    if (h.ram_size != memory_get_ram_size()) {
+        snprintf(part, sizeof(part), "ram_size=%u(want %u)",
+                 (unsigned)h.ram_size, (unsigned)memory_get_ram_size());
+        boot_state_append_reason(reason, reason_cap, part);
+    }
+    if (h.ram_profile != active_ram_profile()) {
+        snprintf(part, sizeof(part), "ram_profile=%u(want %u)",
+                 (unsigned)h.ram_profile, (unsigned)active_ram_profile());
         boot_state_append_reason(reason, reason_cap, part);
     }
     identity = psx_game_identity_runtime();
@@ -864,7 +892,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
             ok = 0; break;
         }
         cur += 16;
-        if (len > 64u * 1024u * 1024u || (uint64_t)(end - cur) < len) {
+        if (len > BOOT_STATE_MAX_BYTES || (uint64_t)(end - cur) < len) {
             ok = 0; break;
         }
         payload = cur;
@@ -878,7 +906,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
             if (len < 4u) { ok = 0; break; }
             pst_r_init(&lr, payload, 4);
             if (!pst_r_u32(&lr, &raw_len) || raw_len == 0 ||
-                raw_len > 64u * 1024u * 1024u) {
+                raw_len > BOOT_STATE_MAX_BYTES) {
                 ok = 0; break;
             }
             inflated = (uint8_t*)malloc(raw_len);
@@ -954,7 +982,8 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
     }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
     sz = ftell(f);
-    if (sz < (long)BOOT_STATE_HEADER_WIRE_BYTES || sz > 64L * 1024L * 1024L) {
+    if (sz < (long)BOOT_STATE_HEADER_WIRE_BYTES ||
+        (uint64_t)sz > (uint64_t)BOOT_STATE_MAX_BYTES) {
         fprintf(stderr, "boot_state: reject — bad size %ld for %s\n",
                 sz, path ? path : "(null)");
         fclose(f);

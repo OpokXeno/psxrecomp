@@ -4,6 +4,7 @@
 #include "dirty_ram_interp.h"
 #include "gpu.h"
 #include "interrupts.h"
+#include "memory.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"
 
@@ -11,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern uint8_t* memory_get_ram_ptr(void);
 extern uint32_t i_stat;
 extern uint32_t i_mask;
 extern void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
@@ -25,7 +25,6 @@ extern uint8_t* spu_get_ram_ptr(void);
 extern uint32_t spu_get_ram_bytes(void);
 extern uint32_t mdec_snapshot_bytes(void);
 extern void     mdec_snapshot_write(uint8_t *p);
-extern uint8_t *memory_get_scratchpad_ptr(void);
 extern uint32_t dma_snapshot_bytes(void);
 extern void     dma_snapshot_write(uint8_t *p);
 extern uint32_t sio_snapshot_bytes(void);
@@ -54,8 +53,6 @@ static uint32_t digest_module(uint32_t (*bytes_fn)(void), void (*write_fn)(uint8
     write_fn(buf);
     return crc32_compute(buf, n);
 }
-
-#define NP_RAM_SIZE (2u * 1024u * 1024u)
 
 uint32_t netplay_cdrom_digest(void)
 {
@@ -113,6 +110,7 @@ void netplay_core_digest_parts(const CPUState* cpu, NetplayCoreParts* out)
     uint32_t mode[3], frac[3];
     int32_t irq_line[3];
     uint32_t wc;
+    uint32_t ram_size, ram_profile;
     uint32_t i;
     uint8_t* ram;
     uint32_t cpu_h, clk_h, tim_h, ram_h, drt_h;
@@ -158,8 +156,14 @@ void netplay_core_digest_parts(const CPUState* cpu, NetplayCoreParts* out)
     crc_tim = crc32_update(crc_tim, (const uint8_t*)frac, sizeof(frac));
 
     ram = memory_get_ram_ptr();
+    ram_size = memory_get_ram_size();
+    ram_profile = memory_developer_ram_enabled() ? 1u : 0u;
+    crc_ram = crc32_update(crc_ram, (const uint8_t *)&ram_profile,
+                           sizeof(ram_profile));
+    crc_ram = crc32_update(crc_ram, (const uint8_t *)&ram_size,
+                           sizeof(ram_size));
     if (ram)
-        crc_ram = crc32_update(crc_ram, ram, NP_RAM_SIZE);
+        crc_ram = crc32_update(crc_ram, ram, ram_size);
 
     wc = dirty_ram_get_bitmap_word_count();
     for (i = 0; i < wc; i++) {

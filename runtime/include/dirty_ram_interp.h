@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include "cpu_state.h"
+#include "memory.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -126,9 +127,10 @@ void     psx_kernel_bless_reset_for_boot(void);
  * (see the window model note above). Clean boot text never enters the window
  * (it runs compiled; capturing it would violate the static-first design). */
 static inline int overlay_cache_window_contains(uint32_t phys) {
-    return phys < DIRTY_RAM_KERNEL_WINDOW_END
-        || phys >= OVERLAY_REGION_FLOOR
-        || dirty_ram_is_dirty(phys);
+    return phys < memory_get_ram_size() &&
+           (phys < DIRTY_RAM_KERNEL_WINDOW_END
+            || phys >= OVERLAY_REGION_FLOOR
+            || dirty_ram_is_dirty(phys));
 }
 uint32_t dirty_ram_get_bitmap(void);
 uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
@@ -199,12 +201,16 @@ typedef struct {
                           * is the evidence stream for interior-alias seeds. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
-/* Every aligned main-RAM word is a possible instruction PC.  Execution
+/* Every aligned word in the maximum main-RAM aperture is a possible
+ * instruction PC. Runtime producers/consumers still gate indices against
+ * memory_get_ram_size(), so retail sessions retain the 2 MiB address space.
+ * Execution
  * coverage only needs presence, not a hit count, so record it in a direct
  * bitmap instead of probing a large hash table for every retired instruction.
- * This covers all 524,288 RAM words (the old 262K-entry hash could saturate)
- * and is also the execution-verified seed source used by overlay_capture. */
-#define DIRTY_RAM_EXEC_WORD_COUNT   ((2u * 1024u * 1024u) / 4u)
+ * This covers all 2,097,152 developer-RAM words (the old 262K-entry hash
+ * could saturate) and is also the execution-verified seed source used by
+ * overlay_capture. */
+#define DIRTY_RAM_EXEC_WORD_COUNT   (PSX_MAIN_RAM_APERTURE_SIZE / 4u)
 #define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
 extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 /* Exact retired-instruction counts for the same coherent capture epoch. The
@@ -214,7 +220,8 @@ extern uint32_t g_dirty_ram_exec_pc_counts[DIRTY_RAM_EXEC_WORD_COUNT];
 /* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
  * guard; they clear that page's capture bits rather than serializing from the
  * universal store hot path. */
-#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS 16u
+#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS \
+    ((PSX_MAIN_RAM_APERTURE_SIZE / 4096u + 31u) / 32u)
 extern uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
 /* Presence-only companion for interpreted block/dispatch entries. The richer
  * counter table remains for telemetry, while capture can snapshot/reset this

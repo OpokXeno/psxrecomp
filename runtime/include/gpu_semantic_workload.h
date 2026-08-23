@@ -48,9 +48,17 @@ typedef enum GpuSemanticWorkloadMatchKind {
     GPU_SEMANTIC_WORKLOAD_MATCH_SNAPPED_UNKEYED,
 } GpuSemanticWorkloadMatchKind;
 
+typedef enum GpuSemanticWorkloadParticipation {
+    GPU_SEMANTIC_WORKLOAD_PARTICIPATION_UNKNOWN = 0,
+    GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT,
+    GPU_SEMANTIC_WORKLOAD_PARTICIPATION_TEMPORAL_PHASE,
+    GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY,
+} GpuSemanticWorkloadParticipation;
+
 typedef struct GpuSemanticWorkloadMatchInfo {
     GpuSemanticWorkloadMatchKind kind;
     GpuSemanticWorkloadMatchKind fallback_kind;
+    GpuSemanticWorkloadParticipation participation;
     size_t current_order;
     size_t previous_order;
     bool previous_order_valid;
@@ -130,6 +138,8 @@ typedef struct GpuSemanticWorkloadDiagnostics {
     uint64_t total_partial_incomplete_match_frames;
     size_t current_count;
     size_t previous_count;
+    size_t current_participating_count;
+    size_t previous_participating_count;
     size_t matched_count;
     size_t snapped_count;
     size_t ambiguous_count;
@@ -149,6 +159,8 @@ typedef struct GpuSemanticWorkloadDiagnostics {
     size_t retrospective_semitransparent_rejected;
     size_t last_seal_previous_count;
     size_t last_seal_current_count;
+    size_t last_seal_previous_participating_count;
+    size_t last_seal_current_participating_count;
     size_t last_seal_previous_unkeyed_count;
     size_t last_seal_current_unkeyed_count;
     size_t last_seal_matched_count;
@@ -180,6 +192,14 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_endpoint(
 GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
     const GpuRenderSemantic *semantic, unsigned int denominator,
     GpuRenderSemantic *out_phases, size_t phase_count);
+/* Temporal endpoints are retained in source history but never join the
+ * authoritative current surface. If every generated phase is culled, mark the
+ * just-recorded endpoint history-only before recording another semantic. */
+GpuSemanticWorkloadStatus gpu_semantic_workload_record_temporal_phases(
+    const GpuRenderSemantic *semantic, unsigned int denominator,
+    GpuRenderSemantic *out_phases, size_t phase_count);
+GpuSemanticWorkloadStatus
+gpu_semantic_workload_mark_last_temporal_history_only(void);
 GpuSemanticWorkloadStatus gpu_semantic_workload_record_anchors(
     const GpuRenderInterpolationVertexAnchor *anchors, size_t count);
 GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void);

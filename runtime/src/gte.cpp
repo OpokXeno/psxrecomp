@@ -1,6 +1,9 @@
 #include "gte.h"
 #include "cpu_state.h"
 #include "gte_attribution.h"
+#include "gte_native_provenance.h"
+#include "ram_provenance.h"
+#include "memory.h"
 #include "nd_intro_ot.h"
 #include "pgxp.h"
 #include <algorithm>
@@ -235,6 +238,473 @@ static uint32_t s_geom_miss_ambig = 0;   /* recorded, but not unambiguously    *
 static uint32_t s_speculative_depth = 0;
 static int s_speculative_timeline_invalidated = 0;
 
+struct NativeProjectionSlot {
+    GteNativeVertexProvenance vertex;
+    int32_t component_x_16_16;
+    int32_t component_y_16_16;
+    uint64_t x_receipt;
+    uint64_t y_receipt;
+    uint32_t generation;
+    uint8_t components;
+    uint8_t x_origin;
+    uint8_t y_origin;
+};
+
+enum {
+    NATIVE_PROJECTION_X = 1u << 0,
+    NATIVE_PROJECTION_Y = 1u << 1,
+    NATIVE_PROJECTION_ORIGIN_X = 1u,
+    NATIVE_PROJECTION_ORIGIN_Y = 2u,
+};
+
+static NativeProjectionSlot *s_native_projection_ram = nullptr;
+static size_t s_native_projection_ram_words = 0;
+static NativeProjectionSlot s_native_projection_gte[4];
+static NativeProjectionSlot s_native_projection_gpr[32];
+static uint64_t s_native_projection_receipt = 0;
+static uint32_t s_native_projection_generation = 1;
+static int s_native_projection_enabled = 0;
+extern "C" {
+int g_gte_native_provenance_active = 0;
+}
+
+static void native_projection_generation_advance(void) {
+    if (++s_native_projection_generation == 0) {
+        if (s_native_projection_ram)
+            std::memset(s_native_projection_ram, 0,
+                        s_native_projection_ram_words *
+                            sizeof(*s_native_projection_ram));
+        std::memset(s_native_projection_gte, 0,
+                    sizeof(s_native_projection_gte));
+        std::memset(s_native_projection_gpr, 0,
+                    sizeof(s_native_projection_gpr));
+        s_native_projection_generation = 1;
+    }
+}
+
+static NativeProjectionSlot *native_projection_ram_slot(uint32_t address) {
+    const uint32_t physical = address & 0x1fffffffu;
+
+    if ((physical & 3u) != 0u || physical >= PSX_MAIN_RAM_APERTURE_SIZE ||
+        s_native_projection_ram == nullptr)
+        return nullptr;
+    const size_t index = memory_main_ram_word_offset(physical) >> 2u;
+    return index < s_native_projection_ram_words
+        ? &s_native_projection_ram[index] : nullptr;
+}
+
+extern "C" void gte_native_provenance_set_enabled(int enabled) {
+    enabled = enabled ? 1 : 0;
+    const size_t words = (size_t)g_psx_ram_size / sizeof(uint32_t);
+    if (enabled && (s_native_projection_ram == nullptr ||
+                    s_native_projection_ram_words != words)) {
+        NativeProjectionSlot *slots = words != 0
+            ? (NativeProjectionSlot *)std::calloc(words, sizeof(*slots))
+            : nullptr;
+        if (slots == nullptr) enabled = 0;
+        else {
+            std::free(s_native_projection_ram);
+            s_native_projection_ram = slots;
+            s_native_projection_ram_words = words;
+            native_projection_generation_advance();
+        }
+    }
+    if (s_native_projection_enabled != enabled)
+        native_projection_generation_advance();
+    s_native_projection_enabled = enabled;
+    g_gte_native_provenance_active = enabled;
+}
+
+extern "C" void gte_native_provenance_invalidate_range(
+        uint32_t address, uint32_t width) {
+    if (!s_native_projection_enabled || s_speculative_depth != 0 || width == 0)
+        return;
+    const uint32_t first = address & ~3u;
+    const uint64_t last_byte = (uint64_t)address + width - 1u;
+    if (last_byte > UINT32_MAX) return;
+    const uint32_t last = (uint32_t)last_byte & ~3u;
+    for (uint32_t word = first;; word += 4u) {
+        NativeProjectionSlot *slot = native_projection_ram_slot(word);
+        if (slot && slot->generation == s_native_projection_generation) {
+            const uint64_t write_first = address > word ? address : word;
+            const uint64_t write_last = last_byte < (uint64_t)word + 3u
+                ? last_byte : (uint64_t)word + 3u;
+            if (write_first <= (uint64_t)word + 1u)
+                slot->components &= (uint8_t)~NATIVE_PROJECTION_X;
+            if (write_last >= (uint64_t)word + 2u)
+                slot->components &= (uint8_t)~NATIVE_PROJECTION_Y;
+            if (slot->components == 0u) slot->generation = 0;
+        }
+        if (word == last || word > UINT32_MAX - 4u) break;
+    }
+}
+
+extern "C" int gte_native_provenance_load(
+        uint32_t address, uint32_t packed_sxy,
+        GteNativeVertexProvenance *out) {
+    if (!s_native_projection_enabled || s_speculative_depth != 0 || out == nullptr)
+        return 0;
+    NativeProjectionSlot *slot = native_projection_ram_slot(address);
+    if (slot == nullptr || slot->generation != s_native_projection_generation ||
+        slot->vertex.packed_sxy != packed_sxy ||
+        slot->components != (NATIVE_PROJECTION_X | NATIVE_PROJECTION_Y) ||
+        slot->x_receipt == 0u || slot->x_receipt != slot->y_receipt)
+        return 0;
+    *out = slot->vertex;
+    out->x_16_16 = slot->component_x_16_16;
+    out->y_16_16 = slot->component_y_16_16;
+    out->receipt = slot->x_receipt;
+    out->projective_valid = out->projective_valid &&
+        slot->x_origin == NATIVE_PROJECTION_ORIGIN_X &&
+        slot->y_origin == NATIVE_PROJECTION_ORIGIN_Y;
+    return 1;
+}
+
+static int native_projection_slot_matches(const NativeProjectionSlot *slot,
+                                          uint32_t value) {
+    return slot != nullptr &&
+        slot->generation == s_native_projection_generation &&
+        slot->components != 0u &&
+        slot->vertex.packed_sxy == value;
+}
+
+static void native_projection_copy_or_kill(NativeProjectionSlot *destination,
+                                           const NativeProjectionSlot *source,
+                                           uint32_t value) {
+    if (destination == nullptr) return;
+    if (native_projection_slot_matches(source, value))
+        *destination = *source;
+    else
+        destination->generation = 0;
+}
+
+static uint32_t native_instruction_op(uint32_t instruction) {
+    return instruction >> 26u;
+}
+
+static uint32_t native_instruction_rs(uint32_t instruction) {
+    return (instruction >> 21u) & 31u;
+}
+
+static uint32_t native_instruction_rt(uint32_t instruction) {
+    return (instruction >> 16u) & 31u;
+}
+
+static uint32_t native_instruction_rd(uint32_t instruction) {
+    return (instruction >> 11u) & 31u;
+}
+
+extern "C" void gte_native_provenance_cpu_load(
+        CPUState *cpu, uint32_t instruction, uint32_t address,
+        uint32_t value) {
+    (void)cpu;
+    if (!s_native_projection_enabled || s_speculative_depth != 0) return;
+    const uint32_t rt = native_instruction_rt(instruction);
+    if (rt == 0u) return;
+    const uint32_t op = native_instruction_op(instruction);
+    if (op == 0x23u) {
+        native_projection_copy_or_kill(
+            &s_native_projection_gpr[rt],
+            native_projection_ram_slot(address & ~3u), value);
+    } else if (op == 0x21u || op == 0x25u) {
+        const NativeProjectionSlot *source =
+            native_projection_ram_slot(address & ~3u);
+        NativeProjectionSlot *destination = &s_native_projection_gpr[rt];
+        const uint8_t high = (address & 2u) != 0u;
+        const uint8_t component = high ? NATIVE_PROJECTION_Y : NATIVE_PROJECTION_X;
+        const uint16_t actual_half = (uint16_t)value;
+        const uint16_t source_half = high
+            ? (uint16_t)(source ? source->vertex.packed_sxy >> 16u : 0u)
+            : (uint16_t)(source ? source->vertex.packed_sxy : 0u);
+        if (source != nullptr &&
+            source->generation == s_native_projection_generation &&
+            (source->components & component) != 0u &&
+            actual_half == source_half) {
+            *destination = {};
+            destination->vertex = source->vertex;
+            destination->vertex.packed_sxy = value;
+            destination->component_x_16_16 = high
+                ? source->component_y_16_16 : source->component_x_16_16;
+            destination->x_receipt = high
+                ? source->y_receipt : source->x_receipt;
+            destination->generation = s_native_projection_generation;
+            destination->components = NATIVE_PROJECTION_X;
+            destination->x_origin = high ? source->y_origin : source->x_origin;
+        } else {
+            destination->generation = 0;
+        }
+    } else {
+        s_native_projection_gpr[rt].generation = 0;
+    }
+}
+
+extern "C" void gte_native_provenance_cpu_store(
+        CPUState *cpu, uint32_t instruction, uint32_t address,
+        uint32_t value) {
+    (void)cpu;
+    if (!s_native_projection_enabled || s_speculative_depth != 0) return;
+    NativeProjectionSlot *destination =
+        native_projection_ram_slot(address & ~3u);
+    const uint32_t op = native_instruction_op(instruction);
+    if (op == 0x2bu) {
+        const uint32_t rt = native_instruction_rt(instruction);
+        native_projection_copy_or_kill(
+            destination, rt != 0u ? &s_native_projection_gpr[rt] : nullptr,
+            value);
+    } else if (op == 0x29u && destination != nullptr) {
+        const uint32_t rt = native_instruction_rt(instruction);
+        const NativeProjectionSlot *source =
+            rt != 0u ? &s_native_projection_gpr[rt] : nullptr;
+        const uint8_t high = (address & 2u) != 0u;
+        if (destination->generation != s_native_projection_generation) {
+            *destination = {};
+            destination->generation = s_native_projection_generation;
+        }
+        if (source != nullptr &&
+            source->generation == s_native_projection_generation &&
+            (source->components & NATIVE_PROJECTION_X) != 0u &&
+            (uint16_t)source->vertex.packed_sxy == (uint16_t)value) {
+            if (high) {
+                destination->component_y_16_16 = source->component_x_16_16;
+                destination->y_receipt = source->x_receipt;
+                destination->y_origin = source->x_origin;
+                destination->components |= NATIVE_PROJECTION_Y;
+                destination->vertex.packed_sxy =
+                    (destination->vertex.packed_sxy & 0x0000ffffu) |
+                    ((value & 0xffffu) << 16u);
+            } else {
+                destination->component_x_16_16 = source->component_x_16_16;
+                destination->x_receipt = source->x_receipt;
+                destination->x_origin = source->x_origin;
+                destination->components |= NATIVE_PROJECTION_X;
+                destination->vertex.packed_sxy =
+                    (destination->vertex.packed_sxy & 0xffff0000u) |
+                    (value & 0xffffu);
+            }
+            destination->vertex.view_x = source->vertex.view_x;
+            destination->vertex.view_y = source->vertex.view_y;
+            destination->vertex.view_z = source->vertex.view_z;
+            destination->vertex.projection_offset_x_16_16 =
+                source->vertex.projection_offset_x_16_16;
+            destination->vertex.projection_offset_y_16_16 =
+                source->vertex.projection_offset_y_16_16;
+            destination->vertex.projection_distance =
+                source->vertex.projection_distance;
+            destination->vertex.depth = source->vertex.depth;
+            destination->vertex.projective_valid =
+                source->vertex.projective_valid;
+        }
+    } else if (destination != nullptr) {
+        destination->generation = 0;
+    }
+}
+
+extern "C" void gte_native_provenance_cpu_alu(
+        CPUState *cpu, uint32_t instruction, uint32_t result,
+        uint32_t source1, uint32_t source2) {
+    (void)cpu;
+    if (!s_native_projection_enabled || s_speculative_depth != 0) return;
+    const uint32_t op = native_instruction_op(instruction);
+    uint32_t destination;
+    const NativeProjectionSlot *source = nullptr;
+    if (op == 0u) {
+        destination = native_instruction_rd(instruction);
+        const uint32_t function = instruction & 63u;
+        const uint32_t rs = native_instruction_rs(instruction);
+        const uint32_t rt = native_instruction_rt(instruction);
+        NativeProjectionSlot *target =
+            destination != 0u ? &s_native_projection_gpr[destination] : nullptr;
+        if (target != nullptr &&
+            (function == 0x00u || function == 0x02u || function == 0x03u) &&
+            ((instruction >> 6u) & 31u) == 16u) {
+            const NativeProjectionSlot *shifted =
+                rt != 0u ? &s_native_projection_gpr[rt] : nullptr;
+            const NativeProjectionSlot shifted_value =
+                shifted != nullptr ? *shifted : NativeProjectionSlot{};
+            shifted = rt != 0u ? &shifted_value : nullptr;
+            *target = {};
+            if (shifted != nullptr &&
+                shifted->generation == s_native_projection_generation) {
+                target->vertex = shifted->vertex;
+                target->vertex.packed_sxy = result;
+                target->generation = s_native_projection_generation;
+                if (function == 0x00u &&
+                    (shifted->components & NATIVE_PROJECTION_X) != 0u) {
+                    target->component_y_16_16 = shifted->component_x_16_16;
+                    target->y_receipt = shifted->x_receipt;
+                    target->y_origin = shifted->x_origin;
+                    target->components = NATIVE_PROJECTION_Y;
+                } else if (function != 0x00u &&
+                           (shifted->components & NATIVE_PROJECTION_Y) != 0u) {
+                    target->component_x_16_16 = shifted->component_y_16_16;
+                    target->x_receipt = shifted->y_receipt;
+                    target->x_origin = shifted->y_origin;
+                    target->components = NATIVE_PROJECTION_X;
+                }
+            }
+            return;
+        }
+        if (target != nullptr && function == 0x25u && rs != 0u && rt != 0u) {
+            const NativeProjectionSlot left_value = s_native_projection_gpr[rs];
+            const NativeProjectionSlot right_value = s_native_projection_gpr[rt];
+            const NativeProjectionSlot *left = &left_value;
+            const NativeProjectionSlot *right = &right_value;
+            *target = {};
+            const NativeProjectionSlot *x_source = nullptr;
+            const NativeProjectionSlot *y_source = nullptr;
+            if (left->generation == s_native_projection_generation &&
+                (left->components & NATIVE_PROJECTION_X) != 0u &&
+                (source1 & 0xffffu) == (result & 0xffffu))
+                x_source = left;
+            else if (right->generation == s_native_projection_generation &&
+                     (right->components & NATIVE_PROJECTION_X) != 0u &&
+                     (source2 & 0xffffu) == (result & 0xffffu))
+                x_source = right;
+            if (left->generation == s_native_projection_generation &&
+                (left->components & NATIVE_PROJECTION_Y) != 0u &&
+                (source1 & 0xffff0000u) == (result & 0xffff0000u))
+                y_source = left;
+            else if (right->generation == s_native_projection_generation &&
+                     (right->components & NATIVE_PROJECTION_Y) != 0u &&
+                     (source2 & 0xffff0000u) == (result & 0xffff0000u))
+                y_source = right;
+            if (x_source != nullptr) {
+                target->vertex = x_source->vertex;
+                target->component_x_16_16 = x_source->component_x_16_16;
+                target->x_receipt = x_source->x_receipt;
+                target->x_origin = x_source->x_origin;
+                target->components |= NATIVE_PROJECTION_X;
+            }
+            if (y_source != nullptr) {
+                target->vertex = y_source->vertex;
+                target->component_y_16_16 = y_source->component_y_16_16;
+                target->y_receipt = y_source->y_receipt;
+                target->y_origin = y_source->y_origin;
+                target->components |= NATIVE_PROJECTION_Y;
+            }
+            if (target->components != 0u) {
+                target->vertex.packed_sxy = result;
+                target->generation = s_native_projection_generation;
+            }
+            return;
+        }
+        if ((function == 0x20u || function == 0x21u || function == 0x25u) &&
+            rt == 0u && rs != 0u)
+            source = &s_native_projection_gpr[rs];
+        else if ((function == 0x20u || function == 0x21u ||
+                  function == 0x25u) && rs == 0u && rt != 0u)
+            source = &s_native_projection_gpr[rt];
+    } else {
+        destination = native_instruction_rt(instruction);
+        if ((op == 0x08u || op == 0x09u || op == 0x0du) &&
+            (instruction & 0xffffu) == 0u) {
+            const uint32_t rs = native_instruction_rs(instruction);
+            if (rs != 0u) source = &s_native_projection_gpr[rs];
+        } else if ((op == 0x08u || op == 0x09u) &&
+                   native_instruction_rs(instruction) != 0u) {
+            NativeProjectionSlot *target =
+                destination != 0u ? &s_native_projection_gpr[destination]
+                                  : nullptr;
+            const NativeProjectionSlot *input =
+                &s_native_projection_gpr[native_instruction_rs(instruction)];
+            const int32_t immediate = (int16_t)(instruction & 0xffffu);
+            if (target != nullptr &&
+                input->generation == s_native_projection_generation &&
+                input->vertex.packed_sxy == source1 &&
+                (result & 0xffff0000u) == (source1 & 0xffff0000u)) {
+                *target = *input;
+                target->vertex.packed_sxy = result;
+                if ((target->components & NATIVE_PROJECTION_X) != 0u) {
+                    target->component_x_16_16 += immediate * INT32_C(65536);
+                    target->x_origin = 0u;
+                }
+                return;
+            }
+        }
+    }
+    if (destination != 0u)
+        native_projection_copy_or_kill(
+            &s_native_projection_gpr[destination], source, result);
+}
+
+extern "C" void gte_native_provenance_cpu_cop2(
+        CPUState *cpu, uint32_t instruction, uint32_t value,
+        uint32_t address) {
+    (void)cpu;
+    if (!s_native_projection_enabled || s_speculative_depth != 0) return;
+    const uint32_t op = native_instruction_op(instruction);
+    if (op == 0x32u) {
+        const uint32_t reg = native_instruction_rt(instruction);
+        if (reg >= 12u && reg <= 15u)
+            native_projection_copy_or_kill(
+                &s_native_projection_gte[reg - 12u],
+                native_projection_ram_slot(address), value);
+        return;
+    }
+    if (op != 0x12u) return;
+    const uint32_t transfer = native_instruction_rs(instruction);
+    const uint32_t rt = native_instruction_rt(instruction);
+    const uint32_t rd = native_instruction_rd(instruction);
+    if (transfer == 0u) {
+        if (rt != 0u && rd >= 12u && rd <= 15u)
+            native_projection_copy_or_kill(
+                &s_native_projection_gpr[rt],
+                &s_native_projection_gte[rd - 12u], value);
+        else if (rt != 0u)
+            s_native_projection_gpr[rt].generation = 0;
+    } else if (transfer == 4u && rd >= 12u && rd <= 14u) {
+        native_projection_copy_or_kill(
+            &s_native_projection_gte[rd - 12u],
+            rt != 0u ? &s_native_projection_gpr[rt] : nullptr, value);
+        if (rd == 14u) s_native_projection_gte[3] = s_native_projection_gte[2];
+    }
+}
+
+static void native_projection_push(
+        int32_t x_16_16, int32_t y_16_16, int32_t view_x,
+        int32_t view_y, int32_t view_z, int32_t offset_x_16_16,
+        int32_t offset_y_16_16, uint16_t distance, uint16_t depth,
+        uint32_t packed_sxy) {
+    if (!s_native_projection_enabled || s_speculative_depth != 0 ||
+        s_gte_replay_sandbox)
+        return;
+    s_native_projection_gte[0] = s_native_projection_gte[1];
+    s_native_projection_gte[1] = s_native_projection_gte[2];
+    NativeProjectionSlot *slot = &s_native_projection_gte[2];
+    uint64_t receipt = ++s_native_projection_receipt;
+    if (receipt == 0) receipt = ++s_native_projection_receipt;
+    slot->vertex = {};
+    slot->vertex.x_16_16 = x_16_16;
+    slot->vertex.y_16_16 = y_16_16;
+    slot->vertex.view_x = view_x;
+    slot->vertex.view_y = view_y;
+    slot->vertex.view_z = view_z;
+    slot->vertex.projection_offset_x_16_16 = offset_x_16_16;
+    slot->vertex.projection_offset_y_16_16 = offset_y_16_16;
+    slot->vertex.receipt = receipt;
+    slot->vertex.packed_sxy = packed_sxy;
+    slot->vertex.projection_distance = distance;
+    slot->vertex.depth = depth;
+    slot->vertex.projective_valid =
+        view_x >= -0x8000 && view_x <= 0x7fff &&
+        view_y >= -0x8000 && view_y <= 0x7fff && view_z > 0 &&
+        view_z <= 0xffff && (uint32_t)view_z * 2u > distance;
+    slot->component_x_16_16 = x_16_16;
+    slot->component_y_16_16 = y_16_16;
+    slot->x_receipt = receipt;
+    slot->y_receipt = receipt;
+    slot->generation = s_native_projection_generation;
+    slot->components = NATIVE_PROJECTION_X | NATIVE_PROJECTION_Y;
+    slot->x_origin = NATIVE_PROJECTION_ORIGIN_X;
+    slot->y_origin = NATIVE_PROJECTION_ORIGIN_Y;
+    s_native_projection_gte[3] = *slot;
+}
+
+static void native_projection_kill_gte_reg(uint8_t reg) {
+    if (reg >= 12u && reg <= 15u)
+        s_native_projection_gte[reg - 12u].generation = 0;
+}
+
 static void gte_geom_generation_advance(void) {
     if (++s_geom_generation == 0) {
         if (s_geom_cache)
@@ -249,11 +719,13 @@ extern "C" void gte_precision_timeline_invalidate(void) {
      * until the outer transaction ends so old provenance cannot be restored.
      * (pgxp_invalidate_all defers the same way behind its suppress bracket.) */
     pgxp_invalidate_all();
+    ram_provenance_reset();
     if (s_speculative_depth != 0) {
         s_speculative_timeline_invalidated = 1;
         return;
     }
     gte_geom_generation_advance();
+    native_projection_generation_advance();
 }
 
 extern "C" void gte_precision_speculative_begin(void) {
@@ -263,14 +735,17 @@ extern "C" void gte_precision_speculative_begin(void) {
      * rolled back afterwards: suppress all shadow recording so the shadows
      * still describe the restored timeline when the bracket closes. */
     pgxp_suppress_begin();
+    ram_provenance_speculative_begin();
 }
 
 extern "C" void gte_precision_speculative_end(void) {
     if (s_speculative_depth == 0) return;
     pgxp_suppress_end();
+    ram_provenance_speculative_end();
     if (--s_speculative_depth == 0) {
         if (s_speculative_timeline_invalidated) {
             gte_geom_generation_advance();
+            native_projection_generation_advance();
             s_speculative_timeline_invalidated = 0;
         }
     }
@@ -287,6 +762,17 @@ extern "C" void gte_precision_tracking_set(int enabled) {
 extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (s_gte_replay_sandbox || reg < 12 || reg > 15) return;
     pgxp_store_gte_reg(addr, reg);
+    if (s_native_projection_enabled && s_speculative_depth == 0) {
+        NativeProjectionSlot *destination = native_projection_ram_slot(addr);
+        const NativeProjectionSlot *source =
+            &s_native_projection_gte[reg - 12u];
+        if (destination != nullptr) {
+            if (source->generation == s_native_projection_generation)
+                *destination = *source;
+            else
+                destination->generation = 0;
+        }
+    }
 }
 
 /* Retired: plain-store invalidation is unnecessary under validate-on-read
@@ -908,6 +1394,12 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     if (!s_gte_replay_sandbox)
         pgxp_gte_push_sxy((int32_t)sx16, (int32_t)sy16, gte->SZ[3],
                           (uint32_t)gte->SXY[2]);
+    native_projection_push(
+        (int32_t)sx16, (int32_t)sy16,
+        static_cast<int32_t>(mac1 >> 12),
+        static_cast<int32_t>(mac2 >> 12),
+        static_cast<int32_t>(mac3 >> 12), gte->OFX, gte->OFY, gte->H,
+        gte->SZ[3], (uint32_t)gte->SXY[2]);
     geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
@@ -2058,8 +2550,10 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
          * drops those on next use. */
         case 12: case 13:
             cpu->gte_data[reg] = val;
-            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
+            if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
                 pgxp_gte_reg_written(reg, val);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(reg);
+            }
             break;
         case 14:
             cpu->gte_data[14] = val;
@@ -2067,6 +2561,8 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
             if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
                 pgxp_gte_reg_written(14, val);
                 pgxp_gte_reg_written(15, val);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(14);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(15);
             }
             break;
         case 15:
@@ -2077,6 +2573,10 @@ extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
             if (!PSXRecomp::GTE::s_gte_replay_sandbox) {
                 pgxp_gte_reg_written(14, val);
                 pgxp_gte_reg_written(15, val);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(12);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(13);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(14);
+                PSXRecomp::GTE::native_projection_kill_gte_reg(15);
             }
             break;
         case 23:

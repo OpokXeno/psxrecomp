@@ -133,9 +133,11 @@ if(BUILD_TESTING)
 
     add_executable(gte_register_access_test
         tests/test_gte_register_access.cpp
+        tests/memory_profile_test_globals.c
         src/gte.cpp
         src/gte_attribution.cpp
         src/pgxp.cpp
+        src/ram_provenance.c
     )
     target_include_directories(gte_register_access_test PRIVATE include)
     target_compile_definitions(gte_register_access_test PRIVATE
@@ -146,9 +148,11 @@ if(BUILD_TESTING)
 
     add_executable(gte_attribution_test
         tests/test_gte_attribution.cpp
+        tests/memory_profile_test_globals.c
         src/gte.cpp
         src/gte_attribution.cpp
-        src/pgxp.cpp)
+        src/pgxp.cpp
+        src/ram_provenance.c)
     target_include_directories(gte_attribution_test PRIVATE include)
     target_compile_definitions(gte_attribution_test PRIVATE
         PSX_NO_DEBUG_TOOLS=1
@@ -614,6 +618,7 @@ if(BUILD_TESTING)
 
     add_executable(gpu_gl_mask_order_test
         tests/test_gpu_gl_mask_order.c
+        tests/memory_profile_test_globals.c
         tests/native_render_baseline_gpu_test_double.c
         src/color_lut.c
         src/gpu.c
@@ -625,6 +630,7 @@ if(BUILD_TESTING)
         src/gpu_render.c
         src/gpu_semantic_workload.c
         src/pgxp.cpp
+        src/ram_provenance.c
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c
         src/gpu_gl_renderer.c)
@@ -648,6 +654,7 @@ if(BUILD_TESTING)
 
     add_executable(gpu_gl_peek_order_test
         tests/test_gpu_gl_peek_order.c
+        tests/memory_profile_test_globals.c
         tests/native_render_baseline_gpu_test_double.c
         src/color_lut.c
         src/gpu.c
@@ -682,6 +689,7 @@ if(BUILD_TESTING)
 
     add_executable(xg_render_gl_transaction_test
         tests/test_xg_render_gl_transaction.c
+        tests/memory_profile_test_globals.c
         tests/native_render_baseline_gpu_test_double.c
         src/color_lut.c
         src/gpu.c
@@ -776,6 +784,7 @@ if(BUILD_TESTING)
         src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/memory.c
+        src/ram_provenance.c
         src/pgxp.cpp
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c)
@@ -811,6 +820,7 @@ if(BUILD_TESTING)
         src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/memory.c
+        src/ram_provenance.c
         src/pgxp.cpp
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c)
@@ -849,6 +859,7 @@ if(BUILD_TESTING)
         src/guest_render_transaction.c
         src/gpu_sw_renderer.c
         src/memory.c
+        src/ram_provenance.c
         src/pgxp.cpp
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c)

@@ -107,6 +107,7 @@ int fail(const char *message, const std::filesystem::path &root) {
 }  // namespace
 
 extern "C" uint8_t *memory_get_ram_ptr(void) { return g_ram; }
+extern "C" uint32_t memory_get_ram_size(void) { return sizeof(g_ram); }
 extern "C" uint32_t dirty_ram_get_bitmap_word_count(void) {
     return DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS;
 }

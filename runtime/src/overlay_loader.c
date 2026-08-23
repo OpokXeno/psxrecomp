@@ -13,6 +13,7 @@
 #include "native_render_baseline.h"
 #include "overlay_posix.h"
 #include "xg_render_auth_runtime.h"
+#include "memory.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,7 +138,7 @@ static int       s_cand_n = 0;
  * scales catastrophically once a warmed cache contains hundreds of variant
  * DLLs. Index candidates by the 4 KiB RAM pages touched by their code ranges;
  * a continuation then examines only candidates that could contain its PC. */
-#define RANGE_PAGE_COUNT (2u * 1024u * 1024u / 4096u)
+#define RANGE_PAGE_COUNT (PSX_MAIN_RAM_APERTURE_SIZE / 4096u)
 #define RANGE_LINK_CAP   (CAND_CAP * 8)
 typedef struct { int cand, next; } RangeLink;
 static int       s_range_page_head[RANGE_PAGE_COUNT];
@@ -203,7 +204,7 @@ static uint32_t s_exact_entry_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 
 static void exact_entry_set(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    if (phys < memory_get_ram_size() && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         s_exact_entry_bitmap[word >> 5] |= 1u << (word & 31u);
     }
@@ -211,7 +212,7 @@ static void exact_entry_set(uint32_t phys) {
 
 static int exact_entry_has(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys >= 2u * 1024u * 1024u || (phys & 3u) != 0u) return 0;
+    if (phys >= memory_get_ram_size() || (phys & 3u) != 0u) return 0;
     uint32_t word = phys >> 2;
     return (s_exact_entry_bitmap[word >> 5] >> (word & 31u)) & 1u;
 }
@@ -708,8 +709,8 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
     for (uint32_t i = 0; i < count; i++) {
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0u || lo >= 2u * 1024u * 1024u ||
-            len > 2u * 1024u * 1024u - lo) {
+        uint32_t ram_size = memory_get_ram_size();
+        if (len == 0u || lo >= ram_size || len > ram_size - lo) {
             s_static_match_crc_misses++;
             return 0;
         }
@@ -795,7 +796,6 @@ typedef struct {
     int runtime_variant_present;
 } ManifestArtifact;
 
-#define OVERLAY_RAM_SIZE (2u * 1024u * 1024u)
 #define MANIFEST_LINE_MAX 160u
 #define MANIFEST_PHYSICAL_LINE_MAX 159u
 #define MANIFEST_PROVENANCE_PREFIX "# psxrecomp overlay provenance "
@@ -808,18 +808,19 @@ enum {
 };
 
 static int man_structurally_valid(const ManFn *m) {
+    uint32_t ram_size = memory_get_ram_size();
     if (!m || !m->has_crc || m->n < 1 || m->n > MAX_CODE_RANGES)
         return 0;
-    if ((m->entry & 0xFFE00000u) != 0x80000000u) return 0;
+    if ((m->entry & 0xFF800000u) != 0x80000000u) return 0;
     uint32_t entry = m->entry & 0x1FFFFFFFu;
-    if ((entry & 3u) != 0u || entry >= OVERLAY_RAM_SIZE) return 0;
+    if ((entry & 3u) != 0u || entry >= ram_size) return 0;
     int entry_covered = 0;
     for (int r = 0; r < m->n; r++) {
-        if ((m->lo[r] & 0xFFE00000u) != 0x80000000u) return 0;
+        if ((m->lo[r] & 0xFF800000u) != 0x80000000u) return 0;
         uint32_t lo = m->lo[r] & 0x1FFFFFFFu;
         uint32_t len = m->len[r];
         if ((lo & 3u) != 0u || (len & 3u) != 0u || len < 4u ||
-            lo >= OVERLAY_RAM_SIZE || len > OVERLAY_RAM_SIZE - lo)
+            lo >= ram_size || len > ram_size - lo)
             return 0;
         if (entry >= lo && entry - lo <= len - 4u) entry_covered = 1;
         for (int p = 0; p < r; p++) {
@@ -972,10 +973,11 @@ static ManFn *parse_manifest(const char *path, int *out_n,
                 manifest_hex_field(&cursor, 8, &parsed_size) &&
                 manifest_hex_field(&cursor, 8, &parsed_crc) &&
                 manifest_record_end(cursor) && !artifact_seen++ &&
-                (parsed_base & 0xFFE00000u) == 0x80000000u &&
+                (parsed_base & 0xFF800000u) == 0x80000000u &&
                 parsed_size > 0 &&
-                (parsed_base & 0x1FFFFFFFu) < OVERLAY_RAM_SIZE &&
-                parsed_size <= OVERLAY_RAM_SIZE - (parsed_base & 0x1FFFFFFFu)) {
+                (parsed_base & 0x1FFFFFFFu) < memory_get_ram_size() &&
+                parsed_size <= memory_get_ram_size() -
+                    (parsed_base & 0x1FFFFFFFu)) {
                 artifact.base = (uint32_t)parsed_base;
                 artifact.size = (uint32_t)parsed_size;
                 artifact.crc32 = (uint32_t)parsed_crc;
@@ -1040,8 +1042,8 @@ static ManFn *parse_manifest(const char *path, int *out_n,
         for (int r = 0; r < arr[i].n; r++) {
             uint32_t lo = arr[i].lo[r] & 0x1FFFFFFFu;
             uint64_t hi = (uint64_t)lo + arr[i].len[r];
-            if (lo >= OVERLAY_RAM_SIZE ||
-                arr[i].len[r] > OVERLAY_RAM_SIZE - lo)
+            if (lo >= memory_get_ram_size() ||
+                arr[i].len[r] > memory_get_ram_size() - lo)
                 invalid = 1;
             if ((uint64_t)entry >= lo && (uint64_t)entry < hi)
                 contains_entry = 1;
@@ -1093,7 +1095,7 @@ static int mips_control_kind(uint32_t instr) {
 static int ranges_contain_word(const uint32_t *lo_list,
                                const uint32_t *len_list, int n,
                                uint32_t phys) {
-    if ((phys & 3u) != 0u || phys > (2u * 1024u * 1024u) - 4u) return 0;
+    if ((phys & 3u) != 0u || phys > memory_get_ram_size() - 4u) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
         uint32_t len = len_list[r];
@@ -1109,7 +1111,7 @@ static int ranges_contain_word(const uint32_t *lo_list,
 static int ranges_delay_slots_hashed(const uint32_t *lo_list,
                                      const uint32_t *len_list, int n) {
     const uint8_t *ram = memory_get_ram_ptr();
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = memory_get_ram_size();
     if (!ram || n < 1 || n > MAX_CODE_RANGES) return 0;
     for (int r = 0; r < n; r++) {
         uint32_t lo = lo_list[r] & 0x1FFFFFFFu;
@@ -1365,6 +1367,7 @@ typedef struct {
     uint8_t manifest_ok;
     uint8_t load_failed;
     uint8_t loaded;
+    uint8_t renderer_authority_bound;
     int resident;
     int capacity_suppressed;
     char path[768];
@@ -1383,6 +1386,15 @@ static int cache_artifact_matches(const CacheEntry *entry,
            (entry->region_start & 0x1FFFFFFFu) ==
                (artifact->base & 0x1FFFFFFFu) &&
            entry->logical_crc == artifact->crc32;
+}
+
+static int manifest_renderer_authority_bound(
+    const CacheEntry *entry, int provenance, uint64_t pair_id,
+    int has_pair_id, const ManifestArtifact *artifact) {
+    return provenance == MANIFEST_PROVENANCE_AUTHORITY && has_pair_id &&
+           pair_id != 0u && artifact != NULL &&
+           artifact->runtime_variant_present &&
+           cache_artifact_matches(entry, artifact);
 }
 
 static int cache_entry_suppress_for_shortfall(int ci, int needed) {
@@ -1795,6 +1807,7 @@ static void rebuild_lazy_manifest_index(void) {
         s_cache_idx[ci].func_count = 0;
         s_cache_idx[ci].indexed_func_count = 0;
         s_cache_idx[ci].manifest_ok = 0;
+        s_cache_idx[ci].renderer_authority_bound = 0;
         char path[800];
         snprintf(path, sizeof(path), "%s", s_cache_idx[ci].path);
         size_t n = strlen(path);
@@ -1804,9 +1817,13 @@ static void rebuild_lazy_manifest_index(void) {
         snprintf(path + n - OVERLAY_SHARED_EXT_LEN,
                  sizeof(path) - (n - OVERLAY_SHARED_EXT_LEN), ".ranges");
         int man_n = 0;
+        uint64_t pair_id = 0;
+        int has_pair_id = 0;
+        int provenance = MANIFEST_PROVENANCE_AUTHORITY;
         PsxGameIdentity identity;
-        ManFn *man = parse_manifest(path, &man_n, NULL, NULL, NULL, &identity,
-                                    NULL);
+        ManifestArtifact artifact;
+        ManFn *man = parse_manifest(path, &man_n, &pair_id, &has_pair_id,
+                                    &provenance, &identity, &artifact);
         if (!man) {
             loader_log("invalid overlay manifest %s (cache entry %s)", path,
                        s_cache_idx[ci].path);
@@ -1817,6 +1834,9 @@ static void rebuild_lazy_manifest_index(void) {
             free(man);
             continue;
         }
+        s_cache_idx[ci].renderer_authority_bound =
+            (uint8_t)manifest_renderer_authority_bound(
+                &s_cache_idx[ci], provenance, pair_id, has_pair_id, &artifact);
         append_lazy_manifest_index(ci, man, man_n);
         free(man);
         if (s_lazy_man_overflow) break;
@@ -3391,6 +3411,11 @@ static int load_one_dll(const char *dll_path,
     if (cache_idx >= 0 && !s_cache_idx[cache_idx].manifest_ok &&
         psx_game_identity_gate(&manifest_identity))
         append_lazy_manifest_index(cache_idx, man, man_n);
+    if (cache_idx >= 0)
+        s_cache_idx[cache_idx].renderer_authority_bound =
+            (uint8_t)manifest_renderer_authority_bound(
+                &s_cache_idx[cache_idx], manifest_provenance, manifest_pair_id,
+                manifest_has_pair_id, &manifest_artifact);
     /* A complete known pair remains a zero-slot operation even when no new
      * bundle of this size can fit. Parse and compare before durably suppressing
      * the cache entry; otherwise safe aliases become unreachable at the cap. */
@@ -3409,9 +3434,9 @@ static int load_one_dll(const char *dll_path,
     }
     RendererProvenance renderer_provenance = { 0 };
     if (cache_idx >= 0 &&
-        manifest_provenance == MANIFEST_PROVENANCE_AUTHORITY &&
-        manifest_has_pair_id && manifest_pair_id != 0u &&
-        cache_artifact_matches(&s_cache_idx[cache_idx], &manifest_artifact)) {
+        manifest_renderer_authority_bound(
+            &s_cache_idx[cache_idx], manifest_provenance, manifest_pair_id,
+            manifest_has_pair_id, &manifest_artifact)) {
         renderer_provenance.identity = manifest_identity;
         renderer_provenance.pair_id = manifest_pair_id;
         renderer_provenance.artifact_base = manifest_artifact.base;
@@ -3651,6 +3676,8 @@ static int lazy_candidate_preferred(int li, int current) {
     const CacheEntry *a = &s_cache_idx[s_lazy_man[li].cache_idx];
     const CacheEntry *b = &s_cache_idx[s_lazy_man[current].cache_idx];
     if (a->tier != b->tier) return a->tier > b->tier;
+    if (a->renderer_authority_bound != b->renderer_authority_bound)
+        return a->renderer_authority_bound > b->renderer_authority_bound;
     if (a->mtime != b->mtime) return a->mtime > b->mtime;
     return strcmp(a->path, b->path) > 0;
 }
@@ -3664,6 +3691,8 @@ static int lazy_choose_complete_or_fallback(int complete, int fallback) {
     const CacheEntry *a = &s_cache_idx[s_lazy_man[complete].cache_idx];
     const CacheEntry *b = &s_cache_idx[s_lazy_man[fallback].cache_idx];
     if (a->tier != b->tier) return a->tier > b->tier ? complete : fallback;
+    if (a->renderer_authority_bound != b->renderer_authority_bound)
+        return a->renderer_authority_bound ? complete : fallback;
     return complete;
 }
 
@@ -3974,6 +4003,9 @@ static int overlay_find_by_range(uint32_t phys, uint32_t *mismatch_addr) {
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys < PSX_MAIN_RAM_APERTURE_SIZE &&
+        phys >= memory_get_ram_size())
+        return 0;
     /* Overlay dispatch is a no-op when the overlay loader is inactive
      * (overlay_cache=false): there are no candidates to match, so this must
      * return 0 (dispatch to interp). This guard is also a HARD SAFETY:
@@ -4522,7 +4554,7 @@ int overlay_fp_enabled(void) {
  * so the comparison isolates COMPUTATION (and is longjmp-safe). A divergence
  * here = a real codegen bug (function + exact register/RAM). Zero divergence =
  * computation is correct and the fault is timing/interrupt-ordering. */
-#define SHADOW_RAM_SIZE  (2u * 1024u * 1024u)
+#define SHADOW_RAM_SIZE  PSX_MAIN_RAM_APERTURE_SIZE
 #define SHADOW_SPAD_SIZE 1024u
 static uint8_t  s_ram0[SHADOW_RAM_SIZE], s_ramN[SHADOW_RAM_SIZE], s_ramI[SHADOW_RAM_SIZE];
 static uint8_t  s_spad0[SHADOW_SPAD_SIZE], s_spadI[SHADOW_SPAD_SIZE];
@@ -4575,6 +4607,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint64_t g_shadow_mmio_hits;
     uint8_t *ram  = memory_get_ram_ptr();
     uint8_t *spad = memory_get_scratchpad_ptr();
+    const uint32_t ram_size = memory_get_ram_size();
 
     extern uint64_t psx_exception_setjmp_epoch(void);
     s_in_shadow = 1;
@@ -4598,7 +4631,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     s_shadow_saved_native_exec = sv;    /* escape-fixup mirror (see decl) */
 
     CPUState cpu0 = *cpu;
-    memcpy(s_ram0,  ram,  SHADOW_RAM_SIZE);
+    memcpy(s_ram0,  ram,  ram_size);
     memcpy(s_spad0, spad, SHADOW_SPAD_SIZE);
 
     /* PASS 1 — INTERPRETER, the authoritative single execution, with the device
@@ -4630,11 +4663,11 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     /* Device-free: preserve the interp result, then run the NATIVE shard from the
      * same input and compare. No device I/O on either pass (proven clean above). */
     CPUState cpuI = *cpu;
-    memcpy(s_ramI,  ram,  SHADOW_RAM_SIZE);
+    memcpy(s_ramI,  ram,  ram_size);
     memcpy(s_spadI, spad, SHADOW_SPAD_SIZE);
 
     *cpu = cpu0;
-    memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
+    memcpy(ram,  s_ram0,  ram_size);
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     /* Arm the own-interior native route for the NATIVE pass only (see
@@ -4676,7 +4709,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     s_shadow_cand = NULL;
     gte_precision_speculative_end();
     CPUState cpuN = *cpu;
-    memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
+    memcpy(s_ramN, ram, ram_size);
     int scheduler_bail = s_shadow_scheduler_bail;
 
     /* Compare native (cpuN/s_ramN) vs interp (cpuI/s_ramI) under identical input. */
@@ -4684,8 +4717,8 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
     for (int r = 1; r < 32; r++) if (cpuN.gpr[r] != cpuI.gpr[r]) { reg = r; break; }
     int hidiff = (cpuN.hi != cpuI.hi), lodiff = (cpuN.lo != cpuI.lo);
     int64_t ramoff = -1;
-    if (memcmp(s_ramN, s_ramI, SHADOW_RAM_SIZE) != 0) {
-        for (uint32_t a = 0; a < SHADOW_RAM_SIZE; a++)
+    if (memcmp(s_ramN, s_ramI, ram_size) != 0) {
+        for (uint32_t a = 0; a < ram_size; a++)
             if (s_ramN[a] != s_ramI[a]) { ramoff = (int64_t)a; break; }
     }
     if (!scheduler_bail && reg < 0 && !hidiff && !lodiff && ramoff < 0) {
@@ -4741,7 +4774,7 @@ static void run_shadow_diff_legacy(CPUState *cpu, Candidate *c, uint32_t addr) {
      * A bail raised by the shadow run must never leak into live execution (a
      * spurious in-progress unwind wedges the guest). */
     *cpu = cpuI;
-    memcpy(ram,  s_ramI,  SHADOW_RAM_SIZE);
+    memcpy(ram,  s_ramI,  ram_size);
     memcpy(spad, s_spadI, SHADOW_SPAD_SIZE);
     g_psx_call_bail = 0;
     s_native_exec  = sv;

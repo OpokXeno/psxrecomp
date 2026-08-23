@@ -180,7 +180,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | Drive the same Xenogears debug-overlay action functions used by its widgets; unavailable in Release builds |
 | `quit` | ✓ |   | — | Shutdown native runtime |
 | `overlay_toggle` | ✓ |   | — | **Native:** flip the in-game developer debug overlay visibility flag (Debug builds only). Same purpose as the Ctrl+F3 hotkey — exists so tests can drive the flag without key injection. On Release builds the API is a static-inline no-op, so the call is harmless and the response always reports `visible:false`. Response: `{"id":N,"ok":true,"visible":true\|false}` |
-| `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | **Native:** invoke one of the in-window debug overlay widget's action functions (the same code path a checkbox / button / slider click would call). Lets a remote client assert the TOGGLES section is wired to the real runtime setters without synthesizing real mouse clicks (which is impossible over TCP). Does NOT bypass the action path — it calls the same function the widget calls. `name` is one of: `texfilter`, `native_wide`, `aspect_set`, `bd_stretch_on`, `bd_stretch_pct`, `interp`, `supersampling`, `antialiasing`, `screen_model`, `turbo_loads`, `spu_hq`, `window_width`, `dump_event_ring`, `dump_latency_ring`, `dump_starv_ring`, `teleport`, `party_slot`, `party_bitfield`, `gold`, `write_var`, `force_battle`, `camera_write`, `event_jump`, `read_field_id`. `value` and `value2` are interpreted per the name; see the per-name section below. `dump_*` actions ignore both. Response: `{"id":N,"ok":true,"name":"...","value":N,"value2":M}` on success, `{"id":N,"ok":false,"err":"unknown name"}` on bad name. **Debug builds only; Release compiles the command to a static-inline `-1` return.** |
+| `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | **Native:** invoke one of the in-window debug overlay widget's action functions (the same code path a checkbox / button / slider click would call). Lets a remote client assert the TOGGLES section is wired to the real runtime setters without synthesizing real mouse clicks (which is impossible over TCP). Does NOT bypass the action path — it calls the same function the widget calls. `name` is one of: `texfilter`, `native_wide`, `developer_mode`, `kernel_menu`, `aspect_set`, `bd_stretch_on`, `bd_stretch_pct`, `interp`, `supersampling`, `antialiasing`, `screen_model`, `turbo_loads`, `spu_hq`, `window_width`, `dump_event_ring`, `dump_latency_ring`, `dump_starv_ring`, `teleport`, `party_slot`, `party_bitfield`, `gold`, `write_var`, `force_battle`, `camera_write`, `event_jump`, `read_field_id`. `value` and `value2` are interpreted per the name; see the per-name section below. `dump_*` actions ignore both. Response: `{"id":N,"ok":true,"name":"...","value":N,"value2":M}` on success, `{"id":N,"ok":false,"err":"unknown name"}` on bad name. **Debug builds only; Release compiles the command to a static-inline `-1` return.** |
 
 ¹ Native `vram_peek` is the legacy name; DS calls it `read_vram`. Same semantics.  
 ² The `pc_*` family is specific to the DS oracle: DuckStation's CPU core honours `CPU::AddBreakpointWithCallback`, while our native runtime dispatches whole recompiled functions (no mid-function PC breaks).
@@ -503,6 +503,23 @@ the new value; that round-trip is the test contract (see
 - `{"cmd":"overlay_widget_action","name":"native_wide","value":2}` →
   engages native-wide (2), squash (1), or off (0). Same path as the
   Native-wide radio / buttons.
+- `{"cmd":"overlay_widget_action","name":"developer_mode","value":1}`
+  enables the 8 MiB developer RAM profile and writes zero to the development
+  word at `0x80010000` without leaving the current module. Value 0 is rejected.
+- `{"cmd":"overlay_widget_action","name":"kernel_menu","value":1}` queues
+  the Kernel Menu transition independently of the active RAM profile. At the
+  first normal `psx_check_interrupts()` block edge after `VSync`, with the
+  VBlank exception fully unwound, it calls
+  `ChangeGameState(0)` and performs a structured scheduler escape to
+  `MainLoop(0)`. This avoids leaving `in_exception` latched, returning into the
+  interrupted module with changed state, or longjmping through host C++
+  presentation frames. The game then enters its native Kernel Menu. Field and
+  Battle load their debug overlays at `0x80280000` only when Developer Mode is
+  active. Value 0 is rejected.
+- `{"cmd":"overlay_widget_action","name":"swap_controller_ports","value":1}`
+  swaps the current local Controller 1 and Controller 2 device routes, including
+  pad mode and rumble ownership. It is rejected during input replay or netplay;
+  value 0 is also rejected.
 - `{"cmd":"overlay_widget_action","name":"aspect_set","value":16,"value2":9}`
   → sets widescreen aspect to 16:9 via `gte_set_display_aspect`.
 - `{"cmd":"overlay_widget_action","name":"bd_stretch_on","value":1}` and

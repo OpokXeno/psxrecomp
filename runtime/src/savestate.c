@@ -515,7 +515,7 @@ int savestate_read_slot(int slot, uint8_t** data_out, size_t* size_out) {
     if (!f) return 0;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
     sz = ftell(f);
-    if (sz <= 0 || (size_t)sz > 8u * 1024u * 1024u) { fclose(f); return 0; }
+    if (sz <= 0 || (size_t)sz > 128u * 1024u * 1024u) { fclose(f); return 0; }
     if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
     buf = (uint8_t*)malloc((size_t)sz);
     if (!buf) { fclose(f); return 0; }
@@ -633,7 +633,7 @@ int savestate_request_load_blob_protocol(const void* data, size_t size) {
         fprintf(stderr, "savestate: load_blob — not configured\n");
         return 0;
     }
-    if (!data || size == 0 || size > 64u * 1024u * 1024u)
+    if (!data || size == 0 || size > 128u * 1024u * 1024u)
         return 0;
     if (!psx_hle_scheduler_enabled()) {
         fprintf(stderr, "savestate: load_blob requires the HLE scheduler\n");

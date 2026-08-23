@@ -676,7 +676,7 @@ NON_AUTHORITY_MANIFEST_PROVENANCES = {
 HOSTED_MANIFEST_MARKER = (
     f'# psxrecomp overlay provenance {HOSTED_MANIFEST_PROVENANCE}')
 HOSTED_UNIQUE_GUARDED_BYTE_CAP = 1024 * 1024
-PSX_RAM_SIZE = 2 * 1024 * 1024
+PSX_RAM_SIZE = 8 * 1024 * 1024
 
 
 class ShardCandidateCapacityError(RuntimeError):
@@ -2917,7 +2917,7 @@ def parse_runtime_shard_manifest(manifest: str,
             except ValueError:
                 return invalid_result
             physical_base = base & 0x1FFFFFFF
-            if (base & 0xFFE00000) != 0x80000000 or size <= 0 or \
+            if (base & 0xFF800000) != 0x80000000 or size <= 0 or \
                     physical_base >= PSX_RAM_SIZE or \
                     size > PSX_RAM_SIZE - physical_base:
                 return invalid_result
@@ -4209,7 +4209,9 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
         # content-matches each function, so a fragment is just another DLL for
         # this region_start.
         key = fragment_shard_key(frag_ids, manifest_provenance)
-        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}{overlay_ext()}')
+        dll_path = os.path.join(
+            cache_dir,
+            f'{phys_addr:08X}_{artifact[2]:08X}_{key:08X}{overlay_ext()}')
         retained_c = os.path.join(cache_dir, f'{key:08X}_fragment_patched.c')
         if not args.force:
             cache_status = cached_shard_manifest_status(
@@ -5783,8 +5785,15 @@ def main():
         load_addr = int(cap['load_addr'], 16)
         size      = int(cap['size'])
         data      = base64.b64decode(cap['bytes_b64'])
+        phys_addr = load_addr & 0x1FFFFFFF
+        if (size <= 0 or len(data) != size or phys_addr >= PSX_RAM_SIZE or
+                size > PSX_RAM_SIZE - phys_addr):
+            stats.add_fail(
+                f'overlay 0x{load_addr:08X}', 'invalid-capture',
+                f'capture exceeds the 8 MiB RAM aperture: '
+                f'phys=0x{phys_addr:X} size={size} bytes={len(data)}')
+            return
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
-        phys_addr = (load_addr & 0x1FFFFFFF)
         plan      = source_observation_plan(args, data, load_addr)
         runtime_identity = runtime_variant_manifest_identity(
             args, data, load_addr)
@@ -6427,8 +6436,8 @@ def main():
                 else:
                     fragment_dll = os.path.join(
                         cache_dir,
-                        f'{phys_addr:08X}_{fragment_shard_key(frag_ids):08X}'
-                        f'{overlay_ext()}')
+                        f'{phys_addr:08X}_{binascii.crc32(data) & 0xFFFFFFFF:08X}_'
+                        f'{fragment_shard_key(frag_ids):08X}{overlay_ext()}')
                     publish_live_shard(fragment_dll)
                     stats.add_ok()
                 for ev, _cc, ranges in frag_ids:
@@ -6441,8 +6450,8 @@ def main():
                 if job.get('resident_cap'):
                     fragment_dll = os.path.join(
                         cache_dir,
-                        f'{phys_addr:08X}_{fragment_shard_key(frag_ids):08X}'
-                        f'{overlay_ext()}')
+                        f'{phys_addr:08X}_{binascii.crc32(data) & 0xFFFFFFFF:08X}_'
+                        f'{fragment_shard_key(frag_ids):08X}{overlay_ext()}')
                     reconcile_bios_resident_marker(
                         fragment_dll, job['resident_cap'], status == 'built')
 
@@ -6630,7 +6639,7 @@ def main():
                 else:
                     fragment_dll = os.path.join(
                         cache_dir,
-                        f'{phys_addr:08X}_'
+                        f'{phys_addr:08X}_{region_crc:08X}_'
                         f'{fragment_shard_key(frag_ids, provenance):08X}'
                         f'{overlay_ext()}')
                     publish_live_shard(fragment_dll)
@@ -6645,7 +6654,7 @@ def main():
                 if job.get('resident_cap'):
                     fragment_dll = os.path.join(
                         cache_dir,
-                        f'{phys_addr:08X}_'
+                        f'{phys_addr:08X}_{region_crc:08X}_'
                         f'{fragment_shard_key(frag_ids, provenance):08X}'
                         f'{overlay_ext()}')
                     reconcile_bios_resident_marker(

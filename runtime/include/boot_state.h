@@ -40,16 +40,17 @@ extern "C" {
  * v3 = little-endian field wire (portable Win/Linux/macOS ARM);
  * v4 = v3 + optional zlib on large sections (section pad bit0 = compressed);
  * v5 = v4 + CD-ROM Sub-Q replacement state;
- * v6 = v5 + exact game and manifest SHA-256 identities. */
-#define BOOT_STATE_VERSION 6u
+ * v6 = v5 + exact game and manifest SHA-256 identities;
+ * v7 = v6 + explicit active main-RAM size and profile. */
+#define BOOT_STATE_VERSION 7u
 /* Only the current complete wire format is accepted. */
-#define BOOT_STATE_VERSION_MIN_READ 6u
+#define BOOT_STATE_VERSION_MIN_READ 7u
 /* Section pad bit0: payload is u32 LE uncompressed_len + zlib deflate bytes. */
 #define BOOT_STATE_SEC_ZLIB 1u
 
 /*
- * On-disk header (v6): the original nine little-endian uint32 fields at offset
- * 0 (36 bytes), followed by the game and manifest SHA-256 identities (64
+ * On-disk header (v7): ten little-endian uint32 fields at offset 0 (40 bytes),
+ * followed by the game and manifest SHA-256 identities (64
  * bytes), then the section stream. ALL key fields must match the running build
  * or the snapshot is rejected. Do not fwrite() this struct — use pst_wire.
  */
@@ -62,18 +63,23 @@ typedef struct {
     uint32_t codegen_hash;   /* PSX_OVERLAY_CODEGEN_HASH (auto-gen by cmake)      */
     int32_t  abi_tag;        /* PSX_OVERLAY_ABI_TAG (abi version | flavor<<16)    */
     uint32_t codegen_ver;    /* PSX_OVERLAY_CODEGEN_VER                           */
+    uint32_t section_count;  /* number of sections that follow                    */
+    uint32_t ram_size;       /* active main RAM bytes (2 MiB or 8 MiB)             */
+    uint32_t ram_profile;    /* BOOT_STATE_RAM_PROFILE_*                           */
     uint8_t  game_sha256[32];
     uint8_t  manifest_sha256[32];
-    /* ---- layout ---- */
-    uint32_t section_count;  /* number of sections that follow                    */
-    uint32_t reserved;       /* 0                                                 */
 } BootStateHeader;
 
-#define BOOT_STATE_GAME_IDENTITY_OFFSET 36u
-#define BOOT_STATE_HEADER_WIRE_BYTES 100u
+enum {
+    BOOT_STATE_RAM_PROFILE_RETAIL = 0u,
+    BOOT_STATE_RAM_PROFILE_DEVELOPER = 1u,
+};
+
+#define BOOT_STATE_GAME_IDENTITY_OFFSET 40u
+#define BOOT_STATE_HEADER_WIRE_BYTES 104u
 
 /*
- * Section stream (v6): section_count records, each laid out as
+ * Section stream (v7): section_count records, each laid out as
  *     uint32_t tag;        LE (one of BS_SEC_*)
  *     uint32_t pad;        LE flags (BOOT_STATE_SEC_ZLIB optional)
  *     uint64_t len;        LE payload byte count
@@ -84,7 +90,7 @@ typedef struct {
  */
 enum {
     BS_SEC_CPU    = 0x01,  /* CPUState: gpr/pc/hi/lo/cop0/gte_data/gte_ctrl       */
-    BS_SEC_RAM    = 0x02,  /* 2 MB main RAM                                       */
+    BS_SEC_RAM    = 0x02,  /* active 2 MiB or 8 MiB main RAM                       */
     BS_SEC_SPAD   = 0x03,  /* 1 KB scratchpad                                     */
     BS_SEC_IRQ    = 0x04,  /* i_stat / i_mask / cycles_since_vblank (12B; 8B ok)  */
     BS_SEC_TIMER  = 0x05,  /* 3 root counters (counter/mode/target/irq/frac)      */

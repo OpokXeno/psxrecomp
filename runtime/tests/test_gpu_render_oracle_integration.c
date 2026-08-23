@@ -3,6 +3,8 @@
 #include "dma.h"
 #include "gpu.h"
 #include "guest_render_native_stream.h"
+#include "gte_native_provenance.h"
+#include "ram_provenance.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -21,6 +23,9 @@ GpuRenderOracleResult gpu_render_oracle_capture_snapshot(GpuRenderOracleSnapshot
 GpuRenderOracleResult gpu_render_oracle_capture_read_event(uint64_t index,
                                                             GpuRenderOracleEvent *out);
 extern void psx_write_word(uint32_t address, uint32_t value);
+extern void test_gte_native_provenance_clear(void);
+extern void test_gte_native_provenance_seed(uint32_t address, uint32_t packed,
+                                            uint64_t receipt);
 
 void psx_xg_render_auth_note_code_write(uint64_t previous_generation,
                                         uint64_t next_generation,
@@ -975,6 +980,125 @@ static int test_native_unbound_submission_rejects_software_backend(void) {
     return 1;
 }
 
+static int test_native_gte_polygon_preflight_is_complete_and_fail_closed(void) {
+    const uint32_t base = UINT32_C(0x00001840);
+    const GpuRenderOracleSource source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+        base, base / 4u, UINT32_C(0x00001800) / 4u,
+    };
+    const uint32_t polygon[] = {
+        UINT32_C(0x200000ff), xy(10u, 10u), xy(20u, 10u), xy(10u, 20u),
+    };
+    GpuNativePacketStreamSnapshot reservation;
+
+    gpu_init();
+    guest_render_native_stream_set_enabled(true);
+    gte_native_provenance_set_enabled(1);
+    test_gte_native_provenance_clear();
+    for (uint32_t vertex = 0u; vertex < 3u; ++vertex)
+        test_gte_native_provenance_seed(
+            base + 4u + vertex * 4u, polygon[1u + vertex], vertex + 1u);
+
+    REQUIRE(gpu_native_preflight_reservation_begin());
+    REQUIRE(gpu_native_preflight_gp0_packet(
+        polygon, sizeof(polygon) / sizeof(polygon[0]), &source));
+    REQUIRE(gpu_native_preflight_reservation_seal());
+    REQUIRE(gpu_native_packet_stream_snapshot(&reservation));
+    REQUIRE(reservation.reservation_phase == 2u &&
+            reservation.reservation_count == 1u);
+    gpu_native_preflight_reservation_abort();
+
+    test_gte_native_provenance_clear();
+    test_gte_native_provenance_seed(base + 4u, polygon[1], 1u);
+    test_gte_native_provenance_seed(base + 8u, polygon[2], 2u);
+    REQUIRE(gpu_native_preflight_reservation_begin());
+    REQUIRE(!gpu_native_preflight_gp0_packet(
+        polygon, sizeof(polygon) / sizeof(polygon[0]), &source));
+    REQUIRE(gpu_native_packet_stream_snapshot(&reservation));
+    REQUIRE(reservation.reservation_phase == 1u &&
+            reservation.reservation_count == 0u);
+    gpu_native_preflight_reservation_abort();
+
+    test_gte_native_provenance_clear();
+    gte_native_provenance_set_enabled(0);
+    guest_render_native_stream_set_enabled(false);
+    return 1;
+}
+
+static void write_cpu_word(uint32_t address, uint32_t value) {
+    psx_write_word(address, value);
+    ram_provenance_note_cpu_store(UINT32_C(0xac000000), address, value);
+}
+
+static int test_native_cpu_dma_publication_is_complete_and_fail_closed(void) {
+    const uint32_t incoming = UINT32_C(0x000017fc);
+    const uint32_t container = UINT32_C(0x00001800);
+    const uint32_t base = container + 4u;
+    const uint32_t polygon[] = {
+        UINT32_C(0x200000ff), xy(10u, 10u), xy(20u, 10u), xy(10u, 20u),
+    };
+    GpuRenderOracleSource source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+        base, base / 4u, container / 4u,
+    };
+    GpuNativePacketStreamSnapshot reservation;
+
+    gpu_init();
+    guest_render_native_stream_set_enabled(true);
+    gte_native_provenance_set_enabled(0);
+    REQUIRE(ram_provenance_init(UINT32_C(2) * 1024u * 1024u));
+    ram_provenance_set_cpu_tracking(true);
+    write_cpu_word(container, UINT32_C(0x04ffffff));
+    for (uint32_t index = 0u; index < 4u; ++index)
+        write_cpu_word(base + index * 4u, polygon[index]);
+    write_cpu_word(incoming, container);
+
+    gpu_native_preflight_set_dma_publication(0u, false, 0u);
+    REQUIRE(gpu_native_preflight_reservation_begin());
+    REQUIRE(!gpu_native_preflight_gp0_packet(
+        polygon, sizeof(polygon) / sizeof(polygon[0]), &source));
+    gpu_native_preflight_reservation_abort();
+
+    {
+        const uint64_t transaction_receipt = ram_provenance_publish_event();
+        REQUIRE(transaction_receipt != 0u);
+        gpu_native_preflight_set_dma_publication(
+            incoming, true, transaction_receipt);
+    }
+    REQUIRE(gpu_native_preflight_reservation_begin());
+    REQUIRE(gpu_native_preflight_gp0_packet(
+        polygon, sizeof(polygon) / sizeof(polygon[0]), &source));
+    REQUIRE(gpu_native_preflight_reservation_seal());
+
+    write_cpu_word(base + 8u, polygon[2]);
+    for (uint32_t index = 0u; index < 3u; ++index) {
+        GpuRenderOracleSource word_source = source;
+        word_source.word_address = base + index * 4u;
+        word_source.word_ordinal = word_source.word_address / 4u;
+        REQUIRE(gpu_native_submit_gp0_word(polygon[index], &word_source));
+    }
+    {
+        GpuRenderOracleSource word_source = source;
+        word_source.word_address = base + 12u;
+        word_source.word_ordinal = word_source.word_address / 4u;
+        REQUIRE(!gpu_native_submit_gp0_word(polygon[3], &word_source));
+    }
+    REQUIRE(gpu_native_packet_stream_snapshot(&reservation));
+    REQUIRE(reservation.reservation_consume_status == 4u);
+    gpu_native_packet_stream_reset();
+
+    gpu_native_preflight_set_dma_publication(
+        incoming, true, ram_provenance_publish_event());
+    REQUIRE(gpu_native_preflight_reservation_begin());
+    REQUIRE(gpu_native_preflight_gp0_packet(
+        polygon, sizeof(polygon) / sizeof(polygon[0]), &source));
+    gpu_native_preflight_reservation_abort();
+
+    ram_provenance_set_cpu_tracking(false);
+    guest_render_native_stream_set_enabled(false);
+    return 1;
+}
+
 static int test_native_unbound_routes_reject_software_backend(void) {
     const uint32_t address = UINT32_C(0x001fff80);
     GpuRenderOracleSource source = {
@@ -1044,6 +1168,8 @@ int main(void) {
                     test_mmio_upload_overflow_and_trailing_preflight() &&
                     test_reserved_ft4_rejects_mutation_and_releases_atomically() &&
                     test_exact_a0_dma_then_attributed_mmio_ft4() &&
+                    test_native_gte_polygon_preflight_is_complete_and_fail_closed() &&
+                    test_native_cpu_dma_publication_is_complete_and_fail_closed() &&
                     test_native_unbound_submission_rejects_software_backend() &&
                     test_native_unbound_routes_reject_software_backend() &&
                     test_native_mmio_submission_finalizes_before_preflight()

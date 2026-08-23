@@ -20,6 +20,9 @@
 #include "gpu_vram_dirty.h"
 #include "gpu_render.h"
 #include "guest_render_native_stream.h"
+#include "gte_native_provenance.h"
+#include "ram_provenance.h"
+#include "memory.h"
 #include "text_xlate.h"
 #include "crash_trace.h"
 #include "debug_server.h"
@@ -5802,10 +5805,10 @@ static int native_semantic_material(
     out->texture_depth = (GpuRenderTextureDepth)encoded_depth;
     out->clut_x = clut_x;
     out->clut_y = clut_y;
-    out->draw_area_left = environment->draw.left;
-    out->draw_area_top = environment->draw.top;
-    out->draw_area_right = environment->draw.right;
-    out->draw_area_bottom = environment->draw.bottom;
+    out->draw_area_left = environment->draw.left & UINT16_C(0x03ff);
+    out->draw_area_top = environment->draw.top & UINT16_C(0x01ff);
+    out->draw_area_right = environment->draw.right & UINT16_C(0x03ff);
+    out->draw_area_bottom = environment->draw.bottom & UINT16_C(0x01ff);
     out->draw_offset_x = environment->draw.offset_x;
     out->draw_offset_y = environment->draw.offset_y;
     out->texture_window_mask_x = environment->draw.texture_window_mask_x;
@@ -6612,6 +6615,7 @@ static uint32_t native_packet_rgb555_to_rgb888(uint16_t color) {
 static void native_stream_fail(const char *operation,
                                uint64_t command_id,
                                int status);
+static void gpu_note_semantic_current(const GpuRenderSemantic *semantic);
 
 static int native_packet_draw_line_segment(
         int32_t x0, int32_t y0, uint16_t color0,
@@ -6644,8 +6648,10 @@ static int native_packet_draw_line_segment(
         native_packet_rgb555_to_rgb888(color1));
     native_semantic_stamp_retrospective_scene(&semantic);
     status = gr_stream_barrier();
-    if (status == GPU_RENDER_TRANSACTION_OK)
+    if (status == GPU_RENDER_TRANSACTION_OK) {
+        gpu_note_semantic_current(&semantic);
         status = gr_draw_semantic_immediate(&semantic);
+    }
     if (status != GPU_RENDER_TRANSACTION_OK) return 0;
     guest_render_native_stream_note_native_line_segment();
     return 1;
@@ -6788,15 +6794,294 @@ static int native_packet_vram_to_cpu(const uint32_t *words, size_t word_count) {
     return 1;
 }
 
+static uint8_t native_gte_polygon_xy_indices(uint8_t opcode,
+                                             uint8_t out_indices[4]) {
+    uint8_t stride;
+    uint8_t vertex_count;
+
+    if (opcode < 0x20u || opcode > 0x3fu || out_indices == NULL) return 0u;
+    vertex_count = (opcode & 0x08u) != 0u ? 4u : 3u;
+    if (opcode < 0x30u)
+        stride = (opcode & 0x04u) != 0u ? 2u : 1u;
+    else
+        stride = (opcode & 0x04u) != 0u ? 3u : 2u;
+    for (uint8_t vertex = 0u; vertex < vertex_count; ++vertex)
+        out_indices[vertex] = (uint8_t)(1u + vertex * stride);
+    return vertex_count;
+}
+
+static void native_gte_semantic_apply_vertex(
+        GpuRenderSemanticVertex *target,
+        const GteNativeVertexProvenance *source) {
+    const int64_t native_x = (int64_t)source->x_16_16 +
+        (int64_t)ws_native_view_offset() * INT64_C(65536);
+
+    if (source->projective_valid) {
+        target->native_view_x =
+            native_x >= INT32_MIN && native_x <= INT32_MAX
+                ? (int32_t)native_x : source->x_16_16;
+        target->native_view_y = source->y_16_16;
+        target->native_view_position =
+            native_x >= INT32_MIN && native_x <= INT32_MAX;
+    } else {
+        target->native_view_position = 0u;
+    }
+    target->projective_view_x = source->view_x;
+    target->projective_view_y = source->view_y;
+    target->projective_view_z = source->view_z;
+    target->projective_offset_x = source->projection_offset_x_16_16;
+    target->projective_offset_y = source->projection_offset_y_16_16;
+    target->projective_native_offset_x =
+        ws_native_view_offset() * INT32_C(65536);
+    target->projective_native_offset_y = 0;
+    target->projective_distance = source->projection_distance;
+    target->projective_position = source->projective_valid;
+    target->temporal_depth = source->depth;
+    target->temporal_depth_valid = source->depth != 0u;
+}
+
+static int native_gte_polygon_bind(
+        const uint32_t *words, size_t word_count,
+        const GpuRenderOracleSource *source,
+        const GpuNativeDrawEnvironment *environment,
+        GpuRenderSemantic *out_semantic, uint8_t out_xy_indices[4],
+        uint64_t out_receipts[4], uint8_t *out_vertex_count) {
+    GteNativeVertexProvenance vertices[4];
+    uint8_t xy_indices[4];
+    uint8_t matched_vertices = 0u;
+    uint8_t projective_vertices = 0u;
+    uint8_t vertex_count;
+    uint8_t opcode;
+
+    if (words == NULL || source == NULL || environment == NULL ||
+        out_semantic == NULL || out_xy_indices == NULL ||
+        out_receipts == NULL || out_vertex_count == NULL || word_count == 0u ||
+        source->kind == GPU_RENDER_ORACLE_SOURCE_UNKNOWN ||
+        source->kind == GPU_RENDER_ORACLE_SOURCE_MMIO ||
+        source->word_address == UINT32_MAX)
+        return 0;
+    opcode = (uint8_t)(words[0] >> 24u);
+    vertex_count = native_gte_polygon_xy_indices(opcode, xy_indices);
+    if (vertex_count == 0u ||
+        native_packet_semantic_from_gp0(
+            words, word_count, environment, out_semantic) != 1)
+        return 0;
+    for (uint8_t vertex = 0u; vertex < vertex_count; ++vertex) {
+        const uint8_t word_index = xy_indices[vertex];
+        const uint32_t address =
+            (source->word_address + (uint32_t)word_index * 4u) &
+            memory_get_ram_word_mask();
+        if ((size_t)word_index >= word_count ||
+            !gte_native_provenance_load(
+                address, words[word_index], &vertices[vertex]))
+            continue;
+        ++matched_vertices;
+        if (vertices[vertex].projective_valid) ++projective_vertices;
+        out_xy_indices[vertex] = word_index;
+        out_receipts[vertex] = vertices[vertex].receipt;
+    }
+    if (matched_vertices != vertex_count) {
+        guest_render_native_stream_note_gte_binding(
+            opcode, matched_vertices, projective_vertices, vertex_count, false);
+        return 0;
+    }
+
+    out_semantic->screen_space_2d = GPU_RENDER_SCREEN_SPACE_2D_NONE;
+    out_semantic->native_view_effect = GPU_RENDER_NATIVE_VIEW_EFFECT_NONE;
+    if (vertex_count == 3u) {
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            native_gte_semantic_apply_vertex(
+                &out_semantic->triangles[0].vertices[vertex],
+                &vertices[vertex]);
+    } else {
+        static const uint8_t split_vertices[2][3] = {
+            {0u, 1u, 2u}, {2u, 1u, 3u},
+        };
+        for (uint8_t triangle = 0u; triangle < 2u; ++triangle)
+            for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+                native_gte_semantic_apply_vertex(
+                    &out_semantic->triangles[triangle].vertices[vertex],
+                    &vertices[split_vertices[triangle][vertex]]);
+    }
+    *out_vertex_count = vertex_count;
+    guest_render_native_stream_note_gte_binding(
+        opcode, matched_vertices, projective_vertices, vertex_count, true);
+    return 1;
+}
+
+#define GPU_NATIVE_CPU_CANONICAL_MAX_WORDS 16u
+
+static struct {
+    uint32_t incoming_link_address;
+    uint64_t transaction_receipt;
+    bool incoming_link_valid;
+} native_dma_publication;
+
+void gpu_native_preflight_set_dma_publication(
+        uint32_t incoming_link_address, bool incoming_link_valid,
+        uint64_t transaction_receipt) {
+    native_dma_publication.incoming_link_address = incoming_link_address;
+    native_dma_publication.incoming_link_valid = incoming_link_valid;
+    native_dma_publication.transaction_receipt = transaction_receipt;
+}
+
 typedef struct GpuNativePreflightReservation {
     GuestRenderNativeStreamCommandIdentity identity;
     GpuRenderTransactionId visual_id;
     GpuRenderSemantic semantic;
     GpuRenderSemantic packet_semantic;
     uint64_t packet_hash;
+    uint64_t gte_receipts[4];
+    uint64_t cpu_word_receipts[GPU_NATIVE_CPU_CANONICAL_MAX_WORDS];
+    uint64_t cpu_container_receipt;
+    uint64_t cpu_incoming_link_receipt;
+    uint32_t cpu_container_value;
+    uint32_t cpu_incoming_link_value;
+    uint32_t cpu_incoming_link_address;
+    uint8_t gte_xy_word_indices[4];
+    uint8_t gte_vertex_count;
     bool resolved_miss;
+    bool gte_bound;
+    bool cpu_canonical_bound;
+    bool cpu_container_valid;
+    bool cpu_incoming_link_valid;
     bool packet_fallback;
 } GpuNativePreflightReservation;
+
+static int native_cpu_canonical_bind(
+        const uint32_t *words, size_t word_count,
+        const GpuRenderOracleSource *source, uint64_t *out_word_receipts,
+        uint64_t *out_container_receipt,
+        uint64_t *out_incoming_link_receipt,
+        uint32_t *out_container_value, uint32_t *out_incoming_link_value) {
+    uint64_t incoming_receipt;
+    uint64_t container_receipt;
+    uint32_t incoming_value;
+    uint32_t container_value;
+    uint32_t container_address;
+
+    if (words == NULL || source == NULL || out_word_receipts == NULL ||
+        out_container_receipt == NULL || out_incoming_link_receipt == NULL ||
+        out_container_value == NULL || out_incoming_link_value == NULL ||
+        word_count == 0u ||
+        word_count > GPU_NATIVE_CPU_CANONICAL_MAX_WORDS ||
+        (source->kind != GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST &&
+         source->kind != GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK &&
+         source->kind != GPU_RENDER_ORACLE_SOURCE_DMA2_BURST) ||
+        native_dma_publication.transaction_receipt == 0u ||
+        source->word_address == UINT32_MAX ||
+        source->container_ordinal > UINT32_MAX / sizeof(uint32_t))
+        return 0;
+
+    container_address =
+        (uint32_t)(source->container_ordinal * sizeof(uint32_t));
+    incoming_receipt = 0u;
+    incoming_value = 0u;
+    container_receipt = 0u;
+    container_value = 0u;
+    if (source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST) {
+        if (native_dma_publication.incoming_link_valid) {
+            incoming_value = psx_read_word(
+                native_dma_publication.incoming_link_address);
+            if ((incoming_value & UINT32_C(0x00ffffff)) ==
+                    UINT32_C(0x00ffffff) ||
+                psx_mod_gpu_dma_resolve_address(
+                    incoming_value & UINT32_C(0x00ffffff)) !=
+                    container_address ||
+                !ram_provenance_cpu_word_receipt(
+                    native_dma_publication.incoming_link_address,
+                    incoming_value,
+                    &incoming_receipt) ||
+                incoming_receipt >= native_dma_publication.transaction_receipt)
+                return 0;
+        }
+        container_value = psx_read_word(container_address);
+        if (!ram_provenance_word_revision(
+                container_address, &container_receipt) ||
+            container_receipt >= native_dma_publication.transaction_receipt)
+            return 0;
+    }
+    for (size_t index = 0u; index < word_count; ++index) {
+        const uint32_t address = source->word_address + (uint32_t)index * 4u;
+        if (psx_read_word(address) != words[index] ||
+            !ram_provenance_word_revision(
+                address, &out_word_receipts[index]) ||
+            out_word_receipts[index] >=
+                native_dma_publication.transaction_receipt)
+            return 0;
+    }
+    *out_container_receipt = container_receipt;
+    *out_incoming_link_receipt = incoming_receipt;
+    *out_container_value = container_value;
+    *out_incoming_link_value = incoming_value;
+    return 1;
+}
+
+static int native_cpu_canonical_revalidate(
+        const uint32_t *words, size_t word_count,
+        const GuestRenderNativeStreamCommandIdentity *identity,
+        const GpuNativePreflightReservation *reservation) {
+    uint64_t receipt;
+    uint32_t value;
+
+    if (words == NULL || identity == NULL || reservation == NULL ||
+        word_count == 0u ||
+        word_count > GPU_NATIVE_CPU_CANONICAL_MAX_WORDS ||
+        identity->command_id > UINT32_MAX ||
+        identity->container_id > UINT32_MAX)
+        return 0;
+    if (reservation->cpu_incoming_link_valid) {
+        value = psx_read_word(reservation->cpu_incoming_link_address);
+        if (value != reservation->cpu_incoming_link_value ||
+            !ram_provenance_cpu_word_receipt(
+                reservation->cpu_incoming_link_address, value, &receipt) ||
+            receipt != reservation->cpu_incoming_link_receipt ||
+            psx_mod_gpu_dma_resolve_address(
+                value & UINT32_C(0x00ffffff)) !=
+                (uint32_t)identity->container_id)
+            return 0;
+    }
+    if (reservation->cpu_container_valid) {
+        value = psx_read_word((uint32_t)identity->container_id);
+        if (value != reservation->cpu_container_value ||
+            !ram_provenance_word_revision(
+                (uint32_t)identity->container_id, &receipt) ||
+            receipt != reservation->cpu_container_receipt)
+            return 0;
+    }
+    for (size_t index = 0u; index < word_count; ++index) {
+        const uint32_t address =
+            (uint32_t)identity->command_id + (uint32_t)index * 4u;
+        if (!ram_provenance_word_revision(address, &receipt) ||
+            receipt != reservation->cpu_word_receipts[index])
+            return 0;
+    }
+    return 1;
+}
+
+static int native_gte_polygon_revalidate(
+        const uint32_t *words, size_t word_count,
+        const GuestRenderNativeStreamCommandIdentity *identity,
+        const GpuNativePreflightReservation *reservation) {
+    if (words == NULL || identity == NULL || reservation == NULL ||
+        reservation->gte_vertex_count == 0u ||
+        identity->command_id > UINT32_MAX)
+        return 0;
+    for (uint8_t vertex = 0u;
+         vertex < reservation->gte_vertex_count; ++vertex) {
+        GteNativeVertexProvenance provenance;
+        const uint8_t word_index = reservation->gte_xy_word_indices[vertex];
+        const uint32_t address =
+            ((uint32_t)identity->command_id + (uint32_t)word_index * 4u) &
+            memory_get_ram_word_mask();
+        if ((size_t)word_index >= word_count ||
+            !gte_native_provenance_load(
+                address, words[word_index], &provenance) ||
+            provenance.receipt != reservation->gte_receipts[vertex])
+            return 0;
+    }
+    return 1;
+}
 
 static struct {
     GpuNativePreflightReservation *entries;
@@ -6898,15 +7183,26 @@ void gpu_native_preflight_reservation_abort(void) {
 static int native_preflight_reservation_append(
         const GuestRenderNativeStreamCommandIdentity *identity,
         const uint32_t *words, size_t word_count,
+        const GpuRenderOracleSource *source,
         const GpuNativeDrawEnvironment *environment) {
     GpuNativePreflightReservation *entry;
     GpuNativePreflightReservation *entries;
     GpuRenderTransactionId visual_id;
     GpuRenderSemantic semantic;
     GpuRenderSemantic packet_semantic;
+    uint64_t gte_receipts[4] = {0};
+    uint64_t cpu_word_receipts[GPU_NATIVE_CPU_CANONICAL_MAX_WORDS] = {0};
+    uint64_t cpu_container_receipt = 0u;
+    uint64_t cpu_incoming_link_receipt = 0u;
+    uint32_t cpu_container_value = 0u;
+    uint32_t cpu_incoming_link_value = 0u;
+    uint8_t gte_xy_indices[4] = {0};
+    uint8_t gte_vertex_count = 0u;
     uint64_t packet_hash;
     GuestRenderNativeStreamStatus reserve_status;
     bool resolved_miss = false;
+    bool gte_bound = false;
+    bool cpu_canonical_bound = false;
     bool packet_fallback = false;
 
     if (native_preflight_reservations.phase != 1) return 0;
@@ -6927,6 +7223,24 @@ static int native_preflight_reservation_append(
             identity, &packet_semantic, &visual_id, &semantic)) {
         reserve_status = GUEST_RENDER_NATIVE_STREAM_OK;
         resolved_miss = true;
+    }
+    if (reserve_status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND &&
+        native_gte_polygon_bind(
+            words, word_count, source, environment, &semantic,
+            gte_xy_indices, gte_receipts, &gte_vertex_count)) {
+        reserve_status = GUEST_RENDER_NATIVE_STREAM_OK;
+        gte_bound = true;
+        memset(&visual_id, 0, sizeof(visual_id));
+    }
+    if (reserve_status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND &&
+        native_cpu_canonical_bind(
+            words, word_count, source, cpu_word_receipts,
+            &cpu_container_receipt, &cpu_incoming_link_receipt,
+            &cpu_container_value, &cpu_incoming_link_value)) {
+        semantic = packet_semantic;
+        reserve_status = GUEST_RENDER_NATIVE_STREAM_OK;
+        cpu_canonical_bound = true;
+        memset(&visual_id, 0, sizeof(visual_id));
     }
     if (reserve_status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND &&
         native_packet_fallback_is_supported(
@@ -6957,7 +7271,26 @@ static int native_preflight_reservation_append(
         entry->semantic = semantic;
     }
     entry->packet_hash = packet_hash;
+    memcpy(entry->gte_receipts, gte_receipts, sizeof(gte_receipts));
+    memcpy(entry->gte_xy_word_indices, gte_xy_indices,
+           sizeof(gte_xy_indices));
+    memcpy(entry->cpu_word_receipts, cpu_word_receipts,
+           sizeof(cpu_word_receipts));
+    entry->cpu_container_receipt = cpu_container_receipt;
+    entry->cpu_incoming_link_receipt = cpu_incoming_link_receipt;
+    entry->cpu_container_value = cpu_container_value;
+    entry->cpu_incoming_link_value = cpu_incoming_link_value;
+    entry->cpu_incoming_link_address =
+        native_dma_publication.incoming_link_address;
+    entry->gte_vertex_count = gte_vertex_count;
     entry->resolved_miss = resolved_miss;
+    entry->gte_bound = gte_bound;
+    entry->cpu_canonical_bound = cpu_canonical_bound;
+    entry->cpu_container_valid = cpu_canonical_bound &&
+        source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST;
+    entry->cpu_incoming_link_valid = cpu_canonical_bound &&
+        source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST &&
+        native_dma_publication.incoming_link_valid;
     entry->packet_fallback = packet_fallback;
     return 1;
 }
@@ -6997,7 +7330,7 @@ int gpu_native_preflight_gp0_packet(
         identity = native_command_identity(opcode, word_count, source, 1);
         if (native_preflight_reservations.phase == 1) {
             result = native_preflight_reservation_append(
-                &identity, words, word_count,
+                &identity, words, word_count, source,
                 &native_preflight_reservations.environment);
         } else {
             gpu_native_environment_get(&environment);
@@ -7135,8 +7468,12 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                     &render_semantic);
             if (render_semantic.line_count != 0u) {
                 render_status = gr_stream_barrier();
-                if (render_status == GPU_RENDER_TRANSACTION_OK)
+                if (render_status == GPU_RENDER_TRANSACTION_OK) {
+                    render_semantic.submission_command_id = source != NULL
+                        ? source->word_address : 0u;
+                    gpu_note_semantic_current(&render_semantic);
                     render_status = gr_draw_semantic_immediate(&render_semantic);
+                }
                 supported = render_status == GPU_RENDER_TRANSACTION_OK;
             }
             if (supported && render_semantic.line_count != 0u) {
@@ -7184,8 +7521,12 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
     if (supported) native_semantic_stamp_retrospective_scene(&semantic);
     if (supported && semantic.triangle_count != 0u) {
             render_status = gr_stream_barrier();
-            if (render_status == GPU_RENDER_TRANSACTION_OK)
+            if (render_status == GPU_RENDER_TRANSACTION_OK) {
+                semantic.submission_command_id = source != NULL
+                    ? source->word_address : 0u;
+                gpu_note_semantic_current(&semantic);
                 render_status = gr_draw_semantic_immediate(&semantic);
+            }
             supported = render_status == GPU_RENDER_TRANSACTION_OK;
         }
     } else if (supported) {
@@ -7215,9 +7556,20 @@ static struct {
     int active;
 } native_packet_stream;
 static void (*gpu_submission_hook)(void);
+static void (*gpu_semantic_current_hook)(const GpuRenderSemantic *semantic);
 
 void gpu_set_submission_hook(void (*hook)(void)) {
     gpu_submission_hook = hook;
+}
+
+void gpu_set_semantic_current_hook(
+        void (*hook)(const GpuRenderSemantic *semantic)) {
+    gpu_semantic_current_hook = hook;
+}
+
+static void gpu_note_semantic_current(const GpuRenderSemantic *semantic) {
+    if (gpu_semantic_current_hook != NULL)
+        gpu_semantic_current_hook(semantic);
 }
 
 void gpu_prepare_submission(void) {
@@ -7327,12 +7679,13 @@ static int native_preflight_reservation_consume(
         const uint32_t *words, size_t word_count,
         GpuRenderTransactionId *out_visual_id,
         GpuRenderSemantic *out_semantic,
-        bool *out_packet_fallback) {
+        bool *out_packet_fallback, bool *out_class_bound) {
     GpuNativePreflightReservation *entry;
     uint64_t actual_hash = native_packet_hash(words, word_count);
 
-    if (out_packet_fallback == NULL) return 0;
+    if (out_packet_fallback == NULL || out_class_bound == NULL) return 0;
     *out_packet_fallback = false;
+    *out_class_bound = false;
     if (native_preflight_reservations.phase != 2 ||
         native_preflight_reservations.consumed >=
             native_preflight_reservations.count) {
@@ -7358,6 +7711,22 @@ static int native_preflight_reservation_consume(
     }
     if (entry->packet_fallback) {
         *out_packet_fallback = true;
+    } else if (entry->gte_bound) {
+        if (!native_gte_polygon_revalidate(
+                words, word_count, identity, entry)) {
+            native_preflight_reservations.last_consume_status = 4u;
+            return 0;
+        }
+        *out_semantic = entry->semantic;
+        *out_class_bound = true;
+    } else if (entry->cpu_canonical_bound) {
+        if (!native_cpu_canonical_revalidate(
+                words, word_count, identity, entry)) {
+            native_preflight_reservations.last_consume_status = 4u;
+            return 0;
+        }
+        *out_semantic = entry->semantic;
+        *out_class_bound = true;
     } else if (entry->resolved_miss) {
         *out_semantic = entry->semantic;
         if (guest_render_native_stream_note_resolved_consumed(
@@ -7394,6 +7763,7 @@ static int native_packet_stream_finish(void) {
     GpuNativeDrawEnvironment environment;
     const GpuRenderSemantic *bound = NULL;
     bool packet_fallback = false;
+    bool class_bound = false;
     int result = 0;
 
     identity = native_command_identity(
@@ -7413,7 +7783,7 @@ static int native_packet_stream_finish(void) {
         if (native_preflight_reservation_consume(
                 &identity, native_packet_stream.words,
                 native_packet_stream.count, &visual_id,
-                &bound_semantic, &packet_fallback)) {
+                &bound_semantic, &packet_fallback, &class_bound)) {
             if (!packet_fallback) bound = &bound_semantic;
         }
     } else {
@@ -7433,8 +7803,10 @@ static int native_packet_stream_finish(void) {
         }
     }
     if (bound != NULL) {
-        native_packet_bound_visual_id = visual_id;
-        native_packet_bound_visual_valid = true;
+        if (!class_bound) {
+            native_packet_bound_visual_id = visual_id;
+            native_packet_bound_visual_valid = true;
+        }
         result = gpu_native_submit_gp0_packet(
             native_packet_stream.words, native_packet_stream.count,
             bound, &native_packet_stream.source);
@@ -7459,6 +7831,7 @@ static int native_packet_stream_finish(void) {
 int gpu_native_submit_gp0_word(uint32_t word,
                                const GpuRenderOracleSource *source) {
     int fixed_words;
+    int result;
 
     if (!source) return 0;
     if (!native_packet_stream.active &&
@@ -7535,7 +7908,8 @@ int gpu_native_submit_gp0_word(uint32_t word,
             g_debug_last_store_pc, g_debug_current_func_addr, debug_guest_ra());
         return 1;
     }
-    return native_packet_stream_finish();
+    result = native_packet_stream_finish();
+    return result;
 }
 
 uint16_t gpu_vram_peek(int x, int y) {
@@ -7890,8 +8264,11 @@ static int native_stream_render_generic_command(void) {
             gp0_cmd_buf, gp0_words_collected, &environment, &semantic) != 1)
         return 0;
     status = gr_stream_barrier();
-    if (status == GPU_RENDER_TRANSACTION_OK)
+    if (status == GPU_RENDER_TRANSACTION_OK) {
+        semantic.submission_command_id = native_stream_command.command_id;
+        gpu_note_semantic_current(&semantic);
         status = gr_draw_semantic_immediate(&semantic);
+    }
     return status == GPU_RENDER_TRANSACTION_OK;
 }
 
@@ -7918,9 +8295,13 @@ static int native_stream_finish_command(void) {
         return 1;
     }
     render_status = gr_stream_barrier();
-    if (render_status == GPU_RENDER_TRANSACTION_OK)
+    if (render_status == GPU_RENDER_TRANSACTION_OK) {
+        native_stream_command.semantic.submission_command_id =
+            native_stream_command.command_id;
+        gpu_note_semantic_current(&native_stream_command.semantic);
         render_status = gr_draw_semantic_immediate(
             &native_stream_command.semantic);
+    }
     if (render_status != GPU_RENDER_TRANSACTION_OK) {
         native_stream_fail("draw", native_stream_command.command_id,
                            render_status);

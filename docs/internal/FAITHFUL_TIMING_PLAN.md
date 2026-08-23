@@ -213,6 +213,93 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-23 (Native early-producer lifecycle closes unbound coverage):**
+  The early FT4 constructors at `0x8007A7F4`/`0x8007AA44` and zoom
+  initializer at `0x800A663C` now authenticate their complete 592/296/744-byte
+  code ranges in guest RAM, then require the exact entry-SP, writer sequence,
+  packet destinations, saved return address, and commit/return site before
+  publishing a scene-scoped producer generation. The two FT4 constructors
+  materialize normal `overlay_ft4_state` records from their completed packets;
+  zoom reuses its existing sidecar. All resources register byte-accurate memory
+  watches and code mutation invalidates both pending and published authority.
+  This path remains independent of loader authority and does not enable the
+  writer-FT4 resolver. Regressions cover valid lifecycle, missing writer, wrong
+  SP, wrong RA, wrong range hash, and stale generation. Two isolated 6,023-
+  VBlank replays (pass77/pass78), followed by final-source pass79 after review,
+  agree exactly: status PASS, zero unbound,
+  packet-derived, or unsupported packets, 1,442,143 producer-bound draws, 1,171
+  midpoint presents, 2,475,562 position-changed vertices presented, zero
+  midpoint formula failures/cancellations/rejections/disarms, no semantic
+  overflow, and accepted static/runtime authentication. Evidence:
+  `build.dbg/xg-take7-history-provenance-pass77.json`,
+  `build.dbg/xg-take7-history-provenance-pass78.json`, and
+  `build.dbg/xg-take7-history-provenance-pass79.json`.
+- **2026-08-23 (Native runtime authority and visual-frame participation):**
+  Runtime-variant authentication now defers a warm canonical hook until the
+  authenticated runtime artifact reaches its exact activation/entry/capture/
+  return sequence, ignores unrelated IRQ hooks while awaiting entry, and does
+  not disarm an idle authenticated fallback when a stale loader shard reports a
+  mismatch. The authoritative 6,023-VBlank replay now completes with 786 exact
+  proofs, zero rejected events, zero disarms, and zero midpoint cancellations.
+  The semantic workload also distinguishes authoritative current primitives
+  from history-only endpoints and phase-only retirement geometry when deciding
+  whether a VBlank contains a new visual frame. This prevents non-current
+  records from replacing the last displayed endpoint or perpetuating current-
+  frame presentation debt. Pass74 records 1,078 real midpoint presents,
+  2,405,294 position-changed vertices presented, zero formula failures, and
+  accepted static/runtime authentication. Native missing bindings fell from
+  53,462 to 95. The remaining packets are 63 opcode-2C and 32 opcode-2E draws
+  from early, unauthenticated artifacts at writers `0x8007A9F4`, `0x8007AB2C`,
+  and `0x800A6884`; the canonical replay deliberately disables the writer-FT4
+  fallback, so they remain blocked pending artifact-backed producer capture
+  rather than being allowlisted by address. A replay-isolated capture produced
+  19 fragments; the active `0x80070000`, `0x8007F000`, `0x80083000`,
+  `0x80088000`, and `0x8009E000` shards match their corresponding ranges in
+  `field5_runtime.bin` byte for byte. The remaining blocker is therefore proof
+  sequencing: these producers emit before the canonical lifecycle publishes
+  dynamic authority. Evidence: `build.dbg/xg-take7-history-provenance-pass74.json`
+  and `/tmp/opencode/xg-pass76-overlay-captures.json`.
+- **2026-08-22 (Native 30/original overlay target):** The debug overlay's
+  Native semantic target now offers `30 FPS (Original)` alongside 60/120/240.
+  The shared renderer setter represents 30 as denominator 1 with zero
+  interpolation phases, bypasses midpoint workload collection, and emits one
+  authoritative current present per call. Returning from 30 with active
+  Native-wide surfaces reuses the permanent phase-0 FBO and allocates only
+  extra phases. The existing 60/120/240 interpolation scheduler and eligibility
+  policy are unchanged. The focused OpenGL sequence test and full Xenogears
+  debug build pass.
+- **2026-08-21 (debug controller port swap):** The debug overlay can now swap
+  the current local Controller 1 and Controller 2 routes for native development
+  interfaces that read port 2. Device, pad mode and rumble ownership move
+  together; both old pad states are released at the boundary, one-player
+  configurations continue sampling port 2 while swapped, and deterministic
+  replay/netplay sessions reject the action.
+- **2026-08-21 (independent Kernel Menu action):** The native Kernel Menu action
+  no longer depends on the 8 MiB developer RAM profile in the overlay, TCP
+  action validation, or transition consumer. Developer Mode remains a separate
+  one-way RAM-profile action; Field and Battle use their development overlays
+  only when that profile was enabled explicitly.
+- **2026-08-21 (Xenogears developer BREAK marker):** The runtime now consumes
+  `break 0x400` only while the explicit 8 MiB developer profile is active,
+  advancing to the next guest instruction. Battle and other development modules
+  execute this marker every frame when `0x80010000 != 0xffffffff` and expect
+  execution to continue at the following instruction. All other BREAK codes and
+  retail-profile occurrences remain fatal.
+- **2026-08-21 (VBlank continues during exception dispatch):** Removed the stale
+  `in_exception` veto from scheduled VBlank generation. CPU cycles and timers
+  already advanced while synchronous guest handlers ran, so suppressing only
+  VBlank could deadlock a handler that re-enabled IEc and waited for the next
+  edge; `cycles_since_vblank` then grew without bound while Timer2 remained
+  pending. Hardware-visible VBlank now raises on its guest-cycle deadline, with
+  CPU delivery still governed by COP0 SR and the existing bounded nested-IRQ
+  checks, as required by `CYCLE_TIMING_ARCH.md`.
+- **2026-08-21 (runtime-profile-aware DMA main RAM):** DMA channels 0-6 now
+  derive main-RAM word wrapping, transfer caps, and contiguous host spans from
+  the active memory profile. Retail retains 2 MiB folding; developer mode
+  preserves addresses through the 8 MiB aperture, including GPU linked-list
+  provenance and CD DMA capture/executable marking. The runtime, focused GPU
+  DMA aperture test, render-oracle integration test, and render-slot
+  substitution test build and pass.
 - **2026-08-20 (Xenogears widescreen current/midpoint handoff):** The OpenGL
   textured-batch path can now retain compatible render state from the current
   phase into the first midpoint phase in Native 16:9. The handoff preserves the

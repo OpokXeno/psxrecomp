@@ -9,7 +9,7 @@ extern "C" {
 
 /* overlay_capture — B-1 implementation of the overlay capture set.
  *
- * On every CD DMA completion into game-code RAM (dest < 0x1C0000), the runtime
+ * On every CD DMA completion into active game-code RAM, the runtime
  * calls overlay_capture_on_dma(). The in-memory DMA set tracks the current
  * image; executed outgoing variants are preserved as coherent immutable
  * snapshots before replacement. At clean process exit,
@@ -40,8 +40,8 @@ void overlay_capture_set_enabled(int enabled);
 void overlay_capture_configure_history(int enabled, const char *persist_dir,
                                        const char *game_id);
 
-/* Call from dma.c execute_ch3_cdrom() after every forward CH3 transfer with
- * load_start < 0x1C0000 and fntrace_is_game_started().
+/* Call from dma.c execute_ch3_cdrom() after every forward CH3 transfer into
+ * active main RAM and fntrace_is_game_started().
  * load_addr is the physical RAM destination, size is byte count,
  * bytes points to the RAM buffer at that address (already written by DMA). */
 void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,

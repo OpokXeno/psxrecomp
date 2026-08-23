@@ -90,6 +90,14 @@ void debug_server_get_status(int *listening, int *port, int *error);
 /* Poll for incoming connections and commands. Non-blocking.
  * Call once per vblank. */
 void debug_server_poll(void);
+/* Consume host UI actions at vblank. Guest control-flow changes are only
+ * queued here because this callback can be nested inside a guest VSync call. */
+void debug_server_poll_overlay_actions(void);
+
+/* Apply a queued guest control-flow change at a normal block edge outside both
+ * exception context and the C++ vblank presentation frames. May escape to the
+ * scheduler and therefore not return. */
+void debug_server_apply_pending_guest_transition(CPUState *cpu);
 
 /* FMV quiet mode suppresses high-frequency trace rings while MDEC video is
  * active. The TCP command pump stays live; expensive per-dispatch/per-frame

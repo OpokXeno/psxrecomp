@@ -3,6 +3,7 @@
 #include "dirty_ram_interp.h"
 #include "code_provider.h"
 #include "crc32.h"
+#include "memory.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -110,7 +111,8 @@ static void private_replay_initialize(void)
         return;
     parsed = strtoul(watched, &end, 0);
     if (!end || *end != '\0' || parsed == 0u || parsed > UINT32_MAX) return;
-    s_private_replay_load_ram = (uint8_t *)malloc(2u * 1024u * 1024u);
+    s_private_replay_load_ram =
+        (uint8_t *)malloc(PSX_MAIN_RAM_APERTURE_SIZE);
     if (!s_private_replay_load_ram) return;
     s_private_replay_exec_pc = (uint32_t)parsed;
     g_overlay_capture_private_execution_enabled = 1;
@@ -121,7 +123,7 @@ static void private_replay_initialize(void)
 void overlay_capture_private_note_execution(uint32_t pc)
 {
     FILE *snapshot;
-    const size_t ram_size = 2u * 1024u * 1024u;
+    const size_t ram_size = memory_get_ram_size();
 
     private_replay_initialize();
     if (!s_private_replay_load_valid && s_private_replay_load_ram &&
@@ -333,7 +335,11 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
     psx_xg_render_auth_note_code_write(0u, 1u, load_addr, size);
 
     if (!s_enabled) return;   /* overlay cache disabled in config */
-    if (size == 0) return;
+    if (size == 0 || !bytes) return;
+    load_addr &= 0x1FFFFFFFu;
+    if (load_addr >= memory_get_ram_size() ||
+        size > memory_get_ram_size() - load_addr)
+        return;
 
     /* Auto-activate on the first post-game-handoff DMA. */
     if (!s_active) {
@@ -344,7 +350,7 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
     private_replay_initialize();
     if (s_private_replay_load_ram) {
         extern uint8_t *memory_get_ram_ptr(void);
-        const uint32_t ram_size = 2u * 1024u * 1024u;
+        const uint32_t ram_size = memory_get_ram_size();
         const uint32_t lo = load_addr & 0x1fffffffu;
         uint32_t hi = lo + size;
         const uint32_t watched = s_private_replay_exec_pc & 0x1fffffffu;
@@ -411,7 +417,8 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
                               const uint32_t *dispatch_pc_bitmap,
                               const uint32_t *exec_pc_bitmap,
                               const uint32_t *exec_pc_counts,
-                              const uint8_t *ram_base)
+                              const uint8_t *ram_base,
+                              uint32_t ram_size)
 {
     uint32_t page_sz = 4096u;
     uint32_t page, run_start;
@@ -442,11 +449,10 @@ static void write_json_window(FILE *f, uint32_t win_lo_page,
              * boot/overlay capture-window boundary is required: those windows
              * stabilize region keys, but they are not MIPS execution barriers.
              * Adjacent dirty pages were already folded into this run. */
-            const uint32_t ram_size = 2u * 1024u * 1024u;
             if (phys <= ram_size && size <= ram_size - phys &&
                 phys + size <= ram_size - 4u)
                 size += 4u;
-            uint32_t virt = 0x80000000u | (phys & 0x1FFFFFu);
+            uint32_t virt = 0x80000000u | phys;
             in_run = 0;
 
             /* Seeds: only per-PC interpreter hits — execution-verified. */
@@ -544,7 +550,8 @@ static int write_json_snapshot(const char *path, uint32_t bw,
                                const uint32_t *dispatch_pc_bitmap,
                                const uint32_t *exec_pc_bitmap,
                                const uint32_t *exec_pc_counts,
-                               const uint8_t *ram_base)
+                               const uint8_t *ram_base,
+                               uint32_t ram_size)
 {
     FILE    *f;
     uint32_t page_sz;
@@ -566,15 +573,16 @@ static int write_json_snapshot(const char *path, uint32_t bw,
      * are unchanged). */
     write_json_window(f, 0u,
                       DIRTY_RAM_KERNEL_WINDOW_END / page_sz, &first_region,
-                      bitmap, dispatch_pc_bitmap, exec_pc_bitmap,
-                      exec_pc_counts, ram_base);
+                       bitmap, dispatch_pc_bitmap, exec_pc_bitmap,
+                       exec_pc_counts, ram_base, ram_size);
     write_json_window(f, DIRTY_RAM_KERNEL_WINDOW_END / page_sz,
                       OVERLAY_REGION_FLOOR / page_sz, &first_region,
-                      bitmap, dispatch_pc_bitmap, exec_pc_bitmap,
-                      exec_pc_counts, ram_base);
-    write_json_window(f, OVERLAY_REGION_FLOOR / page_sz, bw * 32u,
-                      &first_region, bitmap, dispatch_pc_bitmap,
-                      exec_pc_bitmap, exec_pc_counts, ram_base);
+                       bitmap, dispatch_pc_bitmap, exec_pc_bitmap,
+                       exec_pc_counts, ram_base, ram_size);
+    write_json_window(f, OVERLAY_REGION_FLOOR / page_sz,
+                       ram_size / page_sz,
+                       &first_region, bitmap, dispatch_pc_bitmap,
+                       exec_pc_bitmap, exec_pc_counts, ram_base, ram_size);
 
     fprintf(f, "\n]\n");
     {
@@ -874,6 +882,7 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
                                           const uint32_t *exec_pc_bitmap,
                                           const uint32_t *exec_pc_counts,
                                           const uint8_t *ram_base,
+                                          uint32_t ram_size,
                                           const char *reason,
                                           uint64_t sequence)
 {
@@ -881,7 +890,8 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
     snprintf(temp_path, sizeof(temp_path), "%s.%lu.%llu.tmp", s_capture_path,
              CAPTURE_PID(), (unsigned long long)sequence);
     if (!write_json_snapshot(temp_path, bw, bitmap, dispatch_pc_bitmap,
-                             exec_pc_bitmap, exec_pc_counts, ram_base))
+                             exec_pc_bitmap, exec_pc_counts, ram_base,
+                             ram_size))
         return 0;
     return capture_commit_temp(temp_path, reason, sequence);
 }
@@ -891,7 +901,7 @@ static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
                                    uint32_t scope_lo, uint32_t scope_hi,
                                    int include_halo)
 {
-    const uint32_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = memory_get_ram_size();
     memset(bitmap, 0, (size_t)bw * sizeof(uint32_t));
     if (scope_hi > ram_size) scope_hi = ram_size;
     if (scope_lo >= scope_hi) return;
@@ -921,6 +931,7 @@ static uint64_t overlay_capture_write_current(const char *reason,
 {
     extern uint8_t *memory_get_ram_ptr(void);
     uint32_t bw = dirty_ram_get_bitmap_word_count();
+    uint32_t ram_size = memory_get_ram_size();
     uint32_t *bitmap;
     uint64_t sig;
     /* Data-shard and restored-state loads can execute dirty RAM without a
@@ -936,6 +947,7 @@ static uint64_t overlay_capture_write_current(const char *reason,
                                     g_dirty_ram_exec_pc_bitmap,
                                     g_dirty_ram_exec_pc_counts,
                                     memory_get_ram_ptr(),
+                                    ram_size,
                                     reason,
                                     capture_next_sequence());
     free(bitmap);
@@ -949,7 +961,7 @@ void overlay_capture_write_json(void)
         extern uint8_t *memory_get_ram_ptr(void);
         FILE *private_ram = fopen(private_ram_path, "wb");
         if (private_ram) {
-            const size_t ram_size = 2u * 1024u * 1024u;
+            const size_t ram_size = memory_get_ram_size();
             int ok = fwrite(memory_get_ram_ptr(), 1, ram_size, private_ram) ==
                      ram_size;
             if (ok) ok = sync_file(private_ram);
@@ -962,16 +974,17 @@ void overlay_capture_write_json(void)
      * can otherwise merge them into a giant region that changes every run.
      * Final/manual captures use the same executed-page scope as autocapture. */
     (void)overlay_capture_write_current("shutdown-or-manual",
-                                        0, 2u * 1024u * 1024u, 0);
+                                        0, memory_get_ram_size(), 0);
 }
 
 void overlay_capture_before_dma(uint32_t load_addr, uint32_t size)
 {
     if (!s_enabled || !s_active || size == 0) return;
-    uint32_t lo = load_addr & 0x1FFFFFu;
+    uint32_t lo = load_addr & 0x1FFFFFFFu;
     uint32_t hi = lo + size;
-    if (lo >= 2u * 1024u * 1024u) return;
-    if (hi > 2u * 1024u * 1024u || hi < lo) hi = 2u * 1024u * 1024u;
+    uint32_t ram_size = memory_get_ram_size();
+    if (lo >= ram_size) return;
+    if (hi > ram_size || hi < lo) hi = ram_size;
 
     /* Snapshot complete pages touched by this DMA. Page scope prevents sticky
      * dirty runs from turning a small sector replacement into a multi-megabyte
@@ -1091,6 +1104,7 @@ typedef struct {
     uint32_t *exec_pc_counts;
     uint32_t *bitmap;
     uint32_t bitmap_words;
+    uint32_t ram_size;
     uint64_t manifest_sig;
     uint64_t sequence;
     uint64_t retry_frame;
@@ -1161,7 +1175,8 @@ static int autocap_write_thread_main(void *opaque)
     SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
     job->manifest_sig = write_and_commit_snapshot(
         job->bitmap_words, job->bitmap, job->dispatch_pc_bitmap,
-        job->exec_pc_bitmap, job->exec_pc_counts, job->ram, "autocap",
+        job->exec_pc_bitmap, job->exec_pc_counts, job->ram, job->ram_size,
+        "autocap",
         job->sequence);
     SDL_AtomicSet(&s_autocap_write_state, 2);
     return 0;
@@ -1236,7 +1251,7 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
                                                 int scoped)
 {
     extern uint8_t *memory_get_ram_ptr(void);
-    const size_t ram_size = 2u * 1024u * 1024u;
+    const uint32_t ram_size = memory_get_ram_size();
     uint32_t bw = dirty_ram_get_bitmap_word_count();
     AutocapWriteJob *job = (AutocapWriteJob *)calloc(1, sizeof(*job));
     if (!job) return NULL;
@@ -1267,6 +1282,7 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
             job->bitmap[i] = dirty_ram_get_bitmap_word(i);
     }
     job->bitmap_words = bw;
+    job->ram_size = ram_size;
     job->sequence = capture_next_sequence();
     return job;
 }
@@ -1277,7 +1293,7 @@ static int autocap_write_start(void)
      * RAM. Evidence-scoping keeps the background manifest proportional to live
      * coverage and avoids multi-megabyte rewrites every cooldown. */
     AutocapWriteJob *job = capture_snapshot_create(
-        0, 2u * 1024u * 1024u, 1);
+        0, memory_get_ram_size(), 1);
     if (!job) return 0;
     if (!autocap_write_launch(job)) {
         s_autocap_write_job = NULL;
@@ -1308,6 +1324,7 @@ static int preserve_write_thread_main(void *opaque)
             job->snapshot.bitmap_words, job->snapshot.bitmap,
             job->snapshot.dispatch_pc_bitmap, job->snapshot.exec_pc_bitmap,
             job->snapshot.exec_pc_counts, job->snapshot.ram,
+            job->snapshot.ram_size,
             "preserve-outgoing", job->snapshot.sequence);
         if (!job->snapshot.manifest_sig) {
             job->attempts++;

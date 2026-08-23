@@ -9,6 +9,7 @@
 #include "fntrace.h"
 #include "cpu_state.h"
 #include "gpu_render.h"
+#include "gte_native_provenance.h"
 #include "guest_render_bridge.h"
 #include "interrupts.h"
 #include "latency_ring.h"
@@ -24,7 +25,9 @@
 #include "text_xlate.h"
 #include "timers.h"
 
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 int g_exec_phase;
 uint32_t g_debug_current_func_addr;
@@ -44,6 +47,105 @@ uint64_t test_baseline_word_count;
 uint64_t test_baseline_end_calls;
 NativeRenderBaselineOtStatus test_baseline_end_status;
 uint32_t g_dirty_ram_exec_pc_counts[DIRTY_RAM_EXEC_WORD_COUNT];
+
+typedef struct TestGteNativeSlot {
+    uint32_t address;
+    GteNativeVertexProvenance provenance;
+    int valid;
+} TestGteNativeSlot;
+
+static TestGteNativeSlot test_gte_native_slots[16];
+static int test_gte_native_enabled;
+int g_gte_native_provenance_active;
+
+void test_gte_native_provenance_clear(void) {
+    memset(test_gte_native_slots, 0, sizeof(test_gte_native_slots));
+}
+
+void test_gte_native_provenance_seed(uint32_t address, uint32_t packed,
+                                     uint64_t receipt) {
+    for (size_t index = 0u;
+         index < sizeof(test_gte_native_slots) / sizeof(test_gte_native_slots[0]);
+         ++index) {
+        TestGteNativeSlot *slot = &test_gte_native_slots[index];
+        if (!slot->valid) {
+            const int32_t x = (int16_t)packed;
+            const int32_t y = (int16_t)(packed >> 16u);
+            slot->address = address;
+            slot->provenance = (GteNativeVertexProvenance){
+                .x_16_16 = x * INT32_C(65536),
+                .y_16_16 = y * INT32_C(65536),
+                .view_x = x,
+                .view_y = y,
+                .view_z = 256,
+                .receipt = receipt,
+                .packed_sxy = packed,
+                .projection_distance = 256u,
+                .depth = 256u,
+                .projective_valid = 1u,
+            };
+            slot->valid = 1;
+            return;
+        }
+    }
+}
+
+void gte_native_provenance_set_enabled(int enabled) {
+    test_gte_native_enabled = enabled != 0;
+    g_gte_native_provenance_active = test_gte_native_enabled;
+}
+
+void gte_native_provenance_cpu_load(
+        CPUState *cpu, uint32_t instruction, uint32_t address,
+        uint32_t value) {
+    (void)cpu; (void)instruction; (void)address; (void)value;
+}
+
+void gte_native_provenance_cpu_store(
+        CPUState *cpu, uint32_t instruction, uint32_t address,
+        uint32_t value) {
+    (void)cpu; (void)instruction; (void)address; (void)value;
+}
+
+void gte_native_provenance_cpu_alu(
+        CPUState *cpu, uint32_t instruction, uint32_t result,
+        uint32_t source1, uint32_t source2) {
+    (void)cpu; (void)instruction; (void)result; (void)source1; (void)source2;
+}
+
+void gte_native_provenance_cpu_cop2(
+        CPUState *cpu, uint32_t instruction, uint32_t value,
+        uint32_t address) {
+    (void)cpu; (void)instruction; (void)value; (void)address;
+}
+
+void gte_native_provenance_invalidate_range(uint32_t address, uint32_t width) {
+    const uint64_t end = (uint64_t)address + width;
+    for (size_t index = 0u;
+         index < sizeof(test_gte_native_slots) / sizeof(test_gte_native_slots[0]);
+         ++index) {
+        TestGteNativeSlot *slot = &test_gte_native_slots[index];
+        if (slot->valid && slot->address < end &&
+            (uint64_t)slot->address + sizeof(uint32_t) > address)
+            slot->valid = 0;
+    }
+}
+
+int gte_native_provenance_load(uint32_t address, uint32_t packed,
+                               GteNativeVertexProvenance *out) {
+    if (!test_gte_native_enabled || out == NULL) return 0;
+    for (size_t index = 0u;
+         index < sizeof(test_gte_native_slots) / sizeof(test_gte_native_slots[0]);
+         ++index) {
+        const TestGteNativeSlot *slot = &test_gte_native_slots[index];
+        if (slot->valid && slot->address == address &&
+            slot->provenance.packed_sxy == packed) {
+            *out = slot->provenance;
+            return 1;
+        }
+    }
+    return 0;
+}
 
 void guest_render_bridge_force_original(GuestRenderFallbackReason reason) {
     (void)reason;
@@ -258,9 +360,9 @@ void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b) {
 }
 uint32_t psx_bios_kernel_body_count;
 const PsxKernelBody *psx_bios_kernel_bodies;
-uint32_t g_dirty_ram_exec_page_bitmap[16];
-uint32_t g_dirty_ram_exec_pc_bitmap[(2u * 1024u * 1024u / 4u + 31u) / 32u];
-uint32_t g_dirty_ram_dispatch_pc_bitmap[(2u * 1024u * 1024u / 4u + 31u) / 32u];
+uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
+uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+uint32_t g_dirty_ram_dispatch_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 void overlay_loader_note_code_write(void) {}
 void overlay_loader_active_write_check(uint32_t phys, uint32_t size) {
     (void)phys;

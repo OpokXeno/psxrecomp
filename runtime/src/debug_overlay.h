@@ -95,6 +95,12 @@ int psx_debug_overlay_set_force_capture(int on);
  * Returns 0 on success, negative on unknown name or failed write. */
 int psx_debug_overlay_widget_action(const char *name, int value, int value2);
 
+/* Consume separate one-shot requests for Xenogears' 8 MiB developer profile
+ * and its native Kernel Menu. Enabling the profile does not change game state,
+ * and opening the Kernel Menu does not require the developer profile. */
+int psx_debug_overlay_take_developer_mode_request(void);
+int psx_debug_overlay_take_kernel_menu_request(void);
+
 /* Debug-only: fire the field-module teleport with the EXACT verified
  * recipe (7 writes, no fieldID write, no loadNewField call). The engine
  * poll at 0x800784A0 picks up fieldMapNumber + fieldEntryPoint the
@@ -166,6 +172,8 @@ static inline void psx_debug_overlay_window_shot_arm(const char *p) { (void)p; }
 static inline void psx_debug_overlay_capture_state(int *v, int *wc, int *sw) { (void)v; (void)wc; (void)sw; }
 static inline int psx_debug_overlay_set_force_capture(int on) { (void)on; return 0; }
 static inline int psx_debug_overlay_widget_action(const char *n, int v, int v2) { (void)n; (void)v; (void)v2; return -1; }
+static inline int psx_debug_overlay_take_developer_mode_request(void) { return 0; }
+static inline int psx_debug_overlay_take_kernel_menu_request(void) { return 0; }
 static inline int psx_debug_overlay_teleport(int f, int e) { (void)f; (void)e; return -1; }
 static inline int psx_debug_overlay_write_party_slot(int s, int c, int b) { (void)s; (void)c; (void)b; return -1; }
 static inline int psx_debug_overlay_write_party_bitfield(int b) { (void)b; return -1; }

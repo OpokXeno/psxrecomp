@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused regression checks for play-free overlay call-target discovery."""
 import argparse
+import binascii
 import importlib.util
 import os
 import pathlib
@@ -3338,8 +3339,11 @@ def check_real_hosted_fragment_publication(recompiler):
         assert MOD.fragment_shard_key(hosted_ids) != \
             MOD.fragment_shard_key(
                 hosted_ids, MOD.HOSTED_MANIFEST_PROVENANCE)
-        assert hosted_dll.stem.endswith(
-            f'{MOD.fragment_shard_key(hosted_ids, MOD.HOSTED_MANIFEST_PROVENANCE):08X}')
+        assert hosted_dll.stem.split('_') == [
+            f'{LOAD & 0x1FFFFFFF:08X}',
+            f'{binascii.crc32(data) & 0xFFFFFFFF:08X}',
+            f'{MOD.fragment_shard_key(hosted_ids, MOD.HOSTED_MANIFEST_PROVENANCE):08X}',
+        ]
 
         dll_count = len(list(pathlib.Path(td).glob(f'*{MOD.overlay_ext()}')))
         cached_ids, cached_status = MOD.compile_fragment_batch(

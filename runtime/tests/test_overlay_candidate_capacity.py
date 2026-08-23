@@ -114,9 +114,9 @@ def main() -> int:
             "runtime must require each manifest entry inside its guarded ranges")
     require(r"arr\[j\]\.entry[^\n]*==\s*entry", source,
             "runtime must reject duplicate physical manifest entries")
-    require(r"lo\s*>=\s*OVERLAY_RAM_SIZE\s*\|\|\s*"
-            r"arr\[i\]\.len\[r\]\s*>\s*OVERLAY_RAM_SIZE\s*-\s*lo", source,
-            "runtime must reject manifest ranges outside 2 MiB RAM")
+    require(r"lo\s*>=\s*memory_get_ram_size\(\)\s*\|\|\s*"
+            r"arr\[i\]\.len\[r\]\s*>\s*memory_get_ram_size\(\)\s*-\s*lo", source,
+            "runtime must reject manifest ranges outside active RAM")
     require(r"manifest_skip_space\(line\)", source,
             "runtime manifest grammar must accept leading whitespace like Python")
     require(r"manifest_is_space", source,

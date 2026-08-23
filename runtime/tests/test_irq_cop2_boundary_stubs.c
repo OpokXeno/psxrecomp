@@ -3,6 +3,7 @@
 #include "native_render_baseline.h"
 #include "psx_fiber.h"
 #include "psx_scheduler.h"
+#include "ram_provenance.h"
 #include "xg_render_auth_runtime.h"
 
 #include <setjmp.h>
@@ -394,3 +395,6 @@ int dma_cdrom_transfer_active(void) { return 0; }
 psx_fiber_t psx_fiber_current(void) { return NULL; }
 int gpu_ws_present_native_43(void) { return 0; }
 void psx_ws_note_gte_project(int count) { (void)count; }
+void ram_provenance_reset(void) {}
+void ram_provenance_speculative_begin(void) {}
+void ram_provenance_speculative_end(void) {}

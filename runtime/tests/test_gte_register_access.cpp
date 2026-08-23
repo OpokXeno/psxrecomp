@@ -1,5 +1,7 @@
 #include "cpu_state.h"
 #include "gte.h"
+#include "gte_native_provenance.h"
+#include "pgxp.h"
 
 #include <array>
 #include <cstdint>
@@ -652,6 +654,136 @@ int test_precision_speculative_transaction() {
     return 0;
 }
 
+int test_native_projection_provenance() {
+    constexpr uint32_t address = 0x00123450u;
+    constexpr uint32_t copied_address = address + 4u;
+    constexpr uint32_t mfc2_address = address + 8u;
+    constexpr uint32_t moved_address = address + 12u;
+    constexpr uint32_t repacked_address = address + 16u;
+    constexpr uint32_t half_stored_address = address + 20u;
+    CPUState cpu{};
+    GteNativeVertexProvenance provenance{};
+
+    pgxp_set_enabled(0);
+    gte_native_provenance_set_enabled(1);
+    if (pgxp_enabled() != 0)
+        return fail_value("native provenance enables PGXP", 0, 0, 0, 0,
+                          static_cast<uint32_t>(pgxp_enabled()));
+
+    cpu.gte_data[0] = (uint32_t)(uint16_t)64u |
+        ((uint32_t)(uint16_t)32u << 16u);
+    cpu.gte_data[1] = 256u;
+    cpu.gte_ctrl[0] = 0x00001000u;
+    cpu.gte_ctrl[2] = 0x00001000u;
+    cpu.gte_ctrl[4] = 0x00001000u;
+    cpu.gte_ctrl[26] = 256u;
+    gte_execute(&cpu, (1u << 19u) | 0x01u);
+    const uint32_t packed = cpu.gte_data[14];
+    gte_precision_store_word(address, 14u);
+    if (!gte_native_provenance_load(address, packed, &provenance) ||
+        provenance.packed_sxy != packed || provenance.view_x != 64 ||
+        provenance.view_y != 32 || provenance.view_z != 256 ||
+        provenance.depth != 256u || provenance.projection_distance != 256u ||
+        provenance.receipt == 0u || !provenance.projective_valid)
+        return fail_value("native projection receipt", 0, 14, packed, 256u,
+                          static_cast<uint32_t>(provenance.view_z));
+
+    const uint64_t receipt = provenance.receipt;
+    const uint32_t lw_r2 = (0x23u << 26u) | (2u << 16u);
+    const uint32_t sw_r2 = (0x2bu << 26u) | (2u << 16u);
+    gte_native_provenance_cpu_load(&cpu, lw_r2, address, packed);
+    gte_native_provenance_invalidate_range(copied_address, sizeof(uint32_t));
+    gte_native_provenance_cpu_store(&cpu, sw_r2, copied_address, packed);
+    if (!gte_native_provenance_load(copied_address, packed, &provenance) ||
+        provenance.receipt != receipt)
+        return fail_value("LW/SW preserves native receipt", 0, 2, packed,
+                          static_cast<uint32_t>(receipt),
+                          static_cast<uint32_t>(provenance.receipt));
+
+    const uint32_t mfc2_r3_sxy2 =
+        (0x12u << 26u) | (3u << 16u) | (14u << 11u);
+    const uint32_t sw_r3 = (0x2bu << 26u) | (3u << 16u);
+    gte_native_provenance_cpu_cop2(
+        &cpu, mfc2_r3_sxy2, packed, 0u);
+    gte_native_provenance_invalidate_range(mfc2_address, sizeof(uint32_t));
+    gte_native_provenance_cpu_store(&cpu, sw_r3, mfc2_address, packed);
+    if (!gte_native_provenance_load(mfc2_address, packed, &provenance) ||
+        provenance.receipt != receipt)
+        return fail_value("MFC2/SW preserves native receipt", 0, 3, packed,
+                          static_cast<uint32_t>(receipt),
+                          static_cast<uint32_t>(provenance.receipt));
+
+    const uint32_t move_r3_to_r4 =
+        (3u << 21u) | (4u << 11u) | 0x21u;
+    const uint32_t sw_r4 = (0x2bu << 26u) | (4u << 16u);
+    gte_native_provenance_cpu_alu(
+        &cpu, move_r3_to_r4, packed, packed, 0u);
+    gte_native_provenance_invalidate_range(moved_address, sizeof(uint32_t));
+    gte_native_provenance_cpu_store(&cpu, sw_r4, moved_address, packed);
+    if (!gte_native_provenance_load(moved_address, packed, &provenance) ||
+        provenance.receipt != receipt)
+        return fail_value("MOVE/SW preserves native receipt", 0, 4, packed,
+                          static_cast<uint32_t>(receipt),
+                          static_cast<uint32_t>(provenance.receipt));
+
+    const uint32_t lhu_r5 = (0x25u << 26u) | (5u << 16u);
+    const uint32_t lhu_r6 = (0x25u << 26u) | (6u << 16u);
+    const uint32_t sll_r6_16 = (6u << 16u) | (6u << 11u) | (16u << 6u);
+    const uint32_t or_r7_r5_r6 =
+        (5u << 21u) | (6u << 16u) | (7u << 11u) | 0x25u;
+    const uint32_t sw_r7 = (0x2bu << 26u) | (7u << 16u);
+    const uint32_t low_half = packed & 0xffffu;
+    const uint32_t high_half = packed >> 16u;
+    gte_native_provenance_cpu_load(&cpu, lhu_r5, address, low_half);
+    gte_native_provenance_cpu_load(&cpu, lhu_r6, address + 2u, high_half);
+    gte_native_provenance_cpu_alu(
+        &cpu, sll_r6_16, high_half << 16u, high_half, 0u);
+    gte_native_provenance_cpu_alu(
+        &cpu, or_r7_r5_r6, packed, low_half, high_half << 16u);
+    gte_native_provenance_invalidate_range(
+        repacked_address, sizeof(uint32_t));
+    gte_native_provenance_cpu_store(&cpu, sw_r7, repacked_address, packed);
+    if (!gte_native_provenance_load(repacked_address, packed, &provenance) ||
+        provenance.receipt != receipt)
+        return fail_value("LHU/SLL/OR preserves native receipt", 0, 7,
+                          packed, static_cast<uint32_t>(receipt),
+                          static_cast<uint32_t>(provenance.receipt));
+
+    const uint32_t sh_r5 = (0x29u << 26u) | (5u << 16u);
+    const uint32_t sh_r6 = (0x29u << 26u) | (6u << 16u);
+    gte_native_provenance_cpu_load(&cpu, lhu_r5, address, low_half);
+    gte_native_provenance_cpu_store(
+        &cpu, sh_r5, half_stored_address, low_half);
+    gte_native_provenance_cpu_load(&cpu, lhu_r6, address + 2u, high_half);
+    gte_native_provenance_cpu_store(
+        &cpu, sh_r6, half_stored_address + 2u, high_half);
+    if (!gte_native_provenance_load(
+            half_stored_address, packed, &provenance) ||
+        provenance.receipt != receipt)
+        return fail_value("LHU/SH preserves native receipt", 0, 6, packed,
+                          static_cast<uint32_t>(receipt),
+                          static_cast<uint32_t>(provenance.receipt));
+
+    gte_native_provenance_invalidate_range(address, sizeof(uint32_t));
+    if (gte_native_provenance_load(address, packed, &provenance) != 0)
+        return fail_value("same-value overwrite invalidates native receipt",
+                          0, 14, packed, 0u, 1u);
+
+    gte_precision_store_word(address, 14u);
+    if (!gte_native_provenance_load(address, packed, &provenance) ||
+        provenance.receipt != receipt)
+        return fail_value("SWC2 restores native receipt", 0, 14, packed,
+                          static_cast<uint32_t>(receipt),
+                          static_cast<uint32_t>(provenance.receipt));
+
+    gte_precision_timeline_invalidate();
+    if (gte_native_provenance_load(address, packed, &provenance) != 0)
+        return fail_value("timeline invalidates native receipt", 0, 14,
+                          packed, 0u, 1u);
+    gte_native_provenance_set_enabled(0);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -663,6 +795,7 @@ int main() {
     if (int rc = test_command_timing_hook()) return rc;
     if (int rc = test_precise_sxy_invalidation()) return rc;
     if (int rc = test_precision_speculative_transaction()) return rc;
+    if (int rc = test_native_projection_provenance()) return rc;
     std::puts("PASS: canonical GTE register helpers match GTEState transfer oracle");
     return 0;
 }

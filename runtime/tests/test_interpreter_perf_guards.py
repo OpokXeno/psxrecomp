@@ -428,9 +428,9 @@ def main():
         raise AssertionError("runtime loads lost their inline base charge path")
     ram_fast = body(memory, "psx_cyc_main_ram_fast_addr")
     for guard in ("g_ls_mode != 0", "g_ls_replay_active", "g_ds_recording",
-                  "g_ram_read_watch_active",
-                  "g_dma_exec_depth > 0", "addr >= 0xC0000000u",
-                  "phys >= 0x00800000u", "RAM_SIZE - width"):
+                   "g_ram_read_watch_active",
+                   "g_dma_exec_depth > 0", "addr >= 0xC0000000u",
+                   "phys >= 0x00800000u", "g_psx_ram_size - width"):
         if guard not in ram_fast:
             raise AssertionError(f"main-RAM value fast path lost guard: {guard}")
     for fn, fallback in (

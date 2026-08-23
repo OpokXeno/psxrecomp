@@ -613,6 +613,8 @@ static int s_native_view_expand_x;
 static int s_native_view_scale_2d;
 static int s_native_view_preserve_2d_translation_x;
 static GlRendererNativeMidpointDiagnostics s_native_midpoint_diag;
+static uint8_t s_native_midpoint_present_decision;
+static uint8_t s_native_midpoint_present_eligibility;
 static int s_native_midpoint_frame_blocked;
 static int s_native_midpoint_duplicate_seen;
 static int s_native_midpoint_canonical_enabled;
@@ -1230,7 +1232,7 @@ int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out) {
  * source + letterbox rects. PSX_GL_PRESENT_PROBE=1 additionally drains
  * glGetError and samples one backbuffer pixel before the swap; that synchronous
  * diagnostic is intentionally opt-in. Observers query a window after the fact. */
-#define GL_PRES_RING_CAP 4096
+#define GL_PRES_RING_CAP GL_PRES_RING_CAPACITY
 static GlPresEvent s_pres_ring[GL_PRES_RING_CAP];
 static uint64_t    s_pres_seq = 0;
 
@@ -1312,6 +1314,14 @@ static void pres_set_hash(uint64_t sequence, uint64_t hash) {
         GlPresEvent *event = &s_pres_ring[sequence % GL_PRES_RING_CAP];
         event->framebuffer_hash = hash;
         event->framebuffer_hash_valid = 1u;
+    }
+}
+
+static void pres_set_midpoint_decision(uint64_t sequence) {
+    if (sequence < s_pres_seq && s_pres_seq - sequence <= GL_PRES_RING_CAP) {
+        GlPresEvent *event = &s_pres_ring[sequence % GL_PRES_RING_CAP];
+        event->midpoint_decision = s_native_midpoint_present_decision;
+        event->midpoint_eligibility = s_native_midpoint_present_eligibility;
     }
 }
 
@@ -4515,7 +4525,8 @@ int gl_renderer_set_native_interpolation_fps(int target_fps) {
     unsigned int phase_count;
     const unsigned int old_phase_count = s_native_interpolation_phase_count;
 
-    if (target_fps == 0) denominator = 2u;
+    if (target_fps == 30) denominator = 1u;
+    else if (target_fps == 0) denominator = 2u;
     else if (target_fps == 60) denominator = 2u;
     else if (target_fps == 120) denominator = 4u;
     else if (target_fps == 240) denominator = 8u;
@@ -4527,16 +4538,18 @@ int gl_renderer_set_native_interpolation_fps(int target_fps) {
     if (s_ctx && s_raster_ok && phase_count > old_phase_count) {
         const int canonical_width = VRAM_W * s_scale;
         const int canonical_height = VRAM_H * s_scale;
+        const unsigned int first_extra_phase = old_phase_count == 0u
+            ? 1u : old_phase_count;
 
-        for (unsigned int phase = old_phase_count;
+        for (unsigned int phase = first_extra_phase;
              phase < phase_count; ++phase)
             if (!native_phase_allocate_canonical(
                     phase, canonical_width, canonical_height))
                 goto rollback_growth;
         for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot) {
             if (!s_native_view_fbo[slot]) continue;
-            for (unsigned int phase = old_phase_count;
-                 phase < phase_count; ++phase)
+            for (unsigned int phase = first_extra_phase;
+                  phase < phase_count; ++phase)
                 if (!native_phase_allocate_view(
                          slot, phase, s_native_view_width * s_scale,
                          VRAM_H * s_scale))
@@ -4557,7 +4570,7 @@ int gl_renderer_set_native_interpolation_fps(int target_fps) {
     return 1;
 
 rollback_growth:
-    for (unsigned int phase = old_phase_count;
+    for (unsigned int phase = old_phase_count == 0u ? 1u : old_phase_count;
          phase < phase_count; ++phase) {
         native_phase_free_canonical(phase);
         for (int slot = 0; slot < NATIVE_VIEW_MAX_SURF; ++slot)
@@ -6032,7 +6045,7 @@ void gl_renderer_native_midpoint_reset(void) {
 
 static void native_midpoint_cancel_with_reason(
         GlRendererNativeMidpointCancelReason reason, uint32_t status,
-        const GpuRenderSemantic *semantic) {
+        const GpuRenderSemantic *semantic, uint64_t existing_command_id) {
     for (size_t index = 0u; index < s_native_host_queue_count; ++index)
         s_native_host_queue[index].midpoint_valid = 0;
     if (!s_native_midpoint_frame_blocked &&
@@ -6058,6 +6071,10 @@ static void native_midpoint_cancel_with_reason(
             ? semantic->interpolation_identity.primitive_id : 0u;
         s_native_midpoint_diag.last_cancel_identity_valid = semantic != NULL &&
             semantic->interpolation_identity.valid;
+        s_native_midpoint_diag.last_cancel_existing_command_id =
+            existing_command_id;
+        s_native_midpoint_diag.last_cancel_current_command_id = semantic != NULL
+            ? semantic->submission_command_id : 0u;
     }
     /* Never seal a partially rendered source frame: a failed wave or side pass
      * must not become the prior semantic match for the next source frame. */
@@ -6069,11 +6086,12 @@ static void native_midpoint_cancel_with_reason(
 
 void gl_renderer_native_midpoint_cancel(void) {
     native_midpoint_cancel_with_reason(
-        GL_NATIVE_MIDPOINT_CANCEL_GENERIC, 0u, NULL);
+        GL_NATIVE_MIDPOINT_CANCEL_GENERIC, 0u, NULL, 0u);
 }
 
 int gl_renderer_native_midpoint_begin(void) {
-    if (s_native_midpoint_diag.suspended || s_native_midpoint_frame_blocked ||
+    if (s_native_interpolation_phase_count == 0u ||
+        s_native_midpoint_diag.suspended || s_native_midpoint_frame_blocked ||
         s_native_midpoint_diag.frame_open || !s_midpoint_fbo ||
         !glb_transaction_context_ready())
         return 0;
@@ -6124,7 +6142,8 @@ GpuRenderTransactionStatus gl_renderer_record_interpolation_anchors(
     status = gpu_semantic_workload_record_anchors(anchors, count);
     if (status != GPU_SEMANTIC_WORKLOAD_OK) {
         native_midpoint_cancel_with_reason(
-            GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD, (uint32_t)status, NULL);
+            GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD, (uint32_t)status, NULL,
+            0u);
         return status == GPU_SEMANTIC_WORKLOAD_CAPACITY_EXCEEDED
             ? GPU_RENDER_TRANSACTION_STATE_REJECTED
             : GPU_RENDER_TRANSACTION_INVALID_ARGUMENT;
@@ -6171,19 +6190,30 @@ static int native_midpoint_prepare_present(int *out_had_work) {
     GpuSemanticWorkloadDiagnostics workload_diag = {0};
 
     if (out_had_work) *out_had_work = had_work;
+    s_native_midpoint_present_eligibility =
+        GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_UNKNOWN;
+    s_native_midpoint_present_decision = s_native_midpoint_diag.suspended
+        ? GL_NATIVE_MIDPOINT_DECISION_SUSPENDED
+        : GL_NATIVE_MIDPOINT_DECISION_NO_OPEN_FRAME;
     if (!s_native_midpoint_diag.frame_open) return 0;
     if (!had_work) {
         native_midpoint_discard_open_frame();
         s_native_midpoint_diag.midpoint_duplicate_empty_frames++;
         s_native_midpoint_duplicate_seen = 1;
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_EMPTY_DUPLICATE;
         return 0;
     }
     if (!s_native_midpoint_diag.frame_valid ||
         !gl_renderer_native_midpoint_seal()) {
         gl_renderer_native_midpoint_cancel();
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_SEAL_CANCELLED;
         return 0;
     }
     gpu_semantic_workload_diagnostics(&workload_diag);
+    s_native_midpoint_present_eligibility =
+        (uint8_t)workload_diag.last_seal_eligibility;
     switch (workload_diag.last_seal_eligibility) {
     case GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_ELIGIBLE:
         s_native_midpoint_diag.eligibility_complete_frames++;
@@ -6217,6 +6247,8 @@ static int native_midpoint_prepare_present(int *out_had_work) {
         workload_diag.moved_count == 0u) {
         s_native_midpoint_diag.midpoint_duplicate_static_frames++;
         s_native_midpoint_duplicate_seen = 1;
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_STATIC_DUPLICATE;
         return 0;
     }
     {
@@ -6225,17 +6257,25 @@ static int native_midpoint_prepare_present(int *out_had_work) {
         if (s_native_midpoint_diag.previous_usable) {
             if (s_native_midpoint_duplicate_seen) {
                 s_native_midpoint_diag.midpoint_candidates++;
+                s_native_midpoint_present_decision =
+                    GL_NATIVE_MIDPOINT_DECISION_SELECTED;
                 use_midpoint = 1;
             } else {
                 s_native_midpoint_diag
                     .midpoint_eligible_without_duplicate_frames++;
+                s_native_midpoint_present_decision =
+                    GL_NATIVE_MIDPOINT_DECISION_ELIGIBLE_WITHOUT_DUPLICATE;
             }
         } else if (s_native_midpoint_duplicate_seen) {
             s_native_midpoint_diag
                 .midpoint_ineligible_after_duplicate_frames++;
+            s_native_midpoint_present_decision =
+                GL_NATIVE_MIDPOINT_DECISION_INELIGIBLE_AFTER_DUPLICATE;
         } else {
             s_native_midpoint_diag
                 .midpoint_ineligible_without_duplicate_frames++;
+            s_native_midpoint_present_decision =
+                GL_NATIVE_MIDPOINT_DECISION_INELIGIBLE_WITHOUT_DUPLICATE;
         }
         s_native_midpoint_duplicate_seen = 0;
         return use_midpoint;
@@ -6554,6 +6594,8 @@ static uint64_t native_present_swap_texture(
     sequence = pres_record(
         path, source_x, source_y, source_width, source_height,
         lx, ly, lw, lh);
+    if (path == GL_PRES_NATIVE_CURRENT || path == GL_PRES_NATIVE_MIDPOINT)
+        pres_set_midpoint_decision(sequence);
     pres_set_phase(sequence, phase_numerator, phase_denominator);
     pres_set_scanout(
         sequence, scanout_x, scanout_y, scanout_width, scanout_height);
@@ -6580,7 +6622,9 @@ static uint64_t native_present_swap_texture(
     latency_ring_mark(LAT_SWAP_END);
     if (path == GL_PRES_NATIVE_MIDPOINT) {
         s_native_midpoint_diag.midpoint_presents++;
-        if (phase_numerator * 2u == phase_denominator)
+        if (phase_numerator * 2u == phase_denominator &&
+            s_native_midpoint_present_decision ==
+                GL_NATIVE_MIDPOINT_DECISION_SELECTED)
             native_midpoint_note_completed_present();
     } else {
         s_native_midpoint_diag.current_presents++;
@@ -7790,11 +7834,18 @@ int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
     use_midpoint = native_midpoint_prepare_present(&had_work);
     if (use_midpoint && !s_native_midpoint_canonical_enabled) {
         s_native_midpoint_diag.midpoint_candidate_canonical_disabled++;
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_CANONICAL_DISABLED;
         use_midpoint = 0;
     }
     if (present_pending_current && use_midpoint) {
         s_native_midpoint_diag.midpoint_candidate_pending_current++;
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_CANDIDATE_PENDING_CURRENT;
         use_midpoint = 0;
+    } else if (present_pending_current) {
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_PENDING_CURRENT;
     }
     if (had_work)
         native_midpoint_current_target(
@@ -7806,7 +7857,6 @@ int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
         source_x = current_x;
         source_y = current_y;
     }
-
     gl_perf_present_enter();
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (force_4_3)
@@ -7873,7 +7923,8 @@ int gl_renderer_present_native_midpoint(int disp_x, int disp_y, int w, int h,
         last_path = GL_PRES_NATIVE_MIDPOINT;
         next_pending_phase = first_half;
     } else {
-        const unsigned int subframes = s_native_midpoint_diag.suspended
+        const unsigned int subframes = s_native_midpoint_diag.suspended ||
+                s_native_interpolation_denominator == 1u
             ? 1u : s_native_interpolation_denominator / 2u;
 
         for (unsigned int subframe = 0u; subframe < subframes; ++subframe) {
@@ -7960,7 +8011,12 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
     use_midpoint = native_midpoint_prepare_present(&had_work);
     if (present_pending_current && use_midpoint) {
         s_native_midpoint_diag.midpoint_candidate_pending_current++;
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_CANDIDATE_PENDING_CURRENT;
         use_midpoint = 0;
+    } else if (present_pending_current) {
+        s_native_midpoint_present_decision =
+            GL_NATIVE_MIDPOINT_DECISION_PENDING_CURRENT;
     }
     if (had_work)
         native_midpoint_current_target(
@@ -7973,6 +8029,9 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
             s_native_midpoint_seeded[source_slot];
         if (!use_midpoint)
             s_native_midpoint_diag.midpoint_candidate_view_unseeded++;
+        if (!use_midpoint)
+            s_native_midpoint_present_decision =
+                GL_NATIVE_MIDPOINT_DECISION_VIEW_UNSEEDED;
         if (use_midpoint) source_y = current_y;
     } else if (present_pending_current) {
         source_y = s_native_midpoint_pending_y;
@@ -8051,7 +8110,8 @@ int gl_renderer_present_native_view(int disp_x, int disp_y, int disp_h,
         last_path = GL_PRES_NATIVE_MIDPOINT;
         next_pending_phase = first_half;
     } else {
-        const unsigned int subframes = s_native_midpoint_diag.suspended
+        const unsigned int subframes = s_native_midpoint_diag.suspended ||
+                s_native_interpolation_denominator == 1u
             ? 1u : s_native_interpolation_denominator / 2u;
 
         for (unsigned int subframe = 0u; subframe < subframes; ++subframe) {
@@ -11666,6 +11726,8 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
     GpuRenderSemantic phase_semantics[NATIVE_INTERPOLATION_MAX_PHASES];
     GpuSemanticWorkloadStatus workload_status =
         GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
+    GpuRenderSemantic existing_semantic;
+    uint64_t existing_command_id = 0u;
     int base_x;
     int slot;
 
@@ -11687,6 +11749,11 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
         rebuild_mask_stencils();
     }
     if (s_native_midpoint_diag.frame_open) {
+        if (semantic->interpolation_identity.valid &&
+            gpu_semantic_workload_current(
+                &semantic->interpolation_identity, &existing_semantic) ==
+                    GPU_SEMANTIC_WORKLOAD_OK)
+            existing_command_id = existing_semantic.submission_command_id;
         workload_status = gpu_semantic_workload_record_phases(
             semantic, s_native_interpolation_denominator,
             phase_semantics, s_native_interpolation_phase_count);
@@ -11699,7 +11766,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
         } else {
             native_midpoint_cancel_with_reason(
                 GL_NATIVE_MIDPOINT_CANCEL_WORKLOAD_RECORD,
-                (uint32_t)workload_status, semantic);
+                (uint32_t)workload_status, semantic, existing_command_id);
         }
     }
     if (s_native_view_enabled) {
@@ -11803,7 +11870,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_temporal_candidate(
     gpu_semantic_workload_diagnostics(&workload_diagnostics);
     workload_count_before = workload_diagnostics.current_count;
     workload_status = generate_phases
-        ? gpu_semantic_workload_record_phases(
+        ? gpu_semantic_workload_record_temporal_phases(
             semantic, s_native_interpolation_denominator,
             phases, s_native_interpolation_phase_count)
         : gpu_semantic_workload_record_endpoint(semantic);
@@ -11843,8 +11910,15 @@ static GpuRenderTransactionStatus glb_draw_semantic_temporal_candidate(
             continue;
         phase_visibility_mask |= (uint8_t)(1u << phase);
     }
-    if (phase_visibility_mask == 0u)
+    if (phase_visibility_mask == 0u) {
+        workload_status =
+            gpu_semantic_workload_mark_last_temporal_history_only();
+        if (workload_status != GPU_SEMANTIC_WORKLOAD_OK) {
+            ++s_native_midpoint_diag.temporal_candidate_record_failure_count;
+            return GPU_RENDER_TRANSACTION_OK;
+        }
         return GPU_RENDER_TRANSACTION_OK;
+    }
     ++s_native_midpoint_diag.temporal_candidate_visible_count;
     base_x = glb_native_view_semantic_target_base(semantic);
     slot = native_view_prepare_surface(base_x);

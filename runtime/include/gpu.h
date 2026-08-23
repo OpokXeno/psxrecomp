@@ -27,6 +27,8 @@ uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
 void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */
 void     gpu_set_submission_hook(void (*hook)(void));
+void     gpu_set_semantic_current_hook(
+             void (*hook)(const GpuRenderSemantic *semantic));
 void     gpu_prepare_submission(void);
 int      gpu_gp0_command_word_count(uint8_t opcode);
 bool     gpu_gp0_parser_is_idle(void);
@@ -166,6 +168,9 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                                  const GpuRenderOracleSource *source);
 int gpu_native_preflight_gp0_packet(const uint32_t *words, size_t word_count,
                                     const GpuRenderOracleSource *source);
+void gpu_native_preflight_set_dma_publication(uint32_t incoming_link_address,
+                                              bool incoming_link_valid,
+                                              uint64_t transaction_receipt);
 int gpu_native_submit_gp0_word(uint32_t word,
                                const GpuRenderOracleSource *source);
 void gpu_native_packet_stream_reset(void);

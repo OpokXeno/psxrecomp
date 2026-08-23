@@ -22,6 +22,7 @@ PAIR = 0x1020304050607080
 RESIDENT = "psxrecomp bios resident shard v1\n"
 GAME_SHA256 = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 MANIFEST_SHA256 = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+RUNTIME_VARIANT_SHA256 = "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
 
 
 def codegen_leaf() -> str:
@@ -39,7 +40,7 @@ def codegen_leaf() -> str:
                           hash_header.read_text(encoding="utf-8"))
         if match:
             code_hash = match.group(1).lower()
-    return f"cg{version}_{code_hash}"
+    return f"cg{version}_{code_hash}_gc00000000_f0"
 
 
 def identity_namespace() -> str:
@@ -88,6 +89,7 @@ def manifest(entries: list[tuple[int, int]], provenance: str | None = None,
                              if lowercase_identity else MANIFEST_SHA256.upper())
         lines.append(f"I {game_identity} {manifest_identity}\n")
     lines.append(f"A {artifact[0]:08X} {artifact[1]:08X} {artifact[2]:08X}\n")
+    lines.append(f"V {RUNTIME_VARIANT_SHA256.upper()}\n")
     for entry, length in entries:
         crc = zlib.crc32(bytes(length)) & 0xFFFFFFFF
         lines.append(f"F {entry:08X} {crc:08X}\n")

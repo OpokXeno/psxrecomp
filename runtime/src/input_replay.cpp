@@ -1702,6 +1702,19 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     uint32_t native_rate_first_ms = 0u;
     uint32_t native_rate_last_ms = 0u;
     uint32_t native_peak_window_ms = 0u;
+    bool native_presentation_history_truncated = false;
+    struct NativePresentInterval {
+        uint32_t first_frame = 0u;
+        uint32_t last_frame = 0u;
+        uint32_t first_ms = 0u;
+        uint32_t last_ms = 0u;
+        uint64_t midpoint_presents = 0u;
+        uint64_t current_presents = 0u;
+        std::array<uint64_t, GL_NATIVE_MIDPOINT_DECISION_COUNT>
+            decision_counts{};
+        std::array<uint64_t, 9u> eligibility_counts{};
+    };
+    std::vector<NativePresentInterval> native_present_intervals;
     (void)guest_render_native_stream_snapshot(&native_stream);
     gl_renderer_native_midpoint_diag(&native_midpoint);
     retired_failure_events.resize((size_t)retired_failure_total);
@@ -1712,10 +1725,12 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
             ++retired_failure_reason_counts[event.reason];
     {
         const uint64_t total = gl_renderer_pres_total();
-        const uint64_t first = total > 4096u ? total - 4096u : 0u;
+        const uint64_t first = total > GL_PRES_RING_CAPACITY
+            ? total - GL_PRES_RING_CAPACITY : 0u;
         std::vector<GlPresEvent> native_events;
         GlPresEvent last{};
 
+        native_presentation_history_truncated = first != 0u;
         if (total != 0u && gl_renderer_pres_get(total - 1u, &last)) {
             native_rate_last_ms = last.t_ms;
             for (uint64_t sequence = first; sequence < total; ++sequence) {
@@ -1726,6 +1741,31 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
                 if (event.path != GL_PRES_NATIVE_MIDPOINT &&
                     event.path != GL_PRES_NATIVE_CURRENT)
                     continue;
+                {
+                    const size_t interval_index = event.frame / 120u;
+                    if (native_present_intervals.size() <= interval_index)
+                        native_present_intervals.resize(interval_index + 1u);
+                    NativePresentInterval& interval =
+                        native_present_intervals[interval_index];
+                    if (interval.midpoint_presents == 0u &&
+                        interval.current_presents == 0u) {
+                        interval.first_frame = event.frame;
+                        interval.first_ms = event.t_ms;
+                    }
+                    interval.last_frame = event.frame;
+                    interval.last_ms = event.t_ms;
+                    if (event.path == GL_PRES_NATIVE_MIDPOINT)
+                        interval.midpoint_presents++;
+                    else
+                        interval.current_presents++;
+                    if (event.midpoint_decision <
+                            interval.decision_counts.size())
+                        interval.decision_counts[event.midpoint_decision]++;
+                    if (event.midpoint_eligibility <
+                            interval.eligibility_counts.size())
+                        interval.eligibility_counts[
+                            event.midpoint_eligibility]++;
+                }
                 native_events.push_back(event);
                 if (native_rate_last_ms - event.t_ms > 10000u)
                     continue;
@@ -2110,6 +2150,18 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     write_opcode_histogram(
         "native_packet_derived_opcode_counts",
         native_stream.native_packet_derived_opcode_counts);
+    write_opcode_histogram(
+        "native_gte_bound_opcode_counts",
+        native_stream.native_gte_bound_opcode_counts);
+    write_opcode_histogram(
+        "native_gte_zero_opcode_counts",
+        native_stream.native_gte_zero_opcode_counts);
+    write_opcode_histogram(
+        "native_gte_partial_opcode_counts",
+        native_stream.native_gte_partial_opcode_counts);
+    write_opcode_histogram(
+        "native_gte_nonprojective_opcode_counts",
+        native_stream.native_gte_nonprojective_opcode_counts);
     write_opcode_histogram("native_unsupported_opcode_counts",
                            native_stream.native_unsupported_opcode_counts);
     write_opcode_attribution("native_unbound_source_by_opcode",
@@ -2231,9 +2283,29 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << ",\"state_sequence\":"
            << native_stream.first_stage_failure_visual_id.state_sequence << "}"
            << ",\"first_stage_failure_status\":"
-           << static_cast<unsigned>(native_stream.first_stage_failure_status)
-           << ",\"last_command_id\":" << native_stream.last_command_id
-           << ",\"last_status\":"
+            << static_cast<unsigned>(native_stream.first_stage_failure_status)
+            << ",\"last_command_id\":" << native_stream.last_command_id
+            << ",\"last_unbound_reserve_command_id\":"
+            << native_stream.last_unbound_reserve_command_id
+            << ",\"last_unbound_reserve_candidate_count\":"
+            << native_stream.last_unbound_reserve_candidate_count
+            << ",\"last_unbound_reserve_active_count\":"
+            << native_stream.last_unbound_reserve_active_count
+            << ",\"last_unbound_reserve_available_count\":"
+            << native_stream.last_unbound_reserve_available_count
+            << ",\"last_unbound_reserve_miss_failure_mask\":"
+            << native_stream.last_unbound_reserve_miss_failure_mask
+            << ",\"first_unbound_reserve_command_id\":"
+            << native_stream.first_unbound_reserve_command_id
+            << ",\"first_unbound_reserve_candidate_count\":"
+            << native_stream.first_unbound_reserve_candidate_count
+            << ",\"first_unbound_reserve_active_count\":"
+            << native_stream.first_unbound_reserve_active_count
+            << ",\"first_unbound_reserve_available_count\":"
+            << native_stream.first_unbound_reserve_available_count
+            << ",\"first_unbound_reserve_miss_failure_mask\":"
+            << native_stream.first_unbound_reserve_miss_failure_mask
+            << ",\"last_status\":"
            << static_cast<unsigned>(native_stream.last_status)
            << ",\"last_stage_status\":"
             << static_cast<unsigned>(native_stream.last_stage_status)
@@ -2361,10 +2433,46 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
              << native_rate_current_presents
              << ",\"peak_window_ms\":" << native_peak_window_ms
              << ",\"peak_midpoint_presents\":"
-             << native_peak_midpoint_presents
+              << native_peak_midpoint_presents
               << ",\"peak_current_presents\":"
               << native_peak_current_presents
-              << ",\"retired_candidates\":"
+              << ",\"presentation_interval_frames\":120"
+              << ",\"presentation_history_truncated\":"
+              << (native_presentation_history_truncated ? "true" : "false")
+              << ",\"presentation_intervals\":[";
+    {
+        bool first_interval = true;
+        for (const NativePresentInterval& interval : native_present_intervals) {
+            if (interval.midpoint_presents == 0u &&
+                interval.current_presents == 0u)
+                continue;
+            if (!first_interval) output << ',';
+            first_interval = false;
+            output << "{\"first_frame\":" << interval.first_frame
+                   << ",\"last_frame\":" << interval.last_frame
+                   << ",\"window_ms\":"
+                   << (interval.last_ms - interval.first_ms)
+                   << ",\"midpoint_presents\":"
+                   << interval.midpoint_presents
+                   << ",\"current_presents\":"
+                   << interval.current_presents
+                   << ",\"decision_counts\":[";
+            for (size_t index = 0u;
+                 index < interval.decision_counts.size(); ++index) {
+                if (index != 0u) output << ',';
+                output << interval.decision_counts[index];
+            }
+            output << "],\"eligibility_counts\":[";
+            for (size_t index = 0u;
+                 index < interval.eligibility_counts.size(); ++index) {
+                if (index != 0u) output << ',';
+                output << interval.eligibility_counts[index];
+            }
+            output << "]}";
+        }
+    }
+    output << ']'
+               << ",\"retired_candidates\":"
               << native_midpoint.retired_candidate_count
               << ",\"retired_inserted\":"
               << native_midpoint.retired_inserted_count
@@ -2536,9 +2644,23 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
               << "}"
               << ",\"last_cancel_status\":"
               << native_midpoint.last_cancel_status
-              << ",\"last_cancel_workload_current\":"
-              << native_midpoint.last_cancel_workload_current
-             << ",\"gl_error_count\":" << native_midpoint.gl_error_count
+               << ",\"last_cancel_workload_current\":"
+               << native_midpoint.last_cancel_workload_current
+              << ",\"last_cancel_identity\":{\"valid\":"
+              << (native_midpoint.last_cancel_identity_valid ? "true" : "false")
+              << ",\"scene\":"
+              << native_midpoint.last_cancel_identity_scene
+              << ",\"producer\":"
+              << native_midpoint.last_cancel_identity_producer
+              << ",\"primitive\":"
+              << native_midpoint.last_cancel_identity_primitive
+              << "}"
+              << ",\"last_cancel_commands\":{\"existing\":"
+              << native_midpoint.last_cancel_existing_command_id
+              << ",\"current\":"
+              << native_midpoint.last_cancel_current_command_id
+              << "}"
+              << ",\"gl_error_count\":" << native_midpoint.gl_error_count
              << ",\"reset_total\":" << native_midpoint.reset_count
              << ",\"reset_with_previous\":"
              << native_midpoint.reset_with_previous_count
@@ -2849,6 +2971,10 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            << projected_lifecycle.cutover_attempt_count
            << ",\"cutover_successes\":"
            << projected_lifecycle.cutover_success_count
+           << ",\"cutover_rejections\":"
+           << projected_lifecycle.cutover_rejection_count
+           << ",\"last_rejection_blocker\":"
+           << projected_lifecycle.last_rejection_blocker
            << ",\"native_primitives\":"
            << projected_lifecycle.primitive_count
            << ",\"source_misses\":"

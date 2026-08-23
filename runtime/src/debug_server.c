@@ -51,6 +51,8 @@
 #include "gte_attribution.h"
 #include "lockstep.h"
 #include "debug_overlay.h"
+#include "memory.h"
+#include "psx_scheduler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -5237,9 +5239,9 @@ static void handle_read_ram(int id, const char *json)
     uint32_t addr = hex_to_u32(addr_str);
     int len = json_get_int(json, "len", 1);
     if (len < 1) len = 1;
-    /* Effectively the entire 2 MB RAM in one shot.  Response uses a heap-
+    /* Effectively the entire active RAM profile in one shot. Response uses a heap-
      * sized envelope so we don't truncate. */
-    if (len > 0x200000) len = 0x200000;
+    if ((uint32_t)len > memory_get_ram_size()) len = (int)memory_get_ram_size();
 
     /* Heap buffer for hex chars + JSON envelope.  Each byte = 2 hex chars. */
     size_t env = 256;
@@ -9367,6 +9369,7 @@ static void handle_native_stream_diag(int id, const char *json)
     PsxXgRenderSpriteFt4ShadowSnapshot sprites = {0};
     PsxXgRenderWorldTerrainWaterShadowSnapshot terrain = {0};
     PsxXgRenderAuthInstrumentation auth = {0};
+    GuestRenderNativeStreamReserveDiagnostic reserve = {0};
 
     (void)json;
     if (guest_render_native_stream_snapshot(&stream) !=
@@ -9379,6 +9382,7 @@ static void handle_native_stream_diag(int id, const char *json)
     psx_xg_render_auth_sprite_ft4_shadow_snapshot(&sprites);
     psx_xg_render_auth_world_terrain_water_shadow_snapshot(&terrain);
     psx_xg_render_auth_instrumentation_snapshot(&auth);
+    guest_render_native_stream_reserve_diagnostic(&reserve);
     send_fmt(
         "{\"id\":%d,\"ok\":true,"
         "\"stream\":{\"enabled\":%s,\"staged\":%zu,"
@@ -9393,7 +9397,10 @@ static void handle_native_stream_diag(int id, const char *json)
         "\"first_unbound_opcode\":%u,\"last_unbound_opcode\":%u,"
         "\"first_unsupported_opcode\":%u,"
         "\"last_unsupported_opcode\":%u,"
-        "\"last_command_id\":\"0x%llX\"},"
+        "\"last_command_id\":\"0x%llX\","
+        "\"reserve_command_id\":\"0x%llX\","
+        "\"reserve_candidates\":%zu,\"reserve_active\":%zu,"
+        "\"reserve_available\":%zu},"
         "\"model_ft4\":{\"dispatches\":%llu,"
         "\"average_seams\":%llu,\"farthest_seams\":%llu,"
         "\"seams_without_context\":%llu,"
@@ -9530,6 +9537,9 @@ static void handle_native_stream_diag(int id, const char *json)
         stream.first_native_unsupported_opcode,
         stream.last_native_unsupported_opcode,
         (unsigned long long)stream.last_command_id,
+        (unsigned long long)reserve.command_id,
+        reserve.candidate_count, reserve.active_count,
+        reserve.available_count,
         (unsigned long long)ft4.dispatch_begin_count,
         (unsigned long long)ft4.average_seam_count,
         (unsigned long long)ft4.farthest_seam_count,
@@ -9805,6 +9815,7 @@ static void handle_xg_projected_state(int id, const char *json)
         "{\"id\":%d,\"ok\":true,\"frame\":%llu,"
         "\"initializer_begins\":%llu,\"initializer_registrations\":%llu,"
         "\"cutover_attempts\":%llu,\"cutover_successes\":%llu,"
+        "\"cutover_rejections\":%llu,\"last_rejection_blocker\":%u,"
         "\"native_primitives\":%llu,\"source_misses\":%llu,"
         "\"source_blocked\":%llu,\"pending_resets\":%llu,"
         "\"disable_resets\":%llu,\"code_write_resets\":%llu,"
@@ -9821,6 +9832,8 @@ static void handle_xg_projected_state(int id, const char *json)
         (unsigned long long)snapshot.initializer_registration_count,
         (unsigned long long)snapshot.cutover_attempt_count,
         (unsigned long long)snapshot.cutover_success_count,
+        (unsigned long long)snapshot.cutover_rejection_count,
+        snapshot.last_rejection_blocker,
         (unsigned long long)snapshot.primitive_count,
         (unsigned long long)snapshot.source_miss_count,
         (unsigned long long)snapshot.source_blocked_count,
@@ -10944,7 +10957,8 @@ static void handle_gl_coh_ring(int id, const char *json)
  *             geometry_hash_valid, geometry_hash_hex,
  *             phase_surface_hash_valid, phase_surface_hash_hex,
  *             phase_vram_hash_valid, phase_vram_hash_hex,
- *             [scanout_x,scanout_y,scanout_w,scanout_h]] */
+ *             [scanout_x,scanout_y,scanout_w,scanout_h],
+ *             midpoint_decision, midpoint_eligibility] */
 extern uint64_t gl_renderer_pres_total(void);
 
 static void handle_gl_present_ring(int id, const char *json)
@@ -10955,7 +10969,8 @@ static void handle_gl_present_ring(int id, const char *json)
     };
     int n = json_get_int(json, "n", 300);
     if (n < 1) n = 1;
-    if (n > 4096) n = 4096;
+    if ((uint32_t)n > GL_PRES_RING_CAPACITY)
+        n = (int)GL_PRES_RING_CAPACITY;
     uint64_t total = gl_renderer_pres_total();
     GlRendererPresentationDiagnostics diag = {0};
     gl_renderer_presentation_diagnostics(&diag);
@@ -11013,7 +11028,7 @@ static void handle_gl_present_ring(int id, const char *json)
 
         if (!gl_renderer_pres_get(s, &e)) continue;
         written = snprintf(buf + pos, bufsz - pos,
-                        "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u],%u,%u,%u,%u,\"%016llx\",%u,%llu,%llu,%u,%u,%u,\"%016llx\",%u,\"%016llx\",%u,\"%016llx\",%u,\"%016llx\",[%d,%d,%d,%d]]",
+                         "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u],%u,%u,%u,%u,\"%016llx\",%u,%llu,%llu,%u,%u,%u,\"%016llx\",%u,\"%016llx\",%u,\"%016llx\",%u,\"%016llx\",[%d,%d,%d,%d],%u,%u]",
                         first ? "" : ",", (unsigned long long)s, e.frame,
                         e.path < 7 ? path_name[e.path] : "?", e.t_ms,
                         e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
@@ -11035,7 +11050,8 @@ static void handle_gl_present_ring(int id, const char *json)
                          e.phase_vram_hash_valid,
                          (unsigned long long)e.phase_vram_hash,
                          e.scanout_dx, e.scanout_dy,
-                         e.scanout_w, e.scanout_h);
+                         e.scanout_w, e.scanout_h,
+                         e.midpoint_decision, e.midpoint_eligibility);
         if (written < 0 || (size_t)written >= bufsz - event_start) {
             pos = event_start;
             buf[pos] = '\0';
@@ -16257,6 +16273,57 @@ void debug_server_get_status(int *listening, int *port, int *error)
     if (error)     *error     = s_listen_err;
 }
 
+static int s_kernel_menu_transition_pending;
+
+void debug_server_poll_overlay_actions(void)
+{
+    if (!s_cpu || s_in_command)
+        return;
+
+    const int enable_developer =
+        psx_debug_overlay_take_developer_mode_request();
+    const int open_kernel_menu =
+        psx_debug_overlay_take_kernel_menu_request();
+    if (!enable_developer && !open_kernel_menu)
+        return;
+
+    s_in_command = 1;
+    if (enable_developer) {
+        (void)memory_enable_developer_ram();
+        psx_write_byte(0x80010000u, 0u);
+        psx_write_byte(0x80010001u, 0u);
+        psx_write_byte(0x80010002u, 0u);
+        psx_write_byte(0x80010003u, 0u);
+        overlay_loader_rescan();
+    }
+    if (open_kernel_menu)
+        s_kernel_menu_transition_pending = 1;
+    s_in_command = 0;
+}
+
+void debug_server_apply_pending_guest_transition(CPUState *cpu)
+{
+    if (!cpu || !s_kernel_menu_transition_pending ||
+        psx_get_in_exception())
+        return;
+
+    /* The vblank poll can run inside the current module's guest VSync call.
+     * Wait for psx_check_interrupts to reach a normal block edge with the
+     * VBlank exception fully unwound before changing state: escaping earlier
+     * leaves in_exception latched and returning to the old module with state 0
+     * trips its per-frame BREAK 0x400 invariant. This location is also outside
+     * sdl_vblank_present_body's C++ RAII frames, so the scheduler longjmp does
+     * not skip destructors. */
+    s_kernel_menu_transition_pending = 0;
+    s_in_command = 1;
+    cpu->gpr[4] = 0u;
+    cpu->gpr[31] = 0x80001720u;
+    psx_dispatch_call(cpu, 0x8001996Cu, 0x80001720u);
+    cpu->gpr[4] = 0u;
+    s_in_command = 0;
+    psx_scheduler_resume_at(0x80019ACCu);
+}
+
 void debug_server_poll(void)
 {
     /* Phase 1.0e-e2 starvation watchdog heartbeat. Refreshes the
@@ -16265,7 +16332,9 @@ void debug_server_poll(void)
     extern void starvation_watchdog_heartbeat(void);
     starvation_watchdog_heartbeat();
 
-    if (!s_io_mutex || s_in_command) return;   /* no server, or re-entrant */
+    if (s_in_command) return;
+
+    if (!s_io_mutex) return;   /* no server */
 
     SDL_LockMutex(s_io_mutex);
     if (s_io_state != IO_REQ) { SDL_UnlockMutex(s_io_mutex); return; }

@@ -20,7 +20,7 @@ extern "C" {
 typedef struct {
     uint64_t cpu;      /* GPRs/HI/LO/PC/COP0/GTE + micro-state (muldiv/gte/load-delay) */
     uint64_t irqctl;   /* i_stat/i_mask + interrupts.c timing statics + VBLANK schedule */
-    uint64_t ram;      /* 2MB main RAM (incremental page-hash) */
+    uint64_t ram;      /* active main RAM + profile (incremental page-hash) */
     uint64_t scratch;  /* 1KB scratchpad */
     uint64_t vram;     /* 1MB VRAM (incremental page-hash) */
     uint64_t gpu;      /* GPU regs + FIFO + draw budget + deadlines (boot_state blob) */
@@ -41,7 +41,7 @@ uint64_t cosim_state_hash(CosimSubHashes *sub);
 
 /* Incremental page-hash maintenance. Call from the RAM/VRAM write chokepoints in the
  * cosim build: mark the touched page dirty (cheap); the page hash is recomputed lazily
- * inside cosim_state_hash(). phys is the byte offset into RAM (0..2MB) / VRAM (0..1MB). */
+ * inside cosim_state_hash(). phys is the byte offset into active RAM / VRAM (0..1MB). */
 void cosim_note_ram_write(uint32_t phys, uint32_t nbytes);
 void cosim_note_vram_write(uint32_t byte_off, uint32_t nbytes);
 

@@ -13,6 +13,7 @@
  * and compiled-vs-compiled gates.
  */
 #include "cosim_state.h"
+#include "memory.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,8 +30,6 @@ static inline uint64_t fnv_u64(uint64_t h, uint64_t v) { return fnv(h, &v, 8); }
 
 /* ---- runtime state accessors (existing modules) ---- */
 extern CPUState *debug_cpu_ptr;
-extern uint8_t  *memory_get_ram_ptr(void);
-extern uint8_t  *memory_get_scratchpad_ptr(void);
 extern uint32_t  i_stat;
 extern uint32_t  i_mask;
 extern uint64_t  psx_cycle_count;
@@ -51,19 +50,19 @@ extern uint64_t interrupts_cosim_hash(uint64_t seed);
 /* renderer-agnostic VRAM readback (sw renderer = cheap memcpy). */
 extern void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *dst);
 
-#define RAM_SIZE   (2u * 1024u * 1024u)
 #define SPAD_SIZE  (1024u)
 #define PAGE       4096u
-#define RAM_PAGES  (RAM_SIZE / PAGE)      /* 512 */
+#define RAM_MAX_PAGES (PSX_MAIN_RAM_APERTURE_SIZE / PAGE)
 #define VRAM_W 1024
 #define VRAM_H 512
 #define VRAM_SIZE ((uint32_t)(VRAM_W * VRAM_H * 2))   /* 1 MB */
 #define VRAM_PAGES (VRAM_SIZE / PAGE)     /* 256 */
 
 /* ---- incremental RAM page hashes ---- */
-static uint64_t s_ram_page_h[RAM_PAGES];
-static uint8_t  s_ram_page_dirty[RAM_PAGES];
+static uint64_t s_ram_page_h[RAM_MAX_PAGES];
+static uint8_t  s_ram_page_dirty[RAM_MAX_PAGES];
 static int      s_ram_all_dirty = 1;
+static uint32_t s_ram_hashed_size;
 
 /* ---- VRAM: full-recompute when dirty (draws are periodic, not per-block) ---- */
 static uint64_t s_vram_h;
@@ -82,14 +81,16 @@ void cosim_state_reset(void) {
     memset(s_ram_page_h, 0, sizeof s_ram_page_h);
     memset(s_ram_page_dirty, 0, sizeof s_ram_page_dirty);
     s_ram_all_dirty = 1;
+    s_ram_hashed_size = 0;
     s_vram_dirty = 1; s_vram_h = 0;
     s_inj_ram_phys = -1; s_inj_reg = -1;
 }
 
 void cosim_note_ram_write(uint32_t phys, uint32_t nbytes) {
-    if (phys >= RAM_SIZE) return;
+    uint32_t ram_size = memory_get_ram_size();
+    if (phys >= ram_size) return;
     uint32_t last = phys + (nbytes ? nbytes - 1 : 0);
-    if (last >= RAM_SIZE) last = RAM_SIZE - 1;
+    if (last >= ram_size) last = ram_size - 1;
     for (uint32_t p = phys / PAGE; p <= last / PAGE; p++) s_ram_page_dirty[p] = 1;
 }
 void cosim_note_vram_write(uint32_t byte_off, uint32_t nbytes) {
@@ -152,9 +153,17 @@ uint64_t cosim_state_hash(CosimSubHashes *sub) {
     CosimSubHashes s; memset(&s, 0, sizeof s);
     CPUState *cpu = debug_cpu_ptr;
     uint8_t *ram = memory_get_ram_ptr();
+    uint32_t ram_size = memory_get_ram_size();
+    uint32_t ram_pages = ram_size / PAGE;
+    uint32_t ram_profile = memory_developer_ram_enabled() ? 1u : 0u;
+
+    if (ram_size != s_ram_hashed_size) {
+        s_ram_all_dirty = 1;
+        s_ram_hashed_size = ram_size;
+    }
 
     /* apply pending gate-4 injection to live state */
-    if (s_inj_ram_phys >= 0 && (uint32_t)s_inj_ram_phys < RAM_SIZE) {
+    if (s_inj_ram_phys >= 0 && (uint32_t)s_inj_ram_phys < ram_size) {
         ram[s_inj_ram_phys] ^= s_inj_ram_xor; cosim_note_ram_write((uint32_t)s_inj_ram_phys, 1);
         s_inj_ram_phys = -1;
     }
@@ -168,14 +177,15 @@ uint64_t cosim_state_hash(CosimSubHashes *sub) {
     if (cpu) s.cpu = hash_cpu(cpu);
 
     /* RAM: recompute dirty pages, fold page hashes */
-    for (uint32_t p = 0; p < RAM_PAGES; p++) {
+    for (uint32_t p = 0; p < ram_pages; p++) {
         if (s_ram_all_dirty || s_ram_page_dirty[p]) {
             s_ram_page_h[p] = fnv(FNV_OFF, ram + (size_t)p * PAGE, PAGE);
             s_ram_page_dirty[p] = 0;
         }
     }
     s_ram_all_dirty = 0;
-    s.ram = fnv(FNV_OFF, s_ram_page_h, sizeof s_ram_page_h);
+    s.ram = fnv_u32(fnv_u32(FNV_OFF, ram_profile), ram_size);
+    s.ram = fnv(s.ram, s_ram_page_h, (size_t)ram_pages * sizeof(s_ram_page_h[0]));
 
     s.scratch = fnv(FNV_OFF, memory_get_scratchpad_ptr(), SPAD_SIZE);
 

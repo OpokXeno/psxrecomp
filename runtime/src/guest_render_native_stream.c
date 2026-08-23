@@ -104,6 +104,14 @@ static struct {
         GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_packet_derived_opcode_counts[
         GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_bound_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_zero_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_partial_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_nonprojective_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_unsupported_opcode_counts[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint32_t native_unbound_source_by_opcode[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint32_t native_unbound_pc_by_opcode[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
@@ -132,6 +140,8 @@ static struct {
     GuestRenderNativeStreamMissResolver miss_resolver;
     GuestRenderNativeSourceWriterObserver source_writer_observer;
     GuestRenderNativeStreamReserveDiagnostic reserve_diagnostic;
+    GuestRenderNativeStreamReserveDiagnostic last_unbound_reserve_diagnostic;
+    GuestRenderNativeStreamReserveDiagnostic first_unbound_reserve_diagnostic;
     GuestRenderNativeCommandGeneration *command_generations;
     size_t command_generation_count;
     size_t command_generation_capacity;
@@ -866,6 +876,46 @@ static bool semantic_matches_packet(const GpuRenderSemantic *staged,
     return true;
 }
 
+static uint32_t semantic_packet_mismatch_mask(
+        const GpuRenderSemantic *staged,
+        const GpuRenderSemantic *packet) {
+    const bool textured = packet != NULL && packet->material.textured;
+    const bool compare_color = packet != NULL && !packet->material.raw_texture;
+
+    if (!semantic_is_valid(staged)) return UINT32_C(128);
+    if (!semantic_is_valid(packet)) return UINT32_C(256);
+    if (staged->topology != packet->topology) return UINT32_C(512);
+    if (!packet_material_matches(&staged->material, &packet->material))
+        return UINT32_C(1024);
+    if (packet->topology == GPU_RENDER_SEMANTIC_LINES) {
+        if (staged->line_count != packet->line_count) return UINT32_C(2048);
+        for (uint8_t line = 0u; line < packet->line_count; ++line)
+            for (uint8_t vertex = 0u; vertex < 2u; ++vertex)
+                if (!packet_vertex_matches(
+                        &staged->lines[line].vertices[vertex],
+                        &packet->lines[line].vertices[vertex], false, false))
+                    return UINT32_C(8192);
+        return 0u;
+    }
+    if (staged->triangle_count != packet->triangle_count)
+        return UINT32_C(2048);
+    for (uint8_t triangle = 0u;
+         triangle < packet->triangle_count; ++triangle) {
+        if (staged->triangles[triangle].split_index !=
+                packet->triangles[triangle].split_index ||
+            staged->triangles[triangle].split_count !=
+                packet->triangles[triangle].split_count)
+            return UINT32_C(4096);
+        for (uint8_t vertex = 0u; vertex < 3u; ++vertex)
+            if (!packet_vertex_matches(
+                    &staged->triangles[triangle].vertices[vertex],
+                    &packet->triangles[triangle].vertices[vertex], textured,
+                    compare_color))
+                return UINT32_C(8192);
+    }
+    return 0u;
+}
+
 static void clear_entries(void) {
     stream.total_superseded += stream.count;
     for (size_t index = 0u; index < stream.count; ++index)
@@ -1155,14 +1205,29 @@ static bool resolve_miss_internal(
     GpuRenderTransactionId resolved_visual = {0};
 
     if (!stream.enabled || context == NULL || out_semantic == NULL ||
-        (require_active_visual &&
-         !visual_has_active_entries(context->visual_id)) ||
         context->command_id == UINT64_MAX ||
         context->source_kind == GUEST_RENDER_NATIVE_STREAM_SOURCE_UNKNOWN ||
-        context->word_count == 0u || stream.miss_resolver == NULL ||
-        !stream.miss_resolver(context, &resolved_visual, out_semantic) ||
-        resolved_visual.scene_epoch == 0u || !semantic_is_valid(out_semantic))
+        context->word_count == 0u || stream.miss_resolver == NULL) {
+        stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(1);
         return false;
+    }
+    if (require_active_visual &&
+        !visual_has_active_entries(context->visual_id)) {
+        stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(2);
+        return false;
+    }
+    if (!stream.miss_resolver(context, &resolved_visual, out_semantic)) {
+        stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(4);
+        return false;
+    }
+    if (resolved_visual.scene_epoch == 0u) {
+        stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(8);
+        return false;
+    }
+    if (!semantic_is_valid(out_semantic)) {
+        stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(16);
+        return false;
+    }
     if (out_visual_id != NULL) *out_visual_id = resolved_visual;
     return true;
 }
@@ -1194,6 +1259,7 @@ bool guest_render_native_stream_resolve_active_miss(
             .visual_id = visual,
             .command_id = identity->command_id,
             .container_id = identity->container_id,
+            .packet_semantic = packet_semantic,
             .command_writer = identity->command_writer,
             .container_writer = identity->container_writer,
             .source_kind = identity->source_kind,
@@ -1206,11 +1272,17 @@ bool guest_render_native_stream_resolve_active_miss(
         if (!resolve_miss_internal(
                 &context, &resolved_visual, &semantic, false))
             continue;
-        if (!semantic_matches_packet(&semantic, packet_semantic)) continue;
+        if (!semantic_matches_packet(&semantic, packet_semantic)) {
+            stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(32) |
+                semantic_packet_mismatch_mask(&semantic, packet_semantic);
+            continue;
+        }
         ++stream.reserve_diagnostic.available_count;
         if (matched) {
-            if (memcmp(&matched_semantic, &semantic, sizeof(semantic)) != 0)
+            if (memcmp(&matched_semantic, &semantic, sizeof(semantic)) != 0) {
+                stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(64);
                 return false;
+            }
             if (visual_id_precedes(matched_visual, resolved_visual))
                 matched_visual = resolved_visual;
             continue;
@@ -1223,6 +1295,7 @@ bool guest_render_native_stream_resolve_active_miss(
         GuestRenderNativeStreamMissContext context = {
             .command_id = identity->command_id,
             .container_id = identity->container_id,
+            .packet_semantic = packet_semantic,
             .command_writer = identity->command_writer,
             .container_writer = identity->container_writer,
             .source_kind = identity->source_kind,
@@ -1240,9 +1313,16 @@ bool guest_render_native_stream_resolve_active_miss(
             stream.reserve_diagnostic.last_visual_id = resolved_visual;
             return false;
         }
-        if (resolved_visual.scene_epoch == 0u ||
-            !semantic_matches_packet(&matched_semantic, packet_semantic))
+        if (resolved_visual.scene_epoch == 0u) {
+            stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(8);
             return false;
+        }
+        if (!semantic_matches_packet(&matched_semantic, packet_semantic)) {
+            stream.reserve_diagnostic.miss_failure_mask |= UINT32_C(32) |
+                semantic_packet_mismatch_mask(
+                    &matched_semantic, packet_semantic);
+            return false;
+        }
         stream.reserve_diagnostic.last_visual_id = resolved_visual;
         stream.reserve_diagnostic.available_count = 1u;
         *out_visual_id = resolved_visual;
@@ -1409,6 +1489,7 @@ void guest_render_native_stream_note_native_packet_attribution(
     ++stream.native_opcode_counts[opcode];
     if (bound) ++stream.total_native_bound_packets;
     else {
+        stream.last_unbound_reserve_diagnostic = stream.reserve_diagnostic;
         note_unbound_source_hotspot(opcode, source_word_address, source_pc,
                                     source_function, source_return_address);
         if (stream.native_unbound_source_by_opcode[opcode] == UINT32_MAX)
@@ -1419,6 +1500,7 @@ void guest_render_native_stream_note_native_packet_attribution(
             stream.native_unbound_return_address_by_opcode[opcode] =
                 source_return_address;
         if (stream.total_native_unbound_packets == 0u) {
+            stream.first_unbound_reserve_diagnostic = stream.reserve_diagnostic;
             stream.first_native_unbound_opcode = opcode;
             stream.first_native_unbound_source = source_word_address;
             stream.first_native_unbound_pc = source_pc;
@@ -1458,6 +1540,21 @@ void guest_render_native_stream_note_native_draw_source(
     } else {
         ++stream.total_native_packet_derived_draws;
         ++stream.native_packet_derived_opcode_counts[opcode];
+    }
+}
+
+void guest_render_native_stream_note_gte_binding(
+        uint8_t opcode, uint8_t matched_vertices,
+        uint8_t projective_vertices, uint8_t expected_vertices, bool bound) {
+    if (!stream.enabled || expected_vertices == 0u) return;
+    if (bound) {
+        ++stream.native_gte_bound_opcode_counts[opcode];
+    } else if (matched_vertices == 0u) {
+        ++stream.native_gte_zero_opcode_counts[opcode];
+    } else if (matched_vertices < expected_vertices) {
+        ++stream.native_gte_partial_opcode_counts[opcode];
+    } else if (projective_vertices < expected_vertices) {
+        ++stream.native_gte_nonprojective_opcode_counts[opcode];
     }
 }
 
@@ -1815,6 +1912,18 @@ GuestRenderNativeStreamStatus guest_render_native_stream_snapshot(
     memcpy(out_snapshot->native_packet_derived_opcode_counts,
            stream.native_packet_derived_opcode_counts,
            sizeof(out_snapshot->native_packet_derived_opcode_counts));
+    memcpy(out_snapshot->native_gte_bound_opcode_counts,
+           stream.native_gte_bound_opcode_counts,
+           sizeof(out_snapshot->native_gte_bound_opcode_counts));
+    memcpy(out_snapshot->native_gte_zero_opcode_counts,
+           stream.native_gte_zero_opcode_counts,
+           sizeof(out_snapshot->native_gte_zero_opcode_counts));
+    memcpy(out_snapshot->native_gte_partial_opcode_counts,
+           stream.native_gte_partial_opcode_counts,
+           sizeof(out_snapshot->native_gte_partial_opcode_counts));
+    memcpy(out_snapshot->native_gte_nonprojective_opcode_counts,
+           stream.native_gte_nonprojective_opcode_counts,
+           sizeof(out_snapshot->native_gte_nonprojective_opcode_counts));
     memcpy(out_snapshot->native_unsupported_opcode_counts,
            stream.native_unsupported_opcode_counts,
            sizeof(out_snapshot->native_unsupported_opcode_counts));
@@ -1851,6 +1960,26 @@ GuestRenderNativeStreamStatus guest_render_native_stream_snapshot(
     out_snapshot->first_stage_failure_status =
         stream.first_stage_failure_status;
     out_snapshot->last_command_id = stream.last_command_id;
+    out_snapshot->last_unbound_reserve_command_id =
+        stream.last_unbound_reserve_diagnostic.command_id;
+    out_snapshot->last_unbound_reserve_candidate_count =
+        stream.last_unbound_reserve_diagnostic.candidate_count;
+    out_snapshot->last_unbound_reserve_active_count =
+        stream.last_unbound_reserve_diagnostic.active_count;
+    out_snapshot->last_unbound_reserve_available_count =
+        stream.last_unbound_reserve_diagnostic.available_count;
+    out_snapshot->last_unbound_reserve_miss_failure_mask =
+        stream.last_unbound_reserve_diagnostic.miss_failure_mask;
+    out_snapshot->first_unbound_reserve_command_id =
+        stream.first_unbound_reserve_diagnostic.command_id;
+    out_snapshot->first_unbound_reserve_candidate_count =
+        stream.first_unbound_reserve_diagnostic.candidate_count;
+    out_snapshot->first_unbound_reserve_active_count =
+        stream.first_unbound_reserve_diagnostic.active_count;
+    out_snapshot->first_unbound_reserve_available_count =
+        stream.first_unbound_reserve_diagnostic.available_count;
+    out_snapshot->first_unbound_reserve_miss_failure_mask =
+        stream.first_unbound_reserve_diagnostic.miss_failure_mask;
     out_snapshot->last_status = stream.last_status;
     out_snapshot->last_stage_status = stream.last_stage_status;
     out_snapshot->last_consume_status = stream.last_consume_status;

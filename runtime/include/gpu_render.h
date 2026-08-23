@@ -214,6 +214,9 @@ typedef struct GpuRenderSemantic {
      * Packet addresses and draw ordinals are deliberately not identities: PSX
      * games routinely double-buffer packet arenas and reorder OT contents. */
     GpuRenderInterpolationIdentity interpolation_identity;
+    /* Submission provenance for diagnostics only. Matching deliberately ignores
+     * this double-buffered packet address. */
+    uint64_t submission_command_id;
 } GpuRenderSemantic;
 
 typedef enum GpuRenderTemporalCullFlags {

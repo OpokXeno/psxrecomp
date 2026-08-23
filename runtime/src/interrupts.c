@@ -33,6 +33,7 @@
 #include "dma.h"
 #include "native_render_baseline.h"
 #include "cpu_state.h"
+#include "memory.h"
 #include "debug_server.h"
 #include "event_ring.h"
 #include "lockstep.h"
@@ -190,7 +191,8 @@ static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycle
 extern uint64_t g_vblank_raise_count;
 extern int g_cosim_dirty_pump_site;
 
-/* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
+/* Tracks synchronous exception dispatch. Hardware events continue advancing;
+ * CPU exception delivery is gated separately by SR and the nesting checks. */
 static int in_exception;
 /* Guest-cycle deadline: IRQ delivery is blocked while psx_get_cycle_count() is
  * below this. 0 = no cooldown active. Counted in guest cycles (not calls) so both
@@ -417,7 +419,10 @@ static void fire_vblank_edge(void) {
 
 void interrupts_service_scheduled_events(void) {
     note_sio_progress_cycle();
-    if (in_exception) return;
+    /* Exception handling does not stop the GPU clock on real hardware. Raise
+     * VBlank on schedule and let psx_check_interrupts apply the architectural
+     * SR/nesting gates to delivery. Deferring the edge here deadlocks handlers
+     * that re-enable IEc and wait for a later VBlank. */
     while (cycles_since_vblank >= VBLANK_CYCLES) {
         if (should_defer_vblank_for_sio()) return;
         fire_vblank_edge();
@@ -1004,6 +1009,15 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 
 void psx_check_interrupts(CPUState* cpu) {
     psx_cyc_batch_flush();
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* The flush above may have presented a VBlank and queued a host-requested
+     * guest transition. Consume it at this normal block edge only after the
+     * exception handler has fully unwound; this is outside the presentation
+     * callback's C++ frames and is the same class of safe boundary used by
+     * savestate_poll below. */
+    if (!in_exception)
+        debug_server_apply_pending_guest_transition(cpu);
+#endif
     { extern void psx_post_load_grace_tick(void); psx_post_load_grace_tick(); }
     extern int g_ls_suppress_record;
     extern int psx_netplay_active(void);
@@ -1537,12 +1551,12 @@ irq_deliver_eval:
             if (psx_scheduler_top_level_resume_active() &&
                 cpu->pc != 0u && (cpu->pc & 3u) == 0u) {
                 uint32_t phys = cpu->pc & 0x1FFFFFFFu;
-                if (phys < 0x00200000u ||
+                if (phys < memory_get_ram_size() ||
                     (phys >= 0x1FC00000u && phys < 0x1FC80000u))
                     real_pc = cpu->pc;
             }
         }
-        /* Accept the real resume PC from guest RAM (<2MB) OR the BIOS ROM
+        /* Accept the real resume PC from active guest RAM OR the BIOS ROM
          * window. The old RAM-only guard rejected ROM-space block leaders
          * (e.g. OpenBIOS mcWaitForStatus spinning at 0xBFC076xx during a
          * card op), forcing EVERY such delivery onto the legacy sentinel.
@@ -1557,7 +1571,7 @@ irq_deliver_eval:
          * ROM pc still falls back to the sentinel (pre-fix behavior);
          * RAM acceptance is unchanged byte-for-byte. */
         uint32_t real_phys = real_pc & 0x1FFFFFFFu;
-        int resume_in_ram  = real_phys < 0x00200000u;
+        int resume_in_ram  = real_phys < memory_get_ram_size();
         int resume_in_rom  = real_phys >= 0x1FC00000u && real_phys < 0x1FC80000u &&
                              psx_is_dispatchable(real_pc);
         if (real_pc != 0u && (real_pc & 0x3u) == 0u &&

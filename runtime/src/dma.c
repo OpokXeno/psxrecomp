@@ -17,9 +17,11 @@
 #include "crash_trace.h"
 #include "dirty_ram_interp.h"
 #include "gpu.h"
+#include "ram_provenance.h"
 #include "guest_render_bridge.h"
 #include "guest_render_native_stream.h"
 #include "mdec.h"
+#include "memory.h"
 #include "native_render_baseline.h"
 #include "mod_memory.h"
 #include "overlay_capture.h"
@@ -313,7 +315,8 @@ static void start_cdrom_dma_capture(uint32_t requested_words) {
     memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
     cdrom_dma_active_entry.seq = cdrom_dma_history_seq++;
     cdrom_dma_active_entry.frame_start = (uint32_t)s_frame_count;
-    cdrom_dma_active_entry.start_addr = channels[3].madr & 0x1FFFFCu;
+    cdrom_dma_active_entry.start_addr =
+        channels[3].madr & memory_get_ram_word_mask();
     cdrom_dma_active_entry.final_addr = cdrom_dma_active_entry.start_addr;
     cdrom_dma_active_entry.requested_words = requested_words;
     cdrom_dma_active_entry.bcr = channels[3].bcr;
@@ -360,7 +363,8 @@ static void finish_cdrom_dma_capture(uint32_t final_addr, uint8_t completed) {
     cdrom_debug_snapshot(&s);
 
     cdrom_dma_active_entry.frame_end = (uint32_t)s_frame_count;
-    cdrom_dma_active_entry.final_addr = final_addr & 0x1FFFFCu;
+    cdrom_dma_active_entry.final_addr =
+        final_addr & memory_get_ram_word_mask();
     cdrom_dma_active_entry.dicr_end = dicr_read_value(dicr);
     cdrom_dma_active_entry.i_stat_end = i_stat;
     cdrom_dma_active_entry.sector_read_pos_end = s.sector_read_pos;
@@ -409,26 +413,22 @@ static uint32_t transfer_word_count(int ch) {
     return block_size;
 }
 
-/* A single DMA kick can never legitimately move more data than the larger
- * of RAM (2 MB) or VRAM (1 MB): 0x80000 words. A bigger count means the
+/* A single DMA kick can never legitimately move more data than active RAM.
+ * A bigger count means the
  * MADR/BCR/CHCR the guest programmed are corrupt; executing it would grind
  * through billions of masked-wrap accesses feeding garbage to the device
  * sinks. Halt diagnosably with rings intact instead. Linked-list GPU
  * transfers (ch2 sync mode 2) don't use BCR, so length isn't checked there
  * (the node walker has its own MAX_NODES cycle cap). */
-#define DMA_MAX_TRANSFER_WORDS 0x80000u
-
 #ifndef DMA2_LINKED_LIST_MAX_NODES
 #define DMA2_LINKED_LIST_MAX_NODES 0x40000u
 #endif
-
-#define DMA2_RAM_WORD_MASK 0x1FFFFCu
 
 static void validate_transfer_length(int ch) {
     uint32_t sync_mode = (channels[ch].chcr >> 9) & 3u;
     if (ch == 2 && sync_mode == 2) return;
     uint32_t words = transfer_word_count(ch);
-    if (words > DMA_MAX_TRANSFER_WORDS) {
+    if (words > memory_get_ram_size() / 4u) {
         static char reason[160];
         snprintf(reason, sizeof(reason),
                  "DMA ch%d insane transfer length 0x%X words "
@@ -463,7 +463,8 @@ static void cancel_async_transfer(int ch) {
         mdec_async[ch].cycles_accum = 0;
     }
     if (ch == 3) {
-        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 0);
+        finish_cdrom_dma_capture(
+            channels[3].madr & memory_get_ram_word_mask(), 0);
         cdrom_async.active = 0;
         cdrom_async.debug_started = 0;
         cdrom_async.total_words = 0;
@@ -539,9 +540,11 @@ static void start_async_mdec_transfer(int ch) {
     a->cycles_accum = 0;
 
     if (ch == 0) {
-        mdec_debug_dma_in_start(channels[0].madr & 0x1FFFFCu, a->remaining_words);
+        mdec_debug_dma_in_start(
+            channels[0].madr & memory_get_ram_word_mask(), a->remaining_words);
     } else {
-        mdec_debug_dma_out_start(channels[1].madr & 0x1FFFFCu, a->remaining_words);
+        mdec_debug_dma_out_start(
+            channels[1].madr & memory_get_ram_word_mask(), a->remaining_words);
     }
     a->debug_started = 1;
 }
@@ -565,11 +568,12 @@ static void start_async_cdrom_transfer(void) {
     a->total_words = transfer_word_count(3);
     a->remaining_words = a->total_words;
     a->cycles_accum = 0;
-    a->start_addr = channels[3].madr & 0x1FFFFCu;
+    a->start_addr = channels[3].madr & memory_get_ram_word_mask();
     start_cdrom_dma_capture(a->total_words);
 
     if (a->total_words == 0) {
-        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 1);
+        finish_cdrom_dma_capture(
+            channels[3].madr & memory_get_ram_word_mask(), 1);
         cancel_async_transfer(3);
         complete_transfer(3);
     }
@@ -583,13 +587,17 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
     uint32_t size       = a->total_words * 4u;
 
     /* Log and capture game-data transfers only.
-     * Transfers to 0x1C0000+ are FMV/streaming buffers; skip them. */
-    if (!step && size > 0 && load_start < 0x1C0000u) {
-        /* The DMA word loop wraps inside the 2 MB RAM mask; the capture
+     * Transfers in the retail RAM top 256 KiB are FMV/streaming buffers; skip
+     * them. Developer-RAM destinations retain their distinct identity. */
+    if (!step && size > 0 &&
+        (load_start < 0x1C0000u ||
+         load_start >= PSX_MAIN_RAM_RETAIL_SIZE)) {
+        /* The DMA word loop wraps inside the active RAM mask; the capture
          * path below takes a flat ram+offset span and must not follow the
          * wrap past the end of host RAM. */
-        if (size > 0x200000u - load_start)
-            size = 0x200000u - load_start;
+        uint32_t ram_size = memory_get_ram_size();
+        if (size > ram_size - load_start)
+            size = ram_size - load_start;
         int lba = cdrom_get_setloc_lba();
         if (lba >= 0) cd_dma_log_push(lba, load_start, size);
 
@@ -619,7 +627,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
 
     if ((ch == 0 && direction == 0) || (ch == 1 && direction != 0)) {
         uint32_t words = a->total_words;
-        uint32_t addr = channels[ch].madr & 0x1FFFFCu;
+        uint32_t addr = channels[ch].madr & memory_get_ram_word_mask();
         finish_async_mdec_transfer(ch, addr, words);
         return;
     }
@@ -639,7 +647,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
     uint32_t words_budget = a->cycles_accum / cycles_per_word;
     if (words_budget == 0) return;
 
-    uint32_t addr = channels[ch].madr & 0x1FFFFCu;
+    uint32_t addr = channels[ch].madr & memory_get_ram_word_mask();
     uint32_t moved = 0;
     /* ch1 (MDEC→RAM) writes guest RAM here in a deferred step; mark it as
      * DMA-sourced so write-provenance tags these writes with ch1 + the kick PC
@@ -660,13 +668,13 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
             if (!mdec_dma_write_ready()) break;
             uint32_t n = a->remaining_words < words_budget
                        ? a->remaining_words : words_budget;
-            uint32_t max_by_ram = (0x200000u - addr) / 4u;
+            uint32_t max_by_ram = (memory_get_ram_size() - addr) / 4u;
             if (max_by_ram == 0) break;
             if (n > max_by_ram) n = max_by_ram;
             uint32_t got =
                 mdec_dma_write_words((const uint32_t *)(ram + addr), n);
             if (got == 0) break;
-            addr = (addr + got * 4u) & 0x1FFFFCu;
+            addr = (addr + got * 4u) & memory_get_ram_word_mask();
             a->remaining_words -= got;
             words_budget -= got;
             moved += got;
@@ -682,7 +690,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
                 psx_write_word(addr, mdec_dma_read_word());
             }
 
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = (addr + addr_step) & memory_get_ram_word_mask();
             a->remaining_words--;
             words_budget--;
             moved++;
@@ -705,26 +713,26 @@ static void execute_ch0_mdec_in(void) {
     uint32_t direction = chcr & 1;           /* 1=from RAM to MDEC */
     uint32_t step = (chcr >> 1) & 1;
     uint32_t total_words = transfer_word_count(0);
-    uint32_t addr = channels[0].madr & 0x1FFFFCu;
+    uint32_t addr = channels[0].madr & memory_get_ram_word_mask();
     int32_t addr_step = step ? -4 : 4;
 
     if (direction != 0) {
         mdec_debug_dma_in_start(addr, total_words);
         if (addr_step == 4 && total_words > 0 &&
-            addr + total_words * 4u <= 0x200000u) {
+            total_words <= (memory_get_ram_size() - addr) / 4u) {
             extern uint8_t *memory_get_ram_ptr(void);
             uint32_t got = mdec_dma_write_words(
                 (const uint32_t *)(memory_get_ram_ptr() + addr), total_words);
-            addr = (addr + got * 4u) & 0x1FFFFCu;
+            addr = (addr + got * 4u) & memory_get_ram_word_mask();
             /* If the FIFO stalled mid-burst, finish any remainder word-wise. */
             for (uint32_t i = got; i < total_words; i++) {
                 mdec_dma_write_word(psx_read_word(addr));
-                addr = (addr + 4u) & 0x1FFFFCu;
+                addr = (addr + 4u) & memory_get_ram_word_mask();
             }
         } else {
             for (uint32_t i = 0; i < total_words; i++) {
                 mdec_dma_write_word(psx_read_word(addr));
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = (addr + addr_step) & memory_get_ram_word_mask();
             }
         }
         mdec_debug_dma_in_end(addr, total_words);
@@ -739,14 +747,14 @@ static void execute_ch1_mdec_out(void) {
     uint32_t direction = chcr & 1;           /* 0=from MDEC to RAM */
     uint32_t step = (chcr >> 1) & 1;
     uint32_t total_words = transfer_word_count(1);
-    uint32_t addr = channels[1].madr & 0x1FFFFCu;
+    uint32_t addr = channels[1].madr & memory_get_ram_word_mask();
     int32_t addr_step = step ? -4 : 4;
 
     if (direction == 0) {
         mdec_debug_dma_out_start(addr, total_words);
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, mdec_dma_read_word());
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = (addr + addr_step) & memory_get_ram_word_mask();
         }
         mdec_debug_dma_out_end(addr, total_words);
         channels[1].madr = addr;
@@ -792,7 +800,8 @@ static void dma2_feed_journal_command(
         gpu_set_gp0_source(&source);
         gpu_write_gp0(words[i]);
         word_addr = linked ? psx_mod_gpu_dma_resolve_address(word_addr + 4u)
-                           : ((word_addr + 4u) & DMA2_RAM_WORD_MASK);
+                           : ((word_addr + 4u) &
+                              memory_get_ram_word_mask());
     }
 }
 
@@ -934,7 +943,8 @@ static bool dma2_native_submit_sequence(
             ? psx_mod_gpu_dma_resolve_address((uint32_t)(
                 (int64_t)start_addr + (int64_t)word_offset * addr_step))
             : (uint32_t)((int64_t)start_addr +
-                         (int64_t)word_offset * addr_step) & DMA2_RAM_WORD_MASK;
+                         (int64_t)word_offset * addr_step) &
+              memory_get_ram_word_mask();
         GpuRenderOracleSource source;
         source.kind = source_kind;
         source.word_address = command_addr;
@@ -955,10 +965,13 @@ static bool dma2_native_submit_sequence(
 static bool dma2_native_preflight_sequence(
         const uint32_t *words, size_t word_count, uint32_t start_addr,
         int32_t addr_step, GpuRenderOracleSourceKind source_kind,
-        uint32_t container_addr) {
+        uint32_t container_addr, uint32_t incoming_link_addr,
+        bool incoming_link_valid, uint64_t transaction_receipt) {
     size_t word_offset = 0u;
     GpuNativePacketStreamSnapshot pending = {0};
 
+    gpu_native_preflight_set_dma_publication(
+        incoming_link_addr, incoming_link_valid, transaction_receipt);
     if (!gpu_native_packet_stream_snapshot(&pending)) return false;
     if (pending.active) {
         size_t continuation_words;
@@ -981,7 +994,8 @@ static bool dma2_native_preflight_sequence(
             ? psx_mod_gpu_dma_resolve_address((uint32_t)(
                 (int64_t)start_addr + (int64_t)word_offset * addr_step))
             : (uint32_t)((int64_t)start_addr +
-                         (int64_t)word_offset * addr_step) & DMA2_RAM_WORD_MASK;
+                          (int64_t)word_offset * addr_step) &
+              memory_get_ram_word_mask();
         const GpuRenderOracleSource source = {
             source_kind, command_addr, command_addr / 4u,
             container_addr / 4u,
@@ -1012,6 +1026,7 @@ static bool dma2_native_preflight_block(
         GpuRenderOracleSourceKind source_kind, uint32_t container_addr) {
     uint32_t *words;
     bool valid;
+    const uint64_t transaction_receipt = ram_provenance_publish_event();
 
     if (total_words == 0u || !gpu_native_preflight_reservation_begin())
         return false;
@@ -1023,12 +1038,12 @@ static bool dma2_native_preflight_block(
     for (uint32_t index = 0u; index < total_words; ++index) {
         const uint32_t address = (uint32_t)(
             (int64_t)start_addr + (int64_t)index * addr_step) &
-            DMA2_RAM_WORD_MASK;
+            memory_get_ram_word_mask();
         words[index] = psx_read_word(address);
     }
     valid = dma2_native_preflight_sequence(
         words, total_words, start_addr, addr_step, source_kind,
-        container_addr);
+        container_addr, 0u, false, transaction_receipt);
     free(words);
     if (!valid || !gpu_native_preflight_reservation_seal()) {
         gpu_native_preflight_reservation_abort();
@@ -1042,7 +1057,10 @@ static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
     uint32_t cycle_anchor = addr;
     uint32_t cycle_power = 1u;
     uint32_t cycle_length = 0u;
+    uint32_t incoming_link_addr = 0u;
+    bool incoming_link_valid = false;
     bool result = false;
+    const uint64_t transaction_receipt = ram_provenance_publish_event();
 
     if (!gpu_native_preflight_reservation_begin()) return false;
 
@@ -1059,7 +1077,9 @@ static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
                     addr + 4u + index * 4u));
             valid = dma2_native_preflight_sequence(
                 words, num_words, psx_mod_gpu_dma_resolve_address(addr + 4u), 4,
-                GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, addr);
+                GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST, addr,
+                incoming_link_addr, incoming_link_valid,
+                transaction_receipt);
         }
         if (!valid) goto done;
         if (next == UINT32_C(0x00ffffff)) {
@@ -1067,6 +1087,8 @@ static bool dma2_native_preflight_linked_list(uint32_t start_addr) {
             break;
         }
         if ((next & 3u) != 0u) goto done;
+        incoming_link_addr = addr;
+        incoming_link_valid = true;
         addr = psx_mod_gpu_dma_resolve_address(next);
         ++cycle_length;
         if (addr == cycle_anchor) goto done;
@@ -1102,8 +1124,8 @@ static bool dma2_native_read_block(
     }
     for (uint32_t index = 0u; index < total_words; ++index) {
         const uint32_t address = (uint32_t)((int64_t)start_addr +
-                                            (int64_t)index * addr_step) &
-                                 DMA2_RAM_WORD_MASK;
+                                             (int64_t)index * addr_step) &
+                                  memory_get_ram_word_mask();
         words[index] = psx_read_word(address);
     }
     if (!dma2_native_submit_sequence(
@@ -1330,10 +1352,11 @@ static DMA2JournalBuildStatus dma2_build_block_journal(
     memset(storage, 0, sizeof(*storage));
     storage->actual_words = total_words;
     storage->final_madr =
-        (start_addr + total_words * 4u) & DMA2_RAM_WORD_MASK;
+        (start_addr + total_words * 4u) & memory_get_ram_word_mask();
     for (size_t index = 0u; index < total_words; ++index)
         storage->words[index] = psx_read_word(
-            (start_addr + (uint32_t)index * 4u) & DMA2_RAM_WORD_MASK);
+            (start_addr + (uint32_t)index * 4u) &
+            memory_get_ram_word_mask());
 
     while (word_offset < total_words) {
         size_t command_words;
@@ -1345,7 +1368,8 @@ static DMA2JournalBuildStatus dma2_build_block_journal(
         status = dma2_append_journal_command(
             storage, GUEST_RENDER_TRANSACTION_SOURCE_DMA, start_addr,
             start_addr,
-            (start_addr + (uint32_t)word_offset * 4u) & DMA2_RAM_WORD_MASK,
+            (start_addr + (uint32_t)word_offset * 4u) &
+                memory_get_ram_word_mask(),
             word_offset, command_words, &command_count);
         if (status != DMA2_JOURNAL_OK) return status;
         word_offset += command_words;
@@ -1480,7 +1504,6 @@ static uint32_t dma2_execute_linked_list(void) {
     GuestRenderTransactionStatus pending_status;
     uint64_t begin_vram_serial = 0u;
 
-    gpu_prepare_submission();
     if (dma2_native_submission_authoritative()) {
         if (!gpu_gp0_parser_is_idle() ||
             !dma2_native_preflight_linked_list(start_addr)) {
@@ -1587,7 +1610,7 @@ static uint32_t dma2_execute_block_original(
 
         gpu_set_gp0_source(&source);
         gpu_write_gp0(word);
-        addr = (addr + addr_step) & DMA2_RAM_WORD_MASK;
+        addr = (addr + addr_step) & memory_get_ram_word_mask();
     }
     channels[2].madr = addr;
     return total_words;
@@ -1601,7 +1624,6 @@ static uint32_t dma2_execute_block(
     GuestRenderTransactionStatus pending_status;
     uint64_t begin_vram_serial;
 
-    gpu_prepare_submission();
     if (dma2_native_submission_authoritative()) {
         dma2_native_failure_reason[0] = '\0';
         if (!gpu_gp0_parser_is_idle() ||
@@ -1625,7 +1647,7 @@ static uint32_t dma2_execute_block(
         }
         channels[2].madr = (uint32_t)((int64_t)start_addr +
                                       (int64_t)total_words * addr_step) &
-                           DMA2_RAM_WORD_MASK;
+                           memory_get_ram_word_mask();
         return total_words;
     }
     guest_render_transaction_invalidate_deferred();
@@ -1717,12 +1739,13 @@ static uint32_t execute_ch2_gpu(void) {
             uint32_t block_size = channels[2].bcr & 0xFFFF;
             uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
             uint32_t total_words = block_size * block_count;
-            uint32_t addr = channels[2].madr & 0x1FFFFCu;
+            uint32_t addr =
+                channels[2].madr & memory_get_ram_word_mask();
             int32_t  addr_step = step ? -4 : 4;
             for (uint32_t i = 0; i < total_words; i++) {
                 uint32_t pixel_data = gpu_read_gpuread();
                 psx_write_word(addr, pixel_data);
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = (addr + addr_step) & memory_get_ram_word_mask();
             }
             channels[2].madr = addr;
             actual_words = total_words;
@@ -1732,12 +1755,13 @@ static uint32_t execute_ch2_gpu(void) {
     }
 
     /* direction == 1: RAM → GPU */
+    gpu_prepare_submission();
     if (sync_mode == 1) {
         /* Block mode: BCR bits 0-15 = block size (words), bits 16-31 = block count */
         uint32_t block_size = channels[2].bcr & 0xFFFF;
         uint32_t block_count = (channels[2].bcr >> 16) & 0xFFFF;
         uint32_t total_words = block_size * block_count;
-        uint32_t addr = channels[2].madr & 0x1FFFFCu; /* mask to RAM, word-aligned */
+        uint32_t addr = channels[2].madr & memory_get_ram_word_mask();
         int32_t  addr_step = step ? -4 : 4;
 
         actual_words = dma2_execute_block(addr, total_words, addr_step);
@@ -1752,7 +1776,7 @@ static uint32_t execute_ch2_gpu(void) {
         /* Burst mode (sync_mode == 0) */
         uint32_t word_count = channels[2].bcr & 0xFFFF;
         if (word_count == 0) word_count = 0x10000; /* 0 means 0x10000 */
-        uint32_t addr = channels[2].madr & 0x1FFFFCu;
+        uint32_t addr = channels[2].madr & memory_get_ram_word_mask();
         uint64_t container_ordinal = addr / 4u;
         int32_t  addr_step = step ? -4 : 4;
         const bool native_authoritative =
@@ -1788,14 +1812,16 @@ static uint32_t execute_ch2_gpu(void) {
                 };
                 gpu_set_gp0_source(&source);
                 gpu_write_gp0(word);
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = (addr + addr_step) & memory_get_ram_word_mask();
             }
             actual_words = word_count;
         }
         channels[2].madr = addr;
         if (native_authoritative) {
-            addr = (uint32_t)((int64_t)(channels[2].madr & 0x1ffffcu) +
-                              (int64_t)word_count * addr_step) & 0x1ffffcu;
+            addr = (uint32_t)((int64_t)(channels[2].madr &
+                                        memory_get_ram_word_mask()) +
+                              (int64_t)word_count * addr_step) &
+                   memory_get_ram_word_mask();
             channels[2].madr = addr;
         }
     }
@@ -1825,18 +1851,18 @@ static uint32_t execute_ch4_spu(void) {
     uint32_t direction = chcr & 1;           /* 1=from RAM to SPU, 0=SPU to RAM */
     uint32_t step = (chcr >> 1) & 1;
     uint32_t total_words = transfer_word_count(4);
-    uint32_t addr = channels[4].madr & 0x1FFFFCu;
+    uint32_t addr = channels[4].madr & memory_get_ram_word_mask();
     int32_t addr_step = step ? -4 : 4;
 
     if (direction != 0) {
         for (uint32_t i = 0; i < total_words; i++) {
             spu_dma_write(psx_read_word(addr));
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = (addr + addr_step) & memory_get_ram_word_mask();
         }
         /* One aggregated event per SPU-bound transfer (per-word would flood
          * the ring: a full sound-bank upload is ~128k words). */
         audio_trace_event(AUDIO_EV_DMA_WRITE, total_words,
-                          channels[4].madr & 0x1FFFFCu);
+                          channels[4].madr & memory_get_ram_word_mask());
     } else {
         /* SPU RAM -> CPU RAM. This direction previously zero-filled the
          * destination, which is not a transfer at all: SPU RAM is readable
@@ -1847,10 +1873,10 @@ static uint32_t execute_ch4_spu(void) {
          * fell back to a cold-boot path. */
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, spu_dma_read());
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = (addr + addr_step) & memory_get_ram_word_mask();
         }
         audio_trace_event(AUDIO_EV_DMA_READ, total_words,
-                          channels[4].madr & 0x1FFFFCu);
+                          channels[4].madr & memory_get_ram_word_mask());
     }
 
     channels[4].madr = addr;
@@ -1864,7 +1890,7 @@ static void execute_ch6_otc(void) {
      * BCR bits 0-15 = number of entries. */
     uint32_t num_entries = channels[6].bcr & 0xFFFF;
     if (num_entries == 0) num_entries = 0x10000;
-    uint32_t addr = channels[6].madr & 0x1FFFFCu;
+    uint32_t addr = channels[6].madr & memory_get_ram_word_mask();
 
     for (uint32_t i = 0; i < num_entries; i++) {
         uint32_t val;
@@ -1876,7 +1902,7 @@ static void execute_ch6_otc(void) {
             val = (addr - 4) & 0x00FFFFFFu;
         }
         psx_write_word(addr, val);
-        addr = (addr - 4) & 0x1FFFFCu;
+        addr = (addr - 4) & memory_get_ram_word_mask();
     }
 
     complete_transfer(6);
@@ -1892,20 +1918,20 @@ static void execute_ch5_pio(void) {
     uint32_t direction = chcr & 1u;
     uint32_t step = (chcr >> 1) & 1u;
     uint32_t total_words = transfer_word_count(5);
-    uint32_t addr = channels[5].madr & 0x1FFFFCu;
+    uint32_t addr = channels[5].madr & memory_get_ram_word_mask();
     int32_t addr_step = step ? -4 : 4;
 
     if (direction == 1) {
         /* from RAM to device: just read and discard */
         for (uint32_t i = 0; i < total_words; i++) {
             (void)psx_read_word(addr);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = (addr + addr_step) & memory_get_ram_word_mask();
         }
     } else {
         /* to RAM from device: write zeros (device not emulated) */
         for (uint32_t i = 0; i < total_words; i++) {
             psx_write_word(addr, 0);
-            addr = (addr + addr_step) & 0x1FFFFCu;
+            addr = (addr + addr_step) & memory_get_ram_word_mask();
         }
     }
     channels[5].madr = addr;
@@ -2112,7 +2138,8 @@ void dma_advance(uint32_t cycles) {
             }
 
             uint32_t words_budget = a->cycles_accum / DMA_CDROM_CYCLES_PER_WORD;
-            uint32_t addr = channels[3].madr & 0x1FFFFCu;
+            uint32_t addr =
+                channels[3].madr & memory_get_ram_word_mask();
             uint32_t moved = 0;
             g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
             g_dma_initiator_pc = s_dma_ch_initiator_pc[3];  /* deferred: restore kick PC */
@@ -2121,9 +2148,11 @@ void dma_advance(uint32_t cycles) {
              * word. Scheduling-time capture was too early because guest code
              * can continue executing while the CD device is not ready. */
             if (a->remaining_words == a->total_words && words_budget > 0 &&
-                addr < 0x1C0000u) {
+                 (addr < 0x1C0000u ||
+                  addr >= PSX_MAIN_RAM_RETAIL_SIZE)) {
                 uint32_t bytes = a->total_words * 4u;
-                if (bytes > 0x200000u - addr) bytes = 0x200000u - addr;
+                uint32_t ram_size = memory_get_ram_size();
+                if (bytes > ram_size - addr) bytes = ram_size - addr;
                 overlay_capture_before_dma(addr, bytes);
             }
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
@@ -2132,7 +2161,7 @@ void dma_advance(uint32_t cycles) {
                 psx_write_word(addr, word);
                 record_cdrom_dma_word(word);
                 dirty_ram_mark_executable_range(addr, 4);
-                addr = (addr + addr_step) & 0x1FFFFCu;
+                addr = (addr + addr_step) & memory_get_ram_word_mask();
                 a->remaining_words--;
                 words_budget--;
                 moved++;

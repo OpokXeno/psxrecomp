@@ -33,6 +33,7 @@
 extern "C" void psx_event_step_conservative_env_init(void);
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "gte_native_provenance.h"
 #include "mdec.h"
 #include "pgxp.h"
 #include "interrupts.h"
@@ -74,6 +75,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #define RECOMP_AUDIO_DRC_IMPL
 #include "recomp_audio_drc.h"
 #include "memcard.h"
+#include "memory.h"
+#include "ram_provenance.h"
 #include "debug_server.h"
 #include "crash_trace.h"
 #include "freeze_heartbeat.h"
@@ -155,14 +158,13 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <unistd.h>
 #endif
 
-#ifndef PSX_NO_DEBUG_TOOLS
 static bool native_source_writer_observer(
         uint32_t source_word_address,
         GuestRenderNativeSourceWriter *out_writer) {
     uint32_t pc = 0u;
     uint32_t ra = 0u;
 
-    if (!out_writer || !debug_server_find_last_ram_writer(
+    if (!out_writer || !ram_provenance_last_writer(
             source_word_address, &pc, &ra))
         return false;
     out_writer->pc = pc;
@@ -170,7 +172,6 @@ static bool native_source_writer_observer(
     out_writer->return_address = ra;
     return true;
 }
-#endif
 
 #ifndef PSX_DEFAULT_BIOS_PATH
 /* Compile-time fallback name only — not an implicit player choice.
@@ -382,6 +383,7 @@ struct PlayerInput {
     bool    rumble_warned = false;
 };
 static PlayerInput g_players[PSX_MAX_PLAYERS];
+static int g_controller_ports_swapped = 0;
 static std::string s_input_replay_evidence_path;
 /* Offline SIO sample loop bound (from game.toml players; clamped). */
 static int g_offline_pad_count = 2;
@@ -4257,6 +4259,36 @@ static void refresh_player_devices(void) {
     }
 }
 
+extern "C" int psx_input_controller_ports_swapped(void) {
+    return g_controller_ports_swapped;
+}
+
+extern "C" int psx_input_controller_port_swap_available(void) {
+#if PSX_MAX_PLAYERS < 2
+    return 0;
+#else
+    return !input_replay::active() && !psx_netplay_active();
+#endif
+}
+
+extern "C" int psx_input_swap_controller_ports(void) {
+#if PSX_MAX_PLAYERS < 2
+    return 0;
+#else
+    if (!psx_input_controller_port_swap_available()) return 0;
+
+    std::swap(g_players[0], g_players[1]);
+    g_controller_ports_swapped = !g_controller_ports_swapped;
+
+    /* Do not carry a held button or stale connection across ports. Device,
+     * pad mode and rumble ownership move together with PlayerInput. */
+    for (int s = 0; s < 2; ++s)
+        sio_set_pad_state_slot(s, 0xFFFFu);
+    refresh_player_devices();
+    return 1;
+#endif
+}
+
 /* Parse a [controller] device string into a player slot:
  *   "none" -> no pad; "keyboard" -> keyboard map; otherwise an SDL GUID. */
 static void set_player_device(PlayerInput& p, const std::string& dev, int mode) {
@@ -4920,7 +4952,7 @@ static int capture_pad_slot(const host_input::HostInputSnapshot& snapshot, int s
     }
     const host_input::MappingOptions options{
         replay_map, player.deadzone, psx_debug_overlay_swallow_keyboard(),
-        dev_any_input_enabled() && s == 0};
+        dev_any_input_enabled() && s == (g_controller_ports_swapped ? 1 : 0)};
     const int captured = host_input::capture_pad_slot(snapshot, s, &route, options, out);
     player.hybrid_analog = route.hybrid_analog;
     if (input_replay::active() && captured) input_replay::note_mapping();
@@ -5508,6 +5540,7 @@ static void sample_pad_into_sio(int override) {
         return;
     }
     int n = std::max(1, std::min(PSX_MAX_PLAYERS, g_offline_pad_count));
+    if (g_controller_ports_swapped && n < 2) n = 2;
     const uint32_t consumer_sim =
         psx_start_consumer_enabled() ? psx_start_consumer_offline_frame() : 0u;
     for (int s = 0; s < n; ++s) {
@@ -6292,6 +6325,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
     debug_server_wait_if_paused();
+    debug_server_poll_overlay_actions();
     debug_server_poll();
     debug_server_record_frame();
     debug_server_check_watchpoints();
@@ -7254,6 +7288,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * do NOT flush_cpu_uploads (MDEC already wrote the CPU mirror; forcing
          * FBO uploads every frame cut MotK intro from ~50 to ~30 FPS). */
 #ifndef PSX_SDL_NO_RENDER
+        if (native_stream_enabled)
+            psx_xg_render_auth_complete_gpu_source_frame();
         if (g_gl_active && g_gl_fbo_present && !di.depth24 &&
             !native_fmv_active && !local_viewport_crop) {
             if (wide_present) {
@@ -12371,11 +12407,12 @@ int main(int argc, char** argv) {
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_NATIVE_INTERPOLATION_FPS")) {
         const int fps = atoi(e);
-        if (fps == 60 || fps == 120 || fps == 240)
+        if (fps == 30 || fps == 60 || fps == 120 || fps == 240)
             g_native_interpolation_fps = fps;
         else {
             std::fprintf(stderr,
-                         "psxrecomp: PSX_NATIVE_INTERPOLATION_FPS must be 60, 120, or 240\n");
+                         "psxrecomp: PSX_NATIVE_INTERPOLATION_FPS must be "
+                         "30, 60, 120, or 240\n");
             return 1;
         }
     }
@@ -13816,6 +13853,9 @@ session_reboot:
         };
         memcard_init_slots(memcard_dir_str.c_str(), slots);
     }
+    (void)ram_provenance_init(memory_get_ram_size());
+    guest_render_native_stream_set_source_writer_observer(
+        native_source_writer_observer);
     if (!rematch_session) {
         std::atexit(memcard_flush_all);
         /* Persist the game's native OPTION settings on any exit path (belt-and-
@@ -13824,8 +13864,6 @@ session_reboot:
         std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
-        guest_render_native_stream_set_source_writer_observer(
-            native_source_writer_observer);
 #else
         (void)debug_port;
 #endif
@@ -14061,6 +14099,8 @@ session_reboot:
 
         g_native_render_selected =
             render_mode == GUEST_RENDER_RENDER_NATIVE && g_gl_active;
+        gte_native_provenance_set_enabled(g_native_render_selected ? 1 : 0);
+        ram_provenance_set_cpu_tracking(g_native_render_selected);
         update_native_temporal_coverage();
 
         if (!native_render_mode_control_init(
@@ -14075,6 +14115,8 @@ session_reboot:
         psx_xg_render_auth_set_exec_phase_exchange(
             native_render_exchange_exec_phase);
         gpu_set_submission_hook(psx_xg_render_auth_before_gpu_submission);
+        gpu_set_semantic_current_hook(
+            psx_xg_render_auth_note_gpu_semantic_current);
         guest_render_native_stream_set_enabled(false);
         (void)psx_xg_render_auth_configure(
             timing_mode, render_mode, native_render_presentation_gate, nullptr);

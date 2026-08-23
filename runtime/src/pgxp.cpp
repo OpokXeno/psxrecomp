@@ -34,6 +34,7 @@
 #include "pgxp.h"
 #include "pgxp_hooks.h"
 #include "cpu_state.h"
+#include "memory.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -61,7 +62,7 @@ struct PGXPValue {
     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
 };
 
-#define PGXP_RAM_WORDS     (0x200000u >> 2)   /* 2 MB RAM                     */
+#define PGXP_RAM_WORDS     (PSX_MAIN_RAM_APERTURE_SIZE >> 2)
 #define PGXP_SCRATCH_WORDS (0x400u >> 2)      /* 1 KB scratchpad              */
 #define PGXP_REG_HI        32
 #define PGXP_REG_LO        33
@@ -146,8 +147,8 @@ extern "C" void pgxp_get_stats(PGXPStats *out) {
 /* Guest address -> shadow slot, or NULL for BIOS/MMIO/KSEG2 (untrackable). */
 static inline PGXPValue *pgxp_ptr(uint32_t addr) {
     uint32_t m = addr & 0x1FFFFFFFu;
-    if (m < 0x00800000u)                       /* RAM + its mirrors           */
-        return s_ram ? &s_ram[(m & 0x1FFFFCu) >> 2] : nullptr;
+    if (m < PSX_MAIN_RAM_APERTURE_SIZE)        /* active RAM / retail mirrors */
+        return s_ram ? &s_ram[memory_main_ram_word_offset(m) >> 2] : nullptr;
     if ((m & 0xFFFFFC00u) == 0x1F800000u)      /* scratchpad                  */
         return &s_scratch[(m & 0x3FCu) >> 2];
     return nullptr;
@@ -245,6 +246,7 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
 extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
                                uint32_t addr, uint32_t value) {
     (void)cpu;
+    ram_provenance_note_cpu_store(instr, addr, value);
     if (!g_pgxp_active) return;
     PGXPValue *dst = pgxp_ptr(addr);
     if (!dst) return;
@@ -301,6 +303,7 @@ extern "C" void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
 extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
                               uint32_t value, uint32_t addr) {
     (void)cpu;
+    ram_provenance_note_cpu_store(instr, addr, value);
     if (!g_pgxp_active) return;
 
     switch (f_op(instr)) {

@@ -136,7 +136,40 @@ void guest_render_native_stream_set_material_observer(
 }
 
 uint8_t *memory_get_ram_ptr(void) { return s_ram; }
+uint32_t memory_get_ram_size(void) { return RAM_SIZE; }
 uint8_t *memory_get_scratchpad_ptr(void) { return s_scratch; }
+int psx_netplay_is_resimulating(void) { return 0; }
+uint32_t psx_ws_cull_keep_result(uint32_t vanilla, uint32_t forced) {
+    (void)forced;
+    return vanilla;
+}
+uint32_t psx_ws_aspect_cone_result(uint32_t site, uint32_t vanilla,
+                                   uint32_t object, int32_t x, int32_t z,
+                                   int32_t y) {
+    (void)site; (void)object; (void)x; (void)z; (void)y;
+    return vanilla;
+}
+uint32_t psx_ws_angle_widen(uint32_t vanilla) { return vanilla; }
+void psx_pgxp_load(CPUState *cpu, uint32_t instr, uint32_t addr,
+                   uint32_t value) {
+    (void)cpu; (void)instr; (void)addr; (void)value;
+}
+void psx_pgxp_store(CPUState *cpu, uint32_t instr, uint32_t addr,
+                    uint32_t value) {
+    (void)cpu; (void)instr; (void)addr; (void)value;
+}
+void psx_pgxp_alu(CPUState *cpu, uint32_t instr, uint32_t result,
+                  uint32_t s1, uint32_t s2) {
+    (void)cpu; (void)instr; (void)result; (void)s1; (void)s2;
+}
+void psx_pgxp_muldiv(CPUState *cpu, uint32_t instr, uint32_t hi,
+                     uint32_t lo, uint32_t s1, uint32_t s2) {
+    (void)cpu; (void)instr; (void)hi; (void)lo; (void)s1; (void)s2;
+}
+void psx_pgxp_cop2(CPUState *cpu, uint32_t instr, uint32_t value,
+                   uint32_t addr) {
+    (void)cpu; (void)instr; (void)value; (void)addr;
+}
 uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
     (void)phys; (void)len; return 0;
 }

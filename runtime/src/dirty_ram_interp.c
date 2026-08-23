@@ -35,6 +35,7 @@
 #include "lockstep.h"
 #include "native_render_baseline.h"
 #include "overlay_capture.h"
+#include "memory.h"
 #include "starvation_ring.h"
 #include "xenogears_field_hook.h"
 #include "xg_render_auth_runtime.h"
@@ -261,7 +262,7 @@ static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
  * cache-unfriendly open-addressed lookup on every guest instruction. */
 static inline void exec_pc_table_record(uint32_t pc) {
     uint32_t phys = pc & 0x1FFFFFFFu;
-    if (phys < 2u * 1024u * 1024u && (phys & 3u) == 0u) {
+    if (phys < memory_get_ram_size() && (phys & 3u) == 0u) {
         uint32_t word = phys >> 2;
         uint32_t mask = 1u << (word & 31u);
         uint32_t *slot = &g_dirty_ram_exec_pc_bitmap[word >> 5];
@@ -507,6 +508,8 @@ static inline uint32_t fetch_word(uint32_t phys) {
     /* Main RAM is a process-lifetime static allocation. Cache its address so
      * instruction fetch does not cross translation units for every guest op. */
     static const uint8_t *ram;
+    if ((phys & 3u) != 0u || phys > memory_get_ram_size() - 4u)
+        return 0xFFFFFFFFu;
     if (!ram) ram = memory_get_ram_ptr();
     return  (uint32_t)ram[phys]
          | ((uint32_t)ram[phys + 1] <<  8)
@@ -603,7 +606,7 @@ static int ws_cull_site(uint32_t pc) {
         return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    if (hi > memory_get_ram_size()) hi = memory_get_ram_size();
     static uint32_t words[2 * WIN + 1];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
@@ -629,7 +632,7 @@ static int ws_cull_bltz_site(uint32_t pc) {
         return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
-    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    if (hi > memory_get_ram_size()) hi = memory_get_ram_size();
     static uint32_t words[2 * WIN + 1];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
@@ -666,7 +669,7 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
     }
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
-    if (hi > 0x200000u) hi = 0x200000u;          /* 2 MB main RAM */
+    if (hi > memory_get_ram_size()) hi = memory_get_ram_size();
     static uint32_t words[2 * WIN + 2];
     int n = 0;
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 2); a += 4u)
@@ -858,7 +861,8 @@ static inline int phys_is_overlay_flow_region(uint32_t phys) {
 
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
-    return phys_is_overlay_flow_region(phys) && dirty_ram_is_dirty(phys);
+    return phys < memory_get_ram_size() &&
+           phys_is_overlay_flow_region(phys) && dirty_ram_is_dirty(phys);
 }
 
 /* Target the last interp run handed back to the dispatch loop (chained
@@ -2483,6 +2487,10 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     extern int g_psx_dispatch_depth;
     extern void psx_fatal_halt(const char *reason);
+    uint32_t entry_phys = addr & 0x1FFFFFFFu;
+    if (entry_phys < PSX_MAIN_RAM_APERTURE_SIZE &&
+        entry_phys >= memory_get_ram_size())
+        return 0;
 #ifndef PSX_NO_DEBUG_TOOLS
     /* A0/B0/C0 kernel-vector stubs are runtime-written, so calls to them
      * land HERE, not in the static dispatcher — which meant the bioscall
@@ -2961,7 +2969,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * control transfer to a decodable word above the configured boot-EXE
          * text end is enough evidence to admit that word to the interpreter.
          * Data and invalid targets still fail closed. */
-        if (phys < (2u * 1024u * 1024u) &&
+        if (phys < memory_get_ram_size() &&
             phys >= g_overlay_region_floor &&
             dirty_ram_word_looks_decodable(fetch_word(phys))) {
             dirty_ram_mark_executable_range(phys, 4u);

@@ -276,6 +276,8 @@ typedef struct GlRendererNativeMidpointDiagnostics {
     uint32_t last_cancel_identity_producer;
     uint32_t last_cancel_identity_primitive;
     int last_cancel_identity_valid;
+    uint64_t last_cancel_existing_command_id;
+    uint64_t last_cancel_current_command_id;
     uint64_t workload_epoch;
     uint64_t workload_recorded;
     uint64_t workload_total_matched;
@@ -643,6 +645,26 @@ enum {
     GL_PRES_NATIVE_MIDPOINT = 6, /* native semantic stream, midpoint FBO swap  */
 };
 
+typedef enum GlNativeMidpointDecision {
+    GL_NATIVE_MIDPOINT_DECISION_UNKNOWN = 0,
+    GL_NATIVE_MIDPOINT_DECISION_SELECTED,
+    GL_NATIVE_MIDPOINT_DECISION_PENDING_CURRENT,
+    GL_NATIVE_MIDPOINT_DECISION_SUSPENDED,
+    GL_NATIVE_MIDPOINT_DECISION_NO_OPEN_FRAME,
+    GL_NATIVE_MIDPOINT_DECISION_EMPTY_DUPLICATE,
+    GL_NATIVE_MIDPOINT_DECISION_SEAL_CANCELLED,
+    GL_NATIVE_MIDPOINT_DECISION_STATIC_DUPLICATE,
+    GL_NATIVE_MIDPOINT_DECISION_ELIGIBLE_WITHOUT_DUPLICATE,
+    GL_NATIVE_MIDPOINT_DECISION_INELIGIBLE_AFTER_DUPLICATE,
+    GL_NATIVE_MIDPOINT_DECISION_INELIGIBLE_WITHOUT_DUPLICATE,
+    GL_NATIVE_MIDPOINT_DECISION_CANONICAL_DISABLED,
+    GL_NATIVE_MIDPOINT_DECISION_CANDIDATE_PENDING_CURRENT,
+    GL_NATIVE_MIDPOINT_DECISION_VIEW_UNSEEDED,
+    GL_NATIVE_MIDPOINT_DECISION_COUNT,
+} GlNativeMidpointDecision;
+
+#define GL_PRES_RING_CAPACITY 8192u
+
 typedef struct {
     uint32_t frame;        /* s_frame_count at swap                        */
     uint32_t t_ms;         /* SDL_GetTicks() at swap                       */
@@ -658,7 +680,8 @@ typedef struct {
     uint8_t  phase_denominator; /* 0 for current/non-semantic presents     */
     uint8_t  framebuffer_hash_valid;
     uint8_t  presentation_feedback; /* 0=pending/unavailable, 1=presented, 2=discarded */
-    uint16_t reserved;
+    uint8_t  midpoint_decision;   /* GlNativeMidpointDecision */
+    uint8_t  midpoint_eligibility; /* GpuSemanticWorkloadEligibility */
     uint64_t framebuffer_hash;
     uint64_t presentation_time_ns;
     uint64_t refresh_sequence;

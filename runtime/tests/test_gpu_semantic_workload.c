@@ -255,6 +255,7 @@ static int test_rational_phases(void) {
     REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
     REQUIRE(gpu_semantic_workload_record_phases(
                 &current, 4u, phases, 3u) == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_current_count() == 1u);
     REQUIRE(phases[0].triangles[0].vertices[0].x == 20);
     REQUIRE(phases[1].triangles[0].vertices[0].x == 40);
     REQUIRE(phases[2].triangles[0].vertices[0].x == 60);
@@ -679,6 +680,28 @@ static int test_unkeyed_large_translation_snaps(void) {
     REQUIRE(gpu_semantic_workload_record(&current, &recorded) ==
             GPU_SEMANTIC_WORKLOAD_OK);
     REQUIRE(recorded.triangles[0].vertices[0].x ==
+            current.triangles[0].vertices[0].x);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.matched_count == 0u);
+    REQUIRE(diagnostics.snapped_count == 1u);
+    REQUIRE(diagnostics.moved_count == 0u);
+    return 1;
+}
+
+static int test_unkeyed_untextured_motion_snaps(void) {
+    GpuRenderSemantic previous = unkeyed_triangle_pixels(0, 11u);
+    GpuRenderSemantic current = unkeyed_triangle_pixels(8, 11u);
+    GpuRenderSemantic midpoint;
+    GpuSemanticWorkloadDiagnostics diagnostics;
+
+    previous.material.textured = 0u;
+    current.material.textured = 0u;
+    gpu_semantic_workload_reset();
+    REQUIRE(seal_one(&previous));
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record(&current, &midpoint) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(midpoint.triangles[0].vertices[0].x ==
             current.triangles[0].vertices[0].x);
     gpu_semantic_workload_diagnostics(&diagnostics);
     REQUIRE(diagnostics.matched_count == 0u);
@@ -1542,6 +1565,107 @@ static int test_retired_mesh_follows_current_anchors(void) {
     return 1;
 }
 
+static int test_temporal_phase_participation_and_history_downgrade(void) {
+    GpuRenderSemantic previous = triangle(0, 40u);
+    GpuRenderSemantic temporal = triangle(80, 40u);
+    GpuRenderSemantic current = triangle(160, 40u);
+    GpuRenderSemantic phases[GPU_SEMANTIC_INTERPOLATION_MAX_PHASES];
+    GpuSemanticWorkloadDiagnostics diagnostics;
+    GpuSemanticWorkloadMatchInfo match;
+
+    gpu_semantic_workload_reset();
+    REQUIRE(seal_one(&previous));
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record_temporal_phases(
+                &temporal, 2u, phases, 1u) == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(phases[0].triangles[0].vertices[0].x == 40);
+    REQUIRE(gpu_semantic_workload_match_info(
+                &temporal.interpolation_identity, &match) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(match.participation ==
+            GPU_SEMANTIC_WORKLOAD_PARTICIPATION_TEMPORAL_PHASE);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.current_count == 1u);
+    REQUIRE(diagnostics.current_participating_count == 1u);
+    REQUIRE(diagnostics.matched_count == 1u);
+    REQUIRE(diagnostics.moved_count == 1u);
+    REQUIRE(!gpu_semantic_workload_current_frame_has_work());
+
+    REQUIRE(gpu_semantic_workload_mark_last_temporal_history_only() ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_match_info(
+                &temporal.interpolation_identity, &match) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(match.participation ==
+            GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.current_count == 1u);
+    REQUIRE(diagnostics.current_participating_count == 0u);
+    REQUIRE(diagnostics.matched_count == 0u);
+    REQUIRE(diagnostics.moved_count == 0u);
+    REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.last_seal_previous_participating_count == 1u);
+    REQUIRE(diagnostics.last_seal_current_participating_count == 0u);
+    REQUIRE(diagnostics.last_seal_eligibility ==
+            GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_COUNT_MISMATCH);
+
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record_phases(
+                &current, 2u, phases, 1u) == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(phases[0].triangles[0].vertices[0].x == 120);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.previous_count == 1u);
+    REQUIRE(diagnostics.previous_participating_count == 0u);
+    REQUIRE(diagnostics.current_participating_count == 1u);
+    REQUIRE(diagnostics.matched_count == 1u);
+    REQUIRE(diagnostics.moved_count == 1u);
+    REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.last_seal_eligibility ==
+            GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_COUNT_MISMATCH);
+    REQUIRE(gpu_semantic_workload_previous_frame_usable());
+    return 1;
+}
+
+static int test_history_only_records_do_not_change_visual_eligibility(void) {
+    GpuRenderSemantic previous_visible = triangle(0, 41u);
+    GpuRenderSemantic previous_hidden = triangle(100, 42u);
+    GpuRenderSemantic current_visible = triangle(20, 41u);
+    GpuRenderSemantic current_hidden = triangle(120, 42u);
+    GpuRenderSemantic midpoint;
+    GpuSemanticWorkloadDiagnostics diagnostics;
+
+    gpu_semantic_workload_reset();
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record(&previous_visible, &midpoint) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record_endpoint(&previous_hidden) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record_endpoint(&current_hidden) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(!gpu_semantic_workload_current_frame_has_work());
+    REQUIRE(gpu_semantic_workload_record(&current_visible, &midpoint) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_current_frame_has_work());
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.previous_count == 2u);
+    REQUIRE(diagnostics.current_count == 2u);
+    REQUIRE(diagnostics.previous_participating_count == 1u);
+    REQUIRE(diagnostics.current_participating_count == 1u);
+    REQUIRE(diagnostics.matched_count == 1u);
+    REQUIRE(diagnostics.moved_count == 1u);
+    REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+    gpu_semantic_workload_diagnostics(&diagnostics);
+    REQUIRE(diagnostics.last_seal_eligibility ==
+            GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_ELIGIBLE);
+    REQUIRE(gpu_semantic_workload_previous_frame_usable());
+    return 1;
+}
+
 int main(void) {
     if (!test_triangle_and_int64_midpoint()) return 1;
     if (!test_subpixel_midpoint_collapse_is_reported()) return 2;
@@ -1555,6 +1679,7 @@ int main(void) {
     if (!test_unkeyed_retrospective_match_and_color()) return 8;
     if (!test_unkeyed_semitransparent_primitive_snaps()) return 9;
     if (!test_unkeyed_large_translation_snaps()) return 10;
+    if (!test_unkeyed_untextured_motion_snaps()) return 38;
     if (!test_exact_unkeyed_semitransparent_primitive_matches()) return 11;
     if (!test_keyed_semitransparent_primitive_interpolates()) return 12;
     if (!test_keyed_quad_winding_flip_snaps()) return 13;
@@ -1581,5 +1706,7 @@ int main(void) {
     if (!test_used_better_retrospective_candidate_snaps()) return 30;
     if (!test_hidden_mesh_anchors_supply_previous_geometry()) return 33;
     if (!test_retired_mesh_follows_current_anchors()) return 34;
+    if (!test_temporal_phase_participation_and_history_downgrade()) return 39;
+    if (!test_history_only_records_do_not_change_visual_eligibility()) return 40;
     return 0;
 }

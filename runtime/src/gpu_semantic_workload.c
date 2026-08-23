@@ -10,7 +10,10 @@ _Static_assert(GPU_SEMANTIC_WORKLOAD_CAPACITY <= INT32_MAX,
 
 typedef struct GpuSemanticFrame {
     GpuRenderSemantic items[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint8_t participation[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     size_t count;
+    size_t participating_count;
+    size_t authoritative_count;
     size_t unkeyed_count;
     bool overflowed;
     bool conflicted;
@@ -89,6 +92,7 @@ static struct {
         [GPU_SEMANTIC_WORKLOAD_CAPACITY * GPU_SEMANTIC_MAX_VERTICES];
     bool previous_used[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     bool previous_corresponded[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    bool current_moved[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     bool source_geometry_match[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     GpuSemanticWorkloadMatchKind match_kind[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     GpuSemanticWorkloadMatchKind fallback_kind[GPU_SEMANTIC_WORKLOAD_CAPACITY];
@@ -1572,6 +1576,8 @@ void gpu_semantic_workload_reset(void) {
     if (workload_epoch != UINT64_MAX) ++workload_epoch;
     for (size_t index = 0u; index < 2u; ++index) {
         workload.frames[index].count = 0u;
+        workload.frames[index].participating_count = 0u;
+        workload.frames[index].authoritative_count = 0u;
         workload.frames[index].unkeyed_count = 0u;
         workload.frames[index].overflowed = false;
         workload.frames[index].conflicted = false;
@@ -1601,6 +1607,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_begin(void) {
     GpuSemanticAnchorFrame *building_anchors =
         &workload.anchor_frames[workload.building_index];
     building->count = 0u;
+    building->participating_count = 0u;
+    building->authoritative_count = 0u;
     building->unkeyed_count = 0u;
     building->overflowed = false;
     building->conflicted = false;
@@ -1636,10 +1644,13 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_begin(void) {
     }
     workload.building = true;
     workload.diagnostics.current_count = 0u;
+    workload.diagnostics.current_participating_count = 0u;
     workload.diagnostics.current_overflowed = false;
     workload.diagnostics.building = true;
     workload.diagnostics.previous_count = workload.has_sealed
         ? workload.frames[workload.sealed_index].count : 0u;
+    workload.diagnostics.previous_participating_count = workload.has_sealed
+        ? workload.frames[workload.sealed_index].participating_count : 0u;
     workload.diagnostics.previous_usable = workload.has_sealed &&
         !workload.frames[workload.sealed_index].overflowed;
     workload.diagnostics.matched_count = 0u;
@@ -1694,7 +1705,7 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_anchors(
 
 static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     const GpuRenderSemantic *semantic, GpuRenderSemantic *out_midpoint,
-    bool generate_midpoint) {
+    bool generate_midpoint, GpuSemanticWorkloadParticipation participation) {
     GpuSemanticFrame *building;
     const GpuSemanticFrame *previous;
     size_t index;
@@ -1732,7 +1743,14 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     }
     index = building->count++;
     building->items[index] = *semantic;
+    building->participation[index] = (uint8_t)participation;
+    if (participation != GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY)
+        ++building->participating_count;
+    if (participation ==
+        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT)
+        ++building->authoritative_count;
     workload.previous_match[index] = -1;
+    workload.current_moved[index] = false;
     workload.source_geometry_match[index] = false;
     workload.match_kind[index] = GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN;
     workload.fallback_kind[index] = GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN;
@@ -1764,6 +1782,7 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
                       .total_retrospective_semitransparent_rejected;
             }
         } else if (previous_index < 0 && !ambiguous &&
+                   semantic->material.textured &&
                    semantic->topology != GPU_RENDER_SEMANTIC_LINES) {
             previous_index = retrospective_match(previous, semantic, &ambiguous);
         }
@@ -1836,11 +1855,14 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
                 &midpoint_distinct_vertices, &midpoint_collapsed_vertices,
                 &midpoint_formula_failures);
             if (moved) {
+                workload.current_moved[index] = true;
                 record_motion_diagnostics(
                     index, (size_t)previous_index,
                     &previous->items[previous_index], semantic, out_midpoint,
                     position_changed_vertices, position_delta_fixed);
-                ++workload.diagnostics.moved_count;
+                if (participation !=
+                        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY)
+                    ++workload.diagnostics.moved_count;
                 ++workload.diagnostics.total_moved;
             }
             workload.diagnostics.matched_vertex_count += matched_vertices;
@@ -1866,7 +1888,9 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
             workload.diagnostics.total_midpoint_formula_failures +=
                 midpoint_formula_failures;
         }
-        ++workload.diagnostics.matched_count;
+        if (participation !=
+                GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY)
+            ++workload.diagnostics.matched_count;
         ++workload.diagnostics.total_matched;
         if (matched_exact) {
             ++workload.diagnostics.exact_match_count;
@@ -1897,10 +1921,13 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
             ++workload.diagnostics.source_geometry_match_count;
             ++workload.diagnostics.total_source_geometry_matches;
             if (source_geometry_moved) {
+                workload.current_moved[index] = true;
                 record_motion_diagnostics(
                     index, 0u, NULL, semantic, out_midpoint,
                     position_changed_vertices, position_delta_fixed);
-                ++workload.diagnostics.moved_count;
+                if (participation !=
+                        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY)
+                    ++workload.diagnostics.moved_count;
                 ++workload.diagnostics.total_moved;
             }
             workload.diagnostics.position_changed_vertex_count +=
@@ -1941,6 +1968,8 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     }
     ++workload.diagnostics.total_recorded;
     workload.diagnostics.current_count = building->count;
+    workload.diagnostics.current_participating_count =
+        building->participating_count;
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
@@ -1948,12 +1977,43 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record(
         const GpuRenderSemantic *semantic,
         GpuRenderSemantic *out_midpoint) {
     return gpu_semantic_workload_record_internal(
-        semantic, out_midpoint, true);
+        semantic, out_midpoint, true,
+        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT);
 }
 
 GpuSemanticWorkloadStatus gpu_semantic_workload_record_endpoint(
         const GpuRenderSemantic *semantic) {
-    return gpu_semantic_workload_record_internal(semantic, NULL, false);
+    return gpu_semantic_workload_record_internal(
+        semantic, NULL, false,
+        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY);
+}
+
+GpuSemanticWorkloadStatus
+gpu_semantic_workload_mark_last_temporal_history_only(void) {
+    GpuSemanticFrame *building;
+    size_t index;
+
+    if (!workload.building)
+        return GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
+    building = &workload.frames[workload.building_index];
+    if (building->count == 0u)
+        return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
+    index = building->count - 1u;
+    if (building->participation[index] !=
+            GPU_SEMANTIC_WORKLOAD_PARTICIPATION_TEMPORAL_PHASE)
+        return GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
+    building->participation[index] =
+        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY;
+    --building->participating_count;
+    if (workload.previous_match[index] >= 0 &&
+        workload.diagnostics.matched_count != 0u)
+        --workload.diagnostics.matched_count;
+    if (workload.current_moved[index] &&
+        workload.diagnostics.moved_count != 0u)
+        --workload.diagnostics.moved_count;
+    workload.diagnostics.current_participating_count =
+        building->participating_count;
+    return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
 GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void) {
@@ -1971,6 +2031,10 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void) {
     workload.diagnostics.last_seal_previous_count =
         previous != NULL ? previous->count : 0u;
     workload.diagnostics.last_seal_current_count = current->count;
+    workload.diagnostics.last_seal_previous_participating_count =
+        previous != NULL ? previous->participating_count : 0u;
+    workload.diagnostics.last_seal_current_participating_count =
+        current->participating_count;
     workload.diagnostics.last_seal_previous_unkeyed_count =
         previous != NULL ? previous->unkeyed_count : 0u;
     workload.diagnostics.last_seal_current_unkeyed_count =
@@ -1994,7 +2058,10 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void) {
         for (size_t index = 0u; index < previous->count; ++index) {
             const GpuRenderSemantic *semantic;
 
-            if (workload.previous_corresponded[index]) continue;
+            if (workload.previous_corresponded[index] ||
+                previous->participation[index] ==
+                    GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY)
+                continue;
             semantic = &previous->items[index];
             ++workload.diagnostics.last_seal_previous_unmatched_count;
             ++workload.diagnostics.total_previous_unmatched;
@@ -2019,20 +2086,24 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void) {
     } else if (previous->overflowed || current->overflowed) {
         eligibility = GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_OVERFLOW;
         ++workload.diagnostics.total_rejected_overflow_frames;
-    } else if (current->count != previous->count &&
+    } else if (current->participating_count !=
+                   previous->participating_count &&
                workload.diagnostics.moved_count != 0u) {
         eligibility =
             GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_COUNT_MISMATCH;
         ++workload.diagnostics.total_partial_count_mismatch_frames;
-    } else if (current->count != previous->count) {
+    } else if (current->participating_count !=
+               previous->participating_count) {
         eligibility = GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_COUNT_MISMATCH;
         ++workload.diagnostics.total_rejected_count_mismatch_frames;
-    } else if (workload.diagnostics.matched_count != current->count &&
+    } else if (workload.diagnostics.matched_count !=
+                   current->participating_count &&
                workload.diagnostics.moved_count != 0u) {
         eligibility =
             GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_INCOMPLETE_MATCH;
         ++workload.diagnostics.total_partial_incomplete_match_frames;
-    } else if (workload.diagnostics.matched_count != current->count) {
+    } else if (workload.diagnostics.matched_count !=
+               current->participating_count) {
         eligibility = GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_INCOMPLETE_MATCH;
         ++workload.diagnostics.total_rejected_incomplete_match_frames;
     } else if (workload.diagnostics.moved_count == 0u) {
@@ -2050,6 +2121,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_seal(void) {
         eligibility ==
             GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_PARTIAL_INCOMPLETE_MATCH;
     workload.diagnostics.current_count = current->count;
+    workload.diagnostics.current_participating_count =
+        current->participating_count;
     workload.diagnostics.current_overflowed = current->overflowed;
     workload.diagnostics.building = false;
     ++workload.diagnostics.sealed_frames;
@@ -2067,16 +2140,21 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_discard_current(void) {
     }
     current = &workload.frames[workload.building_index];
     current->count = 0u;
+    current->participating_count = 0u;
+    current->authoritative_count = 0u;
     current->unkeyed_count = 0u;
     current->overflowed = false;
     current->conflicted = false;
     workload.anchor_frames[workload.building_index].count = 0u;
     workload.anchor_frames[workload.building_index].overflowed = false;
     workload.diagnostics.current_count = 0u;
+    workload.diagnostics.current_participating_count = 0u;
     workload.diagnostics.current_overflowed = false;
     workload.diagnostics.building = false;
     workload.diagnostics.previous_count = workload.has_sealed
         ? workload.frames[workload.sealed_index].count : 0u;
+    workload.diagnostics.previous_participating_count = workload.has_sealed
+        ? workload.frames[workload.sealed_index].participating_count : 0u;
     workload.diagnostics.previous_usable = workload.has_sealed &&
         !workload.frames[workload.sealed_index].overflowed;
     workload.diagnostics.matched_count = 0u;
@@ -2102,10 +2180,11 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_discard_current(void) {
 
 bool gpu_semantic_workload_current_frame_has_work(void) {
     if (workload.building) {
-        return workload.frames[workload.building_index].count != 0u;
+        return workload.frames[workload.building_index].authoritative_count !=
+               0u;
     }
     return workload.has_sealed &&
-           workload.frames[workload.sealed_index].count != 0u;
+           workload.frames[workload.sealed_index].authoritative_count != 0u;
 }
 
 size_t gpu_semantic_workload_current_count(void) {
@@ -2209,6 +2288,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_match_info(
     *out_match = (GpuSemanticWorkloadMatchInfo){
         .kind = workload.match_kind[(size_t)current_index],
         .fallback_kind = workload.fallback_kind[(size_t)current_index],
+        .participation = (GpuSemanticWorkloadParticipation)
+            current->participation[(size_t)current_index],
         .current_order = (size_t)current_index,
         .previous_order = workload.previous_match[(size_t)current_index] >= 0
             ? (size_t)workload.previous_match[(size_t)current_index] : 0u,
@@ -2417,7 +2498,9 @@ size_t gpu_semantic_workload_retired_count(void) {
     if (workload.building || !workload.has_sealed) return 0u;
     previous = &workload.frames[workload.sealed_index ^ 1u];
     for (size_t index = 0u; index < previous->count; ++index)
-        if (!workload.previous_corresponded[index] &&
+        if (previous->participation[index] ==
+                GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT &&
+            !workload.previous_corresponded[index] &&
             semantic_is_retirable_mesh(&previous->items[index]) &&
             retired_current_geometry(&previous->items[index], NULL))
             ++count;
@@ -2436,7 +2519,9 @@ void gpu_semantic_workload_retired_diagnostics(
         for (size_t index = 0u; index < previous->count; ++index) {
             const GpuRenderSemantic *semantic = &previous->items[index];
 
-            if (workload.previous_corresponded[index] ||
+            if (previous->participation[index] !=
+                    GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT ||
+                workload.previous_corresponded[index] ||
                 !semantic_is_retirable_mesh(semantic) ||
                 semantic->interpolation_identity.producer_id != producer_id)
                 continue;
@@ -2528,7 +2613,9 @@ size_t gpu_semantic_workload_retired_issues(
         const GpuRenderSemantic *semantic = &previous->items[previous_order];
         const GpuRenderMaterial *position_material = NULL;
 
-        if (workload.previous_corresponded[previous_order] ||
+        if (previous->participation[previous_order] !=
+                GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT ||
+            workload.previous_corresponded[previous_order] ||
             !semantic_is_retirable_mesh(semantic))
             continue;
         if (anchors->overflowed) {
@@ -2590,7 +2677,9 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_retired(
         return GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
     previous = &workload.frames[workload.sealed_index ^ 1u];
     for (size_t index = 0u; index < previous->count; ++index) {
-        if (workload.previous_corresponded[index] ||
+        if (previous->participation[index] !=
+                GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT ||
+            workload.previous_corresponded[index] ||
             !semantic_is_retirable_mesh(&previous->items[index]) ||
             !retired_current_geometry(&previous->items[index], NULL))
             continue;
@@ -2697,9 +2786,10 @@ static void reconcile_phase_vertex_positions(
     }
 }
 
-GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
+static GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases_internal(
     const GpuRenderSemantic *semantic, unsigned int denominator,
-    GpuRenderSemantic *out_phases, size_t phase_count) {
+    GpuRenderSemantic *out_phases, size_t phase_count,
+    GpuSemanticWorkloadParticipation participation) {
     GpuRenderSemantic midpoint;
     GpuSemanticWorkloadStatus status;
     uint64_t projective_phase_vertices_before;
@@ -2711,7 +2801,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
         return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
     projective_phase_vertices_before =
         workload.diagnostics.total_projective_phase_vertices;
-    status = gpu_semantic_workload_record(semantic, &midpoint);
+    status = gpu_semantic_workload_record_internal(
+        semantic, &midpoint, true, participation);
     if (status != GPU_SEMANTIC_WORKLOAD_OK) return status;
     workload.diagnostics.total_projective_phase_vertices =
         projective_phase_vertices_before;
@@ -2750,6 +2841,22 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
     reconcile_phase_vertex_positions(
         semantic, index, out_phases, phase_count);
     return GPU_SEMANTIC_WORKLOAD_OK;
+}
+
+GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases(
+    const GpuRenderSemantic *semantic, unsigned int denominator,
+    GpuRenderSemantic *out_phases, size_t phase_count) {
+    return gpu_semantic_workload_record_phases_internal(
+        semantic, denominator, out_phases, phase_count,
+        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT);
+}
+
+GpuSemanticWorkloadStatus gpu_semantic_workload_record_temporal_phases(
+    const GpuRenderSemantic *semantic, unsigned int denominator,
+    GpuRenderSemantic *out_phases, size_t phase_count) {
+    return gpu_semantic_workload_record_phases_internal(
+        semantic, denominator, out_phases, phase_count,
+        GPU_SEMANTIC_WORKLOAD_PARTICIPATION_TEMPORAL_PHASE);
 }
 
 void gpu_semantic_workload_diagnostics(

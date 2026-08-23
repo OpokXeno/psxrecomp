@@ -3,6 +3,7 @@
 
 #include "text_xlate.h"
 #include "cpu_state.h"
+#include "memory.h"
 
 #include <cstdint>
 #include <cstring>
@@ -18,7 +19,6 @@
 
 #include "toml.hpp"
 
-extern "C" uint8_t* memory_get_ram_ptr(void);
 extern "C" { extern uint64_t s_frame_count; }
 /* Renderer VRAM facade (gpu_render.h) — the same read/write path the GP0 0xA0
  * upload uses, so vram-strip patches stay coherent across software/GL backends
@@ -36,14 +36,15 @@ namespace {
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
-// Guest RAM access (little-endian, no swizzle). Main RAM is 2 MB, mirrored
-// across [0,0x800000). Returns 0 / no-op for out-of-range.
+// Guest RAM access (little-endian, no swizzle). Retail RAM mirrors across the
+// 8 MiB aperture; developer RAM uses the full aperture without folding.
 // ---------------------------------------------------------------------------
-constexpr uint32_t kRamSize = 2u * 1024u * 1024u;
-
 inline bool ram_fold(uint32_t va, uint32_t* pa_out) {
     uint32_t p = va & 0x1FFFFFFFu;
-    if (p < 0x00800000u) { *pa_out = p & (kRamSize - 1u); return true; }
+    if (p < PSX_MAIN_RAM_APERTURE_SIZE) {
+        *pa_out = memory_main_ram_offset(p);
+        return true;
+    }
     return false;  // I/O / BIOS / scratchpad — not translatable text storage
 }
 inline uint8_t grb(uint8_t* ram, uint32_t va) {

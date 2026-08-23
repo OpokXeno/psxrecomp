@@ -6,11 +6,17 @@
 
 #include "pgxp.h"
 #include "pgxp_hooks.h"
+#include "memory.h"
 
 #include <cstdio>
 #include <cstring>
 
 static int g_failures = 0;
+extern "C" {
+uint8_t *g_psx_ram = nullptr;
+uint32_t g_psx_ram_size = PSX_MAIN_RAM_RETAIL_SIZE;
+uint32_t g_psx_ram_mask = PSX_MAIN_RAM_RETAIL_SIZE - 1u;
+}
 #define CHECK(cond)                                                          \
     do {                                                                     \
         if (!(cond)) {                                                       \
@@ -103,6 +109,15 @@ int main(void) {
         CHECK(lookup(0xA0100000u, PACKED, 160, 80, &x, &y, &z) ==
               PGXP_SRC_DATAFLOW);
     }
+
+    /* Retail mirrors alias; the developer profile gives upper RAM its own
+     * shadow slot, matching runtime main-RAM canonicalization. */
+    CHECK(lookup(ADDR_A + PSX_MAIN_RAM_RETAIL_SIZE, PACKED, 160, 80,
+                 nullptr, nullptr, nullptr) == PGXP_SRC_DATAFLOW);
+    g_psx_ram_size = PSX_MAIN_RAM_DEVELOPER_SIZE;
+    g_psx_ram_mask = PSX_MAIN_RAM_DEVELOPER_SIZE - 1u;
+    CHECK(lookup(ADDR_A + PSX_MAIN_RAM_RETAIL_SIZE, PACKED, 160, 80,
+                 nullptr, nullptr, nullptr) == PGXP_SRC_NATIVE);
 
     /* --- DMA/untracked overwrite: value validation rejects the shadow --- */
     {

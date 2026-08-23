@@ -140,6 +140,14 @@ typedef struct GuestRenderNativeStreamSnapshot {
         GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_packet_derived_opcode_counts[
         GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_bound_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_zero_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_partial_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
+    uint64_t native_gte_nonprojective_opcode_counts[
+        GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint64_t native_unsupported_opcode_counts[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint32_t native_unbound_source_by_opcode[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
     uint32_t native_unbound_pc_by_opcode[GUEST_RENDER_NATIVE_STREAM_OPCODE_COUNT];
@@ -156,6 +164,16 @@ typedef struct GuestRenderNativeStreamSnapshot {
     GpuRenderTransactionId first_stage_failure_visual_id;
     GuestRenderNativeStreamStatus first_stage_failure_status;
     uint64_t last_command_id;
+    uint64_t last_unbound_reserve_command_id;
+    size_t last_unbound_reserve_candidate_count;
+    size_t last_unbound_reserve_active_count;
+    size_t last_unbound_reserve_available_count;
+    uint32_t last_unbound_reserve_miss_failure_mask;
+    uint64_t first_unbound_reserve_command_id;
+    size_t first_unbound_reserve_candidate_count;
+    size_t first_unbound_reserve_active_count;
+    size_t first_unbound_reserve_available_count;
+    uint32_t first_unbound_reserve_miss_failure_mask;
     GuestRenderNativeStreamStatus last_status;
     GuestRenderNativeStreamStatus last_stage_status;
     GuestRenderNativeStreamStatus last_consume_status;
@@ -191,12 +209,14 @@ typedef struct GuestRenderNativeStreamReserveDiagnostic {
     size_t candidate_count;
     size_t active_count;
     size_t available_count;
+    uint32_t miss_failure_mask;
 } GuestRenderNativeStreamReserveDiagnostic;
 
 typedef struct GuestRenderNativeStreamMissContext {
     GpuRenderTransactionId visual_id;
     uint64_t command_id;
     uint64_t container_id;
+    const GpuRenderSemantic *packet_semantic;
     GuestRenderNativeSourceWriter command_writer;
     GuestRenderNativeSourceWriter container_writer;
     GuestRenderNativeStreamSourceKind source_kind;
@@ -283,6 +303,9 @@ void guest_render_native_stream_note_native_packet_attribution(
     uint32_t source_return_address);
 void guest_render_native_stream_note_native_draw_source(
     uint8_t opcode, bool producer_bound);
+void guest_render_native_stream_note_gte_binding(
+    uint8_t opcode, uint8_t matched_vertices, uint8_t projective_vertices,
+    uint8_t expected_vertices, bool bound);
 void guest_render_native_stream_note_native_state(
     const GuestRenderNativeGpuState *state);
 void guest_render_native_stream_note_independent_vram_present(void);

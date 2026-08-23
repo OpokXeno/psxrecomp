@@ -8,12 +8,11 @@
  * RAM into a GP0 packet (pgxp.cpp). Generated code participates by calling
  * these hooks after the guest operation completes.
  *
- * Gating model (the G1.3 decision): the emitter writes PGXP_*() macro
- * invocations unconditionally; this header expands them to real calls only
- * when the translation unit is compiled with -DPSX_PGXP=1 (the pgxp build
- * variant). In the base variant the macros expand to ((void)0), so base
- * objects compile to exactly the pre-feature code — the feature costs nothing
- * unless a title links the pgxp target.
+ * Gating model: the emitter writes PGXP_*() funnels unconditionally. PGXP
+ * propagation remains compiled in only for the PSX_PGXP variant and disabled
+ * by default. The base variant uses the same funnels solely for the separate,
+ * runtime-gated GTE-to-native provenance tracker; it does not enable PGXP,
+ * geometry correction, tolerance fallback, or sub-pixel rendering.
  *
  * RULES for emit sites:
  *   - Macro arguments MUST be side-effect free (they vanish in base builds).
@@ -37,6 +36,8 @@
  */
 
 #include <stdint.h>
+#include "gte_native_provenance.h"
+#include "ram_provenance.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,18 +73,55 @@ typedef struct PGXPHooks {
     void (*cop2)  (struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr);
 } PGXPHooks;
 
+#define GTE_NATIVE_PROVENANCE_LOAD(instr, addr, val) do { \
+    if (g_gte_native_provenance_active) \
+        gte_native_provenance_cpu_load(cpu, (instr), (addr), (val)); \
+} while (0)
+#define GTE_NATIVE_PROVENANCE_STORE(instr, addr, val) do { \
+    if (g_gte_native_provenance_active) \
+        gte_native_provenance_cpu_store(cpu, (instr), (addr), (val)); \
+} while (0)
+#define GTE_NATIVE_PROVENANCE_ALU(instr, res, s1, s2) do { \
+    if (g_gte_native_provenance_active) \
+        gte_native_provenance_cpu_alu(cpu, (instr), (res), (s1), (s2)); \
+} while (0)
+#define GTE_NATIVE_PROVENANCE_COP2(instr, val, addr) do { \
+    if (g_gte_native_provenance_active) \
+        gte_native_provenance_cpu_cop2(cpu, (instr), (val), (addr)); \
+} while (0)
+#define CPU_RAM_PROVENANCE_STORE(instr, addr, val) \
+    ram_provenance_note_cpu_store((instr), (addr), (val))
+
 #if defined(PSX_PGXP) && PSX_PGXP
-#define PGXP_LOAD(instr, addr, val)              psx_pgxp_load(cpu, (instr), (addr), (val))
-#define PGXP_STORE(instr, addr, val)             psx_pgxp_store(cpu, (instr), (addr), (val))
-#define PGXP_ALU(instr, res, s1, s2)             psx_pgxp_alu(cpu, (instr), (res), (s1), (s2))
+#define PGXP_LOAD(instr, addr, val) do { \
+    GTE_NATIVE_PROVENANCE_LOAD((instr), (addr), (val)); \
+    psx_pgxp_load(cpu, (instr), (addr), (val)); \
+} while (0)
+#define PGXP_STORE(instr, addr, val) do { \
+    GTE_NATIVE_PROVENANCE_STORE((instr), (addr), (val)); \
+    psx_pgxp_store(cpu, (instr), (addr), (val)); \
+} while (0)
+#define PGXP_ALU(instr, res, s1, s2) do { \
+    GTE_NATIVE_PROVENANCE_ALU((instr), (res), (s1), (s2)); \
+    psx_pgxp_alu(cpu, (instr), (res), (s1), (s2)); \
+} while (0)
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2))
-#define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
+#define PGXP_COP2(instr, val, addr) do { \
+    GTE_NATIVE_PROVENANCE_COP2((instr), (val), (addr)); \
+    psx_pgxp_cop2(cpu, (instr), (val), (addr)); \
+} while (0)
 #else
-#define PGXP_LOAD(instr, addr, val)              ((void)0)
-#define PGXP_STORE(instr, addr, val)             ((void)0)
-#define PGXP_ALU(instr, res, s1, s2)             ((void)0)
+#define PGXP_LOAD(instr, addr, val)              GTE_NATIVE_PROVENANCE_LOAD((instr), (addr), (val))
+#define PGXP_STORE(instr, addr, val) do { \
+    GTE_NATIVE_PROVENANCE_STORE((instr), (addr), (val)); \
+    CPU_RAM_PROVENANCE_STORE((instr), (addr), (val)); \
+} while (0)
+#define PGXP_ALU(instr, res, s1, s2)             GTE_NATIVE_PROVENANCE_ALU((instr), (res), (s1), (s2))
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       ((void)0)
-#define PGXP_COP2(instr, val, addr)              ((void)0)
+#define PGXP_COP2(instr, val, addr) do { \
+    GTE_NATIVE_PROVENANCE_COP2((instr), (val), (addr)); \
+    CPU_RAM_PROVENANCE_STORE((instr), (addr), (val)); \
+} while (0)
 #endif
 
 #ifdef __cplusplus

@@ -33,6 +33,7 @@
 #include <intrin.h>       /* MSVC intrinsics: _BitScanForward (no __builtin_ctz) */
 #endif
 #include "cpu_state.h"   /* CPUState (guard-safe: cpu_state.h includes us last) */
+#include "memory.h"
 #include "psx_cycles.h"  /* inline psx_advance_cycles */
 
 #ifdef __cplusplus
@@ -212,7 +213,6 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
 
 /* Main-RAM base + load-delay gate (memory.c). Inlined load helpers use these
  * so MotK VLC / decode hot paths avoid an out-of-line call per LW/LH. */
-extern uint8_t *g_psx_ram;
 extern int      g_psx_load_delay;
 extern int      g_ls_mode;
 extern volatile int g_ds_recording;
@@ -235,7 +235,8 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
                                           uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+    if (g_ls_mode == 0 && !g_ds_recording &&
+        phys < PSX_MAIN_RAM_APERTURE_SIZE) {
         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
         if (g_psx_load_delay) {
             psx_cyc_base(cpu);
@@ -250,7 +251,8 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint32_t value;
-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        memcpy(&value, g_psx_ram + memory_main_ram_word_offset(phys),
+               sizeof(value));
         return value;
     }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
@@ -265,7 +267,8 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
                                           uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+    if (g_ls_mode == 0 && !g_ds_recording &&
+        phys < PSX_MAIN_RAM_APERTURE_SIZE) {
         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
         if (g_psx_load_delay) {
             psx_cyc_base(cpu);
@@ -280,7 +283,8 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint16_t value;
-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        memcpy(&value, g_psx_ram + memory_main_ram_offset(phys),
+               sizeof(value));
         return value;
     }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);

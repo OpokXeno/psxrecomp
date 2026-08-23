@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 
+uint32_t g_psx_ram_mask = PSX_MAIN_RAM_RETAIL_SIZE - 1u;
+
 static int failures;
 
 static void check(int condition, const char *name) {
@@ -28,6 +30,17 @@ int main(void) {
     check(psx_mod_gpu_dma_resolve_address_for(0x001ABCDEu, 0x20000u) ==
               0x001ABCDCu,
           "ordinary main RAM remains word-aligned and unchanged");
+    check(psx_mod_gpu_dma_resolve_address_for(0x002ABCDEu, 0x20000u) ==
+              0x000ABCDCu,
+          "retail profile folds upper main-RAM aperture addresses");
+
+    g_psx_ram_mask = PSX_MAIN_RAM_DEVELOPER_SIZE - 1u;
+    check(psx_mod_gpu_dma_resolve_address_for(0x002ABCDEu, 0x20000u) ==
+              0x002ABCDCu,
+          "developer profile preserves upper main-RAM address identity");
+    check(psx_mod_gpu_dma_resolve_address_for(0x00AABCDEu, 0x20000u) ==
+              0x002ABCDCu,
+          "developer profile folds only beyond the 8 MiB aperture");
     check(psx_mod_gpu_dma_aperture_offset_for(
               0x00F1FFFCu, 4u, 0x20000u, &off) &&
               off == 0x1FFFCu,

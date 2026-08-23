@@ -1,23 +1,29 @@
 #include "boot_state.h"
 #include "game_identity.h"
+#include "memory.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-#define RAM_SIZE (2u * 1024u * 1024u)
+#define RAM_SIZE PSX_MAIN_RAM_DEVELOPER_SIZE
 
 static uint8_t s_ram[RAM_SIZE];
+static uint32_t s_ram_size = PSX_MAIN_RAM_RETAIL_SIZE;
+static int s_developer_ram;
+static uint32_t s_dirty_word_count_applied;
 static uint8_t s_spad[1024];
 static uint8_t s_spuram[1];
 
 uint8_t *memory_get_ram_ptr(void) { return s_ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return s_spad; }
+uint32_t memory_get_ram_size(void) { return s_ram_size; }
+int memory_developer_ram_enabled(void) { return s_developer_ram; }
 uint32_t dirty_ram_get_bitmap_word(uint32_t index) { (void)index; return 0; }
-uint32_t dirty_ram_get_bitmap_word_count(void) { return 1; }
+uint32_t dirty_ram_get_bitmap_word_count(void) { return s_ram_size / (4096u * 32u); }
 void dirty_ram_set_bitmap_words(const uint32_t *words, uint32_t count) {
     (void)words;
-    (void)count;
+    s_dirty_word_count_applied = count;
 }
 void psx_kernel_bless_note_range(uint32_t phys, uint32_t len) {
     (void)phys;
@@ -173,8 +179,35 @@ int main(void) {
                 "mismatched identity fails gate");
     ok &= check(boot_state_save(&cpu, 0x12345678u, 0x80010000u, path),
                 "identity-bearing snapshot saves");
+    s_ram[0] = 0x5au;
+    s_ram[PSX_MAIN_RAM_RETAIL_SIZE] = 0xa5u;
+    ok &= check(boot_state_load(path, 0x12345678u, 0x80010000u, &cpu),
+                "retail snapshot loads");
+    ok &= check(s_ram[0] == 0u &&
+                    s_ram[PSX_MAIN_RAM_RETAIL_SIZE] == 0xa5u,
+                "retail restore touches exactly the active 2 MiB");
+    cpu.pc = 0x11111111u;
+    s_ram[0] = 0x5au;
+    s_ram_size = PSX_MAIN_RAM_DEVELOPER_SIZE;
+    s_developer_ram = 1;
+    ok &= check(!boot_state_load(path, 0x12345678u, 0x80010000u, &cpu),
+                "retail snapshot is rejected by developer profile");
+    ok &= check(cpu.pc == 0x11111111u && s_ram[0] == 0x5au,
+                "cross-profile rejection occurs before state mutation");
+    cpu.pc = 0x80010000u;
+    s_ram[0] = 0x12u;
+    s_ram[RAM_SIZE - 1u] = 0x34u;
+    ok &= check(boot_state_save(&cpu, 0x12345678u, 0x80010000u, path),
+                "developer snapshot saves all active RAM");
+    s_ram[0] = 0u;
+    s_ram[RAM_SIZE - 1u] = 0u;
+    s_dirty_word_count_applied = 0u;
     ok &= check(boot_state_load(path, 0x12345678u, 0x80010000u, &cpu),
                 "matching identity snapshot loads");
+    ok &= check(s_ram[0] == 0x12u && s_ram[RAM_SIZE - 1u] == 0x34u,
+                "developer snapshot restores lower and upper active RAM");
+    ok &= check(s_dirty_word_count_applied == dirty_ram_get_bitmap_word_count(),
+                "developer snapshot restores profile-sized dirty metadata");
 
     {
         FILE *snapshot = fopen(path, "r+b");
