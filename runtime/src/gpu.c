@@ -3564,6 +3564,18 @@ uint32_t gpu_texture_correction_hits(void) {
     return sw_perspective_triangle_count();
 }
 
+/* 1 = faithful (the game's own GP0(E1) dither bit decides, unchanged);
+ * 0 = force off, regardless of what the game requests. Default on. */
+static int s_dithering_enabled = 1;
+
+void gpu_dithering_set(int enabled) {
+    s_dithering_enabled = enabled ? 1 : 0;
+}
+
+int gpu_dithering_enabled(void) {
+    return s_dithering_enabled;
+}
+
 /* Per-vertex precise positions (PGXP, ENHANCEMENTS.md G1). Each of the three
  * packet words is resolved independently: the address-keyed dataflow shadow
  * first (validated against the actual word — exact provenance, survives

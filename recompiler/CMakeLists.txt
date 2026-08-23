@@ -888,7 +888,8 @@ target_link_libraries(reachable_discovery_test PRIVATE fmt)
     add_test(NAME recompiler_patch_cxx17_header_test
              COMMAND recompiler_patch_cxx17_header_test)
 
-    # [video] geometry_correction / perspective_texturing opt-in plumbing.
+    # [video] geometry_correction / perspective_texturing / dithering
+    # opt-in plumbing.
     add_executable(video_enhancement_settings_test
         tests/video_enhancement_settings_test.cpp
         src/config_loader.cpp

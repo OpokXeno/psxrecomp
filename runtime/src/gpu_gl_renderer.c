@@ -3556,7 +3556,7 @@ static void glb_precise_consumed(void) {
     s_pq_valid = 0;
 }
 static void glb_set_dither(int enabled) {
-    int next = enabled ? 1 : 0;
+    int next = (enabled && gpu_dithering_enabled()) ? 1 : 0;
     if (next != s_dither) {
         flush_flat_batch();
         flush_tex_batch();
@@ -9414,8 +9414,9 @@ static GpuRenderTransactionStatus glb_draw_semantic_contents(
                 x, y, u, v, colors, material->tpage, material->clut_x,
                 material->clut_y, material->raw_texture,
                 material->semi_transparent ? material->blend_mode : -1,
-                material->dither && !material->raw_texture, NULL,
-                subpixel_x, subpixel_y);
+                material->dither && !material->raw_texture &&
+                    gpu_dithering_enabled(),
+                NULL, subpixel_x, subpixel_y);
         } else if (material->textured) {
             if (material->shading == GPU_RENDER_SHADING_GOURAUD) {
                 glb_draw_shaded_textured_triangle(
