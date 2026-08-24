@@ -9,7 +9,8 @@
 #include "xg_native_render_baseline.h"
 #endif
 #if defined(PSX_INPUT_REPLAY_XG_BASELINE) || defined(PSX_INPUT_REPLAY_XG_AUTH_PROOF)
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_control.h"
+#include "xg_render_auth_runtime_diagnostics.h"
 #endif
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
 #include "xg_render_auth.h"

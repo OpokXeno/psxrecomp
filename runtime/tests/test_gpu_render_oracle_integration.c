@@ -525,6 +525,11 @@ static uint32_t mmio_submission_hook_command;
 static GpuRenderTransactionId mmio_submission_hook_visual;
 static GpuRenderSemantic mmio_submission_hook_semantic;
 static int mmio_submission_hook_staged;
+static uint32_t ordering_table_submission_hook_calls;
+static uint32_t ordering_table_submission_start;
+static uint64_t ordering_table_consumed_before_prepare;
+static int ordering_table_submission_activated;
+static uint32_t ordering_table_rejection_calls;
 
 static void stage_mmio_submission(void) {
     ++mmio_submission_hook_calls;
@@ -536,6 +541,99 @@ static void stage_mmio_submission(void) {
             mmio_submission_hook_visual) != GUEST_RENDER_NATIVE_STREAM_OK)
         return;
     mmio_submission_hook_staged = 1;
+}
+
+static bool stage_ordering_table_submission(uint32_t start_address) {
+    const GpuRenderTransactionId visual = {1u, 77u};
+    const uint32_t words[] = {
+        UINT32_C(0x20ffffff), xy(32u, 32u), xy(40u, 32u), xy(32u, 40u),
+    };
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic semantic;
+    GuestRenderNativeStreamSnapshot stream;
+
+    ++ordering_table_submission_hook_calls;
+    ordering_table_submission_start = start_address;
+    if (guest_render_native_stream_snapshot(&stream) !=
+            GUEST_RENDER_NATIVE_STREAM_OK)
+        return false;
+    ordering_table_consumed_before_prepare = stream.total_consumed;
+    gpu_native_environment_get(&environment);
+    if (gpu_native_semantic_from_gp0(
+            words, 4, &environment, &semantic) != 1 ||
+        guest_render_native_stream_stage_exact(
+            visual, start_address + 4u, &semantic) !=
+                GUEST_RENDER_NATIVE_STREAM_OK ||
+        guest_render_native_stream_activate_visual(visual) !=
+            GUEST_RENDER_NATIVE_STREAM_OK)
+        return false;
+    ordering_table_submission_activated = 1;
+    return true;
+}
+
+static bool reject_ordering_table_submission(uint32_t start_address) {
+    (void)start_address;
+    ++ordering_table_rejection_calls;
+    return false;
+}
+
+static int test_ordering_table_hook_activates_before_dma_consumption(void) {
+    GuestRenderNativeStreamSnapshot stream;
+    uint64_t consumed_before;
+
+    gpu_init();
+    guest_render_native_stream_clear();
+    guest_render_native_stream_set_enabled(true);
+    REQUIRE(guest_render_native_stream_snapshot(&stream) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    consumed_before = stream.total_consumed;
+    ordering_table_submission_hook_calls = 0u;
+    ordering_table_submission_start = 0u;
+    ordering_table_consumed_before_prepare = UINT64_MAX;
+    ordering_table_submission_activated = 0;
+    gpu_set_ordering_table_submission_hook(stage_ordering_table_submission);
+    psx_write_word(LINKED_FIRST, UINT32_C(0x04ffffff));
+    psx_write_word(LINKED_FIRST + 4u, UINT32_C(0x20ffffff));
+    psx_write_word(LINKED_FIRST + 8u, xy(32u, 32u));
+    psx_write_word(LINKED_FIRST + 12u, xy(40u, 32u));
+    psx_write_word(LINKED_FIRST + 16u, xy(32u, 40u));
+
+    dma_feed(LINKED_FIRST, 0u, DMA2_LINKED);
+
+    REQUIRE(ordering_table_submission_hook_calls == 1u);
+    REQUIRE(ordering_table_submission_start == LINKED_FIRST);
+    REQUIRE(ordering_table_submission_activated);
+    REQUIRE(ordering_table_consumed_before_prepare == consumed_before);
+    REQUIRE(guest_render_native_stream_snapshot(&stream) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(stream.total_consumed ==
+            ordering_table_consumed_before_prepare + 1u);
+    REQUIRE(stream.staged_count == 0u);
+    gpu_set_ordering_table_submission_hook(NULL);
+    guest_render_native_stream_set_enabled(false);
+    return 1;
+}
+
+static int test_ordering_table_hook_failure_is_fail_closed(void) {
+    uint64_t gp0_before;
+
+    gpu_init();
+    guest_render_native_stream_set_enabled(false);
+    ordering_table_rejection_calls = 0u;
+    gpu_set_ordering_table_submission_hook(reject_ordering_table_submission);
+    psx_write_word(LINKED_FIRST, UINT32_C(0x04ffffff));
+    psx_write_word(LINKED_FIRST + 4u, UINT32_C(0x20ffffff));
+    psx_write_word(LINKED_FIRST + 8u, xy(32u, 32u));
+    psx_write_word(LINKED_FIRST + 12u, xy(40u, 32u));
+    psx_write_word(LINKED_FIRST + 16u, xy(32u, 40u));
+    gp0_before = gpu_get_gp0_count();
+
+    dma_feed(LINKED_FIRST, 0u, DMA2_LINKED);
+
+    REQUIRE(ordering_table_rejection_calls == 1u);
+    REQUIRE(gpu_get_gp0_count() == gp0_before);
+    gpu_set_ordering_table_submission_hook(NULL);
+    return 1;
 }
 
 static int test_native_mmio_submission_finalizes_before_preflight(void) {
@@ -1172,7 +1270,9 @@ int main(void) {
                     test_native_cpu_dma_publication_is_complete_and_fail_closed() &&
                     test_native_unbound_submission_rejects_software_backend() &&
                     test_native_unbound_routes_reject_software_backend() &&
-                    test_native_mmio_submission_finalizes_before_preflight()
+                    test_native_mmio_submission_finalizes_before_preflight() &&
+                    test_ordering_table_hook_activates_before_dma_consumption() &&
+                    test_ordering_table_hook_failure_is_fail_closed()
                 ? 0
                 : 1;
 }

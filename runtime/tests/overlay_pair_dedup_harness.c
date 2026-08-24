@@ -3,7 +3,8 @@
 #include "game_identity.h"
 #include "guest_render_native_stream.h"
 #include "native_render_baseline.h"
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_hooks.h"
+#include "xg_render_auth_runtime_invalidation.h"
 #undef PSX_OVERLAY_DLL_BUILD
 
 #include <stdint.h>

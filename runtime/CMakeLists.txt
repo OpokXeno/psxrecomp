@@ -39,7 +39,7 @@ target_link_libraries(psx-runtime PRIVATE
 target_include_directories(psx-runtime PRIVATE
     "${XG_GAME_ROOT}/native_renderer/include")
 target_sources(psx-runtime PRIVATE
-    "${XG_GAME_ROOT}/native_renderer/src/xg_render_unavailable_metadata.c")
+    "${XG_GAME_ROOT}/native_renderer/src/auth/xg_render_unavailable_metadata.c")
 if(TARGET psx-runtime-pgxp)
     target_link_libraries(psx-runtime-pgxp PRIVATE
         xg_visual_state
@@ -49,7 +49,7 @@ if(TARGET psx-runtime-pgxp)
     target_include_directories(psx-runtime-pgxp PRIVATE
         "${XG_GAME_ROOT}/native_renderer/include")
     target_sources(psx-runtime-pgxp PRIVATE
-        "${XG_GAME_ROOT}/native_renderer/src/xg_render_unavailable_metadata.c")
+        "${XG_GAME_ROOT}/native_renderer/src/auth/xg_render_unavailable_metadata.c")
 endif()
 if(TARGET psx-oracle)
     target_link_libraries(psx-oracle PRIVATE
@@ -60,7 +60,7 @@ if(TARGET psx-oracle)
     target_include_directories(psx-oracle PRIVATE
         "${XG_GAME_ROOT}/native_renderer/include")
     target_sources(psx-oracle PRIVATE
-        "${XG_GAME_ROOT}/native_renderer/src/xg_render_unavailable_metadata.c")
+        "${XG_GAME_ROOT}/native_renderer/src/auth/xg_render_unavailable_metadata.c")
 endif()
 
 # With -DPSX_PGXP_VARIANT=ON, psxrecomp_add_runtime_target auto-clones a
@@ -167,7 +167,9 @@ if(BUILD_TESTING)
         src/interrupts.c
         src/gte.cpp
         src/gte_attribution.cpp)
-    target_include_directories(irq_cop2_boundary_test PRIVATE include)
+    target_include_directories(irq_cop2_boundary_test PRIVATE
+        include
+        "${XG_GAME_ROOT}/native_renderer/include")
     target_compile_definitions(irq_cop2_boundary_test PRIVATE
         PSX_NO_DEBUG_TOOLS=1
         PSX_ENABLE_BLOCK_CYCLES=1)

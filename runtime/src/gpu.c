@@ -7568,10 +7568,16 @@ static struct {
     int active;
 } native_packet_stream;
 static void (*gpu_submission_hook)(void);
+static GpuOrderingTableSubmissionHook gpu_ordering_table_submission_hook;
 static void (*gpu_semantic_current_hook)(const GpuRenderSemantic *semantic);
 
 void gpu_set_submission_hook(void (*hook)(void)) {
     gpu_submission_hook = hook;
+}
+
+void gpu_set_ordering_table_submission_hook(
+        GpuOrderingTableSubmissionHook hook) {
+    gpu_ordering_table_submission_hook = hook;
 }
 
 void gpu_set_semantic_current_hook(
@@ -7586,6 +7592,11 @@ static void gpu_note_semantic_current(const GpuRenderSemantic *semantic) {
 
 void gpu_prepare_submission(void) {
     if (gpu_submission_hook != NULL) gpu_submission_hook();
+}
+
+bool gpu_prepare_ordering_table_submission(uint32_t start_address) {
+    return gpu_ordering_table_submission_hook == NULL ||
+        gpu_ordering_table_submission_hook(start_address);
 }
 
 void gpu_native_packet_stream_reset(void) {

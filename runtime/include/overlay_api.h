@@ -9,6 +9,7 @@
 
 #include "cpu_state.h"
 #include "pgxp_hooks.h"
+#include "psx_xg_render_auth_hook_types.h"
 #include <stdint.h>
 
 /* ABI version exported by every overlay DLL as `overlay_abi()`.  The loader
@@ -192,20 +193,6 @@
 #ifndef PSX_OVERLAY_CODEGEN_HASH
 #  define PSX_OVERLAY_CODEGEN_HASH 0u
 #endif
-
-typedef enum PsxXgRenderAuthHook {
-    PSX_XG_RENDER_AUTH_HOOK_PRODUCER_ENTRY = 0,
-    PSX_XG_RENDER_AUTH_HOOK_INTERNAL_OBSERVATION = 1,
-    PSX_XG_RENDER_AUTH_HOOK_CONTINUATION = 2,
-    PSX_XG_RENDER_AUTH_HOOK_PRODUCER_EXIT = 3,
-    PSX_XG_RENDER_AUTH_HOOK_FOREIGN_INTERIOR = 4,
-    PSX_XG_RENDER_AUTH_HOOK_SOURCE_PRE = 5,
-    PSX_XG_RENDER_AUTH_HOOK_SOURCE_COMMIT = 6,
-    PSX_XG_RENDER_AUTH_HOOK_ENTRY = PSX_XG_RENDER_AUTH_HOOK_PRODUCER_ENTRY,
-    PSX_XG_RENDER_AUTH_HOOK_CAPTURE =
-        PSX_XG_RENDER_AUTH_HOOK_INTERNAL_OBSERVATION,
-    PSX_XG_RENDER_AUTH_HOOK_RETURN = PSX_XG_RENDER_AUTH_HOOK_CONTINUATION,
-} PsxXgRenderAuthHook;
 
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */

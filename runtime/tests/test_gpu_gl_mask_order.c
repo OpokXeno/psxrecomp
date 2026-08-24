@@ -1013,7 +1013,7 @@ static void test_temporal_candidate_history_only_participation(void) {
                         GPU_SEMANTIC_WORKLOAD_PARTICIPATION_HISTORY_ONLY,
                 "fully culled temporal endpoint remains keyed history");
     expect_true(gl_renderer_present_native_view(0, 0, 240, 0),
-                "history-only temporal source frame seals normally");
+                "history-only temporal source does not create a visual frame");
     gl_renderer_native_midpoint_diag(&after);
     expect_true(after.temporal_candidate_count ==
                         before.temporal_candidate_count + 1u &&
@@ -1024,8 +1024,11 @@ static void test_temporal_candidate_history_only_participation(void) {
                     after.temporal_candidate_record_failure_count ==
                         before.temporal_candidate_record_failure_count &&
                     after.workload_last_eligibility ==
-                        GPU_SEMANTIC_WORKLOAD_ELIGIBILITY_COUNT_MISMATCH,
-                "history-only candidate is stored without phase presentation");
+                        before.workload_last_eligibility &&
+                    after.sealed_frames == before.sealed_frames &&
+                    after.midpoint_duplicate_empty_frames ==
+                        before.midpoint_duplicate_empty_frames + 1u,
+                "history-only candidate is recorded without sealing or phase presentation");
     expect_true(gl_renderer_configure_native_view(0, 4, 3, 320, 240),
                 "history-only candidate fixture disables Native view");
 }

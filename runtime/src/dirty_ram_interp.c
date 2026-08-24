@@ -38,7 +38,7 @@
 #include "memory.h"
 #include "starvation_ring.h"
 #include "xenogears_field_hook.h"
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_hooks.h"
 #include "fntrace.h"  /* fntrace_is_game_started / fntrace_mark_game_started */
 
 #include <stdint.h>
@@ -530,7 +530,7 @@ static XgRenderSourceExecution xg_render_source_observation_begin(
     XgRenderSourceExecution execution = {0};
     const uint32_t normalized_pc = (pc & 0x1fffffffu) | 0x80000000u;
 
-    if (!g_psx_xg_render_auth_cold_enabled) return execution;
+    if (!psx_xg_render_auth_cold_enabled()) return execution;
     if (!psx_xg_render_auth_source_site_lookup(
             normalized_pc, instruction, &execution.metadata))
         return execution;
@@ -954,7 +954,7 @@ static int dirty_ram_finish_call_return(CPUState *cpu, uint32_t return_pc,
     uint32_t prev_pc = cpu->pc;
     cpu->pc = return_pc;
     if (dirty_ram_pump_boundary(cpu, return_pc, 5)) return 1;
-    if (g_psx_xg_render_auth_cold_enabled &&
+    if (psx_xg_render_auth_cold_enabled() &&
         psx_xg_render_auth_cold_hook_relevant(
             PSX_XG_RENDER_AUTH_HOOK_RETURN, return_pc,
             fetch_word(return_pc & 0x1FFFFFFFu)))
@@ -1388,7 +1388,7 @@ static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     const uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
     const uint32_t cold_flags =
-        g_psx_xg_render_auth_cold_enabled && !g_ls_replay_active
+        psx_xg_render_auth_cold_enabled() && !g_ls_replay_active
             ? psx_xg_render_auth_cold_instruction_flags(pc, insn) : 0u;
     return cold_flags != 0u
         ? exec_one_fetched_observed(cpu, pc, insn, cold_flags, next_pc_out)
@@ -1417,7 +1417,7 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
     }
     uint32_t dummy_next = 0;
     const uint32_t cold_flags =
-        g_psx_xg_render_auth_cold_enabled && !g_ls_replay_active
+        psx_xg_render_auth_cold_enabled() && !g_ls_replay_active
             ? psx_xg_render_auth_cold_instruction_flags(pc, insn) : 0u;
     if (cold_flags != 0u)
         (void)exec_one_fetched_observed(
@@ -1690,7 +1690,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             if (target & 3) return interp_exception(cpu, 4, target, pc);  /* LoadAddressError */
             exec_delay_slot(cpu, pc + 4);
             cosim_exec_one_transfer_hook(pc + 4);
-            if (g_psx_xg_render_auth_cold_enabled &&
+            if (psx_xg_render_auth_cold_enabled() &&
                 psx_xg_render_auth_cold_hook_relevant(
                     PSX_XG_RENDER_AUTH_HOOK_RETURN, target,
                     fetch_word(target & 0x1FFFFFFFu)))
@@ -3045,7 +3045,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     uint32_t current_page = phys >> 12;
     int current_page_dirty = dirty_ram_is_dirty(phys);
     int insns_executed = 0;
-    const int observe_render_source = g_psx_xg_render_auth_cold_enabled;
+    const int observe_render_source = psx_xg_render_auth_cold_enabled();
     const int collect_render_baseline = g_native_render_baseline_armed;
     const int observe_native_render =
         observe_render_source || collect_render_baseline;

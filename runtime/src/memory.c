@@ -27,6 +27,7 @@
 #include "dirty_ram_interp.h"
 #include "psx_cycles.h"
 #include "starvation_ring.h"
+#include "xg_render_auth_runtime_hooks.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,11 +39,6 @@
 #define MOD_MEMORY_SIZE (1u * 1024u * 1024u)
 
 static uint8_t ram[PSX_MAIN_RAM_APERTURE_SIZE];
-extern void psx_xg_render_auth_capture_clear_tile(CPUState *cpu);
-extern void psx_xg_render_auth_capture_logo_sprite(
-    uint32_t command_address, uint8_t color);
-extern void psx_xg_render_auth_capture_tile_write(
-    CPUState *cpu, uint32_t command_address, uint32_t writer_pc, uint8_t color);
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 static uint8_t mod_memory[MOD_MEMORY_SIZE];

@@ -12,7 +12,8 @@
 #include "lockstep.h"
 #include "native_render_baseline.h"
 #include "overlay_posix.h"
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_hooks.h"
+#include "xg_render_auth_runtime_invalidation.h"
 #include "memory.h"
 #include <stdint.h>
 #include <stdlib.h>

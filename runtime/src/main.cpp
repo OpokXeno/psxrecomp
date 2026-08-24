@@ -48,7 +48,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "guest_render_transaction.h"
 #include "native_render_mode_control.h"
 #include "native_render_baseline.h"
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_control.h"
+#include "xg_render_runtime_host_services.h"
 #include "frame_pacing.h"
 #include "xenogears_timing.h"
 #include "latency_ring.h"
@@ -348,6 +349,11 @@ extern "C" uint16_t psx_read_half(uint32_t addr);
 extern "C" void     psx_write_half(uint32_t addr, uint16_t val);
 extern "C" uint8_t  psx_read_byte(uint32_t addr);
 extern "C" void     psx_write_byte(uint32_t addr, uint8_t val);
+
+static uint64_t xg_render_host_frame_count(void) {
+    return s_frame_count;
+}
+
 /* Guest-side data-read wrappers: same as psx_read_* but charge PS1 main-RAM
  * read wait states (R3000A has no D-cache). Wired to cpu->read_* below so the
  * timing applies to recompiled + interpreted guest loads, not debug/device reads. */
@@ -14115,6 +14121,10 @@ session_reboot:
             native_fps_policy.requested_mode == NATIVE_FPS_MODE_NATIVE_59_94
                 ? GUEST_RENDER_TIMING_NATIVE_59_94
                 : GUEST_RENDER_TIMING_ORIGINAL;
+        const XgRenderRuntimeHostServices render_host_services = {
+            xg_render_host_frame_count,
+            psx_read_word,
+        };
 
         g_native_render_selected =
             render_mode == GUEST_RENDER_RENDER_NATIVE && g_gl_active;
@@ -14134,11 +14144,20 @@ session_reboot:
         psx_xg_render_auth_set_exec_phase_exchange(
             native_render_exchange_exec_phase);
         gpu_set_submission_hook(psx_xg_render_auth_before_gpu_submission);
+        gpu_set_ordering_table_submission_hook(
+            psx_xg_render_auth_prepare_ui_ot);
         gpu_set_semantic_current_hook(
             psx_xg_render_auth_note_gpu_semantic_current);
         guest_render_native_stream_set_enabled(false);
-        (void)psx_xg_render_auth_configure(
-            timing_mode, render_mode, native_render_presentation_gate, nullptr);
+        if (!xg_render_runtime_configure_host_services(&render_host_services))
+            return 1;
+        if (!psx_xg_render_auth_configure(
+                timing_mode, render_mode,
+                native_render_presentation_gate, nullptr)) {
+            std::fprintf(stderr,
+                         "psxrecomp: native render authentication runtime configuration failed\n");
+            return 1;
+        }
         g_native_render_widescreen =
             render_mode == GUEST_RENDER_RENDER_NATIVE && wide_requested &&
             g_gl_active;

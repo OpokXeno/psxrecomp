@@ -1768,6 +1768,11 @@ static uint32_t execute_ch2_gpu(void) {
     } else if (sync_mode == 2) {
         uint32_t start_addr =
             psx_mod_gpu_dma_resolve_address(channels[2].madr);
+        if (!gpu_prepare_ordering_table_submission(start_addr)) {
+            psx_fatal_halt("GPU ordering-table submission preparation failed");
+            g_exec_phase = previous_exec_phase;
+            return 0u;
+        }
         gpu_ws_begin_linked_list();
         gpu_ws_prepass_linked_list(start_addr);
         actual_words = dma2_execute_linked_list();

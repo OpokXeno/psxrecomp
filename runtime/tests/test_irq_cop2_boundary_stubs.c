@@ -4,7 +4,7 @@
 #include "psx_fiber.h"
 #include "psx_scheduler.h"
 #include "ram_provenance.h"
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_hooks.h"
 
 #include <setjmp.h>
 #include <stdint.h>
@@ -29,6 +29,7 @@ int g_psx_load_delay;
 volatile int g_ds_recording;
 uint32_t g_psx_icache_tv[1024];
 uint8_t *g_psx_ram;
+uint32_t g_psx_ram_mask = (2u * 1024u * 1024u) - 1u;
 uint64_t g_psx_cycle_fast_limit = UINT64_MAX;
 uint64_t g_psx_bail_first;
 uint64_t g_psx_bail_resolved;
@@ -59,8 +60,9 @@ uint32_t g_xg_render_auth_cold_hook_kinds[8];
 uint32_t g_xg_render_auth_cold_hook_pcs[8];
 uint32_t g_xg_render_auth_source_operations[8];
 uint32_t g_xg_render_auth_source_widths[8];
-bool g_psx_xg_render_auth_cold_enabled = true;
 static PsxXgRenderSourceSiteMetadata s_source_metadata;
+
+bool psx_xg_render_auth_cold_enabled(void) { return true; }
 
 uint64_t psx_get_cycle_count(void) { return psx_cycle_count; }
 void psx_devices_service_to_now(void) {
@@ -78,6 +80,7 @@ void psx_advance_cycles_slow(uint32_t cycles) {
 void psx_icache_fetch(CPUState *cpu, uint32_t addr) { (void)cpu; (void)addr; }
 void psx_icache_fetch_miss(CPUState *cpu, uint32_t addr) { (void)cpu; (void)addr; }
 uint8_t *memory_get_ram_ptr(void) { return g_irq_cop2_test_ram; }
+uint32_t memory_get_ram_size(void) { return sizeof(g_irq_cop2_test_ram); }
 int psx_load_delay_enabled(void) { return 0; }
 uint32_t psx_cyc_load_word_slow(CPUState *cpu, uint32_t address,
                                 uint32_t rt, uint32_t reg_mask) {

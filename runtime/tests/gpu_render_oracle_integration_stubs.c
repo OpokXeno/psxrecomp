@@ -24,6 +24,7 @@
 #include "spu.h"
 #include "text_xlate.h"
 #include "timers.h"
+#include "xg_render_auth_runtime_hooks.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -152,6 +153,11 @@ void guest_render_bridge_force_original(GuestRenderFallbackReason reason) {
 }
 
 void psx_xg_render_auth_capture_clear_tile(CPUState *cpu) { (void)cpu; }
+void psx_xg_render_auth_capture_logo_sprite(
+        uint32_t command_address, uint8_t color) {
+    (void)command_address;
+    (void)color;
+}
 void psx_xg_render_auth_capture_tile_write(
         CPUState *cpu, uint32_t command_address, uint32_t writer_pc,
         uint8_t color) {
@@ -160,8 +166,6 @@ void psx_xg_render_auth_capture_tile_write(
     (void)writer_pc;
     (void)color;
 }
-void psx_xg_render_auth_capture_model_ft3_link(CPUState *cpu) { (void)cpu; }
-
 #ifdef GPU_ATOMIC_CHECKPOINT_TESTING
 void psx_xg_render_auth_note_code_write(uint64_t previous_generation,
                                         uint64_t next_generation,

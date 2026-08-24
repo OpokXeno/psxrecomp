@@ -31,7 +31,7 @@
 #include "gpu.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "present_ring.h"
-#include "xg_render_auth_runtime.h"
+#include "xg_render_auth_runtime_diagnostics.h"
 #include "load_transition_ring.h"
 #include "cdrom.h"
 #include "sio.h"

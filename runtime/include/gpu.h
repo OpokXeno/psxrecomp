@@ -16,6 +16,7 @@
 #include "ws_cull_policy.h"
 
 typedef struct CPUState CPUState;
+typedef bool (*GpuOrderingTableSubmissionHook)(uint32_t start_address);
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,9 +28,12 @@ uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
 void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */
 void     gpu_set_submission_hook(void (*hook)(void));
+void     gpu_set_ordering_table_submission_hook(
+             GpuOrderingTableSubmissionHook hook);
 void     gpu_set_semantic_current_hook(
              void (*hook)(const GpuRenderSemantic *semantic));
 void     gpu_prepare_submission(void);
+bool     gpu_prepare_ordering_table_submission(uint32_t start_address);
 int      gpu_gp0_command_word_count(uint8_t opcode);
 bool     gpu_gp0_parser_is_idle(void);
 uint64_t gpu_render_vram_mutation_serial(void);
