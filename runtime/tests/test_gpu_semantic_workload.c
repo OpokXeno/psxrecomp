@@ -1043,6 +1043,76 @@ static int test_shared_mesh_vertices_keep_one_phase_when_material_snaps(void) {
     return 1;
 }
 
+static int test_unkeyed_shared_position_keeps_exact_phase(void) {
+    static const int32_t previous_a_x[3] = {8, 18, 18};
+    static const int32_t previous_a_y[3] = {90, 90, 100};
+    static const int32_t previous_b_x[3] = {20, 28, 20};
+    static const int32_t previous_b_y[3] = {90, 100, 100};
+    static const int32_t current_a_x[3] = {10, 20, 20};
+    static const int32_t current_a_y[3] = {90, 90, 100};
+    static const int32_t current_b_x[3] = {20, 30, 20};
+    static const int32_t current_b_y[3] = {90, 100, 100};
+    GpuRenderSemantic previous_a = triangle(0, 1u);
+    GpuRenderSemantic previous_b = triangle(0, 2u);
+    GpuRenderSemantic current_a = triangle(0, 1u);
+    GpuRenderSemantic current_b = triangle(0, 2u);
+    GpuRenderSemantic phase_a[1];
+    GpuRenderSemantic phase_b[1];
+    GpuRenderSemantic recorded;
+
+    for (size_t vertex = 0u; vertex < 3u; ++vertex) {
+        GpuRenderSemanticVertex *pa =
+            &previous_a.triangles[0].vertices[vertex];
+        GpuRenderSemanticVertex *pb =
+            &previous_b.triangles[0].vertices[vertex];
+        GpuRenderSemanticVertex *ca =
+            &current_a.triangles[0].vertices[vertex];
+        GpuRenderSemanticVertex *cb =
+            &current_b.triangles[0].vertices[vertex];
+
+        pa->x = previous_a_x[vertex] * INT32_C(65536);
+        pa->y = previous_a_y[vertex] * INT32_C(65536);
+        pb->x = previous_b_x[vertex] * INT32_C(65536);
+        pb->y = previous_b_y[vertex] * INT32_C(65536);
+        ca->x = current_a_x[vertex] * INT32_C(65536);
+        ca->y = current_a_y[vertex] * INT32_C(65536);
+        cb->x = current_b_x[vertex] * INT32_C(65536);
+        cb->y = current_b_y[vertex] * INT32_C(65536);
+        pa->native_view_x = pa->x + INT32_C(16384);
+        pa->native_view_y = pa->y + INT32_C(16384);
+        pb->native_view_x = pb->x + INT32_C(16384);
+        pb->native_view_y = pb->y + INT32_C(16384);
+        ca->native_view_x = ca->x + INT32_C(16384);
+        ca->native_view_y = ca->y + INT32_C(16384);
+        cb->native_view_x = cb->x + INT32_C(16384);
+        cb->native_view_y = cb->y + INT32_C(16384);
+    }
+
+    gpu_semantic_workload_reset();
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record(&previous_a, &recorded) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record(&previous_b, &recorded) ==
+            GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record_phases(
+                &current_a, 2u, phase_a, 1u) == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(gpu_semantic_workload_record_phases(
+                &current_b, 2u, phase_b, 1u) == GPU_SEMANTIC_WORKLOAD_OK);
+    REQUIRE(phase_a[0].triangles[0].vertices[1].x ==
+            19 * INT32_C(65536));
+    REQUIRE(phase_a[0].triangles[0].vertices[1].x ==
+            phase_b[0].triangles[0].vertices[0].x);
+    REQUIRE(phase_a[0].triangles[0].vertices[2].x ==
+            phase_b[0].triangles[0].vertices[2].x);
+    REQUIRE(phase_a[0].triangles[0].vertices[1].native_view_x ==
+            phase_b[0].triangles[0].vertices[0].native_view_x);
+    REQUIRE(phase_b[0].triangles[0].vertices[1].x ==
+            29 * INT32_C(65536));
+    return 1;
+}
+
 static int test_conflicting_previous_shared_vertex_keeps_motion_coherent(void) {
     static const uint32_t ids_a[3] = {0u, 1u, 2u};
     static const uint32_t ids_b[3] = {2u, 3u, 4u};
@@ -2004,6 +2074,7 @@ int main(void) {
     if (!test_unkeyed_textured_translation_interpolates()) return 18;
     if (!test_shared_mesh_vertices_keep_one_phase_when_material_snaps())
         return 19;
+    if (!test_unkeyed_shared_position_keeps_exact_phase()) return 46;
     if (!test_conflicting_previous_shared_vertex_keeps_motion_coherent())
         return 31;
     if (!test_unmatched_shared_vertex_reports_topology_transition()) return 44;

@@ -72,6 +72,7 @@ static struct {
     int32_t previous_anchor_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
     int32_t current_anchor_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
     int32_t phase_vertex_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
+    int32_t phase_position_hash[GPU_SEMANTIC_VERTEX_HASH_CAPACITY];
     uint16_t previous_hash_touched[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     uint16_t current_hash_touched[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     uint16_t previous_retrospective_touched[GPU_SEMANTIC_WORKLOAD_CAPACITY];
@@ -81,6 +82,8 @@ static struct {
     uint16_t current_anchor_hash_touched[GPU_SEMANTIC_ANCHOR_CAPACITY];
     uint16_t phase_vertex_hash_touched[GPU_SEMANTIC_MAX_VERTICES *
                                        GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint16_t phase_position_hash_touched[GPU_SEMANTIC_MAX_VERTICES *
+                                         GPU_SEMANTIC_WORKLOAD_CAPACITY];
     size_t previous_hash_touched_count;
     size_t current_hash_touched_count;
     size_t previous_retrospective_touched_count;
@@ -88,6 +91,7 @@ static struct {
     size_t previous_anchor_hash_touched_count;
     size_t current_anchor_hash_touched_count;
     size_t phase_vertex_hash_touched_count;
+    size_t phase_position_hash_touched_count;
     GpuSemanticPhasePosition phase_positions
         [GPU_SEMANTIC_INTERPOLATION_MAX_PHASES]
         [GPU_SEMANTIC_WORKLOAD_CAPACITY * GPU_SEMANTIC_MAX_VERTICES];
@@ -138,6 +142,9 @@ static void clear_workload_hashes(void) {
     clear_touched_hash(workload.phase_vertex_hash,
                        workload.phase_vertex_hash_touched,
                        &workload.phase_vertex_hash_touched_count);
+    clear_touched_hash(workload.phase_position_hash,
+                       workload.phase_position_hash_touched,
+                       &workload.phase_position_hash_touched_count);
 }
 
 static bool identity_equal(const GpuRenderInterpolationIdentity *a,
@@ -481,6 +488,83 @@ static size_t vertex_identity_hash(
     value *= UINT64_C(0xff51afd7ed558ccd);
     value ^= value >> 33u;
     return (size_t)value & (GPU_SEMANTIC_VERTEX_HASH_CAPACITY - 1u);
+}
+
+static uint64_t phase_position_hash_mix(uint64_t hash, uint64_t value) {
+    hash ^= value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6u) +
+        (hash >> 2u);
+    return hash;
+}
+
+static size_t phase_position_hash_value(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderSemanticVertex *vertex) {
+    const int64_t unit = INT64_C(1) << GPU_RENDER_FIXED_FRACTION_BITS;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+
+#define MIX_PHASE_POSITION(value) \
+    hash = phase_position_hash_mix(hash, (uint64_t)(value))
+    MIX_PHASE_POSITION(semantic->interpolation_identity.scene_id);
+    MIX_PHASE_POSITION(semantic->interpolation_identity.producer_id);
+    MIX_PHASE_POSITION(semantic->screen_space_2d);
+    MIX_PHASE_POSITION(semantic->material.draw_area_left);
+    MIX_PHASE_POSITION(semantic->material.draw_area_top);
+    MIX_PHASE_POSITION(semantic->material.draw_area_right);
+    MIX_PHASE_POSITION(semantic->material.draw_area_bottom);
+    MIX_PHASE_POSITION((int64_t)vertex->x +
+        (int64_t)semantic->material.draw_offset_x * unit);
+    MIX_PHASE_POSITION((int64_t)vertex->y +
+        (int64_t)semantic->material.draw_offset_y * unit);
+    MIX_PHASE_POSITION(vertex->native_view_position);
+    if (vertex->native_view_position) {
+        MIX_PHASE_POSITION((int64_t)vertex->native_view_x +
+            (int64_t)semantic->material.draw_offset_x * unit);
+        MIX_PHASE_POSITION((int64_t)vertex->native_view_y +
+            (int64_t)semantic->material.draw_offset_y * unit);
+    }
+#undef MIX_PHASE_POSITION
+    return (size_t)hash & (GPU_SEMANTIC_VERTEX_HASH_CAPACITY - 1u);
+}
+
+static bool phase_position_equal(
+        const GpuRenderSemantic *a_semantic,
+        const GpuRenderSemanticVertex *a,
+        const GpuRenderSemantic *b_semantic,
+        const GpuRenderSemanticVertex *b) {
+    const int64_t unit = INT64_C(1) << GPU_RENDER_FIXED_FRACTION_BITS;
+
+    if (a_semantic->interpolation_identity.scene_id !=
+            b_semantic->interpolation_identity.scene_id ||
+        a_semantic->interpolation_identity.producer_id !=
+            b_semantic->interpolation_identity.producer_id ||
+        a_semantic->screen_space_2d != b_semantic->screen_space_2d ||
+        a_semantic->material.draw_area_left !=
+            b_semantic->material.draw_area_left ||
+        a_semantic->material.draw_area_top !=
+            b_semantic->material.draw_area_top ||
+        a_semantic->material.draw_area_right !=
+            b_semantic->material.draw_area_right ||
+        a_semantic->material.draw_area_bottom !=
+            b_semantic->material.draw_area_bottom ||
+        (int64_t)a->x +
+                (int64_t)a_semantic->material.draw_offset_x * unit !=
+            (int64_t)b->x +
+                (int64_t)b_semantic->material.draw_offset_x * unit ||
+        (int64_t)a->y +
+                (int64_t)a_semantic->material.draw_offset_y * unit !=
+            (int64_t)b->y +
+                (int64_t)b_semantic->material.draw_offset_y * unit ||
+        a->native_view_position != b->native_view_position)
+        return false;
+    if (!a->native_view_position) return true;
+    return (int64_t)a->native_view_x +
+               (int64_t)a_semantic->material.draw_offset_x * unit ==
+               (int64_t)b->native_view_x +
+               (int64_t)b_semantic->material.draw_offset_x * unit &&
+           (int64_t)a->native_view_y +
+               (int64_t)a_semantic->material.draw_offset_y * unit ==
+               (int64_t)b->native_view_y +
+               (int64_t)b_semantic->material.draw_offset_y * unit;
 }
 
 static size_t anchor_identity_hash(
@@ -3120,6 +3204,77 @@ static void reconcile_phase_vertex_positions(
                 }
             }
             slot = (slot + 1u) & (GPU_SEMANTIC_VERTEX_HASH_CAPACITY - 1u);
+        }
+    }
+    /* Unkeyed copies of one current endpoint must reuse one exact 16.16 phase
+     * before either the canonical or Native surface rasterizes them. */
+    if (semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES) return;
+    for (size_t vertex_index = 0u; vertex_index < vertex_count;
+         ++vertex_index) {
+        const GpuRenderSemanticVertex *vertex =
+            semantic_vertex_at(semantic, vertex_index);
+        size_t slot;
+
+        if (vertex->interpolation_vertex_identity_valid) continue;
+        slot = phase_position_hash_value(semantic, vertex);
+        for (size_t probe = 0u; probe < GPU_SEMANTIC_VERTEX_HASH_CAPACITY;
+             ++probe) {
+            const int32_t entry = workload.phase_position_hash[slot];
+
+            if (entry == 0) {
+                if (!insert_missing) break;
+                const size_t flat_index =
+                    item_index * GPU_SEMANTIC_MAX_VERTICES + vertex_index;
+
+                workload.phase_position_hash_touched[
+                    workload.phase_position_hash_touched_count++] =
+                        (uint16_t)slot;
+                workload.phase_position_hash[slot] =
+                    (int32_t)flat_index + 1;
+                for (size_t phase = 0u; phase < phase_count; ++phase) {
+                    const GpuRenderSemanticVertex *phase_vertex =
+                        semantic_vertex_at(&phases[phase], vertex_index);
+
+                    workload.phase_positions[phase][flat_index] =
+                        (GpuSemanticPhasePosition){
+                            .x = phase_vertex->x,
+                            .y = phase_vertex->y,
+                            .native_x = phase_vertex->native_view_x,
+                            .native_y = phase_vertex->native_view_y,
+                        };
+                }
+                break;
+            }
+            {
+                const size_t existing_flat = (size_t)(entry - 1);
+                const size_t existing_item =
+                    existing_flat / GPU_SEMANTIC_MAX_VERTICES;
+                const size_t existing_vertex =
+                    existing_flat % GPU_SEMANTIC_MAX_VERTICES;
+                const GpuRenderSemantic *existing_semantic =
+                    &current->items[existing_item];
+                const GpuRenderSemanticVertex *existing =
+                    semantic_vertex_at(existing_semantic, existing_vertex);
+
+                if (phase_position_equal(
+                        semantic, vertex, existing_semantic, existing)) {
+                    for (size_t phase = 0u; phase < phase_count; ++phase) {
+                        GpuRenderSemanticVertex *phase_vertex =
+                            semantic_vertex_at_mutable(
+                                &phases[phase], vertex_index);
+                        const GpuSemanticPhasePosition *position =
+                            &workload.phase_positions[phase][existing_flat];
+
+                        phase_vertex->x = position->x;
+                        phase_vertex->y = position->y;
+                        phase_vertex->native_view_x = position->native_x;
+                        phase_vertex->native_view_y = position->native_y;
+                    }
+                    break;
+                }
+            }
+            slot = (slot + 1u) &
+                (GPU_SEMANTIC_VERTEX_HASH_CAPACITY - 1u);
         }
     }
 }
