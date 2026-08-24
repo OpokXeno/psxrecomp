@@ -80,6 +80,16 @@ static bool observe_source_writer(
 static GpuRenderSemantic resolver_semantic;
 static GuestRenderNativeStreamMissContext resolver_expected;
 static GuestRenderNativeStreamCommandIdentity resolver_identity;
+static size_t resolved_semantic_observer_calls;
+static uint64_t resolved_semantic_observer_command_id;
+
+static bool observe_resolved_semantic(
+        uint64_t command_id, const GpuRenderSemantic *semantic) {
+    if (semantic == NULL) return false;
+    resolved_semantic_observer_command_id = command_id;
+    ++resolved_semantic_observer_calls;
+    return true;
+}
 
 static bool contextual_resolver(
         const GuestRenderNativeStreamMissContext *context,
@@ -919,9 +929,14 @@ static int test_equivalent_active_miss_resolutions_commit_once(void) {
     };
     resolver_semantic = make_semantic(88u);
     guest_render_native_stream_set_miss_resolver(visual_agnostic_resolver);
+    resolved_semantic_observer_calls = 0u;
+    resolved_semantic_observer_command_id = 0u;
+    guest_render_native_stream_set_resolved_semantic_observer(
+        observe_resolved_semantic);
     CHECK(guest_render_native_stream_resolve_active_miss(
         &resolver_identity, &resolver_semantic, &resolved_visual,
         &resolved_semantic));
+    CHECK(resolved_semantic_observer_calls == 0u);
     CHECK(resolved_visual.scene_epoch == newer.scene_epoch);
     CHECK(resolved_visual.state_sequence == newer.state_sequence);
     CHECK(resolved_semantic.triangles[0].vertices[0].r == 88u);
@@ -931,6 +946,8 @@ static int test_equivalent_active_miss_resolutions_commit_once(void) {
     CHECK(guest_render_native_stream_note_resolved_consumed(
               resolved_visual, resolver_identity.command_id,
               &resolved_semantic) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(resolved_semantic_observer_calls == 1u);
+    CHECK(resolved_semantic_observer_command_id == resolver_identity.command_id);
     CHECK(guest_render_native_stream_snapshot(&snapshot) ==
           GUEST_RENDER_NATIVE_STREAM_OK);
     CHECK(snapshot.total_staged == 3u);

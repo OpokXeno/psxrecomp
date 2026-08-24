@@ -1,4 +1,5 @@
 #include "gpu_semantic_workload.h"
+#include "psx_gte_divide.h"
 
 #include <limits.h>
 #include <string.h>
@@ -94,11 +95,13 @@ static struct {
     bool previous_corresponded[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     bool current_moved[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     bool source_geometry_match[GPU_SEMANTIC_WORKLOAD_CAPACITY];
+    uint8_t topology_transition_phase_mask[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     GpuSemanticWorkloadMatchKind match_kind[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     GpuSemanticWorkloadMatchKind fallback_kind[GPU_SEMANTIC_WORKLOAD_CAPACITY];
     GpuSemanticAnchorFrame anchor_frames[2];
     unsigned int sealed_index;
     unsigned int building_index;
+    size_t phase_count;
     bool has_sealed;
     bool building;
     GpuSemanticWorkloadDiagnostics diagnostics;
@@ -302,6 +305,16 @@ static bool triangle_winding_compatible(
            (native_a == 0 || native_b == 0 || native_a == native_b);
 }
 
+static bool triangle_phase_winding_compatible(
+        const GpuRenderSemanticTriangle *current,
+        const GpuRenderSemanticTriangle *phase) {
+    const int current_orientation = triangle_orientation(current, true);
+    const int phase_orientation = triangle_orientation(phase, true);
+
+    return current_orientation == 0 ||
+        phase_orientation == current_orientation;
+}
+
 static bool retrospective_material_compatible(const GpuRenderMaterial *a,
                                                const GpuRenderMaterial *b);
 
@@ -492,11 +505,14 @@ static bool anchor_identity_equal(
            anchor->scene_id == semantic->interpolation_identity.scene_id &&
            anchor->vertex.interpolation_vertex_identity_valid &&
            vertex->interpolation_vertex_identity_valid &&
-           anchor->vertex.interpolation_group_id ==
-               vertex->interpolation_group_id &&
-           anchor->vertex.interpolation_vertex_id ==
-               vertex->interpolation_vertex_id;
+            anchor->vertex.interpolation_group_id ==
+                vertex->interpolation_group_id &&
+            anchor->vertex.interpolation_vertex_id ==
+                vertex->interpolation_vertex_id;
 }
+
+static bool material_position_equal(
+    const GpuRenderMaterial *a, const GpuRenderMaterial *b);
 
 static bool vertex_identity_equal(
         const GpuRenderSemantic *a_semantic,
@@ -588,7 +604,10 @@ static void anchor_hash_insert(
                 existing->vertex.interpolation_group_id ==
                     anchor->vertex.interpolation_group_id &&
                 existing->vertex.interpolation_vertex_id ==
-                    anchor->vertex.interpolation_vertex_id)
+                    anchor->vertex.interpolation_vertex_id &&
+                existing->primitive_id == anchor->primitive_id &&
+                material_position_equal(
+                    &existing->material, &anchor->material))
                 return;
         }
         slot = (slot + 1u) & (GPU_SEMANTIC_VERTEX_HASH_CAPACITY - 1u);
@@ -605,6 +624,9 @@ static bool anchor_lookup(
         .producer_id = semantic->interpolation_identity.producer_id,
         .vertex = *vertex,
     };
+    const GpuRenderInterpolationVertexAnchor *primitive_fallback = NULL;
+    const GpuRenderInterpolationVertexAnchor *material_fallback = NULL;
+    const GpuRenderInterpolationVertexAnchor *fallback = NULL;
     size_t slot;
 
     if (!vertex->interpolation_vertex_identity_valid) return false;
@@ -614,15 +636,42 @@ static bool anchor_lookup(
         const int32_t entry = table[slot];
         const GpuRenderInterpolationVertexAnchor *candidate;
 
-        if (entry == 0) return false;
+        if (entry == 0) {
+            const GpuRenderInterpolationVertexAnchor *selected =
+                primitive_fallback != NULL ? primitive_fallback :
+                (material_fallback != NULL ? material_fallback : fallback);
+
+            if (selected == NULL) return false;
+            *out_anchor = selected;
+            return true;
+        }
         candidate = &anchors->items[(size_t)(entry - 1)];
         if (anchor_identity_equal(candidate, semantic, vertex)) {
-            *out_anchor = candidate;
-            return true;
+            const bool primitive_matches = candidate->primitive_id != 0u &&
+                candidate->primitive_id ==
+                    semantic->interpolation_identity.primitive_id;
+            const bool material_matches = material_position_equal(
+                &candidate->material, &semantic->material);
+
+            if (primitive_matches && material_matches) {
+                *out_anchor = candidate;
+                return true;
+            }
+            if (primitive_matches && primitive_fallback == NULL)
+                primitive_fallback = candidate;
+            if (material_matches && material_fallback == NULL)
+                material_fallback = candidate;
+            if (fallback == NULL) fallback = candidate;
         }
         slot = (slot + 1u) & (GPU_SEMANTIC_VERTEX_HASH_CAPACITY - 1u);
     }
-    return false;
+    const GpuRenderInterpolationVertexAnchor *selected =
+        primitive_fallback != NULL ? primitive_fallback :
+        (material_fallback != NULL ? material_fallback : fallback);
+
+    if (selected == NULL) return false;
+    *out_anchor = selected;
+    return true;
 }
 
 static bool previous_vertex_lookup(
@@ -679,6 +728,12 @@ static bool previous_vertex_lookup(
 
 static uint64_t abs_difference_i64(int64_t a, int64_t b) {
     return a >= b ? (uint64_t)(a - b) : (uint64_t)(b - a);
+}
+
+static int64_t fixed_floor_i64(int64_t value) {
+    const int64_t unit = INT64_C(1) << GPU_RENDER_FIXED_FRACTION_BITS;
+
+    return value >= 0 ? value / unit : -((-value + unit - 1) / unit);
 }
 
 static int64_t interpolate_i64(int64_t previous, int64_t current,
@@ -1187,7 +1242,7 @@ static int32_t retrospective_match(const GpuSemanticFrame *previous,
 }
 
 static bool projective_payload_valid(const GpuRenderSemanticVertex *vertex) {
-    const int64_t unit = INT64_C(1) << GPU_RENDER_FIXED_FRACTION_BITS;
+    int32_t scale;
     int64_t projected_x;
     int64_t projected_y;
     int64_t endpoint_x;
@@ -1205,14 +1260,13 @@ static bool projective_payload_valid(const GpuRenderSemanticVertex *vertex) {
             vertex->projective_distance) {
         return false;
     }
+    scale = psx_gte_divide(
+        vertex->projective_distance, (uint16_t)vertex->projective_view_z,
+        NULL);
     projected_x = (int64_t)vertex->projective_offset_x +
-        (int64_t)vertex->projective_view_x *
-            vertex->projective_distance * unit /
-            vertex->projective_view_z;
+        (int64_t)vertex->projective_view_x * scale;
     projected_y = (int64_t)vertex->projective_offset_y +
-        (int64_t)vertex->projective_view_y *
-            vertex->projective_distance * unit /
-            vertex->projective_view_z;
+        (int64_t)vertex->projective_view_y * scale;
     endpoint_x = vertex->native_view_position
         ? (int64_t)vertex->native_view_x -
               vertex->projective_native_offset_x
@@ -1221,8 +1275,10 @@ static bool projective_payload_valid(const GpuRenderSemanticVertex *vertex) {
         ? (int64_t)vertex->native_view_y -
               vertex->projective_native_offset_y
         : vertex->y;
-    return abs_difference_i64(projected_x, endpoint_x) <= 2u * (uint64_t)unit &&
-        abs_difference_i64(projected_y, endpoint_y) <= 2u * (uint64_t)unit;
+    if (vertex->native_view_position)
+        return projected_x == endpoint_x && projected_y == endpoint_y;
+    return fixed_floor_i64(projected_x) == fixed_floor_i64(endpoint_x) &&
+           fixed_floor_i64(projected_y) == fixed_floor_i64(endpoint_y);
 }
 
 static bool interpolate_projective_position(
@@ -1243,6 +1299,7 @@ static bool interpolate_projective_position(
     int64_t projected_y;
     int64_t native_x;
     int64_t native_y;
+    int32_t scale;
 
     if (!projective_payload_valid(previous) ||
         !projective_payload_valid(out))
@@ -1275,9 +1332,11 @@ static bool interpolate_projective_position(
         numerator, denominator);
     if (view_z <= 0 || distance <= 0 || view_z * 2 <= distance)
         return false;
-    projected_x = offset_x + view_x * distance * unit / view_z -
+    scale = psx_gte_divide(
+        (uint16_t)distance, (uint16_t)view_z, NULL);
+    projected_x = offset_x + view_x * scale -
         (int64_t)current_material->draw_offset_x * unit;
-    projected_y = offset_y + view_y * distance * unit / view_z -
+    projected_y = offset_y + view_y * scale -
         (int64_t)current_material->draw_offset_y * unit;
     native_x = projected_x + interpolate_i64(
         previous->projective_native_offset_x,
@@ -1529,6 +1588,114 @@ static bool interpolate_semantic(GpuRenderSemantic *out,
     return moved;
 }
 
+static bool source_geometry_winding_compatible(
+        const GpuRenderSemantic *current) {
+    const int64_t unit = INT64_C(1) << GPU_RENDER_FIXED_FRACTION_BITS;
+
+    if (current->topology != GPU_RENDER_SEMANTIC_TRIANGLES) return true;
+    for (size_t primitive = 0u; primitive < current->triangle_count;
+         ++primitive) {
+        int64_t current_x[3];
+        int64_t current_y[3];
+        int64_t current_native_x[3];
+        int64_t current_native_y[3];
+        int64_t previous_x[3];
+        int64_t previous_y[3];
+        int64_t previous_native_x[3];
+        int64_t previous_native_y[3];
+
+        for (size_t vertex = 0u; vertex < 3u; ++vertex) {
+            const GpuRenderSemanticVertex *current_vertex =
+                &current->triangles[primitive].vertices[vertex];
+            const GpuRenderSemanticVertex *previous_vertex = NULL;
+            const GpuRenderMaterial *previous_material = NULL;
+            int64_t target_delta_x;
+            int64_t target_delta_y;
+
+            if (!previous_vertex_lookup(
+                    current, current_vertex, &previous_vertex,
+                    &previous_material) ||
+                previous_vertex->native_view_position !=
+                    current_vertex->native_view_position)
+                return false;
+            target_delta_x = target_relocation(
+                current->material.draw_area_left,
+                current->material.draw_area_right,
+                current->material.draw_offset_x,
+                previous_material->draw_area_left,
+                previous_material->draw_area_right,
+                previous_material->draw_offset_x);
+            target_delta_y = target_relocation(
+                current->material.draw_area_top,
+                current->material.draw_area_bottom,
+                current->material.draw_offset_y,
+                previous_material->draw_area_top,
+                previous_material->draw_area_bottom,
+                previous_material->draw_offset_y);
+            current_x[vertex] = (int64_t)current_vertex->x +
+                (int64_t)current->material.draw_offset_x * unit;
+            current_y[vertex] = (int64_t)current_vertex->y +
+                (int64_t)current->material.draw_offset_y * unit;
+            previous_x[vertex] = (int64_t)previous_vertex->x +
+                (int64_t)previous_material->draw_offset_x * unit +
+                target_delta_x;
+            previous_y[vertex] = (int64_t)previous_vertex->y +
+                (int64_t)previous_material->draw_offset_y * unit +
+                target_delta_y;
+            current_native_x[vertex] = current_vertex->native_view_position
+                ? (int64_t)current_vertex->native_view_x +
+                      (int64_t)current->material.draw_offset_x * unit
+                : current_x[vertex];
+            current_native_y[vertex] = current_vertex->native_view_position
+                ? (int64_t)current_vertex->native_view_y +
+                      (int64_t)current->material.draw_offset_y * unit
+                : current_y[vertex];
+            previous_native_x[vertex] =
+                previous_vertex->native_view_position
+                ? (int64_t)previous_vertex->native_view_x +
+                      (int64_t)previous_material->draw_offset_x * unit +
+                      target_delta_x
+                : previous_x[vertex];
+            previous_native_y[vertex] =
+                previous_vertex->native_view_position
+                ? (int64_t)previous_vertex->native_view_y +
+                      (int64_t)previous_material->draw_offset_y * unit +
+                      target_delta_y
+                : previous_y[vertex];
+        }
+        {
+            const int current_orientation = product_difference_sign(
+                current_x[1] - current_x[0],
+                current_y[2] - current_y[0],
+                current_y[1] - current_y[0],
+                current_x[2] - current_x[0]);
+            const int previous_orientation = product_difference_sign(
+                previous_x[1] - previous_x[0],
+                previous_y[2] - previous_y[0],
+                previous_y[1] - previous_y[0],
+                previous_x[2] - previous_x[0]);
+            const int current_native_orientation = product_difference_sign(
+                current_native_x[1] - current_native_x[0],
+                current_native_y[2] - current_native_y[0],
+                current_native_y[1] - current_native_y[0],
+                current_native_x[2] - current_native_x[0]);
+            const int previous_native_orientation = product_difference_sign(
+                previous_native_x[1] - previous_native_x[0],
+                previous_native_y[2] - previous_native_y[0],
+                previous_native_y[1] - previous_native_y[0],
+                previous_native_x[2] - previous_native_x[0]);
+
+            if ((current_orientation != 0 && previous_orientation != 0 &&
+                 current_orientation != previous_orientation) ||
+                (current_native_orientation != 0 &&
+                 previous_native_orientation != 0 &&
+                 current_native_orientation != previous_native_orientation))
+                return false;
+        }
+    }
+    return true;
+}
+
 static bool interpolate_source_geometry(
         GpuRenderSemantic *out, unsigned int numerator,
         unsigned int denominator, bool *out_moved,
@@ -1537,9 +1704,12 @@ static bool interpolate_source_geometry(
         size_t *out_midpoint_distinct_vertices,
         size_t *out_midpoint_collapsed_vertices,
         size_t *out_midpoint_formula_failures) {
+    const GpuRenderSemantic current = *out;
     const size_t count = semantic_vertex_count(out);
 
-    if (out_moved == NULL || count == 0u) return false;
+    if (out_moved == NULL || count == 0u ||
+        !source_geometry_winding_compatible(out))
+        return false;
     for (size_t index = 0u; index < count; ++index) {
         const GpuRenderSemanticVertex *previous_vertex;
         const GpuRenderMaterial *previous_material;
@@ -1568,6 +1738,15 @@ static bool interpolate_source_geometry(
             out_midpoint_distinct_vertices, out_midpoint_collapsed_vertices,
             out_midpoint_formula_failures);
     }
+    if (out->topology == GPU_RENDER_SEMANTIC_TRIANGLES)
+        for (size_t primitive = 0u; primitive < out->triangle_count;
+             ++primitive)
+            if (!triangle_phase_winding_compatible(
+                    &current.triangles[primitive],
+                    &out->triangles[primitive])) {
+                *out = current;
+                return false;
+            }
     return true;
 }
 
@@ -1614,6 +1793,7 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_begin(void) {
     building->conflicted = false;
     building_anchors->count = 0u;
     building_anchors->overflowed = false;
+    workload.phase_count = 0u;
     clear_workload_hashes();
     if (workload.has_sealed) {
         const GpuSemanticFrame *previous =
@@ -1752,6 +1932,7 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_internal(
     workload.previous_match[index] = -1;
     workload.current_moved[index] = false;
     workload.source_geometry_match[index] = false;
+    workload.topology_transition_phase_mask[index] = 0u;
     workload.match_kind[index] = GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN;
     workload.fallback_kind[index] = GPU_SEMANTIC_WORKLOAD_MATCH_UNKNOWN;
     current_identity_unique = hash_insert(
@@ -2293,8 +2474,38 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_match_info(
         .current_order = (size_t)current_index,
         .previous_order = workload.previous_match[(size_t)current_index] >= 0
             ? (size_t)workload.previous_match[(size_t)current_index] : 0u,
+        .topology_transition_phase_mask =
+            workload.topology_transition_phase_mask[(size_t)current_index],
         .previous_order_valid =
             workload.previous_match[(size_t)current_index] >= 0,
+    };
+    return GPU_SEMANTIC_WORKLOAD_OK;
+}
+
+GpuSemanticWorkloadStatus gpu_semantic_workload_last_match_info(
+        GpuSemanticWorkloadMatchInfo *out_match) {
+    const GpuSemanticFrame *current;
+    size_t current_index;
+
+    if (out_match == NULL)
+        return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
+    if (!workload.building)
+        return GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
+    current = &workload.frames[workload.building_index];
+    if (current->count == 0u)
+        return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
+    current_index = current->count - 1u;
+    *out_match = (GpuSemanticWorkloadMatchInfo){
+        .kind = workload.match_kind[current_index],
+        .fallback_kind = workload.fallback_kind[current_index],
+        .participation = (GpuSemanticWorkloadParticipation)
+            current->participation[current_index],
+        .current_order = current_index,
+        .previous_order = workload.previous_match[current_index] >= 0
+            ? (size_t)workload.previous_match[current_index] : 0u,
+        .topology_transition_phase_mask =
+            workload.topology_transition_phase_mask[current_index],
+        .previous_order_valid = workload.previous_match[current_index] >= 0,
     };
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
@@ -2409,7 +2620,36 @@ typedef enum RetiredCurrentGeometryStatus {
     RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR,
     RETIRED_CURRENT_GEOMETRY_POSITION_MODE_MISMATCH,
     RETIRED_CURRENT_GEOMETRY_MATERIAL_POSITION_MISMATCH,
+    RETIRED_CURRENT_GEOMETRY_TOPOLOGY_TRANSITION,
 } RetiredCurrentGeometryStatus;
+
+static void reconcile_phase_vertex_positions(
+        const GpuRenderSemantic *semantic, size_t item_index,
+        GpuRenderSemantic *phases, size_t phase_count,
+        bool insert_missing);
+
+static bool retired_anchor_lookup(
+        const GpuRenderSemantic *previous,
+        const GpuRenderSemanticVertex *vertex,
+        const GpuRenderInterpolationVertexAnchor **out_anchor) {
+    const GpuSemanticAnchorFrame *current_anchors =
+        &workload.anchor_frames[workload.sealed_index];
+
+    if (anchor_lookup(workload.current_anchor_hash, current_anchors,
+                      previous, vertex, out_anchor))
+        return true;
+    if (anchor_producer_scene_present(current_anchors, previous))
+        return false;
+
+    /* A producer disappearing is itself a topology transition. Retain its
+     * last authenticated endpoint for one source frame; a partial current
+     * producer contract must never be completed from stale anchors. */
+    const GpuSemanticAnchorFrame *previous_anchors =
+        &workload.anchor_frames[workload.sealed_index ^ 1u];
+    return !previous_anchors->overflowed &&
+        anchor_lookup(workload.previous_anchor_hash, previous_anchors,
+                      previous, vertex, out_anchor);
+}
 
 static RetiredCurrentGeometryStatus retired_current_geometry_status(
         const GpuRenderSemantic *previous,
@@ -2426,8 +2666,7 @@ static RetiredCurrentGeometryStatus retired_current_geometry_status(
             semantic_vertex_at(previous, index);
         const GpuRenderInterpolationVertexAnchor *anchor;
 
-        if (!anchor_lookup(workload.current_anchor_hash, current_anchors,
-                           previous, vertex, &anchor)) {
+        if (!retired_anchor_lookup(previous, vertex, &anchor)) {
             if (!anchor_producer_scene_present(current_anchors, previous) &&
                 current_anchors->count != 0u)
                 return RETIRED_CURRENT_GEOMETRY_SCENE_MISMATCH;
@@ -2444,19 +2683,77 @@ static RetiredCurrentGeometryStatus retired_current_geometry_status(
     }
     if (position_material == NULL)
         return RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR;
+    if (previous->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
+        for (size_t primitive = 0u; primitive < previous->triangle_count;
+             ++primitive) {
+            GpuRenderSemanticTriangle current_triangle =
+                previous->triangles[primitive];
+
+            for (size_t vertex = 0u; vertex < 3u; ++vertex) {
+                const GpuRenderSemanticVertex *previous_vertex =
+                    &previous->triangles[primitive].vertices[vertex];
+                const GpuRenderInterpolationVertexAnchor *anchor;
+
+                if (!retired_anchor_lookup(
+                        previous, previous_vertex, &anchor))
+                    return RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR;
+                copy_vertex_position(
+                    &current_triangle.vertices[vertex], &anchor->vertex);
+            }
+            if (!triangle_winding_compatible(
+                    &previous->triangles[primitive], &current_triangle))
+                return RETIRED_CURRENT_GEOMETRY_TOPOLOGY_TRANSITION;
+        }
+    }
     if (out_position_material != NULL)
         *out_position_material = position_material;
     return RETIRED_CURRENT_GEOMETRY_OK;
 }
 
+static bool interpolate_retired_source_geometry_unchecked(
+        const GpuRenderSemantic *previous, unsigned int numerator,
+        unsigned int denominator, GpuRenderSemantic *out);
+
 static bool retired_current_geometry(
         const GpuRenderSemantic *previous,
         const GpuRenderMaterial **out_position_material) {
-    return retired_current_geometry_status(previous, out_position_material) ==
-        RETIRED_CURRENT_GEOMETRY_OK;
+    const uint64_t projective_vertices_before =
+        workload.diagnostics.total_projective_phase_vertices;
+    const size_t phase_count = workload.phase_count != 0u
+        ? workload.phase_count : GPU_SEMANTIC_INTERPOLATION_MAX_PHASES;
+    GpuRenderSemantic phases[GPU_SEMANTIC_INTERPOLATION_MAX_PHASES];
+
+    if (retired_current_geometry_status(previous, out_position_material) !=
+            RETIRED_CURRENT_GEOMETRY_OK)
+        return false;
+    if (previous->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
+        for (size_t phase = 0u; phase < phase_count; ++phase)
+            if (!interpolate_retired_source_geometry_unchecked(
+                    previous, (unsigned int)phase + 1u,
+                    (unsigned int)phase_count + 1u, &phases[phase])) {
+                workload.diagnostics.total_projective_phase_vertices =
+                    projective_vertices_before;
+                return false;
+            }
+        reconcile_phase_vertex_positions(
+            previous, SIZE_MAX, phases, phase_count, false);
+        for (size_t phase = 0u; phase < phase_count; ++phase)
+            for (size_t primitive = 0u;
+                 primitive < previous->triangle_count; ++primitive)
+                if (!triangle_phase_winding_compatible(
+                        &previous->triangles[primitive],
+                        &phases[phase].triangles[primitive])) {
+                    workload.diagnostics.total_projective_phase_vertices =
+                        projective_vertices_before;
+                    return false;
+                }
+    }
+    workload.diagnostics.total_projective_phase_vertices =
+        projective_vertices_before;
+    return true;
 }
 
-static bool interpolate_retired_source_geometry(
+static bool interpolate_retired_source_geometry_unchecked(
         const GpuRenderSemantic *previous, unsigned int numerator,
         unsigned int denominator, GpuRenderSemantic *out) {
     const GpuSemanticAnchorFrame *current_anchors =
@@ -2464,7 +2761,9 @@ static bool interpolate_retired_source_geometry(
     const GpuRenderMaterial *position_material;
     const size_t count = semantic_vertex_count(previous);
 
-    if (!retired_current_geometry(previous, &position_material)) return false;
+    if (retired_current_geometry_status(previous, &position_material) !=
+            RETIRED_CURRENT_GEOMETRY_OK)
+        return false;
     *out = *previous;
     copy_material_position(&out->material, position_material);
     for (size_t index = 0u; index < count; ++index) {
@@ -2485,8 +2784,7 @@ static bool interpolate_retired_source_geometry(
                 previous, local_previous_vertex, &position_previous,
                 &position_previous_material))
             return false;
-        if (!anchor_lookup(workload.current_anchor_hash, current_anchors,
-                           previous, local_previous_vertex, &anchor))
+        if (!retired_anchor_lookup(previous, local_previous_vertex, &anchor))
             return false;
         copy_vertex_position(out_vertex, &anchor->vertex);
         (void)interpolate_vertex(
@@ -2496,6 +2794,31 @@ static bool interpolate_retired_source_geometry(
             &failures);
     }
     return true;
+}
+
+static bool retired_scene_is_current(const GpuRenderSemantic *previous) {
+    const GpuSemanticFrame *current =
+        &workload.frames[workload.sealed_index];
+    const GpuSemanticAnchorFrame *anchors =
+        &workload.anchor_frames[workload.sealed_index];
+    bool scene_observed = false;
+
+    for (size_t index = 0u; index < current->count; ++index) {
+        const GpuRenderInterpolationIdentity *identity =
+            &current->items[index].interpolation_identity;
+
+        if (!identity->valid) continue;
+        scene_observed = true;
+        if (identity->scene_id == previous->interpolation_identity.scene_id)
+            return true;
+    }
+    for (size_t index = 0u; index < anchors->count; ++index) {
+        scene_observed = true;
+        if (anchors->items[index].scene_id ==
+                previous->interpolation_identity.scene_id)
+            return true;
+    }
+    return !scene_observed;
 }
 
 size_t gpu_semantic_workload_retired_count(void) {
@@ -2509,6 +2832,7 @@ size_t gpu_semantic_workload_retired_count(void) {
                 GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT &&
             !workload.previous_corresponded[index] &&
             semantic_is_retirable_mesh(&previous->items[index]) &&
+            retired_scene_is_current(&previous->items[index]) &&
             retired_current_geometry(&previous->items[index], NULL))
             ++count;
     return count;
@@ -2530,10 +2854,16 @@ void gpu_semantic_workload_retired_diagnostics(
                     GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT ||
                 workload.previous_corresponded[index] ||
                 !semantic_is_retirable_mesh(semantic) ||
-                semantic->interpolation_identity.producer_id != producer_id)
+                !retired_scene_is_current(semantic) ||
+                (producer_id != 0u &&
+                 semantic->interpolation_identity.producer_id != producer_id))
                 continue;
-            const RetiredCurrentGeometryStatus status =
+            RetiredCurrentGeometryStatus status =
                 retired_current_geometry_status(semantic, NULL);
+
+            if (status == RETIRED_CURRENT_GEOMETRY_OK &&
+                !retired_current_geometry(semantic, NULL))
+                status = RETIRED_CURRENT_GEOMETRY_TOPOLOGY_TRANSITION;
 
             ++diagnostics.unmatched;
             switch (status) {
@@ -2548,9 +2878,6 @@ void gpu_semantic_workload_retired_diagnostics(
                 break;
             case RETIRED_CURRENT_GEOMETRY_MISSING_ANCHOR:
                 if (diagnostics.missing_anchor == 0u) {
-                    const GpuSemanticAnchorFrame *anchors =
-                        &workload.anchor_frames[workload.sealed_index];
-
                     diagnostics.first_missing_primitive_id =
                         semantic->interpolation_identity.primitive_id;
                     for (size_t vertex_index = 0u;
@@ -2560,8 +2887,7 @@ void gpu_semantic_workload_retired_diagnostics(
                             semantic_vertex_at(semantic, vertex_index);
                         const GpuRenderInterpolationVertexAnchor *anchor;
 
-                        if (anchor_lookup(
-                                workload.current_anchor_hash, anchors,
+                        if (retired_anchor_lookup(
                                 semantic, vertex, &anchor))
                             continue;
                         diagnostics.first_missing_group_id =
@@ -2578,6 +2904,9 @@ void gpu_semantic_workload_retired_diagnostics(
                 break;
             case RETIRED_CURRENT_GEOMETRY_MATERIAL_POSITION_MISMATCH:
                 ++diagnostics.material_position_mismatch;
+                break;
+            case RETIRED_CURRENT_GEOMETRY_TOPOLOGY_TRANSITION:
+                ++diagnostics.topology_transition;
                 break;
             }
         }
@@ -2623,7 +2952,8 @@ size_t gpu_semantic_workload_retired_issues(
         if (previous->participation[previous_order] !=
                 GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT ||
             workload.previous_corresponded[previous_order] ||
-            !semantic_is_retirable_mesh(semantic))
+            !semantic_is_retirable_mesh(semantic) ||
+            !retired_scene_is_current(semantic))
             continue;
         if (anchors->overflowed) {
             append_retired_issue(
@@ -2638,15 +2968,10 @@ size_t gpu_semantic_workload_retired_issues(
                 semantic_vertex_at(semantic, vertex_index);
             const GpuRenderInterpolationVertexAnchor *anchor;
 
-            if (!anchor_lookup(workload.current_anchor_hash, anchors,
-                               semantic, vertex, &anchor)) {
-                const GpuSemanticWorkloadRetiredIssueReason reason =
-                    !anchor_producer_scene_present(anchors, semantic) &&
-                            anchors->count != 0u
-                        ? GPU_SEMANTIC_RETIRED_ISSUE_SCENE_MISMATCH
-                        : GPU_SEMANTIC_RETIRED_ISSUE_MISSING_ANCHOR;
+            if (!retired_anchor_lookup(semantic, vertex, &anchor)) {
                 append_retired_issue(
-                    semantic, vertex, previous_order, reason,
+                    semantic, vertex, previous_order,
+                    GPU_SEMANTIC_RETIRED_ISSUE_MISSING_ANCHOR,
                     out_issues, capacity, &count);
                 continue;
             }
@@ -2688,6 +3013,7 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_retired(
                 GPU_SEMANTIC_WORKLOAD_PARTICIPATION_AUTHORITATIVE_CURRENT ||
             workload.previous_corresponded[index] ||
             !semantic_is_retirable_mesh(&previous->items[index]) ||
+            !retired_scene_is_current(&previous->items[index]) ||
             !retired_current_geometry(&previous->items[index], NULL))
             continue;
         if (ordinal++ != retired_index) continue;
@@ -2697,11 +3023,6 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_retired(
     }
     return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
 }
-
-static void reconcile_phase_vertex_positions(
-        const GpuRenderSemantic *semantic, size_t item_index,
-        GpuRenderSemantic *phases, size_t phase_count,
-        bool insert_missing);
 
 GpuSemanticWorkloadStatus gpu_semantic_workload_retired_phases(
         size_t retired_index, unsigned int denominator,
@@ -2718,7 +3039,7 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_retired_phases(
         retired_index, &previous, out_previous_order);
     if (status != GPU_SEMANTIC_WORKLOAD_OK) return status;
     for (size_t phase = 0u; phase < phase_count; ++phase)
-        if (!interpolate_retired_source_geometry(
+        if (!interpolate_retired_source_geometry_unchecked(
                 &previous, (unsigned int)phase + 1u, denominator,
                 &out_phases[phase]))
             return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
@@ -2816,6 +3137,9 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases_internal(
         denominator > GPU_SEMANTIC_INTERPOLATION_MAX_PHASES + 1u ||
         phase_count != (size_t)denominator - 1u)
         return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
+    if (workload.phase_count != 0u && workload.phase_count != phase_count)
+        return GPU_SEMANTIC_WORKLOAD_INVALID_ARGUMENT;
+    workload.phase_count = phase_count;
     projective_phase_vertices_before =
         workload.diagnostics.total_projective_phase_vertices;
     status = gpu_semantic_workload_record_internal(
@@ -2857,6 +3181,18 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases_internal(
     }
     reconcile_phase_vertex_positions(
         semantic, index, out_phases, phase_count, true);
+    if (semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES)
+        for (size_t phase = 0u; phase < phase_count; ++phase)
+            for (size_t primitive = 0u;
+                 primitive < semantic->triangle_count; ++primitive)
+                if (!triangle_phase_winding_compatible(
+                        &semantic->triangles[primitive],
+                        &out_phases[phase].triangles[primitive])) {
+                    out_phases[phase] = *semantic;
+                    workload.topology_transition_phase_mask[index] |=
+                        (uint8_t)(1u << phase);
+                    break;
+                }
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 

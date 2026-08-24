@@ -213,6 +213,75 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-24 (Retired model anchor contract completed; strict missing-anchor
+  failures restored):** take7's remaining 16
+  `retired_ineligible_missing_anchors` were traced at the exact failed
+  `retired_anchor_lookup()`. Every missing FT3/FT4 primitive and vertex still
+  existed in the model repository. The current anchor frame either contained a
+  partial producer contract (which correctly prohibited stale fallback) or no
+  producer anchors, while the repository retained the complete source table.
+  Resolved-miss observation now carries the consumed command ID, registers each
+  authenticated model producer/draw-position context, and republishes all
+  lifecycle-current FT3/FT4 source anchors before the temporal frame seals.
+  Tentative resolver probes still publish nothing. Repeated geometric vertex
+  identities are retained separately by draw-position context and primitive;
+  lookup prefers the exact primitive, then matching material position, while
+  preserving geometric fallback for producers such as terrain whose raster
+  context legitimately changes. GDB proved the final outlier was primitive
+  `0x401085ED` of producer `0x0011B66C`: its source existed only in the
+  `draw_offset_y=256` context and had previously been discarded behind the
+  producer's context-0 anchors. Missing endpoints are again emitted as strict
+  `GPU_SEMANTIC_RETIRED_ISSUE_MISSING_ANCHOR` failures. The authoritative
+  6,023-VBlank 60 FPS/16:9 replay is `PASS/trace_complete` with zero missing or
+  absent retired anchors, zero retired failures across all reason classes, zero
+  history/capacity/phase failures, zero material-position mismatches, winding
+  failures, vertex conflicts, formula failures, GL errors, original draws, and
+  unbound/unsupported packets. Evidence:
+  `build/take7-strict-retired-contract-20260824.json`; root-cause GDB command:
+  `/tmp/opencode/xg-retired-missing-root.gdb`.
+- **2026-08-24 (Shared-vertex topology transition proven under GDB and
+  resolved before the fail-closed guard):** A conditional breakpoint after
+  `reconcile_phase_vertex_positions()` captured the remaining take7 fixed-point
+  winding inversion at frame 3,083. Producer `0x0011CF50`, primitive
+  `0x40108B2C`, had no previous primitive correspondence
+  (`previous_index=-1`, fallback `SNAPPED_NOT_FOUND`), but shared vertex 11
+  with a primitive that had interpolated normally. Reconciliation therefore
+  replaced only that shared vertex's Native-view position, from
+  `(16980803,4328304)` to `(17060059,4358025)`, while the other two vertices
+  stayed at the current endpoint and the triangle inverted. This is a topology
+  transition, not an arithmetic failure. After reconciliation, the workload
+  now marks that phase and restores the semantic to current. The result is
+  passed directly from the just-recorded workload item to its queue insertion;
+  a later identity-only lookup was rejected after GDB showed that reused
+  identities could retrieve a different item. Once the complete render queue
+  exists, the renderer locks only the marked semantic's shared vertex
+  identities to their current endpoints. It then adds vertices only from
+  triangles made winding-invalid by those locks and repeats to stability,
+  rather than snapping every primitive in the connected component. GDB
+  observed `mask=0x1` at workload, queue, and application, four queue copies of
+  shared vertex 11 with zero position mismatches, and zero fail-closed guard
+  actions immediately before the guard. The complete
+  6,023-VBlank 60 FPS/16:9 take7 replay is `PASS/trace_complete` with 1,074
+  midpoint presents, 4,170 current presents, 103 retired inserts, zero
+  fixed-point geometry failures, zero component snaps or phase-only rejects by
+  the guard, zero formula failures, GL errors, unbound/unsupported packets,
+  original draws, or fallback draws. The retired inventory no longer treats
+  absent interpolation endpoints as failures: 147 per-vertex missing-anchor
+  events were 43 ineligible semantics with partial anchor coverage, while 843
+  so-called scene mismatches were 185 ineligible semantics whose producer was
+  absent. Both classes remain explicit as
+  `retired_ineligible_missing_anchors` and
+  `retired_ineligible_producer_absent`; contradictory present anchors,
+  overflow, phase generation, geometry, and queue failures remain in the
+  fail-closed event inventory. The final replay reports zero across all 15
+  retired failure classes without producer/group filtering. User visual
+  revalidation confirmed that
+  field-house seams remain closed with the vertex-local policy; the rejected
+  whole-component policy had reintroduced visible gaps despite clean counters.
+  Evidence:
+  `build/take7-midpoint-retired-eligibility-evidence-20260824.json`; GDB command
+  files: `/tmp/opencode/xg-winding-root.gdb` and
+  `/tmp/opencode/xg-topology-apply-proof.gdb`.
 - **2026-08-24 (Retired midpoint shared-vertex trajectory):** Retired mesh
   phases now resolve their previous endpoint through the canonical shared-vertex
   lookup and reuse positions already established by normal current phases for

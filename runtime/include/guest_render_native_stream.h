@@ -182,6 +182,8 @@ typedef struct GuestRenderNativeStreamSnapshot {
 
 typedef void (*GuestRenderNativeStreamMaterialObserver)(
         uint64_t command_id, const GpuRenderMaterial *material);
+typedef bool (*GuestRenderNativeStreamResolvedSemanticObserver)(
+        uint64_t command_id, const GpuRenderSemantic *semantic);
 
 typedef enum GuestRenderNativeStreamSourceKind {
     GUEST_RENDER_NATIVE_STREAM_SOURCE_UNKNOWN = 0,
@@ -236,6 +238,8 @@ void guest_render_native_stream_set_shared_packet_bindings(bool enabled);
 bool guest_render_native_stream_shared_packet_bindings_enabled(void);
 void guest_render_native_stream_set_material_observer(
         GuestRenderNativeStreamMaterialObserver observer);
+void guest_render_native_stream_set_resolved_semantic_observer(
+        GuestRenderNativeStreamResolvedSemanticObserver observer);
 void guest_render_native_stream_set_miss_resolver(
         GuestRenderNativeStreamMissResolver resolver);
 void guest_render_native_stream_set_source_writer_observer(

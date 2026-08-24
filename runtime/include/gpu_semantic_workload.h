@@ -61,6 +61,7 @@ typedef struct GpuSemanticWorkloadMatchInfo {
     GpuSemanticWorkloadParticipation participation;
     size_t current_order;
     size_t previous_order;
+    uint8_t topology_transition_phase_mask;
     bool previous_order_valid;
 } GpuSemanticWorkloadMatchInfo;
 
@@ -223,6 +224,8 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_previous_order(
 GpuSemanticWorkloadStatus gpu_semantic_workload_match_info(
     const GpuRenderInterpolationIdentity *identity,
     GpuSemanticWorkloadMatchInfo *out_match);
+GpuSemanticWorkloadStatus gpu_semantic_workload_last_match_info(
+    GpuSemanticWorkloadMatchInfo *out_match);
 GpuSemanticWorkloadStatus gpu_semantic_workload_current(
     const GpuRenderInterpolationIdentity *identity,
     GpuRenderSemantic *out_semantic);
@@ -239,6 +242,7 @@ typedef struct GpuSemanticWorkloadRetiredDiagnostics {
     size_t missing_anchor;
     size_t position_mode_mismatch;
     size_t material_position_mismatch;
+    size_t topology_transition;
     size_t anchor_overflow;
     uint32_t first_missing_primitive_id;
     uint32_t first_missing_group_id;

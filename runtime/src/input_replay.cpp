@@ -2483,6 +2483,14 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
               << native_midpoint.retired_capacity_miss_count
               << ",\"retired_phase_failures\":"
               << native_midpoint.retired_phase_failure_count
+              << ",\"retired_ineligible_missing_anchors\":"
+              << native_midpoint.retired_ineligible_missing_anchor_count
+              << ",\"retired_ineligible_producer_absent\":"
+              << native_midpoint.retired_ineligible_producer_absent_count
+              << ",\"winding_component_snaps\":"
+              << native_midpoint.winding_component_snap_count
+              << ",\"winding_phase_only_rejects\":"
+              << native_midpoint.winding_phase_only_reject_count
               << ",\"retired_producer_history_recoveries\":"
               << native_midpoint.retired_producer_history_recovery_count
               << ",\"retired_world_model_candidates\":"

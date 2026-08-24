@@ -695,6 +695,7 @@ typedef struct NativeHostQueuedSemantic {
     int clear_margins;
     int midpoint_valid;
     int phase_only;
+    uint8_t topology_transition_phase_mask;
     int temporal_order_valid;
     uint8_t phase_visibility_mask;
     uint32_t phase_order[NATIVE_INTERPOLATION_MAX_PHASES];
@@ -740,8 +741,15 @@ static uint64_t s_retired_failure_event_overflow;
 #define PRODUCER_DIAG_VERTEX_CAP 32768u
 typedef struct ProducerDiagVertex {
     uint64_t scene_id;
+    uint32_t producer_id;
     uint32_t group_id;
     uint32_t vertex_id;
+    uint16_t draw_area_left;
+    uint16_t draw_area_top;
+    uint16_t draw_area_right;
+    uint16_t draw_area_bottom;
+    int16_t draw_offset_x;
+    int16_t draw_offset_y;
     int64_t x;
     int64_t y;
     uint32_t generation;
@@ -767,7 +775,8 @@ static GpuRenderTransactionStatus native_host_pending_flush_reason(
     unsigned int reason);
 static GpuRenderTransactionStatus native_host_queue_push(
     const GpuRenderSemantic *semantic,
-    const GpuRenderSemantic *phase_semantics, int base_x, int slot);
+    const GpuRenderSemantic *phase_semantics,
+    uint8_t topology_transition_phase_mask, int base_x, int slot);
 static GpuRenderTransactionStatus native_host_queue_push_margin_clear(
     int slot, int y, int h, uint16_t color, int midpoint_valid);
 static void native_midpoint_seed_slot(int slot);
@@ -10285,6 +10294,374 @@ static int native_host_diag_fixed_floor(int64_t value) {
         : -(int)((-value + INT64_C(65535)) / INT64_C(65536));
 }
 
+typedef struct NativeHostWindingVertex {
+    uint32_t scene_id;
+    uint32_t producer_id;
+    uint32_t group_id;
+    uint32_t vertex_id;
+    uint32_t generation;
+} NativeHostWindingVertex;
+
+static NativeHostWindingVertex
+    s_native_host_winding_vertices[PRODUCER_DIAG_VERTEX_CAP];
+static uint8_t s_native_host_winding_snap[NATIVE_HOST_QUEUE_CAP];
+static uint32_t s_native_host_winding_generation;
+
+static GpuRenderSemantic *native_host_queue_phase(
+        NativeHostQueuedSemantic *queued, unsigned int phase) {
+    return phase == 0u ? &queued->midpoint
+                       : &queued->extra_phases[phase - 1u];
+}
+
+static int native_host_phase_winding_compatible(
+        const GpuRenderSemantic *current,
+        const GpuRenderSemantic *phase) {
+    if (current->topology != GPU_RENDER_SEMANTIC_TRIANGLES) return 1;
+    for (size_t primitive = 0u; primitive < current->triangle_count;
+         ++primitive) {
+        int64_t current_x[3];
+        int64_t current_y[3];
+        int64_t phase_x[3];
+        int64_t phase_y[3];
+
+        for (size_t vertex = 0u; vertex < 3u; ++vertex) {
+            const GpuRenderSemanticVertex *current_vertex =
+                &current->triangles[primitive].vertices[vertex];
+            const GpuRenderSemanticVertex *phase_vertex =
+                &phase->triangles[primitive].vertices[vertex];
+
+            current_x[vertex] = current_vertex->native_view_position
+                ? current_vertex->native_view_x : current_vertex->x;
+            current_y[vertex] = current_vertex->native_view_position
+                ? current_vertex->native_view_y : current_vertex->y;
+            phase_x[vertex] = phase_vertex->native_view_position
+                ? phase_vertex->native_view_x : phase_vertex->x;
+            phase_y[vertex] = phase_vertex->native_view_position
+                ? phase_vertex->native_view_y : phase_vertex->y;
+        }
+        {
+            const int64_t current_area =
+                (current_x[1] - current_x[0]) *
+                    (current_y[2] - current_y[0]) -
+                (current_y[1] - current_y[0]) *
+                    (current_x[2] - current_x[0]);
+            const int64_t phase_area =
+                (phase_x[1] - phase_x[0]) *
+                    (phase_y[2] - phase_y[0]) -
+                (phase_y[1] - phase_y[0]) *
+                    (phase_x[2] - phase_x[0]);
+
+            if ((current_area < 0 && phase_area >= 0) ||
+                (current_area > 0 && phase_area <= 0))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static size_t native_host_winding_vertex_slot(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderSemanticVertex *vertex) {
+    uint64_t value = semantic->interpolation_identity.scene_id;
+
+    value ^= (uint64_t)semantic->interpolation_identity.producer_id << 32u;
+    value ^= ((uint64_t)vertex->interpolation_group_id << 32u) |
+             vertex->interpolation_vertex_id;
+    value ^= value >> 33u;
+    value *= UINT64_C(0xff51afd7ed558ccd);
+    value ^= value >> 33u;
+    return (size_t)value & (PRODUCER_DIAG_VERTEX_CAP - 1u);
+}
+
+static int native_host_winding_vertex_set(
+        const GpuRenderSemantic *semantic,
+        const GpuRenderSemanticVertex *vertex, int insert) {
+    size_t slot;
+
+    if (!semantic->interpolation_identity.valid ||
+        !vertex->interpolation_vertex_identity_valid)
+        return 0;
+    slot = native_host_winding_vertex_slot(semantic, vertex);
+    for (size_t probe = 0u; probe < PRODUCER_DIAG_VERTEX_CAP; ++probe) {
+        NativeHostWindingVertex *entry =
+            &s_native_host_winding_vertices[slot];
+
+        if (entry->generation != s_native_host_winding_generation) {
+            if (!insert) return 0;
+            *entry = (NativeHostWindingVertex){
+                .scene_id = semantic->interpolation_identity.scene_id,
+                .producer_id = semantic->interpolation_identity.producer_id,
+                .group_id = vertex->interpolation_group_id,
+                .vertex_id = vertex->interpolation_vertex_id,
+                .generation = s_native_host_winding_generation,
+            };
+            return 1;
+        }
+        if (entry->scene_id == semantic->interpolation_identity.scene_id &&
+            entry->producer_id ==
+                semantic->interpolation_identity.producer_id &&
+            entry->group_id == vertex->interpolation_group_id &&
+            entry->vertex_id == vertex->interpolation_vertex_id)
+            return 1;
+        slot = (slot + 1u) & (PRODUCER_DIAG_VERTEX_CAP - 1u);
+    }
+    return 0;
+}
+
+static int native_host_semantic_touches_winding_component(
+        const GpuRenderSemantic *semantic) {
+    const size_t vertex_count = semantic->topology ==
+            GPU_RENDER_SEMANTIC_TRIANGLES
+        ? semantic->triangle_count * 3u : semantic->line_count * 2u;
+
+    for (size_t vertex = 0u; vertex < vertex_count; ++vertex)
+        if (native_host_winding_vertex_set(
+                semantic, native_host_diag_primitive_vertex(
+                    semantic,
+                    vertex / (semantic->topology ==
+                        GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u),
+                    vertex % (semantic->topology ==
+                        GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u)),
+                0))
+            return 1;
+    return 0;
+}
+
+static int native_host_add_winding_component(
+        const GpuRenderSemantic *semantic) {
+    const size_t vertices_per_primitive = semantic->topology ==
+            GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u;
+    const size_t vertex_count = semantic->topology ==
+            GPU_RENDER_SEMANTIC_TRIANGLES
+        ? semantic->triangle_count * 3u : semantic->line_count * 2u;
+    int added = 0;
+
+    for (size_t vertex = 0u; vertex < vertex_count; ++vertex) {
+        const GpuRenderSemanticVertex *position =
+            native_host_diag_primitive_vertex(
+                semantic, vertex / vertices_per_primitive,
+                vertex % vertices_per_primitive);
+
+        if (!native_host_winding_vertex_set(semantic, position, 0) &&
+            native_host_winding_vertex_set(semantic, position, 1))
+            added = 1;
+    }
+    return added;
+}
+
+static GpuRenderSemanticVertex *native_host_primitive_vertex(
+        GpuRenderSemantic *semantic, size_t primitive, size_t vertex) {
+    return semantic->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+        ? &semantic->triangles[primitive].vertices[vertex]
+        : &semantic->lines[primitive].vertices[vertex];
+}
+
+static const GpuRenderSemanticVertex *native_host_queue_current_vertex(
+        size_t count, const GpuRenderSemantic *semantic,
+        const GpuRenderSemanticVertex *vertex) {
+    for (size_t index = 0u; index < count; ++index) {
+        const NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
+        const GpuRenderSemantic *current = &queued->current;
+        size_t primitive_count;
+        size_t vertex_count;
+
+        if (queued->clear_margins || queued->phase_only ||
+            !current->interpolation_identity.valid ||
+            current->interpolation_identity.scene_id !=
+                semantic->interpolation_identity.scene_id ||
+            current->interpolation_identity.producer_id !=
+                semantic->interpolation_identity.producer_id)
+            continue;
+        primitive_count = current->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+            ? current->triangle_count : current->line_count;
+        vertex_count = current->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+            ? 3u : 2u;
+        for (size_t primitive = 0u; primitive < primitive_count; ++primitive)
+            for (size_t current_vertex = 0u; current_vertex < vertex_count;
+                 ++current_vertex) {
+                const GpuRenderSemanticVertex *candidate =
+                    native_host_diag_primitive_vertex(
+                        current, primitive, current_vertex);
+
+                if (candidate->interpolation_vertex_identity_valid &&
+                    candidate->interpolation_group_id ==
+                        vertex->interpolation_group_id &&
+                    candidate->interpolation_vertex_id ==
+                        vertex->interpolation_vertex_id)
+                    return candidate;
+            }
+    }
+    return NULL;
+}
+
+static void native_host_copy_vertex_position(
+        GpuRenderSemanticVertex *target,
+        const GpuRenderSemanticVertex *source) {
+    target->x = source->x;
+    target->y = source->y;
+    target->native_view_x = source->native_view_x;
+    target->native_view_y = source->native_view_y;
+    target->native_view_position = source->native_view_position;
+    target->projective_view_x = source->projective_view_x;
+    target->projective_view_y = source->projective_view_y;
+    target->projective_view_z = source->projective_view_z;
+    target->projective_offset_x = source->projective_offset_x;
+    target->projective_offset_y = source->projective_offset_y;
+    target->projective_native_offset_x = source->projective_native_offset_x;
+    target->projective_native_offset_y = source->projective_native_offset_y;
+    target->projective_distance = source->projective_distance;
+    target->projective_position = source->projective_position;
+    target->temporal_depth = source->temporal_depth;
+    target->temporal_depth_valid = source->temporal_depth_valid;
+}
+
+static void native_host_queue_reject_invalid_winding(
+        size_t count) {
+    for (unsigned int phase = 0u;
+         phase < s_native_interpolation_phase_count; ++phase) {
+        int expanded;
+
+        if (++s_native_host_winding_generation == 0u) {
+            memset(s_native_host_winding_vertices, 0,
+                   sizeof(s_native_host_winding_vertices));
+            ++s_native_host_winding_generation;
+        }
+        memset(s_native_host_winding_snap, 0,
+               count * sizeof(s_native_host_winding_snap[0]));
+        for (size_t index = 0u; index < count; ++index) {
+            NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
+            GpuRenderSemantic *phase_semantic;
+
+            if (!queued->midpoint_valid || queued->clear_margins ||
+                (queued->phase_only &&
+                 (queued->phase_visibility_mask & (1u << phase)) == 0u))
+                continue;
+            phase_semantic = native_host_queue_phase(queued, phase);
+            if (native_host_phase_winding_compatible(
+                    &queued->current, phase_semantic))
+                continue;
+            if (queued->phase_only) {
+                queued->phase_visibility_mask &= (uint8_t)~(1u << phase);
+                ++s_native_midpoint_diag.winding_phase_only_reject_count;
+                continue;
+            }
+            s_native_host_winding_snap[index] = 1u;
+            native_host_add_winding_component(&queued->current);
+        }
+        do {
+            expanded = 0;
+            for (size_t index = 0u; index < count; ++index) {
+                NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
+
+                if (queued->clear_margins ||
+                    s_native_host_winding_snap[index] ||
+                    !native_host_semantic_touches_winding_component(
+                        &queued->current))
+                    continue;
+                if (queued->phase_only) {
+                    if ((queued->phase_visibility_mask &
+                         (uint8_t)(1u << phase)) != 0u) {
+                        queued->phase_visibility_mask &=
+                            (uint8_t)~(1u << phase);
+                        ++s_native_midpoint_diag
+                            .winding_phase_only_reject_count;
+                    }
+                    continue;
+                }
+                s_native_host_winding_snap[index] = 1u;
+                native_host_add_winding_component(&queued->current);
+                expanded = 1;
+            }
+        } while (expanded);
+        for (size_t index = 0u; index < count; ++index)
+            if (s_native_host_winding_snap[index]) {
+                *native_host_queue_phase(
+                    &s_native_host_queue[index], phase) =
+                        s_native_host_queue[index].current;
+                ++s_native_midpoint_diag.winding_component_snap_count;
+            }
+    }
+}
+
+static void native_host_queue_apply_topology_transitions(size_t count) {
+    for (unsigned int phase = 0u;
+         phase < s_native_interpolation_phase_count; ++phase) {
+        int expanded;
+
+        if (++s_native_host_winding_generation == 0u) {
+            memset(s_native_host_winding_vertices, 0,
+                   sizeof(s_native_host_winding_vertices));
+            ++s_native_host_winding_generation;
+        }
+        for (size_t index = 0u; index < count; ++index) {
+            NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
+
+            if (!queued->midpoint_valid || queued->clear_margins ||
+                queued->phase_only ||
+                (queued->topology_transition_phase_mask &
+                 (uint8_t)(1u << phase)) == 0u)
+                continue;
+            (void)native_host_add_winding_component(&queued->current);
+        }
+        do {
+            expanded = 0;
+            for (size_t index = 0u; index < count; ++index) {
+                NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
+                GpuRenderSemantic *phase_semantic;
+                size_t primitive_count;
+                size_t vertex_count;
+
+                if (!queued->midpoint_valid || queued->clear_margins ||
+                    (queued->phase_only &&
+                     (queued->phase_visibility_mask &
+                      (uint8_t)(1u << phase)) == 0u))
+                    continue;
+                phase_semantic = native_host_queue_phase(queued, phase);
+                primitive_count = queued->current.topology ==
+                        GPU_RENDER_SEMANTIC_TRIANGLES
+                    ? queued->current.triangle_count
+                    : queued->current.line_count;
+                vertex_count = queued->current.topology ==
+                        GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u;
+                for (size_t primitive = 0u; primitive < primitive_count;
+                     ++primitive)
+                    for (size_t vertex = 0u; vertex < vertex_count; ++vertex) {
+                        const GpuRenderSemanticVertex *current_vertex =
+                            native_host_diag_primitive_vertex(
+                                &queued->current, primitive, vertex);
+                        const GpuRenderSemanticVertex *endpoint = current_vertex;
+
+                        if (!native_host_winding_vertex_set(
+                                &queued->current, current_vertex, 0))
+                            continue;
+                        if (queued->phase_only)
+                            endpoint = native_host_queue_current_vertex(
+                                count, &queued->current, current_vertex);
+                        if (endpoint != NULL)
+                            native_host_copy_vertex_position(
+                                native_host_primitive_vertex(
+                                    phase_semantic, primitive, vertex),
+                                endpoint);
+                    }
+            }
+            for (size_t index = 0u; index < count; ++index) {
+                NativeHostQueuedSemantic *queued = &s_native_host_queue[index];
+
+                if (!queued->midpoint_valid || queued->clear_margins ||
+                    (queued->phase_only &&
+                     (queued->phase_visibility_mask &
+                      (uint8_t)(1u << phase)) == 0u) ||
+                    native_host_phase_winding_compatible(
+                        &queued->current,
+                        native_host_queue_phase(queued, phase)))
+                    continue;
+                expanded |=
+                    native_host_add_winding_component(&queued->current);
+            }
+        } while (expanded);
+    }
+}
+
 static int native_host_semantic_is_terrain(
         const GpuRenderSemantic *semantic);
 
@@ -10499,6 +10876,9 @@ static void native_host_queue_snapshot_present(size_t count) {
             current->topology == GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : 2u;
 
         if (queued->clear_margins) continue;
+        if (queued->phase_only &&
+            (queued->phase_visibility_mask & 1u) == 0u)
+            continue;
         if (current->interpolation_identity.valid)
             (void)gpu_semantic_workload_match_info(
                 &current->interpolation_identity, &match);
@@ -10635,8 +11015,11 @@ static void native_host_queue_snapshot_present(size_t count) {
                     midpoint_vertex->interpolation_vertex_identity_valid) {
                     size_t slot =
                         ((size_t)midpoint->interpolation_identity.scene_id ^
+                         ((size_t)midpoint->interpolation_identity.producer_id << 13u) ^
                          ((size_t)midpoint_vertex->interpolation_group_id << 7u) ^
-                         midpoint_vertex->interpolation_vertex_id) &
+                         midpoint_vertex->interpolation_vertex_id ^
+                         ((size_t)(uint16_t)midpoint->material.draw_offset_x << 16u) ^
+                         (uint16_t)midpoint->material.draw_offset_y) &
                         (PRODUCER_DIAG_VERTEX_CAP - 1u);
 
                     for (size_t probe = 0u; probe < PRODUCER_DIAG_VERTEX_CAP;
@@ -10648,8 +11031,15 @@ static void native_host_queue_snapshot_present(size_t count) {
                                 s_producer_diag_generation) {
                             *entry = (ProducerDiagVertex){
                                 .scene_id = midpoint->interpolation_identity.scene_id,
+                                .producer_id = midpoint->interpolation_identity.producer_id,
                                 .group_id = midpoint_vertex->interpolation_group_id,
                                 .vertex_id = midpoint_vertex->interpolation_vertex_id,
+                                .draw_area_left = midpoint->material.draw_area_left,
+                                .draw_area_top = midpoint->material.draw_area_top,
+                                .draw_area_right = midpoint->material.draw_area_right,
+                                .draw_area_bottom = midpoint->material.draw_area_bottom,
+                                .draw_offset_x = midpoint->material.draw_offset_x,
+                                .draw_offset_y = midpoint->material.draw_offset_y,
                                 .x = midpoint_x,
                                 .y = midpoint_y,
                                 .generation = s_producer_diag_generation,
@@ -10658,10 +11048,24 @@ static void native_host_queue_snapshot_present(size_t count) {
                         }
                         if (entry->scene_id ==
                                 midpoint->interpolation_identity.scene_id &&
+                            entry->producer_id ==
+                                midpoint->interpolation_identity.producer_id &&
                             entry->group_id ==
                                 midpoint_vertex->interpolation_group_id &&
                             entry->vertex_id ==
-                                midpoint_vertex->interpolation_vertex_id) {
+                                midpoint_vertex->interpolation_vertex_id &&
+                            entry->draw_area_left ==
+                                midpoint->material.draw_area_left &&
+                            entry->draw_area_top ==
+                                midpoint->material.draw_area_top &&
+                            entry->draw_area_right ==
+                                midpoint->material.draw_area_right &&
+                            entry->draw_area_bottom ==
+                                midpoint->material.draw_area_bottom &&
+                            entry->draw_offset_x ==
+                                midpoint->material.draw_offset_x &&
+                            entry->draw_offset_y ==
+                                midpoint->material.draw_offset_y) {
                             if (entry->x != midpoint_x || entry->y != midpoint_y)
                                 native_host_record_retired_failure(
                                     GL_RETIRED_FAILURE_MIDPOINT_VERTEX_CONFLICT,
@@ -10708,34 +11112,6 @@ static void native_host_queue_snapshot_present(size_t count) {
                         (midpoint_fixed_y[2] - midpoint_fixed_y[0]) -
                     (midpoint_fixed_y[1] - midpoint_fixed_y[0]) *
                         (midpoint_fixed_x[2] - midpoint_fixed_x[0]);
-                if (item->current_area != 0 && item->midpoint_area == 0)
-                        native_host_record_midpoint_failure(
-                            GL_RETIRED_FAILURE_MIDPOINT_ZERO_AREA,
-                            queued, current, midpoint, primitive,
-                            previous_order, current_pixel_x, current_pixel_y,
-                            midpoint_pixel_x, midpoint_pixel_y,
-                            item->current_area,
-                            item->midpoint_area);
-                if (item->current_bounds[2] > item->current_bounds[0] &&
-                        item->current_bounds[3] > item->current_bounds[1] &&
-                        (item->midpoint_bounds[2] == item->midpoint_bounds[0] ||
-                         item->midpoint_bounds[3] == item->midpoint_bounds[1]))
-                        native_host_record_midpoint_failure(
-                            GL_RETIRED_FAILURE_MIDPOINT_EXTENT_COLLAPSE,
-                            queued, current, midpoint, primitive,
-                            previous_order, current_pixel_x, current_pixel_y,
-                            midpoint_pixel_x, midpoint_pixel_y,
-                            item->current_area,
-                            item->midpoint_area);
-                if ((item->current_area < 0 && item->midpoint_area > 0) ||
-                        (item->current_area > 0 && item->midpoint_area < 0))
-                        native_host_record_midpoint_failure(
-                            GL_RETIRED_FAILURE_MIDPOINT_WINDING_FLIP,
-                            queued, current, midpoint, primitive,
-                            previous_order, current_pixel_x, current_pixel_y,
-                            midpoint_pixel_x, midpoint_pixel_y,
-                            item->current_area,
-                            item->midpoint_area);
                 if (current_fixed_area != 0 && midpoint_fixed_area == 0)
                     native_host_record_midpoint_failure(
                         GL_RETIRED_FAILURE_MIDPOINT_FIXED_ZERO_AREA,
@@ -11056,6 +11432,7 @@ static int native_host_retired_context(
 static GpuRenderTransactionStatus native_host_queue_insert_retired(
         size_t *in_out_count) {
     const size_t retired_count = gpu_semantic_workload_retired_count();
+    GpuSemanticWorkloadRetiredDiagnostics all_retired = {0};
     GpuSemanticWorkloadRetiredDiagnostics terrain = {0};
     const size_t current_count = *in_out_count;
     const size_t available = NATIVE_HOST_QUEUE_CAP - current_count;
@@ -11084,7 +11461,12 @@ static GpuRenderTransactionStatus native_host_queue_insert_retired(
         current_positions[retired_index] = SIZE_MAX;
     gpu_semantic_workload_retired_diagnostics(
         UINT32_C(0x8009932c), &terrain);
+    gpu_semantic_workload_retired_diagnostics(0u, &all_retired);
     native_host_record_workload_retired_issues();
+    s_native_midpoint_diag.retired_ineligible_missing_anchor_count +=
+        all_retired.missing_anchor;
+    s_native_midpoint_diag.retired_ineligible_producer_absent_count +=
+        all_retired.scene_mismatch;
     s_native_midpoint_diag.retired_terrain_unmatched_count +=
         terrain.unmatched;
     s_native_midpoint_diag.retired_terrain_eligible_count +=
@@ -11322,6 +11704,8 @@ static GpuRenderTransactionStatus native_host_queue_prepare_present(
         s_native_host_queue_count = count;
         if (s_native_interpolation_phase_count == 1u)
             native_host_queue_merge_temporal_phases(count);
+        native_host_queue_apply_topology_transitions(count);
+        native_host_queue_reject_invalid_winding(count);
     }
     native_host_queue_snapshot_present(count);
     s_native_host_semantic_history_index = next_history_index;
@@ -11369,7 +11753,7 @@ static GpuRenderTransactionStatus native_host_pending_flush_reason(
 static GpuRenderTransactionStatus native_host_queue_push(
         const GpuRenderSemantic *semantic,
         const GpuRenderSemantic *phase_semantics,
-        int base_x, int slot) {
+        uint8_t topology_transition_phase_mask, int base_x, int slot) {
     NativeHostQueuedSemantic *queued;
 
     if (semantic == NULL || slot < 0 || slot >= NATIVE_VIEW_MAX_SURF)
@@ -11400,6 +11784,7 @@ static GpuRenderTransactionStatus native_host_queue_push(
     queued->clear_margins = 0;
     queued->midpoint_valid = phase_semantics != NULL;
     queued->phase_only = 0;
+    queued->topology_transition_phase_mask = topology_transition_phase_mask;
     queued->temporal_order_valid = 0;
     queued->phase_visibility_mask = 0u;
     memset(queued->phase_order, 0, sizeof(queued->phase_order));
@@ -11445,6 +11830,7 @@ static GpuRenderTransactionStatus native_host_queue_push_margin_clear(
     queued->clear_margins = 1;
     queued->midpoint_valid = midpoint_valid;
     queued->phase_only = 0;
+    queued->topology_transition_phase_mask = 0u;
     queued->temporal_order_valid = 0;
     queued->phase_visibility_mask = 0u;
     memset(queued->phase_order, 0, sizeof(queued->phase_order));
@@ -11571,8 +11957,11 @@ void gl_renderer_semantic_producer_diag(
             if (!midpoint_vertex->interpolation_vertex_identity_valid)
                 continue;
             slot = ((size_t)midpoint->interpolation_identity.scene_id ^
+                    ((size_t)midpoint->interpolation_identity.producer_id << 13u) ^
                     ((size_t)midpoint_vertex->interpolation_group_id << 7u) ^
-                    midpoint_vertex->interpolation_vertex_id) &
+                    midpoint_vertex->interpolation_vertex_id ^
+                    ((size_t)(uint16_t)midpoint->material.draw_offset_x << 16u) ^
+                    (uint16_t)midpoint->material.draw_offset_y) &
                 (PRODUCER_DIAG_VERTEX_CAP - 1u);
             for (size_t probe = 0u; probe < PRODUCER_DIAG_VERTEX_CAP;
                  ++probe) {
@@ -11581,8 +11970,15 @@ void gl_renderer_semantic_producer_diag(
                 if (entry->generation != s_producer_diag_generation) {
                     *entry = (ProducerDiagVertex){
                         .scene_id = midpoint->interpolation_identity.scene_id,
+                        .producer_id = midpoint->interpolation_identity.producer_id,
                         .group_id = midpoint_vertex->interpolation_group_id,
                         .vertex_id = midpoint_vertex->interpolation_vertex_id,
+                        .draw_area_left = midpoint->material.draw_area_left,
+                        .draw_area_top = midpoint->material.draw_area_top,
+                        .draw_area_right = midpoint->material.draw_area_right,
+                        .draw_area_bottom = midpoint->material.draw_area_bottom,
+                        .draw_offset_x = midpoint->material.draw_offset_x,
+                        .draw_offset_y = midpoint->material.draw_offset_y,
                         .x = midpoint_x,
                         .y = midpoint_y,
                         .generation = s_producer_diag_generation,
@@ -11591,10 +11987,24 @@ void gl_renderer_semantic_producer_diag(
                 }
                 if (entry->scene_id ==
                         midpoint->interpolation_identity.scene_id &&
+                    entry->producer_id ==
+                        midpoint->interpolation_identity.producer_id &&
                     entry->group_id ==
                         midpoint_vertex->interpolation_group_id &&
                     entry->vertex_id ==
-                        midpoint_vertex->interpolation_vertex_id) {
+                        midpoint_vertex->interpolation_vertex_id &&
+                    entry->draw_area_left ==
+                        midpoint->material.draw_area_left &&
+                    entry->draw_area_top ==
+                        midpoint->material.draw_area_top &&
+                    entry->draw_area_right ==
+                        midpoint->material.draw_area_right &&
+                    entry->draw_area_bottom ==
+                        midpoint->material.draw_area_bottom &&
+                    entry->draw_offset_x ==
+                        midpoint->material.draw_offset_x &&
+                    entry->draw_offset_y ==
+                        midpoint->material.draw_offset_y) {
                     ++diagnostics.duplicate_vertex_count;
                     if (entry->x != midpoint_x || entry->y != midpoint_y)
                         ++diagnostics.exact_vertex_conflict_count;
@@ -11728,6 +12138,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
     GpuSemanticWorkloadStatus workload_status =
         GPU_SEMANTIC_WORKLOAD_INVALID_TRANSITION;
     GpuRenderSemantic existing_semantic;
+    uint8_t topology_transition_phase_mask = 0u;
     uint64_t existing_command_id = 0u;
     int base_x;
     int slot;
@@ -11759,6 +12170,12 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
             semantic, s_native_interpolation_denominator,
             phase_semantics, s_native_interpolation_phase_count);
         if (workload_status == GPU_SEMANTIC_WORKLOAD_OK) {
+            GpuSemanticWorkloadMatchInfo match;
+
+            if (gpu_semantic_workload_last_match_info(&match) ==
+                    GPU_SEMANTIC_WORKLOAD_OK)
+                topology_transition_phase_mask =
+                    match.topology_transition_phase_mask;
             native_geometry_accumulate(
                 NATIVE_CURRENT_VARIANT, semantic);
             for (unsigned int phase = 0u;
@@ -11823,7 +12240,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
                 s_native_midpoint_diag.frame_valid &&
                 workload_status == GPU_SEMANTIC_WORKLOAD_OK
             ? phase_semantics : NULL,
-        base_x, slot);
+        topology_transition_phase_mask, base_x, slot);
     if (status != GPU_RENDER_TRANSACTION_OK)
         gl_renderer_native_midpoint_cancel();
     return status;
@@ -11838,6 +12255,7 @@ static GpuRenderTransactionStatus glb_draw_semantic_temporal_candidate(
     uint8_t phase_visibility_mask = 0u;
     uint32_t phase_order[NATIVE_INTERPOLATION_MAX_PHASES] = {0};
     GpuSemanticWorkloadDiagnostics workload_diagnostics;
+    uint8_t topology_transition_phase_mask = 0u;
     GpuRenderSemantic previous;
     size_t workload_count_before;
     uint32_t previous_order;
@@ -11902,10 +12320,21 @@ static GpuRenderTransactionStatus glb_draw_semantic_temporal_candidate(
         ++s_native_midpoint_diag.temporal_candidate_record_failure_count;
         return GPU_RENDER_TRANSACTION_OK;
     }
+    {
+        GpuSemanticWorkloadMatchInfo match;
+
+        if (gpu_semantic_workload_last_match_info(&match) ==
+                GPU_SEMANTIC_WORKLOAD_OK)
+            topology_transition_phase_mask =
+                match.topology_transition_phase_mask;
+    }
     ++s_native_midpoint_diag.temporal_candidate_recorded_count;
     if (!generate_phases) return GPU_RENDER_TRANSACTION_OK;
     for (unsigned int phase = 0u;
          phase < s_native_interpolation_phase_count; ++phase) {
+        if (!native_host_phase_winding_compatible(
+                semantic, &phases[phase]))
+            continue;
         if (!native_host_temporal_phase_visible(
                 &phases[phase], policy, &phase_order[phase]))
             continue;
@@ -11924,7 +12353,8 @@ static GpuRenderTransactionStatus glb_draw_semantic_temporal_candidate(
     base_x = glb_native_view_semantic_target_base(semantic);
     slot = native_view_prepare_surface(base_x);
     if (slot < 0) return GPU_RENDER_TRANSACTION_BACKEND_ERROR;
-    status = native_host_queue_push(semantic, phases, base_x, slot);
+    status = native_host_queue_push(
+        semantic, phases, topology_transition_phase_mask, base_x, slot);
     if (status == GPU_RENDER_TRANSACTION_OK) {
         NativeHostQueuedSemantic *queued =
             &s_native_host_queue[s_native_host_queue_count - 1u];

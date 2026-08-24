@@ -137,6 +137,8 @@ static struct {
     GuestRenderNativeStreamStatus last_stage_status;
     GuestRenderNativeStreamStatus last_consume_status;
     GuestRenderNativeStreamMaterialObserver material_observer;
+    GuestRenderNativeStreamResolvedSemanticObserver
+        resolved_semantic_observer;
     GuestRenderNativeStreamMissResolver miss_resolver;
     GuestRenderNativeSourceWriterObserver source_writer_observer;
     GuestRenderNativeStreamReserveDiagnostic reserve_diagnostic;
@@ -963,6 +965,11 @@ void guest_render_native_stream_set_material_observer(
     stream.material_observer = observer;
 }
 
+void guest_render_native_stream_set_resolved_semantic_observer(
+        GuestRenderNativeStreamResolvedSemanticObserver observer) {
+    stream.resolved_semantic_observer = observer;
+}
+
 void guest_render_native_stream_set_miss_resolver(
         GuestRenderNativeStreamMissResolver resolver) {
     stream.miss_resolver = resolver;
@@ -1347,6 +1354,9 @@ GuestRenderNativeStreamStatus guest_render_native_stream_note_resolved_consumed(
         return consume_result(GUEST_RENDER_NATIVE_STREAM_INVALID_ARGUMENT);
     if (command_has_newer_generation(command_id, visual_id))
         return consume_result(GUEST_RENDER_NATIVE_STREAM_STALE_VISUAL_ID);
+    if (stream.resolved_semantic_observer != NULL &&
+        !stream.resolved_semantic_observer(command_id, semantic))
+        return consume_result(GUEST_RENDER_NATIVE_STREAM_CAPACITY_EXCEEDED);
     latest = command_generation(command_id);
     if (latest == NULL) {
         if (!reserve_command_generations(stream.command_generation_count + 1u))

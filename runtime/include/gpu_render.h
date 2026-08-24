@@ -160,6 +160,7 @@ typedef struct GpuRenderSemanticVertex {
 typedef struct GpuRenderInterpolationVertexAnchor {
     uint64_t scene_id;
     uint32_t producer_id;
+    uint32_t primitive_id;
     GpuRenderMaterial material;
     GpuRenderSemanticVertex vertex;
 } GpuRenderInterpolationVertexAnchor;

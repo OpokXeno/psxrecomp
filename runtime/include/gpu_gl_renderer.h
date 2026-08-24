@@ -217,6 +217,10 @@ typedef struct GlRendererNativeMidpointDiagnostics {
     uint64_t retired_history_miss_count;
     uint64_t retired_capacity_miss_count;
     uint64_t retired_phase_failure_count;
+    uint64_t retired_ineligible_missing_anchor_count;
+    uint64_t retired_ineligible_producer_absent_count;
+    uint64_t winding_component_snap_count;
+    uint64_t winding_phase_only_reject_count;
     uint64_t retired_producer_history_recovery_count;
     uint64_t retired_world_model_candidate_count;
     uint64_t retired_world_model_inserted_count;
