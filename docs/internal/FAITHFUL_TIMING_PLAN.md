@@ -213,6 +213,18 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-24 (Retired midpoint shared-vertex trajectory):** Retired mesh
+  phases now resolve their previous endpoint through the canonical shared-vertex
+  lookup and reuse positions already established by normal current phases for
+  the same scene/producer/group/vertex identity. This preserves retired
+  material, UV, and projective payload while preventing a differing current
+  anchor depth from opening subpixel seams against normal geometry. A focused
+  regression covers conflicting previous copies and current anchor depths in
+  both previous-order permutations. The complete 6,023-VBlank take7 replay is
+  `PASS/trace_complete`: midpoint vertex conflicts fell from 676 to zero with
+  the same 1,053 midpoint presents and 162 retired inserts, zero unbound,
+  unsupported, or original draws, zero GL errors, and zero midpoint formula
+  failures. Evidence: `build/take7-midpoint-conflict-reconcile-evidence-20260824.json`.
 - **2026-08-23 (Native early-producer lifecycle closes unbound coverage):**
   The early FT4 constructors at `0x8007A7F4`/`0x8007AA44` and zoom
   initializer at `0x800A663C` now authenticate their complete 592/296/744-byte
@@ -1162,7 +1174,7 @@ on a fixed region -> next.
   and `git diff --check` pass.
 
 - **2026-08-07 (Native stream family hint):** Added a bounded command-ID to
-  resolver-family hint table in `native_renderer/src/xg_render_auth_runtime.c`.
+  resolver-family hint table in `native_renderer/src/runtime/xg_render_auth_runtime.c`.
   Hints are keyed by the current producer-resource generation, cleared during
   runtime reset, and fall back to the original family precedence chain when a
   cached family misses. The first implementation used a generic family-dispatch

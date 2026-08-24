@@ -1565,6 +1565,117 @@ static int test_retired_mesh_follows_current_anchors(void) {
     return 1;
 }
 
+static int test_retired_mesh_uses_canonical_shared_previous_vertex(void) {
+    static const uint32_t ids_a[3] = {0u, 1u, 2u};
+    static const uint32_t ids_b[3] = {2u, 3u, 4u};
+    static const int32_t previous_x_a[3] = {0, 16, 32};
+    static const int32_t previous_x_b[3] = {96, 112, 128};
+    static const int32_t current_x_a[3] = {160, 176, 192};
+    static const int32_t current_x_b[3] = {192, 208, 224};
+    static const int32_t y[3] = {0, 0, 16};
+
+    for (size_t reverse = 0u; reverse < 2u; ++reverse) {
+        GpuRenderSemantic previous_a =
+            mesh_triangle(1u, ids_a, previous_x_a, y);
+        GpuRenderSemantic previous_b =
+            mesh_triangle(2u, ids_b, previous_x_b, y);
+        GpuRenderSemantic current_a =
+            mesh_triangle(1u, ids_a, current_x_a, y);
+        GpuRenderSemantic current_b =
+            mesh_triangle(2u, ids_b, current_x_b, y);
+        GpuRenderInterpolationVertexAnchor anchors[5];
+        GpuRenderSemantic current_phases[3];
+        GpuRenderSemantic retired_phases[3];
+        GpuRenderSemantic recorded;
+        size_t previous_order = SIZE_MAX;
+
+        make_projective_mesh(&previous_a);
+        make_projective_mesh(&previous_b);
+        make_projective_mesh(&current_a);
+        make_projective_mesh(&current_b);
+        previous_a.triangles[0].vertices[2].projective_view_x = 7;
+        previous_a.triangles[0].vertices[2].projective_view_z = 1000;
+        previous_b.triangles[0].vertices[0].projective_view_x = 7;
+        previous_b.triangles[0].vertices[0].projective_view_z = 1100;
+        current_a.triangles[0].vertices[2].projective_view_x = 7;
+        current_a.triangles[0].vertices[2].projective_view_z = 1200;
+        current_b.triangles[0].vertices[0].projective_view_x = 7;
+        current_b.triangles[0].vertices[0].projective_view_z = 1400;
+        previous_a.material.tpage = 1u;
+        previous_b.material.tpage = 2u;
+        current_a.material = previous_a.material;
+        current_b.material = current_a.material;
+        anchors[0] = (GpuRenderInterpolationVertexAnchor){
+            .scene_id = current_b.interpolation_identity.scene_id,
+            .producer_id = current_b.interpolation_identity.producer_id,
+            .material = current_b.material,
+            .vertex = current_b.triangles[0].vertices[0],
+        };
+        for (size_t vertex = 0u; vertex < 2u; ++vertex) {
+            anchors[vertex + 1u] = (GpuRenderInterpolationVertexAnchor){
+                .scene_id = current_a.interpolation_identity.scene_id,
+                .producer_id = current_a.interpolation_identity.producer_id,
+                .material = current_a.material,
+                .vertex = current_a.triangles[0].vertices[vertex],
+            };
+        }
+        for (size_t vertex = 1u; vertex < 3u; ++vertex) {
+            anchors[vertex + 2u] = (GpuRenderInterpolationVertexAnchor){
+                .scene_id = current_b.interpolation_identity.scene_id,
+                .producer_id = current_b.interpolation_identity.producer_id,
+                .material = current_b.material,
+                .vertex = current_b.triangles[0].vertices[vertex],
+            };
+        }
+
+        gpu_semantic_workload_reset();
+        REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_record(
+                    reverse ? &previous_b : &previous_a, &recorded) ==
+                GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_record(
+                    reverse ? &previous_a : &previous_b, &recorded) ==
+                GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_begin() == GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_record_anchors(anchors, 5u) ==
+                GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_record_phases(
+                    &current_a, 4u, current_phases, 3u) ==
+                GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_seal() == GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(gpu_semantic_workload_retired_count() == 1u);
+        REQUIRE(gpu_semantic_workload_retired_phases(
+                    0u, 4u, retired_phases, 3u, &previous_order) ==
+                GPU_SEMANTIC_WORKLOAD_OK);
+        REQUIRE(previous_order == (reverse ? 0u : 1u));
+        for (size_t phase = 0u; phase < 3u; ++phase) {
+            const GpuRenderSemanticVertex *current_shared =
+                &current_phases[phase].triangles[0].vertices[2];
+            const GpuRenderSemanticVertex *retired_shared =
+                &retired_phases[phase].triangles[0].vertices[0];
+
+            REQUIRE(retired_shared->projective_view_z !=
+                    current_shared->projective_view_z);
+            REQUIRE(retired_shared->x == current_shared->x);
+            REQUIRE(retired_shared->y == current_shared->y);
+            REQUIRE(retired_shared->native_view_x ==
+                    current_shared->native_view_x);
+            REQUIRE(retired_shared->native_view_y ==
+                    current_shared->native_view_y);
+            REQUIRE(retired_shared->projective_offset_x ==
+                    current_shared->projective_offset_x);
+            REQUIRE(retired_shared->projective_native_offset_x ==
+                    current_shared->projective_native_offset_x);
+            REQUIRE(retired_shared->u ==
+                    previous_b.triangles[0].vertices[0].u);
+            REQUIRE(retired_phases[phase].material.tpage ==
+                    previous_b.material.tpage);
+        }
+    }
+    return 1;
+}
+
 static int test_temporal_phase_participation_and_history_downgrade(void) {
     GpuRenderSemantic previous = triangle(0, 40u);
     GpuRenderSemantic temporal = triangle(80, 40u);
@@ -1706,6 +1817,7 @@ int main(void) {
     if (!test_used_better_retrospective_candidate_snaps()) return 30;
     if (!test_hidden_mesh_anchors_supply_previous_geometry()) return 33;
     if (!test_retired_mesh_follows_current_anchors()) return 34;
+    if (!test_retired_mesh_uses_canonical_shared_previous_vertex()) return 41;
     if (!test_temporal_phase_participation_and_history_downgrade()) return 39;
     if (!test_history_only_records_do_not_change_visual_eligibility()) return 40;
     return 0;

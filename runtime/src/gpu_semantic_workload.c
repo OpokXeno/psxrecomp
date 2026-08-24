@@ -2468,8 +2468,10 @@ static bool interpolate_retired_source_geometry(
     *out = *previous;
     copy_material_position(&out->material, position_material);
     for (size_t index = 0u; index < count; ++index) {
-        const GpuRenderSemanticVertex *previous_vertex =
+        const GpuRenderSemanticVertex *local_previous_vertex =
             semantic_vertex_at(previous, index);
+        const GpuRenderSemanticVertex *position_previous = NULL;
+        const GpuRenderMaterial *position_previous_material = NULL;
         GpuRenderSemanticVertex *out_vertex =
             semantic_vertex_at_mutable(out, index);
         const GpuRenderInterpolationVertexAnchor *anchor;
@@ -2479,14 +2481,19 @@ static bool interpolate_retired_source_geometry(
         size_t failures = 0u;
         uint64_t delta = 0u;
 
+        if (!previous_vertex_lookup(
+                previous, local_previous_vertex, &position_previous,
+                &position_previous_material))
+            return false;
         if (!anchor_lookup(workload.current_anchor_hash, current_anchors,
-                           previous, previous_vertex, &anchor))
+                           previous, local_previous_vertex, &anchor))
             return false;
         copy_vertex_position(out_vertex, &anchor->vertex);
         (void)interpolate_vertex(
-            out_vertex, previous_vertex, previous_vertex,
-            &out->material, &previous->material, numerator, denominator,
-            false, &changed, &delta, &distinct, &collapsed, &failures);
+            out_vertex, local_previous_vertex, position_previous,
+            &out->material, position_previous_material, numerator,
+            denominator, false, &changed, &delta, &distinct, &collapsed,
+            &failures);
     }
     return true;
 }
@@ -2691,6 +2698,11 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_retired(
     return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
 }
 
+static void reconcile_phase_vertex_positions(
+        const GpuRenderSemantic *semantic, size_t item_index,
+        GpuRenderSemantic *phases, size_t phase_count,
+        bool insert_missing);
+
 GpuSemanticWorkloadStatus gpu_semantic_workload_retired_phases(
         size_t retired_index, unsigned int denominator,
         GpuRenderSemantic *out_phases, size_t phase_count,
@@ -2710,12 +2722,15 @@ GpuSemanticWorkloadStatus gpu_semantic_workload_retired_phases(
                 &previous, (unsigned int)phase + 1u, denominator,
                 &out_phases[phase]))
             return GPU_SEMANTIC_WORKLOAD_NOT_FOUND;
+    reconcile_phase_vertex_positions(
+        &previous, SIZE_MAX, out_phases, phase_count, false);
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
 static void reconcile_phase_vertex_positions(
         const GpuRenderSemantic *semantic, size_t item_index,
-        GpuRenderSemantic *phases, size_t phase_count) {
+        GpuRenderSemantic *phases, size_t phase_count,
+        bool insert_missing) {
     const GpuSemanticFrame *current =
         &workload.frames[workload.building_index];
     const size_t vertex_count = semantic_vertex_count(semantic);
@@ -2724,8 +2739,6 @@ static void reconcile_phase_vertex_positions(
          ++vertex_index) {
         const GpuRenderSemanticVertex *vertex =
             semantic_vertex_at(semantic, vertex_index);
-        const size_t flat_index =
-            item_index * GPU_SEMANTIC_MAX_VERTICES + vertex_index;
         size_t slot;
 
         if (!vertex->interpolation_vertex_identity_valid) continue;
@@ -2735,6 +2748,10 @@ static void reconcile_phase_vertex_positions(
             const int32_t entry = workload.phase_vertex_hash[slot];
 
             if (entry == 0) {
+                if (!insert_missing) break;
+                const size_t flat_index =
+                    item_index * GPU_SEMANTIC_MAX_VERTICES + vertex_index;
+
                 workload.phase_vertex_hash_touched[
                     workload.phase_vertex_hash_touched_count++] =
                         (uint16_t)slot;
@@ -2839,7 +2856,7 @@ static GpuSemanticWorkloadStatus gpu_semantic_workload_record_phases_internal(
         }
     }
     reconcile_phase_vertex_positions(
-        semantic, index, out_phases, phase_count);
+        semantic, index, out_phases, phase_count, true);
     return GPU_SEMANTIC_WORKLOAD_OK;
 }
 
