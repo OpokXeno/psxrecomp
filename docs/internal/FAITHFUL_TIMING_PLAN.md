@@ -213,6 +213,21 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-25 (Native DMA late-provenance fatal downgraded safely):** Linux
+  core `1787611009` proved the apparent `SIGABRT` originated in
+  `dma2_execute_linked_list`, where an FT4 packet at `0x0011A86C` reached
+  execution with the same command/container identity, nine words, opcode
+  `0x2D`, and packet hash reserved by preflight, but its enhanced GTE provenance
+  receipt no longer revalidated. Supported packets now retain their canonical
+  GP0 fallback eligibility across preflight and use that path when only the
+  optional GTE/CPU precision binding becomes stale. A second run reached the
+  same late-consumption status through the producer stream reservation for an
+  FT3 packet at `0x0011E664`; this now releases the remaining whole-list
+  reservation and resumes canonically from that unchanged packet. Structural
+  identity or byte/hash mismatches still fail closed. The audio worker also
+  registers an exit join so a deliberate fatal cannot be replaced by
+  `std::thread::~thread` calling `std::terminate`. The main Xenogears target
+  rebuilds and `xg_render_oracle_integration` passes.
 - **2026-08-24 (Retired model anchor contract completed; strict missing-anchor
   failures restored):** take7's remaining 16
   `retired_ineligible_missing_anchors` were traced at the exact failed

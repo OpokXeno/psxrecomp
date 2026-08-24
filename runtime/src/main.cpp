@@ -3608,6 +3608,11 @@ static void sdl_audio_worker_main(void) {
 }
 
 static void sdl_audio_worker_start(void) {
+    static const bool cleanup_registered = [] {
+        std::atexit(sdl_audio_worker_stop);
+        return true;
+    }();
+    (void)cleanup_registered;
     if (s_audio_worker.joinable()) return;
     s_audio_worker_stop.store(false, std::memory_order_release);
     s_audio_hard_mute.store(false, std::memory_order_release);

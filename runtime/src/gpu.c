@@ -6958,6 +6958,7 @@ typedef struct GpuNativePreflightReservation {
     bool cpu_container_valid;
     bool cpu_incoming_link_valid;
     bool packet_fallback;
+    bool packet_fallback_supported;
 } GpuNativePreflightReservation;
 
 static int native_cpu_canonical_bind(
@@ -7216,6 +7217,8 @@ static int native_preflight_reservation_append(
     bool gte_bound = false;
     bool cpu_canonical_bound = false;
     bool packet_fallback = false;
+    const bool packet_fallback_supported =
+        native_packet_fallback_is_supported(words, word_count, environment);
 
     if (native_preflight_reservations.phase != 1) return 0;
     native_preflight_reservations.last_reserved_identity = *identity;
@@ -7255,8 +7258,7 @@ static int native_preflight_reservation_append(
         memset(&visual_id, 0, sizeof(visual_id));
     }
     if (reserve_status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND &&
-        native_packet_fallback_is_supported(
-            words, word_count, environment))
+        packet_fallback_supported)
         packet_fallback = true;
     if (reserve_status != GUEST_RENDER_NATIVE_STREAM_OK && !packet_fallback) {
         native_preflight_reservations.last_consume_status =
@@ -7304,6 +7306,7 @@ static int native_preflight_reservation_append(
         source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST &&
         native_dma_publication.incoming_link_valid;
     entry->packet_fallback = packet_fallback;
+    entry->packet_fallback_supported = packet_fallback_supported;
     return 1;
 }
 
@@ -7737,19 +7740,27 @@ static int native_preflight_reservation_consume(
     } else if (entry->gte_bound) {
         if (!native_gte_polygon_revalidate(
                 words, word_count, identity, entry)) {
-            native_preflight_reservations.last_consume_status = 4u;
-            return 0;
+            if (!entry->packet_fallback_supported) {
+                native_preflight_reservations.last_consume_status = 4u;
+                return 0;
+            }
+            *out_packet_fallback = true;
+        } else {
+            *out_semantic = entry->semantic;
+            *out_class_bound = true;
         }
-        *out_semantic = entry->semantic;
-        *out_class_bound = true;
     } else if (entry->cpu_canonical_bound) {
         if (!native_cpu_canonical_revalidate(
                 words, word_count, identity, entry)) {
-            native_preflight_reservations.last_consume_status = 4u;
-            return 0;
+            if (!entry->packet_fallback_supported) {
+                native_preflight_reservations.last_consume_status = 4u;
+                return 0;
+            }
+            *out_packet_fallback = true;
+        } else {
+            *out_semantic = entry->semantic;
+            *out_class_bound = true;
         }
-        *out_semantic = entry->semantic;
-        *out_class_bound = true;
     } else if (entry->resolved_miss) {
         *out_semantic = entry->semantic;
         if (guest_render_native_stream_note_resolved_consumed(
@@ -7787,6 +7798,7 @@ static int native_packet_stream_finish(void) {
     const GpuRenderSemantic *bound = NULL;
     bool packet_fallback = false;
     bool class_bound = false;
+    bool reservation_fallback = false;
     int result = 0;
 
     identity = native_command_identity(
@@ -7808,6 +7820,13 @@ static int native_packet_stream_finish(void) {
                 native_packet_stream.count, &visual_id,
                 &bound_semantic, &packet_fallback, &class_bound)) {
             if (!packet_fallback) bound = &bound_semantic;
+        } else if (native_preflight_reservations.last_consume_status == 4u &&
+                   native_packet_fallback_is_supported(
+                       native_packet_stream.words,
+                       native_packet_stream.count,
+                       &native_preflight_reservations.environment)) {
+            reservation_fallback = true;
+            packet_fallback = true;
         }
     } else {
         gpu_native_environment_get(&environment);
@@ -7825,6 +7844,8 @@ static int native_packet_stream_finish(void) {
                 bound = &bound_semantic;
         }
     }
+    if (reservation_fallback)
+        gpu_native_preflight_reservation_abort();
     if (bound != NULL) {
         if (!class_bound) {
             native_packet_bound_visual_id = visual_id;
