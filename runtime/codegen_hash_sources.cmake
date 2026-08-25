@@ -28,6 +28,8 @@ set(PSXRECOMP_CODEGEN_HASH_SRCS
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/source_observation_plan.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/include/source_observation_plan.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/main_psx.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/ps1_exe_parser.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/include/ps1_exe_parser.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.cpp

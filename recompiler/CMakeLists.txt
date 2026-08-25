@@ -417,6 +417,7 @@ target_include_directories(rabbitizer PRIVATE
 
 # PSXRecomp — MIPS→C recompiler tool
 set(PSXRECOMP_GAME_SOURCES
+    ../runtime/src/psx_sha256.c
     src/ps1_exe_parser.cpp
     src/mips_decoder.cpp
     src/control_flow.cpp
@@ -433,6 +434,7 @@ set(PSXRECOMP_GAME_SOURCES
 
 add_executable(psxrecomp-game ${PSXRECOMP_GAME_SOURCES})
 target_include_directories(psxrecomp-game PRIVATE
+    ../runtime/include
     include
     lib/rabbitizer/include
     lib/rabbitizer/cplusplus/include
@@ -937,6 +939,12 @@ target_link_libraries(reachable_discovery_test PRIVATE fmt)
             NAME fmv_cycle_batch_codegen
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fmv_cycle_batch_codegen.py
+                    --recompiler $<TARGET_FILE:psxrecomp-game>
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        add_test(
+            NAME raw_overlay_codegen
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_raw_overlay_codegen.py
                     --recompiler $<TARGET_FILE:psxrecomp-game>
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
         add_test(

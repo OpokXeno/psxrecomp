@@ -9,6 +9,7 @@
 #include <array>
 #include <cctype>
 #include <set>
+#include <regex>
 #include <vector>
 
 #include "ps1_exe_parser.h"
@@ -22,6 +23,7 @@
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
 #include "write_if_changed.h"
+#include "psx_sha256.h"
 
 /* Baked emitter-source hash (recompiler/CMakeLists.txt custom command; same
  * hash_codegen.cmake + canonical source list as the runtime's overlay cache
@@ -71,6 +73,39 @@ std::string identity_initializer(const std::array<uint8_t, 32>& bytes) {
     return out.str();
 }
 
+bool parse_u32(const std::string& text, uint32_t& value) {
+    if (text.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 0);
+    if (errno != 0 || end == text.c_str() || *end != '\0' ||
+        parsed > 0xFFFFFFFFull) {
+        return false;
+    }
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+std::array<uint8_t, 32> sha256_bytes(const std::vector<uint8_t>& bytes) {
+    std::array<uint8_t, 32> digest{};
+    psx_sha256_compute(bytes.data(), bytes.size(), digest.data());
+    return digest;
+}
+
+std::string sha256_hex(const std::array<uint8_t, 32>& digest) {
+    std::string result;
+    result.reserve(64);
+    for (uint8_t byte : digest) result += fmt::format("{:02x}", byte);
+    return result;
+}
+
+bool valid_output_stem(const std::string& stem) {
+    if (stem.empty() || stem == "." || stem == "..") return false;
+    return std::all_of(stem.begin(), stem.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.';
+    });
+}
+
 // Materialize alias entries as overlapping functions, grouped by host. Each
 // group shares one emitted body (entry switch + host-range blocks); every
 // member lists its siblings so all group CFGs carry identical block leaders.
@@ -118,6 +153,7 @@ int main(int argc, char** argv) {
     const auto print_usage = [&]() {
         fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
         fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--overlay] [--source-observation-plan <file>] [--strict] [--inspect]\n", argv[0]);
+        fmt::print("       {} --raw-image <file> --load-address <addr> --entry-pc <addr> --input-sha256 <sha256> --out-stem <stem> --overlay [--discovery whole-image|reachable] [options]\n", argv[0]);
         fmt::print("Example: {} SCUS_942.36 --seeds seeds/functions.txt --out-dir generated --strict\n", argv[0]);
         fmt::print("\n");
         fmt::print("  --project-root <dir>  Resolve the BIOS profile (bios/SCPH1001.toml, or\n");
@@ -167,6 +203,13 @@ int main(int argc, char** argv) {
     // If --config is provided, all paths come from the TOML and other
     // CLI flags are ignored. Positional form below stays for back-compat.
     std::filesystem::path config_path;
+    std::filesystem::path raw_image_path;
+    std::string raw_input_sha256;
+    std::string output_stem;
+    uint32_t raw_load_address = 0;
+    uint32_t raw_entry_pc = 0;
+    bool raw_load_address_set = false;
+    bool raw_entry_pc_set = false;
     std::string game_identity_hex;
     std::string manifest_digest_hex;
     // --ws-config <path>: load ONLY the [widescreen] site lists from this TOML
@@ -176,6 +219,7 @@ int main(int argc, char** argv) {
     // positional (no --config), so this is the channel for those sites.
     std::filesystem::path ws_config_path;
     std::filesystem::path source_observation_plan_path;
+    std::filesystem::path runtime_include_path;
     // --project-root <dir>: the directory to resolve the BIOS profile against
     // when no explicit [recompiler] bios_config is in play. Without it the
     // probe below uses the process CWD, which is wrong for every caller that
@@ -198,6 +242,14 @@ int main(int argc, char** argv) {
     }
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
+        if (argument == "--runtime-include" && i + 1 < argc) {
+            runtime_include_path = argv[++i];
+        } else if (argument.rfind("--runtime-include=", 0) == 0) {
+            runtime_include_path = argument.substr(18);
+        }
+    }
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
         if (argument == "--game-identity-sha256" && i + 1 < argc) {
             game_identity_hex = argv[++i];
         } else if (argument.rfind("--game-identity-sha256=", 0) == 0) {
@@ -206,6 +258,26 @@ int main(int argc, char** argv) {
             manifest_digest_hex = argv[++i];
         } else if (argument.rfind("--manifest-digest-sha256=", 0) == 0) {
             manifest_digest_hex = argument.substr(25);
+        } else if (argument == "--raw-image" && i + 1 < argc) {
+            raw_image_path = argv[++i];
+        } else if (argument.rfind("--raw-image=", 0) == 0) {
+            raw_image_path = argument.substr(12);
+        } else if (argument == "--load-address" && i + 1 < argc) {
+            raw_load_address_set = parse_u32(argv[++i], raw_load_address);
+        } else if (argument.rfind("--load-address=", 0) == 0) {
+            raw_load_address_set = parse_u32(argument.substr(15), raw_load_address);
+        } else if (argument == "--entry-pc" && i + 1 < argc) {
+            raw_entry_pc_set = parse_u32(argv[++i], raw_entry_pc);
+        } else if (argument.rfind("--entry-pc=", 0) == 0) {
+            raw_entry_pc_set = parse_u32(argument.substr(11), raw_entry_pc);
+        } else if (argument == "--input-sha256" && i + 1 < argc) {
+            raw_input_sha256 = argv[++i];
+        } else if (argument.rfind("--input-sha256=", 0) == 0) {
+            raw_input_sha256 = argument.substr(15);
+        } else if (argument == "--out-stem" && i + 1 < argc) {
+            output_stem = argv[++i];
+        } else if (argument.rfind("--out-stem=", 0) == 0) {
+            output_stem = argument.substr(11);
         }
     }
     for (int i = 1; i < argc; ++i) {
@@ -258,6 +330,7 @@ int main(int argc, char** argv) {
     bool                  inspect_mode = false;
     bool                  overlay_mode = false;
     bool                  reachable_discovery = false;
+    bool                  discovery_cli_set = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
     std::set<uint32_t>    mod_entry_funcs;      // trusted game-mod entry hooks
@@ -407,13 +480,49 @@ int main(int argc, char** argv) {
             fmt::print("  ws_tag_funcs= {}\n", ws_tag_funcs.size());
         fmt::print("\n");
     } else {
-        exe_path = argv[1];
-        for (int i = 2; i < argc; i++) {
+        if (!raw_image_path.empty()) exe_path = raw_image_path;
+        for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
-            if ((arg == "--extra-funcs" || arg == "--seeds") && i + 1 < argc) {
+            if (arg == "--raw-image" || arg == "--load-address" ||
+                arg == "--entry-pc" || arg == "--input-sha256" ||
+                arg == "--out-stem" || arg == "--game-identity-sha256" ||
+                arg == "--manifest-digest-sha256" || arg == "--ws-config" ||
+                arg == "--source-observation-plan" ||
+                arg == "--runtime-include") {
+                ++i;
+            } else if (arg.rfind("--raw-image=", 0) == 0 ||
+                       arg.rfind("--load-address=", 0) == 0 ||
+                       arg.rfind("--entry-pc=", 0) == 0 ||
+                       arg.rfind("--input-sha256=", 0) == 0 ||
+                       arg.rfind("--out-stem=", 0) == 0 ||
+                       arg.rfind("--game-identity-sha256=", 0) == 0 ||
+                       arg.rfind("--manifest-digest-sha256=", 0) == 0 ||
+                       arg.rfind("--ws-config=", 0) == 0 ||
+                       arg.rfind("--source-observation-plan=", 0) == 0 ||
+                       arg.rfind("--runtime-include=", 0) == 0) {
+                continue;
+            } else if ((arg == "--extra-funcs" || arg == "--seeds") && i + 1 < argc) {
                 extra_funcs_path = argv[++i];
             } else if (arg == "--out-dir" && i + 1 < argc) {
                 out_dir = argv[++i];
+            } else if (arg == "--discovery" && i + 1 < argc) {
+                const std::string mode = argv[++i];
+                if (mode != "whole-image" && mode != "reachable") {
+                    fmt::print(stderr,
+                        "psxrecomp-game: FATAL: --discovery must be 'whole-image' or 'reachable'\n");
+                    return 1;
+                }
+                reachable_discovery = mode == "reachable";
+                discovery_cli_set = true;
+            } else if (arg.rfind("--discovery=", 0) == 0) {
+                const std::string mode = arg.substr(12);
+                if (mode != "whole-image" && mode != "reachable") {
+                    fmt::print(stderr,
+                        "psxrecomp-game: FATAL: --discovery must be 'whole-image' or 'reachable'\n");
+                    return 1;
+                }
+                reachable_discovery = mode == "reachable";
+                discovery_cli_set = true;
             } else if (arg == "--strict") {
                 /* The PS-X EXE path is fail-loud by default; accepted for parity
                  * with psxrecomp-bios and project scripts. */
@@ -425,14 +534,73 @@ int main(int argc, char** argv) {
                  * is never mistaken for another flag's argument. */
                 ++i;
             } else if (arg == "--overlay") {
-                /* Overlay-compilation contract: this input is a runtime-captured
-                 * overlay with execution evidence, so discovery is evidence-scoped
-                 * (no whole-byte sweep) and branch/jump-table targets stay as
-                 * in-parent labels. Set unconditionally by compile_overlays.py for
-                 * every overlay input — never a human toggle. */
+                /* Overlay codegen keeps branch/jump-table targets as in-parent
+                 * labels and emits authenticated range guards. Discovery remains
+                 * evidence-scoped by default; complete authenticated raw images
+                 * may explicitly request --discovery whole-image. */
                 overlay_mode = true;
+            } else if (!arg.empty() && arg[0] != '-') {
+                if (!raw_image_path.empty()) {
+                    fmt::print(stderr,
+                        "psxrecomp-game: FATAL: raw image mode cannot be combined with a positional PS-X EXE\n");
+                    return 1;
+                }
+                if (!exe_path.empty()) {
+                    fmt::print(stderr,
+                        "psxrecomp-game: FATAL: multiple PS-X EXE inputs are not supported\n");
+                    return 1;
+                }
+                exe_path = arg;
             }
         }
+        // Captured/partial overlays remain evidence-scoped unless an
+        // authenticated full-image caller opts into the whole-image analyzer.
+        if (overlay_mode && !discovery_cli_set) reachable_discovery = true;
+    }
+
+    const bool raw_image_mode = !raw_image_path.empty();
+    if (raw_image_mode) {
+        std::array<uint8_t, 32> declared_digest{};
+        if (!config_path.empty() || !overlay_mode || !raw_load_address_set ||
+            !raw_entry_pc_set ||
+            !decode_sha256(raw_input_sha256, declared_digest) ||
+            !valid_output_stem(output_stem)) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: raw image mode requires --load-address, --entry-pc, lowercase --input-sha256, safe --out-stem, and --overlay\n");
+            return 1;
+        }
+        if (runtime_include_path.empty()) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: raw image mode requires --runtime-include for codegen hash verification\n");
+            return 1;
+        }
+        const std::filesystem::path hash_header =
+            runtime_include_path / "overlay_codegen_hash.h";
+        std::ifstream hash_source(hash_header);
+        std::ostringstream hash_text;
+        hash_text << hash_source.rdbuf();
+        std::smatch match;
+        const std::string contents = hash_text.str();
+        if (!hash_source ||
+            !std::regex_search(
+                contents, match,
+                std::regex(R"(PSX_OVERLAY_CODEGEN_HASH\s+0x([0-9A-Fa-f]{8})u)")) ||
+            static_cast<uint32_t>(std::strtoul(match[1].str().c_str(), nullptr, 16)) !=
+                static_cast<uint32_t>(PSX_OVERLAY_CODEGEN_HASH) ||
+            PSX_OVERLAY_CODEGEN_HASH == 0u) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: stale recompiler/runtime codegen hash at {} (rebuild psxrecomp-game)\n",
+                hash_header.string());
+            return 1;
+        }
+    } else if (exe_path.empty()) {
+        fmt::print(stderr, "psxrecomp-game: FATAL: no input image was provided\n");
+        return 1;
+    }
+    if (overlay_mode && !reachable_discovery && !raw_image_mode) {
+        fmt::print(stderr,
+            "psxrecomp-game: FATAL: whole-image overlay discovery requires an authenticated --raw-image\n");
+        return 1;
     }
 
 #if defined(PSX_GAME_EXTRA_IDENTITY_SHA256) && defined(PSX_GAME_MANIFEST_DIGEST_SHA256)
@@ -616,15 +784,30 @@ int main(int argc, char** argv) {
         PSXRecomp::CodeGenerator::set_bios_address_model(&s_bios_model);
     }
 
-    // Parse the PS1-EXE file
+    // Parse the executable image. Raw overlays are authenticated before any
+    // patch, discovery, output-directory creation, or generated publication.
     std::string error_msg;
-    fmt::print("Parsing PS1-EXE: {}\n", exe_path.string());
+    fmt::print("Parsing {}: {}\n", raw_image_mode ? "raw overlay" : "PS1-EXE",
+               exe_path.string());
 
-    auto exe = PSXRecomp::PS1ExeParser::parse_file(exe_path, error_msg);
+    auto exe = raw_image_mode
+        ? PSXRecomp::PS1ExeParser::parse_raw_file(
+              exe_path, raw_load_address, raw_entry_pc, error_msg)
+        : PSXRecomp::PS1ExeParser::parse_file(exe_path, error_msg);
 
     if (!exe.has_value()) {
-        fmt::print(stderr, "Failed to parse PS1-EXE: {}\n", error_msg);
+        fmt::print(stderr, "Failed to parse input image: {}\n", error_msg);
         return 1;
+    }
+    if (raw_image_mode) {
+        const std::string observed_sha256 = sha256_hex(sha256_bytes(exe->code_data));
+        if (observed_sha256 != raw_input_sha256) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: raw image SHA-256 mismatch (expected {}, observed {})\n",
+                raw_input_sha256, observed_sha256);
+            return 1;
+        }
+        fmt::print("Authenticated raw image SHA-256: {}\n", observed_sha256);
     }
 
     // [game].text_size is the title-owned static-analysis bound. It may trim a
@@ -838,7 +1021,10 @@ int main(int argc, char** argv) {
      * prologue / preceding jr $ra exists. They are trusted walk roots and
          * exempt from the overlay-mode boundary re-check below.  Lines of the
          * form `call_root 0xXXXXXXXX` carry the same mechanical trust for a
-         * statically proven direct or constant-register call/tail-call target.
+     * statically proven direct or constant-register call/tail-call target.
+     * `isolated_root 0xXXXXXXXX` is an authenticated runtime entry that must be
+     * analyzed as an overlapping root without partitioning the primary function
+     * graph. All isolated analyses are emitted by this same native invocation.
      *
      * Seeds are accepted within the loaded image's own bounds — overlay mode
      * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
@@ -852,6 +1038,7 @@ int main(int argc, char** argv) {
     constexpr size_t kHostedInteriorHostCap = 512;
     std::set<uint32_t>    trusted_root_seeds;
     std::set<uint32_t>    trusted_call_root_seeds;
+    std::set<uint32_t>    isolated_root_seeds;
     std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
     std::set<uint32_t> cross_call_allow;
     if (extra_funcs_path) {
@@ -956,6 +1143,16 @@ int main(int argc, char** argv) {
                 } else if (line.rfind("call_root", 0) == 0) {
                     trusted_call_root = true;
                     p += 9;
+                } else if (line.rfind("isolated_root", 0) == 0) {
+                    p += 13;
+                    uint32_t addr = static_cast<uint32_t>(
+                        std::strtoul(p, nullptr, 16));
+                    if ((addr & 3u) != 0u || addr < seed_lo || addr >= seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid isolated_root: {}\n", line);
+                        return 1;
+                    }
+                    isolated_root_seeds.insert(addr);
+                    continue;
                 }
                 uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
                 if (addr >= seed_lo && addr < seed_hi) {
@@ -993,13 +1190,14 @@ int main(int argc, char** argv) {
             }
             fmt::print("Loaded {} extra function addresses ({} interior, "
                        "{} hosted-interior, {} dispatch-root, {} call-root, {} producer ranges, "
-                       "{} cross-call allows) from {}\n",
+                       "{} isolated-root, {} cross-call allows) from {}\n",
                        file_seeds.size() + interior_seeds.size() +
-                           hosted_interior_seeds.size(),
+                            hosted_interior_seeds.size() + isolated_root_seeds.size(),
                        interior_seeds.size(), hosted_interior_seeds.size(),
                        trusted_root_seeds.size(),
                        trusted_call_root_seeds.size(),
-                       producer_ranges.size(), cross_call_allow.size(),
+                       producer_ranges.size(), isolated_root_seeds.size(),
+                       cross_call_allow.size(),
                        extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
@@ -1008,7 +1206,7 @@ int main(int argc, char** argv) {
 
     PSXRecomp::FunctionAnalysisResult analysis_result;
 
-    if (overlay_mode || reachable_discovery) {
+    if (reachable_discovery) {
         // ── Exact-entry mode: partition seeds into walk roots and interior
         // alias candidates. `interior`-marked seeds (classifier-proven
         // dispatch targets without a callable boundary) are NEVER walk roots —
@@ -1185,6 +1383,7 @@ int main(int argc, char** argv) {
 
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
+
     } else {
         // ── Iterative discovery: seed classification + static data-table scan ──
         //
@@ -1240,19 +1439,21 @@ int main(int argc, char** argv) {
             auto is_text_ptr = [&](uint32_t v) {
                 return (v & 3u) == 0 && v >= exe_lo && v < exe_hi && containing(v) != nullptr;
             };
-            for (uint32_t p = exe_lo; p + 4 <= exe_hi; p += 4) {
-                if (containing(p)) continue;  // instruction word, not a data word
-                uint32_t w = read_w(p);
-                if ((w & 3u) || w < exe_lo || w >= exe_hi) continue;
-                // Table evidence: an adjacent data word that is also a text
-                // pointer. Interior handler entries live in dense pointer
-                // tables; a lone pointer-shaped data word is too weak to mint
-                // an alias from (random data aliases into loose code ranges).
-                bool table_evidence =
-                    (p >= exe_lo + 4 && is_text_ptr(read_w(p - 4))) ||
-                    (p + 8 <= exe_hi && is_text_ptr(read_w(p + 4)));
-                candidates.push_back({w, false, table_evidence});
-                scanned_words++;
+            if (!overlay_mode) {
+                for (uint32_t p = exe_lo; p + 4 <= exe_hi; p += 4) {
+                    if (containing(p)) continue;  // instruction word, not a data word
+                    uint32_t w = read_w(p);
+                    if ((w & 3u) || w < exe_lo || w >= exe_hi) continue;
+                    // Table evidence: an adjacent data word that is also a text
+                    // pointer. Interior handler entries live in dense pointer
+                    // tables; a lone pointer-shaped data word is too weak to mint
+                    // an alias from (random data aliases into loose code ranges).
+                    bool table_evidence =
+                        (p >= exe_lo + 4 && is_text_ptr(read_w(p - 4))) ||
+                        (p + 8 <= exe_hi && is_text_ptr(read_w(p + 4)));
+                    candidates.push_back({w, false, table_evidence});
+                    scanned_words++;
+                }
             }
 
             alias_entries.clear();
@@ -1291,6 +1492,49 @@ int main(int argc, char** argv) {
 
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Alias entries emitted: {}\n\n", alias_entries.size());
+    }
+
+    // Authenticated roots that have no primary host are independent entry
+    // surfaces, not partition boundaries. Analyze each against the same raw
+    // image, then merge unique function entries into one codegen unit. This is
+    // shared by reachable and whole-image discovery: a broad primary census
+    // must not discard execution-proven overlapping entries.
+    if (!isolated_root_seeds.empty()) {
+        std::set<uint32_t> emitted_starts;
+        for (const auto& function : analysis_result.functions)
+            emitted_starts.insert(function.start_addr);
+        size_t isolated_functions = 0;
+        for (uint32_t root : isolated_root_seeds) {
+            PSXRecomp::FunctionAnalyzer isolated_analyzer(*exe);
+            auto isolated = isolated_analyzer.analyze_exact_entries(
+                std::vector<uint32_t>{root}, producer_ranges,
+                cross_call_allow, false);
+            bool root_found = false;
+            for (const auto& function : isolated.functions) {
+                if (function.start_addr == root) root_found = true;
+                if (emitted_starts.insert(function.start_addr).second) {
+                    analysis_result.functions.push_back(function);
+                    isolated_functions++;
+                }
+            }
+            analysis_result.exact_reachable_pcs.insert(
+                isolated.exact_reachable_pcs.begin(),
+                isolated.exact_reachable_pcs.end());
+            if (!root_found) {
+                fmt::print(stderr,
+                    "ERROR: isolated_root 0x{:08X} produced no native function\n",
+                    root);
+                return 1;
+            }
+        }
+        std::sort(analysis_result.functions.begin(),
+                  analysis_result.functions.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.start_addr < right.start_addr;
+                  });
+        fmt::print("Isolated native roots: {} roots, {} additional "
+                   "function entries in the combined unit\n\n",
+                   isolated_root_seeds.size(), isolated_functions);
     }
 
     // Print summary statistics
@@ -1484,29 +1728,30 @@ int main(int argc, char** argv) {
     PSXRecomp::CodeGenerator codegen(*exe, codegen_config);
     codegen.set_annotations(&annotations);
 
-    // Generate code for first 5 functions (as examples)
-    fmt::print("=== C Code Generation Examples ===\n\n");
-    fmt::print("Generating code for first 5 functions...\n\n");
-
-    std::vector<PSXRecomp::Function> sample_funcs;
-    for (size_t i = 0; i < std::min(size_t(5), analysis_result.functions.size()); i++) {
-        sample_funcs.push_back(analysis_result.functions[i]);
-    }
-
-    auto generated = codegen.generate_all_functions(sample_funcs, all_cfgs);
-
-    // Print first generated function as example
-    if (!generated.empty()) {
-        fmt::print("Example Generated Function:\n");
-        fmt::print("---------------------------------------\n");
-        fmt::print("{}\n", generated[0].full_code);
-        fmt::print("---------------------------------------\n\n");
+    // The interactive PS-X EXE path keeps its historical preview. Native raw
+    // units are build-system inputs: avoid translating functions twice and
+    // flooding Ninja's progress output with generated C.
+    if (!raw_image_mode) {
+        fmt::print("=== C Code Generation Examples ===\n\n");
+        fmt::print("Generating code for first 5 functions...\n\n");
+        std::vector<PSXRecomp::Function> sample_funcs;
+        for (size_t i = 0;
+             i < std::min(size_t(5), analysis_result.functions.size()); i++) {
+            sample_funcs.push_back(analysis_result.functions[i]);
+        }
+        auto generated = codegen.generate_all_functions(sample_funcs, all_cfgs);
+        if (!generated.empty()) {
+            fmt::print("Example Generated Function:\n");
+            fmt::print("---------------------------------------\n");
+            fmt::print("{}\n", generated[0].full_code);
+            fmt::print("---------------------------------------\n\n");
+        }
     }
 
     // Generate full C file and save to the generated directory
     // Use argv[2] as output path if provided, otherwise derive from input filename
     // Use filename() not stem() because ".36" in SCUS_942.36 is part of the serial, not an extension
-    std::string exe_stem = exe_path.filename().string();
+    std::string exe_stem = raw_image_mode ? output_stem : exe_path.filename().string();
     std::filesystem::create_directories(out_dir);
     std::filesystem::path output_filename = out_dir / (exe_stem + "_full.c");
     fmt::print("Generating complete C file: {}\n", output_filename.string());
@@ -1653,6 +1898,27 @@ int main(int argc, char** argv) {
             fmt::print("✓ Code-range manifest unchanged ({})\n\n",
                       ranges_filename.string());
         }
+    }
+    if (raw_image_mode) {
+        const std::string provenance = fmt::format(
+            "{{\n"
+            "  \"schema\": \"psxrecomp-input-provenance-v1\",\n"
+            "  \"format\": \"raw\",\n"
+            "  \"sha256\": \"{}\",\n"
+            "  \"load_address\": \"0x{:08X}\",\n"
+            "  \"size\": {},\n"
+            "  \"entry_pc\": \"0x{:08X}\",\n"
+            "  \"discovery\": \"{}\",\n"
+            "  \"game_identity_sha256\": \"{}\",\n"
+            "  \"manifest_identity_sha256\": \"{}\"\n"
+            "}}\n",
+            raw_input_sha256, exe->load_address(), exe->code_size(),
+            exe->entry_point(), reachable_discovery ? "reachable" : "whole-image",
+            game_identity_hex, manifest_digest_hex);
+        const std::filesystem::path provenance_path =
+            out_dir / (exe_stem + "_input.json");
+        write_file_if_changed(provenance_path, provenance);
+        fmt::print("✓ Saved input provenance to {}\n\n", provenance_path.string());
     }
 
     // Generate dispatch table (tomba_dispatch.c)

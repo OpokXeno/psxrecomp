@@ -15,6 +15,7 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #else
+#  include <dirent.h>
 #  include <errno.h>
 #  ifdef __linux__
 #    include <limits.h>
@@ -938,9 +939,8 @@ void autocompile_set_cache_paths(const char *cache_dir, const char *captures) {
 int autocompile_configured(void) { return s_cmd[0] != '\0'; }
 int autocompile_busy(void)       { return ac_state_load() != AC_IDLE; }
 
-static int capture_store_has_records(void) {
-    if (!s_captures[0]) return 0;
-    FILE *capture = fopen(s_captures, "rb");
+static int capture_file_has_records(const char *path) {
+    FILE *capture = fopen(path, "rb");
     if (!capture) return 0;
     int first = EOF;
     int next = EOF;
@@ -956,6 +956,53 @@ static int capture_store_has_records(void) {
     }
     fclose(capture);
     return first != EOF && (first != '[' || (next != EOF && next != ']'));
+}
+
+static int capture_store_has_records(void) {
+    if (!s_captures[0]) return 0;
+    if (capture_file_has_records(s_captures)) return 1;
+    char history[sizeof(s_captures) + 4u];
+    if (snprintf(history, sizeof(history), "%s.d", s_captures) <= 0)
+        return 0;
+#ifdef _WIN32
+    char pattern[sizeof(history) + 8u];
+    if (snprintf(pattern, sizeof(pattern), "%s\\*.json", history) <= 0)
+        return 0;
+    WIN32_FIND_DATAA data;
+    HANDLE search = FindFirstFileA(pattern, &data);
+    if (search == INVALID_HANDLE_VALUE) return 0;
+    int found = 0;
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            char path[sizeof(history) + MAX_PATH + 2u];
+            if (snprintf(path, sizeof(path), "%s\\%s", history,
+                         data.cFileName) > 0 && capture_file_has_records(path)) {
+                found = 1;
+                break;
+            }
+        }
+    } while (FindNextFileA(search, &data));
+    FindClose(search);
+    return found;
+#else
+    DIR *directory = opendir(history);
+    if (!directory) return 0;
+    int found = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        if (name_len < 5u || strcmp(entry->d_name + name_len - 5u, ".json") != 0)
+            continue;
+        char path[sizeof(history) + 512u];
+        if (snprintf(path, sizeof(path), "%s/%s", history, entry->d_name) > 0 &&
+            capture_file_has_records(path)) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(directory);
+    return found;
+#endif
 }
 
 #ifndef _WIN32

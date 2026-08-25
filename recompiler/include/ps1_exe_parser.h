@@ -96,6 +96,15 @@ public:
         std::string& error_msg
     );
 
+    // Parse a headerless RAM image. Authenticated callers provide the exact
+    // load/entry metadata instead of manufacturing a temporary PS-X EXE.
+    static std::optional<PS1Executable> parse_raw_file(
+        const std::filesystem::path& path,
+        uint32_t load_address,
+        uint32_t entry_point,
+        std::string& error_msg
+    );
+
     // Parse PS1-EXE from memory buffer
     static std::optional<PS1Executable> parse_buffer(
         const std::vector<uint8_t>& buffer,

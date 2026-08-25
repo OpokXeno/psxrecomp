@@ -896,6 +896,39 @@ static uint64_t write_and_commit_snapshot(uint32_t bw,
     return capture_commit_temp(temp_path, reason, sequence);
 }
 
+static void capture_filter_linked_static(uint32_t *dispatch_pc_bitmap,
+                                         uint32_t *exec_pc_bitmap,
+                                         uint32_t *exec_pc_counts,
+                                         uint32_t ram_size)
+{
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    extern int psx_overlay_static_image_known(uint32_t addr);
+    for (uint32_t bitmap_word = 0;
+         bitmap_word < DIRTY_RAM_EXEC_BITMAP_WORDS; bitmap_word++) {
+        uint32_t evidence = dispatch_pc_bitmap[bitmap_word] |
+                            exec_pc_bitmap[bitmap_word];
+        for (uint32_t bit = 0; evidence && bit < 32u; bit++) {
+            const uint32_t mask = 1u << bit;
+            if (!(evidence & mask)) continue;
+            evidence &= ~mask;
+            const uint32_t word = bitmap_word * 32u + bit;
+            const uint32_t phys = word * 4u;
+            if (phys >= ram_size ||
+                !psx_overlay_static_image_known(0x80000000u | phys))
+                continue;
+            dispatch_pc_bitmap[bitmap_word] &= ~mask;
+            exec_pc_bitmap[bitmap_word] &= ~mask;
+            exec_pc_counts[word] = 0u;
+        }
+    }
+#else
+    (void)dispatch_pc_bitmap;
+    (void)exec_pc_bitmap;
+    (void)exec_pc_counts;
+    (void)ram_size;
+#endif
+}
+
 static void capture_executed_pages(uint32_t *bitmap, uint32_t bw,
                                    const uint32_t *exec_pc_bitmap,
                                    uint32_t scope_lo, uint32_t scope_hi,
@@ -933,24 +966,48 @@ static uint64_t overlay_capture_write_current(const char *reason,
     uint32_t bw = dirty_ram_get_bitmap_word_count();
     uint32_t ram_size = memory_get_ram_size();
     uint32_t *bitmap;
+    uint32_t *dispatch_pc_bitmap;
+    uint32_t *exec_pc_bitmap;
+    uint32_t *exec_pc_counts;
     uint64_t sig;
     /* Data-shard and restored-state loads can execute dirty RAM without a
      * post-handoff CD DMA. The execution bitmap is authoritative; do not drop
      * that coherent final image merely because the legacy DMA gate stayed off. */
     if (!s_enabled) return 0;
     bitmap = (uint32_t *)malloc((size_t)bw * sizeof(uint32_t));
-    if (!bitmap) return 0;
-    capture_executed_pages(bitmap, bw, g_dirty_ram_exec_pc_bitmap,
+    dispatch_pc_bitmap = (uint32_t *)malloc(
+        sizeof(g_dirty_ram_dispatch_pc_bitmap));
+    exec_pc_bitmap = (uint32_t *)malloc(sizeof(g_dirty_ram_exec_pc_bitmap));
+    exec_pc_counts = (uint32_t *)malloc(sizeof(g_dirty_ram_exec_pc_counts));
+    if (!bitmap || !dispatch_pc_bitmap || !exec_pc_bitmap || !exec_pc_counts) {
+        free(bitmap);
+        free(dispatch_pc_bitmap);
+        free(exec_pc_bitmap);
+        free(exec_pc_counts);
+        return 0;
+    }
+    memcpy(dispatch_pc_bitmap, g_dirty_ram_dispatch_pc_bitmap,
+           sizeof(g_dirty_ram_dispatch_pc_bitmap));
+    memcpy(exec_pc_bitmap, g_dirty_ram_exec_pc_bitmap,
+           sizeof(g_dirty_ram_exec_pc_bitmap));
+    memcpy(exec_pc_counts, g_dirty_ram_exec_pc_counts,
+           sizeof(g_dirty_ram_exec_pc_counts));
+    capture_filter_linked_static(dispatch_pc_bitmap, exec_pc_bitmap,
+                                 exec_pc_counts, ram_size);
+    capture_executed_pages(bitmap, bw, exec_pc_bitmap,
                            scope_lo, scope_hi, include_halo);
     sig = write_and_commit_snapshot(bw, bitmap,
-                                    g_dirty_ram_dispatch_pc_bitmap,
-                                    g_dirty_ram_exec_pc_bitmap,
-                                    g_dirty_ram_exec_pc_counts,
+                                    dispatch_pc_bitmap,
+                                    exec_pc_bitmap,
+                                    exec_pc_counts,
                                     memory_get_ram_ptr(),
                                     ram_size,
                                     reason,
                                     capture_next_sequence());
     free(bitmap);
+    free(dispatch_pc_bitmap);
+    free(exec_pc_bitmap);
+    free(exec_pc_counts);
     return sig;
 }
 
@@ -1272,6 +1329,9 @@ static AutocapWriteJob *capture_snapshot_create(uint32_t scope_lo,
            sizeof(g_dirty_ram_exec_pc_bitmap));
     memcpy(job->exec_pc_counts, g_dirty_ram_exec_pc_counts,
            sizeof(g_dirty_ram_exec_pc_counts));
+    capture_filter_linked_static(job->dispatch_pc_bitmap,
+                                 job->exec_pc_bitmap,
+                                 job->exec_pc_counts, ram_size);
     if (scoped) {
         /* DMA preservation includes a one-page executed halo so an ...FFC
          * control transfer and its ...000 delay slot remain coherent. */
@@ -1454,7 +1514,7 @@ void overlay_autocapture_tick(void)
         return;
     }
 
-    if (!s_autocap_enabled || !s_active) return;
+    if (!s_autocap_enabled) return;
     if (SDL_AtomicGet(&s_autocap_write_state) != 0) return;
     if (s_frame_count - s_autocap_last_check < AUTOCAP_CHECK_FRAMES) return;
     s_autocap_last_check = s_frame_count;
@@ -1463,7 +1523,8 @@ void overlay_autocapture_tick(void)
     uint64_t delta = disp - s_autocap_last_disp;
     s_autocap_last_disp  = disp;
     s_autocap_last_delta = delta;
-    uint64_t insns = g_dirty_ram_insns_run;
+    extern uint64_t g_dirty_window_insns_run;
+    uint64_t insns = g_dirty_window_insns_run;
     uint64_t insns_delta = insns - s_autocap_last_insns;
     s_autocap_last_insns = insns;
     s_autocap_last_insns_delta = insns_delta;

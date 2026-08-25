@@ -52,6 +52,29 @@ continue to fail safely to the interpreter.
 
 ---
 
+## 2026-08-25: authenticated whole-image AOT census
+
+- Discovery is now independent from overlay code-generation policy. Runtime
+  captures and partial overlay inputs retain the default `reachable` mode;
+  complete build-time images may explicitly use `--discovery whole-image`.
+- Overlay `whole-image` is accepted only for a raw image whose SHA-256 is
+  supplied and verified. It scans function boundaries and direct call targets
+  across the authenticated image, but does not promote pointer-looking words
+  from data tables into callable aliases.
+- Evidence-backed `isolated_root` entries remain independent overlapping native
+  entry surfaces in both modes. They are merged after the primary census and do
+  not partition or truncate the containing function.
+- Xenogears' static pipeline uses `whole-image` for all 16 authenticated overlay
+  images. The current manifests contain 3,781 functions and 49,857 exact native
+  dispatch identities; finalization rejects any authenticated call root,
+  isolated root, or continuation missing from the generated unit.
+- Whole-image code/data classification validates SPECIAL and REGIMM sub-fields,
+  not only primary opcodes. Overlay emission excludes fail-closed data stubs from
+  C and exact-range manifests, while direct references to an excluded symbol
+  remain audit-fatal.
+
+---
+
 ## 2026-07-19: strict indirect-dispatch enrichment and scoreboard contract
 
 - A framed-root candidate is accepted only at a return-adjacent boundary with a
@@ -389,6 +412,8 @@ missing or unsupported hashes then fail instead of silently reducing coverage.
 2. Captured bytes wrapped in a **synthetic PS-X EXE** (`make_psxexe`, `:266-274`) and
    handed to the *same* recompiler binary the main EXE uses:
    `psxrecomp-game <fake.psx> --seeds seeds.txt --overlay --ws-config game.toml`.
+   This capture path defaults to `reachable`; `whole-image` is reserved for a
+   complete authenticated raw image in a declared static AOT unit.
 3. Out-of-overlay calls rewritten to `call_by_address()` (resolved at runtime via the
    dispatch table); jump tables → native `switch` + `call_by_address` default.
    `audit_generated_c()` hard-rejects a shard if any direct call escapes or any

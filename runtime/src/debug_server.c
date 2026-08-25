@@ -2995,6 +2995,10 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint64_t g_dirty_ram_aborts;
     extern uint64_t g_dirty_ram_guard_yields;
     extern uint64_t g_dirty_ram_native_handoffs;
+    extern uint64_t g_dirty_window_dispatches;
+    extern uint64_t g_dirty_window_insns_run;
+    extern uint64_t g_dirty_static_overlay_dispatches;
+    extern uint64_t g_dirty_static_overlay_insns_run;
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
@@ -3009,6 +3013,10 @@ static void handle_dirty_ram_stats(int id, const char *json)
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
              "\"guard_yields\":%llu,\"native_handoffs\":%llu,"
+             "\"unknown_overlay_dispatches\":%llu,"
+             "\"unknown_overlay_insns\":%llu,"
+             "\"static_known_interp_dispatches\":%llu,"
+             "\"static_known_interp_insns\":%llu,"
              "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
              id,
              (unsigned long long)g_dirty_ram_blocks_run,
@@ -3016,6 +3024,10 @@ static void handle_dirty_ram_stats(int id, const char *json)
              (unsigned long long)g_dirty_ram_aborts,
              (unsigned long long)g_dirty_ram_guard_yields,
              (unsigned long long)g_dirty_ram_native_handoffs,
+             (unsigned long long)g_dirty_window_dispatches,
+             (unsigned long long)g_dirty_window_insns_run,
+             (unsigned long long)g_dirty_static_overlay_dispatches,
+             (unsigned long long)g_dirty_static_overlay_insns_run,
              (unsigned)dirty_ram_get_bitmap());
 
     int first = 1;
@@ -13937,23 +13949,34 @@ static void handle_overlay_loader_status(int id, const char *json)
         {
             uint64_t checks=0, hits=0, variant_misses=0, address_misses=0;
             uint64_t rehashes=0, crc_misses=0, static_gen_fastpath=0;
+            uint64_t image_checks=0, image_hits=0, image_misses=0;
             extern void psx_overlay_static_get_stats(uint64_t *, uint64_t *,
                                                      uint64_t *, uint64_t *);
+            extern void psx_overlay_static_image_get_stats(uint64_t *,
+                                                            uint64_t *,
+                                                            uint64_t *);
             extern void overlay_loader_static_match_stats(uint64_t *, uint64_t *,
                                                           uint64_t *);
             psx_overlay_static_get_stats(&checks, &hits, &variant_misses,
                                          &address_misses);
+            psx_overlay_static_image_get_stats(&image_checks, &image_hits,
+                                               &image_misses);
             overlay_loader_static_match_stats(&rehashes, &crc_misses,
                                               &static_gen_fastpath);
             n += snprintf(buf + n, sizeof(buf) - n,
                 ",\"static_checks\":%llu,\"static_hits\":%llu,"
                 "\"static_variant_misses\":%llu,\"static_address_misses\":%llu,"
+                "\"static_image_checks\":%llu,\"static_image_hits\":%llu,"
+                "\"static_image_misses\":%llu,"
                 "\"static_rehashes\":%llu,\"static_crc_misses\":%llu,"
                 "\"static_gen_fastpath\":%llu",
                 (unsigned long long)checks,
                 (unsigned long long)hits,
                 (unsigned long long)variant_misses,
                 (unsigned long long)address_misses,
+                (unsigned long long)image_checks,
+                (unsigned long long)image_hits,
+                (unsigned long long)image_misses,
                 (unsigned long long)rehashes,
                 (unsigned long long)crc_misses,
                 (unsigned long long)static_gen_fastpath);

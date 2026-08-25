@@ -577,6 +577,21 @@ void test_runtime_variant_source_observation_hooks_are_exact_and_paired() {
           "non-CPS preserves the delay slot and guards only the original callee");
 }
 
+void test_cop2_irq_resume_is_generated_continuation() {
+    PSXRecomp::PS1Executable executable = make_executable();
+    write_word(executable, kBase, 0x4B400006u);      // NCLIP command
+    write_word(executable, kBase + 4u, 0x24020001u); // addiu v0,zero,1
+    write_word(executable, kBase + 8u, 0x03E00008u); // jr ra
+    write_word(executable, kBase + 12u, 0u);
+    const PSXRecomp::Function function =
+        make_function(kBase, kBase + 16u, "cop2_irq_resume");
+    const std::string output = generate_function(executable, function, true);
+
+    check(output.find("case 0x80010004u:") != std::string::npos &&
+              output.find("goto block_80010004;") != std::string::npos,
+          "COP2 EPC+4 resume is a generated CPS continuation");
+}
+
 void inspect_authenticated_continuation_snippet() {
     PSXRecomp::PS1Executable executable = make_executable();
     write_direct_jal_function(executable);
@@ -612,6 +627,7 @@ int main(int argc, char** argv) {
     test_cps_alias_body_emits_return_in_exact_case();
     test_jr_ra_and_jalr_emit_no_lifecycle_events();
     test_cps_direct_jal_state_does_not_leak_between_functions();
+    test_cop2_irq_resume_is_generated_continuation();
     test_runtime_variant_source_observation_hooks_are_exact_and_paired();
     test_manifest_lifecycle_suppresses_colliding_generic_return();
     return failures == 0 ? 0 : 1;

@@ -99,10 +99,29 @@ void expect_entry_absent(const RunResult& result, uint32_t normalized,
 }
 
 void expect_dispatch_key_absent(const RunResult& result, uint32_t normalized,
-                                const char* message) {
+                                 const char* message) {
     char needle[32];
     std::snprintf(needle, sizeof(needle), "{ 0x%08Xu,", normalized);
     expect(result.dispatch.find(needle) == std::string::npos, message);
+}
+
+void cop2_irq_resume_becomes_block_leader() {
+    const std::vector<uint32_t> words = {
+        0x4B400006u, // NCLIP command
+        0x24020001u, // addiu v0,zero,1
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+    };
+    std::vector<uint8_t> rom;
+    for (uint32_t word : words) append_word(rom, word);
+    const auto walked = FunctionDiscovery::walk_function(
+        rom, kBase, kBase + static_cast<uint32_t>(rom.size()) - 1u,
+        kBase, kBase + static_cast<uint32_t>(rom.size()), "cop2-irq-resume");
+    bool found = false;
+    for (const auto& block : walked.blocks) {
+        if (block.start_addr == kBase + 4u) found = true;
+    }
+    expect(found, "full emitter discovers COP2 EPC+4 resume leader");
 }
 
 void delay_slot_load_falls_back() {
@@ -221,6 +240,7 @@ int main() {
     fragment_split_load_falls_back();
     noncomplementary_lwl_falls_back();
     complementary_lwl_lwr_stays_native();
+    cop2_irq_resume_becomes_block_leader();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d full-function emitter test(s) failed\n", failures);

@@ -112,7 +112,7 @@ does it break the content-hash cache model (the patched bytes may be
 load-address-specific — see §2.5 relocation)? Should the cache key be over
 unpatched or patched bytes?
 
-### 2.3 Function discovery is one evidence hierarchy; no whole-byte sweep
+### 2.3 Runtime-capture discovery is evidence-scoped; no whole-byte sweep
 Rank evidence that an address is a real function entry:
 1. Known entries (initial PC, exported symbols, declared entries)
 2. **Executed PCs** — we literally watched them run (strongest signal)
@@ -120,12 +120,14 @@ Rank evidence that an address is a real function entry:
 4. Jump-table targets we resolved by reading the table
 5. ~~Whole-byte sweep: decode every byte hoping to find functions~~
 
-Tier 5 is the *only* unsound tier for overlays — it invents entries from data,
-which is what produces the data-as-code failures. We have tiers 1–4 for free on
-overlays (we captured them by running them). So discovery should use 1–4 and
-**never** tier 5 for overlays. (The cold main EXE, with no execution evidence,
-is the only place tier 5 has ever been justified — and even there it should be
-the flagged, lowest-confidence tier.)
+Tier 5 is unsound for runtime-captured or partial overlays because it can invent
+entries from data. Those inputs have tiers 1–4 from execution evidence and must
+use `reachable`. Complete authenticated raw images used by a static AOT build
+are a separate case: explicit `--discovery whole-image` performs a full
+function-boundary census while disabling pointer-table alias promotion from
+data. Authenticated overlapping roots are then merged without partitioning the
+primary functions. The cold main EXE, with no execution evidence, is the other
+place broad discovery has been justified.
 
 This was previously implemented as an opt-in recompiler flag
 (`--overlay-exact`). We believe a flag is the wrong abstraction: evidence-driven
@@ -304,8 +306,9 @@ not assumed.
 ## 7. Implementation increments
 
 **Increment 1 — make DLLs safe and loadable (current)**
-1. No whole-byte sweep for overlay inputs (mandatory, ingester-set `--overlay`
-   contract; not a human flag).
+1. No whole-byte sweep for runtime-captured or partial overlay inputs
+   (mandatory `reachable` discovery). Complete authenticated static AOT images
+   may explicitly select `whole-image`.
 2. Split classification: code-reachable / callable entry / internal label.
 3. Per-function (or SCC) audit, not per-region.
 4. Register only proven callable entries.

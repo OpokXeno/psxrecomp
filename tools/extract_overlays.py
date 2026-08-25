@@ -199,13 +199,15 @@ def main():
     print(f'Manifest: {len(overlays)} overlay(s) to find')
     print()
 
-    # Build lookup by crc32
-    remaining = {o['crc32']: o for o in overlays}
+    # Keep manifest records distinct. Separate disc extents may intentionally
+    # contain the same payload and therefore share one CRC-named artifact.
+    remaining = {index: overlay for index, overlay in enumerate(overlays)}
     found     = {}
 
     # --- Pass 0: Direct LBA extraction (fastest — uses cd_read_log data) ---
     print('Pass 0: direct LBA extraction (from cd_read_log)...')
-    for crc, o in list(remaining.items()):
+    for overlay_id, o in list(remaining.items()):
+        crc = o['crc32']
         lba = o.get('start_lba', -1)
         if lba < 0:
             continue
@@ -213,12 +215,12 @@ def main():
         data = disc.read_file_bytes(lba, size)
         actual_crc = crc32_of(data)
         if actual_crc == crc:
-            remaining.pop(crc)
+            remaining.pop(overlay_id)
             out_name = f'{crc:08X}.bin'
             out_path = os.path.join(args.out, out_name)
             with open(out_path, 'wb') as f:
                 f.write(data)
-            found[crc] = (f'lba:{lba}(direct)', lba, size)
+            found[overlay_id] = (f'lba:{lba}(direct)', lba, size)
             print(f'  FOUND  lba={lba}  load=0x{o["load_addr"]:08X}'
                   f'  size={size}  -> {out_name}')
         else:
@@ -237,15 +239,21 @@ def main():
                     continue   # file too small to cover this overlay
                 data = disc.read_file_bytes(lba, try_size)
                 crc  = crc32_of(data[:try_size])
-                if crc in remaining:
-                    o = remaining.pop(crc)
+                matches = [
+                    (overlay_id, overlay)
+                    for overlay_id, overlay in remaining.items()
+                    if overlay['crc32'] == crc and overlay['size'] == try_size
+                ]
+                if matches:
                     out_name = f'{crc:08X}.bin'
                     out_path = os.path.join(args.out, out_name)
                     with open(out_path, 'wb') as f:
-                        f.write(data[:o['size']])
-                    found[crc] = (path, lba, size)
-                    print(f'  FOUND  {path:40s}  load=0x{o["load_addr"]:08X}'
-                          f'  size={o["size"]}  -> {out_name}')
+                        f.write(data[:try_size])
+                    for overlay_id, o in matches:
+                        remaining.pop(overlay_id)
+                        found[overlay_id] = (path, lba, size)
+                        print(f'  FOUND  {path:40s}  load=0x{o["load_addr"]:08X}'
+                              f'  size={o["size"]}  -> {out_name}')
                     break
     except Exception as e:
         print(f'  ISO scan error: {e}')
@@ -254,7 +262,8 @@ def main():
     if remaining:
         print()
         print(f'Pass 2: brute-force sector scan for {len(remaining)} unfound overlay(s)...')
-        for ov_crc, ov in list(remaining.items()):
+        for overlay_id, ov in list(remaining.items()):
+            ov_crc = ov['crc32']
             sz     = ov['size']
             nsec   = (sz + SECTOR_DATA - 1) // SECTOR_DATA
             print(f'  Scanning for crc32=0x{ov_crc:08X} size={sz} ({nsec} sectors)...',
@@ -263,12 +272,12 @@ def main():
             for lba in range(disc.total - nsec + 1):
                 data = disc.read_file_bytes(lba, sz)
                 if crc32_of(data) == ov_crc:
-                    remaining.pop(ov_crc)
+                    remaining.pop(overlay_id)
                     out_name = f'{ov_crc:08X}.bin'
                     out_path = os.path.join(args.out, out_name)
                     with open(out_path, 'wb') as f:
                         f.write(data)
-                    found[ov_crc] = (f'lba:{lba}', lba, sz)
+                    found[overlay_id] = (f'lba:{lba}', lba, sz)
                     print(f'  FOUND  lba={lba}  load=0x{ov["load_addr"]:08X}'
                           f'  size={sz}  -> {out_name}')
                     found_it = True
@@ -282,8 +291,8 @@ def main():
     print(f'Results: {len(found)} found  {len(remaining)} not found')
     if remaining:
         print('Not found (play through more content and re-run dump_overlays.py):')
-        for crc, o in remaining.items():
-            print(f'  0x{crc:08X}  load=0x{o["load_addr"]:08X}  size={o["size"]}')
+        for o in remaining.values():
+            print(f'  0x{o["crc32"]:08X}  load=0x{o["load_addr"]:08X}  size={o["size"]}')
     else:
         print('All overlays extracted successfully.')
 

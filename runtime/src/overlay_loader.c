@@ -706,16 +706,14 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
         return 0;
     }
 
-    uint32_t gen_sum = 0;
+    uint32_t ram_size = memory_get_ram_size();
     for (uint32_t i = 0; i < count; i++) {
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        uint32_t ram_size = memory_get_ram_size();
         if (len == 0u || lo >= ram_size || len > ram_size - lo) {
             s_static_match_crc_misses++;
             return 0;
         }
-        gen_sum += overlay_watch_pagegen_sum(lo, len);
     }
 
     uintptr_t raw = (uintptr_t)lo_len_pairs;
@@ -734,8 +732,31 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
             break;
         }
     }
+    /* Correctness never depends on cache capacity. If a title has more unique
+     * linked ranges than the fixed table can retain, evict the home slot rather
+     * than disabling caching for every subsequently discovered range. */
+    if (!entry) entry = &s_static_match_cache[slot];
 
-    if (entry && entry->ranges && entry->gen_sum == gen_sum) {
+    int same_identity = entry->ranges == lo_len_pairs &&
+                        entry->count == count &&
+                        entry->expected_crc == expected_crc;
+    if (!same_identity) {
+        /* The watch bitmap is monotonic between boots. Register a linked range
+         * once, not on every dispatch; later code-word writes invalidate both
+         * positive and negative results through the page generation. */
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+            overlay_watch_set_range(lo, lo_len_pairs[i * 2u + 1u]);
+        }
+    }
+
+    uint32_t gen_sum = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        gen_sum += overlay_watch_pagegen_sum(lo, lo_len_pairs[i * 2u + 1u]);
+    }
+
+    if (same_identity && entry->gen_sum == gen_sum) {
         s_static_match_gen_fastpath++;
         return entry->matches;
     }
@@ -751,13 +772,11 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
     s_static_match_rehashes++;
     if (!matches) s_static_match_crc_misses++;
 
-    if (entry) {
-        entry->ranges = lo_len_pairs;
-        entry->count = count;
-        entry->expected_crc = expected_crc;
-        entry->gen_sum = gen_sum;
-        entry->matches = matches;
-    }
+    entry->ranges = lo_len_pairs;
+    entry->count = count;
+    entry->expected_crc = expected_crc;
+    entry->gen_sum = gen_sum;
+    entry->matches = matches;
     return matches;
 }
 
@@ -4002,11 +4021,32 @@ static int overlay_find_by_range(uint32_t phys, uint32_t *mismatch_addr) {
     return best;
 }
 
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+static int overlay_static_dispatch(CPUState *cpu, uint32_t addr,
+                                   int *known) {
+    extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
+    extern int psx_overlay_static_image_known(uint32_t addr);
+    if (psx_overlay_dispatch(cpu, addr)) {
+        if (known) *known = 1;
+        return 1;
+    }
+    if (known) *known = psx_overlay_static_image_known(addr);
+    return 0;
+}
+#endif
+
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys < PSX_MAIN_RAM_APERTURE_SIZE &&
         phys >= memory_get_ram_size())
         return 0;
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    {
+        int static_known = 0;
+        if (overlay_static_dispatch(cpu, addr, &static_known)) return 1;
+        if (static_known) return 0;
+    }
+#endif
     /* Overlay dispatch is a no-op when the overlay loader is inactive
      * (overlay_cache=false): there are no candidates to match, so this must
      * return 0 (dispatch to interp). This guard is also a HARD SAFETY:
@@ -5186,6 +5226,22 @@ void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
  * leaks (root cause of the dwarf->overworld native blue screen).
  * Returns 1 iff a native candidate ran. */
 int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    {
+        int static_known = 0;
+        int prev_unit_depth = g_call_unit_depth;
+        if (overlay_unit_defer_enabled())
+            g_call_unit_depth = prev_unit_depth + 1;
+        int ran = overlay_static_dispatch(cpu, addr, &static_known);
+        g_call_unit_depth = prev_unit_depth;
+        if (ran) return 1;
+        if (static_known) {
+            extern void psx_fatal_halt(const char *reason);
+            psx_fatal_halt(
+                "linked static overlay code missed its generated dispatcher");
+        }
+    }
+#endif
     if (!s_active || !s_native_exec)
         return 0;  /* inactive/interp mode: keep the legacy inline path */
     uint32_t phys = addr & 0x1FFFFFFFu;

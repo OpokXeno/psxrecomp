@@ -891,7 +891,6 @@ function(psxrecomp_add_runtime_target target)
     set(options ORACLE COSIM PGXP)
     set(oneValueArgs
         GAME_GENERATED_DISPATCH_C
-        GAME_OVERLAY_STATIC_C
         BIOS_GENERATED_FULL_C
         BIOS_GENERATED_DISPATCH_C
         DEBUG_PORT
@@ -914,7 +913,7 @@ function(psxrecomp_add_runtime_target target)
     # monolithic full.c, so this argument may carry 1..N paths. A single path
     # is just a one-element list, so games still passing one file are
     # unaffected.
-    set(multiValueArgs EXTRAS_SOURCES GAME_GENERATED_FULL_C)
+    set(multiValueArgs EXTRAS_SOURCES GAME_GENERATED_FULL_C GAME_OVERLAY_STATIC_C)
     cmake_parse_arguments(PSXRT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # DEBUG_PORT and WINDOW_TITLE were previously required cmake-time defaults.
@@ -1019,11 +1018,14 @@ function(psxrecomp_add_runtime_target target)
             endif()
         endif()
     endif()
-    # Layer B: statically-compiled overlay dispatch. Inert unless a game
-    # provides a generated overlays_static.c — no target sets this yet.
-    if(PSXRT_GAME_OVERLAY_STATIC_C AND EXISTS "${PSXRT_GAME_OVERLAY_STATIC_C}")
-        set_source_files_properties("${PSXRT_GAME_OVERLAY_STATIC_C}" PROPERTIES GENERATED TRUE)
-        list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_STATIC_C}")
+    # Layer B: statically-compiled overlay dispatch. The source may be produced
+    # by an add_custom_command after configure, so existence is not a configure-
+    # time requirement.
+    if(PSXRT_GAME_OVERLAY_STATIC_C)
+        foreach(_overlay_src IN LISTS PSXRT_GAME_OVERLAY_STATIC_C)
+            set_source_files_properties("${_overlay_src}" PROPERTIES GENERATED TRUE)
+            list(APPEND generated_sources "${_overlay_src}")
+        endforeach()
         set(has_overlay_dispatch TRUE)
     endif()
 

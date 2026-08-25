@@ -213,6 +213,58 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-25 (Static AOT routing/capture audit):** A direct 6,024-frame
+  Xenogears replay completed `trace_complete`/`PASS`. At frame 1,090 the linked
+  dispatcher had served 700,403 exact static hits while
+  `static_known_interp_dispatches=0` and `static_known_interp_insns=0`;
+  unsupported-interpreter aborts also remained zero. A second replay with the
+  normally-disabled replay capture path explicitly enabled proved the unknown
+  pipeline remains live: it emitted eight execution-scoped capture regions and
+  published 137 dynamic `.so`/`.ranges` pairs. Every published pair belonged to
+  unknown low/post-EXE regions (`0x00000000`, `0x00004000`, `0x00006000`, or
+  `0x0004E000`); the compiler's exact static-coverage gate emitted no World AOT
+  DLL. The audit nevertheless found stale partial-load execution evidence in
+  five final capture pages whose bytes now exactly matched `world-overlay`.
+  Capture snapshots now copy and remove every PC served by an exact linked
+  static identity on the emulation thread before asynchronous persistence, so
+  old partial-load evidence cannot be rebound to completed AOT bytes. The
+  focused retry harness proves a static page is omitted while unknown evidence
+  in the same epoch survives; the runtime relinks and the interpreter hot-path
+  guards pass. The generated dynamic artifacts were retained under the private
+  audit directory and the active capture/cache stores were restored empty.
+  `xg_render_manifest_build`, which recursively configured and built a second
+  tree, was removed from automatic CTest registration; focused contract tests
+  remain available directly.
+- **2026-08-25 (Disc 1 executable census complete; 16/16 images linked):** Five
+  additional Disc FAT images now have complete authenticated catalogs and
+  whole-image AOT units: Battle Results (`61` functions), Enter Name (`68`),
+  Battle Setup (`3`), Battle Debug at developer address `0x80280000` (`16`),
+  and the STR/MDEC library (`53`). The aggregate now contains 16 images, 3,781
+  functions, and 49,857 exact CPS dispatch identities. The STR image exposed a
+  primary-opcode-only discovery defect that decoded VLC/Huffman data as code;
+  final classification now validates SPECIAL and REGIMM sub-fields, overlay
+  output omits non-code stubs and ranges, and a raw-codegen regression covers
+  both invalid-subfield data and the 8 MiB developer RAM aperture. All five
+  generated-C audits pass, the Debug runtime links, and the annotation and
+  extraction tests pass.
+- **2026-08-25 (Disc 1 overlay AOT linked; static-validation cache thrash
+  fixed, visual recheck pending):** Eleven SHA-256-authenticated Disc 1 RAW
+  images now compile as independent native CMake/Ninja units and aggregate into
+  35,520 exact CPS dispatch identities linked into XenogearsRecomp. The World
+  manifest no longer assigns Field's valid `0x8009A34C` function root to the
+  World identity, where the same address is data; World now audits clean with
+  222 functions and 3,872 entries. The first full replay was manually aborted
+  after FMV and World Map performance fell to roughly one frame per minute.
+  Root cause was generated validation identity: every CPS entry had its own
+  range-array pointer, producing 35,520 cache keys for a 4,096-entry static
+  match cache even though only 2,517 distinct linked ranges exist. Dispatch
+  generation now interns validation arrays per immutable range, and a saturated
+  cache evicts its home slot rather than disabling caching for all later keys.
+  The regenerated dispatcher has 2,517 validation arrays, passes C11 syntax,
+  the full Debug runtime links, a second Ninja build is incremental, and the 35
+  focused annotation/identity/aggregation tests pass. A short user-driven FMV
+  and World Map visual/performance recheck is still required before another
+  6,023-VBlank replay.
 - **2026-08-25 (Native DMA late-provenance fatal downgraded safely):** Linux
   core `1787611009` proved the apparent `SIGABRT` originated in
   `dma2_execute_linked_list`, where an FT4 packet at `0x0011A86C` reached

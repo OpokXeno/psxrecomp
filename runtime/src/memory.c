@@ -713,6 +713,12 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
  * is a single bitmap lookup.
  */
 static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_CAPACITY_WORDS];
+/* Page generations remain the compact cache key, but only stores overlapping
+ * exact compiled code words may advance them. Overlay code and mutable data
+ * commonly share a page, especially in FMV modules. */
+#define OVERLAY_WATCH_WORD_BITMAP_WORDS \
+    (((PSX_MAIN_RAM_APERTURE_SIZE / 4u) + 31u) / 32u)
+static uint32_t overlay_watch_word_bitmap[OVERLAY_WATCH_WORD_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_CAPACITY];
 
 void dirty_ram_reset_for_boot(void) {
@@ -728,6 +734,7 @@ void dirty_ram_reset_for_boot(void) {
     g_text_exact_last_live = 0;
     g_text_exact_last_ref = 0;
     memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
+    memset(overlay_watch_word_bitmap, 0, sizeof(overlay_watch_word_bitmap));
     memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
@@ -745,6 +752,10 @@ void overlay_watch_set_range(uint32_t phys, uint32_t len) {
     uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t pg = fp; pg <= lp; pg++)
         overlay_watch_bitmap[pg >> 5] |= (1u << (pg & 31u));
+    uint32_t first_word = phys >> 2;
+    uint32_t last_word = end >> 2;
+    for (uint32_t word = first_word; word <= last_word; word++)
+        overlay_watch_word_bitmap[word >> 5] |= (1u << (word & 31u));
 }
 
 void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
@@ -755,6 +766,10 @@ void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
     uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t pg = fp; pg <= lp; pg++)
         overlay_watch_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+    uint32_t first_word = phys >> 2;
+    uint32_t last_word = end >> 2;
+    for (uint32_t word = first_word; word <= last_word; word++)
+        overlay_watch_word_bitmap[word >> 5] &= ~(1u << (word & 31u));
 }
 
 /* Sum of generation counters over the pages spanning [phys, phys+len). The
@@ -820,7 +835,20 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
                (4096u / 4u / 32u) * sizeof(uint32_t));
         g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
     }
-    if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
+    int watched_code_write = 0;
+    if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u && size != 0u) {
+        uint32_t end = phys + size - 1u;
+        if (end >= g_psx_ram_size || end < phys) end = g_psx_ram_size - 1u;
+        uint32_t first_word = phys >> 2;
+        uint32_t last_word = end >> 2;
+        for (uint32_t word = first_word; word <= last_word; word++) {
+            if ((overlay_watch_word_bitmap[word >> 5] >> (word & 31u)) & 1u) {
+                watched_code_write = 1;
+                break;
+            }
+        }
+    }
+    if (watched_code_write) {
         const uint32_t previous_generation = overlay_page_gen[pg];
         overlay_page_gen[pg]++;
         /* Also invalidate generation-aware negative overlay lookups: bytes in

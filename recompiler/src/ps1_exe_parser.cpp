@@ -5,6 +5,12 @@
 
 namespace PSXRecomp {
 
+namespace {
+constexpr uint32_t kDeveloperRamStart = 0x80000000u;
+constexpr uint64_t kDeveloperRamEnd = 0x80800000ull;
+constexpr std::streamsize kDeveloperRamSize = 8 * 1024 * 1024;
+} // namespace
+
 bool apply_static_analysis_bound(PS1Executable& exe,
                                  uint32_t configured_size,
                                  std::string& error_msg) {
@@ -209,6 +215,68 @@ std::optional<PS1Executable> PS1ExeParser::parse_file(
     }
 
     return parse_buffer(buffer, error_msg);
+}
+
+std::optional<PS1Executable> PS1ExeParser::parse_raw_file(
+    const std::filesystem::path& path,
+    uint32_t load_address,
+    uint32_t entry_point,
+    std::string& error_msg
+) {
+    if ((load_address & 3u) != 0u || (entry_point & 3u) != 0u) {
+        error_msg = "Raw image load address and entry point must be instruction-aligned";
+        return std::nullopt;
+    }
+    if (load_address < kDeveloperRamStart || load_address >= kDeveloperRamEnd) {
+        error_msg = fmt::format(
+            "Invalid raw image load address 0x{:08X}. Must be in the 8 MiB developer KSEG0 RAM aperture",
+            load_address);
+        return std::nullopt;
+    }
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        error_msg = fmt::format("Failed to open raw image: {}", path.string());
+        return std::nullopt;
+    }
+    const std::streamsize file_size = file.tellg();
+    if (file_size < 4 || file_size > kDeveloperRamSize) {
+        error_msg = fmt::format(
+            "Raw image size {} is outside the supported 4-byte to 8 MiB range",
+            file_size);
+        return std::nullopt;
+    }
+    const uint64_t end_address =
+        static_cast<uint64_t>(load_address) + static_cast<uint64_t>(file_size);
+    if (end_address > kDeveloperRamEnd) {
+        error_msg = fmt::format(
+            "Raw image load region 0x{:08X}-0x{:08X} extends past the 8 MiB developer RAM aperture",
+            load_address, end_address);
+        return std::nullopt;
+    }
+    if (entry_point < load_address ||
+        static_cast<uint64_t>(entry_point) + 4ull > end_address) {
+        error_msg = fmt::format(
+            "Raw image entry point 0x{:08X} does not identify a complete instruction in the image",
+            entry_point);
+        return std::nullopt;
+    }
+
+    PS1Executable exe{};
+    std::memcpy(exe.header.magic, "PS-X EXE", 8);
+    exe.header.initial_pc = entry_point;
+    exe.header.load_address = load_address;
+    exe.header.file_size = static_cast<uint32_t>(file_size);
+    exe.code_data.resize(static_cast<size_t>(file_size));
+    file.seekg(0, std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(exe.code_data.data()), file_size)) {
+        error_msg = "Failed to read raw image";
+        return std::nullopt;
+    }
+    // Raw overlays have already passed the exact developer-aperture, size, and
+    // entry checks above. PS1Executable::validate() intentionally retains the
+    // retail 2 MiB PS-X EXE contract and must not be reused here.
+    return exe;
 }
 
 // Parse from memory buffer

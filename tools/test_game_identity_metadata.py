@@ -46,6 +46,90 @@ class GameIdentityMetadataTests(unittest.TestCase):
         self.assertLess(gate, crc)
         self.assertLess(crc, native_call)
 
+    def test_static_continuation_sets_resume_pc_before_native_host(self) -> None:
+        identity = compile_overlays.parse_game_identity("12" * 32, "34" * 32)
+        source = compile_overlays.generate_overlay_dispatch([{
+            "addr": 0x80010020,
+            "crc": 0x12345678,
+            "ranges": [(0x80010000, 0x40)],
+            "symbol": "synthetic_native_host",
+            "resume": 0x80010020,
+        }], identity)
+
+        dispatch = source.index("int psx_overlay_dispatch")
+        crc = source.index("psx_overlay_static_code_matches", dispatch)
+        resume = source.index("cpu->pc = 0x80010020u", crc)
+        native_call = source.index("synthetic_native_host(cpu)", resume)
+        self.assertLess(crc, resume)
+        self.assertLess(resume, native_call)
+
+    def test_static_continuations_share_range_validation_cache_key(self) -> None:
+        identity = compile_overlays.parse_game_identity("12" * 32, "34" * 32)
+        shared_range = [(0x80010000, 0x40)]
+        source = compile_overlays.generate_overlay_dispatch([
+            {
+                "addr": 0x80010000,
+                "crc": 0x12345678,
+                "ranges": shared_range,
+                "symbol": "synthetic_native_host",
+            },
+            {
+                "addr": 0x80010020,
+                "crc": 0x12345678,
+                "ranges": shared_range,
+                "symbol": "synthetic_native_host",
+                "resume": 0x80010020,
+            },
+        ], identity)
+
+        declaration = "static const uint32_t psx_ov_static_ranges_"
+        self.assertEqual(source.count(declaration), 1)
+        self.assertEqual(source.count("psx_ov_static_ranges_00000, 1u"), 2)
+
+    def test_static_image_identity_is_separate_from_entry_dispatch(self) -> None:
+        identity = compile_overlays.parse_game_identity("12" * 32, "34" * 32)
+        variants = [{
+            "addr": 0x80010000,
+            "crc": 0x12345678,
+            "ranges": [(0x80010000, 8)],
+            "symbol": "synthetic_native_overlay",
+        }]
+        images = [{
+            "load_addr": 0x80010000,
+            "size": 0x1000,
+            "crc": 0xAABBCCDD,
+            "ranges": [(0x80010000, 0x80)],
+        }]
+
+        source = compile_overlays.generate_overlay_dispatch(
+            variants, identity, images)
+
+        image_matcher = source.index("int psx_overlay_static_image_known")
+        image_contains = source.index("psx_ov_static_ranges_contain", image_matcher)
+        image_crc = source.index("0xAABBCCDDu", image_matcher)
+        entry_dispatch = source.index("int psx_overlay_dispatch", image_matcher)
+        self.assertLess(image_contains, image_crc)
+        self.assertLess(image_crc, entry_dispatch)
+
+    def test_static_image_identity_hashes_merged_linked_ranges(self) -> None:
+        data = bytes(range(32))
+        image = compile_overlays.static_image_identity(
+            [
+                (0x80010000, 0, [(0x80010000, 4), (0x80010008, 4)]),
+                (0x80010004, 0, [(0x80010004, 4)]),
+            ],
+            data,
+            0x80010000,
+            len(data),
+            "synthetic",
+        )
+
+        self.assertEqual(image["ranges"], [(0x10000, 12)])
+        self.assertEqual(
+            image["crc"],
+            compile_overlays.binascii.crc32(data[:12]) & 0xFFFFFFFF,
+        )
+
     def test_static_output_reuse_requires_complete_matching_identity(self) -> None:
         expected = compile_overlays.parse_game_identity(
             "01020304" + ("05" * 28), "10" * 32)

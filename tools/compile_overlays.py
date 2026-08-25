@@ -2305,6 +2305,15 @@ def patch_generated_c(src: str, load_addr: int, size: int) -> str:
 
 STATIC_PREAMBLE = """\
 /* ---- Static overlay (B-2): psx_runtime.h already provides call_by_address. */
+#include "psx_xg_render_auth_hook_types.h"
+extern void psx_xg_render_auth_warm_hook(CPUState *cpu, uint32_t hook,
+                                         uint32_t pc,
+                                         uint32_t instruction_word,
+                                         uint32_t delay_slot_word);
+extern bool psx_xg_render_auth_native_ft4_bypass(CPUState *cpu, uint32_t pc,
+                                                  uint32_t instruction_word);
+#define psx_xg_render_auth psx_xg_render_auth_warm_hook
+#define psx_xg_render_native_ft4_bypass psx_xg_render_auth_native_ft4_bypass
 
 """
 
@@ -2462,26 +2471,57 @@ def add_cps_resume_case(src: str, host_symbol: str,
     return src[:definition.end()] + prologue_text + src[definition.end():], True
 
 
-def generate_overlay_dispatch(variants: list, identity: GameIdentity) -> str:
+def generate_overlay_dispatch(variants: list, identity: GameIdentity,
+                              images: list | None = None) -> str:
     """Generate byte-validated dispatch for all static overlay variants."""
     unique = []
     seen = set()
     for variant in variants:
         ranges = tuple((lo & 0x1FFFFFFF, length)
                        for lo, length in variant['ranges'])
-        key = (variant['addr'], variant['crc'], ranges)
+        resume = int(variant.get('resume', 0)) & 0xFFFFFFFF
+        key = (variant['addr'], variant['crc'], ranges, resume)
         if key in seen:
             continue
         seen.add(key)
         item = dict(variant)
         item['ranges'] = ranges
+        item['resume'] = resume
         unique.append(item)
 
-    unique.sort(key=lambda v: (v['addr'], v['crc'], v['ranges'], v['symbol']))
+    unique.sort(key=lambda v: (
+        v['addr'], v['crc'], v['ranges'], v['resume'], v['symbol']))
+    range_sets = sorted({variant['ranges'] for variant in unique})
+    range_symbols = {
+        ranges: f'psx_ov_static_ranges_{index:05d}'
+        for index, ranges in enumerate(range_sets)
+    }
     by_addr = {}
-    for index, variant in enumerate(unique):
-        variant['range_symbol'] = f'psx_ov_static_ranges_{index:05d}'
+    for variant in unique:
+        # CPS continuation entries from one native function validate the same
+        # immutable code range. Sharing this pointer also shares the runtime's
+        # page-generation/CRC cache entry instead of minting one per block.
+        variant['range_symbol'] = range_symbols[variant['ranges']]
         by_addr.setdefault(variant['addr'], []).append(variant)
+
+    unique_images = []
+    seen_images = set()
+    for image in images or []:
+        ranges = tuple((lo & 0x1FFFFFFF, length)
+                       for lo, length in image['ranges'])
+        key = (image['load_addr'] & 0x1FFFFFFF, image['size'],
+               image['crc'], ranges)
+        if key in seen_images:
+            continue
+        seen_images.add(key)
+        item = dict(image)
+        item['load_addr'] &= 0x1FFFFFFF
+        item['ranges'] = ranges
+        unique_images.append(item)
+    unique_images.sort(key=lambda image: (
+        image['load_addr'], image['size'], image['crc'], image['ranges']))
+    for index, image in enumerate(unique_images):
+        image['range_symbol'] = f'psx_ov_static_image_ranges_{index:03d}'
 
     game_identity = ', '.join(f'0x{value:02X}u'
                               for value in identity.game_sha256)
@@ -2502,16 +2542,43 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity) -> str:
         'static uint64_t psx_ov_static_hits = 0;',
         'static uint64_t psx_ov_static_variant_misses = 0;',
         'static uint64_t psx_ov_static_address_misses = 0;',
+        'static uint64_t psx_ov_static_image_checks = 0;',
+        'static uint64_t psx_ov_static_image_hits = 0;',
+        'static uint64_t psx_ov_static_image_misses = 0;',
         '',
     ]
-    for variant in unique:
+    for symbol in sorted({variant['symbol'] for variant in unique}):
+        lines.append(f'extern void {symbol}(CPUState *cpu);')
+    lines.append('')
+    for ranges in range_sets:
         flat = []
-        for lo, length in variant['ranges']:
+        for lo, length in ranges:
             flat.extend((f'0x{lo:08X}u', f'0x{length:X}u'))
         lines.append(
-            f'static const uint32_t {variant["range_symbol"]}[] = '
+            f'static const uint32_t {range_symbols[ranges]}[] = '
+            '{ ' + ', '.join(flat) + ' };')
+    for image in unique_images:
+        flat = []
+        for lo, length in image['ranges']:
+            flat.extend((f'0x{lo:08X}u', f'0x{length:X}u'))
+        lines.append(
+            f'static const uint32_t {image["range_symbol"]}[] = '
             '{ ' + ', '.join(flat) + ' };')
 
+    if unique_images:
+        lines += [
+            '',
+            'static int psx_ov_static_ranges_contain(const uint32_t *ranges,',
+            '                                         uint32_t count,',
+            '                                         uint32_t addr) {',
+            '    for (uint32_t i = 0; i < count; i++) {',
+            '        uint32_t lo = ranges[i * 2u];',
+            '        uint32_t len = ranges[i * 2u + 1u];',
+            '        if (addr >= lo && addr - lo < len) return 1;',
+            '    }',
+            '    return 0;',
+            '}',
+        ]
     lines += [
         '',
         'void psx_overlay_static_get_stats(uint64_t *checks, uint64_t *hits,',
@@ -2521,6 +2588,39 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity) -> str:
         '    if (hits) *hits = psx_ov_static_hits;',
         '    if (variant_misses) *variant_misses = psx_ov_static_variant_misses;',
         '    if (address_misses) *address_misses = psx_ov_static_address_misses;',
+        '}',
+        '',
+        'void psx_overlay_static_image_get_stats(uint64_t *checks,',
+        '                                        uint64_t *hits,',
+        '                                        uint64_t *misses) {',
+        '    if (checks) *checks = psx_ov_static_image_checks;',
+        '    if (hits) *hits = psx_ov_static_image_hits;',
+        '    if (misses) *misses = psx_ov_static_image_misses;',
+        '}',
+        '',
+        'int psx_overlay_static_image_known(uint32_t addr) {',
+        '    if (!psx_game_identity_bind_static(&k_psx_overlay_static_identity) ||',
+        '        !psx_game_identity_gate(&k_psx_overlay_static_identity)) return 0;',
+        '    const uint32_t key = addr & 0x1FFFFFFFu;',
+        '    (void)key;',
+    ]
+    for image in unique_images:
+        count = len(image['ranges'])
+        lines += [
+            f'    if (psx_ov_static_ranges_contain('
+            f'{image["range_symbol"]}, {count}u, key)) {{',
+            '        psx_ov_static_image_checks++;',
+            f'        if (psx_overlay_static_code_matches('
+            f'{image["range_symbol"]}, {count}u, '
+            f'0x{image["crc"]:08X}u)) {{',
+            '            psx_ov_static_image_hits++;',
+            '            return 1;',
+            '        }',
+            '        psx_ov_static_image_misses++;',
+            '    }',
+        ]
+    lines += [
+        '    return 0;',
         '}',
         '',
         'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
@@ -2539,6 +2639,11 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity) -> str:
                 f'{variant["range_symbol"]}, {count}u, '
                 f'0x{variant["crc"]:08X}u)) {{',
                 '                psx_ov_static_hits++;',
+            ]
+            if variant['resume']:
+                lines.append(
+                    f'                cpu->pc = 0x{variant["resume"]:08X}u;')
+            lines += [
                 f'                {variant["symbol"]}(cpu);',
                 '                return 1;',
                 '            }',
@@ -2625,6 +2730,235 @@ def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
         out.append((ev, crc & 0xFFFFFFFF, ranges))
 
     return out
+
+
+def static_image_identity(func_ids: list, data: bytes, load_addr: int,
+                          size: int, image_id: str | None = None) -> dict:
+    """Build one immutable identity for an image's linked code ranges."""
+    base = load_addr & 0x1FFFFFFF
+    spans = sorted(
+        ((lo & 0x1FFFFFFF), (lo & 0x1FFFFFFF) + length)
+        for _entry, _crc, ranges in func_ids
+        for lo, length in ranges
+    )
+    merged = []
+    for lo, hi in spans:
+        if lo < base or hi > base + size or lo >= hi:
+            raise ValueError(f'{image_id or "static image"}: invalid code range')
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    if not merged or len(merged) > 4096:
+        raise ValueError(
+            f'{image_id or "static image"}: invalid code identity range count '
+            f'{len(merged)}')
+    crc = 0
+    ranges = []
+    for lo, hi in merged:
+        length = hi - lo
+        crc = binascii.crc32(data[lo - base:hi - base], crc)
+        ranges.append((lo, length))
+    chunks = []
+    cursor = base
+    image_hi = base + size
+    while cursor < image_hi:
+        length = min(0x1000 - (cursor & 0xFFF), image_hi - cursor)
+        offset = cursor - base
+        chunks.append((
+            cursor,
+            length,
+            hashlib.sha256(data[offset:offset + length]).hexdigest(),
+        ))
+        cursor += length
+    return {
+        'image_id': image_id,
+        'load_addr': base,
+        'size': size,
+        'crc': crc & 0xFFFFFFFF,
+        'ranges': ranges,
+        'chunks': chunks,
+    }
+
+
+STATIC_COVERAGE_SCHEMA = 'psxrecomp static overlay coverage v2'
+
+
+def static_coverage_document(images: list, identity: GameIdentity) -> dict:
+    """Serialize linked code identities without retaining game bytes."""
+    records = []
+    seen = set()
+    for image in images:
+        ranges = tuple((int(lo) & 0x1FFFFFFF, int(length))
+                       for lo, length in image['ranges'])
+        key = (int(image['load_addr']) & 0x1FFFFFFF, int(image['size']),
+               int(image['crc']) & 0xFFFFFFFF, ranges)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({
+            'image_id': image.get('image_id'),
+            'load_addr': f'0x{key[0] | 0x80000000:08X}',
+            'size': key[1],
+            'code_crc32': f'0x{key[2]:08X}',
+            'ranges': [[f'0x{lo | 0x80000000:08X}', length]
+                       for lo, length in ranges],
+            'chunks': [
+                [f'0x{int(lo) | 0x80000000:08X}', int(length), digest]
+                for lo, length, digest in image['chunks']
+            ],
+        })
+    records.sort(key=lambda image: (
+        int(image['load_addr'], 16), image['size'], image['code_crc32'],
+        image['ranges']))
+    return {
+        'schema': STATIC_COVERAGE_SCHEMA,
+        'game_identity_sha256': identity.game_sha256.hex(),
+        'manifest_identity_sha256': identity.manifest_sha256.hex(),
+        'images': records,
+    }
+
+
+def load_static_coverage(path: str, identity: GameIdentity) -> list:
+    """Load and validate a byte-free linked static coverage sidecar."""
+    with open(path, encoding='utf-8') as source:
+        document = json.load(source)
+    if (not isinstance(document, dict) or
+            document.get('schema') != STATIC_COVERAGE_SCHEMA or
+            document.get('game_identity_sha256') != identity.game_sha256.hex() or
+            document.get('manifest_identity_sha256') !=
+            identity.manifest_sha256.hex() or
+            not isinstance(document.get('images'), list)):
+        raise ValueError('static coverage identity/schema mismatch')
+    images = []
+    for record in document['images']:
+        if not isinstance(record, dict):
+            raise ValueError('invalid static coverage image')
+        load_addr = int(record['load_addr'], 0) & 0x1FFFFFFF
+        size = int(record['size'])
+        crc = int(record['code_crc32'], 0)
+        raw_ranges = record.get('ranges')
+        raw_chunks = record.get('chunks')
+        if (size <= 0 or load_addr >= PSX_RAM_SIZE or
+                size > PSX_RAM_SIZE - load_addr or
+                not isinstance(raw_ranges, list) or
+                not 1 <= len(raw_ranges) <= 4096 or
+                not isinstance(raw_chunks, list) or
+                not 1 <= len(raw_chunks) <= 4096):
+            raise ValueError('invalid static coverage image bounds')
+        ranges = []
+        previous_hi = load_addr
+        for raw_range in raw_ranges:
+            if not isinstance(raw_range, list) or len(raw_range) != 2:
+                raise ValueError('invalid static coverage range')
+            lo = int(raw_range[0], 0) & 0x1FFFFFFF
+            length = int(raw_range[1])
+            if (length <= 0 or lo < previous_hi or lo < load_addr or
+                    length > load_addr + size - lo):
+                raise ValueError('invalid static coverage range bounds')
+            ranges.append((lo, length))
+            previous_hi = lo + length
+        chunks = []
+        previous_hi = load_addr
+        for raw_chunk in raw_chunks:
+            if not isinstance(raw_chunk, list) or len(raw_chunk) != 3:
+                raise ValueError('invalid static coverage chunk')
+            lo = int(raw_chunk[0], 0) & 0x1FFFFFFF
+            length = int(raw_chunk[1])
+            digest = raw_chunk[2]
+            if (lo != previous_hi or length <= 0 or length > 0x1000 or
+                    length > load_addr + size - lo or
+                    not isinstance(digest, str) or len(digest) != 64 or
+                    any(char not in '0123456789abcdef' for char in digest)):
+                raise ValueError('invalid static coverage chunk bounds/digest')
+            chunks.append((lo, length, digest))
+            previous_hi = lo + length
+        if previous_hi != load_addr + size:
+            raise ValueError('static coverage chunks do not cover image')
+        images.append({
+            'image_id': record.get('image_id'),
+            'load_addr': load_addr,
+            'size': size,
+            'crc': crc & 0xFFFFFFFF,
+            'ranges': ranges,
+            'chunks': chunks,
+        })
+    return images
+
+
+def capture_static_coverage_match(cap: dict, data: bytes,
+                                  evidence: set[int], images: list
+                                  ) -> dict | None:
+    """Return the exact linked identity covering every retained capture PC."""
+    if not evidence:
+        return None
+    load_addr = int(cap['load_addr'], 16) & 0x1FFFFFFF
+    size = int(cap['size'])
+    capture_hi = load_addr + size
+    for image in images:
+        image_hi = image['load_addr'] + image['size']
+        if load_addr < image['load_addr'] or capture_hi > image_hi:
+            continue
+        matched_chunks = []
+        fragment_mismatch = False
+        for lo, length, digest in image['chunks']:
+            if lo < load_addr or lo + length > capture_hi:
+                continue
+            offset = lo - load_addr
+            actual = hashlib.sha256(data[offset:offset + length]).hexdigest()
+            if actual != digest:
+                fragment_mismatch = True
+                break
+            matched_chunks.append((lo, length))
+        if fragment_mismatch or not matched_chunks:
+            continue
+        if all(any(lo <= (entry & 0x1FFFFFFF) < lo + length
+                   for lo, length in image['ranges']) and
+               any(lo <= (entry & 0x1FFFFFFF) < lo + length
+                   for lo, length in matched_chunks)
+               for entry in evidence):
+            return image
+    return None
+
+
+def load_capture_union(path: str) -> list:
+    """Union the canonical capture and immutable ``<path>.d`` contributions."""
+    sources = []
+    history = path + '.d'
+    if os.path.isdir(history):
+        sources.extend(os.path.join(history, name)
+                       for name in sorted(os.listdir(history))
+                       if name.lower().endswith('.json'))
+    if os.path.isfile(path):
+        sources.append(path)
+    index = {}
+    evidence_fields = (
+        'executed_pcs', 'dispatch_entry_pcs', 'static_dispatch_entry_pcs',
+        'static_isolated_entry_pcs', 'function_entry_pcs', 'seeds')
+    for source_path in sources:
+        try:
+            with open(source_path, encoding='utf-8') as source:
+                records = json.load(source)
+            if not isinstance(records, list):
+                raise ValueError('root is not a list')
+        except Exception as error:
+            print(f'  warn: could not read {source_path} ({error}); '
+                  'skipping contribution')
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            key = (record.get('load_addr'), hashlib.sha256(
+                str(record.get('bytes_b64', '')).encode('ascii')).digest())
+            if key not in index:
+                index[key] = dict(record)
+                continue
+            current = index[key]
+            for field in evidence_fields:
+                current[field] = sorted(set(current.get(field, [])) |
+                                        set(record.get(field, [])))
+    return [index[key] for key in sorted(index, key=lambda item: (
+        int(item[0], 0), item[1]))]
 
 
 def _mips_control_kind(instr: int) -> int:
@@ -5534,8 +5868,12 @@ def main():
     ap.add_argument('--captures',        default=None,
                     help='overlay_captures.json from the runtime. Optional: the '
                          'runtime injects PSX_OVERLAY_CAPTURES (the canonical '
-                         '<exe>/overlay_captures.json), which wins. Required only '
-                         'for manual/offline invocation.')
+                          '<exe>/overlay_captures.json), which wins. Required only '
+                          'for manual/offline invocation.')
+    ap.add_argument('--static-coverage', default=None,
+                    help='byte-free overlays_static_coverage.json; exact captures '
+                         'whose retained PCs are wholly linked are excluded from '
+                         'dynamic compilation')
     ap.add_argument('--game-toml',       required=True,
                     help='game.toml (for game_id)')
     ap.add_argument('--game-identity-sha256', required=True,
@@ -5596,6 +5934,9 @@ def main():
                          'lost after a later capture)')
     ap.add_argument('--static',          action='store_true',
                     help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
+    ap.add_argument('--static-shards', type=int, default=0,
+                    help='with --static, emit this fixed number of overlay body '
+                         'translation units beside the dispatch TU')
     ap.add_argument('--flavor',          type=int, default=0,
                     help='codegen flavor id baked into overlay_abi() (0=base/master; '
                          'widescreen build passes 1). The loader rejects DLLs whose '
@@ -5613,6 +5954,10 @@ def main():
                          'captures within one region stay ordered. 1 = the '
                          'sequential path. --static always runs sequential.')
     args = ap.parse_args()
+    if args.static_shards < 0 or args.static_shards > 256:
+        ap.error('--static-shards must be between 0 and 256')
+    if args.static_shards and not args.static:
+        ap.error('--static-shards requires --static')
     if os.environ.get('PSX_OVERLAY_LIVE_AUTOCOMPILE') == '1':
         # Live compilation is opportunistic background work. Offline builds can
         # still use every core, but the game must never compete with a compiler
@@ -5676,6 +6021,9 @@ def main():
         if _env_cap != args.captures:
             print(f'[cache] PSX_OVERLAY_CAPTURES overrides --captures: {_env_cap}')
         args.captures = _env_cap
+    _env_static_coverage = os.environ.get('PSX_OVERLAY_STATIC_COVERAGE')
+    if _env_static_coverage:
+        args.static_coverage = _env_static_coverage
     if not args.captures:
         ap.error('no captures file: set PSX_OVERLAY_CAPTURES (runtime injects it) '
                  'or pass --captures for manual/offline use')
@@ -5724,6 +6072,10 @@ def main():
                       'identity metadata')
                 os.remove(static_out)
         os.makedirs(args.out_dir, exist_ok=True)
+        if args.static_shards:
+            for stale in glob.glob(os.path.join(
+                    args.out_dir, 'overlays_static_body_*.c')):
+                os.remove(stale)
     else:
         # Namespaced + versioned gcc cache:
         # <game_id>/gcc/<arch-abi>/cg<N>_<emitter-hash>_gc<config-hash>/
@@ -5746,8 +6098,16 @@ def main():
               f'(codegen ver {cg}, emitter {ch:08x}, config {gh:08x}, '
               f'flavor {int(args.flavor)}{plan_suffix})')
 
-    with open(args.captures) as f:
-        captures = json.load(f)
+    captures = load_capture_union(args.captures)
+    static_coverage_images = []
+    if not args.static and args.static_coverage:
+        try:
+            static_coverage_images = load_static_coverage(
+                args.static_coverage, args.identity)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            ap.error(f'invalid --static-coverage: {error}')
+        print(f'Static coverage: {len(static_coverage_images)} linked image '
+              'identity record(s)')
 
     if args.only_region:
         only_regions = {int(value, 0) & 0x1FFFFFFF
@@ -5763,6 +6123,7 @@ def main():
     # per-function identities for the content-validated dispatcher.
     static_parts = []
     static_requested_entries = set()
+    static_isolated_entries = set()
     static_entry_sources = {}
 
     # overlay-cache v2: per-region_start function-identity coverage, so a capture
@@ -5799,10 +6160,22 @@ def main():
             args, data, load_addr)
         _label = f'overlay 0x{load_addr:08X} crc {crc32:08X}'
         if args.static:
-            for captured_entry in _parse_addr_list(
-                    cap.get('dispatch_entry_pcs', [])):
+            captured_dispatch_entries = _parse_addr_list(
+                cap.get('dispatch_entry_pcs', []))
+            captured_isolated_entries = _parse_addr_list(
+                cap.get('static_isolated_entry_pcs', []))
+            if not captured_isolated_entries <= captured_dispatch_entries:
+                raise RuntimeError(
+                    'static_isolated_entry_pcs must be a subset of '
+                    'dispatch_entry_pcs')
+            for captured_entry in captured_dispatch_entries:
                 entry = ((captured_entry & 0x1FFFFFFF) | 0x80000000)
                 static_requested_entries.add(entry)
+                static_entry_sources[entry] = (
+                    data, load_addr, size, phys_addr)
+            for captured_entry in captured_isolated_entries:
+                entry = ((captured_entry & 0x1FFFFFFF) | 0x80000000)
+                static_isolated_entries.add(entry)
                 static_entry_sources[entry] = (
                     data, load_addr, size, phys_addr)
             # --force-interior is an explicit operator assertion that a live
@@ -5852,6 +6225,7 @@ def main():
 
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
+        demanded_root_entries = walk_root_seed_entries(seeds)
         this_ids = None   # region func-ids once recompiled (None if skipped early)
 
         # Record this region's executed dispatch-proven PCs for the decoupled
@@ -5874,6 +6248,18 @@ def main():
             if repair_roots:
                 print(f'  plan repair: {len(repair_roots)} current-byte '
                       'ordinary root(s) promoted')
+            static_evidence = set(demanded_root_entries) | forced_interiors | repair_roots
+            for field in ('executed_pcs', 'dispatch_entry_pcs',
+                          'function_entry_pcs'):
+                static_evidence.update(_parse_addr_list(cap.get(field, [])))
+            linked_image = capture_static_coverage_match(
+                cap, data, static_evidence, static_coverage_images)
+            if linked_image is not None:
+                image_name = linked_image.get('image_id') or 'unnamed'
+                print(f'  SKIP: exact linked static coverage ({image_name}) '
+                      f'serves all {len(static_evidence)} retained PC(s)\n')
+                stats.add_skip()
+                return
             fragment_job = make_interior_fragment_job(
                 phys_addr, load_addr, size, data, seed_audit,
                 forced_interiors | repair_roots, cap, source_plan=plan)
@@ -5890,7 +6276,6 @@ def main():
             print(f'  seeds: {len(seeds)}  dll: {dll_path}')
         print_seed_audit(seed_audit)
 
-        demanded_root_entries = walk_root_seed_entries(seeds)
         root_seeds = [
             seed for seed in seeds
             if ((seed.split()[0] in ('call_root', 'dispatch_root')) or
@@ -6053,6 +6438,8 @@ def main():
                 static_parts.append({
                     'src': src,
                     'variants': variants,
+                    'image': static_image_identity(
+                        func_ids, data, load_addr, size, cap.get('image_id')),
                     'namespace': namespace,
                     'func_addrs': set(func_addrs),
                     'symbols': symbols,
@@ -7052,12 +7439,36 @@ def main():
             for variant in part['variants']
         }
 
+        # Entries proven to require a narrow identity get an isolated body even
+        # when a larger host owns them. Runtime-loaded data can mutate elsewhere
+        # in that host range without invalidating the unchanged entry fragment.
+        fragment_built = 0
+        new_fragment_parts = []
+        for entry in sorted(static_isolated_entries):
+            source = static_entry_sources.get(entry)
+            if source is None:
+                continue
+            data, load_addr, size, phys_addr = source
+            part = generate_interior_fragment_static(
+                entry, data, load_addr, size, phys_addr, args)
+            if part is None:
+                stats.add_fail(f'static entry 0x{entry:08X}',
+                               'static_isolated',
+                               'isolated static dispatch entry did not compile')
+                continue
+            static_parts.append(part)
+            new_fragment_parts.append(part)
+            fragment_built += 1
+
         # Captured entries not owned by any compiled host are genuine orphan
         # interiors. Compile each as an isolated dispatch-root shard, then give
         # every block in those fragments the same universal resume treatment.
+        existing_entries = {
+            variant['addr']
+            for part in static_parts
+            for variant in part['variants']
+        }
         unresolved = sorted(static_requested_entries - existing_entries)
-        fragment_built = 0
-        new_fragment_parts = []
         for entry in unresolved:
             if entry in existing_entries:
                 continue
@@ -7093,18 +7504,45 @@ def main():
                                'captured dispatch entry with no compiled body/owner')
 
         all_variants = []
-        combined = static_identity_metadata(args.identity)
-        combined += '/* Auto-generated overlay dispatch — do not edit.\n'
-        combined += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
-        combined += ' */\n'
+        static_images = []
         for part in static_parts:
-            combined += part['src']
             all_variants.extend(part['variants'])
-        combined += generate_overlay_dispatch(all_variants, args.identity)
+            if part.get('image') is not None:
+                static_images.append(part['image'])
+        dispatch = static_identity_metadata(args.identity)
+        dispatch += '/* Auto-generated overlay dispatch — do not edit.\n'
+        dispatch += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
+        dispatch += ' */\n'
+        if args.static_shards:
+            buckets = [[] for _ in range(args.static_shards)]
+            for index, part in enumerate(static_parts):
+                buckets[index % args.static_shards].append(part['src'])
+            for index, bucket in enumerate(buckets):
+                shard_path = os.path.join(
+                    args.out_dir, f'overlays_static_body_{index:03d}.c')
+                with open(shard_path, 'w') as output:
+                    output.write(''.join(bucket) if bucket else
+                                 '/* Empty deterministic AOT overlay shard. */\n')
+            dispatch += '#include "psx_runtime.h"\n'
+        else:
+            dispatch += ''.join(part['src'] for part in static_parts)
+        dispatch += generate_overlay_dispatch(
+            all_variants, args.identity, static_images)
         with open(static_out, 'w') as f:
-            f.write(combined)
+            f.write(dispatch)
+        static_coverage_out = os.path.join(
+            args.out_dir, 'overlays_static_coverage.json')
+        static_coverage_tmp = static_coverage_out + '.tmp'
+        with open(static_coverage_tmp, 'w', encoding='utf-8') as output:
+            json.dump(static_coverage_document(static_images, args.identity),
+                      output, indent=2, sort_keys=True)
+            output.write('\n')
+        os.replace(static_coverage_tmp, static_coverage_out)
         print(f'Static output: {static_out}  '
-              f'({len(all_variants)} exact function identities total)')
+              f'({len(all_variants)} exact function identities total, '
+              f'{args.static_shards or 1} body shard(s))')
+        print(f'Static coverage: {static_coverage_out} '
+              f'({len(static_images)} image record(s), no payload bytes)')
 
     # LOUD summary + machine-readable result line, then a non-zero exit when any
     # shard that should have built failed. The runtime's autocompile watcher and

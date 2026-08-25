@@ -4141,6 +4141,24 @@ std::string CodeGenerator::generate_file(
     // Generate all functions first (to collect names)
     auto gen_funcs = generate_all_functions(functions_mut, cfgs_mut);
 
+    // An authenticated overlay must never publish fail-closed data stubs as
+    // native identities. Keep real callers bound to the original symbol so the
+    // generated-C audit reports a missing definition if discovery classified a
+    // reachable function as data, rather than silently falling back at runtime.
+    if (config_.overlay_mode) {
+        const size_t before = gen_funcs.size();
+        gen_funcs.erase(
+            std::remove_if(gen_funcs.begin(), gen_funcs.end(),
+                           [](const GeneratedFunction& function) {
+                               return !function.dispatchable;
+                           }),
+            gen_funcs.end());
+        if (gen_funcs.size() != before) {
+            fmt::print("Excluded {} non-code overlay entries from native output\n",
+                       before - gen_funcs.size());
+        }
+    }
+
     // Forward declarations for all functions
     if (!gen_funcs.empty()) {
         ss << "/* Forward declarations */\n";
@@ -4163,7 +4181,16 @@ std::string CodeGenerator::generate_file(
     // Preserve the exact post-split CFG inventory used by the emitted C. The
     // dispatch generator consumes this so synthesized fallthrough functions
     // receive the same byte-precise native-validity ranges as ordinary entries.
-    last_ranges_manifest_ = generate_ranges_manifest(functions_mut, cfgs_mut);
+    std::set<std::string> emitted_function_names;
+    for (const auto& function : gen_funcs)
+        emitted_function_names.insert(function.function_name);
+    std::vector<Function> emitted_functions;
+    std::copy_if(functions_mut.begin(), functions_mut.end(),
+                 std::back_inserter(emitted_functions),
+                 [&](const Function& function) {
+                     return emitted_function_names.count(function.name) != 0;
+                 });
+    last_ranges_manifest_ = generate_ranges_manifest(emitted_functions, cfgs_mut);
 
     return ss.str();
 }

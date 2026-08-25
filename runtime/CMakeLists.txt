@@ -291,7 +291,7 @@ if(BUILD_TESTING)
     target_include_directories(overlay_capture_retry_test PRIVATE
         include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(overlay_capture_retry_test PRIVATE
-        SDL_MAIN_HANDLED PSX_OVERLAY_CAPTURE_TEST=1
+        SDL_MAIN_HANDLED PSX_OVERLAY_CAPTURE_TEST=1 PSX_HAS_OVERLAY_DISPATCH=1
         $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>
         $<$<BOOL:${PSX_SDL3}>:SDL_setenv=SDL_setenv_unsafe>
         $<$<NOT:$<BOOL:${PSX_SDL3}>>:psx_sdl_init=SDL_Init>)

@@ -595,6 +595,21 @@ FunctionDiscovery::SingleFunctionResult FunctionDiscovery::walk_function(
         result.end_addr = entry;
     }
 
+    /* A compiled IRQ check can issue a COP2 command at its take point. The BIOS
+     * then applies its documented COP2 EPC+4 rule, so the command successor is
+     * an architectural re-entry point. Make it a leader in the full-function
+     * pipeline too; set insertion is iterator-stable and covers consecutive
+     * COP2 command leaders. */
+    for (auto it = block_leader_set.begin(); it != block_leader_set.end(); ++it) {
+        uint32_t leader = *it;
+        if (!visited.count(leader)) continue;
+        uint32_t raw = fetch(leader);
+        if ((raw & 0xFE000000u) == 0x4A000000u &&
+            in_bounds(leader + 4u) && visited.count(leader + 4u)) {
+            block_leader_set.insert(leader + 4u);
+        }
+    }
+
     // Build basic block info from the sorted instruction list and leader set.
     // A block starts at a leader and runs until the next leader or end.
     std::vector<uint32_t> leaders(block_leader_set.begin(), block_leader_set.end());

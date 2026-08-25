@@ -128,6 +128,24 @@ int main(void) {
     CHECK(rescans == 0);
     CHECK(commits == 0);
     unlink(captures);
+
+    char capture_history[512];
+    CHECK(snprintf(capture_history, sizeof(capture_history), "%s.d", captures) > 0);
+    CHECK(mkdir(capture_history, 0700) == 0);
+    char history_capture[640];
+    CHECK(snprintf(history_capture, sizeof(history_capture), "%s/only.json",
+                   capture_history) > 0);
+    FILE *history_file = fopen(history_capture, "wb");
+    CHECK(history_file != NULL);
+    CHECK(fputs("[{}]", history_file) >= 0);
+    CHECK(fclose(history_file) == 0);
+    CHECK(autocompile_request_plan_repair(0));
+    for (int i = 0; i < 500 && autocompile_busy(); i++) {
+        autocompile_poll_main();
+        usleep(10000);
+    }
+    CHECK(unlink(history_capture) == 0);
+    CHECK(rmdir(capture_history) == 0);
     CHECK(!autocompile_request_plan_repair(0));
     autocompile_shutdown();
     return 0;

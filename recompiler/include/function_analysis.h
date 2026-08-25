@@ -108,7 +108,8 @@ public:
     FunctionAnalysisResult analyze_exact_entries(
         const std::vector<uint32_t>& entries,
         const std::vector<std::pair<uint32_t, uint32_t>>& producer_ranges = {},
-        const std::set<uint32_t>& cross_call_allow = {});
+        const std::set<uint32_t>& cross_call_allow = {},
+        bool verbose = true);
 
     // Add a forced entry point address that is treated as a function start
     // even if it has no standard ADDIU $sp prologue. The function will be

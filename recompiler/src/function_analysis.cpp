@@ -419,18 +419,6 @@ bool FunctionAnalyzer::is_likely_data_section(uint32_t start_addr, uint32_t end_
     uint32_t invalid_jal_count = 0;
     uint32_t undefined_opcode_count = 0;
 
-    // Valid PS1 (MIPS R3000) primary opcodes
-    static const bool valid_opcode[64] = {
-        true,  true,  true,  true,  true,  true,  true,  true,   // 0x00-0x07
-        true,  true,  true,  true,  true,  true,  true,  true,   // 0x08-0x0F
-        true,  false, true,  false, false, false, false, false,   // 0x10-0x17 (COP0=0x10, COP2=0x12)
-        false, false, false, false, false, false, false, false,   // 0x18-0x1F
-        true,  true,  true,  true,  true,  true,  true,  false,  // 0x20-0x27
-        true,  true,  true,  true,  false, false, true,  false,  // 0x28-0x2F
-        true,  false, true,  false, false, false, false, false,  // 0x30-0x37 (LWC0=0x30, LWC2=0x32)
-        true,  false, true,  false, false, false, false, false,  // 0x38-0x3F (SWC0=0x38, SWC2=0x3A)
-    };
-
     for (uint32_t addr = start_addr; addr < end_addr; addr += 4) {
         auto word_opt = exe_.read_word(addr);
         if (!word_opt.has_value()) break;
@@ -447,8 +435,9 @@ bool FunctionAnalyzer::is_likely_data_section(uint32_t start_addr, uint32_t end_
             }
         }
 
-        // Check for undefined opcode
-        if (!valid_opcode[opcode]) {
+        // Validate opcode sub-fields too. Data often uses a valid primary
+        // opcode with an impossible SPECIAL funct or REGIMM rt value.
+        if (!is_valid_mips_word(instr)) {
             undefined_opcode_count++;
         }
     }
@@ -1109,7 +1098,8 @@ bool resolve_exact_bounded_jump_table(
 FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     const std::vector<uint32_t>& entries,
     const std::vector<std::pair<uint32_t, uint32_t>>& producer_ranges,
-    const std::set<uint32_t>& cross_call_allow) {
+    const std::set<uint32_t>& cross_call_allow,
+    bool verbose) {
     FunctionAnalysisResult result;
     result.total_instructions = 0;
     result.jr_ra_count = 0;
@@ -1117,7 +1107,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     result.call_discovered_count = 0;
     result.state_continuation_count = 0;
 
-    fmt::print("\n=== Exact-Entry Function Analysis ===\n\n");
+    if (verbose) fmt::print("\n=== Exact-Entry Function Analysis ===\n\n");
 
     auto in_exe = [&](uint32_t addr) {
         return addr >= exe_.header.load_address && addr < exe_.end_address() && (addr & 3u) == 0;
@@ -1308,7 +1298,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     const std::set<uint32_t> explicit_entries = known_entries;
     std::set<uint32_t> derived_entries;
     std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> derived_evidence;
-    fmt::print("Explicit entries: {}\n", explicit_count);
+    if (verbose) fmt::print("Explicit entries: {}\n", explicit_count);
 
     // Discover callees in rounds against one stable entry partition. Processing
     // roots sequentially let an early caller insert a JAL target that actually
@@ -1322,8 +1312,10 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     while (true) {
         auto state = std::make_pair(known_entries, derived_entries);
         if (++discovery_round > 64u || !seen_states.insert(state).second) {
-            fmt::print("WARNING: exact-entry ownership did not converge; "
-                       "falling back to explicit roots only\n");
+            if (verbose) {
+                fmt::print("WARNING: exact-entry ownership did not converge; "
+                           "falling back to explicit roots only\n");
+            }
             known_entries = explicit_entries;
             derived_entries.clear();
             derived_evidence.clear();
@@ -1384,8 +1376,10 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     }
 
     result.call_discovered_count = static_cast<int>(known_entries.size() - explicit_count);
-    fmt::print("Direct-JAL entries: {}\n", result.call_discovered_count);
-    fmt::print("Total exact entries: {}\n\n", known_entries.size());
+    if (verbose) {
+        fmt::print("Direct-JAL entries: {}\n", result.call_discovered_count);
+        fmt::print("Total exact entries: {}\n\n", known_entries.size());
+    }
 
     std::vector<uint32_t> starts_vec(known_entries.begin(), known_entries.end());
     std::sort(starts_vec.begin(), starts_vec.end());
@@ -1834,20 +1828,11 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     auto in_exe_p3 = [&](uint32_t a) {
         return a >= exe_.header.load_address && a < exe_.end_address() && (a & 3u) == 0;
     };
-    // Same primary-opcode validity table as is_likely_data_section so the two
-    // agree on what "clean code" means (COP2/GTE, LWC2/SWC2 are valid PS1 ops).
-    auto valid_primary_p3 = [](uint32_t instr) -> bool {
-        static const bool valid[64] = {
-            true,  true,  true,  true,  true,  true,  true,  true,   // 0x00-0x07
-            true,  true,  true,  true,  true,  true,  true,  true,   // 0x08-0x0F
-            true,  false, true,  false, false, false, false, false,  // 0x10-0x17
-            false, false, false, false, false, false, false, false,  // 0x18-0x1F
-            true,  true,  true,  true,  true,  true,  true,  false,  // 0x20-0x27
-            true,  true,  true,  true,  false, false, true,  false,  // 0x28-0x2F
-            true,  false, true,  false, false, false, false, false,  // 0x30-0x37
-            true,  false, true,  false, false, false, false, false,  // 0x38-0x3F
-        };
-        return valid[(instr >> 26) & 0x3Fu];
+    // Use the same sub-field-aware validity check as exact-entry discovery.
+    // Primary-opcode-only validation lets Huffman and pointer-table words with
+    // impossible SPECIAL/REGIMM encodings masquerade as clean code.
+    auto valid_instruction_p3 = [](uint32_t instr) -> bool {
+        return FunctionAnalyzer::is_valid_mips_word(instr);
     };
     // Mirror exact-entry discovery's strict bounded-switch recognizer so the
     // final extent cannot disagree about which JR targets are code.
@@ -1877,7 +1862,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             if (!word_opt.has_value()) continue;
             uint32_t instr = *word_opt;
             visited.insert(pc);
-            if (!valid_primary_p3(instr)) { hit_invalid = true; continue; }
+            if (!valid_instruction_p3(instr)) { hit_invalid = true; continue; }
             ExactCf cf = exact_classify_cf(pc, instr);
             uint32_t delay = pc + 4u;
             switch (cf.kind) {

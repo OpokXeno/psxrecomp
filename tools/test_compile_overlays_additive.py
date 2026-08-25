@@ -54,6 +54,85 @@ def write_staged_pair(directory, func_ids):
 
 
 class AdditiveCaptureTests(unittest.TestCase):
+    def test_static_coverage_matches_only_exact_fully_linked_capture_evidence(self):
+        load = 0x80010000
+        payload = bytes(range(16))
+        image = compile_overlays.static_image_identity(
+            [(load, 0, [(load, 8)])], payload, load, len(payload), "known")
+        capture = region(load, payload, executed=(load + 4,), dispatch=(load,))
+
+        with tempfile.TemporaryDirectory() as td:
+            sidecar = Path(td) / "overlays_static_coverage.json"
+            sidecar.write_text(json.dumps(
+                compile_overlays.static_coverage_document([image], IDENTITY)),
+                encoding="utf-8")
+            loaded = compile_overlays.load_static_coverage(
+                str(sidecar), IDENTITY)
+
+        self.assertEqual(
+            compile_overlays.capture_static_coverage_match(
+                capture, payload, {load, load + 4}, loaded)["image_id"],
+            "known",
+        )
+        self.assertIsNone(compile_overlays.capture_static_coverage_match(
+            capture, payload, {load + 12}, loaded))
+        changed = bytearray(payload)
+        changed[0] ^= 0xFF
+        self.assertIsNone(compile_overlays.capture_static_coverage_match(
+            capture, bytes(changed), {load}, loaded))
+
+    def test_static_coverage_matches_authenticated_capture_fragment(self):
+        load = 0x80010F00
+        payload = bytes((index * 17) & 0xFF for index in range(0x3100))
+        image = compile_overlays.static_image_identity(
+            [(load, 0, [(load, len(payload))])],
+            payload, load, len(payload), "fragmented-known")
+        fragment_lo = 0x80011000
+        fragment = payload[0x100:0x2104]
+        capture = region(
+            fragment_lo, fragment,
+            executed=(fragment_lo + 4, 0x80012FFC),
+            dispatch=(0x80012000,),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            sidecar = Path(td) / "overlays_static_coverage.json"
+            sidecar.write_text(json.dumps(
+                compile_overlays.static_coverage_document([image], IDENTITY)),
+                encoding="utf-8")
+            loaded = compile_overlays.load_static_coverage(
+                str(sidecar), IDENTITY)
+
+        evidence = {fragment_lo + 4, 0x80012000, 0x80012FFC}
+        self.assertEqual(
+            compile_overlays.capture_static_coverage_match(
+                capture, fragment, evidence, loaded)["image_id"],
+            "fragmented-known",
+        )
+        changed = bytearray(fragment)
+        changed[0x1000] ^= 0xFF
+        self.assertIsNone(compile_overlays.capture_static_coverage_match(
+            capture, bytes(changed), evidence, loaded))
+
+    def test_compile_capture_union_consumes_history_contributions(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "overlay_captures.json"
+            history = Path(str(base) + ".d")
+            history.mkdir()
+            payload = b"\x01\x02\x03\x04"
+            (history / "old.json").write_text(json.dumps([
+                region(0x80010000, payload, executed=(0x80010000,)),
+            ]), encoding="utf-8")
+            base.write_text(json.dumps([
+                region(0x80010000, payload, dispatch=(0x80010000,)),
+            ]), encoding="utf-8")
+
+            captures = compile_overlays.load_capture_union(str(base))
+
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]["executed_pcs"], ["0x80010000"])
+        self.assertEqual(captures[0]["dispatch_entry_pcs"], ["0x80010000"])
+
     def test_region_coverage_unions_current_and_additive_pair_names(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(
                 compile_overlays, "_dll_runtime_exports_match",

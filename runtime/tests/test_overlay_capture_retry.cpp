@@ -24,6 +24,7 @@ uint32_t g_dirty_ram_dispatch_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS]{};
 uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS]{};
 uint64_t g_dirty_ram_insns_run = 0;
 uint64_t g_dirty_window_dispatches = 0;
+uint64_t g_dirty_window_insns_run = 0;
 uint64_t s_frame_count = 0;
 uint32_t g_overlay_region_floor = 0x00010000u;
 uint32_t g_render_auth_dma_count = 0;
@@ -35,6 +36,7 @@ uint8_t g_ram[2u * 1024u * 1024u]{};
 uint32_t g_dirty_pages[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS]{};
 int g_provider_calls = 0;
 int g_provider_accepts = 0;
+int g_static_filter_enabled = 0;
 
 int provider_available() { return 1; }
 int provider_request() {
@@ -127,6 +129,10 @@ extern "C" void psx_xg_render_auth_note_code_write(
 extern "C" void overlay_loader_check_cache(uint32_t, uint32_t,
                                               const uint8_t *) {}
 extern "C" int overlay_loader_registered_count(void) { return 0; }
+extern "C" int psx_overlay_static_image_known(uint32_t addr) {
+    return g_static_filter_enabled &&
+           ((addr & 0x1ffff000u) == 0x00012000u);
+}
 extern "C" const CodeProvider *code_provider_active(void) { return &kProvider; }
 extern "C" uint32_t crc32_compute(const uint8_t *data, size_t size) {
     uint32_t hash = 2166136261u;
@@ -168,7 +174,7 @@ int main() {
         return fail("DMA code mutation was not forwarded to render auth", root);
     set_exec(0x10000u);
     g_dirty_window_dispatches = 128u;
-    g_dirty_ram_insns_run = 100000u;
+    g_dirty_window_insns_run = 100000u;
     s_frame_count = 120u;
     overlay_autocapture_tick();
 
@@ -216,10 +222,17 @@ int main() {
      * long coverage sessions grow by gigabytes. */
     set_dirty_page(0x11000u);
     g_ram[0x11000] = 0x77;
+    set_exec(0x12000u);
+    g_ram[0x12000] = 0x33;
+    g_static_filter_enabled = 1;
     overlay_capture_write_json();
     const std::string final_epoch = read_all(capture);
     if (final_epoch.find("\"size\": 8196") != std::string::npos)
         return fail("final snapshot included dirty unexecuted pages", root);
+    if (final_epoch.find("0x80012000") != std::string::npos)
+        return fail("final snapshot retained linked static execution", root);
+    if (final_epoch.find("0x80010004") == std::string::npos)
+        return fail("static filtering removed unknown execution", root);
 
     overlay_capture_wait_pending();
     std::filesystem::remove_all(root, ignored);

@@ -402,8 +402,22 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
         }
     }
     // Build blocks from boundaries
-    std::sort(boundary_vec.begin(), boundary_vec.end());
-    boundary_vec.erase(std::unique(boundary_vec.begin(), boundary_vec.end()), boundary_vec.end());
+    std::set<uint32_t> boundaries(boundary_vec.begin(), boundary_vec.end());
+    /* The BIOS interrupt handler advances EPC by four when the interrupted
+     * instruction is a COP2 command. The runtime therefore issues a command at
+     * a compiled take point and returns at its successor. Split that successor
+     * into a real block so CPS can re-enter it without an isolated manual root.
+     * Iterating the set also handles consecutive COP2 command leaders. */
+    for (auto it = boundaries.begin(); it != boundaries.end(); ++it) {
+        uint32_t leader = *it;
+        auto instr_opt = exe_.read_word(leader);
+        if (instr_opt.has_value() &&
+            (*instr_opt & 0xFE000000u) == 0x4A000000u &&
+            leader + 4u < func.end_addr) {
+            boundaries.insert(leader + 4u);
+        }
+    }
+    boundary_vec.assign(boundaries.begin(), boundaries.end());
 
     for (size_t i = 0; i < boundary_vec.size(); i++) {
         BasicBlock block;

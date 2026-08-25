@@ -69,10 +69,12 @@ def main():
     failed_write = autocap_tick.find("if (!sig && job)")
     clear_owner = autocap_tick.find("s_autocap_write_job = NULL", failed_write)
     retry_pending = autocap_tick.find("if (s_autocap_write_job)", clear_owner)
-    enabled_gate = autocap_tick.find("if (!s_autocap_enabled || !s_active)")
+    enabled_gate = autocap_tick.find("if (!s_autocap_enabled)")
     if min(failed_write, clear_owner, retry_pending, enabled_gate) < 0 or not (
             failed_write < clear_owner < retry_pending < enabled_gate):
         raise AssertionError("failed periodic capture is not retained and retried before new epochs")
+    if "!s_autocap_enabled || !s_active" in autocap_tick:
+        raise AssertionError("CPU-copied overlays still require a prior DMA capture")
     failed_branch = autocap_tick[failed_write:clear_owner]
     for required in ("job->attempts++", "job->retry_frame", "return;"):
         if required not in failed_branch:
@@ -195,6 +197,15 @@ def main():
     lazy_match = body(loader, "lazy_man_matches")
     if "man_delay_slots_hashed(&lm->fn)" not in lazy_match:
         raise AssertionError("legacy manifests can expose unhashed delay slots")
+    static_match = body(loader, "psx_overlay_static_code_matches")
+    if "if (same_identity && entry->gen_sum == gen_sum)" not in static_match:
+        raise AssertionError("static overlay negative matches are not generation-cached")
+    identity_guard = static_match.find("if (!same_identity)")
+    watch_range = static_match.find("overlay_watch_set_range(lo,")
+    gen_sum = static_match.find("uint32_t gen_sum = 0;")
+    if min(identity_guard, watch_range, gen_sum) < 0 or not (
+            identity_guard < watch_range < gen_sum):
+        raise AssertionError("static overlay ranges are re-watched on the dispatch hot path")
     rebuild = body(loader, "rebuild_lazy_manifest_index")
     append_index = body(loader, "append_lazy_manifest_index")
     if "overlay_watch_set_range(lo, lm->fn.len[r])" not in append_index:
@@ -287,6 +298,10 @@ def main():
     watched_write = body(memory, "overlay_watch_note_write")
     if "g_dirty_ram_exec_page_bitmap" not in watched_write:
         raise AssertionError("RAM writes do not clear stale per-page capture evidence")
+    if ("overlay_watch_word_bitmap" not in watched_write or
+            "watched_code_write" not in watched_write):
+        raise AssertionError(
+            "overlay validation regressed to invalidating on unrelated page data writes")
     if "overlay_capture_before_dma" in watched_write:
         raise AssertionError("universal RAM-write hook regressed to snapshot I/O")
     if "overlay_loader_note_code_write()" not in watched_write:

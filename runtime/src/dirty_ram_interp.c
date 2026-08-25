@@ -47,7 +47,13 @@
 
 uint64_t g_dirty_ram_blocks_run = 0;
 uint64_t g_dirty_ram_insns_run  = 0;
-uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
+/* Autocompile pressure includes only identities absent from the linked static
+ * image set. A miss inside an exact known image is an AOT coverage defect, not
+ * a new overlay for the runtime compiler to absorb. */
+uint64_t g_dirty_window_dispatches = 0;
+uint64_t g_dirty_window_insns_run = 0;
+uint64_t g_dirty_static_overlay_dispatches = 0;
+uint64_t g_dirty_static_overlay_insns_run = 0;
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
 uint64_t g_dirty_ram_native_handoffs = 0;
@@ -2918,18 +2924,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 #endif
 
-    /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
-     * Inert unless a game provides an overlays_static.c at build time. */
-#ifdef PSX_HAS_OVERLAY_DISPATCH
-    {
-        extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
-        if (psx_overlay_dispatch(cpu, addr)) return 1;
-    }
-#endif
-
-    /* A-1: dynamically-loaded overlay DLL functions, checked before the
-     * interpreter.  No-op (returns 0) until overlay_loader_init() runs, which
-     * only happens when the overlay cache is enabled in config. */
+    /* Static overlay dispatch is centralized in the loader entry point so the
+     * same ordering applies to top-level, nested-call, and local handoff paths.
+     * Dynamic candidates remain the second tier. */
     /* §5-E native↔interp fingerprint: capture entry register state for a
      * candidate overlay function, so native and interpreted runs can be diffed
      * by sequence. Additive only — no control-flow change. */
@@ -2958,6 +2955,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             return 1;
         }
     }
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    {
+        extern int psx_overlay_static_image_known(uint32_t addr);
+        if (psx_overlay_static_image_known(addr)) {
+            extern void psx_fatal_halt(const char *reason);
+            if (overlay_cache_window_contains(phys))
+                g_dirty_static_overlay_dispatches++;
+            psx_fatal_halt(
+                "linked static overlay code missed its generated dispatcher");
+        }
+    }
+#endif
 /* Every exit retires any deferred load writeback: once we hand control back to
  * compiled code (or the dispatch loop) nothing downstream knows a register
  * write is still owed, and the pipeline would have drained by then anyway. */
@@ -3230,6 +3239,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             OV_FPLOG_RET1();
         }
         g_dirty_ram_insns_run++;
+        if (overlay_cache_window_contains(pc & 0x1FFFFFFFu))
+            g_dirty_window_insns_run++;
         insns_executed++;
         /* COP0 software-interrupt latency: an MTC0 to CAUSE or SR that makes a
          * software interrupt deliverable (CAUSE.IP0/IP1 & SR.IM0/IM1 & IEc)
@@ -3331,7 +3342,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                  * boundaries. The loader re-hashes generation-changed code
                  * before executing it, so incomplete/self-modified bytes stay on
                  * this authoritative interpreter path. */
-                if (overlay_loader_is_candidate(target_phys)) {
+                {
                     extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
                     if (overlay_loader_dispatch(cpu, target)) {
                         g_dirty_ram_native_handoffs++;
@@ -3340,6 +3351,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                         OV_FPLOG_RET1();
                     }
                 }
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+                {
+                    extern int psx_overlay_static_image_known(uint32_t addr);
+                    if (psx_overlay_static_image_known(target)) {
+                        extern void psx_fatal_halt(const char *reason);
+                        g_dirty_static_overlay_dispatches++;
+                        psx_fatal_halt(
+                            "linked static overlay target has no generated handoff");
+                    }
+                }
+#endif
 #ifdef PSX_HAS_GAME_DISPATCH
                 /* A patched prologue can force entry through the interpreter,
                  * while the remaining static ranges at a later continuation
@@ -3385,6 +3407,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             OV_FPLOG_RET1();
         }
         pc = next_pc;
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+        {
+            extern int psx_overlay_static_image_known(uint32_t addr);
+            if (psx_overlay_static_image_known(pc)) {
+                cpu->pc = pc;
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = pc;
+                OV_FPLOG_RET1();
+            }
+        }
+#endif
 #ifdef PSX_HAS_GAME_DISPATCH
         /* Guest call returns advance without transferred set. Re-check the
          * resume PC so a patched entry can hand its unchanged tail back to

@@ -145,6 +145,12 @@ does not sweep arbitrary bytes for prologues or return-shaped words. Unresolved
 interpretation; add an evidence-backed seed (or a `dispatch_root` seed for a
 proven nonstandard boundary) when they should be compiled.
 
+Raw overlay CLI inputs use `--discovery reachable|whole-image` rather than this
+config field. They default to `reachable`. `whole-image` is accepted only with
+`--raw-image`, `--overlay`, and a verified `--input-sha256`; it is intended for
+complete build-time AOT images, not runtime captures. It retains authenticated
+overlapping roots but disables pointer-table alias promotion from data words.
+
 
 When `game.text_size` is smaller than the PS-X EXE header size, recompilation
 uses it as a static-analysis bound. The value must be nonzero, instruction- and

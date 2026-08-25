@@ -11933,6 +11933,16 @@ int main(int argc, char** argv) {
                     if (!overlay_capture_set_path(captures_path.string().c_str()))
                         throw std::runtime_error("overlay capture path exceeds runtime limit");
                 }
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+                if (!std::getenv("PSX_OVERLAY_STATIC_COVERAGE")) {
+                    std::filesystem::path static_coverage_path =
+                        exe_dir / "overlays_static_coverage.json";
+                    if (std::filesystem::exists(static_coverage_path)) {
+                        SDL_setenv("PSX_OVERLAY_STATIC_COVERAGE",
+                                   static_coverage_path.string().c_str(), 1);
+                    }
+                }
+#endif
                 overlay_capture_set_enabled(1);
                 std::fprintf(stdout,
                     "psxrecomp: additive overlay capture store = %s (+ .d history)\n",
@@ -13530,9 +13540,10 @@ int main(int argc, char** argv) {
     }
     if (input_replay::active()) {
         const char* capture_replay = std::getenv("PSX_OVERLAY_CAPTURE_REPLAY");
-        if (!capture_replay || std::strcmp(capture_replay, "1") != 0)
+        if (!capture_replay || std::strcmp(capture_replay, "1") != 0) {
             overlay_capture_set_enabled(0);
-        overlay_autocapture_set_enabled(0);
+            overlay_autocapture_set_enabled(0);
+        }
     }
 
     std::filesystem::path resolved_bios =
