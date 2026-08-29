@@ -378,9 +378,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/timers.c
     ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_pacing.c
-    ${PSXRECOMP_ROOT}/runtime/src/game_fps_meter.c
-    ${PSXRECOMP_ROOT}/runtime/src/xenogears_timing.c
-    ${PSXRECOMP_ROOT}/runtime/src/xenogears_field_hook.c
+    ${PSXRECOMP_ROOT}/runtime/src/xenogears_scene.c
     ${PSXRECOMP_ROOT}/runtime/src/host_time.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_ROOT}/runtime/src/sio.c

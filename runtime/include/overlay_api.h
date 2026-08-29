@@ -315,9 +315,6 @@ typedef struct {
      * dependent, so overlay code forwards to the host; NULL preserves the
      * vanilla loaded value. */
     uint32_t (*ws_xclip_bound)(uint32_t vanilla);
-    int32_t (*xg_field_frame_step)(uint32_t site_pc, uint32_t instruction_word,
-                                   int32_t original_step, uint32_t frame_token,
-                                   uint32_t tier);
     void (*xg_render_auth)(CPUState *cpu, uint32_t hook, uint32_t pc,
                             uint32_t instruction_word, uint32_t delay_slot_word);
     bool (*xg_render_native_ft4_bypass)(CPUState *cpu, uint32_t pc,

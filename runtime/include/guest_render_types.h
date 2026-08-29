@@ -50,11 +50,6 @@ typedef enum {
 } GuestRenderStatus;
 
 typedef enum {
-    GUEST_RENDER_TIMING_ORIGINAL = 0,
-    GUEST_RENDER_TIMING_NATIVE_59_94,
-} GuestRenderTimingMode;
-
-typedef enum {
     GUEST_RENDER_RENDER_ORIGINAL = 0,
     GUEST_RENDER_RENDER_SHADOW,
     GUEST_RENDER_RENDER_NATIVE,
@@ -92,13 +87,10 @@ typedef struct {
 } GuestRenderVisualStateId;
 
 typedef struct {
-    GuestRenderTimingMode timing_mode;
     GuestRenderRenderMode render_mode;
 } GuestRenderSceneConfig;
 
 typedef struct {
-    GuestRenderTimingMode requested_timing_mode;
-    GuestRenderTimingMode effective_timing_mode;
     GuestRenderRenderMode requested_render_mode;
     GuestRenderRenderMode effective_render_mode;
 } GuestRenderModes;

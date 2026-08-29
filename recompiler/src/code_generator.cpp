@@ -924,13 +924,6 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             "psx_xg_render_static_auth_return(0x800781C4u, cpu->gpr[31]); ";
     }
 
-    if ((addr & 0x1FFFFFFFu) == 0x000758E4u && instr == 0x24630002u) {
-        return fmt::format(
-            "{} = {} + (uint32_t)psx_xenogears_field_frame_step("
-            "0x800758E4u, 0x24630002u, 2, cpu->gpr[17], 1u);{}",
-            reg_name(get_rt(instr)), reg_name(get_rs(instr)), comment);
-    }
-
     // Full-word-guarded terrain-frustum half-angle constants. Scaling the
     // tangent is the geometric counterpart of widening the horizontal
     // projection; adding screen pixels directly to 12-bit angle units is not.
@@ -3788,7 +3781,6 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int32_t psx_ws_player_x_bound(int32_t vanilla);  /* typed gameplay X bound */\n";
-    ss << "extern int32_t psx_xenogears_field_frame_step(uint32_t, uint32_t, int32_t, uint32_t, uint32_t);\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm); /* ws cull signed lower edge (gpu.c) */\n";

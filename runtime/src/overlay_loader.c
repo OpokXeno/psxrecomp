@@ -2747,11 +2747,6 @@ static void init_callbacks(void) {
             extern uint32_t psx_ws_xclip_bound(uint32_t vanilla);
             s_callbacks.ws_xclip_bound = psx_ws_xclip_bound;
         }
-        {
-            extern int32_t psx_xenogears_field_frame_step(
-                uint32_t, uint32_t, int32_t, uint32_t, uint32_t);
-            s_callbacks.xg_field_frame_step = psx_xenogears_field_frame_step;
-        }
         s_callbacks.xg_render_auth = psx_xg_render_auth_warm_hook;
         s_callbacks.xg_render_native_ft4_bypass =
             psx_xg_render_auth_native_ft4_bypass;

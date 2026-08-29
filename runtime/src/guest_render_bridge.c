@@ -215,11 +215,6 @@ static void observe_wrong_thread(void) {
     }
 }
 
-static bool timing_mode_is_valid(GuestRenderTimingMode mode) {
-    return mode == GUEST_RENDER_TIMING_ORIGINAL ||
-           mode == GUEST_RENDER_TIMING_NATIVE_59_94;
-}
-
 static bool render_mode_is_valid(GuestRenderRenderMode mode) {
     return mode == GUEST_RENDER_RENDER_ORIGINAL ||
            mode == GUEST_RENDER_RENDER_SHADOW ||
@@ -271,8 +266,7 @@ GuestRenderStatus guest_render_bridge_begin_scene(
     GuestRenderStatus owner_status;
 
     if (is_wrong_thread()) return GUEST_RENDER_WRONG_THREAD;
-    if (!config || !timing_mode_is_valid(config->timing_mode) ||
-        !render_mode_is_valid(config->render_mode))
+    if (!config || !render_mode_is_valid(config->render_mode))
         return GUEST_RENDER_INVALID_ARGUMENT;
     owner_status = claim_scene_owner();
     if (owner_status != GUEST_RENDER_OK) return owner_status;
@@ -287,8 +281,6 @@ GuestRenderStatus guest_render_bridge_begin_scene(
     bridge.scene_epoch_exhausted = bridge.scene_epoch == bridge.scene_epoch_limit;
     bridge.next_state_sequence = 0u;
     bridge.state_sequence_exhausted = false;
-    bridge.modes.requested_timing_mode = config->timing_mode;
-    bridge.modes.effective_timing_mode = config->timing_mode;
     bridge.modes.requested_render_mode = config->render_mode;
     bridge.modes.effective_render_mode = config->render_mode;
     bridge.fallback_reason = GUEST_RENDER_FALLBACK_NONE;
@@ -618,11 +610,8 @@ void guest_render_bridge_reset_scene(void) {
     memset(&bridge.active_provenance, 0, sizeof(bridge.active_provenance));
     memset(&bridge.completed, 0, sizeof(bridge.completed));
     if (bridge.modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE) {
-        bridge.modes.effective_timing_mode =
-            bridge.modes.requested_timing_mode;
         bridge.modes.effective_render_mode = GUEST_RENDER_RENDER_NATIVE;
     } else {
-        bridge.modes.effective_timing_mode = GUEST_RENDER_TIMING_ORIGINAL;
         bridge.modes.effective_render_mode = GUEST_RENDER_RENDER_ORIGINAL;
     }
     bridge.fallback_reason = GUEST_RENDER_FALLBACK_NONE;

@@ -118,7 +118,6 @@ extern "C" uint32_t dirty_ram_get_bitmap_word(uint32_t index) {
 }
 extern "C" int cdrom_load_in_progress(void) { return 0; }
 extern "C" int fntrace_is_game_started(void) { return 1; }
-extern "C" void psx_xenogears_field_resident_dma(uint32_t, uint32_t) {}
 extern "C" void psx_xg_render_auth_note_code_write(
     uint64_t previous_generation, uint64_t current_generation,
     uint32_t address, uint32_t size) {

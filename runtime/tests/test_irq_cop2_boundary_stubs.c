@@ -198,16 +198,6 @@ int psx_ws_cull_vxrange(uint32_t value, uint32_t immediate) {
     return value < immediate;
 }
 int psx_ws_backdrop_x(int value) { return value; }
-int32_t psx_xenogears_field_frame_step(uint32_t pc, uint32_t instruction,
-                                       int32_t vanilla_step,
-                                       uint32_t field_state, uint32_t enabled) {
-    (void)pc;
-    (void)instruction;
-    (void)field_state;
-    (void)enabled;
-    return vanilla_step;
-}
-
 void psx_xg_render_auth_cold_hook(CPUState *cpu, uint32_t hook, uint32_t pc,
                                   uint32_t instruction_word,
                                   uint32_t delay_slot_word) {

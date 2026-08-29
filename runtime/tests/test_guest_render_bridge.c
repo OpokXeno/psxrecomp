@@ -19,10 +19,9 @@
 #define GUEST_RENDER_BRIDGE_INITIAL_CLAIM_ROUNDS 2000u
 #endif
 
-static GuestRenderSceneConfig scene_config(int timing_mode, int render_mode) {
+static GuestRenderSceneConfig scene_config(int render_mode) {
     GuestRenderSceneConfig config = { 0 };
 
-    config.timing_mode = timing_mode;
     config.render_mode = render_mode;
     return config;
 }
@@ -46,8 +45,7 @@ static int read_snapshot(GuestRenderBridgeSnapshot *out_snapshot) {
 
 static int test_singleton_owner_and_first_id(void) {
     const void *owner;
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                 GUEST_RENDER_RENDER_ORIGINAL);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_ORIGINAL);
     GuestRenderVisualStateId id = { 0 };
 
     guest_render_bridge_test_reset();
@@ -64,8 +62,7 @@ static int test_singleton_owner_and_first_id(void) {
 }
 
 static int test_scene_state_uniqueness_and_repeated_present(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId first = { 0 };
     GuestRenderVisualStateId second = { 0 };
@@ -122,28 +119,20 @@ static int test_scene_state_uniqueness_and_repeated_present(void) {
 }
 
 static int test_modes_are_copied_and_effective_modes_fall_back_independently(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_SHADOW);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_SHADOW);
     GuestRenderBridgeSnapshot snapshot = { 0 };
     GuestRenderModes modes = { 0 };
 
     guest_render_bridge_test_reset();
     CHECK(guest_render_bridge_begin_scene(&config) == GUEST_RENDER_OK);
-    config.timing_mode = GUEST_RENDER_TIMING_ORIGINAL;
     config.render_mode = GUEST_RENDER_RENDER_NATIVE;
     CHECK(read_snapshot(&snapshot));
     modes = snapshot.modes;
-    CHECK(modes.requested_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
-    CHECK(modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(modes.requested_render_mode == GUEST_RENDER_RENDER_SHADOW);
     CHECK(modes.effective_render_mode == GUEST_RENDER_RENDER_SHADOW);
     guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(read_snapshot(&snapshot));
-    CHECK(snapshot.modes.requested_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.requested_render_mode == GUEST_RENDER_RENDER_SHADOW);
-    CHECK(snapshot.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_PRESENTATION_GATE);
     CHECK(snapshot.last_fallback_reason ==
@@ -154,11 +143,9 @@ static int test_modes_are_copied_and_effective_modes_fall_back_independently(voi
     CHECK(!snapshot.fallback_count_overflowed);
 
     guest_render_bridge_test_reset();
-    config = scene_config(GUEST_RENDER_TIMING_ORIGINAL, GUEST_RENDER_RENDER_NATIVE);
+    config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     CHECK(guest_render_bridge_begin_scene(&config) == GUEST_RENDER_OK);
     CHECK(read_snapshot(&snapshot));
-    CHECK(snapshot.modes.requested_timing_mode == GUEST_RENDER_TIMING_ORIGINAL);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_ORIGINAL);
     CHECK(snapshot.modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_BACKEND_FAILURE);
@@ -170,8 +157,7 @@ static int test_modes_are_copied_and_effective_modes_fall_back_independently(voi
 }
 
 static int test_fallback_telemetry_tracks_scene_and_lifetime_state(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderBridgeSnapshot snapshot = { 0 };
 
     guest_render_bridge_test_reset();
@@ -226,8 +212,7 @@ static int test_fallback_telemetry_tracks_scene_and_lifetime_state(void) {
 }
 
 static int test_sequential_producers_no_nesting_and_finalize_order(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle first = { 0 };
@@ -274,8 +259,7 @@ static int test_sequential_producers_no_nesting_and_finalize_order(void) {
 }
 
 static int test_packet_bindings_span_lookup_and_repeated_present(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle first_handle = { 0 };
@@ -357,8 +341,7 @@ static int test_packet_bindings_span_lookup_and_repeated_present(void) {
 }
 
 static int test_packet_binding_duplicates_fail_closed(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -374,7 +357,6 @@ static int test_packet_binding_duplicates_fail_closed(void) {
           GUEST_RENDER_DUPLICATE_PACKET_ADDRESS);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason ==
           GUEST_RENDER_FALLBACK_DUPLICATE_PACKET_ADDRESS);
@@ -389,7 +371,6 @@ static int test_packet_binding_duplicates_fail_closed(void) {
           GUEST_RENDER_DUPLICATE_PRIMITIVE_INDEX);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason ==
           GUEST_RENDER_FALLBACK_DUPLICATE_PRIMITIVE_INDEX);
@@ -402,15 +383,13 @@ static int test_packet_binding_duplicates_fail_closed(void) {
           GUEST_RENDER_INVALID_ARGUMENT);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_INVALID_PACKET_ADDRESS);
     return 1;
 }
 
 static int test_packet_binding_capacity_and_stale_handles_fail_closed(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -434,7 +413,6 @@ static int test_packet_binding_capacity_and_stale_handles_fail_closed(void) {
               (uint32_t)capacity) == GUEST_RENDER_BINDING_CAPACITY_EXCEEDED);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_BINDING_CAPACITY);
 
@@ -450,7 +428,6 @@ static int test_packet_binding_capacity_and_stale_handles_fail_closed(void) {
           GUEST_RENDER_STALE_HANDLE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_STALE_HANDLE);
 
     guest_render_bridge_test_reset();
@@ -464,16 +441,13 @@ static int test_packet_binding_capacity_and_stale_handles_fail_closed(void) {
           GUEST_RENDER_STALE_HANDLE);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode == GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_STALE_HANDLE);
     return 1;
 }
 
 static int test_scene_reset_clears_completed_state_and_open_state_falls_back(void) {
-    GuestRenderSceneConfig native_config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                        GUEST_RENDER_RENDER_NATIVE);
-    GuestRenderSceneConfig original_config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                          GUEST_RENDER_RENDER_ORIGINAL);
+    GuestRenderSceneConfig native_config = scene_config(GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig original_config = scene_config(GUEST_RENDER_RENDER_ORIGINAL);
     GuestRenderVisualStateId id = { 0 };
     GuestRenderVisualStateId after_reset = { 0 };
     GuestRenderCompletedState completed = { 0 };
@@ -489,7 +463,6 @@ static int test_scene_reset_clears_completed_state_and_open_state_falls_back(voi
     CHECK(snapshot.slot_count == 0u);
     CHECK(guest_render_bridge_present(&completed) ==
           GUEST_RENDER_NO_COMPLETED_STATE);
-    CHECK(snapshot.modes.requested_timing_mode == GUEST_RENDER_TIMING_ORIGINAL);
     CHECK(snapshot.modes.requested_render_mode == GUEST_RENDER_RENDER_ORIGINAL);
 
     guest_render_bridge_test_reset();
@@ -498,8 +471,6 @@ static int test_scene_reset_clears_completed_state_and_open_state_falls_back(voi
     CHECK(read_snapshot(&snapshot));
     CHECK(!snapshot.state_open);
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_SCENE_RESET);
     guest_render_bridge_force_original(GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
@@ -514,8 +485,7 @@ static int test_scene_reset_clears_completed_state_and_open_state_falls_back(voi
 }
 
 static int test_scene_reset_and_abort_clear_packet_bindings(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -533,8 +503,6 @@ static int test_scene_reset_and_abort_clear_packet_bindings(void) {
     CHECK(guest_render_bridge_begin_scene(&config) == GUEST_RENDER_OK);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_SCENE_RESET);
 
@@ -551,8 +519,6 @@ static int test_scene_reset_and_abort_clear_packet_bindings(void) {
     guest_render_bridge_abort_scene(GUEST_RENDER_FALLBACK_FORCED_ORIGINAL);
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_NONE);
     CHECK(guest_render_bridge_get_completed_binding(completed, 0u, &binding) ==
@@ -561,8 +527,7 @@ static int test_scene_reset_and_abort_clear_packet_bindings(void) {
 }
 
 static int test_abort_scene_clears_all_state_and_requires_new_scene(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -581,8 +546,6 @@ static int test_abort_scene_clears_all_state_and_requires_new_scene(void) {
     CHECK(!snapshot.state_open);
     CHECK(!snapshot.producer_open);
     CHECK(snapshot.slot_count == 0u);
-    CHECK(snapshot.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_NONE);
     CHECK(guest_render_bridge_present(&completed) ==
@@ -604,8 +567,7 @@ static int test_abort_scene_clears_all_state_and_requires_new_scene(void) {
 }
 
 static int test_slot_capacity_clears_native_slots(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -632,8 +594,7 @@ static int test_slot_capacity_clears_native_slots(void) {
 }
 
 static int test_wrong_id_stale_handle_and_invalid_provenance_fail_closed(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderVisualStateId wrong_id = { 0 };
@@ -691,8 +652,7 @@ static int test_wrong_id_stale_handle_and_invalid_provenance_fail_closed(void) {
 }
 
 static int test_counter_exhaustion_never_wraps(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                 GUEST_RENDER_RENDER_ORIGINAL);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_ORIGINAL);
     GuestRenderVisualStateId first = { 0 };
     GuestRenderVisualStateId second = { 0 };
     GuestRenderCompletedState completed = { 0 };
@@ -726,8 +686,7 @@ static int test_counter_exhaustion_never_wraps(void) {
 }
 
 static int test_null_arguments_are_rejected(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_ORIGINAL,
-                                                 GUEST_RENDER_RENDER_ORIGINAL);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_ORIGINAL);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -780,8 +739,7 @@ static int wrong_thread_begin_state(void *userdata) {
 }
 
 static int test_wrong_thread_poison_does_not_create_a_state(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderBridgeSnapshot before = { 0 };
     GuestRenderBridgeSnapshot after = { 0 };
     GuestRenderVisualStateId id = { 0 };
@@ -803,10 +761,7 @@ static int test_wrong_thread_poison_does_not_create_a_state(void) {
     CHECK(!after.state_open);
     CHECK(!after.producer_open);
     CHECK(after.slot_count == 0u);
-    CHECK(after.modes.requested_timing_mode == before.modes.requested_timing_mode);
     CHECK(after.modes.requested_render_mode == before.modes.requested_render_mode);
-    CHECK(after.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(after.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(after.fallback_reason == GUEST_RENDER_FALLBACK_WRONG_THREAD);
     CHECK(guest_render_bridge_begin_state(&id) == GUEST_RENDER_OK);
@@ -829,8 +784,7 @@ static int wrong_thread_bind_packet(void *userdata) {
 }
 
 static int test_wrong_thread_poison_clears_packet_bindings(void) {
-    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_TIMING_NATIVE_59_94,
-                                                 GUEST_RENDER_RENDER_NATIVE);
+    GuestRenderSceneConfig config = scene_config(GUEST_RENDER_RENDER_NATIVE);
     GuestRenderProducerProvenance provenance = native_provenance();
     GuestRenderVisualStateId id = { 0 };
     GuestRenderProducerHandle handle = { 0 };
@@ -855,8 +809,6 @@ static int test_wrong_thread_poison_clears_packet_bindings(void) {
     CHECK(read_snapshot(&snapshot));
     CHECK(snapshot.binding_count == 0u);
     CHECK(snapshot.producer_open);
-    CHECK(snapshot.modes.effective_timing_mode ==
-          GUEST_RENDER_TIMING_NATIVE_59_94);
     CHECK(snapshot.modes.effective_render_mode == GUEST_RENDER_RENDER_NATIVE);
     CHECK(snapshot.fallback_reason == GUEST_RENDER_FALLBACK_WRONG_THREAD);
     return 1;
@@ -872,7 +824,6 @@ typedef struct InitialClaimRace {
     unsigned int completed;
     atomic_bool stop;
     atomic_int status[2];
-    atomic_int effective_timing[2];
     atomic_int effective_render[2];
     atomic_int fallback_reason[2];
 } InitialClaimRace;
@@ -916,9 +867,6 @@ static int initial_claim_worker(void *userdata) {
 
             SDL_UnlockMutex(race->mutex);
             if (guest_render_bridge_snapshot(&snapshot) != GUEST_RENDER_OK) return 1;
-            atomic_store_explicit(&race->effective_timing[worker->index],
-                                  snapshot.modes.effective_timing_mode,
-                                  memory_order_relaxed);
             atomic_store_explicit(&race->effective_render[worker->index],
                                   snapshot.modes.effective_render_mode,
                                   memory_order_relaxed);
@@ -935,7 +883,7 @@ static int initial_claim_worker(void *userdata) {
 
 static int test_simultaneous_initial_owner_claim_preserves_poison(void) {
     InitialClaimRace race = {
-        .config = { GUEST_RENDER_TIMING_NATIVE_59_94, GUEST_RENDER_RENDER_NATIVE },
+        .config = { GUEST_RENDER_RENDER_NATIVE },
     };
     InitialClaimWorker workers[] = {
         { &race, 0u },
@@ -986,10 +934,7 @@ static int test_simultaneous_initial_owner_claim_preserves_poison(void) {
             result = 0;
             break;
         }
-        if (atomic_load_explicit(&race.effective_timing[owner_index],
-                                 memory_order_relaxed) !=
-                GUEST_RENDER_TIMING_NATIVE_59_94 ||
-            atomic_load_explicit(&race.effective_render[owner_index],
+        if (atomic_load_explicit(&race.effective_render[owner_index],
                                  memory_order_relaxed) !=
                 GUEST_RENDER_RENDER_NATIVE ||
             atomic_load_explicit(&race.fallback_reason[owner_index],

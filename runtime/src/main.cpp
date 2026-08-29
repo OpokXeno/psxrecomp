@@ -51,7 +51,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "xg_render_auth_runtime_control.h"
 #include "xg_render_runtime_host_services.h"
 #include "frame_pacing.h"
-#include "xenogears_timing.h"
+#include "xenogears_scene.h"
 #include "latency_ring.h"
 #include "input_replay.h"
 #include "host_input_mapping.h"
@@ -1011,10 +1011,8 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
 }
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
-    extern void psx_xenogears_field_resident_invalidate(void);
-    psx_xenogears_timing_on_savestate_loaded();
+    psx_xenogears_scene_reset();
     psx_xg_render_auth_scene_boundary();
-    psx_xenogears_field_resident_invalidate();
     mod_runtime_on_savestate_loaded();
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
@@ -6311,12 +6309,12 @@ struct NetplayVblankEpilogue {
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
     const uint32_t previous_scene_generation =
-        psx_xenogears_timing_scene_generation();
+        psx_xenogears_scene_generation();
 
     input_replay::note_guest_vblank();
     input_replay::record_note_guest_vblank();
-    psx_xenogears_timing_vblank_boundary(mdec_recently_active(2));
-    if (psx_xenogears_timing_scene_generation() !=
+    psx_xenogears_scene_vblank_boundary(mdec_recently_active(2));
+    if (psx_xenogears_scene_generation() !=
         previous_scene_generation)
         psx_xg_render_auth_scene_boundary();
     gl_renderer_native_midpoint_set_suspended(
@@ -6602,12 +6600,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     extern int fntrace_is_game_started(void);
 
     if (input_replay::active() || input_replay::recording()) {
-        XgTimingScene scene;
+        XgScene scene;
         SioPadReceipt receipt;
         CDROMDebugState cd{};
         int overlay_active = 0, overlay_registered = 0, overlay_regions_checked = 0;
         int overlay_file_found = 0;
-        psx_xenogears_timing_read_scene(&scene);
+        psx_xenogears_read_scene(&scene);
         sio_get_pad_receipt(&receipt);
         cdrom_debug_snapshot(&cd);
         const int fmv_active = mdec_recently_active(2);
@@ -11211,9 +11209,6 @@ int main(int argc, char** argv) {
     bool        cli_record_on_close = false;
     uint16_t    cli_record_stop_field = 0;
     uint64_t    cli_record_max_vblanks = 0;
-    NativeFpsStartupPolicy native_fps_policy = {
-        NATIVE_FPS_MODE_ORIGINAL, NATIVE_FPS_STARTUP_ORIGINAL_DEFAULT, 0
-    };
     PsxNetplayConfig net_cfg;
     psx_netplay_config_defaults(&net_cfg);
     psx_netplay_apply_env(&net_cfg);  /* CLI flags below win over env */
@@ -11274,11 +11269,6 @@ int main(int argc, char** argv) {
             if (parsed <= UINT16_MAX) cli_record_stop_field = static_cast<uint16_t>(parsed);
         } else if (std::strcmp(argv[i], "--record-max-vblanks") == 0 && i + 1 < argc) {
             cli_record_max_vblanks = std::strtoull(argv[++i], nullptr, 0);
-        } else if (std::strcmp(argv[i], "--native-fps") == 0 && i + 1 < argc) {
-            const char *mode = argv[++i];
-            native_fps_policy.requested_mode = std::strcmp(mode, "native_59_94") == 0
-                ? NATIVE_FPS_MODE_NATIVE_59_94 : NATIVE_FPS_MODE_ORIGINAL;
-            native_fps_policy.startup_reason = NATIVE_FPS_STARTUP_EXPLICIT;
         } else if (std::strcmp(argv[i], "--render-mode") == 0 && i + 1 < argc) {
             cli_render_mode = argv[++i];
         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
@@ -11342,8 +11332,7 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "%s\n", digest.c_str());
         return 0;
     }
-    psx_xenogears_timing_set_startup_policy(&native_fps_policy);
-    psx_xenogears_timing_reset(XG_TIMING_REASON_BOOT);
+    psx_xenogears_scene_reset();
     if (const char *e = std::getenv("PSX_HEADLESS")) {
         if (e[0] && e[0] != '0') {
             g_headless = 1;
@@ -14133,10 +14122,6 @@ session_reboot:
             cli_render_mode);
         const bool wide_requested =
             g_video_aspect_num * 3 != g_video_aspect_den * 4;
-        const GuestRenderTimingMode timing_mode =
-            native_fps_policy.requested_mode == NATIVE_FPS_MODE_NATIVE_59_94
-                ? GUEST_RENDER_TIMING_NATIVE_59_94
-                : GUEST_RENDER_TIMING_ORIGINAL;
         const XgRenderRuntimeHostServices render_host_services = {
             xg_render_host_frame_count,
             psx_read_word,
@@ -14168,7 +14153,7 @@ session_reboot:
         if (!xg_render_runtime_configure_host_services(&render_host_services))
             return 1;
         if (!psx_xg_render_auth_configure(
-                timing_mode, render_mode,
+                render_mode,
                 native_render_presentation_gate, nullptr)) {
             std::fprintf(stderr,
                          "psxrecomp: native render authentication runtime configuration failed\n");

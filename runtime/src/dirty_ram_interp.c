@@ -37,7 +37,6 @@
 #include "overlay_capture.h"
 #include "memory.h"
 #include "starvation_ring.h"
-#include "xenogears_field_hook.h"
 #include "xg_render_auth_runtime_hooks.h"
 #include "fntrace.h"  /* fntrace_is_game_started / fntrace_mark_game_started */
 
@@ -2072,9 +2071,6 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     {
         uint32_t widened = 0;
         uint32_t a = cpu->gpr[rs];
-        if (pc == 0x800758E4u && insn == 0x24630002u)
-            simm = psx_xenogears_field_frame_step(
-                pc, insn, simm, cpu->gpr[17], XG_FIELD_TIER_COLD_INTERPRETER);
         if (psx_ws_semantic_cull_site(pc) == PSX_WS_CULL_SEMANTIC_SCREEN_BIAS)
             cpu->gpr[rt] = psx_ws_guest_cull_screen_bias(
                 a, simm);

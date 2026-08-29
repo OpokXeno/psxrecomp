@@ -175,11 +175,6 @@ const char* render_mode_name(GuestRenderRenderMode mode) {
     }
 }
 
-const char* timing_mode_name(GuestRenderTimingMode mode) {
-    return mode == GUEST_RENDER_TIMING_NATIVE_59_94
-        ? "native_59_94" : "original";
-}
-
 const char* render_fallback_name(GuestRenderFallbackReason reason) {
     switch (reason) {
     case GUEST_RENDER_FALLBACK_NONE: return "none";
@@ -1869,9 +1864,7 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     GuestRenderBridgeSnapshot render_bridge{};
     if (guest_render_bridge_snapshot(&render_bridge) == GUEST_RENDER_OK) {
         render_bridge_snapshot_valid = true;
-        if (render_modes.requested_timing_mode !=
-                render_bridge.modes.requested_timing_mode ||
-            render_modes.requested_render_mode !=
+        if (render_modes.requested_render_mode !=
                 render_bridge.modes.requested_render_mode) {
             render_modes = render_bridge.modes;
         }
@@ -1977,8 +1970,6 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     const bool render_mode_pass = !render_fallback_count_overflowed &&
         render_scene_fallback_count_delta == 0u &&
         render_scene_fallback == GUEST_RENDER_FALLBACK_NONE &&
-        render_modes.requested_timing_mode ==
-            render_modes.effective_timing_mode &&
         render_mode_identity_pass &&
         (render_modes.requested_render_mode ==
              GUEST_RENDER_RENDER_NATIVE
@@ -2025,9 +2016,7 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
         }
         output << ']';
     };
-    output << "{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\",\"timing_mode\":\""
-           << timing_mode_name(render_modes.requested_timing_mode)
-           << "\",\"render_mode\":\""
+    output << "{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\",\"render_mode\":\""
            << render_mode_name(render_modes.requested_render_mode);
     if (replay.checkpoint_configured)
         output << "\",\"checkpoint\":{\"field_id\":"
@@ -2035,11 +2024,7 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     else
         output << "\",\"completion\":\"trace_complete\",\"checkpoint\":null";
     output << ",\"backend\":\"" << backend
-           << "\",\"native_render\":{\"requested_timing_mode\":\""
-           << timing_mode_name(render_modes.requested_timing_mode)
-           << "\",\"effective_timing_mode\":\""
-           << timing_mode_name(render_modes.effective_timing_mode)
-           << "\",\"requested_render_mode\":\""
+           << "\",\"native_render\":{\"requested_render_mode\":\""
            << render_mode_name(render_modes.requested_render_mode)
            << "\",\"effective_render_mode\":\""
            << render_mode_name(render_modes.effective_render_mode)

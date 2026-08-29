@@ -918,35 +918,11 @@ if(BUILD_TESTING)
     add_test(NAME debug_overlay_data_test
              COMMAND debug_overlay_data_test "${XG_GAME_ROOT}")
 
-    add_executable(game_fps_meter_test
-        tests/test_game_fps_meter.c
-        src/game_fps_meter.c)
-    target_include_directories(game_fps_meter_test PRIVATE
-        include ${PSX_SDL_INCLUDE_DIRS})
-    target_compile_definitions(game_fps_meter_test PRIVATE
-        $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>
-        $<$<BOOL:${PSX_SDL3}>:SDL_ENABLE_OLD_NAMES=1>)
-    target_link_libraries(game_fps_meter_test PRIVATE ${PSX_SDL_LIBRARIES})
-    add_test(NAME game_fps_meter_test COMMAND game_fps_meter_test)
-
-    add_executable(native_fps_route_capture_overlay_provenance_test
-        tests/test_native_fps_route_capture_overlay_provenance.c)
-    target_include_directories(native_fps_route_capture_overlay_provenance_test
-        PRIVATE include)
-    add_test(NAME native_fps_route_capture_overlay_provenance_test
-             COMMAND native_fps_route_capture_overlay_provenance_test)
-
-    add_executable(xenogears_field_hook_test
-        tests/test_xenogears_field_hook.c
-        src/xenogears_field_hook.c)
-    target_include_directories(xenogears_field_hook_test PRIVATE include)
-    add_test(NAME xenogears_field_hook_test COMMAND xenogears_field_hook_test)
-
-    add_executable(xenogears_timing_test
-        tests/test_xenogears_timing.c
-        src/xenogears_timing.c)
-    target_include_directories(xenogears_timing_test PRIVATE include)
-    add_test(NAME xenogears_timing_test COMMAND xenogears_timing_test)
+    add_executable(xenogears_scene_test
+        tests/test_xenogears_scene.c
+        src/xenogears_scene.c)
+    target_include_directories(xenogears_scene_test PRIVATE include)
+    add_test(NAME xenogears_scene_test COMMAND xenogears_scene_test)
 
     # These scripts drive an already-built Xenogears runtime or recompiler and
     # are not hermetic framework-runtime tests. Keep them registered and visible
@@ -966,12 +942,6 @@ if(BUILD_TESTING)
         set_tests_properties(xg_${_t}_test PROPERTIES DISABLED TRUE)
     endforeach()
 
-    add_test(NAME xenogears_resident_codegen_test
-             COMMAND ${Python3_EXECUTABLE}
-                     ${PSXRECOMP_ROOT}/recompiler/tests/test_xenogears_resident_codegen.py
-                     --recompiler
-                     ${PSXRECOMP_ROOT}/recompiler/build/psxrecomp-game)
-    set_tests_properties(xenogears_resident_codegen_test PROPERTIES DISABLED TRUE)
 
 endif()
 

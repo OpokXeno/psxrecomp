@@ -211,18 +211,6 @@ void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
 
 void psx_advance_cycles(uint32_t cycles) { (void)cycles; }
 uint64_t psx_get_cycle_count(void) { return 0; }
-int32_t psx_xenogears_field_frame_step(uint32_t site_pc,
-                                       uint32_t instruction_word,
-                                       int32_t immediate,
-                                       uint32_t register_value,
-                                       uint32_t frame_count) {
-    (void)site_pc;
-    (void)instruction_word;
-    (void)immediate;
-    (void)register_value;
-    (void)frame_count;
-    return immediate;
-}
 int psx_cycle_replay_begin(uint64_t cycle) { (void)cycle; return 1; }
 uint64_t psx_cycle_replay_end(void) { return 0; }
 uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr, uint32_t rt,

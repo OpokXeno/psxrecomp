@@ -213,6 +213,12 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-29 (Retired Xenogears native-fps runtime path):** Removed the
+  obsolete Native FPS timing axis, field-frame hook, FPS meter, and startup
+  option while retaining guest Field cadence, interpolation, and Native
+  rendering as independent concerns. Scene tracking used by replay now lives
+  in `xenogears_scene.{h,c}`; the Native renderer configuration and public
+  replay evidence expose only `render_mode`.
 - **2026-08-25 (Static AOT routing/capture audit):** A direct 6,024-frame
   Xenogears replay completed `trace_complete`/`PASS`. At frame 1,090 the linked
   dispatcher had served 700,403 exact static hits while
@@ -1089,7 +1095,7 @@ on a fixed region -> next.
   requires the exact `current,current,midpoint,current,current` ring sequence;
   the Debug executable and focused test rebuilt, and the test passes.
 - **2026-08-13 (Manual Native 30->60 visual proof):** Ran the rebuilt Debug
-  executable manually with `PSX_SMOOTH_60FPS=1`, `--native-fps original`,
+  executable manually with `PSX_SMOOTH_60FPS=1`,
   `--render-mode native`, OpenGL, 16:9, and no replay. A parallel TCP observer
   sampled the existing midpoint/workload, GL-present, and latency rings until
   the user closed the game at frame 6,993, without enabling the expensive

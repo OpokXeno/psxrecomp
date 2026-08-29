@@ -327,11 +327,9 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
     int i;
     OvEntry *e;
     extern int fntrace_is_game_started(void);
-    extern void psx_xenogears_field_resident_dma(uint32_t, uint32_t);
     extern void psx_xg_render_auth_note_code_write(uint64_t, uint64_t,
                                                     uint32_t, uint32_t);
 
-    psx_xenogears_field_resident_dma(load_addr, size);
     psx_xg_render_auth_note_code_write(0u, 1u, load_addr, size);
 
     if (!s_enabled) return;   /* overlay cache disabled in config */

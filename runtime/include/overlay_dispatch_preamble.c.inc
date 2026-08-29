@@ -300,14 +300,6 @@ uint32_t psx_ws_angle_widen(uint32_t vanilla) {
 void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
 }
-int32_t psx_xenogears_field_frame_step(uint32_t site_pc, uint32_t instruction_word,
-                                        int32_t original_step, uint32_t frame_token,
-                                        uint32_t tier) {
-    overlay_flush_cycles();
-    return g_cbs.xg_field_frame_step
-        ? g_cbs.xg_field_frame_step(site_pc, instruction_word, original_step, frame_token, tier)
-        : original_step;
-}
 void psx_xg_render_auth(CPUState *cpu, uint32_t hook, uint32_t pc,
                         uint32_t instruction_word, uint32_t delay_slot_word) {
     if (g_cbs.xg_render_auth)
