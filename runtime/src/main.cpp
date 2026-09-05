@@ -11178,9 +11178,15 @@ namespace {
 #endif
 
 int main(int argc, char** argv) {
-    /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    /* Force line-buffered output so messages appear even if killed.
+     * MSVC's UCRT invalid-parameter validation fast-fails setvbuf() when
+     * size==0 is paired with a buffering mode other than _IONBF (glibc/MinGW
+     * happily treat size 0 + NULL buffer as "pick a default size" for
+     * _IOLBF/_IOFBF; UCRT does not) -- pass a real buffer size so this
+     * behaves the same, and doesn't crash before any diagnostic output can
+     * even be printed, on every platform. */
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+    std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
 #if defined(RECOMP_LAUNCHER)
