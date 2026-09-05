@@ -278,7 +278,11 @@ static inline void exec_pc_table_record(uint32_t pc) {
             uint32_t page = phys >> 12;
             g_dirty_ram_exec_page_bitmap[page >> 5] |= 1u << (page & 31u);
         }
+#if defined(__GNUC__) || defined(__clang__)
         if (__builtin_expect(g_overlay_capture_private_execution_enabled, 0))
+#else
+        if (g_overlay_capture_private_execution_enabled)
+#endif
             overlay_capture_private_note_execution(pc);
     }
 }
