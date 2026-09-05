@@ -1757,8 +1757,11 @@ function(psxrecomp_add_runtime_target target)
         target_compile_options(${target} PRIVATE /GS- /guard:cf-)
         # Visual Studio project files cannot represent language-specific target
         # options on a mixed C/C++ target. Scope the experimental MSVC atomics
-        # switch to the one C source that needs it instead.
-        set_property(SOURCE ${PSXRECOMP_ROOT}/runtime/src/audio_trace.c
+        # switch to just the C sources that include <stdatomic.h> instead.
+        set_property(SOURCE
+            ${PSXRECOMP_ROOT}/runtime/src/audio_trace.c
+            ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
+            ${PSXRECOMP_ROOT}/runtime/src/guest_render_bridge.c
             APPEND PROPERTY COMPILE_OPTIONS /experimental:c11atomics)
         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
         # No console window in Release MSVC builds. /ENTRY keeps main() as
