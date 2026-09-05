@@ -6177,13 +6177,19 @@ int gpu_native_semantic_from_gp0(
     semi_transparent = (words[0] >> 25u) & 1u;
 
     switch (opcode) {
-    case 0x20u ... 0x23u:
+    case 0x20u:
+    case 0x21u:
+    case 0x22u:
+    case 0x23u:
         if (word_count < 4) return -1;
         color[0] = color[1] = color[2] = words[0] & 0x00ffffffu;
         for (int i = 0; i < 3; ++i)
             native_semantic_parse_position(environment, words[1 + i], &x[i], &y[i]);
         break;
-    case 0x24u ... 0x27u:
+    case 0x24u:
+    case 0x25u:
+    case 0x26u:
+    case 0x27u:
         if (word_count < 7) return -1;
         textured = 1; raw_texture = opcode & 1u;
         color[0] = color[1] = color[2] = words[0] & 0x00ffffffu;
@@ -6194,13 +6200,19 @@ int gpu_native_semantic_from_gp0(
             native_semantic_parse_texcoord(words[2 + i * 2], &u[i], &v[i]);
         }
         break;
-    case 0x28u ... 0x2bu:
+    case 0x28u:
+    case 0x29u:
+    case 0x2au:
+    case 0x2bu:
         if (word_count < 5) return -1;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
         for (int i = 0; i < 4; ++i)
             native_semantic_parse_position(environment, words[1 + i], &x[i], &y[i]);
         break;
-    case 0x2cu ... 0x2fu:
+    case 0x2cu:
+    case 0x2du:
+    case 0x2eu:
+    case 0x2fu:
         if (word_count < 9) return -1;
         textured = 1; raw_texture = opcode & 1u;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
@@ -6211,7 +6223,10 @@ int gpu_native_semantic_from_gp0(
             native_semantic_parse_texcoord(words[2 + i * 2], &u[i], &v[i]);
         }
         break;
-    case 0x30u ... 0x33u:
+    case 0x30u:
+    case 0x31u:
+    case 0x32u:
+    case 0x33u:
         if (word_count < 6) return -1;
         shading = GPU_RENDER_SHADING_GOURAUD;
         for (int i = 0; i < 3; ++i) {
@@ -6219,7 +6234,10 @@ int gpu_native_semantic_from_gp0(
             native_semantic_parse_position(environment, words[1 + i * 2], &x[i], &y[i]);
         }
         break;
-    case 0x34u ... 0x37u:
+    case 0x34u:
+    case 0x35u:
+    case 0x36u:
+    case 0x37u:
         if (word_count < 9) return -1;
         textured = 1; raw_texture = opcode & 1u;
         shading = GPU_RENDER_SHADING_GOURAUD;
@@ -6231,7 +6249,10 @@ int gpu_native_semantic_from_gp0(
             native_semantic_parse_texcoord(words[2 + i * 3], &u[i], &v[i]);
         }
         break;
-    case 0x38u ... 0x3bu:
+    case 0x38u:
+    case 0x39u:
+    case 0x3au:
+    case 0x3bu:
         if (word_count < 8) return -1;
         shading = GPU_RENDER_SHADING_GOURAUD;
         for (int i = 0; i < 4; ++i) {
@@ -6239,7 +6260,10 @@ int gpu_native_semantic_from_gp0(
             native_semantic_parse_position(environment, words[1 + i * 2], &x[i], &y[i]);
         }
         break;
-    case 0x3cu ... 0x3fu:
+    case 0x3cu:
+    case 0x3du:
+    case 0x3eu:
+    case 0x3fu:
         if (word_count < 12) return -1;
         textured = 1; raw_texture = opcode & 1u;
         shading = GPU_RENDER_SHADING_GOURAUD;
@@ -6251,7 +6275,10 @@ int gpu_native_semantic_from_gp0(
             native_semantic_parse_texcoord(words[2 + i * 3], &u[i], &v[i]);
         }
         break;
-    case 0x60u ... 0x63u:
+    case 0x60u:
+    case 0x61u:
+    case 0x62u:
+    case 0x63u:
         if (word_count < 3) return -1;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
         native_semantic_parse_position(environment, words[1], &x[0], &y[0]);
@@ -6261,7 +6288,10 @@ int gpu_native_semantic_from_gp0(
         y[2] = y[0] + (int32_t)((words[2] >> 16u) & 0x1ffu);
         x[3] = x[1]; y[3] = y[2];
         break;
-    case 0x64u ... 0x67u:
+    case 0x64u:
+    case 0x65u:
+    case 0x66u:
+    case 0x67u:
         if (word_count < 4) return -1;
         textured = 1; raw_texture = opcode & 1u;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
@@ -6274,14 +6304,20 @@ int gpu_native_semantic_from_gp0(
         u[2] = u[0]; v[2] = v[0] + (int32_t)((words[3] >> 16u) & 0x1ffu);
         x[3] = x[1]; y[3] = y[2]; u[3] = u[1]; v[3] = v[2];
         break;
-    case 0x68u ... 0x6bu:
+    case 0x68u:
+    case 0x69u:
+    case 0x6au:
+    case 0x6bu:
         if (word_count < 2) return -1;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
         native_semantic_parse_position(environment, words[1], &x[0], &y[0]);
         x[1] = x[0] + 1; y[1] = y[0]; x[2] = x[0]; y[2] = y[0] + 1;
         x[3] = x[1]; y[3] = y[2];
         break;
-    case 0x6cu ... 0x6fu:
+    case 0x6cu:
+    case 0x6du:
+    case 0x6eu:
+    case 0x6fu:
         if (word_count < 3) return -1;
         textured = 1; raw_texture = opcode & 1u;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
@@ -6292,14 +6328,20 @@ int gpu_native_semantic_from_gp0(
         x[3] = x[1]; y[3] = y[2]; u[3] = u[1]; v[3] = v[2];
         native_semantic_parse_clut(words[2], &clut_x, &clut_y);
         break;
-    case 0x70u ... 0x73u:
+    case 0x70u:
+    case 0x71u:
+    case 0x72u:
+    case 0x73u:
         if (word_count < 2) return -1;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
         native_semantic_parse_position(environment, words[1], &x[0], &y[0]);
         x[1] = x[0] + 8; y[1] = y[0]; x[2] = x[0]; y[2] = y[0] + 8;
         x[3] = x[1]; y[3] = y[2];
         break;
-    case 0x74u ... 0x77u:
+    case 0x74u:
+    case 0x75u:
+    case 0x76u:
+    case 0x77u:
         if (word_count < 3) return -1;
         textured = 1; raw_texture = opcode & 1u;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
@@ -6310,14 +6352,20 @@ int gpu_native_semantic_from_gp0(
         x[3] = x[1]; y[3] = y[2]; u[3] = u[1]; v[3] = v[2];
         native_semantic_parse_clut(words[2], &clut_x, &clut_y);
         break;
-    case 0x78u ... 0x7bu:
+    case 0x78u:
+    case 0x79u:
+    case 0x7au:
+    case 0x7bu:
         if (word_count < 2) return -1;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
         native_semantic_parse_position(environment, words[1], &x[0], &y[0]);
         x[1] = x[0] + 16; y[1] = y[0]; x[2] = x[0]; y[2] = y[0] + 16;
         x[3] = x[1]; y[3] = y[2];
         break;
-    case 0x7cu ... 0x7fu:
+    case 0x7cu:
+    case 0x7du:
+    case 0x7eu:
+    case 0x7fu:
         if (word_count < 3) return -1;
         textured = 1; raw_texture = opcode & 1u;
         color[0] = color[1] = color[2] = color[3] = words[0] & 0x00ffffffu;
