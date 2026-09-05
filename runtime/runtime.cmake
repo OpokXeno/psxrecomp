@@ -1598,7 +1598,14 @@ function(psxrecomp_add_runtime_target target)
     if(WIN32 OR MINGW)
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
-        target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
+        # iphlpapi: main.cpp's ae_np_collect_local_addresses() calls
+        # GetAdaptersAddresses() unconditionally on WIN32 (local-IP display
+        # works even with netplay off), so this target needs it directly —
+        # it cannot rely on recomp_net's PUBLIC iphlpapi link, since
+        # recomp_net is only linked in when PSXRECOMP_HAS_RECOMP_NET is true
+        # (PSX_NETPLAY is OFF by default), leaving a default MSVC build with
+        # an unresolved __imp_GetAdaptersAddresses at link time otherwise.
+        target_link_libraries(${target} PRIVATE ws2_32 iphlpapi dbghelp comdlg32 opengl32)
         # Newer mingw-w64 maps clock_gettime → clock_gettime64 in libwinpthread.
         # Link it even when netplay code prefers Win32 clocks, so any residual
         # POSIX time refs (third-party / debug tools) resolve under -static.
