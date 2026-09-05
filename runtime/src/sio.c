@@ -44,23 +44,24 @@ static void sio_debug_poll_maybe(void) {
 }
 
 /* Pad state: 0=pressed, 1=released (PS1 convention). Indexed by LOGICAL pad
- * 0 .. PSX_MAX_PLAYERS-1 (not physical SIO slot). */
-static uint16_t pad_buttons[PSX_MAX_PLAYERS] = { [0 ... PSX_MAX_PLAYERS - 1] = 0xFFFF };
+ * 0 .. PSX_MAX_PLAYERS-1 (not physical SIO slot).
+ *
+ * These start zeroed and get their real values (0xFFFF / 0x80 / 0xFF) from
+ * sio_init()'s memset/loop below before any SIO command can observe them —
+ * sio_init runs on every boot and soft reset, so a GNU-only designated-range
+ * initializer here (unsupported by MSVC) is not needed. */
+static uint16_t pad_buttons[PSX_MAX_PLAYERS];
 
 /* Per-logical-pad type + analog stick state. analog: 0=digital pad (poll id
  * 0x41), 1=DualShock/analog (poll id 0x73). Sticks are 0..255, 0x80 centred. */
 static PSX_BSS uint8_t pad_analog[PSX_MAX_PLAYERS];
-static uint8_t pad_stick[PSX_MAX_PLAYERS][4] = {
-    [0 ... PSX_MAX_PLAYERS - 1] = { 0x80, 0x80, 0x80, 0x80 }
-}; /* lx,ly,rx,ry */
+static uint8_t pad_stick[PSX_MAX_PLAYERS][4]; /* lx,ly,rx,ry */
 
 /* DualShock command 0x4D maps the six writable bytes in a 0x42 poll onto the
  * two motors: 0x00 = small/high-frequency, 0x01 = large/low-frequency,
  * 0xFF = unused. The map powers up unassigned and is echoed back while a new
  * map is latched, matching the physical pad/Mednafen protocol. */
-static uint8_t pad_rumble_map[PSX_MAX_PLAYERS][6] = {
-    [0 ... PSX_MAX_PLAYERS - 1] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
-};
+static uint8_t pad_rumble_map[PSX_MAX_PLAYERS][6];
 static PSX_BSS uint8_t pad_rumble_small[PSX_MAX_PLAYERS];
 static PSX_BSS uint8_t pad_rumble_large[PSX_MAX_PLAYERS];
 
@@ -133,10 +134,12 @@ static PSX_BSS uint8_t pad_in_config[PSX_MAX_PLAYERS];
  * the SM (wrongly) answered 0x43 for its digital pad it went down the
  * DualShock config path and read the 0x00 config-response bytes as buttons ->
  * phantom "all pressed" input. Default 1 keeps analog/hybrid pads unchanged;
- * main.cpp sets 0 for PAD_MODE_DIGITAL. */
-static uint8_t pad_supports_config[PSX_MAX_PLAYERS] = {
-    [0 ... PSX_MAX_PLAYERS - 1] = 1
-};
+ * main.cpp sets 0 for PAD_MODE_DIGITAL.
+ *
+ * Starts zeroed; sio_init() (below) sets every slot to 1 before any SIO
+ * command can observe it, so a GNU-only designated-range initializer
+ * (unsupported by MSVC) is not needed here. */
+static uint8_t pad_supports_config[PSX_MAX_PLAYERS];
 
 /* Coherent-DualShock model (Tomba phantom-input fix). A real controller never
  * changes its reported type (0x41 digital <-> 0x73 analog) in the middle of a
@@ -148,10 +151,12 @@ static uint8_t pad_supports_config[PSX_MAX_PLAYERS] = {
  * desync the game's pad driver -> phantom/garbage button reads). Instead the
  * host REQUESTS a type via pad_type_req[] and the change is applied atomically
  * only when the bus is idle (PAD_IDLE) and the pad is NOT in config mode. A
- * request raised during config is held until config exits. -1 = no request. */
-static int8_t pad_type_req[PSX_MAX_PLAYERS] = {
-    [0 ... PSX_MAX_PLAYERS - 1] = -1
-};
+ * request raised during config is held until config exits. -1 = no request.
+ *
+ * Starts zeroed; sio_init() (below) sets every slot to -1 before any SIO
+ * command can observe it, so a GNU-only designated-range initializer
+ * (unsupported by MSVC) is not needed here. */
+static int8_t pad_type_req[PSX_MAX_PLAYERS];
 
 /* ---- Logical pad ↔ physical SIO port mapping ----
  *

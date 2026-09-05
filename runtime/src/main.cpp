@@ -671,6 +671,27 @@ static void post_load_probe_live_pc_dump(const char *why) {
     std::fprintf(stderr, "\n");
 }
 
+/* These counters/registers are all defined in C translation units (memory.c,
+ * interrupts.c, overlay_loader.c, psx_bios_backend.c). The post_load_probe
+ * functions below (and a couple of later call sites) redeclare them locally
+ * as plain `extern`, which in a .cpp file gives them C++ linkage/name
+ * mangling instead of matching the C symbol the definition emits — every
+ * other consumer of these globals is itself a .c file, so this mismatch is
+ * invisible everywhere except here. Declaring them here with `extern "C"`
+ * establishes the correct linkage once; the later unqualified `extern`
+ * redeclarations at function scope then refer back to this same C-linkage
+ * entity per the usual redeclaration rules. */
+extern "C" {
+extern uint64_t g_vblank_raise_count, g_vblank_deliver_count, g_vblank_ack_count;
+extern uint64_t g_dirty_ram_blocks_run;
+extern uint64_t g_dirty_ram_insns_run;
+extern uint64_t g_dirty_pump_count;
+extern uint64_t g_guest_store_count;
+extern uint32_t i_stat, i_mask;
+extern int g_psx_dispatch_depth;
+extern int g_call_unit_depth;
+}
+
 static void post_load_probe_arm(void) {
     if (!post_load_probe_env_on()) {
         s_post_load_probe_left = 0;
@@ -11157,9 +11178,15 @@ namespace {
 #endif
 
 int main(int argc, char** argv) {
-    /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    /* Force line-buffered output so messages appear even if killed.
+     * MSVC's UCRT invalid-parameter validation fast-fails setvbuf() when
+     * size==0 is paired with a buffering mode other than _IONBF (glibc/MinGW
+     * happily treat size 0 + NULL buffer as "pick a default size" for
+     * _IOLBF/_IOFBF; UCRT does not) -- pass a real buffer size so this
+     * behaves the same, and doesn't crash before any diagnostic output can
+     * even be printed, on every platform. */
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+    std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
 #if defined(RECOMP_LAUNCHER)
