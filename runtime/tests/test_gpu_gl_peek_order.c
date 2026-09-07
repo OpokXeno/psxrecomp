@@ -1,6 +1,8 @@
 #include "gpu.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_render.h"
+#include "gte_native_provenance.h"
+#include "memory.h"
 
 #include "psx_sdl.h"
 
@@ -33,6 +35,16 @@ void psx_write_word(void) {}
 void text_xlate_vram_upload(void) {}
 void latency_ring_mark(void) {}
 const GpuRenderBackend *vk_backend_get(void) { return NULL; }
+uint32_t memory_get_ram_word_mask(void) {
+    return g_psx_ram_mask & ~UINT32_C(3);
+}
+int gte_native_provenance_load(uint32_t address, uint32_t packed_sxy,
+                               GteNativeVertexProvenance *out) {
+    (void)address;
+    (void)packed_sxy;
+    (void)out;
+    return 0;
+}
 
 enum {
     BLACK_1555 = 0x0000,
@@ -114,6 +126,47 @@ static void test_depth24_transitions_land_pending_uploads(void) {
                  "depth24 exit lands the pending upload");
 }
 
+static void test_guest_readback_is_region_selective(void) {
+    const int second_x = DOT_X + 100;
+    const uint16_t *cpu_vram;
+    uint64_t first_event;
+    uint64_t last_event;
+    int ensure_events = 0;
+
+    reset_gpu_for_case();
+    gr_vram_write(DOT_X, DOT_Y, BLACK_1555);
+    gr_vram_write(second_x, DOT_Y, BLACK_1555);
+    gl_renderer_flush_cpu_uploads();
+
+    gpu_write_gp0(0x68ffffffu);
+    gpu_write_gp0(gp0_xy(DOT_X, DOT_Y));
+    gpu_write_gp0(0x68ffffffu);
+    gpu_write_gp0(gp0_xy(second_x, DOT_Y));
+
+    first_event = gl_renderer_coh_total();
+    expect_pixel(gr_vram_read(DOT_X, DOT_Y), WHITE_1555,
+                 "guest pixel read receives the GPU-authored pixel");
+    last_event = gl_renderer_coh_total();
+    for (uint64_t sequence = first_event; sequence < last_event; ++sequence) {
+        GlCohEvent event;
+        if (!gl_renderer_coh_get(sequence, &event) ||
+            event.kind != GL_COH_ENSURE)
+            continue;
+        ensure_events++;
+        expect_true(event.x0 == DOT_X && event.y0 == DOT_Y &&
+                    event.x1 == DOT_X && event.y1 == DOT_Y,
+                    "guest pixel readback is exactly one requested pixel");
+    }
+    expect_true(ensure_events == 1,
+                "guest pixel read emits one regional readback event");
+
+    cpu_vram = gpu_get_vram();
+    expect_pixel(cpu_vram[DOT_Y * 1024 + second_x], BLACK_1555,
+                 "regional readback leaves a disjoint GPU pixel stale on CPU");
+    expect_pixel(gr_vram_read(second_x, DOT_Y), WHITE_1555,
+                 "disjoint GPU pixel synchronizes on its own read");
+}
+
 int main(void) {
     SDL_Window *window;
 
@@ -146,12 +199,13 @@ int main(void) {
     if (!failures) {
         test_fbo_peek_lands_prior_gp0_primitives();
         test_depth24_transitions_land_pending_uploads();
+        test_guest_readback_is_region_selective();
     }
 
     gl_renderer_shutdown();
     SDL_DestroyWindow(window);
     SDL_Quit();
     if (failures) return 1;
-    puts("PASS: OpenGL FBO peeks preserve GP0 and depth24 transition ordering");
+    puts("PASS: OpenGL peeks preserve ordering and guest readback is regional");
     return 0;
 }

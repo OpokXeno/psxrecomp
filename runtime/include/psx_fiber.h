@@ -1,6 +1,7 @@
 /*
  * psx_fiber.h — cross-platform cooperative fibers for the BIOS thread
- * scheduler (traps.c) and exception-deferral (interrupts.c).
+ * scheduler (traps.c), exception-deferral (interrupts.c), and the main-thread
+ * Native simulation/presentation loop.
  *
  * The PS1 BIOS manages its own threads (TCBs) and switches between them
  * cooperatively; the runtime mirrors each BIOS thread with a host fiber so
@@ -31,14 +32,16 @@ typedef void* psx_fiber_t;
 typedef void (*psx_fiber_entry)(void* arg);
 
 /* Make the current thread a fiber so it can switch to others. Idempotent;
- * returns the handle for the current thread's fiber. Call before the first
+ * if already on a fiber, returns that fiber (not the OS-thread root).
+ * Call before the first
  * psx_fiber_switch on this thread. */
 psx_fiber_t psx_fiber_convert_thread(void);
 
 /* The currently-executing fiber (GetCurrentFiber analog). */
 psx_fiber_t psx_fiber_current(void);
 
-/* Create a fiber with its own stack. It does not run until switched to. */
+/* Create a fiber with its own stack. It does not run until switched to.
+ * Floating-point context is preserved across switches on both backends. */
 psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg);
 
 /* Switch execution to target; the caller is suspended until switched back. */

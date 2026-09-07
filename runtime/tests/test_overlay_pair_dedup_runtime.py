@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import pathlib
 import platform
@@ -76,7 +77,8 @@ def run(command: list[str], *, cwd: pathlib.Path | None = None) -> None:
 
 
 def manifest(entries: list[tuple[int, int]], provenance: str | None = None,
-              artifact: tuple[int, int, int] = (0x80010000, 16, 0x11111111),
+               artifact: tuple[int, int, str] = (
+                   0x80010000, 16, hashlib.sha256(bytes(16)).hexdigest()),
               include_identity: bool = True,
               lowercase_identity: bool = False) -> str:
     lines = []
@@ -88,7 +90,7 @@ def manifest(entries: list[tuple[int, int]], provenance: str | None = None,
         manifest_identity = (MANIFEST_SHA256.lower()
                              if lowercase_identity else MANIFEST_SHA256.upper())
         lines.append(f"I {game_identity} {manifest_identity}\n")
-    lines.append(f"A {artifact[0]:08X} {artifact[1]:08X} {artifact[2]:08X}\n")
+    lines.append(f"A {artifact[0]:08X} {artifact[1]:08X} {artifact[2].upper()}\n")
     lines.append(f"V {RUNTIME_VARIANT_SHA256.upper()}\n")
     for entry, length in entries:
         crc = zlib.crc32(bytes(length)) & 0xFFFFFFFF
@@ -115,6 +117,7 @@ def compile_harness(gcc: str, out: pathlib) -> None:
         gcc, "-std=c11", "-O0", "-Wall", "-Wextra",
         "-DPSX_NO_DEBUG_TOOLS",
         "-DPSX_OVERLAY_DLL_BUILD",
+        "-DPSX_HAS_OVERLAY_DISPATCH=1",
         "-DPSX_OVERLAY_TEST_CANDIDATE_CAP=4", f"-I{RUNTIME / 'include'}",
         f"-I{ROOT.parent / 'native_renderer' / 'include'}",
         *platform_defines,
@@ -124,6 +127,7 @@ def compile_harness(gcc: str, out: pathlib) -> None:
         str(RUNTIME / "src" / "overlay_path_canon.c"),
         str(RUNTIME / "src" / "overlay_posix.c"),
         str(RUNTIME / "src" / "crc32.c"),
+        str(RUNTIME / "src" / "psx_sha256.c"),
         str(TESTS / "overlay_pair_dedup_harness.c"), "-o", str(out),
         f'-DPSX_GAME_EXTRA_IDENTITY_SHA256="{GAME_SHA256}"',
         f'-DPSX_GAME_MANIFEST_DIGEST_SHA256="{MANIFEST_SHA256}"',
@@ -178,7 +182,8 @@ def scenario(tmp: pathlib.Path, harness: pathlib.Path, full_first: pathlib.Path,
     elif name == "provenance-mismatch":
         second_manifest = manifest(two, "hosted-v1")
     elif name == "artifact-mismatch":
-        second_manifest = manifest(two, artifact=(0x80011000, 16, 0x22222222))
+        second_manifest = manifest(two, artifact=(
+            0x80011000, 16, hashlib.sha256(bytes([1]) * 16).hexdigest()))
 
     first = publish(cache, first_tier, f"00010000_11111111_AAAAAAAA{ext}",
                     first_library, first_manifest, namespaced=name != "flat-cache")

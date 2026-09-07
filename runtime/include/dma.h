@@ -41,6 +41,9 @@ uint32_t dma_cycles_to_deliverable_irq(uint32_t i_mask);
 uint32_t dma_get_dicr(void);
 uint32_t dma_get_dpcr(void);
 int      dma_cdrom_transfer_active(void);
+uint32_t dma_snapshot_bytes(void);
+void     dma_snapshot_write(uint8_t *bytes);
+int      dma_snapshot_read(const uint8_t *bytes, uint32_t length);
 
 typedef struct DMAChannelDebugState {
     uint32_t madr;

@@ -15,6 +15,7 @@
 #define GUEST_RENDER_NATIVE_STREAM_HOTSPOT_CAPACITY 64u
 #define GUEST_RENDER_NATIVE_STREAM_HOTSPOT_REGION_SIZE 4096u
 #define GUEST_RENDER_NATIVE_STREAM_PAYLOAD_WRITER_COUNT 9u
+#define GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1 1u
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +29,8 @@ typedef enum GuestRenderNativeStreamStatus {
     GUEST_RENDER_NATIVE_STREAM_DUPLICATE_COMMAND,
     GUEST_RENDER_NATIVE_STREAM_STALE_VISUAL_ID,
     GUEST_RENDER_NATIVE_STREAM_NOT_FOUND,
+    GUEST_RENDER_NATIVE_STREAM_UNSUPPORTED_VERSION,
+    GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW,
 } GuestRenderNativeStreamStatus;
 
 typedef struct GuestRenderNativeSourceWriter {
@@ -228,6 +231,79 @@ typedef struct GuestRenderNativeStreamMissContext {
     bool container_writer_valid;
 } GuestRenderNativeStreamMissContext;
 
+typedef enum GuestRenderNativeDiagnosticEventKind {
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_PRODUCER_EXACT = 0,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_MISS_RESOLVER,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_CPU_CANONICAL,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_PACKET_DERIVED,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNBOUND,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNSUPPORTED,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_GUEST_GPU_COMPATIBILITY_PRIMITIVE,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_ORIGINAL_PRIMITIVE,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_FORBIDDEN_NON_NATIVE,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SEMANTIC_POST_GTE_READ,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_PACKET_PAYLOAD_READ,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_GP0_DECODE_TO_SEMANTIC,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_OT_PAYLOAD_READ,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNKNOWN_GP0_COMMAND,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNKNOWN_GP1_COMMAND,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_EVENT_KIND_COUNT,
+} GuestRenderNativeDiagnosticEventKind;
+
+enum {
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_COMMAND_ID = 1u << 0,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_VISUAL_ID = 1u << 1,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_ADDRESS = 1u << 2,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC = 1u << 3,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_FUNCTION = 1u << 4,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_RETURN_ADDRESS = 1u << 5,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE = 1u << 6,
+    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_KIND = 1u << 7,
+};
+
+typedef struct GuestRenderNativeDiagnosticSource {
+    uint32_t valid_fields;
+    uint32_t source_word_address;
+    uint32_t pc;
+    uint32_t function;
+    uint32_t return_address;
+    uint64_t command_id;
+    GpuRenderTransactionId visual_id;
+    GuestRenderNativeStreamSourceKind source_kind;
+    uint8_t opcode;
+} GuestRenderNativeDiagnosticSource;
+
+typedef struct GuestRenderNativeDiagnosticsV1 {
+    uint32_t version;
+    uint32_t size;
+    uint64_t reset_sequence;
+    uint64_t producer_exact_primitives;
+    uint64_t miss_resolver_primitives;
+    uint64_t gte_derived_primitives;
+    uint64_t cpu_canonical_primitives;
+    uint64_t packet_derived_primitives;
+    uint64_t unbound_primitives;
+    uint64_t unsupported_primitives;
+    uint64_t guest_gpu_compatibility_primitives;
+    uint64_t original_primitives;
+    uint64_t forbidden_non_native_primitives;
+    uint64_t semantic_post_gte_reads;
+    uint64_t target_packet_payload_reads_by_semantic_lane;
+    uint64_t target_gp0_decode_to_semantic_calls;
+    uint64_t target_ot_payload_geometry_or_material_reads;
+    uint64_t unknown_gp0_commands;
+    uint64_t unknown_gp1_commands;
+    uint64_t uncovered_producers;
+    uint64_t counter_overflow_events;
+    GuestRenderNativeDiagnosticEventKind first_overflow_kind;
+    GuestRenderNativeDiagnosticSource first_overflow_source;
+    GuestRenderNativeDiagnosticSource first_offender[
+        GUEST_RENDER_NATIVE_DIAGNOSTIC_EVENT_KIND_COUNT];
+    bool counter_overflowed;
+} GuestRenderNativeDiagnosticsV1;
+
 typedef bool (*GuestRenderNativeStreamMissResolver)(
         const GuestRenderNativeStreamMissContext *context,
         GpuRenderTransactionId *out_visual_id,
@@ -282,6 +358,13 @@ bool guest_render_native_stream_has_active_bindings(void);
 bool guest_render_native_stream_resolve_miss(
         const GuestRenderNativeStreamMissContext *context,
         GpuRenderSemantic *out_semantic);
+GuestRenderNativeStreamStatus guest_render_native_stream_note_diagnostic_event(
+        GuestRenderNativeDiagnosticEventKind kind,
+        const GuestRenderNativeDiagnosticSource *source);
+GuestRenderNativeStreamStatus guest_render_native_stream_diagnostics_snapshot(
+        uint32_t version, GuestRenderNativeDiagnosticsV1 *out_diagnostics,
+        size_t diagnostics_size);
+GuestRenderNativeStreamStatus guest_render_native_stream_diagnostics_reset(void);
 bool guest_render_native_stream_last_consumed(
         GpuRenderTransactionId visual_id, uint64_t exact_command_id,
         GpuRenderSemantic *out_semantic);
@@ -345,6 +428,9 @@ GuestRenderNativeStreamStatus guest_render_native_stream_snapshot(
 
 #ifdef GUEST_RENDER_NATIVE_STREAM_TESTING
 void guest_render_native_stream_test_reset(void);
+GuestRenderNativeStreamStatus
+guest_render_native_stream_test_set_diagnostic_counter(
+        GuestRenderNativeDiagnosticEventKind kind, uint64_t value);
 #endif
 
 #ifdef __cplusplus

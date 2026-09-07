@@ -1,6 +1,7 @@
 #include "gpu.h"
 #include "gpu_render.h"
 #include "guest_render_transaction.h"
+#include "ram_provenance.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@ static int require(int condition) { return condition; }
 extern void psx_write_word(uint32_t address, uint32_t value);
 extern uint32_t gpu_snapshot_bytes(void);
 extern void gpu_snapshot_write(uint8_t *bytes);
+extern int gpu_snapshot_read(const uint8_t *bytes, uint32_t len);
 extern uint16_t *gpu_get_vram_ptr(void);
 extern int gpu_get_c0_count(void);
 extern uint64_t g_guest_store_count;
@@ -28,6 +30,28 @@ extern uint64_t test_mmio_sync_calls;
 enum {
     GP0_MMIO = 0x1f801810u,
     TEST_WIRE_CAPACITY = 512u,
+    SNAP_GP0_STATE_OFFSET = 140u,
+    SNAP_GP0_WORDS_COLLECTED_OFFSET = 208u,
+    SNAP_VRAM_WRITE_WIDTH_OFFSET = 248u,
+    SNAP_VRAM_WRITE_HEIGHT_OFFSET = 250u,
+    SNAP_VRAM_WRITE_COLUMN_OFFSET = 252u,
+    SNAP_VRAM_WRITE_ROW_OFFSET = 254u,
+    SNAP_VRAM_WRITE_REMAINING_OFFSET = 256u,
+    SNAP_VRAM_SOURCE_RECEIPT_OFFSET = 260u,
+    SNAP_VRAM_SOURCE_FORMAT_OFFSET = 268u,
+    SNAP_VRAM_SOURCE_WORDS_OFFSET = 272u,
+    SNAP_VRAM_SOURCE_VALID_OFFSET = 276u,
+    SNAP_MDEC_SCANOUT_CANDIDATE_OFFSET = 280u,
+    SNAP_MOVIE_FRAME_NUMBER_OFFSET = 284u,
+    SNAP_MOVIE_FRAME_WIDTH_OFFSET = 288u,
+    SNAP_MOVIE_FRAME_HEIGHT_OFFSET = 290u,
+    SNAP_MOVIE_FRAME_COMPLETE_OFFSET = 292u,
+    SNAP_MOVIE_PENDING_OWNER_KIND_OFFSET = 296u,
+    SNAP_MOVIE_PENDING_OWNER_RECEIPT_OFFSET = 300u,
+    SNAP_MOVIE_ACTIVE_OWNER_KIND_OFFSET = 308u,
+    SNAP_MOVIE_ACTIVE_CALLBACK_OFFSET = 312u,
+    SNAP_MOVIE_ACTIVE_OWNER_RECEIPT_OFFSET = 316u,
+    SNAP_MOVIE_OWNER_RECEIPT_COUNTER_OFFSET = 324u,
 };
 
 typedef struct CounterState {
@@ -116,6 +140,14 @@ static void backend_draw_flat_triangle(int x0, int y0, int x1, int y1,
 static uint16_t backend_vram_read(int x, int y) {
     return backend_vram[(uint32_t)(y & 511) * 1024u + (uint32_t)(x & 1023)];
 }
+static void backend_vram_transfer_in(int x, int y, int w, int h,
+                                     const uint16_t *data) {
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    (void)data;
+}
 static GpuRenderTransactionStatus backend_transaction_begin(
         GpuRenderTransactionId id, uint64_t serial) {
     (void)id;
@@ -154,6 +186,7 @@ static const GpuRenderBackend TEST_BACKEND = {
     .set_semi_transparency = backend_set_semi,
     .draw_flat_triangle = backend_draw_flat_triangle,
     .vram_read = backend_vram_read,
+    .vram_transfer_in = backend_vram_transfer_in,
     .set_draw_area = backend_set_draw_area,
     .set_draw_offset = backend_set_draw_offset,
     .transaction_begin = backend_transaction_begin,
@@ -168,6 +201,319 @@ static void reset_gpu(void) {
     guest_render_transaction_test_reset();
     gr_test_inject_backend(&TEST_BACKEND);
     gpu_init();
+}
+
+static void store_le16(uint8_t *bytes, size_t offset, uint16_t value) {
+    bytes[offset] = (uint8_t)value;
+    bytes[offset + 1u] = (uint8_t)(value >> 8u);
+}
+
+static void store_le32(uint8_t *bytes, size_t offset, uint32_t value) {
+    bytes[offset] = (uint8_t)value;
+    bytes[offset + 1u] = (uint8_t)(value >> 8u);
+    bytes[offset + 2u] = (uint8_t)(value >> 16u);
+    bytes[offset + 3u] = (uint8_t)(value >> 24u);
+}
+
+static void store_le64(uint8_t *bytes, size_t offset, uint64_t value) {
+    store_le32(bytes, offset, (uint32_t)value);
+    store_le32(bytes, offset + 4u, (uint32_t)(value >> 32u));
+}
+
+static int exact_snapshot_rejected_without_mutation(
+        const uint8_t *valid, const uint8_t *malformed, uint32_t wire_bytes) {
+    uint8_t after[TEST_WIRE_CAPACITY];
+
+    CHECK(wire_bytes <= sizeof(after));
+    CHECK(!gpu_snapshot_read(malformed, wire_bytes));
+    gpu_snapshot_write(after);
+    return memcmp(valid, after, wire_bytes) == 0;
+}
+
+static int snapshot_roundtrips_without_mutation(void) {
+    uint8_t before[TEST_WIRE_CAPACITY];
+    uint8_t after[TEST_WIRE_CAPACITY];
+    const uint32_t wire_bytes = gpu_snapshot_bytes();
+
+    CHECK(wire_bytes <= sizeof(before));
+    gpu_snapshot_write(before);
+    CHECK(gpu_snapshot_read(before, wire_bytes));
+    gpu_snapshot_write(after);
+    return memcmp(before, after, wire_bytes) == 0;
+}
+
+static int malformed_u32_rejected(
+        const uint8_t *valid, uint32_t wire_bytes, size_t offset,
+        uint32_t value) {
+    uint8_t malformed[TEST_WIRE_CAPACITY];
+
+    CHECK(wire_bytes <= sizeof(malformed));
+    memcpy(malformed, valid, wire_bytes);
+    store_le32(malformed, offset, value);
+    return exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes);
+}
+
+static int malformed_u64_rejected(
+        const uint8_t *valid, uint32_t wire_bytes, size_t offset,
+        uint64_t value) {
+    uint8_t malformed[TEST_WIRE_CAPACITY];
+
+    CHECK(wire_bytes <= sizeof(malformed));
+    memcpy(malformed, valid, wire_bytes);
+    store_le64(malformed, offset, value);
+    return exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes);
+}
+
+static int test_snapshot_rejects_invalid_gp0_state_atomically(void) {
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint8_t malformed[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    reset_gpu();
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+    memcpy(malformed, valid, wire_bytes);
+    store_le32(malformed, SNAP_GP0_STATE_OFFSET, UINT32_MAX);
+    return exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes);
+}
+
+static int test_snapshot_rejects_gp0_command_cursor_overflow_atomically(void) {
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint8_t malformed[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    reset_gpu();
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+    memcpy(malformed, valid, wire_bytes);
+    store_le32(malformed, SNAP_GP0_WORDS_COLLECTED_OFFSET, 17u);
+    return exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes);
+}
+
+static int test_snapshot_rejects_malformed_a0_transfer_atomically(void) {
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint8_t malformed[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    reset_gpu();
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(UINT32_C(0x0014000a));
+    gpu_write_gp0(UINT32_C(0x00020004));
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le16(malformed, SNAP_VRAM_WRITE_WIDTH_OFFSET, 0u);
+    CHECK(exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes));
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le16(malformed, SNAP_VRAM_WRITE_WIDTH_OFFSET, 1025u);
+    CHECK(exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes));
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le16(malformed, SNAP_VRAM_WRITE_HEIGHT_OFFSET, 0u);
+    CHECK(exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes));
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le16(malformed, SNAP_VRAM_WRITE_HEIGHT_OFFSET, 513u);
+    CHECK(exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes));
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le16(malformed, SNAP_VRAM_WRITE_COLUMN_OFFSET, 4u);
+    CHECK(exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes));
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le16(malformed, SNAP_VRAM_WRITE_ROW_OFFSET, 2u);
+    CHECK(exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes));
+
+    memcpy(malformed, valid, wire_bytes);
+    store_le32(malformed, SNAP_VRAM_WRITE_REMAINING_OFFSET, 0u);
+    return exact_snapshot_rejected_without_mutation(
+        valid, malformed, wire_bytes);
+}
+
+static int test_snapshot_rejects_non_boolean_flags_atomically(void) {
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    reset_gpu();
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_VALID_OFFSET, 2u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MDEC_SCANOUT_CANDIDATE_OFFSET, 2u));
+    return malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_FRAME_COMPLETE_OFFSET, 2u);
+}
+
+static int test_snapshot_rejects_movie_owner_enums_atomically(void) {
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    reset_gpu();
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_PENDING_OWNER_KIND_OFFSET, 3u));
+    return malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_ACTIVE_OWNER_KIND_OFFSET, 3u);
+}
+
+static int test_snapshot_rejects_movie_owner_relationships_atomically(void) {
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    reset_gpu();
+    CHECK(gpu_note_movie_owner_start(
+        GPU_MOVIE_OWNER_STANDALONE, UINT32_C(0x80012340)));
+    CHECK(snapshot_roundtrips_without_mutation());
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_ACTIVE_CALLBACK_OFFSET, 0u));
+    CHECK(malformed_u64_rejected(
+        valid, wire_bytes, SNAP_MOVIE_ACTIVE_OWNER_RECEIPT_OFFSET, 0u));
+    CHECK(malformed_u64_rejected(
+        valid, wire_bytes, SNAP_MOVIE_OWNER_RECEIPT_COUNTER_OFFSET, 0u));
+    CHECK(malformed_u64_rejected(
+        valid, wire_bytes, SNAP_MOVIE_ACTIVE_OWNER_RECEIPT_OFFSET, 2u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_ACTIVE_OWNER_KIND_OFFSET,
+        GPU_MOVIE_OWNER_NONE));
+    CHECK(gpu_note_movie_owner_stop(GPU_MOVIE_OWNER_STANDALONE));
+    return snapshot_roundtrips_without_mutation();
+}
+
+static int test_snapshot_rejects_incoherent_pending_movie_atomically(void) {
+    const uint32_t source_address = UINT32_C(0x00002000);
+    const GpuRenderOracleSource mdec_word = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, source_address, 1u, 1u,
+    };
+    RamProvenanceSource provenance = {
+        RAM_PROVENANCE_SOURCE_MDEC_DMA1, 2u, 0u,
+    };
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    CHECK(ram_provenance_init(2u * 1024u * 1024u));
+    ram_provenance_set_cpu_tracking(true);
+    provenance.receipt = ram_provenance_publish_event();
+    CHECK(provenance.receipt != 0u);
+    ram_provenance_note_source_word(source_address, &provenance);
+    reset_gpu();
+    CHECK(gpu_note_movie_owner_start(
+        GPU_MOVIE_OWNER_STANDALONE, UINT32_C(0x80023450)));
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(UINT32_C(0x0014000a));
+    gpu_write_gp0(UINT32_C(0x00010002));
+    gpu_set_gp0_source(&mdec_word);
+    gpu_write_gp0(UINT32_C(0x22221111));
+    CHECK(snapshot_roundtrips_without_mutation());
+    CHECK(gpu_note_movie_frame_complete(
+        7u, UINT32_C(0x80023450)));
+    CHECK(snapshot_roundtrips_without_mutation());
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MDEC_SCANOUT_CANDIDATE_OFFSET, 0u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_FRAME_COMPLETE_OFFSET, 0u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_MOVIE_PENDING_OWNER_KIND_OFFSET,
+        GPU_MOVIE_OWNER_FIELD));
+    CHECK(malformed_u64_rejected(
+        valid, wire_bytes, SNAP_MOVIE_PENDING_OWNER_RECEIPT_OFFSET, 2u));
+
+    {
+        uint8_t malformed[TEST_WIRE_CAPACITY];
+        memcpy(malformed, valid, wire_bytes);
+        store_le16(malformed, SNAP_MOVIE_FRAME_WIDTH_OFFSET, 0u);
+        return exact_snapshot_rejected_without_mutation(
+            valid, malformed, wire_bytes);
+    }
+}
+
+static int test_snapshot_validates_a0_provenance_atomically(void) {
+    const uint32_t source_address = UINT32_C(0x00001000);
+    const GpuRenderOracleSource mdec_word = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, source_address, 1u, 1u,
+    };
+    const GpuRenderOracleSource unknown_word = {
+        GPU_RENDER_ORACLE_SOURCE_UNKNOWN, UINT32_MAX, 2u, 1u,
+    };
+    RamProvenanceSource provenance = {
+        RAM_PROVENANCE_SOURCE_MDEC_DMA1, 2u, 0u,
+    };
+    uint8_t valid[TEST_WIRE_CAPACITY];
+    uint32_t wire_bytes;
+
+    /* Dormant A0 provenance is reset-canonical. */
+    reset_gpu();
+    wire_bytes = gpu_snapshot_bytes();
+    CHECK(wire_bytes <= sizeof(valid));
+    gpu_snapshot_write(valid);
+    CHECK(malformed_u64_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_RECEIPT_OFFSET, 1u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_FORMAT_OFFSET, 1u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_WORDS_OFFSET, 1u));
+
+    /* A newly opened and an unattributed partial A0 are both live states. */
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(UINT32_C(0x0014000a));
+    gpu_write_gp0(UINT32_C(0x00020004));
+    CHECK(snapshot_roundtrips_without_mutation());
+    gpu_write_gp0(UINT32_C(0x22221111));
+    CHECK(snapshot_roundtrips_without_mutation());
+
+    /* A partial MDEC upload retains its receipt/format; a later provenance
+     * failure explicitly leaves that pair in place while invalidating it. */
+    CHECK(ram_provenance_init(2u * 1024u * 1024u));
+    ram_provenance_set_cpu_tracking(true);
+    ram_provenance_reset();
+    provenance.receipt = ram_provenance_publish_event();
+    CHECK(provenance.receipt != 0u);
+    ram_provenance_note_source_word(source_address, &provenance);
+    reset_gpu();
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(UINT32_C(0x0014000a));
+    gpu_write_gp0(UINT32_C(0x00020004));
+    gpu_set_gp0_source(&mdec_word);
+    gpu_write_gp0(UINT32_C(0x22221111));
+    CHECK(snapshot_roundtrips_without_mutation());
+    gpu_snapshot_write(valid);
+    CHECK(malformed_u64_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_RECEIPT_OFFSET, 0u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_FORMAT_OFFSET, 4u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_WORDS_OFFSET, 0u));
+    CHECK(malformed_u32_rejected(
+        valid, wire_bytes, SNAP_VRAM_SOURCE_VALID_OFFSET, 0u));
+
+    gpu_set_gp0_source(&unknown_word);
+    gpu_write_gp0(UINT32_C(0x44443333));
+    return snapshot_roundtrips_without_mutation();
 }
 
 static GpuRenderSemantic valid_semantic(void) {
@@ -619,13 +965,21 @@ static int test_original_material_capture_is_scoped(void) {
 }
 
 int main(void) {
-    if (!test_parser_counters_oracle_and_cursors_restore()) return 1;
-    if (!test_commit_discards_without_restoring()) return 2;
-    if (!test_successful_swap_commits_checkpoint()) return 3;
-    if (!test_gp1_guard_replays_before_trigger_once()) return 4;
-    if (!test_gpustat_guard_polls_once_after_replay()) return 5;
-    if (!test_gpuread_guard_restores_transfer_before_read()) return 6;
-    if (!test_mmio_gp0_guard_has_one_store_and_sync()) return 7;
-    if (!test_original_material_capture_is_scoped()) return 8;
+    if (!test_snapshot_rejects_invalid_gp0_state_atomically()) return 1;
+    if (!test_snapshot_rejects_gp0_command_cursor_overflow_atomically()) return 2;
+    if (!test_snapshot_rejects_malformed_a0_transfer_atomically()) return 3;
+    if (!test_snapshot_rejects_non_boolean_flags_atomically()) return 4;
+    if (!test_snapshot_rejects_movie_owner_enums_atomically()) return 5;
+    if (!test_snapshot_rejects_movie_owner_relationships_atomically()) return 6;
+    if (!test_snapshot_rejects_incoherent_pending_movie_atomically()) return 7;
+    if (!test_snapshot_validates_a0_provenance_atomically()) return 8;
+    if (!test_parser_counters_oracle_and_cursors_restore()) return 9;
+    if (!test_commit_discards_without_restoring()) return 10;
+    if (!test_successful_swap_commits_checkpoint()) return 11;
+    if (!test_gp1_guard_replays_before_trigger_once()) return 12;
+    if (!test_gpustat_guard_polls_once_after_replay()) return 13;
+    if (!test_gpuread_guard_restores_transfer_before_read()) return 14;
+    if (!test_mmio_gp0_guard_has_one_store_and_sync()) return 15;
+    if (!test_original_material_capture_is_scoped()) return 16;
     return 0;
 }

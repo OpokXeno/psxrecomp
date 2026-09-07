@@ -241,26 +241,17 @@ a fake event. The fake delivery was not progress, it was theater.
 At the start of every session, before any code change:
 
 1. Read this file (CLAUDE.md).
-2. Read docs/internal/PLAN.md to confirm what phase we are in and what the next
-   concrete milestone is.
-3. Verify `docs/psx_bios_disasm.txt` exists (primary reference).
-4. Verify Ghidra MCP is reachable. If not, stop and ask.
-5. If a overlay cannot be identified, inspect every
+2. Verify Ghidra MCP is reachable.
+3. If a overlay cannot be identified, inspect every
    `build*/overlay_captures.json` and optional `.d/` records before
    concluding it is absent. Locate the capture by runtime load base/range,
    confirm its metadata proves load address, size, and executed PCs, then
    cross-check the offsets in Ghidra. Use local byte equality only to verify
    identity, without printing or storing payload bytes.
-6. A capture record alone is not a byte-identical `overlays/` artifact. If
+4. A capture record alone is not a byte-identical `overlays/` artifact. If
    no capture-to-local-artifact match exists, mark the result **BLOCKED**.
    Never select by filename, size, CRC, or address alone, and never guess a
    mismatch or convert it into an authenticated manifest.
-7. State out loud: "Architecture A is locked. No interpreter. No stubs.
-   LLE default + oracle; HLE only per the §0 amendments (opt-in tier,
-   LLE fallback, no fakes). BIOS first. Game never until Phase 5."
-
-If any of these fail, do not proceed with the user's task — surface
-the failure first.
 
 ---
 

@@ -22,7 +22,6 @@ typedef struct {
     XgScene scene;
     uint32_t generation;
     uint8_t have_scene;
-    uint8_t fmv_active;
 } XgSceneState;
 
 static XgSceneState s_scene;
@@ -78,34 +77,30 @@ void psx_xenogears_read_scene(XgScene *out)
 
 static int same_scene(const XgScene *left, const XgScene *right)
 {
+    if (left->requested_module != right->requested_module)
+        return 0;
     if (left->valid_field != right->valid_field)
         return 0;
     return !left->valid_field ||
-           (left->field_context == right->field_context &&
-            left->field_id == right->field_id);
+           left->masked_field_id == right->masked_field_id;
 }
 
 void psx_xenogears_scene_reset(void)
 {
     s_scene.have_scene = 0u;
-    s_scene.fmv_active = 0u;
     memset(&s_scene.scene, 0, sizeof(s_scene.scene));
 }
 
 void psx_xenogears_scene_vblank_boundary(int fmv_active)
 {
     XgScene scene;
-    const uint8_t fmv = (uint8_t)(fmv_active != 0);
 
+    /* Render ownership is not scene identity. Movie, Field, UI and effects are
+     * continuous producers for the same game timeline. */
+    (void)fmv_active;
     psx_xenogears_read_scene(&scene);
-    if (fmv != s_scene.fmv_active) {
-        psx_xenogears_scene_reset();
-        s_scene.fmv_active = fmv;
-    }
-    if (s_scene.fmv_active ||
-        (s_scene.have_scene && same_scene(&s_scene.scene, &scene)))
+    if (s_scene.have_scene && same_scene(&s_scene.scene, &scene))
         return;
-    psx_xenogears_scene_reset();
     s_scene.scene = scene;
     s_scene.have_scene = 1u;
     s_scene.generation++;

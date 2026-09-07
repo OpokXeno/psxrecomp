@@ -13,6 +13,7 @@
  */
 
 #include "cpu_state.h"
+#include "game_identity_types.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -42,6 +43,19 @@ void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
  * Returns 1 and calls the compiled function if addr is registered,
  * 0 if not found (fall through to interpreter). */
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+/* Generated static dispatch calls this only after selecting one unambiguous
+ * compiled variant. The helper independently verifies the exact resident code
+ * ranges. Artifact identity remains immutable offline provenance: overlays may
+ * load only a subset of that artifact into RAM at any one time. */
+int psx_overlay_static_note_candidate_dispatch(
+    const uint32_t *code_lo_len_pairs, uint32_t code_count,
+    const uint8_t expected_code_sha256[32],
+    const uint32_t *artifact_lo_len_pairs, uint32_t artifact_count,
+    const uint8_t artifact_sha256[32], const PsxGameIdentity *identity,
+    uint64_t capability_id, uint32_t producer_entry, uint32_t dispatch_pc);
+#endif
 
 /* Freeze new DLL discovery/load (lazy try_load_region, live publish commit,
  * rescan). Already-registered natives keep running. Required for rollback

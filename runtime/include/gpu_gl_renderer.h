@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #include "gpu_render.h"
+#include "../../../native_renderer/include/xg_render_semantic_presentation.h"
 
 struct SDL_Window;
 
@@ -21,6 +22,489 @@ extern "C" {
 /* Create the GL context on a window made with SDL_WINDOW_OPENGL.
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
+
+/* Native OpenGL transport.  init_services must run on the thread which owns
+ * s_ctx, while that context is current; it creates a shared presenter context
+ * and fills callbacks suitable for
+ * XgRenderWorkerServices/XgRenderPresenterServices.  capture_source only
+ * authenticates the sealed SourceCommit header.  It performs no GL work and
+ * captures no compatibility framebuffer.  The worker later consumes every
+ * immutable commit record through the SourceCommit copy API and rasterizes to
+ * owned CPU staging. Only the presenter uploads/draws that immutable endpoint.
+ *
+ * Hold uses the existing compose(endpoint, 1, 1) service repeatedly while the
+ * core keeps the endpoint's original ownership reference. Each successful
+ * compose returns a separate completion fence for the core to retire. The core
+ * resolves each presentation attempt before the next compose and releases the
+ * endpoint exactly once on replacement/invalidation, after retiring its fences.
+ * Ready textures are reused; failed composition does not consume the endpoint.
+ * Native work publishes up to seven complete source-motion phases, n/(N+1)
+ * for n=1..N, plus the authored endpoint at 1/1. Equivalent exact fractions are
+ * accepted. N comes from the nearest integer cadence ratio between the observed
+ * source interval and captured display.temporal_hz, never the monitor rate.
+ * temporal_hz=0 disables smoothing before any replay/evaluation/phase allocation.
+ * All phase CPU buffers are complete before endpoint/fence publication; GL
+ * textures/FBOs are lazily uploaded by the presenter, never by the CPU worker.
+ * Upload state is published under the endpoint lock and failed uploads retain
+ * staging for retry. Phases share the endpoint's ownership/fence lifetime.
+ *
+ * Core schedules increasing alpha using services.clock_ns (SDL_GetTicksNS) over
+ * temporal_interval_ns. Use phases only with a retained previous pixel_digest
+ * equal to temporal_previous_pixel_digest and matching epoch/scene/layout.
+ * Otherwise present 1/1. Zero phases authorize no temporal deferral, artificial
+ * deadline or wait for a future endpoint. Pixel equality is not motion state.
+ * A captured rate transition resets history and expires retained phase images;
+ * their authored endpoints can still be held. It does not reset canonical/VIEW.
+ *
+ * The presentation host must be joined before native_shutdown.  The general
+ * gl_renderer_shutdown path also calls it, after which legacy main-thread
+ * presentation may own SwapWindow again. */
+int gl_renderer_native_init_services(
+    XgRenderWorkerServices *out_worker_services,
+    XgRenderPresenterServices *out_presenter_services);
+int gl_renderer_native_capture_source(
+    XgRenderSourceCommitHandle commit,
+    const XgRenderSourceCommitHeader *sealed_header);
+void gl_renderer_native_shutdown(void);
+/* Main owner only, before the host pump and during yield/EOF waits. Performs
+ * bounded renderer submission/fence service, never swaps or advances the guest.
+ * -1: renderer failure; 0: no progress; 1: progress, notify the render worker.
+ * Must also be called when no endpoint is presentable. */
+int gl_renderer_native_service(void);
+void gl_renderer_native_set_worker_notify(void (*notify)(void *), void *data);
+void gl_renderer_native_stop_gpu_worker(void);
+/* Cheap request query; does not enter GL or execute renderer work. */
+int gl_renderer_native_service_pending(void);
+
+/* Independent Native visual-truth path. When PSX_NATIVE_VISUAL_TRUTH=1 the
+ * OpenGL backend also maintains its existing software 1x canonical mirror.
+ * The VBlank seam snapshots that guest scanout before source publication; the
+ * Native worker later compares it, by full presentation identity, with the
+ * independently compiled endpoint. */
+int gl_renderer_native_guest_reference_enabled(void);
+int gl_renderer_native_capture_guest_reference(
+    uint64_t guest_vblank_sequence, uint64_t guest_cycle);
+
+enum {
+    GL_RENDERER_NATIVE_ENDPOINT_FORMAT_RGBA8 = 1,
+};
+
+/* Endpoint width/height remain the canonical source display dimensions. Storage
+ * width/height describe the actual immutable pixel buffer/GL texture and may be
+ * wider for VIEW. Composition and pixel hashing use storage dimensions.
+ * temporal_phase_count is 0..7. temporal_interval_ns is the guest-cycle
+ * duration since the previous published visual endpoint; interval_vblanks is
+ * diagnostic only. With zero phases both intervals and previous digest are zero.
+ * No temporal scheduling delay is permitted without phases. pixel_digest identifies the current
+ * complete RGBA8 image, not a phase. Digests do not encode display layout. */
+typedef struct GlRendererNativeEndpointMetadata {
+    uint16_t display_x;
+    uint16_t display_y;
+    uint16_t aspect_num;
+    uint16_t aspect_den;
+    uint32_t width;
+    uint32_t height;
+    uint32_t storage_width;
+    uint32_t storage_height;
+    uint32_t format;
+    int depth24;
+    int interlaced;
+    int disabled;
+    uint16_t temporal_hz;
+    uint16_t render_scale;
+    uint32_t temporal_phase_count;
+    uint32_t temporal_interval_vblanks;
+    uint64_t temporal_interval_ns;
+    uint64_t pixel_digest;
+    uint64_t temporal_previous_pixel_digest;
+} GlRendererNativeEndpointMetadata;
+
+int gl_renderer_native_endpoint_metadata(
+    uint64_t opaque_handle,
+    GlRendererNativeEndpointMetadata *out_metadata);
+
+/* native_work uses a worker-owned 1024x512 VRAM, initially zero. A chunk applies
+ * DRAW/UPLOAD/COPY/FILL privately and publishes atomically. Mutation-only chunks
+ * return APPLIED with zero outputs; display boundaries produce independent full
+ * endpoints and software-ready fences. Identical pixel/layout/epoch/scene
+ * boundaries with equivalent retained temporal recipes return APPLIED after all
+ * mutations commit; GPU work with commands is classified only after its actual
+ * storage digest is ready, never from the CPU reference alone. They do not replace the
+ * published visual history or interrupt an interval. Pool backpressure returns
+ * WOULD_BLOCK without applying work. GPU submissions retain one private owned
+ * transaction across retries; service never publishes device/VIEW state itself.
+ * Disabled boundaries produce black and
+ * still require valid scanout dimensions/aspect.
+ *
+ * Device memory survives presentation epoch/scene/artifact changes. The source
+ * must drain before those transitions and send an explicit full-VRAM upload
+ * with mask_set/check disabled on reset/restore. native_vram_identity names
+ * the last applied epoch/sequence.
+ * No guest/compatibility memory is read. Device texturing remains affine and
+ * canonical. TARGET selects an explicit non-wrapping framebuffer rectangle;
+ * it never changes the device pixels or material scissor. A VIEW is maintained
+ * when its width matches native_width - 2*native_offset_x. Native positions and
+ * 2D anchors are rasterized separately, never by stretching the device image.
+ * Unknown draws remain centered. COPY uses declared target maps and may name
+ * a translated destination only when it copies the complete declared source.
+ * A full unmasked VRAM replacement resets VIEW declarations and wave scratch;
+ * SOURCE must emit the restored TARGET before subsequent marked draws.
+ * Layout changes keep declarations but reseed derived images from the owned
+ * canonical center with zero margins. No prior scene is invented in margins.
+ * A recipe starts at a full unmasked FILL or a proven full-target, untextured,
+ * opaque uniform rectangle. The latter is retained as the first draw, including
+ * deterministic dither and mask state; fades and partial scissors are not clears.
+ * The bounded target registry has 64 entries. Wave margins use complete 20x17
+ * cohorts and declared VIEW source rows; incomplete/unsupported cohorts leave
+ * the actual draw/copy result intact and increment view_wave_incomplete instead
+ * of blocking valid device work or inventing a fullscreen warp.
+ *
+ * The separate scene-builder lane retains its compiled-surface carry cache.
+ * Unlike native_work FIFO, that cache cannot reconstruct omitted delta sources.
+ * Movie/UI endpoints in that lane remain discrete.
+ *
+ * Complete recipes retain motion snapshot generations independently of source
+ * commits, including across COPY/COW and visual-history retention. Texture
+ * data is retained per draw, with at most 16 immutable snapshot versions
+ * per recipe. Later writes outside the target do not invalidate past samples;
+ * subsequent draws capture refreshed data. Provenance records actual canonical
+ * fragment writes, not inclusive bounding boxes or transparent/masked pixels.
+ * Fully copied targets inherit their source recipe and its draw-time snapshots.
+ * Replay must match both canonical and VIEW planes. A phase evaluates each
+ * entity's XgRenderMotionPose once, reuses it for every local-vertex binding and
+ * for both planes, then projects. motion.c owns local TRS/quaternion slerp and
+ * hierarchy/camera composition. Unbound source vertices may instead share an
+ * exact scene/group/vertex pair and its projected displacement; primitive identity
+ * is not required for that source-keyed path. No proximity matching or image
+ * blending is used. Unknown draws remain authored/discrete.
+ * An unbound draw in a bound entity's authored producer namespace, conflicting
+ * entity/camera snapshots, incompatible lifecycle or CLIP_REQUIRED rejects the
+ * affected entity/component before phase rendering. The real endpoint and FIFO
+ * remain valid and unchanged.
+ * Renderer phases only read immutable recipe texture/CLUT data and write new
+ * buffers, never committed canonical or VIEW pixels.
+ * Temporal publications are consumed at their before_operation FIFO gaps,
+ * including trailing metadata-only gaps. A scope replaces its complete snapshot;
+ * recipe/history retain exact retired resource refs independently of commits.
+ * Explicit component IDs partition atomic meshes within their producer scope.
+ * Visibility anchors may come only from the immediate compatible publication,
+ * never a last-seen vertex cache. Empty/intermediate publications break stale A.
+ *
+ * render_scale > 1 routes a complete ordered operation journal, not just motion
+ * recipes, to the owner-thread Native GPU service. The CPU device and reference VIEW
+ * stay 1x. All raw texture inputs are copied at their execution boundaries; GPU
+ * COPY reads frozen high-resolution source planes. Only private GPU planes are
+ * modified before the worker atomically applies the completed transaction.
+ * The independent CPU VIEW raster may run on its ordered reader. Canonical writes
+ * intersecting its conservative texture/CLUT read set, transfers, target changes,
+ * failure cleanup and publication drain that reader before mutating/freeing input.
+ * Endpoint width/height remain guest dimensions; storage dimensions are physical.
+ * GPU image digests hash actual RGBA storage through fenced PBOs. Logical reference
+ * digests are separate and never stand in for those images. Optional guest
+ * comparison samples the original logical grid from the actual GPU endpoint.
+ * Movies with intrinsically packed 24-bit pixels keep their original storage. */
+typedef enum GlRendererNativeCompileBlocker {
+    GL_RENDERER_NATIVE_BLOCKER_NONE = 0,
+    GL_RENDERER_NATIVE_BLOCKER_HEADER_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_HEADER_MISMATCH,
+    GL_RENDERER_NATIVE_BLOCKER_INVALID_DISPLAY,
+    GL_RENDERER_NATIVE_BLOCKER_PASS_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_DRAW_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_RESOURCE_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_RESOURCE_VIEW,
+    GL_RENDERER_NATIVE_BLOCKER_RESOURCE_DIGEST,
+    GL_RENDERER_NATIVE_BLOCKER_SURFACE_EDGE_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_UI_NODE_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_UI_GLYPH_RUN_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_UI_GLYPH_PLACEMENT_COPY,
+    GL_RENDERER_NATIVE_BLOCKER_TARGET_SURFACE_DESCRIPTOR,
+    GL_RENDERER_NATIVE_BLOCKER_TEXTURE_DESCRIPTOR,
+    GL_RENDERER_NATIVE_BLOCKER_UI_RESOURCE_DESCRIPTOR,
+    GL_RENDERER_NATIVE_BLOCKER_SURFACE_EDGE_DESCRIPTOR,
+    GL_RENDERER_NATIVE_BLOCKER_MOVIE_LAYOUT,
+    GL_RENDERER_NATIVE_BLOCKER_ENDPOINT_CAPACITY,
+    GL_RENDERER_NATIVE_BLOCKER_WORKER_CONTEXT,
+    GL_RENDERER_NATIVE_BLOCKER_GL_RESOURCE,
+    GL_RENDERER_NATIVE_BLOCKER_FENCE_CAPACITY,
+    GL_RENDERER_NATIVE_BLOCKER_INVALID_RECORD,
+    GL_RENDERER_NATIVE_BLOCKER_PASS_DEPENDENCY,
+    GL_RENDERER_NATIVE_BLOCKER_UNSUPPORTED_UI_NODE,
+    GL_RENDERER_NATIVE_BLOCKER_NO_STORED_DISPLAY_SURFACE,
+    GL_RENDERER_NATIVE_BLOCKER_SURFACE_HISTORY,
+    GL_RENDERER_NATIVE_BLOCKER_NATIVE_OPERATION,
+} GlRendererNativeCompileBlocker;
+
+typedef enum GlRendererNativeTemporalStatus {
+    GL_RENDERER_NATIVE_TEMPORAL_NOT_APPLICABLE = 0,
+    GL_RENDERER_NATIVE_TEMPORAL_SOURCE_STATE_REQUIRED,
+    GL_RENDERER_NATIVE_TEMPORAL_DISCRETE_DISPLAY,
+    GL_RENDERER_NATIVE_TEMPORAL_NO_RECIPE,
+    GL_RENDERER_NATIVE_TEMPORAL_REPLAY_FAILED,
+    GL_RENDERER_NATIVE_TEMPORAL_REPLAY_MISMATCH,
+    GL_RENDERER_NATIVE_TEMPORAL_READY,
+    GL_RENDERER_NATIVE_TEMPORAL_DUPLICATE,
+    GL_RENDERER_NATIVE_TEMPORAL_NO_HISTORY,
+    GL_RENDERER_NATIVE_TEMPORAL_BINDING_INCOMPLETE,
+    GL_RENDERER_NATIVE_TEMPORAL_POSE_INCOMPATIBLE,
+    GL_RENDERER_NATIVE_TEMPORAL_CLIP_REQUIRED,
+    GL_RENDERER_NATIVE_TEMPORAL_PROJECTION_INVALID,
+    GL_RENDERER_NATIVE_TEMPORAL_ALLOCATION,
+    GL_RENDERER_NATIVE_TEMPORAL_STATIC_POSE,
+    GL_RENDERER_NATIVE_TEMPORAL_SMOOTHING_DISABLED,
+    GL_RENDERER_NATIVE_TEMPORAL_SOURCE_CADENCE,
+    GL_RENDERER_NATIVE_TEMPORAL_DEADLINE_EXPIRED,
+    GL_RENDERER_NATIVE_TEMPORAL_WHOLE_ONLY,
+    GL_RENDERER_NATIVE_TEMPORAL_STATUS_COUNT,
+} GlRendererNativeTemporalStatus;
+
+typedef struct GlRendererNativeLegacyOwnerDiagnostics {
+    uint64_t canonical_draws;
+    uint64_t canonical_fills;
+    uint64_t canonical_copies;
+    uint64_t skipped_view_draws;
+    uint64_t skipped_temporal_candidates;
+    uint64_t skipped_anchor_vertices;
+    uint64_t legacy_host_raster_passes;
+    uint32_t pending_host_draws;
+    uint32_t legacy_view_surfaces;
+    uint32_t configured_view_width;
+    int active;
+} GlRendererNativeLegacyOwnerDiagnostics;
+
+typedef struct GlRendererNativeGpuDiagnostics {
+    uint64_t submitted, completed, applied, cancelled;
+    uint64_t geometry_draws, transfer_draws, commands, captured_bytes, readback_bytes;
+    uint64_t service_ns;
+    uint64_t submit_ns, finish_ns, service_max_ns, hash_ns;
+    uint64_t fence_polls, fence_pending, fence_latency_ns, fence_latency_max_ns;
+    uint64_t timed_work, gpu_render_ns, gpu_readback_ns, gpu_max_ns;
+    uint64_t word_uploads, snapshot_commands;
+    uint64_t destination_barriers, destination_copies;
+    /* Reference is the CPU 1x scanout; image is the actual GPU RGBA storage. */
+    uint64_t last_reference_digest, last_image_digest;
+    XgPresentationIdentity last_image_identity;
+    /* Last completed GPU image, not a pending settings request or a CPU movie. */
+    uint32_t render_scale, storage_width, storage_height;
+    /* 0 idle, 1 queued, 2 submitted, 3 ready, 4 published, 5 cancelled, 6 dispatching. */
+    uint32_t pending_state;
+} GlRendererNativeGpuDiagnostics;
+
+typedef struct GlRendererNativeCompilerDiagnostics {
+    uint64_t sealed_captures;
+    uint64_t sealed_capture_rejections;
+    uint64_t compile_attempts;
+    uint64_t compiled_endpoints;
+    uint64_t compile_failures;
+    uint64_t last_commit_digest;
+    uint64_t last_record_audit_digest;
+    uint64_t blocker_resource_id;
+    uint64_t blocker_resource_generation;
+    uint64_t rendered_draw_pixels;
+    uint64_t endpoint_visible_pixels;
+    uint64_t last_endpoint_pixel_digest;
+    XgPresentationIdentity last_capture_identity;
+    XgPresentationIdentity last_compile_identity;
+    uint32_t last_blocker;
+    uint32_t blocker_record_index;
+    uint32_t consumed_passes;
+    uint32_t consumed_draws;
+    uint32_t consumed_resources;
+    uint32_t consumed_surface_edges;
+    uint32_t consumed_ui_nodes;
+    uint32_t consumed_ui_glyph_runs;
+    uint32_t consumed_ui_glyph_placements;
+    uint32_t rendered_passes;
+    uint32_t rendered_draws;
+    uint32_t rendered_surface_edges;
+    uint32_t rendered_ui_nodes;
+    uint32_t rendered_ui_glyphs;
+    uint32_t pass_loads;
+    uint32_t pass_clears;
+    uint32_t pass_discards;
+    uint32_t pass_stores;
+    int all_records_consumed;
+    int last_endpoint_was_movie;
+    int last_endpoint_was_depth24;
+    int last_endpoint_was_discrete;
+    int last_endpoint_pixel_digest_valid;
+    uint32_t last_endpoint_display_x;
+    uint32_t last_endpoint_display_y;
+    uint32_t last_endpoint_width;
+    uint32_t last_endpoint_height;
+    uint32_t last_endpoint_first_edge_kind;
+    uint32_t consumed_native_operations;
+    uint64_t applied_native_work;
+    uint64_t compile_would_block;
+    XgPresentationIdentity native_vram_identity;
+    uint32_t rendered_view_draws;
+    uint32_t marked_view_draws;
+    uint32_t view_copies;
+    uint32_t view_wave_rows;
+    uint32_t view_wave_incomplete;
+    uint32_t last_storage_width;
+    uint32_t last_storage_height;
+    uint32_t view_target_count;
+    int32_t active_view_target;
+    /* Last published native endpoint, not overwritten by duplicate boundaries. */
+    uint64_t temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_STATUS_COUNT];
+    XgPresentationIdentity last_temporal_identity;
+    uint32_t last_temporal_status;
+    uint32_t last_temporal_phase_count;
+    uint32_t last_temporal_interval_vblanks;
+    uint64_t last_temporal_interval_ns;
+    uint64_t duplicate_endpoints;
+    uint64_t motion_evaluations;
+    uint64_t motion_projected_draws;
+    uint32_t consumed_motion_resources;
+    int recipe_canonical_match;
+    int recipe_view_match;
+    /* Last published Native endpoint. Match flags are unknown (zero), not a
+     * failed comparison, when this optional pixel audit was not performed. */
+    int recipe_validation_performed;
+    /* Cumulative committed Native-work counts; excludes diagnostic/phase replay. */
+    uint64_t view_logical_draws;
+    uint64_t view_physical_raster_passes;
+    uint32_t view_domain_count;
+    /* Main-owned GPU path, published under the diagnostic lock at present/read. */
+    GlRendererNativeLegacyOwnerDiagnostics legacy_owner;
+    GlRendererNativeGpuDiagnostics gpu;
+} GlRendererNativeCompilerDiagnostics;
+
+void gl_renderer_native_compiler_diagnostics(
+    GlRendererNativeCompilerDiagnostics *out_diagnostics);
+const char *gl_renderer_native_compile_blocker_name(uint32_t blocker);
+const char *gl_renderer_native_temporal_status_name(uint32_t status);
+
+typedef enum GlRendererNativePresentBlocker {
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_NONE = 0,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_INVALID_ARGUMENT,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_ENDPOINT_MISMATCH,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_STAGING_MISSING,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_CONTEXT,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_UPLOAD,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_DRAWABLE,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_GL_DRAW,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_FENCE,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_SWAP_CONTEXT,
+    GL_RENDERER_NATIVE_PRESENT_BLOCKER_SWAP_REJECTED,
+} GlRendererNativePresentBlocker;
+
+typedef struct GlRendererNativePipelineDiagnostics {
+    uint64_t capture_attempts;
+    uint64_t capture_successes;
+    uint64_t capture_failures;
+    uint64_t upload_attempts;
+    uint64_t upload_successes;
+    uint64_t upload_failures;
+    uint64_t compose_attempts;
+    uint64_t compose_successes;
+    uint64_t compose_failures;
+    uint64_t compose_retired_before_swap;
+    uint64_t swap_attempts;
+    uint64_t swap_successes;
+    uint64_t swap_failures;
+    uint64_t source_pixel_comparisons;
+    uint64_t source_pixel_matches;
+    uint64_t source_pixel_mismatches;
+    uint64_t guest_reference_capture_attempts;
+    uint64_t guest_reference_captures;
+    uint64_t guest_reference_capture_failures;
+    uint64_t guest_reference_bound_sources;
+    uint64_t guest_reference_missing_sources;
+    uint64_t guest_reference_dropped_sources;
+    uint64_t guest_reference_comparisons;
+    uint64_t guest_reference_matches;
+    uint64_t guest_reference_mismatches;
+    uint64_t last_commit_digest;
+    uint64_t last_record_audit_digest;
+    uint64_t last_endpoint_pixel_digest;
+    uint64_t last_endpoint_handle;
+    uint64_t last_backend_generation;
+    uint64_t last_present_sequence;
+    uint64_t last_compared_present_sequence;
+    uint64_t last_compared_endpoint_pixel_digest;
+    uint64_t last_compared_source_hash;
+    uint64_t last_guest_reference_sequence;
+    uint64_t last_guest_reference_digest;
+    uint64_t last_guest_reference_endpoint_digest;
+    uint64_t last_guest_reference_mismatch_pixels;
+    XgPresentationIdentity last_identity;
+    XgPresentationIdentity last_compared_identity;
+    XgPresentationIdentity last_guest_reference_identity;
+    uint32_t last_endpoint_mismatch_mask;
+    uint32_t last_present_blocker;
+    uint32_t last_width;
+    uint32_t last_height;
+    uint32_t last_format;
+    uint32_t last_guest_reference_mismatch_mask;
+    int last_source_pixel_comparison_valid;
+    int last_source_pixel_match;
+    int last_guest_reference_comparison_valid;
+    int last_guest_reference_match;
+    int pending_present;
+} GlRendererNativePipelineDiagnostics;
+
+void gl_renderer_native_pipeline_diagnostics(
+    GlRendererNativePipelineDiagnostics *out_diagnostics);
+const char *gl_renderer_native_present_blocker_name(uint32_t blocker);
+
+enum {
+    GL_NATIVE_GUEST_REFERENCE_MISMATCH_MISSING = 1u << 0,
+    GL_NATIVE_GUEST_REFERENCE_MISMATCH_WIDTH = 1u << 1,
+    GL_NATIVE_GUEST_REFERENCE_MISMATCH_HEIGHT = 1u << 2,
+    GL_NATIVE_GUEST_REFERENCE_MISMATCH_DEPTH = 1u << 3,
+    GL_NATIVE_GUEST_REFERENCE_MISMATCH_PIXELS = 1u << 4,
+};
+
+#define GL_NATIVE_GUEST_REFERENCE_RING_CAPACITY 256u
+#define GL_NATIVE_GUEST_REFERENCE_FAILURE_CAPACITY 16u
+#define GL_NATIVE_GUEST_REFERENCE_SAMPLE_CAPACITY 8u
+
+typedef struct GlRendererNativeGuestReferenceEvent {
+    XgPresentationIdentity identity;
+    uint64_t semantic_digest;
+    uint64_t record_audit_digest;
+    uint64_t reference_pixel_digest;
+    uint64_t endpoint_pixel_digest;
+    uint64_t mismatch_pixel_count;
+    uint64_t rendered_draw_pixels;
+    uint64_t endpoint_visible_pixels;
+    uint32_t scene_module;
+    uint32_t authored_scene_id;
+    uint32_t authored_submode;
+    uint32_t source_interval_vblanks;
+    uint32_t source_display_x;
+    uint32_t source_display_y;
+    uint32_t reference_width;
+    uint32_t reference_height;
+    uint32_t endpoint_width;
+    uint32_t endpoint_height;
+    uint32_t mismatch_mask;
+    uint32_t mismatch_bounds[4];
+    uint32_t consumed_records[6];
+    uint32_t rendered_records[5];
+    uint32_t pass_operations[4];
+    uint16_t sample_x[GL_NATIVE_GUEST_REFERENCE_SAMPLE_CAPACITY];
+    uint16_t sample_y[GL_NATIVE_GUEST_REFERENCE_SAMPLE_CAPACITY];
+    uint32_t reference_samples[GL_NATIVE_GUEST_REFERENCE_SAMPLE_CAPACITY];
+    uint32_t endpoint_samples[GL_NATIVE_GUEST_REFERENCE_SAMPLE_CAPACITY];
+    uint8_t sample_count;
+    uint8_t reference_valid;
+    uint8_t identity_valid;
+    uint8_t endpoint_valid;
+    uint8_t comparison_valid;
+    uint8_t matches_endpoint;
+    uint8_t reference_depth24;
+    uint8_t endpoint_depth24;
+} GlRendererNativeGuestReferenceEvent;
+
+uint64_t gl_renderer_native_guest_reference_total(void);
+int gl_renderer_native_guest_reference_get(
+    uint64_t sequence, GlRendererNativeGuestReferenceEvent *out_event);
+uint64_t gl_renderer_native_guest_reference_failure_total(void);
+int gl_renderer_native_guest_reference_failure_get(
+    uint32_t index, uint64_t *out_sequence,
+    GlRendererNativeGuestReferenceEvent *out_event);
 
 /* Set the GL swap interval / vsync mode (1=vsync, 0=immediate, -1=adaptive).
  * Safe before or after context creation; applies live when a context exists. */
@@ -121,11 +605,11 @@ typedef enum GlRendererTransactionSwapStatus {
 } GlRendererTransactionSwapStatus;
 
 /* Consume a transaction only after gr_commit_validate returned READY. On the
- * READY path the first SDL/GL/window operation is SDL_GL_SwapWindow; all
- * renderer publication and checkpoint disposal follow the call. SDL exposes
- * no swap result, so SUCCESS means the call returned under the context/window
- * ownership validated by commit. NOT_READY performs no SDL/GL/window operation
- * and leaves any open pre-READY checkpoint rollbackable. */
+ * READY path the private owner validation and its immediately-contained swap
+ * precede all renderer publication and checkpoint disposal. SDL exposes no
+ * swap result, so SUCCESS means the call returned under the context/window
+ * ownership validated by commit. NOT_READY leaves any open pre-READY
+ * checkpoint rollbackable. */
 GlRendererTransactionSwapStatus gl_renderer_swap_ready_transaction(void);
 
 /* Fail-closed recovery for the otherwise unreachable case where commit
@@ -603,7 +1087,7 @@ int  gl_renderer_native_view_phase_peek(int base_x, unsigned int phase,
 void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]);
 
 /* Always-on coherency event ring (debug server "gl_coh_ring"): every upload
- * flush, fill, copy, draw bbox, pack, full readback, present, and probe
+ * flush, fill, copy, draw bbox, pack, regional readback, present, and probe
  * perturbation, with rect + frame. An op that flushes internally records its
  * own event AFTER the FLUSH it caused (the event after a FLUSH = trigger). */
 enum {
@@ -613,7 +1097,7 @@ enum {
     GL_COH_COPY     = 4,   /* GP0(80) copy, dest rect                 */
     GL_COH_DRAW     = 5,   /* drawn prim bbox (clipped to draw area)  */
     GL_COH_PACK     = 6,   /* hr FBO -> raw mirror pack (dirty box)   */
-    GL_COH_ENSURE   = 7,   /* full FBO -> CPU VRAM readback           */
+    GL_COH_ENSURE   = 7,   /* regional FBO -> CPU VRAM readback       */
     GL_COH_PRESENT  = 8,   /* 15-bit present blit (display rect)      */
     GL_COH_UPLOAD   = 9,   /* bulk CPU->VRAM transfer_in dest rect    */
     GL_COH_PEEK     = 10,  /* gl_fbo_peek probe (perturbs: flushes)   */
@@ -680,6 +1164,8 @@ typedef struct {
     uint8_t  src_r, src_g, src_b, src_valid; /* blit SOURCE (hr FBO) sample
                                               * at the display-rect centre  */
     uint8_t  swap_completed; /* set only after SDL_GL_SwapWindow returns   */
+    uint8_t  swap_attempted;
+    uint8_t  swap_failed;
     uint8_t  phase_numerator;   /* 0 for current/non-semantic presents     */
     uint8_t  phase_denominator; /* 0 for current/non-semantic presents     */
     uint8_t  framebuffer_hash_valid;
@@ -692,8 +1178,24 @@ typedef struct {
     uint32_t refresh_ns;
     uint32_t presentation_flags;
     uint8_t  source_hash_valid;
-    uint8_t  source_hash_reserved[7];
+    uint8_t  semantic_identity_valid;
+    uint8_t  source_pixel_comparison_valid;
+    uint8_t  source_pixel_match;
+    uint8_t  native_upload_attempted;
+    uint8_t  native_upload_succeeded;
+    uint8_t  native_compose_succeeded;
+    uint8_t  endpoint_pixel_digest_valid;
+    uint8_t  native_retired_before_swap;
+    uint8_t  native_state_reserved[7];
     uint64_t source_hash;
+    XgPresentationIdentity semantic_identity;
+    uint64_t semantic_digest;
+    uint64_t record_audit_digest;
+    uint64_t endpoint_pixel_digest;
+    uint64_t endpoint_handle;
+    uint64_t endpoint_backend_generation;
+    uint32_t endpoint_format;
+    uint32_t endpoint_mismatch_mask;
     uint8_t  geometry_hash_valid;
     uint8_t  geometry_hash_reserved[7];
     uint64_t geometry_hash;

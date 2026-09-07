@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 
+GuestRenderNativeStreamStatus guest_render_native_stream_test_set_p1_counter(
+    uint32_t counter_id, uint8_t opcode, uint64_t value);
+
 #define CHECK(condition) do {                                                \
     if (!(condition)) {                                                      \
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
@@ -955,6 +958,261 @@ static int test_equivalent_active_miss_resolutions_commit_once(void) {
     return 1;
 }
 
+static int test_versioned_diagnostics_separate_source_lanes(void) {
+    const GpuRenderTransactionId visual = {30u, 7u};
+    const GpuRenderSemantic semantic = make_semantic(91u);
+    GuestRenderNativeDiagnosticSource source = {
+        .valid_fields = GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_ADDRESS |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_FUNCTION |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_RETURN_ADDRESS |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_KIND,
+        .source_word_address = 0x00112200u,
+        .pc = 0x80012340u,
+        .function = 0x80012000u,
+        .return_address = 0x80045678u,
+        .source_kind = GUEST_RENDER_NATIVE_STREAM_SOURCE_DMA_LINKED_LIST,
+        .opcode = 0x2cu,
+    };
+    GuestRenderNativeDiagnosticsV1 diagnostics;
+    GpuRenderSemantic consumed;
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              2u, &diagnostics, sizeof(diagnostics)) ==
+          GUEST_RENDER_NATIVE_STREAM_UNSUPPORTED_VERSION);
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1, &diagnostics,
+              sizeof(diagnostics) - 1u) ==
+          GUEST_RENDER_NATIVE_STREAM_INVALID_ARGUMENT);
+
+    CHECK(guest_render_native_stream_stage_exact(
+              visual, 0x9000u, &semantic) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_activate_visual(visual) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_consume_exact(
+              visual, 0x9000u, &consumed) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_resolved_consumed(
+              visual, 0x9004u, &semantic) == GUEST_RENDER_NATIVE_STREAM_OK);
+
+    guest_render_native_stream_note_gte_binding(0x2cu, 3u, 3u, 3u, true);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED, &source) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    source.pc = 0u;
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_CPU_CANONICAL, &source) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GUEST_GPU_COMPATIBILITY_PRIMITIVE,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_SEMANTIC_POST_GTE_READ,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_PACKET_PAYLOAD_READ,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_GP0_DECODE_TO_SEMANTIC,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_OT_PAYLOAD_READ,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_UNKNOWN_GP0_COMMAND,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_UNKNOWN_GP1_COMMAND,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_FORBIDDEN_NON_NATIVE,
+              &source) == GUEST_RENDER_NATIVE_STREAM_OK);
+
+    guest_render_native_stream_note_native_draw_source(0x24u, false);
+    guest_render_native_stream_note_native_packet_attribution(
+        0x24u, true, true, 0x00123400u, 0x80011110u, 0x80011000u,
+        0x80022220u);
+    guest_render_native_stream_note_native_packet_attribution(
+        0x64u, false, false, 0x00123500u, 0x80033330u, 0x80033000u,
+        0x80044440u);
+    guest_render_native_stream_note_original_draw(0x3cu);
+
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1, &diagnostics,
+              sizeof(diagnostics)) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(diagnostics.version == GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1);
+    CHECK(diagnostics.size == sizeof(diagnostics));
+    CHECK(diagnostics.producer_exact_primitives == 1u);
+    CHECK(diagnostics.miss_resolver_primitives == 1u);
+    CHECK(diagnostics.gte_derived_primitives == 1u);
+    CHECK(diagnostics.cpu_canonical_primitives == 1u);
+    CHECK(diagnostics.packet_derived_primitives == 1u);
+    CHECK(diagnostics.unbound_primitives == 1u);
+    CHECK(diagnostics.unsupported_primitives == 1u);
+    CHECK(diagnostics.guest_gpu_compatibility_primitives == 1u);
+    CHECK(diagnostics.original_primitives == 1u);
+    CHECK(diagnostics.forbidden_non_native_primitives == 2u);
+    CHECK(diagnostics.semantic_post_gte_reads == 1u);
+    CHECK(diagnostics.target_packet_payload_reads_by_semantic_lane == 1u);
+    CHECK(diagnostics.target_gp0_decode_to_semantic_calls == 1u);
+    CHECK(diagnostics.target_ot_payload_geometry_or_material_reads == 1u);
+    CHECK(diagnostics.unknown_gp0_commands == 1u);
+    CHECK(diagnostics.unknown_gp1_commands == 1u);
+    CHECK(diagnostics.uncovered_producers == 1u);
+    CHECK(diagnostics.first_offender[
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED].pc == 0x80012340u);
+    CHECK(diagnostics.first_offender[
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_PACKET_DERIVED]
+              .source_word_address == 0x00123400u);
+    CHECK(diagnostics.first_offender[
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_PACKET_DERIVED].pc ==
+          0x80011110u);
+    CHECK(diagnostics.first_offender[
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_UNBOUND].return_address ==
+          0x80044440u);
+    CHECK(diagnostics.first_offender[
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_ORIGINAL_PRIMITIVE]
+              .valid_fields == GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE);
+    CHECK(!diagnostics.counter_overflowed);
+    return 1;
+}
+
+static int test_versioned_diagnostics_overflow_and_reset(void) {
+    const GuestRenderNativeDiagnosticSource source = {
+        .valid_fields = GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE,
+        .pc = 0x800abc00u,
+        .opcode = 0x38u,
+    };
+    GuestRenderNativeDiagnosticsV1 diagnostics;
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_test_set_diagnostic_counter(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED, UINT64_MAX) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED, &source) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(guest_render_native_stream_note_diagnostic_event(
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED, &source) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1, &diagnostics,
+              sizeof(diagnostics)) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(diagnostics.gte_derived_primitives == UINT64_MAX);
+    CHECK(diagnostics.counter_overflowed);
+    CHECK(diagnostics.counter_overflow_events == 2u);
+    CHECK(diagnostics.first_overflow_kind ==
+          GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED);
+    CHECK(diagnostics.first_overflow_source.pc == 0x800abc00u);
+
+    CHECK(guest_render_native_stream_diagnostics_reset() ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1, &diagnostics,
+              sizeof(diagnostics)) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(diagnostics.reset_sequence == 1u);
+    CHECK(diagnostics.gte_derived_primitives == 0u);
+    CHECK(diagnostics.original_primitives == 0u);
+    CHECK(diagnostics.counter_overflow_events == 0u);
+    CHECK(!diagnostics.counter_overflowed);
+    CHECK(diagnostics.first_offender[
+              GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED].valid_fields == 0u);
+
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              7u, 0u, UINT64_MAX) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_diagnostics_reset() ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1, &diagnostics,
+              sizeof(diagnostics)) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(diagnostics.reset_sequence == UINT64_MAX);
+    CHECK(diagnostics.counter_overflowed);
+    CHECK(diagnostics.counter_overflow_events == 1u);
+    CHECK(diagnostics.first_overflow_kind ==
+          GUEST_RENDER_NATIVE_DIAGNOSTIC_EVENT_KIND_COUNT);
+    return 1;
+}
+
+static int test_p1_counters_saturate_and_poison_snapshot(void) {
+    const GpuRenderSemantic semantic = make_semantic(17u);
+    GuestRenderNativeDiagnosticsV1 diagnostics;
+    GuestRenderNativeStreamSnapshot snapshot;
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              1u, 0u, UINT64_MAX - 1u) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              2u, 0u, UINT64_MAX - 1u) == GUEST_RENDER_NATIVE_STREAM_OK);
+    guest_render_native_stream_note_parser_replay_command(0x24u);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(snapshot.total_parser_replay_commands == UINT64_MAX);
+    CHECK(snapshot.total_parser_replay_draws == UINT64_MAX);
+
+    guest_render_native_stream_note_parser_replay_command(0x24u);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(snapshot.total_parser_replay_commands == UINT64_MAX);
+    CHECK(snapshot.total_parser_replay_draws == UINT64_MAX);
+    CHECK(guest_render_native_stream_diagnostics_snapshot(
+              GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1, &diagnostics,
+              sizeof(diagnostics)) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(diagnostics.counter_overflowed);
+    CHECK(diagnostics.counter_overflow_events == 2u);
+    CHECK(diagnostics.first_overflow_kind ==
+          GUEST_RENDER_NATIVE_DIAGNOSTIC_EVENT_KIND_COUNT);
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              3u, 0x64u, UINT64_MAX) == GUEST_RENDER_NATIVE_STREAM_OK);
+    guest_render_native_stream_note_native_packet(0x64u, true, true);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(snapshot.native_opcode_counts[0x64u] == UINT64_MAX);
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              4u, 0u, UINT64_MAX - 1u) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              5u, 0u, UINT64_MAX - 100u) == GUEST_RENDER_NATIVE_STREAM_OK);
+    guest_render_native_stream_note_shared_fmv_present(20u, 10u, false);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(snapshot.total_shared_fmv_frames == UINT64_MAX);
+    CHECK(snapshot.total_shared_fmv_pixels == UINT64_MAX);
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_test_set_p1_counter(
+              6u, 0u, UINT64_MAX) == GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(guest_render_native_stream_stage_exact(
+              (GpuRenderTransactionId){40u, 1u}, 0x1000u, &semantic) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+    CHECK(snapshot.total_staged == UINT64_MAX);
+
+    guest_render_native_stream_test_reset();
+    guest_render_native_stream_set_enabled(true);
+    CHECK(guest_render_native_stream_snapshot(&snapshot) ==
+          GUEST_RENDER_NATIVE_STREAM_OK);
+    CHECK(snapshot.total_parser_replay_commands == 0u);
+    return 1;
+}
+
 int main(void) {
     if (!test_disabled_and_validation()) return 1;
     if (!test_identity_and_single_consumption()) return 1;
@@ -980,6 +1238,9 @@ int main(void) {
     if (!test_suspend_and_reactivate_preserve_exact_visual()) return 1;
     if (!test_preflight_reservation_is_single_consumer_and_abortable()) return 1;
     if (!test_equivalent_active_miss_resolutions_commit_once()) return 1;
+    if (!test_versioned_diagnostics_separate_source_lanes()) return 1;
+    if (!test_versioned_diagnostics_overflow_and_reset()) return 1;
+    if (!test_p1_counters_saturate_and_poison_snapshot()) return 1;
     puts("guest_render_native_stream: all tests passed");
     return 0;
 }

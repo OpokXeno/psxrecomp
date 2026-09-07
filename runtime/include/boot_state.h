@@ -41,15 +41,17 @@ extern "C" {
  * v4 = v3 + optional zlib on large sections (section pad bit0 = compressed);
  * v5 = v4 + CD-ROM Sub-Q replacement state;
  * v6 = v5 + exact game and manifest SHA-256 identities;
- * v7 = v6 + explicit active main-RAM size and profile. */
-#define BOOT_STATE_VERSION 7u
+ * v7 = v6 + explicit active main-RAM size and profile;
+ * v8 = v7 + renderer-owned Native resource checkpoint;
+ * v9 = v8 + exact RAM provenance authority. */
+#define BOOT_STATE_VERSION 9u
 /* Only the current complete wire format is accepted. */
-#define BOOT_STATE_VERSION_MIN_READ 7u
+#define BOOT_STATE_VERSION_MIN_READ 9u
 /* Section pad bit0: payload is u32 LE uncompressed_len + zlib deflate bytes. */
 #define BOOT_STATE_SEC_ZLIB 1u
 
 /*
- * On-disk header (v7): ten little-endian uint32 fields at offset 0 (40 bytes),
+ * On-disk header (v9): ten little-endian uint32 fields at offset 0 (40 bytes),
  * followed by the game and manifest SHA-256 identities (64
  * bytes), then the section stream. ALL key fields must match the running build
  * or the snapshot is rejected. Do not fwrite() this struct — use pst_wire.
@@ -79,7 +81,7 @@ enum {
 #define BOOT_STATE_HEADER_WIRE_BYTES 104u
 
 /*
- * Section stream (v7): section_count records, each laid out as
+ * Section stream (v9): section_count records, each laid out as
  *     uint32_t tag;        LE (one of BS_SEC_*)
  *     uint32_t pad;        LE flags (BOOT_STATE_SEC_ZLIB optional)
  *     uint64_t len;        LE payload byte count
@@ -111,8 +113,44 @@ enum {
                               and IRQ delivery lands a few wait-loop iterations
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
-                              old blobs (left untouched when absent).          */
+                               old blobs (left untouched when absent).          */
+    BS_SEC_NATIVE_RENDER = 0x11, /* Opaque renderer ownership checkpoint; guest
+                                    VRAM remains the sole pixel authority.       */
+    BS_SEC_RAM_PROVENANCE = 0x12, /* Versioned pointer-free per-word RAM authority
+                                     and receipt/revision counter.               */
 };
+
+typedef struct BootStateNativeCheckpointHooks {
+    uint32_t (*snapshot_size)(void);
+    int (*snapshot_write)(uint8_t *out, uint32_t size);
+    int (*restore_prepare)(const uint8_t *checkpoint, uint32_t size,
+                           void **out_prepared);
+    void (*restore_commit)(void *prepared);
+    void (*restore_cancel)(void *prepared);
+    /* Cheap guest-owner preflight. Zero means a complete checkpoint cannot be
+     * captured yet; callers retain pending requests. NULL means no preflight.
+     * Must not advance the guest or mutate state. Writers still validate. */
+    int (*snapshot_ready)(void);
+} BootStateNativeCheckpointHooks;
+
+/* The boot-state layer transports this payload without interpreting it.
+ * prepare is fallible and must not publish state; on rejection it leaves the
+ * prior state intact and *out_prepared NULL. commit is infallible. */
+void boot_state_set_native_checkpoint_hooks(
+    const BootStateNativeCheckpointHooks *hooks);
+
+/* Optional save-progress service, NULL by default. Install/remove on the guest
+ * owner, outside a save. Called only between unlocked save steps/copy chunks,
+ * never inside a module or Native checkpoint writer. It may suspend and return
+ * to the same stack, but must keep guest execution/state frozen: no input,
+ * restore, netplay admission, guest calls or longjmp. Return 0 to abort the save.
+ * Reentrant save/load requests from the service are rejected. No wire change. */
+void boot_state_set_save_service_hook(int (*hook)(void));
+
+#if defined(PSX_BOOT_STATE_TEST_FAULT_INJECTION)
+/* One-shot failure after GPU state apply, before any restore publication. */
+void boot_state_test_fail_after_device_apply_once(void);
+#endif
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */
 int  boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
@@ -129,6 +167,33 @@ int  boot_state_save_buffer(const CPUState* cpu, uint32_t bios_checksum,
 int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                 uint32_t entry_pc, uint8_t** out_data,
                                 size_t* out_len);
+
+/* Split raw save: capture on the guest owner with the guest frozen, encode on
+ * any one thread, then finish on the owner after synchronizing with that thread.
+ * Capture owns every byte needed by encode; no guest/module hooks run there.
+ * Capture consumes reuse even on failure; pass NULL for the first capture.
+ * Finish returns the staging object for reuse after the worker handoff, or free
+ * it with free_raw. Only its successful output is a
+ * publishable snapshot, in the same wire format/order as save_buffer_raw. */
+typedef struct BootStateRawCapture BootStateRawCapture;
+BootStateRawCapture *boot_state_prepare_raw(void);
+BootStateRawCapture *boot_state_capture_raw(const CPUState *cpu,
+                                           uint32_t bios_checksum,
+                                           uint32_t entry_pc,
+                                           BootStateRawCapture *reuse);
+void boot_state_encode_raw(BootStateRawCapture *capture);
+int boot_state_finish_raw(BootStateRawCapture *capture,
+                          uint8_t **out_data, size_t *out_len,
+                          BootStateRawCapture **out_reuse);
+void boot_state_free_raw(BootStateRawCapture *capture);
+
+/* Guest-owner diagnostics for buffer saves; opt-in PSX_SNAPSHOT_PERF=1.
+ * total/max/last_ms measure guest capture (including save service), not async
+ * encoding or ring publication/backpressure. encode_* reports worker time;
+ * succeeded/bytes advance only at finish. No timing calls when disabled. */
+int boot_state_save_perf_json(char *out, int capacity);
+/* Optional owner-thread consumer diagnostics appended to snapshot_perf. */
+void boot_state_set_save_consumer_perf_hook(int (*hook)(char *, int));
 
 /* §96 telemetry: after the latest save, how many VRAM scanlines were dirty
  * and whether the incremental mirror path patched (vs full memcpy). */

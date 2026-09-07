@@ -124,9 +124,17 @@ reject_unfinished_build_dir "$BUILD"
 
 # 1. Build the emitter FRESH so the regen always reflects current source.
 echo "regen_bios: building psxrecomp-bios in $BUILD"
-cmake --build "$BUILD" --target psxrecomp-bios >/dev/null
+cmake --build "$BUILD" --config Release --target psxrecomp-bios >/dev/null
 
-EXE="$BUILD/psxrecomp-bios.exe"; [ -f "$EXE" ] || EXE="$BUILD/psxrecomp-bios"
+BIN_DIR="$BUILD"
+while IFS= read -r CACHE_LINE; do
+    CACHE_LINE="${CACHE_LINE%$'\r'}"
+    if [[ "$CACHE_LINE" == CMAKE_CONFIGURATION_TYPES:* && -n "${CACHE_LINE#*=}" ]]; then
+        BIN_DIR="$BUILD/Release"
+        break
+    fi
+done < "$BUILD/CMakeCache.txt"
+EXE="$BIN_DIR/psxrecomp-bios.exe"; [ -f "$EXE" ] || EXE="$BIN_DIR/psxrecomp-bios"
 [ -f "$EXE" ] || { echo "regen_bios: psxrecomp-bios not found in $BUILD after build"; exit 1; }
 
 toml_value() {

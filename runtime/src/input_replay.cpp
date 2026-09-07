@@ -13,8 +13,12 @@
 #include "xg_render_auth_runtime_diagnostics.h"
 #endif
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
+#include "crash_trace.h"
+#include "psx_cycles.h"
 #include "xg_render_auth.h"
-#include "xg_render_manifest_generated.h"
+#include "xg_render_native_work.h"
+#include "xg_render_runtime_host_services.h"
+#include "xg_render_semantic_presentation.h"
 #endif
 
 #include <algorithm>
@@ -25,9 +29,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <ostream>
 #include <sstream>
 #include <sys/stat.h>
+#include <utility>
 #include <vector>
 
 namespace input_replay {
@@ -152,8 +158,7 @@ struct Replay {
     bool baseline_request = false;
     bool baseline_sample_attempted = false;
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
-    PsxXgRenderAuthInstrumentation auth_instrumentation_start{};
-    bool auth_instrumentation_started = false;
+    bool auth_cold_enabled = false;
     bool producer_family_requested = false;
     bool producer_family_armed = false;
 #endif
@@ -232,37 +237,6 @@ struct Recorder {
 Recorder recorder;
 
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
-struct AuthProofTuple {
-    uint32_t producer_entry = 0;
-    uint32_t capture_site = 0;
-    uint32_t static_callee = 0;
-    uint32_t return_site = 0;
-};
-
-struct AuthProofTrace {
-    uint64_t entry_sequence = 0;
-    uint64_t capture_sequence = 0;
-    uint64_t return_sequence = 0;
-    uint64_t scene_epoch = 0;
-    uint64_t state_sequence = 0;
-};
-
-bool exact_auth_tuple(const AuthProofTuple& value) {
-    const XgRenderManifestValidation& validation = xg_render_manifest_validation;
-
-    return value.producer_entry == validation.producer_entry &&
-           value.capture_site == validation.caller_site &&
-           value.static_callee == validation.static_callee &&
-           value.return_site == validation.return_site;
-}
-
-void write_auth_tuple(std::ostream& output, const AuthProofTuple& value) {
-    output << "{\"producer_entry\":" << value.producer_entry
-           << ",\"capture_site\":" << value.capture_site
-           << ",\"static_callee\":" << value.static_callee
-           << ",\"return_site\":" << value.return_site << "}";
-}
-
 void write_ft4_payload_mismatch(
     std::ostream& output, const PsxXgRenderFt4PayloadMismatch& mismatch) {
     output << "{\"field_bits\":" << mismatch.field_bits
@@ -283,253 +257,6 @@ void write_ft4_payload_mismatch(
            << ",\"actual_clut\":" << mismatch.actual_clut << "}";
 }
 
-PsxXgRenderAuthInstrumentation auth_instrumentation_delta(
-        const PsxXgRenderAuthInstrumentation& current,
-        const PsxXgRenderAuthInstrumentation& start) {
-    const uint64_t start_sequence = std::max({
-        start.last_progress_sequence,
-        start.last_reset_sequence,
-        start.last_publish_sequence,
-    });
-    const auto relative_sequence = [start_sequence](uint64_t sequence) {
-        return sequence > start_sequence ? sequence - start_sequence : 0u;
-    };
-
-    return {
-        current.revision,
-        current.cold_hook_ingress_count - start.cold_hook_ingress_count,
-        current.activation_physical_count - start.activation_physical_count,
-        current.activation_exact_count - start.activation_exact_count,
-        current.entry_physical_count - start.entry_physical_count,
-        current.entry_exact_count - start.entry_exact_count,
-        current.capture_physical_count - start.capture_physical_count,
-        current.capture_exact_count - start.capture_exact_count,
-        current.return_physical_count - start.return_physical_count,
-        current.return_exact_count - start.return_exact_count,
-        relative_sequence(current.last_progress_sequence),
-        relative_sequence(current.last_reset_sequence),
-        relative_sequence(current.last_publish_sequence),
-        current.scene_boundary_count - start.scene_boundary_count,
-        current.disarm_count - start.disarm_count,
-        current.completed_proof_publication_count -
-            start.completed_proof_publication_count,
-        current.native_ir_flush_attempt_count -
-            start.native_ir_flush_attempt_count,
-        current.native_ir_flush_failure_count -
-            start.native_ir_flush_failure_count,
-        current.first_native_ir_flush_failure_index,
-        current.first_native_ir_flush_failure_reason,
-        current.first_native_ir_flush_failure_packet,
-        current.first_native_ir_flush_failure_status,
-    };
-}
-
-bool auth_trace_contains_sequence(const XgRenderAuthTraceSnapshot& trace,
-                                  uint64_t sequence) {
-    if (sequence == 0u) return false;
-    for (size_t index = 0u; index < trace.count; ++index) {
-        if (trace.events[index].sequence == sequence) return true;
-    }
-    return false;
-}
-
-void write_auth_proof(std::ostream& output, uint16_t evidence_field_id) {
-    constexpr uint32_t kXenogearsFieldIdAddress = UINT32_C(0x8006f94e);
-    XgRenderAuthSnapshot runtime_snapshot{};
-    XgRenderAuthTraceSnapshot runtime_trace{};
-    PsxXgRenderAuthProvenance provenance{};
-    PsxXgRenderAuthCompletedProofReceipt completed_proof{};
-    PsxXgRenderAuthInstrumentation instrumentation{};
-    XgRenderAuth* auth = nullptr;
-    psx_xg_render_auth_completed_proof_snapshot(&completed_proof);
-    psx_xg_render_auth_instrumentation_snapshot(&instrumentation);
-    if (replay.auth_instrumentation_started)
-        instrumentation = auth_instrumentation_delta(
-            instrumentation, replay.auth_instrumentation_start);
-    psx_xg_render_auth_provenance_snapshot(&provenance);
-    const bool runtime_available =
-        xg_render_auth_process_owner(&auth) == XG_RENDER_AUTH_OK && auth != nullptr &&
-        xg_render_auth_snapshot(auth, &runtime_snapshot) == XG_RENDER_AUTH_OK &&
-        xg_render_auth_trace_snapshot(auth, &runtime_trace) == XG_RENDER_AUTH_OK;
-    const bool static_accepted = provenance.manifest_bound &&
-        provenance.range_bound;
-    const AuthProofTuple runtime_tuple = {
-        completed_proof.tuple.producer_entry,
-        completed_proof.tuple.capture_site,
-        completed_proof.tuple.static_callee,
-        completed_proof.tuple.return_site,
-    };
-    const AuthProofTrace runtime_proof_trace = {
-        completed_proof.entry_event_sequence,
-        completed_proof.capture_event_sequence,
-        completed_proof.return_event_sequence,
-        completed_proof.state_id.scene_epoch,
-        completed_proof.state_id.state_sequence,
-    };
-    const bool cold_proof =
-        completed_proof.tier == XG_RENDER_AUTH_TIER_COLD_INTERPRETER;
-    const bool warm_proof =
-        completed_proof.tier == XG_RENDER_AUTH_TIER_WARM_NATIVE;
-    const bool runtime_accepted = completed_proof.available &&
-        instrumentation.completed_proof_publication_count > 0u &&
-        !completed_proof.blocked &&
-        completed_proof.producer_record_id ==
-            xg_render_manifest_validation.producer_record_id &&
-        completed_proof.site_record_id ==
-            xg_render_manifest_validation.site_record_id &&
-        exact_auth_tuple(runtime_tuple) &&
-        runtime_proof_trace.scene_epoch != 0u &&
-        runtime_proof_trace.entry_sequence != 0u &&
-        runtime_proof_trace.capture_sequence != 0u &&
-        runtime_proof_trace.return_sequence != 0u &&
-        runtime_proof_trace.entry_sequence + 1u ==
-            runtime_proof_trace.capture_sequence &&
-        runtime_proof_trace.capture_sequence + 1u ==
-            runtime_proof_trace.return_sequence &&
-        (cold_proof ||
-         (warm_proof && completed_proof.candidate_matched &&
-           completed_proof.candidate_dispatched));
-    const bool cold_runtime = completed_proof.available && cold_proof;
-    const bool warm_runtime = completed_proof.available && warm_proof;
-    const bool retained_blocked = completed_proof.available &&
-        completed_proof.blocked;
-    const bool candidate_matched = runtime_accepted
-        ? completed_proof.candidate_matched : provenance.candidate_matched;
-    const bool candidate_dispatched = runtime_accepted
-        ? completed_proof.candidate_dispatched : provenance.candidate_dispatched;
-    const XgRenderAuthReason reject_reason_value = retained_blocked
-        ? completed_proof.blocker_reason : XG_RENDER_AUTH_REJECT_NONE;
-    const PsxXgRenderAuthRejectionReceipt rejection = retained_blocked
-        ? completed_proof.blocker_rejection
-        : PsxXgRenderAuthRejectionReceipt{};
-    const bool observed = static_accepted && runtime_accepted;
-    const char* reject_reason = xg_render_auth_reason_name(reject_reason_value);
-    const char* rejection_source = psx_xg_render_auth_rejection_source_name(
-        rejection.source);
-    const char* rejection_hook = rejection.has_hook
-        ? psx_xg_render_auth_hook_name(rejection.hook) : "none";
-    size_t rejected_event_count = 0u;
-    bool reset_since_trace_start = false;
-    if (runtime_available) {
-        for (size_t index = 0u; index < runtime_trace.count; ++index) {
-            const XgRenderAuthTraceEvent& event = runtime_trace.events[index];
-
-            if (event.event_mode != XG_RENDER_AUTH_EVENT_ACCEPTED_HOOK)
-                ++rejected_event_count;
-            if (event.state_id.scene_epoch !=
-                    runtime_snapshot.logical_identity.state_id.scene_epoch ||
-                event.state_id.state_sequence !=
-                    runtime_snapshot.logical_identity.state_id.state_sequence)
-                reset_since_trace_start = true;
-        }
-    }
-    const size_t trace_event_count = runtime_available ? runtime_trace.count : 0u;
-    const bool trace_overflowed = runtime_available && completed_proof.available &&
-        (!auth_trace_contains_sequence(runtime_trace,
-                                       completed_proof.entry_event_sequence) ||
-         !auth_trace_contains_sequence(runtime_trace,
-                                       completed_proof.capture_event_sequence) ||
-         !auth_trace_contains_sequence(runtime_trace,
-                                       completed_proof.return_event_sequence));
-
-    output << ",\"auth_proof\":{\"schema\":\"xenogears.native-render-auth-proof/v4\""
-           << ",\"status\":\"" << (observed ? "OBSERVED" : "BLOCKED") << "\""
-           << ",\"privacy\":{\"metadata_only\":true,\"raw_instruction_words\":false"
-           << ",\"raw_delay_slot_words\":false,\"identities_or_digests\":false"
-           << ",\"private_paths\":false,\"disc_cards_cache_hashes\":false"
-           << ",\"input_states\":false,\"packets\":false,\"child_runtime_json\":false}"
-            << ",\"static\":{\"accepted\":" << (static_accepted ? "true" : "false")
-            << ",\"provenance\":{\"source\":\"manifest-overlay\""
-            << ",\"image\":\"field-image\""
-            << ",\"producer_entry\":"
-            << xg_render_manifest_validation.producer_entry
-            << ",\"range_start\":"
-            << xg_render_manifest_validation.field_range_start
-            << ",\"range_size\":"
-            << xg_render_manifest_validation.field_range_size
-            << ",\"manifest_bound\":"
-            << (provenance.manifest_bound ? "true" : "false")
-            << ",\"range_bound\":"
-            << (provenance.range_bound ? "true" : "false")
-            << ",\"candidate\":{\"matched\":"
-            << (candidate_matched ? "true" : "false")
-            << ",\"dispatched\":"
-            << (candidate_dispatched ? "true" : "false")
-            << "}}},\"runtime\":{\"accepted\":"
-            << (runtime_accepted ? "true" : "false")
-            << ",\"tier\":\""
-            << (cold_runtime ? "cold" : warm_runtime ? "warm" : "none") << "\""
-            << ",\"reject_reason\":\"" << reject_reason << "\""
-            << ",\"scene_aborted\":" << (retained_blocked ? "true" : "false")
-            << ",\"ir_usable\":" << (runtime_accepted ? "true" : "false")
-            << ",\"native_permitted\":" << (runtime_accepted ? "true" : "false")
-            << ",\"diagnostic\":{\"available\":"
-            << (runtime_available ? "true" : "false")
-            << ",\"producer_begin_count\":"
-            << (completed_proof.available ? 1u : 0u)
-            << ",\"hook_count\":"
-            << (completed_proof.available ? XG_RENDER_AUTH_HOOK_STAGE_COUNT : 0u)
-            << ",\"trace_event_count\":" << trace_event_count
-            << ",\"trace_overflowed\":" << (trace_overflowed ? "true" : "false")
-            << ",\"accepted_entry\":" << (completed_proof.available ? "true" : "false")
-            << ",\"accepted_capture\":" << (completed_proof.available ? "true" : "false")
-            << ",\"accepted_return\":" << (completed_proof.available ? "true" : "false")
-            << ",\"rejected_event_count\":" << rejected_event_count
-            << ",\"reset_since_trace_start\":"
-            << (reset_since_trace_start ? "true" : "false")
-            << ",\"scene_aborted\":"
-            << (retained_blocked ? "true" : "false")
-            << ",\"reject_reason\":\"" << reject_reason << "\""
-            << ",\"rejection_source\":\"" << rejection_source << "\""
-             << ",\"rejection_hook\":\"" << rejection_hook << "\""
-             << ",\"rejection_guest_pc\":" << rejection.guest_pc
-             << ",\"instrumentation\":{\"revision\":" << instrumentation.revision
-             << ",\"cold_hook_ingress_count\":" << instrumentation.cold_hook_ingress_count
-             << ",\"activation_physical_count\":" << instrumentation.activation_physical_count
-             << ",\"activation_exact_count\":" << instrumentation.activation_exact_count
-             << ",\"entry_physical_count\":" << instrumentation.entry_physical_count
-             << ",\"entry_exact_count\":" << instrumentation.entry_exact_count
-             << ",\"capture_physical_count\":" << instrumentation.capture_physical_count
-             << ",\"capture_exact_count\":" << instrumentation.capture_exact_count
-             << ",\"return_physical_count\":" << instrumentation.return_physical_count
-             << ",\"return_exact_count\":" << instrumentation.return_exact_count
-             << ",\"last_progress_sequence\":" << instrumentation.last_progress_sequence
-             << ",\"last_reset_sequence\":" << instrumentation.last_reset_sequence
-             << ",\"last_publish_sequence\":" << instrumentation.last_publish_sequence
-              << ",\"scene_boundary_count\":" << instrumentation.scene_boundary_count
-              << ",\"disarm_count\":" << instrumentation.disarm_count
-              << ",\"completed_proof_publication_count\":" << instrumentation.completed_proof_publication_count
-              << ",\"native_ir_flush_attempt_count\":" << instrumentation.native_ir_flush_attempt_count
-              << ",\"native_ir_flush_failure_count\":" << instrumentation.native_ir_flush_failure_count
-              << ",\"first_native_ir_flush_failure_index\":" << instrumentation.first_native_ir_flush_failure_index
-              << ",\"first_native_ir_flush_failure_reason\":" << instrumentation.first_native_ir_flush_failure_reason
-              << ",\"first_native_ir_flush_failure_packet\":" << instrumentation.first_native_ir_flush_failure_packet
-               << ",\"first_native_ir_flush_failure_status\":" << instrumentation.first_native_ir_flush_failure_status
-               << "}}";
-    if (runtime_accepted) {
-        output << ",\"tuple\":";
-        write_auth_tuple(output, runtime_tuple);
-        output << ",\"trace\":{\"entry_sequence\":"
-               << runtime_proof_trace.entry_sequence
-               << ",\"capture_sequence\":"
-               << runtime_proof_trace.capture_sequence
-               << ",\"return_sequence\":"
-               << runtime_proof_trace.return_sequence
-               << ",\"scene_epoch\":" << runtime_proof_trace.scene_epoch
-               << ",\"state_sequence\":" << runtime_proof_trace.state_sequence
-               << "}";
-    }
-    output << "},\"field_binding\":{\"checkpoint_field_id\":"
-           << replay.checkpoint_expected
-           << ",\"checkpoint_seen\":"
-           << (replay.checkpoint_seen ? "true" : "false")
-           << ",\"checkpoint_seen_vblank\":" << replay.checkpoint_vblank
-           << ",\"evidence_vblank\":" << replay.counters.vblank_latches
-           << ",\"context_valid\":"
-           << (replay.checkpoint_snapshot.valid_field ? "true" : "false")
-           << ",\"context_field_id\":" << replay.checkpoint_snapshot.masked_field_id
-           << "}}";
-}
 #endif
 
 constexpr uint32_t kStableFieldVblanks = 4;
@@ -1467,12 +1194,10 @@ void note_sio() { replay.counters.sio_applies++; }
 void note_snapshot(const Snapshot& snapshot) {
     replay.snapshot = snapshot;
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
-    if (!replay.auth_instrumentation_started && snapshot.valid_field &&
+    if (!replay.auth_cold_enabled && snapshot.valid_field &&
         snapshot.field_context != 0u) {
         psx_xg_render_auth_cold_enable(true);
-        psx_xg_render_auth_instrumentation_snapshot(
-            &replay.auth_instrumentation_start);
-        replay.auth_instrumentation_started = true;
+        replay.auth_cold_enabled = true;
     }
     if (replay.producer_family_requested && !replay.producer_family_armed &&
         snapshot.valid_field && snapshot.field_context != 0u) {
@@ -1633,6 +1358,72 @@ StopReason stop_reason() { return replay.reason; }
 Counters counters() { return replay.counters; }
 bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     std::ofstream output(path); if (!output) return false;
+    const bool completion_pass = replay.checkpoint_configured
+        ? stop_reason() == StopReason::CheckpointReached
+        : stop_reason() == StopReason::TraceComplete;
+#ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
+    const bool native_work_run = xg_render_native_work_enabled();
+    const bool eof_drain_required = native_work_run && completion_pass &&
+        replay.loaded && replay.state_config && replay.actions.empty() &&
+        replay.budget != 0u && replay.index == replay.budget &&
+        replay.index == replay.states.size() && replay.latch_failure == 0u;
+    bool eof_drain_complete = false;
+    bool eof_drain_failed = false;
+    bool eof_wait_unavailable = false;
+    if (eof_drain_required) {
+        bool source_drained = false;
+        for (;;) {
+            XgRenderPresentationDiagnostics drain{};
+            GlRendererNativePipelineDiagnostics transport{};
+            xg_render_semantic_presentation_diagnostics(&drain);
+            gl_renderer_native_pipeline_diagnostics(&transport);
+            if (psx_fatal_halted() || !drain.publication_open ||
+                drain.epoch_terminal || drain.source_lane_blocked ||
+                drain.compile_failures || drain.fence_failures ||
+                drain.endpoint_validation_failures || drain.compose_failures ||
+                drain.retirement_capacity_failures || transport.capture_failures ||
+                transport.upload_failures || transport.compose_failures ||
+                transport.swap_failures) {
+                eof_drain_failed = true;
+                break;
+            }
+            if (source_drained && drain.source_queue_depth == 0u &&
+                !drain.worker_busy && drain.pending_batch_count == 0u &&
+                drain.retirement_queue_depth == 0u && !transport.pending_present) {
+                eof_drain_complete = true;
+                break;
+            }
+            // This also rejects pre-simulation/host-fiber callers before drain
+            // can block. Only host work runs; the guest stack stays suspended.
+            if (!psx_native_render_service_wait(nullptr)) {
+                eof_wait_unavailable = true;
+                break;
+            }
+            if (!source_drained) {
+                if (psx_fatal_halted() ||
+                    !xg_render_native_work_drain(psx_get_cycle_count())) {
+                    eof_drain_failed = true;
+                    break;
+                }
+                source_drained = true;
+            }
+        }
+    }
+    XgRenderNativeWorkSnapshot work{};
+    XgRenderPresentationDiagnostics before{}, presentation{};
+    GlRendererNativeCompilerDiagnostics compiler{};
+    GlRendererNativePipelineDiagnostics pipeline{};
+    XgRenderResourceDiagnostics resources{};
+    if (native_work_run) {
+        // Freeze the observed summary after EOF servicing, before any JSON.
+        xg_render_native_work_snapshot(&work);
+        xg_render_semantic_presentation_diagnostics(&before);
+        gl_renderer_native_compiler_diagnostics(&compiler);
+        gl_renderer_native_pipeline_diagnostics(&pipeline);
+        xg_render_resource_repository_diagnostics(&resources);
+        xg_render_semantic_presentation_diagnostics(&presentation);
+    }
+#endif
     const uint16_t reported_checkpoint_field = replay.checkpoint_configured
         ? (replay.checkpoint_seen ? replay.checkpoint_expected : field_id) : 0u;
     const Counters c = counters();
@@ -1983,9 +1774,6 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
            !render_presentation.interpolation_effective &&
            !render_presentation.smooth_effective &&
            render_presentation.history_count == 0u));
-    const bool completion_pass = replay.checkpoint_configured
-        ? stop_reason() == StopReason::CheckpointReached
-        : stop_reason() == StopReason::TraceComplete;
     const bool pass = completion_pass &&
                         std::string(backend) == "opengl" &&
                         (!replay.baseline_request || baseline.complete) &&
@@ -3842,7 +3630,233 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
     }
 #endif
 #ifdef PSX_INPUT_REPLAY_XG_AUTH_PROOF
-    write_auth_proof(output, field_id);
+    if (render_modes.requested_render_mode == GUEST_RENDER_RENDER_NATIVE &&
+        native_work_run) {
+        const bool snapshot_stable = !before.worker_busy &&
+            !presentation.worker_busy &&
+            before.source_queue_depth == 0u &&
+            presentation.source_queue_depth == 0u &&
+            before.presentation_epoch == presentation.presentation_epoch &&
+            before.published_commits == presentation.published_commits &&
+            before.source_work_acks == presentation.source_work_acks &&
+            before.worker_compile_attempts == presentation.worker_compile_attempts;
+        const bool supported = std::string(backend) == "opengl" &&
+            presentation.publication_open && !presentation.epoch_terminal;
+        const bool fatal_halted = psx_fatal_halted() != 0;
+        const bool executed = compiler.applied_native_work != 0u &&
+            presentation.source_work_acks != 0u &&
+            presentation.last_acked_source.valid &&
+            presentation.last_published_source.valid &&
+            presentation.last_swap_authorized_endpoint.valid &&
+            presentation.last_acked_source.identity.presentation_epoch == presentation.presentation_epoch &&
+            presentation.last_published_source.identity.presentation_epoch == presentation.presentation_epoch &&
+            presentation.last_swap_authorized_endpoint.identity.presentation_epoch == presentation.presentation_epoch &&
+            pipeline.last_identity.presentation_epoch == presentation.presentation_epoch &&
+            pipeline.swap_successes != 0u;
+        const bool source_accounting_valid =
+            presentation.invalidated_source_work <= presentation.stale_commits &&
+            presentation.source_work_acks <= presentation.published_commits &&
+            presentation.invalidated_source_work <=
+                presentation.published_commits - presentation.source_work_acks &&
+            presentation.source_queue_depth == presentation.published_commits -
+                presentation.source_work_acks - presentation.invalidated_source_work;
+        // Invalidation can cancel a source after backend application but before ACK.
+        const bool renderer_accounting_valid =
+            presentation.source_work_acks <= compiler.applied_native_work &&
+            compiler.applied_native_work - presentation.source_work_acks <=
+                presentation.invalidated_source_work &&
+            compiler.native_vram_identity.presentation_epoch == presentation.last_acked_source.identity.presentation_epoch &&
+            compiler.native_vram_identity.source_sequence == presentation.last_acked_source.identity.source_sequence &&
+            presentation.presented_endpoints <= pipeline.swap_successes &&
+            presentation.presented_holds ==
+                pipeline.swap_successes - presentation.presented_endpoints;
+        const bool renderer_accounting_failed = snapshot_stable && !renderer_accounting_valid;
+        // Batch supersession, skipped phases and restore cancellations are
+        // reported separately, not relabelled as rejected source work. The core's
+        // batch_capacity_drops counts only superseded, already-ACKed endpoints.
+        // Repository stale_accesses also counts retirement/availability probes;
+        // failed ownership operations have their own reference failure counter.
+        const std::pair<const char*, uint64_t> errors[] = {
+            {"rejected_commits", presentation.rejected_commits},
+            {"stale_commits_not_invalidated", presentation.stale_commits >= presentation.invalidated_source_work
+                ? presentation.stale_commits - presentation.invalidated_source_work : 0u},
+            {"missed_boundaries", presentation.missed_boundaries},
+            {"duplicate_boundaries", presentation.duplicate_boundaries},
+            {"source_capacity_drops", presentation.source_capacity_drops},
+            {"source_coalesces", presentation.source_coalesces},
+            {"core_compile_failures", presentation.compile_failures},
+            {"core_fence_failures", presentation.fence_failures},
+            {"endpoint_validation_failures", presentation.endpoint_validation_failures},
+            {"core_compose_failures", presentation.compose_failures},
+            {"retirement_capacity_failures", presentation.retirement_capacity_failures},
+            {"lifecycle_rejections", presentation.lifecycle_rejections},
+            {"worker_serialization_rejections", presentation.worker_serialization_rejections},
+            {"capture_rejections", compiler.sealed_capture_rejections},
+            {"compiler_failures", compiler.compile_failures},
+            {"capture_failures", pipeline.capture_failures},
+            {"upload_failures", pipeline.upload_failures},
+            {"compose_failures", pipeline.compose_failures},
+            {"swap_failures", pipeline.swap_failures},
+            {"source_pixel_mismatches", pipeline.source_pixel_mismatches},
+            {"guest_reference_capture_failures", pipeline.guest_reference_capture_failures},
+            {"guest_reference_missing_sources", pipeline.guest_reference_missing_sources},
+            {"guest_reference_dropped_sources", pipeline.guest_reference_dropped_sources},
+            {"guest_reference_mismatches", pipeline.guest_reference_mismatches},
+            {"resource_reference_failures", resources.reference_failures},
+            {"resource_ownership_violations", resources.ownership_violations},
+            {"resource_identity_collisions", resources.identity_collisions},
+        };
+        const bool zero_errors = std::all_of(std::begin(errors), std::end(errors),
+            [](const auto& error) { return error.second == 0u; });
+        const bool pending = work.building || work.sealed ||
+            presentation.source_pending || presentation.worker_busy ||
+            presentation.pending_batch_count != 0u ||
+            presentation.retirement_queue_depth != 0u ||
+            pipeline.pending_present || !snapshot_stable ||
+            (eof_drain_required && !eof_drain_complete);
+        const bool blocked = !supported || !executed || fatal_halted ||
+            presentation.source_lane_blocked || !zero_errors ||
+            !source_accounting_valid || renderer_accounting_failed || eof_drain_failed;
+        const bool traversal_valid = replay.loaded && replay.state_config &&
+            replay.actions.empty() && replay.budget != 0u &&
+            replay.states.size() == replay.budget && replay.index == replay.budget &&
+            c.vblank_latches == replay.budget && c.trace_state_latches == replay.budget &&
+            c.provider_updates >= replay.budget && c.capture_samples >= replay.budget &&
+            c.mapping_reads >= replay.budget && c.sio_applies >= replay.budget &&
+            replay.latch_failure == 0u;
+        const bool checkpoint_valid = !replay.checkpoint_configured ||
+            (replay.checkpoint_seen && replay.checkpoint_vblank != 0u &&
+             replay.checkpoint_vblank <= replay.index &&
+             replay.checkpoint_snapshot.valid_field &&
+             replay.checkpoint_snapshot.masked_field_id == replay.checkpoint_expected);
+        const bool terminal_valid = completion_pass &&
+            (!replay.checkpoint_configured ||
+             (replay.snapshot.valid_field &&
+              replay.snapshot.masked_field_id == replay.checkpoint_expected &&
+              field_id == replay.checkpoint_expected));
+        const bool replay_valid = traversal_valid && checkpoint_valid && terminal_valid;
+        const char* health = blocked ? "blocked" : pending ? "pending" : "healthy";
+        const char* runtime_status = blocked || !replay_valid ? "BLOCKED" :
+            pending ? "PENDING" : "PASS";
+        const char* reason = !supported ? "runtime_unavailable" :
+            fatal_halted ? "fatal_halted" :
+            presentation.source_lane_blocked ? "source_lane_blocked" :
+            !zero_errors ? "pipeline_errors" :
+            !source_accounting_valid || renderer_accounting_failed ? "counter_accounting" :
+            !executed ? "native_work_not_observed" :
+            !replay_valid ? "replay_incomplete_or_invalid" :
+            eof_drain_failed ? "eof_drain_failed" :
+            eof_wait_unavailable ? "eof_host_service_unavailable" :
+            pending ? "work_pending_at_snapshot" : "completed_without_runtime_errors";
+
+        output << ",\"runtime_status\":\"" << runtime_status
+               << "\",\"runtime_reason\":\"" << reason
+               << "\",\"native_work\":{\"pipeline_kind\":\"native-work\""
+               << ",\"scope\":\"runtime-health-not-authorization-or-pixel-equivalence\""
+               << ",\"counter_scope\":\"cumulative-not-replay-deltas\""
+               << ",\"supported\":" << (supported ? "true" : "false")
+               << ",\"executed\":" << (executed ? "true" : "false")
+               << ",\"health\":\"" << health << '"'
+               << ",\"fatal_halted\":" << (fatal_halted ? "true" : "false")
+               << ",\"snapshot_stable\":" << (snapshot_stable ? "true" : "false")
+               << ",\"eof_drain\":{\"required\":" << (eof_drain_required ? "true" : "false")
+               << ",\"complete\":" << (eof_drain_complete ? "true" : "false")
+               << ",\"failed\":" << (eof_drain_failed ? "true" : "false")
+               << ",\"wait_unavailable\":" << (eof_wait_unavailable ? "true" : "false") << '}'
+               << ",\"replay\":{\"traversal_valid\":" << (traversal_valid ? "true" : "false")
+               << ",\"checkpoint_valid\":" << (checkpoint_valid ? "true" : "false")
+               << ",\"terminal_valid\":" << (terminal_valid ? "true" : "false")
+               << "},\"source\":{\"published\":" << presentation.published_commits
+               << ",\"acked\":" << presentation.source_work_acks
+               << ",\"applied_without_endpoint\":" << presentation.applied_source_work
+               << ",\"renderer_applied_native_work\":" << compiler.applied_native_work
+               << ",\"cancelled_by_invalidation\":" << presentation.invalidated_source_work
+               << ",\"queued_pending\":" << presentation.source_queue_depth
+               << ",\"buffered_operations\":" << work.buffered_operations
+               << ",\"buffered_uploads\":" << work.buffered_uploads
+               << ",\"builder_pending\":" << (work.building ? "true" : "false")
+               << ",\"sealed_pending\":" << (work.sealed ? "true" : "false")
+               << ",\"worker_busy\":" << (presentation.worker_busy ? "true" : "false")
+               << ",\"lane_blocked\":" << (presentation.source_lane_blocked ? "true" : "false")
+               << ",\"accounting_valid\":" << (source_accounting_valid ? "true" : "false")
+               << ",\"queue_would_block\":" << presentation.source_queue_would_block
+               << ",\"compile_would_block\":" << presentation.compile_would_block
+               << ",\"last_published_epoch\":" << presentation.last_published_source.identity.presentation_epoch
+               << ",\"last_published_sequence\":" << presentation.last_published_source.identity.source_sequence
+               << ",\"last_acked_epoch\":" << presentation.last_acked_source.identity.presentation_epoch
+               << ",\"last_acked_sequence\":" << presentation.last_acked_source.identity.source_sequence
+               << "},\"presentation\":{\"compiled_endpoints\":" << compiler.compiled_endpoints
+               << ",\"validated_endpoints\":" << presentation.validated_endpoints
+               << ",\"presented_endpoints\":" << presentation.presented_endpoints
+               << ",\"presented_holds\":" << presentation.presented_holds
+               << ",\"swap_successes\":" << pipeline.swap_successes
+               << ",\"pending_batches\":" << presentation.pending_batch_count
+               << ",\"live_batches_including_retained\":" << presentation.batch_queue_depth
+               << ",\"retained_endpoint\":" << (presentation.retained_endpoint ? "true" : "false")
+               << ",\"pending_retirements\":" << presentation.retirement_queue_depth
+               << ",\"pending_present\":" << (pipeline.pending_present ? "true" : "false")
+               << ",\"accounting_valid\":" << (!snapshot_stable ? "null" : renderer_accounting_valid ? "true" : "false")
+               << "},\"drops\":{\"source_capacity\":" << presentation.source_capacity_drops
+               << ",\"batch_capacity\":" << presentation.batch_capacity_drops
+               << ",\"source_coalesces\":" << presentation.source_coalesces
+               << ",\"batch_coalesces\":" << presentation.batch_coalesces
+               << ",\"superseded_endpoints\":" << presentation.superseded_endpoints
+               << ",\"dropped_phases\":" << presentation.dropped_phases
+               << ",\"compose_retired_before_swap\":" << pipeline.compose_retired_before_swap
+               << "},\"scheduling\":{\"batch_capacity_drops\":" << presentation.batch_capacity_drops
+               << ",\"batch_capacity_drop_semantics\":\"superseded-complete-endpoints-after-source-ack\""
+               << "},\"lifecycle\":{\"invalidations\":" << presentation.invalidation_count
+               << ",\"invalidations_by_reason\":[";
+        for (size_t index = 0u; index < XG_RENDER_TIMELINE_INVALIDATION_REASON_COUNT; ++index)
+            output << (index ? "," : "") << presentation.invalidations_by_reason[index];
+        output << "],\"invalidation_reason_names\":[\"reset\",\"restore\",\"rollback\","
+                  "\"disc_change\",\"artifact_change\",\"scene_change\"]"
+               << ",\"stale_commits\":" << presentation.stale_commits
+               << ",\"stale_batches\":" << presentation.stale_batches
+               << ",\"resource_invalidations\":" << resources.invalidations
+               << ",\"resource_import_cancellations\":" << resources.import_cancellations
+               << ",\"resource_stale_accesses\":" << resources.stale_accesses
+               << ",\"resource_stale_access_semantics\":\"mixed-api-rejections-including-retirement-and-availability-probes\""
+               << "},\"errors\":{";
+        for (const auto& error : errors)
+            output << (&error == &errors[0] ? "" : ",") << '"' << error.first << "\":" << error.second;
+        output << "},\"motion\":{\"last_compile_consumed_motion_resources\":" << compiler.consumed_motion_resources
+               << ",\"last_compile_consumed_operations\":" << compiler.consumed_native_operations
+               << ",\"evaluations\":" << compiler.motion_evaluations
+               << ",\"projected_draws\":" << compiler.motion_projected_draws
+               << ",\"last_endpoint_temporal_status\":\""
+               << gl_renderer_native_temporal_status_name(compiler.last_temporal_status)
+               << "\",\"last_endpoint_phase_count\":" << compiler.last_temporal_phase_count
+               << ",\"last_endpoint_interval_vblanks\":" << compiler.last_temporal_interval_vblanks
+               << ",\"last_endpoint_interval_ns\":" << compiler.last_temporal_interval_ns
+               << ",\"last_endpoint_epoch\":" << compiler.last_temporal_identity.presentation_epoch
+               << ",\"last_endpoint_source_sequence\":" << compiler.last_temporal_identity.source_sequence
+               << ",\"recipe_validation_performed\":" << (compiler.recipe_validation_performed ? "true" : "false")
+               << ",\"recipe_canonical_match\":" << (compiler.recipe_canonical_match ? "true" : "false")
+               << ",\"recipe_view_match\":" << (compiler.recipe_view_match ? "true" : "false")
+               << ",\"view_logical_draws\":" << compiler.view_logical_draws
+               << ",\"view_physical_raster_passes\":" << compiler.view_physical_raster_passes
+               << ",\"view_targets\":" << compiler.view_target_count
+               << ",\"view_domains\":" << compiler.view_domain_count
+               << ",\"expired_phase_generations\":" << compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_DEADLINE_EXPIRED]
+               << ",\"whole_only_phase_generations\":" << compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_WHOLE_ONLY]
+               << ",\"legacy_owner\":{\"active\":" << (compiler.legacy_owner.active ? "true" : "false")
+               << ",\"canonical_draws\":" << compiler.legacy_owner.canonical_draws
+               << ",\"canonical_fills\":" << compiler.legacy_owner.canonical_fills
+               << ",\"canonical_copies\":" << compiler.legacy_owner.canonical_copies
+               << ",\"skipped_view_draws\":" << compiler.legacy_owner.skipped_view_draws
+               << ",\"skipped_temporal_candidates\":" << compiler.legacy_owner.skipped_temporal_candidates
+               << ",\"skipped_anchor_vertices\":" << compiler.legacy_owner.skipped_anchor_vertices
+               << ",\"legacy_host_raster_passes\":" << compiler.legacy_owner.legacy_host_raster_passes
+               << ",\"pending_host_draws\":" << compiler.legacy_owner.pending_host_draws
+               << ",\"legacy_view_surfaces\":" << compiler.legacy_owner.legacy_view_surfaces
+               << ",\"configured_view_width\":" << compiler.legacy_owner.configured_view_width << '}'
+               << ",\"last_swap_authorized_epoch\":" << presentation.last_swap_authorized_endpoint.identity.presentation_epoch
+               << ",\"last_swap_authorized_source_sequence\":" << presentation.last_swap_authorized_endpoint.identity.source_sequence
+               << ",\"last_swap_authorized_alpha_numerator\":" << presentation.last_alpha_numerator
+               << ",\"last_swap_authorized_alpha_denominator\":" << presentation.last_alpha_denominator
+               << "}}";
+    }
 #endif
     output << "}\n";
     return output.good();

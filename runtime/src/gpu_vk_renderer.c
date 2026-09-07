@@ -26,6 +26,7 @@
 #include "psx_rewind.h"
 #include "crash_trace.h"
 #include "gpu_vk_upload.h"
+#include "gpu_vram_region_set.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -436,6 +437,8 @@ static void flush_pack_if_sampling(int tpx, int tpy, int depth, int clx, int cly
 static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data);
 static void gpu_copy_rect(int sx, int sy, int dx, int dy, int w, int h);
 static void ensure_cpu(void);             /* GPU -> CPU mirror readback */
+static void ensure_cpu_region(int x, int y, int w, int h);
+static void ensure_cpu_transfer(int x, int y, int w, int h);
 static int  make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, void **map);
 static void free_staging(VkBuffer buf, VkDeviceMemory mem);
 
@@ -451,7 +454,7 @@ static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
  * mirror, and whether the hr image diverges from the CPU mirror. */
 typedef struct { int set, x0, y0, x1, y1; } DirtyRect;
 static DirtyRect s_pack_dirty;
-static int       s_gpu_dirty;
+static GpuVramRegionSet s_gpu_dirty;
 /* CPU-side VRAM writes (GP0 A0 transfers, DMA, fills, single pokes) land in
  * the CPU array immediately and accumulate here; ONE batched upload flushes
  * them before the next GPU op that could observe them (mirrors the GL
@@ -2133,7 +2136,9 @@ static void blit_region(int x, int y, int w, int h, VkImageView src_view,
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
     if (mark_pack) rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
-    s_gpu_dirty = 1;
+    if (!plain)
+        gpu_vram_region_mark_rect(&s_gpu_dirty, x, y,
+                                  x + w - 1, y + h - 1);
 }
 
 /* ---- VRAM transfers (CPU <-> GPU image) -------------------------------- */
@@ -2301,43 +2306,76 @@ static void flush_cpu_upload(void) {
     p_vkCmdEndRenderPass(cb);
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
-    s_gpu_dirty = 1;
+    for (int i = 0; i < nrects; ++i)
+        gpu_vram_region_clear_rect(&s_gpu_dirty,
+                                   rects[i].x0, rects[i].y0,
+                                   rects[i].x1, rects[i].y1);
 }
 
-/* GPU -> CPU mirror: drain batches, pack, copy the whole raw mirror down. */
-static void ensure_cpu(void) {
+/* GPU -> CPU mirror: drain command-order predecessors, then copy only the
+ * requested GPU-authoritative region from the raw mirror. */
+static void ensure_cpu_region(int x, int y, int w, int h) {
     extern int psx_netplay_active(void);
-    if (!s_ready || !s_gpu_dirty || !s_vram) return;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    void *map;
+    VkCommandBuffer cb;
+    VkBufferImageCopy copy = {0};
+
+    if (!s_ready || !s_vram || w <= 0 || h <= 0) return;
+    flush_cpu_upload();
+    flush_tex_batch();
+    flush_geometry();
+    if (!gpu_vram_region_intersects(&s_gpu_dirty, x, y,
+                                    x + w - 1, y + h - 1))
+        return;
     if (psx_netplay_active()) {
-        s_gpu_dirty = 0;
+        gpu_vram_region_clear_rect(&s_gpu_dirty, x, y,
+                                   x + w - 1, y + h - 1);
         return;
     }
-    flush_cpu_upload();   /* readback overwrites s_vram: pending writes land first */
-    flush_tex_batch(); flush_geometry();
-    /* Readback must reflect ALL current hr content, not just the incremental
-     * s_pack_dirty rect. pack_flush() packs only that rect and early-returns if
-     * it is unset — so draws that updated hr (and present) but never marked the
-     * pack rect (e.g. the BIOS shell after the logo) left the raw mirror stale,
-     * and screenshots/guest VRAM reads returned an old frame (the logo) while
-     * the live window showed the shell. Force a full-frame pack here; this path
-     * is readback-only (NOT the per-frame present path), so the cost is paid
-     * only on screenshots / guest VRAM reads, never every frame. */
-    rect_add(&s_pack_dirty, 0, 0, VRAM_W - 1, VRAM_H - 1);
     pack_flush();
-    VkBuffer buf; VkDeviceMemory mem; void *map;
-    if (!make_staging((VkDeviceSize)VRAM_W * VRAM_H * 2, &buf, &mem, &map)) return;
-    VkCommandBuffer cb = begin_oneshot();
+    if (!make_staging((VkDeviceSize)w * h * 2, &buf, &mem, &map)) return;
+    cb = begin_oneshot();
     img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    VkBufferImageCopy rc = {0};
-    rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; rc.imageSubresource.layerCount = 1;
-    rc.imageExtent.width = VRAM_W; rc.imageExtent.height = VRAM_H; rc.imageExtent.depth = 1;
-    p_vkCmdCopyImageToBuffer(cb, s_raw_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rc);
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageOffset.x = x;
+    copy.imageOffset.y = y;
+    copy.imageExtent.width = (uint32_t)w;
+    copy.imageExtent.height = (uint32_t)h;
+    copy.imageExtent.depth = 1;
+    p_vkCmdCopyImageToBuffer(cb, s_raw_img,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             buf, 1, &copy);
     img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     end_oneshot(cb);
     gpu_sync();   /* the readback result must be complete before we read it */
-    memcpy(s_vram, map, (size_t)VRAM_W * VRAM_H * 2);
+    for (int row = 0; row < h; ++row)
+        memcpy(s_vram + (size_t)(y + row) * VRAM_W + x,
+               (const uint16_t *)map + (size_t)row * w,
+               (size_t)w * sizeof(uint16_t));
     free_staging(buf, mem);
-    s_gpu_dirty = 0;
+    gpu_vram_region_clear_rect(&s_gpu_dirty, x, y,
+                               x + w - 1, y + h - 1);
+}
+
+static void ensure_cpu_transfer(int x, int y, int w, int h) {
+    GpuVramRect rects[4];
+    const int count = gpu_vram_split_transfer(x, y, w, h, rects);
+    for (int i = 0; i < count; ++i)
+        ensure_cpu_region(rects[i].x, rects[i].y,
+                          rects[i].w, rects[i].h);
+}
+
+static void ensure_cpu(void) {
+    GpuVramRect bounds;
+    if (!s_ready || !s_vram) return;
+    flush_cpu_upload();
+    flush_tex_batch();
+    flush_geometry();
+    if (!gpu_vram_region_bounds(&s_gpu_dirty, &bounds)) return;
+    ensure_cpu_region(bounds.x, bounds.y, bounds.w, bounds.h);
 }
 
 /* ---- backend vtable ---------------------------------------------------- */
@@ -2345,7 +2383,12 @@ static void ensure_cpu(void) {
  * Vulkan context creation can fall back to software cleanly (mirrors how the GL
  * backend's init calls sw_renderer_init). When Vulkan is active the SW mirror
  * is just the CPU readback target. */
-static void vkb_init(uint16_t *vram) { s_vram = vram; s_cpu_dirty = 0; sw_renderer_init(vram); }
+static void vkb_init(uint16_t *vram) {
+    s_vram = vram;
+    s_cpu_dirty = 0;
+    gpu_vram_region_clear_all(&s_gpu_dirty);
+    sw_renderer_init(vram);
+}
 static void vkb_set_scale(int scale) { if (scale >= 1 && scale <= 4) s_scale = scale; }
 static int  vkb_scale(void) { return s_scale; }
 static void vkb_set_texture_filter(int b) { s_texfilter = b ? 1 : 0; }
@@ -2435,10 +2478,10 @@ static void depth24_clear_skipped_fb(void) {
 static void depth24_upload_policy(void) {
     int d24 = gpu_display_is_depth24();
     if (d24 && !s_depth24_skip_up) {
-        s_up_nrects = 0;
+        flush_cpu_upload();
         rect_clear(&s_d24_skip_fb);
     } else if (!d24 && s_depth24_skip_up) {
-        s_up_nrects = 0;
+        flush_cpu_upload();
         depth24_clear_skipped_fb();
         gpu_depth24_upload_span_reset();
     }
@@ -2446,10 +2489,11 @@ static void depth24_upload_policy(void) {
 }
 
 static void vkb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
+    if (s_ctx_ok) depth24_upload_policy();
     sw_vram_transfer_in(x, y, w, h, data);
     if (!s_ctx_ok) return;
-    depth24_upload_policy();
     if (s_depth24_skip_up && depth24_is_fb_transfer(x, y, w, h)) {
+        gpu_vram_region_clear_transfer(&s_gpu_dirty, x, y, w, h);
         /* Full-VRAM savestate restore: stage FBO; mark scanout band only. */
         if (w >= VRAM_W && h >= VRAM_H) {
             up_add_transfer(x, y, w, h);
@@ -2476,32 +2520,30 @@ void vk_renderer_restage_vram_after_savestate(void) {
     }
 }
 static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
-    ensure_cpu();   /* sync GPU-rendered content down to the CPU mirror first */
-    for (int row = 0; row < h; row++)
-        for (int col = 0; col < w; col++)
-            data[row * w + col] = s_vram ? s_vram[(y + row) * VRAM_W + (x + col)] : 0;
+    ensure_cpu_transfer(x, y, w, h);
+    sw_vram_transfer_out(x, y, w, h, data);
 }
 static void vkb_vram_write(int x, int y, uint16_t pixel) {
+    if (s_ctx_ok) depth24_upload_policy();
     sw_vram_write(x, y, pixel);
     if (!s_ctx_ok) return;
-    depth24_upload_policy();
     up_add(x & (VRAM_W - 1), y & (VRAM_H - 1),
            x & (VRAM_W - 1), y & (VRAM_H - 1));
 }
 static uint16_t vkb_vram_read(int x, int y) {
-    ensure_cpu();   /* gated by s_gpu_dirty; cheap when nothing was drawn */
-    return s_vram ? s_vram[y * VRAM_W + x] : 0;
+    ensure_cpu_transfer(x, y, 1, 1);
+    return sw_vram_read(x, y);
 }
 
 /* render_display: CPU readout path (screenshots / debug server / the 24-bit
  * FMV present). Sync the GPU-authoritative VRAM down, then read out via the
  * software renderer on the shared array — mirrors the GL backend exactly. */
 static int vkb_render_display(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
-    ensure_cpu();
+    ensure_cpu_transfer(dx, dy, dw, dh);
     return sw_render_display(o, p, dx, dy, dw, dh);
 }
 static int vkb_render_display_hires(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
-    ensure_cpu();
+    ensure_cpu_transfer(dx, dy, dw, dh);
     return sw_render_display_hires(o, p, dx, dy, dw, dh);
 }
 
@@ -2681,9 +2723,9 @@ static void flush_geometry(void) {
         int x1 = s_geo_bbox.x1 > s_da_x2 ? s_da_x2 : s_geo_bbox.x1;
         int y1 = s_geo_bbox.y1 > s_da_y2 ? s_da_y2 : s_geo_bbox.y1;
         rect_add(&s_pack_dirty, x0, y0, x1, y1);
+        gpu_vram_region_mark_rect(&s_gpu_dirty, x0, y0, x1, y1);
         rect_clear(&s_geo_bbox);
     }
-    s_gpu_dirty = 1;
 }
 
 static inline void col555(uint16_t c, float out[3]) {
@@ -2945,7 +2987,6 @@ static void flush_tex_batch(void) {
     }
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
-    s_gpu_dirty = 1;
 }
 
 /* Shared PS1 uv-sampling model (limits + mirrored-2D compensation) — one
@@ -3025,7 +3066,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     if (bx0 < s_da_x1) bx0 = s_da_x1; if (by0 < s_da_y1) by0 = s_da_y1;
     if (bx1 > s_da_x2) bx1 = s_da_x2; if (by1 > s_da_y2) by1 = s_da_y2;
     rect_add(&s_pack_dirty, bx0, by0, bx1, by1);
-    s_gpu_dirty = 1;
+    gpu_vram_region_mark_rect(&s_gpu_dirty, bx0, by0, bx1, by1);
 }
 
 static void gpu_textured_rect(int x,int y,int w,int h, int u0,int v0,int u1,int v1,
@@ -3073,42 +3114,89 @@ static void vkb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,
     gpu_textured_rect(x,y,w,h, u0,v0, u1,v1, cx,cy,tp, s_semi_en?s_semi_mode:-1);
 }
 
-/* VRAM->VRAM copy: blit the source hr region to scratch (resolves overlap),
- * then blit scratch -> dest with STP/mask split. Mirrors the GL backend. */
+typedef struct VkVramCopySegment {
+    GpuVramRect rect;           /* physical, non-wrapping VRAM rectangle */
+    int logical_x, logical_y;   /* corresponding offset in the MoveImage rect */
+} VkVramCopySegment;
+
+/* Split one wrapped MoveImage endpoint into physical VRAM rectangles while
+ * retaining where every rectangle belongs in the logical source/destination
+ * block. gpu_vram_split_transfer also clamps oversized commands to one VRAM
+ * traversal, matching the other renderers. */
+static int vk_vram_copy_segments(int x, int y, int w, int h,
+                                 VkVramCopySegment segments[4]) {
+    GpuVramRect rects[4];
+    const int x0 = x & (VRAM_W - 1);
+    const int y0 = y & (VRAM_H - 1);
+    const int count = gpu_vram_split_transfer(x, y, w, h, rects);
+
+    for (int i = 0; i < count; ++i) {
+        segments[i].rect = rects[i];
+        segments[i].logical_x = rects[i].x == x0 ? 0 : VRAM_W - x0;
+        segments[i].logical_y = rects[i].y == y0 ? 0 : VRAM_H - y0;
+    }
+    return count;
+}
+
+/* VRAM->VRAM copy: first assemble the complete wrapped source in scratch at
+ * logical [0,w)x[0,h). Only after that immutable snapshot is complete are the
+ * wrapped destination pieces drawn with the normal STP/mask path. This makes
+ * source wrap, destination wrap, and arbitrary overlap independent of copy
+ * direction. VkImageCopy is image-to-image, so no host buffer row pitch or
+ * R16/RGBA element-size assumptions enter this RGBA8 high-resolution copy. */
 static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
+    VkVramCopySegment source[4], destination[4];
+    VkImageCopy copies[4];
+    int source_count, destination_count;
+
     if (!s_ctx_ok || w <= 0 || h <= 0) return;
     flush_cpu_upload();   /* the copy source may include pending CPU writes */
     flush_tex_batch(); flush_geometry();
-    if (sx + w > VRAM_W) w = VRAM_W - sx;
-    if (dx + w > VRAM_W) w = VRAM_W - dx;
-    if (sy + h > VRAM_H) h = VRAM_H - sy;
-    if (dy + h > VRAM_H) h = VRAM_H - dy;
-    if (w <= 0 || h <= 0) return;
+    if (w > VRAM_W) w = VRAM_W;
+    if (h > VRAM_H) h = VRAM_H;
+    source_count = vk_vram_copy_segments(sx, sy, w, h, source);
+    destination_count = vk_vram_copy_segments(dx, dy, w, h, destination);
+    if (source_count == 0 || destination_count == 0) return;
     s_perf_cur.copy_rects++;
     int S = s_scale;
 
-    /* stage 1: copy source hr region into scratch at the same coords */
+    /* Stage 1: assemble every wrapped source piece in logical scratch space.
+     * All pieces share one command buffer and complete before any destination
+     * render, which is the overlap-safe MoveImage snapshot. */
+    memset(copies, 0, sizeof copies);
+    for (int i = 0; i < source_count; ++i) {
+        const GpuVramRect *r = &source[i].rect;
+        copies[i].srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copies[i].srcSubresource.layerCount = 1;
+        copies[i].dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copies[i].dstSubresource.layerCount = 1;
+        copies[i].srcOffset.x = r->x * S;
+        copies[i].srcOffset.y = r->y * S;
+        copies[i].dstOffset.x = source[i].logical_x * S;
+        copies[i].dstOffset.y = source[i].logical_y * S;
+        copies[i].extent.width = (uint32_t)(r->w * S);
+        copies[i].extent.height = (uint32_t)(r->h * S);
+        copies[i].extent.depth = 1;
+    }
     VkCommandBuffer cb = begin_oneshot();
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     img_to(cb, s_scratch_img, &s_scratch_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy ic = {0};
-    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ic.srcSubresource.layerCount = 1;
-    ic.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ic.dstSubresource.layerCount = 1;
-    ic.srcOffset.x = sx * S; ic.srcOffset.y = sy * S;
-    ic.dstOffset.x = sx * S; ic.dstOffset.y = sy * S;
-    ic.extent.width = w * S; ic.extent.height = h * S; ic.extent.depth = 1;
     p_vkCmdCopyImage(cb, s_vram_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     s_scratch_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+                     s_scratch_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     (uint32_t)source_count, copies);
     end_oneshot(cb);
 
-    /* stage 2: blit scratch -> dest (hr-res source: src_div=1, offset (sx-dx)*S). */
-    blit_region(dx, dy, w, h, s_scratch_view, s_scratch_img, &s_scratch_layout,
-                1, (sx - dx) * S, (sy - dy) * S, 0, 1);
-
-    if (s_vram) {   /* keep CPU mirror coherent for non-GPU readers */
-        for (int row = 0; row < h; row++)
-            for (int col = 0; col < w; col++)
-                s_vram[(dy + row) * VRAM_W + (dx + col)] = s_vram[(sy + row) * VRAM_W + (sx + col)];
+    /* Stage 2: draw each physical destination piece from its matching logical
+     * scratch offset. blit_region marks both the packed R16 mirror and the CPU
+     * mirror dirty; lazy readback therefore cannot expose the old CPU pixels. */
+    for (int i = 0; i < destination_count; ++i) {
+        const GpuVramRect *r = &destination[i].rect;
+        blit_region(r->x, r->y, r->w, r->h,
+                    s_scratch_view, s_scratch_img, &s_scratch_layout,
+                    1,
+                    (destination[i].logical_x - r->x) * S,
+                    (destination[i].logical_y - r->y) * S,
+                    0, 1);
     }
 }
 

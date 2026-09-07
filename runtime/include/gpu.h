@@ -17,12 +17,97 @@
 
 typedef struct CPUState CPUState;
 typedef bool (*GpuOrderingTableSubmissionHook)(uint32_t start_address);
+typedef void (*GpuOrderingTableCompletionHook)(
+    uint32_t start_address, uint32_t transferred_words);
+typedef void (*GpuVramRectTransferHook)(
+    uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+    const uint16_t *pixels, size_t pixel_count);
+typedef void (*GpuVramReadbackCompleteHook)(
+    uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+    size_t pixel_count, uint64_t content_digest);
+typedef enum GpuVramEventOperation {
+    GPU_VRAM_EVENT_UPLOAD = 0,
+    GPU_VRAM_EVENT_READBACK,
+    GPU_VRAM_EVENT_MOVE,
+    GPU_VRAM_EVENT_CLEAR,
+    GPU_VRAM_EVENT_RENDER_TARGET_WRITE,
+    GPU_VRAM_EVENT_RESTORE,
+    GPU_VRAM_EVENT_SCANOUT,
+} GpuVramEventOperation;
+typedef enum GpuVramPayloadSource {
+    GPU_VRAM_PAYLOAD_SOURCE_NONE = 0,
+    GPU_VRAM_PAYLOAD_SOURCE_MDEC_DMA1,
+} GpuVramPayloadSource;
+typedef enum GpuMovieOwnerKind {
+    GPU_MOVIE_OWNER_NONE = 0,
+    GPU_MOVIE_OWNER_STANDALONE = 1,
+    GPU_MOVIE_OWNER_FIELD = 2,
+} GpuMovieOwnerKind;
+typedef struct GpuVramEvent {
+    GpuVramEventOperation operation;
+    uint16_t source_x;
+    uint16_t source_y;
+    uint16_t destination_x;
+    uint16_t destination_y;
+    uint16_t width;
+    uint16_t height;
+    /* Effective replay masks. CLEAR ignores masks; UPLOAD pixels already
+     * include mask acceptance/set, so both are false for those operations. */
+    bool mask_set;
+    bool mask_check;
+    uint16_t fill_color; /* CLEAR: RGB555 converted from the original command. */
+    /* Borrowed until the hook returns. UPLOAD is the accepted row-major
+     * payload; RESTORE is all 1024x512 words from gpu_get_vram(). MOVE must
+     * use source/destination coordinates, not this legacy readback payload. */
+    const uint16_t *pixels;
+    size_t pixel_count;
+    uint64_t content_digest;
+    uint64_t mutation_serial;
+    uint32_t command_source_address;
+    uint32_t command_pc;
+    uint32_t command_function;
+    uint32_t command_return_address;
+    uint32_t command_source_kind;
+    uint32_t command_words[4];
+    uint8_t command_opcode;
+    uint8_t command_word_count;
+    bool command_context_valid;
+    GpuVramPayloadSource payload_source;
+    uint32_t payload_format;
+    uint64_t payload_source_receipt;
+    uint32_t movie_frame_number;
+    uint16_t movie_frame_width;
+    uint16_t movie_frame_height;
+    bool movie_frame_complete;
+    GpuMovieOwnerKind movie_owner_kind;
+    uint64_t movie_owner_receipt;
+} GpuVramEvent;
+typedef void (*GpuVramEventHook)(const GpuVramEvent *event);
+typedef struct GpuPendingVramUpload {
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+    size_t pixel_count;
+} GpuPendingVramUpload;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 void     gpu_init(void);
+uint32_t gpu_snapshot_bytes(void);
+void     gpu_snapshot_write(uint8_t *bytes);
+int      gpu_snapshot_read(const uint8_t *bytes, uint32_t length);
+size_t   gpu_pending_vram_upload_capture(
+             GpuPendingVramUpload *out_upload,
+             uint16_t *out_pixels,
+             size_t pixel_capacity);
+bool     gpu_pending_vram_upload_apply(
+             const GpuPendingVramUpload *upload,
+             const uint16_t *pixels,
+             uint16_t *target_vram,
+             size_t target_pixel_count);
 uint32_t gpu_read_gpustat(void);   /* 0x1F801814 read */
 uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
@@ -30,10 +115,45 @@ void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */
 void     gpu_set_submission_hook(void (*hook)(void));
 void     gpu_set_ordering_table_submission_hook(
              GpuOrderingTableSubmissionHook hook);
+void     gpu_set_ordering_table_completion_hook(
+             GpuOrderingTableCompletionHook hook);
 void     gpu_set_semantic_current_hook(
              void (*hook)(const GpuRenderSemantic *semantic));
+/* Independent of native_stream and the semantic-current binding hook.
+ * Observes each executed GP0 draw once (one callback per polyline segment),
+ * from the final packet and live draw environment, never GTE/RAM lookup or
+ * binding resolution. Coordinates exclude the material's draw offset.
+ * submission_command_id is the command-word address when known, UINT64_MAX
+ * for MMIO/unknown. The collector must copy the borrowed semantic and label
+ * this source packet_adapter; it must not submit GPU work or reenter GP0.
+ * Returning false is fatal. NULL uninstalls; GPU init/reset preserve hooks. */
+void     gpu_set_native_work_draw_hook(
+             bool (*hook)(const GpuRenderSemantic *semantic));
+/* Accepted E3 command identity; only source metadata may declare a view target. */
+void     gpu_set_native_work_environment_hook(bool (*hook)(uint64_t command_id));
+void     gpu_set_source_boundary_hook(void (*hook)(void));
+/* Runs after the guest VBlank callback has returned. Native uses this host
+ * scheduler seam to delay only the next guest quantum. */
+void     gpu_set_host_quantum_boundary_hook(void (*hook)(void));
+void     gpu_set_vram_upload_commit_hook(GpuVramRectTransferHook hook);
+void     gpu_set_vram_readback_complete_hook(
+             GpuVramReadbackCompleteHook hook);
+void     gpu_set_vram_move_complete_hook(GpuVramRectTransferHook hook);
+void     gpu_set_vram_clear_complete_hook(GpuVramRectTransferHook hook);
+/* Hook installation does not emit a rebase. Memory-clearing initialization
+ * emits RESTORE; a GP1 register reset preserves VRAM and pending visual work.
+ * Savestate restoration calls gpu_note_vram_restore() explicitly. */
+void     gpu_set_vram_event_hook(GpuVramEventHook hook);
+bool     gpu_note_movie_owner_start(
+             GpuMovieOwnerKind owner_kind, uint32_t callback_target);
+bool     gpu_note_movie_owner_stop(GpuMovieOwnerKind owner_kind);
+bool     gpu_note_movie_frame_complete(
+             uint32_t frame_number, uint32_t callback_target);
+void     gpu_note_vram_restore(void);
 void     gpu_prepare_submission(void);
 bool     gpu_prepare_ordering_table_submission(uint32_t start_address);
+void     gpu_complete_ordering_table_submission(
+             uint32_t start_address, uint32_t transferred_words);
 int      gpu_gp0_command_word_count(uint8_t opcode);
 bool     gpu_gp0_parser_is_idle(void);
 uint64_t gpu_render_vram_mutation_serial(void);
@@ -76,11 +196,13 @@ void     gpu_vblank_tick(void);        /* Toggle LCF, called at each simulated v
 
 /* Display presentation accessors (Phase 3). */
 const uint16_t* gpu_get_vram(void);    /* Pointer to 1024x512 16-bit VRAM */
+uint16_t* gpu_get_vram_ptr(void);      /* Mutable snapshot/restore surface */
 
 typedef struct {
     uint32_t display_x, display_y;     /* VRAM start of display area (GP1(05h)) */
     uint32_t width, height;            /* Derived from display mode + ranges */
     int      depth24;                  /* GP1(08h) display depth flag: RGB888 scanout */
+    int      interlaced;               /* GP1(08h) vertical interlace flag */
     int      disabled;                 /* GP1(03h) display disable flag */
 } GpuDisplayInfo;
 

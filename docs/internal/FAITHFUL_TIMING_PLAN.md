@@ -12,8 +12,7 @@ auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 Build the **faithful hardware-timing core** of the static recompiler. The PSX
 recompiler is being BUILT, not preserved:
 
-- The correct fix is ALWAYS the faithful, class-level core — NEVER a surgical
-  per-game patch, symptom workaround, `game.toml` hack, or "make native agree
+- The correct fix is ALWAYS the faithful, class-level core — NEVER a symptom workaround, `game.toml` hack, or "make native agree
   with interp even if both are fake."
 - Breaking other titles is acceptable; they were built on a faulty ecosystem and
   will be **regenerated**. Backward-compat is NOT a constraint.
@@ -213,6 +212,119 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-05 (Retained-Movie restore and atomic MDEC publication):** The
+  deferred savestate failure was made directly observable through
+  `savestate_status`, including pending/completed/failed state, last successful
+  save PC, and the Native aggregate prepare stage. It identified a valid
+  retained-surface flag paired with an empty Movie publisher: P8 owner stop and
+  phase invalidation were hard-resetting the publisher after the runtime had
+  retained its final resource. P8 now uses a soft scene boundary for those
+  lifecycle edges, preserves the immutable complete frame, and retires its old
+  capability after resource release. A save at VBlank 1173 and load after 1180
+  completed with no save/load failure, restored the journal exactly to 346,008
+  observed and 285,560 authoritative words, emitted one full-VRAM restore
+  mutation, and recreated retained Movie resource `7945467F29052557` at the
+  fresh restore generation with its digest and 320x216 RGB24 description intact.
+  The same pass made MDEC publication fail closed: Movie commit reports status,
+  phase/compositor ingress has an exact resource-retaining rollback snapshot,
+  the surface-graph commit result is mandatory, and prior Movie state is restored
+  if a later prepare/commit stage rejects. The retained round-trip replay reached
+  Field 5 with zero compile failures and zero surface-graph rejections; its final
+  `FAIL` remains the pre-existing exhausted-budget auth-proof condition. Builds
+  and `git diff --check` pass; no unit tests or screenshots were created or run
+  per task constraint.
+- **2026-09-04 (Movie-to-Field zoom handoff and canonical VRAM checkpoint):**
+  The first visual divergence at the Movie-to-Field transition was traced to
+  five authenticated zoom quads being stranded in the pre-scene queue while
+  the last Movie endpoint remained on screen. Runtime composition now retains
+  the immutable final Movie surface across the scene boundary, remaps the zoom
+  quads to that surface, accepts its native RGB24 descriptor, and permits only
+  an explicitly retained `MOVIE_FRAME` snapshot to cross source generations.
+  The compositor now acquires immutable snapshots consistently with its clone
+  and materialization paths. A direct replay published changing five-draw zoom
+  endpoints from VBlank 1185, reached all 69,120 display pixels, and continued
+  through Field 5 with 438/438 compiled endpoints and zero compile failures,
+  preserving the prior second-Cross rebind fix. The same pass tightened two
+  VRAM grants: resource publication may promote only byte-exact previously
+  observed words, and MOVE authority now requires exact canonical GP0 words
+  plus equality with the actual GPU mutation payload. The known interval-1489
+  MOVE (`80000000 00E00000 000002C0 00200040`) remained authenticated. Native
+  aggregate checkpoint wire version 6 now transactionally includes observed
+  and authoritative journal maps and sparse canonical values, cross-checks the
+  VRAM-resource source generation, installs one fresh monotonic restore
+  mutation, and prevents the following public restore event from clearing or
+  double-advancing it. A TCP savestate round trip matched the fresh VBlank-1513
+  map exactly at 463,000 observed and 209,016 authoritative words, with one
+  restore mutation and zero active transfers. Builds and `git diff --check`
+  pass; no unit tests or screenshots were created or run per task constraint.
+- **2026-09-04 (First identity-correlated visual divergence):** Added opt-in
+  `PSX_NATIVE_VISUAL_TRUTH=1` telemetry that keeps the OpenGL backend's
+  canonical software raster mirror authoritative, captures the displayed VRAM
+  rectangle at the source boundary, and compares it worker-side with the Native CPU
+  endpoint using the full `XgPresentationIdentity`. `native_pipeline_diag`
+  revision 3 reports recent comparisons and permanently retains the first 16
+  failures with pixel bounds/samples and compiler audit metrics. RGB24 alpha is
+  normalized away; after that correction Movie produced 58/58 exact matches
+  with `failure_flags=0`. The first real mismatch is the Movie-to-Field
+  transition at guest-reference sequence 232, identity epoch 6/source 1,
+  VBlank 1681, cycle 948890880, scene 5: all prior 232 comparisons matched,
+  while this 320x216 15-bit endpoint differed in 48,809 pixels across the full
+  display. Its sealed source contained one `CLEAR+STORE` pass, four draws,
+  three resources, no surface edges/UI, and only 25,496 visible Native pixels,
+  whereas the complete GP0-fed software VRAM preserved the scene. CPU-to-GL
+  endpoint upload, composition, swap, and Wayland feedback remained exact,
+  locating the first observed failure before transport in Field source-commit
+  construction, not host presentation. The comparison still does not
+  independently certify GP0 translation or producer authentication.
+- **2026-09-04 (Per-source presentation trace):** Added a bounded, always-on
+  core ring with one event per accepted source publication. Events accumulate
+  source/batch coalescing, compile callback and endpoint validation, both fence
+  states, composition, retirement before swap, swap authorization/completion,
+  stale state, invalidation, mismatch details, and worker/presenter results.
+  `native_pipeline_diag` revision 2 returns the newest core `trace_events`
+  beside the GL `events`, plus the first retained anomalous
+  `trace_failure_events`; the rings correlate by full presentation identity,
+  not local sequence. A direct hash-enabled run returned valid JSON with 52
+  publications, 51 completed source-to-swap paths, 50 resolved exact CPU-to-GL
+  comparisons, and source 52 explicitly marked as compile-in-progress. No
+  failure flag was set in that sample; the outstanding asynchronous source was
+  retained as pending evidence rather than normalized away.
+- **2026-09-04 (Composed-frame loss removed):** The new trace identified the
+  first runtime divergence as a successfully compiled and composed endpoint
+  being retired when a newer pending batch appeared before swap. Presentation
+  now treats successful composition as irrevocable except for actual
+  epoch/scene invalidation, and the four existing batch slots form an ordered
+  pending queue instead of replacing one pending endpoint. A hash-enabled
+  direct run then reported 207 validated endpoints, 207 compositions, 207
+  swaps, 207 Wayland feedback completions, 206 resolved exact CPU-to-GL pixel
+  comparisons, zero batch/source coalesces, zero retired-before-swap events,
+  and zero retained endpoint trace failures. The trace then exposed six
+  accepted commits rejected solely because compilation occurred after their
+  original VBlank; removing that latest-VBlank check preserves VBlank/cycle as
+  immutable identity while epoch/scene remain the actual invalidation gates.
+  The final direct run reported 140 publications, compiles, compositions,
+  swaps, and Wayland feedback completions; 139 resolved CPU-to-GL comparisons
+  were exact, both coalescing counters and retired-before-swap were zero, and
+  the retained trace contained no failure event. The remaining aggregate
+  `phase` flag came from an upstream producer terminal condition, outside the
+  now-complete source-to-swap chain.
+- **2026-09-04 (Native intent-to-screen telemetry correlated):** Added an
+  always-on semantic receipt chain carrying presentation epoch, source
+  sequence, guest VBlank/cycle, scene generation, semantic digest, endpoint
+  handle, backend generation, format, and dimensions through publication,
+  compile validation, composition, and swap authorization. Endpoint validation
+  now records a per-field mismatch mask and counters. The Native transport records
+  capture/upload/compose/actual-swap outcomes and attaches the same identity to
+  the GL presentation ring, fixing sequence zero as a valid first swap. Each
+  CPU-rasterized RGBA8 endpoint receives an independent pixel digest; with
+  `PSX_GL_PRESENT_HASH=1`, asynchronous GL texture readback compares the exact
+  uploaded bytes and records match/mismatch counts before the separately hashed
+  letterboxed/LUT-composed backbuffer and Wayland presented/discarded feedback.
+  TCP command `native_pipeline_diag` consolidates timeline, host, phase, source
+  frame, compositor, compiler, resource/VRAM/movie, transport, and recent
+  correlated event state. A direct run observed 143 source-to-swap frames with
+  no failures and 142 completed CPU-to-GL pixel comparisons, all exact; the
+  newest asynchronous hash remained correctly identified as pending.
 - **2026-08-29 (Retired Xenogears native-fps runtime path):** Removed the
   obsolete Native FPS timing axis, field-frame hook, FPS meter, and startup
   option while retaining guest Field cadence, interpolation, and Native

@@ -1864,6 +1864,8 @@ static void draw_gold_vars_section(void)
 
 
 
+static void prepare_overlay();
+
 void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
 {
     s_win = win;
@@ -1871,7 +1873,7 @@ void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
     s_window_shot_armed = false;
     s_window_shot_path[0] = '\0';
     s_bind_framebuffer = nullptr;
-    (void)ctx; /* ctx is NULL by design — see file header */
+    if(ctx&&ctx==SDL_GL_GetCurrentContext())prepare_overlay();
 }
 
 void psx_debug_overlay_shutdown(void)
@@ -2005,10 +2007,8 @@ int psx_debug_overlay_set_force_capture(int on)
  * Hidden + unarmed performs no target binding or rendering; lazy init and the
  * existing per-attempt guest preparation retain their prior policy.
  */
-void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
+static void prepare_overlay()
 {
-    const GLuint target_fbo = (GLuint)framebuffer;
-
     /* Step 1: lazy init. */
     if (!s_imgui_ready) {
         if (!s_win) return; /* not initialized at all — try next frame */
@@ -2076,6 +2076,13 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
         (void)dbg_data_load_all(path);
     }
 
+}
+
+void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
+{
+    const GLuint target_fbo=(GLuint)framebuffer;
+    prepare_overlay();
+    if(!s_imgui_ready)return;
     if (s_teleport_source_context != 0u) {
         uint32_t field_context = read_u32_le(kAddr_fieldContextPtr);
         if (field_context != 0u && field_context != s_teleport_source_context) {

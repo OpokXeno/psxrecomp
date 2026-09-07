@@ -1,6 +1,8 @@
 #include "boot_state.h"
 #include "game_identity.h"
+#include "gpu.h"
 #include "memory.h"
+#include "ram_provenance.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +16,7 @@ static int s_developer_ram;
 static uint32_t s_dirty_word_count_applied;
 static uint8_t s_spad[1024];
 static uint8_t s_spuram[1];
+static uint16_t s_vram[1024u * 512u];
 
 uint8_t *memory_get_ram_ptr(void) { return s_ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return s_spad; }
@@ -107,11 +110,31 @@ int mdec_snapshot_read(const uint8_t *in, uint32_t len) {
 }
 
 const uint16_t *gpu_get_vram(void) { return NULL; }
+uint16_t *gpu_get_vram_ptr(void) { return s_vram; }
+size_t gpu_pending_vram_upload_capture(GpuPendingVramUpload *upload,
+                                       uint16_t *pixels,
+                                       size_t pixel_capacity) {
+    (void)pixels;
+    (void)pixel_capacity;
+    if (upload) memset(upload, 0, sizeof(*upload));
+    return 0u;
+}
+bool gpu_pending_vram_upload_apply(const GpuPendingVramUpload *upload,
+                                   const uint16_t *pixels,
+                                   uint16_t *target,
+                                   size_t target_pixel_count) {
+    (void)pixels;
+    (void)target;
+    (void)target_pixel_count;
+    return upload != NULL && upload->pixel_count == 0u;
+}
+void gpu_note_vram_restore(void) {}
 int gpu_vram_dirty_tracking(void) { return 0; }
 uint32_t gpu_vram_dirty_row_count(void) { return 0; }
 const uint64_t *gpu_vram_dirty_mask(void) { return s_clean_vram_rows; }
 int gpu_vram_dirty_verify_enabled(void) { return 0; }
 void gpu_vram_dirty_clear(void) {}
+void gpu_vram_dirty_mark_row_impl(uint32_t row) { (void)row; }
 
 void overlay_watch_invalidate_after_ram_restore(void) {}
 void gte_canonicalize_cpu_state(CPUState *cpu) { (void)cpu; }
@@ -146,6 +169,8 @@ int main(void) {
     int ok = 1;
 
     memset(&cpu, 0, sizeof(cpu));
+    ok &= check(ram_provenance_init(s_ram_size),
+                "retail RAM provenance initializes");
     ok &= check(identity != NULL, "runtime identity is configured");
     ok &= check(psx_game_identity_bind_static(identity), "static identity binds");
     ok &= check(psx_game_identity_gate(identity), "matching identity passes gate");
@@ -195,6 +220,8 @@ int main(void) {
     ok &= check(cpu.pc == 0x11111111u && s_ram[0] == 0x5au,
                 "cross-profile rejection occurs before state mutation");
     cpu.pc = 0x80010000u;
+    ok &= check(ram_provenance_init(s_ram_size),
+                "developer RAM provenance resizes");
     s_ram[0] = 0x12u;
     s_ram[RAM_SIZE - 1u] = 0x34u;
     ok &= check(boot_state_save(&cpu, 0x12345678u, 0x80010000u, path),

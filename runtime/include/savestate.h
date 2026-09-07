@@ -14,8 +14,9 @@ extern "C" {
  *
  * A thin wrapper over boot_state.c's complete full-machine serializer
  * (boot_state_save / boot_state_load — CPU/RAM/scratchpad/VRAM/SPU/CDROM/DMA/SIO/
- * timers/IRQ/clock/dirty-bitmap). Format is BOOT_STATE_VERSION 3: little-endian
- * field wires portable across Win/Linux/macOS ARM (see pst_wire.h). Integrity
+ * timers/IRQ/clock/dirty-bitmap). The current BOOT_STATE_VERSION uses
+ * little-endian field wires portable across Win/Linux/macOS ARM (see
+ * pst_wire.h). Integrity
  * key still rejects incompatible builds. The only additions here are: per-slot paths,
  * deferred execution at a safe block-leader boundary (so cpu->pc is a valid
  * resume PC and in_exception == 0), and a restore that unwinds to the scheduler
@@ -96,6 +97,9 @@ int savestate_request_load_blob_protocol(const void* data, size_t size);
 
 /* 1 while a staged save/load has not yet been consumed by savestate_poll. */
 int savestate_pending(void);
+int savestate_load_completed(void);
+int savestate_load_failed(void);
+int savestate_save_failed(void);
 
 /* 1 once after a successful load restore (before scheduler longjmp). Clears. */
 int savestate_take_load_completed(void);

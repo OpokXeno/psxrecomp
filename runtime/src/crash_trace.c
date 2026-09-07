@@ -31,6 +31,7 @@
 #endif
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -932,6 +933,11 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
 /* ── Fatal halt ──────────────────────────────────────────────────────── */
 
 const char *g_psx_fatal_reason = NULL;
+static atomic_int s_fatal_halted;
+
+int psx_fatal_halted(void) {
+    return atomic_load_explicit(&s_fatal_halted, memory_order_relaxed);
+}
 
 /* freeze_heartbeat.c — full ring dump with wedge_kind "fatal". */
 extern void freeze_heartbeat_fatal_dump(const char *reason);
@@ -940,9 +946,7 @@ void psx_fatal_halt(const char *reason) {
     /* Re-entry guard: a post-mortem TCP command served from the halt
      * loop below can itself trip a fatal site. Don't re-dump (the first
      * fatal is the real one) and don't recurse another serve loop. */
-    static int s_halted = 0;
-    if (!s_halted) {
-        s_halted = 1;
+    if (!atomic_exchange_explicit(&s_fatal_halted, 1, memory_order_relaxed)) {
         g_psx_fatal_reason = reason ? reason : "(fatal)";
         psx_crash_trace_dump(g_psx_fatal_reason, NULL);
         freeze_heartbeat_fatal_dump(g_psx_fatal_reason);
@@ -981,6 +985,7 @@ void psx_fatal_halt(const char *reason) {
 
 static void psx_signal_handler(int sig) {
     static char reason[64];
+    atomic_store_explicit(&s_fatal_halted, 1, memory_order_relaxed);
     snprintf(reason, sizeof(reason), "signal_%d", sig);
     psx_crash_trace_dump(reason, NULL);
     /* Involuntary death: dump the full freeze-style rings too, so the
@@ -1004,6 +1009,7 @@ static void psx_soft_exit_handler(int sig) {
 
 #ifdef _WIN32
 static LONG WINAPI psx_seh_handler(EXCEPTION_POINTERS *info) {
+    atomic_store_explicit(&s_fatal_halted, 1, memory_order_relaxed);
     psx_crash_trace_dump("seh", info);
     /* Same as the signal path: keep the rings on involuntary death. */
     if (!g_psx_fatal_reason) g_psx_fatal_reason = "seh";

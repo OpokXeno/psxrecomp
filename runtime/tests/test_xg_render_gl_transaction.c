@@ -2,6 +2,8 @@
 #include "gpu_gl_renderer.h"
 #include "gpu_render.h"
 #include "guest_render_native_stream.h"
+#include "gte_native_provenance.h"
+#include "ram_provenance.h"
 
 #include "psx_sdl.h"
 
@@ -40,6 +42,39 @@ void text_xlate_vram_upload(void) {}
 void latency_ring_mark(void) {}
 const GpuRenderBackend *vk_backend_get(void) { return NULL; }
 extern const GpuRenderBackend *gl_backend_get(void);
+uint32_t memory_get_ram_word_mask(void) { return UINT32_C(0x001ffffc); }
+int gte_native_provenance_load(uint32_t address, uint32_t packed_sxy,
+                               GteNativeVertexProvenance *out) {
+    (void)address;
+    (void)packed_sxy;
+    (void)out;
+    return 0;
+}
+bool ram_provenance_source_word(
+        uint32_t address, RamProvenanceSource *out_source) {
+    (void)address;
+    (void)out_source;
+    return false;
+}
+bool ram_provenance_word_revision(
+        uint32_t address, uint64_t *out_revision) {
+    (void)address;
+    (void)out_revision;
+    return false;
+}
+bool ram_provenance_cpu_word_receipt(
+        uint32_t address, uint32_t value, uint64_t *out_receipt) {
+    (void)address;
+    (void)value;
+    (void)out_receipt;
+    return false;
+}
+void ram_provenance_note_cpu_store(
+        uint32_t instruction, uint32_t address, uint32_t value) {
+    (void)instruction;
+    (void)address;
+    (void)value;
+}
 
 enum {
     TEST_X = 420,
@@ -1224,6 +1259,70 @@ static void test_native_stream_consumes_gp0_anchor(void) {
     guest_render_native_stream_set_enabled(false);
 }
 
+static void test_native_packet_fallback_records_uncovered_producer(void) {
+    const uint32_t command_address = UINT32_C(0x00103004);
+    const uint32_t words[] = {
+        UINT32_C(0x20ffffff),
+        gp0_xy(TEST_X + 16, TEST_Y),
+        gp0_xy(TEST_X + 24, TEST_Y),
+        gp0_xy(TEST_X + 16, TEST_Y + 8),
+    };
+    const GpuRenderOracleSource source = {
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+        command_address, command_address / 4u,
+        (command_address - 4u) / 4u,
+    };
+    GuestRenderNativeDiagnosticsV1 diagnostics = {0};
+
+    guest_render_native_stream_set_enabled(true);
+    guest_render_native_stream_clear();
+    expect_status(guest_render_native_stream_diagnostics_reset(),
+                  GUEST_RENDER_NATIVE_STREAM_OK,
+                  "fallback diagnostics reset succeeds");
+    expect_true(gpu_native_preflight_reservation_begin(),
+                "fallback preflight reservation begins");
+    expect_true(gpu_native_preflight_gp0_packet(
+                    words, sizeof(words) / sizeof(words[0]), &source),
+                "uncovered packet activates the supported fallback");
+    expect_true(gpu_native_preflight_reservation_seal(),
+                "fallback preflight reservation seals");
+    expect_status(guest_render_native_stream_diagnostics_snapshot(
+                      GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                      &diagnostics, sizeof(diagnostics)),
+                  GUEST_RENDER_NATIVE_STREAM_OK,
+                  "fallback diagnostics snapshot succeeds");
+    expect_true(diagnostics.target_gp0_decode_to_semantic_calls == 2u,
+                "preflight records packet and GTE-candidate semantic decodes");
+    expect_true(
+        diagnostics.target_packet_payload_reads_by_semantic_lane == 2u,
+        "preflight records packet and GTE-candidate payload reads");
+    expect_true(diagnostics.uncovered_producers == 1u,
+                "preflight records one uncovered producer");
+    expect_true(diagnostics.first_offender[
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER]
+                    .command_id == command_address &&
+                    diagnostics.first_offender[
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER]
+                        .source_word_address == command_address,
+                "uncovered producer retains packet attribution");
+
+    write_sourced_gp0(command_address, words,
+                      sizeof(words) / sizeof(words[0]));
+    expect_status(guest_render_native_stream_diagnostics_snapshot(
+                      GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                      &diagnostics, sizeof(diagnostics)),
+                  GUEST_RENDER_NATIVE_STREAM_OK,
+                  "post-fallback diagnostics snapshot succeeds");
+    expect_true(diagnostics.target_gp0_decode_to_semantic_calls == 3u,
+                "submission records one additional GP0 semantic decode");
+    expect_true(
+        diagnostics.target_packet_payload_reads_by_semantic_lane == 3u,
+        "submission records one additional packet payload read");
+    expect_true(diagnostics.uncovered_producers == 1u,
+                "submission does not recount the preflight producer gap");
+    guest_render_native_stream_set_enabled(false);
+}
+
 static void test_canonical_framebuffer_digest(void) {
     uint64_t first = 0u;
     uint64_t second = 0u;
@@ -1330,6 +1429,7 @@ int main(void) {
     if (!failures) test_semantic_dither_matches_original_gp0();
     if (!failures) test_immediate_zoom_matches_original_gp0();
     if (!failures) test_native_stream_consumes_gp0_anchor();
+    if (!failures) test_native_packet_fallback_records_uncovered_producer();
     if (!failures) test_invalid_present_and_identity_gates();
     if (!failures) test_interpolation_history_gate();
     if (!failures) test_deferred_candidate_commit();

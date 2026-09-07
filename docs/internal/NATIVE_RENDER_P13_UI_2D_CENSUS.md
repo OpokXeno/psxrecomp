@@ -141,6 +141,39 @@ the receipt intentionally publishes metadata and digests rather than raw packet
 payloads. It does not authorize a production manifest cutover or claim full P13
 coverage.
 
+### Resident text observation seam
+
+The source-authored Resident text observer now has fourteen exact, observe-only
+routes covering context initialization, font initialization/free, text advance,
+row recycle and selection state, stream destruction, string-entry render
+entry/page checkpoint/return, and glyph rasterization. Every generated hook runs
+before its original guest instruction and always preserves guest execution. The
+observer is gated by the static executable identity and the runtime's exact
+native-text PC authorization; it neither reads an ordering table nor consumes
+GP0, VRAM, scanout, or framebuffer pixels.
+
+A direct Native runtime launch on 2026-09-04 exercised the Resident font,
+advance, and glyph routes while the game remained at title Field 490. The
+read-only `native_resident_text_state` receipt reported 349 accepted
+observations with route counts
+`[0,0,1,38,0,0,0,0,0,0,0,0,0,310]`. It captured the canonical font header
+`[314,14,254,5236,81,0,16]` at `0x801FA634` with content digest
+`0xACC36D2E6D5DB21D`. The invalidation count stopped changing after executable
+loading completed. The context and string-entry routes were not exercised, so
+this run is not dialogue lifecycle proof.
+
+The same run retained the existing non-visual presentation invariants:
+`graph_edges=0`, `consumed_records=[1,4,3,0]`,
+`rendered_records=[1,4,0]`, `rendered_draw_pixels=32449`, and
+`endpoint_visible_pixels=32449`. Standalone Movie recorded 232 successful frame
+publications and zero publication failures. Regeneration found all fourteen
+hooks and the integrated `psx-runtime` target built successfully. No test,
+replay, screenshot, pixel comparison, UI source fragment, or bypass ran.
+
+This seam provides source-owned observation for a future semantic adapter. It
+does not publish UI nodes, glyph runs, glyph placements, atlas resources, or a
+Native/P6 fragment, and it does not change the production authorization below.
+
 ## Blocking Proof
 
 Static decompilation, the interactive census, and the Native authority replay

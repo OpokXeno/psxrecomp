@@ -5,6 +5,7 @@
 #include "code_provider.h"
 #include "overlay_backend.h"
 #include "crc32.h"
+#include "psx_sha256.h"
 #include "dirty_ram_interp.h"
 #include "interrupts.h"
 #include "debug_server.h"
@@ -82,7 +83,7 @@ typedef struct {
     uint64_t pair_id;
     uint32_t artifact_base;
     uint32_t artifact_size;
-    uint32_t artifact_crc32;
+    uint8_t artifact_sha256[PSX_GAME_IDENTITY_SHA256_BYTES];
     uint8_t runtime_variant_identity[PSX_GAME_IDENTITY_SHA256_BYTES];
     uint8_t authority_provenance;
     uint8_t pair_bound;
@@ -499,7 +500,7 @@ static void note_render_auth_candidate(const Candidate *c,
                 .pair_id = c->renderer_provenance.pair_id,
                 .artifact_base = c->renderer_provenance.artifact_base,
                 .artifact_size = c->renderer_provenance.artifact_size,
-                .artifact_crc32 = c->renderer_provenance.artifact_crc32,
+                .artifact_sha256 = { 0 },
                 .runtime_variant_identity = { 0 },
                 .authority_provenance =
                     c->renderer_provenance.authority_provenance != 0u,
@@ -507,6 +508,9 @@ static void note_render_auth_candidate(const Candidate *c,
                 .runtime_variant_bound =
                     c->renderer_provenance.runtime_variant_bound != 0u,
             };
+        memcpy(candidate.artifact_sha256,
+               c->renderer_provenance.artifact_sha256,
+               sizeof(candidate.artifact_sha256));
         memcpy(candidate.runtime_variant_identity,
                c->renderer_provenance.runtime_variant_identity,
                sizeof(candidate.runtime_variant_identity));
@@ -681,28 +685,29 @@ static uint32_t cand_gensum(const Candidate *c) {
 #ifdef PSX_HAS_OVERLAY_DISPATCH
 /* Static-overlay validation uses the same exact-code-range contract as the
  * dynamic DLL loader. Generated code passes immutable {phys_lo, len} pairs and
- * the CRC of the bytes it was compiled from. A page-generation cache keeps the
+ * the SHA-256 of the bytes it was compiled from. A page-generation cache keeps the
  * hot path O(number of ranges), without re-hashing unchanged code each call. */
 #define STATIC_MATCH_CACHE_CAP 4096u
 typedef struct {
     const uint32_t *ranges;
     uint32_t count;
-    uint32_t expected_crc;
+    uint8_t expected_sha256[32];
     uint32_t gen_sum;
     int      matches;
 } StaticMatchCache;
 
 static StaticMatchCache s_static_match_cache[STATIC_MATCH_CACHE_CAP];
 static uint64_t s_static_match_rehashes = 0;
-static uint64_t s_static_match_crc_misses = 0;
+static uint64_t s_static_match_digest_misses = 0;
 static uint64_t s_static_match_gen_fastpath = 0;
 
 int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
                                     uint32_t count,
-                                    uint32_t expected_crc) {
+                                    const uint8_t expected_sha256[32]) {
     const uint8_t *ram = memory_get_ram_ptr();
-    if (!ram || !lo_len_pairs || count == 0u || count > 4096u) {
-        s_static_match_crc_misses++;
+    if (!ram || !lo_len_pairs || !expected_sha256 ||
+        count == 0u || count > 4096u) {
+        s_static_match_digest_misses++;
         return 0;
     }
 
@@ -711,13 +716,15 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
         if (len == 0u || lo >= ram_size || len > ram_size - lo) {
-            s_static_match_crc_misses++;
+            s_static_match_digest_misses++;
             return 0;
         }
     }
 
     uintptr_t raw = (uintptr_t)lo_len_pairs;
-    uint32_t slot = (uint32_t)(((raw >> 4) ^ (raw >> 19) ^ expected_crc ^
+    uint32_t digest_key;
+    memcpy(&digest_key, expected_sha256, sizeof(digest_key));
+    uint32_t slot = (uint32_t)(((raw >> 4) ^ (raw >> 19) ^ digest_key ^
                                 (count * 0x9E3779B9u)) &
                                (STATIC_MATCH_CACHE_CAP - 1u));
     StaticMatchCache *entry = NULL;
@@ -727,7 +734,7 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
         if (!candidate->ranges ||
             (candidate->ranges == lo_len_pairs &&
              candidate->count == count &&
-             candidate->expected_crc == expected_crc)) {
+             memcmp(candidate->expected_sha256, expected_sha256, 32u) == 0)) {
             entry = candidate;
             break;
         }
@@ -739,7 +746,8 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
 
     int same_identity = entry->ranges == lo_len_pairs &&
                         entry->count == count &&
-                        entry->expected_crc == expected_crc;
+                        memcmp(entry->expected_sha256,
+                               expected_sha256, 32u) == 0;
     if (!same_identity) {
         /* The watch bitmap is monotonic between boots. Register a linked range
          * once, not on every dispatch; later code-word writes invalidate both
@@ -761,30 +769,95 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
         return entry->matches;
     }
 
-    uint32_t crc = 0xFFFFFFFFu;
+    uint8_t digest[32];
+    psx_sha256_ctx hash;
+    psx_sha256_init(&hash);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        crc = crc32_update(crc, ram + lo, len);
+        psx_sha256_update(&hash, ram + lo, len);
     }
-    crc ^= 0xFFFFFFFFu;
-    int matches = (crc == expected_crc) ? 1 : 0;
+    psx_sha256_final(&hash, digest);
+    int matches = memcmp(digest, expected_sha256, sizeof(digest)) == 0;
     s_static_match_rehashes++;
-    if (!matches) s_static_match_crc_misses++;
+    if (!matches) s_static_match_digest_misses++;
 
     entry->ranges = lo_len_pairs;
     entry->count = count;
-    entry->expected_crc = expected_crc;
+    memcpy(entry->expected_sha256, expected_sha256,
+           sizeof(entry->expected_sha256));
     entry->gen_sum = gen_sum;
     entry->matches = matches;
     return matches;
+}
+
+int psx_overlay_static_note_candidate_dispatch(
+        const uint32_t *code_lo_len_pairs, uint32_t code_count,
+        const uint8_t expected_code_sha256[32],
+        const uint32_t *artifact_lo_len_pairs, uint32_t artifact_count,
+        const uint8_t artifact_sha256[32], const PsxGameIdentity *identity,
+        uint64_t capability_id, uint32_t producer_entry,
+        uint32_t dispatch_pc) {
+    uint32_t artifact_base;
+    uint32_t artifact_size;
+    uint32_t producer_phys;
+    uint32_t dispatch_phys;
+
+    if (!code_lo_len_pairs || !expected_code_sha256 ||
+        code_count == 0u || code_count > 4096u ||
+        !artifact_lo_len_pairs || artifact_count != 1u ||
+        !artifact_sha256 || !identity ||
+        capability_id == 0u || !psx_game_identity_gate(identity))
+        return 0;
+    artifact_base = artifact_lo_len_pairs[0] & 0x1FFFFFFFu;
+    artifact_size = artifact_lo_len_pairs[1];
+    producer_phys = producer_entry & 0x1FFFFFFFu;
+    dispatch_phys = dispatch_pc & 0x1FFFFFFFu;
+    if (artifact_size < 4u || artifact_base >= memory_get_ram_size() ||
+        artifact_size > memory_get_ram_size() - artifact_base ||
+        producer_phys < artifact_base ||
+        producer_phys - artifact_base > artifact_size - 4u ||
+        dispatch_phys < artifact_base ||
+        dispatch_phys - artifact_base > artifact_size - 4u)
+        return 0;
+    for (uint32_t i = 0; i < code_count; i++) {
+        uint32_t lo = code_lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = code_lo_len_pairs[i * 2u + 1u];
+        if (len == 0u || lo < artifact_base ||
+            lo - artifact_base >= artifact_size ||
+            len > artifact_size - (lo - artifact_base))
+            return 0;
+    }
+    if (!psx_overlay_static_code_matches(code_lo_len_pairs, code_count,
+                                          expected_code_sha256))
+        return 0;
+
+    PsxXgRenderAuthCandidate candidate = {
+        .producer_entry = producer_entry,
+        .range_start = artifact_base,
+        .range_size = artifact_size,
+        .dispatch_pc = dispatch_pc,
+        .identity = *identity,
+        .pair_id = capability_id,
+        .artifact_base = artifact_base,
+        .artifact_size = artifact_size,
+        .artifact_sha256 = { 0 },
+        .runtime_variant_identity = { 0 },
+        .authority_provenance = true,
+        .pair_bound = true,
+        .runtime_variant_bound = false,
+    };
+    memcpy(candidate.artifact_sha256, artifact_sha256,
+           sizeof(candidate.artifact_sha256));
+    psx_xg_render_auth_note_candidate_dispatch(&candidate);
+    return 1;
 }
 
 void overlay_loader_static_match_stats(uint64_t *rehashes,
                                        uint64_t *crc_misses,
                                        uint64_t *gen_fastpath) {
     if (rehashes) *rehashes = s_static_match_rehashes;
-    if (crc_misses) *crc_misses = s_static_match_crc_misses;
+    if (crc_misses) *crc_misses = s_static_match_digest_misses;
     if (gen_fastpath) *gen_fastpath = s_static_match_gen_fastpath;
 }
 #endif
@@ -810,7 +883,7 @@ typedef struct {
 typedef struct {
     uint32_t base;
     uint32_t size;
-    uint32_t crc32;
+    uint8_t sha256[PSX_GAME_IDENTITY_SHA256_BYTES];
     uint8_t runtime_variant_identity[PSX_GAME_IDENTITY_SHA256_BYTES];
     int present;
     int runtime_variant_present;
@@ -988,10 +1061,10 @@ static ManFn *parse_manifest(const char *path, int *out_n,
             }
         } else if (*record == 'A') {
             const char *cursor = record + 1;
-            uint64_t parsed_base = 0, parsed_size = 0, parsed_crc = 0;
+            uint64_t parsed_base = 0, parsed_size = 0;
             if (manifest_hex_field(&cursor, 8, &parsed_base) &&
                 manifest_hex_field(&cursor, 8, &parsed_size) &&
-                manifest_hex_field(&cursor, 8, &parsed_crc) &&
+                manifest_sha256_field(&cursor, artifact.sha256) &&
                 manifest_record_end(cursor) && !artifact_seen++ &&
                 (parsed_base & 0xFF800000u) == 0x80000000u &&
                 parsed_size > 0 &&
@@ -1000,7 +1073,6 @@ static ManFn *parse_manifest(const char *path, int *out_n,
                     (parsed_base & 0x1FFFFFFFu)) {
                 artifact.base = (uint32_t)parsed_base;
                 artifact.size = (uint32_t)parsed_size;
-                artifact.crc32 = (uint32_t)parsed_crc;
                 artifact.present = 1;
             } else invalid = 1;
         } else if (*record == 'V') {
@@ -1205,8 +1277,10 @@ static int manifest_artifact_equal(const ManifestArtifact *left,
     return left != NULL && right != NULL &&
            left->present == right->present &&
            (!left->present ||
-            ((left->base & 0x1FFFFFFFu) == (right->base & 0x1FFFFFFFu) &&
-              left->size == right->size && left->crc32 == right->crc32 &&
+             ((left->base & 0x1FFFFFFFu) == (right->base & 0x1FFFFFFFu) &&
+              left->size == right->size &&
+              memcmp(left->sha256, right->sha256,
+                     sizeof(left->sha256)) == 0 &&
               left->runtime_variant_present == right->runtime_variant_present &&
               (!left->runtime_variant_present ||
                memcmp(left->runtime_variant_identity,
@@ -1401,11 +1475,18 @@ static void overlay_image_warm_drop_all(void);
 
 static int cache_artifact_matches(const CacheEntry *entry,
                                   const ManifestArtifact *artifact) {
-    return entry != NULL && artifact != NULL && artifact->present &&
-           artifact->size != 0u &&
-           (entry->region_start & 0x1FFFFFFFu) ==
-               (artifact->base & 0x1FFFFFFFu) &&
-           entry->logical_crc == artifact->crc32;
+    if (entry == NULL || artifact == NULL || !artifact->present ||
+        artifact->size == 0u ||
+        (entry->region_start & 0x1FFFFFFFu) !=
+            (artifact->base & 0x1FFFFFFFu))
+        return 0;
+    const uint32_t base = artifact->base & 0x1FFFFFFFu;
+    uint8_t digest[PSX_GAME_IDENTITY_SHA256_BYTES];
+    psx_sha256_ctx context;
+    psx_sha256_init(&context);
+    psx_sha256_update(&context, memory_get_ram_ptr() + base, artifact->size);
+    psx_sha256_final(&context, digest);
+    return memcmp(digest, artifact->sha256, sizeof(digest)) == 0;
 }
 
 static int manifest_renderer_authority_bound(
@@ -3456,7 +3537,9 @@ static int load_one_dll(const char *dll_path,
         renderer_provenance.pair_id = manifest_pair_id;
         renderer_provenance.artifact_base = manifest_artifact.base;
         renderer_provenance.artifact_size = manifest_artifact.size;
-        renderer_provenance.artifact_crc32 = manifest_artifact.crc32;
+        memcpy(renderer_provenance.artifact_sha256,
+               manifest_artifact.sha256,
+               sizeof(renderer_provenance.artifact_sha256));
         memcpy(renderer_provenance.runtime_variant_identity,
                manifest_artifact.runtime_variant_identity,
                sizeof(renderer_provenance.runtime_variant_identity));
@@ -4028,6 +4111,15 @@ static int overlay_static_dispatch(CPUState *cpu, uint32_t addr,
     if (known) *known = psx_overlay_static_image_known(addr);
     return 0;
 }
+
+static void overlay_static_require_aot(uint32_t addr) {
+    extern uint32_t g_overlay_region_floor;
+    extern void psx_fatal_halt(const char *reason);
+
+    if (!s_active && (addr & 0x1FFFFFFFu) >= g_overlay_region_floor)
+        psx_fatal_halt(
+            "runtime overlay address has no matching linked AOT dispatch");
+}
 #endif
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
@@ -4040,6 +4132,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         int static_known = 0;
         if (overlay_static_dispatch(cpu, addr, &static_known)) return 1;
         if (static_known) return 0;
+        overlay_static_require_aot(addr);
     }
 #endif
     /* Overlay dispatch is a no-op when the overlay loader is inactive
@@ -5235,6 +5328,7 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
             psx_fatal_halt(
                 "linked static overlay code missed its generated dispatcher");
         }
+        overlay_static_require_aot(addr);
     }
 #endif
     if (!s_active || !s_native_exec)

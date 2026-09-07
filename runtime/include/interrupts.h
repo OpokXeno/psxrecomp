@@ -45,6 +45,16 @@ void psx_irq_raise(uint32_t bit, uint32_t detail);
  * allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
 
+/* Optional guest-owner host service at interrupt-check boundaries, outside
+ * exception/device/DMA service. Calls are throttled by ~1 ms of guest cycles;
+ * this does not advance cycles or deliver interrupts. NULL is the default.
+ * Install/remove on the guest owner. The hook may suspend its entire host stack
+ * but must return to it: no guest execution, CPU mutation, restore or longjmp. */
+void psx_interrupts_set_host_service_hook(void (*hook)(void));
+/* Guest-owner wall pacing immediately before the scheduled VBlank raise.
+ * Same suspension contract as host service; never changes guest cycles. */
+void psx_interrupts_set_vblank_host_hook(void (*hook)(void));
+
 /* Cheap block-edge predicate for generated/native code. Device events are
  * raised by psx_advance_cycles(); this reports whether the comparatively
  * expensive delivery/scheduler path can have an architectural effect now. */

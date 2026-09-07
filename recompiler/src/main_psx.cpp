@@ -857,11 +857,18 @@ int main(int argc, char** argv) {
         if (cutover.transfer ==
                 PSXRecomp::CodeGenConfig::NativeCutoverTransfer::ObserveAfter) {
             const auto previous = exe->read_word(cutover.pc - 4u);
-            if (PSXRecomp::ControlFlowAnalyzer::is_control_flow(*word) ||
+            const auto flow = PSXRecomp::ControlFlowAnalyzer::analyze_instruction(
+                cutover.pc, *word);
+            const bool supported_call =
+                (flow.type == PSXRecomp::ControlFlowType::JumpLink ||
+                 flow.type == PSXRecomp::ControlFlowType::JumpLinkReg) &&
+                flow.has_delay_slot;
+            if ((flow.type != PSXRecomp::ControlFlowType::None &&
+                 !supported_call) ||
                 (previous.has_value() &&
                  PSXRecomp::ControlFlowAnalyzer::is_control_flow(*previous))) {
                 fmt::print(stderr,
-                    "psxrecomp-game: FATAL: observe-after site 0x{:08X} cannot be control flow or a delay slot\n",
+                    "psxrecomp-game: FATAL: observe-after site 0x{:08X} must be a non-control instruction or a call, and cannot be a delay slot\n",
                     cutover.pc);
                 return 1;
             }

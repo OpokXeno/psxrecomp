@@ -658,6 +658,18 @@ int savestate_pending(void) {
     return (s_save_pending >= 0 || s_load_pending >= 0) ? 1 : 0;
 }
 
+int savestate_load_completed(void) {
+    return s_load_completed;
+}
+
+int savestate_load_failed(void) {
+    return s_load_failed;
+}
+
+int savestate_save_failed(void) {
+    return s_save_failed;
+}
+
 int savestate_take_load_completed(void) {
     int v = s_load_completed;
     s_load_completed = 0;

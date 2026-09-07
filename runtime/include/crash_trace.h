@@ -32,6 +32,9 @@ void psx_crash_trace_set_exit_origin(const char *origin);
  * Never returns. */
 void psx_fatal_halt(const char *reason);
 
+/* Thread-safe terminal flag; does not read the diagnostic reason pointer. */
+int psx_fatal_halted(void);
+
 /* Set when psx_fatal_halt fires; the freeze heartbeat includes it so an
  * external reader can tell a fatal halt from a wedge. NULL = healthy. */
 extern const char *g_psx_fatal_reason;

@@ -1548,7 +1548,7 @@ static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
             xg_render_source_observation_begin(cpu, pc, insn);
     const int rv =
         exec_one_fetched_inner(cpu, pc, insn, cold_flags, next_pc_out);
-    if (native_cutover_post)
+    if (native_cutover_post && !source_observation_control)
         (void)psx_xg_render_auth_native_ft4_bypass(cpu, pc, insn);
     if (!source_observation_control)
         xg_render_source_observation_commit(cpu, &source_observation);
@@ -1724,6 +1724,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
+            if ((cold_flags & PSX_XG_RENDER_COLD_NATIVE_POST) != 0u)
+                (void)psx_xg_render_auth_native_ft4_bypass(cpu, pc, insn);
             if (observe_render_source)
                 xg_render_source_observation_commit(cpu, &source_observation);
             cosim_exec_one_transfer_hook(pc + 4);
@@ -1948,6 +1950,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                 cpu, PSX_XG_RENDER_AUTH_HOOK_CAPTURE, pc, insn,
                 fetch_word((pc + 4) & 0x1FFFFFFFu));
         exec_delay_slot(cpu, pc + 4);
+        if ((cold_flags & PSX_XG_RENDER_COLD_NATIVE_POST) != 0u)
+            (void)psx_xg_render_auth_native_ft4_bypass(cpu, pc, insn);
         if (observe_render_source)
             xg_render_source_observation_commit(cpu, &source_observation);
         cosim_exec_one_transfer_hook(pc + 4);

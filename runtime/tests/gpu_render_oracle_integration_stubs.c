@@ -59,6 +59,10 @@ static TestGteNativeSlot test_gte_native_slots[16];
 static int test_gte_native_enabled;
 int g_gte_native_provenance_active;
 
+void mod_runtime_on_vblank(void) {}
+void sio_ape_card_unstick_pump(void) {}
+int psx_netplay_active(void) { return 0; }
+
 void test_gte_native_provenance_clear(void) {
     memset(test_gte_native_slots, 0, sizeof(test_gte_native_slots));
 }
@@ -328,14 +332,18 @@ void mdec_debug_dma_out_end(uint32_t addr, uint32_t words) {
     (void)addr;
     (void)words;
 }
+int test_mdec_dma_read_ready;
+uint32_t test_mdec_dma_read_value;
+uint32_t test_mdec_dma_output_format = 3u;
 void mdec_dma_write_word(uint32_t value) { (void)value; }
-uint32_t mdec_dma_read_word(void) { return 0u; }
+uint32_t mdec_dma_read_word(void) { return test_mdec_dma_read_value++; }
 uint32_t mdec_dma_write_words(const uint32_t *src, uint32_t max_words) {
     (void)src;
     return max_words;
 }
 int mdec_dma_write_ready(void) { return 0; }
-int mdec_dma_read_ready(void) { return 0; }
+int mdec_dma_read_ready(void) { return test_mdec_dma_read_ready; }
+uint32_t mdec_dma_output_depth(void) { return test_mdec_dma_output_format; }
 int cdrom_get_setloc_lba(void) { return -1; }
 uint32_t cdrom_dma_read(void) { return 0u; }
 int cdrom_dma_ready(void) { return 0; }

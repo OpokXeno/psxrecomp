@@ -4,6 +4,9 @@
 
 #if !defined(PSX_HAS_RECOMP_NET)
 void psx_netplay_rb_bind(const PsxNetplayRbBindings *b) { (void)b; }
+void psx_netplay_rb_set_episode_begin_callback(void (*callback)(void)) {
+    (void)callback;
+}
 void psx_netplay_rb_start(void) {}
 void psx_netplay_rb_shutdown(void) {}
 void psx_netplay_rb_cold_reset(void) {}
@@ -144,6 +147,11 @@ uint32_t psx_netplay_rb_rtt_estimate_ms(void) { return 0; }
 #include <time.h>
 
 static PsxNetplayRbBindings g_b;
+static void (*g_episode_begin_callback)(void);
+
+void psx_netplay_rb_set_episode_begin_callback(void (*callback)(void)) {
+    g_episode_begin_callback = callback;
+}
 static int g_bound;
 static RNetRbSession *g_rb;
 static NetplaySnapRing *g_snaps;
@@ -7943,6 +7951,7 @@ int psx_netplay_rb_begin_rewind(uint32_t mismatch_tick, int slot)
         corr.flags = RNET_RB_CORR_LIGHT_TIP;
 
     g_last_begin_mismatch = mismatch_tick;
+    if (g_episode_begin_callback) g_episode_begin_callback();
     rnet_rb_begin_episode(g_rb, &corr);
     psx_netplay_timesync_on_episode_boundary();
     clear_episode_wire_state();
@@ -8609,6 +8618,7 @@ static void begin_follower(uint32_t epoch, uint32_t mismatch, uint32_t load, uin
      * slot-partitioned; this only keeps counters monotonic for logging). */
     if ((epoch >> RB_EPOCH_SLOT_BITS) > g_epoch)
         g_epoch = epoch >> RB_EPOCH_SLOT_BITS;
+    if (g_episode_begin_callback) g_episode_begin_callback();
     rnet_rb_begin_episode(g_rb, &corr);
     psx_netplay_timesync_on_episode_boundary();
     clear_episode_wire_state();

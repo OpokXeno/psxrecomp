@@ -1,6 +1,8 @@
 #define PSX_OVERLAY_DLL_BUILD 1
 #include "overlay_loader.h"
+#include "crc32.h"
 #include "game_identity.h"
+#include "psx_sha256.h"
 #include "guest_render_native_stream.h"
 #include "native_render_baseline.h"
 #include "xg_render_auth_runtime_hooks.h"
@@ -31,6 +33,7 @@ static uint8_t s_scratch[1024];
 static PsxXgRenderAuthCandidate s_renderer_candidate;
 static uint32_t s_renderer_candidate_calls;
 static uint32_t s_loader_mismatch_calls;
+static uint32_t s_page_generation;
 static const PsxGameIdentity s_fixture_identity = {
     {0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u,
      0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu,
@@ -90,6 +93,13 @@ void psx_xg_render_auth_loader_mismatch(uint32_t pc) {
     (void)pc;
     s_loader_mismatch_calls++;
 }
+int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {
+    (void)cpu; (void)addr; return 0;
+}
+int psx_overlay_static_image_known(uint32_t addr) {
+    (void)addr; return 0;
+}
+void psx_fatal_halt(const char *reason) { (void)reason; }
 bool psx_xg_render_auth_native_ft4_bypass(
         CPUState *cpu, uint32_t pc, uint32_t instruction) {
     (void)cpu;
@@ -172,7 +182,7 @@ void psx_pgxp_cop2(CPUState *cpu, uint32_t instr, uint32_t value,
     (void)cpu; (void)instr; (void)value; (void)addr;
 }
 uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
-    (void)phys; (void)len; return 0;
+    (void)phys; (void)len; return s_page_generation;
 }
 void overlay_watch_set_range(uint32_t phys, uint32_t len) {
     (void)phys; (void)len;
@@ -365,6 +375,97 @@ static int expect_int(const char *what, long long actual, long long expected) {
     return 0;
 }
 
+static int test_static_artifact_candidate_dispatch(void) {
+    static const uint32_t code_range[] = { 0x00012000u, 4u };
+    static const uint32_t artifact_range[] = { 0x00012000u, 7u };
+    PsxGameIdentity wrong_identity = s_fixture_identity;
+    const uint8_t artifact[] = { 1u, 2u, 3u, 4u, 5u, 6u, 7u };
+    uint8_t code_sha256[32];
+    uint8_t artifact_sha256[32];
+    int ok = 1;
+
+    psx_sha256_compute(artifact, 4u, code_sha256);
+    psx_sha256_compute(artifact, sizeof(artifact), artifact_sha256);
+    memcpy(s_ram + artifact_range[0], artifact, sizeof(artifact));
+    s_renderer_candidate_calls = 0u;
+    ok &= expect_int("static candidate accepted",
+        psx_overlay_static_note_candidate_dispatch(
+            code_range, 1u, code_sha256,
+            artifact_range, 1u, artifact_sha256, &s_fixture_identity,
+            UINT64_C(0x1020304050607080), 0x80012000u, 0xA0012000u), 1);
+    ok &= expect_int("static candidate notification count",
+                     s_renderer_candidate_calls, 1);
+    ok &= expect_int("static candidate producer",
+                     s_renderer_candidate.producer_entry, 0x80012000u);
+    ok &= expect_int("static candidate actual dispatch pc",
+                     s_renderer_candidate.dispatch_pc, 0xA0012000u);
+    ok &= expect_int("static candidate exact range start",
+                     s_renderer_candidate.range_start, 0x00012000u);
+    ok &= expect_int("static candidate exact odd range size",
+                     s_renderer_candidate.range_size, 7u);
+    ok &= expect_int("static candidate artifact sha256",
+                     memcmp(s_renderer_candidate.artifact_sha256,
+                            artifact_sha256, sizeof(artifact_sha256)), 0);
+    ok &= expect_int("static candidate capability",
+                     (long long)s_renderer_candidate.pair_id,
+                     (long long)UINT64_C(0x1020304050607080));
+    ok &= expect_int("static candidate authority provenance",
+                     s_renderer_candidate.authority_provenance, 1);
+    ok &= expect_int("static candidate pair bound",
+                     s_renderer_candidate.pair_bound, 1);
+    ok &= expect_int("static candidate runtime variant unbound",
+                     s_renderer_candidate.runtime_variant_bound, 0);
+    ok &= expect_int("static candidate identity",
+                     memcmp(&s_renderer_candidate.identity,
+                            &s_fixture_identity, sizeof(s_fixture_identity)), 0);
+
+    s_ram[artifact_range[0] + 6u] ^= 1u;
+    ++s_page_generation;
+    ok &= expect_int("static unloaded artifact tail accepted",
+        psx_overlay_static_note_candidate_dispatch(
+            code_range, 1u, code_sha256,
+            artifact_range, 1u, artifact_sha256, &s_fixture_identity,
+            UINT64_C(0x1020304050607080), 0x80012000u, 0x80012000u), 1);
+    ok &= expect_int("static tail change notified",
+                     s_renderer_candidate_calls, 2);
+    s_ram[artifact_range[0] + 6u] ^= 1u;
+    ++s_page_generation;
+
+    s_ram[code_range[0] + 3u] ^= 1u;
+    ++s_page_generation;
+    ok &= expect_int("static code mismatch rejected",
+        psx_overlay_static_note_candidate_dispatch(
+            code_range, 1u, code_sha256,
+            artifact_range, 1u, artifact_sha256, &s_fixture_identity,
+            UINT64_C(0x1020304050607080), 0x80012000u, 0x80012000u), 0);
+    ok &= expect_int("static code mismatch did not notify",
+                     s_renderer_candidate_calls, 2);
+    s_ram[code_range[0] + 3u] ^= 1u;
+    ++s_page_generation;
+
+    ok &= expect_int("static zero capability rejected",
+        psx_overlay_static_note_candidate_dispatch(
+            code_range, 1u, code_sha256,
+            artifact_range, 1u, artifact_sha256, &s_fixture_identity, 0u,
+            0x80012000u, 0x80012000u), 0);
+    wrong_identity.game_sha256[0] ^= 1u;
+    ok &= expect_int("static wrong identity rejected",
+        psx_overlay_static_note_candidate_dispatch(
+            code_range, 1u, code_sha256,
+            artifact_range, 1u, artifact_sha256, &wrong_identity,
+            UINT64_C(0x1020304050607080), 0x80012000u, 0x80012000u), 0);
+    ok &= expect_int("static odd tail cannot contain instruction",
+        psx_overlay_static_note_candidate_dispatch(
+            code_range, 1u, code_sha256,
+            artifact_range, 1u, artifact_sha256, &s_fixture_identity,
+            UINT64_C(0x1020304050607080), 0x80012000u, 0x80012004u), 0);
+    ok &= expect_int("static rejections did not notify",
+                     s_renderer_candidate_calls, 2);
+    s_renderer_candidate_calls = 0u;
+    memset(&s_renderer_candidate, 0, sizeof(s_renderer_candidate));
+    return ok;
+}
+
 static uint32_t loader_owner_count(void) {
     uint32_t loads = 0;
     overlay_loader_get_counters(&loads, NULL, NULL, NULL, NULL, NULL,
@@ -437,6 +538,7 @@ int main(int argc, char **argv) {
     const PsxGameIdentity *identity = psx_game_identity_runtime();
     ok &= expect_int("runtime identity", identity != NULL, 1);
     ok &= expect_int("bound runtime identity", psx_game_identity_gate(identity), 1);
+    ok &= test_static_artifact_candidate_dispatch();
 
     /* Only the first physical pair exists at init. This pins canonical order,
      * then makes rescan responsible for discovering the staged second pair. */
@@ -520,8 +622,8 @@ int main(int argc, char **argv) {
                           0x00010000u);
         ok &= expect_int("renderer artifact size",
                           s_renderer_candidate.artifact_size, 16);
-        ok &= expect_int("renderer artifact crc",
-                          s_renderer_candidate.artifact_crc32, 0x11111111u);
+        ok &= expect_int("renderer artifact sha256",
+                           s_renderer_candidate.artifact_sha256[0], 0x37u);
         ok &= expect_int("renderer producer entry",
                           s_renderer_candidate.producer_entry & 0x1FFFFFFFu,
                           0x00010000u);

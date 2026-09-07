@@ -21,6 +21,7 @@
 
 #if defined(PSX_HAS_RBENGINE_SNAP)
 #include "retcomm_rbengine/snap_ring.h"
+#include "psx_sdl.h"
 #endif
 
 #define RW_THUMB_W     128
@@ -174,6 +175,49 @@ static int s_panel_dirty = 1;
 
 static int s_load_pending;
 static uint32_t s_load_tick;
+
+/* One owned capture in flight. The worker never accesses the ring, thumbnails,
+ * guest state or capture hooks. Mutex handoff publishes the finished wire. */
+static struct {
+    SDL_Thread *thread;
+    SDL_mutex *mutex;
+    SDL_cond *condition;
+    BootStateRawCapture *capture;
+    BootStateRawCapture *spare;
+    int done, stop;
+    uint32_t tick, previous_frame;
+    uint32_t thumb[RW_THUMB_W * RW_THUMB_H];
+} s_encoder;
+static struct {
+    uint64_t submitted, stored, store_failed, encode_failed, loads, load_failed;
+    uint64_t shutdown_pending, waits;
+    uint32_t last_stored_tick, last_load_tick, last_load_pc;
+    uint64_t last_load_cycle;
+} s_perf;
+
+static int rewind_perf_json(char *out, int capacity)
+{
+    int pending = 0;
+    if (s_encoder.thread) {
+        SDL_LockMutex(s_encoder.mutex);
+        pending = s_encoder.capture != NULL;
+        SDL_UnlockMutex(s_encoder.mutex);
+    }
+    return snprintf(out, (size_t)capacity,
+        "{\"submitted\":%llu,\"stored\":%llu,\"store_failed\":%llu,"
+        "\"encode_failed\":%llu,\"pending\":%d,\"retained\":%u,"
+        "\"frame\":%u,\"last_stored_tick\":%u,\"open\":%d,"
+        "\"loads\":%llu,\"load_failed\":%llu,\"last_load_tick\":%u,"
+        "\"last_load_pc\":%u,\"last_load_cycle\":%llu,"
+        "\"shutdown_pending\":%llu,\"waits\":%llu}",
+        (unsigned long long)s_perf.submitted, (unsigned long long)s_perf.stored,
+        (unsigned long long)s_perf.store_failed, (unsigned long long)s_perf.encode_failed,
+        pending, s_count, s_frame, s_perf.last_stored_tick, s_open,
+        (unsigned long long)s_perf.loads, (unsigned long long)s_perf.load_failed,
+        s_perf.last_load_tick, s_perf.last_load_pc,
+        (unsigned long long)s_perf.last_load_cycle,
+        (unsigned long long)s_perf.shutdown_pending, (unsigned long long)s_perf.waits);
+}
 
 static int s_left_was, s_right_was, s_acc_was, s_can_was;
 static uint32_t s_rep_next;
@@ -380,6 +424,57 @@ static void list_push(uint32_t tick, const uint32_t *thumb)
     s_panel_dirty = 1;
 }
 
+static int SDLCALL rewind_encode(void *unused)
+{
+    (void)unused;
+    SDL_LockMutex(s_encoder.mutex);
+    for (;;) {
+        while (!s_encoder.stop && (!s_encoder.capture || s_encoder.done))
+            SDL_CondWait(s_encoder.condition, s_encoder.mutex);
+        if (s_encoder.stop) break;
+        BootStateRawCapture *capture = s_encoder.capture;
+        SDL_UnlockMutex(s_encoder.mutex);
+        boot_state_encode_raw(capture);
+        SDL_LockMutex(s_encoder.mutex);
+        s_encoder.done = 1;
+        SDL_CondBroadcast(s_encoder.condition);
+    }
+    SDL_UnlockMutex(s_encoder.mutex);
+    return 0;
+}
+
+static void finish_capture(int wait)
+{
+    BootStateRawCapture *capture;
+    uint8_t *blob = NULL;
+    size_t len = 0u;
+    if (!s_encoder.thread) return;
+    SDL_LockMutex(s_encoder.mutex);
+    if (wait && s_encoder.capture && !s_encoder.done) s_perf.waits++;
+    while (wait && s_encoder.capture && !s_encoder.done)
+        SDL_CondWait(s_encoder.condition, s_encoder.mutex);
+    if (!s_encoder.capture || !s_encoder.done) {
+        SDL_UnlockMutex(s_encoder.mutex);
+        return;
+    }
+    capture = s_encoder.capture;
+    s_encoder.capture = NULL;
+    s_encoder.done = 0;
+    SDL_UnlockMutex(s_encoder.mutex);
+    const int encoded = boot_state_finish_raw(capture, &blob, &len, &s_encoder.spare);
+    if (encoded && rbe_snap_ring_store(s_ring, s_encoder.tick, blob, len)) {
+        s_perf.stored++;
+        s_perf.last_stored_tick = s_encoder.tick;
+        list_push(s_encoder.tick, s_encoder.thumb);
+    } else {
+        if (encoded) s_perf.store_failed++;
+        else s_perf.encode_failed++;
+        free(blob);
+        s_last_capture_frame = s_encoder.previous_frame;
+        s_capture_due = 1;
+    }
+}
+
 void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 {
     if (!rewind_wanted())
@@ -397,6 +492,14 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
         return;
     }
     s_configured = 1;
+    memset(&s_perf, 0, sizeof(s_perf));
+    boot_state_set_save_consumer_perf_hook(rewind_perf_json);
+    s_encoder.mutex = SDL_CreateMutex();
+    s_encoder.condition = SDL_CreateCond();
+    if (s_encoder.mutex && s_encoder.condition)
+        s_encoder.thread = SDL_CreateThread(rewind_encode, "rewind-encode", NULL);
+    if(s_encoder.thread)s_encoder.spare=boot_state_prepare_raw();
+    /* If host thread creation fails, keep the complete synchronous save path. */
     s_frame = 0;
     s_last_capture_frame = 0xffffffffu;
     s_count = 0;
@@ -410,6 +513,35 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 
 void psx_rewind_shutdown(void)
 {
+    if (s_encoder.thread) {
+        SDL_LockMutex(s_encoder.mutex);
+        if (s_encoder.capture) s_perf.shutdown_pending++;
+        SDL_UnlockMutex(s_encoder.mutex);
+    }
+    finish_capture(1);
+    const char *diagnostics_path = getenv("PSX_REWIND_DIAGNOSTICS_OUT");
+    if (s_configured && diagnostics_path && *diagnostics_path) {
+        char diagnostics[2048];
+        const int n = boot_state_save_perf_json(diagnostics, sizeof(diagnostics));
+        if (n > 0 && n < (int)sizeof(diagnostics)) {
+            FILE *file = fopen(diagnostics_path, "wb");
+            if (file) {
+                (void)fwrite(diagnostics, 1u, (size_t)n, file);
+                fclose(file);
+            }
+        }
+    }
+    if (s_encoder.thread) {
+        SDL_LockMutex(s_encoder.mutex);
+        s_encoder.stop = 1;
+        SDL_CondBroadcast(s_encoder.condition);
+        SDL_UnlockMutex(s_encoder.mutex);
+        SDL_WaitThread(s_encoder.thread, NULL);
+    }
+    if (s_encoder.condition) SDL_DestroyCond(s_encoder.condition);
+    if (s_encoder.mutex) SDL_DestroyMutex(s_encoder.mutex);
+    boot_state_free_raw(s_encoder.spare);
+    memset(&s_encoder, 0, sizeof(s_encoder));
     if (s_ring)
         rbe_snap_ring_destroy(s_ring);
     free(s_thumbs);
@@ -469,14 +601,40 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         return 0;
     snap = *cpu;
     snap.pc = pc;
+    if (s_encoder.thread) {
+        /* Backpressure at the next due capture preserves every requested point;
+         * never replace a queued capture or defer it to hide encoder overload. */
+        finish_capture(1);
+        /* The prior worker has released this staging array. Recopy all entries
+         * but reuse its resident pages instead of faulting a new allocation. */
+        BootStateRawCapture *capture = boot_state_capture_raw(
+            &snap, s_bios, s_entry, s_encoder.spare);
+        s_encoder.spare = NULL;
+        if (!capture) return 0;
+        capture_thumb(s_encoder.thumb);
+        s_encoder.tick = tick;
+        s_encoder.previous_frame = s_last_capture_frame;
+        s_last_capture_frame = tick;
+        s_capture_due = 0;
+        SDL_LockMutex(s_encoder.mutex);
+        s_encoder.capture = capture;
+        s_perf.submitted++;
+        SDL_CondBroadcast(s_encoder.condition);
+        SDL_UnlockMutex(s_encoder.mutex);
+        return 1;
+    }
     if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
         !blob || !len)
         return 0;
+    s_perf.submitted++;
     if (!rbe_snap_ring_store(s_ring, tick, blob, len)) {
+        s_perf.store_failed++;
         free(blob);
         return 0;
     }
     capture_thumb(thumb);
+    s_perf.stored++;
+    s_perf.last_stored_tick = tick;
     list_push(tick, thumb);
     s_last_capture_frame = s_frame;
     s_capture_due = 0;
@@ -497,14 +655,20 @@ static int do_load(CPUState *cpu, uint32_t tick)
     data = rbe_snap_ring_peek(s_ring, tick, &size);
     if (!data || !size)
         return 0;
-    if (!boot_state_load_buffer(data, size, s_bios, s_entry, cpu))
+    if (!boot_state_load_buffer(data, size, s_bios, s_entry, cpu)) {
+        s_perf.load_failed++;
         return 0;
+    }
     if (!resume_pc_ok(cpu->pc))
         return 0;
     rbe_snap_ring_drop_after(s_ring, tick);
     list_drop_after(tick);
     s_frame = tick;
     s_last_capture_frame = tick;
+    s_perf.loads++;
+    s_perf.last_load_tick = tick;
+    s_perf.last_load_pc = cpu->pc;
+    s_perf.last_load_cycle = psx_get_cycle_count();
     psx_cycles_resync_after_restore(cpu);
     interrupts_resync_after_restore();
     cdrom_accelerate_after_savestate();
@@ -518,6 +682,9 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
 {
     if (!psx_rewind_enabled())
         return;
+    /* Finish before a rewind restore can fork the timeline. Ordinary polls do
+     * not wait; a load and shutdown drain the owned capture explicitly. */
+    finish_capture(s_load_pending);
     if (s_load_pending) {
         uint32_t tick = s_load_tick;
         s_load_pending = 0;
@@ -544,6 +711,9 @@ int psx_rewind_toggle(void)
         s_anim_t0 = 0u;
         return 1;
     }
+    /* Freeze the filmstrip before selection starts; a late publication must
+     * not move the user's selection while the rewind menu is open. */
+    finish_capture(1);
     s_open = 1;
     s_anim_dir = 1;
     s_anim_t0 = 0u;

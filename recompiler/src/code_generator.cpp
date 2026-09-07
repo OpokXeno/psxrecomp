@@ -2280,6 +2280,9 @@ std::string CodeGenerator::translate_basic_block(
                 std::string delay_saved_target;  // JR/JALR target captured before delay
 
                 const auto *cutover = native_cutover_site(config_, addr, instr);
+                const bool observe_after = cutover != nullptr &&
+                    cutover->transfer ==
+                        CodeGenConfig::NativeCutoverTransfer::ObserveAfter;
                 if (cutover != nullptr) {
                     const char *callback = native_cutover_callback(config_);
                     if (cutover->transfer ==
@@ -2304,10 +2307,18 @@ std::string CodeGenerator::translate_basic_block(
                            << fmt::format(
                                   "(void){}(cpu, "
                                   "0x{:08X}u, 0x{:08X}u);\n",
-                                  callback, addr, instr);
+                                   callback, addr, instr);
+                    } else if (observe_after &&
+                               (block.exit_instr.type ==
+                                    ControlFlowType::JumpLink ||
+                                block.exit_instr.type ==
+                                    ControlFlowType::JumpLinkReg) &&
+                               block.exit_instr.has_delay_slot) {
+                        /* Emitted after the mandatory delay slot below so the
+                         * observer sees the complete call arguments. */
                     } else {
                         throw std::runtime_error(fmt::format(
-                            "post/return native cutover at control flow 0x{:08X} is unsupported",
+                            "native cutover transfer at control flow 0x{:08X} is unsupported",
                             addr));
                     }
                 }
@@ -2489,6 +2500,13 @@ std::string CodeGenerator::translate_basic_block(
                             emit_cosim_instr(delay_slot_addr, config_.indent);
                         }
                     }
+                }
+
+                if (observe_after) {
+                    ss << config_.indent
+                       << fmt::format(
+                              "(void){}(cpu, 0x{:08X}u, 0x{:08X}u);\n",
+                              native_cutover_callback(config_), addr, instr);
                 }
 
                 // Now emit the branch/jump

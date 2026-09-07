@@ -12,6 +12,7 @@
 #define PSXRECOMP_DEBUG_SERVER_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 
 #include "cpu_state.h"
@@ -116,8 +117,14 @@ uint32_t debug_server_get_tcp_drops(void);
  * Call after vblank processing. */
 void debug_server_record_frame(void);
 
-/* Block while paused, polling TCP + SDL events.
- * Call from vblank callback before frame processing. */
+/* Install/remove on the simulation thread, outside a wait callback. The
+ * callback services host-only work cooperatively; false uses the SDL fallback.
+ * It must not poll debug commands or apply guest transitions recursively. */
+void debug_server_set_host_wait_callback(
+    bool (*callback)(void *user_data), void *user_data);
+
+/* Internal pause gate; pause/step commands remain disabled. If armed, poll
+ * commands on the guest stack and yield host service without advancing guest. */
 void debug_server_wait_if_paused(void);
 
 /* Graceful shutdown. Call at exit. */

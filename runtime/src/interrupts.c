@@ -393,7 +393,14 @@ static void (*s_midframe_audio_pump)(void);
 
 void psx_set_midframe_audio_pump(void (*fn)(void)) { s_midframe_audio_pump = fn; }
 
+static void (*s_vblank_host_hook)(void);
+
+void psx_interrupts_set_vblank_host_hook(void (*hook)(void)) {
+    s_vblank_host_hook = hook;
+}
+
 static void fire_vblank_edge(void) {
+    if (s_vblank_host_hook) s_vblank_host_hook();
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */
@@ -628,6 +635,15 @@ static int      s_defer_switch_pending = 0;
 static uint32_t s_defer_switch_target  = 0;  /* TCB PCB[0] should name after the switch */
 static uint32_t s_defer_switch_from    = 0;  /* the interrupted thread to re-save cleanly */
 
+static void (*s_host_service_hook)(void);
+static uint64_t s_host_service_cycle = UINT64_MAX;
+static int s_host_service_busy;
+
+void psx_interrupts_set_host_service_hook(void (*hook)(void)) {
+    s_host_service_hook = hook;
+    s_host_service_cycle = UINT64_MAX;
+}
+
 /* A/B toggle: PSX_DEFER_SWITCH=0 forces the legacy immediate-switch behavior
  * (longjmp the instant a mid-exception ChangeThread is detected, regardless of
  * nesting) so the deferred-switch fix can be compared against the baseline
@@ -749,6 +765,7 @@ void psx_get_freeze_diag(uint64_t *out_total_checks,
 }
 
 void interrupts_init(void) {
+    psx_interrupts_set_host_service_hook(NULL);
     dispatch_count = 0;
     in_exception = 0;
     exception_nest_depth = 0;
@@ -1009,6 +1026,21 @@ int psx_interrupt_delivery_needed(const CPUState* cpu) {
 
 void psx_check_interrupts(CPUState* cpu) {
     psx_cyc_batch_flush();
+    if (s_host_service_hook && !s_host_service_busy && !in_exception &&
+        !psx_in_device_service && !s_defer_switch_pending &&
+        !g_rfe_escape_pending && !g_pending_exception_longjmp && !g_ls_replay_active) {
+        extern int g_dma_exec_depth;
+        const uint64_t cycle = psx_cycle_count;
+        if (g_dma_exec_depth == 0 && (cycle < s_host_service_cycle ||
+            cycle - s_host_service_cycle >= UINT64_C(33868))) {
+            /* Device callbacks from the flush have returned. The host keeps
+             * this stack suspended; no IRQ/TCB state is saved or redirected. */
+            s_host_service_cycle = cycle;
+            s_host_service_busy = 1;
+            s_host_service_hook();
+            s_host_service_busy = 0;
+        }
+    }
 #ifndef PSX_NO_DEBUG_TOOLS
     /* The flush above may have presented a VBlank and queued a host-requested
      * guest transition. Consume it at this normal block edge only after the

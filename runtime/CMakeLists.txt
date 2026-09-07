@@ -69,6 +69,10 @@ endif()
 # (ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    add_test(NAME overlay_pair_dedup_runtime
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_pair_dedup_runtime.py")
+
     add_executable(launcher_device_roundtrip_test
         tests/test_launcher_device_roundtrip.cpp)
     target_include_directories(launcher_device_roundtrip_test PRIVATE include)
@@ -204,13 +208,65 @@ if(BUILD_TESTING)
     add_executable(game_identity_test
         tests/test_game_identity.c
         src/game_identity.c
-        src/boot_state.c)
+        src/boot_state.c
+        src/ram_provenance.c)
     target_include_directories(game_identity_test PRIVATE include)
     target_compile_definitions(game_identity_test PRIVATE
         PSX_GAME_EXTRA_IDENTITY_SHA256="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         PSX_GAME_MANIFEST_DIGEST_SHA256="202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
     target_link_libraries(game_identity_test PRIVATE ZLIB::ZLIB)
     add_test(NAME game_identity_test COMMAND game_identity_test)
+
+    add_executable(boot_state_partial_vram_upload_test
+        tests/test_boot_state_partial_vram_upload.c
+        tests/gpu_render_oracle_integration_stubs.c
+        src/boot_state.c
+        src/game_identity.c
+        src/color_lut.c
+        src/dma.c
+        src/gpu.c
+        src/gpu_render.c
+        src/gpu_render_oracle.c
+        src/gpu_vram_dirty.c
+        src/guest_render_native_stream.c
+        src/guest_render_transaction.c
+        src/gpu_sw_renderer.c
+        src/ram_provenance.c
+        src/pgxp.cpp
+        src/ws_aspect_cone_math.c
+        src/ws_ui_group.c)
+    target_include_directories(boot_state_partial_vram_upload_test PRIVATE
+        include src ${PSX_SDL_INCLUDE_DIRS})
+    target_compile_definitions(boot_state_partial_vram_upload_test PRIVATE
+        PSX_BOOT_STATE_TEST_FAULT_INJECTION=1
+        PSX_GAME_EXTRA_IDENTITY_SHA256="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        PSX_GAME_MANIFEST_DIGEST_SHA256="202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+    target_link_libraries(boot_state_partial_vram_upload_test PRIVATE
+        ${PSX_SDL_LIBRARIES} ZLIB::ZLIB)
+    if(MSVC)
+        target_compile_options(boot_state_partial_vram_upload_test PRIVATE /Gy)
+        target_link_options(boot_state_partial_vram_upload_test PRIVATE /OPT:REF)
+    elseif(APPLE)
+        target_compile_options(boot_state_partial_vram_upload_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(boot_state_partial_vram_upload_test PRIVATE
+            -Wl,-dead_strip)
+    else()
+        target_compile_options(boot_state_partial_vram_upload_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(boot_state_partial_vram_upload_test PRIVATE
+            -Wl,--gc-sections)
+        target_link_libraries(boot_state_partial_vram_upload_test PRIVATE m)
+    endif()
+    add_test(NAME boot_state_partial_vram_upload_test
+             COMMAND boot_state_partial_vram_upload_test)
+
+    add_executable(ram_provenance_snapshot_test
+        tests/test_ram_provenance_snapshot.c
+        src/ram_provenance.c)
+    target_include_directories(ram_provenance_snapshot_test PRIVATE include)
+    add_test(NAME ram_provenance_snapshot_test
+             COMMAND ram_provenance_snapshot_test)
 
     add_executable(game_identity_unconfigured_test
         tests/test_game_identity_unconfigured.c
@@ -452,6 +508,11 @@ if(BUILD_TESTING)
     target_include_directories(gpu_primitive_reject_test PRIVATE include)
     add_test(NAME gpu_primitive_reject_test COMMAND gpu_primitive_reject_test)
 
+    add_executable(gpu_vram_region_set_test
+        tests/test_gpu_vram_region_set.c)
+    target_include_directories(gpu_vram_region_set_test PRIVATE include)
+    add_test(NAME gpu_vram_region_set_test COMMAND gpu_vram_region_set_test)
+
     add_executable(gpu_sw_edges_test tests/test_gpu_sw_edges.c)
     target_include_directories(gpu_sw_edges_test PRIVATE src)
     add_test(NAME gpu_sw_edges_test COMMAND gpu_sw_edges_test)
@@ -668,6 +729,7 @@ if(BUILD_TESTING)
         src/gpu_render.c
         src/gpu_semantic_workload.c
         src/pgxp.cpp
+        src/ram_provenance.c
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c
         src/gpu_gl_renderer.c)

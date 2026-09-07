@@ -1,12 +1,13 @@
 ﻿/* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
- * the recompiled reset vector. BIOS drives execution; SDL presents
- * VRAM at each vblank via callback from gpu_vblank_tick().
+ * the recompiled reset vector. Native suspends simulation at VBlank/wait
+ * seams so the SDL-thread presenter can run on its own wall-clock deadlines.
  */
 
 #include "cpu_state.h"
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
+#include "psx_fiber.h"
 #include "parity_trace.h"    /* general two-process control-flow parity ring */
 #include "device_trace.h"    /* general two-process device-event cycle ring */
 #include "psx_interpreter.h"
@@ -49,7 +50,12 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "native_render_mode_control.h"
 #include "native_render_baseline.h"
 #include "xg_render_auth_runtime_control.h"
+#include "xg_render_presentation_host.h"
 #include "xg_render_runtime_host_services.h"
+#include "xg_render_source_frame.h"
+#include "xg_render_native_work.h"
+#include "xg_render_native_target.h"
+#include "xg_render_vram_resources.h"
 #include "frame_pacing.h"
 #include "xenogears_scene.h"
 #include "latency_ring.h"
@@ -120,6 +126,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #endif
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <cctype>
 #include <cmath>
@@ -349,9 +356,39 @@ extern "C" uint16_t psx_read_half(uint32_t addr);
 extern "C" void     psx_write_half(uint32_t addr, uint16_t val);
 extern "C" uint8_t  psx_read_byte(uint32_t addr);
 extern "C" void     psx_write_byte(uint32_t addr, uint8_t val);
+extern "C" int      psx_game_text_native_ok(uint32_t addr);
 
 static uint64_t xg_render_host_frame_count(void) {
     return s_frame_count;
+}
+
+static bool xg_render_host_semantic_module(uint32_t *out_module) {
+    XgScene scene = {};
+
+    if (out_module == nullptr) return false;
+    psx_xenogears_read_scene(&scene);
+    if (scene.active_module <= XG_SEMANTIC_MODULE_MENU) {
+        *out_module = scene.active_module;
+        return true;
+    }
+    if (scene.requested_module != XG_SEMANTIC_MODULE_RESIDENT &&
+        scene.requested_module <= XG_SEMANTIC_MODULE_MENU) {
+        *out_module = scene.requested_module;
+        return true;
+    }
+    if (scene.valid_field) {
+        *out_module = XG_SEMANTIC_MODULE_FIELD;
+        return true;
+    }
+    if (scene.requested_module == XG_SEMANTIC_MODULE_RESIDENT) {
+        *out_module = XG_SEMANTIC_MODULE_RESIDENT;
+        return true;
+    }
+    return false;
+}
+
+static bool xg_render_host_native_text_authorizes_pc(uint32_t owner_entry) {
+    return psx_game_text_native_ok(owner_entry) != 0;
 }
 
 /* Guest-side data-read wrappers: same as psx_read_* but charge PS1 main-RAM
@@ -436,9 +473,232 @@ static void mod_call_frame_hooks() {
 static std::atomic<int> g_smooth_60fps{0};
 static std::atomic<int> g_smooth_60fps_requested{0};
 static bool g_native_render_selected = false;
+static int g_video_scale = 1; /* Requested presentation resolution, not guest VRAM scale. */
+static bool g_native_render_source_failed = false;
+static double g_native_guest_speed = 1.0;
 static int g_native_interpolation_fps = 60;
 static int g_video_fps = 30;
 static NativeRenderModeControl g_native_render_mode_control{};
+static XgRenderPresentationHost *g_native_render_presentation_host = nullptr;
+
+/* One SDL/GL OS thread, two roles. Keep the scheduler root across lobby
+ * reentry: the legacy TCB bridge may retain it as its non-owned main fiber. */
+static struct NativeSimulation {
+    psx_fiber_t host = nullptr;
+    psx_fiber_t root = nullptr;
+    psx_fiber_t suspended = nullptr;
+    CPUState *cpu = nullptr;
+    bool active = false;
+    uint64_t resume_deadline_ns = 0;
+    uint64_t guest_deadline_ns = 0;
+    uint64_t present_poll_ns = 0;
+    uint64_t renderer_poll_ns = 0;
+    uint64_t guest_cycle = 0;
+    uint64_t last_realtime_irq_ns = 0;
+    double fractional_ns = 0.0;
+    bool realtime = true;
+    bool clock_rebase = true;
+} g_native_simulation;
+
+static uint64_t native_render_clock_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static struct {
+    struct Sample { uint64_t ns, vblank, cycle; uint32_t scene; } samples[16384];
+    uint64_t total = 0, start_ns = 0;
+    std::string path;
+} g_vblank_timing;
+
+static void vblank_timing_flush() {
+    if (g_vblank_timing.path.empty()) return;
+    FILE *out = std::fopen(g_vblank_timing.path.c_str(), "w");
+    if (!out) return;
+    std::fprintf(out, "start_ns,total,capacity\n%llu,%llu,16384\nns,vblank,cycle,scene\n",
+        (unsigned long long)g_vblank_timing.start_ns,
+        (unsigned long long)g_vblank_timing.total);
+    for (uint64_t i = 0; i < std::min<uint64_t>(g_vblank_timing.total, 16384); ++i) {
+        const auto &s = g_vblank_timing.samples[i];
+        std::fprintf(out, "%llu,%llu,%llu,%u\n", (unsigned long long)s.ns,
+            (unsigned long long)s.vblank, (unsigned long long)s.cycle, s.scene);
+    }
+    std::fclose(out);
+}
+
+static void native_render_guest_clock_reset() {
+    g_native_simulation.guest_deadline_ns = native_render_clock_ns();
+    g_native_simulation.guest_cycle = psx_get_cycle_count();
+    g_native_simulation.fractional_ns = 0.0;
+    g_native_simulation.last_realtime_irq_ns = 0;
+    g_native_simulation.clock_rebase = true;
+}
+
+extern "C" bool psx_native_render_presentation_host_snapshot(
+        XgRenderPresentationHostSnapshot *out_snapshot) {
+    if (!out_snapshot) return false;
+    std::memset(out_snapshot, 0, sizeof(*out_snapshot));
+    return g_native_render_presentation_host != nullptr &&
+        xg_render_presentation_host_snapshot(
+            g_native_render_presentation_host, out_snapshot);
+}
+
+extern "C" void gpu_vblank_fail_closed_present(void);
+
+static void native_render_source_fail_closed() {
+    if (!g_native_render_selected)
+        return;
+    g_native_render_source_failed = true;
+    psx_xg_render_auth_cold_enable(false);
+    guest_render_native_stream_set_enabled(false);
+    gpu_vblank_fail_closed_present();
+    if (g_native_render_presentation_host)
+        xg_render_presentation_host_shutdown(
+            g_native_render_presentation_host);
+}
+
+static void native_render_sync_source_clock() {
+    if (!g_native_simulation.active || !g_native_render_presentation_host ||
+        g_native_render_source_failed)
+        return;
+    const uint64_t now_ns = native_render_clock_ns();
+    const uint64_t deadline_ns = g_native_simulation.guest_deadline_ns;
+    const uint64_t offset_ns = deadline_ns >= now_ns
+        ? deadline_ns - now_ns : now_ns - deadline_ns;
+    if (offset_ns > INT64_MAX || !xg_render_presentation_host_sync_source_clock(
+            g_native_render_presentation_host, g_native_simulation.guest_cycle,
+            deadline_ns >= now_ns ? (int64_t)offset_ns : -(int64_t)offset_ns,
+            g_native_simulation.realtime, g_native_simulation.clock_rebase)) {
+        native_render_source_fail_closed();
+        return;
+    }
+    g_native_simulation.clock_rebase = false;
+}
+
+static void native_render_host_service_boundary();
+
+static bool native_render_native_capture_source(
+        XgRenderSourceCommitHandle commit,
+        const XgRenderSourceCommitHeader *sealed_header,
+        void *) {
+    return gl_renderer_native_capture_source(commit, sealed_header) != 0;
+}
+
+static void native_render_native_notify(void *user_data) {
+    xg_render_presentation_host_notify(
+            static_cast<XgRenderPresentationHost *>(user_data));
+}
+
+static bool native_render_describe_work(XgRenderSourceFrameDescription *description) {
+    if (!psx_xg_render_auth_describe_native_work(description)) return false;
+    /* Also binds a new presentation epoch before its first FIFO publication;
+     * unchanged pacer samples leave the existing origin untouched. */
+    native_render_sync_source_clock();
+    if (g_native_render_source_failed) return false;
+    description->display.temporal_hz =
+        g_smooth_60fps_requested.load(std::memory_order_acquire)
+        ? (uint16_t)g_native_interpolation_fps : 0u;
+    description->display.render_scale = (uint16_t)g_video_scale;
+    return true;
+}
+
+static bool native_render_native_stop_host() {
+    XgRenderPresentationHost *host = g_native_render_presentation_host;
+
+    gpu_set_native_work_draw_hook(nullptr);
+    gpu_set_native_work_environment_hook(nullptr);
+    xg_render_native_work_cancel_pending();
+    (void)xg_render_native_work_configure(nullptr);
+    psx_xg_render_auth_set_native_work_mode(false);
+    xg_render_source_frame_clear_host_callbacks();
+    if (!host)
+        return true;
+    gl_renderer_native_set_worker_notify(nullptr,nullptr);
+    xg_render_presentation_host_shutdown(host);
+    if (!xg_render_presentation_host_join(host) ||
+        !xg_render_presentation_host_destroy(host)) {
+        native_render_source_fail_closed();
+        return false;
+    }
+    g_native_render_presentation_host = nullptr;
+    gl_renderer_native_stop_gpu_worker();
+    return true;
+}
+
+static bool native_render_native_start_host(double presentation_period_ms) {
+    XgRenderWorkerServices worker_services{};
+    XgRenderPresenterServices presenter_services{};
+    XgRenderSourceFrameHostCallbacks callbacks{};
+
+    if (!gl_renderer_native_init_services(
+            &worker_services, &presenter_services)) {
+        native_render_source_fail_closed();
+        return false;
+    }
+    const uint64_t presentation_period_ns =
+        presentation_period_ms > 0.0
+            ? static_cast<uint64_t>(presentation_period_ms * 1000000.0 + 0.5)
+            : 16666667u;
+    g_native_render_presentation_host =
+        xg_render_presentation_host_start(
+            &worker_services, &presenter_services, presentation_period_ns);
+    if (!g_native_render_presentation_host) {
+        native_render_source_fail_closed();
+        gl_renderer_native_shutdown();
+        return false;
+    }
+    callbacks.sealed_capture = native_render_native_capture_source;
+    gl_renderer_native_set_worker_notify(native_render_native_notify,g_native_render_presentation_host);
+    callbacks.published_notify = native_render_native_notify;
+    callbacks.user_data = g_native_render_presentation_host;
+    if (!xg_render_presentation_host_set_hold_presenter(
+            g_native_render_presentation_host, xg_render_presenter_present_hold) ||
+        !xg_render_source_frame_configure_host_callbacks(&callbacks)) {
+        native_render_source_fail_closed();
+        if (!native_render_native_stop_host())
+            return false;
+        gl_renderer_native_shutdown();
+        return false;
+    }
+    const XgRenderNativeWorkServices work_services = {
+        native_render_describe_work,
+        psx_native_render_service_wait,
+        native_render_native_notify,
+        g_native_render_presentation_host,
+        [](void *) -> bool {
+            native_render_host_service_boundary();
+            return !g_native_render_source_failed;
+        },
+    };
+    if (!xg_render_native_work_configure(&work_services)) {
+        (void)native_render_native_stop_host();
+        return false;
+    }
+    psx_xg_render_auth_set_native_work_mode(true);
+    gpu_set_native_work_draw_hook(psx_xg_render_auth_accept_native_draw);
+    gpu_set_native_work_environment_hook([](uint64_t command_id) -> bool {
+        XgRenderNativeOperation target{};
+        return command_id > UINT32_C(0x001ffffc) ||
+            !xg_render_native_target_take((uint32_t)command_id, &target) ||
+            xg_render_native_work_operation(&target, psx_get_cycle_count());
+    });
+    g_native_render_source_failed = false;
+    return true;
+}
+
+static uint64_t native_render_timeline_invalidate(
+        XgRenderTimelineInvalidationReason reason) {
+    const uint64_t epoch =
+        psx_xg_render_auth_timeline_invalidate(reason);
+
+    /* The auth facade owns the single epoch transition plus resource/source
+     * invalidation. The host only needs a wake here; invalidate_or_wake would
+     * advance the same timeline a second time. */
+    if (g_native_render_presentation_host)
+        xg_render_presentation_host_notify(
+            g_native_render_presentation_host);
+    return epoch;
+}
 
 struct Smooth60State {
     std::vector<uint32_t> previous_source;
@@ -1032,8 +1292,9 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
 }
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
+    /* boot_state emits GPU_VRAM_EVENT_RESTORE after applying the guest state;
+     * its Native checkpoint hook has already opened the replacement scene. */
     psx_xenogears_scene_reset();
-    psx_xg_render_auth_scene_boundary();
     mod_runtime_on_savestate_loaded();
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
@@ -1041,6 +1302,7 @@ extern "C" void psx_frontend_on_savestate_loaded(void) {
     /* Re-anchor wall pacing + FPS baseline: admit may have blocked for seconds
      * in the load barrier with next_deadline in the past. */
     s_frame_pacer = FramePacer{ 0 };
+    native_render_guest_clock_reset();
     s_fps_last_time = 0;
     s_fps_last_frame = 0;
     /* Re-anchor guest-cycle→sample budgeting (pump clears queued PCM too). */
@@ -1071,6 +1333,7 @@ extern "C" void psx_frontend_on_savestate_loaded(void) {
  * is already in FMV/media, mirror the disk cutover reset so resume into
  * FMV entry does not treat the tip as a fresh gap (permanent black blank). */
 extern "C" void psx_frontend_on_rb_snap_loaded(void) {
+    native_render_guest_clock_reset();
     const int media = gpu_display_is_depth24() || mdec_recently_active(8) ||
                       cdrom_fmv_stream_pending() || cdrom_xa_stream_active();
     g_audio_cycle_resync = 1;
@@ -1183,9 +1446,9 @@ extern "C" void psx_smooth_60fps_set(int enabled) {
 }
 
 static void set_video_fps(int fps) {
-    g_video_fps = fps == 60 ? 60 : 30;
-    g_native_interpolation_fps = 60;
-    psx_smooth_60fps_set(g_video_fps == 60);
+    g_video_fps = fps == 60 || fps == 120 || fps == 240 ? fps : 30;
+    g_native_interpolation_fps = g_video_fps >= 60 ? g_video_fps : 60;
+    psx_smooth_60fps_set(g_video_fps >= 60);
 }
 #if defined(PSX_WEB)
 extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
@@ -1194,7 +1457,6 @@ extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
 #endif
 
 /* [video] options, resolved from the game config (defaults: native + AA). */
-static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
@@ -1237,7 +1499,8 @@ void psx_video_set_supersampling(int s) {
     if (s < 1) s = 1;
     if (s > 8) s = 8;
     g_video_scale = s;
-    gr_set_scale(g_video_scale);
+    if (!g_native_render_selected)
+        gr_set_scale(g_video_scale);
 }
 int  psx_video_get_antialiasing(void)   { return g_video_aa ? 1 : 0; }
 void psx_video_set_antialiasing(int on) { g_video_aa = (on != 0); }
@@ -1825,7 +2088,8 @@ static bool native_render_opengl_effective(void *) {
 
 static void native_render_set_interpolation_effective(bool enabled, void *) {
     if (g_gl_active)
-        gl_renderer_set_interpolation(enabled ? 1 : 0, g_host_refresh_hz,
+        gl_renderer_set_interpolation(enabled && !g_native_render_selected ? 1 : 0,
+                                      g_host_refresh_hz,
                                       (double)g_frame_interpolation_fps,
                                       g_frame_interpolation_blend);
 }
@@ -2789,6 +3053,8 @@ static int host_refresh_is_approx_60hz(void) {
 }
 
 static int present_vsync_owns_cadence(void) {
+    if (g_native_render_selected)
+        return 0;
     if (g_video_vsync == 0 || g_present_vsync_disabled)
         return 0;
     if (g_frame_period_ms <= 0.0)
@@ -2816,6 +3082,241 @@ static int present_should_wall_pace(void) {
     return g_frame_period_ms > 0.0 && !present_vsync_owns_cadence();
 }
 
+/* Only the host root calls this while simulation is suspended. In particular,
+ * do not poll debug commands, admit netplay, or apply restores here: those can
+ * escape to the scheduler and must execute on its live guest stack. */
+static void native_render_host_service_until(uint64_t deadline_ns) {
+    do {
+        uint64_t presenter_wait_ns = UINT64_MAX;
+        if (!g_headless)
+            SDL_PumpEvents();
+        if (!g_native_render_source_failed && g_native_render_presentation_host) {
+            const int serviced = gl_renderer_native_service();
+            if (serviced > 0)
+                xg_render_presentation_host_notify(g_native_render_presentation_host);
+            if (serviced < 0 ||
+                !xg_render_presentation_host_pump(g_native_render_presentation_host) ||
+                !xg_render_presentation_host_time_until_pump(
+                    g_native_render_presentation_host, &presenter_wait_ns))
+                native_render_source_fail_closed();
+        }
+        const uint64_t now_ns = native_render_clock_ns();
+        if (now_ns >= deadline_ns)
+            break;
+        const uint64_t wait_ns = std::min<uint64_t>(
+            std::min(deadline_ns - now_ns, presenter_wait_ns),
+            gl_renderer_native_service_pending() ? 1000000u : 8000000u);
+        if (wait_ns != 0u) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(wait_ns));
+            /* A wake for the guest deadline must not run another variable-cost
+             * host pump first. Pending work remains for the next service seam. */
+            if (native_render_clock_ns() >= deadline_ns)
+                break;
+        }
+    } while (true);
+}
+
+static void native_render_suspend_until(uint64_t deadline_ns) {
+    if (!g_native_simulation.active) {
+        /* Initial netplay admission precedes scheduler entry on the host. */
+        native_render_host_service_until(deadline_ns);
+        return;
+    }
+    g_native_simulation.suspended = psx_fiber_current();
+    if (!g_native_simulation.suspended ||
+        g_native_simulation.suspended == g_native_simulation.host)
+        std::abort();
+    g_native_simulation.resume_deadline_ns = deadline_ns;
+    psx_fiber_switch(g_native_simulation.host);
+}
+
+static void native_render_host_service_boundary() {
+    if (!g_native_simulation.active || !g_native_render_presentation_host ||
+        g_native_render_source_failed ||
+        psx_fiber_current() == g_native_simulation.host)
+        return;
+    const uint64_t now_ns = native_render_clock_ns();
+    bool renderer_pending = false;
+    if (now_ns >= g_native_simulation.renderer_poll_ns) {
+        g_native_simulation.renderer_poll_ns = now_ns + 1000000u;
+        renderer_pending = gl_renderer_native_service_pending() != 0;
+    }
+    if (now_ns < g_native_simulation.present_poll_ns && !renderer_pending) return;
+    uint64_t wait_ns;
+    if (!xg_render_presentation_host_time_until_present(
+            g_native_render_presentation_host, &wait_ns)) {
+        native_render_source_fail_closed();
+        return;
+    }
+    g_native_simulation.present_poll_ns = now_ns + wait_ns;
+    /* Service only; the time spent presenting consumes the existing guest
+     * budget. Never move source deadlines or wait for a future host tick. */
+    if (wait_ns == 0u || renderer_pending)
+        native_render_suspend_until(now_ns);
+}
+
+/* Wait seams keep the entire guest stack and do not accrue simulation debt.
+ * Shift only wall time, not the cycle baseline: the quantum preceding an
+ * admit wait still owes its normal guest-cycle budget. */
+static void native_render_host_wait(uint32_t milliseconds) {
+    const uint64_t start_ns = native_render_clock_ns();
+    native_render_suspend_until(start_ns + (uint64_t)milliseconds * 1000000u);
+    if (g_native_simulation.active) {
+        const uint64_t pause_ns = native_render_clock_ns() - start_ns;
+        g_native_simulation.guest_deadline_ns += pause_ns;
+        g_native_simulation.clock_rebase = true;
+        native_render_sync_source_clock();
+    }
+}
+
+extern "C" bool psx_native_render_service_wait(void *user_data) {
+    if (!g_native_render_selected || !g_native_simulation.active ||
+        !g_native_render_presentation_host || g_native_render_source_failed ||
+        psx_return_to_lobby_requested() || psx_fatal_halted())
+        return false;
+    const psx_fiber_t caller = psx_fiber_current();
+    if (!caller || caller == g_native_simulation.host)
+        return false;
+    const bool replay_eof = input_replay::stop_reason() ==
+            input_replay::StopReason::CheckpointReached ||
+        input_replay::stop_reason() == input_replay::StopReason::TraceComplete;
+    // EOF must finish accepted batches/fences, not rearm a hold forever after
+    // every completion reap. Keep the retained endpoint and restore the callback.
+    if (replay_eof && !xg_render_presentation_host_set_hold_presenter(
+            g_native_render_presentation_host, nullptr))
+        return false;
+    /* Collector capacity is execution cost, not an intentional guest pause:
+     * it spends the existing cycle budget instead of adding a second wait.
+     * EOF must let visual deadlines drain; only a debug/admission pause shifts
+     * both clocks. The collector supplies the host as its callback context. */
+    if (user_data != nullptr || replay_eof)
+        native_render_suspend_until(native_render_clock_ns() + 1000000u);
+    else
+        native_render_host_wait(1);
+    starvation_watchdog_heartbeat();
+    if (replay_eof && g_native_render_presentation_host &&
+        !g_native_render_source_failed &&
+        !xg_render_presentation_host_set_hold_presenter(
+            g_native_render_presentation_host, xg_render_presenter_present_hold))
+        return false;
+    return g_native_render_presentation_host && !g_native_render_source_failed &&
+           !psx_return_to_lobby_requested() && !psx_fatal_halted();
+}
+
+/* Pace the actual scheduled edge, not the variable-cost frontend after it.
+ * Nested device service retains its complete guest stack across suspension. */
+static void native_render_host_quantum_pace(void) {
+    if (!g_native_render_selected || !g_native_simulation.active)
+        return;
+    double speed = g_native_guest_speed;
+    if (psx_netplay_is_resimulating() || psx_netplay_rb_tip_holding() ||
+        psx_return_to_lobby_requested())
+        speed = 0.0;
+    else if (psx_netplay_active() && !gpu_display_is_depth24() &&
+             psx_netplay_catchup_budget() > 0) {
+        psx_netplay_catchup_consume_frame();
+        speed = 0.0;
+    }
+    const uint64_t cycle = psx_get_cycle_count();
+    const uint64_t now_ns = native_render_clock_ns();
+    g_native_simulation.realtime = speed == 1.0;
+    if (speed <= 0.0 || cycle < g_native_simulation.guest_cycle) {
+        native_render_guest_clock_reset();
+    } else {
+        const double elapsed_ns =
+            (double)(cycle - g_native_simulation.guest_cycle) *
+            (1000000000.0 / 33868800.0) / speed +
+            g_native_simulation.fractional_ns;
+        const uint64_t budget_ns = (uint64_t)elapsed_ns;
+        g_native_simulation.fractional_ns = elapsed_ns - (double)budget_ns;
+        g_native_simulation.guest_cycle = cycle;
+        g_native_simulation.guest_deadline_ns += budget_ns;
+        /* Bounded recovery from CPU stalls, never a burst after a long pause. */
+        if (now_ns > g_native_simulation.guest_deadline_ns &&
+            now_ns - g_native_simulation.guest_deadline_ns > 250000000u) {
+            g_native_simulation.guest_deadline_ns = now_ns;
+            g_native_simulation.clock_rebase = true;
+        }
+    }
+    if (g_native_simulation.realtime && !psx_netplay_active() &&
+        g_native_simulation.last_realtime_irq_ns) {
+        /* Realtime is not fast-forward: spend debt as elapsed wall time, never
+         * as a burst of guest IRQs. Only the clock for new work is rebased. */
+        const uint64_t earliest_irq_ns =
+            g_native_simulation.last_realtime_irq_ns + UINT64_C(16666667);
+        if (g_native_simulation.guest_deadline_ns < earliest_irq_ns) {
+            g_native_simulation.guest_deadline_ns = earliest_irq_ns;
+            g_native_simulation.clock_rebase = true;
+        }
+    }
+    /* Synchronize the updated cycle/deadline pair, not a retained endpoint.
+     * Debt recovery dates new work only; queued work must keep draining. */
+    native_render_sync_source_clock();
+    native_render_suspend_until(g_native_simulation.guest_deadline_ns);
+}
+
+static void native_render_simulation_entry(void *) {
+    for (;;) {
+        psx_scheduler_run(g_native_simulation.cpu);
+        g_native_simulation.cpu = nullptr;
+        g_native_simulation.active = false;
+        psx_fiber_switch(g_native_simulation.host);
+    }
+}
+
+static void native_render_run_scheduler(CPUState *cpu) {
+    if (!g_native_render_selected) {
+        psx_scheduler_run(cpu);
+        return;
+    }
+    if (g_native_simulation.active)
+        std::abort();
+    if (!g_vblank_timing.start_ns) {
+        const char *path = std::getenv("PSX_VBLANK_TIMING_OUT");
+        if (path && *path) {
+            g_vblank_timing.path = path;
+            g_vblank_timing.start_ns = native_render_clock_ns();
+            std::atexit(vblank_timing_flush);
+        }
+    }
+    g_native_simulation.host = psx_fiber_convert_thread();
+    if (!g_native_simulation.host)
+        std::abort();
+    if (!g_native_simulation.root)
+        g_native_simulation.root = psx_fiber_create(
+            8u * 1024u * 1024u, native_render_simulation_entry, nullptr);
+    if (!g_native_simulation.root)
+        std::abort();
+    g_native_simulation.cpu = cpu;
+    g_native_simulation.active = true;
+    g_native_simulation.suspended = g_native_simulation.root;
+    g_native_guest_speed = 1.0;
+    g_native_simulation.realtime = true;
+    g_native_simulation.present_poll_ns = 0u;
+    native_render_guest_clock_reset();
+    native_render_sync_source_clock();
+    psx_interrupts_set_host_service_hook(native_render_host_service_boundary);
+    boot_state_set_save_service_hook([]() -> int {
+        native_render_host_service_boundary();
+        return !g_native_render_source_failed;
+    });
+#ifndef PSX_NO_DEBUG_TOOLS
+    debug_server_set_host_wait_callback(psx_native_render_service_wait, nullptr);
+#endif
+    do {
+        psx_fiber_switch(g_native_simulation.suspended);
+        if (g_native_simulation.active)
+            native_render_host_service_until(g_native_simulation.resume_deadline_ns);
+    } while (g_native_simulation.active);
+    psx_interrupts_set_host_service_hook(nullptr);
+    boot_state_set_save_service_hook(nullptr);
+#ifndef PSX_NO_DEBUG_TOOLS
+    debug_server_set_host_wait_callback(nullptr, nullptr);
+#endif
+    g_native_simulation.suspended = nullptr;
+    g_native_simulation.resume_deadline_ns = 0;
+}
+
 static void apply_present_cadence(void) {
 #ifndef PSX_SDL_NO_RENDER
     const int interval = present_effective_swap_interval();
@@ -2830,7 +3331,11 @@ static void apply_present_cadence(void) {
 }
 
 static void log_present_cadence(void) {
-    if (present_vsync_owns_cadence()) {
+    if (g_native_render_selected) {
+        std::printf("psxrecomp: Native cadence: 33.8688 MHz guest clock, "
+                    "independent %.1f Hz presenter, vsync off\n",
+                    (double)g_native_interpolation_fps);
+    } else if (present_vsync_owns_cadence()) {
         std::printf("psxrecomp: present cadence: driver vsync (%.1f Hz panel, "
                     "wall-clock pacer skipped)\n",
                     g_host_refresh_hz);
@@ -2923,11 +3428,24 @@ static void shutdown_runtime(void) {
     }
     psx_debug_overlay_shutdown();
     debug_server_shutdown();
+    gpu_set_host_quantum_boundary_hook(nullptr);
+    psx_interrupts_set_host_service_hook(nullptr);
+    boot_state_set_save_service_hook(nullptr);
+    if (!native_render_native_stop_host())
+        std::abort();
+    /* A window-close from inside simulation exits the process immediately;
+     * never delete that live stack. Normal scheduler return can release it. */
+    if (!g_native_simulation.active && g_native_simulation.root) {
+        psx_fiber_destroy(g_native_simulation.root);
+        g_native_simulation = {};
+    }
 }
 
 /* Tear down the game window/GL/audio after a lobby soft-return. Leaves SDL
  * subsystems and the lobby WebSocket intact for the next launcher session. */
 static void teardown_game_session_keep_lobby(void) {
+    if (g_native_simulation.active)
+        std::abort(); /* Scheduler must have returned before session teardown. */
     netplay_host_present_restore();
     psx_netplay_shutdown();
     psx_rewind_shutdown();
@@ -2940,11 +3458,17 @@ static void teardown_game_session_keep_lobby(void) {
     }
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
+    gpu_set_host_quantum_boundary_hook(nullptr);
+    psx_interrupts_set_host_service_hook(nullptr);
+    boot_state_set_save_service_hook(nullptr);
+    if (!native_render_native_stop_host())
+        std::abort();
     if (g_vk_active) {
         vk_renderer_shutdown();
         g_vk_active = false;
     }
     if (g_gl_active) {
+        gl_renderer_native_shutdown();
         gl_renderer_shutdown();
         g_gl_active = false;
     }
@@ -5413,7 +5937,10 @@ static void netplay_barrier_admit(int override) {
                 std::fflush(stdout);
                 desync_logged = 1;
             }
-            SDL_Delay(16);
+            if (g_native_render_selected)
+                native_render_host_wait(16);
+            else
+                SDL_Delay(16);
 #ifndef PSX_NO_DEBUG_TOOLS
             debug_server_poll();
 #endif
@@ -5499,15 +6026,18 @@ static void netplay_barrier_admit(int override) {
          * open a ~250ms present gap.
          * §100: MEDIA-KF probe/xfer (~3.7 MB) also parks sim in admit — hold
          * last FMV frame so intro does not freeze for the transfer window. */
-        if (psx_netplay_rb_tip_holding() ||
+        if (!g_native_render_selected && (psx_netplay_rb_tip_holding() ||
             psx_netplay_rb_media_kf_busy() ||
             (psx_netplay_rb_fmv_media_active() && psx_netplay_rb_active() &&
-             !psx_netplay_rb_is_resimulating()))
+             !psx_netplay_rb_is_resimulating())))
             netplay_hold_last_present_tick();
         /* Wake on peer UDP (or 1ms timeout). SDL_Delay(1) under dual FMV load
          * often stretches multi-ms and cut MotK netplay intro ~59→~36; Delay(0)
          * busy-spins and can starve the peer (tick-0 hang). */
-        psx_netplay_wait_recv(1);
+        if (g_native_render_selected)
+            native_render_host_wait(1);
+        else
+            psx_netplay_wait_recv(1);
         /* Admit barriers (save/load sync) can last seconds without guest cycles. */
         starvation_watchdog_heartbeat();
     }
@@ -5637,6 +6167,8 @@ static void sample_headless_pad_into_sio(int override) {
 /* §33/§35/§47: re-present last Live frame on a wall-clock cadence while guest
  * sim is frozen (short resim) or TipHold invent-cap stall (admit spin). */
 static void netplay_hold_last_present_tick(void) {
+    if (g_native_render_selected)
+        return; /* Native swaps belong exclusively to the host pump. */
     static uint64_t s_hold_last_ms;
     uint64_t now = SDL_GetTicks64();
     uint32_t period = (uint32_t)(g_frame_period_ms + 0.5);
@@ -6222,6 +6754,8 @@ static void rewind_poll_nav(uint32_t now_ms) {
 
 static void rewind_pause_present(void) {
     psx_rewind_present_tick((uint32_t)SDL_GetTicks());
+    if (g_native_render_selected)
+        return;
 #ifndef PSX_SDL_NO_RENDER
     if (g_gl_active) {
         gl_renderer_set_interpolation_suspended(1);
@@ -6272,7 +6806,10 @@ static void rewind_host_pause_loop(void) {
         }
         rewind_poll_nav((uint32_t)SDL_GetTicks());
         rewind_pause_present();
-        SDL_Delay(8);
+        if (g_native_render_selected)
+            native_render_host_wait(8);
+        else
+            SDL_Delay(8);
     }
 }
 
@@ -6313,7 +6850,10 @@ static void savestate_menu_host_pause_loop(void) {
         }
         savestate_menu_poll_nav((uint32_t)SDL_GetTicks());
         rewind_pause_present();
-        SDL_Delay(8);
+        if (g_native_render_selected)
+            native_render_host_wait(8);
+        else
+            SDL_Delay(8);
     }
 }
 
@@ -6326,21 +6866,14 @@ struct NetplayVblankEpilogue {
     int override = -1;
 };
 
-/* Called from gpu_vblank_tick() at each simulated vblank. */
-static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+/* Non-Native frontend work called from gpu_vblank_tick() at each simulated
+ * vblank. Native returns after the guest/diagnostic portion below; its real
+ * presenter is exclusively owned by g_native_render_presentation_host. */
+static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
     NetplayVblankEpilogue ep{};
-    const uint32_t previous_scene_generation =
-        psx_xenogears_scene_generation();
 
     input_replay::note_guest_vblank();
     input_replay::record_note_guest_vblank();
-    psx_xenogears_scene_vblank_boundary(mdec_recently_active(2));
-    if (psx_xenogears_scene_generation() !=
-        previous_scene_generation)
-        psx_xg_render_auth_scene_boundary();
-    gl_renderer_native_midpoint_set_suspended(
-        !g_smooth_60fps_requested.load(std::memory_order_acquire) ||
-        gpu_display_is_depth24() || mdec_recently_active(2));
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
      * next tick has a live native chain under its dispatch again. */
@@ -6350,10 +6883,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     struct PostLoadProbeScope {
         int *turbo;
         int *reached;
+        bool enabled;
         ~PostLoadProbeScope() {
-            post_load_probe_on_vblank(*turbo, *reached);
+            if (enabled)
+                post_load_probe_on_vblank(*turbo, *reached);
         }
-    } probe_scope{&probe_turbo, &probe_reached};
+    } probe_scope{&probe_turbo, &probe_reached, !g_native_render_selected};
 
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
@@ -6778,7 +7313,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * dispatches, run unpaced so the (shell-skipped) BIOS kernel init +
      * SYSTEM.CNF + game EXE load compress to host speed. This replaces the
      * old fast_boot snapshot restore; all guest timing is authentic. */
-    if (psx_bios_hle_boot_turbo_active())
+    if (psx_bios_hle_boot_turbo_active() && !g_native_render_selected)
         turbo_loads_active = 1;
     probe_turbo = turbo_loads_active;
 
@@ -6842,6 +7377,43 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                          turbo_loads_active && g_turbo_audio_sink_enabled);
     }
 #endif
+
+    /* Source capture precedes the frontend. Native skips legacy presentation,
+     * not input, netplay admission, restores, or the simulation pacer. */
+    if (g_native_render_selected) {
+        mod_call_frame_hooks();
+        double speed = 1.0;
+        if (g_headless || fmv_skip_active ||
+            psx_netplay_is_resimulating() || psx_netplay_rb_tip_holding())
+            speed = 0.0;
+        if (turbo_loads_active && speed > 0.0) {
+            if (g_turbo_load_wall_multiplier >= 2)
+                speed = (double)g_turbo_load_wall_multiplier;
+            else
+                speed = 0.0;
+        }
+        if (speed > 0.0) {
+            const Uint8 *keys = SDL_GetKeyboardState(NULL);
+            if (host_keymap_down(HOST_KEYMAP_TURBO, keys,
+                                 (int)SDL_GetModState())) {
+                const int multiplier = manual_fast_forward_multiplier();
+                if (multiplier < 0)
+                    speed = 0.0;
+                else if (multiplier >= 2)
+                    speed *= (double)multiplier;
+            }
+        }
+#ifndef PSX_NO_DEBUG_TOOLS
+        if (debug_server_turbo_enabled()) speed = 0.0;
+#endif
+        g_native_guest_speed = speed;
+        ep.skip_pace = 1;
+        return ep;
+    }
+
+    gl_renderer_native_midpoint_set_suspended(
+        !g_smooth_60fps_requested.load(std::memory_order_acquire) ||
+        gpu_display_is_depth24() || mdec_recently_active(2));
 
     if (g_headless) {
         gl_renderer_native_midpoint_reset_for_reason(
@@ -7322,8 +7894,6 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * do NOT flush_cpu_uploads (MDEC already wrote the CPU mirror; forcing
          * FBO uploads every frame cut MotK intro from ~50 to ~30 FPS). */
 #ifndef PSX_SDL_NO_RENDER
-        if (native_stream_enabled)
-            psx_xg_render_auth_complete_gpu_source_frame();
         if (g_gl_active && g_gl_fbo_present && !di.depth24 &&
             !native_fmv_active && !local_viewport_crop) {
             if (wide_present) {
@@ -7791,7 +8361,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     return ep;
 }
 
-static void sdl_vblank_present(void) {
+static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+    return sdl_vblank_frontend_body();
+}
+
+static void sdl_vblank_frontend_epilogue(void) {
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
@@ -7817,6 +8391,10 @@ static void sdl_vblank_present(void) {
         frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
     runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
     latency_ring_mark(LAT_PACED);
+}
+
+static void sdl_vblank_present(void) {
+    sdl_vblank_frontend_epilogue();
 }
 
 /* game.toml [netplay] + last TOC fingerprint — shared by launcher verify and
@@ -12446,7 +13024,7 @@ int main(int argc, char** argv) {
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive).
      * The two Native interpolation environment variables remain diagnostic
-     * overrides; normal configuration uses [video] fps = 30|60. Driver vsync
+     * overrides; normal configuration uses [video] fps = 30|60|120|240. Driver vsync
      * and wall-clock pacing remain mutually exclusive. */
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
@@ -13588,6 +14166,9 @@ session_reboot:
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
     static int s_emu_session = 0;
     const bool rematch_session = (++s_emu_session > 1);
+    if (rematch_session)
+        (void)native_render_timeline_invalidate(
+            XG_RENDER_TIMELINE_DISC_CHANGE);
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s%s\n",
                  bios_path_str.c_str(),
                  rematch_session ? " (rematch)" : "");
@@ -13698,10 +14279,17 @@ session_reboot:
      * software and Vulkan retain the shared backend limit. */
     const int max_internal_scale = gr_backend() == GR_BACKEND_OPENGL
         ? 8 : SW_MAX_INTERNAL_SCALE;
+    g_native_render_selected = native_render_mode_resolve(
+        config_render_mode.c_str(), std::getenv("PSX_NATIVE_RENDER_MODE"),
+        cli_render_mode) == GUEST_RENDER_RENDER_NATIVE;
     if (g_video_scale < 1) g_video_scale = 1;
     if (g_video_scale > max_internal_scale)
         g_video_scale = max_internal_scale;
-    if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
+    if (g_native_render_selected) {
+        /* Native captures the requested factor in each commit. The compatibility
+         * GPU backing is device memory and stays at its native resolution. */
+        gr_set_scale(1);
+    } else if (net_cfg.enabled && s_netplay_gl_present && gl_renderer_cpu_auth_dual()) {
         gr_set_scale(g_video_scale);
         if (g_video_scale > 1) {
             std::fprintf(stdout,
@@ -13725,7 +14313,8 @@ session_reboot:
      * still 0/1 until the GL context comes up later, so g_video_scale does not
      * hold the effective factor at this point. */
     const int requested_scale = g_video_scale;
-    g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+    if (!g_native_render_selected)
+        g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     gr_set_texture_filter(g_video_texfilter);
     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
      * with both off every setter below leaves the tracking caches disabled and
@@ -14063,21 +14652,29 @@ session_reboot:
     }
     psx_apply_window_icon(sdl_window, argv[0]);
 
+    /* Resolve Native before host refresh and GL setup. Its guest clock must
+     * never inherit monitor timing or start the legacy interpolation thread. */
+    g_native_render_selected =
+        native_render_mode_resolve(
+            config_render_mode.c_str(), std::getenv("PSX_NATIVE_RENDER_MODE"),
+            cli_render_mode) == GUEST_RENDER_RENDER_NATIVE;
+
     /* Host refresh: if the panel is within ~2% of 60 Hz, record it so driver
      * vsync can own cadence (pacer skipped). Non-~60 Hz and unknown refresh
      * (common on Wayland) keep PSX 59.94 Hz pacing and force swap interval 0
      * — vsync as the clock would run the sim at the panel rate. */
     {
         SDL_DisplayMode dm;
+        g_host_refresh_hz = 0.0;
         int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
         if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
             double host_hz = (double)dm.refresh_rate;
             g_host_refresh_hz = host_hz;
-            if (host_hz >= 58.8 && host_hz <= 61.2) {
+            if (!g_native_render_selected && host_hz >= 58.8 && host_hz <= 61.2) {
                 g_frame_period_ms = 1000.0 / host_hz;
                 std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
                             "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
-            } else {
+            } else if (!g_native_render_selected) {
                 std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
                             "59.94 Hz pacing\n", dm.refresh_rate);
             }
@@ -14111,7 +14708,7 @@ session_reboot:
          * which is AFTER the earlier offline `g_video_scale = gr_scale()` sync.
          * Re-sync offline so staging matches. Netplay keeps g_video_scale as
          * the settings preference (equals gr_scale() under dual-raster). */
-        if (!netplay_cpu_auth_gpu())
+        if (!g_native_render_selected && !netplay_cpu_auth_gpu())
             g_video_scale = gr_scale();
         if (g_gl_active && !gl_renderer_set_native_interpolation_fps(
                 g_native_interpolation_fps)) {
@@ -14119,9 +14716,20 @@ session_reboot:
                          "psxrecomp: Native interpolation target initialization failed\n");
             return 1;
         }
-        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
+        gl_renderer_set_interpolation(
+                                      g_native_render_selected
+                                          ? 0 : g_frame_interpolation,
+                                      g_host_refresh_hz,
                                       (double)g_frame_interpolation_fps,
                                       /*blend_mode*/ 0);
+        /* Native may have no authenticated source during early boot. Attach an
+         * initial main-thread buffer so Wayland maps the GL surface before Native
+         * takes exclusive presentation ownership. */
+        if (g_gl_active && g_native_render_selected)
+            gl_renderer_present_blank();
+        if (g_gl_active && g_native_render_selected &&
+            gl_renderer_native_guest_reference_enabled())
+            gl_renderer_set_cpu_auth_dual(1);
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
@@ -14152,10 +14760,16 @@ session_reboot:
         const XgRenderRuntimeHostServices render_host_services = {
             xg_render_host_frame_count,
             psx_read_word,
+            xg_render_host_semantic_module,
+            xg_render_host_native_text_authorizes_pc,
         };
 
         g_native_render_selected =
-            render_mode == GUEST_RENDER_RENDER_NATIVE && g_gl_active;
+            render_mode == GUEST_RENDER_RENDER_NATIVE;
+        if (g_native_render_selected && !g_gl_active) {
+            native_render_source_fail_closed();
+            return 1;
+        }
         gte_native_provenance_set_enabled(g_native_render_selected ? 1 : 0);
         ram_provenance_set_cpu_tracking(g_native_render_selected);
         update_native_temporal_coverage();
@@ -14174,8 +14788,56 @@ session_reboot:
         gpu_set_submission_hook(psx_xg_render_auth_before_gpu_submission);
         gpu_set_ordering_table_submission_hook(
             psx_xg_render_auth_prepare_ui_ot);
+        gpu_set_ordering_table_completion_hook(
+            psx_xg_render_auth_complete_ordering_table);
         gpu_set_semantic_current_hook(
             psx_xg_render_auth_note_gpu_semantic_current);
+        gpu_set_vram_event_hook([](const GpuVramEvent *event) {
+            extern uint64_t g_vblank_raise_count;
+            const bool accepted = psx_xg_render_auth_note_vram_event(
+                g_vblank_raise_count, psx_get_cycle_count(), event);
+            if (!accepted && xg_render_native_work_enabled())
+                psx_fatal_halt("Native visual transfer was not accepted");
+        });
+        BootStateNativeCheckpointHooks checkpoint_hooks{};
+        checkpoint_hooks.snapshot_ready = []() -> int {
+            /* The guest owns loader begin/end. Host presentation service cannot
+             * finish it while saving; its checkpoint writer rejects active
+             * loaders. Avoid serializing RAM/VRAM just to fail at that stage. */
+            XgRenderVramResourceSnapshot vram{};
+            xg_render_vram_resources_snapshot(&vram);
+            return !vram.loader_active;
+        };
+        checkpoint_hooks.snapshot_size = []() -> uint32_t {
+            const size_t size = psx_xg_render_auth_checkpoint_size();
+            return size <= UINT32_MAX ? static_cast<uint32_t>(size) : 0u;
+        };
+        checkpoint_hooks.snapshot_write = [](uint8_t *out, uint32_t size) {
+            return psx_xg_render_auth_checkpoint_write(out, size) ? 1 : 0;
+        };
+        checkpoint_hooks.restore_prepare = [](
+                const uint8_t *checkpoint, uint32_t size,
+                void **out_prepared) {
+            auto *restore = static_cast<PsxXgRenderCheckpointRestore *>(nullptr);
+            if (out_prepared == nullptr)
+                return 0;
+            const bool ok = psx_xg_render_auth_checkpoint_prepare(
+                checkpoint, size, &restore);
+            *out_prepared = restore;
+            return ok ? 1 : 0;
+        };
+        checkpoint_hooks.restore_commit = [](void *prepared) {
+            psx_xg_render_auth_checkpoint_commit_boot_restore(
+                static_cast<PsxXgRenderCheckpointRestore *>(prepared));
+            if (g_native_render_presentation_host)
+                xg_render_presentation_host_notify(
+                    g_native_render_presentation_host);
+        };
+        checkpoint_hooks.restore_cancel = [](void *prepared) {
+            psx_xg_render_auth_checkpoint_cancel(
+                static_cast<PsxXgRenderCheckpointRestore *>(prepared));
+        };
+        boot_state_set_native_checkpoint_hooks(&checkpoint_hooks);
         guest_render_native_stream_set_enabled(false);
         if (!xg_render_runtime_configure_host_services(&render_host_services))
             return 1;
@@ -14200,6 +14862,10 @@ session_reboot:
                          "psxrecomp: Native widescreen initialization failed\n");
             return 1;
         }
+        if (g_native_render_selected &&
+            !native_render_native_start_host(
+                1000.0 / g_native_interpolation_fps))
+            return 1;
         gpu_ws_configure_native_cull(
             g_native_render_widescreen && wide_requested,
             g_video_aspect_num, g_video_aspect_den, 320, 240);
@@ -14294,15 +14960,53 @@ session_reboot:
     log_present_cadence();
   }
 
+    /* Source boundaries precede all frontend present/skip policy. */
+    gpu_set_source_boundary_hook([] {
+        extern uint64_t g_vblank_raise_count;
+        const uint32_t previous_scene_generation =
+            psx_xenogears_scene_generation();
+        if (!xg_render_native_work_enabled())
+            (void)gl_renderer_native_capture_guest_reference(
+                g_vblank_raise_count, psx_get_cycle_count());
+        const bool source_boundary_ok = psx_xg_render_auth_source_boundary(
+            g_vblank_raise_count, psx_get_cycle_count());
+        psx_xenogears_scene_vblank_boundary(
+            psx_xg_render_auth_movie_owner_active());
+        if (psx_xenogears_scene_generation() != previous_scene_generation) {
+            psx_xg_render_auth_scene_boundary();
+            if (g_native_render_presentation_host)
+                xg_render_presentation_host_notify(
+                    g_native_render_presentation_host);
+        }
+        if (!source_boundary_ok && xg_render_native_work_enabled())
+            psx_fatal_halt("Native visual work boundary was not accepted");
+    });
+    psx_netplay_rb_set_episode_begin_callback([] {
+        (void)native_render_timeline_invalidate(
+            XG_RENDER_TIMELINE_ROLLBACK);
+    });
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
+    gpu_set_host_quantum_boundary_hook(nullptr);
+    psx_interrupts_set_vblank_host_hook([] {
+        native_render_host_quantum_pace();
+        const uint64_t irq_ns = native_render_clock_ns();
+        g_native_simulation.last_realtime_irq_ns =
+            g_native_simulation.active && g_native_simulation.realtime &&
+            !psx_netplay_active() ? irq_ns : 0u;
+        if (g_vblank_timing.start_ns) {
+            extern uint64_t g_vblank_raise_count;
+            const uint64_t index = g_vblank_timing.total++;
+            if (index < 16384)
+                g_vblank_timing.samples[index] = {irq_ns,
+                    g_vblank_raise_count + 1u, psx_get_cycle_count(),
+                    psx_xenogears_scene_generation()};
+        }
+    });
 
-    /* Wire the in-game debug overlay. The GL context is owned by
-     * gpu_gl_renderer.c (created above in g_video_renderer==1) and is not
-     * directly reachable from this site; T12 reads the renderer-owned
-     * context to do the real ImGui init, so we pass NULL for ctx here.
-     * The header guarantees the API is a no-op on a null context. */
-    psx_debug_overlay_init(sdl_window, nullptr);
+    /* Prepare host UI resources before guest deadlines start. Otherwise the
+     * first hidden overlay swap can synchronously load X11 cursor/theme files. */
+    psx_debug_overlay_init(sdl_window, SDL_GL_GetCurrentContext());
 
     /* Delay-sync LAN (recomp-net). Menu/lobby UI is later work — CLI/env only.
      * Must start after SDL so local pad capture has devices; before the guest
@@ -14741,7 +15445,7 @@ session_reboot:
         }
     }
 
-    psx_scheduler_run(&cpu);
+    native_render_run_scheduler(&cpu);
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;
 #endif
@@ -14806,7 +15510,10 @@ session_reboot:
                    g_slice_exit_in_text, g_slice_exit_want); }
 
     shutdown_runtime();
-    if (g_gl_active) gl_renderer_shutdown();
+    if (g_gl_active) {
+        gl_renderer_native_shutdown();
+        gl_renderer_shutdown();
+    }
     if (g_vk_active) vk_renderer_shutdown();
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */

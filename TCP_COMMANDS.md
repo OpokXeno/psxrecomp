@@ -94,6 +94,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `pc_hit_last` |   | ✓² | — | Captured state (PC, $ra, all GPRs, COP0) from most recent PC break hit |
 | `pc_hit_clear` |   | ✓² | — | Clear the last-hit record |
 | `quit` | ✓ |   | — | Shutdown native runtime |
+| `savestate_status` | ✓ |   | — | Read deferred save/load completion state: pending, load completed/failed, save failed, last successful save PC, and Native checkpoint prepare failure stage |
 
 ¹ Native `vram_peek` is the legacy name; DS calls it `read_vram`. Same semantics.
 ² The `pc_*` family is specific to the DS oracle: DuckStation's CPU core honours `CPU::AddBreakpointWithCallback`, while our native runtime dispatches whole recompiled functions (no mid-function PC breaks).
@@ -670,6 +671,91 @@ On **Release** builds the API is a static-inline no-op (the same
 `PSX_DEBUG_OVERLAY` gate that covers the rest of the overlay). The
 command compiles and answers `armed:true`, but no file is ever written.
 
+## Native semantic pipeline diagnostics
+
+`native_pipeline_diag` correlates the Native semantic frame from sealed source
+intent through CPU compilation, GL texture upload, default-framebuffer
+composition, `SDL_GL_SwapWindow`, and Wayland presentation feedback. Use
+`{"cmd":"native_pipeline_diag","count":8}`; `count` is clamped to 0-16 and
+selects the newest core trace entries and correlated Native presentation events.
+Revision 3 also exposes `guest_reference_events`. Set
+`PSX_NATIVE_VISUAL_TRUTH=1` before launch to maintain the canonical software
+raster mirror and capture the guest display rectangle at the source boundary.
+Each capture is joined to its source and Native endpoint by the full
+`XgPresentationIdentity`. `guest_reference_failure_events` permanently retain
+the first 16 mismatches, while `guest_reference_failure_total` remains
+monotonic, so a sustained failure cannot evict its own first divergence.
+Each failure includes dimensions, depth mode, semantic/record digests, record
+and pass counts, mismatch bounds/count, and up to eight pixel samples.
+
+Every receipt carries the same presentation epoch, source sequence, guest
+VBlank, guest cycle, and scene generation. `endpoint_mismatch_names` defines
+the bit and counter order used by `last_endpoint_mismatch_mask` and
+`endpoint_mismatches`. `failure_flag_names` similarly defines the aggregate
+`failure_flags` bits, from source validation through host presentation.
+`trace_events` is the always-on, bounded core ring. Its monotonic `sequence`,
+`flags`, source identity/digest, endpoint receipt, fence handles, mismatch mask,
+and terminal worker/presenter results expose the exact stage reached by each
+published source. `trace_flag_names` defines the flag bits. The separately
+bounded GL `events` ring joins to it by the five-part presentation identity,
+not by either ring's local sequence number.
+`trace_failure_events` returns the first retained anomalous entries, up to
+`count`, while `retained_trace_failure_count` reports all anomalies still in
+the ring. This keeps the first divergence visible even after newer successful
+frames have displaced it from `trace_events`. Stale or invalidated entries are
+anomalous when they did not already complete their swap callback.
+The transport arrays are ordered as `captures=[attempts,successes,failures]`,
+`uploads=[attempts,successes,failures]`,
+`composes=[attempts,successes,failures,retired_before_swap]`,
+`swaps=[attempts,successes,failures]`, and
+`pixel_comparisons=[completed,matches,mismatches]`. A composition retired
+before swap is separately marked on its event and sets its own failure flag.
+The command never assumes coalescing, invalidation, or shutdown made that loss
+visually harmless. `stage_count_gaps` reports every cumulative count difference
+between published intent, validated endpoints, composition, swap authorization,
+actual swap completion, and terminal compositor feedback; the newest
+asynchronous operation may account for a transient gap, while persistent gaps
+remain explicit evidence to investigate.
+
+Set `PSX_GL_PRESENT_HASH=1` before launch to enable asynchronous pixel
+verification. `endpoint_pixel_digest` hashes the CPU-rasterized RGBA8 endpoint;
+`source_hash` reads back the uploaded GL endpoint texture with the same byte
+hash. `source_pixel_comparison_valid=true` and `matches_endpoint=true` prove
+that the exact compiled pixels survived upload. The composed framebuffer hash
+is recorded separately because letterboxing, scaling, and the screen LUT make
+it a different pixel domain. A completed swap plus feedback `1` proves that
+the compositor presented that correlated surface; feedback `2` means it was
+discarded. The `baseline` object also exposes the opt-in canonical guest
+VRAM/display evidence, but its cumulative digests are separate domains and must
+only be compared with the same named baseline fields from another run.
+
+The guest-reference comparison checks the complete GP0-fed canonical software
+raster, including persistent VRAM contents, against the Native CPU endpoint built
+from the sealed semantic source commit. It can therefore expose missing source
+construction as well as Native raster differences, but it does not independently
+certify GP0-to-semantic conversion or producer authentication. In 24-bit
+display mode RGB is compared with alpha normalized to zero because PS1 RGB24
+scanout has no visual alpha channel.
+
+### Native VRAM journal
+
+`native_vram_journal` returns the newest canonical VRAM mutations. Optional
+filters are `operation`, `x`, `y`, `width`, `height`, and `count`; `count` is
+clamped to `1..8192`. Rectangle filtering selects overlapping mutations.
+
+The `state` array is ordered as
+`[mutation_generation, observed_words, authoritative_words, restorations,
+active_transfers]`. A checkpoint restore installs the saved bitmaps under one
+fresh mutation generation, increments `restorations` once, and leaves
+`active_transfers` zero. Each mutation's `payload_authority[3]` reports whether
+that mutation itself conferred authority; it is not a query of the current
+authority bitmap.
+
+MOVE authority requires a valid, exact four-word GP0 command and byte equality
+between the authenticated source snapshot and the GPU's actual destination
+payload. A malformed or mismatching MOVE still appears in the journal but has
+`payload_authority[3]=false`.
+
 <!-- The upstream instrumentation rule above supersedes this legacy DuckStation-specific rule.
 
 ---
@@ -690,9 +776,9 @@ The TCP server is the canonical instrumentation surface. Rule 3 in `CLAUDE.md` i
 
 ## Complete command index (generated)
 
-**326 commands registered** — 313 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
+**330 commands registered** — 317 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
 
-56 of 326 have prose above; **270 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
+56 of 330 have prose above; **274 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
 
 Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this block has drifted from the code.
 
@@ -864,11 +950,15 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `native_display_ring_get` | ✓ |  |  |
 | `native_last_motion_diag` | ✓ |  |  |
 | `native_midpoint_diag` | ✓ |  |  |
+| `native_renderer_state` | ✓ |  |  |
+| `native_pipeline_diag` | ✓ |  |  |
 | `native_producer_phase_diag` | ✓ |  |  |
 | `native_producer_phase_items` | ✓ |  |  |
+| `native_resident_text_state` | ✓ |  |  |
 | `native_semantic_last` | ✓ |  |  |
 | `native_stream_attribution` | ✓ |  |  |
 | `native_stream_diag` | ✓ |  |  |
+| `native_vram_resources` | ✓ |  |  |
 | `native_wave_diag` | ✓ |  |  |
 | `ot_frame_dump` | ✓ |  |  |
 | `overlay_candidates` | ✓ |  |  |
@@ -932,6 +1022,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `run_to_frame` | ✓ |  | ✓ |
 | `s3_smear_watch` | ✓ |  | ✓ |
 | `savestate` | ✓ |  |  |
+| `savestate_status` | ✓ |  |  |
 | `screenshot` | ✓ | ✓ | ✓ |
 | `screenshot_file` | ✓ | ✓ | ✓ |
 | `screenshot_hires` | ✓ |  | ✓ |

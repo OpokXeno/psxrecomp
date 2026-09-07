@@ -18,6 +18,7 @@ uint32_t mdec_dma_write_words(const uint32_t *src, uint32_t max_words);
 uint32_t mdec_dma_read_words(uint32_t *dst, uint32_t max_words);
 int mdec_dma_write_ready(void);
 int mdec_dma_read_ready(void);
+uint32_t mdec_dma_output_depth(void);
 
 /* FMV detector: nonzero if a colour (15/24-bit) MDEC decode ran within the
  * last `within_frames` vblanks. Streamed video decodes continuously; the

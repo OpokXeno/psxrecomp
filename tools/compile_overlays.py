@@ -96,6 +96,7 @@ OVERLAY_PLAN_TOOL_INPUTS = (
     'tools/native_render_overlay_codegen.py',
     'tools/native_render_overlay_ranges.py',
     'tools/native_render_runtime_variant_model.py',
+    'tools/run_with_source_observation_plan.py',
 )
 
 
@@ -2471,8 +2472,23 @@ def add_cps_resume_case(src: str, host_symbol: str,
     return src[:definition.end()] + prologue_text + src[definition.end():], True
 
 
+def merge_code_ranges(range_sets) -> tuple[tuple[int, int], ...]:
+    intervals = sorted(
+        (lo & 0x1FFFFFFF, (lo & 0x1FFFFFFF) + length)
+        for ranges in range_sets
+        for lo, length in ranges
+    )
+    merged = []
+    for lo, hi in intervals:
+        if not merged or lo > merged[-1][1]:
+            merged.append([lo, hi])
+        elif hi > merged[-1][1]:
+            merged[-1][1] = hi
+    return tuple((lo, hi - lo) for lo, hi in merged)
+
+
 def generate_overlay_dispatch(variants: list, identity: GameIdentity,
-                              images: list | None = None) -> str:
+                               images: list | None = None) -> str:
     """Generate byte-validated dispatch for all static overlay variants."""
     unique = []
     seen = set()
@@ -2480,17 +2496,21 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
         ranges = tuple((lo & 0x1FFFFFFF, length)
                        for lo, length in variant['ranges'])
         resume = int(variant.get('resume', 0)) & 0xFFFFFFFF
-        key = (variant['addr'], variant['crc'], ranges, resume)
+        digest = variant['code_sha256'].lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise ValueError('static code identity must be SHA-256')
+        key = (variant['addr'], digest, ranges, resume)
         if key in seen:
             continue
         seen.add(key)
         item = dict(variant)
         item['ranges'] = ranges
+        item['code_sha256'] = digest
         item['resume'] = resume
         unique.append(item)
 
     unique.sort(key=lambda v: (
-        v['addr'], v['crc'], v['ranges'], v['resume'], v['symbol']))
+        v['addr'], v['code_sha256'], v['ranges'], v['resume'], v['symbol']))
     range_sets = sorted({variant['ranges'] for variant in unique})
     range_symbols = {
         ranges: f'psx_ov_static_ranges_{index:05d}'
@@ -2510,7 +2530,7 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
         ranges = tuple((lo & 0x1FFFFFFF, length)
                        for lo, length in image['ranges'])
         key = (image['load_addr'] & 0x1FFFFFFF, image['size'],
-               image['crc'], ranges)
+               image['code_sha256'], ranges)
         if key in seen_images:
             continue
         seen_images.add(key)
@@ -2519,9 +2539,11 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
         item['ranges'] = ranges
         unique_images.append(item)
     unique_images.sort(key=lambda image: (
-        image['load_addr'], image['size'], image['crc'], image['ranges']))
+        image['load_addr'], image['size'], image['code_sha256'], image['ranges']))
     for index, image in enumerate(unique_images):
         image['range_symbol'] = f'psx_ov_static_image_ranges_{index:03d}'
+    known_image_union = merge_code_ranges(
+        image['ranges'] for image in unique_images)
 
     game_identity = ', '.join(f'0x{value:02X}u'
                               for value in identity.game_sha256)
@@ -2537,7 +2559,7 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
         '};',
         'extern int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,',
         '                                           uint32_t count,',
-        '                                           uint32_t expected_crc);',
+        '                                           const uint8_t expected_sha256[32]);',
         'static uint64_t psx_ov_static_checks = 0;',
         'static uint64_t psx_ov_static_hits = 0;',
         'static uint64_t psx_ov_static_variant_misses = 0;',
@@ -2557,12 +2579,32 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
         lines.append(
             f'static const uint32_t {range_symbols[ranges]}[] = '
             '{ ' + ', '.join(flat) + ' };')
+    digest_values = sorted({variant['code_sha256'] for variant in unique} |
+                           {image['code_sha256'] for image in unique_images})
+    digest_symbols = {
+        digest: f'psx_ov_static_sha256_{index:05d}'
+        for index, digest in enumerate(digest_values)
+    }
+    for digest in digest_values:
+        initializer = ', '.join(
+            f'0x{value:02x}u' for value in bytes.fromhex(digest))
+        lines.append(f'static const uint8_t {digest_symbols[digest]}[32] = '
+                     '{ ' + initializer + ' };')
     for image in unique_images:
         flat = []
         for lo, length in image['ranges']:
             flat.extend((f'0x{lo:08X}u', f'0x{length:X}u'))
         lines.append(
             f'static const uint32_t {image["range_symbol"]}[] = '
+            '{ ' + ', '.join(flat) + ' };')
+    if known_image_union:
+        flat = [
+            value
+            for lo, length in known_image_union
+            for value in (f'0x{lo:08X}u', f'0x{length:X}u')
+        ]
+        lines.append(
+            'static const uint32_t psx_ov_static_image_union[] = '
             '{ ' + ', '.join(flat) + ' };')
 
     if unique_images:
@@ -2604,6 +2646,12 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
         '    const uint32_t key = addr & 0x1FFFFFFFu;',
         '    (void)key;',
     ]
+    if known_image_union:
+        lines += [
+            '    if (!psx_ov_static_ranges_contain('
+            f'            psx_ov_static_image_union, {len(known_image_union)}u, '
+            'key)) return 0;',
+        ]
     for image in unique_images:
         count = len(image['ranges'])
         lines += [
@@ -2612,7 +2660,7 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
             '        psx_ov_static_image_checks++;',
             f'        if (psx_overlay_static_code_matches('
             f'{image["range_symbol"]}, {count}u, '
-            f'0x{image["crc"]:08X}u)) {{',
+            f'{digest_symbols[image["code_sha256"]]})) {{',
             '            psx_ov_static_image_hits++;',
             '            return 1;',
             '        }',
@@ -2637,7 +2685,7 @@ def generate_overlay_dispatch(variants: list, identity: GameIdentity,
                 '            psx_ov_static_checks++;',
                 f'            if (psx_overlay_static_code_matches('
                 f'{variant["range_symbol"]}, {count}u, '
-                f'0x{variant["crc"]:08X}u)) {{',
+                f'{digest_symbols[variant["code_sha256"]]})) {{',
                 '                psx_ov_static_hits++;',
             ]
             if variant['resume']:
@@ -2732,6 +2780,18 @@ def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
     return out
 
 
+def code_ranges_sha256(data: bytes, load_addr: int,
+                       ranges: list[tuple[int, int]]) -> str:
+    base = load_addr & 0x1FFFFFFF
+    digest = hashlib.sha256()
+    for lo, length in ranges:
+        offset = (lo & 0x1FFFFFFF) - base
+        if offset < 0 or length <= 0 or offset + length > len(data):
+            raise ValueError('static code range escapes captured image')
+        digest.update(data[offset:offset + length])
+    return digest.hexdigest()
+
+
 def static_image_identity(func_ids: list, data: bytes, load_addr: int,
                           size: int, image_id: str | None = None) -> dict:
     """Build one immutable identity for an image's linked code ranges."""
@@ -2754,10 +2814,12 @@ def static_image_identity(func_ids: list, data: bytes, load_addr: int,
             f'{image_id or "static image"}: invalid code identity range count '
             f'{len(merged)}')
     crc = 0
+    digest = hashlib.sha256()
     ranges = []
     for lo, hi in merged:
         length = hi - lo
         crc = binascii.crc32(data[lo - base:hi - base], crc)
+        digest.update(data[lo - base:hi - base])
         ranges.append((lo, length))
     chunks = []
     cursor = base
@@ -2776,12 +2838,13 @@ def static_image_identity(func_ids: list, data: bytes, load_addr: int,
         'load_addr': base,
         'size': size,
         'crc': crc & 0xFFFFFFFF,
+        'code_sha256': digest.hexdigest(),
         'ranges': ranges,
         'chunks': chunks,
     }
 
 
-STATIC_COVERAGE_SCHEMA = 'psxrecomp static overlay coverage v2'
+STATIC_COVERAGE_SCHEMA = 'psxrecomp static overlay coverage v3'
 
 
 def static_coverage_document(images: list, identity: GameIdentity) -> dict:
@@ -2792,7 +2855,7 @@ def static_coverage_document(images: list, identity: GameIdentity) -> dict:
         ranges = tuple((int(lo) & 0x1FFFFFFF, int(length))
                        for lo, length in image['ranges'])
         key = (int(image['load_addr']) & 0x1FFFFFFF, int(image['size']),
-               int(image['crc']) & 0xFFFFFFFF, ranges)
+               str(image['code_sha256']).lower(), ranges)
         if key in seen:
             continue
         seen.add(key)
@@ -2800,7 +2863,7 @@ def static_coverage_document(images: list, identity: GameIdentity) -> dict:
             'image_id': image.get('image_id'),
             'load_addr': f'0x{key[0] | 0x80000000:08X}',
             'size': key[1],
-            'code_crc32': f'0x{key[2]:08X}',
+            'code_sha256': key[2],
             'ranges': [[f'0x{lo | 0x80000000:08X}', length]
                        for lo, length in ranges],
             'chunks': [
@@ -2809,7 +2872,7 @@ def static_coverage_document(images: list, identity: GameIdentity) -> dict:
             ],
         })
     records.sort(key=lambda image: (
-        int(image['load_addr'], 16), image['size'], image['code_crc32'],
+        int(image['load_addr'], 16), image['size'], image['code_sha256'],
         image['ranges']))
     return {
         'schema': STATIC_COVERAGE_SCHEMA,
@@ -2836,11 +2899,13 @@ def load_static_coverage(path: str, identity: GameIdentity) -> list:
             raise ValueError('invalid static coverage image')
         load_addr = int(record['load_addr'], 0) & 0x1FFFFFFF
         size = int(record['size'])
-        crc = int(record['code_crc32'], 0)
+        code_sha256 = record.get('code_sha256')
         raw_ranges = record.get('ranges')
         raw_chunks = record.get('chunks')
         if (size <= 0 or load_addr >= PSX_RAM_SIZE or
                 size > PSX_RAM_SIZE - load_addr or
+                not isinstance(code_sha256, str) or
+                not re.fullmatch(r'[0-9a-f]{64}', code_sha256) or
                 not isinstance(raw_ranges, list) or
                 not 1 <= len(raw_ranges) <= 4096 or
                 not isinstance(raw_chunks, list) or
@@ -2879,7 +2944,7 @@ def load_static_coverage(path: str, identity: GameIdentity) -> list:
             'image_id': record.get('image_id'),
             'load_addr': load_addr,
             'size': size,
-            'crc': crc & 0xFFFFFFFF,
+            'code_sha256': code_sha256,
             'ranges': ranges,
             'chunks': chunks,
         })
@@ -3032,7 +3097,7 @@ def audit_func_id_delay_slots(func_ids: list, data: bytes,
 def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
                          provenance: str | None = None,
                          identity: GameIdentity | None = None,
-                         artifact: tuple[int, int, int] | None = None,
+                          artifact: tuple[int, int, str] | None = None,
                          runtime_variant_identity: str | None = None) -> str:
     """Serialize one loader manifest.
 
@@ -3050,13 +3115,15 @@ def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
         out_lines.append(f'I {identity.game_sha256.hex().upper()} '
                          f'{identity.manifest_sha256.hex().upper()}\n')
     if artifact is not None:
-        artifact_base, artifact_size, artifact_crc32 = artifact
+        artifact_base, artifact_size, artifact_sha256 = artifact
         artifact_phys = artifact_base & 0x1FFFFFFF
         if (artifact_size <= 0 or artifact_phys >= PSX_RAM_SIZE or
                 artifact_size > PSX_RAM_SIZE - artifact_phys):
             raise ValueError('invalid overlay artifact tuple')
+        if not re.fullmatch(r'[0-9a-fA-F]{64}', artifact_sha256):
+            raise ValueError('overlay artifact identity must be a SHA-256 digest')
         out_lines.append(f'A {(artifact_phys | 0x80000000):08X} '
-                         f'{artifact_size:X} {artifact_crc32 & 0xFFFFFFFF:08X}\n')
+                         f'{artifact_size:X} {artifact_sha256.upper()}\n')
     if runtime_variant_identity is not None:
         if (len(runtime_variant_identity) != 64 or any(
                 character not in '0123456789abcdefABCDEF'
@@ -3076,7 +3143,7 @@ def overlay_ranges_text(func_ids: list, pair_id: int | None = None,
 def overlay_pair_id(src: str, func_ids: list,
                     provenance: str | None = None,
                     identity: GameIdentity | None = None,
-                    artifact: tuple[int, int, int] | None = None,
+                     artifact: tuple[int, int, str] | None = None,
                     runtime_variant_identity: str | None = None) -> int:
     """Bind a newly compiled DLL to the exact C and range manifest it uses."""
     digest = hashlib.sha256()
@@ -3125,7 +3192,7 @@ def write_overlay_ranges_from(func_ids: list, out_path: str,
                               pair_id: int | None = None,
                                provenance: str | None = None,
                                identity: GameIdentity | None = None,
-                               artifact: tuple[int, int, int] | None = None,
+                                artifact: tuple[int, int, str] | None = None,
                                runtime_variant_identity: str | None = None) -> int:
     """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
     parse_overlay_func_ids. Returns the number of functions written.
@@ -3204,7 +3271,7 @@ def load_region_entry_set(cache_dir: str, phys_addr: int,
 def parse_runtime_shard_manifest(manifest: str,
                                   require_pair: bool = True,
                                   include_artifact: bool = False
-                                  ) -> tuple[int | None, list] | tuple[int | None, list, tuple[int, int, int] | None]:
+                                  ) -> tuple[int | None, list] | tuple[int | None, list, tuple[int, int, str] | None]:
     """Parse only identities representable by the runtime manifest contract."""
     def hex_field(token: str, max_digits: int) -> int:
         if not re.fullmatch(rf'[0-9A-Fa-f]{{1,{max_digits}}}', token):
@@ -3247,7 +3314,9 @@ def parse_runtime_shard_manifest(manifest: str,
             try:
                 base = hex_field(parts[1], 8)
                 size = hex_field(parts[2], 8)
-                crc32 = hex_field(parts[3], 8)
+                if not re.fullmatch(r'[0-9A-F]{64}', parts[3]):
+                    raise ValueError('invalid artifact SHA-256')
+                sha256 = parts[3].lower()
             except ValueError:
                 return invalid_result
             physical_base = base & 0x1FFFFFFF
@@ -3255,7 +3324,7 @@ def parse_runtime_shard_manifest(manifest: str,
                     physical_base >= PSX_RAM_SIZE or \
                     size > PSX_RAM_SIZE - physical_base:
                 return invalid_result
-            artifacts.append((base, size, crc32))
+            artifacts.append((base, size, sha256))
         elif parts[0] == 'I':
             if len(parts) != 3:
                 return invalid_result
@@ -3623,6 +3692,8 @@ def generate_interior_fragment_static(interior: int, data: bytes,
                     'addr': ev,
                     'symbol': symbols[ev],
                     'crc': code_crc,
+                    'code_sha256': code_ranges_sha256(
+                        data, load_addr, ranges),
                     'ranges': ranges,
                 })
         return {
@@ -4533,7 +4604,7 @@ def compile_fragment_batch(requested_entries, data: bytes, load_addr: int,
                               'provenance')
             manifest_provenance = HOSTED_MANIFEST_PROVENANCE
         src = add_overlay_identity_export(src, args.identity)
-        artifact = (load_addr, size, binascii.crc32(data) & 0xFFFFFFFF)
+        artifact = (load_addr, size, hashlib.sha256(data).hexdigest())
         pair_id = overlay_pair_id(
             src, frag_ids, manifest_provenance, args.identity, artifact,
             runtime_identity)
@@ -4842,7 +4913,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                  candidate_cap: int | None = None,
                   manifest_provenance: str | None = None,
                   identity: GameIdentity | None = None,
-                  artifact: tuple[int, int, int] | None = None,
+                   artifact: tuple[int, int, str] | None = None,
                   runtime_variant_identity: str | None = None) -> bool:
     """Publish a shard only after all of its artifacts are complete.
 
@@ -5157,7 +5228,7 @@ def _runtime_manifest_range_link_count(funcs: list) -> int:
 
 def _normalized_runtime_manifest_identity(manifest: str, pair_id: int | None,
                                            funcs: list,
-                                           artifact: tuple[int, int, int] | None = None):
+                                            artifact: tuple[int, int, str] | None = None):
     """Return a conservative whole-pair identity, or ``None`` if ambiguous.
 
     Runtime address aliases are normalized, but F and R ordering is retained:
@@ -5476,7 +5547,7 @@ def preflight_shard_candidate_capacity(
         final_dll: str, func_ids: list, pair_id: int,
         manifest_provenance: str | None, expected_abi: int | None,
         candidate_cap: int,
-        artifact: tuple[int, int, int] | None = None,
+        artifact: tuple[int, int, str] | None = None,
         runtime_variant_identity: str | None = None) -> str | None:
     """Reject an impossible publication before invoking the native linker.
 
@@ -6433,6 +6504,8 @@ def main():
                             'addr': ev,
                             'symbol': symbols[ev],
                             'crc': code_crc,
+                            'code_sha256': code_ranges_sha256(
+                                data, load_addr, ranges),
                             'ranges': ranges,
                         })
                 static_parts.append({
@@ -6546,7 +6619,7 @@ def main():
                         _label, 'manifest_ranges', representability_error)
                     return
                 src = add_overlay_identity_export(src, args.identity)
-                artifact = (load_addr, size, binascii.crc32(data) & 0xFFFFFFFF)
+                artifact = (load_addr, size, hashlib.sha256(data).hexdigest())
                 pair_id = overlay_pair_id(
                     src, this_ids, identity=args.identity, artifact=artifact,
                     runtime_variant_identity=runtime_identity)
@@ -7423,10 +7496,16 @@ def main():
                         f'    {host_symbol}(cpu);\n'
                         f'}}\n')
                     for code_crc, ranges in part['ids_by_addr'][host]:
+                        owner = next(
+                            variant for variant in part['variants']
+                            if variant['addr'] == host and
+                            variant['crc'] == code_crc and
+                            variant['ranges'] == ranges)
                         part['variants'].append({
                             'addr': entry,
                             'symbol': symbol,
                             'crc': code_crc,
+                            'code_sha256': owner['code_sha256'],
                             'ranges': ranges,
                         })
                     done.add(entry)

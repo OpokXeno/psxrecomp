@@ -89,6 +89,8 @@ typedef struct {
     uint32_t remaining_words;
     uint32_t cycles_accum;
     uint32_t start_addr;   /* madr at transfer start (CD overlay capture) */
+    uint64_t provenance_receipt;
+    uint32_t provenance_format;
 } DMAAsyncChannel;
 
 static DMAAsyncChannel mdec_async[2];
@@ -461,6 +463,8 @@ static void cancel_async_transfer(int ch) {
         mdec_async[ch].total_words = 0;
         mdec_async[ch].remaining_words = 0;
         mdec_async[ch].cycles_accum = 0;
+        mdec_async[ch].provenance_receipt = 0u;
+        mdec_async[ch].provenance_format = 0u;
     }
     if (ch == 3) {
         finish_cdrom_dma_capture(
@@ -538,6 +542,10 @@ static void start_async_mdec_transfer(int ch) {
     a->total_words = transfer_word_count(ch);
     a->remaining_words = a->total_words;
     a->cycles_accum = 0;
+    a->start_addr = channels[ch].madr & memory_get_ram_word_mask();
+    a->provenance_receipt = ch == 1
+        ? ram_provenance_publish_event() : 0u;
+    a->provenance_format = ch == 1 ? mdec_dma_output_depth() : 0u;
 
     if (ch == 0) {
         mdec_debug_dma_in_start(
@@ -625,6 +633,23 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
     int32_t addr_step = step ? -4 : 4;
     uint32_t cycles_per_word = (ch == 0) ? DMA_MDEC_IN_CYCLES_PER_WORD : DMA_MDEC_OUT_CYCLES_PER_WORD;
 
+    if (ch == 1 && a->provenance_receipt == 0u) {
+        const uint32_t moved_words = a->total_words - a->remaining_words;
+        uint32_t moved_addr = a->start_addr;
+
+        a->provenance_receipt = ram_provenance_publish_event();
+        a->provenance_format = mdec_dma_output_depth();
+        for (uint32_t index = 0u; index < moved_words; ++index) {
+            ram_provenance_note_source_word(
+                moved_addr, &(RamProvenanceSource){
+                    .kind = RAM_PROVENANCE_SOURCE_MDEC_DMA1,
+                    .format = a->provenance_format,
+                    .receipt = a->provenance_receipt,
+                });
+            moved_addr = (moved_addr + addr_step) & memory_get_ram_word_mask();
+        }
+    }
+
     if ((ch == 0 && direction == 0) || (ch == 1 && direction != 0)) {
         uint32_t words = a->total_words;
         uint32_t addr = channels[ch].madr & memory_get_ram_word_mask();
@@ -688,6 +713,12 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
                 if (!mdec_dma_read_ready()) break;
                 g_dma_cur_madr = addr;
                 psx_write_word(addr, mdec_dma_read_word());
+                ram_provenance_note_source_word(
+                    addr, &(RamProvenanceSource){
+                        .kind = RAM_PROVENANCE_SOURCE_MDEC_DMA1,
+                        .format = a->provenance_format,
+                        .receipt = a->provenance_receipt,
+                    });
             }
 
             addr = (addr + addr_step) & memory_get_ram_word_mask();
@@ -1777,6 +1808,7 @@ static uint32_t execute_ch2_gpu(void) {
         gpu_ws_prepass_linked_list(start_addr);
         actual_words = dma2_execute_linked_list();
         gpu_ws_end_linked_list();
+        gpu_complete_ordering_table_submission(start_addr, actual_words);
     } else {
         /* Burst mode (sync_mode == 0) */
         uint32_t word_count = channels[2].bcr & 0xFFFF;
@@ -2399,9 +2431,14 @@ static int dma_w_async(PstW *w, const DMAAsyncChannel *a) {
            pst_w_u32(w, a->cycles_accum) && pst_w_u32(w, a->start_addr);
 }
 static int dma_r_async(PstR *r, DMAAsyncChannel *a) {
-    return pst_r_u8(r, &a->active) && pst_r_u8(r, &a->debug_started) &&
+    int valid;
+
+    a->provenance_receipt = 0u;
+    a->provenance_format = 0u;
+    valid = pst_r_u8(r, &a->active) && pst_r_u8(r, &a->debug_started) &&
            pst_r_u32(r, &a->total_words) && pst_r_u32(r, &a->remaining_words) &&
            pst_r_u32(r, &a->cycles_accum) && pst_r_u32(r, &a->start_addr);
+    return valid && a->remaining_words <= a->total_words;
 }
 static int dma_w_delay(PstW *w, const DMADelayedComplete *d) {
     return pst_w_u8(w, d->active) && pst_w_u32(w, d->total_words) &&

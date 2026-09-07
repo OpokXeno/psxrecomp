@@ -41,6 +41,7 @@
 
 extern uint32_t g_debug_last_store_pc;
 extern uint32_t g_debug_current_func_addr;
+uint32_t debug_guest_ra(void);
 extern uint16_t psx_read_half(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint32_t psx_read_word(uint32_t addr);
@@ -94,6 +95,17 @@ static GpuRenderOracleTransfer oracle_transfer(GpuRenderOracleTransferDirection 
 static void gpu_render_transaction_checkpoint_reset(void);
 static void gpu_write_gp0_body(uint32_t val);
 static uint16_t gp0_ot_rank = 0xFFFFu;
+static void (*gpu_source_boundary_hook)(void);
+static void (*gpu_host_quantum_boundary_hook)(void);
+static int gpu_present_fail_closed;
+static bool (*gpu_native_work_draw_hook)(const GpuRenderSemantic *semantic);
+static bool (*gpu_native_work_environment_hook)(uint64_t command_id);
+static bool gpu_native_work_decode(
+    const uint32_t *words, size_t word_count,
+    const GpuNativeDrawEnvironment *environment,
+    const GpuRenderOracleSource *source, GpuRenderSemantic *out);
+static void gpu_note_draw_executed(const GpuRenderSemantic *canonical,
+                                   const GpuRenderSemantic *native);
 
 /* ---- Widescreen proportion correction --------------------------------------
  * Active only when [video] aspect_ratio != 4:3 AND the game's [widescreen]
@@ -2430,6 +2442,104 @@ static uint32_t vram_write_remaining;          /* words remaining */
  * CPU-visible transfer remains ordered because GP0 accepts no next command
  * until this payload is complete. Maximum PS1 transfer = full VRAM (1 MiB). */
 static uint16_t vram_write_pixels[1024 * 512];
+static uint64_t vram_write_source_receipt;
+static uint32_t vram_write_source_format;
+static uint32_t vram_write_source_words;
+static int vram_write_source_valid;
+static int mdec_scanout_candidate;
+static uint32_t movie_frame_number;
+static uint16_t movie_frame_width;
+static uint16_t movie_frame_height;
+static uint16_t movie_frame_target_y;
+static int movie_frame_complete;
+static GpuMovieOwnerKind movie_pending_owner_kind;
+static uint64_t movie_pending_owner_receipt;
+static GpuMovieOwnerKind movie_active_owner_kind;
+static uint32_t movie_active_owner_callback_target;
+static uint64_t movie_active_owner_receipt;
+static uint64_t movie_owner_receipt_counter;
+static GpuVramRectTransferHook gpu_vram_upload_commit_hook;
+static GpuVramRectTransferHook gpu_vram_move_complete_hook;
+static GpuVramRectTransferHook gpu_vram_clear_complete_hook;
+static GpuVramEventHook gpu_vram_event_hook;
+static GpuVramEvent gpu_pending_vram_event;
+static int gpu_pending_vram_event_valid;
+
+static void movie_pending_frame_reset(void) {
+    movie_frame_number = 0u;
+    movie_frame_width = 0u;
+    movie_frame_height = 0u;
+    movie_frame_target_y = 0u;
+    movie_frame_complete = 0;
+    movie_pending_owner_kind = GPU_MOVIE_OWNER_NONE;
+    movie_pending_owner_receipt = 0u;
+}
+
+static void vram_write_source_reset(void) {
+    vram_write_source_receipt = 0u;
+    vram_write_source_format = 0u;
+    vram_write_source_words = 0u;
+    vram_write_source_valid = 1;
+}
+
+static void vram_write_source_note(const GpuRenderOracleSource *source) {
+    RamProvenanceSource provenance;
+    const bool ram_source = source != NULL &&
+        (source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK ||
+         source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_BURST ||
+         source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST);
+
+    if (vram_write_source_words != UINT32_MAX) vram_write_source_words++;
+    if (!vram_write_source_valid || !ram_source ||
+        !ram_provenance_source_word(source->word_address, &provenance) ||
+        provenance.kind != RAM_PROVENANCE_SOURCE_MDEC_DMA1) {
+        vram_write_source_valid = 0;
+        return;
+    }
+    if (vram_write_source_receipt == 0u) {
+        vram_write_source_receipt = provenance.receipt;
+        vram_write_source_format = provenance.format;
+    } else if (vram_write_source_receipt != provenance.receipt ||
+               vram_write_source_format != provenance.format) {
+        vram_write_source_valid = 0;
+    }
+}
+
+static bool vram_write_has_mdec_source(void) {
+    const uint64_t pixel_count = (uint64_t)vram_write_w * vram_write_h;
+    const uint64_t expected_words = (pixel_count + 1u) / 2u;
+
+    return vram_write_source_valid && vram_write_source_receipt != 0u &&
+        expected_words <= UINT32_MAX &&
+        vram_write_source_words == (uint32_t)expected_words;
+}
+
+static void gpu_emit_vram_event(GpuVramEvent event) {
+    if (gpu_vram_event_hook == NULL) return;
+    event.mutation_serial = gpu_render_vram_mutation_serial();
+    if (!event.command_context_valid && gp0_cmd_source_addr != UINT32_MAX) {
+        event.command_source_address = gp0_cmd_source_addr;
+        event.command_pc = g_debug_last_store_pc;
+        event.command_function = g_debug_current_func_addr;
+        event.command_return_address = debug_guest_ra();
+        event.command_source_kind = (uint32_t)gp0_cmd_source.kind;
+        event.command_opcode = (uint8_t)(gp0_cmd_buf[0] >> 24u);
+        event.command_context_valid = true;
+    }
+    gpu_vram_event_hook(&event);
+}
+
+void gpu_note_vram_restore(void) {
+    gpu_emit_vram_event((GpuVramEvent){
+        .operation = GPU_VRAM_EVENT_RESTORE,
+        .destination_x = 0u,
+        .destination_y = 0u,
+        .width = 1024u,
+        .height = 512u,
+        .pixels = gpu_get_vram(),
+        .pixel_count = 1024u * 512u,
+    });
+}
 
 /* Depth24 CPU→VRAM upload span (halfwords, exclusive end). See
  * gpu_depth24_rgb_limit — declared early so gpu_reset_state can clear it. */
@@ -2439,6 +2549,8 @@ static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
 static void depth24_note_upload(uint32_t x, uint32_t w);
 
 static void gp0_commit_cpu_to_vram(void) {
+    const bool has_mdec_source = vram_write_has_mdec_source();
+
     for (uint32_t row = 0; row < vram_write_h; row++)
         for (uint32_t col = 0; col < vram_write_w; col++)
             vram_write_pixels[row * vram_write_w + col] =
@@ -2446,6 +2558,10 @@ static void gp0_commit_cpu_to_vram(void) {
                      ((vram_write_x + col) & 1023u)];
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
+    if (gpu_vram_upload_commit_hook != NULL)
+        gpu_vram_upload_commit_hook(
+            vram_write_x, vram_write_y, vram_write_w, vram_write_h,
+            vram_write_pixels, (size_t)vram_write_w * vram_write_h);
     depth24_note_upload(vram_write_x, vram_write_w);
     {
         GpuRenderOracleDrawState draw = oracle_draw_state();
@@ -2455,8 +2571,28 @@ static void gp0_commit_cpu_to_vram(void) {
                                              GPU_RENDER_ORACLE_MUTATION_UPLOAD,
                                              &draw, &transfer);
     }
+    gpu_emit_vram_event((GpuVramEvent){
+        .operation = GPU_VRAM_EVENT_UPLOAD,
+        .destination_x = vram_write_x,
+        .destination_y = vram_write_y,
+        .width = vram_write_w,
+        .height = vram_write_h,
+        .mask_set = false,
+        .mask_check = false,
+        .pixels = vram_write_pixels,
+        .pixel_count = (size_t)vram_write_w * vram_write_h,
+        .payload_source = has_mdec_source
+            ? GPU_VRAM_PAYLOAD_SOURCE_MDEC_DMA1
+            : GPU_VRAM_PAYLOAD_SOURCE_NONE,
+        .payload_format = has_mdec_source
+            ? vram_write_source_format : 0u,
+        .payload_source_receipt = has_mdec_source
+            ? vram_write_source_receipt : 0u,
+    });
+    if (has_mdec_source) mdec_scanout_candidate = 1;
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
+    vram_write_source_reset();
     text_xlate_vram_upload(vram_write_x, vram_write_y,
                            vram_write_w, vram_write_h);
 }
@@ -2466,6 +2602,9 @@ static int      vram_read_active;
 static uint16_t vram_read_x, vram_read_y;
 static uint16_t vram_read_w, vram_read_h;
 static uint16_t vram_read_col, vram_read_row;
+static size_t vram_read_pixel_count;
+static uint64_t vram_read_content_digest;
+static GpuVramReadbackCompleteHook gpu_vram_readback_complete_hook;
 
 /* ---- GPU internal state ---- */
 
@@ -2780,6 +2919,7 @@ static void gpu_reset_state(int clear_vram) {
     };
     gp0_material_capture_active = 0;
     gp0_material_capture_observed = 0;
+    gpu_pending_vram_event_valid = 0;
     memset(&gp0_captured_material, 0, sizeof(gp0_captured_material));
     memset(&native_stream_command, 0, sizeof(native_stream_command));
     gpu_native_packet_stream_reset();
@@ -2795,10 +2935,15 @@ static void gpu_reset_state(int clear_vram) {
     vram_write_w = vram_write_h = 0;
     vram_write_col = vram_write_row = 0;
     vram_write_remaining = 0;
+    vram_write_source_reset();
+    mdec_scanout_candidate = 0;
+    movie_pending_frame_reset();
     vram_read_active = 0;
     vram_read_x = vram_read_y = 0;
     vram_read_w = vram_read_h = 0;
     vram_read_col = vram_read_row = 0;
+    vram_read_pixel_count = 0u;
+    vram_read_content_digest = UINT64_C(1469598103934665603);
 
     /* Reset all state to power-on defaults */
     texpage_x = 0;
@@ -2853,15 +2998,24 @@ static void gpu_reset_state(int clear_vram) {
     s_d24_upload_x1 = 0;
     s_d24_present_hold = 0;
     s_d24_prev_disp_h = 0;
+    /* GP1(00h) resets registers, not VRAM. Preserve accepted native deltas;
+     * only a memory-clearing initialization needs a replacement image. */
+    if (clear_vram && gpu_vram_event_hook != NULL) gpu_note_vram_restore();
 }
 
 void gpu_init(void) {
+    gpu_present_fail_closed = 0;
     gpu_render_transaction_checkpoint_reset();
-    gpu_reset_state(1);
+    /* Reset may publish a rebase through hooks installed before gpu_init. */
     if (!gpu_render_oracle_initialized) {
         gpu_render_oracle_device_init(&gpu_render_oracle);
         gpu_render_oracle_initialized = 1;
     }
+    movie_active_owner_kind = GPU_MOVIE_OWNER_NONE;
+    movie_active_owner_callback_target = 0u;
+    movie_active_owner_receipt = 0u;
+    movie_owner_receipt_counter = 0u;
+    gpu_reset_state(1);
 }
 
 GpuRenderOracleResult gpu_render_oracle_capture_begin(void) {
@@ -2886,6 +3040,51 @@ GpuRenderOracleResult gpu_render_oracle_capture_read_event(uint64_t index,
 
 uint64_t gpu_render_vram_mutation_serial(void) {
     return gpu_render_oracle.global_vram_serial;
+}
+
+size_t gpu_pending_vram_upload_capture(
+        GpuPendingVramUpload *out_upload,
+        uint16_t *out_pixels,
+        size_t pixel_capacity) {
+    size_t pixel_count;
+
+    if (out_upload == NULL) return 0u;
+    memset(out_upload, 0, sizeof(*out_upload));
+    if (gp0_state != GP0_VRAM_WRITE) return 0u;
+    pixel_count = (size_t)vram_write_row * vram_write_w + vram_write_col;
+    *out_upload = (GpuPendingVramUpload){
+        .x = vram_write_x,
+        .y = vram_write_y,
+        .width = vram_write_w,
+        .height = vram_write_h,
+        .pixel_count = pixel_count,
+    };
+    if (pixel_count == 0u || out_pixels == NULL || pixel_capacity < pixel_count)
+        return pixel_count;
+    for (size_t index = 0u; index < pixel_count; ++index) {
+        const uint32_t x = (vram_write_x + index % vram_write_w) & 1023u;
+        const uint32_t y = (vram_write_y + index / vram_write_w) & 511u;
+        out_pixels[index] = vram[y * 1024u + x];
+    }
+    return pixel_count;
+}
+
+bool gpu_pending_vram_upload_apply(
+        const GpuPendingVramUpload *upload,
+        const uint16_t *pixels,
+        uint16_t *target_vram,
+        size_t target_pixel_count) {
+    if (upload == NULL || pixels == NULL || target_vram == NULL ||
+        upload->width == 0u || upload->height == 0u ||
+        upload->pixel_count > (size_t)upload->width * upload->height ||
+        target_pixel_count < 1024u * 512u)
+        return false;
+    for (size_t index = 0u; index < upload->pixel_count; ++index) {
+        const uint32_t x = (upload->x + index % upload->width) & 1023u;
+        const uint32_t y = (upload->y + index / upload->width) & 511u;
+        target_vram[y * 1024u + x] = pixels[index];
+    }
+    return true;
 }
 
 bool gpu_render_vram_mutation_overflowed(void) {
@@ -3008,7 +3207,17 @@ uint32_t gpu_read_gpuread(void) {
     for (int i = 0; i < 2; i++) {
         uint16_t rx = (vram_read_x + vram_read_col) % 1024;
         uint16_t ry = (vram_read_y + vram_read_row) % 512;
-        value |= (uint32_t)gr_vram_read((int)rx, (int)ry) << (i * 16);
+        const uint16_t pixel = gr_vram_read((int)rx, (int)ry);
+        const uint8_t pixel_bytes[] = {
+            (uint8_t)pixel, (uint8_t)(pixel >> 8u)
+        };
+
+        value |= (uint32_t)pixel << (i * 16);
+        for (size_t byte = 0u; byte < sizeof(pixel); ++byte) {
+            vram_read_content_digest ^= pixel_bytes[byte];
+            vram_read_content_digest *= UINT64_C(1099511628211);
+        }
+        vram_read_pixel_count++;
 
         if (++vram_read_col == vram_read_w) {
             vram_read_col = 0;
@@ -3031,12 +3240,25 @@ uint32_t gpu_read_gpuread(void) {
 
     gpu_render_oracle_hook_gpuread_word(&gpu_render_oracle);
     if (!vram_read_active) {
+        if (gpu_vram_readback_complete_hook != NULL)
+            gpu_vram_readback_complete_hook(
+                vram_read_x, vram_read_y, vram_read_w, vram_read_h,
+                vram_read_pixel_count, vram_read_content_digest);
         GpuRenderOracleDrawState draw = oracle_draw_state();
         GpuRenderOracleTransfer transfer =
             oracle_transfer(GPU_RENDER_ORACLE_TRANSFER_VRAM_TO_CPU);
         gpu_render_oracle_hook_gp0_complete(&gpu_render_oracle,
                                              GPU_RENDER_ORACLE_MUTATION_NONE,
                                              &draw, &transfer);
+        gpu_emit_vram_event((GpuVramEvent){
+            .operation = GPU_VRAM_EVENT_READBACK,
+            .source_x = vram_read_x,
+            .source_y = vram_read_y,
+            .width = vram_read_w,
+            .height = vram_read_h,
+            .pixel_count = vram_read_pixel_count,
+            .content_digest = vram_read_content_digest,
+        });
     }
     gpuread_latch = value;
     return value;
@@ -3066,6 +3288,12 @@ void gpu_vblank_clear_deferred_present(void) {
     /* longjmp from flush_resume abandons the flush_present stack frame —
      * must drop the reentrancy guard or every later flush no-ops forever. */
     s_flushing_present = 0;
+}
+
+/* Close source publication, not the VBlank frontend: it also services input,
+ * netplay and host pacing. The frontend owns stopping its visual presenter. */
+void gpu_vblank_fail_closed_present(void) {
+    gpu_present_fail_closed = 1;
 }
 
 void gpu_vblank_arm_deferred_present(void) {
@@ -3137,6 +3365,8 @@ void gpu_vblank_flush_present(void) {
         s_present_pending--;
         if (vblank_callback)
             vblank_callback();
+        if (gpu_host_quantum_boundary_hook)
+            gpu_host_quantum_boundary_hook();
     }
     s_flushing_present = 0;
 }
@@ -3184,6 +3414,61 @@ void gpu_vblank_tick(void) {
     }
     split_trace_reset(&split_trace_this);
     gpustat_poll_count = 0;
+    if (gpu_vram_event_hook != NULL && !display_disabled) {
+        GpuDisplayInfo display;
+        gpu_get_display_info(&display);
+        if (display.width != 0u && display.height != 0u) {
+            uint32_t source_width = display.depth24
+                ? (display.width * 3u + 1u) / 2u : display.width;
+            const size_t source_pixels = (size_t)source_width * display.height;
+            const bool movie_scanout_ready = movie_frame_complete &&
+                movie_active_owner_kind != GPU_MOVIE_OWNER_NONE &&
+                display.display_y == movie_frame_target_y;
+            const bool capture_framebuffer = mdec_scanout_candidate &&
+                movie_scanout_ready &&
+                source_width <= 1024u && display.height <= 512u &&
+                source_pixels <= sizeof(vram_write_pixels) /
+                    sizeof(vram_write_pixels[0]);
+
+            if (capture_framebuffer)
+                gr_vram_transfer_out(
+                    (int)display.display_x, (int)display.display_y,
+                    (int)source_width, (int)display.height,
+                    vram_write_pixels);
+            gpu_emit_vram_event((GpuVramEvent){
+                .operation = GPU_VRAM_EVENT_SCANOUT,
+                .source_x = (uint16_t)display.display_x,
+                .source_y = (uint16_t)display.display_y,
+                .width = (uint16_t)(capture_framebuffer
+                    ? source_width : display.width),
+                .height = (uint16_t)display.height,
+                .pixels = capture_framebuffer ? vram_write_pixels : NULL,
+                .pixel_count = capture_framebuffer
+                    ? source_pixels : (size_t)display.width * display.height,
+                .payload_format = capture_framebuffer
+                    ? (display.depth24 ? 2u : 3u) : 0u,
+                .movie_frame_number = capture_framebuffer &&
+                    movie_frame_complete ? movie_frame_number : 0u,
+                .movie_frame_width = capture_framebuffer &&
+                    movie_frame_complete ? movie_frame_width : 0u,
+                .movie_frame_height = capture_framebuffer &&
+                    movie_frame_complete ? movie_frame_height : 0u,
+                .movie_frame_complete = capture_framebuffer &&
+                    movie_frame_complete,
+                .movie_owner_kind = capture_framebuffer &&
+                    movie_frame_complete ? movie_pending_owner_kind :
+                    GPU_MOVIE_OWNER_NONE,
+                .movie_owner_receipt = capture_framebuffer &&
+                    movie_frame_complete ? movie_pending_owner_receipt : 0u,
+            });
+            if (capture_framebuffer) {
+                mdec_scanout_candidate = 0;
+                movie_pending_frame_reset();
+            }
+        }
+    }
+    if (!gpu_present_fail_closed && gpu_source_boundary_hook != NULL)
+        gpu_source_boundary_hook();
     /* Trusted package-selected plugins run on guest VBlank, independent of
      * host presentation, pacing, turbo, or skipped frames. */
     mod_runtime_on_vblank();
@@ -3208,6 +3493,8 @@ void gpu_vblank_tick(void) {
                 s_present_pending = 1;
         } else {
             vblank_callback();
+            if (gpu_host_quantum_boundary_hook)
+                gpu_host_quantum_boundary_hook();
         }
     }
 }
@@ -3460,6 +3747,7 @@ void gpu_get_display_info(GpuDisplayInfo* out) {
     out->display_x = display_area_x;
     out->display_y = display_area_y;
     out->depth24   = (int)(display_depth & 1u);
+    out->interlaced = (int)(vertical_interlace & 1u);
     out->disabled  = (int)display_disabled;
 
     /* Dot-clock divider from GP1(08h) hres (psx-spx / DuckStation). */
@@ -3813,29 +4101,30 @@ static void raster_triangle(int32_t x0, int32_t y0,
 }
 
 /* Execute mono triangle (GP0 0x20-0x23) */
-static void gp0_exec_mono_tri(void) {
+static int gp0_exec_mono_tri(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint32_t color = gp0_cmd_buf[0] & UINT32_C(0x00ffffff);
     int32_t vx[3], vy[3];
     for (int i = 0; i < 3; i++) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
     }
-    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return 0;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_bbox(vx, vy, 3)) return 0;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(1, 2, 3,
                              vx, vy);
     gr_draw_flat_triangle_rgb888(vx[0], vy[0], vx[1], vy[1],
                                  vx[2], vy[2], color);
+    return 1;
 }
 
 /* Execute mono quad (GP0 0x28-0x2B) — two triangles: (0,1,2) and (2,1,3) */
-static void gp0_exec_mono_quad(void) {
+static int gp0_exec_mono_quad(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint32_t color24 = gp0_cmd_buf[0] & UINT32_C(0x00ffffff);
     uint16_t color = rgb888_to_rgb555(color24);
@@ -3844,7 +4133,7 @@ static void gp0_exec_mono_quad(void) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
-    if (rej_a && rej_b) return;
+    if (rej_a && rej_b) return 0;
 
     /* Full-screen filters are commonly encoded as an axis-aligned quad. Drawing
      * a semi-transparent quad as two independent triangles blends their shared
@@ -3865,7 +4154,7 @@ static void gp0_exec_mono_quad(void) {
         y += draw_offset_y;
         gr_set_semi_transparency(semi_trans, (int)semi_transparency);
         gr_draw_flat_rect(x, y, w, h, color);
-        return;
+        return 3;
     }
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (no-op else) */
     ws_nw_hud_shift_vertices(vx, 4);
@@ -3873,7 +4162,7 @@ static void gp0_exec_mono_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_bbox(vx, vy, 4)) return 0;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     /* Semi axis-aligned mono quads (UI boxes/borders): one rect, not two tris.
      * Thin semi borders (e.g. CTR name-entry OT-1144 teal 3×H) otherwise double-
@@ -3890,7 +4179,7 @@ static void gp0_exec_mono_quad(void) {
         int h = (int)(max_y - min_y);
         if (w > 0 && h > 0) {
             gr_draw_flat_rect(min_x, min_y, w, h, color);
-            return;
+            return 3;
         }
     }
     if (!rej_a) {
@@ -3907,10 +4196,11 @@ static void gp0_exec_mono_quad(void) {
         gr_draw_flat_triangle_rgb888(vx[2], vy[2], vx[1], vy[1],
                                      vx[3], vy[3], color24);
     }
+    return (!rej_a ? 1 : 0) | (!rej_b ? 2 : 0);
 }
 
 /* Execute shaded triangle (GP0 0x30-0x33) — Gouraud shaded */
-static void gp0_exec_shaded_tri(void) {
+static int gp0_exec_shaded_tri(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[3], vy[3];
     uint32_t c[3];
@@ -3919,19 +4209,20 @@ static void gp0_exec_shaded_tri(void) {
         c[i] = gp0_cmd_buf[i * 2] & UINT32_C(0x00ffffff);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
-    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return 0;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_bbox(vx, vy, 3)) return 0;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(1, 3, 5,
                              vx, vy);
     gr_draw_gouraud_triangle_rgb888(vx[0], vy[0], c[0],
                                     vx[1], vy[1], c[1],
                                     vx[2], vy[2], c[2]);
+    return 1;
 }
 
 void gpu_arm_shaded_quad_capture(void) { sq_cap_armed = 1; sq_cap_count = 0; }
@@ -3942,7 +4233,7 @@ int  gpu_get_shaded_quad_capture(const GpuSqCapEntry** out) {
 }
 
 /* Execute shaded quad (GP0 0x38-0x3B) */
-static void gp0_exec_shaded_quad(void) {
+static int gp0_exec_shaded_quad(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[4], vy[4];
     uint32_t c[4];
@@ -3953,14 +4244,14 @@ static void gp0_exec_shaded_quad(void) {
     }
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
-    if (rej_a && rej_b) return;
+    if (rej_a && rej_b) return 0;
     ws_nw_backdrop_stretch_quad(vx, vy);   /* full-frame 2D backdrop stretch (sky gradient; no-op else) */
     ws_nw_hud_shift_vertices(vx, 4);
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_bbox(vx, vy, 4)) return 0;
     /* Capture vertex data when armed. */
     if (sq_cap_armed && !native_stream_command.replaying &&
         sq_cap_count < SQ_CAP_MAX) {
@@ -3987,6 +4278,7 @@ static void gp0_exec_shaded_quad(void) {
                                         vx[1], vy[1], c[1],
                                         vx[3], vy[3], c[3]);
     }
+    return (!rej_a ? 1 : 0) | (!rej_b ? 2 : 0);
 }
 
 /* Helper: build texpage word from GPU state for SW renderer.
@@ -4023,7 +4315,7 @@ static void setup_textured_draw(uint32_t color24, int semi_trans, int raw_textur
 }
 
 /* Execute textured triangle (GP0 0x24-0x27) */
-static void gp0_exec_textured_tri(void) {
+static int gp0_exec_textured_tri(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -4043,14 +4335,14 @@ static void gp0_exec_textured_tri(void) {
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
-    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return 0;
 
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_bbox(vx, vy, 3)) return 0;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
     prepare_precise_triangle(1, 3, 5,
@@ -4060,10 +4352,11 @@ static void gp0_exec_textured_tri(void) {
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
                               clut_x, clut_y, tpage);
+    return 1;
 }
 
 /* Execute textured quad (GP0 0x2C-0x2F) */
-static void gp0_exec_textured_quad(void) {
+static int gp0_exec_textured_quad(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -4086,7 +4379,7 @@ static void gp0_exec_textured_quad(void) {
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
-    if (rej_a && rej_b) return;
+    if (rej_a && rej_b) return 0;
 
     /* Widescreen: tagged billboard quads carry CPU-computed pixel offsets the
      * GTE squash never saw — re-squash every X around the prim's anchor. */
@@ -4103,7 +4396,7 @@ static void gp0_exec_textured_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_bbox(vx, vy, 4)) return 0;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
 
@@ -4123,12 +4416,12 @@ static void gp0_exec_textured_quad(void) {
             if (right_u - left_u == w && bot_v - top_v == h) {
                 gr_draw_textured_rect(x, y, w, h, left_u, top_v,
                                       clut_x, clut_y, tpage);
-                return;
+                return 3;
             }
             gr_draw_textured_rect_scaled(x, y, w, h, left_u, top_v,
                                          right_u, bot_v,
                                          clut_x, clut_y, tpage);
-            return;
+            return 3;
         }
     }
 
@@ -4152,10 +4445,11 @@ static void gp0_exec_textured_quad(void) {
                                   vx[3], vy[3], u[3], v[3],
                                   clut_x, clut_y, tpage);
     }
+    return (!rej_a ? 1 : 0) | (!rej_b ? 2 : 0);
 }
 
 /* Execute shaded textured triangle (GP0 0x34-0x37) */
-static void gp0_exec_shaded_textured_tri(void) {
+static int gp0_exec_shaded_textured_tri(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[3], vy[3];
@@ -4177,14 +4471,14 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
-    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
+    if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return 0;
 
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 3)) return;
+    if (draw_area_out_bbox(vx, vy, 3)) return 0;
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     prepare_precise_triangle(1, 4, 7,
@@ -4194,10 +4488,11 @@ static void gp0_exec_shaded_textured_tri(void) {
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[2], vy[2], u[2], v[2], c[2],
                                      clut_x, clut_y, tpage, raw_texture);
+    return 1;
 }
 
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
-static void gp0_exec_shaded_textured_quad(void) {
+static int gp0_exec_shaded_textured_quad(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[4], vy[4];
@@ -4224,7 +4519,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     set_tpage_from_poly(tpage_word);   /* latches even for size-rejected polys */
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
-    if (rej_a && rej_b) return;
+    if (rej_a && rej_b) return 0;
 
     ws_auto_ui_transform_quad(vx, vy);
     ws_nw_hud_shift_vertices(vx, 4);
@@ -4232,7 +4527,7 @@ static void gp0_exec_shaded_textured_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    if (draw_area_out_bbox(vx, vy, 4)) return;
+    if (draw_area_out_bbox(vx, vy, 4)) return 0;
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     if (!rej_a) {
@@ -4255,16 +4550,17 @@ static void gp0_exec_shaded_textured_quad(void) {
                                          vx[3], vy[3], u[3], v[3], c[3],
                                          clut_x, clut_y, tpage, raw_texture);
     }
+    return (!rej_a ? 1 : 0) | (!rej_b ? 2 : 0);
 }
 
 /* Execute mono line (GP0 0x40-0x47) — Bresenham */
-static void gp0_exec_mono_line(void) {
+static int gp0_exec_mono_line(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
-    if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
+    if (psx_gpu_line_oversize(x0, y0, x1, y1)) return 0;
     int32_t vx[2] = { x0, x1 };
     ws_nw_hud_shift_vertices(vx, 2);
     x0 = vx[0]; x1 = vx[1];
@@ -4272,21 +4568,22 @@ static void gp0_exec_mono_line(void) {
     x1 += draw_offset_x; y1 += draw_offset_y;
     {
         int32_t lx[2] = { x0, x1 }, ly[2] = { y0, y1 };
-        if (draw_area_out_bbox(lx, ly, 2)) return;
+        if (draw_area_out_bbox(lx, ly, 2)) return 0;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_line(x0, y0, x1, y1, color);
+    return 1;
 }
 
 /* Execute shaded line (GP0 0x50-0x57) */
-static void gp0_exec_shaded_line(void) {
+static int gp0_exec_shaded_line(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t c0 = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     uint16_t c1 = rgb888_to_rgb555(gp0_cmd_buf[2] & 0xFFFFFFu);
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
-    if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
+    if (psx_gpu_line_oversize(x0, y0, x1, y1)) return 0;
     int32_t vx[2] = { x0, x1 };
     ws_nw_hud_shift_vertices(vx, 2);
     x0 = vx[0]; x1 = vx[1];
@@ -4294,14 +4591,15 @@ static void gp0_exec_shaded_line(void) {
     x1 += draw_offset_x; y1 += draw_offset_y;
     {
         int32_t lx[2] = { x0, x1 }, ly[2] = { y0, y1 };
-        if (draw_area_out_bbox(lx, ly, 2)) return;
+        if (draw_area_out_bbox(lx, ly, 2)) return 0;
     }
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_shaded_line(x0, y0, c0, x1, y1, c1);
+    return 1;
 }
 
 /* Execute mono rectangle (GP0 0x60-0x63) */
-static void gp0_exec_mono_rect(void) {
+static int gp0_exec_mono_rect(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
@@ -4313,13 +4611,14 @@ static void gp0_exec_mono_rect(void) {
     ws_expand_fullscreen_rect(&x0, y0, &w, h);
     x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
-    if (draw_area_out_rect(x0, y0, w, h)) return;
+    if (draw_area_out_rect(x0, y0, w, h)) return 0;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, w, h, color);
+    return 1;
 }
 
 /* Execute textured rectangle (GP0 0x64-0x67) */
-static void gp0_exec_textured_rect(void) {
+static int gp0_exec_textured_rect(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -4359,7 +4658,7 @@ static void gp0_exec_textured_rect(void) {
     x0 += draw_offset_x; y0 += draw_offset_y;
     {
         int dw = (ws_w && ws_w != w) ? ws_w : w;
-        if (draw_area_out_rect(x0, y0, dw, h)) return;
+        if (draw_area_out_rect(x0, y0, dw, h)) return 0;
     }
     setup_textured_draw(color24, semi_trans, raw_texture);
     if (ws_w && ws_w != w)
@@ -4367,24 +4666,26 @@ static void gp0_exec_textured_rect(void) {
                                      clut_x, clut_y, current_texpage());
     else
         gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
+    return 1;
 }
 
 /* Execute 1x1 dot (GP0 0x68-0x6B) */
-static void gp0_exec_mono_dot(void) {
+static int gp0_exec_mono_dot(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
     x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
-    if (draw_area_out_point(x, y)) return;
+    if (draw_area_out_point(x, y)) return 0;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x, y, 1, 1, color);
+    return 1;
 }
 
 /* Native replay of GP0(6C-6F), kept separate from the command-state pass so
  * the same packet transform is used without allowing the first pass to draw. */
-static void gp0_exec_textured_dot(void) {
+static int gp0_exec_textured_dot(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -4401,10 +4702,11 @@ static void gp0_exec_textured_dot(void) {
     setup_textured_draw(color24, semi_trans, raw_texture);
     gr_draw_textured_rect(x0, y0, 1, 1, u0, v0, clut_x, clut_y,
                           current_texpage());
+    return 1;
 }
 
 /* Execute 8x8 textured sprite (GP0 0x74-0x77) */
-static void gp0_exec_textured_8x8(void) {
+static int gp0_exec_textured_8x8(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -4415,7 +4717,7 @@ static void gp0_exec_textured_8x8(void) {
     x0 += draw_offset_x; y0 += draw_offset_y;
     {
         int dw = (ws_w && ws_w != 8) ? ws_w : 8;
-        if (draw_area_out_rect(x0, y0, dw, 8)) return;
+        if (draw_area_out_rect(x0, y0, dw, 8)) return 0;
     }
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
@@ -4429,23 +4731,25 @@ static void gp0_exec_textured_8x8(void) {
                                      clut_x, clut_y, current_texpage());
     else
         gr_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
+    return 1;
 }
 
 /* Execute 8x8 sprite (GP0 0x70-0x73) */
-static void gp0_exec_mono_8x8(void) {
+static int gp0_exec_mono_8x8(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += ws_nw_hud_shift(x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    if (draw_area_out_rect(x0, y0, 8, 8)) return;
+    if (draw_area_out_rect(x0, y0, 8, 8)) return 0;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, 8, 8, color);
+    return 1;
 }
 
 /* Execute 16x16 mono sprite (GP0 0x78-0x7B). */
-static void gp0_exec_mono_16x16(void) {
+static int gp0_exec_mono_16x16(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
@@ -4454,10 +4758,11 @@ static void gp0_exec_mono_16x16(void) {
     y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, 16, 16, color);
+    return 1;
 }
 
 /* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
-static void gp0_exec_textured_16x16(void) {
+static int gp0_exec_textured_16x16(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
@@ -4477,7 +4782,7 @@ static void gp0_exec_textured_16x16(void) {
 
     {
         int dw = (ws_w && ws_w != 16) ? ws_w : 16;
-        if (draw_area_out_rect(x0, y0, dw, 16)) return;
+        if (draw_area_out_rect(x0, y0, dw, 16)) return 0;
     }
     setup_textured_draw(color24, semi_trans, raw_texture);
     if (ws_w && ws_w != 16)
@@ -4485,6 +4790,7 @@ static void gp0_exec_textured_16x16(void) {
                                      clut_x, clut_y, current_texpage());
     else
         gr_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
+    return 1;
 }
 
 /* ---- GP0 command execution ---- */
@@ -4505,11 +4811,60 @@ static void gp0_exec_fill_rect(void) {
     uint32_t dst_y = (gp0_cmd_buf[1] >> 16) & 0x1FFu;
     uint32_t width = ((gp0_cmd_buf[2] & 0x3FFu) + 0xFu) & ~0xFu;  /* round up to 16 */
     uint32_t height = (gp0_cmd_buf[2] >> 16) & 0x1FFu;
+    const uint32_t command_source_address = gp0_cmd_source_addr;
+    const uint32_t command_pc = g_debug_last_store_pc;
+    const uint32_t command_function = g_debug_current_func_addr;
+    const uint32_t command_return_address = debug_guest_ra();
+    const uint32_t command_source_kind = (uint32_t)gp0_cmd_source.kind;
+    const uint8_t command_opcode = (uint8_t)(gp0_cmd_buf[0] >> 24u);
+    const uint32_t command_word0 = gp0_cmd_buf[0];
+    const uint32_t command_word1 = gp0_cmd_buf[1];
+    const uint32_t command_word2 = gp0_cmd_buf[2];
 
     /* Fill ignores draw area, mask bits, and draw offset — writes directly to
      * VRAM. Routed through the renderer so it also fills the hi-res
      * supersampling mirror (no-op cost when supersampling is off). */
     gr_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
+    if (!gr_draw_suppression_active() && gpu_vram_clear_complete_hook != NULL &&
+        width != 0u && height != 0u) {
+        const size_t pixel_count = (size_t)width * height;
+        for (size_t index = 0u; index < pixel_count; ++index)
+            vram_write_pixels[index] = color16;
+        gpu_vram_clear_complete_hook(
+            (uint16_t)dst_x, (uint16_t)dst_y,
+            (uint16_t)width, (uint16_t)height,
+            vram_write_pixels, pixel_count);
+    }
+    if (!gr_draw_suppression_active() && width != 0u && height != 0u) {
+        const size_t pixel_count = (size_t)width * height;
+        if (gpu_vram_event_hook != NULL)
+            for (size_t index = 0u; index < pixel_count; ++index)
+                vram_write_pixels[index] = color16;
+        gpu_pending_vram_event = (GpuVramEvent){
+            .operation = GPU_VRAM_EVENT_CLEAR,
+            .destination_x = (uint16_t)dst_x,
+            .destination_y = (uint16_t)dst_y,
+            .width = (uint16_t)width,
+            .height = (uint16_t)height,
+            .mask_set = false,
+            .mask_check = false,
+            .fill_color = color16,
+            .pixels = vram_write_pixels,
+            .pixel_count = pixel_count,
+            .command_source_address = command_source_address,
+            .command_pc = command_pc,
+            .command_function = command_function,
+            .command_return_address = command_return_address,
+            .command_source_kind = command_source_kind,
+            .command_words = {
+                command_word0, command_word1, command_word2, 0u,
+            },
+            .command_opcode = command_opcode,
+            .command_word_count = 3u,
+            .command_context_valid = true,
+        };
+        gpu_pending_vram_event_valid = 1;
+    }
 
     /* Native-wide: when the game clears a display buffer, clear the full width
      * of that buffer's wide surface over the same rows — refreshing the centred
@@ -4534,7 +4889,11 @@ static void gp0_exec_fill_rect_native(void) {
     gr_native_fill_rect(x, y, w, h, color);
 }
 
-static void gp0_exec_vram_copy(void) {
+static void gp0_exec_vram_copy(
+        uint8_t command_opcode, uint32_t command_source_address,
+        uint32_t command_pc, uint32_t command_function,
+        uint32_t command_return_address, uint32_t command_source_kind,
+        const uint32_t command_words[4]) {
     int src_x = gp0_cmd_buf[1] & 0x3FF;
     int src_y = (gp0_cmd_buf[1] >> 16) & 0x1FF;
     int dst_x = gp0_cmd_buf[2] & 0x3FF;
@@ -4543,7 +4902,47 @@ static void gp0_exec_vram_copy(void) {
     int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
     if (w == 0) w = 0x400;
     if (h == 0) h = 0x200;
+    const bool mask_set = set_mask_bit != 0u;
+    const bool mask_check = check_mask_bit != 0u;
     gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+    if (!gr_draw_suppression_active() && gpu_vram_move_complete_hook != NULL) {
+        const size_t pixel_count = (size_t)w * (size_t)h;
+        gr_vram_transfer_out(dst_x, dst_y, w, h, vram_write_pixels);
+        gpu_vram_move_complete_hook(
+            (uint16_t)dst_x, (uint16_t)dst_y, (uint16_t)w, (uint16_t)h,
+            vram_write_pixels, pixel_count);
+    }
+    if (!gr_draw_suppression_active()) {
+        const size_t pixel_count = (size_t)w * (size_t)h;
+        if (gpu_vram_event_hook != NULL)
+            gr_vram_transfer_out(dst_x, dst_y, w, h, vram_write_pixels);
+        gpu_pending_vram_event = (GpuVramEvent){
+            .operation = GPU_VRAM_EVENT_MOVE,
+            .source_x = (uint16_t)src_x,
+            .source_y = (uint16_t)src_y,
+            .destination_x = (uint16_t)dst_x,
+            .destination_y = (uint16_t)dst_y,
+            .width = (uint16_t)w,
+            .height = (uint16_t)h,
+            .mask_set = mask_set,
+            .mask_check = mask_check,
+            .pixels = vram_write_pixels,
+            .pixel_count = pixel_count,
+            .command_source_address = command_source_address,
+            .command_pc = command_pc,
+            .command_function = command_function,
+            .command_return_address = command_return_address,
+            .command_source_kind = command_source_kind,
+            .command_words = {
+                command_words[0], command_words[1],
+                command_words[2], command_words[3],
+            },
+            .command_opcode = command_opcode,
+            .command_word_count = 4u,
+            .command_context_valid = true,
+        };
+        gpu_pending_vram_event_valid = 1;
+    }
 }
 
 static void gp0_exec_draw_mode(void) {
@@ -4697,9 +5096,16 @@ static void gp0_exec_cpu_to_vram(void) {
     vram_write_w = (w == 0) ? 0x400 : (uint16_t)w;
     vram_write_h = (h == 0) ? 0x200 : (uint16_t)h;
 
-    /* Record for debug */
-    if (a0_history_count < A0_HISTORY_CAP) {
-        int slot = a0_history_count++;
+    /* Record the newest uploads in chronological order for debug. */
+    {
+        int slot;
+        if (a0_history_count < A0_HISTORY_CAP) {
+            slot = a0_history_count++;
+        } else {
+            memmove(&a0_history[0], &a0_history[1],
+                    sizeof(a0_history[0]) * (A0_HISTORY_CAP - 1));
+            slot = A0_HISTORY_CAP - 1;
+        }
         a0_history[slot].x = vram_write_x;
         a0_history[slot].y = vram_write_y;
         a0_history[slot].w = vram_write_w;
@@ -4737,6 +5143,7 @@ static void gp0_exec_cpu_to_vram(void) {
 
     uint32_t num_pixels = (uint32_t)vram_write_w * (uint32_t)vram_write_h;
     vram_write_remaining = (num_pixels + 1) / 2;
+    vram_write_source_reset();
 
     if (vram_write_remaining > 0)
         gp0_state = GP0_VRAM_WRITE;
@@ -4794,6 +5201,8 @@ static void gp0_exec_vram_to_cpu(void) {
 
     vram_read_col = 0;
     vram_read_row = 0;
+    vram_read_pixel_count = 0u;
+    vram_read_content_digest = UINT64_C(1469598103934665603);
     vram_read_active = 1;
 }
 
@@ -5161,9 +5570,7 @@ uint32_t gpu_gp0_ring_max_words(void){ return GPU_GP0_RING_MAX_WORDS; }
 void gpu_set_gp0_source(const GpuRenderOracleSource *source) {
     if (source == NULL) return;
     gp0_next_source_addr = source->word_address;
-    if (gpu_render_oracle.enabled || g_native_render_baseline_armed ||
-        gp0_material_capture_active || guest_render_native_stream_enabled())
-        gp0_next_source = *source;
+    gp0_next_source = *source;
 }
 
 /* Fill `out[0..max_out-1]` with entries from the requested frame; returns
@@ -5536,6 +5943,20 @@ static void oracle_complete_fixed(uint8_t opcode) {
              command == GPU_RENDER_ORACLE_COMMAND_NONE) return;
     draw = oracle_draw_state();
     gpu_render_oracle_hook_gp0_complete(&gpu_render_oracle, mutation, &draw, NULL);
+    if (command == GPU_RENDER_ORACLE_COMMAND_DRAW &&
+        !gr_draw_suppression_active() &&
+        draw_area_left <= draw_area_right && draw_area_top <= draw_area_bottom) {
+        gpu_emit_vram_event((GpuVramEvent){
+            .operation = GPU_VRAM_EVENT_RENDER_TARGET_WRITE,
+            .destination_x = (uint16_t)draw_area_left,
+            .destination_y = (uint16_t)draw_area_top,
+            .width = (uint16_t)(draw_area_right - draw_area_left + 1u),
+            .height = (uint16_t)(draw_area_bottom - draw_area_top + 1u),
+            .pixel_count =
+                (size_t)(draw_area_right - draw_area_left + 1u) *
+                (draw_area_bottom - draw_area_top + 1u),
+        });
+    }
 }
 
 static void oracle_abort_gp0(void) {
@@ -5545,6 +5966,42 @@ static void oracle_abort_gp0(void) {
 
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
+    GpuRenderSemantic canonical;
+    bool captured = false;
+    int executed = 0;
+    const uint32_t command_source_address = gp0_cmd_source_addr;
+    const uint32_t command_pc = g_debug_last_store_pc;
+    const uint32_t command_function = g_debug_current_func_addr;
+    const uint32_t command_return_address = debug_guest_ra();
+    const uint32_t command_source_kind = (uint32_t)gp0_cmd_source.kind;
+    const uint32_t command_words[4] = {
+        gp0_cmd_buf[0], gp0_cmd_buf[1], gp0_cmd_buf[2], gp0_cmd_buf[3],
+    };
+    if (gpu_native_work_draw_hook != NULL &&
+        opcode >= 0x20u && opcode <= 0x7fu &&
+        !gr_draw_suppression_active()) {
+        GpuNativeDrawEnvironment environment;
+        const uint32_t *draw_words = gp0_cmd_buf;
+        uint32_t rect_words[3];
+
+        /* The canonical mono-rect executor clamps full 16-bit sizes rather
+         * than masking them like textured rects/the native packet route. */
+        if (opcode >= 0x60u && opcode <= 0x63u) {
+            uint32_t width = gp0_cmd_buf[2] & 0xffffu;
+            uint32_t height = gp0_cmd_buf[2] >> 16u;
+            if (width > 1023u) width = 1023u;
+            if (height > 511u) height = 511u;
+            rect_words[0] = gp0_cmd_buf[0];
+            rect_words[1] = gp0_cmd_buf[1];
+            rect_words[2] = width | (height << 16u);
+            draw_words = rect_words;
+        }
+        gpu_native_environment_get(&environment);
+        captured = gpu_native_work_decode(
+            draw_words, (size_t)gp0_words_needed, &environment,
+            &gp0_cmd_source, &canonical);
+    }
+    gpu_pending_vram_event_valid = 0;
     gp0_opcode_count[opcode]++;
 #ifndef PSX_NO_DEBUG_TOOLS
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
@@ -5610,66 +6067,66 @@ static void gp0_execute_command(void) {
 
         /* Drawing commands — polygons */
         case 0x20: case 0x21: case 0x22: case 0x23:
-            gp0_exec_mono_tri();
+            executed = gp0_exec_mono_tri();
             break;
         case 0x24: case 0x25: case 0x26: case 0x27:
-            gp0_exec_textured_tri();
+            executed = gp0_exec_textured_tri();
             break;
         case 0x28: case 0x29: case 0x2A: case 0x2B:
-            gp0_exec_mono_quad();
+            executed = gp0_exec_mono_quad();
             break;
         case 0x2C: case 0x2D: case 0x2E: case 0x2F:
-            gp0_exec_textured_quad();
+            executed = gp0_exec_textured_quad();
             break;
         case 0x30: case 0x31: case 0x32: case 0x33:
-            gp0_exec_shaded_tri();
+            executed = gp0_exec_shaded_tri();
             break;
         case 0x34: case 0x35: case 0x36: case 0x37:
-            gp0_exec_shaded_textured_tri();
+            executed = gp0_exec_shaded_textured_tri();
             break;
         case 0x38: case 0x39: case 0x3A: case 0x3B:
-            gp0_exec_shaded_quad();
+            executed = gp0_exec_shaded_quad();
             break;
         case 0x3C: case 0x3D: case 0x3E: case 0x3F:
-            gp0_exec_shaded_textured_quad();
+            executed = gp0_exec_shaded_textured_quad();
             break;
 
         /* Lines */
         case 0x40: case 0x41: case 0x42: case 0x43:
         case 0x44: case 0x45: case 0x46: case 0x47:
-            gp0_exec_mono_line();
+            executed = gp0_exec_mono_line();
             break;
         case 0x50: case 0x51: case 0x52: case 0x53:
         case 0x54: case 0x55: case 0x56: case 0x57:
-            gp0_exec_shaded_line();
+            executed = gp0_exec_shaded_line();
             break;
 
         /* Rectangles */
         case 0x60: case 0x61: case 0x62: case 0x63:
-            gp0_exec_mono_rect();
+            executed = gp0_exec_mono_rect();
             break;
         case 0x64: case 0x65: case 0x66: case 0x67:
-            gp0_exec_textured_rect();
+            executed = gp0_exec_textured_rect();
             break;
         case 0x68: case 0x69: case 0x6A: case 0x6B:
-            gp0_exec_mono_dot();
+            executed = gp0_exec_mono_dot();
             break;
         case 0x6C: case 0x6D: case 0x6E: case 0x6F: {
-            gp0_exec_textured_dot();
+            executed = gp0_exec_textured_dot();
             break;
         }
         case 0x70: case 0x71: case 0x72: case 0x73:
-            gp0_exec_mono_8x8();
+            executed = gp0_exec_mono_8x8();
             break;
         case 0x74: case 0x75: case 0x76: case 0x77:
-            gp0_exec_textured_8x8();
+            executed = gp0_exec_textured_8x8();
             break;
         case 0x78: case 0x79: case 0x7A: case 0x7B: {
-            gp0_exec_mono_16x16();
+            executed = gp0_exec_mono_16x16();
             break;
         }
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
-            gp0_exec_textured_16x16();
+            executed = gp0_exec_textured_16x16();
             break;
 
         /* VRAM→VRAM copy */
@@ -5681,7 +6138,9 @@ static void gp0_execute_command(void) {
         case 0x94: case 0x95: case 0x96: case 0x97:
         case 0x98: case 0x99: case 0x9A: case 0x9B:
         case 0x9C: case 0x9D: case 0x9E: case 0x9F: {
-            gp0_exec_vram_copy();
+            gp0_exec_vram_copy(
+                opcode, command_source_address, command_pc, command_function,
+                command_return_address, command_source_kind, command_words);
             break;
         }
 
@@ -5719,19 +6178,76 @@ static void gp0_execute_command(void) {
              * implemented. Fatal halt so we know exactly what's needed next,
              * with all rings queryable post-mortem. */
             {
+                const GuestRenderNativeDiagnosticSource source = {
+                    .valid_fields =
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_ADDRESS |
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC |
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_FUNCTION |
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_RETURN_ADDRESS |
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE |
+                        GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_KIND,
+                    .source_word_address = gp0_cmd_source_addr,
+                    .pc = g_debug_last_store_pc,
+                    .function = g_debug_current_func_addr,
+                    .return_address = debug_guest_ra(),
+                    .source_kind =
+                        (GuestRenderNativeStreamSourceKind)gp0_cmd_source.kind,
+                    .opcode = opcode,
+                };
                 static char reason[96];
+                (void)guest_render_native_stream_note_diagnostic_event(
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNKNOWN_GP0_COMMAND,
+                    &source);
                 snprintf(reason, sizeof(reason),
                          "GPU GP0 unimplemented command 0x%02X (word 0x%08X)",
                          opcode, gp0_cmd_buf[0]);
                 psx_fatal_halt(reason);
             }
     }
+    if (executed != 0 && !gr_draw_suppression_active()) {
+        /* Quad executors return the actually submitted triangle bits. The
+         * packet/environment were captured before any rasterizer/barrier. */
+        if (captured && opcode < 0x40u && (opcode & 8u) != 0u &&
+            executed != 3) {
+            if (executed == 2) canonical.triangles[0] = canonical.triangles[1];
+            canonical.triangle_count = 1u;
+        }
+        gpu_note_draw_executed(captured ? &canonical : NULL, NULL);
+    }
     if (opcode >= 0x20u && opcode <= 0x7fu &&
-        guest_render_native_stream_enabled() &&
-        !native_stream_command.active && !gr_draw_suppression_active())
-        guest_render_native_stream_note_original_draw(opcode);
+        !native_stream_command.active && !gr_draw_suppression_active()) {
+        const GuestRenderNativeDiagnosticSource source = {
+            .valid_fields =
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_ADDRESS |
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC |
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_FUNCTION |
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_RETURN_ADDRESS |
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE |
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_KIND,
+            .source_word_address = gp0_cmd_source_addr,
+            .pc = g_debug_last_store_pc,
+            .function = g_debug_current_func_addr,
+            .return_address = debug_guest_ra(),
+            .source_kind =
+                (GuestRenderNativeStreamSourceKind)gp0_cmd_source.kind,
+            .opcode = opcode,
+        };
+        (void)guest_render_native_stream_note_diagnostic_event(
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_GUEST_GPU_COMPATIBILITY_PRIMITIVE,
+            &source);
+    }
     baseline_note_original_material(opcode, (uint64_t)gp0_words_needed);
+    if (opcode == 0xe3u && gpu_native_work_environment_hook != NULL &&
+        !gpu_native_work_environment_hook(
+            command_source_kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
+            command_source_address != UINT32_MAX
+                ? command_source_address & UINT32_C(0x001ffffc) : UINT64_MAX))
+        psx_fatal_halt("Native draw target was not accepted");
     oracle_complete_fixed(opcode);
+    if (gpu_pending_vram_event_valid) {
+        gpu_emit_vram_event(gpu_pending_vram_event);
+        gpu_pending_vram_event_valid = 0;
+    }
 }
 
 /* ---- GP0 write (0x1F801810 write) — command state machine ---- */
@@ -6158,6 +6674,22 @@ void gpu_native_environment_apply(const uint32_t *words, int word_count,
     }
 }
 
+static int native_note_gp0_semantic_decode(uint8_t opcode) {
+    const GuestRenderNativeDiagnosticSource source = {
+        .valid_fields = GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE,
+        .opcode = opcode,
+    };
+
+    if (!guest_render_native_stream_enabled()) return 1;
+    if (guest_render_native_stream_note_diagnostic_event(
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_GP0_DECODE_TO_SEMANTIC,
+            &source) != GUEST_RENDER_NATIVE_STREAM_OK)
+        return 0;
+    return guest_render_native_stream_note_diagnostic_event(
+               GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_PACKET_PAYLOAD_READ,
+               &source) == GUEST_RENDER_NATIVE_STREAM_OK;
+}
+
 int gpu_native_semantic_from_gp0(
         const uint32_t *words, int word_count,
         const GpuNativeDrawEnvironment *environment,
@@ -6395,6 +6927,7 @@ int gpu_native_semantic_from_gp0(
     }
     out->screen_space_2d = native_semantic_screen_space_mode(opcode, out, NULL);
     native_semantic_classify_native_view_effect(opcode, out, NULL);
+    if (!native_note_gp0_semantic_decode(opcode)) return -1;
     return 1;
 }
 
@@ -6469,11 +7002,12 @@ int gpu_native_line_semantic_from_gp0(
 
         parse_vertex(words[1], &previous_x, &previous_y);
         parse_vertex(words[2], &x1, &y1);
-        return native_semantic_line_append(
-            out, previous_x, previous_y, previous_color,
-            x1, y1, previous_color) && out->line_count != 0u ? 1 : 0;
+        if (!native_semantic_line_append(
+                out, previous_x, previous_y, previous_color,
+                x1, y1, previous_color))
+            return 0;
     }
-    if (opcode >= 0x50u && opcode <= 0x57u) {
+    else if (opcode >= 0x50u && opcode <= 0x57u) {
         int32_t x1;
         int32_t y1;
         const uint16_t color1 = rgb888_to_rgb555(
@@ -6481,51 +7015,58 @@ int gpu_native_line_semantic_from_gp0(
 
         parse_vertex(words[1], &previous_x, &previous_y);
         parse_vertex(words[3], &x1, &y1);
-        return native_semantic_line_append(
-            out, previous_x, previous_y, previous_color,
-            x1, y1, color1) && out->line_count != 0u ? 1 : 0;
+        if (!native_semantic_line_append(
+                out, previous_x, previous_y, previous_color,
+                x1, y1, color1))
+            return 0;
     }
-    if (word_count == 2u || native_packet_is_polyline_terminator(words[1]))
-        return 0;
-    parse_vertex(words[1], &previous_x, &previous_y);
-    if (!shaded) {
-        for (size_t index = 2u; index < word_count; ++index) {
-            int32_t x1;
-            int32_t y1;
+    else {
+        if (word_count == 2u ||
+            native_packet_is_polyline_terminator(words[1]))
+            return 0;
+        parse_vertex(words[1], &previous_x, &previous_y);
+        if (!shaded) {
+            for (size_t index = 2u; index < word_count; ++index) {
+                int32_t x1;
+                int32_t y1;
 
-            if (native_packet_is_polyline_terminator(words[index])) break;
-            parse_vertex(words[index], &x1, &y1);
-            if (!native_semantic_line_append(
-                    out, previous_x, previous_y, previous_color,
-                    x1, y1, previous_color))
-                return -1;
-            previous_x = x1;
-            previous_y = y1;
-        }
-    } else {
-        for (size_t index = 2u; index < word_count;) {
-            uint16_t color1;
-            int32_t x1;
-            int32_t y1;
+                if (native_packet_is_polyline_terminator(words[index])) break;
+                parse_vertex(words[index], &x1, &y1);
+                if (!native_semantic_line_append(
+                        out, previous_x, previous_y, previous_color,
+                        x1, y1, previous_color))
+                    return -1;
+                previous_x = x1;
+                previous_y = y1;
+            }
+        } else {
+            for (size_t index = 2u; index < word_count;) {
+                uint16_t color1;
+                int32_t x1;
+                int32_t y1;
 
-            if (native_packet_is_polyline_terminator(words[index])) break;
-            color1 = rgb888_to_rgb555(words[index] & UINT32_C(0x00ffffff));
-            ++index;
-            if (index >= word_count ||
-                native_packet_is_polyline_terminator(words[index]))
-                break;
-            parse_vertex(words[index], &x1, &y1);
-            ++index;
-            if (!native_semantic_line_append(
-                    out, previous_x, previous_y, previous_color,
-                    x1, y1, color1))
-                return -1;
-            previous_x = x1;
-            previous_y = y1;
-            previous_color = color1;
+                if (native_packet_is_polyline_terminator(words[index])) break;
+                color1 = rgb888_to_rgb555(
+                    words[index] & UINT32_C(0x00ffffff));
+                ++index;
+                if (index >= word_count ||
+                    native_packet_is_polyline_terminator(words[index]))
+                    break;
+                parse_vertex(words[index], &x1, &y1);
+                ++index;
+                if (!native_semantic_line_append(
+                        out, previous_x, previous_y, previous_color,
+                        x1, y1, color1))
+                    return -1;
+                previous_x = x1;
+                previous_y = y1;
+                previous_color = color1;
+            }
         }
     }
-    return out->line_count != 0u ? 1 : 0;
+    if (out->line_count == 0u) return 0;
+    if (!native_note_gp0_semantic_decode(opcode)) return -1;
+    return 1;
 }
 
 static int native_packet_semantic_from_gp0(
@@ -6542,14 +7083,22 @@ static int native_packet_semantic_from_gp0(
         words, (int)word_count, environment, out_semantic);
 }
 
-static int native_packet_fallback_is_supported(
+static bool gpu_native_work_decode(
         const uint32_t *words, size_t word_count,
-        const GpuNativeDrawEnvironment *environment) {
-    GpuRenderSemantic semantic;
-
-    return gr_backend() == GR_BACKEND_OPENGL &&
-        native_packet_semantic_from_gp0(
-            words, word_count, environment, &semantic) == 1;
+        const GpuNativeDrawEnvironment *environment,
+        const GpuRenderOracleSource *source, GpuRenderSemantic *out) {
+    if (gpu_native_work_draw_hook == NULL) return false;
+    if (native_packet_semantic_from_gp0(words, word_count, environment, out) != 1)
+        return false;
+    out->material.draw_area_left = environment->draw.left;
+    out->material.draw_area_top = environment->draw.top;
+    out->material.draw_area_right = environment->draw.right;
+    out->material.draw_area_bottom = environment->draw.bottom;
+    out->submission_command_id = source != NULL &&
+        source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
+        source->word_address != UINT32_MAX
+            ? source->word_address : UINT64_MAX;
+    return true;
 }
 
 static int native_packet_is_textured_polygon(uint8_t opcode) {
@@ -6672,18 +7221,49 @@ static uint32_t native_packet_rgb555_to_rgb888(uint16_t color) {
            ((uint32_t)(color & UINT16_C(0x7c00)) << 9u);
 }
 
+static bool gpu_native_work_decode_line(
+        int32_t x0, int32_t y0, uint16_t color0,
+        int32_t x1, int32_t y1, uint16_t color1,
+        int shaded, int semi_transparent, int coordinates_include_offset,
+        const GpuRenderOracleSource *source, GpuRenderSemantic *out) {
+    GpuNativeDrawEnvironment environment;
+    uint32_t words[4];
+
+    if (gpu_native_work_draw_hook == NULL) return false;
+    gpu_native_environment_get(&environment);
+    if (coordinates_include_offset) {
+        x0 -= environment.draw.offset_x;
+        y0 -= environment.draw.offset_y;
+        x1 -= environment.draw.offset_x;
+        y1 -= environment.draw.offset_y;
+    }
+    /* A bounded, complete line packet per executed segment. No polyline is
+     * accumulated in the two-line semantic buffer; offsets remain material. */
+    words[0] = ((uint32_t)(shaded ? 0x50u : 0x40u) << 24u) |
+        ((uint32_t)semi_transparent << 25u) |
+        native_packet_rgb555_to_rgb888(color0);
+    words[1] = ((uint32_t)x0 & 0x7ffu) | (((uint32_t)y0 & 0x7ffu) << 16u);
+    words[2] = shaded ? native_packet_rgb555_to_rgb888(color1) :
+        (((uint32_t)x1 & 0x7ffu) | (((uint32_t)y1 & 0x7ffu) << 16u));
+    words[3] = ((uint32_t)x1 & 0x7ffu) | (((uint32_t)y1 & 0x7ffu) << 16u);
+    return gpu_native_work_decode(words, shaded ? 4u : 3u,
+                                  &environment, source, out);
+}
+
 static void native_stream_fail(const char *operation,
                                uint64_t command_id,
                                int status);
-static void gpu_note_semantic_current(const GpuRenderSemantic *semantic);
 
 static int native_packet_draw_line_segment(
         int32_t x0, int32_t y0, uint16_t color0,
         int32_t x1, int32_t y1, uint16_t color1,
-        int shaded, int semi_transparent, int coordinates_include_offset) {
+        int shaded, int semi_transparent, int coordinates_include_offset,
+        const GpuRenderOracleSource *source) {
     GpuNativeDrawEnvironment environment;
     GpuRenderSemantic semantic;
+    GpuRenderSemantic canonical;
     GpuRenderTransactionStatus status;
+    bool captured;
 
     if (psx_gpu_line_oversize(x0, y0, x1, y1)) return 1;
     memset(&semantic, 0, sizeof(semantic));
@@ -6707,18 +7287,26 @@ static int native_packet_draw_line_segment(
         &semantic.lines[0].vertices[1], x1, y1, 0, 0,
         native_packet_rgb555_to_rgb888(color1));
     native_semantic_stamp_retrospective_scene(&semantic);
+    captured = gpu_native_work_decode_line(
+        x0, y0, color0, x1, y1, color1, shaded, semi_transparent,
+        coordinates_include_offset, source, &canonical);
+    semantic.submission_command_id = source != NULL &&
+        source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
+        source->word_address != UINT32_MAX
+            ? source->word_address : UINT64_MAX;
     status = gr_stream_barrier();
     if (status == GPU_RENDER_TRANSACTION_OK) {
-        gpu_note_semantic_current(&semantic);
         status = gr_draw_semantic_immediate(&semantic);
     }
     if (status != GPU_RENDER_TRANSACTION_OK) return 0;
+    gpu_note_draw_executed(captured ? &canonical : NULL, &semantic);
     guest_render_native_stream_note_native_line_segment();
     return 1;
 }
 
 static int native_packet_submit_lines(const uint32_t *words,
-                                      size_t word_count) {
+                                      size_t word_count,
+                                      const GpuRenderOracleSource *source) {
     const uint8_t opcode = words && word_count != 0u
         ? (uint8_t)(words[0] >> 24u) : 0u;
     const int shaded = (opcode & 0x10u) != 0u;
@@ -6735,7 +7323,7 @@ static int native_packet_submit_lines(const uint32_t *words,
         parse_vertex(words[2], &x1, &y1);
         return native_packet_draw_line_segment(
             previous_x, previous_y, previous_color,
-            x1, y1, previous_color, 0, semi_transparent, 0);
+            x1, y1, previous_color, 0, semi_transparent, 0, source);
     }
     if (opcode >= 0x50u && opcode <= 0x57u) {
         int32_t x1;
@@ -6746,7 +7334,7 @@ static int native_packet_submit_lines(const uint32_t *words,
         parse_vertex(words[3], &x1, &y1);
         return native_packet_draw_line_segment(
             previous_x, previous_y, previous_color,
-            x1, y1, color1, 1, semi_transparent, 0);
+            x1, y1, color1, 1, semi_transparent, 0, source);
     }
     if (word_count == 2u || native_packet_is_polyline_terminator(words[1]))
         return 1;
@@ -6760,7 +7348,7 @@ static int native_packet_submit_lines(const uint32_t *words,
             parse_vertex(words[index], &x1, &y1);
             if (!native_packet_draw_line_segment(
                 previous_x, previous_y, previous_color,
-                x1, y1, previous_color, 0, semi_transparent, 0))
+                x1, y1, previous_color, 0, semi_transparent, 0, source))
                 return 0;
             previous_x = x1;
             previous_y = y1;
@@ -6783,7 +7371,7 @@ static int native_packet_submit_lines(const uint32_t *words,
         ++index;
         if (!native_packet_draw_line_segment(
             previous_x, previous_y, previous_color,
-            x1, y1, color1, 1, semi_transparent, 0))
+            x1, y1, color1, 1, semi_transparent, 0, source))
             return 0;
         previous_x = x1;
         previous_y = y1;
@@ -6792,12 +7380,17 @@ static int native_packet_submit_lines(const uint32_t *words,
     return 1;
 }
 
+static const GpuRenderOracleSource *native_packet_word_sources;
+static size_t native_packet_word_source_count;
+
 static int native_packet_cpu_to_vram(const uint32_t *words,
-                                     size_t word_count) {
+                                     size_t word_count,
+                                     const GpuRenderOracleSource *source) {
     size_t pixel_index = 0u;
     uint32_t width;
     uint32_t height;
     uint64_t pixel_count;
+    bool has_mdec_source;
 
     if (word_count < 3u) return 0;
     vram_write_x = (uint16_t)(words[1] & 0x3ffu);
@@ -6813,6 +7406,15 @@ static int native_packet_cpu_to_vram(const uint32_t *words,
 
     vram_write_w = (uint16_t)width;
     vram_write_h = (uint16_t)height;
+    vram_write_source_reset();
+    for (size_t word_index = 3u; word_index < word_count; ++word_index) {
+        const GpuRenderOracleSource *word_source =
+            native_packet_word_sources != NULL &&
+            native_packet_word_source_count == word_count
+                ? &native_packet_word_sources[word_index] : NULL;
+        vram_write_source_note(word_source);
+    }
+    has_mdec_source = vram_write_has_mdec_source();
     for (size_t word_index = 3u; word_index < word_count; ++word_index) {
         for (unsigned half = 0u; half < 2u && pixel_index < pixel_count;
              ++half) {
@@ -6831,6 +7433,38 @@ static int native_packet_cpu_to_vram(const uint32_t *words,
     }
     gr_vram_transfer_in(vram_write_x, vram_write_y, vram_write_w,
                         vram_write_h, vram_write_pixels);
+    if (gpu_vram_upload_commit_hook != NULL)
+        gpu_vram_upload_commit_hook(
+            vram_write_x, vram_write_y, vram_write_w, vram_write_h,
+            vram_write_pixels, (size_t)vram_write_w * vram_write_h);
+    gpu_emit_vram_event((GpuVramEvent){
+        .operation = GPU_VRAM_EVENT_UPLOAD,
+        .destination_x = vram_write_x,
+        .destination_y = vram_write_y,
+        .width = vram_write_w,
+        .height = vram_write_h,
+        .mask_set = false,
+        .mask_check = false,
+        .pixels = vram_write_pixels,
+        .pixel_count = (size_t)vram_write_w * vram_write_h,
+        .command_source_address = source != NULL
+            ? source->word_address : UINT32_MAX,
+        .command_source_kind = source != NULL
+            ? (uint32_t)source->kind : GPU_RENDER_ORACLE_SOURCE_UNKNOWN,
+        .command_words = { words[0], words[1], words[2], 0u },
+        .command_opcode = (uint8_t)(words[0] >> 24u),
+        .command_word_count = 3u,
+        .command_context_valid = true,
+        .payload_source = has_mdec_source
+            ? GPU_VRAM_PAYLOAD_SOURCE_MDEC_DMA1
+            : GPU_VRAM_PAYLOAD_SOURCE_NONE,
+        .payload_format = has_mdec_source
+            ? vram_write_source_format : 0u,
+        .payload_source_receipt = has_mdec_source
+            ? vram_write_source_receipt : 0u,
+    });
+    if (has_mdec_source) mdec_scanout_candidate = 1;
+    vram_write_source_reset();
     depth24_note_upload(vram_write_x, vram_write_w);
     text_xlate_vram_upload(vram_write_x, vram_write_y,
                            vram_write_w, vram_write_h);
@@ -6850,6 +7484,8 @@ static int native_packet_vram_to_cpu(const uint32_t *words, size_t word_count) {
     vram_read_h = (uint16_t)(height == 0u ? 0x200u : height);
     vram_read_col = 0u;
     vram_read_row = 0u;
+    vram_read_pixel_count = 0u;
+    vram_read_content_digest = UINT64_C(1469598103934665603);
     vram_read_active = 1;
     return 1;
 }
@@ -7195,6 +7831,43 @@ static GuestRenderNativeStreamCommandIdentity native_command_identity(
     return identity;
 }
 
+static GuestRenderNativeDiagnosticSource native_diagnostic_source(
+        const GuestRenderNativeStreamCommandIdentity *identity) {
+    GuestRenderNativeDiagnosticSource source = {
+        .valid_fields =
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_COMMAND_ID |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_ADDRESS |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_KIND,
+        .source_word_address = identity->command_id <= UINT32_MAX
+            ? (uint32_t)identity->command_id : UINT32_MAX,
+        .command_id = identity->command_id,
+        .source_kind = identity->source_kind,
+        .opcode = identity->opcode,
+    };
+
+    if (identity->command_writer_valid) {
+        source.valid_fields |=
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_FUNCTION |
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_RETURN_ADDRESS;
+        source.pc = identity->command_writer.pc;
+        source.function = identity->command_writer.function;
+        source.return_address = identity->command_writer.return_address;
+    }
+    return source;
+}
+
+static int native_note_uncovered_producer(
+        const GuestRenderNativeStreamCommandIdentity *identity) {
+    const GuestRenderNativeDiagnosticSource source =
+        native_diagnostic_source(identity);
+
+    return guest_render_native_stream_note_diagnostic_event(
+               GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER,
+               &source) == GUEST_RENDER_NATIVE_STREAM_OK;
+}
+
 static int native_command_identities_structurally_equal(
         const GuestRenderNativeStreamCommandIdentity *left,
         const GuestRenderNativeStreamCommandIdentity *right) {
@@ -7265,8 +7938,7 @@ static int native_preflight_reservation_append(
     bool gte_bound = false;
     bool cpu_canonical_bound = false;
     bool packet_fallback = false;
-    const bool packet_fallback_supported =
-        native_packet_fallback_is_supported(words, word_count, environment);
+    bool packet_fallback_supported;
 
     if (native_preflight_reservations.phase != 1) return 0;
     native_preflight_reservations.last_reserved_identity = *identity;
@@ -7278,6 +7950,7 @@ static int native_preflight_reservation_append(
             (uint8_t)(20u + GUEST_RENDER_NATIVE_STREAM_INVALID_ARGUMENT);
         return 0;
     }
+    packet_fallback_supported = gr_backend() == GR_BACKEND_OPENGL;
     reserve_status = guest_render_native_stream_reserve_exact(
         native_preflight_reservations.id, identity, &packet_semantic,
         &visual_id, &semantic);
@@ -7306,8 +7979,13 @@ static int native_preflight_reservation_append(
         memset(&visual_id, 0, sizeof(visual_id));
     }
     if (reserve_status == GUEST_RENDER_NATIVE_STREAM_NOT_FOUND &&
-        packet_fallback_supported)
+        packet_fallback_supported) {
+        if (!native_note_uncovered_producer(identity)) {
+            native_preflight_reservations.last_consume_status = 6u;
+            return 0;
+        }
         packet_fallback = true;
+    }
     if (reserve_status != GUEST_RENDER_NATIVE_STREAM_OK && !packet_fallback) {
         native_preflight_reservations.last_consume_status =
             (uint8_t)(20u + reserve_status);
@@ -7401,8 +8079,7 @@ int gpu_native_preflight_gp0_packet(
                 words, word_count, &environment, &packet_semantic) == 1 &&
                 (guest_render_native_stream_match_exact(
                     &identity, &packet_semantic, &visual_id) ||
-                native_packet_fallback_is_supported(
-                    words, word_count, &environment));
+                gr_backend() == GR_BACKEND_OPENGL);
         }
     }
     if (result && native_preflight_reservations.phase == 1)
@@ -7422,6 +8099,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         ? (uint8_t)(words[0] >> 24u) : 0u;
     GpuNativeDrawEnvironment environment;
     GpuRenderSemantic semantic;
+    GpuRenderSemantic canonical;
+    bool captured = false;
     const GpuRenderSemantic *effective_bound_semantic = bound_semantic;
     GpuRenderTransactionStatus render_status;
     int supported = 1;
@@ -7431,8 +8110,15 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         gr_backend() != GR_BACKEND_OPENGL)
         supported = 0;
     if (supported && source) gpu_set_gp0_source(source);
+    if (supported && native_packet_is_draw(opcode) &&
+        (opcode < 0x40u || opcode > 0x5fu || bound_semantic != NULL) &&
+        gpu_native_work_draw_hook != NULL) {
+        gpu_native_environment_get(&environment);
+        captured = gpu_native_work_decode(
+            words, word_count, &environment, source, &canonical);
+    }
     if (supported && opcode >= 0xa0u && opcode <= 0xbfu) {
-        supported = native_packet_cpu_to_vram(words, word_count);
+        supported = native_packet_cpu_to_vram(words, word_count, source);
     } else if (supported && opcode == 0x02u) {
         uint16_t color = rgb888_to_rgb555(words[0] & 0x00ffffffu);
         const int x = (int)(words[1] & 0x3f0u);
@@ -7442,6 +8128,38 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         if (word_count != 3u) supported = 0;
         else {
             gr_native_fill_rect(x, y, w, h, color);
+            if ((gpu_vram_clear_complete_hook != NULL ||
+                 gpu_vram_event_hook != NULL) && w != 0 && h != 0) {
+                const size_t pixel_count = (size_t)w * (size_t)h;
+                for (size_t index = 0u; index < pixel_count; ++index)
+                    vram_write_pixels[index] = color;
+                if (gpu_vram_clear_complete_hook != NULL)
+                    gpu_vram_clear_complete_hook(
+                        (uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h,
+                        vram_write_pixels, pixel_count);
+                gpu_emit_vram_event((GpuVramEvent){
+                    .operation = GPU_VRAM_EVENT_CLEAR,
+                    .destination_x = (uint16_t)x,
+                    .destination_y = (uint16_t)y,
+                    .width = (uint16_t)w,
+                    .height = (uint16_t)h,
+                    .mask_set = false,
+                    .mask_check = false,
+                    .fill_color = color,
+                    .pixels = vram_write_pixels,
+                    .pixel_count = pixel_count,
+                    .command_source_address = source != NULL
+                        ? source->word_address : 0u,
+                    .command_source_kind = source != NULL
+                        ? (uint32_t)source->kind : 0u,
+                    .command_words = {
+                        words[0], words[1], words[2], 0u,
+                    },
+                    .command_opcode = opcode,
+                    .command_word_count = 3u,
+                    .command_context_valid = source != NULL,
+                });
+            }
             if (ws_native_wide_active() && ws_is_fb_base((uint32_t)x))
                 gr_wide_clear(x, y, h, color);
         }
@@ -7450,13 +8168,50 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         else {
             int width = (int)(words[3] & 0x3ffu);
             int height = (int)((words[3] >> 16u) & 0x1ffu);
+            const int src_x = (int)(words[1] & 0x3ffu);
+            const int src_y = (int)((words[1] >> 16u) & 0x1ffu);
+            const int dst_x = (int)(words[2] & 0x3ffu);
+            const int dst_y = (int)((words[2] >> 16u) & 0x1ffu);
+            const bool mask_set = set_mask_bit != 0u;
+            const bool mask_check = check_mask_bit != 0u;
             if (width == 0) width = 0x400;
             if (height == 0) height = 0x200;
-            gr_native_copy_rect((int)(words[1] & 0x3ffu),
-                                (int)((words[1] >> 16u) & 0x1ffu),
-                                (int)(words[2] & 0x3ffu),
-                                (int)((words[2] >> 16u) & 0x1ffu),
-                                width, height);
+            gr_native_copy_rect(
+                src_x, src_y, dst_x, dst_y, width, height);
+            if (gpu_vram_move_complete_hook != NULL ||
+                gpu_vram_event_hook != NULL) {
+                const size_t pixel_count = (size_t)width * (size_t)height;
+                gr_vram_transfer_out(
+                    dst_x, dst_y, width, height, vram_write_pixels);
+                if (gpu_vram_move_complete_hook != NULL)
+                    gpu_vram_move_complete_hook(
+                        (uint16_t)dst_x, (uint16_t)dst_y,
+                        (uint16_t)width, (uint16_t)height,
+                        vram_write_pixels, pixel_count);
+                gpu_emit_vram_event((GpuVramEvent){
+                    .operation = GPU_VRAM_EVENT_MOVE,
+                    .source_x = (uint16_t)src_x,
+                    .source_y = (uint16_t)src_y,
+                    .destination_x = (uint16_t)dst_x,
+                    .destination_y = (uint16_t)dst_y,
+                    .width = (uint16_t)width,
+                    .height = (uint16_t)height,
+                    .mask_set = mask_set,
+                    .mask_check = mask_check,
+                    .pixels = vram_write_pixels,
+                    .pixel_count = pixel_count,
+                    .command_source_address = source != NULL
+                        ? source->word_address : 0u,
+                    .command_source_kind = source != NULL
+                        ? (uint32_t)source->kind : 0u,
+                    .command_words = {
+                        words[0], words[1], words[2], words[3],
+                    },
+                    .command_opcode = opcode,
+                    .command_word_count = 4u,
+                    .command_context_valid = source != NULL,
+                });
+            }
         }
     } else if (supported && opcode >= 0xc0u && opcode <= 0xdfu) {
         supported = native_packet_vram_to_cpu(words, word_count);
@@ -7489,6 +8244,12 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             state.mask_set = draw.mask_set;
             state.mask_check = draw.mask_check;
             guest_render_native_stream_note_native_state(&state);
+            if (opcode == 0xe3u && gpu_native_work_environment_hook != NULL &&
+                !gpu_native_work_environment_hook(
+                    source != NULL && source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
+                    source->word_address != UINT32_MAX
+                        ? source->word_address & UINT32_C(0x001ffffc) : UINT64_MAX))
+                psx_fatal_halt("Native draw target was not accepted");
             return 1;
         }
     } else if (supported && opcode == 0x1fu) {
@@ -7499,7 +8260,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         }
     } else if (supported && opcode >= 0x40u && opcode <= 0x5fu) {
         if (bound_semantic == NULL) {
-            supported = native_packet_submit_lines(words, word_count);
+            supported = native_packet_submit_lines(words, word_count, source);
         } else if (bound_semantic->topology != GPU_RENDER_SEMANTIC_LINES) {
             supported = 0;
         } else {
@@ -7509,6 +8270,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             native_semantic_stamp_retrospective_scene(&semantic);
             render_semantic = semantic;
             render_semantic.line_count = 0u;
+            if (captured && canonical.line_count != semantic.line_count)
+                captured = false;
             for (uint8_t index = 0u; index < semantic.line_count; ++index) {
                 const GpuRenderSemanticLine *line = &semantic.lines[index];
                 const int32_t x0 = line->vertices[0].x /
@@ -7521,6 +8284,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                     (1 << GPU_RENDER_FIXED_FRACTION_BITS);
 
                 if (psx_gpu_line_oversize(x0, y0, x1, y1)) continue;
+                if (captured)
+                    canonical.lines[render_semantic.line_count] = canonical.lines[index];
                 render_semantic.lines[render_semantic.line_count++] = *line;
             }
             if (native_packet_bound_visual_valid &&
@@ -7532,14 +8297,17 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             if (render_semantic.line_count != 0u) {
                 render_status = gr_stream_barrier();
                 if (render_status == GPU_RENDER_TRANSACTION_OK) {
-                    render_semantic.submission_command_id = source != NULL
-                        ? source->word_address : 0u;
-                    gpu_note_semantic_current(&render_semantic);
+                    render_semantic.submission_command_id = source != NULL &&
+                        source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
+                        source->word_address != UINT32_MAX
+                            ? source->word_address : UINT64_MAX;
                     render_status = gr_draw_semantic_immediate(&render_semantic);
                 }
                 supported = render_status == GPU_RENDER_TRANSACTION_OK;
             }
             if (supported && render_semantic.line_count != 0u) {
+                if (captured) canonical.line_count = render_semantic.line_count;
+                gpu_note_draw_executed(captured ? &canonical : NULL, &render_semantic);
                 for (uint8_t index = 0u;
                      index < render_semantic.line_count; ++index)
                     guest_render_native_stream_note_native_line_segment();
@@ -7581,16 +8349,19 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                 opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
         }
-    if (supported) native_semantic_stamp_retrospective_scene(&semantic);
-    if (supported && semantic.triangle_count != 0u) {
+        if (supported) native_semantic_stamp_retrospective_scene(&semantic);
+        if (supported && semantic.triangle_count != 0u) {
             render_status = gr_stream_barrier();
             if (render_status == GPU_RENDER_TRANSACTION_OK) {
-                semantic.submission_command_id = source != NULL
-                    ? source->word_address : 0u;
-                gpu_note_semantic_current(&semantic);
+                semantic.submission_command_id = source != NULL &&
+                    source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
+                    source->word_address != UINT32_MAX
+                        ? source->word_address : UINT64_MAX;
                 render_status = gr_draw_semantic_immediate(&semantic);
             }
             supported = render_status == GPU_RENDER_TRANSACTION_OK;
+            if (supported)
+                gpu_note_draw_executed(captured ? &canonical : NULL, &semantic);
         }
     } else if (supported) {
         const int fixed_words = gpu_gp0_command_word_count(opcode);
@@ -7620,6 +8391,7 @@ static struct {
 } native_packet_stream;
 static void (*gpu_submission_hook)(void);
 static GpuOrderingTableSubmissionHook gpu_ordering_table_submission_hook;
+static GpuOrderingTableCompletionHook gpu_ordering_table_completion_hook;
 static void (*gpu_semantic_current_hook)(const GpuRenderSemantic *semantic);
 
 void gpu_set_submission_hook(void (*hook)(void)) {
@@ -7631,14 +8403,140 @@ void gpu_set_ordering_table_submission_hook(
     gpu_ordering_table_submission_hook = hook;
 }
 
+void gpu_set_ordering_table_completion_hook(
+        GpuOrderingTableCompletionHook hook) {
+    gpu_ordering_table_completion_hook = hook;
+}
+
 void gpu_set_semantic_current_hook(
         void (*hook)(const GpuRenderSemantic *semantic)) {
     gpu_semantic_current_hook = hook;
 }
 
-static void gpu_note_semantic_current(const GpuRenderSemantic *semantic) {
-    if (gpu_semantic_current_hook != NULL)
-        gpu_semantic_current_hook(semantic);
+void gpu_set_native_work_draw_hook(
+        bool (*hook)(const GpuRenderSemantic *semantic)) {
+    gpu_native_work_draw_hook = hook;
+}
+
+void gpu_set_native_work_environment_hook(bool (*hook)(uint64_t command_id)) {
+    gpu_native_work_environment_hook = hook;
+}
+
+void gpu_set_source_boundary_hook(void (*hook)(void)) {
+    gpu_source_boundary_hook = hook;
+    gpu_present_fail_closed = 0;
+}
+
+void gpu_set_host_quantum_boundary_hook(void (*hook)(void)) {
+    gpu_host_quantum_boundary_hook = hook;
+}
+
+void gpu_set_vram_upload_commit_hook(GpuVramRectTransferHook hook) {
+    gpu_vram_upload_commit_hook = hook;
+}
+
+void gpu_set_vram_readback_complete_hook(GpuVramReadbackCompleteHook hook) {
+    gpu_vram_readback_complete_hook = hook;
+}
+
+void gpu_set_vram_move_complete_hook(GpuVramRectTransferHook hook) {
+    gpu_vram_move_complete_hook = hook;
+}
+
+void gpu_set_vram_clear_complete_hook(GpuVramRectTransferHook hook) {
+    gpu_vram_clear_complete_hook = hook;
+}
+
+void gpu_set_vram_event_hook(GpuVramEventHook hook) {
+    gpu_vram_event_hook = hook;
+}
+
+bool gpu_note_movie_owner_start(
+        GpuMovieOwnerKind owner_kind, uint32_t callback_target) {
+    if ((owner_kind != GPU_MOVIE_OWNER_STANDALONE &&
+         owner_kind != GPU_MOVIE_OWNER_FIELD) ||
+        callback_target == 0u || movie_owner_receipt_counter == UINT64_MAX)
+        return false;
+
+    movie_owner_receipt_counter++;
+    movie_active_owner_kind = owner_kind;
+    movie_active_owner_callback_target = callback_target;
+    movie_active_owner_receipt = movie_owner_receipt_counter;
+    movie_pending_frame_reset();
+    return true;
+}
+
+bool gpu_note_movie_owner_stop(GpuMovieOwnerKind owner_kind) {
+    if (owner_kind == GPU_MOVIE_OWNER_NONE ||
+        owner_kind != movie_active_owner_kind)
+        return false;
+
+    movie_active_owner_kind = GPU_MOVIE_OWNER_NONE;
+    movie_active_owner_callback_target = 0u;
+    movie_active_owner_receipt = 0u;
+    mdec_scanout_candidate = 0;
+    movie_pending_frame_reset();
+    return true;
+}
+
+bool gpu_note_movie_frame_complete(
+        uint32_t frame_number, uint32_t callback_target) {
+    GpuDisplayInfo display;
+
+    gpu_get_display_info(&display);
+    if (movie_active_owner_kind == GPU_MOVIE_OWNER_NONE ||
+        callback_target == 0u ||
+        callback_target != movie_active_owner_callback_target ||
+        !mdec_scanout_candidate || movie_frame_complete ||
+        display.width == 0u ||
+        display.width > UINT16_MAX || display.height == 0u ||
+        display.height > UINT16_MAX)
+        return false;
+
+    movie_frame_number = frame_number;
+    movie_frame_width = (uint16_t)display.width;
+    movie_frame_height = (uint16_t)display.height;
+    movie_frame_target_y = vram_write_y;
+    movie_frame_complete = 1;
+    movie_pending_owner_kind = movie_active_owner_kind;
+    movie_pending_owner_receipt = movie_active_owner_receipt;
+    return true;
+}
+
+static void gpu_note_draw_executed(const GpuRenderSemantic *canonical,
+                                   const GpuRenderSemantic *native) {
+    /* The generic collector always receives packet_adapter geometry, never
+     * the optional authoritative binding sent to the legacy observer. */
+    if (gpu_native_work_draw_hook != NULL) {
+        GpuRenderSemantic segment;
+        const GpuRenderSemantic *draw = canonical;
+        uint8_t count = 1u;
+
+        if (canonical == NULL) {
+            psx_fatal_halt("GPU native_work packet_adapter draw decode failed");
+            return;
+        }
+        if (canonical->topology == GPU_RENDER_SEMANTIC_LINES) {
+            count = canonical->line_count;
+            if (count == 0u || count > GPU_RENDER_SEMANTIC_LINE_CAPACITY) {
+                psx_fatal_halt("GPU native_work packet_adapter invalid line count");
+                return;
+            }
+            segment = *canonical;
+            segment.line_count = 1u;
+            draw = &segment;
+        }
+        for (uint8_t index = 0u; index < count; ++index) {
+            if (draw == &segment)
+                segment.lines[0] = canonical->lines[index];
+            if (!gpu_native_work_draw_hook(draw)) {
+                psx_fatal_halt("GPU native_work packet_adapter draw capture rejected");
+                return;
+            }
+        }
+    }
+    if (native != NULL && gpu_semantic_current_hook != NULL)
+        gpu_semantic_current_hook(native);
 }
 
 void gpu_prepare_submission(void) {
@@ -7648,6 +8546,12 @@ void gpu_prepare_submission(void) {
 bool gpu_prepare_ordering_table_submission(uint32_t start_address) {
     return gpu_ordering_table_submission_hook == NULL ||
         gpu_ordering_table_submission_hook(start_address);
+}
+
+void gpu_complete_ordering_table_submission(
+        uint32_t start_address, uint32_t transferred_words) {
+    if (gpu_ordering_table_completion_hook != NULL)
+        gpu_ordering_table_completion_hook(start_address, transferred_words);
 }
 
 void gpu_native_packet_stream_reset(void) {
@@ -7792,8 +8696,23 @@ static int native_preflight_reservation_consume(
                 native_preflight_reservations.last_consume_status = 4u;
                 return 0;
             }
+            if (!native_note_uncovered_producer(&entry->identity)) {
+                native_preflight_reservations.last_consume_status = 6u;
+                return 0;
+            }
             *out_packet_fallback = true;
         } else {
+            const GuestRenderNativeDiagnosticSource source =
+                native_diagnostic_source(&entry->identity);
+            if (guest_render_native_stream_note_diagnostic_event(
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_SEMANTIC_POST_GTE_READ,
+                    &source) != GUEST_RENDER_NATIVE_STREAM_OK ||
+                guest_render_native_stream_note_diagnostic_event(
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_GTE_DERIVED,
+                    &source) != GUEST_RENDER_NATIVE_STREAM_OK) {
+                native_preflight_reservations.last_consume_status = 6u;
+                return 0;
+            }
             *out_semantic = entry->semantic;
             *out_class_bound = true;
         }
@@ -7804,8 +8723,20 @@ static int native_preflight_reservation_consume(
                 native_preflight_reservations.last_consume_status = 4u;
                 return 0;
             }
+            if (!native_note_uncovered_producer(&entry->identity)) {
+                native_preflight_reservations.last_consume_status = 6u;
+                return 0;
+            }
             *out_packet_fallback = true;
         } else {
+            const GuestRenderNativeDiagnosticSource source =
+                native_diagnostic_source(identity);
+            if (guest_render_native_stream_note_diagnostic_event(
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_CPU_CANONICAL,
+                    &source) != GUEST_RENDER_NATIVE_STREAM_OK) {
+                native_preflight_reservations.last_consume_status = 6u;
+                return 0;
+            }
             *out_semantic = entry->semantic;
             *out_class_bound = true;
         }
@@ -7869,10 +8800,15 @@ static int native_packet_stream_finish(void) {
                 &bound_semantic, &packet_fallback, &class_bound)) {
             if (!packet_fallback) bound = &bound_semantic;
         } else if (native_preflight_reservations.last_consume_status == 4u &&
-                   native_packet_fallback_is_supported(
-                       native_packet_stream.words,
-                       native_packet_stream.count,
-                       &native_preflight_reservations.environment)) {
+                   native_preflight_reservations.consumed <
+                       native_preflight_reservations.count &&
+                   native_preflight_reservations.entries[
+                       native_preflight_reservations.consumed]
+                       .packet_fallback_supported) {
+            if (!native_note_uncovered_producer(&identity)) {
+                gpu_native_preflight_reservation_abort();
+                return 0;
+            }
             reservation_fallback = true;
             packet_fallback = true;
         }
@@ -7894,6 +8830,8 @@ static int native_packet_stream_finish(void) {
     }
     if (reservation_fallback)
         gpu_native_preflight_reservation_abort();
+    native_packet_word_sources = native_packet_stream.sources;
+    native_packet_word_source_count = native_packet_stream.count;
     if (bound != NULL) {
         if (!class_bound) {
             native_packet_bound_visual_id = visual_id;
@@ -7909,6 +8847,8 @@ static int native_packet_stream_finish(void) {
             native_packet_stream.words, native_packet_stream.count,
             NULL, &native_packet_stream.source);
     }
+    native_packet_word_sources = NULL;
+    native_packet_word_source_count = 0u;
     if (result) {
         native_packet_stream.count = 0u;
         native_packet_stream.expected = 0u;
@@ -8015,6 +8955,7 @@ static void gpu_write_gp0_body(uint32_t val) {
 
     /* State: consuming pixel data for CPU→VRAM transfer */
     if (gp0_state == GP0_VRAM_WRITE) {
+        vram_write_source_note(&gp0_next_source);
         if (gpu_render_oracle.enabled) {
             oracle_source_word();
             gpu_render_oracle_hook_upload_word(&gpu_render_oracle);
@@ -8097,13 +9038,22 @@ static void gpu_write_gp0_body(uint32_t val) {
                 if (!native_packet_draw_line_segment(
                         polyline_prev_x, polyline_prev_y, polyline_color,
                         x, y, polyline_color, 0,
-                        (int)((gp0_cmd_buf[0] >> 25u) & 1u), 1))
+                        (int)((gp0_cmd_buf[0] >> 25u) & 1u), 1,
+                        &gp0_cmd_source))
                     native_stream_fail(
                         "polyline", native_stream_command.command_id,
                         GPU_RENDER_TRANSACTION_BACKEND_ERROR);
             } else {
+                GpuRenderSemantic canonical;
+                const bool capture = !gr_draw_suppression_active();
+                const bool captured = capture && gpu_native_work_decode_line(
+                    polyline_prev_x, polyline_prev_y, polyline_color,
+                    x, y, polyline_color, 0, polyline_semi_trans, 1,
+                    &gp0_cmd_source, &canonical);
                 gr_draw_line(polyline_prev_x, polyline_prev_y, x, y,
                              polyline_color);
+                if (capture)
+                    gpu_note_draw_executed(captured ? &canonical : NULL, NULL);
                 if (guest_render_native_stream_enabled() &&
                     !gr_draw_suppression_active())
                     guest_render_native_stream_note_original_draw(
@@ -8163,13 +9113,22 @@ static void gpu_write_gp0_body(uint32_t val) {
                     if (!native_packet_draw_line_segment(
                             polyline_prev_x, polyline_prev_y, polyline_prev_c,
                             x, y, polyline_color, 1,
-                            (int)((gp0_cmd_buf[0] >> 25u) & 1u), 1))
+                            (int)((gp0_cmd_buf[0] >> 25u) & 1u), 1,
+                            &gp0_cmd_source))
                         native_stream_fail(
                             "polyline", native_stream_command.command_id,
                             GPU_RENDER_TRANSACTION_BACKEND_ERROR);
                 } else {
+                    GpuRenderSemantic canonical;
+                    const bool capture = !gr_draw_suppression_active();
+                    const bool captured = capture && gpu_native_work_decode_line(
+                        polyline_prev_x, polyline_prev_y, polyline_prev_c,
+                        x, y, polyline_color, 1, polyline_semi_trans, 1,
+                        &gp0_cmd_source, &canonical);
                     gr_draw_shaded_line(polyline_prev_x, polyline_prev_y,
                                        polyline_prev_c, x, y, polyline_color);
+                    if (capture)
+                        gpu_note_draw_executed(captured ? &canonical : NULL, NULL);
                     if (guest_render_native_stream_enabled() &&
                         !gr_draw_suppression_active())
                         guest_render_native_stream_note_original_draw(
@@ -8307,7 +9266,9 @@ static int native_stream_render_generic_command(void) {
     const uint8_t opcode = native_stream_command.opcode;
     GpuNativeDrawEnvironment environment;
     GpuRenderSemantic semantic;
+    GpuRenderSemantic canonical;
     GpuRenderTransactionStatus status;
+    bool captured;
 
     if (opcode == 0x02u) {
         gp0_exec_fill_rect_native();
@@ -8333,7 +9294,7 @@ static int native_stream_render_generic_command(void) {
         return native_packet_draw_line_segment(
             x0, y0, rgb888_to_rgb555(gp0_cmd_buf[0] & 0x00ffffffu),
             x1, y1, rgb888_to_rgb555(gp0_cmd_buf[0] & 0x00ffffffu),
-            0, (int)((gp0_cmd_buf[0] >> 25u) & 1u), 0);
+            0, (int)((gp0_cmd_buf[0] >> 25u) & 1u), 0, &gp0_cmd_source);
     }
     if (opcode >= 0x50u && opcode <= 0x57u) {
         int32_t x0, y0, x1, y1;
@@ -8342,7 +9303,7 @@ static int native_stream_render_generic_command(void) {
         return native_packet_draw_line_segment(
             x0, y0, rgb888_to_rgb555(gp0_cmd_buf[0] & 0x00ffffffu),
             x1, y1, rgb888_to_rgb555(gp0_cmd_buf[2] & 0x00ffffffu),
-            1, (int)((gp0_cmd_buf[0] >> 25u) & 1u), 0);
+            1, (int)((gp0_cmd_buf[0] >> 25u) & 1u), 0, &gp0_cmd_source);
     }
 
     /* Variable-length polylines render their segments as their payload arrives
@@ -8355,23 +9316,67 @@ static int native_stream_render_generic_command(void) {
     if (gpu_native_semantic_from_gp0(
             gp0_cmd_buf, gp0_words_collected, &environment, &semantic) != 1)
         return 0;
+    captured = gpu_native_work_decode(
+        gp0_cmd_buf, (size_t)gp0_words_collected, &environment,
+        &gp0_cmd_source, &canonical);
     status = gr_stream_barrier();
     if (status == GPU_RENDER_TRANSACTION_OK) {
         semantic.submission_command_id = native_stream_command.command_id;
-        gpu_note_semantic_current(&semantic);
         status = gr_draw_semantic_immediate(&semantic);
     }
+    if (status == GPU_RENDER_TRANSACTION_OK)
+        gpu_note_draw_executed(captured ? &canonical : NULL, &semantic);
     return status == GPU_RENDER_TRANSACTION_OK;
 }
 
 static int native_stream_finish_command(void) {
     GpuRenderTransactionStatus render_status;
+    GpuNativeDrawEnvironment environment;
+    GpuRenderSemantic canonical;
+    bool captured;
     uint32_t texture_window;
 
     if (!native_stream_command.active || gp0_state != GP0_IDLE) return 1;
     if (native_stream_command.generic) {
+        const GuestRenderNativeDiagnosticSource source = {
+            .valid_fields =
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_COMMAND_ID |
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE,
+            .command_id = native_stream_command.command_id,
+            .opcode = native_stream_command.opcode,
+        };
         int rendered;
 
+        if (native_stream_command.command_id <= UINT32_MAX) {
+            GuestRenderNativeDiagnosticSource attributed_source = source;
+            attributed_source.valid_fields |=
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_ADDRESS;
+            attributed_source.source_word_address =
+                (uint32_t)native_stream_command.command_id;
+            if (guest_render_native_stream_enabled() &&
+                guest_render_native_stream_note_diagnostic_event(
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER,
+                    &attributed_source) != GUEST_RENDER_NATIVE_STREAM_OK) {
+                native_stream_fail(
+                    "generic producer diagnostic",
+                    native_stream_command.command_id,
+                    GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+                native_stream_command.active = 0;
+                native_stream_command.generic = 0;
+                return 0;
+            }
+        } else if (guest_render_native_stream_enabled() &&
+                   guest_render_native_stream_note_diagnostic_event(
+                       GUEST_RENDER_NATIVE_DIAGNOSTIC_UNCOVERED_PRODUCER,
+                       &source) != GUEST_RENDER_NATIVE_STREAM_OK) {
+            native_stream_fail(
+                "generic producer diagnostic",
+                native_stream_command.command_id,
+                GUEST_RENDER_NATIVE_STREAM_COUNTER_OVERFLOW);
+            native_stream_command.active = 0;
+            native_stream_command.generic = 0;
+            return 0;
+        }
         native_stream_command.replaying = 0;
         rendered = native_stream_render_generic_command();
         if (!rendered) {
@@ -8386,11 +9391,14 @@ static int native_stream_finish_command(void) {
         native_stream_command.opcode = 0;
         return 1;
     }
+    gpu_native_environment_get(&environment);
+    captured = gpu_native_work_decode(
+        gp0_cmd_buf, (size_t)gp0_words_collected, &environment,
+        &gp0_cmd_source, &canonical);
     render_status = gr_stream_barrier();
     if (render_status == GPU_RENDER_TRANSACTION_OK) {
         native_stream_command.semantic.submission_command_id =
             native_stream_command.command_id;
-        gpu_note_semantic_current(&native_stream_command.semantic);
         render_status = gr_draw_semantic_immediate(
             &native_stream_command.semantic);
     }
@@ -8400,6 +9408,8 @@ static int native_stream_finish_command(void) {
         native_stream_command.active = 0;
         return 0;
     }
+    gpu_note_draw_executed(captured ? &canonical : NULL,
+                           &native_stream_command.semantic);
 
     /* Semantic draws carry their own material. Restore the persistent GP0
      * environment expected by the next command without replaying any pixels. */
@@ -8484,6 +9494,7 @@ static void gp1_reset_command_buffer(void) {
     gp0_words_collected = 0;
     gp0_words_needed = 0;
     vram_write_remaining = 0;
+    vram_write_source_reset();
 }
 
 static void gp1_ack_irq1(void) {
@@ -8643,7 +9654,21 @@ void gpu_write_gp1(uint32_t val) {
         case 0x1C: case 0x1D: case 0x1E: case 0x1F:
             gp1_get_info(val); break;
         default: {
+            const GuestRenderNativeDiagnosticSource source = {
+                .valid_fields =
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_PC |
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_FUNCTION |
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_RETURN_ADDRESS |
+                    GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE,
+                .pc = g_debug_last_store_pc,
+                .function = g_debug_current_func_addr,
+                .return_address = debug_guest_ra(),
+                .opcode = (uint8_t)cmd,
+            };
             static char reason[96];
+            (void)guest_render_native_stream_note_diagnostic_event(
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_UNKNOWN_GP1_COMMAND,
+                &source);
             snprintf(reason, sizeof(reason),
                      "GPU GP1 unknown command 0x%02X (word 0x%08X)", cmd, val);
             psx_fatal_halt(reason);
@@ -8675,6 +9700,15 @@ void gpu_write_gp1(uint32_t val) {
     X(polyline_semi_trans) X(polyline_has_prev) \
     X(vram_write_x) X(vram_write_y) X(vram_write_w) X(vram_write_h) \
     X(vram_write_col) X(vram_write_row) X(vram_write_remaining) \
+    X(vram_write_source_receipt) X(vram_write_source_format) \
+    X(vram_write_source_words) X(vram_write_source_valid) \
+    X(mdec_scanout_candidate) \
+    X(movie_frame_number) X(movie_frame_width) X(movie_frame_height) \
+    X(movie_frame_target_y) \
+    X(movie_frame_complete) X(movie_pending_owner_kind) \
+    X(movie_pending_owner_receipt) \
+    X(movie_active_owner_kind) X(movie_active_owner_callback_target) \
+    X(movie_active_owner_receipt) X(movie_owner_receipt_counter) \
     X(vram_read_active) X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h) \
     X(vram_read_col) X(vram_read_row)
 #define GPU_COSIM_SNAP_FIELDS(X) \
@@ -8695,6 +9729,15 @@ void gpu_write_gp1(uint32_t val) {
     X(polyline_semi_trans) X(polyline_has_prev) \
     X(vram_write_x) X(vram_write_y) X(vram_write_w) X(vram_write_h) \
     X(vram_write_col) X(vram_write_row) X(vram_write_remaining) \
+    X(vram_write_source_receipt) X(vram_write_source_format) \
+    X(vram_write_source_words) X(vram_write_source_valid) \
+    X(mdec_scanout_candidate) \
+    X(movie_frame_number) X(movie_frame_width) X(movie_frame_height) \
+    X(movie_frame_target_y) \
+    X(movie_frame_complete) X(movie_pending_owner_kind) \
+    X(movie_pending_owner_receipt) \
+    X(movie_active_owner_kind) X(movie_active_owner_callback_target) \
+    X(movie_active_owner_receipt) X(movie_owner_receipt_counter) \
     X(vram_read_active) X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h) \
     X(vram_read_col) X(vram_read_row)
 #include "pst_wire.h"
@@ -8704,6 +9747,7 @@ static int gpu_snap_emit(PstW *w) {
 #define WU(f) do { if (!pst_w_u32(w, (uint32_t)(f))) return 0; } while (0)
 #define WI(f) do { if (!pst_w_i32(w, (int32_t)(f))) return 0; } while (0)
 #define WH(f) do { if (!pst_w_u16(w, (uint16_t)(f))) return 0; } while (0)
+#define WQ(f) do { if (!pst_w_u64(w, (uint64_t)(f))) return 0; } while (0)
     WU(texpage_x); WU(texpage_y); WU(semi_transparency); WU(texpage_colors);
     WU(dither_enabled); WU(draw_to_display); WU(texture_disable); WU(texture_window_value);
     WU(set_mask_bit); WU(check_mask_bit);
@@ -8723,20 +9767,78 @@ static int gpu_snap_emit(PstW *w) {
     WI(polyline_semi_trans); WI(polyline_has_prev);
     WH(vram_write_x); WH(vram_write_y); WH(vram_write_w); WH(vram_write_h);
     WH(vram_write_col); WH(vram_write_row); WU(vram_write_remaining);
+    WQ(vram_write_source_receipt); WU(vram_write_source_format);
+    WU(vram_write_source_words); WI(vram_write_source_valid);
+    WI(mdec_scanout_candidate);
+    WU(movie_frame_number); WH(movie_frame_width); WH(movie_frame_height);
+    WI(movie_frame_complete);
+    WU(movie_pending_owner_kind); WQ(movie_pending_owner_receipt);
+    WU(movie_active_owner_kind); WU(movie_active_owner_callback_target);
+    WQ(movie_active_owner_receipt); WQ(movie_owner_receipt_counter);
     WI(vram_read_active); WH(vram_read_x); WH(vram_read_y); WH(vram_read_w); WH(vram_read_h);
     WH(vram_read_col); WH(vram_read_row);
+    WQ(vram_read_pixel_count); WQ(vram_read_content_digest);
     /* Depth24 present helpers (MotK FMV) — must resume with upload span. */
     WU(s_d24_upload_x1); WI(s_d24_present_hold); WU(s_d24_prev_disp_h);
+    WH(movie_frame_target_y);
 #undef WU
 #undef WI
 #undef WH
+#undef WQ
     return 1;
 }
-static int gpu_snap_parse(PstR *r) {
-    uint32_t u; int32_t i; uint16_t h;
-#define RU(f) do { if (!pst_r_u32(r, &u)) return 0; (f) = u; } while (0)
-#define RI(f) do { if (!pst_r_i32(r, &i)) return 0; (f) = i; } while (0)
-#define RH(f) do { if (!pst_r_u16(r, &h)) return 0; (f) = h; } while (0)
+#define GPU_SNAPSHOT_U32_FIELDS(X) \
+    X(texpage_x) X(texpage_y) X(semi_transparency) X(texpage_colors) \
+    X(dither_enabled) X(draw_to_display) X(texture_disable) X(texture_window_value) \
+    X(set_mask_bit) X(check_mask_bit) X(interlace_field) X(reverse_flag) \
+    X(draw_area_left) X(draw_area_top) X(draw_area_right) X(draw_area_bottom) \
+    X(hres1) X(hres2) X(vres) X(video_mode) X(display_depth) X(vertical_interlace) \
+    X(display_disabled) X(irq1_flag) X(dma_direction) X(lcf) \
+    X(display_area_x) X(display_area_y) \
+    X(h_display_x1) X(h_display_x2) X(v_display_y1) X(v_display_y2) \
+    X(gpuread_latch) X(gp0_next_source_addr) X(gp0_cmd_source_addr) \
+    X(vram_write_remaining) X(vram_write_source_format) \
+    X(vram_write_source_words) X(movie_frame_number) \
+    X(movie_pending_owner_kind) X(movie_active_owner_kind) \
+    X(movie_active_owner_callback_target) X(s_d24_upload_x1) X(s_d24_prev_disp_h)
+#define GPU_SNAPSHOT_I32_FIELDS(X) \
+    X(draw_offset_x) X(draw_offset_y) X(gp0_words_collected) X(gp0_words_needed) \
+    X(polyline_prev_x) X(polyline_prev_y) X(polyline_semi_trans) \
+    X(polyline_has_prev) X(vram_write_source_valid) X(mdec_scanout_candidate) \
+    X(movie_frame_complete) X(vram_read_active) X(s_d24_present_hold)
+#define GPU_SNAPSHOT_U16_FIELDS(X) \
+    X(polyline_color) X(polyline_prev_c) \
+    X(vram_write_x) X(vram_write_y) X(vram_write_w) X(vram_write_h) \
+    X(vram_write_col) X(vram_write_row) X(movie_frame_width) X(movie_frame_height) \
+    X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h) \
+    X(vram_read_col) X(vram_read_row) X(movie_frame_target_y)
+#define GPU_SNAPSHOT_U64_FIELDS(X) \
+    X(vram_write_source_receipt) X(movie_pending_owner_receipt) \
+    X(movie_active_owner_receipt) X(movie_owner_receipt_counter) \
+    X(vram_read_pixel_count) X(vram_read_content_digest)
+
+typedef struct GpuSnapshotState {
+#define DECL_U32(f) uint32_t f;
+#define DECL_I32(f) int32_t f;
+#define DECL_U16(f) uint16_t f;
+#define DECL_U64(f) uint64_t f;
+    GPU_SNAPSHOT_U32_FIELDS(DECL_U32)
+    GPU_SNAPSHOT_I32_FIELDS(DECL_I32)
+    GPU_SNAPSHOT_U16_FIELDS(DECL_U16)
+    GPU_SNAPSHOT_U64_FIELDS(DECL_U64)
+#undef DECL_U32
+#undef DECL_I32
+#undef DECL_U16
+#undef DECL_U64
+    uint32_t gp0_state;
+    uint32_t gp0_cmd_buf[16];
+} GpuSnapshotState;
+
+static int gpu_snap_parse(PstR *r, GpuSnapshotState *out) {
+#define RU(f) do { if (!pst_r_u32(r, &out->f)) return 0; } while (0)
+#define RI(f) do { if (!pst_r_i32(r, &out->f)) return 0; } while (0)
+#define RH(f) do { if (!pst_r_u16(r, &out->f)) return 0; } while (0)
+#define RQ(f) do { if (!pst_r_u64(r, &out->f)) return 0; } while (0)
     RU(texpage_x); RU(texpage_y); RU(semi_transparency); RU(texpage_colors);
     RU(dither_enabled); RU(draw_to_display); RU(texture_disable); RU(texture_window_value);
     RU(set_mask_bit); RU(check_mask_bit);
@@ -8747,9 +9849,7 @@ static int gpu_snap_parse(PstR *r) {
     RU(display_disabled); RU(irq1_flag); RU(dma_direction); RU(lcf);
     RU(display_area_x); RU(display_area_y);
     RU(h_display_x1); RU(h_display_x2); RU(v_display_y1); RU(v_display_y2);
-    RU(gpuread_latch);
-    if (!pst_r_u32(r, &u)) return 0;
-    gp0_state = (Gp0State)u;
+    RU(gpuread_latch); RU(gp0_state);
     for (int k = 0; k < 16; k++) RU(gp0_cmd_buf[k]);
     RI(gp0_words_collected); RI(gp0_words_needed);
     RU(gp0_next_source_addr); RU(gp0_cmd_source_addr);
@@ -8757,13 +9857,185 @@ static int gpu_snap_parse(PstR *r) {
     RI(polyline_semi_trans); RI(polyline_has_prev);
     RH(vram_write_x); RH(vram_write_y); RH(vram_write_w); RH(vram_write_h);
     RH(vram_write_col); RH(vram_write_row); RU(vram_write_remaining);
+    RQ(vram_write_source_receipt); RU(vram_write_source_format);
+    RU(vram_write_source_words); RI(vram_write_source_valid);
+    RI(mdec_scanout_candidate);
+    RU(movie_frame_number); RH(movie_frame_width); RH(movie_frame_height);
+    RI(movie_frame_complete);
+    RU(movie_pending_owner_kind); RQ(movie_pending_owner_receipt);
+    RU(movie_active_owner_kind); RU(movie_active_owner_callback_target);
+    RQ(movie_active_owner_receipt); RQ(movie_owner_receipt_counter);
     RI(vram_read_active); RH(vram_read_x); RH(vram_read_y); RH(vram_read_w); RH(vram_read_h);
     RH(vram_read_col); RH(vram_read_row);
+    RQ(vram_read_pixel_count); RQ(vram_read_content_digest);
     RU(s_d24_upload_x1); RI(s_d24_present_hold); RU(s_d24_prev_disp_h);
+    RH(movie_frame_target_y);
 #undef RU
 #undef RI
 #undef RH
+#undef RQ
     return 1;
+}
+
+static int gpu_snap_validate(const GpuSnapshotState *s) {
+    const int command_capacity =
+        (int)(sizeof(s->gp0_cmd_buf) / sizeof(s->gp0_cmd_buf[0]));
+    const uint8_t opcode = (uint8_t)(s->gp0_cmd_buf[0] >> 24u);
+    const uint32_t mdec_format_max = 3u;
+
+    if (s->gp0_state > (uint32_t)GP0_POLYLINE_SHADED ||
+        s->gp0_words_collected < 0 ||
+        s->gp0_words_collected > command_capacity ||
+        s->gp0_words_needed < 0 || s->gp0_words_needed > command_capacity ||
+        (s->vram_write_source_valid != 0 &&
+         s->vram_write_source_valid != 1) ||
+        (s->mdec_scanout_candidate != 0 &&
+         s->mdec_scanout_candidate != 1) ||
+        (s->movie_frame_complete != 0 && s->movie_frame_complete != 1) ||
+        s->movie_pending_owner_kind > (uint32_t)GPU_MOVIE_OWNER_FIELD ||
+        s->movie_active_owner_kind > (uint32_t)GPU_MOVIE_OWNER_FIELD)
+        return 0;
+
+    switch ((Gp0State)s->gp0_state) {
+        case GP0_IDLE:
+            break;
+        case GP0_COLLECTING:
+            if (s->gp0_words_collected < 1 ||
+                s->gp0_words_collected >= s->gp0_words_needed ||
+                gpu_gp0_command_word_count(opcode) != s->gp0_words_needed)
+                return 0;
+            break;
+        case GP0_VRAM_WRITE: {
+            uint64_t pixels;
+            uint64_t cursor;
+            uint64_t words;
+
+            if (opcode < 0xa0u || opcode > 0xbfu ||
+                s->gp0_words_collected != 3 || s->gp0_words_needed != 3 ||
+                s->vram_write_x >= 1024u || s->vram_write_y >= 512u ||
+                s->vram_write_w == 0u || s->vram_write_w > 1024u ||
+                s->vram_write_h == 0u || s->vram_write_h > 512u ||
+                s->vram_write_col >= s->vram_write_w ||
+                s->vram_write_row >= s->vram_write_h)
+                return 0;
+            pixels = (uint64_t)s->vram_write_w * s->vram_write_h;
+            cursor = (uint64_t)s->vram_write_row * s->vram_write_w +
+                     s->vram_write_col;
+            words = (pixels + 1u) / 2u;
+            if (cursor >= pixels || (cursor & 1u) != 0u ||
+                s->vram_write_remaining == 0u ||
+                s->vram_write_remaining != (pixels - cursor + 1u) / 2u ||
+                s->vram_write_source_words !=
+                    words - s->vram_write_remaining)
+                return 0;
+            if (s->vram_write_source_words == 0u) {
+                if (!s->vram_write_source_valid ||
+                    s->vram_write_source_receipt != 0u ||
+                    s->vram_write_source_format != 0u)
+                    return 0;
+            } else if ((s->vram_write_source_valid &&
+                        s->vram_write_source_receipt == 0u) ||
+                       (!s->vram_write_source_valid &&
+                        s->vram_write_source_receipt != 0u &&
+                        s->vram_write_source_words < 2u) ||
+                       (s->vram_write_source_receipt == 0u &&
+                        s->vram_write_source_format != 0u) ||
+                       (s->vram_write_source_receipt != 0u &&
+                        s->vram_write_source_format > mdec_format_max)) {
+                /* Once a word loses MDEC provenance, `valid` remains false.
+                 * The receipt/format may therefore be either empty (the first
+                 * word failed) or the coherent MDEC pair retained from an
+                 * earlier word. Both states are produced by the live A0 path. */
+                return 0;
+            }
+            break;
+        }
+        case GP0_POLYLINE_MONO:
+            if (opcode < 0x48u || opcode > 0x4fu ||
+                s->gp0_words_collected < 1 ||
+                s->polyline_has_prev < 0 || s->polyline_has_prev > 1)
+                return 0;
+            break;
+        case GP0_POLYLINE_SHADED:
+            if (opcode < 0x58u || opcode > 0x5fu ||
+                s->gp0_words_collected < 1 ||
+                s->polyline_has_prev < 0 || s->polyline_has_prev > 2)
+                return 0;
+            break;
+    }
+
+    if (s->gp0_state != (uint32_t)GP0_VRAM_WRITE &&
+        (!s->vram_write_source_valid ||
+         s->vram_write_source_receipt != 0u ||
+         s->vram_write_source_format != 0u ||
+         s->vram_write_source_words != 0u))
+        return 0;
+
+    if (s->movie_active_owner_kind == (uint32_t)GPU_MOVIE_OWNER_NONE) {
+        /* Stopping an owner preserves the monotonically increasing counter,
+         * but clears the active callback and receipt. */
+        if (s->movie_active_owner_callback_target != 0u ||
+            s->movie_active_owner_receipt != 0u)
+            return 0;
+    } else if (s->movie_active_owner_callback_target == 0u ||
+               s->movie_active_owner_receipt == 0u ||
+               s->movie_active_owner_receipt !=
+                   s->movie_owner_receipt_counter) {
+        return 0;
+    }
+
+    if (!s->movie_frame_complete) {
+        if (s->movie_frame_number != 0u || s->movie_frame_width != 0u ||
+            s->movie_frame_height != 0u || s->movie_frame_target_y != 0u ||
+            s->movie_pending_owner_kind !=
+                (uint32_t)GPU_MOVIE_OWNER_NONE ||
+            s->movie_pending_owner_receipt != 0u)
+            return 0;
+    } else if (!s->mdec_scanout_candidate ||
+               s->movie_frame_width == 0u || s->movie_frame_height == 0u ||
+               s->movie_frame_target_y >= 512u ||
+               s->movie_active_owner_kind ==
+                   (uint32_t)GPU_MOVIE_OWNER_NONE ||
+               s->movie_pending_owner_kind !=
+                   s->movie_active_owner_kind ||
+               s->movie_pending_owner_receipt == 0u ||
+               s->movie_pending_owner_receipt !=
+                   s->movie_active_owner_receipt) {
+        return 0;
+    }
+
+    if (s->vram_read_pixel_count > SIZE_MAX ||
+        (s->vram_read_active != 0 && s->vram_read_active != 1))
+        return 0;
+    if (s->vram_read_active) {
+        uint64_t pixels;
+        uint64_t cursor;
+
+        if (s->vram_read_x >= 1024u || s->vram_read_y >= 512u ||
+            s->vram_read_w == 0u || s->vram_read_w > 1024u ||
+            s->vram_read_h == 0u || s->vram_read_h > 512u ||
+            s->vram_read_col >= s->vram_read_w ||
+            s->vram_read_row >= s->vram_read_h)
+            return 0;
+        pixels = (uint64_t)s->vram_read_w * s->vram_read_h;
+        cursor = (uint64_t)s->vram_read_row * s->vram_read_w +
+                 s->vram_read_col;
+        if (cursor >= pixels || (cursor & 1u) != 0u ||
+            s->vram_read_pixel_count != cursor)
+            return 0;
+    }
+    return 1;
+}
+
+static void gpu_snap_commit(const GpuSnapshotState *s) {
+#define COMMIT(f) f = s->f;
+    GPU_SNAPSHOT_U32_FIELDS(COMMIT)
+    GPU_SNAPSHOT_I32_FIELDS(COMMIT)
+    GPU_SNAPSHOT_U16_FIELDS(COMMIT)
+    GPU_SNAPSHOT_U64_FIELDS(COMMIT)
+#undef COMMIT
+    gp0_state = (Gp0State)s->gp0_state;
+    memcpy(gp0_cmd_buf, s->gp0_cmd_buf, sizeof(gp0_cmd_buf));
 }
 
 uint32_t gpu_snapshot_bytes(void) {
@@ -8811,6 +10083,15 @@ void gpu_cosim_dump(char *out, int cap) {
     X(polyline_semi_trans) X(polyline_has_prev)
     X(vram_write_x) X(vram_write_y) X(vram_write_w) X(vram_write_h)
     X(vram_write_col) X(vram_write_row) X(vram_write_remaining)
+    X(vram_write_source_receipt) X(vram_write_source_format)
+    X(vram_write_source_words) X(vram_write_source_valid)
+    X(mdec_scanout_candidate)
+    X(movie_frame_number) X(movie_frame_width) X(movie_frame_height)
+    X(movie_frame_target_y)
+    X(movie_frame_complete) X(movie_pending_owner_kind)
+    X(movie_pending_owner_receipt)
+    X(movie_active_owner_kind) X(movie_active_owner_callback_target)
+    X(movie_active_owner_receipt) X(movie_owner_receipt_counter)
     X(vram_read_active) X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h)
     X(vram_read_col) X(vram_read_row)
 #undef X
@@ -8819,9 +10100,13 @@ void gpu_cosim_dump(char *out, int cap) {
 }
 int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     PstR r;
-    if (len != gpu_snapshot_bytes()) return 0;
+    GpuSnapshotState snapshot;
+    if (!p || len != gpu_snapshot_bytes()) return 0;
     pst_r_init(&r, p, len);
-    if (!gpu_snap_parse(&r)) return 0;
+    if (!gpu_snap_parse(&r, &snapshot) || r.p != r.end ||
+        !gpu_snap_validate(&snapshot))
+        return 0;
+    gpu_snap_commit(&snapshot);
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on a stale draw area after savestate load. */
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
@@ -8830,6 +10115,10 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     ws_nw_sync_target();
     return 1;
 }
+#undef GPU_SNAPSHOT_U32_FIELDS
+#undef GPU_SNAPSHOT_I32_FIELDS
+#undef GPU_SNAPSHOT_U16_FIELDS
+#undef GPU_SNAPSHOT_U64_FIELDS
 uint16_t* gpu_get_vram_ptr(void){ return vram; }
 uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }
 

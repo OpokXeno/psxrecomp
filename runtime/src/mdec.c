@@ -1107,6 +1107,10 @@ int mdec_dma_read_ready(void) {
     return mdec.output_pos < mdec.output_size;
 }
 
+uint32_t mdec_dma_output_depth(void) {
+    return mdec.output_depth;
+}
+
 void mdec_debug_get_state(MDECDebugState *out) {
     if (!out) return;
     out->command = mdec.command;

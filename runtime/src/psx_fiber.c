@@ -17,7 +17,7 @@ psx_fiber_t psx_fiber_convert_thread(void)
      * can return an unspecified TEB value that isn't the sentinel, causing
      * the sentinel check to silently skip ConvertThreadToFiber, leaving
      * the thread as a non-fiber, and crashing the first SwitchToFiber. */
-    void* fib = ConvertThreadToFiber(NULL);
+    void* fib = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
     if (!fib && GetLastError() == ERROR_ALREADY_FIBER)
         fib = GetCurrentFiber();
     return (psx_fiber_t)fib;
@@ -27,7 +27,8 @@ psx_fiber_t psx_fiber_current(void)      { return (psx_fiber_t)GetCurrentFiber()
 
 psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg)
 {
-    return (psx_fiber_t)CreateFiber((SIZE_T)stack_size,
+    return (psx_fiber_t)CreateFiberEx(0, (SIZE_T)stack_size,
+                                    FIBER_FLAG_FLOAT_SWITCH,
                                     (LPFIBER_START_ROUTINE)entry, arg);
 }
 
@@ -66,8 +67,7 @@ typedef struct psx_fiber_impl {
     void*           arg;
 } psx_fiber_impl;
 
-/* Cooperative + single-threaded, so a plain static tracks who's running. */
-static psx_fiber_impl* s_current = NULL;
+static _Thread_local psx_fiber_impl* s_current = NULL;
 
 /* makecontext only passes ints; split the fiber pointer across two. */
 static void psx_fiber_trampoline(unsigned int hi, unsigned int lo)
@@ -84,6 +84,7 @@ psx_fiber_t psx_fiber_convert_thread(void)
 {
     if (!s_current) {
         psx_fiber_impl* f = (psx_fiber_impl*)calloc(1, sizeof(*f));
+        if (!f) return NULL;
         f->stack = NULL;       /* runs on the real thread stack */
         s_current = f;
     }
@@ -115,9 +116,10 @@ void psx_fiber_switch(psx_fiber_t target)
 {
     psx_fiber_impl* to   = (psx_fiber_impl*)target;
     psx_fiber_impl* from = s_current;
-    if (!to || to == from) return;
+    if (!to || !from) abort();
+    if (to == from) return;
     s_current = to;
-    swapcontext(&from->ctx, &to->ctx);
+    if (swapcontext(&from->ctx, &to->ctx) != 0) abort();
     /* Resumed: s_current was set back to `from` by whoever switched here. */
 }
 

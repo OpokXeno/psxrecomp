@@ -7,7 +7,14 @@
 #include "ram_provenance.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Compile the productive shared resolver and its real GPU environment into
+ * this synthetic fixture so line diagnostics are exercised through the same
+ * resolver -> decoder wiring used by the native renderer. */
+#include "../../../native_renderer/src/infrastructure/xg_render_shared_packet_resolver.c"
+#include "../../../native_renderer/src/infrastructure/xg_render_shared_packet_gpu_environment.c"
 
 #ifndef GPU_RENDER_ORACLE_SOURCE_CONTRACT
 typedef struct {
@@ -23,9 +30,11 @@ GpuRenderOracleResult gpu_render_oracle_capture_snapshot(GpuRenderOracleSnapshot
 GpuRenderOracleResult gpu_render_oracle_capture_read_event(uint64_t index,
                                                             GpuRenderOracleEvent *out);
 extern void psx_write_word(uint32_t address, uint32_t value);
+extern uint32_t psx_read_word(uint32_t address);
 extern void test_gte_native_provenance_clear(void);
 extern void test_gte_native_provenance_seed(uint32_t address, uint32_t packed,
-                                            uint64_t receipt);
+                                             uint64_t receipt);
+extern void gpu_vblank_fail_closed_present(void);
 
 void psx_xg_render_auth_note_code_write(uint64_t previous_generation,
                                         uint64_t next_generation,
@@ -102,6 +111,125 @@ typedef enum {
 
 static int require(int condition) { return condition; }
 #define REQUIRE(condition) do { if (!require(condition)) return 0; } while (0)
+
+typedef struct CapturedRectTransfer {
+    uint16_t x, y, width, height;
+    uint16_t pixels[32];
+    size_t pixel_count;
+    uint64_t content_digest;
+    uint32_t calls;
+} CapturedRectTransfer;
+
+static CapturedRectTransfer upload_commit;
+static CapturedRectTransfer readback_complete;
+static CapturedRectTransfer move_complete;
+static CapturedRectTransfer clear_complete;
+static uint16_t pending_upload_target[1024u * 512u];
+static GpuVramEvent vram_events[10];
+static uint16_t vram_event_pixels[10][32];
+static size_t vram_event_count;
+static int vram_event_serial_mismatch;
+static int rejected_source_boundary_calls;
+static int rejected_vram_event_calls;
+static int frontend_present_calls;
+
+static void reject_source_boundary(void) {
+    rejected_source_boundary_calls++;
+    gpu_vblank_fail_closed_present();
+}
+
+static void accept_source_boundary(void) {
+    rejected_source_boundary_calls++;
+}
+
+static void reject_vram_event(const GpuVramEvent *event) {
+    (void)event;
+    rejected_vram_event_calls++;
+    gpu_vblank_fail_closed_present();
+}
+
+static void count_frontend_present(void) {
+    frontend_present_calls++;
+}
+
+static void capture_vram_event(const GpuVramEvent *event) {
+    size_t index;
+    if (event == NULL || vram_event_count >= 10u) return;
+    index = vram_event_count++;
+    vram_events[index] = *event;
+    if (event->mutation_serial != gpu_render_vram_mutation_serial())
+        vram_event_serial_mismatch = 1;
+    if (event->pixels != NULL && event->pixel_count <= 32u) {
+        memcpy(vram_event_pixels[index], event->pixels,
+               event->pixel_count * sizeof(*event->pixels));
+        vram_events[index].pixels = vram_event_pixels[index];
+    }
+}
+
+static void capture_upload_commit(
+        uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+        const uint16_t *pixels, size_t pixel_count) {
+    upload_commit.x = x;
+    upload_commit.y = y;
+    upload_commit.width = width;
+    upload_commit.height = height;
+    upload_commit.pixel_count = pixel_count;
+    upload_commit.calls++;
+    if (pixel_count <= sizeof(upload_commit.pixels) /
+            sizeof(upload_commit.pixels[0]))
+        memcpy(upload_commit.pixels, pixels, pixel_count * sizeof(*pixels));
+}
+
+static void capture_readback_complete(
+        uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+        size_t pixel_count, uint64_t content_digest) {
+    readback_complete.x = x;
+    readback_complete.y = y;
+    readback_complete.width = width;
+    readback_complete.height = height;
+    readback_complete.pixel_count = pixel_count;
+    readback_complete.content_digest = content_digest;
+    readback_complete.calls++;
+}
+
+static uint64_t digest_pixels(const uint16_t *pixels, size_t pixel_count) {
+    uint64_t digest = UINT64_C(1469598103934665603);
+    for (size_t index = 0u; index < pixel_count; ++index) {
+        digest ^= (uint8_t)pixels[index];
+        digest *= UINT64_C(1099511628211);
+        digest ^= (uint8_t)(pixels[index] >> 8u);
+        digest *= UINT64_C(1099511628211);
+    }
+    return digest;
+}
+
+static void capture_rect_transfer(
+        CapturedRectTransfer *capture,
+        uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+        const uint16_t *pixels, size_t pixel_count) {
+    capture->x = x;
+    capture->y = y;
+    capture->width = width;
+    capture->height = height;
+    capture->pixel_count = pixel_count;
+    capture->calls++;
+    if (pixel_count <= sizeof(capture->pixels) / sizeof(capture->pixels[0]))
+        memcpy(capture->pixels, pixels, pixel_count * sizeof(*pixels));
+}
+
+static void capture_move_complete(
+        uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+        const uint16_t *pixels, size_t pixel_count) {
+    capture_rect_transfer(&move_complete, x, y, width, height,
+                          pixels, pixel_count);
+}
+
+static void capture_clear_complete(
+        uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+        const uint16_t *pixels, size_t pixel_count) {
+    capture_rect_transfer(&clear_complete, x, y, width, height,
+                          pixels, pixel_count);
+}
 
 static uint32_t xy(uint32_t x, uint32_t y) { return x | (y << 16); }
 
@@ -688,6 +816,12 @@ static int test_native_non_draw_commands_preserve_gp0_semantics(void) {
     const uint64_t gp0_before = gpu_get_gp0_count();
 
     gpu_init();
+    memset(&upload_commit, 0, sizeof(upload_commit));
+    memset(&move_complete, 0, sizeof(move_complete));
+    memset(&clear_complete, 0, sizeof(clear_complete));
+    gpu_set_vram_upload_commit_hook(capture_upload_commit);
+    gpu_set_vram_move_complete_hook(capture_move_complete);
+    gpu_set_vram_clear_complete_hook(capture_clear_complete);
     guest_render_native_stream_set_enabled(true);
     REQUIRE(guest_render_native_stream_snapshot(&before) ==
             GUEST_RENDER_NATIVE_STREAM_OK);
@@ -728,12 +862,37 @@ static int test_native_non_draw_commands_preserve_gp0_semantics(void) {
     REQUIRE(gpu_vram_peek(0, 511) == UINT16_C(0x2222));
     REQUIRE(gpu_vram_peek(1023, 0) == UINT16_C(0x3333));
     REQUIRE(gpu_vram_peek(0, 0) == UINT16_C(0x4444));
-    REQUIRE(gpu_get_gp0_count() - gp0_before == 7u);
+    REQUIRE(upload_commit.calls == 1u && upload_commit.pixel_count == 4u);
+    REQUIRE(upload_commit.pixels[0] == UINT16_C(0x1111));
+    REQUIRE(upload_commit.pixels[3] == UINT16_C(0x4444));
+
+    REQUIRE(submit_native_word(UINT32_C(0x80000000), UINT32_C(0x00001418),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(submit_native_word(xy(1023u, 511u), UINT32_C(0x0000141c),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(submit_native_word(xy(20u, 20u), UINT32_C(0x00001420),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(submit_native_word(xy(2u, 2u), UINT32_C(0x00001424),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(move_complete.calls == 1u && move_complete.pixel_count == 4u);
+    REQUIRE(move_complete.pixels[0] == UINT16_C(0x1111));
+    REQUIRE(move_complete.pixels[3] == UINT16_C(0x4444));
+
+    REQUIRE(submit_native_word(UINT32_C(0x020000ff), UINT32_C(0x00001428),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(submit_native_word(xy(32u, 32u), UINT32_C(0x0000142c),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(submit_native_word(xy(1u, 1u), UINT32_C(0x00001430),
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, UINT32_C(0x00001400)));
+    REQUIRE(clear_complete.calls == 1u && clear_complete.pixel_count == 16u);
+    REQUIRE(clear_complete.pixels[0] == UINT16_C(0x001f));
+    REQUIRE(clear_complete.pixels[15] == UINT16_C(0x001f));
+    REQUIRE(gpu_get_gp0_count() - gp0_before == 14u);
     REQUIRE(guest_render_native_stream_snapshot(&after) ==
             GUEST_RENDER_NATIVE_STREAM_OK);
-    REQUIRE(after.total_native_packets - before.total_native_packets == 3u);
+    REQUIRE(after.total_native_packets - before.total_native_packets == 5u);
     REQUIRE(after.total_native_bound_packets -
-                before.total_native_bound_packets == 3u);
+                before.total_native_bound_packets == 5u);
     REQUIRE(after.total_native_unbound_packets ==
             before.total_native_unbound_packets);
     REQUIRE(after.native_opcode_counts[0x00] -
@@ -742,6 +901,358 @@ static int test_native_non_draw_commands_preserve_gp0_semantics(void) {
                 before.native_opcode_counts[0x01] == 1u);
     REQUIRE(after.native_opcode_counts[0xa0] -
                 before.native_opcode_counts[0xa0] == 1u);
+    REQUIRE(after.native_opcode_counts[0x80] -
+                before.native_opcode_counts[0x80] == 1u);
+    REQUIRE(after.native_opcode_counts[0x02] -
+                before.native_opcode_counts[0x02] == 1u);
+    gpu_set_vram_upload_commit_hook(NULL);
+    gpu_set_vram_move_complete_hook(NULL);
+    gpu_set_vram_clear_complete_hook(NULL);
+    guest_render_native_stream_set_enabled(false);
+    return 1;
+}
+
+static int test_vram_rect_observers_publish_only_final_transfers(void) {
+    const uint16_t readback_pixels[] = {
+        UINT16_C(0x9111), UINT16_C(0xa222),
+        UINT16_C(0xb333), UINT16_C(0xc444),
+    };
+    uint8_t snapshot[512];
+    uint32_t snapshot_size;
+    uint64_t mutation_before;
+    memset(&upload_commit, 0, sizeof(upload_commit));
+    memset(&readback_complete, 0, sizeof(readback_complete));
+    memset(&move_complete, 0, sizeof(move_complete));
+    memset(&clear_complete, 0, sizeof(clear_complete));
+    memset(vram_events, 0, sizeof(vram_events));
+    vram_event_count = 0u;
+    vram_event_serial_mismatch = 0;
+    gpu_init();
+    mutation_before = gpu_render_vram_mutation_serial();
+    gpu_set_vram_upload_commit_hook(capture_upload_commit);
+    gpu_set_vram_readback_complete_hook(capture_readback_complete);
+    gpu_set_vram_move_complete_hook(capture_move_complete);
+    gpu_set_vram_clear_complete_hook(capture_clear_complete);
+    gpu_set_vram_event_hook(capture_vram_event);
+
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(2u, 2u));
+    gpu_write_gp0(UINT32_C(0xa2229111));
+    REQUIRE(upload_commit.calls == 0u);
+    gpu_write_gp0(UINT32_C(0xc444b333));
+    REQUIRE(upload_commit.calls == 1u);
+    REQUIRE(upload_commit.x == 1023u && upload_commit.y == 511u);
+    REQUIRE(upload_commit.width == 2u && upload_commit.height == 2u);
+    REQUIRE(upload_commit.pixel_count == 4u);
+    REQUIRE(upload_commit.pixels[0] == UINT16_C(0x9111));
+    REQUIRE(upload_commit.pixels[1] == UINT16_C(0xa222));
+    REQUIRE(upload_commit.pixels[2] == UINT16_C(0xb333));
+    REQUIRE(upload_commit.pixels[3] == UINT16_C(0xc444));
+    REQUIRE(vram_event_count == 1u);
+    REQUIRE(vram_events[0].operation == GPU_VRAM_EVENT_UPLOAD);
+    REQUIRE(vram_events[0].destination_x == 1023u &&
+            vram_events[0].destination_y == 511u);
+    REQUIRE(vram_events[0].mutation_serial == mutation_before + 1u);
+
+    gpu_write_gp0(UINT32_C(0x80000000));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(10u, 10u));
+    gpu_write_gp0(xy(2u, 2u));
+    REQUIRE(move_complete.calls == 1u);
+    REQUIRE(move_complete.x == 10u && move_complete.y == 10u);
+    REQUIRE(move_complete.width == 2u && move_complete.height == 2u);
+    REQUIRE(move_complete.pixel_count == 4u);
+    REQUIRE(move_complete.pixels[0] == UINT16_C(0x9111));
+    REQUIRE(move_complete.pixels[1] == UINT16_C(0xa222));
+    REQUIRE(move_complete.pixels[2] == UINT16_C(0xb333));
+    REQUIRE(move_complete.pixels[3] == UINT16_C(0xc444));
+    REQUIRE(vram_event_count == 2u);
+    REQUIRE(vram_events[1].operation == GPU_VRAM_EVENT_MOVE);
+    REQUIRE(vram_events[1].source_x == 1023u &&
+            vram_events[1].source_y == 511u);
+    REQUIRE(vram_events[1].destination_x == 10u &&
+            vram_events[1].destination_y == 10u);
+    REQUIRE(vram_events[1].mutation_serial == mutation_before + 2u);
+
+    gpu_write_gp0(UINT32_C(0xc0000000));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(2u, 2u));
+    REQUIRE(gpu_read_gpuread() == UINT32_C(0xa2229111));
+    REQUIRE(readback_complete.calls == 0u);
+    REQUIRE(gpu_read_gpuread() == UINT32_C(0xc444b333));
+    REQUIRE(readback_complete.calls == 1u);
+    REQUIRE(readback_complete.x == 1023u && readback_complete.y == 511u);
+    REQUIRE(readback_complete.width == 2u && readback_complete.height == 2u);
+    REQUIRE(readback_complete.pixel_count == 4u);
+    REQUIRE(readback_complete.content_digest ==
+            digest_pixels(readback_pixels, 4u));
+    REQUIRE(vram_event_count == 3u);
+    REQUIRE(vram_events[2].operation == GPU_VRAM_EVENT_READBACK);
+    REQUIRE(vram_events[2].mutation_serial == mutation_before + 2u);
+    REQUIRE(vram_events[2].content_digest ==
+            digest_pixels(readback_pixels, 4u));
+
+    gpu_write_gp0(UINT32_C(0xc0000000));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(2u, 2u));
+    REQUIRE(gpu_read_gpuread() == UINT32_C(0xa2229111));
+    snapshot_size = gpu_snapshot_bytes();
+    REQUIRE(snapshot_size <= sizeof(snapshot));
+    gpu_snapshot_write(snapshot);
+    gpu_write_gp1(UINT32_C(0x00000000));
+    REQUIRE(gpu_snapshot_read(snapshot, snapshot_size));
+    REQUIRE(gpu_read_gpuread() == UINT32_C(0xc444b333));
+    REQUIRE(readback_complete.calls == 2u);
+    REQUIRE(readback_complete.content_digest ==
+            digest_pixels(readback_pixels, 4u));
+
+    gpu_write_gp0(UINT32_C(0xe6000002));
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(1u, 1u));
+    gpu_write_gp0(UINT32_C(0x00000001));
+    REQUIRE(upload_commit.calls == 2u);
+    REQUIRE(upload_commit.pixel_count == 1u);
+    REQUIRE(upload_commit.pixels[0] == UINT16_C(0x9111));
+
+    gpu_write_gp0(UINT32_C(0x020000ff));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(2u, 2u));
+    REQUIRE(clear_complete.calls == 1u);
+    REQUIRE(clear_complete.x == 1008u && clear_complete.y == 511u);
+    REQUIRE(clear_complete.width == 16u && clear_complete.height == 2u);
+    REQUIRE(clear_complete.pixel_count == 32u);
+    REQUIRE(clear_complete.pixels[0] == UINT16_C(0x001f));
+    REQUIRE(clear_complete.pixels[31] == UINT16_C(0x001f));
+    REQUIRE(vram_event_count == 6u);
+    REQUIRE(vram_events[4].operation == GPU_VRAM_EVENT_UPLOAD);
+    REQUIRE(vram_events[5].operation == GPU_VRAM_EVENT_CLEAR);
+    REQUIRE(vram_events[5].mutation_serial == mutation_before + 4u);
+
+    gpu_write_gp0(UINT32_C(0xb0000000));
+    gpu_write_gp0(xy(40u, 40u));
+    gpu_write_gp0(xy(1u, 1u));
+    REQUIRE(vram_event_count == 6u);
+    gpu_write_gp0(UINT32_C(0x00007777));
+    REQUIRE(vram_event_count == 7u);
+    REQUIRE(vram_events[6].operation == GPU_VRAM_EVENT_UPLOAD);
+    REQUIRE(vram_events[6].destination_x == 40u &&
+            vram_events[6].destination_y == 40u);
+    REQUIRE(vram_events[6].mutation_serial == mutation_before + 5u);
+
+    gpu_write_gp0(UINT32_C(0xa0000000));
+    gpu_write_gp0(xy(8u, 8u));
+    gpu_write_gp0(xy(2u, 2u));
+    gpu_write_gp0(UINT32_C(0x66665555));
+    {
+        GpuPendingVramUpload pending = {0};
+        uint16_t pixels[2] = {0};
+
+        REQUIRE(gpu_pending_vram_upload_capture(
+                    &pending, pixels, 2u) == 2u);
+        REQUIRE(pending.x == 8u && pending.y == 8u);
+        REQUIRE(pending.width == 2u && pending.height == 2u);
+        REQUIRE(pending.pixel_count == 2u);
+        memset(pending_upload_target, 0, sizeof(pending_upload_target));
+        REQUIRE(gpu_pending_vram_upload_apply(
+            &pending, pixels, pending_upload_target,
+            sizeof(pending_upload_target) / sizeof(pending_upload_target[0])));
+        REQUIRE(pending_upload_target[8u * 1024u + 8u] ==
+                UINT16_C(0x5555));
+        REQUIRE(pending_upload_target[8u * 1024u + 9u] ==
+                UINT16_C(0x6666));
+    }
+    gpu_write_gp1(UINT32_C(0x01000000));
+    REQUIRE(upload_commit.calls == 3u);
+
+    gpu_write_gp0(UINT32_C(0xc0000000));
+    gpu_write_gp0(xy(1023u, 511u));
+    gpu_write_gp0(xy(2u, 2u));
+    (void)gpu_read_gpuread();
+    REQUIRE(readback_complete.calls == 2u);
+    REQUIRE(vram_event_count == 7u);
+    gpu_write_gp1(UINT32_C(0x03000000));
+    gpu_vblank_tick();
+    REQUIRE(vram_event_count == 8u);
+    REQUIRE(vram_events[7].operation == GPU_VRAM_EVENT_SCANOUT);
+    REQUIRE(vram_events[7].mutation_serial == mutation_before + 5u);
+    REQUIRE(!vram_event_serial_mismatch);
+    gpu_write_gp1(UINT32_C(0x00000000));
+    (void)gpu_read_gpuread();
+    REQUIRE(readback_complete.calls == 2u);
+    gpu_write_gp0(UINT32_C(0x680000ff));
+    gpu_write_gp0(xy(12u, 14u));
+    REQUIRE(vram_event_count == 9u);
+    REQUIRE(vram_events[8].operation == GPU_VRAM_EVENT_RENDER_TARGET_WRITE);
+    REQUIRE(vram_events[8].pixels == NULL);
+    REQUIRE(vram_events[8].mutation_serial == mutation_before + 6u);
+    REQUIRE(!vram_event_serial_mismatch);
+    gpu_set_vram_upload_commit_hook(NULL);
+    gpu_set_vram_readback_complete_hook(NULL);
+    gpu_set_vram_move_complete_hook(NULL);
+    gpu_set_vram_clear_complete_hook(NULL);
+    gpu_set_vram_event_hook(NULL);
+    return 1;
+}
+
+static int test_guest_gpu_draw_is_compatibility_not_original(void) {
+    GuestRenderNativeDiagnosticsV1 diagnostics = {0};
+
+    gpu_init();
+    guest_render_native_stream_set_enabled(false);
+    REQUIRE(guest_render_native_stream_diagnostics_reset() ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    gpu_write_gp0(UINT32_C(0x680000ff));
+    gpu_write_gp0(xy(12u, 14u));
+    REQUIRE(guest_render_native_stream_diagnostics_snapshot(
+                GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                &diagnostics, sizeof(diagnostics)) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(diagnostics.guest_gpu_compatibility_primitives == 1u);
+    REQUIRE(diagnostics.original_primitives == 0u);
+    REQUIRE(diagnostics.forbidden_non_native_primitives == 0u);
+    return 1;
+}
+
+static uint32_t shared_line_words[4];
+static uint32_t shared_line_base;
+
+static uint32_t read_shared_line_word(uint32_t address) {
+    return shared_line_words[(address - shared_line_base) / 4u];
+}
+
+static GuestRenderRenderMode shared_line_render_mode(void) {
+    return GUEST_RENDER_RENDER_NATIVE;
+}
+
+static bool shared_line_bindings_enabled(void) { return true; }
+static uint64_t shared_line_visual_scene(void) { return 7u; }
+static uint64_t shared_line_interpolation_scene(void) { return 11u; }
+
+static int resolve_shared_line(
+        uint32_t base, const uint32_t *words, size_t word_count,
+        GpuRenderSemantic *out_semantic) {
+    const XgRenderSharedPacketResolverServices services = {
+        .guest.read_word = read_shared_line_word,
+        .environment = xg_render_shared_packet_gpu_environment_services(),
+        .mode = {
+            .render_mode = shared_line_render_mode,
+            .packet_bindings_enabled = shared_line_bindings_enabled,
+        },
+        .identity = {
+            .visual_scene_generation = shared_line_visual_scene,
+            .interpolation_scene_generation =
+                shared_line_interpolation_scene,
+        },
+    };
+    GuestRenderNativeStreamMissContext context = {
+        .visual_id = {8u, 0u},
+        .command_id = base,
+        .container_id = base,
+        .source_kind = GUEST_RENDER_NATIVE_STREAM_SOURCE_DMA_BLOCK,
+        .opcode = (uint8_t)(words[0] >> 24u),
+        .word_count = word_count,
+    };
+    GpuRenderTransactionId visual_id = {0};
+
+    shared_line_base = base;
+    memset(shared_line_words, 0, sizeof(shared_line_words));
+    memcpy(shared_line_words, words, word_count * sizeof(*words));
+    return xg_render_shared_packet_resolve(
+        &context, &visual_id, out_semantic, &services);
+}
+
+static int test_productive_line_semantic_diagnostics_through_shared_resolver(void) {
+    const uint32_t rejected_line[] = {
+        UINT32_C(0x40ffffff), xy(2u, 3u),
+    };
+    const uint32_t zero_line_polyline[] = {
+        UINT32_C(0x48ffffff), UINT32_C(0x50005000),
+    };
+    const uint32_t line[] = {
+        UINT32_C(0x40ffffff), xy(2u, 3u), xy(5u, 7u),
+    };
+    const uint32_t polyline[] = {
+        UINT32_C(0x48ffffff), xy(11u, 13u), xy(17u, 19u),
+        UINT32_C(0x50005000),
+    };
+    GuestRenderNativeDiagnosticsV1 diagnostics = {0};
+    GpuRenderSemantic semantic;
+    const GuestRenderNativeDiagnosticSource *gp0_source;
+    const GuestRenderNativeDiagnosticSource *packet_source;
+
+    gpu_init();
+    guest_render_native_stream_set_enabled(true);
+    REQUIRE(guest_render_native_stream_diagnostics_reset() ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+
+    REQUIRE(!resolve_shared_line(
+        UINT32_C(0x200), rejected_line,
+        sizeof(rejected_line) / sizeof(rejected_line[0]), &semantic));
+    REQUIRE(!resolve_shared_line(
+        UINT32_C(0x240), zero_line_polyline,
+        sizeof(zero_line_polyline) / sizeof(zero_line_polyline[0]),
+        &semantic));
+    REQUIRE(guest_render_native_stream_diagnostics_snapshot(
+                GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                &diagnostics, sizeof(diagnostics)) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(diagnostics.target_gp0_decode_to_semantic_calls == 0u);
+    REQUIRE(diagnostics.target_packet_payload_reads_by_semantic_lane == 0u);
+
+    REQUIRE(resolve_shared_line(
+        UINT32_C(0x280), line, sizeof(line) / sizeof(line[0]), &semantic));
+    REQUIRE(semantic.topology == GPU_RENDER_SEMANTIC_LINES);
+    REQUIRE(semantic.line_count == 1u);
+    REQUIRE(guest_render_native_stream_diagnostics_snapshot(
+                GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                &diagnostics, sizeof(diagnostics)) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(diagnostics.target_gp0_decode_to_semantic_calls == 1u);
+    REQUIRE(diagnostics.target_packet_payload_reads_by_semantic_lane == 1u);
+    gp0_source = &diagnostics.first_offender[
+        GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_GP0_DECODE_TO_SEMANTIC];
+    packet_source = &diagnostics.first_offender[
+        GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_PACKET_PAYLOAD_READ];
+    REQUIRE(gp0_source->valid_fields ==
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE);
+    REQUIRE(gp0_source->opcode == 0x40u);
+    REQUIRE(memcmp(gp0_source, packet_source, sizeof(*gp0_source)) == 0);
+
+    REQUIRE(resolve_shared_line(
+        UINT32_C(0x2c0), polyline,
+        sizeof(polyline) / sizeof(polyline[0]), &semantic));
+    REQUIRE(semantic.topology == GPU_RENDER_SEMANTIC_LINES);
+    REQUIRE(semantic.line_count == 1u);
+    REQUIRE(guest_render_native_stream_diagnostics_snapshot(
+                GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                &diagnostics, sizeof(diagnostics)) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(diagnostics.target_gp0_decode_to_semantic_calls == 2u);
+    REQUIRE(diagnostics.target_packet_payload_reads_by_semantic_lane == 2u);
+    REQUIRE(gp0_source->opcode == 0x40u);
+    REQUIRE(memcmp(gp0_source, packet_source, sizeof(*gp0_source)) == 0);
+
+    REQUIRE(guest_render_native_stream_diagnostics_reset() ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(resolve_shared_line(
+        UINT32_C(0x300), polyline,
+        sizeof(polyline) / sizeof(polyline[0]), &semantic));
+    REQUIRE(guest_render_native_stream_diagnostics_snapshot(
+                GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                &diagnostics, sizeof(diagnostics)) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(diagnostics.target_gp0_decode_to_semantic_calls == 1u);
+    REQUIRE(diagnostics.target_packet_payload_reads_by_semantic_lane == 1u);
+    gp0_source = &diagnostics.first_offender[
+        GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_GP0_DECODE_TO_SEMANTIC];
+    packet_source = &diagnostics.first_offender[
+        GUEST_RENDER_NATIVE_DIAGNOSTIC_TARGET_PACKET_PAYLOAD_READ];
+    REQUIRE(gp0_source->valid_fields ==
+            GUEST_RENDER_NATIVE_DIAGNOSTIC_SOURCE_OPCODE);
+    REQUIRE(gp0_source->opcode == 0x48u);
+    REQUIRE(memcmp(gp0_source, packet_source, sizeof(*gp0_source)) == 0);
     guest_render_native_stream_set_enabled(false);
     return 1;
 }
@@ -1088,9 +1599,12 @@ static int test_native_gte_polygon_preflight_is_complete_and_fail_closed(void) {
         UINT32_C(0x200000ff), xy(10u, 10u), xy(20u, 10u), xy(10u, 20u),
     };
     GpuNativePacketStreamSnapshot reservation;
+    GuestRenderNativeDiagnosticsV1 diagnostics = {0};
 
     gpu_init();
     guest_render_native_stream_set_enabled(true);
+    REQUIRE(guest_render_native_stream_diagnostics_reset() ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
     gte_native_provenance_set_enabled(1);
     test_gte_native_provenance_clear();
     for (uint32_t vertex = 0u; vertex < 3u; ++vertex)
@@ -1104,7 +1618,25 @@ static int test_native_gte_polygon_preflight_is_complete_and_fail_closed(void) {
     REQUIRE(gpu_native_packet_stream_snapshot(&reservation));
     REQUIRE(reservation.reservation_phase == 2u &&
             reservation.reservation_count == 1u);
-    gpu_native_preflight_reservation_abort();
+    for (uint32_t index = 0u; index < 3u; ++index)
+        REQUIRE(submit_native_word(
+            polygon[index], base + index * 4u,
+            GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+            UINT32_C(0x00001800)));
+    REQUIRE(!submit_native_word(
+        polygon[3], base + 12u,
+        GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST,
+        UINT32_C(0x00001800)));
+    REQUIRE(guest_render_native_stream_diagnostics_snapshot(
+                GUEST_RENDER_NATIVE_DIAGNOSTICS_VERSION_1,
+                &diagnostics, sizeof(diagnostics)) ==
+            GUEST_RENDER_NATIVE_STREAM_OK);
+    REQUIRE(diagnostics.semantic_post_gte_reads == 1u);
+    REQUIRE(diagnostics.gte_derived_primitives == 1u);
+    REQUIRE(diagnostics.first_offender[
+                GUEST_RENDER_NATIVE_DIAGNOSTIC_SEMANTIC_POST_GTE_READ]
+                .command_id == base);
+    gpu_native_packet_stream_reset();
 
     test_gte_native_provenance_clear();
     test_gte_native_provenance_seed(base + 4u, polygon[1], 1u);
@@ -1126,6 +1658,216 @@ static int test_native_gte_polygon_preflight_is_complete_and_fail_closed(void) {
 static void write_cpu_word(uint32_t address, uint32_t value) {
     psx_write_word(address, value);
     ram_provenance_note_cpu_store(UINT32_C(0xac000000), address, value);
+}
+
+static int feed_mdec_upload_words(
+        const uint32_t *words, size_t word_count, uint32_t base,
+        int native) {
+    for (size_t index = 0u; index < word_count; ++index) {
+        const GpuRenderOracleSource source = {
+            GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK,
+            base + (uint32_t)index * 4u,
+            (base + (uint32_t)index * 4u) / 4u,
+            base / 4u,
+        };
+        if (native) {
+            if (!gpu_native_submit_gp0_word(words[index], &source)) return 0;
+        } else {
+            gpu_set_gp0_source(&source);
+            gpu_write_gp0(words[index]);
+        }
+    }
+    return 1;
+}
+
+static int test_mdec_ram_provenance_reaches_vram_upload(void) {
+    const uint32_t base = UINT32_C(0x00012000);
+    const uint32_t standalone_callback = UINT32_C(0x801d3480);
+    const uint32_t field_callback = UINT32_C(0x801d3490);
+    const uint32_t words[] = {
+        UINT32_C(0xa0000000), xy(40u, 50u), xy(4u, 1u),
+        UINT32_C(0x22221111), UINT32_C(0x44443333),
+    };
+    RamProvenanceSource source = {
+        .kind = RAM_PROVENANCE_SOURCE_MDEC_DMA1,
+        .format = 3u,
+    };
+    uint8_t *gpu_snapshot;
+    uint32_t gpu_snapshot_size;
+
+    REQUIRE(ram_provenance_init(UINT32_C(2) * 1024u * 1024u));
+    ram_provenance_set_cpu_tracking(true);
+    source.receipt = ram_provenance_publish_event();
+    REQUIRE(source.receipt != 0u);
+    ram_provenance_note_source_word(base + 12u, &source);
+    ram_provenance_note_source_word(base + 16u, &source);
+
+    gpu_init();
+    vram_event_count = 0u;
+    gpu_set_vram_event_hook(capture_vram_event);
+    REQUIRE(feed_mdec_upload_words(
+        words, sizeof(words) / sizeof(words[0]), base, 0));
+    REQUIRE(vram_event_count == 1u);
+    REQUIRE(vram_events[0].operation == GPU_VRAM_EVENT_UPLOAD);
+    REQUIRE(vram_events[0].payload_source ==
+            GPU_VRAM_PAYLOAD_SOURCE_MDEC_DMA1);
+    REQUIRE(vram_events[0].payload_format == 3u);
+    REQUIRE(vram_events[0].payload_source_receipt == source.receipt);
+    REQUIRE(!gpu_note_movie_owner_start(
+        GPU_MOVIE_OWNER_NONE, standalone_callback));
+    REQUIRE(!gpu_note_movie_owner_start(
+        (GpuMovieOwnerKind)3, standalone_callback));
+    REQUIRE(!gpu_note_movie_owner_start(GPU_MOVIE_OWNER_STANDALONE, 0u));
+    REQUIRE(gpu_note_movie_owner_start(
+        GPU_MOVIE_OWNER_STANDALONE, standalone_callback));
+    REQUIRE(!gpu_note_movie_frame_complete(
+        0u, standalone_callback + 4u));
+    REQUIRE(gpu_note_movie_frame_complete(
+        0u, standalone_callback));
+    gpu_snapshot_size = gpu_snapshot_bytes();
+    gpu_snapshot = (uint8_t *)malloc(gpu_snapshot_size);
+    REQUIRE(gpu_snapshot != NULL);
+    gpu_snapshot_write(gpu_snapshot);
+    REQUIRE(gpu_note_movie_owner_start(
+        GPU_MOVIE_OWNER_FIELD, field_callback));
+    REQUIRE(gpu_snapshot_read(gpu_snapshot, gpu_snapshot_size));
+    free(gpu_snapshot);
+    REQUIRE(!gpu_note_movie_owner_stop(GPU_MOVIE_OWNER_FIELD));
+    gpu_write_gp1(UINT32_C(0x05000000) | (50u << 10u) | 40u);
+    gpu_write_gp1(UINT32_C(0x03000000));
+    gpu_vblank_tick();
+    REQUIRE(vram_event_count == 2u);
+    REQUIRE(vram_events[1].operation == GPU_VRAM_EVENT_SCANOUT);
+    REQUIRE(vram_events[1].pixels != NULL);
+    REQUIRE(vram_events[1].payload_format == 3u);
+    REQUIRE(vram_events[1].movie_frame_complete);
+    REQUIRE(vram_events[1].movie_frame_number == 0u);
+    REQUIRE(vram_events[1].movie_frame_width == vram_events[1].width);
+    REQUIRE(vram_events[1].movie_frame_height == vram_events[1].height);
+    REQUIRE(vram_events[1].movie_owner_kind ==
+            GPU_MOVIE_OWNER_STANDALONE);
+    REQUIRE(vram_events[1].movie_owner_receipt != 0u);
+    REQUIRE(vram_events[1].pixel_count ==
+            (size_t)vram_events[1].width * vram_events[1].height);
+    REQUIRE(vram_events[1].pixels[0] == UINT16_C(0x1111));
+    REQUIRE(vram_events[1].pixels[1] == UINT16_C(0x2222));
+    REQUIRE(vram_events[1].pixels[2] == UINT16_C(0x3333));
+    REQUIRE(vram_events[1].pixels[3] == UINT16_C(0x4444));
+    gpu_vblank_tick();
+    REQUIRE(vram_event_count == 3u);
+    REQUIRE(vram_events[2].operation == GPU_VRAM_EVENT_SCANOUT);
+    REQUIRE(vram_events[2].pixels == NULL);
+    REQUIRE(!vram_events[2].movie_frame_complete);
+    REQUIRE(vram_events[2].movie_owner_kind == GPU_MOVIE_OWNER_NONE);
+    REQUIRE(vram_events[2].movie_owner_receipt == 0u);
+
+    REQUIRE(feed_mdec_upload_words(
+        words, sizeof(words) / sizeof(words[0]), base, 0));
+    REQUIRE(gpu_note_movie_frame_complete(
+        1u, standalone_callback));
+    gpu_vblank_tick();
+    REQUIRE(vram_event_count == 5u);
+    REQUIRE(vram_events[4].operation == GPU_VRAM_EVENT_SCANOUT);
+    REQUIRE(vram_events[4].movie_frame_complete);
+    REQUIRE(vram_events[4].movie_frame_number == 1u);
+    REQUIRE(vram_events[4].movie_owner_kind ==
+            GPU_MOVIE_OWNER_STANDALONE);
+    REQUIRE(vram_events[4].movie_owner_receipt ==
+            vram_events[1].movie_owner_receipt);
+
+    REQUIRE(feed_mdec_upload_words(
+        words, sizeof(words) / sizeof(words[0]), base, 0));
+    REQUIRE(gpu_note_movie_frame_complete(
+        2u, standalone_callback));
+    REQUIRE(!gpu_note_movie_owner_stop(GPU_MOVIE_OWNER_FIELD));
+    REQUIRE(gpu_note_movie_owner_stop(GPU_MOVIE_OWNER_STANDALONE));
+    REQUIRE(!gpu_note_movie_frame_complete(
+        2u, standalone_callback));
+    gpu_vblank_tick();
+    REQUIRE(vram_event_count == 7u);
+    REQUIRE(vram_events[6].operation == GPU_VRAM_EVENT_SCANOUT);
+    REQUIRE(!vram_events[6].movie_frame_complete);
+    REQUIRE(vram_events[6].movie_owner_kind == GPU_MOVIE_OWNER_NONE);
+    REQUIRE(vram_events[6].movie_owner_receipt == 0u);
+
+    REQUIRE(gpu_note_movie_owner_start(
+        GPU_MOVIE_OWNER_FIELD, field_callback));
+    REQUIRE(feed_mdec_upload_words(
+        words, sizeof(words) / sizeof(words[0]), base, 0));
+    REQUIRE(gpu_note_movie_frame_complete(3u, field_callback));
+    gpu_vblank_tick();
+    REQUIRE(vram_event_count == 9u);
+    REQUIRE(vram_events[8].movie_frame_complete);
+    REQUIRE(vram_events[8].movie_owner_kind == GPU_MOVIE_OWNER_FIELD);
+    REQUIRE(vram_events[8].movie_owner_receipt ==
+            vram_events[1].movie_owner_receipt + 1u);
+
+    gpu_init();
+    vram_event_count = 0u;
+    guest_render_native_stream_set_enabled(true);
+    REQUIRE(feed_mdec_upload_words(
+        words, sizeof(words) / sizeof(words[0]), base, 1));
+    REQUIRE(vram_event_count == 1u);
+    REQUIRE(vram_events[0].payload_source ==
+            GPU_VRAM_PAYLOAD_SOURCE_MDEC_DMA1);
+    REQUIRE(vram_events[0].payload_source_receipt == source.receipt);
+    guest_render_native_stream_set_enabled(false);
+
+    gpu_init();
+    vram_event_count = 0u;
+    ram_provenance_invalidate_range(base + 16u, 1u);
+    REQUIRE(feed_mdec_upload_words(
+        words, sizeof(words) / sizeof(words[0]), base, 0));
+    REQUIRE(vram_event_count == 1u);
+    REQUIRE(vram_events[0].payload_source == GPU_VRAM_PAYLOAD_SOURCE_NONE);
+    REQUIRE(vram_events[0].payload_source_receipt == 0u);
+    gpu_set_vram_event_hook(NULL);
+    ram_provenance_set_cpu_tracking(false);
+    return 1;
+}
+
+static int test_dma1_mdec_output_tags_ram_words(void) {
+    extern int test_mdec_dma_read_ready;
+    extern uint32_t test_mdec_dma_read_value;
+    extern uint32_t test_mdec_dma_output_format;
+    const uint32_t base = UINT32_C(0x00013000);
+    uint8_t dma_snapshot[512];
+    uint32_t dma_snapshot_size;
+    RamProvenanceSource first;
+    RamProvenanceSource second;
+
+    REQUIRE(ram_provenance_init(UINT32_C(2) * 1024u * 1024u));
+    ram_provenance_set_cpu_tracking(true);
+    dma_init();
+    test_mdec_dma_read_ready = 1;
+    test_mdec_dma_read_value = UINT32_C(0x44332211);
+    test_mdec_dma_output_format = 2u;
+    dma_write(UINT32_C(0x1f8010f0), UINT32_C(0x00000080));
+    dma_write(UINT32_C(0x1f801090), base);
+    dma_write(UINT32_C(0x1f801094), UINT32_C(0x00010002));
+    dma_write(UINT32_C(0x1f801098), UINT32_C(0x01000200));
+    dma_advance(14u);
+    REQUIRE(ram_provenance_source_word(base, &first));
+    REQUIRE(!ram_provenance_source_word(base + 4u, &second));
+    dma_snapshot_size = dma_snapshot_bytes();
+    REQUIRE(dma_snapshot_size <= sizeof(dma_snapshot));
+    dma_snapshot_write(dma_snapshot);
+    ram_provenance_reset();
+    REQUIRE(!ram_provenance_source_word(base, &second));
+    REQUIRE(dma_snapshot_read(dma_snapshot, dma_snapshot_size));
+    dma_advance(1u);
+    REQUIRE(ram_provenance_source_word(base, &first));
+    dma_advance(13u);
+    REQUIRE(ram_provenance_source_word(base + 4u, &second));
+    REQUIRE(first.kind == RAM_PROVENANCE_SOURCE_MDEC_DMA1);
+    REQUIRE(first.format == 2u && first.receipt != 0u);
+    REQUIRE(second.kind == first.kind && second.format == first.format);
+    REQUIRE(second.receipt == first.receipt);
+    REQUIRE(psx_read_word(base) == UINT32_C(0x44332211));
+    REQUIRE(psx_read_word(base + 4u) == UINT32_C(0x44332212));
+    test_mdec_dma_read_ready = 0;
+    ram_provenance_set_cpu_tracking(false);
+    return 1;
 }
 
 static int test_native_cpu_dma_publication_is_complete_and_fail_closed(void) {
@@ -1253,6 +1995,40 @@ static int test_native_unbound_routes_reject_software_backend(void) {
     return 1;
 }
 
+static int test_rejected_native_sources_block_frontend_present(void) {
+    rejected_source_boundary_calls = 0;
+    rejected_vram_event_calls = 0;
+    frontend_present_calls = 0;
+
+    gpu_init();
+    gpu_set_source_boundary_hook(accept_source_boundary);
+    gpu_set_vram_event_hook(reject_vram_event);
+    gpu_set_vblank_callback(count_frontend_present);
+    gpu_write_gp1(UINT32_C(0x05000000));
+    gpu_write_gp1(UINT32_C(0x03000000));
+    gpu_vblank_arm_deferred_present();
+    REQUIRE(gpu_vblank_present_pending());
+    gpu_vblank_tick();
+    REQUIRE(rejected_vram_event_calls == 1);
+    REQUIRE(rejected_source_boundary_calls == 0);
+    REQUIRE(frontend_present_calls == 0);
+    gpu_vblank_arm_deferred_present();
+    REQUIRE(!gpu_vblank_present_pending());
+
+    gpu_set_vram_event_hook(NULL);
+    gpu_init();
+    gpu_set_source_boundary_hook(reject_source_boundary);
+    gpu_vblank_tick();
+    REQUIRE(rejected_source_boundary_calls == 1);
+    REQUIRE(frontend_present_calls == 0);
+    gpu_vblank_arm_deferred_present();
+    REQUIRE(!gpu_vblank_present_pending());
+
+    gpu_set_source_boundary_hook(NULL);
+    gpu_set_vblank_callback(NULL);
+    return 1;
+}
+
 int main(void) {
     (void)structured_source_setter;
     return test_capture_preserves_guest_outputs() &&
@@ -1262,17 +2038,23 @@ int main(void) {
                     test_parser_packet_exclusions() &&
                     test_real_routes_normalize_without_erasing_provenance() &&
                     test_native_non_draw_commands_preserve_gp0_semantics() &&
+                    test_vram_rect_observers_publish_only_final_transfers() &&
+                    test_guest_gpu_draw_is_compatibility_not_original() &&
+                    test_productive_line_semantic_diagnostics_through_shared_resolver() &&
                     test_mmio_upload_payload_continues_through_dma() &&
                     test_mmio_upload_overflow_and_trailing_preflight() &&
                     test_reserved_ft4_rejects_mutation_and_releases_atomically() &&
                     test_exact_a0_dma_then_attributed_mmio_ft4() &&
-                    test_native_gte_polygon_preflight_is_complete_and_fail_closed() &&
-                    test_native_cpu_dma_publication_is_complete_and_fail_closed() &&
+                     test_native_gte_polygon_preflight_is_complete_and_fail_closed() &&
+                     test_dma1_mdec_output_tags_ram_words() &&
+                     test_mdec_ram_provenance_reaches_vram_upload() &&
+                     test_native_cpu_dma_publication_is_complete_and_fail_closed() &&
                     test_native_unbound_submission_rejects_software_backend() &&
-                    test_native_unbound_routes_reject_software_backend() &&
-                    test_native_mmio_submission_finalizes_before_preflight() &&
-                    test_ordering_table_hook_activates_before_dma_consumption() &&
-                    test_ordering_table_hook_failure_is_fail_closed()
+                     test_native_unbound_routes_reject_software_backend() &&
+                     test_native_mmio_submission_finalizes_before_preflight() &&
+                     test_ordering_table_hook_activates_before_dma_consumption() &&
+                     test_ordering_table_hook_failure_is_fail_closed() &&
+                     test_rejected_native_sources_block_frontend_present()
                 ? 0
                 : 1;
 }

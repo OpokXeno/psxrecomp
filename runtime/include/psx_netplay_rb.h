@@ -36,6 +36,7 @@ typedef struct PsxNetplayRbBindings {
 } PsxNetplayRbBindings;
 
 void psx_netplay_rb_bind(const PsxNetplayRbBindings *b);
+void psx_netplay_rb_set_episode_begin_callback(void (*callback)(void));
 void psx_netplay_rb_start(void);
 void psx_netplay_rb_shutdown(void);
 /* Soft-return / rematch: wipe RB host residue that rb_shutdown leaves
