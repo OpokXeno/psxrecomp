@@ -391,6 +391,23 @@ static bool xg_render_host_native_text_authorizes_pc(uint32_t owner_entry) {
     return psx_game_text_native_ok(owner_entry) != 0;
 }
 
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+extern "C" int psx_overlay_static_artifact_code_write_overlaps(
+    const uint8_t sha256[32], uint32_t base, uint32_t size,
+    uint32_t address, uint32_t write_size);
+#endif
+
+static int xg_render_host_artifact_code_write_overlaps(
+        const uint8_t sha256[32], uint32_t base, uint32_t size,
+        uint32_t address, uint32_t write_size) {
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    return psx_overlay_static_artifact_code_write_overlaps(
+        sha256, base, size, address, write_size);
+#else
+    return -1;
+#endif
+}
+
 /* Guest-side data-read wrappers: same as psx_read_* but charge PS1 main-RAM
  * read wait states (R3000A has no D-cache). Wired to cpu->read_* below so the
  * timing applies to recompiled + interpreted guest loads, not debug/device reads. */
@@ -14762,6 +14779,7 @@ session_reboot:
             psx_read_word,
             xg_render_host_semantic_module,
             xg_render_host_native_text_authorizes_pc,
+            xg_render_host_artifact_code_write_overlaps,
         };
 
         g_native_render_selected =

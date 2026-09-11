@@ -1145,6 +1145,7 @@ typedef struct GlNativeVertexMesh {
 typedef struct GlNativeVertexPair {
     GlNativeVertexSample endpoints[2];
     uint32_t mesh;
+    uint32_t previous_draw;
     uint8_t valid;
     uint8_t anchor_recovered;
 } GlNativeVertexPair;
@@ -10520,6 +10521,25 @@ static const XgRenderTemporalCoverageView *native_coverage_previous(const GlNati
     return &a->current.view;
 }
 
+static int native_motion_texture_footprint_equal(
+        const GpuRenderSemantic *a, const GpuRenderSemantic *b) {
+    const GpuRenderMaterial *am = &a->material, *bm = &b->material;
+    if (a->triangle_count != b->triangle_count ||
+        am->textured != bm->textured || am->tpage != bm->tpage ||
+        am->clut_x != bm->clut_x || am->clut_y != bm->clut_y ||
+        am->texture_window_mask_x != bm->texture_window_mask_x ||
+        am->texture_window_mask_y != bm->texture_window_mask_y ||
+        am->texture_window_offset_x != bm->texture_window_offset_x ||
+        am->texture_window_offset_y != bm->texture_window_offset_y)
+        return 0;
+    for (uint32_t t = 0u; t < a->triangle_count; ++t)
+        for (uint32_t v = 0u; v < 3u; ++v)
+            if (a->triangles[t].vertices[v].u != b->triangles[t].vertices[v].u ||
+                a->triangles[t].vertices[v].v != b->triangles[t].vertices[v].v)
+                return 0;
+    return 1;
+}
+
 static int native_motion_vertices(const GlNativeRecipe *previous, const GlNativeRecipe *current,
                                 uint32_t phases, GlNativeVertexCache *cache, GlNativeVertexDiagnostics *diag) {
     const size_t capacity = ((size_t)previous->count + current->count) * 6u;
@@ -10590,6 +10610,7 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
             uses[end].group == uses[first].group && uses[end].vertex == uses[first].vertex) ++end;
         if (!uses[end - 1u].frame) { first = end; continue; }
         GlNativeVertexPair *pair = &cache->pairs[cache->pair_count];
+        pair->previous_draw = UINT32_MAX;
         uint32_t seen = 0u, mesh = UINT32_MAX;
         int conflict = 0;
         for (uint32_t j = first; j < end; ++j) {
@@ -10598,7 +10619,7 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
                 conflict |= memcmp(&pair->endpoints[use->frame], &use->sample, sizeof(use->sample)) != 0;
             else pair->endpoints[use->frame] = use->sample;
             seen |= 1u << use->frame;
-            if (!use->frame) continue;
+            if (!use->frame) { pair->previous_draw = use->draw; continue; }
             cache->map[use->draw][use->corner] = cache->pair_count;
             const uint32_t root = native_motion_mesh_root(cache, use->mesh);
             if (mesh == UINT32_MAX) mesh = root;
@@ -10628,7 +10649,7 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
         }
         const GlNativeVertexSample *a = &pair->endpoints[0], *b = &pair->endpoints[1];
         pair->valid = seen == 3u && !conflict && a->native == b->native && a->projective == b->projective &&
-            (b->native || b->projective) && (!b->projective ||
+            (!b->projective ||
                 (a->distance && b->distance && a->view[2] > 0 && b->view[2] > 0));
         diag->vertices++;
         if (seen != 3u) diag->missing++;
@@ -10649,6 +10670,18 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
         for (uint32_t v = 0u; v < current->draws[i].semantic.triangle_count * 3u; ++v) {
             const uint32_t key = cache->map[i][v];
             if (key == UINT32_MAX || !cache->pairs[key].valid) mesh->bad = 1u;
+            else if (current->draws[i].semantic.material.textured &&
+                     !cache->pairs[key].endpoints[1].projective) {
+                /* Billboard animation is discrete. Reusing a packet/vertex ID
+                 * does not make two different cels the same geometry: applying
+                 * the current UVs to an in-between shape stretches its pixels.
+                 * Keep the whole producer discrete across a cel change. */
+                const uint32_t prior = cache->pairs[key].previous_draw;
+                if (prior == UINT32_MAX ||
+                    !native_motion_texture_footprint_equal(
+                        &previous->draws[prior].semantic,
+                        &current->draws[i].semantic)) mesh->bad = 1u;
+            }
         }
     }
     cache->deltas = calloc((size_t)(cache->pair_count ? cache->pair_count : 1u) * phases, sizeof(*cache->deltas));
