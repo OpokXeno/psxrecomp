@@ -212,6 +212,110 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-12 (World culling and World-to-Lahan mixed-model jitter, visually
+  confirmed; shared-path extension):** Recorded `build-dbg/input-replay-combat.toml`
+  is complete, 4809 VBlanks. It visits World, Lahan, Field 5 and Lahan again.
+  The user's initial description of billboards was clarified: affected geometry
+  is scenery (tree bases, wheels and the cart), not actors or the compass.
+  Read-only pose probes found actor billboard anchors exact in both visits;
+  their interpolation was not the cause.
+
+  At VBlank 3251, average-depth FT3 commands including `15dba8`, `15dc68`,
+  `15dc48` and `15dc88` had registered model bindings but no captured semantic
+  identity. A bounded trace through `capture_ft3_link` proved both the FT3 source
+  and packet template absent. Its attempted material decode used s0, which the
+  resident render loop uses for the vertex pool, not the material descriptor.
+  First-visit identity rejects accumulated to 12854; the second visit did not
+  add more. Publishing FT3 geometry at the authenticated model entry removes
+  this initializer-cache dependency. GPU acceptance still checks exact GTE XY
+  and layout and supplies the actual packet's material and OT order.
+
+  World terrain/water and native World model builders still computed orientation
+  from integer SXY. Both now use `xg_host_3d_nclip`, sharing the bounded Q16
+  determinant with the resident model fix. The user confirmed both World face
+  disappearance and first-visit Lahan jitter resolved in the non-GDB replay
+  `.tmp/world-lahan-fixed-60.json`.
+
+  At the user's request, extended model-entry geometry publication to FT4 too:
+  all 17 resident polygon families have a complete source binding, independent
+  of optional later template observers. Removed the incorrect s0 material decode.
+  Field and Gear validation share `xg_model_primitive_layout.h`. Gear helpers no
+  longer reject a complete skeleton merely for containing other resident polygon
+  families; they validate the same live LUT strides, indices and packet bounds,
+  and use the common full-geometry capture (including relit FT4). The existing
+  Battle source publisher already covers all 17 families and six dispatch modes.
+  Also extended the temporal candidate front-face check to Native Q16 positions;
+  it previously tested canonical XY even when the raster used Native positions.
+  Cloud angular-wedge tests are world-space integer predicates, not projected
+  polygon orientation; they do not belong to this correction.
+
+  Verification after extension: `.tmp/world-lahan-generalized-state.json` has
+  zero binding-identity rejects at VBlanks 3350/3650/4501. At 3350, model `15d8c0`
+  has 11/11 draws pose-bound (previously 5, with the other faces unkeyed); unkeyed
+  draws in that frame fell from 42 to 1. Cart `1556e4` has 33/33 pose-bound draws
+  at 3650. Final non-GDB replay `.tmp/world-lahan-generalized-final-60.json`:
+  runtime PASS, trace_complete, all 4809 latches, zero GL errors, 5 expired phase
+  generations over the full replay, final temporal state ready; peak 10 s window
+  has 298 midpoint + 303 current presents. Rebuilt `build-dbg/XenogearsRecomp`.
+  Gear mixed-family extension is structurally verified against the shared
+  resident layout and compiled, but this replay provides no Gear-scene visual
+  coverage. No tests or generated C were manually modified.
+
+- **2026-09-12 (Concrete attack selection and cross-overlay switch census):**
+  The user confirmed opening Attack works, then reported another static-dispatch
+  fatal at frame 9323 / `2026-09-12T16:44:49Z`, target `8008646c`, return address
+  `80086400`. Ghidra and the authenticated battle input identify owner `800861d0`
+  and its 13-entry switch at `800702b8` (`jr` at `8008645c`). This schedule uses
+  `clear s1` in the bounds-branch delay; its fallthrough case ladder has many
+  interior destinations. The resolver now proves register dataflow across useful
+  ALU/store instructions, table-base LUI/ADDIU setup on either side of SLL,
+  separated bounds definitions, and duplicated SLTIU definitions in incoming
+  branch/jump delay slots. Hoisted constant bases may span local branches when
+  their definitions cannot be skipped or clobbered; calls still reject that
+  proof. The C++ reader also now permits byte-sized trailing image data: the
+  producer's END need not be word-aligned, while instruction/table addresses
+  and every complete word read still must be valid.
+
+  Audited all 24 built raw overlays against their SHA-256 input manifests and
+  generated dispatcher entries. Before regeneration: 33 missing destinations
+  (19 battle, 4 battling, 1 menu, 9 world). Final audit:
+  `.tmp/switch-dispatch-audit-final.json` — 197 recognized tables, zero missing
+  destinations, zero C++/Python resolver disagreements. Two additional battle
+  tables with S7 bases spanning calls remain conservatively unrecognized; their
+  four constant-table targets were independently checked and are already valid
+  dispatcher entries. This fixes the audited class across overlays rather than
+  adding seeds for one crashing address. Rebuilt the recompiler and build-dbg;
+  existing bounded-switch discovery checks pass, and no tests were added or
+   modified. The user subsequently confirmed concrete attack selection works.
+
+- **2026-09-12 (Battle Attack static-dispatch miss):** Last-run report timestamp
+  `2026-09-12T16:25:27Z`, frame 6499, and freeze dump `1789230327` identify the
+  fatal `linked static overlay code missed its generated dispatcher`. The last
+  transfer was `800807f0 -> 80080848`, with index register v1=4, in the battle
+  menu owner `80080160`. The raw battle overlay SHA-256
+  `1830b4ef1fe37129972fc310dfad534f8161d6c0b123e74254c3711334a3e291`
+  matches build provenance and the report's code peek byte-for-byte. Its table
+  at `8006fe7c` has 101 entries / 21 unique destinations; `80080848` and `80080928`
+  were emitted only inside other blocks and absent from the native dispatcher.
+  The compiler schedules SLL in the bounds BEQ's delay slot, followed by the
+  table-base LUI, ADDU, LW, NOP, JR. Both the C++ exact resolver and Python
+  capture verifier now accept this structurally checked schedule, preserving
+  register/base/bounds and inbound-edge checks. CFG construction makes every
+  proven table destination a real block and records JR successors, so CPS
+  entry switches, dispatcher registration and cycle slices agree automatically.
+  No address-specific seed or runtime fallback was added.
+
+  Rebuilt `psxrecomp-game` and `build-dbg/XenogearsRecomp`; the regenerated battle
+  and aggregate static dispatchers include both missing entries. The real-input
+  audit `.tmp/attack-dispatch-proof.json` reports all 21 destinations registered
+  and an independent two-instruction slice at Attack's `80080848`. Existing
+  `overlay_auth_continuation_codegen_test` passes. The broader existing Python
+  overlay-discovery suite passes its jump-table/ownership/alias checks, then
+  fails its unrelated interior-fragment assertion at line 3010 (address
+  `80200000` expected out of range); that assertion also fails with the unmodified
+   HEAD module. No tests were added or changed. The user subsequently confirmed
+   opening Attack works; the original crash report and freeze dumps were preserved.
+
 - **2026-09-12 (Shadow atomicity and Native model NCLIP, both visually confirmed):**
   The 3742-VBlank replay exposed unrelated shadows sharing producer ID 3. At
   VBlanks 3301/3581 a newly visible off-screen shadow (actor 34) invalidated the

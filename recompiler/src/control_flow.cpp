@@ -382,6 +382,7 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
     };
 
     // Scan instructions for branches/jumps to find block starts
+    std::map<uint32_t, std::set<uint32_t>> table_successors;
     for (uint32_t addr = walk_lo; addr < func.end_addr; addr += 4) {
         auto instr_opt = exe_.read_word(addr);
         if (!instr_opt) continue;
@@ -392,6 +393,17 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
 
             if (cf.target != 0 && cf.target >= walk_lo && cf.target < func.end_addr) {
                 add_boundary(cf.target);
+            }
+            if (cf.type == ControlFlowType::JumpRegister) {
+                ExactJumpTable table;
+                if (resolve_exact_bounded_jump_table(exe_, walk_lo, func.end_addr,
+                        addr, (instr >> 21u) & 0x1fu, table, nullptr,
+                        func.producer_lo, func.producer_hi)) {
+                    for (const auto& target : table.targets) {
+                        add_boundary(target.second);
+                        table_successors[addr].insert(target.second);
+                    }
+                }
             }
 
             // After delay slot is a new block
@@ -474,6 +486,11 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
                    block.exit_instr.type == ControlFlowType::JumpLinkReg) {
             uint32_t ft = block.exit_instr.address + 8;
             if (in_func(ft)) block.successors.push_back(ft);
+        } else if (block.exit_instr.type == ControlFlowType::JumpRegister) {
+            const auto found = table_successors.find(block.exit_instr.address);
+            if (found != table_successors.end())
+                for (uint32_t target : found->second)
+                    if (in_func(target)) block.successors.push_back(target);
         } else if (block.exit_instr.type != ControlFlowType::Return &&
                    block.exit_instr.type != ControlFlowType::JumpRegister) {
             uint32_t next = block.end_addr + 4;

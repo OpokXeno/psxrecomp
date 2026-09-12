@@ -69,6 +69,7 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_vram_region_set.h"
+#include "psx_render_nclip.h"
 #include "xg_render_motion.h"
 #include "xg_render_semantic_presentation.h"
 #include "latency_ring.h"
@@ -20164,6 +20165,14 @@ static int native_host_temporal_phase_visible(
         c = &semantic->triangles[0].vertices[2];
         area = ((int64_t)b->x - a->x) * ((int64_t)c->y - a->y) -
             ((int64_t)b->y - a->y) * ((int64_t)c->x - a->x);
+        if (a->native_view_position && b->native_view_position && c->native_view_position) {
+            /* Temporal visibility must use the positions that Native draws,
+             * just like endpoint NCLIP. Canonical XY may already be snapped to
+             * integers and give a different sign for an edge-on triangle. */
+            const int32_t x[3] = {a->native_view_x, b->native_view_x, c->native_view_x};
+            const int32_t y[3] = {a->native_view_y, b->native_view_y, c->native_view_y};
+            area = psx_render_nclip((area > 0) - (area < 0), x, y);
+        }
         if ((policy->front_face == GPU_RENDER_TEMPORAL_FRONT_POSITIVE &&
              area <= 0) ||
             (policy->front_face == GPU_RENDER_TEMPORAL_FRONT_NEGATIVE &&

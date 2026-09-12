@@ -773,8 +773,9 @@ bool resolve_exact_bounded_jump_table(
         producer_lo = exe.header.load_address;
         producer_hi = exe.end_address();
     }
-    if (producer_lo >= producer_hi || (producer_lo & 3u) != 0u ||
-        (producer_hi & 3u) != 0u) {
+    // An image may end in byte-sized data. Only instruction/table addresses
+    // need alignment; every complete word is range-checked when read below.
+    if (producer_lo >= producer_hi || (producer_lo & 3u) != 0u) {
         return false;
     }
     auto jr_word = read(jr_pc);
@@ -851,13 +852,22 @@ bool resolve_exact_bounded_jump_table(
     lw_offset = static_cast<int32_t>(
         static_cast<int16_t>(*lw_word & 0xFFFFu));
 
-    // The address add and index scale must be the two instructions immediately
-    // before the load. This deliberately excludes raw-window coincidences.
+    // The address add immediately precedes the load. The index scale precedes
+    // the add, optionally separated by the table-base LUI. Compilers also put
+    // that SLL in the bounds branch's delay slot and materialize LUI afterwards.
     uint32_t addu_pc = lw_pc - 4u;
     uint32_t sll_pc = addu_pc - 4u;
     auto addu_word = read(addu_pc);
     auto sll_word = read(sll_pc);
     if (!addu_word.has_value() || !sll_word.has_value()) return false;
+    std::vector<uint32_t> scheduled_base_defs;
+    while ((*sll_word >> 26u) == 0x0fu || (*sll_word >> 26u) == 0x09u) {
+        if (scheduled_base_defs.size() == 2u || sll_pc < entry + 4u) return false;
+        scheduled_base_defs.push_back(sll_pc);
+        sll_pc -= 4u;
+        sll_word = read(sll_pc);
+        if (!sll_word.has_value()) return false;
+    }
     uint32_t addu_op = (*addu_word >> 26) & 0x3Fu;
     uint32_t addu_rs = (*addu_word >> 21) & 0x1Fu;
     uint32_t addu_rt = (*addu_word >> 16) & 0x1Fu;
@@ -883,16 +893,19 @@ bool resolve_exact_bounded_jump_table(
         return false;
     }
 
-    // Exact canonical guard: sltiu; beq; nop; sll. This is the same accepted
-    // suffix as the Python capture verifier and excludes unrelated bounds.
-    if (sll_pc < entry + 12u) return false;
-    uint32_t guard_pc = sll_pc - 8u;
-    uint32_t bound_pc = sll_pc - 12u;
+    // Locate the guarding branch across its delay slot and optional table-base
+    // setup. Every intervening instruction is validated below against the actual
+    // reaching definitions; opcode proximity alone is not a switch proof.
+    uint32_t guard_pc = 0u;
+    for (uint32_t back = 1u; back <= 4u && sll_pc >= entry + back * 4u; ++back) {
+        const uint32_t pc = sll_pc - back * 4u;
+        auto word = read(pc);
+        if (!word.has_value()) return false;
+        if (is_control(pc, *word)) { guard_pc = pc; break; }
+    }
+    if (guard_pc < entry + 4u) return false;
     auto guard_word_opt = read(guard_pc);
-    auto bound_word = read(bound_pc);
-    auto guard_delay = read(sll_pc - 4u);
-    if (!guard_word_opt.has_value() || !bound_word.has_value() ||
-        !guard_delay.has_value() || *guard_delay != 0u) {
+    if (!guard_word_opt.has_value()) {
         return false;
     }
     uint32_t guard_word = *guard_word_opt;
@@ -904,14 +917,43 @@ bool resolve_exact_bounded_jump_table(
         (guard_rs != 0u && guard_rt != 0u)) {
         return false;
     }
+    uint32_t bound_pc = guard_pc - 4u;
+    auto bound_word = read(bound_pc);
+    for (unsigned back = 0u; back < 3u && bound_word.has_value() &&
+            !exact_instruction_writes_gpr(*bound_word, bound_reg); ++back) {
+        if (is_control(bound_pc, *bound_word) || bound_pc < entry + 4u) return false;
+        bound_pc -= 4u;
+        bound_word = read(bound_pc);
+    }
+    if (!bound_word.has_value()) return false;
+    auto duplicate_bound_delay = [&](uint32_t source, uint32_t target) {
+        if (target != guard_pc || bound_pc + 4u != guard_pc) return false;
+        const auto branch = read(source), delay = read(source + 4u);
+        if (!branch.has_value() || !delay.has_value() || *delay != *bound_word ||
+            !exact_is_valid_mips_word(*branch)) return false;
+        const uint32_t op = *branch >> 26u;
+        return op == 2u || (op >= 4u && op <= 7u) || (op >= 0x14u && op <= 0x17u) ||
+            (op == 1u && ((*branch >> 16u) & 0x1fu) <= 3u);
+    };
     uint32_t bound_op = (*bound_word >> 26) & 0x3Fu;
     uint32_t bound_rs = (*bound_word >> 21) & 0x1Fu;
     uint32_t bound_rt = (*bound_word >> 16) & 0x1Fu;
     uint32_t count = *bound_word & 0xFFFFu;
     if (bound_op != 0x0Bu || bound_rs != index_reg ||
         bound_rt != bound_reg || count == 0u || count >= 512u ||
-        in_delay_slot(bound_pc)) {
+        writes_between(bound_pc + 4u, sll_pc, index_reg)) {
         return false;
+    }
+    for (uint32_t pc = entry; pc < bound_pc; pc += 4u) {
+        const auto word = read(pc);
+        if (!word.has_value()) return false;
+        const ExactCf cf = exact_classify_cf(pc, *word);
+        if ((cf.kind == ExactCfKind::Branch || cf.kind == ExactCfKind::Jump || cf.kind == ExactCfKind::Jal) &&
+            cf.target > bound_pc && cf.target <= jr_pc && !duplicate_bound_delay(pc, cf.target)) return false;
+    }
+    if (in_delay_slot(bound_pc)) {
+        const uint32_t before_bound_op = *read(bound_pc - 4u) >> 26u;
+        if (before_bound_op != 4u && before_bound_op != 5u) return false;
     }
     uint32_t guard_target = exact_branch_target(guard_pc, guard_word);
     if ((guard_target & 3u) != 0u || guard_target < entry ||
@@ -926,7 +968,7 @@ bool resolve_exact_bounded_jump_table(
     uint32_t low_pc = 0, source_reg = base_reg;
     int16_t low = 0;
     uint32_t lui_pc = 0, upper = 0;
-    for (uint32_t back = 1; back <= 32u; back++) {
+    for (uint32_t back = 1; back <= (addu_pc - entry) / 4u; back++) {
         if (addu_pc < entry + back * 4u) break;
         uint32_t pc = addu_pc - back * 4u;
         auto word = read(pc);
@@ -948,7 +990,7 @@ bool resolve_exact_bounded_jump_table(
         break;
     }
     if (low_pc != 0u) {
-        for (uint32_t back = 1; back <= 32u; back++) {
+        for (uint32_t back = 1; back <= (low_pc - entry) / 4u; back++) {
             if (low_pc < entry + back * 4u) break;
             uint32_t pc = low_pc - back * 4u;
             auto word = read(pc);
@@ -963,22 +1005,31 @@ bool resolve_exact_bounded_jump_table(
             break;
         }
     }
-    if (lui_pc == 0u || in_delay_slot(lui_pc) ||
-        (low_pc != 0u && in_delay_slot(low_pc)) ||
+    if (lui_pc == 0u || (in_delay_slot(lui_pc) && lui_pc != guard_pc + 4u) ||
+        (low_pc != 0u && in_delay_slot(low_pc) && low_pc != guard_pc + 4u) ||
         inbound_skips(lui_pc, addu_pc) ||
         (low_pc != 0u && inbound_skips(low_pc, addu_pc)) ||
         has_call_between(lui_pc, addu_pc)) {
         return false;
     }
-    // No other control transfer may intervene between the proven constant and
-    // the canonical suffix. The bounds BEQ is the sole exception.
-    for (uint32_t pc = lui_pc + 4u; pc < sll_pc; pc += 4u) {
-        auto word = read(pc);
-        if (!word.has_value() ||
-            (pc != guard_pc && is_control(pc, *word))) {
+    for (uint32_t pc : scheduled_base_defs)
+        if (pc != lui_pc && pc != low_pc) return false;
+    for (uint32_t pc = bound_pc + 4u; pc < sll_pc; pc += 4u) {
+        if (pc == guard_pc) continue;
+        const auto word = read(pc);
+        if (!word.has_value() || !exact_is_valid_mips_word(*word) ||
+            is_control(pc, *word)) return false;
+        const uint32_t op = *word >> 26u, fn = *word & 0x3fu;
+        const bool alu = (op == 0u && (fn <= 7u || (fn >= 0x20u && fn <= 0x2bu))) ||
+            (op >= 8u && op <= 0x0fu);
+        const bool store = op == 0x28u || op == 0x29u || op == 0x2bu;
+        if ((!alu && !store) || exact_instruction_writes_gpr(*word, index_reg) ||
+            (pc < guard_pc && exact_instruction_writes_gpr(*word, bound_reg)))
             return false;
-        }
     }
+    // A hoisted base may span local branches: its writes are checked over the
+    // entire interval and inbound edges cannot bypass its definition. Calls
+    // remain rejected above because their register effects are not proven here.
     uint32_t base_def_end = low_pc != 0u ? low_pc + 4u : lui_pc + 4u;
     if (writes_between(base_def_end, addu_pc, base_reg) ||
         (low_pc != 0u &&
@@ -1078,6 +1129,7 @@ bool resolve_exact_bounded_jump_table(
             break;
         }
     }
+    const uint32_t protected_start = std::min(lui_pc, bound_pc);
     for (uint32_t source = entry; source < hard_cap; source += 4u) {
         auto word = read(source);
         if (!word.has_value()) return false;
@@ -1085,9 +1137,9 @@ bool resolve_exact_bounded_jump_table(
         bool direct = cf.kind == ExactCfKind::Branch ||
                       cf.kind == ExactCfKind::Jump ||
                       cf.kind == ExactCfKind::Jal;
-        if (direct && cf.target > lui_pc && cf.target <= jr_pc &&
-            (source < lui_pc || source > jr_pc) &&
-            !case_reachable.count(source)) {
+        if (direct && cf.target > protected_start && cf.target <= jr_pc &&
+            (source < protected_start || source > jr_pc) &&
+            !case_reachable.count(source) && !duplicate_bound_delay(source, cf.target)) {
             return false;
         }
     }
