@@ -212,6 +212,94 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-12 (Shadow atomicity and Native model NCLIP, both visually confirmed):**
+  The 3742-VBlank replay exposed unrelated shadows sharing producer ID 3. At
+  VBlanks 3301/3581 a newly visible off-screen shadow (actor 34) invalidated the
+  whole group, snapping the visible actors' shadows. Shadows now use per-actor
+  producer IDs in namespace `0x53000000` and preserve their real 3D projection
+  instead of interpolating screen-only coordinates. The user confirmed the
+  shadow jitter/partial disappearance was fixed.
+
+  For black near-edge-on terrain faces, retaining immediate previous-only faces
+  did not fix the reported defect; that experiment has been fully removed.
+  A user-requested A/B culling experiment isolated NCLIP: globally overriding it
+  also affected collision/camera logic and was rejected; bypassing ONLY resident
+  model-renderer sites `8002c700..8003159f` removed the defect. The final solution
+  keeps culling active and evaluates orientation with the Native Q16 positions.
+  `psx_render_nclip.h` shares exact bounded int64 determinant/sign logic between
+  GTE render-site handling and host FT3/FT4 source capture. Original signed area
+  magnitude is retained when its sign agrees; fractional positive areas cannot
+  vanish through integer rounding. The GTE path requires current FIFO provenance
+  and an application render-site predicate, leaving general/collision/camera
+  NCLIP unchanged. The text-validity gate takes the resident dispatcher ENTRY
+  `8002c700`, not an interior GTE instruction PC (the first integration wrongly
+  rejected those PCs because they were not compiled entry points).
+
+  No bypass environment switch remains. The user confirmed the restored-culling
+  fix. Full replay without GDB (`.tmp/precise-model-nclip-authorized-60.json`):
+  runtime PASS / trace_complete, zero OpenGL errors, 299 midpoint / 302 current
+  presents in 10000 ms, one expired phase generation, final temporal state ready.
+  No tests were added or modified. Failed retention code was removed after this
+  successful run; its invocation was already absent during verification.
+
+- **2026-09-12 (Field billboard cel-change placement, visually confirmed):**
+  The same 3742-VBlank replay isolated producer `0x1b3720` (the reported ox).
+  At VBlank 3345 two cel pieces changed UVs/local rectangles, causing the
+  shared-vertex texture-footprint guard to snap the entire sprite to current,
+  including unchanged body pieces. Its source billboard MATRIX remained a
+  coherent placement (diagonal Q12 scale 3072, smoothly moving translation).
+  Capture now publishes one immutable view-space placement per normal Field
+  billboard invocation and binds each CURRENT cel's local geometry to it.
+  Animation/UV changes remain discrete while placement interpolates. The
+  authenticated source owner is RenderFieldCharacterSprites, `80075b44..800764b3`,
+  entry opcode `27bdff18`; Ghidra field-overlay disassembly and live caller
+  `8007622c` identify its ordinary resident billboard call. Asset-pointer writes
+  invalidate placement history; inconsistent per-piece transforms retire the
+  entity. Source endpoints publish the pose's continuity generation after
+  repository staging, rather than the unrelated legacy submission epoch (the
+  initial integration captured poses but rejected binding on 78523 vs 13).
+  At 3345 all four pieces are pose-bound/enabled; the unchanged body's delta is
+  (+2.320917, -1.068927) pixels instead of zero. The static sample at 3463 has
+  exactly zero motion. The user confirmed the fix. Final full run without GDB,
+  `.tmp/ox-final-60.json`, reports runtime PASS / trace_complete, zero expired
+  phases, zero OpenGL errors, and 298 midpoint / 303 current presents per 10 s.
+  No tests were added or modified. The failed inline-breakpoint diagnostic was
+  replaced with a single machine-entry stop; debugger timing is not FPS evidence.
+
+- **2026-09-12 (Mixed-family Field model jitter, visually confirmed):** New
+  complete recording `build-dbg/input-replay-new.toml` (3742 VBlanks) reproduced
+  intermittent map-model displacement. Source inspection identified producers
+  `0x1556e4` and `0x17d7d8`: their camera/local poses were valid, but
+  `capture_motion_bindings` rejected polygon families 4 (F3) and 12 (F4), clearing
+  the entire model's bindings. The fallback shared-vertex path then alternated
+  between interpolation and current-only as visibility changed. Capture now
+  follows all 17 resident dispatch rows, validates packet bounds and LUT strides,
+  and binds every family to the same immutable model pose. Families outside the
+  existing FT3/FT4 source lanes publish exact source geometry; acceptance checks
+  GTE XY and consumes the actual draw's final material and OT order. Sampled
+  draws from both producers are fully pose-bound with zero source-3D mismatch;
+  their poses remain enabled once previous visibility exists. GDB inspection is
+  numerical evidence only because debugger stops can expire phase deadlines.
+  Final full replay WITHOUT GDB (`.tmp/model-mixed-final-60.json`) completed with
+  runtime health PASS, zero OpenGL errors, zero expired phase generations, and
+  296 midpoint / 303 current presents in the final 9999 ms. The user confirmed
+  the reported jitter no longer occurs. No tests were added or modified.
+
+- **2026-09-12 (Lahan house/ground interpolation discontinuity):** The replay
+  `build-dbg/input-replay.toml` exposed coincident source-3D boundary vertices
+  taking different phase positions: the ground producer `0x18d434` snapped to
+  current while adjoining models interpolated. Stepping its source capture at
+  VBlank 3415 proved that the reconstructed camera exactly matched the game's
+  MATRIX, but TRS extraction rejected a normalized column dot of 0.00242734141
+  against a 0.002 shear threshold. Camera extraction now uses polar decomposition
+  for its rotational curve; existing source-matrix endpoint anchoring preserves
+  the captured affine endpoints. After isolating this fix from experimental face
+  retention, VBlanks 3421/3631/3671 report zero visible shared-boundary splits,
+  maximum separation 0.0, and zero camera matrix rejections. The normal 16:9/60
+  replay completed with runtime health PASS. The user subsequently confirmed
+  this and the preceding sprite/shadow fixes before reporting the separate
+  mixed-family model jitter above. No tests were added or modified, per user request.
+
 - **2026-09-05 (Retained-Movie restore and atomic MDEC publication):** The
   deferred savestate failure was made directly observable through
   `savestate_status`, including pending/completed/failed state, last successful

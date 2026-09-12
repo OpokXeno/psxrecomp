@@ -7,6 +7,7 @@
 #include "nd_intro_ot.h"
 #include "pgxp.h"
 #include "psx_gte_divide.h"
+#include "psx_render_nclip.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -231,6 +232,10 @@ static NativeProjectionSlot s_native_projection_gpr[32];
 static uint64_t s_native_projection_receipt = 0;
 static uint32_t s_native_projection_generation = 1;
 static int s_native_projection_enabled = 0;
+static int (*s_render_nclip_filter)(uint32_t pc);
+extern "C" void gte_native_provenance_set_render_nclip_filter(int (*filter)(uint32_t)) {
+    s_render_nclip_filter = filter;
+}
 extern "C" {
 int g_gte_native_provenance_active = 0;
 }
@@ -2259,6 +2264,20 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd,
     }
 #endif
     gte_run_command(&gte, cmd);
+
+    if (func == 0x06 && s_native_projection_enabled && !s_gte_replay_sandbox &&
+        s_render_nclip_filter && s_render_nclip_filter(guest_pc_known ? guest_pc : cpu->pc)) {
+        int32_t x[3], y[3];
+        bool valid = true;
+        for (unsigned i = 0; i < 3; ++i) {
+            const NativeProjectionSlot &slot = s_native_projection_gte[i];
+            valid &= slot.generation == s_native_projection_generation &&
+                slot.components == (NATIVE_PROJECTION_X | NATIVE_PROJECTION_Y) &&
+                slot.vertex.receipt != 0 && slot.vertex.packed_sxy == gte.SXY[i];
+            x[i] = slot.vertex.x_16_16; y[i] = slot.vertex.y_16_16;
+        }
+        if (valid) gte.MAC0 = psx_render_nclip(gte.MAC0, x, y);
+    }
 
 #ifndef PSX_NO_DEBUG_TOOLS
     if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);

@@ -14789,6 +14789,13 @@ session_reboot:
             return 1;
         }
         gte_native_provenance_set_enabled(g_native_render_selected ? 1 : 0);
+        gte_native_provenance_set_render_nclip_filter([](uint32_t pc) -> int {
+            const uint32_t physical = pc & 0x1fffffffu;
+            /* The text gate takes a dispatcher entry, not an interior GTE PC.
+             * This is the same resident owner used by model source capture. */
+            return g_native_render_widescreen && physical >= 0x2c700u && physical < 0x315a0u &&
+                xg_render_host_native_text_authorizes_pc(0x8002c700u);
+        });
         ram_provenance_set_cpu_tracking(g_native_render_selected);
         update_native_temporal_coverage();
 

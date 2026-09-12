@@ -25,6 +25,9 @@ typedef struct GteNativeVertexProvenance {
 } GteNativeVertexProvenance;
 
 void gte_native_provenance_set_enabled(int enabled);
+/* Game integration identifies authenticated rendering-only NCLIP sites.
+ * Generic GTE/collision/camera uses retain hardware arithmetic. */
+void gte_native_provenance_set_render_nclip_filter(int (*filter)(uint32_t pc));
 void gte_native_provenance_invalidate_range(uint32_t address, uint32_t width);
 int gte_native_provenance_load(uint32_t address, uint32_t packed_sxy,
                                GteNativeVertexProvenance *out);
