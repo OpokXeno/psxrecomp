@@ -212,6 +212,40 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-12 (16:9 title artwork and transition coverage, visually confirmed):**
+  The user reported a stretched Xenogears title image and 4:3 black fades over
+  the wide Field/World view. Actual window captures reproduce both independently
+  of motion interpolation. At VBlank 2291 the World fade is a nonprojective,
+  subtractive Gouraud quad covering `(0,0)..(320,216)`, with screen-space mode
+  NONE; it darkened only the center of the 426-column Native surface. The GPU
+  semantic classifier now recognizes complete display-covering, untextured
+  rectangles (flat or Gouraud) as STRETCH. It checks draw-area/display coverage,
+  excludes projected vertices, and proves the two triangles form a rectangle
+  with a shared diagonal. Original color, blend, canonical XY and OT order remain
+  authoritative, including the real 216-line display band.
+
+  A broad textured-SPRT policy change did not fix the logo and was removed.
+  Complete Native recipe inspection instead found the two title FT4 strips
+  already carrying Native positions: canonical boundaries `0,256,320` became
+  `0,340.8,426`. The producer is `xg_field_projected`, whose view mapper stretched
+  every strip. Its authenticated title source at `1102bc` has a 320x224 image,
+  zero angular phase multiplier, zero radial placement, and zero distance-fade
+  divisor: a fixed image rather than a scrolling/distance-scaled panorama.
+  Such image strips now carry `preserve_image_aspect` and receive the common
+  53-column center translation, preserving the image's 320-column span. The
+  panorama route and flat upper/lower coverage bands retain full-width mapping.
+  The policy is source-config based, without a title-field ID or texture-page
+  whitelist, and has no FPS-dependent branch.
+
+  Rebuilt `build-dbg/XenogearsRecomp`; the user confirmed both fixes visually.
+  Evidence: `.tmp/aspect-window-before-{800,2290}.png` versus
+  `.tmp/aspect-fixed-{800,2290}.png`, captured with `window_shot` (the actual
+  composited Native presentation, not canonical VRAM). Final non-GDB replay
+  `.tmp/aspect-fixed-60.json`: runtime PASS, trace_complete, 4809 VBlank latches,
+  zero GL errors, final temporal status ready; nine expired phase generations
+  across the complete screenshot-instrumented run. No tests or generated C were
+  manually modified.
+
 - **2026-09-12 (World culling and World-to-Lahan mixed-model jitter, visually
   confirmed; shared-path extension):** Recorded `build-dbg/input-replay-combat.toml`
   is complete, 4809 VBlanks. It visits World, Lahan, Field 5 and Lahan again.

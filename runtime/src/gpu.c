@@ -6586,6 +6586,59 @@ static int native_semantic_is_dialogue_continue_indicator(
             XG_DIALOGUE_CONTINUE_HEIGHT * INT32_C(65536);
 }
 
+static int native_semantic_is_fullscreen_filter(const GpuRenderSemantic *semantic) {
+    GpuDisplayInfo display = {0};
+    int32_t min_x = INT32_MAX, max_x = INT32_MIN;
+    int32_t min_y = INT32_MAX, max_y = INT32_MIN;
+    unsigned triangles[2] = {0u, 0u};
+
+    if (semantic == NULL || semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        semantic->triangle_count != 2u || semantic->line_count != 0u ||
+        semantic->material.textured || semantic->material.raw_texture)
+        return 0;
+    gpu_get_display_info(&display);
+    const GpuRenderMaterial *material = &semantic->material;
+    const uint32_t height = display.height > 224u ? 224u : display.height;
+    if (!display.width || !height ||
+        material->draw_area_right < material->draw_area_left ||
+        material->draw_area_bottom < material->draw_area_top ||
+        (uint32_t)(material->draw_area_right - material->draw_area_left + 1) != display.width ||
+        (uint32_t)(material->draw_area_bottom - material->draw_area_top + 1) < height)
+        return 0;
+    for (uint32_t t = 0u; t < 2u; ++t)
+        for (uint32_t v = 0u; v < 3u; ++v) {
+            const GpuRenderSemanticVertex *vertex = &semantic->triangles[t].vertices[v];
+            if (vertex->native_view_position || vertex->projective_position) return 0;
+            if (vertex->x < min_x) min_x = vertex->x;
+            if (vertex->x > max_x) max_x = vertex->x;
+            if (vertex->y < min_y) min_y = vertex->y;
+            if (vertex->y > max_y) max_y = vertex->y;
+        }
+    if ((int64_t)min_x + (int64_t)material->draw_offset_x * 65536 >
+            (int64_t)material->draw_area_left * 65536 ||
+        (int64_t)max_x + (int64_t)material->draw_offset_x * 65536 <
+            ((int64_t)material->draw_area_left + display.width) * 65536 ||
+        (int64_t)min_y + (int64_t)material->draw_offset_y * 65536 >
+            (int64_t)material->draw_area_top * 65536 ||
+        (int64_t)max_y + (int64_t)material->draw_offset_y * 65536 <
+            ((int64_t)material->draw_area_top + height) * 65536)
+        return 0;
+    /* Prove a complete rectangle, not just a large two-triangle bounding box.
+     * Flat and Gouraud filters share this layout; their color/blend is retained. */
+    for (uint32_t t = 0u; t < 2u; ++t)
+        for (uint32_t v = 0u; v < 3u; ++v) {
+            const GpuRenderSemanticVertex *vertex = &semantic->triangles[t].vertices[v];
+            if ((vertex->x != min_x && vertex->x != max_x) ||
+                (vertex->y != min_y && vertex->y != max_y)) return 0;
+            const unsigned corner = (vertex->x == max_x ? 1u : 0u) |
+                (vertex->y == max_y ? 2u : 0u);
+            if (triangles[t] & (1u << corner)) return 0;
+            triangles[t] |= 1u << corner;
+        }
+    const unsigned diagonal = triangles[0] & triangles[1];
+    return (triangles[0] | triangles[1]) == 15u && (diagonal == 6u || diagonal == 9u);
+}
+
 static uint8_t native_semantic_screen_space_mode(
         uint8_t opcode, const GpuRenderSemantic *semantic,
         const GpuRenderOracleSource *source) {
@@ -6594,8 +6647,10 @@ static uint8_t native_semantic_screen_space_mode(
         native_semantic_is_dialogue_border(opcode, semantic) ||
         native_semantic_is_dialogue_continue_indicator(opcode, semantic))
         return GPU_RENDER_SCREEN_SPACE_2D_NONE;
-    return opcode >= 0x60u ? GPU_RENDER_SCREEN_SPACE_2D_STRETCH
-                           : GPU_RENDER_SCREEN_SPACE_2D_NONE;
+    /* Display-covering polygon filters need the same expansion as TILEs,
+     * including Gouraud fades that have no initializer-template classification. */
+    return opcode >= 0x60u || native_semantic_is_fullscreen_filter(semantic)
+        ? GPU_RENDER_SCREEN_SPACE_2D_STRETCH : GPU_RENDER_SCREEN_SPACE_2D_NONE;
 }
 
 static void native_semantic_parse_position(const GpuNativeDrawEnvironment *environment,
