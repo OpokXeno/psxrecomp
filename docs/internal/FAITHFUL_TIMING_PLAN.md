@@ -227,6 +227,36 @@ scene-lane tests are obsolete (removed edge width/height fields, old bool compil
 callback and rejected legacy pass submission); they were not used as validation
 of the new native-work lane.
 
+### 2026-09-14 — Native capture exhaustion and dynamic storage
+
+Live Field 1 diagnosis proved that Native/60-FPS status alone does not establish
+subpixel geometry coverage. With FT4/sprite blockers 78/88 latched, a recipe had
+1220 unkeyed draws without native positions and only 25 other native-position
+draws. A diagnostic rearm restored models temporarily (user confirmed), then
+the issue recurred. At the captured publication failure all 8192 source-capture
+slots were unconsumed. Culled source polygons need storage too; the legacy IR
+budget was not a valid bound on pending Native captures.
+
+Capture storage now grows while retaining pending entries. A subsequent audit
+converted model replay/workspace and sprite caches, motion instances/commands,
+resource versions/identities/capabilities, model publication metadata, and Native
+recipe draw/pose/coverage/snapshot storage. Lookup indices grew to 32-bit. GPU
+streaming command/payload buffers now grow with old-prefix retirement, publishing
+their pointers under the same mutex as the immutable command prefix. The GL
+owner reads one published pointer pair per service; it never races realloc/free.
+This removes the former 131072-command/64-MiB storage ceilings without adding a
+worker wait inside compile. Source-format bounds, backpressure windows and
+diagnostic rings remain bounded.
+
+Four targeted tests pass normally and with Clang ASan/UBSan, covering >8192
+pending captures, >4096 resource identities, >512 live poses, >16384 command
+bindings, index widening, rehash invalidation and >64-MiB stable-prefix storage.
+The rebuilt build-dbg completed the 4809-VBlank Field/World replay with SDL
+offscreen, port 4371, runtime PASS/trace_complete, 186 samples, zero blocked
+model/sprite samples and zero sampled GL errors. No screenshots; the user's
+existing instance was not restarted. Parent-repository documentation and
+evidence index: `docs/xenogears/graphics/08-native-storage-growth.md`.
+
 ### 2026-09-14 — World camera/tree interpolation continuity (user confirmed)
 
 Follow-up static audit covered Field, central Battle and Battling. Fixed Field

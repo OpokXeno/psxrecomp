@@ -353,12 +353,15 @@ typedef struct BsOut {
     size_t   len;
     size_t   cap;
     int      no_zlib; /* 1 => always raw sections (netplay snap ring) */
+    int      no_service; /* Pure worker-side encoding; never pump guest/GL hooks. */
     uint32_t section; /* attempted wire section, for failed-save diagnostics */
     BootStateRawCapture *capture;
 } BsOut;
 
 struct BootStateRawCapture {
     uint8_t *data;
+    uint8_t *staging;
+    size_t staging_capacity;
     size_t len, provenance_offset;
     uint32_t provenance_capacity;
     RamProvenanceSnapshot *provenance;
@@ -385,20 +388,20 @@ static int bs_reserve(BsOut *o, size_t n) {
 
 static int bs_write(BsOut* o, const void* p, size_t n) {
     if (!n) return 1;
-    if (!save_service()) return 0;
+    if (!o->no_service && !save_service()) return 0;
     if (o->f)
-        return fwrite(p, 1, n, o->f) == n && save_service();
+        return fwrite(p, 1, n, o->f) == n && (o->no_service || save_service());
     if (!bs_reserve(o, n)) return 0;
     /* The guest stays stopped and p remains stable across service calls.
      * Keep the original single memcpy when no host service is installed. */
     while (n != 0u) {
-        const size_t chunk = s_save_service_hook != NULL && n > 256u * 1024u
+        const size_t chunk = !o->no_service && s_save_service_hook != NULL && n > 256u * 1024u
             ? 256u * 1024u : n;
         memcpy(o->data + o->len, p, chunk);
         o->len += chunk;
         p = (const uint8_t *)p + chunk;
         n -= chunk;
-        if (!save_service()) return 0;
+        if (!o->no_service && !save_service()) return 0;
     }
     return 1;
 }
@@ -453,15 +456,60 @@ static int write_section(BsOut* o, uint32_t tag, const void* data, uint64_t len)
                 compress2(packed + 4, &dest_len, (const Bytef*)data, (uLong)len,
                           Z_BEST_SPEED) == Z_OK) {
                 uint64_t payload = 4u + (uint64_t)dest_len;
-                int ok = write_section_raw(o, tag, BOOT_STATE_SEC_ZLIB,
-                                           packed, payload);
-                free(packed);
-                return ok;
+                if (payload < len) {
+                    int ok = write_section_raw(o, tag, BOOT_STATE_SEC_ZLIB,
+                                               packed, payload);
+                    free(packed);
+                    return ok;
+                }
             }
             free(packed);
         }
     }
     return write_section_raw(o, tag, 0u, data, len);
+}
+
+static int boot_state_parse_header(const uint8_t *, size_t, BootStateHeader *);
+
+int boot_state_compress_buffer(const uint8_t *data, size_t size,
+                              uint8_t **out_data, size_t *out_size) {
+    BootStateHeader header;
+    BsOut out = {0};
+    size_t offset = BOOT_STATE_HEADER_WIRE_BYTES;
+    if (!out_data || !out_size) return 0;
+    *out_data = NULL; *out_size = 0u;
+    if (!boot_state_parse_header(data, size, &header) ||
+        header.magic != BOOT_STATE_MAGIC || header.version != BOOT_STATE_VERSION ||
+        header.section_count > (size - BOOT_STATE_HEADER_WIRE_BYTES) / 16u)
+        return 0;
+    /* Only immutable captured bytes are touched. The normal serializer's
+     * service hook belongs to the guest/GL owner, not the rewind encoder. */
+    out.no_service = 1;
+    if (!bs_write(&out, data, BOOT_STATE_HEADER_WIRE_BYTES)) goto fail;
+    for (uint32_t i = 0u; i < header.section_count; ++i) {
+        uint32_t tag, flags;
+        uint64_t length;
+        PstR section;
+        if (size - offset < 16u) goto fail;
+        pst_r_init(&section, data + offset, 16u);
+        if (!pst_r_u32(&section, &tag) || !pst_r_u32(&section, &flags) ||
+            !pst_r_u64(&section, &length) || (flags & ~BOOT_STATE_SEC_ZLIB)) goto fail;
+        offset += 16u;
+        if (length > size - offset) goto fail;
+        if (flags) {
+            if (!write_section_raw(&out, tag, flags, data + offset, length)) goto fail;
+        } else if (!write_section(&out, tag, data + offset, length)) goto fail;
+        offset += (size_t)length;
+    }
+    if (offset != size) goto fail;
+    /* Do not retain the serializer's geometric reserve in every rewind slot. */
+    uint8_t *tight = realloc(out.data, out.len);
+    *out_data = tight ? tight : out.data;
+    *out_size = out.len;
+    return 1;
+fail:
+    free(out.data);
+    return 0;
 }
 
 static int write_module_section(BsOut* o, uint32_t tag,
@@ -830,8 +878,23 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
         if (provenance_capacity <= SIZE_MAX - o.cap)
             o.cap += provenance_capacity;
     }
-    o.data = (uint8_t*)malloc(o.cap);
+    if (capture) {
+        if (capture->staging_capacity < o.cap) {
+            uint8_t *grown = realloc(capture->staging, o.cap);
+            if (!grown) return 0;
+            capture->staging = grown;
+            capture->staging_capacity = o.cap;
+        }
+        o.data = capture->staging;
+        o.cap = capture->staging_capacity;
+    } else {
+        o.data = (uint8_t*)malloc(o.cap);
+    }
     const int ok = o.data && boot_state_save_to(&o, cpu, bios_checksum, entry_pc);
+    if (capture) {
+        capture->staging = o.data;
+        capture->staging_capacity = o.cap;
+    }
     if (profile) {
         s_save_perf.active = 0;
         s_save_perf.last_ms = boot_state_mono_ms() - begin_ms;
@@ -851,7 +914,7 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
         }
     }
     if (!ok) {
-        free(o.data);
+        if (!capture) free(o.data);
         return 0;
     }
     *out_data = o.data;
@@ -916,6 +979,19 @@ void boot_state_encode_raw(BootStateRawCapture *capture) {
                     capture->len - tail);
         capture->len -= capture->provenance_capacity - size;
     }
+    if (capture->ok) {
+        uint8_t *packed = NULL;
+        size_t packed_size = 0u;
+        if (boot_state_compress_buffer(capture->data, capture->len, &packed, &packed_size)) {
+            /* Keep the large raw workspace in the encoder, rather than
+             * feeding a new ~25 MiB allocation through malloc each capture. */
+            if (capture->data != capture->staging) free(capture->data);
+            capture->data = packed;
+            capture->len = packed_size;
+        }
+        /* A compression allocation failure still leaves a complete raw state.
+         * Capturing/decompressing it uses the same checked section format. */
+    }
     if (capture->profile)
         capture->encode_ms = boot_state_mono_ms() - begin_ms;
 }
@@ -942,8 +1018,13 @@ int boot_state_finish_raw(BootStateRawCapture *capture,
     if (ok) {
         *out_data = capture->data;
         *out_len = capture->len;
+        if (capture->data == capture->staging) {
+            /* Raw fallback transfers ownership to the ring. */
+            capture->staging = NULL;
+            capture->staging_capacity = 0u;
+        }
     } else {
-        free(capture->data);
+        if (capture->data != capture->staging) free(capture->data);
     }
     capture->data = NULL;
     capture->len = 0u;
@@ -953,7 +1034,8 @@ int boot_state_finish_raw(BootStateRawCapture *capture,
 
 void boot_state_free_raw(BootStateRawCapture *capture) {
     if (!capture) return;
-    free(capture->data);
+    if (capture->data != capture->staging) free(capture->data);
+    free(capture->staging);
     ram_provenance_snapshot_free(capture->provenance);
     free(capture);
 }

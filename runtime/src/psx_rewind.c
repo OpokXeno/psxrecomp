@@ -623,7 +623,7 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         SDL_UnlockMutex(s_encoder.mutex);
         return 1;
     }
-    if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
+    if (!boot_state_save_buffer(&snap, s_bios, s_entry, &blob, &len) ||
         !blob || !len)
         return 0;
     s_perf.submitted++;

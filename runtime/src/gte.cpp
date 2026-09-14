@@ -225,7 +225,9 @@ enum {
     NATIVE_PROJECTION_ORIGIN_Y = 2u,
 };
 
-static NativeProjectionSlot *s_native_projection_ram = nullptr;
+static constexpr size_t NATIVE_PROJECTION_PAGE_WORDS = 256u;
+static NativeProjectionSlot *s_native_projection_pages[
+    PSX_MAIN_RAM_APERTURE_SIZE / (NATIVE_PROJECTION_PAGE_WORDS * sizeof(uint32_t))];
 static size_t s_native_projection_ram_words = 0;
 static NativeProjectionSlot s_native_projection_gte[4];
 static NativeProjectionSlot s_native_projection_gpr[32];
@@ -241,11 +243,13 @@ int g_gte_native_provenance_active = 0;
 }
 
 static void native_projection_generation_advance(void) {
+    /* Old-generation data is unreachable. Release only pages that actually
+     * carried a projected coordinate, rather than retaining a dense RAM shadow. */
+    for (auto &page : s_native_projection_pages) {
+        std::free(page);
+        page = nullptr;
+    }
     if (++s_native_projection_generation == 0) {
-        if (s_native_projection_ram)
-            std::memset(s_native_projection_ram, 0,
-                        s_native_projection_ram_words *
-                            sizeof(*s_native_projection_ram));
         std::memset(s_native_projection_gte, 0,
                     sizeof(s_native_projection_gte));
         std::memset(s_native_projection_gpr, 0,
@@ -254,32 +258,26 @@ static void native_projection_generation_advance(void) {
     }
 }
 
-static NativeProjectionSlot *native_projection_ram_slot(uint32_t address) {
+static NativeProjectionSlot *native_projection_ram_slot(uint32_t address, bool create = false) {
     const uint32_t physical = address & 0x1fffffffu;
 
-    if ((physical & 3u) != 0u || physical >= PSX_MAIN_RAM_APERTURE_SIZE ||
-        s_native_projection_ram == nullptr)
+    if ((physical & 3u) != 0u || physical >= PSX_MAIN_RAM_APERTURE_SIZE)
         return nullptr;
     const size_t index = memory_main_ram_word_offset(physical) >> 2u;
-    return index < s_native_projection_ram_words
-        ? &s_native_projection_ram[index] : nullptr;
+    if (index >= s_native_projection_ram_words) return nullptr;
+    NativeProjectionSlot *&page = s_native_projection_pages[index / NATIVE_PROJECTION_PAGE_WORDS];
+    if (!page && create)
+        page = (NativeProjectionSlot *)std::calloc(NATIVE_PROJECTION_PAGE_WORDS, sizeof(*page));
+    return page ? &page[index % NATIVE_PROJECTION_PAGE_WORDS] : nullptr;
 }
 
 extern "C" void gte_native_provenance_set_enabled(int enabled) {
     enabled = enabled ? 1 : 0;
     const size_t words = (size_t)g_psx_ram_size / sizeof(uint32_t);
-    if (enabled && (s_native_projection_ram == nullptr ||
-                    s_native_projection_ram_words != words)) {
-        NativeProjectionSlot *slots = words != 0
-            ? (NativeProjectionSlot *)std::calloc(words, sizeof(*slots))
-            : nullptr;
-        if (slots == nullptr) enabled = 0;
-        else {
-            std::free(s_native_projection_ram);
-            s_native_projection_ram = slots;
-            s_native_projection_ram_words = words;
-            native_projection_generation_advance();
-        }
+    if (!words) enabled = 0;
+    if (enabled && s_native_projection_ram_words != words) {
+        s_native_projection_ram_words = words;
+        native_projection_generation_advance();
     }
     if (s_native_projection_enabled != enabled)
         native_projection_generation_advance();
@@ -415,9 +413,14 @@ extern "C" void gte_native_provenance_cpu_store(
         uint32_t value) {
     (void)cpu;
     if (!s_native_projection_enabled || s_speculative_depth != 0) return;
-    NativeProjectionSlot *destination =
-        native_projection_ram_slot(address & ~3u);
     const uint32_t op = native_instruction_op(instruction);
+    const uint32_t source_rt = native_instruction_rt(instruction);
+    const NativeProjectionSlot *stored = source_rt ? &s_native_projection_gpr[source_rt] : nullptr;
+    const bool projected = op == 0x2bu ? native_projection_slot_matches(stored, value) :
+        op == 0x29u && stored && stored->generation == s_native_projection_generation &&
+        (stored->components & NATIVE_PROJECTION_X) &&
+        (uint16_t)stored->vertex.packed_sxy == (uint16_t)value;
+    NativeProjectionSlot *destination = native_projection_ram_slot(address & ~3u, projected);
     if (op == 0x2bu) {
         const uint32_t rt = native_instruction_rt(instruction);
         native_projection_copy_or_kill(
@@ -735,9 +738,10 @@ extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (s_gte_replay_sandbox || reg < 12 || reg > 15) return;
     pgxp_store_gte_reg(addr, reg);
     if (s_native_projection_enabled && s_speculative_depth == 0) {
-        NativeProjectionSlot *destination = native_projection_ram_slot(addr);
         const NativeProjectionSlot *source =
             &s_native_projection_gte[reg - 12u];
+        NativeProjectionSlot *destination = native_projection_ram_slot(addr,
+            source->generation == s_native_projection_generation);
         if (destination != nullptr) {
             if (source->generation == s_native_projection_generation)
                 *destination = *source;

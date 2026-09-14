@@ -126,13 +126,21 @@ static int native_motion_departures(const GlNativeRecipe *previous, const GlNati
             if (!native_recipe_private(&phase)) goto failed;
         }
         GlNativeRecipe *recipe = phase.recipe;
-        if (recipe->count == GL_NATIVE_RECIPE_CAPACITY) goto failed;
+        if (recipe->count == UINT32_MAX) goto failed;
+        GlNativeRecipeDraw *draws = xg_render_array_reserve(recipe->draws,
+            sizeof(*draws), &recipe->draw_capacity, recipe->count + 1u, UINT32_MAX);
+        if (!draws) goto failed;
+        recipe->draws = draws;
         uint32_t coverage = 0u;
         for (; coverage < recipe->coverage_count; ++coverage)
             if (!memcmp(&recipe->coverages[coverage].reference, &now->reference, sizeof(old->reference))) break;
         if (coverage == recipe->coverage_count) {
-            if (coverage == XG_RENDER_SCENE_RESOURCE_CAPACITY ||
-                !native_coverage_acquire_ref(now->reference)) goto failed;
+            if (coverage == UINT32_MAX) goto failed;
+            GlNativeRecipeCoverage *coverages = xg_render_array_reserve(recipe->coverages,
+                sizeof(*coverages), &recipe->coverage_capacity, coverage + 1u, UINT32_MAX);
+            if (!coverages) goto failed;
+            recipe->coverages = coverages;
+            if (!native_coverage_acquire_ref(now->reference)) goto failed;
             recipe->coverages[recipe->coverage_count++] = *now;
         }
         draw.temporal_index = coverage;

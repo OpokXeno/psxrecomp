@@ -182,6 +182,12 @@ BootStateRawCapture *boot_state_capture_raw(const CPUState *cpu,
                                            uint32_t entry_pc,
                                            BootStateRawCapture *reuse);
 void boot_state_encode_raw(BootStateRawCapture *capture);
+
+/* Lossless worker-safe repacking of an already captured state. Preserves the
+ * header and section order, using the existing per-section zlib wire encoding.
+ * Does not call guest/GL service hooks; caller owns the returned allocation. */
+int boot_state_compress_buffer(const uint8_t *data, size_t size,
+                              uint8_t **out_data, size_t *out_size);
 int boot_state_finish_raw(BootStateRawCapture *capture,
                           uint8_t **out_data, size_t *out_len,
                           BootStateRawCapture **out_reuse);
