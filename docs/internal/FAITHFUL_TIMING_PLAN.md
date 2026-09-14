@@ -212,6 +212,35 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-14 — Restore the host dithering override in Native rendering
+
+The Native CPU/GPU raster paths consumed only the guest material dither bit,
+unlike the legacy renderer which also honored the host master toggle. Capture
+the force-off preference in immutable display state, hash/compare it with the
+source frame, and carry it into endpoint and phase recipes. GPU command capture
+and CPU rasterization now both combine the captured override with the material
+bit. No guest GPU register state is changed. Debug native replay A/B with
+PSX_DITHERING=1/0 completed: 359 matched guest VBlank/cycle endpoints had different
+GPU pixel digests, and both runs presented alpha=1/2 midpoints. The focused
+native-work display-option snapshot/digest regression passed. Supplemental legacy
+scene-lane tests are obsolete (removed edge width/height fields, old bool compile
+callback and rejected legacy pass submission); they were not used as validation
+of the new native-work lane.
+
+### 2026-09-14 — Native worldmap interpolation screen departures
+
+The Native phase recipe previously iterated only current endpoint draws, dropping
+faces still visible under the intermediate camera as they exited the current
+viewport. Phase-only screen departures now use adjacent authenticated coverage
+samples, compatible geometry identities, and the existing shared vertex/pose
+interpolation. Original endpoint recipes and subsequent history remain unchanged.
+Verified with the recorded 3576-VBlank native-input replay in build-dbg, without
+runtime-state or screenshots: in the worldmap interval, 60 FPS produced 463 new
+ready phase groups and 106 observed swaps at alpha=1/2 (268/272 samples had a
+midpoint ready). The 30 FPS control reported zero generated/presented midpoints
+in 276 samples. Both replays exited normally. The user confirmed the culling
+defect was no longer visible. No guest timing or instruction semantics changed.
+
 - **2026-09-12 (16:9 title artwork and transition coverage, visually confirmed):**
   The user reported a stretched Xenogears title image and 4:3 black fades over
   the wide Field/World view. Actual window captures reproduce both independently

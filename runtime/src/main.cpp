@@ -616,6 +616,7 @@ static bool native_render_describe_work(XgRenderSourceFrameDescription *descript
         g_smooth_60fps_requested.load(std::memory_order_acquire)
         ? (uint16_t)g_native_interpolation_fps : 0u;
     description->display.render_scale = (uint16_t)g_video_scale;
+    description->display.dithering_disabled = gpu_dithering_enabled() == 0;
     return true;
 }
 

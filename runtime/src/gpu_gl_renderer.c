@@ -1057,6 +1057,7 @@ typedef struct GlNativeRecipeDraw {
     uint64_t temporal_component;
     uint32_t temporal_index;
     uint8_t enhanced;
+    uint8_t temporal_departure; /* Phase-only, never part of endpoint/history. */
     uint8_t dither_x, dither_y;
     uint16_t view_origin_y;
 } GlNativeRecipeDraw;
@@ -1082,6 +1083,7 @@ typedef struct GlNativeRecipe {
     GlNativeRecipeCoverage coverages[XG_RENDER_SCENE_RESOURCE_CAPACITY];
     GlNativeCoverageState *publication;
     uint16_t width, height, view_width, view_height, offset;
+    bool dithering_disabled;
     GlNativeRecipePixels *textures;
     /* Words depending on this replay's framebuffer, including COPY/draw aliases.
      * External rendered textures are otherwise immutable discrete inputs. */
@@ -6516,6 +6518,7 @@ typedef struct GlNativeCpuCompiler {
     int view_pass;
     GpuVramRegionSet *raster_words;
     uint8_t dither_x, dither_y;
+    bool dithering_disabled;
     GlNativeCpuSurface surfaces[XG_RENDER_SCENE_RESOURCE_CAPACITY];
     GlNativeCpuSurface *last_display_surface;
     uint32_t viewport_x;
@@ -7294,7 +7297,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     (!material->mask_check || (*destination >> 24u) == 0u)) {
                     int color[3] = {a->r, a->g, a->b};
                     const int end_color[3] = {b->r, b->g, b->b};
-                    const int phase = material->dither ? dither[
+                    const int phase = material->dither && !compiler->dithering_disabled ? dither[
                         (((y + compiler->dither_y) & 3) << 2) | ((x + compiler->dither_x) & 3)] : 0;
                     for (int channel = 0; channel < 3; ++channel) {
                         if (steps && material->shading == XG_RENDER_IR_SHADING_GOURAUD)
@@ -7561,7 +7564,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                         color5[channel] = color8[channel];
                 }
                 if (!material->textured || !material->raw_texture) {
-                    int phase = material->dither ? dither[
+                    int phase = material->dither && !compiler->dithering_disabled ? dither[
                         (((y + compiler->dither_y) & 3) << 2) | ((x + compiler->dither_x) & 3)] : 0;
                     for (int channel = 0; channel < 3; ++channel)
                         color5[channel] = native_clamp5(
@@ -8403,6 +8406,8 @@ static int native_gpu_draw(GlNativeCpuCompiler *compiler, const XgSemanticDrawRe
     GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_DRAW);
     if (!command) return 0;
     command->plane = compiler->gpu_plane; command->draw = *draw;
+    command->draw.primitive.material.dither =
+        draw->primitive.material.dither && !compiler->dithering_disabled;
     command->y = origin_y; command->x = compiler->dither_x;
     return 1;
 }
@@ -8607,6 +8612,7 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         recipe->publication = views->publication;
         if (recipe->publication) recipe->publication->references++;
     }
+    recipe->dithering_disabled = audit->header.display.dithering_disabled;
     if (!native_recipe_textures(recipe, target, words, &draw, audit->header.display.render_scale, views)) { native_recipe_drop(target); return; }
     uint32_t motion_index = UINT32_MAX;
     if (binding->motion.handle.resource_id) {
@@ -10227,6 +10233,7 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         .width = VRAM_W, .height = VRAM_H, .valid = 1};
     compiler.audit = audit;
     compiler.native_vram = &native; compiler.native_texture = &texture; compiler.native_clut = &clut;
+    compiler.dithering_disabled = recipe->dithering_disabled;
     compiler.viewport_width = width; compiler.viewport_height = recipe->height;
     compiler.gpu = gpu; compiler.gpu_only = gpu != NULL;
     compiler.gpu_plane = GL_NATIVE_GPU_PHASE_BASE + phase;
@@ -10236,6 +10243,11 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         .width = width, .height = recipe->height, .valid = 1};
     for (uint32_t i = 0u; i < recipe->count; ++i) {
         const GlNativeRecipeDraw *record = &recipe->draws[i];
+        if (record->temporal_departure &&
+            !(record->motion.motion.handle.resource_id
+                ? entities && record->motion_index < recipe->motion_count && entities[record->motion_index].enabled
+                : vertices && vertices->draw_mesh[i] != UINT32_MAX &&
+                    vertices->meshes[vertices->draw_mesh[i]].enabled)) continue;
         GpuRenderSemantic semantic = record->semantic;
         XgSemanticDrawRecord draw;
         if (semantic.material.draw_area_top < crop_y + row_begin)
@@ -10521,6 +10533,8 @@ static const XgRenderTemporalCoverageView *native_coverage_previous(const GlNati
     if (!ac || !bc || (!same && !xg_render_temporal_components_compatible(a->current.view.header, ac, b->current.view.header, bc))) return NULL;
     return &a->current.view;
 }
+
+#include "gpu_gl_native_departures.h"
 
 static int native_motion_texture_footprint_equal(
         const GpuRenderSemantic *a, const GpuRenderSemantic *b) {
@@ -10895,6 +10909,7 @@ static int native_motion_layout_equal(const GlNativeMotionHistory *history, cons
         a->disabled == b->disabled && a->native_width == b->native_width &&
         a->native_height == b->native_height && a->native_offset_x == b->native_offset_x &&
         a->temporal_hz == b->temporal_hz &&
+        a->dithering_disabled == b->dithering_disabled &&
         (a->render_scale ? a->render_scale : 1u) == (b->render_scale ? b->render_scale : 1u);
 }
 
@@ -10916,6 +10931,7 @@ static void native_motion_probe_discard(void) {
 static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRecipe *b) {
     if (a == b) return 1; /* Retained recipes are immutable through COPY/COW. */
     if (!a || !b || a->count != b->count || a->motion_count != b->motion_count || a->coverage_count != b->coverage_count ||
+        a->dithering_disabled != b->dithering_disabled ||
         a->clear_color != b->clear_color ||
         a->width != b->width || a->height != b->height || a->view_width != b->view_width ||
         a->view_height != b->view_height || a->offset != b->offset ||
@@ -10950,6 +10966,7 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
     GlNativeVertexDiagnostics vertex_diag = {.vblank = header->identity.guest_vblank_sequence};
     GlNativeMotionEntity *entities = NULL;
     GlNativeMotionProjection *projections = NULL;
+    GlNativeRecipe *phase_recipe = NULL;
     uint32_t *check = NULL;
     const uint32_t gpu_checkpoint = views->gpu ? views->gpu->count : 0u;
     prepared->history = (GlNativeMotionHistory){.identity = header->identity, .scene = header->scene, .display = header->display,
@@ -11028,6 +11045,9 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_SOURCE_CADENCE;
         goto finished;
     }
+    audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_ALLOCATION;
+    if (!native_motion_departures(old->recipe, recipe, &phase_recipe)) goto finished;
+    if (phase_recipe) recipe = phase_recipe;
     entities = calloc(recipe->motion_count ? recipe->motion_count : 1u, sizeof(*entities));
     audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_ALLOCATION;
     if (!entities) goto finished;
@@ -11151,6 +11171,7 @@ finished:
         probe->scanout_height = header->display.height;
     }
     native_motion_vertices_discard(&vertices); free(projections); free(entities);
+    native_recipe_release(phase_recipe);
 }
 
 static int native_compile_native_work(XgRenderSourceCommitHandle commit,
@@ -11263,6 +11284,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     canvas.resource = &texture;
     canvas.width = VRAM_W; canvas.height = VRAM_H; canvas.valid = 1;
     compiler.audit = audit;
+    compiler.dithering_disabled = display->dithering_disabled;
     compiler.native_vram = &canvas;
     compiler.native_words = canvas.words;
     compiler.raster_words = &views->raster_words;
@@ -11567,6 +11589,7 @@ static int native_compile_cpu(GlNativeCompileAudit *audit, uint32_t **out_pixels
     int result = 0, display_x = 0, display_y = 0;
     memset(&compiler, 0, sizeof(compiler));
     compiler.audit = audit;
+    compiler.dithering_disabled = audit->header.display.dithering_disabled;
     *out_pixels = NULL;
     if (audit->blocker != GL_RENDERER_NATIVE_BLOCKER_NONE) goto finished;
     if (audit->header.identity.source_sequence == 0u ||

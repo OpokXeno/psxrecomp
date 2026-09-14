@@ -14234,6 +14234,9 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"view_logical_draws\":%llu,\"view_physical_raster_passes\":%llu,"
         "\"view_targets\":%u,\"view_domains\":%u,"
         "\"expired_phase_generations\":%llu,\"whole_only_phase_generations\":%llu,"
+        "\"ready_phase_generations\":%llu,\"last_phase_count\":%u,"
+        "\"last_temporal_status\":\"%s\",\"last_interval_vblanks\":%u,"
+        "\"last_swap_alpha\":[%llu,%llu],"
         "\"legacy_owner\":{\"active\":%s,\"canonical_draws\":%llu,"
         "\"canonical_fills\":%llu,\"canonical_copies\":%llu,"
         "\"skipped_view_draws\":%llu,\"skipped_temporal_candidates\":%llu,"
@@ -14327,6 +14330,12 @@ static void handle_native_pipeline_diag(int id, const char *json)
         compiler.view_target_count, compiler.view_domain_count,
         (unsigned long long)compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_DEADLINE_EXPIRED],
         (unsigned long long)compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_WHOLE_ONLY],
+        (unsigned long long)compiler.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_READY],
+        compiler.last_temporal_phase_count,
+        gl_renderer_native_temporal_status_name(compiler.last_temporal_status),
+        compiler.last_temporal_interval_vblanks,
+        (unsigned long long)presentation.last_alpha_numerator,
+        (unsigned long long)presentation.last_alpha_denominator,
         compiler.legacy_owner.active ? "true" : "false",
         (unsigned long long)compiler.legacy_owner.canonical_draws,
         (unsigned long long)compiler.legacy_owner.canonical_fills,
