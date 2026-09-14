@@ -101,16 +101,14 @@ static int native_motion_departures(const GlNativeRecipe *previous, const GlNati
             before->semantic.screen_space_2d || before->semantic.native_view_effect ||
             native_departure_outside(previous, before)) continue;
         const GlNativeRecipeCoverage *old = &previous->coverages[before->temporal_index];
-        const GlNativeCoverageScope *scope = NULL;
-        for (uint32_t j = 0u; j < current->publication->count; ++j)
-            if (current->publication->scopes[j].current.view.header->producer_scope == old->view.header->producer_scope)
-                scope = &current->publication->scopes[j];
-        if (!scope || memcmp(&scope->previous.reference, &old->reference, sizeof(old->reference))) continue;
+        const GlNativeRecipeCoverage *now = native_coverage_recipe_scope(
+            current, old->view.header->producer_scope);
+        if (!now || memcmp(&now->predecessor, &old->reference, sizeof(old->reference))) continue;
         const XgRenderTemporalComponent *a = native_coverage_component(&old->view, before->temporal_component);
-        const XgRenderTemporalComponent *b = native_coverage_component(&scope->current.view, before->temporal_component);
-        if (!a || !b || !xg_render_temporal_components_compatible(old->view.header, a, scope->current.view.header, b)) continue;
+        const XgRenderTemporalComponent *b = native_coverage_component(&now->view, before->temporal_component);
+        if (!a || !b || !xg_render_temporal_components_compatible(old->view.header, a, now->view.header, b)) continue;
         GlNativeRecipeDraw draw;
-        if (!native_departure_reproject(before, &scope->current, &draw) ||
+        if (!native_departure_reproject(before, now, &draw) ||
             !native_departure_outside(current, &draw)) continue;
         if (draw.motion.motion.handle.resource_id) {
             const XgRenderMotionPose *old_pose, *new_pose;
@@ -131,11 +129,11 @@ static int native_motion_departures(const GlNativeRecipe *previous, const GlNati
         if (recipe->count == GL_NATIVE_RECIPE_CAPACITY) goto failed;
         uint32_t coverage = 0u;
         for (; coverage < recipe->coverage_count; ++coverage)
-            if (!memcmp(&recipe->coverages[coverage].reference, &scope->current.reference, sizeof(old->reference))) break;
+            if (!memcmp(&recipe->coverages[coverage].reference, &now->reference, sizeof(old->reference))) break;
         if (coverage == recipe->coverage_count) {
             if (coverage == XG_RENDER_SCENE_RESOURCE_CAPACITY ||
-                !native_coverage_acquire_ref(scope->current.reference)) goto failed;
-            recipe->coverages[recipe->coverage_count++] = scope->current;
+                !native_coverage_acquire_ref(now->reference)) goto failed;
+            recipe->coverages[recipe->coverage_count++] = *now;
         }
         draw.temporal_index = coverage;
         if (draw.textures) draw.textures->references++;

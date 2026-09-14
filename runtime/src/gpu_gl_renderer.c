@@ -1064,6 +1064,8 @@ typedef struct GlNativeRecipeDraw {
 typedef struct GlNativeRecipeCoverage {
     XgSemanticResourceRef reference;
     XgRenderTemporalCoverageView view;
+    /* Identity-only adjacency receipt; no ownership of predecessor bytes. */
+    XgSemanticResourceRef predecessor;
 } GlNativeRecipeCoverage;
 typedef struct GlNativeCoverageScope {
     GlNativeRecipeCoverage current, previous;
@@ -7806,7 +7808,7 @@ static int native_coverage_publish(GlNativeViewState *views, XgSemanticResourceR
     if (index == state->count) state->count++;
     native_coverage_release_ref(scope->previous.reference);
     scope->previous = scope->current;
-    scope->current = (GlNativeRecipeCoverage){ref, view};
+    scope->current = (GlNativeRecipeCoverage){ref, view, scope->previous.reference};
     return 1;
 }
 
@@ -8643,6 +8645,19 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
                 !native_coverage_acquire_ref(ref)) { native_recipe_drop(target); return; }
             temporal_index = recipe->coverage_count++;
             recipe->coverages[temporal_index] = (GlNativeRecipeCoverage){ref, view};
+            /* The CPU may publish the next camera before this OT reaches the
+             * GPU. Keep the adjacency receipt of the DRAW's source, not the
+             * latest publication at recipe completion. */
+            for (uint32_t i = 0u; views->publication && i < views->publication->count; ++i) {
+                const GlNativeCoverageScope *scope = &views->publication->scopes[i];
+                const GlNativeRecipeCoverage *source =
+                    !memcmp(&ref, &scope->current.reference, sizeof(ref)) ? &scope->current :
+                    !memcmp(&ref, &scope->previous.reference, sizeof(ref)) ? &scope->previous : NULL;
+                if (source) {
+                    recipe->coverages[temporal_index].predecessor = source->predecessor;
+                    break;
+                }
+            }
         }
         const XgRenderTemporalComponent *component = native_coverage_component(
             &recipe->coverages[temporal_index].view, operation->temporal.component_id);
@@ -10515,23 +10530,39 @@ static const GpuRenderSemanticVertex *native_coverage_vertex(const XgRenderTempo
         s->vertex.interpolation_vertex_id == vertex ? &s->vertex : NULL;
 }
 
+static const GlNativeRecipeCoverage *native_coverage_recipe_scope(
+        const GlNativeRecipe *recipe, uint32_t scope) {
+    const GlNativeRecipeCoverage *found = NULL;
+    for (uint32_t i = 0u; i < recipe->coverage_count; ++i) {
+        const GlNativeRecipeCoverage *candidate = &recipe->coverages[i];
+        if (candidate->view.header->producer_scope != scope) continue;
+        /* A mixed-update target has no unique source endpoint. */
+        if (found) return NULL;
+        found = candidate;
+    }
+    if (found) return found;
+    /* A wholly culled producer can still supply its authenticated source. */
+    for (uint32_t i = 0u; recipe->publication && i < recipe->publication->count; ++i) {
+        const GlNativeRecipeCoverage *candidate = &recipe->publication->scopes[i].current;
+        if (candidate->view.header->producer_scope == scope) return candidate;
+    }
+    return NULL;
+}
+
 static const XgRenderTemporalCoverageView *native_coverage_previous(const GlNativeRecipe *previous,
                                                                  const GlNativeRecipe *current, const GlNativeRecipeDraw *draw) {
-    if (!previous->publication || !current->publication || draw->temporal_index >= current->coverage_count) return NULL;
+    if (draw->temporal_index >= current->coverage_count) return NULL;
     const GlNativeRecipeCoverage *binding = &current->coverages[draw->temporal_index];
     const uint32_t scope = binding->view.header->producer_scope;
-    const GlNativeCoverageScope *a = NULL, *b = NULL;
-    for (uint32_t i = 0u; i < previous->publication->count; ++i)
-        if (previous->publication->scopes[i].current.view.header->producer_scope == scope) a = &previous->publication->scopes[i];
-    for (uint32_t i = 0u; i < current->publication->count; ++i)
-        if (current->publication->scopes[i].current.view.header->producer_scope == scope) b = &current->publication->scopes[i];
-    if (!a || !b || memcmp(&binding->reference, &b->current.reference, sizeof(binding->reference))) return NULL;
-    const int same = !memcmp(&a->current.reference, &b->current.reference, sizeof(binding->reference));
-    if (!same && memcmp(&a->current.reference, &b->previous.reference, sizeof(binding->reference))) return NULL;
-    const XgRenderTemporalComponent *ac = native_coverage_component(&a->current.view, draw->temporal_component);
-    const XgRenderTemporalComponent *bc = native_coverage_component(&b->current.view, draw->temporal_component);
-    if (!ac || !bc || (!same && !xg_render_temporal_components_compatible(a->current.view.header, ac, b->current.view.header, bc))) return NULL;
-    return &a->current.view;
+    const GlNativeRecipeCoverage *a = native_coverage_recipe_scope(previous, scope);
+    const GlNativeRecipeCoverage *b = native_coverage_recipe_scope(current, scope);
+    if (!a || b != binding) return NULL;
+    const int same = !memcmp(&a->reference, &b->reference, sizeof(binding->reference));
+    if (!same && memcmp(&a->reference, &b->predecessor, sizeof(binding->reference))) return NULL;
+    const XgRenderTemporalComponent *ac = native_coverage_component(&a->view, draw->temporal_component);
+    const XgRenderTemporalComponent *bc = native_coverage_component(&b->view, draw->temporal_component);
+    if (!ac || !bc || (!same && !xg_render_temporal_components_compatible(a->view.header, ac, b->view.header, bc))) return NULL;
+    return &a->view;
 }
 
 #include "gpu_gl_native_departures.h"

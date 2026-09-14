@@ -227,6 +227,57 @@ scene-lane tests are obsolete (removed edge width/height fields, old bool compil
 callback and rejected legacy pass submission); they were not used as validation
 of the new native-work lane.
 
+### 2026-09-14 — World camera/tree interpolation continuity (user confirmed)
+
+Follow-up static audit covered Field, central Battle and Battling. Fixed Field
+particle grouping (independent object plus spawn generation, shared by visible
+and culled paths), local embedded FT4 object grouping, and shared Field/Battle
+panorama band identities/coverage. Bands now keep role IDs 8/9/10 rather than
+compacted draw indices; hidden band samples remain part of the connected source
+component without emitting guest packets. Field pose-bound models, actor
+billboards/shadows and the shared Gear helper already use per-instance placement.
+Central Battle's source geometry capture and Battling's reviewed unkeyed/line
+routes do not provide the temporal metadata needed to claim complete 60 FPS
+interpolation; no identities were invented from their compacted output packets.
+
+The new source-fixture target `xg_field_temporal_continuity` passes normally and
+under Clang ASan/UBSan. It covers spawn/reuse/cull/parity identity and hidden-band
+continuity in both OT domains. The old static-auth suite still references removed
+UI/surface APIs and is not counted as passing. Build-dbg rebuilt; the full World
+regression replay reports runtime PASS/trace_complete, zero sampled compiler/GL
+errors and 191/191 sampled World statuses ready. No screenshots or Battle/Battling
+gameplay claims. Audit and scope: parent repository
+`docs/xenogears/graphics/07-native-temporal-continuity-audit.md`.
+
+The new 4862-VBlank replay `build-dbg/input-replay-20260914-201455-60fps.toml`
+reproduced three continuity defects without screenshots. World trees used moving
+5x5 window slots as IDs and lacked native-work temporal coverage; one new quad
+could make all 468 trees discrete. Tree identity now uses the source grid entry,
+and independently owned quad coverage includes culled samples. Terrain geometry
+digests included camera-dependent tile activity; native capture now snapshots
+inactive source tiles too, excluding visibility from geometry identity while
+preserving guest emission culls.
+
+Read-only recipe probes also proved a shared consumer defect: at VBlank 3316,
+actual draw updates were 3310/3312 but the latest publication was already 3314.
+`GlNativeRecipeCoverage` now retains an identity-only predecessor receipt and
+consumers select bound draw coverage rather than the latest published camera.
+Screen departures use the same source pairing. Mixed updates and nonadjacent or
+incompatible generations still reject; predecessor bytes gain no extra ownership.
+
+Before/after sampled runs each cover 86 world frames: completely discrete tree
+samples 15 -> 0; terrain 20 -> 0. The corrected probe has all 13,146 tree and
+120,740 terrain draws interpolation-enabled, with zero invalid vertex pairs.
+The final non-GDB replay completed: runtime PASS / trace_complete; all 189
+worldmap samples report ready, with no new expired phase generations and zero
+native compiler/GL errors. The separate legacy full-native certification status
+remains FAIL in both A/B evidence, not a certification pass. Four focused producer
+and shadow tests pass, including window-slide identity and hidden-tile capture
+regressions. Rebuilt `build-dbg/XenogearsRecomp`. The user confirmed the camera
+was much smoother and tree jitter was no longer noticeable. Full mechanism and
+artifact index: `docs/xenogears/worldmap/09-native-interpolation-continuity.md`
+in the Xenogears parent repository; local evidence `.tmp/world-jitter-*`.
+
 ### 2026-09-14 — Native worldmap interpolation screen departures
 
 The Native phase recipe previously iterated only current endpoint draws, dropping
