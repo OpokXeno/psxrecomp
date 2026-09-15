@@ -212,6 +212,106 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-15 — Residual subpixel wobble and camera affine inverse
+
+The user still saw subtle contour/position wobble after the whole-model clip
+rejection fix. GDB traced fractional coordinates through enhanced recipes into
+the actual GPU VIEW vertices: subpixel was enabled. However, retaining only the
+fractional final screen XY had already lost fractional MAC/SZ input and divide
+precision. In a visible field-15 sample, this differed from continuous projection
+by 0.185 pixels. Native binding now refines presentation coordinates from owned
+LOCAL geometry; matching Native endpoint/phase projection keeps those fractions.
+Canonical guest XY and source GTE matrices retain their hardware results.
+
+An initial coherent-TRS variant made the wobble worse, as reported by the user,
+and was rolled back. Comparing both signs of its residual over 251 captured
+camera states did not justify simply negating the correction. The recovered
+camera center was using the transpose of the fitted rotation divided by uniform
+scale, although the original Q12 view matrix contains affine rounding/shear.
+That is not its inverse and changes the recovered eye as the residual changes.
+The final variant obtains the center using the actual cofactor/determinant
+inverse, then uses the coherent camera/LOCAL-TRS basis for Native endpoints and
+phases. Wrapped World and staged Gear translations retain their source basis.
+Guest-owner derived transforms are cached by complete immutable motion ref.
+
+The user explicitly confirmed the final result: "Ya se ve bien!" The complete
+3,610-VBlank replay also exits 0 with `runtime_status=PASS`, healthy Native work,
+and all recorded runtime error counters zero. Replay SHA-256 and both root
+memory-card hashes match the baseline; cards are unchanged after playback.
+The build uses `cmake --build build-dbg --target psx-runtime -j 8`; playback uses
+the absolute root memcard directory and `--no-launcher`. No tests were executed
+or modified. Final receipts are
+`/home/pc/opencode-tmp/opencode/xg-field-camera-affine-inverse-60-*`; subpixel
+and matrix-series diagnostics remain under `xg-field-camera-*` and
+`xg-camera-*-series*` in that directory.
+
+### 2026-09-15 — Field 15 camera motion and whole-model temporal rejection
+
+The new `input-replay-20260915-203537-60fps.toml` records 3,610 VBlanks and
+loads field 15. Direct inspection of immutable render recipes confirmed that
+the models retained fractional Native coordinates and authenticated motion poses.
+The old `skipped_anchor_vertices` counter was not evidence of lost precision.
+Instead, producer `0x15e8f0` intermittently lost interpolation for its entire
+large model: at VBlanks 2501 and 2851, one offscreen face had a negative phase
+depth (approximately -71.62 / -72.75), causing `XG_RENDER_MOTION_CLIP_REQUIRED`
+and disabling all 442 / 392 primitives. Visible models then advanced at different
+temporal rates as the camera rotated.
+
+Removed the phase-only nonpositive-Z rejection from the shared motion projector.
+The GTE has no geometric near-plane clip: SZ saturates to zero and its divide
+result saturates to `0x1ffff`, as implemented independently by the source GTE
+projector in `xg_host_3d.c`. Motion already defined that finite projection for
+endpoints; temporal phases now use it too. Finite/range/lifecycle validation stays
+active. No field ID, model address, or viewport exception controls the behavior.
+
+The runtime build and complete gameplay replay succeed. GDB confirms the same
+two models now remain enabled, with zero projection failures and every primitive
+receiving its phase displacement. Source matrix/projective-coordinate error is
+zero; the largest visible midpoint curvature in those captures is below 0.026
+pixels. Projected draws rise from 216,345 to 362,590. All 3,613 recorded
+source/endpoint output digests agree; only temporal geometry changes. Replay and
+memory-card SHA-256 receipts match, and both memory cards remain unchanged.
+Launches use `--no-launcher` and the absolute
+`--memcard-dir /home/pc/xenogears-port/XenogearsRecomp`. Evidence:
+`/home/pc/opencode-tmp/opencode/xg-field-camera-{before,after}*` and
+`xg-field-camera-{reject,reject-after}.json`. Per user instruction, no tests were
+executed or modified. A first GDB launch that opened the launcher was discarded;
+GDB uses plain `run` to preserve its explicit `--args` command line.
+
+### 2026-09-15 — Restore Native interpolation throughput after integration
+
+The post-merge replay completed but lost temporal presentation continuity:
+1,096 midpoints / 149 expired phase generations versus 1,446 / 22 before the
+merge. A repeated post-merge run reproduced 1,183 / 128 and no midpoint presents
+through VBlanks 2640-2879. Native timing receipts showed expired construction
+budgets and a backed-up GPU work queue. Profiling with the correct root memory
+cards located substantial cost in the GL driver; the renderer replaced its VBO
+for each triangle/transfer in command slices containing thousands of draws.
+
+Native GPU service now prepares one immutable vertex upload per published FIFO
+slice and draws from explicit vertex offsets. Shared conversion helpers preserve
+triangle colors/coordinates and expanded-line endpoints; copies use the source
+plane extent that the ordered snapshot captures. Texture writes, snapshots,
+destination barriers, scissors and material changes retain their original order.
+Whole-buffer replacement preserves earlier queued vertex stores. This is a
+submission optimization, with the guest clock and temporal deadlines unchanged.
+Per-draw SubData/mapped-buffer experiments stalled on this driver and were fully
+discarded before selecting the immutable slice upload.
+
+Validation: `cmake --build build-dbg --target psx-runtime -j 8` passes. Using
+`build-dbg/input-replay-20260914-201455-60fps.toml` and the absolute
+`--memcard-dir /home/pc/xenogears-port/XenogearsRecomp`, the complete replay exits
+0 with `runtime_status=PASS`, healthy Native work, 1,455 midpoint presents,
+17 expired phase generations and zero sampled host audio underruns. Every full
+120-VBlank window from 2400 onward records 60 midpoints and 60 current presents.
+All 4,866 source/endpoint output digests match the unoptimized post-merge run,
+including the GPU-rendered base images. No screenshots or obsolete Native tests
+were used as gates. Receipts are in
+`/home/pc/opencode-tmp/opencode/xg-audio-20260915-interp-batched-vbo/`; paired
+timings are `xg-interp-merge-before.csv` and `xg-interp-merge-batched-vbo.csv` in
+the same temporary-work parent. Discard the earlier profile launched with
+relative `--memcard-dir .`, which resolved to the executable directory.
+
 ### 2026-09-15 — Local upstream integration with Native work rendering
 
 Integrated upstream/master at `193a60b8` on the unpublished

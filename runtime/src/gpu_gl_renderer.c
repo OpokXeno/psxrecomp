@@ -12404,8 +12404,104 @@ static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uin
     return 1;
 }
 
+static void native_gpu_draw_vertex_data(const GlNativeGpuCommand *command,
+                                       uint32_t triangle, float data[6][8]) {
+    const XgSemanticDrawRecord *draw = &command->draw;
+    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
+    memset(data, 0, 6u * 8u * sizeof(float));
+    for (unsigned v = 0; v < (lines ? 2u : 3u); ++v) {
+        const XgRenderIrVertex *iv = lines ? NULL : &draw->primitive.triangles[triangle].vertices[v];
+        const GpuRenderSemanticVertex *lv = lines ? &draw->lines[triangle].vertices[v] : NULL;
+        const unsigned c = m->shading == XG_RENDER_IR_SHADING_FLAT ? 0u : v;
+        data[v][0] = (float)(lines ? lv->x : iv->x) / 65536.f + m->draw_offset_x;
+        data[v][1] = (float)(lines ? lv->y : iv->y) / 65536.f + m->draw_offset_y - command->y;
+        data[v][2] = lines ? 0.f : (float)iv->u / 65536.f;
+        data[v][3] = lines ? 0.f : (float)iv->v / 65536.f;
+        data[v][4] = lines ? draw->lines[triangle].vertices[c].r : draw->primitive.triangles[triangle].vertices[c].r;
+        data[v][5] = lines ? draw->lines[triangle].vertices[c].g : draw->primitive.triangles[triangle].vertices[c].g;
+        data[v][6] = lines ? draw->lines[triangle].vertices[c].b : draw->primitive.triangles[triangle].vertices[c].b;
+    }
+}
+
+static void native_gpu_line_vertex_data(float data[6][8]) {
+    /* Unit-width geometry including both authored endpoints. */
+    float a[8], b[8]; memcpy(a,data[0],sizeof(a));memcpy(b,data[1],sizeof(b));
+    const float dx=b[0]-a[0],dy=b[1]-a[1],length=hypotf(dx,dy);
+    const float ux=length>0.f?dx/length:1.f,uy=length>0.f?dy/length:0.f;
+    const float extension=length>0.f?0.5f/length:0.f;
+    if (!length) memcpy(b,a,sizeof(b));
+    for(unsigned v=0;v<6u;++v) {
+        const int end=v==1u||v==4u||v==5u;
+        const float side=v==0u||v==1u||v==4u?-0.5f:0.5f;
+        memcpy(data[v],end?b:a,sizeof(a));
+        data[v][0]+=ux*(end?0.5f:-0.5f)-uy*side;
+        data[v][1]+=uy*(end?0.5f:-0.5f)+ux*side;
+        for(unsigned c=4u;c<7u;++c)data[v][c]+=(b[c]-a[c])*(end?extension:-extension);
+    }
+}
+
+static uint32_t native_gpu_command_vertex_count(const GlNativeGpuCommand *command) {
+    if (command->kind == NATIVE_GPU_DRAW)
+        return command->draw.topology == GPU_RENDER_SEMANTIC_LINES
+            ? command->draw.line_count * 6u : command->draw.primitive.triangle_count * 3u;
+    return command->kind == NATIVE_GPU_SEED || command->kind == NATIVE_GPU_SPAN ? 6u : 0u;
+}
+
+static int native_gpu_upload_vertex_slice(const GlNativeGpuWork *work,
+        const GlNativeGpuCommand *commands, uint32_t begin, uint32_t end) {
+    size_t count = 0u;
+    for (uint32_t i = begin; i < end; ++i) {
+        const uint32_t n = native_gpu_command_vertex_count(&commands[i]);
+        if (n > (size_t)INT_MAX - count) return 0;
+        count += n;
+    }
+    if (!count) return 1;
+    if (count > SIZE_MAX / (8u * sizeof(float))) return 0;
+    float (*vertices)[8] = malloc(count * sizeof(*vertices));
+    if (!vertices) return 0;
+    size_t cursor = 0u;
+    for (uint32_t i = begin; i < end; ++i) {
+        const GlNativeGpuCommand *command = &commands[i];
+        const uint32_t n = native_gpu_command_vertex_count(command);
+        if (!n) continue;
+        if (command->kind == NATIVE_GPU_DRAW) {
+            const int lines = command->draw.topology == GPU_RENDER_SEMANTIC_LINES;
+            const uint32_t stride = lines ? 6u : 3u;
+            for (uint32_t t = 0; t < n / stride; ++t) {
+                float data[6][8];
+                native_gpu_draw_vertex_data(command, t, data);
+                if (lines) native_gpu_line_vertex_data(data);
+                memcpy(vertices + cursor, data, stride * sizeof(*vertices));
+                cursor += stride;
+            }
+        } else {
+            float u0=0.f,v0=0.f,u1=1.f,v1=1.f;
+            if (command->kind != NATIVE_GPU_SEED && command->source != UINT32_MAX) {
+                const GlNativeGpuPlane *source = &work->planes[command->source];
+                if (!source->width || !source->height) { free(vertices); return 0; }
+                u0=(float)(command->sx*work->scale)/source->width;
+                v0=(float)(command->sy*work->scale)/source->height;
+                u1=(float)((command->sx+command->sw)*work->scale)/source->width;
+                v1=(float)((command->sy+command->sh)*work->scale)/source->height;
+            }
+            const float x=command->x,y=command->y,r=x+command->w,b=y+command->h;
+            const float data[6][8]={{x,y,u0,v0},{r,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{r,y,u1,v0},{r,b,u1,v1}};
+            memcpy(vertices + cursor, data, sizeof(data));
+            cursor += 6u;
+        }
+    }
+    /* One immutable upload per published FIFO slice. BufferData retains the
+     * previous store for queued draws; no in-flight range is overwritten.
+     * Texture writes, barriers, material changes and draws stay in FIFO order. */
+    p_glBufferData(PSXGL_ARRAY_BUFFER, count * sizeof(*vertices), vertices, PSXGL_STREAM_DRAW);
+    free(vertices);
+    return 1;
+}
+
 static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCommand *command,
-                                  GlNativeGpuPlane *snapshots, const uint8_t *captured_data) {
+                                  GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
+                                  uint32_t first_vertex) {
     GlNativeGpuPlane *plane=&work->planes[command->plane];
     const uint32_t scale=work->scale;
     if (command->kind==NATIVE_GPU_DRAW) {
@@ -12422,20 +12518,11 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             if(right>=(int)(plane->width/scale))right=plane->width/scale-1;
             if(bottom>=(int)(plane->height/scale))bottom=plane->height/scale-1;
             if(left>right||top>bottom)continue;
-            for(unsigned v=0;v<(lines?2u:3u);++v) {
-                const XgRenderIrVertex *iv=lines?NULL:&draw->primitive.triangles[t].vertices[v];
-                const GpuRenderSemanticVertex *lv=lines?&draw->lines[t].vertices[v]:NULL;
-                const unsigned c=m->shading==XG_RENDER_IR_SHADING_FLAT?0u:v;
-                data[v][0]=(float)(lines?lv->x:iv->x)/65536.f+m->draw_offset_x;
-                data[v][1]=(float)(lines?lv->y:iv->y)/65536.f+m->draw_offset_y-command->y;
-                data[v][2]=lines?0.f:(float)iv->u/65536.f; data[v][3]=lines?0.f:(float)iv->v/65536.f;
-                data[v][4]=lines?draw->lines[t].vertices[c].r:draw->primitive.triangles[t].vertices[c].r;
-                data[v][5]=lines?draw->lines[t].vertices[c].g:draw->primitive.triangles[t].vertices[c].g;
-                data[v][6]=lines?draw->lines[t].vertices[c].b:draw->primitive.triangles[t].vertices[c].b;
-                if (!lines) {
-                    attribute_x[v]=iv->x/65536.0+m->draw_offset_x;
-                    attribute_y[v]=iv->y/65536.0+m->draw_offset_y-command->y;
-                }
+            native_gpu_draw_vertex_data(command, t, data);
+            if (!lines) for(unsigned v=0;v<3u;++v) {
+                const XgRenderIrVertex *iv=&draw->primitive.triangles[t].vertices[v];
+                attribute_x[v]=iv->x/65536.0+m->draw_offset_x;
+                attribute_y[v]=iv->y/65536.0+m->draw_offset_y-command->y;
             }
             if (lines && command->plane == 0u &&
                 (abs((int)floorf(data[1][0])-(int)floorf(data[0][0])) >= VRAM_W ||
@@ -12452,23 +12539,6 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             if(left>right||top>bottom)continue;
             if (!lines) native_attribute_planes(&draw->primitive.triangles[t],
                 attribute_x,attribute_y,scale,m->shading==XG_RENDER_IR_SHADING_GOURAUD,&attributes);
-            if (lines) {
-                /* Unit-width geometry, including both authored endpoints; do
-                 * not depend on the driver's optional wide-line support. */
-                float a[8], b[8]; memcpy(a,data[0],sizeof(a));memcpy(b,data[1],sizeof(b));
-                const float dx=b[0]-a[0],dy=b[1]-a[1],length=hypotf(dx,dy);
-                const float ux=length>0.f?dx/length:1.f,uy=length>0.f?dy/length:0.f;
-                const float extension=length>0.f?0.5f/length:0.f;
-                if (!length) memcpy(b,a,sizeof(b));
-                for(unsigned v=0;v<6u;++v) {
-                    const int end=v==1u||v==4u||v==5u;
-                    const float side=v==0u||v==1u||v==4u?-0.5f:0.5f;
-                    memcpy(data[v],end?b:a,sizeof(a));
-                    data[v][0]+=ux*(end?0.5f:-0.5f)-uy*side;
-                    data[v][1]+=uy*(end?0.5f:-0.5f)+ux*side;
-                    for(unsigned c=4u;c<7u;++c)data[v][c]+=(b[c]-a[c])*(end?extension:-extension);
-                }
-            }
             if(!native_gpu_target(work,plane,scale,left,top,right-left+1,bottom-top+1,m->semi_transparent||m->mask_check))return 0;
             p_glUniform4f(s_native_gpu_size,(float)plane->width/scale,(float)plane->height/scale,0.5f/scale-1.f/64.f,(float)scale);
             /* The plane origin is target-local, just like gl_FragCoord. The
@@ -12492,14 +12562,12 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                 p_glUniform2i(s_native_gpu_origin,command->x,command->y);
                 s_native_gpu_origin_value[0]=command->x;s_native_gpu_origin_value[1]=command->y;
             }
-            p_glBufferData(PSXGL_ARRAY_BUFFER,(lines?6u:3u)*sizeof(data[0]),data,PSXGL_STREAM_DRAW);
-            glDrawArrays(GL_TRIANGLES,0,lines?6:3);
+            glDrawArrays(GL_TRIANGLES,(GLint)(first_vertex+t*(lines?6u:3u)),lines?6:3);
             work->geometry_draws++;
         }
         return 1;
     }
     GLuint texture=0;
-    float u0=0,v0=0,u1=1,v1=1;
     if(command->kind==NATIVE_GPU_SEED) {
         p_glActiveTexture(PSXGL_TEXTURE0+2); glBindTexture(GL_TEXTURE_2D,s_native_gpu_input);
         glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,command->w,command->h,0,GL_RGBA,GL_UNSIGNED_BYTE,captured_data+command->data);
@@ -12510,9 +12578,6 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
         const GlNativeGpuPlane *source=&snapshots[command->source];
         if(!source->texture)return 0;
         texture=source->texture;
-        u0=(float)(command->sx*scale)/source->width; v0=(float)(command->sy*scale)/source->height;
-        u1=(float)((command->sx+command->sw)*scale)/source->width;
-        v1=(float)((command->sy+command->sh)*scale)/source->height;
     }
     if(!native_gpu_target(work,plane,scale,command->x,command->y,command->w,command->h,(command->mask&2u)!=0))return 0;
     if(texture){p_glActiveTexture(PSXGL_TEXTURE0+2);glBindTexture(GL_TEXTURE_2D,texture);}
@@ -12520,9 +12585,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
     native_gpu_uniform4(1,s_native_gpu_flags,command->mask&1u,(command->mask>>1u)&1u,0,texture?2:1);
     p_glUniform4f(s_native_gpu_color,(command->color&255u)/255.f,((command->color>>8u)&255u)/255.f,
         ((command->color>>16u)&255u)/255.f,(command->color>>24u)/255.f);
-    const float x=command->x,y=command->y,r=x+command->w,b=y+command->h;
-    const float data[6][8]={{x,y,u0,v0},{r,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{r,y,u1,v0},{r,b,u1,v1}};
-    p_glBufferData(PSXGL_ARRAY_BUFFER,sizeof(data),data,PSXGL_STREAM_DRAW); glDrawArrays(GL_TRIANGLES,0,6);
+    glDrawArrays(GL_TRIANGLES,(GLint)first_vertex,6);
     work->transfer_draws++;
     return 1;
 }
@@ -12695,8 +12758,12 @@ static int native_gpu_service(void) {
         p_glUseProgram(s_native_gpu_program);p_glBindVertexArray(s_native_gpu_vao);
         p_glBindBuffer(PSXGL_ARRAY_BUFFER,s_native_gpu_vbo);
         p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_native_gpu_words);
+        if (ok) ok=native_gpu_upload_vertex_slice(work,commands,work->cursor,command_limit);
+        uint32_t first_vertex=0u;
         for(uint32_t i=work->cursor;i<command_limit&&ok;++i) {
             const GlNativeGpuCommand *command=&commands[i];
+            const uint32_t command_first_vertex=first_vertex;
+            first_vertex+=native_gpu_command_vertex_count(command);
             if(command->kind==NATIVE_GPU_WORDS) {
                 work->word_uploads++;
                 int left=VRAM_W,top=VRAM_H,right=0,bottom=0;
@@ -12725,7 +12792,7 @@ static int native_gpu_service(void) {
                     ok=native_gpu_plane_size(&snapshots[j],work->planes[j].width,work->planes[j].height);
                     if(ok)native_gpu_blit(&work->planes[j],&snapshots[j],0,0,work->planes[j].width,work->planes[j].height);
                 }
-            } else ok=native_gpu_render_command(work,command,snapshots,captured_data);
+            } else ok=native_gpu_render_command(work,command,snapshots,captured_data,command_first_vertex);
             work->cursor=i+1u;
             if(!gpu_owner&&ok&&work->cursor<command_limit&&SDL_GetTicksNS()-started>=1000000u) {
                 /* Resume the exact next FIFO command on the next owner service.
@@ -12873,12 +12940,15 @@ static int native_gpu_thread_main(void *unused) {
                 }
                 p_glBindFramebuffer(PSXGL_FRAMEBUFFER,warm.planes[0].framebuffer);
                 glDisable(GL_SCISSOR_TEST);glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);
-                warmed&=native_gpu_render_command(&warm,&command,warm.snapshots,warm.data);
+                warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u) &&
+                    native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,0u);
             }
         command=(GlNativeGpuCommand){.kind=NATIVE_GPU_SPAN,.source=UINT32_MAX,.w=16,.h=16,.color=0xff000000};
-        warmed&=native_gpu_render_command(&warm,&command,warm.snapshots,warm.data);
+        warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u) &&
+            native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,0u);
         command.kind=NATIVE_GPU_SEED;warm.data=(uint8_t *)warm_pixels;
-        warmed&=native_gpu_render_command(&warm,&command,warm.snapshots,warm.data);
+        warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u) &&
+            native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,0u);
         glFinish();
         warmed&=!native_drain_gl_errors();
     }
