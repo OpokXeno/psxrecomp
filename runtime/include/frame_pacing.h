@@ -56,6 +56,16 @@ void frame_pacer_wait(FramePacer *p, double period_ms);
  * transient debt and forgiving it once thirty full frames late. */
 void frame_pacer_wait_stable(FramePacer *p, double period_ms);
 
+/* 1 while the display driver's swap block — not the pacer above — is what holds
+ * the guest to its vblank cadence (present_vsync_owns_cadence() in main.cpp).
+ * The two are XOR: when this returns 1 the frontend does not call
+ * frame_pacer_wait(), so the ONLY thing throttling the guest is the swap.
+ *
+ * A renderer that elides a redundant swap (unchanged front buffer) must
+ * therefore not do so while this is 1: the elided frame blocks on nothing, and
+ * a game that presents every other vblank runs at 2x. */
+int psx_present_vsync_owns_cadence(void);
+
 #ifdef __cplusplus
 }
 #endif

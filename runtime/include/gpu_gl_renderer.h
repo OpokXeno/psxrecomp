@@ -22,6 +22,10 @@ extern "C" {
 /* Create the GL context on a window made with SDL_WINDOW_OPENGL.
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
+/* Select a retained immutable bank for the next textured submission; zero
+ * selects live VRAM. Emulation/GL owning thread only. Returns 0 if unavailable. */
+int gl_renderer_select_texture_bank(uint16_t id);
+int gl_renderer_texture_banks_supported(void);
 
 /* Native OpenGL transport.  init_services must run on the thread which owns
  * s_ctx, while that context is current; it creates a shared presenter context
@@ -515,11 +519,13 @@ void gl_renderer_set_swap_interval(int interval);
 int gl_renderer_set_native_interpolation_fps(int target_fps);
 int gl_renderer_native_interpolation_fps(void);
 
-/* Presentation-only frame interpolation. High-refresh sub-presents blend the
- * two most recent stable display images; guest simulation timing is unchanged. */
+/* Presentation-only temporal blending. High-refresh sub-presents blend the two
+ * most recent stable display images on the owning render thread/context; this
+ * does not generate motion vectors or true intermediate object positions. */
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
-                                   int blend_mode);
+                                   double source_hz, int blend_mode);
 void gl_renderer_set_interpolation_suspended(int suspended);
+int gl_renderer_interpolation_owns_cadence(void);
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames,
                                     double *host_hz, double *target_hz,
@@ -543,6 +549,12 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
                                          int src_h, int linear, int force_4_3,
                                          int content_w);
+
+/* Bezel art shown in the letterbox/pillarbox margins. Takes RGBA8 pixels; the
+ * caller owns them and may free them on return. Passing NULL clears it.
+ * Returns 0 only if a texture could not be created. */
+int  gl_renderer_set_bezel(const void *rgba, int w, int h);
+int  gl_renderer_has_bezel(void);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
@@ -579,6 +591,11 @@ void gl_renderer_restage_vram_after_savestate(void);
  * digests / GPUREAD authority) while the OpenGL hr FBO keeps settings-scale
  * SSAA for present-only. Never enables glReadPixels; CPU stays current. */
 void gl_renderer_set_cpu_auth_dual(int on);
+
+/* FMV present reconstruction, settings.toml [video] fmv_filter. Takes the
+ * config enum VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic).
+ * Only consulted while video antialiasing is on; AA off is always nearest. */
+void gl_renderer_set_fmv_filter(int cfg_value);
 int  gl_renderer_cpu_auth_dual(void);
 
 /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).
@@ -1065,6 +1082,23 @@ GpuRenderTransactionStatus gl_renderer_record_interpolation_anchors(
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
+
+/* Scanline post-process (host display setting). on toggles the effect; strength
+ * (0..1) is the depth of the dark gap between PS1 scanlines. Applied at the
+ * native display-line pitch in the present/interpolation shaders, and faded in
+ * with output scale so it never shimmers on a sub-2x window. gl_renderer_get_
+ * scanlines returns the on flag and (via out-param) the current strength. */
+void gl_renderer_set_scanlines(int on, float strength);
+int  gl_renderer_get_scanlines(float *strength);
+
+/* Presentation-only gamma adjustment. gamma = 1.0 is the identity; values
+ * above 1.0 lift shadow detail and values below 1.0 darken it. The adjustment
+ * is applied once to game content in the final GL presentation pass, including
+ * temporal interpolation, but not to the bezel, host OSD, black margins, or an
+ * already-composed hold-last image. Non-finite and out-of-range values are
+ * clamped to a safe range. Safe to call before GL context creation. */
+void  gl_renderer_set_post_gamma(float gamma);
+float gl_renderer_get_post_gamma(void);
 
 /* Select full native-wide mirror rendering instead of the centre-splice fast
  * path. Textured edge expansion needs the complete mirror surface. */

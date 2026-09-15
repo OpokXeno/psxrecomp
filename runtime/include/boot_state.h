@@ -43,10 +43,11 @@ extern "C" {
  * v6 = v5 + exact game and manifest SHA-256 identities;
  * v7 = v6 + explicit active main-RAM size and profile;
  * v8 = v7 + renderer-owned Native resource checkpoint;
- * v9 = v8 + exact RAM provenance authority. */
-#define BOOT_STATE_VERSION 9u
+ * v9 = v8 + exact RAM provenance authority;
+ * v10 = v9 + per-word DMA2, XA DATA_END and enhancement-memory layout cookie. */
+#define BOOT_STATE_VERSION 10u
 /* Only the current complete wire format is accepted. */
-#define BOOT_STATE_VERSION_MIN_READ 9u
+#define BOOT_STATE_VERSION_MIN_READ 10u
 /* Section pad bit0: payload is u32 LE uncompressed_len + zlib deflate bytes. */
 #define BOOT_STATE_SEC_ZLIB 1u
 
@@ -70,6 +71,7 @@ typedef struct {
     uint32_t ram_profile;    /* BOOT_STATE_RAM_PROFILE_*                           */
     uint8_t  game_sha256[32];
     uint8_t  manifest_sha256[32];
+    uint32_t reserved;       /* enhancement-memory layout cookie; vanilla 0      */
 } BootStateHeader;
 
 enum {
@@ -78,19 +80,20 @@ enum {
 };
 
 #define BOOT_STATE_GAME_IDENTITY_OFFSET 40u
-#define BOOT_STATE_HEADER_WIRE_BYTES 104u
+#define BOOT_STATE_HEADER_WIRE_BYTES 108u
 
 /*
- * Section stream (v9): section_count records, each laid out as
+ * Section stream (v10): section_count records, each laid out as
  *     uint32_t tag;        LE (one of BS_SEC_*)
  *     uint32_t pad;        LE flags (BOOT_STATE_SEC_ZLIB optional)
  *     uint64_t len;        LE payload byte count
  *     uint8_t  payload[len];   (module payloads are LE field wires too)
  * When BOOT_STATE_SEC_ZLIB is set, payload = u32 LE raw_len + zlib(raw).
- * An unknown tag, a length mismatch, or a missing required section on load is a
- * hard reject (incomplete restore is never allowed) -> normal boot + recapture.
+ * Unknown, malformed or missing required sections are rejected before commit;
+ * an incomplete restore is never allowed.
  */
 enum {
+    BS_SEC_MODMEM = 0x13,  /* allocated opt-in CPU/GPU enhancement arenas */
     BS_SEC_CPU    = 0x01,  /* CPUState: gpr/pc/hi/lo/cop0/gte_data/gte_ctrl       */
     BS_SEC_RAM    = 0x02,  /* active 2 MiB or 8 MiB main RAM                       */
     BS_SEC_SPAD   = 0x03,  /* 1 KB scratchpad                                     */

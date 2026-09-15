@@ -33,6 +33,10 @@
 #  include <unistd.h>
 #endif
 
+#ifndef PSX_OVERLAY_FLAVOR
+#define PSX_OVERLAY_FLAVOR 0
+#endif
+
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
                             * many absolute paths (python+script+recompiler+tcc+...) */
 static char s_cwd[512];
@@ -1160,6 +1164,16 @@ int autocompile_request(void) {
     if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
     SetEnvironmentVariableA("PSX_OVERLAY_LIVE_AUTOCOMPILE", "1");
     SetEnvironmentVariableA("PSX_OVERLAY_DEFER_ACTIVATION", "1");
+    /* Pin the FLAVOR the same way: the tool's --flavor defaults to 0 (play),
+     * so an instrumented (flavor 2) runtime spawned a compile whose shards it
+     * could never load — the loader's flavor guard rejected them and EVERY
+     * overlay ran interpreted, forever, on debug builds. The child must
+     * always write the flavor this runtime reads. */
+    {
+        char flavor_buf[16];
+        snprintf(flavor_buf, sizeof flavor_buf, "%d", (int)PSX_OVERLAY_FLAVOR);
+        SetEnvironmentVariableA("PSX_OVERLAY_FLAVOR", flavor_buf);
+    }
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). The WHOLE command is

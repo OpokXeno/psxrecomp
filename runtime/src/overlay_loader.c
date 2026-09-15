@@ -633,6 +633,10 @@ static uint64_t s_diffgate_interp = 0;  /* CPS interior re-entries sent to the  
                                         /* interp because their candidate is    */
                                         /* still inside the diff verify budget  */
 static uint32_t s_last_crc       = 0;
+/* psx_overlay_resident_crc_at(phys, &valid) -- the occupant fingerprint the dirty
+ * interpreter stamps on each interpreted PC (DirtyRamPcEntry.occ_crc) -- is
+ * defined with the static-match cache below; s_last_crc is its DLL-path
+ * fallback. */
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint64_t s_cand_overflow  = 0;   /* registrations dropped at CAND_CAP  */
 static uint64_t s_pair_aliases   = 0;   /* validated complete pairs deduped    */
@@ -692,8 +696,11 @@ typedef struct {
     const uint32_t *ranges;
     uint32_t count;
     uint8_t expected_sha256[32];
+    uint32_t expected_crc; /* diagnostic only; learned after SHA validation */
     uint32_t gen_sum;
     int      matches;
+    uint32_t lo_min;      /* span of the variant's code ranges (phys), for */
+    uint32_t hi_max;      /* psx_overlay_resident_crc_at()                 */
 } StaticMatchCache;
 
 static StaticMatchCache s_static_match_cache[STATIC_MATCH_CACHE_CAP];
@@ -788,6 +795,18 @@ int psx_overlay_static_code_matches(const uint32_t *lo_len_pairs,
            sizeof(entry->expected_sha256));
     entry->gen_sum = gen_sum;
     entry->matches = matches;
+    if (!same_identity) entry->expected_crc = 0u;
+    entry->lo_min = UINT32_MAX;
+    entry->hi_max = 0u;
+    uint32_t crc = UINT32_MAX;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t lo = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        const uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (lo < entry->lo_min) entry->lo_min = lo;
+        if (lo + len > entry->hi_max) entry->hi_max = lo + len;
+        if (matches) crc = crc32_update(crc, ram + lo, len);
+    }
+    if (matches) entry->expected_crc = crc ^ UINT32_MAX;
     return matches;
 }
 
@@ -853,6 +872,51 @@ int psx_overlay_static_note_candidate_dispatch(
     return 1;
 }
 
+/* Occupant fingerprint for an interpreted PC (tier-1 enrichment,
+ * DirtyRamPcEntry.occ_crc / occ_ok). Scans the static-match cache for the
+ * variant whose code ranges span `phys`:
+ *   - one that matched and whose pages are unchanged since (same
+ *     page-generation test the dispatch fast path uses) -> its manifest CRC,
+ *     *valid = 1. An interior the static walk missed, interpreted inside a
+ *     validating variant: the normal Axis B seed.
+ *   - otherwise the spanning variant most recently consulted -> its manifest
+ *     CRC, *valid = 0. "Compiled for this band, resident, but NOT validating"
+ *     -- a CRC-miss occupant (data inside the code range rewritten at run
+ *     time, or a section that differs from the one compiled). This is the
+ *     case a plain 0 would hide, and it is the one that explains a band that
+ *     is compiled yet fully interpreted (SCENA16 at the title screen,
+ *     2026-09-05).
+ *   - no spanning variant at all -> 0 / *valid = 0 (BIOS, kernel, boot EXE,
+ *     or a band nothing was compiled for); DLL-path titles get the last
+ *     residency hash as a hint instead.
+ * Static manifests carry SHA-256 here. The diagnostic CRC is learned only
+ * after those bytes validate; a never-validating candidate has no known CRC.
+ * This telemetry never participates in dispatch authorization.
+ * Called only on EXTERNAL interp
+ * entries, so a 4096-slot scan is fine. */
+uint32_t psx_overlay_resident_crc_at(uint32_t phys, int *valid) {
+    phys &= 0x1FFFFFFFu;
+    uint32_t stale = 0;
+    for (uint32_t i = 0; i < STATIC_MATCH_CACHE_CAP; i++) {
+        const StaticMatchCache *e = &s_static_match_cache[i];
+        if (!e->ranges || phys < e->lo_min || phys >= e->hi_max)
+            continue;
+        if (e->matches) {
+            uint32_t gen_sum = 0;
+            for (uint32_t k = 0; k < e->count; k++)
+                gen_sum += overlay_watch_pagegen_sum(e->ranges[k * 2u] & 0x1FFFFFFFu,
+                                                    e->ranges[k * 2u + 1u]);
+            if (gen_sum == e->gen_sum) {
+                if (valid) *valid = 1;
+                return e->expected_crc;
+            }
+        }
+        if (!stale) stale = e->expected_crc;
+    }
+    if (valid) *valid = 0;
+    return stale ? stale : s_last_crc;
+}
+
 void overlay_loader_static_match_stats(uint64_t *rehashes,
                                        uint64_t *crc_misses,
                                        uint64_t *gen_fastpath) {
@@ -860,6 +924,8 @@ void overlay_loader_static_match_stats(uint64_t *rehashes,
     if (crc_misses) *crc_misses = s_static_match_digest_misses;
     if (gen_fastpath) *gen_fastpath = s_static_match_gen_fastpath;
 }
+#else
+uint32_t psx_overlay_resident_crc_at(uint32_t phys, int *valid) { (void)phys; if (valid) *valid = 0; return s_last_crc; }
 #endif
 
 /* ---- Per-DLL code-range manifest --------------------------------------- */
@@ -2732,6 +2798,12 @@ static void init_callbacks(void) {
     s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
     /* Return-from-exception mark (ABI v12): overlay `rfe` ops forward here. */
     s_callbacks.rfe_mark_escape          = psx_rfe_mark_escape;
+    /* Stale-static guard (ABI v22): defined by the generated dispatch shard in
+     * this executable, so overlay DLLs forward here rather than link it. */
+    {
+        extern int psx_game_text_native_ok(uint32_t addr);
+        s_callbacks.game_text_native_ok  = psx_game_text_native_ok;
+    }
     /* Call-contract state (ABI v2): DLL code shares the runtime's bail
      * flag and counters through these pointers. */
     s_callbacks.call_bail_flag = &g_psx_call_bail;
@@ -2807,6 +2879,12 @@ static void init_callbacks(void) {
         {
             extern int32_t psx_ws_player_x_bound(int32_t vanilla);
             s_callbacks.ws_player_x_bound = psx_ws_player_x_bound;
+        }
+        {
+            extern int32_t psx_ws_screen_x_bound(int32_t vanilla);
+            extern void psx_mod_function_entry(CPUState *cpu, uint32_t address);
+            s_callbacks.ws_screen_x_bound = psx_ws_screen_x_bound;
+            s_callbacks.mod_function_entry = psx_mod_function_entry;
         }
         /* ABI v14: GTE precision-store tracker — the emitter emits a direct
          * gte_precision_store_word() call for every swc2 (GTE store-word),

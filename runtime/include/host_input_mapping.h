@@ -25,9 +25,10 @@ struct ControllerMapEntry {
     uint16_t bit = 0;
     const char* ini_name = nullptr;
     std::vector<ControllerSource> sources{};
+    uint16_t fold_bit = 0;
 };
 
-using ControllerMap = std::array<ControllerMapEntry, 16>;
+using ControllerMap = std::array<ControllerMapEntry, 24>;
 
 struct PlayerRoute {
     uint8_t kind = 0;

@@ -1157,7 +1157,7 @@ static void test_interpolation_history_gate(void) {
 
     gr_vram_write(0, 0, BLACK_1555);
     gl_renderer_flush_cpu_uploads();
-    gl_renderer_set_interpolation(1, 120.0, 120.0, 0);
+    gl_renderer_set_interpolation(1, 120.0, 120.0, 60.0, 0);
     gl_renderer_present_vram(0, 0, 320, 240, 0, 0);
     gl_renderer_interpolation_diag(&enabled, NULL, &history, NULL, NULL, NULL);
     expect_true(enabled == 1 && history > 0,
@@ -1166,7 +1166,7 @@ static void test_interpolation_history_gate(void) {
                   GPU_RENDER_TRANSACTION_STATE_REJECTED,
                   "active interpolation/history rejects begin");
 
-    gl_renderer_set_interpolation(0, 60.0, 60.0, 0);
+    gl_renderer_set_interpolation(0, 60.0, 60.0, 60.0, 0);
     gl_renderer_interpolation_diag(&enabled, NULL, &history, NULL, NULL, NULL);
     expect_true(enabled == 0 && history == 0,
                 "disabled interpolation has quiesced history");

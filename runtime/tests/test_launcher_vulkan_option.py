@@ -2,12 +2,12 @@
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
-main = (root / "runtime" / "src" / "main.cpp").read_text()
 launcher_ui = (root.parent / "recomp-ui" / "src" / "common" /
-               "backends" / "imgui" / "launcher_imgui.cpp").read_text()
-config_h = (root / "recompiler" / "src" / "config_loader.h").read_text()
-config_cpp = (root / "recompiler" / "src" / "config_loader.cpp").read_text()
-runtime_cmake = (root / "runtime" / "runtime.cmake").read_text()
+               "backends" / "imgui" / "launcher_imgui.cpp").read_text(encoding="utf-8")
+main = (root / "runtime" / "src" / "main.cpp").read_text(encoding="utf-8")
+config_h = (root / "recompiler" / "src" / "config_loader.h").read_text(encoding="utf-8")
+config_cpp = (root / "recompiler" / "src" / "config_loader.cpp").read_text(encoding="utf-8")
+runtime_cmake = (root / "runtime" / "runtime.cmake").read_text(encoding="utf-8")
 
 assert "runtime/" + "launcher" not in runtime_cmake
 assert "Rml" + "Ui" not in runtime_cmake
@@ -23,8 +23,8 @@ assert "/*vulkan_offered*/" in config_cpp
 assert '"Software"' in main
 assert '"OpenGL (Recommended)"' in main
 assert '"Vulkan"' in main
-assert "gi.renderer_labels      = kPsxRendererLabels;" in main
-assert "gi.num_renderers        = vulkan_offered ? 3 : 2;" in main
+assert "gi->renderer_labels = kPsxRendererLabels;" in main
+assert "gi->num_renderers = vulkan_offered_b ? 3 : 2;" in main
 assert "ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1)" in main
 assert "settings requested Vulkan, but this game does not" in main
 

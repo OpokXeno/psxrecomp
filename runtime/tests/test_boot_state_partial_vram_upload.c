@@ -25,6 +25,7 @@ static uint32_t checkpoint_native_state;
 static uint32_t checkpoint_prepared_state;
 static int checkpoint_reject_restore;
 static uint8_t ram_before_fault[PSX_MAIN_RAM_RETAIL_SIZE];
+static uint32_t enhancement_state;
 
 uint32_t i_stat;
 uint32_t i_mask;
@@ -45,6 +46,18 @@ uint32_t memory_get_ram_size(void) { return sizeof(ram); }
 uint32_t memory_get_ram_word_mask(void) { return g_psx_ram_mask & ~3u; }
 int memory_developer_ram_enabled(void) { return 0; }
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address) { return address; }
+int gl_renderer_select_texture_bank(uint16_t id) { return id == 0u; }
+uint32_t psx_mod_memory_layout_cookie(void) { return 0x1234u; }
+uint32_t psx_mod_memory_snapshot_bytes(void) { return sizeof(enhancement_state); }
+void psx_mod_memory_snapshot_write(uint8_t *out) {
+    for (unsigned i = 0; i < 4; ++i) out[i] = (uint8_t)(enhancement_state >> (8u * i));
+}
+int psx_mod_memory_snapshot_read(const uint8_t *in, uint32_t size) {
+    if (!in || size != 4u) return 0;
+    enhancement_state = (uint32_t)in[0] | ((uint32_t)in[1] << 8u) |
+        ((uint32_t)in[2] << 16u) | ((uint32_t)in[3] << 24u);
+    return 1;
+}
 
 uint32_t psx_read_word(uint32_t address) {
     uint32_t offset = address & g_psx_ram_mask;
@@ -57,6 +70,7 @@ uint16_t psx_read_half(uint32_t address) {
     return (uint16_t)((uint16_t)ram[offset] |
                       ((uint16_t)ram[offset + 1u] << 8u));
 }
+uint32_t psx_mod_read_word(uint32_t address) { return psx_read_word(address); }
 uint8_t psx_read_byte(uint32_t address) {
     return ram[address & g_psx_ram_mask];
 }
@@ -318,6 +332,7 @@ int main(void) {
     gpu_set_vram_event_hook(capture_vram_event);
     boot_state_set_native_checkpoint_hooks(&checkpoint_hooks);
     checkpoint_native_state = UINT32_C(0x11223344);
+    enhancement_state = UINT32_C(0x12345678);
     vram = gpu_get_vram_ptr();
     for (size_t index = 0; index < 6u; ++index)
         vram[vram_index(index)] = (uint16_t)(UINT16_C(0x7000) + index);
@@ -341,6 +356,7 @@ int main(void) {
         return 1;
     }
     checkpoint_native_state = UINT32_C(0xa1b2c3d4);
+    enhancement_state = UINT32_C(0x87654321);
 
     dma_advance(14u);
     newer_source.receipt = ram_provenance_publish_event();
@@ -450,6 +466,7 @@ int main(void) {
             checkpoint_restore_calls != checkpoint_restores_before ||
             checkpoint_cancel_calls != checkpoint_cancels_before + 1u ||
             checkpoint_native_state != UINT32_C(0xa1b2c3d4) ||
+            enhancement_state != UINT32_C(0x87654321) ||
             restore_event_calls != restore_events_before ||
             memcmp(&cpu, &cpu_before_fault, sizeof(cpu)) != 0 ||
             memcmp(ram, ram_before_fault, sizeof(ram_before_fault)) != 0 ||
@@ -476,12 +493,14 @@ int main(void) {
     free(after_fault);
     free(before_fault);
 
+    const uint32_t expected_restore_events = restore_event_calls + 1u;
     if (!boot_state_load_buffer(state, state_size, bios_checksum, entry_pc,
                                 &cpu)) {
         free(state);
         return 1;
     }
     free(state);
+    if (enhancement_state != UINT32_C(0x12345678)) return 1;
     if (ram[0] == UINT8_C(0x5a) ||
         !ram_provenance_source_word(completed_base, &restored_source) ||
         restored_source.receipt != completed_source.receipt ||
@@ -499,7 +518,7 @@ int main(void) {
         restored_source.receipt != active_source.receipt)
         return 1;
     if (gpu_gp0_parser_is_idle() || upload_commit_calls != 0u ||
-        restore_event_calls != 1u || upload_event_calls != 0u ||
+        restore_event_calls != expected_restore_events || upload_event_calls != 0u ||
         checkpoint_restore_calls != 1u ||
         gpu_render_vram_mutation_serial() != serial_before)
         return 1;
@@ -511,7 +530,7 @@ int main(void) {
     if (gpu_gp0_parser_is_idle() || upload_commit_calls != 0u) return 1;
     gpu_write_gp0(UINT32_C(0x66665555));
     if (!gpu_gp0_parser_is_idle() || upload_commit_calls != 1u ||
-        restore_event_calls != 1u || upload_event_calls != 1u ||
+        restore_event_calls != expected_restore_events || upload_event_calls != 1u ||
         gpu_render_vram_mutation_serial() != serial_before + 1u)
         return 1;
     for (size_t index = 0; index < 6u; ++index) {

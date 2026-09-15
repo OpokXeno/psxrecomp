@@ -1908,7 +1908,7 @@ void psx_debug_overlay_toggle(void)
                                        &host_hz, &target_hz, &swaps);
         if (enabled && !s_interp_guard_active) {
             s_interp_guard_active = true;
-            gl_renderer_set_interpolation(0, host_hz, target_hz, 0);
+            gl_renderer_set_interpolation(0, host_hz, target_hz, 0.0, 0);
         }
     } else if (!s_visible && was_visible && s_interp_guard_active) {
         s_interp_guard_active = false;

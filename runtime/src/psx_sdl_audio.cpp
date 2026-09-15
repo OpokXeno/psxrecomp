@@ -47,6 +47,9 @@ extern "C" SDL_AudioDeviceID psx_sdl_audio_open(
 
     const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(s_audio_stream);
     if (have) {
+        /* Report the stream input spec. SDL3 converts from this format to the
+         * device format internally; reporting the device format here makes the
+         * runtime generate at the wrong rate before SDL resamples it again. */
         std::memset(have, 0, sizeof(*have));
         /* SDL3's device stream converts from the application-side format
          * supplied above. Callers must generate that format, not the physical

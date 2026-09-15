@@ -44,7 +44,9 @@ uint16_t controller_buttons(const ControllerSnapshot* controller, const Controll
         for (const ControllerSource& source : entry.sources) {
             if ((!suppress_sticks || !stick_axis(source)) &&
                 source_pressed(controller, source, deadzone)) {
-                buttons &= static_cast<uint16_t>(~entry.bit);
+                const uint16_t bit = entry.bit ? entry.bit :
+                    (!suppress_sticks ? entry.fold_bit : 0u);
+                buttons &= static_cast<uint16_t>(~bit);
                 break;
             }
         }
@@ -108,7 +110,7 @@ int capture_pad_slot(const HostInputSnapshot& snapshot, int slot, PlayerRoute* p
                      const MappingOptions& options, PsxNetPad* out) {
     if (!out || !player || slot < 0 || slot > 1) return 0;
     *out = {0xFFFFu, 0x80u, 0x80u, 0x80u, 0x80u, 0u, 0u};
-    const bool dev_here = options.dev_p1 && slot == 0;
+    const bool dev_here = options.dev_p1;
     if (player->kind == 0 && !dev_here) return 0;
 
     const int player_number = slot + 1;
@@ -147,7 +149,7 @@ int capture_pad_slot(const HostInputSnapshot& snapshot, int slot, PlayerRoute* p
             if (!options.keyboard_swallowed)
                 psx_keybinds_sticks(snapshot.keyboard().data(), player_number, sticks);
         } else {
-            controller_sticks(selected, options.controller_deadzone, true, sticks);
+            controller_sticks(selected, options.controller_deadzone, false, sticks);
         }
     } else if (analog) {
         if (player->kind == 1) {

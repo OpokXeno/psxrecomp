@@ -3,10 +3,14 @@ from pathlib import Path
 import re
 
 source = (Path(__file__).parents[1] / "src" / "gpu_vk_renderer.c").read_text()
+# Match the DEFINITION, not the forward declaration: require the parameter
+# list to be followed by `{`. Without `[^;]*?\)\s*\{` the search latches onto
+# the prototype above the definition and `body` becomes the *next* function
+# (finish_present), which silently satisfied the TRANSFER_BIT assertion while
+# never examining submit_present at all.
 match = re.search(
-    r"static void submit_present\([^)]*\)\s*\{.*?^\}",
-    source,
-    flags=re.DOTALL | re.MULTILINE,
+    r"static void submit_present\([^;]*?\)\s*\{.*?\n\}", source,
+    flags=re.DOTALL
 )
 assert match, "submit_present definition not found"
 body = match.group(0)

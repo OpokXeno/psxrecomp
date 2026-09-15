@@ -1,5 +1,6 @@
 #include "boot_state.h"
 #include "game_identity.h"
+#include "mod_memory.h"
 #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
 #include "dirty_ram_interp.h"
 #include "gpu.h"           /* gpu_get_vram — CPU-auth mirror under dual-raster   */
@@ -422,6 +423,7 @@ static int write_header_le(BsOut* o, const BootStateHeader* h) {
         !pst_w_u32(&w, h->ram_profile) ||
         !pst_w_bytes(&w, h->game_sha256, sizeof(h->game_sha256)) ||
         !pst_w_bytes(&w, h->manifest_sha256, sizeof(h->manifest_sha256)) ||
+        !pst_w_u32(&w, h->reserved) ||
         w.written != BOOT_STATE_HEADER_WIRE_BYTES)
         return 0;
     return bs_write(o, buf, sizeof buf);
@@ -703,6 +705,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     memset(&h, 0, sizeof h);
     h.magic         = BOOT_STATE_MAGIC;
     h.version       = BOOT_STATE_VERSION;
+    h.reserved      = psx_mod_memory_layout_cookie();
     h.bios_checksum = bios_checksum;
     h.entry_pc      = entry_pc;
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
@@ -719,7 +722,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (!identity) return 0;
     memcpy(h.game_sha256, identity->game_sha256, sizeof(h.game_sha256));
     memcpy(h.manifest_sha256, identity->manifest_sha256, sizeof(h.manifest_sha256));
-    h.section_count = 18;
+    h.section_count = 18 + (psx_mod_memory_snapshot_bytes() ? 1u : 0u);
 
     ok = write_header_le(o, &h);
 
@@ -727,6 +730,9 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(), h.ram_size);
     if (ok) ok = write_ram_provenance_section(o);
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
+    if (ok && psx_mod_memory_snapshot_bytes())
+        ok = write_module_section(o, BS_SEC_MODMEM, psx_mod_memory_snapshot_bytes,
+                                  psx_mod_memory_snapshot_write);
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
          * rebased every tip to phase 0 and forked MotK wait-loop resim
@@ -1197,6 +1203,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         free(words);
         return 1;
     }
+    case BS_SEC_MODMEM:
+        return psx_mod_memory_snapshot_read(p, len);
     case BS_SEC_ICACHE: {
         PstR r;
         if (len != 1024u * 4u) return 0;
@@ -1206,6 +1214,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return 1;
     }
     default:
+        /* The complete section set is validated before any state is applied. */
         return 0;
     }
 }
@@ -1230,7 +1239,8 @@ static int boot_state_parse_header(const uint8_t* file, size_t file_len,
         !pst_r_u32(&hr, &h_out->ram_size) ||
         !pst_r_u32(&hr, &h_out->ram_profile) ||
         !pst_r_bytes(&hr, h_out->game_sha256, sizeof(h_out->game_sha256)) ||
-        !pst_r_bytes(&hr, h_out->manifest_sha256, sizeof(h_out->manifest_sha256))) {
+        !pst_r_bytes(&hr, h_out->manifest_sha256, sizeof(h_out->manifest_sha256)) ||
+        !pst_r_u32(&hr, &h_out->reserved)) {
         return 0;
     }
     return 1;
@@ -1278,6 +1288,10 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
         snprintf(part, sizeof(part), "magic=%08X(want %08X)",
                  (unsigned)h.magic, (unsigned)BOOT_STATE_MAGIC);
         boot_state_append_reason(reason, reason_cap, part);
+    }
+    if (h.reserved != psx_mod_memory_layout_cookie()) {
+        boot_state_append_reason(reason, reason_cap, "enhancement_memory_layout");
+        return 0;
     }
     if (h.version < BOOT_STATE_VERSION_MIN_READ ||
         h.version > BOOT_STATE_VERSION) {
@@ -1375,6 +1389,7 @@ typedef struct BootStateRollback {
     BootStateModuleSnapshot dma;
     BootStateModuleSnapshot sio;
     BootStateModuleSnapshot mdec;
+    BootStateModuleSnapshot modmem;
     uint16_t *vram;
     uint8_t *spu_ram;
     uint32_t spu_ram_size;
@@ -1408,6 +1423,7 @@ static void boot_state_free_rollback(BootStateRollback *rollback)
     free(rollback->dma.data);
     free(rollback->sio.data);
     free(rollback->mdec.data);
+    free(rollback->modmem.data);
     free(rollback->vram);
     free(rollback->spu_ram);
     free(rollback->dirty_words);
@@ -1440,7 +1456,10 @@ static int boot_state_capture_rollback(BootStateRollback *rollback)
         !boot_state_capture_module(
             &rollback->sio, sio_snapshot_bytes, sio_snapshot_write) ||
         !boot_state_capture_module(
-            &rollback->mdec, mdec_snapshot_bytes, mdec_snapshot_write))
+            &rollback->mdec, mdec_snapshot_bytes, mdec_snapshot_write) ||
+        (psx_mod_memory_snapshot_bytes() && !boot_state_capture_module(
+            &rollback->modmem, psx_mod_memory_snapshot_bytes,
+            psx_mod_memory_snapshot_write)))
         goto fail;
 
     rollback->vram = (uint16_t *)malloc(VRAM_SIZE);
@@ -1501,6 +1520,8 @@ static int boot_state_restore_rollback(const BootStateRollback *rollback)
     ok &= dma_snapshot_read(rollback->dma.data, rollback->dma.size);
     ok &= sio_snapshot_read(rollback->sio.data, rollback->sio.size);
     ok &= mdec_snapshot_read(rollback->mdec.data, rollback->mdec.size);
+    if (rollback->modmem.size)
+        ok &= psx_mod_memory_snapshot_read(rollback->modmem.data, rollback->modmem.size);
     dirty_ram_set_bitmap_words(
         rollback->dirty_words, rollback->dirty_word_count);
     memcpy(g_psx_icache_tv, rollback->icache, sizeof(rollback->icache));
@@ -1540,7 +1561,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         (1u<<BS_SEC_TIMER)|(1u<<BS_SEC_CLOCK)|(1u<<BS_SEC_GPU)|(1u<<BS_SEC_VRAM)|
         (1u<<BS_SEC_SPU)|(1u<<BS_SEC_SPURAM)|(1u<<BS_SEC_CDROM)|(1u<<BS_SEC_DMA)|
         (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY)|(1u<<BS_SEC_ICACHE)|
-        (1u<<BS_SEC_NATIVE_RENDER)|(1u<<BS_SEC_RAM_PROVENANCE);
+        (1u<<BS_SEC_NATIVE_RENDER)|(1u<<BS_SEC_RAM_PROVENANCE)|
+        (psx_mod_memory_snapshot_bytes() ? (1u<<BS_SEC_MODMEM) : 0u);
     uint32_t seen = 0u;
     int ok = 1;
     const double t0 = boot_state_mono_ms();

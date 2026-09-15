@@ -418,7 +418,12 @@ std::atomic<int>                         g_msg_sep_pending{0}; // unpatched coun
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
-std::atomic<bool>     g_capture_on{false};    // opt-in authoring inventory
+std::atomic<bool>     g_capture_on{false};    // inventory capture DEFAULT OFF:
+    // the always-on Shift-JIS string-inventory scan costs 26-35% of
+    // whole-lane throughput on streaming-heavy titles (measured across
+    // three GT2 race lanes; reproduced fleet-wide). Substitution (table +
+    // language armed) is unaffected; PSX_XLATE_CAPTURE=1 re-enables the
+    // scan for translation authoring.
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_hits{0};
 std::string           g_lang = "en";
@@ -491,10 +496,11 @@ void load_tables_locked() {
         try { data = toml::parse(de.path().string()); }
         catch (...) { continue; }
         ++files;
-        if (!data.contains("entry")) continue;
-        const auto& arr = toml::find(data, "entry");
-        if (!arr.is_array()) continue;
-        for (const auto& e : arr.as_array()) {
+        /* A fixes-only file (vram_patch / glyph-label / msg blocks, no string
+         * table) is valid: gate each block on its own key, never the file. */
+        const auto arr = data.contains("entry") ? toml::find(data, "entry")
+                                                : toml::value(toml::array{});
+        if (arr.is_array()) for (const auto& e : arr.as_array()) {
             if (!e.contains("src_hex")) continue;
             std::string hex = toml::find_or<std::string>(e, "src_hex", "");
             auto bytes = hex_to_bytes(hex);
