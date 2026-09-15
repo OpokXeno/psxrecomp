@@ -163,6 +163,19 @@ typedef struct {
 static SpuVoice voices[SPU_VOICE_COUNT];
 static SDL_SpinLock s_spu_lock;
 
+static void (*s_sync_callback)(void);
+
+void spu_set_sync_callback(void (*callback)(void)) {
+    s_sync_callback = callback;
+}
+
+static void spu_sync(void) {
+    /* Catch up BEFORE taking the lock: the callback calls spu_render, which
+     * owns the lock while mixing. Device changes take effect only afterwards.
+     * Like Beetle's CDC/SPU update, this uses guest time, never host demand. */
+    if (s_sync_callback) s_sync_callback();
+}
+
 static void spu_lock(void) {
 #if defined(PSX_SDL3)
     SDL_LockSpinlock(&s_spu_lock);
@@ -449,6 +462,7 @@ static void spu_cd_audio_reset_unlocked(void) {
 }
 
 void spu_cd_audio_reset(void) {
+    spu_sync();
     spu_lock();
     spu_cd_audio_reset_unlocked();
     spu_unlock();
@@ -490,6 +504,7 @@ static void spu_cd_audio_push_unlocked(const int16_t* stereo, int frames) {
 }
 
 void spu_cd_audio_push(const int16_t* stereo, int frames) {
+    spu_sync();
     spu_lock();
     spu_cd_audio_push_unlocked(stereo, frames);
     spu_unlock();
@@ -1485,6 +1500,7 @@ static uint32_t spu_read_unlocked(uint32_t addr) {
 
 uint32_t spu_read(uint32_t addr) {
     uint32_t value;
+    spu_sync();
     spu_lock();
     value = spu_read_unlocked(addr);
     spu_unlock();
@@ -1597,6 +1613,7 @@ static void spu_write_unlocked(uint32_t addr, uint32_t value) {
 }
 
 void spu_write(uint32_t addr, uint32_t value) {
+    spu_sync();
     spu_lock();
     spu_write_unlocked(addr, value);
     spu_unlock();
@@ -1614,6 +1631,7 @@ static void spu_dma_write_unlocked(uint32_t word) {
 }
 
 void spu_dma_write(uint32_t word) {
+    spu_sync();
     spu_lock();
     spu_dma_write_unlocked(word);
     spu_unlock();
@@ -1625,6 +1643,7 @@ void spu_dma_write(uint32_t word) {
  * EXE transitions via this path; returning zeros breaks them. */
 uint32_t spu_dma_read(void) {
     uint32_t word = 0;
+    spu_sync();
     spu_lock();
     spu_irq_check(transfer_addr, 4u);
     if (transfer_addr + 3 < SPU_RAM_SIZE) {

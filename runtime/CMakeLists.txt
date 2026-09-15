@@ -612,6 +612,21 @@ if(BUILD_TESTING)
     add_test(NAME spu_end_without_repeat_test
              COMMAND spu_end_without_repeat_test)
 
+    add_executable(spu_guest_sync_test tests/test_spu_guest_sync.c)
+    target_include_directories(spu_guest_sync_test PRIVATE
+        include ${PSX_SDL_INCLUDE_DIRS})
+    target_compile_definitions(spu_guest_sync_test PRIVATE
+        $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>)
+    if(PSX_SDL_LIBRARY_DIRS)
+        target_link_directories(spu_guest_sync_test PRIVATE ${PSX_SDL_LIBRARY_DIRS})
+    endif()
+    if(PSX_STATIC_RUNTIME AND PSX_SDL_STATIC_LDFLAGS)
+        target_link_libraries(spu_guest_sync_test PRIVATE ${PSX_SDL_STATIC_LDFLAGS})
+    else()
+        target_link_libraries(spu_guest_sync_test PRIVATE ${PSX_SDL_LIBRARIES})
+    endif()
+    add_test(NAME spu_guest_sync_test COMMAND spu_guest_sync_test)
+
     add_executable(spu_gaussian_test tests/test_spu_gaussian.c)
     target_include_directories(spu_gaussian_test PRIVATE include)
     add_test(NAME spu_gaussian_test COMMAND spu_gaussian_test)

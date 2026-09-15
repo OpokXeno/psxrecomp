@@ -10,6 +10,11 @@ extern "C" {
 void spu_init(void);
 void spu_render(int16_t* out_stereo, int frames);
 
+/* Guest-thread catch-up before MMIO, DMA or CD input changes. The callback
+ * renders elapsed guest cycles with spu_render; it must not access SPU MMIO.
+ * Host audio callbacks only consume the resulting PCM. NULL disconnects it. */
+void spu_set_sync_callback(void (*callback)(void));
+
 typedef struct SpuDebugInfo {
     uint32_t ctrl;
     uint32_t active_mask;
@@ -129,8 +134,8 @@ void spu_dma_write(uint32_t word);
 uint32_t spu_dma_read(void);
 int spu_dma_ready(void);
 
-/* Protect direct SPU-RAM pointer access while the real-time audio worker may
- * be decoding a block. Prefer the copy/snapshot APIs when possible. */
+/* Protect direct SPU-RAM pointer access. Prefer the copy/snapshot APIs when
+ * possible. */
 void spu_state_lock(void);
 void spu_state_unlock(void);
 void spu_ram_copy_out(uint8_t *out, uint32_t len);

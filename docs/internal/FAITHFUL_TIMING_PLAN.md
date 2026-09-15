@@ -212,6 +212,43 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-15 — SPU/CD clock synchronization and Native audio crackling
+
+Static analysis traced the regression to the wall-clock SPU worker: it consumed
+CD/XA samples while the guest/CD sector clock was suspended. The latest recording
+(`build-dbg/input-replay-20260914-201455-60fps.toml`, 4,862 VBlanks) reproduced
+416 CD underflow frames before its first button skipped the intro. Extending
+only that recording's neutral prefix to 1,800 VBlanks reproduced 3,040 CD
+underflow frames; an approximately 9.5-second PCM window contained 39 interior
+zero runs in SPU output, while the decoded CD input contained none. SDL's own
+queue reported no underruns, localizing the corruption upstream of playback.
+
+The guest thread now owns SPU advancement at one sample per 768 guest cycles.
+VBlank and pre-MMIO/DMA/CD-input sync points share one remainder-carrying budget;
+pending samples use the old device state before a write, sector arrival, or
+stream reset. The SDL callback consumes only queued PCM. All elapsed SPU time
+advances even without a device or while host output is suppressed. Reference:
+Beetle PSX `mednafen/psx/cdc.c`, `PS_CDC_Update` / `SPU_UpdateFromCDC`, which
+schedule sector and SPU progress in the same emulated clock domain.
+
+The first full verification exposed a second clock defect: Native's minimum
+`last_actual_wake + 16666667 ns` deadline accumulated scheduler oversleep instead
+of recovering it, starving even the corrected guest-clock producer. Keep the
+absolute guest-cycle deadline and its existing long-stall recovery. With both
+fixes, the original replay and extended intro reach trace completion, exit 0,
+`runtime_status=PASS`, and `native_work.health=healthy`; sampled CD and host
+underflow/overflow totals are all zero. Final FMV PCM has no interior zero runs
+at either SPU or host output. The legacy renderer-authorization `status=FAIL`
+receipt is present before and after; it is not an audio or runtime-health verdict.
+
+Validation: `cmake --build build-dbg --target psx-runtime -j 8` succeeds; focused
+CTest `spu_guest_sync_test`, `spu_gaussian_test`, `spu_end_without_repeat_test`,
+and `cdrom_irq_mask_test` all pass. The new device test checks sector continuity,
+sub-sample/repeated-read boundaries, old-volume application, CD reset ordering,
+late-sector causality, and DMA synchronization. No screenshots were captured or
+used. Local PCM and TCP receipts live under
+`/home/pc/opencode-tmp/opencode/xg-audio-20260915-*`.
+
 ### 2026-09-14 — Restore the host dithering override in Native rendering
 
 The Native CPU/GPU raster paths consumed only the guest material dither bit,
