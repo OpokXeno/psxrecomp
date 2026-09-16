@@ -366,6 +366,24 @@ static bool xg_render_host_semantic_module(uint32_t *out_module) {
     XgScene scene = {};
 
     if (out_module == nullptr) return false;
+
+    /* The field/world/battle/battling overlays all load at the same address
+     * (0x8006faf0, header_size=0 per annotations/overlays/index.toml, so
+     * this is literally each overlay's first instruction word). Whichever
+     * one is currently resident there is ground truth for the active
+     * module — unlike active_module/requested_module below (0x800592C0/
+     * 0x80018088), which belong to the developer debug menu's state
+     * machine (CommitGameStateTransition, 0x8001996C) and are never
+     * populated during normal retail play (active_module reads a constant
+     * 0xFFFFFFFF, requested_module a constant RESIDENT). Signatures
+     * confirmed live across sustained field/world/battle sessions. */
+    switch (psx_read_word(0x8006faf0u)) {
+    case 0x00000004u: *out_module = XG_SEMANTIC_MODULE_FIELD;  return true;
+    case 0x00000005u: *out_module = XG_SEMANTIC_MODULE_WORLD;  return true;
+    case 0x00000006u: *out_module = XG_SEMANTIC_MODULE_BATTLE; return true;
+    default: break;
+    }
+
     psx_xenogears_read_scene(&scene);
     if (scene.active_module <= XG_SEMANTIC_MODULE_MENU) {
         *out_module = scene.active_module;
