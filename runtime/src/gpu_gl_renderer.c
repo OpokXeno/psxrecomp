@@ -8606,9 +8606,19 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         ? m->draw_area_bottom : target->y + target->height - 1;
     if (left > right || top > bottom) return;
     s_native_recipe_texture_read = (GlNativeRecipeDropEvent){.material = *m, .texture_reason = "none"};
-    /* An unsupported operation on another target cannot invalidate this recipe. */
-    if (source->native_view_effect || recipe->count == UINT32_MAX) {
-        s_native_recipe_texture_read.texture_reason = source->native_view_effect ? "native_view_effect" : "draw_capacity";
+    /* A recipe is only ever appended to or fully dropped, never truncated.
+     * native_recipe_drop normally fires often enough (layout changes, motion
+     * binding changes, ...) to keep it small, but a scene that never hits one
+     * of those (a world-map battle) lets it grow past 100k draws. Combined
+     * with native_recipe_private()'s copy-on-write — which copies the entire
+     * history on every draw whenever references > 1, a routine state — cost
+     * compounds with every draw ever appended. Cap it like the existing
+     * UINT32_MAX/native_view_effect drops below. */
+    enum { XG_NATIVE_RECIPE_MAX_DRAWS = 16384u };
+    if (source->native_view_effect || recipe->count == UINT32_MAX ||
+        recipe->count >= XG_NATIVE_RECIPE_MAX_DRAWS) {
+        s_native_recipe_texture_read.texture_reason = source->native_view_effect ?
+            "native_view_effect" : "draw_capacity";
         native_recipe_drop(target); return;
     }
     if (binding->motion.handle.resource_id) {
