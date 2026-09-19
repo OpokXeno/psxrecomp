@@ -207,21 +207,25 @@ def field_id():
 
 
 def field_context_ptr():
-    """Read fieldContextPtr (u32 LE) at 0x800B0078."""
-    return read_ram_u32_le("0x800B0078")
+    """Read resident overlay signature (u32 LE) at 0x8006FAF0.
+
+    4 = Field (same ground truth as the renderer's semantic-module
+    detection). Neither 0x800B0078 (scheduler transient) nor 0x800592C0
+    (dev-menu state machine, constant 0xFFFFFFFF in retail play) is a
+    usable signal in this runtime."""
+    return read_ram_u32_le("0x8006FAF0")
 
 
 def wait_for_field_module(timeout_s):
-    """Poll fieldContextPtr 0x800B0078 until non-zero (field module is
-    the active module and the teleport poll is running). Returns the
-    fieldID at the time of first sighting."""
+    """Poll overlay signature 0x8006FAF0 until == 4 (field module is
+    resident and the teleport poll is running). Returns the fieldID at
+    the time of first sighting."""
     t0 = time.time()
     while time.time() - t0 < timeout_s:
-        fcp = field_context_ptr()
-        if fcp != 0:
+        if field_context_ptr() == 4:
             return field_id()
         time.sleep(0.25)
-    fail(f"fieldContextPtr 0x800B0078 stayed 0 for {timeout_s}s — field module never loaded")
+    fail(f"overlay signature 0x8006FAF0 never became 4 for {timeout_s}s — field module never loaded")
 
 
 def frame_count():
@@ -242,7 +246,9 @@ def widget_action(name, value=0, value2=0, req_id=0):
 
 def teleport(field_id_, entry):
     """Fire teleport via the widget action path. Returns the action's rc
-    (0 = armed, 1 = refused, <0 = failure)."""
+    (0 = armed in place, 4 = boot-to-field requested, 1 = game not
+    booted enough, 2 = already in flight, 3 = engine busy,
+    -1 = bad field id, -2 = bad entry)."""
     r = widget_action("teleport", value=field_id_, value2=entry)
     if not r.get("ok"):
         fail(f"teleport widget_action rejected: {r}")
@@ -305,7 +311,7 @@ def main() -> int:
     print(f"server up after {boot_elapsed:.1f}s; frame={frame_count()}")
 
     # ---- (b) Wait for field module to be active, then go to title (490) ----
-    print("waiting for field module to become active (fieldContextPtr 0x800B0078 != 0)...")
+    print("waiting for field module to become resident (overlay sig 0x8006FAF0 == 4)...")
     cur_field = wait_for_field_module(TITLE_POLL_S)
     print(f"  field module active; fieldID={cur_field}")
     if cur_field != 490:
@@ -333,24 +339,28 @@ def main() -> int:
 
     # ---- (c) Fire teleport to Lahan (1) ----
     print("step (c): pre-teleport gate state:")
+    print(f"  overlaySig     0x8006FAF0   = {read_ram_u32_le('0x8006FAF0')} (want 4 = Field)")
     print(f"  fieldMapNumber 0x8004F34C   = {read_ram_u32_le('0x8004F34C')}")
     print(f"  teleportGate1  0x800ADBEC   = {read_ram_u32_le('0x800ADBEC')}")
-    print(f"  fieldChangePrev 0x800ADB64  = {read_ram_u32_le('0x800ADB64')}")
-    print(f"  teleportArm    0x800ADBC4   = {read_ram_u32_le('0x800ADBC4')}")
+    print(f"  partyLoadState 0x800ADBC4   = {read_ram_u32_le('0x800ADBC4')}")
+    print(f"  menuRequest    0x800ADB64   = {read_ram_u32_le('0x800ADB64')}")
+    print(f"  fadeGate       0x800B2118   = {read_ram_u16_le('0x800B2118')}")
     print(f"  teleportMusic  0x8004F308   = {read_ram_u32_le('0x8004F308')}")
     print(f"  teleportAnim   0x800ADB90   = {read_ram_u32_le('0x800ADB90')}")
     print(f"  loadFileIndex  0x8004F330   = {read_ram_u32_le('0x8004F330')}")
     print(f"  fieldEntryPt   0x8006EF66   = {read_ram_u16_le('0x8006EF66')}")
+    print(f"  activeEntryPt  0x800C3A6A   = {read_ram_u16_le('0x800C3A6A')}")
     rc = teleport(1, 0)
     if rc != 0:
         fail(f"teleport(1) refused (rc={rc}) — field module guard at title?")
     print("step (c): post-teleport gate state:")
     print(f"  fieldMapNumber 0x8004F34C   = {read_ram_u32_le('0x8004F34C')}")
     print(f"  teleportGate1  0x800ADBEC   = {read_ram_u32_le('0x800ADBEC')}")
-    print(f"  fieldChangePrev 0x800ADB64  = {read_ram_u32_le('0x800ADB64')}")
-    print(f"  teleportArm    0x800ADBC4   = {read_ram_u32_le('0x800ADBC4')}")
+    print(f"  menuRequest    0x800ADB64   = {read_ram_u32_le('0x800ADB64')} (must stay 0xFF: no bogus menu)")
+    print(f"  partyLoadState 0x800ADBC4   = {read_ram_u32_le('0x800ADBC4')} (must stay 0xFF: untouched)")
     print(f"  loadFileIndex  0x8004F330   = {read_ram_u32_le('0x8004F330')}")
     print(f"  fieldEntryPt   0x8006EF66   = {read_ram_u16_le('0x8006EF66')}")
+    print(f"  activeEntryPt  0x800C3A6A   = {read_ram_u16_le('0x800C3A6A')} (entry must be staged here)")
     landed = wait_for_field(1, LAHAN_POLL_S, "lahan")
     ok(f"step (c): fieldID == 1 (Lahan) after teleport (verified {landed})")
 

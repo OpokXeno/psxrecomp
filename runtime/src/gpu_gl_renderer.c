@@ -1133,7 +1133,7 @@ typedef struct GlNativeRecipe {
     uint32_t coverage_capacity;
     GlNativeRecipeCoverage *coverages;
     GlNativeCoverageState *publication;
-    uint16_t width, height, view_width, view_height, offset;
+    uint16_t width, height, view_width, view_height, offset, origin_x, origin_y;
     bool dithering_disabled;
     GlNativeRecipePixels *textures;
     /* Words depending on this replay's framebuffer, including COPY/draw aliases.
@@ -1393,7 +1393,7 @@ typedef struct GlNativeGpuWork {
     uint64_t geometry_draws, transfer_draws, visible_pixels;
     uint32_t *reference_pixels; /* Optional logical-grid samples of the GPU image. */
     int row_planes[VRAM_H];
-    uint16_t scanout_x, scanout_y, scanout_width, scanout_height, phase_crop_y;
+    uint16_t scanout_x, scanout_y, scanout_width, scanout_height, phase_crop_y, phase_crop_x;
     uint16_t scanout_canonical_width, scanout_offset;
     uint32_t phase_count;
     int state, failed, fresh, scanout, depth24, disabled;
@@ -7605,7 +7605,8 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
         const int origin = target->resource &&
             (target->resource->view.descriptor.flags & XG_RENDER_RESOURCE_DESCRIPTOR_HAS_VRAM_REGION)
             ? target->resource->view.descriptor.vram_y : 0;
-        if (!native_gpu_draw(compiler, draw, origin)) return 0;
+        if (!native_gpu_draw(compiler, draw,
+            compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE ? 0 : origin)) return 0;
         if (compiler->gpu_only) return 1;
     }
     if (lines) {
@@ -9077,6 +9078,7 @@ static void native_recipe_begin(GlNativeViewState *views, GlNativeViewTarget *ta
     recipe->publication = views->publication;
     if (recipe->publication) recipe->publication->references++;
     recipe->width = target->width; recipe->height = target->height;
+    recipe->origin_x = target->x; recipe->origin_y = target->y;
     recipe->view_width = native_view_eligible(views, target) ? views->width : 0u;
     recipe->view_height = views->reference_height; recipe->offset = views->offset;
     gpu_vram_region_mark_rect(&recipe->feedback, target->x, target->y,
@@ -10616,9 +10618,13 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         if (!pixels) goto finished;
         for (size_t i = 0u; i < (size_t)width * recipe->height; ++i) pixels[i] = recipe->clear_color;
     } else {
-        gpu->widths[GL_NATIVE_GPU_PHASE_BASE+phase] = (uint16_t)width;
-        gpu->heights[GL_NATIVE_GPU_PHASE_BASE+phase] = recipe->height;
-        if (!native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, width, recipe->height,
+        /* Use the endpoint raster's coordinate domain and viewport. Rendering
+         * the same Q16 geometry into a cropped-height viewport changes GL's
+         * subpixel rounding and UV-plane origin in alternate presentations. */
+        const uint16_t raster_width = use_view ? (uint16_t)width : VRAM_W;
+        gpu->widths[GL_NATIVE_GPU_PHASE_BASE+phase] = raster_width;
+        gpu->heights[GL_NATIVE_GPU_PHASE_BASE+phase] = VRAM_H;
+        if (!native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, raster_width, VRAM_H,
             UINT32_MAX, 0,0,0,0,recipe->clear_color,0)) goto finished;
     }
     texture.view_valid = 1;
@@ -10759,8 +10765,18 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         if (use_view) {
             const GlNativeViewRaster raster = {.width = recipe->width, .height = recipe->height, .pixels = pixels};
             if (!native_view_raster(&compiler, recipe->view_width, recipe->offset, &raster,
-                &draw, i, record->enhanced, record->view_origin_y)) goto finished;
-        } else if (!native_render_draw(&compiler, &target, &draw, i)) goto finished;
+                &draw, i, record->enhanced, gpu ? recipe->origin_y : record->view_origin_y)) goto finished;
+        } else {
+            if (gpu) {
+                draw.primitive.material.draw_offset_x += recipe->origin_x;
+                draw.primitive.material.draw_offset_y += recipe->origin_y;
+                draw.primitive.material.draw_area_left += recipe->origin_x;
+                draw.primitive.material.draw_area_right += recipe->origin_x;
+                draw.primitive.material.draw_area_top += recipe->origin_y;
+                draw.primitive.material.draw_area_bottom += recipe->origin_y;
+            }
+            if (!native_render_draw(&compiler, &target, &draw, i)) goto finished;
+        }
     }
     if (!gpu) {
         memmove(pixels, pixels + (size_t)crop_y * width, (size_t)width * height * sizeof(*pixels));
@@ -11519,7 +11535,11 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         }
     }
     prepared->count = phase_count;
-    if (views->gpu) { views->gpu->phase_count = phase_count; views->gpu->phase_crop_y = crop_y; }
+    if (views->gpu) {
+        views->gpu->phase_count = phase_count;
+        views->gpu->phase_crop_y = recipe->origin_y + crop_y;
+        views->gpu->phase_crop_x = recipe->view_width ? 0u : header->display.display_x;
+    }
     prepared->interval_ns = interval; prepared->previous_digest = old->pixel_digest;
     audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_READY;
     audit->temporal_phase_count = prepared->count; audit->temporal_interval_ns = interval;
@@ -12844,9 +12864,10 @@ static int native_gpu_service(void) {
                     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,input->framebuffer);
                     const unsigned width=index==0?work->scanout_canonical_width:work->scanout_width;
                     for(unsigned x=0;x<width;) {
-                        const unsigned sx=index==0?(work->scanout_x+x)&(VRAM_W-1):x;
+                        const unsigned source_width=input->width/work->scale;
+                        const unsigned sx=(x+(image?work->phase_crop_x:index==0?work->scanout_x:0u))%source_width;
                         const unsigned dx=x+(index==0?work->scanout_offset:0u);
-                        const unsigned span=index==0&&width-x>VRAM_W-sx?VRAM_W-sx:width-x;
+                        const unsigned span=width-x>source_width-sx?source_width-sx:width-x;
                         p_glBlitFramebuffer(sx*work->scale,sy*work->scale,(sx+span)*work->scale,(sy+rows)*work->scale,
                             dx*work->scale,y*work->scale,(dx+span)*work->scale,(y+rows)*work->scale,GL_COLOR_BUFFER_BIT,GL_NEAREST);
                         x+=span;
@@ -13140,20 +13161,19 @@ static XgRenderCompileResult native_worker_compile(XgRenderSourceCommitHandle co
         if (scale > GL_MAX_INTERNAL_SCALE) {
             native_audit_block(audit,GL_RENDERER_NATIVE_BLOCKER_INVALID_DISPLAY,0,0,0); goto compile_failed;
         }
-        if (scale > 1u || s_native_gpu_scale > 1u) {
-            gpu = calloc(1u,sizeof(*gpu));
-            if (!gpu) goto compile_failed;
-            gpu->timing=timing;
-            /* Commands/payload grow on demand. Published prefixes keep their
-             * backing allocations alive until this work is retired. */
-            gpu->words = calloc((size_t)VRAM_W*VRAM_H,sizeof(uint16_t));
-            if (!gpu->words) goto compile_failed;
-            gpu->scale = scale; gpu->commit = commit; gpu->identity = audit->header.identity;
-            gpu->fresh = scale != s_native_gpu_scale || s_native_views.width != audit->header.display.native_width ||
-                s_native_views.offset != audit->header.display.native_offset_x ||
-                s_native_views.reference_height != audit->header.display.native_height;
-            gpu->timing.fresh = gpu->fresh;
-        }
+        /* Native endpoint rasterization is GPU-backed at every supported scale. */
+        gpu = calloc(1u,sizeof(*gpu));
+        if (!gpu) goto compile_failed;
+        gpu->timing=timing;
+        /* Commands/payload grow on demand. Published prefixes keep their
+         * backing allocations alive until this work is retired. */
+        gpu->words = calloc((size_t)VRAM_W*VRAM_H,sizeof(uint16_t));
+        if (!gpu->words) goto compile_failed;
+        gpu->scale = scale; gpu->commit = commit; gpu->identity = audit->header.identity;
+        gpu->fresh = scale != s_native_gpu_scale || s_native_views.width != audit->header.display.native_width ||
+            s_native_views.offset != audit->header.display.native_offset_x ||
+            s_native_views.reference_height != audit->header.display.native_height;
+        gpu->timing.fresh = gpu->fresh;
         staged_views = malloc(sizeof(*staged_views));
         if (!staged_views) {
             native_audit_block(audit, GL_RENDERER_NATIVE_BLOCKER_GL_RESOURCE, 0u, 0u, 0u);
@@ -22936,6 +22956,7 @@ static const GpuRenderBackend GL_BACKEND = {
       .present_native_cpu_frame = glb_present_native_cpu_frame,
       .canonical_framebuffer_digest = glb_canonical_framebuffer_digest,
     .vram_write = glb_vram_write, .vram_read = glb_vram_read,
+    .vram_prepare_read = ensure_cpu_transfer,
     .vram_transfer_in = glb_vram_transfer_in, .vram_transfer_out = glb_vram_transfer_out,
     .set_draw_area = glb_set_draw_area, .get_draw_area = glb_get_draw_area,
     .set_draw_offset = glb_set_draw_offset,

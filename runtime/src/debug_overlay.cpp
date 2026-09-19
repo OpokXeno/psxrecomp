@@ -250,9 +250,28 @@ static char     s_teleport_filter[64] = {0};
 static char     s_teleport_status[96] = {0};
 static int      s_teleport_status_frames = 0;
 static int      s_last_teleport_id   = -1;
-static uint32_t s_teleport_source_context = 0u;
+/* In-flight teleport tracking. The old code keyed completion off the
+ * 0x800B0078 pointer, but that is the scheduler's per-dispatch current-
+ * actor pointer (rewritten for every actor every frame by 0x800A2030),
+ * so it was useless both as an "is field active" signal and as a
+ * completion signal. Track the requested target + arm time instead and
+ * confirm via the fieldID mirror in pre_swap. -1 = idle. */
+static int      s_teleport_target_id = -1;
+static int      s_teleport_source_id = -1;
+static uint64_t s_teleport_arm_ms = 0u;
+static uint64_t s_teleport_deadline_ms = 0u;
 static uint64_t s_teleport_ready_ms = 0u;
 static constexpr uint64_t kTeleportSettleMs = 10000u;
+static constexpr uint64_t kTeleportTimeoutMs = 12000u;
+static constexpr uint64_t kTeleportBootTimeoutMs = 60000u;
+static constexpr uint64_t kTeleportSameMapConfirmMs = 2000u;
+/* Boot-to-field request (teleport issued outside the field module).
+ * Staged here, consumed by debug_server_apply_pending_guest_transition
+ * at the next safe vblank edge, which writes the persistent target and
+ * yanks to MainLoop(1) — the same mechanism the Kernel Menu transition
+ * uses. -1 = none pending. */
+static int      s_field_boot_target = -1;
+static int      s_field_boot_entry = 0;
 
 static int      s_party_slot[3]      = {0, 1, 2};
 static int      s_party_bitfield     = 0x07FF;
@@ -841,24 +860,68 @@ static void draw_rings_section(void)
 /* Verified address book (see debug_overlay/data/addrs.xml). Every write
  * goes through psx_write_byte to keep the path identical to the read-
  * accessor the existing inspector uses. u32/u16 values are emitted as
- * 4/2 sequential byte writes (little-endian). The engine's field poll
- * picks up the teleport recipe from fieldMapNumber (0x8004F34C) +
- * fieldVars[1] (0x8006EF66) on the next frame; we do NOT touch
- * fieldID (0x8006F94E) — it's a cosmetic mirror and writing it
- * corrupts texture streaming. We do NOT call loadNewField (not
- * reentrant — the poll is the only correct caller). */
-static constexpr uint32_t kAddr_fieldContextPtr     = 0x800B0078u;
-static constexpr uint32_t kAddr_fieldID             = 0x8006F94Eu;
-static constexpr uint32_t kAddr_fieldMapNumber      = 0x8004F34Cu;
-static constexpr uint32_t kAddr_fieldChangePrevented= 0x800ADB64u;
-static constexpr uint32_t kAddr_teleportGate1       = 0x800ADBECu;
-static constexpr uint32_t kAddr_teleportArm         = 0x800ADBC4u;
-static constexpr uint32_t kAddr_teleportGateMusic   = 0x8004F308u;
-static constexpr uint32_t kAddr_teleportGateAnim    = 0x800ADB90u;
-static constexpr uint32_t kAddr_fieldEntryPointU16  = 0x8006EF66u;
-static constexpr uint32_t kAddr_fieldPositionX      = 0x8006EF82u;
-static constexpr uint32_t kAddr_fieldPositionZ      = 0x8006EF84u;
-static constexpr uint32_t kAddr_fieldPositionY      = 0x8006EF86u;
+ * 4/2 sequential byte writes (little-endian).
+ *
+ * Map teleport mirrors what the game's own scripted transitions do
+ * (opcode 0x98 FieldScriptChangeFieldWhenReady at 0x800932D0 and the
+ * door-walk path through 0x80092894): stage the destination field in
+ * fieldMapNumber (0x8004F34C), stage the entry point in the ACTIVE VM
+ * mirror (0x800C3A68+2, not just the persistent gameState copy), then
+ * clear the poll gate (0x800ADBEC) last as the commit. The field poll
+ * inside RunFieldCoordinator (0x800784A0) picks the recipe up on the
+ * next frame and runs the full completion sequence (bundle apply + var
+ * init + actor reset + script restart + texture/stream re-init).
+ *
+ * Deliberately NOT written (the old 7-write recipe got these wrong):
+ * - 0x800ADB64 is the MENU request slot (idle 0xFF; FE 58 writes 3,
+ *   consumed by FieldLoadAndOpenMenu 0x800799D4). Writing 0 queued a
+ *   bogus Normal-Menu request on every teleport.
+ * - 0x8006EF82/84/86 are script vars 15/16/17, not a "position" the
+ *   poll reads. Player placement comes from the destination map's
+ *   arrival table (docs/xenogears/field/02 §5) via the entry var.
+ *   Zeroing them just corrupted script state.
+ * - 0x800ADBC4 is the party-skin load state (0xFF = idle). Writing
+ *   0xFF during a party stream faked "idle"; instead refuse while busy.
+ * - 0x8004F308/0x800ADB90 (music/anim gates) must be 0 for the poll to
+ *   fire, but zeroing them while busy fakes readiness. The poll retries
+ *   every frame on its own, so never write them — only the commit gate.
+ * We do NOT touch fieldID (0x8006F94E) — the persist step copies the
+ * target there itself — and we do NOT call loadNewField (not reentrant;
+ * the poll is the only correct caller). */
+static constexpr uint32_t kAddr_fieldID               = 0x8006F94Eu;
+static constexpr uint32_t kAddr_fieldMapNumber        = 0x8004F34Cu;
+static constexpr uint32_t kAddr_teleportGate1         = 0x800ADBECu;
+static constexpr uint32_t kAddr_teleportGateMusic     = 0x8004F308u;
+static constexpr uint32_t kAddr_teleportGateAnim      = 0x800ADB90u;
+static constexpr uint32_t kAddr_fieldEntryPointU16    = 0x8006EF66u;
+/* Resident loaded-module id (SLUS BSS, set by the overlay loader
+ * 0x800199CC; -1 = loading/none). 1 = Field. NOTE: this belongs to the
+ * developer debug menu's state machine and reads a constant 0xFFFFFFFF
+ * during normal retail play in this runtime — it is NOT a usable
+ * field-active signal (see xg_render_host_semantic_module in main.cpp).
+ * Kept only so the panel can show why the old detection was wrong. */
+static constexpr uint32_t kAddr_residentLoadedModule  = 0x800592C0u;
+/* Ground truth for the resident module (same as main.cpp): the
+ * field/world/battle/battling overlays all load at 0x8006FAF0, so the
+ * first instruction word identifies whoever is resident. Confirmed live
+ * across sustained field/world/battle sessions. */
+static constexpr uint32_t kAddr_overlaySignature      = 0x8006FAF0u;
+static constexpr uint32_t kSigFieldOverlay            = 0x00000004u;
+static constexpr uint32_t kSigWorldOverlay            = 0x00000005u;
+static constexpr uint32_t kSigBattleOverlay           = 0x00000006u;
+/* gameState pointer (SLUS), set once the boot has progressed far enough
+ * to own game state. Gates the boot-to-field path: yanking to MainLoop
+ * before this exists has no game state to stage into. */
+static constexpr uint32_t kAddr_gameStatePtr           = 0x8005A39Cu;
+static constexpr uint32_t kAddr_activeFieldVarsBase   = 0x800C3A68u;
+static constexpr uint32_t kAddr_activeEntryPointU16   = 0x800C3A68u + 2u;
+/* Busy gates (read-only checks, never written): party-skin streaming in
+ * flight, a menu request staged, or a fade/transition already running. */
+static constexpr uint32_t kAddr_partyLoadState         = 0x800ADBC4u;
+static constexpr uint32_t kAddr_menuRequest            = 0x800ADB64u;
+static constexpr uint32_t kAddr_fadeGate               = 0x800B2118u;
+static constexpr int      kMaxTeleportFieldId          = 729;
+static constexpr int      kMaxTeleportEntryPoint       = 255;
 /* currentParty in gameState (0x8006F368) is a per-frame COPY: the field
  * kernel's sync routine (0x800A3200, runs every frame) reloads it from the
  * kernel party slots at 0x80062590 (3 x u32, low byte = char id,
@@ -909,13 +972,6 @@ static void write_u16_le(uint32_t addr, uint16_t val)
     psx_write_byte(addr + 1, (uint8_t)((val >> 8) & 0xFFu));
 }
 
-static void reset_teleport_position(void)
-{
-    write_u16_le(kAddr_fieldPositionX, 0u);
-    write_u16_le(kAddr_fieldPositionZ, 0u);
-    write_u16_le(kAddr_fieldPositionY, 0u);
-}
-
 static uint16_t read_u16_le(uint32_t addr)
 {
     return (uint16_t)((uint32_t)psx_read_byte(addr) |
@@ -930,44 +986,135 @@ static uint32_t read_u32_le(uint32_t addr)
          | ((uint32_t)psx_read_byte(addr + 3) << 24);
 }
 
-/* True when the field module is the active module. The strongest
- * signal: the field context pointer is non-zero (set by field-module
- * init, cleared when the field module is left). The field poll
- * (0x800784A0) only runs while the field context is live, so when
- * this is zero the recipe writes will be ignored and a "teleport"
- * would silently no-op. Title screen (field 490) lives in the field
- * module — verified live. */
+/* True when the field module is the active module. Reads the resident
+ * overlay signature at 0x8006FAF0 (same ground truth as
+ * xg_render_host_semantic_module in main.cpp): 4 = Field, 5 = Worldmap,
+ * 6 = Battle. Neither 0x800B0078 (scheduler transient, rewritten every
+ * dispatch) nor 0x800592C0 (dev-menu state machine, constant 0xFFFFFFFF
+ * in retail play) is a usable signal in this runtime. */
 static bool field_module_active(void)
 {
-    return read_u32_le(kAddr_fieldContextPtr) != 0u;
+    return read_u32_le(kAddr_overlaySignature) == kSigFieldOverlay;
 }
 
-/* Public read accessor used by the panel + tests. */
+/* Resident module for panel readouts, derived from the same signature:
+ * 1=Field 2=Battle 3=Worldmap (semantic ids), -1 = other/loading. */
+static int resident_loaded_module(void)
+{
+    uint32_t sig = read_u32_le(kAddr_overlaySignature);
+    if (sig == kSigFieldOverlay)  return 1;
+    if (sig == kSigBattleOverlay) return 2;
+    if (sig == kSigWorldOverlay)  return 3;
+    return -1;
+}
+
+static const char *resident_module_name(int id)
+{
+    switch (id) {
+        case 1:  return "Field";
+        case 2:  return "Battle";
+        case 3:  return "Worldmap";
+        default: return "other/loading";
+    }
+}
+
+/* Public read accessor used by the panel + tests. Returns -1 when the
+ * field module is not the active module (the mirror is only meaningful
+ * while field owns the game state). */
 int psx_debug_overlay_read_field_id(void)
 {
-    if (read_u32_le(kAddr_fieldContextPtr) == 0u) return -1;
+    if (!field_module_active()) return -1;
     return (int)read_u16_le(kAddr_fieldID);
+}
+
+/* Dry-run of the teleport preconditions: same return codes as
+ * psx_debug_overlay_teleport but performs no write. Lets event_jump
+ * validate BEFORE applying its varWrites, so a refused jump leaves RAM
+ * untouched. Sets *out_boot when the request must go through the
+ * boot-to-field path (field module not resident). */
+static int psx_debug_overlay_teleport_guard(int fieldId, int entryPoint, bool *out_boot)
+{
+    if (s_teleport_target_id >= 0) {
+        return 2;
+    }
+    if (fieldId < 0 || fieldId > kMaxTeleportFieldId) {
+        return -1;
+    }
+    if (entryPoint < 0 || entryPoint > kMaxTeleportEntryPoint) {
+        return -2;
+    }
+    if (!field_module_active()) {
+        /* Boot-to-field path: needs game state to exist so there is a
+         * persistent fieldID/entry to stage (too early in boot = refuse;
+         * same code as before, new meaning documented in the header). */
+        if (read_u32_le(kAddr_gameStatePtr) == 0u) {
+            return 1;
+        }
+        if (out_boot) *out_boot = true;
+        return 0;
+    }
+    if (out_boot) *out_boot = false;
+    /* Refuse while the engine is mid-flight elsewhere: party-skin
+     * streaming owns 0x800ADBC4 (0xFF = idle), a staged menu request
+     * owns 0x800ADB64 (0xFF = idle), and a running fade/transition owns
+     * 0x800B2118 (0 = idle). Arming on top of any of those corrupts the
+     * in-progress operation (probable black screen). The music/anim/CD
+     * gates are intentionally NOT checked here: the poll retries them
+     * every frame on its own, so an early arm is harmless. */
+    if (read_u32_le(kAddr_partyLoadState) != 0xFFu) {
+        return 3;
+    }
+    if (read_u32_le(kAddr_menuRequest) != 0xFFu) {
+        return 3;
+    }
+    if (read_u16_le(kAddr_fadeGate) != 0u) {
+        return 3;
+    }
+    return 0;
 }
 
 int psx_debug_overlay_teleport(int fieldId, int entryPoint)
 {
-    if (!field_module_active()) {
-        return 1;
+    bool boot = false;
+    int rc = psx_debug_overlay_teleport_guard(fieldId, entryPoint, &boot);
+    if (rc != 0) {
+        return rc;
     }
-    if (s_teleport_source_context != 0u || s_teleport_ready_ms != 0u) {
-        return 2;
+    if (boot) {
+        /* Not in field: stage a boot-to-field request for the safe-point
+         * yank (debug_server_apply_pending_guest_transition). No RAM is
+         * written here — staging happens on the emu thread right before
+         * the transition, so the current module cannot clobber it. */
+        spu_debug_music_quarantine_begin();
+        s_field_boot_target = fieldId;
+        s_field_boot_entry = entryPoint;
+        s_teleport_source_id = -1;
+        s_teleport_target_id = fieldId;
+        s_last_teleport_id = fieldId;
+        s_teleport_arm_ms = SDL_GetTicks64();
+        s_teleport_deadline_ms = s_teleport_arm_ms + kTeleportBootTimeoutMs;
+        return 4;
     }
-    s_teleport_source_context = read_u32_le(kAddr_fieldContextPtr);
+    s_teleport_source_id = psx_debug_overlay_read_field_id();
     spu_debug_music_quarantine_begin();
-    write_u32_le(kAddr_teleportGate1,        0u);
-    write_u32_le(kAddr_fieldChangePrevented, 0u);
-    write_u32_le(kAddr_fieldMapNumber,      (uint32_t)fieldId);
+    /* Stage values first, commit gate last: the poll consumes the trio
+     * together, and the TCP path can race the game thread, so the gate
+     * must never be visible before the values are.
+     * Entry goes to BOTH mirrors: playable-actor init reads the active
+     * VM mirror (FUN_800a3018(2) -> 0x800C3A68+2), while the persist
+     * step (0x800A30FC) copies active -> persistent right before the
+     * transition. Writing only the persistent copy (the old bug) meant
+     * persist clobbered it with the stale active value and the
+     * destination map spawned at the wrong arrival record — often
+     * out-of-bounds garbage -> black screen. */
+    write_u16_le(kAddr_activeEntryPointU16, (uint16_t)((unsigned)entryPoint & 0xFFFFu));
     write_u16_le(kAddr_fieldEntryPointU16,  (uint16_t)((unsigned)entryPoint & 0xFFFFu));
-    reset_teleport_position();
-    write_u32_le(kAddr_teleportGateMusic,    0u);
-    write_u32_le(kAddr_teleportGateAnim,     0u);
-    write_u32_le(kAddr_teleportArm,          0xFFu);
+    write_u32_le(kAddr_fieldMapNumber,      (uint32_t)fieldId);
+    write_u32_le(kAddr_teleportGate1,        0u);
+    s_teleport_target_id = fieldId;
     s_last_teleport_id = fieldId;
+    s_teleport_arm_ms = SDL_GetTicks64();
+    s_teleport_deadline_ms = s_teleport_arm_ms + kTeleportTimeoutMs;
     return 0;
 }
 
@@ -1016,6 +1163,15 @@ int psx_debug_overlay_write_var(int var, int value)
     if (var < 0 || var >= kFieldVarsCount) return -1;
     if (value < 0 || value > 0xFFFF) return -2;
     write_u16_le(kAddr_fieldVarsBase + (uint32_t)var * 2u, (uint16_t)value);
+    /* Script handlers read the ACTIVE mirror (0x800C3A68), and the
+     * persist step (0x800A30FC) copies active -> persistent, so a
+     * persistent-only write is clobbered before a teleport's transition
+     * consumes it (this silently dropped event_jump varWrites). Mirror
+     * to active while field is loaded; skip it otherwise (that BSS
+     * belongs to another module then). */
+    if (field_module_active()) {
+        write_u16_le(kAddr_activeFieldVarsBase + (uint32_t)var * 2u, (uint16_t)value);
+    }
     return 0;
 }
 
@@ -1065,17 +1221,27 @@ int psx_debug_overlay_camera_write(int ex, int ey, int ez, int ax, int ay, int a
     return 0;
 }
 
-/* Event Jump: apply the event's varWrites (via psx_write_byte to
- * fieldVars, same path as the W5 vars editor) then fire the verified
- * 7-write teleport recipe. `eventId` is the index into the events
- * table loaded from events.xml. Returns 0 on success, positive on
- * teleport-refused (field module not active), negative on bad id. */
+/* Event Jump: validate the teleport preconditions FIRST (dry-run, no
+ * write), then apply the event's varWrites (via psx_write_byte to
+ * fieldVars, same path as the W5 vars editor), then fire the teleport
+ * recipe — or the boot-to-field request when outside field. `eventId`
+ * is the index into the events table loaded from events.xml. Ordering
+ * matters: a refused jump must leave RAM untouched, otherwise a failed
+ * Jump silently corrupts GameProgress and poisons the NEXT jump.
+ * Returns 0 on in-place arm, 4 on boot-to-field request, positive on
+ * teleport-refused (1 = game not booted far enough, 2 = teleport
+ * already in flight, 3 = engine busy), negative on bad id. */
 int psx_debug_overlay_event_jump(int eventId)
 {
     int ne = 0;
     const DbgEvent *evs = dbg_data_events(&ne);
     if (evs == nullptr || eventId < 0 || eventId >= ne) return -1;
     const DbgEvent &e = evs[eventId];
+    bool boot = false;
+    int rc = psx_debug_overlay_teleport_guard(e.mapId, e.entryPoint, &boot);
+    if (rc != 0) {
+        return rc;
+    }
     /* Apply each varWrite via the W5 path (so the write goes through
      * the same clamp+error-report the manual vars editor uses). */
     for (int i = 0; i < e.numVarWrites; i++) {
@@ -1097,19 +1263,37 @@ static bool field_name_known(int id, const char **out_name)
 
 static void draw_teleport_section(void)
 {
+    int mod = resident_loaded_module();
     int cur = psx_debug_overlay_read_field_id();
     const char *cur_name = nullptr;
     bool cur_known = (cur >= 0) && field_name_known(cur, &cur_name);
+    ImGui::Text("Module: %s (overlay sig 0x%08X)",
+                resident_module_name(mod), (unsigned)read_u32_le(kAddr_overlaySignature));
     ImGui::Text("Current field: %s%d%s%s",
                 cur >= 0 ? "" : "?",
                 cur >= 0 ? cur : 0,
                 cur_known ? "  (" : "",
                 cur_known ? cur_name : (cur >= 0 ? "  (unknown)" : ""));
     if (!field_module_active()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
-            "Field module NOT active - teleport will be refused.");
+        ImGui::TextDisabled("Field NOT resident: Teleport will boot Field to the target");
+        ImGui::TextDisabled("(yanks the current module, like the Kernel Menu transition).");
     } else {
-        ImGui::TextDisabled("Field module active - teleport is armed by recipe only.");
+        /* Live readiness gates so a refusal is explainable. */
+        uint32_t party = read_u32_le(kAddr_partyLoadState);
+        uint32_t menu  = read_u32_le(kAddr_menuRequest);
+        uint16_t fade  = read_u16_le(kAddr_fadeGate);
+        bool busy = (party != 0xFFu) || (menu != 0xFFu) || (fade != 0u);
+        if (busy) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+                "Engine busy: party=0x%X menu=0x%X fade=%u - teleport will be refused.",
+                (unsigned)party, (unsigned)menu, (unsigned)fade);
+        } else {
+            ImGui::TextDisabled("Field module active - engine idle, teleport ready.");
+        }
+        if (s_teleport_target_id >= 0) {
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
+                "Teleport in flight -> field %d ...", s_teleport_target_id);
+        }
     }
 
     if (s_last_teleport_id >= 0 && s_teleport_status_frames > 0) {
@@ -1124,8 +1308,12 @@ static void draw_teleport_section(void)
 
     ImGui::InputInt("Target field id", &s_teleport_field_id, 1, 10);
     if (s_teleport_field_id < 0)   s_teleport_field_id = 0;
-    if (s_teleport_field_id > 2047) s_teleport_field_id = 2047;
+    if (s_teleport_field_id > kMaxTeleportFieldId) s_teleport_field_id = kMaxTeleportFieldId;
     ImGui::InputInt("Entry point", &s_teleport_entry, 1, 10);
+    if (s_teleport_entry < 0) s_teleport_entry = 0;
+    if (s_teleport_entry > kMaxTeleportEntryPoint) s_teleport_entry = kMaxTeleportEntryPoint;
+    ImGui::TextDisabled("Entry selects the map's arrival record (pos/layer/camera).");
+    ImGui::TextDisabled("Out-of-range entries read bytecode garbage -> black screen. Use 0 unless sure.");
 
     {
         const char *name = nullptr;
@@ -1136,25 +1324,36 @@ static void draw_teleport_section(void)
         }
     }
 
-    bool can_tp = field_module_active();
+    bool can_tp = (s_teleport_target_id < 0);
     if (!can_tp) ImGui::BeginDisabled();
-    if (ImGui::Button("Teleport")) {
+    if (ImGui::Button(field_module_active() ? "Teleport" : "Boot to field")) {
         int rc = psx_debug_overlay_teleport(s_teleport_field_id, s_teleport_entry);
         if (rc == 0) {
             std::snprintf(s_teleport_status, sizeof(s_teleport_status),
                 "Teleport armed -> field %d, entry %d (poll engages next frame)",
                 s_teleport_field_id, s_teleport_entry);
             s_teleport_status_frames = 90; /* ~1.5s at 60fps */
-        } else {
+        } else if (rc == 4) {
             std::snprintf(s_teleport_status, sizeof(s_teleport_status),
-                "Teleport refused (rc=%d) - field module not active", rc);
+                "Field boot requested -> field %d, entry %d (watch Current field)",
+                s_teleport_field_id, s_teleport_entry);
+            s_teleport_status_frames = 240;
+        } else {
+            const char *why = "unknown";
+            if (rc == 1)       why = "game not booted far enough (no game state yet)";
+            else if (rc == 2)  why = "teleport already in flight";
+            else if (rc == 3)  why = "engine busy (party/menu/fade)";
+            else if (rc == -1) why = "bad field id (0-729)";
+            else if (rc == -2) why = "bad entry (0-255)";
+            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+                "Teleport refused (rc=%d): %s", rc, why);
             s_teleport_status_frames = 90;
         }
     }
     if (!can_tp) ImGui::EndDisabled();
     if (!can_tp) {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Disabled: field module not active (fieldContextPtr 0x800B0078 == 0).");
+            ImGui::SetTooltip("Disabled: a teleport is already in flight.");
         }
     }
 
@@ -1162,34 +1361,28 @@ static void draw_teleport_section(void)
     if (ImGui::SmallButton("Title (490)")) {
         s_teleport_field_id = 490;
         s_teleport_entry    = 0;
-        if (field_module_active()) {
-            int rc = psx_debug_overlay_teleport(490, 0);
-            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
-                "Teleport armed -> field 490 title (rc=%d)", rc);
-            s_teleport_status_frames = 90;
-        }
+        int rc = psx_debug_overlay_teleport(490, 0);
+        std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+            "Teleport -> field 490 title (rc=%d)", rc);
+        s_teleport_status_frames = 90;
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Debug room (0)")) {
         s_teleport_field_id = 0;
         s_teleport_entry    = 0;
-        if (field_module_active()) {
-            int rc = psx_debug_overlay_teleport(0, 0);
-            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
-                "Teleport armed -> field 0 debug (rc=%d)", rc);
-            s_teleport_status_frames = 90;
-        }
+        int rc = psx_debug_overlay_teleport(0, 0);
+        std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+            "Teleport -> field 0 debug (rc=%d)", rc);
+        s_teleport_status_frames = 90;
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Lahan (1)")) {
         s_teleport_field_id = 1;
         s_teleport_entry    = 0;
-        if (field_module_active()) {
-            int rc = psx_debug_overlay_teleport(1, 0);
-            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
-                "Teleport armed -> field 1 Lahan (rc=%d)", rc);
-            s_teleport_status_frames = 90;
-        }
+        int rc = psx_debug_overlay_teleport(1, 0);
+        std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+            "Teleport -> field 1 Lahan (rc=%d)", rc);
+        s_teleport_status_frames = 90;
     }
 
     ImGui::Separator();
@@ -1224,13 +1417,11 @@ static void draw_teleport_section(void)
                                       ImGuiSelectableFlags_AllowDoubleClick)) {
                     s_teleport_field_id = fields[i].id;
                     if (ImGui::IsMouseDoubleClicked(0)) {
-                        if (field_module_active()) {
-                            int rc = psx_debug_overlay_teleport(fields[i].id, s_teleport_entry);
-                            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
-                                "Teleport armed -> %d %s (rc=%d)",
-                                fields[i].id, fields[i].name ? fields[i].name : "", rc);
-                            s_teleport_status_frames = 90;
-                        }
+                        int rc = psx_debug_overlay_teleport(fields[i].id, s_teleport_entry);
+                        std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+                            "Teleport -> %d %s (rc=%d)",
+                            fields[i].id, fields[i].name ? fields[i].name : "", rc);
+                        s_teleport_status_frames = 90;
                     }
                 }
             }
@@ -1684,8 +1875,7 @@ static void draw_event_jump_section(void)
     }
 
     if (!field_module_active()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
-            "Field module NOT active — Jump buttons will be refused.");
+        ImGui::TextDisabled("Field NOT resident: Jump boots Field to the event's map first.");
     }
 
     if (ImGui::BeginTable("events", 5,
@@ -1744,7 +1934,7 @@ static void draw_event_jump_section(void)
             ImGui::TableSetColumnIndex(4);
             ImGui::PushID(i);
             bool can_jump = (e.verified || s_allow_unverified_events) &&
-                            field_module_active();
+                            (s_teleport_target_id < 0);
             if (!can_jump) ImGui::BeginDisabled();
             if (ImGui::SmallButton("Jump")) {
                 int rc = psx_debug_overlay_event_jump(e.id);
@@ -1753,10 +1943,15 @@ static void draw_event_jump_section(void)
                         sizeof(s_event_jump_status),
                         "Event %d armed: map=%d entry=%d, %d varWrite(s) applied.",
                         e.id, e.mapId, e.entryPoint, e.numVarWrites);
+                } else if (rc == 4) {
+                    std::snprintf(s_event_jump_status,
+                        sizeof(s_event_jump_status),
+                        "Event %d: field boot requested (map=%d), %d varWrite(s) applied.",
+                        e.id, e.mapId, e.numVarWrites);
                 } else {
                     std::snprintf(s_event_jump_status,
                         sizeof(s_event_jump_status),
-                        "Event %d refused (rc=%d) - field module not active?",
+                        "Event %d refused (rc=%d) - RAM untouched.",
                         e.id, rc);
                 }
                 s_event_jump_status_frames = 120;
@@ -1766,9 +1961,9 @@ static void draw_event_jump_section(void)
                 ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 ImGui::SetTooltip("Unverified: status != \"verified\" in events.xml. "
                                   "Greyed out until Ghidra validation.");
-            } else if (!field_module_active() &&
+            } else if (s_teleport_target_id >= 0 &&
                        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip("Field module not active (fieldContextPtr 0x800B0078 == 0).");
+                ImGui::SetTooltip("A teleport is already in flight.");
             }
             ImGui::PopID();
         }
@@ -2083,11 +2278,34 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
     const GLuint target_fbo=(GLuint)framebuffer;
     prepare_overlay();
     if(!s_imgui_ready)return;
-    if (s_teleport_source_context != 0u) {
-        uint32_t field_context = read_u32_le(kAddr_fieldContextPtr);
-        if (field_context != 0u && field_context != s_teleport_source_context) {
-            s_teleport_source_context = 0u;
-            s_teleport_ready_ms = SDL_GetTicks64() + kTeleportSettleMs;
+    if (s_teleport_target_id >= 0) {
+        /* Confirm via the fieldID mirror: the persist step copies the
+         * target there as the transition engages. Same-map teleports
+         * keep the same id, so require a grace period before accepting
+         * equality (the reload still takes ~seconds of fades). On
+         * timeout, say where we are stuck instead of going silent —
+         * the usual cause is an out-of-range entry point (arrival
+         * table over-read -> garbage spawn -> black screen). */
+        int cur_field = psx_debug_overlay_read_field_id();
+        uint64_t now = SDL_GetTicks64();
+        bool same_map = (s_teleport_target_id == s_teleport_source_id);
+        bool confirmed = (cur_field == s_teleport_target_id) &&
+                         (!same_map || (now - s_teleport_arm_ms) > kTeleportSameMapConfirmMs);
+        if (confirmed) {
+            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+                "Teleport done: now on field %d.", cur_field);
+            s_teleport_status_frames = 240;
+            /* Keep s_last_teleport_id >= 0 so the panel shows the
+             * message; the settle block below clears it. */
+            s_teleport_target_id = -1;
+            s_teleport_ready_ms = now + kTeleportSettleMs;
+        } else if (now >= s_teleport_deadline_ms) {
+            std::snprintf(s_teleport_status, sizeof(s_teleport_status),
+                "Teleport timed out (still on field %d) - bad entry? engine stuck?",
+                cur_field);
+            s_teleport_status_frames = 240;
+            s_teleport_target_id = -1;
+            s_teleport_ready_ms = now + kTeleportSettleMs;
         }
     }
     if (read_u32_le(kAddr_teleportGateMusic) != 0u) {
@@ -2448,6 +2666,17 @@ int psx_debug_overlay_take_kernel_menu_request(void)
     const bool requested = s_kernel_menu_request;
     s_kernel_menu_request = false;
     return requested ? 1 : 0;
+}
+
+int psx_debug_overlay_take_field_boot_request(int *fieldId, int *entryPoint)
+{
+    if (s_field_boot_target < 0) {
+        return 0;
+    }
+    if (fieldId)    *fieldId    = s_field_boot_target;
+    if (entryPoint) *entryPoint = s_field_boot_entry;
+    s_field_boot_target = -1;
+    return 1;
 }
 
 #endif /* PSX_DEBUG_OVERLAY */

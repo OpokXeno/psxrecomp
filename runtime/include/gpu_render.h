@@ -403,6 +403,10 @@ int gr_canonical_framebuffer_digest(int display_x, int display_y,
                                     uint64_t *out_digest);
 
 /* VRAM transfers */
+/* Prefetch the CPU mirror for a GPUREAD rectangle without consuming pixels.
+ * Later point reads still enforce coherency if intervening GPU work writes it.
+ * CPU-authoritative backends need no preparation. */
+void gr_vram_prepare_read(int x, int y, int w, int h);
 void gr_vram_write(int x, int y, uint16_t pixel);
 uint16_t gr_vram_read(int x, int y);
 void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data);
@@ -550,6 +554,7 @@ typedef struct GpuRenderBackend {
                                          int display_height,
                                          uint64_t *out_digest);
     void (*vram_write)(int x, int y, uint16_t pixel);
+    void (*vram_prepare_read)(int x, int y, int w, int h);
     uint16_t (*vram_read)(int x, int y);
     void (*vram_transfer_in)(int x, int y, int w, int h, const uint16_t *data);
     void (*vram_transfer_out)(int x, int y, int w, int h, uint16_t *data);

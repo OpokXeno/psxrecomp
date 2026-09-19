@@ -212,6 +212,59 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-16 — Combat readback stall; residual Native wobble remains open
+
+Used `build-dbg/input-replay-20260916-113133.toml` (4,558 VBlanks), Native/OpenGL,
+root memory cards, and no `--runtime-state`. No screenshots or tests were added,
+modified, or used. The user still reports wobble with interpolation enabled;
+do **not** treat the following component fixes as resolution of that report.
+
+- The combat-entry stall around VBlanks 2802–2813 reproduced at about 8 VBlanks/s
+  for 1.35 seconds. `perf script` localized it to one `glReadPixels` per GPUREAD
+  pixel (`ensure_cpu_region -> glb_vram_read -> gpu_read_gpuread -> DMA2`).
+  Prefetch the transfer rectangle through an optional backend coherency callback
+  at the first GPUREAD, keeping point-read dirty checks and guest transfer state.
+  The same window subsequently advances at normal cadence.
+- Model entry capture incorrectly depended on rigid-pose availability, and mode 1
+  was restricted to Gear callers. Preserve authenticated geometry independently
+  of pose eligibility; retain fractional MAC/SZ in the unposed Native projector.
+- Unposed model endpoint publication used the pre-scene bridge, replacing source
+  vertex IDs with corner IDs. Exact publication preserves those IDs. Complete
+  per-model temporal coverage supplies previously culled vertices. Publication
+  must run on the final group at `8002c86c` (`s3 == -1`), not just the wrapper
+  end at `800257dc`, which Field does not call. Captured proof: 2,250 successful
+  publications, zero rejections; all 3,889 and 1,341 sampled draws for two unposed
+  meshes interpolate, versus recurring missing-previous-vertex rejections before.
+- Base and phase rasterization used different viewport heights/origins. A GDB
+  diagnostic that rendered phases without motion found 0–107 differing RGB
+  pixels per 1704x864 image. Using the endpoint coordinate domain for the phase
+  canvas, then cropping scanout, gives identical hashes and zero RGB differences
+  in ten sampled comparisons. This is a real consistency fix, not proof that the
+  reported moving-scene wobble is gone.
+- An all-draw bulk capture preserved models, poses, billboard vertices, UVs,
+  materials and GPU command geometry. After normalizing render-target origins,
+  105,767 phase triangles matched the calculated Q16 coordinates exactly. UVs,
+  RGB attributes and rigid LOCAL vertices did not change in the paired samples.
+  A separate 4,526-swap capture found no backwards source order or full-to-midpoint
+  reversal; the late window had no sampled presentation gaps above 25 ms.
+
+Experimental perspective-texture/depth changes and a not-yet-wired camera-input
+reconstruction were removed after failing to establish the user's remaining
+symptom. In particular, source camera reconstruction requires observing the real
+look-at/render lifecycle; do not replace it with the latest eye globals. Offline
+integer reconstruction matched 251 saved look-at matrices, but that alone does
+not validate a new presentation path. The residual wobble is **UNRESOLVED**.
+Private receipts and diagnostic tools: `/home/pc/opencode-tmp/opencode/` with
+prefix `xg-combat-wobble-` (notably `before`, `profile`, `coverage-published`,
+`endpoint-same-domain`, `swap-order`). GDB captures perturb timing and are not FPS
+measurements. Legacy replay `status=FAIL` is distinct from `runtime_status=PASS`.
+After removing the experiments, `cmake --build build-dbg --target psx-runtime -j 8`
+and the complete `retained-fixes` replay succeed (exit 0, `trace_complete`,
+`runtime_status=PASS`, zero compile failures). The 2798–2820 source window falls
+from 1,544.23 ms to 368.12 ms; VBlanks 3900–4500 take 10,008.02 ms. Both memory
+cards are unchanged and replay SHA-256 remains
+`817b9582165b1b94ec96f7dfd65c95ce58f59e4a712dff8b6ddfa3b3fecad2f3`.
+
 ### 2026-09-15 — Residual subpixel wobble and camera affine inverse
 
 The user still saw subtle contour/position wobble after the whole-model clip

@@ -95,21 +95,50 @@ int psx_debug_overlay_set_force_capture(int on);
  * Returns 0 on success, negative on unknown name or failed write. */
 int psx_debug_overlay_widget_action(const char *name, int value, int value2);
 
-/* Consume separate one-shot requests for Xenogears' 8 MiB developer profile
- * and its native Kernel Menu. Enabling the profile does not change game state,
- * and opening the Kernel Menu does not require the developer profile. */
+/* Consume separate one-shot requests for Xenogears' 8 MiB developer profile,
+ * its native Kernel Menu, and a boot-to-field teleport. Enabling the profile
+ * does not change game state, and opening the Kernel Menu does not require
+ * the developer profile. */
 int psx_debug_overlay_take_developer_mode_request(void);
 int psx_debug_overlay_take_kernel_menu_request(void);
+/* Consume a pending boot-to-field teleport staged by psx_debug_overlay_teleport
+ * when the field module was not resident. Returns 1 with *fieldId/*entryPoint
+ * filled (0..729 / 0..255) when a request is pending, 0 when idle. The
+ * consumer (debug_server_apply_pending_guest_transition) stages the
+ * persistent target and yanks to MainLoop(1) at the next safe vblank edge
+ * — the same mechanism as the Kernel Menu transition. */
+int psx_debug_overlay_take_field_boot_request(int *fieldId, int *entryPoint);
 
-/* Debug-only: fire the field-module teleport with the EXACT verified
- * recipe (7 writes, no fieldID write, no loadNewField call). The engine
- * poll at 0x800784A0 picks up fieldMapNumber + fieldEntryPoint the
- * next frame and runs the full completion sequence. The guard requires
- * the field module to be active (fieldContextPtr 0x800B0078 != 0);
- * otherwise the writes are skipped and a non-zero error is returned.
- * 0 = armed (engine will load target within a few frames).
- * > 0 = refused (guard tripped; `value` arg is the field id for context).
- * < 0 = internal failure. */
+/* Debug-only: teleport to a field map, from anywhere.
+ *
+ * Inside the field module this mirrors what the game's own scripted
+ * transitions do (opcode 0x98 at 0x800932D0): stage the target in
+ * fieldMapNumber (0x8004F34C) + the entry point in the ACTIVE VM mirror
+ * (0x800C3A68+2, plus the persistent 0x8006EF66 copy), then clear the
+ * poll gate (0x800ADBEC) as the commit. The engine poll at 0x800784A0
+ * picks it up the next frame and runs the full completion sequence.
+ *
+ * Outside the field module (battle / worldmap / menu / movie) there is
+ * no poll to consume a recipe, so the call instead stages a boot-to-field
+ * request: the debug server yanks to MainLoop(1) at the next safe vblank
+ * edge (same mechanism as the Kernel Menu transition) and Field boots
+ * straight into the target map+entry. This abandons the current module
+ * without its teardown — same trade-off as the Kernel Menu yank; do not
+ * use it mid memory-card write.
+ *
+ * Field residency is detected via the overlay signature at 0x8006FAF0
+ * (4 = Field; same ground truth as the renderer's semantic-module
+ * detection). 0x800B0078 and 0x800592C0 are NOT usable signals here.
+ * 0 = armed in-place (engine will load target within a few frames).
+ * 4 = boot-to-field requested (watch Current field; ~60 s timeout).
+ * 1 = refused: game has no game state yet (too early in boot).
+ * 2 = refused: a teleport is already in flight (no write performed).
+ * 3 = refused: engine busy — party streaming, menu request, or
+ *     fade/transition running (no write performed).
+ * -1 = bad field id (valid: 0..729 per fields.xml).
+ * -2 = bad entry point (valid: 0..255; each map only implements a few
+ *     arrival records — out-of-range reads bytecode garbage and usually
+ *     lands on a black screen). */
 int psx_debug_overlay_teleport(int fieldId, int entryPoint);
 
 /* Debug-only: write party slot [0..2] to the kernel master slots at
@@ -131,8 +160,10 @@ int psx_debug_overlay_write_party_bitfield(int bitfield);
 /* Debug-only: write gold u32 LE at 0x8006EF58. 0 = ok. */
 int psx_debug_overlay_write_gold(unsigned int gold);
 
-/* Debug-only: write fieldVars[var] u16 LE at 0x8006EF64+var*2. 0 = ok,
- * negative on bad var. */
+/* Debug-only: write fieldVars[var] u16 LE at 0x8006EF64+var*2 (+ the
+ * active VM mirror at 0x800C3A68+var*2 while field is loaded, since
+ * script handlers read the active copy and persist would otherwise
+ * clobber a persistent-only write). 0 = ok, negative on bad var. */
 int psx_debug_overlay_write_var(int var, int value);
 
 /* Debug-only: write the encounter-trigger gate u32 LE at 0x800B2298.
@@ -150,13 +181,16 @@ int psx_debug_overlay_camera_write(int ex, int ey, int ez,
                                     int ax, int ay, int az);
 
 /* Debug-only: apply the event's varWrites (via write_var) then
- * fire the teleport recipe. `eventId` is the index into the events
- * table loaded from events.xml. 0 = armed, 1 = refused (field module
- * not active), negative on bad id. */
+ * teleport (in-place recipe, or boot-to-field when outside field).
+ * `eventId` is the index into the events table loaded from events.xml.
+ * 0 = armed, 4 = boot-to-field requested, 1 = refused (game not booted
+ * far enough), 2/3 = refused (in flight / engine busy), negative on
+ * bad id. A refused jump leaves RAM untouched. */
 int psx_debug_overlay_event_jump(int eventId);
 
 /* Read the 2-byte current field ID from 0x8006F94E (LE) and return
- * -1 when invalid (used by the teleport guard + panel readout). */
+ * -1 when the field module is not resident (the mirror is only
+ * meaningful while field owns the game state). */
 int psx_debug_overlay_read_field_id(void);
 
 #else /* Release: every call is a static-inline no-op (zero code, zero symbols). */
@@ -174,6 +208,7 @@ static inline int psx_debug_overlay_set_force_capture(int on) { (void)on; return
 static inline int psx_debug_overlay_widget_action(const char *n, int v, int v2) { (void)n; (void)v; (void)v2; return -1; }
 static inline int psx_debug_overlay_take_developer_mode_request(void) { return 0; }
 static inline int psx_debug_overlay_take_kernel_menu_request(void) { return 0; }
+static inline int psx_debug_overlay_take_field_boot_request(int *f, int *e) { (void)f; (void)e; return 0; }
 static inline int psx_debug_overlay_teleport(int f, int e) { (void)f; (void)e; return -1; }
 static inline int psx_debug_overlay_write_party_slot(int s, int c, int b) { (void)s; (void)c; (void)b; return -1; }
 static inline int psx_debug_overlay_write_party_bitfield(int b) { (void)b; return -1; }

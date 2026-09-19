@@ -607,14 +607,23 @@ touch `fieldID` directly and never call `loadNewField` (the field
 poll at `0x800784A0` is the only correct caller).
 
 - `{"cmd":"overlay_widget_action","name":"teleport","value":<fieldId>,"value2":<entryPoint>}`
-  → fires the verified 7-write recipe. The field-module guard
-  (`fieldContextPtr 0x800B0078 != 0`) must be satisfied; otherwise
-  the function returns 1 and the recipe is NOT written. The engine
-  picks up `fieldMapNumber` (0x8004F34C) and `fieldEntryPoint`
-  (0x8006EF66) on the next frame and runs the full completion
-  sequence. Response on success: `{"ok":true,...,"value":0}`; on
-  refusal: `{"ok":true,...,"value":1}` (the action's own return
-  rides in `value` — pass through OK semantics).
+  → teleport to a field map, from anywhere. Inside field it fires the
+  recipe (mirrors opcode 0x98: entry to the ACTIVE VM mirror
+  0x800C3A68+2 AND persistent 0x8006EF66, target to `fieldMapNumber`
+  0x8004F34C, clear poll gate 0x800ADBEC last); the engine picks it up
+  on the next frame. Outside field (battle/worldmap/menu/movie) there
+  is no poll, so it stages a boot-to-field instead: at the next safe
+  vblank edge the server writes persistent fieldID/entry and yanks to
+  MainLoop(1) — same mechanism as the Kernel Menu transition (the
+  current module is abandoned without teardown; do not use mid
+  memory-card write). Residency is detected via the overlay signature
+  at 0x8006FAF0 (4 = Field). Response: `{"ok":true,...,"value":0}` on
+  in-place arm, `value:4` on boot-to-field request; refusals ride in
+  `value`: 1 = game has no game state yet, 2 = teleport already in
+  flight, 3 = engine busy, -1 = bad field id (0..729),
+  -2 = bad entry (0..255). NOTE: each map only implements a few arrival
+  records — an out-of-range entry reads bytecode garbage as a spawn
+  position (usual black-screen cause); prefer entry 0.
 - `{"cmd":"overlay_widget_action","name":"party_slot","value":<slot*256+charId>,"value2":<bitfieldBit|-1>}`
   → writes party slot [0..2] to the kernel master slots at
   `0x80062590+slot*4` (u32, low byte = char id, 0xFF = empty), then
@@ -635,12 +644,14 @@ poll at `0x800784A0` is the only correct caller).
   `value` is a signed int; pass values up to `2^31-1` (the runtime
   clamps to u32 on the write).
 - `{"cmd":"overlay_widget_action","name":"write_var","value":<var>,"value2":<u16>}`
-  → writes `fieldVars[var]` at `0x8006EF64+var*2` (LE). `var` is
-  0..511; named vars are in `debug_overlay/data/flags.xml` (e.g.
+  → writes `fieldVars[var]` at `0x8006EF64+var*2` (LE) plus the active
+  VM mirror at `0x800C3A68+var*2` while field is loaded (handlers read
+  the active copy; a persistent-only write is clobbered by persist).
+  `var` is 0..511; named vars are in `debug_overlay/data/flags.xml` (e.g.
   `var 0 = GameProgress`, `var 2 = FieldEntryPoint`).
 - `{"cmd":"overlay_widget_action","name":"read_field_id","value":0}`
   → reads `fieldID` from `0x8006F94E` (LE u16). Returns -1 when
-  the field module is not active.
+  the field module is not resident (overlay sig 0x8006FAF0 != 4).
 - `{"cmd":"overlay_widget_action","name":"force_battle","value":<u32>}`
   → writes the encounter-trigger gate u32 LE at `0x800B2298`
   (reference-verified: the reference's validation hook writes 0 here
@@ -662,8 +673,8 @@ poll at `0x800784A0` is the only correct caller).
   0x800af880/0x800af890).
 - `{"cmd":"overlay_widget_action","name":"event_jump","value":<eventId>}`
   → applies the event's `varWrites` (via the `write_var` path:
-  `fieldVars[var]` at `0x8006EF64+var*2`, LE) then fires the verified
-  7-write teleport recipe. `eventId` is the index into the events
+  `fieldVars[var]` at `0x8006EF64+var*2`, LE, plus the active mirror)
+  then fires the teleport recipe. `eventId` is the index into the events
   table loaded from `debug_overlay/data/events.xml` (35 entries
   currently; verified=green button, unverified=greyed). The TCP
   action does NOT enforce the verified flag (TCP clients can read the

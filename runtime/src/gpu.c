@@ -3484,6 +3484,14 @@ uint32_t gpu_read_gpuread(void) {
     if (!vram_read_active)
         return gpuread_latch;
 
+    /* Synchronize the transfer as a rectangle at its first actual read, rather
+     * than forcing a host GPU readback for each 16-bit pixel. This only updates
+     * the backend's coherent CPU mirror: it neither advances the guest transfer
+     * nor snapshots over later writes. gr_vram_read retains its dirty check. */
+    if (vram_read_pixel_count == 0u)
+        gr_vram_prepare_read(vram_read_x, vram_read_y,
+                             vram_read_w, vram_read_h);
+
     /* Read two 16-bit pixels from VRAM and pack into one 32-bit word.
      * Routed through the renderer facade: under the GL backend the GPU-side
      * framebuffer is authoritative and must be synced down before the CPU

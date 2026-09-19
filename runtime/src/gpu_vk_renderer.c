@@ -3394,6 +3394,7 @@ static const GpuRenderBackend VK_BACKEND = {
     .render_display_hires          = vkb_render_display_hires,
     .vram_write                    = vkb_vram_write,
     .vram_read                     = vkb_vram_read,
+    .vram_prepare_read             = ensure_cpu_transfer,
     .vram_transfer_in              = vkb_vram_transfer_in,
     .vram_transfer_out             = vkb_vram_transfer_out,
     .set_draw_area                 = vkb_set_draw_area,

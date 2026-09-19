@@ -627,6 +627,9 @@ int gr_canonical_framebuffer_digest(int display_x, int display_y,
         display_x, display_y, display_width, display_height, out_digest);
 }
 void gr_vram_write(int x, int y, uint16_t pixel)     { g_b->vram_write(x, y, pixel); }
+void gr_vram_prepare_read(int x, int y, int w, int h) {
+    if (g_b->vram_prepare_read) g_b->vram_prepare_read(x, y, w, h);
+}
 uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, y); }
 void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { g_b->vram_transfer_in(x, y, w, h, d); }
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->vram_transfer_out(x, y, w, h, d); }

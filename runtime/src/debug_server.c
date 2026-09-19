@@ -18613,8 +18613,34 @@ void debug_server_poll_overlay_actions(void)
 
 void debug_server_apply_pending_guest_transition(CPUState *cpu)
 {
-    if (!cpu || !s_kernel_menu_transition_pending ||
-        psx_get_in_exception())
+    if (!cpu || psx_get_in_exception())
+        return;
+
+    /* Boot-to-field teleport issued outside the field module: stage the
+     * persistent target (fieldID + entry var — field boot copies them
+     * into the active VM mirror itself) and yank to MainLoop(1). Same
+     * safe-boundary mechanism as the Kernel Menu transition below: the
+     * current module is abandoned without its teardown. Handled before
+     * the kernel request so a (user-error) double-pending pair resolves
+     * deterministically; each path longjmps and never falls through. */
+    {
+        int boot_field = -1, boot_entry = 0;
+        if (psx_debug_overlay_take_field_boot_request(&boot_field, &boot_entry) &&
+            boot_field >= 0) {
+            psx_write_byte(0x8006F94Eu, (uint8_t)(boot_field & 0xFF));
+            psx_write_byte(0x8006F94Fu, (uint8_t)((boot_field >> 8) & 0xFF));
+            psx_write_byte(0x8006EF66u, (uint8_t)(boot_entry & 0xFF));
+            psx_write_byte(0x8006EF67u, (uint8_t)((boot_entry >> 8) & 0xFF));
+            s_in_command = 1;
+            cpu->gpr[4] = 1u;
+            psx_dispatch_call(cpu, 0x8001996Cu, 0x80001720u);
+            cpu->gpr[4] = 0u;
+            s_in_command = 0;
+            psx_scheduler_resume_at(0x80019ACCu);
+        }
+    }
+
+    if (!s_kernel_menu_transition_pending)
         return;
 
     /* The vblank poll can run inside the current module's guest VSync call.
