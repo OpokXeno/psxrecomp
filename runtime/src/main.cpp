@@ -182,6 +182,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -573,7 +574,7 @@ static uint64_t native_render_clock_ns() {
 }
 
 static struct {
-    struct Sample { uint64_t ns, vblank, cycle; uint32_t scene; } samples[16384];
+    struct Sample { uint64_t ns, vblank, cycle; uint32_t scene; uint64_t thread_cpu_ns, pace_ns; } samples[16384];
     uint64_t total = 0, start_ns = 0;
     std::string path;
 } g_vblank_timing;
@@ -582,13 +583,14 @@ static void vblank_timing_flush() {
     if (g_vblank_timing.path.empty()) return;
     FILE *out = std::fopen(g_vblank_timing.path.c_str(), "w");
     if (!out) return;
-    std::fprintf(out, "start_ns,total,capacity\n%llu,%llu,16384\nns,vblank,cycle,scene\n",
+    std::fprintf(out, "start_ns,total,capacity\n%llu,%llu,16384\nns,vblank,cycle,scene,thread_cpu_ns,pace_ns\n",
         (unsigned long long)g_vblank_timing.start_ns,
         (unsigned long long)g_vblank_timing.total);
     for (uint64_t i = 0; i < std::min<uint64_t>(g_vblank_timing.total, 16384); ++i) {
         const auto &s = g_vblank_timing.samples[i];
-        std::fprintf(out, "%llu,%llu,%llu,%u\n", (unsigned long long)s.ns,
-            (unsigned long long)s.vblank, (unsigned long long)s.cycle, s.scene);
+        std::fprintf(out, "%llu,%llu,%llu,%u,%llu,%llu\n", (unsigned long long)s.ns,
+            (unsigned long long)s.vblank, (unsigned long long)s.cycle, s.scene,
+            (unsigned long long)s.thread_cpu_ns, (unsigned long long)s.pace_ns);
     }
     std::fclose(out);
 }
@@ -17358,15 +17360,22 @@ session_reboot:
     gpu_set_vblank_callback(sdl_vblank_present);
     gpu_set_host_quantum_boundary_hook(nullptr);
     psx_interrupts_set_vblank_host_hook([] {
+        const uint64_t pace_start = g_vblank_timing.start_ns ? native_render_clock_ns() : 0;
         native_render_host_quantum_pace();
         const uint64_t irq_ns = native_render_clock_ns();
         if (g_vblank_timing.start_ns) {
             extern uint64_t g_vblank_raise_count;
+            uint64_t thread_cpu_ns = 0;
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+            struct timespec cpu_time;
+            if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_time) == 0)
+                thread_cpu_ns = (uint64_t)cpu_time.tv_sec * 1000000000u + cpu_time.tv_nsec;
+#endif
             const uint64_t index = g_vblank_timing.total++;
             if (index < 16384)
                 g_vblank_timing.samples[index] = {irq_ns,
                     g_vblank_raise_count + 1u, psx_get_cycle_count(),
-                    psx_xenogears_scene_generation()};
+                    psx_xenogears_scene_generation(), thread_cpu_ns, irq_ns - pace_start};
         }
     });
 

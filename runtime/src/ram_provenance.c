@@ -113,14 +113,15 @@ void ram_provenance_invalidate_range(uint32_t address, uint32_t width) {
         !main_ram_offset(address, &offset))
         return;
     revision = next_cpu_revision();
-    for (uint32_t byte = 0u; byte < width; ++byte) {
-        const uint32_t current = offset + byte;
-        RamProvenanceEntry *entry;
-        uint8_t mask;
-
-        if ((size_t)current >= main_ram_writer_count * sizeof(uint32_t)) break;
-        entry = &main_ram_writers[current >> 2u];
-        mask = (uint8_t)(1u << (current & 3u));
+    const uint32_t available = (uint32_t)(main_ram_writer_count * sizeof(uint32_t) - offset);
+    if (width > available) width = available;
+    /* Metadata is word-granular. Clear the covered byte mask in one update,
+     * retaining the same event revision for unaligned heads and tails. */
+    while (width) {
+        const uint32_t first = offset & 3u;
+        const uint32_t count = width < 4u-first ? width : 4u-first;
+        const uint8_t mask = (uint8_t)(((1u << count)-1u) << first);
+        RamProvenanceEntry *entry = &main_ram_writers[offset >> 2u];
         entry->cpu_valid_bytes &= (uint8_t)~mask;
         entry->source_valid_bytes &= (uint8_t)~mask;
         if (entry->source_valid_bytes == 0u) {
@@ -129,6 +130,8 @@ void ram_provenance_invalidate_range(uint32_t address, uint32_t width) {
             entry->source_receipt = 0u;
         }
         entry->cpu_revision = revision;
+        offset += count;
+        width -= count;
     }
 }
 
@@ -150,6 +153,13 @@ void ram_provenance_note_cpu_store(uint32_t instruction, uint32_t address,
     }
     if (!main_ram_offset(address, &offset)) return;
     revision = next_cpu_revision();
+    if (width == 4u && !(offset & 3u)) {
+        RamProvenanceEntry *entry = &main_ram_writers[offset >> 2u];
+        entry->cpu_value = value;
+        entry->cpu_valid_bytes = UINT8_C(0x0f);
+        entry->cpu_revision = revision;
+        return;
+    }
     for (uint32_t byte = 0u; byte < width; ++byte) {
         const uint32_t current = offset + byte;
         RamProvenanceEntry *entry;

@@ -290,6 +290,11 @@ extern "C" void gte_native_provenance_invalidate_range(
         uint32_t address, uint32_t width) {
     if (!s_native_projection_enabled || s_speculative_depth != 0 || width == 0)
         return;
+    if (width == 4u && !(address & 3u)) {
+        NativeProjectionSlot *slot = native_projection_ram_slot(address);
+        if (slot) slot->generation = 0;
+        return;
+    }
     const uint32_t first = address & ~3u;
     const uint64_t last_byte = (uint64_t)address + width - 1u;
     if (last_byte > UINT32_MAX) return;
@@ -495,8 +500,14 @@ extern "C" void gte_native_provenance_cpu_alu(
             ((instruction >> 6u) & 31u) == 16u) {
             const NativeProjectionSlot *shifted =
                 rt != 0u ? &s_native_projection_gpr[rt] : nullptr;
-            const NativeProjectionSlot shifted_value =
-                shifted != nullptr ? *shifted : NativeProjectionSlot{};
+            /* Most integer shifts do not carry projected coordinates. Check
+             * the generation before copying the full provenance receipt; as in
+             * copy_or_kill, generation zero invalidates all payload fields. */
+            if (shifted == nullptr || shifted->generation != s_native_projection_generation) {
+                target->generation = 0;
+                return;
+            }
+            const NativeProjectionSlot shifted_value = *shifted;
             shifted = rt != 0u ? &shifted_value : nullptr;
             *target = {};
             if (shifted != nullptr &&
@@ -521,6 +532,11 @@ extern "C" void gte_native_provenance_cpu_alu(
             return;
         }
         if (target != nullptr && function == 0x25u && rs != 0u && rt != 0u) {
+            if (s_native_projection_gpr[rs].generation != s_native_projection_generation &&
+                s_native_projection_gpr[rt].generation != s_native_projection_generation) {
+                target->generation = 0;
+                return;
+            }
             const NativeProjectionSlot left_value = s_native_projection_gpr[rs];
             const NativeProjectionSlot right_value = s_native_projection_gpr[rt];
             const NativeProjectionSlot *left = &left_value;
