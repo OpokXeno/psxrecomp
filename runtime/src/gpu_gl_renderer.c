@@ -15818,6 +15818,7 @@ static void interp_reset_history(void) {
 
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
                                    double source_hz, int blend_mode) {
+    static int disabled_logged;
     double effective_hz = target_hz > 0.0 ? target_hz : host_hz;
     if (effective_hz < source_hz) effective_hz = source_hz;
     int active = (!s_native_active && enabled && source_hz >= 1.0 && source_hz <= 1000.0 &&
@@ -15832,15 +15833,18 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
     s_interp_target_hz = active ? effective_hz : 0.0;
     s_interp_source_hz = active ? source_hz : 0.0;
     s_interp_blend_mode = blend_mode == 1 ? 1 : 0;
-    if (active)
+    if (active) {
+        disabled_logged = 0;
         fprintf(stdout, "psxrecomp: GL temporal frame blending enabled: %.1f "
                 "presents/s from %.3f guest frames/s on the render thread "
                 "(%s blend; no motion vectors)\n",
                 effective_hz, source_hz,
                 s_interp_blend_mode ? "change-adaptive" : "linear");
-    else
+    } else if (!disabled_logged) {
+        disabled_logged = 1;
         fprintf(stdout, "psxrecomp: GL temporal frame blending disabled "
                 "(host %.1f Hz)\n", host_hz);
+    }
 }
 
 void gl_renderer_set_interpolation_suspended(int suspended) {
