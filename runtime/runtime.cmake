@@ -2449,7 +2449,10 @@ function(psxrecomp_add_runtime_target target)
         set_property(SOURCE
             ${PSXRECOMP_ROOT}/runtime/src/audio_trace.c
             ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
+            ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
             ${PSXRECOMP_ROOT}/runtime/src/guest_render_bridge.c
+            ${PSXRECOMP_ROOT}/runtime/src/guest_tty.c
+            ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
             APPEND PROPERTY COMPILE_OPTIONS /experimental:c11atomics)
         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
         # No console window in Release MSVC builds. /ENTRY keeps main() as
