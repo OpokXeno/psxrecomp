@@ -41,7 +41,14 @@ endif()
 option(PSX_OPTIMIZED_DEBUG "Optimize Debug runtime code while retaining debug facilities" ON)
 if(PSX_OPTIMIZED_DEBUG)
     if(MSVC)
-        add_compile_options($<$<CONFIG:Debug>:/O2>)
+        # MSVC's Debug defaults (/Od /RTC1 /Ob0) fight /O2 (D8016 on cl.exe,
+        # heavy stutter on clang-cl); drop them and keep inlining on. The debug
+        # CRT (/MDd) also stutters this runtime, so Debug uses the release CRT.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        foreach(_lang C CXX)
+            string(REGEX REPLACE "/RTC1|/Od|/Ob0" "" CMAKE_${_lang}_FLAGS_DEBUG "${CMAKE_${_lang}_FLAGS_DEBUG}")
+        endforeach()
+        add_compile_options($<$<CONFIG:Debug>:/O2> $<$<CONFIG:Debug>:/Ob2>)
     else()
         add_compile_options($<$<CONFIG:Debug>:-O3>)
     endif()
