@@ -509,8 +509,19 @@ static int gl_swap_window_private(GlSwapCaller caller) {
 }
 
 static void apply_swap_interval(void) {
-    int interval = s_native_interpolation_denominator > 2u
-        ? 0 : s_swap_interval;
+    /* The Toggles FPS selector only wrote the denominator before: route it
+     * to the real swap cadence here (and in main.cpp's
+     * present_effective_swap_interval, which must agree). 30 -> every 2nd
+     * vsync on a 60 Hz panel; past 2 -> immediate, the midpoint worker
+     * emits the extra phases itself. Gated on the native path so stale
+     * denominators never pace interp/legacy presents. */
+    int interval = s_swap_interval;
+    if (s_native_active) {
+        if (s_native_interpolation_denominator > 2u)
+            interval = 0;
+        else if (s_native_interpolation_denominator <= 1u)
+            interval = 2;
+    }
 
     if (!s_ctx) return;
     if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
@@ -943,6 +954,15 @@ typedef enum GlNativeFenceState {
 } GlNativeFenceState;
 
 #define GL_NATIVE_MOTION_PHASE_CAPACITY 7u
+/* Adaptive phase budget: how many motion phases each batch may author.
+ * The tick-rate need (interval x hz) assumes generation is free; when the
+ * worker cannot render that many phases before the tick deadline, batches
+ * publish at the deadline and every tick selects due-whole (phased 0/s at
+ * 240 Hz). The budget tracks what fits: partial publish snaps it to the
+ * rendered prefix, expiry steps it down, sustained early completion probes
+ * upward. Worker-thread only (motion_prepare + denominator site below). */
+static unsigned int s_native_phase_budget = GL_NATIVE_MOTION_PHASE_CAPACITY;
+static unsigned int s_native_phase_budget_early_streak = 0u;
 typedef struct GlNativePhaseImage {
     GLuint texture, framebuffer;
     uint32_t *pixels;
@@ -1031,6 +1051,11 @@ typedef struct GlNativeCompileAudit {
     uint32_t temporal_status;
     uint32_t consumed_motion_resources, temporal_phase_count, temporal_interval_vblanks;
     uint32_t motion_evaluations, motion_projected_draws;
+    /* Phase-loop cost (replay + hash per rendered phase): ns + delivered
+     * phases, merged into phase_gen_* diag. Only successful/partial loops
+     * accumulate (discarded work is pure waste, not generation cost). */
+    uint64_t phase_gen_ns;
+    uint32_t phase_gen_count;
     uint64_t temporal_interval_ns;
     int recipe_canonical_match, recipe_view_match, recipe_validation_performed;
     /* Only populated entries are read; keep capacity storage out of the reset. */
@@ -6077,6 +6102,9 @@ static void native_publish_compile_audit(const GlNativeCompileAudit *audit,
             s_native_compiler_diag.last_temporal_interval_ns = audit->temporal_interval_ns;
             s_native_compiler_diag.motion_evaluations += audit->motion_evaluations;
             s_native_compiler_diag.motion_projected_draws += audit->motion_projected_draws;
+            s_native_compiler_diag.phase_gen_ns_total += audit->phase_gen_ns;
+            s_native_compiler_diag.phase_gen_batches += audit->phase_gen_count > 0u ? 1u : 0u;
+            s_native_compiler_diag.phase_gen_phases += audit->phase_gen_count;
             s_native_compiler_diag.recipe_canonical_match = audit->recipe_canonical_match;
             s_native_compiler_diag.recipe_view_match = audit->recipe_view_match;
             s_native_compiler_diag.recipe_validation_performed = audit->recipe_validation_performed;
@@ -11603,7 +11631,9 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
     const uint64_t cycles = header->identity.guest_cycle - old->identity.guest_cycle;
     const uint64_t seconds = cycles / UINT64_C(33868800);
     if (seconds >= UINT64_MAX / UINT64_C(1000000000)) goto finished;
-    const uint64_t interval = seconds * UINT64_C(1000000000) +
+    /* Non-const: partial publish (below) shrinks it to the rendered prefix
+     * so the presenter maps phases over the covered sub-interval. */
+    uint64_t interval = seconds * UINT64_C(1000000000) +
         (cycles % UINT64_C(33868800)) * UINT64_C(1000000000) / UINT64_C(33868800);
     /* Nearest cadence ratio avoids an extra phase for 59.94-vs-60 rounding.
      * Bound before multiplying so long source intervals cannot overflow. */
@@ -11612,7 +11642,16 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         ? GL_NATIVE_MOTION_PHASE_CAPACITY + 1u
         : (uint32_t)((interval * temporal_hz + UINT64_C(500000000)) / UINT64_C(1000000000));
     if (denominator < 1u) denominator = 1u;
-    const uint32_t phase_count = denominator - 1u;
+    /* Cap the tick-rate need by the adaptive budget: authoring more phases
+     * than generation fits only publishes at the deadline (all-due wholes
+     * downstream) while burning the extra renders. */
+    {
+        const unsigned int budget_denom = s_native_phase_budget + 1u;
+        if (denominator > budget_denom) denominator = budget_denom;
+    }
+    /* Non-const: a tick deadline can time-box generation to fewer phases
+     * (partial publish below reassigns both to the rendered prefix). */
+    uint32_t phase_count = denominator - 1u;
     if (!phase_count) {
         audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_SOURCE_CADENCE;
         goto finished;
@@ -11636,10 +11675,35 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_SOURCE_STATE_REQUIRED;
         goto finished;
     }
+    const uint64_t phase_loop_started = SDL_GetPerformanceCounter();
     for (uint32_t phase = 0u; phase < phase_count; ++phase) {
         if (deadline_known && SDL_GetTicksNS() >= deadline_ns) {
-            audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_DEADLINE_EXPIRED;
-            goto phases_failed;
+            if (phase == 0u) {
+                /* Nothing fit: step the budget down gradually (a single
+                 * already-overdue loop may be transient). */
+                if (s_native_phase_budget > 1u) --s_native_phase_budget;
+                s_native_phase_budget_early_streak = 0u;
+                audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_DEADLINE_EXPIRED;
+                goto phases_failed;
+            }
+            /* Time-boxed generation: publish the phases already rendered
+             * instead of discarding all work. They cover the first
+             * phase/phase_count of the interval (fractions were preflighted
+             * against the full denominator), so shrink the interval to
+             * match — the presenter maps phases uniformly over it and
+             * holds the whole after. Strictly better than whole-only:
+             * at 240 Hz ticks a 7-phase batch rarely fits its deadline,
+             * and discarding 4 rendered phases produced the all-whole
+             * output (phased 0/s) plus the wasted renders. */
+            phase_count = phase;
+            interval = interval * (uint64_t)phase / denominator;
+            /* Exact fit discovered: what rendered is what fits. Snap the
+             * budget to it (strictly shrinks: phase < capped phase_count).
+             * The early-streak reset below is implied (break lands at/after
+             * the deadline), stated here for clarity. */
+            s_native_phase_budget = phase;
+            s_native_phase_budget_early_streak = 0u;
+            break;
         }
         /* Preflight validated every phase before enabling any entity. Replay
          * consumes those exact projections, without reevaluating the hierarchy. */
@@ -11663,11 +11727,48 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
             if (!native_recipe_render(recipe, entities, &vertices, phase, recipe->view_width != 0u,
                     audit, crop_y, header->display.height, &check)) goto phases_failed;
             prepared->phases[phase].pixels = check; check = NULL;
-            prepared->phases[phase].digest = pres_hash_bytes((const uint8_t *)prepared->phases[phase].pixels, pixel_bytes);
+            /* Per-phase digests have no consumer (chain/history use the base
+             * and whole digests); hashing full frames xN per batch just to
+             * discard costs ~1/3 of the phase loop. Audit builds keep it. */
+            if (s_native_recipe_audit_enabled)
+                prepared->phases[phase].digest = pres_hash_bytes((const uint8_t *)prepared->phases[phase].pixels, pixel_bytes);
+            else
+                prepared->phases[phase].digest = 0u;
             prepared->phases[phase].upload_state = GL_NATIVE_ENDPOINT_UPLOAD_STAGED;
         }
     }
     prepared->count = phase_count;
+    if (phase_count > 0u) {
+        const uint64_t phase_loop_ended = SDL_GetPerformanceCounter();
+        const uint64_t freq = SDL_GetPerformanceFrequency();
+        if (freq != 0u && phase_loop_ended >= phase_loop_started) {
+            audit->phase_gen_ns += (phase_loop_ended - phase_loop_started) *
+                UINT64_C(1000000000) / freq;
+            audit->phase_gen_count += phase_count;
+        }
+        /* Slow upward probe: only a full need completed with wide margin
+         * earns it (partial already snapped down above; cutting close
+         * resets the streak without moving). */
+        if (deadline_known && temporal_hz != 0u) {
+            const uint64_t now_ns = SDL_GetTicksNS();
+            if (now_ns < deadline_ns) {
+                const uint64_t tick_ns = UINT64_C(1000000000) / temporal_hz;
+                if (deadline_ns - now_ns > 2u * tick_ns) {
+                    if (++s_native_phase_budget_early_streak >= 60u) {
+                        s_native_phase_budget_early_streak = 0u;
+                        if (s_native_phase_budget < GL_NATIVE_MOTION_PHASE_CAPACITY)
+                            ++s_native_phase_budget;
+                    }
+                } else {
+                    s_native_phase_budget_early_streak = 0u;
+                }
+            } else {
+                s_native_phase_budget_early_streak = 0u;
+            }
+        } else {
+            s_native_phase_budget_early_streak = 0u;
+        }
+    }
     if (views->gpu) {
         views->gpu->phase_count = phase_count;
         views->gpu->phase_crop_y = recipe->origin_y + crop_y;
@@ -12901,6 +13002,7 @@ static int native_gpu_service(void) {
         SDL_UnlockMutex(s_native_state_mutex);
         if(status!=PSXGL_TIMEOUT_EXPIRED) {
             int hashes_ok=1;
+            size_t readback_mapped_bytes = 0u;
             if(status==PSXGL_ALREADY_SIGNALED||status==PSXGL_CONDITION_SATISFIED) {
                 const uint64_t latency=SDL_GetTicksNS()-work->submitted_ns;
                 GLuint64 times[3]={0};
@@ -12919,9 +13021,19 @@ static int native_gpu_service(void) {
                 for(unsigned i=0;i<=work->phase_count&&work->scanout;++i) {
                     const uint64_t copy_started=SDL_GetTicksNS();
                     const size_t bytes=(size_t)work->images[i].width*work->images[i].height*4u;
+                    /* Phase digests (i>0) have no consumer: the chain uses
+                     * [0]/whole digests. Mapping + hashing full frames only
+                     * to discard costs a transfer and a CPU hash per phase.
+                     * Keep [0] (chain/probe/visible scan) plus anything an
+                     * armed probe or audit build needs; skip the rest. */
+                    const int need_pixels = (i == 0) ||
+                        s_native_recipe_audit_enabled ||
+                        s_native_motion_probe.target_vblank;
+                    if (!need_pixels) { work->image_digests[i] = 0u; continue; }
                     p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER,work->readbacks[i]);
                     const void *pixels=p_glMapBufferRange(PSXGL_PIXEL_PACK_BUFFER,0,bytes,PSXGL_MAP_READ_BIT);
                     if(!pixels){hashes_ok=0;break;}
+                    readback_mapped_bytes += bytes;
                     /* Presentation owns GPU textures; only an explicitly armed
                      * motion probe retains CPU image bytes. Hash the mapped
                      * immutable readback on its GL owner instead of copying the
@@ -12969,7 +13081,7 @@ static int native_gpu_service(void) {
             if (!work->failed) {
                 s_native_compiler_diag.gpu.completed++;
                 if (work->scanout) {
-                    s_native_compiler_diag.gpu.readback_bytes+=(size_t)work->images[0].width*work->images[0].height*4u*(work->phase_count+1u);
+                    s_native_compiler_diag.gpu.readback_bytes += readback_mapped_bytes;
                 }
             }
             work->timing.ready_ns=SDL_GetTicksNS();
@@ -14216,6 +14328,7 @@ static void native_presenter_swap(void *user_data) {
     swapped = gl_swap_window_private(GL_SWAP_CALLER_NATIVE_PRESENTER);
     if (swapped) {
         pres_mark_swap_completed(sequence);
+        s_last_present_path = GL_PRES_NATIVE_WORKER;
         s_probe_swap++;
     } else {
         pres_mark_swap_attempted(sequence, 1);
@@ -14651,6 +14764,10 @@ rollback_growth:
 
 int gl_renderer_native_interpolation_fps(void) {
     return (int)s_native_interpolation_denominator * 30;
+}
+
+int gl_renderer_last_present_path(void) {
+    return s_last_present_path;
 }
 
 void gl_renderer_native_shutdown(void) {

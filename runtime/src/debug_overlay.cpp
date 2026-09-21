@@ -122,9 +122,13 @@ extern "C" {
                                    starvation_ring_dump */
 #include "cpu_state.h"          /* gte_set_display_aspect */
 #include "spu.h"
+#include "xg_render_presentation_host.h" /* host snapshot: true tick/present rates */
 
 extern void psx_frame_interpolation_set(int enabled);
 extern int psx_frame_interpolation_enabled(void);
+extern int psx_native_semantic_fps_set(int fps);
+extern "C" bool psx_native_render_presentation_host_snapshot(
+    XgRenderPresentationHostSnapshot *out_snapshot);
 
 /* Memory read accessor — used by the RAM Inspector section. */
 extern uint8_t psx_read_byte(uint32_t addr);
@@ -143,6 +147,9 @@ extern int  psx_ws_get_native_wide(void);
 extern int g_ws_bd_stretch_on;
 extern int g_ws_bd_stretch_pct;
 
+/* True guest-vblank raise counter (interrupts.c, cycle-paced). */
+extern uint64_t g_vblank_raise_count;
+
 /* Launcher-equivalent video/audio setters defined in main.cpp (extern "C"
  * there). turbo loads is a direct extern "C" global, same as debug_server. */
 extern "C" int  psx_video_get_supersampling(void);
@@ -151,10 +158,15 @@ extern "C" int  psx_video_get_antialiasing(void);
 extern "C" void psx_video_set_antialiasing(int on);
 extern "C" int  psx_video_get_screen_model(void);
 extern "C" void psx_video_set_screen_model(int k);
+extern "C" void psx_video_get_aspect(int *num, int *den);
+extern "C" int  psx_debug_display_aspect(int num, int den, int adaptive);
+extern "C" int  psx_video_set_aspect_runtime(int num, int den, int native_wide);
 extern "C" int  psx_audio_get_spu_hq(void);
 extern "C" void psx_audio_set_spu_hq(int on);
 extern "C" int  psx_video_get_window_width(void);
 extern "C" void psx_video_set_window_width(int w);
+extern "C" int  psx_video_get_vsync(void);
+extern "C" void psx_video_set_vsync(int mode);
 extern "C" int  psx_input_controller_ports_swapped(void);
 extern "C" int  psx_input_controller_port_swap_available(void);
 extern "C" int  psx_input_swap_controller_ports(void);
@@ -242,6 +254,157 @@ static int s_aspect_den = 3;
  * (gr_backend() never changes after init). */
 static const char *s_backend_name = "?";
 
+/* Presented-frame + vblank rate tracking for the GPU State readouts.
+ * pre_swap runs once per present on the main thread, so counting its calls
+ * measures exactly what reaches the screen (game frames + interpolated
+ * frames alike — never vblank pacing). The guest vblank raise counter
+ * gives the real VSYNC rate beside it. 500 ms sample windows. */
+static uint64_t s_present_count      = 0;
+static uint64_t s_present_last       = 0;
+static uint64_t s_present_tick       = 0;
+static double   s_present_fps        = 0.0;
+static uint64_t s_vblank_last        = 0;
+static uint64_t s_vblank_tick        = 0;
+static double   s_vblank_hz          = 0.0;
+/* True presenter cadence (host ticks that ran present_next vs ticks that
+ * actually composed+swapped). pre_swap counts every swap attempt including
+ * blocked ones, so FPS (presented) reads high when the driver/compositor
+ * eats frames; this pair is the ground truth for whether the FPS selector's
+ * period retarget stuck. Sampled in the same window as s_present_fps. */
+static uint64_t s_host_att_last      = 0;
+static uint64_t s_host_pre_last      = 0;
+static double   s_host_att_rate      = 0.0;
+static double   s_host_pre_rate      = 0.0;
+static int      s_host_snap_ok       = 0;
+/* Per-tick outcome breakdown: empty (no batch ready), fence (GPU work not
+ * done), held (re-presented retained frame = duplicate). High hold/empty at
+ * 120/240 means the worker can't feed phases that fast. */
+static uint64_t s_host_empty_last    = 0;
+static uint64_t s_host_fence_last    = 0;
+static uint64_t s_host_held_last     = 0;
+static double   s_host_empty_rate    = 0.0;
+static double   s_host_fence_rate    = 0.0;
+static double   s_host_held_rate     = 0.0;
+/* Phase-generation outcomes: READY (with last authored count), EXPIRED
+ * (worker too slow for the tick deadline), WHOLE_ONLY. Tells whether 240
+ * starves from slow generation or from authoring too few phases. */
+static uint64_t s_ph_ready_last      = 0;
+static uint64_t s_ph_exp_last        = 0;
+static uint64_t s_ph_whole_last      = 0;
+static double   s_ph_ready_rate      = 0.0;
+static double   s_ph_exp_rate        = 0.0;
+static double   s_ph_whole_rate      = 0.0;
+static uint32_t s_ph_last_count      = 0;
+static uint32_t s_ph_last_status     = 0;
+/* Fresh endpoint presents/s, hold re-presents/s, and phase (non-whole)
+/s. At 240 with healthy consumption ends ~= ticks; ends << ticks with
+ * holds ~= ticks means batches die after one present. */
+static uint64_t s_ph_ends_last       = 0;
+static uint64_t s_ph_holds_last      = 0;
+static uint64_t s_ph_vis_last        = 0;
+static double   s_ph_ends_rate       = 0.0;
+static double   s_ph_holds_rate      = 0.0;
+static double   s_ph_vis_rate        = 0.0;
+
+static void gpu_state_sample_rates(void)
+{
+    uint64_t now = SDL_GetTicks64();
+    s_present_count++;
+    if (s_present_tick == 0u) {
+        s_present_tick = now;
+        s_vblank_tick = now;
+        s_present_last = s_present_count;
+        s_vblank_last = g_vblank_raise_count;
+        return;
+    }
+    if (now - s_present_tick < 500u) return;
+    double dt = (double)(now - s_present_tick) / 1000.0;
+    if (dt > 0.0) {
+        s_present_fps = (double)(s_present_count - s_present_last) / dt;
+        uint64_t vb = g_vblank_raise_count;
+        if (vb >= s_vblank_last) {
+            s_vblank_hz = (double)(vb - s_vblank_last) / dt;
+        }
+        s_vblank_last = vb;
+        XgRenderPresentationHostSnapshot snap;
+        if (psx_native_render_presentation_host_snapshot(&snap)) {
+            s_host_snap_ok = 1;
+            if (snap.presenter_attempts >= s_host_att_last)
+                s_host_att_rate = (double)(snap.presenter_attempts -
+                                           s_host_att_last) / dt;
+            if (snap.presenter_presented >= s_host_pre_last)
+                s_host_pre_rate = (double)(snap.presenter_presented -
+                                           s_host_pre_last) / dt;
+            s_host_att_last = snap.presenter_attempts;
+            s_host_pre_last = snap.presenter_presented;
+            if (snap.presenter_empty >= s_host_empty_last)
+                s_host_empty_rate = (double)(snap.presenter_empty -
+                                             s_host_empty_last) / dt;
+            if (snap.presenter_fence_pending >= s_host_fence_last)
+                s_host_fence_rate = (double)(snap.presenter_fence_pending -
+                                             s_host_fence_last) / dt;
+            if (snap.presenter_held >= s_host_held_last)
+                s_host_held_rate = (double)(snap.presenter_held -
+                                            s_host_held_last) / dt;
+            s_host_empty_last = snap.presenter_empty;
+            s_host_fence_last = snap.presenter_fence_pending;
+            s_host_held_last = snap.presenter_held;
+            GlRendererNativeCompilerDiagnostics cd;
+            gl_renderer_native_compiler_diagnostics(&cd);
+            uint64_t cr = cd.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_READY];
+            uint64_t ce = cd.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_DEADLINE_EXPIRED];
+            uint64_t cw = cd.temporal_status_counts[GL_RENDERER_NATIVE_TEMPORAL_WHOLE_ONLY];
+            if (cr >= s_ph_ready_last)
+                s_ph_ready_rate = (double)(cr - s_ph_ready_last) / dt;
+            if (ce >= s_ph_exp_last)
+                s_ph_exp_rate = (double)(ce - s_ph_exp_last) / dt;
+            if (cw >= s_ph_whole_last)
+                s_ph_whole_rate = (double)(cw - s_ph_whole_last) / dt;
+            s_ph_ready_last = cr;
+            s_ph_exp_last = ce;
+            s_ph_whole_last = cw;
+            s_ph_last_count = cd.last_temporal_phase_count;
+            s_ph_last_status = cd.last_temporal_status;
+            uint64_t pe = snap.presentation.presented_endpoints;
+            uint64_t ph = snap.presentation.presented_holds;
+            uint64_t pv = snap.presentation.visual_only_updates;
+            if (pe >= s_ph_ends_last)
+                s_ph_ends_rate = (double)(pe - s_ph_ends_last) / dt;
+            if (ph >= s_ph_holds_last)
+                s_ph_holds_rate = (double)(ph - s_ph_holds_last) / dt;
+            if (pv >= s_ph_vis_last)
+                s_ph_vis_rate = (double)(pv - s_ph_vis_last) / dt;
+            s_ph_ends_last = pe;
+            s_ph_holds_last = ph;
+            s_ph_vis_last = pv;
+        } else {
+            s_host_snap_ok = 0;
+        }
+    }
+    s_present_last = s_present_count;
+    s_present_tick = now;
+    s_vblank_tick = now;
+}
+
+/* Independent tools window. The overlay used to render inside the game GL
+ * window (covering the game); it now owns a separate SDL window + GL
+ * context, so the debugger lives beside the game instead of on top of it.
+ * s_tools_win/s_tools_ctx are created lazily on the first pre_swap (the
+ * main thread owns the game GL context there). Entry GL state is captured
+ * per pre_swap call (present paths do not all share one context) and
+ * restored after tools-window work. s_legacy_inline selects the
+ * old in-game render path when the tools window cannot be created
+ * (headless/constrained GL) — same widgets, zero behavior delta. */
+static SDL_Window   *s_tools_win     = nullptr;
+static SDL_GLContext s_tools_ctx     = nullptr;
+static bool          s_separate_ready = false;
+static bool          s_legacy_inline  = false;
+
+/* Forward: input-path helpers defined beside process_event (need SDL event
+ * types), used early by the free-camera hold. */
+static bool tools_input_active(void);
+static SDL_Window *overlay_active_window(void);
+
 /* State for the three new panels (teleport / party / gold+vars). */
 static int      s_teleport_field_id   = 1;
 static int      s_teleport_entry      = 0;
@@ -275,9 +438,28 @@ static int      s_field_boot_entry = 0;
 
 static int      s_party_slot[3]      = {0, 1, 2};
 static int      s_party_bitfield     = 0x07FF;
-static bool     s_party_roster_show  = true;
 static bool     s_party_unlock[11]   = { true, true, true, true, true,
                                          true, true, true, true, true, true };
+static int      s_party_status_frames = 0;
+static char     s_party_status[128]  = {0};
+static int      s_party_level_p[3]   = {1, 1, 1};
+static int      s_party_level_e[3]   = {1, 1, 1};
+/* Stat editor state (roster-direct). u16: HP/maxHP/MP/maxMP. u8: five
+ * attributes + hit/evade. EXP remaining (u32 x2) primes authentic
+ * level-ups: the result loop fires on crossed thresholds. */
+static int      s_party_hp[3]    = {0, 0, 0};
+static int      s_party_mhp[3]   = {0, 0, 0};
+static int      s_party_mp[3]    = {0, 0, 0};
+static int      s_party_mmp[3]   = {0, 0, 0};
+static int      s_party_atk[3]   = {0, 0, 0};
+static int      s_party_def[3]   = {0, 0, 0};
+static int      s_party_agi[3]   = {0, 0, 0};
+static int      s_party_eth[3]   = {0, 0, 0};
+static int      s_party_efd[3]   = {0, 0, 0};
+static int      s_party_hit[3]   = {0, 0, 0};
+static int      s_party_eva[3]   = {0, 0, 0};
+static int      s_party_expr[3]  = {0, 0, 0};
+static int      s_party_expe[3]  = {0, 0, 0};
 
 static int      s_gold_value         = 0;
 static int      s_gold_dirty         = 0;
@@ -285,22 +467,423 @@ static int      s_vars_filter_sel    = -1;
 static char     s_vars_filter[64]    = {0};
 static int      s_var_edit[512]      = {0};
 
-/* State for the Force Battle panel (W6). The encounter-trigger address
- * 0x800B2298 is verified-by-reference (the reference's validation hook
- * writes it to 0 to disable encounters for deterministic replay). What
- * writing a non-zero does is HYPOTHESIZED from the reference's logic
- * (`playMusicAuthorized != 0` is one of the gates for the encounter
- * countdown to fire), but the live offset of the other encounter
- * countdown vars (g_encounterTimer / g_encounterDataCountdown /
- * g_encounterTriggerTime[32]) is not in the reference's address book,
- * so the panel ships the gate write + extensive readouts + a clear
- * "best-effort: depends on field encounter data" status — see
- * draw_battle_section for the exact contract. */
-static int      s_battle_scene_id    = 0;
-static int      s_battle_arena_id    = 0;
-static int      s_battle_trigger_val = 1;     /* value written to 0x800B2298 */
-static char     s_battle_status[96]  = {0};
+/* Global enemy picker: (name, set, def). Parsed from
+ * docs/xenogears-disc1-filesystem.md dir 0x0D visual-file lists.
+ * Lanes of one battle must share a set (single enemy pair loads),
+ * so picking an enemy from another set switches the battle set. */
+struct DbgBattleEnemy { const char *name; int set; int def; };
+static const DbgBattleEnemy kBattleEnemies[] = {
+    { "Jackal", 0, 0 },
+    { "Hobgob", 0, 1 },
+    { "Armor Grub", 0, 2 },
+    { "Armor Wasp", 0, 3 },
+    { "Jackal", 1, 0 },
+    { "Hobgob", 1, 1 },
+    { "Lucre Bug", 1, 2 },
+    { "Nolucre Bug", 1, 3 },
+    { "Hobgob", 1, 4 },
+    { "Armor Grub", 1, 5 },
+    { "Hobgob", 1, 6 },
+    { "Jackal dupe", 1, 7 },
+    { "Gigafoot", 2, 0 },
+    { "Gigafoot", 2, 1 },
+    { "Trooper", 2, 2 },
+    { "Trooper", 2, 3 },
+    { "Forest Elf", 3, 0 },
+    { "Dive Bomber", 3, 1 },
+    { "Gonzalez", 3, 2 },
+    { "Leonardo", 3, 3 },
+    { "Heinrich", 3, 4 },
+    { "Vargas", 3, 5 },
+    { "Dwarf", 3, 6 },
+    { "Forest Elf", 3, 7 },
+    { "Aveh Corporal", 4, 0 },
+    { "Aveh Soldier", 4, 1 },
+    { "Aveh Corporal", 4, 2 },
+    { "Aveh Corporal", 4, 3 },
+    { "Aveh Soldier", 4, 4 },
+    { "Aveh Guard", 4, 5 },
+    { "Aveh Guard", 4, 6 },
+    { "ShakhanGuard", 4, 7 },
+    { "Sand Man", 5, 0 },
+    { "Tin Robo", 5, 1 },
+    { "Dune Man", 5, 2 },
+    { "Neo Tin Robo", 5, 3 },
+    { "Supa Tin Robo", 5, 4 },
+    { "Shellbelle", 6, 0 },
+    { "Hammerhead", 6, 1 },
+    { "Shellbell F1", 6, 2 },
+    { "Hammerhead F1", 6, 3 },
+    { "Carrier", 7, 0 },
+    { "Shadey", 7, 1 },
+    { "Suzarn", 7, 2 },
+    { "Carrier F1", 7, 3 },
+    { "Dan", 8, 0 },
+    { "Wiseman", 8, 1 },
+    { "Wiseman", 8, 2 },
+    { "Big Joe", 8, 3 },
+    { "Alpha Weltall", 9, 0 },
+    { "Musha Mk100", 9, 1 },
+    { "NeoMushaMk100", 9, 2 },
+    { "Assassin", 10, 0 },
+    { "Assassin", 10, 1 },
+    { "Rankar Dragon", 11, 0 },
+    { "Elly", 11, 1 },
+    { "Rankar R", 11, 2 },
+    { "WM Rankar 1", 11, 3 },
+    { "WM Rankar 2 [Rankar Dragon", 11, 4 },
+    { "Land Crab", 11, 5 },
+    { "Weltall]", 11, 6 },
+    { "Armor Grub", 12, 0 },
+    { "Armor Wasp", 12, 1 },
+    { "Acid Frog", 12, 2 },
+    { "Sand Shark", 12, 3 },
+    { "Mullet", 12, 4 },
+    { "Rain Frog", 12, 5 },
+    { "Sand Shark", 12, 6 },
+    { "Vierge", 13, 0 },
+    { "Alpha Weltall", 13, 1 },
+    { "True Weltall", 13, 2 },
+    { "Clawknight", 14, 0 },
+    { "Swordknight", 14, 1 },
+    { "Aegisknight", 14, 2 },
+    { "Wandknight", 14, 3 },
+    { "Clawknight R", 14, 4 },
+    { "Swordknight R", 14, 5 },
+    { "Aegisknight R", 14, 6 },
+    { "Wandknight R", 14, 7 },
+    { "Alkanshel", 15, 0 },
+    { "Schpariel", 15, 1 },
+    { "Alkanshel", 15, 2 },
+    { "HarquebusMk10", 16, 0 },
+    { "Hatamoto Mk3", 16, 1 },
+    { "Mechanic", 16, 2 },
+    { "HarquebusMk10 duplicate", 16, 3 },
+    { "Neo Wels", 17, 0 },
+    { "Wels", 17, 1 },
+    { "Wyvern", 18, 0 },
+    { "Miang's Gear", 18, 1 },
+    { "Haishao", 18, 2 },
+    { "Haishao", 18, 3 },
+    { "Calamity", 19, 0 },
+    { "Dora", 19, 1 },
+    { "Amphysvena", 20, 0 },
+    { "Opiomorph", 20, 1 },
+    { "Nomad Fix Bot", 21, 0 },
+    { "Salvager", 21, 1 },
+    { "Dora dupe", 21, 2 },
+    { "Twin Burner", 22, 0 },
+    { "Spear Trooper", 22, 1 },
+    { "Quadrafoot dupe", 22, 2 },
+    { "Rotten Sod", 23, 0 },
+    { "Slugger", 23, 1 },
+    { "Abandon", 23, 2 },
+    { "Orphan", 23, 3 },
+    { "Dorothy dupe", 23, 4 },
+    { "Croaker Tribe", 24, 0 },
+    { "Forbidden", 24, 1 },
+    { "Forbidden", 24, 2 },
+    { "Forbidden", 24, 3 },
+    { "Forbidden", 24, 4 },
+    { "Croaker Tribe", 24, 5 },
+    { "Margie", 25, 0 },
+    { "Shakhan Guard", 25, 1 },
+    { "GuardMachine", 25, 2 },
+    { "Shakhan Monk", 25, 3 },
+    { "Freelancer", 25, 4 },
+    { "Defencer", 25, 5 },
+    { "Traffic Jam", 26, 0 },
+    { "Traffic Jam", 26, 1 },
+    { "Vierge dupe", 26, 2 },
+    { "Medusoid", 27, 0 },
+    { "May Fly", 27, 1 },
+    { "Medusoid", 27, 2 },
+    { "Edelweiss dupe", 27, 3 },
+    { "Rico", 28, 0 },
+    { "Death Scythe dupe", 28, 1 },
+    { "Medusoid dupe", 28, 2 },
+    { "Hecht", 29, 0 },
+    { "Super Aerod", 29, 1 },
+    { "Medusoid dupe", 29, 2 },
+    { "Ripper", 30, 0 },
+    { "Phobia", 30, 1 },
+    { "Dorothy", 30, 2 },
+    { "Death Eater", 30, 3 },
+    { "Brigandier", 31, 0 },
+    { "Crescens", 31, 1 },
+    { "Medusoid dupe", 31, 2 },
+    { "Edelweiss", 32, 0 },
+    { "Planter", 32, 1 },
+    { "Littlefoot", 33, 0 },
+    { "Solaris Guard", 33, 1 },
+    { "Security Cube", 33, 2 },
+    { "Eagle Gunner", 34, 0 },
+    { "Eagle Armor", 34, 1 },
+    { "Eagle Blade", 34, 2 },
+    { "White Knight", 35, 0 },
+    { "Citadel", 35, 1 },
+    { "Avalanche", 35, 2 },
+    { "Shinobi Mk0", 36, 0 },
+    { "Mammoth", 36, 1 },
+    { "Eagle Blade dupe", 36, 2 },
+    { "Conjurer", 37, 0 },
+    { "Edin", 37, 1 },
+    { "Gun Drone", 37, 2 },
+    { "Fis-6", 38, 0 },
+    { "Fis-6Mechanic", 38, 1 },
+    { "Wyrm", 39, 0 },
+    { "Death Scythe", 39, 1 },
+    { "Wyrm", 39, 2 },
+    { "Death Scythe", 39, 3 },
+    { "Hopper", 40, 0 },
+    { "Lil' Kobold", 40, 1 },
+    { "Eagle Blade dupe", 40, 2 },
+    { "Tears", 41, 0 },
+    { "Gimmick", 41, 1 },
+    { "Neo Tears", 41, 2 },
+    { "Neo Gimmick", 41, 3 },
+    { "Siebzehn", 42, 0 },
+    { "Achtzehn", 42, 1 },
+    { "Achtzehn", 42, 2 },
+    { "Sand Tripper", 43, 0 },
+    { "Quadrafoot", 43, 1 },
+    { "Achtzehn dupe", 43, 2 },
+    { "Sufal", 44, 0 },
+    { "Sufal Gear", 44, 1 },
+    { "Sufal Gear", 44, 2 },
+    { "Sufal", 44, 3 },
+    { "Sufal Mass", 44, 4 },
+    { "Margie", 45, 0 },
+    { "Ramsus", 45, 1 },
+    { "Miang", 45, 2 },
+    { "Fei", 45, 3 },
+    { "Id", 45, 4 },
+    { "Main Gun", 46, 0 },
+    { "Small Gun", 46, 1 },
+    { "Big Joe", 47, 0 },
+    { "Scud", 47, 1 },
+    { "Dwarf", 47, 2 },
+    { "Leonardo", 47, 3 },
+    { "Heinrich", 47, 4 },
+    { "Vargas", 47, 5 },
+    { "Gonzalez", 47, 6 },
+    { "Forest Elf v2 duplicates", 47, 7 },
+    { "Giant Wels", 48, 0 },
+    { "Haishao", 48, 1 },
+    { "Rhino", 49, 0 },
+    { "Batrat", 49, 1 },
+    { "Gebler Guard", 50, 0 },
+    { "Swordsman", 50, 1 },
+    { "Swordsman", 50, 2 },
+    { "Id", 51, 0 },
+    { "Weltall-Id dupe", 51, 1 },
+    { "Id Weltall-Id", 52, 0 },
+    { "Weltall-Id dupe", 52, 1 },
+    { "[Rattan", 52, 2 },
+    { "Mugwort", 52, 3 },
+    { "Regulus]", 52, 4 },
+    { "Shakhan", 53, 0 },
+    { "Vendetta", 53, 1 },
+    { "Shakhan dupe", 53, 2 },
+    { "Bladegash", 54, 0 },
+    { "Skyghene", 54, 1 },
+    { "Marinebasher", 54, 2 },
+    { "Grandgrowl", 54, 3 },
+    { "Bladegash", 54, 4 },
+    { "G Elements", 55, 0 },
+    { "Hammer", 55, 1 },
+    { "Grahf", 56, 0 },
+    { "Grahf", 56, 1 },
+    { "Executioner", 56, 2 },
+    { "Original Weltall", 56, 3 },
+    { "Dominia", 57, 0 },
+    { "Tolone", 57, 1 },
+    { "Seraphita", 57, 2 },
+    { "Kelvena Kelvina", 57, 3 },
+    { "Tolone", 57, 4 },
+    { "Seraphita", 57, 5 },
+    { "Snow Bot", 58, 0 },
+    { "Bot", 58, 1 },
+    { "Seraphita dupe", 58, 2 },
+    { "Kelvena dupe", 58, 3 },
+    { "Rapid Fire", 59, 0 },
+    { "Breaker", 59, 1 },
+    { "Fuel Tank", 59, 2 },
+    { "Kelvena dupe", 59, 3 },
+    { "Aragonite", 60, 0 },
+    { "Merman", 60, 1 },
+    { "Etone", 61, 0 },
+    { "Etone", 61, 1 },
+    { "Twin Burner", 61, 2 },
+    { "Neo Etone", 61, 3 },
+    { "Neo Etone", 61, 4 },
+    { "Metatron", 62, 0 },
+    { "Sundel", 62, 1 },
+    { "Harlute", 62, 2 },
+    { "Marlute", 62, 3 },
+    { "Unused 5th placeholder", 62, 4 },
+    { "stats present in Marlute battle", 62, 5 },
+    { "Deus", 63, 0 },
+    { "Deus", 63, 1 },
+    { "Deus (Final Form variations: 70K", 63, 2 },
+    { "52K", 63, 3 },
+    { "40K)", 63, 4 },
+    { "Deus Deus 1st Form", 64, 0 },
+    { "Ft. Hurricane", 64, 1 },
+    { "Pedestal", 65, 0 },
+    { "Airwalk", 65, 1 },
+    { "Eagle Wing", 65, 2 },
+    { "Golem", 66, 0 },
+    { "Griffon", 66, 1 },
+    { "Griffon", 66, 2 },
+    { "Redrum", 67, 0 },
+    { "Bloody", 67, 1 },
+    { "Bloody Bros", 67, 2 },
+    { "(Weltall-Id)", 68, 0 },
+    { "Eagle Gunner", 68, 1 },
+    { "Wyvern", 68, 2 },
+    { "Ramsus", 68, 3 },
+    { "Pecking Duck", 69, 0 },
+    { "Lil'Allemange", 69, 1 },
+    { "Id Xenogears-Id", 70, 0 },
+    { "Original Weltall (Wiseman)", 70, 1 },
+    { "Tusk-Tusk", 71, 0 },
+    { "Dragon", 71, 1 },
+    { "Dragon", 71, 2 },
+    { "Dragon", 71, 3 },
+    { "Tusk-Tusk", 71, 4 },
+    { "Dragon", 71, 5 },
+    { "Dragon", 71, 6 },
+    { "Dragon", 71, 7 },
+    { "Wind Seraph", 72, 0 },
+    { "Earth Seraph", 72, 1 },
+    { "Power Seraph", 72, 2 },
+    { "Sword Seraph", 73, 0 },
+    { "Heal Seraph", 73, 1 },
+    { "Fire Seraph", 73, 2 },
+    { "Water Seraph", 73, 3 },
+    { "Sword Seraph", 74, 0 },
+    { "Heal Seraph", 74, 1 },
+    { "Fire Seraph", 74, 2 },
+    { "Water Seraph [Weltall-Id", 74, 3 },
+    { "Wyvern", 74, 4 },
+    { "Airwalk", 74, 5 },
+    { "Yggdrasil II]", 74, 6 },
+    { "Urobolus", 75, 0 },
+};
+static constexpr int kBattleEnemyCount = 297;
+static constexpr int kBattleEnemySetMax = 75;
+
+/* Battle arenas (dir 0x0F pairs): arena n <-> env file 6+2n, init 7+2n.
+ * Parsed from docs/xenogears-disc1-filesystem.md (75 stages). */
+struct DbgBattleArena { int id; const char *name; };
+static const DbgBattleArena kBattleArenas[] = {
+    { 0, "stage0 - Aveh Transport Ship" },
+    { 1, "stage1 - Blackmoon Forest" },
+    { 2, "stage2 - Nortune (Kislev) - D Block Alleyway" },
+    { 3, "stage3 - Mountain Path" },
+    { 4, "stage4 - Mountain Cave" },
+    { 5, "stage5 - Anima Dungeon/Zeboim Ruins?" },
+    { 6, "stage6 - Forest" },
+    { 7, "stage7 - Desert" },
+    { 8, "stage8 - Bledavik Tournament Stage" },
+    { 9, "stage9 - Nortune - Sewers" },
+    { 10, "stage10 - Nortune - Gear Paddocks" },
+    { 11, "stage11 - Goliath Factory" },
+    { 12, "stage12 - Desert - Wyrm Fight" },
+    { 13, "stage13 - Fatima Castle Stairway" },
+    { 14, "stage14 - Nisan" },
+    { 15, "stage15 - Gear Hangar" },
+    { 16, "stage16 - Yggdrasil II - Ocean (Starboard)" },
+    { 17, "stage17 - Stalactite Cave - Calamity Fight" },
+    { 18, "stage18 - Lahan Under Attack" },
+    { 19, "stage19 - Metal Corridor" },
+    { 20, "stage20 - Goliath" },
+    { 21, "stage21 - Reaper Ship - Storeroom" },
+    { 22, "stage22 - Reaper Ship - Meat Locker" },
+    { 23, "stage23 - Facility - Hallways" },
+    { 24, "stage24 - Stalactite Cave Depths" },
+    { 25, "stage25 - Mountain Pass" },
+    { 26, "stage26 - Giant Experiment Chamber" },
+    { 27, "stage27 - Kefeinzel" },
+    { 28, "stage28 - Sargasso" },
+    { 29, "stage29 - Goliath Factory - Fis-6 Fight" },
+    { 30, "stage30 - Zeboim City" },
+    { 31, "stage31 - Fatima Castle Courtyard" },
+    { 32, "stage32 - Nisan Underground Facility" },
+    { 33, "stage33 - Anima Relic Puzzle Room? Unused?" },
+    { 34, "stage34 - Shevat Hallway" },
+    { 35, "stage35 - Babel Tower" },
+    { 36, "stage36 - Babel Tower Platform" },
+    { 37, "stage37 - Ship Hallway" },
+    { 38, "stage38 - Solaris Gateway Bridge" },
+    { 39, "stage39 - Zeboim Bridge" },
+    { 40, "stage40 - Hecht" },
+    { 41, "stage41 - Waters Surface?" },
+    { 42, "stage42 - Platforms" },
+    { 43, "stage43 - Overworld (Snow)" },
+    { 44, "stage44 - Overworld (Plains)" },
+    { 45, "stage45 - Shevat? Floating Platforms" },
+    { 46, "stage46 - Destroyed Platform" },
+    { 47, "stage47 - Overworld (Barrens)" },
+    { 48, "stage48 - Solaris Waterway" },
+    { 49, "stage49 - Raziel Tree" },
+    { 50, "stage50 - Fatima Castle Hallway" },
+    { 51, "stage51 - 4 Platforms Stage" },
+    { 52, "stage52 - Soylent System - Sufal Mass Fight" },
+    { 53, "stage53 - Overworld (Ocean)" },
+    { 54, "stage54 - Solaris Room?" },
+    { 55, "stage55 - Energy Core Bridge" },
+    { 56, "stage56 - Merkava Room" },
+    { 57, "stage57 - Merkava Corridor" },
+    { 58, "stage58 - Merkava Platform" },
+    { 59, "stage59 - Merkava Hallway" },
+    { 60, "stage60 - Deus Rebirth Chamber" },
+    { 61, "stage61 - Golgoda" },
+    { 62, "stage62 - Babel Tower - Hanger" },
+    { 63, "stage63 - Zohar" },
+    { 64, "stage64 - Space Void?" },
+    { 65, "stage65 - Deus Inner Core" },
+    { 66, "stage66 - Path of Sephirot" },
+    { 67, "stage67 - Babel Tower Platforms" },
+    { 68, "stage68 - Hecht Starboard" },
+    { 69, "stage69 - Yggdrasil II - Ocean (Port)" },
+    { 70, "stage70 - Clouds - Achtzehn Fight" },
+    { 71, "stage71 - Capsized Ship" },
+    { 72, "stage72 - Ft. Jasper" },
+    { 73, "stage73 - Facility Room" },
+    { 74, "stage74 - Ft. Jasper - Central Chamber?" },
+};
+static constexpr int kBattleArenaCount = 75;
+
+/* State for the Battle Selector panel (W6, rewritten with game knowledge).
+ * The old panel only armed the encounter gate (0x800B2298) and hoped the
+ * random countdown would fire — best-effort, often nothing. The new panel
+ * mirrors the engine's own explicit-battle path (field opcode 0x71
+ * StartBattle at 0x80093568 / FE 84 at 0x800933F8): stage a 32-byte
+ * formation record into the resident section-6 table (0x800658DC, static,
+ * installed per map by InstallFieldScene), forward the staged config
+ * (0x800B2356 -> 0x8005954C), write selected index (0x80059508) + request
+ * flag (0x800594F8 = 0), then commit the handoff (0x800ADBDC = 0,
+ * 0x800ADBE0 = 0, 0x800ADB88 = 1, LAST). The field coordinator consumes it
+ * exactly like a scripted explicit battle (ordinary snapshot + return).
+ * Party/gears/levels stage through the persistent records the battle
+ * loader copies at startup (kernel slots via the safe formation API,
+ * gear byte roster+0xA0, level bytes roster+0x62/63). */
+static int      s_battle_trigger_val = 1;     /* encounter gate 0x800B2298 (randoms on/off) */
+static int      s_battle_enemy_set   = 0;     /* derived pool: set of the picked lanes */
+static int      s_battle_arena       = 0;
+static int      s_battle_lane_def[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static bool     s_battle_lane_gear[8] = {false, false, false, false, false, false, false, false};
+static char     s_battle_enemy_filter[64] = {0};
+static int      s_battle_party[3]    = {0, 0xFF, 0xFF};
+static bool     s_battle_mounted[3]  = {false, false, false};
+static int      s_battle_gear[3]     = {0xFF, 0xFF, 0xFF};  /* per-slot gear id -> that slot char's roster+0xA0 */
+static int      s_battle_level_p[3]  = {1, 1, 1};
+static int      s_battle_level_e[3]  = {1, 1, 1};
+static char     s_battle_status[160] = {0};
 static int      s_battle_status_frames = 0;
+static bool     s_battle_edit_init = false;
 
 /* State for the Free Camera panel (W6) — rewritten with game knowledge.
  *
@@ -512,18 +1095,19 @@ static void draw_gpu_state_section(void)
 {
     ImGui::Text("Backend         : %s", s_backend_name);
 
-    int internal_scale = gr_scale();
-    ImGui::Text("Internal scale  : %dx",
-                internal_scale > 0 ? internal_scale : 1);
+    /* Requested presentation scale (same source as the Toggles slider).
+     * gr_scale() reports the GL raster, which stays 1 by design under the
+     * native renderer — that phantom 1x is what this row used to show. */
+    ImGui::Text("Internal scale  : %dx", psx_video_get_supersampling());
 
     ImGui::Text("Texture filter  : %s",
                 texfilter_label(gr_texture_filter()));
 
-    /* Same accessors the TCP gpu_state handler uses (gpu.h). */
+    /* Same accessors the TCP gpu_state handler uses (gpu.h). Display comes
+     * straight from the CRTC registers: 320x216 is genuine (worldmap modes
+     * and field letterbox), not a stale read. */
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
-    GpuDrawArea da;
-    gpu_get_draw_area(&da);
     uint32_t hx1 = 0, hx2 = 0, hy1 = 0, hy2 = 0, hr1 = 0, hr2 = 0;
     gpu_get_crtc_debug(&hx1, &hx2, &hy1, &hy2, &hr1, &hr2);
     ImGui::Text("Display         : %ux%u  (depth=%d, %s)",
@@ -532,53 +1116,58 @@ static void draw_gpu_state_section(void)
                 di.disabled ? "disabled" : "enabled");
     ImGui::Text("Display range   : x=[%u..%u] y=[%u..%u]",
                 hx1, hx2, hy1, hy2);
-    ImGui::Text("Draw area       : (%u,%u)..(%u,%u)  off=(%d,%d)",
-                da.left, da.top, da.right, da.bottom, da.offset_x, da.offset_y);
 
-    /* ws.xnum/xden mirror the TCP ws_aspect handler's response field. */
-    GpuWsDebug ws;
-    gpu_ws_get_debug(&ws);
-    if (ws.xden > 0) {
-        ImGui::Text("Aspect          : %d/%d  (squash mode %d)",
-                    ws.xnum, ws.xden, ws.mode);
-    } else {
-        ImGui::Text("Aspect          : (unset)");
-    }
+    /* Display-buffer draw state omitted: the live draw area alternates
+     * every frame between the double-buffered contexts by design, so a
+     * readout carries no information (verified against gpu_get_draw_area
+     * + the field's paired render contexts). RAM Inspector covers
+     * manual inspection. */
 
-    ImGui::Text("Native wide     : %s  (extra=%d)",
-                psx_ws_get_native_wide() ? "on" : "off", ws.nw_extra);
-
-    ImGui::Text("BD stretch      : on=%d pct=%d",
-                g_ws_bd_stretch_on, g_ws_bd_stretch_pct);
-
+    /* Configured game aspect (4:3, or 16:9 when widescreen is selected).
+     * Not the GTE/squash internals. */
     {
-        /* Same diag helper the TCP gl_interp handler uses. */
-        int en = 0, sus = 0, hist = 0;
-        double hh = 0.0, th = 0.0;
-        uint64_t swaps = 0;
-        gl_renderer_interpolation_diag(&en, &sus, &hist, &hh, &th, &swaps);
-        ImGui::Text("Interp          : %s  host=%.2fHz target=%.2fHz swaps=%llu",
-                    en ? "on" : "off", hh, th,
-                    (unsigned long long)swaps);
-    }
-    ImGui::Text("Native semantic : %d FPS",
-                gl_renderer_native_interpolation_fps());
-
-    {
-        /* all[1] is average total_ms per frame; same array the TCP
-         * frame_perf handler reads. */
-        double all[18] = {0};
-        int n = gl_renderer_perf_aggregate(-1, all);
-        if (n > 0 && all[1] > 0.0) {
-            double fps = 1000.0 / all[1];
-            ImGui::Text("FPS (avg)       : %.2f  (n=%d)", fps, n);
+        int anum = 4, aden = 3;
+        psx_video_get_aspect(&anum, &aden);
+        if (aden > 0) {
+            ImGui::Text("Aspect          : %d:%d", anum, aden);
         } else {
-            ImGui::Text("FPS (avg)       : (no GL samples yet)");
+            ImGui::Text("Aspect          : (unset)");
         }
     }
 
-    ImGui::Text("Frame           : %llu",
-                (unsigned long long)s_frame_count);
+    /* Native semantic target (managed in Toggles). Presented rate is the
+     * FPS row below; the target alone never moves. */
+    ImGui::Text("Native semantic : %d FPS target",
+                gl_renderer_native_interpolation_fps());
+
+    /* Presented frames per second: pre_swap counts every present (game +
+     * interpolated alike), never vblank pacing. Replaces the GL perf-ring
+     * average, whose sampling stays off unless something enables it. */
+    if (s_present_fps > 0.0) {
+        ImGui::Text("FPS (presented) : %.1f", s_present_fps);
+    } else {
+        ImGui::Text("FPS (presented) : (measuring...)");
+    }
+    /* Ground-truth presenter cadence: due ticks/s vs completed
+     * compose+swap/s. Diverges from FPS (presented) when attempts don't
+     * complete (blocked swap, empty tick). */
+    if (s_host_snap_ok) {
+        ImGui::Text("Presenter       : ticks %.1f/s, swapped %.1f/s",
+                    s_host_att_rate, s_host_pre_rate);
+        ImGui::Text("  outcomes      : empty %.1f/s, fence %.1f/s, held %.1f/s",
+                    s_host_empty_rate, s_host_fence_rate, s_host_held_rate);
+        ImGui::Text("  phases        : ready %.1f/s (last x%u %s), expired %.1f/s, whole %.1f/s",
+                    s_ph_ready_rate, s_ph_last_count,
+                    gl_renderer_native_temporal_status_name(s_ph_last_status),
+                    s_ph_exp_rate, s_ph_whole_rate);
+        ImGui::Text("  presents      : fresh %.1f/s, holds %.1f/s, phased %.1f/s",
+                    s_ph_ends_rate, s_ph_holds_rate, s_ph_vis_rate);
+    } else {
+        ImGui::Text("Presenter       : (no host)");
+    }
+
+    /* True guest VSYNC rate (cycle-paced raise counter). */
+    ImGui::Text("Vblanks         : %.2f Hz", s_vblank_hz);
 }
 
 /* ---- RAM Inspector ----------------------------------------------------- */
@@ -702,65 +1291,42 @@ static void request_kernel_menu(void)
 
 static void draw_toggles_section(void)
 {
-    bool tf = gr_texture_filter() != 0;
-    if (ImGui::Checkbox("Texture filter (bilinear)", &tf)) {
-        gr_set_texture_filter(tf ? 1 : 0);
-    }
-
-    /* Read live xnum/xden from gpu_ws_get_debug so the widget always
-     * shows the runtime's actual state. */
-    GpuWsDebug ws;
-    gpu_ws_get_debug(&ws);
-    int anum = (ws.xden > 0) ? ws.xnum : s_aspect_num;
-    int aden = (ws.xden > 0) ? ws.xden : s_aspect_den;
-    /* Read the live GTE aspect so the widget matches what the TCP
-     * gte_get_display_aspect would return (single source of truth). */
-    gte_get_display_aspect(&anum, &aden);
-    if (ImGui::SliderInt("Aspect num", &anum, 1, 32)) {
-        s_aspect_num = anum;
-        gte_set_display_aspect_ex(anum, aden > 0 ? aden : 3);
-    }
-    if (ImGui::SliderInt("Aspect den", &aden, 1, 32)) {
-        s_aspect_den = aden;
-        gte_set_display_aspect_ex(anum > 0 ? anum : 4, aden);
-    }
-    if (ImGui::Button("Aspect 4:3 (squash off)")) {
-        s_aspect_num = 4; s_aspect_den = 3;
-        gte_set_display_aspect_ex(4, 3);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Aspect 16:9")) {
-        s_aspect_num = 16; s_aspect_den = 9;
-        gte_set_display_aspect_ex(16, 9);
-    }
-
-    /* Native-wide on/off — read from psx_ws_get_native_wide. */
-    int nw = psx_ws_get_native_wide();
-    bool nw_on = nw > 0;
-    if (ImGui::Checkbox("Native wide (on/off/squash 0/1/2)", &nw_on)) {
-        psx_ws_set_native_wide(nw_on ? 1 : 0);
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("off"))   psx_ws_set_native_wide(0);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("squash")) psx_ws_set_native_wide(1);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("native")) psx_ws_set_native_wide(2);
-
-    /* Backdrop stretch — on/pct are file-scope statics in gpu_gl_renderer.c
-     * (externed above). The widget writes them directly; the next present
-     * path picks them up. */
-    bool bds = g_ws_bd_stretch_on != 0;
-    if (ImGui::Checkbox("BD stretch on", &bds)) {
-        g_ws_bd_stretch_on = bds ? 1 : 0;
-    }
-    int bdp = g_ws_bd_stretch_pct;
-    if (ImGui::SliderInt("BD stretch pct (0=auto)", &bdp, 0, 200)) {
-        g_ws_bd_stretch_pct = bdp;
+    /* Single aspect selector (4:3 / 16:9). Same stack the launcher
+     * fixed-aspect applies, but live: display fit, widescreen projection
+     * (GTE + ws configure) and the native view + cull reconfigure. */
+    static const char *kAspectRatio[] = { "4:3", "16:9" };
+    int vanum = 4, vaden = 3;
+    psx_video_get_aspect(&vanum, &vaden);
+    int aspect_index = (vaden > 0 && vanum * 3 != vaden * 4) ? 1 : 0;
+    if (ImGui::Combo("Aspect ratio", &aspect_index, kAspectRatio, 2)) {
+        if (aspect_index == 1) {
+            (void)psx_video_set_aspect_runtime(16, 9, 1);
+            s_aspect_num = 16; s_aspect_den = 9;
+            g_ws_bd_stretch_on = 1;
+        } else {
+            (void)psx_video_set_aspect_runtime(4, 3, 0);
+            s_aspect_num = 4; s_aspect_den = 3;
+            g_ws_bd_stretch_on = 0;
+        }
     }
 
     ImGui::Separator();
     ImGui::TextDisabled("Launcher settings:");
+
+    bool dith = gpu_dithering_enabled() != 0;
+    if (ImGui::Checkbox("Dithering", &dith)) {
+        gpu_dithering_set(dith ? 1 : 0);
+    }
+
+    /* VSync mode: 1 = on, 0 = off (immediate), -1 = adaptive. Live via
+     * apply_present_cadence; native-semantic overrides still apply. */
+    static const char *kVsyncModes[] = { "Off", "On", "Adaptive" };
+    int vs = psx_video_get_vsync();
+    int vs_index = vs >= 1 ? 1 : (vs == 0 ? 0 : 2);
+    if (ImGui::Combo("VSync", &vs_index, kVsyncModes, 3)) {
+        static const int modes[] = {0, 1, -1};
+        psx_video_set_vsync(modes[vs_index]);
+    }
 
     int ss = psx_video_get_supersampling();
     if (ImGui::SliderInt("Supersampling (internal scale)", &ss, 1, 8)) {
@@ -802,8 +1368,9 @@ static void draw_toggles_section(void)
     if (ImGui::Combo("Native semantic target", &native_fps_index,
                      kNativeInterpolationTargets, 4)) {
         static const int targets[] = {30, 60, 120, 240};
-        (void)gl_renderer_set_native_interpolation_fps(
-            targets[native_fps_index]);
+        /* Full retarget (phase pool + presenter tick), not just the GL
+         * denominator: the host period is what paces worker presents. */
+        (void)psx_native_semantic_fps_set(targets[native_fps_index]);
     }
 
     bool tl = g_turbo_loads_enabled != 0;
@@ -1037,6 +1604,19 @@ static constexpr int      kMaxTeleportEntryPoint       = 255;
 static constexpr uint32_t kAddr_currentParty        = 0x8006F368u;
 static constexpr uint32_t kAddr_kernelPartySlots    = 0x80062590u;
 static constexpr uint32_t kAddr_partyBitfield       = 0x8006F364u;
+static constexpr uint32_t kAddr_partyFrameMask      = 0x8006F366u;
+/* Party mirrors + mount bytes + exclusion mask. The engine maintains
+ * mirror[i] == slot[i] on every path (boot init FUN_8001ad4c, stager
+ * FUN_8008a7dc, rotate opcode FUN_8008c334). gameState+0x22B1+slot are
+ * mount-state bytes (docs/xenogears/field/07 §10: 0 = on foot, 1 =
+ * mounted); the battle loader takes the Gear placement path from them.
+ * The party writer leaves them alone (worldmap reconcile + field mount
+ * controller own them); only the battle selector drives them, explicitly
+ * per user checkbox. The menu (docs/xenogears/menu/08 §9) refuses
+ * exchanges for +0x2318 bits. */
+static constexpr uint32_t kAddr_partyMirrorBase      = 0x8006FABCu;
+static constexpr uint32_t kAddr_partyMountBase     = 0x8006F8E5u;
+static constexpr uint32_t kAddr_partyExclusion       = 0x8006F94Cu;
 static constexpr uint32_t kAddr_gold                = 0x8006EF58u;
 static constexpr uint32_t kAddr_fieldVarsBase       = 0x8006EF64u;
 static constexpr uint32_t kAddr_partyRosterBase     = 0x8006D8A0u;
@@ -1117,6 +1697,21 @@ static constexpr int      kBattleEntityCount        = 11;
  * addresses of the other encounter vars (timer / countdown /
  * triggerTime[32]) are NOT in the reference address book. */
 static constexpr uint32_t kAddr_encounterTrigger    = 0x800B2298u;
+/* Explicit-battle handoff (field opcode 0x71 StartBattle 0x80093568 /
+ * FE 84 0x800933f8 — same six writes, same order, same gates).
+ * Formation table: 16 x 32B resident section-6 records, installed per map
+ * at a static address by InstallFieldScene (FUN_8007008c -> 0x800658dc). */
+static constexpr uint32_t kAddr_battleFormTable      = 0x800658DCu;
+static constexpr int      kBattleFormCount           = 16;
+static constexpr int      kBattleFormSize            = 32;
+static constexpr uint32_t kAddr_battleSelIndex       = 0x80059508u;
+static constexpr uint32_t kAddr_battleReqFlag        = 0x800594F8u;
+static constexpr uint32_t kAddr_battleConfig         = 0x8005954Cu;
+static constexpr uint32_t kAddr_battleConfigSrc      = 0x800B2356u;
+static constexpr uint32_t kAddr_battleGateDC         = 0x800ADBDCu;
+static constexpr uint32_t kAddr_battleGateE0         = 0x800ADBE0u;
+static constexpr uint32_t kAddr_battleGate88         = 0x800ADB88u;
+static constexpr uint32_t kAddr_battleGateE4         = 0x800ADBE4u;
 static constexpr int      kPartyRosterStride        = 0xA4;
 static constexpr int      kPartyRosterCount         = 11;
 static constexpr int      kFieldVarsCount           = 512;
@@ -1297,30 +1892,140 @@ int psx_debug_overlay_teleport(int fieldId, int entryPoint)
     return 0;
 }
 
+/* Party formation validation + atomic apply.
+ *
+ * Crash model (field-overlay FUN_8008a790/bc80/bdd8/c334, SLUS
+ * FUN_8001ad4c/InitializeCharacterSkinSet, menu docs/xenogears/menu/08):
+ * - The engine never validates IDs (annotation: "IDs are not validated
+ *   against 0..10") — a garbage id sizes heap allocs wrong → refuse.
+ * - Its own validator rejects duplicates and full parties; lookups
+ *   (FUN_8009fa00) poison on any 0xFF hole → refuse duplicates, pack left.
+ * - The menu contract keeps >=1 member → refuse all-empty.
+ * - Per-member 0x5000 resource buffers + mirrors + flags travel WITH slot
+ *   contents on every engine path; a direct slot write orphans them. The
+ *   field-entry init rebuilds them from the current slots, so a validated
+ *   formation takes full effect on the next field change (teleport/door);
+ *   mid-field the new leader/followers desync until then (documented).
+ * - Busy engine (skin streaming / staged menu / fade) + wrong module make
+ *   any write unsafe → refuse with the teleport-style codes.
+ * - Locked members (availability AND of 0x1D30&0x1D32 fails) are auto-
+ *   unlocked by OR-ing both masks (explicit user intent, monotonic, never
+ *   cleared) instead of refused — same philosophy as the old auto-OR.
+ *
+ * Codes: 0 = applied. 1 = field module not resident. 2 = engine busy.
+ * -1 = bad id (not 0..10/0xFF). -2 = empty formation. -3 = duplicate. */
+static int psx_debug_overlay_party_guard(int c0, int c1, int c2)
+{
+    int c[3] = { c0, c1, c2 };
+    for (int i = 0; i < 3; i++) {
+        if (c[i] != 0xFF && (c[i] < 0 || c[i] > 10)) return -1;
+    }
+    if (c[0] == 0xFF && c[1] == 0xFF && c[2] == 0xFF) return -2;
+    for (int i = 0; i < 3; i++) {
+        if (c[i] == 0xFF) continue;
+        for (int j = i + 1; j < 3; j++) {
+            if (c[i] == c[j]) return -3;
+        }
+    }
+    if (!field_module_active()) return 1;
+    if (read_u32_le(kAddr_partyLoadState) != 0xFFu) return 2;
+    if (read_u32_le(kAddr_menuRequest) != 0xFFu) return 2;
+    if (read_u16_le(kAddr_fadeGate) != 0u) return 2;
+    return 0;
+}
+
+/* Branch uniformity (Lahan-escape crash finding, verified live with
+ * T1/T2 bisects): a formation mixing story-unlocked and newly-unlocked
+ * members crashes map transitions (field scripts branch on raw 0x1D30
+ * bits via FieldScriptCheckAvailablePartyMember), while story-exact AND
+ * full-unlock states are safe. So when any written member fails the
+ * PRE-write availability AND, 0x1D30 goes to 0x07FF (all 11, uniform
+ * set-paths everywhere). 0x1D32 keeps story semantics (menu/battle
+ * availability AND unchanged apart from the member bits). Returns true
+ * when the full unlock fired. */
+static bool psx_debug_overlay_party_unlock(int *members, int n,
+                                           uint16_t *out_bf, uint16_t *out_fm)
+{
+    uint16_t pre_bf = read_u16_le(kAddr_partyBitfield);
+    uint16_t pre_fm = read_u16_le(kAddr_partyFrameMask);
+    uint16_t bf = pre_bf;
+    uint16_t fm = pre_fm;
+    bool fresh = false;
+    for (int i = 0; i < n; i++) {
+        if (members[i] == 0xFF) continue;
+        if (members[i] < 0 || members[i] > 10) continue;
+        bf |= (uint16_t)(1u << members[i]);
+        fm |= (uint16_t)(1u << members[i]);
+        if (!((pre_bf & pre_fm) & (1u << members[i]))) fresh = true;
+    }
+    if (fresh) bf = 0x07FFu;
+    write_u16_le(kAddr_partyBitfield, bf);
+    write_u16_le(kAddr_partyFrameMask, fm);
+    if (out_bf) *out_bf = bf;
+    if (out_fm) *out_fm = fm;
+    return fresh;
+}
+
+/* Apply a validated, packed formation: unlock bits (both masks, OR-only)
+ * first, then mirrors and slots. Bitfield-first keeps every intermediate
+ * frame in the safe (superset-bits, old-or-new-slots) shape — never the
+ * crash combo (new slot, clear bit) the old code proved fatal.
+ * Deliberately NOT touched: gameState+0x22B1 (the add-opcodes clear it,
+ * but worldmap's reconcile (FUN_80075d4c) compares it against 0x8006EE70
+ * and counts it — a blind 0 creates a mismatch plus a gear-ready under-
+ * count that breaks worldmap entry; leaving it keeps reconcile quiet). */
+static void psx_debug_overlay_party_commit(int c0, int c1, int c2)
+{
+    int c[3] = { c0, c1, c2 };
+    psx_debug_overlay_party_unlock(c, 3, nullptr, nullptr);
+    for (int i = 0; i < 3; i++) {
+        uint32_t id = (c[i] == 0xFF) ? 0xFFu : (uint32_t)c[i];
+        write_u32_le(kAddr_partyMirrorBase + (uint32_t)i * 4u, id);
+        write_u32_le(kAddr_kernelPartySlots + (uint32_t)i * 4u, id);
+    }
+}
+
+/* Full atomic formation write (panel + TCP party_set). Packs left like the
+ * boot init and release compaction (holes poison engine lookups). */
+int psx_debug_overlay_write_party_formation(int c0, int c1, int c2)
+{
+    int rc = psx_debug_overlay_party_guard(c0, c1, c2);
+    if (rc != 0) return rc;
+    int packed[3] = { 0xFF, 0xFF, 0xFF };
+    int n = 0;
+    int c[3] = { c0, c1, c2 };
+    for (int i = 0; i < 3; i++) {
+        if (c[i] != 0xFF) packed[n++] = c[i];
+    }
+    psx_debug_overlay_party_commit(packed[0], packed[1], packed[2]);
+    return 0;
+}
+
 int psx_debug_overlay_write_party_slot(int slot, int charId, int bitfieldBit)
 {
     if (slot < 0 || slot > 2) return -1;
-    if (charId < 0 || charId > 0xFF) return -2;
-    /* The camp menu builds its member list from the unlock bitfield, and a
-     * party member whose bit is clear crashes field loading (user-verified:
-     * char followed in field, absent from menu, died on next screen change;
-     * also user-verified that writing the slot BEFORE the bitfield crashes
-     * while bitfield-first works — the game validates party state against
-     * the bitfield on frames in between). So: compute the final bitfield
-     * (OR every member including the about-to-be-written one, never clear
-     * bits) and write it FIRST, then write the slot. */
-    uint16_t bf = read_u16_le(kAddr_partyBitfield);
-    if (charId < 11) bf |= (uint16_t)(1u << charId);
+    if (charId != 0xFF && (charId < 0 || charId > 10)) return -2;
+    /* Single-slot granularity (TCP compat): guard module/busy/id only.
+     * Cross-slot shape (duplicates/holes) is the atomic formation API's
+     * job — the panel validates the whole formation before applying. */
+    if (!field_module_active()) return 1;
+    if (read_u32_le(kAddr_partyLoadState) != 0xFFu) return 2;
+    if (read_u32_le(kAddr_menuRequest) != 0xFFu) return 2;
+    if (read_u16_le(kAddr_fadeGate) != 0u) return 2;
+    uint32_t id = (charId == 0xFF) ? 0xFFu : (uint32_t)charId;
+    int form[3];
     for (int s = 0; s < 3; s++) {
-        if (s == slot) continue;
-        uint32_t id = read_u32_le(kAddr_kernelPartySlots + (uint32_t)s * 4u) & 0xFFu;
-        if (id < 11u) bf |= (uint16_t)(1u << id);
+        if (s == slot) form[s] = charId;
+        else form[s] = (int)(read_u32_le(kAddr_kernelPartySlots + (uint32_t)s * 4u) & 0xFFu);
     }
-    if (bitfieldBit >= 0 && bitfieldBit < 16) {
+    if (bitfieldBit >= 0 && bitfieldBit < 11) {
+        uint16_t bf = read_u16_le(kAddr_partyBitfield);
         bf |= (uint16_t)(1u << bitfieldBit);
+        write_u16_le(kAddr_partyBitfield, bf);
     }
-    write_u16_le(kAddr_partyBitfield, bf);
-    write_u32_le(kAddr_kernelPartySlots + (uint32_t)slot * 4u, (uint32_t)charId);
+    psx_debug_overlay_party_unlock(form, 3, nullptr, nullptr);
+    write_u32_le(kAddr_partyMirrorBase + (uint32_t)slot * 4u, id);
+    write_u32_le(kAddr_kernelPartySlots + (uint32_t)slot * 4u, id);
     return 0;
 }
 
@@ -1375,6 +2080,75 @@ int psx_debug_overlay_force_battle(int value)
     overlay_capture_before_debug_write(
         kAddr_encounterTrigger, sizeof(uint32_t));
     write_u32_le(kAddr_encounterTrigger, (uint32_t)value);
+    return 0;
+}
+
+/* Explicit battle start. Mirrors field opcode 0x71 StartBattle (0x80093568;
+ * same six writes, same order, same readiness gates — FE 84 at 0x800933f8
+ * writes the identical handoff): stage the 32-byte formation record into
+ * the resident section-6 table slot, forward the staged config word,
+ * write selected index + request flag, then commit the handoff triple
+ * LAST (0x800ADBDC = 0, 0x800ADBE0 = 0, 0x800ADB88 = 1). The field
+ * coordinator consumes it exactly like a scripted explicit battle
+ * (ordinary transient snapshot + return to field; no post-battle
+ * destination is staged — that needs FE 84's save-current call).
+ *
+ * `rec` layout (docs/xenogears/battle/02 §3): +0x00 enemy-set, +0x01
+ * policy, +0x02 arena, +0x03 event idx, +0x04..06 party placement,
+ * +0x07 pad, +0x08..0F enemy lanes (def 0-7 | 0x80 gear-scale, 0x7F
+ * empty), +0x10..17 lane flags (bit 7 hidden), +0x18..1F positions.
+ * The caller (panel/TCP) builds it by cloning the live template record
+ * and overriding enemy-set/arena/policy/lanes — positions stay
+ * map-tested (zeroed when the arena changes; the loader spreads stacked
+ * occupants across successive coordinates).
+ *
+ * Returns 0 on arm (battle engages over the next frames), 1 = field
+ * module not resident (section-6 table is field-resident), 2 = handoff
+ * already armed (0x800ADB88 set — coordinator hasn't consumed yet),
+ * 3 = engine busy or not ready (skin streaming / menu / fade / music /
+ * anim / coordinator gates), -1 = bad index, -2 = bad record bytes
+ * (enemy-set > 75, arena > 74, lane def > 7 and != 0x7F). */
+int psx_debug_overlay_start_battle(int index, const uint8_t rec[32])
+{
+    if (index < 0 || index >= kBattleFormCount) return -1;
+    if (!rec) return -2;
+    if (rec[0x00] > 75 || rec[0x02] > 74) return -2;
+    for (int i = 0; i < 8; i++) {
+        uint8_t lane = rec[0x08 + i] & 0x7F;
+        if (lane != 0x7F && lane > 7) return -2;
+    }
+    if (!field_module_active()) return 1;
+    if (read_u32_le(kAddr_battleGate88) != 0u) return 2;
+    if (read_u32_le(kAddr_partyLoadState) != 0xFFu) return 3;
+    if (read_u32_le(kAddr_menuRequest) != 0xFFu) return 3;
+    if (read_u16_le(kAddr_fadeGate) != 0u) return 3;
+    if (read_u32_le(kAddr_battleGateDC) == 0u ||
+        read_u32_le(kAddr_battleGateE4) == 0u ||
+        read_u32_le(kAddr_teleportGate1) == 0u) return 3;
+    if (read_u32_le(kAddr_teleportGateMusic) == 0xFFFFFFFFu) return 3;
+    if (read_u32_le(kAddr_teleportGateAnim) != 0u) return 3;
+    uint32_t base = kAddr_battleFormTable + (uint32_t)index * (uint32_t)kBattleFormSize;
+    overlay_capture_before_debug_write(base, (size_t)kBattleFormSize);
+    for (int i = 0; i < 32; i++) psx_write_byte(base + (uint32_t)i, rec[i]);
+    /* Forward the staged config word unchanged (zero new information —
+     * exactly what opcode 0x71 copies). */
+    write_u32_le(kAddr_battleConfig, read_u32_le(kAddr_battleConfigSrc));
+    psx_write_byte(kAddr_battleSelIndex, (uint8_t)index);
+    psx_write_byte(kAddr_battleReqFlag, 0u);
+    /* Commit LAST: the coordinator consumes the trio together. */
+    write_u32_le(kAddr_battleGateDC, 0u);
+    write_u32_le(kAddr_battleGateE0, 0u);
+    write_u32_le(kAddr_battleGate88, 1u);
+    return 0;
+}
+
+/* Roster byte/u16/u32 writers for battle staging (gear id, levels).
+ * charId 0-10; the battle loader copies these records at startup. */
+static int battle_roster_write_u8(int charId, uint32_t off, uint8_t val)
+{
+    if (charId < 0 || charId > 10) return -1;
+    if (!field_module_active()) return 1;
+    psx_write_byte(kAddr_partyRosterBase + (uint32_t)charId * (uint32_t)kPartyRosterStride + off, val);
     return 0;
 }
 
@@ -1837,6 +2611,39 @@ static void draw_party_section(void)
     int nc = 0;
     const DbgCharacter *chars = dbg_data_characters(&nc);
 
+    /* Live engine state: module + busy gates (same triple as teleport —
+     * skin streaming, staged menu and fade all make slot writes unsafe). */
+    {
+        uint32_t party = read_u32_le(kAddr_partyLoadState);
+        uint32_t menu  = read_u32_le(kAddr_menuRequest);
+        uint16_t fade  = read_u16_le(kAddr_fadeGate);
+        bool busy = (party != 0xFFu) || (menu != 0xFFu) || (fade != 0u);
+        ImGui::Text("Module: %s", resident_module_name(resident_loaded_module()));
+        if (!field_module_active()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+                "Field NOT resident — party writes refused outside field.");
+        } else if (busy) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+                "Engine busy: party=0x%X menu=0x%X fade=%u — writes refused.",
+                (unsigned)party, (unsigned)menu, (unsigned)fade);
+        } else {
+            ImGui::TextDisabled("Field idle — party writes accepted.");
+        }
+    }
+    uint16_t live_bf = read_u16_le(kAddr_partyBitfield);
+    uint16_t live_fm = read_u16_le(kAddr_partyFrameMask);
+    uint16_t live_ex = read_u16_le(kAddr_partyExclusion);
+    ImGui::Text("Masks live: unlock=0x%04X frame=0x%04X AND=0x%04X excl=0x%04X",
+                (unsigned)live_bf, (unsigned)live_fm,
+                (unsigned)(live_bf & live_fm), (unsigned)live_ex);
+
+    if (s_party_status_frames > 0 && s_party_status[0]) {
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f),
+            "%s", s_party_status);
+        s_party_status_frames--;
+    }
+
+    ImGui::Separator();
     ImGui::Text("Party (3 slots, 0xFF = empty):");
     ImGui::SameLine();
     if (ImGui::SmallButton("Read current##party")) {
@@ -1881,18 +2688,306 @@ static void draw_party_section(void)
         ImGui::PopID();
     }
 
-    if (ImGui::Button("Write party to RAM")) {
+    /* Live validation of the pending formation against the engine's own
+     * rules (validator FUN_8008a790 + menu docs/xenogears/menu/08):
+     * no duplicates, no holes (packed left on write), >=1 member,
+     * availability notes, exclusion + empty-record warnings. */
+    {
+        bool empty = true;
         for (int s = 0; s < 3; s++) {
-            psx_debug_overlay_write_party_slot(s, s_party_slot[s], -1);
+            if (s_party_slot[s] == 0xFF) continue;
+            empty = false;
+            for (int t = s + 1; t < 3; t++) {
+                if (s_party_slot[s] == s_party_slot[t]) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                        "Duplicate member %d (slots %d+%d) — engine assumes unique.",
+                        s_party_slot[s], s, t);
+                }
+            }
+            uint16_t avail = (uint16_t)(live_bf & live_fm);
+            if (s_party_slot[s] < 11 && !(avail & (1u << s_party_slot[s]))) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                    "Slot %d: char %d locked — write auto-unlocks both masks.",
+                    s, s_party_slot[s]);
+            }
+            if (s_party_slot[s] < 16 && (live_ex & (1u << s_party_slot[s]))) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                    "Slot %d: char %d is story-excluded (+0x2318) — risky.",
+                    s, s_party_slot[s]);
+            }
+            if (s_party_slot[s] < kPartyRosterCount) {
+                uint32_t base = kAddr_partyRosterBase +
+                                (uint32_t)s_party_slot[s] * (uint32_t)kPartyRosterStride;
+                bool zero = true;
+                for (int b = 0; b < 16; b++) {
+                    if (psx_read_byte(base + (uint32_t)b) != 0) { zero = false; break; }
+                }
+                if (zero) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                        "Slot %d: char %d roster record empty — battle risk.",
+                        s, s_party_slot[s]);
+                }
+            }
+        }
+        if (empty) {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                "Empty formation — the menu contract requires >= 1 member.");
+        }
+        bool holes = (s_party_slot[0] == 0xFF && (s_party_slot[1] != 0xFF || s_party_slot[2] != 0xFF)) ||
+                     (s_party_slot[1] == 0xFF && s_party_slot[2] != 0xFF);
+        if (holes && !empty) {
+            ImGui::TextDisabled("Holes pack left on write (engine lookups poison on 0xFF).");
         }
     }
+
+    if (ImGui::Button("Write party to RAM (atomic)")) {
+        int rc = psx_debug_overlay_write_party_formation(
+            s_party_slot[0], s_party_slot[1], s_party_slot[2]);
+        if (rc == 0) {
+            int packed[3] = { 0xFF, 0xFF, 0xFF };
+            int n = 0;
+            for (int s = 0; s < 3; s++) {
+                if (s_party_slot[s] != 0xFF) packed[n++] = s_party_slot[s];
+            }
+            for (int s = 0; s < 3; s++) s_party_slot[s] = packed[s];
+            bool full = read_u16_le(kAddr_partyBitfield) == 0x07FFu;
+            std::snprintf(s_party_status, sizeof(s_party_status),
+                "Party written [%d,%d,%d]%s. Full effect on field change.",
+                packed[0], packed[1], packed[2],
+                full ? " + full unlock (branch uniformity)" : "");
+        } else {
+            const char *why = "unknown";
+            if (rc == 1)       why = "field module not resident";
+            else if (rc == 2)  why = "engine busy (party/menu/fade)";
+            else if (rc == -1) why = "bad id (0-10 or 0xFF)";
+            else if (rc == -2) why = "empty formation";
+            else if (rc == -3) why = "duplicate member";
+            std::snprintf(s_party_status, sizeof(s_party_status),
+                "Party refused (rc=%d): %s", rc, why);
+        }
+        s_party_status_frames = 120;
+    }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Writes 3 u32 slots to 0x80062590 (kernel master;"
-                          " gameState 0x8006F368 follows next frame).");
+        ImGui::SetTooltip("Validates the whole formation, then writes bitfields "
+                          "(OR-only) + mirrors + 3 kernel slots at 0x80062590; "
+                          "gameState 0x8006F368 follows next frame. New members "
+                          "load fully on the next field change.");
     }
 
     ImGui::Separator();
-    ImGui::Text("Unlock bitfield (0x8006F364, 11 bits):");
+    if (ImGui::CollapsingHeader("Levels & Stats")) {
+    ImGui::Text("Levels (roster +0x62/+0x63, 1-99; stats/EXP untouched):");
+    for (int s = 0; s < 3; s++) {
+        ImGui::PushID(500 + s);
+        int ch = s_party_slot[s];
+        if (ch < 0 || ch > 10) {
+            ImGui::TextDisabled("Slot %d: --", s);
+        } else {
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            uint8_t live_p = psx_read_byte(base + 0x62u);
+            uint8_t live_e = psx_read_byte(base + 0x63u);
+            ImGui::Text("Slot %d (live P%u/E%u):", s, (unsigned)live_p, (unsigned)live_e);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("Phys##plp", &s_party_level_p[s], 0, 0);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("Ether##ple", &s_party_level_e[s], 0, 0);
+            if (s_party_level_p[s] < 1) s_party_level_p[s] = 1;
+            if (s_party_level_p[s] > 99) s_party_level_p[s] = 99;
+            if (s_party_level_e[s] < 1) s_party_level_e[s] = 1;
+            if (s_party_level_e[s] > 99) s_party_level_e[s] = 99;
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::SmallButton("Read live levels")) {
+        for (int s = 0; s < 3; s++) {
+            int ch = s_party_slot[s];
+            if (ch < 0 || ch > 10) continue;
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            int lp = (int)psx_read_byte(base + 0x62u);
+            int le = (int)psx_read_byte(base + 0x63u);
+            s_party_level_p[s] = (lp >= 1 && lp <= 99) ? lp : 1;
+            s_party_level_e[s] = (le >= 1 && le <= 99) ? le : 1;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Write levels")) {
+        for (int s = 0; s < 3; s++) {
+            int ch = s_party_slot[s];
+            if (ch < 0 || ch > 10) continue;
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            int lp = s_party_level_p[s], le = s_party_level_e[s];
+            if (lp < 1) { lp = 1; } if (lp > 99) { lp = 99; }
+            if (le < 1) { le = 1; } if (le > 99) { le = 99; }
+            psx_write_byte(base + 0x62u, (uint8_t)lp);
+            psx_write_byte(base + 0x63u, (uint8_t)le);
+        }
+        std::snprintf(s_party_status, sizeof(s_party_status),
+            "Levels written to roster records.");
+        s_party_status_frames = 90;
+    }
+    ImGui::TextDisabled("Levels are the number only: stats/EXP below drive behavior.");
+
+    ImGui::Separator();
+    ImGui::Text("Stats (roster-direct, engine caps; battle copies them verbatim):");
+    for (int s = 0; s < 3; s++) {
+        ImGui::PushID(600 + s);
+        int ch = s_party_slot[s];
+        if (ch < 0 || ch > 10) {
+            ImGui::TextDisabled("Slot %d: --", s);
+        } else {
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            uint16_t lhp = read_u16_le(base + 0x4Cu);
+            uint16_t lmhp = read_u16_le(base + 0x4Eu);
+            ImGui::Text("Slot %d (HP %u/%u):", s, (unsigned)lhp, (unsigned)lmhp);
+            ImGui::SetNextItemWidth(60);
+            ImGui::InputInt("HP##shp", &s_party_hp[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60);
+            ImGui::InputInt("max##smhp", &s_party_mhp[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(52);
+            ImGui::InputInt("MP##smp", &s_party_mp[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(52);
+            ImGui::InputInt("max##smmp", &s_party_mmp[s], 0, 0);
+            ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("atk##sat", &s_party_atk[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("def##sdf", &s_party_def[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("agi##sag", &s_party_agi[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("eth##set", &s_party_eth[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("efd##sef", &s_party_efd[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("hit##shi", &s_party_hit[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(46);
+            ImGui::InputInt("eva##sev", &s_party_eva[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(70);
+            ImGui::InputInt("EXPp##sxp", &s_party_expr[s], 0, 0);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(70);
+            ImGui::InputInt("EXPe##sxe", &s_party_expe[s], 0, 0);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("EXP remaining to next level (roster +0x44/+0x48). "
+                                  "Set 0/1 to prime authentic level-ups (stats + "
+                                  "unlock checks) on the next battle result.");
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Prime##sxp")) {
+                s_party_expr[s] = 0;
+                s_party_expe[s] = 0;
+                int ch = s_party_slot[s];
+                if (ch >= 0 && ch <= 10) {
+                    uint32_t base = kAddr_partyRosterBase +
+                                    (uint32_t)ch * (uint32_t)kPartyRosterStride;
+                    write_u32_le(base + 0x44u, 0u);
+                    write_u32_le(base + 0x48u, 0u);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Zero both tracks right now: the next battle result runs "
+                                  "the real level-up loop (docs/battle/08).");
+            }
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::SmallButton("Read live stats")) {
+        for (int s = 0; s < 3; s++) {
+            int ch = s_party_slot[s];
+            if (ch < 0 || ch > 10) continue;
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            s_party_hp[s]   = (int)read_u16_le(base + 0x4Cu);
+            s_party_mhp[s]  = (int)read_u16_le(base + 0x4Eu);
+            s_party_mp[s]   = (int)read_u16_le(base + 0x50u);
+            s_party_mmp[s]  = (int)read_u16_le(base + 0x52u);
+            s_party_atk[s]  = (int)psx_read_byte(base + 0x58u);
+            s_party_def[s]  = (int)psx_read_byte(base + 0x59u);
+            s_party_agi[s]  = (int)psx_read_byte(base + 0x5Au);
+            s_party_eth[s]  = (int)psx_read_byte(base + 0x5Bu);
+            s_party_efd[s]  = (int)psx_read_byte(base + 0x5Cu);
+            s_party_hit[s]  = (int)psx_read_byte(base + 0x5Eu);
+            s_party_eva[s]  = (int)psx_read_byte(base + 0x5Fu);
+            s_party_expr[s] = (int)read_u32_le(base + 0x44u);
+            s_party_expe[s] = (int)read_u32_le(base + 0x48u);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Max stats")) {
+        for (int s = 0; s < 3; s++) {
+            s_party_mhp[s] = 999; s_party_hp[s] = 999;
+            s_party_mmp[s] = 99; s_party_mp[s] = 99;
+            s_party_atk[s] = 200; s_party_def[s] = 200;
+            s_party_agi[s] = 99;
+            s_party_eth[s] = 200; s_party_efd[s] = 200;
+            s_party_hit[s] = 99; s_party_eva[s] = 99;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Prime all")) {
+        for (int s = 0; s < 3; s++) {
+            int ch = s_party_slot[s];
+            if (ch < 0 || ch > 10) continue;
+            s_party_expr[s] = 0;
+            s_party_expe[s] = 0;
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            write_u32_le(base + 0x44u, 0u);
+            write_u32_le(base + 0x48u, 0u);
+        }
+        std::snprintf(s_party_status, sizeof(s_party_status),
+            "EXP primed: next battle result levels up.");
+        s_party_status_frames = 90;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Write stats")) {
+        for (int s = 0; s < 3; s++) {
+            int ch = s_party_slot[s];
+            if (ch < 0 || ch > 10) continue;
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)ch * (uint32_t)kPartyRosterStride;
+            int hp = s_party_hp[s], mhp = s_party_mhp[s];
+            int mp = s_party_mp[s], mmp = s_party_mmp[s];
+            if (hp < 0) { hp = 0; } if (hp > 999) { hp = 999; }
+            if (mhp < 1) { mhp = 1; } if (mhp > 999) { mhp = 999; }
+            if (mp < 0) { mp = 0; } if (mp > 99) { mp = 99; }
+            if (mmp < 1) { mmp = 1; } if (mmp > 99) { mmp = 99; }
+            if (hp > mhp) { hp = mhp; }
+            if (mp > mmp) { mp = mmp; }
+            write_u16_le(base + 0x4Cu, (uint16_t)hp);
+            write_u16_le(base + 0x4Eu, (uint16_t)mhp);
+            write_u16_le(base + 0x50u, (uint16_t)mp);
+            write_u16_le(base + 0x52u, (uint16_t)mmp);
+            int at[7] = { s_party_atk[s], s_party_def[s], s_party_agi[s],
+                          s_party_eth[s], s_party_efd[s], s_party_hit[s],
+                          s_party_eva[s] };
+            int cap[7] = { 200, 200, 99, 200, 200, 99, 99 };
+            /* +0x58..0x5C attributes, +0x5E/+0x5F hit/evade (+0x5D gap). */
+            uint32_t off[7] = { 0x58u, 0x59u, 0x5Au, 0x5Bu, 0x5Cu, 0x5Eu, 0x5Fu };
+            for (int i = 0; i < 7; i++) {
+                if (at[i] < 0) at[i] = 0;
+                if (at[i] > cap[i]) at[i] = cap[i];
+                psx_write_byte(base + off[i], (uint8_t)at[i]);
+            }
+            uint32_t er = s_party_expr[s] < 0 ? 0u : (uint32_t)s_party_expr[s];
+            uint32_t ee = s_party_expe[s] < 0 ? 0u : (uint32_t)s_party_expe[s];
+            write_u32_le(base + 0x44u, er);
+            write_u32_le(base + 0x48u, ee);
+        }
+        std::snprintf(s_party_status, sizeof(s_party_status),
+            "Stats written to roster records.");
+        s_party_status_frames = 90;
+    }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Unlock bitfield (0x8006F364, 11 bits; frame mask 0x8006F366 live=0x%04X):",
+                (unsigned)read_u16_le(kAddr_partyFrameMask));
+    ImGui::TextDisabled("Slot writes auto-OR both masks (never clear). This editor writes 0x8006F364 only.");
     if (ImGui::SmallButton("Set 0x07FF (all 11)")) s_party_bitfield = 0x07FF;
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear")) s_party_bitfield = 0;
@@ -1933,13 +3028,13 @@ static void draw_party_section(void)
     }
 
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Roster (partyRoster, 0x8006D8A0, 0xA4 stride)",
-                                &s_party_roster_show)) {
-        if (ImGui::BeginTable("roster", 4,
+    if (ImGui::CollapsingHeader("Character Records (0x8006D8A0, 0xA4 stride)")) {
+        if (ImGui::BeginTable("roster", 5,
                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
             ImGui::TableSetupColumn("id");
             ImGui::TableSetupColumn("name");
             ImGui::TableSetupColumn("unlocked");
+            ImGui::TableSetupColumn("gear");
             ImGui::TableSetupColumn("first 16 bytes (hex)");
             ImGui::TableHeadersRow();
             uint16_t bf = read_u16_le(kAddr_partyBitfield);
@@ -1954,92 +3049,277 @@ static void draw_party_section(void)
                 ImGui::TableSetColumnIndex(2);
                 ImGui::Text("%s", (bf & (1u << i)) ? "yes" : "no");
                 ImGui::TableSetColumnIndex(3);
+                /* Associated Gear id (roster+0xA0, 0xFF = no Gear): world
+                 * entry allocates per-member Gear buffers from this byte. */
+                uint8_t gear = psx_read_byte(kAddr_partyRosterBase +
+                                             (uint32_t)i * (uint32_t)kPartyRosterStride + 0xA0u);
+                if (gear == 0xFF) {
+                    ImGui::TextDisabled("FF(none)");
+                } else {
+                    ImGui::Text("0x%02X", (unsigned)gear);
+                }
+                ImGui::TableSetColumnIndex(4);
                 char hex[64] = {0};
                 int pos = 0;
+                bool zero = true;
                 uint32_t base = kAddr_partyRosterBase + (uint32_t)i * (uint32_t)kPartyRosterStride;
                 for (int b = 0; b < 16; b++) {
                     uint8_t v = psx_read_byte(base + (uint32_t)b);
+                    if (v != 0) zero = false;
                     hex[pos++] = hex_nibble(v >> 4);
                     hex[pos++] = hex_nibble(v & 0xF);
                 }
                 hex[pos] = '\0';
-                ImGui::Text("%s", hex);
+                if (zero) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+                        "%s (empty!)", hex);
+                } else {
+                    ImGui::Text("%s", hex);
+                }
             }
             ImGui::EndTable();
         }
     }
 }
 
-/* ---- Force Battle panel (W6) ------------------------------------------- */
+/* ---- Battle selector panel (W6, rewritten) ------------------------------ */
+
+/* Pull the whole editor from live RAM (current table[15] set/arena/lanes
+ * as safe defaults + party + roster gear/levels). A blank record falls
+ * back to lane 0 = def 0. */
+static void battle_pull_all(void)
+{
+    uint32_t tbase = kAddr_battleFormTable + 15u * (uint32_t)kBattleFormSize;
+    int set = (int)psx_read_byte(tbase + 0);
+    int arena = (int)psx_read_byte(tbase + 2);
+    s_battle_enemy_set = (set >= 0 && set <= kBattleEnemySetMax) ? set : 0;
+    s_battle_arena = (arena >= 0 && arena < kBattleArenaCount) ? arena : 0;
+    bool any = false;
+    for (int i = 0; i < 8; i++) {
+        uint8_t lane = psx_read_byte(tbase + 0x08u + (uint32_t)i);
+        if (lane == 0x7Fu) {
+            s_battle_lane_def[i] = 0xFF;
+            s_battle_lane_gear[i] = false;
+        } else {
+            s_battle_lane_def[i] = lane & 0x07u;
+            s_battle_lane_gear[i] = (lane & 0x80u) != 0u;
+            any = true;
+        }
+    }
+    if (!any) s_battle_lane_def[0] = 0;
+    for (int s = 0; s < 3; s++) {
+        int ch = (int)(read_u32_le(kAddr_kernelPartySlots + (uint32_t)s * 4u) & 0xFFu);
+        s_battle_party[s] = (ch >= 0 && ch < 11) ? ch : 0xFF;
+        s_battle_mounted[s] = psx_read_byte(kAddr_partyMountBase + (uint32_t)s) != 0u;
+        if (s_battle_party[s] == 0xFF) {
+            s_battle_gear[s] = 0xFF;
+            s_battle_level_p[s] = 1;
+            s_battle_level_e[s] = 1;
+        } else {
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)s_battle_party[s] * (uint32_t)kPartyRosterStride;
+            s_battle_gear[s] = (int)psx_read_byte(base + 0xA0u);
+            int lp = (int)psx_read_byte(base + 0x62u);
+            int le = (int)psx_read_byte(base + 0x63u);
+            s_battle_level_p[s] = (lp >= 1 && lp <= 99) ? lp : 1;
+            s_battle_level_e[s] = (le >= 1 && le <= 99) ? le : 1;
+        }
+    }
+}
+
+/* Enemy sets whose visuals are Gear-scale ([GEAR] in the disc-1 census,
+ * MIX sets excluded — lane's call there). Picking from one pre-checks
+ * Gear-scale on the filled lane. */
+static bool battle_set_is_gear(int set)
+{
+    static const int kGearSets[] = { 2, 9, 13, 14, 15, 18, 19, 20, 21, 22,
+        26, 27, 29, 31, 34, 35, 36, 37, 39, 42, 43, 46, 48, 52, 53, 54, 55,
+        58, 59, 60, 61, 62, 63, 64, 65, 66, 68, 70, 71, 72, 73, 74, 75 };
+    for (size_t i = 0; i < sizeof(kGearSets) / sizeof(kGearSets[0]); i++) {
+        if (kGearSets[i] == set) return true;
+    }
+    return false;
+}
+
+/* Lane def name within a set (global list lookup). */
+static const char *battle_lane_name(int set, int def)
+{
+    if (def < 0 || def > 7) return "0xFF (empty)";
+    for (int i = 0; i < kBattleEnemyCount; i++) {
+        if (kBattleEnemies[i].set == set && kBattleEnemies[i].def == def)
+            return kBattleEnemies[i].name;
+    }
+    return "?";
+}
+
+/* Shared apply path (panel button + TCP start_battle): stage roster
+ * gear/levels, party formation (safe API), formation record, then the
+ * opcode-71 handoff. Reports into s_battle_status. Returns the
+ * start_battle rc. */
+static int battle_apply(void)
+{
+    /* 1. Roster gear + levels per battle-party slot. */
+    for (int s = 0; s < 3; s++) {
+        int ch = s_battle_party[s];
+        if (ch < 0 || ch > 10) continue;
+        uint32_t base = kAddr_partyRosterBase + (uint32_t)ch * (uint32_t)kPartyRosterStride;
+        int gear = s_battle_gear[s];
+        if (gear >= 0 && gear < 20) {
+            psx_write_byte(base + 0xA0u, (uint8_t)gear);
+        } else if (gear == 0xFF) {
+            psx_write_byte(base + 0xA0u, 0xFFu);
+        }
+        int lp = s_battle_level_p[s], le = s_battle_level_e[s];
+        if (lp < 1) { lp = 1; } if (lp > 99) { lp = 99; }
+        if (le < 1) { le = 1; } if (le > 99) { le = 99; }
+        psx_write_byte(base + 0x62u, (uint8_t)lp);
+        psx_write_byte(base + 0x63u, (uint8_t)le);
+        /* Mount state for the battle loader's Gear placement path
+         * (docs/xenogears/field/07 §10). Field actors untouched. */
+        psx_write_byte(kAddr_partyMountBase + (uint32_t)s,
+                       s_battle_mounted[s] ? 1u : 0u);
+    }
+    /* 2. Party formation (validates: dups/empty/module/busy). */
+    int rc = psx_debug_overlay_write_party_formation(
+        s_battle_party[0], s_battle_party[1], s_battle_party[2]);
+    if (rc != 0) {
+        const char *why = "unknown";
+        if (rc == 1)       why = "field module not resident";
+        else if (rc == 2)  why = "engine busy (party/menu/fade)";
+        else if (rc == -1) why = "bad party id";
+        else if (rc == -2) why = "empty party";
+        else if (rc == -3) why = "duplicate member";
+        std::snprintf(s_battle_status, sizeof(s_battle_status),
+            "Battle staging stopped at party (rc=%d): %s", rc, why);
+        s_battle_status_frames = 150;
+        return rc;
+    }
+    /* 3. Formation record, fixed layout (docs/xenogears/battle/02 §3 +
+     * community Enemy Encounter Setups doc, byte-identical): policy 0x40
+     * (map-standard wild battle), party placement 0/1/2, zeroed lane
+     * flags/positions (the loader spreads stacked occupants across
+     * successive coordinates). Always written to slot 15. */
+    uint8_t rec[32] = {0};
+    rec[0x00] = (uint8_t)s_battle_enemy_set;
+    rec[0x01] = 0x40u;
+    rec[0x02] = (uint8_t)s_battle_arena;
+    rec[0x03] = 0u;
+    rec[0x04] = 0u; rec[0x05] = 1u; rec[0x06] = 2u;
+    rec[0x07] = 0u;
+    int lanes = 0;
+    for (int i = 0; i < 8; i++) {
+        int def = s_battle_lane_def[i];
+        if (def < 0 || def > 7) {
+            rec[0x08 + i] = 0x7Fu;
+        } else {
+            /* Bit 7 = Gear-scale realization (lane byte, docs/battle/02
+             * §3). Gear bosses (Deus & co.) hang without it — the loader
+             * realizes them down the wrong pipeline. */
+            rec[0x08 + i] = (uint8_t)(((uint8_t)def & 0x07u) |
+                                     (s_battle_lane_gear[i] ? 0x80u : 0u));
+            lanes++;
+        }
+        rec[0x10 + i] = 0u;
+        /* Distinct positions per lane (not all zero): stacked Gear-scale
+         * bosses never settle their placement, and the entrance gate
+         * waits for actors at terrain height forever (red hang). Tables
+         * hold 8 lanes by design. */
+        rec[0x18 + i] = (uint8_t)i;
+    }
+    if (lanes == 0) {
+        std::snprintf(s_battle_status, sizeof(s_battle_status),
+            "Battle refused: no enemies picked.");
+        s_battle_status_frames = 150;
+        return -2;
+    }
+    /* 4. Handoff (guards inside). */
+    rc = psx_debug_overlay_start_battle(15, rec);
+    if (rc == 0) {
+        std::snprintf(s_battle_status, sizeof(s_battle_status),
+            "Battle armed: %d lane(s), arena %d (watch transition)", lanes, s_battle_arena);
+    } else {
+        const char *why = "unknown";
+        if (rc == 1)       why = "field module not resident";
+        else if (rc == 2)  why = "handoff already armed";
+        else if (rc == 3)  why = "engine busy/not ready";
+        else if (rc == -1) why = "bad table index";
+        else if (rc == -2) why = "bad record bytes";
+        std::snprintf(s_battle_status, sizeof(s_battle_status),
+            "Battle refused (rc=%d): %s", rc, why);
+    }
+    s_battle_status_frames = 150;
+    return rc;
+}
 
 static void draw_battle_section(void)
 {
-    /* Live encounter-gate state — same accessor the TCP `read_ram` +
-     * Force Battle action uses, so the widget and the TCP view agree
-     * on what's in RAM right now. */
-    uint32_t gate_now = read_u32_le(kAddr_encounterTrigger);
-    ImGui::Text("Encounter gate (0x800B2298): 0x%08X  (%u)",
-                (unsigned)gate_now, (unsigned)gate_now);
-    ImGui::TextDisabled(
-        "Reference-verified: 0=disabled, non-zero=armed (per playMusicAuthorized gate).");
-    ImGui::TextDisabled(
-        "Actual battle firing still requires field encounter data + countdown = 0.");
+    int nc = 0;
+    const DbgCharacter *chars = dbg_data_characters(&nc);
+    int ng = 0;
+    const DbgCharacter *gears = dbg_data_gears(&ng);
 
-    /* Party preset (read-only) — currentParty[0..2] + bitfield. Same
-     * accessors the W5 Party panel uses, so the user can cross-check
-     * the battle's party against the in-window Party editor. */
+    auto char_name = [&](int id) -> const char * {
+        if (id == 0xFF) return "0xFF (empty)";
+        for (int i = 0; i < nc; i++) {
+            if (chars[i].id == id) return chars[i].name ? chars[i].name : "?";
+        }
+        return "?";
+    };
+    auto gear_name = [&](int id) -> const char * {
+        if (id == 0xFF) return "0xFF (none)";
+        for (int i = 0; i < ng; i++) {
+            if (gears[i].id == id) return gears[i].name ? gears[i].name : "?";
+        }
+        return "?";
+    };
+
+    if (!s_battle_edit_init && field_module_active()) {
+        s_battle_edit_init = true;
+        battle_pull_all();
+    }
+
+    /* Readiness: module + opcode-71 gates + busy triple + armed state. */
     {
-        uint8_t p0 = psx_read_byte(kAddr_currentParty + 0);
-        uint8_t p1 = psx_read_byte(kAddr_currentParty + 1);
-        uint8_t p2 = psx_read_byte(kAddr_currentParty + 2);
-        uint16_t bf = read_u16_le(kAddr_partyBitfield);
-        ImGui::Text("Party (live): [%02X, %02X, %02X]  bitfield=0x%04X",
-                    (unsigned)p0, (unsigned)p1, (unsigned)p2, (unsigned)bf);
-    }
-
-    ImGui::Separator();
-    ImGui::InputInt("Battle scene id (display only)", &s_battle_scene_id);
-    ImGui::InputInt("Battle arena id (display only)", &s_battle_arena_id);
-    ImGui::TextDisabled(
-        "Live offset of the chosen battleConfig is not in the reference address book; "
-        "these inputs are captured for future live discovery and the W6 manual script.");
-
-    /* Trigger value: what to write to 0x800B2298. 0 = disable (sanity
-     * test), 1 = arm (default). */
-    ImGui::InputInt("Trigger value (write to 0x800B2298)",
-                    &s_battle_trigger_val);
-    if (s_battle_trigger_val < 0)     s_battle_trigger_val = 0;
-    if (s_battle_trigger_val > 0xFFFF) s_battle_trigger_val = 0xFFFF;
-
-    bool can_arm = field_module_active();
-    if (!can_arm) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
-            "Field module NOT active — battle sequence will not engage. "
-            "You can still arm the gate (writes to 0x800B2298) for inspection.");
-    }
-    if (!can_arm) ImGui::BeginDisabled();
-    if (ImGui::Button("Start Battle (arm encounter gate)")) {
-        int rc = psx_debug_overlay_force_battle(s_battle_trigger_val);
-        uint32_t post = read_u32_le(kAddr_encounterTrigger);
-        if (rc == 0) {
-            std::snprintf(s_battle_status, sizeof(s_battle_status),
-                "Encounter gate armed -> 0x800B2298=0x%08X (post=%u). Battle will fire when field + countdown align.",
-                (unsigned)s_battle_trigger_val, (unsigned)post);
+        uint32_t dc = read_u32_le(kAddr_battleGateDC);
+        uint32_t e4 = read_u32_le(kAddr_battleGateE4);
+        uint32_t ec = read_u32_le(kAddr_teleportGate1);
+        uint32_t m2 = read_u32_le(kAddr_menuRequest);
+        uint32_t mu = read_u32_le(kAddr_teleportGateMusic);
+        uint32_t an = read_u32_le(kAddr_teleportGateAnim);
+        uint32_t party = read_u32_le(kAddr_partyLoadState);
+        uint16_t fade = read_u16_le(kAddr_fadeGate);
+        uint32_t armed = read_u32_le(kAddr_battleGate88);
+        ImGui::Text("Module: %s%s", resident_module_name(resident_loaded_module()),
+                    armed ? "  ARMED (handoff pending)" : "");
+        if (!field_module_active()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+                "Field NOT resident — explicit battles need the section-6 table.");
+        } else if (armed) {
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
+                "Handoff armed — coordinator consumes over the next frames.");
         } else {
-            std::snprintf(s_battle_status, sizeof(s_battle_status),
-                "force_battle refused (rc=%d).", rc);
+            bool ready = (dc != 0u && e4 != 0u && ec != 0u && m2 == 0xFFu &&
+                          mu != 0xFFFFFFFFu && an == 0u && party == 0xFFu && fade == 0u);
+            if (ready) ImGui::TextDisabled("Readiness gates clear — Start will arm.");
+            else ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f),
+                "Not ready: dc=%u e4=%u ec=%u menu=0x%X music=0x%X anim=%u party=0x%X fade=%u",
+                (unsigned)(dc != 0u), (unsigned)(e4 != 0u), (unsigned)(ec != 0u),
+                (unsigned)m2, (unsigned)mu, (unsigned)an, (unsigned)party, (unsigned)fade);
         }
-        s_battle_status_frames = 120;
     }
-    if (!can_arm) ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Disable (write 0)")) {
-        int rc = psx_debug_overlay_force_battle(0);
-        if (rc == 0) {
-            std::snprintf(s_battle_status, sizeof(s_battle_status),
-                "Encounter gate disabled -> 0x800B2298=0.");
+
+    /* Random-encounter gate (kept): 0 = randoms off, non-zero = on. */
+    {
+        uint32_t gate_now = read_u32_le(kAddr_encounterTrigger);
+        ImGui::Text("Encounter gate (0x800B2298): 0x%08X", (unsigned)gate_now);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Randoms on")) {
+            (void)psx_debug_overlay_force_battle(1);
         }
-        s_battle_status_frames = 120;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Randoms off")) {
+            (void)psx_debug_overlay_force_battle(0);
+        }
     }
 
     if (s_battle_status_frames > 0 && s_battle_status[0]) {
@@ -2047,6 +3327,226 @@ static void draw_battle_section(void)
             "%s", s_battle_status);
         s_battle_status_frames--;
     }
+
+    ImGui::Separator();
+    ImGui::Text("Enemies (8 lanes; all lanes share one set by engine design):");
+    ImGui::InputText("Search##bef", s_battle_enemy_filter, sizeof(s_battle_enemy_filter));
+    {
+        /* Lane chips: picked enemies + clear buttons. */
+        for (int i = 0; i < 8; i++) {
+            ImGui::PushID(300 + i);
+            if (s_battle_lane_def[i] < 0 || s_battle_lane_def[i] > 7) {
+                ImGui::TextDisabled("lane %d: --", i);
+            } else {
+                ImGui::Text("lane %d: %s%s", i,
+                            battle_lane_name(s_battle_enemy_set, s_battle_lane_def[i]),
+                            s_battle_lane_gear[i] ? " [Gear]" : "");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x##blc")) {
+                    s_battle_lane_def[i] = 0xFF;
+                    s_battle_lane_gear[i] = false;
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Gear##blg", &s_battle_lane_gear[i]);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Gear-scale realization (lane bit 7). "
+                                      "Required for Gear bosses (Deus & co.) — "
+                                      "without it the loader hangs.");
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+    if (ImGui::BeginChild("enemy_list", ImVec2(0, 180), true)) {
+        for (int i = 0; i < kBattleEnemyCount; i++) {
+            const DbgBattleEnemy &e = kBattleEnemies[i];
+            if (s_battle_enemy_filter[0] != '\0') {
+                char hay[96];
+                std::snprintf(hay, sizeof(hay), "%s %d", e.name, e.set);
+                if (std::strstr(hay, s_battle_enemy_filter) == nullptr) continue;
+            }
+            char lbl[128];
+            std::snprintf(lbl, sizeof(lbl), "%s (set %d)##be%d", e.name, e.set, i);
+            if (ImGui::Selectable(lbl, false)) {
+                /* Lanes share one enemy pair: switching sets clears lanes.
+                 * [GEAR] sets pre-check Gear-scale on the filled lane. */
+                if (e.set != s_battle_enemy_set) {
+                    bool occupied = false;
+                    for (int l = 0; l < 8; l++) {
+                        if (s_battle_lane_def[l] >= 0 && s_battle_lane_def[l] <= 7) {
+                            occupied = true;
+                            break;
+                        }
+                    }
+                    if (occupied) {
+                        for (int l = 0; l < 8; l++) {
+                            s_battle_lane_def[l] = 0xFF;
+                            s_battle_lane_gear[l] = false;
+                        }
+                        std::snprintf(s_battle_status, sizeof(s_battle_status),
+                            "Enemy set switched to %d — lanes cleared.", e.set);
+                        s_battle_status_frames = 120;
+                    }
+                    s_battle_enemy_set = e.set;
+                }
+                for (int l = 0; l < 8; l++) {
+                    if (s_battle_lane_def[l] < 0 || s_battle_lane_def[l] > 7) {
+                        s_battle_lane_def[l] = e.def;
+                        s_battle_lane_gear[l] = battle_set_is_gear(e.set);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::TextDisabled("Record: policy 0x40 (wild standard), placement 0/1/2, positions 0.");
+    {
+        bool dup = false;
+        for (int i = 0; i < 8 && !dup; i++) {
+            if (s_battle_lane_def[i] < 0 || s_battle_lane_def[i] > 7) continue;
+            for (int j = i + 1; j < 8; j++) {
+                if (s_battle_lane_def[i] == s_battle_lane_def[j]) { dup = true; break; }
+            }
+        }
+        if (dup) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "Duplicated boss defs load but hang once turns start (shared "
+                "phase state; verified: 2x Deus red-freezes, 1 active + 1 "
+                "reserve fights fine). Mobs duplicate safely.");
+        }
+    }
+    ImGui::TextDisabled("Scripted bosses (Deus & co.) need Gear-scale + their event;"
+                        " raw lanes may hang at the red fade (kill the game, RAM-only).");
+    {
+        char preview[96];
+        const char *an = "?";
+        if (s_battle_arena >= 0 && s_battle_arena < kBattleArenaCount)
+            an = kBattleArenas[s_battle_arena].name;
+        std::snprintf(preview, sizeof(preview), "%d: %s", s_battle_arena, an);
+        if (ImGui::BeginCombo("Arena", preview)) {
+            for (int i = 0; i < kBattleArenaCount; i++) {
+                char item[128];
+                std::snprintf(item, sizeof(item), "%d: %s",
+                              kBattleArenas[i].id, kBattleArenas[i].name);
+                if (ImGui::Selectable(item, s_battle_arena == i)) {
+                    s_battle_arena = i;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    ImGui::Separator();
+    ImGui::Text("Battle party (chars + gears + levels):");
+    for (int s = 0; s < 3; s++) {
+        ImGui::PushID(200 + s);
+        char lbl[32];
+        std::snprintf(lbl, sizeof(lbl), "Slot %d", s);
+        ImGui::Text("%s", lbl); ImGui::SameLine();
+        ImGui::SetNextItemWidth(130);
+        if (ImGui::BeginCombo("##bpchar", char_name(s_battle_party[s]))) {
+            if (ImGui::Selectable("0xFF (empty)", s_battle_party[s] == 0xFF)) {
+                s_battle_party[s] = 0xFF;
+            }
+            for (int i = 0; i < nc; i++) {
+                char item[64];
+                std::snprintf(item, sizeof(item), "%d  %s",
+                              chars[i].id, chars[i].name ? chars[i].name : "");
+                if (ImGui::Selectable(item, s_battle_party[s] == chars[i].id)) {
+                    s_battle_party[s] = chars[i].id;
+                    /* Pull that char's live gear/levels into the editor. */
+                    uint32_t base = kAddr_partyRosterBase +
+                                    (uint32_t)chars[i].id * (uint32_t)kPartyRosterStride;
+                    s_battle_gear[s] = (int)psx_read_byte(base + 0xA0u);
+                    s_battle_level_p[s] = (int)psx_read_byte(base + 0x62u);
+                    s_battle_level_e[s] = (int)psx_read_byte(base + 0x63u);
+                    if (s_battle_level_p[s] < 1) s_battle_level_p[s] = 1;
+                    if (s_battle_level_e[s] < 1) s_battle_level_e[s] = 1;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110);
+        if (ImGui::BeginCombo("##bpgear", gear_name(s_battle_gear[s]))) {
+            if (ImGui::Selectable("0xFF (none)", s_battle_gear[s] == 0xFF)) {
+                s_battle_gear[s] = 0xFF;
+                s_battle_mounted[s] = false;
+            }
+            for (int i = 0; i < ng; i++) {
+                char item[64];
+                std::snprintf(item, sizeof(item), "%d  %s",
+                              gears[i].id, gears[i].name ? gears[i].name : "");
+                if (ImGui::Selectable(item, s_battle_gear[s] == gears[i].id)) {
+                    s_battle_gear[s] = gears[i].id;
+                    /* A real gear implies fighting mounted. */
+                    s_battle_mounted[s] = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(46);
+        ImGui::InputInt("Phys##blp", &s_battle_level_p[s], 0, 0);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(46);
+        ImGui::InputInt("Ether##ble", &s_battle_level_e[s], 0, 0);
+        if (s_battle_level_p[s] < 1) s_battle_level_p[s] = 1;
+        if (s_battle_level_p[s] > 99) s_battle_level_p[s] = 99;
+        if (s_battle_level_e[s] < 1) s_battle_level_e[s] = 1;
+        if (s_battle_level_e[s] > 99) s_battle_level_e[s] = 99;
+        /* Live HP readout for the chosen char (display only). */
+        if (s_battle_party[s] >= 0 && s_battle_party[s] < 11) {
+            uint32_t base = kAddr_partyRosterBase +
+                            (uint32_t)s_battle_party[s] * (uint32_t)kPartyRosterStride;
+            uint16_t hp = read_u16_le(base + 0x4Cu);
+            uint16_t mhp = read_u16_le(base + 0x4Eu);
+            uint8_t lv = psx_read_byte(base + 0x62u);
+            ImGui::SameLine();
+            ImGui::TextDisabled("HP %u/%u Lv%u", (unsigned)hp, (unsigned)mhp, (unsigned)lv);
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Mounted##bm", &s_battle_mounted[s]);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Fight IN the Gear (mount byte gameState+0x22B1). "
+                              "Needs a gear assigned above; field actors stay as-is.");
+        }
+        if (s_battle_mounted[s] && s_battle_gear[s] == 0xFF) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "(no gear!)");
+        }
+        ImGui::PopID();
+    }
+    if (ImGui::SmallButton("Copy from Party panel")) {
+        for (int s = 0; s < 3; s++) s_battle_party[s] = s_party_slot[s];
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Read live party")) {
+        for (int s = 0; s < 3; s++) {
+            s_battle_party[s] = (int)(read_u32_le(kAddr_kernelPartySlots +
+                                                  (uint32_t)s * 4u) & 0xFFu);
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Start battle (explicit handoff)")) {
+        (void)battle_apply();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Stages roster gear/levels, party formation, the "
+                          "formation record, then the opcode-71 handoff. The "
+                          "coordinator consumes it like a scripted battle "
+                          "(snapshot + return to field).");
+    }
+    if (s_battle_status_frames > 0 && s_battle_status[0]) {
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f),
+            "%s", s_battle_status);
+        s_battle_status_frames--;
+    }
+    ImGui::TextDisabled(
+        "Positions follow the template record (zeroed on arena change; the "
+        "loader spreads stacked occupants). Event bit (0x20) needs a valid "
+        "event index. Field only; worldmap has its own encounter route.");
 
     ImGui::Separator();
     ImGui::Text("Battle entities (0x800CCCE8, 11 x 0x170 bytes):");
@@ -2116,12 +3616,12 @@ static bool cam_pan_gate(Uint32 btn)
 /* Positional pose step (field/battle/battling): keys fly eye+at, mouse
  * right/middle-drag orbits `at` around `eye`, wheel dollies along view.
  * Updates s_cam_eye_f/at_f; the caller holds the pose per module. */
-static void camera_pose_step(bool typing)
+static void camera_pose_step(bool allow_motion)
 {
     float ex = s_cam_eye_f[0], ey = s_cam_eye_f[1], ez = s_cam_eye_f[2];
     float ax = s_cam_at_f[0],  ay = s_cam_at_f[1],  az = s_cam_at_f[2];
 
-    if (s_camera_keys_enable && !typing) {
+    if (s_camera_keys_enable && allow_motion) {
         const Uint8 *ks = SDL_GetKeyboardState(nullptr);
         if (ks) {
             float dx = ax - ex, dy = ay - ey, dz = az - ez;
@@ -2181,7 +3681,7 @@ static void camera_pose_step(bool typing)
         s_cam_last_mx = mx; s_cam_last_my = my;
         const bool dragging =
             (btn & SDL_BUTTON_RMASK) || (btn & SDL_BUTTON_MMASK);
-        if (s_cam_mouse_look && dragging && (mdx != 0 || mdy != 0) && !typing) {
+        if (s_cam_mouse_look && dragging && (mdx != 0 || mdy != 0) && allow_motion) {
             float dx = ax - ex, dy = ay - ey, dz = az - ez;
             float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             if (dist < 0.001f) { dx = 0.0f; dy = 0.0f; dz = 1.0f; dist = 1.0f; }
@@ -2211,7 +3711,7 @@ static void camera_pose_step(bool typing)
         /* Left-drag glide: horizontal drag strafes in X, vertical drag
          * moves forward/back on the ground plane — mouse-driven WASD
          * (no height change; Q/E and wheel cover that). */
-        if (cam_pan_gate(btn) && (mdx != 0 || mdy != 0) && !typing) {
+        if (cam_pan_gate(btn) && (mdx != 0 || mdy != 0) && allow_motion) {
             float dx = ax - ex, dz = az - ez;
             float dl = std::sqrt(dx*dx + dz*dz);
             float fx = 0.0f, fz = 1.0f;
@@ -2239,7 +3739,7 @@ static void camera_pose_step(bool typing)
  * mouse/arrows drive yaw/pitch, wheel drives distance. The pipeline then
  * derives the eye from origin+yaw/pitch/dist, so the rig translates and
  * orbits with zero convention error. */
-static void camera_orbit_step(bool typing)
+static void camera_orbit_step(bool allow_motion)
 {
     constexpr float kTurn = 4096.0f / (2.0f * 3.141592653589793f);
     /* Ground basis from yaw alone (exact, no matrix-layout dependence):
@@ -2250,7 +3750,7 @@ static void camera_orbit_step(bool typing)
     float sy = std::sin(yawrad), cy = std::cos(yawrad);
     float fx = sy, fz = -cy;
     float rx = cy, rz = sy;
-    if (s_camera_keys_enable && !typing) {
+    if (s_camera_keys_enable && allow_motion) {
         const Uint8 *ks = SDL_GetKeyboardState(nullptr);
         if (ks) {
             bool boost = ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT];
@@ -2286,7 +3786,7 @@ static void camera_orbit_step(bool typing)
         s_cam_last_mx = mx; s_cam_last_my = my;
         const bool dragging =
             (btn & SDL_BUTTON_RMASK) || (btn & SDL_BUTTON_MMASK);
-        if (s_cam_mouse_look && dragging && (mdx != 0 || mdy != 0) && !typing) {
+        if (s_cam_mouse_look && dragging && (mdx != 0 || mdy != 0) && allow_motion) {
             /* yaw+ turns right: drag right orbits right. */
             s_w_yaw += (int)std::lround((float)mdx * s_cam_mouse_sens * kTurn);
             float dy = (float)mdy * s_cam_mouse_sens * kTurn *
@@ -2299,7 +3799,7 @@ static void camera_orbit_step(bool typing)
         }
         /* Left-drag glide: same WASD-style mapping on the ground plane —
          * horizontal strafes in X, vertical moves forward/back. */
-        if (cam_pan_gate(btn) && (mdx != 0 || mdy != 0) && !typing) {
+        if (cam_pan_gate(btn) && (mdx != 0 || mdy != 0) && allow_motion) {
             float rxl = std::sqrt(rx*rx + rz*rz);
             float fxl = std::sqrt(fx*fx + fz*fz);
             float k = s_w_dist_f * s_cam_pan_factor;
@@ -2419,6 +3919,11 @@ static void apply_camera_frame(uint32_t sig)
         if (!camera_freeze(sig)) return; /* unsupported state; panel explains */
     }
     bool typing = s_visible && s_imgui_ready && ImGui::GetIO().WantCaptureKeyboard;
+    /* Motion input needs a live path into the debugger: legacy single
+     * window keeps the historic rule (works open or closed); the separate
+     * tools window must own keyboard focus (playing in the game window
+     * never also flies). Typing in a panel field never flies. */
+    bool allow_motion = !typing && (s_legacy_inline || tools_input_active());
     if (sig == kSigWorldOverlay) {
         /* While frozen, slot 9 must still hold our 0 and slot 10 the
          * ordinary updater. A cinematic reassignment owns the slots again:
@@ -2437,7 +3942,7 @@ static void apply_camera_frame(uint32_t sig)
             s_camera_status_frames = 120;
             return;
         }
-        camera_orbit_step(typing);
+        camera_orbit_step(allow_motion);
         /* Drive the free origin (12.12 fixed) and drag streaming with its
          * XZ deltas — the same accumulators slot 9 feeds, so terrain keeps
          * loading around the camera instead of the party. */
@@ -2472,7 +3977,7 @@ static void apply_camera_frame(uint32_t sig)
             write_u16_le(s10 + kWorldCamSlot10ModeOff, 0u);
         return;
     }
-    camera_pose_step(typing);
+    camera_pose_step(allow_motion);
     if (sig == kSigBattleOverlay)      camera_hold_battle();
     else if (sig == kSigBattlingOverlay) camera_hold_battling();
     else                               camera_hold_field();
@@ -2904,6 +4409,10 @@ void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
 {
     s_win = win;
     s_imgui_ready = false;
+    s_legacy_inline = false;
+    s_separate_ready = false;
+    s_tools_win = nullptr;
+    s_tools_ctx = nullptr;
     s_window_shot_armed = false;
     s_window_shot_path[0] = '\0';
     s_bind_framebuffer = nullptr;
@@ -2913,11 +4422,24 @@ void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
 void psx_debug_overlay_shutdown(void)
 {
     if (s_imgui_ready) {
+        if (s_separate_ready && s_tools_ctx) {
+            SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx);
+        }
         ImGui_ImplOpenGL3_Shutdown();
         PSX_IMGUI_SDL_SHUTDOWN();
         ImGui::DestroyContext();
         s_imgui_ready = false;
     }
+    if (s_tools_ctx) {
+        SDL_GL_DeleteContext(s_tools_ctx);
+        s_tools_ctx = nullptr;
+    }
+    if (s_tools_win) {
+        SDL_DestroyWindow(s_tools_win);
+        s_tools_win = nullptr;
+    }
+    s_separate_ready = false;
+    s_legacy_inline = false;
     s_win = nullptr;
     s_bind_framebuffer = nullptr;
     s_window_shot_armed = false;
@@ -2944,10 +4466,19 @@ void psx_debug_overlay_toggle(void)
             s_interp_guard_active = true;
             gl_renderer_set_interpolation(0, host_hz, target_hz, 0.0, 0);
         }
-    } else if (!s_visible && was_visible && s_interp_guard_active) {
-        s_interp_guard_active = false;
-        if (psx_frame_interpolation_enabled())
-            psx_frame_interpolation_set(1);
+        if (s_separate_ready && s_tools_win) {
+            SDL_ShowWindow(s_tools_win);
+            SDL_RaiseWindow(s_tools_win);
+        }
+    } else if (!s_visible && was_visible) {
+        if (s_interp_guard_active) {
+            s_interp_guard_active = false;
+            if (psx_frame_interpolation_enabled())
+                psx_frame_interpolation_set(1);
+        }
+        if (s_separate_ready && s_tools_win) {
+            SDL_HideWindow(s_tools_win);
+        }
     }
 }
 
@@ -2956,15 +4487,58 @@ bool psx_debug_overlay_is_visible(void)
     return s_visible;
 }
 
+/* The ImGui backend lives on this window; text input starts/stops there. */
+static SDL_Window *overlay_active_window(void)
+{
+    if (s_separate_ready && s_tools_win) return s_tools_win;
+    return s_win;
+}
+
+/* True when the given window currently owns keyboard focus. */
+static bool window_has_input_focus(SDL_Window *win)
+{
+    return win && ((SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0);
+}
+
+/* True when free-camera motion input (keys/mouse/wheel) may drive the
+ * camera this frame. Legacy in-game path: the single window (old rule —
+ * works open or closed). Separate window: either debugger window focused
+ * (tools for tweaking, game for flying over the fullscreen view); alt-tab
+ * away disables motion. */
+static bool tools_input_active(void)
+{
+    if (s_legacy_inline) return true;
+    if (!s_visible || !s_imgui_ready || !s_tools_win) return false;
+    return window_has_input_focus(s_tools_win) || window_has_input_focus(s_win);
+}
+
 bool psx_debug_overlay_process_event(const SDL_Event *ev)
 {
     if (!ev) return false;
+
+    /* Tools-window close button (X): hide the overlay instead of quitting.
+     * Consumed before ImGui sees it; game-window close still quits via
+     * main.cpp. SDL2/SDL3 spell window-close differently. */
+    if (s_tools_win) {
+#if defined(PSX_SDL3)
+        if (ev->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+            ev->window.windowID == SDL_GetWindowID(s_tools_win)) {
+#else
+        if (ev->type == SDL_WINDOWEVENT &&
+            ev->window.event == SDL_WINDOWEVENT_CLOSE &&
+            ev->window.windowID == SDL_GetWindowID(s_tools_win)) {
+#endif
+            if (s_visible) psx_debug_overlay_toggle();
+            return true;
+        }
+    }
 
     /* Free-camera wheel dolly: accumulate notches and (when enabled)
      * consume the event before ImGui sees it, so the wheel flies the
      * camera instead of scrolling panels. Uncheck "Wheel dollies" in
      * the panel to scroll the UI with the wheel while flying. */
-    if (ev->type == SDL_MOUSEWHEEL && s_camera_enabled && s_cam_wheel_dolly) {
+    if (ev->type == SDL_MOUSEWHEEL && s_camera_enabled && s_cam_wheel_dolly &&
+        (s_legacy_inline || tools_input_active())) {
         s_cam_wheel_accum += (float)ev->wheel.y;
         return true;
     }
@@ -2994,18 +4568,28 @@ bool psx_debug_overlay_process_event(const SDL_Event *ev)
 bool psx_debug_overlay_swallow_keyboard(void)
 {
     /* The runtime's pad sampler polls SDL_GetKeyboardState every frame —
-     * WantCaptureKeyboard alone does NOT stop that, so we MASK it. Cases:
-     * - overlay hidden + free-cam flying with capture on: mask, so WASD
-     *   flies the camera instead of also walking the player (any camera
-     *   module: field/world/battle/battling);
-     * - overlay visible but ImGui not ready yet: mask (open edge);
-     * - overlay visible + ImGui wants the keyboard: mask (text input).
-     * Free-cam capture only applies while a game overlay owns the game
-     * (the only modules the freezer touches), so menus keep input. */
-    if (s_camera_enabled && s_cam_capture_input && resident_overlay_sig() != 0u) return true;
-    if (!s_visible) return false;
-    if (!s_imgui_ready) return true;
-    return ImGui::GetIO().WantCaptureKeyboard;
+     * WantCaptureKeyboard alone does NOT stop that, so we MASK it.
+     * Legacy in-game path (single window): historic rules — flying with
+     * capture on masks (any camera module), visible-but-not-ready masks
+     * (open edge), ImGui text input masks.
+     * Separate window: the OS routes keys to the focused window, but the
+     * game polls globally, so mask while the tools window owns keyboard
+     * focus (typing values or flying must not also drive the player) or
+     * while ImGui holds the keyboard. A hidden tools window never masks. */
+    if (s_legacy_inline) {
+        if (s_camera_enabled && s_cam_capture_input && resident_overlay_sig() != 0u) return true;
+        if (!s_visible) return false;
+        if (!s_imgui_ready) return true;
+        return ImGui::GetIO().WantCaptureKeyboard;
+    }
+    if (!s_visible || !s_imgui_ready) return false;
+    if (window_has_input_focus(s_tools_win)) return true;
+    if (ImGui::GetIO().WantCaptureKeyboard) return true;
+    if (window_has_input_focus(s_win) && s_camera_enabled &&
+        s_camera_keys_enable && s_cam_capture_input &&
+        resident_overlay_sig() != 0u)
+        return true;
+    return false;
 }
 
 /* Used by the debug_server's overlay_capture_state command — exposes the
@@ -3051,45 +4635,122 @@ int psx_debug_overlay_set_force_capture(int on)
  * Hidden + unarmed performs no target binding or rendering; lazy init and the
  * existing per-attempt guest preparation retain their prior policy.
  */
+
+/* One ImGui context bound to (win, ctx). The caller must hold that GL
+ * context current. Rolls back cleanly on failure (retry next frame). */
+static bool imgui_init_for(SDL_Window *win, SDL_GLContext ctx)
+{
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    /* DockingEnable / ViewportsEnable are not present in the vendored
+     * ImGui 1.91.9b "master" build (docking branch only); leave
+     * ConfigFlags at the default zero. */
+    io.IniFilename = "debug_overlay.ini";
+
+    ImGui::StyleColorsDark();
+    /* Larger UI than the 13px default — the tools window sits beside the
+     * game at monitor distance. Font must be added before the GL backend
+     * init builds the atlas texture. */
+    {
+        ImFontConfig font_cfg;
+        font_cfg.SizePixels = 19.0f;
+        io.Fonts->AddFontDefault(&font_cfg);
+        ImGui::GetStyle().ScaleAllSizes(1.25f);
+    }
+
+    if (!PSX_IMGUI_SDL_INIT_OPENGL(win, ctx)) {
+        ImGui::DestroyContext();
+        return false;
+    }
+    /* "#version 330 core" matches the GL context the runtime creates
+     * (gpu_gl_renderer.c creates a core 3.3 context); the tools context
+     * below requests the same profile. */
+    if (!ImGui_ImplOpenGL3_Init("#version 330 core")) {
+        PSX_IMGUI_SDL_SHUTDOWN();
+        ImGui::DestroyContext();
+        return false;
+    }
+    return true;
+}
+
+/* Create the independent tools window + GL context. Same recipe the native
+ * GPU thread uses (hidden window, shared context while the game context is
+ * current). Starts hidden — toggle() shows it. Shows immediately when the
+ * overlay is already visible (late init). Idempotent. */
+static bool tools_window_ensure(SDL_Window *game_win, SDL_GLContext game_ctx)
+{
+    if (s_separate_ready) return true;
+    if (!game_win || !game_ctx) return false;
+    /* GL attributes are global inputs to the next context creation (same
+     * core-3.3 recipe as main.cpp); set immediately before creating. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    SDL_Window *w = SDL_CreateWindow(
+        "Xenogears Debug",
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        560, 850,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
+    if (!w) {
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+        return false;
+    }
+    SDL_GLContext ctx = SDL_GL_CreateContext(w);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    if (!ctx) {
+        SDL_DestroyWindow(w);
+        return false;
+    }
+    /* Immediate present on the tools context: its SwapWindow must never
+     * block the game frame on vblank. Restore the entry context after. */
+    SDL_GL_MakeCurrent(w, ctx);
+    SDL_GL_SetSwapInterval(0);
+    SDL_GL_MakeCurrent(game_win, game_ctx);
+    s_tools_win = w;
+    s_tools_ctx = ctx;
+    s_separate_ready = true;
+    if (s_visible) {
+        SDL_ShowWindow(s_tools_win);
+        SDL_RaiseWindow(s_tools_win);
+    }
+    return true;
+}
+
 static void prepare_overlay()
 {
     /* Step 1: lazy init. */
-    if (!s_imgui_ready) {
+    if (!s_imgui_ready && !s_legacy_inline) {
         if (!s_win) return; /* not initialized at all — try next frame */
         SDL_GLContext ctx = SDL_GL_GetCurrentContext();
         if (!ctx) return;   /* main context not current yet — try next frame */
 
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO &io = ImGui::GetIO();
-        /* DockingEnable / ViewportsEnable are not present in the vendored
-         * ImGui 1.91.9b "master" build (docking branch only); leave
-         * ConfigFlags at the default zero and let the minimal window
-         * stand alone. */
-        io.IniFilename = "debug_overlay.ini";
-
-        ImGui::StyleColorsDark();
-        /* Larger UI than the 13px default — the window is read at couch
-         * distance over the game. Font must be added before the GL backend
-         * init builds the atlas texture. */
-        {
-            ImFontConfig font_cfg;
-            font_cfg.SizePixels = 19.0f;
-            io.Fonts->AddFontDefault(&font_cfg);
-            ImGui::GetStyle().ScaleAllSizes(1.25f);
-        }
-
-        if (!PSX_IMGUI_SDL_INIT_OPENGL(s_win, ctx)) {
+        /* Prefer the independent tools window; fall back to the legacy
+         * in-game render when it cannot be created (headless/GL limits).
+         * Either way s_imgui_ready gates the UI below. */
+        if (tools_window_ensure(s_win, ctx)) {
+            /* Backend init builds GL objects: hold the tools context. */
+            SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx);
+            if (!imgui_init_for(s_tools_win, s_tools_ctx)) {
+                /* Tools GL broken after window creation — tear it down and
+                 * try the legacy path next frame. */
+                SDL_GL_MakeCurrent(s_win, ctx);
+                SDL_GL_DeleteContext(s_tools_ctx);
+                SDL_DestroyWindow(s_tools_win);
+                s_tools_ctx = nullptr;
+                s_tools_win = nullptr;
+                s_separate_ready = false;
+                return;
+            }
+            SDL_GL_MakeCurrent(s_win, ctx);
+        } else if (!imgui_init_for(s_win, ctx)) {
             /* Init failed — roll back and try again next frame. */
-            ImGui::DestroyContext();
             return;
-        }
-        /* "#version 330 core" matches the GL context the runtime creates
-         * (gpu_gl_renderer.c creates a core 3.3 context). */
-        if (!ImGui_ImplOpenGL3_Init("#version 330 core")) {
-            PSX_IMGUI_SDL_SHUTDOWN();
-            ImGui::DestroyContext();
-            return;
+        } else {
+            s_legacy_inline = true;
         }
         s_imgui_ready = true;
 
@@ -3122,9 +4783,151 @@ static void prepare_overlay()
 
 }
 
+/* Shared window content for both render paths. Legacy: floating window
+ * over the game. Separate: fills the tools window (the OS chrome carries
+ * the "Xenogears Debug" title). */
+static void draw_debug_window(void)
+{
+if (s_legacy_inline) {
+    ImGui::SetNextWindowSize(ImVec2(480, 640), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Xenogears Debug");
+} else {
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
+    ImGui::Begin("Xenogears Debug", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+}
+ImGui::Checkbox("Visible (Ctrl+F3)", &s_visible);
+/* No visible widget for this: TCP tests set s_force_text_capture via
+     * overlay_force_capture so ImGui reports WantCaptureKeyboard=true
+     * deterministically without SDL injection. The field only appears
+     * while that flag is armed. */
+    if (s_force_text_capture) {
+        /* WantCaptureKeyboard is only set when a widget is ACTIVELY
+         * requesting keyboard input; a drawn-but-unfocused InputText
+         * does not request it. Re-assert focus on the next widget every
+         * frame so the field stays bound and the mask is stable. */
+        ImGui::SetKeyboardFocusHere(0);
+        ImGui::InputText("##force_text", s_force_text_buf,
+                         sizeof(s_force_text_buf));
+    }
+    ImGui::Separator();
+
+    /* ---- Section 1: GPU State (read-only) ---- */
+    ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+    if (ImGui::CollapsingHeader("GPU State")) {
+        draw_gpu_state_section();
+    }
+
+    /* ---- Section 2: RAM Inspector ---- */
+    ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+    if (ImGui::CollapsingHeader("RAM Inspector")) {
+        draw_ram_inspector_section();
+    }
+
+    /* ---- Section 3: Toggles ---- */
+    ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+    if (ImGui::CollapsingHeader("Toggles")) {
+        draw_toggles_section();
+    }
+
+    /* ---- Section 4: Rings ---- */
+    if (ImGui::CollapsingHeader("Rings")) {
+        draw_rings_section();
+    }
+
+    /* ---- Section 5: Map Teleport (write action) ---- */
+    if (ImGui::CollapsingHeader("Map Teleport")) {
+        draw_teleport_section();
+    }
+
+    /* ---- Section 6: Party (write action) ---- */
+    if (ImGui::CollapsingHeader("Party")) {
+        draw_party_section();
+    }
+
+    /* ---- Section 7: Gold & Variables (write action) ---- */
+    if (ImGui::CollapsingHeader("Gold & Variables")) {
+        draw_gold_vars_section();
+    }
+
+    /* ---- Section 8: Force Battle (W6) ---- */
+    if (ImGui::CollapsingHeader("Force Battle")) {
+        draw_battle_section();
+    }
+
+    /* ---- Section 9: Free Camera (W6) ---- */
+    if (ImGui::CollapsingHeader("Free Camera")) {
+        draw_camera_section();
+    }
+
+    /* ---- Section 10: Event Jump (W6) ---- */
+    if (ImGui::CollapsingHeader("Event Jump")) {
+        draw_event_jump_section();
+    }
+
+    ImGui::End();
+}
+
+/* Drive SDL text input from this frame's WantTextInput. Latched so
+ * we only call SDL_Start/Stop on transitions, not every frame;
+ * pre_swap runs on the same thread as the SDL event pump, so the
+ * state is correct for the NEXT PollEvent cycle. */
+static void drive_text_input(SDL_Window *win)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    if (io.WantTextInput && !s_text_input_started) {
+        psx_sdl_start_text_input(win);
+        s_text_input_started = true;
+    } else if (!io.WantTextInput && s_text_input_started) {
+        psx_sdl_stop_text_input(win);
+        s_text_input_started = false;
+    }
+}
+
+/* One ImGui frame into the independent tools window. The entry GL
+ * (window, context) is captured per call — pre_swap runs in several
+ * present paths that do not all share one context — and restored
+ * afterwards, so the game present and any window_shot readback proceed
+ * untouched. */
+static void render_tools_window(GLuint target_fbo)
+{
+    SDL_Window *entry_win = SDL_GL_GetCurrentWindow();
+    SDL_GLContext entry_ctx = SDL_GL_GetCurrentContext();
+    if (!entry_win || !entry_ctx) return;
+    if (SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx) != 0) return;
+    int tw = 0, th = 0;
+    SDL_GL_GetDrawableSize(s_tools_win, &tw, &th);
+    if (tw <= 0 || th <= 0) {
+        SDL_GL_MakeCurrent(entry_win, entry_ctx);
+        return;
+    }
+    ImGui_ImplOpenGL3_NewFrame();
+    PSX_IMGUI_SDL_NEW_FRAME();
+    ImGui::NewFrame();
+
+    draw_debug_window();
+    drive_text_input(s_tools_win);
+
+    ImGui::Render();
+    glViewport(0, 0, (GLsizei)tw, (GLsizei)th);
+    glClearColor(0.07f, 0.07f, 0.09f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    SDL_GL_SwapWindow(s_tools_win);
+    /* Hand the GL thread back exactly as found. bind_overlay_target keeps
+     * the game-target FBO selected for the game present / window_shot. */
+    SDL_GL_MakeCurrent(entry_win, entry_ctx);
+    (void)bind_overlay_target(target_fbo);
+}
+
 void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
 {
     const GLuint target_fbo=(GLuint)framebuffer;
+    /* Presented-frame + vblank rates (GPU State readouts). Runs on every
+     * present, visible or not — one pre_swap call is one image on screen. */
+    gpu_state_sample_rates();
     prepare_overlay();
     if(!s_imgui_ready)return;
     if (s_teleport_target_id >= 0) {
@@ -3178,109 +4981,40 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
         camera_unfreeze();
     }
 
-    /* Step 2: render. Skipped when hidden (zero GL work). */
+    /* Step 2: render. Skipped when hidden (zero GL work). Legacy path
+     * composites into the game target; the separate path draws into the
+     * tools window and leaves the game framebuffer untouched. */
     if (s_visible) {
-        ImGui_ImplOpenGL3_NewFrame();
-        PSX_IMGUI_SDL_NEW_FRAME();
-        ImGui::NewFrame();
+        if (s_legacy_inline) {
+            ImGui_ImplOpenGL3_NewFrame();
+            PSX_IMGUI_SDL_NEW_FRAME();
+            ImGui::NewFrame();
 
-        ImGui::SetNextWindowSize(ImVec2(480, 640), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Xenogears Debug");
-        ImGui::Checkbox("Visible (Ctrl+F3)", &s_visible);
-        /* No visible widget for this: TCP tests set s_force_text_capture via
-         * overlay_force_capture so ImGui reports WantCaptureKeyboard=true
-         * deterministically without SDL injection. The field only appears
-         * while that flag is armed. */
-        if (s_force_text_capture) {
-            /* WantCaptureKeyboard is only set when a widget is ACTIVELY
-             * requesting keyboard input; a drawn-but-unfocused InputText
-             * does not request it. Re-assert focus on the next widget every
-             * frame so the field stays bound and the mask is stable. */
-            ImGui::SetKeyboardFocusHere(0);
-            ImGui::InputText("##force_text", s_force_text_buf,
-                             sizeof(s_force_text_buf));
-        }
-        ImGui::Separator();
+            draw_debug_window();
+            drive_text_input(overlay_active_window());
 
-        /* ---- Section 1: GPU State (read-only) ---- */
-        if (ImGui::CollapsingHeader("GPU State",
-                                    ImGuiTreeNodeFlags_DefaultOpen)) {
-            draw_gpu_state_section();
-        }
-
-        /* ---- Section 2: RAM Inspector ---- */
-        if (ImGui::CollapsingHeader("RAM Inspector",
-                                    ImGuiTreeNodeFlags_DefaultOpen)) {
-            draw_ram_inspector_section();
-        }
-
-        /* ---- Section 3: Toggles ---- */
-        if (ImGui::CollapsingHeader("Toggles",
-                                    ImGuiTreeNodeFlags_DefaultOpen)) {
-            draw_toggles_section();
-        }
-
-        /* ---- Section 4: Rings ---- */
-        if (ImGui::CollapsingHeader("Rings")) {
-            draw_rings_section();
-        }
-
-        /* ---- Section 5: Map Teleport (write action) ---- */
-        if (ImGui::CollapsingHeader("Map Teleport")) {
-            draw_teleport_section();
-        }
-
-        /* ---- Section 6: Party (write action) ---- */
-        if (ImGui::CollapsingHeader("Party (experimental)")) {
-            draw_party_section();
-        }
-
-        /* ---- Section 7: Gold & Variables (write action) ---- */
-        if (ImGui::CollapsingHeader("Gold & Variables")) {
-            draw_gold_vars_section();
-        }
-
-        /* ---- Section 8: Force Battle (W6) ---- */
-        if (ImGui::CollapsingHeader("Force Battle")) {
-            draw_battle_section();
-        }
-
-        /* ---- Section 9: Free Camera (W6) ---- */
-        if (ImGui::CollapsingHeader("Free Camera")) {
-            draw_camera_section();
-        }
-
-        /* ---- Section 10: Event Jump (W6) ---- */
-        if (ImGui::CollapsingHeader("Event Jump")) {
-            draw_event_jump_section();
-        }
-
-        ImGui::End();
-
-        /* Drive SDL text input from this frame's WantTextInput. Latched so
-         * we only call SDL_Start/Stop on transitions, not every frame;
-         * pre_swap runs on the same thread as the SDL event pump, so the
-         * state is correct for the NEXT PollEvent cycle. */
-        ImGuiIO &io = ImGui::GetIO();
-        if (io.WantTextInput && !s_text_input_started) {
-            psx_sdl_start_text_input(s_win);
-            s_text_input_started = true;
-        } else if (!io.WantTextInput && s_text_input_started) {
-            psx_sdl_stop_text_input(s_win);
-            s_text_input_started = false;
-        }
-
-        ImGui::Render();
-        if (bind_overlay_target(target_fbo)) {
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            (void)bind_overlay_target(target_fbo);
+            ImGui::Render();
+            if (bind_overlay_target(target_fbo)) {
+                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+                (void)bind_overlay_target(target_fbo);
+            }
+        } else {
+            /* The tools window is pure UI: redrawing it on every game
+             * present (up to 440/s at 240 Hz targets) burns full ImGui
+             * renders + window swaps that also perturb the very cadence
+             * being measured. Cap at ~60 Hz; game sampling above is
+             * unaffected (it runs per pre_swap regardless). */
+            static uint64_t s_tools_last_ms = 0u;
+            const uint64_t now_ms = SDL_GetTicks64();
+            if (now_ms - s_tools_last_ms >= 16u) {
+                s_tools_last_ms = now_ms;
+                render_tools_window(target_fbo);
+            }
         }
     } else if (s_text_input_started) {
-        /* Hidden mid-text-input (Ctrl+F3 while typing): the Start call lives
-         * inside the visible branch, so a toggle-while-typing leaves the
-         * latch set — release it here to keep SDL text input off across the
-         * open/close cycle. */
-        psx_sdl_stop_text_input(s_win);
+        /* Hidden mid-text-input (Ctrl+F3 while typing): release the latch
+         * to keep SDL text input off across the open/close cycle. */
+        psx_sdl_stop_text_input(overlay_active_window());
         s_text_input_started = false;
     }
 
@@ -3364,7 +5098,7 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         return 0;
     }
     if (std::strcmp(name, "native_interp_fps") == 0) {
-        return gl_renderer_set_native_interpolation_fps(value) ? 0 : -2;
+        return psx_native_semantic_fps_set(value) > 0 ? 0 : -2;
     }
     if (std::strcmp(name, "supersampling") == 0) {
         psx_video_set_supersampling(value);
@@ -3443,15 +5177,21 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         return psx_debug_overlay_teleport(value, value2);
     }
     if (std::strcmp(name, "party_slot") == 0) {
-        /* value = slot (lower 16 bits) + charId (next 8 bits) packed, or
-         * use value=slot, value2=charId convention (value/100 = slot,
-         * value%100 unused). To keep the API one-line, accept the
-         * simple encoding: value = slot*256 + charId (slot in low byte,
+        /* value = slot*256 + charId (slot in low byte,
          * charId in next byte). value2 = bitfieldBit (or -1 to skip). */
         int slot = value & 0xFF;
         int charId = (value >> 8) & 0xFF;
         int bfBit = value2;
         return psx_debug_overlay_write_party_slot(slot, charId, bfBit);
+    }
+    if (std::strcmp(name, "party_set") == 0) {
+        /* Atomic formation: value = c0 | c1<<8 | c2<<16 (0xFF = empty).
+         * Full validation (duplicates/holes/empty/busy/module); packs
+         * left before writing. value2 unused. */
+        int c0 = value & 0xFF;
+        int c1 = (value >> 8) & 0xFF;
+        int c2 = (value >> 16) & 0xFF;
+        return psx_debug_overlay_write_party_formation(c0, c1, c2);
     }
     if (std::strcmp(name, "party_bitfield") == 0) {
         return psx_debug_overlay_write_party_bitfield(value);
@@ -3468,10 +5208,56 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     /* ---- W6 actions ---- */
     if (std::strcmp(name, "force_battle") == 0) {
         /* value = the gate value to write to 0x800B2298. 0 disables,
-         * non-zero arms. The actual battle requires the field to have
-         * encounter data loaded + the countdown to reach 0; this action
-         * is best-effort (see draw_battle_section comment). */
+         * non-zero arms random encounters (best-effort: needs field
+         * encounter data + countdown). */
         return psx_debug_overlay_force_battle(value);
+    }
+    if (std::strcmp(name, "start_battle") == 0) {
+        /* Explicit battle via the panel editor (same path as the button):
+         * value = arena override 0..74 (0xFF = keep panel), value2 =
+         * global enemy index to append (0..kBattleEnemyCount-1, negative
+         * = skip). Runs roster + party + record + handoff. */
+        if (value >= 0 && value < kBattleArenaCount) s_battle_arena = value;
+        if (value2 >= 0 && value2 < kBattleEnemyCount) {
+            const DbgBattleEnemy &e = kBattleEnemies[value2];
+            if (e.set != s_battle_enemy_set) {
+                for (int l = 0; l < 8; l++) {
+                    s_battle_lane_def[l] = 0xFF;
+                    s_battle_lane_gear[l] = false;
+                }
+                s_battle_enemy_set = e.set;
+            }
+            for (int l = 0; l < 8; l++) {
+                if (s_battle_lane_def[l] < 0 || s_battle_lane_def[l] > 7) {
+                    s_battle_lane_def[l] = e.def;
+                    s_battle_lane_gear[l] = battle_set_is_gear(e.set);
+                    break;
+                }
+            }
+        }
+        return battle_apply();
+    }
+    if (std::strcmp(name, "battle_enemy") == 0) {
+        /* Append a global enemy (by kBattleEnemies index) to the first
+         * empty lane, switching sets (clearing lanes) as needed. Returns
+         * 0 on append, -2 on bad index, -3 when lanes are full. */
+        if (value < 0 || value >= kBattleEnemyCount) return -2;
+        const DbgBattleEnemy &e = kBattleEnemies[value];
+        if (e.set != s_battle_enemy_set) {
+            for (int l = 0; l < 8; l++) {
+                s_battle_lane_def[l] = 0xFF;
+                s_battle_lane_gear[l] = false;
+            }
+            s_battle_enemy_set = e.set;
+        }
+        for (int l = 0; l < 8; l++) {
+            if (s_battle_lane_def[l] < 0 || s_battle_lane_def[l] > 7) {
+                s_battle_lane_def[l] = e.def;
+                s_battle_lane_gear[l] = battle_set_is_gear(e.set);
+                return 0;
+            }
+        }
+        return -3;
     }
     if (std::strcmp(name, "camera_write") == 0) {
         /* Pack 6 s16 coords into 2 ints. value = (ey<<16)|ex,

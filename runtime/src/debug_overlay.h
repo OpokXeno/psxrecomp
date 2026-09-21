@@ -8,6 +8,7 @@
  * code and zero symbols. The flag is set per-target by runtime.cmake only
  * when the build gate PSX_DEBUG_OVERLAY is ON. */
 #include <stdbool.h>
+#include <stdint.h>
 #include "psx_sdl.h"
 
 #ifdef __cplusplus
@@ -147,12 +148,23 @@ int psx_debug_overlay_teleport(int fieldId, int entryPoint);
  * currentParty (0x8006F368) is a per-frame copy of these — writing it
  * directly is reverted by the kernel sync (0x800A3200), so the master
  * is written instead and gameState follows on the next frame.
- * Automatically ORs the unlock-bitfield (0x8006F364) bits of ALL
- * non-empty party members — the menu lists members from the bitfield
- * and a member without their bit crashes field loading. Additionally
- * ORs `bitfieldBit` (0..10) when >= 0. 0 = ok, negative on bad
- * slot/char. */
+ * Automatically ORs the unlock-bitfield (0x8006F364) and frame mask
+ * (0x8006F366) bits of ALL non-empty party members — the menu lists
+ * members from the bitfield and a member without their bit crashes field
+ * loading. Additionally ORs `bitfieldBit` (0..10) when >= 0. Mirrors the
+ * slot into 0x8006FABC, like the engine's own add-member path.
+ * gameState+0x22B1 is deliberately untouched (worldmap's reconcile reads
+ * it — a blind write breaks worldmap entry). Guards: field module
+ * resident, engine idle (skin streaming / menu request / fade). 0 = ok.
+ * 1 = not field, 2 = engine busy, negative on bad slot/char. */
 int psx_debug_overlay_write_party_slot(int slot, int charId, int bitfieldBit);
+
+/* Debug-only: atomic 3-slot formation write (packs left, like the boot
+ * init and menu release compaction — holes poison engine lookups).
+ * Full engine-mirrored validation before any write. Same guards as the
+ * slot write. 0 = ok. 1 = not field, 2 = engine busy, -1 = bad id,
+ * -2 = empty formation, -3 = duplicate member. */
+int psx_debug_overlay_write_party_formation(int c0, int c1, int c2);
 
 /* Debug-only: write the 2-byte party unlock bitfield at 0x8006F364
  * (LE). 0 = ok, negative on bad value. */
@@ -169,11 +181,17 @@ int psx_debug_overlay_write_var(int var, int value);
 
 /* Debug-only: write the encounter-trigger gate u32 LE at 0x800B2298.
  * Reference-verified (the reference's validation hook writes 0 here
- * to disable encounters for deterministic replay). Non-zero arms the
- * gate; the actual battle still requires field encounter data +
- * countdown = 0 (those vars' live addresses are not in the reference
- * address book). 0 = ok, negative on bad value. */
+ * to disable encounters for deterministic replay). Non-zero arms
+ * random encounters; the actual battle still requires field encounter
+ * data + countdown = 0. 0 = ok, negative on bad value. */
 int psx_debug_overlay_force_battle(int value);
+
+/* Debug-only: start an explicit battle (field opcode-71 recipe). Stages
+ * the 32-byte formation record into the resident section-6 table slot,
+ * forwards the staged config, writes index + request flag, then commits
+ * the handoff triple. 0 = armed, 1 = not field, 2 = already armed,
+ * 3 = busy/not ready, negative on bad index/record. */
+int psx_debug_overlay_start_battle(int index, const uint8_t rec[32]);
 
 /* Debug-only: write the camera pose of the resident module (PSX world
  * units, integers). Field: current+desired as 6 x u32 fixed16
@@ -218,10 +236,12 @@ static inline int psx_debug_overlay_take_kernel_menu_request(void) { return 0; }
 static inline int psx_debug_overlay_take_field_boot_request(int *f, int *e) { (void)f; (void)e; return 0; }
 static inline int psx_debug_overlay_teleport(int f, int e) { (void)f; (void)e; return -1; }
 static inline int psx_debug_overlay_write_party_slot(int s, int c, int b) { (void)s; (void)c; (void)b; return -1; }
+static inline int psx_debug_overlay_write_party_formation(int c0, int c1, int c2) { (void)c0; (void)c1; (void)c2; return -1; }
 static inline int psx_debug_overlay_write_party_bitfield(int b) { (void)b; return -1; }
 static inline int psx_debug_overlay_write_gold(unsigned int g) { (void)g; return -1; }
 static inline int psx_debug_overlay_write_var(int v, int x) { (void)v; (void)x; return -1; }
 static inline int psx_debug_overlay_force_battle(int v) { (void)v; return -1; }
+static inline int psx_debug_overlay_start_battle(int i, const uint8_t r[32]) { (void)i; (void)r; return -1; }
 static inline int psx_debug_overlay_camera_write(int ex,int ey,int ez,int ax,int ay,int az) { (void)ex;(void)ey;(void)ez;(void)ax;(void)ay;(void)az; return -1; }
 static inline int psx_debug_overlay_event_jump(int id) { (void)id; return -1; }
 static inline int psx_debug_overlay_read_field_id(void) { return -1; }

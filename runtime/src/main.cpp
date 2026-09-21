@@ -1739,6 +1739,29 @@ extern "C" int psx_frame_interpolation_enabled(void) {
     return g_frame_interpolation;
 }
 
+/* Native semantic FPS target (Toggles combo + TCP). The GL setter alone only
+ * resized the phase pool: the presentation host kept ticking at its startup
+ * period, so 120/240 never moved. Retarget the host tick live too.
+ * 30 ("Original") is deliberately NOT slowed to 33 ms: it means the game's
+ * designed cadence (field 30, battle 60, ...), which is denominator 1
+ * (no invented phases) on 60 Hz ticks — the output follows the guest.
+ * Forcing 33 ms ticks would halve battle to 30. */
+extern "C" int psx_native_semantic_fps_set(int fps) {
+    uint64_t period_ns;
+    if (fps != 30 && fps != 60 && fps != 120 && fps != 240) return 0;
+    if (fps == 120) period_ns = 8333333u;
+    else if (fps == 240) period_ns = 4166667u;
+    else period_ns = 16666667u;
+    if (!gl_renderer_set_native_interpolation_fps(fps))
+        return 0;
+    g_native_interpolation_fps = fps;
+    if (g_native_render_selected && g_native_render_presentation_host &&
+        !xg_render_presentation_host_set_period(
+            g_native_render_presentation_host, period_ns))
+        return -1;
+    return 1;
+}
+
 /* Map the configured tri-state fullscreen mode (g_fullscreen) to the SDL
  * window-fullscreen flag: used both to open the window in that mode and to
  * pick the hotkey's fullscreen target. */
@@ -1804,6 +1827,13 @@ extern "C" int psx_mod_set_fixed_display_aspect(
     std::fprintf(stdout, "psxrecomp: mod selected fixed display aspect %u:%u\n",
                  (unsigned)numerator, (unsigned)denominator);
     return 1;
+}
+
+/* Configured game aspect (default 4:3; launcher/mods/adaptive may widen).
+ * Read-only snapshot for the debug overlay's GPU State readout. */
+extern "C" void psx_video_get_aspect(int *num, int *den) {
+    if (num) *num = g_video_aspect_num;
+    if (den) *den = g_video_aspect_den;
 }
 
 extern "C" int psx_mod_set_adaptive_display_aspect(
@@ -2268,6 +2298,32 @@ extern "C" int psx_debug_display_aspect(int num, int den, int adaptive) {
         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
     }
     g_ws_projection_mode = -1;
+    refresh_widescreen_projection();
+    return 1;
+}
+
+/* Full runtime aspect switch (Toggles combo): the same stack the launcher
+ * fixed-aspect setting and the adaptive window-follow apply at startup —
+ * display aspect + backend fits, widescreen projection (GTE + ws configure
+ * from the wide flag), and, on the native render path, the native view +
+ * cull reconfigure that psx_ws_set_native_wide skips (it early-returns
+ * under native widescreen). Without the native-view step the switch only
+ * half-applies on the native renderer. Session-only, like the TCP
+ * display-aspect command. */
+extern "C" int psx_video_set_aspect_runtime(int num, int den, int native_wide) {
+    if (num <= 0 || den <= 0)
+        return 0;
+    g_ws_native_wide = native_wide ? 1 : 0;
+    if (!psx_debug_display_aspect(num, den, 0))
+        return 0;
+    const bool wide = num * 3 != den * 4;
+    if (g_native_render_widescreen) {
+        gpu_ws_configure_native_cull(wide, num, den, 320, 240);
+        (void)psx_xg_render_auth_configure_native_view(
+            wide, (uint16_t)num, (uint16_t)den, 320u, 240u);
+        (void)gl_renderer_configure_native_view(
+            wide ? 1 : 0, num, den, 320, 240);
+    }
     refresh_widescreen_projection();
     return 1;
 }
@@ -3533,6 +3589,19 @@ static int present_effective_swap_interval(void) {
         return 0;
     if (g_frame_interpolation)
         return 0;
+    /* Native semantic target owns the present cadence on the GL native
+     * path (the Toggles selector only wrote the denominator before, so
+     * every setting presented at 60): 30 -> swap every 2nd vsync on a
+     * 60 Hz panel; 120/240 -> immediate, the midpoint worker emits the
+     * extra phases itself. Matches gpu_gl_renderer's apply_swap_interval
+     * (0 past denominator 2) so neither side stomps the other. */
+    if (g_native_render_selected && g_gl_active) {
+        int native_fps = gl_renderer_native_interpolation_fps();
+        if (native_fps > 0 && native_fps <= 30)
+            return 2;
+        if (native_fps >= 120)
+            return 0;
+    }
     if (g_frame_period_ms <= 0.0)
         return 0;
     if (present_vsync_owns_cadence())
@@ -3805,6 +3874,21 @@ static void apply_present_cadence(void) {
         (void)SDL_RenderSetVSync(sdl_renderer, interval != 0 ? 1 : 0);
     latency_ring_set_present_mode(interval);
 #endif
+}
+
+/* Live VSync selector (Toggles: off/on/adaptive). 1 = vsync, 0 = immediate,
+ * -1 = adaptive (falls back where the driver lacks it). Routes through the
+ * effective-interval computation so native-semantic and interp overrides
+ * keep applying on top. */
+extern "C" int psx_video_get_vsync(void) {
+    return g_video_vsync;
+}
+
+extern "C" void psx_video_set_vsync(int mode) {
+    if (mode > 1) mode = 1;
+    if (mode < -1) mode = -1;
+    g_video_vsync = mode;
+    apply_present_cadence();
 }
 
 static void log_present_cadence(void) {

@@ -184,7 +184,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | Drive the same Xenogears debug-overlay action functions used by its widgets; unavailable in Release builds |
 | `quit` | ✓ |   | — | Shutdown native runtime |
 | `overlay_toggle` | ✓ |   | — | **Native:** flip the in-game developer debug overlay visibility flag (Debug builds only). Same purpose as the Ctrl+F3 hotkey — exists so tests can drive the flag without key injection. On Release builds the API is a static-inline no-op, so the call is harmless and the response always reports `visible:false`. Response: `{"id":N,"ok":true,"visible":true\|false}` |
-| `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | **Native:** invoke one of the in-window debug overlay widget's action functions (the same code path a checkbox / button / slider click would call). Lets a remote client assert the TOGGLES section is wired to the real runtime setters without synthesizing real mouse clicks (which is impossible over TCP). Does NOT bypass the action path — it calls the same function the widget calls. `name` is one of: `texfilter`, `native_wide`, `developer_mode`, `kernel_menu`, `aspect_set`, `bd_stretch_on`, `bd_stretch_pct`, `interp`, `supersampling`, `antialiasing`, `screen_model`, `turbo_loads`, `spu_hq`, `window_width`, `dump_event_ring`, `dump_latency_ring`, `dump_starv_ring`, `teleport`, `party_slot`, `party_bitfield`, `gold`, `write_var`, `force_battle`, `camera_write`, `event_jump`, `read_field_id`. `value` and `value2` are interpreted per the name; see the per-name section below. `dump_*` actions ignore both. Response: `{"id":N,"ok":true,"name":"...","value":N,"value2":M}` on success, `{"id":N,"ok":false,"err":"unknown name"}` on bad name. **Debug builds only; Release compiles the command to a static-inline `-1` return.** |
+| `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | **Native:** invoke one of the in-window debug overlay widget's action functions (the same code path a checkbox / button / slider click would call). Lets a remote client assert the TOGGLES section is wired to the real runtime setters without synthesizing real mouse clicks (which is impossible over TCP). Does NOT bypass the action path — it calls the same function the widget calls. `name` is one of: `texfilter`, `native_wide`, `developer_mode`, `kernel_menu`, `aspect_set`, `bd_stretch_on`, `bd_stretch_pct`, `interp`, `supersampling`, `antialiasing`, `screen_model`, `turbo_loads`, `spu_hq`, `window_width`, `dump_event_ring`, `dump_latency_ring`, `dump_starv_ring`, `teleport`,   `party_slot`, `party_bitfield`, `party_set`, `gold`, `write_var`, `force_battle`, `start_battle`, `battle_enemy`, `camera_write`, `event_jump`, `read_field_id`. `value` and `value2` are interpreted per the name; see the per-name section below. `dump_*` actions ignore both. Response: `{"id":N,"ok":true,"name":"...","value":N,"value2":M}` on success, `{"id":N,"ok":false,"err":"unknown name"}` on bad name. **Debug builds only; Release compiles the command to a static-inline `-1` return.** |
 
 ¹ Native `vram_peek` is the legacy name; DS calls it `read_vram`. Same semantics.  
 ² The `pc_*` family is specific to the DS oracle: DuckStation's CPU core honours `CPU::AddBreakpointWithCallback`, while our native runtime dispatches whole recompiled functions (no mid-function PC breaks).
@@ -627,16 +627,28 @@ poll at `0x800784A0` is the only correct caller).
 - `{"cmd":"overlay_widget_action","name":"party_slot","value":<slot*256+charId>,"value2":<bitfieldBit|-1>}`
   → writes party slot [0..2] to the kernel master slots at
   `0x80062590+slot*4` (u32, low byte = char id, 0xFF = empty), then
-  automatically ORs the unlock-bitfield (`0x8006F364`) bits of ALL
-  non-empty party members (the camp menu lists members from the
-  bitfield; a member without their bit crashes field loading), and
-  additionally ORs `bitfieldBit` (0..10) when `value2 >= 0`.
+  automatically ORs the unlock-bitfield (`0x8006F364`) and frame mask
+  (`0x8006F366`) bits of ALL non-empty party members (the camp menu
+  lists members from the bitfield; a member without their bit crashes
+  field loading), and additionally ORs `bitfieldBit` (0..10) when
+  `value2 >= 0`. Also mirrors the slot into `0x8006FABC`, like the
+  engine's own add-member path (gameState+0x22B1 is deliberately untouched:
+  worldmap's reconcile reads it). Guards: field
+  module resident (overlay sig 4), engine idle (skin streaming / menu /
+  fade) — refusals ride in `value`: 1 = not field, 2 = engine busy,
+  -1 = bad slot, -2 = bad char id (0..10/0xFF).
   `slot` and `charId` are packed into `value`:
   `value = (charId << 8) | slot`. NOTE: gameState `currentParty`
   (0x8006F368) is a per-frame copy of the kernel slots (sync at
   0x800A3200) — writing it directly is silently reverted; the kernel
   master is the correct target and gameState follows on the next
-  frame.
+  frame. New members load fully on the next field change.
+- `{"cmd":"overlay_widget_action","name":"party_set","value":<c0|c1<<8|c2<<16>}`
+  → atomic 3-slot formation write (packs left like the boot init;
+  holes poison engine lookups). Full engine-mirrored validation before
+  any write (no duplicates, >=1 member, valid ids, field resident,
+  engine idle). Refusals: 1 = not field, 2 = engine busy, -1 = bad id,
+  -2 = empty formation, -3 = duplicate. `value2` unused.
 - `{"cmd":"overlay_widget_action","name":"party_bitfield","value":<u16>}`
   → writes the 2-byte unlock bitfield at `0x8006F364` (LE).
 - `{"cmd":"overlay_widget_action","name":"gold","value":<u32>}`
@@ -655,13 +667,22 @@ poll at `0x800784A0` is the only correct caller).
 - `{"cmd":"overlay_widget_action","name":"force_battle","value":<u32>}`
   → writes the encounter-trigger gate u32 LE at `0x800B2298`
   (reference-verified: the reference's validation hook writes 0 here
-  to disable encounters for deterministic replay). `value=0` disables,
-  non-zero arms. **Best-effort:** the actual battle firing still
-  requires the field to have encounter data loaded AND the per-field
-  countdown to reach zero; those vars' live addresses are not in the
-  reference address book, so the action arms the gate but cannot
-  guarantee a battle on the next frame. Documented in the in-window
-  "Force Battle" panel (Section 8).
+  to disable encounters for deterministic replay). `value=0` disables
+  random encounters, non-zero arms them. Best-effort: firing still
+  requires field encounter data + countdown.
+- `{"cmd":"overlay_widget_action","name":"start_battle","value":<arena|0xFF>,"value2":<enemy|neg>}`
+  → explicit battle via the panel editor (same path as the Start button):
+  `value` = arena override 0..74 (`0xFF` = keep panel), `value2` = global
+  enemy index to append (`0..kBattleEnemyCount-1`, negative = skip).
+  Stages roster gear/levels, the party formation (safe API), a fixed-layout
+  record (policy 0x40, placement 0/1/2, zeroed flags/positions) into slot
+  15, then the opcode-71 handoff. Refusals ride in `value`: 1 = not
+  field, 2 = already armed, 3 = busy/not ready, -1/-2 = bad index/record.
+- `{"cmd":"overlay_widget_action","name":"battle_enemy","value":<enemy>}`
+  → appends a global enemy (kBattleEnemies index) to the first empty
+  lane, switching enemy sets (clearing lanes) as needed — lanes of one
+  battle share a single enemy pair by engine design. 0 = appended,
+  -2 = bad index, -3 = lanes full. `value2` unused.
 - `{"cmd":"overlay_widget_action","name":"camera_write","value":<packed_xy>,"value2":<packed_xy>}`
   → writes the resident module's camera pose (PSX world units, s16 each).
   Field: 6 x u32 fixed16 to current eye (0x800AF880/884/888), current target
