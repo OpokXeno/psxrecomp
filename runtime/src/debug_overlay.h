@@ -65,7 +65,8 @@ void psx_debug_overlay_window_shot_arm(const char *path);
  * raw visibility; `want_capture` is visible && io.WantCaptureKeyboard
  * (false when ImGui is not yet initialized); `swallow` is what
  * psx_debug_overlay_swallow_keyboard() returns (visible && (WantCapture
- * || !imgui_ready)). */
+ * || !imgui_ready), plus the free-camera input capture, which can hold
+ * true while hidden when flying with the overlay closed). */
 void psx_debug_overlay_capture_state(int *visible, int *want_capture,
                                      int *swallow);
 
@@ -174,9 +175,15 @@ int psx_debug_overlay_write_var(int var, int value);
  * address book). 0 = ok, negative on bad value. */
 int psx_debug_overlay_force_battle(int value);
 
-/* Debug-only: write 3 x s16 LE to cameraEye (0x800AF880) and cameraAt
- * (0x800AF890). Coords are clamped to int16. 0 = ok, negative on bad
- * value. */
+/* Debug-only: write the camera pose of the resident module (PSX world
+ * units, integers). Field: current+desired as 6 x u32 fixed16
+ * (0x800AF880/884/888, 0x800AF890/894/898, 0x800AF8B0/B4/B8,
+ * 0x800AF8C0/C4/C8). Battle: current 3 x s16 (0x800D3354/5C) + desired
+ * halves packed into 0x800D30A0/A8. Battling: 3 x u32 eye (0x8009871C) +
+ * target (0x8009867C). Mirrors the pose into the panel editor. One-shot
+ * unless the panel's free camera is enabled (freeze holds it). World
+ * orbit mode has no positional pose and returns -3.
+ * 0 = ok, negative otherwise. */
 int psx_debug_overlay_camera_write(int ex, int ey, int ez,
                                     int ax, int ay, int az);
 

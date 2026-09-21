@@ -663,14 +663,19 @@ poll at `0x800784A0` is the only correct caller).
   guarantee a battle on the next frame. Documented in the in-window
   "Force Battle" panel (Section 8).
 - `{"cmd":"overlay_widget_action","name":"camera_write","value":<packed_xy>,"value2":<packed_xy>}`
-  → writes 3 x s16 LE to `cameraEye` (0x800AF880) and `cameraAt`
-  (0x800AF890). Bit-packing: `value = (ey << 16) | ex`,
+  → writes the resident module's camera pose (PSX world units, s16 each).
+  Field: 6 x u32 fixed16 to current eye (0x800AF880/884/888), current target
+  (0x800AF890/894/898), desired eye (0x800AF8B0/B4/B8) and desired target
+  (0x800AF8C0/C4/C8). Battle: 3 x s16 current (0x800D3354/5C) + desired
+  halves packed into 0x800D30A0/A8. Battling: 3 x u32 eye (0x8009871C) +
+  target (0x8009867C). Bit-packing: `value = (ey << 16) | ex`,
   `value2 = (ay << 16) | ax` (all s16). The Z coords are read from
-  the overlay's editor state (`s_camera_eye[2]`, `s_camera_at[2]`) so
-  the TCP test can either pre-load them via the in-window panel, or
-  chain this with `value=0,value2=0` to test the read-only path. Both
-  addresses are verified-static (addrs.xml + reference validation at
-  0x800af880/0x800af890).
+  the overlay's editor state (`s_cam_eye_f[2]`, `s_cam_at_f[2]`).
+  One-shot unless the panel's free camera is enabled (freeze holds
+  the pose every frame). World orbit mode has no positional pose and
+  returns -3. All addresses verified-static (addrs.xml: field-overlay
+  FUN_80073230/FUN_80072D74, battle-overlay FUN_800BBAB8/FUN_800BC2F0,
+  battling FUN_8007099C/FUN_80070808).
 - `{"cmd":"overlay_widget_action","name":"event_jump","value":<eventId>}`
   → applies the event's `varWrites` (via the `write_var` path:
   `fieldVars[var]` at `0x8006EF64+var*2`, LE, plus the active mirror)
