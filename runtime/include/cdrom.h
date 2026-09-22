@@ -71,6 +71,11 @@ int cdrom_timing_record(uint64_t seq, CdTimingPub* out);
  * active transfers, reports an open shell, waits two emulated seconds, then
  * makes the mounted media readable. This call does not mount a different image. */
 void debug_force_cd_reinsert(void);
+/* Physically exchange the mounted medium: opens image_path first (returns 0
+ * and changes nothing when it cannot), then runs the same timed lid-open /
+ * close cycle as debug_force_cd_reinsert with the new image inserted. Call
+ * only from the emulation thread, like every other drive mutation. */
+int cdrom_swap_disc(const char* image_path);
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA

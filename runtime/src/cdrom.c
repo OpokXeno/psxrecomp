@@ -3473,6 +3473,37 @@ int cdrom_snapshot_read(const uint8_t *p, uint32_t len) {
     return 1;
 }
 
+int cdrom_swap_disc(const char* image_path) {
+    void* replacement;
+
+    if (!image_path || !image_path[0]) return 0;
+    /* Open the new medium before touching the drive, so a bad path leaves
+     * the mounted disc and every in-flight transfer exactly as they were. */
+    replacement = iso_open(image_path);
+    if (!replacement) return 0;
+    /* A physical swap: stop the old transfer, expose the tray-open event, and
+     * present the new medium only after the timed lid closes. */
+    stop_read_stream();
+    stop_cdda_playback();
+    xa_reset_decode();
+    spu_cd_audio_reset();
+    if (iso_handle) iso_close(iso_handle);
+    iso_handle = replacement;
+    last_sector_lba = -1;
+    last_valid_subq_available = 0;
+    subq_replacements_active = iso_has_subq_replacements(iso_handle);
+    if (subq_replacements_active) update_last_valid_subq(0);
+
+    stat_reg = CDSTAT_ERROR | CDSTAT_SHELL;
+    cdrom_clear_pending_dataready();
+    cdrom_lid_begin_open(&s_lid, psx_cycle_count);
+    s_lid_irq_pending = 1;
+    present_lid_open_irq_if_ready();
+    trace_cdrom('O', 1, (uint32_t)CDROM_LID_CLOSE_DELAY_CYCLES,
+                (uint32_t)(CDROM_LID_CLOSE_DELAY_CYCLES >> 32));
+    return 1;
+}
+
 void debug_force_cd_reinsert(void) {
     /* Stop the old transfer before exposing a physical tray-open event. */
     stop_read_stream();

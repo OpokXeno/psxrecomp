@@ -2841,6 +2841,36 @@ static void write_cached_path(const char* argv0, const char* filename,
     if (f.is_open()) f << path.string() << "\n";
 }
 
+/* disc.cfg of a multi-disc set: one image per line in disc order, as the
+ * launcher's multi-disc setup flush writes it (a slot not located yet is an
+ * empty line, so line N stays disc N). A single-disc title's one-line file is
+ * the degenerate case, and read_cached_path's first line is still disc 1. */
+static std::vector<std::filesystem::path> read_cached_disc_list(const char* argv0) {
+    std::vector<std::filesystem::path> discs;
+    std::ifstream f(sidecar_cfg_path(argv0, "disc.cfg"));
+    if (!f.is_open()) return discs;
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+            line.pop_back();
+        discs.emplace_back(line);
+    }
+    while (!discs.empty() && discs.back().empty()) discs.pop_back();
+    return discs;
+}
+
+/* Record one disc's image without dropping the other discs' lines. */
+static void write_cached_disc_slot(const char* argv0, size_t slot,
+                                   const std::filesystem::path& path) {
+    std::vector<std::filesystem::path> discs = read_cached_disc_list(argv0);
+    if (discs.size() <= slot) discs.resize(slot + 1);
+    discs[slot] = path;
+    std::ofstream f(sidecar_cfg_path(argv0, "disc.cfg"), std::ios::trunc);
+    if (!f.is_open()) return;
+    for (size_t i = 0; i < discs.size(); ++i)
+        f << discs[i].string() << "\n";
+}
+
 static void launcher_warning(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
@@ -2918,6 +2948,16 @@ static bool pick_runtime_file(const char* title, const char* filter,
  * either may be what the player picked. Populated from game.toml; empty for
  * every single-disc title, which therefore behaves exactly as before. */
 static std::unordered_map<std::string, std::string> g_disc_serials;
+/* game.toml [game] disc_serials in disc order, to gate an image the player
+ * binds to a slot after load (the stem map above is keyed per image). */
+static std::vector<std::string> g_disc_serial_list;
+
+/* The set as mounted this session: build roster slots rebound to the images
+ * the player located, and the 1-based disc in the drive (0 = single-disc).
+ * Owned by the emulation thread; the debug overlay swaps through
+ * psx_disc_swap, which runs on that same thread. */
+static std::vector<std::filesystem::path> g_disc_roster;
+static int g_mounted_disc_index = 0;
 
 /* Per-disc netplay TOC fingerprints, same keying and same reason as
  * g_disc_serials: every disc of a set has its own TOC, so a set gated on the
@@ -2933,11 +2973,35 @@ static std::string uppercase_ascii(std::string s);
  * the game declared one, the game's own id otherwise. An image that belongs
  * to a declared set but has no serial listed is returned ungated (""), never
  * gated against another disc's number. */
+/* Slot (0-based) of the set whose serial this image carries, or -1. The set's
+ * images are wherever the player keeps them, so an image is placed by what it
+ * is (the SYSTEM.CNF serial), never by its file name or by the slot that
+ * happened to be selected when it was browsed. */
+static int disc_slot_for_image(const std::filesystem::path& disc) {
+    if (g_disc_serial_list.size() < 2 || disc.empty()) return -1;
+    const PSXRecompV4::DiscIdentity id =
+        PSXRecompV4::identify_disc(disc, std::string(), /*expected_crc*/0,
+                                   /*has_expected_crc*/false, /*compute_crc*/false);
+    if (!id.opened || id.detected_serial.empty()) return -1;
+    const std::string serial = uppercase_ascii(id.detected_serial);
+    for (size_t i = 0; i < g_disc_serial_list.size(); ++i)
+        if (uppercase_ascii(g_disc_serial_list[i]) == serial) return (int)i;
+    return -1;
+}
+
 static std::string expected_serial_for_disc(const std::filesystem::path& disc,
                                             const std::string& fallback) {
-    if (g_disc_serials.empty()) return fallback;
+    if (g_disc_serials.empty() && g_disc_serial_list.size() < 2) return fallback;
     const auto it = g_disc_serials.find(uppercase_ascii(disc.stem().string()));
-    return it != g_disc_serials.end() ? it->second : std::string();
+    if (it != g_disc_serials.end()) return it->second;
+    /* A set declared by its serials accepts any disc of the set under the
+     * serial it actually carries; anything else is checked against the boot
+     * disc's and reported as the wrong game. */
+    if (g_disc_serial_list.size() > 1) {
+        const int slot = disc_slot_for_image(disc);
+        return slot >= 0 ? g_disc_serial_list[(size_t)slot] : fallback;
+    }
+    return std::string();
 }
 
 static std::string uppercase_ascii(std::string s) {
@@ -3293,7 +3357,8 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         }
         picked = normalize_disc_path_for_launch(picked);
         if (validate_disc_for_launch(picked, game_id)) {
-            write_cached_path(argv0, "disc.cfg", picked);
+            /* The boot disc is line 1; keep any other discs of the set. */
+            write_cached_disc_slot(argv0, 0, picked);
             return picked;
         }
     }
@@ -13814,6 +13879,64 @@ namespace {
 }  // namespace
 #endif
 
+/* ---- multi-disc hot swap (debug overlay) ---------------------------------
+ * The drive half is cdrom_swap_disc; this is the set half: which image a disc
+ * number means this session, the disc-patching mod plan for that image, and
+ * the per-disc savestate scope. Runs on the emulation thread (the overlay and
+ * its TCP actions dispatch there), like the Ctrl+C reinsert it extends. */
+extern "C" int psx_disc_count(void) {
+    return g_disc_roster.size() > 1 ? (int)g_disc_roster.size() : 0;
+}
+
+extern "C" int psx_disc_mounted(void) {
+    return g_mounted_disc_index;
+}
+
+extern "C" const char* psx_disc_path(int disc_number) {
+    if (disc_number < 1 || disc_number > (int)g_disc_roster.size()) return "";
+    static std::string path;
+    path = g_disc_roster[(size_t)disc_number - 1u].string();
+    return path.c_str();
+}
+
+extern "C" int psx_disc_swap(int disc_number, char* error, size_t error_cap) {
+    auto fail = [&](const std::string& why) {
+        if (error && error_cap) std::snprintf(error, error_cap, "%s", why.c_str());
+        std::fprintf(stderr, "psxrecomp: disc swap refused: %s\n", why.c_str());
+        return 0;
+    };
+    if (error && error_cap) error[0] = '\0';
+    if (psx_netplay_active()) return fail("disc swap is disabled in netplay");
+    if (g_disc_roster.size() < 2) return fail("not a multi-disc title");
+    if (disc_number < 1 || disc_number > (int)g_disc_roster.size())
+        return fail("no such disc");
+    if (disc_number == g_mounted_disc_index)
+        return fail("that disc is already in the drive");
+    const std::filesystem::path stock = g_disc_roster[(size_t)disc_number - 1u];
+    if (stock.empty() || !std::filesystem::exists(stock))
+        return fail("disc " + std::to_string(disc_number) +
+                    " has not been located (set it in the launcher)");
+    /* Disc-patching mods resolve per mounted disc (each disc of the set has
+     * its own digest and plan); mount the patched view when one results. */
+    std::string mod_error;
+    if (!PSXRecompV4::mod_runtime_commit(stock, &mod_error))
+        return fail("mods cannot be applied to disc " +
+                    std::to_string(disc_number) + ": " + mod_error);
+    const std::filesystem::path& mod_disc =
+        PSXRecompV4::mod_runtime_effective_disc_path();
+    const std::string mount = (mod_disc.empty() ? stock : mod_disc).string();
+    if (!cdrom_swap_disc(mount.c_str()))
+        return fail("cannot open " + mount);
+    g_mounted_disc_index = disc_number;
+    savestate_set_disc_scope(disc_number);
+    std::fprintf(stdout, "psxrecomp: disc %d inserted (%s)\n", disc_number,
+                 mount.c_str());
+    char osd[32];
+    std::snprintf(osd, sizeof(osd), "Disc %d inserted", disc_number);
+    host_osd_push(osd, 2000);
+    return 1;
+}
+
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed.
      * MSVC's UCRT invalid-parameter validation fast-fails setvbuf() when
@@ -14235,6 +14358,7 @@ int main(int argc, char** argv) {
              * the launcher's disc verdict. Keyed by the image's uppercased
              * stem so a .cue and its .bin agree. */
             g_disc_serials.clear();
+            g_disc_serial_list = gc.disc_serials;
             for (size_t i = 0;
                  i < gc.discs.size() && i < gc.disc_serials.size(); ++i) {
                 if (gc.disc_serials[i].empty()) continue;
@@ -14250,7 +14374,33 @@ int main(int argc, char** argv) {
                 g_disc_netplay_fps[uppercase_ascii(gc.discs[i].stem().string())] =
                     gc.netplay_required_disc_fps[i];
             }
-            if (!gc.discs.empty()) resolved_disc = gc.discs.front();
+            /* The build roster names the images the build was made from; the
+             * player's own copies live wherever they located them (disc.cfg,
+             * one line per disc). Bind each located image to its slot and gate
+             * it on that slot's serial, so disc 1 cannot be mounted as disc 2. */
+            /* A set may be declared by its serials alone: the build ships no
+             * image paths, and every slot is filled by the player. */
+            if (gc.disc_serials.size() > 1 &&
+                game_discs.size() < gc.disc_serials.size())
+                game_discs.resize(gc.disc_serials.size());
+            if (game_discs.size() > 1) {
+                const auto located = read_cached_disc_list(argv[0]);
+                for (size_t i = 0; i < located.size(); ++i) {
+                    if (located[i].empty()) continue;
+                    const std::filesystem::path p =
+                        normalize_disc_path_for_launch(located[i]);
+                    if (!std::filesystem::exists(p)) continue;
+                    const int by_serial = disc_slot_for_image(p);
+                    const size_t slot = by_serial >= 0 ? (size_t)by_serial : i;
+                    if (slot >= game_discs.size()) continue;
+                    game_discs[slot] = p;
+                    if (slot < gc.disc_serials.size() &&
+                        !gc.disc_serials[slot].empty())
+                        g_disc_serials[uppercase_ascii(p.stem().string())] =
+                            gc.disc_serials[slot];
+                }
+            }
+            if (!game_discs.empty()) resolved_disc = game_discs.front();
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
@@ -15881,9 +16031,11 @@ int main(int argc, char** argv) {
             std::vector<RecompLauncherCDisc> rui_discs;
             if (game_discs.size() > 1) {
                 rui_disc_paths.reserve(game_discs.size());
+                /* A slot the player has not located is "" -- never the cwd
+                 * that normalizing an empty path would produce. */
                 for (const auto& d : game_discs)
-                    rui_disc_paths.push_back(
-                        normalize_disc_path_for_launch(d).string());
+                    rui_disc_paths.push_back(d.empty() ? std::string()
+                        : normalize_disc_path_for_launch(d).string());
                 rui_discs.reserve(rui_disc_paths.size());
                 for (size_t i = 0; i < rui_disc_paths.size(); ++i)
                     rui_discs.push_back(RecompLauncherCDisc{
@@ -16006,6 +16158,32 @@ int main(int argc, char** argv) {
                     selected_disc_index = ls.disc_index;
                     seed.disc_index = ls.disc_index;
                     seed.has_disc_index = true;
+                    /* A browse rebinds only the selected slot: record that
+                     * image as this disc's location, keeping the other discs. */
+                    size_t slot = (size_t)std::min(
+                        ls.disc_index, (int)game_discs.size()) - 1u;
+                    if (rui_out_disc[0]) {
+                        const std::filesystem::path chosen =
+                            normalize_disc_path_for_launch(rui_out_disc);
+                        if (std::filesystem::exists(chosen)) {
+                            /* The image decides its slot: browsing disc 1
+                             * while "Disc 2" is selected mounts and records
+                             * disc 1 as disc 1. */
+                            const int by_serial = disc_slot_for_image(chosen);
+                            if (by_serial >= 0 && (size_t)by_serial != slot) {
+                                slot = (size_t)by_serial;
+                                selected_disc_index = by_serial + 1;
+                                seed.disc_index = selected_disc_index;
+                            }
+                            game_discs[slot] = chosen;
+                            if (slot < g_disc_serial_list.size() &&
+                                !g_disc_serial_list[slot].empty())
+                                g_disc_serials[uppercase_ascii(
+                                    chosen.stem().string())] =
+                                    g_disc_serial_list[slot];
+                            write_cached_disc_slot(argv[0], slot, chosen);
+                        }
+                    }
                 }
                 seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
@@ -16390,7 +16568,17 @@ int main(int argc, char** argv) {
                 if (seed.has_disc_path) {
                     seed.disc_path = normalize_disc_path_for_launch(seed.disc_path);
                     resolved_disc = seed.disc_path;
-                    write_cached_path(argv[0], "disc.cfg", resolved_disc);
+                    if (game_discs.size() > 1) {
+                        /* disc.cfg holds the whole set, one line per disc:
+                         * record the mounted image on its own line and keep
+                         * where the player located every other disc. */
+                        const int by_serial = disc_slot_for_image(resolved_disc);
+                        const size_t slot = by_serial >= 0 ? (size_t)by_serial
+                            : (size_t)std::max(selected_disc_index, 1) - 1u;
+                        write_cached_disc_slot(argv[0], slot, resolved_disc);
+                    } else {
+                        write_cached_path(argv[0], "disc.cfg", resolved_disc);
+                    }
                 }
                 memcard1_enabled = seed.memcard1_enabled;
                 memcard2_enabled = seed.memcard2_enabled;
@@ -17733,6 +17921,20 @@ session_reboot:
          * is the key the slot files already use. Single-disc titles pass 0 and
          * keep their existing filenames untouched. */
         savestate_set_disc_scope(game_discs.size() > 1 ? selected_disc_index : 0);
+        g_disc_roster = game_discs;
+        g_mounted_disc_index = game_discs.size() > 1 ? selected_disc_index : 0;
+        if (game_discs.size() > 1 && !resolved_disc.empty()) {
+            /* The mounted image is what is in the drive, whichever path chose
+             * it (settings, disc.cfg, CLI); bind it so a later swap back to
+             * this disc finds it, and so disc.cfg remembers it. */
+            const int slot = disc_slot_for_image(resolved_disc);
+            if (slot >= 0) {
+                g_disc_roster[(size_t)slot] = resolved_disc;
+                g_mounted_disc_index = slot + 1;
+                savestate_set_disc_scope(g_mounted_disc_index);
+                write_cached_disc_slot(argv[0], (size_t)slot, resolved_disc);
+            }
+        }
         savestate_configure(memcard_dir.string().c_str(),
                             memory_get_bios_checksum(), game_entry_pc,
                             bios_token, openbios_ws);
@@ -18214,8 +18416,8 @@ soft_return_lobby:
         if (game_discs.size() > 1) {
             rui_disc_paths.reserve(game_discs.size());
             for (const auto& d : game_discs)
-                rui_disc_paths.push_back(
-                    normalize_disc_path_for_launch(d).string());
+                rui_disc_paths.push_back(d.empty() ? std::string()
+                    : normalize_disc_path_for_launch(d).string());
             rui_discs.reserve(rui_disc_paths.size());
             for (size_t i = 0; i < rui_disc_paths.size(); ++i)
                 rui_discs.push_back(RecompLauncherCDisc{

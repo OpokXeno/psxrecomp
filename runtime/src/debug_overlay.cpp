@@ -171,6 +171,13 @@ extern "C" int  psx_input_controller_ports_swapped(void);
 extern "C" int  psx_input_controller_port_swap_available(void);
 extern "C" int  psx_input_swap_controller_ports(void);
 extern "C" int  g_turbo_loads_enabled;
+/* Multi-disc set (main.cpp): roster size (0 = single-disc), the disc in the
+ * drive, each disc's located image, and the hot swap itself. */
+extern "C" int         psx_disc_count(void);
+extern "C" int         psx_disc_mounted(void);
+extern "C" const char* psx_disc_path(int disc_number);
+extern "C" int         psx_disc_swap(int disc_number, char* error, size_t error_cap);
+static void draw_disc_section(void);
 }
 
 /* Visibility flag. Flipped by psx_debug_overlay_toggle (Ctrl+F3) and by
@@ -4840,6 +4847,11 @@ ImGui::Checkbox("Visible (Ctrl+F3)", &s_visible);
         draw_toggles_section();
     }
 
+    /* ---- Section: Disc (multi-disc hot swap) ---- */
+    if (ImGui::CollapsingHeader("Disc")) {
+        draw_disc_section();
+    }
+
     /* ---- Section 4: Rings ---- */
     if (ImGui::CollapsingHeader("Rings")) {
         draw_rings_section();
@@ -5056,6 +5068,37 @@ void psx_debug_overlay_post_swap(int completed)
 
 /* ---- widget action hook (debug-only, TCP-driven) ----------------------- */
 
+/* ---- Disc: multi-disc hot swap ------------------------------------------ */
+static char s_disc_swap_error[256];
+
+static void draw_disc_section(void)
+{
+    const int count = psx_disc_count();
+    if (count < 2) {
+        ImGui::TextDisabled("Single-disc title");
+        return;
+    }
+    ImGui::Text("In drive: Disc %d", psx_disc_mounted());
+    for (int disc = 1; disc <= count; ++disc) {
+        const char* path = psx_disc_path(disc);
+        ImGui::PushID(disc);
+        ImGui::BeginDisabled(disc == psx_disc_mounted());
+        char label[32];
+        std::snprintf(label, sizeof(label), "Insert Disc %d", disc);
+        if (ImGui::Button(label))
+            (void)psx_disc_swap(disc, s_disc_swap_error, sizeof(s_disc_swap_error));
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", path && path[0] ? path : "(not located)");
+        ImGui::PopID();
+    }
+    ImGui::TextWrapped("Opens the lid, inserts the disc and closes it after "
+                       "two emulated seconds. Use it when the game asks for "
+                       "another disc.");
+    if (s_disc_swap_error[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", s_disc_swap_error);
+}
+
 int psx_debug_overlay_widget_action(const char *name, int value, int value2)
 {
     if (!name) return -1;
@@ -5084,6 +5127,10 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         if (value == 0) return -2;
         request_kernel_menu();
         return 0;
+    }
+    if (std::strcmp(name, "disc_swap") == 0) {
+        return psx_disc_swap(value, s_disc_swap_error,
+                             sizeof(s_disc_swap_error)) ? 0 : -3;
     }
     if (std::strcmp(name, "swap_controller_ports") == 0) {
         if (value == 0) return -2;
