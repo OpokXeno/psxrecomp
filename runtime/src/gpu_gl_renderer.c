@@ -6932,6 +6932,8 @@ typedef struct GlNativeCpuCompiler {
     GlNativeGpuWork *gpu;
     uint32_t gpu_plane;
     int gpu_only;
+    /* Row band of a parallel VIEW reference raster (raster Y, inclusive). */
+    int banded, band_top, band_bottom;
     struct GlNativeViewWorker *view_worker;
     GlNativeViewState *native_views;
 } GlNativeCpuCompiler;
@@ -7712,6 +7714,8 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                 uint32_t *destination;
                 if (x >= material->draw_area_left && x <= material->draw_area_right &&
                     y >= material->draw_area_top && y <= material->draw_area_bottom &&
+                    (!compiler->banded ||
+                     (y >= compiler->band_top && y <= compiler->band_bottom)) &&
                     native_surface_pixel(target, x, y, &destination) &&
                     native_pixel_in_viewport(compiler, target, destination) &&
                     (!material->mask_check || (*destination >> 24u) == 0u)) {
@@ -7869,6 +7873,14 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
             if (min_y < native_origin_y) min_y = native_origin_y;
             if (max_x >= (int)width) max_x = (int)width - 1;
             if (max_y >= native_origin_y + (int)height) max_y = native_origin_y + (int)height - 1;
+        }
+        if (compiler->banded) {
+            /* Disjoint rows of one ordered raster: edge/UV equations and
+             * absolute dither coordinates are unchanged, so every pixel gets
+             * exactly the fragments of the single-thread reference. */
+            if (min_y < compiler->band_top) min_y = compiler->band_top;
+            if (max_y > compiler->band_bottom) max_y = compiler->band_bottom;
+            if (min_y > max_y) continue;
         }
         area = (px[1] - px[0]) * (py[2] - py[0]) -
                (py[1] - py[0]) * (px[2] - px[0]);
@@ -8086,44 +8098,84 @@ typedef struct GlNativeViewJob {
     uint32_t record_index;
     uint8_t dither_x, dither_y;
 } GlNativeViewJob;
-typedef struct GlNativeViewWorker {
+/* The VIEW reference raster runs on up to four band threads. Each band owns
+ * disjoint raster rows and replays every job in submission order, so the
+ * per-pixel draw order (and the result) is identical to one reader. */
+#define GL_NATIVE_VIEW_BAND_CAPACITY 4u
+struct GlNativeViewWorker;
+typedef struct GlNativeViewBand {
+    struct GlNativeViewWorker *owner;
     GlNativeCpuCompiler compiler;
     GlNativeCompileAudit audit;
     SDL_Thread *thread;
+    uint32_t index, done;
+    int failed;
+} GlNativeViewBand;
+typedef struct GlNativeViewWorker {
     SDL_mutex *mutex;
     SDL_cond *condition;
     GlNativeViewJob *jobs;
     uint16_t reads[VRAM_H];
-    uint32_t count, done;
-    int stop, failed;
+    uint32_t count, band_count;
+    int stop;
+    GlNativeViewBand bands[GL_NATIVE_VIEW_BAND_CAPACITY];
 } GlNativeViewWorker;
 static GlNativeViewWorker *s_native_view_worker;
 
+static int native_view_worker_idle(const GlNativeViewWorker *worker) {
+    for (uint32_t i = 0u; i < worker->band_count; ++i)
+        if (worker->bands[i].done != worker->count) return 0;
+    return 1;
+}
+
 static int native_view_worker_main(void *data) {
-    GlNativeViewWorker *worker = data;
+    GlNativeViewBand *band = data;
+    GlNativeViewWorker *worker = band->owner;
     SDL_LockMutex(worker->mutex);
     for (;;) {
-        while (worker->done == worker->count && !worker->stop)
+        while (band->done == worker->count && !worker->stop)
             SDL_CondWait(worker->condition, worker->mutex);
-        if (worker->done == worker->count && worker->stop) break;
-        const uint32_t begin = worker->done, end = worker->count;
+        if (band->done == worker->count && worker->stop) break;
+        const uint32_t begin = band->done, end = worker->count;
+        const int bands = (int)worker->band_count;
         SDL_UnlockMutex(worker->mutex);
         /* Published jobs never change until finish has joined this reader.
          * Drain a captured prefix without a mutex round trip per triangle. */
         for (uint32_t i = begin; i < end; ++i) {
             GlNativeViewJob *job = &worker->jobs[i];
-            worker->compiler.viewport_width = job->surface.width;
-            worker->compiler.viewport_height = job->surface.height;
-            worker->compiler.dither_x = job->dither_x; worker->compiler.dither_y = job->dither_y;
-            const int ok = worker->failed || native_render_draw(&worker->compiler, &job->surface, &job->draw, job->record_index);
-            worker->failed |= !ok;
+            const int origin = (job->resource.view.descriptor.flags &
+                                XG_RENDER_RESOURCE_DESCRIPTOR_HAS_VRAM_REGION)
+                ? (int)job->resource.view.descriptor.vram_y : 0;
+            const int height = (int)job->surface.height;
+            const int index = (int)band->index;
+            band->compiler.viewport_width = job->surface.width;
+            band->compiler.viewport_height = job->surface.height;
+            band->compiler.dither_x = job->dither_x; band->compiler.dither_y = job->dither_y;
+            band->compiler.banded = bands > 1;
+            /* Outer bands are open-ended: a band split can move work between
+             * threads but can never leave a row uncovered. */
+            band->compiler.band_top = index == 0 ? INT_MIN : origin + height * index / bands;
+            band->compiler.band_bottom = index == bands - 1 ? INT_MAX
+                : origin + height * (index + 1) / bands - 1;
+            const int ok = band->failed || native_render_draw(&band->compiler, &job->surface, &job->draw, job->record_index);
+            band->failed |= !ok;
         }
         SDL_LockMutex(worker->mutex);
-        worker->done = end;
-        if (worker->done == worker->count) SDL_CondBroadcast(worker->condition);
+        band->done = end;
+        SDL_CondBroadcast(worker->condition);
     }
     SDL_UnlockMutex(worker->mutex);
     return 1;
+}
+
+static int native_view_worker_failed(const GlNativeViewWorker *worker,
+                                     const GlNativeCompileAudit **out_audit) {
+    for (uint32_t i = 0u; i < worker->band_count; ++i)
+        if (worker->bands[i].failed) {
+            if (out_audit) *out_audit = &worker->bands[i].audit;
+            return 1;
+        }
+    return 0;
 }
 
 static int native_view_worker_drain(GlNativeCpuCompiler *compiler, int left, int top, int right, int bottom) {
@@ -8137,8 +8189,8 @@ static int native_view_worker_drain(GlNativeCpuCompiler *compiler, int left, int
     for (int y = top; y <= bottom; ++y) reads |= worker->reads[y];
     if (!(reads & mask) && !(left == 0 && right == VRAM_W - 1 && top == 0 && bottom == VRAM_H - 1)) return 1;
     SDL_LockMutex(worker->mutex);
-    while (worker->done != worker->count) SDL_CondWait(worker->condition, worker->mutex);
-    const int ok = !worker->failed;
+    while (!native_view_worker_idle(worker)) SDL_CondWait(worker->condition, worker->mutex);
+    const int ok = !native_view_worker_failed(worker, NULL);
     SDL_UnlockMutex(worker->mutex);
     memset(worker->reads, 0, sizeof(worker->reads));
     return ok;
@@ -8146,12 +8198,13 @@ static int native_view_worker_drain(GlNativeCpuCompiler *compiler, int left, int
 
 static int native_view_worker_finish(GlNativeCpuCompiler *compiler) {
     GlNativeViewWorker *worker = compiler->view_worker;
+    const GlNativeCompileAudit *failed = NULL;
     if (!worker) return 1;
     SDL_LockMutex(worker->mutex);
-    while (worker->done != worker->count) SDL_CondWait(worker->condition, worker->mutex);
-    const int ok = !worker->failed;
-    if (!ok) native_audit_block(compiler->audit, worker->audit.blocker, worker->audit.blocker_record_index,
-        worker->audit.blocker_resource_id, worker->audit.blocker_resource_generation);
+    while (!native_view_worker_idle(worker)) SDL_CondWait(worker->condition, worker->mutex);
+    const int ok = !native_view_worker_failed(worker, &failed);
+    if (!ok) native_audit_block(compiler->audit, failed->blocker, failed->blocker_record_index,
+        failed->blocker_resource_id, failed->blocker_resource_generation);
     SDL_UnlockMutex(worker->mutex);
     compiler->view_worker = NULL;
     return ok;
@@ -8161,10 +8214,26 @@ static void native_view_worker_shutdown(void) {
     GlNativeViewWorker *worker = s_native_view_worker;
     if (!worker) return;
     SDL_LockMutex(worker->mutex); worker->stop = 1;
-    SDL_CondSignal(worker->condition); SDL_UnlockMutex(worker->mutex);
-    SDL_WaitThread(worker->thread, NULL);
+    SDL_CondBroadcast(worker->condition); SDL_UnlockMutex(worker->mutex);
+    for (uint32_t i = 0u; i < worker->band_count; ++i)
+        SDL_WaitThread(worker->bands[i].thread, NULL);
     SDL_DestroyCond(worker->condition); SDL_DestroyMutex(worker->mutex);
     free(worker->jobs); free(worker); s_native_view_worker = NULL;
+}
+
+static void native_view_worker_bind(GlNativeViewWorker *worker, const GlNativeCpuCompiler *compiler) {
+    for (uint32_t i = 0u; i < GL_NATIVE_VIEW_BAND_CAPACITY; ++i) {
+        GlNativeViewBand *band = &worker->bands[i];
+        band->compiler = *compiler;
+        band->compiler.audit = &band->audit; band->compiler.gpu = NULL;
+        band->compiler.view_worker = NULL; band->compiler.raster_words = NULL;
+        band->compiler.banded = 0;
+        band->done = 0u; band->failed = 0;
+        band->audit.blocker = 0u; band->audit.rendered_draws = 0u;
+        band->audit.rendered_draw_pixels = 0u;
+    }
+    worker->count = 0u;
+    memset(worker->reads, 0, sizeof(worker->reads));
 }
 
 static int native_view_worker_draw(GlNativeCpuCompiler *compiler, GlNativeCpuSurface *surface,
@@ -8173,28 +8242,34 @@ static int native_view_worker_draw(GlNativeCpuCompiler *compiler, GlNativeCpuSur
         GlNativeViewWorker *worker = s_native_view_worker;
         if (worker) {
             /* The preceding transaction joined every job before freeing its
-             * input storage. Rebind only while the reader is quiescent. */
+             * input storage. Rebind only while the readers are quiescent. */
             SDL_LockMutex(worker->mutex);
-            worker->compiler = *compiler;
-            worker->compiler.audit = &worker->audit; worker->compiler.gpu = NULL;
-            worker->compiler.view_worker = NULL; worker->compiler.raster_words = NULL;
-            worker->count = worker->done = 0u; worker->failed = 0;
-            worker->audit.blocker = 0u; worker->audit.rendered_draws = 0u;
-            worker->audit.rendered_draw_pixels = 0u;
-            memset(worker->reads, 0, sizeof(worker->reads));
+            native_view_worker_bind(worker, compiler);
             SDL_UnlockMutex(worker->mutex);
         } else {
+            const int cpus = SDL_GetCPUCount();
+            const uint32_t wanted = cpus >= 12 ? 4u : cpus >= 6 ? 2u : 1u;
             worker = calloc(1u, sizeof(*worker));
             if (!worker) return native_render_draw(compiler, surface, draw, record_index);
             worker->jobs = malloc(GL_NATIVE_VIEW_JOB_CAPACITY * sizeof(*worker->jobs));
             worker->mutex = SDL_CreateMutex(); worker->condition = SDL_CreateCond();
             if (worker->jobs && worker->mutex && worker->condition) {
-                worker->compiler = *compiler;
-                worker->compiler.audit = &worker->audit; worker->compiler.gpu = NULL;
-                worker->compiler.view_worker = NULL; worker->compiler.raster_words = NULL;
-                worker->thread = SDL_CreateThread(native_view_worker_main, "native-reference", worker);
+                native_view_worker_bind(worker, compiler);
+                /* Bands start idle (done == count == 0), so the band count
+                 * is final before any job is published. Stop at the first
+                 * failed thread: bands must be a contiguous 0..n-1 range. */
+                SDL_LockMutex(worker->mutex);
+                for (uint32_t i = 0u; i < wanted; ++i) {
+                    worker->bands[i].owner = worker;
+                    worker->bands[i].index = i;
+                    worker->bands[i].thread = SDL_CreateThread(
+                        native_view_worker_main, "native-reference", &worker->bands[i]);
+                    if (!worker->bands[i].thread) break;
+                    worker->band_count++;
+                }
+                SDL_UnlockMutex(worker->mutex);
             }
-            if (!worker->thread) {
+            if (!worker->band_count) {
                 if (worker->condition) SDL_DestroyCond(worker->condition);
                 if (worker->mutex) SDL_DestroyMutex(worker->mutex);
                 free(worker->jobs); free(worker);
@@ -8235,9 +8310,11 @@ static int native_view_worker_draw(GlNativeCpuCompiler *compiler, GlNativeCpuSur
     job->draw = *draw; job->resource = *surface->resource; job->surface = *surface;
     job->surface.resource = &job->resource; job->record_index = record_index;
     job->dither_x = compiler->dither_x; job->dither_y = compiler->dither_y;
-    const int wake = worker->done == worker->count;
+    int wake = 0;
+    for (uint32_t i = 0u; i < worker->band_count; ++i)
+        wake |= worker->bands[i].done == worker->count;
     worker->count++;
-    if (wake) SDL_CondSignal(worker->condition);
+    if (wake) SDL_CondBroadcast(worker->condition);
     SDL_UnlockMutex(worker->mutex);
     return 1;
 }
