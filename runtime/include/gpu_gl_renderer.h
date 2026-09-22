@@ -524,11 +524,9 @@ void gl_renderer_set_swap_interval(int interval);
  * Wayland presentation feedback may phase-align that clock to physical retrace. */
 int gl_renderer_set_native_interpolation_fps(int target_fps);
 int gl_renderer_native_interpolation_fps(void);
-/* Last present path taken (GL_PRES_* enum: 0=VRAM 4:3, 1=WIDE, 2=CPU,
- * 3=BLANK, 4=INTERP, 5=NATIVE_CURRENT, 6=NATIVE_MIDPOINT, -1=none yet).
- * Tells whether frames go through the midpoint phase emitter (only path
- * where the native FPS denominator multiplies presents). */
-int gl_renderer_last_present_path(void);
+/* True requested target (pool denominator aside): 75/144/165 report
+ * exactly; the plain getter above reports denominator*30. */
+int gl_renderer_native_interpolation_target_fps(void);
 
 /* Presentation-only temporal blending. High-refresh sub-presents blend the two
  * most recent stable display images on the owning render thread/context; this
@@ -1176,9 +1174,6 @@ enum {
     GL_PRES_INTERP = 4,  /* host-refresh interpolation sub-present              */
     GL_PRES_NATIVE_CURRENT = 5,  /* native semantic stream, current FBO swap   */
     GL_PRES_NATIVE_MIDPOINT = 6, /* native semantic stream, midpoint FBO swap  */
-    GL_PRES_NATIVE_WORKER = 7, /* native worker presenter swap (phase-selected
-                                  per host tick; the path whose cadence the
-                                  Toggles FPS selector governs) */
 };
 
 typedef enum GlNativeMidpointDecision {

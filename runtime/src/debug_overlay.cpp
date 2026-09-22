@@ -1138,7 +1138,7 @@ static void draw_gpu_state_section(void)
     /* Native semantic target (managed in Toggles). Presented rate is the
      * FPS row below; the target alone never moves. */
     ImGui::Text("Native semantic : %d FPS target",
-                gl_renderer_native_interpolation_fps());
+                gl_renderer_native_interpolation_target_fps());
 
     /* Presented frames per second: pre_swap counts every present (game +
      * interpolated alike), never vblank pacing. Replaces the GL perf-ring
@@ -1360,14 +1360,22 @@ static void draw_toggles_section(void)
     }
 
     static const char *kNativeInterpolationTargets[] = {
-        "30 FPS (Original)", "60 FPS", "120 FPS", "240 FPS"
+        "30 FPS (Original)", "60 FPS", "75 FPS", "120 FPS", "144 FPS",
+        "165 FPS", "240 FPS"
     };
-    int native_fps = gl_renderer_native_interpolation_fps();
-    int native_fps_index = native_fps == 240 ? 3 :
-        native_fps == 120 ? 2 : native_fps == 60 ? 1 : 0;
+    /* True target (denominator getter lies for 75/144/165). Unknown maps
+     * to 60. */
+    int native_fps = gl_renderer_native_interpolation_target_fps();
+    int native_fps_index = 1;
+    {
+        static const int known[] = {30, 60, 75, 120, 144, 165, 240};
+        for (int i = 0; i < 7; ++i) {
+            if (known[i] == native_fps) { native_fps_index = i; break; }
+        }
+    }
     if (ImGui::Combo("Native semantic target", &native_fps_index,
-                     kNativeInterpolationTargets, 4)) {
-        static const int targets[] = {30, 60, 120, 240};
+                     kNativeInterpolationTargets, 7)) {
+        static const int targets[] = {30, 60, 75, 120, 144, 165, 240};
         /* Full retarget (phase pool + presenter tick), not just the GL
          * denominator: the host period is what paces worker presents. */
         (void)psx_native_semantic_fps_set(targets[native_fps_index]);

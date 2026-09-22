@@ -467,6 +467,9 @@ static GLuint s_extra_phase_fbo[NATIVE_INTERPOLATION_MAX_PHASES - 1u];
 static GLuint s_extra_phase_rb[NATIVE_INTERPOLATION_MAX_PHASES - 1u];
 static unsigned int s_native_interpolation_denominator = 2u;
 static unsigned int s_native_interpolation_phase_count = 1u;
+/* True requested target (60 default). The denominator is pool sizing only;
+ * for non-multiple targets (75/144/165) denominator*30 would lie. */
+static int s_native_interpolation_target_fps = 60;
 static uint64_t s_native_present_deadline;
 
 /* The only SDL_GL_SwapWindow callsite in this translation unit.  Ownership is
@@ -490,14 +493,14 @@ static int gl_swap_window_private(GlSwapCaller caller) {
             allowed = s_swap_owner_thread == current;
         }
     } else if (caller == GL_SWAP_CALLER_LEGACY_MAIN &&
-               current == s_swap_legacy_main_thread &&
-               current_context == s_ctx) {
-        s_swap_owner_thread = current; /* legacy main may reclaim only here */
+                current == s_swap_legacy_main_thread &&
+                current_context == s_ctx) {
+         s_swap_owner_thread = current; /* legacy main may reclaim only here */
         allowed = 1;
     } else if (caller == GL_SWAP_CALLER_LEGACY_INTERPOLATION &&
-               current == s_swap_legacy_interpolation_thread &&
-               current_context == s_interp_ctx) {
-        s_swap_owner_thread = current;
+                current == s_swap_legacy_interpolation_thread &&
+                current_context == s_interp_ctx) {
+         s_swap_owner_thread = current;
         allowed = 1;
     }
     if (allowed && !native_path) SDL_GL_SwapWindow(s_win);
@@ -509,19 +512,10 @@ static int gl_swap_window_private(GlSwapCaller caller) {
 }
 
 static void apply_swap_interval(void) {
-    /* The Toggles FPS selector only wrote the denominator before: route it
-     * to the real swap cadence here (and in main.cpp's
-     * present_effective_swap_interval, which must agree). 30 -> every 2nd
-     * vsync on a 60 Hz panel; past 2 -> immediate, the midpoint worker
-     * emits the extra phases itself. Gated on the native path so stale
-     * denominators never pace interp/legacy presents. */
+    /* Applies s_swap_interval verbatim. Cadence ownership lives in main
+     * (present_effective_swap_interval: user x target x panel); the old
+     * denominator override here used to stomp it on every FPS change. */
     int interval = s_swap_interval;
-    if (s_native_active) {
-        if (s_native_interpolation_denominator > 2u)
-            interval = 0;
-        else if (s_native_interpolation_denominator <= 1u)
-            interval = 2;
-    }
 
     if (!s_ctx) return;
     if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
@@ -953,7 +947,7 @@ typedef enum GlNativeFenceState {
     GL_NATIVE_FENCE_STATE_READY,
 } GlNativeFenceState;
 
-#define GL_NATIVE_MOTION_PHASE_CAPACITY 7u
+#define GL_NATIVE_MOTION_PHASE_CAPACITY 15u
 /* Adaptive phase budget: how many motion phases each batch may author.
  * The tick-rate need (interval x hz) assumes generation is free; when the
  * worker cannot render that many phases before the tick deadline, batches
@@ -14328,7 +14322,6 @@ static void native_presenter_swap(void *user_data) {
     swapped = gl_swap_window_private(GL_SWAP_CALLER_NATIVE_PRESENTER);
     if (swapped) {
         pres_mark_swap_completed(sequence);
-        s_last_present_path = GL_PRES_NATIVE_WORKER;
         s_probe_swap++;
     } else {
         pres_mark_swap_attempted(sequence, 1);
@@ -14706,12 +14699,15 @@ int gl_renderer_set_native_interpolation_fps(int target_fps) {
     unsigned int phase_count;
     const unsigned int old_phase_count = s_native_interpolation_phase_count;
 
-    if (target_fps == 30) denominator = 1u;
-    else if (target_fps == 0) denominator = 2u;
-    else if (target_fps == 60) denominator = 2u;
-    else if (target_fps == 120) denominator = 4u;
-    else if (target_fps == 240) denominator = 8u;
-    else return 0;
+    /* Any target in 30..240 works: the pool holds ceil(hz/30) phases and
+     * the presenter samples phases per tick (no fixed multiples needed).
+     * 0 keeps its legacy 60 meaning. Pool capacity caps at denominator 8. */
+    if (target_fps == 0) target_fps = 60;
+    if (target_fps < 30 || target_fps > 240) return 0;
+    denominator = ((unsigned int)target_fps + 29u) / 30u;
+    if (denominator < 1u) denominator = 1u;
+    if (denominator > GL_NATIVE_MOTION_PHASE_CAPACITY + 1u)
+        denominator = GL_NATIVE_MOTION_PHASE_CAPACITY + 1u;
     phase_count = denominator - 1u;
     if (denominator == s_native_interpolation_denominator) {
         return 1;
@@ -14749,7 +14745,9 @@ int gl_renderer_set_native_interpolation_fps(int target_fps) {
     }
     s_native_interpolation_denominator = denominator;
     s_native_interpolation_phase_count = phase_count;
-    apply_swap_interval();
+    s_native_interpolation_target_fps = target_fps;
+    /* No interval call here: main owns cadence (present_effective_swap_interval)
+     * and re-applies after every target change. */
     return 1;
 
 rollback_growth:
@@ -14766,8 +14764,10 @@ int gl_renderer_native_interpolation_fps(void) {
     return (int)s_native_interpolation_denominator * 30;
 }
 
-int gl_renderer_last_present_path(void) {
-    return s_last_present_path;
+/* True target as requested (75/144/165 survive; the denominator getter
+ * above only reports pool sizing in 30 Hz units). */
+int gl_renderer_native_interpolation_target_fps(void) {
+    return s_native_interpolation_target_fps;
 }
 
 void gl_renderer_native_shutdown(void) {

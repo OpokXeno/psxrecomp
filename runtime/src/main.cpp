@@ -1540,7 +1540,7 @@ extern "C" void psx_smooth_60fps_set(int enabled) {
 }
 
 static void set_video_fps(int fps) {
-    g_video_fps = fps == 60 || fps == 120 || fps == 240 ? fps : 30;
+    g_video_fps = (fps >= 30 && fps <= 240) ? fps : 30;
     g_native_interpolation_fps = g_video_fps >= 60 ? g_video_fps : 60;
     psx_smooth_60fps_set(g_video_fps >= 60);
 }
@@ -1747,11 +1747,13 @@ extern "C" int psx_frame_interpolation_enabled(void) {
  * (no invented phases) on 60 Hz ticks — the output follows the guest.
  * Forcing 33 ms ticks would halve battle to 30. */
 extern "C" int psx_native_semantic_fps_set(int fps) {
-    uint64_t period_ns;
-    if (fps != 30 && fps != 60 && fps != 120 && fps != 240) return 0;
-    if (fps == 120) period_ns = 8333333u;
-    else if (fps == 240) period_ns = 4166667u;
-    else period_ns = 16666667u;
+    if (fps < 30 || fps > 240) return 0;
+    /* 30 ("Original") and 60 tick at 60 Hz: 30 means the game's designed
+     * cadence (denominator 1, no invented phases) on 60 Hz ticks. Above
+     * 60 the period is the target rate itself. */
+    const uint64_t period_ns = (fps == 30 || fps == 60)
+        ? UINT64_C(16666667)
+        : (UINT64_C(1000000000) + (uint64_t)fps / 2u) / (uint64_t)fps;
     if (!gl_renderer_set_native_interpolation_fps(fps))
         return 0;
     g_native_interpolation_fps = fps;
@@ -1759,6 +1761,8 @@ extern "C" int psx_native_semantic_fps_set(int fps) {
         !xg_render_presentation_host_set_period(
             g_native_render_presentation_host, period_ns))
         return -1;
+    /* Re-resolve user x target x panel now that the denominator moved. */
+    apply_present_cadence();
     return 1;
 }
 
@@ -3584,23 +3588,54 @@ extern "C" int psx_present_vsync_owns_cadence(void) {
     return present_vsync_owns_cadence();
 }
 
+/* Native-path swap interval from user preference x target x panel.
+ * HARD RULE: blocking intervals only at target <= 60. Swaps run on the
+ * thread that also runs the guest fibers; a blocking swap consumes its
+ * tick period, and above 60 Hz ticks subdivide guest frames (no frame-end
+ * idle left to borrow) — the guest starves and vblanks decay to 0 (seen
+ * at 240 on a 240 Hz panel, and fps>75 on a 75 Hz panel). At <= 60 the
+ * ticks align with frame boundaries and borrow frame-end idle safely.
+ * Within that rule: divisor targets pace by hardware (tear-free),
+ * non-divisors go immediate + host-period pacing (pump due-gates every
+ * tick; compositor/VRR decides what reaches the eye). User Off forces
+ * immediate everywhere (30 still reads as 30 via duplicate wholes).
+ * Adaptive maps to -1 only for 1:1 (SDL has no adaptive divisor).
+ * Panel unknown keeps the legacy target-only behavior. Returns -2 to
+ * fall through to the generic path. */
+static int native_present_interval(void) {
+    /* True target (main-owned); the GL getter reports pool sizing in
+     * 30 Hz units and lies for 75/144/165. */
+    const int native_fps = g_native_interpolation_fps;
+    if (native_fps > 60)
+        return 0;
+    if (native_fps > 0 && g_video_vsync != 0 && g_host_refresh_hz > 0.0) {
+        const double panel = g_host_refresh_hz;
+        const double exact = panel / (double)native_fps;
+        const int divisor = (int)(exact + 0.5);
+        if (divisor >= 1 &&
+            std::fabs(panel - (double)native_fps * divisor) <= panel * 0.01)
+            return (g_video_vsync < 0 && divisor == 1) ? -1 : divisor;
+        return 0;
+    }
+    if (native_fps > 0 && native_fps <= 30)
+        return 2;
+    if (native_fps >= 120)
+        return 0;
+    return -2;
+}
+
 static int present_effective_swap_interval(void) {
     if (g_netplay_vsync_forced_off || psx_netplay_active())
         return 0;
     if (g_frame_interpolation)
         return 0;
     /* Native semantic target owns the present cadence on the GL native
-     * path (the Toggles selector only wrote the denominator before, so
-     * every setting presented at 60): 30 -> swap every 2nd vsync on a
-     * 60 Hz panel; 120/240 -> immediate, the midpoint worker emits the
-     * extra phases itself. Matches gpu_gl_renderer's apply_swap_interval
-     * (0 past denominator 2) so neither side stomps the other. */
+     * path; the interval itself follows user x target x panel (see
+     * native_present_interval), so neither side stomps the other. */
     if (g_native_render_selected && g_gl_active) {
-        int native_fps = gl_renderer_native_interpolation_fps();
-        if (native_fps > 0 && native_fps <= 30)
-            return 2;
-        if (native_fps >= 120)
-            return 0;
+        const int native_interval = native_present_interval();
+        if (native_interval != -2)
+            return native_interval;
     }
     if (g_frame_period_ms <= 0.0)
         return 0;

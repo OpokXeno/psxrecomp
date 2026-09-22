@@ -12,7 +12,9 @@ extern "C" {
 #endif
 
 #define GPU_SEMANTIC_WORKLOAD_CAPACITY 4096u
-#define GPU_SEMANTIC_INTERPOLATION_MAX_PHASES 7u
+/* 16 phases (denominator 16): covers 240 Hz ticks over ~66 ms guest
+ * intervals (15 fps zones). Arrays, validators and FBO pools derive. */
+#define GPU_SEMANTIC_INTERPOLATION_MAX_PHASES 15u
 
 typedef enum GpuSemanticWorkloadStatus {
     GPU_SEMANTIC_WORKLOAD_OK = 0,
