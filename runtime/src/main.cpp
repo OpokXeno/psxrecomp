@@ -2242,7 +2242,8 @@ static void update_adaptive_widescreen() {
     }
 
     const bool wide = num * 3 != den * 4;
-    if (g_native_render_widescreen)
+    g_native_render_widescreen = g_native_render_selected && wide;
+    if (g_native_render_selected)
         gpu_ws_configure_native_cull(wide, num, den, 320, 240);
 
     if (g_ws_engaged) {
@@ -2253,11 +2254,14 @@ static void update_adaptive_widescreen() {
         gpu_ws_configure(mode != 0 ? num : 4, mode != 0 ? den : 3,
                           g_ws_anchor_addr,
                           g_ws_hud_sprt ? 1 : 0, mode);
-        if (g_native_render_widescreen) {
+        if (g_native_render_selected) {
+            /* The Native view is the subpixel presentation surface, not only
+             * the widescreen widen: at 4:3 it keeps the canonical width with a
+             * zero reveal so gameplay keeps the source-space projection. */
             (void)psx_xg_render_auth_configure_native_view(
-                wide, (uint16_t)num, (uint16_t)den, 320u, 240u);
+                1, (uint16_t)num, (uint16_t)den, 320u, 240u);
             (void)gl_renderer_configure_native_view(
-                wide ? 1 : 0, num, den, 320, 240);
+                1, num, den, 320, 240);
         }
     }
     refresh_widescreen_projection();
@@ -2322,12 +2326,13 @@ extern "C" int psx_video_set_aspect_runtime(int num, int den, int native_wide) {
     if (!psx_debug_display_aspect(num, den, 0))
         return 0;
     const bool wide = num * 3 != den * 4;
-    if (g_native_render_widescreen) {
+    g_native_render_widescreen = g_native_render_selected && wide;
+    if (g_native_render_selected) {
         gpu_ws_configure_native_cull(wide, num, den, 320, 240);
         (void)psx_xg_render_auth_configure_native_view(
-            wide, (uint16_t)num, (uint16_t)den, 320u, 240u);
+            1, (uint16_t)num, (uint16_t)den, 320u, 240u);
         (void)gl_renderer_configure_native_view(
-            wide ? 1 : 0, num, den, 320, 240);
+            1, num, den, 320, 240);
     }
     refresh_widescreen_projection();
     return 1;
@@ -8429,12 +8434,15 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
 
         /* Native-wide present: on a game frame, Native View is the only valid
          * presentation path. FMV/menu frames stay 4:3, but gameplay must never
-         * silently fall back to the canonical VRAM present. */
+         * silently fall back to the canonical VRAM present. The view exists at
+         * the canonical aspect too (zero reveal), so this is not gated on the
+         * widescreen request: 4:3 gameplay presents the same source-space
+         * subpixel surface instead of the integer canonical raster. */
         const bool native_stream_enabled = guest_render_native_stream_enabled();
         if (g_native_render_widescreen && g_ws_engaged && native_stream_enabled)
             s_native_wide_gameplay_started = true;
         const bool native_view_present =
-            g_native_render_widescreen && native_stream_enabled &&
+            g_native_render_selected && native_stream_enabled &&
             !fmv_frame && !di.depth24 && g_gl_active &&
             !local_viewport_crop && gl_renderer_native_view_width() > 0;
         const bool native_wide_game_frame =
@@ -17256,8 +17264,12 @@ session_reboot:
         gte_native_provenance_set_render_nclip_filter([](uint32_t pc) -> int {
             const uint32_t physical = pc & 0x1fffffffu;
             /* The text gate takes a dispatcher entry, not an interior GTE PC.
-             * This is the same resident owner used by model source capture. */
-            return g_native_render_widescreen && physical >= 0x2c700u && physical < 0x315a0u &&
+             * This is the same resident owner used by model source capture.
+             * The exact NCLIP sign is a precision fix, not a widescreen one:
+             * the integer MAC0 rounds a nearly edge-on face to zero and the
+             * guest's own backface branch then flickers. Apply it whenever the
+             * native render owns the frame, at 4:3 as well. */
+            return g_native_render_selected && physical >= 0x2c700u && physical < 0x315a0u &&
                 xg_render_host_native_text_authorizes_pc(0x8002c700u);
         });
         ram_provenance_set_cpu_tracking(g_native_render_selected);
@@ -17337,15 +17349,16 @@ session_reboot:
                          "psxrecomp: native render authentication runtime configuration failed\n");
             return 1;
         }
+        const bool native_view_requested =
+            render_mode == GUEST_RENDER_RENDER_NATIVE && g_gl_active;
         g_native_render_widescreen =
-            render_mode == GUEST_RENDER_RENDER_NATIVE && wide_requested &&
-            g_gl_active;
+            native_view_requested && wide_requested;
         if (!psx_xg_render_auth_configure_native_view(
-                g_native_render_widescreen,
+                native_view_requested,
                 (uint16_t)g_video_aspect_num, (uint16_t)g_video_aspect_den,
                 320u, 240u) ||
             !gl_renderer_configure_native_view(
-                g_native_render_widescreen ? 1 : 0,
+                native_view_requested ? 1 : 0,
                 g_video_aspect_num, g_video_aspect_den, 320, 240)) {
             std::fprintf(stderr,
                          "psxrecomp: Native widescreen initialization failed\n");

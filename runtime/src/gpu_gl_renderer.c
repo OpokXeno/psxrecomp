@@ -12268,7 +12268,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     if (audit->header.display_boundary) {
         const int use_view = !display->depth24 && views->width &&
             display->width == views->width - 2u * views->offset &&
-            (uint32_t)display->aspect_num * views->reference_height >
+            (uint32_t)display->aspect_num * views->reference_height >=
                 (uint32_t)display->aspect_den * display->width;
         const uint32_t storage_width = use_view ? views->width : display->width;
         int row_views[VRAM_H];
@@ -17627,17 +17627,19 @@ int gl_renderer_configure_native_view(int enabled, int aspect_num,
     if (!enabled) return 1;
     if (aspect_num <= 0 || aspect_den <= 0 || canonical_width <= 0 ||
         canonical_height <= 0 ||
-        aspect_num * canonical_height <= aspect_den * canonical_width)
+        aspect_num * canonical_height < aspect_den * canonical_width)
         return 0;
     /* Keep the synthetic reveal symmetric in integer raster space. An odd
      * rounded width (427 for 320x240 at 16:9) leaves one extra column on one
      * side and makes a switch from the legacy 426-wide compositor visibly
      * translate the scene. The centered raster surface is the shared geometry
-     * contract for the legacy and producer-driven Native paths. */
+     * contract for the legacy and producer-driven Native paths. The canonical
+     * aspect is the degenerate reveal: a canonical-width surface, offset zero,
+     * which still presents the source-space subpixel geometry at 4:3. */
     width = ((int64_t)canonical_height * aspect_num + aspect_den / 2) /
             aspect_den;
     if (((width - canonical_width) & 1) != 0) --width;
-    if (width <= canonical_width || width > VRAM_W) return 0;
+    if (width < canonical_width || width > VRAM_W) return 0;
     s_native_view_width = (int)width;
     s_native_view_offset = ((int)width - canonical_width) / 2;
     s_native_view_canonical_width = canonical_width;
