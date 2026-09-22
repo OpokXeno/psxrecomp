@@ -5048,6 +5048,12 @@ void psx_debug_overlay_pre_swap(void)
     psx_debug_overlay_pre_swap_target(0u);
 }
 
+void psx_debug_overlay_post_swap(int completed)
+{
+    if (!completed && s_present_count > s_present_last)
+        s_present_count--;
+}
+
 /* ---- widget action hook (debug-only, TCP-driven) ----------------------- */
 
 int psx_debug_overlay_widget_action(const char *name, int value, int value2)

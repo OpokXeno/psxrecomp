@@ -46,6 +46,12 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer);
 /* Default-framebuffer wrapper retained for the normal present paths. */
 void psx_debug_overlay_pre_swap(void);
 
+/* Post-swap correction: pre_swap counts every attempt (including blocked
+ * ones), so FPS (presented) would read high whenever attempts don't
+ * complete. The worker path reports its result; uncompleted attempts are
+ * subtracted back. Second-boundary skew is +-1 frame. */
+void psx_debug_overlay_post_swap(int completed);
+
 /* True when the overlay is visible AND wants exclusive keyboard focus
  * (e.g. a text field is being edited). The game must skip its own key
  * dispatch for as long as this is true. */
@@ -226,6 +232,7 @@ static inline bool psx_debug_overlay_is_visible(void) { return false; }
 static inline bool psx_debug_overlay_process_event(const SDL_Event *e) { (void)e; return false; }
 static inline void psx_debug_overlay_pre_swap_target(unsigned int f) { (void)f; }
 static inline void psx_debug_overlay_pre_swap(void) { psx_debug_overlay_pre_swap_target(0u); }
+static inline void psx_debug_overlay_post_swap(int c) { (void)c; }
 static inline bool psx_debug_overlay_swallow_keyboard(void) { return false; }
 static inline void psx_debug_overlay_window_shot_arm(const char *p) { (void)p; }
 static inline void psx_debug_overlay_capture_state(int *v, int *wc, int *sw) { (void)v; (void)wc; (void)sw; }

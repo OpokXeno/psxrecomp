@@ -1757,6 +1757,7 @@ extern "C" int psx_native_semantic_fps_set(int fps) {
     if (!gl_renderer_set_native_interpolation_fps(fps))
         return 0;
     g_native_interpolation_fps = fps;
+    psx_smooth_60fps_set(fps >= 60);
     if (g_native_render_selected && g_native_render_presentation_host &&
         !xg_render_presentation_host_set_period(
             g_native_render_presentation_host, period_ns))

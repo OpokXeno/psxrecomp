@@ -11670,8 +11670,23 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         goto finished;
     }
     const uint64_t phase_loop_started = SDL_GetPerformanceCounter();
+    /* Pipeline margin: stop rendering ~2 ticks before the deadline so the
+     * batch publishes while ticks are still early (phases display) instead
+     * of at/past it (every tick due-whole). Phase 0 keeps the raw deadline
+     * (nothing to publish yet); light batches finish before the margin
+     * anyway. */
+    uint64_t phase_stop_ns = 0u;
+    int have_phase_stop = 0;
+    if (deadline_known && temporal_hz != 0u) {
+        const uint64_t tick_ns = UINT64_C(1000000000) / temporal_hz;
+        const uint64_t margin_ns = 2u * tick_ns;
+        phase_stop_ns = deadline_ns > margin_ns ? deadline_ns - margin_ns : 0u;
+        have_phase_stop = 1;
+    }
     for (uint32_t phase = 0u; phase < phase_count; ++phase) {
-        if (deadline_known && SDL_GetTicksNS() >= deadline_ns) {
+        const uint64_t phase_limit_ns =
+            (phase == 0u || !have_phase_stop) ? deadline_ns : phase_stop_ns;
+        if (deadline_known && SDL_GetTicksNS() >= phase_limit_ns) {
             if (phase == 0u) {
                 /* Nothing fit: step the budget down gradually (a single
                  * already-overdue loop may be transient). */
@@ -14320,6 +14335,7 @@ static void native_presenter_swap(void *user_data) {
     (void)psx_wayland_presentation_request(sequence);
     latency_ring_mark(LAT_SWAP_BEGIN);
     swapped = gl_swap_window_private(GL_SWAP_CALLER_NATIVE_PRESENTER);
+    psx_debug_overlay_post_swap(swapped);
     if (swapped) {
         pres_mark_swap_completed(sequence);
         s_probe_swap++;
