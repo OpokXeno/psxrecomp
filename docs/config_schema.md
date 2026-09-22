@@ -119,8 +119,8 @@ respective files.
 | `text_size` | both | hex string, size in bytes of the static region. For games this also bounds main-EXE analysis and establishes the overlay floor. A smaller-than-header bound must be verified non-code and 4 KiB aligned. |
 | `stack_base` | game | hex string, initial `$sp` value for the game |
 | `disc` | game (single-disc) | path to .cue, relative to project root |
-| `discs` | game (multi-disc) | array of .cue paths; `disc` is sugar for `discs = [disc]` |
-| `disc_serials` | game (multi-disc, optional) | array parallel to `discs`: the serial each disc carries (`["SCUS-94163", "SCUS-94164", "SCUS-94165"]`). Without it every disc is checked against `[game] id` — the BOOT disc's serial — so selecting disc 2 reports "wrong disc". A disc with no entry here is not serial-gated; the ISO-header check still applies. |
+| `discs` | game (multi-disc, optional) | array of .cue paths, the build's roster; `disc` is sugar for `discs = [disc]`. Optional when `disc_serials` declares the set (see below) — a distributed `game.toml` should not carry image paths players do not have. |
+| `disc_serials` | game (multi-disc) | the serial each disc carries, in disc order (`["SCUS-94163", "SCUS-94164", "SCUS-94165"]`). With more than one entry it alone declares the set: slots beyond `discs` start unlocated and the player locates each image in the launcher. An image is placed in the slot of the serial it carries (SYSTEM.CNF), whatever its file name, and any disc of the set passes the disc verdict under its own serial. Without it every disc is checked against `[game] id` — the BOOT disc's serial — so selecting disc 2 reports "wrong disc". |
 
 ### Multi-disc selection
 
@@ -139,6 +139,22 @@ selected = 2                               # 1-based index into [game] discs
 or by hand — switches discs even though `path` still points at the previous
 one. That is what makes disc choice manageable like any other setting. Both
 keys are written only for multi-disc titles.
+
+Where the player located every disc lives in `disc.cfg` next to the
+executable: one image per line, in disc order, with an empty line for a disc
+not located yet (a single-disc title's one-line file is the degenerate case).
+The launcher writes it the moment any disc is located, and mounting a disc
+updates only that disc's own line, so locating disc 2 and then playing disc 1
+remembers both. Slots from `disc.cfg` are bound by serial, like a browse.
+
+### Disc hot swap
+
+Debug builds expose an in-game disc change in the debug overlay's **Disc**
+section (and the `overlay_widget_action` `disc_swap` TCP action): it opens the
+new image first (a bad path changes nothing), runs the timed lid open/close
+with that image inserted, re-resolves disc-patching mods for the new disc, and
+switches the per-disc savestate scope. It is refused in netplay. Release builds
+change discs through the launcher's Disc Selection.
 
 ## Recompiler block
 
@@ -554,8 +570,8 @@ to_lo       = "0x..."           # target start offset (phys = phys - from_lo + t
 
 These are noted here so future work knows where to slot them:
 
-- Game `discs` field (Phase D). For now Tomba uses `disc = "..."`.
-- `[runtime] disc_swap_command` — runtime-side disc swap (Phase D).
+- `[runtime] disc_swap_command` — a player-facing runtime disc swap. The
+  mechanism exists (see "Disc hot swap"); only the debug overlay reaches it.
 - `[recompiler] seeds` as an array of paths (currently single file;
   Phase A might allow multiple).
 - `[program] type` explicit discriminator (currently inferred from
