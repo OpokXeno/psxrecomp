@@ -7607,6 +7607,21 @@ static void native_attribute_planes(const XgRenderIrTriangle *triangle,
     }
 }
 
+/* Perspective payload contract for one CPU-rasterized triangle: every vertex
+ * must carry a projective position with a positive view z (the divisor used by
+ * q = 1/z). A partially projected triangle keeps the faithful affine path
+ * instead of blocking the frame, exactly like the GPU vertex weights. */
+static int native_triangle_all_projective(const XgRenderIrTriangle *triangle) {
+    unsigned vertex;
+    if (triangle == NULL) return 0;
+    for (vertex = 0u; vertex < 3u; ++vertex) {
+        const XgRenderIrVertex *current = &triangle->vertices[vertex];
+        if (!current->projective_position || current->projective_view_z <= 0)
+            return 0;
+    }
+    return 1;
+}
+
 static int native_render_draw(GlNativeCpuCompiler *compiler,
                           GlNativeCpuSurface *target,
                           const XgSemanticDrawRecord *draw,
@@ -7800,7 +7815,14 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
         double px[3], py[3], area;
         double edges[3][3];
         int top_left[3];
-        int perspective = !compiler->native_vram && triangle->vertices[0].projective_position;
+        /* The canonical VRAM raster is the guest-visible surface and keeps the
+         * faithful affine sampling. Every presentation surface (native view,
+         * recipe target, compatibility pass) takes the perspective payload when
+         * the triangle carries it, matching the GPU shader path. */
+        int perspective = (compiler->native_vram == NULL ||
+                           target != compiler->native_vram) &&
+            material->textured &&
+            native_triangle_all_projective(triangle);
         int min_x = INT_MAX, min_y = INT_MAX, max_x = INT_MIN, max_y = INT_MIN;
         if (triangle->split_index != ti ||
             triangle->split_count != primitive->triangle_count) {
@@ -10868,10 +10890,21 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
                             vertex->native_view_x = (int32_t)llround(native_x);
                             vertex->native_view_y = (int32_t)llround(native_y);
                         }
-                        /* This owned-VRAM recipe uses affine UVs at endpoints
-                         * AND phases. Do not introduce perspective-only phases
-                         * or reuse endpoint GTE payloads for temporal projection. */
-                        vertex->projective_position = 0u;
+                        /* Perspective sampling must not flip to affine on
+                         * alternate presented frames: an interpolated phase is
+                         * shown next to its endpoint. screen_delta[2] is this
+                         * phase's own continuous view depth, in the same units
+                         * as the GTE mac[2] the endpoints carry, so adopt it
+                         * with the same validity window (0, 0xffff]. Outside
+                         * that window the endpoint would also have cleared the
+                         * flag, so the triangle stays affine. */
+                        if (vertex->projective_position) {
+                            const double depth = screen_delta[t][v][2];
+                            if (depth > 0.0 && depth <= 65535.0)
+                                vertex->projective_view_z = (int32_t)floor(depth);
+                            else
+                                vertex->projective_position = 0u;
+                        }
                         vertex->temporal_depth_valid = 0u;
                     }
                 motion_audit->motion_projected_draws++;
@@ -10891,7 +10924,10 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
                         vertex->native_view_x = (int32_t)((int64_t)vertex->native_view_x + delta[2]);
                         vertex->native_view_y = (int32_t)((int64_t)vertex->native_view_y + delta[3]);
                     }
-                    vertex->projective_position = 0u;
+                    /* The projected payload has no phase-local depth here, so
+                     * the endpoint depth stays; hiding it would make this
+                     * phase sample affine while its endpoint sampled
+                     * perspective. Phases stop being temporal samples. */
                     vertex->temporal_depth_valid = 0u;
                 }
             motion_audit->motion_projected_draws++;
@@ -12609,6 +12645,38 @@ static GLint s_native_gpu_attribute_origin, s_native_gpu_attribute_plane[5], s_n
 static GlNativeGpuPlane s_native_gpu_destination;
 static int s_native_gpu_uniforms[4][4], s_native_gpu_depth_value, s_native_gpu_origin_value[2];
 
+/* Native GPU vertex: position (2), uv (2), color (4), perspective weight (1)
+ * and padding. The weight is the normalized reciprocal view depth (1/z with
+ * the nearest vertex at 1.0); zero selects the faithful affine path. */
+#define GL_NATIVE_GPU_VERTEX_FLOATS 12u
+#define GL_NATIVE_GPU_VERTEX_WEIGHT 8u
+
+/* Perspective weights for one native GPU triangle. Returns 1 and fills
+ * weight[3] only when every vertex carries a valid projective position
+ * (flag set, view z > 0), mirroring the CPU rasterizer's per-triangle
+ * validation; otherwise the triangle stays affine. The weights are scaled so
+ * the nearest vertex is 1.0, which keeps the homogeneous w the vertex shader
+ * derives (w = 1/weight = z/zMin) in a well-conditioned range. */
+static int native_gpu_triangle_weights(const XgRenderIrTriangle *triangle,
+                                       float weight[3]) {
+    int32_t nearest = 0;
+    unsigned vertex;
+    weight[0] = weight[1] = weight[2] = 0.0f;
+    if (triangle == NULL) return 0;
+    for (vertex = 0u; vertex < 3u; ++vertex) {
+        const XgRenderIrVertex *current = &triangle->vertices[vertex];
+        if (!current->projective_position || current->projective_view_z <= 0)
+            return 0;
+        if (nearest == 0 || current->projective_view_z < nearest)
+            nearest = current->projective_view_z;
+    }
+    if (nearest == 0) return 0;
+    for (vertex = 0u; vertex < 3u; ++vertex)
+        weight[vertex] = (float)nearest /
+            (float)triangle->vertices[vertex].projective_view_z;
+    return 1;
+}
+
 static void native_gpu_uniform4(unsigned group, GLint location, int a, int b, int c, int d) {
     const int value[4] = {a,b,c,d};
     if (!memcmp(s_native_gpu_uniforms[group],value,sizeof(value))) return;
@@ -12618,13 +12686,22 @@ static void native_gpu_uniform4(unsigned group, GLint location, int a, int b, in
 static const char *NATIVE_GPU_VS =
     "#version 330\n"
     "layout(location=0) in vec2 p; layout(location=1) in vec2 uv; layout(location=2) in vec4 c;\n"
+    "layout(location=3) in float q;   /* reciprocal-z weight; 0 = affine */\n"
     "uniform vec4 size; noperspective out vec2 t; noperspective out vec4 color;\n"
-    "void main(){t=uv; color=c; gl_Position=vec4((p+size.z)/size.xy*2.0-1.0,0,1);}\n";
+    /* t_p is a smooth varying: setting the homogeneous w from the weight makes
+     * the rasterizer divide it by 1/w, which is exactly the perspective-correct
+     * interpolation V = sum(li*Vi*wi)/sum(li*wi) with wi proportional to view z. */
+    "smooth out vec2 t_p; flat out int persp;\n"
+    "void main(){t=uv; t_p=uv; color=c; persp=q>0.0?1:0;\n"
+    "  float w=q>0.0?1.0/q:1.0;\n"
+    /* Scaling both x/y and w leaves the NDC position unchanged, so coverage is
+     * identical to the affine path; only the varying interpolation changes. */
+    "  gl_Position=vec4(((p+size.z)/size.xy*2.0-1.0)*w,0.0,w);}\n";
 static const char *NATIVE_GPU_FS =
     "#version 330\n"
     "uniform usampler2D words; uniform sampler2D source_image,destination;\n"
     "uniform ivec4 state,flags,page,window; uniform int depth; uniform ivec2 origin;\n"
-    "uniform vec4 size,constant_color; noperspective in vec2 t; noperspective in vec4 color; out vec4 result;\n"
+    "uniform vec4 size,constant_color; noperspective in vec2 t; smooth in vec2 t_p; flat in int persp; noperspective in vec4 color; out vec4 result;\n"
     "uniform vec4 attribute_origin; uniform vec4 attribute_plane[5]; uniform ivec4 attribute_dda[5];\n"
     "float attribute_at(int a){\n"
     " if(attribute_origin.z==1.0){\n"
@@ -12644,7 +12721,8 @@ static const char *NATIVE_GPU_FS =
     " ivec3 c=ivec3(clamp(rgb,0.0,255.0)); int mask=flags.x,blend=state.z;\n"
     " const int d[16]=int[16](-4,0,-3,1,2,-2,3,-1,-3,1,-4,0,3,-1,2,-2);\n"
     " ivec2 dp=ivec2(floor(gl_FragCoord.xy/size.w))+origin; int bias=flags.z!=0?d[(dp.y&3)*4+(dp.x&3)]:0;\n"
-    " if(state.x!=0){ivec2 q=ivec2(mod(vec2(attribute_at(0),attribute_at(1)),256.0))&255; q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
+    " if(state.x!=0){vec2 uvs=persp!=0?t_p:vec2(attribute_at(0),attribute_at(1));\n"
+    "  ivec2 q=ivec2(mod(uvs,256.0))&255; q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
     "  int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));\n"
     "  if(depth<2){int index=depth==0?(w>>((q.x&3)*4))&15:(w>>((q.x&1)*8))&255; w=word_at(page.zw+ivec2(index,0));}\n"
     "  if(w==0)discard; ivec3 tex=ivec3(w,w>>5,w>>10)&31; int stp=(w>>15)&1; mask|=stp; blend&=stp;\n"
@@ -12687,9 +12765,11 @@ static int native_gpu_program_init(void) {
     p_glGenVertexArrays(1, &s_native_gpu_vao); p_glGenBuffers(1, &s_native_gpu_vbo);
     p_glBindVertexArray(s_native_gpu_vao); p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_native_gpu_vbo);
     p_glEnableVertexAttribArray(0); p_glEnableVertexAttribArray(1); p_glEnableVertexAttribArray(2);
-    p_glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,8*sizeof(float),(void *)0);
-    p_glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,8*sizeof(float),(void *)(2*sizeof(float)));
-    p_glVertexAttribPointer(2,4,GL_FLOAT,GL_FALSE,8*sizeof(float),(void *)(4*sizeof(float)));
+    p_glEnableVertexAttribArray(3);
+    p_glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,GL_NATIVE_GPU_VERTEX_FLOATS*sizeof(float),(void *)0);
+    p_glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,GL_NATIVE_GPU_VERTEX_FLOATS*sizeof(float),(void *)(2*sizeof(float)));
+    p_glVertexAttribPointer(2,4,GL_FLOAT,GL_FALSE,GL_NATIVE_GPU_VERTEX_FLOATS*sizeof(float),(void *)(4*sizeof(float)));
+    p_glVertexAttribPointer(3,1,GL_FLOAT,GL_FALSE,GL_NATIVE_GPU_VERTEX_FLOATS*sizeof(float),(void *)(GL_NATIVE_GPU_VERTEX_WEIGHT*sizeof(float)));
     p_glUseProgram(s_native_gpu_program);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"words"),0);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"destination"),1);
@@ -12745,11 +12825,15 @@ static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uin
 }
 
 static void native_gpu_draw_vertex_data(const GlNativeGpuCommand *command,
-                                       uint32_t triangle, float data[6][8]) {
+                                       uint32_t triangle,
+                                       float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]) {
     const XgSemanticDrawRecord *draw = &command->draw;
     const XgRenderIrMaterialState *m = &draw->primitive.material;
     const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
-    memset(data, 0, 6u * 8u * sizeof(float));
+    float weight[3];
+    const int perspective = !lines && m->textured != 0u &&
+        native_gpu_triangle_weights(&draw->primitive.triangles[triangle], weight);
+    memset(data, 0, 6u * GL_NATIVE_GPU_VERTEX_FLOATS * sizeof(float));
     for (unsigned v = 0; v < (lines ? 2u : 3u); ++v) {
         const XgRenderIrVertex *iv = lines ? NULL : &draw->primitive.triangles[triangle].vertices[v];
         const GpuRenderSemanticVertex *lv = lines ? &draw->lines[triangle].vertices[v] : NULL;
@@ -12761,10 +12845,11 @@ static void native_gpu_draw_vertex_data(const GlNativeGpuCommand *command,
         data[v][4] = lines ? draw->lines[triangle].vertices[c].r : draw->primitive.triangles[triangle].vertices[c].r;
         data[v][5] = lines ? draw->lines[triangle].vertices[c].g : draw->primitive.triangles[triangle].vertices[c].g;
         data[v][6] = lines ? draw->lines[triangle].vertices[c].b : draw->primitive.triangles[triangle].vertices[c].b;
+        if (perspective) data[v][GL_NATIVE_GPU_VERTEX_WEIGHT] = weight[v];
     }
 }
 
-static void native_gpu_line_vertex_data(float data[6][8]) {
+static void native_gpu_line_vertex_data(float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]) {
     /* Unit-width geometry including both authored endpoints. */
     float a[8], b[8]; memcpy(a,data[0],sizeof(a));memcpy(b,data[1],sizeof(b));
     const float dx=b[0]-a[0],dy=b[1]-a[1],length=hypotf(dx,dy);
@@ -12797,8 +12882,8 @@ static int native_gpu_upload_vertex_slice(const GlNativeGpuWork *work,
         count += n;
     }
     if (!count) return 1;
-    if (count > SIZE_MAX / (8u * sizeof(float))) return 0;
-    float (*vertices)[8] = malloc(count * sizeof(*vertices));
+    if (count > SIZE_MAX / (GL_NATIVE_GPU_VERTEX_FLOATS * sizeof(float))) return 0;
+    float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOATS] = malloc(count * sizeof(*vertices));
     if (!vertices) return 0;
     size_t cursor = 0u;
     for (uint32_t i = begin; i < end; ++i) {
@@ -12809,7 +12894,7 @@ static int native_gpu_upload_vertex_slice(const GlNativeGpuWork *work,
             const int lines = command->draw.topology == GPU_RENDER_SEMANTIC_LINES;
             const uint32_t stride = lines ? 6u : 3u;
             for (uint32_t t = 0; t < n / stride; ++t) {
-                float data[6][8];
+                float data[6][GL_NATIVE_GPU_VERTEX_FLOATS];
                 native_gpu_draw_vertex_data(command, t, data);
                 if (lines) native_gpu_line_vertex_data(data);
                 memcpy(vertices + cursor, data, stride * sizeof(*vertices));
@@ -12826,7 +12911,7 @@ static int native_gpu_upload_vertex_slice(const GlNativeGpuWork *work,
                 v1=(float)((command->sy+command->sh)*work->scale)/source->height;
             }
             const float x=command->x,y=command->y,r=x+command->w,b=y+command->h;
-            const float data[6][8]={{x,y,u0,v0},{r,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{r,y,u1,v0},{r,b,u1,v1}};
+            const float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]={{x,y,u0,v0},{r,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{r,y,u1,v0},{r,b,u1,v1}};
             memcpy(vertices + cursor, data, sizeof(data));
             cursor += 6u;
         }
@@ -12849,7 +12934,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
         const XgRenderIrMaterialState *m=&draw->primitive.material;
         const int lines=draw->topology==GPU_RENDER_SEMANTIC_LINES;
         for (uint32_t t=0;t<(lines?draw->line_count:draw->primitive.triangle_count);++t) {
-            float data[6][8]={{0}};
+            float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]={{0}};
             GlNativeAttributePlanes attributes;
             double attribute_x[3],attribute_y[3];
             int left=m->draw_area_left,top=(int)m->draw_area_top-command->y;
