@@ -294,6 +294,47 @@ bool sha256_file(const std::filesystem::path& path, std::string& out,
     return true;
 }
 
+/* SHA-256 of the disc's boot PS-X EXE (SYSTEM.CNF `BOOT = cdrom:\\NAME;1`),
+ * or "" when it cannot be read. Each disc of a set boots its own EXE, so this
+ * is the program identity of the disc being committed, where the loose EXE
+ * passed to mod_runtime_initialize only names the build's boot disc (and is
+ * absent from release installs). */
+std::string boot_exe_sha256(PS1::ISOReader& disc) {
+    uint8_t cnf[2048] = {0};
+    const size_t cnf_size = disc.ReadFile("SYSTEM.CNF", cnf, sizeof(cnf) - 1);
+    if (cnf_size == 0) return {};
+    const std::string text((const char*)cnf, cnf_size);
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    size_t at = lower.find("cdrom:");
+    if (at == std::string::npos) return {};
+    at += 6;
+    while (at < text.size() && (text[at] == '\\' || text[at] == '/')) ++at;
+    std::string name;
+    while (at < text.size() && text[at] != ';' && text[at] != '\r' &&
+           text[at] != '\n' && text[at] != ' ' && text[at] != '\t' &&
+           text[at] != '\0' && name.size() < 64)
+        name += text[at++];
+    const size_t slash = name.find_last_of("\\/");
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    PS1::ISOFileEntry entry;
+    if (name.empty() || !disc.FindFile(name, entry) || entry.size == 0 ||
+        entry.size > 8u * 1024u * 1024u)
+        return {};
+    std::vector<uint8_t> exe(entry.size);
+    if (disc.ReadFile(name, exe.data(), exe.size()) != exe.size()) return {};
+    psx_sha256_ctx hash;
+    psx_sha256_init(&hash);
+    psx_sha256_update(&hash, exe.data(), exe.size());
+    uint8_t digest[32];
+    psx_sha256_final(&hash, digest);
+    std::ostringstream hex;
+    for (uint8_t byte : digest)
+        hex << std::hex << std::setw(2) << std::setfill('0') << (unsigned)byte;
+    return hex.str();
+}
+
 void sha256_u32(psx_sha256_ctx& hash, uint32_t value) {
     const uint8_t bytes[4] = {
         static_cast<uint8_t>(value),
@@ -1396,8 +1437,15 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path,
         s.verified_disc_required = false;
         s.disc_enabled = false;
     }
+    /* Resolve against the committed disc's own boot EXE: disc 2 of a set
+     * boots a different program image than the loose EXE of the build. */
+    std::string exe_sha256 = s.exe_sha256;
+    if (verified_reader) {
+        const std::string disc_exe = boot_exe_sha256(*verified_reader);
+        if (!disc_exe.empty()) exe_sha256 = disc_exe;
+    }
     ModResolution plan =
-        s.manager.resolve(s.game_id, s.exe_sha256, digest);
+        s.manager.resolve(s.game_id, exe_sha256, digest);
     if (!plan.ok) {
         s.validation = plan;
         s.error.clear();
