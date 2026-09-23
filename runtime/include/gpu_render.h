@@ -123,6 +123,24 @@ typedef struct GpuRenderMaterial {
     uint8_t mask_check;
 } GpuRenderMaterial;
 
+/* HD texture replacement decision for one textured draw, made in guest order
+ * against the upload tracker (see hd_texture_runtime.h). A page texel (u, v)
+ * of the draw lives at upload texel (u + texel_offset_u, v + texel_offset_v);
+ * the replacement image covers the whole texel_width x texel_height upload at
+ * any resolution. lim is the draw's inclusive sampled page-texel rectangle
+ * (lo_u, lo_v, hi_u, hi_v). Host presentation only; never guest state. */
+typedef struct GpuRenderHdTexture {
+    uint32_t texture_hash;
+    uint32_t palette_hash;
+    int32_t texel_offset_u;
+    int32_t texel_offset_v;
+    uint16_t texel_width;
+    uint16_t texel_height;
+    uint8_t lim[4];
+    uint8_t valid;
+    uint8_t reserved[3];
+} GpuRenderHdTexture;
+
 typedef struct GpuRenderSemanticVertex {
     GpuRenderFixed16_16 x;
     GpuRenderFixed16_16 y;
@@ -430,6 +448,17 @@ void gr_vram_prepare_read(int x, int y, int w, int h);
 void gr_vram_write(int x, int y, uint16_t pixel);
 uint16_t gr_vram_read(int x, int y);
 void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data);
+
+/* Observer of completed VRAM mutations routed through this facade: CPU->VRAM
+ * uploads (including whole-VRAM restores), VRAM->VRAM copies and fills. Used
+ * by HD texture replacement to track where uploaded textures live. NULL
+ * members are skipped; NULL clears the table. */
+typedef struct GrVramObserver {
+    void (*upload)(int x, int y, int w, int h, const uint16_t *pixels);
+    void (*copy)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
+    void (*fill)(int x, int y, int w, int h);
+} GrVramObserver;
+void gr_set_vram_observer(const GrVramObserver *observer);
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *data);
 
 /* Draw area / offset */

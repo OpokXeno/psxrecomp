@@ -104,6 +104,7 @@ static int      s_vram_mirror_valid;
 static uint32_t s_last_vram_dirty_rows;
 static int      s_last_vram_incremental;
 static BootStateNativeCheckpointHooks s_native_checkpoint_hooks;
+static BootStateHdTextureHooks s_hd_texture_hooks;
 static int (*s_save_service_hook)(void);
 static int s_save_service_busy;
 static int (*s_save_consumer_perf_hook)(char *, int);
@@ -180,6 +181,17 @@ void boot_state_set_native_checkpoint_hooks(
 {
     s_native_checkpoint_hooks = hooks != NULL
         ? *hooks : (BootStateNativeCheckpointHooks){0};
+}
+
+void boot_state_set_hd_texture_hooks(const BootStateHdTextureHooks *hooks)
+{
+    s_hd_texture_hooks = hooks != NULL
+        ? *hooks : (BootStateHdTextureHooks){0};
+}
+
+static int hd_texture_hooks_installed(void) {
+    return s_hd_texture_hooks.bytes && s_hd_texture_hooks.write &&
+        s_hd_texture_hooks.read && s_hd_texture_hooks.reset;
 }
 
 void boot_state_set_save_service_hook(int (*hook)(void))
@@ -722,7 +734,8 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (!identity) return 0;
     memcpy(h.game_sha256, identity->game_sha256, sizeof(h.game_sha256));
     memcpy(h.manifest_sha256, identity->manifest_sha256, sizeof(h.manifest_sha256));
-    h.section_count = 18 + (psx_mod_memory_snapshot_bytes() ? 1u : 0u);
+    h.section_count = 18 + (psx_mod_memory_snapshot_bytes() ? 1u : 0u) +
+        (hd_texture_hooks_installed() ? 1u : 0u);
 
     ok = write_header_le(o, &h);
 
@@ -828,6 +841,10 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
             free(db);
         }
     }
+    /* Last, so a load applies it after BS_SEC_VRAM has rebased the tracker. */
+    if (ok && hd_texture_hooks_installed())
+        ok = write_module_section(o, BS_SEC_HD_TEXTURE, s_hd_texture_hooks.bytes,
+                                  s_hd_texture_hooks.write);
     return ok;
 }
 
@@ -1134,6 +1151,9 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         return gpu_snapshot_read(p, len);
     case BS_SEC_VRAM: {
         if (len != VRAM_SIZE) return 0;
+        /* Every upload the tracker knew is gone; BS_SEC_HD_TEXTURE (written
+         * after this section) restores the saved timeline's residency. */
+        if (hd_texture_hooks_installed()) s_hd_texture_hooks.reset();
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
         /* Wire == host layout: upload straight from the section buffer. */
         gr_vram_transfer_in(0, 0, VRAM_W, VRAM_H, (const uint16_t*)p);
@@ -1205,6 +1225,9 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
     }
     case BS_SEC_MODMEM:
         return psx_mod_memory_snapshot_read(p, len);
+    case BS_SEC_HD_TEXTURE:
+        /* Host metadata: a state carrying it loads fine without the hooks. */
+        return !hd_texture_hooks_installed() || s_hd_texture_hooks.read(p, len);
     case BS_SEC_ICACHE: {
         PstR r;
         if (len != 1024u * 4u) return 0;
@@ -1603,7 +1626,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         }
         cur += 16u;
         if (section->tag == 0u || section->tag >= 32u ||
-            (required & (1u << section->tag)) == 0u ||
+            ((required | (1u << BS_SEC_HD_TEXTURE)) &
+             (1u << section->tag)) == 0u ||
             (seen & (1u << section->tag)) != 0u ||
             len > BOOT_STATE_MAX_BYTES || (uint64_t)(end - cur) < len) {
             ok = 0;

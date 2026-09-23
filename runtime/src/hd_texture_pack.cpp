@@ -56,7 +56,8 @@ constexpr size_t kMaxTrackingStateBytes = size_t{8} * 1024 * 1024;
 constexpr uint32_t kMaxTrackingStateUploads = 8192;
 constexpr uint32_t kMaxTrackingStateFragments = 262144;
 #ifndef HD_TEXTURE_PACK_DISABLE_PNG_DECODE
-constexpr size_t kMaxDecodeQueue = 32;
+constexpr size_t kMaxDecodeQueue = 256;
+constexpr unsigned kDecodeWorkers = 3;
 constexpr size_t kMaxPngFileBytes = size_t{64} * 1024 * 1024;
 #endif
 
@@ -454,7 +455,7 @@ struct DecodeCache {
     std::condition_variable wake;
     std::unordered_map<uint64_t, DecodeItem> items;
     std::deque<uint64_t> queue;
-    std::thread worker;
+    std::vector<std::thread> workers;
     size_t budget = kDefaultDecodeBudget;
     size_t used = 0;
     uint64_t tick = 0;
@@ -467,7 +468,8 @@ struct DecodeCache {
             stop = true;
         }
         wake.notify_all();
-        if (worker.joinable()) worker.join();
+        for (std::thread& worker : workers)
+            if (worker.joinable()) worker.join();
     }
 };
 
@@ -660,6 +662,9 @@ struct HdTexturePack {
      * larger after invalidation, but is reset with tracking and therefore can
      * only cause extra work, never a missed invalidation. */
     Rect upload_bounds{};
+    /* texture hash -> every palette hash the pack ships for it. Uploads whose
+     * hash is absent here can never be replaced, so they are not tracked. */
+    std::unordered_map<uint32_t, std::vector<uint32_t>> palettes_by_texture;
     DecodeCache decode;
 };
 
@@ -768,113 +773,187 @@ void upload_index_collect(const HdTexturePack* pack,
                        out_serials->end());
 }
 
+struct ScannedRoot {
+    std::string asset_root;
+    std::string replacement_root;
+    std::unordered_map<uint64_t, EntryRecord> entries;
+    size_t replacement_file_count = 0;
+    size_t logical_mapping_count = 0;
+};
+
+/* Accepts, in order of preference:
+ *   the Beetle replacement directory itself (numeric PNGs directly inside),
+ *   a directory holding exactly one *-texture-replacements child (with or
+ *   without Hashes.ini beside it) - the layout packs ship in. */
+static bool scan_root(const char* selected, ScannedRoot* out, std::string* message) {
+    std::error_code ec;
+    fs::path input = fs::absolute(fs::u8path(selected), ec).lexically_normal();
+    if (ec || !fs::is_directory(input, ec)) {
+        *message = "not a directory";
+        return false;
+    }
+
+    fs::path replacement;
+    fs::path hashes_ini;
+    if (directory_has_pack_png(input)) {
+        replacement = input;
+        hashes_ini = fs::is_regular_file(input / "Hashes.ini", ec)
+            ? input / "Hashes.ini" : input.parent_path() / "Hashes.ini";
+    } else {
+        std::vector<fs::path> children;
+        for (fs::directory_iterator it(input, ec), end; !ec && it != end; it.increment(ec)) {
+            if (it->is_directory(ec) &&
+                ends_with_ci(it->path().filename().string(), "-texture-replacements"))
+                children.push_back(it->path());
+        }
+        std::sort(children.begin(), children.end());
+        if (children.size() != 1) {
+            *message = children.empty()
+                ? "no <hash>-<palette>.png textures or *-texture-replacements folder found"
+                : "folder holds several *-texture-replacements folders; pick one";
+            return false;
+        }
+        replacement = children.front();
+        hashes_ini = input / "Hashes.ini";
+    }
+
+    out->asset_root = input.u8string();
+    out->replacement_root = replacement.lexically_normal().u8string();
+
+    std::unordered_map<uint64_t, std::string> mappings;
+    parse_hashes_ini(hashes_ini, &mappings);
+    out->logical_mapping_count = mappings.size();
+
+    std::vector<fs::path> files;
+    for (fs::directory_iterator it(replacement, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        uint32_t texture_hash = 0;
+        uint32_t palette_hash = 0;
+        if (parse_png_filename(it->path(), &texture_hash, &palette_hash))
+            files.push_back(it->path());
+    }
+    if (ec) {
+        *message = "failed to scan replacement directory";
+        return false;
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        *message = "replacement directory has no <hash>-<palette>.png textures";
+        return false;
+    }
+
+    for (const fs::path& path : files) {
+        uint32_t texture_hash = 0;
+        uint32_t palette_hash = 0;
+        if (!parse_png_filename(path, &texture_hash, &palette_hash)) continue;
+        ++out->replacement_file_count;
+        const uint64_t key = make_key(texture_hash, palette_hash);
+        auto found = out->entries.find(key);
+        if (found != out->entries.end()) {
+            found->second.ambiguous = true;
+            continue;
+        }
+        EntryRecord record;
+        record.texture_hash = texture_hash;
+        record.palette_hash = palette_hash;
+        record.replacement_path = path.lexically_normal().u8string();
+        const auto mapping = mappings.find(key);
+        if (mapping != mappings.end()) record.logical_path = mapping->second;
+        out->entries.emplace(key, std::move(record));
+    }
+    return true;
+}
+
 extern "C" {
 
 int hd_texture_pack_create(const char* explicit_root,
                            HdTexturePack** out_pack,
                            char* error,
                            size_t error_capacity) {
+    const char* selected = explicit_root;
+    if (!selected || !selected[0]) selected = std::getenv("PSXRECOMP_HD_TEXTURE_ROOT");
+    if (!selected || !selected[0]) {
+        if (out_pack) *out_pack = nullptr;
+        write_error(error, error_capacity,
+                    "HD asset root is unset (PSXRECOMP_HD_TEXTURE_ROOT)");
+        return 0;
+    }
+    return hd_texture_pack_create_multi(&selected, 1, out_pack, error,
+                                        error_capacity);
+}
+
+int hd_texture_pack_create_multi(const char* const* roots,
+                                 size_t root_count,
+                                 HdTexturePack** out_pack,
+                                 char* error,
+                                 size_t error_capacity) {
     if (out_pack) *out_pack = nullptr;
     if (error && error_capacity) error[0] = '\0';
     if (!out_pack) {
         write_error(error, error_capacity, "out_pack is null");
         return 0;
     }
+    if (!roots || root_count == 0) {
+        write_error(error, error_capacity, "no HD asset roots");
+        return 0;
+    }
 
     try {
-        const char* selected = explicit_root;
-        if (!selected || !selected[0]) selected = std::getenv("PSXRECOMP_HD_TEXTURE_ROOT");
-        if (!selected || !selected[0]) {
-            write_error(error, error_capacity,
-                        "HD asset root is unset (PSXRECOMP_HD_TEXTURE_ROOT)");
-            return 0;
-        }
-
-        std::error_code ec;
-        fs::path input = fs::absolute(fs::path(selected), ec).lexically_normal();
-        if (ec || !fs::is_directory(input, ec)) {
-            write_error(error, error_capacity, "HD asset root is not a directory");
-            return 0;
-        }
-
-        fs::path replacement;
-        fs::path hashes_ini;
-        if (directory_has_pack_png(input)) {
-            replacement = input;
-            hashes_ini = fs::is_regular_file(input / "Hashes.ini", ec)
-                ? input / "Hashes.ini" : input.parent_path() / "Hashes.ini";
-        } else if (fs::is_regular_file(input / "Hashes.ini", ec)) {
-            std::vector<fs::path> children;
-            for (fs::directory_iterator it(input, ec), end; !ec && it != end; it.increment(ec)) {
-                if (it->is_directory(ec) &&
-                    ends_with_ci(it->path().filename().string(), "-texture-replacements"))
-                    children.push_back(it->path());
-            }
-            std::sort(children.begin(), children.end());
-            if (children.size() != 1) {
+        auto pack = std::make_unique<HdTexturePack>();
+        for (size_t i = 0; i < root_count; ++i) {
+            ScannedRoot scanned;
+            std::string message;
+            if (!roots[i] || !roots[i][0] ||
+                !scan_root(roots[i], &scanned, &message)) {
                 write_error(error, error_capacity,
-                            "pack root must contain exactly one *-texture-replacements directory");
+                            std::string(roots[i] ? roots[i] : "") + ": " + message);
                 return 0;
             }
-            replacement = children.front();
-            hashes_ini = input / "Hashes.ini";
-        } else {
-            write_error(error, error_capacity,
-                        "no numeric PNGs or Hashes.ini + replacement directory found");
-            return 0;
-        }
-
-        auto pack = std::make_unique<HdTexturePack>();
-        pack->asset_root = input.string();
-        pack->replacement_root = replacement.lexically_normal().string();
-
-        std::unordered_map<uint64_t, std::string> mappings;
-        parse_hashes_ini(hashes_ini, &mappings);
-        pack->logical_mapping_count = mappings.size();
-
-        std::vector<fs::path> files;
-        for (fs::directory_iterator it(replacement, ec), end; !ec && it != end;
-             it.increment(ec)) {
-            if (!it->is_regular_file(ec)) continue;
-            uint32_t texture_hash = 0;
-            uint32_t palette_hash = 0;
-            if (parse_png_filename(it->path(), &texture_hash, &palette_hash))
-                files.push_back(it->path());
-        }
-        if (ec) {
-            write_error(error, error_capacity, "failed to scan replacement directory");
-            return 0;
-        }
-        std::sort(files.begin(), files.end());
-        if (files.empty()) {
-            write_error(error, error_capacity, "replacement directory has no numeric PNGs");
-            return 0;
-        }
-
-        for (const fs::path& path : files) {
-            uint32_t texture_hash = 0;
-            uint32_t palette_hash = 0;
-            if (!parse_png_filename(path, &texture_hash, &palette_hash)) continue;
-            ++pack->replacement_file_count;
-            const uint64_t key = make_key(texture_hash, palette_hash);
-            auto found = pack->entries.find(key);
-            if (found != pack->entries.end()) {
-                if (!found->second.ambiguous) {
-                    found->second.ambiguous = true;
-                    ++pack->ambiguous_key_count;
-                }
-                continue;
+            if (i == 0) {
+                pack->asset_root = scanned.asset_root;
+                pack->replacement_root = scanned.replacement_root;
             }
-            EntryRecord record;
-            record.texture_hash = texture_hash;
-            record.palette_hash = palette_hash;
-            record.replacement_path = path.lexically_normal().string();
-            const auto mapping = mappings.find(key);
-            if (mapping != mappings.end()) record.logical_path = mapping->second;
-            pack->entries.emplace(key, std::move(record));
+            pack->replacement_file_count += scanned.replacement_file_count;
+            pack->logical_mapping_count += scanned.logical_mapping_count;
+            /* Earlier roots take priority: a later pack only fills keys the
+             * earlier ones do not provide. Ambiguity stays per-root. */
+            for (auto& [key, record] : scanned.entries) {
+                if (pack->entries.count(key)) continue;
+                if (record.ambiguous) ++pack->ambiguous_key_count;
+                pack->palettes_by_texture[record.texture_hash].push_back(
+                    record.palette_hash);
+                pack->entries.emplace(key, std::move(record));
+            }
         }
-
         *out_pack = pack.release();
+        return 1;
+    } catch (const std::exception& exception) {
+        write_error(error, error_capacity, exception.what());
+        return 0;
+    }
+}
+
+int hd_texture_pack_probe(const char* root,
+                          size_t* out_file_count,
+                          char* resolved_root,
+                          size_t resolved_capacity,
+                          char* error,
+                          size_t error_capacity) {
+    if (out_file_count) *out_file_count = 0;
+    if (resolved_root && resolved_capacity) resolved_root[0] = '\0';
+    if (error && error_capacity) error[0] = '\0';
+    try {
+        ScannedRoot scanned;
+        std::string message;
+        if (!root || !root[0] || !scan_root(root, &scanned, &message)) {
+            write_error(error, error_capacity, message);
+            return 0;
+        }
+        if (out_file_count) *out_file_count = scanned.replacement_file_count;
+        if (resolved_root && resolved_capacity)
+            std::snprintf(resolved_root, resolved_capacity, "%s",
+                          scanned.replacement_root.c_str());
         return 1;
     } catch (const std::exception& exception) {
         write_error(error, error_capacity, exception.what());
@@ -1015,6 +1094,10 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
         return 0;
     const uint32_t hash = hd_texture_crc32_words_le(words, required);
     hd_texture_pack_invalidate(pack, x, y, width_words, height);
+    if (out_texture_hash) *out_texture_hash = hash;
+    /* An upload the pack has no image for can never be matched; it only
+     * needed to cut whatever it overwrote, which invalidate just did. */
+    if (!pack->palettes_by_texture.count(hash)) return 1;
     Upload upload;
     upload.serial = pack->next_upload_serial++;
     upload.hash = hash;
@@ -1041,8 +1124,85 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
      * after adding an upload.  Upload creation is far less frequent than GPU
      * primitive submission. */
     upload_index_rebuild(pack);
-    if (out_texture_hash) *out_texture_hash = hash;
     return 1;
+}
+
+void hd_texture_pack_track_copy(HdTexturePack* pack,
+                                uint16_t src_x,
+                                uint16_t src_y,
+                                uint16_t dst_x,
+                                uint16_t dst_y,
+                                uint16_t width_words,
+                                uint16_t height) {
+    if (!pack || width_words == 0 || height == 0 ||
+        width_words > kVramWidth || height > kVramHeight)
+        return;
+    const unsigned sx = src_x & (kVramWidth - 1), sy = src_y & (kVramHeight - 1);
+    const unsigned dx = dst_x & (kVramWidth - 1), dy = dst_y & (kVramHeight - 1);
+    const bool contiguous =
+        sx + width_words <= kVramWidth && sy + height <= kVramHeight &&
+        dx + width_words <= kVramWidth && dy + height <= kVramHeight;
+    /* Beetle carries the tracked texture along a VRAM->VRAM copy: the
+     * destination shows the same upload, offset by the move. Copies that wrap
+     * the VRAM edge only invalidate their destination. */
+    struct Moved {
+        uint64_t serial;
+        uint32_t hash;
+        uint16_t width, height;
+        Fragment fragment;
+    };
+    std::vector<Moved> moved;
+    if (contiguous) {
+        const Rect src{sx, sy, width_words, height};
+        for (const Upload& upload : pack->uploads) {
+            if (!intersects(upload.bounds, src)) continue;
+            for (const Fragment& fragment : upload.fragments) {
+                if (!intersects(fragment.rect, src)) continue;
+                const unsigned left = std::max(fragment.rect.x, src.x);
+                const unsigned top = std::max(fragment.rect.y, src.y);
+                const unsigned right = std::min(fragment.rect.x + fragment.rect.width,
+                                                src.x + src.width);
+                const unsigned bottom = std::min(fragment.rect.y + fragment.rect.height,
+                                                 src.y + src.height);
+                Fragment piece;
+                piece.rect = Rect{left - sx + dx, top - sy + dy,
+                                  right - left, bottom - top};
+                piece.source_x = fragment.source_x + left - fragment.rect.x;
+                piece.source_y = fragment.source_y + top - fragment.rect.y;
+                moved.push_back({upload.serial, upload.hash, upload.width,
+                                 upload.height, piece});
+            }
+        }
+    }
+    hd_texture_pack_invalidate(pack, dst_x, dst_y, width_words, height);
+    if (moved.empty()) return;
+    for (const Moved& item : moved) {
+        Upload* target = nullptr;
+        for (Upload& upload : pack->uploads)
+            if (upload.serial == item.serial) { target = &upload; break; }
+        if (!target) {
+            /* An overlapping copy can cut its own source away entirely; the
+             * copied pixels still belong to that upload. */
+            Upload revived;
+            revived.serial = item.serial;
+            revived.hash = item.hash;
+            revived.width = item.width;
+            revived.height = item.height;
+            pack->uploads.push_back(std::move(revived));
+            target = &pack->uploads.back();
+        }
+        target->fragments.push_back(item.fragment);
+        target->bounds = fragment_bounds(target->fragments);
+    }
+    upload_index_rebuild(pack);
+}
+
+void hd_texture_pack_prefetch(HdTexturePack* pack, uint32_t texture_hash) {
+    if (!pack) return;
+    const auto found = pack->palettes_by_texture.find(texture_hash);
+    if (found == pack->palettes_by_texture.end()) return;
+    for (const uint32_t palette_hash : found->second)
+        (void)hd_texture_pack_request_decode(pack, texture_hash, palette_hash);
 }
 
 void hd_texture_pack_reset_tracking(HdTexturePack* pack) {
@@ -1172,14 +1332,16 @@ int hd_texture_pack_match(HdTexturePack* pack,
     if (!pack || !query || query->depth > HD_TEXTURE_DEPTH_16BPP ||
         !query->vram || query->vram_word_count < kVramWords)
         return HD_TEXTURE_LOOKUP_ERROR;
+    if (pack->uploads.empty()) return HD_TEXTURE_LOOKUP_NONE;
     const std::vector<Rect> wanted = query_rectangles(*query);
     if (wanted.empty()) return HD_TEXTURE_LOOKUP_ERROR;
-    const uint32_t palette_hash = hd_texture_hash_clut(
-        query->vram, query->vram_word_count, query->clut_x, query->clut_y,
-        query->depth);
 
     std::vector<uint64_t> candidate_serials;
     upload_index_collect(pack, wanted, &candidate_serials);
+    if (candidate_serials.empty()) return HD_TEXTURE_LOOKUP_NONE;
+    const uint32_t palette_hash = hd_texture_hash_clut(
+        query->vram, query->vram_word_count, query->clut_x, query->clut_y,
+        query->depth);
     const Upload* candidate = nullptr;
     const EntryRecord* candidate_entry = nullptr;
     for (const uint64_t serial : candidate_serials) {
@@ -1289,7 +1451,8 @@ int hd_texture_pack_request_decode(HdTexturePack* pack,
     pack->decode.queue.push_back(key);
     if (!pack->decode.started) {
         pack->decode.started = true;
-        pack->decode.worker = std::thread(decode_worker, &pack->decode);
+        for (unsigned i = 0; i < kDecodeWorkers; ++i)
+            pack->decode.workers.emplace_back(decode_worker, &pack->decode);
     }
     pack->decode.wake.notify_one();
     return HD_TEXTURE_LOOKUP_NONE;
@@ -1317,6 +1480,19 @@ int hd_texture_pack_acquire_decoded(HdTexturePack* pack,
     out_pixels->stride = lease->image->width * 4;
     out_pixels->lease = lease;
     return HD_TEXTURE_LOOKUP_FOUND;
+}
+
+void hd_texture_pack_forget_decoded(HdTexturePack* pack,
+                                    uint32_t texture_hash,
+                                    uint32_t palette_hash) {
+    if (!pack) return;
+    std::lock_guard<std::mutex> lock(pack->decode.mutex);
+    const auto found = pack->decode.items.find(make_key(texture_hash, palette_hash));
+    if (found == pack->decode.items.end() ||
+        found->second.state != DecodeState::Ready)
+        return;
+    pack->decode.used -= found->second.bytes;
+    pack->decode.items.erase(found);
 }
 
 void hd_texture_pixels_release(HdTexturePixels* pixels) {

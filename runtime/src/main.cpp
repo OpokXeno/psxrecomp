@@ -45,6 +45,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "load_transition_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
+#include "hd_texture_runtime.h"
 #include "gpu_gl_renderer.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
@@ -16865,6 +16866,44 @@ session_reboot:
                      g_video_renderer == 1 ? "opengl" : "software");
     }
     gpu_init();
+    /* HD texture replacement is Native-first. While the Native work stream is
+     * enabled it owns the upload tracker: its own VRAM operations feed it and
+     * each of its DRAWs carries the decision to the Native GPU. The renderer
+     * facade feeds the tracker only when Native work is not running, for the
+     * compatibility (legacy GL) presentation. Residency travels with
+     * savestates. All of it is inert while no texture pack is enabled. */
+    {
+        static const GrVramObserver hd_texture_observer = {
+            [](int x, int y, int w, int h, const uint16_t *pixels) {
+                if (!xg_render_native_work_enabled())
+                    hd_texture_runtime_on_upload(x, y, w, h, pixels);
+            },
+            [](int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
+                if (!xg_render_native_work_enabled())
+                    hd_texture_runtime_on_copy(src_x, src_y, dst_x, dst_y, w, h);
+            },
+            [](int x, int y, int w, int h) {
+                if (!xg_render_native_work_enabled())
+                    hd_texture_runtime_on_fill(x, y, w, h);
+            },
+        };
+        static const XgRenderNativeHdTextureHooks hd_texture_native = {
+            hd_texture_runtime_resolve_semantic,
+            hd_texture_runtime_on_upload,
+            hd_texture_runtime_on_copy,
+            hd_texture_runtime_on_fill,
+        };
+        static const BootStateHdTextureHooks hd_texture_state = {
+            hd_texture_runtime_state_bytes,
+            hd_texture_runtime_state_write,
+            hd_texture_runtime_state_read,
+            hd_texture_runtime_state_reset,
+        };
+        hd_texture_runtime_set_vram(gpu_get_vram());
+        xg_render_native_work_set_hd_texture_hooks(&hd_texture_native);
+        gr_set_vram_observer(&hd_texture_observer);
+        boot_state_set_hd_texture_hooks(&hd_texture_state);
+    }
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
      * runs sw_renderer_init). OpenGL supports the fork's extended 8x ceiling;
      * software and Vulkan retain the shared backend limit. */

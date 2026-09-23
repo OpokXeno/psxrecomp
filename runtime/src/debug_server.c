@@ -31,6 +31,7 @@
 #include "guest_render_native_stream.h"
 #include "gpu.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+#include "hd_texture_runtime.h"
 #include "present_ring.h"
 #include "xg_render_auth_runtime_diagnostics.h"
 #include "xg_render_auth_runtime_control.h"
@@ -17550,6 +17551,44 @@ static void handle_phase_hot(int id, const char *json)
 /* idle_skip: idle-loop cycle-skip status + runtime toggle.
  *   {"cmd":"idle_skip"}              -> counters
  *   {"cmd":"idle_skip","enable":0|1} -> toggle, then counters */
+/* HD texture replacement state.
+ *   {"cmd":"hd_textures"}             -> counters + recently matched keys
+ *   {"cmd":"hd_textures","enable":0|1} -> A/B replacement live, then counters
+ * Keys print as the pack's <texhash>-<palhash> file stems. */
+static void handle_hd_textures(int id, const char *json)
+{
+    int en = json_get_int(json, "enable", -1);
+    if (en == 0 || en == 1) hd_texture_runtime_set_enabled(en);
+    HdTextureRuntimeStats st;
+    hd_texture_runtime_stats(&st);
+    uint64_t gl[7] = {0};
+    if (gr_backend() == GR_BACKEND_OPENGL) gl_renderer_hd_texture_stats(gl);
+    char recent[16 * 20 + 2];
+    size_t used = 0;
+    recent[0] = '\0';
+    for (uint32_t i = 0; i < st.recent_count && used + 22 < sizeof(recent); ++i)
+        used += (size_t)snprintf(recent + used, sizeof(recent) - used,
+                                 "%s\"%x-%x\"", i ? "," : "",
+                                 (unsigned)(st.recent[i] >> 32),
+                                 (unsigned)st.recent[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":%d,\"enabled\":%d,"
+             "\"pack_images\":%llu,\"tracked_uploads\":%llu,"
+             "\"uploads_seen\":%llu,\"resolves\":%llu,\"matches\":%llu,"
+             "\"native_resident\":%llu,\"native_bytes\":%llu,\"native_failed\":%llu,"
+             "\"legacy_resident\":%llu,\"legacy_bytes\":%llu,\"legacy_failed\":%llu,"
+             "\"native_draws\":%llu,\"recent\":[%s]}",
+             id, st.active, st.enabled,
+             (unsigned long long)st.pack_images,
+             (unsigned long long)st.tracked_uploads,
+             (unsigned long long)st.uploads_seen,
+             (unsigned long long)st.resolves,
+             (unsigned long long)st.matches,
+             (unsigned long long)gl[0], (unsigned long long)gl[1],
+             (unsigned long long)gl[2], (unsigned long long)gl[3],
+             (unsigned long long)gl[4], (unsigned long long)gl[5],
+             (unsigned long long)gl[6], recent);
+}
+
 static void handle_idle_skip(int id, const char *json)
 {
     extern int      g_idle_skip_enabled;
@@ -17765,6 +17804,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_widget_action", handle_overlay_widget_action },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
+    { "hd_textures",       handle_hd_textures },
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },

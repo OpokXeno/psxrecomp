@@ -1356,6 +1356,9 @@ uint64_t gl_renderer_perf_prim_split(double *out_tex_frac);
 /* Cumulative textured-batch diagnostics: total, then flushes caused by
  * isolation, blend-mode, mask, filter, backdrop-gate, texture-window, capacity. */
 void gl_renderer_batch_diag(uint64_t out[8]);
+/* HD texture replacement: {native resident, native bytes, native failed,
+ * legacy resident, legacy bytes, legacy failed, native draws replaced}. */
+void gl_renderer_hd_texture_stats(uint64_t out[7]);
 
 #ifdef PSX_GL_TRANSACTION_TESTING
 enum {

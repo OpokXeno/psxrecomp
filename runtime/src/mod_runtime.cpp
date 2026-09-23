@@ -5,6 +5,7 @@
 #include "mod_packages.h"
 #include "mod_plugins.h"
 #include "gpu.h"
+#include "hd_texture_packs.h"
 #include "psx_sha256.h"
 
 #if defined(RECOMP_LAUNCHER)
@@ -928,7 +929,7 @@ bool diagnostic_matches(const ModResolution::Diagnostic& diagnostic,
             diagnostic.other_feature_id == feature_id);
 }
 
-int provider_feature_count(void*) {
+int provider_package_feature_count() {
     int count = 0;
     for (const auto& [package_id, versions] : state().manager.packages()) {
         (void)versions;
@@ -939,8 +940,46 @@ int provider_feature_count(void*) {
     return count;
 }
 
+/* HD texture packs are listed after every package feature, as features of a
+ * synthetic package the manager never sees. */
+bool is_texture_pack_package(const char* package_id) {
+    return package_id && std::strcmp(package_id, kHdTexturePackPackageId) == 0;
+}
+
+void texture_pack_feature(const HdTexturePackEntry& entry,
+                          RecompLauncherCModFeature* out) {
+    std::memset(out, 0, sizeof(*out));
+    copy_text(out->id, sizeof(out->id), entry.id);
+    copy_text(out->package_id, sizeof(out->package_id), kHdTexturePackPackageId);
+    copy_text(out->package_name, sizeof(out->package_name), "Texture Packs");
+    copy_text(out->name, sizeof(out->name), entry.name);
+    copy_text(out->group, sizeof(out->group), "Texture Packs");
+    copy_text(out->description, sizeof(out->description),
+              "Replaces the game's textures with the images in this folder "
+              "(Beetle PSX HW / RetroArch texture replacement format).");
+    copy_text(out->texture_pack_path, sizeof(out->texture_pack_path), entry.path);
+    out->texture_pack = 1;
+    out->texture_pack_images = (int)std::min<size_t>(entry.image_count, INT32_MAX);
+    out->enabled = entry.enabled ? 1 : 0;
+    if (!entry.error.empty()) {
+        out->has_error = 1;
+        copy_text(out->status, sizeof(out->status), entry.error);
+    }
+}
+
+int provider_feature_count(void*) {
+    return provider_package_feature_count() + (int)hd_texture_packs().size();
+}
+
 int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
     if (!out) return 0;
+    const int package_features = provider_package_feature_count();
+    if (index >= package_features) {
+        const size_t pack = (size_t)(index - package_features);
+        if (pack >= hd_texture_packs().size()) return 0;
+        texture_pack_feature(hd_texture_packs()[pack], out);
+        return 1;
+    }
     const ModPackage* package = nullptr;
     const ModFeature* feature = nullptr;
     if (!provider_feature_at(index, package, feature)) return 0;
@@ -1056,6 +1095,15 @@ int provider_feature_choice_get(void*, const char* package_id,
 int provider_feature_enable(void*, const char* package_id,
                             const char* feature_id, int enabled) {
     if (!package_id || !feature_id) return 0;
+    if (is_texture_pack_package(package_id)) {
+        std::string error;
+        if (!hd_texture_packs_set_enabled(feature_id, enabled != 0, &error)) {
+            set_error(error);
+            return 0;
+        }
+        state().error.clear();
+        return 1;
+    }
     return mutate([&](std::string& error) {
         const ModFeature* feature =
             state().manager.selected_feature(package_id, feature_id);
@@ -1261,6 +1309,28 @@ int provider_set_option(void*, const char* id, const char* option, const char* v
     });
 }
 
+int provider_texture_pack_add(void*, const char* folder) {
+    std::string error;
+    if (!folder || !hd_texture_packs_add(folder, nullptr, &error)) {
+        set_error(folder ? error : "no folder selected");
+        return 0;
+    }
+    state().error.clear();
+    return 1;
+}
+
+int provider_texture_pack_remove(void*, const char* package_id,
+                                 const char* feature_id) {
+    std::string error;
+    if (!is_texture_pack_package(package_id) || !feature_id ||
+        !hd_texture_packs_remove(feature_id, &error)) {
+        set_error(error.empty() ? "not a texture pack" : error);
+        return 0;
+    }
+    state().error.clear();
+    return 1;
+}
+
 int provider_commit(void*, const char* image_path) {
     std::string error;
     if (!mod_runtime_commit(image_path ? std::filesystem::path(image_path) :
@@ -1317,6 +1387,10 @@ RecompLauncherCModProvider provider = {
     provider_feature_resource_count,
     provider_feature_resource_get,
     provider_feature_resource_set_path,
+    nullptr, /* catalog_diagnostic_count */
+    nullptr, /* catalog_diagnostic_get */
+    provider_texture_pack_add,
+    provider_texture_pack_remove,
 };
 #endif
 
@@ -1353,6 +1427,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
     s.verified_disc_required = false;
     s.launcher_committed = false;
     s.manager.set_root(root);
+    hd_texture_packs_load(root);
     s.game_id = game_id;
     s.entry_phys = game_entry_pc & 0x1FFFFFFFu;
     if (!s.manager.scan(&s.error) || !s.manager.load_state(&s.error)) {
@@ -1398,6 +1473,7 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
     s.launcher_committed = false;
     s.error.clear();
     if (error) error->clear();
+    hd_texture_packs_deactivate();
     std::fprintf(stdout, "psxrecomp: mods cleared for netplay (vanilla session)\n");
     return true;
 }
@@ -1405,6 +1481,9 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
 bool mod_runtime_commit(const std::filesystem::path& disc_path,
                         std::string* error) try {
     RuntimeMods& s = state();
+    /* Texture packs only change what the renderer samples; they are outside
+     * the verified mod plan and never block a launch. */
+    (void)hd_texture_packs_activate(nullptr);
     if (!s.initialized) return true;
     if (s.launcher_committed) {
         s.launcher_committed = false;

@@ -15,6 +15,7 @@
 #include "gpu_sw_renderer.h"
 #endif
 #include <stdio.h>
+#include <string.h>
 
 #ifdef GPU_RENDER_TRANSACTION_TESTING
 static const GpuRenderBackend SW_BACKEND = {
@@ -477,6 +478,24 @@ GpuRenderTransactionStatus gr_record_interpolation_anchors(
         ? GPU_RENDER_TRANSACTION_BACKEND_ERROR : status;
 }
 
+/* Host-side VRAM observer (HD texture tracking). Kept a plain pointer table
+ * so the facade carries no link dependency on its consumer. */
+static GrVramObserver g_vram_observer;
+
+void gr_set_vram_observer(const GrVramObserver *observer) {
+    if (observer) g_vram_observer = *observer;
+    else memset(&g_vram_observer, 0, sizeof(g_vram_observer));
+}
+static void vram_observer_upload(int x, int y, int w, int h, const uint16_t *d) {
+    if (g_vram_observer.upload) g_vram_observer.upload(x, y, w, h, d);
+}
+static void vram_observer_copy(int sx, int sy, int dx, int dy, int w, int h) {
+    if (g_vram_observer.copy) g_vram_observer.copy(sx, sy, dx, dy, w, h);
+}
+static void vram_observer_fill(int x, int y, int w, int h) {
+    if (g_vram_observer.fill) g_vram_observer.fill(x, y, w, h);
+}
+
 /* ---- Dispatch wrappers (one line each; forward to the active backend) ---- */
 void gr_init(uint16_t *vram)                         { g_b->init(vram); }
 void gr_set_scale(int scale)                         { g_b->set_scale(scale); }
@@ -501,10 +520,14 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
         g_b->set_perspective_triangle(enabled, q0, q1, q2);
 }
 void gr_fill_rect(int x, int y, int w, int h, uint16_t c) {
-    if (!gr_draw_suppression_active()) g_b->fill_rect(x, y, w, h, c);
+    if (gr_draw_suppression_active()) return;
+    g_b->fill_rect(x, y, w, h, c);
+    vram_observer_fill(x, y, w, h);
 }
 void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
-    if (!gr_draw_suppression_active()) g_b->copy_rect(sx, sy, dx, dy, w, h);
+    if (gr_draw_suppression_active()) return;
+    g_b->copy_rect(sx, sy, dx, dy, w, h);
+    vram_observer_copy(sx, sy, dx, dy, w, h);
 }
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
     if (!gr_draw_suppression_active())
@@ -585,10 +608,12 @@ void gr_draw_shaded_line(int x0, int y0, uint16_t c0, int x1, int y1, uint16_t c
 void gr_native_fill_rect(int x, int y, int w, int h, uint16_t c) {
     if (g_b->native_fill_rect) g_b->native_fill_rect(x, y, w, h, c);
     else g_b->fill_rect(x, y, w, h, c);
+    vram_observer_fill(x, y, w, h);
 }
 void gr_native_copy_rect(int sx, int sy, int dx, int dy, int w, int h) {
     if (g_b->native_copy_rect) g_b->native_copy_rect(sx, sy, dx, dy, w, h);
     else g_b->copy_rect(sx, sy, dx, dy, w, h);
+    vram_observer_copy(sx, sy, dx, dy, w, h);
 }
 void gr_native_draw_line(int x0, int y0, int x1, int y1, uint16_t c) {
     g_b->draw_line(x0, y0, x1, y1, c);
@@ -631,7 +656,10 @@ void gr_vram_prepare_read(int x, int y, int w, int h) {
     if (g_b->vram_prepare_read) g_b->vram_prepare_read(x, y, w, h);
 }
 uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, y); }
-void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { g_b->vram_transfer_in(x, y, w, h, d); }
+void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) {
+    g_b->vram_transfer_in(x, y, w, h, d);
+    vram_observer_upload(x, y, w, h, d);
+}
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->vram_transfer_out(x, y, w, h, d); }
 void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1, x2, y2); }
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2) { g_b->get_draw_area(x1, y1, x2, y2); }

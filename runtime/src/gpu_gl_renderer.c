@@ -79,6 +79,7 @@
 #include <limits.h>
 #include <float.h>
 #include "mod_texture_banks.h"
+#include "hd_texture_runtime.h"
 #include "frame_interpolation.h"
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
@@ -265,6 +266,8 @@ static PFN_glBlendEquationSeparate p_glBlendEquationSeparate;
 static PFN_glGenVertexArrays   p_glGenVertexArrays;
 static PFN_glBindVertexArray   p_glBindVertexArray;
 static PFN_glActiveTexture     p_glActiveTexture;
+typedef void   (APIENTRY *PFN_glGenerateMipmap)(GLenum);
+static PFN_glGenerateMipmap    p_glGenerateMipmap;
 static PFN_glGenBuffers        p_glGenBuffers;
 static PFN_glBindBuffer        p_glBindBuffer;
 static PFN_glBufferData        p_glBufferData;
@@ -331,6 +334,7 @@ static int load_modern_gl(void) {
     LOAD(p_glBlendEquationSeparate, "glBlendEquationSeparate");
     LOAD(p_glGenVertexArrays, "glGenVertexArrays"); LOAD(p_glBindVertexArray, "glBindVertexArray");
     LOAD(p_glActiveTexture, "glActiveTexture");  LOAD(p_glGenBuffers, "glGenBuffers");
+    LOAD(p_glGenerateMipmap, "glGenerateMipmap");
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
     LOAD(p_glMapBufferRange, "glMapBufferRange");
     LOAD(p_glUnmapBuffer, "glUnmapBuffer");
@@ -545,6 +549,188 @@ static FrameInterpolationSchedule s_interp_schedule;
 static void interp_present_source_interval(void);
 static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh);
 
+/* ---- HD texture replacement: GPU copies of pack images ------------------ *
+ * One cache per GL context (the legacy renderer's and the Native GPU
+ * thread's), each touched only by its owning thread. Images arrive decoded
+ * from the pack's worker threads; a draw whose image is not resident yet
+ * samples guest VRAM this frame and picks the image up once it lands.
+ *
+ * Upload converts the pack's alpha convention (0 = hole, 127 = STP set,
+ * 255 = opaque) to coverage: alpha >= 64 is opaque, and colour is
+ * premultiplied by coverage so linear/mip filtering never bleeds a hole's
+ * colour into an edge. The shader divides it back out. STP stays the guest
+ * texel's own bit. */
+#define PSXGL_ACTIVE_TEXTURE 0x84E0
+#define HD_GL_CACHE_BUDGET ((uint64_t)1536u * 1024u * 1024u)
+
+typedef struct HdGlEntry {
+    uint64_t key;
+    GLuint texture;
+    uint64_t bytes;
+    uint64_t last_use;
+    uint8_t failed;
+} HdGlEntry;
+
+typedef struct HdGlCache {
+    HdGlEntry *entries;
+    size_t count, capacity;
+    uint64_t bytes, tick;
+    uint64_t resident, failed; /* scalar mirrors for cross-thread diagnostics */
+    uint32_t generation;
+    uint8_t *scratch;
+    size_t scratch_capacity;
+} HdGlCache;
+
+static void hd_gl_cache_clear(HdGlCache *cache) {
+    for (size_t i = 0; i < cache->count; ++i)
+        if (cache->entries[i].texture) glDeleteTextures(1, &cache->entries[i].texture);
+    cache->count = 0;
+    cache->bytes = 0;
+    cache->resident = cache->failed = 0;
+}
+
+static void hd_gl_cache_evict(HdGlCache *cache, uint64_t incoming) {
+    while (cache->bytes + incoming > HD_GL_CACHE_BUDGET) {
+        size_t victim = SIZE_MAX;
+        for (size_t i = 0; i < cache->count; ++i)
+            if (cache->entries[i].texture &&
+                (victim == SIZE_MAX ||
+                 cache->entries[i].last_use < cache->entries[victim].last_use))
+                victim = i;
+        if (victim == SIZE_MAX) return;
+        glDeleteTextures(1, &cache->entries[victim].texture);
+        cache->bytes -= cache->entries[victim].bytes;
+        --cache->resident;
+        /* Order-preserving removal: the caller's newest entry stays last. */
+        memmove(&cache->entries[victim], &cache->entries[victim + 1u],
+                (cache->count - victim - 1u) * sizeof(cache->entries[0]));
+        --cache->count;
+    }
+}
+
+/* Texture for a draw's replacement, uploading it on first availability, bound
+ * to `unit`. Returns 0 while the image is decoding, missing or unusable. */
+static GLuint hd_gl_texture_bind(HdGlCache *cache, const GpuRenderHdTexture *hd,
+                                 GLenum unit);
+/* Callers keep their own texture-unit assumptions: the active unit is
+ * restored after binding the replacement to `unit`. */
+static GLuint hd_gl_texture(HdGlCache *cache, const GpuRenderHdTexture *hd,
+                            GLenum unit) {
+    if (!hd->valid || !hd_texture_runtime_pack()) return 0;
+    GLint previous = PSXGL_TEXTURE0;
+    glGetIntegerv(PSXGL_ACTIVE_TEXTURE, &previous);
+    const GLuint texture = hd_gl_texture_bind(cache, hd, unit);
+    p_glActiveTexture((GLenum)previous);
+    return texture;
+}
+
+static GLuint hd_gl_texture_bind(HdGlCache *cache, const GpuRenderHdTexture *hd,
+                                 GLenum unit) {
+    HdTexturePack *pack = hd_texture_runtime_pack();
+    if (!hd->valid || !pack) return 0;
+    const uint32_t generation = hd_texture_runtime_generation();
+    if (cache->generation != generation) {
+        hd_gl_cache_clear(cache);
+        cache->generation = generation;
+    }
+    const uint64_t key = ((uint64_t)hd->texture_hash << 32) | hd->palette_hash;
+    for (size_t i = 0; i < cache->count; ++i) {
+        HdGlEntry *entry = &cache->entries[i];
+        if (entry->key != key) continue;
+        if (entry->failed) return 0;
+        entry->last_use = ++cache->tick;
+        p_glActiveTexture(unit);
+        glBindTexture(GL_TEXTURE_2D, entry->texture);
+        return entry->texture;
+    }
+    HdTexturePixels pixels;
+    const int state = hd_texture_pack_acquire_decoded(pack, hd->texture_hash,
+                                                     hd->palette_hash, &pixels);
+    if (state == HD_TEXTURE_LOOKUP_NONE) {
+        (void)hd_texture_pack_request_decode(pack, hd->texture_hash,
+                                             hd->palette_hash);
+        return 0;
+    }
+    if (cache->count == cache->capacity) {
+        const size_t capacity = cache->capacity ? cache->capacity * 2u : 64u;
+        HdGlEntry *entries = (HdGlEntry *)realloc(cache->entries,
+                                                  capacity * sizeof(*entries));
+        if (!entries) {
+            if (state == HD_TEXTURE_LOOKUP_FOUND) hd_texture_pixels_release(&pixels);
+            return 0;
+        }
+        cache->entries = entries;
+        cache->capacity = capacity;
+    }
+    HdGlEntry *entry = &cache->entries[cache->count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->key = key;
+    entry->last_use = ++cache->tick;
+    if (state != HD_TEXTURE_LOOKUP_FOUND) {
+        entry->failed = 1;
+        ++cache->failed;
+        return 0;
+    }
+    const size_t bytes = (size_t)pixels.width * pixels.height * 4u;
+    if (cache->scratch_capacity < bytes) {
+        uint8_t *scratch = (uint8_t *)realloc(cache->scratch, bytes);
+        if (!scratch) {
+            hd_texture_pixels_release(&pixels);
+            --cache->count;
+            return 0;
+        }
+        cache->scratch = scratch;
+        cache->scratch_capacity = bytes;
+    }
+    for (uint32_t y = 0; y < pixels.height; ++y) {
+        const uint8_t *in = pixels.rgba + (size_t)y * pixels.stride;
+        uint8_t *out = cache->scratch + (size_t)y * pixels.width * 4u;
+        for (uint32_t x = 0; x < pixels.width; ++x, in += 4, out += 4) {
+            const int opaque = in[3] >= 64;
+            out[0] = opaque ? in[0] : 0;
+            out[1] = opaque ? in[1] : 0;
+            out[2] = opaque ? in[2] : 0;
+            out[3] = opaque ? 255 : 0;
+        }
+    }
+    const uint32_t width = pixels.width, height = pixels.height;
+    hd_texture_pixels_release(&pixels);
+    hd_texture_pack_forget_decoded(pack, hd->texture_hash, hd->palette_hash);
+    const uint64_t resident = (uint64_t)bytes * 4u / 3u; /* with mip chain */
+    hd_gl_cache_evict(cache, resident);
+    /* Eviction may have moved entries; this one is still the last. */
+    entry = &cache->entries[cache->count - 1u];
+    GLint alignment, row_length;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glGetIntegerv(PSXGL_UNPACK_ROW_LENGTH, &row_length);
+    while (glGetError() != GL_NO_ERROR) {}
+    glGenTextures(1, &entry->texture);
+    p_glActiveTexture(unit);
+    glBindTexture(GL_TEXTURE_2D, entry->texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, cache->scratch);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, row_length);
+    p_glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteTextures(1, &entry->texture);
+        entry->texture = 0;
+        entry->failed = 1;
+        ++cache->failed;
+        return 0;
+    }
+    entry->bytes = resident;
+    cache->bytes += resident;
+    ++cache->resident;
+    return entry->texture;
+}
+
 static GLuint s_bank_tex[65536];
 static GLuint s_selected_bank_tex;
 /* Native raw-1555 sampling mirror + readback source. */
@@ -579,6 +765,10 @@ static float s_pq[3];
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
 static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
+static GLint s_uHd = -1, s_uHdOn = -1, s_uHdMap = -1;
+/* HD texture replacement on the legacy context (unused while Native owns
+ * presentation: its GPU thread samples replacements itself). */
+static HdGlCache s_legacy_hd_cache;
 static GLint s_geo_uDither = -1, s_geo_uScale = -1;
 static GLint s_tex_uDither = -1, s_tex_uScale = -1;
 static GLint s_uLimits = -1;
@@ -1157,6 +1347,7 @@ typedef struct GlNativeRecipeDraw {
     uint8_t temporal_departure; /* Phase-only, never part of endpoint/history. */
     uint8_t dither_x, dither_y;
     uint16_t view_origin_y;
+    GpuRenderHdTexture hd_texture; /* page-relative, survives relocation */
 } GlNativeRecipeDraw;
 typedef struct GlNativeRecipeCoverage {
     XgSemanticResourceRef reference;
@@ -2879,6 +3070,9 @@ static const char *TEX_FS =
     "uniform int u_filter;    /* 1 = bilinear */\n"
     "uniform int u_dither;   /* effective per-primitive GP0(E1) dither */\n"
     "uniform int u_scale;    /* HR samples per native VRAM pixel */\n"
+    /* HD texture replacement (batch-uniform): u_hd_map = page->upload texel
+     * offset u/v and upload size in texels. */
+    "uniform sampler2D u_hd; uniform int u_hd_on; uniform ivec4 u_hd_map;\n"
     PSX_DITHER_QUANTIZE_GLSL
     "int vram_at(int x, int y){\n"
     "  ivec2 p = ivec2(x & 1023, y & 511);\n"
@@ -2911,6 +3105,41 @@ static const char *TEX_FS =
     "}\n"
     "void main(){\n"
     "  vec2 uv = v_persp != 0 ? v_uv_p : v_uv;\n"
+    /* HD coordinates first, in uniform control flow (see NATIVE_GPU_FS). */
+    "  vec2 hd_uv = vec2(0.0);\n"
+    "  if (u_hd_on != 0) {\n"
+    "    vec2 hp = uv + vec2(u_shift); vec2 fl = floor(hp); ivec2 hq = ivec2(fl) & 255;\n"
+    "    vec2 k = vec2(textureSize(u_hd, 0)) / vec2(u_hd_map.zw);\n"
+    "    vec2 lo = vec2(0.5) / k, hi = vec2(u_hd_map.zw) - vec2(0.5) / k;\n"
+    "    if ((u_twin.x | u_twin.y) != 0) {\n"
+    "      hq = (hq & ~(u_twin.xy * 8)) | ((u_twin.zw & u_twin.xy) * 8);\n"
+    "    } else {\n"
+    "      lo = vec2(v_limits.xy + u_hd_map.xy) + vec2(0.5) / k;\n"
+    "      hi = vec2(v_limits.zw + u_hd_map.xy) + vec2(1.0) - vec2(0.5) / k;\n"
+    "    }\n"
+    "    hd_uv = clamp(vec2(hq + u_hd_map.xy) + (hp - fl), lo, hi) / vec2(u_hd_map.zw);\n"
+    "  }\n"
+    "  vec2 hd_dx = dFdx(hd_uv), hd_dy = dFdy(hd_uv);\n"
+    /* Replacement: coverage and colour from the HD image (premultiplied at
+     * upload), STP from the guest texel, no 15-bit quantization. */
+    "  if (u_hd_on != 0) {\n"
+    "    vec4 h = textureGrad(u_hd, hd_uv, hd_dx, hd_dy);\n"
+    "    if (h.a < 0.5) discard;\n"
+    "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
+    "    int hstp = raw != 0 ? (raw >> 15) & 1 : 0;\n"
+    "    if (u_semipass == 1 && hstp == 1) discard;\n"
+    "    if (u_semipass == 2 && hstp == 0) discard;\n"
+    "    vec3 c = h.rgb / h.a;\n"
+    "    if (v_raw == 0) c = clamp(c * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "    float hd_dst = 0.0;\n"
+    "    if (u_semimode == 4 && v_semi != 0 && hstp != 0) {\n"
+    "      hd_dst = v_semi == 1 ? 0.5 : 1.0;\n"
+    "      if (v_semi == 1) c *= 0.5; else if (v_semi == 4) c *= 0.25;\n"
+    "    }\n"
+    "    frag = vec4(c, (hstp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
+    "    blend_factor = vec4(0.0, 0.0, 0.0, hd_dst);\n"
+    "    return;\n"
+    "  }\n"
     "  int stp; vec3 rgb = vec3(0.0); ivec3 nearest5 = ivec3(0);\n"
     "  if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
@@ -3779,6 +4008,8 @@ static int   s_tb_n = 0;                    /* verts queued */
 static int   s_tb_semi = -2;
 static int   s_tb_mask = 0, s_tb_filter = 0, s_tb_dither = 0;
 static GLuint s_tb_bank_tex, s_tb_handoff_bank_tex;
+static GLuint s_tb_hd_tex, s_tb_handoff_hd_tex;   /* batch key: replacement image */
+static int   s_tb_hd_map[4], s_tb_handoff_hd_map[4];
 static int   s_tb_twin[4] = {0, 0, 0, 0};
 static int   s_tb_handoff_active = 0;
 static int   s_tb_handoff_area[4];
@@ -3900,6 +4131,8 @@ static int tex_batch_handoff_matches(void) {
         s_tb_handoff_filter == s_tb_filter &&
         s_tb_handoff_dither == s_tb_dither &&
         s_tb_handoff_bank_tex == s_tb_bank_tex &&
+        s_tb_handoff_hd_tex == s_tb_hd_tex &&
+        memcmp(s_tb_handoff_hd_map, s_tb_hd_map, sizeof(s_tb_hd_map)) == 0 &&
         s_tb_handoff_mask_check == s_mask_check &&
         s_tb_handoff_scale == s_scale &&
         memcmp(s_tb_handoff_twin, s_tb_twin, sizeof(s_tb_twin)) == 0;
@@ -3915,6 +4148,8 @@ static void tex_batch_handoff_remember(void) {
     s_tb_handoff_filter = s_tb_filter;
     s_tb_handoff_dither = s_tb_dither;
     s_tb_handoff_bank_tex = s_tb_bank_tex;
+    s_tb_handoff_hd_tex = s_tb_hd_tex;
+    memcpy(s_tb_handoff_hd_map, s_tb_hd_map, sizeof(s_tb_hd_map));
     s_tb_handoff_mask_check = s_mask_check;
     s_tb_handoff_scale = s_scale;
     memcpy(s_tb_handoff_twin, s_tb_twin, sizeof(s_tb_twin));
@@ -3952,7 +4187,18 @@ static void flush_tex_batch_internal(int handoff) {
         p_glUniform1i(s_uFilter, s_tb_filter);
         p_glUniform1i(s_tex_uDither, s_tb_dither);
         p_glUniform1i(s_tex_uScale, s_scale);
+        p_glUniform1i(s_uHd, 1);
+        p_glUniform1i(s_uHdOn, s_tb_hd_tex != 0);
+        p_glUniform4i(s_uHdMap, s_tb_hd_map[0], s_tb_hd_map[1],
+                      s_tb_hd_map[2], s_tb_hd_map[3]);
         p_glBindVertexArray(s_tex_vao);
+    }
+    if (s_tb_hd_tex) {
+        /* Rebound even on a continued handoff: uploading a newly decoded
+         * replacement uses the same unit between flushes. */
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, s_tb_hd_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0);
     }
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
@@ -4215,6 +4461,23 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);
     mark_prim_dirty(xs, ys, 3, 1 /* textured */);
 
+    /* HD texture replacement, decided now: this runs in guest order with the
+     * upload tracker. While Native owns presentation this context only keeps
+     * the canonical mirror, which must stay guest-exact. */
+    GLuint hd_tex = 0;
+    int hd_map[4] = {0, 0, 0, 0};
+    if (hd_texture_runtime_active() && !s_native_active && !s_selected_bank_tex) {
+        GpuRenderHdTexture hd;
+        if (hd_texture_runtime_resolve((uint16_t)base_x, (uint16_t)base_y,
+                (uint8_t)depth, clut_x, clut_y, lim,
+                (uint8_t)s_tw_mask_x, (uint8_t)s_tw_mask_y,
+                (uint8_t)s_tw_off_x, (uint8_t)s_tw_off_y, &hd) &&
+            (hd_tex = hd_gl_texture(&s_legacy_hd_cache, &hd, PSXGL_TEXTURE0 + 1)) != 0) {
+            hd_map[0] = hd.texel_offset_u; hd_map[1] = hd.texel_offset_v;
+            hd_map[2] = hd.texel_width;    hd_map[3] = hd.texel_height;
+        }
+    }
+
     /* Append to the textured batch. Flush first if this prim's blend/mask/twin/
      * filter differ from the open batch, or the buffer is full. Per-prim texture
      * state goes in the vertex; only these keys force a new draw. */
@@ -4253,6 +4516,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         int reason = -1;
         if (s_tb_n > 0) {
             if (s_tb_bank_tex != s_selected_bank_tex) reason = 0;
+            else if (s_tb_hd_tex != hd_tex ||
+                     memcmp(s_tb_hd_map, hd_map, sizeof(hd_map)) != 0) reason = 0;
             else if (isolate) reason = 0;
             else if (batch_semi != s_tb_semi) reason = 1;
             else if (s_mask_set != s_tb_mask) reason = 2;
@@ -4272,6 +4537,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             s_tb_filter = s_tex_filter; s_tb_dither = dither;
             s_tb_gate = gate;
             s_tb_bank_tex = s_selected_bank_tex;
+            s_tb_hd_tex = hd_tex;
+            memcpy(s_tb_hd_map, hd_map, sizeof(hd_map));
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
@@ -5397,6 +5664,9 @@ static int init_gpu_raster(void) {
     s_uTwin     = p_glGetUniformLocation(s_tex_prog, "u_twin");
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
+    s_uHd       = p_glGetUniformLocation(s_tex_prog, "u_hd");
+    s_uHdOn     = p_glGetUniformLocation(s_tex_prog, "u_hd_on");
+    s_uHdMap    = p_glGetUniformLocation(s_tex_prog, "u_hd_map");
     s_geo_uDither = p_glGetUniformLocation(s_geo_prog, "u_dither");
     s_geo_uScale = p_glGetUniformLocation(s_geo_prog, "u_scale");
     s_tex_uDither = p_glGetUniformLocation(s_tex_prog, "u_dither");
@@ -9593,7 +9863,8 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         .temporal_component = operation->temporal.component_id, .temporal_index = temporal_index,
         .projection_offset_x = (int32_t)dx, .projection_offset_y = (int32_t)dy,
         .view_origin_y = target->y,
-        .dither_x = target->x & 3u, .dither_y = target->y & 3u};
+        .dither_x = target->x & 3u, .dither_y = target->y & 3u,
+        .hd_texture = operation->hd_texture};
     if (draw.material.textured) recipe->textures->references++;
 }
 
@@ -11358,6 +11629,7 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
             }
         }
         if (!native_materialize_native_draw(&semantic, &draw)) goto finished;
+        draw.hd_texture = record->hd_texture;
         if (use_view) {
             const GlNativeViewRaster raster = {.width = recipe->width, .height = recipe->height,
                 .pixels = pixels, .depth = depth};
@@ -12014,7 +12286,8 @@ static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRec
             x->motion_index != y->motion_index ||
             x->temporal_index != y->temporal_index || x->temporal_component != y->temporal_component ||
             x->enhanced != y->enhanced || x->view_origin_y != y->view_origin_y ||
-            x->dither_x != y->dither_x || x->dither_y != y->dither_y) return 0;
+            x->dither_x != y->dither_x || x->dither_y != y->dither_y ||
+            memcmp(&x->hd_texture, &y->hd_texture, sizeof(x->hd_texture))) return 0;
     }
     return 1;
 }
@@ -12527,6 +12800,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_DRAW) {
             XgSemanticDrawRecord draw;
             if (!native_materialize_native_draw(&operation.semantic, &draw)) goto failed;
+            draw.hd_texture = operation.hd_texture;
             int marked = draw.screen_space_2d != 0u || draw.native_view_effect != 0u;
             for (uint32_t ti = 0u; ti < draw.primitive.triangle_count; ++ti)
                 for (uint32_t vi = 0u; vi < 3u; ++vi)
@@ -13089,6 +13363,11 @@ static GLint s_native_gpu_attribute_origin, s_native_gpu_attribute_plane[5], s_n
 static GLint s_native_gpu_depth_state, s_native_gpu_depth_plane, s_native_gpu_depth_origin, s_native_gpu_depth_view;
 static GlNativeGpuPlane s_native_gpu_destination;
 static int s_native_gpu_uniforms[6][4], s_native_gpu_depth_value, s_native_gpu_origin_value[2];
+/* HD texture replacement on the Native GPU thread's context. */
+static GLint s_native_gpu_hd_on = -1, s_native_gpu_hd_map = -1, s_native_gpu_hd_lim = -1;
+static int s_native_gpu_hd_value;
+static HdGlCache s_native_gpu_hd_cache;
+static uint64_t s_native_gpu_hd_draws;
 
 /* Native GPU vertex: position (2), uv (2), color (4), perspective weight (1)
  * and padding. The weight is the normalized reciprocal view depth (1/z with
@@ -13145,6 +13424,9 @@ static const char *NATIVE_GPU_VS =
 static const char *NATIVE_GPU_FS =
     "#version 330\n"
     "uniform usampler2D words,destination_depth,source_depth; uniform sampler2D source_image,destination;\n"
+    /* HD texture replacement: hd_map = (page->upload texel offset u/v, upload
+     * size in texels), hd_lim = the draw's sampled page-texel rectangle. */
+    "uniform sampler2D hd_image; uniform int hd_on; uniform ivec4 hd_map,hd_lim;\n"
     "uniform ivec4 state,flags,page,window; uniform int depth; uniform ivec2 origin;\n"
     /* Native depth plane (see native_depth_plane): depth_state = (test, mode of
      * an unblended fragment 1=far 2=key 3=copy source, per-texel keep, bias);
@@ -13189,6 +13471,17 @@ static const char *NATIVE_GPU_FS =
     "}\n"
     "int word_at(ivec2 p){return int(texelFetch(words,p&ivec2(1023,511),0).r);}\n"
     "void main(){\n"
+    /* HD coordinates and their derivatives come first, in uniform control
+     * flow: every later discard would leave the texture LOD undefined. The
+     * sample point is the texel-space position of the fragment centre, like
+     * the bilinear VRAM path (size.z is the rasterizer's grid shift). */
+    " vec2 hd_uv=vec2(0.0),hd_dx=vec2(0.0),hd_dy=vec2(0.0);\n"
+    " if(hd_on!=0){vec2 hp=(persp!=0?t_p:t)+vec2(size.z); vec2 fl=floor(hp);\n"
+    "  ivec2 hq=ivec2(fl)&255; hq=(hq&~(window.xy*8))|((window.zw&window.xy)*8);\n"
+    "  vec2 k=vec2(textureSize(hd_image,0))/vec2(hd_map.zw);\n"
+    "  vec2 tx=clamp(vec2(hq+hd_map.xy)+(hp-fl),vec2(hd_lim.xy+hd_map.xy)+0.5/k,vec2(hd_lim.zw+hd_map.xy)+1.0-0.5/k);\n"
+    "  hd_uv=tx/vec2(hd_map.zw);}\n"
+    " hd_dx=dFdx(hd_uv); hd_dy=dFdy(hd_uv);\n"
     " vec4 old=vec4(0); if(flags.y!=0 || (flags.w==0 && state.z!=0)) old=texelFetch(destination,ivec2(gl_FragCoord.xy),0);\n"
     " if(flags.y!=0 && old.a>0.0) discard;\n"
     " uint key=0u,stored=0u; if(depth_state.x!=0||depth_state.z!=0) stored=texelFetch(destination_depth,ivec2(gl_FragCoord.xy),0).r;\n"
@@ -13202,16 +13495,27 @@ static const char *NATIVE_GPU_FS =
     " ivec3 c=ivec3(clamp(rgb,0.0,255.0)); int mask=flags.x,blend=state.z;\n"
     " const int d[16]=int[16](-4,0,-3,1,2,-2,3,-1,-3,1,-4,0,3,-1,2,-2);\n"
     " ivec2 dp=ivec2(floor(gl_FragCoord.xy/size.w))+origin; int bias=flags.z!=0?d[(dp.y&3)*4+(dp.x&3)]:0;\n"
+    " bool hd=false; vec3 hf=vec3(0.0);\n"
     " if(state.x!=0){vec2 uvs=persp!=0?t_p:vec2(attribute_at(0),attribute_at(1));\n"
     "  ivec2 q=ivec2(mod(uvs,256.0))&255; q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
     "  int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));\n"
     "  if(depth<2){int index=depth==0?(w>>((q.x&3)*4))&15:(w>>((q.x&1)*8))&255; w=word_at(page.zw+ivec2(index,0));}\n"
+    /* Replacement: coverage and colour from the HD image (premultiplied by
+     * coverage at upload), STP from the guest texel, full 8-bit precision. */
+    "  if(hd_on!=0){vec4 h=textureGrad(hd_image,hd_uv,hd_dx,hd_dy); if(h.a<0.5)discard; hd=true;\n"
+    "   hf=h.rgb/h.a; if(state.y==0)hf=clamp(hf*vec3(c)/128.0,0.0,1.0);\n"
+    "   int stp=w!=0?(w>>15)&1:0; mask|=stp; blend&=stp;\n"
+    "  }else{\n"
     "  if(w==0)discard; ivec3 tex=ivec3(w,w>>5,w>>10)&31; int stp=(w>>15)&1; mask|=stp; blend&=stp;\n"
-    "  c=state.y!=0?tex:clamp((((tex*c)>>4)+bias)>>3,ivec3(0),ivec3(31));\n"
+    "  c=state.y!=0?tex:clamp((((tex*c)>>4)+bias)>>3,ivec3(0),ivec3(31));}\n"
     " }else c=clamp((c+bias)>>3,ivec3(0),ivec3(31));\n"
+    " if(hd){if(blend!=0){vec3 b=old.rgb;\n"
+    "  if(state.w==0)hf=(b+hf)*0.5; else if(state.w==1)hf=b+hf; else if(state.w==2)hf=b-hf; else hf=b+hf*0.25;}\n"
+    "  result=vec4(clamp(hf,0.0,1.0),float(mask));\n"
+    " }else{\n"
     " if(blend!=0){ivec3 b=ivec3(floor(old.rgb*255.0+0.5))>>3;\n"
     "  if(state.w==0)c=(b+c)/2; else if(state.w==1)c=b+c; else if(state.w==2)c=b-c; else c=b+c/4;}\n"
-    " c=clamp(c,ivec3(0),ivec3(31)); result=vec4(vec3((c<<3)|(c>>2))/255.0,float(mask));\n"
+    " c=clamp(c,ivec3(0),ivec3(31)); result=vec4(vec3((c<<3)|(c>>2))/255.0,float(mask));}\n"
     /* Blended fragments keep the stored key; opaque ones (including opaque
      * texels of a semi-transparent material) write the key or far. */
     " depth_result=uvec4(blend!=0?stored:(depth_state.y==2?key:0u));\n"
@@ -13320,6 +13624,11 @@ static int native_gpu_program_init(void) {
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"source_image"),2);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"destination_depth"),3);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"source_depth"),4);
+    p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"hd_image"),5);
+    s_native_gpu_hd_on=p_glGetUniformLocation(s_native_gpu_program,"hd_on");
+    s_native_gpu_hd_map=p_glGetUniformLocation(s_native_gpu_program,"hd_map");
+    s_native_gpu_hd_lim=p_glGetUniformLocation(s_native_gpu_program,"hd_lim");
+    s_native_gpu_hd_value=0;
     s_native_gpu_depth_state=p_glGetUniformLocation(s_native_gpu_program,"depth_state");
     s_native_gpu_depth_plane=p_glGetUniformLocation(s_native_gpu_program,"depth_plane");
     s_native_gpu_depth_origin=p_glGetUniformLocation(s_native_gpu_program,"depth_origin");
@@ -13629,6 +13938,23 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             } else native_gpu_uniform4(1,s_native_gpu_flags,m->mask_set,m->mask_check,m->dither,0);
             native_gpu_uniform4(2,s_native_gpu_page,m->texture_page_x*64,m->texture_page_y*256,m->clut_x,m->clut_y);
             native_gpu_uniform4(3,s_native_gpu_window,m->texture_window_mask_x,m->texture_window_mask_y,m->texture_window_offset_x,m->texture_window_offset_y);
+            {
+                /* The replacement is bound for the whole draw; its texture is
+                 * per-draw state like the page and CLUT above. */
+                const GpuRenderHdTexture *hd = &draw->hd_texture;
+                const int hd_on = !wire && m->textured && hd->valid &&
+                    hd_gl_texture(&s_native_gpu_hd_cache, hd, PSXGL_TEXTURE0 + 5) != 0;
+                if (hd_on) {
+                    ++s_native_gpu_hd_draws;
+                    p_glUniform4i(s_native_gpu_hd_map, hd->texel_offset_u, hd->texel_offset_v,
+                                  hd->texel_width, hd->texel_height);
+                    p_glUniform4i(s_native_gpu_hd_lim, hd->lim[0], hd->lim[1], hd->lim[2], hd->lim[3]);
+                }
+                if (s_native_gpu_hd_value != hd_on) {
+                    p_glUniform1i(s_native_gpu_hd_on, hd_on);
+                    s_native_gpu_hd_value = hd_on;
+                }
+            }
             if(s_native_gpu_depth_value!=(int)m->texture_depth) {
                 p_glUniform1i(s_native_gpu_depth,m->texture_depth);s_native_gpu_depth_value=m->texture_depth;
             }
@@ -14165,6 +14491,7 @@ static int native_gpu_thread_main(void *unused) {
     if(s_native_gpu_vbo)p_glDeleteBuffers(1,&s_native_gpu_vbo);
     if(s_native_gpu_words)glDeleteTextures(1,&s_native_gpu_words);
     if(s_native_gpu_input)glDeleteTextures(1,&s_native_gpu_input);
+    hd_gl_cache_clear(&s_native_gpu_hd_cache);
     s_native_gpu_program=s_native_gpu_vao=s_native_gpu_vbo=s_native_gpu_words=s_native_gpu_input=0;
     SDL_GL_MakeCurrent(s_native_gpu_drawable,NULL);
     return 0;
@@ -15676,6 +16003,8 @@ void gl_renderer_native_shutdown(void) {
         free(s_native_gpu_readback_spare[i]);s_native_gpu_readback_spare[i]=NULL;s_native_gpu_readback_capacity[i]=0;
     }
     memset(&s_native_gpu_destination,0,sizeof(s_native_gpu_destination));
+    s_native_gpu_hd_cache.count = 0; s_native_gpu_hd_cache.bytes = 0; /* died with the context */
+    s_native_gpu_hd_cache.resident = s_native_gpu_hd_cache.failed = 0;
     s_native_gpu_program=s_native_gpu_vao=s_native_gpu_vbo=s_native_gpu_words=s_native_gpu_input=0u;
     s_native_gpu_scale=0u;
     s_native_presenter_prog = 0u;
@@ -15733,7 +16062,11 @@ void gl_renderer_shutdown(void) {
     }
     memset(s_bank_tex, 0, sizeof s_bank_tex);
     s_selected_bank_tex = s_tb_bank_tex = s_tb_handoff_bank_tex = 0;
-    if (s_ctx) SDL_GL_MakeCurrent(s_win, s_ctx);
+    s_tb_hd_tex = s_tb_handoff_hd_tex = 0;
+    if (s_ctx) {
+        SDL_GL_MakeCurrent(s_win, s_ctx);
+        hd_gl_cache_clear(&s_legacy_hd_cache);
+    }
     gl_renderer_native_shutdown();
     psx_wayland_presentation_shutdown();
     pres_hash_collect();
@@ -24168,3 +24501,17 @@ static const GpuRenderBackend GL_BACKEND = {
 };
 
 const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }
+
+/* HD texture replacement diagnostics for the debug server: GPU-resident
+ * replacement images and their bytes per context, images that failed to load,
+ * and draws the Native GPU thread actually drew from a replacement. Plain
+ * reads of owner-thread counters; values are advisory. */
+void gl_renderer_hd_texture_stats(uint64_t out[7]) {
+    out[0] = s_native_gpu_hd_cache.resident;
+    out[1] = s_native_gpu_hd_cache.bytes;
+    out[2] = s_native_gpu_hd_cache.failed;
+    out[3] = s_legacy_hd_cache.resident;
+    out[4] = s_legacy_hd_cache.bytes;
+    out[5] = s_legacy_hd_cache.failed;
+    out[6] = s_native_gpu_hd_draws;
+}

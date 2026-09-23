@@ -610,6 +610,9 @@ if(BUILD_TESTING)
     add_executable(mod_runtime_test
         tests/test_mod_runtime.cpp
         src/mod_runtime.cpp
+        src/hd_texture_packs.cpp
+        src/hd_texture_runtime.cpp
+        src/hd_texture_pack.cpp
         src/mod_packages.cpp
         src/disc_path.cpp
         src/cue_sheet.cpp
@@ -620,7 +623,9 @@ if(BUILD_TESTING)
         include
         ../recompiler/include
         ../recompiler/lib/toml11)
-    target_link_libraries(mod_runtime_test PRIVATE chdr-static)
+    target_link_libraries(mod_runtime_test PRIVATE chdr-static Threads::Threads)
+    target_compile_definitions(mod_runtime_test PRIVATE
+        HD_TEXTURE_PACK_DISABLE_PNG_DECODE=1)
     # The real disc hasher uses a 1 MiB scratch buffer. Match the runtime's
     # stack allowance instead of overflowing MinGW's 1 MiB executable default.
     if(WIN32)

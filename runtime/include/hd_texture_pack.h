@@ -76,6 +76,22 @@ int hd_texture_pack_create(const char* explicit_root,
                            HdTexturePack** out_pack,
                            char* error,
                            size_t error_capacity);
+/* Several packs at once: roots[0] has the highest priority and a later root
+ * only contributes keys none of the earlier ones provide. Each root accepts the
+ * same layouts as hd_texture_pack_create. */
+int hd_texture_pack_create_multi(const char* const* roots,
+                                 size_t root_count,
+                                 HdTexturePack** out_pack,
+                                 char* error,
+                                 size_t error_capacity);
+/* Validates a candidate root without keeping it: reports how many
+ * replacement images it holds and the replacement directory it resolved to. */
+int hd_texture_pack_probe(const char* root,
+                          size_t* out_file_count,
+                          char* resolved_root,
+                          size_t resolved_capacity,
+                          char* error,
+                          size_t error_capacity);
 void hd_texture_pack_destroy(HdTexturePack* pack);
 void hd_texture_pack_get_info(const HdTexturePack* pack,
                               HdTexturePackInfo* out_info);
@@ -102,6 +118,7 @@ uint32_t hd_texture_hash_clut(const uint16_t* vram,
 
 /* Upload bytes are row-major logical upload words, independent of destination
  * wrapping. Tracking invalidates/splits every intersected older residency.
+ * Only uploads whose hash the pack ships an image for are kept resident.
  * Width <= 1024 and height <= 512; X/Y may wrap. */
 int hd_texture_pack_track_upload(HdTexturePack* pack,
                                  uint16_t x,
@@ -111,6 +128,16 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
                                  const uint16_t* words,
                                  size_t word_count,
                                  uint32_t* out_texture_hash);
+/* GP0(80h) VRAM->VRAM copy: tracked texture pieces inside the source rect
+ * reappear at the destination (Beetle's rect-tracker blit); everything the
+ * destination previously held is invalidated. */
+void hd_texture_pack_track_copy(HdTexturePack* pack,
+                                uint16_t src_x,
+                                uint16_t src_y,
+                                uint16_t dst_x,
+                                uint16_t dst_y,
+                                uint16_t width_words,
+                                uint16_t height);
 void hd_texture_pack_invalidate(HdTexturePack* pack,
                                 uint16_t x,
                                 uint16_t y,
@@ -181,6 +208,14 @@ int hd_texture_pack_acquire_decoded(HdTexturePack* pack,
                                     uint32_t texture_hash,
                                     uint32_t palette_hash,
                                     HdTexturePixels* out_pixels);
+/* Queues every palette variant the pack ships for this texture hash, so an
+ * image is usually decoded by the time the game first draws it. */
+void hd_texture_pack_prefetch(HdTexturePack* pack, uint32_t texture_hash);
+/* Drops a Ready decoded image once its consumer has its own copy (e.g. a GPU
+ * texture). Outstanding leases keep their pixels alive. */
+void hd_texture_pack_forget_decoded(HdTexturePack* pack,
+                                    uint32_t texture_hash,
+                                    uint32_t palette_hash);
 void hd_texture_pixels_release(HdTexturePixels* pixels);
 
 #ifdef __cplusplus

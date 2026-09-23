@@ -121,7 +121,23 @@ enum {
                                     VRAM remains the sole pixel authority.       */
     BS_SEC_RAM_PROVENANCE = 0x12, /* Versioned pointer-free per-word RAM authority
                                      and receipt/revision counter.               */
+    BS_SEC_HD_TEXTURE = 0x14, /* Optional host HD-texture upload residency
+                                 (texture-pack tracker). Written when its hooks
+                                 are installed; applied after VRAM; absent in
+                                 states saved without it.                     */
 };
+
+/* Host payload for BS_SEC_HD_TEXTURE, NULL by default. write fills exactly
+ * bytes() bytes; read validates and returns 0 on a malformed payload. reset
+ * runs when BS_SEC_VRAM replaces guest VRAM, so a state saved without the
+ * section never inherits the previous timeline's residency. */
+typedef struct BootStateHdTextureHooks {
+    uint32_t (*bytes)(void);
+    void (*write)(uint8_t *out);
+    int (*read)(const uint8_t *data, uint32_t size);
+    void (*reset)(void);
+} BootStateHdTextureHooks;
+void boot_state_set_hd_texture_hooks(const BootStateHdTextureHooks *hooks);
 
 typedef struct BootStateNativeCheckpointHooks {
     uint32_t (*snapshot_size)(void);
