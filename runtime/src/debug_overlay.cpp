@@ -485,13 +485,21 @@ static int      s_var_edit[512]      = {0};
 /* Global enemy picker: (name, set, def). Parsed from
  * docs/xenogears-disc1-filesystem.md dir 0x0D visual-file lists.
  * Lanes of one battle must share a set (single enemy pair loads),
- * so picking an enemy from another set switches the battle set. */
+ * so picking an enemy from another set switches the battle set.
+ *
+ * Only definitions with a usable AI block are listed. A visual file can
+ * name enemies whose selector block in the set's definition file (dir 0x0D
+ * ID 2+2*set; docs/xenogears/battle/06 §2) is empty: its turn program sits
+ * on its own header or the reaction offset points past the block. The
+ * engine never stages those, and attacking one runs the enemy VM over
+ * zeros until its action list overflows into the mecha table and the
+ * kernel vectors. Checked on both discs (identical): set 0 has only def 0
+ * (Hobgob/Armor Grub/Armor Wasp there are not real), and set 11 def 6
+ * ("Weltall", a parse artifact of "[Rankar Dragon, Land Crab, Weltall]")
+ * is empty. */
 struct DbgBattleEnemy { const char *name; int set; int def; };
 static const DbgBattleEnemy kBattleEnemies[] = {
     { "Jackal", 0, 0 },
-    { "Hobgob", 0, 1 },
-    { "Armor Grub", 0, 2 },
-    { "Armor Wasp", 0, 3 },
     { "Jackal", 1, 0 },
     { "Hobgob", 1, 1 },
     { "Lucre Bug", 1, 2 },
@@ -548,7 +556,6 @@ static const DbgBattleEnemy kBattleEnemies[] = {
     { "WM Rankar 1", 11, 3 },
     { "WM Rankar 2 [Rankar Dragon", 11, 4 },
     { "Land Crab", 11, 5 },
-    { "Weltall]", 11, 6 },
     { "Armor Grub", 12, 0 },
     { "Armor Wasp", 12, 1 },
     { "Acid Frog", 12, 2 },
@@ -786,7 +793,8 @@ static const DbgBattleEnemy kBattleEnemies[] = {
     { "Yggdrasil II]", 74, 6 },
     { "Urobolus", 75, 0 },
 };
-static constexpr int kBattleEnemyCount = 297;
+static constexpr int kBattleEnemyCount =
+    (int)(sizeof(kBattleEnemies) / sizeof(kBattleEnemies[0]));
 static constexpr int kBattleEnemySetMax = 75;
 
 /* Battle arenas (dir 0x0F pairs): arena n <-> env file 6+2n, init 7+2n.
