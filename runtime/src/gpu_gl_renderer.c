@@ -5409,6 +5409,18 @@ void gl_renderer_set_display_aspect(int num, int den) {
     s_aspect_num = num; s_aspect_den = den;
 }
 
+/* Presentation-only stretch (Toggles "3:2"): the game keeps its 4:3 view and
+ * only the final fit widens, so non-square guest pixels present square. The
+ * legacy paths get it through s_aspect (set_display_aspect); this flag lets
+ * the Native presenter, which fits to its endpoint's aspect, follow. 24-bit
+ * (FMV) endpoints stay 4:3, like force_4_3 on the legacy paths. 0 = off. */
+static int s_stretch_num = 0, s_stretch_den = 0;
+
+void gl_renderer_set_display_stretch(int num, int den) {
+    if (num <= 0 || den <= 0) { num = 0; den = 0; }
+    s_stretch_num = num; s_stretch_den = den;
+}
+
 /* Letterbox: largest num:den rect centered in an enclosing rectangle. */
 static void letterbox_rect_aspect_in(int ox, int oy, int ow, int oh,
                                      int num, int den,
@@ -15287,10 +15299,15 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
         failure_blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_DRAWABLE;
         goto compose_failed;
     }
-    letterbox_rect_aspect_in(0, 0, ww, wh,
-                             endpoint.metadata.aspect_num,
-                             endpoint.metadata.aspect_den,
-                             &lx, &ly, &lw, &lh);
+    if (s_stretch_num > 0 && !endpoint.metadata.depth24)
+        letterbox_rect_aspect_in(0, 0, ww, wh,
+                                 s_stretch_num, s_stretch_den,
+                                 &lx, &ly, &lw, &lh);
+    else
+        letterbox_rect_aspect_in(0, 0, ww, wh,
+                                 endpoint.metadata.aspect_num,
+                                 endpoint.metadata.aspect_den,
+                                 &lx, &ly, &lw, &lh);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);

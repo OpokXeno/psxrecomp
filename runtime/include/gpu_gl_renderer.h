@@ -1106,6 +1106,11 @@ GpuRenderTransactionStatus gl_renderer_record_interpolation_anchors(
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
 
+/* Presentation-only stretch of the 4:3 view to num:den (0,0 = off). Pair with
+ * gl_renderer_set_display_aspect(num, den); the Native presenter follows it
+ * for everything except 24-bit (FMV) endpoints, which stay 4:3. */
+void gl_renderer_set_display_stretch(int num, int den);
+
 /* Scanline post-process (host display setting). on toggles the effect; strength
  * (0..1) is the depth of the dark gap between PS1 scanlines. Applied at the
  * native display-line pitch in the present/interpolation shaders, and faded in

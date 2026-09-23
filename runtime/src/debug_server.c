@@ -8390,13 +8390,22 @@ static void handle_ws_aspect_get(int id, const char *json)
 }
 
 extern int psx_debug_display_aspect(int num, int den, int adaptive);
+extern int psx_video_set_display_stretch(int num, int den);
+/* stretch=1 keeps the 4:3 game view and only stretches the present to num:den
+ * (the Toggles "3:2" option); otherwise num:den is the widescreen aspect. */
 static void handle_display_aspect(int id, const char *json) {
     int num=json_get_int(json,"num",-1), den=json_get_int(json,"den",-1);
     int adaptive=json_get_int(json,"adaptive",0);
-    if (!psx_debug_display_aspect(num,den,adaptive)) {
+    int stretch=json_get_int(json,"stretch",0);
+    if (stretch) {
+        if (!psx_video_set_display_stretch(num,den)) {
+            send_err(id,"invalid display stretch (wider than 4:3, up to 32:9)");return;
+        }
+    } else if (!psx_debug_display_aspect(num,den,adaptive)) {
         send_err(id,"invalid display aspect (4:3 through 32:9)");return;
     }
-    send_fmt("{\"id\":%d,\"ok\":true,\"num\":%d,\"den\":%d,\"adaptive\":%d}",id,num,den,adaptive!=0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"num\":%d,\"den\":%d,\"adaptive\":%d,\"stretch\":%d}",
+             id,num,den,adaptive!=0,stretch!=0);
 }
 
 /* Live native-wide vs squash toggle (A/B): ws_nw on=<0|1> re-engages the wide

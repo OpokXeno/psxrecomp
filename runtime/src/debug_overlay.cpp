@@ -161,6 +161,8 @@ extern "C" void psx_video_set_screen_model(int k);
 extern "C" void psx_video_get_aspect(int *num, int *den);
 extern "C" int  psx_debug_display_aspect(int num, int den, int adaptive);
 extern "C" int  psx_video_set_aspect_runtime(int num, int den, int native_wide);
+extern "C" int  psx_video_set_display_stretch(int num, int den);
+extern "C" int  psx_video_get_display_stretch(int *num, int *den);
 extern "C" int  psx_audio_get_spu_hq(void);
 extern "C" void psx_audio_set_spu_hq(int on);
 extern "C" int  psx_video_get_native_depth_test(void);
@@ -1141,7 +1143,11 @@ static void draw_gpu_state_section(void)
     {
         int anum = 4, aden = 3;
         psx_video_get_aspect(&anum, &aden);
-        if (aden > 0) {
+        int snum = 0, sden = 0;
+        if (psx_video_get_display_stretch(&snum, &sden)) {
+            ImGui::Text("Aspect          : %d:%d (stretched to %d:%d)",
+                        anum, aden, snum, sden);
+        } else if (aden > 0) {
             ImGui::Text("Aspect          : %d:%d", anum, aden);
         } else {
             ImGui::Text("Aspect          : (unset)");
@@ -1304,24 +1310,36 @@ static void request_kernel_menu(void)
 
 static void draw_toggles_section(void)
 {
-    /* Single aspect selector (4:3 / 16:9). Same stack the launcher
-     * fixed-aspect applies, but live: display fit, widescreen projection
-     * (GTE + ws configure) and the native view + cull reconfigure. */
-    static const char *kAspectRatio[] = { "4:3", "16:9" };
+    /* Single aspect selector (4:3 / 3:2 / 16:9). 4:3 and 16:9 run the same
+     * stack the launcher fixed-aspect applies, but live: display fit,
+     * widescreen projection (GTE + ws configure) and the native view + cull
+     * reconfigure. 3:2 keeps the 4:3 game view and only stretches the
+     * present, so the guest's non-square pixels show square (round battle
+     * reticle/palette, square portraits); FMVs stay 4:3. */
+    static const char *kAspectRatio[] = { "4:3", "3:2 (stretched)", "16:9" };
     int vanum = 4, vaden = 3;
     psx_video_get_aspect(&vanum, &vaden);
-    int aspect_index = (vaden > 0 && vanum * 3 != vaden * 4) ? 1 : 0;
-    if (ImGui::Combo("Aspect ratio", &aspect_index, kAspectRatio, 2)) {
-        if (aspect_index == 1) {
+    int aspect_index = (vaden > 0 && vanum * 3 != vaden * 4) ? 2
+                     : psx_video_get_display_stretch(nullptr, nullptr) ? 1 : 0;
+    if (ImGui::Combo("Aspect ratio", &aspect_index, kAspectRatio, 3)) {
+        if (aspect_index == 2) {
             (void)psx_video_set_aspect_runtime(16, 9, 1);
             s_aspect_num = 16; s_aspect_den = 9;
             g_ws_bd_stretch_on = 1;
+        } else if (aspect_index == 1) {
+            (void)psx_video_set_display_stretch(3, 2);
+            s_aspect_num = 4; s_aspect_den = 3;
+            g_ws_bd_stretch_on = 0;
         } else {
             (void)psx_video_set_aspect_runtime(4, 3, 0);
             s_aspect_num = 4; s_aspect_den = 3;
             g_ws_bd_stretch_on = 0;
         }
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("3:2 stretches the 4:3 picture to Xenogears' pixel\n"
+                          "aspect: circles round, portraits square. Same field\n"
+                          "of view as 4:3; FMVs stay 4:3.");
 
     ImGui::Separator();
     ImGui::TextDisabled("Launcher settings:");

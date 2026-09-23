@@ -2303,9 +2303,22 @@ extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 
 /* TCP diagnostics: change the rendered view without moving, resizing, raising
  * or focusing the user's window. Transient; never writes settings.toml. */
+/* Presentation-only stretch (Toggles "3:2"); 0 = off. The game aspect above
+ * stays 4:3, so no widescreen projection, native wide view or cull widening
+ * engages; only the backends' final fit changes. Session-only. */
+static int g_video_stretch_num = 0;
+static int g_video_stretch_den = 0;
+
+static void clear_display_stretch() {
+    g_video_stretch_num = 0;
+    g_video_stretch_den = 0;
+    gl_renderer_set_display_stretch(0, 0);
+}
+
 extern "C" int psx_debug_display_aspect(int num, int den, int adaptive) {
     if (adaptive) return psx_mod_set_adaptive_display_aspect(num, den);
     if (!psx_mod_set_fixed_display_aspect(num, den)) return 0;
+    clear_display_stretch();
     gl_renderer_set_display_aspect(num, den);
     vk_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
@@ -2341,6 +2354,34 @@ extern "C" int psx_video_set_aspect_runtime(int num, int den, int native_wide) {
             1, num, den, 320, 240);
     }
     refresh_widescreen_projection();
+    return 1;
+}
+
+/* Stretch the 4:3 view to num:den at present (Toggles "3:2"). Resets the game
+ * to 4:3 first so a live 16:9 disengages, then widens only the display fit. */
+extern "C" int psx_video_set_display_stretch(int num, int den) {
+    if (num <= 0 || den <= 0 || num * 3 <= den * 4 || num * 9 > den * 32)
+        return 0;
+    if (!psx_video_set_aspect_runtime(4, 3, 0))
+        return 0;
+    g_video_stretch_num = num;
+    g_video_stretch_den = den;
+    gl_renderer_set_display_aspect(num, den);
+    gl_renderer_set_display_stretch(num, den);
+    vk_renderer_set_display_aspect(num, den);
+    if (sdl_renderer) {
+        g_logical_w = 480 * num * g_video_scale / den;
+        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
+    }
+    return 1;
+}
+
+/* Active presentation stretch; returns 0 (and leaves num/den) when off. */
+extern "C" int psx_video_get_display_stretch(int *num, int *den) {
+    if (g_video_stretch_num <= 0 || g_video_stretch_den <= 0)
+        return 0;
+    if (num) *num = g_video_stretch_num;
+    if (den) *den = g_video_stretch_den;
     return 1;
 }
 
