@@ -11175,6 +11175,37 @@ static void handle_native_last_motion_diag(int id, const char *json)
     send_line(buffer);
 }
 
+/* native_sprite_cards: last staged Field actor card pieces (two triangles
+ * each; canonical Q16.16 x/y and u/v), oldest first. count<=64. */
+static void handle_native_sprite_cards(int id, const char *json)
+{
+    PsxXgRenderSpriteCardDiagnostic cards[64];
+    int requested = json_get_int(json, "count", 64);
+    if (requested < 1) requested = 1;
+    if (requested > 64) requested = 64;
+    const size_t count = psx_xg_render_auth_sprite_cards(cards, (size_t)requested);
+    const size_t capacity = 128u + count * 640u;
+    char *buffer = (char *)malloc(capacity);
+    if (buffer == NULL) { send_err(id, "alloc failed"); return; }
+    size_t position = (size_t)snprintf(buffer, capacity,
+        "{\"id\":%d,\"ok\":true,\"cards\":[", id);
+    for (size_t i = 0u; i < count && position < capacity; ++i) {
+        const PsxXgRenderSpriteCardDiagnostic *c = &cards[i];
+        position += (size_t)snprintf(buffer + position, capacity - position,
+            "%s{\"seq\":%u,\"sprite\":\"0x%08X\",\"descriptor\":\"0x%08X\",\"v\":[",
+            i ? "," : "", c->sequence, c->sprite_address, c->descriptor_address);
+        for (int k = 0; k < 6 && position < capacity; ++k)
+            position += (size_t)snprintf(buffer + position, capacity - position,
+                "%s[%d,%d,%d,%d]", k ? "," : "", c->x[k], c->y[k], c->u[k], c->v[k]);
+        if (position < capacity)
+            position += (size_t)snprintf(buffer + position, capacity - position, "]}");
+    }
+    if (position < capacity)
+        snprintf(buffer + position, capacity - position, "]}");
+    send_fmt("%s", buffer);
+    free(buffer);
+}
+
 static void handle_native_producer_phase_items(int id, const char *json)
 {
     char producer_text[32];
@@ -18070,6 +18101,7 @@ static const CmdEntry s_commands[] = {
     { "native_vram_journal", handle_native_vram_journal },
     { "native_producer_phase_diag", handle_native_producer_phase_diag },
     { "native_producer_phase_items", handle_native_producer_phase_items },
+    { "native_sprite_cards", handle_native_sprite_cards },
     { "native_stream_attribution", handle_native_stream_attribution },
     { "xg_projected_state", handle_xg_projected_state },
     { "wide_full",         handle_wide_full },
