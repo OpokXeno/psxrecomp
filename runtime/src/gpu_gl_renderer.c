@@ -4423,6 +4423,82 @@ static void gpu_line_subpixel(const float *x, const float *y,
  * stencil (mask) write value is constant within each pass; the semi pass is
  * also where PS1 blending applies. lim = uv sampling bounds (see
  * tri_uv_limits); NULL computes them from the vertices. */
+/* Semi-transparent prims used to be drawn one per draw call so a later prim
+ * blends over an earlier one in submission order. That order only matters
+ * where their pixels meet: prims whose coverage is disjoint commute, so the
+ * open batch can take a semi prim that overlaps none of its triangles and the
+ * result is identical. Scene-heavy frames (Xenogears Gear battles: ~20k semi
+ * triangles/s) otherwise pay a full state setup + draw per triangle.
+ *
+ * Exact 2D separating-axis test on the queued triangles. Touching counts as
+ * disjoint: GL's fill rule never covers a pixel from both sides of a shared
+ * edge (the two halves of a quad). Degenerate triangles cover nothing. The
+ * scan is capped so a long batch of scattered prims stays cheap. */
+#define TEXBATCH_SEMI_SCAN_TRIS 256
+
+static float tri_area2(const float *x, const float *y) {
+    return (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+}
+
+static int tri_axis_separates(const float *ax, const float *ay,
+                              const float *bx, const float *by,
+                              float nx, float ny) {
+    float a_lo = ax[0] * nx + ay[0] * ny, a_hi = a_lo;
+    float b_lo = bx[0] * nx + by[0] * ny, b_hi = b_lo;
+    for (int i = 1; i < 3; i++) {
+        const float pa = ax[i] * nx + ay[i] * ny;
+        const float pb = bx[i] * nx + by[i] * ny;
+        if (pa < a_lo) a_lo = pa;
+        if (pa > a_hi) a_hi = pa;
+        if (pb < b_lo) b_lo = pb;
+        if (pb > b_hi) b_hi = pb;
+    }
+    return a_hi <= b_lo || b_hi <= a_lo;
+}
+
+static int tris_overlap(const float *ax, const float *ay,
+                        const float *bx, const float *by) {
+    for (int t = 0; t < 2; t++) {
+        const float *px = t ? bx : ax, *py = t ? by : ay;
+        for (int i = 0; i < 3; i++) {
+            const int j = i == 2 ? 0 : i + 1;
+            if (tri_axis_separates(ax, ay, bx, by,
+                                   py[j] - py[i], px[i] - px[j]))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+/* 1 = the triangle overlaps a queued one (or the scan cap is hit) and must
+ * not join the open batch; 0 = disjoint from everything queued. */
+static int tex_batch_semi_overlaps(const float *x, const float *y) {
+    const int tris = s_tb_n / 3;
+    float lo_x, hi_x, lo_y, hi_y;
+
+    if (tris > TEXBATCH_SEMI_SCAN_TRIS) return 1;
+    if (tri_area2(x, y) == 0.0f) return 0;
+    lo_x = hi_x = x[0]; lo_y = hi_y = y[0];
+    for (int i = 1; i < 3; i++) {
+        if (x[i] < lo_x) lo_x = x[i];
+        if (x[i] > hi_x) hi_x = x[i];
+        if (y[i] < lo_y) lo_y = y[i];
+        if (y[i] > hi_y) hi_y = y[i];
+    }
+    for (int t = 0; t < tris; t++) {
+        const float *v = &s_tb[t * 3 * TEXV];
+        const float qx[3] = { v[0], v[TEXV], v[2 * TEXV] };
+        const float qy[3] = { v[1], v[TEXV + 1], v[2 * TEXV + 1] };
+        if (qx[0] >= hi_x && qx[1] >= hi_x && qx[2] >= hi_x) continue;
+        if (qx[0] <= lo_x && qx[1] <= lo_x && qx[2] <= lo_x) continue;
+        if (qy[0] >= hi_y && qy[1] >= hi_y && qy[2] >= hi_y) continue;
+        if (qy[0] <= lo_y && qy[1] <= lo_y && qy[2] <= lo_y) continue;
+        if (tri_area2(qx, qy) == 0.0f) continue;
+        if (tris_overlap(x, y, qx, qy)) return 1;
+    }
+    return 0;
+}
+
 static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const int *us, const int *vs,
                                   const float *col, uint16_t texpage,
@@ -4507,18 +4583,25 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * mis-orders against neighbouring opaque geometry. Isolate EVERY
          * semi-transparent textured prim: drain the open batch, draw this
          * prim alone (composited fully before the next), let opaque prims
-         * keep batching. Cost is one draw per semi prim. A separately opted-in
-         * immutable bank may batch the single-pass dual-source cases: it
-         * cannot alias a render target, keeps painter order, and still splits
-         * on opaque transitions, bank/state changes, masking or subtraction. */
+         * keep batching. A semi prim joins an open batch of the same state
+         * only when its coverage is disjoint from every queued triangle
+         * (tex_batch_semi_overlaps), which leaves painter order unobservable.
+         * A separately opted-in immutable bank may batch the single-pass
+         * dual-source cases: it cannot alias a render target, keeps painter
+         * order, and still splits on opaque transitions, bank/state changes,
+         * masking or subtraction. */
         int isolate = semi >= 0 &&
             !mod_texture_bank_batchable(s_selected_bank_tex != 0, s_mask_check, semi);
+        float tri_x[3], tri_y[3];
+        for (int i = 0; i < 3; i++) {
+            tri_x[i] = subpixel_x ? subpixel_x[i] : (float)xs[i];
+            tri_y[i] = subpixel_y ? subpixel_y[i] : (float)ys[i];
+        }
         int reason = -1;
         if (s_tb_n > 0) {
             if (s_tb_bank_tex != s_selected_bank_tex) reason = 0;
             else if (s_tb_hd_tex != hd_tex ||
                      memcmp(s_tb_hd_map, hd_map, sizeof(hd_map)) != 0) reason = 0;
-            else if (isolate) reason = 0;
             else if (batch_semi != s_tb_semi) reason = 1;
             else if (s_mask_set != s_tb_mask) reason = 2;
             else if (s_tex_filter != s_tb_filter) reason = 3;
@@ -4526,6 +4609,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else if (twx != s_tb_twin[0] || twy != s_tb_twin[1] ||
                       tox != s_tb_twin[2] || toy != s_tb_twin[3]) reason = 5;
             else if (dither != s_tb_dither) reason = 5;
+            else if (isolate && tex_batch_semi_overlaps(tri_x, tri_y)) reason = 0;
         }
         if (reason >= 0) {
             s_batch_reason[reason]++;
@@ -4543,8 +4627,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         }
         float *vp = &s_tb[s_tb_n * TEXV];
         for (int i = 0; i < 3; i++, vp += TEXV) {
-            vp[0] = subpixel_x ? subpixel_x[i] : (float)xs[i];
-            vp[1] = subpixel_y ? subpixel_y[i] : (float)ys[i];
+            vp[0] = tri_x[i];
+            vp[1] = tri_y[i];
             vp[2] = (float)us[i];   vp[3] = (float)vs[i];
             vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
             vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
@@ -4556,7 +4640,6 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[19] = s_pq_valid ? s_pq[i] : 0.0f;                   /* a_q; 0 = affine */
         }
         s_tb_n += 3;
-        if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
     }
 }
 
