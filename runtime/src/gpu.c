@@ -7105,7 +7105,12 @@ static int native_semantic_is_dialogue_continue_indicator(
             XG_DIALOGUE_CONTINUE_HEIGHT * INT32_C(65536);
 }
 
-static int native_semantic_is_fullscreen_filter(const GpuRenderSemantic *semantic) {
+/* An untextured polygon rectangle spanning the whole display width is a
+ * screen-space layer, whatever its height: full-screen fades, and the
+ * panorama's horizon fills and Gouraud haze band (CreateFieldPanoramaPrimitiveSet
+ * fixes their X at 0 and 320; RenderFieldPanoramaSpan only moves their Y). Left
+ * at the 4:3 span they leave a centred rectangle over the widened sky. */
+static int native_semantic_is_full_width_filter(const GpuRenderSemantic *semantic) {
     GpuDisplayInfo display = {0};
     int32_t min_x = INT32_MAX, max_x = INT32_MIN;
     int32_t min_y = INT32_MAX, max_y = INT32_MIN;
@@ -7137,10 +7142,7 @@ static int native_semantic_is_fullscreen_filter(const GpuRenderSemantic *semanti
             (int64_t)material->draw_area_left * 65536 ||
         (int64_t)max_x + (int64_t)material->draw_offset_x * 65536 <
             ((int64_t)material->draw_area_left + display.width) * 65536 ||
-        (int64_t)min_y + (int64_t)material->draw_offset_y * 65536 >
-            (int64_t)material->draw_area_top * 65536 ||
-        (int64_t)max_y + (int64_t)material->draw_offset_y * 65536 <
-            ((int64_t)material->draw_area_top + height) * 65536)
+        max_y <= min_y)
         return 0;
     /* Prove a complete rectangle, not just a large two-triangle bounding box.
      * Flat and Gouraud filters share this layout; their color/blend is retained. */
@@ -7166,9 +7168,9 @@ static uint8_t native_semantic_screen_space_mode(
         native_semantic_is_dialogue_border(opcode, semantic) ||
         native_semantic_is_dialogue_continue_indicator(opcode, semantic))
         return GPU_RENDER_SCREEN_SPACE_2D_NONE;
-    /* Display-covering polygon filters need the same expansion as TILEs,
+    /* Display-width polygon filters need the same expansion as TILEs,
      * including Gouraud fades that have no initializer-template classification. */
-    return opcode >= 0x60u || native_semantic_is_fullscreen_filter(semantic)
+    return opcode >= 0x60u || native_semantic_is_full_width_filter(semantic)
         ? GPU_RENDER_SCREEN_SPACE_2D_STRETCH : GPU_RENDER_SCREEN_SPACE_2D_NONE;
 }
 
