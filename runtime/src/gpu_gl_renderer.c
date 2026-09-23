@@ -3126,7 +3126,17 @@ static const char *TEX_FS =
     "    vec4 h = textureGrad(u_hd, hd_uv, hd_dx, hd_dy);\n"
     "    if (h.a < 0.5) discard;\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
-    "    int hstp = raw != 0 ? (raw >> 15) & 1 : 0;\n"
+    /* Guest-transparent texel under HD coverage: STP of the nearest opaque
+     * guest texel, else the prim's semi-transparency (see hd_fringe_stp). */
+    "    int hstp = raw != 0 ? (raw >> 15) & 1 : (v_semi != 0 ? 1 : 0);\n"
+    "    if (raw == 0) {\n"
+    "      const ivec2 o[8] = ivec2[8](ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1),\n"
+    "                                  ivec2(1,1), ivec2(-1,1), ivec2(1,-1), ivec2(-1,-1));\n"
+    "      for (int i = 0; i < 8; ++i) {\n"
+    "        int n = fetch_texel(int(floor(uv.x)) + o[i].x, int(floor(uv.y)) + o[i].y);\n"
+    "        if (n != 0) { hstp = (n >> 15) & 1; break; }\n"
+    "      }\n"
+    "    }\n"
     "    if (u_semipass == 1 && hstp == 1) discard;\n"
     "    if (u_semipass == 2 && hstp == 0) discard;\n"
     "    vec3 c = h.rgb / h.a;\n"
@@ -13565,6 +13575,21 @@ static const char *NATIVE_GPU_FS =
     " return floor(attribute_plane[a].x+dot(attribute_plane[a].yz,delta));\n"
     "}\n"
     "int word_at(ivec2 p){return int(texelFetch(words,p&ivec2(1023,511),0).r);}\n"
+    "int guest_texel(ivec2 q){q&=255; q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
+    " int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));\n"
+    " if(depth<2){int index=depth==0?(w>>((q.x&3)*4))&15:(w>>((q.x&1)*8))&255; w=word_at(page.zw+ivec2(index,0));}\n"
+    " return w;}\n"
+    /* An HD texel can cover a texel that is transparent in the guest image
+     * (its anti-aliased edge overhangs the original silhouette). Such a texel
+     * has no STP of its own; forcing 0 drew it opaque, and the dark colours a
+     * semi-transparent HUD piece blends with showed as black edge pixels. Take
+     * the STP of the nearest opaque guest texel inside the sampled rectangle;
+     * with none, follow the material's semi-transparency. */
+    "int hd_fringe_stp(ivec2 q){\n"
+    " const ivec2 o[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,1),ivec2(1,-1),ivec2(-1,-1));\n"
+    " for(int i=0;i<8;++i){ivec2 n=q+o[i]; if((window.x|window.y)==0)n=clamp(n,hd_lim.xy,hd_lim.zw);\n"
+    "  int w=guest_texel(n); if(w!=0)return (w>>15)&1;}\n"
+    " return state.z!=0?1:0;}\n"
     "void main(){\n"
     /* HD coordinates and their derivatives come first, in uniform control
      * flow: every later discard would leave the texture LOD undefined. The
@@ -13599,7 +13624,7 @@ static const char *NATIVE_GPU_FS =
      * coverage at upload), STP from the guest texel, full 8-bit precision. */
     "  if(hd_on!=0){vec4 h=textureGrad(hd_image,hd_uv,hd_dx,hd_dy); if(h.a<0.5)discard; hd=true;\n"
     "   hf=h.rgb/h.a; if(state.y==0)hf=clamp(hf*vec3(c)/128.0,0.0,1.0);\n"
-    "   int stp=w!=0?(w>>15)&1:0; mask|=stp; blend&=stp;\n"
+    "   int stp=w!=0?(w>>15)&1:hd_fringe_stp(ivec2(mod(uvs,256.0))&255); mask|=stp; blend&=stp;\n"
     "  }else{\n"
     "  if(w==0)discard; ivec3 tex=ivec3(w,w>>5,w>>10)&31; int stp=(w>>15)&1; mask|=stp; blend&=stp;\n"
     "  c=state.y!=0?tex:clamp((((tex*c)>>4)+bias)>>3,ivec3(0),ivec3(31));}\n"
