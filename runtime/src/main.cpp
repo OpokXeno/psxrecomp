@@ -2113,13 +2113,15 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
  * launcher stores window_width; height follows the configured aspect).
  * Live: every present path re-reads the drawable size per frame. */
 extern "C" int psx_video_get_window_width(void) { return g_video_win_w; }
+static void present_aspect(int *num, int *den);
 extern "C" void psx_video_set_window_width(int w) {
     if (w < 640) w = 640;
     if (w > 7680) w = 7680;
     g_video_win_w = w;
     if (sdl_window) {
-        int ww = w, hh = 0;
-        clamp_window_aspect(&ww, &hh, g_video_aspect_num, g_video_aspect_den);
+        int ww = w, hh = 0, num, den;
+        present_aspect(&num, &den);
+        clamp_window_aspect(&ww, &hh, num, den);
         SDL_SetWindowSize(sdl_window, ww, hh);
     }
 }
@@ -2301,11 +2303,10 @@ extern "C" void psx_ws_set_native_wide(int on) {
 }
 extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 
-/* TCP diagnostics: change the rendered view without moving, resizing, raising
- * or focusing the user's window. Transient; never writes settings.toml. */
-/* Presentation-only stretch (Toggles "3:2"); 0 = off. The game aspect above
- * stays 4:3, so no widescreen projection, native wide view or cull widening
- * engages; only the backends' final fit changes. Session-only. */
+/* Presentation-only stretch (Toggles / launcher "3:2"); 0 = off. The game
+ * aspect above stays 4:3, so no widescreen projection, native wide view or
+ * cull widening engages; only the backends' final fit changes. Persisted as
+ * aspect_ratio = "3:2" (see split_display_stretch). */
 static int g_video_stretch_num = 0;
 static int g_video_stretch_den = 0;
 
@@ -2315,6 +2316,71 @@ static void clear_display_stretch() {
     gl_renderer_set_display_stretch(0, 0);
 }
 
+/* A configured 3:2 is the stretched presentation, never a 3:2 widescreen:
+ * move it out of the game aspect before anything reads that as wide. */
+static void split_display_stretch() {
+    if (g_video_aspect_num * 2 == g_video_aspect_den * 3) {
+        g_video_stretch_num = 3;
+        g_video_stretch_den = 2;
+        g_video_aspect_num = 4;
+        g_video_aspect_den = 3;
+    } else {
+        g_video_stretch_num = 0;
+        g_video_stretch_den = 0;
+    }
+}
+
+/* Aspect the window and the present fit use: the stretch when active. */
+static void present_aspect(int *num, int *den) {
+    const bool stretched = g_video_stretch_num > 0 && g_video_stretch_den > 0;
+    *num = stretched ? g_video_stretch_num : g_video_aspect_num;
+    *den = stretched ? g_video_stretch_den : g_video_aspect_den;
+}
+
+/* Launcher aspect choices for this title, in aspect_index order: 4:3, 3:2
+ * (stretched presentation, always available), then the widescreen modes the
+ * game offers. Settings persist the choice as its W:H. */
+struct PsxAspectChoice { const char *label; int num, den; };
+static PsxAspectChoice g_aspect_choices[4] = { { "4:3", 4, 3 } };
+static const char *g_aspect_labels[4] = { "4:3" };
+static int g_aspect_choice_count = 1;
+
+static void build_aspect_choices(bool ws_offered, bool ultrawide_offered) {
+    g_aspect_choice_count = 0;
+    g_aspect_choices[g_aspect_choice_count++] = { "4:3", 4, 3 };
+    g_aspect_choices[g_aspect_choice_count++] = { "3:2 (stretched)", 3, 2 };
+    if (ws_offered)
+        g_aspect_choices[g_aspect_choice_count++] = { "16:9", 16, 9 };
+    if (ultrawide_offered)
+        g_aspect_choices[g_aspect_choice_count++] = { "21:9", 21, 9 };
+    for (int i = 0; i < g_aspect_choice_count; ++i)
+        g_aspect_labels[i] = g_aspect_choices[i].label;
+}
+
+static int aspect_choice_index(int num, int den) {
+    for (int i = 0; i < g_aspect_choice_count; ++i)
+        if (num * g_aspect_choices[i].den == den * g_aspect_choices[i].num)
+            return i;
+    return 0;
+}
+
+static void aspect_choice_get(int index, int *num, int *den) {
+    if (index < 0 || index >= g_aspect_choice_count) index = 0;
+    *num = g_aspect_choices[index].num;
+    *den = g_aspect_choices[index].den;
+}
+
+/* Push the present aspect (and stretch) to every backend fit. */
+static void apply_present_aspect() {
+    int num, den;
+    present_aspect(&num, &den);
+    gl_renderer_set_display_aspect(num, den);
+    gl_renderer_set_display_stretch(g_video_stretch_num, g_video_stretch_den);
+    vk_renderer_set_display_aspect(num, den);
+}
+
+/* TCP diagnostics: change the rendered view without moving, resizing, raising
+ * or focusing the user's window. Transient; never writes settings.toml. */
 extern "C" int psx_debug_display_aspect(int num, int den, int adaptive) {
     if (adaptive) return psx_mod_set_adaptive_display_aspect(num, den);
     if (!psx_mod_set_fixed_display_aspect(num, den)) return 0;
@@ -11375,10 +11441,12 @@ namespace {
     PsxLobbyMatchCaps ae_netplay_caps_from_settings(const RecompLauncherCSettings* s) {
         PsxLobbyMatchCaps caps{};
         caps.valid = 1;
-        switch (s ? s->aspect_index : 0) {
-            case 2:  caps.aspect_num = 21; caps.aspect_den = 9; break;
-            case 1:  caps.aspect_num = 16; caps.aspect_den = 9; break;
-            default: caps.aspect_num = 4;  caps.aspect_den = 3; break;
+        {
+            /* The game aspect: a stretched 3:2 plays a 4:3 view. */
+            int num = 4, den = 3;
+            aspect_choice_get(s ? s->aspect_index : 0, &num, &den);
+            if (num * 2 == den * 3) { num = 4; den = 3; }
+            caps.aspect_num = num; caps.aspect_den = den;
         }
         caps.turbo_loads   = s ? (s->turbo_loads != 0) : 0;
         caps.auto_skip_fmv = s ? (s->auto_skip_fmv != 0) : 0;
@@ -13811,6 +13879,10 @@ namespace {
                (ws_ultrawide_offered_b ? 0x4 : 0))
             : 0;
         gi->aspect_experimental = ws_offered_b ? 1 : 0;
+        /* 4:3, 3:2 (stretched) and the offered widescreen modes; the
+         * launcher's aspect_index indexes g_aspect_choices. */
+        gi->aspect_labels = g_aspect_labels;
+        gi->num_aspect_labels = g_aspect_choice_count;
         gi->renderer_labels = kPsxRendererLabels;
         gi->num_renderers = vulkan_offered_b ? 3 : 2;
         gi->settings_bindings = 1;
@@ -15399,6 +15471,11 @@ int main(int argc, char** argv) {
         g_frame_interpolation_fps = 0;
     }
 
+    /* The launcher offers 4:3, 3:2 (stretched) and the widescreen modes this
+     * title declares; a configured 3:2 is the stretch, not a wide aspect. */
+    build_aspect_choices(ws_offered, ws_ultrawide_offered);
+    split_display_stretch();
+
     /* Widescreen/View mode is mod-owned on PSX. Clamp the generic display
      * aspect to native 4:3 so neither a legacy game.toml offer/default nor a
      * stale settings.toml value can engage it before trusted mod activation. */
@@ -15799,8 +15876,8 @@ int main(int argc, char** argv) {
             seed.has_frame_interpolation = frame_interpolation_offered;
             seed.frame_interpolation_fps = g_frame_interpolation_fps;
             seed.has_frame_interpolation_fps = frame_interpolation_offered;
-            seed.aspect_num = g_video_aspect_num;
-            seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
+            present_aspect(&seed.aspect_num, &seed.aspect_den);
+            seed.has_aspect_ratio = true;
             seed.audio_freq = g_audio_freq;               seed.has_audio_freq = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             seed.rewind = g_rewind_enabled != 0;          seed.has_rewind = true;
@@ -15959,9 +16036,8 @@ int main(int argc, char** argv) {
             ls.msu1_dir[0]    = '\0';
             std::snprintf(ls.netplay_player_name, sizeof(ls.netplay_player_name), "%s",
                           has_netplay_player_name ? netplay_player_name.c_str() : "");
-            /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
-            ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
-                                 (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
+            /* aspect_index: position in this title's g_aspect_choices. */
+            ls.aspect_index   = aspect_choice_index(seed.aspect_num, seed.aspect_den);
 
             /* ---- deeper PSX-style settings (capability-gated via launcher_profile
              * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
@@ -16240,13 +16316,9 @@ int main(int argc, char** argv) {
                 }
                 seed.fullscreen    = ls.fullscreen;            seed.has_fullscreen = true;
                 seed.skip_launcher = ls.skip_launcher != 0;   seed.has_skip_launcher = true;
-                /* aspect_index round-trips 0/1/2 -> 4:3 / 16:9 / 21:9, superseding the
-                 * legacy ls.widescreen bool (still set above for older callers). */
-                switch (ls.aspect_index) {
-                    case 2:  seed.aspect_num = 21; seed.aspect_den = 9; break;
-                    case 1:  seed.aspect_num = 16; seed.aspect_den = 9; break;
-                    default: seed.aspect_num = 4;  seed.aspect_den = 3; break;
-                }
+                /* aspect_index round-trips through g_aspect_choices, superseding
+                 * the legacy ls.widescreen bool (still set above for older callers). */
+                aspect_choice_get(ls.aspect_index, &seed.aspect_num, &seed.aspect_den);
                 seed.has_aspect_ratio = true;
                 /* has_texture_filter is on (PSX profile) so the launcher edits
                  * ls.texture_filter directly (0=nearest,1=bilinear); ls.linear_filter
@@ -16568,6 +16640,7 @@ int main(int argc, char** argv) {
                 set_video_fps(seed.fps);
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
+                split_display_stretch();
                 g_audio_freq      = seed.audio_freq;
                 g_audio_spu_hq    = seed.spu_hq;
                 g_rewind_enabled = seed.has_rewind ? (seed.rewind ? 1 : 0) : 0;
@@ -17030,8 +17103,7 @@ session_reboot:
     /* Display aspect. Identity at the default 4:3. The present letterbox uses
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
-    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
-    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    apply_present_aspect();
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
         /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
@@ -17377,7 +17449,11 @@ session_reboot:
      * widescreen hack); the present path letterboxes to the same aspect, so
      * the image scales to fill the larger window with no further distortion. */
     int game_w = g_video_win_w, game_h = 0;
-    clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
+    {
+        int num, den;
+        present_aspect(&num, &den);
+        clamp_window_aspect(&game_w, &game_h, num, den);
+    }
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -17706,7 +17782,9 @@ session_reboot:
      * unchanged. Netplay CPU-auth: always 1× (sim has no hi-res mirror). */
     {
         const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        g_logical_w = 480 * g_video_aspect_num * tex_scale / g_video_aspect_den;
+        int num, den;
+        present_aspect(&num, &den);
+        g_logical_w = 480 * num * tex_scale / den;
         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * tex_scale);
     }
   }
@@ -18413,8 +18491,11 @@ soft_return_lobby:
                 PSX_HOTKEY_PAD_SELECT_L1);
         ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD_TOGGLE] =
             normalize_hotkey_pad_binding(g_hotkey_pad_fast_forward_toggle, 0);
-        ls.aspect_index = (g_video_aspect_num * 9 == g_video_aspect_den * 21) ? 2
-            : (g_video_aspect_num == 16 && g_video_aspect_den == 9) ? 1 : 0;
+        {
+            int num, den;
+            present_aspect(&num, &den);
+            ls.aspect_index = aspect_choice_index(num, den);
+        }
         ls.language_index = 0;
         for (size_t li = 0; li < lang_menu_options.size(); li++) {
             if (lang_menu_options[li].code == resolved_language) {
@@ -18787,11 +18868,7 @@ soft_return_lobby:
                 us.has_fullscreen = true;
                 us.window_width = ls.window_width > 0 ? ls.window_width : g_video_win_w;
                 us.has_window_width = true;
-                switch (ls.aspect_index) {
-                    case 2:  us.aspect_num = 21; us.aspect_den = 9; break;
-                    case 1:  us.aspect_num = 16; us.aspect_den = 9; break;
-                    default: us.aspect_num = 4;  us.aspect_den = 3; break;
-                }
+                aspect_choice_get(ls.aspect_index, &us.aspect_num, &us.aspect_den);
                 us.has_aspect_ratio = true;
                 if (ls.bios_path[0]) {
                     us.bios_path = ls.bios_path;
@@ -18866,11 +18943,9 @@ soft_return_lobby:
                 PSX_HOTKEY_PAD_SELECT_L1);
             g_hotkey_pad_fast_forward_toggle = normalize_hotkey_pad_binding(
                 ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD_TOGGLE], 0);
-            switch (ls.aspect_index) {
-                case 2:  g_video_aspect_num = 21; g_video_aspect_den = 9; break;
-                case 1:  g_video_aspect_num = 16; g_video_aspect_den = 9; break;
-                default: g_video_aspect_num = 4;  g_video_aspect_den = 3; break;
-            }
+            aspect_choice_get(ls.aspect_index, &g_video_aspect_num, &g_video_aspect_den);
+            split_display_stretch();
+            apply_present_aspect();
             g_video_win_w = ls.window_width > 0 ? ls.window_width : g_video_win_w;
             /* Preference for persistence; session settle may override boot path. */
             if (ls.bios_path[0])
