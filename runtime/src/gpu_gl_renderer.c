@@ -8038,6 +8038,8 @@ typedef struct GlNativeAttributePlanes {
     double plane[5][3]; /* UV, RGB: seed, logical d/dx, logical d/dy. */
     uint32_t dda[5][3]; /* Q12 seed and physical-pixel steps, modulo 256. */
     int integral;
+    /* Inclusive sampled texel range {lo_u, lo_v, hi_u, hi_v} (gpu_uv.h). */
+    int limits[4];
 } GlNativeAttributePlanes;
 
 static void native_attribute_planes(const XgRenderIrTriangle *triangle,
@@ -8052,6 +8054,21 @@ static void native_attribute_planes(const XgRenderIrTriangle *triangle,
                           x[2] < x[0] ? 2u : 0u;
     memset(out, 0, sizeof(*out));
     out->x = x[core]; out->y = y[core]; out->integral = 1;
+    {
+        /* The PS1 never samples a mapping's exclusive-edge texel (gpu_uv.h).
+         * The seed bias above lands on it exactly only for unit uv slopes; a
+         * scaled mirrored 2D card (Field actor halves) otherwise reaches the
+         * never-sampled column at its edge and paints its transparent texel
+         * as a seam. Clamp to the sampled range like the canonical path. */
+        float fx[3], fy[3];
+        int us[3], vs[3];
+        for (unsigned i = 0u; i < 3u; ++i) {
+            fx[i] = (float)x[i]; fy[i] = (float)y[i];
+            us[i] = (int)floor(triangle->vertices[i].u / 65536.0);
+            vs[i] = (int)floor(triangle->vertices[i].v / 65536.0);
+        }
+        psx_uv_tri_limits_f32(fx, fy, us, vs, out->limits);
+    }
     for (unsigned i = 0u; i < 3u; ++i) {
         const XgRenderIrVertex *v = &triangle->vertices[i];
         const XgRenderIrVertex *c = &triangle->vertices[gouraud ? i : 0u];
@@ -8636,12 +8653,21 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     /* floor() produced integral texcoords. For values fitting
                      * int, the sampler's low-eight-bit wrap is exactly fmod(256),
                      * including negative coordinates, without a floating divide. */
-                    const int sample_u = (attributes.integral && !perspective) ||
+                    int sample_u = (attributes.integral && !perspective) ||
                         (sampled[0] >= INT_MIN && sampled[0] <= INT_MAX)
                         ? (int)sampled[0] : (int)fmod(sampled[0], 256.0);
-                    const int sample_v = (attributes.integral && !perspective) ||
+                    int sample_v = (attributes.integral && !perspective) ||
                         (sampled[1] >= INT_MIN && sampled[1] <= INT_MAX)
                         ? (int)sampled[1] : (int)fmod(sampled[1], 256.0);
+                    if ((material->texture_window_mask_x |
+                         material->texture_window_mask_y) == 0u) {
+                        int su = sample_u & 255, sv = sample_v & 255;
+                        su = su < attributes.limits[0] ? attributes.limits[0] :
+                             su > attributes.limits[2] ? attributes.limits[2] : su;
+                        sv = sv < attributes.limits[1] ? attributes.limits[1] :
+                             sv > attributes.limits[3] ? attributes.limits[3] : sv;
+                        sample_u = su; sample_v = sv;
+                    }
                     if (native_words) {
                         texel = native_native_texel(native_words, material, sample_u, sample_v);
                     } else if (!native_sample_draw_texel(compiler, draw,
@@ -13470,6 +13496,7 @@ static GlNativeGpuPlane s_native_gpu_destination;
 static int s_native_gpu_uniforms[6][4], s_native_gpu_depth_value, s_native_gpu_origin_value[2];
 /* HD texture replacement on the Native GPU thread's context. */
 static GLint s_native_gpu_hd_on = -1, s_native_gpu_hd_map = -1, s_native_gpu_hd_lim = -1;
+static GLint s_native_gpu_sample_lim = -1;
 static int s_native_gpu_hd_value;
 static HdGlCache s_native_gpu_hd_cache;
 static uint64_t s_native_gpu_hd_draws;
@@ -13532,6 +13559,8 @@ static const char *NATIVE_GPU_FS =
     /* HD texture replacement: hd_map = (page->upload texel offset u/v, upload
      * size in texels), hd_lim = the draw's sampled page-texel rectangle. */
     "uniform sampler2D hd_image; uniform int hd_on; uniform ivec4 hd_map,hd_lim;\n"
+    /* Inclusive sampled texel range of the triangle (gpu_uv.h limits). */
+    "uniform ivec4 sample_lim;\n"
     "uniform ivec4 state,flags,page,window; uniform int depth; uniform ivec2 origin;\n"
     /* Native depth plane (see native_depth_plane): depth_state = (test, mode of
      * an unblended fragment 1=far 2=key 3=copy source, per-texel keep, bias);
@@ -13617,7 +13646,8 @@ static const char *NATIVE_GPU_FS =
     " ivec2 dp=ivec2(floor(gl_FragCoord.xy/size.w))+origin; int bias=flags.z!=0?d[(dp.y&3)*4+(dp.x&3)]:0;\n"
     " bool hd=false; vec3 hf=vec3(0.0);\n"
     " if(state.x!=0){vec2 uvs=persp!=0?t_p:vec2(attribute_at(0),attribute_at(1));\n"
-    "  ivec2 q=ivec2(mod(uvs,256.0))&255; q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
+    "  ivec2 q=ivec2(mod(uvs,256.0))&255; if((window.x|window.y)==0)q=clamp(q,sample_lim.xy,sample_lim.zw);\n"
+    "  q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
     "  int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));\n"
     "  if(depth<2){int index=depth==0?(w>>((q.x&3)*4))&15:(w>>((q.x&1)*8))&255; w=word_at(page.zw+ivec2(index,0));}\n"
     /* Replacement: coverage and colour from the HD image (premultiplied by
@@ -13748,6 +13778,7 @@ static int native_gpu_program_init(void) {
     s_native_gpu_hd_on=p_glGetUniformLocation(s_native_gpu_program,"hd_on");
     s_native_gpu_hd_map=p_glGetUniformLocation(s_native_gpu_program,"hd_map");
     s_native_gpu_hd_lim=p_glGetUniformLocation(s_native_gpu_program,"hd_lim");
+    s_native_gpu_sample_lim=p_glGetUniformLocation(s_native_gpu_program,"sample_lim");
     s_native_gpu_hd_value=0;
     s_native_gpu_depth_state=p_glGetUniformLocation(s_native_gpu_program,"depth_state");
     s_native_gpu_depth_plane=p_glGetUniformLocation(s_native_gpu_program,"depth_plane");
@@ -14042,6 +14073,9 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             p_glUniform4f(s_native_gpu_size,(float)plane->width/scale,(float)plane->height/scale,0.5f/scale-1.f/64.f,(float)scale);
             /* The plane origin is target-local, just like gl_FragCoord. The
              * source row/VRAM origin is already removed above, exactly once. */
+            if (lines) p_glUniform4i(s_native_gpu_sample_lim,0,0,255,255);
+            else p_glUniform4i(s_native_gpu_sample_lim,attributes.limits[0],attributes.limits[1],
+                attributes.limits[2],attributes.limits[3]);
             p_glUniform4f(s_native_gpu_attribute_origin,lines?0.f:(float)attributes.x,
                 lines?0.f:(float)attributes.y,lines?0.f:attributes.integral?1.f:2.f,0.f);
             if (!lines) for (unsigned a=0u;a<5u;++a) {
