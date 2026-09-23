@@ -124,6 +124,11 @@
 #define PSXGL_READ_FRAMEBUFFER      0x8CA8
 #define PSXGL_DRAW_FRAMEBUFFER      0x8CA9
 #define PSXGL_COLOR_ATTACHMENT0     0x8CE0
+#define PSXGL_COLOR_ATTACHMENT1     0x8CE1
+#define PSXGL_R32UI                 0x8236
+#define PSXGL_SAMPLES_PASSED        0x8914
+#define PSXGL_QUERY_RESULT          0x8866
+#define PSXGL_COLOR                 0x1800
 #define PSXGL_DEPTH_STENCIL_ATTACHMENT 0x821A
 #define PSXGL_FRAMEBUFFER_COMPLETE  0x8CD5
 #define PSXGL_RENDERBUFFER          0x8D41
@@ -197,6 +202,9 @@ typedef GLenum (APIENTRY *PFN_glClientWaitSync)(GLsync, GLbitfield, GLuint64);
 typedef void   (APIENTRY *PFN_glWaitSync)(GLsync, GLbitfield, GLuint64);
 typedef void   (APIENTRY *PFN_glDeleteSync)(GLsync);
 typedef void   (APIENTRY *PFN_glTextureBarrier)(void);
+typedef void   (APIENTRY *PFN_glDrawBuffers)(GLsizei, const GLenum *);
+typedef void   (APIENTRY *PFN_glColorMaski)(GLuint, GLboolean, GLboolean, GLboolean, GLboolean);
+typedef void   (APIENTRY *PFN_glClearBufferuiv)(GLenum, GLint, const GLuint *);
 typedef void   (APIENTRY *PFN_glGenFramebuffers)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glDeleteFramebuffers)(GLsizei, const GLuint *);
 typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
@@ -270,6 +278,9 @@ static PFN_glClientWaitSync p_glClientWaitSync;
 static PFN_glWaitSync p_glWaitSync;
 static PFN_glDeleteSync p_glDeleteSync;
 static PFN_glTextureBarrier p_glTextureBarrier;
+static PFN_glDrawBuffers p_glDrawBuffers;
+static PFN_glColorMaski p_glColorMaski;
+static PFN_glClearBufferuiv p_glClearBufferuiv;
 static PFN_glGenFramebuffers   p_glGenFramebuffers;
 static PFN_glDeleteFramebuffers p_glDeleteFramebuffers;
 static PFN_glBindFramebuffer   p_glBindFramebuffer;
@@ -330,6 +341,10 @@ static int load_modern_gl(void) {
     LOAD(p_glClientWaitSync, "glClientWaitSync");
     LOAD(p_glWaitSync, "glWaitSync");
     LOAD(p_glDeleteSync, "glDeleteSync");
+    /* GL 3.0 core; only the optional Native depth plane (MRT) uses them. */
+    p_glDrawBuffers = (PFN_glDrawBuffers)SDL_GL_GetProcAddress("glDrawBuffers");
+    p_glColorMaski = (PFN_glColorMaski)SDL_GL_GetProcAddress("glColorMaski");
+    p_glClearBufferuiv = (PFN_glClearBufferuiv)SDL_GL_GetProcAddress("glClearBufferuiv");
     p_glTextureBarrier = SDL_GL_ExtensionSupported("GL_ARB_texture_barrier")
         ? (PFN_glTextureBarrier)SDL_GL_GetProcAddress("glTextureBarrier") : NULL;
     const char *texture_barrier=getenv("PSX_GL_TEXTURE_BARRIER");
@@ -1052,6 +1067,12 @@ typedef struct GlNativeCompileAudit {
     uint32_t phase_gen_count;
     uint64_t temporal_interval_ns;
     int recipe_canonical_match, recipe_view_match, recipe_validation_performed;
+    /* Native depth test (CPU reference raster): VIEW draws by effective stamp
+     * (NONE/TEST/TEST_WRITE), and fragments tested/rejected/written/reset. */
+    uint32_t depth_draws[3];
+    uint64_t depth_tested_fragments, depth_rejected_fragments;
+    uint64_t depth_written_fragments, depth_reset_fragments;
+    uint32_t depth_key_min, depth_key_max; /* keys written; 0 = none (depth view range) */
     /* Only populated entries are read; keep capacity storage out of the reset. */
     XgSemanticPassRecord passes[XG_RENDER_SCENE_PASS_CAPACITY];
     XgSemanticDrawRecord draws[XG_RENDER_SCENE_DRAW_CAPACITY];
@@ -1165,6 +1186,7 @@ typedef struct GlNativeRecipe {
     GlNativeCoverageState *publication;
     uint16_t width, height, view_width, view_height, offset, origin_x, origin_y;
     bool dithering_disabled;
+    bool depth_test; /* Captured native_depth_test: replays keep a depth plane. */
     GlNativeRecipePixels *textures;
     /* Words depending on this replay's framebuffer, including COPY/draw aliases.
      * External rendered textures are otherwise immutable discrete inputs. */
@@ -1192,7 +1214,7 @@ typedef struct GlNativeMotionPrepared {
     uint64_t interval_ns, previous_digest;
 } GlNativeMotionPrepared;
 typedef struct GlNativeMotionProjection {
-    double screen[2][3][3], native[2][3][2];
+    double screen[2][3][3], native[2][3][3]; /* native: x, y, view-Z deltas */
     XgRenderMotionProjectResult result;
 } GlNativeMotionProjection;
 typedef struct GlNativeMotionEntity {
@@ -1209,6 +1231,7 @@ typedef struct GlNativeMotionEntity {
 typedef struct GlNativeVertexSample {
     int64_t position[4], offset[2];
     int32_t view[3];
+    int32_t depth; /* native_view_depth (Q12 view Z), zero when absent */
     uint16_t distance;
     uint8_t native, projective;
 } GlNativeVertexSample;
@@ -1239,7 +1262,7 @@ typedef struct GlNativeVertexCache {
     GlNativeVertexMesh *meshes;
     uint32_t (*map)[6];
     uint32_t *draw_mesh;
-    int64_t (*deltas)[4];
+    int64_t (*deltas)[5]; /* canonical x/y, Native x/y, Native depth (Q12) */
     uint32_t pair_count, mesh_count;
 } GlNativeVertexCache;
 typedef struct GlNativeVertexDiagnostics {
@@ -1282,7 +1305,7 @@ typedef struct GlNativeMotionRejectEvent {
     uint64_t entity_id, source_update;
     uint32_t draw_index, producer_id;
 } GlNativeMotionRejectEvent;
-static volatile GlNativeMotionRejectEvent s_native_motion_reject_events[32];
+static volatile GlNativeMotionRejectEvent s_native_motion_reject_events[GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY];
 static volatile uint64_t s_native_motion_reject_total;
 #define GL_NATIVE_VIEW_TARGET_CAPACITY 64u
 typedef struct GlNativeViewDomain {
@@ -1293,6 +1316,7 @@ typedef struct GlNativeViewDomain {
 typedef struct GlNativeViewRaster {
     uint16_t x, y, width, height;
     uint32_t *pixels;
+    uint32_t *depth; /* Optional depth plane indexed like pixels. */
 } GlNativeViewRaster;
 typedef struct GlNativeViewTarget {
     uint16_t x, y, width, height;
@@ -1317,6 +1341,9 @@ typedef struct GlNativeViewState {
     GlNativeCoverageState *publication;
     GpuVramRegionSet raster_words;
     int reset_motion_history;
+    /* Captured native_depth_test. Each DOMAIN allocation then holds its depth
+     * plane after the pixels, so COW/retention/free cover both together. */
+    int depth_test;
     struct GlNativeGpuWork *gpu; /* Private compiler journal; never published. */
     GlNativeViewTarget targets[GL_NATIVE_VIEW_TARGET_CAPACITY];
     GlNativeViewDomain domains[GL_NATIVE_VIEW_TARGET_CAPACITY];
@@ -1332,9 +1359,43 @@ static void native_views_copy(GlNativeViewState *destination, const GlNativeView
     memcpy(destination->domains, source->domains, source->domain_count * sizeof(source->domains[0]));
 }
 
+/* The depth plane of a VIEW domain lives right after its pixels in the same
+ * allocation, with the same (physical VRAM row, x) indexing. */
+static size_t native_view_domain_bytes(const GlNativeViewState *views) {
+    return (size_t)views->width * VRAM_H * (sizeof(uint32_t) + (views->depth_test ? sizeof(uint32_t) : 0u));
+}
+
+static uint32_t *native_view_domain_depth(const GlNativeViewState *views, const GlNativeViewDomain *domain) {
+    return views->depth_test && domain->pixels
+        ? domain->pixels + (size_t)views->width * VRAM_H : NULL;
+}
+
+/* Depth rows aliasing target->pixels (same base row), or NULL. */
+static uint32_t *native_view_target_depth(const GlNativeViewState *views, const GlNativeViewTarget *target) {
+    if (!views->depth_test || !target->pixels) return NULL;
+    for (uint32_t i = 0u; i < views->domain_count; ++i) {
+        const GlNativeViewDomain *domain = &views->domains[i];
+        if (domain->x == target->x && domain->width == target->width && domain->pixels)
+            return native_view_domain_depth(views, domain) + (target->pixels - domain->pixels);
+    }
+    return NULL;
+}
+
+/* Every non-draw write (fill/copy/upload/seed/margin/wave) leaves a pixel that
+ * no certified surface owns: its depth returns to far, in lockstep with the
+ * GPU span/seed that writes zero into the plane's depth attachment. */
+static void native_depth_clear_rows(uint32_t *depth, size_t pitch, int x, int y, int width, int height) {
+    if (!depth || width <= 0 || height <= 0) return;
+    for (int row = 0; row < height; ++row)
+        memset(depth + (size_t)(y + row) * pitch + x, 0, (size_t)width * sizeof(*depth));
+}
+
 #define GL_NATIVE_GPU_PHASE_BASE (GL_NATIVE_VIEW_TARGET_CAPACITY + 1u)
 #define GL_NATIVE_GPU_PLANES (GL_NATIVE_GPU_PHASE_BASE + GL_NATIVE_MOTION_PHASE_CAPACITY)
-typedef struct GlNativeGpuPlane { GLuint texture, framebuffer; uint32_t width, height; } GlNativeGpuPlane;
+/* depth: optional R32UI COLOR_ATTACHMENT1 (Native depth keys; 0 = far).
+ * dirty: physical bbox [x0,y0)-(x1,y1) rendered since this plane's last
+ * texture barrier; a destination read outside it needs no barrier. */
+typedef struct GlNativeGpuPlane { GLuint texture, framebuffer, depth; uint32_t width, height; int dirty[4]; } GlNativeGpuPlane;
 typedef enum GlNativeGpuOp { NATIVE_GPU_SEED, NATIVE_GPU_DRAW, NATIVE_GPU_WORDS, NATIVE_GPU_SNAPSHOT, NATIVE_GPU_SPAN } GlNativeGpuOp;
 typedef struct GlNativeGpuCommand {
     GlNativeGpuOp kind;
@@ -1436,10 +1497,21 @@ typedef struct GlNativeGpuWork {
     uint16_t scanout_canonical_width, scanout_offset;
     uint32_t phase_count;
     int state, failed, fresh, scanout, depth24, disabled;
+    int depth_test; /* VIEW/phase planes carry a depth attachment (never plane 0). */
     GLsync fence;
     GLuint timers[3];
     uint64_t submitted_ns, word_uploads, snapshot_commands;
     uint64_t destination_barriers, destination_copies;
+    uint64_t skipped_barriers;       /* destination reads with no overlapping write */
+    int depth_view;                  /* GL_NATIVE_DEPTH_VIEW_* captured at creation */
+    int wireframe;                   /* debug wireframe captured at creation */
+    int depth_view_log[2];           /* depth view range: log2 of min/max key, x256 */
+    /* GPU depth telemetry: triangles depth-tested, and GL_SAMPLES_PASSED of the
+     * runs of depth-tested triangles (occlusion queries, read at completion). */
+    uint64_t depth_tested_triangles;
+    GLuint *depth_queries;
+    uint32_t depth_query_count, depth_query_capacity;
+    int depth_query_open;
 } GlNativeGpuWork;
 /* Compiler-owner hints only. Each transaction still owns its own allocations;
  * a larger frame keeps the existing append/retirement growth path. */
@@ -1487,7 +1559,7 @@ static size_t s_native_gpu_readback_capacity[GL_NATIVE_MOTION_PHASE_CAPACITY + 1
 static uint32_t s_native_gpu_scale;
 static GlNativeGpuCommand *native_gpu_command(GlNativeGpuWork *, GlNativeGpuOp);
 static int native_gpu_data(GlNativeGpuWork *, const void *, size_t, uint32_t *);
-static int native_gpu_seed(GlNativeGpuWork *, uint32_t, uint32_t, uint32_t, const uint32_t *);
+static int native_gpu_seed(GlNativeGpuWork *, uint32_t, uint32_t, uint32_t, const uint32_t *, uint32_t *);
 static int native_gpu_span(GlNativeGpuWork *, uint32_t, int, int, int, int, uint32_t, float, float, float, float, uint32_t, uint32_t);
 static int native_gpu_pixel(GlNativeGpuWork *, uint32_t, int, int, uint32_t, uint32_t);
 static void native_gpu_free(GlNativeGpuWork *);
@@ -3628,6 +3700,25 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
 static int s_wide_fast = 1;
 void gl_renderer_set_wide_fast(int on) { s_wide_fast = on ? 1 : 0; }
 int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
+/* On by default; only the debug overlay / debug server switch it. */
+static SDL_atomic_t s_native_depth_test_option = {1};
+void gl_renderer_set_native_depth_test(int on) { SDL_AtomicSet(&s_native_depth_test_option, on ? 1 : 0); }
+int  gl_renderer_native_depth_test(void) { return SDL_AtomicGet(&s_native_depth_test_option); }
+static SDL_atomic_t s_native_depth_view_option;
+static int s_native_gpu_depth_view_applied;
+/* Depth view normalization: log2 of the written key range (x256), smoothed
+ * over frames so the colours do not pump. Compile-owner state only. */
+static int s_native_depth_view_log_min, s_native_depth_view_log_max;
+void gl_renderer_set_native_depth_view(int mode) {
+    SDL_AtomicSet(&s_native_depth_view_option, mode >= 0 && mode <= 3 ? mode : 0);
+}
+int  gl_renderer_native_depth_view(void) { return SDL_AtomicGet(&s_native_depth_view_option); }
+/* Debug wireframe of the GPU VIEW/phase planes: triangles as unlit lines over
+ * black. Presentation only; guest VRAM (plane 0) and textures are untouched. */
+static SDL_atomic_t s_native_wireframe_option;
+static int s_native_gpu_wireframe_applied;
+void gl_renderer_set_native_wireframe(int on) { SDL_AtomicSet(&s_native_wireframe_option, on ? 1 : 0); }
+int  gl_renderer_native_wireframe(void) { return SDL_AtomicGet(&s_native_wireframe_option); }
 static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h); /* def below */
 /* True if [lo,hi] (canonical draw-x) lies strictly inside the 4:3 frame, so the
  * prim adds nothing to either reveal margin and its mirror can be skipped. */
@@ -6114,7 +6205,25 @@ static void native_publish_compile_audit(const GlNativeCompileAudit *audit,
         s_native_compiler_diag.applied_native_work++;
         s_native_compiler_diag.view_logical_draws += audit->rendered_view_draws;
         s_native_compiler_diag.view_physical_raster_passes += audit->view_raster_passes;
+        for (unsigned i = 0u; i < 3u; ++i)
+            s_native_compiler_diag.depth_draws[i] += audit->depth_draws[i];
+        s_native_compiler_diag.depth_tested_fragments += audit->depth_tested_fragments;
+        s_native_compiler_diag.depth_rejected_fragments += audit->depth_rejected_fragments;
+        s_native_compiler_diag.depth_written_fragments += audit->depth_written_fragments;
+        s_native_compiler_diag.depth_reset_fragments += audit->depth_reset_fragments;
+        if (audit->depth_key_min && audit->depth_key_max >= audit->depth_key_min) {
+            const int lo = (int)(log2((double)audit->depth_key_min) * 256.0);
+            const int hi = (int)(log2((double)audit->depth_key_max) * 256.0);
+            if (!s_native_depth_view_log_max) {
+                s_native_depth_view_log_min = lo; s_native_depth_view_log_max = hi;
+            } else {
+                s_native_depth_view_log_min += (lo - s_native_depth_view_log_min) / 4;
+                s_native_depth_view_log_max += (hi - s_native_depth_view_log_max) / 4;
+            }
+        }
     }
+    if (audit->header.native_work)
+        s_native_compiler_diag.native_depth_test = audit->header.display.native_depth_test;
     s_native_compiler_diag.consumed_native_operations =
         audit->consumed_native_operations;
     s_native_compiler_diag.consumed_motion_resources = audit->consumed_motion_resources;
@@ -6880,6 +6989,9 @@ typedef struct GlNativeCpuSurface {
     /* Writable only on the transaction-private Native canvas, never VIEW or
      * replay targets. Kept in lockstep with pixels at actual fragment writes. */
     uint16_t *words;
+    /* Optional Native depth plane (key 2^40/z_q12, 0 = far), indexed like
+     * pixels. Present only on VIEW/replay presentation targets with the option. */
+    uint32_t *depth;
     uint32_t width;
     uint32_t height;
     int valid;
@@ -7502,6 +7614,8 @@ static int native_materialize_native_draw(const GpuRenderSemantic *semantic,
     draw->native_view_effect = semantic->native_view_effect;
     draw->native_view_effect_index = semantic->native_view_effect_index;
     XgRenderIrNativePrimitive *primitive = &draw->primitive;
+    primitive->depth_policy = semantic->depth_policy;
+    primitive->depth_bias = semantic->depth_bias;
 #define NATIVE_COPY_MATERIAL(field) primitive->material.field = semantic->material.field
     NATIVE_COPY_MATERIAL(tpage);
     NATIVE_COPY_MATERIAL(texture_page_x); NATIVE_COPY_MATERIAL(texture_page_y);
@@ -7529,7 +7643,7 @@ static int native_materialize_native_draw(const GpuRenderSemantic *semantic,
             NATIVE_COPY_VERTEX(x); NATIVE_COPY_VERTEX(y); NATIVE_COPY_VERTEX(u); NATIVE_COPY_VERTEX(v);
             NATIVE_COPY_VERTEX(r); NATIVE_COPY_VERTEX(g); NATIVE_COPY_VERTEX(b);
             NATIVE_COPY_VERTEX(native_view_x); NATIVE_COPY_VERTEX(native_view_y);
-            NATIVE_COPY_VERTEX(native_view_position);
+            NATIVE_COPY_VERTEX(native_view_position); NATIVE_COPY_VERTEX(native_view_depth);
             NATIVE_COPY_VERTEX(projective_view_x); NATIVE_COPY_VERTEX(projective_view_y);
             NATIVE_COPY_VERTEX(projective_view_z);
             NATIVE_COPY_VERTEX(projective_offset_x); NATIVE_COPY_VERTEX(projective_offset_y);
@@ -7622,6 +7736,124 @@ static int native_triangle_all_projective(const XgRenderIrTriangle *triangle) {
             return 0;
     }
     return 1;
+}
+
+/* ---- Native depth test (host option; see GpuRenderDepthPolicy) ----------
+ * The PS1 has no depth buffer: primitives are sorted into OT buckets and the
+ * game relies on that order. The optional depth plane only arbitrates between
+ * producer-classified 3D surfaces. Invariant: a plane texel holds the key of
+ * the certified opaque surface visible there, or 0 ("far") when anything else
+ * (a transfer, seed, clear, uncertified or merely tested opaque fragment)
+ * wrote it. Blended fragments leave it unchanged. So OT order decides wherever
+ * two certified surfaces do not meet directly.
+ *
+ * Key: D = 2^40 / z_q12 (= 4096 * 65536 / z), affine in screen space for a
+ * perspective triangle. Each triangle gets one integer plane: N0 is D in Q8 at
+ * the integer raster origin (ox, oy), and a, b are the Q8 gradients per logical
+ * pixel. Evaluation is modular uint32 arithmetic; only the in-triangle result
+ * has to fit, so the CPU reference (logical pixel corners) and the GPU at scale
+ * 1 produce identical keys, and at scale S the GPU produces the same key at the
+ * subpixel that coincides with the CPU sample.
+ * Test: D + (D >> bias) >= Dold - (Dold >> 10): ties within 2^-10 resolve to
+ * the later draw (OT order). Guest VRAM (plane 0 / native_vram) never has one. */
+#define GL_NATIVE_DEPTH_TIE_SHIFT 10
+#define GL_NATIVE_DEPTH_SLOPE_LIMIT (1 << 22)
+enum { GL_NATIVE_DEPTH_KEEP = 0, GL_NATIVE_DEPTH_RESET = 1, GL_NATIVE_DEPTH_WRITE = 2 };
+/* Debug presentation of the GPU planes (gl_renderer_set_native_depth_view). */
+enum { GL_NATIVE_DEPTH_VIEW_OFF = 0, GL_NATIVE_DEPTH_VIEW_DEPTH = 1, GL_NATIVE_DEPTH_VIEW_POLICY = 2,
+       GL_NATIVE_DEPTH_VIEW_DEPTH_GREY = 3 };
+/* Policy colours of the policy view: NONE, TEST, TEST_WRITE, stamped but
+ * without a usable depth plane on this triangle. */
+enum { GL_NATIVE_DEPTH_SHOW_NONE = 0, GL_NATIVE_DEPTH_SHOW_TEST = 1,
+       GL_NATIVE_DEPTH_SHOW_WRITE = 2, GL_NATIVE_DEPTH_SHOW_FALLBACK = 3 };
+typedef struct GlNativeDepthPlane { int32_t n0, a, b, ox, oy; } GlNativeDepthPlane;
+/* write is the mode of an unblended fragment; semi marks per-texel blending,
+ * whose blended fragments keep the stored key. */
+typedef struct GlNativeDepthMode {
+    int test, write, semi, bias, show;
+    GlNativeDepthPlane plane;
+} GlNativeDepthMode;
+
+/* Q12 unfloored view Z as projected. z <= H/2 is where the GTE quotient
+ * saturates, so the vertex was placed as if at H/2: use that depth rather than
+ * dropping the triangle (the near-plane "clip" in depth space). z > 0xffff is
+ * the far saturation. Behind the camera (z <= 0) has no depth. */
+static int32_t native_depth_q12(double z, uint32_t distance) {
+    if (!isfinite(z) || z <= 0.0) return 0;
+    const double near = distance * (65536.0 / 131071.0);
+    if (z < near) z = near;
+    if (z > 65535.0) z = 65535.0;
+    const double q12 = z * 4096.0;
+    return q12 >= 1.0 ? (int32_t)llround(q12) : 0;
+}
+
+/* Unfloored producer depth first; the integer GTE MAC3 only as a fallback. */
+static int32_t native_vertex_depth_q12(const XgRenderIrVertex *vertex) {
+    if (vertex->native_view_depth > 0) return vertex->native_view_depth;
+    return vertex->projective_position && vertex->projective_view_z > 0 &&
+        vertex->projective_view_z <= 0xffff ? vertex->projective_view_z * 4096 : 0;
+}
+
+/* The integer plane through the exact raster positions this rasterizer uses.
+ * Planes whose gradients exceed the fixed-point range (edge-on slivers) have
+ * no depth; that is decided once here, identically for both rasterizers. */
+static int native_depth_plane(const XgRenderIrTriangle *triangle,
+                              const double x[3], const double y[3], GlNativeDepthPlane *out) {
+    double d[3];
+    for (unsigned i = 0u; i < 3u; ++i) {
+        const int32_t z = native_vertex_depth_q12(&triangle->vertices[i]);
+        if (z <= 0) return 0;
+        d[i] = 1099511627776.0 / z;
+    }
+    const double area = (x[1]-x[0])*(y[2]-y[0]) - (x[2]-x[0])*(y[1]-y[0]);
+    if (area == 0.0 || !isfinite(area)) return 0;
+    const double dx = ((d[1]-d[0])*(y[2]-y[0]) - (d[2]-d[0])*(y[1]-y[0])) / area;
+    const double dy = ((x[1]-x[0])*(d[2]-d[0]) - (x[2]-x[0])*(d[1]-d[0])) / area;
+    if (!isfinite(dx) || !isfinite(dy) || !isfinite(x[0]) || !isfinite(y[0]) ||
+        fabs(x[0]) > 1048576.0 || fabs(y[0]) > 1048576.0) return 0;
+    const double ox = floor(x[0]), oy = floor(y[0]);
+    const double a = nearbyint(dx * 256.0), b = nearbyint(dy * 256.0);
+    const double n0 = nearbyint((d[0] + dx * (ox - x[0]) + dy * (oy - y[0])) * 256.0);
+    if (fabs(a) > GL_NATIVE_DEPTH_SLOPE_LIMIT || fabs(b) > GL_NATIVE_DEPTH_SLOPE_LIMIT ||
+        n0 < 256.0 || n0 >= 1073741824.0) return 0;
+    *out = (GlNativeDepthPlane){(int32_t)n0, (int32_t)a, (int32_t)b, (int32_t)ox, (int32_t)oy};
+    return 1;
+}
+
+/* Key at a logical pixel corner (x, y); mirrors the shader at r = 0. */
+static inline uint32_t native_depth_at(const GlNativeDepthPlane *plane, int x, int y) {
+    const uint32_t n = (uint32_t)plane->n0 + (uint32_t)plane->a * (uint32_t)(x - plane->ox) +
+        (uint32_t)plane->b * (uint32_t)(y - plane->oy);
+    const int32_t d = (int32_t)n >> 8;
+    return d < 1 ? 1u : (uint32_t)d;
+}
+
+static inline int native_depth_pass(uint32_t key, int bias, uint32_t stored) {
+    const uint32_t tested = key + (bias ? key >> bias : 0u);
+    return tested >= stored - (stored >> GL_NATIVE_DEPTH_TIE_SHIFT);
+}
+
+/* Per-triangle mode from the draw's stamp and its FINAL material. */
+static GlNativeDepthMode native_depth_mode(const XgSemanticDrawRecord *draw, const XgRenderIrTriangle *triangle,
+                                           const double x[3], const double y[3]) {
+    GlNativeDepthMode mode = {0, GL_NATIVE_DEPTH_RESET, 0, 0, GL_NATIVE_DEPTH_SHOW_NONE, {0}};
+    unsigned policy = draw->primitive.depth_policy;
+    mode.semi = draw->primitive.material.semi_transparent ? 1 : 0;
+    if (draw->topology != GPU_RENDER_SEMANTIC_TRIANGLES || draw->screen_space_2d || draw->native_view_effect ||
+        policy > GPU_RENDER_DEPTH_TEST_WRITE)
+        policy = GPU_RENDER_DEPTH_NONE;
+    if (policy == GPU_RENDER_DEPTH_NONE) return mode;
+    if (!triangle || !native_depth_plane(triangle, x, y, &mode.plane)) {
+        mode.show = GL_NATIVE_DEPTH_SHOW_FALLBACK;
+        return mode;
+    }
+    mode.test = 1;
+    mode.bias = draw->primitive.depth_bias <= 16u ? draw->primitive.depth_bias : 0;
+    if (policy == GPU_RENDER_DEPTH_TEST_WRITE) {
+        mode.write = GL_NATIVE_DEPTH_WRITE;
+        mode.show = GL_NATIVE_DEPTH_SHOW_WRITE;
+    } else mode.show = GL_NATIVE_DEPTH_SHOW_TEST;
+    return mode;
 }
 
 static int native_render_draw(GlNativeCpuCompiler *compiler,
@@ -7732,6 +7964,8 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                         color[0], color[1], color[2], material->mask_set,
                         material->semi_transparent, material->blend_mode);
                     *destination = conv_1555_to_rgba8(word);
+                    if (target->depth && !material->semi_transparent)
+                        target->depth[destination - target->pixels] = 0u;
                     if (target->words) {
                         const size_t index = destination - target->pixels;
                         target->words[index] = word;
@@ -7889,6 +8123,8 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
         GlNativeAttributePlanes attributes;
         native_attribute_planes(triangle, px, py, 1u,
             material->shading == XG_RENDER_IR_SHADING_GOURAUD, &attributes);
+        const GlNativeDepthMode depth_mode = target->depth
+            ? native_depth_mode(draw, triangle, px, py) : (GlNativeDepthMode){0};
         const double orientation = area < 0.0 ? -1.0 : 1.0;
         area *= orientation;
         for (int vi = 0; vi < 3; ++vi) {
@@ -7958,6 +8194,17 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     !native_pixel_in_viewport(compiler, target, destination)) continue;
                 if (material->mask_check && (*destination >> 24u) != 0u)
                     continue;
+                uint32_t *const depth_cell = target->depth ? target->depth + (destination - target->pixels) : NULL;
+                uint32_t fragment_depth = 0u;
+                int blended = 0; /* this fragment actually blends: it keeps the stored key */
+                if (depth_cell && depth_mode.test) {
+                    fragment_depth = native_depth_at(&depth_mode.plane, x, y);
+                    compiler->audit->depth_tested_fragments++;
+                    if (!native_depth_pass(fragment_depth, depth_mode.bias, *depth_cell)) {
+                        compiler->audit->depth_rejected_fragments++;
+                        continue;
+                    }
+                }
                 if (constant_fragment) {
                     word = constant_word;
                     goto native_write_fragment;
@@ -8037,10 +8284,12 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                      * unpacking/modulating/clamping/repacking opaque pixels. */
                     if (direct_texel) {
                         word = texel | (material->mask_set ? UINT16_C(0x8000) : 0u);
-                        if (material->semi_transparent && (texel & UINT16_C(0x8000)))
+                        if (material->semi_transparent && (texel & UINT16_C(0x8000))) {
                             word = native_psx_fragment_word(*destination,
                                 texel & 31u, (texel >> 5u) & 31u, (texel >> 10u) & 31u,
                                 1, 1, material->blend_mode);
+                            blended = 1;
+                        }
                         goto native_write_fragment;
                     }
                     for (int channel = 0; channel < 3; ++channel) {
@@ -8068,8 +8317,24 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     color5[0], color5[1], color5[2], mask, blend,
                     material->blend_mode) : (uint16_t)(color5[0] |
                         (color5[1] << 5u) | (color5[2] << 10u) | (mask << 15u));
+                blended = blend;
 native_write_fragment:
                 *destination = conv_1555_to_rgba8(word);
+                /* Per texel: blended fragments keep the key; opaque texels of a
+                 * semi-transparent material write like any opaque fragment. */
+                if (depth_cell && !blended) {
+                    if (depth_mode.write == GL_NATIVE_DEPTH_WRITE) {
+                        *depth_cell = fragment_depth;
+                        compiler->audit->depth_written_fragments++;
+                        if (!compiler->audit->depth_key_min || fragment_depth < compiler->audit->depth_key_min)
+                            compiler->audit->depth_key_min = fragment_depth;
+                        if (fragment_depth > compiler->audit->depth_key_max)
+                            compiler->audit->depth_key_max = fragment_depth;
+                    } else if (*depth_cell != 0u) {
+                        *depth_cell = 0u;
+                        compiler->audit->depth_reset_fragments++;
+                    }
+                }
                 if (target->words) {
                     const size_t index = destination - target->pixels;
                     target->words[index] = word;
@@ -8205,6 +8470,22 @@ static int native_view_worker_finish(GlNativeCpuCompiler *compiler) {
     const int ok = !native_view_worker_failed(worker, &failed);
     if (!ok) native_audit_block(compiler->audit, failed->blocker, failed->blocker_record_index,
         failed->blocker_resource_id, failed->blocker_resource_generation);
+    /* Band audits restart at every bind; fold their depth counters once here. */
+    for (uint32_t i = 0u; i < worker->band_count; ++i) {
+        GlNativeCompileAudit *band = &worker->bands[i].audit;
+        compiler->audit->depth_tested_fragments += band->depth_tested_fragments;
+        compiler->audit->depth_rejected_fragments += band->depth_rejected_fragments;
+        compiler->audit->depth_written_fragments += band->depth_written_fragments;
+        compiler->audit->depth_reset_fragments += band->depth_reset_fragments;
+        if (band->depth_key_min && (!compiler->audit->depth_key_min ||
+                band->depth_key_min < compiler->audit->depth_key_min))
+            compiler->audit->depth_key_min = band->depth_key_min;
+        if (band->depth_key_max > compiler->audit->depth_key_max)
+            compiler->audit->depth_key_max = band->depth_key_max;
+        band->depth_tested_fragments = band->depth_rejected_fragments = 0u;
+        band->depth_written_fragments = band->depth_reset_fragments = 0u;
+        band->depth_key_min = band->depth_key_max = 0u;
+    }
     SDL_UnlockMutex(worker->mutex);
     compiler->view_worker = NULL;
     return ok;
@@ -8231,6 +8512,9 @@ static void native_view_worker_bind(GlNativeViewWorker *worker, const GlNativeCp
         band->done = 0u; band->failed = 0;
         band->audit.blocker = 0u; band->audit.rendered_draws = 0u;
         band->audit.rendered_draw_pixels = 0u;
+        band->audit.depth_tested_fragments = band->audit.depth_rejected_fragments = 0u;
+        band->audit.depth_written_fragments = band->audit.depth_reset_fragments = 0u;
+        band->audit.depth_key_min = band->audit.depth_key_max = 0u;
     }
     worker->count = 0u;
     memset(worker->reads, 0, sizeof(worker->reads));
@@ -8505,7 +8789,7 @@ static int native_view_domain_private(GlNativeViewState *views, uint32_t index, 
     GlNativeViewDomain *domain = &views->domains[index];
     const uint64_t bit = UINT64_C(1) << index;
     if ((views->owned & bit) && !copy_snapshot) return 1;
-    const size_t bytes = (size_t)views->width * VRAM_H * sizeof(uint32_t);
+    const size_t bytes = native_view_domain_bytes(views);
     uint32_t *pixels = domain->pixels ? malloc(bytes) : calloc(1u, bytes);
     if (!pixels) return 0;
     if (domain->pixels) memcpy(pixels, domain->pixels, bytes);
@@ -8535,6 +8819,8 @@ static int native_view_private(GlNativeViewState *views, uint32_t index,
         if (domain->initialized[y]) continue;
         memcpy(domain->pixels + (size_t)y * views->width + views->offset,
             canonical + (size_t)y * VRAM_W + target->x, (size_t)target->width * sizeof(uint32_t));
+        native_depth_clear_rows(native_view_domain_depth(views, domain), views->width,
+            views->offset, (int)y, target->width, 1);
         if (views->gpu && !gpu_new) {
             GlNativeGpuCommand *seed = native_gpu_command(views->gpu, NATIVE_GPU_SEED);
             if (!seed) return 0;
@@ -8545,7 +8831,8 @@ static int native_view_private(GlNativeViewState *views, uint32_t index,
         }
         domain->initialized[y] = 1u;
     }
-    if (!native_gpu_seed(views->gpu, slot + 1u, views->width, VRAM_H, domain->pixels)) return 0;
+    if (!native_gpu_seed(views->gpu, slot + 1u, views->width, VRAM_H, domain->pixels,
+            native_view_domain_depth(views, domain))) return 0;
     target->pixels = domain->pixels + (size_t)target->y * views->width;
     return 1;
 }
@@ -8888,7 +9175,7 @@ static int native_gpu_data(GlNativeGpuWork *work, const void *data, size_t bytes
 }
 
 static int native_gpu_seed(GlNativeGpuWork *work, uint32_t plane, uint32_t width, uint32_t height,
-                       const uint32_t *pixels) {
+                       const uint32_t *pixels, uint32_t *depth) {
     if (!work) return 1;
     if (plane >= GL_NATIVE_GPU_PLANES || !width || !height) return 0;
     if (work->widths[plane]) return 1;
@@ -8896,6 +9183,8 @@ static int native_gpu_seed(GlNativeGpuWork *work, uint32_t plane, uint32_t width
     if (!work->fresh && plane < GL_NATIVE_GPU_PHASE_BASE && s_native_gpu_planes[plane].texture) return 1;
     GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_SEED);
     if (!command) return 0;
+    /* A whole-plane seed writes far depth on the GPU; keep the CPU plane equal. */
+    if (depth) memset(depth, 0, (size_t)width * height * sizeof(*depth));
     command->plane = plane; command->w = width; command->h = height;
     return native_gpu_data(work, pixels, (size_t)width * height * sizeof(*pixels), &command->data);
 }
@@ -9239,6 +9528,7 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         if (recipe->publication) recipe->publication->references++;
     }
     recipe->dithering_disabled = audit->header.display.dithering_disabled;
+    recipe->depth_test = audit->header.display.native_depth_test;
     if (!native_recipe_textures(recipe, target, words, &draw, audit->header.display.render_scale, views)) { native_recipe_drop(target); return; }
     uint32_t motion_index = UINT32_MAX;
     if (binding->motion.handle.resource_id) {
@@ -9593,7 +9883,7 @@ static int native_view_raster(GlNativeCpuCompiler *compiler, uint16_t view_width
     resource.view.descriptor.vram_width = view_width;
     resource.view.descriptor.vram_height = target->height;
     surface = (GlNativeCpuSurface){.resource = &resource, .pixels = target->pixels,
-        .width = view_width, .height = target->height, .valid = 1};
+        .depth = target->depth, .width = view_width, .height = target->height, .valid = 1};
     const uint32_t saved_draws = compiler->audit->rendered_draws;
     const uint64_t saved_pixels = compiler->audit->rendered_draw_pixels;
     const uint32_t saved_width = compiler->viewport_width, saved_height = compiler->viewport_height;
@@ -9622,6 +9912,9 @@ static int native_view_draw(GlNativeCpuCompiler *compiler, GlNativeViewState *vi
     uint64_t visited = 0u;
     if (material->draw_area_left > material->draw_area_right ||
         material->draw_area_top > material->draw_area_bottom) return 1;
+    if (views->depth_test)
+        compiler->audit->depth_draws[draw->primitive.depth_policy <= GPU_RENDER_DEPTH_TEST_WRITE
+            ? draw->primitive.depth_policy : GPU_RENDER_DEPTH_NONE]++;
     for (uint32_t i = 0u; i < views->count; ++i) {
         const GlNativeViewTarget *first = &views->targets[i];
         if ((visited & (UINT64_C(1) << i)) || !native_view_eligible(views, first)) continue;
@@ -9644,7 +9937,8 @@ static int native_view_draw(GlNativeCpuCompiler *compiler, GlNativeViewState *vi
         if (!logical) continue;
         const GlNativeViewDomain *domain = &views->domains[domain_index];
         const GlNativeViewRaster target = {.x = domain->x, .width = domain->width,
-            .height = VRAM_H, .pixels = domain->pixels};
+            .height = VRAM_H, .pixels = domain->pixels,
+            .depth = native_view_domain_depth(views, domain)};
         /* The declared viewport, not the availability of predivide metadata,
          * determines its full scissor. Unmarked billboards keep their size and
          * canonical position plus the same center offset as the other draws. */
@@ -9870,6 +10164,8 @@ static int native_view_wave_apply(GlNativeViewState *views, uint32_t source_inde
             const int clipped_bottom = bottom < target->height ? bottom : target->height;
             if (!native_gpu_span(views->gpu, gpu_target, begin, target->y+clipped_top,
                 end-begin, clipped_bottom-clipped_top, UINT32_MAX, 0,0,0,0,0,0)) return 0;
+            native_depth_clear_rows(native_view_target_depth(views, target), views->width,
+                begin, clipped_top, end - begin, clipped_bottom - clipped_top);
             for (int y = top < 0 ? 0 : top; y < bottom && y < target->height; ++y)
                 memset(target->pixels + (size_t)y * views->width + begin, 0,
                        (size_t)(end - begin) * sizeof(uint32_t));
@@ -9978,6 +10274,7 @@ static int native_view_transfer(GlNativeViewState *views,
             copied_domains |= UINT64_C(1) << domain;
         }
         if (!native_view_private(views, i, canonical)) goto finished;
+        uint32_t *const target_depth = native_view_target_depth(views, target);
         for (uint32_t y = 0u; y < target->height; ++y) {
             const uint32_t dy = (target->y + y - operation->dst_y) & (VRAM_H - 1);
             if (dy >= operation->height) continue;
@@ -9999,9 +10296,18 @@ static int native_view_transfer(GlNativeViewState *views,
                         (size_t)views->width * sizeof(*row));
                 else
                     for (uint32_t x = 0u; x < views->width; ++x) row[x] = color;
+                /* A full-row copy of a VIEW domain moves its surfaces, keys
+                 * included (the snapshot allocation holds its plane after the
+                 * pixels). Fills and partial copies leave no certified surface. */
+                if (target_depth && wide_copy)
+                    memcpy(target_depth + (size_t)y * views->width,
+                        snapshot[source_index] + (size_t)views->width * VRAM_H +
+                            (size_t)(source_y - source->y) * views->width,
+                        (size_t)views->width * sizeof(*target_depth));
+                else native_depth_clear_rows(target_depth, views->width, 0, (int)y, views->width, 1);
                 if (!native_gpu_span(views->gpu, domain+1u, 0, target->y+y, views->width, 1,
                     wide_copy ? native_view_domain(views, source)+1u : UINT32_MAX,
-                    0, source_y, views->width, 1, color, 0)) goto finished;
+                    0, source_y, views->width, 1, color, target_depth && wide_copy ? 4u : 0u)) goto finished;
                 continue;
             }
             for (uint32_t x = 0u; x < views->width; ++x) {
@@ -10017,6 +10323,7 @@ static int native_view_transfer(GlNativeViewState *views,
                     if (!native_gpu_span(views->gpu, domain+1u, x, target->y+y, 1, 1,
                         UINT32_MAX, 0, 0, 0, 0, 0, 0)) goto finished;
                     *destination = 0u;
+                    if (target_depth) target_depth[(size_t)y * views->width + x] = 0u;
                     continue;
                 }
                 if (!center && !wide_copy &&
@@ -10057,6 +10364,7 @@ static int native_view_transfer(GlNativeViewState *views,
                 } else if (!native_gpu_pixel(views->gpu, domain+1u, x, target->y+y, color, gpu_mask)) goto finished;
                 if (operation->mask_check && (*destination >> 24u)) continue;
                 *destination = color | (operation->mask_set ? UINT32_C(0xff000000) : 0u);
+                if (target_depth) target_depth[(size_t)y * views->width + x] = 0u;
             }
         }
         if (copy) audit->view_copies++;
@@ -10863,6 +11171,7 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
     GlNativePhaseProducer producers[64] = {0};
     uint32_t producer_count = 0u;
     uint32_t *pixels = NULL;
+    uint32_t *depth = NULL;
     int ok = 0;
     *out_pixels = NULL;
     if (!width || !audit || crop_y > recipe->height ||
@@ -10871,6 +11180,9 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         pixels = malloc((size_t)width * recipe->height * sizeof(*pixels));
         if (!pixels) goto finished;
         for (size_t i = 0u; i < (size_t)width * recipe->height; ++i) pixels[i] = recipe->clear_color;
+        /* The recipe starts at a full-target clear: its depth starts far. */
+        if (recipe->depth_test && !(depth = calloc((size_t)width * recipe->height, sizeof(*depth))))
+            goto finished;
     } else {
         /* Use the endpoint raster's coordinate domain and viewport. Rendering
          * the same Q16 geometry into a cropped-height viewport changes GL's
@@ -10906,7 +11218,7 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
     compiler.gpu_plane = GL_NATIVE_GPU_PHASE_BASE + phase;
     target_resource.view.descriptor.width = width;
     target_resource.view.descriptor.height = recipe->height;
-    target = (GlNativeCpuSurface){.resource = &target_resource, .pixels = pixels,
+    target = (GlNativeCpuSurface){.resource = &target_resource, .pixels = pixels, .depth = depth,
         .width = width, .height = recipe->height, .valid = 1};
     for (uint32_t i = 0u; i < recipe->count; ++i) {
         const GlNativeRecipeDraw *record = &recipe->draws[i];
@@ -10934,7 +11246,7 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
             record->motion_index < recipe->motion_count && entities[record->motion_index].enabled) {
             const GlNativeMotionProjection *projection = &entities[record->motion_index].projections[i];
             const double (*screen_delta)[3][3] = projection->screen;
-            const double (*native_delta)[3][2] = projection->native;
+            const double (*native_delta)[3][3] = projection->native;
             const XgRenderMotionProjectResult projected = projection->result;
             if (projected == XG_RENDER_MOTION_CLIP_REQUIRED) {
                 motion_audit->temporal_status = GL_RENDERER_NATIVE_TEMPORAL_CLIP_REQUIRED;
@@ -10982,6 +11294,18 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
                             else
                                 vertex->projective_position = 0u;
                         }
+                        /* Depth test key: the endpoint's own unfloored depth plus
+                         * the pose's Native view-Z displacement, like the Native
+                         * positions (a static pose leaves it bit-identical).
+                         * Without an endpoint depth, fall back to phase Z. */
+                        if (vertex->native_view_depth > 0) {
+                            const double depth = vertex->native_view_depth + native_delta[t][v][2] * 4096.0;
+                            vertex->native_view_depth = isfinite(depth) && depth >= 1.0 && depth <= 65535.0 * 4096.0
+                                ? (int32_t)llround(depth) : native_depth_q12(screen_delta[t][v][2],
+                                    vertex->projective_distance);
+                        } else if (vertex->projective_position)
+                            vertex->native_view_depth = native_depth_q12(screen_delta[t][v][2],
+                                vertex->projective_distance);
                         vertex->temporal_depth_valid = 0u;
                     }
                 motion_audit->motion_projected_draws++;
@@ -11000,6 +11324,10 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
                     if (vertex->native_view_position) {
                         vertex->native_view_x = (int32_t)((int64_t)vertex->native_view_x + delta[2]);
                         vertex->native_view_y = (int32_t)((int64_t)vertex->native_view_y + delta[3]);
+                    }
+                    if (vertex->native_view_depth > 0) {
+                        const int64_t depth = (int64_t)vertex->native_view_depth + delta[4];
+                        vertex->native_view_depth = depth > 0 && depth <= INT32_MAX ? (int32_t)depth : 0;
                     }
                     /* The projected payload has no phase-local depth here, so
                      * the endpoint depth stays; hiding it would make this
@@ -11031,7 +11359,8 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         }
         if (!native_materialize_native_draw(&semantic, &draw)) goto finished;
         if (use_view) {
-            const GlNativeViewRaster raster = {.width = recipe->width, .height = recipe->height, .pixels = pixels};
+            const GlNativeViewRaster raster = {.width = recipe->width, .height = recipe->height,
+                .pixels = pixels, .depth = depth};
             if (!native_view_raster(&compiler, recipe->view_width, recipe->offset, &raster,
                 &draw, i, record->enhanced, gpu ? recipe->origin_y : record->view_origin_y)) goto finished;
         } else {
@@ -11055,7 +11384,7 @@ finished:
     if (ok && gpu)
         for (uint32_t i = 0u; i < producer_count && s_native_phase_producer_count < 65536u; ++i)
             s_native_phase_producers[s_native_phase_producer_count++] = producers[i];
-    free(pixels); free(audit);
+    free(pixels); free(depth); free(audit);
     return ok;
 }
 
@@ -11128,11 +11457,32 @@ static int native_motion_camera_equal(const XgRenderMotionPose *a, const XgRende
 
 static int native_motion_reject(const char *reason, const XgRenderMotionPose *pose,
                              uint32_t draw_index, uint32_t producer_id) {
-    s_native_motion_reject_events[s_native_motion_reject_total++ % 32u] = (GlNativeMotionRejectEvent){
+    if (s_native_state_mutex) SDL_LockMutex(s_native_state_mutex);
+    s_native_motion_reject_events[s_native_motion_reject_total++ % GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY] =
+        (GlNativeMotionRejectEvent){
         .reason = reason, .entity_id = pose ? pose->entity_id : 0u,
         .source_update = pose ? pose->source_update : 0u,
         .draw_index = draw_index, .producer_id = producer_id};
+    if (s_native_state_mutex) SDL_UnlockMutex(s_native_state_mutex);
     return 0;
+}
+
+uint32_t gl_renderer_native_motion_rejects(GlRendererNativeMotionRejectEvent *out,
+                                           uint32_t capacity, uint64_t *out_total) {
+    uint32_t count = 0u;
+    if (s_native_state_mutex) SDL_LockMutex(s_native_state_mutex);
+    const uint64_t total = s_native_motion_reject_total;
+    const uint64_t kept = total < GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY
+        ? total : GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY;
+    for (uint64_t sequence = total - kept; out && sequence < total && count < capacity; ++sequence) {
+        const volatile GlNativeMotionRejectEvent *event =
+            &s_native_motion_reject_events[sequence % GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY];
+        out[count++] = (GlRendererNativeMotionRejectEvent){sequence, event->reason, event->entity_id,
+            event->source_update, event->draw_index, event->producer_id};
+    }
+    if (s_native_state_mutex) SDL_UnlockMutex(s_native_state_mutex);
+    if (out_total) *out_total = total;
+    return count;
 }
 
 static int native_motion_mesh_compare(const void *left, const void *right) {
@@ -11176,6 +11526,7 @@ static void native_motion_vertex_sample(GlNativeVertexSample *sample, const GpuR
     sample->position[0] = (int64_t)p->x - dx; sample->position[1] = (int64_t)p->y - dy;
     sample->native = p->native_view_position != 0u;
     sample->projective = p->projective_position != 0u;
+    sample->depth = p->native_view_depth > 0 ? p->native_view_depth : 0;
     if (sample->native) {
         sample->position[2] = (int64_t)p->native_view_x - dx - (int64_t)offset * 65536;
         sample->position[3] = (int64_t)p->native_view_y - dy;
@@ -11438,6 +11789,10 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
                 if (!isfinite(delta) || delta < -4294967295.0 || delta > 4294967295.0) mesh->bad = 1u;
                 else cache->deltas[(size_t)phase * cache->pair_count + i][axis] = (int64_t)llround(delta);
             }
+            /* View Z is affine in the source frame interval: the same lerp the
+             * bend above projects. A missing endpoint depth keeps the current one. */
+            cache->deltas[(size_t)phase * cache->pair_count + i][4] = a->depth > 0 && b->depth > 0
+                ? (int64_t)llround(weight * ((double)a->depth - b->depth)) : 0;
         }
     }
     /* One policy for the whole producer/component, including new visibility
@@ -11617,6 +11972,7 @@ static int native_motion_layout_equal(const GlNativeMotionHistory *history, cons
         a->native_height == b->native_height && a->native_offset_x == b->native_offset_x &&
         a->temporal_hz == b->temporal_hz &&
         a->dithering_disabled == b->dithering_disabled &&
+        a->native_depth_test == b->native_depth_test &&
         (a->render_scale ? a->render_scale : 1u) == (b->render_scale ? b->render_scale : 1u);
 }
 
@@ -11639,6 +11995,7 @@ static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRec
     if (a == b) return 1; /* Retained recipes are immutable through COPY/COW. */
     if (!a || !b || a->count != b->count || a->motion_count != b->motion_count || a->coverage_count != b->coverage_count ||
         a->dithering_disabled != b->dithering_disabled ||
+        a->depth_test != b->depth_test ||
         a->clear_color != b->clear_color ||
         a->width != b->width || a->height != b->height || a->view_width != b->view_width ||
         a->view_height != b->view_height || a->offset != b->offset ||
@@ -12012,7 +12369,8 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
          display->native_width <= 2u * display->native_offset_x)) goto failed;
     if (views->width != display->native_width ||
         views->reference_height != display->native_height ||
-        views->offset != display->native_offset_x) {
+        views->offset != display->native_offset_x ||
+        views->depth_test != (int)display->native_depth_test) {
         /* Layout changes preserve declarations, but not old projection pixels.
          * A later TARGET/draw seeds only the center from our own device plane. */
         views->reset_motion_history = 1;
@@ -12031,6 +12389,8 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     views->width = display->native_width;
     views->reference_height = display->native_height;
     views->offset = display->native_offset_x;
+    /* Toggling the option resets the domains above: allocation layout differs. */
+    views->depth_test = display->native_depth_test ? 1 : 0;
     if (views->temporal_hz != display->temporal_hz) views->reset_motion_history = 1;
     views->temporal_hz = display->temporal_hz;
     if (audit->header.discontinuity) views->reset_motion_history = 1;
@@ -12117,10 +12477,17 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     compiler.gpu = gpu;
     compiler.native_views = views;
     if (gpu) {
-        if (!native_gpu_seed(gpu, 0u, VRAM_W, VRAM_H, canvas.pixels)) goto allocation_failed;
-        for (uint32_t i = 0u; i < views->domain_count; ++i)
-            if (views->domains[i].pixels && !native_gpu_seed(gpu, i+1u, views->width, VRAM_H,
-                views->domains[i].pixels)) goto allocation_failed;
+        if (!native_gpu_seed(gpu, 0u, VRAM_W, VRAM_H, canvas.pixels, NULL)) goto allocation_failed;
+        for (uint32_t i = 0u; i < views->domain_count; ++i) {
+            if (!views->domains[i].pixels) continue;
+            /* A seed resets depth; never mutate the committed domain for it. */
+            if (views->depth_test && !gpu->widths[i+1u] &&
+                (gpu->fresh || !s_native_gpu_planes[i+1u].texture) &&
+                !native_view_domain_private(views, i, NULL)) goto allocation_failed;
+            if (!native_gpu_seed(gpu, i+1u, views->width, VRAM_H,
+                views->domains[i].pixels, native_view_domain_depth(views, &views->domains[i])))
+                goto allocation_failed;
+        }
     }
 
     uint32_t publication_index = 0u;
@@ -12719,8 +13086,9 @@ static GLuint s_native_gpu_program, s_native_gpu_vao, s_native_gpu_vbo, s_native
 static GLint s_native_gpu_size, s_native_gpu_state, s_native_gpu_flags, s_native_gpu_page;
 static GLint s_native_gpu_window, s_native_gpu_depth, s_native_gpu_origin, s_native_gpu_color;
 static GLint s_native_gpu_attribute_origin, s_native_gpu_attribute_plane[5], s_native_gpu_attribute_dda[5];
+static GLint s_native_gpu_depth_state, s_native_gpu_depth_plane, s_native_gpu_depth_origin, s_native_gpu_depth_view;
 static GlNativeGpuPlane s_native_gpu_destination;
-static int s_native_gpu_uniforms[4][4], s_native_gpu_depth_value, s_native_gpu_origin_value[2];
+static int s_native_gpu_uniforms[6][4], s_native_gpu_depth_value, s_native_gpu_origin_value[2];
 
 /* Native GPU vertex: position (2), uv (2), color (4), perspective weight (1)
  * and padding. The weight is the normalized reciprocal view depth (1/z with
@@ -12776,9 +13144,39 @@ static const char *NATIVE_GPU_VS =
     "  gl_Position=vec4(((p+size.z)/size.xy*2.0-1.0)*w,0.0,w);}\n";
 static const char *NATIVE_GPU_FS =
     "#version 330\n"
-    "uniform usampler2D words; uniform sampler2D source_image,destination;\n"
+    "uniform usampler2D words,destination_depth,source_depth; uniform sampler2D source_image,destination;\n"
     "uniform ivec4 state,flags,page,window; uniform int depth; uniform ivec2 origin;\n"
-    "uniform vec4 size,constant_color; noperspective in vec2 t; smooth in vec2 t_p; flat in int persp; noperspective in vec4 color; out vec4 result;\n"
+    /* Native depth plane (see native_depth_plane): depth_state = (test, mode of
+     * an unblended fragment 1=far 2=key 3=copy source, per-texel keep, bias);
+     * depth_plane = (N0 Q8, a, b, scale) at the logical depth_origin. The key is
+     * the CPU reference's integer evaluation, extended to scale S subpixels.
+     * depth_view = (0 off / 1 depth colour / 2 policy / 3 depth grey,
+     * policy colour, log2 key range x256). */
+    "uniform ivec4 depth_state,depth_plane,depth_view; uniform ivec2 depth_origin;\n"
+    "uniform vec4 size,constant_color; noperspective in vec2 t; smooth in vec2 t_p; flat in int persp; noperspective in vec4 color;\n"
+    "layout(location=0) out vec4 result; layout(location=1) out uvec4 depth_result;\n"
+    "uint depth_key(){\n"
+    " int S=depth_plane.w; ivec2 d=ivec2(gl_FragCoord.xy)-depth_origin*S;\n"
+    " ivec2 l=ivec2(d.x>=0?d.x/S:-((S-1-d.x)/S),d.y>=0?d.y/S:-((S-1-d.y)/S)); ivec2 r=d-l*S;\n"
+    " int n=int(uint(depth_plane.x)+uint(depth_plane.y)*uint(l.x)+uint(depth_plane.z)*uint(l.y));\n"
+    " int k=(n>>8)+((n&255)*S+depth_plane.y*r.x+depth_plane.z*r.y+S*134217728)/(256*S)-524288;\n"
+    " return uint(max(k,1));\n"
+    "}\n"
+    /* Depth views: black = no certified surface; otherwise t over the frame's
+     * written key range (1 = near). Mode 1 maps t on a Turbo ramp (red near,
+     * blue far), mode 3 on grey (near bright, far dark). */
+    /* lw is the screen-space width of one contour step (fwidth, taken by the
+     * caller in uniform control flow): contours stay about one pixel wide. */
+    "vec3 depth_gray(uint k,float lw){if(k==0u)return vec3(0.0);\n"
+    " float l=log2(float(k)); float lo=float(depth_view.z)/256.0,hi=float(depth_view.w)/256.0;\n"
+    " float t=hi>lo+0.01?clamp((l-lo)/(hi-lo),0.0,1.0):0.5;\n"
+    " float contour=fract(l*16.0)<min(lw,0.5)?0.5:1.0;\n"
+    " if(depth_view.x==3)return vec3(0.12+0.88*t)*contour;\n"
+    " vec4 v4=vec4(1.0,t,t*t,t*t*t); vec2 v2=v4.zw*v4.z;\n"
+    " vec3 c=vec3(dot(v4,vec4(0.13572138,4.61539260,-42.66032258,132.13108234))+dot(v2,vec2(-152.94239396,59.28637943)),\n"
+    "  dot(v4,vec4(0.09140261,2.19418839,4.84296658,-14.18503333))+dot(v2,vec2(4.27729857,2.82956604)),\n"
+    "  dot(v4,vec4(0.10667330,12.64194608,-60.58204836,110.36276771))+dot(v2,vec2(-89.90310912,27.34824973)));\n"
+    " return clamp(c,0.0,1.0)*contour;}\n"
     "uniform vec4 attribute_origin; uniform vec4 attribute_plane[5]; uniform ivec4 attribute_dda[5];\n"
     "float attribute_at(int a){\n"
     " if(attribute_origin.z==1.0){\n"
@@ -12793,7 +13191,13 @@ static const char *NATIVE_GPU_FS =
     "void main(){\n"
     " vec4 old=vec4(0); if(flags.y!=0 || (flags.w==0 && state.z!=0)) old=texelFetch(destination,ivec2(gl_FragCoord.xy),0);\n"
     " if(flags.y!=0 && old.a>0.0) discard;\n"
-    " if(flags.w!=0){result=flags.w==1?constant_color:texture(source_image,t); if(flags.x!=0)result.a=1.0; return;}\n"
+    " uint key=0u,stored=0u; if(depth_state.x!=0||depth_state.z!=0) stored=texelFetch(destination_depth,ivec2(gl_FragCoord.xy),0).r;\n"
+    " if(depth_state.x!=0){key=depth_key(); uint tested=key+(depth_state.w!=0?key>>uint(depth_state.w):0u);\n"
+    "  if(tested<stored-(stored>>10u)) discard;}\n"
+    " if(flags.w!=0){result=flags.w==1?constant_color:texture(source_image,t); if(flags.x!=0)result.a=1.0;\n"
+    "  depth_result=uvec4(depth_state.y==3?texture(source_depth,t).r:0u);\n"
+    "  if(depth_view.x==1||depth_view.x==3)result.rgb=depth_gray(depth_result.r,fwidth(log2(float(max(depth_result.r,1u)))*16.0));\n"
+    "  return;}\n"
     " vec3 rgb=attribute_origin.z==0.0?floor(color.rgb+0.5):vec3(attribute_at(2),attribute_at(3),attribute_at(4));\n"
     " ivec3 c=ivec3(clamp(rgb,0.0,255.0)); int mask=flags.x,blend=state.z;\n"
     " const int d[16]=int[16](-4,0,-3,1,2,-2,3,-1,-3,1,-4,0,3,-1,2,-2);\n"
@@ -12807,13 +13211,52 @@ static const char *NATIVE_GPU_FS =
     " }else c=clamp((c+bias)>>3,ivec3(0),ivec3(31));\n"
     " if(blend!=0){ivec3 b=ivec3(floor(old.rgb*255.0+0.5))>>3;\n"
     "  if(state.w==0)c=(b+c)/2; else if(state.w==1)c=b+c; else if(state.w==2)c=b-c; else c=b+c/4;}\n"
-    " c=clamp(c,ivec3(0),ivec3(31)); result=vec4(vec3((c<<3)|(c>>2))/255.0,float(mask));}\n";
+    " c=clamp(c,ivec3(0),ivec3(31)); result=vec4(vec3((c<<3)|(c>>2))/255.0,float(mask));\n"
+    /* Blended fragments keep the stored key; opaque ones (including opaque
+     * texels of a semi-transparent material) write the key or far. */
+    " depth_result=uvec4(blend!=0?stored:(depth_state.y==2?key:0u));\n"
+    " if(depth_view.x==1||depth_view.x==3){float lw=fwidth(log2(float(max(depth_result.r,1u)))*16.0);\n"
+    "  result.rgb=blend!=0?old.rgb:depth_gray(depth_result.r,lw);}\n"
+    " else if(depth_view.x==2){vec3 tint=depth_view.y==1?vec3(1.0,0.85,0.1):depth_view.y==2?vec3(0.1,0.9,0.2):\n"
+    "  depth_view.y==3?vec3(1.0,0.15,0.15):vec3(dot(result.rgb,vec3(0.3,0.59,0.11)));\n"
+    "  result.rgb=depth_view.y==0?tint*0.6:mix(result.rgb,tint,0.55);}}\n";
 
 static void native_gpu_plane_free(GlNativeGpuPlane *plane) {
     if (plane->framebuffer && (SDL_GL_GetCurrentContext() == s_native_presenter_ctx || SDL_GL_GetCurrentContext()==s_native_gpu_ctx))
         p_glDeleteFramebuffers(1, &plane->framebuffer);
     if (plane->texture) glDeleteTextures(1, &plane->texture);
+    if (plane->depth) glDeleteTextures(1, &plane->depth);
     memset(plane, 0, sizeof(*plane));
+}
+
+static int native_gpu_depth_supported(void) {
+    return p_glDrawBuffers && p_glColorMaski && p_glClearBufferuiv;
+}
+
+/* Everything since the last barrier is unknown: the next destination read
+ * barriers. Used at slice start and after any non-draw write (blit, clear). */
+static void native_gpu_plane_dirty_all(GlNativeGpuPlane *plane) {
+    plane->dirty[0] = plane->dirty[1] = 0;
+    plane->dirty[2] = plane->dirty[3] = INT_MAX;
+}
+
+/* Attach (once) and clear-to-far the plane's R32UI depth attachment. */
+static int native_gpu_plane_depth(GlNativeGpuPlane *plane) {
+    if (plane->depth) return 1;
+    if (!plane->framebuffer || !native_gpu_depth_supported()) return 0;
+    plane->depth = make_tex(PSXGL_R32UI, (int)plane->width, (int)plane->height, PSXGL_RED_INTEGER, GL_UNSIGNED_INT);
+    if (!plane->depth) return 0;
+    static const GLenum both[2] = {PSXGL_COLOR_ATTACHMENT0, PSXGL_COLOR_ATTACHMENT1};
+    static const GLuint far_depth[4] = {0u, 0u, 0u, 0u};
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, plane->framebuffer);
+    p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, plane->depth, 0);
+    p_glDrawBuffers(2, both);
+    glDisable(GL_SCISSOR_TEST);
+    p_glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    p_glClearBufferuiv(PSXGL_COLOR, 1, far_depth);
+    p_glDrawBuffers(1, both);
+    native_gpu_plane_dirty_all(plane);
+    return p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) == PSXGL_FRAMEBUFFER_COMPLETE;
 }
 
 static int native_gpu_plane_size(GlNativeGpuPlane *plane, uint32_t width, uint32_t height) {
@@ -12829,7 +13272,31 @@ static void native_gpu_blit(const GlNativeGpuPlane *source, const GlNativeGpuPla
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source->framebuffer);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, destination->framebuffer);
+    if (destination->depth) {
+        /* A colour blit writes every enabled draw buffer: never the depth plane. */
+        static const GLenum color[1] = {PSXGL_COLOR_ATTACHMENT0};
+        p_glDrawBuffers(1, color);
+    }
     p_glBlitFramebuffer(x,y,x+w,y+h,x,y,x+w,y+h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    native_gpu_plane_dirty_all((GlNativeGpuPlane *)destination);
+}
+
+/* Depth attachment copy (carry-forward, destination scratch). Leaves the read
+ * buffer at ATTACHMENT0, which scanout composition reads. */
+static void native_gpu_blit_depth(const GlNativeGpuPlane *source, const GlNativeGpuPlane *destination,
+                                  int x, int y, int w, int h) {
+    if (!source->depth || !destination->depth) return;
+    static const GLenum depth_only[2] = {GL_NONE, PSXGL_COLOR_ATTACHMENT1};
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source->framebuffer);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, destination->framebuffer);
+    glReadBuffer(PSXGL_COLOR_ATTACHMENT1);
+    p_glDrawBuffers(2, depth_only);
+    p_glBlitFramebuffer(x,y,x+w,y+h,x,y,x+w,y+h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    glReadBuffer(PSXGL_COLOR_ATTACHMENT0);
+    static const GLenum color[1] = {PSXGL_COLOR_ATTACHMENT0};
+    p_glDrawBuffers(1, color);
+    native_gpu_plane_dirty_all((GlNativeGpuPlane *)destination);
 }
 
 static int native_gpu_program_init(void) {
@@ -12851,6 +13318,12 @@ static int native_gpu_program_init(void) {
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"words"),0);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"destination"),1);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"source_image"),2);
+    p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"destination_depth"),3);
+    p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"source_depth"),4);
+    s_native_gpu_depth_state=p_glGetUniformLocation(s_native_gpu_program,"depth_state");
+    s_native_gpu_depth_plane=p_glGetUniformLocation(s_native_gpu_program,"depth_plane");
+    s_native_gpu_depth_origin=p_glGetUniformLocation(s_native_gpu_program,"depth_origin");
+    s_native_gpu_depth_view=p_glGetUniformLocation(s_native_gpu_program,"depth_view");
     s_native_gpu_size=p_glGetUniformLocation(s_native_gpu_program,"size");
     s_native_gpu_state=p_glGetUniformLocation(s_native_gpu_program,"state");
     s_native_gpu_flags=p_glGetUniformLocation(s_native_gpu_program,"flags");
@@ -12871,33 +13344,73 @@ static int native_gpu_program_init(void) {
     return s_native_gpu_vao && s_native_gpu_vbo && s_native_gpu_words && s_native_gpu_input && !native_drain_gl_errors();
 }
 
+/* Depth flags for native_gpu_target: the plane's depth attachment is a draw
+ * buffer, and the draw samples the destination key. */
+enum { GL_NATIVE_GPU_DEPTH_ATTACHED = 1, GL_NATIVE_GPU_DEPTH_READ = 2 };
+
+static int native_gpu_rect_dirty(const GlNativeGpuPlane *plane, int x0, int y0, int x1, int y1) {
+    return x0 < plane->dirty[2] && plane->dirty[0] < x1 && y0 < plane->dirty[3] && plane->dirty[1] < y1;
+}
+
+static void native_gpu_rect_mark(GlNativeGpuPlane *plane, int x0, int y0, int x1, int y1) {
+    if (plane->dirty[0] >= plane->dirty[2] || plane->dirty[1] >= plane->dirty[3]) {
+        plane->dirty[0] = x0; plane->dirty[1] = y0; plane->dirty[2] = x1; plane->dirty[3] = y1;
+        return;
+    }
+    if (x0 < plane->dirty[0]) plane->dirty[0] = x0;
+    if (y0 < plane->dirty[1]) plane->dirty[1] = y0;
+    if (x1 > plane->dirty[2]) plane->dirty[2] = x1;
+    if (y1 > plane->dirty[3]) plane->dirty[3] = y1;
+}
+
 static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uint32_t scale, int x, int y, int w, int h, int read_destination,
-                             GlNativeGpuPlane **bound_target) {
-    if (read_destination) {
+                             GlNativeGpuPlane **bound_target, unsigned depth) {
+    const int read_depth = (depth & GL_NATIVE_GPU_DEPTH_READ) != 0;
+    const int px0 = x*(int)scale, py0 = y*(int)scale, px1 = (x+w)*(int)scale, py1 = (y+h)*(int)scale;
+    if (read_destination || read_depth) {
         p_glActiveTexture(PSXGL_TEXTURE0+1);
         if(p_glTextureBarrier) {
             /* Each draw has non-overlapping triangle coverage and reads only
              * its own destination texel once, at integer gl_FragCoord. ARB's
-             * read/modify/write rule permits this with a barrier between draws. */
+             * read/modify/write rule permits this with a barrier between draws.
+             * Reads are confined to the scissor: when nothing was rendered
+             * there since the last barrier, the texels are already coherent. */
             glBindTexture(GL_TEXTURE_2D,plane->texture);
-            p_glTextureBarrier();
-            work->destination_barriers++;
+            if (read_depth) {
+                p_glActiveTexture(PSXGL_TEXTURE0+3); glBindTexture(GL_TEXTURE_2D,plane->depth);
+                p_glActiveTexture(PSXGL_TEXTURE0+1);
+            }
+            if (native_gpu_rect_dirty(plane, px0, py0, px1, py1)) {
+                p_glTextureBarrier();
+                work->destination_barriers++;
+                plane->dirty[0] = plane->dirty[1] = plane->dirty[2] = plane->dirty[3] = 0;
+            } else work->skipped_barriers++;
         } else {
         /* One maximum-sized scratch target avoids reallocating when canonical
          * and extended VIEW triangles alternate. Only the primitive bbox copies. */
         if (!native_gpu_plane_size(&s_native_gpu_destination,VRAM_W*scale,VRAM_H*scale)) return 0;
+        if (read_depth && !native_gpu_plane_depth(&s_native_gpu_destination)) return 0;
         native_gpu_blit(plane,&s_native_gpu_destination,x*scale,y*scale,w*scale,h*scale);
+        if (read_depth) native_gpu_blit_depth(plane,&s_native_gpu_destination,x*scale,y*scale,w*scale,h*scale);
         work->destination_copies++;
         if (bound_target) *bound_target = NULL;
+        if (read_depth) {
+            p_glActiveTexture(PSXGL_TEXTURE0+3); glBindTexture(GL_TEXTURE_2D,s_native_gpu_destination.depth);
+        }
         p_glActiveTexture(PSXGL_TEXTURE0+1); glBindTexture(GL_TEXTURE_2D,s_native_gpu_destination.texture);
         }
     }
     if (!bound_target || *bound_target != plane) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER,plane->framebuffer);
         glViewport(0,0,plane->width,plane->height); glEnable(GL_SCISSOR_TEST);
+        if (plane->depth) {
+            static const GLenum buffers[2] = {PSXGL_COLOR_ATTACHMENT0, PSXGL_COLOR_ATTACHMENT1};
+            p_glDrawBuffers((depth & GL_NATIVE_GPU_DEPTH_ATTACHED) ? 2 : 1, buffers);
+        }
         if (bound_target) *bound_target = plane;
     }
     glScissor(x*scale,y*scale,w*scale,h*scale);
+    native_gpu_rect_mark(plane, px0, py0, px1, py1);
     return 1;
 }
 
@@ -13001,11 +13514,55 @@ static int native_gpu_upload_vertex_slice(const GlNativeGpuWork *work,
     return 1;
 }
 
+/* Depth uniforms for one GPU draw/transfer. Mirrors native_render_draw on the
+ * VIEW/phase planes (plane 0, guest VRAM, never has depth or a debug view).
+ * mode->write 3 copies the key of a SPAN's snapshot source (full-row copies). */
+static unsigned native_gpu_depth_uniforms(const GlNativeGpuWork *work, const GlNativeGpuPlane *plane,
+                                          const GlNativeDepthMode *mode, int view_plane) {
+    const int view = view_plane ? work->depth_view : GL_NATIVE_DEPTH_VIEW_OFF;
+    native_gpu_uniform4(4, s_native_gpu_depth_view, view, mode->show,
+        work->depth_view_log[0], work->depth_view_log[1]);
+    if (!work->depth_test || !plane->depth || !view_plane) {
+        native_gpu_uniform4(5, s_native_gpu_depth_state, 0, 0, 0, 0);
+        return 0u;
+    }
+    native_gpu_uniform4(5, s_native_gpu_depth_state, mode->test, mode->write, mode->semi, mode->bias);
+    if (mode->test) {
+        p_glUniform4i(s_native_gpu_depth_plane, mode->plane.n0, mode->plane.a, mode->plane.b, (int)work->scale);
+        p_glUniform2i(s_native_gpu_depth_origin, mode->plane.ox, mode->plane.oy);
+    }
+    return GL_NATIVE_GPU_DEPTH_ATTACHED | (mode->test || mode->semi ? GL_NATIVE_GPU_DEPTH_READ : 0u);
+}
+
+/* One GL_SAMPLES_PASSED query spans each run of depth-tested triangles. */
+static void native_gpu_depth_query(GlNativeGpuWork *work, int open) {
+    if (!p_glBeginQuery || !p_glEndQuery || !p_glGenQueries || open == work->depth_query_open) return;
+    if (!open) {
+        p_glEndQuery(PSXGL_SAMPLES_PASSED);
+        work->depth_query_open = 0;
+        return;
+    }
+    if (work->depth_query_count == work->depth_query_capacity) {
+        const uint32_t capacity = work->depth_query_capacity ? work->depth_query_capacity * 2u : 64u;
+        GLuint *queries = realloc(work->depth_queries, capacity * sizeof(*queries));
+        if (!queries) return;
+        work->depth_queries = queries; work->depth_query_capacity = capacity;
+    }
+    GLuint query = 0u;
+    p_glGenQueries(1, &query);
+    if (!query) return;
+    work->depth_queries[work->depth_query_count++] = query;
+    p_glBeginQuery(PSXGL_SAMPLES_PASSED, query);
+    work->depth_query_open = 1;
+}
+
 static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCommand *command,
                                   GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
                                   uint32_t first_vertex, GlNativeGpuPlane **bound_target) {
     GlNativeGpuPlane *plane=&work->planes[command->plane];
     const uint32_t scale=work->scale;
+    /* Debug wireframe (VIEW/phase planes only): see gl_renderer_set_native_wireframe. */
+    const int wire=work->wireframe&&command->plane!=0u;
     if (command->kind==NATIVE_GPU_DRAW) {
         const XgSemanticDrawRecord *draw=&command->draw;
         const XgRenderIrMaterialState *m=&draw->primitive.material;
@@ -13041,7 +13598,18 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             if(left>right||top>bottom)continue;
             if (!lines) native_attribute_planes(&draw->primitive.triangles[t],
                 attribute_x,attribute_y,scale,m->shading==XG_RENDER_IR_SHADING_GOURAUD,&attributes);
-            if(!native_gpu_target(work,plane,scale,left,top,right-left+1,bottom-top+1,m->semi_transparent||m->mask_check,bound_target))return 0;
+            /* Plane 0 is guest VRAM: never depth. Lines only reset (opaque). */
+            GlNativeDepthMode depth_mode = {0, GL_NATIVE_DEPTH_RESET, m->semi_transparent ? 1 : 0, 0,
+                GL_NATIVE_DEPTH_SHOW_NONE, {0}};
+            if (wire) depth_mode.semi = 0;
+            else if (!lines && command->plane != 0u &&
+                (work->depth_test || work->depth_view != GL_NATIVE_DEPTH_VIEW_OFF))
+                depth_mode = native_depth_mode(draw, &draw->primitive.triangles[t], attribute_x, attribute_y);
+            const unsigned depth = native_gpu_depth_uniforms(work, plane, &depth_mode, command->plane != 0u);
+            const int tested = (depth & GL_NATIVE_GPU_DEPTH_ATTACHED) && depth_mode.test;
+            work->depth_tested_triangles += tested ? 1u : 0u;
+            native_gpu_depth_query(work, tested);
+            if(!native_gpu_target(work,plane,scale,left,top,right-left+1,bottom-top+1,!wire&&(m->semi_transparent||m->mask_check),bound_target,depth))return 0;
             p_glUniform4f(s_native_gpu_size,(float)plane->width/scale,(float)plane->height/scale,0.5f/scale-1.f/64.f,(float)scale);
             /* The plane origin is target-local, just like gl_FragCoord. The
              * source row/VRAM origin is already removed above, exactly once. */
@@ -13054,7 +13622,11 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                     (float)attributes.plane[a][1],(float)attributes.plane[a][2],0.f);
             }
             native_gpu_uniform4(0,s_native_gpu_state,m->textured,m->raw_texture,m->semi_transparent,m->blend_mode);
-            native_gpu_uniform4(1,s_native_gpu_flags,m->mask_set,m->mask_check,m->dither,0);
+            if (wire) {
+                /* Unlit constant lines (the transfer path of the shader). */
+                native_gpu_uniform4(1,s_native_gpu_flags,0,0,0,1);
+                p_glUniform4f(s_native_gpu_color,0.85f,1.f,0.85f,0.f);
+            } else native_gpu_uniform4(1,s_native_gpu_flags,m->mask_set,m->mask_check,m->dither,0);
             native_gpu_uniform4(2,s_native_gpu_page,m->texture_page_x*64,m->texture_page_y*256,m->clut_x,m->clut_y);
             native_gpu_uniform4(3,s_native_gpu_window,m->texture_window_mask_x,m->texture_window_mask_y,m->texture_window_offset_x,m->texture_window_offset_y);
             if(s_native_gpu_depth_value!=(int)m->texture_depth) {
@@ -13064,7 +13636,9 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                 p_glUniform2i(s_native_gpu_origin,command->x,command->y);
                 s_native_gpu_origin_value[0]=command->x;s_native_gpu_origin_value[1]=command->y;
             }
+            if (wire && !lines) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
             glDrawArrays(GL_TRIANGLES,(GLint)(first_vertex+t*(lines?6u:3u)),lines?6:3);
+            if (wire && !lines) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             work->geometry_draws++;
         }
         return 1;
@@ -13081,11 +13655,26 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
         if(!source->texture)return 0;
         texture=source->texture;
     }
-    if(!native_gpu_target(work,plane,scale,command->x,command->y,command->w,command->h,(command->mask&2u)!=0,bound_target))return 0;
+    native_gpu_depth_query(work, 0);
+    /* Transfers write far depth, except full-row VIEW copies (mask bit 2),
+     * which carry their source rows' keys, exactly like the CPU domain copy. */
+    const int copy_depth = (command->mask & 4u) && texture && command->kind == NATIVE_GPU_SPAN &&
+        command->source != UINT32_MAX && snapshots[command->source].depth;
+    const GlNativeDepthMode transfer_depth = {0, copy_depth ? 3 : GL_NATIVE_DEPTH_RESET, 0, 0,
+        GL_NATIVE_DEPTH_SHOW_NONE, {0}};
+    const unsigned depth = native_gpu_depth_uniforms(work, plane, &transfer_depth, command->plane != 0u);
+    if (copy_depth) {
+        p_glActiveTexture(PSXGL_TEXTURE0+4); glBindTexture(GL_TEXTURE_2D, snapshots[command->source].depth);
+    }
+    if(!native_gpu_target(work,plane,scale,command->x,command->y,command->w,command->h,(command->mask&2u)!=0,bound_target,depth))return 0;
     if(texture){p_glActiveTexture(PSXGL_TEXTURE0+2);glBindTexture(GL_TEXTURE_2D,texture);}
     p_glUniform4f(s_native_gpu_size,(float)plane->width/scale,(float)plane->height/scale,0,(float)scale);
-    native_gpu_uniform4(1,s_native_gpu_flags,command->mask&1u,(command->mask>>1u)&1u,0,texture?2:1);
-    p_glUniform4f(s_native_gpu_color,(command->color&255u)/255.f,((command->color>>8u)&255u)/255.f,
+    /* Wireframe: guest pixels (seeds, fills, copies out of guest VRAM) are black;
+     * copies between VIEW planes carry their lines. */
+    const int black=wire&&(!texture||command->kind==NATIVE_GPU_SEED||command->source==0u);
+    native_gpu_uniform4(1,s_native_gpu_flags,command->mask&1u,(command->mask>>1u)&1u,0,texture&&!black?2:1);
+    if (black) p_glUniform4f(s_native_gpu_color,0.f,0.f,0.f,(command->color>>24u)/255.f);
+    else p_glUniform4f(s_native_gpu_color,(command->color&255u)/255.f,((command->color>>8u)&255u)/255.f,
         ((command->color>>16u)&255u)/255.f,(command->color>>24u)/255.f);
     glDrawArrays(GL_TRIANGLES,(GLint)first_vertex,6);
     work->transfer_draws++;
@@ -13110,6 +13699,9 @@ static void native_gpu_free(GlNativeGpuWork *work) {
     for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)native_gpu_plane_free(&work->images[i]);
     for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)if(work->readbacks[i])p_glDeleteBuffers(1,&work->readbacks[i]);
     if(work->fence)p_glDeleteSync(work->fence);
+    if(work->depth_query_count&&(SDL_GL_GetCurrentContext()==s_native_presenter_ctx||SDL_GL_GetCurrentContext()==s_native_gpu_ctx))
+        p_glDeleteQueries((GLsizei)work->depth_query_count,work->depth_queries);
+    free(work->depth_queries);
     native_gpu_buffers_free(work);free(work->words);free(work->reference_pixels);free(work);
 }
 
@@ -13150,6 +13742,7 @@ static int native_gpu_service(void) {
         native_gpu_free(work);result=1;
     } else if(state==NATIVE_GPU_CANCELLED) {
         if(work->timers[0]){p_glDeleteQueries(3,work->timers);memset(work->timers,0,sizeof(work->timers));}
+        if(work->depth_query_count){p_glDeleteQueries((GLsizei)work->depth_query_count,work->depth_queries);work->depth_query_count=0u;}
         for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&work->planes[i]);
         for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&work->snapshots[i]);
         for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)native_gpu_plane_free(&work->images[i]);
@@ -13179,7 +13772,15 @@ static int native_gpu_service(void) {
                 GLuint64 times[3]={0};
                 if(work->timers[0])for(unsigned i=0;i<3;++i)
                     p_glGetQueryObjectui64v(work->timers[i],GL_QUERY_RESULT,&times[i]);
+                GLuint64 depth_samples=0u;
+                for(uint32_t i=0;i<work->depth_query_count;++i) {
+                    GLuint64 passed=0u;
+                    p_glGetQueryObjectui64v(work->depth_queries[i],PSXGL_QUERY_RESULT,&passed);
+                    depth_samples+=passed;
+                }
+                if(work->depth_query_count){p_glDeleteQueries((GLsizei)work->depth_query_count,work->depth_queries);work->depth_query_count=0u;}
                 SDL_LockMutex(s_native_state_mutex);
+                s_native_compiler_diag.gpu.depth_samples_passed+=depth_samples;
                 s_native_compiler_diag.gpu.fence_latency_ns+=latency;
                 if(latency>s_native_compiler_diag.gpu.fence_latency_max_ns)s_native_compiler_diag.gpu.fence_latency_max_ns=latency;
                 if(work->timers[0]) {
@@ -13283,9 +13884,16 @@ static int native_gpu_service(void) {
             work->planes[i]=s_native_gpu_spare_planes[i];
             memset(&s_native_gpu_spare_planes[i],0,sizeof(s_native_gpu_spare_planes[i]));
             ok=native_gpu_plane_size(&work->planes[i],widths[i]*work->scale,heights[i]*work->scale);
-            if(ok&&!work->fresh&&i<GL_NATIVE_GPU_PHASE_BASE&&s_native_gpu_planes[i].texture)
+            /* VIEW domains and phases carry the depth plane; guest VRAM never. */
+            if(ok&&i&&work->depth_test&&native_gpu_depth_supported())ok=native_gpu_plane_depth(&work->planes[i]);
+            if(ok&&!work->fresh&&i<GL_NATIVE_GPU_PHASE_BASE&&s_native_gpu_planes[i].texture) {
                 native_gpu_blit(&s_native_gpu_planes[i],&work->planes[i],0,0,work->planes[i].width,work->planes[i].height);
+                native_gpu_blit_depth(&s_native_gpu_planes[i],&work->planes[i],0,0,work->planes[i].width,work->planes[i].height);
+            }
         }
+        /* Writes of an earlier slice are not known to be coherent: the first
+         * destination read of each plane in this slice barriers. */
+        for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)if(work->planes[i].texture)native_gpu_plane_dirty_all(&work->planes[i]);
         /* These bindings are invariant within this command slice. Texture
          * allocations use units 1/2 and cannot displace the word sampler. */
         p_glUseProgram(s_native_gpu_program);p_glBindVertexArray(s_native_gpu_vao);
@@ -13320,10 +13928,16 @@ static int native_gpu_service(void) {
                 glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
             } else if(command->kind==NATIVE_GPU_SNAPSHOT) {
                 work->snapshot_commands++;
+                native_gpu_depth_query(work,0);
                 p_glActiveTexture(PSXGL_TEXTURE0+2);
                 for(unsigned j=0;j<GL_NATIVE_GPU_PHASE_BASE&&ok;++j)if(work->planes[j].texture) {
                     ok=native_gpu_plane_size(&snapshots[j],work->planes[j].width,work->planes[j].height);
                     if(ok)native_gpu_blit(&work->planes[j],&snapshots[j],0,0,work->planes[j].width,work->planes[j].height);
+                    /* Full-row VIEW copies carry their source keys (SPAN mask bit 2). */
+                    if(ok&&work->planes[j].depth) {
+                        ok=native_gpu_plane_depth(&snapshots[j]);
+                        if(ok)native_gpu_blit_depth(&work->planes[j],&snapshots[j],0,0,work->planes[j].width,work->planes[j].height);
+                    }
                 }
             } else if (gpu_owner && command->kind == NATIVE_GPU_DRAW) {
                 /* A pure DRAW run only samples the fixed raw-word texture and
@@ -13358,6 +13972,7 @@ static int native_gpu_service(void) {
             if(!gpu_owner&&ok&&work->cursor<command_limit&&SDL_GetTicksNS()-started>=1000000u) {
                 /* Resume the exact next FIFO command on the next owner service.
                  * No fence, endpoint or canonical state is published yet. */
+                native_gpu_depth_query(work,0);
                 glFlush();
                 work->timing.service_ns+=SDL_GetTicksNS()-started;
                 work->timing.service_cpu_ns+=native_thread_cpu_ns()-cpu_started;
@@ -13365,6 +13980,7 @@ static int native_gpu_service(void) {
                 goto service_done;
             }
         }
+        native_gpu_depth_query(work,0);
         if(!sealed) {
             glFlush();
             SDL_LockMutex(s_native_state_mutex);
@@ -13434,6 +14050,8 @@ static int native_gpu_service(void) {
         s_native_compiler_diag.gpu.snapshot_commands+=work->snapshot_commands;
         s_native_compiler_diag.gpu.destination_barriers+=work->destination_barriers;
         s_native_compiler_diag.gpu.destination_copies+=work->destination_copies;
+        s_native_compiler_diag.gpu.skipped_barriers+=work->skipped_barriers;
+        s_native_compiler_diag.gpu.depth_tested_triangles+=work->depth_tested_triangles;
         work->state=NATIVE_GPU_SUBMITTED;
         SDL_UnlockMutex(s_native_state_mutex);
         if(!ok){SDL_LockMutex(s_native_state_mutex);work->failed=1;work->state=NATIVE_GPU_READY;SDL_UnlockMutex(s_native_state_mutex);}
@@ -13713,7 +14331,19 @@ static XgRenderCompileResult native_worker_compile(XgRenderSourceCommitHandle co
         gpu->scale = scale; gpu->commit = commit; gpu->identity = audit->header.identity;
         gpu->fresh = scale != s_native_gpu_scale || s_native_views.width != audit->header.display.native_width ||
             s_native_views.offset != audit->header.display.native_offset_x ||
-            s_native_views.reference_height != audit->header.display.native_height;
+            s_native_views.reference_height != audit->header.display.native_height ||
+            s_native_views.depth_test != (int)audit->header.display.native_depth_test;
+        gpu->depth_test = audit->header.display.native_depth_test;
+        /* The debug views tint the persistent planes: switching re-seeds them. */
+        gpu->depth_view = SDL_AtomicGet(&s_native_depth_view_option);
+        gpu->depth_view_log[0] = s_native_depth_view_log_min;
+        gpu->depth_view_log[1] = s_native_depth_view_log_max;
+        gpu->wireframe = SDL_AtomicGet(&s_native_wireframe_option);
+        if (gpu->wireframe) gpu->depth_view = GL_NATIVE_DEPTH_VIEW_OFF;
+        if (gpu->depth_view != s_native_gpu_depth_view_applied ||
+            gpu->wireframe != s_native_gpu_wireframe_applied) gpu->fresh = 1;
+        s_native_gpu_depth_view_applied = gpu->depth_view;
+        s_native_gpu_wireframe_applied = gpu->wireframe;
         gpu->timing.fresh = gpu->fresh;
         staged_views = malloc(sizeof(*staged_views));
         if (!staged_views) {

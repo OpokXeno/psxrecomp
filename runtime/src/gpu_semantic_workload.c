@@ -2684,6 +2684,7 @@ static void copy_vertex_position(GpuRenderSemanticVertex *target,
     target->native_view_x = source->native_view_x;
     target->native_view_y = source->native_view_y;
     target->native_view_position = source->native_view_position;
+    target->native_view_depth = source->native_view_depth;
     target->projective_view_x = source->projective_view_x;
     target->projective_view_y = source->projective_view_y;
     target->projective_view_z = source->projective_view_z;

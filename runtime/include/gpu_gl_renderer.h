@@ -284,6 +284,11 @@ typedef struct GlRendererNativeGpuDiagnostics {
     uint64_t timed_work, gpu_render_ns, gpu_readback_ns, gpu_max_ns;
     uint64_t word_uploads, snapshot_commands;
     uint64_t destination_barriers, destination_copies;
+    /* Destination reads that needed no barrier (no write overlapped them). */
+    uint64_t skipped_barriers;
+    /* Native depth test on the GPU: triangles depth-tested, and samples that
+     * passed in runs of them (GL_SAMPLES_PASSED, at the render scale). */
+    uint64_t depth_tested_triangles, depth_samples_passed;
     /* Reference is the CPU 1x scanout; image is the actual GPU RGBA storage. */
     uint64_t last_reference_digest, last_image_digest;
     XgPresentationIdentity last_image_identity;
@@ -375,6 +380,15 @@ typedef struct GlRendererNativeCompilerDiagnostics {
     uint64_t phase_gen_ns_total;
     uint64_t phase_gen_batches;
     uint64_t phase_gen_phases;
+    /* Native depth test. Last captured option state, and cumulative committed
+     * VIEW draws per effective stamp (NONE/TEST/TEST_WRITE) plus CPU reference
+     * raster fragments tested, rejected, written and reset to far. */
+    int native_depth_test;
+    uint64_t depth_draws[3];
+    uint64_t depth_tested_fragments;
+    uint64_t depth_rejected_fragments;
+    uint64_t depth_written_fragments;
+    uint64_t depth_reset_fragments;
     /* Main-owned GPU path, published under the diagnostic lock at present/read. */
     GlRendererNativeLegacyOwnerDiagnostics legacy_owner;
     GlRendererNativeGpuDiagnostics gpu;
@@ -1112,6 +1126,42 @@ float gl_renderer_get_post_gamma(void);
 /* Select full native-wide mirror rendering instead of the centre-splice fast
  * path. Textured edge expansion needs the complete mirror surface. */
 void gl_renderer_set_wide_fast(int on);
+/* Native renderer per-pixel depth test for producer-classified 3D draws
+ * (host presentation only). Always on at startup; only the debug overlay and
+ * debug server switch it, and it is never persisted. Off is bit-identical to
+ * pure ordering-table order. Captured into each Native work's display state,
+ * so it applies from the next frame. */
+void gl_renderer_set_native_depth_test(int on);
+int  gl_renderer_native_depth_test(void);
+/* Debug presentation of the Native GPU VIEW/phase planes: 0 = off, 1 = depth
+ * keys on a colour ramp over the frame's key range (red near, blue far; black
+ * = no certified surface), 3 = the same range in grey (near bright),
+ * 2 = per-draw depth policy tint (grey NONE, yellow TEST, green TEST_WRITE,
+ * red = stamped but without a usable depth plane). Presentation only; changing
+ * it re-seeds the planes. Only the GPU (render scale > 1) path shows it. */
+void gl_renderer_set_native_depth_view(int mode);
+int  gl_renderer_native_depth_view(void);
+/* Debug wireframe of the Native GPU VIEW/phase planes: every triangle drawn as
+ * unlit one-pixel lines over black (guest pixels, fills and copies out of
+ * guest VRAM become black). Presentation only; overrides the depth view and
+ * re-seeds the planes when changed. Only the GPU path shows it. */
+void gl_renderer_set_native_wireframe(int on);
+int  gl_renderer_native_wireframe(void);
+
+/* Bounded ring of Native motion (frame interpolation) entity rejections: why
+ * a bound entity's phases fell back to discrete endpoints. Copies up to
+ * capacity most recent events, oldest first; returns the count copied. */
+typedef struct GlRendererNativeMotionRejectEvent {
+    uint64_t sequence;       /* 0-based position in the lifetime event stream */
+    const char *reason;      /* static string */
+    uint64_t entity_id;
+    uint64_t source_update;
+    uint32_t draw_index;
+    uint32_t producer_id;
+} GlRendererNativeMotionRejectEvent;
+#define GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY 32u
+uint32_t gl_renderer_native_motion_rejects(GlRendererNativeMotionRejectEvent *out,
+                                           uint32_t capacity, uint64_t *out_total);
 
 void gl_renderer_shutdown(void);
 

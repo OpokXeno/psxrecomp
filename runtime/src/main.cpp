@@ -668,6 +668,7 @@ static bool native_render_describe_work(XgRenderSourceFrameDescription *descript
         ? (uint16_t)g_native_interpolation_fps : 0u;
     description->display.render_scale = (uint16_t)g_video_scale;
     description->display.dithering_disabled = gpu_dithering_enabled() == 0;
+    description->display.native_depth_test = gl_renderer_native_depth_test() != 0;
     return true;
 }
 
@@ -1650,6 +1651,10 @@ void psx_video_set_screen_model(int k)  {
     g_video_screen = k;
     gpu_set_screen_kind(k);
 }
+/* Native renderer depth test: on by default, switched only from the debug
+ * overlay (never persisted). See gl_renderer_set_native_depth_test. */
+int  psx_video_get_native_depth_test(void) { return gl_renderer_native_depth_test(); }
+void psx_video_set_native_depth_test(int on) { gl_renderer_set_native_depth_test(on); }
 int  psx_audio_get_spu_hq(void)         { return g_audio_spu_hq ? 1 : 0; }
 void psx_audio_set_spu_hq(int on)       {
     g_audio_spu_hq = (on != 0);
@@ -7616,7 +7621,13 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
                     snprintf(title, sizeof(title), "%s  [Game %.0f fps %.2fx]",
                              s_fps_base_title.c_str(), fps, speed);
                 }
-                SDL_SetWindowTitle(sdl_window, title);
+                /* Under Wayland/libdecor every title change redraws the window
+                 * decoration on this (guest) thread: skip unchanged titles. */
+                static std::string s_fps_last_title;
+                if (s_fps_last_title != title) {
+                    s_fps_last_title = title;
+                    SDL_SetWindowTitle(sdl_window, title);
+                }
             }
             if (!g_headless) {
                 char osd[96];

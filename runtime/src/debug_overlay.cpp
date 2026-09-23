@@ -163,6 +163,12 @@ extern "C" int  psx_debug_display_aspect(int num, int den, int adaptive);
 extern "C" int  psx_video_set_aspect_runtime(int num, int den, int native_wide);
 extern "C" int  psx_audio_get_spu_hq(void);
 extern "C" void psx_audio_set_spu_hq(int on);
+extern "C" int  psx_video_get_native_depth_test(void);
+extern "C" void psx_video_set_native_depth_test(int on);
+extern "C" int  gl_renderer_native_depth_view(void);
+extern "C" void gl_renderer_set_native_depth_view(int mode);
+extern "C" int  gl_renderer_native_wireframe(void);
+extern "C" void gl_renderer_set_native_wireframe(int on);
 extern "C" int  psx_video_get_window_width(void);
 extern "C" void psx_video_set_window_width(int w);
 extern "C" int  psx_video_get_vsync(void);
@@ -1324,6 +1330,33 @@ static void draw_toggles_section(void)
     if (ImGui::Checkbox("Dithering", &dith)) {
         gpu_dithering_set(dith ? 1 : 0);
     }
+
+    /* Native renderer only: per-pixel depth between classified 3D surfaces.
+     * Off = pure OT order. */
+    bool depth_test = psx_video_get_native_depth_test() != 0;
+    if (ImGui::Checkbox("Native depth test", &depth_test)) {
+        psx_video_set_native_depth_test(depth_test ? 1 : 0);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Depth-test producer-classified 3D draws (models,\n"
+                          "terrain, sprites, shadows and effects all write;\n"
+                          "blended texels never do). Applies next frame.");
+    /* Debug presentation of the GPU planes (render scale > 1 only). */
+    static const char *kDepthViews[] = { "Off", "Depth (colour)", "Policy", "Depth (grey)" };
+    int depth_view = gl_renderer_native_depth_view();
+    if (ImGui::Combo("Depth view", &depth_view, kDepthViews, 4))
+        gl_renderer_set_native_depth_view(depth_view);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Depth (colour): red near to blue far; Depth (grey): near\n"
+                          "bright, far dark (black = no certified surface).\n"
+                          "Policy: grey NONE, yellow TEST, green TEST_WRITE,\n"
+                          "red = classified but without a usable depth plane.");
+    bool wireframe = gl_renderer_native_wireframe() != 0;
+    if (ImGui::Checkbox("Wireframe", &wireframe))
+        gl_renderer_set_native_wireframe(wireframe ? 1 : 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Draw every triangle as lines over black\n"
+                          "(presentation only; overrides the depth view).");
 
     /* VSync mode: 1 = on, 0 = off (immediate), -1 = adaptive. Live via
      * apply_present_cadence; native-semantic overrides still apply. */
@@ -5179,6 +5212,18 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     }
     if (std::strcmp(name, "spu_hq") == 0) {
         psx_audio_set_spu_hq(value ? 1 : 0);
+        return 0;
+    }
+    if (std::strcmp(name, "native_depth_test") == 0) {
+        psx_video_set_native_depth_test(value ? 1 : 0);
+        return 0;
+    }
+    if (std::strcmp(name, "native_depth_view") == 0) {
+        gl_renderer_set_native_depth_view(value);
+        return 0;
+    }
+    if (std::strcmp(name, "native_wireframe") == 0) {
+        gl_renderer_set_native_wireframe(value ? 1 : 0);
         return 0;
     }
     if (std::strcmp(name, "window_width") == 0) {

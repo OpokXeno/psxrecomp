@@ -11018,6 +11018,84 @@ static int native_motion_append_semantic(
     return 1;
 }
 
+/* Native depth test: option state, cumulative CPU-reference counters and GPU
+ * counters. Optional "set":0/1 changes the live option and "view":0..3 the
+ * debug presentation (off/depth colour/policy/depth grey); both apply from
+ * the next frame. */
+static void handle_native_depth_diag(int id, const char *json)
+{
+    GlRendererNativeCompilerDiagnostics compiler;
+    const int set = json_get_int(json, "set", -1);
+    const int view = json_get_int(json, "view", -1);
+
+    if (set >= 0) gl_renderer_set_native_depth_test(set != 0);
+    if (view >= 0) gl_renderer_set_native_depth_view(view);
+    gl_renderer_native_compiler_diagnostics(&compiler);
+    send_fmt("{\"id\":%d,\"ok\":true,\"option\":%s,\"captured\":%s,\"view\":%d,"
+             "\"draws\":{\"none\":%llu,\"test\":%llu,\"test_write\":%llu},"
+             "\"fragments\":{\"tested\":%llu,\"rejected\":%llu,"
+             "\"written\":%llu,\"reset\":%llu},"
+             "\"gpu\":{\"tested_triangles\":%llu,\"samples_passed\":%llu,"
+             "\"barriers\":%llu,\"skipped_barriers\":%llu}}",
+             id, gl_renderer_native_depth_test() ? "true" : "false",
+             compiler.native_depth_test ? "true" : "false",
+             gl_renderer_native_depth_view(),
+             (unsigned long long)compiler.depth_draws[0],
+             (unsigned long long)compiler.depth_draws[1],
+             (unsigned long long)compiler.depth_draws[2],
+             (unsigned long long)compiler.depth_tested_fragments,
+             (unsigned long long)compiler.depth_rejected_fragments,
+             (unsigned long long)compiler.depth_written_fragments,
+             (unsigned long long)compiler.depth_reset_fragments,
+             (unsigned long long)compiler.gpu.depth_tested_triangles,
+             (unsigned long long)compiler.gpu.depth_samples_passed,
+             (unsigned long long)compiler.gpu.destination_barriers,
+             (unsigned long long)compiler.gpu.skipped_barriers);
+}
+
+/* Native frame-interpolation entity rejections (bounded ring, oldest first). */
+static void handle_native_motion_rejects(int id, const char *json)
+{
+    GlRendererNativeMotionRejectEvent events[GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY];
+    char buffer[8192];
+    uint64_t total = 0u;
+    size_t position;
+    int written;
+    const uint32_t count = gl_renderer_native_motion_rejects(
+        events, GL_RENDERER_NATIVE_MOTION_REJECT_CAPACITY, &total);
+
+    (void)json;
+    written = snprintf(buffer, sizeof(buffer),
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"events\":[",
+                       id, (unsigned long long)total);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        send_err(id, "native motion rejects overflow");
+        return;
+    }
+    position = (size_t)written;
+    for (uint32_t i = 0u; i < count; ++i) {
+        written = snprintf(buffer + position, sizeof(buffer) - position,
+            "%s{\"sequence\":%llu,\"reason\":\"%s\",\"entity_id\":%llu,"
+            "\"source_update\":%llu,\"draw_index\":%u,\"producer_id\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)events[i].sequence,
+            events[i].reason ? events[i].reason : "",
+            (unsigned long long)events[i].entity_id,
+            (unsigned long long)events[i].source_update,
+            events[i].draw_index, events[i].producer_id);
+        if (written < 0 || (size_t)written >= sizeof(buffer) - position) {
+            send_err(id, "native motion rejects overflow");
+            return;
+        }
+        position += (size_t)written;
+    }
+    if (position + 3u > sizeof(buffer)) {
+        send_err(id, "native motion rejects overflow");
+        return;
+    }
+    memcpy(buffer + position, "]}", 3u);
+    send_fmt("%s", buffer);
+}
+
 static void handle_native_last_motion_diag(int id, const char *json)
 {
     GpuSemanticWorkloadMotionDiagnostics motion = {0};
@@ -17743,6 +17821,8 @@ static const CmdEntry s_commands[] = {
     { "native_midpoint_diag", handle_native_midpoint_diag },
     { "native_wave_diag", handle_native_wave_diag },
     { "native_last_motion_diag", handle_native_last_motion_diag },
+    { "native_depth_diag", handle_native_depth_diag },
+    { "native_motion_rejects", handle_native_motion_rejects },
     { "gl_present_ring",   handle_gl_present_ring },
     { "present_ring",      handle_present_ring },
     { "frame_perf",        handle_frame_perf },

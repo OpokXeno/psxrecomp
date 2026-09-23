@@ -65,6 +65,7 @@ static int native_departure_reproject(const GlNativeRecipeDraw *before,
             p->projective_view_x = now->projective_view_x;
             p->projective_view_y = now->projective_view_y;
             p->projective_view_z = now->projective_view_z;
+            p->native_view_depth = now->native_view_depth;
             p->projective_distance = now->projective_distance;
         }
     draw->temporal_departure = 1u;

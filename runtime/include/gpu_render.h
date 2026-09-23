@@ -136,6 +136,10 @@ typedef struct GpuRenderSemanticVertex {
     GpuRenderFixed16_16 native_view_x;
     GpuRenderFixed16_16 native_view_y;
     uint8_t native_view_position;
+    /* Optional unfloored view-space Z in Q12 (GTE MAC3 domain before the >>12)
+     * from the producer's presentation transform. Zero means absent. Used only
+     * by the host Native depth test; never compared against guest packets. */
+    int32_t native_view_depth;
     /* Optional pre-divide projection payload for temporal reprojection. */
     int32_t projective_view_x;
     int32_t projective_view_y;
@@ -191,6 +195,16 @@ typedef struct GpuRenderSemanticLine {
     GpuRenderSemanticVertex vertices[2];
 } GpuRenderSemanticLine;
 
+/* Host Native depth-test participation of one draw. A producer stamps it from
+ * its family classification; guest packets always carry NONE. The raster still
+ * applies the final material: a semi-transparent draw never writes depth, and
+ * a draw without view depth on every vertex behaves as NONE. */
+typedef enum GpuRenderDepthPolicy {
+    GPU_RENDER_DEPTH_NONE = 0,       /* OT order only; opaque writes reset depth. */
+    GPU_RENDER_DEPTH_TEST = 1,       /* Tested against certified depth, never writes it. */
+    GPU_RENDER_DEPTH_TEST_WRITE = 2, /* Certified opaque 3D: tests and writes. */
+} GpuRenderDepthPolicy;
+
 /* Backend-neutral native primitive. The fixed capacity and 16.16 coordinates
  * directly cover a triangle or a quad split into two ordered triangles. A
  * producer may additionally provide a source-derived Native-view position. */
@@ -207,6 +221,12 @@ typedef struct GpuRenderSemantic {
     /* Producer-local packet index for effects whose topology is stable while
      * linked-list order and per-frame geometry are not. */
     uint16_t native_view_effect_index;
+    /* GpuRenderDepthPolicy; host presentation only. */
+    uint8_t depth_policy;
+    /* Depth-test bias toward the camera, as a shift: the tested key D gains
+     * D >> depth_bias (0 = none). Lets decals/billboards resting on a certified
+     * surface pass against it. Never changes the value a draw writes. */
+    uint8_t depth_bias;
     uint8_t triangle_count;
     GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];
     uint8_t line_count;
