@@ -245,6 +245,8 @@ typedef struct GpuRenderSemantic {
      * D >> depth_bias (0 = none). Lets decals/billboards resting on a certified
      * surface pass against it. Never changes the value a draw writes. */
     uint8_t depth_bias;
+    /* Host-only AA exclusion for authored sprites and UI. */
+    uint8_t aa_exempt;
     uint8_t triangle_count;
     GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];
     uint8_t line_count;

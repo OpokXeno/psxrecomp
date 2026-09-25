@@ -609,7 +609,23 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.video_window_width = static_cast<int>(n);
         }
         if (video.contains("antialiasing")) {
-            rt.video_antialiasing = toml::find<bool>(video, "antialiasing");
+            const auto &value = toml::find(video, "antialiasing");
+            if (value.is_boolean())
+                rt.video_antialiasing = toml::get<bool>(value) ? 1 : 0;
+            else {
+                const auto mode = toml::get<std::string>(value);
+                static const char *names[] = {"off", "fxaa", "smaa", "taa", "msaa", "ssaa"};
+                auto it = std::find(std::begin(names), std::end(names), mode);
+                if (it == std::end(names))
+                    throw std::runtime_error("[video] invalid antialiasing mode: " + mode);
+                rt.video_antialiasing = static_cast<int>(it - std::begin(names));
+            }
+        }
+        if (video.contains("antialiasing_factor")) {
+            const int n = toml::find<int>(video, "antialiasing_factor");
+            if (n != 1 && n != 2 && n != 4 && n != 8 && n != 16)
+                throw std::runtime_error("[video] antialiasing_factor must be 1, 2, 4, 8 or 16");
+            rt.video_antialiasing_factor = n;
         }
         if (video.contains("texture_filtering")) {
             const auto mode = toml::find<std::string>(video, "texture_filtering");
@@ -617,13 +633,6 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else if (mode == "bilinear") rt.video_texture_filter = 1;
             else throw std::runtime_error(fmt::format(
                 "[video] texture_filtering must be \"nearest\" or \"bilinear\": {}", mode));
-        }
-        if (video.contains("fmv_filter")) {
-            const auto mode = toml::find<std::string>(video, "fmv_filter");
-            if (!video_fmv_filter_parse(mode, &rt.video_fmv_filter))
-                throw std::runtime_error(fmt::format(
-                    "[video] fmv_filter must be \"nearest\", \"bilinear\", "
-                    "\"sharp\" or \"bicubic\": {}", mode));
         }
         if (video.contains("renderer")) {
             const auto mode = toml::find<std::string>(video, "renderer");
@@ -2388,16 +2397,27 @@ UserSettings load_user_settings(const fs::path& path) {
             if (n >= 640 && n <= 3840) { s.window_width = (int)n; s.has_window_width = true; }
         });
         if (v.contains("antialiasing")) try_get([&]{
-            s.antialiasing = toml::find<bool>(v, "antialiasing"); s.has_antialiasing = true;
+            const auto &value = toml::find(v, "antialiasing");
+            if (value.is_boolean()) s.antialiasing = toml::get<bool>(value) ? 1 : 0;
+            else {
+                const auto mode = toml::get<std::string>(value);
+                static const char *names[] = {"off", "fxaa", "smaa", "taa", "msaa", "ssaa"};
+                auto it = std::find(std::begin(names), std::end(names), mode);
+                if (it == std::end(names)) return;
+                s.antialiasing = static_cast<int>(it - std::begin(names));
+            }
+            s.has_antialiasing = true;
+        });
+        if (v.contains("antialiasing_factor")) try_get([&]{
+            const int n = toml::find<int>(v, "antialiasing_factor");
+            if (n == 1 || n == 2 || n == 4 || n == 8 || n == 16) {
+                s.antialiasing_factor = n; s.has_antialiasing_factor = true;
+            }
         });
         if (v.contains("texture_filtering")) try_get([&]{
             const auto m = toml::find<std::string>(v, "texture_filtering");
             if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
             else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
-        });
-        if (v.contains("fmv_filter")) try_get([&]{
-            const auto m = toml::find<std::string>(v, "fmv_filter");
-            if (video_fmv_filter_parse(m, &s.fmv_filter)) s.has_fmv_filter = true;
         });
         if (v.contains("geometry_correction")) try_get([&]{
             s.geometry_correction = toml::find<bool>(v, "geometry_correction");
@@ -2749,12 +2769,15 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "supersampling     = " << s.supersampling << "\n";
     if (s.has_window_width)
         f << "window_width      = " << s.window_width << "\n";
-    if (s.has_antialiasing)
-        f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
+    if (s.has_antialiasing) {
+        static const char *names[] = {"off", "fxaa", "smaa", "taa", "msaa", "ssaa"};
+        const int mode = s.antialiasing >= 0 && s.antialiasing < 6 ? s.antialiasing : 0;
+        f << "antialiasing      = \"" << names[mode] << "\"\n";
+    }
+    if (s.has_antialiasing_factor)
+        f << "antialiasing_factor = " << s.antialiasing_factor << "\n";
     if (s.has_texture_filter)
         f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
-    if (s.has_fmv_filter)
-        f << "fmv_filter        = \"" << video_fmv_filter_name(s.fmv_filter) << "\"\n";
     if (s.has_geometry_correction)
         f << "geometry_correction   = "
           << (s.geometry_correction ? "true" : "false") << "\n";

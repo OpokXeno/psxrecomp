@@ -544,6 +544,8 @@ static std::atomic<int> g_smooth_60fps{0};
 static std::atomic<int> g_smooth_60fps_requested{0};
 static bool g_native_render_selected = false;
 static int g_video_scale = 1; /* Requested presentation resolution, not guest VRAM scale. */
+static int g_video_aa = 1; /* Host AA mode, also selects Native raster scale. */
+static int g_video_aa_factor = 4; /* Quality multiplier independent of AA mode. */
 static bool g_native_render_source_failed = false;
 static double g_native_guest_speed = 1.0;
 static int g_native_interpolation_fps = 60;
@@ -667,7 +669,12 @@ static bool native_render_describe_work(XgRenderSourceFrameDescription *descript
     description->display.temporal_hz =
         g_smooth_60fps_requested.load(std::memory_order_acquire)
         ? (uint16_t)g_native_interpolation_fps : 0u;
-    description->display.render_scale = (uint16_t)g_video_scale;
+    /* Nx means N spatial samples, not N pixels per axis. 16x fits a 4x
+     * ordered raster rather than allocating impossible 16x-wide VRAM planes. */
+    const int aa_scale = g_video_aa >= 3 && g_video_aa <= 5
+        ? (g_video_aa_factor >= 16 ? 4 : g_video_aa_factor >= 8 ? 3 :
+           g_video_aa_factor >= 2 ? 2 : 1) : 1;
+    description->display.render_scale = (uint16_t)(g_video_scale > aa_scale ? g_video_scale : aa_scale);
     description->display.dithering_disabled = gpu_dithering_enabled() == 0;
     description->display.native_depth_test = gl_renderer_native_depth_test() != 0;
     return true;
@@ -1553,14 +1560,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
 #endif
 
 /* [video] options, resolved from the game config (defaults: native + AA). */
-static bool          g_video_aa    = true;  /* linear present filtering */
-/* FMV present reconstruction (VIDEO_FMV_FILTER_*), pushed to the GL renderer
- * once the config is resolved. Only consulted while g_video_aa is on. */
-static int           g_video_fmv_filter = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
 /* Scanline post-process (host display enhancement). Off by default; toggled by
  * the launcher Display card, the PSX_SCANLINES env override, the F6 hotkey, or
- * the `scanline` TCP command. Strength 0..1 is the dark-gap depth. Pushed to the
- * GL renderer each present alongside the FMV filter. */
+ * the `scanline` TCP command. Strength 0..1 is the dark-gap depth. */
 static bool          g_video_scanlines = false;
 static float         g_video_scanline_strength = 0.5f;
 
@@ -1579,19 +1581,6 @@ extern "C" int psx_video_get_scanlines(float *strength) {
     return g_video_scanlines ? 1 : 0;
 }
 
-/* recomp-ui stores this 1-based so a zero-initialized (older) host reads as
- * "unset" rather than pinning nearest; the config enum is 0-based. Convert at
- * the boundary, and treat anything out of range as the default. */
-static inline int launcher_fmv_filter_to_cfg(int ls_value) {
-    if (ls_value < 1 || ls_value > PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
-        return PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
-    return ls_value - 1;
-}
-static inline int cfg_fmv_filter_to_launcher(int cfg_value) {
-    if (cfg_value < 0 || cfg_value >= PSXRecompV4::VIDEO_FMV_FILTER_COUNT)
-        cfg_value = PSXRecompV4::VIDEO_FMV_FILTER_DEFAULT;
-    return cfg_value + 1;
-}
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
@@ -1643,8 +1632,20 @@ void psx_video_set_supersampling(int s) {
     if (!g_native_render_selected)
         gr_set_scale(g_video_scale);
 }
-int  psx_video_get_antialiasing(void)   { return g_video_aa ? 1 : 0; }
-void psx_video_set_antialiasing(int on) { g_video_aa = (on != 0); }
+int  psx_video_get_antialiasing(void)   { return g_video_aa; }
+void psx_video_set_antialiasing(int mode) {
+    if (mode < 0 || mode > 5) mode = 0;
+    g_video_aa = mode;
+    if (mode == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
+    gl_renderer_set_antialiasing(mode);
+    gl_renderer_set_antialiasing_factor(g_video_aa_factor);
+}
+int psx_video_get_antialiasing_factor(void) { return g_video_aa_factor; }
+void psx_video_set_antialiasing_factor(int factor) {
+    if (factor != 1 && factor != 2 && factor != 4 && factor != 8 && factor != 16) factor = 4;
+    g_video_aa_factor = g_video_aa == 3 && factor > 4 ? 4 : factor;
+    gl_renderer_set_antialiasing_factor(g_video_aa_factor);
+}
 int  psx_video_get_screen_model(void)   { return g_video_screen; }
 void psx_video_set_screen_model(int k)  {
     if (k < 0) k = 0;
@@ -9056,8 +9057,7 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
         /* OpenGL present: upload the active display rect and draw a full-screen
          * quad. Either SwapWindow vsync OR the wall-clock pacer owns timing,
          * never both. 24-bit (FMV) frames pin to native 4:3. */
-        /* Filter reconstruction and inset UVs avoid sampling adjacent texels. */
-        gl_renderer_set_fmv_filter(g_video_fmv_filter);
+        /* Inset UVs avoid sampling adjacent texels. */
         if (native_fmv_active) {
             if (native_fmv_frame_available && gr_present_native_cpu_frame(
                     native_fmv_pixels, (int)native_fmv_width,
@@ -14585,8 +14585,8 @@ int main(int argc, char** argv) {
                 g_video_win_w_explicit = true;
             }
             g_video_aa         = gc.runtime.video_antialiasing;
+            g_video_aa_factor  = gc.runtime.video_antialiasing_factor;
             g_video_texfilter  = gc.runtime.video_texture_filter;
-            g_video_fmv_filter = gc.runtime.video_fmv_filter;
             g_video_geometry_correction   =
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
@@ -15283,8 +15283,9 @@ int main(int argc, char** argv) {
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+        if (us.has_antialiasing_factor) g_video_aa_factor = us.antialiasing_factor;
+        if (g_video_aa == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
-        if (us.has_fmv_filter)     g_video_fmv_filter = us.fmv_filter;
         if (us.has_geometry_correction)
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
@@ -15850,8 +15851,8 @@ int main(int argc, char** argv) {
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
+            seed.antialiasing_factor = g_video_aa_factor; seed.has_antialiasing_factor = true;
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
-            seed.fmv_filter = g_video_fmv_filter;         seed.has_fmv_filter = true;
             /* Seeded (and marked present) so a launcher save round-trips the
              * player's hand-edited value instead of dropping the key. */
             seed.geometry_correction = (g_video_geometry_correction != 0);
@@ -16051,9 +16052,9 @@ int main(int argc, char** argv) {
                 PSXRecompV4::DEFAULT_VIDEO_RENDERER != 0)
                 ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
             ls.supersampling      = seed.supersampling;
-            ls.antialiasing       = seed.antialiasing ? 1 : 0;
+            ls.antialiasing       = seed.antialiasing;
+            ls.antialiasing_factor = seed.antialiasing_factor;
             ls.texture_filter     = seed.texture_filter;
-            ls.fmv_filter         = cfg_fmv_filter_to_launcher(seed.fmv_filter);
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
             ls.dither_force_off = seed.dithering ? 0 : 1;
@@ -16325,8 +16326,6 @@ int main(int argc, char** argv) {
                  * is the legacy fallback field for consoles without the cap and is
                  * left unused here. */
                 seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
-                seed.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
-                seed.has_fmv_filter = true;
                 {
                     const int n = std::min(PSX_MAX_PLAYERS, RECOMP_LAUNCHER_MAX_PLAYERS);
                     const int un = std::min(n, PSXRecompV4::UserSettings::kMaxControllerPlayers);
@@ -16376,7 +16375,8 @@ int main(int argc, char** argv) {
                 seed.window_width          = ls.window_width;          seed.has_window_width          = true;
                 seed.renderer              = ls.renderer;              seed.has_renderer              = true;
                 seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
-                seed.antialiasing          = ls.antialiasing != 0;     seed.has_antialiasing          = true;
+                seed.antialiasing          = ls.antialiasing;          seed.has_antialiasing          = true;
+                seed.antialiasing_factor   = ls.antialiasing_factor;   seed.has_antialiasing_factor   = true;
                 seed.geometry_correction   = ls.geometry_correction != 0;
                 seed.has_geometry_correction = true;
                 seed.perspective_texturing = ls.perspective_texturing != 0;
@@ -16389,8 +16389,6 @@ int main(int argc, char** argv) {
                 seed.has_frame_interpolation = frame_interpolation_offered;
                 seed.frame_interpolation_fps = ls.frame_interp_fps;
                 seed.has_frame_interpolation_fps = frame_interpolation_offered;
-                seed.fmv_filter            = launcher_fmv_filter_to_cfg(ls.fmv_filter);
-                seed.has_fmv_filter        = true;
 #if defined(RECOMP_LAUNCHER_HAS_SCANLINES)
                 seed.scanlines             = ls.scanlines != 0;        seed.has_scanlines             = true;
                 if (ls.scanline_strength_pct >= 0) {
@@ -16616,8 +16614,9 @@ int main(int argc, char** argv) {
                 g_video_renderer  = seed.renderer;
                 g_video_scale     = seed.supersampling;
                 g_video_aa        = seed.antialiasing;
+                g_video_aa_factor = seed.antialiasing_factor;
+                if (g_video_aa == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
                 g_video_texfilter = seed.texture_filter;
-                g_video_fmv_filter = seed.fmv_filter;
                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
                 g_video_dithering     = seed.dithering ? 1 : 0;
@@ -17018,6 +17017,9 @@ session_reboot:
         gr_set_vram_observer(&hd_texture_observer);
         boot_state_set_hd_texture_hooks(&hd_texture_state);
     }
+    if (g_video_aa == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
+    gl_renderer_set_antialiasing(g_video_aa);
+    gl_renderer_set_antialiasing_factor(g_video_aa_factor);
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
      * runs sw_renderer_init). OpenGL supports the fork's extended 8x ceiling;
      * software and Vulkan retain the shared backend limit. */
@@ -18457,9 +18459,9 @@ soft_return_lobby:
         if (ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1))
             ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
         ls.supersampling = g_video_scale;
-        ls.antialiasing = g_video_aa ? 1 : 0;
+        ls.antialiasing = g_video_aa;
+        ls.antialiasing_factor = g_video_aa_factor;
         ls.texture_filter = g_video_texfilter;
-        ls.fmv_filter = cfg_fmv_filter_to_launcher(g_video_fmv_filter);
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
         ls.dither_force_off = g_video_dithering ? 0 : 1;
@@ -18807,12 +18809,12 @@ soft_return_lobby:
                 us.has_renderer = true;
                 us.supersampling = ls.supersampling;
                 us.has_supersampling = true;
-                us.antialiasing = ls.antialiasing != 0;
+                us.antialiasing = ls.antialiasing;
                 us.has_antialiasing = true;
+                us.antialiasing_factor = ls.antialiasing_factor;
+                us.has_antialiasing_factor = true;
                 us.texture_filter = ls.texture_filter;
                 us.has_texture_filter = true;
-                us.fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
-                us.has_fmv_filter = true;
                 us.geometry_correction = ls.geometry_correction != 0;
                 us.has_geometry_correction = true;
                 us.perspective_texturing = ls.perspective_texturing != 0;
@@ -18883,9 +18885,9 @@ soft_return_lobby:
             }
             g_video_renderer = ls.renderer;
             g_video_scale = ls.supersampling;
-            g_video_aa = ls.antialiasing;
+            psx_video_set_antialiasing(ls.antialiasing);
+            psx_video_set_antialiasing_factor(ls.antialiasing_factor);
             g_video_texfilter = ls.texture_filter;
-            g_video_fmv_filter = launcher_fmv_filter_to_cfg(ls.fmv_filter);
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
             g_video_dithering = ls.dither_force_off ? 0 : 1;

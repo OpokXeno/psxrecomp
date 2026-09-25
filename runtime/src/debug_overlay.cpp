@@ -156,6 +156,8 @@ extern "C" int  psx_video_get_supersampling(void);
 extern "C" void psx_video_set_supersampling(int s);
 extern "C" int  psx_video_get_antialiasing(void);
 extern "C" void psx_video_set_antialiasing(int on);
+extern "C" int psx_video_get_antialiasing_factor(void);
+extern "C" void psx_video_set_antialiasing_factor(int factor);
 extern "C" int  psx_video_get_screen_model(void);
 extern "C" void psx_video_set_screen_model(int k);
 extern "C" void psx_video_get_aspect(int *num, int *den);
@@ -1412,10 +1414,22 @@ static void draw_toggles_section(void)
                           " aspect ratio.");
     }
 
-    bool aa = psx_video_get_antialiasing() != 0;
-    if (ImGui::Checkbox("Antialiasing (present filter)", &aa)) {
-        psx_video_set_antialiasing(aa ? 1 : 0);
-    }
+    static const char *kAAModes[] = {"SSAA", "MSAA", "TAA", "SMAA", "FXAA", "Off"};
+    static const int kAAModeValues[] = {5, 4, 3, 2, 1, 0};
+    int aa_index = 5;
+    for (int i = 0; i < 6; ++i)
+        if (psx_video_get_antialiasing() == kAAModeValues[i]) aa_index = i;
+    if (ImGui::Combo("Antialiasing", &aa_index, kAAModes, 6))
+        psx_video_set_antialiasing(kAAModeValues[aa_index]);
+    const int aa = psx_video_get_antialiasing();
+    static const char *kAAFactors[] = {"1x", "2x", "4x", "8x", "16x"};
+    const int factors[] = {1, 2, 4, 8, 16};
+    int factor = psx_video_get_antialiasing_factor();
+    int factor_index = factor == 1 ? 0 : factor == 2 ? 1 : factor == 8 ? 3 : factor == 16 ? 4 : 2;
+    if (aa == 0) ImGui::BeginDisabled();
+    if (ImGui::Combo("AA multiplier", &factor_index, kAAFactors, aa == 3 ? 3 : 5))
+        psx_video_set_antialiasing_factor(factors[factor_index]);
+    if (aa == 0) ImGui::EndDisabled();
 
     static const char *kScreenModels[] = {
         "Raw", "CRT", "Composite", "Trinitron"
@@ -5225,7 +5239,11 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         return 0;
     }
     if (std::strcmp(name, "antialiasing") == 0) {
-        psx_video_set_antialiasing(value ? 1 : 0);
+        psx_video_set_antialiasing(value);
+        return 0;
+    }
+    if (std::strcmp(name, "antialiasing_factor") == 0) {
+        psx_video_set_antialiasing_factor(value);
         return 0;
     }
     if (std::strcmp(name, "screen_model") == 0) {

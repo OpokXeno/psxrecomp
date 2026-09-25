@@ -1163,7 +1163,8 @@ typedef enum GlNativeFenceState {
 static unsigned int s_native_phase_budget = GL_NATIVE_MOTION_PHASE_CAPACITY;
 static unsigned int s_native_phase_budget_early_streak = 0u;
 typedef struct GlNativePhaseImage {
-    GLuint texture, framebuffer;
+    GLuint texture, framebuffer, mask_texture;
+    int mask_valid;
     uint32_t *pixels;
     uint64_t digest;
     GlNativeEndpointUploadState upload_state;
@@ -1171,6 +1172,8 @@ typedef struct GlNativePhaseImage {
 
 typedef struct GlNativeEndpointSlot {
     GLuint texture;
+    GLuint mask_texture;
+    int mask_valid;
     GLuint framebuffer; /* allocated/uploaded by the main-thread presenter */
     uint32_t *staged_pixels;
     XgPresentationIdentity identity;
@@ -1305,6 +1308,21 @@ static GLint s_native_presenter_u_tex = -1;
 static GLint s_native_presenter_u_uv_rect = -1;
 static GLint s_native_presenter_u_lut = -1;
 static GLint s_native_presenter_u_lut_on = -1;
+static GLint s_native_presenter_u_aa = -1;
+static GLint s_native_presenter_u_history = -1;
+static GLint s_native_presenter_u_history_valid = -1;
+static GLint s_native_presenter_u_drawable = -1;
+static GLint s_native_presenter_u_factor = -1;
+static GLint s_native_presenter_u_mask = -1;
+static GLint s_native_presenter_u_mask_valid = -1;
+static GLuint s_native_aa_history_tex;
+static int s_native_aa_history_w, s_native_aa_history_h;
+static int s_native_aa_history_lx, s_native_aa_history_ly;
+static int s_native_aa_history_lw, s_native_aa_history_lh;
+static int s_native_aa_history_valid;
+static unsigned s_native_aa_frame;
+static int s_antialiasing_mode = 1;
+static int s_antialiasing_factor = 4;
 static GLuint s_native_presenter_lut_tex;
 static int s_native_presenter_lut_generation = -1;
 static uint64_t s_native_backend_generation;
@@ -1675,6 +1693,7 @@ typedef struct GlNativeGpuWork {
     uint16_t dirty_word_rows[VRAM_H]; /* One bit per 64-word canonical block. */
     uint16_t widths[GL_NATIVE_GPU_PLANES], heights[GL_NATIVE_GPU_PLANES];
     GlNativeGpuPlane planes[GL_NATIVE_GPU_PLANES], images[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
+    GlNativeGpuPlane mask_images[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
     GlNativeGpuPlane snapshots[GL_NATIVE_GPU_PLANES];
     uint32_t cursor;
     GLuint readbacks[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
@@ -2865,7 +2884,76 @@ static const char *PRESENT_FS =
     "uniform vec2 u_sharp_scale;\n"
     "uniform int  u_sharp;\n"
     "uniform float u_gamma;\n"
+    "uniform int u_aa_mode, u_aa_factor, u_aa_history_valid, u_aa_mask_valid;\n"
+    "uniform sampler2D u_aa_history, u_aa_mask;\n"
+    "uniform vec2 u_aa_drawable, u_aa_jitter;\n"
     PSX_SCANLINE_UNIFORMS
+    "float aa_luma(vec3 c){return dot(c,vec3(0.299,0.587,0.114));}\n"
+    "bool aa_exempt(vec2 uv){float a=texture(u_aa_mask,uv).a;\n"
+    " return (a>0.16&&a<0.5)||a>0.83;}\n"
+    "bool aa_guard(vec2 uv){if(u_aa_mask_valid==0)return false;\n"
+    " vec2 d=fwidth(v_uv);\n"
+    " return aa_exempt(uv)||aa_exempt(uv+vec2(d.x,0))||aa_exempt(uv-vec2(d.x,0))||\n"
+    " aa_exempt(uv+vec2(0,d.y))||aa_exempt(uv-vec2(0,d.y));}\n"
+    "vec4 aa_spatial(vec2 uv){\n"
+    " vec2 pixel=1.0/vec2(textureSize(u_tex,0));\n"
+    /* The Native raster has destination feedback and mask-bit semantics: a GL
+     * multisample FBO cannot be sampled by the next draw. Resolve ordered
+     * raster samples instead (fully shaded, unlike coverage-only HW MSAA). */
+    " if(u_aa_mode==4 || u_aa_mode==5){\n"
+    "  int count=u_aa_factor;\n"
+    "  int grid=count>=16?4:count>=8?(u_aa_mode==5?3:4):count>=2?2:1;\n"
+    "  vec4 sum=vec4(0.0); vec2 foot=fwidth(uv);\n"
+    "  for(int i=0;i<count;++i){\n"
+    "   int columns=grid,rows=(count+grid-1)/grid;\n"
+    "   int j=count==2&&i==1?3:count==8&&u_aa_mode==5&&i>=4?i+1:i;\n"
+    "   vec2 p=(vec2(j%columns,j/columns)+0.5)/vec2(columns,rows)-0.5;\n"
+    "   sum+=texture(u_tex,uv+p*foot);}\n"
+    "  return sum/float(count);\n"
+    " }\n"
+    " if(u_aa_mode!=1 && u_aa_mode!=2)return texture(u_tex,uv);\n"
+    " vec3 c=texture(u_tex,uv).rgb; float l=aa_luma(c);\n"
+    " float n=aa_luma(texture(u_tex,uv+vec2(0,pixel.y)).rgb);\n"
+    " float s=aa_luma(texture(u_tex,uv-vec2(0,pixel.y)).rgb);\n"
+    " float e=aa_luma(texture(u_tex,uv+vec2(pixel.x,0)).rgb);\n"
+    " float w=aa_luma(texture(u_tex,uv-vec2(pixel.x,0)).rgb);\n"
+    " float contrast=max(max(abs(l-n),abs(l-s)),max(abs(l-e),abs(l-w)));\n"
+    " if(contrast<max(0.025,0.125*max(max(n,s),max(e,w))))return vec4(c,1);\n"
+    " if(u_aa_mode==1){\n"
+    "  float nw=aa_luma(texture(u_tex,uv+pixel*vec2(-1,1)).rgb);\n"
+    "  float ne=aa_luma(texture(u_tex,uv+pixel).rgb);\n"
+    "  float sw=aa_luma(texture(u_tex,uv-pixel).rgb);\n"
+    "  float se=aa_luma(texture(u_tex,uv+pixel*vec2(1,-1)).rgb);\n"
+    "  vec2 dir=vec2(-((nw+ne)-(sw+se)),(nw+sw)-(ne+se));\n"
+    "  float reduce=max((nw+ne+sw+se)*0.0078125,0.0078125);\n"
+    "  float span=float(u_aa_factor)*2.0;\n"
+    "  dir=clamp(dir/(min(abs(dir.x),abs(dir.y))+reduce),vec2(-span),vec2(span))*pixel;\n"
+    "  vec3 a=0.5*(texture(u_tex,uv+dir/6.0).rgb+texture(u_tex,uv-dir/6.0).rgb);\n"
+    "  vec3 b=0.5*a+0.25*(texture(u_tex,uv+dir*0.5).rgb+texture(u_tex,uv-dir*0.5).rgb);\n"
+    "  float lo=min(l,min(min(n,s),min(e,w))),hi=max(l,max(max(n,s),max(e,w)));\n"
+    "  float lb=aa_luma(b);return vec4(lb<lo||lb>hi?a:b,1);\n"
+    " }\n"
+    /* Morphological edge detection, directional search and blend weights.
+     * An analytic 1x area weight is used instead of a precomputed area LUT. */
+    " bool horizontal=abs(n-s)>abs(e-w);\n"
+    " vec2 axis=horizontal?vec2(pixel.x,0):vec2(0,pixel.y);\n"
+    " vec2 across=horizontal?vec2(0,pixel.y):vec2(pixel.x,0);\n"
+    " float edge=max(abs(l-(horizontal?n:w)),abs(l-(horizontal?s:e)));\n"
+    " float left=0.0,right=0.0;\n"
+    " for(int i=1;i<=32;++i){if(i>u_aa_factor*2)break;\n"
+    "  vec2 p=uv-axis*float(i);\n"
+    "  if(abs(aa_luma(texture(u_tex,p+across).rgb)-aa_luma(texture(u_tex,p-across).rgb))<edge*0.5)break;\n"
+    "  left=float(i);\n"
+    " }\n"
+    " for(int i=1;i<=32;++i){if(i>u_aa_factor*2)break;\n"
+    "  vec2 p=uv+axis*float(i);\n"
+    "  if(abs(aa_luma(texture(u_tex,p+across).rgb)-aa_luma(texture(u_tex,p-across).rgb))<edge*0.5)break;\n"
+    "  right=float(i);\n"
+    " }\n"
+    " float weight=clamp(0.5*min(left,right)/(left+right+1.0),0.0,0.45);\n"
+    " vec2 shift=across*(horizontal?(abs(l-n)>abs(l-s)?1.0:-1.0):(abs(l-e)>abs(l-w)?1.0:-1.0));\n"
+    " return vec4(mix(c,texture(u_tex,uv+shift).rgb,weight),1);\n"
+    "}\n"
     /* Catmull-Rom bicubic via 9 bilinear taps. Sharper than plain bilinear at
      * the same smoothness, with mild overshoot that reads as edge definition.
      * The present texture holds exactly the source rect and wraps CLAMP_TO_EDGE,
@@ -2897,8 +2985,12 @@ static const char *PRESENT_FS =
     PSX_SCANLINE_FUNC
     "void main(){\n"
     "  vec2 uv = v_uv;\n"
+    "  bool protected_pixel=u_aa_mode!=0&&aa_guard(v_uv);\n"
+    "  if(u_aa_mode==3&&!protected_pixel)uv+=u_aa_jitter*fwidth(v_uv);\n"
     "  vec4 c;\n"
-    "  if (u_sharp == 2) { c = bicubic(uv); }\n"
+    "  if(protected_pixel){ivec2 q=ivec2(clamp(v_uv,vec2(0),vec2(0.999999))*vec2(textureSize(u_tex,0)));\n"
+    "    c=texelFetch(u_tex,q,0);}\n"
+    "  else if (u_sharp == 2) { c = bicubic(uv); }\n"
     "  else {\n"
     "    if (u_sharp == 1) {\n"
     "      vec2 scale = max(u_sharp_scale, vec2(1.0));\n"
@@ -2912,7 +3004,7 @@ static const char *PRESENT_FS =
     "      vec2 hi = max(u_uv_rect.xy, u_uv_rect.zw);\n"
     "      uv = clamp(uv, lo, hi);\n"
     "    }\n"
-    "    c = texture(u_tex, uv);\n"
+    "    c = aa_spatial(uv);\n"
     "  }\n"
     "  if (u_screenlut_on == 1) {\n"
     "    ivec3 q = ivec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5) >> 3;\n"
@@ -2921,6 +3013,13 @@ static const char *PRESENT_FS =
     "  }\n"
     "  c.rgb = psx_scanline(c.rgb, v_uv.y);\n"
     "  if (u_gamma > 0.0 && u_gamma != 1.0) c.rgb = pow(max(c.rgb, vec3(0.0)), vec3(1.0 / u_gamma));\n"
+    "  if(u_aa_mode==3 && !protected_pixel && u_aa_history_valid!=0){\n"
+    "    vec2 h_uv=gl_FragCoord.xy/u_aa_drawable;\n"
+    "    vec3 old=texture(u_aa_history,h_uv).rgb;\n"
+    "    vec3 diff=abs(old-c.rgb); float change=max(diff.r,max(diff.g,diff.b));\n"
+    "    float keep=1.0-1.0/float(u_aa_factor);\n"
+    "    c.rgb=mix(c.rgb,old,keep*(1.0-smoothstep(0.025,0.15,change)));\n"
+    "  }\n"
     "  frag = c;\n"
     "}\n";
 static const char *INTERP_FS =
@@ -5419,14 +5518,22 @@ static void upload_native_present_tex(const uint32_t *pixels, int w, int h,
     }
 }
 
-static int s_fmv_filter_cfg = 0;          /* VIDEO_FMV_FILTER_NEAREST */
-
-void gl_renderer_set_fmv_filter(int cfg_value) {
-    if (cfg_value >= 0 && cfg_value <= 3) s_fmv_filter_cfg = cfg_value;
+void gl_renderer_set_antialiasing(int mode) {
+    if (mode < 0 || mode > 5) mode = 0;
+    if (s_antialiasing_mode != mode) s_native_aa_history_valid = 0;
+    s_antialiasing_mode = mode;
+    if (mode == 3 && s_antialiasing_factor > 4)
+        gl_renderer_set_antialiasing_factor(4);
 }
 
-static int fmv_filter_mode(void) {
-    return s_fmv_filter_cfg - 1;
+void gl_renderer_set_antialiasing_factor(int factor) {
+    if (factor != 1 && factor != 2 && factor != 4 && factor != 8 && factor != 16) factor = 4;
+    if (s_antialiasing_mode == 3 && factor > 4) factor = 4;
+    if (s_antialiasing_factor != factor) {
+        s_native_aa_history_valid = 0;
+        s_native_aa_frame = 0;
+    }
+    s_antialiasing_factor = factor;
 }
 
 /* Select the present-program sampling mode. s_present_prog is shared by the CPU
@@ -7986,11 +8093,13 @@ static int native_materialize_native_draw(const GpuRenderSemantic *semantic,
     memcpy(draw->lines, semantic->lines,
            semantic->line_count * sizeof(draw->lines[0]));
     draw->screen_space_2d = semantic->screen_space_2d;
+    draw->aa_exempt = semantic->aa_exempt;
     draw->native_view_effect = semantic->native_view_effect;
     draw->native_view_effect_index = semantic->native_view_effect_index;
     XgRenderIrNativePrimitive *primitive = &draw->primitive;
     primitive->depth_policy = semantic->depth_policy;
     primitive->depth_bias = semantic->depth_bias;
+    primitive->aa_exempt = semantic->aa_exempt;
 #define NATIVE_COPY_MATERIAL(field) primitive->material.field = semantic->material.field
     NATIVE_COPY_MATERIAL(tpage);
     NATIVE_COPY_MATERIAL(texture_page_x); NATIVE_COPY_MATERIAL(texture_page_y);
@@ -13497,6 +13606,7 @@ static int s_native_gpu_uniforms[6][4], s_native_gpu_depth_value, s_native_gpu_o
 /* HD texture replacement on the Native GPU thread's context. */
 static GLint s_native_gpu_hd_on = -1, s_native_gpu_hd_map = -1, s_native_gpu_hd_lim = -1;
 static GLint s_native_gpu_sample_lim = -1;
+static GLint s_native_gpu_aa_exempt = -1;
 static int s_native_gpu_hd_value;
 static HdGlCache s_native_gpu_hd_cache;
 static uint64_t s_native_gpu_hd_draws;
@@ -13562,6 +13672,7 @@ static const char *NATIVE_GPU_FS =
     /* Inclusive sampled texel range of the triangle (gpu_uv.h limits). */
     "uniform ivec4 sample_lim;\n"
     "uniform ivec4 state,flags,page,window; uniform int depth; uniform ivec2 origin;\n"
+    "uniform int aa_exempt;\n"
     /* Native depth plane (see native_depth_plane): depth_state = (test, mode of
      * an unblended fragment 1=far 2=key 3=copy source, per-texel keep, bias);
      * depth_plane = (N0 Q8, a, b, scale) at the logical depth_origin. The key is
@@ -13632,11 +13743,13 @@ static const char *NATIVE_GPU_FS =
     "  hd_uv=tx/vec2(hd_map.zw);}\n"
     " hd_dx=dFdx(hd_uv); hd_dy=dFdy(hd_uv);\n"
     " vec4 old=vec4(0); if(flags.y!=0 || (flags.w==0 && state.z!=0)) old=texelFetch(destination,ivec2(gl_FragCoord.xy),0);\n"
-    " if(flags.y!=0 && old.a>0.0) discard;\n"
+    " if(flags.y!=0 && old.a>0.5) discard;\n"
     " uint key=0u,stored=0u; if(depth_state.x!=0||depth_state.z!=0) stored=texelFetch(destination_depth,ivec2(gl_FragCoord.xy),0).r;\n"
     " if(depth_state.x!=0){key=depth_key(); uint tested=key+(depth_state.w!=0?key>>uint(depth_state.w):0u);\n"
     "  if(tested<stored-(stored>>10u)) discard;}\n"
-    " if(flags.w!=0){result=flags.w==1?constant_color:texture(source_image,t); if(flags.x!=0)result.a=1.0;\n"
+    " if(flags.w!=0){result=flags.w==1?constant_color:texture(source_image,t);\n"
+    "  if(flags.z!=0)result.a=result.a>0.5?2.0/3.0:0.0;\n"
+    "  if(flags.x!=0)result.a=result.a>0.83||result.a>0.16&&result.a<0.5?1.0:2.0/3.0;\n"
     "  depth_result=uvec4(depth_state.y==3?texture(source_depth,t).r:0u);\n"
     "  if(depth_view.x==1||depth_view.x==3)result.rgb=depth_gray(depth_result.r,fwidth(log2(float(max(depth_result.r,1u)))*16.0));\n"
     "  return;}\n"
@@ -13661,11 +13774,11 @@ static const char *NATIVE_GPU_FS =
     " }else c=clamp((c+bias)>>3,ivec3(0),ivec3(31));\n"
     " if(hd){if(blend!=0){vec3 b=old.rgb;\n"
     "  if(state.w==0)hf=(b+hf)*0.5; else if(state.w==1)hf=b+hf; else if(state.w==2)hf=b-hf; else hf=b+hf*0.25;}\n"
-    "  result=vec4(clamp(hf,0.0,1.0),float(mask));\n"
+    "  result=vec4(clamp(hf,0.0,1.0),float(mask*2+aa_exempt)/3.0);\n"
     " }else{\n"
     " if(blend!=0){ivec3 b=ivec3(floor(old.rgb*255.0+0.5))>>3;\n"
     "  if(state.w==0)c=(b+c)/2; else if(state.w==1)c=b+c; else if(state.w==2)c=b-c; else c=b+c/4;}\n"
-    " c=clamp(c,ivec3(0),ivec3(31)); result=vec4(vec3((c<<3)|(c>>2))/255.0,float(mask));}\n"
+    " c=clamp(c,ivec3(0),ivec3(31)); result=vec4(vec3((c<<3)|(c>>2))/255.0,float(mask*2+aa_exempt)/3.0);}\n"
     /* Blended fragments keep the stored key; opaque ones (including opaque
      * texels of a semi-transparent material) write the key or far. */
     " depth_result=uvec4(blend!=0?stored:(depth_state.y==2?key:0u));\n"
@@ -13757,6 +13870,7 @@ static int native_gpu_program_init(void) {
     if (s_native_gpu_program) return 1;
     s_native_gpu_program = build_program(NATIVE_GPU_VS, NATIVE_GPU_FS);
     if (!s_native_gpu_program) return 0;
+    s_native_gpu_aa_exempt = p_glGetUniformLocation(s_native_gpu_program, "aa_exempt");
     /* Newly linked uniform values are zero. Only this owner uses this program. */
     memset(s_native_gpu_uniforms,0,sizeof(s_native_gpu_uniforms));
     memset(s_native_gpu_origin_value,0,sizeof(s_native_gpu_origin_value));s_native_gpu_depth_value=0;
@@ -14085,6 +14199,8 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                     (float)attributes.plane[a][1],(float)attributes.plane[a][2],0.f);
             }
             native_gpu_uniform4(0,s_native_gpu_state,m->textured,m->raw_texture,m->semi_transparent,m->blend_mode);
+            p_glUniform1i(s_native_gpu_aa_exempt,
+                draw->aa_exempt || draw->screen_space_2d != GPU_RENDER_SCREEN_SPACE_2D_NONE);
             if (wire) {
                 /* Unlit constant lines (the transfer path of the shader). */
                 native_gpu_uniform4(1,s_native_gpu_flags,0,0,0,1);
@@ -14152,7 +14268,8 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
     /* Wireframe: guest pixels (seeds, fills, copies out of guest VRAM) are black;
      * copies between VIEW planes carry their lines. */
     const int black=wire&&(!texture||command->kind==NATIVE_GPU_SEED||command->source==0u);
-    native_gpu_uniform4(1,s_native_gpu_flags,command->mask&1u,(command->mask>>1u)&1u,0,texture&&!black?2:1);
+    native_gpu_uniform4(1,s_native_gpu_flags,command->mask&1u,(command->mask>>1u)&1u,
+        command->kind == NATIVE_GPU_SPAN ? 0 : 1,texture&&!black?2:1);
     if (black) p_glUniform4f(s_native_gpu_color,0.f,0.f,0.f,(command->color>>24u)/255.f);
     else p_glUniform4f(s_native_gpu_color,(command->color&255u)/255.f,((command->color>>8u)&255u)/255.f,
         ((command->color>>16u)&255u)/255.f,(command->color>>24u)/255.f);
@@ -14177,6 +14294,7 @@ static void native_gpu_free(GlNativeGpuWork *work) {
     for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&work->planes[i]);
     for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&work->snapshots[i]);
     for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)native_gpu_plane_free(&work->images[i]);
+    for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)native_gpu_plane_free(&work->mask_images[i]);
     for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)if(work->readbacks[i])p_glDeleteBuffers(1,&work->readbacks[i]);
     if(work->fence)p_glDeleteSync(work->fence);
     if(work->depth_query_count&&(SDL_GL_GetCurrentContext()==s_native_presenter_ctx||SDL_GL_GetCurrentContext()==s_native_gpu_ctx))
@@ -14226,6 +14344,7 @@ static int native_gpu_service(void) {
         for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&work->planes[i]);
         for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&work->snapshots[i]);
         for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)native_gpu_plane_free(&work->images[i]);
+        for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)native_gpu_plane_free(&work->mask_images[i]);
         for(unsigned i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i)if(work->readbacks[i]) {
             p_glDeleteBuffers(1,&work->readbacks[i]);work->readbacks[i]=0;
         }
@@ -14501,6 +14620,13 @@ static int native_gpu_service(void) {
                     }
                     y+=rows;
                 }
+                /* Retain the final per-pixel sprite/UI class before normalising
+                 * endpoint alpha for the published RGBA digest. Source alpha
+                 * carries PS1 mask-bit (bit 1) and AA exclusion (bit 0). */
+                GlNativeGpuPlane *mask_image = &work->mask_images[image];
+                ok = native_gpu_plane_size(mask_image, output->width, output->height);
+                if (!ok) break;
+                native_gpu_blit(output, mask_image, 0, 0, output->width, output->height);
                 p_glBindFramebuffer(PSXGL_FRAMEBUFFER,output->framebuffer);
                 glColorMask(GL_FALSE,GL_FALSE,GL_FALSE,GL_TRUE);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
                 glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
@@ -15053,6 +15179,7 @@ gpu_ready:
     endpoint->generation = endpoint_generation;
     endpoint->temporal_generation = s_native_temporal_generation;
     endpoint->staged_pixels = compiled_pixels;
+    endpoint->mask_valid = 0;
     endpoint->identity = audit->header.identity;
     endpoint->metadata = (GlRendererNativeEndpointMetadata){
         .display_x = audit->header.display.display_x,
@@ -15088,6 +15215,7 @@ gpu_ready:
     endpoint->pixel_digest = audit->endpoint_pixel_digest;
     for (uint32_t i = 0u; i < motion.count; ++i) {
         endpoint->phases[i].pixels = motion.phases[i].pixels;
+        endpoint->phases[i].mask_valid = 0;
         endpoint->phases[i].digest = motion.phases[i].digest;
         endpoint->phases[i].upload_state = GL_NATIVE_ENDPOINT_UPLOAD_STAGED;
         motion.phases[i].pixels = NULL;
@@ -15098,14 +15226,21 @@ gpu_ready:
     if (gpu && gpu->scanout) {
         for (uint32_t i=0;i<=motion.count;++i) {
             GlNativeGpuPlane *image=&gpu->images[i];
+            GlNativeGpuPlane *mask_image=&gpu->mask_images[i];
             if (!i) {
                 GlNativeGpuPlane old={.texture=endpoint->texture,.framebuffer=image->framebuffer};
                 endpoint->texture=image->texture;*image=old;
+                GlNativeGpuPlane old_mask={.texture=endpoint->mask_texture,.framebuffer=mask_image->framebuffer};
+                endpoint->mask_texture=mask_image->texture;*mask_image=old_mask;
+                endpoint->mask_valid=1;
                 endpoint->upload_state=GL_NATIVE_ENDPOINT_UPLOAD_READY;
             } else {
                 GlNativePhaseImage *phase=&endpoint->phases[i-1u];
                 GlNativeGpuPlane old={.texture=phase->texture,.framebuffer=image->framebuffer};
                 phase->texture=image->texture;*image=old;
+                GlNativeGpuPlane old_mask={.texture=phase->mask_texture,.framebuffer=mask_image->framebuffer};
+                phase->mask_texture=mask_image->texture;*mask_image=old_mask;
+                phase->mask_valid=1;
                 phase->digest=gpu->image_digests[i];phase->upload_state=GL_NATIVE_ENDPOINT_UPLOAD_READY;
             }
         }
@@ -15261,6 +15396,7 @@ static void native_presenter_update_lut(void) {
 static GlNativePhaseImage native_endpoint_image(const GlNativeEndpointSlot *endpoint, uint32_t index) {
     if (index) return endpoint->phases[index - 1u];
     return (GlNativePhaseImage){.texture = endpoint->texture, .framebuffer = endpoint->framebuffer,
+        .mask_texture = endpoint->mask_texture, .mask_valid = endpoint->mask_valid,
         .pixels = endpoint->staged_pixels, .digest = endpoint->pixel_digest, .upload_state = endpoint->upload_state};
 }
 
@@ -15268,8 +15404,19 @@ static void native_endpoint_store_image(GlNativeEndpointSlot *endpoint, uint32_t
     if (index) endpoint->phases[index - 1u] = *image;
     else {
         endpoint->texture = image->texture; endpoint->framebuffer = image->framebuffer;
+        endpoint->mask_texture = image->mask_texture; endpoint->mask_valid = image->mask_valid;
         endpoint->staged_pixels = image->pixels; endpoint->upload_state = image->upload_state;
     }
+}
+
+static float native_aa_halton(unsigned index, unsigned base) {
+    float value = 0.f, place = 1.f;
+    while (index) {
+        place /= (float)base;
+        value += place * (float)(index % base);
+        index /= base;
+    }
+    return value - 0.5f;
 }
 
 static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
@@ -15458,13 +15605,64 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
     glViewport(0, 0, ww, wh);
     glClearColor(0.f, 0.f, 0.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
+    /* CPU endpoints have no class mask: a nearest present leaves all guest
+     * sprites/UI untouched rather than guessing from their final colours. */
+    const int aa_mode = endpoint.metadata.depth24 || !image.mask_valid
+        ? 0 : s_antialiasing_mode;
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, endpoint.texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    aa_mode == 0 ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                    aa_mode == 0 ? GL_NEAREST : GL_LINEAR);
+    if (aa_mode == 3) {
+        if (!s_native_aa_history_tex) glGenTextures(1, &s_native_aa_history_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_2D, s_native_aa_history_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (ww != s_native_aa_history_w || wh != s_native_aa_history_h) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ww, wh, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            s_native_aa_history_w = ww;
+            s_native_aa_history_h = wh;
+            s_native_aa_history_valid = 0;
+        }
+        if (lx != s_native_aa_history_lx || ly != s_native_aa_history_ly ||
+            lw != s_native_aa_history_lw || lh != s_native_aa_history_lh)
+            s_native_aa_history_valid = 0;
+        s_native_aa_history_lx = lx; s_native_aa_history_ly = ly;
+        s_native_aa_history_lw = lw; s_native_aa_history_lh = lh;
+        p_glActiveTexture(PSXGL_TEXTURE0);
+    }
     p_glUseProgram(s_native_presenter_prog);
     p_glUniform1i(s_native_presenter_u_tex, 0);
+    /* CPU fallback has no per-pixel class mask. Preserve every guest sprite
+     * and UI pixel there by disabling post-AA for that endpoint. */
+    if (aa_mode != 3) s_native_aa_history_valid = 0;
+    p_glUniform1i(s_native_presenter_u_aa, aa_mode);
+    p_glUniform1i(s_native_presenter_u_factor, s_antialiasing_factor);
+    p_glUniform1i(s_native_presenter_u_mask, 3);
+    p_glUniform1i(s_native_presenter_u_mask_valid, image.mask_valid);
+    if (image.mask_valid && image.mask_texture) {
+        p_glActiveTexture(PSXGL_TEXTURE0 + 3);
+        glBindTexture(GL_TEXTURE_2D, image.mask_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        p_glActiveTexture(PSXGL_TEXTURE0);
+    }
+    p_glUniform1i(s_native_presenter_u_history, 2);
+    p_glUniform1i(s_native_presenter_u_history_valid,
+                   aa_mode == 3 && s_native_aa_history_valid);
+    p_glUniform2f(s_native_presenter_u_drawable, (float)ww, (float)wh);
+    {
+        const unsigned phase = s_native_aa_frame++ % (unsigned)s_antialiasing_factor + 1u;
+        p_glUniform2f(p_glGetUniformLocation(s_native_presenter_prog, "u_aa_jitter"),
+                      native_aa_halton(phase, 2u), native_aa_halton(phase, 3u));
+    }
     if (!endpoint.metadata.depth24 && !endpoint.metadata.disabled) {
         p_glActiveTexture(PSXGL_TEXTURE0 + 1);
         native_presenter_update_lut();
@@ -15479,6 +15677,13 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
     glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
+    if (aa_mode == 3 && s_native_aa_history_tex) {
+        p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_2D, s_native_aa_history_tex);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, ww, wh);
+        s_native_aa_history_valid = 1;
+        p_glActiveTexture(PSXGL_TEXTURE0);
+    }
     present_sequence = pres_record(
         image_index ? GL_PRES_NATIVE_MIDPOINT : GL_PRES_NATIVE_CURRENT,
         endpoint.metadata.display_x, endpoint.metadata.display_y,
@@ -15499,6 +15704,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
     completion_sync = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     if (!completion_sync || native_drain_gl_errors()) {
+        s_native_aa_history_valid = 0;
         failure_blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_GL_DRAW;
         goto compose_failed;
     }
@@ -15721,6 +15927,20 @@ int gl_renderer_native_init_services(
             p_glGetUniformLocation(s_native_presenter_prog, "u_screenlut");
         s_native_presenter_u_lut_on =
             p_glGetUniformLocation(s_native_presenter_prog, "u_screenlut_on");
+        s_native_presenter_u_aa =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_mode");
+        s_native_presenter_u_history =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_history");
+        s_native_presenter_u_history_valid =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_history_valid");
+        s_native_presenter_u_drawable =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_drawable");
+        s_native_presenter_u_factor =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_factor");
+        s_native_presenter_u_mask =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_mask");
+        s_native_presenter_u_mask_valid =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_mask_valid");
     }
     interval = s_native_interpolation_denominator > 2u ? 0 : s_swap_interval;
     if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0)
@@ -15813,6 +16033,8 @@ init_failed:
                 p_glDeleteProgram(s_native_presenter_prog);
             if (s_native_presenter_lut_tex)
                 glDeleteTextures(1, &s_native_presenter_lut_tex);
+            if (s_native_aa_history_tex)
+                glDeleteTextures(1, &s_native_aa_history_tex);
             native_context_leave();
         } else if (s_ctx && SDL_GL_MakeCurrent(s_win, s_ctx) == 0) {
             /* Program/textures are shared; the child owns and destroys VAO. */
@@ -15820,11 +16042,15 @@ init_failed:
                 p_glDeleteProgram(s_native_presenter_prog);
             if (s_native_presenter_lut_tex)
                 glDeleteTextures(1, &s_native_presenter_lut_tex);
+            if (s_native_aa_history_tex)
+                glDeleteTextures(1, &s_native_aa_history_tex);
         }
     }
     s_native_presenter_vao = 0u;
     s_native_presenter_prog = 0u;
     s_native_presenter_lut_tex = 0u;
+    s_native_aa_history_tex = 0u;
+    s_native_aa_history_w = s_native_aa_history_h = s_native_aa_history_valid = 0;
     s_native_presenter_lut_generation = -1;
     (void)SDL_GL_MakeCurrent(s_win, s_ctx);
     if (s_native_presenter_ctx) SDL_GL_DeleteContext(s_native_presenter_ctx);
@@ -16108,16 +16334,22 @@ void gl_renderer_native_shutdown(void) {
             p_glDeleteProgram(s_native_presenter_prog);
         if (s_native_presenter_lut_tex)
             glDeleteTextures(1, &s_native_presenter_lut_tex);
+        if (s_native_aa_history_tex)
+            glDeleteTextures(1, &s_native_aa_history_tex);
         for (uint32_t i = 0u; i < GL_NATIVE_ENDPOINT_CAPACITY; ++i) {
             if (s_native_endpoints[i].framebuffer)
                 p_glDeleteFramebuffers(1, &s_native_endpoints[i].framebuffer);
             if (s_native_endpoints[i].texture)
                 glDeleteTextures(1, &s_native_endpoints[i].texture);
+            if (s_native_endpoints[i].mask_texture)
+                glDeleteTextures(1, &s_native_endpoints[i].mask_texture);
             for (uint32_t p = 0u; p < GL_NATIVE_MOTION_PHASE_CAPACITY; ++p) {
                 if (s_native_endpoints[i].phases[p].framebuffer)
                     p_glDeleteFramebuffers(1, &s_native_endpoints[i].phases[p].framebuffer);
                 if (s_native_endpoints[i].phases[p].texture)
                     glDeleteTextures(1, &s_native_endpoints[i].phases[p].texture);
+                if (s_native_endpoints[i].phases[p].mask_texture)
+                    glDeleteTextures(1, &s_native_endpoints[i].phases[p].mask_texture);
             }
         }
         native_context_leave();
@@ -16140,12 +16372,19 @@ void gl_renderer_native_shutdown(void) {
             p_glDeleteProgram(s_native_presenter_prog);
         if (s_native_presenter_lut_tex)
             glDeleteTextures(1, &s_native_presenter_lut_tex);
+        if (s_native_aa_history_tex)
+            glDeleteTextures(1, &s_native_aa_history_tex);
         for (uint32_t i = 0u; i < GL_NATIVE_ENDPOINT_CAPACITY; ++i) {
             if (s_native_endpoints[i].texture)
                 glDeleteTextures(1, &s_native_endpoints[i].texture);
-            for (uint32_t p = 0u; p < GL_NATIVE_MOTION_PHASE_CAPACITY; ++p)
+            if (s_native_endpoints[i].mask_texture)
+                glDeleteTextures(1, &s_native_endpoints[i].mask_texture);
+            for (uint32_t p = 0u; p < GL_NATIVE_MOTION_PHASE_CAPACITY; ++p) {
                 if (s_native_endpoints[i].phases[p].texture)
                     glDeleteTextures(1, &s_native_endpoints[i].phases[p].texture);
+                if (s_native_endpoints[i].phases[p].mask_texture)
+                    glDeleteTextures(1, &s_native_endpoints[i].phases[p].mask_texture);
+            }
         }
     }
     s_native_presenter_vao = 0u;
@@ -16168,6 +16407,8 @@ void gl_renderer_native_shutdown(void) {
     s_native_gpu_scale=0u;
     s_native_presenter_prog = 0u;
     s_native_presenter_lut_tex = 0u;
+    s_native_aa_history_tex = 0u;
+    s_native_aa_history_w = s_native_aa_history_h = s_native_aa_history_valid = 0;
     s_native_presenter_lut_generation = -1;
 
     SDL_LockMutex(s_native_state_mutex);
@@ -16350,33 +16591,16 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
         lw = (lw * content_w) / src_w;
         if (lw < 1) lw = 1;
     }
-    /* This is the low-res source path (24-bit FMV, and the forced-CPU present
-     * diagnostic): a 320x192-class image blown up to fill the window, so how it
-     * is reconstructed is very visible. `linear` (the video AA setting) allows
-     * filtered reconstruction when [video] fmv_filter opts into it:
-     *
-     *   nearest   hard pixels, uneven pixel widths at non-integer scale
-     *   bilinear  plain GL_LINEAR — smoothest, but blurs the whole texel
-     *   sharp     sharp-bilinear: flat texel interiors, ramp confined to a
-     *             one-output-pixel band at the boundary
-     *   bicubic   Catmull-Rom
-     *
-     * Measured on this intro at 1280x960 (fraction of adjacent pixel pairs
-     * differing by >=24 luma = visible staircase, vs mean |dx| = overall
-     * sharpness): nearest 1.00%/1.028, sharp 0.87%/1.008, bicubic 0.34%/1.038,
-     * bilinear 0.14%/0.930. Bicubic removes two thirds of the staircase while
-     * holding gradient at the nearest level; bilinear removes the most but
-     * costs 10% of it, which reads as blur. Still a taste call, hence the knob. */
-    int filt_mode = linear ? fmv_filter_mode()
-                           : -1;          /* AA off: nearest, no shader work */
+    /* FMV and forced-CPU presents retain nearest reconstruction. */
+    (void)linear;
     present_bezel(ww, wh, lx, ly, lw, lh);
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
-    upload_present_tex(pixels, src_w, src_h, filt_mode >= 0 ? 1 : 0);
+    upload_present_tex(pixels, src_w, src_h, 0);
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
     p_glUniform1i(s_present_uLutOn, 0);
     present_set_gamma(s_present_uGamma, 1);
-    present_set_sharp(filt_mode, src_w, src_h, lw, lh);
+    present_set_sharp(0, src_w, src_h, lw, lh);
     /* CPU present texture holds exactly the display rect, so v_uv spans it and
      * pitch == display height == src_h. */
     PRESENT_SCANLINE(src_h, src_h, lh);
@@ -16461,16 +16685,16 @@ int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
         lw = (lw * content_w) / src_w;
         if (lw < 1) lw = 1;
     }
-    const int filt_mode = linear ? fmv_filter_mode() : -1;
+    (void)linear;
     present_bezel(ww, wh, lx, ly, lw, lh);
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
-    upload_native_present_tex(pixels, src_w, src_h, filt_mode >= 0);
+    upload_native_present_tex(pixels, src_w, src_h, 0);
     p_glUseProgram(s_present_prog);
     p_glUniform1i(s_present_uTex, 0);
     p_glUniform1i(s_present_uLutOn, 0);
     present_set_gamma(s_present_uGamma, 1);
-    present_set_sharp(filt_mode, src_w, src_h, lw, lh);
+    present_set_sharp(0, src_w, src_h, lw, lh);
     PRESENT_SCANLINE(src_h, src_h, lh);
     if (crop) {
         const float u0 = 0.5f / (float)src_w;
