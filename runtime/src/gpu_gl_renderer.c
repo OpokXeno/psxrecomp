@@ -8317,8 +8317,8 @@ typedef struct GlNativeDepthMode {
  * the far saturation. Behind the camera (z <= 0) has no depth. */
 static int32_t native_depth_q12(double z, uint32_t distance) {
     if (!isfinite(z) || z <= 0.0) return 0;
-    const double near = distance * (65536.0 / 131071.0);
-    if (z < near) z = near;
+    const double near_depth = distance * (65536.0 / 131071.0);
+    if (z < near_depth) z = near_depth;
     if (z > 65535.0) z = 65535.0;
     const double q12 = z * 4096.0;
     return q12 >= 1.0 ? (int32_t)llround(q12) : 0;

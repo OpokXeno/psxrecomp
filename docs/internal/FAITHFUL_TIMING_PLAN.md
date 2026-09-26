@@ -212,6 +212,14 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-26 — Windows cross-build of Native filtering
+
+The Windows runner failed to compile `gpu_gl_renderer.c` at the local variable
+`near`: llvm-mingw's `minwindef.h` defines `near` as an empty macro. Renamed
+that depth-bound variable to `near_depth`, leaving the computation unchanged.
+The complete `build-win` Release target now compiles and links with llvm-mingw;
+`build-dbg` also builds. No guest rendering or filtering semantics changed.
+
 ### 2026-09-26 — Native texture and sprite filtering
 
 Restored the nearest/bilinear selector on Native presentation draws and added
