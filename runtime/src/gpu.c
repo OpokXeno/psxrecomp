@@ -7502,6 +7502,9 @@ int gpu_native_semantic_from_gp0(
         native_semantic_quad(out, x, y, u, v, color);
     }
     out->screen_space_2d = native_semantic_screen_space_mode(opcode, out, NULL);
+    /* GP0 textured rectangles are SPRT primitives. They include glyphs and
+     * HUD art even when no game-specific producer captured their packets. */
+    out->sprite_texture = textured && opcode >= 0x64u && opcode <= 0x7fu;
     native_semantic_classify_native_view_effect(opcode, out, NULL);
     if (!native_note_gp0_semantic_decode(opcode)) return -1;
     return 1;
@@ -8926,6 +8929,9 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                 opcode, &semantic, source);
             native_semantic_apply_raster_state(&semantic);
         }
+        if (supported && semantic.material.textured &&
+            opcode >= 0x64u && opcode <= 0x7fu)
+            semantic.sprite_texture = 1u;
         if (supported) native_semantic_stamp_retrospective_scene(&semantic);
         if (supported && semantic.triangle_count != 0u) {
             render_status = gr_stream_barrier();

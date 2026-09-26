@@ -247,6 +247,8 @@ typedef struct GpuRenderSemantic {
     uint8_t depth_bias;
     /* Host-only AA exclusion for authored sprites and UI. */
     uint8_t aa_exempt;
+    /* Host-only sprite/UI texture sampling class. */
+    uint8_t sprite_texture;
     uint8_t triangle_count;
     GpuRenderSemanticTriangle triangles[GPU_RENDER_SEMANTIC_TRIANGLE_CAPACITY];
     uint8_t line_count;

@@ -874,6 +874,7 @@ static int s_dither = 0;
 static int s_mask_set = 0, s_mask_check = 0;
 static int s_tw_mask_x = 0, s_tw_mask_y = 0, s_tw_off_x = 0, s_tw_off_y = 0;
 static int s_tex_filter = 0;
+static int s_sprite_filter = 0;
 /* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
  * duplicate stencil copy current is deferred until mask checking is requested. */
 static int s_stencil_valid = 1;
@@ -1701,6 +1702,7 @@ typedef struct GlNativeGpuWork {
     size_t readback_capacity[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
     uint64_t image_digests[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
     uint64_t geometry_draws, transfer_draws, visible_pixels;
+    uint64_t filter_draws[2][2];
     uint32_t *reference_pixels; /* Optional logical-grid samples of the GPU image. */
     int row_planes[VRAM_H];
     uint16_t scanout_x, scanout_y, scanout_width, scanout_height, phase_crop_y, phase_crop_x;
@@ -1857,6 +1859,7 @@ typedef struct NativeDrawState {
     int mask_set, mask_check;
     int tw_mask_x, tw_mask_y, tw_off_x, tw_off_y;
     int tex_filter;
+    int sprite_filter;
 } NativeDrawState;
 
 static void native_draw_state_save(NativeDrawState *state) {
@@ -1880,6 +1883,7 @@ static void native_draw_state_save(NativeDrawState *state) {
     state->tw_off_x = s_tw_off_x;
     state->tw_off_y = s_tw_off_y;
     state->tex_filter = s_tex_filter;
+    state->sprite_filter = s_sprite_filter;
 }
 
 static void native_draw_state_restore(const NativeDrawState *state) {
@@ -1903,6 +1907,7 @@ static void native_draw_state_restore(const NativeDrawState *state) {
     s_tw_off_x = state->tw_off_x;
     s_tw_off_y = state->tw_off_y;
     s_tex_filter = state->tex_filter;
+    s_sprite_filter = state->sprite_filter;
     sw_set_draw_area(state->area_x1, state->area_y1,
                      state->area_x2, state->area_y2);
     sw_set_draw_offset(state->off_x, state->off_y);
@@ -2089,6 +2094,7 @@ typedef struct GlTransactionCheckpoint {
     int mask_set, mask_check;
     int tw_mask_x, tw_mask_y, tw_off_x, tw_off_y;
     int tex_filter;
+    int sprite_filter;
     int stencil_valid;
 
     GpuVramRegionSet gpu_dirty;
@@ -4057,6 +4063,32 @@ static SDL_atomic_t s_native_wireframe_option;
 static int s_native_gpu_wireframe_applied;
 void gl_renderer_set_native_wireframe(int on) { SDL_AtomicSet(&s_native_wireframe_option, on ? 1 : 0); }
 int  gl_renderer_native_wireframe(void) { return SDL_AtomicGet(&s_native_wireframe_option); }
+/* Only affects future Native VIEW draws; canonical guest VRAM is unchanged. */
+static SDL_atomic_t s_scene_filter_strength = {25};
+void gl_renderer_set_scene_filter_strength(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    SDL_AtomicSet(&s_scene_filter_strength, percent);
+}
+int gl_renderer_scene_filter_strength(void) {
+    return SDL_AtomicGet(&s_scene_filter_strength);
+}
+static SDL_atomic_t s_scene_anisotropy;
+void gl_renderer_set_anisotropy(int samples) {
+    if (samples != 2 && samples != 4 && samples != 8 && samples != 16)
+        samples = 0;
+    SDL_AtomicSet(&s_scene_anisotropy, samples);
+}
+int gl_renderer_anisotropy(void) {
+    return SDL_AtomicGet(&s_scene_anisotropy);
+}
+static SDL_atomic_t s_debug_mipmaps;
+void gl_renderer_set_debug_mipmaps(int enabled) {
+    SDL_AtomicSet(&s_debug_mipmaps, enabled ? 1 : 0);
+}
+int gl_renderer_debug_mipmaps(void) {
+    return SDL_AtomicGet(&s_debug_mipmaps);
+}
 static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h); /* def below */
 /* True if [lo,hi] (canonical draw-x) lies strictly inside the 4:3 frame, so the
  * prim adds nothing to either reveal margin and its mirror can be skipped. */
@@ -5076,6 +5108,8 @@ static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (w
                                                       unaffected since it never reads gr_scale()) */
 static void glb_set_texture_filter(int b) { s_tex_filter = b ? 1 : 0; sw_set_texture_filter(b); }
 static int  glb_texture_filter(void) { return s_tex_filter; }
+void gl_renderer_set_sprite_filter(int bilinear) { s_sprite_filter = bilinear ? 1 : 0; }
+int gl_renderer_sprite_filter(void) { return s_sprite_filter; }
 
 static void glb_set_semi_transparency(int e, int m) { s_semi_en = e; s_semi_mode = m & 3; sw_set_semi_transparency(e, m); }
 static void glb_set_mask_bits(int s, int c) {
@@ -8094,12 +8128,14 @@ static int native_materialize_native_draw(const GpuRenderSemantic *semantic,
            semantic->line_count * sizeof(draw->lines[0]));
     draw->screen_space_2d = semantic->screen_space_2d;
     draw->aa_exempt = semantic->aa_exempt;
+    draw->sprite_texture = semantic->sprite_texture;
     draw->native_view_effect = semantic->native_view_effect;
     draw->native_view_effect_index = semantic->native_view_effect_index;
     XgRenderIrNativePrimitive *primitive = &draw->primitive;
     primitive->depth_policy = semantic->depth_policy;
     primitive->depth_bias = semantic->depth_bias;
     primitive->aa_exempt = semantic->aa_exempt;
+    primitive->sprite_texture = semantic->sprite_texture;
 #define NATIVE_COPY_MATERIAL(field) primitive->material.field = semantic->material.field
     NATIVE_COPY_MATERIAL(tpage);
     NATIVE_COPY_MATERIAL(texture_page_x); NATIVE_COPY_MATERIAL(texture_page_y);
@@ -8357,6 +8393,81 @@ static GlNativeDepthMode native_depth_mode(const XgSemanticDrawRecord *draw, con
     return mode;
 }
 
+/* CPU reference for the extra Native 3D texture taps. Nearest coverage/STP is
+ * decided by the caller; these samples contribute only RGB, after the CLUT. */
+static int native_filter_tap(GlNativeCpuCompiler *compiler,
+        const XgSemanticDrawRecord *draw, GlNativeResourceRecord *texture,
+        GlNativeResourceRecord *clut, const uint16_t *native_words,
+        const GlNativeAttributePlanes *attributes, int u, int v,
+        uint16_t *out) {
+    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    u &= 255; v &= 255;
+    if (!(m->texture_window_mask_x | m->texture_window_mask_y)) {
+        if (u < attributes->limits[0]) u = attributes->limits[0];
+        if (u > attributes->limits[2]) u = attributes->limits[2];
+        if (v < attributes->limits[1]) v = attributes->limits[1];
+        if (v > attributes->limits[3]) v = attributes->limits[3];
+    }
+    if (native_words) {
+        *out = native_native_texel(native_words, m, u, v);
+        return 1;
+    }
+    return native_sample_draw_texel(compiler, draw, texture, clut, u, v, out);
+}
+
+static int native_anisotropic_tap(GlNativeCpuCompiler *compiler,
+        const XgSemanticDrawRecord *draw, GlNativeResourceRecord *texture,
+        GlNativeResourceRecord *clut, const uint16_t *native_words,
+        const GlNativeAttributePlanes *attributes, double u, double v,
+        double color[3], int *valid) {
+    const double fu = u - floor(u) - 0.5, fv = v - floor(v) - 0.5;
+    const int du = fu < 0.0 ? -1 : 1, dv = fv < 0.0 ? -1 : 1;
+    const double x = fabs(fu), y = fabs(fv);
+    const double weights[4] = {
+        (1.0 - x) * (1.0 - y), x * (1.0 - y),
+        (1.0 - x) * y, x * y,
+    };
+    uint16_t taps[4];
+    double total = 0.0;
+    color[0] = color[1] = color[2] = 0.0;
+    *valid = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (!native_filter_tap(compiler, draw, texture, clut, native_words,
+                attributes, (int)floor(u) + ((i & 1) ? du : 0),
+                (int)floor(v) + ((i & 2) ? dv : 0), &taps[i]))
+            return 0;
+        if (taps[i]) total += weights[i];
+    }
+    if (total == 0.0) return 1;
+    for (int i = 0; i < 4; ++i) if (taps[i])
+        for (int channel = 0; channel < 3; ++channel)
+            color[channel] += ((taps[i] >> (channel * 5)) & 31) * weights[i] / total;
+    *valid = 1;
+    return 1;
+}
+
+/* Singular-value footprint shared with the GL shader: physical-pixel texel
+ * gradients, major-axis span, and at most N samples, only for minification. */
+static int native_anisotropic_span(double ux, double vx, double uy, double vy,
+        int maximum, double *span_u, double *span_v) {
+    const double xx = ux*ux + vx*vx, yy = uy*uy + vy*vy;
+    const double xy = ux*uy + vx*vy;
+    const double major = 0.5 * (xx + yy + sqrt((xx-yy)*(xx-yy) + 4.0*xy*xy));
+    const double minor = fmax(xx + yy - major, 1.0);
+    int count = (int)fmin(16.0, ceil(sqrt(major / minor)));
+    if (count > maximum) count = maximum;
+    if (count < 2) return 1;
+    double dx = 1.0, dy = 0.0;
+    if (fabs(xy) > 0.000001) {
+        dx = xy; dy = major - xx;
+        const double norm = hypot(dx, dy);
+        dx /= norm; dy /= norm;
+    } else if (yy > xx) { dx = 0.0; dy = 1.0; }
+    *span_u = ux*dx + uy*dy;
+    *span_v = vx*dx + vy*dy;
+    return count;
+}
+
 static int native_render_draw(GlNativeCpuCompiler *compiler,
                           GlNativeCpuSurface *target,
                           const XgSemanticDrawRecord *draw,
@@ -8545,6 +8656,14 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
         const int direct_texel = material->raw_texture || (flat && no_dither &&
             triangle->vertices[0].r == 128u && triangle->vertices[0].g == 128u &&
             triangle->vertices[0].b == 128u);
+        const int filter_strength = draw->sprite_texture ? 100 :
+            gl_renderer_scene_filter_strength();
+        const int filter_draw = material->textured && target != compiler->native_vram &&
+            filter_strength > 0 && (draw->sprite_texture ? s_sprite_filter : s_tex_filter);
+        const int anisotropy = material->textured && target != compiler->native_vram &&
+            !draw->sprite_texture &&
+            draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE ?
+            gl_renderer_anisotropy() : 0;
         const int constant_fragment = !material->textured && flat && no_dither &&
             !material->semi_transparent;
         const uint16_t constant_word = (uint16_t)((triangle->vertices[0].r >> 3u) |
@@ -8711,6 +8830,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     goto native_write_fragment;
                 }
                 double sampled[5];
+                double continuous_u = 0.0, continuous_v = 0.0;
                 const unsigned attribute_begin = material->textured && !perspective ? 0u : 2u;
                 const unsigned attribute_end = !material->raw_texture &&
                     material->shading == XG_RENDER_IR_SHADING_GOURAUD ? 5u : 2u;
@@ -8725,14 +8845,26 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                             attributes.dda[a][1] * (uint32_t)(x - (int)attributes.x) +
                             attributes.dda[a][2] * (uint32_t)(y - (int)attributes.y);
                         const int value = (q & UINT32_C(0xfffff)) >> 12u;
-                        if (a < 2u) sampled[a] = value;
+                        if (a < 2u) {
+                            sampled[a] = value;
+                            if (filter_draw || anisotropy > 1) {
+                                const double phase = (q & UINT32_C(0xfffff)) / 4096.0;
+                                if (a == 0u) continuous_u = phase;
+                                else continuous_v = phase;
+                            }
+                        }
                         else color8[a - 2u] = value;
                     } else {
                         /* Fractional VIEW geometry uses its actual plane, not
                          * an invented PS1 fractional-coordinate instruction. */
-                        sampled[a] = floor(attributes.plane[a][0] +
+                        const double phase = attributes.plane[a][0] +
                             attributes.plane[a][1] * (x - attributes.x) +
-                            attributes.plane[a][2] * (y - attributes.y));
+                            attributes.plane[a][2] * (y - attributes.y);
+                        sampled[a] = floor(phase);
+                        if (a < 2u && (filter_draw || anisotropy > 1)) {
+                            if (a == 0u) continuous_u = phase;
+                            else continuous_v = phase;
+                        }
                         if (a >= 2u)
                             color8[a - 2u] = (int)fmax(0.0, fmin(255.0, sampled[a]));
                     }
@@ -8758,6 +8890,8 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                              w2 * triangle->vertices[2].v * q2) / denominator;
                         sampled[0] = floor(u / 65536.0 + 0.5);
                         sampled[1] = floor(v / 65536.0 + 0.5);
+                        continuous_u = u / 65536.0;
+                        continuous_v = v / 65536.0;
                     }
                     /* floor() produced integral texcoords. For values fitting
                      * int, the sampler's low-eight-bit wrap is exactly fmod(256),
@@ -8789,10 +8923,135 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                         return 0;
                     }
                     if (texel == 0u) continue;
+                    double filtered5[3] = {
+                        texel & 31u, (texel >> 5u) & 31u, (texel >> 10u) & 31u,
+                    };
+                    int filter_pixel = filter_draw;
+                    const double shifted_u = continuous_u +
+                        (perspective ? 0.5 - 1.0 / 64.0 : 0.0);
+                    const double shifted_v = continuous_v +
+                        (perspective ? 0.5 - 1.0 / 64.0 : 0.0);
+                    if (filter_draw) {
+                        filtered5[0] = filtered5[1] = filtered5[2] = 0.0;
+                        /* Nearest is authoritative for coverage/STP. Clamp the
+                         * other three taps to this primitive's sampled texels
+                         * before applying the PSX texture window/CLUT. */
+                        double fx = shifted_u - floor(shifted_u) - 0.5;
+                        double fy = shifted_v - floor(shifted_v) - 0.5;
+                        const int du = fx < 0.0 ? -1 : 1;
+                        const int dv = fy < 0.0 ? -1 : 1;
+                        fx = fabs(fx); fy = fabs(fy);
+                        const double weights[4] = {
+                            (1.0 - fx) * (1.0 - fy), fx * (1.0 - fy),
+                            (1.0 - fx) * fy, fx * fy,
+                        };
+                        uint16_t taps[4] = {texel, 0, 0, 0};
+                        double total = weights[0];
+                        for (int tap = 1; tap < 4; ++tap) {
+                            int tu = ((sample_u & 255) + ((tap & 1) ? du : 0)) & 255;
+                            int tv = ((sample_v & 255) + ((tap & 2) ? dv : 0)) & 255;
+                            if (!(material->texture_window_mask_x |
+                                  material->texture_window_mask_y)) {
+                                if (tu < attributes.limits[0]) tu = attributes.limits[0];
+                                if (tu > attributes.limits[2]) tu = attributes.limits[2];
+                                if (tv < attributes.limits[1]) tv = attributes.limits[1];
+                                if (tv > attributes.limits[3]) tv = attributes.limits[3];
+                            }
+                            if (native_words) taps[tap] = native_native_texel(
+                                native_words, material, tu, tv);
+                            else if (!native_sample_draw_texel(compiler, draw,
+                                     texture_resource, clut_resource, tu, tv,
+                                     &taps[tap])) {
+                                native_audit_block(compiler->audit,
+                                    GL_RENDERER_NATIVE_BLOCKER_TEXTURE_DESCRIPTOR,
+                                    record_index, draw->texture_resource_id,
+                                    draw->texture_generation);
+                                return 0;
+                            }
+                            if (taps[tap]) total += weights[tap];
+                        }
+                        for (int tap = 0; tap < 4; ++tap) if (taps[tap])
+                            for (int channel = 0; channel < 3; ++channel)
+                                filtered5[channel] += ((taps[tap] >> (channel * 5)) & 31) *
+                                    weights[tap] / total;
+                    }
+                    if (anisotropy > 1) {
+                        double ux = attributes.plane[0][1], vx = attributes.plane[1][1];
+                        double uy = attributes.plane[0][2], vy = attributes.plane[1][2];
+                        if (perspective) {
+                            double w[3], reciprocal[3], denominator = 0.0;
+                            for (int i = 0; i < 3; ++i) {
+                                w[i] = (edges[i][0]*x + edges[i][1]*y + edges[i][2]) / area;
+                                reciprocal[i] = 1.0 / triangle->vertices[i].projective_view_z;
+                                denominator += w[i] * reciprocal[i];
+                            }
+                            if (denominator > 0.0) {
+                                double den_dx = 0.0, den_dy = 0.0;
+                                ux = vx = uy = vy = 0.0;
+                                for (int i = 0; i < 3; ++i) {
+                                    const double sx = edges[i][0] * reciprocal[i] / area;
+                                    const double sy = edges[i][1] * reciprocal[i] / area;
+                                    const double u = triangle->vertices[i].u / 65536.0;
+                                    const double v = triangle->vertices[i].v / 65536.0;
+                                    den_dx += sx; den_dy += sy;
+                                    ux += sx*u; vx += sx*v;
+                                    uy += sy*u; vy += sy*v;
+                                }
+                                ux = (ux - continuous_u * den_dx) / denominator;
+                                vx = (vx - continuous_v * den_dx) / denominator;
+                                uy = (uy - continuous_u * den_dy) / denominator;
+                                vy = (vy - continuous_v * den_dy) / denominator;
+                            }
+                        }
+                        double span_u = 0.0, span_v = 0.0;
+                        const int samples = native_anisotropic_span(ux, vx, uy, vy,
+                            anisotropy, &span_u, &span_v);
+                        if (samples > 1) {
+                            filter_pixel = 1;
+                            double sum[3] = {0.0, 0.0, 0.0};
+                            int valid = 0;
+                            for (int i = 0; i < samples; ++i) {
+                                const double offset = ((i + 0.5) / samples) - 0.5;
+                                double color[3] = {0.0, 0.0, 0.0};
+                                int sampled_valid = 0;
+                                int fetched = 1;
+                                if (filter_draw) {
+                                    fetched = native_anisotropic_tap(compiler, draw,
+                                        texture_resource, clut_resource, native_words,
+                                        &attributes, shifted_u + offset*span_u,
+                                        shifted_v + offset*span_v, color, &sampled_valid);
+                                } else {
+                                    uint16_t tap;
+                                    fetched = native_filter_tap(compiler, draw,
+                                        texture_resource, clut_resource, native_words,
+                                        &attributes, (int)floor(shifted_u + offset*span_u),
+                                        (int)floor(shifted_v + offset*span_v), &tap);
+                                    if (fetched && tap) {
+                                        for (int channel = 0; channel < 3; ++channel)
+                                            color[channel] = (tap >> (channel * 5)) & 31;
+                                        sampled_valid = 1;
+                                    }
+                                }
+                                if (!fetched) {
+                                    native_audit_block(compiler->audit,
+                                        GL_RENDERER_NATIVE_BLOCKER_TEXTURE_DESCRIPTOR,
+                                        record_index, draw->texture_resource_id,
+                                        draw->texture_generation);
+                                    return 0;
+                                }
+                                if (!sampled_valid) continue;
+                                for (int channel = 0; channel < 3; ++channel)
+                                    sum[channel] += color[channel];
+                                ++valid;
+                            }
+                            if (valid) for (int channel = 0; channel < 3; ++channel)
+                                filtered5[channel] = sum[channel] / valid;
+                        }
+                    }
                     /* Raw texture and undithered neutral modulation preserve
                      * RGB555 exactly. Keep the texel's mask/blend bit, without
                      * unpacking/modulating/clamping/repacking opaque pixels. */
-                    if (direct_texel) {
+                    if (direct_texel && !filter_pixel) {
                         word = texel | (material->mask_set ? UINT16_C(0x8000) : 0u);
                         if (material->semi_transparent && (texel & UINT16_C(0x8000))) {
                             word = native_psx_fragment_word(*destination,
@@ -8803,9 +9062,13 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                         goto native_write_fragment;
                     }
                     for (int channel = 0; channel < 3; ++channel) {
-                        int tex5 = (texel >> (channel * 5)) & 31;
-                        color5[channel] = material->raw_texture ? tex5 :
-                            ((tex5 * color8[channel]) >> 4u);
+                        const double nearest5 = (double)((texel >> (channel * 5)) & 31);
+                        const double tex5 = !filter_pixel ? nearest5 :
+                            !filter_draw || filter_strength == 100 ? filtered5[channel] :
+                            nearest5 + (filtered5[channel] - nearest5) * filter_strength / 100.0;
+                        color5[channel] = material->raw_texture
+                            ? (int)tex5
+                            : (int)(tex5 * color8[channel] / 16.0);
                     }
                     mask |= (texel >> 15u) & 1u;
                     blend &= (texel >> 15u) & 1u;
@@ -13607,9 +13870,156 @@ static int s_native_gpu_uniforms[6][4], s_native_gpu_depth_value, s_native_gpu_o
 static GLint s_native_gpu_hd_on = -1, s_native_gpu_hd_map = -1, s_native_gpu_hd_lim = -1;
 static GLint s_native_gpu_sample_lim = -1;
 static GLint s_native_gpu_aa_exempt = -1;
+static GLint s_native_gpu_filter = -1;
+static GLint s_native_gpu_filter_strength = -1;
+static GLint s_native_gpu_anisotropy = -1, s_native_gpu_uv_gradient = -1;
+static GLint s_native_gpu_mip_on = -1, s_native_gpu_mip_rect = -1;
 static int s_native_gpu_hd_value;
 static HdGlCache s_native_gpu_hd_cache;
 static uint64_t s_native_gpu_hd_draws;
+
+/* Debug mipmaps are decoded AFTER the CLUT, one sampled UV island at a time.
+ * A mip chain of the packed 1024x512 VRAM would average palette indices and
+ * unrelated atlas neighbours. Only the Native GPU owner touches this cache. */
+enum { GL_NATIVE_MIP_CAPACITY = 128 };
+typedef struct GlNativeMipEntry {
+    GLuint texture;
+    uint16_t page_x, page_y, clut_x, clut_y;
+    uint8_t depth;
+    int limits[4];
+    uint64_t hash, used;
+    uint8_t dirty;
+} GlNativeMipEntry;
+static GlNativeMipEntry s_native_mips[GL_NATIVE_MIP_CAPACITY];
+static uint32_t s_native_mip_count;
+static uint64_t s_native_mip_tick;
+static uint8_t s_native_mip_pixels[256u * 256u * 4u];
+static SDL_atomic_t s_mip_uploads, s_mip_revalidations, s_mip_hits;
+static SDL_atomic_t s_mip_invalidations, s_mip_bound_draws, s_mip_resident;
+
+void gl_renderer_debug_mipmap_diagnostics(GlRendererDebugMipmapDiagnostics *out) {
+    if (!out) return;
+    *out = (GlRendererDebugMipmapDiagnostics){
+        gl_renderer_debug_mipmaps(), SDL_AtomicGet(&s_mip_resident),
+        SDL_AtomicGet(&s_mip_uploads), SDL_AtomicGet(&s_mip_revalidations),
+        SDL_AtomicGet(&s_mip_hits), SDL_AtomicGet(&s_mip_invalidations),
+        SDL_AtomicGet(&s_mip_bound_draws),
+    };
+}
+
+static void native_gpu_mips_clear(void) {
+    for (uint32_t i = 0u; i < s_native_mip_count; ++i)
+        if (s_native_mips[i].texture) glDeleteTextures(1, &s_native_mips[i].texture);
+    s_native_mip_count = 0u;
+    SDL_AtomicSet(&s_mip_resident, 0);
+}
+
+static void native_gpu_mips_dirty_all(void) {
+    for (uint32_t i = 0u; i < s_native_mip_count; ++i)
+        if (!s_native_mips[i].dirty) {
+            s_native_mips[i].dirty = 1u;
+            SDL_AtomicAdd(&s_mip_invalidations, 1);
+        }
+}
+
+/* WORDS patches follow guest order, so only texture pages / palette rows that
+ * intersect this write need revalidation. A wrapped page conservatively marks
+ * its affected rows dirty. On a new work with an unrelated initial snapshot,
+ * dirty_all revalidates content hashes on first use without discarding GL ids. */
+static void native_gpu_mips_dirty_rect(int left, int top, int right, int bottom) {
+    for (uint32_t i = 0u; i < s_native_mip_count; ++i) {
+        GlNativeMipEntry *e = &s_native_mips[i];
+        const int shift = e->depth == 0u ? 2 : e->depth == 1u ? 1 : 0;
+        const int y0 = e->page_y * 256 + e->limits[1];
+        const int y1 = e->page_y * 256 + e->limits[3] + 1;
+        const int x0 = e->page_x * 64 + (e->limits[0] >> shift);
+        const int x1 = e->page_x * 64 + (e->limits[2] >> shift) + 1;
+        const int palette = e->depth != 2u && e->clut_y >= top && e->clut_y < bottom;
+        const int page = y0 < bottom && y1 > top &&
+            ((x0 < right && x1 > left) || x1 > VRAM_W);
+        if ((page || palette) && !e->dirty) {
+            e->dirty = 1u;
+            SDL_AtomicAdd(&s_mip_invalidations, 1);
+        }
+    }
+}
+
+static int native_gpu_mip_key_equal(const GlNativeMipEntry *e,
+        const XgRenderIrMaterialState *m, const int limits[4]) {
+    return e->page_x == m->texture_page_x && e->page_y == m->texture_page_y &&
+        e->depth == m->texture_depth && e->clut_x == m->clut_x &&
+        e->clut_y == m->clut_y && !memcmp(e->limits, limits, sizeof(e->limits));
+}
+
+/* Return a bound mipmapped RGBA texture on unit 6, or 0 to keep the original
+ * VRAM filter. The owner's word shadow matches the texture sampled by draw
+ * commands at this exact FIFO point, including preceding WORDS uploads. */
+static GLuint native_gpu_mip_bind(const uint16_t *words,
+        const XgRenderIrMaterialState *m, const int limits[4]) {
+    if (!words || !p_glGenerateMipmap || limits[0] > limits[2] ||
+        limits[1] > limits[3] || m->texture_window_mask_x ||
+        m->texture_window_mask_y) return 0u;
+    const int width = limits[2] - limits[0] + 1;
+    const int height = limits[3] - limits[1] + 1;
+    /* A full-page limit can mean the authored UVs cross the 256 wrap. There
+     * is no single atlas island to downsample safely in that case. */
+    if (width < 1 || width >= 256 || height < 1 || height >= 256) return 0u;
+    uint32_t index = 0u;
+    for (; index < s_native_mip_count; ++index)
+        if (native_gpu_mip_key_equal(&s_native_mips[index], m, limits)) break;
+    if (index == s_native_mip_count) {
+        if (s_native_mip_count < GL_NATIVE_MIP_CAPACITY) ++s_native_mip_count;
+        else {
+            index = 0u;
+            for (uint32_t i = 1u; i < s_native_mip_count; ++i)
+                if (s_native_mips[i].used < s_native_mips[index].used) index = i;
+            if (s_native_mips[index].texture)
+                glDeleteTextures(1, &s_native_mips[index].texture);
+        }
+        s_native_mips[index] = (GlNativeMipEntry){0};
+        GlNativeMipEntry *e = &s_native_mips[index];
+        e->page_x = m->texture_page_x; e->page_y = m->texture_page_y;
+        e->clut_x = m->clut_x; e->clut_y = m->clut_y;
+        e->depth = m->texture_depth;
+        memcpy(e->limits, limits, sizeof(e->limits));
+        e->dirty = 1u;
+        SDL_AtomicSet(&s_mip_resident, (int)s_native_mip_count);
+    }
+    GlNativeMipEntry *e = &s_native_mips[index];
+    e->used = ++s_native_mip_tick;
+    if (e->dirty || !e->texture) {
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+            const uint16_t word = native_native_texel(words, m,
+                limits[0] + x, limits[1] + y);
+            uint8_t *pixel = s_native_mip_pixels + ((size_t)y * width + x) * 4u;
+            hash = (hash ^ (word & 255u)) * UINT64_C(1099511628211);
+            hash = (hash ^ (word >> 8u)) * UINT64_C(1099511628211);
+            pixel[0] = word ? (uint8_t)(((word & 31u) << 3u) | ((word & 31u) >> 2u)) : 0u;
+            pixel[1] = word ? (uint8_t)((((word >> 5u) & 31u) << 3u) | (((word >> 5u) & 31u) >> 2u)) : 0u;
+            pixel[2] = word ? (uint8_t)((((word >> 10u) & 31u) << 3u) | (((word >> 10u) & 31u) >> 2u)) : 0u;
+            pixel[3] = word ? 255u : 0u;
+        }
+        if (!e->texture || e->hash != hash) {
+            if (!e->texture) glGenTextures(1, &e->texture);
+            if (!e->texture) return 0u;
+            p_glActiveTexture(PSXGL_TEXTURE0 + 6); glBindTexture(GL_TEXTURE_2D, e->texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, s_native_mip_pixels);
+            p_glGenerateMipmap(GL_TEXTURE_2D);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            e->hash = hash;
+            SDL_AtomicAdd(&s_mip_uploads, 1);
+        } else SDL_AtomicAdd(&s_mip_revalidations, 1);
+        e->dirty = 0u;
+    } else SDL_AtomicAdd(&s_mip_hits, 1);
+    p_glActiveTexture(PSXGL_TEXTURE0 + 6); glBindTexture(GL_TEXTURE_2D, e->texture);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    return e->texture;
+}
 
 /* Native GPU vertex: position (2), uv (2), color (4), perspective weight (1)
  * and padding. The weight is the normalized reciprocal view depth (1/z with
@@ -13669,10 +14079,14 @@ static const char *NATIVE_GPU_FS =
     /* HD texture replacement: hd_map = (page->upload texel offset u/v, upload
      * size in texels), hd_lim = the draw's sampled page-texel rectangle. */
     "uniform sampler2D hd_image; uniform int hd_on; uniform ivec4 hd_map,hd_lim;\n"
+    "uniform sampler2D mip_image; uniform int mip_on; uniform ivec4 mip_rect;\n"
     /* Inclusive sampled texel range of the triangle (gpu_uv.h limits). */
     "uniform ivec4 sample_lim;\n"
     "uniform ivec4 state,flags,page,window; uniform int depth; uniform ivec2 origin;\n"
     "uniform int aa_exempt;\n"
+    "uniform int texture_filter;\n"
+    "uniform float filter_strength;\n"
+    "uniform int anisotropy; uniform vec4 uv_gradient;\n"
     /* Native depth plane (see native_depth_plane): depth_state = (test, mode of
      * an unblended fragment 1=far 2=key 3=copy source, per-texel keep, bias);
      * depth_plane = (N0 Q8, a, b, scale) at the logical depth_origin. The key is
@@ -13705,20 +14119,47 @@ static const char *NATIVE_GPU_FS =
     "  dot(v4,vec4(0.10667330,12.64194608,-60.58204836,110.36276771))+dot(v2,vec2(-89.90310912,27.34824973)));\n"
     " return clamp(c,0.0,1.0)*contour;}\n"
     "uniform vec4 attribute_origin; uniform vec4 attribute_plane[5]; uniform ivec4 attribute_dda[5];\n"
-    "float attribute_at(int a){\n"
+    "float attribute_sample(int a){\n"
     " if(attribute_origin.z==1.0){\n"
     "  ivec2 delta=ivec2(floor(gl_FragCoord.xy))-ivec2(attribute_origin.xy*size.w);\n"
     "  uvec3 p=uvec3(attribute_dda[a].xyz); uint q=p.x+p.y*uint(delta.x)+p.z*uint(delta.y);\n"
-    "  return float((q&1048575u)>>12u);\n"
+    "  return float(q&1048575u)/4096.0;\n"
     " }\n"
     " vec2 delta=(gl_FragCoord.xy-vec2(0.5))/size.w-attribute_origin.xy;\n"
-    " return floor(attribute_plane[a].x+dot(attribute_plane[a].yz,delta));\n"
+    " return attribute_plane[a].x+dot(attribute_plane[a].yz,delta);\n"
     "}\n"
+    "float attribute_at(int a){return floor(attribute_sample(a));}\n"
     "int word_at(ivec2 p){return int(texelFetch(words,p&ivec2(1023,511),0).r);}\n"
-    "int guest_texel(ivec2 q){q&=255; q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
+    "int guest_texel(ivec2 q){q&=255; if((window.x|window.y)==0)q=clamp(q,sample_lim.xy,sample_lim.zw);\n"
+    " q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
     " int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));\n"
     " if(depth<2){int index=depth==0?(w>>((q.x&3)*4))&15:(w>>((q.x&1)*8))&255; w=word_at(page.zw+ivec2(index,0));}\n"
     " return w;}\n"
+    /* Extra samples integrate the elongated texel-space footprint along its
+     * principal axis. Each sample honours the same atlas clamp, CLUT lookup and
+     * transparent-texel renormalization as the ordinary bilinear footprint. */
+    "vec4 anisotropic_tap(vec2 uv){ivec2 base=ivec2(floor(uv));\n"
+    " vec2 f=fract(uv)-0.5; ivec2 dir=ivec2(f.x<0.0?-1:1,f.y<0.0?-1:1); f=abs(f);\n"
+    " int a=guest_texel(base),b=guest_texel(base+ivec2(dir.x,0));\n"
+    " int c=guest_texel(base+ivec2(0,dir.y)),d=guest_texel(base+dir);\n"
+    " vec4 w=vec4((1.0-f.x)*(1.0-f.y),f.x*(1.0-f.y),(1.0-f.x)*f.y,f.x*f.y);\n"
+    " w*=vec4(float(a!=0),float(b!=0),float(c!=0),float(d!=0));\n"
+    " float total=dot(w,vec4(1.0)); if(total==0.0)return vec4(0.0);\n"
+    " vec3 rgb=vec3(ivec3(a,a>>5,a>>10)&31)*w.x+vec3(ivec3(b,b>>5,b>>10)&31)*w.y+\n"
+    "  vec3(ivec3(c,c>>5,c>>10)&31)*w.z+vec3(ivec3(d,d>>5,d>>10)&31)*w.w;\n"
+    " return vec4(rgb/total,1.0);}\n"
+    /* Decoded mip texels carry premultiplied coverage so transparent palette
+     * entries never darken opaque art. Guest nearest remains the STP/cutout
+     * authority; this function supplies presentation RGB only. */
+    "vec4 mip_color(vec2 uv,float lod,int point){\n"
+    " vec2 local=(uv-vec2(mip_rect.xy))/vec2(mip_rect.zw); vec4 h;\n"
+    " if(point!=0){int max_level=int(floor(log2(float(max(mip_rect.z,mip_rect.w)))));\n"
+    "  int level=int(clamp(floor(lod+0.5),0.0,float(max_level)));\n"
+    "  ivec2 shape=textureSize(mip_image,level);\n"
+    "  ivec2 p=clamp(ivec2(floor(local*vec2(shape))),ivec2(0),shape-ivec2(1));\n"
+    "  h=texelFetch(mip_image,p,level);}\n"
+    " else h=textureLod(mip_image,local,lod);\n"
+    " if(h.a<=0.00001)return vec4(0.0); return vec4(h.rgb*(31.0/h.a),h.a);}\n"
     /* An HD texel can cover a texel that is transparent in the guest image
      * (its anti-aliased edge overhangs the original silhouette). Such a texel
      * has no STP of its own; forcing 0 drew it opaque, and the dark colours a
@@ -13742,6 +14183,11 @@ static const char *NATIVE_GPU_FS =
     "  vec2 tx=clamp(vec2(hq+hd_map.xy)+(hp-fl),vec2(hd_lim.xy+hd_map.xy)+0.5/k,vec2(hd_lim.zw+hd_map.xy)+1.0-0.5/k);\n"
     "  hd_uv=tx/vec2(hd_map.zw);}\n"
     " hd_dx=dFdx(hd_uv); hd_dy=dFdy(hd_uv);\n"
+    /* Derivatives must precede every per-fragment discard. Affine gradients
+     * come from the unwrapped attribute plane, not the modulo-256 DDA value. */
+    " vec2 ax=vec2(0.0),ay=vec2(0.0);\n"
+    " if(anisotropy>1||mip_on!=0){ax=persp!=0?dFdx(t_p):uv_gradient.xy;\n"
+    "  ay=persp!=0?dFdy(t_p):uv_gradient.zw;}\n"
     " vec4 old=vec4(0); if(flags.y!=0 || (flags.w==0 && state.z!=0)) old=texelFetch(destination,ivec2(gl_FragCoord.xy),0);\n"
     " if(flags.y!=0 && old.a>0.5) discard;\n"
     " uint key=0u,stored=0u; if(depth_state.x!=0||depth_state.z!=0) stored=texelFetch(destination_depth,ivec2(gl_FragCoord.xy),0).r;\n"
@@ -13759,10 +14205,7 @@ static const char *NATIVE_GPU_FS =
     " ivec2 dp=ivec2(floor(gl_FragCoord.xy/size.w))+origin; int bias=flags.z!=0?d[(dp.y&3)*4+(dp.x&3)]:0;\n"
     " bool hd=false; vec3 hf=vec3(0.0);\n"
     " if(state.x!=0){vec2 uvs=persp!=0?t_p:vec2(attribute_at(0),attribute_at(1));\n"
-    "  ivec2 q=ivec2(mod(uvs,256.0))&255; if((window.x|window.y)==0)q=clamp(q,sample_lim.xy,sample_lim.zw);\n"
-    "  q=(q&~(window.xy*8))|((window.zw&window.xy)*8);\n"
-    "  int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));\n"
-    "  if(depth<2){int index=depth==0?(w>>((q.x&3)*4))&15:(w>>((q.x&1)*8))&255; w=word_at(page.zw+ivec2(index,0));}\n"
+    "  ivec2 q=ivec2(mod(uvs,256.0))&255; int w=guest_texel(q);\n"
     /* Replacement: coverage and colour from the HD image (premultiplied by
      * coverage at upload), STP from the guest texel, full 8-bit precision. */
     "  if(hd_on!=0){vec4 h=textureGrad(hd_image,hd_uv,hd_dx,hd_dy); if(h.a<0.5)discard; hd=true;\n"
@@ -13770,7 +14213,48 @@ static const char *NATIVE_GPU_FS =
     "   int stp=w!=0?(w>>15)&1:hd_fringe_stp(ivec2(mod(uvs,256.0))&255); mask|=stp; blend&=stp;\n"
     "  }else{\n"
     "  if(w==0)discard; ivec3 tex=ivec3(w,w>>5,w>>10)&31; int stp=(w>>15)&1; mask|=stp; blend&=stp;\n"
-    "  c=state.y!=0?tex:clamp((((tex*c)>>4)+bias)>>3,ivec3(0),ivec3(31));}\n"
+    "  if(texture_filter!=0||anisotropy>1||mip_on!=0){\n"
+    /* For affine draws, base and weights use the same PS1 attribute accumulator.
+     * Interpolating t separately can place its floor on the other side of a
+     * texel boundary (especially for mirrored UVs), sending the filter toward
+     * the wrong neighbour while coverage and STP still use attribute_at. */
+    "   vec2 filter_uv=persp!=0?t_p+vec2(size.z):vec2(attribute_sample(0),attribute_sample(1));\n"
+    "   vec3 filtered=vec3(tex);\n"
+    "   if(texture_filter!=0){vec2 f=fract(filter_uv)-0.5;\n"
+    "    ivec2 step_dir=ivec2(f.x<0.0?-1:1,f.y<0.0?-1:1); f=abs(f);\n"
+    "    int w10=guest_texel(q+ivec2(step_dir.x,0)),w01=guest_texel(q+ivec2(0,step_dir.y));\n"
+    "    int w11=guest_texel(q+step_dir);\n"
+    "    vec4 weights=vec4((1.0-f.x)*(1.0-f.y),f.x*(1.0-f.y),(1.0-f.x)*f.y,f.x*f.y);\n"
+    "    weights*=vec4(1.0,float(w10!=0),float(w01!=0),float(w11!=0));\n"
+    "    weights/=dot(weights,vec4(1.0));\n"
+    "    filtered=vec3(tex)*weights.x+vec3(ivec3(w10,w10>>5,w10>>10)&31)*weights.y+\n"
+    "     vec3(ivec3(w01,w01>>5,w01>>10)&31)*weights.z+vec3(ivec3(w11,w11>>5,w11>>10)&31)*weights.w;}\n"
+    /* Singular values of the UV Jacobian identify the principal footprint
+     * even when both screen-space gradients point in nearly the same direction. */
+    "   if(anisotropy>1||mip_on!=0){float xx=dot(ax,ax),yy=dot(ay,ay),xy=dot(ax,ay);\n"
+    "    float major2=0.5*(xx+yy+sqrt((xx-yy)*(xx-yy)+4.0*xy*xy));\n"
+    "    float minor2=max(xx+yy-major2,1.0);\n"
+    "    int n=anisotropy>1?min(anisotropy,int(min(16.0,ceil(sqrt(major2/minor2))))):1;\n"
+    "    bool use_mip=mip_on!=0&&major2>1.0;\n"
+    "    if(n>1){vec2 dir=abs(xy)>0.000001?normalize(vec2(xy,major2-xx)):\n"
+    "      (xx>=yy?vec2(1.0,0.0):vec2(0.0,1.0));\n"
+    "     vec2 span=ax*dir.x+ay*dir.y; vec3 sum=vec3(0.0); float valid=0.0;\n"
+    "     for(int i=0;i<16;++i){if(i>=n)break;\n"
+    "      vec2 uv=filter_uv+((float(i)+0.5)/float(n)-0.5)*span;\n"
+    "      if(use_mip){vec4 tap=mip_color(uv,log2(sqrt(minor2)),texture_filter==0?1:0);\n"
+    "       sum+=tap.rgb*tap.a; valid+=tap.a;}\n"
+    "      else if(texture_filter!=0){vec4 tap=anisotropic_tap(uv);\n"
+    "       sum+=tap.rgb; valid+=tap.a;}\n"
+    "      else{int tap=guest_texel(ivec2(floor(uv)));\n"
+    "       if(tap!=0){sum+=vec3(ivec3(tap,tap>>5,tap>>10)&31); valid+=1.0;}}}\n"
+    "     if(valid>0.0)filtered=sum/valid;\n"
+    "    }else if(use_mip){vec4 tap=mip_color(filter_uv,log2(sqrt(major2)),texture_filter==0?1:0);\n"
+    "     if(tap.a>0.0)filtered=tap.rgb;}\n"
+    "   }\n"
+    "   if(texture_filter!=0&&filter_strength<1.0)filtered=mix(vec3(tex),filtered,filter_strength);\n"
+    "   vec3 scaled=state.y!=0?filtered*8.0:floor(filtered*vec3(c)/16.0);\n"
+    "   c=clamp(ivec3(floor((scaled+float(state.y!=0?0:bias))/8.0)),ivec3(0),ivec3(31));\n"
+    "  }else c=state.y!=0?tex:clamp((((tex*c)>>4)+bias)>>3,ivec3(0),ivec3(31));}\n"
     " }else c=clamp((c+bias)>>3,ivec3(0),ivec3(31));\n"
     " if(hd){if(blend!=0){vec3 b=old.rgb;\n"
     "  if(state.w==0)hf=(b+hf)*0.5; else if(state.w==1)hf=b+hf; else if(state.w==2)hf=b-hf; else hf=b+hf*0.25;}\n"
@@ -13871,6 +14355,12 @@ static int native_gpu_program_init(void) {
     s_native_gpu_program = build_program(NATIVE_GPU_VS, NATIVE_GPU_FS);
     if (!s_native_gpu_program) return 0;
     s_native_gpu_aa_exempt = p_glGetUniformLocation(s_native_gpu_program, "aa_exempt");
+    s_native_gpu_filter = p_glGetUniformLocation(s_native_gpu_program, "texture_filter");
+    s_native_gpu_filter_strength = p_glGetUniformLocation(s_native_gpu_program, "filter_strength");
+    s_native_gpu_anisotropy = p_glGetUniformLocation(s_native_gpu_program, "anisotropy");
+    s_native_gpu_uv_gradient = p_glGetUniformLocation(s_native_gpu_program, "uv_gradient");
+    s_native_gpu_mip_on = p_glGetUniformLocation(s_native_gpu_program, "mip_on");
+    s_native_gpu_mip_rect = p_glGetUniformLocation(s_native_gpu_program, "mip_rect");
     /* Newly linked uniform values are zero. Only this owner uses this program. */
     memset(s_native_gpu_uniforms,0,sizeof(s_native_gpu_uniforms));
     memset(s_native_gpu_origin_value,0,sizeof(s_native_gpu_origin_value));s_native_gpu_depth_value=0;
@@ -13889,6 +14379,7 @@ static int native_gpu_program_init(void) {
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"destination_depth"),3);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"source_depth"),4);
     p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"hd_image"),5);
+    p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"mip_image"),6);
     s_native_gpu_hd_on=p_glGetUniformLocation(s_native_gpu_program,"hd_on");
     s_native_gpu_hd_map=p_glGetUniformLocation(s_native_gpu_program,"hd_map");
     s_native_gpu_hd_lim=p_glGetUniformLocation(s_native_gpu_program,"hd_lim");
@@ -14132,6 +14623,7 @@ static void native_gpu_depth_query(GlNativeGpuWork *work, int open) {
 
 static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCommand *command,
                                   GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
+                                  const uint16_t *words,
                                   uint32_t first_vertex, GlNativeGpuPlane **bound_target) {
     GlNativeGpuPlane *plane=&work->planes[command->plane];
     const uint32_t scale=work->scale;
@@ -14201,6 +14693,22 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             native_gpu_uniform4(0,s_native_gpu_state,m->textured,m->raw_texture,m->semi_transparent,m->blend_mode);
             p_glUniform1i(s_native_gpu_aa_exempt,
                 draw->aa_exempt || draw->screen_space_2d != GPU_RENDER_SCREEN_SPACE_2D_NONE);
+            const int filter_strength = draw->sprite_texture ? 100 :
+                gl_renderer_scene_filter_strength();
+            p_glUniform1i(s_native_gpu_filter,
+                command->plane != 0u && filter_strength > 0 &&
+                (draw->sprite_texture ? s_sprite_filter : s_tex_filter));
+            p_glUniform1f(s_native_gpu_filter_strength, filter_strength / 100.f);
+            p_glUniform1i(s_native_gpu_anisotropy,
+                command->plane != 0u && !lines && !draw->sprite_texture &&
+                draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE &&
+                m->textured
+                    ? gl_renderer_anisotropy() : 0);
+            if (!lines) p_glUniform4f(s_native_gpu_uv_gradient,
+                (float)(attributes.plane[0][1] / scale),
+                (float)(attributes.plane[1][1] / scale),
+                (float)(attributes.plane[0][2] / scale),
+                (float)(attributes.plane[1][2] / scale));
             if (wire) {
                 /* Unlit constant lines (the transfer path of the shader). */
                 native_gpu_uniform4(1,s_native_gpu_flags,0,0,0,1);
@@ -14224,6 +14732,17 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                     p_glUniform1i(s_native_gpu_hd_on, hd_on);
                     s_native_gpu_hd_value = hd_on;
                 }
+                const int mip_on = !hd_on && !wire && !lines && command->plane != 0u &&
+                    m->textured && !draw->sprite_texture &&
+                    draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE &&
+                    gl_renderer_debug_mipmaps() &&
+                    native_gpu_mip_bind(words, m, attributes.limits) != 0u;
+                p_glUniform1i(s_native_gpu_mip_on, mip_on);
+                if (mip_on) SDL_AtomicAdd(&s_mip_bound_draws, 1);
+                if (mip_on) p_glUniform4i(s_native_gpu_mip_rect,
+                    attributes.limits[0], attributes.limits[1],
+                    attributes.limits[2] - attributes.limits[0] + 1,
+                    attributes.limits[3] - attributes.limits[1] + 1);
             }
             if(s_native_gpu_depth_value!=(int)m->texture_depth) {
                 p_glUniform1i(s_native_gpu_depth,m->texture_depth);s_native_gpu_depth_value=m->texture_depth;
@@ -14236,6 +14755,10 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             glDrawArrays(GL_TRIANGLES,(GLint)(first_vertex+t*(lines?6u:3u)),lines?6:3);
             if (wire && !lines) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             work->geometry_draws++;
+            if (m->textured && command->plane != 0u)
+                work->filter_draws[draw->sprite_texture != 0u]
+                    [(draw->sprite_texture ? s_sprite_filter :
+                        s_tex_filter && filter_strength > 0) != 0]++;
         }
         return 1;
     }
@@ -14464,6 +14987,8 @@ static int native_gpu_service(void) {
         GlNativeGpuPlane *snapshots=work->snapshots;
         static uint16_t upload_words[VRAM_W*VRAM_H];
         int ok=!work->render_failed&&native_gpu_program_init();
+        if (!gl_renderer_debug_mipmaps() && s_native_mip_count)
+            native_gpu_mips_clear();
         /* Timestamp spans include any queue idle between owner slices; they
          * measure completion latency on the GPU clock, not active utilization. */
         if(state==NATIVE_GPU_QUEUED&&p_glQueryCounter&&p_glGenQueries&&p_glGetQueryObjectui64v&&p_glDeleteQueries) {
@@ -14474,6 +14999,9 @@ static int native_gpu_service(void) {
         glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);glPixelStorei(GL_UNPACK_ALIGNMENT,4);
         if(state==NATIVE_GPU_QUEUED) {
         work->timing.dispatch_begin_ns=started;
+        if (memcmp(upload_words,captured_data+work->initial_words_offset,
+                   sizeof(upload_words)) != 0)
+            native_gpu_mips_dirty_all();
         memcpy(upload_words,captured_data+work->initial_words_offset,sizeof(upload_words));
         p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_native_gpu_words);
         glTexImage2D(GL_TEXTURE_2D,0,GL_R16UI,VRAM_W,VRAM_H,0,GL_RED_INTEGER,GL_UNSIGNED_SHORT,upload_words);
@@ -14525,6 +15053,7 @@ static int native_gpu_service(void) {
                 glPixelStorei(GL_UNPACK_ROW_LENGTH,VRAM_W);
                 glTexSubImage2D(GL_TEXTURE_2D,0,left,top,right-left,bottom-top,GL_RED_INTEGER,GL_UNSIGNED_SHORT,upload_words+top*VRAM_W+left);
                 glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
+                native_gpu_mips_dirty_rect(left,top,right,bottom);
             } else if(command->kind==NATIVE_GPU_SNAPSHOT) {
                 work->snapshot_commands++;
                 native_gpu_depth_query(work,0);
@@ -14561,12 +15090,12 @@ static int native_gpu_service(void) {
                     for (uint32_t draw = i; draw < end && ok; ++draw) {
                         if (commands[draw].plane == plane)
                             ok = native_gpu_render_command(work, &commands[draw], snapshots,
-                                captured_data, vertex, &bound_target);
+                                captured_data, upload_words, vertex, &bound_target);
                         vertex += native_gpu_command_vertex_count(&commands[draw]);
                     }
                 }
                 i = end - 1u;
-            } else ok=native_gpu_render_command(work,command,snapshots,captured_data,command_first_vertex,NULL);
+            } else ok=native_gpu_render_command(work,command,snapshots,captured_data,upload_words,command_first_vertex,NULL);
             work->cursor=i+1u;
             if(!gpu_owner&&ok&&work->cursor<command_limit&&SDL_GetTicksNS()-started>=1000000u) {
                 /* Resume the exact next FIFO command on the next owner service.
@@ -14651,6 +15180,10 @@ static int native_gpu_service(void) {
         s_native_compiler_diag.gpu.commands+=work->count;
         s_native_compiler_diag.gpu.captured_bytes+=work->bytes;
         s_native_compiler_diag.gpu.geometry_draws+=work->geometry_draws;
+        for (unsigned family = 0u; family < 2u; ++family)
+            for (unsigned filter = 0u; filter < 2u; ++filter)
+                s_native_compiler_diag.gpu.filter_draws[family][filter] +=
+                    work->filter_draws[family][filter];
         s_native_compiler_diag.gpu.transfer_draws+=work->transfer_draws;
         s_native_compiler_diag.gpu.word_uploads+=work->word_uploads;
         s_native_compiler_diag.gpu.snapshot_commands+=work->snapshot_commands;
@@ -14727,14 +15260,14 @@ static int native_gpu_thread_main(void *unused) {
                 p_glBindFramebuffer(PSXGL_FRAMEBUFFER,warm.planes[0].framebuffer);
                 glDisable(GL_SCISSOR_TEST);glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);
                 warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u) &&
-                    native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,0u,NULL);
+                    native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,warm_words,0u,NULL);
             }
         command=(GlNativeGpuCommand){.kind=NATIVE_GPU_SPAN,.source=UINT32_MAX,.w=16,.h=16,.color=0xff000000};
         warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u) &&
-            native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,0u,NULL);
+            native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,warm_words,0u,NULL);
         command.kind=NATIVE_GPU_SEED;warm.data=(uint8_t *)warm_pixels;
         warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u) &&
-            native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,0u,NULL);
+            native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,warm_words,0u,NULL);
         glFinish();
         warmed&=!native_drain_gl_errors();
     }
@@ -14771,6 +15304,7 @@ static int native_gpu_thread_main(void *unused) {
     if(s_native_gpu_vbo)p_glDeleteBuffers(1,&s_native_gpu_vbo);
     if(s_native_gpu_words)glDeleteTextures(1,&s_native_gpu_words);
     if(s_native_gpu_input)glDeleteTextures(1,&s_native_gpu_input);
+    native_gpu_mips_clear();
     hd_gl_cache_clear(&s_native_gpu_hd_cache);
     s_native_gpu_program=s_native_gpu_vao=s_native_gpu_vbo=s_native_gpu_words=s_native_gpu_input=0;
     SDL_GL_MakeCurrent(s_native_gpu_drawable,NULL);
@@ -20768,6 +21302,7 @@ static void glb_transaction_snapshot(GlTransactionCheckpoint *checkpoint) {
     checkpoint->tw_mask_x = s_tw_mask_x; checkpoint->tw_mask_y = s_tw_mask_y;
     checkpoint->tw_off_x = s_tw_off_x; checkpoint->tw_off_y = s_tw_off_y;
     checkpoint->tex_filter = s_tex_filter;
+    checkpoint->sprite_filter = s_sprite_filter;
     checkpoint->stencil_valid = s_stencil_valid;
 
     checkpoint->gpu_dirty = s_gpu_dirty;
@@ -20835,6 +21370,7 @@ static void glb_transaction_restore_draw_state(
     s_tw_off_x = checkpoint->tw_off_x;
     s_tw_off_y = checkpoint->tw_off_y;
     s_tex_filter = checkpoint->tex_filter;
+    s_sprite_filter = checkpoint->sprite_filter;
 
     sw_set_draw_area(checkpoint->area_x1, checkpoint->area_y1,
                      checkpoint->area_x2, checkpoint->area_y2);

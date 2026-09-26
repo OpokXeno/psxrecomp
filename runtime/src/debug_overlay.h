@@ -91,8 +91,8 @@ int psx_debug_overlay_set_force_capture(int on);
  * runtime setters (asserting that flipping a widget value actually
  * changes the matching TCP getter) without needing a real mouse click
  * (which is impossible from a remote client). Accepted `name`s are
- * enumerated in TCP_COMMANDS.md; the canonical set is: texfilter,
- * native_wide, aspect_set, bd_stretch_on, bd_stretch_pct, interp,
+ * enumerated in TCP_COMMANDS.md; the canonical set includes texfilter,
+ * spritefilter, native_wide, aspect_set, bd_stretch_on, bd_stretch_pct, interp,
  * dump_event_ring, dump_latency_ring, dump_starv_ring, teleport,
  * party_slot, party_bitfield, gold, write_var, force_battle,
  * camera_write, event_jump, read_field_id. `value` is interpreted

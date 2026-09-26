@@ -184,7 +184,10 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | Drive the same Xenogears debug-overlay action functions used by its widgets; unavailable in Release builds |
 | `quit` | ✓ |   | — | Shutdown native runtime |
 | `overlay_toggle` | ✓ |   | — | **Native:** flip the in-game developer debug overlay visibility flag (Debug builds only). Same purpose as the Ctrl+F3 hotkey — exists so tests can drive the flag without key injection. On Release builds the API is a static-inline no-op, so the call is harmless and the response always reports `visible:false`. Response: `{"id":N,"ok":true,"visible":true\|false}` |
-| `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | **Native:** invoke one of the in-window debug overlay widget's action functions (the same code path a checkbox / button / slider click would call). Lets a remote client assert the TOGGLES section is wired to the real runtime setters without synthesizing real mouse clicks (which is impossible over TCP). Does NOT bypass the action path — it calls the same function the widget calls. `name` is one of: `texfilter`, `native_wide`, `developer_mode`, `kernel_menu`, `disc_swap`, `aspect_set`, `bd_stretch_on`, `bd_stretch_pct`, `interp`, `supersampling`, `antialiasing`, `screen_model`, `turbo_loads`, `spu_hq`, `window_width`, `dump_event_ring`, `dump_latency_ring`, `dump_starv_ring`, `teleport`,   `party_slot`, `party_bitfield`, `party_set`, `gold`, `write_var`, `force_battle`, `start_battle`, `battle_enemy`, `camera_write`, `event_jump`, `read_field_id`. `value` and `value2` are interpreted per the name; see the per-name section below. `dump_*` actions ignore both. Response: `{"id":N,"ok":true,"name":"...","value":N,"value2":M}` on success, `{"id":N,"ok":false,"err":"unknown name"}` on bad name. **Debug builds only; Release compiles the command to a static-inline `-1` return.** |
+| `overlay_widget_action` | ✓ |   | `name`, `value`, `value2` | **Native:** invoke one of the in-window debug overlay widget's action functions (the same code path a checkbox / button / slider click would call). Lets a remote client assert the TOGGLES section is wired to the real runtime setters without synthesizing real mouse clicks (which is impossible over TCP). Does NOT bypass the action path — it calls the same function the widget calls. `name` is one of: `texfilter`, `spritefilter`, `native_wide`, `developer_mode`, `kernel_menu`, `disc_swap`, `aspect_set`, `bd_stretch_on`, `bd_stretch_pct`, `interp`, `supersampling`, `antialiasing`, `screen_model`, `turbo_loads`, `spu_hq`, `window_width`, `dump_event_ring`, `dump_latency_ring`, `dump_starv_ring`, `teleport`,   `party_slot`, `party_bitfield`, `party_set`, `gold`, `write_var`, `force_battle`, `start_battle`, `battle_enemy`, `camera_write`, `event_jump`, `read_field_id`. `value` and `value2` are interpreted per the name; see the per-name section below. `dump_*` actions ignore both. Response: `{"id":N,"ok":true,"name":"...","value":N,"value2":M}` on success, `{"id":N,"ok":false,"err":"unknown name"}` on bad name. **Debug builds only; Release compiles the command to a static-inline `-1` return.** |
+| `texture_filter_strength` | ✓ |   | `value` (optional, 0..100) | Native scene bilinear strength, live: 100 is full bilinear, 0 follows the exact nearest path; sprites/UI and guest VRAM are unaffected. Omit `value` to query. Returns `{"id":N,"ok":true,"value":N}`. Defaults to 25 on each launch; TCP overrides last until the process exits. |
+| `anisotropy` | ✓ |   | `value` (optional: 0, 2, 4, 8, 16) | Native 3D scene directional sampling; 0 = Off. Uses point taps with Nearest, bilinear taps with Bilinear. Omit `value` to query. Live control; sprites/UI and canonical guest VRAM are unaffected. Returns `{"id":N,"ok":true,"value":N}`. |
+| `mipmap_diag` | ✓ |   | — | Read-only Native debug mipmap cache state: `enabled`, `resident`, `uploads`, `revalidations`, `hits`, `invalidations`, `bound_draws`. The debug menu's **Generate texture mipmaps (experimental)** checkbox controls it; the default is Off. |
 
 ¹ Native `vram_peek` is the legacy name; DS calls it `read_vram`. Same semantics.  
 ² The `pc_*` family is specific to the DS oracle: DuckStation's CPU core honours `CPU::AddBreakpointWithCallback`, while our native runtime dispatches whole recompiled functions (no mid-function PC breaks).
@@ -540,7 +543,19 @@ the new value; that round-trip is the test contract (see
 `tests/test_overlay_widgets.py`).
 
 - `{"cmd":"overlay_widget_action","name":"texfilter","value":1}` → applies
-  bilinear texture filter (same path as the "Texture filter" checkbox).
+  bilinear scene texture filtering (same path as the debug-menu selector).
+- `{"cmd":"overlay_widget_action","name":"spritefilter","value":1}` → applies
+  bilinear sampling to Native sprites/UI independently of scene textures
+  (same path as the debug-menu selector).
+- `{"cmd":"texture_filter_strength","value":50}` → half the Native scene
+  bilinear contribution. Values 0, 25 (the default), 50, 75 and 100 let you compare the
+  same scene without changing sprite/UI filtering; omit `value` to query.
+- `{"cmd":"anisotropy","value":8}` → up to 8 directional texture samples
+  on minified, angled Native 3D surfaces. Set 0 to switch it Off without
+  changing Nearest/Bilinear or sprite filtering; omit `value` to query.
+- `{"cmd":"overlay_widget_action","name":"debug_mipmaps","value":1}` →
+  the same debug-only checkbox as **Generate texture mipmaps (experimental)**.
+  `mipmap_diag` queries cache activity; value 0 turns it off.
 - `{"cmd":"overlay_widget_action","name":"native_wide","value":2}` →
   engages native-wide (2), squash (1), or off (0). Same path as the
   Native-wide radio / buttons.

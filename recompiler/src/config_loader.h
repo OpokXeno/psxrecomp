@@ -366,6 +366,10 @@ struct RuntimeConfig {
     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
+    // Independent sampling for sprite/UI art (nearest by default).
+    int                   video_sprite_filter = 0;
+    // Native 3D scene directional texture sampling: 0=off, 2/4/8/16x.
+    int                   video_anisotropic_filtering = 0;
 
     // renderer: "software" | "opengl" (default) | "vulkan". Selects the
     // rasterizer/present backend. The software rasterizer remains the explicit
@@ -1186,6 +1190,8 @@ struct UserSettings {
     bool has_antialiasing   = false; int antialiasing = 1;
     bool has_antialiasing_factor = false; int antialiasing_factor = 4;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    bool has_sprite_filter = false; int sprite_filter = 0; // 0=nearest,1=bilinear
+    bool has_anisotropic_filtering = false; int anisotropic_filtering = 0; // 0,2,4,8,16
     // Sub-pixel vertex precision / perspective-correct UVs (see RuntimeConfig).
     // Both default off — the faithful floor — and are player-selectable.
     bool has_geometry_correction   = false; bool geometry_correction   = false;

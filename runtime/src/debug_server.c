@@ -14994,6 +14994,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "],\"gpu\":{\"submitted\":%llu,\"completed\":%llu,\"applied\":%llu,"
         "\"cancelled\":%llu,\"geometry_draws\":%llu,\"transfer_draws\":%llu,"
         "\"commands\":%llu,\"captured_bytes\":%llu,\"readback_bytes\":%llu,"
+        "\"filter_draws\":[[%llu,%llu],[%llu,%llu]],"
         "\"service_ns\":%llu,\"submit_ns\":%llu,\"finish_ns\":%llu,\"service_max_ns\":%llu,\"hash_ns\":%llu,"
         "\"fence_polls\":%llu,\"fence_pending\":%llu,\"fence_latency_ns\":%llu,\"fence_latency_max_ns\":%llu,"
         "\"timed_work\":%llu,\"gpu_render_ns\":%llu,\"gpu_readback_ns\":%llu,\"gpu_max_ns\":%llu,"
@@ -15010,6 +15011,10 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (unsigned long long)compiler.gpu.commands,
         (unsigned long long)compiler.gpu.captured_bytes,
         (unsigned long long)compiler.gpu.readback_bytes,
+        (unsigned long long)compiler.gpu.filter_draws[0][0],
+        (unsigned long long)compiler.gpu.filter_draws[0][1],
+        (unsigned long long)compiler.gpu.filter_draws[1][0],
+        (unsigned long long)compiler.gpu.filter_draws[1][1],
         (unsigned long long)compiler.gpu.service_ns,
         (unsigned long long)compiler.gpu.submit_ns,
         (unsigned long long)compiler.gpu.finish_ns,
@@ -17831,6 +17836,46 @@ static void handle_overlay_widget_action(int id, const char *json)
     }
 }
 
+/* Native scene texture-filter strength (temporary live A/B control). Query by
+ * omitting value; 0 follows nearest exactly, 100 is the normal bilinear path. */
+static void handle_texture_filter_strength(int id, const char *json)
+{
+    const int value = json_get_int(json, "value", -1);
+    if (value < -1 || value > 100) {
+        send_err(id, "value must be 0..100");
+        return;
+    }
+    if (value >= 0) gl_renderer_set_scene_filter_strength(value);
+    send_fmt("{\"id\":%d,\"ok\":true,\"value\":%d}\n", id,
+             gl_renderer_scene_filter_strength());
+}
+
+/* Independent Native 3D texture quality, with live readback. */
+static void handle_anisotropy(int id, const char *json)
+{
+    const int value = json_get_int(json, "value", -1);
+    if (value != -1 && value != 0 && value != 2 && value != 4 &&
+        value != 8 && value != 16) {
+        send_err(id, "value must be 0, 2, 4, 8 or 16");
+        return;
+    }
+    if (value >= 0) gl_renderer_set_anisotropy(value);
+    send_fmt("{\"id\":%d,\"ok\":true,\"value\":%d}\n", id,
+             gl_renderer_anisotropy());
+}
+
+static void handle_mipmap_diag(int id, const char *json)
+{
+    GlRendererDebugMipmapDiagnostics d = {0};
+    (void)json;
+    gl_renderer_debug_mipmap_diagnostics(&d);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"resident\":%d,"
+             "\"uploads\":%d,\"revalidations\":%d,\"hits\":%d,"
+             "\"invalidations\":%d,\"bound_draws\":%d}\n", id,
+             d.enabled, d.resident, d.uploads, d.revalidations,
+             d.hits, d.invalidations, d.bound_draws);
+}
+
 static const CmdEntry s_commands[] = {
     { "phase_profile",     handle_phase_profile },
     { "starv_ring",        handle_starv_ring },
@@ -17842,6 +17887,9 @@ static const CmdEntry s_commands[] = {
     { "overlay_capture_state", handle_overlay_capture_state },
     { "overlay_force_capture", handle_overlay_force_capture },
     { "overlay_widget_action", handle_overlay_widget_action },
+    { "texture_filter_strength", handle_texture_filter_strength },
+    { "anisotropy", handle_anisotropy },
+    { "mipmap_diag", handle_mipmap_diag },
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
     { "hd_textures",       handle_hd_textures },

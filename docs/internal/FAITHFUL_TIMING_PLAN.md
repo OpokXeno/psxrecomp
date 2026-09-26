@@ -212,6 +212,156 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-09-26 — Native texture and sprite filtering
+
+Restored the nearest/bilinear selector on Native presentation draws and added
+an independent sprite/UI selector, with family classification, launcher and
+`settings.toml` plumbing. Canonical guest VRAM remains unfiltered. The runtime
+build succeeds; OpenGL context initialization succeeds. This is a host visual
+enhancement and makes no changes to the guest cycle/timing model.
+Follow-up: the GL worker's independent semantic-to-draw conversion had dropped
+the sprite class, and uncaptured GP0 SPRT / resident font draws lacked a tag.
+Both now preserve/derive that class. A live `native_pipeline_diag` session
+observed VIEW draw counts in both scene-bilinear and sprite-bilinear buckets
+after independent toggles; the player visually confirmed the separation.
+Review of bilinear strength found that the Native GPU shader derived its tap
+weights from integer DDA UVs rather than the continuous interpolated UV used
+by the earlier GL and CPU paths. At 4x every sample mixed 39.0625% of its
+previous neighbour along each axis; the correct per-subpixel weights are
+37.5%, 12.5%, 12.5%, 37.5% (toward the respective neighbouring texel). The
+shader now keeps integer DDA for coverage/STP and uses the continuous UV for
+weights. This changes presentation only, not canonical guest VRAM or timing.
+
+Follow-up on visible polygon edges: the continuous vertex UV was a different
+interpolant from the PS1 DDA used for the base texel. For reversed mappings at
+4x, it could even choose the opposite neighbour: an example with U=5→4 gives
+four base samples at U=5, but the old weight direction is −,+,+,− instead of
+the DDA phase's +,+,−,−. The Native GPU shader and CPU reference now take the
+fractional weight from the same unrounded attribute accumulator as the base
+texel (integer Q12 DDA or fractional plane), retaining nearest coverage/STP.
+Build and a 4x phase calculation pass; a live Native GPU diagnostic exercised
+32,292 scene-bilinear draws and 0 sprite-bilinear draws. User requested no
+further screenshots, so the reported edge appearance is not visually confirmed
+resolved. Distinguish UV seams from polygon silhouette edges before further
+filter adjustments.
+The user localized the report to a pale line between adjoining faces on a
+green floor in a Field map, not World-map terrain or an object's silhouette.
+Field model FT4s split into two triangles and use this same Native filter;
+adjacent faces can also have independent texture regions. The DDA-phase fix
+has not yet been player-checked in that Field scene. Do not replace the
+per-primitive UV clamp with unrestricted atlas sampling merely on this report:
+that could mix unrelated neighbouring artwork. First confirm whether the
+line persists with the updated build in the identified Field and whether
+both sides share the same texture page/CLUT and continuous UVs.
+The user then reported the same prominent face boundaries on World terrain,
+and requested no replay while playing there. Read-only live TCP diagnostics
+confirmed 259,148 scene-bilinear Native GPU draws in two seconds (zero scene
+nearest), 4,396 emitted terrain triangles, zero shared-raster conflicts, and
+zero mesh native-vertex conflicts. World ground maps independent 16x16 atlas
+cells (`xg_world_terrain_water.c::make_uv`), so per-triangle UV clamps can
+repeat border texels instead of filtering across adjoining cell artwork.
+That structural fact does not by itself prove the pale line's source; ask
+whether the line disappears entirely on Nearest at the same camera position
+before changing the filter or assuming there is a geometry crack. No replay
+or captures were taken for this World observation.
+The user reports that the pale line is still present but much less noticeable
+with Nearest. This is consistent with an existing source seam being broadened
+by bilinear weights rather than bilinear inventing a new polygon boundary.
+The current shader's positive renormalized weights cannot brighten beyond the
+sampled texels; the actual border texel colours versus uncovered background
+remain unmeasured. Do not conflate the zero shared-vertex conflicts with a
+proof of zero subpixel raster gaps. The next correction needs a concrete
+source-versus-filter discriminator, without unsolicited captures or replay.
+At the user's request, added a temporary Native scene bilinear-strength A/B
+control over TCP (`texture_filter_strength`, integer 0..100). At 100 the shader
+uses its unchanged bilinear result; at 0 the shader and CPU compiler take the
+exact nearest branch; intermediate values blend filtered RGB555 toward the
+nearest texel before modulation/quantization. Coverage, STP, sprite/UI
+filtering, and canonical VRAM remain unchanged. The atomic setting defaults
+to 100 for each launch and only affects future Native VIEW draws. Runtime
+build and `git diff --check` pass; an isolated headless process on port 4371
+confirmed query/set for 100/50/0 and rejection of 101. The already running
+game process cannot load the new TCP command until restarted. No captures or
+replay were used for this control. The player subsequently compared 0, 10,
+20, 25 and 50 percent live and chose 25 percent as the permanent launch
+default; the TCP command continues to override it for the current process.
+
+### 2026-09-26 — Native scene anisotropic filtering
+
+Added an independent Off/2x/4x/8x/16x quality selector for Native 3D scene
+textures. The PS1 atlas is sampled manually, so a GL sampler anisotropy switch
+alone would not affect it. The GPU and CPU Native paths now derive the major
+axis and aspect ratio from the texel-space UV Jacobian (perspective derivatives
+where applicable, unwrapped PS1 affine attribute gradients otherwise). For an
+elongated minified footprint they take up to the selected number of point
+samples with Nearest, or bilinear samples with Bilinear, along that axis, with
+the same per-primitive atlas bounds and CLUT lookup (and transparent-texel
+colour renormalization for bilinear taps). The closest guest texel remains
+the authority for coverage/STP. The selected scene bilinear strength still
+blends bilinear RGB with nearest (25% by default), not the point-sampled
+anisotropic path. Sprite/UI and canonical guest VRAM paths are unaffected;
+Off and isotropic footprints use the existing nearest/bilinear path. At this
+stage there were no guest mipmaps; this integrated the major axis of the
+actual high-resolution sample footprint rather than relying on sampler state.
+
+The independent option is wired through the PSX launcher and `settings.toml`
+(`anisotropic_filtering = 0|2|4|8|16`), debug overlay, and a live query/set TCP
+command. Off is the default. `psx-runtime` builds; an isolated SDL offscreen
+OpenGL session linked the shader, accepted 16x and rejected invalid 3x, and
+processed 7,500 scene-bilinear draws without a GL compile error. A numerical
+Jacobian check gives 1 sample for isotropic and magnified footprints, 4 for a
+4:1 axis-aligned minification, and 5 for nearly parallel gradients. No replay
+or screenshots were used. Visual and performance judgment on an angled 3D
+scene remains with the player after relaunch.
+The user correctly pointed out that anisotropy need not require bilinear.
+Native GPU and CPU now use directional point taps with Nearest (or with
+bilinear strength at zero), and bilinear taps plus the selected scene strength
+with Bilinear. The option remains independent. Guest-texture mipmap generation
+was considered but not added: the PS1 has no mipmaps, and generating them by
+default would change the authored look. If later wanted as an optional visual
+enhancement, the indexed atlas would need CLUT-decoded, per-region,
+transparency-aware levels with invalidation on VRAM writes; generating mipmaps
+on the raw packed VRAM texture would mix unrelated artwork. Existing HD
+replacement packs already have their own mip chains.
+After the Nearest decoupling, `psx-runtime` builds and an isolated SDL offscreen
+OpenGL run accepted anisotropy=8 with scene texture filtering set to Nearest.
+The Native GPU shader linked and processed 5,580 nearest scene draws (0
+bilinear draws) without a shader error. No replay, screenshots, or player's
+running process were used. The player will judge the visual outcome.
+
+### 2026-09-26 — Experimental runtime mipmaps in the debug menu
+
+At the user's explicit request, added a separate **Generate texture mipmaps
+(experimental)** debug-overlay checkbox, Off by default and absent from
+launcher/settings. This is an optional Native GPU presentation enhancement,
+not PS1-authentic texture sampling. Mip levels are built lazily from CLUT-
+decoded, transparency-premultiplied texels within the draw's own UV bounds,
+then cached by page/depth/CLUT/bounds. The owner follows its exact FIFO word
+shadow: relevant WORDS writes dirty dependent cached regions or palette rows;
+an initial snapshot change revalidates the decoded content hash on first use.
+The nearest guest texel remains authoritative for cutout and STP; mip levels
+contribute RGB only. Anisotropic samples use the minor-axis mip level, while
+isotropic minification uses the major-axis level. Nearest samples point texels
+at the selected level, Bilinear uses trilinear mip sampling and still honours
+the 25% scene strength. Texture-window mappings and sprite/UI bypass this
+experimental cache. HD replacements keep their existing independent mipmaps.
+
+`psx-runtime` builds. An isolated offscreen OpenGL run with the checkbox On
+processed 5,580 mip-bound scene draws, with 23 mip uploads, 334 unchanged
+content revalidations, 5,223 cache hits, 355 dirty invalidations and 7 live
+cache entries. No screenshots or replay were used; visual quality remains for
+the player to judge after restarting.
+The final build conservatively bypasses mip generation for a full 256-texel
+UV range, which can represent a wrapped atlas mapping rather than one image.
+Another isolated OpenGL run confirmed Off starts with 0 resident textures,
+On produced 7 resident / 23 uploads / 4,652 mip-bound draws, and Off again
+released the cache to 0 resident without further mip-bound draws. No image
+captures or replay were involved.
+A separate offscreen GL run with scene Nearest, anisotropy 8x, and debug
+mipmaps On processed 4,844 nearest scene draws with 4,844 mip-bound draws,
+23 mip uploads, and no bilinear scene draws. Thus both Nearest and Bilinear
+mode shaders use the optional cache. No image captures or replay were used.
+
 ### 2026-09-16 — Combat readback stall; residual Native wobble remains open
 
 Used `build-dbg/input-replay-20260916-113133.toml` (4,558 VBlanks), Native/OpenGL,

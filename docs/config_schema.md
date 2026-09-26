@@ -464,6 +464,9 @@ offer_vulkan = false      # show Vulkan in the launcher only after game validati
 fps = 30                  # 30 = original cadence; 60 = Native interpolation
 auto_skip_fmv = false     # legacy Settings/runtime default
 offer_skip_fmv = true     # false when the game exposes this through Mods
+texture_filtering = "nearest" # scene surfaces: "nearest" or "bilinear"
+sprite_filtering = "nearest"  # sprite/UI art, independently selectable
+anisotropic_filtering = 0     # Native 3D scene textures: 0 (Off), 2, 4, 8, 16
 ```
 
 `renderer = "vulkan"` remains an experimental runtime choice and still requires
@@ -475,6 +478,28 @@ Vulkan after validating their visuals and stability.
 Native interpolation presentation path while preserving guest VBlank, input,
 and audio timing. The launcher persists the same `fps = 30|60` value in
 `settings.toml`; it exposes no separate interpolation toggle.
+
+`texture_filtering` and `sprite_filtering` select nearest or bilinear sampling
+for Native scene textures and sprite/UI art independently. Both default to
+`nearest` and may be overridden in `settings.toml` or via the launcher. Native
+presentation applies these filters after guest VRAM rendering, so changing them
+does not alter the game's VRAM content.
+`anisotropic_filtering` is an independent Native OpenGL 3D scene quality setting,
+defaulting to Off. It takes up to 2/4/8/16 samples along the elongated
+texel-space footprint of an angled/minified surface: point samples with
+`texture_filtering = "nearest"`, bilinear samples with `"bilinear"`.
+The 25% scene bilinear strength affects only the latter. Sprites/UI and
+canonical guest VRAM are unaffected. This manually samples the PS1 atlas
+within each primitive's UV limits, rather than relying on OpenGL's sampler
+anisotropy. The debug-only mipmap experiment below is separate.
+
+The experimental **Generate texture mipmaps** checkbox is available only in
+the Native debug overlay. It defaults to Off and has no `[video]` or launcher
+setting. When enabled, the Native GPU builds mip levels on demand from the
+CLUT-decoded texels within each 3D primitive's sampled UV rectangle, and
+revalidates affected entries when guest VRAM changes. It filters presentation
+RGB only; guest coverage, STP and VRAM remain unmodified. Texture-window
+mappings and sprite/UI draws retain their existing sampling paths.
 
 `offer_skip_fmv` defaults to true for compatibility with the shared PSX
 Settings surface. A game migrating Skip FMVs into its built-in mod catalog sets

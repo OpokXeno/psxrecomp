@@ -284,6 +284,9 @@ typedef struct GlRendererNativeGpuDiagnostics {
     uint64_t timed_work, gpu_render_ns, gpu_readback_ns, gpu_max_ns;
     uint64_t word_uploads, snapshot_commands;
     uint64_t destination_barriers, destination_copies;
+    /* VIEW textured triangles by semantic class (scene/sprite) and selected
+     * sampling mode (nearest/bilinear). Guest VRAM draws are excluded. */
+    uint64_t filter_draws[2][2];
     /* Destination reads that needed no barrier (no write overlapped them). */
     uint64_t skipped_barriers;
     /* Native depth test on the GPU: triangles depth-tested, and samples that
@@ -617,6 +620,25 @@ void gl_renderer_set_cpu_auth_dual(int on);
 
 /* Live host AA selection: Off/FXAA/SMAA/TAA/MSAA/SSAA (0..5). */
 void gl_renderer_set_antialiasing(int mode);
+/* Native sprite/UI texels use an independent nearest/bilinear selector. */
+void gl_renderer_set_sprite_filter(int bilinear);
+int  gl_renderer_sprite_filter(void);
+/* Native scene bilinear strength, 0..100%. Live/debug-only visual control;
+ * 100 is the normal filter, 0 renders the exact nearest path. */
+void gl_renderer_set_scene_filter_strength(int percent);
+int  gl_renderer_scene_filter_strength(void);
+/* Native 3D scene texture footprint, independent of nearest/bilinear and
+ * sprite/UI filtering: 0 (off), 2, 4, 8 or 16 directional samples. */
+void gl_renderer_set_anisotropy(int samples);
+int  gl_renderer_anisotropy(void);
+/* Debug-only presentation enhancement. Disabled by default; decoded mipmaps
+ * are generated on demand per sampled UV rectangle and CLUT. */
+void gl_renderer_set_debug_mipmaps(int enabled);
+int  gl_renderer_debug_mipmaps(void);
+typedef struct GlRendererDebugMipmapDiagnostics {
+    int enabled, resident, uploads, revalidations, hits, invalidations, bound_draws;
+} GlRendererDebugMipmapDiagnostics;
+void gl_renderer_debug_mipmap_diagnostics(GlRendererDebugMipmapDiagnostics *out);
 void gl_renderer_set_antialiasing_factor(int factor);
 int  gl_renderer_cpu_auth_dual(void);
 

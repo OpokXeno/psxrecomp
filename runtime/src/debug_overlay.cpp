@@ -1127,6 +1127,8 @@ static void draw_gpu_state_section(void)
 
     ImGui::Text("Texture filter  : %s",
                 texfilter_label(gr_texture_filter()));
+    ImGui::Text("Sprite filter   : %s",
+                texfilter_label(gl_renderer_sprite_filter()));
 
     /* Same accessors the TCP gpu_state handler uses (gpu.h). Display comes
      * straight from the CRTC registers: 320x216 is genuine (worldmap modes
@@ -1413,6 +1415,31 @@ static void draw_toggles_section(void)
         ImGui::SetTooltip("Window resolution; height follows the configured"
                           " aspect ratio.");
     }
+
+    static const char *kTextureFilters[] = { "Nearest", "Bilinear" };
+    int texture_filter = gr_texture_filter();
+    if (ImGui::Combo("Texture filtering", &texture_filter, kTextureFilters, 2))
+        (void)psx_debug_overlay_widget_action("texfilter", texture_filter, 0);
+    int sprite_filter = gl_renderer_sprite_filter();
+    if (ImGui::Combo("Sprite filtering", &sprite_filter, kTextureFilters, 2))
+        (void)psx_debug_overlay_widget_action("spritefilter", sprite_filter, 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Independent sampling for Native sprites and UI art.");
+    static const char *kAnisotropyLabels[] = {"Off", "2x", "4x", "8x", "16x"};
+    static const int kAnisotropyValues[] = {0, 2, 4, 8, 16};
+    const int anisotropy = gl_renderer_anisotropy();
+    int aniso_index = 0;
+    for (int i = 1; i < 5; ++i)
+        if (anisotropy == kAnisotropyValues[i]) aniso_index = i;
+    if (ImGui::Combo("Anisotropic filtering", &aniso_index, kAnisotropyLabels, 5))
+        (void)psx_debug_overlay_widget_action("anisotropy", kAnisotropyValues[aniso_index], 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Angled 3D scene textures; works with Nearest or Bilinear. Sprite/UI art is unaffected.");
+    bool mipmaps = gl_renderer_debug_mipmaps() != 0;
+    if (ImGui::Checkbox("Generate texture mipmaps (experimental)", &mipmaps))
+        (void)psx_debug_overlay_widget_action("debug_mipmaps", mipmaps ? 1 : 0, 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Native 3D textures only. Builds CLUT-decoded mip levels per UV region; guest VRAM stays unchanged.");
 
     static const char *kAAModes[] = {"SSAA", "MSAA", "TAA", "SMAA", "FXAA", "Off"};
     static const int kAAModeValues[] = {5, 4, 3, 2, 1, 0};
@@ -5183,6 +5210,20 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
      * contract. */
     if (std::strcmp(name, "texfilter") == 0) {
         gr_set_texture_filter(value ? 1 : 0);
+        return 0;
+    }
+    if (std::strcmp(name, "spritefilter") == 0) {
+        gl_renderer_set_sprite_filter(value ? 1 : 0);
+        return 0;
+    }
+    if (std::strcmp(name, "anisotropy") == 0) {
+        if (value != 0 && value != 2 && value != 4 && value != 8 && value != 16)
+            return -2;
+        gl_renderer_set_anisotropy(value);
+        return 0;
+    }
+    if (std::strcmp(name, "debug_mipmaps") == 0) {
+        gl_renderer_set_debug_mipmaps(value != 0);
         return 0;
     }
     if (std::strcmp(name, "native_wide") == 0) {

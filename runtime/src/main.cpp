@@ -1582,6 +1582,8 @@ extern "C" int psx_video_get_scanlines(float *strength) {
 }
 
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
+static int           g_video_spritefilter = 0; /* sprite/UI sampling */
+static int           g_video_anisotropy = 0; /* Off, 2x, 4x, 8x, 16x; 3D scene */
 /* Sub-pixel vertex precision + perspective-correct UVs (PGXP-style). Visual
  * only: the PS1-visible GTE SXY FIFO stays integer, so guest-side culling and
  * SXY readback are untouched. Default off = the faithful floor. */
@@ -14587,6 +14589,8 @@ int main(int argc, char** argv) {
             g_video_aa         = gc.runtime.video_antialiasing;
             g_video_aa_factor  = gc.runtime.video_antialiasing_factor;
             g_video_texfilter  = gc.runtime.video_texture_filter;
+            g_video_spritefilter = gc.runtime.video_sprite_filter;
+            g_video_anisotropy = gc.runtime.video_anisotropic_filtering;
             g_video_geometry_correction   =
                 gc.runtime.video_geometry_correction ? 1 : 0;
             g_video_perspective_texturing =
@@ -15286,6 +15290,8 @@ int main(int argc, char** argv) {
         if (us.has_antialiasing_factor) g_video_aa_factor = us.antialiasing_factor;
         if (g_video_aa == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+        if (us.has_sprite_filter) g_video_spritefilter = us.sprite_filter;
+        if (us.has_anisotropic_filtering) g_video_anisotropy = us.anisotropic_filtering;
         if (us.has_geometry_correction)
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
@@ -15853,6 +15859,9 @@ int main(int argc, char** argv) {
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
             seed.antialiasing_factor = g_video_aa_factor; seed.has_antialiasing_factor = true;
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
+            seed.sprite_filter = g_video_spritefilter;    seed.has_sprite_filter = true;
+            seed.anisotropic_filtering = g_video_anisotropy;
+            seed.has_anisotropic_filtering = true;
             /* Seeded (and marked present) so a launcher save round-trips the
              * player's hand-edited value instead of dropping the key. */
             seed.geometry_correction = (g_video_geometry_correction != 0);
@@ -16055,6 +16064,8 @@ int main(int argc, char** argv) {
             ls.antialiasing       = seed.antialiasing;
             ls.antialiasing_factor = seed.antialiasing_factor;
             ls.texture_filter     = seed.texture_filter;
+            ls.sprite_filter      = seed.sprite_filter;
+            ls.anisotropic_filtering = seed.anisotropic_filtering;
             ls.geometry_correction   = seed.geometry_correction ? 1 : 0;
             ls.perspective_texturing = seed.perspective_texturing ? 1 : 0;
             ls.dither_force_off = seed.dithering ? 0 : 1;
@@ -16326,6 +16337,9 @@ int main(int argc, char** argv) {
                  * is the legacy fallback field for consoles without the cap and is
                  * left unused here. */
                 seed.texture_filter = ls.texture_filter ? 1 : 0; seed.has_texture_filter = true;
+                seed.sprite_filter = ls.sprite_filter ? 1 : 0; seed.has_sprite_filter = true;
+                seed.anisotropic_filtering = ls.anisotropic_filtering;
+                seed.has_anisotropic_filtering = true;
                 {
                     const int n = std::min(PSX_MAX_PLAYERS, RECOMP_LAUNCHER_MAX_PLAYERS);
                     const int un = std::min(n, PSXRecompV4::UserSettings::kMaxControllerPlayers);
@@ -16617,6 +16631,8 @@ int main(int argc, char** argv) {
                 g_video_aa_factor = seed.antialiasing_factor;
                 if (g_video_aa == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
                 g_video_texfilter = seed.texture_filter;
+                g_video_spritefilter = seed.sprite_filter;
+                g_video_anisotropy = seed.anisotropic_filtering;
                 g_video_geometry_correction   = seed.geometry_correction ? 1 : 0;
                 g_video_perspective_texturing = seed.perspective_texturing ? 1 : 0;
                 g_video_dithering     = seed.dithering ? 1 : 0;
@@ -17062,6 +17078,8 @@ session_reboot:
     if (!g_native_render_selected)
         g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     gr_set_texture_filter(g_video_texfilter);
+    gl_renderer_set_sprite_filter(g_video_spritefilter);
+    gl_renderer_set_anisotropy(g_video_anisotropy);
     /* Sub-pixel vertex precision + perspective-correct UVs. Both default off;
      * with both off every setter below leaves the tracking caches disabled and
      * the draw path is the faithful integer one, unchanged. */
@@ -17121,11 +17139,12 @@ session_reboot:
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
-    if (g_video_scale > 1 || g_video_texfilter)
+    if (g_video_scale > 1 || g_video_texfilter || g_video_spritefilter)
         std::fprintf(stdout,
-                     "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
+                     "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s, sprite filter %s)\n",
                      g_video_scale, g_video_aa ? "on" : "off",
-                     g_video_texfilter ? "bilinear" : "nearest");
+                     g_video_texfilter ? "bilinear" : "nearest",
+                     g_video_spritefilter ? "bilinear" : "nearest");
     if (g_video_screen != 0)
         std::fprintf(stdout, "psxrecomp: screen-colour model %s\n",
                      g_video_screen == 1 ? "crt" : g_video_screen == 2 ? "composite"
@@ -18462,6 +18481,8 @@ soft_return_lobby:
         ls.antialiasing = g_video_aa;
         ls.antialiasing_factor = g_video_aa_factor;
         ls.texture_filter = g_video_texfilter;
+        ls.sprite_filter = g_video_spritefilter;
+        ls.anisotropic_filtering = g_video_anisotropy;
         ls.geometry_correction = g_video_geometry_correction ? 1 : 0;
         ls.perspective_texturing = g_video_perspective_texturing ? 1 : 0;
         ls.dither_force_off = g_video_dithering ? 0 : 1;
@@ -18815,6 +18836,10 @@ soft_return_lobby:
                 us.has_antialiasing_factor = true;
                 us.texture_filter = ls.texture_filter;
                 us.has_texture_filter = true;
+                us.sprite_filter = ls.sprite_filter;
+                us.has_sprite_filter = true;
+                us.anisotropic_filtering = ls.anisotropic_filtering;
+                us.has_anisotropic_filtering = true;
                 us.geometry_correction = ls.geometry_correction != 0;
                 us.has_geometry_correction = true;
                 us.perspective_texturing = ls.perspective_texturing != 0;
@@ -18888,6 +18913,11 @@ soft_return_lobby:
             psx_video_set_antialiasing(ls.antialiasing);
             psx_video_set_antialiasing_factor(ls.antialiasing_factor);
             g_video_texfilter = ls.texture_filter;
+            g_video_spritefilter = ls.sprite_filter;
+            g_video_anisotropy = ls.anisotropic_filtering;
+            gr_set_texture_filter(g_video_texfilter);
+            gl_renderer_set_sprite_filter(g_video_spritefilter);
+            gl_renderer_set_anisotropy(g_video_anisotropy);
             g_video_geometry_correction = ls.geometry_correction ? 1 : 0;
             g_video_perspective_texturing = ls.perspective_texturing ? 1 : 0;
             g_video_dithering = ls.dither_force_off ? 0 : 1;
