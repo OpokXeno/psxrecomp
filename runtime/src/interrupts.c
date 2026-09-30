@@ -481,8 +481,15 @@ void psx_spu_sample_event_service(void) {
     }
 }
 
+static void (*s_vblank_mod_hook)(void);
+
+void psx_mod_set_vblank_entry_hook(void (*hook)(void)) {
+    s_vblank_mod_hook = hook;
+}
+
 static void fire_vblank_edge(void) {
     if (s_vblank_host_hook) s_vblank_host_hook();
+    if (s_vblank_mod_hook) s_vblank_mod_hook();
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */
