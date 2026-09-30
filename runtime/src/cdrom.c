@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #ifndef _WIN32
 #  include <signal.h>
 #endif
@@ -431,6 +432,43 @@ static uint64_t s_warm_route_mismatches;
 static uint64_t s_warm_route_sectors;
 static uint64_t s_warm_route_consumer_waits;
 static uint64_t s_warm_route_consumer_wait_cycles;
+static CDROMDataReadPolicy s_data_read_policy;
+static CDROMDataReadRange s_data_read_range;
+static _Atomic int s_data_read_enabled = 1;
+static int s_data_read_last_enabled = 1;
+
+int cdrom_data_read_policy_available(void) { return s_data_read_policy != NULL; }
+int cdrom_data_read_policy_enabled(void) {
+    return atomic_load_explicit(&s_data_read_enabled, memory_order_relaxed);
+}
+void cdrom_set_data_read_policy_enabled(int enabled) {
+    atomic_store_explicit(&s_data_read_enabled, enabled != 0, memory_order_relaxed);
+}
+
+void cdrom_set_data_read_policy(CDROMDataReadPolicy policy) {
+    s_data_read_policy = policy;
+    s_data_read_range = (CDROMDataReadRange){0};
+}
+
+static int data_read_policy_rate(void) {
+    int enabled = cdrom_data_read_policy_enabled();
+    if (enabled != s_data_read_last_enabled) {
+        s_data_read_range = (CDROMDataReadRange){0};
+        s_data_read_last_enabled = enabled;
+    }
+    if (!enabled || !s_data_read_policy || xa_stream_active || (mode_reg & 0x48u))
+        return 0;
+    const int lba = (read_min * 60 + read_sec) * 75 + read_sect - 150;
+    if (lba < s_data_read_range.first_lba || lba >= s_data_read_range.end_lba) {
+        s_data_read_range = s_data_read_policy(lba);
+        if (s_data_read_range.first_lba > lba ||
+            s_data_read_range.end_lba <= lba ||
+            s_data_read_range.sectors_per_frame < 0)
+            s_data_read_range = (CDROMDataReadRange){lba, lba + 1, 0};
+    }
+    int rate = s_data_read_range.sectors_per_frame;
+    return rate < 0 ? 0 : rate > 4096 ? 4096 : rate;
+}
 
 void cdrom_register_warm_route(int arm_lba, const int* lbas, int count,
                                int instant_max_per_frame) {
@@ -594,6 +632,12 @@ static int apply_read_speed(int delay) {
      * configure divisor=32 while every actual data-read deadline stayed 1x/2x. */
     if (xa_stream_active || (mode_reg & 0x48u)) return delay;
     if (s_warm_route_active) return warm_route_period();
+    int rate = data_read_policy_rate();
+    if (rate) {
+        int period = VBLANK_CYCLES_NTSC / rate;
+        if (period < CDROM_MIN_DELAY) period = CDROM_MIN_DELAY;
+        return period < delay ? period : delay;
+    }
     return apply_speed(delay);
 }
 
@@ -633,8 +677,9 @@ static void burst_note_sector(void) {
     b->end_ms    = ms;
     b->sectors++;
     const CDROMWarmRoute *route = warm_route_current();
-    b->rate    = (uint32_t)(route ? route->rate : g_instant_max_per_frame);
-    b->divisor = (uint32_t)(s_warm_route_active ? 0
+    int policy_rate = data_read_policy_rate();
+    b->rate    = (uint32_t)(route ? route->rate : policy_rate ? policy_rate : g_instant_max_per_frame);
+    b->divisor = (uint32_t)(s_warm_route_active || policy_rate ? 0
                                                 : g_disc_speed_divisor);
 }
 
@@ -1609,6 +1654,7 @@ static int read_continues_current_stream(void) {
 }
 
 static void start_read_stream(uint8_t cmd) {
+    s_data_read_range = (CDROMDataReadRange){0};
     cdda_playing = 0;
     cdda_track = 0;
     cdda_delay = 0;
@@ -2616,12 +2662,12 @@ static void process_pending(uint32_t cycles) {
 static uint64_t s_read_hold_cycles;
 static uint64_t s_read_hold_events;
 
-/* Route-only HLE producer/consumer handshake. Do not overwrite a cached
+/* Bounded asset/route HLE producer/consumer handshake. Do not overwrite a cached
  * sector or data-ready callback: make the next sector eligible only after the
  * guest consumes the FIFO and acknowledges the previous notification.
  * Multi-sector DMA may refill while its original data-ready IRQ is active. */
-static int warm_route_consumer_blocked(void) {
-    if (!s_warm_route_active) return 0;
+static int bounded_read_consumer_blocked(void) {
+    if (!s_warm_route_active && !data_read_policy_rate()) return 0;
     /* Tomba's raw-sector path intentionally consumes 12 header + 2048 data
      * bytes from a 2340-byte FIFO and leaves the final 280 bytes unread. The
      * IRQ ack (plus an inactive DMA channel), not sector_available, is the
@@ -2681,9 +2727,11 @@ static int accelerated_consumer_blocked(void) {
 static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
 
-    if (warm_route_consumer_blocked()) {
-        s_warm_route_consumer_waits++;
-        s_warm_route_consumer_wait_cycles += cycles;
+    if (bounded_read_consumer_blocked()) {
+        if (s_warm_route_active) {
+            s_warm_route_consumer_waits++;
+            s_warm_route_consumer_wait_cycles += cycles;
+        }
         return;
     }
 
@@ -2779,6 +2827,7 @@ static void present_pending_dataready(void) {
 }
 
 void cdrom_init(const char* cue_path) {
+    s_data_read_range = (CDROMDataReadRange){0};
     memset(param_fifo, 0, sizeof(param_fifo));
     memset(response_fifo, 0, sizeof(response_fifo));
     memset(s_sector_ring, 0, sizeof(s_sector_ring));
@@ -3036,7 +3085,7 @@ uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
         if (d < best) best = d;
     }
     /* Active sector read: next data-ready in read_delay cycles. */
-    if (reading && !warm_route_consumer_blocked() &&
+    if (reading && !bounded_read_consumer_blocked() &&
         read_delay > 0 && (uint32_t)read_delay < best)
         best = (uint32_t)read_delay;
     return best;
@@ -3458,6 +3507,8 @@ int cdrom_snapshot_read(const uint8_t *p, uint32_t len) {
     pst_r_init(&r, p, len);
     if (!cdrom_snap_parse(&r))
         return 0;
+    /* Reclassify against restored RAM on the next emulation-thread read. */
+    s_data_read_range = (CDROMDataReadRange){0};
     /* Absolute host deadlines are not on the wire — rebuild from restored
      * relative read_delay (psx_cycle_count is resynced by the load caller). */
     cdrom_resync_deadlines_after_restore();

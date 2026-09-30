@@ -5788,6 +5788,7 @@ static void handle_cdrom_state(int id, const char *json)
              "\"request\":\"0x%02X\","
              "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
              "\"mode\":\"0x%02X\","
+             "\"fast_map_load_available\":%d,\"fast_map_load\":%d,"
              "\"param_count\":%d,\"response_read\":%d,\"response_count\":%d,"
              "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
              "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
@@ -5805,6 +5806,7 @@ static void handle_cdrom_state(int id, const char *json)
              id, (unsigned long long)s.seq, s.has_disc,
              s.index_reg, s.stat_reg, s.request_reg, s.irq_enable, s.irq_flag,
              s.mode_reg,
+             cdrom_data_read_policy_available(), cdrom_data_read_policy_enabled(),
              s.param_count, s.response_read, s.response_count,
              s.sector_available, s.sector_read_pos, s.sector_size,
              s.reading, s.read_min, s.read_sec, s.read_sect,

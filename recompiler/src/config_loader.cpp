@@ -2477,6 +2477,9 @@ UserSettings load_user_settings(const fs::path& path) {
         // Deprecated and ignored: read only so the runtime can report that a
         // stale value was found (and so the next save drops it). Never applied
         // — see UserSettings::turbo_loads in config_loader.h.
+        if (v.contains("fast_map_load")) try_get([&]{
+            s.fast_map_load = toml::find<bool>(v, "fast_map_load"); s.has_fast_map_load = true;
+        });
         if (v.contains("turbo_loads")) try_get([&]{
             s.turbo_loads = toml::find<bool>(v, "turbo_loads"); s.has_turbo_loads = true;
         });
@@ -2827,6 +2830,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "scanline_strength = " << s.scanline_strength << "\n";
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
+    if (s.has_fast_map_load)
+        f << "fast_map_load     = " << (s.fast_map_load ? "true" : "false") << "\n";
     /* turbo_loads is deliberately NOT written back: it is deprecated and no
      * longer restored, so re-emitting it would preserve a dead row that looks
      * authoritative. Omitting it lets an existing settings.toml self-clean on

@@ -1665,6 +1665,22 @@ void psx_audio_set_spu_hq(int on)       {
     spu_shadow_set_enabled(on);
 }
 }
+static std::filesystem::path s_fast_map_settings_path;
+extern "C" int psx_fast_map_load_set(int enabled) {
+    if (!cdrom_data_read_policy_available()) return -1;
+    cdrom_set_data_read_policy_enabled(enabled);
+    if (s_fast_map_settings_path.empty()) return 0;
+    try {
+        auto settings = PSXRecompV4::load_user_settings(s_fast_map_settings_path);
+        if (settings.parse_error) return -2;
+        settings.fast_map_load = enabled != 0;
+        settings.has_fast_map_load = true;
+        return PSXRecompV4::save_user_settings(s_fast_map_settings_path, settings) ? 0 : -2;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "psxrecomp: cannot save Fast map load: %s\n", ex.what());
+        return -2;
+    }
+}
 /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
  * movie's per-movie total minus 3; writing the current movie's total down to
@@ -13892,6 +13908,7 @@ namespace {
         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
         gi->has_skip_fmv = skip_fmv_offered_b ? 1 : 0;
         gi->has_turbo_loads = turbo_loads_offered_b ? 1 : 0;
+        gi->has_fast_map_load = cdrom_data_read_policy_available();
         /* PGXP is framework-owned and configured outside the launcher. */
         gi->has_geometry_precision = 0;
         /* Master dithering on/off; a plain renderer toggle, unlike PGXP. */
@@ -15242,6 +15259,9 @@ int main(int argc, char** argv) {
 #endif
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
+        s_fast_map_settings_path = settings_path;
+        if (us.has_fast_map_load && cdrom_data_read_policy_available())
+            cdrom_set_data_read_policy_enabled(us.fast_map_load);
         user_settings_has_renderer = us.has_renderer;
         if (us.parse_error) {
             /* The file exists but is not valid TOML: every setting in it (the
@@ -15505,6 +15525,8 @@ int main(int argc, char** argv) {
      * The two Native interpolation environment variables remain diagnostic
      * overrides; normal configuration uses [video] fps = 30|60|120|240. Driver vsync
      * and wall-clock pacing remain mutually exclusive. */
+    if (const char *e = std::getenv("XG_FAST_MAP_READS"))
+        cdrom_set_data_read_policy_enabled(e[0] != '0');
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
@@ -15878,6 +15900,8 @@ int main(int argc, char** argv) {
             seed.has_auto_skip_fmv = skip_fmv_offered;
             seed.turbo_loads = (g_turbo_loads_enabled != 0);
             seed.has_turbo_loads = turbo_loads_offered;
+            seed.fast_map_load = cdrom_data_read_policy_enabled() != 0;
+            seed.has_fast_map_load = cdrom_data_read_policy_available() != 0;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = g_fullscreen;                seed.has_fullscreen = true;
@@ -16095,6 +16119,7 @@ int main(int argc, char** argv) {
                 normalize_hotkey_pad_binding(seed.hotkey_pad_fast_forward_toggle, 0);
             ls.auto_skip_fmv      = seed.auto_skip_fmv ? 1 : 0;
             ls.turbo_loads        = seed.turbo_loads ? 1 : 0;
+            ls.fast_map_load      = seed.fast_map_load ? 1 : 0;
             /* Localization: index of resolved_language within lang_menu_options
              * (match by code; games with no [runtime].languages list leave
              * lang_menu_options empty and this stays 0 / unused). */
@@ -16437,6 +16462,8 @@ int main(int argc, char** argv) {
                 seed.has_auto_skip_fmv = skip_fmv_offered;
                 seed.turbo_loads = ls.turbo_loads != 0;
                 seed.has_turbo_loads = turbo_loads_offered;
+                seed.fast_map_load = ls.fast_map_load != 0;
+                seed.has_fast_map_load = cdrom_data_read_policy_available() != 0;
                 host_volume_set(ls.volume);
                 /* Bundled-BIOS builds ignore any launcher-supplied path (the
                  * picker is hidden, but a stale settings file could still
@@ -16649,6 +16676,7 @@ int main(int argc, char** argv) {
                 g_auto_skip_fmv = skip_fmv_offered && seed.auto_skip_fmv ? 1 : 0;
                 g_turbo_loads_enabled =
                     turbo_loads_offered && seed.turbo_loads ? 1 : 0;
+                cdrom_set_data_read_policy_enabled(seed.fast_map_load);
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen;
@@ -18497,6 +18525,7 @@ soft_return_lobby:
         ls.spu_hq = g_audio_spu_hq ? 1 : 0;
         ls.auto_skip_fmv = (skip_fmv_offered && g_auto_skip_fmv) ? 1 : 0;
         ls.turbo_loads = (turbo_loads_offered && g_turbo_loads_enabled) ? 1 : 0;
+        ls.fast_map_load = cdrom_data_read_policy_enabled();
         ls.rewind_enabled = g_rewind_enabled;
         ls.rewind_depth = g_rewind_depth;
         ls.rewind_interval = g_rewind_interval;
@@ -18891,6 +18920,8 @@ soft_return_lobby:
                 us.has_auto_skip_fmv = skip_fmv_offered;
                 us.turbo_loads = ls.turbo_loads != 0;
                 us.has_turbo_loads = turbo_loads_offered;
+                us.fast_map_load = ls.fast_map_load != 0;
+                us.has_fast_map_load = cdrom_data_read_policy_available() != 0;
                 us.fullscreen = ls.fullscreen != 0;
                 us.has_fullscreen = true;
                 us.window_width = ls.window_width > 0 ? ls.window_width : g_video_win_w;
@@ -18939,6 +18970,7 @@ soft_return_lobby:
              * offered flags are false for both, so leave both globals alone. */
             if (skip_fmv_offered)     g_auto_skip_fmv = ls.auto_skip_fmv ? 1 : 0;
             if (turbo_loads_offered)  g_turbo_loads_enabled = ls.turbo_loads ? 1 : 0;
+            cdrom_set_data_read_policy_enabled(ls.fast_map_load);
             g_fullscreen = ls.fullscreen != 0;
             g_frame_interpolation = ls.frame_interp ? 1 : 0;
             g_frame_interpolation_fps = ls.frame_interp_fps;

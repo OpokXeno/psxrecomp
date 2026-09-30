@@ -38,6 +38,7 @@
 #include "debug_overlay.h"
 #include "debug_overlay_data.h"
 #include "memory.h"
+#include "cdrom.h"
 #include "overlay_capture.h"
 
 /* The vendored Dear ImGui lives at recomp-ui/src/third_party/imgui. Its
@@ -165,6 +166,7 @@ extern "C" int  psx_debug_display_aspect(int num, int den, int adaptive);
 extern "C" int  psx_video_set_aspect_runtime(int num, int den, int native_wide);
 extern "C" int  psx_video_set_display_stretch(int num, int den);
 extern "C" int  psx_video_get_display_stretch(int *num, int *den);
+extern "C" int  psx_fast_map_load_set(int enabled);
 extern "C" int  psx_audio_get_spu_hq(void);
 extern "C" void psx_audio_set_spu_hq(int on);
 extern "C" int  psx_video_get_native_depth_test(void);
@@ -1486,6 +1488,14 @@ static void draw_toggles_section(void)
         /* Full retarget (phase pool + presenter tick), not just the GL
          * denominator: the host period is what paces worker presents. */
         (void)psx_native_semantic_fps_set(targets[native_fps_index]);
+    }
+
+    if (cdrom_data_read_policy_available()) {
+        bool fast = cdrom_data_read_policy_enabled() != 0;
+        if (ImGui::Checkbox("Fast map load", &fast))
+            (void)psx_debug_overlay_widget_action("fast_map_load", fast ? 1 : 0, 0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Shorten map-loading waits while keeping gameplay and fades at their normal speed.");
     }
 
     bool tl = g_turbo_loads_enabled != 0;
@@ -5290,6 +5300,9 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     if (std::strcmp(name, "screen_model") == 0) {
         psx_video_set_screen_model(value);
         return 0;
+    }
+    if (std::strcmp(name, "fast_map_load") == 0) {
+        return psx_fast_map_load_set(value ? 1 : 0);
     }
     if (std::strcmp(name, "turbo_loads") == 0) {
         g_turbo_loads_enabled = value ? 1 : 0;

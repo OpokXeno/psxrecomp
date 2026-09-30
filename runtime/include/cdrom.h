@@ -47,6 +47,23 @@ void cdrom_register_warm_route(int arm_lba, const int* lbas, int count,
 void cdrom_warm_route_set_enabled(int enabled);
 void cdrom_warm_route_stats_json(char* out, int cap);
 
+/* Trusted title policy for bounded asset reads. Return a containing LBA range
+ * and sectors/VBlank (zero keeps authentic timing). The callback is read-only
+ * and derives its answer from
+ * restored guest state; no policy state is added to CD snapshots. XA/filter
+ * reads bypass it, and the route consumer handshake still protects each IRQ. */
+typedef struct CDROMDataReadRange {
+    int first_lba;
+    int end_lba; /* exclusive */
+    int sectors_per_frame;
+} CDROMDataReadRange;
+typedef CDROMDataReadRange (*CDROMDataReadPolicy)(int lba);
+void cdrom_set_data_read_policy(CDROMDataReadPolicy policy);
+int cdrom_data_read_policy_available(void);
+int cdrom_data_read_policy_enabled(void);
+/* Thread-safe UI switch; the emulation thread invalidates its cached range. */
+void cdrom_set_data_read_policy_enabled(int enabled);
+
 /* Passive physical-deadline -> buffer -> INT1 exposure telemetry (L1.5).
  * Diagnostics only: recording never changes CD scheduling or delivery. */
 void cdrom_timing_reset(void);

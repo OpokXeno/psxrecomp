@@ -1213,6 +1213,8 @@ struct UserSettings {
     // later game.toml change is exactly the write-only latch that shipped
     // turbo-on to MegaManX6Recomp users who had no way to turn it off.
     bool has_turbo_loads    = false; bool turbo_loads    = false;
+    // Title-scoped map reads; leaves CPU and frame pacing unchanged.
+    bool has_fast_map_load  = false; bool fast_map_load  = true;
     bool has_fast_boot      = false; bool fast_boot      = false;
     // HLE BIOS tier toggle (see RuntimeConfig::bios_hle). Overrides game.toml.
     bool has_bios_hle       = false; bool bios_hle       = false;
