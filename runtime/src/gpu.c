@@ -2856,6 +2856,8 @@ static uint16_t vram_read_w, vram_read_h;
 static uint16_t vram_read_col, vram_read_row;
 static size_t vram_read_pixel_count;
 static uint64_t vram_read_content_digest;
+/* Derived presentation receipt; a restore invalidates a partial read receipt. */
+static uint64_t vram_read_rgb_digest;
 static GpuVramReadbackCompleteHook gpu_vram_readback_complete_hook;
 
 /* ---- GPU internal state ---- */
@@ -3228,6 +3230,7 @@ static void gpu_reset_state(int clear_vram) {
     vram_read_col = vram_read_row = 0;
     vram_read_pixel_count = 0u;
     vram_read_content_digest = UINT64_C(1469598103934665603);
+    vram_read_rgb_digest = UINT64_C(1469598103934665603);
 
     /* Reset all state to power-on defaults */
     texpage_x = 0;
@@ -3509,6 +3512,10 @@ uint32_t gpu_read_gpuread(void) {
         for (size_t byte = 0u; byte < sizeof(pixel); ++byte) {
             vram_read_content_digest ^= pixel_bytes[byte];
             vram_read_content_digest *= UINT64_C(1099511628211);
+            if (vram_read_rgb_digest) {
+                vram_read_rgb_digest ^= byte ? pixel_bytes[byte] & 0x7fu : pixel_bytes[byte];
+                vram_read_rgb_digest *= UINT64_C(1099511628211);
+            }
         }
         vram_read_pixel_count++;
 
@@ -3551,6 +3558,7 @@ uint32_t gpu_read_gpuread(void) {
             .height = vram_read_h,
             .pixel_count = vram_read_pixel_count,
             .content_digest = vram_read_content_digest,
+            .rgb_content_digest = vram_read_rgb_digest,
         });
     }
     gpuread_latch = value;
@@ -5616,6 +5624,7 @@ static void gp0_exec_vram_to_cpu(void) {
     vram_read_row = 0;
     vram_read_pixel_count = 0u;
     vram_read_content_digest = UINT64_C(1469598103934665603);
+    vram_read_rgb_digest = UINT64_C(1469598103934665603);
     vram_read_active = 1;
 }
 
@@ -8066,6 +8075,7 @@ static int native_packet_vram_to_cpu(const uint32_t *words, size_t word_count) {
     vram_read_row = 0u;
     vram_read_pixel_count = 0u;
     vram_read_content_digest = UINT64_C(1469598103934665603);
+    vram_read_rgb_digest = UINT64_C(1469598103934665603);
     vram_read_active = 1;
     return 1;
 }
@@ -10473,6 +10483,7 @@ static int gpu_snap_parse(PstR *r, GpuSnapshotState *out) {
     RI(vram_read_active); RH(vram_read_x); RH(vram_read_y); RH(vram_read_w); RH(vram_read_h);
     RH(vram_read_col); RH(vram_read_row);
     RQ(vram_read_pixel_count); RQ(vram_read_content_digest);
+    vram_read_rgb_digest = 0u;
     RU(s_d24_upload_x1); RI(s_d24_present_hold); RU(s_d24_prev_disp_h);
     RH(movie_frame_target_y);
 #undef RU

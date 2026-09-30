@@ -1530,6 +1530,7 @@ typedef struct GlNativeViewRaster {
 } GlNativeViewRaster;
 typedef struct GlNativeViewTarget {
     uint16_t x, y, width, height;
+    int transition_snapshot; /* 1: certified capture; 2: pending CPU round trip. */
     uint64_t declaration;
     uint32_t *pixels;
     NativeViewWaveTile wave_tiles[NATIVE_VIEW_WAVE_PACKET_COUNT];
@@ -1554,6 +1555,9 @@ typedef struct GlNativeViewState {
     /* Captured native_depth_test. Each DOMAIN allocation then holds its depth
      * plane after the pixels, so COW/retention/free cover both together. */
     int depth_test;
+    uint64_t readback_rgb_digest;
+    uint16_t readback_x, readback_y, readback_width, readback_height;
+    int readback_capture;
     struct GlNativeGpuWork *gpu; /* Private compiler journal; never published. */
     GlNativeViewTarget targets[GL_NATIVE_VIEW_TARGET_CAPACITY];
     GlNativeViewDomain domains[GL_NATIVE_VIEW_TARGET_CAPACITY];
@@ -7566,6 +7570,7 @@ typedef struct GlNativeCpuCompiler {
     GlNativeViewState *native_views;
 } GlNativeCpuCompiler;
 static int native_gpu_draw(GlNativeCpuCompiler *, const XgSemanticDrawRecord *, int);
+static int native_transition_texture(const GlNativeViewState *, const XgSemanticDrawRecord *);
 static int native_view_worker_drain(GlNativeCpuCompiler *, int, int, int, int);
 
 typedef enum GlNativeOrderedKind {
@@ -8597,6 +8602,8 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
         compiler->audit->rendered_draws++;
         return 1;
     }
+    const GlNativeViewState *transition_views = compiler->view_pass ? compiler->native_views : NULL;
+    const int transition = transition_views ? native_transition_texture(transition_views, draw) : -1;
     if (material->textured) {
         texture_resource = compiler->native_texture ? compiler->native_texture : native_audit_resource(
             compiler->audit, draw->texture_resource_id,
@@ -8922,16 +8929,30 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                             draw->texture_generation);
                         return 0;
                     }
+                    /* The CPU VIEW endpoint is also used at render scale 1.
+                     * Its screenshot must sample the same full-width domain
+                     * as the GPU, rather than the canonical texture crop. */
+                    if (transition >= 0) {
+                        const GlNativeViewState *views = transition_views;
+                        const GlNativeViewTarget *source = &views->targets[transition];
+                        int sx = (int)floor((continuous_u + 0.5 - 1.0 / 64.0 +
+                            material->texture_page_x * 64 - source->x) * views->width / source->width);
+                        int sy = (int)floor(continuous_v + 0.5 - 1.0 / 64.0);
+                        sx = sx < 0 ? 0 : sx >= (int)views->width ? (int)views->width - 1 : sx;
+                        sy = sy < 0 ? 0 : sy >= source->height ? source->height - 1 : sy;
+                        if (source->pixels) texel = (texel & UINT16_C(0x8000)) |
+                            (native_rgba_to_1555(source->pixels[(size_t)sy * views->width + sx]) & UINT16_C(0x7fff));
+                    }
                     if (texel == 0u) continue;
                     double filtered5[3] = {
                         texel & 31u, (texel >> 5u) & 31u, (texel >> 10u) & 31u,
                     };
-                    int filter_pixel = filter_draw;
+                    int filter_pixel = transition < 0 && filter_draw;
                     const double shifted_u = continuous_u +
                         (perspective ? 0.5 - 1.0 / 64.0 : 0.0);
                     const double shifted_v = continuous_v +
                         (perspective ? 0.5 - 1.0 / 64.0 : 0.0);
-                    if (filter_draw) {
+                    if (transition < 0 && filter_draw) {
                         filtered5[0] = filtered5[1] = filtered5[2] = 0.0;
                         /* Nearest is authoritative for coverage/STP. Clamp the
                          * other three taps to this primitive's sampled texels
@@ -8975,7 +8996,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                                 filtered5[channel] += ((taps[tap] >> (channel * 5)) & 31) *
                                     weights[tap] / total;
                     }
-                    if (anisotropy > 1) {
+                    if (transition < 0 && anisotropy > 1) {
                         double ux = attributes.plane[0][1], vx = attributes.plane[1][1];
                         double uy = attributes.plane[0][2], vy = attributes.plane[1][2];
                         if (perspective) {
@@ -9549,6 +9570,77 @@ static int native_view_eligible(const GlNativeViewState *views, const GlNativeVi
         target->width == views->width - 2u * views->offset;
 }
 
+/* Retail framebuffer captures use the active short-display height (216),
+ * Field's 224 lines, or a 240-line texture including bottom padding. */
+static int native_transition_height(uint32_t height) {
+    return height == 216u || height == 224u || height == 240u;
+}
+
+static int native_transition_texture(const GlNativeViewState *views,
+                                     const XgSemanticDrawRecord *draw) {
+    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    if (draw->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
+        draw->native_view_effect || !m->textured ||
+        m->texture_depth != XG_RENDER_IR_TEXTURE_15_BIT ||
+        m->texture_page_y != 1u || m->texture_page_x < 11u ||
+        m->texture_window_mask_x || m->texture_window_mask_y)
+        return -1;
+    for (uint32_t i = 0u; i < views->count; ++i) {
+        const GlNativeViewTarget *source = &views->targets[i];
+        if (source->transition_snapshot != 1 || !native_view_eligible(views, source)) continue;
+        /* World Map's FT4 mesh reaches row 239 even in the 216-row display.
+         * Its off-screen vertices are safe when V equals raster Y throughout
+         * the triangle: the scissor proves every sampled row is captured. */
+        int clipped_v = m->draw_area_top <= m->draw_area_bottom &&
+            m->draw_area_bottom - m->draw_area_top < source->height;
+        for (uint32_t t = 0u; t < draw->primitive.triangle_count && clipped_v; ++t)
+            for (uint32_t v = 0u; v < 3u; ++v) {
+                const XgRenderIrVertex *vertex = &draw->primitive.triangles[t].vertices[v];
+                if (vertex->native_view_position || vertex->projective_position ||
+                    vertex->v != (int64_t)vertex->y +
+                        (int64_t)(m->draw_offset_y - m->draw_area_top) * 65536)
+                    clipped_v = 0;
+            }
+        int inside = draw->primitive.triangle_count != 0u;
+        for (uint32_t t = 0u; t < draw->primitive.triangle_count && inside; ++t)
+            for (uint32_t v = 0u; v < 3u; ++v) {
+                const XgRenderIrVertex *vertex = &draw->primitive.triangles[t].vertices[v];
+                const int64_t u = vertex->u +
+                    (int64_t)(m->texture_page_x * 64 - source->x) * 65536;
+                if (u < 0 || u > (int64_t)source->width * 65536 ||
+                    (!clipped_v && (vertex->v < 0 ||
+                        vertex->v > (int32_t)source->height * 65536)))
+                    inside = 0;
+            }
+        if (inside) return (int)i;
+    }
+    return -1;
+}
+
+static int native_transition_overwritten(const GlNativeViewTarget *target,
+                                        const XgSemanticDrawRecord *draw) {
+    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    if (!target->transition_snapshot ||
+        m->draw_area_left >= target->x + target->width || m->draw_area_right < target->x ||
+        m->draw_area_top >= target->y + target->height || m->draw_area_bottom < target->y)
+        return 0;
+    for (uint32_t t = 0; t < draw->primitive.triangle_count; ++t) {
+        int64_t left = INT64_MAX, top = INT64_MAX, right = INT64_MIN, bottom = INT64_MIN;
+        for (uint32_t v = 0; v < 3; ++v) {
+            const XgRenderIrVertex *vertex = &draw->primitive.triangles[t].vertices[v];
+            const int64_t x = vertex->x + (int64_t)m->draw_offset_x * 65536;
+            const int64_t y = vertex->y + (int64_t)m->draw_offset_y * 65536;
+            if (x < left) left = x; if (x > right) right = x;
+            if (y < top) top = y; if (y > bottom) bottom = y;
+        }
+        if (left < (int64_t)(target->x + target->width) * 65536 &&
+            right >= (int64_t)target->x * 65536 &&
+            top < (int64_t)(target->y + target->height) * 65536 &&
+            bottom >= (int64_t)target->y * 65536) return 1;
+    }
+    return 0;
+}
+
 static uint32_t native_view_domain(GlNativeViewState *views, const GlNativeViewTarget *target) {
     for (uint32_t i = 0u; i < views->domain_count; ++i)
         if (views->domains[i].x == target->x && views->domains[i].width == target->width) return i;
@@ -10080,6 +10172,24 @@ static int native_gpu_draw(GlNativeCpuCompiler *compiler, const XgSemanticDrawRe
     GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_DRAW);
     if (!command) return 0;
     command->plane = compiler->gpu_plane; command->draw = *draw;
+    /* A framebuffer capture is a VIEW texture, including the reveal margins
+     * and every internal-resolution sample. Ordinary textures use raw words.
+     * The transfer journal separates source-plane writes from these draws. */
+    if (compiler->view_pass && compiler->native_views) {
+        GlNativeViewState *views = compiler->native_views;
+        const int index = native_transition_texture(views, draw);
+        if (index >= 0) {
+            GlNativeViewTarget *source = &views->targets[index];
+            const uint32_t domain = native_view_domain(views, source);
+            if (domain != UINT32_MAX && domain + 1u != command->plane) {
+                command->source = domain + 1u;
+                command->sx = m->texture_page_x * 64 - source->x;
+                command->sy = m->texture_page_y * 256;
+                command->sw = source->width;
+                command->sh = VRAM_H;
+            }
+        }
+    }
     command->draw.primitive.material.dither =
         draw->primitive.material.dither && !compiler->dithering_disabled;
     command->y = origin_y; command->x = compiler->dither_x;
@@ -10703,6 +10813,9 @@ static int native_view_draw(GlNativeCpuCompiler *compiler, GlNativeViewState *vi
             const uint32_t end = (uint32_t)material->draw_area_bottom + 1u < alias->y + alias->height
                 ? (uint32_t)material->draw_area_bottom + 1u : alias->y + alias->height;
             if (top >= end) continue;
+            if (native_transition_overwritten(alias, draw)) {
+                views->targets[j].transition_snapshot = 0;
+            }
             if (!native_view_private(views, j, compiler->native_vram->pixels)) return 0;
             domain_index = native_view_domain(views, alias);
             memset(rows + top, 1, end - top);
@@ -10982,6 +11095,80 @@ static int native_view_wave_apply(GlNativeViewState *views, uint32_t source_inde
     return 1;
 }
 
+/* StoreImage/LoadImage round trips used by FieldSetVramStpBits and the Battle
+ * ripple change STP only. Compare every RGB555 word before preserving VIEW;
+ * an unrelated upload, even with the same dimensions, must replace it. */
+static int native_transition_upload(GlNativeViewState *views,
+                                    const XgRenderNativeOperation *operation,
+                                    const GlNativeResourceRecord *upload,
+                                    const uint16_t *words,
+                                    XgRenderNativeOperation *view_operation) {
+    if (operation->kind != XG_RENDER_NATIVE_OPERATION_UPLOAD ||
+        operation->mask_set || operation->mask_check) return 0;
+    /* READBACK records the words the guest actually received. They can differ
+     * from Native's canonical raster at triangle edges; comparing only against
+     * that raster incorrectly treats an STP-only round trip as a new texture. */
+    if (views->readback_capture && views->readback_rgb_digest &&
+        operation->width == views->readback_width && operation->height == views->readback_height &&
+        ((operation->dst_x == views->readback_x && operation->dst_y == views->readback_y) ||
+         (views->readback_width == 320 && operation->dst_x == 704 && operation->dst_y == 256))) {
+        uint64_t digest = UINT64_C(1469598103934665603);
+        for (uint32_t y = 0; y < operation->height; ++y)
+            for (uint32_t x = 0; x < operation->width; ++x) {
+                const uint16_t word = native_read_u16((const uint8_t *)upload->view.bytes +
+                    (size_t)y * upload->view.descriptor.row_pitch + x * 2u) & UINT16_C(0x7fff);
+                digest = (digest ^ (word & 255u)) * UINT64_C(1099511628211);
+                digest = (digest ^ (word >> 8u)) * UINT64_C(1099511628211);
+            }
+        if (digest == views->readback_rgb_digest) {
+            int retained = 0;
+            for (uint32_t i = 0; i < views->count; ++i) {
+                GlNativeViewTarget *target = &views->targets[i];
+                if (target->transition_snapshot && target->x == 704 && target->y == 256) {
+                    target->transition_snapshot = 1;
+                    retained = 1;
+                }
+            }
+            views->readback_rgb_digest = 0u;
+            if (retained) return 1;
+        }
+    }
+    for (uint32_t i = 0u; i < views->count; ++i) {
+        const GlNativeViewTarget *target = &views->targets[i];
+        if (!target->transition_snapshot || operation->dst_x < target->x ||
+            operation->dst_y < target->y ||
+            operation->dst_x + operation->width > target->x + target->width ||
+            operation->dst_y + operation->height > target->y + target->height)
+            continue;
+        int same = 1;
+        for (uint32_t y = 0u; y < operation->height && same; ++y)
+            for (uint32_t x = 0u; x < operation->width; ++x)
+                if (((native_read_u16((const uint8_t *)upload->view.bytes +
+                        (size_t)y * upload->view.descriptor.row_pitch + x * 2u) ^
+                      words[(size_t)(operation->dst_y + y) * VRAM_W + operation->dst_x + x]) &
+                     UINT16_C(0x7fff)) != 0u) { same = 0; break; }
+        if (same) return 1;
+    }
+    /* RunFramebufferRadialRippleDissolve captures (0,0,320,224), sets STP,
+     * then uploads at (704,256). Prove the round trip from its actual words. */
+    if (operation->dst_x != 704u || operation->dst_y != 256u ||
+        operation->width != 320u ||
+        !native_transition_height(operation->height) ||
+        native_view_cover(views, views->count, 0, 0, 320,
+            operation->height < 224u ? operation->height : 224u) < 0)
+        return 0;
+    for (uint32_t y = 0u; y < operation->height; ++y)
+        for (uint32_t x = 0u; x < operation->width; ++x)
+            if (((native_read_u16((const uint8_t *)upload->view.bytes +
+                    (size_t)y * upload->view.descriptor.row_pitch + x * 2u) ^
+                  words[(size_t)y * VRAM_W + x]) & UINT16_C(0x7fff)) != 0u)
+                return 0;
+    *view_operation = *operation;
+    view_operation->kind = XG_RENDER_NATIVE_OPERATION_COPY;
+    view_operation->src_x = view_operation->src_y = 0u;
+    return 2;
+}
+
 static int native_view_transfer(GlNativeViewState *views,
                              const XgRenderNativeOperation *operation,
                              const GlNativeResourceRecord *upload,
@@ -10994,12 +11181,26 @@ static int native_view_transfer(GlNativeViewState *views,
     uint32_t *old_owned[GL_NATIVE_VIEW_TARGET_CAPACITY] = {0};
     uint64_t copied_domains = 0u;
     const int copy = operation->kind == XG_RENDER_NATIVE_OPERATION_COPY;
+    const int transition_copy = copy && operation->dst_x == 704u &&
+        operation->dst_y == 256u && operation->width == 320u &&
+        native_transition_height(operation->height) &&
+        !operation->mask_set && !operation->mask_check &&
+        native_view_cover(views, original_count, operation->src_x,
+            operation->src_y, operation->width,
+            operation->height < 224u ? operation->height : 224u) >= 0;
     int result = 0;
     *wave_source = -1;
     *wave_destinations = 0u;
     if (!copy && operation->width == VRAM_W && operation->height == VRAM_H &&
         !operation->mask_check) views->reset_motion_history = 1;
     if (copy) {
+        /* Retail captures can crop 240 rows to 224, or include 16 padding
+         * rows after a 224-row framebuffer. The per-row COPY below preserves
+         * VIEW where declared and supplies canonical padding elsewhere. */
+        if (transition_copy &&
+            native_view_target(views, operation->dst_x, operation->dst_y,
+                operation->width, operation->height) < 0)
+            goto finished;
         /* Freeze all source slices before replacing any domain allocation. */
         for (uint32_t i = 0u; i < original_count; ++i)
             if (native_view_eligible(views, &views->targets[i]) && !views->targets[i].pixels &&
@@ -11041,6 +11242,10 @@ static int native_view_transfer(GlNativeViewState *views,
                         intersects = 1; break;
                     }
         if (!intersects) continue;
+        target->transition_snapshot = transition_copy && full_x && full_y &&
+            target->x == 704u && target->y == 256u && target->width == 320u &&
+            native_transition_height(target->height) &&
+            !operation->mask_set && !operation->mask_check;
         const uint32_t domain = native_view_domain(views, target);
         if (domain == UINT32_MAX) goto finished;
         if (copy && !(copied_domains & (UINT64_C(1) << domain))) {
@@ -13152,6 +13357,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         views->reset_motion_history = 1;
         for (uint32_t i = 0u; i < views->count; ++i) {
             views->targets[i].pixels = NULL;
+            views->targets[i].transition_snapshot = 0;
             memset(views->targets[i].wave_seen, 0, sizeof(views->targets[i].wave_seen));
             views->targets[i].wave_count = 0u;
             views->targets[i].wave_invalid = 0;
@@ -13161,6 +13367,8 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
          * while the committed allocations stay alive until publication. */
         memset(views->domains, 0, sizeof(views->domains));
         views->domain_count = 0u;
+        views->readback_rgb_digest = 0u;
+        views->readback_capture = 0;
     }
     views->width = display->native_width;
     views->reference_height = display->native_height;
@@ -13300,6 +13508,41 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             views->targets[index].declaration = ++views->declaration_sequence;
             continue;
         }
+        if (operation.kind == XG_RENDER_NATIVE_OPERATION_READBACK) {
+            views->readback_rgb_digest = operation.readback_rgb_digest;
+            views->readback_x = operation.dst_x; views->readback_y = operation.dst_y;
+            views->readback_width = operation.width; views->readback_height = operation.height;
+            views->readback_capture = 0;
+            const int source = native_view_cover(views, views->count,
+                operation.dst_x, operation.dst_y, operation.width, operation.height);
+            if (source >= 0 && views->targets[source].transition_snapshot == 1)
+                views->readback_capture = 1;
+            else if (operation.width == 320 && native_transition_height(operation.height) &&
+                native_view_cover(views, views->count, operation.dst_x, operation.dst_y, 320,
+                    operation.height < 224u ? operation.height : 224u) >= 0) {
+                /* Freeze the rendered source at StoreImage, before the guest can
+                 * clear/reuse its framebuffer. This COPY affects VIEW only;
+                 * the subsequent LoadImage must prove the RGB receipt. */
+                XgRenderNativeOperation capture = {.kind = XG_RENDER_NATIVE_OPERATION_COPY,
+                    .src_x = operation.dst_x, .src_y = operation.dst_y,
+                    .dst_x = 704, .dst_y = 256, .width = 320, .height = operation.height};
+                if (!copy_pixels) copy_pixels = malloc(canvas_bytes);
+                if (!copy_pixels) goto allocation_failed;
+                for (uint32_t y = 0; y < operation.height; ++y)
+                    memcpy(copy_pixels + (size_t)y * 320,
+                        canvas.pixels + (size_t)((operation.dst_y + y) & (VRAM_H - 1)) * VRAM_W + operation.dst_x,
+                        320 * sizeof(*copy_pixels));
+                int wave_source;
+                uint64_t wave_destinations;
+                if (!native_view_transfer(views, &capture, NULL, canvas.pixels, copy_pixels,
+                    &wave_source, &wave_destinations, audit)) goto allocation_failed;
+                for (uint32_t i = 0; i < views->count; ++i)
+                    if (views->targets[i].x == 704 && views->targets[i].y == 256 &&
+                        views->targets[i].transition_snapshot) views->targets[i].transition_snapshot = 2;
+                views->readback_capture = 1;
+            }
+            continue;
+        }
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_DRAW) {
             XgSemanticDrawRecord draw;
             if (!native_materialize_native_draw(&operation.semantic, &draw)) goto failed;
@@ -13311,12 +13554,37 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             for (uint32_t li = 0u; li < draw.line_count; ++li)
                 for (uint32_t vi = 0u; vi < 2u; ++vi)
                     marked |= draw.lines[li].vertices[vi].native_view_position;
-            if (!native_view_draw(&compiler, views, &draw, operation_index, marked)) goto failed;
-            for (uint32_t i = 0u; i < views->count; ++i)
-                native_recipe_append(views, i, &operation, audit, canvas.words,
-                    views->active >= 0 && native_view_eligible(views, &views->targets[i]) &&
-                    views->targets[views->active].x == views->targets[i].x &&
-                    views->targets[views->active].width == views->targets[i].width);
+            XgSemanticDrawRecord view_draw = draw;
+            const int transition = native_transition_texture(views, &draw) >= 0;
+            if (transition) {
+                /* The complete 320-wide capture denotes the complete VIEW,
+                 * rather than its central 4:3 crop. Apply the authored mesh
+                 * deformation to the wider image, preserving canonical XY. */
+                view_draw.screen_space_2d = GPU_RENDER_SCREEN_SPACE_2D_STRETCH;
+                view_draw.interpolation_id = 0u;
+                for (uint32_t t = 0u; t < view_draw.primitive.triangle_count; ++t)
+                    for (uint32_t v = 0u; v < 3u; ++v) {
+                        view_draw.primitive.triangles[t].vertices[v].native_view_position = false;
+                        view_draw.primitive.triangles[t].vertices[v].projective_position = false;
+                    }
+                marked = 1;
+            }
+            if (!native_view_draw(&compiler, views, &view_draw, operation_index, marked)) goto failed;
+            for (uint32_t i = 0u; i < views->count; ++i) {
+                GlNativeViewTarget *target = &views->targets[i];
+                const XgRenderIrMaterialState *m = &draw.primitive.material;
+                if (transition && m->draw_area_left < target->x + target->width &&
+                    m->draw_area_right >= target->x && m->draw_area_top < target->y + target->height &&
+                    m->draw_area_bottom >= target->y) {
+                    /* Phase recipes retain canonical texture words. They cannot
+                     * replay this GPU framebuffer dependency at full resolution;
+                     * hold the actual endpoint at the effect's authored cadence. */
+                    native_recipe_drop(target);
+                } else native_recipe_append(views, i, &operation, audit, canvas.words,
+                    views->active >= 0 && native_view_eligible(views, target) &&
+                    views->targets[views->active].x == target->x &&
+                    views->targets[views->active].width == target->width);
+            }
             if (draw.native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
                 views->active >= 0 && native_view_eligible(views, &views->targets[views->active]) &&
                 !native_view_wave_capture(&views->targets[views->active], &draw))
@@ -13361,11 +13629,9 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             }
         } else if (operation.kind == XG_RENDER_NATIVE_OPERATION_COPY) {
             if (operation.src_x >= VRAM_W || operation.src_y >= VRAM_H) goto failed;
-            if (!copy_pixels) {
-                copy_pixels = (uint32_t *)malloc(canvas_bytes);
-                copy_words = (uint16_t *)malloc(word_bytes);
-                if (!copy_pixels || !copy_words) goto allocation_failed;
-            }
+            if (!copy_pixels) copy_pixels = malloc(canvas_bytes);
+            if (!copy_words) copy_words = malloc(word_bytes);
+            if (!copy_pixels || !copy_words) goto allocation_failed;
             /* Snapshot every wrapped source pixel before the first write. */
             for (uint32_t y = 0u; y < operation.height; ++y) {
                 const size_t row = (size_t)((operation.src_y + y) & (VRAM_H - 1)) * VRAM_W;
@@ -13380,8 +13646,20 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                 }
             }
         }
-        int wave_source;
-        uint64_t wave_destinations;
+
+        XgRenderNativeOperation view_operation = operation;
+        const int transition_upload = native_transition_upload(
+            views, &operation, &upload, canvas.words, &view_operation);
+        if (transition_upload == 2) {
+            if (!copy_pixels) copy_pixels = malloc(canvas_bytes);
+            if (!copy_pixels) goto allocation_failed;
+            for (uint32_t y = 0u; y < operation.height; ++y)
+                memcpy(copy_pixels + (size_t)y * operation.width,
+                    canvas.pixels + (size_t)y * VRAM_W,
+                    operation.width * sizeof(*copy_pixels));
+        }
+        int wave_source = -1;
+        uint64_t wave_destinations = 0u;
         copy_recipe_count = 0u;
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_COPY) {
             copy_recipe_count = views->count;
@@ -13390,7 +13668,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                 if (copy_recipes[i]) copy_recipes[i]->references++;
             }
         }
-        if (!native_view_transfer(views, &operation, &upload, canvas.pixels, copy_pixels,
+        if (transition_upload != 1 && !native_view_transfer(views, &view_operation, &upload, canvas.pixels, copy_pixels,
                               &wave_source, &wave_destinations, audit)) goto allocation_failed;
         if (!operation.mask_set && !operation.mask_check &&
             operation.kind != XG_RENDER_NATIVE_OPERATION_UPLOAD) {
@@ -14179,9 +14457,10 @@ static const char *NATIVE_GPU_FS =
     " vec2 hd_uv=vec2(0.0),hd_dx=vec2(0.0),hd_dy=vec2(0.0);\n"
     " if(hd_on!=0){vec2 hp=(persp!=0?t_p:t)+vec2(size.z); vec2 fl=floor(hp);\n"
     "  ivec2 hq=ivec2(fl)&255; hq=(hq&~(window.xy*8))|((window.zw&window.xy)*8);\n"
-    "  vec2 k=vec2(textureSize(hd_image,0))/vec2(hd_map.zw);\n"
+    "  if(hd_on==2){hd_uv=(hp+vec2(hd_map.xy))/vec2(hd_map.zw);}\n"
+    "  else {vec2 k=vec2(textureSize(hd_image,0))/vec2(hd_map.zw);\n"
     "  vec2 tx=clamp(vec2(hq+hd_map.xy)+(hp-fl),vec2(hd_lim.xy+hd_map.xy)+0.5/k,vec2(hd_lim.zw+hd_map.xy)+1.0-0.5/k);\n"
-    "  hd_uv=tx/vec2(hd_map.zw);}\n"
+    "  hd_uv=tx/vec2(hd_map.zw);}}\n"
     " hd_dx=dFdx(hd_uv); hd_dy=dFdy(hd_uv);\n"
     /* Derivatives must precede every per-fragment discard. Affine gradients
      * come from the unwrapped attribute plane, not the modulo-256 DDA value. */
@@ -14208,8 +14487,8 @@ static const char *NATIVE_GPU_FS =
     "  ivec2 q=ivec2(mod(uvs,256.0))&255; int w=guest_texel(q);\n"
     /* Replacement: coverage and colour from the HD image (premultiplied by
      * coverage at upload), STP from the guest texel, full 8-bit precision. */
-    "  if(hd_on!=0){vec4 h=textureGrad(hd_image,hd_uv,hd_dx,hd_dy); if(h.a<0.5)discard; hd=true;\n"
-    "   hf=h.rgb/h.a; if(state.y==0)hf=clamp(hf*vec3(c)/128.0,0.0,1.0);\n"
+    "  if(hd_on!=0){vec4 h=textureGrad(hd_image,hd_uv,hd_dx,hd_dy); if(hd_on==1&&h.a<0.5)discard; hd=true;\n"
+    "   hf=hd_on==2?h.rgb:h.rgb/h.a; if(state.y==0)hf=clamp(hf*vec3(c)/128.0,0.0,1.0);\n"
     "   int stp=w!=0?(w>>15)&1:hd_fringe_stp(ivec2(mod(uvs,256.0))&255); mask|=stp; blend&=stp;\n"
     "  }else{\n"
     "  if(w==0)discard; ivec3 tex=ivec3(w,w>>5,w>>10)&31; int stp=(w>>15)&1; mask|=stp; blend&=stp;\n"
@@ -14720,9 +14999,17 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                 /* The replacement is bound for the whole draw; its texture is
                  * per-draw state like the page and CLUT above. */
                 const GpuRenderHdTexture *hd = &draw->hd_texture;
-                const int hd_on = !wire && m->textured && hd->valid &&
-                    hd_gl_texture(&s_native_gpu_hd_cache, hd, PSXGL_TEXTURE0 + 5) != 0;
-                if (hd_on) {
+                const int snapshot = !wire && command->source &&
+                    command->source < GL_NATIVE_GPU_PHASE_BASE &&
+                    work->planes[command->source].texture;
+                const int hd_on = snapshot ? 2 : (!wire && m->textured && hd->valid &&
+                    hd_gl_texture(&s_native_gpu_hd_cache, hd, PSXGL_TEXTURE0 + 5) != 0);
+                if (snapshot) {
+                    p_glActiveTexture(PSXGL_TEXTURE0 + 5);
+                    glBindTexture(GL_TEXTURE_2D, work->planes[command->source].texture);
+                    p_glUniform4i(s_native_gpu_hd_map, (int)command->sx, (int)command->sy,
+                                  (int)command->sw, (int)command->sh);
+                } else if (hd_on) {
                     ++s_native_gpu_hd_draws;
                     p_glUniform4i(s_native_gpu_hd_map, hd->texel_offset_u, hd->texel_offset_v,
                                   hd->texel_width, hd->texel_height);

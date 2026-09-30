@@ -1034,6 +1034,8 @@ if(BUILD_TESTING)
         endif()
     endif()
 
+    include("${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_gl_transition_test.cmake")
+
     add_executable(gpu_render_transaction_test
         tests/test_gpu_render_transaction.c
         src/gpu_render.c)

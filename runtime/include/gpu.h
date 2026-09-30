@@ -62,6 +62,9 @@ typedef struct GpuVramEvent {
     const uint16_t *pixels;
     size_t pixel_count;
     uint64_t content_digest;
+    /* READBACK: FNV of the returned little-endian RGB555 words, excluding STP.
+     * Allows presentation to prove a CPU round trip which only changes bit 15. */
+    uint64_t rgb_content_digest;
     uint64_t mutation_serial;
     uint32_t command_source_address;
     uint32_t command_pc;
