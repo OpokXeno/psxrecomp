@@ -306,9 +306,14 @@ int psx_mod_set_controller_presentation_policy(
  */
 #if defined(_MSC_VER)
 #pragma section(".CRT$XCU", read)
+#if defined(__clang__)
+#define PSX_MOD_CONSTRUCTOR_USED __attribute__((used))
+#else
+#define PSX_MOD_CONSTRUCTOR_USED
+#endif
 #define PSX_MOD_CONSTRUCTOR(name)                                           \
     static void __cdecl name(void);                                        \
-    __declspec(allocate(".CRT$XCU"))                                       \
+    __declspec(allocate(".CRT$XCU")) PSX_MOD_CONSTRUCTOR_USED              \
     static void (__cdecl* name##_constructor)(void) = name;                \
     static void __cdecl name(void)
 #elif defined(__GNUC__) || defined(__clang__)
