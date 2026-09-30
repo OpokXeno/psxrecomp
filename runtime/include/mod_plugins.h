@@ -28,6 +28,10 @@ void psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
 
 /* Narrow guest services available to trusted plugin callbacks. */
 int psx_mod_game_started(void);
+/* Always-on trusted callback at the scheduled VBlank edge, before the guest
+ * interrupt is raised. Emulation thread only; it may read and write guest RAM
+ * but must derive its decisions from guest state alone (replay-deterministic). */
+void psx_mod_set_vblank_entry_hook(PSXModVBlankCallback hook);
 /* Read an original mounted-disc file without changing guest CD state/timing.
  * Emulation-thread callbacks only. NULL buffer + zero capacity queries size;
  * otherwise capacity must hold the entire file. Active sector mods apply. */
