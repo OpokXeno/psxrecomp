@@ -7,6 +7,7 @@
 #include "crc32.h"
 #include "psx_sha256.h"
 #include "dirty_ram_interp.h"
+#include "mod_native_runtime.h"
 #include "interrupts.h"
 #include "debug_server.h"
 #include "psx_cycles.h"
@@ -4201,6 +4202,7 @@ static void overlay_static_require_aot(uint32_t addr) {
 #endif
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
+    if (mod_native_requires_overlay_interpreter()) return 0;
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys < PSX_MAIN_RAM_APERTURE_SIZE &&
         phys >= memory_get_ram_size())
@@ -5392,6 +5394,7 @@ void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
  * leaks (root cause of the dwarf->overworld native blue screen).
  * Returns 1 iff a native candidate ran. */
 int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
+    if (mod_native_requires_overlay_interpreter()) return 0;
 #ifdef PSX_HAS_OVERLAY_DISPATCH
     {
         int static_known = 0;

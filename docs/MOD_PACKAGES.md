@@ -111,7 +111,7 @@ stale the moment either side gains a mod.
 
 ## Feature manifest
 
-Write new manifests at the current format version, which is **6**. Older
+Write new manifests at the lowest version supporting their operations, through **9**. Older
 versions stay readable so installed packages survive an update, and each
 section below notes the version a field first required.
 
@@ -449,7 +449,7 @@ id = "example.warp-debug"
 ```
 
 The plugin id is a stable registry key, not a library path or symbol name. The
-package archive supplies no native code. Resolution fails before launch when
+plugin declaration supplies no native code; external libraries use the separate format-9 module model. Resolution fails before launch when
 an enabled plugin has no registered implementation or when two features claim
 the same plugin id. Active plugin identities and owners participate in the
 canonical plan fingerprint.
@@ -777,7 +777,7 @@ feature is enabled and unset.
 `resolver = "builtin:<id>"` selects a resolver statically registered by the
 game. Format-5 plugin ids and format-6 indexed-file format ids likewise select
 only statically registered implementations. Packages cannot load arbitrary
-native code or select arbitrary symbols.
+native code through static plugin selectors. Format-9 native modules require separate explicit player consent.
 
 The installer accepts stored or DEFLATE-compressed ZIP entries, validates CRCs,
 rejects encrypted entries and unsafe or absolute paths, limits archives to 4096
@@ -795,8 +795,8 @@ or widescreen content.
 The built-in package `psx.presentation.bezel` targets every game but defaults to
 off, so the default presentation is unchanged: letterbox and pillarbox margins
 remain black. Enabling the feature without choosing artwork is also a no-op.
-The package supplies only the declaration and trusted plugin selection; archives
-still cannot load native code.
+The package supplies only the declaration and trusted plugin selection; this
+bezel package supplies no external native code.
 
 ### Retained-scene loading presentation (native-wide opt-in)
 
@@ -823,3 +823,55 @@ GPU reset and savestate restore discard this host-only history. A save loaded
 directly into a frozen loading frame cannot recreate wide reveal strips absent
 from the canonical saved framebuffer. `ws_scene_hold_test` covers long holds,
 menu release, delayed buffer flips, retained 4:3 scenes, FMV and timeline reset.
+
+## External native modules (format 9)
+
+Format 9 adds `[[native_module]]` declarations with `id`, `feature`, `platform`,
+`file`, lowercase `sha256`, and optional option `when` conditions. Each
+`[[native_module.hook]]` declares an aligned game-RAM `address` and original
+instruction bytes in `expected`. Guards contain whole instructions and fit in
+game RAM; there is no 64-byte maximum. Their length does not limit the C/C++
+replacement code. The title's packaging helper generates them from a local
+PS-X EXE or mapped raw code image, and calculates the library and executable
+hashes. Authors normally supply addresses rather than hex bytes.
+Variants share feature/id and differ by OS/CPU
+platform. Native modules are an explicit exception to the static plugin model:
+`[[plugin]]` remains a selector for trusted, statically linked implementations.
+
+Format 9 also supports optional `resume_address` on a hook. It replaces the contiguous
+instruction range `[address, resume_address)` through the native `block`
+callback, then resumes the original suffix. The complete range must be guarded
+by `expected`. Partial ranges cannot overlap or contain
+a function-hook entry. Branch/load delay-slot entries are excluded. Resident
+compiled footprints containing a partial range and overlay code run through the
+interpreter while partial hooks are active. The extended descriptor remains
+ABI v1; old descriptors continue to work for function hooks. A module has no
+fixed hook-count limit and can mix many function hooks and partial ranges.
+Unknown native module and hook fields are rejected. Partial hooks require a
+runtime that implements the range extension; declaring format 9 does not add
+that support to earlier builds.
+
+Installation requires explicit player consent bound to the SHA-256 of the
+inspected archive. Inspection, installation and resolution never load code.
+
+The standalone C SDK is `runtime/include/mod_native_api.h`. A library exports
+`psx_native_mod_v1` and a size/version checked descriptor. Hooks can replace a
+function or synchronously invoke the next mod/original once with the supplied
+register view. Compatible hooks compose in resolved order; incompatible guards
+fail resolution. Guards are checked against live guest bytes on each dispatch
+to avoid intercepting an unrelated overlay at a reused address. Lifecycle,
+VBlank, savestate reset, committed options, guest memory and cycle services are
+provided through a scoped host table. Native code has process privileges; this
+is an ABI, not a sandbox or proof of publisher authenticity.
+
+The append-only ABI v1 `call_guest` service invokes another live guest function
+from a function or partial hook. It prepares o32 word arguments and a temporary
+guest stack frame, restores the caller's register view on normal return, and
+returns v0/v1 separately. Memory/coprocessor effects and guest cycles persist;
+nonlocal exits propagate through the hook chain. Its availability is checked by
+host-table size. `runtime/include/mod_native_api.hpp` provides standalone C++17
+wrappers for named registers, typed options, hooks, and guest calls. These services
+use format 9 and do not require new package fields.
+
+For the full manifest schema, callback contracts and independent build example,
+see the title's [native hook guide](../../MOD_NATIVE_HOOKS.md).

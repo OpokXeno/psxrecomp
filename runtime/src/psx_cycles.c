@@ -800,3 +800,6 @@ void psx_gte_stall(CPUState* cpu) {
         psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
     }
 }
+
+/* ABI callback for external native mods; uses the authoritative guest clock. */
+void psx_native_mod_advance_cycles(uint32_t cycles) { psx_advance_cycles(cycles); }

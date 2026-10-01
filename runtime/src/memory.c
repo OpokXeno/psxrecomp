@@ -19,6 +19,7 @@
 #include "memory.h"
 #include "ram_provenance.h"
 #include "mod_memory.h"
+#include "mod_native_runtime.h"
 #include "pst_wire.h"
 #include "sio.h"
 #include "spu.h"
@@ -572,6 +573,8 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
 }
 
 int dirty_ram_text_native_ok(uint32_t phys) {
+    /* Legacy generated dispatchers have no exact function footprints. */
+    if (mod_native_blocks_intersect(0x10000u, 0x1f0000u)) return 0;
     if (!text_ref_image || phys < text_ref_lo || phys >= text_ref_hi)
         return !dirty_ram_is_dirty(phys);
 
@@ -627,6 +630,7 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (mod_native_blocks_intersect(phys, len)) return 0;
         if (len == 0 || phys < text_ref_lo || phys >= text_ref_hi ||
             len > text_ref_hi - phys) {
             g_text_native_blocked++;

@@ -4,6 +4,7 @@
 #include "iso_reader.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "mod_native_runtime.h"
 #include "gpu.h"
 #include "hd_texture_packs.h"
 #include "psx_sha256.h"
@@ -1281,6 +1282,30 @@ int provider_install(void*, const char* path) {
     });
 }
 
+int provider_inspect(void*, const char* path, RecompLauncherCModArchiveInspection* out) {
+    if (!path || !out) return 0;
+    ModArchiveInspection info;
+    if (!state().manager.inspect_archive(path, info, &state().error)) return 0;
+    std::memset(out, 0, sizeof(*out));
+    out->native_code = info.native_code;
+    copy_text(out->name, sizeof(out->name), info.name);
+    copy_text(out->author, sizeof(out->author), info.author);
+    copy_text(out->package_id, sizeof(out->package_id), info.id);
+    copy_text(out->version, sizeof(out->version), info.version);
+    copy_text(out->archive_sha256, sizeof(out->archive_sha256), info.archive_sha256);
+    return 1;
+}
+
+int provider_install_trusted(void*, const char* path, const char* digest) {
+    if (!path || !digest) return 0;
+    return mutate([&](std::string& error) {
+        std::string id, version;
+        if (!state().manager.install_archive(path, &id, &version, &error, digest)) return false;
+        if (!state().manager.scan(&error)) return false;
+        return state().manager.select_version(id, version, &error);
+    });
+}
+
 int provider_remove(void*, const char* id, const char* version) {
     if (!id || !version) return 0;
     return mutate([&](std::string& error) {
@@ -1391,6 +1416,8 @@ RecompLauncherCModProvider provider = {
     nullptr, /* catalog_diagnostic_get */
     provider_texture_pack_add,
     provider_texture_pack_remove,
+    provider_inspect,
+    provider_install_trusted,
 };
 #endif
 
@@ -1402,6 +1429,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
                             const std::filesystem::path& exe_path,
                             std::string* error) {
     RuntimeMods& s = state();
+    mod_native_reset();
     s.manager.set_root({});
     s.plan = {};
     s.validation = {};
@@ -1450,6 +1478,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
 }
 
 bool mod_runtime_clear_for_netplay(std::string* error) {
+    mod_native_reset();
     RuntimeMods& s = state();
     if (!s.initialized) {
         if (error) error->clear();
@@ -1650,6 +1679,11 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path,
         if (error) *error = commit_error;
         return false;
     }
+    if (!mod_native_prepare(plan, &commit_error)) {
+        s.error = commit_error;
+        if (error) *error = commit_error;
+        return false;
+    }
     const bool indexed_plan = !plan.indexed_files.empty();
     s.disc_path = std::move(committed_disc_path);
     s.disc_sha256 = std::move(digest);
@@ -1798,6 +1832,7 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
         applied = true;
     }
     s.main_applied = true;
+    mod_native_savestate_loaded();
     if (applied)
         std::fprintf(stdout,
             "psxrecomp: reapplied mod plan %s after savestate restore\n",
@@ -1849,6 +1884,7 @@ extern "C" void mod_runtime_activate_plugins(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
+    mod_native_activate();
     for (const ModResolution::Plugin& plugin : s.plan.plugins) {
         s.current_plugin = &plugin;
         mod_invoke_activation_plugin(plugin.id);
@@ -1860,6 +1896,7 @@ extern "C" void mod_runtime_on_vblank(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
+    mod_native_vblank();
     for (const ModResolution::Plugin& plugin : s.plan.plugins) {
         s.current_plugin = &plugin;
         mod_invoke_vblank_plugin(plugin.id);

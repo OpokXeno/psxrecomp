@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace PSXRecompV4 {
@@ -204,6 +205,26 @@ struct ModPlugin {
     int64_t order = 0;
 };
 
+struct ModNativeHook {
+    uint32_t address = 0;
+    std::vector<uint8_t> expected;
+    /* Zero: function hook. Otherwise replace [address, resume_address). */
+    uint32_t resume_address = 0;
+};
+
+struct ModNativeModule {
+    std::string feature_id, id, platform, sha256;
+    std::filesystem::path file;
+    std::vector<ModNativeHook> hooks;
+    std::map<std::string, std::string> when;
+};
+
+struct ModArchiveInspection {
+    std::string id, version, name, author, archive_sha256;
+    bool native_code = false;
+};
+const char* mod_native_platform();
+
 struct ModIndexedFile {
     std::string feature_id;
     std::string format;
@@ -289,6 +310,8 @@ struct ModPackage {
     std::vector<ModPatch> patches;
     std::vector<ModOverlay> overlays;
     std::vector<ModPlugin> plugins;
+    std::vector<ModNativeModule> native_modules;
+    std::string native_digest; /* exact manifest + authenticated native payloads */
     std::vector<ModIndexedFile> indexed_files;
     std::vector<ModResource> resources;
     std::vector<ModDerivedDisc> derived_discs;
@@ -352,6 +375,12 @@ struct ModResolution {
         std::string feature_id;
     };
     std::vector<Plugin> plugins;
+    struct NativeModule {
+        ModNativeModule module;
+        std::string package_id;
+        std::map<std::string, std::string> options;
+    };
+    std::vector<NativeModule> native_modules;
     struct IndexedFile {
         std::string format;
         uint32_t index = 0;
@@ -424,7 +453,11 @@ public:
     bool install_archive(const std::filesystem::path& archive,
                          std::string* installed_id = nullptr,
                          std::string* installed_version = nullptr,
-                         std::string* error = nullptr);
+                         std::string* error = nullptr,
+                         const std::string& trusted_archive_sha256 = {});
+    /* Read/validate only. Never maps or executes a native library. */
+    bool inspect_archive(const std::filesystem::path& archive,
+                         ModArchiveInspection& out, std::string* error = nullptr);
     bool remove_version(const std::string& id, const std::string& version,
                         std::string* error = nullptr);
 
@@ -491,6 +524,7 @@ private:
     std::vector<std::string> scan_errors_;
     std::map<std::string, std::map<std::string, ModPackage>> packages_;
     std::map<std::string, ModSelection> selections_;
+    std::map<std::pair<std::string, std::string>, std::string> native_trust_;
 
     void disable_package(const std::string& package_id);
     void disable_conflicts_with(const ModPackage& package);

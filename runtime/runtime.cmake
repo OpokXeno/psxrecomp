@@ -541,6 +541,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_pgxp.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_bezel.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_packages.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/mod_native_runtime.cpp
     ${PSXRECOMP_ROOT}/runtime/src/mod_runtime.cpp
     ${PSXRECOMP_ROOT}/runtime/src/mod_texture_banks.c
     ${PSXRECOMP_ROOT}/runtime/src/hd_texture_pack.cpp
@@ -1859,7 +1860,8 @@ function(psxrecomp_add_runtime_target target)
             COMMENT "Staging SDL3 runtime DLL"
             VERBATIM)
     endif()
-    target_link_libraries(${target} PRIVATE Threads::Threads)
+    target_link_libraries(${target} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    target_compile_definitions(${target} PRIVATE PSX_NATIVE_MODS=1)
 
     # zlib: boot_state v4 savestate compression (RAM/VRAM/SPU blobs).
     # Portable Windows toolchains (cmake-clang-v1) have no system zlib —

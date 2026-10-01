@@ -24,6 +24,7 @@
  */
 
 #include "dirty_ram_interp.h"
+#include "mod_native_runtime.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "interrupts.h"
@@ -1437,7 +1438,14 @@ int dirty_ram_xprobe_json(char *out, int cap) {
  * In the BIOS-only build psx_dispatch_game_compiled does not exist, and the
  * two callers below are themselves gated behind the same macro. */
 #ifdef PSX_HAS_GAME_DISPATCH
-static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
+static int interp_enter_compiled(CPUState *cpu, uint32_t target, uint32_t return_pc) {
+    if (mod_native_on_dispatch(cpu, target, cpu->gpr[31])) {
+        /* A suspended interpreter JAL/JALR owns a return boundary, unlike
+         * a flat CPS/tail dispatch. Preserve its contract and IRQ pump. */
+        if (return_pc && !g_psx_call_bail && dirty_ram_same_pc(cpu->pc, return_pc))
+            cpu->pc = 0;
+        return 1;
+    }
     if (target == 0x8001A954u) site_note(&g_site_interp);
     /* Decline when the target page no longer matches the static game image.
      * Returning 0 lets the JAL/JALR handler fall through to local-flow interp
@@ -1473,6 +1481,16 @@ static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
                                      uint32_t insn,
                                      uint32_t cold_flags,
                                      uint32_t *next_pc_out);
+static int try_native_block(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
+    if (!mod_native_has_block(pc)) return 0;
+    /* Native code is not a MIPS delay-slot instruction. Never erase a pending
+     * load's architectural delay; the original instruction runs in that case. */
+    if (s_ld_pend_armed && s_ld_pend_age == 0u) return 0;
+    dirty_ram_ld_delay_flush(cpu);
+    if (!mod_native_on_block(cpu, pc)) return 0;
+    *next_pc_out = cpu->pc;
+    return 1;
+}
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     const uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
     const uint32_t cold_flags =
@@ -1530,6 +1548,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
 static int exec_one_fetched_unobserved(CPUState *cpu, uint32_t pc,
                                        uint32_t insn,
                                        uint32_t *next_pc_out) {
+    if (try_native_block(cpu, pc, next_pc_out)) return g_psx_call_bail ? 1 : 0;
     /* A load's writeback becomes visible to the instruction AFTER its delay
      * slot: load at N, hidden from N+1, visible from N+2. s_ld_pend_age tracks
      * that: 0 = armed by the instruction just executed, 1 = the delay slot has
@@ -1607,6 +1626,7 @@ static int exec_one_fetched_observed(CPUState *cpu, uint32_t pc,
                                       uint32_t insn,
                                       uint32_t cold_flags,
                                       uint32_t *next_pc_out) {
+    if (try_native_block(cpu, pc, next_pc_out)) return g_psx_call_bail ? 1 : 0;
     const uint32_t opcode = op_field(insn);
     const int source_observation_control =
         opcode == 0x03u ||
@@ -1834,7 +1854,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             }
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
-            if (interp_enter_compiled(cpu, target)) {
+            if (interp_enter_compiled(cpu, target, return_pc)) {
                 if (g_psx_call_bail) CRET(CRES_EC_BAIL, 1);  /* wild unwind: cpu->pc = true target */
                 if (cpu->pc != 0) CRET(CRES_EC_PC, 1);
                 if (rd == 0 || rd == 31) {
@@ -2063,7 +2083,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (g_precise_mode || g_ls_replay_active) { cpu->pc = target; return 1; }  /* slice / lockstep-replay: plain transfer, never execute the callee */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
-        if (interp_enter_compiled(cpu, target)) {
+        if (interp_enter_compiled(cpu, target, return_pc)) {
             if (g_psx_call_bail) { XRES(XRES_EC_BAIL); return 1; }  /* wild unwind: cpu->pc = true target */
             if (cpu->pc != 0)    { XRES(XRES_EC_PC); return 1; }
             if (psx_call_contract(cpu, return_pc, site_sp)) { XRES(XRES_EC_CONTRACT); return 1; }
@@ -2637,6 +2657,9 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
      * and the handoff's baseline/scratch clears then corrupt the boot
      * (observed: MoH SLUS-00974 garbage-jump/VBLANK-wedge, 2026-08-06). */
     fntrace_maybe_mark_game_started(cpu, addr);
+    /* A CPS callee's $ra can differ from the enclosing trampoline's stop
+     * address. Native next/replacement must return to this callee's caller. */
+    if (mod_native_on_dispatch(cpu, addr, cpu->gpr[31])) return 1;
     if (addr == 0x8001A954u)      site_note(&g_site_dd954);   /* loop head re-dispatch */
     else if (addr == 0x80046264u) site_note(&g_site_dd264);   /* loop tail re-dispatch */
     int prev = g_dirty_interp_active;
@@ -3062,7 +3085,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifdef PSX_HAS_OVERLAY_DISPATCH
     {
         extern int psx_overlay_static_image_known(uint32_t addr);
-        if (psx_overlay_static_image_known(addr)) {
+        if (!mod_native_requires_overlay_interpreter() && psx_overlay_static_image_known(addr)) {
             extern void psx_fatal_halt(const char *reason);
             if (overlay_cache_window_contains(phys))
                 g_dirty_static_overlay_dispatches++;
@@ -3472,7 +3495,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                  * interpreter in an otherwise static overlay. Surface an exact
                  * resident match to the outer dispatcher, never nest tail flow. */
                 extern int psx_overlay_static_can_dispatch(uint32_t addr);
-                if (psx_overlay_static_can_dispatch(target)) {
+                if (!mod_native_requires_overlay_interpreter() && psx_overlay_static_can_dispatch(target)) {
                     g_dirty_ram_native_handoffs++;
                     g_dirty_ram_blocks_run++;
                     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
@@ -3503,7 +3526,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifdef PSX_HAS_OVERLAY_DISPATCH
                 {
                     extern int psx_overlay_static_image_known(uint32_t addr);
-                    if (psx_overlay_static_image_known(target)) {
+                    if (!mod_native_requires_overlay_interpreter() && psx_overlay_static_image_known(target)) {
                         extern void psx_fatal_halt(const char *reason);
                         g_dirty_static_overlay_dispatches++;
                         psx_fatal_halt(
@@ -3515,7 +3538,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 /* A patched prologue can force entry through the interpreter,
                  * while the remaining static ranges at a later continuation
                  * are still safe to run as compiled code. */
-                if (clean_game_text_miss && interp_enter_compiled(cpu, target)) {
+                if (clean_game_text_miss && interp_enter_compiled(cpu, target, 0)) {
                     g_dirty_ram_native_handoffs++;
                     g_dirty_ram_blocks_run++;
                     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
@@ -3565,7 +3588,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifdef PSX_HAS_OVERLAY_DISPATCH
         {
             extern int psx_overlay_static_image_known(uint32_t addr);
-            if (psx_overlay_static_image_known(pc)) {
+            if (!mod_native_requires_overlay_interpreter() && psx_overlay_static_image_known(pc)) {
                 cpu->pc = pc;
                 g_dirty_ram_blocks_run++;
                 if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
@@ -3582,7 +3605,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * match before this straight-line handoff. Control-transfer handoffs
          * retain suffix validation because they are explicit guest entries. */
         if (clean_game_text_miss && psx_game_text_native_ok_full(pc) &&
-            interp_enter_compiled(cpu, pc)) {
+            interp_enter_compiled(cpu, pc, 0)) {
             g_dirty_ram_native_handoffs++;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;

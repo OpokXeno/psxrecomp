@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -23,7 +24,7 @@ namespace PSXRecompV4 {
 namespace {
 
 constexpr uint32_t kMinFormatVersion = 1;
-constexpr uint32_t kMaxFormatVersion = 8;
+constexpr uint32_t kMaxFormatVersion = 9;
 constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
 constexpr uint64_t kMaxIndexedPayloadBytes = 512ull * 1024ull * 1024ull;
 constexpr uint32_t kMaxArchiveFiles = 4096;
@@ -723,6 +724,7 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
                                  const std::vector<ModResolution::Overlay>& overlays,
                                  const std::vector<ModResolution::DerivedDisc>& derived_discs,
                                  const std::vector<ModResolution::Plugin>& plugins,
+                                 const std::vector<ModResolution::NativeModule>& native_modules,
                                  const std::vector<ModResolution::IndexedFile>& indexed_files,
                                  const std::vector<ModResolution::Resource>& resources,
                                  const std::string& source_disc_sha256) {
@@ -797,6 +799,14 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
     for (const ModResolution::Plugin& plugin : plugins) {
         out << "plugin:" << plugin.id << ':' << plugin.package_id << ':'
             << plugin.feature_id << '\n';
+    }
+    for (const auto& native : native_modules) {
+        out << "native-v1:" << native.package_id << ':' << native.module.feature_id
+            << ':' << native.module.id << ':' << native.module.platform << ':'
+            << native.module.sha256 << '\n';
+        for (const auto& hook : native.module.hooks)
+            out << "hook:" << hook.address << ':' << hex_bytes(hook.expected)
+                << ':' << hook.resume_address << '\n';
     }
     for (const ModResolution::IndexedFile& indexed : indexed_files) {
         out << kIndexedFileSchemaToken << ':' << indexed.format << ':'
@@ -1569,6 +1579,24 @@ std::string fingerprint_text(const std::string& text) {
 
 } // namespace
 
+const char* mod_native_platform() {
+#if defined(_WIN32)
+# define PSX_MOD_OS "windows"
+#elif defined(__APPLE__)
+# define PSX_MOD_OS "macos"
+#else
+# define PSX_MOD_OS "linux"
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return PSX_MOD_OS "-aarch64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return PSX_MOD_OS "-x86_64";
+#else
+    return "unsupported";
+#endif
+#undef PSX_MOD_OS
+}
+
 bool mod_register_builtin_resolver(const std::string& id, ModBuiltinResolver resolver) {
     if (!valid_id(id) || !resolver) return false;
     return builtin_resolvers().emplace(id, std::move(resolver)).second;
@@ -1678,6 +1706,7 @@ bool strip_developer_features(ModPackage& package) {
     prune(package.patches);
     prune(package.overlays);
     prune(package.plugins);
+    prune(package.native_modules);
     prune(package.resources);
     return !package.features.empty();
 }
@@ -1690,6 +1719,7 @@ void ModPackageManager::set_root(fs::path mods_root) {
     root_ = std::move(mods_root);
     packages_.clear();
     selections_.clear();
+    native_trust_.clear();
 }
 
 bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
@@ -2525,6 +2555,92 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                 ++declaration_index;
             }
         }
+        if (cfg.contains("native_module")) {
+            if (out.format_version < 9 || !feature_style)
+                throw std::runtime_error("native modules require format_version 9 and explicit features");
+            std::set<std::tuple<std::string, std::string, std::string>> identities;
+            std::vector<uint8_t> manifest_bytes;
+            std::string file_error;
+            if (!read_file(path, manifest_bytes, &file_error))
+                throw std::runtime_error(file_error);
+            std::string authenticated(reinterpret_cast<const char*>(manifest_bytes.data()), manifest_bytes.size());
+            const auto& declarations = toml::find(cfg, "native_module").as_array();
+            if (declarations.size() > 64)
+                throw std::runtime_error("native package exceeds 64 module variants");
+            for (const auto& v : declarations) {
+                for (const auto& [key, unused] : v.as_table()) {
+                    (void)unused;
+                    if (key != "id" && key != "feature" && key != "platform" &&
+                        key != "file" && key != "sha256" && key != "when" && key != "hook")
+                        throw std::runtime_error("native module has unknown field: " + key);
+                }
+                ModNativeModule module;
+                module.feature_id = toml::find<std::string>(v, "feature");
+                module.id = toml::find<std::string>(v, "id");
+                module.platform = toml::find<std::string>(v, "platform");
+                const std::set<std::string> platforms = {
+                    "linux-x86_64", "linux-aarch64", "windows-x86_64",
+                    "windows-aarch64", "macos-x86_64", "macos-aarch64"};
+                if (!find_feature(out, module.feature_id) || !valid_id(module.id) ||
+                    !platforms.count(module.platform) ||
+                    !identities.emplace(module.feature_id, module.id, module.platform).second)
+                    throw std::runtime_error("invalid or duplicate native module identity/platform");
+                const auto relative = toml::find<std::string>(v, "file");
+                if (!safe_archive_name(relative))
+                    throw std::runtime_error("native module path is unsafe");
+                module.file = out.root / fs::path(relative);
+                /* Manual catalog copies must obey the archive's containment rule too. */
+                const auto canonical_root = fs::canonical(out.root);
+                const auto canonical_file = fs::canonical(module.file);
+                const auto contained = canonical_file.lexically_relative(canonical_root);
+                if (contained.empty() || *contained.begin() == ".." ||
+                    !fs::is_regular_file(canonical_file))
+                    throw std::runtime_error("native module escapes package root");
+                module.sha256 = toml::find<std::string>(v, "sha256");
+                std::vector<uint8_t> payload;
+                if (!valid_sha256(module.sha256) ||
+                    !read_file(canonical_file, payload, &file_error) || payload.empty() ||
+                    fingerprint_text(std::string(reinterpret_cast<const char*>(payload.data()), payload.size())) != module.sha256)
+                    throw std::runtime_error("native module checksum failed: " + relative);
+                authenticated += "\n" + module.sha256;
+                read_conditions(v, out.options, module.feature_id, module.when, "native module");
+                std::set<uint32_t> addresses;
+                if (v.contains("hook")) for (const auto& h : toml::find(v, "hook").as_array()) {
+                    for (const auto& [key, unused] : h.as_table()) {
+                        (void)unused;
+                        if (key != "address" && key != "expected" && key != "resume_address")
+                            throw std::runtime_error("native hook has unknown field: " + key);
+                    }
+                    ModNativeHook hook;
+                    const int64_t address = toml::find<int64_t>(h, "address");
+                    if (address < 0 || address > UINT32_MAX || (address & 3) ||
+                        (address & 0x1fffffff) < 0x10000 ||
+                        (address & 0x1fffffff) >= 0x200000)
+                        throw std::runtime_error("native hook must name an aligned game RAM address");
+                    hook.address = static_cast<uint32_t>(address);
+                    if (h.contains("resume_address")) {
+                        const int64_t resume = toml::find<int64_t>(h, "resume_address");
+                        if (resume <= address || resume > UINT32_MAX || (resume & 3) ||
+                            (resume & 0x1fffffff) >= 0x200000 ||
+                            (resume & 0xe0000000) != (address & 0xe0000000))
+                            throw std::runtime_error("partial native hook requires a forward aligned resume_address in the same RAM segment");
+                        hook.resume_address = static_cast<uint32_t>(resume);
+                    }
+                    if (!parse_hex_bytes(toml::find<std::string>(h, "expected"), hook.expected) ||
+                        hook.expected.size() < 4 ||
+                        (hook.expected.size() & 3) ||
+                        (hook.resume_address && hook.expected.size() != hook.resume_address - hook.address) ||
+                        (address & 0x1fffffff) + hook.expected.size() > 0x200000 ||
+                        !addresses.insert(hook.address & 0x1fffffff).second)
+                        throw std::runtime_error("native hook requires a unique address and whole expected instructions that fit in game RAM (the entire replaced range for a partial hook)");
+                    module.hooks.push_back(std::move(hook));
+                }
+                out.native_modules.push_back(std::move(module));
+            }
+            if (out.native_modules.empty())
+                throw std::runtime_error("native module table is empty");
+            out.native_digest = fingerprint_text(authenticated);
+        }
         if (cfg.contains("indexed_file")) {
             if (!feature_style)
                 throw std::runtime_error(
@@ -2807,6 +2923,7 @@ bool ModPackageManager::scan(std::string* error) {
 
 bool ModPackageManager::load_state(std::string* error) {
     selections_.clear();
+    native_trust_.clear();
     const fs::path path = root_ / "state.toml";
     if (!fs::exists(path)) {
         reconcile_conflicts();
@@ -2817,6 +2934,16 @@ bool ModPackageManager::load_state(std::string* error) {
         const int64_t version = toml::find<int64_t>(cfg, "format_version");
         if (version != 1 && version != 2)
             throw std::runtime_error("unsupported state format_version");
+        if (cfg.contains("native_trust")) {
+            for (const auto& v : toml::find(cfg, "native_trust").as_array()) {
+                const auto id = toml::find<std::string>(v, "id");
+                const auto version = toml::find<std::string>(v, "version");
+                const auto digest = toml::find<std::string>(v, "digest");
+                if (!valid_id(id) || !parse_semver(version).valid || !valid_sha256(digest))
+                    throw std::runtime_error("invalid native trust record");
+                native_trust_[{id, version}] = digest;
+            }
+        }
         if (cfg.contains("package")) {
             for (const toml::value& v : toml::find(cfg, "package").as_array()) {
                 const std::string id = toml::find<std::string>(v, "id");
@@ -2907,6 +3034,11 @@ bool ModPackageManager::save_state(std::string* error) const {
         return false;
     }
     out << "format_version = 2\n";
+    for (const auto& [identity, digest] : native_trust_) {
+        out << "\n[[native_trust]]\nid = " << quote_toml(identity.first)
+            << "\nversion = " << quote_toml(identity.second)
+            << "\ndigest = " << quote_toml(digest) << "\n";
+    }
     for (const auto& [id, selection] : selections_) {
         out << "\n[[package]]\n";
         out << "id = " << quote_toml(id) << "\n";
@@ -2969,10 +3101,37 @@ bool ModPackageManager::save_state(std::string* error) const {
     return true;
 }
 
+bool ModPackageManager::inspect_archive(const fs::path& archive,
+                                        ModArchiveInspection& out,
+                                        std::string* error) {
+    out = {};
+    std::vector<uint8_t> bytes;
+    std::vector<ZipEntry> entries;
+    if (!read_file(archive, bytes, error) || !parse_zip(bytes, entries, error)) return false;
+    std::error_code ec;
+    fs::create_directories(root_ / ".staging", ec);
+    if (ec) { set_error(error, "cannot create inspection staging directory"); return false; }
+    const auto token = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path staging = root_ / ".staging" / ("inspect-" + std::to_string(token));
+    if (fs::exists(staging)) { set_error(error, "inspection staging path exists"); return false; }
+    ModPackage package;
+    const bool ok = extract_zip(bytes, entries, staging, error) &&
+                    read_manifest(staging / "manifest.toml", package, error);
+    fs::remove_all(staging, ec);
+    if (!ok) return false;
+    out.id = package.id; out.version = package.version;
+    out.name = package.name; out.author = package.author;
+    out.native_code = !package.native_modules.empty();
+    out.archive_sha256 = fingerprint_text(std::string(
+        reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    return true;
+}
+
 bool ModPackageManager::install_archive(const fs::path& archive,
                                         std::string* installed_id,
                                         std::string* installed_version,
-                                        std::string* error) {
+                                        std::string* error,
+                                        const std::string& trusted_archive_sha256) {
     std::vector<uint8_t> bytes;
     std::vector<ZipEntry> entries;
     if (!read_file(archive, bytes, error) || !parse_zip(bytes, entries, error))
@@ -3004,6 +3163,14 @@ bool ModPackageManager::install_archive(const fs::path& archive,
     ModPackage package;
     if (!read_manifest(staging / "manifest.toml", package, error)) {
         fs::remove_all(staging, ec);
+        return false;
+    }
+    const bool native = !package.native_modules.empty();
+    const auto archive_digest = fingerprint_text(std::string(
+        reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    if (native && trusted_archive_sha256 != archive_digest) {
+        fs::remove_all(staging, ec);
+        set_error(error, "native code requires explicit trust for this exact archive");
         return false;
     }
     if (!developer_channel_ && !strip_developer_features(package)) {
@@ -3038,6 +3205,18 @@ bool ModPackageManager::install_archive(const fs::path& archive,
         fs::remove_all(destination, ec);
         return false;
     }
+    if (native) {
+        const auto key = std::make_pair(published.id, published.version);
+        const auto previous = native_trust_.find(key);
+        const std::string old = previous == native_trust_.end() ? "" : previous->second;
+        native_trust_[key] = published.native_digest;
+        if (!save_state(error)) {
+            if (old.empty()) native_trust_.erase(key); else native_trust_[key] = old;
+            fs::remove_all(destination, ec);
+            return false;
+        }
+    }
+    if (!developer_channel_) strip_developer_features(published);
     published.origin = ModPackageOrigin::Installed;
     packages_[published.id][published.version] = published;
     if (installed_id) *installed_id = published.id;
@@ -3084,6 +3263,15 @@ bool ModPackageManager::remove_version(const std::string& id, const std::string&
          * build, which is not a model any player can reason about. */
         set_error(error, "cannot remove a bundled package; it ships with the game");
         return false;
+    }
+    const auto trust = native_trust_.find({id, version});
+    if (trust != native_trust_.end()) {
+        const auto previous = trust->second;
+        native_trust_.erase(trust);
+        if (!save_state(error)) {
+            native_trust_[{id, version}] = previous;
+            return false;
+        }
     }
     const fs::path path = pit->second.at(version).root;
     std::error_code ec;
@@ -3784,6 +3972,38 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
             resolved.feature_id = overlay->feature_id;
             result.overlays.push_back(std::move(resolved));
         }
+        if (!package->native_modules.empty()) {
+            ModPackage verified;
+            std::string verification_error;
+            const auto trust = native_trust_.find({package->id, package->version});
+            if (!read_manifest(package->root / "manifest.toml", verified, &verification_error) ||
+                verified.native_digest != package->native_digest ||
+                trust == native_trust_.end() || trust->second != verified.native_digest) {
+                result.errors.push_back(package->id + ": native content changed or has not been explicitly trusted; reinstall through the launcher. " + verification_error);
+            } else {
+                std::set<std::pair<std::string, std::string>> needed, supported;
+                for (const auto& module : package->native_modules) {
+                    if (!is_feature_enabled(*package, selected, *find_feature(*package, module.feature_id)) ||
+                        !conditions_match(*package, selected, module.feature_id, module.when)) continue;
+                    const auto key = std::make_pair(module.feature_id, module.id);
+                    needed.insert(key);
+                    if (module.platform != mod_native_platform()) continue;
+                    supported.insert(key);
+                    ModResolution::NativeModule native;
+                    native.module = module; native.package_id = package->id;
+                    for (const auto& option : package->options) {
+                        if (option.feature_id != module.feature_id) continue;
+                        const bool disabled = !option.disabled_by.empty() &&
+                            feature_option_value(package->id, module.feature_id, option.disabled_by) == "true";
+                        native.options[option.id] = disabled ? option.default_value :
+                            feature_option_value(package->id, module.feature_id, option.id);
+                    }
+                    result.native_modules.push_back(std::move(native));
+                }
+                for (const auto& key : needed) if (!supported.count(key))
+                    result.errors.push_back(package->id + "/" + key.first + ": native module " + key.second + " is unavailable for " + mod_native_platform());
+            }
+        }
         std::vector<const ModPlugin*> plugins;
         plugins.reserve(package->plugins.size());
         for (const ModPlugin& plugin : package->plugins) {
@@ -3906,6 +4126,73 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
         result.errors.push_back(
             "more than one derived-disc provider is active: " + providers);
     }
+    std::map<uint32_t, std::pair<const ModResolution::NativeModule*, const ModNativeHook*>> native_claims;
+    std::map<uint32_t, uint32_t> native_blocks;
+    for (const auto& native : result.native_modules) for (const auto& hook : native.module.hooks) {
+        if (!hook.resume_address) continue;
+        const uint32_t lo = hook.address & 0x1fffffff;
+        const uint32_t hi = hook.resume_address & 0x1fffffff;
+        auto next = native_blocks.lower_bound(lo);
+        if ((next != native_blocks.end() && next->first < hi) ||
+            (next != native_blocks.begin() && std::prev(next)->second > lo))
+            result.errors.push_back(native.package_id + ": partial native hook ranges overlap");
+        native_blocks.emplace(lo, hi);
+    }
+    for (const auto& native : result.native_modules) {
+        for (const auto& hook : native.module.hooks) {
+            const uint32_t phys = hook.address & 0x1fffffff;
+            if (!hook.resume_address) {
+                auto after = native_blocks.upper_bound(phys);
+                if (after != native_blocks.begin() && std::prev(after)->second > phys)
+                    result.errors.push_back(native.package_id + ": function hook entry lies inside a partial replacement range");
+            }
+            for (const auto& write : result.writes) {
+                if (write.target != ModPatchTarget::MainExe) continue;
+                const auto collides = [&](uint64_t offset, const std::vector<uint8_t>& bytes) {
+                    const uint64_t begin = (write.location & 0x1fffffff) + offset;
+                    const uint64_t first = std::max<uint64_t>(begin, phys);
+                    const uint64_t last = std::min<uint64_t>(begin + bytes.size(), uint64_t(phys) + hook.expected.size());
+                    for (uint64_t at = first; at < last; ++at)
+                        if (bytes[at - begin] != hook.expected[at - phys]) return true;
+                    return false;
+                };
+                bool collision = write.fields.empty() && collides(0, write.replacement);
+                for (const auto& field : write.fields)
+                    collision = collision || collides(field.offset, field.replacement);
+                if (collision) {
+                    ModResolution::Diagnostic diagnostic;
+                    diagnostic.resource = "native-hook:" + std::to_string(phys);
+                    diagnostic.package_id = native.package_id;
+                    diagnostic.feature_id = native.module.feature_id;
+                    diagnostic.other_package_id = write.package_id;
+                    diagnostic.other_feature_id = write.feature_id;
+                    diagnostic.message = native.package_id + ": native hook guard conflicts with executable patch from " + write.package_id;
+                    result.diagnostics.push_back(diagnostic);
+                    result.errors.push_back(diagnostic.message);
+                }
+            }
+            const auto claimed = native_claims.find(phys);
+            if (claimed != native_claims.end()) {
+                const auto& previous = *claimed->second.second;
+                const size_t common = std::min(previous.expected.size(), hook.expected.size());
+                if (hook.resume_address != previous.resume_address ||
+                    !std::equal(hook.expected.begin(), hook.expected.begin() + common, previous.expected.begin())) {
+                    ModResolution::Diagnostic diagnostic;
+                    diagnostic.resource = "native-hook:" + std::to_string(phys);
+                    diagnostic.package_id = native.package_id;
+                    diagnostic.feature_id = native.module.feature_id;
+                    diagnostic.other_package_id = claimed->second.first->package_id;
+                    diagnostic.other_feature_id = claimed->second.first->module.feature_id;
+                    diagnostic.message = native.package_id + ": incompatible expected bytes for " + diagnostic.resource;
+                    result.diagnostics.push_back(diagnostic);
+                    result.errors.push_back(diagnostic.message);
+                }
+                if (hook.expected.size() > previous.expected.size())
+                    claimed->second = {&native, &hook};
+            } else native_claims[phys] = {&native, &hook};
+        }
+    }
+
     std::vector<ModResolution::Plugin> coalesced_plugins;
     coalesced_plugins.reserve(result.plugins.size());
     for (const ModResolution::Plugin& plugin : result.plugins) {
@@ -4286,6 +4573,7 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
         result.overlays.clear();
         result.derived_discs.clear();
         result.plugins.clear();
+        result.native_modules.clear();
         result.indexed_files.clear();
         result.resources.clear();
         return result;
@@ -4293,7 +4581,7 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
     result.fingerprint = fingerprint_text(
         canonical_resolution(
             result.ordered, selections_, result.writes, result.overlays,
-            result.derived_discs, result.plugins, result.indexed_files, result.resources,
+            result.derived_discs, result.plugins, result.native_modules, result.indexed_files, result.resources,
             disc_sha256));
     result.ok = true;
     return result;

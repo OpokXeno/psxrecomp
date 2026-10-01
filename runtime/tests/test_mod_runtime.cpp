@@ -81,6 +81,9 @@ extern "C" void gpu_get_display_info(GpuDisplayInfo* out) {
 
 extern "C" void dirty_ram_mark_executable_range(uint32_t, uint32_t) {}
 extern "C" int fntrace_is_game_started(void) { return 1; }
+extern "C" void psx_dispatch_call(CPUState*, uint32_t, uint32_t) {}
+extern "C" { int g_psx_call_bail = 0; }
+extern "C" void psx_native_mod_advance_cycles(uint32_t) {}
 
 static void test_vblank_plugin(void) {
     plugin_calls++;
