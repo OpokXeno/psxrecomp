@@ -13,6 +13,7 @@
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
 #include "pst_wire.h"
 #include "ram_provenance.h"
+#include "gte_precision_state.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,9 +169,25 @@ int boot_state_save_perf_json(char *out, int capacity) {
         s_save_perf.worst_service_ms, s_save_perf.worst_clone_ms, consumer);
 }
 
-static int snapshot_ready(void) {
-    return !s_native_checkpoint_hooks.snapshot_ready ||
-        s_native_checkpoint_hooks.snapshot_ready();
+int boot_state_snapshot_ready(void) {
+    if (s_native_checkpoint_hooks.restore_from_vram) return 1;
+    if (s_native_checkpoint_hooks.snapshot_ready &&
+        !s_native_checkpoint_hooks.snapshot_ready())
+        return 0;
+    /* Zero means unavailable, not an empty checkpoint, when the renderer owns
+     * a checkpoint writer. Its restore_prepare cannot restore zero bytes. */
+    return !s_native_checkpoint_hooks.snapshot_size ||
+        s_native_checkpoint_hooks.snapshot_size() != 0u;
+}
+
+static char s_load_error[256];
+
+const char* boot_state_last_load_error(void) { return s_load_error; }
+
+static int boot_state_load_reject(const char* message) {
+    snprintf(s_load_error, sizeof(s_load_error), "%s", message);
+    fprintf(stderr, "boot_state: reject — %s\n", s_load_error);
+    return 0;
 }
 #if defined(PSX_BOOT_STATE_TEST_FAULT_INJECTION)
 static int s_test_fail_after_device_apply;
@@ -546,8 +563,11 @@ static int write_native_checkpoint_section(BsOut *o)
     uint8_t *checkpoint = NULL;
     int ok;
 
-    if (s_native_checkpoint_hooks.snapshot_size != NULL)
+    if (!s_native_checkpoint_hooks.restore_from_vram &&
+        s_native_checkpoint_hooks.snapshot_size != NULL) {
         size = s_native_checkpoint_hooks.snapshot_size();
+        if (size == 0u) return 0;
+    }
     if (size != 0u) {
         if (s_native_checkpoint_hooks.snapshot_write == NULL)
             return 0;
@@ -561,6 +581,19 @@ static int write_native_checkpoint_section(BsOut *o)
     }
     ok = write_section(o, BS_SEC_NATIVE_RENDER, checkpoint, size);
     free(checkpoint);
+    return ok;
+}
+
+static int write_precision_section(BsOut *o)
+{
+    o->section = BS_SEC_GTE_PRECISION;
+    const uint32_t size = gte_precision_snapshot_bytes();
+    if (size == 0u || size > BOOT_STATE_MAX_BYTES) return 0;
+    uint8_t *data = (uint8_t *)malloc(size);
+    if (!data) return 0;
+    const int ok = gte_precision_snapshot_write(data, size) &&
+        write_section(o, BS_SEC_GTE_PRECISION, data, size);
+    free(data);
     return ok;
 }
 
@@ -734,12 +767,13 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (!identity) return 0;
     memcpy(h.game_sha256, identity->game_sha256, sizeof(h.game_sha256));
     memcpy(h.manifest_sha256, identity->manifest_sha256, sizeof(h.manifest_sha256));
-    h.section_count = 18 + (psx_mod_memory_snapshot_bytes() ? 1u : 0u) +
+    h.section_count = 19 + (psx_mod_memory_snapshot_bytes() ? 1u : 0u) +
         (hd_texture_hooks_installed() ? 1u : 0u);
 
     ok = write_header_le(o, &h);
 
     if (ok) ok = write_cpu_section(o, cpu);
+    if (ok) ok = write_precision_section(o);
     if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(), h.ram_size);
     if (ok) ok = write_ram_provenance_section(o);
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
@@ -851,16 +885,26 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
 int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
                      uint32_t entry_pc, const char* path) {
     BsOut o;
-    if (s_save_service_busy || !snapshot_ready()) return 0;
-    FILE* f = fopen(path, "wb");
+    if (s_save_service_busy || !boot_state_snapshot_ready() || !path) return 0;
+    char temporary_path[1024];
+    if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", path) >=
+        (int)sizeof(temporary_path)) return 0;
+    FILE* f = fopen(temporary_path, "wb");
     int ok;
     if (!f) return 0;
     memset(&o, 0, sizeof o);
     o.f = f;
     ok = boot_state_save_to(&o, cpu, bios_checksum, entry_pc);
-    fclose(f);
-    if (!ok)
-        remove(path);
+    if (fflush(f) != 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (ok) {
+#ifdef _WIN32
+        ok = MoveFileExA(temporary_path, path, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+        ok = rename(temporary_path, path) == 0;
+#endif
+    }
+    if (!ok) remove(temporary_path);
     return ok;
 }
 
@@ -874,7 +918,7 @@ static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum
     *out_len = 0;
     const int profile = save_perf_enabled();
     if (profile) s_save_perf.attempts++;
-    if (!snapshot_ready()) {
+    if (!boot_state_snapshot_ready()) {
         if (profile) {
             s_save_perf.deferred++;
             s_save_perf.last_deferred_cycle = psx_cycle_count;
@@ -1084,9 +1128,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &cpu->gte_data[i])) return 0;
         for (int i = 0; i < 32; i++)
             if (!pst_r_u32(&r, &cpu->gte_ctrl[i])) return 0;
-        /* Architectural normalize + drop host-only projection provenance that
-         * belonged to the pre-load timeline (not part of the wire format). */
-        gte_canonicalize_cpu_state(cpu);
+        /* Normalize and replace precision only after all sections validate.
+         * A failed device restore must keep the current timeline's shadows. */
         return 1;
     }
     case BS_SEC_RAM:
@@ -1566,7 +1609,9 @@ static int boot_state_restore_rollback(const BootStateRollback *rollback)
 int boot_state_load_buffer(const uint8_t* file, size_t file_len,
                            uint32_t bios_checksum, uint32_t entry_pc,
                            CPUState* cpu) {
-    if (s_save_service_busy) return 0;
+    s_load_error[0] = '\0';
+    if (s_save_service_busy)
+        return boot_state_load_reject("A state is still being saved");
     const uint8_t* cur;
     const uint8_t* end;
     BootStateHeader h;
@@ -1577,6 +1622,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     RamProvenanceSnapshot *provenance_snapshot = NULL;
     BootStateRollback rollback;
     void *prepared_native = NULL;
+    GtePrecisionSnapshot *prepared_precision = NULL;
+    const BootStateParsedSection *precision_section = NULL;
     CPUState staged_cpu;
     char reject[256];
     const uint32_t required =
@@ -1584,7 +1631,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         (1u<<BS_SEC_TIMER)|(1u<<BS_SEC_CLOCK)|(1u<<BS_SEC_GPU)|(1u<<BS_SEC_VRAM)|
         (1u<<BS_SEC_SPU)|(1u<<BS_SEC_SPURAM)|(1u<<BS_SEC_CDROM)|(1u<<BS_SEC_DMA)|
         (1u<<BS_SEC_SIO)|(1u<<BS_SEC_MDEC)|(1u<<BS_SEC_DIRTY)|(1u<<BS_SEC_ICACHE)|
-        (1u<<BS_SEC_NATIVE_RENDER)|(1u<<BS_SEC_RAM_PROVENANCE)|
+        (s_native_checkpoint_hooks.restore_from_vram ? 0u : (1u<<BS_SEC_NATIVE_RENDER))|
+        (1u<<BS_SEC_RAM_PROVENANCE)|
         (psx_mod_memory_snapshot_bytes() ? (1u<<BS_SEC_MODMEM) : 0u);
     uint32_t seen = 0u;
     int ok = 1;
@@ -1599,13 +1647,11 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     if (cpu == NULL ||
         !boot_state_check_buffer(file, file_len, bios_checksum, entry_pc,
                                  reject, sizeof(reject))) {
-        fprintf(stderr, "boot_state: reject — %s\n",
-                reject[0] ? reject : "unknown");
-        return 0;
+        return boot_state_load_reject(reject[0] ? reject : "No running game to restore");
     }
     if (!boot_state_parse_header(file, file_len, &h) ||
         h.section_count > (uint32_t)(sizeof(sections) / sizeof(sections[0])))
-        return 0;
+        return boot_state_load_reject("Invalid state section count");
 
     cur = file + BOOT_STATE_HEADER_WIRE_BYTES;
     end = file + file_len;
@@ -1626,7 +1672,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         }
         cur += 16u;
         if (section->tag == 0u || section->tag >= 32u ||
-            ((required | (1u << BS_SEC_HD_TEXTURE)) &
+            ((required | (1u << BS_SEC_NATIVE_RENDER) | (1u << BS_SEC_HD_TEXTURE) |
+              (1u << BS_SEC_GTE_PRECISION)) &
              (1u << section->tag)) == 0u ||
             (seen & (1u << section->tag)) != 0u ||
             len > BOOT_STATE_MAX_BYTES || (uint64_t)(end - cur) < len) {
@@ -1674,7 +1721,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
     if (!ok || cur != end || (seen & required) != required) {
         boot_state_free_parsed_sections(sections, h.section_count);
-        return 0;
+        return boot_state_load_reject("State data is incomplete or damaged");
     }
     for (uint32_t index = 0u; index < h.section_count; ++index) {
         if (sections[index].tag == BS_SEC_RAM)
@@ -1683,16 +1730,28 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
             provenance_section = &sections[index];
         else if (sections[index].tag == BS_SEC_NATIVE_RENDER)
             native_section = &sections[index];
+        else if (sections[index].tag == BS_SEC_GTE_PRECISION)
+            precision_section = &sections[index];
     }
     if (ram_section == NULL || ram_section->len != memory_get_ram_size() ||
-        provenance_section == NULL || native_section == NULL ||
+        provenance_section == NULL ||
+        (!s_native_checkpoint_hooks.restore_from_vram && native_section == NULL) ||
         !ram_provenance_snapshot_decode(
             provenance_section->data, provenance_section->len,
             ram_section->len, &provenance_snapshot)) {
         boot_state_free_parsed_sections(sections, h.section_count);
-        return 0;
+        return boot_state_load_reject("State memory data is incomplete or damaged");
     }
-    if ((s_native_checkpoint_hooks.restore_prepare == NULL) !=
+    if (!s_native_checkpoint_hooks.restore_from_vram &&
+        s_native_checkpoint_hooks.restore_prepare != NULL &&
+        native_section->len == 0u) {
+        ram_provenance_snapshot_free(provenance_snapshot);
+        boot_state_free_parsed_sections(sections, h.section_count);
+        return boot_state_load_reject(
+            "Native renderer data is missing. Save a new state");
+    }
+    if (!s_native_checkpoint_hooks.restore_from_vram &&
+        ((s_native_checkpoint_hooks.restore_prepare == NULL) !=
             (s_native_checkpoint_hooks.restore_commit == NULL) ||
         (s_native_checkpoint_hooks.restore_prepare == NULL) !=
             (s_native_checkpoint_hooks.restore_cancel == NULL) ||
@@ -1701,17 +1760,27 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         (s_native_checkpoint_hooks.restore_prepare != NULL &&
          (!s_native_checkpoint_hooks.restore_prepare(
               native_section->data, native_section->len, &prepared_native) ||
-          prepared_native == NULL))) {
+          prepared_native == NULL)))) {
         ram_provenance_snapshot_free(provenance_snapshot);
         boot_state_free_parsed_sections(sections, h.section_count);
-        return 0;
+        return boot_state_load_reject("Could not restore the state's renderer resources");
     }
-    if (!boot_state_capture_rollback(&rollback)) {
+    if (precision_section != NULL &&
+        !gte_precision_snapshot_prepare(precision_section->data,
+                                        precision_section->len, &prepared_precision)) {
         if (prepared_native != NULL)
             s_native_checkpoint_hooks.restore_cancel(prepared_native);
         ram_provenance_snapshot_free(provenance_snapshot);
         boot_state_free_parsed_sections(sections, h.section_count);
-        return 0;
+        return boot_state_load_reject("State vertex precision data is invalid or unavailable");
+    }
+    if (!boot_state_capture_rollback(&rollback)) {
+        gte_precision_snapshot_cancel(prepared_precision);
+        if (prepared_native != NULL)
+            s_native_checkpoint_hooks.restore_cancel(prepared_native);
+        ram_provenance_snapshot_free(provenance_snapshot);
+        boot_state_free_parsed_sections(sections, h.section_count);
+        return boot_state_load_reject("Not enough memory to restore the state safely");
     }
 
     staged_cpu = *cpu;
@@ -1721,11 +1790,18 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
         if (section->tag == BS_SEC_RAM ||
             section->tag == BS_SEC_RAM_PROVENANCE ||
-            section->tag == BS_SEC_NATIVE_RENDER)
+            section->tag == BS_SEC_NATIVE_RENDER ||
+            section->tag == BS_SEC_GTE_PRECISION)
             continue;
         t_sec = boot_state_mono_ms();
         ok = apply_section(section->tag, section->data, section->len,
                            &staged_cpu, entry_pc);
+        if (!ok) {
+            char message[128];
+            snprintf(message, sizeof(message), "Invalid device data in state section %u",
+                     (unsigned)section->tag);
+            (void)boot_state_load_reject(message);
+        }
 #if defined(PSX_BOOT_STATE_TEST_FAULT_INJECTION)
         if (ok && section->tag == BS_SEC_GPU &&
             s_test_fail_after_device_apply) {
@@ -1746,6 +1822,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         boot_state_free_rollback(&rollback);
         if (prepared_native != NULL)
             s_native_checkpoint_hooks.restore_cancel(prepared_native);
+        gte_precision_snapshot_cancel(prepared_precision);
         ram_provenance_snapshot_free(provenance_snapshot);
         boot_state_free_parsed_sections(sections, h.section_count);
         return 0;
@@ -1753,14 +1830,15 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
     if (prepared_native != NULL)
         s_native_checkpoint_hooks.restore_commit(prepared_native);
-    gpu_note_vram_restore();
 
     {
         const double t_ram = boot_state_mono_ms();
         memcpy(memory_get_ram_ptr(), ram_section->data, ram_section->len);
+        *cpu = staged_cpu;
+        gte_canonicalize_cpu_state(cpu);
         ram_provenance_snapshot_commit(provenance_snapshot);
         provenance_snapshot = NULL;
-        *cpu = staged_cpu;
+        gte_precision_snapshot_commit(prepared_precision);
         apply_ram_ms += boot_state_mono_ms() - t_ram;
     }
     {
@@ -1768,6 +1846,9 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         psx_kernel_bless_note_range(0u, ram_section->len);
     }
     overlay_watch_invalidate_after_ram_restore();
+    /* Native Work rebuilds from this event. Its source description and
+     * authentication must observe restored RAM/CPU as well as restored VRAM. */
+    gpu_note_vram_restore();
     boot_state_free_rollback(&rollback);
     boot_state_free_parsed_sections(sections, h.section_count);
 
@@ -1786,7 +1867,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
 int boot_state_load(const char* path, uint32_t bios_checksum,
                     uint32_t entry_pc, CPUState* cpu) {
-    FILE* f = fopen(path, "rb");
+    s_load_error[0] = '\0';
+    FILE* f = path ? fopen(path, "rb") : NULL;
     long sz;
     uint8_t* file = NULL;
     size_t file_len = 0;
@@ -1795,27 +1877,32 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
     double t_after_read;
 
     if (!f) {
-        fprintf(stderr, "boot_state: reject — missing %s\n",
-                path ? path : "(null)");
-        return 0;
+        return boot_state_load_reject("State file is missing or unreadable");
     }
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return boot_state_load_reject("Could not read the state file");
+    }
     sz = ftell(f);
     if (sz < (long)BOOT_STATE_HEADER_WIRE_BYTES ||
         (uint64_t)sz > (uint64_t)BOOT_STATE_MAX_BYTES) {
-        fprintf(stderr, "boot_state: reject — bad size %ld for %s\n",
-                sz, path ? path : "(null)");
         fclose(f);
-        return 0;
+        return boot_state_load_reject("State file is truncated or too large");
     }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return boot_state_load_reject("Could not read the state file");
+    }
     file_len = (size_t)sz;
     file = (uint8_t*)malloc(file_len);
-    if (!file) { fclose(f); return 0; }
+    if (!file) {
+        fclose(f);
+        return boot_state_load_reject("Not enough memory to read the state file");
+    }
     if (fread(file, 1, file_len, f) != file_len) {
         free(file);
         fclose(f);
-        return 0;
+        return boot_state_load_reject("Could not read the complete state file");
     }
     fclose(f);
     t_after_read = boot_state_mono_ms();

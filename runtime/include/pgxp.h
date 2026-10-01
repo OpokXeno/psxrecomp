@@ -11,8 +11,9 @@
  * packet's RAM address, validated against the actual word — never guessed
  * from the rounded position (the measured G1.4 dead end).
  *
- * Guest-visible state is NEVER touched: shadows are host-only, dropped on
- * savestate/rewind, and suppressed during speculative validation passes.
+ * Guest-visible state is NEVER touched: shadows are host-only, saved alongside
+ * guest state, and suppressed during speculative validation passes. Restores
+ * without a precision section invalidate the previous timeline's shadows.
  */
 
 #include <stdint.h>
@@ -42,6 +43,15 @@ float pgxp_tolerance(void);
 /* Drop all shadows (savestate load, raw RAM restore, timeline breaks).
  * O(1) via generation bump. Deferred while suppressed. */
 void pgxp_invalidate_all(void);
+
+/* Sparse, pointer-free checkpoint used by the GTE precision savestate section.
+ * Prepare has no live side effects; commit keeps the current user settings. */
+typedef struct PGXPSnapshot PGXPSnapshot;
+uint32_t pgxp_snapshot_bytes(void);
+int pgxp_snapshot_write(uint8_t *out, uint32_t size);
+int pgxp_snapshot_prepare(const uint8_t *data, uint32_t size, PGXPSnapshot **out);
+void pgxp_snapshot_commit(PGXPSnapshot *snapshot);
+void pgxp_snapshot_cancel(PGXPSnapshot *snapshot);
 
 /* Counted suppression bracket for speculative native-validation passes and
  * the GTE replay sandbox: hooks and producers no-op inside it. */

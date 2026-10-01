@@ -27,7 +27,7 @@
  * harmless because the position it describes is still that word.
  *
  * Everything here is host-only and visual-only: guest-visible state is never
- * read back from shadows, shadows are dropped on savestate/rewind, and the
+ * read back from shadows, savestates preserve their matching shadows, and the
  * speculative native-validation bracket suppresses all recording.
  */
 
@@ -35,6 +35,7 @@
 #include "pgxp_hooks.h"
 #include "cpu_state.h"
 #include "memory.h"
+#include "pst_wire.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -187,6 +188,116 @@ static inline void pv_reset(PGXPValue *pv, uint32_t value) {
 }
 
 static inline void pv_kill(PGXPValue *pv) { pv->gen = 0; }
+
+/* The sparse keys cover active RAM, scratchpad, GPR/HI/LO and GTE registers.
+ * Generation numbers are deliberately rebased on restore rather than copied. */
+struct PGXPSnapshotEntry {
+    uint32_t key;
+    PGXPValue value;
+};
+struct PGXPSnapshot {
+    uint32_t count;
+    PGXPSnapshotEntry *entries;
+};
+static constexpr uint32_t PGXP_SNAPSHOT_MAGIC = 0x31584750u; /* PGX1 */
+static constexpr uint32_t PGXP_SNAPSHOT_HEADER_BYTES = 16u;
+static constexpr uint32_t PGXP_SNAPSHOT_ENTRY_BYTES = 20u;
+
+static const PGXPValue *pgxp_snapshot_slot(uint32_t key, uint32_t ram_words) {
+    if (key < ram_words) return s_ram ? &s_ram[key] : nullptr;
+    key -= ram_words;
+    if (key < PGXP_SCRATCH_WORDS) return &s_scratch[key];
+    key -= PGXP_SCRATCH_WORDS;
+    if (key < 34u) return &s_gpr[key];
+    return &s_gte[key - 34u];
+}
+
+extern "C" uint32_t pgxp_snapshot_bytes(void) {
+    if (s_suppress != 0u) return 0u;
+    uint32_t count = 0u;
+    const uint32_t words = memory_get_ram_size() / 4u;
+    if (s_enabled)
+        for (uint32_t key = 0u; key < words + PGXP_SCRATCH_WORDS + 66u; ++key)
+            if (pv_live(pgxp_snapshot_slot(key, words))) ++count;
+    return PGXP_SNAPSHOT_HEADER_BYTES + count * PGXP_SNAPSHOT_ENTRY_BYTES;
+}
+
+extern "C" int pgxp_snapshot_write(uint8_t *out, uint32_t size) {
+    if (!out || size < PGXP_SNAPSHOT_HEADER_BYTES || s_suppress != 0u) return 0;
+    PstW w;
+    pst_w_init(&w, out, size);
+    const uint32_t words = memory_get_ram_size() / 4u;
+    const uint32_t count = (size - PGXP_SNAPSHOT_HEADER_BYTES) / PGXP_SNAPSHOT_ENTRY_BYTES;
+    if (!pst_w_u32(&w, PGXP_SNAPSHOT_MAGIC) || !pst_w_u32(&w, 1u) ||
+        !pst_w_u32(&w, words) || !pst_w_u32(&w, count)) return 0;
+    if (s_enabled)
+        for (uint32_t key = 0u; key < words + PGXP_SCRATCH_WORDS + 66u; ++key) {
+            const PGXPValue *v = pgxp_snapshot_slot(key, words);
+            if (!pv_live(v)) continue;
+            if (!pst_w_u32(&w, key) || !pst_w_i32(&w, v->x16) ||
+                !pst_w_i32(&w, v->y16) || !pst_w_u16(&w, v->z) ||
+                !pst_w_u16(&w, v->flags) || !pst_w_u32(&w, v->value)) return 0;
+        }
+    return w.written == size;
+}
+
+extern "C" void pgxp_snapshot_cancel(PGXPSnapshot *snapshot) {
+    if (!snapshot) return;
+    std::free(snapshot->entries);
+    std::free(snapshot);
+}
+
+extern "C" int pgxp_snapshot_prepare(const uint8_t *data, uint32_t size,
+                                      PGXPSnapshot **out) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!data || size < PGXP_SNAPSHOT_HEADER_BYTES || s_suppress != 0u) return 0;
+    PstR r;
+    pst_r_init(&r, data, size);
+    uint32_t magic, version, words, count;
+    if (!pst_r_u32(&r, &magic) || magic != PGXP_SNAPSHOT_MAGIC ||
+        !pst_r_u32(&r, &version) || version != 1u ||
+        !pst_r_u32(&r, &words) || words != memory_get_ram_size() / 4u ||
+        !pst_r_u32(&r, &count) || count > words + PGXP_SCRATCH_WORDS + 66u ||
+        (uint64_t)PGXP_SNAPSHOT_HEADER_BYTES +
+            (uint64_t)count * PGXP_SNAPSHOT_ENTRY_BYTES != size) return 0;
+    auto *snapshot = (PGXPSnapshot *)std::calloc(1u, sizeof(PGXPSnapshot));
+    if (!snapshot) return 0;
+    snapshot->entries = (PGXPSnapshotEntry *)std::calloc(
+        count ? count : 1u, sizeof(PGXPSnapshotEntry));
+    if (!snapshot->entries) { pgxp_snapshot_cancel(snapshot); return 0; }
+    snapshot->count = count;
+    for (uint32_t index = 0u; index < count; ++index) {
+        auto &e = snapshot->entries[index];
+        if (!pst_r_u32(&r, &e.key) || e.key >= words + PGXP_SCRATCH_WORDS + 66u ||
+            (index && e.key <= snapshot->entries[index - 1u].key) ||
+            !pst_r_i32(&r, &e.value.x16) || !pst_r_i32(&r, &e.value.y16) ||
+            !pst_r_u16(&r, &e.value.z) || !pst_r_u16(&r, &e.value.flags) ||
+            !(e.value.flags & PGXP_F_VXY) || (e.value.flags & ~7u) ||
+            !pst_r_u32(&r, &e.value.value)) {
+            pgxp_snapshot_cancel(snapshot);
+            return 0;
+        }
+    }
+    *out = snapshot;
+    return 1;
+}
+
+extern "C" void pgxp_snapshot_commit(PGXPSnapshot *snapshot) {
+    if (!snapshot) return;
+    pgxp_invalidate_all();
+    if (s_enabled) {
+        const uint32_t words = memory_get_ram_size() / 4u;
+        for (uint32_t index = 0u; index < snapshot->count; ++index) {
+            auto *destination = const_cast<PGXPValue *>(
+                pgxp_snapshot_slot(snapshot->entries[index].key, words));
+            if (!destination) continue;
+            *destination = snapshot->entries[index].value;
+            destination->gen = s_gen;
+        }
+    }
+    pgxp_snapshot_cancel(snapshot);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Instruction field helpers                                                  */

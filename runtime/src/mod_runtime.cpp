@@ -80,6 +80,7 @@ struct RuntimeMods {
     bool verified_disc_required = false;
     bool launcher_committed = false;
     const ModResolution::Plugin* current_plugin = nullptr;
+    std::map<std::pair<std::string, std::string>, bool> live_features;
 };
 
 struct DiscIndexes {
@@ -97,6 +98,68 @@ std::map<std::string, ModIndexedFileHandler>& indexed_file_handlers() {
 RuntimeMods& state() {
     static RuntimeMods value;
     return value;
+}
+
+std::map<std::string, PSXModRuntimeToggleCallback>& runtime_toggle_plugins() {
+    static std::map<std::string, PSXModRuntimeToggleCallback> value;
+    return value;
+}
+
+/* Keep the authenticated guest plan immutable. A live override may only
+ * control a standalone host plugin with an explicit stock-reset callback. */
+const ModPlugin* runtime_toggle_plugin(const ModPackage& package,
+                                      const ModFeature& feature) {
+    const RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok || feature.legacy ||
+        package.resolver != "declarative" ||
+        !package.patches.empty() || !package.overlays.empty() ||
+        !package.indexed_files.empty() || !package.derived_discs.empty() ||
+        !package.native_modules.empty() || !package.resources.empty() ||
+        !package.dependencies.empty() || !package.conflicts.empty() ||
+        !package.constraints.empty()) return nullptr;
+    bool matches = false;
+    for (const auto& target : package.targets) {
+        if ((target.game_id == "*" || target.game_id == s.game_id) &&
+            (target.exe_sha256.empty() || target.exe_sha256 == s.exe_sha256) &&
+            (target.disc_sha256.empty() || target.disc_sha256 == s.disc_sha256))
+            matches = true;
+    }
+    if (!matches || !s.manager.conflict_blocker(package.id).empty()) return nullptr;
+    const ModPlugin* result = nullptr;
+    for (const auto& plugin : package.plugins) {
+        if (plugin.feature_id != feature.id) continue;
+        if (result || !plugin.when.empty() ||
+            !runtime_toggle_plugins().count(plugin.id)) return nullptr;
+        result = &plugin;
+    }
+    if (result) {
+        // A process-wide host setting needs one unambiguous feature owner.
+        int owners = 0;
+        for (const auto& entry : s.manager.packages()) {
+            const auto* owner = s.manager.selected_package(entry.first);
+            if (!owner) continue;
+            for (const auto& plugin : owner->plugins)
+                if (plugin.id == result->id && ++owners > 1) return nullptr;
+        }
+    }
+    return result;
+}
+
+void reset_runtime_toggles() {
+    RuntimeMods& s = state();
+    for (const auto& entry : s.manager.packages()) {
+        const auto* package = s.manager.selected_package(entry.first);
+        if (!package) continue;
+        for (const auto& feature : package->features) {
+            const auto* plugin = runtime_toggle_plugin(*package, feature);
+            if (!plugin) continue;
+            const auto live = s.live_features.find({package->id, feature.id});
+            const bool enabled = live != s.live_features.end() ? live->second
+                : s.manager.feature_enabled(package->id, feature.id);
+            if (enabled) runtime_toggle_plugins().at(plugin->id)(0);
+        }
+    }
+    s.live_features.clear();
 }
 
 struct FunctionEntryPlugin {
@@ -1429,9 +1492,11 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
                             const std::filesystem::path& exe_path,
                             std::string* error) {
     RuntimeMods& s = state();
+    reset_runtime_toggles();
     mod_native_reset();
     s.manager.set_root({});
     s.plan = {};
+    s.live_features.clear();
     s.validation = {};
     s.raw_disc_index.clear();
     s.user_disc_index.clear();
@@ -1480,6 +1545,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
 bool mod_runtime_clear_for_netplay(std::string* error) {
     mod_native_reset();
     RuntimeMods& s = state();
+    reset_runtime_toggles();
     if (!s.initialized) {
         if (error) error->clear();
         return true;
@@ -1687,6 +1753,7 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path,
     const bool indexed_plan = !plan.indexed_files.empty();
     s.disc_path = std::move(committed_disc_path);
     s.disc_sha256 = std::move(digest);
+    s.exe_sha256 = std::move(exe_sha256);
     s.plan = std::move(plan);
     s.validation = std::move(validation);
     s.raw_disc_index.swap(indexes.raw_disc);
@@ -1712,6 +1779,55 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path,
 
 const std::string& mod_runtime_fingerprint() {
     return state().plan.fingerprint;
+}
+
+std::vector<ModRuntimeFeature> mod_runtime_features() {
+    const RuntimeMods& s = state();
+    std::vector<ModRuntimeFeature> out;
+    for (const auto& entry : s.manager.packages()) {
+        const auto* package = s.manager.selected_package(entry.first);
+        if (!package || package->id == "psx.enhancement.pgxp") continue;
+        for (const auto& feature : package->features) {
+            if (feature.hidden || (feature.channel == ModChannel::Developer &&
+                !s.manager.developer_channel_visible())) continue;
+            bool enabled = false;
+            for (const auto* active : s.plan.ordered)
+                if (active->id == package->id)
+                    enabled = s.manager.feature_enabled(package->id, feature.id);
+            const auto live = s.live_features.find({package->id, feature.id});
+            if (live != s.live_features.end()) enabled = live->second;
+            out.push_back({package->id, feature.id, feature.name,
+                           feature.description, enabled,
+                           runtime_toggle_plugin(*package, feature) != nullptr});
+        }
+    }
+    return out;
+}
+
+bool mod_runtime_set_feature_enabled(const std::string& package_id,
+                                    const std::string& feature_id, bool enabled,
+                                    std::string* error) {
+    RuntimeMods& s = state();
+    const auto* package = s.manager.selected_package(package_id);
+    const auto* feature = s.manager.selected_feature(package_id, feature_id);
+    const auto* plugin = package && feature ? runtime_toggle_plugin(*package, *feature) : nullptr;
+    if (!plugin) {
+        if (error) *error = "This feature requires a restart or is unavailable in this session.";
+        return false;
+    }
+    // Persist only eligible host features. The authenticated guest plan stays
+    // immutable; the live override implements this session's effective state.
+    const bool previous = s.manager.feature_enabled(package_id, feature_id);
+    if (!s.manager.set_feature_enabled(package_id, feature_id, enabled, error)) return false;
+    if (!s.manager.save_state(error)) {
+        (void)s.manager.set_feature_enabled(package_id, feature_id, previous, nullptr);
+        return false;
+    }
+    // Insert first so the callback can query the effective state consistently.
+    s.live_features[{package_id, feature_id}] = enabled;
+    runtime_toggle_plugins().at(plugin->id)(enabled ? 1 : 0);
+    if (error) error->clear();
+    return true;
 }
 
 const std::filesystem::path& mod_runtime_effective_disc_path() {
@@ -1886,10 +2002,24 @@ extern "C" void mod_runtime_activate_plugins(void) {
     if (!s.initialized || !s.plan.ok) return;
     mod_native_activate();
     for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        if (s.live_features.count({plugin.package_id, plugin.feature_id})) continue;
         s.current_plugin = &plugin;
         mod_invoke_activation_plugin(plugin.id);
         s.current_plugin = nullptr;
     }
+    for (const auto& entry : s.live_features) {
+        const auto* package = s.manager.selected_package(entry.first.first);
+        const auto* feature = s.manager.selected_feature(entry.first.first, entry.first.second);
+        if (package && feature)
+            if (const auto* plugin = runtime_toggle_plugin(*package, *feature))
+                runtime_toggle_plugins().at(plugin->id)(entry.second ? 1 : 0);
+    }
+}
+
+extern "C" int psx_mod_register_runtime_toggle_plugin(
+    const char* id, PSXModRuntimeToggleCallback callback) {
+    if (!id || !id[0] || !callback) return 0;
+    return PSXRecompV4::runtime_toggle_plugins().emplace(id, callback).second ? 1 : 0;
 }
 
 extern "C" void mod_runtime_on_vblank(void) {

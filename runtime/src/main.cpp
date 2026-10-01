@@ -104,6 +104,16 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "launcher_device.h"
 #include "game_options.h"
 #include "debug_overlay.h"
+#include "runtime_menu.h"
+#include "runtime_menu_actions.h"
+#include "free_camera.h"
+extern "C" {
+extern int g_ws_bd_stretch_on;
+extern int g_ws_bd_stretch_pct;
+}
+#ifdef RECOMP_LAUNCHER
+#include "consoles/psx/psx_pad_binds.h"
+#endif
 #include "mod_plugins.h"
 #include "mod_runtime.h"
 #include "crc32.h"
@@ -1374,10 +1384,12 @@ static void post_load_probe_on_vblank(int turbo_active, int present_reached) {
  * restored VRAM — including a blank if display was disabled in the snapshot. */
 static void savestate_input_guard_arm(void);
 extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) {
-    char buf[64];
+    char buf[320];
     const int disp = slot + 1;
-    if (!is_load && ok)
+    if (!is_load && ok) {
         psx_savestate_menu_note_slots_changed();
+        psx_runtime_menu_note_savestates_changed();
+    }
     if (is_load && ok)
         savestate_input_guard_arm();
     if (is_load) {
@@ -1391,12 +1403,17 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
         else
             snprintf(buf, sizeof(buf), "Save failed slot %d", disp);
     }
+    if (!ok && *savestate_last_error()) {
+        const size_t length = std::strlen(buf);
+        std::snprintf(buf + length, sizeof(buf) - length, ": %s", savestate_last_error());
+    }
+    psx_runtime_menu_savestate_status(buf, !ok);
     host_osd_push(buf, 2000);
 }
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
     /* boot_state emits GPU_VRAM_EVENT_RESTORE after applying the guest state;
-     * its Native checkpoint hook has already opened the replacement scene. */
+     * Native Work rebuilds from VRAM in a fresh presentation epoch. */
     psx_xenogears_scene_reset();
     mod_runtime_on_savestate_loaded();
     s_disabled_frame_presented = false;
@@ -1997,6 +2014,8 @@ extern "C" int psx_mod_set_bezel_artwork(const char* path) {
     return 1;
 }
 
+static void apply_load_acceleration_runtime(uint32_t multiplier, uint32_t release_frames);
+
 extern "C" int psx_mod_set_load_acceleration(
     uint32_t wall_clock_multiplier, uint32_t release_frames) {
     /* Host pacing only changes how fast wall-clock time is fed to a load; every
@@ -2013,6 +2032,7 @@ extern "C" int psx_mod_set_load_acceleration(
     }
     g_mod_load_wall_multiplier = (int)wall_clock_multiplier;
     g_mod_load_release_frames = (int)release_frames;
+    apply_load_acceleration_runtime(wall_clock_multiplier, release_frames);
     return 1;
 }
 
@@ -2037,6 +2057,11 @@ extern "C" int psx_mod_set_disc_speed(
     g_mod_disc_speed_divisor = (int)divisor;
     g_mod_disc_instant_rate =
         divisor == 0 ? (int)instant_max_per_frame : -1;
+    // Keep BIOS boot authentic; the next game dispatch applies the stored
+    // speed. Once in-game, update the sector scheduler immediately.
+    cdrom_set_game_speed((int)divisor);
+    if (psx_mod_game_started()) cdrom_set_speed((int)divisor);
+    if (divisor == 0) cdrom_set_instant_rate((int)instant_max_per_frame);
     return 1;
 }
 
@@ -2840,6 +2865,12 @@ static int g_turbo_audio_sink_config_enabled = 0;
 /* Zero multiplier retains the historical uncapped turbo behavior. */
 static int g_turbo_load_wall_multiplier = 0;
 static int g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
+static void apply_load_acceleration_runtime(uint32_t multiplier, uint32_t release_frames) {
+    g_turbo_load_wall_multiplier = (int)multiplier;
+    g_turbo_load_release_frames = (int)release_frames;
+    g_turbo_loads_enabled = multiplier != 1;
+    g_turbo_audio_sink_enabled = multiplier != 1;
+}
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t sdl_audio_buf[2048 * 2];
 
@@ -4236,6 +4267,8 @@ static void shutdown_runtime(void) {
         SDL_GameController* replay_players[2] = { nullptr, nullptr };
         input_replay::detach(replay_players);
     }
+    psx_runtime_menu_shutdown();
+    psx_free_camera_shutdown();
     psx_debug_overlay_shutdown();
     debug_server_shutdown();
     gpu_set_host_quantum_boundary_hook(nullptr);
@@ -5203,11 +5236,16 @@ static std::string default_input_ini_text(void) {
         "rs_right = rightx+\n";
 }
 
+static std::string s_runtime_input_exe_path;
+static std::string s_runtime_input_ini_path;
+
 static void load_input_config(const char* argv0) {
+    s_runtime_input_exe_path = argv0 ? argv0 : "";
     set_default_controller_mapping();
 
     namespace fs = std::filesystem;
     fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
+    s_runtime_input_ini_path = config_path.string();
     std::error_code ec;
     if (!fs::exists(config_path, ec)) {
         std::ofstream out(config_path, std::ios::binary);
@@ -5288,6 +5326,169 @@ static void load_input_config(const char* argv0) {
      * it here so the runtime always reflects the current bindings. */
     psx_keybinds_init(argv0);
 }
+
+#ifdef RECOMP_LAUNCHER
+extern "C" int psx_input_runtime_bindings_available(void) {
+    return !input_replay::active() && !input_replay::recording();
+}
+
+extern "C" int psx_runtime_menu_save_settings(unsigned int changed, int windowed_visible) {
+    if (s_fast_map_settings_path.empty()) return 0;
+    try {
+        auto s = PSXRecompV4::load_user_settings(s_fast_map_settings_path);
+        if (s.parse_error) return 0;
+        if (changed & MENU_ASPECT) {
+            present_aspect(&s.aspect_num, &s.aspect_den); s.has_aspect_ratio = true;
+            s.adaptive_view = false; s.has_adaptive_view = true;
+        }
+        if (changed & MENU_WINDOW_SIZE) { s.window_width = g_video_win_w; s.has_window_width = true; }
+        if (changed & MENU_FULLSCREEN) {
+            const Uint32 flags = SDL_GetWindowFlags(sdl_window);
+            s.fullscreen = (flags & SDL_WINDOW_FULLSCREEN) ? 1 : 0;
+            s.has_fullscreen = true;
+        }
+        if (changed & MENU_VSYNC) { s.vsync = g_video_vsync; s.has_vsync = true; }
+        if (changed & MENU_SCALE) { s.supersampling = g_video_scale; s.has_supersampling = true; }
+        if (changed & MENU_TEXTURE_FILTER) { s.texture_filter = gr_texture_filter(); s.has_texture_filter = true; }
+        if (changed & MENU_SPRITE_FILTER) { s.sprite_filter = gl_renderer_sprite_filter(); s.has_sprite_filter = true; }
+        if (changed & MENU_ANISOTROPY) { s.anisotropic_filtering = gl_renderer_anisotropy(); s.has_anisotropic_filtering = true; }
+        if (changed & MENU_ANTIALIASING) { s.antialiasing = g_video_aa; s.has_antialiasing = true; }
+        if (changed & (MENU_AA_FACTOR | MENU_ANTIALIASING)) { s.antialiasing_factor = g_video_aa_factor; s.has_antialiasing_factor = true; }
+        if (changed & MENU_FPS) { s.fps = gl_renderer_native_interpolation_target_fps(); s.has_fps = true; }
+        if (changed & MENU_DITHERING) { s.dithering = gpu_dithering_enabled() != 0; s.has_dithering = true; }
+        if (changed & MENU_SCREEN_MODEL) { s.screen_kind = g_video_screen; s.has_screen_kind = true; }
+        if (changed & MENU_Z_BUFFER) { s.z_buffer = gl_renderer_native_depth_test() != 0; s.has_z_buffer = true; }
+        if (changed & MENU_MIPMAPS) { s.texture_mipmaps = gl_renderer_debug_mipmaps() != 0; s.has_texture_mipmaps = true; }
+        if (changed & MENU_WIREFRAME) { s.wireframe = gl_renderer_native_wireframe() != 0; s.has_wireframe = true; }
+        if (changed & MENU_DEPTH_VIEW) { s.depth_view = gl_renderer_native_depth_view(); s.has_depth_view = true; }
+        if (changed & MENU_BACKDROP_STRETCH) { s.backdrop_stretch = g_ws_bd_stretch_on != 0; s.has_backdrop_stretch = true; }
+        if (changed & MENU_BACKDROP_PERCENT) { s.backdrop_stretch_percent = g_ws_bd_stretch_pct; s.has_backdrop_stretch_percent = true; }
+        if (changed & MENU_VOLUME) { s.volume = host_volume_get(); s.has_volume = true; }
+        if (changed & MENU_SPU_HQ) { s.spu_hq = g_audio_spu_hq; s.has_spu_hq = true; }
+        if (changed & MENU_HD_TEXTURES) {
+            HdTextureRuntimeStats hd{}; hd_texture_runtime_stats(&hd);
+            s.hd_texture_replacements = hd.enabled != 0; s.has_hd_texture_replacements = true;
+        }
+        if (changed & MENU_CAMERA) {
+            PsxFreeCameraSettings camera{};
+            psx_free_camera_get_settings(&camera);
+            s.has_free_camera = true;
+            s.camera_enabled = camera.enabled;
+            s.camera_fly_keys = camera.fly_keys;
+            s.camera_capture_input = camera.capture_input;
+            s.camera_mouse_look = camera.mouse_look;
+            s.camera_invert_y = camera.invert_y;
+            s.camera_wheel_dolly = camera.wheel_dolly;
+            s.camera_pan = camera.pan;
+            s.camera_fly_speed = camera.fly_speed;
+            s.camera_rotation_speed = camera.rotation_speed;
+            s.camera_look_sensitivity = camera.look_sensitivity;
+            s.camera_wheel_step = camera.wheel_step;
+            s.camera_pan_factor = camera.pan_factor;
+        }
+        if (changed & MENU_VISIBILITY) { s.menu_bar_visible = windowed_visible != 0; s.has_menu_bar_visible = true; }
+        return PSXRecompV4::save_user_settings(s_fast_map_settings_path, s) ? 1 : 0;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "psxrecomp: cannot save menu settings: %s\n", ex.what());
+        return 0;
+    }
+}
+
+extern "C" int psx_runtime_menu_restore_settings(void) {
+    try {
+        const auto s = PSXRecompV4::load_user_settings(s_fast_map_settings_path);
+        if (s.has_z_buffer) gl_renderer_set_native_depth_test(s.z_buffer);
+        if (s.has_texture_mipmaps) gl_renderer_set_debug_mipmaps(s.texture_mipmaps);
+        if (s.has_wireframe) gl_renderer_set_native_wireframe(s.wireframe);
+        if (s.has_depth_view) gl_renderer_set_native_depth_view(s.depth_view);
+        if (s.has_backdrop_stretch) g_ws_bd_stretch_on = s.backdrop_stretch;
+        if (s.has_backdrop_stretch_percent) g_ws_bd_stretch_pct = s.backdrop_stretch_percent;
+        if (s.has_hd_texture_replacements) hd_texture_runtime_set_enabled(s.hd_texture_replacements);
+        if (s.has_free_camera) {
+            PsxFreeCameraSettings camera{};
+            camera.enabled = s.camera_enabled;
+            camera.fly_keys = s.camera_fly_keys;
+            camera.capture_input = s.camera_capture_input;
+            camera.mouse_look = s.camera_mouse_look;
+            camera.invert_y = s.camera_invert_y;
+            camera.wheel_dolly = s.camera_wheel_dolly;
+            camera.pan = s.camera_pan;
+            camera.fly_speed = s.camera_fly_speed;
+            camera.rotation_speed = s.camera_rotation_speed;
+            camera.look_sensitivity = s.camera_look_sensitivity;
+            camera.wheel_step = s.camera_wheel_step;
+            camera.pan_factor = s.camera_pan_factor;
+            psx_free_camera_set_settings(&camera);
+        }
+        return s.has_menu_bar_visible ? s.menu_bar_visible : 1;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "psxrecomp: cannot restore menu settings: %s\n", ex.what());
+        return 1;
+    }
+}
+
+extern "C" int psx_input_binding_player_count(void) { return PSX_MAX_PLAYERS; }
+
+extern "C" int psx_input_binding_gamepad(int player, SDL_JoystickID* instance,
+                                        char* name, size_t capacity) {
+    if (player < 1 || player > PSX_MAX_PLAYERS) return 0;
+    const PlayerInput& p = g_players[player - 1];
+    if (!p.handle || !p.guid[0]) return 0;
+    if (instance) *instance = p.instance;
+    if (name && capacity) {
+        const char* label = SDL_GameControllerName(p.handle);
+        std::snprintf(name, capacity, "%s", label ? label : "Gamepad");
+    }
+    return 1;
+}
+
+extern "C" void psx_input_gamepad_binding_label(int player, int button,
+                                               char* out, size_t capacity) {
+    if (!out || !capacity) return;
+    std::string label;
+    if (player >= 1 && player <= PSX_MAX_PLAYERS && button >= 0 && button < PSX_KB_COUNT) {
+        const auto& sources = controller_map_for(g_players[player - 1])[button].sources;
+        for (const auto& source : sources) {
+            const bool is_button = source.kind == ControllerSource::Kind::Button;
+            const char* name = is_button
+                ? SDL_GameControllerGetStringForButton((SDL_GameControllerButton)source.id)
+                : SDL_GameControllerGetStringForAxis((SDL_GameControllerAxis)source.id);
+            if (!name) continue;
+            if (!label.empty()) label += ", ";
+            label += name;
+            if (!is_button) label += source.kind == ControllerSource::Kind::AxisNegative ? '-' : '+';
+        }
+    }
+    std::snprintf(out, capacity, "%s", label.empty() ? "None" : label.c_str());
+}
+
+// The launcher orders face/shoulder buttons differently from PsxKeybindButton.
+static const int kRuntimeToLauncherButton[PSX_KB_COUNT] = {
+    0, 1, 2, 3, 6, 5, 7, 4, 8, 10, 9, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23
+};
+
+extern "C" int psx_input_set_gamepad_binding(int player, int button, int kind,
+                                            int code, int direction) {
+    if (!psx_input_runtime_bindings_available() || button < 0 || button >= PSX_KB_COUNT ||
+        !psx_input_binding_gamepad(player, nullptr, nullptr, 0)) return 0;
+    const auto& p = g_players[player - 1];
+    rui_psx_pad_binds_set(s_runtime_input_ini_path.c_str(), p.guid,
+                         kRuntimeToLauncherButton[button], kind, code, direction);
+    const std::string exe = s_runtime_input_exe_path;
+    load_input_config(exe.c_str());
+    return 1;
+}
+
+extern "C" int psx_input_reset_gamepad_bindings(int player) {
+    if (!psx_input_runtime_bindings_available() ||
+        !psx_input_binding_gamepad(player, nullptr, nullptr, 0)) return 0;
+    rui_psx_pad_binds_reset(s_runtime_input_ini_path.c_str(), g_players[player - 1].guid);
+    const std::string exe = s_runtime_input_exe_path;
+    load_input_config(exe.c_str());
+    return 1;
+}
+#endif
 
 static void close_player(PlayerInput& p) {
     if (p.handle) {
@@ -5554,7 +5755,7 @@ static uint16_t pad_from_keyboard(int player) {
      * must return the active-low "all released" word (0xFFFF, same value
      * the controller-not-connected path already uses) so the game sees no
      * keys while the user is typing in the overlay. */
-    if (psx_debug_overlay_swallow_keyboard()) return (uint16_t)0xFFFF;
+    if (psx_runtime_menu_capture_input() || psx_free_camera_capture_input() || psx_debug_overlay_swallow_keyboard()) return (uint16_t)0xFFFF;
     const Uint8* keys = SDL_GetKeyboardState(NULL);
     return psx_keybinds_pad_word(keys, player);
 }
@@ -5624,6 +5825,7 @@ static void axes_to_pad_pair(int16_t vx, int16_t vy, uint8_t* obx, uint8_t* oby,
 /* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
  * 1..5 — selects which keybinds.ini section drives a keyboard port. */
 static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_stick_axes) {
+    if (psx_runtime_menu_capture_input() || psx_free_camera_capture_input()) return (uint16_t)0xFFFF;
     if (input_replay::active()) input_replay::note_mapping();
     if (p.kind == 1) return pad_from_keyboard(player);
     if (p.kind == 2)
@@ -5652,6 +5854,7 @@ static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_
  * source. */
 static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4]) {
     out[0] = out[1] = out[2] = out[3] = 0x80;
+    if (psx_runtime_menu_capture_input() || psx_free_camera_capture_input()) return;
     if (p.kind == 1) {
         /* Keyboard analog: the configurable left/right stick-direction binds
          * (default = arrow keys on the LEFT stick; RIGHT stick unbound), so the
@@ -5835,7 +6038,7 @@ static bool controller_policy_dpad_active(const PlayerInput& p, int player,
         }
     }
     if (src.keybinds) {
-        if (psx_debug_overlay_swallow_keyboard()) return false;
+        if (psx_runtime_menu_capture_input() || psx_free_camera_capture_input() || psx_debug_overlay_swallow_keyboard()) return false;
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         if (psx_keybinds_dpad_active(keys, player)) return true;
     }
@@ -6226,7 +6429,7 @@ static int capture_pad_slot(const host_input::HostInputSnapshot& snapshot, int s
         }
     }
     const host_input::MappingOptions options{
-        replay_map, player.deadzone, psx_debug_overlay_swallow_keyboard(),
+        replay_map, player.deadzone, (psx_runtime_menu_capture_input() || psx_free_camera_capture_input() || psx_debug_overlay_swallow_keyboard()),
         dev_any_input_enabled() && s == (g_controller_ports_swapped ? 1 : 0)};
     const int captured = host_input::capture_pad_slot(snapshot, s, &route, options, out);
     if (captured && has_policy) {
@@ -6237,7 +6440,7 @@ static int capture_pad_slot(const host_input::HostInputSnapshot& snapshot, int s
             s, s + 1, configured_mode, out->buttons, sticks, stick_live, dpad_live);
         (void)host_input::capture_pad_slot(snapshot, s, &route, options, out);
     }
-    if (captured && savestate_input_guard_active()) {
+    if (captured && (savestate_input_guard_active() || psx_runtime_menu_capture_input() || psx_free_camera_capture_input())) {
         out->buttons = 0xffffu;
         out->lx = out->ly = out->rx = out->ry = 0x80u;
     }
@@ -7237,6 +7440,7 @@ static int normalize_hotkey_pad_binding(int binding, int fallback) {
 }
 
 static int hotkey_pad_binding_down(int binding) {
+    if (psx_runtime_menu_capture_input() || psx_free_camera_capture_input()) return 0;
     SDL_GameController *h = g_players[0].handle;
     if (!h || binding == 0)
         return 0;
@@ -7341,6 +7545,40 @@ static void savestate_menu_submit(int save) {
         savestate_menu_open = 0;
         savestate_menu_sync_overlay();
     }
+}
+
+extern "C" int psx_runtime_savestate_submit(int slot, int save) {
+    auto refused = [](const char* message) {
+        psx_runtime_menu_savestate_status(message, true);
+        host_osd_push(message, 3000);
+        return 0;
+    };
+    if (slot < 0 || slot >= SAVESTATE_SLOTS) return refused("Invalid save-state slot");
+    if (savestate_pending()) return refused("A save/load is already in progress");
+    if (!save) {
+        if (!psx_hle_scheduler_enabled())
+            return refused("Loading requires the HLE thread scheduler");
+        char reason[256];
+        if (!savestate_slot_compatible(slot, reason, sizeof(reason))) {
+            const char* message = "This state file is missing, unreadable or damaged";
+            if (std::strstr(reason, "bios=")) message = "This state requires a different BIOS image";
+            else if (std::strstr(reason, "version=") || std::strstr(reason, "codegen_") ||
+                     std::strstr(reason, "abi_tag=") || std::strstr(reason, "manifest_sha256"))
+                message = "This state was saved with a different game build";
+            else if (std::strstr(reason, "ram_") || std::strstr(reason, "enhancement_memory_layout"))
+                message = "This state requires a different memory/mod configuration";
+            else if (std::strstr(reason, "game_sha256") || std::strstr(reason, "entry="))
+                message = "This state belongs to a different game";
+            std::fprintf(stderr, "savestate: menu load refused slot %d: %s\n", slot, reason);
+            return refused(message);
+        }
+    }
+    if (!savestate_submit_slot(slot, save))
+        return refused(save ? "Could not save state" : "Could not load state");
+    char message[64];
+    std::snprintf(message, sizeof(message), "%s slot %d...", save ? "Saving" : "Loading", slot + 1);
+    psx_runtime_menu_savestate_status(message, false);
+    return 1;
 }
 
 static int savestate_menu_slot_from_key(SDL_Keycode key) {
@@ -7839,6 +8077,9 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
              * the rest of the loop body — plain F3 must still fall through
              * to the savestate block below, but Ctrl+F3 must NOT also
              * load slot 2, so the gate sits ahead of every F1-F12 check. */
+            if (psx_runtime_menu_process_event(&ev)) continue;
+            if (psx_free_camera_process_event(&ev,
+                    psx_runtime_menu_capture_input() || psx_debug_overlay_camera_input_blocked())) continue;
             if (psx_debug_overlay_process_event(&ev)) continue;
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
@@ -7958,6 +8199,8 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
                 }
             }
         }
+        psx_free_camera_update(psx_debug_overlay_camera_input_window(),
+            psx_runtime_menu_capture_input() || psx_debug_overlay_camera_input_blocked());
         savestate_menu_poll_toggle_buttons();
         rewind_poll_toggle_buttons();
         fast_forward_toggle_poll_buttons();
@@ -15346,6 +15589,7 @@ int main(int argc, char** argv) {
         }
         if (us.has_audio_freq)     g_audio_freq      = us.audio_freq;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
+        if (us.has_volume)         host_volume_set(us.volume);
         if (us.has_rewind)        g_rewind_enabled = us.rewind ? 1 : 0;
         if (us.has_rewind_depth)  g_rewind_depth   = us.rewind_depth;
         if (us.has_rewind_interval) g_rewind_interval = us.rewind_interval;
@@ -15872,7 +16116,7 @@ int main(int argc, char** argv) {
             int lr = 2; /* 0 = launch, 1 = quit, 2 = unavailable */
             const bool bios_choice_supported =
                 psx_bios_has_selectable() != 0 || psx_bios_registry_count == 0;
-            PSXRecompV4::UserSettings seed;
+            PSXRecompV4::UserSettings seed = PSXRecompV4::load_user_settings(s_fast_map_settings_path);
             /* Netplay session BIOS is match-only; never overwrite seed/bios.cfg. */
             std::filesystem::path match_session_bios_path;
             bool match_session_bios_set = false;
@@ -16836,14 +17080,12 @@ int main(int argc, char** argv) {
             player_mode[i] = g_mod_controller_mode_override[i];
     }
     if (g_mod_load_wall_multiplier >= 0) {
-        g_turbo_loads_enabled = 1;
-        g_turbo_load_wall_multiplier = g_mod_load_wall_multiplier;
-        g_turbo_load_release_frames = g_mod_load_release_frames;
+        apply_load_acceleration_runtime((uint32_t)g_mod_load_wall_multiplier,
+                                        (uint32_t)g_mod_load_release_frames);
         /* Fast Loading advances the guest at a host rate greater than real
          * time. Keep the canonical SPU/CD stream running, but discard the
          * accelerated presentation-side audio until pacing resumes; otherwise
          * the SDL bridge overflows and the load becomes observably unstable. */
-        g_turbo_audio_sink_enabled = g_turbo_load_wall_multiplier > 1;
         if (g_turbo_load_wall_multiplier) {
             std::fprintf(stdout,
                 "psxrecomp: mod selected %dx load acceleration "
@@ -17742,6 +17984,13 @@ session_reboot:
             psx_xg_render_auth_checkpoint_cancel(
                 static_cast<PsxXgRenderCheckpointRestore *>(prepared));
         };
+        if (g_native_render_selected) {
+            /* Native Work restores its device memory from the full VRAM
+             * image. The journal/resource checkpoint belongs to the other
+             * render path and must not gate saving or loading this one. */
+            checkpoint_hooks = {};
+            checkpoint_hooks.restore_from_vram = 1;
+        }
         boot_state_set_native_checkpoint_hooks(&checkpoint_hooks);
         guest_render_native_stream_set_enabled(false);
         if (!xg_render_runtime_configure_host_services(&render_host_services))
@@ -17920,7 +18169,9 @@ session_reboot:
 
     /* Prepare host UI resources before guest deadlines start. Otherwise the
      * first hidden overlay swap can synchronously load X11 cursor/theme files. */
+    psx_free_camera_init(sdl_window);
     psx_debug_overlay_init(sdl_window, SDL_GL_GetCurrentContext());
+    psx_runtime_menu_init(sdl_window);
 
     /* Delay-sync LAN (recomp-net). Menu/lobby UI is later work — CLI/env only.
      * Must start after SDL so local pad capture has devices; before the guest

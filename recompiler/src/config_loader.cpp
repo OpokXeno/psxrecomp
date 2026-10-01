@@ -2395,6 +2395,23 @@ UserSettings load_user_settings(const fs::path& path) {
 
     if (doc.contains("video")) {
         const toml::value& v = toml::find(doc, "video");
+        auto read_bool = [&](const char* key, bool& has, bool& value) {
+            if (v.contains(key)) try_get([&]{ value = toml::find<bool>(v, key); has = true; });
+        };
+        read_bool("z_buffer", s.has_z_buffer, s.z_buffer);
+        read_bool("texture_mipmaps", s.has_texture_mipmaps, s.texture_mipmaps);
+        read_bool("wireframe", s.has_wireframe, s.wireframe);
+        read_bool("backdrop_stretch", s.has_backdrop_stretch, s.backdrop_stretch);
+        read_bool("hd_texture_replacements", s.has_hd_texture_replacements, s.hd_texture_replacements);
+        read_bool("menu_bar_visible", s.has_menu_bar_visible, s.menu_bar_visible);
+        if (v.contains("depth_view")) try_get([&]{
+            const int n = toml::find<int>(v, "depth_view");
+            if (n >= 0 && n <= 3) { s.depth_view = n; s.has_depth_view = true; }
+        });
+        if (v.contains("backdrop_stretch_percent")) try_get([&]{
+            const int n = toml::find<int>(v, "backdrop_stretch_percent");
+            if (n >= 0 && n <= 100) { s.backdrop_stretch_percent = n; s.has_backdrop_stretch_percent = true; }
+        });
         if (v.contains("renderer")) try_get([&]{
             const auto m = toml::find<std::string>(v, "renderer");
             if (m == "software") { s.renderer = 0; s.has_renderer = true; }
@@ -2567,8 +2584,57 @@ UserSettings load_user_settings(const fs::path& path) {
             s.has_rewind_interval = true;
         });
     }
+    if (doc.contains("camera")) {
+        const toml::value& c = toml::find(doc, "camera");
+        s.has_free_camera = true;
+        if (c.contains("enabled")) try_get([&]{
+            s.camera_enabled = toml::find<bool>(c, "enabled");
+        });
+        if (c.contains("fly_keys")) try_get([&]{
+            s.camera_fly_keys = toml::find<bool>(c, "fly_keys");
+        });
+        if (c.contains("capture_input")) try_get([&]{
+            s.camera_capture_input = toml::find<bool>(c, "capture_input");
+        });
+        if (c.contains("mouse_look")) try_get([&]{
+            s.camera_mouse_look = toml::find<bool>(c, "mouse_look");
+        });
+        if (c.contains("invert_y")) try_get([&]{
+            s.camera_invert_y = toml::find<bool>(c, "invert_y");
+        });
+        if (c.contains("wheel_dolly")) try_get([&]{
+            s.camera_wheel_dolly = toml::find<bool>(c, "wheel_dolly");
+        });
+        if (c.contains("pan")) try_get([&]{
+            s.camera_pan = toml::find<bool>(c, "pan");
+        });
+        if (c.contains("fly_speed")) try_get([&]{
+            const double v = toml::find<double>(c, "fly_speed");
+            if (v >= 1 && v <= 2048) s.camera_fly_speed = (float)v;
+        });
+        if (c.contains("rotation_speed")) try_get([&]{
+            const double v = toml::find<double>(c, "rotation_speed");
+            if (v >= 0 && v <= 0.5) s.camera_rotation_speed = (float)v;
+        });
+        if (c.contains("look_sensitivity")) try_get([&]{
+            const double v = toml::find<double>(c, "look_sensitivity");
+            if (v >= 0.0005 && v <= 0.02) s.camera_look_sensitivity = (float)v;
+        });
+        if (c.contains("wheel_step")) try_get([&]{
+            const double v = toml::find<double>(c, "wheel_step");
+            if (v >= 4 && v <= 512) s.camera_wheel_step = (float)v;
+        });
+        if (c.contains("pan_factor")) try_get([&]{
+            const double v = toml::find<double>(c, "pan_factor");
+            if (v >= 0.0002 && v <= 0.01) s.camera_pan_factor = (float)v;
+        });
+    }
     if (doc.contains("audio")) {
         const toml::value& a = toml::find(doc, "audio");
+        if (a.contains("volume")) try_get([&]{
+            const int n = toml::find<int>(a, "volume");
+            if (n >= 0 && n <= 100) { s.volume = n; s.has_volume = true; }
+        });
         if (a.contains("frequency")) try_get([&]{
             const auto n = toml::find<int64_t>(a, "frequency");
             if (valid_user_audio_freq((int)n)) {
@@ -2788,6 +2854,14 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     f << "# Overrides the bundled game.toml; the command line overrides this file.\n\n";
 
     f << "[video]\n";
+    if (s.has_z_buffer) f << "z_buffer = " << (s.z_buffer ? "true" : "false") << "\n";
+    if (s.has_texture_mipmaps) f << "texture_mipmaps = " << (s.texture_mipmaps ? "true" : "false") << "\n";
+    if (s.has_wireframe) f << "wireframe = " << (s.wireframe ? "true" : "false") << "\n";
+    if (s.has_depth_view) f << "depth_view = " << s.depth_view << "\n";
+    if (s.has_backdrop_stretch) f << "backdrop_stretch = " << (s.backdrop_stretch ? "true" : "false") << "\n";
+    if (s.has_backdrop_stretch_percent) f << "backdrop_stretch_percent = " << s.backdrop_stretch_percent << "\n";
+    if (s.has_hd_texture_replacements) f << "hd_texture_replacements = " << (s.hd_texture_replacements ? "true" : "false") << "\n";
+    if (s.has_menu_bar_visible) f << "menu_bar_visible = " << (s.menu_bar_visible ? "true" : "false") << "\n";
     if (s.has_renderer)
         f << "renderer          = \""
           << (s.renderer == 2 ? "vulkan" : s.renderer == 1 ? "opengl" : "software")
@@ -2864,7 +2938,23 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "rewind_depth      = " << s.rewind_depth << "\n";
     if (s.has_rewind_interval)
         f << "rewind_interval   = " << s.rewind_interval << "\n";
+    if (s.has_free_camera) {
+        f << "\n[camera]\n";
+        f << "enabled = " << (s.camera_enabled ? "true" : "false") << "\n";
+        f << "fly_keys = " << (s.camera_fly_keys ? "true" : "false") << "\n";
+        f << "capture_input = " << (s.camera_capture_input ? "true" : "false") << "\n";
+        f << "mouse_look = " << (s.camera_mouse_look ? "true" : "false") << "\n";
+        f << "invert_y = " << (s.camera_invert_y ? "true" : "false") << "\n";
+        f << "wheel_dolly = " << (s.camera_wheel_dolly ? "true" : "false") << "\n";
+        f << "pan = " << (s.camera_pan ? "true" : "false") << "\n";
+        f << "fly_speed = " << std::showpoint << s.camera_fly_speed << std::noshowpoint << "\n";
+        f << "rotation_speed = " << std::showpoint << s.camera_rotation_speed << std::noshowpoint << "\n";
+        f << "look_sensitivity = " << std::showpoint << s.camera_look_sensitivity << std::noshowpoint << "\n";
+        f << "wheel_step = " << std::showpoint << s.camera_wheel_step << std::noshowpoint << "\n";
+        f << "pan_factor = " << std::showpoint << s.camera_pan_factor << std::noshowpoint << "\n";
+    }
     f << "\n[audio]\n";
+    if (s.has_volume) f << "volume = " << s.volume << "\n";
     if (s.has_audio_freq)
         f << "frequency = " << s.audio_freq << "\n";
     if (s.has_spu_hq)

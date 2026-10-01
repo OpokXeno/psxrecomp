@@ -432,6 +432,7 @@ else()
     set(_psx_debug_overlay_default OFF)
 endif()
 option(PSX_DEBUG_OVERLAY "Build the in-game developer debug overlay (ImGui, Ctrl+F3)" ${_psx_debug_overlay_default})
+option(PSX_RUNTIME_MENU "Build the player menu bar (Debug and Release, F10)" ON)
 
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
@@ -2133,10 +2134,20 @@ function(psxrecomp_add_runtime_target target)
         target_compile_definitions(${target} PRIVATE PSX_COSIM=1 PSX_NO_DEBUG_TOOLS=1)
     endif()
 
+    if(PSX_RECOMP_UI AND NOT PSXRT_ORACLE AND (PSX_RUNTIME_MENU OR PSX_DEBUG_OVERLAY))
+        target_sources(${target} PRIVATE ${PSXRECOMP_ROOT}/runtime/src/free_camera.cpp)
+    endif()
+
     # Shared recomp-ui Dear ImGui launcher (not in the oracle build — that's headless).
     # Lives at the game repo root (RECOMP_UI_ROOT / CMAKE_SOURCE_DIR/recomp-ui),
     # not under psxrecomp/lib/.
     if(PSX_RECOMP_UI AND NOT PSXRT_ORACLE)
+        if(PSX_RUNTIME_MENU)
+            target_sources(${target} PRIVATE
+                ${PSXRECOMP_ROOT}/runtime/src/runtime_menu.cpp)
+        else()
+            target_compile_definitions(${target} PRIVATE PSX_NO_RUNTIME_MENU=1)
+        endif()
         if(NOT RECOMP_UI_ROOT OR NOT EXISTS "${RECOMP_UI_ROOT}/recomp_ui.cmake")
             message(FATAL_ERROR
                 "PSX_RECOMP_UI=ON but recomp-ui is missing from the game "

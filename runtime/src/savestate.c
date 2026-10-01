@@ -1,3 +1,4 @@
+#include "free_camera.h"
 /* savestate.c — user save states. The runtime UI opens from the save-state menu.
  * See savestate.h.
  *
@@ -64,6 +65,8 @@ static int      s_save_failed = 0;
 static uint32_t s_last_save_pc = 0;
 static int      s_save_defer_slot = -1;
 static double   s_save_defer_t0 = 0.0;
+static double   s_save_retry_after = 0.0;
+static char     s_error[256];
 static uint8_t *s_load_blob = NULL;   /* optional in-memory .pst for netplay */
 static size_t   s_load_blob_len = 0;
 
@@ -548,25 +551,36 @@ int savestate_read_thumb(int slot, uint32_t* out_argb, int out_w, int out_h) {
 }
 
 int savestate_slot_compatible(int slot, char* reason, size_t reason_cap) {
-    uint8_t* data = NULL;
-    size_t size = 0;
-    int ok;
-    if (reason && reason_cap)
-        reason[0] = '\0';
-    if (!s_configured) {
-        if (reason && reason_cap)
-            snprintf(reason, reason_cap, "not_configured");
+    uint8_t header[BOOT_STATE_HEADER_WIRE_BYTES];
+    char fallback_reason[256];
+    char path[600];
+    FILE* file;
+    long size;
+    if (reason && reason_cap) reason[0] = '\0';
+    if (!savestate_slot_path(slot, path, sizeof(path))) {
+        if (reason && reason_cap) snprintf(reason, reason_cap, "not_configured");
         return 0;
     }
-    if (!savestate_read_slot(slot, &data, &size) || !data) {
-        if (reason && reason_cap)
-            snprintf(reason, reason_cap, "missing");
+    file = fopen(path, "rb");
+    if (!file) {
+        if (reason && reason_cap) snprintf(reason, reason_cap, "missing");
         return 0;
     }
-    ok = boot_state_check_buffer(data, size, s_bios_checksum, s_entry_pc,
-                                 reason, reason_cap);
-    free(data);
-    return ok;
+    if (fseek(file, 0, SEEK_END) != 0 ||
+        (size = ftell(file)) < (long)sizeof(header) ||
+        (unsigned long)size > 128u * 1024u * 1024u ||
+        fseek(file, 0, SEEK_SET) != 0 ||
+        fread(header, 1, sizeof(header), file) != sizeof(header)) {
+        fclose(file);
+        if (reason && reason_cap) snprintf(reason, reason_cap, "missing_or_truncated");
+        return 0;
+    }
+    fclose(file);
+    /* check_buffer validates the integrity header only. Section/resource
+     * validation still happens transactionally when the actual load runs. */
+    return boot_state_check_buffer(header, sizeof(header), s_bios_checksum,
+        s_entry_pc, reason && reason_cap ? reason : fallback_reason,
+        reason && reason_cap ? reason_cap : sizeof(fallback_reason));
 }
 
 int savestate_read_slot(int slot, uint8_t** data_out, size_t* size_out) {
@@ -653,6 +667,8 @@ static int request_save_inner(int slot) {
     s_save_failed = 0;
     s_last_save_pc = 0; /* block netplay transfer until this write stamps a PC */
     s_save_defer_slot = -1;
+    s_save_retry_after = 0.0;
+    s_error[0] = '\0';
     s_save_pending = slot;
     s_status_pending = 1;
     s_status_last_load = 0;
@@ -672,6 +688,7 @@ static int request_load_inner(int slot) {
     }
     s_load_failed = 0;
     s_load_completed = 0;
+    s_error[0] = '\0';
     s_load_pending = slot;
     s_status_pending = 1;
     s_status_last_load = 1;
@@ -723,6 +740,7 @@ int savestate_request_load_blob_protocol(const void* data, size_t size) {
     s_load_blob_len = size;
     s_load_failed = 0;
     s_load_completed = 0;
+    s_error[0] = '\0';
     s_load_pending = 0; /* non-negative: poll will prefer the blob */
     return 1;
 }
@@ -742,6 +760,8 @@ int savestate_load_failed(void) {
 int savestate_save_failed(void) {
     return s_save_failed;
 }
+
+const char* savestate_last_error(void) { return s_error; }
 
 void savestate_status_json(char* buf, size_t cap) {
     if (!buf || cap == 0) return;
@@ -778,7 +798,11 @@ uint32_t savestate_last_save_pc(void) {
 void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
     if (s_save_pending < 0 && s_load_pending < 0) return;   /* hot path: nothing staged */
 
+    /* Snapshots must contain the game camera's own control state. */
+    psx_free_camera_suspend();
     if (s_save_pending >= 0) {
+        const double now = savestate_mono_ms();
+        if (now < s_save_retry_after) return;
         int slot = s_save_pending;
         char path[600];
         uint32_t pc = savestate_resolve_resume_pc(cpu, resume_pc);
@@ -787,27 +811,32 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         int pc_matches_cpu = cpu && cpu->pc != 0u &&
                              (((cpu->pc ^ pc) & 0x1FFFFFFFu) == 0u);
         int pc_ok = savestate_resume_pc_ok(pc);
-        if ((resume_pc == 0u && !pc_matches_cpu) || !snapshot_safe || !pc_ok) {
+        int renderer_ready = boot_state_snapshot_ready();
+        if ((resume_pc == 0u && !pc_matches_cpu) || !snapshot_safe || !pc_ok ||
+            !renderer_ready) {
             /* FMV/present edges often poll with hint=0; wait briefly for a
              * sticky BB / IRQ latch rather than writing pc=0 poison. */
-            const double now = savestate_mono_ms();
             if (s_save_defer_slot != slot) {
                 s_save_defer_slot = slot;
                 s_save_defer_t0 = now;
                 fprintf(stderr,
-                        "savestate: deferring slot %d — no safe resume PC "
+                        "savestate: deferring slot %d — machine not ready "
                         "(hint=0x%08X cpu=0x%08X compiled=0x%08X "
-                        "last=0x%08X sticky=0x%08X ra=0x%08X safe=%d site=%d)\n",
+                        "last=0x%08X sticky=0x%08X ra=0x%08X safe=%d site=%d renderer=%d)\n",
                         slot, (unsigned)resume_pc,
                         (unsigned)(cpu ? cpu->pc : 0u),
                         (unsigned)psx_compiled_irq_resume_pc(),
                         (unsigned)psx_last_irq_check_pc(),
                         (unsigned)psx_netplay_rb_sticky_bb_pc(),
                         (unsigned)(cpu ? cpu->gpr[31] : 0u),
-                        snapshot_safe, snapshot_site);
+                        snapshot_safe, snapshot_site, renderer_ready);
             }
-            if (now - s_save_defer_t0 < 2000.0)
+            if (now - s_save_defer_t0 < 2000.0) {
+                /* Native readiness scans resource owners. Retry at most once
+                 * per 10 ms while busy, rather than at every guest block. */
+                s_save_retry_after = renderer_ready ? 0.0 : now + 10.0;
                 return;
+            }
             s_save_pending = -1;
             s_save_defer_slot = -1;
             s_last_save_pc = 0;
@@ -815,17 +844,20 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             s_status_pending = 0;
             s_status_last_ok = 0;
             s_status_generation++;
+            snprintf(s_error, sizeof(s_error), "%s", renderer_ready
+                ? "No safe execution point to save. Try again"
+                : "Renderer resources are not ready. Try again after loading finishes");
             fprintf(stderr,
-                    "savestate: SAVE FAILED slot %d — no safe resume PC "
+                    "savestate: SAVE FAILED slot %d — machine not ready "
                     "(hint=0x%08X cpu=0x%08X compiled=0x%08X "
-                    "last=0x%08X sticky=0x%08X ra=0x%08X safe=%d site=%d)\n",
+                    "last=0x%08X sticky=0x%08X ra=0x%08X safe=%d site=%d renderer=%d)\n",
                     slot, (unsigned)resume_pc,
                     (unsigned)(cpu ? cpu->pc : 0u),
                     (unsigned)psx_compiled_irq_resume_pc(),
                     (unsigned)psx_last_irq_check_pc(),
                     (unsigned)psx_netplay_rb_sticky_bb_pc(),
                     (unsigned)(cpu ? cpu->gpr[31] : 0u),
-                    snapshot_safe, snapshot_site);
+                    snapshot_safe, snapshot_site, renderer_ready);
             psx_frontend_on_savestate_notify(0, slot, 0);
         } else {
             s_save_pending = -1;
@@ -849,6 +881,8 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 } else {
                     s_last_save_pc = 0;
                     s_save_failed = 1;
+                    snprintf(s_error, sizeof(s_error),
+                             "Could not write a complete state file");
                 }
                 s_status_pending = 0;
                 s_status_last_ok = ok ? 1 : 0;
@@ -882,6 +916,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                                             s_bios_checksum, s_entry_pc, cpu);
             clear_load_blob();
             if (!loaded) {
+                snprintf(s_error, sizeof(s_error), "%s", boot_state_last_load_error());
                 fprintf(stderr,
                         "savestate: LOAD FAILED blob (%zu bytes, entry=%08X)\n",
                         blob_len, (unsigned)s_entry_pc);
@@ -891,6 +926,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         } else if (savestate_slot_path(slot, path, sizeof(path))) {
             loaded = boot_state_load(path, s_bios_checksum, s_entry_pc, cpu);
             if (!loaded) {
+                snprintf(s_error, sizeof(s_error), "%s", boot_state_last_load_error());
                 fprintf(stderr,
                         "savestate: LOAD FAILED slot %d %s\n",
                         slot, path);
@@ -898,6 +934,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 psx_frontend_on_savestate_notify(1, slot, 0);
             }
         } else {
+            snprintf(s_error, sizeof(s_error), "State file path is unavailable");
             fprintf(stderr, "savestate: LOAD FAILED slot %d (no path)\n", slot);
             s_load_failed = 1;
             psx_frontend_on_savestate_notify(1, slot, 0);
@@ -909,6 +946,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                     slot, (unsigned)cpu->pc, path[0] ? "" : " [blob]");
             loaded = 0;
             s_load_failed = 1;
+            snprintf(s_error, sizeof(s_error), "State has no valid execution point to resume");
             psx_frontend_on_savestate_notify(1, slot, 0);
         }
         if (!loaded) {

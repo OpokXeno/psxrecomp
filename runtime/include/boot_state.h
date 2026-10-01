@@ -44,7 +44,8 @@ extern "C" {
  * v7 = v6 + explicit active main-RAM size and profile;
  * v8 = v7 + renderer-owned Native resource checkpoint;
  * v9 = v8 + exact RAM provenance authority;
- * v10 = v9 + per-word DMA2, XA DATA_END and enhancement-memory layout cookie. */
+ * v10 = v9 + per-word DMA2, XA DATA_END and enhancement-memory layout cookie;
+ * optional precision section preserves Native/PGXP projection fractions. */
 #define BOOT_STATE_VERSION 10u
 /* Only the current complete wire format is accepted. */
 #define BOOT_STATE_VERSION_MIN_READ 10u
@@ -117,10 +118,13 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                                old blobs (left untouched when absent).          */
-    BS_SEC_NATIVE_RENDER = 0x11, /* Opaque renderer ownership checkpoint; guest
-                                    VRAM remains the sole pixel authority.       */
+    BS_SEC_NATIVE_RENDER = 0x11, /* Optional host checkpoint when the active renderer
+                                    can reconstruct its resources from saved VRAM. */
     BS_SEC_RAM_PROVENANCE = 0x12, /* Versioned pointer-free per-word RAM authority
                                      and receipt/revision counter.               */
+    BS_SEC_GTE_PRECISION = 0x13, /* Optional sparse Native/PGXP projection state.
+                                     Absent in older v10 saves: invalidate then
+                                     rebuild precision through guest execution. */
     BS_SEC_HD_TEXTURE = 0x14, /* Optional host HD-texture upload residency
                                  (texture-pack tracker). Written when its hooks
                                  are installed; applied after VRAM; absent in
@@ -150,6 +154,11 @@ typedef struct BootStateNativeCheckpointHooks {
      * captured yet; callers retain pending requests. NULL means no preflight.
      * Must not advance the guest or mutate state. Writers still validate. */
     int (*snapshot_ready)(void);
+    /* Native Work reconstructs device memory through GPU_VRAM_EVENT_RESTORE
+     * from the required full VRAM section. Its legacy host checkpoint is not
+     * needed: save an empty section and accept missing/empty/older payloads.
+     * Other render paths retain complete checkpoint validation by default. */
+    int restore_from_vram;
 } BootStateNativeCheckpointHooks;
 
 /* The boot-state layer transports this payload without interpreting it.
@@ -157,6 +166,10 @@ typedef struct BootStateNativeCheckpointHooks {
  * prior state intact and *out_prepared NULL. commit is infallible. */
 void boot_state_set_native_checkpoint_hooks(
     const BootStateNativeCheckpointHooks *hooks);
+
+/* Cheap guest-owner preflight, including availability of a complete Native
+ * checkpoint when its hooks are installed. Pending UI saves can retry later. */
+int boot_state_snapshot_ready(void);
 
 /* Optional save-progress service, NULL by default. Install/remove on the guest
  * owner, outside a save. Called only between unlocked save steps/copy chunks,
@@ -237,6 +250,9 @@ int  boot_state_load(const char* path, uint32_t bios_checksum,
 int  boot_state_load_buffer(const uint8_t* file, size_t file_len,
                             uint32_t bios_checksum, uint32_t entry_pc,
                             CPUState* cpu);
+
+/* Reason for the latest failed load; empty after a successful load. */
+const char* boot_state_last_load_error(void);
 
 /* Header-only integrity check (no section inflate/apply). Returns 1 if this
  * build can load the image; 0 and fills reason (when non-NULL) on reject. */

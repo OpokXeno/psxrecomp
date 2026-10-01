@@ -8,6 +8,14 @@ extern "C" {
 
 typedef void (*PSXModVBlankCallback)(void);
 typedef void (*PSXModActivationCallback)(void);
+/* Opt-in, reversible host setting. Called on the emulation/render thread;
+ * enabled=0 must restore stock behavior. The current executable/disc plan
+ * remains immutable. The callback implements the whole effect without
+ * relying on plan-owned VBlank/function hooks. Only standalone, unconditional
+ * plugin features are eligible. Native modules and guest patches require a restart. */
+typedef void (*PSXModRuntimeToggleCallback)(int enabled);
+int psx_mod_register_runtime_toggle_plugin(
+    const char* id, PSXModRuntimeToggleCallback callback);
 struct CPUState;
 typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
                                             uint32_t address);

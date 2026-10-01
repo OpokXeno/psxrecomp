@@ -56,6 +56,8 @@ void psx_debug_overlay_post_swap(int completed);
  * (e.g. a text field is being edited). The game must skip its own key
  * dispatch for as long as this is true. */
 bool psx_debug_overlay_swallow_keyboard(void);
+SDL_Window* psx_debug_overlay_camera_input_window(void);
+bool psx_debug_overlay_camera_input_blocked(void);
 
 /* Arm a one-shot capture of the next pre-swap composited target (game +
  * overlay) to a PNG. The default wrapper captures the GL back buffer; a
@@ -234,6 +236,8 @@ static inline void psx_debug_overlay_pre_swap_target(unsigned int f) { (void)f; 
 static inline void psx_debug_overlay_pre_swap(void) { psx_debug_overlay_pre_swap_target(0u); }
 static inline void psx_debug_overlay_post_swap(int c) { (void)c; }
 static inline bool psx_debug_overlay_swallow_keyboard(void) { return false; }
+static inline SDL_Window* psx_debug_overlay_camera_input_window(void) { return NULL; }
+static inline bool psx_debug_overlay_camera_input_blocked(void) { return false; }
 static inline void psx_debug_overlay_window_shot_arm(const char *p) { (void)p; }
 static inline void psx_debug_overlay_capture_state(int *v, int *wc, int *sw) { (void)v; (void)wc; (void)sw; }
 static inline int psx_debug_overlay_set_force_capture(int on) { (void)on; return 0; }

@@ -118,6 +118,9 @@ int savestate_load_completed(void);
 int savestate_load_failed(void);
 int savestate_save_failed(void);
 
+/* Reason for the latest failed save/load; reset when staging a new request. */
+const char* savestate_last_error(void);
+
 /* Machine-readable lifecycle receipt for deterministic debug harnesses. */
 void savestate_status_json(char* buf, size_t cap);
 

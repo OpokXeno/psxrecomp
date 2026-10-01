@@ -50,6 +50,17 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path = {},
 bool mod_runtime_clear_for_netplay(std::string* error = nullptr);
 const std::string& mod_runtime_fingerprint();
 const std::filesystem::path& mod_runtime_effective_disc_path();
+struct ModRuntimeFeature {
+    std::string package_id, feature_id, name, description;
+    bool enabled = false;
+    bool runtime_toggle = false;
+};
+/* Memory-only catalog query. Reversible host changes persist for the next
+ * launch without changing the current authenticated guest patch plan. */
+std::vector<ModRuntimeFeature> mod_runtime_features();
+bool mod_runtime_set_feature_enabled(const std::string& package_id,
+                                    const std::string& feature_id, bool enabled,
+                                    std::string* error = nullptr);
 bool mod_runtime_compute_disc_sha256(
     const std::filesystem::path& disc_path, std::string& digest,
     std::string* error = nullptr);

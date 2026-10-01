@@ -1181,6 +1181,21 @@ struct UserSettings {
     // launcher save would overwrite their file with defaults.
     bool parse_error = false;
 
+    // [camera] Free-camera controls; scene pose is never persisted.
+    bool has_free_camera = false;
+    bool camera_enabled = false;
+    bool camera_fly_keys = true;
+    bool camera_capture_input = true;
+    bool camera_mouse_look = true;
+    bool camera_invert_y = false;
+    bool camera_wheel_dolly = true;
+    bool camera_pan = true;
+    float camera_fly_speed = 32.0f;
+    float camera_rotation_speed = 0.05f;
+    float camera_look_sensitivity = 0.005f;
+    float camera_wheel_step = 64.0f;
+    float camera_pan_factor = 0.002f;
+
     // [video]
     bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // 0=software,1=opengl,2=vulkan
     bool has_supersampling  = false; int  supersampling  = 1; // 1..8
@@ -1198,6 +1213,15 @@ struct UserSettings {
     bool has_perspective_texturing = false; bool perspective_texturing = false;
     bool has_dithering             = false; bool dithering             = true;
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
+    // Player menu settings that are outside the launcher's main controls.
+    bool has_z_buffer = false; bool z_buffer = true;
+    bool has_texture_mipmaps = false; bool texture_mipmaps = false;
+    bool has_wireframe = false; bool wireframe = false;
+    bool has_depth_view = false; int depth_view = 0;
+    bool has_backdrop_stretch = false; bool backdrop_stretch = false;
+    bool has_backdrop_stretch_percent = false; int backdrop_stretch_percent = 100;
+    bool has_hd_texture_replacements = false; bool hd_texture_replacements = true;
+    bool has_menu_bar_visible = false; bool menu_bar_visible = true;
     // Scanline post-process (see RuntimeConfig::video_scanlines). Strength stored
     // 0..1; the launcher ABI carries it as an integer percent.
     bool has_scanlines         = false; bool   scanlines         = false;
@@ -1266,6 +1290,7 @@ struct UserSettings {
     bool has_hotkey_pad_fast_forward_toggle = false; int hotkey_pad_fast_forward_toggle = 0; /* unbound */
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
+    bool has_volume         = false; int volume = 100;
     bool has_audio_freq     = false; int  audio_freq     = 44100;
     // [bios] / [disc] / [memcard]
     bool has_bios_path      = false; std::filesystem::path bios_path;

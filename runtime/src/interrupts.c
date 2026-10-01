@@ -42,6 +42,7 @@
 #include "psx_instr_cost.h"
 #include "psx_scheduler.h"
 #include "spu.h"
+#include "savestate.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1270,7 +1271,10 @@ void psx_check_interrupts(CPUState* cpu) {
         uint32_t sr = cpu->cop0[COP0_SR];
         if (!(sr & 0x01u) || !(sr & (1u << 10))) {
             s_irq_path_fast_sr++;
-            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+            /* A UI request must run at the next safe block edge, rather
+             * than wait for the periodic background-maintenance interval. */
+            const int maintenance_due = (++s_fast_maintenance & 0x3FFFu) == 0;
+            if (maintenance_due || savestate_pending()) {
                 extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
                 extern void psx_netplay_poll_snap(CPUState* cpu, uint32_t resume_pc);
                 extern void psx_selfcheck_poll(CPUState* cpu, uint32_t resume_pc);
@@ -1283,11 +1287,13 @@ void psx_check_interrupts(CPUState* cpu) {
                 uint32_t resume_pc = g_dirty_safe_resume_pc
                     ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc;
                 savestate_poll(cpu, resume_pc);
-                /* MotK FMV/VLC live here — must flush pending RB snaps too. */
-                psx_netplay_poll_snap(cpu, resume_pc);
-                psx_selfcheck_poll(cpu, resume_pc);
-                psx_rewind_poll(cpu, resume_pc);
-                debug_server_poll();
+                if (maintenance_due) {
+                    /* MotK FMV/VLC live here — flush pending RB snaps too. */
+                    psx_netplay_poll_snap(cpu, resume_pc);
+                    psx_selfcheck_poll(cpu, resume_pc);
+                    psx_rewind_poll(cpu, resume_pc);
+                    debug_server_poll();
+                }
             }
             PSX_CHECK_INTERRUPTS_RETURN();
         }
@@ -1331,7 +1337,10 @@ void psx_check_interrupts(CPUState* cpu) {
         }
         if ((i_stat & i_mask) == 0 && sw_pending == 0) {
             s_irq_path_fast_none++;
-            if ((++s_fast_maintenance & 0x3FFFu) == 0) {
+            /* A UI request must run at the next safe block edge, rather
+             * than wait for the periodic background-maintenance interval. */
+            const int maintenance_due = (++s_fast_maintenance & 0x3FFFu) == 0;
+            if (maintenance_due || savestate_pending()) {
                 extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
                 extern void psx_netplay_poll_snap(CPUState* cpu, uint32_t resume_pc);
                 extern void psx_selfcheck_poll(CPUState* cpu, uint32_t resume_pc);
@@ -1341,10 +1350,12 @@ void psx_check_interrupts(CPUState* cpu) {
                 uint32_t resume_pc = g_dirty_safe_resume_pc
                     ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc;
                 savestate_poll(cpu, resume_pc);
-                psx_netplay_poll_snap(cpu, resume_pc);
-                psx_selfcheck_poll(cpu, resume_pc);
-                psx_rewind_poll(cpu, resume_pc);
-                debug_server_poll();
+                if (maintenance_due) {
+                    psx_netplay_poll_snap(cpu, resume_pc);
+                    psx_selfcheck_poll(cpu, resume_pc);
+                    psx_rewind_poll(cpu, resume_pc);
+                    debug_server_poll();
+                }
             }
             PSX_CHECK_INTERRUPTS_RETURN();
         }
@@ -1364,18 +1375,20 @@ void psx_check_interrupts(CPUState* cpu) {
         s_last_interrupt_check_cycle = psx_get_cycle_count();
         g_ls_suppress_record++;
         total_checks++;
-        if ((total_checks & 0x3FFFu) == 0) {
+        const int maintenance_due = (total_checks & 0x3FFFu) == 0;
+        if (maintenance_due || savestate_pending()) {
             extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
             extern void psx_netplay_poll_snap(CPUState* cpu, uint32_t resume_pc);
             extern void psx_selfcheck_poll(CPUState* cpu, uint32_t resume_pc);
             extern void psx_rewind_poll(CPUState* cpu, uint32_t resume_pc);
             savestate_poll(cpu, check_pc);
-            /* Sticky CD/VBlank mid-path is MotK's FMV hot edge — without this
-             * the RB snap ring never fills (pending save never polled). */
-            psx_netplay_poll_snap(cpu, check_pc);
-            psx_selfcheck_poll(cpu, check_pc);
-            psx_rewind_poll(cpu, check_pc);
-            debug_server_poll();
+            if (maintenance_due) {
+                /* Sticky CD/VBlank is MotK's FMV hot edge: keep RB snaps flowing. */
+                psx_netplay_poll_snap(cpu, check_pc);
+                psx_selfcheck_poll(cpu, check_pc);
+                psx_rewind_poll(cpu, check_pc);
+                debug_server_poll();
+            }
         }
         goto irq_deliver_eval;
     }

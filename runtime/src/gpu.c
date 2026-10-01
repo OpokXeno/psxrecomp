@@ -2790,6 +2790,8 @@ void gpu_note_vram_restore(void) {
         .height = 512u,
         .pixels = gpu_get_vram(),
         .pixel_count = 1024u * 512u,
+        .movie_owner_kind = (GpuMovieOwnerKind)movie_active_owner_kind,
+        .movie_owner_receipt = movie_active_owner_receipt,
     });
 }
 

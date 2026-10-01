@@ -63,9 +63,23 @@ static void builtin_cd_speed_activate(void) {
         (unsigned)speed_option_number(PKG_CD, "cd-speed", "multiplier", 4), 0u);
 }
 
+static void builtin_fast_loading_toggle(int enabled) {
+    if (enabled) builtin_fast_loading_activate();
+    else (void)psx_mod_set_load_acceleration(1u, 0u);
+}
+
+static void builtin_cd_speed_toggle(int enabled) {
+    if (enabled) builtin_cd_speed_activate();
+    else (void)psx_mod_set_disc_speed(1u, 0u);
+}
+
 PSX_MOD_CONSTRUCTOR(psx_register_builtin_speed_plugins) {
     (void)psx_mod_register_activation_plugin(
         "psx.fast-loading", builtin_fast_loading_activate);
     (void)psx_mod_register_activation_plugin(
         "psx.cd-speed", builtin_cd_speed_activate);
+    (void)psx_mod_register_runtime_toggle_plugin(
+        "psx.fast-loading", builtin_fast_loading_toggle);
+    (void)psx_mod_register_runtime_toggle_plugin(
+        "psx.cd-speed", builtin_cd_speed_toggle);
 }

@@ -74,6 +74,7 @@
 #include "xg_render_semantic_presentation.h"
 #include "latency_ring.h"
 #include "debug_overlay.h"
+#include "runtime_menu.h"
 #include "wayland_presentation.h"
 
 #include <limits.h>
@@ -16636,6 +16637,7 @@ static void native_presenter_swap(void *user_data) {
         }
         return;
     }
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     (void)psx_wayland_presentation_request(sequence);
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -17453,6 +17455,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     hold_capture_drawable();
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     if (!gl_swap_with_osd()) return;
@@ -17535,6 +17538,7 @@ int gl_renderer_present_native_cpu_frame(const uint32_t *pixels, int src_w,
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     hold_capture_drawable();
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     if (!gl_swap_with_osd()) return 0;
@@ -17569,6 +17573,7 @@ void gl_renderer_present_blank(void) {
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     hold_capture_drawable();
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     if (!gl_swap_with_osd()) return;
@@ -18432,6 +18437,7 @@ static int interp_present(float alpha) {
     uint64_t present_sequence =
         pres_record(GL_PRES_INTERP, 0, 0, s_interp_w, s_interp_h,
                     lx, ly, lw, lh);
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     if (!gl_swap_with_osd()) return 0;
     pres_mark_swap_completed(present_sequence);
@@ -18790,6 +18796,7 @@ int gl_renderer_present_hold_last(void) {
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     if (!gl_swap_with_osd()) return 0;
@@ -18815,6 +18822,7 @@ int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dw == w && s_last_dh == h &&
         !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1) &&
         !host_osd_needs_present() &&
+        !psx_runtime_menu_needs_present() &&
         !psx_present_vsync_owns_cadence() &&
         !gl_renderer_interpolation_owns_cadence()) {
         s_probe_skip++;
@@ -18863,6 +18871,7 @@ int gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      * the hook's readback targets the default framebuffer's back buffer. */
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     hold_capture_drawable();
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     if (!gl_swap_with_osd()) return 0;
@@ -19511,6 +19520,7 @@ static uint64_t native_present_swap_texture(
     pres_set_geometry_hash(sequence, geometry_hash, geometry_hash_valid);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     hold_capture_drawable();
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     if (hash_framebuffer) {
         pres_phase_vram_hash_issue(sequence, phase_surface_fbo, texture_width);
@@ -20664,6 +20674,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
         !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1) &&
         !host_osd_needs_present() &&
+        !psx_runtime_menu_needs_present() &&
         !psx_present_vsync_owns_cadence() &&
         !gl_renderer_interpolation_owns_cadence()) {
         s_probe_skip++;
@@ -20707,6 +20718,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
      * FBO wide_blit_center left bound. */
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     hold_capture_drawable();
+    psx_runtime_menu_pre_swap_target(0u);
     psx_debug_overlay_pre_swap();
     latency_ring_mark(LAT_SWAP_BEGIN);
     if (!gl_swap_with_osd()) return 0;
@@ -25457,6 +25469,7 @@ static GpuRenderTransactionStatus glb_commit_validate(
                         present->linear_filter, lx, ly, lw, lh, 1, 1);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, checkpoint->staging_fbo);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, checkpoint->staging_fbo);
+    psx_runtime_menu_pre_swap_target((unsigned int)checkpoint->staging_fbo);
     psx_debug_overlay_pre_swap_target((unsigned int)checkpoint->staging_fbo);
     pres_prepare_staged(&checkpoint->staged_present_event,
                         checkpoint->staging_fbo,

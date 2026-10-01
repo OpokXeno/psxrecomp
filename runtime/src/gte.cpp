@@ -2,6 +2,8 @@
 #include "cpu_state.h"
 #include "gte_attribution.h"
 #include "gte_native_provenance.h"
+#include "gte_precision_state.h"
+#include "pst_wire.h"
 #include "ram_provenance.h"
 #include "memory.h"
 #include "nd_intro_ot.h"
@@ -196,6 +198,9 @@ static uint32_t s_geom_hits = 0;
 static uint32_t s_geom_lookups = 0;      /* lookups attempted                  */
 static uint32_t s_geom_miss_unrec = 0;   /* nothing was ever recorded here     */
 static uint32_t s_geom_miss_ambig = 0;   /* recorded, but not unambiguously    */
+static int32_t s_nclip_last_native = 0;
+static int8_t s_nclip_last_precise_sign = 0;
+static bool s_nclip_last_precise_valid = false;
 
 /* Exact GTE projection provenance now lives in the PGXP value-propagation
  * engine (pgxp.cpp): per-word RAM/scratchpad shadows plus per-GPR and per-GTE-
@@ -711,6 +716,7 @@ extern "C" void gte_precision_timeline_invalidate(void) {
      * until the outer transaction ends so old provenance cannot be restored.
      * (pgxp_invalidate_all defers the same way behind its suppress bracket.) */
     pgxp_invalidate_all();
+    s_nclip_last_precise_valid = false;
     ram_provenance_reset();
     if (s_speculative_depth != 0) {
         s_speculative_timeline_invalidated = 1;
@@ -741,6 +747,250 @@ extern "C" void gte_precision_speculative_end(void) {
             s_speculative_timeline_invalidated = 0;
         }
     }
+}
+
+/* Savestates must preserve fractions that cannot be recovered from integer
+ * RAM/SXY or VRAM. Save live entries only, with explicit little-endian fields;
+ * receipts remain paired, while cache generations are rebased on commit. */
+struct GeomSnapshotEntry {
+    uint32_t key;
+    int32_t x16, y16;
+    uint32_t ambiguous;
+};
+} // namespace GTE
+} // namespace PSXRecomp
+
+struct GtePrecisionSnapshot {
+    PSXRecomp::GTE::NativeProjectionSlot *pages[
+        PSX_MAIN_RAM_APERTURE_SIZE / (PSXRecomp::GTE::NATIVE_PROJECTION_PAGE_WORDS * 4u)];
+    PSXRecomp::GTE::NativeProjectionSlot gpr[32];
+    PSXRecomp::GTE::NativeProjectionSlot gte[4];
+    uint64_t receipt;
+    PSXRecomp::GTE::GeomSnapshotEntry *geometry;
+    uint32_t geometry_count;
+    PGXPSnapshot *pgxp;
+    int32_t nclip_native;
+    int8_t nclip_sign;
+    uint8_t nclip_valid;
+};
+
+namespace PSXRecomp {
+namespace GTE {
+static constexpr uint32_t PRECISION_SNAPSHOT_MAGIC = 0x31505447u; /* GTP1 */
+static constexpr uint32_t PRECISION_HEADER_BYTES = 40u;
+static constexpr uint32_t NATIVE_SLOT_WIRE_BYTES = 76u;
+static constexpr uint32_t GEOM_SLOT_WIRE_BYTES = 16u;
+
+static const NativeProjectionSlot *native_snapshot_slot(uint32_t key, uint32_t words) {
+    if (key < words) {
+        auto *page = s_native_projection_pages[key / NATIVE_PROJECTION_PAGE_WORDS];
+        return page ? &page[key % NATIVE_PROJECTION_PAGE_WORDS] : nullptr;
+    }
+    key -= words;
+    return key < 32u ? &s_native_projection_gpr[key] : &s_native_projection_gte[key - 32u];
+}
+
+static void precision_snapshot_counts(uint32_t *native_count, uint32_t *geom_count) {
+    *native_count = *geom_count = 0u;
+    const uint32_t words = memory_get_ram_size() / 4u;
+    if (s_native_projection_enabled)
+        for (uint32_t key = 0u; key < words + 36u; ++key) {
+            const auto *slot = native_snapshot_slot(key, words);
+            if (slot && slot->generation == s_native_projection_generation && slot->components)
+                ++*native_count;
+        }
+    if (s_geom_enabled && s_geom_cache)
+        for (uint32_t key = 0u; key < GEOM_CACHE_SIZE; ++key)
+            if (s_geom_cache[key].generation == s_geom_generation) ++*geom_count;
+}
+
+extern "C" uint32_t gte_precision_snapshot_bytes(void) {
+    if (s_speculative_depth != 0u) return 0u;
+    const uint32_t pgxp_bytes = pgxp_snapshot_bytes();
+    if (!pgxp_bytes) return 0u;
+    uint32_t native_count, geom_count;
+    precision_snapshot_counts(&native_count, &geom_count);
+    const uint64_t size = PRECISION_HEADER_BYTES + (uint64_t)native_count * NATIVE_SLOT_WIRE_BYTES +
+        (uint64_t)geom_count * GEOM_SLOT_WIRE_BYTES + pgxp_bytes;
+    return size <= UINT32_MAX ? (uint32_t)size : 0u;
+}
+
+static int native_snapshot_write_slot(PstW *w, uint32_t key, const NativeProjectionSlot *slot) {
+    const auto &v = slot->vertex;
+    return pst_w_u32(w, key) && pst_w_i32(w, v.x_16_16) && pst_w_i32(w, v.y_16_16) &&
+        pst_w_i32(w, v.view_x) && pst_w_i32(w, v.view_y) && pst_w_i32(w, v.view_z) &&
+        pst_w_i32(w, v.projection_offset_x_16_16) && pst_w_i32(w, v.projection_offset_y_16_16) &&
+        pst_w_u64(w, v.receipt) && pst_w_u32(w, v.packed_sxy) &&
+        pst_w_u16(w, v.projection_distance) && pst_w_u16(w, v.depth) &&
+        pst_w_u8(w, v.projective_valid) && pst_w_i32(w, slot->component_x_16_16) &&
+        pst_w_i32(w, slot->component_y_16_16) && pst_w_u64(w, slot->x_receipt) &&
+        pst_w_u64(w, slot->y_receipt) && pst_w_u8(w, slot->components) &&
+        pst_w_u8(w, slot->x_origin) && pst_w_u8(w, slot->y_origin);
+}
+
+extern "C" int gte_precision_snapshot_write(uint8_t *out, uint32_t size) {
+    if (!out || s_speculative_depth != 0u) return 0;
+    uint32_t native_count, geom_count;
+    precision_snapshot_counts(&native_count, &geom_count);
+    const uint32_t pgxp_bytes = pgxp_snapshot_bytes();
+    if (!pgxp_bytes || (uint64_t)PRECISION_HEADER_BYTES +
+        (uint64_t)native_count * NATIVE_SLOT_WIRE_BYTES +
+        (uint64_t)geom_count * GEOM_SLOT_WIRE_BYTES + pgxp_bytes != size) return 0;
+    const uint32_t words = memory_get_ram_size() / 4u;
+    PstW w;
+    pst_w_init(&w, out, size);
+    if (!pst_w_u32(&w, PRECISION_SNAPSHOT_MAGIC) || !pst_w_u32(&w, 1u) ||
+        !pst_w_u32(&w, words) || !pst_w_u32(&w, native_count) ||
+        !pst_w_u32(&w, geom_count) || !pst_w_u32(&w, pgxp_bytes) ||
+        !pst_w_u64(&w, s_native_projection_receipt) ||
+        !pst_w_i32(&w, s_nclip_last_native) ||
+        !pst_w_u8(&w, (uint8_t)s_nclip_last_precise_sign) ||
+        !pst_w_u8(&w, s_nclip_last_precise_valid ? 1u : 0u) ||
+        !pst_w_u16(&w, 0u)) return 0;
+    if (s_native_projection_enabled)
+        for (uint32_t key = 0u; key < words + 36u; ++key) {
+            const auto *slot = native_snapshot_slot(key, words);
+            if (slot && slot->generation == s_native_projection_generation && slot->components &&
+                !native_snapshot_write_slot(&w, key, slot)) return 0;
+        }
+    if (s_geom_enabled && s_geom_cache)
+        for (uint32_t key = 0u; key < GEOM_CACHE_SIZE; ++key) {
+            const auto &v = s_geom_cache[key];
+            if (v.generation != s_geom_generation) continue;
+            if (!pst_w_u32(&w, key) || !pst_w_i32(&w, v.x16) ||
+                !pst_w_i32(&w, v.y16) || !pst_w_u32(&w, v.ambiguous)) return 0;
+        }
+    return w.written + pgxp_bytes == size && pgxp_snapshot_write(w.p, pgxp_bytes);
+}
+
+extern "C" void gte_precision_snapshot_cancel(GtePrecisionSnapshot *snapshot) {
+    if (!snapshot) return;
+    for (auto *page : snapshot->pages) std::free(page);
+    std::free(snapshot->geometry);
+    pgxp_snapshot_cancel(snapshot->pgxp);
+    std::free(snapshot);
+}
+
+static int native_snapshot_read_slot(PstR *r, NativeProjectionSlot *slot, uint64_t receipt) {
+    auto &v = slot->vertex;
+    return pst_r_i32(r, &v.x_16_16) && pst_r_i32(r, &v.y_16_16) &&
+        pst_r_i32(r, &v.view_x) && pst_r_i32(r, &v.view_y) && pst_r_i32(r, &v.view_z) &&
+        pst_r_i32(r, &v.projection_offset_x_16_16) && pst_r_i32(r, &v.projection_offset_y_16_16) &&
+        pst_r_u64(r, &v.receipt) && v.receipt <= receipt && pst_r_u32(r, &v.packed_sxy) &&
+        pst_r_u16(r, &v.projection_distance) && pst_r_u16(r, &v.depth) &&
+        pst_r_u8(r, &v.projective_valid) && v.projective_valid <= 1u &&
+        pst_r_i32(r, &slot->component_x_16_16) && pst_r_i32(r, &slot->component_y_16_16) &&
+        pst_r_u64(r, &slot->x_receipt) && slot->x_receipt <= receipt &&
+        pst_r_u64(r, &slot->y_receipt) && slot->y_receipt <= receipt &&
+        pst_r_u8(r, &slot->components) && slot->components >= 1u && slot->components <= 3u &&
+        pst_r_u8(r, &slot->x_origin) && slot->x_origin <= 2u &&
+        pst_r_u8(r, &slot->y_origin) && slot->y_origin <= 2u;
+}
+
+extern "C" int gte_precision_snapshot_prepare(const uint8_t *data, uint32_t size,
+                                               GtePrecisionSnapshot **out) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!data || size < PRECISION_HEADER_BYTES || s_speculative_depth != 0u) return 0;
+    PstR r;
+    pst_r_init(&r, data, size);
+    uint32_t magic, version, words, native_count, geom_count, pgxp_bytes;
+    uint64_t receipt;
+    int32_t nclip_native;
+    uint8_t nclip_sign, nclip_valid;
+    uint16_t reserved;
+    if (!pst_r_u32(&r, &magic) || magic != PRECISION_SNAPSHOT_MAGIC ||
+        !pst_r_u32(&r, &version) || version != 1u ||
+        !pst_r_u32(&r, &words) || words != memory_get_ram_size() / 4u ||
+        !pst_r_u32(&r, &native_count) || native_count > words + 36u ||
+        !pst_r_u32(&r, &geom_count) || geom_count > GEOM_CACHE_SIZE ||
+        !pst_r_u32(&r, &pgxp_bytes) || !pst_r_u64(&r, &receipt) ||
+        !pst_r_i32(&r, &nclip_native) || !pst_r_u8(&r, &nclip_sign) ||
+        (nclip_sign != 0u && nclip_sign != 1u && nclip_sign != 255u) ||
+        !pst_r_u8(&r, &nclip_valid) || nclip_valid > 1u ||
+        !pst_r_u16(&r, &reserved) || reserved != 0u ||
+        (uint64_t)PRECISION_HEADER_BYTES + (uint64_t)native_count * NATIVE_SLOT_WIRE_BYTES +
+            (uint64_t)geom_count * GEOM_SLOT_WIRE_BYTES + pgxp_bytes != size) return 0;
+    auto *snapshot = (GtePrecisionSnapshot *)std::calloc(1u, sizeof(GtePrecisionSnapshot));
+    if (!snapshot) return 0;
+    snapshot->receipt = receipt;
+    snapshot->nclip_native = nclip_native;
+    snapshot->nclip_sign = (int8_t)nclip_sign;
+    snapshot->nclip_valid = nclip_valid;
+    uint32_t previous = 0u;
+    for (uint32_t index = 0u; index < native_count; ++index) {
+        uint32_t key;
+        if (!pst_r_u32(&r, &key) || key >= words + 36u || (index && key <= previous)) {
+            gte_precision_snapshot_cancel(snapshot); return 0;
+        }
+        previous = key;
+        NativeProjectionSlot *slot;
+        if (key < words) {
+            auto *&page = snapshot->pages[key / NATIVE_PROJECTION_PAGE_WORDS];
+            if (!page) page = (NativeProjectionSlot *)std::calloc(
+                NATIVE_PROJECTION_PAGE_WORDS, sizeof(NativeProjectionSlot));
+            if (!page) { gte_precision_snapshot_cancel(snapshot); return 0; }
+            slot = &page[key % NATIVE_PROJECTION_PAGE_WORDS];
+        } else {
+            key -= words;
+            slot = key < 32u ? &snapshot->gpr[key] : &snapshot->gte[key - 32u];
+        }
+        if (!native_snapshot_read_slot(&r, slot, receipt)) {
+            gte_precision_snapshot_cancel(snapshot); return 0;
+        }
+    }
+    snapshot->geometry = (GeomSnapshotEntry *)std::calloc(
+        geom_count ? geom_count : 1u, sizeof(GeomSnapshotEntry));
+    if (!snapshot->geometry) { gte_precision_snapshot_cancel(snapshot); return 0; }
+    snapshot->geometry_count = geom_count;
+    for (uint32_t index = 0u; index < geom_count; ++index) {
+        auto &v = snapshot->geometry[index];
+        if (!pst_r_u32(&r, &v.key) || v.key >= GEOM_CACHE_SIZE ||
+            (index && v.key <= snapshot->geometry[index - 1u].key) ||
+            !pst_r_i32(&r, &v.x16) || !pst_r_i32(&r, &v.y16) ||
+            !pst_r_u32(&r, &v.ambiguous) || v.ambiguous > 1u) {
+            gte_precision_snapshot_cancel(snapshot); return 0;
+        }
+    }
+    if (!pgxp_snapshot_prepare(r.p, pgxp_bytes, &snapshot->pgxp)) {
+        gte_precision_snapshot_cancel(snapshot); return 0;
+    }
+    *out = snapshot;
+    return 1;
+}
+
+extern "C" void gte_precision_snapshot_commit(GtePrecisionSnapshot *snapshot) {
+    if (!snapshot) return;
+    native_projection_generation_advance();
+    s_native_projection_receipt = snapshot->receipt;
+    if (s_native_projection_enabled) {
+        for (size_t index = 0u; index < sizeof(snapshot->pages) / sizeof(snapshot->pages[0]); ++index) {
+            auto *page = snapshot->pages[index];
+            if (!page) continue;
+            for (size_t word = 0u; word < NATIVE_PROJECTION_PAGE_WORDS; ++word)
+                if (page[word].components) page[word].generation = s_native_projection_generation;
+            s_native_projection_pages[index] = page;
+            snapshot->pages[index] = nullptr;
+        }
+        std::memcpy(s_native_projection_gpr, snapshot->gpr, sizeof(snapshot->gpr));
+        std::memcpy(s_native_projection_gte, snapshot->gte, sizeof(snapshot->gte));
+        for (auto &slot : s_native_projection_gpr)
+            if (slot.components) slot.generation = s_native_projection_generation;
+        for (auto &slot : s_native_projection_gte)
+            if (slot.components) slot.generation = s_native_projection_generation;
+    }
+    gte_geom_generation_advance();
+    if (s_geom_enabled && s_geom_cache)
+        for (uint32_t index = 0u; index < snapshot->geometry_count; ++index) {
+            const auto &v = snapshot->geometry[index];
+            s_geom_cache[v.key] = {v.x16, v.y16, s_geom_generation, v.ambiguous};
+        }
+    pgxp_snapshot_commit(snapshot->pgxp);
+    snapshot->pgxp = nullptr;
+    s_nclip_last_native = snapshot->nclip_native;
+    s_nclip_last_precise_sign = snapshot->nclip_sign;
+    s_nclip_last_precise_valid = snapshot->nclip_valid != 0u;
+    gte_precision_snapshot_cancel(snapshot);
 }
 
 extern "C" void gte_precision_tracking_set(int enabled) {
@@ -1438,9 +1688,6 @@ void gte_rtpt(GTEState* gte, uint32_t instr) {
 static uint64_t s_nclip_precise_hits = 0;
 static uint64_t s_nclip_fallbacks = 0;
 static uint64_t s_nclip_disagreements = 0;
-static int32_t s_nclip_last_native = 0;
-static int8_t s_nclip_last_precise_sign = 0;
-static bool s_nclip_last_precise_valid = false;
 extern "C" void gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
                                         uint64_t *disagreements) {
     if (hits) *hits = s_nclip_precise_hits;
