@@ -108,7 +108,12 @@ typedef struct PsxHleCallEntry {
     uint8_t  in_exc;     /* recorded inside guest exception context */
 } PsxHleCallEntry;
 
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Release keeps only the counters: observability history is debug-only. */
+#define PSX_HLE_RING_CAP 1u
+#else
 #define PSX_HLE_RING_CAP 16384  /* power of two */
+#endif
 
 /* Snapshot accessors: seq is the total number of records ever written; entry
  * i (seq-CAP .. seq-1 valid window) returns the ring slot for that sequence. */

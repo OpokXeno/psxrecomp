@@ -91,6 +91,14 @@ struct {
 bool binding_menu_drawn;
 unsigned int dirty_settings;
 Uint64 settings_save_due;
+/* The bar is presented on every host swap (240/s at 240 FPS) but its content
+ * changes with input or slowly-varying settings. Rebuild the ImGui frame on
+ * input, while interacting, or at ~60 Hz; otherwise redraw the retained draw
+ * data, which stays valid until the next NewFrame. */
+bool menu_input_pending = true;
+bool menu_frame_valid;
+Uint64 menu_frame_built_ns;
+constexpr Uint64 kMenuRebuildIntervalNs = 16000000u;
 
 struct ContextScope {
     ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -339,7 +347,7 @@ void video_menu() {
         ImGui::EndMenu();
     }
     bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-    if (ImGui::MenuItem("Fullscreen", "Alt+Enter", fullscreen)) {
+    if (ImGui::MenuItem("Fullscreen", "F11", fullscreen)) {
         SDL_SetWindowFullscreen(window, fullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
         remember(MENU_FULLSCREEN);
     }
@@ -508,6 +516,19 @@ void render_frame(unsigned int framebuffer) {
     }
     if (!visibility.visible || !ensure_context()) { release_capture(); flush_settings(true); return; }
     ContextScope scope;
+    const Uint64 now_ns = (Uint64)((double)SDL_GetPerformanceCounter() * 1e9 /
+                                   (double)SDL_GetPerformanceFrequency());
+    if (menu_frame_valid && !menu_input_pending && !capture && !text_input &&
+        now_ns - menu_frame_built_ns < kMenuRebuildIntervalNs) {
+        if (bind_framebuffer) {
+            bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+        }
+        return;
+    }
+    menu_input_pending = false;
+    menu_frame_built_ns = now_ns;
     ImGui_ImplOpenGL3_NewFrame();
     MENU_SDL_NEW_FRAME();
     ImGui::NewFrame();
@@ -521,6 +542,7 @@ void render_frame(unsigned int framebuffer) {
         text_input = want_text;
     }
     ImGui::Render();
+    menu_frame_valid = true;
     if (!ImGui::IsAnyItemActive()) flush_settings();
     if (bind_framebuffer) {
         bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
@@ -600,7 +622,7 @@ bool psx_runtime_menu_process_event(const SDL_Event* ev) {
     }
     if (!visibility.visible) return false;
     if (capture_binding_event(ev)) return true;
-    if (context) { ContextScope scope; MENU_SDL_EVENT(ev); }
+    if (context) { ContextScope scope; MENU_SDL_EVENT(ev); menu_input_pending = true; }
     if (key) return psx_runtime_menu_capture_input();
     if (mouse) {
         if (psx_runtime_menu_capture_input()) return true;
@@ -618,6 +640,26 @@ bool psx_runtime_menu_process_event(const SDL_Event* ev) {
 bool psx_runtime_menu_needs_present(void) { sync_fullscreen(); return visibility.visible || visibility.clear_pending; }
 void psx_runtime_menu_pre_swap_target(unsigned int framebuffer) {
     render_frame(framebuffer); visibility.clear_pending = false;
+}
+void psx_runtime_menu_service_layer(void) {
+    if (!visibility.visible || !window) {
+        gl_renderer_ui_layer_hide();
+        render_frame(0u); /* releases capture and flushes settings */
+        visibility.clear_pending = false;
+        return;
+    }
+    const Uint64 now_ns = (Uint64)((double)SDL_GetPerformanceCounter() * 1e9 /
+                                   (double)SDL_GetPerformanceFrequency());
+    if (menu_frame_valid && !menu_input_pending && !capture && !text_input &&
+        now_ns - menu_frame_built_ns < kMenuRebuildIntervalNs)
+        return; /* The published layer is still current. */
+    int width = 0, height = 0;
+    SDL_GL_GetDrawableSize(window, &width, &height);
+    const unsigned int framebuffer = gl_renderer_ui_layer_begin(width, height);
+    if (!framebuffer) return;
+    render_frame(framebuffer);
+    gl_renderer_ui_layer_end();
+    visibility.clear_pending = false;
 }
 void psx_runtime_menu_note_savestates_changed(void) { save_slots_dirty = true; }
 void psx_runtime_menu_savestate_status(const char* message, bool failed) {

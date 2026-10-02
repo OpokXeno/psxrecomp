@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /*
- * User save states (F7 save-state menu by default; 12 slots).
+ * User save states (runtime menu File tab; 12 slots).
  *
  * A thin wrapper over boot_state.c's complete full-machine serializer
  * (boot_state_save / boot_state_load — CPU/RAM/scratchpad/VRAM/SPU/CDROM/DMA/SIO/

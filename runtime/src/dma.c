@@ -58,7 +58,7 @@ typedef struct {
 } DMAChannel;
 
 static DMAChannel channels[7];
-static char dma2_native_failure_reason[512];
+static char dma2_native_failure_reason[1024];
 
 static void dma2_native_note_failure(const char *kind, uint32_t address,
                                      uint8_t opcode) {
@@ -82,6 +82,14 @@ static void dma2_native_note_failure(const char *kind, uint32_t address,
              pending.actual_source_kind, pending.actual_opcode,
              pending.actual_word_count,
              (unsigned long long)pending.actual_packet_hash);
+    {
+        extern const char *psx_native_render_fail_origin(void);
+        const char *origin = psx_native_render_fail_origin();
+        const size_t used = strlen(dma2_native_failure_reason);
+        if (origin && origin[0] && used < sizeof(dma2_native_failure_reason))
+            snprintf(dma2_native_failure_reason + used,
+                     sizeof(dma2_native_failure_reason) - used, " [%s]", origin);
+    }
 }
 
 typedef struct {
@@ -1561,6 +1569,12 @@ static bool dma2_native_submission_authoritative(void) {
     return guest_render_native_stream_enabled();
 }
 
+/* Native work consumes packets directly (gpu.c): no OT/block preflight, no
+ * reservations and no per-word DMA publication for provenance receipts. */
+static bool dma2_native_preflight_required(void) {
+    return !gpu_native_work_active();
+}
+
 static uint32_t dma2_execute_linked_list(void) {
     uint32_t start_addr = psx_mod_gpu_dma_resolve_address(channels[2].madr);
     uint32_t actual_words = 0u;
@@ -1572,7 +1586,8 @@ static uint32_t dma2_execute_linked_list(void) {
 
     if (dma2_native_submission_authoritative()) {
         if (!gpu_gp0_parser_is_idle() ||
-            !dma2_native_preflight_linked_list(start_addr)) {
+            (dma2_native_preflight_required() &&
+             !dma2_native_preflight_linked_list(start_addr))) {
             psx_fatal_halt("Native OT preflight rejected an unauthenticated command");
             return 0u;
         }
@@ -1693,9 +1708,10 @@ static uint32_t dma2_execute_block(
     if (dma2_native_submission_authoritative()) {
         dma2_native_failure_reason[0] = '\0';
         if (!gpu_gp0_parser_is_idle() ||
-            !dma2_native_preflight_block(
+            (dma2_native_preflight_required() &&
+             !dma2_native_preflight_block(
                 start_addr, total_words, addr_step,
-                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, start_addr)) {
+                GPU_RENDER_ORACLE_SOURCE_DMA2_BLOCK, start_addr))) {
             psx_fatal_halt(dma2_native_failure_reason[0] != '\0'
                 ? dma2_native_failure_reason
                 : "Native DMA block preflight rejected an unauthenticated command");
@@ -1827,9 +1843,10 @@ static void gpu_ll_emit_word(void *opaque, uint32_t address, uint32_t word) {
         /* Authenticate the packet assembled from actual DMA reads. A CPU
          * write can change a not-yet-consumed link or payload after CHCR starts
          * the transfer, so an eager whole-list reservation is not valid here. */
-        gpu_native_preflight_set_dma_publication(
-            gpu_linked_list.previous_addr, gpu_linked_list.nodes_processed > 1u,
-            ram_provenance_publish_event());
+        if (dma2_native_preflight_required())
+            gpu_native_preflight_set_dma_publication(
+                gpu_linked_list.previous_addr, gpu_linked_list.nodes_processed > 1u,
+                ram_provenance_publish_event());
         if (!gpu_native_submit_gp0_word(word, &source)) {
             dma2_native_note_failure("DMA render", address, (uint8_t)(word >> 24u));
             gpu_native_preflight_reservation_abort();
@@ -1962,10 +1979,11 @@ static uint32_t execute_ch2_gpu(void) {
 
         if (native_authoritative) {
             if (!gpu_gp0_parser_is_idle() ||
-                !dma2_native_preflight_block(
+                (dma2_native_preflight_required() &&
+                 !dma2_native_preflight_block(
                     addr, word_count, addr_step,
                     GPU_RENDER_ORACLE_SOURCE_DMA2_BURST,
-                    (uint32_t)container_ordinal * 4u)) {
+                    (uint32_t)container_ordinal * 4u))) {
                 psx_fatal_halt("Native DMA burst preflight rejected an unauthenticated command");
                 g_exec_phase = previous_exec_phase;
                 return 0u;

@@ -204,7 +204,12 @@ void sio_get_pad_receipt(SioPadReceipt *out);
 
 /* ---- SIO byte-level trace ring buffer ----
  * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Release keeps only the counters: observability history is debug-only. */
+#define SIO_TRACE_CAP 1u
+#else
 #define SIO_TRACE_CAP (1 << 20)
+#endif
 
 typedef struct {
     uint32_t seq;           /* monotonic sequence number */
@@ -277,7 +282,12 @@ void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
  * One entry per card protocol transaction (0x81 → terminal state / abort).
  * Always-on.  64K entries × ~544 B ≈ 35 MB — holds tens of minutes of card
  * activity at typical detection-cycle rates. */
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Release keeps only the counters: observability history is debug-only. */
+#define SIO_TXN_CAP 1u
+#else
 #define SIO_TXN_CAP        (1 << 16)
+#endif
 #define SIO_TXN_MAX_BYTES  256
 
 typedef enum {
@@ -321,7 +331,12 @@ const SioTxnEntry *sio_get_card_txn_live(void);
  *
  * Captures every time IRQ #7 (SIO0) is raised into I_STAT.  Always-on.
  * 1M entries × ~64 B ≈ 64 MB — holds tens of minutes of IRQ history. */
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Release keeps only the counters: observability history is debug-only. */
+#define SIO_IRQ_RING_CAP 1u
+#else
 #define SIO_IRQ_RING_CAP (1 << 20)
+#endif
 
 typedef enum {
     SIO_IRQ_SRC_UNKNOWN  = 0,

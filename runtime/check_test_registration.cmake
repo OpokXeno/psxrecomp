@@ -30,9 +30,9 @@
 # to configure — so there is no single tree in which CMake can see every
 # registered target. Rather than force them together (which would make the
 # BIOS-free recompiler tree unconfigurable for newcomers), this reads both
-# CMakeLists.txt files as TEXT and compares the test files they mention against
-# the test files on disk. That works identically from either project, so both
-# call it and each independently catches an orphan in the other.
+# CMakeLists.txt files and their included test modules as TEXT and compares the
+# test files they mention against the test files on disk. That works identically
+# from either project, so both call it and each catches an orphan in the other.
 #
 # Usage: call at the END of a CMakeLists.txt.
 #   include(${CMAKE_CURRENT_SOURCE_DIR}/check_test_registration.cmake)
@@ -58,6 +58,22 @@ function(psxrecomp_check_all_tests_registered)
             continue()
         endif()
         file(READ "${_cml}" _text)
+
+        # Test targets may live in a module included from a project's tests/.
+        # Read only modules actually referenced by that project's CMakeLists,
+        # resolving its source/list directory independently of our caller.
+        get_filename_component(_project_dir "${_cml}" DIRECTORY)
+        string(REGEX MATCHALL
+            [=[include\([ \t]*"?[$][{]CMAKE_CURRENT_(SOURCE|LIST)_DIR[}]/tests/[A-Za-z0-9_]+\.cmake"?[ \t]*\)]=]
+            _test_includes "${_text}")
+        foreach(_include IN LISTS _test_includes)
+            string(REGEX MATCH [=[/tests/([A-Za-z0-9_]+\.cmake)]=] _match "${_include}")
+            set(_module "${_project_dir}/tests/${CMAKE_MATCH_1}")
+            if(EXISTS "${_module}")
+                file(READ "${_module}" _module_text)
+                string(APPEND _text "\n${_module_text}")
+            endif()
+        endforeach()
 
         # Direct references: tests/test_foo.c, ../runtime/tests/test_foo.py,
         # tests/foo_test.cpp ... Matched narrowly (test_ prefix / _test suffix)

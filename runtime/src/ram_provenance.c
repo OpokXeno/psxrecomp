@@ -99,6 +99,18 @@ void ram_provenance_reset(void) {
     (void)next_cpu_revision();
 }
 
+/* CPU store receipts and GP0 command writer PCs only serve the GP0
+ * preflight binding; MDEC source invalidation (FMV detection) stays on. */
+static bool preflight_tracking_enabled = true;
+
+void ram_provenance_set_preflight_tracking(bool enabled) {
+    preflight_tracking_enabled = enabled;
+}
+
+bool ram_provenance_preflight_tracking(void) {
+    return cpu_tracking_enabled && preflight_tracking_enabled;
+}
+
 void ram_provenance_set_cpu_tracking(bool enabled) {
     if (cpu_tracking_enabled == enabled) return;
     cpu_tracking_enabled = enabled;
@@ -112,6 +124,23 @@ void ram_provenance_invalidate_range(uint32_t address, uint32_t width) {
     if (!cpu_tracking_enabled || cpu_speculative_depth != 0u || width == 0u ||
         !main_ram_offset(address, &offset))
         return;
+    if (!preflight_tracking_enabled) {
+        /* Native work keeps only DMA source (MDEC) ownership: a CPU store
+         * revokes it, and nothing reads CPU receipts. */
+        RamProvenanceEntry *entry = &main_ram_writers[offset >> 2u];
+        const uint32_t last = (offset + width - 1u) >> 2u;
+        if (last >= main_ram_writer_count) return;
+        for (;;) {
+            if (entry->source_kind != RAM_PROVENANCE_SOURCE_NONE) {
+                entry->source_valid_bytes = 0u;
+                entry->source_kind = RAM_PROVENANCE_SOURCE_NONE;
+                entry->source_format = 0u;
+                entry->source_receipt = 0u;
+            }
+            if (entry == &main_ram_writers[last]) return;
+            ++entry;
+        }
+    }
     revision = next_cpu_revision();
     const uint32_t available = (uint32_t)(main_ram_writer_count * sizeof(uint32_t) - offset);
     if (width > available) width = available;
@@ -143,7 +172,8 @@ void ram_provenance_note_cpu_store(uint32_t instruction, uint32_t address,
     uint64_t revision;
 
     (void)value;
-    if (!cpu_tracking_enabled || cpu_speculative_depth != 0u) return;
+    if (!cpu_tracking_enabled || !preflight_tracking_enabled ||
+        cpu_speculative_depth != 0u) return;
     switch (opcode) {
     case 0x28u: width = 1u; break;
     case 0x29u: width = 2u; break;
@@ -270,7 +300,8 @@ void ram_provenance_note_command_word(uint32_t address, uint32_t value,
     const uint8_t opcode = (uint8_t)(value >> 24u);
     RamProvenanceEntry *entry;
 
-    if (opcode < 0x20u || opcode > 0x7fu || writer_pc == 0u) return;
+    if (!cpu_tracking_enabled || !preflight_tracking_enabled ||
+        opcode < 0x20u || opcode > 0x7fu || writer_pc == 0u) return;
     entry = writer_slot(address);
     if (entry == NULL) return;
     entry->pc = writer_pc;

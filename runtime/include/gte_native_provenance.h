@@ -25,6 +25,8 @@ typedef struct GteNativeVertexProvenance {
 } GteNativeVertexProvenance;
 
 void gte_native_provenance_set_enabled(int enabled);
+/* CPU/RAM dataflow only (GP0 preflight binding); register shadow unaffected. */
+void gte_native_provenance_set_dataflow(int enabled);
 /* Game integration identifies authenticated rendering-only NCLIP sites.
  * Generic GTE/collision/camera uses retain hardware arithmetic. */
 void gte_native_provenance_set_render_nclip_filter(int (*filter)(uint32_t pc));

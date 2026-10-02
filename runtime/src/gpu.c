@@ -8703,7 +8703,6 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         supported = 0;
     if (supported && source) gpu_set_gp0_source(source);
     if (supported && native_packet_is_draw(opcode) &&
-        (opcode < 0x40u || opcode > 0x5fu || bound_semantic != NULL) &&
         gpu_native_work_draw_hook != NULL) {
         gpu_native_environment_get(&environment);
         captured = gpu_native_work_decode(
@@ -8814,6 +8813,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             GpuDrawState draw;
 
             native_packet_apply_environment(words, opcode);
+            if (gpu_native_work_draw_hook != NULL) goto native_environment_done;
             gpu_get_draw_state(&draw);
             memset(&state, 0, sizeof(state));
             state.command_word = words[0];
@@ -8836,6 +8836,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             state.mask_set = draw.mask_set;
             state.mask_check = draw.mask_check;
             guest_render_native_stream_note_native_state(&state);
+native_environment_done:
             if (opcode == 0xe3u && gpu_native_work_environment_hook != NULL &&
                 !gpu_native_work_environment_hook(
                     source != NULL && source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
@@ -8900,9 +8901,10 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
             if (supported && render_semantic.line_count != 0u) {
                 if (captured) canonical.line_count = render_semantic.line_count;
                 gpu_note_draw_executed(captured ? &canonical : NULL, &render_semantic);
-                for (uint8_t index = 0u;
-                     index < render_semantic.line_count; ++index)
-                    guest_render_native_stream_note_native_line_segment();
+                if (gpu_native_work_draw_hook == NULL)
+                    for (uint8_t index = 0u;
+                         index < render_semantic.line_count; ++index)
+                        guest_render_native_stream_note_native_line_segment();
             }
         }
     } else if (supported && native_packet_is_draw(opcode)) {
@@ -8963,6 +8965,8 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
         supported = fixed_words > 0 && (size_t)fixed_words == word_count;
     }
 
+    /* Native work consumes packets directly: no coverage diagnostics. */
+    if (gpu_native_work_draw_hook != NULL) return supported;
     if (supported && native_packet_is_draw(opcode))
         guest_render_native_stream_note_native_draw_source(
             opcode, bound_semantic != NULL);
@@ -9011,6 +9015,10 @@ void gpu_set_semantic_current_hook(
 void gpu_set_native_work_draw_hook(
         bool (*hook)(const GpuRenderSemantic *semantic)) {
     gpu_native_work_draw_hook = hook;
+}
+
+bool gpu_native_work_active(void) {
+    return gpu_native_work_draw_hook != NULL;
 }
 
 void gpu_set_native_work_environment_hook(bool (*hook)(uint64_t command_id)) {
@@ -9375,6 +9383,27 @@ static int native_packet_stream_finish(void) {
     bool reservation_fallback = false;
     int result = 0;
 
+    if (gpu_native_work_draw_hook != NULL) {
+        /* Native work: the collector resolves producer captures itself and
+         * the canonical raster only uses packet XY, so packets go straight
+         * to GP0 without preflight, reservations or stream binding. */
+        native_packet_word_sources = native_packet_stream.sources;
+        native_packet_word_source_count = native_packet_stream.count;
+        result = gpu_native_submit_gp0_packet(
+            native_packet_stream.words, native_packet_stream.count,
+            NULL, &native_packet_stream.source);
+        native_packet_word_sources = NULL;
+        native_packet_word_source_count = 0u;
+        if (result) {
+            native_packet_stream.count = 0u;
+            native_packet_stream.expected = 0u;
+            native_packet_stream.opcode = 0u;
+            memset(&native_packet_stream.source, 0,
+                   sizeof(native_packet_stream.source));
+            native_packet_stream.active = 0;
+        }
+        return result;
+    }
     identity = native_command_identity(
         native_packet_stream.opcode, native_packet_stream.count,
         &native_packet_stream.source, 0);

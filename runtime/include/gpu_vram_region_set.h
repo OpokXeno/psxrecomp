@@ -91,14 +91,19 @@ static inline int gpu_vram_region_intersects(const GpuVramRegionSet *set,
 
     const int first_word = x0 >> 6;
     const int last_word = x1 >> 6;
+    if (first_word == last_word) {
+        const uint64_t mask = gpu_vram_region_word_mask(x0 & 63, x1 & 63);
+        for (int y = y0; y <= y1; ++y)
+            if (set->rows[y][first_word] & mask) return 1;
+        return 0;
+    }
+    const uint64_t first_mask = UINT64_MAX << (x0 & 63);
+    const uint64_t last_mask = gpu_vram_region_word_mask(0, x1 & 63);
     for (int y = y0; y <= y1; ++y) {
-        for (int word = first_word; word <= last_word; ++word) {
-            const int first_bit = word == first_word ? x0 & 63 : 0;
-            const int last_bit = word == last_word ? x1 & 63 : 63;
-            if (set->rows[y][word] &
-                gpu_vram_region_word_mask(first_bit, last_bit))
-                return 1;
-        }
+        if ((set->rows[y][first_word] & first_mask) ||
+            (set->rows[y][last_word] & last_mask)) return 1;
+        for (int word = first_word + 1; word < last_word; ++word)
+            if (set->rows[y][word]) return 1;
     }
     return 0;
 }

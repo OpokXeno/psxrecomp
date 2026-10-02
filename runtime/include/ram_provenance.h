@@ -25,6 +25,8 @@ typedef struct RamProvenanceSnapshot RamProvenanceSnapshot;
 bool ram_provenance_init(size_t main_ram_size);
 void ram_provenance_reset(void);
 void ram_provenance_set_cpu_tracking(bool enabled);
+void ram_provenance_set_preflight_tracking(bool enabled);
+bool ram_provenance_preflight_tracking(void);
 void ram_provenance_invalidate_range(uint32_t address, uint32_t width);
 void ram_provenance_note_cpu_store(uint32_t instruction, uint32_t address,
                                    uint32_t value);

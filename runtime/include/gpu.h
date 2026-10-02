@@ -132,6 +132,8 @@ void     gpu_set_semantic_current_hook(
  * Returning false is fatal. NULL uninstalls; GPU init/reset preserve hooks. */
 void     gpu_set_native_work_draw_hook(
              bool (*hook)(const GpuRenderSemantic *semantic));
+/* True while the Native work collector is installed (packets bypass preflight). */
+bool     gpu_native_work_active(void);
 /* Accepted E3 command identity; only source metadata may declare a view target. */
 void     gpu_set_native_work_environment_hook(bool (*hook)(uint64_t command_id));
 void     gpu_set_source_boundary_hook(void (*hook)(void));

@@ -843,6 +843,8 @@ static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_CAPACITY_WORDS];
     (((PSX_MAIN_RAM_APERTURE_SIZE / 4u) + 31u) / 32u)
 static uint32_t overlay_watch_word_bitmap[OVERLAY_WATCH_WORD_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_CAPACITY];
+/* Guest main-RAM stores (all widths), for host-side capture profiling. */
+uint64_t g_psx_ram_store_count;
 
 void dirty_ram_reset_for_boot(void) {
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
@@ -1165,7 +1167,8 @@ static inline void note_ram_command_provenance(uint32_t phys, uint32_t value,
     uint32_t shift;
     uint32_t mask;
 
-    if (phys < UINT32_C(0x0005a000) || aligned + 3u >= g_psx_ram_size)
+    if (!ram_provenance_preflight_tracking() ||
+        phys < UINT32_C(0x0005a000) || aligned + 3u >= g_psx_ram_size)
         return;
     word = read_ram_word(aligned);
     shift = (phys & 3u) * 8u;
@@ -1921,6 +1924,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, val, 4);
+        g_psx_ram_store_count++;
         overlay_watch_note_write(phys, 4);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
@@ -2056,6 +2060,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 2);
+        g_psx_ram_store_count++;
         overlay_watch_note_write(phys, 2);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
@@ -2395,6 +2400,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
         text_guard_note_write(phys, (uint32_t)val, 1);
+        g_psx_ram_store_count++;
         overlay_watch_note_write(phys, 1);
 #ifdef PSX_COSIM
         { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }

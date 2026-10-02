@@ -291,9 +291,17 @@ extern "C" void gte_native_provenance_set_enabled(int enabled) {
     g_gte_native_provenance_active = enabled;
 }
 
+/* Per-instruction CPU/RAM dataflow of projective vertices (GTE register ->
+ * GPR -> RAM packet word) only feeds the GP0 preflight binding. Native work
+ * consumes packets directly, so it keeps the GTE register shadow (the exact
+ * NCLIP sign fix) and turns the dataflow and RAM slots off. */
+extern "C" void gte_native_provenance_set_dataflow(int enabled) {
+    g_gte_native_provenance_active = enabled && s_native_projection_enabled;
+}
+
 extern "C" void gte_native_provenance_invalidate_range(
         uint32_t address, uint32_t width) {
-    if (!s_native_projection_enabled || s_speculative_depth != 0 || width == 0)
+    if (!g_gte_native_provenance_active || s_speculative_depth != 0 || width == 0)
         return;
     if (width == 4u && !(address & 3u)) {
         NativeProjectionSlot *slot = native_projection_ram_slot(address);
@@ -323,7 +331,7 @@ extern "C" void gte_native_provenance_invalidate_range(
 extern "C" int gte_native_provenance_load(
         uint32_t address, uint32_t packed_sxy,
         GteNativeVertexProvenance *out) {
-    if (!s_native_projection_enabled || s_speculative_depth != 0 || out == nullptr)
+    if (!g_gte_native_provenance_active || s_speculative_depth != 0 || out == nullptr)
         return 0;
     NativeProjectionSlot *slot = native_projection_ram_slot(address);
     if (slot == nullptr || slot->generation != s_native_projection_generation ||
@@ -1004,7 +1012,7 @@ extern "C" void gte_precision_tracking_set(int enabled) {
 extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (s_gte_replay_sandbox || reg < 12 || reg > 15) return;
     pgxp_store_gte_reg(addr, reg);
-    if (s_native_projection_enabled && s_speculative_depth == 0) {
+    if (g_gte_native_provenance_active && s_speculative_depth == 0) {
         const NativeProjectionSlot *source =
             &s_native_projection_gte[reg - 12u];
         NativeProjectionSlot *destination = native_projection_ram_slot(addr,

@@ -75,6 +75,27 @@ void gl_renderer_native_shutdown(void);
  * -1: renderer failure; 0: no progress; 1: progress, notify the render worker.
  * Must also be called when no endpoint is presentable. */
 int gl_renderer_native_service(void);
+/* Restores the legacy GL context if a presenter compose left the native
+ * presenter context retained for its swap. Call after each host pump. */
+void gl_renderer_native_context_settle(void);
+/* Dedicated presenter thread: begin binds the presenter context on the
+ * calling thread (and routes compose/swap/completion fences to it); end
+ * releases it so the main thread may use it again. */
+int gl_renderer_native_presenter_thread_begin(void);
+/* Main thread: move the legacy context to a hidden drawable while another
+ * thread owns the window surface, and back afterwards. */
+int gl_renderer_native_main_detach_window(void);
+void gl_renderer_native_main_attach_window(void);
+void gl_renderer_native_presenter_thread_end(void);
+/* Shared UI layer (main thread renders, presenter thread composites).
+ * begin returns the framebuffer to draw into, 0 to skip this frame. */
+unsigned int gl_renderer_ui_layer_begin(int width, int height);
+void gl_renderer_ui_layer_end(void);
+void gl_renderer_ui_layer_hide(void);
+/* Main thread, presenter threaded: bind/unbind the private UI context
+ * around ImGui work (menu layer, tools window). enter returns 0 to skip. */
+int gl_renderer_ui_context_enter(void);
+void gl_renderer_ui_context_leave(void);
 void gl_renderer_native_set_worker_notify(void (*notify)(void *), void *data);
 void gl_renderer_native_stop_gpu_worker(void);
 /* Cheap request query; does not enter GL or execute renderer work. */
@@ -283,15 +304,17 @@ typedef struct GlRendererNativeGpuDiagnostics {
     uint64_t fence_polls, fence_pending, fence_latency_ns, fence_latency_max_ns;
     uint64_t timed_work, gpu_render_ns, gpu_readback_ns, gpu_max_ns;
     uint64_t word_uploads, snapshot_commands;
+    uint64_t prefetch_prepared, prefetch_used, prefetch_discarded, prefetch_cpu_ns;
     uint64_t destination_barriers, destination_copies;
     /* VIEW textured triangles by semantic class (scene/sprite) and selected
      * sampling mode (nearest/bilinear). Guest VRAM draws are excluded. */
     uint64_t filter_draws[2][2];
     /* Destination reads that needed no barrier (no write overlapped them). */
     uint64_t skipped_barriers;
-    /* Native depth test on the GPU: triangles depth-tested, and samples that
-     * passed in runs of them (GL_SAMPLES_PASSED, at the render scale). */
+    /* Native depth test on the GPU: triangles depth-tested, and optional samples
+     * passed (PSX_NATIVE_DEPTH_STATS=1, GL_SAMPLES_PASSED at render scale). */
     uint64_t depth_tested_triangles, depth_samples_passed;
+    uint32_t depth_samples_enabled;
     /* Reference is the CPU 1x scanout; image is the actual GPU RGBA storage. */
     uint64_t last_reference_digest, last_image_digest;
     XgPresentationIdentity last_image_identity;

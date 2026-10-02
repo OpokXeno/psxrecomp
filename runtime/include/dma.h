@@ -89,7 +89,11 @@ typedef struct DMATraceEntry {
  * exact head and every node before the node's GP0 words are submitted. The
  * GPU ring supplies the command payloads keyed by their source addresses. */
 #define DMA_OT_TRACE_LIST_CAP (1u << 12)
+#ifdef PSX_NO_DEBUG_TOOLS
+#define DMA_OT_TRACE_NODE_CAP 1u
+#else
 #define DMA_OT_TRACE_NODE_CAP (1u << 17)
+#endif
 
 typedef enum DMAOtTraceMode {
     DMA_OT_TRACE_ORIGINAL = 0,

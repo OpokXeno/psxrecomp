@@ -7240,6 +7240,61 @@ static void handle_audio_stats(int id, const char *json)
              correction);
 }
 
+/* native_capture_profile {"enable":0|1,"reset":0|1,"path":"ring.csv"}:
+ * guest-thread native capture cost per cutover module / stage, guest RAM
+ * store count, and optionally the ordered (slot,result,duration) ring. */
+static void handle_native_capture_profile(int id, const char *json)
+{
+    extern uint64_t g_psx_ram_store_count;
+    extern void xg_render_capture_profile_control(bool enable, bool reset);
+    extern bool xg_render_capture_profile_read(uint32_t slot, uint64_t *calls,
+                                               uint64_t *ns, uint64_t results[3]);
+    extern uint64_t xg_render_capture_profile_ring(const uint32_t **entries,
+                                                   uint32_t *capacity);
+    static int enabled;
+    const int enable = json_get_int(json, "enable", -1);
+    const int reset = json_get_int(json, "reset", 0);
+    if (enable >= 0 || reset) {
+        if (enable >= 0) enabled = enable != 0;
+        xg_render_capture_profile_control(enabled != 0, reset != 0);
+    }
+    char path[512];
+    if (json_get_str(json, "path", path, sizeof(path))) {
+        const uint32_t *ring = NULL; uint32_t capacity = 0u;
+        const uint64_t count = xg_render_capture_profile_ring(&ring, &capacity);
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fputs("seq,slot,result,duration_ns\n", f);
+            const uint64_t first = count > capacity ? count - capacity : 0u;
+            for (uint64_t i = first; i < count; ++i) {
+                const uint32_t e = ring[i % capacity];
+                fprintf(f, "%llu,%u,%u,%u\n", (unsigned long long)i,
+                        e >> 27, (e >> 25) & 3u, (e & 0x1ffffffu) * 100u);
+            }
+            fclose(f);
+        }
+    }
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"ok\":true,\"enabled\":%d,\"ram_stores\":%llu,\"slots\":[",
+        id, enabled, (unsigned long long)g_psx_ram_store_count);
+    int first = 1;
+    for (uint32_t slot = 0u; slot < 27u; ++slot) {
+        uint64_t calls = 0u, ns = 0u, results[3] = {0u, 0u, 0u};
+        if (!xg_render_capture_profile_read(slot, &calls, &ns, results) || !calls) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+            "%s{\"slot\":%u,\"calls\":%llu,\"ns\":%llu,\"continue\":%llu,"
+            "\"observed\":%llu,\"bypass\":%llu}",
+            first ? "" : ",", slot, (unsigned long long)calls,
+            (unsigned long long)ns, (unsigned long long)results[0],
+            (unsigned long long)results[1], (unsigned long long)results[2]);
+        first = 0;
+        if (pos >= (int)sizeof(buf) - 256) break;
+    }
+    snprintf(buf + pos, sizeof(buf) - (size_t)pos, "]}");
+    send_fmt("%s", buf);
+}
+
 static void handle_audio_wav(int id, const char *json)
 {
     char path[512];
@@ -8644,8 +8699,8 @@ static void handle_mmx6_freshfix(int id, const char *json)
              id, gpu_ws_mmx6_freshfix_get(), gpu_ws_mmx6_refill_cols(), total, bad);
 }
 
-/* Save-state save/load via the debug server. Player-facing hotkeys route
- * through the F7 save-state menu; this command keeps the flow headless.
+/* Save-state save/load via the debug server. Players use the runtime menu's
+ * File tab; this command keeps the flow headless.
  * {"cmd":"savestate","op":"save"|
  * "load","slot":N}. The request is staged and runs at the next block boundary
  * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
@@ -11047,7 +11102,7 @@ static void handle_native_depth_diag(int id, const char *json)
              "\"draws\":{\"none\":%llu,\"test\":%llu,\"test_write\":%llu},"
              "\"fragments\":{\"tested\":%llu,\"rejected\":%llu,"
              "\"written\":%llu,\"reset\":%llu},"
-             "\"gpu\":{\"tested_triangles\":%llu,\"samples_passed\":%llu,"
+             "\"gpu\":{\"tested_triangles\":%llu,\"samples_passed\":%llu,\"samples_enabled\":%s,"
              "\"barriers\":%llu,\"skipped_barriers\":%llu}}",
              id, gl_renderer_native_depth_test() ? "true" : "false",
              compiler.native_depth_test ? "true" : "false",
@@ -11061,6 +11116,7 @@ static void handle_native_depth_diag(int id, const char *json)
              (unsigned long long)compiler.depth_reset_fragments,
              (unsigned long long)compiler.gpu.depth_tested_triangles,
              (unsigned long long)compiler.gpu.depth_samples_passed,
+             compiler.gpu.depth_samples_enabled ? "true" : "false",
              (unsigned long long)compiler.gpu.destination_barriers,
              (unsigned long long)compiler.gpu.skipped_barriers);
 }
@@ -14429,6 +14485,10 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"swap_authorized_to_completed\":%llu,"
         "\"swap_completed_to_feedback\":%llu},"
         "\"queues\":{\"source\":%u,\"batch\":%u,\"retirement\":%u},"
+        "\"selection\":{\"presented_endpoints\":%llu,\"presented_holds\":%llu,"
+        "\"visual_only_updates\":%llu,\"guard_empties\":%llu,"
+        "\"due_wholes\":%llu,\"phases\":%llu,\"last_remaining_ms\":%lld,"
+        "\"duplicates\":%llu,\"visual_lag_us\":%llu},"
         "\"publication_open\":%s,\"epoch_terminal\":%s,"
         "\"source_pending\":%s,\"batch_pending\":%s,\"receipts\":{",
         id, failure_flags,
@@ -14491,6 +14551,15 @@ static void handle_native_pipeline_diag(int id, const char *json)
                 gl_presentation.feedback_discarded),
         presentation.source_queue_depth, presentation.batch_queue_depth,
         presentation.retirement_queue_depth,
+        (unsigned long long)presentation.presented_endpoints,
+        (unsigned long long)presentation.presented_holds,
+        (unsigned long long)presentation.visual_only_updates,
+        (unsigned long long)presentation.selection_guard_empties,
+        (unsigned long long)presentation.selection_due_wholes,
+        (unsigned long long)presentation.selection_phases,
+        (long long)presentation.selection_last_remaining_ms,
+        (unsigned long long)presentation.duplicate_presents,
+        (unsigned long long)(presentation.visual_lag_ns / 1000u),
         presentation.publication_open ? "true" : "false",
         presentation.epoch_terminal ? "true" : "false",
         presentation.source_pending ? "true" : "false",
@@ -15001,6 +15070,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"fence_polls\":%llu,\"fence_pending\":%llu,\"fence_latency_ns\":%llu,\"fence_latency_max_ns\":%llu,"
         "\"timed_work\":%llu,\"gpu_render_ns\":%llu,\"gpu_readback_ns\":%llu,\"gpu_max_ns\":%llu,"
         "\"word_uploads\":%llu,\"snapshot_commands\":%llu,\"destination_barriers\":%llu,\"destination_copies\":%llu,\"last_reference_digest\":\"0x%llX\","
+        "\"prefetch_prepared\":%llu,\"prefetch_used\":%llu,\"prefetch_discarded\":%llu,\"prefetch_cpu_ns\":%llu,"
         "\"last_image_digest\":\"0x%llX\",\"render_scale\":%u,"
         "\"storage_width\":%u,\"storage_height\":%u,\"pending_state\":%u,"
         "\"last_image_identity\":[%llu,%llu,%llu,%llu,%u]}}",
@@ -15035,6 +15105,10 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (unsigned long long)compiler.gpu.destination_barriers,
         (unsigned long long)compiler.gpu.destination_copies,
         (unsigned long long)compiler.gpu.last_reference_digest,
+        (unsigned long long)compiler.gpu.prefetch_prepared,
+        (unsigned long long)compiler.gpu.prefetch_used,
+        (unsigned long long)compiler.gpu.prefetch_discarded,
+        (unsigned long long)compiler.gpu.prefetch_cpu_ns,
         (unsigned long long)compiler.gpu.last_image_digest,
         compiler.gpu.render_scale, compiler.gpu.storage_width,
         compiler.gpu.storage_height, compiler.gpu.pending_state,
@@ -18141,6 +18215,7 @@ static const CmdEntry s_commands[] = {
     { "dump_buffer",       handle_dump_buffer },
     { "native_semantic_last", handle_native_semantic_last },
     { "native_stream_diag", handle_native_stream_diag },
+    { "native_capture_profile", handle_native_capture_profile },
     { "native_resident_text_state", handle_native_resident_text_state },
     { "native_renderer_state", handle_native_renderer_state },
     { "native_static_artifacts", handle_native_static_artifacts },

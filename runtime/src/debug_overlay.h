@@ -46,6 +46,13 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer);
 /* Default-framebuffer wrapper retained for the normal present paths. */
 void psx_debug_overlay_pre_swap(void);
 
+/* Split form for a dedicated presenter thread. present_observe runs on the
+ * presenting thread before each swap (presented-frame rates, window_shot
+ * readback of the composed frame). service_main runs on the main thread
+ * (tools window, deferred UI state); it never touches the game window. */
+void psx_debug_overlay_present_observe(void);
+void psx_debug_overlay_service_main(void);
+
 /* Post-swap correction: pre_swap counts every attempt (including blocked
  * ones), so FPS (presented) would read high whenever attempts don't
  * complete. The worker path reports its result; uncompleted attempts are
@@ -234,6 +241,8 @@ static inline bool psx_debug_overlay_is_visible(void) { return false; }
 static inline bool psx_debug_overlay_process_event(const SDL_Event *e) { (void)e; return false; }
 static inline void psx_debug_overlay_pre_swap_target(unsigned int f) { (void)f; }
 static inline void psx_debug_overlay_pre_swap(void) { psx_debug_overlay_pre_swap_target(0u); }
+static inline void psx_debug_overlay_present_observe(void) {}
+static inline void psx_debug_overlay_service_main(void) {}
 static inline void psx_debug_overlay_post_swap(int c) { (void)c; }
 static inline bool psx_debug_overlay_swallow_keyboard(void) { return false; }
 static inline SDL_Window* psx_debug_overlay_camera_input_window(void) { return NULL; }

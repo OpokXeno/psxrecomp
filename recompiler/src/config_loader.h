@@ -1283,7 +1283,6 @@ struct UserSettings {
     // [hotkeys] controller-only host shortcuts. Values use recomp-ui's
     // RECOMP_LAUNCHER_PAD_* encoding (0 = unbound, 1+button, 100+axis).
     bool has_hotkey_pad_rewind = false; int hotkey_pad_rewind = 1272; /* select+r3 */
-    bool has_hotkey_pad_save_state_menu = false; int hotkey_pad_save_state_menu = 2040; /* select+r1 */
     // fast_forward_pad: hold-to-fast-forward, the controller twin of the
     // keyboard [KeyMap] Turbo (Tab). 0 = unbound.
     bool has_hotkey_pad_fast_forward = false; int hotkey_pad_fast_forward = 1528; /* select+l1 */

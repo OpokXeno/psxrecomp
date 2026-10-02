@@ -24,7 +24,6 @@
 #include "load_accel.h"
 #include "savestate.h"
 #include "psx_rewind.h"
-#include "psx_savestate_menu.h"
 #include "host_osd.h"
 #include "host_keymap.h"
 #include "png_write.h"       /* png_write_rgb — present_shot readback */
@@ -58,6 +57,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "native_render_baseline.h"
 #include "xg_render_auth_runtime_control.h"
 #include "xg_render_presentation_host.h"
+#include "xg_render_semantic_presentation.h"
 #include "xg_render_runtime_host_services.h"
 #include "xg_render_source_frame.h"
 #include "xg_render_native_work.h"
@@ -159,6 +159,9 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <chrono>
 #include <mutex>
 #include <thread>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -626,12 +629,47 @@ extern "C" bool psx_native_render_presentation_host_snapshot(
 
 extern "C" void gpu_vblank_fail_closed_present(void);
 
-static void native_render_source_fail_closed() {
+/* Dedicated presenter thread (PSX_PRESENTER_THREAD=0 disables). It owns the
+ * presenter GL context and pumps the host at the presentation cadence, so
+ * 240 Hz composition/swaps no longer consume guest-thread time. The guest
+ * thread stays the host controller (source clock, period, hold presenter)
+ * and keeps all ImGui/SDL window work, publishing UI as a shared layer. */
+static struct {
+    SDL_Thread *thread = nullptr;
+    std::atomic<bool> stop{false};
+    std::atomic<int> state{0}; /* 0 starting, 1 running, -1 failed/exited */
+} g_native_presenter;
+
+static void native_presenter_stop();
+static void apply_present_cadence(void);
+
+/* First fail-closed origin, with host/presenter state, for fatal reports. */
+static char g_native_fail_origin[256];
+
+extern "C" const char *psx_native_render_fail_origin(void) {
+    return g_native_fail_origin;
+}
+
+static void native_render_source_fail_closed(int origin_line) {
     if (!g_native_render_selected)
         return;
+    if (!g_native_fail_origin[0]) {
+        XgRenderPresentationHostSnapshot snap{};
+        const bool have = g_native_render_presentation_host &&
+            xg_render_presentation_host_snapshot(g_native_render_presentation_host, &snap);
+        std::snprintf(g_native_fail_origin, sizeof(g_native_fail_origin),
+            "fail_closed@main.cpp:%d host_state=%d presenter_thread=%d/%d "
+            "drain_failures=%llu owner_rejections=%llu last_presenter=%d",
+            origin_line, have ? (int)snap.state : -1,
+            g_native_presenter.thread != nullptr, g_native_presenter.state.load(),
+            have ? (unsigned long long)snap.retirement_drain_failures : 0ull,
+            have ? (unsigned long long)snap.presenter_owner_rejections : 0ull,
+            have ? (int)snap.last_presenter_result : -1);
+    }
     g_native_render_source_failed = true;
     psx_xg_render_auth_cold_enable(false);
     guest_render_native_stream_set_enabled(false);
+    native_presenter_stop();
     gpu_vblank_fail_closed_present();
     if (g_native_render_presentation_host)
         xg_render_presentation_host_shutdown(
@@ -646,11 +684,23 @@ static void native_render_sync_source_clock() {
     const uint64_t deadline_ns = g_native_simulation.guest_deadline_ns;
     const uint64_t offset_ns = deadline_ns >= now_ns
         ? deadline_ns - now_ns : now_ns - deadline_ns;
+    /* Lag of the guest's current cycle behind its paced schedule. Measured
+     * from the live cycle, not the last pace point: publication syncs happen
+     * mid-quantum, after the guest already advanced past guest_cycle. */
+    uint64_t lag_ns = 0u;
+    if (g_native_simulation.realtime) {
+        const uint64_t cycle = psx_get_cycle_count();
+        const uint64_t ahead_ns = cycle > g_native_simulation.guest_cycle
+            ? (uint64_t)((double)(cycle - g_native_simulation.guest_cycle) *
+                  (1000000000.0 / 33868800.0)) : 0u;
+        const uint64_t scheduled_ns = deadline_ns + ahead_ns;
+        lag_ns = now_ns > scheduled_ns ? now_ns - scheduled_ns : 0u;
+    }
     if (offset_ns > INT64_MAX || !xg_render_presentation_host_sync_source_clock(
             g_native_render_presentation_host, g_native_simulation.guest_cycle,
             deadline_ns >= now_ns ? (int64_t)offset_ns : -(int64_t)offset_ns,
-            g_native_simulation.realtime, g_native_simulation.clock_rebase)) {
-        native_render_source_fail_closed();
+            lag_ns, g_native_simulation.realtime, g_native_simulation.clock_rebase)) {
+        native_render_source_fail_closed(__LINE__);
         return;
     }
     g_native_simulation.clock_rebase = false;
@@ -670,12 +720,19 @@ static void native_render_native_notify(void *user_data) {
             static_cast<XgRenderPresentationHost *>(user_data));
 }
 
+static bool native_render_describe_fields(XgRenderSourceFrameDescription *description);
+
+
 static bool native_render_describe_work(XgRenderSourceFrameDescription *description) {
     if (!psx_xg_render_auth_describe_native_work(description)) return false;
     /* Also binds a new presentation epoch before its first FIFO publication;
      * unchanged pacer samples leave the existing origin untouched. */
     native_render_sync_source_clock();
     if (g_native_render_source_failed) return false;
+    return native_render_describe_fields(description);
+}
+
+static bool native_render_describe_fields(XgRenderSourceFrameDescription *description) {
     description->display.temporal_hz =
         g_smooth_60fps_requested.load(std::memory_order_acquire)
         ? (uint16_t)g_native_interpolation_fps : 0u;
@@ -690,6 +747,102 @@ static bool native_render_describe_work(XgRenderSourceFrameDescription *descript
     return true;
 }
 
+
+
+static bool native_presenter_thread_requested() {
+    const char *value = std::getenv("PSX_PRESENTER_THREAD");
+    return !(value && value[0] == '0');
+}
+
+static int native_presenter_thread_main(void *) {
+    XgRenderPresentationHost *host = g_native_render_presentation_host;
+    if (!gl_renderer_native_presenter_thread_begin()) {
+        g_native_presenter.state.store(-1);
+        return -1;
+    }
+    if (!xg_render_presentation_host_rebind_owner(host)) {
+        gl_renderer_native_presenter_thread_end();
+        g_native_presenter.state.store(-1);
+        return -1;
+    }
+    g_native_presenter.state.store(1);
+    while (!g_native_presenter.stop.load(std::memory_order_acquire)) {
+        uint64_t wait_ns = 0u;
+        if (!xg_render_presentation_host_pump(host) ||
+            !xg_render_presentation_host_time_until_pump(host, &wait_ns)) {
+            g_native_presenter.state.store(-1);
+            break;
+        }
+        /* Short slices keep stop requests responsive. */
+        if (wait_ns != 0u)
+            std::this_thread::sleep_for(std::chrono::nanoseconds(
+                std::min<uint64_t>(wait_ns, 2000000u)));
+    }
+    gl_renderer_native_presenter_thread_end();
+    return 0;
+}
+
+/* Native compile and phase workers allocate multi-megabyte buffers that other
+ * threads free. glibc keeps those holes in each worker's arena instead of
+ * returning them, so release free pages to the OS on a slow cadence. */
+static void native_heap_trimmer_start() {
+#if defined(__GLIBC__)
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                (void)malloc_trim(0);
+            }
+        }).detach();
+    });
+#endif
+}
+
+static bool native_presenter_threaded() {
+    return g_native_presenter.thread != nullptr;
+}
+
+/* Stops the thread and returns host ownership to the guest thread. */
+static void native_presenter_stop() {
+    if (!g_native_presenter.thread) return;
+    g_native_presenter.stop.store(true, std::memory_order_release);
+    SDL_WaitThread(g_native_presenter.thread, nullptr);
+    g_native_presenter.thread = nullptr;
+    gl_renderer_native_main_attach_window();
+    if (g_native_render_presentation_host)
+        (void)xg_render_presentation_host_rebind_owner(
+            g_native_render_presentation_host);
+    /* Guest-thread presentation must not block on vsync again. */
+    apply_present_cadence();
+}
+
+static void native_presenter_start() {
+    if (!native_presenter_thread_requested() ||
+        !g_native_render_presentation_host || g_native_presenter.thread)
+        return;
+    gl_renderer_native_context_settle();
+    if (!gl_renderer_native_main_detach_window()) {
+        gl_renderer_native_main_attach_window();
+        return;
+    }
+    g_native_presenter.stop.store(false);
+    g_native_presenter.state.store(0);
+    g_native_presenter.thread = SDL_CreateThread(
+        native_presenter_thread_main, "native-presenter", nullptr);
+    if (!g_native_presenter.thread) {
+        gl_renderer_native_main_attach_window();
+        return;
+    }
+    while (g_native_presenter.state.load() == 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    if (g_native_presenter.state.load() < 0) {
+        /* Fall back to pumping from the guest thread. */
+        native_presenter_stop();
+        g_native_presenter.state.store(0);
+    }
+}
+
 static bool native_render_native_stop_host() {
     XgRenderPresentationHost *host = g_native_render_presentation_host;
 
@@ -701,11 +854,12 @@ static bool native_render_native_stop_host() {
     xg_render_source_frame_clear_host_callbacks();
     if (!host)
         return true;
+    native_presenter_stop();
     gl_renderer_native_set_worker_notify(nullptr,nullptr);
     xg_render_presentation_host_shutdown(host);
     if (!xg_render_presentation_host_join(host) ||
         !xg_render_presentation_host_destroy(host)) {
-        native_render_source_fail_closed();
+        native_render_source_fail_closed(__LINE__);
         return false;
     }
     g_native_render_presentation_host = nullptr;
@@ -720,7 +874,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
 
     if (!gl_renderer_native_init_services(
             &worker_services, &presenter_services)) {
-        native_render_source_fail_closed();
+        native_render_source_fail_closed(__LINE__);
         return false;
     }
     const uint64_t presentation_period_ns =
@@ -731,7 +885,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
         xg_render_presentation_host_start(
             &worker_services, &presenter_services, presentation_period_ns);
     if (!g_native_render_presentation_host) {
-        native_render_source_fail_closed();
+        native_render_source_fail_closed(__LINE__);
         gl_renderer_native_shutdown();
         return false;
     }
@@ -742,7 +896,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
     if (!xg_render_presentation_host_set_hold_presenter(
             g_native_render_presentation_host, xg_render_presenter_present_hold) ||
         !xg_render_source_frame_configure_host_callbacks(&callbacks)) {
-        native_render_source_fail_closed();
+        native_render_source_fail_closed(__LINE__);
         if (!native_render_native_stop_host())
             return false;
         gl_renderer_native_shutdown();
@@ -763,6 +917,9 @@ static bool native_render_native_start_host(double presentation_period_ms) {
         return false;
     }
     psx_xg_render_auth_set_native_work_mode(true);
+    native_heap_trimmer_start();
+    native_presenter_start();
+    apply_present_cadence();
     gpu_set_native_work_draw_hook(psx_xg_render_auth_accept_native_draw);
     gpu_set_native_work_environment_hook([](uint64_t command_id) -> bool {
         XgRenderNativeOperation target{};
@@ -876,6 +1033,7 @@ static int post_load_probe_env_on(void) {
 }
 static Uint64   s_fps_last_time = 0;
 static uint64_t s_fps_last_frame = 0;
+static uint64_t s_fps_last_shown = 0;
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
@@ -1387,7 +1545,6 @@ extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) 
     char buf[320];
     const int disp = slot + 1;
     if (!is_load && ok) {
-        psx_savestate_menu_note_slots_changed();
         psx_runtime_menu_note_savestates_changed();
     }
     if (is_load && ok)
@@ -1628,7 +1785,6 @@ static int           g_rewind_enabled = 0;
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
 static int           g_hotkey_pad_rewind = 1272;       /* select + r3 */
-static int           g_hotkey_pad_save_state_menu = 2040;/* select + r1 */
 static int           g_hotkey_pad_fast_forward = 1528;   /* select + l1 (hold) */
 static int           g_hotkey_pad_fast_forward_toggle = 0; /* unbound: latch fast-forward */
 static uint32_t      g_savestate_input_guard_min_until = 0;
@@ -1788,21 +1944,36 @@ extern "C" int psx_frame_interpolation_enabled(void) {
  * designed cadence (field 30, battle 60, ...), which is denominator 1
  * (no invented phases) on 60 Hz ticks — the output follows the guest.
  * Forcing 33 ms ticks would halve battle to 30. */
+/* Presenter tick period for a native target. 30 ("Original") and 60 tick at
+ * 60 Hz: 30 means the game's designed cadence (denominator 1, no invented
+ * phases) on 60 Hz ticks. Above 60 the period is the target rate itself --
+ * except when a threaded presenter swaps with vsync at the panel rate: then a
+ * slightly shorter tick lets the blocking swap own the cadence, instead of a
+ * free-running timer beating against vblank (missed vblanks, uneven pacing). */
+static bool native_present_display_locked(int fps) {
+    return fps > 60 && native_presenter_threaded() && g_video_vsync != 0 &&
+        g_host_refresh_hz > 0.0 &&
+        std::fabs(g_host_refresh_hz - (double)fps) <= (double)fps * 0.01;
+}
+
+static uint64_t native_present_period_ns(int fps) {
+    if (fps == 30 || fps == 60) return UINT64_C(16666667);
+    const uint64_t period_ns =
+        (UINT64_C(1000000000) + (uint64_t)fps / 2u) / (uint64_t)fps;
+    if (native_present_display_locked(fps))
+        return period_ns - period_ns / 32u;
+    return period_ns;
+}
+
 extern "C" int psx_native_semantic_fps_set(int fps) {
     if (fps < 30 || fps > 240) return 0;
-    /* 30 ("Original") and 60 tick at 60 Hz: 30 means the game's designed
-     * cadence (denominator 1, no invented phases) on 60 Hz ticks. Above
-     * 60 the period is the target rate itself. */
-    const uint64_t period_ns = (fps == 30 || fps == 60)
-        ? UINT64_C(16666667)
-        : (UINT64_C(1000000000) + (uint64_t)fps / 2u) / (uint64_t)fps;
     if (!gl_renderer_set_native_interpolation_fps(fps))
         return 0;
     g_native_interpolation_fps = fps;
     psx_smooth_60fps_set(fps >= 60);
     if (g_native_render_selected && g_native_render_presentation_host &&
         !xg_render_presentation_host_set_period(
-            g_native_render_presentation_host, period_ns))
+            g_native_render_presentation_host, native_present_period_ns(fps)))
         return -1;
     /* Re-resolve user x target x panel now that the denominator moved. */
     apply_present_cadence();
@@ -1816,6 +1987,45 @@ static Uint32 psx_fullscreen_flag_for_mode(int mode) {
     if (mode == 2) return SDL_WINDOW_FULLSCREEN;         /* exclusive */
     if (mode == 1) return SDL_WINDOW_FULLSCREEN_DESKTOP; /* borderless */
     return 0;                                            /* windowed */
+}
+
+/* Handle fullscreen before overlays can capture keyboard input. F11 stays
+ * available even with an older config.ini containing Alt+Return; a configured
+ * alternative continues to work alongside it. */
+static bool host_fullscreen_process_event(const SDL_Event* event) {
+    if (!sdl_window || event->type != SDL_KEYDOWN ||
+        event->key.windowID != SDL_GetWindowID(sdl_window) ||
+        !host_hotkey_input_focused())
+        return false;
+    const SDL_Keycode key = psx_sdl_event_keycode(event);
+    const SDL_Keymod mod = psx_sdl_event_keymod(event);
+#if defined(PSX_SDL3)
+    const SDL_Scancode scancode = event->key.scancode;
+#else
+    const SDL_Scancode scancode = event->key.keysym.scancode;
+#endif
+    const bool f11 = (key == SDLK_F11 || scancode == SDL_SCANCODE_F11) &&
+        !(mod & (KMOD_CTRL | KMOD_ALT | KMOD_SHIFT | KMOD_GUI));
+    if (!f11 && !host_keymap_match_event(HOST_KEYMAP_FULLSCREEN,
+                                       (int)key, (int)scancode, (int)mod))
+        return false;
+    if (event->key.repeat)
+        return true;
+    const bool fullscreen = (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) != 0;
+    Uint32 target = fullscreen ? 0 : psx_fullscreen_flag_for_mode(g_fullscreen);
+    if (!fullscreen && target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
+#if defined(PSX_SDL3)
+    const bool ok = SDL_SetWindowFullscreen(sdl_window, target);
+#else
+    const bool ok = SDL_SetWindowFullscreen(sdl_window, target) == 0;
+#endif
+    if (!ok) {
+        std::fprintf(stderr, "[fullscreen] %s\n", SDL_GetError());
+        host_osd_push("Fullscreen change failed", 2000);
+    } else {
+        host_osd_push(fullscreen ? "Windowed" : "Fullscreen", 1500);
+    }
+    return true;
 }
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
@@ -3840,8 +4050,12 @@ static int native_present_interval(void) {
     /* True target (main-owned); the GL getter reports pool sizing in
      * 30 Hz units and lies for 75/144/165. */
     const int native_fps = g_native_interpolation_fps;
+    /* High targets used to force immediate swaps: a vsync-blocked swap on the
+     * guest thread would stall emulation. A dedicated presenter thread may
+     * block, so honour the user's vsync there (no tearing; the time-based
+     * phase selection still samples the right image after a blocked swap). */
     if (native_fps > 60)
-        return 0;
+        return native_presenter_threaded() ? g_video_vsync : 0;
     if (native_fps > 0 && g_video_vsync != 0 && g_host_refresh_hz > 0.0) {
         const double panel = g_host_refresh_hz;
         const double exact = panel / (double)native_fps;
@@ -3903,6 +4117,21 @@ static int present_should_wall_pace(void) {
     return g_frame_period_ms > 0.0;
 }
 
+/* Guest-thread UI while a dedicated thread presents: the tools window and the
+ * runtime menu layer, both rate-limited internally to ~60 Hz. */
+static uint64_t g_native_ui_service_ns;
+static constexpr uint64_t kNativeUiServicePeriodNs = 4000000u;
+
+static void native_render_ui_service() {
+    const uint64_t now_ns = native_render_clock_ns();
+    if (now_ns - g_native_ui_service_ns < kNativeUiServicePeriodNs) return;
+    g_native_ui_service_ns = now_ns;
+    if (!gl_renderer_ui_context_enter()) return;
+    psx_runtime_menu_service_layer();
+    psx_debug_overlay_service_main();
+    gl_renderer_ui_context_leave();
+}
+
 /* Only the host root calls this while simulation is suspended. In particular,
  * do not poll debug commands, admit netplay, or apply restores here: those can
  * escape to the scheduler and must execute on its live guest stack. */
@@ -3915,11 +4144,20 @@ static void native_render_host_service_until(uint64_t deadline_ns) {
             const int serviced = gl_renderer_native_service();
             if (serviced > 0)
                 xg_render_presentation_host_notify(g_native_render_presentation_host);
-            if (serviced < 0 ||
-                !xg_render_presentation_host_pump(g_native_render_presentation_host) ||
-                !xg_render_presentation_host_time_until_pump(
-                    g_native_render_presentation_host, &presenter_wait_ns))
-                native_render_source_fail_closed();
+            if (native_presenter_threaded()) {
+                if (serviced < 0 || g_native_presenter.state.load() < 0)
+                    native_render_source_fail_closed(__LINE__);
+                else
+                    native_render_ui_service();
+            } else {
+                const bool pumped = serviced >= 0 &&
+                    xg_render_presentation_host_pump(g_native_render_presentation_host);
+                gl_renderer_native_context_settle();
+                if (!pumped ||
+                    !xg_render_presentation_host_time_until_pump(
+                        g_native_render_presentation_host, &presenter_wait_ns))
+                    native_render_source_fail_closed(__LINE__);
+            }
         }
         const uint64_t now_ns = native_render_clock_ns();
         if (now_ns >= deadline_ns)
@@ -3957,6 +4195,14 @@ static void native_render_host_service_boundary() {
         psx_fiber_current() == g_native_simulation.host)
         return;
     const uint64_t now_ns = native_render_clock_ns();
+    if (native_presenter_threaded()) {
+        /* Presentation runs on its own thread; only the guest-thread UI (menu
+         * layer, tools window) still needs these seams. A guest that never
+         * idles would otherwise starve it and make the menu feel laggy. */
+        if (now_ns - g_native_ui_service_ns >= kNativeUiServicePeriodNs)
+            native_render_suspend_until(now_ns);
+        return;
+    }
     bool renderer_pending = false;
     if (now_ns >= g_native_simulation.renderer_poll_ns) {
         g_native_simulation.renderer_poll_ns = now_ns + 1000000u;
@@ -3966,7 +4212,7 @@ static void native_render_host_service_boundary() {
     uint64_t wait_ns;
     if (!xg_render_presentation_host_time_until_present(
             g_native_render_presentation_host, &wait_ns)) {
-        native_render_source_fail_closed();
+        native_render_source_fail_closed(__LINE__);
         return;
     }
     g_native_simulation.present_poll_ns = now_ns + wait_ns;
@@ -4067,7 +4313,11 @@ static void native_render_host_quantum_pace(void) {
     /* Synchronize the updated cycle/deadline pair, not a retained endpoint.
      * Debt recovery dates new work only; queued work must keep draining. */
     native_render_sync_source_clock();
-    native_render_suspend_until(g_native_simulation.guest_deadline_ns);
+    /* A late guest edge has no idle budget to lend to another host pump.
+     * The periodic service seams still present due ticks while simulation
+     * catches up; don't add an unconditional pump to every overdue VBlank. */
+    if (native_render_clock_ns() < g_native_simulation.guest_deadline_ns)
+        native_render_suspend_until(g_native_simulation.guest_deadline_ns);
 }
 
 static void native_render_simulation_entry(void *) {
@@ -4137,6 +4387,18 @@ static void apply_present_cadence(void) {
     const int interval = present_effective_swap_interval();
     if (g_gl_active)
         gl_renderer_set_swap_interval(interval);
+    /* Vsync, panel and presenter threading all decide the native tick. */
+    if (g_native_render_selected && g_native_render_presentation_host)
+        (void)xg_render_presentation_host_set_period(
+            g_native_render_presentation_host,
+            native_present_period_ns(g_native_interpolation_fps));
+    if (g_native_render_selected && g_native_render_presentation_host)
+        (void)xg_render_presentation_host_set_display_locked(
+            g_native_render_presentation_host,
+            native_present_display_locked(g_native_interpolation_fps)
+                ? (UINT64_C(1000000000) + (uint64_t)g_native_interpolation_fps / 2u) /
+                      (uint64_t)g_native_interpolation_fps
+                : 0u);
     if (g_vk_active)
         vk_renderer_set_present_mode(interval);
     if (sdl_renderer)
@@ -4163,8 +4425,9 @@ extern "C" void psx_video_set_vsync(int mode) {
 static void log_present_cadence(void) {
     if (g_native_render_selected) {
         std::printf("psxrecomp: Native cadence: 33.8688 MHz guest clock, "
-                    "independent %.1f Hz presenter, vsync off\n",
-                    (double)g_native_interpolation_fps);
+                    "independent %.1f Hz presenter, swap interval %d\n",
+                    (double)g_native_interpolation_fps,
+                    present_effective_swap_interval());
     } else if (present_vsync_owns_cadence()) {
         /* The pacer still runs underneath as a deadline cap (see
          * present_should_wall_pace) -- a no-op whenever the swap actually
@@ -6923,6 +7186,7 @@ static void netplay_barrier_admit(int override) {
         if (!g_headless) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
+                if (host_fullscreen_process_event(&ev)) continue;
                 if (ev.type == SDL_QUIT) {
                     netplay_soft_exit("sdl_window_close");
                     if (psx_return_to_lobby_requested()) goto done;
@@ -7394,9 +7658,7 @@ static void depth24_stage_scanout(const GpuDisplayInfo *di, uint32_t *buf,
 }
 
 enum {
-    PSX_ASSIST_BIND_REWIND = 0,
-    PSX_ASSIST_BIND_SAVE_STATE_MENU,
-    PSX_ASSIST_BIND_FAST_FORWARD,   /* hold-to-fast-forward; pad twin of [KeyMap] Turbo */
+    PSX_ASSIST_BIND_FAST_FORWARD = 0,   /* hold-to-fast-forward; pad twin of [KeyMap] Turbo */
     PSX_ASSIST_BIND_FAST_FORWARD_TOGGLE, /* press-to-latch; pad twin of [KeyMap] TurboToggle */
     PSX_ASSIST_BIND_COUNT
 };
@@ -7413,9 +7675,6 @@ enum {
 #define PSX_HOTKEY_PAD_SELECT_R3 \
     PSX_HOTKEY_PAD_BUTTON_COMBO(((uint32_t)1u << SDL_CONTROLLER_BUTTON_BACK) | \
                                 ((uint32_t)1u << SDL_CONTROLLER_BUTTON_RIGHTSTICK))
-#define PSX_HOTKEY_PAD_SELECT_R1 \
-    PSX_HOTKEY_PAD_BUTTON_COMBO(((uint32_t)1u << SDL_CONTROLLER_BUTTON_BACK) | \
-                                ((uint32_t)1u << SDL_CONTROLLER_BUTTON_RIGHTSHOULDER))
 #define PSX_HOTKEY_PAD_SELECT_L1 \
     PSX_HOTKEY_PAD_BUTTON_COMBO(((uint32_t)1u << SDL_CONTROLLER_BUTTON_BACK) | \
                                 ((uint32_t)1u << SDL_CONTROLLER_BUTTON_LEFTSHOULDER))
@@ -7478,43 +7737,6 @@ static int hotkey_pad_binding_down(int binding) {
     return 0;
 }
 
-static int savestate_menu_open = 0;
-static int savestate_menu_slot = 0;
-static int savestate_menu_ignore_toggle_release = 0;
-static SDL_Keycode savestate_menu_open_key = 0;
-
-static void savestate_menu_sync_overlay(void) {
-    psx_savestate_menu_set_state(savestate_menu_open, savestate_menu_slot);
-}
-
-static void savestate_menu_close(void) {
-    savestate_menu_open = 0;
-    savestate_menu_sync_overlay();
-    host_osd_push("Save states closed", 800);
-}
-
-static void savestate_menu_toggle(SDL_Keycode opened_by_key) {
-    if (psx_rewind_is_open())
-        return;
-    if (savestate_menu_open) {
-        savestate_menu_close();
-        return;
-    }
-    savestate_menu_open = 1;
-    savestate_menu_ignore_toggle_release = 1;
-    savestate_menu_open_key = opened_by_key;
-    savestate_menu_sync_overlay();
-}
-
-static void savestate_menu_move(int delta) {
-    savestate_menu_slot += delta;
-    while (savestate_menu_slot < 0)
-        savestate_menu_slot += 12;
-    while (savestate_menu_slot >= 12)
-        savestate_menu_slot -= 12;
-    savestate_menu_sync_overlay();
-}
-
 static int savestate_submit_slot(int slot, int save) {
     if (!save && !savestate_slot_exists(slot)) {
         char msg[32];
@@ -7537,13 +7759,6 @@ static int savestate_submit_slot(int slot, int save) {
         return savestate_request_save(slot);
     } else {
         return savestate_request_load(slot);
-    }
-}
-
-static void savestate_menu_submit(int save) {
-    if (savestate_submit_slot(savestate_menu_slot, save) && savestate_menu_open) {
-        savestate_menu_open = 0;
-        savestate_menu_sync_overlay();
     }
 }
 
@@ -7581,109 +7796,6 @@ extern "C" int psx_runtime_savestate_submit(int slot, int save) {
     return 1;
 }
 
-static int savestate_menu_slot_from_key(SDL_Keycode key) {
-    if (key >= SDLK_1 && key <= SDLK_9)
-        return (int)(key - SDLK_1);
-    if (key == SDLK_0)
-        return 9;
-    if (key == SDLK_MINUS)
-        return 10;
-    if (key == SDLK_EQUALS)
-        return 11;
-    return -1;
-}
-
-static void savestate_menu_handle_key(SDL_Keycode key, SDL_Scancode scancode,
-                                      int mod, int repeat) {
-    int slot;
-    if (repeat)
-        return;
-    if (savestate_menu_open_key && key == savestate_menu_open_key)
-        return;
-    slot = savestate_menu_slot_from_key(key);
-    if (slot >= 0) {
-        savestate_menu_slot = slot;
-        savestate_menu_sync_overlay();
-        return;
-    }
-    if (host_keymap_match_event(HOST_KEYMAP_SAVE_STATE_MENU, (int)key,
-                                (int)scancode, mod) ||
-        key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-        savestate_menu_close();
-    } else if (key == SDLK_LEFT || key == SDLK_UP) {
-        savestate_menu_move(-1);
-    } else if (key == SDLK_RIGHT || key == SDLK_DOWN) {
-        savestate_menu_move(+1);
-    } else if (key == SDLK_s) {
-        savestate_menu_submit(1);
-    } else if (key == SDLK_l) {
-        savestate_menu_submit(0);
-    } else if (key == SDLK_RETURN || key == SDLK_SPACE) {
-        savestate_menu_submit((mod & KMOD_SHIFT) != 0);
-    }
-}
-
-static void savestate_menu_poll_nav(uint32_t now_ms) {
-    static int prev_load, prev_save, prev_cancel, prev_toggle;
-    static int held_dir, last_step_ms;
-    int prev = 0, next = 0, load = 0, save = 0, cancel = 0;
-    int dir = 0;
-
-    SDL_GameController *h = g_players[0].handle;
-    if (h) {
-        const Sint16 lx =
-            SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTX);
-        const int dz = 16000;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_LEFT) ||
-            SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_UP) ||
-            lx < -dz)
-            prev = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
-            SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_DOWN) ||
-            lx > dz)
-            next = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_A))
-            load = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_X))
-            save = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_B))
-            cancel = 1;
-    }
-
-    const int toggle = hotkey_pad_binding_down(g_hotkey_pad_save_state_menu);
-    if (savestate_menu_ignore_toggle_release) {
-        if (!toggle)
-            savestate_menu_ignore_toggle_release = 0;
-    } else if (toggle && !prev_toggle) {
-        cancel = 1;
-    }
-    prev_toggle = toggle;
-
-    if (load && !prev_load)
-        savestate_menu_submit(0);
-    if (save && !prev_save)
-        savestate_menu_submit(1);
-    if (cancel && !prev_cancel)
-        savestate_menu_close();
-    prev_load = load;
-    prev_save = save;
-    prev_cancel = cancel;
-
-    if (!savestate_menu_open)
-        return;
-
-    dir = next ? +1 : prev ? -1 : 0;
-    if (!dir) {
-        held_dir = 0;
-        return;
-    }
-    if (dir != held_dir || (int32_t)(now_ms - (uint32_t)last_step_ms) >= 160) {
-        savestate_menu_move(dir);
-        held_dir = dir;
-        last_step_ms = (int)now_ms;
-    }
-}
-
 static int rewind_toggle_buttons_down(void) {
     return hotkey_pad_binding_down(g_hotkey_pad_rewind);
 }
@@ -7693,14 +7805,6 @@ static void rewind_poll_toggle_buttons(void) {
     int down = rewind_toggle_buttons_down();
     if (down && !was_down && !psx_rewind_is_open())
         psx_rewind_toggle();
-    was_down = down;
-}
-
-static void savestate_menu_poll_toggle_buttons(void) {
-    static int was_down;
-    int down = hotkey_pad_binding_down(g_hotkey_pad_save_state_menu);
-    if (down && !was_down && !psx_rewind_is_open())
-        savestate_menu_toggle(0);
     was_down = down;
 }
 
@@ -7803,6 +7907,7 @@ static void rewind_host_pause_loop(void) {
     while (psx_rewind_is_open()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            if (host_fullscreen_process_event(&ev)) continue;
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
@@ -7844,57 +7949,6 @@ static void rewind_host_pause_loop(void) {
     savestate_input_guard_arm();
 }
 
-/* Freeze guest in vblank present while the save-state slot menu is open. */
-static void savestate_menu_host_pause_loop(void) {
-    freeze_heartbeat_set_paused(1);
-    while (savestate_menu_open) {
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) {
-                psx_crash_trace_set_exit_origin("sdl_window_close");
-                shutdown_runtime();
-                std::exit(0);
-            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-                refresh_player_devices();
-            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-                close_controller();
-                refresh_player_devices();
-            } else if (ev.type == SDL_KEYDOWN) {
-#if defined(PSX_SDL3)
-                const SDL_Keymod mod = ev.key.mod;
-                const SDL_Keycode key = ev.key.key;
-                const SDL_Scancode scancode = ev.key.scancode;
-                const int repeat = ev.key.repeat ? 1 : 0;
-#else
-                const Uint16 mod = ev.key.keysym.mod;
-                const SDL_Keycode key = ev.key.keysym.sym;
-                const SDL_Scancode scancode = ev.key.keysym.scancode;
-                const int repeat = ev.key.repeat ? 1 : 0;
-#endif
-                savestate_menu_handle_key(key, scancode, (int)mod, repeat);
-            } else if (ev.type == SDL_KEYUP) {
-#if defined(PSX_SDL3)
-                const SDL_Keycode key = ev.key.key;
-#else
-                const SDL_Keycode key = ev.key.keysym.sym;
-#endif
-                if (savestate_menu_open_key == key)
-                    savestate_menu_open_key = 0;
-            }
-        }
-        savestate_menu_poll_nav((uint32_t)SDL_GetTicks());
-        rewind_pause_present();
-        starvation_watchdog_heartbeat();
-        if (g_native_render_selected)
-            native_render_host_wait(8);
-        else
-            SDL_Delay(8);
-    }
-    freeze_heartbeat_set_paused(0);
-    /* Swallow the close press; a just-queued save must not snapshot it. */
-    savestate_input_guard_arm();
-}
-
 /* Epilogue for netplay admit/pace AFTER all C++ RAII in the present body
  * is destroyed — episode snap load longjmps via psx_netplay_rb_flush_resume and
  * must not cross non-trivial destructors (UB / guest crash). */
@@ -7907,6 +7961,21 @@ struct NetplayVblankEpilogue {
 /* Non-Native frontend work called from gpu_vblank_tick() at each simulated
  * vblank. Native returns after the guest/diagnostic portion below; its real
  * presenter is exclusively owned by g_native_render_presentation_host. */
+/* Distinct images actually shown: every swap minus the ones that repeated the
+ * previous image (native holds on an unchanged phase). Without the Native
+ * presenter each GL present is a new image. */
+static uint64_t fps_shown_frames_total(void) {
+    if (g_native_render_selected) {
+        XgRenderPresentationDiagnostics diagnostics{};
+        xg_render_semantic_presentation_diagnostics(&diagnostics);
+        const uint64_t swaps =
+            diagnostics.presented_endpoints + diagnostics.presented_holds;
+        return swaps > diagnostics.duplicate_presents
+            ? swaps - diagnostics.duplicate_presents : 0u;
+    }
+    return g_gl_active ? gl_renderer_pres_total() : 0u;
+}
+
 static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
     NetplayVblankEpilogue ep{};
 
@@ -7962,6 +8031,7 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
         if (!s_fps_last_time) {
             s_fps_last_time = now;
             s_fps_last_frame = s_frame_count;
+            s_fps_last_shown = fps_shown_frames_total();
             if (sdl_window && s_fps_base_title.empty()) {
                 const char *title = SDL_GetWindowTitle(sdl_window);
                 if (title) s_fps_base_title = title;
@@ -7970,22 +8040,16 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
             const double fps = (double)(s_frame_count - s_fps_last_frame) / seconds;
             const double speed = fps / 59.94;
-            double display_fps = 0.0;
-            if (g_frame_interpolation && g_gl_active) {
-                display_fps = g_frame_interpolation_fps > 0
-                    ? (double)g_frame_interpolation_fps
-                    : g_host_refresh_hz;
-            }
+            /* fps counts simulated vblanks (game speed); shown_fps counts the
+             * distinct images that reached the display. */
+            const uint64_t shown = fps_shown_frames_total();
+            const double shown_fps = shown >= s_fps_last_shown
+                ? (double)(shown - s_fps_last_shown) / seconds : 0.0;
+            s_fps_last_shown = shown;
             if (!g_headless && sdl_window) {
                 char title[256];
-                if (display_fps > 0.0) {
-                    snprintf(title, sizeof(title),
-                             "%s  [Game %.0f fps %.2fx | Display %.0f fps]",
-                             s_fps_base_title.c_str(), fps, speed, display_fps);
-                } else {
-                    snprintf(title, sizeof(title), "%s  [Game %.0f fps %.2fx]",
-                             s_fps_base_title.c_str(), fps, speed);
-                }
+                snprintf(title, sizeof(title), "%s  [%.0f FPS | %.0f vblanks %.2fx]",
+                         s_fps_base_title.c_str(), shown_fps, fps, speed);
                 /* Under Wayland/libdecor every title change redraws the window
                  * decoration on this (guest) thread: skip unchanged titles. */
                 static std::string s_fps_last_title;
@@ -7996,14 +8060,8 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
             }
             if (!g_headless) {
                 char osd[96];
-                if (display_fps > 0.0) {
-                    snprintf(osd, sizeof(osd),
-                             "Game %.0f FPS  %.2fx | Display %.0f FPS",
-                             fps, speed, display_fps);
-                } else {
-                    snprintf(osd, sizeof(osd), "Game %.0f FPS  %.2fx",
-                             fps, speed);
-                }
+                snprintf(osd, sizeof(osd), "%.0f FPS | %.0f vblanks  %.2fx",
+                         shown_fps, fps, speed);
                 host_osd_set_status(osd);
             }
             if (netplay_timing_on() && s_np_timing_frames > 0) {
@@ -8072,11 +8130,9 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            /* Hand the event to the in-game debug overlay first. When the
-             * overlay consumes it (e.g. Ctrl+F3 toggles visibility), skip
-             * the rest of the loop body — plain F3 must still fall through
-             * to the savestate block below, but Ctrl+F3 must NOT also
-             * load slot 2, so the gate sits ahead of every F1-F12 check. */
+            if (host_fullscreen_process_event(&ev)) continue;
+            /* Overlays consume their own shortcuts and navigation after the
+             * global fullscreen shortcut has been handled. */
             if (psx_runtime_menu_process_event(&ev)) continue;
             if (psx_free_camera_process_event(&ev,
                     psx_runtime_menu_capture_input() || psx_debug_overlay_camera_input_blocked())) continue;
@@ -8125,12 +8181,6 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
                                             (int)scancode, (int)mod)) {
                     psx_rewind_toggle();
                 }
-                else if (!key_repeat &&
-                         host_keymap_match_event(HOST_KEYMAP_SAVE_STATE_MENU,
-                                                 (int)key, (int)scancode,
-                                                 (int)mod)) {
-                    savestate_menu_toggle(key);
-                }
                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
                     debug_force_cd_reinsert();
@@ -8170,44 +8220,14 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
                                                     (int)mod)) {
                     host_volume_adjust(-5);
                 }
-                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. Toggles between
-                 * windowed and the CONFIGURED tri-state mode (g_fullscreen: 1
-                 * borderless desktop fullscreen keeping the desktop resolution
-                 * and letterboxing the image, or 2 exclusive fullscreen — a
-                 * real display-mode change). SDL_WINDOW_FULLSCREEN's bit is
-                 * set in both SDL_WINDOW_FULLSCREEN and
-                 * SDL_WINDOW_FULLSCREEN_DESKTOP, so testing just that bit
-                 * detects "currently fullscreen, either mode". */
-                else if (!key_repeat &&
-                         host_keymap_match_event(HOST_KEYMAP_FULLSCREEN,
-                                                 (int)key, (int)scancode,
-                                                 (int)mod)) {
-                    Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                                   SDL_WINDOW_FULLSCREEN;
-                    if (is_fs) {
-                        SDL_SetWindowFullscreen(sdl_window, 0);
-                        host_osd_push("Windowed", 1500);
-                    } else {
-                        /* If the configured mode is "off", the hotkey still
-                         * needs a mode to switch INTO — default to borderless,
-                         * matching the historical (pre-tri-state) behaviour. */
-                        Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
-                        if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
-                        SDL_SetWindowFullscreen(sdl_window, target);
-                        host_osd_push("Fullscreen", 1500);
-                    }
-                }
             }
         }
         psx_free_camera_update(psx_debug_overlay_camera_input_window(),
             psx_runtime_menu_capture_input() || psx_debug_overlay_camera_input_blocked());
-        savestate_menu_poll_toggle_buttons();
         rewind_poll_toggle_buttons();
         fast_forward_toggle_poll_buttons();
         psx_rewind_note_frame();
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
-        if (savestate_menu_open)
-            savestate_menu_host_pause_loop();
         if (psx_rewind_is_open())
             rewind_host_pause_loop();
     }
@@ -8522,8 +8542,8 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
         static int turbo_was_down = 0;
         /* Keyboard ([KeyMap] Turbo, default Tab) or the controller host
          * shortcut ([hotkeys] fast_forward_pad, default select+L1). Both are
-         * hold-to-run; the pad chord goes through the same combo matcher as
-         * Rewind / Save states so the launcher's binding editor covers it.
+         * hold-to-run; the pad chord uses the shared combo matcher and is
+         * configurable through the launcher's binding editor.
          * g_manual_turbo_latched is the press-to-lock twin (TurboToggle /
          * fast_forward_toggle_pad) and drives the same path. */
         const bool kb_turbo = host_hotkey_input_focused() &&
@@ -14086,8 +14106,6 @@ namespace {
         "Vulkan",
     };
     static const char* const kPsxHostShortcutLabels[] = {
-        "Rewind",
-        "Save states",
         "Fast-forward",
         "Fast-forward toggle",
     };
@@ -14156,7 +14174,6 @@ namespace {
         gi->has_geometry_precision = 0;
         /* Master dithering on/off; a plain renderer toggle, unlike PGXP. */
         gi->has_dithering = 1;
-        gi->has_rewind_depth = 1;
         if (language_labels && num_languages > 0) {
             gi->language_labels = language_labels;
             gi->num_languages = num_languages;
@@ -15597,10 +15614,6 @@ int main(int argc, char** argv) {
             g_hotkey_pad_rewind = normalize_hotkey_pad_binding(
                 us.hotkey_pad_rewind,
                 PSX_HOTKEY_PAD_SELECT_R3);
-        if (us.has_hotkey_pad_save_state_menu)
-            g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
-                us.hotkey_pad_save_state_menu,
-                PSX_HOTKEY_PAD_SELECT_R1);
         if (us.has_hotkey_pad_fast_forward)
             g_hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
                 us.hotkey_pad_fast_forward,
@@ -16158,13 +16171,6 @@ int main(int argc, char** argv) {
             seed.has_aspect_ratio = true;
             seed.audio_freq = g_audio_freq;               seed.has_audio_freq = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
-            seed.rewind = g_rewind_enabled != 0;          seed.has_rewind = true;
-            seed.rewind_depth = g_rewind_depth;           seed.has_rewind_depth = true;
-            seed.rewind_interval = g_rewind_interval;     seed.has_rewind_interval = true;
-            seed.hotkey_pad_rewind = g_hotkey_pad_rewind;
-            seed.has_hotkey_pad_rewind = true;
-            seed.hotkey_pad_save_state_menu = g_hotkey_pad_save_state_menu;
-            seed.has_hotkey_pad_save_state_menu = true;
             seed.hotkey_pad_fast_forward = g_hotkey_pad_fast_forward;
             seed.has_hotkey_pad_fast_forward = true;
             seed.hotkey_pad_fast_forward_toggle = g_hotkey_pad_fast_forward_toggle;
@@ -16347,15 +16353,6 @@ int main(int argc, char** argv) {
             ls.frame_interp       = seed.frame_interpolation ? 1 : 0;
             ls.frame_interp_fps   = seed.frame_interpolation_fps;
             ls.spu_hq             = seed.spu_hq ? 1 : 0;
-            ls.rewind_enabled    = seed.rewind ? 1 : 0;
-            ls.rewind_depth      = seed.rewind_depth > 0 ? seed.rewind_depth : 50;
-            ls.rewind_interval   = seed.rewind_interval > 0 ? seed.rewind_interval : 15;
-            ls.assist_pad_bind[PSX_ASSIST_BIND_REWIND] =
-                normalize_hotkey_pad_binding(seed.hotkey_pad_rewind,
-                    PSX_HOTKEY_PAD_SELECT_R3);
-            ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU] =
-                normalize_hotkey_pad_binding(seed.hotkey_pad_save_state_menu,
-                    PSX_HOTKEY_PAD_SELECT_R1);
             ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD] =
                 normalize_hotkey_pad_binding(seed.hotkey_pad_fast_forward,
                     PSX_HOTKEY_PAD_SELECT_L1);
@@ -16681,20 +16678,6 @@ int main(int argc, char** argv) {
 #endif
                 seed.audio_freq            = ls.audio_freq;            seed.has_audio_freq            = true;
                 seed.spu_hq                = ls.spu_hq != 0;           seed.has_spu_hq                = true;
-                seed.rewind                = ls.rewind_enabled != 0;
-                seed.has_rewind            = true;
-                seed.rewind_depth          = ls.rewind_depth > 0 ? ls.rewind_depth : 50;
-                seed.has_rewind_depth      = true;
-                seed.rewind_interval       = ls.rewind_interval > 0 ? ls.rewind_interval : 15;
-                seed.has_rewind_interval   = true;
-                seed.hotkey_pad_rewind = normalize_hotkey_pad_binding(
-                    ls.assist_pad_bind[PSX_ASSIST_BIND_REWIND],
-                    PSX_HOTKEY_PAD_SELECT_R3);
-                seed.has_hotkey_pad_rewind = true;
-                seed.hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
-                    ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
-                    PSX_HOTKEY_PAD_SELECT_R1);
-                seed.has_hotkey_pad_save_state_menu = true;
                 seed.hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
                     ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD],
                     PSX_HOTKEY_PAD_SELECT_L1);
@@ -16930,17 +16913,6 @@ int main(int argc, char** argv) {
                 split_display_stretch();
                 g_audio_freq      = seed.audio_freq;
                 g_audio_spu_hq    = seed.spu_hq;
-                g_rewind_enabled = seed.has_rewind ? (seed.rewind ? 1 : 0) : 0;
-                g_rewind_depth   = seed.has_rewind_depth && seed.rewind_depth > 0
-                    ? seed.rewind_depth : 50;
-                g_rewind_interval = seed.has_rewind_interval && seed.rewind_interval > 0
-                    ? seed.rewind_interval : 15;
-                g_hotkey_pad_rewind = seed.has_hotkey_pad_rewind
-                    ? seed.hotkey_pad_rewind
-                    : PSX_HOTKEY_PAD_SELECT_R3;
-                g_hotkey_pad_save_state_menu = seed.has_hotkey_pad_save_state_menu
-                    ? seed.hotkey_pad_save_state_menu
-                    : PSX_HOTKEY_PAD_SELECT_R1;
                 g_hotkey_pad_fast_forward = seed.has_hotkey_pad_fast_forward
                     ? seed.hotkey_pad_fast_forward
                     : PSX_HOTKEY_PAD_SELECT_L1;
@@ -17732,7 +17704,7 @@ session_reboot:
     /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
      * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
      * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
-     * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
+     * windowed. Matches the in-game F11 hotkey behaviour. */
     win_flags |= psx_fullscreen_flag_for_mode(g_fullscreen);
     /* Open at the user-chosen window size (default 1280 wide) instead of the
      * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
@@ -17903,7 +17875,7 @@ session_reboot:
         g_native_render_selected =
             render_mode == GUEST_RENDER_RENDER_NATIVE;
         if (g_native_render_selected && !g_gl_active) {
-            native_render_source_fail_closed();
+            native_render_source_fail_closed(__LINE__);
             return 1;
         }
         gte_native_provenance_set_enabled(g_native_render_selected ? 1 : 0);
@@ -17919,6 +17891,12 @@ session_reboot:
                 xg_render_host_native_text_authorizes_pc(0x8002c700u);
         });
         ram_provenance_set_cpu_tracking(g_native_render_selected);
+        /* Native work consumes GP0 packets directly: the preflight binding's
+         * per-instruction GTE dataflow and CPU store receipts have no
+         * consumer. MDEC source tracking (FMV) and the GTE register shadow
+         * (exact NCLIP sign) stay on. */
+        gte_native_provenance_set_dataflow(g_native_render_selected ? 0 : 1);
+        ram_provenance_set_preflight_tracking(!g_native_render_selected);
         update_native_temporal_coverage();
 
         if (!native_render_mode_control_init(
@@ -18777,17 +18755,6 @@ soft_return_lobby:
         ls.auto_skip_fmv = (skip_fmv_offered && g_auto_skip_fmv) ? 1 : 0;
         ls.turbo_loads = (turbo_loads_offered && g_turbo_loads_enabled) ? 1 : 0;
         ls.fast_map_load = cdrom_data_read_policy_enabled();
-        ls.rewind_enabled = g_rewind_enabled;
-        ls.rewind_depth = g_rewind_depth;
-        ls.rewind_interval = g_rewind_interval;
-        ls.assist_pad_bind[PSX_ASSIST_BIND_REWIND] =
-            normalize_hotkey_pad_binding(
-                g_hotkey_pad_rewind,
-                PSX_HOTKEY_PAD_SELECT_R3);
-        ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU] =
-            normalize_hotkey_pad_binding(
-                g_hotkey_pad_save_state_menu,
-                PSX_HOTKEY_PAD_SELECT_R1);
         ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD] =
             normalize_hotkey_pad_binding(
                 g_hotkey_pad_fast_forward,
@@ -19146,20 +19113,6 @@ soft_return_lobby:
                 us.has_audio_freq = true;
                 us.spu_hq = ls.spu_hq != 0;
                 us.has_spu_hq = true;
-                us.rewind = ls.rewind_enabled != 0;
-                us.has_rewind = true;
-                us.rewind_depth = ls.rewind_depth > 0 ? ls.rewind_depth : 50;
-                us.has_rewind_depth = true;
-                us.rewind_interval = ls.rewind_interval > 0 ? ls.rewind_interval : 15;
-                us.has_rewind_interval = true;
-                us.hotkey_pad_rewind = normalize_hotkey_pad_binding(
-                    ls.assist_pad_bind[PSX_ASSIST_BIND_REWIND],
-                    PSX_HOTKEY_PAD_SELECT_R3);
-                us.has_hotkey_pad_rewind = true;
-                us.hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
-                    ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
-                    PSX_HOTKEY_PAD_SELECT_R1);
-                us.has_hotkey_pad_save_state_menu = true;
                 us.hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
                     ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD],
                     PSX_HOTKEY_PAD_SELECT_L1);
@@ -19227,32 +19180,6 @@ soft_return_lobby:
             g_frame_interpolation_fps = ls.frame_interp_fps;
             g_audio_freq = ls.audio_freq;
             g_audio_spu_hq = ls.spu_hq != 0;
-            if (ls.rewind_depth > 0) {
-                g_rewind_depth = ls.rewind_depth;
-                psx_rewind_set_depth((uint32_t)g_rewind_depth);
-            }
-            if (ls.rewind_interval > 0) {
-                g_rewind_interval = ls.rewind_interval;
-                psx_rewind_set_interval((uint32_t)g_rewind_interval);
-            }
-            /* Applied live so turning rewind off frees the ring now rather
-             * than next launch — reclaiming it is the point of the setting.
-             * shutdown() also closes the overlay and drops a pending load. */
-            if ((ls.rewind_enabled ? 1 : 0) != g_rewind_enabled) {
-                g_rewind_enabled = ls.rewind_enabled ? 1 : 0;
-                psx_rewind_set_enabled(g_rewind_enabled);
-                if (g_rewind_enabled)
-                    psx_rewind_configure(memory_get_bios_checksum(),
-                                         game_entry_pc);
-                else
-                    psx_rewind_shutdown();
-            }
-            g_hotkey_pad_rewind = normalize_hotkey_pad_binding(
-                ls.assist_pad_bind[PSX_ASSIST_BIND_REWIND],
-                PSX_HOTKEY_PAD_SELECT_R3);
-            g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
-                ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU],
-                PSX_HOTKEY_PAD_SELECT_R1);
             g_hotkey_pad_fast_forward = normalize_hotkey_pad_binding(
                 ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD],
                 PSX_HOTKEY_PAD_SELECT_L1);

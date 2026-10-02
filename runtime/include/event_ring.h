@@ -40,7 +40,12 @@ extern "C" {
 #endif
 
 /* 64K entries * 48 bytes ~= 3 MB. Covers many frames of transition activity. */
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Release keeps only the counters: observability history is debug-only. */
+#define EVENT_RING_CAP 1u
+#else
 #define EVENT_RING_CAP (1u << 16)
+#endif
 
 typedef enum {
     EV_NONE        = 0,

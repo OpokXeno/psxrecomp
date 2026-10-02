@@ -325,6 +325,11 @@ static uint64_t s_ph_vis_last        = 0;
 static double   s_ph_ends_rate       = 0.0;
 static double   s_ph_holds_rate      = 0.0;
 static double   s_ph_vis_rate        = 0.0;
+/* True repeats (same image swapped again) and the guest-lag envelope that
+ * new source deadlines carry. holds above also counts phase advances. */
+static uint64_t s_ph_dup_last        = 0;
+static double   s_ph_dup_rate        = 0.0;
+static double   s_ph_lag_ms          = 0.0;
 
 static void gpu_state_sample_rates(void)
 {
@@ -397,6 +402,11 @@ static void gpu_state_sample_rates(void)
             s_ph_ends_last = pe;
             s_ph_holds_last = ph;
             s_ph_vis_last = pv;
+            uint64_t pd = snap.presentation.duplicate_presents;
+            if (pd >= s_ph_dup_last)
+                s_ph_dup_rate = (double)(pd - s_ph_dup_last) / dt;
+            s_ph_dup_last = pd;
+            s_ph_lag_ms = (double)snap.presentation.visual_lag_ns / 1e6;
         } else {
             s_host_snap_ok = 0;
         }
@@ -1075,6 +1085,8 @@ static void draw_gpu_state_section(void)
                     s_ph_exp_rate, s_ph_whole_rate);
         ImGui::Text("  presents      : fresh %.1f/s, holds %.1f/s, phased %.1f/s",
                     s_ph_ends_rate, s_ph_holds_rate, s_ph_vis_rate);
+        ImGui::Text("  repeats       : %.1f/s (same image), guest lag %.1f ms",
+                    s_ph_dup_rate, s_ph_lag_ms);
     } else {
         ImGui::Text("Presenter       : (no host)");
     }
@@ -4027,12 +4039,34 @@ static void render_tools_window(GLuint target_fbo)
     (void)bind_overlay_target(target_fbo);
 }
 
+static void overlay_service(GLuint target_fbo, bool threaded_present);
+static void overlay_window_shot(GLuint target_fbo);
+
 void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
 {
     const GLuint target_fbo=(GLuint)framebuffer;
     /* Presented-frame + vblank rates (GPU State readouts). Runs on every
      * present, visible or not — one pre_swap call is one image on screen. */
     gpu_state_sample_rates();
+    overlay_service(target_fbo, false);
+    overlay_window_shot(target_fbo);
+}
+
+void psx_debug_overlay_present_observe(void)
+{
+    gpu_state_sample_rates();
+    overlay_window_shot(0u);
+}
+
+void psx_debug_overlay_service_main(void)
+{
+    /* The game window belongs to the presenter thread: draw only into the
+     * tools window, at most ~60 Hz (enforced below). */
+    overlay_service(0u, true);
+}
+
+static void overlay_service(GLuint target_fbo, bool threaded_present)
+{
     prepare_overlay();
     if(!s_imgui_ready)return;
     if (s_teleport_target_id >= 0) {
@@ -4077,7 +4111,9 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
      * composites into the game target; the separate path draws into the
      * tools window and leaves the game framebuffer untouched. */
     if (s_visible) {
-        if (s_legacy_inline) {
+        if (s_legacy_inline && threaded_present) {
+            /* No game-window context on this thread; nothing to draw into. */
+        } else if (s_legacy_inline) {
             ImGui_ImplOpenGL3_NewFrame();
             PSX_IMGUI_SDL_NEW_FRAME();
             ImGui::NewFrame();
@@ -4110,6 +4146,10 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
         s_text_input_started = false;
     }
 
+}
+
+static void overlay_window_shot(GLuint target_fbo)
+{
     /* Step 3: window_shot readback. Always runs when armed (works hidden
      * too — captures the game-only frame in that case). Must run AFTER
      * RenderDrawData when visible so the overlay's pixels are in the back

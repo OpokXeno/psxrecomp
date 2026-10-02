@@ -88,10 +88,8 @@ static void add_bind(HostKeymapAction action, int keycode, int scancode, int mod
 }
 
 static void apply_defaults(void) {
-    if (want_default(HOST_KEYMAP_FULLSCREEN)) {
-        add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_RETURN, (int)SDL_SCANCODE_RETURN, KMOD_ALT);
-        add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_f, (int)SDL_SCANCODE_F, KMOD_CTRL);
-    }
+    if (want_default(HOST_KEYMAP_FULLSCREEN))
+        add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_F11, (int)SDL_SCANCODE_F11, 0);
     if (want_default(HOST_KEYMAP_TURBO))
         add_bind(HOST_KEYMAP_TURBO, (int)SDLK_TAB, (int)SDL_SCANCODE_TAB, 0);
     if (want_default(HOST_KEYMAP_VOLUME_UP))
@@ -104,8 +102,6 @@ static void apply_defaults(void) {
     if (want_default(HOST_KEYMAP_REWIND))
         add_bind(HOST_KEYMAP_REWIND, (int)SDLK_F8, (int)SDL_SCANCODE_F8, 0);
 #endif
-    if (want_default(HOST_KEYMAP_SAVE_STATE_MENU))
-        add_bind(HOST_KEYMAP_SAVE_STATE_MENU, (int)SDLK_F7, (int)SDL_SCANCODE_F7, 0);
     if (want_default(HOST_KEYMAP_SCANLINES))
         add_bind(HOST_KEYMAP_SCANLINES, (int)SDLK_F6, (int)SDL_SCANCODE_F6, 0);
     if (want_default(HOST_KEYMAP_TURBO_TOGGLE))
@@ -166,7 +162,6 @@ static HostKeymapAction action_for_key(const char *name) {
     if (ieq(name, "VolumeDown")) return HOST_KEYMAP_VOLUME_DOWN;
     if (ieq(name, "DisplayPerf")) return HOST_KEYMAP_DISPLAY_PERF;
     if (ieq(name, "Rewind")) return HOST_KEYMAP_REWIND;
-    if (ieq(name, "SaveStateMenu")) return HOST_KEYMAP_SAVE_STATE_MENU;
     if (ieq(name, "Scanlines")) return HOST_KEYMAP_SCANLINES;
     if (ieq(name, "TurboToggle")) return HOST_KEYMAP_TURBO_TOGGLE;
     return HOST_KEYMAP_ACTION_COUNT;
@@ -319,10 +314,7 @@ const char *host_keymap_label(HostKeymapAction action, char *out, size_t cap) {
 #if defined(PSX_HAS_RBENGINE_SNAP)
         if (action == HOST_KEYMAP_REWIND)
             snprintf(out, cap, "F8");
-        else
 #endif
-        if (action == HOST_KEYMAP_SAVE_STATE_MENU)
-            snprintf(out, cap, "F7");
         return out;
     }
     b = &a->binds[0];
