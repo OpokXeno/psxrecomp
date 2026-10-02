@@ -362,7 +362,7 @@ typedef struct {
      * emitter change (Phase 2 of docs/ENHANCEMENTS.md G1 value propagation). */
     const PGXPHooks *pgxp;
     int32_t (*ws_screen_x_bound)(int32_t vanilla);
-    void (*mod_function_entry)(CPUState *cpu, uint32_t address);
+    int (*mod_function_entry)(CPUState *cpu, uint32_t address);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

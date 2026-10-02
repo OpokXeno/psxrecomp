@@ -1,3 +1,4 @@
+#include "cpu_state.h"
 #include "mod_runtime.h"
 
 #include "disc_path.h"
@@ -2159,12 +2160,16 @@ extern "C" int psx_mod_register_function_entry_plugin(
     return 1;
 }
 
-extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
+extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
     using namespace PSXRecompV4;
-    if (!cpu) return;
+    if (!cpu) return 0;
     for (const FunctionEntryPlugin& plugin : function_entry_plugins()) {
-        if (plugin.address == address) plugin.callback(cpu, address);
+        if (plugin.address == address && plugin.callback(cpu, address)) {
+            cpu->pc = cpu->gpr[31];
+            return 1;
+        }
     }
+    return 0;
 }
 
 extern "C" void mod_runtime_patch_disc_sector(uint32_t lba, int raw_sector,
