@@ -3139,8 +3139,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * on interp dispatch so the contract does not depend on which backend
      * executes the page. */
     {
-        extern void psx_mod_function_entry(CPUState *cpu, uint32_t address);
-        psx_mod_function_entry(cpu, addr);
+        extern int psx_mod_function_entry(CPUState *cpu, uint32_t address);
+        (void)psx_mod_function_entry(cpu, addr);
     }
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
@@ -3567,8 +3567,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 /* Local transfers bypass dispatch, but must retain the same
                  * function-entry hooks as a surfaced interpreter entry. */
                 {
-                    extern void psx_mod_function_entry(CPUState *, uint32_t);
-                    psx_mod_function_entry(cpu, target);
+                    extern int psx_mod_function_entry(CPUState *, uint32_t);
+                    (void)psx_mod_function_entry(cpu, target);
                 }
                 pc = target;
                 current_page = target_phys >> 12;

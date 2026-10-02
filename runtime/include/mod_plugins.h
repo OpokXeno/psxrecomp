@@ -17,8 +17,10 @@ typedef void (*PSXModRuntimeToggleCallback)(int enabled);
 int psx_mod_register_runtime_toggle_plugin(
     const char* id, PSXModRuntimeToggleCallback callback);
 struct CPUState;
-typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
-                                            uint32_t address);
+/* Return nonzero to skip the function body; the callback then owns the
+ * return value. Generated code only. */
+typedef int (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
+                                           uint32_t address);
 
 /*
  * Register a trusted, statically linked plugin implementation. Package
@@ -32,7 +34,7 @@ int psx_mod_register_vblank_plugin(const char* id,
 int psx_mod_register_function_entry_plugin(
     const char* id, uint32_t address, PSXModFunctionEntryCallback callback);
 /* Called only from generated functions explicitly listed by the game config. */
-void psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
+int psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
 
 /* Narrow guest services available to trusted plugin callbacks. */
 int psx_mod_game_started(void);
