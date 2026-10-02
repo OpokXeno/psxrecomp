@@ -364,6 +364,16 @@ void video_menu() {
     const char* vs_names[] = {"Off", "On", "Adaptive"};
     const int vs_values[] = {0, 1, -1};
     choice("VSync", psx_video_get_vsync(), vs_names, vs_values, 3, psx_video_set_vsync, MENU_VSYNC);
+    const char* fps_names[] = {"Original", "60 FPS", "75 FPS", "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
+    const int fps_values[] = {30, 60, 75, 120, 144, 165, 240};
+    if (ImGui::BeginMenu("Frame rate", gr_backend() == 1)) {
+        for (int i = 0; i < 7; ++i)
+            if (ImGui::MenuItem(fps_names[i], nullptr, gl_renderer_native_interpolation_target_fps() == fps_values[i])) {
+                psx_native_semantic_fps_set(fps_values[i]);
+                remember(MENU_FPS);
+            }
+        ImGui::EndMenu();
+    }
     ImGui::Separator();
     if (ImGui::BeginMenu("Rendering", gr_backend() == 1)) {
         int scale = psx_video_get_supersampling();
@@ -386,16 +396,6 @@ void video_menu() {
         choice("AA multiplier", psx_video_get_antialiasing_factor(), factor_names, factors,
                psx_video_get_antialiasing() == 3 ? 3 : 5, psx_video_set_antialiasing_factor, MENU_AA_FACTOR);
         if (psx_video_get_antialiasing() == 0) ImGui::EndDisabled();
-        const char* fps_names[] = {"30 FPS (Original)", "60 FPS", "75 FPS", "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
-        const int fps_values[] = {30, 60, 75, 120, 144, 165, 240};
-        if (ImGui::BeginMenu("Frame rate")) {
-            for (int i = 0; i < 7; ++i)
-                if (ImGui::MenuItem(fps_names[i], nullptr, gl_renderer_native_interpolation_target_fps() == fps_values[i])) {
-                    psx_native_semantic_fps_set(fps_values[i]);
-                    remember(MENU_FPS);
-                }
-            ImGui::EndMenu();
-        }
         ImGui::EndMenu();
     }
     const char* screen_names[] = {"Raw", "CRT", "Composite", "Trinitron"};

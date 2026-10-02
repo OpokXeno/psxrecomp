@@ -1412,6 +1412,10 @@ typedef struct GlNativeRecipe {
     uint32_t references;
     uint32_t count;
     uint32_t clear_color;
+    /* Nonzero: the recipe starts from the target's captured contents (base
+     * plane base_slot) instead of clear_color. */
+    uint64_t base_serial;
+    uint32_t base_slot;
     uint32_t texture_count;
     uint32_t motion_count;
     uint32_t motion_capacity;
@@ -1567,6 +1571,9 @@ typedef struct GlNativeViewTarget {
     uint32_t wave_count;
     int wave_invalid;
     GlNativeRecipe *recipe;
+    /* Covered the scanout since its recipe began: the next declaration of a
+     * snapshot-based target starts a new frame. */
+    int displayed;
 } GlNativeViewTarget;
 typedef struct GlNativeViewState {
     uint32_t domain_count;
@@ -1648,7 +1655,10 @@ typedef struct GlNativeGpuPlane {
     uint32_t dirty_epochs[64][2];
 } GlNativeGpuPlane;
 typedef enum GlNativeGpuOp { NATIVE_GPU_SEED, NATIVE_GPU_DRAW, NATIVE_GPU_WORDS, NATIVE_GPU_SNAPSHOT, NATIVE_GPU_SPAN,
-    NATIVE_GPU_WORDS_RESET } GlNativeGpuOp;
+    NATIVE_GPU_WORDS_RESET, NATIVE_GPU_BASE } GlNativeGpuOp;
+/* SPAN sources at or above this index sample a persistent recipe base plane
+ * (one per VIEW target) instead of a same-work snapshot. */
+#define GL_NATIVE_GPU_BASE_SOURCE GL_NATIVE_GPU_PLANES
 typedef struct GlNativeGpuCommand {
     GlNativeGpuOp kind;
     uint32_t plane, source, data, color, mask;
@@ -1835,6 +1845,10 @@ static GlNativeMotionProbe s_native_motion_probe;
 enum { NATIVE_GPU_QUEUED = 1, NATIVE_GPU_SUBMITTED, NATIVE_GPU_READY, NATIVE_GPU_PUBLISHED, NATIVE_GPU_CANCELLED, NATIVE_GPU_DISPATCHING, NATIVE_GPU_WAIT_INPUT };
 static GlNativeGpuWork *s_native_gpu_work;
 static GlNativeGpuPlane s_native_gpu_planes[GL_NATIVE_GPU_PHASE_BASE];
+/* Owner-only. A target's contents when its snapshot-based recipe began; phase
+ * replays of that recipe start from it. Survives works: a double-buffered
+ * frame is declared in one source and displayed in the next. */
+static GlNativeGpuPlane s_native_gpu_recipe_bases[GL_NATIVE_VIEW_TARGET_CAPACITY];
 /* Owner-only retired storage. Contents are never used as input to a new work. */
 static GlNativeGpuPlane s_native_gpu_spare_planes[GL_NATIVE_GPU_PLANES];
 static uint8_t *s_native_gpu_readback_spare[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
@@ -10984,6 +10998,35 @@ static void native_recipe_begin(GlNativeViewState *views, GlNativeViewTarget *ta
     target->recipe = recipe;
 }
 
+/* Frames that never clear (battle: full 3D overdraw, no FILL) still replay
+ * exactly when every phase starts from what the endpoint itself drew over:
+ * the VIEW plane at this declaration, captured in FIFO order on the GPU. */
+static uint64_t s_native_recipe_base_serial;
+static void native_recipe_begin_snapshot(GlNativeViewState *views, uint32_t index) {
+    GlNativeViewTarget *target = &views->targets[index];
+    const uint32_t domain = native_view_domain(views, target);
+    if (!views->gpu || index >= GL_NATIVE_VIEW_TARGET_CAPACITY || domain == UINT32_MAX ||
+        !native_view_eligible(views, target)) return;
+    s_native_recipe_texture_read = (GlNativeRecipeDropEvent){.texture_reason = "snapshot_begin"};
+    native_recipe_begin(views, target, 0u);
+    GlNativeRecipe *recipe = target->recipe;
+    if (!recipe) return;
+    GlNativeGpuCommand *capture = native_gpu_command(views->gpu, NATIVE_GPU_BASE);
+    if (!capture) { native_recipe_drop(target); return; }
+    capture->plane = domain + 1u;
+    capture->source = index;
+    if (++s_native_recipe_base_serial == 0u) ++s_native_recipe_base_serial;
+    recipe->base_serial = s_native_recipe_base_serial;
+    recipe->base_slot = index;
+    target->displayed = 0;
+    /* COPY aliases of the previous capture in this slot lost their base. */
+    for (uint32_t i = 0u; i < views->count; ++i) {
+        GlNativeViewTarget *alias = &views->targets[i];
+        if (alias->recipe && alias->recipe != recipe && alias->recipe->base_serial &&
+            alias->recipe->base_slot == index) native_recipe_drop(alias);
+    }
+}
+
 static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op,
                                 GlNativeRecipe *const *before, uint32_t before_count) {
     const int copy = op->kind == XG_RENDER_NATIVE_OPERATION_COPY;
@@ -12674,6 +12717,8 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
     if (!width || !audit || crop_y > recipe->height ||
         height > recipe->height - crop_y) goto finished;
     if (!gpu) {
+        /* A captured base exists only on the GPU (the optional CPU audit). */
+        if (recipe->base_serial) goto finished;
         pixels = malloc((size_t)width * recipe->height * sizeof(*pixels));
         if (!pixels) goto finished;
         for (size_t i = 0u; i < (size_t)width * recipe->height; ++i) pixels[i] = recipe->clear_color;
@@ -12687,7 +12732,14 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         const uint16_t raster_width = use_view ? (uint16_t)width : VRAM_W;
         gpu->widths[GL_NATIVE_GPU_PHASE_BASE+phase] = raster_width;
         gpu->heights[GL_NATIVE_GPU_PHASE_BASE+phase] = VRAM_H;
-        if (!native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, raster_width, VRAM_H,
+        if (recipe->base_serial) {
+            /* Same raster domain as the captured VIEW plane: copy it whole,
+             * with its depth keys, exactly like a full-row VIEW copy. */
+            if (!use_view || recipe->base_slot >= GL_NATIVE_VIEW_TARGET_CAPACITY ||
+                !native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, raster_width, VRAM_H,
+                    GL_NATIVE_GPU_BASE_SOURCE + recipe->base_slot, 0, 0, raster_width, VRAM_H,
+                    0u, recipe->depth_test ? 4u : 0u)) goto finished;
+        } else if (!native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, raster_width, VRAM_H,
             UINT32_MAX, 0,0,0,0,recipe->clear_color,0)) goto finished;
     }
     texture.view_valid = 1;
@@ -13810,7 +13862,7 @@ static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRec
     if (!a || !b || a->count != b->count || a->motion_count != b->motion_count || a->coverage_count != b->coverage_count ||
         a->dithering_disabled != b->dithering_disabled ||
         a->depth_test != b->depth_test ||
-        a->clear_color != b->clear_color ||
+        a->clear_color != b->clear_color || a->base_serial != b->base_serial ||
         a->width != b->width || a->height != b->height || a->view_width != b->view_width ||
         a->view_height != b->view_height || a->offset != b->offset ||
         (a->motion_count && memcmp(a->motions, b->motions, a->motion_count * sizeof(a->motions[0])))) return 0;
@@ -13863,6 +13915,11 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
     prepared->history = (GlNativeMotionHistory){.identity = header->identity, .scene = header->scene, .display = header->display,
         .pixel_digest = audit->endpoint_pixel_digest, .reference_digest = audit->endpoint_pixel_digest,
         .storage_width = audit->endpoint_storage_width, .valid = 1};
+    {
+        const int shown = native_view_cover(views, views->count, header->display.display_x,
+            header->display.display_y, header->display.width, header->display.height);
+        if (shown >= 0) views->targets[shown].displayed = 1;
+    }
     if (!temporal_hz) {
         /* OFF still executes every source operation and the Native geometry.
          * It needs neither recipe replay nor pose evaluations/phase buffers. */
@@ -14381,6 +14438,16 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             if (index < 0 || (!views->targets[index].pixels &&
                              !native_view_private(views, (uint32_t)index, canvas.pixels)))
                 goto allocation_failed;
+            {
+                /* No recipe yet, or a snapshot frame that already reached the
+                 * scanout or that the game left for another target: this
+                 * declaration starts a new frame. A FILL clear still replaces
+                 * it with a clear-based recipe. */
+                const GlNativeViewTarget *declared = &views->targets[index];
+                if (!declared->recipe || (declared->recipe->base_serial &&
+                        (declared->displayed || views->active != index)))
+                    native_recipe_begin_snapshot(views, (uint32_t)index);
+            }
             views->active = index;
             views->targets[index].declaration = ++views->declaration_sequence;
             continue;
@@ -16084,11 +16151,14 @@ static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
         } else {
             float u0=0.f,v0=0.f,u1=1.f,v1=1.f;
             if (command->kind != NATIVE_GPU_SEED && command->source != UINT32_MAX) {
-                const GlNativeGpuPlane *source = &work->planes[command->source];
+                /* A recipe base has its destination phase raster's size. */
+                const uint32_t source_plane = command->source >= GL_NATIVE_GPU_BASE_SOURCE
+                    ? command->plane : command->source;
+                const GlNativeGpuPlane *source = &work->planes[source_plane];
                 /* Deferred CPU journals have captured dimensions but no GL
                  * objects yet. They produce the same scaled UV denominator. */
-                const uint32_t width = source->width ? source->width : work->widths[command->source]*work->scale;
-                const uint32_t height = source->height ? source->height : work->heights[command->source]*work->scale;
+                const uint32_t width = source->width ? source->width : work->widths[source_plane]*work->scale;
+                const uint32_t height = source->height ? source->height : work->heights[source_plane]*work->scale;
                 if (!width || !height) { free(vertices); return 0; }
                 u0=(float)(command->sx*work->scale)/width;
                 v0=(float)(command->sy*work->scale)/height;
@@ -16420,21 +16490,31 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
         texture=s_native_gpu_input;
-    } else if(command->source!=UINT32_MAX) {
-        const GlNativeGpuPlane *source=&snapshots[command->source];
-        if(!source->texture)return 0;
-        texture=source->texture;
+    }
+    const GlNativeGpuPlane *source_plane = NULL;
+    if(command->kind!=NATIVE_GPU_SEED&&command->source!=UINT32_MAX) {
+        if(command->source>=GL_NATIVE_GPU_BASE_SOURCE) {
+            const uint32_t slot=command->source-GL_NATIVE_GPU_BASE_SOURCE;
+            if(slot>=GL_NATIVE_VIEW_TARGET_CAPACITY)return 0;
+            /* A target without GL storage yet had nothing drawn: its base is
+             * the cleared plane (this span's zero color). */
+            source_plane=s_native_gpu_recipe_bases[slot].texture?&s_native_gpu_recipe_bases[slot]:NULL;
+        } else {
+            source_plane=&snapshots[command->source];
+            if(!source_plane->texture)return 0;
+        }
+        if(source_plane)texture=source_plane->texture;
     }
     native_gpu_depth_query(work, 0);
     /* Transfers write far depth, except full-row VIEW copies (mask bit 2),
      * which carry their source rows' keys, exactly like the CPU domain copy. */
     const int copy_depth = (command->mask & 4u) && texture && command->kind == NATIVE_GPU_SPAN &&
-        command->source != UINT32_MAX && snapshots[command->source].depth;
+        source_plane && source_plane->depth;
     const GlNativeDepthMode transfer_depth = {0, copy_depth ? 3 : GL_NATIVE_DEPTH_RESET, 0, 0,
         GL_NATIVE_DEPTH_SHOW_NONE, {0}};
     const unsigned depth = native_gpu_depth_uniforms(work, plane, &transfer_depth, command->plane != 0u);
     if (copy_depth) {
-        p_glActiveTexture(PSXGL_TEXTURE0+4); glBindTexture(GL_TEXTURE_2D, snapshots[command->source].depth);
+        p_glActiveTexture(PSXGL_TEXTURE0+4); glBindTexture(GL_TEXTURE_2D, source_plane->depth);
     }
     if(!native_gpu_target(work,plane,scale,command->x,command->y,command->w,command->h,(command->mask&2u)!=0,bound_target,depth,NULL))return 0;
     if(texture){p_glActiveTexture(PSXGL_TEXTURE0+2);glBindTexture(GL_TEXTURE_2D,texture);}
@@ -16744,6 +16824,22 @@ static int native_gpu_service(void) {
                     glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
                     native_gpu_mips_dirty_rect(left,top,right,bottom);
                 }
+            } else if(command->kind==NATIVE_GPU_BASE) {
+                /* Capture the target's VIEW plane, in FIFO order, as the base
+                 * of the snapshot recipe that begins at this declaration. */
+                native_gpu_image_barrier();
+                native_gpu_depth_query(work,0);
+                p_glActiveTexture(PSXGL_TEXTURE0+2);
+                GlNativeGpuPlane *source=command->plane<GL_NATIVE_GPU_PHASE_BASE?&work->planes[command->plane]:NULL;
+                if(source&&source->texture&&command->source<GL_NATIVE_VIEW_TARGET_CAPACITY) {
+                    GlNativeGpuPlane *base=&s_native_gpu_recipe_bases[command->source];
+                    ok=native_gpu_plane_size(base,source->width,source->height);
+                    if(ok)native_gpu_blit(source,base,0,0,source->width,source->height);
+                    if(ok&&source->depth) {
+                        ok=native_gpu_plane_depth(base);
+                        if(ok)native_gpu_blit_depth(source,base,0,0,source->width,source->height);
+                    }
+                }
             } else if(command->kind==NATIVE_GPU_SNAPSHOT) {
                 native_gpu_image_barrier();
                 work->snapshot_commands++;
@@ -17019,6 +17115,7 @@ static int native_gpu_thread_main(void *unused) {
      * textures cross contexts; these FBOs/VAO/queries never leave this thread. */
     native_gpu_free(s_native_gpu_work);s_native_gpu_work=NULL;
     for(unsigned i=0;i<GL_NATIVE_GPU_PHASE_BASE;++i)native_gpu_plane_free(&s_native_gpu_planes[i]);
+    for(unsigned i=0;i<GL_NATIVE_VIEW_TARGET_CAPACITY;++i)native_gpu_plane_free(&s_native_gpu_recipe_bases[i]);
     for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_planes[i]);
     native_gpu_plane_free(&s_native_gpu_destination);
     if(s_native_gpu_program)p_glDeleteProgram(s_native_gpu_program);

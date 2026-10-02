@@ -1361,7 +1361,7 @@ static void draw_toggles_section(void)
     }
 
     static const char *kNativeInterpolationTargets[] = {
-        "30 FPS (Original)", "60 FPS", "75 FPS", "120 FPS", "144 FPS",
+        "Original", "60 FPS", "75 FPS", "120 FPS", "144 FPS",
         "165 FPS", "240 FPS"
     };
     /* True target (denominator getter lies for 75/144/165). Unknown maps
