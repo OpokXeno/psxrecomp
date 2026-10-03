@@ -253,8 +253,10 @@ void controls_menu() {
     if (!ImGui::BeginMenu("Controls")) return;
     const bool editable = psx_input_runtime_bindings_available() != 0;
     ImGui::TextDisabled("Bindings apply immediately and are saved");
-    if (ImGui::BeginMenu("Player 1", editable)) {
-        const int player = 1;
+    for (int player = 1; player <= psx_input_binding_player_count(); ++player) {
+        char title[16];
+        std::snprintf(title, sizeof(title), "Player %d", player);
+        if (!ImGui::BeginMenu(title, editable)) continue;
         binding_menu(player, BindingDevice::Keyboard, "Keyboard", true);
         binding_menu(player, BindingDevice::Alternate, "Alternate keyboard / mouse", true);
         char gamepad[128];

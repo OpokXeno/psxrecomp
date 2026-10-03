@@ -7684,6 +7684,12 @@ static bool gpu_native_work_decode(
     if (gpu_native_work_draw_hook == NULL) return false;
     if (native_packet_semantic_from_gp0(words, word_count, environment, out) != 1)
         return false;
+    /* The decoder classifies without provenance. Packet families identified
+     * by address, such as the animated Field dialogue body, need the source. */
+    const uint8_t opcode = (uint8_t)(words[0] >> 24u);
+    if (opcode < 0x40u || opcode > 0x5fu)
+        out->screen_space_2d =
+            native_semantic_screen_space_mode(opcode, out, source);
     out->material.draw_area_left = environment->draw.left;
     out->material.draw_area_top = environment->draw.top;
     out->material.draw_area_right = environment->draw.right;
