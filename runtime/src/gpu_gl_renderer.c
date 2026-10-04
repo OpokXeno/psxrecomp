@@ -13739,14 +13739,14 @@ static int native_phase_place(const GlNativePhasePlacement *placement, const dou
  * triangles at out; near flags the corners behind the plane. */
 static uint32_t native_phase_clip_triangle(const XgRenderIrTriangle *moved,
                                            const XgRenderMotionPhaseView *const views[3],
-                                           unsigned near, const GlNativePhasePlacement *placement,
+                                           unsigned near_mask, const GlNativePhasePlacement *placement,
                                            XgRenderIrTriangle out[2]) {
     const double near_z = native_phase_near_plane(placement->view);
     XgRenderIrVertex polygon[4];
     unsigned count = 0u;
     for (unsigned k = 0u; k < 3u; ++k) {
         const unsigned next = (k + 1u) % 3u;
-        const int a_front = !(near & (1u << k)), b_front = !(near & (1u << next));
+        const int a_front = !(near_mask & (1u << k)), b_front = !(near_mask & (1u << next));
         if (a_front) polygon[count++] = moved->vertices[k];
         if (a_front == b_front) continue;
         const double *a = views[k]->view, *b = views[next]->view;
@@ -13813,7 +13813,7 @@ static int native_mesh_phase_triangles(const GlNativeRecipe *recipe, const GlNat
         double screen[2][3][3], native[2][3][3];
         const double *vertex_screen[2][3], *vertex_native[2][3];
         const XgRenderMotionPhaseView *views[3];
-        unsigned near = 0u, placed = 0u;
+        unsigned near_mask = 0u, placed = 0u;
         XgRenderMotionProjectResult result = XG_RENDER_MOTION_ENDPOINT;
         if (corner_vertices) {
             /* One triangle; its corners share one pose. */
@@ -13828,20 +13828,20 @@ static int native_mesh_phase_triangles(const GlNativeRecipe *recipe, const GlNat
                 result = XG_RENDER_MOTION_PROJECTED;
                 vertex_screen[0][v] = phase->screen; vertex_native[0][v] = phase->native;
                 views[v] = &phase->view;
-                if (phase->view.view[2] < native_phase_near_plane(&phase->view)) near |= 1u << v;
+                if (phase->view.view[2] < native_phase_near_plane(&phase->view)) near_mask |= 1u << v;
             }
             if (result == XG_RENDER_MOTION_PROJECTED) {
                 *moved_any = 1;
-                /* Every corner behind this phase's near plane: nothing to draw. */
-                if (near == 7u) continue;
+                /* Every corner behind this phase's near_mask plane: nothing to draw. */
+                if (near_mask == 7u) continue;
                 /* A corner without an endpoint Native position (its
                  * projection overflowed behind the camera) is placed from
                  * this phase's view, like a clip point. */
                 for (uint32_t v = 0u; v < 3u; ++v)
-                    if (!(near & (1u << v)) && !strip_native &&
+                    if (!(near_mask & (1u << v)) && !strip_native &&
                         !triangles[first].triangle.vertices[v].native_view_position) placed |= 1u << v;
-                for (uint32_t v = 0u; v < 3u && (near | placed); ++v) if (!views[v]) near = placed = 0u;
-            } else near = 0u;
+                for (uint32_t v = 0u; v < 3u && (near_mask | placed); ++v) if (!views[v]) near_mask = placed = 0u;
+            } else near_mask = 0u;
         } else {
             /* Two triangles at a time under one pose: each triangle's own (a
              * run may cross objects) or the record's. The pose is enabled for
@@ -13895,27 +13895,27 @@ static int native_mesh_phase_triangles(const GlNativeRecipe *recipe, const GlNat
                     vertex->projective_offset_y = (int32_t)((int64_t)vertex->projective_offset_y + dy);
                 }
                 if (strip_native) vertex->native_view_position = false;
-                /* A corner behind the near plane is replaced by the clip,
+                /* A corner behind the near_mask plane is replaced by the clip,
                  * a corner without an endpoint position placed below. */
                 if (valid && result == XG_RENDER_MOTION_PROJECTED && vertex_screen[k][v] &&
-                    !((near | placed) & (1u << v)))
+                    !((near_mask | placed) & (1u << v)))
                     valid = native_mesh_vertex_move(vertex, vertex_screen[k][v], vertex_native[k][v]);
             }
             if (!valid) continue;
-            if (near | placed) {
+            if (near_mask | placed) {
                 /* The placement's reference: a corner moved the ordinary way. */
                 unsigned reference = 0u;
-                while (reference < 3u && ((near | placed) & (1u << reference))) ++reference;
+                while (reference < 3u && ((near_mask | placed) & (1u << reference))) ++reference;
                 if (reference == 3u) continue;
                 GlNativePhasePlacement placement;
                 native_phase_placement(&placement, &tri->vertices[reference], views[reference]);
                 for (uint32_t v = 0u; v < 3u && valid; ++v)
                     if (placed & (1u << v)) valid = native_phase_place(&placement, views[v]->view, &tri->vertices[v]);
                 if (!valid) continue;
-                if (near) {
+                if (near_mask) {
                     const GlNativeTextureState texture = mesh->textures ? mesh->textures[first + k] : template_texture;
                     XgRenderIrTriangle clipped[2];
-                    const uint32_t pieces = native_phase_clip_triangle(tri, views, near, &placement, clipped);
+                    const uint32_t pieces = native_phase_clip_triangle(tri, views, near_mask, &placement, clipped);
                     for (uint32_t c = 0u; c < pieces; ++c) {
                         moved[kept].triangle = clipped[c];
                         moved[kept++].texture = texture;
