@@ -126,7 +126,7 @@ int capture_pad_slot(const HostInputSnapshot& snapshot, int slot, PlayerRoute* p
         analog = player->hybrid_analog ? 1 : 0;
     }
 
-    const bool suppress_sticks = analog != 0;
+    const bool suppress_sticks = analog != 0 && !options.stick_drives_dpad;
     uint16_t buttons = 0xFFFFu;
     if (player->kind == 1) {
         if (!options.keyboard_swallowed)

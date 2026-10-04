@@ -580,6 +580,12 @@ struct RuntimeConfig {
     // segment but keeps the device dropdown). Default false.
     bool                  controller_lock_device = false;
 
+    // stick_drives_dpad: the left stick also presses the D-pad (input.ini ls_*
+    // fold onto Up/Down/Left/Right) while the pad presents as ANALOG, not only
+    // in digital mode. For digital-only games played on an analog pad: the
+    // stick moves like the D-pad, the D-pad keeps working. Default false.
+    bool                  controller_stick_drives_dpad = false;
+
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre
     // dead-band. Absent => runtime default (12000). Overridden per-install by

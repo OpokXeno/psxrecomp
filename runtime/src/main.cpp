@@ -6052,10 +6052,15 @@ static bool source_is_stick_axis(const ControllerSource& s) {
  * left/right analog-stick axes do NOT contribute button bits — see
  * source_is_stick_axis above. Digital mode passes false, so ls_* stick
  * directions still fold onto the D-pad via fold_bit. */
+/* game.toml [controller] stick_drives_dpad: the stick keeps pressing the
+ * D-pad even while the pad presents as analog. */
+static bool g_stick_drives_dpad = false;
+
 static uint16_t controller_pad_buttons(const ControllerMap& map,
                                        SDL_GameController* h,
                                        bool suppress_stick_axes,
                                        int deadzone_raw) {
+    if (g_stick_drives_dpad) suppress_stick_axes = false;
     uint16_t buttons = 0xFFFF;  /* all released */
     if (!h) return buttons;
     for (const auto& entry : map) {
@@ -6700,7 +6705,8 @@ static int capture_pad_slot(const host_input::HostInputSnapshot& snapshot, int s
     }
     const host_input::MappingOptions options{
         replay_map, player.deadzone, (psx_runtime_menu_capture_input() || psx_free_camera_capture_input() || psx_debug_overlay_swallow_keyboard()),
-        dev_any_input_enabled() && s == (g_controller_ports_swapped ? 1 : 0)};
+        dev_any_input_enabled() && s == (g_controller_ports_swapped ? 1 : 0),
+        g_stick_drives_dpad};
     const int captured = host_input::capture_pad_slot(snapshot, s, &route, options, out);
     if (captured && has_policy) {
         const uint8_t sticks[] = {out->lx, out->ly, out->rx, out->ry};
@@ -15140,6 +15146,7 @@ int main(int argc, char** argv) {
                 ctrl_locked_mode[i] = player_mode[i];
             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
             ctrl_lock_device  = gc.runtime.controller_lock_device;
+            g_stick_drives_dpad = gc.runtime.controller_stick_drives_dpad;
             if (gc.runtime.has_deadzone) {
                 resolved_deadzone = gc.runtime.deadzone;
                 for (int i = 0; i < PSX_MAX_PLAYERS; ++i)

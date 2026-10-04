@@ -42,6 +42,7 @@ struct MappingOptions {
     int controller_deadzone = 0;
     bool keyboard_swallowed = false;
     bool dev_p1 = false;
+    bool stick_drives_dpad = false;   // ls_* fold onto the D-pad in analog mode too
 };
 
 int capture_pad_slot(const HostInputSnapshot& snapshot, int slot,
