@@ -134,6 +134,15 @@ void     gpu_set_native_work_draw_hook(
              bool (*hook)(const GpuRenderSemantic *semantic));
 /* True while the Native work collector is installed (packets bypass preflight). */
 bool     gpu_native_work_active(void);
+/* True when a VRAM move came from the Field wave's own transfer packets
+ * (FUN_800a4dac): Native applies that whole effect itself. */
+bool     gpu_native_field_wave_transfer(uint32_t command_source_address);
+/* Field wave column boundaries x(first .. first + count - 1) by the game's own
+ * displacement, 16c + Ax * rsin(phase + c * fx) >> 12, once its current
+ * parameters reproduce the observed interior boundaries x(1..19) of one mesh
+ * row (observed[c]). False when none do. Reads guest RAM only. */
+bool     gpu_native_field_wave_columns(const int16_t observed[21], int first,
+                                       uint32_t count, int16_t *out);
 /* Accepted E3 command identity; only source metadata may declare a view target. */
 void     gpu_set_native_work_environment_hook(bool (*hook)(uint64_t command_id));
 void     gpu_set_source_boundary_hook(void (*hook)(void));

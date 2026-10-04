@@ -150,6 +150,8 @@ static int native_motion_departures(const GlNativeRecipe *previous, const GlNati
             (recipe->count - successor) * sizeof(*recipe->draws));
         recipe->draws[successor] = draw;
         recipe->count++;
+        /* A departure keeps its place before the next surviving draw. */
+        if (recipe->wave && successor <= recipe->wave_at) recipe->wave_at++;
         for (uint32_t j = 0u; j < count; ++j)
             if (keys[j].index >= successor) keys[j].index++;
     }

@@ -94,7 +94,6 @@ enum {
  * an incomplete restore is never allowed.
  */
 enum {
-    BS_SEC_MODMEM = 0x13,  /* allocated opt-in CPU/GPU enhancement arenas */
     BS_SEC_CPU    = 0x01,  /* CPUState: gpr/pc/hi/lo/cop0/gte_data/gte_ctrl       */
     BS_SEC_RAM    = 0x02,  /* active 2 MiB or 8 MiB main RAM                       */
     BS_SEC_SPAD   = 0x03,  /* 1 KB scratchpad                                     */
@@ -129,6 +128,9 @@ enum {
                                  (texture-pack tracker). Written when its hooks
                                  are installed; applied after VRAM; absent in
                                  states saved without it.                     */
+    BS_SEC_MODMEM = 0x15,  /* allocated opt-in CPU/GPU enhancement arenas. States
+                              written while it shared 0x13 with GTE_PRECISION
+                              carry it as the second 0x13 (after SPAD).      */
 };
 
 /* Host payload for BS_SEC_HD_TEXTURE, NULL by default. write fills exactly

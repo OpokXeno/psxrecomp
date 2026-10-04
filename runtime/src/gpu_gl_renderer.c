@@ -1475,6 +1475,71 @@ typedef struct GlNativeCoverageState {
     uint32_t capacity;
     GlNativeCoverageScope *scopes;
 } GlNativeCoverageState;
+/* Field wave (FUN_800a4dac). The guest saves the bottom 48 rows at x=960,
+ * redraws its frame 32 rows lower through rows 0..13 of a 20x17 mesh of 16x16
+ * tiles, lifts the result 32 rows, and redraws the bottom from the saved rows
+ * through rows 14..16. The displacement is separable: every row shares the
+ * column boundaries x(c) = 16c + Ax*rsin(phase + c*fx) >> 12, every column
+ * the row boundaries. Native keeps those transfers and tiles out of VIEW and
+ * replays the same mesh as spans of the rendered VIEW plane, continuing the
+ * game's column formula through the widescreen margins. */
+#define NATIVE_WAVE_COLUMNS 20
+#define NATIVE_WAVE_ROWS 17
+#define NATIVE_WAVE_TILES (NATIVE_WAVE_COLUMNS * NATIVE_WAVE_ROWS)
+#define NATIVE_WAVE_TRANSFERS 15
+#define NATIVE_WAVE_MAX_BOUNDARIES 96
+/* The guest links rows 13..0 then 16..14, each from column 19 down to 0: row
+ * 14 column 0 is the last tile of a frame's mesh. */
+#define NATIVE_WAVE_LAST_TILE (14u * NATIVE_WAVE_COLUMNS)
+typedef struct GlNativeWaveTile {
+    int16_t left, right, top, bottom; /* target-local x, VRAM rows */
+    int16_t texture_x, texture_y;     /* VRAM texel of its top-left corner */
+    int16_t clip_top, clip_bottom;    /* drawing area rows */
+    uint8_t after_lift;
+} GlNativeWaveTile;
+typedef struct GlNativeWaveTransfer {
+    uint16_t src_x, src_y, dst_x, dst_y, width, height;
+} GlNativeWaveTransfer;
+/* One target's wave transfers and tiles of the frame being drawn. */
+typedef struct GlNativeWaveCapture {
+    GlNativeWaveTile tiles[NATIVE_WAVE_TILES];
+    uint8_t seen[NATIVE_WAVE_TILES];
+    uint32_t count, transfer_count;
+    GlNativeWaveTransfer transfers[NATIVE_WAVE_TRANSFERS];
+    GlNativeWaveTransfer lift; /* valid when lifted */
+    int lifted, invalid;
+} GlNativeWaveCapture;
+typedef struct GlNativeWaveRow {
+    int16_t top, bottom, source_y, clip_top, clip_bottom; /* target-local rows */
+    uint8_t after_lift; /* drawn after the lift rather than lifted by it */
+    uint8_t present;    /* draws inside its drawing area */
+} GlNativeWaveRow;
+typedef struct GlNativeWaveGeometry {
+    int16_t first_column; /* column of x[0]; negative inside the left margin */
+    uint16_t boundary_count, row_count; /* rows[] is indexed by guest mesh row */
+    int16_t x[NATIVE_WAVE_MAX_BOUNDARIES]; /* target-local boundary x */
+    GlNativeWaveRow rows[NATIVE_WAVE_ROWS];
+} GlNativeWaveGeometry;
+/* Immutable once built; shared by the recipes that replay it. */
+typedef struct GlNativeWaveWarp {
+    uint32_t references;
+    uint16_t view_width, offset; /* VIEW plane x = target-local x + offset */
+    uint16_t origin_y;           /* VRAM row of target-local row 0 */
+    GlNativeWaveTransfer lift;   /* applied to whole VIEW rows when lifted */
+    int lifted;
+    GlNativeWaveGeometry current, previous;
+    int has_previous;
+} GlNativeWaveWarp;
+static void native_wave_release(GlNativeWaveWarp *warp) {
+    if (warp && !--warp->references) free(warp);
+}
+static int native_wave_geometry_equal(const GlNativeWaveWarp *a, const GlNativeWaveWarp *b) {
+    if (a == b) return 1;
+    return a && b && a->lifted == b->lifted && !memcmp(&a->lift, &b->lift, sizeof(a->lift)) &&
+        a->view_width == b->view_width && a->offset == b->offset && a->origin_y == b->origin_y &&
+        !memcmp(&a->current, &b->current, sizeof(a->current));
+}
+
 typedef struct GlNativeRecipe {
     uint32_t references;
     uint32_t count;
@@ -1504,6 +1569,9 @@ typedef struct GlNativeRecipe {
     uint32_t feedback_cache_count, feedback_cache_next;
     uint32_t draw_capacity;
     GlNativeRecipeDraw *draws;
+    /* The Field wave runs before draw wave_at (after the last when equal). */
+    GlNativeWaveWarp *wave;
+    uint32_t wave_at;
 } GlNativeRecipe;
 typedef struct GlNativeMotionHistory {
     GlNativeRecipe *recipe;
@@ -1637,10 +1705,7 @@ typedef struct GlNativeViewTarget {
     int transition_snapshot; /* 1: certified capture; 2: pending CPU round trip. */
     uint64_t declaration;
     uint32_t *pixels;
-    NativeViewWaveTile wave_tiles[NATIVE_VIEW_WAVE_PACKET_COUNT];
-    uint8_t wave_seen[NATIVE_VIEW_WAVE_PACKET_COUNT];
-    uint32_t wave_count;
-    int wave_invalid;
+    GlNativeWaveCapture wave;
     GlNativeRecipe *recipe;
     /* Draws of its recent recipes: the next recipe's initial reserve, even
      * when the previous one was dropped before the new frame began. */
@@ -1670,6 +1735,9 @@ typedef struct GlNativeViewState {
     uint16_t readback_x, readback_y, readback_width, readback_height;
     int readback_capture;
     struct GlNativeGpuWork *gpu; /* Private compiler journal; never published. */
+    /* The last source frame's wave mesh: the start of the next interval. */
+    GlNativeWaveGeometry wave_previous;
+    uint64_t wave_previous_vblank;
     GlNativeViewTarget targets[GL_NATIVE_VIEW_TARGET_CAPACITY];
     GlNativeViewDomain domains[GL_NATIVE_VIEW_TARGET_CAPACITY];
 } GlNativeViewState;
@@ -1729,7 +1797,14 @@ typedef struct GlNativeGpuPlane {
     uint32_t dirty_epochs[64][2];
 } GlNativeGpuPlane;
 typedef enum GlNativeGpuOp { NATIVE_GPU_SEED, NATIVE_GPU_DRAW, NATIVE_GPU_WORDS, NATIVE_GPU_SNAPSHOT, NATIVE_GPU_SPAN,
-    NATIVE_GPU_WORDS_RESET, NATIVE_GPU_BASE } GlNativeGpuOp;
+    NATIVE_GPU_WORDS_RESET, NATIVE_GPU_BASE,
+    /* mesh_count SPAN rectangles (GlNativeGpuSpanRect at data) sharing one
+     * plane, source and mask, in one draw; x/y/w/h bound them all. */
+    NATIVE_GPU_SPANS } GlNativeGpuOp;
+typedef struct GlNativeGpuSpanRect {
+    float x, y, w, h; /* fractional edges rasterize by pixel centre */
+    float sx, sy, sw, sh;
+} GlNativeGpuSpanRect;
 /* SPAN sources at or above this index sample a persistent recipe base plane
  * (one per VIEW target) instead of a same-work snapshot. */
 #define GL_NATIVE_GPU_BASE_SOURCE GL_NATIVE_GPU_PLANES
@@ -1907,6 +1982,7 @@ typedef struct GlNativeGpuWork {
     uint16_t scanout_x, scanout_y, scanout_width, scanout_height, phase_crop_y, phase_crop_x;
     uint16_t scanout_canonical_width, scanout_offset;
     uint32_t phase_count;
+    double wave_phase; /* A phase journal's place in its interval, (0, 1]. */
     int state, failed, fresh, scanout, depth24, disabled;
     int depth_test; /* VIEW/phase planes carry a depth attachment (never plane 0). */
     GLsync fence;
@@ -1976,6 +2052,9 @@ static GlNativeGpuPlane s_native_gpu_planes[GL_NATIVE_GPU_PHASE_BASE];
 static GlNativeGpuPlane s_native_gpu_recipe_bases[GL_NATIVE_VIEW_TARGET_CAPACITY];
 /* Owner-only retired storage. Contents are never used as input to a new work. */
 static GlNativeGpuPlane s_native_gpu_spare_planes[GL_NATIVE_GPU_PLANES];
+/* Owner-only. Snapshot storage of the last dispatch, reused by the next: a
+ * phase snapshot per frame would otherwise allocate full planes every work. */
+static GlNativeGpuPlane s_native_gpu_spare_snapshots[GL_NATIVE_GPU_PLANES];
 static uint8_t *s_native_gpu_readback_spare[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
 static size_t s_native_gpu_readback_capacity[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
 static uint32_t s_native_gpu_scale;
@@ -10000,6 +10079,7 @@ static void native_recipe_release(GlNativeRecipe *recipe) {
         native_recipe_mesh_release(recipe->draws[i].mesh);
     }
     native_recipe_pixels_release(recipe->textures);
+    native_wave_release(recipe->wave);
     free(recipe->draws);
     free(recipe->motions);
     free(recipe->coverages);
@@ -10056,6 +10136,7 @@ static int native_recipe_private(GlNativeViewTarget *target) {
     copy->references = 1u;
     if (copy->publication) copy->publication->references++;
     if (copy->textures) copy->textures->references++;
+    if (copy->wave) copy->wave->references++;
     for (uint32_t i = 0u; i < copy->count; ++i) {
         if (copy->draws[i].textures) copy->draws[i].textures->references++;
         if (copy->draws[i].mesh) copy->draws[i].mesh->references++;
@@ -10801,6 +10882,31 @@ static int native_gpu_span(GlNativeGpuWork *work, uint32_t plane, int x, int y, 
     return 1;
 }
 
+/* One draw of many SPAN rectangles: same plane, source and mask, in order. */
+static int native_gpu_spans(GlNativeGpuWork *work, uint32_t plane, uint32_t source, uint32_t mask,
+                            const GlNativeGpuSpanRect *rects, uint32_t count) {
+    static const uint8_t pad[8];
+    uint32_t offset, ignored;
+    int left = INT_MAX, top = INT_MAX, right = INT_MIN, bottom = INT_MIN;
+    if (!work || !count) return 1;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const int x0 = (int)floorf(rects[i].x), y0 = (int)floorf(rects[i].y);
+        const int x1 = (int)ceilf(rects[i].x + rects[i].w), y1 = (int)ceilf(rects[i].y + rects[i].h);
+        if (x0 < left) left = x0;
+        if (y0 < top) top = y0;
+        if (x1 > right) right = x1;
+        if (y1 > bottom) bottom = y1;
+    }
+    if ((work->bytes & 7u) && !native_gpu_data(work, pad, 8u - (work->bytes & 7u), &ignored)) return 0;
+    if (!native_gpu_data(work, rects, (size_t)count * sizeof(*rects), &offset)) return 0;
+    GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_SPANS);
+    if (!command) return 0;
+    command->plane = plane; command->source = source; command->mask = mask;
+    command->data = offset; command->mesh_count = count;
+    command->x = left; command->y = top; command->w = right - left; command->h = bottom - top;
+    return 1;
+}
+
 static int native_gpu_raw_texture_dirty(const GlNativeGpuWork *work, const XgRenderIrMaterialState *m) {
     const unsigned blocks = 1u << m->texture_depth;
     uint32_t mask = ((1u << blocks) - 1u) << m->texture_page_x;
@@ -11541,7 +11647,9 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         .view_origin_y = target->y,
         .dither_x = target->x & 3u, .dither_y = target->y & 3u,
         .hd_texture = operation->hd_texture};
-    if (!mesh && native_recipe_coalesce(recipe, &record)) return;
+    /* Never fold a later draw into one the wave already displaced. */
+    if (!mesh && !(recipe->wave && recipe->wave_at == recipe->count) &&
+        native_recipe_coalesce(recipe, &record)) return;
     if (mesh) expanded->references++;
     recipe->draws[recipe->count++] = record;
     if (!mesh && native_recipe_coalescible(&recipe->draws[recipe->count - 1u]))
@@ -11624,11 +11732,19 @@ static void native_recipe_frame_draw(GlNativeViewState *views, const XgSemanticD
     }
 }
 
+/* Canonical words a transfer leaves rasterized (copied from rasterized words)
+ * or replaced by transferred data. */
+static void native_recipe_raster_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op) {
+    const int raster = op->kind == XG_RENDER_NATIVE_OPERATION_COPY &&
+        native_recipe_region(&views->raster_words, op->src_x, op->src_y, op->width, op->height);
+    if (raster) gpu_vram_region_mark_transfer(&views->raster_words, op->dst_x, op->dst_y, op->width, op->height);
+    else if (!op->mask_check)
+        gpu_vram_region_clear_transfer(&views->raster_words, op->dst_x, op->dst_y, op->width, op->height);
+}
+
 static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op,
                                 GlNativeRecipe *const *before, uint32_t before_count) {
     const int copy = op->kind == XG_RENDER_NATIVE_OPERATION_COPY;
-    const int raster = copy && native_recipe_region(&views->raster_words,
-        op->src_x, op->src_y, op->width, op->height);
     for (uint32_t i = 0u; i < views->count; ++i) {
         GlNativeViewTarget *t = &views->targets[i];
         const uint32_t dx = (t->x - op->dst_x) & (VRAM_W - 1);
@@ -11696,9 +11812,7 @@ static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativ
             target->x + target->width - 1, target->y + target->height - 1);
         recipe->feedback_cache_count = 0u;
     }
-    if (raster) gpu_vram_region_mark_transfer(&views->raster_words, op->dst_x, op->dst_y, op->width, op->height);
-    else if (!op->mask_check)
-        gpu_vram_region_clear_transfer(&views->raster_words, op->dst_x, op->dst_y, op->width, op->height);
+    native_recipe_raster_transfer(views, op);
 }
 
 static void native_recipe_draw_written(GlNativeViewState *views, const XgRenderNativeOperation *operation,
@@ -12082,245 +12196,365 @@ static int native_view_draw(GlNativeCpuCompiler *compiler, GlNativeViewState *vi
     return 1;
 }
 
-static int native_view_wave_capture(GlNativeViewTarget *target,
-                                const XgSemanticDrawRecord *draw) {
+static void native_wave_capture_reset(GlNativeWaveCapture *wave) {
+    memset(wave->seen, 0, sizeof(wave->seen));
+    wave->count = wave->transfer_count = 0u;
+    wave->lifted = wave->invalid = 0;
+}
+
+/* One 16x16 tile of the active target's mesh: an axis-aligned FT4 that
+ * stretches its texels over the displaced cell. */
+static int native_wave_capture_tile(GlNativeViewTarget *target, const XgSemanticDrawRecord *draw) {
     const XgRenderIrNativePrimitive *p = &draw->primitive;
     const XgRenderIrMaterialState *m = &p->material;
     const uint32_t index = draw->native_view_effect_index;
-    if (index >= NATIVE_VIEW_WAVE_PACKET_COUNT || p->triangle_count != 2u ||
-        !m->textured || m->raw_texture || m->semi_transparent ||
+    GlNativeWaveCapture *wave = &target->wave;
+    int64_t u0 = INT64_MAX, u1 = INT64_MIN, v0 = INT64_MAX, v1 = INT64_MIN;
+    if (index >= NATIVE_WAVE_TILES) return 0;
+    if (wave->seen[index]) {
+        /* The next frame's mesh without a new declaration. */
+        memset(wave->seen, 0, sizeof(wave->seen));
+        wave->count = 0u;
+        wave->invalid = 0;
+        wave->lifted = 0;
+    }
+    wave->seen[index] = 1u;
+    wave->count++;
+    if (p->triangle_count != 2u || !m->textured || m->raw_texture || m->semi_transparent ||
         m->texture_depth != XG_RENDER_IR_TEXTURE_15_BIT ||
-        m->shading != XG_RENDER_IR_SHADING_FLAT ||
-        m->texture_window_mask_x || m->texture_window_mask_y ||
-        target->width != NATIVE_VIEW_WAVE_COLUMNS * 16) return 0;
-    const XgRenderIrVertex *a = &p->triangles[0].vertices[0];
-    const XgRenderIrVertex *b = &p->triangles[0].vertices[1];
-    const XgRenderIrVertex *c = &p->triangles[0].vertices[2];
-    const XgRenderIrVertex *d = &p->triangles[1].vertices[2];
-    if ((int64_t)b->x - a->x < 8 * 65536 || (int64_t)b->x - a->x > 24 * 65536 ||
-        (int64_t)d->x - c->x != (int64_t)b->x - a->x ||
-        a->x != c->x || b->x != d->x || a->y != b->y || c->y != d->y ||
-        (int64_t)b->u - a->u != 16 * 65536 || (int64_t)d->u - c->u != 16 * 65536 ||
-        a->u != c->u || b->u != d->u || a->v != b->v || c->v != d->v ||
-        (int64_t)c->v - a->v != 16 * 65536) return 0;
-    for (uint32_t ti = 0u; ti < 2u; ++ti)
-        for (uint32_t vi = 0u; vi < 3u; ++vi) {
-            const XgRenderIrVertex *v = &p->triangles[ti].vertices[vi];
-            if (v->r != 128u || v->g != 128u || v->b != 128u ||
-                v->x % 65536 || v->y % 65536 || v->u % 65536 || v->v % 65536)
-                return 0;
+        m->texture_window_mask_x || m->texture_window_mask_y) return 0;
+    for (uint32_t t = 0u; t < 2u; ++t)
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const XgRenderIrVertex *v = &p->triangles[t].vertices[i];
+            if (v->native_view_position || v->projective_position ||
+                v->x % 65536 || v->y % 65536 || v->u % 65536 || v->v % 65536) return 0;
+            if (v->u < u0) u0 = v->u;
+            if (v->u > u1) u1 = v->u;
+            if (v->v < v0) v0 = v->v;
+            if (v->v > v1) v1 = v->v;
         }
-    if (target->wave_count == NATIVE_VIEW_WAVE_PACKET_COUNT || target->wave_seen[index]) {
-        memset(target->wave_seen, 0, sizeof(target->wave_seen));
-        target->wave_count = 0u;
-        target->wave_invalid = 0;
-    }
-    target->wave_tiles[index] = (NativeViewWaveTile){
-        .left = a->x / 65536 + m->draw_offset_x - target->x,
-        .right = b->x / 65536 + m->draw_offset_x - target->x,
-        .top = a->y / 65536 + m->draw_offset_y,
-        .bottom = c->y / 65536 + m->draw_offset_y,
-        .texture_x = m->texture_page_x * 64,
-        .texture_y = m->texture_page_y * 256,
-        .u = a->u / 65536, .v = a->v / 65536,
-        .draw_top = m->draw_area_top,
-        .framebuffer_height = m->draw_area_bottom - m->draw_area_top + 1,
+    if (u1 - u0 != 16 * 65536 || v1 - v0 != 16 * 65536) return 0;
+    /* Edges follow the texel corners they carry. The guest flips its unused
+     * fourteenth row upside down; rows are checked again when built. */
+    int64_t left = INT64_MIN, right = INT64_MIN, top = INT64_MIN, bottom = INT64_MIN;
+    for (uint32_t t = 0u; t < 2u; ++t)
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const XgRenderIrVertex *v = &p->triangles[t].vertices[i];
+            int64_t *x = v->u == u0 ? &left : &right, *y = v->v == v0 ? &top : &bottom;
+            if ((*x != INT64_MIN && *x != v->x) || (*y != INT64_MIN && *y != v->y)) return 0;
+            *x = v->x; *y = v->y;
+        }
+    if (left == INT64_MIN || right == INT64_MIN || top == INT64_MIN || bottom == INT64_MIN) return 0;
+    wave->tiles[index] = (GlNativeWaveTile){
+        .left = (int16_t)(left / 65536 + m->draw_offset_x - target->x),
+        .right = (int16_t)(right / 65536 + m->draw_offset_x - target->x),
+        .top = (int16_t)(top / 65536 + m->draw_offset_y),
+        .bottom = (int16_t)(bottom / 65536 + m->draw_offset_y),
+        .texture_x = (int16_t)(m->texture_page_x * 64 + u0 / 65536),
+        .texture_y = (int16_t)(m->texture_page_y * 256 + v0 / 65536),
+        .clip_top = (int16_t)m->draw_area_top, .clip_bottom = (int16_t)m->draw_area_bottom,
+        .after_lift = (uint8_t)(wave->lifted != 0),
     };
-    target->wave_seen[index] = 1u;
-    target->wave_count++;
     return 1;
 }
 
-static int native_view_wave_displacement(const int *boundaries, int x) {
-    const int width = NATIVE_VIEW_WAVE_COLUMNS * 16;
-    int wrapped = x % width;
-    if (wrapped < 0) wrapped += width;
-    const int column = wrapped / 16;
-    const int fraction = wrapped % 16;
-    const int first = boundaries[column] - column * 16;
-    const int second = boundaries[column + 1] - (column + 1) * 16;
-    return (first * (16 - fraction) + second * fraction + 8) / 16;
+/* The VIEW row a tile samples: the frame as drawn, before the guest's own
+ * transfers moved it (bottom rows saved aside, the rest lifted 32 rows). A
+ * tile drawn before the lift reads its own target directly. */
+static int native_wave_source_row(const GlNativeWaveCapture *wave, const GlNativeViewTarget *target,
+                                  int x, int y, int after_lift) {
+    for (uint32_t i = 0u; i < wave->transfer_count; ++i) {
+        const GlNativeWaveTransfer *t = &wave->transfers[i];
+        if (x >= t->dst_x && x < t->dst_x + t->width && y >= t->dst_y && y < t->dst_y + t->height)
+            return t->src_y + (y - t->dst_y);
+    }
+    if (x < target->x || x >= target->x + target->width ||
+        y < target->y || y >= target->y + target->height) return INT_MIN;
+    if (after_lift && y >= wave->lift.dst_y && y < wave->lift.dst_y + wave->lift.height)
+        return y - wave->lift.dst_y + wave->lift.src_y;
+    return y;
 }
 
-static int native_view_wave_snapshot(GlNativeViewState *views, int base_x, int width,
-                                  const uint32_t *canonical,
-                                  uint32_t *scratch, uint8_t *known_rows) {
-    memset(known_rows, 0, VRAM_H);
-    for (int y = 0; y < VRAM_H; ++y) {
-        const int index = native_view_cover(views, views->count, base_x, y, width, 1);
-        if (index < 0) continue;
-        const GlNativeViewTarget *input = &views->targets[index];
-        if (input->x != base_x || input->width != width) continue;
-        if (!input->pixels && !native_view_private(views, (uint32_t)index, canonical)) return 0;
-        if (!input->pixels) continue;
-        memcpy(scratch + (size_t)y * views->width,
-               input->pixels + (size_t)(y - input->y) * views->width,
-               (size_t)views->width * sizeof(*scratch));
-        known_rows[y] = 1u;
+static GlNativeWaveWarp *native_wave_build(GlNativeViewState *views, const GlNativeViewTarget *target,
+                                           uint64_t vblank) {
+    const GlNativeWaveCapture *wave = &target->wave;
+    GlNativeWaveGeometry geometry;
+    int16_t observed[NATIVE_WAVE_COLUMNS + 1];
+    int have_observed = 0;
+    if (wave->invalid || !wave->count) return NULL;
+    memset(&geometry, 0, sizeof(geometry));
+    for (uint32_t r = 0u; r < NATIVE_WAVE_ROWS; ++r) {
+        const GlNativeWaveTile *row = &wave->tiles[r * NATIVE_WAVE_COLUMNS];
+        const uint8_t *seen = &wave->seen[r * NATIVE_WAVE_COLUMNS];
+        int source_y = INT_MIN, present = 0;
+        for (uint32_t c = 0u; c < NATIVE_WAVE_COLUMNS; ++c) present += seen[c] != 0u;
+        /* A collapsed row can be culled before it reaches Native. */
+        if (!present) continue;
+        if (present != NATIVE_WAVE_COLUMNS) return NULL;
+        /* The guest collapses its unused fourteenth row below the drawing
+         * area (flat or upside down): it never draws anything. */
+        const GlNativeWaveTile *middle = &row[NATIVE_WAVE_COLUMNS / 2u];
+        if (middle->bottom <= middle->top || middle->top > middle->clip_bottom ||
+            middle->bottom <= middle->clip_top) continue;
+        /* Edges must agree where they can be seen: the guest leaves column 0
+         * of row 12 one row off below the drawing area. */
+        for (uint32_t c = 0u; c < NATIVE_WAVE_COLUMNS; ++c) {
+            const int clip_top = row[c].clip_top, clip_bottom = row[c].clip_bottom + 1;
+#define NATIVE_WAVE_CLIPPED(value) ((value) < clip_top ? clip_top : (value) > clip_bottom ? clip_bottom : (value))
+            if (NATIVE_WAVE_CLIPPED(row[c].top) != NATIVE_WAVE_CLIPPED(middle->top) ||
+                NATIVE_WAVE_CLIPPED(row[c].bottom) != NATIVE_WAVE_CLIPPED(middle->bottom) ||
+                row[c].clip_top != middle->clip_top || row[c].clip_bottom != middle->clip_bottom ||
+                row[c].after_lift != middle->after_lift ||
+                (c && row[c].left != row[c - 1u].right)) return NULL;
+#undef NATIVE_WAVE_CLIPPED
+        }
+        for (uint32_t c = 0u; c < NATIVE_WAVE_COLUMNS; ++c) {
+            const int y = native_wave_source_row(wave, target, row[c].texture_x, row[c].texture_y,
+                row[c].after_lift);
+            if (y == INT_MIN) continue; /* the guest's unsaved 15th block */
+            if (source_y != INT_MIN && y != source_y) return NULL;
+            source_y = y;
+        }
+        if (source_y == INT_MIN) return NULL;
+        if (!have_observed) {
+            for (uint32_t c = 0u; c < NATIVE_WAVE_COLUMNS; ++c) observed[c] = row[c].left;
+            observed[NATIVE_WAVE_COLUMNS] = row[NATIVE_WAVE_COLUMNS - 1u].right;
+            have_observed = 1;
+        }
+        /* Target-local, so the other double buffer's mesh is comparable. */
+        geometry.rows[r] = (GlNativeWaveRow){
+            .top = (int16_t)(middle->top - target->y), .bottom = (int16_t)(middle->bottom - target->y),
+            .source_y = (int16_t)(source_y - target->y),
+            .clip_top = (int16_t)(middle->clip_top - target->y),
+            .clip_bottom = (int16_t)(middle->clip_bottom - target->y),
+            .after_lift = middle->after_lift, .present = 1u};
+    }
+    if (!have_observed) return NULL;
+    geometry.row_count = NATIVE_WAVE_ROWS;
+    /* Columns cover the margins plus one beyond, so each displaced edge has a
+     * tile behind it. The game pins x(0)=0 and x(20)=320 only at its own
+     * screen edges; past them, its formula continues. */
+    const int margin = (views->offset + 15) / 16 + 1;
+    const uint32_t count = NATIVE_WAVE_COLUMNS + 1u + 2u * (uint32_t)margin;
+    if (count > NATIVE_WAVE_MAX_BOUNDARIES) return NULL;
+    geometry.first_column = (int16_t)-margin;
+    geometry.boundary_count = (uint16_t)count;
+    if (!gpu_native_field_wave_columns(observed, -margin, count, geometry.x)) {
+        /* No parameters reproduce this mesh: keep its columns exactly and
+         * leave the margins undisplaced. */
+        for (uint32_t i = 0u; i < count; ++i) {
+            const int c = -margin + (int)i;
+            geometry.x[i] = (int16_t)(c >= 0 && c <= NATIVE_WAVE_COLUMNS ? observed[c] : 16 * c);
+        }
+    }
+    GlNativeWaveWarp *warp = calloc(1u, sizeof(*warp));
+    if (!warp) return NULL;
+    warp->references = 1u;
+    warp->view_width = views->width;
+    warp->offset = views->offset;
+    warp->origin_y = target->y;
+    warp->lift = wave->lift;
+    warp->lifted = wave->lifted;
+    warp->current = geometry;
+    const GlNativeWaveGeometry *previous = &views->wave_previous;
+    /* Rows pair by guest index; one entering or leaving the drawing area
+     * keeps its own endpoint (native_wave_row_from). */
+    const int compatible = previous->boundary_count == geometry.boundary_count &&
+        previous->first_column == geometry.first_column &&
+        previous->row_count == geometry.row_count &&
+        vblank > views->wave_previous_vblank && vblank - views->wave_previous_vblank <= 8u;
+    if (compatible) {
+        warp->previous = *previous;
+        warp->has_previous = 1;
+    }
+    views->wave_previous = geometry;
+    views->wave_previous_vblank = vblank;
+    return warp;
+}
+
+static const GlNativeWaveRow *native_wave_row_from(const GlNativeWaveGeometry *was,
+                                                   const GlNativeWaveRow *row, uint32_t r) {
+    const GlNativeWaveRow *from = &was->rows[r];
+    return from->present && from->source_y == row->source_y && from->after_lift == row->after_lift &&
+        from->clip_top == row->clip_top && from->clip_bottom == row->clip_bottom ? from : row;
+}
+
+static float native_wave_lerp(int from, int to, double t) {
+    return (float)(from + (to - from) * t);
+}
+
+typedef struct GlNativeWaveBatch {
+    GlNativeGpuWork *gpu;
+    uint32_t plane, count;
+    GlNativeGpuSpanRect rects[1024];
+} GlNativeWaveBatch;
+
+static int native_wave_rect(GlNativeWaveBatch *batch, float x, float y, float w, float h,
+                            float sx, float sy, float sw, float sh) {
+    if (batch->count == sizeof(batch->rects) / sizeof(batch->rects[0])) {
+        if (!native_gpu_spans(batch->gpu, batch->plane, batch->plane, 4u, batch->rects, batch->count))
+            return 0;
+        batch->count = 0u;
+    }
+    batch->rects[batch->count++] = (GlNativeGpuSpanRect){x, y, w, h, sx, sy, sw, sh};
+    return 1;
+}
+
+/* Target-local rows [y0, y1) of one mesh row, moved by shift, as stretched
+ * spans. Interpolated edges stay fractional: a phase moves the wave by
+ * sub-pixel amounts instead of stepping whole guest pixels. */
+static int native_wave_emit_rows(GlNativeWaveBatch *batch, const GlNativeWaveWarp *warp,
+                                 const GlNativeWaveGeometry *now, const GlNativeWaveGeometry *was,
+                                 uint32_t r, double t, float top, float bottom, float y0, float y1,
+                                 int shift) {
+    const float width = warp->view_width;
+    if (y1 <= y0) return 1;
+    const float sy = warp->origin_y + now->rows[r].source_y + (y0 - top) * 16.f / (bottom - top);
+    const float sh = (y1 - y0) * 16.f / (bottom - top);
+    for (uint32_t i = 0u; i + 1u < now->boundary_count; ++i) {
+        const float left = native_wave_lerp(was->x[i], now->x[i], t) + warp->offset;
+        const float right = native_wave_lerp(was->x[i + 1u], now->x[i + 1u], t) + warp->offset;
+        const float x0 = left > 0.f ? left : 0.f;
+        const float x1 = right < width ? right : width;
+        if (right <= left || x1 <= x0) continue;
+        const float sx = (float)(16 * (now->first_column + (int)i) + warp->offset) +
+            (x0 - left) * 16.f / (right - left);
+        const float sw = (x1 - x0) * 16.f / (right - left);
+        if (!native_wave_rect(batch, x0, warp->origin_y + y0 + shift, x1 - x0, y1 - y0,
+                sx, sy, sw, sh)) return 0;
     }
     return 1;
 }
 
-/* CPU form of the existing 20x17 wave recipe: sort columns, resolve canonical
- * rows before the three packed rows, then repeat horizontal displacement into
- * the margins. Only a declared full-width framebuffer COPY triggers it. */
-static int native_view_wave_apply(GlNativeViewState *views, uint32_t source_index,
-                               uint32_t destination_index,
-                               const XgRenderNativeOperation *copy,
-                               const uint32_t *scratch, const uint8_t *known_rows,
-                               GlNativeCompileAudit *audit) {
-    GlNativeViewTarget *source = &views->targets[source_index];
-    GlNativeViewTarget *target = &views->targets[destination_index];
-    NativeViewWaveRow rows[NATIVE_VIEW_WAVE_ROWS];
-    int row_count = 0, anchor = -1, packed_offset[2] = {0, 0};
-    if ((!source->wave_count && !source->wave_invalid) ||
-        !source->pixels || !target->pixels) return 1;
-    if (copy->width != source->width || copy->width != target->width ||
-        copy->src_x != source->x || copy->dst_x != target->x ||
-        copy->src_x != copy->dst_x || copy->src_y != copy->dst_y + 32 ||
-        copy->height != 192u || copy->mask_set || copy->mask_check) return 1;
-    if (source->wave_count != NATIVE_VIEW_WAVE_PACKET_COUNT || source->wave_invalid) {
-        /* Enabling a layout in the middle of a cohort cannot recover its
-         * missing geometry. Keep the already-rendered/copy results, not a fake
-         * margin warp, and do not block valid device work behind that cohort. */
+/* Replays the effect over one VIEW or phase plane in FIFO order, all reading
+ * the plane as it was before the effect: the lift as a whole-row copy, the
+ * rows drawn before it already lifted, then the rows drawn after it. t places
+ * the mesh in its interval. */
+static int native_wave_emit_batch(GlNativeWaveBatch *batch, const GlNativeWaveWarp *warp, double t);
+static int native_wave_emit(GlNativeGpuWork *gpu, uint32_t plane, const GlNativeWaveWarp *warp, double t) {
+    if (!gpu) return 1;
+    if (!(t > 0.0 && t < 1.0)) t = 1.0;
+    GlNativeGpuCommand *snapshot = native_gpu_command(gpu, NATIVE_GPU_SNAPSHOT);
+    if (!snapshot) return 0;
+    snapshot->plane = plane;
+    GlNativeWaveBatch *batch = malloc(sizeof(*batch));
+    if (!batch) return 0;
+    batch->gpu = gpu; batch->plane = plane; batch->count = 0u;
+    const int ok = native_wave_emit_batch(batch, warp, t);
+    free(batch);
+    return ok;
+}
+
+static int native_wave_emit_batch(GlNativeWaveBatch *batch, const GlNativeWaveWarp *warp, double t) {
+    const GlNativeWaveGeometry *now = &warp->current;
+    const GlNativeWaveGeometry *was = warp->has_previous ? &warp->previous : now;
+    const GlNativeWaveTransfer *lift = &warp->lift;
+    /* The lift in target-local rows. */
+    const int source0 = lift->src_y - warp->origin_y, source1 = source0 + lift->height;
+    const int covered0 = lift->dst_y - warp->origin_y, covered1 = covered0 + lift->height;
+    const int shift = warp->lifted ? covered0 - source0 : 0;
+    if (warp->lifted && !native_wave_rect(batch, 0.f, lift->dst_y, warp->view_width, lift->height,
+            0.f, lift->src_y, warp->view_width, lift->height)) return 0;
+    for (int after = 0; after < 2; ++after)
+        for (uint32_t r = 0u; r < now->row_count; ++r) {
+            const GlNativeWaveRow *row = &now->rows[r];
+            if (!row->present || row->after_lift != after) continue;
+            const GlNativeWaveRow *from = native_wave_row_from(was, row, r);
+            const float top = native_wave_lerp(from->top, row->top, t);
+            const float bottom = native_wave_lerp(from->bottom, row->bottom, t);
+            const float y0 = top > row->clip_top ? top : row->clip_top;
+            const float y1 = bottom < row->clip_bottom + 1 ? bottom : row->clip_bottom + 1;
+            if (bottom <= top || y1 <= y0) continue;
+            if (after || !warp->lifted) {
+                if (!native_wave_emit_rows(batch, warp, now, was, r, t, top, bottom, y0, y1, 0))
+                    return 0;
+                continue;
+            }
+            /* The lift moves the part inside its source rows. Of the rest,
+             * what falls in its destination rows is overwritten by it. */
+            if (!native_wave_emit_rows(batch, warp, now, was, r, t, top, bottom,
+                    y0 > source0 ? y0 : source0, y1 < source1 ? y1 : source1, shift)) return 0;
+            const float outside[2][2] = {{y0, y1 < source0 ? y1 : source0},
+                                         {y0 > source1 ? y0 : source1, y1}};
+            for (int part = 0; part < 2; ++part) {
+                const float a = outside[part][0], b = outside[part][1];
+                if (!native_wave_emit_rows(batch, warp, now, was, r, t, top, bottom,
+                        a, b < covered0 ? b : covered0, 0) ||
+                    !native_wave_emit_rows(batch, warp, now, was, r, t, top, bottom,
+                        a > covered1 ? a : covered1, b, 0)) return 0;
+            }
+        }
+    return native_gpu_spans(batch->gpu, batch->plane, batch->plane, 4u, batch->rects, batch->count);
+}
+
+/* The last tile arrived: replace the guest's redraw of this target with the
+ * Native one, and let phases replay it at the same point of the frame. */
+static int native_wave_finish(GlNativeViewState *views, uint32_t index, uint64_t vblank,
+                              GlNativeCompileAudit *audit) {
+    GlNativeViewTarget *target = &views->targets[index];
+    GlNativeWaveWarp *warp = native_wave_build(views, target, vblank);
+    const uint32_t domain = native_view_domain(views, target);
+    native_wave_capture_reset(&target->wave);
+    if (!warp || domain == UINT32_MAX) {
+        native_wave_release(warp);
         audit->view_wave_incomplete++;
         return 1;
     }
-    for (int source_kind = 0; source_kind < 2; ++source_kind) {
-        for (int group = 0; group < NATIVE_VIEW_WAVE_ROWS; ++group) {
-            int order[NATIVE_VIEW_WAVE_COLUMNS];
-            for (int col = 0; col < NATIVE_VIEW_WAVE_COLUMNS; ++col) {
-                const int index = group * NATIVE_VIEW_WAVE_COLUMNS + col;
-                int insertion = col;
-                while (insertion && source->wave_tiles[order[insertion - 1]].left >
-                                      source->wave_tiles[index].left) {
-                    order[insertion] = order[insertion - 1];
-                    --insertion;
-                }
-                order[insertion] = index;
-            }
-            const NativeViewWaveTile *first = &source->wave_tiles[order[0]];
-            const int canonical = first->texture_x + first->u >= source->x &&
-                first->texture_x + first->u < source->x + source->width;
-            if (canonical != (source_kind == 0)) continue;
-            const NativeViewWaveTile *left = NULL, *right = NULL;
-            for (int col = 0; col < NATIVE_VIEW_WAVE_COLUMNS; ++col) {
-                const NativeViewWaveTile *tile = &source->wave_tiles[order[col]];
-                if (tile->bottom <= tile->top) continue;
-                if (!right) right = tile;
-                left = tile;
-            }
-            if (!left || !right) continue;
-            NativeViewWaveRow *row = &rows[row_count++];
-            int source_top;
-            row->left_top = left->top + copy->dst_y - copy->src_y - target->y;
-            row->left_bottom = left->bottom + copy->dst_y - copy->src_y - target->y;
-            row->right_top = right->top + copy->dst_y - copy->src_y - target->y;
-            row->right_bottom = right->bottom + copy->dst_y - copy->src_y - target->y;
-            if (canonical) {
-                source_top = first->texture_y + first->v;
-                if (source_top > anchor) {
-                    anchor = source_top;
-                    packed_offset[0] = row->left_top + target->y - source_top;
-                    packed_offset[1] = row->right_top + target->y - source_top;
-                }
+    const int ok = native_wave_emit(views->gpu, domain + 1u, warp, 1.0);
+    if (ok) {
+        audit->view_wave_rows += warp->current.row_count;
+        if (target->recipe && native_recipe_private(target)) {
+            GlNativeRecipe *recipe = target->recipe;
+            if (recipe->wave) {
+                s_native_recipe_texture_read.texture_reason = "second_wave";
+                native_recipe_drop(target);
             } else {
-                if (first->v < 0 || first->v > 160 || first->v % 80) {
-                    audit->view_wave_incomplete++;
-                    return 1;
-                }
-                source_top = first->draw_top + first->framebuffer_height - 48 +
-                    (first->v / 80) * 16;
-                if (anchor >= 0) {
-                    row->left_top = source_top + packed_offset[0] - target->y;
-                    row->left_bottom = row->left_top + 16;
-                    row->right_top = source_top + packed_offset[1] - target->y;
-                    row->right_bottom = row->right_top + 16;
-                }
-            }
-            row->left_source_top = row->right_source_top = source_top;
-            row->left_source_bottom = row->right_source_bottom = source_top + 16;
-            for (int col = 0; col < NATIVE_VIEW_WAVE_COLUMNS; ++col) {
-                const NativeViewWaveTile *tile = &source->wave_tiles[order[col]];
-                if (!col) row->boundaries[0] = tile->left;
-                row->boundaries[col + 1] = tile->right;
+                recipe->wave = warp;
+                warp->references++;
+                recipe->wave_at = recipe->count;
             }
         }
     }
-    /* Validate the complete visible read set before touching either margin. */
-    for (int ri = 0; ri < row_count; ++ri)
-        for (int side = 0; side < 2; ++side) {
-            const NativeViewWaveRow *row = &rows[ri];
-            const int top = side ? row->right_top : row->left_top;
-            const int bottom = side ? row->right_bottom : row->left_bottom;
-            const int source_top = side ? row->right_source_top : row->left_source_top;
-            if (bottom <= top) continue;
-            for (int y = top < 0 ? 0 : top; y < bottom && y < target->height; ++y) {
-                const int sy = source_top + (int)(((int64_t)(y - top) * 2 + 1) * 16 /
-                    ((int64_t)(bottom - top) * 2));
-                if (sy < 0 || sy >= VRAM_H || !known_rows[sy]) {
-                    audit->view_wave_incomplete++;
-                    return 1;
-                }
-            }
-        }
-    for (int ri = 0; ri < row_count; ++ri) {
-        const NativeViewWaveRow *row = &rows[ri];
-        for (int side = 0; side < 2; ++side) {
-            const int top = side ? row->right_top : row->left_top;
-            const int bottom = side ? row->right_bottom : row->left_bottom;
-            const int source_top = side ? row->right_source_top : row->left_source_top;
-            const int source_bottom = side ? row->right_source_bottom : row->left_source_bottom;
-            const int begin = side ? views->offset + target->width : 0;
-            const int end = side ? views->width : views->offset;
-            if (bottom <= top) continue;
-            const uint32_t gpu_target = views->gpu ? native_view_domain(views, target)+1u : 0u;
-            const int clipped_top = top < 0 ? 0 : top;
-            const int clipped_bottom = bottom < target->height ? bottom : target->height;
-            if (!native_gpu_span(views->gpu, gpu_target, begin, target->y+clipped_top,
-                end-begin, clipped_bottom-clipped_top, UINT32_MAX, 0,0,0,0,0,0)) return 0;
-            native_depth_clear_rows(native_view_target_depth(views, target), views->width,
-                begin, clipped_top, end - begin, clipped_bottom - clipped_top);
-            for (int y = top < 0 ? 0 : top; y < bottom && y < target->height; ++y)
-                memset(target->pixels + (size_t)y * views->width + begin, 0,
-                       (size_t)(end - begin) * sizeof(uint32_t));
-            for (int cursor = side ? begin : end; side ? cursor < end : cursor > begin;) {
-                const int start = side ? cursor : (cursor - 16 > begin ? cursor - 16 : begin);
-                const int finish = side ? (cursor + 16 < end ? cursor + 16 : end) : cursor;
-                int dl = start + native_view_wave_displacement(row->boundaries, start - views->offset);
-                int dr = finish + native_view_wave_displacement(row->boundaries, finish - views->offset);
-                if (start == begin) dl = begin;
-                if (finish == end) dr = end;
-                if (dr > dl) {
-                    for (int y = top < 0 ? 0 : top; y < bottom && y < target->height; ++y) {
-                        const int sy = source_top + (int)(((int64_t)(y - top) * 2 + 1) *
-                            (source_bottom - source_top) / ((int64_t)(bottom - top) * 2));
-                        if (sy < 0 || sy >= VRAM_H || !known_rows[sy]) continue;
-                        if (views->gpu) {
-                            const int input = native_view_cover(views, views->count, source->x, sy, source->width, 1);
-                            const uint32_t plane = input < 0 ? 0u : native_view_domain(views, &views->targets[input])+1u;
-                            const int l = dl < begin ? begin : dl, r = dr < end ? dr : end;
-                            const float sl = start + (float)((double)(l-dl)*(finish-start)/(dr-dl));
-                            const float sw = (float)((double)(r-l)*(finish-start)/(dr-dl));
-                            const float sh = (float)(source_bottom-source_top)/(bottom-top);
-                            const float source_y = source_top+(y-top)*sh;
-                            if (!native_gpu_span(views->gpu, gpu_target, l, target->y+y, r-l, 1,
-                                plane, plane ? sl : source->x+sl-views->offset, source_y, sw, sh, 0, 0)) return 0;
-                        }
-                        for (int x = dl < begin ? begin : dl; x < dr && x < end; ++x) {
-                            const int sx = start + (int)(((int64_t)(x - dl) * 2 + 1) *
-                                (finish - start) / ((int64_t)(dr - dl) * 2));
-                            target->pixels[(size_t)y * views->width + x] =
-                                scratch[(size_t)sy * views->width + sx];
-                        }
-                    }
-                }
-                cursor = side ? finish : start;
-            }
-        }
+    native_wave_release(warp);
+    return ok;
+}
+
+/* A transfer of the wave: the lift of a whole VIEW target (1) or a block
+ * saved outside every target (2) stays out of VIEW; anything else is an
+ * ordinary copy (0). */
+static int native_wave_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op) {
+    const int destination = native_view_cover(views, views->count, op->dst_x, op->dst_y,
+                                              op->width, op->height);
+    if (destination >= 0) {
+        GlNativeViewTarget *target = &views->targets[destination];
+        if (!native_view_eligible(views, target) || op->width != target->width ||
+            op->src_x != op->dst_x || op->dst_x != target->x ||
+            native_view_cover(views, views->count, op->src_x, op->src_y,
+                              op->width, op->height) != destination) return 0;
+        target->wave.lift = (GlNativeWaveTransfer){op->src_x, op->src_y, op->dst_x, op->dst_y,
+            op->width, op->height};
+        target->wave.lifted = 1;
+        return 1;
     }
-    audit->view_wave_rows += (uint32_t)row_count;
-    return 1;
+    for (uint32_t i = 0u; i < views->count; ++i) {
+        const GlNativeViewTarget *target = &views->targets[i];
+        if (op->dst_x < target->x + target->width && target->x < op->dst_x + op->width &&
+            op->dst_y < target->y + target->height && target->y < op->dst_y + op->height) return 0;
+    }
+    const int source = native_view_cover(views, views->count, op->src_x, op->src_y,
+                                         op->width, op->height);
+    if (source < 0) return 0;
+    GlNativeWaveCapture *wave = &views->targets[source].wave;
+    const GlNativeWaveTransfer transfer = {op->src_x, op->src_y, op->dst_x, op->dst_y,
+        op->width, op->height};
+    uint32_t slot = 0u;
+    while (slot < wave->transfer_count && (wave->transfers[slot].dst_x != op->dst_x ||
+           wave->transfers[slot].dst_y != op->dst_y)) ++slot;
+    if (slot < NATIVE_WAVE_TRANSFERS) {
+        wave->transfers[slot] = transfer;
+        if (slot == wave->transfer_count) wave->transfer_count++;
+    }
+    return 2;
 }
 
 /* StoreImage/LoadImage round trips used by FieldSetVramStpBits and the Battle
@@ -12402,7 +12636,6 @@ static int native_view_transfer(GlNativeViewState *views,
                              const GlNativeResourceRecord *upload,
                              const uint32_t *canonical,
                              const uint32_t *copy_pixels,
-                             int *wave_source, uint64_t *wave_destinations,
                              GlNativeCompileAudit *audit) {
     const uint32_t original_count = views->count;
     const uint32_t *snapshot[GL_NATIVE_VIEW_TARGET_CAPACITY] = {0};
@@ -12417,8 +12650,6 @@ static int native_view_transfer(GlNativeViewState *views,
             operation->src_y, operation->width,
             operation->height < 224u ? operation->height : 224u) >= 0;
     int result = 0;
-    *wave_source = -1;
-    *wave_destinations = 0u;
     if (!copy && operation->width == VRAM_W && operation->height == VRAM_H &&
         !operation->mask_check) views->reset_motion_history = 1;
     if (copy) {
@@ -12433,8 +12664,6 @@ static int native_view_transfer(GlNativeViewState *views,
         for (uint32_t i = 0u; i < original_count; ++i)
             if (native_view_eligible(views, &views->targets[i]) && !views->targets[i].pixels &&
                 !native_view_private(views, i, canonical)) goto finished;
-        *wave_source = native_view_cover(views, original_count,
-            operation->src_x, operation->src_y, operation->width, operation->height);
         for (uint32_t i = 0u; i < original_count; ++i) {
             const GlNativeViewTarget *source = &views->targets[i];
             const uint32_t dx = (source->x - operation->src_x) & (VRAM_W - 1);
@@ -12492,8 +12721,6 @@ static int native_view_transfer(GlNativeViewState *views,
             const GlNativeViewTarget *source = source_index >= 0 ? &views->targets[source_index] : NULL;
             const int wide_copy = source && snapshot[source_index] &&
                 source_x == source->x && source->width == target->width;
-            if (wide_copy && source_index == *wave_source)
-                *wave_destinations |= UINT64_C(1) << i;
             if (!operation->mask_set && !operation->mask_check &&
                 (wide_copy || (full_x && operation->kind == XG_RENDER_NATIVE_OPERATION_FILL))) {
                 uint32_t *row = target->pixels + (size_t)y * views->width;
@@ -12575,11 +12802,8 @@ static int native_view_transfer(GlNativeViewState *views,
             }
         }
         if (copy) audit->view_copies++;
-        if (!copy && full_x && full_y && !operation->mask_check) {
-            memset(target->wave_seen, 0, sizeof(target->wave_seen));
-            target->wave_count = 0u;
-            target->wave_invalid = 0;
-        }
+        if (!copy && full_x && full_y && !operation->mask_check)
+            native_wave_capture_reset(&target->wave);
     }
     result = 1;
 finished:
@@ -13796,6 +14020,9 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         .width = width, .height = recipe->height, .valid = 1};
     for (uint32_t i = 0u; i < recipe->count; ++i) {
         const GlNativeRecipeDraw *record = &recipe->draws[i];
+        if (gpu && recipe->wave && recipe->wave_at == i &&
+            !native_wave_emit(gpu, GL_NATIVE_GPU_PHASE_BASE + phase, recipe->wave, gpu->wave_phase))
+            goto finished;
         if (record->temporal_departure &&
             !(record->motion.motion.handle.resource_id
                 ? entities && record->motion_index < recipe->motion_count && entities[record->motion_index].enabled
@@ -14000,6 +14227,9 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
                       : native_render_draw(&compiler, &target, &draw, i))) goto finished;
         }
     }
+    if (gpu && recipe->wave && recipe->wave_at == recipe->count &&
+        !native_wave_emit(gpu, GL_NATIVE_GPU_PHASE_BASE + phase, recipe->wave, gpu->wave_phase))
+        goto finished;
     if (!gpu) {
         memmove(pixels, pixels + (size_t)crop_y * width, (size_t)width * height * sizeof(*pixels));
         for (size_t i = 0u; i < (size_t)width * height; ++i) pixels[i] |= UINT32_C(0xff000000);
@@ -14965,6 +15195,7 @@ static void native_phase_job_execute(GlNativePhaseJob *job, int capture) {
     if (!gpu) return;
     gpu->identity = job->identity;
     gpu->scale = job->scale;
+    gpu->wave_phase = (double)(job->phase + 1u) / job->denominator;
     gpu->depth_test = job->depth_test;
     gpu->depth_view = job->depth_view;
     gpu->wireframe = job->wireframe;
@@ -15146,6 +15377,7 @@ static int native_phase_merge(GlNativeGpuWork *target, GlNativePhaseJob *job,
     memcpy(commands, source->commands, (size_t)source->count * sizeof(*commands));
     for (uint32_t i = 0u; i < source->count; ++i)
         if (commands[i].kind == NATIVE_GPU_WORDS || commands[i].kind == NATIVE_GPU_SEED ||
+            commands[i].kind == NATIVE_GPU_SPANS ||
             (commands[i].kind == NATIVE_GPU_DRAW && commands[i].mesh_count))
             commands[i].data += data_offset;
     target->count += source->count;
@@ -15231,6 +15463,9 @@ static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRec
     for (uint32_t i = 0u; i < a->coverage_count; ++i)
         if (memcmp(&a->coverages[i].reference, &b->coverages[i].reference, sizeof(a->coverages[i].reference))) return 0;
     if (a->publication != b->publication) return 0;
+    /* A wave animates over a still scene: its mesh is part of the pose. */
+    if (!a->wave != !b->wave || a->wave_at != b->wave_at ||
+        (a->wave && !native_wave_geometry_equal(a->wave, b->wave))) return 0;
     for (uint32_t i = 0u; i < a->count; ++i) {
         const GlNativeRecipeDraw *x = &a->draws[i], *y = &b->draws[i];
         /* Pixel equality alone cannot prove temporal equality. Include all
@@ -15690,9 +15925,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         for (uint32_t i = 0u; i < views->count; ++i) {
             views->targets[i].pixels = NULL;
             views->targets[i].transition_snapshot = 0;
-            memset(views->targets[i].wave_seen, 0, sizeof(views->targets[i].wave_seen));
-            views->targets[i].wave_count = 0u;
-            views->targets[i].wave_invalid = 0;
+            native_wave_capture_reset(&views->targets[i].wave);
             native_recipe_drop(&views->targets[i]);
         }
         /* Different horizontal projection: staging drops domain references,
@@ -15910,6 +16143,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             }
             views->active = index;
             views->targets[index].declaration = ++views->declaration_sequence;
+            native_wave_capture_reset(&views->targets[index].wave);
             continue;
         }
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_READBACK) {
@@ -15936,10 +16170,8 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                     memcpy(copy_pixels + (size_t)y * 320,
                         canvas.pixels + (size_t)((operation.dst_y + y) & (VRAM_H - 1)) * VRAM_W + operation.dst_x,
                         320 * sizeof(*copy_pixels));
-                int wave_source;
-                uint64_t wave_destinations;
                 if (!native_view_transfer(views, &capture, NULL, canvas.pixels, copy_pixels,
-                    &wave_source, &wave_destinations, audit)) goto allocation_failed;
+                    audit)) goto allocation_failed;
                 for (uint32_t i = 0; i < views->count; ++i)
                     if (views->targets[i].x == 704 && views->targets[i].y == 256 &&
                         views->targets[i].transition_snapshot) views->targets[i].transition_snapshot = 2;
@@ -15951,6 +16183,28 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             XgSemanticDrawRecord draw;
             if (!native_materialize_native_draw(&operation.semantic, &draw)) goto failed;
             draw.hd_texture = operation.hd_texture;
+            const XgRenderIrMaterialState *wave_area = &draw.primitive.material;
+            const int wave_target = draw.native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
+                gpu && !view_cpu
+                ? native_view_cover(views, views->count, wave_area->draw_area_left,
+                    wave_area->draw_area_top, wave_area->draw_area_right - wave_area->draw_area_left + 1,
+                    wave_area->draw_area_bottom - wave_area->draw_area_top + 1) : -1;
+            if (wave_target >= 0 && native_view_eligible(views, &views->targets[wave_target])) {
+                /* Guest VRAM keeps the guest's own redraw; VIEW gets the
+                 * whole effect at once when its last tile arrives. The mesh
+                 * may follow a transfer without any new declaration. */
+                GlNativeViewTarget *target = &views->targets[wave_target];
+                if (!native_wave_capture_tile(target, &draw)) target->wave.invalid = 1;
+                if ((draw.native_view_effect_index == NATIVE_WAVE_LAST_TILE ||
+                     target->wave.count == NATIVE_WAVE_TILES) &&
+                    (!native_view_worker_drain(&compiler, 0, 0, VRAM_W - 1, VRAM_H - 1) ||
+                     !native_wave_finish(views, (uint32_t)wave_target,
+                        audit->header.identity.guest_vblank_sequence, audit))) goto allocation_failed;
+                compiler.gpu_only = 0;
+                if (!native_render_draw(&compiler, &canvas, &draw, operation_index)) goto failed;
+                native_recipe_draw_written(views, &operation, audit, canvas.words);
+                continue;
+            }
             int marked = draw.screen_space_2d != 0u || draw.native_view_effect != 0u;
             for (uint32_t ti = 0u; ti < draw.primitive.triangle_count; ++ti)
                 for (uint32_t vi = 0u; vi < 3u; ++vi)
@@ -15998,11 +16252,6 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                     views->targets[views->active].x == target->x &&
                     views->targets[views->active].width == target->width, NULL);
             }
-
-            if (draw.native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
-                views->active >= 0 && native_view_eligible(views, &views->targets[views->active]) &&
-                !native_view_wave_capture(&views->targets[views->active], &draw))
-                views->targets[views->active].wave_invalid = 1;
             if (!native_render_draw(&compiler, &canvas, &draw, operation_index))
                 goto failed;
             compiler.gpu_only = 0;
@@ -16073,8 +16322,12 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                     canvas.pixels + (size_t)y * VRAM_W,
                     operation.width * sizeof(*copy_pixels));
         }
-        int wave_source = -1;
-        uint64_t wave_destinations = 0u;
+        /* The wave's own transfers (gpu_native_field_wave_transfer) leave
+         * VIEW alone when Native replays the effect on the GPU planes. */
+        const int wave_transfer = operation.kind == XG_RENDER_NATIVE_OPERATION_COPY &&
+            operation.semantic.native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
+            gpu && !view_cpu && !operation.mask_set && !operation.mask_check
+            ? native_wave_transfer(views, &operation) : 0;
         copy_recipe_count = 0u;
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_COPY) {
             copy_recipe_count = views->count;
@@ -16083,8 +16336,9 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                 if (copy_recipes[i]) copy_recipes[i]->references++;
             }
         }
-        if (transition_upload != 1 && !native_view_transfer(views, &view_operation, &upload, canvas.pixels, copy_pixels,
-                              &wave_source, &wave_destinations, audit)) goto allocation_failed;
+        if (transition_upload != 1 && !wave_transfer &&
+            !native_view_transfer(views, &view_operation, &upload, canvas.pixels, copy_pixels,
+                              audit)) goto allocation_failed;
         if (!operation.mask_set && !operation.mask_check &&
             operation.kind != XG_RENDER_NATIVE_OPERATION_UPLOAD) {
             /* COPY reads the pre-write snapshot, including overlapping moves.
@@ -16163,28 +16417,10 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                     gpu->dirty_texture_pages[offset / (VRAM_W * 256u)] |= 1u << ((offset % VRAM_W) / 64u);
                 }
             }
-        native_recipe_transfer(views, &operation, copy_recipes, copy_recipe_count);
+        if (wave_transfer == 1) native_recipe_raster_transfer(views, &operation);
+        else native_recipe_transfer(views, &operation, copy_recipes, copy_recipe_count);
         for (uint32_t i = 0u; i < copy_recipe_count; ++i) native_recipe_release(copy_recipes[i]);
         copy_recipe_count = 0u;
-        if (operation.kind == XG_RENDER_NATIVE_OPERATION_COPY && wave_source >= 0 &&
-            operation.src_x == operation.dst_x && operation.height == 192u &&
-            operation.src_y == operation.dst_y + 32 &&
-            !operation.mask_set && !operation.mask_check && wave_destinations &&
-            (views->targets[wave_source].wave_count || views->targets[wave_source].wave_invalid)) {
-            uint8_t known_rows[VRAM_H];
-            if (!native_view_wave_snapshot(views, operation.dst_x,
-                views->targets[wave_source].width, canvas.pixels, copy_pixels, known_rows))
-                goto allocation_failed;
-            if (gpu && !native_gpu_command(gpu, NATIVE_GPU_SNAPSHOT)) goto allocation_failed;
-            for (uint32_t i = 0u; i < views->count; ++i)
-                if ((wave_destinations & (UINT64_C(1) << i)) &&
-                    !native_view_wave_apply(views, (uint32_t)wave_source, i,
-                                         &operation, copy_pixels, known_rows, audit)) goto failed;
-            views->targets[wave_source].wave_count = 0u;
-            views->targets[wave_source].wave_invalid = 0;
-            memset(views->targets[wave_source].wave_seen, 0,
-                   sizeof(views->targets[wave_source].wave_seen));
-        }
     }
     if (!native_view_worker_finish(&compiler)) goto failed;
     if (audit->header.display_boundary) {
@@ -17528,6 +17764,7 @@ static uint32_t native_gpu_command_vertex_count(const GlNativeGpuCommand *comman
     if (command->kind == NATIVE_GPU_DRAW)
         return command->draw.topology == GPU_RENDER_SEMANTIC_LINES
             ? command->draw.line_count * 6u : native_gpu_command_triangles(command) * 3u;
+    if (command->kind == NATIVE_GPU_SPANS) return command->mesh_count * 6u;
     return command->kind == NATIVE_GPU_SEED || command->kind == NATIVE_GPU_SPAN ? 6u : 0u;
 }
 
@@ -17637,6 +17874,21 @@ static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
                 if (lines) native_gpu_line_vertex_data(data);
                 memcpy(vertices + cursor, data, stride * sizeof(*vertices));
                 cursor += stride;
+            }
+        } else if (command->kind == NATIVE_GPU_SPANS) {
+            const GlNativeGpuPlane *source = &work->planes[command->source];
+            const uint32_t width = source->width ? source->width : work->widths[command->source]*work->scale;
+            const uint32_t height = source->height ? source->height : work->heights[command->source]*work->scale;
+            if (!width || !height) { free(vertices); return 0; }
+            const GlNativeGpuSpanRect *rects = (const GlNativeGpuSpanRect *)(blob + command->data);
+            for (uint32_t r = 0u; r < command->mesh_count; ++r) {
+                const GlNativeGpuSpanRect *rect = &rects[r];
+                const float u0=rect->sx*work->scale/width, v0=rect->sy*work->scale/height;
+                const float u1=(rect->sx+rect->sw)*work->scale/width, v1=(rect->sy+rect->sh)*work->scale/height;
+                const float x=rect->x,y=rect->y,rx=x+rect->w,b=y+rect->h;
+                const float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]={{x,y,u0,v0},{rx,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{rx,y,u1,v0},{rx,b,u1,v1}};
+                memcpy(vertices + cursor, data, sizeof(data));
+                cursor += 6u;
             }
         } else {
             float u0=0.f,v0=0.f,u1=1.f,v1=1.f;
@@ -18066,7 +18318,8 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
     native_gpu_depth_query(work, 0);
     /* Transfers write far depth, except full-row VIEW copies (mask bit 2),
      * which carry their source rows' keys, exactly like the CPU domain copy. */
-    const int copy_depth = (command->mask & 4u) && texture && command->kind == NATIVE_GPU_SPAN &&
+    const int copy_depth = (command->mask & 4u) && texture &&
+        (command->kind == NATIVE_GPU_SPAN || command->kind == NATIVE_GPU_SPANS) &&
         source_plane && source_plane->depth;
     const GlNativeDepthMode transfer_depth = {0, copy_depth ? 3 : GL_NATIVE_DEPTH_RESET, 0, 0,
         GL_NATIVE_DEPTH_SHOW_NONE, {0}};
@@ -18081,11 +18334,11 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
      * copies between VIEW planes carry their lines. */
     const int black=wire&&(!texture||command->kind==NATIVE_GPU_SEED||command->source==0u);
     native_gpu_uniform4(1,s_native_gpu_flags,command->mask&1u,(command->mask>>1u)&1u,
-        command->kind == NATIVE_GPU_SPAN ? 0 : 1,texture&&!black?2:1);
+        command->kind == NATIVE_GPU_SEED ? 1 : 0,texture&&!black?2:1);
     if (black) native_gpu_uniform_float4(NATIVE_UNIFORM_COLOR,s_native_gpu_color,0.f,0.f,0.f,(command->color>>24u)/255.f);
     else native_gpu_uniform_float4(NATIVE_UNIFORM_COLOR,s_native_gpu_color,(command->color&255u)/255.f,((command->color>>8u)&255u)/255.f,
         ((command->color>>16u)&255u)/255.f,(command->color>>24u)/255.f);
-    glDrawArrays(GL_TRIANGLES,(GLint)first_vertex,6);
+    glDrawArrays(GL_TRIANGLES,(GLint)first_vertex,(GLsizei)native_gpu_command_vertex_count(command));
     work->transfer_draws++;
     return 1;
 }
@@ -18398,7 +18651,14 @@ static int native_gpu_service(void) {
                 work->snapshot_commands++;
                 native_gpu_depth_query(work,0);
                 p_glActiveTexture(PSXGL_TEXTURE0+2);
-                for(unsigned j=0;j<GL_NATIVE_GPU_PHASE_BASE&&ok;++j)if(work->planes[j].texture) {
+                /* plane 0: every VIEW domain; otherwise that one plane, which
+                 * may be a phase (the Field wave reads its own plane). */
+                for(unsigned j=0;j<GL_NATIVE_GPU_PLANES&&ok;++j)if(work->planes[j].texture&&
+                        (command->plane?j==command->plane:j<GL_NATIVE_GPU_PHASE_BASE)) {
+                    if(!snapshots[j].texture&&s_native_gpu_spare_snapshots[j].texture) {
+                        snapshots[j]=s_native_gpu_spare_snapshots[j];
+                        memset(&s_native_gpu_spare_snapshots[j],0,sizeof(snapshots[j]));
+                    }
                     ok=native_gpu_plane_size(&snapshots[j],work->planes[j].width,work->planes[j].height);
                     if(ok)native_gpu_blit(&work->planes[j],&snapshots[j],0,0,work->planes[j].width,work->planes[j].height);
                     /* Full-row VIEW copies carry their source keys (SPAN mask bit 2). */
@@ -18526,7 +18786,11 @@ static int native_gpu_service(void) {
                 }
             }
         }
-        for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&snapshots[i]);
+        for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)if(snapshots[i].texture) {
+            native_gpu_plane_free(&s_native_gpu_spare_snapshots[i]);
+            s_native_gpu_spare_snapshots[i]=snapshots[i];
+            memset(&snapshots[i],0,sizeof(snapshots[i]));
+        }
         if(work->timers[0])p_glQueryCounter(work->timers[2],GL_TIMESTAMP);
         work->fence=ok?p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE,0):NULL;glFlush();
         work->submitted_ns=SDL_GetTicksNS();
@@ -18670,6 +18934,7 @@ static int native_gpu_thread_main(void *unused) {
     for(unsigned i=0;i<GL_NATIVE_GPU_PHASE_BASE;++i)native_gpu_plane_free(&s_native_gpu_planes[i]);
     for(unsigned i=0;i<GL_NATIVE_VIEW_TARGET_CAPACITY;++i)native_gpu_plane_free(&s_native_gpu_recipe_bases[i]);
     for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_planes[i]);
+    for(unsigned i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_snapshots[i]);
     native_gpu_plane_free(&s_native_gpu_destination);
     if(s_native_gpu_program)p_glDeleteProgram(s_native_gpu_program);
     if(s_native_gpu_vao)p_glDeleteVertexArrays(1,&s_native_gpu_vao);
@@ -20518,6 +20783,7 @@ void gl_renderer_native_shutdown(void) {
         native_gpu_free(s_native_gpu_work); s_native_gpu_work = NULL;
         for (uint32_t i=0;i<GL_NATIVE_GPU_PHASE_BASE;++i)native_gpu_plane_free(&s_native_gpu_planes[i]);
         for (uint32_t i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_planes[i]);
+        for (uint32_t i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_snapshots[i]);
         native_gpu_plane_free(&s_native_gpu_destination);
         if(s_native_gpu_program)p_glDeleteProgram(s_native_gpu_program);
         if(s_native_gpu_vao)p_glDeleteVertexArrays(1,&s_native_gpu_vao);
@@ -20566,6 +20832,7 @@ void gl_renderer_native_shutdown(void) {
         native_gpu_free(s_native_gpu_work); s_native_gpu_work = NULL;
         for (uint32_t i=0;i<GL_NATIVE_GPU_PHASE_BASE;++i)native_gpu_plane_free(&s_native_gpu_planes[i]);
         for (uint32_t i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_planes[i]);
+        for (uint32_t i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_snapshots[i]);
         native_gpu_plane_free(&s_native_gpu_destination);
         if(s_native_gpu_program)p_glDeleteProgram(s_native_gpu_program);
         if(s_native_gpu_vbo)p_glDeleteBuffers(1,&s_native_gpu_vbo);
@@ -20610,6 +20877,7 @@ void gl_renderer_native_shutdown(void) {
     }
     memset(s_native_gpu_planes,0,sizeof(s_native_gpu_planes));
     memset(s_native_gpu_spare_planes,0,sizeof(s_native_gpu_spare_planes));
+    memset(s_native_gpu_spare_snapshots,0,sizeof(s_native_gpu_spare_snapshots));
     for (uint32_t i=0;i<=GL_NATIVE_MOTION_PHASE_CAPACITY;++i) {
         free(s_native_gpu_readback_spare[i]);s_native_gpu_readback_spare[i]=NULL;s_native_gpu_readback_capacity[i]=0;
     }

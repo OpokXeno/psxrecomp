@@ -1671,6 +1671,11 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
             break;
         }
         cur += 16u;
+        /* Older writers tagged MODMEM 0x13 too; it always follows the
+         * precision section, so the second 0x13 is the enhancement arena. */
+        if (section->tag == BS_SEC_GTE_PRECISION &&
+            (seen & (1u << BS_SEC_GTE_PRECISION)) != 0u)
+            section->tag = BS_SEC_MODMEM;
         if (section->tag == 0u || section->tag >= 32u ||
             ((required | (1u << BS_SEC_NATIVE_RENDER) | (1u << BS_SEC_HD_TEXTURE) |
               (1u << BS_SEC_GTE_PRECISION)) &

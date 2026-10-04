@@ -6942,10 +6942,42 @@ enum {
     XG_FIELD_WAVE_ROWS = 17,
     XG_FIELD_WAVE_PACKET_STRIDE = 0x28,
     XG_FIELD_WAVE_COMMAND_OFFSET = 4,
+    XG_FIELD_WAVE_TRANSFER_COUNT = 15,
+    XG_FIELD_WAVE_TRANSFER_STRIDE = 0x18,
 };
 
 #define XG_FIELD_WAVE_ACTIVE UINT32_C(0x800b2078)
 #define XG_FIELD_WAVE_PACKET_BASES UINT32_C(0x800b20bc)
+#define XG_FIELD_WAVE_TRANSFER_BASES UINT32_C(0x800b20b4)
+#define XG_FIELD_WAVE_X_AMPLITUDE UINT32_C(0x800b2080) /* 16.16 */
+#define XG_FIELD_WAVE_X_FREQUENCY UINT32_C(0x800b2088) /* 16.16 */
+#define XG_FIELD_WAVE_X_SPEED UINT32_C(0x800b2090)     /* 16.16 */
+#define XG_FIELD_WAVE_X_PHASE UINT32_C(0x800b20b0)
+#define XG_FIELD_WAVE_SINE_TABLE UINT32_C(0x800523f2)  /* FUN_8003f8cc */
+
+/* The column parameters each mesh was built with, sampled while the guest
+ * submits it. The scene script ramps amplitude, frequency and speed, and
+ * Native compiles a mesh frames later: guest RAM has moved on by then. */
+typedef struct FieldWaveParameters {
+    int16_t amplitude, frequency, phase;
+} FieldWaveParameters;
+#define FIELD_WAVE_PARAMETER_HISTORY 16u
+static FieldWaveParameters field_wave_parameters[FIELD_WAVE_PARAMETER_HISTORY];
+static volatile uint32_t field_wave_parameter_count;
+
+static void field_wave_note_parameters(void) {
+    const FieldWaveParameters now = {
+        (int16_t)(psx_read_word(XG_FIELD_WAVE_X_AMPLITUDE) >> 16),
+        (int16_t)(psx_read_word(XG_FIELD_WAVE_X_FREQUENCY) >> 16),
+        (int16_t)psx_read_word(XG_FIELD_WAVE_X_PHASE),
+    };
+    const uint32_t count = field_wave_parameter_count;
+    const FieldWaveParameters *last = count
+        ? &field_wave_parameters[(count - 1u) % FIELD_WAVE_PARAMETER_HISTORY] : NULL;
+    if (last && !memcmp(last, &now, sizeof(now))) return;
+    field_wave_parameters[count % FIELD_WAVE_PARAMETER_HISTORY] = now;
+    field_wave_parameter_count = count + 1u;
+}
 
 static void native_semantic_classify_native_view_effect(
         uint8_t opcode, GpuRenderSemantic *semantic,
@@ -6985,9 +7017,102 @@ static void native_semantic_classify_native_view_effect(
                 GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID;
             semantic->native_view_effect_index =
                 (uint16_t)(offset / XG_FIELD_WAVE_PACKET_STRIDE);
+            field_wave_note_parameters();
             return;
         }
     }
+}
+
+/* The same routine queues fifteen double-buffered 0x18-byte VRAM moves: 64x16
+ * blocks saving the bottom 48 rows at x=960, then the 320x192 move lifting the
+ * frame 32 rows before the mesh redraws it. */
+bool gpu_native_field_wave_transfer(uint32_t command_source_address) {
+    const uint32_t address = command_source_address & UINT32_C(0x1fffffff);
+
+    if (command_source_address == UINT32_MAX ||
+        (psx_read_word(XG_FIELD_WAVE_ACTIVE) & UINT32_C(0xffff)) == 0u)
+        return false;
+    for (uint32_t buffer = 0u; buffer < XG_FIELD_WAVE_BUFFER_COUNT; ++buffer) {
+        const uint32_t base = psx_read_word(
+            XG_FIELD_WAVE_TRANSFER_BASES + buffer * 4u) & UINT32_C(0x1fffffff);
+        if (base < UINT32_C(0x200000) && address >= base &&
+            address - base < XG_FIELD_WAVE_TRANSFER_COUNT *
+                             XG_FIELD_WAVE_TRANSFER_STRIDE)
+            return true;
+    }
+    return false;
+}
+
+static int32_t field_wave_ram_s16(const uint8_t *ram, uint32_t address) {
+    address &= UINT32_C(0x1fffff);
+    return (int16_t)(ram[address] | ram[address + 1u] << 8);
+}
+
+static int32_t field_wave_displacement(const uint8_t *ram, int32_t amplitude,
+                                       int32_t angle) {
+    return field_wave_ram_s16(ram, XG_FIELD_WAVE_SINE_TABLE +
+        (uint32_t)(angle & 0xfff) * 4u) * amplitude >> 12;
+}
+
+static bool field_wave_columns_match(const uint8_t *ram, const int16_t observed[21],
+                                     int32_t amplitude, int32_t frequency,
+                                     int32_t phase) {
+    for (int32_t column = 1; column < 20; ++column)
+        if (16 * column + field_wave_displacement(
+                ram, amplitude, phase + column * frequency) != observed[column])
+            return false;
+    return true;
+}
+
+static void field_wave_columns(const uint8_t *ram, int32_t amplitude,
+                               int32_t frequency, int32_t phase, int first,
+                               uint32_t count, int16_t *out) {
+    for (uint32_t index = 0u; index < count; ++index) {
+        const int32_t boundary = first + (int32_t)index;
+        out[index] = (int16_t)(16 * boundary + field_wave_displacement(
+            ram, amplitude, phase + boundary * frequency));
+    }
+}
+
+bool gpu_native_field_wave_columns(const int16_t observed[21], int first,
+                                   uint32_t count, int16_t *out) {
+    const uint8_t *ram = memory_get_ram_ptr();
+    int32_t amplitude, frequency, speed, phase;
+
+    if (ram == NULL || observed == NULL || out == NULL) return false;
+    /* The parameters sampled at submission, most recent first. */
+    for (uint32_t back = 0u, total = field_wave_parameter_count;
+         back < FIELD_WAVE_PARAMETER_HISTORY && back < total; ++back) {
+        const FieldWaveParameters sample =
+            field_wave_parameters[(total - 1u - back) % FIELD_WAVE_PARAMETER_HISTORY];
+        if (field_wave_columns_match(ram, observed, sample.amplitude,
+                                     sample.frequency, sample.phase)) {
+            field_wave_columns(ram, sample.amplitude, sample.frequency,
+                               sample.phase, first, count, out);
+            return true;
+        }
+    }
+    amplitude = field_wave_ram_s16(ram, XG_FIELD_WAVE_X_AMPLITUDE + 2u);
+    frequency = field_wave_ram_s16(ram, XG_FIELD_WAVE_X_FREQUENCY + 2u);
+    speed = field_wave_ram_s16(ram, XG_FIELD_WAVE_X_SPEED + 2u);
+    phase = field_wave_ram_s16(ram, XG_FIELD_WAVE_X_PHASE);
+    /* Native compiles a mesh after the guest has advanced the phase (and, in
+     * a scripted ramp, the amplitude): walk back its own per-frame step first,
+     * then try every phase of the table, nearest amplitudes first. */
+    for (int32_t ramp = 0; ramp < 5; ++ramp) {
+        const int32_t candidate_amplitude =
+            amplitude + (ramp & 1 ? 1 : -1) * ((ramp + 1) / 2);
+        for (int32_t attempt = 0; attempt < 16 + 4096; ++attempt) {
+            const int32_t candidate = attempt < 16
+                ? phase - attempt * speed : attempt - 16;
+            if (!field_wave_columns_match(ram, observed, candidate_amplitude,
+                                          frequency, candidate)) continue;
+            field_wave_columns(ram, candidate_amplitude, frequency, candidate,
+                               first, count, out);
+            return true;
+        }
+    }
+    return false;
 }
 
 static int native_semantic_is_field_dialogue_window_source(
@@ -7693,6 +7818,7 @@ static bool gpu_native_work_decode(
     if (opcode < 0x40u || opcode > 0x5fu)
         out->screen_space_2d =
             native_semantic_screen_space_mode(opcode, out, source);
+    native_semantic_classify_native_view_effect(opcode, out, source);
     out->material.draw_area_left = environment->draw.left;
     out->material.draw_area_top = environment->draw.top;
     out->material.draw_area_right = environment->draw.right;
@@ -8780,9 +8906,16 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                 src_x, src_y, dst_x, dst_y, width, height);
             if (gpu_vram_move_complete_hook != NULL ||
                 gpu_vram_event_hook != NULL) {
-                const size_t pixel_count = (size_t)width * (size_t)height;
-                gr_vram_transfer_out(
-                    dst_x, dst_y, width, height, vram_write_pixels);
+                /* The Native work collector replays a move from its
+                 * coordinates. Reading the result back would stall the guest
+                 * on the host GPU at every move. */
+                const bool payload = gpu_vram_move_complete_hook != NULL ||
+                    !gpu_native_work_active();
+                const size_t pixel_count = payload
+                    ? (size_t)width * (size_t)height : 0u;
+                if (payload)
+                    gr_vram_transfer_out(
+                        dst_x, dst_y, width, height, vram_write_pixels);
                 if (gpu_vram_move_complete_hook != NULL)
                     gpu_vram_move_complete_hook(
                         (uint16_t)dst_x, (uint16_t)dst_y,
@@ -8798,7 +8931,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                     .height = (uint16_t)height,
                     .mask_set = mask_set,
                     .mask_check = mask_check,
-                    .pixels = vram_write_pixels,
+                    .pixels = payload ? vram_write_pixels : NULL,
                     .pixel_count = pixel_count,
                     .command_source_address = source != NULL
                         ? source->word_address : 0u,
