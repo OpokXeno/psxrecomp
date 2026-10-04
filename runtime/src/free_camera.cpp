@@ -198,10 +198,7 @@ static constexpr uint32_t kWorldCamSlot10TPitchOff = 0x58u;
 static constexpr uint32_t kWorldCamSlot10PAccOff   = 0x60u;
 static constexpr uint32_t kWorldCamSlot9Fn         = 0x800914D0u;
 static constexpr uint32_t kWorldCamSlot10Fn        = 0x80091C18u;
-/* View matrix (0x20 bytes: 3x3 s16 rotation row-major + 3x s32 translation)
- * and streaming accumulators (XZ, same units as origin deltas). The matrix
- * is GTE +Z-forward: row 2 = view forward, row 0 = view right. */
-static constexpr uint32_t kAddr_worldCamMatrix      = 0x8009C808u;
+/* Streaming accumulators (XZ, same units as origin deltas). */
 static constexpr uint32_t kAddr_worldStreamX        = 0x8009BBB4u;
 static constexpr uint32_t kAddr_worldStreamZ        = 0x8009BBBCu;
 /* Write a u32 LE to guest RAM. 4 byte writes via psx_write_byte (same
@@ -656,27 +653,19 @@ static void camera_pose_step(bool allow_motion)
     s_cam_at_f[0]  = ax; s_cam_at_f[1]  = ay; s_cam_at_f[2]  = az;
 }
 
-/* World orbit rig: translate its origin on the ground using the rendered
- * view's forward/right axes. Mouse/arrows turn the rig; the wheel changes
- * distance. Travel-heading conventions need not match camera conventions. */
+/* World orbit rig: translate its origin on the ground along the view's
+ * heading. The view looks along (sin yaw, cos yaw) on the ground
+ * (FUN_80096f18: RotMatrixYXZ(pitch, yaw, 0)), but the origin and the
+ * streaming accumulators run with Z mirrored against that frame (measured:
+ * +X moves the camera along view X, -Z moves it backwards). In origin
+ * terms forward is (sin yaw, -cos yaw) and screen-right (cos yaw, sin yaw),
+ * at every pitch. Mouse/arrows turn the rig; the wheel changes distance. */
 static void camera_orbit_step(bool allow_motion)
 {
     constexpr float kTurn = 4096.0f / (2.0f * 3.141592653589793f);
-    float yawrad = (float)s_w_yaw * (6.283185307179586f / 4096.0f);
-    float fx = std::sin(yawrad), fz = -std::cos(yawrad);
-    float rx = std::cos(yawrad), rz = std::sin(yawrad);
-    // A PSX MATRIX stores nine row-major s16 Q12 components. Row 0 is
-    // screen-right and row 2 is view-forward; discard Y for ground motion.
-    const float view_fx = (float)(int16_t)read_u16_le(kAddr_worldCamMatrix + 12u);
-    const float view_fz = (float)(int16_t)read_u16_le(kAddr_worldCamMatrix + 16u);
-    const float view_rx = (float)(int16_t)read_u16_le(kAddr_worldCamMatrix);
-    const float view_rz = (float)(int16_t)read_u16_le(kAddr_worldCamMatrix + 4u);
-    const float forward_length = std::sqrt(view_fx*view_fx + view_fz*view_fz);
-    const float right_length = std::sqrt(view_rx*view_rx + view_rz*view_rz);
-    if (forward_length > 1.0f && right_length > 1.0f) {
-        fx = view_fx / forward_length; fz = view_fz / forward_length;
-        rx = view_rx / right_length; rz = view_rz / right_length;
-    }
+    const float yawrad = (float)s_w_yaw * (6.283185307179586f / 4096.0f);
+    const float fx = std::sin(yawrad), fz = -std::cos(yawrad);
+    const float rx = std::cos(yawrad), rz = std::sin(yawrad);
     if (s_camera_keys_enable && allow_motion) {
         const Uint8 *ks = SDL_GetKeyboardState(nullptr);
         if (ks) {
@@ -722,7 +711,8 @@ static void camera_orbit_step(bool allow_motion)
             s_w_pitch += (int)std::lround(dy);
         }
         if (s_cam_wheel_accum != 0.0f) {
-            s_w_dist_f += s_cam_wheel_accum * s_cam_wheel_step;
+            /* Wheel forward zooms in, as the field dolly moves forward. */
+            s_w_dist_f -= s_cam_wheel_accum * s_cam_wheel_step;
             s_cam_wheel_accum = 0.0f;
         }
         /* Left-drag glide: same WASD-style mapping on the ground plane —
