@@ -1,4 +1,5 @@
 #include "dma_gpu_ll.h"
+#include "mod_memory.h"
 
 #include <string.h>
 
@@ -8,6 +9,14 @@
  * transfer before DMA reaches the changed word. */
 #define DMA_GPU_LL_HEADER_CYCLES 1u
 #define DMA_GPU_LL_SETUP_CYCLES  0u
+
+/* Packets a host enhancement adds in its GPU-DMA aperture are not guest
+ * work: reading them costs no guest time, so the game's frame timing and
+ * DMA completion stay those of its own list. */
+static uint32_t node_cycles(uint32_t address, uint32_t cycles) {
+    return address >= PSX_MOD_GPU_DMA_APERTURE_BASE && address < 0x01000000u
+        ? 0u : cycles;
+}
 
 static uint32_t resolve_address(const DMAGPULinkedListOps *ops, void *opaque,
                                 uint32_t address) {
@@ -92,7 +101,8 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
                 state->previous_addr = state->current_addr;
                 state->current_addr = resolve_address(
                     ops, opaque, state->next_addr);
-                state->cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
+                state->cycles_remaining =
+                    node_cycles(state->current_addr, DMA_GPU_LL_HEADER_CYCLES);
             }
         } else if (state->phase == DMA_GPU_LL_PHASE_SETUP) {
             state->emit_node = ops->begin_node
@@ -100,7 +110,7 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
                       opaque, state->current_addr, state->word_count) != 0)
                 : 1u;
             state->phase = DMA_GPU_LL_PHASE_PAYLOAD;
-            state->cycles_remaining = 1u;
+            state->cycles_remaining = node_cycles(state->current_addr, 1u);
         } else if (state->phase == DMA_GPU_LL_PHASE_PAYLOAD) {
             uint32_t word_addr = resolve_address(
                 ops, opaque, state->current_addr + 4u +
@@ -114,7 +124,7 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
             state->total_words++;
 
             if (state->payload_index < state->word_count) {
-                state->cycles_remaining = 1u;
+                state->cycles_remaining = node_cycles(state->current_addr, 1u);
             } else if (state->next_addr == 0x00FFFFFFu) {
                 finish(state, ops, opaque);
                 return;
@@ -123,7 +133,8 @@ void dma_gpu_ll_advance(DMAGPULinkedList *state, uint32_t cycles,
                 state->previous_addr = state->current_addr;
                 state->current_addr = resolve_address(
                     ops, opaque, state->next_addr);
-                state->cycles_remaining = DMA_GPU_LL_HEADER_CYCLES;
+                state->cycles_remaining =
+                    node_cycles(state->current_addr, DMA_GPU_LL_HEADER_CYCLES);
             }
         } else {
             state->hit_limit = 1;

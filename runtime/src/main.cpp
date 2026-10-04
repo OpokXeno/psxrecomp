@@ -432,6 +432,7 @@ static bool xg_render_host_semantic_module(uint32_t *out_module) {
     case 0x00000004u: *out_module = XG_SEMANTIC_MODULE_FIELD;  return true;
     case 0x00000005u: *out_module = XG_SEMANTIC_MODULE_WORLD;  return true;
     case 0x00000006u: *out_module = XG_SEMANTIC_MODULE_BATTLE; return true;
+    case 0x00000007u: *out_module = XG_SEMANTIC_MODULE_BATTLING; return true;
     default: break;
     }
 
@@ -784,7 +785,10 @@ static int native_presenter_thread_main(void *) {
 
 /* Native compile and phase workers allocate multi-megabyte buffers that other
  * threads free. glibc keeps those holes in each worker's arena instead of
- * returning them, so release free pages to the OS on a slow cadence. */
+ * returning them, so release free pages to the OS on a slow cadence, but only
+ * a large surplus: those buffers are reallocated every frame, and trimming the
+ * working set makes the next frames fault it back in (zero-fill faults plus
+ * huge page attempts that wake kswapd and push other programs to swap). */
 static void native_heap_trimmer_start() {
 #if defined(__GLIBC__)
     static std::once_flag once;
@@ -792,6 +796,9 @@ static void native_heap_trimmer_start() {
         std::thread([] {
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
+#if __GLIBC_PREREQ(2, 33)
+                if (mallinfo2().fordblks < (size_t{1} << 30)) continue;
+#endif
                 (void)malloc_trim(0);
             }
         }).detach();
@@ -14353,6 +14360,14 @@ int main(int argc, char** argv) {
     std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
+#if defined(__GLIBC__)
+    /* Per-frame buffers of a few MB (phase journals, VRAM word copies,
+     * projections) would otherwise be mmapped and unmapped every frame:
+     * thousands of fresh page faults per second. Serve them from the heap
+     * (32 MB is glibc's maximum threshold) and keep freed heap tops. */
+    (void)mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
+    (void)mallopt(M_TRIM_THRESHOLD, 256 * 1024 * 1024);
+#endif
 #if defined(RECOMP_LAUNCHER)
     launcher_boot_timing_mark("host:main_enter");
 #endif
@@ -17887,8 +17902,19 @@ session_reboot:
              * the integer MAC0 rounds a nearly edge-on face to zero and the
              * guest's own backface branch then flickers. Apply it whenever the
              * native render owns the frame, at 4:3 as well. */
-            return g_native_render_selected && physical >= 0x2c700u && physical < 0x315a0u &&
-                xg_render_host_native_text_authorizes_pc(0x8002c700u);
+            if (!g_native_render_selected) return 0;
+            if (physical >= 0x2c700u && physical < 0x315a0u)
+                return xg_render_host_native_text_authorizes_pc(0x8002c700u);
+            /* Overlay terrain cells branch on NCLIP the same way: the
+             * World Map ground (WorldMapEmitGroundCellTriangles) and the
+             * Battling arena heightfield (BattlingRenderVisibleTerrainStrips).
+             * Their resident overlay tag and the NCLIP word itself gate it;
+             * the native producers replay the same exact sign. */
+            const uint32_t tag = psx_read_word(0x8006faf0u);
+            const bool terrain_nclip =
+                (tag == 5u && (physical == 0x999acu || physical == 0x99b18u)) ||
+                (tag == 7u && (physical == 0x72e84u || physical == 0x72f3cu));
+            return terrain_nclip && psx_read_word(pc) == 0x4b400006u;
         });
         ram_provenance_set_cpu_tracking(g_native_render_selected);
         /* Native work consumes GP0 packets directly: the preflight binding's

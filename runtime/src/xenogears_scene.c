@@ -14,6 +14,8 @@ enum {
     XG_MODULE_ACTIVE = 0x800592C0u,
     XG_MODULE_POINTER = 0x800592BCu,
     XG_GAME_PROGRESS = 0x8006EF64u,
+    XG_OVERLAY_TAG = 0x8006FAF0u,
+    XG_OVERLAY_FIELD = 4u,
     XG_FIELD_ID_MASK = 0x07FFu,
     XG_FIELD_ID_LIMIT = 0x0400u,
 };
@@ -67,7 +69,11 @@ void psx_xenogears_read_scene(XgScene *out)
     scene.module_pointer = read_u32(XG_MODULE_POINTER);
     scene.raw_field_id = read_u16(XG_FIELD_ID);
     scene.masked_field_id = scene.raw_field_id & XG_FIELD_ID_MASK;
-    if (valid_pointer(scene.field_context)) {
+    /* The field context is Field overlay state. Other overlays reuse that
+     * RAM (Battling's second ordering table spans it), so it names a field
+     * only while the Field overlay is resident. */
+    if (read_u32(XG_OVERLAY_TAG) == XG_OVERLAY_FIELD &&
+        valid_pointer(scene.field_context)) {
         scene.field_id = scene.masked_field_id;
         scene.game_progress = read_u16(XG_GAME_PROGRESS);
         scene.valid_field = (uint8_t)(scene.masked_field_id < XG_FIELD_ID_LIMIT);

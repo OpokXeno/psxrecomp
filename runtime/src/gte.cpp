@@ -665,6 +665,76 @@ extern "C" void gte_native_provenance_cpu_cop2(
     }
 }
 
+/* Projection tap (gte_native_provenance.h). Open-addressed by packed SXY; a
+ * slot from an older generation is free. */
+static constexpr uint32_t kProjectionTapSlots = 8192u;
+struct ProjectionTapSlot {
+    uint32_t packed_sxy;
+    uint32_t generation;
+    GteNativeVertexProvenance vertex;
+};
+static ProjectionTapSlot *s_projection_tap;
+static uint32_t s_projection_tap_ranges[GTE_NATIVE_PROJECTION_TAP_MAX_RANGES][2];
+static uint32_t s_projection_tap_range_count;
+static uint32_t s_projection_tap_generation = 2u;
+static uint32_t s_gte_exec_pc;
+static bool s_gte_exec_pc_known;
+
+extern "C" void gte_native_projection_tap_configure(
+        const uint32_t (*ranges)[2], uint32_t count) {
+    if (count > GTE_NATIVE_PROJECTION_TAP_MAX_RANGES) count = 0u;
+    if (count != 0u && s_projection_tap == nullptr)
+        s_projection_tap = static_cast<ProjectionTapSlot *>(
+            calloc(kProjectionTapSlots, sizeof(ProjectionTapSlot)));
+    if (s_projection_tap == nullptr) count = 0u;
+    for (uint32_t i = 0; i < count; ++i) {
+        s_projection_tap_ranges[i][0] = ranges[i][0] & 0x1fffffffu;
+        s_projection_tap_ranges[i][1] = ranges[i][1] & 0x1fffffffu;
+    }
+    s_projection_tap_range_count = count;
+}
+
+extern "C" void gte_native_projection_tap_advance(void) {
+    if (++s_projection_tap_generation < 2u) s_projection_tap_generation = 2u;
+}
+
+/* Expired slots are skipped, not chain ends: a live key may sit past one. */
+static ProjectionTapSlot *projection_tap_probe(uint32_t packed_sxy, bool insert) {
+    uint32_t index = (packed_sxy * 2654435761u) & (kProjectionTapSlots - 1u);
+    ProjectionTapSlot *free_slot = nullptr;
+    for (uint32_t probe = 0; probe < 32u; ++probe) {
+        ProjectionTapSlot *slot = &s_projection_tap[index];
+        const bool live = slot->generation + 1u >= s_projection_tap_generation;
+        if (live && slot->packed_sxy == packed_sxy) return slot;
+        if (!live && free_slot == nullptr) free_slot = slot;
+        index = (index + 1u) & (kProjectionTapSlots - 1u);
+    }
+    return insert ? free_slot : nullptr;
+}
+
+static void projection_tap_record(const GteNativeVertexProvenance &vertex) {
+    if (s_projection_tap_range_count == 0u || !s_gte_exec_pc_known) return;
+    const uint32_t pc = s_gte_exec_pc & 0x1fffffffu;
+    bool inside = false;
+    for (uint32_t i = 0; i < s_projection_tap_range_count && !inside; ++i)
+        inside = pc >= s_projection_tap_ranges[i][0] && pc < s_projection_tap_ranges[i][1];
+    if (!inside) return;
+    ProjectionTapSlot *slot = projection_tap_probe(vertex.packed_sxy, true);
+    if (slot == nullptr) return;
+    slot->packed_sxy = vertex.packed_sxy;
+    slot->generation = s_projection_tap_generation;
+    slot->vertex = vertex;
+}
+
+extern "C" int gte_native_projection_tap_lookup(
+        uint32_t packed_sxy, GteNativeVertexProvenance *out) {
+    if (s_projection_tap_range_count == 0u || out == nullptr) return 0;
+    const ProjectionTapSlot *slot = projection_tap_probe(packed_sxy, false);
+    if (slot == nullptr) return 0;
+    *out = slot->vertex;
+    return 1;
+}
+
 static void native_projection_push(
         int32_t x_16_16, int32_t y_16_16, int32_t view_x,
         int32_t view_y, int32_t view_z, int32_t offset_x_16_16,
@@ -703,6 +773,7 @@ static void native_projection_push(
     slot->x_origin = NATIVE_PROJECTION_ORIGIN_X;
     slot->y_origin = NATIVE_PROJECTION_ORIGIN_Y;
     s_native_projection_gte[3] = *slot;
+    projection_tap_record(slot->vertex);
 }
 
 static void native_projection_kill_gte_reg(uint8_t reg) {
@@ -2584,6 +2655,8 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd,
         }
     }
     s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
+    s_gte_exec_pc = guest_pc;
+    s_gte_exec_pc_known = guest_pc_known;
 
     GTEState gte;
     gte_import_cpu_state(&gte, cpu);

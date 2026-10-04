@@ -51,6 +51,10 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
 
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address);
+/* Host view of an allocated aperture span (NULL outside it), for host
+ * producers that build their packets there. Aperture writes have no guest
+ * side effects, so this is the same as storing word by word. */
+uint8_t *psx_mod_gpu_dma_host(uint32_t address, uint32_t size);
 uint32_t psx_mod_memory_alloc(uint32_t size, uint32_t alignment);
 /* Allocations are fixed during activation. Snapshot allocated bytes, never
  * host pointers; immutable host assets are reconstructed separately. */

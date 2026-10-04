@@ -71,6 +71,7 @@
 #include "gpu_vram_region_set.h"
 #include "psx_render_nclip.h"
 #include "xg_render_motion.h"
+#include "xg_render_native_mesh.h"
 #include "xg_render_semantic_presentation.h"
 #include "latency_ring.h"
 #include "debug_overlay.h"
@@ -1380,6 +1381,38 @@ typedef struct GlNativeRecipeReads {
     GpuVramRegionSet words;
     uint16_t indices[VRAM_H * GPU_VRAM_REGION_WORDS_PER_ROW];
 } GlNativeRecipeReads;
+/* The material fields a batch may vary per triangle: which texels and how
+ * they combine. Clip area, offsets, texture window, dither and mask bits
+ * stay the command's (or recipe record's) own. */
+typedef struct GlNativeTextureState {
+    uint16_t tpage, page_x, page_y, clut_x, clut_y;
+    uint8_t texture_depth, shading, textured, raw_texture, semi_transparent, blend_mode;
+} GlNativeTextureState;
+static inline GlNativeTextureState native_texture_state(const XgRenderIrMaterialState *m) {
+    return (GlNativeTextureState){m->tpage, m->texture_page_x, m->texture_page_y, m->clut_x, m->clut_y,
+        (uint8_t)m->texture_depth, (uint8_t)m->shading, m->textured, m->raw_texture,
+        m->semi_transparent, (uint8_t)m->blend_mode};
+}
+static inline void native_texture_state_apply(XgRenderIrMaterialState *m, const GlNativeTextureState *t) {
+    m->tpage = t->tpage; m->texture_page_x = t->page_x; m->texture_page_y = t->page_y;
+    m->clut_x = t->clut_x; m->clut_y = t->clut_y;
+    m->texture_depth = (XgRenderIrTextureDepth)t->texture_depth;
+    m->shading = (XgRenderIrShading)t->shading;
+    m->textured = t->textured; m->raw_texture = t->raw_texture;
+    m->semi_transparent = t->semi_transparent;
+    m->blend_mode = (XgRenderIrBlendMode)t->blend_mode;
+}
+static inline int native_texture_state_equal(const GlNativeTextureState *a, const GlNativeTextureState *b) {
+    return a->tpage == b->tpage && a->page_x == b->page_x && a->page_y == b->page_y &&
+        a->clut_x == b->clut_x && a->clut_y == b->clut_y && a->texture_depth == b->texture_depth &&
+        a->shading == b->shading && a->textured == b->textured && a->raw_texture == b->raw_texture &&
+        a->semi_transparent == b->semi_transparent && a->blend_mode == b->blend_mode;
+}
+static inline GlNativeTextureState native_texture_state_semantic(const GpuRenderMaterial *m) {
+    return (GlNativeTextureState){m->tpage, m->texture_page_x, m->texture_page_y, m->clut_x, m->clut_y,
+        (uint8_t)m->texture_depth, (uint8_t)m->shading, m->textured, m->raw_texture,
+        m->semi_transparent, (uint8_t)m->blend_mode};
+}
 typedef struct GlNativeRecipeDraw {
     GpuRenderSemantic semantic; /* target-local coordinates; no packet pointers */
     GlNativeRecipePixels *textures; /* Immutable texels at this draw's execution. */
@@ -1393,7 +1426,41 @@ typedef struct GlNativeRecipeDraw {
     uint8_t dither_x, dither_y;
     uint16_t view_origin_y;
     GpuRenderHdTexture hd_texture; /* page-relative, survives relocation */
+    /* A MESH: semantic is its material template (no triangles); the shared
+     * expansion holds them in guest coordinates, relocated by
+     * projection_offset_x/y at replay exactly like semantic was. */
+    struct GlNativeRecipeMesh *mesh;
 } GlNativeRecipeDraw;
+/* An expanded MESH operation: immutable once built, shared by the recipes
+ * that replay it (counted on the compile owner, read by phase workers). */
+typedef struct GlNativeRecipeMesh {
+    uint32_t references, count;
+    uint32_t capacity;
+    /* Coalesced guest draws (native_recipe_coalesce): triangles already
+     * relocated into the recipe target, each with its own texture state
+     * (textures, capacity entries), grown in place while one recipe alone
+     * holds them. A MESH operation's expansion is not relocated and uses
+     * its record's texture state (textures NULL). */
+    uint8_t relocated;
+    GlNativeTextureState *textures;
+    /* Coalesced runs may also cross objects: each triangle's own pose
+     * (recipe motion index and part) and owner identity (capacity entries;
+     * NULL: the record's). */
+    struct GlNativeRecipeMeshPose *poses;
+    XgRenderNativeMeshTriangle triangles[];
+} GlNativeRecipeMesh;
+typedef struct GlNativeRecipeMeshPose {
+    uint64_t scene_id;
+    uint32_t motion_index, part, producer_id;
+    uint8_t identity_valid;
+} GlNativeRecipeMeshPose;
+static inline int native_recipe_pose_equal(const GlNativeRecipeMeshPose *a, const GlNativeRecipeMeshPose *b) {
+    return a->scene_id == b->scene_id && a->motion_index == b->motion_index && a->part == b->part &&
+        a->producer_id == b->producer_id && a->identity_valid == b->identity_valid;
+}
+static void native_recipe_mesh_release(GlNativeRecipeMesh *mesh) {
+    if (mesh && !--mesh->references) { free(mesh->textures); free(mesh->poses); free(mesh); }
+}
 typedef struct GlNativeRecipeCoverage {
     XgSemanticResourceRef reference;
     XgRenderTemporalCoverageView view;
@@ -1431,6 +1498,10 @@ typedef struct GlNativeRecipe {
     /* Words depending on this replay's framebuffer, including COPY/draw aliases.
      * External rendered textures are otherwise immutable discrete inputs. */
     GpuVramRegionSet feedback;
+    /* Recent feedback-region answers for texture page and CLUT rectangles,
+     * which consecutive draws keep asking; every feedback write clears it. */
+    struct { int16_t x, y, w, h; uint8_t result; } feedback_cache[4];
+    uint32_t feedback_cache_count, feedback_cache_next;
     uint32_t draw_capacity;
     GlNativeRecipeDraw *draws;
 } GlNativeRecipe;
@@ -1571,6 +1642,9 @@ typedef struct GlNativeViewTarget {
     uint32_t wave_count;
     int wave_invalid;
     GlNativeRecipe *recipe;
+    /* Draws of its recent recipes: the next recipe's initial reserve, even
+     * when the previous one was dropped before the new frame began. */
+    uint32_t recipe_draws;
     /* Covered the scanout since its recipe began: the next declaration of a
      * snapshot-based target starts a new frame. */
     int displayed;
@@ -1659,13 +1733,64 @@ typedef enum GlNativeGpuOp { NATIVE_GPU_SEED, NATIVE_GPU_DRAW, NATIVE_GPU_WORDS,
 /* SPAN sources at or above this index sample a persistent recipe base plane
  * (one per VIEW target) instead of a same-work snapshot. */
 #define GL_NATIVE_GPU_BASE_SOURCE GL_NATIVE_GPU_PLANES
+/* One triangle of a mesh DRAW, with its own texture state. */
+typedef struct GlNativeGpuMeshTriangle {
+    XgRenderIrTriangle triangle;
+    GlNativeTextureState texture;
+} GlNativeGpuMeshTriangle;
+
 typedef struct GlNativeGpuCommand {
     GlNativeGpuOp kind;
     uint32_t plane, source, data, color, mask;
+    /* A mesh DRAW: mesh_count GlNativeGpuMeshTriangle at `data` in its
+     * journal's data blob, under draw's material with each triangle's own
+     * texture state; draw.primitive holds none. */
+    uint32_t mesh_count;
     int x, y, w, h;
     float sx, sy, sw, sh;
     XgSemanticDrawRecord draw;
 } GlNativeGpuCommand;
+
+static inline uint32_t native_gpu_command_triangles(const GlNativeGpuCommand *command) {
+    return command->mesh_count ? command->mesh_count : command->draw.primitive.triangle_count;
+}
+
+/* data: the blob of the journal (work, published slice or phase chunk) that
+ * holds this command. */
+static inline const XgRenderIrTriangle *native_gpu_command_triangle(
+        const GlNativeGpuCommand *command, const uint8_t *data, uint32_t triangle) {
+    return command->mesh_count
+        ? &((const GlNativeGpuMeshTriangle *)(const void *)(data + command->data))[triangle].triangle
+        : &command->draw.primitive.triangles[triangle];
+}
+
+/* A triangle's complete material: the command's, with a mesh triangle's own
+ * texture state applied in scratch. */
+static inline const XgRenderIrMaterialState *native_gpu_command_material(
+        const GlNativeGpuCommand *command, const uint8_t *data, uint32_t triangle,
+        XgRenderIrMaterialState *scratch) {
+    if (!command->mesh_count) return &command->draw.primitive.material;
+    *scratch = command->draw.primitive.material;
+    native_texture_state_apply(scratch,
+        &((const GlNativeGpuMeshTriangle *)(const void *)(data + command->data))[triangle].texture);
+    return scratch;
+}
+
+/* The per-triangle material flags vertex and raster setup read, without
+ * materializing the whole material. */
+typedef struct GlNativeTriangleFlags { uint8_t textured, gouraud, semi_transparent; } GlNativeTriangleFlags;
+static inline GlNativeTriangleFlags native_gpu_command_flags(const GlNativeGpuCommand *command,
+                                                             const uint8_t *data, uint32_t triangle) {
+    if (command->mesh_count) {
+        const GlNativeTextureState *texture =
+            &((const GlNativeGpuMeshTriangle *)(const void *)(data + command->data))[triangle].texture;
+        return (GlNativeTriangleFlags){texture->textured != 0u,
+            texture->shading == XG_RENDER_IR_SHADING_GOURAUD, texture->semi_transparent != 0u};
+    }
+    const XgRenderIrMaterialState *m = &command->draw.primitive.material;
+    return (GlNativeTriangleFlags){m->textured != 0u, m->shading == XG_RENDER_IR_SHADING_GOURAUD,
+        m->semi_transparent != 0u};
+}
 typedef struct GlNativeGpuGeometry GlNativeGpuGeometry;
 struct GlNativeGpuWork;
 static GlNativeGpuGeometry *native_gpu_geometry_prepare(const struct GlNativeGpuWork *work);
@@ -1870,6 +1995,7 @@ typedef struct GlNativeRecipeDropEvent {
     GpuRenderMaterial material;
 } GlNativeRecipeDropEvent;
 static volatile GlNativeRecipeDropEvent s_native_recipe_drop_events[32];
+
 static volatile uint64_t s_native_recipe_drop_total;
 static GlNativeRecipeDropEvent s_native_recipe_texture_read;
 static uint64_t s_native_pending_present_sequence;
@@ -2485,6 +2611,40 @@ static uint64_t pres_hash_bytes(const uint8_t *bytes, size_t size) {
     return hash;
 }
 
+/* Scaled GPU image digest: four independent multiply chains over 32-byte
+ * blocks (one serial chain is latency bound on multi-megabyte readbacks),
+ * folded together, with the visible-pixel count in the same pass. Only ever
+ * compared with other GPU image digests. */
+static uint64_t native_gpu_image_digest(const void *pixels, size_t size, uint64_t *visible) {
+    const uint8_t *bytes = pixels;
+    uint64_t lanes[4] = {GL_PRESENT_HASH_FNV_OFFSET, GL_PRESENT_HASH_FNV_OFFSET ^ 1u,
+                         GL_PRESENT_HASH_FNV_OFFSET ^ 2u, GL_PRESENT_HASH_FNV_OFFSET ^ 3u};
+    uint64_t count = 0u;
+    size_t index = 0u;
+    for (; index + 32u <= size; index += 32u) {
+        uint64_t words[4];
+        memcpy(words, bytes + index, sizeof(words));
+        for (unsigned lane = 0u; lane < 4u; ++lane) {
+            lanes[lane] = pres_hash_word(lanes[lane], words[lane]);
+            if (visible)
+                count += ((words[lane] & UINT64_C(0x00ffffff)) != 0u) +
+                         ((words[lane] & UINT64_C(0x00ffffff00000000)) != 0u);
+        }
+    }
+    uint64_t hash = GL_PRESENT_HASH_FNV_OFFSET;
+    for (unsigned lane = 0u; lane < 4u; ++lane) hash = pres_hash_word(hash, lanes[lane]);
+    for (; index < size; ++index) hash = (hash ^ bytes[index]) * GL_PRESENT_HASH_FNV_PRIME;
+    if (visible) {
+        for (size_t p = (size / 32u) * 32u; p + 4u <= size; p += 4u) {
+            uint32_t rgba;
+            memcpy(&rgba, bytes + p, sizeof(rgba));
+            count += (rgba & UINT32_C(0x00ffffff)) != 0u;
+        }
+        *visible += count;
+    }
+    return hash;
+}
+
 static void pres_set_hash(uint64_t sequence, uint64_t hash) {
     if (sequence < s_pres_seq && s_pres_seq - sequence <= GL_PRES_RING_CAP) {
         GlPresEvent *event = &s_pres_ring[sequence % GL_PRES_RING_CAP];
@@ -2570,7 +2730,8 @@ static void pres_hash_collect(void) {
         if (bytes) {
             const uint64_t hash = pres_hash_bytes(bytes, slot->bytes);
             if (slot->kind == GL_PRESENT_HASH_SOURCE)
-                pres_set_source_hash(slot->sequence, hash);
+                /* Compared with the endpoint's GPU image digest. */
+                pres_set_source_hash(slot->sequence, native_gpu_image_digest(bytes, slot->bytes, NULL));
             else if (slot->kind == GL_PRESENT_HASH_PHASE_SURFACE)
                 pres_set_phase_surface_hash(slot->sequence, hash);
             else if (slot->kind == GL_PRESENT_HASH_PHASE_VRAM)
@@ -7818,8 +7979,41 @@ typedef struct GlNativeCpuCompiler {
     int banded, band_top, band_bottom;
     struct GlNativeViewWorker *view_worker;
     GlNativeViewState *native_views;
+    /* Mesh mode: the template draw carries no triangles; native_view_raster
+     * emits these (an XgRenderIrTriangle at mesh_base + i * mesh_stride,
+     * with the GlNativeTextureState at mesh_textures + i * mesh_stride, or
+     * the template's when mesh_textures is NULL), GPU only, as one mesh
+     * command. */
+    const uint8_t *mesh_base;
+    const uint8_t *mesh_textures;
+    /* Optional uint32_t flags at the same stride: PHASE_ONLY triangles are
+     * left out of this (endpoint) draw. */
+    const uint8_t *mesh_flags;
+    size_t mesh_stride;
+    uint32_t mesh_count;
+    /* Optional: the mesh is this caller's scratch, relocated in place. */
+    GlNativeGpuMeshTriangle *mesh_writable;
 } GlNativeCpuCompiler;
 static int native_gpu_draw(GlNativeCpuCompiler *, const XgSemanticDrawRecord *, int);
+static int native_gpu_draw_mesh(GlNativeCpuCompiler *, const XgSemanticDrawRecord *, int,
+                                const GlNativeGpuMeshTriangle *, uint32_t);
+
+/* Per-thread scratch triangles for mesh relocation (compile owner and phase
+ * workers each have their own). */
+static GlNativeGpuMeshTriangle *native_mesh_buffer(unsigned which, uint32_t count) {
+    static _Thread_local GlNativeGpuMeshTriangle *buffers[2];
+    static _Thread_local uint32_t capacities[2];
+    if (which > 1u) return NULL;
+    if (count > capacities[which]) {
+        uint32_t capacity = capacities[which] ? capacities[which] : 1024u;
+        while (capacity < count) capacity *= 2u;
+        GlNativeGpuMeshTriangle *grown = realloc(buffers[which], (size_t)capacity * sizeof(*grown));
+        if (!grown) return NULL;
+        buffers[which] = grown;
+        capacities[which] = capacity;
+    }
+    return buffers[which];
+}
 static int native_transition_texture(const GlNativeViewState *, const XgSemanticDrawRecord *);
 static int native_view_worker_drain(GlNativeCpuCompiler *, int, int, int, int);
 
@@ -8371,6 +8565,30 @@ static uint32_t native_psx_fragment(uint32_t destination, int r5, int g5, int b5
 
 /* Keep the transport conversion local: linking submission would pull producer
  * and authentication state into the otherwise independent render worker. */
+static void native_materialize_triangle(const GpuRenderSemanticTriangle *source_triangle,
+                                        XgRenderIrTriangle *triangle) {
+    triangle->split_index = source_triangle->split_index;
+    triangle->split_count = source_triangle->split_count;
+    for (uint32_t vi = 0u; vi < 3u; ++vi) {
+        XgRenderIrVertex *target = &triangle->vertices[vi];
+        const GpuRenderSemanticVertex *source = &source_triangle->vertices[vi];
+#define NATIVE_COPY_VERTEX(field) target->field = source->field
+        NATIVE_COPY_VERTEX(x); NATIVE_COPY_VERTEX(y); NATIVE_COPY_VERTEX(u); NATIVE_COPY_VERTEX(v);
+        NATIVE_COPY_VERTEX(r); NATIVE_COPY_VERTEX(g); NATIVE_COPY_VERTEX(b);
+        NATIVE_COPY_VERTEX(native_view_x); NATIVE_COPY_VERTEX(native_view_y);
+        NATIVE_COPY_VERTEX(native_view_position); NATIVE_COPY_VERTEX(native_view_depth);
+        NATIVE_COPY_VERTEX(projective_view_x); NATIVE_COPY_VERTEX(projective_view_y);
+        NATIVE_COPY_VERTEX(projective_view_z);
+        NATIVE_COPY_VERTEX(projective_offset_x); NATIVE_COPY_VERTEX(projective_offset_y);
+        NATIVE_COPY_VERTEX(projective_native_offset_x); NATIVE_COPY_VERTEX(projective_native_offset_y);
+        NATIVE_COPY_VERTEX(projective_distance); NATIVE_COPY_VERTEX(projective_position);
+        NATIVE_COPY_VERTEX(temporal_depth); NATIVE_COPY_VERTEX(temporal_depth_valid);
+        NATIVE_COPY_VERTEX(interpolation_group_id); NATIVE_COPY_VERTEX(interpolation_vertex_id);
+        NATIVE_COPY_VERTEX(interpolation_vertex_identity_valid);
+#undef NATIVE_COPY_VERTEX
+    }
+}
+
 static int native_materialize_native_draw(const GpuRenderSemantic *semantic,
                                       XgSemanticDrawRecord *draw) {
     if (semantic->triangle_count > XG_RENDER_IR_TRIANGLE_CAPACITY ||
@@ -8408,28 +8626,8 @@ static int native_materialize_native_draw(const GpuRenderSemantic *semantic,
     primitive->material.shading = (XgRenderIrShading)semantic->material.shading;
     primitive->material.blend_mode = (XgRenderIrBlendMode)semantic->material.blend_mode;
     primitive->triangle_count = semantic->triangle_count;
-    for (uint32_t ti = 0u; ti < semantic->triangle_count; ++ti) {
-        primitive->triangles[ti].split_index = semantic->triangles[ti].split_index;
-        primitive->triangles[ti].split_count = semantic->triangles[ti].split_count;
-        for (uint32_t vi = 0u; vi < 3u; ++vi) {
-            XgRenderIrVertex *target = &primitive->triangles[ti].vertices[vi];
-            const GpuRenderSemanticVertex *source = &semantic->triangles[ti].vertices[vi];
-#define NATIVE_COPY_VERTEX(field) target->field = source->field
-            NATIVE_COPY_VERTEX(x); NATIVE_COPY_VERTEX(y); NATIVE_COPY_VERTEX(u); NATIVE_COPY_VERTEX(v);
-            NATIVE_COPY_VERTEX(r); NATIVE_COPY_VERTEX(g); NATIVE_COPY_VERTEX(b);
-            NATIVE_COPY_VERTEX(native_view_x); NATIVE_COPY_VERTEX(native_view_y);
-            NATIVE_COPY_VERTEX(native_view_position); NATIVE_COPY_VERTEX(native_view_depth);
-            NATIVE_COPY_VERTEX(projective_view_x); NATIVE_COPY_VERTEX(projective_view_y);
-            NATIVE_COPY_VERTEX(projective_view_z);
-            NATIVE_COPY_VERTEX(projective_offset_x); NATIVE_COPY_VERTEX(projective_offset_y);
-            NATIVE_COPY_VERTEX(projective_native_offset_x); NATIVE_COPY_VERTEX(projective_native_offset_y);
-            NATIVE_COPY_VERTEX(projective_distance); NATIVE_COPY_VERTEX(projective_position);
-            NATIVE_COPY_VERTEX(temporal_depth); NATIVE_COPY_VERTEX(temporal_depth_valid);
-            NATIVE_COPY_VERTEX(interpolation_group_id); NATIVE_COPY_VERTEX(interpolation_vertex_id);
-            NATIVE_COPY_VERTEX(interpolation_vertex_identity_valid);
-#undef NATIVE_COPY_VERTEX
-        }
-    }
+    for (uint32_t ti = 0u; ti < semantic->triangle_count; ++ti)
+        native_materialize_triangle(&semantic->triangles[ti], &primitive->triangles[ti]);
     return 1;
 }
 
@@ -8595,8 +8793,9 @@ static int32_t native_vertex_depth_q12(const XgRenderIrVertex *vertex) {
 }
 
 /* The integer plane through the exact raster positions this rasterizer uses.
- * Planes whose gradients exceed the fixed-point range (edge-on slivers) have
- * no depth; that is decided once here, identically for both rasterizers. */
+ * Planes whose gradients exceed the fixed-point range (edge-on slivers, faces
+ * reaching up to the camera) take their farthest corner's key, flat; that is
+ * decided once here, identically for both rasterizers. */
 static int native_depth_plane(const XgRenderIrTriangle *triangle,
                               const double x[3], const double y[3], GlNativeDepthPlane *out) {
     double d[3];
@@ -8607,16 +8806,26 @@ static int native_depth_plane(const XgRenderIrTriangle *triangle,
     }
     const double area = (x[1]-x[0])*(y[2]-y[0]) - (x[2]-x[0])*(y[1]-y[0]);
     if (area == 0.0 || !isfinite(area)) return 0;
+    if (!isfinite(x[0]) || !isfinite(y[0]) || fabs(x[0]) > 1048576.0 || fabs(y[0]) > 1048576.0) return 0;
+    const double ox = floor(x[0]), oy = floor(y[0]);
     const double dx = ((d[1]-d[0])*(y[2]-y[0]) - (d[2]-d[0])*(y[1]-y[0])) / area;
     const double dy = ((x[1]-x[0])*(d[2]-d[0]) - (x[2]-x[0])*(d[1]-d[0])) / area;
-    if (!isfinite(dx) || !isfinite(dy) || !isfinite(x[0]) || !isfinite(y[0]) ||
-        fabs(x[0]) > 1048576.0 || fabs(y[0]) > 1048576.0) return 0;
-    const double ox = floor(x[0]), oy = floor(y[0]);
-    const double a = nearbyint(dx * 256.0), b = nearbyint(dy * 256.0);
-    const double n0 = nearbyint((d[0] + dx * (ox - x[0]) + dy * (oy - y[0])) * 256.0);
-    if (fabs(a) > GL_NATIVE_DEPTH_SLOPE_LIMIT || fabs(b) > GL_NATIVE_DEPTH_SLOPE_LIMIT ||
-        n0 < 256.0 || n0 >= 1073741824.0) return 0;
-    *out = (GlNativeDepthPlane){(int32_t)n0, (int32_t)a, (int32_t)b, (int32_t)ox, (int32_t)oy};
+    if (isfinite(dx) && isfinite(dy)) {
+        const double a = nearbyint(dx * 256.0), b = nearbyint(dy * 256.0);
+        const double n0 = nearbyint((d[0] + dx * (ox - x[0]) + dy * (oy - y[0])) * 256.0);
+        if (fabs(a) <= GL_NATIVE_DEPTH_SLOPE_LIMIT && fabs(b) <= GL_NATIVE_DEPTH_SLOPE_LIMIT &&
+            n0 >= 256.0 && n0 < 1073741824.0) {
+            *out = (GlNativeDepthPlane){(int32_t)n0, (int32_t)a, (int32_t)b, (int32_t)ox, (int32_t)oy};
+            return 1;
+        }
+    }
+    /* Too steep for the fixed-point plane (a face reaching right up to the
+     * camera, a near-plane clip): one constant key, its farthest corner's.
+     * It still occludes what lies behind all of it, and never covers
+     * anything in front of its far end (feet standing on that ground). */
+    const double far_key = fmin(fmin(d[0], d[1]), d[2]) * 256.0;
+    if (!isfinite(far_key) || far_key < 256.0) return 0;
+    *out = (GlNativeDepthPlane){(int32_t)fmin(far_key, 1073741823.0), 0, 0, (int32_t)ox, (int32_t)oy};
     return 1;
 }
 
@@ -9786,7 +9995,10 @@ static void native_recipe_release(GlNativeRecipe *recipe) {
         (void)xg_render_resource_release(recipe->motions[i].handle);
     for (uint32_t i = 0u; i < recipe->coverage_count; ++i)
         native_coverage_release_ref(recipe->coverages[i].reference);
-    for (uint32_t i = 0u; i < recipe->count; ++i) native_recipe_pixels_release(recipe->draws[i].textures);
+    for (uint32_t i = 0u; i < recipe->count; ++i) {
+        native_recipe_pixels_release(recipe->draws[i].textures);
+        native_recipe_mesh_release(recipe->draws[i].mesh);
+    }
     native_recipe_pixels_release(recipe->textures);
     free(recipe->draws);
     free(recipe->motions);
@@ -9796,6 +10008,9 @@ static void native_recipe_release(GlNativeRecipe *recipe) {
 
 static void native_recipe_drop_at(GlNativeViewTarget *target, uint32_t line, const char *caller) {
     if (target->recipe) {
+        const uint32_t count = target->recipe->count;
+        target->recipe_draws = count >= target->recipe_draws ? count
+            : target->recipe_draws - (target->recipe_draws - count) / 4u;
         volatile GlNativeRecipeDropEvent *event = &s_native_recipe_drop_events[s_native_recipe_drop_total % 32u];
         *event = s_native_recipe_texture_read;
         event->caller = caller; event->line = line;
@@ -9841,8 +10056,10 @@ static int native_recipe_private(GlNativeViewTarget *target) {
     copy->references = 1u;
     if (copy->publication) copy->publication->references++;
     if (copy->textures) copy->textures->references++;
-    for (uint32_t i = 0u; i < copy->count; ++i)
+    for (uint32_t i = 0u; i < copy->count; ++i) {
         if (copy->draws[i].textures) copy->draws[i].textures->references++;
+        if (copy->draws[i].mesh) copy->draws[i].mesh->references++;
+    }
     const uint32_t motion_count = copy->motion_count;
     copy->motion_count = 0u;
     const uint32_t coverage_count = copy->coverage_count;
@@ -10095,6 +10312,20 @@ static int native_recipe_region(const GpuVramRegionSet *set, int x, int y, int w
     return 0;
 }
 
+static int native_recipe_feedback_region(GlNativeRecipe *recipe, int x, int y, int w, int h) {
+    for (uint32_t i = 0u; i < recipe->feedback_cache_count; ++i)
+        if (recipe->feedback_cache[i].x == x && recipe->feedback_cache[i].y == y &&
+            recipe->feedback_cache[i].w == w && recipe->feedback_cache[i].h == h)
+            return recipe->feedback_cache[i].result;
+    const int result = native_recipe_region(&recipe->feedback, x, y, w, h);
+    const uint32_t slot = recipe->feedback_cache_next++ % 4u;
+    recipe->feedback_cache[slot].x = (int16_t)x; recipe->feedback_cache[slot].y = (int16_t)y;
+    recipe->feedback_cache[slot].w = (int16_t)w; recipe->feedback_cache[slot].h = (int16_t)h;
+    recipe->feedback_cache[slot].result = (uint8_t)result;
+    if (recipe->feedback_cache_count < 4u) recipe->feedback_cache_count++;
+    return result;
+}
+
 static int native_recipe_word(GlNativeRecipe *recipe,
                             const GlNativeViewTarget *target, const uint16_t *words,
                             int x, int y, int *changed) {
@@ -10169,6 +10400,37 @@ static void native_recipe_reads_clear(GlNativeRecipeReads *reads) {
         reads->words.rows[index/GPU_VRAM_REGION_WORDS_PER_ROW][index%GPU_VRAM_REGION_WORDS_PER_ROW]=0;
     }
     reads->words.nonzero_words=0;
+}
+
+/* Mark a VRAM word rectangle (wrapping in X at VRAM_W) and index its words. */
+static void native_recipe_reads_mark(GlNativeRecipeReads *reads, int x, int y, int width, int height) {
+    for (int part = 0; part < 2 && width > 0; ++part) {
+        const int x0 = x & (VRAM_W - 1), span = width < VRAM_W - x0 ? width : VRAM_W - x0;
+        for (int row = y; row < y + height && row < VRAM_H; ++row)
+            for (int word = x0 >> 6; word <= (x0 + span - 1) >> 6; ++word) {
+                const int first = word == x0 >> 6 ? x0 & 63 : 0;
+                const int last = word == (x0 + span - 1) >> 6 ? (x0 + span - 1) & 63 : 63;
+                uint64_t *bits = &reads->words.rows[row][word];
+                if (!*bits)
+                    reads->indices[reads->words.nonzero_words++] =
+                        (uint16_t)(row * GPU_VRAM_REGION_WORDS_PER_ROW + word);
+                *bits |= gpu_vram_region_word_mask(first, last);
+            }
+        x = 0; width -= span;
+    }
+}
+
+/* A mesh's reads: its whole texture page and CLUT row, a superset of the
+ * texels any of its triangles samples under that material. */
+static void native_recipe_mesh_reads(const GpuRenderSemantic *draw, GlNativeRecipeReads *reads) {
+    const GpuRenderMaterial *m = &draw->material;
+    native_recipe_reads_clear(reads);
+    if (!m->textured) return;
+    native_recipe_reads_mark(reads, m->texture_page_x * 64, m->texture_page_y * 256,
+                             64 << m->texture_depth, 256);
+    if (m->texture_depth != GPU_RENDER_TEXTURE_15_BIT)
+        native_recipe_reads_mark(reads, m->clut_x, m->clut_y,
+                                 m->texture_depth == GPU_RENDER_TEXTURE_4_BIT ? 16 : 256, 1);
 }
 
 static void native_recipe_texture_reads_uncached(const GpuRenderSemantic *draw, GlNativeRecipeReads *reads,
@@ -10596,86 +10858,248 @@ static int native_gpu_replay_texture(GlNativeGpuWork *work, const uint16_t *word
     return 1;
 }
 
-static int native_gpu_draw(GlNativeCpuCompiler *compiler, const XgSemanticDrawRecord *draw, int origin_y) {
-    GlNativeGpuWork *work = compiler->gpu;
-    const XgRenderIrMaterialState *m = &draw->primitive.material;
-    if (!work) return 1;
-    if (m->textured && compiler->gpu_only && compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE) {
-        if (!native_gpu_replay_texture(work, compiler->native_words, m)) return 0;
-    } else if (m->textured && (!compiler->native_vram || compiler->native_words != compiler->native_vram->words ||
-                       native_gpu_raw_texture_dirty(work, m))) {
-        if (!compiler->native_words) return 0;
-        /* Raw texels and draw destinations are separate resources. Synchronize
-         * dirty blocks in the sampled pages, including unused texels, instead
-         * of clipping every triangle to rediscover an exact read footprint.
-         * The canonical shadow is the completed preceding FIFO state. Recipe
-         * feedback/ownership still uses its exact read analysis separately. */
-        const int canonical = compiler->native_vram && compiler->native_words == compiler->native_vram->words;
-        for (unsigned page=0u;page<(1u<<m->texture_depth);++page) {
-            const unsigned block=(m->texture_page_x+page)&15u;
-            const uint16_t mask=(uint16_t)(1u<<block);
-            for (unsigned row=m->texture_page_y*256u;row<(m->texture_page_y+1u)*256u;++row) {
-                if (canonical && !(work->dirty_word_rows[row]&mask)) continue;
-                const uint32_t offset=row*VRAM_W+block*64u;
-                if (canonical) work->dirty_word_rows[row]&=(uint16_t)~mask;
-                if (!memcmp(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t))) continue;
-                GlNativeGpuCommand *patch=native_gpu_command(work,NATIVE_GPU_WORDS);
-                if (!patch) return 0;
-                patch->x=block*64u;patch->y=row;patch->w=64;
-                if (!native_gpu_data(work,compiler->native_words+offset,64u*sizeof(uint16_t),&patch->data)) return 0;
-                memcpy(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t));
-                if (!canonical) {
-                    work->dirty_word_rows[offset/VRAM_W]|=mask;
-                    work->dirty_texture_pages[offset/(VRAM_W*256u)]|=mask;
-                }
+/* Synchronize the raw-word texture with the pages and CLUT one material
+ * samples, before the draw that samples them. */
+static int native_gpu_sync_texture(GlNativeCpuCompiler *compiler, GlNativeGpuWork *work,
+                                   const XgRenderIrMaterialState *m) {
+    if (!m->textured) return 1;
+    if (compiler->gpu_only && compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE)
+        return native_gpu_replay_texture(work, compiler->native_words, m);
+    if (compiler->native_vram && compiler->native_words == compiler->native_vram->words &&
+        !native_gpu_raw_texture_dirty(work, m)) return 1;
+    if (!compiler->native_words) return 0;
+    /* Raw texels and draw destinations are separate resources. Synchronize
+     * dirty blocks in the sampled pages, including unused texels, instead
+     * of clipping every triangle to rediscover an exact read footprint.
+     * The canonical shadow is the completed preceding FIFO state. Recipe
+     * feedback/ownership still uses its exact read analysis separately. */
+    const int canonical = compiler->native_vram && compiler->native_words == compiler->native_vram->words;
+    for (unsigned page=0u;page<(1u<<m->texture_depth);++page) {
+        const unsigned block=(m->texture_page_x+page)&15u;
+        const uint16_t mask=(uint16_t)(1u<<block);
+        for (unsigned row=m->texture_page_y*256u;row<(m->texture_page_y+1u)*256u;++row) {
+            if (canonical && !(work->dirty_word_rows[row]&mask)) continue;
+            const uint32_t offset=row*VRAM_W+block*64u;
+            if (canonical) work->dirty_word_rows[row]&=(uint16_t)~mask;
+            if (!memcmp(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t))) continue;
+            GlNativeGpuCommand *patch=native_gpu_command(work,NATIVE_GPU_WORDS);
+            if (!patch) return 0;
+            patch->x=block*64u;patch->y=row;patch->w=64;
+            if (!native_gpu_data(work,compiler->native_words+offset,64u*sizeof(uint16_t),&patch->data)) return 0;
+            memcpy(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t));
+            if (!canonical) {
+                work->dirty_word_rows[offset/VRAM_W]|=mask;
+                work->dirty_texture_pages[offset/(VRAM_W*256u)]|=mask;
             }
-            if (canonical) work->dirty_texture_pages[m->texture_page_y]&=(uint16_t)~mask;
         }
-        if (m->texture_depth!=XG_RENDER_IR_TEXTURE_15_BIT) {
-            const unsigned entries=m->texture_depth==XG_RENDER_IR_TEXTURE_4_BIT?16u:256u;
-            const unsigned blocks=((m->clut_x&63u)+entries+63u)/64u;
-            for (unsigned i=0u;i<blocks;++i) {
-                const unsigned block=(m->clut_x/64u+i)&15u;
-                const uint16_t mask=(uint16_t)(1u<<block);
-                if (canonical && !(work->dirty_word_rows[m->clut_y]&mask)) continue;
-                const uint32_t offset=m->clut_y*VRAM_W+block*64u;
-                if (canonical) work->dirty_word_rows[m->clut_y]&=(uint16_t)~mask;
-                if (!memcmp(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t))) continue;
-                GlNativeGpuCommand *patch=native_gpu_command(work,NATIVE_GPU_WORDS);
-                if (!patch) return 0;
-                patch->x=block*64u;patch->y=m->clut_y;patch->w=64;
-                if (!native_gpu_data(work,compiler->native_words+offset,64u*sizeof(uint16_t),&patch->data)) return 0;
-                memcpy(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t));
-                if (!canonical) {
-                    work->dirty_word_rows[offset/VRAM_W]|=mask;
-                    work->dirty_texture_pages[offset/(VRAM_W*256u)]|=mask;
-                }
+        if (canonical) work->dirty_texture_pages[m->texture_page_y]&=(uint16_t)~mask;
+    }
+    if (m->texture_depth!=XG_RENDER_IR_TEXTURE_15_BIT) {
+        const unsigned entries=m->texture_depth==XG_RENDER_IR_TEXTURE_4_BIT?16u:256u;
+        const unsigned blocks=((m->clut_x&63u)+entries+63u)/64u;
+        for (unsigned i=0u;i<blocks;++i) {
+            const unsigned block=(m->clut_x/64u+i)&15u;
+            const uint16_t mask=(uint16_t)(1u<<block);
+            if (canonical && !(work->dirty_word_rows[m->clut_y]&mask)) continue;
+            const uint32_t offset=m->clut_y*VRAM_W+block*64u;
+            if (canonical) work->dirty_word_rows[m->clut_y]&=(uint16_t)~mask;
+            if (!memcmp(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t))) continue;
+            GlNativeGpuCommand *patch=native_gpu_command(work,NATIVE_GPU_WORDS);
+            if (!patch) return 0;
+            patch->x=block*64u;patch->y=m->clut_y;patch->w=64;
+            if (!native_gpu_data(work,compiler->native_words+offset,64u*sizeof(uint16_t),&patch->data)) return 0;
+            memcpy(work->words+offset,compiler->native_words+offset,64u*sizeof(uint16_t));
+            if (!canonical) {
+                work->dirty_word_rows[offset/VRAM_W]|=mask;
+                work->dirty_texture_pages[offset/(VRAM_W*256u)]|=mask;
             }
         }
     }
-    GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_DRAW);
-    if (!command) return 0;
-    command->plane = compiler->gpu_plane; command->draw = *draw;
+    return 1;
+}
+
+/* Journal-level batching. A DRAW whose render state equals that of the
+ * latest unpublished DRAW on its plane, but for its texture state, appends
+ * its triangles (each with its own texture state) to that command, which
+ * becomes (or stays) a mesh in the data blob: GL executes the same
+ * triangles in the same per-plane order, with the shared state evaluated
+ * once per texture change. The GL owner already groups a pure DRAW run by
+ * plane, so looking back over other planes' draws keeps every plane's own
+ * order. A texture sync between two draws ends the run (WORDS is not a
+ * DRAW). Plane 0 (canonical) interleaves single triangles and never
+ * coalesces; VIEW and phase planes keep a run's data contiguous at the blob
+ * end. */
+static int native_gpu_draw_state_equal(const XgSemanticDrawRecord *a, const XgSemanticDrawRecord *b,
+                                       uint8_t dither) {
+    const XgRenderIrMaterialState *x = &a->primitive.material, *y = &b->primitive.material;
+    return a->topology == GPU_RENDER_SEMANTIC_TRIANGLES && b->topology == GPU_RENDER_SEMANTIC_TRIANGLES &&
+        !a->line_count && !b->line_count &&
+        x->draw_area_left == y->draw_area_left && x->draw_area_top == y->draw_area_top &&
+        x->draw_area_right == y->draw_area_right && x->draw_area_bottom == y->draw_area_bottom &&
+        x->draw_offset_x == y->draw_offset_x && x->draw_offset_y == y->draw_offset_y &&
+        x->texture_window_mask_x == y->texture_window_mask_x &&
+        x->texture_window_mask_y == y->texture_window_mask_y &&
+        x->texture_window_offset_x == y->texture_window_offset_x &&
+        x->texture_window_offset_y == y->texture_window_offset_y &&
+        x->dither == (dither != 0u) && x->mask_set == y->mask_set && x->mask_check == y->mask_check &&
+        a->primitive.depth_policy == b->primitive.depth_policy &&
+        a->primitive.depth_bias == b->primitive.depth_bias &&
+        a->primitive.aa_exempt == b->primitive.aa_exempt &&
+        a->primitive.sprite_texture == b->primitive.sprite_texture &&
+        a->screen_space_2d == b->screen_space_2d && a->aa_exempt == b->aa_exempt &&
+        a->sprite_texture == b->sprite_texture && a->native_view_effect == b->native_view_effect &&
+        a->native_view_effect_index == b->native_view_effect_index &&
+        !memcmp(&a->hd_texture, &b->hd_texture, sizeof(a->hd_texture));
+}
+
+static GlNativeGpuCommand *native_gpu_coalesce_target(GlNativeGpuWork *work, uint32_t plane,
+                                                      const XgSemanticDrawRecord *draw, uint8_t dither,
+                                                      int x, int y) {
+    for (uint32_t i = work->count, seen = 0u; i-- > work->published_count && seen < 8u; ++seen) {
+        GlNativeGpuCommand *command = &work->commands[i];
+        if (command->kind != NATIVE_GPU_DRAW || command->source) return NULL;
+        if (command->plane != plane) continue;
+        return command->x == x && command->y == y &&
+            native_gpu_draw_state_equal(&command->draw, draw, dither) ? command : NULL;
+    }
+    return NULL;
+}
+
+static int native_gpu_mesh_data(GlNativeGpuWork *work, const GlNativeGpuMeshTriangle *triangles,
+                                uint32_t count, uint32_t *offset) {
+    /* 8-byte aligned triangles in this journal's blob. */
+    static const uint8_t pad[8];
+    uint32_t ignored;
+    if ((work->bytes & 7u) && !native_gpu_data(work, pad, 8u - (work->bytes & 7u), &ignored)) return 0;
+    return native_gpu_data(work, triangles, (size_t)count * sizeof(*triangles), offset);
+}
+
+static int native_gpu_coalesce_append(GlNativeGpuWork *work, GlNativeGpuCommand *run,
+                                      const GlNativeGpuMeshTriangle *triangles, uint32_t count) {
+    uint32_t offset;
+    if (!count) return 1;
+    if (run->mesh_count && run->data + (size_t)run->mesh_count * sizeof(*triangles) != work->bytes) {
+        /* Another mesh was stored after this run: start a new command. */
+        GlNativeGpuCommand copy = *run;
+        if (!native_gpu_mesh_data(work, triangles, count, &offset)) return 0;
+        GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_DRAW);
+        if (!command) return 0;
+        *command = copy;
+        command->data = offset; command->mesh_count = count;
+        return 1;
+    }
+    if (!run->mesh_count) {
+        /* Move the run's inline triangles to the blob first. */
+        GlNativeGpuMeshTriangle inline_triangles[XG_RENDER_IR_TRIANGLE_CAPACITY];
+        const uint32_t inline_count = run->draw.primitive.triangle_count;
+        memset(inline_triangles, 0, sizeof(inline_triangles));
+        for (uint32_t t = 0u; t < inline_count; ++t) {
+            inline_triangles[t].triangle = run->draw.primitive.triangles[t];
+            inline_triangles[t].texture = native_texture_state(&run->draw.primitive.material);
+        }
+        if (!native_gpu_mesh_data(work, inline_triangles, inline_count, &offset)) return 0;
+        run->data = offset;
+        run->mesh_count = inline_count;
+        run->draw.primitive.triangle_count = 0u;
+    }
+    if (!native_gpu_data(work, triangles, (size_t)count * sizeof(*triangles), &offset)) return 0;
+    run->mesh_count += count;
+    return 1;
+}
+
+/* The depth view's key range, now that no CPU raster writes fragments:
+ * the keys (2^40 / Q12 view Z, as native_depth_plane) of the on-screen
+ * corners of the endpoint's depth-writing triangles. */
+static void native_gpu_note_depth_range(GlNativeCpuCompiler *compiler, const XgSemanticDrawRecord *draw,
+                                        const GlNativeGpuMeshTriangle *mesh, uint32_t mesh_count) {
+    if (!compiler->audit || compiler->gpu_plane == 0u || compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE ||
+        !compiler->native_views || !compiler->native_views->depth_test ||
+        draw->primitive.depth_policy != GPU_RENDER_DEPTH_TEST_WRITE) return;
+    const uint32_t count = mesh ? mesh_count : draw->primitive.triangle_count;
+    const int32_t width = (int32_t)compiler->viewport_width, height = (int32_t)compiler->viewport_height;
+    for (uint32_t t = 0u; t < count; ++t) {
+        const XgRenderIrTriangle *triangle = mesh ? &mesh[t].triangle : &draw->primitive.triangles[t];
+        if (mesh ? mesh[t].texture.semi_transparent : draw->primitive.material.semi_transparent) continue;
+        for (unsigned v = 0u; v < 3u; ++v) {
+            const XgRenderIrVertex *vertex = &triangle->vertices[v];
+            const int32_t x = vertex->x >> 16, y = vertex->y >> 16;
+            if (x < 0 || y < 0 || (width && x >= width) || (height && y >= height)) continue;
+            const int32_t z = native_vertex_depth_q12(vertex);
+            if (z <= 0) continue;
+            const uint32_t key = (uint32_t)fmin(4294967295.0, 1099511627776.0 / z);
+            if (!compiler->audit->depth_key_min || key < compiler->audit->depth_key_min)
+                compiler->audit->depth_key_min = key;
+            if (key > compiler->audit->depth_key_max) compiler->audit->depth_key_max = key;
+        }
+    }
+}
+
+static int native_gpu_draw(GlNativeCpuCompiler *compiler, const XgSemanticDrawRecord *draw, int origin_y) {
+    return native_gpu_draw_mesh(compiler, draw, origin_y, NULL, 0u);
+}
+
+static int native_gpu_draw_mesh(GlNativeCpuCompiler *compiler, const XgSemanticDrawRecord *draw,
+                                int origin_y, const GlNativeGpuMeshTriangle *mesh, uint32_t mesh_count) {
+    GlNativeGpuWork *work = compiler->gpu;
+    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    if (!work) return 1;
+    if (mesh) {
+        XgRenderIrMaterialState material = *m;
+        for (uint32_t t = 0u; t < mesh_count; ++t) {
+            if (t && native_texture_state_equal(&mesh[t].texture, &mesh[t - 1u].texture)) continue;
+            native_texture_state_apply(&material, &mesh[t].texture);
+            if (!native_gpu_sync_texture(compiler, work, &material)) return 0;
+        }
+    } else if (!native_gpu_sync_texture(compiler, work, m)) return 0;
     /* A framebuffer capture is a VIEW texture, including the reveal margins
      * and every internal-resolution sample. Ordinary textures use raw words.
      * The transfer journal separates source-plane writes from these draws. */
+    uint32_t source = 0u;
+    float sx = 0.f, sy = 0.f, sw = 0.f, sh = 0.f;
     if (compiler->view_pass && compiler->native_views) {
         GlNativeViewState *views = compiler->native_views;
         const int index = native_transition_texture(views, draw);
         if (index >= 0) {
-            GlNativeViewTarget *source = &views->targets[index];
-            const uint32_t domain = native_view_domain(views, source);
-            if (domain != UINT32_MAX && domain + 1u != command->plane) {
-                command->source = domain + 1u;
-                command->sx = m->texture_page_x * 64 - source->x;
-                command->sy = m->texture_page_y * 256;
-                command->sw = source->width;
-                command->sh = VRAM_H;
+            GlNativeViewTarget *view = &views->targets[index];
+            const uint32_t domain = native_view_domain(views, view);
+            if (domain != UINT32_MAX && domain + 1u != compiler->gpu_plane) {
+                source = domain + 1u;
+                sx = m->texture_page_x * 64 - view->x;
+                sy = m->texture_page_y * 256;
+                sw = view->width;
+                sh = VRAM_H;
             }
         }
     }
-    command->draw.primitive.material.dither =
-        draw->primitive.material.dither && !compiler->dithering_disabled;
+    const uint8_t dither = draw->primitive.material.dither && !compiler->dithering_disabled;
+    native_gpu_note_depth_range(compiler, draw, mesh, mesh_count);
+    if (!source && compiler->gpu_plane != 0u) {
+        GlNativeGpuCommand *run = native_gpu_coalesce_target(work, compiler->gpu_plane, draw, dither,
+            compiler->dither_x, origin_y);
+        if (run) {
+            if (mesh) return native_gpu_coalesce_append(work, run, mesh, mesh_count);
+            GlNativeGpuMeshTriangle triangles[XG_RENDER_IR_TRIANGLE_CAPACITY];
+            memset(triangles, 0, sizeof(triangles));
+            for (uint32_t t = 0u; t < draw->primitive.triangle_count; ++t) {
+                triangles[t].triangle = draw->primitive.triangles[t];
+                triangles[t].texture = native_texture_state(m);
+            }
+            return native_gpu_coalesce_append(work, run, triangles, draw->primitive.triangle_count);
+        }
+    }
+    uint32_t mesh_offset = 0u;
+    if (mesh && !native_gpu_mesh_data(work, mesh, mesh_count, &mesh_offset)) return 0;
+    GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_DRAW);
+    if (!command) return 0;
+    command->plane = compiler->gpu_plane; command->draw = *draw;
+    if (mesh) {
+        command->data = mesh_offset;
+        command->mesh_count = mesh_count;
+        command->draw.primitive.triangle_count = 0u;
+    }
+    command->source = source;
+    command->sx = sx; command->sy = sy; command->sw = sw; command->sh = sh;
+    command->draw.primitive.material.dither = dither;
     command->y = origin_y; command->x = compiler->dither_x;
     return 1;
 }
@@ -10718,7 +11142,7 @@ static int native_recipe_feedback_reads(const GlNativeRecipe *recipe, const GlNa
     return 0;
 }
 
-static int native_recipe_unchanged_region(const GlNativeRecipe *recipe, const GlNativeViewTarget *target,
+static int native_recipe_unchanged_region(GlNativeRecipe *recipe, const GlNativeViewTarget *target,
                                       const GlNativeViewState *views, int x, int y, int width, int height) {
     GpuVramRect rects[4];
     const int count = gpu_vram_split_transfer(x, y, width, height, rects);
@@ -10729,7 +11153,7 @@ static int native_recipe_unchanged_region(const GlNativeRecipe *recipe, const Gl
         if (box->x < target->x + target->width && target->x < box->x + box->w &&
             box->y < target->y + target->height && target->y < box->y + box->h) return 0;
     }
-    if (native_recipe_region(&recipe->feedback, x, y, width, height)) return 0;
+    if (native_recipe_feedback_region(recipe, x, y, width, height)) return 0;
     for (int r = 0; r < count; ++r) {
         const GpuVramRect *box = &rects[r];
         for (int block = box->x / 64; block <= (box->x + box->w - 1) / 64; ++block) {
@@ -10749,7 +11173,7 @@ static int native_recipe_unchanged_region(const GlNativeRecipe *recipe, const Gl
 
 static int native_recipe_textures(GlNativeRecipe *recipe, const GlNativeViewTarget *target,
                                const uint16_t *words, GpuRenderSemantic *draw, uint32_t scale,
-                               const GlNativeViewState *views) {
+                               const GlNativeViewState *views, int mesh) {
     if (!draw->material.textured) return 1;
     const GpuRenderMaterial *m = &draw->material;
     if (recipe->textures && native_recipe_unchanged_region(recipe, target, views,
@@ -10759,7 +11183,8 @@ static int native_recipe_textures(GlNativeRecipe *recipe, const GlNativeViewTarg
     s_native_recipe_texture_read = (GlNativeRecipeDropEvent){.material = draw->material, .texture_reason = "none"};
     int changed = !recipe->textures;
     static GlNativeRecipeReads reads;
-    native_recipe_texture_reads(draw, &reads, scale, 0, recipe);
+    if (mesh) native_recipe_mesh_reads(draw, &reads);
+    else native_recipe_texture_reads(draw, &reads, scale, 0, recipe);
     const int feedback = native_recipe_feedback_reads(recipe, &reads) ||
         native_recipe_region(&reads.words, target->x, target->y, target->width, target->height);
     for (uint32_t i = 0u; i < reads.words.nonzero_words; ++i) {
@@ -10825,10 +11250,141 @@ static const XgRenderTemporalComponent *native_coverage_component(const XgRender
         ? &view->components[lo] : NULL;
 }
 
+/* Consecutive pose-bound guest draws that differ only in their polygons
+ * replay as one MESH record: one phase loop and one GPU command per run
+ * instead of a record, a projection slot and a command per polygon. The
+ * per-polygon path projects the same LOCAL corners under the same pose;
+ * runs never cross a material, texture snapshot or binding change, so the
+ * OT order and every replayed triangle stay exactly as appended. */
+static int native_recipe_coalescible(const GlNativeRecipeDraw *record) {
+    const GpuRenderSemantic *s = &record->semantic;
+    return record->motion.motion.handle.resource_id && !record->temporal_departure &&
+        !record->temporal_component && s->topology == GPU_RENDER_SEMANTIC_TRIANGLES &&
+        !s->screen_space_2d && !s->native_view_effect && !s->line_count &&
+        (record->mesh ? record->mesh->relocated
+                      : s->triangle_count && s->triangle_count == record->motion.triangle_count);
+}
+
+static GlNativeRecipeMeshPose native_recipe_record_pose(const GlNativeRecipeDraw *record) {
+    const GpuRenderInterpolationIdentity *owner = &record->semantic.interpolation_identity;
+    return (GlNativeRecipeMeshPose){.scene_id = owner->scene_id, .motion_index = record->motion_index,
+        .part = record->motion.motion_part_index, .producer_id = owner->producer_id,
+        .identity_valid = owner->valid};
+}
+
+static void native_recipe_mesh_triangle(XgRenderNativeMeshTriangle *out,
+                                        const GpuRenderSemanticTriangle *triangle,
+                                        const XgRenderMotionDrawBinding *binding, uint32_t t) {
+    memset(out, 0, sizeof(*out));
+    native_materialize_triangle(triangle, &out->triangle);
+    memcpy(out->local, binding->local[t], sizeof(out->local));
+    memcpy(out->vertex_ids, binding->vertex_ids[t], sizeof(out->vertex_ids));
+}
+
+/* A lone pose-bound draw as a one-polygon run: it takes the mesh replay,
+ * which clips at each phase's near plane, and later draws can join it. */
+static int native_recipe_meshify(GlNativeRecipeDraw *record) {
+    const GpuRenderSemantic *a = &record->semantic;
+    const uint32_t count = a->triangle_count, capacity = 16u;
+    GlNativeRecipeMesh *mesh = malloc(sizeof(*mesh) + (size_t)capacity * sizeof(mesh->triangles[0]));
+    GlNativeTextureState *textures = malloc((size_t)capacity * sizeof(*textures));
+    GlNativeRecipeMeshPose *poses = malloc((size_t)capacity * sizeof(*poses));
+    if (!mesh || !textures || !poses) { free(mesh); free(textures); free(poses); return 0; }
+    const GlNativeTextureState texture = native_texture_state_semantic(&a->material);
+    const GlNativeRecipeMeshPose pose = native_recipe_record_pose(record);
+    for (uint32_t t = 0u; t < count; ++t) {
+        native_recipe_mesh_triangle(&mesh->triangles[t], &a->triangles[t], &record->motion, t);
+        textures[t] = texture;
+        poses[t] = pose;
+    }
+    *mesh = (GlNativeRecipeMesh){.references = 1u, .count = count, .capacity = capacity,
+        .relocated = 1u, .textures = textures, .poses = poses};
+    /* The record is now the run's template: material and binding identity
+     * only, its polygons live in the mesh. */
+    record->semantic.triangle_count = 0u;
+    memset(record->semantic.triangles, 0, sizeof(record->semantic.triangles));
+    record->motion.triangle_count = 0u;
+    memset(record->motion.local, 0, sizeof(record->motion.local));
+    memset(record->motion.vertex_ids, 0, sizeof(record->motion.vertex_ids));
+    record->mesh = mesh;
+    return 1;
+}
+
+static int native_recipe_coalesce(GlNativeRecipe *recipe, const GlNativeRecipeDraw *next) {
+    if (!recipe->count || next->mesh || !native_recipe_coalescible(next)) return 0;
+    GlNativeRecipeDraw *last = &recipe->draws[recipe->count - 1u];
+    const GpuRenderSemantic *a = &last->semantic, *b = &next->semantic;
+    const GpuRenderMaterial *x = &a->material, *y = &b->material;
+    if (!native_recipe_coalescible(last) ||
+        /* Texture state may differ per triangle; the rest of the material
+         * (clip, offsets, window, dither, mask) is the record's. */
+        x->draw_area_left != y->draw_area_left || x->draw_area_top != y->draw_area_top ||
+        x->draw_area_right != y->draw_area_right || x->draw_area_bottom != y->draw_area_bottom ||
+        x->draw_offset_x != y->draw_offset_x || x->draw_offset_y != y->draw_offset_y ||
+        x->texture_window_mask_x != y->texture_window_mask_x ||
+        x->texture_window_mask_y != y->texture_window_mask_y ||
+        x->texture_window_offset_x != y->texture_window_offset_x ||
+        x->texture_window_offset_y != y->texture_window_offset_y ||
+        x->dither != y->dither || x->mask_set != y->mask_set || x->mask_check != y->mask_check ||
+        a->depth_policy != b->depth_policy || a->depth_bias != b->depth_bias ||
+        a->aa_exempt != b->aa_exempt || a->sprite_texture != b->sprite_texture ||
+        /* Pose and owner identity may differ per triangle (poses). */
+        last->temporal_index != next->temporal_index ||
+        last->textures != next->textures || last->enhanced != next->enhanced ||
+        last->projection_offset_x != next->projection_offset_x ||
+        last->projection_offset_y != next->projection_offset_y ||
+        last->view_origin_y != next->view_origin_y ||
+        last->dither_x != next->dither_x || last->dither_y != next->dither_y ||
+        memcmp(&last->hd_texture, &next->hd_texture, sizeof(last->hd_texture))) return 0;
+    if (!last->mesh && !native_recipe_meshify(last)) return 0;
+    GlNativeRecipeMesh *mesh = last->mesh;
+    const uint32_t count = mesh->count;
+    const uint32_t needed = count + b->triangle_count;
+    if (mesh->references != 1u || needed > mesh->capacity) {
+        /* Grow in place only while this recipe alone holds the mesh; a
+         * copy-on-write recipe shares it with its retained original. */
+        const int owned = mesh->references == 1u;
+        uint32_t capacity = owned ? mesh->capacity : 16u;
+        while (capacity < needed) capacity *= 2u;
+        const size_t bytes = sizeof(*mesh) + (size_t)capacity * sizeof(mesh->triangles[0]);
+        GlNativeTextureState *textures = owned
+            ? realloc(mesh->textures, (size_t)capacity * sizeof(*textures))
+            : malloc((size_t)capacity * sizeof(*textures));
+        if (!textures) return 0;
+        if (owned) mesh->textures = textures;
+        GlNativeRecipeMeshPose *poses = owned
+            ? realloc(mesh->poses, (size_t)capacity * sizeof(*poses))
+            : malloc((size_t)capacity * sizeof(*poses));
+        if (!poses) { if (!owned) free(textures); return 0; }
+        if (owned) mesh->poses = poses;
+        GlNativeRecipeMesh *grown = owned ? realloc(mesh, bytes) : malloc(bytes);
+        if (!grown) { if (!owned) { free(textures); free(poses); } return 0; }
+        grown->textures = textures;
+        grown->poses = poses;
+        if (!owned) {
+            memcpy(grown->triangles, mesh->triangles, (size_t)count * sizeof(mesh->triangles[0]));
+            memcpy(textures, mesh->textures, (size_t)count * sizeof(*textures));
+            memcpy(poses, mesh->poses, (size_t)count * sizeof(*poses));
+            native_recipe_mesh_release(mesh);
+        }
+        grown->references = 1u; grown->count = count;
+        grown->capacity = capacity; grown->relocated = 1u;
+        last->mesh = mesh = grown;
+    }
+    const GlNativeTextureState texture = native_texture_state_semantic(&b->material);
+    const GlNativeRecipeMeshPose pose = native_recipe_record_pose(next);
+    for (uint32_t t = 0u; t < b->triangle_count; ++t) {
+        mesh->textures[mesh->count] = texture;
+        mesh->poses[mesh->count] = pose;
+        native_recipe_mesh_triangle(&mesh->triangles[mesh->count++], &b->triangles[t], &next->motion, t);
+    }
+    return 1;
+}
+
 static void native_recipe_append(GlNativeViewState *views, uint32_t index,
                               const XgRenderNativeOperation *operation, const GlNativeCompileAudit *audit,
                               const uint16_t *words,
-                              int enhanced) {
+                              int enhanced, GlNativeRecipeMesh *expanded) {
     const GpuRenderSemantic *source = &operation->semantic;
     const XgRenderMotionDrawBinding *binding = &operation->motion;
     GlNativeViewTarget *target = &views->targets[index];
@@ -10852,18 +11408,24 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
      * history on every draw whenever references > 1, a routine state — cost
      * compounds with every draw ever appended. Cap it like the existing
      * UINT32_MAX/native_view_effect drops below. */
-    enum { XG_NATIVE_RECIPE_MAX_DRAWS = 16384u };
+    /* Coalesced runs pack a frame into few records, so the record cap alone
+     * would let such a recipe span many frames; every frame retains its own
+     * poses, which copy-on-write and release then walk. Cap those too. */
+    enum { XG_NATIVE_RECIPE_MAX_DRAWS = 16384u, XG_NATIVE_RECIPE_MAX_MOTIONS = 1024u };
     if (source->native_view_effect || recipe->count == UINT32_MAX ||
-        recipe->count >= XG_NATIVE_RECIPE_MAX_DRAWS) {
-        s_native_recipe_texture_read.texture_reason = source->native_view_effect ?
-            "native_view_effect" : "draw_capacity";
+        recipe->count >= XG_NATIVE_RECIPE_MAX_DRAWS ||
+        recipe->motion_count >= XG_NATIVE_RECIPE_MAX_MOTIONS) {
+        s_native_recipe_texture_read.texture_reason = source->native_view_effect ? "native_view_effect" :
+            recipe->count >= XG_NATIVE_RECIPE_MAX_DRAWS ? "draw_capacity" : "motion_capacity";
         native_recipe_drop(target); return;
     }
+    const int mesh = operation->kind == XG_RENDER_NATIVE_OPERATION_MESH;
     if (binding->motion.handle.resource_id) {
         int retained = 0;
         for (uint32_t i = 0u; i < audit->consumed_motion_resources; ++i)
             retained |= native_motion_ref_equal(binding->motion, audit->motion_resources[i]);
-        if (!retained || !xg_render_motion_binding_valid(binding) ||
+        if (!retained || !(mesh ? xg_render_motion_mesh_binding_valid(binding)
+                                : xg_render_motion_binding_valid(binding)) ||
             source->topology != GPU_RENDER_SEMANTIC_TRIANGLES ||
             binding->triangle_count != source->triangle_count) {
             s_native_recipe_texture_read.texture_reason = "motion_binding";
@@ -10911,7 +11473,7 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
     }
     recipe->dithering_disabled = audit->header.display.dithering_disabled;
     recipe->depth_test = audit->header.display.native_depth_test;
-    if (!native_recipe_textures(recipe, target, words, &draw, audit->header.display.render_scale, views)) { native_recipe_drop(target); return; }
+    if (!native_recipe_textures(recipe, target, words, &draw, audit->header.display.render_scale, views, mesh)) { native_recipe_drop(target); return; }
     uint32_t motion_index = UINT32_MAX;
     if (binding->motion.handle.resource_id) {
         for (uint32_t i = 0u; i < recipe->motion_count; ++i)
@@ -10968,7 +11530,9 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         if (!component || component->producer_id != draw.interpolation_identity.producer_id ||
             component->scene_id != draw.interpolation_identity.scene_id) { native_recipe_drop(target); return; }
     }
-    recipe->draws[recipe->count++] = (GlNativeRecipeDraw){
+    if (mesh && !expanded) { native_recipe_drop(target); return; }
+    const GlNativeRecipeDraw record = {
+        .mesh = mesh ? expanded : NULL,
         .semantic = draw, .enhanced = enhanced != 0,
         .textures = draw.material.textured ? recipe->textures : NULL,
         .motion = *binding, .motion_index = motion_index,
@@ -10977,15 +11541,27 @@ static void native_recipe_append(GlNativeViewState *views, uint32_t index,
         .view_origin_y = target->y,
         .dither_x = target->x & 3u, .dither_y = target->y & 3u,
         .hd_texture = operation->hd_texture};
+    if (!mesh && native_recipe_coalesce(recipe, &record)) return;
+    if (mesh) expanded->references++;
+    recipe->draws[recipe->count++] = record;
+    if (!mesh && native_recipe_coalescible(&recipe->draws[recipe->count - 1u]))
+        (void)native_recipe_meshify(&recipe->draws[recipe->count - 1u]);
     if (draw.material.textured) recipe->textures->references++;
 }
 
 static void native_recipe_begin(GlNativeViewState *views, GlNativeViewTarget *target, uint32_t color) {
     s_native_recipe_texture_read = (GlNativeRecipeDropEvent){.texture_reason = "clear_begin"};
+    /* A target's frames are alike in size: start at its last recipe's draw
+     * count instead of regrowing from 16 by doubling (each regrowth copies
+     * every 1 KiB record so far). */
     native_recipe_drop(target);
+    const uint32_t expected = target->recipe_draws;
     GlNativeRecipe *recipe = malloc(sizeof(*recipe));
     if (!recipe) return;
     memset(recipe, 0, sizeof(*recipe));
+    if (expected)
+        recipe->draws = xg_render_array_reserve_uninitialized(NULL, sizeof(*recipe->draws),
+            &recipe->draw_capacity, expected + expected / 4u, UINT32_MAX);
     recipe->references = 1u; recipe->clear_color = color;
     recipe->publication = views->publication;
     if (recipe->publication) recipe->publication->references++;
@@ -10996,6 +11572,7 @@ static void native_recipe_begin(GlNativeViewState *views, GlNativeViewTarget *ta
     gpu_vram_region_mark_rect(&recipe->feedback, target->x, target->y,
         target->x + target->width - 1, target->y + target->height - 1);
     target->recipe = recipe;
+    target->displayed = 0; /* A new frame; scanout marks it once shown. */
 }
 
 /* Frames that never clear (battle: full 3D overdraw, no FILL) still replay
@@ -11027,6 +11604,26 @@ static void native_recipe_begin_snapshot(GlNativeViewState *views, uint32_t inde
     }
 }
 
+/* A game that neither clears nor declares its target (Battling redraws over
+ * the buffer it showed two frames earlier) starts a new frame with its first
+ * draw over a shown target, with no recipe or a snapshot one: the same
+ * snapshot a declaration would start, captured before this draw. Recipes
+ * dropped mid-frame are not shown and stay dropped. */
+static void native_recipe_frame_draw(GlNativeViewState *views, const XgSemanticDrawRecord *draw) {
+    const XgRenderIrMaterialState *dm = &draw->primitive.material;
+    const int frame = native_view_cover(views, views->count, dm->draw_area_left,
+        dm->draw_area_top, dm->draw_area_right - dm->draw_area_left + 1,
+        dm->draw_area_bottom - dm->draw_area_top + 1);
+    const GlNativeRecipe *shown = frame >= 0 ? views->targets[frame].recipe : NULL;
+    if (frame >= 0 && views->targets[frame].displayed &&
+        (!shown || shown->base_serial) &&
+        dm->draw_area_left == views->targets[frame].x &&
+        dm->draw_area_right - dm->draw_area_left + 1 == views->targets[frame].width) {
+        native_recipe_begin_snapshot(views, (uint32_t)frame);
+        if (views->targets[frame].recipe) views->active = frame;
+    }
+}
+
 static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op,
                                 GlNativeRecipe *const *before, uint32_t before_count) {
     const int copy = op->kind == XG_RENDER_NATIVE_OPERATION_COPY;
@@ -11052,6 +11649,13 @@ static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativ
         if (full && op->kind == XG_RENDER_NATIVE_OPERATION_FILL && !op->mask_check) {
             native_recipe_begin(views, t, conv_1555_to_rgba8(op->fill_color) |
                 (op->mask_set ? UINT32_C(0xff000000) : 0u));
+        } else if (op->kind == XG_RENDER_NATIVE_OPERATION_FILL && !op->mask_check) {
+            /* A clear that leaves part of the target (Battling clears
+             * 320x224 at y 240 while the target is 218 lines from y 256)
+             * starts a snapshot frame: the base, captured in FIFO order right
+             * after this FILL, holds the clear and whatever it left, and the
+             * later draws replay over it. */
+            native_recipe_begin_snapshot(views, i);
         } else if (full && copy && !op->mask_set && !op->mask_check) {
             const int sx = (op->src_x + dx) & (VRAM_W - 1);
             const int sy = (op->src_y + dy) & (VRAM_H - 1);
@@ -11090,6 +11694,7 @@ static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativ
                 }
         gpu_vram_region_mark_rect(&recipe->feedback, target->x, target->y,
             target->x + target->width - 1, target->y + target->height - 1);
+        recipe->feedback_cache_count = 0u;
     }
     if (raster) gpu_vram_region_mark_transfer(&views->raster_words, op->dst_x, op->dst_y, op->width, op->height);
     else if (!op->mask_check)
@@ -11120,13 +11725,24 @@ static void native_recipe_draw_written(GlNativeViewState *views, const XgRenderN
             GlNativeViewTarget *target = &views->targets[i];
             if (!target->recipe || (left >= target->x && top >= target->y &&
                 right < target->x + target->width && bottom < target->y + target->height)) continue;
+            /* The exact texel footprint lies inside the texture page and its
+             * CLUT row: when neither meets this recipe's feedback region,
+             * native_recipe_feedback_reads finds nothing. Skip computing it. */
+            const GpuRenderMaterial *tm = &draw.material;
+            if (!native_recipe_feedback_region(target->recipe, tm->texture_page_x * 64, tm->texture_page_y * 256,
+                    64 << tm->texture_depth, 256) &&
+                (tm->texture_depth == GPU_RENDER_TEXTURE_15_BIT ||
+                 !native_recipe_feedback_region(target->recipe, tm->clut_x, tm->clut_y,
+                    tm->texture_depth == GPU_RENDER_TEXTURE_4_BIT ? 16 : 256, 1))) continue;
             if (!reads_ready) {
                 native_recipe_texture_reads(&draw, &reads, audit->header.display.render_scale, 0, NULL);
                 reads_ready = 1;
             }
             if (!native_recipe_feedback_reads(target->recipe, &reads)) continue;
-            if (native_recipe_private(target))
+            if (native_recipe_private(target)) {
                 gpu_vram_region_mark_rect(&target->recipe->feedback, left, top, right, bottom);
+                target->recipe->feedback_cache_count = 0u;
+            }
         }
     }
     /* Actual fragment writes already recorded provenance. An AABB would also
@@ -11177,6 +11793,7 @@ static void native_recipe_draw_written(GlNativeViewState *views, const XgRenderN
             gpu_vram_region_clear_rect(&target->recipe->feedback, left, top, clear_right, clear_bottom);
             gpu_vram_region_mark_rect(&target->recipe->feedback, target->x, target->y,
                 target->x + target->width - 1, target->y + target->height - 1);
+            target->recipe->feedback_cache_count = 0u;
         }
     }
     for (uint32_t i = 0u; i < views->count; ++i) {
@@ -11198,7 +11815,7 @@ static void native_recipe_draw_written(GlNativeViewState *views, const XgRenderN
          * draw itself so dither/mask semantics are reproduced, not guessed from
          * its final color. The initial zero never survives the proven overwrite. */
         native_recipe_begin(views, t, 0u);
-        native_recipe_append(views, i, operation, audit, words, native_view_eligible(views, t));
+        native_recipe_append(views, i, operation, audit, words, native_view_eligible(views, t), NULL);
         gpu_vram_region_clear_rect(&views->raster_words, t->x, t->y, t->x + t->width - 1, t->y + t->height - 1);
     }
 }
@@ -11292,12 +11909,63 @@ static int native_view_raster(GlNativeCpuCompiler *compiler, uint16_t view_width
             *px = (int32_t)x; *py = (int32_t)y;
         }
     }
+    if (compiler->mesh_count) {
+        /* Meshes are host geometry on the GPU planes only, never a CPU
+         * surface. The same per-vertex VIEW relocation as above. */
+        if (!compiler->gpu_only) return 1;
+        GlNativeGpuMeshTriangle *moved = compiler->mesh_writable
+            ? compiler->mesh_writable : native_mesh_buffer(0u, compiler->mesh_count);
+        if (!moved) return 0;
+        const GlNativeTextureState template_texture = native_texture_state(&draw.primitive.material);
+        uint32_t mesh_count = compiler->mesh_count;
+        if (!compiler->mesh_writable) {
+            uint32_t kept = 0u;
+            for (uint32_t t = 0u; t < compiler->mesh_count; ++t) {
+                uint32_t flags = 0u;
+                if (compiler->mesh_flags)
+                    memcpy(&flags, compiler->mesh_flags + (size_t)t * compiler->mesh_stride, sizeof(flags));
+                if (flags & XG_RENDER_NATIVE_MESH_PHASE_ONLY) continue;
+                memcpy(&moved[kept].triangle, compiler->mesh_base + (size_t)t * compiler->mesh_stride,
+                    sizeof(moved[kept].triangle));
+                if (compiler->mesh_textures)
+                    memcpy(&moved[kept].texture, compiler->mesh_textures + (size_t)t * compiler->mesh_stride,
+                        sizeof(moved[kept].texture));
+                else moved[kept].texture = template_texture;
+                ++kept;
+            }
+            mesh_count = kept;
+            if (!mesh_count) return 1;
+        }
+        for (uint32_t t = 0u; t < mesh_count; ++t) {
+            for (uint32_t vi = 0u; vi < 3u; ++vi) {
+                XgRenderIrVertex *v = &moved[t].triangle.vertices[vi];
+                const int native_position = enhanced && v->native_view_position;
+                v->native_view_position = false;
+                int64_t x = (int64_t)(native_position ? v->native_view_x : v->x) +
+                    (int64_t)(original->draw_offset_x - target->x) * 65536;
+                const int64_t y = (int64_t)(native_position ? v->native_view_y : v->y) +
+                    (int64_t)(original->draw_offset_y - target->y + raster_origin_y) * 65536;
+                if (!native_position) x = mode == GPU_RENDER_SCREEN_SPACE_2D_STRETCH
+                    ? native_div_floor(x * view_width, target->width) : x + translation;
+                if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX) return 0;
+                v->x = (int32_t)x; v->y = (int32_t)y;
+            }
+        }
+        return native_gpu_draw_mesh(compiler, &draw,
+            compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE ? 0 : raster_origin_y,
+            moved, mesh_count);
+    }
     if (compiler->gpu_only) {
         /* Published recipes already passed source/material validation. The
          * phase projection and VIEW coordinate bounds were checked above;
-         * no CPU surface or repeated generic raster validation is needed. */
-        return native_gpu_draw(compiler, &draw,
+         * no CPU surface or repeated generic raster validation is needed.
+         * Still a VIEW pass: a transition capture samples its VIEW plane. */
+        const int saved_view_pass = compiler->view_pass;
+        compiler->view_pass = 1;
+        const int drawn = native_gpu_draw(compiler, &draw,
             compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE ? 0 : raster_origin_y);
+        compiler->view_pass = saved_view_pass;
+        return drawn;
     }
     resource.view.descriptor.width = view_width;
     resource.view.descriptor.height = target->height;
@@ -12696,12 +13364,369 @@ static int native_apply_surface_edge(GlNativeCpuCompiler *compiler,
 
 /* Complete replay. Shared source-transform curves and local-vertex GTE anchors
  * preserve both endpoint planes, without screen-image warping or polygon fits. */
+/* A phase's pose deltas on one mesh vertex: the per-draw replay's own rules
+ * (positions, phase-continuous projective Z, depth key). False when a
+ * position leaves the 16.16 range. */
+static int native_mesh_vertex_move(XgRenderIrVertex *vertex, const double screen[3],
+                                   const double native[3]) {
+    const double x = vertex->x + screen[0] * 65536.0, y = vertex->y + screen[1] * 65536.0;
+    const double native_x = vertex->native_view_x + native[0] * 65536.0;
+    const double native_y = vertex->native_view_y + native[1] * 65536.0;
+    if (!isfinite(x) || !isfinite(y) || x < INT32_MIN || x > INT32_MAX ||
+        y < INT32_MIN || y > INT32_MAX) return 0;
+    if (vertex->native_view_position &&
+        (!isfinite(native_x) || !isfinite(native_y) || native_x < INT32_MIN ||
+         native_x > INT32_MAX || native_y < INT32_MIN || native_y > INT32_MAX)) return 0;
+    vertex->x = (int32_t)llround(x); vertex->y = (int32_t)llround(y);
+    if (vertex->native_view_position) {
+        vertex->native_view_x = (int32_t)llround(native_x);
+        vertex->native_view_y = (int32_t)llround(native_y);
+    }
+    if (vertex->projective_position) {
+        if (screen[2] > 0.0 && screen[2] <= 65535.0)
+            vertex->projective_view_z = (int32_t)floor(screen[2]);
+        else
+            vertex->projective_position = false;
+    }
+    if (vertex->native_view_depth > 0) {
+        const double depth = vertex->native_view_depth + native[2] * 4096.0;
+        vertex->native_view_depth = isfinite(depth) && depth >= 1.0 && depth <= 65535.0 * 4096.0
+            ? (int32_t)llround(depth) : native_depth_q12(screen[2], vertex->projective_distance);
+    } else if (vertex->projective_position)
+        vertex->native_view_depth = native_depth_q12(screen[2], vertex->projective_distance);
+    vertex->temporal_depth_valid = false;
+    return 1;
+}
+
+/* Corner endpoints shared by every phase of one interval (see
+ * XgRenderMotionVertexEndpoints): offsets[i] is record i's first corner,
+ * three per triangle of its pose-bound geometry. A DRAW record's corners
+ * hold their endpoints (corners); a mesh record's corners name a unique
+ * vertex (corner_vertices; UINT32_MAX: no enabled pose), one per pose,
+ * part and LOCAL position, whose endpoints are computed once and whose
+ * phase part each phase evaluates once (GlNativeMotionPhaseVertex). Unique
+ * vertices of an endpoint job's records occupy slots [ranges[j][0],
+ * ranges[j][1]) of the corner index space. */
+typedef struct GlNativeMotionVertex {
+    XgHost3dVector local;
+    uint32_t motion_index, part;
+} GlNativeMotionVertex;
+typedef struct GlNativeMotionPhaseVertex {
+    double screen[3], native[3];
+    XgRenderMotionPhaseView view; /* for clipping at this phase's near plane */
+    uint8_t state; /* NATIVE_MOTION_VERTEX_* */
+} GlNativeMotionPhaseVertex;
+enum { NATIVE_MOTION_VERTEX_ENDPOINT = 0, NATIVE_MOTION_VERTEX_PROJECTED, NATIVE_MOTION_VERTEX_INVALID };
+typedef struct GlNativeMotionEndpoints {
+    uint32_t *offsets;
+    XgRenderMotionVertexEndpoints *corners;
+    uint32_t *corner_vertices;
+    GlNativeMotionVertex *vertices;
+    XgRenderMotionVertexEndpoints *vertex_endpoints;
+    uint32_t ranges[GL_NATIVE_MOTION_PHASE_CAPACITY][2];
+    uint32_t range_count, corner_count;
+} GlNativeMotionEndpoints;
+
+static const XgRenderMotionVertexEndpoints (*native_motion_endpoints_at(
+        const GlNativeMotionEndpoints *endpoints, uint32_t record, uint32_t triangle))[3] {
+    if (!endpoints || !endpoints->corners) return NULL;
+    return (const XgRenderMotionVertexEndpoints (*)[3])(const void *)
+        (endpoints->corners + endpoints->offsets[record] + (size_t)triangle * 3u);
+}
+
+/* One phase's part of every unique mesh vertex: under its pose when that is
+ * enabled for the whole interval (entities) and evaluated at this phase
+ * (phase_entities). */
+static void native_motion_phase_vertices(const GlNativeMotionEndpoints *endpoints,
+                                         const GlNativeMotionEntity *entities,
+                                         const GlNativeMotionEntity *phase_entities,
+                                         GlNativeMotionPhaseVertex *out) {
+    for (uint32_t r = 0u; r < endpoints->range_count; ++r)
+        for (uint32_t u = endpoints->ranges[r][0]; u < endpoints->ranges[r][1]; ++u) {
+            const GlNativeMotionVertex *vertex = &endpoints->vertices[u];
+            GlNativeMotionPhaseVertex *phase = &out[u];
+            phase->state = NATIVE_MOTION_VERTEX_ENDPOINT;
+            if (!entities[vertex->motion_index].enabled) continue;
+            const XgRenderMotionEvaluation *evaluation = &phase_entities[vertex->motion_index].evaluation;
+            if (!evaluation->interpolated) continue;
+            phase->state = xg_render_motion_vertex_phase(evaluation, vertex->part, &vertex->local,
+                &endpoints->vertex_endpoints[u], phase->screen, phase->native, &phase->view)
+                ? NATIVE_MOTION_VERTEX_PROJECTED : NATIVE_MOTION_VERTEX_INVALID;
+        }
+}
+
+/* The near plane of a phase: just in front of the GTE divide's saturation
+ * (z = distance / 2), where the continuous projection is exact. */
+static double native_phase_near_plane(const XgRenderMotionPhaseView *view) {
+    return view->distance * 0.5 + 8.0;
+}
+
+/* Where the phase camera puts a view-space point, in the 16.16 Native and
+ * canonical coordinates of a triangle whose reference corner was moved the
+ * ordinary way: the same continuous projection plus that corner's offsets
+ * (relocation, Native centring), so placed points join moved ones exactly. */
+typedef struct GlNativePhasePlacement {
+    const XgRenderMotionPhaseView *view;
+    double native_offset[2];
+    int64_t canonical_offset[2];
+    int native_position;
+} GlNativePhasePlacement;
+
+static void native_phase_placement(GlNativePhasePlacement *out, const XgRenderIrVertex *reference,
+                                   const XgRenderMotionPhaseView *view) {
+    const double q = view->distance / fmin(view->view[2], 65535.0);
+    out->view = view;
+    out->native_offset[0] = reference->native_view_x -
+        (view->screen_offset[0] + fmax(-32768.0, fmin(view->view[0], 32767.0)) * q) * 65536.0;
+    out->native_offset[1] = reference->native_view_y -
+        (view->screen_offset[1] + fmax(-32768.0, fmin(view->view[1], 32767.0)) * q) * 65536.0;
+    out->canonical_offset[0] = (int64_t)reference->x - reference->native_view_x;
+    out->canonical_offset[1] = (int64_t)reference->y - reference->native_view_y;
+    out->native_position = reference->native_view_position;
+}
+
+static int native_phase_place(const GlNativePhasePlacement *placement, const double p[3],
+                              XgRenderIrVertex *vertex) {
+    const double q = placement->view->distance / fmin(p[2], 65535.0);
+    const double nx = (placement->view->screen_offset[0] + fmax(-32768.0, fmin(p[0], 32767.0)) * q) * 65536.0 +
+        placement->native_offset[0];
+    const double ny = (placement->view->screen_offset[1] + fmax(-32768.0, fmin(p[1], 32767.0)) * q) * 65536.0 +
+        placement->native_offset[1];
+    if (!isfinite(nx) || !isfinite(ny) || fabs(nx) > 2.0e9 || fabs(ny) > 2.0e9) return 0;
+    vertex->native_view_x = (int32_t)llround(nx);
+    vertex->native_view_y = (int32_t)llround(ny);
+    vertex->native_view_position = placement->native_position;
+    const int64_t x = vertex->native_view_x + placement->canonical_offset[0];
+    const int64_t y = vertex->native_view_y + placement->canonical_offset[1];
+    if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX) return 0;
+    vertex->x = (int32_t)x; vertex->y = (int32_t)y;
+    vertex->projective_position = true;
+    vertex->projective_view_z = (int32_t)floor(p[2]);
+    vertex->native_view_depth = native_depth_q12(p[2], (uint32_t)placement->view->distance);
+    vertex->temporal_depth_valid = false;
+    return 1;
+}
+
+/* A moved triangle that crosses its phase camera's near plane: clipped in
+ * that camera's view space like any 3D renderer would, instead of drawing
+ * corners behind the camera through the saturated projection (the faces
+ * that leap across the screen). Each crossing interpolates the edge in view
+ * space (UV and colour with it) and is placed like its corners. Writes 0..2
+ * triangles at out; near flags the corners behind the plane. */
+static uint32_t native_phase_clip_triangle(const XgRenderIrTriangle *moved,
+                                           const XgRenderMotionPhaseView *const views[3],
+                                           unsigned near, const GlNativePhasePlacement *placement,
+                                           XgRenderIrTriangle out[2]) {
+    const double near_z = native_phase_near_plane(placement->view);
+    XgRenderIrVertex polygon[4];
+    unsigned count = 0u;
+    for (unsigned k = 0u; k < 3u; ++k) {
+        const unsigned next = (k + 1u) % 3u;
+        const int a_front = !(near & (1u << k)), b_front = !(near & (1u << next));
+        if (a_front) polygon[count++] = moved->vertices[k];
+        if (a_front == b_front) continue;
+        const double *a = views[k]->view, *b = views[next]->view;
+        const double t = (near_z - a[2]) / (b[2] - a[2]);
+        const XgRenderIrVertex *va = &moved->vertices[k], *vb = &moved->vertices[next];
+        XgRenderIrVertex *c = &polygon[count++];
+        *c = a_front ? *va : *vb;
+        double p[3];
+        for (unsigned r = 0u; r < 3u; ++r) p[r] = a[r] + t * (b[r] - a[r]);
+        p[2] = near_z;
+        if (!native_phase_place(placement, p, c)) return 0u;
+        c->u = (int32_t)llround(va->u + t * ((double)vb->u - va->u));
+        c->v = (int32_t)llround(va->v + t * ((double)vb->v - va->v));
+        c->r = (uint8_t)lround(va->r + t * ((double)vb->r - va->r));
+        c->g = (uint8_t)lround(va->g + t * ((double)vb->g - va->g));
+        c->b = (uint8_t)lround(va->b + t * ((double)vb->b - va->b));
+    }
+    if (count < 3u) return 0u;
+    uint32_t triangles = 0u;
+    for (unsigned first = 1u; first + 1u < count; ++first) {
+        out[triangles] = *moved;
+        out[triangles].vertices[0] = polygon[0];
+        out[triangles].vertices[1] = polygon[first];
+        out[triangles].vertices[2] = polygon[first + 1u];
+        ++triangles;
+    }
+    return triangles;
+}
+
+/* A recipe MESH at one phase: its triangles relocated exactly as the recipe
+ * relocated a DRAW's semantic, then moved by their pose's phase curve
+ * (each unique vertex evaluated once, phase_vertices; or two triangles at a
+ * time through the shared projection cache). Without an enabled pose they
+ * stay at the endpoint. Triangles whose phase projection fails are left out
+ * of this phase only. */
+static int native_mesh_phase_triangles(const GlNativeRecipe *recipe, const GlNativeRecipeDraw *record,
+                                       uint32_t record_index,
+                                       const GlNativeMotionEntity *entities,
+                                       const GlNativeMotionEntity *phase_entities,
+                                       const GlNativeMotionEndpoints *endpoints,
+                                       const GlNativeMotionPhaseVertex *phase_vertices,
+                                       GlNativeGpuMeshTriangle **out, uint32_t *out_count, int *moved_any) {
+    const GlNativeRecipeMesh *mesh = record->mesh;
+    *out = NULL; *out_count = 0u; *moved_any = 0;
+    if (!mesh) return 0;
+    const GlNativeRecipeMeshPose record_pose = {.motion_index = record->motion_index,
+        .part = record->motion.motion_part_index};
+    const XgRenderNativeMeshTriangle *triangles = mesh->triangles;
+    /* A clipped triangle can become two. */
+    GlNativeGpuMeshTriangle *moved = native_mesh_buffer(1u, mesh->count * 2u);
+    if (!moved) return 0;
+    const GlNativeTextureState template_texture = native_texture_state_semantic(&record->semantic.material);
+    /* Coalesced draws were relocated at append, like a DRAW's semantic. */
+    const int64_t dx = mesh->relocated ? 0 : record->projection_offset_x;
+    const int64_t dy = mesh->relocated ? 0 : record->projection_offset_y;
+    const int strip_native = !record->enhanced && recipe->view_width;
+    const uint32_t *corner_vertices = phase_vertices && endpoints && endpoints->corner_vertices &&
+        record->motion.motion.handle.resource_id
+        ? endpoints->corner_vertices + endpoints->offsets[record_index] : NULL;
+    const XgRenderMotionVertexEndpoints (*corner_endpoints)[3] =
+        native_motion_endpoints_at(endpoints, record_index, 0u);
+    uint32_t kept = 0u;
+    for (uint32_t first = 0u, pair; first < mesh->count; first += pair) {
+        double screen[2][3][3], native[2][3][3];
+        const double *vertex_screen[2][3], *vertex_native[2][3];
+        const XgRenderMotionPhaseView *views[3];
+        unsigned near = 0u, placed = 0u;
+        XgRenderMotionProjectResult result = XG_RENDER_MOTION_ENDPOINT;
+        if (corner_vertices) {
+            /* One triangle; its corners share one pose. */
+            pair = 1u;
+            for (uint32_t v = 0u; v < 3u; ++v) {
+                const uint32_t u = corner_vertices[(size_t)first * 3u + v];
+                const GlNativeMotionPhaseVertex *phase = u == UINT32_MAX ? NULL : &phase_vertices[u];
+                vertex_screen[0][v] = vertex_native[0][v] = NULL;
+                views[v] = NULL;
+                if (!phase || phase->state == NATIVE_MOTION_VERTEX_ENDPOINT) continue;
+                if (phase->state == NATIVE_MOTION_VERTEX_INVALID) { result = XG_RENDER_MOTION_INVALID; break; }
+                result = XG_RENDER_MOTION_PROJECTED;
+                vertex_screen[0][v] = phase->screen; vertex_native[0][v] = phase->native;
+                views[v] = &phase->view;
+                if (phase->view.view[2] < native_phase_near_plane(&phase->view)) near |= 1u << v;
+            }
+            if (result == XG_RENDER_MOTION_PROJECTED) {
+                *moved_any = 1;
+                /* Every corner behind this phase's near plane: nothing to draw. */
+                if (near == 7u) continue;
+                /* A corner without an endpoint Native position (its
+                 * projection overflowed behind the camera) is placed from
+                 * this phase's view, like a clip point. */
+                for (uint32_t v = 0u; v < 3u; ++v)
+                    if (!(near & (1u << v)) && !strip_native &&
+                        !triangles[first].triangle.vertices[v].native_view_position) placed |= 1u << v;
+                for (uint32_t v = 0u; v < 3u && (near | placed); ++v) if (!views[v]) near = placed = 0u;
+            } else near = 0u;
+        } else {
+            /* Two triangles at a time under one pose: each triangle's own (a
+             * run may cross objects) or the record's. The pose is enabled for
+             * the whole interval (entities) and evaluated at this phase
+             * (phase_entities, when the phase has its own copy). */
+            const GlNativeRecipeMeshPose *pose = mesh->poses ? &mesh->poses[first] : &record_pose;
+            pair = mesh->count - first >= 2u &&
+                (!mesh->poses || native_recipe_pose_equal(pose, &mesh->poses[first + 1u])) ? 2u : 1u;
+            const GlNativeMotionEntity *entity = entities && record->motion.motion.handle.resource_id &&
+                pose->motion_index < recipe->motion_count && entities[pose->motion_index].enabled
+                ? &(phase_entities ? phase_entities : entities)[pose->motion_index] : NULL;
+            if (entity) {
+                XgRenderMotionDrawBinding binding = {.motion = recipe->motions[pose->motion_index],
+                    .motion_part_index = pose->part,
+                    .triangle_count = pair, .native_exact = 1u};
+                *moved_any = 1;
+                for (uint32_t k = 0u; k < pair; ++k) {
+                    memcpy(binding.local[k], triangles[first + k].local, sizeof(binding.local[k]));
+                    memcpy(binding.vertex_ids[k], triangles[first + k].vertex_ids,
+                           sizeof(binding.vertex_ids[k]));
+                }
+                result = xg_render_motion_project_shared(&entity->evaluation, &binding,
+                    corner_endpoints ? corner_endpoints + first : NULL, screen, native);
+                for (uint32_t k = 0u; k < pair; ++k)
+                    for (uint32_t v = 0u; v < 3u; ++v) {
+                        vertex_screen[k][v] = screen[k][v]; vertex_native[k][v] = native[k][v];
+                    }
+            }
+        }
+        if (result != XG_RENDER_MOTION_ENDPOINT && result != XG_RENDER_MOTION_PROJECTED) continue;
+        for (uint32_t k = 0u; k < pair; ++k) {
+            /* A phase-only face exists only where its camera moved, and only
+             * while it faces this phase's camera. */
+            const int phase_only = (triangles[first + k].flags & XG_RENDER_NATIVE_MESH_PHASE_ONLY) != 0u;
+            if (phase_only && result != XG_RENDER_MOTION_PROJECTED) continue;
+            /* Moved in place in this phase's buffer. */
+            XgRenderIrTriangle *tri = &moved[kept].triangle;
+            *tri = triangles[first + k].triangle;
+            int valid = 1;
+            for (uint32_t v = 0u; v < 3u && valid; ++v) {
+                XgRenderIrVertex *vertex = &tri->vertices[v];
+                const int64_t x = (int64_t)vertex->x + dx, y = (int64_t)vertex->y + dy;
+                valid = x >= INT32_MIN && x <= INT32_MAX && y >= INT32_MIN && y <= INT32_MAX;
+                vertex->x = (int32_t)x; vertex->y = (int32_t)y;
+                if (vertex->native_view_position) {
+                    vertex->native_view_x = (int32_t)((int64_t)vertex->native_view_x + dx);
+                    vertex->native_view_y = (int32_t)((int64_t)vertex->native_view_y + dy);
+                }
+                if (vertex->projective_position) {
+                    vertex->projective_offset_x = (int32_t)((int64_t)vertex->projective_offset_x + dx);
+                    vertex->projective_offset_y = (int32_t)((int64_t)vertex->projective_offset_y + dy);
+                }
+                if (strip_native) vertex->native_view_position = false;
+                /* A corner behind the near plane is replaced by the clip,
+                 * a corner without an endpoint position placed below. */
+                if (valid && result == XG_RENDER_MOTION_PROJECTED && vertex_screen[k][v] &&
+                    !((near | placed) & (1u << v)))
+                    valid = native_mesh_vertex_move(vertex, vertex_screen[k][v], vertex_native[k][v]);
+            }
+            if (!valid) continue;
+            if (near | placed) {
+                /* The placement's reference: a corner moved the ordinary way. */
+                unsigned reference = 0u;
+                while (reference < 3u && ((near | placed) & (1u << reference))) ++reference;
+                if (reference == 3u) continue;
+                GlNativePhasePlacement placement;
+                native_phase_placement(&placement, &tri->vertices[reference], views[reference]);
+                for (uint32_t v = 0u; v < 3u && valid; ++v)
+                    if (placed & (1u << v)) valid = native_phase_place(&placement, views[v]->view, &tri->vertices[v]);
+                if (!valid) continue;
+                if (near) {
+                    const GlNativeTextureState texture = mesh->textures ? mesh->textures[first + k] : template_texture;
+                    XgRenderIrTriangle clipped[2];
+                    const uint32_t pieces = native_phase_clip_triangle(tri, views, near, &placement, clipped);
+                    for (uint32_t c = 0u; c < pieces; ++c) {
+                        moved[kept].triangle = clipped[c];
+                        moved[kept++].texture = texture;
+                    }
+                    continue;
+                }
+            }
+            if (phase_only) {
+                double area = 0.0;
+                for (uint32_t v = 0u; v < 3u; ++v) {
+                    const XgRenderIrVertex *a = &tri->vertices[v], *b = &tri->vertices[(v + 1u) % 3u];
+                    const double ax = a->native_view_position ? a->native_view_x : a->x;
+                    const double ay = a->native_view_position ? a->native_view_y : a->y;
+                    const double bx = b->native_view_position ? b->native_view_x : b->x;
+                    const double by = b->native_view_position ? b->native_view_y : b->y;
+                    area += ax * by - bx * ay;
+                }
+                if (!(area > 0.0)) continue;
+            }
+            moved[kept++].texture = mesh->textures ? mesh->textures[first + k] : template_texture;
+        }
+    }
+    *out = moved; *out_count = kept;
+    return 1;
+}
+
 static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativeMotionEntity *entities,
                              const GlNativeVertexCache *vertices, uint32_t phase, int use_view,
                              GlNativeRecipeStats *motion_audit,
                               uint16_t crop_y, uint16_t height, uint32_t **out_pixels,
                               uint16_t row_begin, uint16_t row_end, GlNativeGpuWork *gpu,
-                              const GlNativeMotionProjection *phase_projections) {
+                              const GlNativeMotionProjection *phase_projections,
+                              const GlNativeMotionEntity *phase_entities,
+                              const GlNativeMotionEndpoints *endpoints,
+                              const GlNativeMotionPhaseVertex *phase_vertices) {
     const uint32_t width = use_view ? recipe->view_width : recipe->width;
     GlNativeCompileAudit *audit = malloc(sizeof(*audit));
     if (audit) memset(audit, 0, offsetof(GlNativeCompileAudit, passes));
@@ -12791,6 +13816,60 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         texture.view.bytes = compiler.native_words;
         clut.view.bytes = compiler.native_words;
         if (semantic.material.textured && !record->textures) goto finished;
+        if (record->mesh) {
+            GlNativeGpuMeshTriangle *triangles;
+            uint32_t count;
+            /* Enabled across the whole interval (entities); evaluated at this
+             * phase (phase_entities, when the phase has its own copy). */
+            int entity = 0;
+            if (!native_mesh_phase_triangles(recipe, record, i, entities, phase_entities,
+                    endpoints, phase_vertices, &triangles, &count, &entity)) goto finished;
+            if (!count) continue;
+            if (!native_materialize_native_draw(&semantic, &draw)) goto finished;
+            draw.hd_texture = record->hd_texture;
+            if (!gpu) {
+                /* The CPU replay rasterizes the same moved triangles one at a
+                 * time, through the per-draw path. */
+                draw.primitive.triangle_count = 1u;
+                for (uint32_t t = 0u; t < count; ++t) {
+                    XgSemanticDrawRecord single = draw;
+                    single.primitive.triangles[0] = triangles[t].triangle;
+                    native_texture_state_apply(&single.primitive.material, &triangles[t].texture);
+                    if (use_view) {
+                        const GlNativeViewRaster raster = {.width = recipe->width, .height = recipe->height,
+                            .pixels = pixels, .depth = depth};
+                        if (!native_view_raster(&compiler, recipe->view_width, recipe->offset, &raster,
+                            &single, i, record->enhanced, record->view_origin_y)) goto finished;
+                    } else if (!native_render_draw(&compiler, &target, &single, i)) goto finished;
+                }
+                if (entity) motion_audit->motion_projected_draws++;
+                continue;
+            }
+            compiler.mesh_base = (const uint8_t *)&triangles[0].triangle;
+            compiler.mesh_textures = (const uint8_t *)&triangles[0].texture;
+            compiler.mesh_stride = sizeof(*triangles);
+            compiler.mesh_count = count;
+            compiler.mesh_writable = triangles;
+            int drawn;
+            if (use_view) {
+                const GlNativeViewRaster raster = {.width = recipe->width, .height = recipe->height,
+                    .pixels = pixels, .depth = depth};
+                drawn = native_view_raster(&compiler, recipe->view_width, recipe->offset, &raster,
+                    &draw, i, record->enhanced, recipe->origin_y);
+            } else {
+                draw.primitive.material.draw_offset_x += recipe->origin_x;
+                draw.primitive.material.draw_offset_y += recipe->origin_y;
+                draw.primitive.material.draw_area_left += recipe->origin_x;
+                draw.primitive.material.draw_area_right += recipe->origin_x;
+                draw.primitive.material.draw_area_top += recipe->origin_y;
+                draw.primitive.material.draw_area_bottom += recipe->origin_y;
+                drawn = native_gpu_draw_mesh(&compiler, &draw, 0, triangles, count);
+            }
+            compiler.mesh_count = 0u; compiler.mesh_writable = NULL;
+            if (!drawn) goto finished;
+            if (entity) motion_audit->motion_projected_draws++;
+            continue;
+        }
         if (entities && record->motion.motion.handle.resource_id &&
             record->motion_index < recipe->motion_count && entities[record->motion_index].enabled) {
             const GlNativeMotionProjection *projection = phase_projections ? &phase_projections[i]
@@ -12940,7 +14019,7 @@ finished:
 static int native_recipe_stripe_thread(void *data) {
     GlNativeRecipeStripe *job = data;
     job->ok = native_recipe_render_rows(job->recipe, job->entities, job->vertices, job->phase,
-        job->use_view, &job->stats, job->crop_y, job->height, &job->pixels, job->begin, job->end, NULL, NULL);
+        job->use_view, &job->stats, job->crop_y, job->height, &job->pixels, job->begin, job->end, NULL, NULL, NULL, NULL, NULL);
     return job->ok;
 }
 
@@ -13105,6 +14184,30 @@ static void native_motion_vertices_discard(GlNativeVertexCache *cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
+static uint32_t native_recipe_record_triangles(const GlNativeRecipeDraw *draw) {
+    return draw->mesh ? draw->mesh->count : draw->semantic.triangle_count;
+}
+
+static const GpuRenderSemanticVertex *native_semantic_vertex(const XgRenderIrVertex *source,
+                                                             GpuRenderSemanticVertex *target) {
+    memset(target, 0, sizeof(*target));
+#define NATIVE_COPY_VERTEX(field) target->field = source->field
+    NATIVE_COPY_VERTEX(x); NATIVE_COPY_VERTEX(y); NATIVE_COPY_VERTEX(u); NATIVE_COPY_VERTEX(v);
+    NATIVE_COPY_VERTEX(r); NATIVE_COPY_VERTEX(g); NATIVE_COPY_VERTEX(b);
+    NATIVE_COPY_VERTEX(native_view_x); NATIVE_COPY_VERTEX(native_view_y);
+    NATIVE_COPY_VERTEX(native_view_position); NATIVE_COPY_VERTEX(native_view_depth);
+    NATIVE_COPY_VERTEX(projective_view_x); NATIVE_COPY_VERTEX(projective_view_y);
+    NATIVE_COPY_VERTEX(projective_view_z);
+    NATIVE_COPY_VERTEX(projective_offset_x); NATIVE_COPY_VERTEX(projective_offset_y);
+    NATIVE_COPY_VERTEX(projective_native_offset_x); NATIVE_COPY_VERTEX(projective_native_offset_y);
+    NATIVE_COPY_VERTEX(projective_distance); NATIVE_COPY_VERTEX(projective_position);
+    NATIVE_COPY_VERTEX(temporal_depth); NATIVE_COPY_VERTEX(temporal_depth_valid);
+    NATIVE_COPY_VERTEX(interpolation_group_id); NATIVE_COPY_VERTEX(interpolation_vertex_id);
+    NATIVE_COPY_VERTEX(interpolation_vertex_identity_valid);
+#undef NATIVE_COPY_VERTEX
+    return target;
+}
+
 static void native_motion_vertex_sample(GlNativeVertexSample *sample, const GpuRenderSemanticVertex *p,
                                       int32_t dx, int32_t dy, uint16_t offset) {
     memset(sample, 0, sizeof(*sample));
@@ -13198,12 +14301,47 @@ static int native_motion_texture_footprint_equal(
     return 1;
 }
 
+static int native_motion_group_compare(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The vertex mesh of an unscoped producer (meshes[0, mesh_count) are the
+ * sorted unique keys), or UINT32_MAX. Not resolved to its root. */
+static uint32_t native_motion_mesh_find(const GlNativeVertexCache *cache, uint64_t scene, uint32_t producer) {
+    uint32_t lo = 0u, hi = cache->mesh_count;
+    const GlNativeVertexMesh key = {.scene = scene, .producer = producer};
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2u;
+        GlNativeVertexMesh probe = cache->meshes[mid];
+        probe.draw = 0u;
+        if (native_motion_mesh_compare(&probe, &key) < 0) lo = mid + 1u; else hi = mid;
+    }
+    if (lo == cache->mesh_count) return UINT32_MAX;
+    const GlNativeVertexMesh *found = &cache->meshes[lo];
+    return found->scene == scene && found->producer == producer && !found->scope && !found->component
+        ? lo : UINT32_MAX;
+}
+
 static int native_motion_vertices(const GlNativeRecipe *previous, const GlNativeRecipe *current,
                                 uint32_t phases, GlNativeVertexCache *cache, GlNativeVertexDiagnostics *diag) {
-    const size_t capacity = ((size_t)previous->count + current->count) * 6u;
+    size_t capacity = 0u;
+    for (unsigned frame = 0u; frame < 2u; ++frame) {
+        const GlNativeRecipe *recipe = frame ? current : previous;
+        for (uint32_t i = 0u; i < recipe->count; ++i)
+            capacity += native_recipe_record_triangles(&recipe->draws[i]) * 3u;
+    }
+    /* A coalesced run that crosses objects owns one vertex mesh per pose
+     * owner, besides its record's. */
+    size_t mesh_capacity = current->count;
+    for (uint32_t i = 0u; i < current->count; ++i) {
+        const GlNativeRecipeMesh *mesh = current->draws[i].mesh;
+        for (uint32_t t = 0u; mesh && mesh->poses && t < mesh->count; ++t)
+            mesh_capacity += !t || !native_recipe_pose_equal(&mesh->poses[t], &mesh->poses[t - 1u]);
+    }
     GlNativeVertexUse *uses = malloc((capacity ? capacity : 1u) * sizeof(*uses));
     cache->pairs = malloc((capacity ? capacity : 1u) * sizeof(*cache->pairs));
-    cache->meshes = calloc(current->count ? current->count : 1u, sizeof(*cache->meshes));
+    cache->meshes = calloc(mesh_capacity ? mesh_capacity : 1u, sizeof(*cache->meshes));
     cache->map = malloc((current->count ? current->count : 1u) * sizeof(*cache->map));
     cache->draw_mesh = malloc((current->count ? current->count : 1u) * sizeof(*cache->draw_mesh));
     if (!uses || !cache->pairs || !cache->meshes || !cache->map || !cache->draw_mesh) {
@@ -13221,6 +14359,14 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
         cache->meshes[mesh_uses++] = (GlNativeVertexMesh){.scene = s->interpolation_identity.scene_id,
             .producer = s->interpolation_identity.producer_id, .draw = i, .component = draw->temporal_component,
             .scope = draw->temporal_component ? current->coverages[draw->temporal_index].view.header->producer_scope : 0u};
+        const GlNativeRecipeMesh *mesh = draw->mesh;
+        for (uint32_t t = 0u; mesh && mesh->poses && t < mesh->count; ++t) {
+            const GlNativeRecipeMeshPose *pose = &mesh->poses[t];
+            if ((t && native_recipe_pose_equal(pose, &mesh->poses[t - 1u])) ||
+                !pose->scene_id || !pose->producer_id) continue;
+            cache->meshes[mesh_uses++] = (GlNativeVertexMesh){.scene = pose->scene_id,
+                .producer = pose->producer_id, .draw = UINT32_MAX};
+        }
     }
     qsort(cache->meshes, mesh_uses, sizeof(*cache->meshes), native_motion_mesh_compare);
     for (uint32_t i = 0u; i < mesh_uses; ++i) {
@@ -13233,8 +14379,41 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
             cache->meshes[cache->mesh_count].parent = cache->mesh_count;
             cache->mesh_count++;
         }
-        cache->draw_mesh[use.draw] = cache->mesh_count - 1u;
+        if (use.draw != UINT32_MAX) cache->draw_mesh[use.draw] = cache->mesh_count - 1u;
     }
+    /* Pairs only move unbound meshes; a pose-bound draw's vertices matter
+     * solely where they alias an unbound draw's (same group), joining that
+     * mesh and holding it discrete. Vertices of bound draws in groups no
+     * unbound draw uses can join nothing unbound: leave them out. */
+    uint32_t *unbound_groups = NULL, unbound_group_count = 0u;
+    for (unsigned frame = 0u; frame < 2u; ++frame) {
+        const GlNativeRecipe *recipe = frame ? current : previous;
+        for (uint32_t i = 0u; i < recipe->count; ++i) {
+            const GlNativeRecipeDraw *draw = &recipe->draws[i];
+            const GpuRenderSemantic *s = &draw->semantic;
+            if (draw->motion.motion.handle.resource_id ||
+                s->topology != GPU_RENDER_SEMANTIC_TRIANGLES || s->screen_space_2d ||
+                s->native_view_effect || !s->interpolation_identity.scene_id) continue;
+            for (uint32_t t = 0u; t < s->triangle_count; ++t)
+                for (uint32_t v = 0u; v < 3u; ++v) {
+                    const GpuRenderSemanticVertex *p = &s->triangles[t].vertices[v];
+                    if (!p->interpolation_vertex_identity_valid || !p->interpolation_group_id) continue;
+                    if (unbound_group_count % 1024u == 0u) {
+                        uint32_t *grown = realloc(unbound_groups,
+                            (unbound_group_count + 1024u) * sizeof(*grown));
+                        if (!grown) {
+                            free(unbound_groups); free(uses);
+                            native_motion_vertices_discard(cache); return 0;
+                        }
+                        unbound_groups = grown;
+                    }
+                    unbound_groups[unbound_group_count++] = p->interpolation_group_id;
+                }
+        }
+    }
+    if (unbound_group_count)
+        qsort(unbound_groups, unbound_group_count, sizeof(*unbound_groups),
+              native_motion_group_compare);
     for (unsigned frame = 0u; frame < 2u; ++frame) {
         const GlNativeRecipe *recipe = frame ? current : previous;
         for (uint32_t i = 0u; i < recipe->count; ++i) {
@@ -13242,24 +14421,45 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
             const GpuRenderSemantic *s = &draw->semantic;
             if (s->topology != GPU_RENDER_SEMANTIC_TRIANGLES || s->screen_space_2d || s->native_view_effect ||
                 !s->interpolation_identity.scene_id) continue;
-            for (uint32_t t = 0u; t < s->triangle_count; ++t)
+            const int bound = draw->motion.motion.handle.resource_id != 0u;
+            if (bound && !unbound_group_count) continue;
+            /* A coalesced run's polygons live in its mesh, already relocated
+             * like a DRAW's; a MESH operation's expansion is not. */
+            const int32_t dx = !draw->mesh || draw->mesh->relocated ? draw->projection_offset_x : 0;
+            const int32_t dy = !draw->mesh || draw->mesh->relocated ? draw->projection_offset_y : 0;
+            const uint32_t triangles = native_recipe_record_triangles(draw);
+            const GlNativeRecipeMeshPose *poses = draw->mesh ? draw->mesh->poses : NULL;
+            for (uint32_t t = 0u; t < triangles; ++t)
                 for (uint32_t v = 0u; v < 3u; ++v) {
-                    const GpuRenderSemanticVertex *p = &s->triangles[t].vertices[v];
-                    if (!p->interpolation_vertex_identity_valid || !p->interpolation_group_id ||
-                        (frame && cache->draw_mesh[i] == UINT32_MAX)) continue;
+                    GpuRenderSemanticVertex mesh_vertex;
+                    const GpuRenderSemanticVertex *p = draw->mesh
+                        ? native_semantic_vertex(&draw->mesh->triangles[t].triangle.vertices[v], &mesh_vertex)
+                        : &s->triangles[t].vertices[v];
+                    /* A triangle of a run crossing objects joins its own
+                     * pose owner's mesh. */
+                    const uint64_t scene = poses ? poses[t].scene_id : s->interpolation_identity.scene_id;
+                    const uint32_t owner_mesh = !frame ? UINT32_MAX : poses
+                        ? native_motion_mesh_find(cache, poses[t].scene_id, poses[t].producer_id)
+                        : cache->draw_mesh[i];
+                    if (!p->interpolation_vertex_identity_valid || !p->interpolation_group_id || !scene ||
+                        (frame && owner_mesh == UINT32_MAX)) continue;
+                    if (bound && (!unbound_group_count ||
+                        !bsearch(&p->interpolation_group_id, unbound_groups, unbound_group_count,
+                                 sizeof(*unbound_groups), native_motion_group_compare))) continue;
                     GlNativeVertexUse *use = &uses[use_count++];
-                    use->scene = s->interpolation_identity.scene_id;
+                    use->scene = scene;
                     use->component = draw->temporal_component;
                     use->scope = draw->temporal_component ? recipe->coverages[draw->temporal_index].view.header->producer_scope : 0u;
                     use->group = p->interpolation_group_id; use->vertex = p->interpolation_vertex_id;
                     use->frame = (uint8_t)frame; use->draw = i; use->corner = t * 3u + v;
-                    use->mesh = frame ? cache->draw_mesh[i] : UINT32_MAX;
+                    use->mesh = owner_mesh;
                     /* Strip destination relocation only, never recover 3D from
                      * screen XY. Canonical and Native anchors remain distinct. */
-                    native_motion_vertex_sample(&use->sample, p, draw->projection_offset_x, draw->projection_offset_y, recipe->offset);
+                    native_motion_vertex_sample(&use->sample, p, dx, dy, recipe->offset);
                 }
         }
     }
+    free(unbound_groups);
     const GlNativeVertexUse **ordered = NULL;
     if (!native_motion_vertex_order(uses, use_count, &ordered)) {
         free(uses); native_motion_vertices_discard(cache); return 0;
@@ -13282,7 +14482,8 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
             else pair->endpoints[use->frame] = use->sample;
             seen |= 1u << use->frame;
             if (!use->frame) { pair->previous_draw = use->draw; continue; }
-            cache->map[use->draw][use->corner] = cache->pair_count;
+            /* Only unbound draws (at most two triangles) read the map. */
+            if (use->corner < 6u) cache->map[use->draw][use->corner] = cache->pair_count;
             const uint32_t root = native_motion_mesh_root(cache, use->mesh);
             if (mesh == UINT32_MAX) mesh = root;
             else cache->meshes[root].parent = mesh = native_motion_mesh_root(cache, mesh);
@@ -13328,7 +14529,17 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
         if (cache->draw_mesh[i] == UINT32_MAX) continue;
         const uint32_t root = cache->draw_mesh[i] = native_motion_mesh_root(cache, cache->draw_mesh[i]);
         GlNativeVertexMesh *mesh = &cache->meshes[root];
-        if (current->draws[i].motion.motion.handle.resource_id) { mesh->bound = 1u; continue; }
+        if (current->draws[i].motion.motion.handle.resource_id) {
+            mesh->bound = 1u;
+            const GlNativeRecipeMesh *run = current->draws[i].mesh;
+            for (uint32_t t = 0u; run && run->poses && t < run->count; ++t) {
+                if (t && native_recipe_pose_equal(&run->poses[t], &run->poses[t - 1u])) continue;
+                const uint32_t owner = native_motion_mesh_find(cache, run->poses[t].scene_id,
+                    run->poses[t].producer_id);
+                if (owner != UINT32_MAX) cache->meshes[native_motion_mesh_root(cache, owner)].bound = 1u;
+            }
+            continue;
+        }
         mesh->unbound = 1u;
         for (uint32_t v = 0u; v < current->draws[i].semantic.triangle_count * 3u; ++v) {
             const uint32_t key = cache->map[i][v];
@@ -13414,6 +14625,34 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
     return 1;
 }
 
+/* One pose-bound draw (or triangle of a run) and its entity: a single owner
+ * producer/scene/component/scope, a bound current pose, recorded source
+ * history, and no unbound geometry in its producer's vertex mesh. */
+static void native_motion_entity_owner(const GlNativeRecipe *previous, const GlNativeRecipe *current,
+                                       const GlNativeRecipeDraw *draw, uint32_t i,
+                                       GlNativeMotionEntity *entity,
+                                       const GpuRenderInterpolationIdentity *owner,
+                                       int pose_current, int partial) {
+    const uint32_t scope = draw->temporal_component ? current->coverages[draw->temporal_index].view.header->producer_scope : 0u;
+    if (draw->semantic.screen_space_2d || !pose_current ||
+        !owner->valid || !owner->producer_id || (entity->owner_producer &&
+        (entity->owner_producer != owner->producer_id || entity->owner_scene != owner->scene_id ||
+         entity->owner_component != draw->temporal_component || entity->owner_scope != scope))) {
+        entity->enabled = 0;
+        native_motion_reject("entity_producer_conflict", entity->current_pose, i, owner->producer_id);
+    }
+    entity->owner_scene = owner->scene_id; entity->owner_producer = owner->producer_id;
+    entity->owner_component = draw->temporal_component; entity->owner_scope = scope;
+    if (draw->temporal_component && !native_coverage_previous(previous, current, draw)) {
+        entity->enabled = 0;
+        native_motion_reject("component_publication_history", entity->current_pose, i, owner->producer_id);
+    }
+    if (partial) {
+        entity->enabled = 0;
+        native_motion_reject("partial_entity_binding", entity->current_pose, i, owner->producer_id);
+    }
+}
+
 static void native_motion_entities(const GlNativeRecipe *previous, const GlNativeRecipe *current,
                                const XgPresentationIdentity *identity, const GlNativeVertexCache *vertices,
                                GlNativeMotionEntity *entities) {
@@ -13462,26 +14701,28 @@ static void native_motion_entities(const GlNativeRecipe *previous, const GlNativ
     for (uint32_t i = 0u; i < current->count; ++i) {
         const GlNativeRecipeDraw *draw = &current->draws[i];
         if (!draw->motion.motion.handle.resource_id || draw->motion_index >= current->motion_count) continue;
-        GlNativeMotionEntity *entity = &entities[draw->motion_index];
-        const GpuRenderInterpolationIdentity *owner = &draw->semantic.interpolation_identity;
-        const uint32_t scope = draw->temporal_component ? current->coverages[draw->temporal_index].view.header->producer_scope : 0u;
-        if (draw->semantic.screen_space_2d || !native_motion_ref_equal(draw->motion.motion, current->motions[draw->motion_index]) ||
-            !owner->valid || !owner->producer_id || (entity->owner_producer &&
-            (entity->owner_producer != owner->producer_id || entity->owner_scene != owner->scene_id ||
-             entity->owner_component != draw->temporal_component || entity->owner_scope != scope))) {
-            entity->enabled = 0;
-            native_motion_reject("entity_producer_conflict", entity->current_pose, i, owner->producer_id);
+        const GlNativeRecipeMesh *run = draw->mesh;
+        if (run && run->poses) {
+            /* A run crossing objects: the same ownership rules for each
+             * triangle's own pose, as if it were still its own draw. */
+            for (uint32_t t = 0u; t < run->count; ++t) {
+                const GlNativeRecipeMeshPose *pose = &run->poses[t];
+                if (t && native_recipe_pose_equal(pose, &run->poses[t - 1u])) continue;
+                if (pose->motion_index >= current->motion_count) continue;
+                const GpuRenderInterpolationIdentity owner = {.scene_id = pose->scene_id,
+                    .producer_id = pose->producer_id, .valid = pose->identity_valid};
+                uint32_t owner_mesh = native_motion_mesh_find(vertices, pose->scene_id, pose->producer_id);
+                while (owner_mesh != UINT32_MAX && vertices->meshes[owner_mesh].parent != owner_mesh)
+                    owner_mesh = vertices->meshes[owner_mesh].parent;
+                native_motion_entity_owner(previous, current, draw, i, &entities[pose->motion_index],
+                    &owner, 1, owner_mesh != UINT32_MAX && vertices->meshes[owner_mesh].unbound);
+            }
+            continue;
         }
-        entity->owner_scene = owner->scene_id; entity->owner_producer = owner->producer_id;
-        entity->owner_component = draw->temporal_component; entity->owner_scope = scope;
-        if (draw->temporal_component && !native_coverage_previous(previous, current, draw)) {
-            entity->enabled = 0;
-            native_motion_reject("component_publication_history", entity->current_pose, i, owner->producer_id);
-        }
-        if (vertices->draw_mesh[i] != UINT32_MAX && vertices->meshes[vertices->draw_mesh[i]].unbound) {
-            entity->enabled = 0;
-            native_motion_reject("partial_entity_binding", entity->current_pose, i, owner->producer_id);
-        }
+        native_motion_entity_owner(previous, current, draw, i, &entities[draw->motion_index],
+            &draw->semantic.interpolation_identity,
+            native_motion_ref_equal(draw->motion.motion, current->motions[draw->motion_index]),
+            vertices->draw_mesh[i] != UINT32_MAX && vertices->meshes[vertices->draw_mesh[i]].unbound);
     }
     for (uint32_t i = 0u; i < current->motion_count; ++i) {
         if (!entities[i].owner_producer) entities[i].enabled = 0;
@@ -13518,8 +14759,8 @@ static void native_motion_entities(const GlNativeRecipe *previous, const GlNativ
     free(previous_poses);
 }
 
-static void native_motion_preflight(const GlNativeRecipe *recipe, GlNativeMotionEntity *entities,
-                                 double alpha, int advance, GlNativeMotionProjection *projections, uint32_t *evaluations) {
+static void native_motion_evaluate_entities(const GlNativeRecipe *recipe, GlNativeMotionEntity *entities,
+                                            double alpha, int advance, uint32_t *evaluations) {
     for (uint32_t i = 0u; i < recipe->motion_count; ++i) {
         if (!entities[i].enabled) continue;
         (*evaluations)++;
@@ -13531,14 +14772,21 @@ static void native_motion_preflight(const GlNativeRecipe *recipe, GlNativeMotion
             native_motion_reject("pose_evaluation", entities[i].current_pose, UINT32_MAX, entities[i].owner_producer);
         }
     }
+}
+
+static void native_motion_project_draws(const GlNativeRecipe *recipe, GlNativeMotionEntity *entities,
+                                        GlNativeMotionProjection *projections,
+                                        const GlNativeMotionEndpoints *endpoints) {
     for (uint32_t i = 0u; i < recipe->count; ++i) {
         const GlNativeRecipeDraw *draw = &recipe->draws[i];
-        if (!draw->motion.motion.handle.resource_id || draw->motion_index >= recipe->motion_count) continue;
+        if (!draw->motion.motion.handle.resource_id || draw->motion_index >= recipe->motion_count ||
+            draw->mesh) continue;
         GlNativeMotionEntity *entity = &entities[draw->motion_index];
         if (!entity->enabled) continue;
         GlNativeMotionProjection *projection = &projections[i];
-        const XgRenderMotionProjectResult result = projection->result = xg_render_motion_project(
-            &entity->evaluation, &draw->motion, projection->screen, projection->native);
+        const XgRenderMotionProjectResult result = projection->result = xg_render_motion_project_shared(
+            &entity->evaluation, &draw->motion, native_motion_endpoints_at(endpoints, i, 0u),
+            projection->screen, projection->native);
         if (result == XG_RENDER_MOTION_ENDPOINT) continue;
         int valid = result == XG_RENDER_MOTION_PROJECTED;
         for (uint32_t t = 0u; valid && t < draw->semantic.triangle_count; ++t)
@@ -13558,6 +14806,79 @@ static void native_motion_preflight(const GlNativeRecipe *recipe, GlNativeMotion
     }
 }
 
+static void native_motion_preflight(const GlNativeRecipe *recipe, GlNativeMotionEntity *entities,
+                                 double alpha, int advance, GlNativeMotionProjection *projections, uint32_t *evaluations) {
+    native_motion_evaluate_entities(recipe, entities, alpha, advance, evaluations);
+    native_motion_project_draws(recipe, entities, projections, NULL);
+}
+
+/* Records [begin, end) of endpoint job `job`: every pose-bound DRAW corner's
+ * endpoints, and every mesh corner's unique vertex (deduplicated by pose,
+ * part and LOCAL position within the job) with its endpoints, all under the
+ * entities' evaluated pairs (shared by all phases of the interval). */
+static void native_motion_endpoints_compute(const GlNativeRecipe *recipe, const GlNativeMotionEntity *entities,
+                                            GlNativeMotionEndpoints *endpoints,
+                                            uint32_t begin, uint32_t end, uint32_t job) {
+    const uint32_t base = endpoints->offsets[begin];
+    uint32_t unique = base;
+    /* Open-addressed slots of this job's unique vertices. */
+    uint32_t capacity = 64u;
+    while (capacity < 2u * (endpoints->offsets[end] - base)) capacity *= 2u;
+    uint32_t *table = endpoints->corner_vertices ? malloc((size_t)capacity * sizeof(*table)) : NULL;
+    if (table) memset(table, 0xff, (size_t)capacity * sizeof(*table));
+    for (uint32_t i = begin; i < end; ++i) {
+        const GlNativeRecipeDraw *draw = &recipe->draws[i];
+        const uint32_t first = endpoints->offsets[i];
+        const uint32_t count = endpoints->offsets[i + 1u] - first;
+        XgRenderMotionVertexEndpoints *corners = endpoints->corners + first;
+        for (uint32_t c = 0u; c < count; ++c) corners[c].valid = 0u;
+        if (!count) continue;
+        const GlNativeRecipeMesh *mesh = draw->mesh;
+        if (!mesh) {
+            if (draw->motion_index < recipe->motion_count && entities[draw->motion_index].enabled)
+                (void)xg_render_motion_project_endpoints(&entities[draw->motion_index].evaluation,
+                    &draw->motion, (XgRenderMotionVertexEndpoints (*)[3])(void *)corners);
+            continue;
+        }
+        uint32_t *corner_vertices = endpoints->corner_vertices + first;
+        for (uint32_t t = 0u; t < mesh->count; ++t) {
+            const uint32_t motion_index = mesh->poses ? mesh->poses[t].motion_index : draw->motion_index;
+            const uint32_t part = mesh->poses ? mesh->poses[t].part : draw->motion.motion_part_index;
+            const int enabled = table && motion_index < recipe->motion_count && entities[motion_index].enabled;
+            for (uint32_t v = 0u; v < 3u; ++v) {
+                uint32_t *corner = &corner_vertices[(size_t)t * 3u + v];
+                *corner = UINT32_MAX;
+                if (!enabled) continue;
+                const XgHost3dVector *p = &mesh->triangles[t].local[v];
+                uint64_t key = (uint16_t)p->x | (uint64_t)(uint16_t)p->y << 16u |
+                    (uint64_t)(uint16_t)p->z << 32u | (uint64_t)(part & 0xffffu) << 48u;
+                key = (key ^ (uint64_t)motion_index * UINT64_C(0x9e3779b97f4a7c15)) *
+                    UINT64_C(0xbf58476d1ce4e5b9);
+                for (uint32_t h = (uint32_t)(key >> 32u) & (capacity - 1u);; h = (h + 1u) & (capacity - 1u)) {
+                    const uint32_t slot = table[h];
+                    if (slot == UINT32_MAX) {
+                        GlNativeMotionVertex *vertex = &endpoints->vertices[unique];
+                        vertex->local = *p; vertex->motion_index = motion_index; vertex->part = part;
+                        (void)xg_render_motion_vertex_endpoints(&entities[motion_index].evaluation, part, p,
+                            &endpoints->vertex_endpoints[unique]);
+                        table[h] = *corner = unique++;
+                        break;
+                    }
+                    const GlNativeMotionVertex *vertex = &endpoints->vertices[slot];
+                    if (vertex->motion_index == motion_index && vertex->part == part &&
+                        vertex->local.x == p->x && vertex->local.y == p->y && vertex->local.z == p->z) {
+                        *corner = slot;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    free(table);
+    endpoints->ranges[job][0] = base;
+    endpoints->ranges[job][1] = unique;
+}
+
 /* Phases read the same immutable recipe but write independent projections and
  * command journals. Only the compile owner merges/publishes those journals;
  * all OpenGL execution stays on its existing FIFO owner. */
@@ -13567,6 +14888,8 @@ typedef struct GlNativePhaseJob {
     const GlNativeMotionEntity *render_entities;
     GlNativeMotionEntity *entities;
     GlNativeMotionProjection *projections;
+    GlNativeMotionEndpoints *endpoints;
+    uint32_t endpoint_begin, endpoint_end; /* records of an endpoint job */
     const uint16_t *initial_words;
     XgPresentationIdentity identity;
     GlNativeGpuWork *gpu;
@@ -13616,17 +14939,25 @@ static void native_motion_entity_copy(GlNativeMotionEntity *target, const GlNati
     memcpy(a->curve_wrap_shift, b->curve_wrap_shift, sizeof(b->curve_wrap_shift));
 }
 
+enum { NATIVE_PHASE_PREFLIGHT = 0, NATIVE_PHASE_CAPTURE = 1, NATIVE_PHASE_ENDPOINTS = 2 };
+
 static void native_phase_job_execute(GlNativePhaseJob *job, int capture) {
+    if (capture == NATIVE_PHASE_ENDPOINTS) {
+        native_motion_endpoints_compute(job->recipe, job->render_entities, job->endpoints,
+            job->endpoint_begin, job->endpoint_end, job->phase);
+        return;
+    }
     if (!capture) {
         for (uint32_t i = 0u; i < job->recipe->motion_count; ++i)
             native_motion_entity_copy(&job->entities[i], &job->render_entities[i]);
-        /* Phase zero prepared the shared endpoint curves before the copies.
+        /* Phase zero evaluated the shared endpoint curves before the copies.
          * Each other phase advances its own copy without evaluating endpoints
-         * again, and can disable only its private entity flags. */
+         * again, and can disable only its private entity flags. Every phase
+         * projects its own draws over the interval's shared corner endpoints. */
         if (job->phase)
-            native_motion_preflight(job->recipe, job->entities,
-                (double)(job->phase + 1u) / job->denominator, 1,
-                job->projections, &job->evaluations);
+            native_motion_evaluate_entities(job->recipe, job->entities,
+                (double)(job->phase + 1u) / job->denominator, 1, &job->evaluations);
+        native_motion_project_draws(job->recipe, job->entities, job->projections, job->endpoints);
         return;
     }
     GlNativeGpuWork *gpu = job->gpu = calloc(1u, sizeof(*gpu));
@@ -13648,9 +14979,19 @@ static void native_phase_job_execute(GlNativePhaseJob *job, int capture) {
         reset->w = VRAM_W; reset->h = VRAM_H;
     }
     uint32_t *unused = NULL;
+    /* Each unique mesh vertex's part of this phase, once. */
+    GlNativeMotionPhaseVertex *phase_vertices = NULL;
+    if (job->endpoints && job->endpoints->corner_vertices) {
+        phase_vertices = malloc((job->endpoints->corner_count ? job->endpoints->corner_count : 1u) *
+            sizeof(*phase_vertices));
+        if (!phase_vertices) return;
+        native_motion_phase_vertices(job->endpoints, job->render_entities, job->entities, phase_vertices);
+    }
     job->ok = native_recipe_render_rows(job->recipe, job->render_entities, job->vertices,
         job->phase, job->recipe->view_width != 0u, &job->stats, job->crop_y,
-        job->height, &unused, 0u, job->height, gpu, job->projections);
+        job->height, &unused, 0u, job->height, gpu, job->projections, job->entities, job->endpoints,
+        phase_vertices);
+    free(phase_vertices);
     free(unused);
     /* The private word shadow only diffs texture pages while rows render;
      * merge transfers commands and data, never words. */
@@ -13785,6 +15126,12 @@ static int native_phase_merge(GlNativeGpuWork *target, GlNativePhaseJob *job,
         if (!commands) return 0;
         target->commands = commands;
     }
+    /* Mesh triangles keep their 8-byte alignment in the merged blob. */
+    static const uint8_t pad[8];
+    if (source->bytes && (target->bytes & 7u)) {
+        uint32_t ignored;
+        if (!native_gpu_data(target, pad, 8u - (target->bytes & 7u), &ignored)) return 0;
+    }
     uint32_t data_offset = target->bytes;
     if (source->bytes && !native_gpu_data(target, source->data, source->bytes, &data_offset)) return 0;
     /* Each private journal starts from the same raw-word shadow. Restore that
@@ -13798,7 +15145,8 @@ static int native_phase_merge(GlNativeGpuWork *target, GlNativePhaseJob *job,
     GlNativeGpuCommand *commands = target->commands + target->count;
     memcpy(commands, source->commands, (size_t)source->count * sizeof(*commands));
     for (uint32_t i = 0u; i < source->count; ++i)
-        if (commands[i].kind == NATIVE_GPU_WORDS || commands[i].kind == NATIVE_GPU_SEED)
+        if (commands[i].kind == NATIVE_GPU_WORDS || commands[i].kind == NATIVE_GPU_SEED ||
+            (commands[i].kind == NATIVE_GPU_DRAW && commands[i].mesh_count))
             commands[i].data += data_offset;
     target->count += source->count;
     const uint32_t plane = GL_NATIVE_GPU_PHASE_BASE + job->phase;
@@ -13857,6 +15205,20 @@ static void native_motion_probe_discard(void) {
     memset(probe, 0, sizeof(*probe));
 }
 
+/* Meshes are rebuilt every source frame: equal by content, like semantic. */
+static int native_recipe_mesh_equal(const GlNativeRecipeMesh *a, const GlNativeRecipeMesh *b) {
+    if (a == b) return 1;
+    if (!a || !b || a->count != b->count || a->relocated != b->relocated ||
+        !a->textures != !b->textures ||
+        memcmp(a->triangles, b->triangles, (size_t)a->count * sizeof(a->triangles[0]))) return 0;
+    for (uint32_t t = 0u; a->textures && t < a->count; ++t)
+        if (!native_texture_state_equal(&a->textures[t], &b->textures[t])) return 0;
+    if (!a->poses != !b->poses) return 0;
+    for (uint32_t t = 0u; a->poses && t < a->count; ++t)
+        if (!native_recipe_pose_equal(&a->poses[t], &b->poses[t])) return 0;
+    return 1;
+}
+
 static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRecipe *b) {
     if (a == b) return 1; /* Retained recipes are immutable through COPY/COW. */
     if (!a || !b || a->count != b->count || a->motion_count != b->motion_count || a->coverage_count != b->coverage_count ||
@@ -13881,7 +15243,8 @@ static int native_motion_recipe_equal(const GlNativeRecipe *a, const GlNativeRec
             x->temporal_index != y->temporal_index || x->temporal_component != y->temporal_component ||
             x->enhanced != y->enhanced || x->view_origin_y != y->view_origin_y ||
             x->dither_x != y->dither_x || x->dither_y != y->dither_y ||
-            memcmp(&x->hd_texture, &y->hd_texture, sizeof(x->hd_texture))) return 0;
+            memcmp(&x->hd_texture, &y->hd_texture, sizeof(x->hd_texture)) ||
+            !native_recipe_mesh_equal(x->mesh, y->mesh)) return 0;
     }
     return 1;
 }
@@ -13906,6 +15269,7 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
     GlNativeVertexDiagnostics vertex_diag = {.vblank = header->identity.guest_vblank_sequence};
     GlNativeMotionEntity *entities = NULL;
     GlNativeMotionProjection *projections = NULL;
+    GlNativeMotionEndpoints endpoints = {0};
     GlNativePhaseJob phase_jobs[GL_NATIVE_MOTION_PHASE_CAPACITY] = {0};
     uint32_t phase_job_count = 0u, phase_initial_words_offset = 0u;
     int phase_capture_active = 0;
@@ -14031,14 +15395,38 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
     if (views->gpu && views->gpu->scanout) {
         /* Evaluate endpoint curves once. Copies retain those exact curves and
          * source GTE anchors; workers only advance/project their own phase. */
-        native_motion_preflight(recipe, entities, 1.0 / denominator, 0,
-            projections, &audit->motion_evaluations);
+        native_motion_evaluate_entities(recipe, entities, 1.0 / denominator, 0, &audit->motion_evaluations);
+        /* Every corner's endpoint projection and anchors are the same in all
+         * phases: compute them once, split across the workers, instead of
+         * again in each phase's thread. */
+        endpoints.offsets = malloc(((size_t)recipe->count + 1u) * sizeof(*endpoints.offsets));
+        if (!endpoints.offsets) goto finished;
+        uint32_t corners = 0u;
+        for (uint32_t i = 0u; i < recipe->count; ++i) {
+            endpoints.offsets[i] = corners;
+            const GlNativeRecipeDraw *draw = &recipe->draws[i];
+            if (draw->motion.motion.handle.resource_id) {
+                const uint32_t triangles = draw->mesh ? draw->mesh->count : draw->motion.triangle_count;
+                if (triangles > (UINT32_MAX - corners) / 3u) goto finished;
+                corners += triangles * 3u;
+            }
+        }
+        endpoints.offsets[recipe->count] = corners;
+        endpoints.corner_count = corners;
+        endpoints.range_count = phase_count;
+        endpoints.corners = malloc((corners ? corners : 1u) * sizeof(*endpoints.corners));
+        endpoints.corner_vertices = malloc((corners ? corners : 1u) * sizeof(*endpoints.corner_vertices));
+        endpoints.vertices = malloc((corners ? corners : 1u) * sizeof(*endpoints.vertices));
+        endpoints.vertex_endpoints = malloc((corners ? corners : 1u) * sizeof(*endpoints.vertex_endpoints));
+        if (!endpoints.corners || !endpoints.corner_vertices || !endpoints.vertices ||
+            !endpoints.vertex_endpoints) goto finished;
         phase_job_count = phase_count;
         const size_t entity_bytes = (size_t)recipe->motion_count * sizeof(*entities);
         for (uint32_t phase = 0u; phase < phase_count; ++phase) {
             GlNativePhaseJob *job = &phase_jobs[phase];
             *job = (GlNativePhaseJob){.recipe = recipe, .vertices = &vertices,
                 .render_entities = entities, .projections = projections + (size_t)phase * recipe->count,
+                .endpoints = &endpoints,
                 .initial_words = views->gpu->words, .identity = views->gpu->identity,
                 .phase = phase, .denominator = denominator, .crop_y = crop_y,
                 .height = header->display.height, .scale = views->gpu->scale,
@@ -14047,7 +15435,16 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
             job->entities = malloc(entity_bytes ? entity_bytes : sizeof(*entities));
             if (!job->entities) goto finished;
         }
-        native_phase_run(phase_jobs, phase_count, 0);
+        /* Split by corners: one mesh record can hold most of them. */
+        for (uint32_t phase = 0u, record = 0u; phase < phase_count; ++phase) {
+            const uint64_t limit = (uint64_t)corners * (phase + 1u) / phase_count;
+            phase_jobs[phase].endpoint_begin = record;
+            while (record < recipe->count && (phase + 1u == phase_count || endpoints.offsets[record] < limit))
+                ++record;
+            phase_jobs[phase].endpoint_end = record;
+        }
+        native_phase_run(phase_jobs, phase_count, NATIVE_PHASE_ENDPOINTS);
+        native_phase_run(phase_jobs, phase_count, NATIVE_PHASE_PREFLIGHT);
         /* Keep entity-wide rejection atomic across the entire interval, as in
          * serial preflight: one invalid phase disables it in every replay. */
         for (uint32_t phase = 0u; phase < phase_count; ++phase) {
@@ -14092,7 +15489,7 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         }
         if (s_native_motion_probe.target_vblank && !native_gpu_data(views->gpu, views->gpu->words,
             (size_t)VRAM_W * VRAM_H * sizeof(*views->gpu->words), &phase_initial_words_offset)) goto phases_failed;
-        phase_capture_active = native_phase_begin(phase_jobs, phase_count, 1);
+        phase_capture_active = native_phase_begin(phase_jobs, phase_count, NATIVE_PHASE_CAPTURE);
     }
     for (uint32_t phase = 0u; phase < phase_count; ++phase) {
         /* Publish the next FIFO phase as soon as it is captured, while later
@@ -14235,6 +15632,8 @@ finished:
         probe->scanout_height = header->display.height;
     }
     native_motion_vertices_discard(&vertices); free(projections); free(entities);
+    free(endpoints.offsets); free(endpoints.corners); free(endpoints.corner_vertices);
+    free(endpoints.vertices); free(endpoints.vertex_endpoints);
     native_recipe_release(phase_recipe);
 }
 
@@ -14394,14 +15793,30 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     compiler.viewport_height = VRAM_H;
     compiler.gpu = gpu;
     compiler.native_views = views;
+    /* With a GPU scanout (internal scale above 1, 15-bit display) the VIEW
+     * planes live on the GPU: nothing presented, copied or drawn there reads
+     * the CPU VIEW raster. Keep that software raster only for the CPU
+     * presentation path and the optional pixel audits. */
+    const int view_cpu = !gpu || gpu->scale <= 1u || display->depth24 ||
+        s_native_recipe_audit_enabled || gl_renderer_native_guest_reference_enabled();
     if (gpu) {
         if (!native_gpu_seed(gpu, 0u, VRAM_W, VRAM_H, canvas.pixels, NULL)) goto allocation_failed;
         for (uint32_t i = 0u; i < views->domain_count; ++i) {
             if (!views->domains[i].pixels) continue;
+            const int seeding = !gpu->widths[i+1u] && (gpu->fresh || !gpu->base_planes[i+1u]);
             /* A seed resets depth; never mutate the committed domain for it. */
-            if (views->depth_test && !gpu->widths[i+1u] &&
-                (gpu->fresh || !gpu->base_planes[i+1u]) &&
+            if ((views->depth_test || !view_cpu) && seeding &&
                 !native_view_domain_private(views, i, NULL)) goto allocation_failed;
+            if (seeding && !view_cpu) {
+                /* Without the CPU VIEW raster, a new GPU plane starts from the
+                 * canonical frame in the centre (margins as last recorded). */
+                GlNativeViewDomain *domain = &views->domains[i];
+                for (uint32_t y = 0u; y < VRAM_H; ++y)
+                    if (domain->initialized[y])
+                        memcpy(domain->pixels + (size_t)y * views->width + views->offset,
+                            canvas.pixels + (size_t)y * VRAM_W + domain->x,
+                            (size_t)domain->width * sizeof(uint32_t));
+            }
             if (!native_gpu_seed(gpu, i+1u, views->width, VRAM_H,
                 views->domains[i].pixels, native_view_domain_depth(views, &views->domains[i])))
                 goto allocation_failed;
@@ -14430,6 +15845,51 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         audit->consumed_native_operations++;
         if (views->write_serial == UINT64_MAX) goto failed;
         views->write_serial++;
+        if (operation.kind == XG_RENDER_NATIVE_OPERATION_MESH) {
+            /* Host geometry: the VIEW/phase GPU planes only, never guest VRAM
+             * or a CPU surface; one command per raster run, one recipe draw. */
+            const XgRenderNativeMeshInstance *instance;
+            const XgRenderNativeMeshGeometry *geometry;
+            XgSemanticDrawRecord draw;
+            if (!xg_render_native_mesh_instance_view(operation.mesh, &instance) ||
+                !xg_render_native_mesh_geometry_view(operation.mesh_geometry, &geometry) ||
+                !native_materialize_native_draw(&operation.semantic, &draw)) goto failed;
+            /* Expanded once; the endpoint and every recipe share it. */
+            GlNativeRecipeMesh *expanded = malloc(sizeof(*expanded) +
+                (size_t)xg_render_native_mesh_instance_triangles(instance) * sizeof(expanded->triangles[0]));
+            if (!expanded) goto allocation_failed;
+            expanded->references = 1u;
+            expanded->count = expanded->capacity = xg_render_native_mesh_instance_triangles(instance);
+            expanded->relocated = 0u;
+            expanded->textures = NULL;
+            expanded->poses = NULL;
+            if (!xg_render_native_mesh_expand(instance, geometry, expanded->triangles)) {
+                free(expanded); goto failed;
+            }
+            native_recipe_frame_draw(views, &draw);
+            if (compiler.gpu) {
+                compiler.gpu_only = 1;
+                compiler.mesh_base = (const uint8_t *)&expanded->triangles[0].triangle;
+                compiler.mesh_textures = NULL;
+                compiler.mesh_flags = (const uint8_t *)&expanded->triangles[0].flags;
+                compiler.mesh_stride = sizeof(expanded->triangles[0]);
+                compiler.mesh_count = expanded->count;
+                const int drawn = native_view_draw(&compiler, views, &draw, operation_index, 1);
+                compiler.mesh_count = 0u;
+                compiler.mesh_flags = NULL;
+                compiler.gpu_only = 0;
+                if (!drawn) { native_recipe_mesh_release(expanded); goto failed; }
+            }
+            for (uint32_t i = 0u; i < views->count; ++i) {
+                GlNativeViewTarget *target = &views->targets[i];
+                native_recipe_append(views, i, &operation, audit, canvas.words,
+                    views->active >= 0 && native_view_eligible(views, target) &&
+                    views->targets[views->active].x == target->x &&
+                    views->targets[views->active].width == target->width, expanded);
+            }
+            native_recipe_mesh_release(expanded);
+            continue;
+        }
         if (operation.kind != XG_RENDER_NATIVE_OPERATION_DRAW &&
             !native_view_worker_drain(&compiler, 0, 0, VRAM_W - 1, VRAM_H - 1)) goto failed;
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_TARGET) {
@@ -14513,7 +15973,16 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                     }
                 marked = 1;
             }
+            if (!transition) native_recipe_frame_draw(views, &draw);
+            /* Packets a host enhancement adds in the GPU-DMA aperture are
+             * never software rasterized: they reach the GPU planes only.
+             * Nothing guest-visible derives from them. */
+            const uint64_t host_command = operation.semantic.submission_command_id;
+            const int host_draw = compiler.gpu && host_command >= UINT64_C(0x00800000) &&
+                                  host_command < UINT64_C(0x01000000);
+            compiler.gpu_only = host_draw || !view_cpu;
             if (!native_view_draw(&compiler, views, &view_draw, operation_index, marked)) goto failed;
+            compiler.gpu_only = host_draw;
             for (uint32_t i = 0u; i < views->count; ++i) {
                 GlNativeViewTarget *target = &views->targets[i];
                 const XgRenderIrMaterialState *m = &draw.primitive.material;
@@ -14527,14 +15996,16 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                 } else native_recipe_append(views, i, &operation, audit, canvas.words,
                     views->active >= 0 && native_view_eligible(views, target) &&
                     views->targets[views->active].x == target->x &&
-                    views->targets[views->active].width == target->width);
+                    views->targets[views->active].width == target->width, NULL);
             }
+
             if (draw.native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
                 views->active >= 0 && native_view_eligible(views, &views->targets[views->active]) &&
                 !native_view_wave_capture(&views->targets[views->active], &draw))
                 views->targets[views->active].wave_invalid = 1;
             if (!native_render_draw(&compiler, &canvas, &draw, operation_index))
                 goto failed;
+            compiler.gpu_only = 0;
             native_recipe_draw_written(views, &operation, audit, canvas.words);
             continue;
         }
@@ -14755,7 +16226,9 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             if (display->disabled) {
                 for (uint32_t x = 0u; x < storage_width; ++x)
                     output[x] = UINT32_C(0xff000000);
-            } else if (use_view && row_views[y] >= 0) {
+            } else if (use_view && row_views[y] >= 0 && view_cpu) {
+                /* Without the CPU VIEW raster the GPU composes the scanout;
+                 * this logical reference is the canonical frame below. */
                 const GlNativeViewTarget *view = &views->targets[row_views[y]];
                 const uint32_t *input = view->pixels + (size_t)(row_y - view->y) * storage_width;
                 for (uint32_t x = 0u; x < storage_width; ++x)
@@ -15092,7 +16565,7 @@ finished:
 static GLuint s_native_gpu_program, s_native_gpu_vao, s_native_gpu_vbo, s_native_gpu_words, s_native_gpu_input;
 static int s_native_gpu_interlock;
 static GLuint s_native_gpu_parameter_buffer, s_native_gpu_parameter_texture;
-static GLint s_native_gpu_parameters_on, s_native_gpu_parameter_base;
+static GLint s_native_gpu_parameters_on, s_native_gpu_parameter_base, s_native_gpu_parameter_shared;
 static void native_gpu_batch_flush(void);
 static void native_gpu_image_barrier(void);
 static GLint s_native_gpu_size, s_native_gpu_state, s_native_gpu_flags, s_native_gpu_page;
@@ -15130,11 +16603,18 @@ enum {
 };
 typedef struct GlNativeGpuParameters { uint32_t value[NATIVE_PARAMETER_COUNT][4]; } GlNativeGpuParameters;
 static GlNativeGpuParameters *s_native_gpu_parameter_capture;
+/* Uploaded per multi-draw: each triangle's varying parameters (its texture
+ * state, depth and attribute planes) and the index of a shared record with
+ * the command's constant ones, deduplicated between consecutive triangles.
+ * Shared records follow the triangle records in the same buffer. */
+enum { NATIVE_TRIANGLE_TEXELS = 14, NATIVE_SHARED_TEXELS = 6 };
 static struct {
-    GlNativeGpuParameters parameters[NATIVE_GPU_BATCH_CAPACITY];
+    uint32_t texels[NATIVE_GPU_BATCH_CAPACITY * NATIVE_TRIANGLE_TEXELS +
+                    NATIVE_GPU_BATCH_CAPACITY * NATIVE_SHARED_TEXELS][4];
+    uint32_t shared[NATIVE_GPU_BATCH_CAPACITY][NATIVE_SHARED_TEXELS][4];
     GLint first[NATIVE_GPU_BATCH_CAPACITY];
     GLsizei count[NATIVE_GPU_BATCH_CAPACITY];
-    uint32_t base, parameter_count, draw_count;
+    uint32_t base, parameter_count, shared_count, draw_count;
 } s_native_gpu_batch;
 
 /* HD texture replacement on the Native GPU thread's context. */
@@ -15420,7 +16900,7 @@ static const char *NATIVE_GPU_FS =
     "layout(pixel_interlock_ordered) in;\n"
     "layout(rgba8,binding=0) coherent uniform image2D destination_image;\n"
     "layout(r32ui,binding=1) coherent uniform uimage2D destination_depth_image;\n"
-    "uniform usamplerBuffer parameters; uniform int parameters_on,parameter_base; flat in int parameter_index;\n"
+    "uniform usamplerBuffer parameters; uniform int parameters_on,parameter_base,parameter_shared; flat in int parameter_index;\n"
     "uniform ivec4 u_sample_lim,u_state,u_flags,u_page,u_window; uniform int u_depth; uniform ivec2 u_origin;\n"
     "uniform int u_aa_exempt,u_texture_filter,u_anisotropy; uniform float u_filter_strength; uniform vec4 u_uv_gradient;\n"
     "ivec4 sample_lim=ivec4(0),state=ivec4(0),flags=ivec4(0),page=ivec4(0),window=ivec4(0); int depth=0,aa_exempt=0,texture_filter=0,anisotropy=0; ivec2 origin=ivec2(0);\n"
@@ -15479,17 +16959,20 @@ static const char *NATIVE_GPU_FS =
     " anisotropy=u_anisotropy;uv_gradient=u_uv_gradient;size=u_size;constant_color=u_constant_color;\n"
     " depth_state=u_depth_state;depth_plane=u_depth_plane;depth_view=u_depth_view;depth_origin=u_depth_origin;\n"
     " attribute_origin=u_attribute_origin;for(int a=0;a<5;++a){attribute_plane[a]=u_attribute_plane[a];attribute_dda[a]=u_attribute_dda[a];}return;}\n"
-    " int b=(parameter_index-parameter_base)*28;\n"
-    " state=ivec4(texelFetch(parameters,b));flags=ivec4(texelFetch(parameters,b+1));\n"
-    " page=ivec4(texelFetch(parameters,b+2));window=ivec4(texelFetch(parameters,b+3));\n"
-    " depth_view=ivec4(texelFetch(parameters,b+4));depth_state=ivec4(texelFetch(parameters,b+5));\n"
-    " for(int a=0;a<5;++a){attribute_dda[a]=ivec4(texelFetch(parameters,b+6+a));attribute_plane[a]=uintBitsToFloat(texelFetch(parameters,b+21+a));}\n"
-    " sample_lim=ivec4(texelFetch(parameters,b+11));depth_plane=ivec4(texelFetch(parameters,b+12));\n"
-    " ivec4 scalars=ivec4(texelFetch(parameters,b+16));aa_exempt=scalars.x;texture_filter=scalars.y;anisotropy=scalars.z;\n"
-    " size=uintBitsToFloat(texelFetch(parameters,b+17));attribute_origin=uintBitsToFloat(texelFetch(parameters,b+18));\n"
-    " uv_gradient=uintBitsToFloat(texelFetch(parameters,b+19));constant_color=uintBitsToFloat(texelFetch(parameters,b+20));\n"
-    " uvec4 misc=texelFetch(parameters,b+26);depth=int(misc.x);origin=ivec2(misc.yz);filter_strength=uintBitsToFloat(misc.w);\n"
-    " depth_origin=ivec2(texelFetch(parameters,b+27).xy);\n"
+    /* native_gpu_batch_draw: 14 texels per triangle, then 6 per shared record. */
+    " int b=(parameter_index-parameter_base)*14;\n"
+    " state=ivec4(texelFetch(parameters,b));page=ivec4(texelFetch(parameters,b+1));\n"
+    " depth_state=ivec4(texelFetch(parameters,b+2));sample_lim=ivec4(texelFetch(parameters,b+3));\n"
+    " depth_plane=ivec4(texelFetch(parameters,b+4));attribute_origin=uintBitsToFloat(texelFetch(parameters,b+5));\n"
+    " uv_gradient=uintBitsToFloat(texelFetch(parameters,b+6));\n"
+    " ivec4 scalars=ivec4(texelFetch(parameters,b+7));aa_exempt=scalars.x;texture_filter=scalars.y;anisotropy=scalars.z;\n"
+    " uvec4 own=texelFetch(parameters,b+8);depth=int(own.x);depth_origin=ivec2(own.yz);\n"
+    " for(int a=0;a<5;++a){uvec4 v=texelFetch(parameters,b+9+a);attribute_dda[a]=ivec4(v);attribute_plane[a]=uintBitsToFloat(v);}\n"
+    " int s=parameter_shared+int(own.w)*6;\n"
+    " flags=ivec4(texelFetch(parameters,s));window=ivec4(texelFetch(parameters,s+1));\n"
+    " depth_view=ivec4(texelFetch(parameters,s+2));size=uintBitsToFloat(texelFetch(parameters,s+3));\n"
+    " constant_color=uintBitsToFloat(texelFetch(parameters,s+4));\n"
+    " uvec4 misc=texelFetch(parameters,s+5);origin=ivec2(misc.yz);filter_strength=uintBitsToFloat(misc.w);\n"
     "}\n"
     "vec4 destination_color(){return imageLoad(destination_image,ivec2(gl_FragCoord.xy));}\n"
     "uint destination_key(){return imageLoad(destination_depth_image,ivec2(gl_FragCoord.xy)).r;}\n"
@@ -15846,6 +17329,7 @@ static int native_gpu_program_init(void) {
         p_glGenBuffers(1,&s_native_gpu_parameter_buffer);glGenTextures(1,&s_native_gpu_parameter_texture);
         s_native_gpu_parameters_on=p_glGetUniformLocation(s_native_gpu_program,"parameters_on");
         s_native_gpu_parameter_base=p_glGetUniformLocation(s_native_gpu_program,"parameter_base");
+        s_native_gpu_parameter_shared=p_glGetUniformLocation(s_native_gpu_program,"parameter_shared");
         p_glUniform1i(p_glGetUniformLocation(s_native_gpu_program,"parameters"),7);
         SDL_Log("Native GPU: ordered image blending and batched geometry enabled");
     }
@@ -15997,26 +17481,28 @@ static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uin
 }
 
 static void native_gpu_draw_vertex_data(const GlNativeGpuCommand *command,
-                                       uint32_t triangle,
+                                       const uint8_t *blob, uint32_t triangle,
                                        float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]) {
     const XgSemanticDrawRecord *draw = &command->draw;
-    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    const XgRenderIrMaterialState *m = &draw->primitive.material; /* clip/offsets: the command's */
+    const GlNativeTriangleFlags flags = native_gpu_command_flags(command, blob, triangle);
     const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
+    const XgRenderIrTriangle *tri = lines ? NULL : native_gpu_command_triangle(command, blob, triangle);
     float weight[3];
-    const int perspective = !lines && m->textured != 0u &&
-        native_gpu_triangle_weights(&draw->primitive.triangles[triangle], weight);
+    const int perspective = !lines && flags.textured &&
+        native_gpu_triangle_weights(tri, weight);
     memset(data, 0, (lines ? 6u : 3u) * GL_NATIVE_GPU_VERTEX_FLOATS * sizeof(float));
     for (unsigned v = 0; v < (lines ? 2u : 3u); ++v) {
-        const XgRenderIrVertex *iv = lines ? NULL : &draw->primitive.triangles[triangle].vertices[v];
+        const XgRenderIrVertex *iv = lines ? NULL : &tri->vertices[v];
         const GpuRenderSemanticVertex *lv = lines ? &draw->lines[triangle].vertices[v] : NULL;
-        const unsigned c = m->shading == XG_RENDER_IR_SHADING_FLAT ? 0u : v;
+        const unsigned c = !flags.gouraud ? 0u : v;
         data[v][0] = (float)(lines ? lv->x : iv->x) / 65536.f + m->draw_offset_x;
         data[v][1] = (float)(lines ? lv->y : iv->y) / 65536.f + m->draw_offset_y - command->y;
         data[v][2] = lines ? 0.f : (float)iv->u / 65536.f;
         data[v][3] = lines ? 0.f : (float)iv->v / 65536.f;
-        data[v][4] = lines ? draw->lines[triangle].vertices[c].r : draw->primitive.triangles[triangle].vertices[c].r;
-        data[v][5] = lines ? draw->lines[triangle].vertices[c].g : draw->primitive.triangles[triangle].vertices[c].g;
-        data[v][6] = lines ? draw->lines[triangle].vertices[c].b : draw->primitive.triangles[triangle].vertices[c].b;
+        data[v][4] = lines ? draw->lines[triangle].vertices[c].r : tri->vertices[c].r;
+        data[v][5] = lines ? draw->lines[triangle].vertices[c].g : tri->vertices[c].g;
+        data[v][6] = lines ? draw->lines[triangle].vertices[c].b : tri->vertices[c].b;
         if (perspective) data[v][GL_NATIVE_GPU_VERTEX_WEIGHT] = weight[v];
     }
 }
@@ -16041,7 +17527,7 @@ static void native_gpu_line_vertex_data(float data[6][GL_NATIVE_GPU_VERTEX_FLOAT
 static uint32_t native_gpu_command_vertex_count(const GlNativeGpuCommand *command) {
     if (command->kind == NATIVE_GPU_DRAW)
         return command->draw.topology == GPU_RENDER_SEMANTIC_LINES
-            ? command->draw.line_count * 6u : command->draw.primitive.triangle_count * 3u;
+            ? command->draw.line_count * 6u : native_gpu_command_triangles(command) * 3u;
     return command->kind == NATIVE_GPU_SEED || command->kind == NATIVE_GPU_SPAN ? 6u : 0u;
 }
 
@@ -16064,12 +17550,13 @@ struct GlNativeGpuGeometry {
  * workers. Attribute/depth planes use the original Q16 values in double,
  * while coverage uses exactly the floats uploaded to the vertex buffer. */
 static void native_gpu_prepare_draw(const GlNativeGpuWork *work,
-        const GlNativeGpuCommand *command, uint32_t triangle,
+        const GlNativeGpuCommand *command, const uint8_t *blob, uint32_t triangle,
         uint32_t width, uint32_t height,
         const float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
         GlNativeGpuDrawGeometry *out) {
     const XgSemanticDrawRecord *draw = &command->draw;
-    const XgRenderIrMaterialState *m = &draw->primitive.material;
+    const XgRenderIrMaterialState *m = &draw->primitive.material; /* clip/offsets: the command's */
+    const GlNativeTriangleFlags flags = native_gpu_command_flags(command, blob, triangle);
     const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
     const int wire = work->wireframe && command->plane != 0u;
     float line_data[6][GL_NATIVE_GPU_VERTEX_FLOATS];
@@ -16083,12 +17570,13 @@ static void native_gpu_prepare_draw(const GlNativeGpuWork *work,
     if (left > right || top > bottom) return;
     out->scissor[0] = left; out->scissor[1] = top;
     out->scissor[2] = right - left + 1; out->scissor[3] = bottom - top + 1;
+    const XgRenderIrTriangle *tri = lines ? NULL : native_gpu_command_triangle(command, blob, triangle);
     if (lines) {
         /* Coverage uses authored endpoints, before unit-width expansion. */
-        native_gpu_draw_vertex_data(command, triangle, line_data);
+        native_gpu_draw_vertex_data(command, blob, triangle, line_data);
         vertices = line_data;
     } else for (unsigned v = 0u; v < 3u; ++v) {
-        const XgRenderIrVertex *iv = &draw->primitive.triangles[triangle].vertices[v];
+        const XgRenderIrVertex *iv = &tri->vertices[v];
         x[v] = iv->x / 65536.0 + m->draw_offset_x;
         y[v] = iv->y / 65536.0 + m->draw_offset_y - command->y;
     }
@@ -16105,20 +17593,22 @@ static void native_gpu_prepare_draw(const GlNativeGpuWork *work,
     if (top < (int)floorf(min_y) - 1) top = (int)floorf(min_y) - 1;
     if (bottom > (int)ceilf(max_y) + 1) bottom = (int)ceilf(max_y) + 1;
     if (left > right || top > bottom) return;
-    if (!lines) native_attribute_planes(&draw->primitive.triangles[triangle],
-        x, y, work->scale, m->shading == XG_RENDER_IR_SHADING_GOURAUD, &out->attributes);
-    out->depth = (GlNativeDepthMode){0, GL_NATIVE_DEPTH_RESET, m->semi_transparent ? 1 : 0,
+    if (!lines) native_attribute_planes(tri,
+        x, y, work->scale, flags.gouraud, &out->attributes);
+    out->depth = (GlNativeDepthMode){0, GL_NATIVE_DEPTH_RESET, flags.semi_transparent ? 1 : 0,
         0, GL_NATIVE_DEPTH_SHOW_NONE, {0}};
     if (wire) out->depth.semi = 0;
     else if (!lines && command->plane != 0u &&
-        (work->depth_test || work->depth_view != GL_NATIVE_DEPTH_VIEW_OFF))
-        out->depth = native_depth_mode(draw, &draw->primitive.triangles[triangle], x, y);
+        (work->depth_test || work->depth_view != GL_NATIVE_DEPTH_VIEW_OFF)) {
+        out->depth = native_depth_mode(draw, tri, x, y);
+        out->depth.semi = flags.semi_transparent; /* this triangle's own */
+    }
     out->left = left; out->top = top; out->right = right; out->bottom = bottom;
     out->visible = 1;
 }
 
 static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
-        const GlNativeGpuCommand *commands, uint32_t begin, uint32_t end,
+        const GlNativeGpuCommand *commands, const uint8_t *blob, uint32_t begin, uint32_t end,
         float (**out_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS], uint32_t *out_count) {
     *out_vertices = NULL;
     *out_count = 0u;
@@ -16143,7 +17633,7 @@ static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
             const uint32_t stride = lines ? 6u : 3u;
             for (uint32_t t = 0; t < n / stride; ++t) {
                 float data[6][GL_NATIVE_GPU_VERTEX_FLOATS];
-                native_gpu_draw_vertex_data(command, t, data);
+                native_gpu_draw_vertex_data(command, blob, t, data);
                 if (lines) native_gpu_line_vertex_data(data);
                 memcpy(vertices + cursor, data, stride * sizeof(*vertices));
                 cursor += stride;
@@ -16176,11 +17666,11 @@ static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
 }
 
 static int native_gpu_upload_vertex_slice(const GlNativeGpuWork *work,
-        const GlNativeGpuCommand *commands, uint32_t begin, uint32_t end,
+        const GlNativeGpuCommand *commands, const uint8_t *blob, uint32_t begin, uint32_t end,
         float (**out_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS]) {
     native_gpu_batch_flush();
     uint32_t count;
-    if (!native_gpu_build_vertex_slice(work, commands, begin, end, out_vertices, &count)) return 0;
+    if (!native_gpu_build_vertex_slice(work, commands, blob, begin, end, out_vertices, &count)) return 0;
     if (count) p_glBufferData(PSXGL_ARRAY_BUFFER, (size_t)count * sizeof(**out_vertices),
         *out_vertices, PSXGL_STREAM_DRAW);
     return 1;
@@ -16196,7 +17686,7 @@ static GlNativeGpuGeometry *native_gpu_geometry_prepare(const GlNativeGpuWork *w
     if (!geometry || !work->scale) goto failed;
     geometry->command_count = work->count;
     uint32_t vertices;
-    if (!native_gpu_build_vertex_slice(work, work->commands, 0u, work->count,
+    if (!native_gpu_build_vertex_slice(work, work->commands, work->data, 0u, work->count,
         &geometry->vertices, &vertices)) goto failed;
     geometry->offsets = malloc(((size_t)work->count + 1u) * sizeof(*geometry->offsets));
     if (!geometry->offsets) goto failed;
@@ -16207,7 +17697,7 @@ static GlNativeGpuGeometry *native_gpu_geometry_prepare(const GlNativeGpuWork *w
         vertex += native_gpu_command_vertex_count(command);
         if (command->kind == NATIVE_GPU_DRAW)
             primitive += command->draw.topology == GPU_RENDER_SEMANTIC_LINES
-                ? command->draw.line_count : command->draw.primitive.triangle_count;
+                ? command->draw.line_count : native_gpu_command_triangles(command);
     }
     geometry->offsets[work->count] = (GlNativeGpuGeometryOffset){vertex, primitive};
     geometry->primitives = primitive ? malloc((size_t)primitive * sizeof(*geometry->primitives)) : NULL;
@@ -16219,7 +17709,7 @@ static GlNativeGpuGeometry *native_gpu_geometry_prepare(const GlNativeGpuWork *w
         const GlNativeGpuGeometryOffset offset = geometry->offsets[i];
         const uint32_t count = geometry->offsets[i + 1u].primitive - offset.primitive;
         for (uint32_t t = 0u; t < count; ++t)
-            native_gpu_prepare_draw(work, command, t, work->widths[command->plane],
+            native_gpu_prepare_draw(work, command, work->data, t, work->widths[command->plane],
                 work->heights[command->plane], geometry->vertices + offset.vertex + t * stride,
                 &geometry->primitives[offset.primitive + t]);
     }
@@ -16297,10 +17787,14 @@ static void native_gpu_depth_query(GlNativeGpuWork *work, int open) {
 
 static void native_gpu_batch_flush(void) {
     if (!s_native_gpu_batch.draw_count) return;
+    const uint32_t triangle_texels = s_native_gpu_batch.parameter_count * NATIVE_TRIANGLE_TEXELS;
+    const uint32_t shared_texels = s_native_gpu_batch.shared_count * NATIVE_SHARED_TEXELS;
+    memcpy(s_native_gpu_batch.texels[triangle_texels], s_native_gpu_batch.shared,
+        (size_t)shared_texels * sizeof(s_native_gpu_batch.texels[0]));
     p_glBindBuffer(PSXGL_TEXTURE_BUFFER,s_native_gpu_parameter_buffer);
     p_glBufferData(PSXGL_TEXTURE_BUFFER,
-        s_native_gpu_batch.parameter_count*sizeof(GlNativeGpuParameters),
-        s_native_gpu_batch.parameters,PSXGL_STREAM_DRAW);
+        (size_t)(triangle_texels + shared_texels) * sizeof(s_native_gpu_batch.texels[0]),
+        s_native_gpu_batch.texels,PSXGL_STREAM_DRAW);
     p_glActiveTexture(PSXGL_TEXTURE0+7);glBindTexture(PSXGL_TEXTURE_BUFFER,s_native_gpu_parameter_texture);
     p_glTexBuffer(PSXGL_TEXTURE_BUFFER,PSXGL_RGBA32UI,s_native_gpu_parameter_buffer);
     /* HD/mip textures vary per draw and use the ordinary path. This batch
@@ -16310,26 +17804,60 @@ static void native_gpu_batch_flush(void) {
     if (s_native_gpu_scalars[NATIVE_UNIFORM_MIP]) {
         p_glUniform1i(s_native_gpu_mip_on,0);s_native_gpu_scalars[NATIVE_UNIFORM_MIP]=0;
     }
-    float size[4];memcpy(size,s_native_gpu_batch.parameters[0].value[NATIVE_PARAMETER_FLOAT4+NATIVE_UNIFORM_SIZE],sizeof(size));
+    /* The vertex stage's plane size: the first shared record's (texel 3). */
+    float size[4];memcpy(size,s_native_gpu_batch.shared[0][3],sizeof(size));
     if (memcmp(s_native_gpu_float4_values[NATIVE_UNIFORM_SIZE],size,sizeof(size))) {
         p_glUniform4f(s_native_gpu_size,size[0],size[1],size[2],size[3]);
         memcpy(s_native_gpu_float4_values[NATIVE_UNIFORM_SIZE],size,sizeof(size));
     }
     p_glUniform1i(s_native_gpu_parameters_on,1);
     p_glUniform1i(s_native_gpu_parameter_base,(GLint)s_native_gpu_batch.base);
+    p_glUniform1i(s_native_gpu_parameter_shared,(GLint)triangle_texels);
     p_glMultiDrawArrays(GL_TRIANGLES,s_native_gpu_batch.first,s_native_gpu_batch.count,(GLsizei)s_native_gpu_batch.draw_count);
     p_glUniform1i(s_native_gpu_parameters_on,0);
-    s_native_gpu_batch.draw_count=s_native_gpu_batch.parameter_count=0u;
+    s_native_gpu_batch.draw_count=s_native_gpu_batch.parameter_count=s_native_gpu_batch.shared_count=0u;
 }
 
+/* Pack one triangle's captured parameters (the NATIVE_PARAMETER_* layout)
+ * into its record and, when the command's constant ones changed, a new
+ * shared record. The shader's load_parameters reads exactly this layout. */
 static void native_gpu_batch_draw(uint32_t first, uint32_t count, const GlNativeGpuParameters *parameters) {
+    static const uint8_t shared_slots[NATIVE_SHARED_TEXELS] = {
+        1u, 3u, 4u, NATIVE_PARAMETER_FLOAT4 + NATIVE_UNIFORM_SIZE,
+        NATIVE_PARAMETER_FLOAT4 + NATIVE_UNIFORM_COLOR, NATIVE_PARAMETER_MISC};
+    static const uint8_t triangle_slots[8] = {
+        0u, 2u, 5u, NATIVE_UNIFORM_SAMPLE_LIMIT, NATIVE_UNIFORM_DEPTH_PLANE,
+        NATIVE_PARAMETER_FLOAT4 + NATIVE_UNIFORM_ATTRIBUTE_ORIGIN,
+        NATIVE_PARAMETER_FLOAT4 + NATIVE_UNIFORM_UV_GRADIENT, NATIVE_PARAMETER_SCALARS};
     const uint32_t index=first/3u, records=count/3u;
+    uint32_t shared[NATIVE_SHARED_TEXELS][4];
+    for (unsigned i = 0u; i < NATIVE_SHARED_TEXELS; ++i)
+        memcpy(shared[i], parameters->value[shared_slots[i]], sizeof(shared[i]));
     if (s_native_gpu_batch.draw_count &&
         (index < s_native_gpu_batch.base || index-s_native_gpu_batch.base+records > NATIVE_GPU_BATCH_CAPACITY ||
-         s_native_gpu_batch.draw_count==NATIVE_GPU_BATCH_CAPACITY)) native_gpu_batch_flush();
+         s_native_gpu_batch.draw_count==NATIVE_GPU_BATCH_CAPACITY ||
+         (s_native_gpu_batch.shared_count == NATIVE_GPU_BATCH_CAPACITY &&
+          memcmp(shared, s_native_gpu_batch.shared[NATIVE_GPU_BATCH_CAPACITY - 1u], sizeof(shared)))))
+        native_gpu_batch_flush();
     if (!s_native_gpu_batch.draw_count) s_native_gpu_batch.base=index;
+    if (!s_native_gpu_batch.shared_count ||
+        memcmp(shared, s_native_gpu_batch.shared[s_native_gpu_batch.shared_count - 1u], sizeof(shared)))
+        memcpy(s_native_gpu_batch.shared[s_native_gpu_batch.shared_count++], shared, sizeof(shared));
+    uint32_t record[NATIVE_TRIANGLE_TEXELS][4];
+    for (unsigned i = 0u; i < 8u; ++i) memcpy(record[i], parameters->value[triangle_slots[i]], sizeof(record[i]));
+    record[8][0] = parameters->value[NATIVE_PARAMETER_MISC][0];
+    record[8][1] = parameters->value[NATIVE_PARAMETER_DEPTH_ORIGIN][0];
+    record[8][2] = parameters->value[NATIVE_PARAMETER_DEPTH_ORIGIN][1];
+    record[8][3] = s_native_gpu_batch.shared_count - 1u;
+    /* Integral attributes use their DDA entries, the others their planes. */
+    float attribute_origin[4];
+    memcpy(attribute_origin, parameters->value[NATIVE_PARAMETER_FLOAT4 + NATIVE_UNIFORM_ATTRIBUTE_ORIGIN],
+        sizeof(attribute_origin));
+    memcpy(record[9], attribute_origin[2] == 1.f ? parameters->value[6] :
+        parameters->value[NATIVE_PARAMETER_ATTRIBUTES], 5u * sizeof(record[9]));
     const uint32_t offset=index-s_native_gpu_batch.base;
-    for (uint32_t i=0u;i<records;++i) s_native_gpu_batch.parameters[offset+i]=*parameters;
+    for (uint32_t i=0u;i<records;++i)
+        memcpy(s_native_gpu_batch.texels[(size_t)(offset + i) * NATIVE_TRIANGLE_TEXELS], record, sizeof(record));
     s_native_gpu_batch.parameter_count=offset+records;
     const uint32_t draw=s_native_gpu_batch.draw_count++;
     s_native_gpu_batch.first[draw]=(GLint)first;s_native_gpu_batch.count[draw]=(GLsizei)count;
@@ -16353,12 +17881,50 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
     const int wire=work->wireframe&&command->plane!=0u;
     if (command->kind==NATIVE_GPU_DRAW) {
         const XgSemanticDrawRecord *draw=&command->draw;
-        const XgRenderIrMaterialState *m=&draw->primitive.material;
         const int lines=draw->topology==GPU_RENDER_SEMANTIC_LINES;
-        for (uint32_t t=0;t<(lines?draw->line_count:draw->primitive.triangle_count);++t) {
+        /* Material, plane and sampling state are the command's, except a mesh
+         * triangle's texture state: evaluate them once per change. Each
+         * triangle adds its attribute planes, depth plane and bbox; a batched
+         * triangle starts from the record of the same texture state. */
+        const int filter_strength = draw->sprite_texture ? 100 :
+            gl_renderer_scene_filter_strength();
+        const float strength_value=filter_strength/100.f;
+        const int anisotropy_option = command->plane != 0u && !lines && !draw->sprite_texture &&
+            draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE ? gl_renderer_anisotropy() : 0;
+        const int debug_mipmaps = gl_renderer_debug_mipmaps();
+        const int batched = s_native_gpu_interlock && !wire && !draw->hd_texture.valid && !command->source &&
+            !debug_mipmaps;
+        /* One capture record per command: per-triangle fields are rewritten
+         * for every triangle, the shared ones again on a texture change. */
+        GlNativeGpuParameters parameters;
+        if (batched) memset(&parameters, 0, sizeof(parameters));
+        int shared_valid = 0, material_valid = 0;
+        GlNativeTextureState shared_texture = {0};
+        XgRenderIrMaterialState material;
+        const GlNativeGpuMeshTriangle *mesh_triangles = command->mesh_count
+            ? (const GlNativeGpuMeshTriangle *)(const void *)(captured_data + command->data) : NULL;
+        for (uint32_t t=0;t<(lines?draw->line_count:native_gpu_command_triangles(command));++t) {
+            const XgRenderIrMaterialState *m = &draw->primitive.material;
+            if (mesh_triangles) {
+                /* A mesh triangle's material: rebuilt only when its texture
+                 * state differs from the previous triangle's. */
+                const GlNativeTextureState *texture = &mesh_triangles[t].texture;
+                if (!material_valid || !native_texture_state_equal(texture, &shared_texture)) {
+                    material = draw->primitive.material;
+                    native_texture_state_apply(&material, texture);
+                    shared_texture = *texture;
+                    material_valid = 1;
+                    shared_valid = 0;
+                }
+                m = &material;
+            }
+            const int anisotropy_value = m->textured ? anisotropy_option : 0;
+            const int uv_gradient = !lines && (anisotropy_value>1 || (command->plane!=0u && m->textured &&
+                !draw->sprite_texture && draw->screen_space_2d==GPU_RENDER_SCREEN_SPACE_2D_NONE &&
+                debug_mipmaps));
             GlNativeGpuDrawGeometry local;
             const GlNativeGpuDrawGeometry *geometry = prepared ? &prepared[t] : &local;
-            if (!prepared) native_gpu_prepare_draw(work, command, t, plane->width / scale,
+            if (!prepared) native_gpu_prepare_draw(work, command, captured_data, t, plane->width / scale,
                 plane->height / scale, slice_vertices + first_vertex + t * (lines ? 6u : 3u), &local);
             if (!geometry->visible) continue;
             const GlNativeAttributePlanes *attributes = &geometry->attributes;
@@ -16366,9 +17932,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             const int left = geometry->left, top = geometry->top;
             const int right = geometry->right, bottom = geometry->bottom;
             const int *draw_scissor = geometry->scissor;
-            const int batched = s_native_gpu_interlock && !wire && !draw->hd_texture.valid && !command->source &&
-                !gl_renderer_debug_mipmaps();
-            GlNativeGpuParameters parameters={0};
+            const int reuse = batched && shared_valid;
             if (!batched) native_gpu_batch_flush();
             s_native_gpu_parameter_capture=batched?&parameters:NULL;
             const unsigned depth = native_gpu_depth_uniforms(work, plane, depth_mode, command->plane != 0u);
@@ -16376,8 +17940,6 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             work->depth_tested_triangles += tested ? 1u : 0u;
             native_gpu_depth_query(work, tested);
             if(!native_gpu_target(work,plane,scale,left,top,right-left+1,bottom-top+1,!wire&&(m->semi_transparent||m->mask_check),bound_target,depth,draw_scissor)){s_native_gpu_parameter_capture=NULL;return 0;}
-            native_gpu_uniform_float4(NATIVE_UNIFORM_SIZE,s_native_gpu_size,
-                (float)plane->width/scale,(float)plane->height/scale,0.5f/scale-1.f/64.f,(float)scale);
             /* The plane origin is target-local, just like gl_FragCoord. The
              * source row/VRAM origin is already removed above, exactly once. */
             if (m->textured && !lines) native_gpu_uniform4(NATIVE_UNIFORM_SAMPLE_LIMIT,s_native_gpu_sample_lim,attributes->limits[0],attributes->limits[1],
@@ -16385,34 +17947,28 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             native_gpu_uniform_float4(NATIVE_UNIFORM_ATTRIBUTE_ORIGIN,s_native_gpu_attribute_origin,lines?0.f:(float)attributes->x,
                 lines?0.f:(float)attributes->y,lines?0.f:attributes->integral?1.f:2.f,0.f);
             if (!lines) native_gpu_attribute_uniforms(attributes);
+            if (uv_gradient)
+                native_gpu_uniform_float4(NATIVE_UNIFORM_UV_GRADIENT,s_native_gpu_uv_gradient,
+                (float)(attributes->plane[0][1] / scale),
+                (float)(attributes->plane[1][1] / scale),
+                (float)(attributes->plane[0][2] / scale),
+                (float)(attributes->plane[1][2] / scale));
+            if (!reuse) {
+            native_gpu_uniform_float4(NATIVE_UNIFORM_SIZE,s_native_gpu_size,
+                (float)plane->width/scale,(float)plane->height/scale,0.5f/scale-1.f/64.f,(float)scale);
             native_gpu_uniform4(0,s_native_gpu_state,m->textured,m->raw_texture,m->semi_transparent,m->blend_mode);
             native_gpu_uniform1(NATIVE_UNIFORM_AA,s_native_gpu_aa_exempt,
                 draw->aa_exempt || draw->screen_space_2d != GPU_RENDER_SCREEN_SPACE_2D_NONE);
-            const int filter_strength = draw->sprite_texture ? 100 :
-                gl_renderer_scene_filter_strength();
             native_gpu_uniform1(NATIVE_UNIFORM_FILTER,s_native_gpu_filter,
                 command->plane != 0u && filter_strength > 0 &&
                 (draw->sprite_texture ? s_sprite_filter : s_tex_filter));
-            const float strength_value=filter_strength/100.f;
             if (s_native_gpu_parameter_capture) {
                 memcpy(&s_native_gpu_parameter_capture->value[NATIVE_PARAMETER_MISC][3],&strength_value,sizeof(strength_value));
             } else if (s_native_gpu_strength_value!=strength_value) {
                 p_glUniform1f(s_native_gpu_filter_strength,strength_value);
                 s_native_gpu_strength_value=strength_value;
             }
-            const int anisotropy_value=command->plane != 0u && !lines && !draw->sprite_texture &&
-                draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE &&
-                m->textured
-                    ? gl_renderer_anisotropy() : 0;
             native_gpu_uniform1(NATIVE_UNIFORM_ANISOTROPY,s_native_gpu_anisotropy,anisotropy_value);
-            if (!lines && (anisotropy_value>1 || (command->plane!=0u && m->textured &&
-                    !draw->sprite_texture && draw->screen_space_2d==GPU_RENDER_SCREEN_SPACE_2D_NONE &&
-                    gl_renderer_debug_mipmaps())))
-                native_gpu_uniform_float4(NATIVE_UNIFORM_UV_GRADIENT,s_native_gpu_uv_gradient,
-                (float)(attributes->plane[0][1] / scale),
-                (float)(attributes->plane[1][1] / scale),
-                (float)(attributes->plane[0][2] / scale),
-                (float)(attributes->plane[1][2] / scale));
             if (wire) {
                 /* Unlit constant lines (the transfer path of the shader). */
                 native_gpu_uniform4(1,s_native_gpu_flags,0,0,0,1);
@@ -16469,6 +18025,8 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                 p_glUniform2i(s_native_gpu_origin,command->x,command->y);
                 s_native_gpu_origin_value[0]=command->x;s_native_gpu_origin_value[1]=command->y;
             }
+            }
+            if (batched) shared_valid = 1;
             if (wire && !lines) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
             s_native_gpu_parameter_capture=NULL;
             if (batched) native_gpu_batch_draw(first_vertex+t*(lines?6u:3u),lines?6u:3u,&parameters);
@@ -16680,12 +18238,7 @@ static int native_gpu_service(void) {
                     }
                     const uint64_t hash_started=native_thread_cpu_ns();
                     if (!i) work->timing.hash_begin_ns=SDL_GetTicksNS();
-                    work->image_digests[i]=pres_hash_bytes(pixels,bytes);
-                    if (!i) {
-                        const uint32_t *rgba=pixels;
-                        for(size_t p=0;p<bytes/sizeof(*rgba);++p)
-                            work->visible_pixels+=(rgba[p]&UINT32_C(0x00ffffff))!=0u;
-                    }
+                    work->image_digests[i]=native_gpu_image_digest(pixels,bytes,!i?&work->visible_pixels:NULL);
                     work->timing.hash_cpu_ns+=native_thread_cpu_ns()-hash_started;
                     work->timing.hash_end_ns=SDL_GetTicksNS();
                     if (!i) {
@@ -16765,7 +18318,7 @@ static int native_gpu_service(void) {
         if (ok && geometry) {
             native_gpu_upload_geometry(geometry, cursor, command_limit, &slice_vertices);
             borrowed_vertices = 1;
-        } else if (ok) ok=native_gpu_upload_vertex_slice(work,commands,cursor,command_limit,&slice_vertices);
+        } else if (ok) ok=native_gpu_upload_vertex_slice(work,commands,captured_data,cursor,command_limit,&slice_vertices);
         uint32_t first_vertex=0u;
         for(uint32_t i=cursor;i<command_limit&&ok;++i) {
             const GlNativeGpuCommand *command=&commands[i];
@@ -17067,16 +18620,16 @@ static int native_gpu_thread_main(void *unused) {
                 p_glBindFramebuffer(PSXGL_FRAMEBUFFER,warm.planes[0].framebuffer);
                 native_gpu_image_barrier();glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
                 glDisable(GL_SCISSOR_TEST);glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);
-                warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u,&warm_vertices) &&
+                warmed&=native_gpu_upload_vertex_slice(&warm,&command,warm.data,0u,1u,&warm_vertices) &&
                     native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,warm_words,0u,NULL,warm_vertices,NULL);
                 free(warm_vertices); warm_vertices = NULL;
             }
         command=(GlNativeGpuCommand){.kind=NATIVE_GPU_SPAN,.source=UINT32_MAX,.w=16,.h=16,.color=0xff000000};
-        warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u,&warm_vertices) &&
+        warmed&=native_gpu_upload_vertex_slice(&warm,&command,warm.data,0u,1u,&warm_vertices) &&
             native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,warm_words,0u,NULL,warm_vertices,NULL);
         free(warm_vertices); warm_vertices = NULL;
         command.kind=NATIVE_GPU_SEED;warm.data=(uint8_t *)warm_pixels;
-        warmed&=native_gpu_upload_vertex_slice(&warm,&command,0u,1u,&warm_vertices) &&
+        warmed&=native_gpu_upload_vertex_slice(&warm,&command,warm.data,0u,1u,&warm_vertices) &&
             native_gpu_render_command(&warm,&command,warm.snapshots,warm.data,warm_words,0u,NULL,warm_vertices,NULL);
         free(warm_vertices); warm_vertices = NULL;
         native_gpu_image_barrier();glFinish();

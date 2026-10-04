@@ -44,6 +44,19 @@ void gte_native_provenance_cpu_cop2(struct CPUState *cpu, uint32_t instruction,
                                     uint32_t value, uint32_t address);
 extern int g_gte_native_provenance_active;
 
+/* Projection tap: while configured, every RTPS/RTPT executed at a guest PC in
+ * one of the given [begin, end) ranges records its native projection, keyed
+ * by the packed SXY it produced. A game producer can then recover the native
+ * position of packets that copy those SXY words unchanged. Lookups accept the
+ * current and the previous generation; the producer advances it once per
+ * guest frame. count == 0 disables the tap. */
+#define GTE_NATIVE_PROJECTION_TAP_MAX_RANGES 16u
+void gte_native_projection_tap_configure(const uint32_t (*ranges)[2],
+                                         uint32_t count);
+void gte_native_projection_tap_advance(void);
+int gte_native_projection_tap_lookup(uint32_t packed_sxy,
+                                     GteNativeVertexProvenance *out);
+
 #ifdef __cplusplus
 }
 #endif

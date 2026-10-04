@@ -8953,7 +8953,17 @@ native_environment_done:
             opcode >= 0x64u && opcode <= 0x7fu)
             semantic.sprite_texture = 1u;
         if (supported) native_semantic_stamp_retrospective_scene(&semantic);
-        if (supported && semantic.triangle_count != 0u) {
+        /* Packets a host enhancement adds in its GPU-DMA aperture belong to
+         * the Native view only: they never draw into guest-visible VRAM. */
+        const bool host_added = source != NULL &&
+            source->kind == GPU_RENDER_ORACLE_SOURCE_DMA2_LINKED_LIST &&
+            source->word_address >= PSX_MOD_GPU_DMA_APERTURE_BASE &&
+            source->word_address < 0x01000000u &&
+            gpu_native_work_draw_hook != NULL;
+        if (supported && host_added && semantic.triangle_count != 0u) {
+            semantic.submission_command_id = source->word_address;
+            gpu_note_draw_executed(captured ? &canonical : NULL, &semantic);
+        } else if (supported && semantic.triangle_count != 0u) {
             render_status = gr_stream_barrier();
             if (render_status == GPU_RENDER_TRANSACTION_OK) {
                 semantic.submission_command_id = source != NULL &&
