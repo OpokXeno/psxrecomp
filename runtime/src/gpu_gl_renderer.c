@@ -72,6 +72,7 @@
 #include "psx_render_nclip.h"
 #include "xg_render_motion.h"
 #include "xg_render_native_mesh.h"
+#include "xg_render_native_work.h"
 #include "xg_render_semantic_presentation.h"
 #include "latency_ring.h"
 #include "debug_overlay.h"
@@ -425,6 +426,8 @@ static uint64_t s_swap_legacy_main_thread;
 static uint64_t s_swap_legacy_interpolation_thread;
 static uint64_t s_swap_owner_thread;
 static int s_native_active;
+static int s_native_legacy_deferred;
+static int native_single_owner_enabled(void);
 static int gl_swap_window_private(GlSwapCaller caller);
 static int native_is_presenter_thread(void);
 
@@ -1798,7 +1801,7 @@ typedef struct GlNativeGpuPlane {
     uint32_t dirty_epochs[64][2];
 } GlNativeGpuPlane;
 typedef enum GlNativeGpuOp { NATIVE_GPU_SEED, NATIVE_GPU_DRAW, NATIVE_GPU_WORDS, NATIVE_GPU_SNAPSHOT, NATIVE_GPU_SPAN,
-    NATIVE_GPU_WORDS_RESET, NATIVE_GPU_BASE,
+    NATIVE_GPU_WORDS_RESET, NATIVE_GPU_BASE, NATIVE_GPU_CANONICAL_READBACK,
     /* mesh_count SPAN rectangles (GlNativeGpuSpanRect at data) sharing one
      * plane, source and mask, in one draw; x/y/w/h bound them all. */
     NATIVE_GPU_SPANS } GlNativeGpuOp;
@@ -1956,6 +1959,9 @@ typedef struct GlNativeGpuWork {
     int sealed, cancel_requested, render_failed;
     int deferred; /* CPU-prepared successor: no GL publication before FIFO promotion. */
     uint32_t initial_words_offset;
+    int canonical_gpu;
+    uint32_t *canonical_pixels; /* GL-owned readback storage; never aliases the CPU canvas. */
+    uint32_t canonical_requested, canonical_completed;
     GlNativeGpuCommand *commands;
     uint8_t *data;
     GlNativeGpuGeometry *geometry; /* Private phase worker preparation, moved with its journal. */
@@ -2020,6 +2026,7 @@ static void native_gpu_buffers_free(GlNativeGpuWork *work) {
     work->chunk_count = work->published_chunk_count = 0u;
     free(work->commands); work->commands = NULL;
     free(work->data); work->data = NULL;
+    free(work->canonical_pixels); work->canonical_pixels = NULL;
     native_gpu_geometry_free(work->geometry); work->geometry = NULL;
     xg_render_retired_buffers_free(&work->retired_buffers);
 }
@@ -2059,6 +2066,7 @@ static GlNativeGpuPlane s_native_gpu_spare_snapshots[GL_NATIVE_GPU_PLANES];
 static uint8_t *s_native_gpu_readback_spare[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
 static size_t s_native_gpu_readback_capacity[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
 static uint32_t s_native_gpu_scale;
+static int s_native_gpu_canonical;
 static GlNativeGpuCommand *native_gpu_command(GlNativeGpuWork *, GlNativeGpuOp);
 static int native_gpu_data(GlNativeGpuWork *, const void *, size_t, uint32_t *);
 static int native_gpu_seed(GlNativeGpuWork *, uint32_t, uint32_t, uint32_t, const uint32_t *, uint32_t *);
@@ -4254,13 +4262,37 @@ static void pack_flush(void) {
 
 /* Make sure the raw mirror is current for a textured draw that samples the
  * given texture page / CLUT. */
+static int dirty_intersects_wrapped(const DirtyRect *dirty, int x, int y, int w, int h) {
+    GpuVramRect rectangles[4];
+    const int count = gpu_vram_split_transfer(x & (VRAM_W - 1),
+        y & (VRAM_H - 1), w, h, rectangles);
+    for (int i = 0; i < count; ++i)
+        if (rect_intersects(dirty, rectangles[i].x, rectangles[i].y,
+                rectangles[i].x + rectangles[i].w - 1,
+                rectangles[i].y + rectangles[i].h - 1)) return 1;
+    return 0;
+}
+
+static int pack_intersects_wrapped(int x, int y, int w, int h) {
+    return dirty_intersects_wrapped(&s_pack_dirty, x, y, w, h);
+}
+
 static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
-                                   int clut_x, int clut_y) {
+                                   int clut_x, int clut_y, const int *limits) {
     if (s_native_host_queue_flushing) return;
     if (!s_pack_dirty.set) return;
-    int page_w = depth == 0 ? 64 : depth == 1 ? 128 : 256;  /* VRAM columns */
-    if (rect_intersects(&s_pack_dirty, tpage_x, tpage_y,
-                        tpage_x + page_w - 1, tpage_y + 255)) {
+    /* fetch_texel clamps every tap to these inclusive UV bounds when the
+     * texture window is disabled. A full-page hazard used to flush even when
+     * the drawn framebuffer and sampled texture occupied disjoint subregions
+     * of that page. Preserve the full footprint for windowed sampling. */
+    const int shift = depth == 0 ? 2 : depth == 1 ? 1 : 0;
+    const int bounded = limits && !(s_tw_mask_x | s_tw_mask_y);
+    const int u0 = bounded ? limits[0] : 0;
+    const int v0 = bounded ? limits[1] : 0;
+    const int u1 = bounded ? limits[2] : 255;
+    const int v1 = bounded ? limits[3] : 255;
+    if (pack_intersects_wrapped(tpage_x + (u0 >> shift), tpage_y + v0,
+            (u1 >> shift) - (u0 >> shift) + 1, v1 - v0 + 1)) {
         if (native_host_pending_flush_reason(3u) !=
             GPU_RENDER_TRANSACTION_OK) return;
         flush_flat_batch();
@@ -4269,7 +4301,7 @@ static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
     }
     if (depth <= 1) {
         int n = depth == 0 ? 16 : 256;
-        if (rect_intersects(&s_pack_dirty, clut_x, clut_y, clut_x + n - 1, clut_y)) {
+        if (pack_intersects_wrapped(clut_x, clut_y, n, 1)) {
             if (native_host_pending_flush_reason(3u) !=
                 GPU_RENDER_TRANSACTION_OK) return;
             flush_flat_batch();
@@ -4279,9 +4311,46 @@ static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
     }
 }
 
+static int native_single_owner_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_NATIVE_SINGLE_OWNER");
+        enabled = e && e[0] == '1';
+    }
+    return enabled && s_native_active && s_raster_ok && !s_cpu_auth_dual &&
+        xg_render_native_work_enabled();
+}
+
+/* Native replays accepted geometry/fills/copies into canonical VRAM. Only a
+ * CPU read needs the mirror: finish the FIFO before exposing any of its words.
+ * Keep this opt-in until CPU readbacks and mode transitions have wider coverage. */
+static int native_legacy_sync(void) {
+    if (!s_native_legacy_deferred) return 1;
+    extern uint64_t psx_get_cycle_count(void);
+    extern void psx_fatal_halt(const char *);
+    if (!xg_render_native_work_drain(psx_get_cycle_count())) {
+        psx_fatal_halt("Native canonical synchronization failed");
+        return 0;
+    }
+    SDL_LockMutex(s_native_state_mutex);
+    const int valid = s_native_native_words != NULL;
+    if (valid) memcpy(s_vram, s_native_native_words, VRAM_W * VRAM_H * sizeof(*s_vram));
+    SDL_UnlockMutex(s_native_state_mutex);
+    if (!valid) {
+        psx_fatal_halt("Native canonical words unavailable");
+        return 0;
+    }
+    s_native_legacy_deferred = 0;
+    gpu_vram_region_clear_all(&s_gpu_dirty);
+    up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+    flush_cpu_upload();
+    return 1;
+}
+
 /* ---- coherency: GPU -> CPU readback -------------------------------------- */
 static void ensure_cpu_region(int x, int y, int w, int h) {
     extern int psx_netplay_active(void);
+    if (!native_legacy_sync()) return;
     if (!s_raster_ok || w <= 0 || h <= 0 ||
         !gpu_vram_region_intersects(&s_gpu_dirty, x, y,
                                     x + w - 1, y + h - 1))
@@ -4321,6 +4390,7 @@ static void ensure_cpu_transfer(int x, int y, int w, int h) {
 
 static void ensure_cpu(void) {
     GpuVramRect bounds;
+    if (!native_legacy_sync()) return;
     if (!s_raster_ok || !gpu_vram_region_bounds(&s_gpu_dirty, &bounds)) return;
     ensure_cpu_region(bounds.x, bounds.y, bounds.w, bounds.h);
 }
@@ -5055,6 +5125,27 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   int semi, int dither, const int *lim,
                                   const float *subpixel_x,
                                   const float *subpixel_y) {
+    /* Native owns the wide image separately. A canonical triangle wholly
+     * outside its drawing area cannot read or write a pixel: avoid preparing
+     * texture feedback and submitting an empty draw to the legacy mirror. */
+    if (s_native_active && !g_wide_cur && !s_native_view_pass && !s_midpoint_pass_fbo) {
+        float left = subpixel_x ? subpixel_x[0] : (float)xs[0];
+        float right = left;
+        float top = subpixel_y ? subpixel_y[0] : (float)ys[0];
+        float bottom = top;
+        for (unsigned v = 1; v < 3; ++v) {
+            const float x = subpixel_x ? subpixel_x[v] : (float)xs[v];
+            const float y = subpixel_y ? subpixel_y[v] : (float)ys[v];
+            if (x < left) left = x; if (x > right) right = x;
+            if (y < top) top = y; if (y > bottom) bottom = y;
+        }
+        if (right < s_area_x1 || left > s_area_x2 + 1 ||
+            bottom < s_area_y1 || top > s_area_y2 + 1 ||
+            right < 0 || left > VRAM_W || bottom < 0 || top > VRAM_H) {
+            ++s_scene_prims_tex;
+            return;
+        }
+    }
     int lim_buf[4];
     int uv_buf[6];
     if (!lim) {
@@ -5083,7 +5174,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     if (!s_native_host_queue_flushing)
         flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
     if (!s_selected_bank_tex)
-        flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);
+        flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y, lim);
     mark_prim_dirty(xs, ys, 3, 1 /* textured */);
 
     /* HD texture replacement, decided now: this runs in guest order with the
@@ -5139,7 +5230,12 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * dual-source cases: it cannot alias a render target, keeps painter
          * order, and still splits on opaque transitions, bank/state changes,
          * masking or subtraction. */
-        int isolate = semi >= 0 &&
+        /* The canonical Native mirror uses the same ordered, single-pass
+         * dual-source draw. Its VRAM feedback barrier above has already drained
+         * any producer whose output this triangle samples. Keep opaque
+         * transitions separate, and retain isolation for the two-pass modes. */
+        int ordered_native = s_native_active && batch_semi == 4 && !s_mask_check;
+        int isolate = semi >= 0 && !ordered_native &&
             !mod_texture_bank_batchable(s_selected_bank_tex != 0, s_mask_check, semi);
         float tri_x[3], tri_y[3];
         for (int i = 0; i < 3; i++) {
@@ -5484,6 +5580,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
 
 /* ---- backend vtable wrappers ------------------------------------------- */
 static void glb_init(uint16_t *vram) {
+    s_native_legacy_deferred = 0;
     gl_renderer_native_midpoint_reset_for_reason(
         GL_NATIVE_MIDPOINT_RESET_INITIALIZE);
     s_vram = vram;
@@ -8125,6 +8222,8 @@ typedef struct GlNativeCpuCompiler {
     GlNativeGpuWork *gpu;
     uint32_t gpu_plane;
     int gpu_only;
+    int canonical_dirty;
+    int canonical_left, canonical_top, canonical_right, canonical_bottom;
     /* Row band of a parallel VIEW reference raster (raster Y, inclusive). */
     int banded, band_top, band_bottom;
     struct GlNativeViewWorker *view_worker;
@@ -8144,6 +8243,7 @@ typedef struct GlNativeCpuCompiler {
     /* Optional: the mesh is this caller's scratch, relocated in place. */
     GlNativeGpuMeshTriangle *mesh_writable;
 } GlNativeCpuCompiler;
+static int native_gpu_canonical_sync(GlNativeCpuCompiler *);
 static int native_gpu_draw(GlNativeCpuCompiler *, const XgSemanticDrawRecord *, int);
 static int native_gpu_draw_mesh(GlNativeCpuCompiler *, const XgSemanticDrawRecord *, int,
                                 const GlNativeGpuMeshTriangle *, uint32_t);
@@ -8550,6 +8650,9 @@ static int native_texture_window_coord(int coordinate, uint8_t mask,
            (((int)offset & (int)mask) * 8);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
 static inline uint16_t native_native_texel(const uint16_t *words,
                                        const XgRenderIrMaterialState *material, int u, int v) {
     u = native_texture_window_coord(u, material->texture_window_mask_x, material->texture_window_offset_x);
@@ -9090,16 +9193,31 @@ static int native_anisotropic_span(double ux, double vx, double uy, double vy,
     return count;
 }
 
-static int native_render_draw(GlNativeCpuCompiler *compiler,
+static inline void native_attribute_step(uint32_t q[5], const GlNativeAttributePlanes *attributes) {
+    q[0] += attributes->dda[0][1];
+    q[1] += attributes->dda[1][1];
+    q[2] += attributes->dda[2][1];
+    q[3] += attributes->dda[3][1];
+    q[4] += attributes->dda[4][1];
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline int native_render_draw_impl(GlNativeCpuCompiler *compiler,
                           GlNativeCpuSurface *target,
                           const XgSemanticDrawRecord *draw,
-                          uint32_t record_index) {
+                          uint32_t record_index, int canonical) {
     static const int dither[16] = {
         -4, 0, -3, 1, 2, -2, 3, -1,
         -3, 1, -4, 0, 3, -1, 2, -2,
     };
     const XgRenderIrNativePrimitive *primitive = &draw->primitive;
-    const XgRenderIrMaterialState *material = &primitive->material;
+    /* Immutable draw state cannot alias the writable VRAM words. Keeping a
+     * local value lets the sampler hoist page/window/CLUT constants across
+     * fragment writes, including the uint16_t fields of the material. */
+    const XgRenderIrMaterialState material_value = primitive->material;
+    const XgRenderIrMaterialState *material = &material_value;
     GlNativeResourceRecord *texture_resource = NULL;
     GlNativeResourceRecord *clut_resource = NULL;
     uint16_t encoded_depth = (uint16_t)((material->tpage >> 7u) & 3u);
@@ -9226,7 +9344,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
         return 1;
     }
     const GlNativeViewState *transition_views = compiler->view_pass ? compiler->native_views : NULL;
-    const int transition = transition_views ? native_transition_texture(transition_views, draw) : -1;
+    const int transition = !canonical && transition_views ? native_transition_texture(transition_views, draw) : -1;
     if (material->textured) {
         texture_resource = compiler->native_texture ? compiler->native_texture : native_audit_resource(
             compiler->audit, draw->texture_resource_id,
@@ -9267,18 +9385,20 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
     }
     /* These handles were validated once above. Do not repeat generic resource
      * dispatch or RGBA conversion for each Native texture and palette access. */
-    const uint16_t *native_words = texture_resource == compiler->native_texture &&
+    const uint16_t *native_words = canonical ? target->words : texture_resource == compiler->native_texture &&
         (material->texture_depth == XG_RENDER_IR_TEXTURE_15_BIT || clut_resource == compiler->native_clut)
         ? compiler->native_words : NULL;
     const XgRenderResourceDescriptor *target_descriptor = target->resource ? &target->resource->view.descriptor : NULL;
-    const int native_target = compiler->native_vram && target->pixels && target_descriptor &&
+    const int native_target = canonical || (compiler->native_vram && target->pixels && target_descriptor &&
         !compiler->viewport_x && !compiler->viewport_y && target->width <= VRAM_W && target->height <= VRAM_H &&
         target_descriptor->width == target->width && target_descriptor->height == target->height &&
         (!(target_descriptor->flags & XG_RENDER_RESOURCE_DESCRIPTOR_HAS_VRAM_REGION) ||
          (!target_descriptor->vram_x &&
-          target_descriptor->vram_width == target->width && target_descriptor->vram_height == target->height));
-    const int native_origin_y = native_target &&
+          target_descriptor->vram_width == target->width && target_descriptor->vram_height == target->height)));
+    const int native_origin_y = !canonical && native_target &&
         (target_descriptor->flags & XG_RENDER_RESOURCE_DESCRIPTOR_HAS_VRAM_REGION) ? target_descriptor->vram_y : 0;
+    const int canonical_rows = canonical || (native_target && target == compiler->native_vram &&
+        target->words && target->width == VRAM_W && native_origin_y == 0);
     for (uint32_t ti = 0u; ti < primitive->triangle_count; ++ti) {
         const XgRenderIrTriangle *triangle = &primitive->triangles[ti];
         const int flat = material->shading == XG_RENDER_IR_SHADING_FLAT;
@@ -9288,9 +9408,9 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
             triangle->vertices[0].b == 128u);
         const int filter_strength = draw->sprite_texture ? 100 :
             gl_renderer_scene_filter_strength();
-        const int filter_draw = material->textured && target != compiler->native_vram &&
+        const int filter_draw = !canonical && material->textured && target != compiler->native_vram &&
             filter_strength > 0 && (draw->sprite_texture ? s_sprite_filter : s_tex_filter);
-        const int anisotropy = material->textured && target != compiler->native_vram &&
+        const int anisotropy = !canonical && material->textured && target != compiler->native_vram &&
             !draw->sprite_texture &&
             draw->screen_space_2d == GPU_RENDER_SCREEN_SPACE_2D_NONE ?
             gl_renderer_anisotropy() : 0;
@@ -9302,12 +9422,13 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
             (material->mask_set ? UINT16_C(0x8000) : 0u));
         double px[3], py[3], area;
         double edges[3][3];
+        int integral_edges = 1;
         int top_left[3];
         /* The canonical VRAM raster is the guest-visible surface and keeps the
          * faithful affine sampling. Every presentation surface (native view,
          * recipe target, compatibility pass) takes the perspective payload when
          * the triangle carries it, matching the GPU shader path. */
-        int perspective = (compiler->native_vram == NULL ||
+        int perspective = !canonical && (compiler->native_vram == NULL ||
                            target != compiler->native_vram) &&
             material->textured &&
             native_triangle_all_projective(triangle);
@@ -9325,6 +9446,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                 ? vertex->native_view_x : vertex->x;
             int32_t position_y = !compiler->native_vram && vertex->native_view_position
                 ? vertex->native_view_y : vertex->y;
+            integral_edges &= (((uint32_t)position_x | (uint32_t)position_y) & UINT32_C(0xffff)) == 0u;
             int ix, iy;
             if (!compiler->native_vram &&
                 ((vertex->projective_position ? 1 : 0) != perspective ||
@@ -9366,14 +9488,22 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
             if (max_y > compiler->band_bottom) max_y = compiler->band_bottom;
             if (min_y > max_y) continue;
         }
+        /* No canonical pixel survives clipping. VIEW was submitted separately;
+         * avoid attribute setup and a redundant, fully clipped GPU command. */
+        if ((min_x > max_x || min_y > max_y) &&
+            (!compiler->gpu || (!compiler->view_pass && target == compiler->native_vram)))
+            continue;
         area = (px[1] - px[0]) * (py[2] - py[0]) -
                (py[1] - py[0]) * (px[2] - px[0]);
         if (area == 0.0) continue;
         if (target->words && !native_view_worker_drain(compiler, min_x, min_y, max_x, max_y)) return 0;
         GlNativeAttributePlanes attributes;
-        native_attribute_planes(triangle, px, py, 1u,
-            material->shading == XG_RENDER_IR_SHADING_GOURAUD, &attributes);
-        const GlNativeDepthMode depth_mode = target->depth
+        /* Constant untextured fragments go directly to native_write_fragment.
+         * Their CPU raster consumes no UV or colour interpolation planes. */
+        if (!constant_fragment)
+            native_attribute_planes(triangle, px, py, 1u,
+                material->shading == XG_RENDER_IR_SHADING_GOURAUD, &attributes);
+        const GlNativeDepthMode depth_mode = !canonical && target->depth
             ? native_depth_mode(draw, triangle, px, py) : (GlNativeDepthMode){0};
         const double orientation = area < 0.0 ? -1.0 : 1.0;
         area *= orientation;
@@ -9403,7 +9533,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
          * Q16 coordinates make nonzero edge slopes at least 1/65536, so double
          * rounding in these intersections is far below the one-pixel guard. */
         double edge_inverse[3];
-        const int trim_rows = max_x - min_x >= 16;
+        const int trim_rows = canonical || max_x - min_x >= 16;
         if (trim_rows)
             for (int e = 0; e < 3; ++e)
                 edge_inverse[e] = edges[e][0] ? 1.0 / edges[e][0] : 0.0;
@@ -9415,6 +9545,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
             for (unsigned v = 0u; v < 3u; ++v)
                 perspective_reciprocal[v] = 1.0 / triangle->vertices[v].projective_view_z;
         for (int y = min_y; y <= max_y; ++y) {
+            uint16_t written_blocks = 0u;
             int row_min = min_x, row_max = max_x;
             if (trim_rows) {
                 const double sy = y + 1.0 / 64.0;
@@ -9430,28 +9561,73 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     }
                 }
             }
-            for (int x = row_min; x <= row_max; ++x) {
+            /* Integer vertices produce edge values in exact multiples of
+             * 1/64, well within double's integer precision for Q16 positions.
+             * Advance those edges by addition; fractional VIEW geometry keeps
+             * its original evaluation, avoiding accumulated rounding changes. */
+            double row_edges[3];
+            for (int e = 0; e < 3; ++e)
+                row_edges[e] = edges[e][0] * (row_min + 1.0 / 64.0) +
+                    edges[e][1] * (y + 1.0 / 64.0) + edges[e][2];
+            if (canonical) {
+                /* Coverage is an intersection of three linear half-spaces.
+                 * Integer-vertex edges are exact in double here. Refine the
+                 * conservative row bounds with the original top-left rule;
+                 * every pixel between the resulting endpoints is then inside.
+                 * This removes three edge tests from every covered fragment. */
+                for (int e = 0; e < 3 && row_min <= row_max; ++e) {
+                    if (edges[e][0] == 0.0 &&
+                        (row_edges[e] < 0.0 || (row_edges[e] == 0.0 && !top_left[e]))) {
+                        row_min = row_max + 1;
+                        break;
+                    }
+                    if (edges[e][0] > 0.0) {
+                        double edge = edges[e][0] * (row_min + 1.0 / 64.0) +
+                            edges[e][1] * (y + 1.0 / 64.0) + edges[e][2];
+                        while (row_min <= row_max && (edge < 0.0 || (edge == 0.0 && !top_left[e]))) {
+                            ++row_min; edge += edges[e][0];
+                        }
+                    } else if (edges[e][0] < 0.0) {
+                        double edge = edges[e][0] * (row_max + 1.0 / 64.0) +
+                            edges[e][1] * (y + 1.0 / 64.0) + edges[e][2];
+                        while (row_min <= row_max && (edge < 0.0 || (edge == 0.0 && !top_left[e]))) {
+                            --row_max; edge -= edges[e][0];
+                        }
+                    }
+                }
+            }
+            uint32_t row_attributes[5];
+            if (canonical && !constant_fragment)
+                for (unsigned a = 0u; a < 5u; ++a)
+                    row_attributes[a] = attributes.dda[a][0] +
+                        attributes.dda[a][1] * (uint32_t)(row_min - (int)attributes.x) +
+                        attributes.dda[a][2] * (uint32_t)(y - (int)attributes.y);
+            for (int x = row_min; x <= row_max; ++x,
+                    row_edges[0] += edges[0][0], row_edges[1] += edges[1][0],
+                    row_edges[2] += edges[2][0],
+                    (canonical && !constant_fragment ?
+                        native_attribute_step(row_attributes, &attributes) : (void)0)) {
                 const double sx = x + 1.0 / 64.0;
                 const double sy = y + 1.0 / 64.0;
-                const double e0 =
+                const double e0 = (canonical || integral_edges) ? row_edges[0] :
                     edges[0][0] * sx + edges[0][1] * sy + edges[0][2];
-                const double e1 =
+                const double e1 = (canonical || integral_edges) ? row_edges[1] :
                     edges[1][0] * sx + edges[1][1] * sy + edges[1][2];
-                const double e2 =
+                const double e2 = (canonical || integral_edges) ? row_edges[2] :
                     edges[2][0] * sx + edges[2][1] * sy + edges[2][2];
                 uint32_t *destination;
                 uint16_t word;
                 int color8[3], color5[3], mask, blend;
-                if (e0 < 0.0 || (e0 == 0.0 && !top_left[0]) ||
+                if (!canonical && (e0 < 0.0 || (e0 == 0.0 && !top_left[0]) ||
                     e1 < 0.0 || (e1 == 0.0 && !top_left[1]) ||
-                    e2 < 0.0 || (e2 == 0.0 && !top_left[2]))
+                    e2 < 0.0 || (e2 == 0.0 && !top_left[2])))
                     continue;
                 if (native_target) destination = target->pixels + (size_t)(y - native_origin_y) * target->width + x;
                 else if (!native_surface_pixel(target, x, y, &destination) ||
                     !native_pixel_in_viewport(compiler, target, destination)) continue;
                 if (material->mask_check && (*destination >> 24u) != 0u)
                     continue;
-                uint32_t *const depth_cell = target->depth ? target->depth + (destination - target->pixels) : NULL;
+                uint32_t *const depth_cell = !canonical && target->depth ? target->depth + (destination - target->pixels) : NULL;
                 uint32_t fragment_depth = 0u;
                 int blended = 0; /* this fragment actually blends: it keeps the stored key */
                 if (depth_cell && depth_mode.test) {
@@ -9473,8 +9649,21 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                 color8[0] = triangle->vertices[0].r;
                 color8[1] = triangle->vertices[0].g;
                 color8[2] = triangle->vertices[0].b;
-                for (unsigned a = attribute_begin; a < attribute_end; ++a) {
-                    if (attributes.integral) {
+                if (canonical) {
+                    /* Unsigned Q12 addition is exactly the original multiply
+                     * modulo 2^32. Step even across uncovered/transparent
+                     * pixels, so the sample remains tied to its absolute X. */
+                    if (material->textured) {
+                        sampled[0] = (row_attributes[0] >> 12u) & 255u;
+                        sampled[1] = (row_attributes[1] >> 12u) & 255u;
+                    }
+                    if (!material->raw_texture && material->shading == XG_RENDER_IR_SHADING_GOURAUD) {
+                        color8[0] = (row_attributes[2] >> 12u) & 255u;
+                        color8[1] = (row_attributes[3] >> 12u) & 255u;
+                        color8[2] = (row_attributes[4] >> 12u) & 255u;
+                    }
+                } else for (unsigned a = attribute_begin; a < attribute_end; ++a) {
+                    if (canonical || attributes.integral) {
                         const uint32_t q = attributes.dda[a][0] +
                             attributes.dda[a][1] * (uint32_t)(x - (int)attributes.x) +
                             attributes.dda[a][2] * (uint32_t)(y - (int)attributes.y);
@@ -9530,10 +9719,10 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     /* floor() produced integral texcoords. For values fitting
                      * int, the sampler's low-eight-bit wrap is exactly fmod(256),
                      * including negative coordinates, without a floating divide. */
-                    int sample_u = (attributes.integral && !perspective) ||
+                    int sample_u = canonical || (attributes.integral && !perspective) ||
                         (sampled[0] >= INT_MIN && sampled[0] <= INT_MAX)
                         ? (int)sampled[0] : (int)fmod(sampled[0], 256.0);
-                    int sample_v = (attributes.integral && !perspective) ||
+                    int sample_v = canonical || (attributes.integral && !perspective) ||
                         (sampled[1] >= INT_MIN && sampled[1] <= INT_MAX)
                         ? (int)sampled[1] : (int)fmod(sampled[1], 256.0);
                     if ((material->texture_window_mask_x |
@@ -9571,6 +9760,28 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                             (native_rgba_to_1555(source->pixels[(size_t)sy * views->width + sx]) & UINT16_C(0x7fff));
                     }
                     if (texel == 0u) continue;
+                    /* Nearest sampling has integral RGB555 channels. Preserve
+                     * the two original truncations (modulation /16, then /8
+                     * after dithering), without constructing floating-point
+                     * filter taps for every canonical fragment. */
+                    if (!filter_draw && anisotropy <= 1) {
+                        if (direct_texel) {
+                            word = texel | (material->mask_set ? UINT16_C(0x8000) : 0u);
+                            if (material->semi_transparent && (texel & UINT16_C(0x8000))) {
+                                word = native_psx_fragment_word(*destination,
+                                    texel & 31u, (texel >> 5u) & 31u, (texel >> 10u) & 31u,
+                                    1, 1, material->blend_mode);
+                                blended = 1;
+                            }
+                            goto native_write_fragment;
+                        }
+                        color5[0] = ((texel & 31u) * (unsigned)color8[0]) >> 4u;
+                        color5[1] = (((texel >> 5u) & 31u) * (unsigned)color8[1]) >> 4u;
+                        color5[2] = (((texel >> 10u) & 31u) * (unsigned)color8[2]) >> 4u;
+                        mask |= (texel >> 15u) & 1u;
+                        blend &= (texel >> 15u) & 1u;
+                        goto native_quantize_fragment;
+                    }
                     double filtered5[3] = {
                         texel & 31u, (texel >> 5u) & 31u, (texel >> 10u) & 31u,
                     };
@@ -9724,6 +9935,7 @@ static int native_render_draw(GlNativeCpuCompiler *compiler,
                     for (int channel = 0; channel < 3; ++channel)
                         color5[channel] = color8[channel];
                 }
+native_quantize_fragment:
                 if (!material->textured || !material->raw_texture) {
                     int phase = material->dither && !compiler->dithering_disabled ? dither[
                         (((y + compiler->dither_y) & 3) << 2) | ((x + compiler->dither_x) & 3)] : 0;
@@ -9759,23 +9971,134 @@ native_write_fragment:
                 if (target->words) {
                     const size_t index = destination - target->pixels;
                     target->words[index] = word;
-                    if (compiler->native_views) {
-                        compiler->native_views->word_versions[index / VRAM_W][(index % VRAM_W) / 64u] = compiler->native_views->write_serial;
-                        compiler->native_views->word_page_versions[index / (VRAM_W * 256u)][(index % VRAM_W) / 64u] = compiler->native_views->write_serial;
-                    }
-                    if (compiler->gpu) {
-                        compiler->gpu->dirty_word_rows[index / VRAM_W] |= 1u << ((index % VRAM_W) / 64u);
-                        compiler->gpu->dirty_texture_pages[index / (VRAM_W * 256u)] |= 1u << ((index % VRAM_W) / 64u);
+                    if (canonical_rows) written_blocks |= (uint16_t)(1u << (x >> 6));
+                    else {
+                        if (compiler->native_views) {
+                            compiler->native_views->word_versions[index / VRAM_W][(index % VRAM_W) / 64u] = compiler->native_views->write_serial;
+                            compiler->native_views->word_page_versions[index / (VRAM_W * 256u)][(index % VRAM_W) / 64u] = compiler->native_views->write_serial;
+                        }
+                        if (compiler->gpu) {
+                            compiler->gpu->dirty_word_rows[index / VRAM_W] |= 1u << ((index % VRAM_W) / 64u);
+                            compiler->gpu->dirty_texture_pages[index / (VRAM_W * 256u)] |= 1u << ((index % VRAM_W) / 64u);
+                        }
                     }
                 }
-                if (compiler->raster_words && !compiler->view_pass)
-                    gpu_vram_region_mark_rect(compiler->raster_words, x, y, x, y);
+                if (compiler->raster_words && !compiler->view_pass) {
+                    if (canonical_rows) {
+                        uint64_t *bits = &compiler->raster_words->rows[y][x >> 6];
+                        if (!*bits) compiler->raster_words->nonzero_words++;
+                        *bits |= UINT64_C(1) << (x & 63);
+                    } else gpu_vram_region_mark_rect(compiler->raster_words, x, y, x, y);
+                }
                 compiler->audit->rendered_draw_pixels++;
+            }
+            /* Readers observe versions at draw boundaries, not between texels
+             * of this row. Publish each actually written block only once. */
+            if (written_blocks) {
+                if (compiler->gpu) {
+                    compiler->gpu->dirty_word_rows[y] |= written_blocks;
+                    compiler->gpu->dirty_texture_pages[y >> 8] |= written_blocks;
+                }
+                if (compiler->native_views)
+                    for (unsigned b = 0u; b < GPU_VRAM_REGION_WORDS_PER_ROW; ++b)
+                        if (written_blocks & (1u << b)) {
+                            compiler->native_views->word_versions[y][b] = compiler->native_views->write_serial;
+                            compiler->native_views->word_page_versions[y >> 8][b] = compiler->native_views->write_serial;
+                        }
             }
         }
     }
     compiler->audit->rendered_draws++;
     return 1;
+}
+
+/* Specialize the same raster equations for the common canonical integer
+ * surface. The constant argument lets the compiler remove VIEW/depth/filter
+ * branches from its pixel loop without maintaining a second raster algorithm. */
+static int native_render_draw(GlNativeCpuCompiler *compiler,
+        GlNativeCpuSurface *target, const XgSemanticDrawRecord *draw,
+        uint32_t record_index) {
+    if (compiler->gpu && compiler->gpu->canonical_gpu && target == compiler->native_vram) {
+        /* Host enhancement packets belong to VIEW, never to guest VRAM. */
+        if (compiler->gpu_only) return 1;
+        if (draw->topology == GPU_RENDER_SEMANTIC_TRIANGLES &&
+            (!draw->primitive.triangle_count || draw->primitive.triangle_count > XG_RENDER_IR_TRIANGLE_CAPACITY)) {
+            native_audit_block(compiler->audit, GL_RENDERER_NATIVE_BLOCKER_INVALID_RECORD,
+                record_index, 0u, 0u);
+            return 0;
+        }
+        const unsigned count = draw->topology == GPU_RENDER_SEMANTIC_TRIANGLES
+            ? draw->primitive.triangle_count : 1u;
+        for (unsigned t = 0u; t < count; ++t) {
+            XgSemanticDrawRecord part = *draw;
+            if (draw->topology == GPU_RENDER_SEMANTIC_TRIANGLES) {
+                part.primitive.triangle_count = 1u;
+                part.primitive.triangles[0] = draw->primitive.triangles[t];
+                part.primitive.triangles[0].split_index = 0u;
+                part.primitive.triangles[0].split_count = 1u;
+            }
+            compiler->gpu_only = 1;
+            const int ok = native_render_draw_impl(compiler, target, &part, record_index, 0);
+            compiler->gpu_only = 0;
+            if (!ok) return 0;
+            const XgRenderIrMaterialState *m = &part.primitive.material;
+            int left = VRAM_W, top = VRAM_H, right = -1, bottom = -1;
+            const unsigned vertices = part.topology == GPU_RENDER_SEMANTIC_TRIANGLES ? 3u : part.line_count * 2u;
+            for (unsigned v = 0u; v < vertices; ++v) {
+                const int32_t x = part.topology == GPU_RENDER_SEMANTIC_TRIANGLES
+                    ? part.primitive.triangles[0].vertices[v].x : part.lines[v / 2u].vertices[v % 2u].x;
+                const int32_t y = part.topology == GPU_RENDER_SEMANTIC_TRIANGLES
+                    ? part.primitive.triangles[0].vertices[v].y : part.lines[v / 2u].vertices[v % 2u].y;
+                const int px = native_fixed_floor(x) + m->draw_offset_x;
+                const int py = native_fixed_floor(y) + m->draw_offset_y;
+                if (px < left) left = px; if (px > right) right = px;
+                if (py < top) top = py; if (py > bottom) bottom = py;
+            }
+            if (left < m->draw_area_left) left = m->draw_area_left;
+            if (top < m->draw_area_top) top = m->draw_area_top;
+            if (right > m->draw_area_right) right = m->draw_area_right;
+            if (bottom > m->draw_area_bottom) bottom = m->draw_area_bottom;
+            if (left < 0) left = 0; if (top < 0) top = 0;
+            if (right >= VRAM_W) right = VRAM_W - 1;
+            if (bottom >= VRAM_H) bottom = VRAM_H - 1;
+            if (left <= right && top <= bottom) {
+                if (!compiler->canonical_dirty) {
+                    compiler->canonical_left = left; compiler->canonical_top = top;
+                    compiler->canonical_right = right; compiler->canonical_bottom = bottom;
+                } else {
+                    if (left < compiler->canonical_left) compiler->canonical_left = left;
+                    if (top < compiler->canonical_top) compiler->canonical_top = top;
+                    if (right > compiler->canonical_right) compiler->canonical_right = right;
+                    if (bottom > compiler->canonical_bottom) compiler->canonical_bottom = bottom;
+                }
+                compiler->canonical_dirty = 1;
+            }
+        }
+        compiler->audit->rendered_draws++;
+        return 1;
+    }
+    int canonical = target && compiler->native_vram == target &&
+        compiler->native_words == target->words && target->words && target->pixels &&
+        compiler->native_texture && compiler->native_clut && !compiler->view_pass &&
+        !target->depth && target->width == VRAM_W && target->height == VRAM_H &&
+        !compiler->viewport_x && !compiler->viewport_y &&
+        compiler->viewport_width == VRAM_W && compiler->viewport_height == VRAM_H &&
+        target->resource && target->resource->view.descriptor.width == VRAM_W &&
+        target->resource->view.descriptor.height == VRAM_H &&
+        (!(target->resource->view.descriptor.flags & XG_RENDER_RESOURCE_DESCRIPTOR_HAS_VRAM_REGION) ||
+         (!target->resource->view.descriptor.vram_x && !target->resource->view.descriptor.vram_y &&
+          target->resource->view.descriptor.vram_width == VRAM_W &&
+          target->resource->view.descriptor.vram_height == VRAM_H)) &&
+        draw->topology == GPU_RENDER_SEMANTIC_TRIANGLES &&
+        draw->primitive.triangle_count <= XG_RENDER_IR_TRIANGLE_CAPACITY;
+    for (uint32_t t = 0u; canonical && t < draw->primitive.triangle_count; ++t)
+        for (unsigned v = 0u; v < 3u; ++v) {
+            const XgRenderIrVertex *vertex = &draw->primitive.triangles[t].vertices[v];
+            if (((uint32_t)vertex->x | (uint32_t)vertex->y |
+                 (uint32_t)vertex->u | (uint32_t)vertex->v) & UINT32_C(0xffff)) canonical = 0;
+        }
+    if (canonical) return native_render_draw_impl(compiler, target, draw, record_index, 1);
+    return native_render_draw_impl(compiler, target, draw, record_index, 0);
 }
 
 /* CPU VIEW is independent storage, but samples canonical raw words. The single
@@ -10176,6 +10499,18 @@ static void native_recipe_drop_at(GlNativeViewTarget *target, uint32_t line, con
 }
 #define native_recipe_drop(target) native_recipe_drop_at((target), __LINE__, __func__)
 
+/* Recipes exist solely to replay intermediate temporal frames. Endpoint
+ * draws, framebuffer copies and the wave warp execute on their own GPU planes
+ * without them. Keep capture available to explicit diagnostics. */
+static int native_recipe_tracking_hz(uint16_t temporal_hz) {
+    return temporal_hz || s_native_recipe_audit_enabled ||
+        s_native_motion_probe.target_vblank;
+}
+
+static int native_recipe_tracking(const GlNativeViewState *views) {
+    return native_recipe_tracking_hz(views->temporal_hz);
+}
+
 static int native_recipe_private(GlNativeViewTarget *target) {
     GlNativeRecipe *recipe = target->recipe;
     if (!recipe) return 0;
@@ -10431,8 +10766,11 @@ static int native_view_cover(const GlNativeViewState *views, uint32_t count,
         if (x < target->x || y < target->y ||
             x + w > target->x + target->width ||
             y + h > target->y + target->height) continue;
-        if (x == target->x && y == target->y &&
-            w == target->width && h == target->height) return (int)i;
+        /* An old exact-size alias can outlive a scene change. In battle the
+         * 216-line scanout crops a freshly declared 224-line framebuffer;
+         * selecting an older 216-line target loses its temporal recipe every
+         * other page flip. Resolve by declaration age, as for scanout rows,
+         * instead of letting that stale exact extent override the owner. */
         if (found < 0 || target->declaration > views->targets[found].declaration)
             found = (int)i;
     }
@@ -10845,7 +11183,7 @@ static void native_gpu_publish_prefix(GlNativeGpuWork *work,int seal) {
         work->state=NATIVE_GPU_QUEUED;s_native_gpu_work=work;
         work->timing.queued_ns=SDL_GetTicksNS();
     } else if(work->state==NATIVE_GPU_WAIT_INPUT)work->state=NATIVE_GPU_DISPATCHING;
-    work->sealed=seal;
+    work->sealed=seal > 0;
     SDL_CondBroadcast(s_native_gpu_condition);
     SDL_UnlockMutex(s_native_state_mutex);
 }
@@ -10892,6 +11230,54 @@ static int native_gpu_data(GlNativeGpuWork *work, const void *data, size_t bytes
     }
     *offset = work->bytes;
     memcpy(work->data + work->bytes, data, bytes); work->bytes += (uint32_t)bytes;
+    return 1;
+}
+
+/* Read back completed GPU raster work only at a CPU dependency boundary.
+ * The compile owner sleeps while the GL owner executes the published prefix. */
+static int native_gpu_canonical_sync(GlNativeCpuCompiler *compiler) {
+    if (!compiler->canonical_dirty) return 1;
+    GlNativeGpuWork *work = compiler->gpu;
+    if (!work || !work->canonical_gpu || work->deferred) return 0;
+    GlNativeGpuCommand *command = native_gpu_command(work, NATIVE_GPU_CANONICAL_READBACK);
+    if (!command) return 0;
+    command->data = ++work->canonical_requested;
+    command->x = compiler->canonical_left & ~63;
+    command->y = compiler->canonical_top;
+    command->w = (compiler->canonical_right | 63) - command->x + 1;
+    command->h = compiler->canonical_bottom - command->y + 1;
+    native_gpu_publish_prefix(work, -1);
+    SDL_LockMutex(s_native_state_mutex);
+    while (work->canonical_completed < work->canonical_requested &&
+           !work->render_failed && !work->failed && !work->cancel_requested &&
+           SDL_AtomicGet(&s_native_gpu_run) && SDL_AtomicGet(&s_native_gpu_status) > 0)
+        SDL_CondWaitTimeout(s_native_gpu_condition, s_native_state_mutex, 10);
+    const int ok = work->canonical_completed == work->canonical_requested &&
+        !work->render_failed && !work->failed && !work->cancel_requested;
+    SDL_UnlockMutex(s_native_state_mutex);
+    if (!ok) return 0;
+    GlNativeViewState *views = compiler->native_views;
+    const unsigned first = (unsigned)compiler->canonical_left / 64u;
+    const unsigned last = (unsigned)compiler->canonical_right / 64u;
+    const uint16_t mask = (uint16_t)(((1u << (last - first + 1u)) - 1u) << first);
+    for (int y = compiler->canonical_top; y <= compiler->canonical_bottom; ++y) {
+        for (unsigned b = first; b <= last; ++b) {
+            const size_t offset = (size_t)y * VRAM_W + b * 64u;
+            for (unsigned x = 0u; x < 64u; ++x) {
+                /* GPU alpha carries both the guest mask and AA exemption.
+                 * Only its high bit is the guest mask. */
+                const uint32_t pixel = work->canonical_pixels[offset + x];
+                const uint16_t word = native_rgba_to_1555(pixel & UINT32_C(0x80ffffff));
+                compiler->native_vram->words[offset + x] = word;
+                compiler->native_vram->pixels[offset + x] = conv_1555_to_rgba8(word);
+            }
+            views->word_versions[y][b] = views->write_serial;
+            views->word_page_versions[y >> 8][b] = views->write_serial;
+        }
+        work->dirty_word_rows[y] |= mask;
+        work->dirty_texture_pages[y >> 8] |= mask;
+    }
+    compiler->canonical_dirty = 0;
     return 1;
 }
 
@@ -11038,23 +11424,42 @@ static int native_gpu_replay_texture(GlNativeGpuWork *work, const uint16_t *word
 /* Synchronize the raw-word texture with the pages and CLUT one material
  * samples, before the draw that samples them. */
 static int native_gpu_sync_texture(GlNativeCpuCompiler *compiler, GlNativeGpuWork *work,
-                                   const XgRenderIrMaterialState *m) {
+                                   const XgRenderIrMaterialState *m, const int *limits) {
     if (!m->textured) return 1;
+    if (compiler->canonical_dirty) {
+        DirtyRect dirty = {compiler->canonical_left, compiler->canonical_top,
+            compiler->canonical_right, compiler->canonical_bottom, 1};
+        const unsigned shift = 2u - m->texture_depth;
+        const int bounded = limits && !(m->texture_window_mask_x | m->texture_window_mask_y);
+        const int x = m->texture_page_x * 64u + (bounded ? limits[0] >> shift : 0);
+        const int y = m->texture_page_y * 256u + (bounded ? limits[1] : 0);
+        const int w = bounded ? (limits[2] >> shift) - (limits[0] >> shift) + 1 : 64 << m->texture_depth;
+        const int h = bounded ? limits[3] - limits[1] + 1 : 256;
+        if (dirty_intersects_wrapped(&dirty, x, y, w, h) ||
+            (m->texture_depth != XG_RENDER_IR_TEXTURE_15_BIT &&
+             dirty_intersects_wrapped(&dirty, m->clut_x, m->clut_y,
+                m->texture_depth == XG_RENDER_IR_TEXTURE_4_BIT ? 16 : 256, 1)))
+            if (!native_gpu_canonical_sync(compiler)) return 0;
+    }
     if (compiler->gpu_only && compiler->gpu_plane >= GL_NATIVE_GPU_PHASE_BASE)
         return native_gpu_replay_texture(work, compiler->native_words, m);
     if (compiler->native_vram && compiler->native_words == compiler->native_vram->words &&
         !native_gpu_raw_texture_dirty(work, m)) return 1;
     if (!compiler->native_words) return 0;
-    /* Raw texels and draw destinations are separate resources. Synchronize
-     * dirty blocks in the sampled pages, including unused texels, instead
-     * of clipping every triangle to rediscover an exact read footprint.
-     * The canonical shadow is the completed preceding FIFO state. Recipe
-     * feedback/ownership still uses its exact read analysis separately. */
+    /* The shader clamps all taps to the triangle's UV range without a texture
+     * window. Synchronizing unrelated framebuffer rows within that page adds
+     * WORDS commands and breaks otherwise compatible GPU draw batches. */
     const int canonical = compiler->native_vram && compiler->native_words == compiler->native_vram->words;
-    for (unsigned page=0u;page<(1u<<m->texture_depth);++page) {
+    const int bounded = canonical && limits && !(m->texture_window_mask_x | m->texture_window_mask_y);
+    const unsigned shift = 2u - m->texture_depth;
+    const unsigned first_page = bounded ? (unsigned)limits[0] >> (shift + 6u) : 0u;
+    const unsigned last_page = bounded ? (unsigned)limits[2] >> (shift + 6u) : (1u << m->texture_depth) - 1u;
+    const unsigned first_row = m->texture_page_y * 256u + (bounded ? (unsigned)limits[1] : 0u);
+    const unsigned end_row = m->texture_page_y * 256u + (bounded ? (unsigned)limits[3] + 1u : 256u);
+    for (unsigned page=first_page;page<=last_page;++page) {
         const unsigned block=(m->texture_page_x+page)&15u;
         const uint16_t mask=(uint16_t)(1u<<block);
-        for (unsigned row=m->texture_page_y*256u;row<(m->texture_page_y+1u)*256u;++row) {
+        for (unsigned row=first_row;row<end_row;++row) {
             if (canonical && !(work->dirty_word_rows[row]&mask)) continue;
             const uint32_t offset=row*VRAM_W+block*64u;
             if (canonical) work->dirty_word_rows[row]&=(uint16_t)~mask;
@@ -11069,7 +11474,9 @@ static int native_gpu_sync_texture(GlNativeCpuCompiler *compiler, GlNativeGpuWor
                 work->dirty_texture_pages[offset/(VRAM_W*256u)]|=mask;
             }
         }
-        if (canonical) work->dirty_texture_pages[m->texture_page_y]&=(uint16_t)~mask;
+        /* A partial-row sync leaves the coarse page dirty for later draws. */
+        if (canonical && end_row - first_row == 256u)
+            work->dirty_texture_pages[m->texture_page_y]&=(uint16_t)~mask;
     }
     if (m->texture_depth!=XG_RENDER_IR_TEXTURE_15_BIT) {
         const unsigned entries=m->texture_depth==XG_RENDER_IR_TEXTURE_4_BIT?16u:256u;
@@ -11103,9 +11510,9 @@ static int native_gpu_sync_texture(GlNativeCpuCompiler *compiler, GlNativeGpuWor
  * once per texture change. The GL owner already groups a pure DRAW run by
  * plane, so looking back over other planes' draws keeps every plane's own
  * order. A texture sync between two draws ends the run (WORDS is not a
- * DRAW). Plane 0 (canonical) interleaves single triangles and never
- * coalesces; VIEW and phase planes keep a run's data contiguous at the blob
- * end. */
+ * DRAW). Canonical triangles can share this ordered batch too: their texture
+ * dependencies were synchronized before appending, and a WORDS patch still
+ * closes the run before any dependent triangle. */
 static int native_gpu_draw_state_equal(const XgSemanticDrawRecord *a, const XgSemanticDrawRecord *b,
                                        uint8_t dither) {
     const XgRenderIrMaterialState *x = &a->primitive.material, *y = &b->primitive.material;
@@ -11225,9 +11632,29 @@ static int native_gpu_draw_mesh(GlNativeCpuCompiler *compiler, const XgSemanticD
         for (uint32_t t = 0u; t < mesh_count; ++t) {
             if (t && native_texture_state_equal(&mesh[t].texture, &mesh[t - 1u].texture)) continue;
             native_texture_state_apply(&material, &mesh[t].texture);
-            if (!native_gpu_sync_texture(compiler, work, &material)) return 0;
+            if (!native_gpu_sync_texture(compiler, work, &material, NULL)) return 0;
         }
-    } else if (!native_gpu_sync_texture(compiler, work, m)) return 0;
+    } else {
+        int limits[4], *footprint = NULL;
+        if (m->textured && !(m->texture_window_mask_x | m->texture_window_mask_y) &&
+            draw->topology == GPU_RENDER_SEMANTIC_TRIANGLES && draw->primitive.triangle_count) {
+            int lo_u = INT_MAX, lo_v = INT_MAX, hi_u = INT_MIN, hi_v = INT_MIN;
+            for (uint32_t t = 0u; t < draw->primitive.triangle_count; ++t)
+                for (unsigned v = 0u; v < 3u; ++v) {
+                    const XgRenderIrVertex *vertex = &draw->primitive.triangles[t].vertices[v];
+                    const int u = native_fixed_floor(vertex->u), vv = native_fixed_floor(vertex->v);
+                    if (u < lo_u) lo_u = u; if (u > hi_u) hi_u = u;
+                    if (vv < lo_v) lo_v = vv; if (vv > hi_v) hi_v = vv;
+                }
+            /* No exclusive-edge tightening: this bounds every triangle's
+             * shader clamp, including mirrored mappings. Wrapping uses the
+             * full axis, exactly as gpu_uv.h does for its sample limits. */
+            psx_uv_axis_limits(lo_u, hi_u, 0, &limits[0], &limits[2]);
+            psx_uv_axis_limits(lo_v, hi_v, 0, &limits[1], &limits[3]);
+            footprint = limits;
+        }
+        if (!native_gpu_sync_texture(compiler, work, m, footprint)) return 0;
+    }
     /* A framebuffer capture is a VIEW texture, including the reveal margins
      * and every internal-resolution sample. Ordinary textures use raw words.
      * The transfer journal separates source-plane writes from these draws. */
@@ -11250,7 +11677,7 @@ static int native_gpu_draw_mesh(GlNativeCpuCompiler *compiler, const XgSemanticD
     }
     const uint8_t dither = draw->primitive.material.dither && !compiler->dithering_disabled;
     native_gpu_note_depth_range(compiler, draw, mesh, mesh_count);
-    if (!source && compiler->gpu_plane != 0u) {
+    if (!source) {
         GlNativeGpuCommand *run = native_gpu_coalesce_target(work, compiler->gpu_plane, draw, dither,
             compiler->dither_x, origin_y);
         if (run) {
@@ -11734,6 +12161,8 @@ static void native_recipe_begin(GlNativeViewState *views, GlNativeViewTarget *ta
      * count instead of regrowing from 16 by doubling (each regrowth copies
      * every 1 KiB record so far). */
     native_recipe_drop(target);
+    target->displayed = 0;
+    if (!native_recipe_tracking(views)) return;
     const uint32_t expected = target->recipe_draws;
     GlNativeRecipe *recipe = malloc(sizeof(*recipe));
     if (!recipe) return;
@@ -11789,6 +12218,7 @@ static void native_recipe_begin_snapshot(GlNativeViewState *views, uint32_t inde
  * snapshot a declaration would start, captured before this draw. Recipes
  * dropped mid-frame are not shown and stay dropped. */
 static void native_recipe_frame_draw(GlNativeViewState *views, const XgSemanticDrawRecord *draw) {
+    if (!native_recipe_tracking(views)) return;
     const XgRenderIrMaterialState *dm = &draw->primitive.material;
     const int frame = native_view_cover(views, views->count, dm->draw_area_left,
         dm->draw_area_top, dm->draw_area_right - dm->draw_area_left + 1,
@@ -11806,6 +12236,7 @@ static void native_recipe_frame_draw(GlNativeViewState *views, const XgSemanticD
 /* Canonical words a transfer leaves rasterized (copied from rasterized words)
  * or replaced by transferred data. */
 static void native_recipe_raster_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op) {
+    if (!native_recipe_tracking(views)) return;
     const int raster = op->kind == XG_RENDER_NATIVE_OPERATION_COPY &&
         native_recipe_region(&views->raster_words, op->src_x, op->src_y, op->width, op->height);
     if (raster) gpu_vram_region_mark_transfer(&views->raster_words, op->dst_x, op->dst_y, op->width, op->height);
@@ -11815,6 +12246,7 @@ static void native_recipe_raster_transfer(GlNativeViewState *views, const XgRend
 
 static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativeOperation *op,
                                 GlNativeRecipe *const *before, uint32_t before_count) {
+    if (!native_recipe_tracking(views)) return;
     const int copy = op->kind == XG_RENDER_NATIVE_OPERATION_COPY;
     for (uint32_t i = 0u; i < views->count; ++i) {
         GlNativeViewTarget *t = &views->targets[i];
@@ -11888,6 +12320,7 @@ static void native_recipe_transfer(GlNativeViewState *views, const XgRenderNativ
 
 static void native_recipe_draw_written(GlNativeViewState *views, const XgRenderNativeOperation *operation,
                                     const GlNativeCompileAudit *audit, const uint16_t *words) {
+    if (!native_recipe_tracking(views)) return;
     const GpuRenderSemantic *semantic = &operation->semantic;
     GpuRenderSemantic draw = *semantic;
     int left = INT_MAX, top = INT_MAX, right = INT_MIN, bottom = INT_MIN;
@@ -12208,7 +12641,11 @@ static int native_view_draw(GlNativeCpuCompiler *compiler, GlNativeViewState *vi
             if (native_transition_overwritten(alias, draw)) {
                 views->targets[j].transition_snapshot = 0;
             }
-            if (!native_view_private(views, j, compiler->native_vram->pixels)) return 0;
+            /* GPU-only draws do not write the CPU domain. Retain its immutable
+             * allocation until a transfer/CPU raster actually needs a private
+             * copy; newly declared rows still go through normal seeding. */
+            if ((!compiler->gpu_only || !alias->pixels) &&
+                !native_view_private(views, j, compiler->native_vram->pixels)) return 0;
             domain_index = native_view_domain(views, alias);
             for (uint32_t word = top / 64u; word <= (end - 1u) / 64u; ++word) {
                 const unsigned first_bit = word == top / 64u ? top & 63u : 0u;
@@ -16013,6 +16450,8 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     views->depth_test = display->native_depth_test ? 1 : 0;
     if (views->temporal_hz != display->temporal_hz) views->reset_motion_history = 1;
     views->temporal_hz = display->temporal_hz;
+    if (!native_recipe_tracking(views))
+        for (uint32_t i = 0u; i < views->count; ++i) native_recipe_drop(&views->targets[i]);
     if (audit->header.discontinuity) views->reset_motion_history = 1;
     if (identity->source_sequence == 0u || identity->presentation_epoch == 0u ||
         (base_identity->source_sequence != 0u &&
@@ -16027,8 +16466,10 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         native_audit_block(audit, GL_RENDERER_NATIVE_BLOCKER_INVALID_DISPLAY, 0u, 0u, 0u);
         goto failed;
     }
-    const int reuse_canvas = base_views == &s_native_views &&
-        s_native_spare_vram && s_native_spare_words && base_vram;
+    /* The compile owner also owns speculative successors. A spare is private
+     * storage there too: compare its versions against the actual predecessor,
+     * rather than copying the full VRAM just because that base is staged. */
+    const int reuse_canvas = s_native_spare_vram && s_native_spare_words && base_vram;
     if (reuse_canvas) {
         canvas.pixels = s_native_spare_vram; s_native_spare_vram = NULL;
         canvas.words = s_native_spare_words; s_native_spare_words = NULL;
@@ -16090,7 +16531,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     compiler.dithering_disabled = display->dithering_disabled;
     compiler.native_vram = &canvas;
     compiler.native_words = canvas.words;
-    compiler.raster_words = &views->raster_words;
+    compiler.raster_words = native_recipe_tracking(views) ? &views->raster_words : NULL;
     compiler.native_texture = &texture;
     compiler.native_clut = &clut;
     compiler.viewport_width = VRAM_W;
@@ -16100,7 +16541,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     /* Native VIEW planes are GPU-owned at every internal scale, including 1x.
      * Host meshes and DMA-aperture enhancements have no CPU raster equivalent.
      * Keep the software VIEW only for CPU presentation and pixel audits. */
-    const int view_cpu = !gpu || display->depth24 ||
+    const int view_cpu = !gpu ||
         s_native_recipe_audit_enabled || gl_renderer_native_guest_reference_enabled();
     if (gpu) {
         if (!native_gpu_seed(gpu, 0u, VRAM_W, VRAM_H, canvas.pixels, NULL)) goto allocation_failed;
@@ -16148,6 +16589,9 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         audit->consumed_native_operations++;
         if (views->write_serial == UINT64_MAX) goto failed;
         views->write_serial++;
+        if (operation.kind != XG_RENDER_NATIVE_OPERATION_DRAW &&
+            operation.kind != XG_RENDER_NATIVE_OPERATION_MESH &&
+            !native_gpu_canonical_sync(&compiler)) goto failed;
         if (operation.kind == XG_RENDER_NATIVE_OPERATION_MESH) {
             /* Host geometry: the VIEW/phase GPU planes only, never guest VRAM
              * or a CPU surface; one command per raster run, one recipe draw. */
@@ -16253,6 +16697,9 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             XgSemanticDrawRecord draw;
             if (!native_materialize_native_draw(&operation.semantic, &draw)) goto failed;
             draw.hd_texture = operation.hd_texture;
+            /* Optional temporal/audit recipes capture immutable CPU words.
+             * Resolve their prior writes before taking any such snapshot. */
+            if (native_recipe_tracking(views) && !native_gpu_canonical_sync(&compiler)) goto failed;
             const XgRenderIrMaterialState *wave_area = &draw.primitive.material;
             const int wave_target = draw.native_view_effect == GPU_RENDER_NATIVE_VIEW_EFFECT_WAVE_GRID &&
                 gpu && !view_cpu
@@ -16272,6 +16719,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                         audit->header.identity.guest_vblank_sequence, audit))) goto allocation_failed;
                 compiler.gpu_only = 0;
                 if (!native_render_draw(&compiler, &canvas, &draw, operation_index)) goto failed;
+                if (native_recipe_tracking(views) && !native_gpu_canonical_sync(&compiler)) goto failed;
                 native_recipe_draw_written(views, &operation, audit, canvas.words);
                 continue;
             }
@@ -16325,6 +16773,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             if (!native_render_draw(&compiler, &canvas, &draw, operation_index))
                 goto failed;
             compiler.gpu_only = 0;
+            if (native_recipe_tracking(views) && !native_gpu_canonical_sync(&compiler)) goto failed;
             native_recipe_draw_written(views, &operation, audit, canvas.words);
             continue;
         }
@@ -16498,7 +16947,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         for (uint32_t i = 0u; i < copy_recipe_count; ++i) native_recipe_release(copy_recipes[i]);
         copy_recipe_count = 0u;
     }
-    if (!native_view_worker_finish(&compiler)) goto failed;
+    if (!native_view_worker_finish(&compiler) || !native_gpu_canonical_sync(&compiler)) goto failed;
     if (audit->header.display_boundary) {
         const int use_view = !display->depth24 && views->width &&
             display->width == views->width - 2u * views->offset &&
@@ -16513,7 +16962,8 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
             const int row_y = (display->display_y + y) & (VRAM_H - 1);
             row_views[y] = use_view ? native_view_cover(views, views->count,
                 display->display_x, row_y, display->width, 1) : -1;
-            if (row_views[y] >= 0 && !native_view_private(views, (uint32_t)row_views[y], canvas.pixels))
+            if (row_views[y] >= 0 && !views->targets[row_views[y]].pixels &&
+                !native_view_private(views, (uint32_t)row_views[y], canvas.pixels))
                 goto allocation_failed;
         }
         audit->endpoint_storage_width = storage_width;
@@ -17847,6 +18297,12 @@ static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uin
     return 1;
 }
 
+/* Guest texture words always live on the 1x grid. VIEW planes retain the
+ * selected presentation resolution independently. */
+static uint32_t native_gpu_plane_scale(const GlNativeGpuWork *work, uint32_t plane) {
+    return work->canonical_gpu && !plane ? 1u : work->scale;
+}
+
 static void native_gpu_draw_vertex_data(const GlNativeGpuCommand *command,
                                        const uint8_t *blob, uint32_t triangle,
                                        float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]) {
@@ -17856,7 +18312,9 @@ static void native_gpu_draw_vertex_data(const GlNativeGpuCommand *command,
     const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
     const XgRenderIrTriangle *tri = lines ? NULL : native_gpu_command_triangle(command, blob, triangle);
     float weight[3];
-    const int perspective = !lines && flags.textured &&
+    /* Guest VRAM retains PS1 affine sampling. Perspective correction belongs
+     * to presentation planes and must not feed back into guest texture words. */
+    const int perspective = command->plane != 0u && !lines && flags.textured &&
         native_gpu_triangle_weights(tri, weight);
     memset(data, 0, (lines ? 6u : 3u) * GL_NATIVE_GPU_VERTEX_FLOATS * sizeof(float));
     for (unsigned v = 0; v < (lines ? 2u : 3u); ++v) {
@@ -17962,7 +18420,7 @@ static void native_gpu_prepare_draw(const GlNativeGpuWork *work,
     if (bottom > (int)ceilf(max_y) + 1) bottom = (int)ceilf(max_y) + 1;
     if (left > right || top > bottom) return;
     if (!lines) native_attribute_planes(tri,
-        x, y, work->scale, flags.gouraud, &out->attributes);
+        x, y, native_gpu_plane_scale(work, command->plane), flags.gouraud, &out->attributes);
     out->depth = (GlNativeDepthMode){0, GL_NATIVE_DEPTH_RESET, flags.semi_transparent ? 1 : 0,
         0, GL_NATIVE_DEPTH_SHOW_NONE, {0}};
     if (wire) out->depth.semi = 0;
@@ -18008,14 +18466,15 @@ static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
             }
         } else if (command->kind == NATIVE_GPU_SPANS) {
             const GlNativeGpuPlane *source = &work->planes[command->source];
-            const uint32_t width = source->width ? source->width : work->widths[command->source]*work->scale;
-            const uint32_t height = source->height ? source->height : work->heights[command->source]*work->scale;
+            const uint32_t source_scale = native_gpu_plane_scale(work, command->source);
+            const uint32_t width = source->width ? source->width : work->widths[command->source]*source_scale;
+            const uint32_t height = source->height ? source->height : work->heights[command->source]*source_scale;
             if (!width || !height) { free(vertices); return 0; }
             const GlNativeGpuSpanRect *rects = (const GlNativeGpuSpanRect *)(blob + command->data);
             for (uint32_t r = 0u; r < command->mesh_count; ++r) {
                 const GlNativeGpuSpanRect *rect = &rects[r];
-                const float u0=rect->sx*work->scale/width, v0=rect->sy*work->scale/height;
-                const float u1=(rect->sx+rect->sw)*work->scale/width, v1=(rect->sy+rect->sh)*work->scale/height;
+                const float u0=rect->sx*source_scale/width, v0=rect->sy*source_scale/height;
+                const float u1=(rect->sx+rect->sw)*source_scale/width, v1=(rect->sy+rect->sh)*source_scale/height;
                 const float x=rect->x,y=rect->y,rx=x+rect->w,b=y+rect->h;
                 const float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]={{x,y,u0,v0},{rx,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{rx,y,u1,v0},{rx,b,u1,v1}};
                 memcpy(vertices + cursor, data, sizeof(data));
@@ -18028,15 +18487,16 @@ static int native_gpu_build_vertex_slice(const GlNativeGpuWork *work,
                 const uint32_t source_plane = command->source >= GL_NATIVE_GPU_BASE_SOURCE
                     ? command->plane : command->source;
                 const GlNativeGpuPlane *source = &work->planes[source_plane];
+                const uint32_t source_scale = native_gpu_plane_scale(work, source_plane);
                 /* Deferred CPU journals have captured dimensions but no GL
                  * objects yet. They produce the same scaled UV denominator. */
-                const uint32_t width = source->width ? source->width : work->widths[source_plane]*work->scale;
-                const uint32_t height = source->height ? source->height : work->heights[source_plane]*work->scale;
+                const uint32_t width = source->width ? source->width : work->widths[source_plane]*source_scale;
+                const uint32_t height = source->height ? source->height : work->heights[source_plane]*source_scale;
                 if (!width || !height) { free(vertices); return 0; }
-                u0=(float)(command->sx*work->scale)/width;
-                v0=(float)(command->sy*work->scale)/height;
-                u1=(float)((command->sx+command->sw)*work->scale)/width;
-                v1=(float)((command->sy+command->sh)*work->scale)/height;
+                u0=(float)(command->sx*source_scale)/width;
+                v0=(float)(command->sy*source_scale)/height;
+                u1=(float)((command->sx+command->sw)*source_scale)/width;
+                v1=(float)((command->sy+command->sh)*source_scale)/height;
             }
             const float x=command->x,y=command->y,r=x+command->w,b=y+command->h;
             const float data[6][GL_NATIVE_GPU_VERTEX_FLOATS]={{x,y,u0,v0},{r,y,u1,v0},{x,b,u0,v1},{x,b,u0,v1},{r,y,u1,v0},{r,b,u1,v1}};
@@ -18259,7 +18719,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                                   const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
                                   const GlNativeGpuDrawGeometry *prepared) {
     GlNativeGpuPlane *plane=&work->planes[command->plane];
-    const uint32_t scale=work->scale;
+    const uint32_t scale=native_gpu_plane_scale(work, command->plane);
     /* Debug wireframe (VIEW/phase planes only): see gl_renderer_set_native_wireframe. */
     const int wire=work->wireframe&&command->plane!=0u;
     if (command->kind==NATIVE_GPU_DRAW) {
@@ -18366,7 +18826,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
                 const int snapshot = !wire && command->source &&
                     command->source < GL_NATIVE_GPU_PHASE_BASE &&
                     work->planes[command->source].texture;
-                const int hd_on = snapshot ? 2 : (!wire && m->textured && hd->valid &&
+                const int hd_on = snapshot ? 2 : (command->plane != 0u && !wire && m->textured && hd->valid &&
                     hd_gl_texture(&s_native_gpu_hd_cache, hd, PSXGL_TEXTURE0 + 5) != 0);
                 if (snapshot) {
                     native_gpu_image_barrier();
@@ -18677,7 +19137,8 @@ static int native_gpu_service(void) {
         for(unsigned i=0;i<GL_NATIVE_GPU_PLANES&&ok;++i)if(widths[i]&&!work->planes[i].texture) {
             work->planes[i]=s_native_gpu_spare_planes[i];
             memset(&s_native_gpu_spare_planes[i],0,sizeof(s_native_gpu_spare_planes[i]));
-            ok=native_gpu_plane_size(&work->planes[i],widths[i]*work->scale,heights[i]*work->scale);
+            const uint32_t plane_scale = native_gpu_plane_scale(work, i);
+            ok=native_gpu_plane_size(&work->planes[i],widths[i]*plane_scale,heights[i]*plane_scale);
             if (ok) native_gpu_plane_dirty_all(&work->planes[i]);
             /* VIEW domains and phases carry the depth plane; guest VRAM never. */
             if(ok&&i&&work->depth_test&&native_gpu_depth_supported())ok=native_gpu_plane_depth(&work->planes[i]);
@@ -18703,7 +19164,24 @@ static int native_gpu_service(void) {
             const GlNativeGpuCommand *command=&commands[i];
             const uint32_t command_first_vertex=first_vertex;
             first_vertex+=native_gpu_command_vertex_count(command);
-            if(command->kind==NATIVE_GPU_WORDS || command->kind==NATIVE_GPU_WORDS_RESET) {
+            if (command->kind == NATIVE_GPU_CANONICAL_READBACK) {
+                native_gpu_image_barrier();
+                p_glBindBuffer(PSXGL_PIXEL_PACK_BUFFER, 0);
+                p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, work->planes[0].framebuffer);
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                glPixelStorei(GL_PACK_ROW_LENGTH, VRAM_W);
+                glReadPixels(command->x, command->y, command->w, command->h,
+                    GL_RGBA, GL_UNSIGNED_BYTE,
+                    work->canonical_pixels + (size_t)command->y * VRAM_W + command->x);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+                p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+                ok = !native_drain_gl_errors();
+                SDL_LockMutex(s_native_state_mutex);
+                work->render_failed |= !ok;
+                work->canonical_completed = command->data;
+                SDL_CondBroadcast(s_native_gpu_condition);
+                SDL_UnlockMutex(s_native_state_mutex);
+            } else if(command->kind==NATIVE_GPU_WORDS || command->kind==NATIVE_GPU_WORDS_RESET) {
                 native_gpu_batch_flush();
                 int left=VRAM_W,top=VRAM_H,right=0,bottom=0;
                 /* No draw observes the intermediate patches in this run. Keep
@@ -18877,11 +19355,12 @@ static int native_gpu_service(void) {
                     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,input->framebuffer);
                     const unsigned width=index==0?work->scanout_canonical_width:work->scanout_width;
                     for(unsigned x=0;x<width;) {
-                        const unsigned source_width=input->width/work->scale;
+                        const unsigned source_scale = native_gpu_plane_scale(work, index);
+                        const unsigned source_width=input->width/source_scale;
                         const unsigned sx=(x+(image?work->phase_crop_x:index==0?work->scanout_x:0u))%source_width;
                         const unsigned dx=x+(index==0?work->scanout_offset:0u);
                         const unsigned span=width-x>source_width-sx?source_width-sx:width-x;
-                        p_glBlitFramebuffer(sx*work->scale,sy*work->scale,(sx+span)*work->scale,(sy+rows)*work->scale,
+                        p_glBlitFramebuffer(sx*source_scale,sy*source_scale,(sx+span)*source_scale,(sy+rows)*source_scale,
                             dx*work->scale,y*work->scale,(dx+span)*work->scale,(y+rows)*work->scale,GL_COLOR_BUFFER_BIT,GL_NEAREST);
                         x+=span;
                     }
@@ -19124,6 +19603,16 @@ static int native_upload_endpoint(GlNativeEndpointSlot *endpoint,
     return !native_drain_gl_errors();
 }
 
+static int native_gpu_canonical_enabled(const XgRenderSourceCommitHeader *header) {
+    const char *option = getenv("PSX_NATIVE_GPU_CANONICAL");
+    /* Temporal recipes need immutable draw-time words and exact fragment-write
+     * provenance. GPU canonical raster currently needs a blocking readback per
+     * draw for those words and does not record that provenance. Keep the 1x CPU
+     * canonical path for recipe capture; VIEW and phases still render on GPU. */
+    return (!option || option[0] != '0') && s_native_gpu_thread &&
+        !native_recipe_tracking_hz(header->display.temporal_hz);
+}
+
 static GlNativeGpuWork *native_gpu_work_create(XgRenderSourceCommitHandle commit,
         const GlNativeCompileAudit *audit, const GlNativeViewState *base_views,
         uint32_t base_scale, const GlNativeGpuWork *base_gpu, int deferred) {
@@ -19142,13 +19631,20 @@ static GlNativeGpuWork *native_gpu_work_create(XgRenderSourceCommitHandle commit
     gpu->words = malloc((size_t)VRAM_W * VRAM_H * sizeof(*gpu->words));
     if (!gpu->words) { native_gpu_buffers_free(gpu); free(gpu); return NULL; }
     gpu->scale = scale; gpu->commit = commit; gpu->identity = audit->header.identity;
+    gpu->canonical_gpu = native_gpu_canonical_enabled(&audit->header);
+    if (gpu->canonical_gpu) {
+        gpu->canonical_pixels = malloc((size_t)VRAM_W * VRAM_H * sizeof(*gpu->canonical_pixels));
+        if (!gpu->canonical_pixels) { native_gpu_buffers_free(gpu); free(gpu->words); free(gpu); return NULL; }
+    }
     /* A prepared predecessor may create a plane that is absent from the
      * committed state today. Its successor must preserve that full-resolution
      * plane instead of replacing it with a logical-grid CPU seed. */
     for (uint32_t i = 0u; i < GL_NATIVE_GPU_PHASE_BASE; ++i)
         gpu->base_planes[i] = base_gpu ? base_gpu->widths[i] != 0u : s_native_gpu_planes[i].texture != 0u;
     gpu->deferred = deferred;
-    gpu->fresh = scale != base_scale || base_views->width != audit->header.display.native_width ||
+    gpu->fresh = scale != base_scale ||
+        gpu->canonical_gpu != (base_gpu ? base_gpu->canonical_gpu : s_native_gpu_canonical) ||
+        base_views->width != audit->header.display.native_width ||
         base_views->offset != audit->header.display.native_offset_x ||
         base_views->reference_height != audit->header.display.native_height ||
         base_views->depth_test != (int)audit->header.display.native_depth_test;
@@ -19197,11 +19693,13 @@ static int native_prefetch_one(GlNativeGpuWork *current) {
     XgRenderSourceCommitHandle next;
     XgRenderSourceCommitHeader header;
     uint64_t deadline;
-    if (!base->audit || !base->views || !base->vram || !base->words ||
+    if (current->canonical_gpu || !base->audit || !base->views || !base->vram || !base->words ||
         current->depth_view || current->wireframe || s_native_motion_probe.target_vblank ||
         s_native_recipe_audit_enabled || gl_renderer_native_guest_reference_enabled() ||
         !xg_render_worker_acquire_next_source(current->commit, base_gpu->commit, &next, &header, &deadline)) return 0;
-    if (!header.native_work) {
+    /* A deferred successor cannot service canonical GPU readbacks. In
+     * particular, do not prefetch across a switch that disables interpolation. */
+    if (!header.native_work || native_gpu_canonical_enabled(&header)) {
         (void)xg_render_source_commit_release_read(next);
         return 0;
     }
@@ -19562,6 +20060,7 @@ gpu_ready:
                 GlNativeGpuPlane old=s_native_gpu_planes[i]; s_native_gpu_planes[i]=gpu->planes[i]; gpu->planes[i]=old;
             }
             s_native_gpu_scale=gpu->scale;
+            s_native_gpu_canonical=gpu->canonical_gpu;
             s_native_compiler_diag.gpu.applied++;
             if (gpu->scanout) s_native_compiler_diag.gpu.last_reference_digest=motion.history.reference_digest;
         }
@@ -20553,6 +21052,15 @@ int gl_renderer_native_init_services(
     s_native_temporal_generation = 0u;
     native_persistent_surfaces_clear();
     native_canvas_spare_clear();
+    /* The host has joined. Preserve its last completed canonical state before
+     * releasing Native storage; no collector drain is possible after shutdown. */
+    if (s_native_legacy_deferred) {
+        if (s_native_native_words && s_vram)
+            memcpy(s_vram, s_native_native_words, VRAM_W * VRAM_H * sizeof(*s_vram));
+        s_native_legacy_deferred = 0;
+        gpu_vram_region_clear_all(&s_gpu_dirty);
+        up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+    }
     free(s_native_native_vram);
     s_native_native_vram = NULL;
     free(s_native_native_words);
@@ -21024,6 +21532,7 @@ void gl_renderer_native_shutdown(void) {
     s_native_gpu_program=s_native_gpu_vao=s_native_gpu_vbo=s_native_gpu_words=s_native_gpu_input=0u;
     s_native_gpu_upload_words_valid=0;
     s_native_gpu_scale=0u;
+    s_native_gpu_canonical=0;
     s_native_presenter_prog = 0u;
     s_native_presenter_lut_tex = 0u;
     s_native_aa_history_tex = 0u;
@@ -21042,6 +21551,15 @@ void gl_renderer_native_shutdown(void) {
     SDL_UnlockMutex(s_native_state_mutex);
     native_persistent_surfaces_clear();
     native_canvas_spare_clear();
+    /* The host has joined. Preserve its last completed canonical state before
+     * releasing Native storage; no collector drain is possible after shutdown. */
+    if (s_native_legacy_deferred) {
+        if (s_native_native_words && s_vram)
+            memcpy(s_vram, s_native_native_words, VRAM_W * VRAM_H * sizeof(*s_vram));
+        s_native_legacy_deferred = 0;
+        gpu_vram_region_clear_all(&s_gpu_dirty);
+        up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
+    }
     free(s_native_native_vram);
     s_native_native_vram = NULL;
     free(s_native_native_words);
@@ -21401,6 +21919,7 @@ void gl_renderer_invalidate_present(void) {
 }
 
 void gl_renderer_restage_vram_after_savestate(void) {
+    s_native_legacy_deferred = 0;
     if (!s_raster_ok || !s_vram) return;
     /* Belt-and-suspenders after boot_state VRAM apply: force CPU mirror → FBO
      * even if a depth24 skip swallowed the restore, then re-arm scanout-band
@@ -23964,6 +24483,13 @@ static void native_view_ensure_destination_surfaces(int x, int w) {
 }
 
 static void glb_native_fill_rect(int x, int y, int w, int h, uint16_t color) {
+    if (native_single_owner_enabled()) {
+        gpu_vram_region_mark_rect(&s_gpu_dirty, 0, 0, VRAM_W - 1, VRAM_H - 1);
+        s_native_legacy_deferred = 1;
+        s_native_legacy_owner.canonical_fills++;
+        return;
+    }
+    if (!native_legacy_sync()) return;
     const int operation_x = x & (VRAM_W - 1);
     const int operation_w = w > VRAM_W ? VRAM_W : w;
 
@@ -24243,6 +24769,13 @@ static void native_view_copy_to_target(GLuint target_fbo, int base_x,
 
 static void glb_native_copy_rect(int src_x, int src_y, int dst_x, int dst_y,
                                   int w, int h) {
+    if (native_single_owner_enabled()) {
+        gpu_vram_region_mark_rect(&s_gpu_dirty, 0, 0, VRAM_W - 1, VRAM_H - 1);
+        s_native_legacy_deferred = 1;
+        s_native_legacy_owner.canonical_copies++;
+        return;
+    }
+    if (!native_legacy_sync()) return;
     if (s_cpu_auth_dual || !s_raster_ok)
         sw_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
     if (!s_raster_ok) {
@@ -28894,6 +29427,15 @@ static GpuRenderTransactionStatus glb_draw_semantic_immediate(
         !s_native_midpoint_diag.suspended &&
         !s_native_midpoint_frame_blocked)
         (void)gl_renderer_native_midpoint_begin();
+    if (native_single_owner_enabled()) {
+        status = glb_validate_semantic(semantic);
+        if (status != GPU_RENDER_TRANSACTION_OK) return status;
+        if (!s_native_legacy_deferred)
+            gpu_vram_region_mark_rect(&s_gpu_dirty, 0, 0, VRAM_W - 1, VRAM_H - 1);
+        s_native_legacy_deferred = 1;
+        s_native_legacy_owner.canonical_draws++;
+        return GPU_RENDER_TRANSACTION_OK;
+    }
     flush_cpu_upload();
     if (semantic->material.mask_check && !s_stencil_valid) {
         if (native_host_pending_flush_reason(6u) !=
