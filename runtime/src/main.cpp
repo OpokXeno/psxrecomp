@@ -558,7 +558,7 @@ static std::atomic<int> g_smooth_60fps{0};
 static std::atomic<int> g_smooth_60fps_requested{0};
 static bool g_native_render_selected = false;
 static int g_video_scale = 1; /* Requested presentation resolution, not guest VRAM scale. */
-static int g_video_aa = 1; /* Host AA mode, also selects Native raster scale. */
+static int g_video_aa = 0; /* Host AA defaults off; also selects Native raster scale. */
 static int g_video_aa_factor = 4; /* Quality multiplier independent of AA mode. */
 static bool g_native_render_source_failed = false;
 static double g_native_guest_speed = 1.0;

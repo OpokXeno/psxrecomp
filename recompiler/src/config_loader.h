@@ -356,8 +356,8 @@ struct RuntimeConfig {
     // the historical fit-to-display behavior; player settings may override it.
     int                   video_window_width = 0;
 
-    // Host presentation AA: off, FXAA, SMAA, TAA, MSAA, SSAA.
-    int                   video_antialiasing = 1;
+    // Host presentation AA: off (default), FXAA, SMAA, TAA, MSAA, SSAA.
+    int                   video_antialiasing = 0;
     // Independent quality multiplier. SSAA/MSAA use N spatial samples;
     // FXAA/SMAA search farther; TAA accumulates N jitter phases.
     // Values: 1, 2, 4, 8, 16.
@@ -1208,7 +1208,7 @@ struct UserSettings {
     // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
     // both the launcher and the emulator window so they boot at the same size.
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
-    bool has_antialiasing   = false; int antialiasing = 1;
+    bool has_antialiasing   = false; int antialiasing = 0;
     bool has_antialiasing_factor = false; int antialiasing_factor = 4;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_sprite_filter = false; int sprite_filter = 0; // 0=nearest,1=bilinear

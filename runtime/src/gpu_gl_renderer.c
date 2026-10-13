@@ -1337,6 +1337,7 @@ static GLint s_native_presenter_u_uv_rect = -1;
 static GLint s_native_presenter_u_lut = -1;
 static GLint s_native_presenter_u_lut_on = -1;
 static GLint s_native_presenter_u_aa = -1;
+static GLint s_native_presenter_u_aa_nearest = -1;
 static GLint s_native_presenter_u_history = -1;
 static GLint s_native_presenter_u_history_valid = -1;
 static GLint s_native_presenter_u_drawable = -1;
@@ -1349,7 +1350,7 @@ static int s_native_aa_history_lx, s_native_aa_history_ly;
 static int s_native_aa_history_lw, s_native_aa_history_lh;
 static int s_native_aa_history_valid;
 static unsigned s_native_aa_frame;
-static int s_antialiasing_mode = 1;
+static int s_antialiasing_mode = 0;
 static int s_antialiasing_factor = 4;
 static GLuint s_native_presenter_lut_tex;
 static int s_native_presenter_lut_generation = -1;
@@ -3252,7 +3253,7 @@ static const char *PRESENT_FS =
     "uniform vec2 u_sharp_scale;\n"
     "uniform int  u_sharp;\n"
     "uniform float u_gamma;\n"
-    "uniform int u_aa_mode, u_aa_factor, u_aa_history_valid, u_aa_mask_valid;\n"
+    "uniform int u_aa_mode, u_aa_factor, u_aa_history_valid, u_aa_mask_valid, u_aa_nearest;\n"
     "uniform sampler2D u_aa_history, u_aa_mask;\n"
     "uniform vec2 u_aa_drawable, u_aa_jitter;\n"
     PSX_SCANLINE_UNIFORMS
@@ -3264,7 +3265,10 @@ static const char *PRESENT_FS =
     " return aa_exempt(uv)||aa_exempt(uv+vec2(d.x,0))||aa_exempt(uv-vec2(d.x,0))||\n"
     " aa_exempt(uv+vec2(0,d.y))||aa_exempt(uv-vec2(0,d.y));}\n"
     "vec4 aa_spatial(vec2 uv){\n"
-    " vec2 pixel=1.0/vec2(textureSize(u_tex,0));\n"
+    /* At native 1x, FXAA operates on the nearest-expanded window image. Its
+     * edge neighbourhood is one output pixel, not one enlarged guest texel;
+     * flat interiors therefore keep their exact texture colours. */
+    " vec2 pixel=u_aa_nearest!=0?fwidth(v_uv):1.0/vec2(textureSize(u_tex,0));\n"
     /* The Native raster has destination feedback and mask-bit semantics: a GL
      * multisample FBO cannot be sampled by the next draw. Resolve ordered
      * raster samples instead (fully shaded, unlike coverage-only HW MSAA). */
@@ -20051,13 +20055,16 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
      * sprites/UI untouched rather than guessing from their final colours. */
     const int aa_mode = endpoint.metadata.depth24 || !image.mask_valid
         ? 0 : s_antialiasing_mode;
+    /* GPU scanout now also serves 1x. Do not turn FXAA into whole-image
+     * bilinear magnification there: filter edges at the window pixel scale. */
+    const int aa_nearest = aa_mode == 1 && endpoint.metadata.render_scale <= 1u;
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, endpoint.texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                    aa_mode == 0 ? GL_NEAREST : GL_LINEAR);
+                    aa_mode == 0 || aa_nearest ? GL_NEAREST : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                    aa_mode == 0 ? GL_NEAREST : GL_LINEAR);
+                    aa_mode == 0 || aa_nearest ? GL_NEAREST : GL_LINEAR);
     if (aa_mode == 3) {
         if (!s_native_aa_history_tex) glGenTextures(1, &s_native_aa_history_tex);
         p_glActiveTexture(PSXGL_TEXTURE0 + 2);
@@ -20086,6 +20093,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
      * and UI pixel there by disabling post-AA for that endpoint. */
     if (aa_mode != 3) s_native_aa_history_valid = 0;
     p_glUniform1i(s_native_presenter_u_aa, aa_mode);
+    p_glUniform1i(s_native_presenter_u_aa_nearest, aa_nearest);
     p_glUniform1i(s_native_presenter_u_factor, s_antialiasing_factor);
     p_glUniform1i(s_native_presenter_u_mask, 3);
     p_glUniform1i(s_native_presenter_u_mask_valid, image.mask_valid);
@@ -20514,6 +20522,8 @@ int gl_renderer_native_init_services(
             p_glGetUniformLocation(s_native_presenter_prog, "u_screenlut_on");
         s_native_presenter_u_aa =
             p_glGetUniformLocation(s_native_presenter_prog, "u_aa_mode");
+        s_native_presenter_u_aa_nearest =
+            p_glGetUniformLocation(s_native_presenter_prog, "u_aa_nearest");
         s_native_presenter_u_history =
             p_glGetUniformLocation(s_native_presenter_prog, "u_aa_history");
         s_native_presenter_u_history_valid =
