@@ -2690,6 +2690,31 @@ static uint64_t pres_hash_bytes(const uint8_t *bytes, size_t size) {
     return hash;
 }
 
+/* Exact pres_hash_bytes digest for RGBA words, with visible-pixel accounting
+ * in the same pass. Keep the serial hash and odd-pixel byte tail unchanged:
+ * reference/history checks must receive precisely the existing fingerprint. */
+static uint64_t pres_hash_pixels_visible(const void *pixels, size_t count, uint64_t *visible) {
+    const uint8_t *bytes = pixels;
+    uint64_t hash = GL_PRESENT_HASH_FNV_OFFSET, seen = 0u;
+    size_t pixel = 0u;
+    for (; pixel + 1u < count; pixel += 2u) {
+        uint64_t word;
+        memcpy(&word, bytes + pixel * sizeof(uint32_t), sizeof(word));
+        hash = pres_hash_word(hash, word);
+        seen += ((word & UINT64_C(0x00ffffff)) != 0u) +
+            ((word & UINT64_C(0x00ffffff00000000)) != 0u);
+    }
+    if (pixel < count) {
+        uint32_t rgba;
+        memcpy(&rgba, bytes + pixel * sizeof(uint32_t), sizeof(rgba));
+        seen += (rgba & UINT32_C(0x00ffffff)) != 0u;
+        for (size_t b = 0u; b < sizeof(rgba); ++b)
+            hash = (hash ^ bytes[pixel * sizeof(uint32_t) + b]) * GL_PRESENT_HASH_FNV_PRIME;
+    }
+    *visible += seen;
+    return hash;
+}
+
 /* Scaled GPU image digest: four independent multiply chains over 32-byte
  * blocks (one serial chain is latency bound on multi-megabyte readbacks),
  * folded together, with the visible-pixel count in the same pass. Only ever
@@ -3746,6 +3771,48 @@ static inline uint32_t conv_1555_to_rgba8(uint16_t p) {
     uint32_t r = (p & 0x1F) << 3, g = ((p >> 5) & 0x1F) << 3, b = ((p >> 10) & 0x1F) << 3;
     uint32_t a = (p >> 15) & 1 ? 0xFF : 0;
     return r | (g << 8) | (b << 16) | (a << 24);   /* RGBA8 little-endian */
+}
+
+/* Logical scanout still feeds reference/history checks with GPU presentation.
+ * Resolve row wrapping outside the flat loops so their conversions vectorize. */
+static void native_scanout_row_15(uint32_t *output, const uint16_t *row,
+        uint32_t x, uint32_t width) {
+    const uint32_t first = width < VRAM_W - x ? width : VRAM_W - x;
+    const uint16_t *input = row + x;
+    for (uint32_t i = 0u; i < first; ++i)
+        output[i] = conv_1555_to_rgba8(input[i]) | UINT32_C(0xff000000);
+    output += first;
+    for (uint32_t i = 0u; i < width - first; ++i)
+        output[i] = conv_1555_to_rgba8(row[i]) | UINT32_C(0xff000000);
+}
+
+static void native_scanout_row_24(uint32_t *output, const uint16_t *row,
+        uint32_t x, uint32_t width) {
+    while (width >= 2u) {
+        /* Two RGB pixels occupy three words, starting at an even byte address.
+         * Only a pair straddling the VRAM edge needs individual wrapped reads. */
+        if (x > VRAM_W - 3u) {
+            const uint32_t a = row[x], b = row[(x + 1u) & (VRAM_W - 1u)];
+            const uint32_t c = row[(x + 2u) & (VRAM_W - 1u)];
+            output[0] = UINT32_C(0xff000000) | a | ((b & 255u) << 16u);
+            output[1] = UINT32_C(0xff000000) | (b >> 8u) | (c << 8u);
+            output += 2u; width -= 2u; x = (x + 3u) & (VRAM_W - 1u);
+            continue;
+        }
+        const uint32_t available = (VRAM_W - x) / 3u;
+        const uint32_t pairs = width / 2u < available ? width / 2u : available;
+        const uint16_t *input = row + x;
+        for (uint32_t i = 0u; i < pairs; ++i) {
+            const uint32_t a = input[i * 3u], b = input[i * 3u + 1u], c = input[i * 3u + 2u];
+            output[i * 2u] = UINT32_C(0xff000000) | a | ((b & 255u) << 16u);
+            output[i * 2u + 1u] = UINT32_C(0xff000000) | (b >> 8u) | (c << 8u);
+        }
+        output += pairs * 2u; width -= pairs * 2u; x = (x + pairs * 3u) & (VRAM_W - 1u);
+    }
+    if (width) {
+        const uint32_t a = row[x], b = row[(x + 1u) & (VRAM_W - 1u)];
+        output[0] = UINT32_C(0xff000000) | a | ((b & 255u) << 16u);
+    }
 }
 
 /* ---- mask-bit stencil --------------------------------------------------- *
@@ -16026,11 +16093,10 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
     compiler.viewport_height = VRAM_H;
     compiler.gpu = gpu;
     compiler.native_views = views;
-    /* With a GPU scanout (internal scale above 1, 15-bit display) the VIEW
-     * planes live on the GPU: nothing presented, copied or drawn there reads
-     * the CPU VIEW raster. Keep that software raster only for the CPU
-     * presentation path and the optional pixel audits. */
-    const int view_cpu = !gpu || gpu->scale <= 1u || display->depth24 ||
+    /* Native VIEW planes are GPU-owned at every internal scale, including 1x.
+     * Host meshes and DMA-aperture enhancements have no CPU raster equivalent.
+     * Keep the software VIEW only for CPU presentation and pixel audits. */
+    const int view_cpu = !gpu || display->depth24 ||
         s_native_recipe_audit_enabled || gl_renderer_native_guest_reference_enabled();
     if (gpu) {
         if (!native_gpu_seed(gpu, 0u, VRAM_W, VRAM_H, canvas.pixels, NULL)) goto allocation_failed;
@@ -16339,6 +16405,12 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         if (transition_upload != 1 && !wave_transfer &&
             !native_view_transfer(views, &view_operation, &upload, canvas.pixels, copy_pixels,
                               audit)) goto allocation_failed;
+        /* Wave transfers leave VIEW untouched, but their canonical COPY still
+         * reads the pre-write image. They bypass native_view_transfer(), which
+         * normally captures it: refresh it here even if an older snapshot
+         * exists, so overlapping lifts and saved blocks use current pixels. */
+        if (wave_transfer && !native_gpu_command(gpu, NATIVE_GPU_SNAPSHOT))
+            goto allocation_failed;
         if (!operation.mask_set && !operation.mask_check &&
             operation.kind != XG_RENDER_NATIVE_OPERATION_UPLOAD) {
             /* COPY reads the pre-write snapshot, including overlapping moves.
@@ -16442,7 +16514,7 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
         }
         audit->endpoint_storage_width = storage_width;
         if (gpu) {
-            gpu->scanout = !display->depth24 && gpu->scale > 1u;
+            gpu->scanout = !display->depth24;
             gpu->disabled = display->disabled; gpu->depth24 = display->depth24;
             gpu->scanout_x = display->display_x; gpu->scanout_y = display->display_y;
             gpu->scanout_width = storage_width; gpu->scanout_height = display->height;
@@ -16470,32 +16542,19 @@ static int native_compile_native_work(XgRenderSourceCommitHandle commit,
                 for (uint32_t x = 0u; x < storage_width; ++x)
                     output[x] = input[x] | UINT32_C(0xff000000);
             } else if (display->depth24) {
-                for (uint32_t x = 0u; x < storage_width; ++x) {
-                    uint32_t color = UINT32_C(0xff000000);
-                    for (uint32_t channel = 0u; channel < 3u; ++channel) {
-                        const uint32_t byte_x =
-                            (display->display_x * 2u + x * 3u + channel) & (VRAM_W * 2u - 1u);
-                        const uint16_t word = canvas.words[row + byte_x / 2u];
-                        color |= ((uint32_t)(word >> ((byte_x & 1u) * 8u)) & 255u) << (channel * 8u);
-                    }
-                    output[x] = color;
-                }
+                native_scanout_row_24(output, canvas.words + row, display->display_x, storage_width);
             } else {
                 const uint32_t offset = use_view ? views->offset : 0u;
                 for (uint32_t x = 0u; x < offset; ++x)
                     output[x] = UINT32_C(0xff000000);
-                for (uint32_t x = 0u; x < display->width; ++x)
-                    output[offset + x] = conv_1555_to_rgba8(canvas.words[
-                        row + ((display->display_x + x) & (VRAM_W - 1))]) | UINT32_C(0xff000000);
+                native_scanout_row_15(output + offset, canvas.words + row, display->display_x, display->width);
                 for (uint32_t x = offset + display->width; x < storage_width; ++x)
                     output[x] = UINT32_C(0xff000000);
             }
         }
         const size_t endpoint_count = (size_t)storage_width * display->height;
-        for (size_t i = 0u; i < endpoint_count; ++i)
-            audit->endpoint_visible_pixels += (endpoint_pixels[i] & UINT32_C(0x00ffffff)) != 0u;
-        audit->endpoint_pixel_digest = pres_hash_bytes(
-            (const uint8_t *)endpoint_pixels, endpoint_count * sizeof(*endpoint_pixels));
+        audit->endpoint_pixel_digest = pres_hash_pixels_visible(endpoint_pixels, endpoint_count,
+            &audit->endpoint_visible_pixels);
     }
     audit->endpoint_was_depth24 = display->depth24;
     audit->endpoint_was_discrete = 1;
@@ -16799,6 +16858,10 @@ finished:
 }
 
 static GLuint s_native_gpu_program, s_native_gpu_vao, s_native_gpu_vbo, s_native_gpu_words, s_native_gpu_input;
+/* GL-owner shadow, including FIFO word patches and phase resets. Valid only
+ * for the current word texture's storage, never for a newly created context. */
+static uint16_t s_native_gpu_upload_words[VRAM_W * VRAM_H];
+static int s_native_gpu_upload_words_valid;
 static int s_native_gpu_interlock;
 static GLuint s_native_gpu_parameter_buffer, s_native_gpu_parameter_texture;
 static GLint s_native_gpu_parameters_on, s_native_gpu_parameter_base, s_native_gpu_parameter_shared;
@@ -17573,10 +17636,74 @@ static int native_gpu_program_init(void) {
     /* All transactions use the same word format and dimensions. Allocate
      * once, then replace texels without recreating the driver's storage. */
     p_glActiveTexture(PSXGL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,s_native_gpu_words);
+    s_native_gpu_upload_words_valid = 0;
     glTexImage2D(GL_TEXTURE_2D,0,GL_R16UI,VRAM_W,VRAM_H,0,GL_RED_INTEGER,GL_UNSIGNED_SHORT,NULL);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
     return s_native_gpu_vao && s_native_gpu_vbo && s_native_gpu_words && s_native_gpu_input && !native_drain_gl_errors();
+}
+
+static int native_gpu_sync_initial_words(const void *words) {
+    /* Display-only batches and unchanged texture baselines need no repeated
+     * 1 MiB driver transfer. Compare exact bytes, including any patches left by
+     * the preceding batch; the first upload remains mandatory even for zeros. */
+    if (s_native_gpu_upload_words_valid &&
+        memcmp(s_native_gpu_upload_words, words, sizeof(s_native_gpu_upload_words)) == 0)
+        return 0;
+    uint32_t left = 0u, top = 0u, right = VRAM_W, bottom = VRAM_H;
+    const uint8_t *input = words;
+    const size_t row_bytes = VRAM_W * sizeof(uint16_t);
+    if (s_native_gpu_upload_words_valid) {
+        /* All changes fit one bounding rectangle. Find its rows first, then
+         * expand only columns outside the bounds already established. A dense
+         * change reaches full width immediately; it needs no per-block scan of
+         * every row. Source snapshots may be unaligned: compare/copy bytes. */
+        while (top < bottom && memcmp(s_native_gpu_upload_words + top * VRAM_W,
+            input + top * row_bytes, row_bytes) == 0) ++top;
+        while (bottom > top && memcmp(s_native_gpu_upload_words + (bottom - 1u) * VRAM_W,
+            input + (bottom - 1u) * row_bytes, row_bytes) == 0) --bottom;
+        left = VRAM_W; right = 0u;
+        /* Try both boundary rows before the interior: distant corner writes
+         * already imply a full rectangle, without scanning every intervening row. */
+        for (uint32_t row = 0u; row < bottom - top && (left || right < VRAM_W); ++row) {
+            const uint32_t y = row == 0u ? top : row == 1u ? bottom - 1u : top + row - 1u;
+            const uint8_t *old_row = (const uint8_t *)(s_native_gpu_upload_words + y * VRAM_W);
+            const uint8_t *new_row = input + y * row_bytes;
+            if (left && memcmp(old_row, new_row, left * sizeof(uint16_t)) != 0) {
+                uint32_t first = 0u;
+                while (first < left && memcmp(old_row + first * sizeof(uint16_t),
+                    new_row + first * sizeof(uint16_t), 64u * sizeof(uint16_t)) == 0) first += 64u;
+                left = first;
+            }
+            if (right < VRAM_W && memcmp(old_row + right * sizeof(uint16_t),
+                new_row + right * sizeof(uint16_t), (VRAM_W - right) * sizeof(uint16_t)) != 0) {
+                uint32_t end = VRAM_W;
+                while (end > right && memcmp(old_row + (end - 64u) * sizeof(uint16_t),
+                    new_row + (end - 64u) * sizeof(uint16_t), 64u * sizeof(uint16_t)) == 0) end -= 64u;
+                right = end;
+            }
+        }
+    }
+    /* Preserve initial-snapshot mip revalidation, including wrapped UV islands;
+     * only the storage copy/transfer shrinks, not the texture cache contract. */
+    native_gpu_mips_dirty_all();
+    if (left == 0u && right == VRAM_W) {
+        memcpy(s_native_gpu_upload_words + top * VRAM_W, input + top * row_bytes,
+            (bottom - top) * row_bytes);
+    } else {
+        for (uint32_t y = top; y < bottom; ++y)
+            memcpy(s_native_gpu_upload_words + y * VRAM_W + left,
+                input + y * row_bytes + left * sizeof(uint16_t), (right - left) * sizeof(uint16_t));
+    }
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_native_gpu_words);
+    const int partial_columns = left != 0u || right != VRAM_W;
+    if (partial_columns) glPixelStorei(GL_UNPACK_ROW_LENGTH, VRAM_W);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, left, top, right - left, bottom - top,
+        GL_RED_INTEGER, GL_UNSIGNED_SHORT, s_native_gpu_upload_words + top * VRAM_W + left);
+    if (partial_columns) glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    s_native_gpu_upload_words_valid = 1;
+    return 1;
 }
 
 /* Depth flags for native_gpu_target: the plane's depth attachment is a draw
@@ -18525,7 +18652,7 @@ static int native_gpu_service(void) {
         }
     } else if(state==NATIVE_GPU_QUEUED||state==NATIVE_GPU_DISPATCHING) {
         GlNativeGpuPlane *snapshots=work->snapshots;
-        static uint16_t upload_words[VRAM_W*VRAM_H];
+        uint16_t *upload_words = s_native_gpu_upload_words;
         static uint16_t reset_word_rows[VRAM_H]; /* Dirty 64-word blocks since the baseline. */
         int ok=!work->render_failed&&native_gpu_program_init();
         if (!gl_renderer_debug_mipmaps() && s_native_mip_count)
@@ -18541,12 +18668,7 @@ static int native_gpu_service(void) {
         if(state==NATIVE_GPU_QUEUED) {
         memset(reset_word_rows,0,sizeof(reset_word_rows));
         work->timing.dispatch_begin_ns=started;
-        if (memcmp(upload_words,initial_data+work->initial_words_offset,
-                   sizeof(upload_words)) != 0)
-            native_gpu_mips_dirty_all();
-        memcpy(upload_words,initial_data+work->initial_words_offset,sizeof(upload_words));
-        p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_native_gpu_words);
-        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,VRAM_W,VRAM_H,GL_RED_INTEGER,GL_UNSIGNED_SHORT,upload_words);
+        (void)native_gpu_sync_initial_words(initial_data + work->initial_words_offset);
         }
         for(unsigned i=0;i<GL_NATIVE_GPU_PLANES&&ok;++i)if(widths[i]&&!work->planes[i].texture) {
             work->planes[i]=s_native_gpu_spare_planes[i];
@@ -18816,7 +18938,12 @@ static int native_gpu_service(void) {
         s_native_compiler_diag.gpu.depth_tested_triangles+=work->depth_tested_triangles;
         work->state=NATIVE_GPU_SUBMITTED;
         SDL_UnlockMutex(s_native_state_mutex);
-        if(!ok){SDL_LockMutex(s_native_state_mutex);work->failed=1;work->state=NATIVE_GPU_READY;SDL_UnlockMutex(s_native_state_mutex);}
+        if(!ok) {
+            s_native_gpu_upload_words_valid=0;
+            SDL_LockMutex(s_native_state_mutex);
+            work->failed=1;work->state=NATIVE_GPU_READY;
+            SDL_UnlockMutex(s_native_state_mutex);
+        }
         result=ok?1:-1;
     }
 service_done:
@@ -18860,8 +18987,7 @@ static int native_gpu_thread_main(void *unused) {
     if(warmed) {
         glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_CULL_FACE);
         glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
-        p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_native_gpu_words);
-        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,VRAM_W,VRAM_H,GL_RED_INTEGER,GL_UNSIGNED_SHORT,warm_words);
+        (void)native_gpu_sync_initial_words(warm_words);
         p_glActiveTexture(PSXGL_TEXTURE0+2);glBindTexture(GL_TEXTURE_2D,s_native_gpu_input);
         glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,16,16,0,GL_RGBA,GL_UNSIGNED_BYTE,warm_pixels);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
@@ -18948,6 +19074,7 @@ static int native_gpu_thread_main(void *unused) {
     native_gpu_mips_clear();
     hd_gl_cache_clear(&s_native_gpu_hd_cache);
     s_native_gpu_program=s_native_gpu_vao=s_native_gpu_vbo=s_native_gpu_words=s_native_gpu_input=0;
+    s_native_gpu_upload_words_valid=0;
     SDL_GL_MakeCurrent(s_native_gpu_drawable,NULL);
     return 0;
 }
@@ -20885,6 +21012,7 @@ void gl_renderer_native_shutdown(void) {
     s_native_gpu_hd_cache.count = 0; s_native_gpu_hd_cache.bytes = 0; /* died with the context */
     s_native_gpu_hd_cache.resident = s_native_gpu_hd_cache.failed = 0;
     s_native_gpu_program=s_native_gpu_vao=s_native_gpu_vbo=s_native_gpu_words=s_native_gpu_input=0u;
+    s_native_gpu_upload_words_valid=0;
     s_native_gpu_scale=0u;
     s_native_presenter_prog = 0u;
     s_native_presenter_lut_tex = 0u;

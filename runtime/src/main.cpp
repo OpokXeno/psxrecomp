@@ -17954,8 +17954,63 @@ session_reboot:
             extern uint64_t g_vblank_raise_count;
             const bool accepted = psx_xg_render_auth_note_vram_event(
                 g_vblank_raise_count, psx_get_cycle_count(), event);
-            if (!accepted && xg_render_native_work_enabled())
-                psx_fatal_halt("Native visual transfer was not accepted");
+            if (!accepted && xg_render_native_work_enabled()) {
+                /* A rejected transfer can be the first observer of an earlier
+                 * asynchronous compiler failure. Preserve both sides before
+                 * teardown; the release crash report serializes this reason. */
+                static char reason[3072];
+                XgRenderNativeWorkSnapshot work{};
+                XgRenderPresentationDiagnostics timeline{};
+                GlRendererNativeCompilerDiagnostics compiler{};
+                GlRendererNativePipelineDiagnostics pipeline{};
+                GpuDisplayInfo display{};
+                xg_render_native_work_snapshot(&work);
+                xg_render_semantic_presentation_diagnostics(&timeline);
+                gl_renderer_native_compiler_diagnostics(&compiler);
+                gl_renderer_native_pipeline_diagnostics(&pipeline);
+                gpu_get_display_info(&display);
+                const GpuVramEvent empty{};
+                const GpuVramEvent &transfer = event ? *event : empty;
+                std::snprintf(reason, sizeof(reason),
+                    "Native visual transfer was not accepted: stage=%s result=%d "
+                    "event=%u src=%u,%u dst=%u,%u size=%ux%u pixels=%llu "
+                    "opcode=%02x command=%08x pc=%08x words=%08x,%08x,%08x,%08x "
+                    "cycle=%llu publication=%llu/%llu buffered=%u/%u building=%d sealed=%d "
+                    "timeline=%llu/%llu boundary=%llu scene=%u queue=%u open=%d blocked=%d "
+                    "compile_result=%d failures=%llu fences=%llu mismatch=%u "
+                    "compiler=%s record=%u resource=%llu/%llu source=%llu/%llu operations=%u "
+                    "targets=%u domains=%u gpu_state=%u present=%s "
+                    "display=%ux%u@%u,%u depth24=%d disabled=%d origin=%s",
+                    work.failure_stage ? work.failure_stage : "unrecorded", work.failure_result,
+                    (unsigned)transfer.operation, transfer.source_x, transfer.source_y,
+                    transfer.destination_x, transfer.destination_y, transfer.width, transfer.height,
+                    (unsigned long long)transfer.pixel_count, transfer.command_opcode,
+                    transfer.command_source_address, transfer.command_pc,
+                    transfer.command_words[0], transfer.command_words[1],
+                    transfer.command_words[2], transfer.command_words[3],
+                    (unsigned long long)psx_get_cycle_count(),
+                    (unsigned long long)work.publication_epoch,
+                    (unsigned long long)work.publication_cycle,
+                    work.buffered_operations, work.buffered_uploads, work.building, work.sealed,
+                    (unsigned long long)timeline.presentation_epoch,
+                    (unsigned long long)timeline.source_sequence,
+                    (unsigned long long)timeline.guest_cycle, timeline.scene_generation,
+                    timeline.source_queue_depth, timeline.publication_open, timeline.source_lane_blocked,
+                    (int)timeline.last_compile_result, (unsigned long long)timeline.compile_failures,
+                    (unsigned long long)timeline.fence_failures, timeline.last_endpoint_mismatch_mask,
+                    gl_renderer_native_compile_blocker_name(compiler.last_blocker),
+                    compiler.blocker_record_index, (unsigned long long)compiler.blocker_resource_id,
+                    (unsigned long long)compiler.blocker_resource_generation,
+                    (unsigned long long)compiler.last_compile_identity.presentation_epoch,
+                    (unsigned long long)compiler.last_compile_identity.source_sequence,
+                    compiler.consumed_native_operations, compiler.view_target_count,
+                    compiler.view_domain_count, compiler.gpu.pending_state,
+                    gl_renderer_native_present_blocker_name(pipeline.last_present_blocker),
+                    display.width, display.height, display.display_x, display.display_y,
+                    display.depth24, display.disabled, g_native_fail_origin);
+                std::fprintf(stderr, "%s\n", reason);
+                psx_fatal_halt(reason);
+            }
         });
         BootStateNativeCheckpointHooks checkpoint_hooks{};
         checkpoint_hooks.snapshot_ready = []() -> int {
