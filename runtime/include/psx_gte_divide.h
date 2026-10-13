@@ -28,6 +28,11 @@ static inline void psx_gte_initialize_divide_table(void) {
 }
 
 static inline unsigned int psx_gte_clz16(uint16_t value) {
+#if defined(__GNUC__) || defined(__clang__)
+    /* __builtin_clz is undefined for zero; the portable loop returns 16. */
+    return value ? (unsigned int)__builtin_clz((unsigned int)value) -
+        (unsigned int)(sizeof(unsigned int) * 8u - 16u) : 16u;
+#else
     unsigned int count = 0u;
 
     for (int bit = 15; bit >= 0; --bit) {
@@ -35,6 +40,7 @@ static inline unsigned int psx_gte_clz16(uint16_t value) {
         ++count;
     }
     return count;
+#endif
 }
 
 static inline int32_t psx_gte_reciprocal(uint16_t divisor) {

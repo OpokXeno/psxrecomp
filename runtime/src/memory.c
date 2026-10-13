@@ -1858,14 +1858,14 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
      * exception vector at 0x80000080 is. Tomba 2 later passes buffer=0 to the
      * BIOS card write routine, so stale mirror bytes at 0 corrupt the sector 63
      * management write and leave the load menu stuck checking the card. */
-    if (fntrace_is_game_started() &&
-        phys < 0x10u && g_debug_last_store_pc == 0xBFC10A00u) return;
+    if (phys < 0x10u && g_debug_last_store_pc == 0xBFC10A00u &&
+        fntrace_is_game_started()) return;
 
     /* BIOS helpers use RAM address zero as a tiny delay-loop scratch between
      * device-register polls. Treat these two dummy stores as non-visible; real
      * hardware / Beetle preserve Tomba 2's sector-63 card-management payload
      * when it passes buffer=0 to _card_write. */
-    if (fntrace_is_game_started() && phys == 0u) {
+    if (phys == 0u && fntrace_is_game_started()) {
         switch (g_debug_last_store_pc) {
         case 0xBFC04E90u:
         case 0xBFC04EF0u:

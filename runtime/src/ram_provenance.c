@@ -37,6 +37,11 @@ static unsigned cpu_speculative_depth;
 static bool cpu_tracking_enabled;
 static bool cpu_reset_pending;
 
+/* Conservative occupancy for the 8 MiB main-RAM aperture. Once a page has
+ * held an MDEC receipt it stays marked until reset/restore, so invalidation
+ * can skip untouched metadata without ever overlooking a live source. */
+static uint8_t source_pages[0x00800000u / 4096u];
+
 static bool main_ram_offset(uint32_t address, uint32_t *out_offset) {
     uint32_t physical = address & UINT32_C(0x1fffffff);
     const size_t main_ram_size = main_ram_writer_count * sizeof(uint32_t);
@@ -54,6 +59,7 @@ static uint64_t next_cpu_revision(void) {
         if (main_ram_writers != NULL)
             memset(main_ram_writers, 0,
                    main_ram_writer_count * sizeof(*main_ram_writers));
+        memset(source_pages, 0, sizeof(source_pages));
         cpu_revision = 1u;
     }
     return cpu_revision;
@@ -96,6 +102,7 @@ void ram_provenance_reset(void) {
     if (main_ram_writers != NULL)
         memset(main_ram_writers, 0,
                main_ram_writer_count * sizeof(*main_ram_writers));
+    memset(source_pages, 0, sizeof(source_pages));
     (void)next_cpu_revision();
 }
 
@@ -125,6 +132,8 @@ void ram_provenance_invalidate_range(uint32_t address, uint32_t width) {
         !main_ram_offset(address, &offset))
         return;
     if (!preflight_tracking_enabled) {
+        if (width <= 4u && (offset >> 12u) == ((offset + width - 1u) >> 12u) &&
+            !source_pages[offset >> 12u]) return;
         /* Native work keeps only DMA source (MDEC) ownership: a CPU store
          * revokes it, and nothing reads CPU receipts. */
         RamProvenanceEntry *entry = &main_ram_writers[offset >> 2u];
@@ -253,6 +262,7 @@ void ram_provenance_note_source_word(
         !main_ram_offset(address, &offset))
         return;
     entry = &main_ram_writers[offset >> 2u];
+    source_pages[offset >> 12u] = 1u;
     entry->source_kind = (uint8_t)source->kind;
     entry->source_format = source->format;
     entry->source_receipt = source->receipt;
@@ -595,6 +605,12 @@ void ram_provenance_snapshot_commit(RamProvenanceSnapshot *snapshot) {
         return;
     old_writers = main_ram_writers;
     main_ram_writers = snapshot->writers;
+    memset(source_pages, 0, sizeof(source_pages));
+    const size_t tracked = main_ram_writer_count < 0x00800000u / 4u
+        ? main_ram_writer_count : 0x00800000u / 4u;
+    for (size_t i = 0u; i < tracked; ++i)
+        if (main_ram_writers[i].source_kind != RAM_PROVENANCE_SOURCE_NONE)
+            source_pages[i / (4096u / 4u)] = 1u;
     cpu_revision = snapshot->revision;
     cpu_speculative_depth = 0u;
     cpu_reset_pending = false;
