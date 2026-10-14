@@ -29400,9 +29400,10 @@ static GpuRenderTransactionStatus glb_stream_barrier(void) {
         return GPU_RENDER_TRANSACTION_CONTEXT_LOST;
     if (!glb_transaction_interpolation_quiesced())
         return GPU_RENDER_TRANSACTION_STATE_REJECTED;
-    return glb_transaction_consume_gl_errors()
-        ? GPU_RENDER_TRANSACTION_BACKEND_ERROR
-        : GPU_RENDER_TRANSACTION_OK;
+    /* No glGetError here: this runs before every draw, and a driver round trip
+     * per draw stalls the guest thread while the presenter thread is active.
+     * Errors are still drained at the transaction boundaries. */
+    return GPU_RENDER_TRANSACTION_OK;
 }
 
 static GpuRenderTransactionStatus glb_draw_semantic_immediate(
