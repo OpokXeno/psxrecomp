@@ -4132,11 +4132,14 @@ static void overlay_service(GLuint target_fbo, bool threaded_present)
              * renders + window swaps that also perturb the very cadence
              * being measured. Cap at ~60 Hz; game sampling above is
              * unaffected (it runs per pre_swap regardless). */
-            static uint64_t s_tools_last_ms = 0u;
+            static uint64_t s_tools_next_ms = 0u;
             const uint64_t now_ms = SDL_GetTicks64();
-            if (now_ms - s_tools_last_ms >= 16u) {
-                s_tools_last_ms = now_ms;
+            if (now_ms >= s_tools_next_ms) {
                 render_tools_window(target_fbo);
+                /* Also cap at ~5% of this thread: injected overlays
+                 * (RTSS/Afterburner) make the tools-window swap slow. */
+                const uint64_t cost_ms = SDL_GetTicks64() - now_ms;
+                s_tools_next_ms = now_ms + (cost_ms * 20u > 16u ? cost_ms * 20u : 16u);
             }
         }
     } else if (s_text_input_started) {
