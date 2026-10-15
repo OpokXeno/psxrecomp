@@ -1581,10 +1581,15 @@ function(psxrecomp_add_runtime_target target)
             # those as a completed training run, so no llvm-profdata merge is
             # required for this branch.
             if(PSX_PGO STREQUAL "generate")
+                # Native phase workers execute the same hot functions on
+                # multiple threads. Non-atomic counters lose updates and GCC
+                # rejects the resulting flow-inconsistent profiles at use.
                 target_compile_options(${target} PRIVATE
-                    "-fprofile-generate=${_psx_pgo_dir}")
+                    "-fprofile-generate=${_psx_pgo_dir}"
+                    -fprofile-update=atomic)
                 target_link_options(${target} PRIVATE
-                    "-fprofile-generate=${_psx_pgo_dir}")
+                    "-fprofile-generate=${_psx_pgo_dir}"
+                    -fprofile-update=atomic)
             else()
                 target_compile_options(${target} PRIVATE
                     "-fprofile-use=${_psx_pgo_dir}"
