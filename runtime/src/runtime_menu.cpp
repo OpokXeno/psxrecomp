@@ -34,6 +34,8 @@
 #include "savestate.h"
 #include <cstdio>
 #include <ctime>
+#include <algorithm>
+#include <cmath>
 
 extern "C" {
 int psx_video_get_supersampling(void);
@@ -55,6 +57,7 @@ void psx_video_set_window_width(int);
 int psx_video_get_vsync(void);
 void psx_video_set_vsync(int);
 int psx_native_semantic_fps_set(int);
+int psx_video_get_fps(void);
 int psx_audio_get_spu_hq(void);
 void psx_audio_set_spu_hq(int);
 int psx_fast_map_load_set(int);
@@ -366,14 +369,23 @@ void video_menu() {
     const char* vs_names[] = {"Off", "On", "Adaptive"};
     const int vs_values[] = {0, 1, -1};
     choice("VSync", psx_video_get_vsync(), vs_names, vs_values, 3, psx_video_set_vsync, MENU_VSYNC);
-    const char* fps_names[] = {"Original", "60 FPS", "75 FPS", "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
-    const int fps_values[] = {30, 60, 75, 120, 144, 165, 240};
+    const char* fps_names[] = {"Original", "60 FPS", "75 FPS", "90 FPS", "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
+    const int fps_values[] = {30, 60, 75, 90, 120, 144, 165, 240};
     if (ImGui::BeginMenu("Frame rate", gr_backend() == 1)) {
-        for (int i = 0; i < 7; ++i)
-            if (ImGui::MenuItem(fps_names[i], nullptr, gl_renderer_native_interpolation_target_fps() == fps_values[i])) {
-                psx_native_semantic_fps_set(fps_values[i]);
-                remember(MENU_FPS);
+        const int selected_fps = psx_video_get_fps();
+        bool listed = false;
+        for (int i = 0; i < (int)(sizeof(fps_values) / sizeof(*fps_values)); ++i) {
+            listed |= selected_fps == fps_values[i];
+            if (ImGui::MenuItem(fps_names[i], nullptr, selected_fps == fps_values[i])) {
+                if (psx_native_semantic_fps_set(fps_values[i]) > 0)
+                    remember(MENU_FPS);
             }
+        }
+        if (!listed) {
+            char label[24];
+            std::snprintf(label, sizeof(label), "%d FPS", selected_fps);
+            ImGui::MenuItem(label, nullptr, true, false);
+        }
         ImGui::EndMenu();
     }
     ImGui::Separator();
@@ -660,7 +672,33 @@ void psx_runtime_menu_service_layer(void) {
     const unsigned int framebuffer = gl_renderer_ui_layer_begin(width, height);
     if (!framebuffer) return;
     render_frame(framebuffer);
-    gl_renderer_ui_layer_end();
+    /* The menu bar normally occupies only a few rows. Restrict the presenter's
+     * premultiplied overlay draw instead of blending a transparent full window
+     * at every 75/120/240 Hz tick. Popups expand the conservative clip union. */
+    {
+        ContextScope scope;
+        const ImDrawData *data=context?ImGui::GetDrawData():nullptr;
+        float left=(float)width,top=(float)height,right=0,bottom=0;
+        bool full=false;
+        if(data)for(int l=0;l<data->CmdListsCount;++l)
+            for(const ImDrawCmd &command:data->CmdLists[l]->CmdBuffer) {
+                if(command.UserCallback){full=true;continue;}
+                if(!command.ElemCount)continue;
+                const ImVec2 offset=data->DisplayPos,scale=data->FramebufferScale;
+                left=std::min(left,(command.ClipRect.x-offset.x)*scale.x);
+                top=std::min(top,(command.ClipRect.y-offset.y)*scale.y);
+                right=std::max(right,(command.ClipRect.z-offset.x)*scale.x);
+                bottom=std::max(bottom,(command.ClipRect.w-offset.y)*scale.y);
+            }
+        if(full)gl_renderer_ui_layer_end();
+        else {
+            const int x=(int)std::floor(std::clamp(left,0.f,(float)width));
+            const int y=(int)std::floor(std::clamp(top,0.f,(float)height));
+            const int r=(int)std::ceil(std::clamp(right,0.f,(float)width));
+            const int b=(int)std::ceil(std::clamp(bottom,0.f,(float)height));
+            gl_renderer_ui_layer_end_rect(x,height-b,std::max(0,r-x),std::max(0,b-y));
+        }
+    }
     visibility.clear_pending = false;
 }
 void psx_runtime_menu_note_savestates_changed(void) { save_slots_dirty = true; }

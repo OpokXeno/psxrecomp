@@ -736,9 +736,8 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("fps")) {
             rt.video_fps = toml::find<int>(video, "fps");
-            if (rt.video_fps != 30 && rt.video_fps != 60 &&
-                rt.video_fps != 120 && rt.video_fps != 240)
-                throw std::runtime_error("[video] fps must be 30, 60, 120, or 240");
+            if (rt.video_fps < 30 || rt.video_fps > 240)
+                throw std::runtime_error("[video] fps must be between 30 and 240");
         }
         if (video.contains("offer_frame_interpolation")) {
             rt.video_offer_frame_interpolation =
@@ -2533,7 +2532,7 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("fps")) try_get([&]{
             s.fps = toml::find<int>(v, "fps");
-            if (s.fps == 30 || s.fps == 60 || s.fps == 120 || s.fps == 240)
+            if (s.fps >= 30 && s.fps <= 240)
                 s.has_fps = true;
         });
         if (v.contains("frame_interpolation")) try_get([&]{

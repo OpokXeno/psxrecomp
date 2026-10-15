@@ -6,6 +6,11 @@
 #include "ram_provenance.h"
 
 #include "psx_sdl.h"
+#if defined(PSX_SDL3)
+#include <SDL3/SDL_opengl.h>
+#else
+#include <SDL_opengl.h>
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1365,6 +1370,72 @@ static void test_shutdown_with_pending_deferred_ready(void) {
                 "shutdown case retains a READY checkpoint and candidate");
 }
 
+static SDL_atomic_t option_presenter_ready, option_presenter_stop;
+
+static int option_presenter(void *unused) {
+    (void)unused;
+    if (!gl_renderer_native_presenter_thread_begin()) {
+        SDL_AtomicSet(&option_presenter_ready, -1);
+        return -1;
+    }
+    SDL_AtomicSet(&option_presenter_ready, 1);
+    while (!SDL_AtomicGet(&option_presenter_stop)) SDL_Delay(1);
+    gl_renderer_native_presenter_thread_end();
+    return 0;
+}
+
+static void test_native_runtime_options(void) {
+    XgRenderWorkerServices worker = {0};
+    XgRenderPresenterServices presenter = {0};
+    expect_true(gl_renderer_init_context(test_window), "option test GL initializes");
+    expect_true(gl_renderer_native_init_services(&worker, &presenter),
+                "option test starts the real Native GPU owner");
+    if (failures) return;
+    expect_true(gl_renderer_native_main_detach_window(), "main detaches for presenter");
+    SDL_AtomicSet(&option_presenter_ready, 0);
+    SDL_AtomicSet(&option_presenter_stop, 0);
+    SDL_Thread *thread = SDL_CreateThread(option_presenter, "options-presenter", NULL);
+    expect_true(thread != NULL, "option test presenter starts");
+    if (!thread) return;
+    while (!SDL_AtomicGet(&option_presenter_ready)) SDL_Delay(1);
+    expect_true(SDL_AtomicGet(&option_presenter_ready) > 0, "presenter owns its context");
+    expect_true(gl_renderer_ui_context_enter(), "menu enters its separate UI context");
+    if (!failures) {
+        const unsigned int ui_fbo = gl_renderer_ui_layer_begin(32, 32);
+        expect_true(ui_fbo != 0u, "menu has a valid render target");
+        const int targets[] = {60, 75, 90, 120, 144, 165, 240, 60, 30, 75};
+        for (unsigned i = 0u; i < sizeof(targets) / sizeof(*targets); ++i) {
+            GLint bound = 0;
+            expect_true(gl_renderer_set_native_interpolation_fps(targets[i]),
+                        "Native FPS change succeeds in UI context");
+            expect_true(gl_renderer_native_interpolation_target_fps() == targets[i],
+                        "exact FPS target survives changes within a phase bucket");
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+            expect_true((unsigned int)bound == ui_fbo, "FPS change preserves menu FBO");
+            expect_true(gl_renderer_configure_native_view(1, i & 1u ? 16 : 4,
+                i & 1u ? 9 : 3, 320, 240), "live aspect change succeeds");
+            expect_true(gl_renderer_native_view_width() == (i & 1u ? 426 : 320),
+                        "live aspect change updates Native dimensions");
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+            expect_true((unsigned int)bound == ui_fbo, "aspect change preserves menu FBO");
+            glClearColor(0.25f, 0.5f, 0.75f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            unsigned char pixel[4] = {0};
+            glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            expect_true(pixel[0] >= 63 && pixel[0] <= 64 && pixel[1] == 128 &&
+                        pixel[2] == 191 && pixel[3] == 255,
+                        "menu remains drawable after FPS/aspect transitions");
+            expect_true(glGetError() == GL_NO_ERROR, "option transitions produce no GL errors");
+        }
+        gl_renderer_ui_layer_end();
+    }
+    gl_renderer_ui_context_leave();
+    SDL_AtomicSet(&option_presenter_stop, 1);
+    SDL_WaitThread(thread, NULL);
+    gl_renderer_native_main_attach_window();
+    gl_renderer_shutdown();
+}
+
 int main(void) {
     const GpuRenderBackend *backend;
     SDL_Window *window;
@@ -1447,6 +1518,7 @@ int main(void) {
                     diag.deferred_candidate_discards == 1u,
                     "shutdown restores READY state and releases its candidate");
     }
+    if (!failures) test_native_runtime_options();
     SDL_DestroyWindow(window);
     SDL_Quit();
     if (failures) return 1;

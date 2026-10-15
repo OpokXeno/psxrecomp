@@ -1064,6 +1064,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `native_vram_journal` | ✓ |  |  |
 | `native_vram_resources` | ✓ |  |  |
 | `native_wave_diag` | ✓ |  |  |
+| `native_world_models_diag` | ✓ |  |  |
 | `ot_frame_dump` | ✓ |  |  |
 | `overlay_candidates` | ✓ |  |  |
 | `overlay_capture_dump` | ✓ |  |  |

@@ -3,6 +3,7 @@
 #include "psx_align.h"
 #include "pst_wire.h"
 #include "psx_cycles.h"
+#include "host_parallel.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -230,6 +231,42 @@ static uint32_t native_frame_width(uint32_t bytes_per_pixel,
     return 0u;
 }
 
+typedef struct MdecFrameBatch {
+    uint32_t width, macroblocks;
+} MdecFrameBatch;
+
+static void mdec_publish_ranges(uint32_t begin, uint32_t end, void *context) {
+    const MdecFrameBatch *frame = context;
+    const uint32_t width = frame->width, macroblocks = frame->macroblocks;
+    for (uint32_t block = begin; block < end; ++block) {
+        const uint32_t block_x = block % macroblocks;
+        const uint32_t block_y = block / macroblocks;
+        for (uint32_t py = 0u; py < 16u; ++py) {
+            for (uint32_t px = 0u; px < 16u; ++px) {
+                const uint32_t source_pixel = block * 256u + py * 16u + px;
+                const uint32_t destination =
+                    (block_y * 16u + py) * width + block_x * 16u + px;
+                if (mdec.output_depth == 3u) {
+                    const uint16_t packed =
+                        (uint16_t)mdec.output[source_pixel * 2u] |
+                        ((uint16_t)mdec.output[source_pixel * 2u + 1u] << 8u);
+                    mdec_native_frame[destination] =
+                        0xff000000u |
+                        ((uint32_t)((packed >> 0u) & 0x1fu) << 19u) |
+                        ((uint32_t)((packed >> 5u) & 0x1fu) << 11u) |
+                        ((uint32_t)((packed >> 10u) & 0x1fu) << 3u);
+                } else {
+                    const uint32_t source = source_pixel * 3u;
+                    mdec_native_frame[destination] = 0xff000000u |
+                        ((uint32_t)mdec.output[source] << 16u) |
+                        ((uint32_t)mdec.output[source + 1u] << 8u) |
+                        mdec.output[source + 2u];
+                }
+            }
+        }
+    }
+}
+
 static void publish_native_frame(void) {
     const uint32_t bytes_per_pixel = mdec.output_depth == 3u ? 2u : 3u;
     const uint32_t width = native_frame_width(bytes_per_pixel,
@@ -258,34 +295,10 @@ static void publish_native_frame(void) {
         mdec_native_frame_capacity = capacity;
     }
 
-    for (uint32_t block = 0u; block < mdec.decode_macroblocks; ++block) {
-        const uint32_t block_x = block % macroblocks;
-        const uint32_t block_y = block / macroblocks;
-        if (block_y >= macroblock_rows) break;
-        for (uint32_t py = 0u; py < 16u; ++py) {
-            for (uint32_t px = 0u; px < 16u; ++px) {
-                const uint32_t source_pixel = block * 256u + py * 16u + px;
-                const uint32_t destination =
-                    (block_y * 16u + py) * width + block_x * 16u + px;
-                if (mdec.output_depth == 3u) {
-                    const uint16_t packed =
-                        (uint16_t)mdec.output[source_pixel * 2u] |
-                        ((uint16_t)mdec.output[source_pixel * 2u + 1u] << 8u);
-                    mdec_native_frame[destination] =
-                        0xff000000u |
-                        ((uint32_t)((packed >> 0u) & 0x1fu) << 19u) |
-                        ((uint32_t)((packed >> 5u) & 0x1fu) << 11u) |
-                        ((uint32_t)((packed >> 10u) & 0x1fu) << 3u);
-                } else {
-                    const uint32_t source = source_pixel * 3u;
-                    mdec_native_frame[destination] = 0xff000000u |
-                        ((uint32_t)mdec.output[source] << 16u) |
-                        ((uint32_t)mdec.output[source + 1u] << 8u) |
-                        mdec.output[source + 2u];
-                }
-            }
-        }
-    }
+    const uint32_t available = macroblocks * macroblock_rows;
+    const uint32_t blocks = mdec.decode_macroblocks < available ? mdec.decode_macroblocks : available;
+    MdecFrameBatch frame = {width, macroblocks};
+    psx_parallel_for(blocks, 4u, mdec_publish_ranges, &frame);
     mdec_native_frame_width = width;
     mdec_native_frame_height = height;
     mdec_native_frame_depth24 = mdec.output_depth != 3u;
@@ -512,7 +525,7 @@ static void idct_block(int16_t *block)
 }
 #endif
 
-static int decode_rle_block(int16_t *block, const uint8_t *quant,
+static int decode_rle_coefficients(int16_t *block, const uint8_t *quant,
                             uint32_t *pos, uint32_t end) {
     memset(block, 0, 64 * sizeof(int16_t));
     if (*pos >= end) return 0;
@@ -549,6 +562,12 @@ static int decode_rle_block(int16_t *block, const uint8_t *quant,
         block[zigzag_to_linear[k]] = (int16_t)clamp_int(tmp, -0x4000, 0x3FFF);
     }
 
+    return 1;
+}
+
+static int decode_rle_block(int16_t *block, const uint8_t *quant,
+                             uint32_t *pos, uint32_t end) {
+    if (!decode_rle_coefficients(block, quant, pos, end)) return 0;
     idct_block(block);
     return 1;
 }
@@ -698,12 +717,8 @@ static void mdec_encode_row24_sse2(const int16_t *by, const int16_t *cb4,
 #undef MDEC_M9
 #endif /* MDEC_HAVE_SSE2 */
 
-static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
+static void write_color_macroblock(uint8_t *out, const int16_t *crblk, const int16_t *cbblk,
                                     const int16_t yblk[4][64]) {
-    /* 16×16: 512 bytes @15bpp, 768 @24bpp — reserve once per MB. */
-    uint32_t need = (mdec.output_depth == 3) ? 512u : 768u;
-    uint8_t *out = output_reserve(need);
-    if (!out) return;
     uint8_t *p = out;
 #if defined(MDEC_HAVE_SSE2)
     /* MotK FMV is 24bpp — row SIMD (Beetle EncodeRow24). 16bpp stays scalar. */
@@ -722,7 +737,6 @@ static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
                                    &crblk[crow + 4], rgb_xor, p);
             p += 24;
         }
-        mdec.output_size += need;
         return;
     }
 #endif
@@ -736,6 +750,14 @@ static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
                                crblk[chroma], cbblk[chroma]);
         }
     }
+}
+
+static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
+                                     const int16_t yblk[4][64]) {
+    const uint32_t need = mdec.output_depth == 3 ? 512u : 768u;
+    uint8_t *out = output_reserve(need);
+    if (!out) return;
+    write_color_macroblock(out, crblk, cbblk, yblk);
     mdec.output_size += need;
 }
 
@@ -745,7 +767,7 @@ static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
 static volatile uint32_t g_mdec_decode_count = 0;
 uint32_t mdec_get_decode_count(void) { return g_mdec_decode_count; }
 
-static void execute_decode(void) {
+static void execute_decode_serial(void) {
     uint32_t pos = 0;
     uint32_t end = mdec.input_count;
     g_mdec_decode_count++;
@@ -792,6 +814,83 @@ static void execute_decode(void) {
     mdec_last_color_decode_frame = s_frame_count;
     publish_native_frame();
     mdec_last_color_decode_cycle = psx_cycle_count;
+    trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
+}
+
+typedef struct MdecParallelDecode {
+    int16_t (*coefficients)[64];
+    uint8_t *output;
+    uint32_t blocks_per_job, bytes_per_job;
+} MdecParallelDecode;
+
+static void mdec_transform_ranges(uint32_t begin, uint32_t end, void *context) {
+    const MdecParallelDecode *decode = context;
+    /* The guest owner waits for this batch: tables and output flags cannot
+     * change while workers transform private coefficients/disjoint bytes. */
+    for (uint32_t i = begin; i < end; ++i) {
+        int16_t (*blocks)[64] = decode->coefficients + (size_t)i * decode->blocks_per_job;
+        uint8_t *output = decode->output + (size_t)i * decode->bytes_per_job;
+        for (uint32_t b = 0u; b < decode->blocks_per_job; ++b) idct_block(blocks[b]);
+        if (decode->blocks_per_job == 1u) {
+            for (uint32_t p = 0u; p < 64u; ++p) output[p] = to_output_u8(blocks[0][p]);
+        } else write_color_macroblock(output, blocks[0], blocks[1], blocks + 2u);
+    }
+}
+
+static void execute_decode(void) {
+    const uint32_t end = mdec.input_count;
+    const uint32_t blocks_per_job = mdec.output_depth < 2u ? 1u : 6u;
+    const uint32_t bytes_per_job = blocks_per_job == 1u ? 64u :
+        mdec.output_depth == 3u ? 512u : 768u;
+    const uint32_t capacity = end / blocks_per_job;
+    /* A coefficient block consumes at least one halfword. Include scratch
+     * for an incomplete final macroblock, whose stop/counter semantics stay
+     * identical to the serial decoder. Allocation failure uses that decoder. */
+    if (capacity < 2u || (size_t)end > SIZE_MAX / sizeof(int16_t[64]) - 6u ||
+        capacity > UINT32_MAX / bytes_per_job) {
+        execute_decode_serial();
+        return;
+    }
+    int16_t (*coefficients)[64] = malloc(((size_t)end + 6u) * sizeof(*coefficients));
+    if (!coefficients || !ensure_output_capacity(capacity * bytes_per_job)) {
+        free(coefficients);
+        execute_decode_serial();
+        return;
+    }
+    ++g_mdec_decode_count;
+    clear_output();
+    mdec.decode_macroblocks = mdec.decode_blocks = 0u;
+    mdec.decode_stop_reason = MDEC_STOP_NONE;
+    mdec.decode_input_end = end;
+    mdec.dma_out_words = mdec.dma_read_underflows = 0u;
+    uint32_t pos = 0u;
+    const uint32_t stops[6] = {MDEC_STOP_CR, MDEC_STOP_CB, MDEC_STOP_Y0,
+        MDEC_STOP_Y1, MDEC_STOP_Y2, MDEC_STOP_Y3};
+    while (pos < end) {
+        const size_t first = (size_t)mdec.decode_macroblocks * blocks_per_job;
+        uint32_t b;
+        for (b = 0u; b < blocks_per_job; ++b) {
+            const uint8_t *quant = blocks_per_job == 6u && b < 2u ? mdec.uv_quant : mdec.y_quant;
+            if (!decode_rle_coefficients(coefficients[first + b], quant, &pos, end)) {
+                mdec.decode_stop_reason = blocks_per_job == 1u ? MDEC_STOP_Y0 : stops[b];
+                break;
+            }
+        }
+        if (b != blocks_per_job) break;
+        ++mdec.decode_macroblocks;
+    }
+    if (pos >= end && mdec.decode_stop_reason == MDEC_STOP_NONE)
+        mdec.decode_stop_reason = MDEC_STOP_INPUT_END;
+    mdec.decode_input_pos = pos;
+    MdecParallelDecode decode = {coefficients, mdec.output, blocks_per_job, bytes_per_job};
+    psx_parallel_for(mdec.decode_macroblocks, 1u, mdec_transform_ranges, &decode);
+    mdec.output_size = mdec.decode_macroblocks * bytes_per_job;
+    free(coefficients);
+    if (blocks_per_job == 6u) {
+        mdec_last_color_decode_frame = s_frame_count;
+        publish_native_frame();
+        mdec_last_color_decode_cycle = psx_cycle_count;
+    }
     trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
 }
 

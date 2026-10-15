@@ -2,7 +2,6 @@
  * Rasterization, texture banks and Native resources use production code. */
 #include "host_time.h"
 #include "psx_rewind.h"
-#include "psx_savestate_menu.h"
 #include "frame_pacing.h"
 #include <stdint.h>
 

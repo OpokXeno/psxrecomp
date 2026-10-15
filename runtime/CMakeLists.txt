@@ -72,6 +72,20 @@ if(BUILD_TESTING)
     add_executable(host_cpu_test tests/test_host_cpu.c src/host_cpu.c)
     target_include_directories(host_cpu_test PRIVATE include)
     add_test(NAME host_cpu_affinity COMMAND host_cpu_test)
+    add_executable(host_parallel_test tests/test_host_parallel.cpp
+        src/host_parallel.cpp src/host_cpu.c)
+    target_include_directories(host_parallel_test PRIVATE include)
+    find_package(Threads REQUIRED)
+    target_link_libraries(host_parallel_test PRIVATE Threads::Threads)
+    add_test(NAME host_parallel COMMAND host_parallel_test)
+    set_tests_properties(host_parallel PROPERTIES TIMEOUT 20)
+    add_executable(mdec_parallel_test tests/test_mdec_parallel.c
+        src/host_parallel.cpp src/host_cpu.c)
+    target_include_directories(mdec_parallel_test PRIVATE include)
+    target_compile_definitions(mdec_parallel_test PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    target_link_libraries(mdec_parallel_test PRIVATE Threads::Threads)
+    add_test(NAME mdec_parallel COMMAND mdec_parallel_test)
+    set_tests_properties(mdec_parallel PROPERTIES TIMEOUT 30)
     add_test(NAME overlay_pair_dedup_runtime
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_pair_dedup_runtime.py")
@@ -226,7 +240,7 @@ if(BUILD_TESTING)
     # VRAM residency, portable tracking state, and bounded asynchronous decode.
     add_executable(hd_texture_pack_test
         tests/test_hd_texture_pack.cpp
-        src/hd_texture_pack.cpp)
+        src/hd_texture_pack.cpp src/host_cpu.c)
     target_include_directories(hd_texture_pack_test PRIVATE include)
     find_package(Threads REQUIRED)
     target_link_libraries(hd_texture_pack_test PRIVATE Threads::Threads)
@@ -735,6 +749,22 @@ if(BUILD_TESTING)
     target_include_directories(frame_pacing_test PRIVATE include)
     add_test(NAME frame_pacing_test COMMAND frame_pacing_test)
 
+    add_executable(native_present_cadence_test tests/test_native_present_cadence.c)
+    target_include_directories(native_present_cadence_test PRIVATE include)
+    add_test(NAME native_present_cadence COMMAND native_present_cadence_test)
+
+    # Link the parser dependency normally so this settings regression also
+    # runs on Windows, without relying on ELF section garbage collection.
+    add_executable(native_fps_settings_test
+        tests/test_native_fps_settings.cpp ../recompiler/src/config_loader.cpp
+        ../recompiler/src/ps1_exe_parser.cpp)
+    target_include_directories(native_fps_settings_test PRIVATE
+        ../recompiler/src ../recompiler/include ../recompiler/lib/fmt/include ../recompiler/lib/toml11)
+    target_compile_features(native_fps_settings_test PRIVATE cxx_std_17)
+    target_compile_definitions(native_fps_settings_test PRIVATE FMT_HEADER_ONLY=1)
+    add_test(NAME native_fps_settings COMMAND native_fps_settings_test
+        "${CMAKE_CURRENT_BINARY_DIR}/native_fps_settings_fixture.toml")
+
     # Same family of bug as frame_pacing: the starvation watchdog's staleness
     # gap must not wrap when the (cross-thread) heartbeat is newer than the
     # clock sample taken by the emu thread.
@@ -1164,6 +1194,7 @@ if(BUILD_TESTING)
 
     foreach(gl_test gpu_gl_mask_order_test gpu_gl_peek_order_test xg_render_gl_transaction_test)
         target_sources(${gl_test} PRIVATE
+            src/host_parallel.cpp
             tests/gl_present_host_test_double.c
             src/mod_texture_banks.c src/frame_interpolation.c
             src/host_time.c src/host_osd.c)

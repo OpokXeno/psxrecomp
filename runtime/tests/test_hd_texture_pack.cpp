@@ -512,6 +512,40 @@ void test_bounded_async_decode(Fixture& fixture) {
     hd_texture_pixels_release(&pixels);
 }
 
+void test_async_decode_burst(Fixture& fixture) {
+    const unsigned images = 64;
+    const fs::path source = fixture.replacements / key_name(0xD000u, 0);
+    write_test_png(source, 128, 96);
+    for (unsigned i = 1; i < images; ++i)
+        fs::copy_file(source, fixture.replacements / key_name(0xD000u + i, 0));
+    HdTexturePack* pack = open_pack(fixture.root);
+    if (!pack) return;
+    for (unsigned i = 0; i < images; ++i)
+        check(hd_texture_pack_request_decode(pack, 0xD000u + i, 0) == HD_TEXTURE_LOOKUP_NONE,
+              "burst queues each independent image");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (unsigned i = 0; i < images; ++i) {
+        HdTexturePixels pixels{};
+        int status;
+        do {
+            status = hd_texture_pack_acquire_decoded(pack, 0xD000u + i, 0, &pixels);
+            if (status != HD_TEXTURE_LOOKUP_NONE) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (std::chrono::steady_clock::now() < deadline);
+        check(status == HD_TEXTURE_LOOKUP_FOUND, "growing worker pool drains the complete image burst");
+        check(pixels.rgba && pixels.width == 128 && pixels.height == 96 &&
+                  pixels.rgba[2] == 0xA5u && pixels.rgba[3] == 0x7Fu,
+              "parallel decode preserves each image's pixels");
+        hd_texture_pixels_release(&pixels);
+    }
+    hd_texture_pack_destroy(pack);
+    pack = open_pack(fixture.root);
+    if (!pack) return;
+    for (unsigned i = 0; i < images; ++i)
+        hd_texture_pack_request_decode(pack, 0xD000u + i, 0);
+    hd_texture_pack_destroy(pack); /* Joins workers with queued/in-flight work. */
+}
+
 } // namespace
 
 int main() {
@@ -523,6 +557,7 @@ int main() {
     test_wrapping(fixture);
     test_ambiguity_fallback();
     test_bounded_async_decode(fixture);
+    test_async_decode_burst(fixture);
 
     if (failures) {
         std::fprintf(stderr, "test_hd_texture_pack: %d failure(s)\n", failures);

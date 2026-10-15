@@ -91,6 +91,9 @@ void gl_renderer_native_presenter_thread_end(void);
  * begin returns the framebuffer to draw into, 0 to skip this frame. */
 unsigned int gl_renderer_ui_layer_begin(int width, int height);
 void gl_renderer_ui_layer_end(void);
+/* Publish only the UI's occupied rectangle, in bottom-left framebuffer pixels.
+ * Empty bounds hide the layer. The full-size API above remains available. */
+void gl_renderer_ui_layer_end_rect(int x, int y, int width, int height);
 void gl_renderer_ui_layer_hide(void);
 /* Main thread, presenter threaded: bind/unbind the private UI context
  * around ImGui work (menu layer, tools window). enter returns 0 to skip. */

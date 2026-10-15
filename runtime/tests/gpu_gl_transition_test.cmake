@@ -32,7 +32,9 @@ if(UNIX AND NOT APPLE AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # GPU-only additions at 1x and exact word-texture reuse use real hidden GL.
     find_package(OpenGL REQUIRED)
     add_executable(native_gpu_scale_test
-        "${CMAKE_CURRENT_LIST_DIR}/test_native_gpu_scale.c")
+        "${CMAKE_CURRENT_LIST_DIR}/test_native_gpu_scale.c"
+        "${CMAKE_CURRENT_LIST_DIR}/../src/host_parallel.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/../src/host_cpu.c")
     target_include_directories(native_gpu_scale_test PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/../include" ${PSX_SDL_INCLUDE_DIRS})
     target_compile_features(native_gpu_scale_test PRIVATE c_std_11)
@@ -49,6 +51,9 @@ if(UNIX AND NOT APPLE AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         xg_semantic_presentation xg_render_ir ${PSX_SDL_LIBRARIES} OpenGL::GL m)
     add_test(NAME native_gpu_scale
         COMMAND native_gpu_scale_test)
+    add_test(NAME native_worker_scaling
+        COMMAND native_gpu_scale_test --workers-only)
+    set_tests_properties(native_worker_scaling PROPERTIES TIMEOUT 30)
     set_tests_properties(native_gpu_scale PROPERTIES TIMEOUT 20
         ENVIRONMENT "SDL_VIDEODRIVER=offscreen;LP_NUM_THREADS=2")
 endif()

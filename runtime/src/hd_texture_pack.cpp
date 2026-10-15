@@ -1,4 +1,5 @@
 #include "hd_texture_pack.h"
+#include "host_cpu.h"
 
 #ifndef HD_TEXTURE_PACK_DISABLE_PNG_DECODE
 #include "../third_party/stb_image.h" /* declarations only; implementation is shared */
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -57,7 +59,6 @@ constexpr uint32_t kMaxTrackingStateUploads = 8192;
 constexpr uint32_t kMaxTrackingStateFragments = 262144;
 #ifndef HD_TEXTURE_PACK_DISABLE_PNG_DECODE
 constexpr size_t kMaxDecodeQueue = 256;
-constexpr unsigned kDecodeWorkers = 3;
 constexpr size_t kMaxPngFileBytes = size_t{64} * 1024 * 1024;
 #endif
 
@@ -459,7 +460,7 @@ struct DecodeCache {
     size_t budget = kDefaultDecodeBudget;
     size_t used = 0;
     uint64_t tick = 0;
-    bool started = false;
+    unsigned active = 0;
     bool stop = false;
 
     ~DecodeCache() {
@@ -509,6 +510,7 @@ void decode_worker(DecodeCache* cache) {
             auto it = cache->items.find(key);
             if (it == cache->items.end()) continue;
             it->second.state = DecodeState::Loading;
+            ++cache->active;
             path = it->second.path;
         }
 
@@ -546,6 +548,7 @@ void decode_worker(DecodeCache* cache) {
         if (loaded) stbi_image_free(loaded);
 
         std::lock_guard<std::mutex> lock(cache->mutex);
+        --cache->active;
         auto it = cache->items.find(key);
         if (it == cache->items.end()) continue;
         if (!decoded || bytes > cache->budget) {
@@ -1449,10 +1452,23 @@ int hd_texture_pack_request_decode(HdTexturePack* pack,
     item.path = record->second.replacement_path;
     pack->decode.items.emplace(key, std::move(item));
     pack->decode.queue.push_back(key);
-    if (!pack->decode.started) {
-        pack->decode.started = true;
-        for (unsigned i = 0; i < kDecodeWorkers; ++i)
+    /* Grow with pending + in-flight images so a single miss starts one reader,
+     * while a busy pack can use every CPU allowed by the process affinity. */
+    const unsigned wanted = psx_host_worker_count(std::thread::hardware_concurrency(),
+        static_cast<unsigned>(pack->decode.queue.size() + pack->decode.active));
+    try {
+        pack->decode.workers.reserve(wanted);
+        while (pack->decode.workers.size() < wanted)
             pack->decode.workers.emplace_back(decode_worker, &pack->decode);
+    } catch (const std::system_error&) {
+        /* Existing readers can drain the queue after a partial start. */
+    } catch (const std::bad_alloc&) {
+        /* Keep decoding with the successfully allocated workers. */
+    }
+    if (pack->decode.workers.empty()) {
+        pack->decode.queue.pop_back();
+        pack->decode.items[key].state = DecodeState::Failed;
+        return HD_TEXTURE_LOOKUP_ERROR;
     }
     pack->decode.wake.notify_one();
     return HD_TEXTURE_LOOKUP_NONE;

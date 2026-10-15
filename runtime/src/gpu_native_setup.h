@@ -55,7 +55,7 @@ static const char *NATIVE_GPU_SETUP_CS =
     "    ivec2 lv=axis_limits(min(vs[0],min(vs[1],vs[2])),max(vs[0],max(vs[1],vs[2])),dv);\n"
     "    parameters[b+3u]=uvec4(lu.x,lv.x,lu.y,lv.y);\n"
     "    int core=x[1]<=x[0]?(x[2]<=x[1]?2:1):(x[2]<x[0]?2:0);\n"
-    "    parameters[b+5u]=floatBitsToUint(vec4(float(x[core]),float(y[core]),integral?1.0lf:2.0lf,0.0lf));\n"
+    "    parameters[b+5u]=floatBitsToUint(vec4(float(x[core]),float(y[core]),integral?1.0lf:2.0lf,t.config.y==0?1.0lf:0.0lf));\n"
     "    precise double area=(x[1]-x[0])*(y[2]-y[0])-(x[2]-x[0])*(y[1]-y[0]);\n"
     "    double scale=double(t.config.x);\n"
     "    precise dvec4 uv_step;\n"

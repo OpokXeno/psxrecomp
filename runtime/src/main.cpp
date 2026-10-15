@@ -46,6 +46,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_render.h"
 #include "hd_texture_runtime.h"
 #include "gpu_gl_renderer.h"
+#include "native_present_cadence.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
@@ -562,7 +563,8 @@ static int g_video_aa = 0; /* Host AA defaults off; also selects Native raster s
 static int g_video_aa_factor = 4; /* Quality multiplier independent of AA mode. */
 static bool g_native_render_source_failed = false;
 static double g_native_guest_speed = 1.0;
-static int g_native_interpolation_fps = 60;
+/* The selected FPS is shared by config, launcher, menus and presentation.
+ * Original stays 30 here even though its presenter ticks at 60 Hz. */
 static int g_video_fps = 30;
 static NativeRenderModeControl g_native_render_mode_control{};
 static XgRenderPresentationHost *g_native_render_presentation_host = nullptr;
@@ -736,7 +738,7 @@ static bool native_render_describe_work(XgRenderSourceFrameDescription *descript
 static bool native_render_describe_fields(XgRenderSourceFrameDescription *description) {
     description->display.temporal_hz =
         g_smooth_60fps_requested.load(std::memory_order_acquire)
-        ? (uint16_t)g_native_interpolation_fps : 0u;
+        ? (uint16_t)g_video_fps : 0u;
     /* Nx means N spatial samples, not N pixels per axis. 16x fits a 4x
      * ordered raster rather than allocating impossible 16x-wide VRAM planes. */
     const int aa_scale = g_video_aa >= 3 && g_video_aa <= 5
@@ -1731,8 +1733,7 @@ extern "C" void psx_smooth_60fps_set(int enabled) {
 
 static void set_video_fps(int fps) {
     g_video_fps = (fps >= 30 && fps <= 240) ? fps : 30;
-    g_native_interpolation_fps = g_video_fps >= 60 ? g_video_fps : 60;
-    psx_smooth_60fps_set(g_video_fps >= 60);
+    psx_smooth_60fps_set(g_video_fps > 30);
 }
 #if defined(PSX_WEB)
 extern "C" EMSCRIPTEN_KEEPALIVE void psx_web_set_smooth_60fps(int enabled) {
@@ -1951,33 +1952,20 @@ extern "C" int psx_frame_interpolation_enabled(void) {
  * designed cadence (field 30, battle 60, ...), which is denominator 1
  * (no invented phases) on 60 Hz ticks — the output follows the guest.
  * Forcing 33 ms ticks would halve battle to 30. */
-/* Presenter tick period for a native target. 30 ("Original") and 60 tick at
- * 60 Hz: 30 means the game's designed cadence (denominator 1, no invented
- * phases) on 60 Hz ticks. Above 60 the period is the target rate itself --
- * except when a threaded presenter swaps with vsync at the panel rate: then a
- * slightly shorter tick lets the blocking swap own the cadence, instead of a
- * free-running timer beating against vblank (missed vblanks, uneven pacing). */
-static bool native_present_display_locked(int fps) {
-    return fps > 60 && native_presenter_threaded() && g_video_vsync != 0 &&
-        g_host_refresh_hz > 0.0 &&
-        std::fabs(g_host_refresh_hz - (double)fps) <= (double)fps * 0.01;
+static uint64_t native_present_period_ns(int fps) {
+    return native_present_cadence_resolve(fps, g_host_refresh_hz,
+        g_video_vsync, native_presenter_threaded()).period_ns;
 }
 
-static uint64_t native_present_period_ns(int fps) {
-    if (fps == 30 || fps == 60) return UINT64_C(16666667);
-    const uint64_t period_ns =
-        (UINT64_C(1000000000) + (uint64_t)fps / 2u) / (uint64_t)fps;
-    if (native_present_display_locked(fps))
-        return period_ns - period_ns / 32u;
-    return period_ns;
+extern "C" int psx_video_get_fps(void) {
+    return g_video_fps;
 }
 
 extern "C" int psx_native_semantic_fps_set(int fps) {
     if (fps < 30 || fps > 240) return 0;
     if (!gl_renderer_set_native_interpolation_fps(fps))
         return 0;
-    g_native_interpolation_fps = fps;
-    psx_smooth_60fps_set(fps >= 60);
+    set_video_fps(fps);
     if (g_native_render_selected && g_native_render_presentation_host &&
         !xg_render_presentation_host_set_period(
             g_native_render_presentation_host, native_present_period_ns(fps)))
@@ -4039,44 +4027,12 @@ extern "C" int psx_present_vsync_owns_cadence(void) {
     return present_vsync_owns_cadence();
 }
 
-/* Native-path swap interval from user preference x target x panel.
- * HARD RULE: blocking intervals only at target <= 60. Swaps run on the
- * thread that also runs the guest fibers; a blocking swap consumes its
- * tick period, and above 60 Hz ticks subdivide guest frames (no frame-end
- * idle left to borrow) — the guest starves and vblanks decay to 0 (seen
- * at 240 on a 240 Hz panel, and fps>75 on a 75 Hz panel). At <= 60 the
- * ticks align with frame boundaries and borrow frame-end idle safely.
- * Within that rule: divisor targets pace by hardware (tear-free),
- * non-divisors go immediate + host-period pacing (pump due-gates every
- * tick; compositor/VRR decides what reaches the eye). User Off forces
- * immediate everywhere (30 still reads as 30 via duplicate wholes).
- * Adaptive maps to -1 only for 1:1 (SDL has no adaptive divisor).
- * Panel unknown keeps the legacy target-only behavior. Returns -2 to
- * fall through to the generic path. */
+/* Blocking swaps belong only to the dedicated presenter, and only when the
+ * panel rate can represent the requested cadence. The guest-thread fallback
+ * and mismatched targets use wall-clock pacing with immediate swaps. */
 static int native_present_interval(void) {
-    /* True target (main-owned); the GL getter reports pool sizing in
-     * 30 Hz units and lies for 75/144/165. */
-    const int native_fps = g_native_interpolation_fps;
-    /* High targets used to force immediate swaps: a vsync-blocked swap on the
-     * guest thread would stall emulation. A dedicated presenter thread may
-     * block, so honour the user's vsync there (no tearing; the time-based
-     * phase selection still samples the right image after a blocked swap). */
-    if (native_fps > 60)
-        return native_presenter_threaded() ? g_video_vsync : 0;
-    if (native_fps > 0 && g_video_vsync != 0 && g_host_refresh_hz > 0.0) {
-        const double panel = g_host_refresh_hz;
-        const double exact = panel / (double)native_fps;
-        const int divisor = (int)(exact + 0.5);
-        if (divisor >= 1 &&
-            std::fabs(panel - (double)native_fps * divisor) <= panel * 0.01)
-            return (g_video_vsync < 0 && divisor == 1) ? -1 : divisor;
-        return 0;
-    }
-    if (native_fps > 0 && native_fps <= 30)
-        return 2;
-    if (native_fps >= 120)
-        return 0;
-    return -2;
+    return native_present_cadence_resolve(g_video_fps,
+        g_host_refresh_hz, g_video_vsync, native_presenter_threaded()).swap_interval;
 }
 
 static int present_effective_swap_interval(void) {
@@ -4398,14 +4354,13 @@ static void apply_present_cadence(void) {
     if (g_native_render_selected && g_native_render_presentation_host)
         (void)xg_render_presentation_host_set_period(
             g_native_render_presentation_host,
-            native_present_period_ns(g_native_interpolation_fps));
+            native_present_period_ns(g_video_fps));
     if (g_native_render_selected && g_native_render_presentation_host)
         (void)xg_render_presentation_host_set_display_locked(
             g_native_render_presentation_host,
-            native_present_display_locked(g_native_interpolation_fps)
-                ? (UINT64_C(1000000000) + (uint64_t)g_native_interpolation_fps / 2u) /
-                      (uint64_t)g_native_interpolation_fps
-                : 0u);
+            native_present_cadence_resolve(g_video_fps,
+                g_host_refresh_hz, g_video_vsync,
+                native_presenter_threaded()).display_period_ns);
     if (g_vk_active)
         vk_renderer_set_present_mode(interval);
     if (sdl_renderer)
@@ -4432,8 +4387,9 @@ extern "C" void psx_video_set_vsync(int mode) {
 static void log_present_cadence(void) {
     if (g_native_render_selected) {
         std::printf("psxrecomp: Native cadence: 33.8688 MHz guest clock, "
-                    "independent %.1f Hz presenter, swap interval %d\n",
-                    (double)g_native_interpolation_fps,
+                    "independent %.1f Hz presenter, target %d%s, swap interval %d\n",
+                    (double)(g_video_fps == 30 ? 60 : g_video_fps),
+                    g_video_fps, g_video_fps == 30 ? " (Original)" : " FPS",
                     present_effective_swap_interval());
     } else if (present_vsync_owns_cadence()) {
         /* The pacer still runs underneath as a deadline cap (see
@@ -5624,7 +5580,7 @@ extern "C" int psx_runtime_menu_save_settings(unsigned int changed, int windowed
         if (changed & MENU_ANISOTROPY) { s.anisotropic_filtering = gl_renderer_anisotropy(); s.has_anisotropic_filtering = true; }
         if (changed & MENU_ANTIALIASING) { s.antialiasing = g_video_aa; s.has_antialiasing = true; }
         if (changed & (MENU_AA_FACTOR | MENU_ANTIALIASING)) { s.antialiasing_factor = g_video_aa_factor; s.has_antialiasing_factor = true; }
-        if (changed & MENU_FPS) { s.fps = gl_renderer_native_interpolation_target_fps(); s.has_fps = true; }
+        if (changed & MENU_FPS) { s.fps = psx_video_get_fps(); s.has_fps = true; }
         if (changed & MENU_DITHERING) { s.dithering = gpu_dithering_enabled() != 0; s.has_dithering = true; }
         if (changed & MENU_SCREEN_MODEL) { s.screen_kind = g_video_screen; s.has_screen_kind = true; }
         if (changed & MENU_Z_BUFFER) { s.z_buffer = gl_renderer_native_depth_test() != 0; s.has_z_buffer = true; }
@@ -15802,22 +15758,26 @@ int main(int argc, char** argv) {
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive).
      * The two Native interpolation environment variables remain diagnostic
-     * overrides; normal configuration uses [video] fps = 30|60|120|240. Driver vsync
+     * overrides; normal configuration uses [video] fps in 30..240. Driver vsync
      * and wall-clock pacing remain mutually exclusive. */
     if (const char *e = std::getenv("XG_FAST_MAP_READS"))
         cdrom_set_data_read_policy_enabled(e[0] != '0');
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
-    if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))
+    if (const char *e = std::getenv("PSX_SMOOTH_60FPS")) {
+        /* The legacy enable override implies a 60 FPS target when config
+         * selected Original; it must not depend on a hidden 60 FPS default. */
+        if (atoi(e) && g_video_fps == 30) set_video_fps(60);
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
+    }
     if (const char *e = std::getenv("PSX_NATIVE_INTERPOLATION_FPS")) {
         const int fps = atoi(e);
-        if (fps == 30 || fps == 60 || fps == 120 || fps == 240)
-            g_native_interpolation_fps = fps;
+        if (fps >= 30 && fps <= 240)
+            set_video_fps(fps);
         else {
             std::fprintf(stderr,
                          "psxrecomp: PSX_NATIVE_INTERPOLATION_FPS must be "
-                         "30, 60, 120, or 240\n");
+                         "between 30 and 240\n");
             return 1;
         }
     }
@@ -17838,7 +17798,7 @@ session_reboot:
         if (!g_native_render_selected && !netplay_cpu_auth_gpu())
             g_video_scale = gr_scale();
         if (g_gl_active && !gl_renderer_set_native_interpolation_fps(
-                g_native_interpolation_fps)) {
+                g_video_fps)) {
             std::fprintf(stderr,
                          "psxrecomp: Native interpolation target initialization failed\n");
             return 1;
@@ -18085,7 +18045,7 @@ session_reboot:
         }
         if (g_native_render_selected &&
             !native_render_native_start_host(
-                1000.0 / g_native_interpolation_fps))
+                native_present_period_ns(g_video_fps) / 1000000.0))
             return 1;
         gpu_ws_configure_native_cull(
             g_native_render_widescreen && wide_requested,

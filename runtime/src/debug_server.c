@@ -9620,6 +9620,24 @@ static void handle_dump_buffer(int id, const char *json)
              id, path, x0, y0, w, h);
 }
 
+static void handle_native_world_models_diag(int id, const char *json)
+{
+    (void)json;
+    PsxXgRenderWorldNativeSnapshot d = {0};
+    psx_xg_render_auth_world_models_native_snapshot(&d);
+    send_fmt("{\"id\":%d,\"ok\":true,\"cutovers\":%llu,"
+        "\"primitives\":%llu,\"failures\":%llu,\"first_stage\":%u,"
+        "\"first_detail\":%u,\"last_stage\":%u,\"last_detail\":%u,"
+        "\"templates\":%llu,\"missing_model\":%u,\"missing_packet\":%u}",
+        id, (unsigned long long)d.native_cutover_count,
+        (unsigned long long)d.native_primitive_count,
+        (unsigned long long)d.native_failure_count,
+        d.first_failure_stage, d.first_failure_detail,
+        d.last_failure_stage, d.last_failure_detail,
+        (unsigned long long)d.packet_copy_template_count,
+        d.first_missing_model_address, d.first_missing_packet_address);
+}
+
 static void handle_native_semantic_last(int id, const char *json)
 {
     char value[64];
@@ -10593,11 +10611,12 @@ static const char *native_midpoint_reset_reason_name(uint32_t reason)
 
 static void handle_native_midpoint_diag(int id, const char *json)
 {
+    extern int psx_video_get_fps(void);
     GlRendererNativeMidpointDiagnostics diag = {0};
     (void)json;
     gl_renderer_native_midpoint_diag(&diag);
     send_fmt(
-        "{\"id\":%d,\"ok\":true,\"target_fps\":%u,\"phase_count\":%u,"
+        "{\"id\":%d,\"ok\":true,\"selected_fps\":%d,\"target_fps\":%u,\"phase_count\":%u,"
         "\"begun\":%llu,\"sealed\":%llu,"
         "\"midpoint_presents\":%llu,\"current_presents\":%llu,"
         "\"midpoint_candidates\":%llu,"
@@ -10710,7 +10729,7 @@ static void handle_native_midpoint_diag(int id, const char *json)
         "\"last_gl_operation\":%u,"
         "\"frame_open\":%s,\"frame_valid\":%s,\"suspended\":%s,"
         "\"previous_usable\":%s}",
-        id, diag.target_fps, diag.phase_count,
+        id, psx_video_get_fps(), diag.target_fps, diag.phase_count,
         (unsigned long long)diag.begun_frames,
         (unsigned long long)diag.sealed_frames,
         (unsigned long long)diag.midpoint_presents,
@@ -18215,6 +18234,7 @@ static const CmdEntry s_commands[] = {
     { "dump_buffer",       handle_dump_buffer },
     { "native_semantic_last", handle_native_semantic_last },
     { "native_stream_diag", handle_native_stream_diag },
+    { "native_world_models_diag", handle_native_world_models_diag },
     { "native_capture_profile", handle_native_capture_profile },
     { "native_resident_text_state", handle_native_resident_text_state },
     { "native_renderer_state", handle_native_renderer_state },

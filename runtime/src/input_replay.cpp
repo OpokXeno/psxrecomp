@@ -3820,7 +3820,11 @@ bool write_evidence(const char* path, uint16_t field_id, const char* backend) {
                << "},\"errors\":{";
         for (const auto& error : errors)
             output << (&error == &errors[0] ? "" : ",") << '"' << error.first << "\":" << error.second;
-        output << "},\"motion\":{\"last_compile_consumed_motion_resources\":" << compiler.consumed_motion_resources
+        output << "},\"gpu\":{\"timed_work\":" << compiler.gpu.timed_work
+               << ",\"render_ns\":" << compiler.gpu.gpu_render_ns
+               << ",\"scanout_ns\":" << compiler.gpu.gpu_readback_ns
+               << ",\"commands\":" << compiler.gpu.commands
+               << "},\"motion\":{\"last_compile_consumed_motion_resources\":" << compiler.consumed_motion_resources
                << ",\"last_compile_consumed_operations\":" << compiler.consumed_native_operations
                << ",\"evaluations\":" << compiler.motion_evaluations
                << ",\"projected_draws\":" << compiler.motion_projected_draws

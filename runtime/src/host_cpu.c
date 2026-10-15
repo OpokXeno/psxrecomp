@@ -35,3 +35,11 @@ unsigned psx_host_available_cpu_count(unsigned fallback)
 #endif
     return fallback;
 }
+
+unsigned psx_host_worker_count(unsigned fallback, unsigned work_items)
+{
+    if (!work_items) return 0;
+    unsigned cpus = psx_host_available_cpu_count(fallback);
+    if (!cpus) cpus = 1;
+    return cpus < work_items ? cpus : work_items;
+}
