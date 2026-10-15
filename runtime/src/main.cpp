@@ -8098,17 +8098,17 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
                 std::fprintf(stderr,
                     "[FPS] game: %.1f fps (%.2fx) | frames: %llu | "
                     "guest=%.2f ms/f admit=%.2f ms/f replay=%.0f%% "
-                    "present_gap_p95=%u ms max=%u ms (n=%llu)\n",
+                    "present_gap_p95=%u ms max=%u ms (n=%llu) | shown: %.1f fps\n",
                     fps, speed, (unsigned long long)s_frame_count,
                     guest_ms, admit_ms, replay_pct,
                     (unsigned)gap_p95, (unsigned)gap_max,
-                    (unsigned long long)s_np_timing_frames);
+                    (unsigned long long)s_np_timing_frames, shown_fps);
                 s_np_admit_ticks = 0;
                 s_np_guest_ticks = 0;
                 s_np_timing_frames = 0;
             } else {
-                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
-                             fps, speed, (unsigned long long)s_frame_count);
+                std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu | shown: %.1f fps\n",
+                             fps, speed, (unsigned long long)s_frame_count, shown_fps);
             }
             std::fflush(stderr);
             s_fps_last_time = now;
