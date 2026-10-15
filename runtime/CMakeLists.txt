@@ -69,6 +69,9 @@ endif()
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    add_executable(host_cpu_test tests/test_host_cpu.c src/host_cpu.c)
+    target_include_directories(host_cpu_test PRIVATE include)
+    add_test(NAME host_cpu_affinity COMMAND host_cpu_test)
     add_test(NAME overlay_pair_dedup_runtime
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_pair_dedup_runtime.py")
@@ -1068,7 +1071,7 @@ if(BUILD_TESTING)
         src/ram_provenance.c
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c
-        src/gpu_gl_renderer.c)
+        src/gpu_gl_renderer.c src/host_cpu.c)
     target_include_directories(gpu_gl_mask_order_test PRIVATE
         include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(gpu_gl_mask_order_test PRIVATE
@@ -1104,7 +1107,7 @@ if(BUILD_TESTING)
         src/ram_provenance.c
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c
-        src/gpu_gl_renderer.c)
+        src/gpu_gl_renderer.c src/host_cpu.c)
     target_include_directories(gpu_gl_peek_order_test PRIVATE
         include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(gpu_gl_peek_order_test PRIVATE
@@ -1139,7 +1142,7 @@ if(BUILD_TESTING)
         src/pgxp.cpp
         src/ws_aspect_cone_math.c
         src/ws_ui_group.c
-        src/gpu_gl_renderer.c)
+        src/gpu_gl_renderer.c src/host_cpu.c)
     target_include_directories(xg_render_gl_transaction_test PRIVATE
         include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(xg_render_gl_transaction_test PRIVATE

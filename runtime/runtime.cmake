@@ -468,6 +468,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/xenogears_scene.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_interpolation.c
     ${PSXRECOMP_ROOT}/runtime/src/host_time.c
+    ${PSXRECOMP_ROOT}/runtime/src/host_cpu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_ROOT}/runtime/src/sio.c
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
@@ -1564,6 +1565,10 @@ function(psxrecomp_add_runtime_target target)
                 target_link_options(${target} PRIVATE -fprofile-instr-generate)
             else()
                 set(_psx_pgo_profile "${_psx_pgo_dir}/default.profdata")
+                if(NOT EXISTS "${_psx_pgo_profile}")
+                    message(FATAL_ERROR
+                        "PSX_PGO=use requires a trained profile: ${_psx_pgo_profile}")
+                endif()
                 target_compile_options(${target} PRIVATE
                     "-fprofile-instr-use=${_psx_pgo_profile}"
                     -Wno-profile-instr-out-of-date

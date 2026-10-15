@@ -89,6 +89,7 @@
 #include "frame_interpolation.h"
 #include "host_osd.h"
 #include "host_time.h"
+#include "host_cpu.h"
 #include "frame_pacing.h"
 #include "psx_rewind.h"
 
@@ -100,9 +101,6 @@
 #endif
 #include <math.h>
 #include <stddef.h>
-#if defined(__linux__)
-#include <sched.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16073,12 +16071,7 @@ static int native_phase_pool_start(void) {
     GlNativePhasePool *pool = &s_native_phase_pool;
     if (pool->attempted) return pool->run;
     pool->attempted = 1;
-    uint32_t workers = SDL_GetCPUCount();
-#if defined(__linux__)
-    cpu_set_t allowed;
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
-        workers = (uint32_t)CPU_COUNT(&allowed);
-#endif
+    uint32_t workers = psx_host_available_cpu_count((unsigned)SDL_GetCPUCount());
     if (!workers) return 0;
     if (workers > GL_NATIVE_PHASE_WORKERS) workers = GL_NATIVE_PHASE_WORKERS;
     pool->mutex = SDL_CreateMutex();
