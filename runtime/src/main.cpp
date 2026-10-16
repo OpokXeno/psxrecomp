@@ -6,6 +6,7 @@
  */
 
 #include "cpu_state.h"
+#include "host_time.h"
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
 #include "psx_fiber.h"
 #include "parity_trace.h"    /* general two-process control-flow parity ring */
@@ -757,6 +758,24 @@ static bool native_presenter_thread_requested() {
     return !(value && value[0] == '0');
 }
 
+/* Windows sleeps overshoot by several tenths of a millisecond per call, more
+ * than the margin the display-locked cadence leaves (period/32). That pushed a
+ * 165 FPS target on a 165 Hz panel down to ~150 presents per second. Sleep on
+ * a high-resolution timer and spin the final stretch. */
+static void native_presenter_wait(uint64_t wait_ns) {
+#if defined(_WIN32)
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::nanoseconds(wait_ns);
+    constexpr uint64_t spin_ns = 1000000u;
+    if (wait_ns > spin_ns)
+        psx_host_sleep_micros(static_cast<unsigned>((wait_ns - spin_ns) / 1000u));
+    while (clock::now() < deadline)
+        std::this_thread::yield();
+#else
+    std::this_thread::sleep_for(std::chrono::nanoseconds(wait_ns));
+#endif
+}
+
 static int native_presenter_thread_main(void *) {
     XgRenderPresentationHost *host = g_native_render_presentation_host;
     if (!gl_renderer_native_presenter_thread_begin()) {
@@ -778,8 +797,7 @@ static int native_presenter_thread_main(void *) {
         }
         /* Short slices keep stop requests responsive. */
         if (wait_ns != 0u)
-            std::this_thread::sleep_for(std::chrono::nanoseconds(
-                std::min<uint64_t>(wait_ns, 2000000u)));
+            native_presenter_wait(std::min<uint64_t>(wait_ns, 2000000u));
     }
     gl_renderer_native_presenter_thread_end();
     return 0;
