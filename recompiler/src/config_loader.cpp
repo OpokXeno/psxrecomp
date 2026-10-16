@@ -2376,6 +2376,21 @@ static bool valid_user_audio_freq(int n) {
     return n == 32040 || n == 32000 || n == 44100 || n == 48000;
 }
 
+// Paths are stored as UTF-8: the ANSI code page cannot hold every filename on
+// Windows, and path::string() throws for the ones it cannot.
+static std::string path_to_utf8(const fs::path& p) {
+    const auto u = p.generic_u8string();
+    return std::string(u.begin(), u.end());
+}
+
+static fs::path path_from_utf8(const std::string& s) {
+#if defined(__cpp_char8_t)
+    return fs::path(std::u8string(s.begin(), s.end()));
+#else
+    return fs::u8path(s);
+#endif
+}
+
 UserSettings load_user_settings(const fs::path& path) {
     UserSettings s;
     std::error_code ec;
@@ -2383,7 +2398,9 @@ UserSettings load_user_settings(const fs::path& path) {
 
     toml::value doc;
     try {
-        doc = toml::parse(path.string());
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) throw std::runtime_error("cannot open settings file");
+        doc = toml::parse(in, "settings.toml");
     } catch (const std::exception&) {
         // Malformed file: fall back to all-defaults rather than refuse to boot,
         // but tell the caller so the user hears about it (and so the file can
@@ -2693,14 +2710,14 @@ UserSettings load_user_settings(const fs::path& path) {
         const toml::value& b = toml::find(doc, "bios");
         if (b.contains("path")) try_get([&]{
             const auto p = toml::find<std::string>(b, "path");
-            if (!p.empty()) { s.bios_path = fs::path(p); s.has_bios_path = true; }
+            if (!p.empty()) { s.bios_path = path_from_utf8(p); s.has_bios_path = true; }
         });
     }
     if (doc.contains("disc")) {
         const toml::value& d = toml::find(doc, "disc");
         if (d.contains("path")) try_get([&]{
             const auto p = toml::find<std::string>(d, "path");
-            if (!p.empty()) { s.disc_path = fs::path(p); s.has_disc_path = true; }
+            if (!p.empty()) { s.disc_path = path_from_utf8(p); s.has_disc_path = true; }
         });
         /* Multi-disc selection, 1-based. Anything below 1 is a malformed
          * hand-edit, not a request to boot disc 0 -- clamp up and keep going
@@ -2716,15 +2733,15 @@ UserSettings load_user_settings(const fs::path& path) {
         const toml::value& m = toml::find(doc, "memcard");
         if (m.contains("dir")) try_get([&]{
             const auto p = toml::find<std::string>(m, "dir");
-            if (!p.empty()) { s.memcard_dir = fs::path(p); s.has_memcard_dir = true; }
+            if (!p.empty()) { s.memcard_dir = path_from_utf8(p); s.has_memcard_dir = true; }
         });
         if (m.contains("card1")) try_get([&]{
             const auto p = toml::find<std::string>(m, "card1");
-            if (!p.empty()) { s.memcard1_path = fs::path(p); s.has_memcard1_path = true; }
+            if (!p.empty()) { s.memcard1_path = path_from_utf8(p); s.has_memcard1_path = true; }
         });
         if (m.contains("card2")) try_get([&]{
             const auto p = toml::find<std::string>(m, "card2");
-            if (!p.empty()) { s.memcard2_path = fs::path(p); s.has_memcard2_path = true; }
+            if (!p.empty()) { s.memcard2_path = path_from_utf8(p); s.has_memcard2_path = true; }
         });
         if (m.contains("enable1")) try_get([&]{
             s.memcard1_enabled = toml::find<bool>(m, "enable1"); s.has_memcard1_enabled = true;
@@ -2836,14 +2853,15 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (!path.parent_path().empty())
         fs::create_directories(path.parent_path(), ec);  // best-effort
 
-    std::ofstream f(path, std::ios::trunc);
+    // Write beside the target and rename over it, so a crash or a full disk
+    // cannot leave a truncated settings.toml.
+    fs::path tmp_path = path;
+    tmp_path += ".tmp";
+    std::ofstream f(tmp_path, std::ios::trunc);
     if (!f.is_open()) return false;
 
     // TOML strings use forward slashes so backslash escaping is never an issue.
-    auto fwd = [](const fs::path& p) {
-        std::string str = p.generic_string();
-        return str;
-    };
+    auto fwd = [](const fs::path& p) { return path_to_utf8(p); };
 
     f << "# psxrecomp user settings - written by the launcher. Safe to hand-edit.\n";
     f << "# Overrides the bundled game.toml; the command line overrides this file.\n\n";
@@ -3055,7 +3073,16 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "extra_late = " << s.parappa_timing_extra_late << "\n";
     }
 
-    return f.good();
+    f.flush();
+    const bool wrote = f.good();
+    f.close();
+    ec.clear();
+    if (wrote) fs::rename(tmp_path, path, ec);
+    if (!wrote || ec) {
+        fs::remove(tmp_path, ec);
+        return false;
+    }
+    return true;
 }
 
 bool upsert_game_toml_controller_bool(const std::filesystem::path& path,

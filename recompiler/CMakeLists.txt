@@ -1049,6 +1049,21 @@ target_link_libraries(reachable_discovery_test PRIVATE fmt)
     target_link_libraries(rewind_settings_test PRIVATE fmt)
     add_test(NAME rewind_settings_test COMMAND rewind_settings_test)
 
+    # settings.toml save/load round trip (fps table, non-ASCII paths, atomic save).
+    add_executable(settings_persistence_test
+        tests/settings_persistence_test.cpp
+        src/config_loader.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(settings_persistence_test PRIVATE
+        include
+        src
+        lib/fmt/include
+        lib/toml11
+    )
+    target_link_libraries(settings_persistence_test PRIVATE fmt)
+    add_test(NAME settings_persistence_test COMMAND settings_persistence_test)
+
     # Needs bios/SCPH1001.toml — run from the framework root.
     add_test(NAME bios_address_model_test
              COMMAND bios_address_model_test
