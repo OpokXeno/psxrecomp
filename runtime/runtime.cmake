@@ -1692,6 +1692,34 @@ function(psxrecomp_add_runtime_target target)
     file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/psxrecomp_exe_name-${target}.txt"
          CONTENT "$<TARGET_FILE_BASE_NAME:${target}>\n")
 
+    # ---- Windows UTF-8 code page ------------------------------------------
+    # With the process ANSI code page set to UTF-8 (Windows 10 1903+), narrow
+    # path conversions (path::string(), fopen, argv) no longer throw or mangle
+    # characters outside the system code page, e.g. an install folder with CJK
+    # or accented characters. Older Windows ignores the element.
+    if(WIN32)
+        set(_psxrt_manifest "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8.manifest")
+        file(WRITE "${_psxrt_manifest}"
+"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">
+  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">
+    <windowsSettings>
+      <activeCodePage xmlns=\"http://schemas.microsoft.com/SMI/2019/WindowsSettings\">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
+")
+        if(MSVC)
+            target_sources(${target} PRIVATE "${_psxrt_manifest}")
+        else()
+            enable_language(RC)
+            string(REPLACE "\\" "/" _psxrt_manifest_fwd "${_psxrt_manifest}")
+            set(_psxrt_manifest_rc "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8_manifest.rc")
+            file(WRITE "${_psxrt_manifest_rc}" "1 24 \"${_psxrt_manifest_fwd}\"\n")
+            target_sources(${target} PRIVATE "${_psxrt_manifest_rc}")
+        endif()
+    endif()
+
     # ---- Windows / desktop app icon ---------------------------------------
     # Prefer an explicit APP_ICON, then the game-repo copy under assets/, then
     # the framework default shipped in psxrecomp/assets (Retro-themed pad).
