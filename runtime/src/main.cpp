@@ -16981,9 +16981,8 @@ int main(int argc, char** argv) {
                     if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
                 }
                 g_video_win_w = seed.window_width;
-                /* Persist the user's choices next to the exe. */
-                PSXRecompV4::save_user_settings(
-                    exe_dir_from_argv(argv[0]) / "settings.toml", seed);
+                /* Persist the user's choices to the settings file in use. */
+                PSXRecompV4::save_user_settings(s_fast_map_settings_path, seed);
             }
         }
     }
@@ -19081,8 +19080,7 @@ soft_return_lobby:
             /* Persist controller (and rematch video) choices without wiping
              * the rest of settings.toml — merge into the on-disk file. */
             {
-                const auto settings_path =
-                    exe_dir_from_argv(argv[0]) / "settings.toml";
+                const auto settings_path = s_fast_map_settings_path;
                 PSXRecompV4::UserSettings us =
                     PSXRecompV4::load_user_settings(settings_path);
                 const int un = std::min(PSX_MAX_PLAYERS,
