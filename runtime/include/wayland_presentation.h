@@ -12,6 +12,7 @@ typedef struct PsxWaylandPresentationEvent {
     uint32_t refresh_ns;
     uint32_t flags;
     uint8_t presented;
+    uint64_t request_ns;
 } PsxWaylandPresentationEvent;
 
 typedef struct PsxWaylandPresentationDiagnostics {
@@ -22,6 +23,9 @@ typedef struct PsxWaylandPresentationDiagnostics {
     uint32_t clock_id;
     int wayland_window;
     int protocol_available;
+    uint64_t latency_count;
+    uint64_t latency_sum_ns;
+    uint64_t latency_hist[8];
 } PsxWaylandPresentationDiagnostics;
 
 typedef void (*PsxWaylandPresentationCallback)(

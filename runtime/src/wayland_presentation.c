@@ -12,10 +12,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct PendingFeedback {
     struct wp_presentation_feedback *feedback;
     uint64_t swap_sequence;
+    uint64_t request_ns;
     struct PendingFeedback *next;
 } PendingFeedback;
 
@@ -27,6 +29,7 @@ static PendingFeedback *s_pending;
 static PsxWaylandPresentationCallback s_callback;
 static void *s_callback_opaque;
 static PsxWaylandPresentationDiagnostics s_diagnostics;
+static int s_clock_id_known;
 
 static void feedback_remove(PendingFeedback *pending) {
     PendingFeedback **link = &s_pending;
@@ -60,8 +63,22 @@ static void feedback_presented(
     event.refresh_ns = refresh;
     event.flags = flags;
     event.presented = 1u;
+    event.request_ns = pending->request_ns;
     feedback_remove(pending);
     s_diagnostics.presented++;
+    if (pending->request_ns != 0u &&
+            event.presentation_time_ns >= pending->request_ns) {
+        uint64_t lat = event.presentation_time_ns - pending->request_ns;
+        uint64_t bucket = 7u;
+
+        if (event.refresh_ns != 0u) {
+            bucket = (lat + event.refresh_ns / 2u) / event.refresh_ns;
+            if (bucket > 7u) bucket = 7u;
+        }
+        s_diagnostics.latency_count++;
+        s_diagnostics.latency_sum_ns += lat;
+        s_diagnostics.latency_hist[bucket]++;
+    }
     if (s_callback) s_callback(&event, s_callback_opaque);
     wp_presentation_feedback_destroy(feedback);
     free(pending);
@@ -73,6 +90,7 @@ static void feedback_discarded(
     PsxWaylandPresentationEvent event = {0};
 
     event.swap_sequence = pending->swap_sequence;
+    event.request_ns = pending->request_ns;
     feedback_remove(pending);
     s_diagnostics.discarded++;
     if (s_callback) s_callback(&event, s_callback_opaque);
@@ -91,6 +109,7 @@ static void presentation_clock_id(
     (void)data;
     (void)presentation;
     s_diagnostics.clock_id = clock_id;
+    s_clock_id_known = 1;
 }
 
 static const struct wp_presentation_listener s_presentation_listener = {
@@ -186,6 +205,7 @@ void psx_wayland_presentation_shutdown(void) {
     s_pending = NULL;
     s_callback = NULL;
     s_callback_opaque = NULL;
+    s_clock_id_known = 0;
     memset(&s_diagnostics, 0, sizeof(s_diagnostics));
 }
 
@@ -195,6 +215,18 @@ int psx_wayland_presentation_request(uint64_t swap_sequence) {
     if (!s_presentation || !s_surface) return 0;
     pending = (PendingFeedback *)calloc(1u, sizeof(*pending));
     if (!pending) return 0;
+    {
+        struct timespec ts;
+        clockid_t clock = s_clock_id_known
+            ? (clockid_t)s_diagnostics.clock_id : CLOCK_MONOTONIC;
+
+        if (clock_gettime(clock, &ts) == 0) {
+            pending->request_ns = (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
+                (uint64_t)ts.tv_nsec;
+        } else {
+            pending->request_ns = 0u;
+        }
+    }
     pending->feedback = wp_presentation_feedback(s_presentation, s_surface);
     if (!pending->feedback) {
         free(pending);

@@ -22,6 +22,11 @@ extern "C" {
 /* Create the GL context on a window made with SDL_WINDOW_OPENGL.
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
+/* Visible window (s_win, for size, input and Wayland) plus the window that
+ * owns every GL context (s_gl_drawable). Equal to gl_renderer_init_context
+ * when no Vulkan present owns the visible window. */
+int  gl_renderer_init_context_split(struct SDL_Window *window, struct SDL_Window *gl_drawable);
+struct SDL_Window *gl_renderer_gl_drawable(void);
 /* Select a retained immutable bank for the next textured submission; zero
  * selects live VRAM. Emulation/GL owning thread only. Returns 0 if unavailable. */
 int gl_renderer_select_texture_bank(uint16_t id);
@@ -110,6 +115,8 @@ int gl_renderer_native_service_pending(void);
  * Native worker later compares it, by full presentation identity, with the
  * independently compiled endpoint. */
 int gl_renderer_native_guest_reference_enabled(void);
+/* Cumulative GPU ns/count per pass (base_draws, phase_draws, scanout, present_compose); PSX_NATIVE_GPU_PROFILE=1. */
+void gl_renderer_gpu_profile(uint64_t ns[4], uint64_t count[4], uint64_t fragments[4], int *enabled);
 int gl_renderer_native_capture_guest_reference(
     uint64_t guest_vblank_sequence, uint64_t guest_cycle);
 
@@ -314,6 +321,7 @@ typedef struct GlRendererNativeGpuDiagnostics {
     uint64_t filter_draws[2][2];
     /* Destination reads that needed no barrier (no write overlapped them). */
     uint64_t skipped_barriers;
+    uint64_t scheduled_layers; /* layers of barrier-scheduled DRAW runs */
     /* Native depth test on the GPU: triangles depth-tested, and optional samples
      * passed (PSX_NATIVE_DEPTH_STATS=1, GL_SAMPLES_PASSED at render scale). */
     uint64_t depth_tested_triangles, depth_samples_passed;

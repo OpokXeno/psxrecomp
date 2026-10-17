@@ -48,6 +48,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "hd_texture_runtime.h"
 #include "gpu_gl_renderer.h"
 #include "native_present_cadence.h"
+#include "native_vk_present.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
 #define STBI_NO_STDIO
 #include "../third_party/stb_image.h"
@@ -491,6 +492,9 @@ extern "C" uint8_t  psx_guest_read_byte(uint32_t addr);
 extern "C" {
 SDL_Window* sdl_window = nullptr;
 }
+/* Hidden OpenGL window owning every GL context while the visible window is a
+ * Vulkan window (Native presents through nvp). Null otherwise. */
+static SDL_Window *g_gl_drawable = nullptr;
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
 /* Per-player input device routing (PSX ports 1 & 2). Seeded from the
@@ -4368,6 +4372,8 @@ static void apply_present_cadence(void) {
     const int interval = present_effective_swap_interval();
     if (g_gl_active)
         gl_renderer_set_swap_interval(interval);
+    if (nvp_active())
+        nvp_set_present_policy(interval, g_video_vsync);
     /* Vsync, panel and presenter threading all decide the native tick. */
     if (g_native_render_selected && g_native_render_presentation_host)
         (void)xg_render_presentation_host_set_period(
@@ -4405,10 +4411,11 @@ extern "C" void psx_video_set_vsync(int mode) {
 static void log_present_cadence(void) {
     if (g_native_render_selected) {
         std::printf("psxrecomp: Native cadence: 33.8688 MHz guest clock, "
-                    "independent %.1f Hz presenter, target %d%s, swap interval %d\n",
+                    "independent %.1f Hz presenter, target %d%s, swap interval %d%s\n",
                     (double)(g_video_fps == 30 ? 60 : g_video_fps),
                     g_video_fps, g_video_fps == 30 ? " (Original)" : " FPS",
-                    present_effective_swap_interval());
+                    present_effective_swap_interval(),
+                    nvp_active() ? ", Vulkan swapchain" : "");
     } else if (present_vsync_owns_cadence()) {
         /* The pacer still runs underneath as a deadline cap (see
          * present_should_wall_pace) -- a no-op whenever the swap actually
@@ -4562,6 +4569,12 @@ static void teardown_game_session_keep_lobby(void) {
     }
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
+    nvp_shutdown();
+    if (g_gl_drawable) {
+        (void)SDL_GL_MakeCurrent(g_gl_drawable, nullptr);
+        SDL_DestroyWindow(g_gl_drawable);
+        g_gl_drawable = nullptr;
+    }
     if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
     if (sdl_pixel_buf) { std::free(sdl_pixel_buf); sdl_pixel_buf = nullptr; }
     /* Rematch must re-run force_sw (and prefer CPU-auth GL present again). */
@@ -17694,10 +17707,48 @@ session_reboot:
     }
 #endif
 
+    /* Resolve Native before the window flags, host refresh and GL setup. Its
+     * guest clock must never inherit monitor timing or start the legacy
+     * interpolation thread. */
+    g_native_render_selected =
+        native_render_mode_resolve(
+            config_render_mode.c_str(), std::getenv("PSX_NATIVE_RENDER_MODE"),
+            cli_render_mode) == GUEST_RENDER_RENDER_NATIVE;
+
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    /* Native with the GL renderer presents through a Vulkan swapchain when the
+     * nvp probe succeeds. The visible window is then a Vulkan window, and every
+     * GL context lives on a hidden OpenGL drawable created here. */
+    if (g_video_renderer == 1 && g_native_render_selected) {
+        configure_core_gl_context_attributes();
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        g_gl_drawable = SDL_CreateWindow(
+            "XenogearsRecomp GL",
+            SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+            1, 1,
+            SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN
+        );
+        if (g_gl_drawable) {
+            bool vk_present = false;
+            SDL_GLContext probe_ctx = SDL_GL_CreateContext(g_gl_drawable);
+            if (probe_ctx) {
+                if (SDL_GL_MakeCurrent(g_gl_drawable, probe_ctx) == 0) {
+                    vk_present = nvp_probe() != 0;
+                    (void)SDL_GL_MakeCurrent(g_gl_drawable, nullptr);
+                }
+                SDL_GL_DeleteContext(probe_ctx);
+            }
+            if (!vk_present) {
+                SDL_DestroyWindow(g_gl_drawable);
+                g_gl_drawable = nullptr;
+            }
+        }
+    }
+    bool vk_window = g_gl_drawable != nullptr;
     if (g_video_renderer == 1) {
         configure_core_gl_context_attributes();
-        win_flags |= SDL_WINDOW_OPENGL;
+        win_flags |= vk_window ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL;
     }
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
     /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
@@ -17716,24 +17767,35 @@ session_reboot:
         present_aspect(&num, &den);
         clamp_window_aspect(&game_w, &game_h, num, den);
     }
-    sdl_window = SDL_CreateWindow(
-        window_title.c_str(),
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        game_w, game_h,
-        win_flags
-    );
+    const auto create_game_window = [&](decltype(win_flags) flags) {
+        return SDL_CreateWindow(
+            window_title.c_str(),
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            game_w, game_h,
+            flags
+        );
+    };
+    sdl_window = create_game_window(win_flags);
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
     }
     psx_apply_window_icon(sdl_window, argv[0]);
-
-    /* Resolve Native before host refresh and GL setup. Its guest clock must
-     * never inherit monitor timing or start the legacy interpolation thread. */
-    g_native_render_selected =
-        native_render_mode_resolve(
-            config_render_mode.c_str(), std::getenv("PSX_NATIVE_RENDER_MODE"),
-            cli_render_mode) == GUEST_RENDER_RENDER_NATIVE;
+    if (vk_window && !nvp_attach_window(sdl_window)) {
+        /* Vulkan present unavailable: recreate the visible window as the
+         * plain OpenGL window and drop the hidden drawable. */
+        std::printf("psxrecomp: Vulkan present unavailable; using OpenGL window\n");
+        SDL_DestroyWindow(sdl_window);
+        sdl_window = create_game_window((win_flags & ~SDL_WINDOW_VULKAN) | SDL_WINDOW_OPENGL);
+        if (!sdl_window) {
+            std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+            return 1;
+        }
+        psx_apply_window_icon(sdl_window, argv[0]);
+        SDL_DestroyWindow(g_gl_drawable);
+        g_gl_drawable = nullptr;
+        vk_window = false;
+    }
 
     /* Maximise instead of computing the frame size ourselves.
      *
@@ -17761,7 +17823,11 @@ session_reboot:
      * this phase) and fall through to the SDL_Renderer present path below. */
     if (g_video_renderer == 1) {
         gl_renderer_set_swap_interval(present_effective_swap_interval()); /* applied at context init */
-        g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+        nvp_set_present_policy(present_effective_swap_interval(), g_video_vsync);
+        g_gl_active = (nvp_active()
+            ? gl_renderer_init_context_split(sdl_window, g_gl_drawable)
+            : gl_renderer_init_context(sdl_window)) != 0;
+        if (!g_gl_active && nvp_active()) nvp_shutdown();
 
         /* Bezel artwork (Mods): load after the GL context exists. */
         if (!g_bezel_path.empty() && g_gl_active) {
@@ -18752,6 +18818,12 @@ session_reboot:
     if (g_vk_active) vk_renderer_shutdown();
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
+    nvp_shutdown();
+    if (g_gl_drawable) {
+        (void)SDL_GL_MakeCurrent(g_gl_drawable, nullptr);
+        SDL_DestroyWindow(g_gl_drawable);
+        g_gl_drawable = nullptr;
+    }
     SDL_DestroyWindow(sdl_window);
     SDL_Quit();
 

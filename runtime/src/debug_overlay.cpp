@@ -3834,6 +3834,9 @@ static bool tools_window_ensure(SDL_Window *game_win, SDL_GLContext game_ctx)
 
 static void prepare_overlay()
 {
+    /* The window that owns the current GL context may be a hidden GL drawable
+     * (Vulkan-presented Native), not s_win, so restore to the entry window. */
+    SDL_Window *const entry_win = SDL_GL_GetCurrentWindow();
     /* Step 1: lazy init. */
     if (!s_imgui_ready && !s_legacy_inline) {
         if (!s_win) return; /* not initialized at all — try next frame */
@@ -3843,13 +3846,13 @@ static void prepare_overlay()
         /* Prefer the independent tools window; fall back to the legacy
          * in-game render when it cannot be created (headless/GL limits).
          * Either way s_imgui_ready gates the UI below. */
-        if (tools_window_ensure(s_win, ctx)) {
+        if (tools_window_ensure(entry_win, ctx)) {
             /* Backend init builds GL objects: hold the tools context. */
             SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx);
             if (!imgui_init_for(s_tools_win, s_tools_ctx)) {
                 /* Tools GL broken after window creation — tear it down and
                  * try the legacy path next frame. */
-                SDL_GL_MakeCurrent(s_win, ctx);
+                SDL_GL_MakeCurrent(entry_win, ctx);
                 SDL_GL_DeleteContext(s_tools_ctx);
                 SDL_DestroyWindow(s_tools_win);
                 s_tools_ctx = nullptr;
@@ -3857,7 +3860,7 @@ static void prepare_overlay()
                 s_separate_ready = false;
                 return;
             }
-            SDL_GL_MakeCurrent(s_win, ctx);
+            SDL_GL_MakeCurrent(entry_win, ctx);
         } else if (!imgui_init_for(s_win, ctx)) {
             /* Init failed — roll back and try again next frame. */
             return;
@@ -4054,8 +4057,13 @@ void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
 
 void psx_debug_overlay_present_observe(void)
 {
+    psx_debug_overlay_present_observe_target(0u);
+}
+
+void psx_debug_overlay_present_observe_target(unsigned int framebuffer)
+{
     gpu_state_sample_rates();
-    overlay_window_shot(0u);
+    overlay_window_shot((GLuint)framebuffer);
 }
 
 void psx_debug_overlay_service_main(void)

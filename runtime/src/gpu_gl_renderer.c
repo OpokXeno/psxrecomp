@@ -71,6 +71,7 @@
 #include "gpu_semantic_workload.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "native_vk_present.h"
 #include "gpu_vram_region_set.h"
 #include "psx_render_nclip.h"
 #include "xg_render_motion.h"
@@ -413,6 +414,7 @@ static int load_modern_gl(void) {
 
 /* ---- state ------------------------------------------------------------- */
 static SDL_Window   *s_win = NULL;
+static SDL_Window   *s_gl_drawable = NULL;
 static SDL_GLContext s_ctx = NULL;
 static SDL_GLContext s_native_presenter_ctx = NULL;
 static SDL_GLContext s_native_gpu_ctx;
@@ -560,11 +562,14 @@ static int gl_swap_window_private(GlSwapCaller caller) {
          s_swap_owner_thread = current;
         allowed = 1;
     }
-    if (allowed && !native_path) SDL_GL_SwapWindow(s_win);
+    if (allowed && !native_path && !nvp_active()) SDL_GL_SwapWindow(s_win);
     SDL_UnlockMutex(s_swap_owner_mutex);
     /* SDL3 requires the Native swap on the window-owning thread.  Do not keep the
      * Native ownership mutex held while the compositor/driver may block. */
-    if (allowed && native_path) SDL_GL_SwapWindow(s_win);
+    if (allowed && native_path) {
+        if (nvp_active()) allowed = nvp_present();
+        else SDL_GL_SwapWindow(s_win);
+    }
     return allowed;
 }
 
@@ -1346,6 +1351,8 @@ static SDL_mutex *s_native_presenter_context_mutex;
 static GlNativeEndpointSlot s_native_endpoints[GL_NATIVE_ENDPOINT_CAPACITY];
 static GlNativeFenceSlot s_native_fences[GL_NATIVE_FENCE_CAPACITY];
 static GLuint s_native_presenter_vao;
+/* Framebuffer the Native presenter composed into this frame (0 = window). */
+static GLuint s_native_present_target_fbo;
 static GLuint s_native_presenter_prog;
 static GLint s_native_presenter_u_tex = -1;
 static GLint s_native_presenter_u_uv_rect = -1;
@@ -1803,15 +1810,13 @@ static void native_depth_clear_rows(uint32_t *depth, size_t pitch, int x, int y,
 #define GL_NATIVE_GPU_PHASE_BASE (GL_NATIVE_VIEW_TARGET_CAPACITY + 1u)
 #define GL_NATIVE_GPU_PLANES (GL_NATIVE_GPU_PHASE_BASE + GL_NATIVE_MOTION_PHASE_CAPACITY)
 /* depth: optional R32UI COLOR_ATTACHMENT1 (Native depth keys; 0 = far).
- * Dirty tiles conservatively cover physical draw bboxes since the barrier.
- * A bounding union alone falsely makes distant triangles overlap. Epochs
- * clear the small tile map without a full memset at every texture barrier. */
+ * Non-interlock: hazards holds the exact geometry written since the last
+ * texture barrier (lazy); dirty_all = unknown writes, every read barriers. */
 typedef struct GlNativeGpuPlane {
     GLuint texture, framebuffer, depth;
-    uint32_t width, height, tile_width, tile_height, dirty_serial;
-    int dirty[4], dirty_all;
-    uint64_t dirty_tiles[64][2];
-    uint32_t dirty_epochs[64][2];
+    uint32_t width, height;
+    int dirty_all;
+    struct GlNativeGpuHazards *hazards;
 } GlNativeGpuPlane;
 typedef enum GlNativeGpuOp { NATIVE_GPU_SEED, NATIVE_GPU_DRAW, NATIVE_GPU_WORDS, NATIVE_GPU_SNAPSHOT, NATIVE_GPU_SPAN,
     NATIVE_GPU_WORDS_RESET, NATIVE_GPU_BASE, NATIVE_GPU_CANONICAL_READBACK, NATIVE_GPU_TEMPLATE,
@@ -2076,6 +2081,7 @@ typedef struct GlNativeGpuWork {
     uint64_t submitted_ns, word_uploads, snapshot_commands;
     uint64_t destination_barriers, destination_copies;
     uint64_t skipped_barriers;       /* destination reads with no overlapping write */
+    uint64_t scheduled_layers;       /* barrier-separated layers of scheduled DRAW runs */
     int depth_view;                  /* GL_NATIVE_DEPTH_VIEW_* captured at creation */
     int wireframe;                   /* debug wireframe captured at creation */
     int depth_view_log[2];           /* depth view range: log2 of min/max key, x256 */
@@ -3073,9 +3079,10 @@ static void pres_hash_issue_readback(uint64_t sequence, GLuint source_fbo,
         s_present_hash_requested++;
 }
 
-static void pres_hash_issue(uint64_t sequence, int width, int height) {
+static void pres_hash_issue(uint64_t sequence, GLuint source_fbo,
+                            int width, int height) {
     pres_hash_issue_readback(
-        sequence, 0, 0, 0, width, height, GL_PRESENT_HASH_FRAMEBUFFER);
+        sequence, source_fbo, 0, 0, width, height, GL_PRESENT_HASH_FRAMEBUFFER);
 }
 
 static void pres_source_hash_issue(uint64_t sequence, GLuint source_fbo,
@@ -7502,7 +7509,7 @@ static int native_context_enter(void) {
          * against init/shutdown. */
         SDL_LockMutex(s_native_presenter_context_mutex);
         if (SDL_GL_GetCurrentContext() == s_native_presenter_ctx ||
-            SDL_GL_MakeCurrent(s_win, s_native_presenter_ctx) == 0)
+            SDL_GL_MakeCurrent(s_gl_drawable, s_native_presenter_ctx) == 0)
             return 1;
         SDL_UnlockMutex(s_native_presenter_context_mutex);
         return 0;
@@ -7511,14 +7518,14 @@ static int native_context_enter(void) {
         /* Mutex already held. Revalidate in case anything switched contexts. */
         s_native_presenter_ctx_retained = 0;
         if (SDL_GL_GetCurrentContext() == s_native_presenter_ctx ||
-            SDL_GL_MakeCurrent(s_win, s_native_presenter_ctx) == 0)
+            SDL_GL_MakeCurrent(s_gl_drawable, s_native_presenter_ctx) == 0)
             return 1;
-        (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+        (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
         SDL_UnlockMutex(s_native_presenter_context_mutex);
         return 0;
     }
     SDL_LockMutex(s_native_presenter_context_mutex);
-    if (SDL_GL_MakeCurrent(s_win, s_native_presenter_ctx) != 0) {
+    if (SDL_GL_MakeCurrent(s_gl_drawable, s_native_presenter_ctx) != 0) {
         SDL_UnlockMutex(s_native_presenter_context_mutex);
         return 0;
     }
@@ -7531,7 +7538,7 @@ static void native_context_leave(void) {
      * thread restore the legacy renderer context instead of leaving the
      * window contextless (SDL3 transitions stay on the recorded thread). */
     if (!native_presenter_threaded())
-        (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+        (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
     SDL_UnlockMutex(s_native_presenter_context_mutex);
 }
 
@@ -7570,7 +7577,7 @@ int gl_renderer_native_main_detach_window(void) {
 
 void gl_renderer_native_main_attach_window(void) {
     if (!native_is_main_thread() || !s_win || !s_ctx) return;
-    (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
 }
 
 /* Main-thread UI (runtime menu layer, debug tools window) gets its own shared
@@ -7624,7 +7631,7 @@ int gl_renderer_native_presenter_thread_begin(void) {
     if (!s_win || !s_native_presenter_ctx || !s_native_presenter_context_mutex)
         return 0;
     SDL_LockMutex(s_native_presenter_context_mutex);
-    const int ok = SDL_GL_MakeCurrent(s_win, s_native_presenter_ctx) == 0;
+    const int ok = SDL_GL_MakeCurrent(s_gl_drawable, s_native_presenter_ctx) == 0;
     if (ok) __atomic_store_n(&s_native_presenter_thread, (uint64_t)SDL_ThreadID(), __ATOMIC_RELEASE);
     SDL_UnlockMutex(s_native_presenter_context_mutex);
     return ok;
@@ -7633,7 +7640,7 @@ int gl_renderer_native_presenter_thread_begin(void) {
 void gl_renderer_native_presenter_thread_end(void) {
     if (!native_presenter_threaded() || !native_is_presenter_thread()) return;
     SDL_LockMutex(s_native_presenter_context_mutex);
-    (void)SDL_GL_MakeCurrent(s_win, NULL);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable, NULL);
     __atomic_store_n(&s_native_presenter_thread, (uint64_t)0u, __ATOMIC_RELEASE);
     SDL_UnlockMutex(s_native_presenter_context_mutex);
 }
@@ -14782,16 +14789,23 @@ static int native_recipe_render_rows(const GlNativeRecipe *recipe, const GlNativ
         const uint16_t raster_width = use_view ? (uint16_t)width : VRAM_W;
         gpu->widths[GL_NATIVE_GPU_PHASE_BASE+phase] = raster_width;
         gpu->heights[GL_NATIVE_GPU_PHASE_BASE+phase] = VRAM_H;
+        /* The phase scanout reads only rows phase_crop_y (origin_y + crop_y)
+         * through + height, and every draw is clipped to them below. Seed just
+         * those rows; the Field wave also reads source rows of its own plane. */
+        int seed_y = recipe->wave ? 0 : (int)recipe->origin_y + crop_y;
+        int seed_h = recipe->wave ? VRAM_H : height;
+        if (seed_y > VRAM_H) seed_y = VRAM_H;
+        if (seed_h > VRAM_H - seed_y) seed_h = VRAM_H - seed_y;
         if (gpu->capture_templates) {
             /* A geometry template has no framebuffer seed or transfer. */
         } else if (recipe->base_serial) {
-            /* Same raster domain as the captured VIEW plane: copy it whole,
-             * with its depth keys, exactly like a full-row VIEW copy. */
+            /* Same raster domain as the captured VIEW plane: copy its rows,
+             * with their depth keys, exactly like a full-row VIEW copy. */
             if (!use_view || recipe->base_slot >= GL_NATIVE_VIEW_TARGET_CAPACITY ||
-                !native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, raster_width, VRAM_H,
-                    GL_NATIVE_GPU_BASE_SOURCE + recipe->base_slot, 0, 0, raster_width, VRAM_H,
+                !native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, seed_y, raster_width, seed_h,
+                    GL_NATIVE_GPU_BASE_SOURCE + recipe->base_slot, 0, (float)seed_y, raster_width, (float)seed_h,
                     0u, recipe->depth_test ? 4u : 0u)) goto finished;
-        } else if (!native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, 0, raster_width, VRAM_H,
+        } else if (!native_gpu_span(gpu, GL_NATIVE_GPU_PHASE_BASE+phase, 0, seed_y, raster_width, seed_h,
             UINT32_MAX, 0,0,0,0,recipe->clear_color,0)) goto finished;
     }
     texture.view_valid = 1;
@@ -17921,6 +17935,7 @@ static void native_gpu_setup_init(void) {
 static uint16_t s_native_gpu_upload_words[VRAM_W * VRAM_H];
 static int s_native_gpu_upload_words_valid;
 static int s_native_gpu_interlock;
+static int s_native_gpu_scheduled_run; /* native_gpu_target leaves barriers to the layer scheduler */
 static GLuint s_native_gpu_parameter_buffer, s_native_gpu_parameter_texture;
 static GLint s_native_gpu_parameters_on, s_native_gpu_parameter_base, s_native_gpu_parameter_shared;
 static void native_gpu_batch_flush(void);
@@ -18560,7 +18575,42 @@ static const char *NATIVE_GPU_FS =
     "#endif\n"
     "}\n";
 
+/* Writes since the last texture barrier, as exact pixel-space shapes (one
+ * triangle or rectangle each). A uniform grid of small index lists finds
+ * candidates; a full cell is saturated (any query touching it overlaps) and
+ * shapes spanning many cells sit in a short linear list. Overflow of either
+ * sets plane->dirty_all instead. */
+#define NATIVE_HZ_SHAPES 4096u
+#define NATIVE_HZ_CELL 64u
+#define NATIVE_HZ_CELL_CAP 8u
+#define NATIVE_HZ_FULL 255u
+#define NATIVE_HZ_BIG 16u
+#define NATIVE_HZ_BIG_CELLS 32u
+#define NATIVE_HZ_MARGIN 0.0625f
+typedef struct GlNativeGpuShape {
+    float v[3][2], box[4], mag; /* pixels; box = x0,y0,x1,y1 */
+    float p[3][2], q[3], off;   /* raw vertex data, triangles only */
+    int tri;
+} GlNativeGpuShape;
+typedef struct GlNativeGpuHazards {
+    uint32_t count, big_count, touched_count, columns, rows;
+    uint16_t big[NATIVE_HZ_BIG];
+    uint8_t *cell_n;
+    uint16_t *cell_index;
+    uint32_t *touched;
+    GlNativeGpuShape shapes[NATIVE_HZ_SHAPES];
+} GlNativeGpuHazards;
+
+static void native_gpu_hazards_clear(GlNativeGpuHazards *hz) {
+    for (uint32_t i = 0; i < hz->touched_count; ++i) hz->cell_n[hz->touched[i]] = 0;
+    hz->touched_count = hz->count = hz->big_count = 0;
+}
+
 static void native_gpu_plane_free(GlNativeGpuPlane *plane) {
+    if (plane->hazards) {
+        free(plane->hazards->cell_n); free(plane->hazards->cell_index); free(plane->hazards->touched);
+        free(plane->hazards);
+    }
     if (plane->framebuffer && (SDL_GL_GetCurrentContext() == s_native_presenter_ctx || SDL_GL_GetCurrentContext()==s_native_gpu_ctx))
         p_glDeleteFramebuffers(1, &plane->framebuffer);
     if (plane->texture) glDeleteTextures(1, &plane->texture);
@@ -18575,16 +18625,12 @@ static int native_gpu_depth_supported(void) {
 /* Everything since the last barrier is unknown: the next destination read
  * barriers. Used at slice start and after any non-draw write (blit, clear). */
 static void native_gpu_plane_dirty_all(GlNativeGpuPlane *plane) {
-    plane->dirty[0] = plane->dirty[1] = 0;
-    plane->dirty[2] = plane->dirty[3] = INT_MAX;
     plane->dirty_all = 1;
 }
 
 static void native_gpu_plane_barrier_clear(GlNativeGpuPlane *plane) {
-    memset(plane->dirty, 0, sizeof(plane->dirty));
     plane->dirty_all = 0;
-    if (++plane->dirty_serial == 0u)
-        memset(plane->dirty_epochs, 0xff, sizeof(plane->dirty_epochs));
+    if (plane->hazards) native_gpu_hazards_clear(plane->hazards);
 }
 
 /* Attach (once) and clear-to-far the plane's R32UI depth attachment. */
@@ -18611,8 +18657,6 @@ static int native_gpu_plane_size(GlNativeGpuPlane *plane, uint32_t width, uint32
     native_gpu_plane_free(plane);
     plane->texture = make_tex(GL_RGBA8, (int)width, (int)height, GL_RGBA, GL_UNSIGNED_BYTE);
     plane->width = width; plane->height = height;
-    plane->tile_width = (width + 127u) / 128u;
-    plane->tile_height = (height + 63u) / 64u;
     return plane->texture && make_fbo(&plane->framebuffer, plane->texture, 0);
 }
 
@@ -18748,7 +18792,8 @@ static GLuint native_gpu_ordered_program(int generic) {
 static int native_gpu_program_init(void) {
     if (s_native_gpu_program) return 1;
     s_native_gpu_interlock = p_glBindImageTexture && p_glMemoryBarrier && p_glTexBuffer && p_glMultiDrawArrays &&
-        SDL_GL_ExtensionSupported("GL_ARB_fragment_shader_interlock");
+        SDL_GL_ExtensionSupported("GL_ARB_fragment_shader_interlock") &&
+        !(getenv("PSX_NATIVE_GPU_INTERLOCK") && getenv("PSX_NATIVE_GPU_INTERLOCK")[0]=='0');
     if (s_native_gpu_interlock) {
         const char *option=getenv("PSX_NATIVE_GENERIC_RASTER");
         s_native_gpu_program=native_gpu_ordered_program(option && option[0]=='1');
@@ -18932,62 +18977,270 @@ static int native_gpu_sync_initial_words(const void *words) {
  * buffer, and the draw samples the destination key. */
 enum { GL_NATIVE_GPU_DEPTH_ATTACHED = 1, GL_NATIVE_GPU_DEPTH_READ = 2 };
 
-static int native_gpu_rect_dirty(const GlNativeGpuPlane *plane, int x0, int y0, int x1, int y1) {
-    if (x0 >= x1 || y0 >= y1) return 0;
-    if (!(x0 < plane->dirty[2] && plane->dirty[0] < x1 && y0 < plane->dirty[3] && plane->dirty[1] < y1)) return 0;
-    if (plane->dirty_all) return 1;
-    const unsigned first_x = (unsigned)x0 / plane->tile_width;
-    const unsigned last_x = (unsigned)(x1 - 1) / plane->tile_width;
-    const unsigned first_y = (unsigned)y0 / plane->tile_height;
-    const unsigned last_y = (unsigned)(y1 - 1) / plane->tile_height;
-    for (unsigned word = first_x / 64u; word <= last_x / 64u; ++word) {
-        const unsigned lo = word == first_x / 64u ? first_x & 63u : 0u;
-        const unsigned hi = word == last_x / 64u ? last_x & 63u : 63u;
-        const uint64_t mask = gpu_vram_region_word_mask((int)lo, (int)hi);
-        for (unsigned row = first_y; row <= last_y; ++row)
-            if (plane->dirty_epochs[row][word] == plane->dirty_serial &&
-                (plane->dirty_tiles[row][word] & mask)) return 1;
+static int native_gpu_shape_tri(GlNativeGpuShape *s, const float *v0, const float *v1, const float *v2, float off, uint32_t scale) {
+    const float *v[3] = {v0, v1, v2};
+    for (int i = 0; i < 3; ++i) {
+        s->p[i][0] = v[i][0]; s->p[i][1] = v[i][1]; s->q[i] = v[i][GL_NATIVE_GPU_VERTEX_WEIGHT];
+        if (!(fabsf(s->p[i][0]) < 1e6f && fabsf(s->p[i][1]) < 1e6f)) return -1;
+    }
+    /* Repeated vertices rasterize nothing. Collinear distinct ones stay: float
+     * rounding in the vertex shader may give them a sliver of area. */
+    if (!memcmp(s->p[0], s->p[1], 8) || !memcmp(s->p[1], s->p[2], 8) || !memcmp(s->p[0], s->p[2], 8)) return 0;
+    s->off = off; s->tri = 1; s->mag = 0.f;
+    s->box[0] = s->box[1] = INFINITY; s->box[2] = s->box[3] = -INFINITY;
+    for (int i = 0; i < 3; ++i)
+        for (int a = 0; a < 2; ++a) {
+            s->v[i][a] = (float)(((double)s->p[i][a] + off) * scale);
+            if (s->v[i][a] < s->box[a]) s->box[a] = s->v[i][a];
+            if (s->v[i][a] > s->box[a + 2]) s->box[a + 2] = s->v[i][a];
+            if (fabsf(s->v[i][a]) > s->mag) s->mag = fabsf(s->v[i][a]);
+        }
+    return 1;
+}
+
+static void native_gpu_shape_rect(GlNativeGpuShape *s, int x0, int y0, int x1, int y1) {
+    s->tri = 0;
+    s->box[0] = (float)x0; s->box[1] = (float)y0; s->box[2] = (float)x1; s->box[3] = (float)y1;
+    s->mag = fmaxf(fmaxf(fabsf(s->box[0]), fabsf(s->box[1])), fmaxf(fabsf(s->box[2]), fabsf(s->box[3])));
+}
+
+static void native_gpu_shape_points(const GlNativeGpuShape *s, float pt[4][2], int *n) {
+    if (s->tri) { memcpy(pt, s->v, sizeof(s->v)); *n = 3; return; }
+    pt[0][0] = pt[3][0] = s->box[0]; pt[1][0] = pt[2][0] = s->box[2];
+    pt[0][1] = pt[1][1] = s->box[1]; pt[2][1] = pt[3][1] = s->box[3];
+    *n = 4;
+}
+
+/* 1 when some edge normal of triangle t separates a and b by more than m. */
+static int native_gpu_shape_separated(const GlNativeGpuShape *t, const GlNativeGpuShape *a, const GlNativeGpuShape *b, double m) {
+    float pa[4][2], pb[4][2]; int na, nb;
+    native_gpu_shape_points(a, pa, &na); native_gpu_shape_points(b, pb, &nb);
+    for (int i = 0; i < 3; ++i) {
+        const double ex = (double)t->v[(i + 1) % 3][0] - t->v[i][0], ey = (double)t->v[(i + 1) % 3][1] - t->v[i][1];
+        const double len = sqrt(ex * ex + ey * ey);
+        if (!(len > 0.0)) continue;
+        double lo_a = INFINITY, hi_a = -INFINITY, lo_b = INFINITY, hi_b = -INFINITY;
+        for (int k = 0; k < na; ++k) {
+            const double d = (pa[k][0] * -ey + pa[k][1] * ex) / len;
+            if (d < lo_a) lo_a = d;
+            if (d > hi_a) hi_a = d;
+        }
+        for (int k = 0; k < nb; ++k) {
+            const double d = (pb[k][0] * -ey + pb[k][1] * ex) / len;
+            if (d < lo_b) lo_b = d;
+            if (d > hi_b) hi_b = d;
+        }
+        if (hi_a + m < lo_b || hi_b + m < lo_a) return 1;
     }
     return 0;
 }
 
-static void native_gpu_rect_mark(GlNativeGpuPlane *plane, int x0, int y0, int x1, int y1) {
-    if (x0 >= x1 || y0 >= y1) return;
-    if (plane->dirty[0] >= plane->dirty[2] || plane->dirty[1] >= plane->dirty[3]) {
-        plane->dirty[0] = x0; plane->dirty[1] = y0; plane->dirty[2] = x1; plane->dirty[3] = y1;
-    } else {
-        if (x0 < plane->dirty[0]) plane->dirty[0] = x0;
-        if (y0 < plane->dirty[1]) plane->dirty[1] = y0;
-        if (x1 > plane->dirty[2]) plane->dirty[2] = x1;
-        if (y1 > plane->dirty[3]) plane->dirty[3] = y1;
+/* Triangles t and o share vertex V (t->v[ti] == o->v[oi]). 1 when an edge of t
+ * through V has t on one side and both other vertices of o farther than m on
+ * the other: then the two closures intersect only at V. */
+static int native_gpu_vertex_separated(const GlNativeGpuShape *t, int ti, const GlNativeGpuShape *o, int oi, double m) {
+    const double vx = t->v[ti][0], vy = t->v[ti][1];
+    for (int e = 1; e <= 2; ++e) {
+        const int w = (ti + e) % 3, x = (ti + 3 - e) % 3;
+        const double ex = t->v[w][0] - vx, ey = t->v[w][1] - vy, len = sqrt(ex * ex + ey * ey);
+        if (!(len > 0.0)) continue;
+        const double side = (ex * (t->v[x][1] - vy) - ey * (t->v[x][0] - vx)) / len;
+        if (fabs(side) <= m) continue;
+        int beyond = 1;
+        for (int k = 0; k < 3 && beyond; ++k) {
+            if (k == oi) continue;
+            const double d = (ex * (o->v[k][1] - vy) - ey * (o->v[k][0] - vx)) / len;
+            beyond = side > 0.0 ? d < -m : d > m;
+        }
+        if (beyond) return 1;
     }
-    if (plane->dirty_all) return;
-    const unsigned first_x = (unsigned)x0 / plane->tile_width;
-    const unsigned last_x = (unsigned)(x1 - 1) / plane->tile_width;
-    const unsigned first_y = (unsigned)y0 / plane->tile_height;
-    const unsigned last_y = (unsigned)(y1 - 1) / plane->tile_height;
-    for (unsigned word = first_x / 64u; word <= last_x / 64u; ++word) {
-        const unsigned lo = word == first_x / 64u ? first_x & 63u : 0u;
-        const unsigned hi = word == last_x / 64u ? last_x & 63u : 63u;
-        const uint64_t mask = gpu_vram_region_word_mask((int)lo, (int)hi);
-        for (unsigned row = first_y; row <= last_y; ++row) {
-            if (plane->dirty_epochs[row][word] != plane->dirty_serial) {
-                plane->dirty_epochs[row][word] = plane->dirty_serial;
-                plane->dirty_tiles[row][word] = 0u;
-            }
-            plane->dirty_tiles[row][word] |= mask;
+    return 0;
+}
+
+/* 1 when some pixel centre (x + 0.5, y + 0.5) lies within m of both triangles:
+ * each triangle grown by m is six half-planes, and each centre row of their
+ * common box gives one x interval to test. Rows beyond the cap count as hits. */
+static int native_gpu_tris_share_centre(const GlNativeGpuShape *a, const GlNativeGpuShape *b, double m) {
+    double nx[6], ny[6], c[6];
+    for (int s = 0; s < 2; ++s) {
+        const GlNativeGpuShape *t = s ? b : a;
+        const double area = ((double)t->v[1][0] - t->v[0][0]) * ((double)t->v[2][1] - t->v[0][1]) -
+                            ((double)t->v[1][1] - t->v[0][1]) * ((double)t->v[2][0] - t->v[0][0]);
+        const double sign = area < 0.0 ? -1.0 : 1.0;
+        for (int i = 0; i < 3; ++i) {
+            const double x0 = t->v[i][0], y0 = t->v[i][1];
+            const double ex = t->v[(i + 1) % 3][0] - x0, ey = t->v[(i + 1) % 3][1] - y0, len = sqrt(ex * ex + ey * ey);
+            const int k = s * 3 + i;
+            if (!(len > 0.0)) { nx[k] = ny[k] = 0.0; c[k] = -1.0; continue; } /* always satisfied */
+            /* inside: n . P >= c, with n the unit inward normal */
+            nx[k] = -ey * sign / len; ny[k] = ex * sign / len;
+            c[k] = nx[k] * x0 + ny[k] * y0 - m;
         }
     }
+    const double y0 = fmax(a->box[1], b->box[1]) - m, y1 = fmin(a->box[3], b->box[3]) + m;
+    const double r0 = ceil(y0 - 0.5), r1 = floor(y1 - 0.5);
+    if (r1 - r0 > 1024.0) return 1;
+    const double x0 = fmax(a->box[0], b->box[0]) - m, x1 = fmin(a->box[2], b->box[2]) + m;
+    for (double r = r0; r <= r1; r += 1.0) {
+        const double yc = r + 0.5;
+        double lo = x0, hi = x1;
+        for (int k = 0; k < 6 && lo <= hi; ++k) {
+            const double rhs = c[k] - ny[k] * yc;
+            if (nx[k] > 1e-12) { const double v = rhs / nx[k]; if (v > lo) lo = v; }
+            else if (nx[k] < -1e-12) { const double v = rhs / nx[k]; if (v < hi) hi = v; }
+            else if (rhs > 0.0) hi = lo - 1.0;
+        }
+        if (lo <= hi && ceil(lo - 0.5) <= floor(hi - 0.5)) return 1;
+    }
+    return 0;
+}
+
+/* Could the two shapes produce a fragment at the same pixel? Conservative:
+ * 0 only when provably disjoint. margin covers vertex-shader float rounding
+ * and rasterizer snapping, growing with coordinate magnitude. */
+static int native_gpu_shape_overlap(const GlNativeGpuShape *a, const GlNativeGpuShape *b, uint32_t scale) {
+    const double m = NATIVE_HZ_MARGIN + 1e-5 * fmaxf(a->mag, b->mag);
+    if (a->box[0] > b->box[2] + m || b->box[0] > a->box[2] + m ||
+        a->box[1] > b->box[3] + m || b->box[1] > a->box[3] + m) return 0;
+    if (a->tri && b->tri && a->off == b->off) {
+        /* Watertight rule: triangles sharing an edge with bitwise-identical
+         * endpoints (and weights, so identical window coordinates) on strictly
+         * opposite sides never both cover a pixel. */
+        int ai[3], bi[3], shared = 0;
+        for (int i = 0; i < 3 && shared < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                if (!memcmp(a->p[i], b->p[j], 8) && !memcmp(&a->q[i], &b->q[j], 4)) { ai[shared] = i; bi[shared++] = j; break; }
+        if (shared == 2) {
+            const float *s0 = a->p[ai[0]], *s1 = a->p[ai[1]];
+            const float *ta = a->p[3 - ai[0] - ai[1]], *tb = b->p[3 - bi[0] - bi[1]];
+            const double ex = (double)s1[0] - s0[0], ey = (double)s1[1] - s0[1], len = sqrt(ex * ex + ey * ey);
+            if (len > 0.0) {
+                const double da = (ex * ((double)ta[1] - s0[1]) - ey * ((double)ta[0] - s0[0])) / len * scale;
+                const double db = (ex * ((double)tb[1] - s0[1]) - ey * ((double)tb[0] - s0[0])) / len * scale;
+                if ((da > m && db < -m) || (da < -m && db > m)) return 0;
+            }
+            return 1;
+        }
+        /* One common vertex V: when a line through V along an edge of either
+         * triangle keeps the other's remaining vertices strictly beyond it, the
+         * closures meet only at V, which no fragment uses unless V lies on a
+         * pixel centre. */
+        if (shared == 1) {
+            const double fx = a->v[ai[0]][0] - floor(a->v[ai[0]][0]), fy = a->v[ai[0]][1] - floor(a->v[ai[0]][1]);
+            if ((fabs(fx - 0.5) > 1.0 / 128.0 || fabs(fy - 0.5) > 1.0 / 128.0) &&
+                (native_gpu_vertex_separated(a, ai[0], b, bi[0], m) || native_gpu_vertex_separated(b, bi[0], a, ai[0], m)))
+                return 0;
+        }
+    }
+    if (a->tri && native_gpu_shape_separated(a, a, b, m)) return 0;
+    if (b->tri && native_gpu_shape_separated(b, a, b, m)) return 0;
+    if (a->tri && b->tri && !native_gpu_tris_share_centre(a, b, m)) return 0;
+    return 1;
+}
+
+/* Grid cells of the margin-grown box inside the plane; 0 = no pixel centre. */
+static int native_gpu_shape_cells_sized(const GlNativeGpuPlane *plane, uint32_t columns, uint32_t rows, uint32_t size,
+                                        const GlNativeGpuShape *s, int c[4]) {
+    const float e = NATIVE_HZ_MARGIN + 1e-5f * s->mag;
+    const float w = (float)plane->width, h = (float)plane->height;
+    if (s->box[2] + e < 0.f || s->box[3] + e < 0.f || s->box[0] - e > w || s->box[1] - e > h) return 0;
+    c[0] = (int)(fmaxf(s->box[0] - e, 0.f) / (float)size);
+    c[1] = (int)(fmaxf(s->box[1] - e, 0.f) / (float)size);
+    c[2] = (int)(fmaxf(s->box[2] + e, 0.f) / (float)size);
+    c[3] = (int)(fmaxf(s->box[3] + e, 0.f) / (float)size);
+    if (c[2] >= (int)columns) c[2] = (int)columns - 1;
+    if (c[3] >= (int)rows) c[3] = (int)rows - 1;
+    if (c[0] > c[2]) c[0] = c[2];
+    if (c[1] > c[3]) c[1] = c[3];
+    return 1;
+}
+
+static int native_gpu_shape_cells(const GlNativeGpuPlane *plane, uint32_t columns, uint32_t rows, const GlNativeGpuShape *s, int c[4]) {
+    return native_gpu_shape_cells_sized(plane, columns, rows, NATIVE_HZ_CELL, s, c);
+}
+
+static int native_gpu_hazard_hit(const GlNativeGpuPlane *plane, const GlNativeGpuShape *b, uint32_t scale) {
+    const GlNativeGpuHazards *hz = plane->hazards;
+    int c[4];
+    if (!hz || !hz->count) return 0;
+    if (!native_gpu_shape_cells(plane, hz->columns, hz->rows, b, c)) return 0;
+    if ((c[2] - c[0] + 1) * (c[3] - c[1] + 1) > (int)NATIVE_HZ_BIG_CELLS) {
+        for (uint32_t i = 0; i < hz->count; ++i)
+            if (native_gpu_shape_overlap(&hz->shapes[i], b, scale)) return 1;
+        return 0;
+    }
+    for (int y = c[1]; y <= c[3]; ++y)
+        for (int x = c[0]; x <= c[2]; ++x) {
+            const uint32_t cell = (uint32_t)y * hz->columns + (uint32_t)x, n = hz->cell_n[cell];
+            if (n == NATIVE_HZ_FULL) return 1;
+            for (uint32_t k = 0; k < n; ++k)
+                if (native_gpu_shape_overlap(&hz->shapes[hz->cell_index[cell * NATIVE_HZ_CELL_CAP + k]], b, scale)) return 1;
+        }
+    for (uint32_t k = 0; k < hz->big_count; ++k)
+        if (native_gpu_shape_overlap(&hz->shapes[hz->big[k]], b, scale)) return 1;
+    return 0;
+}
+
+/* Any failure to record makes every later read of the plane barrier. */
+static void native_gpu_hazard_add(GlNativeGpuPlane *plane, const GlNativeGpuShape *s) {
+    GlNativeGpuHazards *hz = plane->hazards;
+    if (!hz) {
+        const uint32_t columns = (plane->width + NATIVE_HZ_CELL - 1u) / NATIVE_HZ_CELL;
+        const uint32_t rows = (plane->height + NATIVE_HZ_CELL - 1u) / NATIVE_HZ_CELL;
+        hz = columns && rows ? calloc(1, sizeof(*hz)) : NULL;
+        if (hz) {
+            hz->columns = columns; hz->rows = rows;
+            hz->cell_n = calloc((size_t)columns * rows, 1);
+            hz->cell_index = malloc((size_t)columns * rows * NATIVE_HZ_CELL_CAP * sizeof(uint16_t));
+            hz->touched = malloc((size_t)columns * rows * sizeof(uint32_t));
+            plane->hazards = hz;
+            if (!hz->cell_n || !hz->cell_index || !hz->touched) { plane->dirty_all = 1; return; }
+        } else { plane->dirty_all = 1; return; }
+    }
+    int c[4];
+    if (!native_gpu_shape_cells(plane, hz->columns, hz->rows, s, c)) return;
+    if (hz->count == NATIVE_HZ_SHAPES) { plane->dirty_all = 1; return; }
+    const uint32_t index = hz->count;
+    if ((c[2] - c[0] + 1) * (c[3] - c[1] + 1) > (int)NATIVE_HZ_BIG_CELLS) {
+        if (hz->big_count == NATIVE_HZ_BIG) { plane->dirty_all = 1; return; }
+        hz->big[hz->big_count++] = (uint16_t)index;
+    } else
+        for (int y = c[1]; y <= c[3]; ++y)
+            for (int x = c[0]; x <= c[2]; ++x) {
+                const uint32_t cell = (uint32_t)y * hz->columns + (uint32_t)x, n = hz->cell_n[cell];
+                if (!n) hz->touched[hz->touched_count++] = cell;
+                if (n == NATIVE_HZ_FULL) continue;
+                if (n == NATIVE_HZ_CELL_CAP) hz->cell_n[cell] = NATIVE_HZ_FULL;
+                else { hz->cell_index[cell * NATIVE_HZ_CELL_CAP + n] = (uint16_t)index; hz->cell_n[cell] = (uint8_t)(n + 1u); }
+            }
+    hz->shapes[hz->count++] = *s;
 }
 
 static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uint32_t scale, int x, int y, int w, int h, int read_destination,
-                             GlNativeGpuPlane **bound_target, unsigned depth, const int *draw_scissor) {
+                             GlNativeGpuPlane **bound_target, unsigned depth, const int *draw_scissor,
+                             const float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOATS], uint32_t vertex_count, float offset) {
     const int read_depth = (depth & GL_NATIVE_GPU_DEPTH_READ) != 0;
     const int px0 = x > 0 ? x*(int)scale : 0;
     const int py0 = y > 0 ? y*(int)scale : 0;
     const int right = (x+w)*(int)scale, bottom = (y+h)*(int)scale;
     const int px1 = right < (int)plane->width ? right : (int)plane->width;
     const int py1 = bottom < (int)plane->height ? bottom : (int)plane->height;
+    /* Non-interlock: the draw's exact fragment shapes, not its bbox. A shape
+     * the geometry cannot bound (non-finite) is unknown: barrier, then
+     * everything is unknown until the next one. */
+    GlNativeGpuShape shapes[2];
+    uint32_t shape_count = 0;
+    int shape_unknown = 0;
+    if (!s_native_gpu_interlock && !s_native_gpu_scheduled_run) {
+        if (vertices && vertex_count) {
+            for (uint32_t t = 0; t < vertex_count / 3u; ++t) {
+                const int r = native_gpu_shape_tri(&shapes[shape_count], vertices[t * 3u], vertices[t * 3u + 1u], vertices[t * 3u + 2u],
+                                                   offset, scale);
+                if (r < 0) shape_unknown = 1;
+                else if (r) ++shape_count;
+            }
+        } else if (px0 < px1 && py0 < py1) native_gpu_shape_rect(&shapes[shape_count++], px0, py0, px1, py1);
+    }
     if (!s_native_gpu_interlock && (read_destination || read_depth)) {
         if(p_glTextureBarrier) {
             /* Each draw has non-overlapping triangle coverage and reads only
@@ -19003,7 +19256,11 @@ static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uin
                     p_glActiveTexture(PSXGL_TEXTURE0+3);glBindTexture(GL_TEXTURE_2D,plane->depth);
                 }
             }
-            if (native_gpu_rect_dirty(plane, px0, py0, px1, py1)) {
+            int hazard = plane->dirty_all || shape_unknown;
+            for (uint32_t i = 0; !hazard && i < shape_count; ++i) hazard = native_gpu_hazard_hit(plane, &shapes[i], scale);
+            if (s_native_gpu_scheduled_run) {
+                /* native_gpu_schedule_run placed the barriers. */
+            } else if (hazard) {
                 p_glTextureBarrier();
                 work->destination_barriers++;
                 native_gpu_plane_barrier_clear(plane);
@@ -19061,7 +19318,10 @@ static int native_gpu_target(GlNativeGpuWork *work, GlNativeGpuPlane *plane, uin
         glScissor(scissor[0],scissor[1],scissor[2],scissor[3]);
         memcpy(s_native_gpu_scissor_value,scissor,sizeof(scissor));
     }
-    if (!s_native_gpu_interlock) native_gpu_rect_mark(plane, px0, py0, px1, py1);
+    if (!s_native_gpu_interlock && !s_native_gpu_scheduled_run && !plane->dirty_all) {
+        if (shape_unknown) plane->dirty_all = 1;
+        for (uint32_t i = 0; i < shape_count && !plane->dirty_all; ++i) native_gpu_hazard_add(plane, &shapes[i]);
+    }
     return 1;
 }
 
@@ -19601,12 +19861,31 @@ static void native_gpu_image_barrier(void) {
         PSXGL_TEXTURE_FETCH_BARRIER_BIT | PSXGL_FRAMEBUFFER_BARRIER_BIT);
 }
 
+/* layers: per-triangle layer of a scheduled run (NULL = every triangle); only
+ * triangles whose layer equals `layer` render. */
+static int native_gpu_render_layer(GlNativeGpuWork *work, const GlNativeGpuCommand *command,
+                                  GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
+                                  const uint16_t *words,
+                                  uint32_t first_vertex, GlNativeGpuPlane **bound_target,
+                                  const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
+                                  const GlNativeGpuDrawGeometry *prepared,
+                                  const uint16_t *layers, uint32_t layer);
 static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCommand *command,
                                   GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
                                   const uint16_t *words,
                                   uint32_t first_vertex, GlNativeGpuPlane **bound_target,
                                   const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
                                   const GlNativeGpuDrawGeometry *prepared) {
+    return native_gpu_render_layer(work, command, snapshots, captured_data, words, first_vertex, bound_target,
+                                   slice_vertices, prepared, NULL, 0u);
+}
+static int native_gpu_render_layer(GlNativeGpuWork *work, const GlNativeGpuCommand *command,
+                                  GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
+                                  const uint16_t *words,
+                                  uint32_t first_vertex, GlNativeGpuPlane **bound_target,
+                                  const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
+                                  const GlNativeGpuDrawGeometry *prepared,
+                                  const uint16_t *layers, uint32_t layer) {
     GlNativeGpuPlane *plane=&work->planes[command->plane];
     const uint32_t scale=native_gpu_plane_scale(work, command->plane);
     /* Debug wireframe (VIEW/phase planes only): see gl_renderer_set_native_wireframe. */
@@ -19636,6 +19915,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
         const GlNativeGpuMeshTriangle *mesh_triangles = command->mesh_count
             ? (const GlNativeGpuMeshTriangle *)(const void *)(captured_data + command->data) : NULL;
         for (uint32_t t=0;t<(lines?draw->line_count:native_gpu_command_triangles(command));++t) {
+            if (layers && layers[t] != layer) continue;
             const XgRenderIrMaterialState *m = &draw->primitive.material;
             if (mesh_triangles) {
                 /* A mesh triangle's material: rebuilt only when its texture
@@ -19672,7 +19952,8 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
             work->depth_tested_triangles += tested ? 1u : 0u;
             if (!s_native_gpu_template_capture.parameters) {
                 native_gpu_depth_query(work, tested);
-                if(!native_gpu_target(work,plane,scale,left,top,right-left+1,bottom-top+1,!wire&&(m->semi_transparent||m->mask_check),bound_target,depth,draw_scissor)){s_native_gpu_parameter_capture=NULL;return 0;}
+                if(!native_gpu_target(work,plane,scale,left,top,right-left+1,bottom-top+1,!wire&&(m->semi_transparent||m->mask_check),bound_target,depth,draw_scissor,
+                    slice_vertices ? slice_vertices + first_vertex + t * (lines ? 6u : 3u) : NULL,lines ? 6u : 3u,0.5f/scale-1.f/64.f)){s_native_gpu_parameter_capture=NULL;return 0;}
             }
             /* The plane origin is target-local, just like gl_FragCoord. The
              * source row/VRAM origin is already removed above, exactly once. */
@@ -19814,7 +20095,7 @@ static int native_gpu_render_command(GlNativeGpuWork *work, const GlNativeGpuCom
     if (copy_depth) {
         p_glActiveTexture(PSXGL_TEXTURE0+4); glBindTexture(GL_TEXTURE_2D, source_plane->depth);
     }
-    if(!native_gpu_target(work,plane,scale,command->x,command->y,command->w,command->h,(command->mask&2u)!=0,bound_target,depth,NULL))return 0;
+    if(!native_gpu_target(work,plane,scale,command->x,command->y,command->w,command->h,(command->mask&2u)!=0,bound_target,depth,NULL,NULL,0,0.f))return 0;
     if(texture){p_glActiveTexture(PSXGL_TEXTURE0+2);glBindTexture(GL_TEXTURE_2D,texture);}
     native_gpu_uniform_float4(NATIVE_UNIFORM_SIZE,s_native_gpu_size,(float)plane->width/scale,(float)plane->height/scale,0,(float)scale);
     /* Wireframe: guest pixels (seeds, fills, copies out of guest VRAM) are black;
@@ -20076,7 +20357,7 @@ static int native_gpu_template_render(GlNativeGpuWork *work,const GlNativeGpuCom
     GlNativeGpuPlane *plane=&work->planes[command->plane];
     const uint32_t scale=native_gpu_plane_scale(work,command->plane);
     if(!native_gpu_target(work,plane,scale,info->left,info->top,info->right-info->left+1,
-        info->bottom-info->top+1,0,bound_target,info->depth,info->scissor))return 0;
+        info->bottom-info->top+1,0,bound_target,info->depth,info->scissor,NULL,0,0.f))return 0;
     for(uint32_t t=0u;t<info->count;) {
         if(!plan->visible[info->first+t]){++t;continue;}
         const uint32_t first=t++;
@@ -20177,6 +20458,311 @@ int gl_renderer_native_service_pending(void) {
     return pending;
 }
 
+/* Env-gated GPU pass profiler (PSX_NATIVE_GPU_PROFILE=1): GL_TIME_ELAPSED per
+ * pass category, one pool per GL context (owner / presenter); totals are read
+ * by the debug server from another thread. */
+#define GPUPROF_RING 64
+typedef struct { GLuint q[GPUPROF_RING], f[GPUPROF_RING]; uint8_t cat[GPUPROF_RING]; unsigned head, n; int active; uint8_t acat; GLuint aq, af; } GpuProfPool;
+static GpuProfPool s_gpuprof_owner, s_gpuprof_pres;
+static uint64_t s_gpuprof_ns[4], s_gpuprof_cnt[4], s_gpuprof_frag[4];
+/* GL_FRAGMENT_SHADER_INVOCATIONS_ARB when ARB_pipeline_statistics_query exists. */
+static int gpuprof_fragments(void) {
+    static int e = -1;
+    if (e < 0) e = SDL_GL_ExtensionSupported("GL_ARB_pipeline_statistics_query") ? 1 : 0;
+    return e;
+}
+static int gpuprof_enabled(void) {
+    static int e = -1;
+    if (e < 0) { const char *v = getenv("PSX_NATIVE_GPU_PROFILE"); e = v && v[0] == '1'; }
+    return e;
+}
+static void gpuprof_begin(GpuProfPool *p, unsigned cat) {
+    if (!gpuprof_enabled() || p->active || p->n >= GPUPROF_RING || !p_glGenQueries || !p_glBeginQuery) return;
+    p_glGenQueries(1, &p->aq);
+    p_glBeginQuery(0x88BF, p->aq);
+    p->af = 0u;
+    if (gpuprof_fragments()) { p_glGenQueries(1, &p->af); p_glBeginQuery(0x82F4, p->af); }
+    p->active = 1; p->acat = (uint8_t)cat;
+}
+static void gpuprof_end(GpuProfPool *p) {
+    if (!p->active) return;
+    p_glEndQuery(0x88BF);
+    if (p->af) p_glEndQuery(0x82F4);
+    const unsigned i = (p->head + p->n++) % GPUPROF_RING;
+    p->q[i] = p->aq; p->f[i] = p->af; p->cat[i] = p->acat; p->active = 0;
+}
+static void gpuprof_poll(GpuProfPool *p) {
+    if (!p->n || !p_glGetQueryObjectiv || !p_glGetQueryObjectui64v) return;
+    while (p->n) {
+        GLint av = 0; const GLuint q = p->q[p->head];
+        p_glGetQueryObjectiv(q, 0x8867, &av);
+        if (!av) break;
+        GLuint64 t = 0;
+        p_glGetQueryObjectui64v(q, GL_QUERY_RESULT, &t);
+        __atomic_fetch_add(&s_gpuprof_ns[p->cat[p->head]], (uint64_t)t, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s_gpuprof_cnt[p->cat[p->head]], 1u, __ATOMIC_RELAXED);
+        if (p->f[p->head]) {
+            GLuint64 fragments = 0;
+            p_glGetQueryObjectui64v(p->f[p->head], GL_QUERY_RESULT, &fragments);
+            __atomic_fetch_add(&s_gpuprof_frag[p->cat[p->head]], (uint64_t)fragments, __ATOMIC_RELAXED);
+            p_glDeleteQueries(1, &p->f[p->head]);
+        }
+        p_glDeleteQueries(1, &p->q[p->head]);
+        p->head = (p->head + 1) % GPUPROF_RING; --p->n;
+    }
+}
+void gl_renderer_gpu_profile(uint64_t ns[4], uint64_t count[4], uint64_t fragments[4], int *enabled) {
+    for (int i = 0; i < 4; ++i) {
+        ns[i] = __atomic_load_n(&s_gpuprof_ns[i], __ATOMIC_RELAXED);
+        fragments[i] = __atomic_load_n(&s_gpuprof_frag[i], __ATOMIC_RELAXED);
+        count[i] = __atomic_load_n(&s_gpuprof_cnt[i], __ATOMIC_RELAXED);
+    }
+    *enabled = gpuprof_enabled();
+}
+
+/* Layer scheduling of a pure DRAW run on one plane (no interlock). Each
+ * primitive (triangle, or a line's two) gets layer(T) = max over earlier
+ * overlapping U of layer(U) + (T reads the destination/key ? 1 : 0), 0 if none;
+ * layer L > 0 is preceded by one texture barrier. Reads in layer L see every
+ * overlapping earlier write (they sit in layers < L, behind a barrier);
+ * overlapping primitives keep their relative order (layers never decrease along
+ * an overlap chain and ROP order holds within a layer); disjoint primitives
+ * cannot affect each other's pixels. Overlap is the hazard set's conservative
+ * test; candidates come from a grid of unbounded per-cell lists. Unknown shapes
+ * raise every later primitive above all earlier layers. */
+#define NATIVE_SCHED_CMDS 2048u
+#define NATIVE_SCHED_PRIMS 65536u
+#define NATIVE_SCHED_LAYERS 1024u
+#define NATIVE_SCHED_NONE 0xFFFFu
+#define NATIVE_SCHED_CELL 8u /* guest pixels */
+typedef struct GlNativeSchedPrim { uint32_t shape; uint8_t count, reads, unknown; } GlNativeSchedPrim;
+static struct {
+    GlNativeGpuDrawGeometry *geo; GlNativeSchedPrim *prim; uint16_t *layer, *shape_layer;
+    GlNativeGpuShape *shape; uint32_t *stamp, *touched, *node_shape; int32_t *cell_head, *node_next;
+    uint32_t geo_cap, prim_cap, layer_cap, shape_cap, shape_layer_cap, stamp_cap, cell_cap, node_cap, node_next_cap, query;
+} s_sched;
+static struct { uint32_t base, vertex; uint16_t lo, hi; const GlNativeGpuDrawGeometry *prepared; } s_sched_cmd[NATIVE_SCHED_CMDS];
+
+static int native_sched_reserve(void **p, uint32_t *cap, uint32_t need, size_t size) {
+    if (need <= *cap) return 1;
+    uint32_t n = *cap ? *cap : 256u;
+    while (n < need) n *= 2u;
+    void *q = realloc(*p, (size_t)n * size);
+    if (!q) return 0;
+    *p = q; *cap = n;
+    return 1;
+}
+
+/* Same decision as native_gpu_depth_uniforms' GL_NATIVE_GPU_DEPTH_READ, without uniforms. */
+static int native_gpu_depth_reads(const GlNativeGpuWork *work, const GlNativeGpuPlane *plane,
+                                  const GlNativeDepthMode *mode, int view_plane) {
+    if (work->canonical_gpu && !view_plane && plane->depth) return 0;
+    return work->depth_test && plane->depth && view_plane && (mode->test || mode->semi);
+}
+
+/* Highest layer(U) + r over earlier shapes overlapping s, or `best` if higher. */
+static uint32_t native_sched_query(const GlNativeGpuPlane *plane, uint32_t columns, uint32_t rows, uint32_t size,
+                                   const GlNativeGpuShape *s, uint32_t r, uint32_t scale, uint32_t best) {
+    int c[4];
+    if (!native_gpu_shape_cells_sized(plane, columns, rows, size, s, c)) return best;
+    const uint32_t stamp = ++s_sched.query;
+    for (int y = c[1]; y <= c[3]; ++y)
+        for (int x = c[0]; x <= c[2]; ++x)
+            for (int32_t n = s_sched.cell_head[(uint32_t)y * columns + (uint32_t)x]; n >= 0; n = s_sched.node_next[n]) {
+                const uint32_t u = s_sched.node_shape[n];
+                if (s_sched.stamp[u] == stamp) continue;
+                s_sched.stamp[u] = stamp;
+                if (s_sched.shape_layer[u] + r > best && native_gpu_shape_overlap(&s_sched.shape[u], s, scale)) best = s_sched.shape_layer[u] + r;
+            }
+    return best;
+}
+
+/* 1 rendered, 0 failed, -1 not applicable (nothing was drawn). */
+static int native_gpu_schedule_run(GlNativeGpuWork *work, unsigned plane_index, const GlNativeGpuCommand *commands,
+        uint32_t first, uint32_t end, uint32_t first_vertex, GlNativeGpuPlane *snapshots, const uint8_t *captured_data,
+        const uint16_t *words, GlNativeGpuPlane **bound_target,
+        const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS], const GlNativeGpuGeometry *geometry) {
+    GlNativeGpuPlane *plane = &work->planes[plane_index];
+    const uint32_t scale = native_gpu_plane_scale(work, plane_index);
+    if (s_native_gpu_interlock || !p_glTextureBarrier || work->wireframe || !slice_vertices ||
+        s_native_gpu_template_capture.parameters || !plane->texture || !scale || end - first > NATIVE_SCHED_CMDS) return -1;
+    const uint32_t cell_size = NATIVE_SCHED_CELL * scale;
+    const uint32_t columns = (plane->width + cell_size - 1u) / cell_size;
+    const uint32_t rows = (plane->height + cell_size - 1u) / cell_size;
+    if (!columns || !rows || columns * rows > 1u << 20) return -1;
+    uint32_t total = 0u, ncmd = 0u, vertex = first_vertex;
+    int need_geo = 0;
+    for (uint32_t d = first; d < end; ++d) {
+        const GlNativeGpuCommand *command = &commands[d];
+        if (command->plane == plane_index) {
+            const uint32_t n = command->draw.topology == GPU_RENDER_SEMANTIC_LINES ? command->draw.line_count : native_gpu_command_triangles(command);
+            s_sched_cmd[ncmd].base = total; s_sched_cmd[ncmd].vertex = vertex;
+            s_sched_cmd[ncmd].lo = NATIVE_SCHED_NONE; s_sched_cmd[ncmd].hi = 0u;
+            s_sched_cmd[ncmd].prepared = geometry && geometry->primitives ? geometry->primitives + geometry->offsets[d].primitive : NULL;
+            need_geo |= !s_sched_cmd[ncmd].prepared;
+            total += n; ++ncmd;
+        }
+        vertex += native_gpu_command_vertex_count(command);
+    }
+    if (!total) return 1;
+    if (total > NATIVE_SCHED_PRIMS) return -1;
+    const uint32_t cells = columns * rows;
+    if (!native_sched_reserve((void **)&s_sched.prim, &s_sched.prim_cap, total, sizeof(*s_sched.prim)) ||
+        !native_sched_reserve((void **)&s_sched.layer, &s_sched.layer_cap, total, sizeof(*s_sched.layer))) return -1;
+    if ((need_geo && !native_sched_reserve((void **)&s_sched.geo, &s_sched.geo_cap, total, sizeof(*s_sched.geo))) ||
+        !native_sched_reserve((void **)&s_sched.shape, &s_sched.shape_cap, 2u * total, sizeof(*s_sched.shape)) ||
+        !native_sched_reserve((void **)&s_sched.shape_layer, &s_sched.shape_layer_cap, 2u * total, sizeof(*s_sched.shape_layer)) ||
+        !native_sched_reserve((void **)&s_sched.stamp, &s_sched.stamp_cap, 2u * total, sizeof(*s_sched.stamp))) return -1;
+    if (cells > s_sched.cell_cap) {
+        free(s_sched.cell_head); free(s_sched.touched);
+        s_sched.cell_head = malloc((size_t)cells * sizeof(*s_sched.cell_head));
+        s_sched.touched = malloc((size_t)cells * sizeof(*s_sched.touched));
+        if (!s_sched.cell_head || !s_sched.touched) {
+            free(s_sched.cell_head); free(s_sched.touched);
+            s_sched.cell_head = NULL; s_sched.touched = NULL; s_sched.cell_cap = 0u;
+            return -1;
+        }
+        for (uint32_t i = 0; i < cells; ++i) s_sched.cell_head[i] = -1;
+        s_sched.cell_cap = cells;
+    }
+    /* Planning: geometry, reads and layers, without GL side effects. */
+    const float offset = 0.5f / scale - 1.f / 64.f;
+    uint32_t prim_count = 0u, shape_count = 0u, touched = 0u, nodes = 0u, run_max = 0u, p = 0u;
+    int global = 0, failed = 0;
+    s_sched.query = 0u;
+    for (uint32_t d = first, ci = 0u; d < end && !failed; ++d) {
+        const GlNativeGpuCommand *command = &commands[d];
+        if (command->plane != plane_index) continue;
+        const XgSemanticDrawRecord *draw = &command->draw;
+        const int lines = draw->topology == GPU_RENDER_SEMANTIC_LINES;
+        const uint32_t per = lines ? 6u : 3u, vstart = s_sched_cmd[ci].vertex;
+        const GlNativeGpuMeshTriangle *mesh = command->mesh_count
+            ? (const GlNativeGpuMeshTriangle *)(const void *)(captured_data + command->data) : NULL;
+        int material_valid = 0;
+        GlNativeTextureState shared_texture = {0};
+        XgRenderIrMaterialState material;
+        for (uint32_t t = 0; t < (lines ? draw->line_count : native_gpu_command_triangles(command)) && !failed; ++t, ++p) {
+            const XgRenderIrMaterialState *m = &draw->primitive.material;
+            if (mesh) {
+                const GlNativeTextureState *texture = &mesh[t].texture;
+                if (!material_valid || !native_texture_state_equal(texture, &shared_texture)) {
+                    material = draw->primitive.material;
+                    native_texture_state_apply(&material, texture);
+                    shared_texture = *texture;
+                    material_valid = 1;
+                }
+                m = &material;
+            }
+            const GlNativeGpuDrawGeometry *g;
+            if (s_sched_cmd[ci].prepared) g = &s_sched_cmd[ci].prepared[t];
+            else {
+                GlNativeGpuDrawGeometry *out = &s_sched.geo[p];
+                native_gpu_prepare_draw(work, command, captured_data, t, plane->width / scale, plane->height / scale,
+                                        slice_vertices + vstart + t * per, out);
+                g = out;
+            }
+            s_sched.layer[p] = NATIVE_SCHED_NONE;
+            if (!g->visible) continue;
+            GlNativeSchedPrim *pr = &s_sched.prim[prim_count++];
+            pr->shape = shape_count; pr->count = 0u; pr->unknown = 0u;
+            pr->reads = (m->semi_transparent || m->mask_check || native_gpu_depth_reads(work, plane, &g->depth, command->plane != 0u)) != 0;
+            for (uint32_t k = 0; k < per / 3u; ++k) {
+                const float (*v)[GL_NATIVE_GPU_VERTEX_FLOATS] = slice_vertices + vstart + t * per + k * 3u;
+                const int r = native_gpu_shape_tri(&s_sched.shape[shape_count], v[0], v[1], v[2], offset, scale);
+                if (r < 0) pr->unknown = 1u;
+                else if (r) { ++pr->count; ++shape_count; }
+            }
+            uint32_t layer = 0u;
+            if (pr->unknown || global) { if (prim_count > 1u) layer = run_max + pr->reads; }
+            else for (uint32_t k = 0; k < pr->count; ++k)
+                layer = native_sched_query(plane, columns, rows, cell_size, &s_sched.shape[pr->shape + k], pr->reads, scale, layer);
+            if (pr->unknown) global = 1;
+            if (layer > NATIVE_SCHED_LAYERS) { failed = 1; break; }
+            if (layer > run_max) run_max = layer;
+            s_sched.layer[p] = (uint16_t)layer;
+            if (layer < s_sched_cmd[ci].lo) s_sched_cmd[ci].lo = (uint16_t)layer;
+            if (layer > s_sched_cmd[ci].hi) s_sched_cmd[ci].hi = (uint16_t)layer;
+            for (uint32_t k = 0; k < pr->count; ++k) {
+                const uint32_t si = pr->shape + k;
+                int c[4];
+                s_sched.shape_layer[si] = (uint16_t)layer;
+                s_sched.stamp[si] = 0u;
+                if (!native_gpu_shape_cells_sized(plane, columns, rows, cell_size, &s_sched.shape[si], c)) continue;
+                const uint32_t need = nodes + (uint32_t)((c[2] - c[0] + 1) * (c[3] - c[1] + 1));
+                if (!native_sched_reserve((void **)&s_sched.node_shape, &s_sched.node_cap, need, sizeof(*s_sched.node_shape)) ||
+                    !native_sched_reserve((void **)&s_sched.node_next, &s_sched.node_next_cap, need, sizeof(*s_sched.node_next))) {
+                    failed = 1;
+                    break;
+                }
+                for (int y = c[1]; y <= c[3]; ++y)
+                    for (int x = c[0]; x <= c[2]; ++x) {
+                        const uint32_t cell = (uint32_t)y * columns + (uint32_t)x;
+                        if (s_sched.cell_head[cell] < 0) s_sched.touched[touched++] = cell;
+                        s_sched.node_shape[nodes] = si;
+                        s_sched.node_next[nodes] = s_sched.cell_head[cell];
+                        s_sched.cell_head[cell] = (int32_t)nodes++;
+                    }
+            }
+        }
+        ++ci;
+    }
+    for (uint32_t i = 0; i < touched; ++i) s_sched.cell_head[s_sched.touched[i]] = -1;
+    if (failed) return -1;
+    if (!prim_count) return 1;
+    /* Emission. A layer-0 read that may see writes from before the run needs
+     * one leading barrier; native_gpu_target stays out of the way. */
+    int pre = 0;
+    for (uint32_t i = 0, q = 0; i < prim_count && !pre; ++i) {
+        while (q < total && s_sched.layer[q] == NATIVE_SCHED_NONE) ++q;
+        const GlNativeSchedPrim *pr = &s_sched.prim[i];
+        if (s_sched.layer[q++] || !pr->reads) continue;
+        pre = plane->dirty_all || pr->unknown;
+        for (uint32_t k = 0; !pre && k < pr->count; ++k) pre = native_gpu_hazard_hit(plane, &s_sched.shape[pr->shape + k], scale);
+    }
+    int ok = 1;
+    s_native_gpu_scheduled_run = 1;
+    for (uint32_t layer = 0; layer <= run_max && ok; ++layer) {
+        if (layer ? 1 : pre) {
+            p_glTextureBarrier();
+            work->destination_barriers++;
+            native_gpu_plane_barrier_clear(plane);
+        }
+        for (uint32_t d = first, ci = 0u; d < end && ok; ++d) {
+            if (commands[d].plane != plane_index) continue;
+            const uint32_t i = ci++;
+            if (layer < s_sched_cmd[i].lo || layer > s_sched_cmd[i].hi) continue;
+            ok = native_gpu_render_layer(work, &commands[d], snapshots, captured_data, words, s_sched_cmd[i].vertex, bound_target,
+                slice_vertices, s_sched_cmd[i].prepared ? s_sched_cmd[i].prepared : s_sched.geo + s_sched_cmd[i].base,
+                s_sched.layer + s_sched_cmd[i].base, layer);
+        }
+    }
+    s_native_gpu_scheduled_run = 0;
+    work->scheduled_layers += run_max + 1u;
+    /* Only the last layer is unprotected by a barrier. */
+    for (uint32_t i = 0, q = 0; i < prim_count && !plane->dirty_all; ++i) {
+        while (q < total && s_sched.layer[q] == NATIVE_SCHED_NONE) ++q;
+        const GlNativeSchedPrim *pr = &s_sched.prim[i];
+        if (s_sched.layer[q++] != run_max) continue;
+        if (pr->unknown) plane->dirty_all = 1;
+        for (uint32_t k = 0; k < pr->count && !plane->dirty_all; ++k) native_gpu_hazard_add(plane, &s_sched.shape[pr->shape + k]);
+    }
+    return ok;
+}
+
+/* Cache draws [first, end) replayed on one phase plane, as one scheduled run. */
+static int native_gpu_schedule_templates(GlNativeGpuWork *work, const GlNativePhaseTemplates *cache, uint32_t plane,
+        uint32_t first, uint32_t end, GlNativeGpuPlane *snapshots, const uint16_t *words, GlNativeGpuPlane **bound_target) {
+    static GlNativeGpuCommand *commands;
+    static uint32_t capacity;
+    if (s_native_gpu_interlock || !native_sched_reserve((void **)&commands, &capacity, cache->count, sizeof(*commands))) return -1;
+    for (uint32_t d = first; d < end; ++d) {
+        commands[d] = cache->commands[d];
+        commands[d].plane = plane;
+    }
+    return native_gpu_schedule_run(work, plane, commands, first, end, cache->geometry->offsets[first].vertex, snapshots,
+        cache->data, words, bound_target, cache->geometry->vertices, cache->geometry->gpu_setup ? NULL : cache->geometry);
+}
+
 static int native_gpu_service(void) {
     const int gpu_owner=SDL_GL_GetCurrentContext()==s_native_gpu_ctx;
     if(!gpu_owner&&!native_is_main_thread())return -1;
@@ -20203,6 +20789,8 @@ static int native_gpu_service(void) {
     if(state==NATIVE_GPU_QUEUED)work->state=NATIVE_GPU_DISPATCHING;
     SDL_UnlockMutex(s_native_state_mutex);
     if(!gpu_owner&&!native_context_enter())return -1;
+    GpuProfPool *const gprof = gpu_owner ? &s_gpuprof_owner : &s_gpuprof_pres;
+    gpuprof_poll(gprof);
     const uint64_t started = SDL_GetTicksNS();
     const uint64_t cpu_started = native_thread_cpu_ns();
     float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS] = NULL;
@@ -20375,6 +20963,7 @@ static int native_gpu_service(void) {
             p_glGenQueries(3,work->timers);
             p_glQueryCounter(work->timers[0],GL_TIMESTAMP);
         }
+        gpuprof_begin(gprof, phase_slice ? 1u : 0u);
         glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_CULL_FACE);
         glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);glPixelStorei(GL_UNPACK_ALIGNMENT,4);
         if(state==NATIVE_GPU_QUEUED) {
@@ -20429,8 +21018,17 @@ static int native_gpu_service(void) {
                 const GlNativePhaseTemplates *cache = work->phase_templates;
                 if (!cache || command->data >= cache->count) { ok = 0; break; }
                 native_gpu_template_parameters_prepare(work,command->plane);
+                uint32_t end = i + 1u;
+                while (end < command_limit && end - i < NATIVE_SCHED_CMDS && commands[end].kind == NATIVE_GPU_TEMPLATE &&
+                       commands[end].plane == command->plane && commands[end].data == command->data + (end - i)) ++end;
+                int scheduled = -1;
                 if (work->template_parameters) {
                     ok=native_gpu_template_render(work,command,&template_bound_target);
+                } else if (command->data + (end - i) <= cache->count &&
+                           (scheduled = native_gpu_schedule_templates(work, cache, command->plane, command->data,
+                               command->data + (end - i), snapshots, upload_words, &template_bound_target)) >= 0) {
+                    ok = scheduled;
+                    i = end - 1u;
                 } else {
                 GlNativeGpuCommand draw = cache->commands[command->data];
                 draw.plane = command->plane;
@@ -20563,7 +21161,7 @@ static int native_gpu_service(void) {
                         if(ok)native_gpu_blit_depth(&work->planes[j],&snapshots[j],0,0,work->planes[j].width,work->planes[j].height);
                     }
                 }
-            } else if (gpu_owner && command->kind == NATIVE_GPU_DRAW) {
+            } else if ((gpu_owner || !s_native_gpu_interlock) && command->kind == NATIVE_GPU_DRAW) {
                 /* A pure DRAW run only samples the fixed raw-word texture and
                  * each draw's own destination. Different planes are independent:
                  * keep FIFO order within each plane, but avoid alternating the
@@ -20583,6 +21181,9 @@ static int native_gpu_service(void) {
                 for (unsigned plane = 0u; plane < GL_NATIVE_GPU_PLANES && ok; ++plane) {
                     if (!planes[plane]) continue;
                     uint32_t vertex = command_first_vertex;
+                    const int scheduled = native_gpu_schedule_run(work, plane, commands, i, end, command_first_vertex, snapshots,
+                        captured_data, upload_words, &bound_target, slice_vertices, geometry);
+                    if (scheduled >= 0) { ok = scheduled; continue; }
                     for (uint32_t draw = i; draw < end && ok; ++draw) {
                         if (commands[draw].plane == plane)
                             ok = native_gpu_render_command(work, &commands[draw], snapshots,
@@ -20602,6 +21203,7 @@ static int native_gpu_service(void) {
                 /* Resume the exact next FIFO command on the next owner service.
                  * No fence, endpoint or canonical state is published yet. */
                 native_gpu_depth_query(work,0);
+                gpuprof_end(gprof);
                 glFlush();
                 work->timing.service_ns+=SDL_GetTicksNS()-started;
                 work->timing.service_cpu_ns+=native_thread_cpu_ns()-cpu_started;
@@ -20620,6 +21222,7 @@ static int native_gpu_service(void) {
             ++work->chunk_cursor;
             work->phase_cursor=0u;
         }
+        gpuprof_end(gprof);
         if(!sealed || (ok && work->chunk_cursor < published_chunks)) {
             work->timing.service_draw_cpu_ns+=native_thread_cpu_ns()-draw_cpu_begin;
             /* Prefixes still belong exclusively to this GPU owner. Flushing
@@ -20642,6 +21245,7 @@ static int native_gpu_service(void) {
         const uint64_t scanout_cpu_begin=native_thread_cpu_ns();
         work->timing.service_draw_cpu_ns+=scanout_cpu_begin-draw_cpu_begin;
         if(work->timers[0])p_glQueryCounter(work->timers[1],GL_TIMESTAMP);
+        gpuprof_begin(gprof, 2u);
         if(ok&&work->scanout) {
             const int resolve = native_gpu_scanout_init();
             for(unsigned image=0;image<=work->phase_count&&ok;++image) {
@@ -20723,6 +21327,7 @@ static int native_gpu_service(void) {
             memset(&snapshots[i],0,sizeof(snapshots[i]));
         }
         work->timing.service_scanout_cpu_ns+=native_thread_cpu_ns()-scanout_cpu_begin;
+        gpuprof_end(gprof);
         if(work->timers[0])p_glQueryCounter(work->timers[2],GL_TIMESTAMP);
         work->fence=ok?p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE,0):NULL;glFlush();
         work->submitted_ns=SDL_GetTicksNS();
@@ -20745,6 +21350,7 @@ static int native_gpu_service(void) {
         s_native_compiler_diag.gpu.destination_barriers+=work->destination_barriers;
         s_native_compiler_diag.gpu.destination_copies+=work->destination_copies;
         s_native_compiler_diag.gpu.skipped_barriers+=work->skipped_barriers;
+        s_native_compiler_diag.gpu.scheduled_layers+=work->scheduled_layers;
         s_native_compiler_diag.gpu.depth_tested_triangles+=work->depth_tested_triangles;
         work->state=NATIVE_GPU_SUBMITTED;
         SDL_UnlockMutex(s_native_state_mutex);
@@ -21748,6 +22354,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
     int upload_required = 0;
     int upload_ok = 1;
     int upload_result_recorded = 0;
+    GLuint present_target = 0u;
     (void)user_data;
     if (out_completion_fence) *out_completion_fence = 0u;
     if (!compiled || !out_completion_fence || alpha_denominator == 0u ||
@@ -21899,6 +22506,14 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
         failure_blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_DRAWABLE;
         goto compose_failed;
     }
+    if (nvp_active()) {
+        present_target = (GLuint)nvp_begin_frame(ww, wh);
+        if (!present_target) {
+            failure_blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_DRAWABLE;
+            goto compose_failed;
+        }
+    }
+    s_native_present_target_fbo = present_target;
     if (s_stretch_num > 0 && !endpoint.metadata.depth24)
         letterbox_rect_aspect_in(0, 0, ww, wh,
                                  s_stretch_num, s_stretch_den,
@@ -21908,7 +22523,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
                                  endpoint.metadata.aspect_num,
                                  endpoint.metadata.aspect_den,
                                  &lx, &ly, &lw, &lh);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, present_target);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
@@ -21988,6 +22603,8 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
                   !endpoint.metadata.depth24 && !endpoint.metadata.disabled &&
                   s_native_presenter_lut_tex != 0u);
     p_glUniform4f(s_native_presenter_u_uv_rect, 0.f, 0.f, 1.f, 1.f);
+    gpuprof_poll(&s_gpuprof_pres);
+    gpuprof_begin(&s_gpuprof_pres, 3u);
     p_glBindVertexArray(s_native_presenter_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0);
@@ -21999,6 +22616,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
         s_native_aa_history_valid = 1;
         p_glActiveTexture(PSXGL_TEXTURE0);
     }
+    gpuprof_end(&s_gpuprof_pres);
     present_sequence = pres_record(
         image_index ? GL_PRES_NATIVE_MIDPOINT : GL_PRES_NATIVE_CURRENT,
         endpoint.metadata.display_x, endpoint.metadata.display_y,
@@ -22015,7 +22633,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
     pres_source_hash_issue(present_sequence, endpoint.framebuffer, 0, 0,
                             (int)image.texture_width,
                             (int)image.texture_height);
-    pres_hash_issue(present_sequence, ww, wh);
+    pres_hash_issue(present_sequence, present_target, ww, wh);
     completion_sync = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     if (!completion_sync || native_drain_gl_errors()) {
@@ -22053,6 +22671,7 @@ static bool native_presenter_compose(const XgRenderCompiledEndpoint *compiled,
     return true;
 
 compose_failed:
+    s_native_present_target_fbo = 0u;
     /* Compose failure is a presenter-host callback, never a guest boundary.
      * The failed draw must stop protecting the endpoint before core release. */
     glFinish();
@@ -22215,7 +22834,7 @@ static void native_ui_layer_composite(void) {
         p_glDeleteSync(layer->ready);
         layer->ready = NULL;
     }
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_native_present_target_fbo);
     /* Compose leaves the viewport on the letterboxed game rect; the UI layer
      * covers the whole window (menu bar over pillarbox bands too). */
     glEnable(GL_SCISSOR_TEST);
@@ -22254,6 +22873,7 @@ static void native_presenter_swap(void *user_data) {
             if (event->phase_numerator && native_unpack_handle(event->endpoint_handle, GL_NATIVE_ENDPOINT_CAPACITY, &slot, &generation) &&
                 s_native_endpoints[slot].generation == generation &&
                 s_native_endpoints[slot].temporal_generation != s_native_temporal_generation) {
+                s_native_present_target_fbo = 0u;
                 pres_mark_native_retired(sequence);
                 s_native_pipeline_diag.compose_retired_before_swap++;
                 s_native_pending_present_valid = 0;
@@ -22267,6 +22887,7 @@ static void native_presenter_swap(void *user_data) {
     }
     if (pending) pres_mark_swap_attempted(sequence, 0);
     if (!pending || !native_is_presenter_thread() || !native_context_enter()) {
+        s_native_present_target_fbo = 0u;
         if (pending) pres_mark_swap_attempted(sequence, 1);
         if (s_native_state_mutex) {
             SDL_LockMutex(s_native_state_mutex);
@@ -22281,18 +22902,19 @@ static void native_presenter_swap(void *user_data) {
         return;
     }
     if (native_presenter_threaded()) {
-        native_presenter_apply_swap_interval();
+        if (!nvp_active()) native_presenter_apply_swap_interval();
         /* UI is rendered by the main thread; only composite it here. The
          * debug overlay keeps its own window and just observes this present. */
         native_ui_layer_composite();
-        psx_debug_overlay_present_observe();
+        psx_debug_overlay_present_observe_target(s_native_present_target_fbo);
     } else {
-        psx_runtime_menu_pre_swap_target(0u);
-        psx_debug_overlay_pre_swap();
+        psx_runtime_menu_pre_swap_target(s_native_present_target_fbo);
+        psx_debug_overlay_pre_swap_target(s_native_present_target_fbo);
     }
     (void)psx_wayland_presentation_request(sequence);
     latency_ring_mark(LAT_SWAP_BEGIN);
     swapped = gl_swap_window_private(GL_SWAP_CALLER_NATIVE_PRESENTER);
+    s_native_present_target_fbo = 0u;
     psx_debug_overlay_post_swap(swapped);
     if (swapped) {
         pres_mark_swap_completed(sequence);
@@ -22352,7 +22974,7 @@ int gl_renderer_native_init_services(
         s_interp_ctx = NULL;
     }
     s_swap_legacy_interpolation_thread = 0u;
-    (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
     /* Canonical GPU work remains observable by guest reads/rewind. Only the
      * queued host-view passes are disposable when Native takes visual ownership. */
     flush_flat_batch();
@@ -22382,10 +23004,10 @@ int gl_renderer_native_init_services(
         SDL_WINDOWPOS_UNDEFINED, 1, 1, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
     if (!s_native_gpu_drawable) goto init_failed;
     s_native_gpu_ctx=SDL_GL_CreateContext(s_native_gpu_drawable);
-    (void)SDL_GL_MakeCurrent(s_win,s_ctx);
-    s_native_presenter_ctx = SDL_GL_CreateContext(s_win);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable,s_ctx);
+    s_native_presenter_ctx = SDL_GL_CreateContext(s_gl_drawable);
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
-    (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
     if (!s_native_presenter_ctx||!s_native_gpu_ctx) goto init_failed;
 
     if (!native_context_enter())
@@ -22427,7 +23049,7 @@ int gl_renderer_native_init_services(
         s_native_presenter_u_lut < 0 ||
         s_native_presenter_u_lut_on < 0)
         goto init_failed;
-    (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
 
     memset(s_native_endpoints, 0, sizeof(s_native_endpoints));
     memset(s_native_fences, 0, sizeof(s_native_fences));
@@ -22534,8 +23156,9 @@ init_failed:
                 glDeleteTextures(1, &s_native_presenter_lut_tex);
             if (s_native_aa_history_tex)
                 glDeleteTextures(1, &s_native_aa_history_tex);
+            nvp_release_gl_context();
             native_context_leave();
-        } else if (s_ctx && SDL_GL_MakeCurrent(s_win, s_ctx) == 0) {
+        } else if (s_ctx && SDL_GL_MakeCurrent(s_gl_drawable, s_ctx) == 0) {
             /* Program/textures are shared; the child owns and destroys VAO. */
             if (s_native_presenter_prog)
                 p_glDeleteProgram(s_native_presenter_prog);
@@ -22551,7 +23174,7 @@ init_failed:
     s_native_aa_history_tex = 0u;
     s_native_aa_history_w = s_native_aa_history_h = s_native_aa_history_valid = 0;
     s_native_presenter_lut_generation = -1;
-    (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+    (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
     if (s_native_presenter_ctx) SDL_GL_DeleteContext(s_native_presenter_ctx);
     s_native_presenter_ctx = NULL;
     if (s_native_presenter_context_mutex)
@@ -22606,7 +23229,16 @@ int gl_renderer_select_texture_bank(uint16_t id) {
 }
 
 int gl_renderer_init_context(SDL_Window *win) {
-    s_win = win;
+    return gl_renderer_init_context_split(win, win);
+}
+
+SDL_Window *gl_renderer_gl_drawable(void) {
+    return s_gl_drawable;
+}
+
+int gl_renderer_init_context_split(SDL_Window *window, SDL_Window *gl_drawable) {
+    s_win = window;
+    s_gl_drawable = gl_drawable;
     s_swap_owner_mutex = SDL_CreateMutex();
     if (!s_swap_owner_mutex) return 0;
     s_swap_legacy_main_thread = (uint64_t)SDL_ThreadID();
@@ -22619,9 +23251,9 @@ int gl_renderer_init_context(SDL_Window *win) {
     s_native_present_h = 0;
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    s_ctx = SDL_GL_CreateContext(win);
+    s_ctx = SDL_GL_CreateContext(s_gl_drawable);
     if (!s_ctx) { fprintf(stdout, "psxrecomp: GL context creation failed (%s)\n", SDL_GetError()); SDL_DestroyMutex(s_swap_owner_mutex); s_swap_owner_mutex=NULL; return 0; }
-    if (SDL_GL_MakeCurrent(win, s_ctx) != 0) { fprintf(stdout, "psxrecomp: MakeCurrent failed (%s)\n", SDL_GetError()); SDL_GL_DeleteContext(s_ctx); s_ctx=NULL; SDL_DestroyMutex(s_swap_owner_mutex); s_swap_owner_mutex=NULL; return 0; }
+    if (SDL_GL_MakeCurrent(s_gl_drawable, s_ctx) != 0) { fprintf(stdout, "psxrecomp: MakeCurrent failed (%s)\n", SDL_GetError()); SDL_GL_DeleteContext(s_ctx); s_ctx=NULL; SDL_DestroyMutex(s_swap_owner_mutex); s_swap_owner_mutex=NULL; return 0; }
     /* Swap interval: 1=vsync (tear-free, default), 0=immediate (lowest display
      * latency, may tear; our wall-clock pacer still holds 59.94Hz), -1=adaptive.
      * Adaptive falls back to vsync if the driver rejects it. */
@@ -22885,8 +23517,9 @@ void gl_renderer_native_shutdown(void) {
                     glDeleteTextures(1, &s_native_endpoints[i].phases[p].mask_texture);
             }
         }
+        nvp_release_gl_context();
         native_context_leave();
-    } else if (s_ctx && SDL_GL_MakeCurrent(s_win, s_ctx) == 0) {
+    } else if (s_ctx && SDL_GL_MakeCurrent(s_gl_drawable, s_ctx) == 0) {
         native_gpu_free(s_native_gpu_work); s_native_gpu_work = NULL;
         for (uint32_t i=0;i<GL_NATIVE_GPU_PHASE_BASE;++i)native_gpu_plane_free(&s_native_gpu_planes[i]);
         for (uint32_t i=0;i<GL_NATIVE_GPU_PLANES;++i)native_gpu_plane_free(&s_native_gpu_spare_planes[i]);
@@ -23000,7 +23633,7 @@ void gl_renderer_native_shutdown(void) {
     memset(&s_native_motion_history, 0, sizeof(s_native_motion_history));
 
     native_recipe_reads_cache_clear();
-    if (s_ctx) (void)SDL_GL_MakeCurrent(s_win, s_ctx);
+    if (s_ctx) (void)SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
     if (s_native_presenter_ctx) SDL_GL_DeleteContext(s_native_presenter_ctx);
     s_native_presenter_ctx = NULL;
     if(s_native_gpu_ctx)SDL_GL_DeleteContext(s_native_gpu_ctx);
@@ -23032,7 +23665,7 @@ void gl_renderer_shutdown(void) {
     s_selected_bank_tex = s_tb_bank_tex = s_tb_handoff_bank_tex = 0;
     s_tb_hd_tex = s_tb_handoff_hd_tex = 0;
     if (s_ctx) {
-        SDL_GL_MakeCurrent(s_win, s_ctx);
+        SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
         hd_gl_cache_clear(&s_legacy_hd_cache);
     }
     gl_renderer_native_shutdown();
@@ -23058,7 +23691,7 @@ void gl_renderer_shutdown(void) {
         s_interp_ctx = NULL;
     }
     if (s_ctx) {
-        SDL_GL_MakeCurrent(s_win, s_ctx);
+        SDL_GL_MakeCurrent(s_gl_drawable, s_ctx);
         if (s_interp_draw_fence) {
             p_glDeleteSync(s_interp_draw_fence);
             s_interp_draw_fence = NULL;
@@ -25275,7 +25908,7 @@ static uint64_t native_present_swap_texture(
         pres_source_hash_issue(
             sequence, source_fbo, source_x * s_scale, source_y * s_scale,
             source_width * s_scale, source_height * s_scale);
-        pres_hash_issue(sequence, window_width, window_height);
+        pres_hash_issue(sequence, 0u, window_width, window_height);
     }
     (void)psx_wayland_presentation_request(sequence);
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -27057,7 +27690,7 @@ static int glb_transaction_context_ready(void) {
     SDL_Window *const window = SDL_GL_GetCurrentWindow();
     return s_ctx != NULL && s_win != NULL && s_raster_ok && s_vram != NULL &&
            SDL_GL_GetCurrentContext() == s_ctx &&
-           (window == s_win ||
+           (window == s_gl_drawable ||
             (s_native_main_drawable != NULL && window == s_native_main_drawable));
 }
 

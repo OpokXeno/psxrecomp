@@ -51,6 +51,7 @@ void psx_debug_overlay_pre_swap(void);
  * readback of the composed frame). service_main runs on the main thread
  * (tools window, deferred UI state); it never touches the game window. */
 void psx_debug_overlay_present_observe(void);
+void psx_debug_overlay_present_observe_target(unsigned int framebuffer);
 void psx_debug_overlay_service_main(void);
 
 /* Post-swap correction: pre_swap counts every attempt (including blocked
@@ -242,6 +243,7 @@ static inline bool psx_debug_overlay_process_event(const SDL_Event *e) { (void)e
 static inline void psx_debug_overlay_pre_swap_target(unsigned int f) { (void)f; }
 static inline void psx_debug_overlay_pre_swap(void) { psx_debug_overlay_pre_swap_target(0u); }
 static inline void psx_debug_overlay_present_observe(void) {}
+static inline void psx_debug_overlay_present_observe_target(unsigned int f) { (void)f; }
 static inline void psx_debug_overlay_service_main(void) {}
 static inline void psx_debug_overlay_post_swap(int c) { (void)c; }
 static inline bool psx_debug_overlay_swallow_keyboard(void) { return false; }

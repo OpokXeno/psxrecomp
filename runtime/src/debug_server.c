@@ -60,6 +60,8 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "wayland_presentation.h"
+#include "native_vk_present.h"
 #include "gpu_semantic_workload.h"
 #include "gte_attribution.h"
 #include "lockstep.h"
@@ -10360,6 +10362,57 @@ static void handle_window_shot(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"armed\":true}\n", id, path);
 }
 
+/* gpu_profile: cumulative GL_TIME_ELAPSED per Native pass (PSX_NATIVE_GPU_PROFILE=1). */
+static void handle_gpu_profile(int id, const char *json)
+{
+    (void)json;
+    uint64_t ns[4], n[4], f[4];
+    int en = 0;
+    gl_renderer_gpu_profile(ns, n, f, &en);
+    static const char *const names[4] = {"base_draws", "phase_draws", "scanout", "present_compose"};
+    char body[640];
+    int pos = 0;
+    for (int i = 0; i < 4 && pos < (int)sizeof(body); ++i)
+        pos += snprintf(body + pos, sizeof(body) - (size_t)pos,
+            ",\"%s\":{\"ns\":%llu,\"count\":%llu,\"fragments\":%llu}", names[i],
+            (unsigned long long)ns[i], (unsigned long long)n[i], (unsigned long long)f[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d%s}\n", id, en, body);
+}
+
+/* vk_present: counters of the Vulkan presentation path used by Native. */
+static void handle_vk_present(int id, const char *json)
+{
+    (void)json;
+    char obj[2048];
+    nvp_diagnostics_json(obj, (int)sizeof(obj));
+    send_fmt("{\"id\":%d,\"ok\":true,\"vk_present\":%s}\n", id, obj);
+}
+
+/* vk_present_shot: reads back the next presented Vulkan swapchain image (what
+ * the compositor receives) and writes it to a PNG. Blocks until the presenter
+ * presents a frame or the timeout expires. */
+static void handle_vk_present_shot(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "vk_present_shot.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    unsigned char *rgb = NULL;
+    int W = 0, H = 0;
+    if (!nvp_capture_presented(1000, &rgb, &W, &H)) {
+        send_err(id, "vk present capture failed (inactive, unsupported or timed out)");
+        return;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)H);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
+             id, path, W, H);
+}
+
 /* screenshot: capture what the player is actually being shown. Native-wide
  * presentation is wider than the canonical PSX display rectangle, so routing
  * this command unconditionally through handle_screenshot_file silently omits
@@ -11478,9 +11531,11 @@ static void handle_gl_present_ring(int id, const char *json)
         n = (int)GL_PRES_RING_CAPACITY;
     uint64_t total = gl_renderer_pres_total();
     GlRendererPresentationDiagnostics diag = {0};
+    PsxWaylandPresentationDiagnostics wl_diag = {0};
     gl_renderer_presentation_diagnostics(&diag);
+    psx_wayland_presentation_diagnostics(&wl_diag);
     uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
-    const size_t bufsz = 1024u + (size_t)n * 512u;
+    const size_t bufsz = 1536u + (size_t)n * 512u;
     char *buf = (char *)malloc(bufsz);
     if (!buf) { send_err(id, "alloc failed"); return; }
     int written = snprintf(buf, bufsz,
@@ -11498,7 +11553,10 @@ static void handle_gl_present_ring(int id, const char *json)
                        "\"presentation\":{\"wayland_window\":%s,"
                        "\"protocol_available\":%s,\"clock_id\":%u,"
                        "\"requested\":%llu,\"presented\":%llu,"
-                       "\"discarded\":%llu,\"pending\":%llu},\"events\":[",
+                       "\"discarded\":%llu,\"pending\":%llu,"
+                       "\"latency_count\":%llu,\"latency_sum_ns\":%llu,"
+                       "\"latency_hist\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]},"
+                       "\"events\":[",
                        id, (unsigned long long)total, (unsigned)SDL_GetTicks(),
                        diag.hash_enabled ? "true" : "false",
                        (unsigned long long)diag.hash_requested,
@@ -11519,7 +11577,17 @@ static void handle_gl_present_ring(int id, const char *json)
                        (unsigned long long)diag.feedback_requested,
                        (unsigned long long)diag.feedback_presented,
                        (unsigned long long)diag.feedback_discarded,
-                       (unsigned long long)diag.feedback_pending);
+                       (unsigned long long)diag.feedback_pending,
+                       (unsigned long long)wl_diag.latency_count,
+                       (unsigned long long)wl_diag.latency_sum_ns,
+                       (unsigned long long)wl_diag.latency_hist[0],
+                       (unsigned long long)wl_diag.latency_hist[1],
+                       (unsigned long long)wl_diag.latency_hist[2],
+                       (unsigned long long)wl_diag.latency_hist[3],
+                       (unsigned long long)wl_diag.latency_hist[4],
+                       (unsigned long long)wl_diag.latency_hist[5],
+                       (unsigned long long)wl_diag.latency_hist[6],
+                       (unsigned long long)wl_diag.latency_hist[7]);
     if (written < 0 || (size_t)written >= bufsz) {
         free(buf);
         send_err(id, "response formatting failed");
@@ -14507,7 +14575,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"selection\":{\"presented_endpoints\":%llu,\"presented_holds\":%llu,"
         "\"visual_only_updates\":%llu,\"guard_empties\":%llu,"
         "\"due_wholes\":%llu,\"phases\":%llu,\"last_remaining_ms\":%lld,"
-        "\"duplicates\":%llu,\"visual_lag_us\":%llu},"
+        "\"duplicates\":%llu,\"visual_lag_us\":%llu,\"render_lag_us\":%llu},"
         "\"publication_open\":%s,\"epoch_terminal\":%s,"
         "\"source_pending\":%s,\"batch_pending\":%s,\"receipts\":{",
         id, failure_flags,
@@ -14579,6 +14647,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (long long)presentation.selection_last_remaining_ms,
         (unsigned long long)presentation.duplicate_presents,
         (unsigned long long)(presentation.visual_lag_ns / 1000u),
+        (unsigned long long)(presentation.render_lag_ns / 1000u),
         presentation.publication_open ? "true" : "false",
         presentation.epoch_terminal ? "true" : "false",
         presentation.source_pending ? "true" : "false",
@@ -15088,7 +15157,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"service_ns\":%llu,\"submit_ns\":%llu,\"finish_ns\":%llu,\"service_max_ns\":%llu,\"hash_ns\":%llu,"
         "\"fence_polls\":%llu,\"fence_pending\":%llu,\"fence_latency_ns\":%llu,\"fence_latency_max_ns\":%llu,"
         "\"timed_work\":%llu,\"gpu_render_ns\":%llu,\"gpu_readback_ns\":%llu,\"gpu_max_ns\":%llu,"
-        "\"word_uploads\":%llu,\"snapshot_commands\":%llu,\"destination_barriers\":%llu,\"destination_copies\":%llu,\"last_reference_digest\":\"0x%llX\","
+        "\"word_uploads\":%llu,\"snapshot_commands\":%llu,\"destination_barriers\":%llu,\"destination_copies\":%llu,\"scheduled_layers\":%llu,\"last_reference_digest\":\"0x%llX\","
         "\"prefetch_prepared\":%llu,\"prefetch_used\":%llu,\"prefetch_discarded\":%llu,\"prefetch_cpu_ns\":%llu,"
         "\"last_image_digest\":\"0x%llX\",\"render_scale\":%u,"
         "\"storage_width\":%u,\"storage_height\":%u,\"pending_state\":%u,"
@@ -15123,6 +15192,7 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (unsigned long long)compiler.gpu.snapshot_commands,
         (unsigned long long)compiler.gpu.destination_barriers,
         (unsigned long long)compiler.gpu.destination_copies,
+        (unsigned long long)compiler.gpu.scheduled_layers,
         (unsigned long long)compiler.gpu.last_reference_digest,
         (unsigned long long)compiler.gpu.prefetch_prepared,
         (unsigned long long)compiler.gpu.prefetch_used,
@@ -18252,6 +18322,9 @@ static const CmdEntry s_commands[] = {
     { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "window_shot",       handle_window_shot },
+    { "vk_present",        handle_vk_present },
+    { "gpu_profile",       handle_gpu_profile },
+    { "vk_present_shot",   handle_vk_present_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },

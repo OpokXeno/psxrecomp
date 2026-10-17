@@ -459,6 +459,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/wayland_presentation.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_vk_present.c
     ${PSXRECOMP_ROOT}/runtime/src/dma_gpu_ll.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
