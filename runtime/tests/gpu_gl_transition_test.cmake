@@ -53,6 +53,9 @@ if(UNIX AND NOT APPLE AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         COMMAND native_gpu_scale_test)
     add_test(NAME native_worker_scaling
         COMMAND native_gpu_scale_test --workers-only)
+    add_test(NAME native_motion_texture_identity
+        COMMAND native_gpu_scale_test --motion-only)
+    set_tests_properties(native_motion_texture_identity PROPERTIES TIMEOUT 10)
     set_tests_properties(native_worker_scaling PROPERTIES TIMEOUT 30)
     set_tests_properties(native_gpu_scale PROPERTIES TIMEOUT 20
         ENVIRONMENT "SDL_VIDEODRIVER=offscreen;LP_NUM_THREADS=2")

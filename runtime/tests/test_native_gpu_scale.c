@@ -984,7 +984,75 @@ static void check_worker_scaling(void) {
         cpus, peak, bands);
 }
 
+static void check_motion_texture_identity(void) {
+    GlNativeRecipeDraw before[2] = {0}, after[2] = {0};
+    const uint32_t corners[2][3] = {{0u, 1u, 2u}, {2u, 1u, 3u}};
+    for (uint32_t draw = 0u; draw < 2u; ++draw) {
+        GpuRenderSemantic *s = &before[draw].semantic;
+        *s = triangle(draw + 1u, 248u, 0u);
+        s->screen_space_2d = GPU_RENDER_SCREEN_SPACE_2D_NONE;
+        s->material.textured = 1u;
+        s->interpolation_identity = (GpuRenderInterpolationIdentity){1u, 7u, draw + 100u, 1u};
+        for (uint32_t v = 0u; v < 3u; ++v) {
+            const uint32_t corner = corners[draw][v];
+            GpuRenderSemanticVertex *p = &s->triangles[0].vertices[v];
+            p->x = (16 + 32 * (corner & 1u)) * 65536;
+            p->y = (16 + 32 * (corner >> 1u)) * 65536;
+            p->native_view_x = p->x + 16384;
+            p->native_view_y = p->y + 8192;
+            p->native_view_position = 1u;
+            p->interpolation_group_id = 7u;
+            p->interpolation_vertex_id = corner;
+            p->interpolation_vertex_identity_valid = 1u;
+            /* Different faces can share source vertices across a UV seam. */
+            p->u = (draw * 64u + corner * 8u) * 65536;
+            p->v = corner * 8u * 65536;
+        }
+        after[draw] = before[draw];
+        for (uint32_t v = 0u; v < 3u; ++v) {
+            after[draw].semantic.triangles[0].vertices[v].x += 65536;
+            after[draw].semantic.triangles[0].vertices[v].native_view_x += 32768;
+        }
+    }
+    for (unsigned scenario = 0u; scenario < 8u; ++scenario) {
+        GlNativeRecipeDraw prior[2] = {before[0], before[1]};
+        GlNativeRecipeDraw now[2] = {after[0], after[1]};
+        switch (scenario) {
+        case 1u: prior[0] = before[1]; prior[1] = before[0]; break;
+        case 2u: now[0] = after[1]; now[1] = after[0]; break;
+        case 3u: now[0].semantic.triangles[0].vertices[0].u += 65536; break;
+        case 4u: now[0].semantic.material.tpage ^= 1u; break;
+        case 5u: now[0].semantic.interpolation_identity.primitive_id += 999u; break;
+        case 6u: prior[1].semantic.interpolation_identity = prior[0].semantic.interpolation_identity; break;
+        case 7u: prior[0].semantic.interpolation_identity.valid = 0u; break;
+        }
+        GlNativeRecipe previous = {.draws = prior, .count = 2u};
+        GlNativeRecipe current = {.draws = now, .count = 2u};
+        GlNativeVertexCache cache = {0};
+        GlNativeVertexDiagnostics diag = {0};
+        assert(native_motion_vertices(&previous, &current, 1u, &cache, &diag));
+        assert(diag.matched == 4u && !diag.missing && !diag.conflicts);
+        assert(diag.active_meshes == (scenario < 3u));
+        assert(diag.discrete_meshes == (scenario >= 3u));
+        if (scenario < 3u)
+            for (uint32_t i = 0u; i < cache.pair_count; ++i) {
+                assert(cache.deltas[i][0] == -32768);
+                assert(cache.deltas[i][2] == -16384);
+            }
+        /* Selection must never rewrite the Native endpoint or round its XY. */
+        for (uint32_t d = 0u; d < 2u; ++d)
+            for (uint32_t v = 0u; v < 3u; ++v)
+                assert((now[d].semantic.triangles[0].vertices[v].native_view_x & 65535) == 49152);
+        native_motion_vertices_discard(&cache);
+    }
+    puts("motion textures: UV seams/OT reordering interpolate; cel changes and missing/ambiguous identities stay discrete");
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--motion-only") == 0) {
+        check_motion_texture_identity();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--workers-only") == 0) {
         assert(SDL_Init(0) == 0);
         check_worker_scaling();
@@ -1024,6 +1092,7 @@ int main(int argc, char **argv) {
         check_raster_equivalence(scale,gaps,scale==4 && argc==2 && strcmp(argv[1],"--raster-benchmark")==0);
     check_setup_selection();
     check_setup_batches(argc == 2 && strcmp(argv[1], "--setup-benchmark") == 0);
+    check_motion_texture_identity();
     check_ui_clip();
     native_view_worker_shutdown();
     native_phase_pool_stop();

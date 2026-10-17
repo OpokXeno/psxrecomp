@@ -1659,7 +1659,6 @@ typedef struct GlNativeVertexMesh {
 typedef struct GlNativeVertexPair {
     GlNativeVertexSample endpoints[2];
     uint32_t mesh;
-    uint32_t previous_draw;
     uint8_t valid;
     uint8_t anchor_recovered;
 } GlNativeVertexPair;
@@ -15370,6 +15369,63 @@ static int native_motion_texture_footprint_equal(
     return 1;
 }
 
+typedef struct GlNativeMotionDrawKey {
+    GpuRenderInterpolationIdentity identity;
+    uint64_t component;
+    uint32_t scope, index;
+} GlNativeMotionDrawKey;
+
+static GlNativeMotionDrawKey native_motion_draw_key(const GlNativeRecipe *recipe, uint32_t index) {
+    const GlNativeRecipeDraw *draw = &recipe->draws[index];
+    return (GlNativeMotionDrawKey){.identity = draw->semantic.interpolation_identity,
+        .component = draw->temporal_component, .index = index,
+        .scope = draw->temporal_component
+            ? recipe->coverages[draw->temporal_index].view.header->producer_scope : 0u};
+}
+
+static int native_motion_draw_key_compare(const void *left, const void *right) {
+    const GlNativeMotionDrawKey *a = left, *b = right;
+#define COMPARE_DRAW_KEY(field) if (a->field != b->field) return a->field < b->field ? -1 : 1
+    COMPARE_DRAW_KEY(identity.scene_id);
+    COMPARE_DRAW_KEY(identity.producer_id);
+    COMPARE_DRAW_KEY(identity.primitive_id);
+    COMPARE_DRAW_KEY(scope);
+    COMPARE_DRAW_KEY(component);
+#undef COMPARE_DRAW_KEY
+    return 0;
+}
+
+/* Texture cels belong to primitives, not shared vertex aliases. A vertex at
+ * a UV seam can occur in several faces with different texture footprints.
+ * Index the previous draws once, only for the nonprojective fallback which
+ * needs this check; rigid/projective geometry pays no sorting/allocation cost. */
+static int native_motion_texture_keys(const GlNativeRecipe *recipe,
+                                     GlNativeMotionDrawKey **out, uint32_t *count) {
+    GlNativeMotionDrawKey *keys = malloc((recipe->count ? recipe->count : 1u) * sizeof(*keys));
+    if (!keys) return 0;
+    *count = 0u;
+    for (uint32_t i = 0u; i < recipe->count; ++i) {
+        const GlNativeRecipeDraw *draw = &recipe->draws[i];
+        const GpuRenderSemantic *s = &draw->semantic;
+        if (!draw->motion.motion.handle.resource_id && s->interpolation_identity.valid &&
+            s->topology == GPU_RENDER_SEMANTIC_TRIANGLES && !s->screen_space_2d && !s->native_view_effect)
+            keys[(*count)++] = native_motion_draw_key(recipe, i);
+    }
+    qsort(keys, *count, sizeof(*keys), native_motion_draw_key_compare);
+    *out = keys;
+    return 1;
+}
+
+static uint32_t native_motion_texture_previous(const GlNativeRecipe *current, uint32_t draw,
+        const GlNativeMotionDrawKey *keys, uint32_t count) {
+    const GlNativeMotionDrawKey key = native_motion_draw_key(current, draw);
+    if (!key.identity.valid || !count) return UINT32_MAX;
+    const GlNativeMotionDrawKey *match = bsearch(&key, keys, count, sizeof(*keys), native_motion_draw_key_compare);
+    if (!match || (match != keys && !native_motion_draw_key_compare(match - 1, match)) ||
+        (match != keys + count - 1u && !native_motion_draw_key_compare(match + 1, match))) return UINT32_MAX;
+    return match->index;
+}
+
 static int native_motion_group_compare(const void *a, const void *b) {
     const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return x < y ? -1 : x > y;
@@ -15541,7 +15597,6 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
         if (!ordered[end - 1u]->frame) { first = end; continue; }
         GlNativeVertexPair *pair = &cache->pairs[cache->pair_count];
         memset(pair, 0, sizeof(*pair));
-        pair->previous_draw = UINT32_MAX;
         uint32_t seen = 0u, mesh = UINT32_MAX;
         int conflict = 0;
         for (uint32_t j = first; j < end; ++j) {
@@ -15550,7 +15605,7 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
                 conflict |= memcmp(&pair->endpoints[use->frame], &use->sample, sizeof(use->sample)) != 0;
             else pair->endpoints[use->frame] = use->sample;
             seen |= 1u << use->frame;
-            if (!use->frame) { pair->previous_draw = use->draw; continue; }
+            if (!use->frame) continue;
             /* Only unbound draws (at most two triangles) read the map. */
             if (use->corner < 6u) cache->map[use->draw][use->corner] = cache->pair_count;
             const uint32_t root = native_motion_mesh_root(cache, use->mesh);
@@ -15594,6 +15649,8 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
     free(uses);
     for (uint32_t i = 0u; i < cache->pair_count; ++i)
         cache->pairs[i].mesh = native_motion_mesh_root(cache, cache->pairs[i].mesh);
+    GlNativeMotionDrawKey *texture_keys = NULL;
+    uint32_t texture_key_count = 0u;
     for (uint32_t i = 0u; i < current->count; ++i) {
         if (cache->draw_mesh[i] == UINT32_MAX) continue;
         const uint32_t root = cache->draw_mesh[i] = native_motion_mesh_root(cache, cache->draw_mesh[i]);
@@ -15610,23 +15667,25 @@ static int native_motion_vertices(const GlNativeRecipe *previous, const GlNative
             continue;
         }
         mesh->unbound = 1u;
+        int check_texture = 0;
         for (uint32_t v = 0u; v < current->draws[i].semantic.triangle_count * 3u; ++v) {
             const uint32_t key = cache->map[i][v];
             if (key == UINT32_MAX || !cache->pairs[key].valid) mesh->bad = 1u;
             else if (current->draws[i].semantic.material.textured &&
-                     !cache->pairs[key].endpoints[1].projective) {
-                /* Billboard animation is discrete. Reusing a packet/vertex ID
-                 * does not make two different cels the same geometry: applying
-                 * the current UVs to an in-between shape stretches its pixels.
-                 * Keep the whole producer discrete across a cel change. */
-                const uint32_t prior = cache->pairs[key].previous_draw;
-                if (prior == UINT32_MAX ||
-                    !native_motion_texture_footprint_equal(
-                        &previous->draws[prior].semantic,
-                        &current->draws[i].semantic)) mesh->bad = 1u;
+                     !cache->pairs[key].endpoints[1].projective) check_texture = 1;
+        }
+        if (check_texture && !mesh->bad) {
+            if (!texture_keys && !native_motion_texture_keys(previous, &texture_keys, &texture_key_count)) {
+                native_motion_vertices_discard(cache); return 0;
             }
+            /* Billboard animation is discrete. Compare this primitive's own
+             * previous footprint, rejecting missing or ambiguous identities. */
+            const uint32_t prior = native_motion_texture_previous(current, i, texture_keys, texture_key_count);
+            if (prior == UINT32_MAX || !native_motion_texture_footprint_equal(
+                    &previous->draws[prior].semantic, &current->draws[i].semantic)) mesh->bad = 1u;
         }
     }
+    free(texture_keys);
     cache->deltas = calloc((size_t)(cache->pair_count ? cache->pair_count : 1u) * phases, sizeof(*cache->deltas));
     if (!cache->deltas) { native_motion_vertices_discard(cache); return 0; }
     for (uint32_t i = 0u; i < cache->pair_count; ++i) {
