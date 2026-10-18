@@ -474,6 +474,20 @@ a build compiled with Vulkan support. `offer_vulkan` controls launcher
 visibility only; it defaults to false so game projects must explicitly expose
 Vulkan after validating their visuals and stability.
 
+Native Vulkan performance diagnostics (`native_vk_services` on the debug API)
+separate swaps from selected endpoint/phase image updates. `image_updates` and
+`phase_composes` count source-image changes; they are not pixel-uniqueness or
+physical-display feedback measurements. `compose_reuses` counts held spatial-AA
+results reused while UI composition continues. TAA still accumulates every tick.
+`gpu_compose_ns / gpu_composes` measures the final composition pass separately
+from the executor's journal timestamps (which can include queue/producer gaps).
+For controlled comparisons, `PSX_NATIVE_VK_COMPOSE_CACHE=0` disables held-result
+reuse, `PSX_NATIVE_GPU_IMAGE_HASH=0` uses CPU readback hashing, and
+`PSX_NATIVE_VK_PHASE_STREAM=0` waits for the complete journal before execution.
+The default streaming path starts the immutable base during interpolation
+preparation, consumes published phase chunks in FIFO order, and waits for the
+final seal before scanout. It preserves interpolation deadlines and image quality.
+
 `fps = 30` preserves original PSX presentation cadence. `fps = 60` enables the
 Native interpolation presentation path while preserving guest VBlank, input,
 and audio timing. The launcher persists the same `fps = 30|60` value in

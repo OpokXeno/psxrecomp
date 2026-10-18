@@ -21,7 +21,8 @@ extern "C" {
 typedef enum {
     GR_BACKEND_SOFTWARE = 0,
     GR_BACKEND_OPENGL   = 1,
-    GR_BACKEND_VULKAN   = 2
+    GR_BACKEND_VULKAN   = 2,
+    GR_BACKEND_NATIVE   = 3   /* API-free VRAM owner over the host backend */
 } GrBackend;
 
 enum {
@@ -320,7 +321,17 @@ typedef struct GpuRenderPresent {
 } GpuRenderPresent;
 
 void      gr_set_backend(GrBackend backend);  /* call before gr_init() */
-GrBackend gr_backend(void);                   /* effective backend after init */
+/* Effective host renderer after init. GR_BACKEND_NATIVE is not a host: it
+ * replaces the facade table with the API-free canonical VRAM owner
+ * (gpu_native_canonical.c) while the host renderer keeps presenting, so
+ * gr_backend() keeps naming the host. Selecting any other backend switches
+ * the facade back. */
+GrBackend gr_backend(void);
+/* The facade table accepts Native semantic packets: it provides both
+ * stream_barrier and draw_semantic_immediate. */
+int       gr_native_packets_supported(void);
+/* The facade table is the native canonical VRAM owner. */
+int       gr_vram_owner_is_native(void);
 
 /* Lifecycle / global state */
 void gr_init(uint16_t *vram);

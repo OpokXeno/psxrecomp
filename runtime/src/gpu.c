@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "gpu_native_canonical.h"
 #include "native_render_baseline.h"
 #include "gpu_render_oracle_internal.h"
 #include "gpu_gl_renderer.h"
@@ -3775,6 +3776,7 @@ void gpu_vblank_tick(void) {
     /* Trusted package-selected plugins run on guest VBlank, independent of
      * host presentation, pacing, turbo, or skipped frames. */
     mod_runtime_on_vblank();
+    gpu_native_canonical_audit_vblank();
     psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (!vblank_callback)
         return;
@@ -6774,6 +6776,12 @@ static void gp0_execute_command(void) {
                 ? command_source_address & UINT32_C(0x001ffffc) : UINT64_MAX))
         psx_fatal_halt("Native draw target was not accepted");
     oracle_complete_fixed(opcode);
+    if (gpu_native_canonical_audit_mode() >= 3) {
+        GpuNativeDrawEnvironment audit_environment;
+        gpu_native_environment_get(&audit_environment);
+        gpu_native_canonical_audit_command(gp0_cmd_buf, gp0_words_needed,
+                                           &audit_environment);
+    }
     if (gpu_pending_vram_event_valid) {
         gpu_emit_vram_event(gpu_pending_vram_event);
         gpu_pending_vram_event_valid = 0;
@@ -8677,7 +8685,7 @@ static int native_preflight_reservation_append(
             (uint8_t)(20u + GUEST_RENDER_NATIVE_STREAM_INVALID_ARGUMENT);
         return 0;
     }
-    packet_fallback_supported = gr_backend() == GR_BACKEND_OPENGL;
+    packet_fallback_supported = gr_native_packets_supported() != 0;
     reserve_status = guest_render_native_stream_reserve_exact(
         native_preflight_reservations.id, identity, &packet_semantic,
         &visual_id, &semantic);
@@ -8806,7 +8814,7 @@ int gpu_native_preflight_gp0_packet(
                 words, word_count, &environment, &packet_semantic) == 1 &&
                 (guest_render_native_stream_match_exact(
                     &identity, &packet_semantic, &visual_id) ||
-                gr_backend() == GR_BACKEND_OPENGL);
+                gr_native_packets_supported());
         }
     }
     if (result && native_preflight_reservations.phase == 1)
@@ -8818,6 +8826,34 @@ int gpu_native_preflight_gp0_packet(
 
 static GpuRenderTransactionId native_packet_bound_visual_id;
 static bool native_packet_bound_visual_valid;
+
+/* GP0 primitive-size rejection for a semantic triangle list: the hardware
+ * (psx-spx, Beetle DrawTriangle) draws nothing for a triangle whose vertices
+ * are more than 1023 apart in X or 511 in Y, tested per triangle on the
+ * parsed integer coordinates (draw offsets do not change distances). The
+ * Native work collector applies the same rule to the journal it rasterizes;
+ * the host raster must drop the same triangles. Accepted triangles are
+ * compacted and renumbered. */
+static void native_semantic_drop_oversize(GpuRenderSemantic *semantic) {
+    uint8_t accepted = 0u;
+
+    if (semantic->topology != GPU_RENDER_SEMANTIC_TRIANGLES) return;
+    for (uint8_t t = 0u; t < semantic->triangle_count; ++t) {
+        int32_t x[3], y[3];
+        for (int v = 0; v < 3; ++v) {
+            x[v] = semantic->triangles[t].vertices[v].x / INT32_C(65536);
+            y[v] = semantic->triangles[t].vertices[v].y / INT32_C(65536);
+        }
+        if (psx_gpu_triangle_oversize(x, y, 0, 1, 2)) continue;
+        if (accepted != t) semantic->triangles[accepted] = semantic->triangles[t];
+        ++accepted;
+    }
+    semantic->triangle_count = accepted;
+    for (uint8_t t = 0u; t < accepted; ++t) {
+        semantic->triangles[t].split_index = t;
+        semantic->triangles[t].split_count = accepted;
+    }
+}
 
 int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
                                  const GpuRenderSemantic *bound_semantic,
@@ -8834,7 +8870,7 @@ int gpu_native_submit_gp0_packet(const uint32_t *words, size_t word_count,
 
     if (!words || word_count == 0u) supported = 0;
     if (supported && native_packet_is_draw(opcode) &&
-        gr_backend() != GR_BACKEND_OPENGL)
+        !gr_native_packets_supported())
         supported = 0;
     if (supported && source) gpu_set_gp0_source(source);
     if (supported && native_packet_is_draw(opcode) &&
@@ -9100,13 +9136,17 @@ native_environment_done:
             semantic.submission_command_id = source->word_address;
             gpu_note_draw_executed(captured ? &canonical : NULL, &semantic);
         } else if (supported && semantic.triangle_count != 0u) {
+            GpuRenderSemantic host_semantic;
             render_status = gr_stream_barrier();
             if (render_status == GPU_RENDER_TRANSACTION_OK) {
                 semantic.submission_command_id = source != NULL &&
                     source->kind != GPU_RENDER_ORACLE_SOURCE_MMIO &&
                     source->word_address != UINT32_MAX
                         ? source->word_address : UINT64_MAX;
-                render_status = gr_draw_semantic_immediate(&semantic);
+                host_semantic = semantic;
+                native_semantic_drop_oversize(&host_semantic);
+                if (host_semantic.triangle_count != 0u)
+                    render_status = gr_draw_semantic_immediate(&host_semantic);
             }
             supported = render_status == GPU_RENDER_TRANSACTION_OK;
             if (supported)
@@ -9117,6 +9157,11 @@ native_environment_done:
         supported = fixed_words > 0 && (size_t)fixed_words == word_count;
     }
 
+    if (supported && gpu_native_canonical_audit_mode() >= 3) {
+        GpuNativeDrawEnvironment audit_environment;
+        gpu_native_environment_get(&audit_environment);
+        gpu_native_canonical_audit_command(words, word_count, &audit_environment);
+    }
     /* Native work consumes packets directly: no coverage diagnostics. */
     if (gpu_native_work_draw_hook != NULL) return supported;
     if (supported && native_packet_is_draw(opcode))

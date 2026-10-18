@@ -17,6 +17,10 @@
 #endif
 #include <time.h>
 #include "debug_server.h"
+#include "native_vk_presenter.h"
+#if defined(PSX_HAVE_VULKAN)
+#include "vk_swapchain.h"
+#endif
 #include "psx_bss.h"
 #include "nd_intro_ot.h"
 #include "latency_ring.h"
@@ -30,6 +34,7 @@
 #include "native_render_baseline.h"
 #include "guest_render_native_stream.h"
 #include "gpu.h"
+#include "gpu_native_canonical.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "hd_texture_runtime.h"
 #include "present_ring.h"
@@ -62,6 +67,14 @@
 #include "gpu_gl_renderer.h"
 #include "wayland_presentation.h"
 #include "native_vk_present.h"
+#include "native_vk_executor.h"
+#if defined(PSX_HAVE_VULKAN)
+#include "vk_core.h"
+#else
+/* vk_core.h needs volk, which a build without Vulkan does not have. */
+int vk_core_info_json(char *out, int capacity);
+int vk_core_validation_json(char *out, int capacity, int count);
+#endif
 #include "gpu_semantic_workload.h"
 #include "gte_attribution.h"
 #include "lockstep.h"
@@ -9524,6 +9537,34 @@ static void handle_screenshot_hires(int id, const char *json)
              "\"height\":%u,\"scale\":%d}", id, path, ow, oh, scale);
 }
 
+/* Native on Vulkan: the next presented swapchain image (the composed frame, UI layer included)
+ * to a PNG. Blocks until the presenter presents or the timeout expires. */
+static void send_vk_present_png(int id, const char *json, const char *default_name)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, default_name, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    unsigned char *rgb = NULL;
+    int W = 0, H = 0;
+    int captured = nvp_capture_presented(1000, &rgb, &W, &H);
+    /* Native on Vulkan presents through vk_swapchain directly (no nvp). */
+    if (!captured && native_vk_services_active())
+        captured = vk_swapchain_capture_presented(1000, &rgb, &W, &H);
+    if (!captured) {
+        send_err(id, "vk present capture failed (inactive, unsupported or timed out)");
+        return;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)H);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
+             id, path, W, H);
+}
+
 /* present_shot — PNG of the COMPOSED renderer output: the frame after SDL fits
  * the display buffer into the logical surface, i.e. at the aspect the player is
  * actually looking at.
@@ -9541,13 +9582,16 @@ static void handle_screenshot_hires(int id, const char *json)
  * next present. Sample `present_shot_seq` before staging and poll it until the
  * counter moves; `wrote` in that reply says whether a file actually landed.
  *
- * Refused up front on headless (no present surface) and on the Vulkan backend,
- * which presents through its own swapchain and has no readback hook — accepting
- * there would leave a request nothing can ever fulfil. */
+ * Refused up front on headless (no present surface). On Native Vulkan it is served
+ * synchronously from the presented swapchain image (send_vk_present_png). */
 static void handle_present_shot(int id, const char *json)
 {
     extern int present_shot_request(const char *path);
     extern int present_shot_seq(void);
+    if (native_vk_services_active()) {
+        send_vk_present_png(id, json, "psx_present_shot.png");
+        return;
+    }
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
         strncpy(path, "psx_present_shot.png", sizeof(path) - 1);
@@ -10354,6 +10398,10 @@ static void handle_wide_shot(int id, const char *json)
  * frame after this command returns. Tests must poll for the file. */
 static void handle_window_shot(int id, const char *json)
 {
+    if (native_vk_services_active()) {
+        send_vk_present_png(id, json, "window_shot.png");
+        return;
+    }
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
         strncpy(path, "window_shot.png", sizeof(path) - 1);
@@ -10388,29 +10436,136 @@ static void handle_vk_present(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"vk_present\":%s}\n", id, obj);
 }
 
+/* vk_info: the shared Vulkan core's device, capabilities, extensions, first
+ * failure and validation counters, with the swapchain counters embedded. */
+static void handle_vk_info(int id, const char *json)
+{
+    (void)json;
+    enum { CAP = 16 * 1024 };
+    char *obj = (char *)malloc(CAP);
+    if (!obj) {
+        send_err(id, "vk_info: out of memory");
+        return;
+    }
+    int n = vk_core_info_json(obj, CAP);
+    if (n >= CAP) send_err(id, "vk_info response overflow");
+    else send_fmt("{\"id\":%d,\"ok\":true,\"vk_info\":%s}\n", id, obj);
+    free(obj);
+}
+
+/* native_vk_shadow: totals, refusals and recent mismatches of the Vulkan Native shadow. */
+static void handle_native_vk_shadow(int id, const char *json)
+{
+    (void)json;
+    enum { CAP = 64 * 1024 };
+    char *obj = (char *)malloc(CAP);
+    if (!obj) {
+        send_err(id, "native_vk_shadow: out of memory");
+        return;
+    }
+    int n = native_vk_shadow_json(obj, CAP);
+    if (n >= CAP) send_err(id, "native_vk_shadow response overflow");
+    else send_fmt("{\"id\":%d,\"ok\":true,\"native_vk_shadow\":%s}\n", id, obj);
+    free(obj);
+}
+
+/* native_vk_shadow_dump: GL and Vulkan RGBA8 of the first mismatch ("path" prefix). */
+static void handle_native_vk_shadow_dump(int id, const char *json)
+{
+    char path[512], err[160] = "";
+    if (!json_get_str(json, "path", path, sizeof(path)) || !path[0]) {
+        send_err(id, "native_vk_shadow_dump: missing path");
+        return;
+    }
+    if (!native_vk_shadow_dump(path, err, sizeof(err))) send_err(id, err);
+    else send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\"}\n", id, path);
+}
+
+/* native_vk_services: Native on Vulkan (no OpenGL): presenter, swapchain and executor counters, plus
+ * why a requested Vulkan Native fell back to OpenGL ("fallback_reason", empty when it did not). */
+static void handle_native_vk_services(int id, const char *json)
+{
+    extern const char *psx_native_vk_fallback_reason(void);
+    (void)json;
+    enum { CAP = 64 * 1024 };
+    char *obj = (char *)malloc(CAP);
+    if (!obj) {
+        send_err(id, "native_vk_services: out of memory");
+        return;
+    }
+    int n = native_vk_services_json(obj, CAP);
+    if (n >= CAP) send_err(id, "native_vk_services response overflow");
+    else send_fmt("{\"id\":%d,\"ok\":true,\"fallback_reason\":\"%s\",\"native_vk_services\":%s}\n",
+                  id, psx_native_vk_fallback_reason(), obj);
+    free(obj);
+}
+
+/* vk_validation: the most recent Vulkan validation / debug-utils messages
+ * ("count", default all kept). */
+static void handle_vk_validation(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 0);
+    enum { CAP = 256 * 1024 };
+    char *obj = (char *)malloc(CAP);
+    if (!obj) {
+        send_err(id, "vk_validation: out of memory");
+        return;
+    }
+    int n = vk_core_validation_json(obj, CAP, count);
+    if (n >= CAP) send_err(id, "vk_validation response overflow");
+    else send_fmt("{\"id\":%d,\"ok\":true,\"vk_validation\":%s}\n", id, obj);
+    free(obj);
+}
+
 /* vk_present_shot: reads back the next presented Vulkan swapchain image (what
  * the compositor receives) and writes it to a PNG. Blocks until the presenter
  * presents a frame or the timeout expires. */
 static void handle_vk_present_shot(int id, const char *json)
 {
+    send_vk_present_png(id, json, "vk_present_shot.png");
+}
+
+/* screenshot on Native Vulkan: the guest display read through the facade's CPU readout
+ * (gr_render_display), which needs no OpenGL context. */
+static void handle_vk_display_shot(int id, const char *json)
+{
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) {
+        send_err(id, "display disabled"); return;
+    }
+    if (di.depth24) { send_err(id, "24bpp scanout (unsupported)"); return; }
+    uint32_t w = di.width;  if (w > 640) w = 640;
+    uint32_t h = di.height; if (h > 512) h = 512;
+
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
-        strncpy(path, "vk_present_shot.png", sizeof(path) - 1);
+        strncpy(path, "psx_screenshot.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
-    unsigned char *rgb = NULL;
-    int W = 0, H = 0;
-    if (!nvp_capture_presented(1000, &rgb, &W, &H)) {
-        send_err(id, "vk present capture failed (inactive, unsupported or timed out)");
-        return;
+    uint32_t *argb = (uint32_t *)calloc((size_t)w * h, sizeof(uint32_t));
+    if (!argb) { send_err(id, "alloc failed"); return; }
+    int got = gr_render_display(argb, (int)(w * sizeof(*argb)),
+                                (int)di.display_x, (int)di.display_y, (int)w, (int)h);
+    if (got < (int)((size_t)w * h)) {
+        free(argb); send_err(id, "no display surface"); return;
     }
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { free(argb); send_err(id, "alloc failed"); return; }
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        rgb[i * 3 + 0] = (uint8_t)((argb[i] >> 16) & 0xFF);
+        rgb[i * 3 + 1] = (uint8_t)((argb[i] >> 8) & 0xFF);
+        rgb[i * 3 + 2] = (uint8_t)(argb[i] & 0xFF);
+    }
+    free(argb);
     FILE *f = fopen(path, "wb");
     if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
-    int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)H);
-    free(rgb); fclose(f);
+    int ok = png_write_rgb(f, rgb, w, h);
+    free(rgb);
+    fclose(f);
     if (!ok) { send_err(id, "png encode failed"); return; }
-    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
-             id, path, W, H);
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}",
+             id, path, w, h);
 }
 
 /* screenshot: capture what the player is actually being shown. Native-wide
@@ -10421,6 +10576,10 @@ static void handle_vk_present_shot(int id, const char *json)
 static void handle_present_screenshot(int id, const char *json)
 {
     extern int gr_wide_supported(void);
+    if (native_vk_services_active()) {
+        handle_vk_display_shot(id, json);
+        return;
+    }
     if (gr_wide_supported() && ws_nw_extra() > 0) {
         handle_wide_shot(id, json);
         return;
@@ -15149,8 +15308,10 @@ static void handle_native_pipeline_diag(int id, const char *json)
         send_err(id, "native_pipeline_diag response overflow");
         return;
     }
+    char gl_identity[512];
+    json_escape_string(gl_identity, sizeof(gl_identity), gl_renderer_gl_identity());
     pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-        "],\"gpu\":{\"submitted\":%llu,\"completed\":%llu,\"applied\":%llu,"
+        "],\"gpu\":{\"gl\":\"%s\",\"submitted\":%llu,\"completed\":%llu,\"applied\":%llu,"
         "\"cancelled\":%llu,\"geometry_draws\":%llu,\"transfer_draws\":%llu,"
         "\"commands\":%llu,\"captured_bytes\":%llu,\"readback_bytes\":%llu,"
         "\"filter_draws\":[[%llu,%llu],[%llu,%llu]],"
@@ -15161,7 +15322,9 @@ static void handle_native_pipeline_diag(int id, const char *json)
         "\"prefetch_prepared\":%llu,\"prefetch_used\":%llu,\"prefetch_discarded\":%llu,\"prefetch_cpu_ns\":%llu,"
         "\"last_image_digest\":\"0x%llX\",\"render_scale\":%u,"
         "\"storage_width\":%u,\"storage_height\":%u,\"pending_state\":%u,"
+        "\"failures\":%llu,\"failure_stage\":\"%s\",\"failure_command\":%u,\"failure_kind\":%u,\"failure_gl_error\":\"0x%X\","
         "\"last_image_identity\":[%llu,%llu,%llu,%llu,%u]}}",
+        gl_identity,
         (unsigned long long)compiler.gpu.submitted,
         (unsigned long long)compiler.gpu.completed,
         (unsigned long long)compiler.gpu.applied,
@@ -15201,6 +15364,9 @@ static void handle_native_pipeline_diag(int id, const char *json)
         (unsigned long long)compiler.gpu.last_image_digest,
         compiler.gpu.render_scale, compiler.gpu.storage_width,
         compiler.gpu.storage_height, compiler.gpu.pending_state,
+        (unsigned long long)compiler.gpu.failures,
+        gl_renderer_native_gpu_failure_name(compiler.gpu.failure_stage),
+        compiler.gpu.failure_command, compiler.gpu.failure_kind, compiler.gpu.failure_gl_error,
         (unsigned long long)compiler.gpu.last_image_identity.presentation_epoch,
         (unsigned long long)compiler.gpu.last_image_identity.source_sequence,
         (unsigned long long)compiler.gpu.last_image_identity.guest_vblank_sequence,
@@ -17799,6 +17965,61 @@ static void handle_hd_textures(int id, const char *json)
              (unsigned long long)gl[6], recent);
 }
 
+/* native_canonical: Native canonical VRAM owner counters (single-owner OpenGL
+ * and the `native` facade backend share them).
+ *   {"cmd":"native_canonical"} -> active, deferral state, syncs, deferrals */
+static void handle_native_canonical(int id, const char *json)
+{
+    GpuNativeCanonicalStats st;
+    (void)json;
+    gpu_native_canonical_stats(&st);
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":%d,\"deferred\":%d,"
+             "\"sync_count\":%llu,\"sync_total_ns\":%llu,\"sync_max_ns\":%llu,"
+             "\"deferred_draws\":%llu,\"deferred_legacy_draws\":%llu,"
+             "\"deferred_fills\":%llu,\"deferred_copies\":%llu,"
+             "\"transfers_in\":%llu,\"transfers_out\":%llu,\"handoffs\":%llu,"
+             "\"skipped_temporal_candidates\":%llu,"
+             "\"skipped_anchor_vertices\":%llu}",
+             id, st.active, st.deferred,
+             (unsigned long long)st.sync_count,
+             (unsigned long long)st.sync_total_ns,
+             (unsigned long long)st.sync_max_ns,
+             (unsigned long long)st.deferred_draws,
+             (unsigned long long)st.deferred_legacy_draws,
+             (unsigned long long)st.deferred_fills,
+             (unsigned long long)st.deferred_copies,
+             (unsigned long long)st.transfers_in,
+             (unsigned long long)st.transfers_out,
+             (unsigned long long)st.handoffs,
+             (unsigned long long)st.skipped_temporal_candidates,
+             (unsigned long long)st.skipped_anchor_vertices);
+}
+
+/* canonical_audit (PSX_NATIVE_CANONICAL_AUDIT=1|2): GL raster vs Native words.
+ *   {"cmd":"canonical_audit","n":N}        totals + newest N ring entries
+ *   {"cmd":"canonical_audit_dump","path":P} write P.gl.bin / P.native.bin */
+static void handle_canonical_audit(int id, const char *json)
+{
+    char *out = gpu_native_canonical_audit_json(id, json_get_int(json, "n", 0));
+    if (!out) { send_err(id, "oom"); return; }
+    send_line(out);
+    free(out);
+}
+
+static void handle_canonical_audit_dump(int id, const char *json)
+{
+    char path[900];
+    char *out;
+    if (!json_get_str(json, "path", path, sizeof(path)) || !path[0]) {
+        send_err(id, "path required");
+        return;
+    }
+    out = gpu_native_canonical_audit_dump(id, path);
+    if (!out) { send_err(id, "oom"); return; }
+    send_line(out);
+    free(out);
+}
+
 static void handle_idle_skip(int id, const char *json)
 {
     extern int      g_idle_skip_enabled;
@@ -18058,6 +18279,9 @@ static const CmdEntry s_commands[] = {
     { "phase_hot",         handle_phase_hot },
     { "idle_skip",         handle_idle_skip },
     { "hd_textures",       handle_hd_textures },
+    { "native_canonical",  handle_native_canonical },
+    { "canonical_audit",   handle_canonical_audit },
+    { "canonical_audit_dump", handle_canonical_audit_dump },
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
@@ -18323,8 +18547,13 @@ static const CmdEntry s_commands[] = {
     { "wide_shot",         handle_wide_shot },
     { "window_shot",       handle_window_shot },
     { "vk_present",        handle_vk_present },
+    { "vk_info",           handle_vk_info },
+    { "vk_validation",     handle_vk_validation },
+    { "native_vk_shadow",  handle_native_vk_shadow },
+    { "native_vk_shadow_dump", handle_native_vk_shadow_dump },
     { "gpu_profile",       handle_gpu_profile },
     { "vk_present_shot",   handle_vk_present_shot },
+    { "native_vk_services", handle_native_vk_services },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },

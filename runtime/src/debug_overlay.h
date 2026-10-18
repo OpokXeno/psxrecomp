@@ -54,6 +54,12 @@ void psx_debug_overlay_present_observe(void);
 void psx_debug_overlay_present_observe_target(unsigned int framebuffer);
 void psx_debug_overlay_service_main(void);
 
+/* Native on Vulkan: the overlay has no window of its own. The runtime menu composites its ImGui
+ * frame into the same UI layer, so vk_record draws into the caller's VkCommandBuffer (passed as
+ * void*). vk_visible is nonzero while the overlay is shown. */
+int  psx_debug_overlay_vk_visible(void);
+void psx_debug_overlay_vk_record(void *cmd_buffer, int width, int height);
+
 /* Post-swap correction: pre_swap counts every attempt (including blocked
  * ones), so FPS (presented) would read high whenever attempts don't
  * complete. The worker path reports its result; uncompleted attempts are
@@ -245,6 +251,8 @@ static inline void psx_debug_overlay_pre_swap(void) { psx_debug_overlay_pre_swap
 static inline void psx_debug_overlay_present_observe(void) {}
 static inline void psx_debug_overlay_present_observe_target(unsigned int f) { (void)f; }
 static inline void psx_debug_overlay_service_main(void) {}
+static inline int  psx_debug_overlay_vk_visible(void) { return 0; }
+static inline void psx_debug_overlay_vk_record(void *c, int w, int h) { (void)c; (void)w; (void)h; }
 static inline void psx_debug_overlay_post_swap(int c) { (void)c; }
 static inline bool psx_debug_overlay_swallow_keyboard(void) { return false; }
 static inline SDL_Window* psx_debug_overlay_camera_input_window(void) { return NULL; }

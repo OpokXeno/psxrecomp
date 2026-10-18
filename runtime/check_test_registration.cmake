@@ -44,6 +44,7 @@ set(_PSXRECOMP_TESTREG_DIR "${CMAKE_CURRENT_LIST_DIR}")
 # Every entry needs a reason. An entry with no reason is a silent orphan with
 # extra steps, which is the thing this file exists to prevent.
 set(PSXRECOMP_TESTS_NOT_REGISTERED
+    "test_native_vk_debug_views.py|manual live integration test requiring an isolated running Vulkan game, private save, explicit debug-server port and screenshot output directory"
     "test_overlay_posix.c|built and run by tests/run_overlay_posix_test.sh, which stages the dlopen fixture tree; that script is registered as overlay_posix_test on UNIX"
 )
 

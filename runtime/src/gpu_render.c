@@ -70,6 +70,10 @@ extern const GpuRenderBackend *gl_backend_get(void);
 /* Supplied by gpu_vk_renderer.c; returns NULL until the Vulkan backend is
  * ready (init succeeded). When Vulkan isn't compiled in it returns NULL. */
 extern const GpuRenderBackend *vk_backend_get(void);
+#ifndef GPU_RENDER_TRANSACTION_TESTING
+/* Supplied by gpu_native_canonical.c: the API-free canonical VRAM owner. */
+extern const GpuRenderBackend *native_canonical_backend_get(void);
+#endif
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
@@ -164,12 +168,22 @@ void gr_set_backend(GrBackend backend) {
     /* The selector is documented as pre-init. Never orphan an open checkpoint
      * if a caller violates that ordering. */
     if (g_transaction.phase != GR_TRANSACTION_IDLE) return;
+    /* The native table overlays the host renderer: g_effective keeps naming
+     * the host, and switching back to it is not a new selection. */
+    const int from_native = gr_vram_owner_is_native();
+#ifndef GPU_RENDER_TRANSACTION_TESTING
+    if (backend == GR_BACKEND_NATIVE) {
+        g_b = native_canonical_backend_get();
+        return;
+    }
+#endif
     if (backend == GR_BACKEND_OPENGL) {
         const GpuRenderBackend *gl = gl_backend_get();
         if (gl) {
             g_b = gl;
             g_effective = GR_BACKEND_OPENGL;
-            fprintf(stdout, "psxrecomp: renderer = opengl (%s)\n", gl->name);
+            if (!from_native)
+                fprintf(stdout, "psxrecomp: renderer = opengl (%s)\n", gl->name);
             return;
         }
         fprintf(stdout, "psxrecomp: renderer = opengl requested but unavailable "
@@ -190,6 +204,18 @@ void gr_set_backend(GrBackend backend) {
 }
 
 GrBackend gr_backend(void) { return g_effective; }
+
+int gr_vram_owner_is_native(void) {
+#ifndef GPU_RENDER_TRANSACTION_TESTING
+    return g_b == native_canonical_backend_get();
+#else
+    return 0;
+#endif
+}
+
+int gr_native_packets_supported(void) {
+    return g_b->stream_barrier != NULL && g_b->draw_semantic_immediate != NULL;
+}
 
 GpuRenderDrawSuppressionStatus gr_draw_suppression_begin(void) {
     if (g_draw_suppression.poisoned)

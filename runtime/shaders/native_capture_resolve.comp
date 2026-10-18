@@ -1,0 +1,89 @@
+#version 450
+//! gl_version 430
+#include "native_prelude.glsl"
+layout(local_size_x=128) in;
+layout(std430,PSX_BINDING(0,0)) buffer Metadata { uint meta[]; };
+layout(std430,PSX_BINDING(1,1)) readonly buffer Fragments { uvec4 fragments[]; };
+layout(rgba8,PSX_BINDING(2,2)) uniform image2D color_image;
+layout(r32ui,PSX_BINDING(3,3)) uniform uimage2D depth_image;
+#ifdef VULKAN
+layout(push_constant) uniform CapturePush { vec4 view; ivec4 rect; uvec4 info; };
+#else
+uniform vec4 view; uniform ivec4 rect; uniform uvec4 info;
+#endif
+shared uint scan[256];
+shared uint carry,block_sum;
+void main(){
+ uint pixels=uint(rect.z*rect.w),lane=gl_LocalInvocationID.x;
+ if(info.x==0u){
+  uint base=gl_WorkGroupID.x*256u,a=base+lane,b=a+128u;
+  scan[lane]=a<pixels?meta[4u+a]:0u;
+  scan[lane+128u]=b<pixels?meta[4u+b]:0u;barrier();
+  for(uint step=1u;step<256u;step<<=1u){uint i=(lane+1u)*step*2u-1u;
+   if(i<256u)scan[i]+=scan[i-step];barrier();}
+  if(lane==0u){meta[4u+3u*pixels+gl_WorkGroupID.x]=scan[255];scan[255]=0u;}barrier();
+  for(uint step=128u;step!=0u;step>>=1u){uint i=(lane+1u)*step*2u-1u;
+   if(i<256u){uint left=scan[i-step];scan[i-step]=scan[i];scan[i]+=left;}barrier();}
+  if(a<pixels)meta[4u+2u*pixels+a]=scan[lane];
+  if(b<pixels)meta[4u+2u*pixels+b]=scan[lane+128u];
+  return;
+ }
+ if(info.x==1u){
+  uint groups=(pixels+255u)/256u,limit=info.y+1u;
+  if(lane==0u)carry=0u;barrier();
+  /* Scan the group totals cooperatively. A serial dependent SSBO load per
+   * group leaves almost the entire GPU idle at low clocks. Saturation is
+   * exact whenever the list fits and prevents wraparound on overflow. */
+  for(uint base=0u;base<groups;base+=256u){
+   uint a=base+lane,b=a+128u;
+   scan[lane]=a<groups?min(meta[4u+3u*pixels+a],limit):0u;
+   scan[lane+128u]=b<groups?min(meta[4u+3u*pixels+b],limit):0u;barrier();
+   for(uint step=1u;step<256u;step<<=1u){uint i=(lane+1u)*step*2u-1u;
+    if(i<256u)scan[i]=min(scan[i]+scan[i-step],limit);barrier();}
+   if(lane==0u){block_sum=scan[255];scan[255]=0u;
+    if(block_sum>info.y||carry>info.y-min(block_sum,info.y))atomicOr(meta[0],1u);}
+   barrier();
+   for(uint step=128u;step!=0u;step>>=1u){uint i=(lane+1u)*step*2u-1u;
+    if(i<256u){uint left=scan[i-step];scan[i-step]=scan[i];scan[i]=min(scan[i]+left,limit);}barrier();}
+   if(a<groups)meta[4u+3u*pixels+a]=min(carry+scan[lane],limit);
+   if(b<groups)meta[4u+3u*pixels+b]=min(carry+scan[lane+128u],limit);
+   barrier();if(lane==0u)carry=min(carry+block_sum,limit);barrier();
+  }
+  if(lane==0u)meta[1]=carry;return;
+ }
+ uint pixel=gl_GlobalInvocationID.x;
+ if(pixel>=pixels||meta[0]!=0u)return;
+ uint count=meta[4u+pixels+pixel];if(count==0u)return;
+ uint offset=meta[4u+2u*pixels+pixel]+meta[4u+3u*pixels+(pixel>>8u)];
+ ivec2 p=ivec2(int(pixel%uint(rect.z)),int(pixel/uint(rect.z)))+rect.xy;
+ uint rgba=packUnorm4x8(imageLoad(color_image,p)),key=imageLoad(depth_image,p).r;
+ /* Raster work commonly appends a pixel's fragments monotonically, in
+  * either direction. Recognize that exact order instead of performing a
+  * quadratic search for every pixel; arbitrary interleavings retain it. */
+ bool ascending=true,descending=true;uint prior=fragments[offset].x;
+ for(uint j=1u;j<count;++j){uint order=fragments[offset+j].x;
+  ascending=ascending&&order>prior;descending=descending&&order<prior;prior=order;
+  if(!ascending&&!descending)break;}
+ uint previous=0u;
+ for(uint done=0u;done<count;++done){uvec4 selected;
+  if(ascending)selected=fragments[offset+done];
+  else if(descending)selected=fragments[offset+count-1u-done];
+  else{selected=uvec4(0xffffffffu);
+   for(uint j=0u;j<count;++j){uvec4 f=fragments[offset+j];if(f.x>previous&&f.x<selected.x)selected=f;}}
+  previous=selected.x;uint bits=selected.w;
+  if((bits&(1u<<20u))!=0u&&(rgba>>24u)>127u)continue;
+  if((bits&(1u<<21u))!=0u&&selected.z<key-(key>>10u))continue;
+  ivec3 c=ivec3(int(bits&31u),int((bits>>5u)&31u),int((bits>>10u)&31u));
+  bool blend=(bits&(1u<<16u))!=0u;
+  if(blend){ivec3 old=ivec3(int(rgba&255u),int((rgba>>8u)&255u),int((rgba>>16u)&255u))>>3;
+   uint mode=(bits>>18u)&3u;
+   if(mode==0u)c=(old+c)/2;else if(mode==1u)c=old+c;else if(mode==2u)c=old-c;else c=old+c/4;}
+  c=clamp(c,ivec3(0),ivec3(31));c=(c<<3)|(c>>2);
+  uint alpha=(((bits>>15u)&1u)*2u+((bits>>17u)&1u))*85u;
+  rgba=uint(c.r)|(uint(c.g)<<8u)|(uint(c.b)<<16u)|(alpha<<24u);
+  uint write_mode=(bits>>22u)&7u;
+  key=write_mode==4u?1u:blend?((bits&(1u<<25u))!=0u?key:0u):write_mode==2u?selected.y:0u;
+ }
+ imageStore(color_image,p,unpackUnorm4x8(rgba));
+ if(info.w!=0u)imageStore(depth_image,p,uvec4(key));
+}

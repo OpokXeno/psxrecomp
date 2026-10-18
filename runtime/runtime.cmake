@@ -457,9 +457,19 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render_oracle.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_semantic_workload.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/gpu_native_canonical.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_gpu_hazard.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_gpu_geometry.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_work_compiler.c
     ${PSXRECOMP_ROOT}/runtime/src/wayland_presentation.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/vk_core.c
+    ${PSXRECOMP_ROOT}/runtime/src/vk_swapchain.c
     ${PSXRECOMP_ROOT}/runtime/src/native_vk_present.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_vk_executor.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_vk_presenter.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_presenter_select.c
+    ${PSXRECOMP_ROOT}/runtime/src/hd_texture_cache.c
     ${PSXRECOMP_ROOT}/runtime/src/dma_gpu_ll.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
@@ -2329,6 +2339,73 @@ function(psxrecomp_add_runtime_target target)
         endif()
     endif()
 
+    # Python for the shader embedding tools.
+    # Resolve the native interpreter behind the Windows Python launcher.
+    # Invoking py.exe with a .py file can honor that file's /usr/bin/env
+    # shebang and accidentally select an unrelated MSYS Python, which cannot
+    # open the native absolute paths emitted by Windows CMake/Ninja.
+    if(WIN32 AND NOT PSX_PYTHON)
+        find_program(_psx_python_launcher NAMES py)
+        if(_psx_python_launcher)
+            execute_process(
+                COMMAND "${_psx_python_launcher}" -3 -c
+                        "import sys; print(sys.executable)"
+                OUTPUT_VARIABLE _psx_native_python
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(EXISTS "${_psx_native_python}")
+                set(PSX_PYTHON "${_psx_native_python}" CACHE FILEPATH
+                    "Python 3 interpreter used by runtime build tools")
+            endif()
+        endif()
+    endif()
+    if(NOT PSX_PYTHON)
+        find_program(PSX_PYTHON NAMES python python3)
+    endif()
+    if(NOT PSX_PYTHON)
+        message(FATAL_ERROR
+            "Shader embedding requires Python 3 (py/python/python3)")
+    endif()
+    # Shared shader sources (runtime/shaders): one GLSL file per Native/present
+    # program serves both APIs. The GL text is generated here (tools/embed_glsl.py
+    # resolves #include, strips comments and emits one C string per program and
+    # variant); the Vulkan SPIR-V is built from the same files below.
+    set(_gl_shader_dir "${PSXRECOMP_ROOT}/runtime/shaders")
+    file(GLOB _gl_shaders
+        "${_gl_shader_dir}/*.vert" "${_gl_shader_dir}/*.frag"
+        "${_gl_shader_dir}/*.comp")
+    file(GLOB _gl_shader_includes "${_gl_shader_dir}/*.glsl")
+    set(_gl_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/${target}_glgen")
+    set(_gl_shader_hdr "${_gl_gen_dir}/gl_shaders.h")
+    set(_gl_shader_depfile "${_gl_gen_dir}/gl_shaders.h.d")
+    set(_gl_depfile_args "")
+    if(NOT CMAKE_GENERATOR MATCHES "Visual Studio|Xcode" OR
+       NOT CMAKE_VERSION VERSION_LESS 3.21)
+        set(_gl_depfile_args DEPFILE "${_gl_shader_depfile}")
+    endif()
+    add_custom_command(
+        OUTPUT  "${_gl_shader_hdr}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_gl_gen_dir}"
+        COMMAND "${PSX_PYTHON}"
+                "${PSXRECOMP_ROOT}/tools/embed_glsl.py"
+                --out "${_gl_shader_hdr}"
+                --depfile "${_gl_shader_depfile}"
+                ${_gl_shaders}
+        DEPENDS ${_gl_shaders}
+                ${_gl_shader_includes}
+                "${PSXRECOMP_ROOT}/tools/embed_glsl.py"
+        ${_gl_depfile_args}
+        COMMENT "Generating OpenGL shader text"
+        VERBATIM)
+    add_custom_target(${target}_gl_shaders DEPENDS "${_gl_shader_hdr}")
+    add_dependencies(${target} ${target}_gl_shaders)
+    target_include_directories(${target} PRIVATE "${_gl_gen_dir}")
+
+    # Export the effective Vulkan definition for release verification (works
+    # with Ninja, Makefiles and Visual Studio, without compile_commands.json).
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${target}_compile_definitions.txt"
+        CONTENT "$<JOIN:$<FILTER:$<TARGET_PROPERTY:${target},COMPILE_DEFINITIONS>,INCLUDE,^PSX_HAVE_VULKAN=>,\n>\n")
+
     # ---- Vulkan backend (gpu_vk_renderer.c) --------------------------------
     # Vulkan is loaded ENTIRELY dynamically via SDL_Vulkan_LoadLibrary +
     # vkGetInstanceProcAddr (mirroring how the GL backend loads modern GL through
@@ -2343,6 +2420,15 @@ function(psxrecomp_add_runtime_target target)
     # runtime renderer: OpenGL remains the default in config_loader.h. Builders
     # can still use -DPSX_ENABLE_VULKAN=OFF to produce the inert stub explicitly.
     option(PSX_ENABLE_VULKAN "Build the Vulkan renderer backend when SDK tools are available" ON)
+    # PSX_REQUIRE_VULKAN turns every silent fallback to the software stub into a
+    # configure error. Release builds set it so a missing SDK cannot ship a
+    # binary without the Vulkan backend.
+    option(PSX_REQUIRE_VULKAN "Fail configuration when the Vulkan backend cannot be built" OFF)
+    if(PSX_REQUIRE_VULKAN)
+        set(_vk_missing FATAL_ERROR)
+    else()
+        set(_vk_missing STATUS)
+    endif()
     if(PSX_ENABLE_VULKAN)
     # $VULKAN_SDK first; else find_path. Unset before find_path — an empty
     # normal _vk_inc makes find_path a no-op on modern CMake (Homebrew miss).
@@ -2398,7 +2484,7 @@ function(psxrecomp_add_runtime_target target)
                     "Vulkan backend: ${_vk_inc} is not reachable directly; "
                     "staged ${_vk_stage} instead.")
             else()
-                message(STATUS
+                message(${_vk_missing}
                     "Vulkan backend: headers at ${_vk_inc} are not reachable from "
                     "${CMAKE_C_COMPILER} - gpu_vk_renderer.c builds as a software "
                     "stub. Set VULKAN_SDK to a copy the compiler can see to enable it.")
@@ -2416,41 +2502,48 @@ function(psxrecomp_add_runtime_target target)
             target_include_directories(${target} PRIVATE "${_vk_inc}")
         endif()
         target_compile_definitions(${target} PRIVATE PSX_HAVE_VULKAN=1)
+        # volk loads the Vulkan entry points at runtime (dlopen on Linux, which
+        # the Threads/CMAKE_DL_LIBS link above already covers). vk_mem_alloc.cpp
+        # is the single VMA implementation TU and includes volk.h itself.
+        target_include_directories(${target} PRIVATE
+            "${PSXRECOMP_ROOT}/runtime/third_party/volk"
+            "${PSXRECOMP_ROOT}/runtime/third_party/vma")
+        target_sources(${target} PRIVATE
+            ${PSXRECOMP_ROOT}/runtime/third_party/volk/volk.c
+            ${PSXRECOMP_ROOT}/runtime/third_party/vma/vk_mem_alloc.cpp)
+        # Dear ImGui's Vulkan backend (runtime menu on Native-on-Vulkan), loading its
+        # entry points through the same volk as vk_core.
+        if(PSX_RECOMP_UI AND NOT PSXRT_ORACLE AND (PSX_RUNTIME_MENU OR PSX_DEBUG_OVERLAY))
+            set(_psx_imgui_vk "${RECOMP_UI_ROOT}/src/third_party/imgui/backends/imgui_impl_vulkan.cpp")
+            target_sources(${target} PRIVATE "${_psx_imgui_vk}"
+                "${PSXRECOMP_ROOT}/runtime/src/psx_imgui_vulkan.cpp")
+            set_source_files_properties("${_psx_imgui_vk}" PROPERTIES COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK=1)
+            set_property(SOURCE "${PSXRECOMP_ROOT}/runtime/src/psx_imgui_vulkan.cpp" APPEND PROPERTY COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK=1)
+            foreach(_psx_vk_ui_src runtime_menu.cpp debug_overlay.cpp)
+                set_property(SOURCE "${PSXRECOMP_ROOT}/runtime/src/${_psx_vk_ui_src}" APPEND PROPERTY COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK=1 PSX_IMGUI_VULKAN=1)
+            endforeach()
+        endif()
         # Compile every shader under runtime/shaders/ to SPIR-V (glslc) and embed
         # them into one generated header (vk_shaders_spv.h) of uint32_t arrays, so
         # gpu_vk_renderer.c creates shader modules with no runtime file deps.
-        # Resolve the native interpreter behind the Windows Python launcher.
-        # Invoking py.exe with a .py file can honor that file's /usr/bin/env
-        # shebang and accidentally select an unrelated MSYS Python, which cannot
-        # open the native absolute paths emitted by Windows CMake/Ninja.
-        if(WIN32 AND NOT PSX_PYTHON)
-            find_program(_psx_python_launcher NAMES py)
-            if(_psx_python_launcher)
-                execute_process(
-                    COMMAND "${_psx_python_launcher}" -3 -c
-                            "import sys; print(sys.executable)"
-                    OUTPUT_VARIABLE _psx_native_python
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET)
-                if(EXISTS "${_psx_native_python}")
-                    set(PSX_PYTHON "${_psx_native_python}" CACHE FILEPATH
-                        "Python 3 interpreter used by runtime build tools")
-                endif()
-            endif()
-        endif()
-        if(NOT PSX_PYTHON)
-            find_program(PSX_PYTHON NAMES python python3)
-        endif()
-        if(NOT PSX_PYTHON)
-            message(FATAL_ERROR
-                "Vulkan shader embedding requires Python 3 (py/python/python3)")
-        endif()
         set(_vk_shader_dir "${PSXRECOMP_ROOT}/runtime/shaders")
         file(GLOB _vk_shaders
             "${_vk_shader_dir}/*.vert" "${_vk_shader_dir}/*.frag"
             "${_vk_shader_dir}/*.comp")
+        # Shared .glsl includes are not compiled on their own; they only trigger
+        # a rebuild here (the depfile covers the ones actually included).
+        file(GLOB _vk_shader_includes "${_vk_shader_dir}/*.glsl")
         set(_vk_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/${target}_vkgen")
         set(_vk_spv_hdr "${_vk_gen_dir}/vk_shaders_spv.h")
+        set(_vk_spv_depfile "${_vk_gen_dir}/vk_shaders_spv.h.d")
+        # DEPFILE is an error for the Visual Studio and Xcode generators before
+        # CMake 3.21 (the minimum here is 3.20), so only pass it where supported.
+        # Ninja and Makefile generators take it at 3.20.
+        set(_vk_depfile_args "")
+        if(NOT CMAKE_GENERATOR MATCHES "Visual Studio|Xcode" OR
+           NOT CMAKE_VERSION VERSION_LESS 3.21)
+            set(_vk_depfile_args DEPFILE "${_vk_spv_depfile}")
+        endif()
         add_custom_command(
             OUTPUT  "${_vk_spv_hdr}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${_vk_gen_dir}"
@@ -2458,19 +2551,26 @@ function(psxrecomp_add_runtime_target target)
                     "${PSXRECOMP_ROOT}/tools/embed_spirv.py"
                     --glslc "${GLSLC_EXE}"
                     --out   "${_vk_spv_hdr}"
+                    --depfile "${_vk_spv_depfile}"
                     ${_vk_shaders}
             DEPENDS ${_vk_shaders}
+                    ${_vk_shader_includes}
                     "${PSXRECOMP_ROOT}/tools/embed_spirv.py"
+            ${_vk_depfile_args}
             COMMENT "Compiling + embedding Vulkan SPIR-V shaders"
             VERBATIM)
         add_custom_target(${target}_vk_shaders DEPENDS "${_vk_spv_hdr}")
         add_dependencies(${target} ${target}_vk_shaders)
         target_include_directories(${target} PRIVATE "${_vk_gen_dir}")
     else()
-        message(STATUS "Vulkan backend: PSX_ENABLE_VULKAN=ON but SDK headers/glslc "
+        message(${_vk_missing} "Vulkan backend: PSX_ENABLE_VULKAN=ON but SDK headers/glslc "
                        "not found - gpu_vk_renderer.c builds as a software stub")
     endif()
     else()
+        if(PSX_REQUIRE_VULKAN)
+            message(FATAL_ERROR "Vulkan backend: PSX_REQUIRE_VULKAN=ON needs "
+                                "PSX_ENABLE_VULKAN=ON")
+        endif()
         message(STATUS "Vulkan backend: disabled (PSX_ENABLE_VULKAN=OFF) - "
                        "gpu_vk_renderer.c builds as an inert stub")
     endif()

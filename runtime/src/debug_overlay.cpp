@@ -51,15 +51,22 @@
 #define PSX_IMGUI_SDL_INIT_OPENGL ImGui_ImplSDL3_InitForOpenGL
 #define PSX_IMGUI_SDL_NEW_FRAME ImGui_ImplSDL3_NewFrame
 #define PSX_IMGUI_SDL_PROCESS_EVENT ImGui_ImplSDL3_ProcessEvent
+#define PSX_IMGUI_SDL_INIT_VULKAN ImGui_ImplSDL3_InitForVulkan
 #define PSX_IMGUI_SDL_SHUTDOWN ImGui_ImplSDL3_Shutdown
 #else
 #include <imgui_impl_sdl2.h>
 #define PSX_IMGUI_SDL_INIT_OPENGL ImGui_ImplSDL2_InitForOpenGL
 #define PSX_IMGUI_SDL_NEW_FRAME ImGui_ImplSDL2_NewFrame
 #define PSX_IMGUI_SDL_PROCESS_EVENT ImGui_ImplSDL2_ProcessEvent
+#define PSX_IMGUI_SDL_INIT_VULKAN ImGui_ImplSDL2_InitForVulkan
 #define PSX_IMGUI_SDL_SHUTDOWN ImGui_ImplSDL2_Shutdown
 #endif
 #include <imgui_impl_opengl3.h>
+#if defined(PSX_IMGUI_VULKAN)
+#include <imgui_impl_vulkan.h>
+#include "native_vk_presenter.h"
+#include "psx_imgui_vulkan.h"
+#endif
 
 /* png_write_rgb is the same dependency-free header the debug server uses to
  * write its screenshot_file / wide_shot PNGs — reuse the exact mechanism for
@@ -178,6 +185,7 @@ extern "C" int  gl_renderer_native_wireframe(void);
 extern "C" void gl_renderer_set_native_wireframe(int on);
 extern "C" int  psx_video_get_window_width(void);
 extern "C" void psx_video_set_window_width(int w);
+extern "C" int psx_video_set_window_maximized(int enabled);
 extern "C" int  psx_video_get_vsync(void);
 extern "C" void psx_video_set_vsync(int mode);
 extern "C" int  psx_input_controller_ports_swapped(void);
@@ -209,6 +217,10 @@ static SDL_Window *s_win = nullptr;
  * GL context (the main thread's context is current at that point — init
  * is called with NULL by design). */
 static bool s_imgui_ready = false;
+#if defined(PSX_IMGUI_VULKAN)
+/* Native on Vulkan: the overlay's own ImGui context (no GL). */
+static ImGuiContext *s_vk_ctx = nullptr;
+#endif
 
 /* window_shot arm. The debug server thread sets s_window_shot_armed and
  * copies the path; the next pre_swap consumes the arm and clears it. The
@@ -3545,6 +3557,16 @@ void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
 
 void psx_debug_overlay_shutdown(void)
 {
+#if defined(PSX_IMGUI_VULKAN)
+    if (s_vk_ctx) {
+        ImGui::SetCurrentContext(s_vk_ctx);
+        PSX_IMGUI_SDL_SHUTDOWN();
+        psx_imgui_vulkan_backend_shutdown();
+        ImGui::DestroyContext(s_vk_ctx);
+        s_vk_ctx = nullptr;
+        s_imgui_ready = false;
+    }
+#endif
     if (s_imgui_ready) {
         if (s_separate_ready && s_tools_ctx) {
             SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx);
@@ -3832,6 +3854,24 @@ static bool tools_window_ensure(SDL_Window *game_win, SDL_GLContext game_ctx)
     return true;
 }
 
+/* Load the XML data tables once. SDL_GetBasePath() is stable for the process
+ * lifetime and the dir is staged by POST_BUILD. A failure here is non-fatal —
+ * dbg_data_*_missing() lets the UI render an empty placeholder so the user can
+ * still use the other widgets. */
+static void load_dbg_data_once(void)
+{
+    if (s_dbg_data_loaded) return;
+    s_dbg_data_loaded = true;   /* one-shot latch; never re-try */
+    const char *base = SDL_GetBasePath();
+    char path[1024];
+    if (base && *base) {
+        std::snprintf(path, sizeof(path), "%sdebug_overlay/data", base);
+    } else {
+        std::snprintf(path, sizeof(path), "debug_overlay/data");
+    }
+    (void)dbg_data_load_all(path);
+}
+
 static void prepare_overlay()
 {
     /* The window that owns the current GL context may be a hidden GL drawable
@@ -3880,22 +3920,8 @@ static void prepare_overlay()
         }
     }
 
-    /* Step 1b: load XML data tables once. SDL_GetBasePath() is stable for
-     * the process lifetime and the dir is staged by POST_BUILD. A failure
-     * here is non-fatal — dbg_data_*_missing() lets the UI render an empty
-     * placeholder so the user can still use the other widgets. */
-    if (!s_dbg_data_loaded) {
-        s_dbg_data_loaded = true;   /* one-shot latch; never re-try */
-        const char *base = SDL_GetBasePath();
-        char path[1024];
-        if (base && *base) {
-            std::snprintf(path, sizeof(path), "%sdebug_overlay/data", base);
-        } else {
-            std::snprintf(path, sizeof(path), "debug_overlay/data");
-        }
-        (void)dbg_data_load_all(path);
-    }
-
+    /* Step 1b: XML data tables, loaded once. */
+    load_dbg_data_once();
 }
 
 /* Shared window content for both render paths. Legacy: floating window
@@ -4044,6 +4070,71 @@ static void render_tools_window(GLuint target_fbo)
 
 static void overlay_service(GLuint target_fbo, bool threaded_present);
 static void overlay_window_shot(GLuint target_fbo);
+
+#if defined(PSX_IMGUI_VULKAN)
+/* Native on Vulkan: one ImGui context in the legacy in-game layout, platform
+ * on SDL and renderer on the shared Vulkan backend (the runtime menu's). The
+ * context stays current on success, as the GL path leaves it. */
+static bool vk_overlay_init(void)
+{
+    if (!s_win || !native_vk_services_active()) return false;
+    IMGUI_CHECKVERSION();
+    ImGuiContext *previous = ImGui::GetCurrentContext();
+    ImGuiContext *ctx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(ctx);
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = "debug_overlay.ini";
+    ImGui::StyleColorsDark();
+    ImFontConfig font_cfg;
+    font_cfg.SizePixels = 19.0f;
+    io.Fonts->AddFontDefault(&font_cfg);
+    ImGui::GetStyle().ScaleAllSizes(1.25f);
+    const bool platform = PSX_IMGUI_SDL_INIT_VULKAN(s_win);
+    const bool backend = platform && psx_imgui_vulkan_backend_init();
+    if (!backend) {
+        if (platform) PSX_IMGUI_SDL_SHUTDOWN();
+        ImGui::DestroyContext(ctx);
+        ImGui::SetCurrentContext(previous);
+        return false;
+    }
+    s_vk_ctx = ctx;
+    s_legacy_inline = true;
+    s_imgui_ready = true;
+    s_backend_name = "vulkan";
+    return true;
+}
+
+int psx_debug_overlay_vk_visible(void)
+{
+    return s_visible ? 1 : 0;
+}
+
+void psx_debug_overlay_vk_record(void *cmd_buffer, int width, int height)
+{
+    (void)width;
+    (void)height;
+    if (!s_visible || !cmd_buffer) return;
+    if (!s_imgui_ready && !vk_overlay_init()) return;
+    if (!s_vk_ctx) return;
+    ImGuiContext *previous = ImGui::GetCurrentContext();
+    ImGui::SetCurrentContext(s_vk_ctx);
+    load_dbg_data_once();
+    ImGui_ImplVulkan_NewFrame();
+    PSX_IMGUI_SDL_NEW_FRAME();
+    ImGui::NewFrame();
+    draw_debug_window();
+    drive_text_input(overlay_active_window());
+    ImGui::Render();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), (VkCommandBuffer)cmd_buffer);
+    ImGui::SetCurrentContext(previous);
+}
+#else
+int psx_debug_overlay_vk_visible(void) { return 0; }
+void psx_debug_overlay_vk_record(void *cmd_buffer, int width, int height)
+{
+    (void)cmd_buffer; (void)width; (void)height;
+}
+#endif
 
 void psx_debug_overlay_pre_swap_target(unsigned int framebuffer)
 {
@@ -4340,6 +4431,9 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     if (std::strcmp(name, "window_width") == 0) {
         psx_video_set_window_width(value);
         return 0;
+    }
+    if (std::strcmp(name, "window_maximized") == 0) {
+        return psx_video_set_window_maximized(value) ? 0 : -2;
     }
     if (std::strcmp(name, "dump_event_ring") == 0) {
         int n = event_ring_dump_file("event_ring.json");

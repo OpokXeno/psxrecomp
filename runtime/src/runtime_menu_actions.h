@@ -20,6 +20,14 @@ int psx_input_set_gamepad_binding(int player, int button, int kind,
 int psx_input_reset_gamepad_bindings(int player);
 int psx_runtime_savestate_submit(int slot, int save);
 
+/* Renderer changes are preferences for the next launch, never live switches. */
+int psx_video_vulkan_offered(void);
+int psx_video_get_renderer(void);
+int psx_video_set_renderer(int renderer);
+int psx_video_renderer_restart_required(void);
+/* The active host renderer, not the legacy VRAM facade or next-launch API. */
+int psx_video_hardware_rendering_active(void);
+
 enum RuntimeMenuSetting {
     MENU_ASPECT = 1u << 0, MENU_WINDOW_SIZE = 1u << 1,
     MENU_FULLSCREEN = 1u << 2, MENU_VSYNC = 1u << 3,
@@ -32,7 +40,8 @@ enum RuntimeMenuSetting {
     MENU_DEPTH_VIEW = 1u << 16, MENU_BACKDROP_STRETCH = 1u << 17,
     MENU_BACKDROP_PERCENT = 1u << 18, MENU_VOLUME = 1u << 19,
     MENU_SPU_HQ = 1u << 20, MENU_HD_TEXTURES = 1u << 21,
-    MENU_VISIBILITY = 1u << 22, MENU_CAMERA = 1u << 23
+    MENU_VISIBILITY = 1u << 22, MENU_CAMERA = 1u << 23,
+    MENU_RENDERER = 1u << 24
 };
 int psx_runtime_menu_save_settings(unsigned int changed, int windowed_visible);
 /* Restore advanced preferences after renderer initialization; returns the

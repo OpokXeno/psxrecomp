@@ -7,16 +7,24 @@
 
 #ifdef PSX_RUNTIME_MENU
 #include <imgui.h>
+#include "runtime_menu_draw_bounds.h"
 #include <imgui_impl_opengl3.h>
+#if defined(PSX_IMGUI_VULKAN)
+#include <imgui_impl_vulkan.h>
+#include "psx_imgui_vulkan.h"
+#include "debug_overlay.h"
+#endif
 #if defined(PSX_SDL3)
 #include <imgui_impl_sdl3.h>
 #define MENU_SDL_INIT_GL ImGui_ImplSDL3_InitForOpenGL
+#define MENU_SDL_INIT_VK ImGui_ImplSDL3_InitForVulkan
 #define MENU_SDL_NEW_FRAME ImGui_ImplSDL3_NewFrame
 #define MENU_SDL_EVENT ImGui_ImplSDL3_ProcessEvent
 #define MENU_SDL_SHUTDOWN ImGui_ImplSDL3_Shutdown
 #else
 #include <imgui_impl_sdl2.h>
 #define MENU_SDL_INIT_GL ImGui_ImplSDL2_InitForOpenGL
+#define MENU_SDL_INIT_VK ImGui_ImplSDL2_InitForVulkan
 #define MENU_SDL_NEW_FRAME ImGui_ImplSDL2_NewFrame
 #define MENU_SDL_EVENT ImGui_ImplSDL2_ProcessEvent
 #define MENU_SDL_SHUTDOWN ImGui_ImplSDL2_Shutdown
@@ -25,6 +33,7 @@
 #include "gpu.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+#include "native_vk_presenter.h"
 #include "cdrom.h"
 #include "host_osd.h"
 #include "hd_texture_runtime.h"
@@ -332,6 +341,28 @@ bool capture_binding_event(const SDL_Event* ev) {
 
 void video_menu() {
     if (!ImGui::BeginMenu("Video")) return;
+    /* Native Vulkan owns the hardware renderer while gr_backend() still names
+     * its software compatibility facade. Gate on the active host instead. */
+    const bool hardware_rendering = psx_video_hardware_rendering_active() != 0;
+    const bool native_vulkan = native_vk_services_active() != 0;
+    if (ImGui::BeginMenu("Renderer")) {
+        const int selected = psx_video_get_renderer();
+        const char* names[] = {"OpenGL", "Vulkan (Recommended)"};
+        for (int renderer = 1; renderer <= 2; ++renderer) {
+            const bool available = renderer == 1 || psx_video_vulkan_offered();
+            if (ImGui::MenuItem(names[renderer - 1], nullptr, selected == renderer, available) &&
+                selected != renderer && psx_video_set_renderer(renderer)) {
+                remember(MENU_RENDERER);
+                flush_settings(true);
+            }
+            if (!available) tooltip("Vulkan is not offered by this game/build.");
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled(psx_video_renderer_restart_required()
+            ? "Restart the game to apply the renderer change"
+            : "Renderer changes apply after restarting the game");
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("Aspect ratio")) {
         int n = 4, d = 3;
         psx_video_get_aspect(&n, &d);
@@ -371,7 +402,7 @@ void video_menu() {
     choice("VSync", psx_video_get_vsync(), vs_names, vs_values, 3, psx_video_set_vsync, MENU_VSYNC);
     const char* fps_names[] = {"Original", "60 FPS", "75 FPS", "90 FPS", "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
     const int fps_values[] = {30, 60, 75, 90, 120, 144, 165, 240};
-    if (ImGui::BeginMenu("Frame rate", gr_backend() == 1)) {
+    if (ImGui::BeginMenu("Frame rate", hardware_rendering)) {
         const int selected_fps = psx_video_get_fps();
         bool listed = false;
         for (int i = 0; i < (int)(sizeof(fps_values) / sizeof(*fps_values)); ++i) {
@@ -389,7 +420,7 @@ void video_menu() {
         ImGui::EndMenu();
     }
     ImGui::Separator();
-    if (ImGui::BeginMenu("Rendering", gr_backend() == 1)) {
+    if (ImGui::BeginMenu("Rendering", hardware_rendering)) {
         int scale = psx_video_get_supersampling();
         ImGui::SetNextItemWidth(220);
         if (ImGui::SliderInt("Internal scale", &scale, 1, 8)) { psx_video_set_supersampling(scale); remember(MENU_SCALE); }
@@ -415,13 +446,16 @@ void video_menu() {
     const char* screen_names[] = {"Raw", "CRT", "Composite", "Trinitron"};
     const int screen_values[] = {0, 1, 2, 3};
     choice("Screen model", psx_video_get_screen_model(), screen_names, screen_values, 4, psx_video_set_screen_model, MENU_SCREEN_MODEL);
-    if (ImGui::BeginMenu("Advanced", gr_backend() == 1)) {
+    if (ImGui::BeginMenu("Advanced", hardware_rendering)) {
         toggle("Z-buffer", psx_video_get_native_depth_test(), psx_video_set_native_depth_test, MENU_Z_BUFFER);
         const char* names[] = {"Off", "Depth (colour)", "Policy", "Depth (grey)"};
         const int values[] = {0, 1, 2, 3};
         choice("Depth view", gl_renderer_native_depth_view(), names, values, 4, gl_renderer_set_native_depth_view, MENU_DEPTH_VIEW);
         toggle("Wireframe", gl_renderer_native_wireframe(), gl_renderer_set_native_wireframe, MENU_WIREFRAME);
+        ImGui::BeginDisabled(native_vulkan);
         toggle("Generate texture mipmaps (experimental)", gl_renderer_debug_mipmaps(), gl_renderer_set_debug_mipmaps, MENU_MIPMAPS);
+        if (native_vulkan) tooltip("Debug mipmaps are not implemented by Native Vulkan yet.");
+        ImGui::EndDisabled();
         bool stretch = g_ws_bd_stretch_on != 0;
         if (ImGui::MenuItem("Stretch widescreen backdrops", nullptr, stretch)) {
             g_ws_bd_stretch_on = !stretch; remember(MENU_BACKDROP_STRETCH);
@@ -499,17 +533,39 @@ void draw_menu() {
     ImGui::EndMainMenuBar();
 }
 
+#if defined(PSX_IMGUI_VULKAN)
+// Native on Vulkan: the menu renders into the presenter's UI layer image.
+bool vulkan_mode = false;
+VkCommandBuffer ui_cmd = VK_NULL_HANDLE;
+// Last composed UI layer (menu + debug overlay share it); 0 forces a recompose.
+uint64_t vk_layer_built_ns = 0;
+bool vk_layer_cache_valid = false;
+std::vector<unsigned char> vk_layer_signature, vk_layer_candidate;
+
+#endif
+
 bool ensure_context() {
     if (context) return true;
+#if defined(PSX_IMGUI_VULKAN)
+    vulkan_mode = native_vk_services_active() != 0;
+    vk_layer_cache_valid = false;
+    if (!window || (!vulkan_mode && !SDL_GL_GetCurrentContext())) return false;
+#else
     if (!window || !SDL_GL_GetCurrentContext()) return false;
+#endif
     ImGuiContext* previous = ImGui::GetCurrentContext();
     context = ImGui::CreateContext();
     ImGui::SetCurrentContext(context);
     ImGui::GetIO().IniFilename = nullptr;
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
+#if defined(PSX_IMGUI_VULKAN)
+    const bool platform = vulkan_mode ? MENU_SDL_INIT_VK(window) : MENU_SDL_INIT_GL(window, SDL_GL_GetCurrentContext());
+    const bool backend = platform && (vulkan_mode ? psx_imgui_vulkan_backend_init() : ImGui_ImplOpenGL3_Init("#version 330"));
+#else
     const bool platform = MENU_SDL_INIT_GL(window, SDL_GL_GetCurrentContext());
     const bool backend = platform && ImGui_ImplOpenGL3_Init("#version 330");
+#endif
     if (!backend) {
         if (platform) MENU_SDL_SHUTDOWN();
         ImGui::DestroyContext(context); context = nullptr;
@@ -518,7 +574,21 @@ bool ensure_context() {
     return backend;
 }
 
-void render_frame(unsigned int framebuffer) {
+void draw_data(unsigned int framebuffer) {
+#if defined(PSX_IMGUI_VULKAN)
+    if (vulkan_mode) {
+        if (ui_cmd) ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ui_cmd);
+        return;
+    }
+#endif
+    if (bind_framebuffer) {
+        bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+    }
+}
+
+void render_frame(unsigned int framebuffer, bool record = true) {
     sync_fullscreen();
     if (reset_focus && context) {
         ContextScope scope;
@@ -534,15 +604,14 @@ void render_frame(unsigned int framebuffer) {
                                    (double)SDL_GetPerformanceFrequency());
     if (menu_frame_valid && !menu_input_pending && !capture && !text_input &&
         now_ns - menu_frame_built_ns < kMenuRebuildIntervalNs) {
-        if (bind_framebuffer) {
-            bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
-        }
+        if (record) draw_data(framebuffer);
         return;
     }
     menu_input_pending = false;
     menu_frame_built_ns = now_ns;
+#if defined(PSX_IMGUI_VULKAN)
+    if (vulkan_mode) ImGui_ImplVulkan_NewFrame(); else
+#endif
     ImGui_ImplOpenGL3_NewFrame();
     MENU_SDL_NEW_FRAME();
     ImGui::NewFrame();
@@ -558,11 +627,7 @@ void render_frame(unsigned int framebuffer) {
     ImGui::Render();
     menu_frame_valid = true;
     if (!ImGui::IsAnyItemActive()) flush_settings();
-    if (bind_framebuffer) {
-        bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
-    }
+    if (record) draw_data(framebuffer);
     // Crossfade presentation has a worker context; suspend while navigating.
     if (capture && !interpolation_suspended) {
         int enabled = 0;
@@ -598,6 +663,11 @@ void psx_runtime_menu_shutdown(void) {
     if (context) {
         ContextScope scope;
         if (text_input) psx_sdl_stop_text_input(window);
+#if defined(PSX_IMGUI_VULKAN)
+        if (vulkan_mode) {
+            psx_imgui_vulkan_backend_shutdown();
+        } else
+#endif
         ImGui_ImplOpenGL3_Shutdown();
         MENU_SDL_SHUTDOWN();
         ImGui::DestroyContext(context);
@@ -655,7 +725,71 @@ bool psx_runtime_menu_needs_present(void) { sync_fullscreen(); return visibility
 void psx_runtime_menu_pre_swap_target(unsigned int framebuffer) {
     render_frame(framebuffer); visibility.clear_pending = false;
 }
+#if defined(PSX_IMGUI_VULKAN)
+namespace {
+// Same layer protocol as the GL path below, into the presenter's Vulkan UI layer.
+void service_layer_vulkan() {
+    if (!window) return;
+    const bool menu_on = visibility.visible;
+    const bool overlay_on = psx_debug_overlay_vk_visible() != 0;
+    if (!menu_on && !overlay_on) {
+        vk_layer_built_ns = 0;
+        vk_layer_cache_valid = false;
+        native_vk_ui_hide();
+        render_frame(0u);
+        visibility.clear_pending = false;
+        return;
+    }
+    const Uint64 now_ns = (Uint64)((double)SDL_GetPerformanceCounter() * 1e9 /
+                                   (double)SDL_GetPerformanceFrequency());
+    if (vk_layer_built_ns && !menu_input_pending && !capture && !text_input &&
+        now_ns - vk_layer_built_ns < kMenuRebuildIntervalNs)
+        return;
+    if (menu_on && !ensure_context()) return;
+    int width = 0, height = 0;
+    SDL_GetWindowSizeInPixels(window, &width, &height);
+    render_frame(0u, false);
+    {
+        ContextScope scope;
+        const ImDrawData *data = context ? ImGui::GetDrawData() : nullptr;
+        float left = (float)width, top = (float)height, right = 0, bottom = 0;
+        bool full = overlay_on;
+        if (!full) full = runtime_menu_draw_bounds(data, left, top, right, bottom);
+        const bool cacheable = menu_on && !overlay_on && !capture && !text_input && !full &&
+            runtime_menu_draw_signature(data, ImGui::GetIO().Fonts->TexID, width, height, vk_layer_candidate);
+        if (cacheable && vk_layer_cache_valid && vk_layer_candidate == vk_layer_signature) {
+            vk_layer_built_ns = now_ns; visibility.clear_pending = false; return;
+        }
+        if (!cacheable) vk_layer_cache_valid = false;
+        const int content_height = full ? height : (int)std::ceil(std::clamp(bottom, 0.f, (float)height));
+        if (!content_height) { vk_layer_cache_valid = false; native_vk_ui_hide(); return; }
+        ui_cmd = native_vk_ui_begin_clipped(width, height, content_height);
+        if (!ui_cmd) return;
+        if (menu_on) draw_data(0u);
+        if (overlay_on) psx_debug_overlay_vk_record(ui_cmd, width, height);
+        ui_cmd = VK_NULL_HANDLE;
+        int submitted = 0;
+        if (full) submitted = native_vk_ui_end();
+        else {
+            const int x = (int)std::floor(std::clamp(left, 0.f, (float)width));
+            const int y = (int)std::floor(std::clamp(top, 0.f, (float)height));
+            const int r = (int)std::ceil(std::clamp(right, 0.f, (float)width));
+            const int b = (int)std::ceil(std::clamp(bottom, 0.f, (float)height));
+            submitted = native_vk_ui_end_rect(x, y, std::max(0, r - x), std::max(0, b - y));
+        }
+        vk_layer_cache_valid = cacheable && submitted;
+        if (vk_layer_cache_valid) vk_layer_signature.swap(vk_layer_candidate);
+    }
+    visibility.clear_pending = false;
+    vk_layer_built_ns = now_ns;
+}
+} // namespace
+#endif
+
 void psx_runtime_menu_service_layer(void) {
+#if defined(PSX_IMGUI_VULKAN)
+    if (native_vk_services_active()) { service_layer_vulkan(); return; }
+#endif
     if (!visibility.visible || !window) {
         gl_renderer_ui_layer_hide();
         render_frame(0u); /* releases capture and flushes settings */
@@ -679,17 +813,7 @@ void psx_runtime_menu_service_layer(void) {
         ContextScope scope;
         const ImDrawData *data=context?ImGui::GetDrawData():nullptr;
         float left=(float)width,top=(float)height,right=0,bottom=0;
-        bool full=false;
-        if(data)for(int l=0;l<data->CmdListsCount;++l)
-            for(const ImDrawCmd &command:data->CmdLists[l]->CmdBuffer) {
-                if(command.UserCallback){full=true;continue;}
-                if(!command.ElemCount)continue;
-                const ImVec2 offset=data->DisplayPos,scale=data->FramebufferScale;
-                left=std::min(left,(command.ClipRect.x-offset.x)*scale.x);
-                top=std::min(top,(command.ClipRect.y-offset.y)*scale.y);
-                right=std::max(right,(command.ClipRect.z-offset.x)*scale.x);
-                bottom=std::max(bottom,(command.ClipRect.w-offset.y)*scale.y);
-            }
+        const bool full=runtime_menu_draw_bounds(data,left,top,right,bottom);
         if(full)gl_renderer_ui_layer_end();
         else {
             const int x=(int)std::floor(std::clamp(left,0.f,(float)width));

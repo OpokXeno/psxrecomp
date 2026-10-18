@@ -45,8 +45,14 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "load_transition_ring.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
+#include "gpu_native_canonical.h"
 #include "hd_texture_runtime.h"
 #include "gpu_gl_renderer.h"
+#include "native_vk_presenter.h"
+#if defined(PSX_HAVE_VULKAN)
+#include "vk_core.h"
+#include "vk_swapchain.h"
+#endif
 #include "native_present_cadence.h"
 #include "native_vk_present.h"
 /* Declarations only: STB_IMAGE_IMPLEMENTATION lives in psx_window_icon.cpp. */
@@ -130,6 +136,7 @@ extern int g_ws_bd_stretch_pct;
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* shared recomp-ui Dear ImGui launcher */
 #include "launcher_profile.h"  /* per-system variant profile (theme/caps bundle) */
+#include "launcher_renderer.h" /* graphics API indices vs persistent backend IDs */
 #include "launcher_boot_timing.h" /* PSX_LAUNCHER_BOOT_TIMING stamps */
 #if defined(PSX_HAS_CODEGEN_SETUP_HOST)
 extern "C" void psx_game_codegen_setup_apply(RecompLauncherCGameInfo* gi);
@@ -757,6 +764,49 @@ static bool native_render_describe_fields(XgRenderSourceFrameDescription *descri
 
 
 
+/* Native on Vulkan: no OpenGL context in the process. The Vulkan services (executor, presenter, neutral
+ * Native state) replace the GL ones behind these wrappers; every GL-only call below dispatches on
+ * g_native_vk. g_native_vk_wanted means "try it" (Vulkan renderer + Native); a failed bring-up falls
+ * back to OpenGL in the same run and leaves the reason in g_native_vk_note (debug server). */
+static bool g_native_vk_wanted = false;
+static bool g_native_vk = false;
+static char g_native_vk_note[256] = "";
+static XgRenderWorkerServices g_native_vk_worker{};
+static XgRenderPresenterServices g_native_vk_presenter{};
+
+extern "C" const char *psx_native_vk_fallback_reason(void) { return g_native_vk_note; }
+
+static int nx_presenter_thread_begin() {
+    return g_native_vk ? 1 : gl_renderer_native_presenter_thread_begin();
+}
+static void nx_presenter_thread_end() {
+    if (!g_native_vk) gl_renderer_native_presenter_thread_end();
+}
+static void nx_main_attach_window() {
+    if (!g_native_vk) gl_renderer_native_main_attach_window();
+}
+static int nx_main_detach_window() {
+    return g_native_vk ? 1 : gl_renderer_native_main_detach_window();
+}
+static void nx_context_settle() {
+    if (!g_native_vk) gl_renderer_native_context_settle();
+}
+static void nx_stop_gpu_worker() {
+    if (g_native_vk) native_vk_services_stop_worker();
+    else gl_renderer_native_stop_gpu_worker();
+}
+static void nx_native_shutdown() {
+    if (g_native_vk) native_vk_services_shutdown();
+    else gl_renderer_native_shutdown();
+}
+static int nx_native_init_services(XgRenderWorkerServices *worker, XgRenderPresenterServices *presenter) {
+    if (!g_native_vk)
+        return gl_renderer_native_init_services(worker, presenter);
+    *worker = g_native_vk_worker;
+    *presenter = g_native_vk_presenter;
+    return 1;
+}
+
 static bool native_presenter_thread_requested() {
     const char *value = std::getenv("PSX_PRESENTER_THREAD");
     return !(value && value[0] == '0');
@@ -782,12 +832,12 @@ static void native_presenter_wait(uint64_t wait_ns) {
 
 static int native_presenter_thread_main(void *) {
     XgRenderPresentationHost *host = g_native_render_presentation_host;
-    if (!gl_renderer_native_presenter_thread_begin()) {
+    if (!nx_presenter_thread_begin()) {
         g_native_presenter.state.store(-1);
         return -1;
     }
     if (!xg_render_presentation_host_rebind_owner(host)) {
-        gl_renderer_native_presenter_thread_end();
+        nx_presenter_thread_end();
         g_native_presenter.state.store(-1);
         return -1;
     }
@@ -803,7 +853,7 @@ static int native_presenter_thread_main(void *) {
         if (wait_ns != 0u)
             native_presenter_wait(std::min<uint64_t>(wait_ns, 2000000u));
     }
-    gl_renderer_native_presenter_thread_end();
+    nx_presenter_thread_end();
     return 0;
 }
 
@@ -840,7 +890,7 @@ static void native_presenter_stop() {
     g_native_presenter.stop.store(true, std::memory_order_release);
     SDL_WaitThread(g_native_presenter.thread, nullptr);
     g_native_presenter.thread = nullptr;
-    gl_renderer_native_main_attach_window();
+    nx_main_attach_window();
     if (g_native_render_presentation_host)
         (void)xg_render_presentation_host_rebind_owner(
             g_native_render_presentation_host);
@@ -852,9 +902,9 @@ static void native_presenter_start() {
     if (!native_presenter_thread_requested() ||
         !g_native_render_presentation_host || g_native_presenter.thread)
         return;
-    gl_renderer_native_context_settle();
-    if (!gl_renderer_native_main_detach_window()) {
-        gl_renderer_native_main_attach_window();
+    nx_context_settle();
+    if (!nx_main_detach_window()) {
+        nx_main_attach_window();
         return;
     }
     g_native_presenter.stop.store(false);
@@ -862,7 +912,7 @@ static void native_presenter_start() {
     g_native_presenter.thread = SDL_CreateThread(
         native_presenter_thread_main, "native-presenter", nullptr);
     if (!g_native_presenter.thread) {
-        gl_renderer_native_main_attach_window();
+        nx_main_attach_window();
         return;
     }
     while (g_native_presenter.state.load() == 0)
@@ -877,6 +927,7 @@ static void native_presenter_start() {
 static bool native_render_native_stop_host() {
     XgRenderPresentationHost *host = g_native_render_presentation_host;
 
+    gpu_native_canonical_leave();
     gpu_set_native_work_draw_hook(nullptr);
     gpu_set_native_work_environment_hook(nullptr);
     xg_render_native_work_cancel_pending();
@@ -894,7 +945,7 @@ static bool native_render_native_stop_host() {
         return false;
     }
     g_native_render_presentation_host = nullptr;
-    gl_renderer_native_stop_gpu_worker();
+    nx_stop_gpu_worker();
     return true;
 }
 
@@ -903,7 +954,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
     XgRenderPresenterServices presenter_services{};
     XgRenderSourceFrameHostCallbacks callbacks{};
 
-    if (!gl_renderer_native_init_services(
+    if (!nx_native_init_services(
             &worker_services, &presenter_services)) {
         native_render_source_fail_closed(__LINE__);
         return false;
@@ -917,7 +968,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
             &worker_services, &presenter_services, presentation_period_ns);
     if (!g_native_render_presentation_host) {
         native_render_source_fail_closed(__LINE__);
-        gl_renderer_native_shutdown();
+        nx_native_shutdown();
         return false;
     }
     callbacks.sealed_capture = native_render_native_capture_source;
@@ -930,7 +981,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
         native_render_source_fail_closed(__LINE__);
         if (!native_render_native_stop_host())
             return false;
-        gl_renderer_native_shutdown();
+        nx_native_shutdown();
         return false;
     }
     const XgRenderNativeWorkServices work_services = {
@@ -959,6 +1010,7 @@ static bool native_render_native_start_host(double presentation_period_ms) {
             xg_render_native_work_operation(&target, psx_get_cycle_count());
     });
     g_native_render_source_failed = false;
+    (void)gpu_native_canonical_enter();
     return true;
 }
 
@@ -1066,6 +1118,12 @@ static Uint64   s_fps_last_time = 0;
 static uint64_t s_fps_last_frame = 0;
 static uint64_t s_fps_last_shown = 0;
 static std::string s_fps_base_title;
+static std::string s_window_base_title;
+static std::mutex s_window_title_mutex;
+static std::string s_window_title_pending;
+static std::string s_window_title_requested;
+static bool s_window_title_event_pending = false;
+static void host_window_title_async(const char *title);
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
 static int      s_turbo_present_skip = 0;
@@ -1135,7 +1193,7 @@ static void fps_telemetry_toggle(void) {
     s_fps_last_time = 0;
     s_fps_last_frame = 0;
     if (!enabled && sdl_window && !s_fps_base_title.empty())
-        SDL_SetWindowTitle(sdl_window, s_fps_base_title.c_str());
+        host_window_title_async(s_fps_base_title.c_str());
     if (!enabled)
         host_osd_set_status(NULL);
     s_fps_base_title.clear();
@@ -1604,6 +1662,14 @@ extern "C" void psx_frontend_on_savestate_loaded(void) {
      * Native Work rebuilds from VRAM in a fresh presentation epoch. */
     psx_xenogears_scene_reset();
     mod_runtime_on_savestate_loaded();
+    /* Native Work rebuilds device state from VRAM, not the legacy renderer's
+     * checkpoint. A cold-process load can resume in world/battle without ever
+     * visiting the field entry that normally enables Native packet routing.
+     * Keep DMA/GP0 on that route so captured wide/subpixel geometry is consumed
+     * instead of replaying only the guest's canonical 4:3 packets. Never revive
+     * a renderer that has already failed closed. */
+    if (g_native_render_selected && !g_native_render_source_failed)
+        guest_render_native_stream_set_enabled(true);
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
     smooth_60_reset();
@@ -1800,6 +1866,8 @@ static int           g_video_dithering     = 1;
 static int           g_video_pgxp_cpu_mode         = 0;
 static float         g_video_pgxp_tolerance        = 0.5f;
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
+static bool          g_video_vulkan_offered = false;
+static int           g_video_next_renderer = -1; /* menu preference; active backend stays untouched */
 static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
@@ -2009,7 +2077,54 @@ static Uint32 psx_fullscreen_flag_for_mode(int mode) {
 /* Handle fullscreen before overlays can capture keyboard input. F11 stays
  * available even with an older config.ini containing Alt+Return; a configured
  * alternative continues to work alongside it. */
+static std::atomic<Uint32> g_window_control_event{0};
+
+static void host_window_title_async(const char *title) {
+    const Uint32 type = g_window_control_event.load();
+    if (!type || type == (Uint32)-1 || !title) return;
+    {
+        std::lock_guard<std::mutex> lock(s_window_title_mutex);
+        if (s_window_title_requested == title) return;
+        s_window_title_requested = title;
+        s_window_title_pending = title;
+        if (s_window_title_event_pending) return;
+        s_window_title_event_pending = true;
+    }
+    SDL_Event event{};
+    event.type = type; event.user.code = 2;
+    if (SDL_PushEvent(&event) <= 0) {
+        std::lock_guard<std::mutex> lock(s_window_title_mutex);
+        s_window_title_event_pending = false;
+        s_window_title_requested.clear();
+    }
+}
+
+extern "C" int psx_video_set_window_maximized(int enabled) {
+    if (!g_window_control_event || g_window_control_event == (Uint32)-1) return 0;
+    SDL_Event event{};
+    event.type = g_window_control_event;
+    event.user.code = enabled != 0;
+    return SDL_PushEvent(&event) > 0;
+}
+
 static bool host_fullscreen_process_event(const SDL_Event* event) {
+    /* Debug/UI requests are marshalled to the SDL event owner, including on
+     * Windows and Wayland where window mutations are main-thread operations. */
+    if (g_window_control_event && event->type == g_window_control_event) {
+        if (event->user.code == 2) {
+            std::string title;
+            {
+                std::lock_guard<std::mutex> lock(s_window_title_mutex);
+                title.swap(s_window_title_pending);
+                s_window_title_event_pending = false;
+            }
+            if (sdl_window && !title.empty()) SDL_SetWindowTitle(sdl_window, title.c_str());
+        } else if (sdl_window) {
+            if (event->user.code) SDL_MaximizeWindow(sdl_window);
+            else SDL_RestoreWindow(sdl_window);
+        }
+        return true;
+    }
     if (!sdl_window || event->type != SDL_KEYDOWN ||
         event->key.windowID != SDL_GetWindowID(sdl_window) ||
         !host_hotkey_input_focused())
@@ -4065,7 +4180,7 @@ static int present_effective_swap_interval(void) {
     /* Native semantic target owns the present cadence on the GL native
      * path; the interval itself follows user x target x panel (see
      * native_present_interval), so neither side stomps the other. */
-    if (g_native_render_selected && g_gl_active) {
+    if (g_native_render_selected && (g_gl_active || g_native_vk)) {
         const int native_interval = native_present_interval();
         if (native_interval != -2)
             return native_interval;
@@ -4111,6 +4226,11 @@ static void native_render_ui_service() {
     const uint64_t now_ns = native_render_clock_ns();
     if (now_ns - g_native_ui_service_ns < kNativeUiServicePeriodNs) return;
     g_native_ui_service_ns = now_ns;
+    if (g_native_vk) {
+        /* The menu and the debug overlay both draw into the Vulkan UI layer. */
+        psx_runtime_menu_service_layer();
+        return;
+    }
     if (!gl_renderer_ui_context_enter()) return;
     psx_runtime_menu_service_layer();
     psx_debug_overlay_service_main();
@@ -4137,7 +4257,7 @@ static void native_render_host_service_until(uint64_t deadline_ns) {
             } else {
                 const bool pumped = serviced >= 0 &&
                     xg_render_presentation_host_pump(g_native_render_presentation_host);
-                gl_renderer_native_context_settle();
+                nx_context_settle();
                 if (!pumped ||
                     !xg_render_presentation_host_time_until_pump(
                         g_native_render_presentation_host, &presenter_wait_ns))
@@ -4367,6 +4487,58 @@ static void native_render_run_scheduler(CPUState *cpu) {
     g_native_simulation.resume_deadline_ns = 0;
 }
 
+/* Native on Vulkan bring-up on the SDL_WINDOW_VULKAN window: device, surface, swapchain, then the Native
+ * services (presenter objects, neutral Native state, executor thread). Any failure releases everything and
+ * leaves the reason in why; the caller falls back to OpenGL. */
+static bool native_vk_bring_up(SDL_Window *window, char *why, size_t why_size) {
+#if defined(PSX_HAVE_VULKAN)
+    VkCoreDeviceRequest request;
+    std::memset(&request, 0, sizeof(request));
+    if (!vk_core_init(&request)) {
+        std::snprintf(why, why_size, "vk_core: %s", vk_core_failure());
+        return false;
+    }
+    if (!vk_core_attach_window(window)) {
+        std::snprintf(why, why_size, "window: %s", vk_core_failure());
+        vk_core_shutdown();
+        return false;
+    }
+    vk_swapchain_set_present_policy(present_effective_swap_interval(), g_video_vsync);
+    if (!vk_swapchain_create()) {
+        std::snprintf(why, why_size, "swapchain creation failed");
+        vk_core_detach_window();
+        vk_core_shutdown();
+        return false;
+    }
+    char reason[200] = "";
+    if (!native_vk_services_init(&g_native_vk_worker, &g_native_vk_presenter, window,
+                                 reason, sizeof(reason))) {
+        std::snprintf(why, why_size, "%s", reason);
+        vk_swapchain_destroy();
+        vk_core_detach_window();
+        vk_core_shutdown();
+        return false;
+    }
+    return true;
+#else
+    (void)window;
+    std::snprintf(why, why_size, "built without Vulkan");
+    return false;
+#endif
+}
+
+static void native_vk_tear_down() {
+#if defined(PSX_HAVE_VULKAN)
+    if (!g_native_vk) return;
+    native_vk_services_shutdown();
+    vk_swapchain_destroy();
+    vk_core_detach_window();
+    vk_core_shutdown();
+    gl_renderer_native_set_neutral_host(0);
+    g_native_vk = false;
+#endif
+}
+
 static void apply_present_cadence(void) {
 #ifndef PSX_SDL_NO_RENDER
     const int interval = present_effective_swap_interval();
@@ -4374,6 +4546,10 @@ static void apply_present_cadence(void) {
         gl_renderer_set_swap_interval(interval);
     if (nvp_active())
         nvp_set_present_policy(interval, g_video_vsync);
+#if defined(PSX_HAVE_VULKAN)
+    if (g_native_vk)
+        vk_swapchain_set_present_policy(interval, g_video_vsync);
+#endif
     /* Vsync, panel and presenter threading all decide the native tick. */
     if (g_native_render_selected && g_native_render_presentation_host)
         (void)xg_render_presentation_host_set_period(
@@ -4562,6 +4738,7 @@ static void teardown_game_session_keep_lobby(void) {
         vk_renderer_shutdown();
         g_vk_active = false;
     }
+    native_vk_tear_down();
     if (g_gl_active) {
         gl_renderer_native_shutdown();
         gl_renderer_shutdown();
@@ -5585,6 +5762,22 @@ static void load_input_config(const char* argv0) {
 }
 
 #ifdef RECOMP_LAUNCHER
+extern "C" int psx_video_vulkan_offered(void) { return g_video_vulkan_offered ? 1 : 0; }
+extern "C" int psx_video_get_renderer(void) {
+    return g_video_next_renderer >= 0 ? g_video_next_renderer : g_video_renderer;
+}
+extern "C" int psx_video_set_renderer(int renderer) {
+    if (renderer != 1 && (renderer != 2 || !g_video_vulkan_offered)) return 0;
+    g_video_next_renderer = renderer;
+    return 1;
+}
+extern "C" int psx_video_renderer_restart_required(void) {
+    return psx_video_get_renderer() != g_video_renderer;
+}
+extern "C" int psx_video_hardware_rendering_active(void) {
+    return g_gl_active || g_vk_active || g_native_vk;
+}
+
 extern "C" int psx_input_runtime_bindings_available(void) {
     return !input_replay::active() && !input_replay::recording();
 }
@@ -5594,6 +5787,7 @@ extern "C" int psx_runtime_menu_save_settings(unsigned int changed, int windowed
     try {
         auto s = PSXRecompV4::load_user_settings(s_fast_map_settings_path);
         if (s.parse_error) return 0;
+        if (changed & MENU_RENDERER) { s.renderer = psx_video_get_renderer(); s.has_renderer = true; }
         if (changed & MENU_ASPECT) {
             present_aspect(&s.aspect_num, &s.aspect_den); s.has_aspect_ratio = true;
             s.adaptive_view = false; s.has_adaptive_view = true;
@@ -5655,9 +5849,15 @@ extern "C" int psx_runtime_menu_restore_settings(void) {
     try {
         const auto s = PSXRecompV4::load_user_settings(s_fast_map_settings_path);
         if (s.has_z_buffer) gl_renderer_set_native_depth_test(s.z_buffer);
-        if (s.has_texture_mipmaps) gl_renderer_set_debug_mipmaps(s.texture_mipmaps);
         if (s.has_wireframe) gl_renderer_set_native_wireframe(s.wireframe);
         if (s.has_depth_view) gl_renderer_set_native_depth_view(s.depth_view);
+        if (g_native_vk) {
+            /* Debug mipmap generation is still GL-only. Preserve its saved
+             * preference, but do not submit an unsupported Vulkan work. */
+            gl_renderer_set_debug_mipmaps(0);
+        } else {
+            if (s.has_texture_mipmaps) gl_renderer_set_debug_mipmaps(s.texture_mipmaps);
+        }
         if (s.has_backdrop_stretch) g_ws_bd_stretch_on = s.backdrop_stretch;
         if (s.has_backdrop_stretch_percent) g_ws_bd_stretch_pct = s.backdrop_stretch_percent;
         if (s.has_hd_texture_replacements) hd_texture_runtime_set_enabled(s.hd_texture_replacements);
@@ -8033,8 +8233,7 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
             s_fps_last_frame = s_frame_count;
             s_fps_last_shown = fps_shown_frames_total();
             if (sdl_window && s_fps_base_title.empty()) {
-                const char *title = SDL_GetWindowTitle(sdl_window);
-                if (title) s_fps_base_title = title;
+                s_fps_base_title = s_window_base_title;
             }
         } else if (frequency && now - s_fps_last_time >= frequency) {
             const double seconds = (double)(now - s_fps_last_time) / (double)frequency;
@@ -8050,13 +8249,10 @@ static NetplayVblankEpilogue sdl_vblank_frontend_body(void) {
                 char title[256];
                 snprintf(title, sizeof(title), "%s  [%.0f FPS | %.0f vblanks %.2fx]",
                          s_fps_base_title.c_str(), shown_fps, fps, speed);
-                /* Under Wayland/libdecor every title change redraws the window
-                 * decoration on this (guest) thread: skip unchanged titles. */
-                static std::string s_fps_last_title;
-                if (s_fps_last_title != title) {
-                    s_fps_last_title = title;
-                    SDL_SetWindowTitle(sdl_window, title);
-                }
+                /* Defer decoration changes to normal SDL event processing,
+                 * rather than doing them inline while guest timing is sampled.
+                 * Coalesce identical titles and keep window events ordered. */
+                host_window_title_async(title);
             }
             if (!g_headless) {
                 char osd[96];
@@ -14103,7 +14299,10 @@ namespace {
     static const char* const kPsxRendererLabels[] = {
         "Software",
         "OpenGL (Recommended)",
-        "Vulkan",
+    };
+    static const char* const kPsxGraphicsApiLabels[] = {
+        "OpenGL",
+        "Vulkan (Recommended)",
     };
     static const char* const kPsxHostShortcutLabels[] = {
         "Fast-forward",
@@ -14162,8 +14361,9 @@ namespace {
          * launcher's aspect_index indexes g_aspect_choices. */
         gi->aspect_labels = g_aspect_labels;
         gi->num_aspect_labels = g_aspect_choice_count;
-        gi->renderer_labels = kPsxRendererLabels;
-        gi->num_renderers = vulkan_offered_b ? 3 : 2;
+        gi->has_renderer = vulkan_offered_b ? 1 : 0;
+        gi->renderer_labels = vulkan_offered_b ? kPsxGraphicsApiLabels : kPsxRendererLabels;
+        gi->num_renderers = 2;
         gi->settings_bindings = 1;
         gi->assist_binding_labels = kPsxHostShortcutLabels;
         gi->assist_binding_count = PSX_ASSIST_BIND_COUNT;
@@ -15099,7 +15299,10 @@ int main(int argc, char** argv) {
                                      gc.ws_cull_h_imms.data(), (int)gc.ws_cull_h_imms.size());
             /* gc.runtime.offer_turbo_loads is deprecated and ignored — see
              * turbo_loads_offered above. Nothing to assign. */
+#if defined(PSX_HAVE_VULKAN)
             vulkan_offered = gc.vulkan_offered;
+#endif
+            g_video_vulkan_offered = vulkan_offered;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache
@@ -15559,7 +15762,7 @@ int main(int argc, char** argv) {
                 g_video_renderer = 1;
                 std::fprintf(stdout,
                     "psxrecomp: settings requested Vulkan, but this game does not "
-                    "offer Vulkan in the launcher; using OpenGL.\n");
+                    "offer Vulkan in this build; using OpenGL.\n");
             } else {
                 g_video_renderer = us.renderer;
             }
@@ -16339,12 +16542,12 @@ int main(int argc, char** argv) {
             /* ---- deeper PSX-style settings (capability-gated via launcher_profile
              * below). Sourced 1:1 from PSXRecompV4::UserSettings (config_loader.h). */
             ls.window_width      = seed.window_width;
-            ls.renderer           = seed.renderer;
+            ls.renderer           = psx_launcher_renderer_index(seed.renderer, vulkan_offered);
             /* Fresh / invalid seed → OpenGL (DEFAULT_VIDEO_RENDERER), never
              * Software — unless the user explicitly saved software. */
-            if (ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1))
-                ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
-            if (ls.renderer == 0 && !user_settings_has_renderer &&
+            if (ls.renderer < 0 || ls.renderer > 1)
+                ls.renderer = psx_launcher_renderer_index(PSXRecompV4::DEFAULT_VIDEO_RENDERER, vulkan_offered);
+            if (!vulkan_offered && ls.renderer == 0 && !user_settings_has_renderer &&
                 PSXRecompV4::DEFAULT_VIDEO_RENDERER != 0)
                 ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
             ls.supersampling      = seed.supersampling;
@@ -16479,8 +16682,6 @@ int main(int argc, char** argv) {
                 rui_lang_labels.empty() ? nullptr : rui_lang_labels.data(),
                 (int)rui_lang_labels.size(),
                 /*resume_netplay_room=*/0);
-            gi.renderer_labels      = kPsxRendererLabels;
-            gi.num_renderers        = vulkan_offered ? 3 : 2;
             gi.has_turbo_loads      = turbo_loads_offered ? 1 : 0;
             gi.discs = rui_discs.empty() ? nullptr : rui_discs.data();
             gi.num_discs = (int)rui_discs.size();
@@ -16666,7 +16867,7 @@ int main(int argc, char** argv) {
                 /* ---- deeper PSX-style settings write-back (mirrors the seed
                  * fields above), all gated on by the "psx" launcher_profile caps. */
                 seed.window_width          = ls.window_width;          seed.has_window_width          = true;
-                seed.renderer              = ls.renderer;              seed.has_renderer              = true;
+                seed.renderer              = psx_launcher_renderer_backend(ls.renderer, vulkan_offered); seed.has_renderer = true;
                 seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
                 seed.antialiasing          = ls.antialiasing;          seed.has_antialiasing          = true;
                 seed.antialiasing_factor   = ls.antialiasing_factor;   seed.has_antialiasing_factor   = true;
@@ -17138,6 +17339,8 @@ int main(int argc, char** argv) {
     }
 
 session_reboot:
+    /* Remember the requested API even if bring-up falls back to OpenGL. */
+    g_video_next_renderer = g_video_renderer;
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
     static int s_emu_session = 0;
     const bool rematch_session = (++s_emu_session > 1);
@@ -17241,7 +17444,15 @@ session_reboot:
         /* Select the renderer backend BEFORE gpu_init() (which runs gr_init ->
          * the backend's init on the VRAM buffer). Software is the default and
          * the fallback; an unavailable OpenGL backend reverts to software. */
-        gr_set_backend(g_video_renderer == 2 ? GR_BACKEND_VULKAN :
+        /* Vulkan + Native: the Native services own guest VRAM through the canonical
+         * facade, so the legacy Vulkan renderer is never created (the software
+         * table only backs the facade until it takes over). */
+        g_native_vk_wanted = g_video_renderer == 2 &&
+            native_render_mode_resolve(config_render_mode.c_str(),
+                                       std::getenv("PSX_NATIVE_RENDER_MODE"),
+                                       cli_render_mode) == GUEST_RENDER_RENDER_NATIVE;
+        gr_set_backend(g_native_vk_wanted ? GR_BACKEND_SOFTWARE :
+                       g_video_renderer == 2 ? GR_BACKEND_VULKAN :
                        g_video_renderer == 1 ? GR_BACKEND_OPENGL :
                                               GR_BACKEND_SOFTWARE);
         std::fprintf(stdout, "psxrecomp: renderer backend requested: %s\n",
@@ -17750,7 +17961,17 @@ session_reboot:
         configure_core_gl_context_attributes();
         win_flags |= vk_window ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL;
     }
-    if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
+    if (g_video_renderer == 2) {
+        win_flags |= SDL_WINDOW_VULKAN;
+        /* Let SDL supply the platform's drawable-pixel size on Windows,
+         * Wayland and X11. AA canvas sizing uses that common contract rather
+         * than depending on a particular window-system backend. */
+#if defined(PSX_SDL3)
+        win_flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#else
+        win_flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
+    }
     /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
      * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
      * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
@@ -17781,6 +18002,14 @@ session_reboot:
         return 1;
     }
     psx_apply_window_icon(sdl_window, argv[0]);
+    g_window_control_event = SDL_RegisterEvents(1);
+    s_window_base_title = window_title;
+    {
+        std::lock_guard<std::mutex> lock(s_window_title_mutex);
+        s_window_title_pending.clear();
+        s_window_title_requested = window_title;
+        s_window_title_event_pending = false;
+    }
     if (vk_window && !nvp_attach_window(sdl_window)) {
         /* Vulkan present unavailable: recreate the visible window as the
          * plain OpenGL window and drop the hidden drawable. */
@@ -17795,6 +18024,31 @@ session_reboot:
         SDL_DestroyWindow(g_gl_drawable);
         g_gl_drawable = nullptr;
         vk_window = false;
+    }
+
+    if (g_native_vk_wanted) {
+        char why[256] = "";
+        if (native_vk_bring_up(sdl_window, why, sizeof(why))) {
+            g_native_vk = true;
+            gl_renderer_native_set_neutral_host(1);
+            std::printf("psxrecomp: Native renders and presents through Vulkan (no OpenGL context)\n");
+        } else {
+            /* Same run, OpenGL: the Vulkan window cannot become an OpenGL one. */
+            std::snprintf(g_native_vk_note, sizeof(g_native_vk_note), "%s", why);
+            std::printf("psxrecomp: Native on Vulkan unavailable (%s); using OpenGL\n", why);
+            g_native_vk_wanted = false;
+            g_video_renderer = 1;
+            SDL_DestroyWindow(sdl_window);
+            configure_core_gl_context_attributes();
+            sdl_window = create_game_window((win_flags & ~SDL_WINDOW_VULKAN) | SDL_WINDOW_OPENGL);
+            if (!sdl_window) {
+                std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+                return 1;
+            }
+            psx_apply_window_icon(sdl_window, argv[0]);
+            gr_set_backend(GR_BACKEND_OPENGL);
+            gr_init(gpu_get_vram_ptr());
+        }
     }
 
     /* Maximise instead of computing the frame size ourselves.
@@ -17906,14 +18160,14 @@ session_reboot:
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
      * already initialized the software renderer on the shared VRAM array). */
-    if (g_video_renderer == 2) {
+    if (g_video_renderer == 2 && !g_native_vk) {
         vk_renderer_set_present_mode(present_effective_swap_interval());
         g_vk_active = (vk_renderer_init_context(sdl_window) != 0);
         if (!g_vk_active) gr_set_backend(GR_BACKEND_SOFTWARE);
         if (!netplay_cpu_auth_gpu())
             g_video_scale = gr_scale();
     }
-    latency_ring_set_backend(g_vk_active ? "vulkan" : g_gl_active ? "opengl" : "software");
+    latency_ring_set_backend(g_vk_active || g_native_vk ? "vulkan" : g_gl_active ? "opengl" : "software");
     latency_ring_set_present_mode(present_effective_swap_interval());
     {
         const NativeRenderPresentationOps presentation_ops = {
@@ -17939,7 +18193,7 @@ session_reboot:
 
         g_native_render_selected =
             render_mode == GUEST_RENDER_RENDER_NATIVE;
-        if (g_native_render_selected && !g_gl_active) {
+        if (g_native_render_selected && !g_gl_active && !g_native_vk) {
             native_render_source_fail_closed(__LINE__);
             return 1;
         }
@@ -18023,7 +18277,8 @@ session_reboot:
                     "compile_result=%d failures=%llu fences=%llu mismatch=%u "
                     "compiler=%s record=%u resource=%llu/%llu source=%llu/%llu operations=%u "
                     "targets=%u domains=%u gpu_state=%u present=%s "
-                    "display=%ux%u@%u,%u depth24=%d disabled=%d origin=%s",
+                    "display=%ux%u@%u,%u depth24=%d disabled=%d origin=%s "
+                    "gpu_failure=%s/%llu command=%u kind=%u gl_code=0x%x vk_present=%d gl=%s",
                     work.failure_stage ? work.failure_stage : "unrecorded", work.failure_result,
                     (unsigned)transfer.operation, transfer.source_x, transfer.source_y,
                     transfer.destination_x, transfer.destination_y, transfer.width, transfer.height,
@@ -18050,7 +18305,11 @@ session_reboot:
                     compiler.view_domain_count, compiler.gpu.pending_state,
                     gl_renderer_native_present_blocker_name(pipeline.last_present_blocker),
                     display.width, display.height, display.display_x, display.display_y,
-                    display.depth24, display.disabled, g_native_fail_origin);
+                    display.depth24, display.disabled, g_native_fail_origin,
+                    gl_renderer_native_gpu_failure_name(compiler.gpu.failure_stage),
+                    (unsigned long long)compiler.gpu.failures, compiler.gpu.failure_command,
+                    compiler.gpu.failure_kind, compiler.gpu.failure_gl_error, nvp_active(),
+                    gl_renderer_gl_identity());
                 std::fprintf(stderr, "%s\n", reason);
                 psx_fatal_halt(reason);
             }
@@ -18112,7 +18371,7 @@ session_reboot:
             return 1;
         }
         const bool native_view_requested =
-            render_mode == GUEST_RENDER_RENDER_NATIVE && g_gl_active;
+            render_mode == GUEST_RENDER_RENDER_NATIVE && (g_gl_active || g_native_vk);
         g_native_render_widescreen =
             native_view_requested && wide_requested;
         if (!psx_xg_render_auth_configure_native_view(
@@ -18164,7 +18423,7 @@ session_reboot:
      * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
      * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
      * fall back progressively if a driver can't provide vsync/accel. */
-  if (!g_gl_active && !g_vk_active) {
+  if (!g_gl_active && !g_vk_active && !g_native_vk) {
 #ifdef _WIN32
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
@@ -18209,7 +18468,7 @@ session_reboot:
         }
     }
 
-  if (!g_gl_active && !g_vk_active) {
+  if (!g_gl_active && !g_vk_active && !g_native_vk) {
     const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
     sdl_texture = SDL_CreateTexture(
         sdl_renderer,
@@ -18811,6 +19070,7 @@ session_reboot:
                    g_slice_exit_in_text, g_slice_exit_want); }
 
     shutdown_runtime();
+    native_vk_tear_down();
     if (g_gl_active) {
         gl_renderer_native_shutdown();
         gl_renderer_shutdown();
@@ -18868,9 +19128,9 @@ soft_return_lobby:
         ls.audio_freq = g_audio_freq;
         ls.volume = host_volume_get();
         ls.window_width = g_video_win_w;
-        ls.renderer = g_video_renderer;
-        if (ls.renderer < 0 || ls.renderer > (vulkan_offered ? 2 : 1))
-            ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
+        ls.renderer = psx_launcher_renderer_index(psx_video_get_renderer(), vulkan_offered);
+        if (ls.renderer < 0 || ls.renderer > 1)
+            ls.renderer = psx_launcher_renderer_index(PSXRecompV4::DEFAULT_VIDEO_RENDERER, vulkan_offered);
         ls.supersampling = g_video_scale;
         ls.antialiasing = g_video_aa;
         ls.antialiasing_factor = g_video_aa_factor;
@@ -19209,7 +19469,7 @@ soft_return_lobby:
                         us.memcard2_path = memcard2_path; us.has_memcard2_path = true;
                     }
                 }
-                us.renderer = ls.renderer;
+                us.renderer = psx_launcher_renderer_backend(ls.renderer, vulkan_offered);
                 us.has_renderer = true;
                 us.supersampling = ls.supersampling;
                 us.has_supersampling = true;
@@ -19279,7 +19539,7 @@ soft_return_lobby:
                 }
                 (void)PSXRecompV4::save_user_settings(settings_path, us);
             }
-            g_video_renderer = ls.renderer;
+            g_video_renderer = psx_launcher_renderer_backend(ls.renderer, vulkan_offered);
             g_video_scale = ls.supersampling;
             psx_video_set_antialiasing(ls.antialiasing);
             psx_video_set_antialiasing_factor(ls.antialiasing_factor);

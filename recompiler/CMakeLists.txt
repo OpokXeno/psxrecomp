@@ -1268,6 +1268,14 @@ target_link_libraries(reachable_discovery_test PRIVATE fmt)
                 overlay_decodable_fallback
                 overlay_init_guard
                 recomp_ui_root_override
+                runtime_menu_vulkan_controls
+                runtime_menu_draw_bounds
+                native_savestate_packet_route
+                native_vk_compose_cache
+                native_vk_phase_stream
+                native_sched_bounds
+                native_hazard_precompute
+                native_vk_depth_bounds
                 pal_cadence_host_refresh
                 sdl3_main_single_include
                 spu_sample_scheduler_default

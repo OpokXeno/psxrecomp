@@ -17,6 +17,12 @@ layout(location = 7) in vec4  a_limits;
  * PS1-faithful default: w below is then exactly 1.0 and the fragment shader
  * reads the noperspective varying, i.e. the pre-feature pipeline unchanged. */
 layout(location = 8) in float a_q;
+/* Hardware U/V/R/G/B interpolant planes (gpu_dda.h), flat per primitive; word
+ * 15 (a_dda3.w) is the plane-present flag. */
+layout(location = 9)  in uvec4 a_dda0;
+layout(location = 10) in uvec4 a_dda1;
+layout(location = 11) in uvec4 a_dda2;
+layout(location = 12) in uvec4 a_dda3;
 
 layout(push_constant) uniform PC {
     float u_shift;
@@ -26,6 +32,9 @@ layout(push_constant) uniform PC {
     int   u_maskset;
     int   u_filter;
     ivec4 u_twin;
+    int   u_dither;
+    int   u_scale;
+    int   u_dda_ok;
 } pc;
 
 layout(location = 0) noperspective out vec2  v_uv;
@@ -37,9 +46,15 @@ layout(location = 5) flat out int   v_raw;
 layout(location = 6) flat out ivec4 v_limits;
 layout(location = 7) smooth out vec2 v_uv_p;   /* perspective-correct UV */
 layout(location = 8) flat   out int  v_persp;
+layout(location = 9)  noperspective out vec2 v_pos;
+layout(location = 10) flat out uvec4 v_dda0;
+layout(location = 11) flat out uvec4 v_dda1;
+layout(location = 12) flat out uvec4 v_dda2;
+layout(location = 13) flat out uvec4 v_dda3;
 
 void main() {
-    v_uv = a_uv; v_uv_p = a_uv; v_col = a_col;
+    v_uv = a_uv; v_uv_p = a_uv; v_col = a_col; v_pos = a_pos;
+    v_dda0 = a_dda0; v_dda1 = a_dda1; v_dda2 = a_dda2; v_dda3 = a_dda3;
     v_persp = (a_q > 0.0) ? 1 : 0;
     v_tpage = ivec2(a_tpage + 0.5);
     v_clut  = ivec2(a_clut + 0.5);

@@ -1,0 +1,43 @@
+#version 450
+//! gl_version 430
+//! variant FILTERED NATIVE_DECODE_FILTERED=1
+#include "native_prelude.glsl"
+/* Decode an immutable replay texture/CLUT once, preserving the exact RGB555
+ * word, zero transparency and STP bit. Fragment filtering still uses the same
+ * taps and integer colour arithmetic; only dependent palette reads disappear. */
+layout(local_size_x=8,local_size_y=8) in;
+PSX_USAMPLERBUFFER(0, words)
+layout(r32ui,PSX_BINDING(1,1)) writeonly uniform uimage2D decoded;
+#ifdef NATIVE_DECODE_FILTERED
+layout(rgba8,PSX_BINDING(2,2)) writeonly uniform image2D filtered;
+PSX_USAMPLER2D(3, base_words)
+#endif
+#ifdef VULKAN
+layout(push_constant) uniform DecodePage { ivec4 page; ivec2 state; };
+#else
+uniform ivec4 page; uniform ivec2 state;
+#endif
+uint word_at(ivec2 p) {
+    p &= ivec2(1023,511);
+#ifdef NATIVE_DECODE_FILTERED
+    if(state.y==0)return texelFetch(base_words,p,0).r;
+#endif
+    return texelFetch(words,(state.y-1)*524288+p.y*1024+p.x).r;
+}
+void main() {
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    int shift=state.x==0?2:state.x==1?1:0;
+    uint word=word_at(page.xy+ivec2(q.x>>shift,q.y));
+    if(state.x<2) {
+        uint index=state.x==0?(word>>uint((q.x&3)*4))&15u:(word>>uint((q.x&1)*8))&255u;
+        word=word_at(page.zw+ivec2(int(index),0));
+    }
+    imageStore(decoded,q,uvec4(word));
+#ifdef NATIVE_DECODE_FILTERED
+    /* RGB stores the original 0..31 channel values as bytes. Alpha is
+     * coverage, not STP: the original integer word remains authoritative
+     * for cutout, blending and mask/depth behavior. */
+    vec3 rgb=vec3(uvec3(word,word>>5u,word>>10u)&31u)/255.0;
+    imageStore(filtered,q,vec4(rgb,word!=0u?1.0:0.0));
+#endif
+}

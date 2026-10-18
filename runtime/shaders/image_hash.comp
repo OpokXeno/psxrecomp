@@ -1,0 +1,32 @@
+#version 450
+//! gl_version 430
+// An order-sensitive, parallel fingerprint of the immutable RGBA8 image.
+// The full legacy byte digest remains the audit/probe format.
+#extension GL_ARB_gpu_shader_int64 : require
+#include "native_prelude.glsl"
+layout(local_size_x=128) in;
+layout(PSX_BINDING(9,9)) uniform sampler2D source_image;
+layout(std430,PSX_BINDING(0,0)) writeonly buffer Results { uvec4 results[]; };
+shared uint64_t hashes[128];
+shared uint visible[128];
+uint64_t mix64(uint64_t x) {
+    x=(x^(x>>30))*0xbf58476d1ce4e5b9ul;
+    x=(x^(x>>27))*0x94d049bb133111ebul;
+    return x^(x>>31);
+}
+void main() {
+    ivec2 size=textureSize(source_image,0);
+    uint count=uint(size.x)*uint(size.y),lane=gl_LocalInvocationID.x;
+    uint64_t hash=0ul;uint seen=0u;
+    for(uint i=gl_GlobalInvocationID.x;i<count;i+=gl_NumWorkGroups.x*128u) {
+        uint rgba=packUnorm4x8(texelFetch(source_image,ivec2(i%uint(size.x),i/uint(size.x)),0));
+        hash^=mix64(uint64_t(rgba)^(uint64_t(i)*0x9e3779b97f4a7c15ul));
+        seen+=uint((rgba&0xffffffu)!=0u);
+    }
+    hashes[lane]=hash;visible[lane]=seen;barrier();
+    for(uint stride=64u;stride!=0u;stride>>=1u) {
+        if(lane<stride){hashes[lane]^=hashes[lane+stride];visible[lane]+=visible[lane+stride];}
+        barrier();
+    }
+    if(lane==0u)results[gl_WorkGroupID.x]=uvec4(uint(hashes[0]),uint(hashes[0]>>32),visible[0],0u);
+}

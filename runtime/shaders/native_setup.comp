@@ -1,0 +1,125 @@
+#version 450
+//! gl_version 430
+// GPU-resident Native triangle setup. Keep arithmetic and rounding aligned
+// with native_attribute_planes/native_depth_plane; no CPU readback.
+// Explicit dvec component stores preserve Q16 precision on the tested NVIDIA
+// compiler, whose dynamically indexed scalar arrays rounded these to float.
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_ARB_gpu_shader_int64 : require
+#include "native_prelude.glsl"
+layout(local_size_x=64) in;
+#define NATIVE_SETUP_UNIFORMS(U) U(int, triangle_count)
+struct Triangle { ivec4 xyuv[3]; ivec4 rgbz[3]; ivec4 config; ivec4 depth; };
+layout(std430,PSX_BINDING(0,0)) readonly buffer Inputs { Triangle triangles[]; };
+layout(std430,PSX_BINDING(1,1)) buffer Parameters { uvec4 parameters[]; };
+PSX_UNIFORMS(SetupDraw, 0, NATIVE_SETUP_UNIFORMS)
+bool finite(double x) { return !isnan(x)&&!isinf(x); }
+ivec2 axis_limits(int lo,int hi,int dir) {
+    if(dir>0&&hi>lo)--hi;
+    if(dir<0&&hi>lo)++lo;
+    return (lo>>8)==(hi>>8)?ivec2(lo&255,hi&255):ivec2(0,255);
+}
+void set3(inout dvec3 target,int index,double value){if(index==0)target.x=value;else if(index==1)target.y=value;else target.z=value;}
+void set4(inout dvec4 target,int index,double value){if(index==0)target.x=value;else if(index==1)target.y=value;else if(index==2)target.z=value;else target.w=value;}
+void main() {
+    uint id=gl_GlobalInvocationID.x;
+    if(id>=uint(triangle_count))return;
+    Triangle t=triangles[id];
+    uint b=id*14u,s=uint(triangle_count)*14u+id*6u;
+    precise dvec3 x,y,v[5];
+    vec3 fx,fy;
+    ivec3 us,vs;
+    bool integral=true;
+    for(int i=0;i<3;++i) {
+        set3(x,i,double(t.xyuv[i].x)/65536.0lf+double(t.config.z));
+        set3(y,i,double(t.xyuv[i].y)/65536.0lf+double(t.config.w));
+        fx[i]=float(x[i]);
+        fy[i]=float(y[i]);
+        us[i]=int(floor(double(t.xyuv[i].z)/65536.0lf));
+        vs[i]=int(floor(double(t.xyuv[i].w)/65536.0lf));
+        set3(v[0],i,double(t.xyuv[i].z)/65536.0lf);
+        set3(v[1],i,double(t.xyuv[i].w)/65536.0lf);
+        int c=t.config.y!=0?i:0;
+        for(int a=2;a<5;++a)set3(v[a],i,double(t.rgbz[c][a-2]));
+        integral=integral&&x[i]==floor(x[i])&&y[i]==floor(y[i])&&
+            (t.xyuv[i].z%65536)==0&&(t.xyuv[i].w%65536)==0;
+    }
+    // gpu_uv.h intentionally subtracts float positions before double products.
+    precise double dudx=-double(fy[1]-fy[0])*double(us[2])-double(fy[2]-fy[1])*double(us[0])-double(fy[0]-fy[2])*double(us[1]);
+    precise double dvdx=-double(fy[1]-fy[0])*double(vs[2])-double(fy[2]-fy[1])*double(vs[0])-double(fy[0]-fy[2])*double(vs[1]);
+    precise double dudy= double(fx[1]-fx[0])*double(us[2])+double(fx[2]-fx[1])*double(us[0])+double(fx[0]-fx[2])*double(us[1]);
+    precise double dvdy= double(fx[1]-fx[0])*double(vs[2])+double(fx[2]-fx[1])*double(vs[0])+double(fx[0]-fx[2])*double(vs[1]);
+    precise double fa=double(fx[1]-fx[0])*double(fy[2]-fy[0])-double(fx[2]-fx[0])*double(fy[1]-fy[0]);
+    int du=fa==0.0lf?0:dudx==0.0lf?int(sign(dudy)):dudy==0.0lf?int(sign(dudx)):0;
+    int dv=fa==0.0lf?0:dvdx==0.0lf?int(sign(dvdy)):dvdy==0.0lf?int(sign(dvdx)):0;
+    if(fa<0.0lf){du=-du;dv=-dv;}
+    ivec2 lu=axis_limits(min(us[0],min(us[1],us[2])),max(us[0],max(us[1],us[2])),du);
+    ivec2 lv=axis_limits(min(vs[0],min(vs[1],vs[2])),max(vs[0],max(vs[1],vs[2])),dv);
+    parameters[b+3u]=uvec4(lu.x,lv.x,lu.y,lv.y);
+    int core=x[1]<=x[0]?(x[2]<=x[1]?2:1):(x[2]<x[0]?2:0);
+    parameters[b+5u]=floatBitsToUint(vec4(float(x[core]),float(y[core]),integral?1.0lf:2.0lf,t.config.y==0?1.0lf:0.0lf));
+    precise double area=(x[1]-x[0])*(y[2]-y[0])-(x[2]-x[0])*(y[1]-y[0]);
+    double scale=double(t.config.x);
+    precise dvec4 uv_step;
+    for(int a=0;a<5;++a) {
+        precise double seed=0.0lf,dx=0.0lf,dy=0.0lf;
+        uvec3 dda=uvec3(0);
+        if(area!=0.0lf) {
+            if(a>=2&&t.config.y==0) {
+                seed=v[a][0]+0.5lf;
+                dda.x=uint(int64_t(v[a][0])*4096l+2048l)&1048575u;
+            } else {
+                precise double nx=(v[a][1]-v[a][0])*(y[2]-y[0])-(v[a][2]-v[a][0])*(y[1]-y[0]);
+                precise double ny=(x[1]-x[0])*(v[a][2]-v[a][0])-(x[2]-x[0])*(v[a][1]-v[a][0]);
+                dx=nx/area;dy=ny/area;
+                bool mirror=a<2&&((dx<0.0lf&&dy==0.0lf)||(dy<0.0lf&&dx==0.0lf));
+                precise double bias=a<2?0.5lf/scale+(mirror?1.0lf-1.0lf/scale:0.0lf):0.5lf;
+                seed=v[a][core]+bias;
+                if(integral) {
+                    int64_t den=int64_t(area)*int64_t(t.config.x);
+                    int64_t sx=int64_t(nx)*4096l/den,sy=int64_t(ny)*4096l/den;
+                    int64_t q=int64_t(v[a][core])*4096l+
+                        (a<2?2048l/int64_t(t.config.x)+(mirror?4096l-4096l/int64_t(t.config.x):0l):2048l);
+                    dda=uvec3(uint(q),uint(sx),uint(sy))&1048575u;
+                    seed=double(q)/4096.0lf;
+                    dx=double(sx)*scale/4096.0lf;dy=double(sy)*scale/4096.0lf;
+                }
+            }
+        }
+        parameters[b+9u+uint(a)]=integral?uvec4(dda,0u):floatBitsToUint(vec4(float(seed),float(dx),float(dy),0.0lf));
+        if(a<2){set4(uv_step,a,dx/scale);set4(uv_step,a+2,dy/scale);}
+    }
+    if(parameters[b+7u].z>1u)parameters[b+6u]=floatBitsToUint(vec4(uv_step[0],uv_step[1],uv_step[2],uv_step[3]));
+    // Match native_depth_plane, including its constant far-corner fallback.
+    if(t.depth.z==0)return;
+    bool valid=t.depth.x!=0&&area!=0.0lf&&finite(area)&&finite(x[0])&&finite(y[0])&&
+        abs(x[0])<=1048576.0lf&&abs(y[0])<=1048576.0lf;
+    precise dvec3 d;
+    for(int i=0;i<3;++i) {
+        valid=valid&&t.rgbz[i].w>0;
+        set3(d,i,t.rgbz[i].w>0?1099511627776.0lf/double(t.rgbz[i].w):0.0lf);
+    }
+    int show=t.depth.x==0?0:3;
+    ivec4 depth_plane=ivec4(0);
+    ivec2 depth_origin=ivec2(0);
+    if(valid) {
+        precise double ox=floor(x[0]),oy=floor(y[0]);
+        precise double dx=((d[1]-d[0])*(y[2]-y[0])-(d[2]-d[0])*(y[1]-y[0]))/area;
+        precise double dy=((x[1]-x[0])*(d[2]-d[0])-(x[2]-x[0])*(d[1]-d[0]))/area;
+        precise double a=roundEven(dx*256.0lf),c=roundEven(dy*256.0lf);
+        precise double n=roundEven((d[0]+dx*(ox-x[0])+dy*(oy-y[0]))*256.0lf);
+        depth_origin=ivec2(ox,oy);
+        if(finite(dx)&&finite(dy)&&abs(a)<=4194304.0lf&&abs(c)<=4194304.0lf&&n>=256.0lf&&n<1073741824.0lf)
+            depth_plane=ivec4(int(n),int(a),int(c),t.config.x);
+        else {
+            precise double far_key=min(min(d[0],d[1]),d[2])*256.0lf;
+            valid=finite(far_key)&&far_key>=256.0lf;
+            if(valid)depth_plane=ivec4(int(min(far_key,1073741823.0lf)),0,0,t.config.x);
+        }
+    }
+    if(valid)show=t.depth.x==2?2:1;
+    parameters[b+2u]=uvec4(valid?1:0,valid&&t.depth.x==2?2:1,t.depth.w,valid?t.depth.y:0);
+    if(valid)parameters[b+4u]=uvec4(depth_plane);
+    if(valid)parameters[b+8u].yz=uvec2(depth_origin);
+    parameters[s+2u].y=uint(show);
+}

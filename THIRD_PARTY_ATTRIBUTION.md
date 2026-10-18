@@ -41,6 +41,9 @@ constrains this repository's own terms; the obligation is to carry the notice.
 | --- | --- | --- | --- |
 | [toml11](https://github.com/ToruNiina/toml11) by Toru Niina | MIT | recompiler **and** runtime | `recompiler/lib/toml11/LICENSE`, shipped as `runtime/licenses/toml11-NOTICES.txt` |
 | [stb_image](http://nothings.org/stb) by Sean Barrett | MIT **or** public domain (Unlicense), at your option | runtime | notice in `runtime/third_party/stb_image.h`, shipped as `runtime/licenses/stb_image-NOTICES.txt` |
+| [volk](https://github.com/zeux/volk) by Arseny Kapoulkine (tag `vulkan-sdk-1.4.363.0`) | MIT | runtime (`PSX_HAVE_VULKAN`) | `runtime/third_party/volk/`, notice shipped as `runtime/licenses/volk-NOTICES.txt` |
+| [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) by AMD / GPUOpen (tag `v3.4.0`) | MIT | runtime (`PSX_HAVE_VULKAN`) | `runtime/third_party/vma/`, notice shipped as `runtime/licenses/vma-NOTICES.txt` |
+| [Dear ImGui](https://github.com/ocornut/imgui) `imgui_impl_vulkan` backend (tag `v1.91.9b`) by Omar Cornut | MIT | runtime Vulkan menus | `recomp-ui/src/third_party/imgui/backends/`, notice shipped as `runtime/licenses/imgui-NOTICES.txt` |
 | [rabbitizer](https://github.com/Decompollaborate/rabbitizer) by Decompollaborate | MIT | recompiler only | `recompiler/lib/rabbitizer/LICENSE` |
 | [ELFIO](https://github.com/serge1/ELFIO) by Serge Lamikhov-Center | MIT | recompiler only | `recompiler/lib/ELFIO/LICENSE.txt` |
 | [{fmt}](https://github.com/fmtlib/fmt) by Victor Zverovich | MIT | recompiler only | `recompiler/lib/fmt/LICENSE.rst` |

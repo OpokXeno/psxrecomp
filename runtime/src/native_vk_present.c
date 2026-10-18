@@ -54,34 +54,27 @@ int nvp_diagnostics_json(char *out, int capacity)
 
 #else  /* PSX_HAVE_VULKAN */
 
+#include <stdarg.h>
 #include <stdatomic.h>
 #include "psx_sdl.h"
 #if defined(PSX_SDL3)
-#include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_opengl.h>
 #else
-#include <SDL_vulkan.h>
 #include <SDL_opengl.h>
 #endif
 #if defined(_WIN32)
 #include <windows.h>
-#define VK_USE_PLATFORM_WIN32_KHR
 #else
 #include <unistd.h>
 #endif
-#define VK_NO_PROTOTYPES
-#include <vulkan/vulkan.h>
+#include "vk_core.h"
+#include "vk_swapchain.h"
 #if defined(_WIN32)
 #include <vulkan/vulkan_win32.h>
 #endif
 
-#define NVP_SAY(...) fprintf(stdout, "psxrecomp: vk-present: " __VA_ARGS__)
-
-#define NVP_RING 3            /* interop images and frames in flight */
-#define NVP_MAX_SC 8          /* swapchain images supported */
+#define NVP_RING 3            /* interop images and handover frames */
 #define NVP_MAX_GL_DEV 8
-#define NVP_ACQUIRE_TIMEOUT_NS 100000000ull
-#define NVP_PRESENT_WAIT_TIMEOUT_NS 100000000ull
 
 /* GL values from the Khronos registry, defined here so the file does not
  * depend on which GL headers the platform ships. */
@@ -158,94 +151,10 @@ static NvpPfnBindFramebuffer         nvp_glBindFramebuffer;
 static NvpPfnFramebufferTexture2D    nvp_glFramebufferTexture2D;
 static NvpPfnCheckFramebufferStatus  nvp_glCheckFramebufferStatus;
 
-/* ---- Vulkan entry points ------------------------------------------------ */
-static PFN_vkGetInstanceProcAddr nvp_vkGetInstanceProcAddr;
-static PFN_vkGetDeviceProcAddr   nvp_vkGetDeviceProcAddr;
-
-#define NVP_VK_GLOBAL_FUNCS(X) \
-    X(vkCreateInstance)
-
-#define NVP_VK_INSTANCE_FUNCS(X) \
-    X(vkDestroyInstance) \
-    X(vkEnumeratePhysicalDevices) \
-    X(vkGetPhysicalDeviceProperties2) \
-    X(vkGetPhysicalDeviceFeatures2) \
-    X(vkGetPhysicalDeviceQueueFamilyProperties) \
-    X(vkGetPhysicalDeviceMemoryProperties) \
-    X(vkGetPhysicalDeviceFormatProperties) \
-    X(vkGetPhysicalDeviceImageFormatProperties2) \
-    X(vkGetPhysicalDeviceExternalSemaphoreProperties) \
-    X(vkEnumerateDeviceExtensionProperties) \
-    X(vkGetPhysicalDeviceSurfaceSupportKHR) \
-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
-    X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
-    X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
-    X(vkDestroySurfaceKHR) \
-    X(vkCreateDevice)
-
-#if defined(_WIN32)
-#define NVP_VK_PLATFORM_FUNCS(X) \
-    X(vkGetMemoryWin32HandleKHR) \
-    X(vkGetSemaphoreWin32HandleKHR)
-#else
-#define NVP_VK_PLATFORM_FUNCS(X) \
-    X(vkGetMemoryFdKHR) \
-    X(vkGetSemaphoreFdKHR)
-#endif
-
-#define NVP_VK_DEVICE_FUNCS(X) \
-    X(vkDestroyDevice) \
-    X(vkGetDeviceQueue) \
-    X(vkDeviceWaitIdle) \
-    X(vkCreateCommandPool) \
-    X(vkDestroyCommandPool) \
-    X(vkAllocateCommandBuffers) \
-    X(vkFreeCommandBuffers) \
-    X(vkResetCommandBuffer) \
-    X(vkBeginCommandBuffer) \
-    X(vkEndCommandBuffer) \
-    X(vkQueueSubmit) \
-    X(vkCreateFence) \
-    X(vkDestroyFence) \
-    X(vkWaitForFences) \
-    X(vkResetFences) \
-    X(vkCreateSemaphore) \
-    X(vkDestroySemaphore) \
-    X(vkCreateImage) \
-    X(vkDestroyImage) \
-    X(vkGetImageMemoryRequirements) \
-    X(vkAllocateMemory) \
-    X(vkFreeMemory) \
-    X(vkBindImageMemory) \
-    X(vkCmdPipelineBarrier) \
-    X(vkCmdBlitImage) \
-    X(vkCmdClearColorImage) \
-    X(vkCmdCopyImageToBuffer) \
-    X(vkCreateBuffer) \
-    X(vkDestroyBuffer) \
-    X(vkGetBufferMemoryRequirements) \
-    X(vkBindBufferMemory) \
-    X(vkMapMemory) \
-    X(vkUnmapMemory) \
-    X(vkCreateSwapchainKHR) \
-    X(vkDestroySwapchainKHR) \
-    X(vkGetSwapchainImagesKHR) \
-    X(vkAcquireNextImageKHR) \
-    X(vkQueuePresentKHR) \
-    NVP_VK_PLATFORM_FUNCS(X)
-
-#define NVP_DECL(n) static PFN_##n nvp_##n;
-NVP_VK_GLOBAL_FUNCS(NVP_DECL)
-NVP_VK_INSTANCE_FUNCS(NVP_DECL)
-NVP_VK_DEVICE_FUNCS(NVP_DECL)
-#undef NVP_DECL
-static PFN_vkEnumerateInstanceVersion nvp_vkEnumerateInstanceVersion;
-static PFN_vkWaitForPresentKHR nvp_vkWaitForPresentKHR;  /* optional, device level */
-
 /* ---- state -------------------------------------------------------------- */
 typedef struct NvpImage {
     VkImage image;
-    VkDeviceMemory memory;
+    VkDeviceMemory memory;   /* explicit allocation: VMA cannot export memory */
     VkSemaphore gl_ready;    /* GL signals, Vulkan waits */
     VkSemaphore vk_done;     /* Vulkan signals, GL waits */
     GLuint tex, fbo, memobj;
@@ -253,59 +162,27 @@ typedef struct NvpImage {
     int vk_done_pending;     /* Vulkan signaled vk_done, GL has not waited */
 } NvpImage;
 
+/* Command buffer and fence for a submit that only hands an interop image
+ * over (no swapchain image to blit into). */
 typedef struct NvpFrame {
     VkCommandBuffer cb;
     VkFence fence;
 } NvpFrame;
 
-static int s_probed;                 /* instance + device exist */
+#if defined(_WIN32)
+static PFN_vkGetMemoryWin32HandleKHR nvp_get_memory_handle;
+static PFN_vkGetSemaphoreWin32HandleKHR nvp_get_semaphore_handle;
+#endif
+
+static int s_probed;                 /* vk_core is initialized for the interop path */
 static int s_active;
-static VkInstance s_instance;
-static VkPhysicalDevice s_phys;
-static VkDevice s_dev;
-static VkQueue s_queue;
-static uint32_t s_qfam;
 static VkCommandPool s_pool;
-static VkPhysicalDeviceMemoryProperties s_memprops;
-static int s_has_present_id, s_has_present_wait;
-static int s_use_present_wait;       /* present_id + present_wait enabled and loaded */
-/* Max not-yet-displayed FIFO images (0 = unbounded, PSX_VK_PRESENT_DEPTH 0-3).
- * Depth 2 (the previous image must be on screen before another is queued) is
- * one refresh shorter, but every compose must then land between that scanout
- * and the compositor's next deadline; on a slow GPU it falls into a stable
- * half-rate pattern. Depth 3 keeps full rate and still drops ~1 refresh of
- * queue latency versus the unbounded 3-image FIFO. */
-static int s_present_depth = 3;
-static uint64_t s_present_id;        /* last id handed out, strictly increasing */
-static uint64_t s_sc_first_id;       /* first id presented on the current swapchain */
-static uint64_t s_last_presented_id; /* last id of a successful present, this swapchain */
-static int s_sdl_vk_loaded;
+static NvpFrame s_frames[NVP_RING];
+static uint32_t s_frame_cursor;
 
 static GLubyte s_gl_dev_uuid[NVP_MAX_GL_DEV][NVP_GL_UUID_SIZE_EXT];
 static int s_gl_dev_count;
 static GLubyte s_gl_drv_uuid[NVP_GL_UUID_SIZE_EXT];
-
-static SDL_Window *s_win;
-static VkSurfaceKHR s_surface;
-static VkFormat s_sc_format;
-static VkSwapchainKHR s_swapchain;
-static _Atomic int s_sc_can_read;    /* swapchain images have TRANSFER_SRC */
-static VkExtent2D s_extent;
-static uint32_t s_sc_count;
-static VkImage s_sc_images[NVP_MAX_SC];
-static VkSemaphore s_render_done[NVP_MAX_SC];
-static VkSemaphore s_acquire_sem[NVP_MAX_SC + 1];
-static uint32_t s_acquire_cursor;
-static uint32_t s_mode_mask;         /* bit per supported VkPresentModeKHR 0..3 */
-static VkPresentModeKHR s_present_mode;
-static int s_have_mode;
-static int s_win_w, s_win_h;         /* window pixel size at last creation */
-static int s_minimized;
-static int s_need_recreate;
-static uint64_t s_images_since_create;
-
-static NvpFrame s_frames[NVP_RING];
-static uint32_t s_frame_cursor;
 
 static NvpImage s_img[NVP_RING];
 static int s_interop_live;           /* VK side of the interop images exists */
@@ -315,28 +192,19 @@ static int s_iw, s_ih;
 static uint32_t s_cursor;
 static int s_begun;
 static int s_applied_interval = 1;
-static int s_applied_vsync = 1;
 
 static _Atomic int s_req_interval = 1;
 static _Atomic int s_req_vsync = 1;
 
-/* debug readback handshake: 0 idle, 1 requested, 2 ready, 3 capturing */
-static _Atomic int s_cap_state;
-static unsigned char *s_cap_rgb;     /* ready result, owned until taken */
-static int s_cap_w, s_cap_h;
+/* First reason the probe or the attach failed, for the debug server. */
+static char s_probe_failure[192];
 
 /* diagnostics: written by the presenter thread, read from any thread */
-static _Atomic int s_d_present_mode = -1;
-static _Atomic uint32_t s_d_sc_images, s_d_ext_w, s_d_ext_h, s_d_int_w, s_d_int_h;
-static _Atomic uint64_t s_d_frames_begun, s_d_frames_presented, s_d_images_presented;
-static _Atomic uint64_t s_d_acquire_timeouts, s_d_out_of_date, s_d_suboptimal;
-static _Atomic uint64_t s_d_sc_recreations, s_d_interop_recreations;
-static _Atomic uint64_t s_d_minimized_skips, s_d_failures;
+static _Atomic uint32_t s_d_int_w, s_d_int_h;
+static _Atomic uint64_t s_d_frames_begun, s_d_frames_presented;
+static _Atomic uint64_t s_d_interop_recreations, s_d_failures;
 static _Atomic uint64_t s_d_last_present_ns, s_d_max_block_ns;
 static _Atomic int s_d_last_result;
-static _Atomic int s_d_present_wait_on, s_d_present_depth;
-static _Atomic uint64_t s_d_present_waits, s_d_present_wait_timeouts;
-static _Atomic uint64_t s_d_present_wait_ns_total, s_d_present_wait_max_ns, s_d_last_present_id;
 
 #define NVP_ADD(v, n) atomic_fetch_add_explicit(&(v), (n), memory_order_relaxed)
 #define NVP_GET(v) atomic_load_explicit(&(v), memory_order_relaxed)
@@ -358,37 +226,19 @@ static void nvp_fail(VkResult r)
     NVP_SET(s_d_last_result, (int)r);
 }
 
-/* ---- loading ------------------------------------------------------------ */
-static int nvp_load_global(void)
+/* Keeps the first reason; quotes and control characters are replaced so the
+ * text can go into JSON as is. */
+static void nvp_note(const char *fmt, ...)
 {
-#define NVP_LOAD(n) nvp_##n = (PFN_##n)nvp_vkGetInstanceProcAddr(NULL, #n); \
-    if (!nvp_##n) { NVP_SAY("missing " #n "\n"); return 0; }
-    NVP_VK_GLOBAL_FUNCS(NVP_LOAD)
-#undef NVP_LOAD
-    nvp_vkEnumerateInstanceVersion = (PFN_vkEnumerateInstanceVersion)
-        nvp_vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceVersion");
-    return 1;
-}
-
-static int nvp_load_instance(void)
-{
-#define NVP_LOAD(n) nvp_##n = (PFN_##n)nvp_vkGetInstanceProcAddr(s_instance, #n); \
-    if (!nvp_##n) { NVP_SAY("missing " #n "\n"); return 0; }
-    NVP_VK_INSTANCE_FUNCS(NVP_LOAD)
-#undef NVP_LOAD
-    nvp_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)
-        nvp_vkGetInstanceProcAddr(s_instance, "vkGetDeviceProcAddr");
-    if (!nvp_vkGetDeviceProcAddr) { NVP_SAY("missing vkGetDeviceProcAddr\n"); return 0; }
-    return 1;
-}
-
-static int nvp_load_device(void)
-{
-#define NVP_LOAD(n) nvp_##n = (PFN_##n)nvp_vkGetDeviceProcAddr(s_dev, #n); \
-    if (!nvp_##n) { NVP_SAY("missing " #n "\n"); return 0; }
-    NVP_VK_DEVICE_FUNCS(NVP_LOAD)
-#undef NVP_LOAD
-    return 1;
+    if (s_probe_failure[0]) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_probe_failure, sizeof(s_probe_failure), fmt, ap);
+    va_end(ap);
+    size_t n = strlen(s_probe_failure);
+    while (n && s_probe_failure[n - 1] == '\n') s_probe_failure[--n] = '\0';
+    for (char *c = s_probe_failure; *c; ++c)
+        if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = ' ';
 }
 
 /* ---- GL probe ----------------------------------------------------------- */
@@ -396,7 +246,7 @@ static int nvp_gl_load_one(void **slot, const char *name)
 {
     *slot = (void *)SDL_GL_GetProcAddress(name);
     if (!*slot) {
-        NVP_SAY("GL entry point %s missing\n", name);
+        nvp_note("GL entry point %s missing\n", name);
         return 0;
     }
     return 1;
@@ -423,7 +273,7 @@ static int nvp_probe_gl(void)
         else if (!strcmp(e, sem_h)) have_sem_h = 1;
     }
     if (!have_mem || !have_sem || !have_mem_h || !have_sem_h) {
-        NVP_SAY("GL lacks %s%s%s%s\n",
+        nvp_note("GL lacks %s%s%s%s\n",
                 have_mem ? "" : "GL_EXT_memory_object ",
                 have_sem ? "" : "GL_EXT_semaphore ",
                 have_mem_h ? "" : mem_h, have_sem_h ? "" : sem_h);
@@ -457,7 +307,7 @@ static int nvp_probe_gl(void)
     GLint nuuid = 0;
     glGetIntegerv(NVP_GL_NUM_DEVICE_UUIDS_EXT, &nuuid);
     if (nuuid <= 0) {
-        NVP_SAY("GL reports no device UUID\n");
+        nvp_note("GL reports no device UUID\n");
         return 0;
     }
     if (nuuid > NVP_MAX_GL_DEV) nuuid = NVP_MAX_GL_DEV;
@@ -471,10 +321,11 @@ static int nvp_probe_gl(void)
 /* ---- teardown ----------------------------------------------------------- */
 static void nvp_destroy_image_vk(NvpImage *im)
 {
-    if (im->gl_ready) nvp_vkDestroySemaphore(s_dev, im->gl_ready, NULL);
-    if (im->vk_done) nvp_vkDestroySemaphore(s_dev, im->vk_done, NULL);
-    if (im->image) nvp_vkDestroyImage(s_dev, im->image, NULL);
-    if (im->memory) nvp_vkFreeMemory(s_dev, im->memory, NULL);
+    VkDevice dev = vk_core_device();
+    if (im->gl_ready) vkDestroySemaphore(dev, im->gl_ready, NULL);
+    if (im->vk_done) vkDestroySemaphore(dev, im->vk_done, NULL);
+    if (im->image) vkDestroyImage(dev, im->image, NULL);
+    if (im->memory) vkFreeMemory(dev, im->memory, NULL);
     im->gl_ready = im->vk_done = VK_NULL_HANDLE;
     im->image = VK_NULL_HANDLE;
     im->memory = VK_NULL_HANDLE;
@@ -494,10 +345,10 @@ static void nvp_destroy_image_gl(NvpImage *im)
  * must be current); otherwise only the Vulkan side is released. */
 static void nvp_destroy_interop(int with_gl)
 {
-    if (s_dev) nvp_vkDeviceWaitIdle(s_dev);
+    if (vk_core_device()) vk_core_device_wait_idle();
     for (int i = 0; i < NVP_RING; ++i) {
         if (with_gl && s_gl_live) nvp_destroy_image_gl(&s_img[i]);
-        if (s_dev) nvp_destroy_image_vk(&s_img[i]);
+        if (vk_core_device()) nvp_destroy_image_vk(&s_img[i]);
         memset(&s_img[i], 0, sizeof(s_img[i]));
     }
     s_interop_live = 0;
@@ -509,115 +360,42 @@ static void nvp_destroy_interop(int with_gl)
     NVP_SET(s_d_int_h, 0);
 }
 
-static void nvp_destroy_sc_sync(void)
+static void nvp_destroy_frames(void)
 {
-    for (uint32_t i = 0; i < NVP_MAX_SC; ++i) {
-        if (s_render_done[i]) nvp_vkDestroySemaphore(s_dev, s_render_done[i], NULL);
-        s_render_done[i] = VK_NULL_HANDLE;
+    VkDevice dev = vk_core_device();
+    for (int i = 0; i < NVP_RING; ++i) {
+        if (s_frames[i].fence) vkDestroyFence(dev, s_frames[i].fence, NULL);
+        if (s_frames[i].cb && s_pool) vkFreeCommandBuffers(dev, s_pool, 1, &s_frames[i].cb);
     }
-    for (uint32_t i = 0; i < NVP_MAX_SC + 1; ++i) {
-        if (s_acquire_sem[i]) nvp_vkDestroySemaphore(s_dev, s_acquire_sem[i], NULL);
-        s_acquire_sem[i] = VK_NULL_HANDLE;
-    }
-    s_acquire_cursor = 0;
+    if (s_pool) vkDestroyCommandPool(dev, s_pool, NULL);
+    memset(s_frames, 0, sizeof(s_frames));
+    s_pool = VK_NULL_HANDLE;
 }
 
 static void nvp_teardown(void)
 {
-    if (s_dev) nvp_vkDeviceWaitIdle(s_dev);
-    if (s_interop_live) nvp_destroy_interop(0);
-    if (s_dev) {
-        nvp_destroy_sc_sync();
-        for (int i = 0; i < NVP_RING; ++i) {
-            if (s_frames[i].fence) nvp_vkDestroyFence(s_dev, s_frames[i].fence, NULL);
-            if (s_frames[i].cb && s_pool) nvp_vkFreeCommandBuffers(s_dev, s_pool, 1, &s_frames[i].cb);
-        }
-        if (s_swapchain) nvp_vkDestroySwapchainKHR(s_dev, s_swapchain, NULL);
-        if (s_pool) nvp_vkDestroyCommandPool(s_dev, s_pool, NULL);
+    if (vk_core_device()) {
+        vk_core_device_wait_idle();
+        if (s_interop_live) nvp_destroy_interop(0);
+        nvp_destroy_frames();
     }
-    memset(s_frames, 0, sizeof(s_frames));
-    atomic_store(&s_sc_can_read, 0);
-    if (s_cap_rgb) free(s_cap_rgb);
-    s_cap_rgb = NULL;
-    atomic_store(&s_cap_state, 0);
-    s_swapchain = VK_NULL_HANDLE;
-    s_pool = VK_NULL_HANDLE;
-    if (s_surface && s_instance) nvp_vkDestroySurfaceKHR(s_instance, s_surface, NULL);
-    s_surface = VK_NULL_HANDLE;
-    if (s_dev) nvp_vkDestroyDevice(s_dev, NULL);
-    s_dev = VK_NULL_HANDLE;
-    s_queue = VK_NULL_HANDLE;
-    if (s_instance && nvp_vkDestroyInstance) nvp_vkDestroyInstance(s_instance, NULL);
-    s_instance = VK_NULL_HANDLE;
-    s_phys = VK_NULL_HANDLE;
-    if (s_sdl_vk_loaded) SDL_Vulkan_UnloadLibrary();
-    s_sdl_vk_loaded = 0;
+    vk_swapchain_destroy();
+    vk_core_detach_window();
+    vk_core_shutdown();
 
     s_probed = 0;
     s_active = 0;
-    s_win = NULL;
-    s_sc_count = 0;
-    s_have_mode = 0;
-    s_mode_mask = 0;
-    s_minimized = 0;
-    s_need_recreate = 0;
-    s_win_w = s_win_h = 0;
-    s_extent.width = s_extent.height = 0;
     s_frame_cursor = 0;
     s_cursor = 0;
     s_begun = 0;
     s_ever_interop = 0;
-    s_images_since_create = 0;
-    s_has_present_id = s_has_present_wait = 0;
-    s_use_present_wait = 0;
-    nvp_vkWaitForPresentKHR = NULL;
-    s_sc_first_id = 0;
-    s_last_presented_id = 0;
-    NVP_SET(s_d_present_wait_on, 0);
-    NVP_SET(s_d_present_mode, -1);
-    NVP_SET(s_d_sc_images, 0);
-    NVP_SET(s_d_ext_w, 0);
-    NVP_SET(s_d_ext_h, 0);
 }
 
 /* ---- probe -------------------------------------------------------------- */
-static int nvp_device_has_ext(const VkExtensionProperties *props, uint32_t n, const char *name)
+/* Checks the chosen device for everything the interop path needs beyond what
+ * vk_core_init guaranteed (the external memory and semaphore extensions). */
+static int nvp_check_interop_device(VkPhysicalDevice pd)
 {
-    for (uint32_t i = 0; i < n; ++i)
-        if (!strcmp(props[i].extensionName, name)) return 1;
-    return 0;
-}
-
-/* Checks the chosen physical device for everything the interop path needs
- * and picks the queue family. Prints the reason and returns 0 when unusable. */
-static int nvp_check_device(VkPhysicalDevice pd)
-{
-    uint32_t en = 0;
-    nvp_vkEnumerateDeviceExtensionProperties(pd, NULL, &en, NULL);
-    VkExtensionProperties *ext = (VkExtensionProperties *)calloc(en ? en : 1, sizeof(*ext));
-    if (!ext) return 0;
-    nvp_vkEnumerateDeviceExtensionProperties(pd, NULL, &en, ext);
-#if defined(_WIN32)
-    const char *need[3] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                            VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-                            VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME };
-#else
-    const char *need[3] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                            VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                            VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME };
-#endif
-    int ok = 1;
-    for (int i = 0; i < 3; ++i) {
-        if (!nvp_device_has_ext(ext, en, need[i])) {
-            NVP_SAY("Vulkan device lacks %s\n", need[i]);
-            ok = 0;
-        }
-    }
-    s_has_present_id = nvp_device_has_ext(ext, en, VK_KHR_PRESENT_ID_EXTENSION_NAME);
-    s_has_present_wait = nvp_device_has_ext(ext, en, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-    free(ext);
-    if (!ok) return 0;
-
     VkPhysicalDeviceExternalImageFormatInfo efi = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
     efi.handleType = NVP_VK_MEM_HANDLE;
@@ -631,10 +409,10 @@ static int nvp_check_device(VkPhysicalDevice pd)
     VkExternalImageFormatProperties efp = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
     VkImageFormatProperties2 ifp = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 };
     ifp.pNext = &efp;
-    if (nvp_vkGetPhysicalDeviceImageFormatProperties2(pd, &ifi, &ifp) != VK_SUCCESS ||
+    if (vkGetPhysicalDeviceImageFormatProperties2(pd, &ifi, &ifp) != VK_SUCCESS ||
         !(efp.externalMemoryProperties.externalMemoryFeatures &
           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
-        NVP_SAY("Vulkan cannot export RGBA8 images\n");
+        nvp_note("Vulkan cannot export RGBA8 images");
         return 0;
     }
 
@@ -642,215 +420,60 @@ static int nvp_check_device(VkPhysicalDevice pd)
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO };
     esi.handleType = NVP_VK_SEM_HANDLE;
     VkExternalSemaphoreProperties esp = { VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
-    nvp_vkGetPhysicalDeviceExternalSemaphoreProperties(pd, &esi, &esp);
+    vkGetPhysicalDeviceExternalSemaphoreProperties(pd, &esi, &esp);
     if (!(esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)) {
-        NVP_SAY("Vulkan cannot export semaphores\n");
+        nvp_note("Vulkan cannot export semaphores");
         return 0;
     }
 
     VkFormatProperties fp;
-    nvp_vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
-        NVP_SAY("RGBA8 cannot be a blit source\n");
+        nvp_note("RGBA8 cannot be a blit source");
         return 0;
     }
-
-    uint32_t qn = 0;
-    nvp_vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, NULL);
-    if (qn > 16) qn = 16;
-    VkQueueFamilyProperties qf[16];
-    nvp_vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf);
-    for (uint32_t f = 0; f < qn; ++f) {
-        if (qf[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            s_qfam = f;
-            return 1;
-        }
-    }
-    NVP_SAY("no graphics queue family\n");
-    return 0;
-}
-
-static int nvp_probe_vk(void)
-{
-#if defined(PSX_SDL3)
-    if (!SDL_Vulkan_LoadLibrary(NULL))
-#else
-    if (SDL_Vulkan_LoadLibrary(NULL) != 0)
-#endif
-    {
-        NVP_SAY("SDL_Vulkan_LoadLibrary failed (no Vulkan ICD?)\n");
-        return 0;
-    }
-    s_sdl_vk_loaded = 1;
-    nvp_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
-    if (!nvp_vkGetInstanceProcAddr) {
-        NVP_SAY("no vkGetInstanceProcAddr from SDL\n");
-        return 0;
-    }
-    if (!nvp_load_global()) return 0;
-    uint32_t ver = VK_API_VERSION_1_0;
-    if (nvp_vkEnumerateInstanceVersion) nvp_vkEnumerateInstanceVersion(&ver);
-    if (ver < VK_API_VERSION_1_1) {
-        NVP_SAY("Vulkan instance older than 1.1\n");
-        return 0;
-    }
-
-    unsigned ext_count = 0;
-    const char *exts[16];
-#if defined(PSX_SDL3)
-    const char *const *sdl_exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
-    if (!sdl_exts) {
-        NVP_SAY("SDL_Vulkan_GetInstanceExtensions failed\n");
-        return 0;
-    }
-    if (ext_count > 16) ext_count = 16;
-    for (unsigned i = 0; i < ext_count; ++i) exts[i] = sdl_exts[i];
-#else
-    if (!SDL_Vulkan_GetInstanceExtensions(NULL, &ext_count, NULL)) {
-        NVP_SAY("SDL_Vulkan_GetInstanceExtensions(count) failed\n");
-        return 0;
-    }
-    if (ext_count > 16) ext_count = 16;
-    if (!SDL_Vulkan_GetInstanceExtensions(NULL, &ext_count, exts)) {
-        NVP_SAY("SDL_Vulkan_GetInstanceExtensions(list) failed\n");
-        return 0;
-    }
-#endif
-    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    app.pApplicationName = "psxrecomp";
-    app.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
-    ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = ext_count;
-    ici.ppEnabledExtensionNames = exts;
-    if (nvp_vkCreateInstance(&ici, NULL, &s_instance) != VK_SUCCESS) {
-        NVP_SAY("vkCreateInstance failed\n");
-        return 0;
-    }
-    if (!nvp_load_instance()) return 0;
-
-    uint32_t n = 0;
-    nvp_vkEnumeratePhysicalDevices(s_instance, &n, NULL);
-    if (n > 8) n = 8;
-    VkPhysicalDevice devs[8];
-    nvp_vkEnumeratePhysicalDevices(s_instance, &n, devs);
-    VkPhysicalDevice match = VK_NULL_HANDLE;
-    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = "";
-    for (uint32_t i = 0; i < n && !match; ++i) {
-        VkPhysicalDeviceIDProperties idp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
-        VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-        p2.pNext = &idp;
-        nvp_vkGetPhysicalDeviceProperties2(devs[i], &p2);
-        if (p2.properties.apiVersion < VK_API_VERSION_1_1) continue;
-        if (memcmp(idp.driverUUID, s_gl_drv_uuid, VK_UUID_SIZE) != 0) continue;
-        for (int g = 0; g < s_gl_dev_count; ++g) {
-            if (!memcmp(idp.deviceUUID, s_gl_dev_uuid[g], VK_UUID_SIZE)) {
-                match = devs[i];
-                snprintf(name, sizeof(name), "%s", p2.properties.deviceName);
-                break;
-            }
-        }
-    }
-    if (!match) {
-        NVP_SAY("GL and Vulkan devices differ\n");
-        return 0;
-    }
-    s_phys = match;
-    if (!nvp_check_device(s_phys)) return 0;
-    nvp_vkGetPhysicalDeviceMemoryProperties(s_phys, &s_memprops);
-
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo q = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
-    q.queueFamilyIndex = s_qfam;
-    q.queueCount = 1;
-    q.pQueuePriorities = &prio;
-#if defined(_WIN32)
-    const char *dev_exts[5] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                                VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-                                VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME };
-#else
-    const char *dev_exts[5] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                                VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                                VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME };
-#endif
-    uint32_t dev_ext_count = 3;
-    VkPhysicalDevicePresentIdFeaturesKHR pid_f = {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
-    VkPhysicalDevicePresentWaitFeaturesKHR pw_f = {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
-    int want_pw = 0;
-    if (s_has_present_id && s_has_present_wait) {
-        VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-        pid_f.pNext = &pw_f;
-        f2.pNext = &pid_f;
-        nvp_vkGetPhysicalDeviceFeatures2(s_phys, &f2);
-        if (pid_f.presentId == VK_TRUE && pw_f.presentWait == VK_TRUE) {
-            want_pw = 1;
-            dev_exts[dev_ext_count++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
-            dev_exts[dev_ext_count++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
-        }
-    }
-    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &q;
-    dci.enabledExtensionCount = dev_ext_count;
-    dci.ppEnabledExtensionNames = dev_exts;
-    if (want_pw) {
-        /* Features are enabled by chaining the structs the query filled in. */
-        pid_f.presentId = VK_TRUE;
-        pw_f.presentWait = VK_TRUE;
-        pw_f.pNext = NULL;
-        pid_f.pNext = &pw_f;
-        dci.pNext = &pid_f;
-    }
-    if (nvp_vkCreateDevice(s_phys, &dci, NULL, &s_dev) != VK_SUCCESS) {
-        s_dev = VK_NULL_HANDLE;
-        NVP_SAY("vkCreateDevice failed\n");
-        return 0;
-    }
-    if (!nvp_load_device()) {
-        if (nvp_vkDestroyDevice) nvp_vkDestroyDevice(s_dev, NULL);
-        s_dev = VK_NULL_HANDLE;
-        return 0;
-    }
-    nvp_vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
-    if (want_pw) {
-        nvp_vkWaitForPresentKHR = (PFN_vkWaitForPresentKHR)
-            nvp_vkGetDeviceProcAddr(s_dev, "vkWaitForPresentKHR");
-        s_use_present_wait = nvp_vkWaitForPresentKHR != NULL;
-    }
-    NVP_SET(s_d_present_wait_on, s_use_present_wait);
-
-    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = s_qfam;
-    if (nvp_vkCreateCommandPool(s_dev, &pci, NULL, &s_pool) != VK_SUCCESS) {
-        s_pool = VK_NULL_HANDLE;
-        NVP_SAY("vkCreateCommandPool failed\n");
-        return 0;
-    }
-    NVP_SAY("device = %s (present_id=%d present_wait=%d)\n", name,
-            s_has_present_id, s_has_present_wait);
-    if (s_use_present_wait) NVP_SAY("present_wait queue depth %d\n", s_present_depth);
-    else NVP_SAY("present_wait unavailable\n");
     return 1;
 }
 
 int nvp_probe(void)
 {
     if (s_probed) return 1;
+    s_probe_failure[0] = '\0';
     const char *env = getenv("PSX_VK_PRESENT");
     if (env && env[0] == '0') {
-        NVP_SAY("disabled by PSX_VK_PRESENT=0\n");
+        nvp_note("disabled by PSX_VK_PRESENT=0");
         return 0;
     }
     if (!nvp_probe_gl()) return 0;
-    const char *denv = getenv("PSX_VK_PRESENT_DEPTH");
-    s_present_depth = 3;
-    if (denv && denv[0] >= '0' && denv[0] <= '3' && !denv[1])
-        s_present_depth = denv[0] - '0';
-    NVP_SET(s_d_present_depth, s_present_depth);
-    if (!nvp_probe_vk()) {
+
+#if defined(_WIN32)
+    static const char *const dev_exts[2] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+                                             VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME };
+#else
+    static const char *const dev_exts[2] = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                                             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME };
+#endif
+    VkCoreDeviceRequest req;
+    memset(&req, 0, sizeof(req));
+    req.device_uuids = (const uint8_t (*)[VK_UUID_SIZE])s_gl_dev_uuid;
+    req.device_uuid_count = (uint32_t)s_gl_dev_count;
+    req.driver_uuid = s_gl_drv_uuid;
+    req.extensions = dev_exts;
+    req.extension_count = 2;
+    if (!vk_core_init(&req)) {
+        nvp_note("%s", vk_core_failure());
+        return 0;
+    }
+#if defined(_WIN32)
+    nvp_get_memory_handle = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(vk_core_device(), "vkGetMemoryWin32HandleKHR");
+    nvp_get_semaphore_handle = (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(vk_core_device(), "vkGetSemaphoreWin32HandleKHR");
+    if (!nvp_get_memory_handle || !nvp_get_semaphore_handle) {
+        nvp_note("Win32 external handle entry points missing");
+        nvp_teardown();
+        return 0;
+    }
+#endif
+    if (!nvp_check_interop_device(vk_core_physical_device())) {
         nvp_teardown();
         return 0;
     }
@@ -858,181 +481,6 @@ int nvp_probe(void)
     return 1;
 }
 
-/* ---- swapchain ---------------------------------------------------------- */
-static VkPresentModeKHR nvp_pick_mode(int interval, int user_vsync)
-{
-#define NVP_HAS(m) ((s_mode_mask >> (m)) & 1u)
-    if (interval >= 1) return VK_PRESENT_MODE_FIFO_KHR;
-    if (interval == -1)
-        return NVP_HAS(VK_PRESENT_MODE_FIFO_RELAXED_KHR) ? VK_PRESENT_MODE_FIFO_RELAXED_KHR
-                                                         : VK_PRESENT_MODE_FIFO_KHR;
-    if (user_vsync != 0) {
-        if (NVP_HAS(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
-        if (NVP_HAS(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
-        return VK_PRESENT_MODE_FIFO_KHR;
-    }
-    if (NVP_HAS(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (NVP_HAS(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
-    return VK_PRESENT_MODE_FIFO_KHR;
-#undef NVP_HAS
-}
-
-static uint32_t nvp_clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
-{
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
-/* (Re)creates the swapchain for the current window size and present policy.
- * Returns 1 on success, 2 when the window is minimized (no swapchain), 0 on
- * failure (the previous swapchain, if any, is kept). */
-static int nvp_create_swapchain(void)
-{
-    VkSurfaceCapabilitiesKHR caps;
-    VkResult r = nvp_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_phys, s_surface, &caps);
-    if (r != VK_SUCCESS) { nvp_fail(r); return 0; }
-
-    uint32_t mn = 0;
-    nvp_vkGetPhysicalDeviceSurfacePresentModesKHR(s_phys, s_surface, &mn, NULL);
-    if (mn > 16) mn = 16;
-    VkPresentModeKHR modes[16];
-    nvp_vkGetPhysicalDeviceSurfacePresentModesKHR(s_phys, s_surface, &mn, modes);
-    s_mode_mask = 0;
-    for (uint32_t i = 0; i < mn; ++i)
-        if ((uint32_t)modes[i] < 32) s_mode_mask |= 1u << (uint32_t)modes[i];
-
-    int ww = 0, wh = 0;
-    SDL_GetWindowSizeInPixels(s_win, &ww, &wh);
-    s_win_w = ww;
-    s_win_h = wh;
-    VkExtent2D ext;
-    if (caps.currentExtent.width != 0xFFFFFFFFu) {
-        ext = caps.currentExtent;
-    } else {
-        ext.width = nvp_clamp_u32((uint32_t)(ww > 0 ? ww : 0), caps.minImageExtent.width,
-                                  caps.maxImageExtent.width);
-        ext.height = nvp_clamp_u32((uint32_t)(wh > 0 ? wh : 0), caps.minImageExtent.height,
-                                   caps.maxImageExtent.height);
-        if (ww <= 0 || wh <= 0) ext.width = ext.height = 0;
-    }
-
-    nvp_vkDeviceWaitIdle(s_dev);
-    if (ext.width == 0 || ext.height == 0) {
-        if (s_swapchain) {
-            nvp_vkDestroySwapchainKHR(s_dev, s_swapchain, NULL);
-            s_swapchain = VK_NULL_HANDLE;
-        }
-        nvp_destroy_sc_sync();
-        s_sc_count = 0;
-        s_have_mode = 0;
-        s_minimized = 1;
-        s_need_recreate = 0;
-        NVP_SET(s_d_present_mode, -1);
-        NVP_SET(s_d_sc_images, 0);
-        return 2;
-    }
-    s_minimized = 0;
-
-    uint32_t want_images = caps.minImageCount > 3 ? caps.minImageCount : 3;
-    if (caps.maxImageCount != 0 && want_images > caps.maxImageCount) want_images = caps.maxImageCount;
-    if (want_images > NVP_MAX_SC) want_images = NVP_MAX_SC;
-    if (want_images < caps.minImageCount) {
-        NVP_SAY("surface needs %u swapchain images, more than supported\n", caps.minImageCount);
-        nvp_fail(VK_ERROR_INITIALIZATION_FAILED);
-        return 0;
-    }
-    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-        NVP_SAY("swapchain images cannot be transfer destinations\n");
-        nvp_fail(VK_ERROR_INITIALIZATION_FAILED);
-        return 0;
-    }
-
-    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    if (!(caps.supportedCompositeAlpha & alpha)) {
-        for (uint32_t b = 1; b <= 8; b <<= 1) {
-            if (caps.supportedCompositeAlpha & b) { alpha = (VkCompositeAlphaFlagBitsKHR)b; break; }
-        }
-    }
-
-    VkPresentModeKHR mode = nvp_pick_mode(s_applied_interval, s_applied_vsync);
-    VkSwapchainKHR old = s_swapchain;
-    VkSwapchainCreateInfoKHR sci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
-    sci.surface = s_surface;
-    sci.minImageCount = want_images;
-    sci.imageFormat = s_sc_format;
-    sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    sci.imageExtent = ext;
-    sci.imageArrayLayers = 1;
-    int can_read = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
-    sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                     (can_read ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
-    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
-    sci.compositeAlpha = alpha;
-    sci.presentMode = mode;
-    sci.clipped = VK_TRUE;
-    sci.oldSwapchain = old;
-    VkSwapchainKHR sc = VK_NULL_HANDLE;
-    r = nvp_vkCreateSwapchainKHR(s_dev, &sci, NULL, &sc);
-    if (r != VK_SUCCESS) { nvp_fail(r); return 0; }
-    if (old) nvp_vkDestroySwapchainKHR(s_dev, old, NULL);
-    s_swapchain = sc;
-    /* Present ids of the old swapchain mean nothing to the new one. */
-    s_sc_first_id = 0;
-    s_last_presented_id = 0;
-    atomic_store(&s_sc_can_read, can_read);
-    nvp_destroy_sc_sync();
-
-    uint32_t cnt = 0;
-    nvp_vkGetSwapchainImagesKHR(s_dev, sc, &cnt, NULL);
-    if (cnt > NVP_MAX_SC) {
-        NVP_SAY("swapchain returned %u images, more than supported\n", cnt);
-        nvp_vkDestroySwapchainKHR(s_dev, sc, NULL);
-        s_swapchain = VK_NULL_HANDLE;
-        s_sc_count = 0;
-        nvp_fail(VK_ERROR_INITIALIZATION_FAILED);
-        return 0;
-    }
-    nvp_vkGetSwapchainImagesKHR(s_dev, sc, &cnt, s_sc_images);
-    s_sc_count = cnt;
-    VkSemaphoreCreateInfo semi = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    for (uint32_t i = 0; i < cnt; ++i) {
-        if (nvp_vkCreateSemaphore(s_dev, &semi, NULL, &s_render_done[i]) != VK_SUCCESS) {
-            s_need_recreate = 1;
-            nvp_fail(VK_ERROR_INITIALIZATION_FAILED);
-            return 0;
-        }
-    }
-    for (uint32_t i = 0; i < cnt + 1; ++i) {
-        if (nvp_vkCreateSemaphore(s_dev, &semi, NULL, &s_acquire_sem[i]) != VK_SUCCESS) {
-            s_need_recreate = 1;
-            nvp_fail(VK_ERROR_INITIALIZATION_FAILED);
-            return 0;
-        }
-    }
-    s_extent = ext;
-    s_present_mode = mode;
-    s_have_mode = 1;
-    s_need_recreate = 0;
-    s_images_since_create = 0;
-    NVP_SET(s_d_present_mode, (int)mode);
-    NVP_SET(s_d_sc_images, cnt);
-    NVP_SET(s_d_ext_w, ext.width);
-    NVP_SET(s_d_ext_h, ext.height);
-    NVP_ADD(s_d_sc_recreations, 1);
-    return 1;
-}
-
-/* Applies pending policy and size changes. Called at the top of each frame. */
-static void nvp_refresh_swapchain(void)
-{
-    int ww = 0, wh = 0;
-    SDL_GetWindowSizeInPixels(s_win, &ww, &wh);
-    int need = s_need_recreate || !s_swapchain || ww != s_win_w || wh != s_win_h ||
-               (s_have_mode && nvp_pick_mode(s_applied_interval, s_applied_vsync) != s_present_mode);
-    if (need) (void)nvp_create_swapchain();
-}
-
-/* ---- command helpers ---------------------------------------------------- */
 static void nvp_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
                         VkAccessFlags src_access, VkAccessFlags dst_access,
                         VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,
@@ -1049,50 +497,40 @@ static void nvp_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkI
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
-    nvp_vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
 static void nvp_acquire_interop(VkCommandBuffer cb, VkImage img)
 {
     nvp_barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_EXTERNAL, s_qfam);
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_EXTERNAL, vk_core_queue_family());
 }
 
 static void nvp_release_interop(VkCommandBuffer cb, VkImage img)
 {
     nvp_barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_ACCESS_TRANSFER_READ_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_qfam, VK_QUEUE_FAMILY_EXTERNAL);
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vk_core_queue_family(), VK_QUEUE_FAMILY_EXTERNAL);
 }
 
 static VkResult nvp_wait_reset_frame(NvpFrame *f)
 {
-    VkResult r = nvp_vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
+    VkResult r = vkWaitForFences(vk_core_device(), 1, &f->fence, VK_TRUE, UINT64_MAX);
     if (r != VK_SUCCESS) return r;
-    r = nvp_vkResetFences(s_dev, 1, &f->fence);
+    r = vkResetFences(vk_core_device(), 1, &f->fence);
     if (r != VK_SUCCESS) return r;
-    return nvp_vkResetCommandBuffer(f->cb, 0);
+    return vkResetCommandBuffer(f->cb, 0);
 }
 
 /* ---- interop images ----------------------------------------------------- */
 static int nvp_find_memory_type(uint32_t bits)
 {
-    for (uint32_t i = 0; i < s_memprops.memoryTypeCount; ++i)
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(vk_core_physical_device(), &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
         if ((bits & (1u << i)) &&
-            (s_memprops.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-            return (int)i;
-    return -1;
-}
-
-/* Host-visible, host-coherent memory for the debug readback buffer. */
-static int nvp_find_host_memory_type(uint32_t bits)
-{
-    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < s_memprops.memoryTypeCount; ++i)
-        if ((bits & (1u << i)) &&
-            (s_memprops.memoryTypes[i].propertyFlags & want) == want)
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
             return (int)i;
     return -1;
 }
@@ -1111,13 +549,13 @@ static int nvp_make_semaphore(VkSemaphore *vs, GLuint *gs)
     exp.handleTypes = NVP_VK_SEM_HANDLE;
     VkSemaphoreCreateInfo ci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     ci.pNext = &exp;
-    if (nvp_vkCreateSemaphore(s_dev, &ci, NULL, vs) != VK_SUCCESS) { *vs = VK_NULL_HANDLE; return 0; }
+    if (vkCreateSemaphore(vk_core_device(), &ci, NULL, vs) != VK_SUCCESS) { *vs = VK_NULL_HANDLE; return 0; }
 #if defined(_WIN32)
     VkSemaphoreGetWin32HandleInfoKHR gi = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
     gi.semaphore = *vs;
     gi.handleType = NVP_VK_SEM_HANDLE;
     HANDLE h = NULL;
-    if (nvp_vkGetSemaphoreWin32HandleKHR(s_dev, &gi, &h) != VK_SUCCESS) return 0;
+    if (nvp_get_semaphore_handle(vk_core_device(), &gi, &h) != VK_SUCCESS) return 0;
     nvp_glGenSemaphoresEXT(1, gs);
     nvp_gl_error_pending();
     nvp_glImportSemaphoreEXT(*gs, NVP_GL_HANDLE_TYPE, (void *)h);
@@ -1128,7 +566,7 @@ static int nvp_make_semaphore(VkSemaphore *vs, GLuint *gs)
     gi.semaphore = *vs;
     gi.handleType = NVP_VK_SEM_HANDLE;
     int fd = -1;
-    if (nvp_vkGetSemaphoreFdKHR(s_dev, &gi, &fd) != VK_SUCCESS) return 0;
+    if (vkGetSemaphoreFdKHR(vk_core_device(), &gi, &fd) != VK_SUCCESS) return 0;
     nvp_glGenSemaphoresEXT(1, gs);
     nvp_gl_error_pending();
     nvp_glImportSemaphoreEXT(*gs, NVP_GL_HANDLE_TYPE, fd);
@@ -1159,12 +597,12 @@ static int nvp_create_image(NvpImage *im, int w, int h)
                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (nvp_vkCreateImage(s_dev, &ci, NULL, &im->image) != VK_SUCCESS) {
+    if (vkCreateImage(vk_core_device(), &ci, NULL, &im->image) != VK_SUCCESS) {
         im->image = VK_NULL_HANDLE;
         return 0;
     }
     VkMemoryRequirements req;
-    nvp_vkGetImageMemoryRequirements(s_dev, im->image, &req);
+    vkGetImageMemoryRequirements(vk_core_device(), im->image, &req);
     int type = nvp_find_memory_type(req.memoryTypeBits);
     if (type < 0) return 0;
     VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
@@ -1176,11 +614,11 @@ static int nvp_create_image(NvpImage *im, int w, int h)
     ai.pNext = &exp;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = (uint32_t)type;
-    if (nvp_vkAllocateMemory(s_dev, &ai, NULL, &im->memory) != VK_SUCCESS) {
+    if (vkAllocateMemory(vk_core_device(), &ai, NULL, &im->memory) != VK_SUCCESS) {
         im->memory = VK_NULL_HANDLE;
         return 0;
     }
-    if (nvp_vkBindImageMemory(s_dev, im->image, im->memory, 0) != VK_SUCCESS) return 0;
+    if (vkBindImageMemory(vk_core_device(), im->image, im->memory, 0) != VK_SUCCESS) return 0;
 
     nvp_gl_error_pending();
     nvp_glCreateMemoryObjectsEXT(1, &im->memobj);
@@ -1191,7 +629,7 @@ static int nvp_create_image(NvpImage *im, int w, int h)
     gi.memory = im->memory;
     gi.handleType = NVP_VK_MEM_HANDLE;
     HANDLE hnd = NULL;
-    if (nvp_vkGetMemoryWin32HandleKHR(s_dev, &gi, &hnd) != VK_SUCCESS) return 0;
+    if (nvp_get_memory_handle(vk_core_device(), &gi, &hnd) != VK_SUCCESS) return 0;
     nvp_glImportMemoryEXT(im->memobj, (GLuint64)req.size, NVP_GL_HANDLE_TYPE, (void *)hnd);
     CloseHandle(hnd);  /* the Win32 import duplicates the handle */
     if (nvp_gl_error_pending()) return 0;
@@ -1200,7 +638,7 @@ static int nvp_create_image(NvpImage *im, int w, int h)
     gi.memory = im->memory;
     gi.handleType = NVP_VK_MEM_HANDLE;
     int fd = -1;
-    if (nvp_vkGetMemoryFdKHR(s_dev, &gi, &fd) != VK_SUCCESS) return 0;
+    if (vkGetMemoryFdKHR(vk_core_device(), &gi, &fd) != VK_SUCCESS) return 0;
     nvp_glImportMemoryEXT(im->memobj, (GLuint64)req.size, NVP_GL_HANDLE_TYPE, fd);
     if (nvp_gl_error_pending()) {
         close(fd);  /* GL takes ownership only on success */
@@ -1236,19 +674,8 @@ static int nvp_create_image(NvpImage *im, int w, int h)
  * external queue family, so the first present acquires it like any other. */
 static int nvp_init_image_layouts(void)
 {
-    VkCommandBuffer cb;
-    VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    ai.commandPool = s_pool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    if (nvp_vkAllocateCommandBuffers(s_dev, &ai, &cb) != VK_SUCCESS) return 0;
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkFence fence = VK_NULL_HANDLE;
-    int ok = 0;
-    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (nvp_vkCreateFence(s_dev, &fci, NULL, &fence) != VK_SUCCESS) goto out;
-    if (nvp_vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) goto out;
+    VkCommandBuffer cb = vk_core_oneshot_begin();
+    if (!cb) return 0;
     for (int i = 0; i < NVP_RING; ++i) {
         nvp_barrier(cb, s_img[i].image, VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
@@ -1256,16 +683,7 @@ static int nvp_init_image_layouts(void)
                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
         nvp_release_interop(cb, s_img[i].image);
     }
-    if (nvp_vkEndCommandBuffer(cb) != VK_SUCCESS) goto out;
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
-    if (nvp_vkQueueSubmit(s_queue, 1, &si, fence) != VK_SUCCESS) goto out;
-    ok = nvp_vkWaitForFences(s_dev, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
-out:
-    if (fence) nvp_vkDestroyFence(s_dev, fence, NULL);
-    nvp_vkFreeCommandBuffers(s_dev, s_pool, 1, &cb);
-    return ok;
+    return vk_core_oneshot_end_wait(cb);
 }
 
 static int nvp_create_interop(int w, int h)
@@ -1290,120 +708,24 @@ void nvp_set_present_policy(int swap_interval, int user_vsync)
 {
     atomic_store(&s_req_interval, swap_interval);
     atomic_store(&s_req_vsync, user_vsync);
+    vk_swapchain_set_present_policy(swap_interval, user_vsync);
 }
 
 int nvp_active(void) { return s_active; }
 
 /* ---- attach ------------------------------------------------------------- */
-/* Presents one cleared frame so the compositor maps the window. */
-static int nvp_present_black(void)
+static int nvp_create_frames(void)
 {
-    NvpFrame *f = &s_frames[0];
-    uint32_t ii = 0;
-    VkSemaphore acq = s_acquire_sem[s_acquire_cursor];
-    s_acquire_cursor = (s_acquire_cursor + 1) % (s_sc_count + 1);
-    VkResult r = nvp_vkAcquireNextImageKHR(s_dev, s_swapchain, 1000000000ull, acq, VK_NULL_HANDLE, &ii);
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { nvp_fail(r); return 0; }
-    if (nvp_wait_reset_frame(f) != VK_SUCCESS) return 0;
-    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    nvp_vkBeginCommandBuffer(f->cb, &bi);
-    nvp_barrier(f->cb, s_sc_images[ii], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
-    VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
-    VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    nvp_vkCmdClearColorImage(f->cb, s_sc_images[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-    nvp_barrier(f->cb, s_sc_images[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
-    nvp_vkEndCommandBuffer(f->cb);
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &acq;
-    si.pWaitDstStageMask = &stage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &f->cb;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &s_render_done[ii];
-    r = nvp_vkQueueSubmit(s_queue, 1, &si, f->fence);
-    if (r != VK_SUCCESS) { nvp_fail(r); return 0; }
-    VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &s_render_done[ii];
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &s_swapchain;
-    pi.pImageIndices = &ii;
-    VkPresentIdKHR pid = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
-    uint64_t pres_id = 0;
-    if (s_use_present_wait) {
-        pres_id = ++s_present_id;
-        pid.swapchainCount = 1;
-        pid.pPresentIds = &pres_id;
-        pi.pNext = &pid;
-    }
-    r = nvp_vkQueuePresentKHR(s_queue, &pi);
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { nvp_fail(r); return 0; }
-    if (pres_id) {
-        if (!s_sc_first_id) s_sc_first_id = pres_id;
-        s_last_presented_id = pres_id;
-        NVP_SET(s_d_last_present_id, pres_id);
-    }
-    return nvp_vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
-}
-
-static int nvp_attach_impl(SDL_Window *window)
-{
-    if (!s_probed || !window) return 0;
-    s_win = window;
-#if defined(PSX_SDL3)
-    if (!SDL_Vulkan_CreateSurface(window, s_instance, NULL, &s_surface))
-#else
-    if (!SDL_Vulkan_CreateSurface(window, s_instance, &s_surface))
-#endif
-    {
-        s_surface = VK_NULL_HANDLE;
-        NVP_SAY("SDL_Vulkan_CreateSurface failed\n");
+    VkDevice dev = vk_core_device();
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = vk_core_queue_family();
+    if (vkCreateCommandPool(dev, &pci, NULL, &s_pool) != VK_SUCCESS) {
+        s_pool = VK_NULL_HANDLE;
+        nvp_note("vkCreateCommandPool failed");
         return 0;
     }
-    VkBool32 present = VK_FALSE;
-    nvp_vkGetPhysicalDeviceSurfaceSupportKHR(s_phys, s_qfam, s_surface, &present);
-    if (!present) {
-        NVP_SAY("queue family cannot present to the window\n");
-        return 0;
-    }
-
-    uint32_t fn = 0;
-    nvp_vkGetPhysicalDeviceSurfaceFormatsKHR(s_phys, s_surface, &fn, NULL);
-    if (fn > 64) fn = 64;
-    VkSurfaceFormatKHR fmts[64];
-    nvp_vkGetPhysicalDeviceSurfaceFormatsKHR(s_phys, s_surface, &fn, fmts);
-    static const VkFormat prefer[2] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
-    int found = 0;
-    for (int p = 0; p < 2 && !found; ++p) {
-        for (uint32_t i = 0; i < fn; ++i) {
-            if (fmts[i].format == prefer[p] &&
-                fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                s_sc_format = prefer[p];
-                found = 1;
-                break;
-            }
-        }
-    }
-    if (!found) {
-        NVP_SAY("surface offers no UNORM format\n");
-        return 0;
-    }
-    VkFormatProperties fp;
-    nvp_vkGetPhysicalDeviceFormatProperties(s_phys, s_sc_format, &fp);
-    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
-        NVP_SAY("swapchain format cannot be a blit destination\n");
-        return 0;
-    }
-
-    /* Frame ring: command buffers and fences (created signaled). */
+    /* Command buffers and fences (created signaled). */
     VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     cai.commandPool = s_pool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1411,24 +733,28 @@ static int nvp_attach_impl(SDL_Window *window)
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     for (int i = 0; i < NVP_RING; ++i) {
-        if (nvp_vkAllocateCommandBuffers(s_dev, &cai, &s_frames[i].cb) != VK_SUCCESS) {
+        if (vkAllocateCommandBuffers(dev, &cai, &s_frames[i].cb) != VK_SUCCESS) {
             s_frames[i].cb = VK_NULL_HANDLE;
             return 0;
         }
-        if (nvp_vkCreateFence(s_dev, &fci, NULL, &s_frames[i].fence) != VK_SUCCESS) {
+        if (vkCreateFence(dev, &fci, NULL, &s_frames[i].fence) != VK_SUCCESS) {
             s_frames[i].fence = VK_NULL_HANDLE;
             return 0;
         }
     }
+    return 1;
+}
 
-    s_applied_interval = atomic_load(&s_req_interval);
-    s_applied_vsync = atomic_load(&s_req_vsync);
-    if (nvp_create_swapchain() == 0) {
-        NVP_SAY("swapchain creation failed\n");
+static int nvp_attach_impl(SDL_Window *window)
+{
+    if (!s_probed || !window) return 0;
+    if (!vk_core_attach_window(window)) {
+        nvp_note("%s", vk_core_failure());
         return 0;
     }
-    if (s_swapchain && !nvp_present_black()) {
-        NVP_SAY("first present failed\n");
+    if (!nvp_create_frames()) return 0;
+    if (!vk_swapchain_create()) {
+        nvp_note("swapchain creation failed");
         return 0;
     }
     return 1;
@@ -1441,8 +767,6 @@ int nvp_attach_window(SDL_Window *window)
         return 0;
     }
     s_active = 1;
-    NVP_SAY("swapchain %ux%u, %u images, present mode %d\n", s_extent.width, s_extent.height,
-            s_sc_count, s_have_mode ? (int)s_present_mode : -1);
     return 1;
 }
 
@@ -1454,8 +778,6 @@ unsigned int nvp_begin_frame(int width, int height)
     if (width <= 0 || height <= 0) return 0;
 
     s_applied_interval = atomic_load(&s_req_interval);
-    s_applied_vsync = atomic_load(&s_req_vsync);
-    nvp_refresh_swapchain();
 
     if (!s_interop_live || s_iw != width || s_ih != height) {
         if (s_interop_live) {
@@ -1486,226 +808,68 @@ unsigned int nvp_begin_frame(int width, int height)
     return im->fbo;
 }
 
-/* Records and submits one command buffer for presentation repeat `r`.
- * have_image: a swapchain image (index ii, acquire semaphore acq) takes the
- * blit; without it only the interop hand-over is submitted so the binary
- * semaphores stay balanced. first: wait gl_ready and acquire the image from
- * GL's queue family. last: release it back and signal vk_done. cap_buf: a
- * host-readable buffer that receives the presented image (debug readback),
- * or VK_NULL_HANDLE. */
-static VkResult nvp_submit_repeat(NvpFrame *f, NvpImage *im, int have_image, uint32_t ii,
-                                  VkSemaphore acq, int first, int last, VkBuffer cap_buf)
+/* Submits a command buffer that only moves the interop image between queue
+ * families, with no swapchain image to blit into, so the binary semaphores
+ * stay balanced. first: wait gl_ready and acquire the image from GL's queue
+ * family. last: release it back and signal vk_done. */
+static VkResult nvp_submit_handover(NvpFrame *f, NvpImage *im, int first, int last)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkResult r = nvp_vkBeginCommandBuffer(f->cb, &bi);
+    VkResult r = vkBeginCommandBuffer(f->cb, &bi);
     if (r != VK_SUCCESS) return r;
     if (first) nvp_acquire_interop(f->cb, im->image);
-    if (have_image) {
-        VkImage sc = s_sc_images[ii];
-        nvp_barrier(f->cb, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
-        /* GL is bottom-up, Vulkan top-down: flip while blitting. */
-        VkImageBlit blit;
-        memset(&blit, 0, sizeof(blit));
-        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        blit.srcSubresource.layerCount = 1;
-        blit.srcOffsets[0].y = s_ih;
-        blit.srcOffsets[1].x = s_iw;
-        blit.srcOffsets[1].z = 1;
-        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        blit.dstSubresource.layerCount = 1;
-        blit.dstOffsets[1].x = (int32_t)s_extent.width;
-        blit.dstOffsets[1].y = (int32_t)s_extent.height;
-        blit.dstOffsets[1].z = 1;
-        VkFilter filter = ((uint32_t)s_iw == s_extent.width && (uint32_t)s_ih == s_extent.height)
-                              ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        nvp_vkCmdBlitImage(f->cb, im->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
-        if (cap_buf != VK_NULL_HANDLE) {
-            /* Debug readback: copy the presented image into cap_buf, then
-             * hand it to present as before. */
-            nvp_barrier(f->cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
-            VkBufferImageCopy region;
-            memset(&region, 0, sizeof(region));
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent.width = s_extent.width;
-            region.imageExtent.height = s_extent.height;
-            region.imageExtent.depth = 1;
-            nvp_vkCmdCopyImageToBuffer(f->cb, sc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cap_buf, 1, &region);
-            nvp_barrier(f->cb, sc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                        0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
-            VkBufferMemoryBarrier bb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bb.buffer = cap_buf;
-            bb.offset = 0;
-            bb.size = VK_WHOLE_SIZE;
-            nvp_vkCmdPipelineBarrier(f->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                                     0, 0, NULL, 1, &bb, 0, NULL);
-        } else {
-            nvp_barrier(f->cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                        VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_QUEUE_FAMILY_IGNORED,
-                        VK_QUEUE_FAMILY_IGNORED);
-        }
-    }
     if (last) nvp_release_interop(f->cb, im->image);
-    r = nvp_vkEndCommandBuffer(f->cb);
+    r = vkEndCommandBuffer(f->cb);
     if (r != VK_SUCCESS) return r;
 
-    VkSemaphore waits[2], signals[2];
-    VkPipelineStageFlags stages[2] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
-    uint32_t nw = 0, ns = 0;
-    if (first) waits[nw++] = im->gl_ready;
-    if (have_image) waits[nw++] = acq;
-    if (have_image) signals[ns++] = s_render_done[ii];
-    if (last) signals[ns++] = im->vk_done;
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.waitSemaphoreCount = nw;
-    si.pWaitSemaphores = waits;
-    si.pWaitDstStageMask = stages;
+    if (first) {
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &im->gl_ready;
+        si.pWaitDstStageMask = &stage;
+    }
     si.commandBufferCount = 1;
     si.pCommandBuffers = &f->cb;
-    si.signalSemaphoreCount = ns;
-    si.pSignalSemaphores = signals;
-    return nvp_vkQueueSubmit(s_queue, 1, &si, f->fence);
+    if (last) {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &im->vk_done;
+    }
+    return vk_core_submit(1, &si, f->fence);
 }
 
-/* ---- debug readback ----------------------------------------------------- */
-static void nvp_cap_free(VkBuffer buf, VkDeviceMemory mem)
+/* Closes a handover with a submit of its own on the next handover frame. */
+static VkResult nvp_close_handover(NvpImage *im, int first)
 {
-    if (buf) nvp_vkDestroyBuffer(s_dev, buf, NULL);
-    if (mem) nvp_vkFreeMemory(s_dev, mem, NULL);
+    NvpFrame *f = &s_frames[s_frame_cursor];
+    s_frame_cursor = (s_frame_cursor + 1) % NVP_RING;
+    VkResult r = nvp_wait_reset_frame(f);
+    if (r != VK_SUCCESS) return r;
+    return nvp_submit_handover(f, im, first, 1);
 }
 
-/* Presenter thread. Creates the host-readable buffer that receives one
- * presented swapchain image. Returns 0 with both handles null on failure. */
-static int nvp_cap_create(VkBuffer *buf, VkDeviceMemory *mem)
+/* Records the flipped blit from the interop image into the swapchain frame. */
+static void nvp_record_blit(VkSwapFrame *fr, NvpImage *im)
 {
-    *buf = VK_NULL_HANDLE;
-    *mem = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bci.size = (VkDeviceSize)s_extent.width * s_extent.height * 4;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (bci.size == 0 || nvp_vkCreateBuffer(s_dev, &bci, NULL, buf) != VK_SUCCESS) {
-        *buf = VK_NULL_HANDLE;
-        return 0;
-    }
-    int ok = 0;
-    VkMemoryRequirements req;
-    nvp_vkGetBufferMemoryRequirements(s_dev, *buf, &req);
-    int type = nvp_find_host_memory_type(req.memoryTypeBits);
-    if (type >= 0) {
-        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = (uint32_t)type;
-        if (nvp_vkAllocateMemory(s_dev, &ai, NULL, mem) == VK_SUCCESS &&
-            nvp_vkBindBufferMemory(s_dev, *buf, *mem, 0) == VK_SUCCESS)
-            ok = 1;
-    }
-    if (!ok) {
-        nvp_cap_free(*buf, *mem);
-        *buf = VK_NULL_HANDLE;
-        *mem = VK_NULL_HANDLE;
-    }
-    return ok;
-}
-
-/* Presenter thread, after nvp_submit_repeat that copied into buf returned
- * submit_r. Waits for that submit (the fence is not reset), converts the
- * pixels to top-down RGB8, frees buf and publishes the result. Always frees
- * buf, and always leaves s_cap_state at 2 (ready) or 0 (failed). */
-static void nvp_cap_finish(NvpFrame *f, VkBuffer buf, VkDeviceMemory mem, VkResult submit_r)
-{
-    unsigned char *rgb = NULL;
-    int w = (int)s_extent.width, h = (int)s_extent.height;
-    int ok = 0;
-    if (submit_r == VK_SUCCESS) {
-        VkResult wr = nvp_vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, 1000000000ull);
-        if (wr != VK_SUCCESS) {
-            nvp_vkDeviceWaitIdle(s_dev);  /* the copy may still be using buf */
-        } else {
-            void *p = NULL;
-            if (nvp_vkMapMemory(s_dev, mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
-                size_t n = (size_t)w * (size_t)h;
-                rgb = (unsigned char *)malloc(n * 3);
-                if (rgb) {
-                    const unsigned char *src = (const unsigned char *)p;
-                    int bgr = s_sc_format == VK_FORMAT_B8G8R8A8_UNORM;
-                    for (size_t i = 0; i < n; ++i) {
-                        rgb[i * 3 + 0] = src[i * 4 + (bgr ? 2 : 0)];
-                        rgb[i * 3 + 1] = src[i * 4 + 1];
-                        rgb[i * 3 + 2] = src[i * 4 + (bgr ? 0 : 2)];
-                    }
-                    ok = 1;
-                }
-                nvp_vkUnmapMemory(s_dev, mem);
-            }
-        }
-    }
-    nvp_cap_free(buf, mem);
-    if (!ok) {
-        free(rgb);
-        atomic_store(&s_cap_state, 0);
-        return;
-    }
-    if (s_cap_rgb) free(s_cap_rgb);
-    s_cap_rgb = rgb;
-    s_cap_w = w;
-    s_cap_h = h;
-    atomic_store(&s_cap_state, 2);
-}
-
-int nvp_capture_presented(int timeout_ms, unsigned char **out_rgb, int *out_w, int *out_h)
-{
-    if (!out_rgb || !out_w || !out_h) return 0;
-    *out_rgb = NULL;
-    *out_w = 0;
-    *out_h = 0;
-    if (!s_active || !atomic_load(&s_sc_can_read)) return 0;
-    int expect = 0;
-    if (!atomic_compare_exchange_strong(&s_cap_state, &expect, 1)) return 0;
-
-    uint64_t deadline = nvp_now_ns() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
-    int st = atomic_load(&s_cap_state);
-    while (st == 1 && nvp_now_ns() < deadline) {
-        SDL_Delay(2);
-        st = atomic_load(&s_cap_state);
-    }
-    if (st == 1) {
-        expect = 1;
-        if (atomic_compare_exchange_strong(&s_cap_state, &expect, 0)) return 0;
-        st = expect;  /* the presenter moved on before the timeout was taken */
-    }
-    if (st == 3) {
-        deadline = nvp_now_ns() + 1000ull * 1000000ull;
-        while ((st = atomic_load(&s_cap_state)) == 3 && nvp_now_ns() < deadline)
-            SDL_Delay(2);
-        /* The presenter bounds its own work, so it always leaves 3. Keep
-         * waiting so its result is consumed here and no stale 2 remains. */
-        while (st == 3) {
-            SDL_Delay(2);
-            st = atomic_load(&s_cap_state);
-        }
-    }
-    if (st != 2) return 0;
-
-    *out_rgb = s_cap_rgb;
-    *out_w = s_cap_w;
-    *out_h = s_cap_h;
-    s_cap_rgb = NULL;
-    atomic_store(&s_cap_state, 0);
-    return 1;
+    vk_swapchain_frame_layout(fr, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* GL is bottom-up, Vulkan top-down: flip while blitting. */
+    VkImageBlit blit;
+    memset(&blit, 0, sizeof(blit));
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[0].y = s_ih;
+    blit.srcOffsets[1].x = s_iw;
+    blit.srcOffsets[1].z = 1;
+    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.dstSubresource.layerCount = 1;
+    blit.dstOffsets[1].x = (int32_t)fr->width;
+    blit.dstOffsets[1].y = (int32_t)fr->height;
+    blit.dstOffsets[1].z = 1;
+    VkFilter filter = ((uint32_t)s_iw == fr->width && (uint32_t)s_ih == fr->height)
+                          ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    vkCmdBlitImage(fr->cmd, im->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fr->image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
 }
 
 int nvp_present(void)
@@ -1723,131 +887,44 @@ int nvp_present(void)
     int balanced = 0, presented = 0, skipped_minimized = 0, hard_fail = 0;
     for (int r = 0; r < repeats && !hard_fail; ++r) {
         int first = (r == 0);
-        NvpFrame *f = &s_frames[s_frame_cursor];
-        s_frame_cursor = (s_frame_cursor + 1) % NVP_RING;
-        VkResult vr = nvp_wait_reset_frame(f);
-        if (vr != VK_SUCCESS) { nvp_fail(vr); hard_fail = 1; break; }
-
-        int have_image = 0;
-        uint32_t ii = 0;
-        VkSemaphore acq = VK_NULL_HANDLE;
-        if (!s_swapchain) {
-            NVP_ADD(s_d_minimized_skips, 1);
-            skipped_minimized = 1;
-        } else {
-            if (s_use_present_wait && s_present_depth > 0 &&
-                (s_present_mode == VK_PRESENT_MODE_FIFO_KHR ||
-                 s_present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
-                s_last_presented_id != 0 &&
-                s_last_presented_id > (uint64_t)(s_present_depth - 1)) {
-                /* Bound the not-yet-displayed images: wait for the image
-                 * queued depth presents ago to reach the screen. */
-                uint64_t target = s_last_presented_id - (uint64_t)(s_present_depth - 1);
-                if (target > 0 && target >= s_sc_first_id) {
-                    uint64_t w0 = nvp_now_ns();
-                    VkResult wr = nvp_vkWaitForPresentKHR(s_dev, s_swapchain, target,
-                                                          NVP_PRESENT_WAIT_TIMEOUT_NS);
-                    uint64_t wdt = nvp_now_ns() - w0;
-                    NVP_ADD(s_d_present_waits, 1);
-                    NVP_ADD(s_d_present_wait_ns_total, wdt);
-                    if (wdt > NVP_GET(s_d_present_wait_max_ns)) NVP_SET(s_d_present_wait_max_ns, wdt);
-                    if (wr == VK_TIMEOUT) {
-                        NVP_ADD(s_d_present_wait_timeouts, 1);
-                    } else if (wr == VK_ERROR_OUT_OF_DATE_KHR) {
-                        NVP_ADD(s_d_out_of_date, 1);
-                        s_need_recreate = 1;
-                    } else if (wr != VK_SUCCESS && wr != VK_SUBOPTIMAL_KHR) {
-                        nvp_fail(wr);
-                    }
-                }
-            }
-            acq = s_acquire_sem[s_acquire_cursor];
-            vr = nvp_vkAcquireNextImageKHR(s_dev, s_swapchain, NVP_ACQUIRE_TIMEOUT_NS, acq,
-                                           VK_NULL_HANDLE, &ii);
-            if (vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR) {
-                have_image = 1;
-                s_acquire_cursor = (s_acquire_cursor + 1) % (s_sc_count + 1);
-                if (vr == VK_SUBOPTIMAL_KHR) {
-                    NVP_ADD(s_d_suboptimal, 1);
-                    /* A swapchain that is suboptimal from its first image would
-                     * otherwise be rebuilt every frame. */
-                    if (s_images_since_create >= 60) s_need_recreate = 1;
-                }
-            } else {
-                if (vr == VK_ERROR_OUT_OF_DATE_KHR) {
-                    NVP_ADD(s_d_out_of_date, 1);
-                    s_need_recreate = 1;
-                } else if (vr == VK_TIMEOUT || vr == VK_NOT_READY) {
-                    NVP_ADD(s_d_acquire_timeouts, 1);
-                } else {
-                    nvp_fail(vr);
-                    s_need_recreate = 1;
-                }
-            }
-        }
-
-        int last = (r == repeats - 1) || !have_image;
-        VkBuffer cap_buf = VK_NULL_HANDLE;
-        VkDeviceMemory cap_mem = VK_NULL_HANDLE;
-        if (r == 0 && have_image && atomic_load(&s_sc_can_read)) {
-            int want = 1;
-            if (atomic_compare_exchange_strong(&s_cap_state, &want, 3)) {
-                if (!nvp_cap_create(&cap_buf, &cap_mem)) atomic_store(&s_cap_state, 0);
-            }
-        }
-        vr = nvp_submit_repeat(f, im, have_image, ii, acq, first, last, cap_buf);
-        if (cap_buf != VK_NULL_HANDLE) nvp_cap_finish(f, cap_buf, cap_mem, vr);
-        if (vr != VK_SUCCESS) { nvp_fail(vr); hard_fail = 1; break; }
-        if (last) balanced = 1;
-        if (!have_image) break;
-
-        VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_render_done[ii];
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &s_swapchain;
-        pi.pImageIndices = &ii;
-        VkPresentIdKHR pid = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
-        uint64_t pres_id = 0;
-        if (s_use_present_wait) {
-            pres_id = ++s_present_id;
-            pid.swapchainCount = 1;
-            pid.pPresentIds = &pres_id;
-            pi.pNext = &pid;
-        }
-        vr = nvp_vkQueuePresentKHR(s_queue, &pi);
-        if (vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR) {
-            if (pres_id) {
-                if (!s_sc_first_id) s_sc_first_id = pres_id;
-                s_last_presented_id = pres_id;
-                NVP_SET(s_d_last_present_id, pres_id);
-            }
-            presented++;
-            s_images_since_create++;
-            NVP_ADD(s_d_images_presented, 1);
-            if (vr == VK_SUBOPTIMAL_KHR) {
-                NVP_ADD(s_d_suboptimal, 1);
-                if (s_images_since_create >= 60) s_need_recreate = 1;
-            }
-        } else if (vr == VK_ERROR_OUT_OF_DATE_KHR) {
-            NVP_ADD(s_d_out_of_date, 1);
-            s_need_recreate = 1;
-            if (!last) {
-                /* Close the interop hand-over with a submit of its own. */
-                NvpFrame *g = &s_frames[s_frame_cursor];
-                s_frame_cursor = (s_frame_cursor + 1) % NVP_RING;
-                if (nvp_wait_reset_frame(g) == VK_SUCCESS &&
-                    nvp_submit_repeat(g, im, 0, 0, VK_NULL_HANDLE, 0, 1, VK_NULL_HANDLE) == VK_SUCCESS)
-                    balanced = 1;
-                else
-                    hard_fail = 1;
-            }
+        int last = (r == repeats - 1);
+        VkSwapFrame fr;
+        VkSwapAcquire acq = vk_swapchain_acquire(&fr);
+        if (acq != VK_SWAP_ACQUIRE_OK) {
+            /* Nothing to blit into (minimized, or the acquire failed): only
+             * the interop hand-over is submitted. */
+            if (acq == VK_SWAP_ACQUIRE_SKIP) skipped_minimized = 1;
+            VkResult vr = nvp_close_handover(im, first);
+            if (vr != VK_SUCCESS) { nvp_fail(vr); hard_fail = 1; break; }
+            balanced = 1;
             break;
-        } else {
-            nvp_fail(vr);
-            s_need_recreate = 1;
-            hard_fail = 1;
         }
+
+        if (first) nvp_acquire_interop(fr.cmd, im->image);
+        nvp_record_blit(&fr, im);
+        if (last) nvp_release_interop(fr.cmd, im->image);
+
+        VkSwapDiagnostics before, after;
+        vk_swapchain_diagnostics(&before);
+        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        int ok = vk_swapchain_present(&fr, first ? 1 : 0, &im->gl_ready, &wait_stage,
+                                      last ? 1 : 0, &im->vk_done);
+        if (fr.submitted && last) balanced = 1;
+        if (ok) {
+            presented++;
+            continue;
+        }
+        vk_swapchain_diagnostics(&after);
+        if (!fr.submitted || after.failures != before.failures) {
+            /* A failed submit or present: hard failure. */
+            hard_fail = 1;
+        } else if (!last) {
+            /* Out of date: close the interop hand-over with a submit of its own. */
+            VkResult vr = nvp_close_handover(im, 0);
+            if (vr == VK_SUCCESS) balanced = 1;
+            else hard_fail = 1;
+        }
+        break;
     }
 
     if (balanced) im->vk_done_pending = 1;
@@ -1861,53 +938,64 @@ int nvp_present(void)
     return (presented > 0 || skipped_minimized) && !hard_fail;
 }
 
+int nvp_capture_presented(int timeout_ms, unsigned char **out_rgb, int *out_w, int *out_h)
+{
+    if (!s_active) {
+        if (out_rgb) *out_rgb = NULL;
+        if (out_w) *out_w = 0;
+        if (out_h) *out_h = 0;
+        return 0;
+    }
+    return vk_swapchain_capture_presented(timeout_ms, out_rgb, out_w, out_h);
+}
+
 void nvp_release_gl_context(void)
 {
-    if (!s_dev || !s_interop_live) return;
+    if (!vk_core_device() || !s_interop_live) return;
     glFinish();
     nvp_destroy_interop(1);
 }
 
 void nvp_shutdown(void)
 {
-    int was_active = s_active;
     nvp_teardown();
-    if (was_active) NVP_SAY("shut down\n");
 }
 
 /* ---- diagnostics -------------------------------------------------------- */
 void nvp_diagnostics(NvpDiagnostics *out)
 {
+    VkSwapDiagnostics sw;
+    vk_swapchain_diagnostics(&sw);
     memset(out, 0, sizeof(*out));
     out->active = s_active;
-    out->present_mode = NVP_GET(s_d_present_mode);
+    out->present_mode = sw.present_mode;
     out->requested_interval = atomic_load(&s_req_interval);
     out->requested_vsync = atomic_load(&s_req_vsync);
-    out->swapchain_images = NVP_GET(s_d_sc_images);
-    out->extent_width = NVP_GET(s_d_ext_w);
-    out->extent_height = NVP_GET(s_d_ext_h);
+    out->swapchain_images = sw.images;
+    out->extent_width = sw.extent_width;
+    out->extent_height = sw.extent_height;
     out->interop_width = NVP_GET(s_d_int_w);
     out->interop_height = NVP_GET(s_d_int_h);
     out->frames_begun = NVP_GET(s_d_frames_begun);
     out->frames_presented = NVP_GET(s_d_frames_presented);
-    out->images_presented = NVP_GET(s_d_images_presented);
-    out->acquire_timeouts = NVP_GET(s_d_acquire_timeouts);
-    out->out_of_date = NVP_GET(s_d_out_of_date);
-    out->suboptimal = NVP_GET(s_d_suboptimal);
-    out->swapchain_recreations = NVP_GET(s_d_sc_recreations);
+    out->images_presented = sw.frames_presented;
+    out->acquire_timeouts = sw.acquire_timeouts;
+    out->out_of_date = sw.out_of_date;
+    out->suboptimal = sw.suboptimal;
+    out->swapchain_recreations = sw.recreations;
     out->interop_recreations = NVP_GET(s_d_interop_recreations);
-    out->minimized_skips = NVP_GET(s_d_minimized_skips);
-    out->failures = NVP_GET(s_d_failures);
+    out->minimized_skips = sw.minimized_skips;
+    out->failures = NVP_GET(s_d_failures) + sw.failures;
     out->last_present_ns = NVP_GET(s_d_last_present_ns);
     out->max_present_block_ns = NVP_GET(s_d_max_block_ns);
-    out->last_vk_result = NVP_GET(s_d_last_result);
-    out->present_wait = NVP_GET(s_d_present_wait_on);
-    out->present_depth = NVP_GET(s_d_present_depth);
-    out->present_waits = NVP_GET(s_d_present_waits);
-    out->present_wait_timeouts = NVP_GET(s_d_present_wait_timeouts);
-    out->present_wait_ns_total = NVP_GET(s_d_present_wait_ns_total);
-    out->present_wait_max_ns = NVP_GET(s_d_present_wait_max_ns);
-    out->last_present_id = NVP_GET(s_d_last_present_id);
+    out->last_vk_result = sw.failures ? sw.last_vk_result : NVP_GET(s_d_last_result);
+    out->present_wait = sw.present_wait;
+    out->present_depth = sw.present_depth;
+    out->present_waits = sw.present_waits;
+    out->present_wait_timeouts = sw.present_wait_timeouts;
+    out->present_wait_ns_total = sw.present_wait_ns_total;
+    out->present_wait_max_ns = sw.present_wait_max_ns;
+    out->last_present_id = sw.last_present_id;
 }
 
 int nvp_diagnostics_json(char *out, int capacity)
@@ -1925,7 +1013,7 @@ int nvp_diagnostics_json(char *out, int capacity)
         "\"last_present_ns\":%llu,\"max_present_block_ns\":%llu,\"last_vk_result\":%d,"
         "\"present_wait\":%d,\"present_depth\":%d,\"present_waits\":%llu,"
         "\"present_wait_timeouts\":%llu,\"present_wait_ns_total\":%llu,"
-        "\"present_wait_max_ns\":%llu,\"last_present_id\":%llu}",
+        "\"present_wait_max_ns\":%llu,\"last_present_id\":%llu,\"probe_failure\":\"%s\"}",
         d.active, d.present_mode, d.requested_interval, d.requested_vsync,
         (unsigned)d.swapchain_images, (unsigned)d.extent_width, (unsigned)d.extent_height,
         (unsigned)d.interop_width, (unsigned)d.interop_height,
@@ -1938,7 +1026,7 @@ int nvp_diagnostics_json(char *out, int capacity)
         d.last_vk_result, d.present_wait, d.present_depth,
         (unsigned long long)d.present_waits, (unsigned long long)d.present_wait_timeouts,
         (unsigned long long)d.present_wait_ns_total, (unsigned long long)d.present_wait_max_ns,
-        (unsigned long long)d.last_present_id);
+        (unsigned long long)d.last_present_id, s_probe_failure);
 }
 
 #endif  /* PSX_HAVE_VULKAN */

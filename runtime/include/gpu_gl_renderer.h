@@ -333,6 +333,11 @@ typedef struct GlRendererNativeGpuDiagnostics {
     uint32_t render_scale, storage_width, storage_height;
     /* 0 idle, 1 queued, 2 submitted, 3 ready, 4 published, 5 cancelled, 6 dispatching. */
     uint32_t pending_state;
+    /* First failure of the last failed GPU work: GL_RENDERER_NATIVE_GPU_FAILURE_*,
+     * the FIFO command (index, opcode) it stopped at and the first GL error
+     * drained on that thread, or the fence wait status (0 none). */
+    uint64_t failures;
+    uint32_t failure_stage, failure_command, failure_kind, failure_gl_error;
 } GlRendererNativeGpuDiagnostics;
 
 typedef struct GlRendererNativeCompilerDiagnostics {
@@ -434,6 +439,26 @@ typedef struct GlRendererNativeCompilerDiagnostics {
 void gl_renderer_native_compiler_diagnostics(
     GlRendererNativeCompilerDiagnostics *out_diagnostics);
 const char *gl_renderer_native_compile_blocker_name(uint32_t blocker);
+
+typedef enum GlRendererNativeGpuFailure {
+    GL_RENDERER_NATIVE_GPU_FAILURE_NONE = 0,
+    GL_RENDERER_NATIVE_GPU_FAILURE_JOURNAL,        /* command/data journal allocation */
+    GL_RENDERER_NATIVE_GPU_FAILURE_CANONICAL_SYNC, /* recipe feedback map wait */
+    GL_RENDERER_NATIVE_GPU_FAILURE_PROGRAM,        /* program/objects or a pending GL error */
+    GL_RENDERER_NATIVE_GPU_FAILURE_PHASE_UPLOAD,   /* phase textures or templates */
+    GL_RENDERER_NATIVE_GPU_FAILURE_PLANE,          /* plane or depth allocation */
+    GL_RENDERER_NATIVE_GPU_FAILURE_VERTICES,       /* vertex slice upload */
+    GL_RENDERER_NATIVE_GPU_FAILURE_COMMAND,        /* a FIFO command */
+    GL_RENDERER_NATIVE_GPU_FAILURE_CANONICAL_READ, /* canonical readback GL error */
+    GL_RENDERER_NATIVE_GPU_FAILURE_SCANOUT,        /* scanout image allocation */
+    GL_RENDERER_NATIVE_GPU_FAILURE_FENCE,          /* glFenceSync returned 0 */
+    GL_RENDERER_NATIVE_GPU_FAILURE_GL_ERROR,       /* GL error at submission */
+    GL_RENDERER_NATIVE_GPU_FAILURE_FENCE_WAIT,     /* fence not signaled; code = wait status */
+    GL_RENDERER_NATIVE_GPU_FAILURE_READBACK        /* image hash/readback mapping */
+} GlRendererNativeGpuFailure;
+const char *gl_renderer_native_gpu_failure_name(uint32_t stage);
+/* "vendor | renderer | version | interlock=N barrier=N" of the GL context. */
+const char *gl_renderer_gl_identity(void);
 const char *gl_renderer_native_temporal_status_name(uint32_t status);
 
 typedef enum GlRendererNativePresentBlocker {
@@ -720,6 +745,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
 
 /* Producer-driven Native widescreen. This is independent from gpu_ws_* and the
  * legacy wide mirror; only Native semantic draws populate these surfaces. */
+/* Native on Vulkan: the view configuration needs no GL context. */
+void gl_renderer_native_set_neutral_host(int enabled);
 int gl_renderer_configure_native_view(int enabled, int aspect_num,
                                       int aspect_den, int canonical_width,
                                       int canonical_height);
