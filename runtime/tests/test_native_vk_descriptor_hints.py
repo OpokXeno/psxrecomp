@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Exercise the executor's actual descriptor lookup across collisions/resets."""
+import argparse
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 
-source = (Path(__file__).resolve().parents[1] / "src/native_vk_executor.c").read_text()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--compiler", default="cc")
+args = parser.parse_args()
+
+source = (Path(__file__).resolve().parents[1] / "src/native_vk_executor.c").read_text(
+    encoding="utf-8")
 key = source.split("typedef struct NvkSetKey {", 1)[1].split("} NvkSetKey;", 1)[0]
 lookup = source.split("static VkDescriptorSet nvk_set0_cached", 1)[1].split(
     "/* Set 0 of the native pipeline", 1)[0]
@@ -65,8 +72,9 @@ int main(void) {
 '''.replace("KEY", key).replace("LOOKUP", lookup)
 with tempfile.TemporaryDirectory(prefix="xg-descriptor-hints-") as directory:
     path = Path(directory)
-    (path / "test.c").write_text(harness)
-    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
-                    str(path / "test.c"), "-o", str(path / "test")], check=True)
-    subprocess.run([str(path / "test")], check=True)
+    executable = path / ("test.exe" if os.name == "nt" else "test")
+    (path / "test.c").write_text(harness, encoding="utf-8")
+    subprocess.run([args.compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
+                    str(path / "test.c"), "-o", str(executable)], check=True)
+    subprocess.run([str(executable)], check=True)
 print("PASS descriptor key collisions, pool reset, capacity rollover, disabled path")

@@ -1358,6 +1358,10 @@ endif()
 
 # ---- test-registration completeness guard -----------------------------------
 if(BUILD_TESTING AND Python3_Interpreter_FOUND AND NOT MSVC)
+    add_test(NAME native_vk_descriptor_hints
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/tests/test_native_vk_descriptor_hints.py"
+            --compiler "${CMAKE_C_COMPILER}")
     add_test(NAME gpu_upload_history
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/tests/test_gpu_upload_history.py"
