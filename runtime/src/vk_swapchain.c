@@ -33,6 +33,8 @@ typedef int vk_swapchain_unavailable_t;
 typedef struct VksFrame {
     VkCommandBuffer cmd;
     VkFence fence;
+    VkFence acquired;
+    int acquire_pending;
 } VksFrame;
 
 static int s_active;
@@ -97,6 +99,12 @@ static _Atomic uint64_t s_d_present_waits, s_d_present_wait_timeouts;
 static _Atomic uint64_t s_d_present_wait_ns_total, s_d_present_wait_max_ns, s_d_last_present_id;
 static int s_wait_diagnostics;
 static _Atomic uint64_t s_d_frame_fence_ns, s_d_acquire_ns, s_d_submit_ns, s_d_present_ns;
+/* Opt-in WSI experiment: 1 observes readiness, 2 also waits on the CPU before
+ * queuing the swapchain draw. Keep the semaphore wait in both modes: it still
+ * supplies the device-side dependency. No extra fence exists by default. */
+static int s_acquire_fence_mode;
+static _Atomic uint64_t s_d_acquire_pending, s_d_acquire_pending_submit;
+static _Atomic uint64_t s_d_acquire_fence_wait_ns, s_d_acquire_fence_timeouts;
 
 #define VKS_ADD(v, n) atomic_fetch_add_explicit(&(v), (n), memory_order_relaxed)
 #define VKS_GET(v) atomic_load_explicit(&(v), memory_order_relaxed)
@@ -436,6 +444,11 @@ static int vks_create_frames(void)
             s_frames[i].fence = VK_NULL_HANDLE;
             return vks_create_fail("fence creation failed");
         }
+        if (s_acquire_fence_mode) {
+            VkFenceCreateInfo aci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (!vk_core_check(vkCreateFence(dev, &aci, NULL, &s_frames[i].acquired), "acquire fence"))
+                return vks_create_fail("acquire fence creation failed");
+        }
     }
     return 1;
 }
@@ -499,6 +512,9 @@ int vk_swapchain_create(void)
 {
     const char *waits = getenv("PSX_VK_WAIT_DIAGNOSTICS");
     s_wait_diagnostics = waits && waits[0] == '1';
+    const char *acquire_fence = getenv("PSX_VK_ACQUIRE_FENCE");
+    s_acquire_fence_mode = acquire_fence &&
+        (acquire_fence[0] == '1' || acquire_fence[0] == '2') && !acquire_fence[1] ? acquire_fence[0] - '0' : 0;
     s_failure[0] = '\0';
     if (!vks_create_impl()) {
         vk_swapchain_destroy();
@@ -515,6 +531,7 @@ void vk_swapchain_destroy(void)
         vks_destroy_images();
         for (int i = 0; i < VKS_FRAMES; ++i) {
             if (s_frames[i].fence) vkDestroyFence(dev, s_frames[i].fence, NULL);
+            if (s_frames[i].acquired) vkDestroyFence(dev, s_frames[i].acquired, NULL);
             if (s_frames[i].cmd && s_pool) vkFreeCommandBuffers(dev, s_pool, 1, &s_frames[i].cmd);
         }
         if (s_swapchain) vkDestroySwapchainKHR(dev, s_swapchain, NULL);
@@ -606,9 +623,19 @@ VkSwapAcquire vk_swapchain_acquire(VkSwapFrame *frame)
     }
 
     VkSemaphore acq = s_acquire_sem[s_acquire_cursor];
+    if (f->acquire_pending) {
+        /* The preceding frame fence covers the semaphore consumption, but
+         * explicitly complete the acquisition fence before resetting it.
+         * Failed/timed-out acquisitions never set acquire_pending. */
+        vr = vkWaitForFences(dev, 1, &f->acquired, VK_TRUE, UINT64_MAX);
+        if (!vk_core_check(vr, "acquire fence reuse wait")) { vks_fail(vr); return VK_SWAP_ACQUIRE_FAILED; }
+        vr = vkResetFences(dev, 1, &f->acquired);
+        if (!vk_core_check(vr, "acquire fence reset")) { vks_fail(vr); return VK_SWAP_ACQUIRE_FAILED; }
+        f->acquire_pending = 0;
+    }
     uint32_t ii = 0;
     wait_started = s_wait_diagnostics ? vks_now_ns() : 0u;
-    vr = vkAcquireNextImageKHR(dev, s_swapchain, VKS_ACQUIRE_TIMEOUT_NS, acq, VK_NULL_HANDLE, &ii);
+    vr = vkAcquireNextImageKHR(dev, s_swapchain, VKS_ACQUIRE_TIMEOUT_NS, acq, f->acquired, &ii);
     if (s_wait_diagnostics) VKS_ADD(s_d_acquire_ns, vks_now_ns() - wait_started);
     if (vr != VK_SUCCESS && vr != VK_SUBOPTIMAL_KHR) {
         if (vr == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -622,6 +649,12 @@ VkSwapAcquire vk_swapchain_acquire(VkSwapFrame *frame)
             s_need_recreate = 1;
         }
         return VK_SWAP_ACQUIRE_FAILED;
+    }
+    if (f->acquired) {
+        f->acquire_pending = 1;
+        VkResult ready = vkGetFenceStatus(dev, f->acquired);
+        if (ready == VK_NOT_READY) VKS_ADD(s_d_acquire_pending, 1);
+        else if (!vk_core_check(ready, "acquire fence status")) { vks_fail(ready); return VK_SWAP_ACQUIRE_FAILED; }
     }
     s_acquire_cursor = (s_acquire_cursor + 1) % (s_count + 1);
     if (vr == VK_SUBOPTIMAL_KHR) {
@@ -847,6 +880,26 @@ int vk_swapchain_present(VkSwapFrame *frame, uint32_t extra_wait_count, const Vk
     si.pCommandBuffers = &frame->cmd;
     si.signalSemaphoreCount = ns;
     si.pSignalSemaphores = signals;
+    if (s_frames[frame->slot].acquired) {
+        VkFence acquired = s_frames[frame->slot].acquired;
+        VkResult ready = vkGetFenceStatus(vk_core_device(), acquired);
+        if (ready == VK_NOT_READY) {
+            VKS_ADD(s_d_acquire_pending_submit, 1);
+            if (s_acquire_fence_mode == 2) {
+                const uint64_t began = vks_now_ns();
+                ready = vkWaitForFences(vk_core_device(), 1, &acquired, VK_TRUE, VKS_ACQUIRE_TIMEOUT_NS);
+                VKS_ADD(s_d_acquire_fence_wait_ns, vks_now_ns() - began);
+                /* On timeout still submit/consume the acquisition semaphore;
+                 * abandoning an acquired image would break the frame ring. */
+                if (ready == VK_TIMEOUT) VKS_ADD(s_d_acquire_fence_timeouts, 1);
+            }
+        }
+        if (ready != VK_NOT_READY && ready != VK_TIMEOUT && !vk_core_check(ready, "acquire fence before submit")) {
+            vks_fail(ready);
+            if (capturing) vks_cap_finish(frame, &cap_buf, ready);
+            return 0;
+        }
+    }
     uint64_t wait_started = s_wait_diagnostics ? vks_now_ns() : 0u;
     r = vk_core_submit(1, &si, s_frames[frame->slot].fence);
     if (s_wait_diagnostics) VKS_ADD(s_d_submit_ns, vks_now_ns() - wait_started);
@@ -950,7 +1003,9 @@ int vk_swapchain_diagnostics_json(char *out, int capacity)
         "\"present_wait\":%d,\"present_depth\":%d,\"present_waits\":%llu,"
         "\"present_wait_timeouts\":%llu,\"present_wait_ns_total\":%llu,"
         "\"present_wait_max_ns\":%llu,\"last_present_id\":%llu,\"create_failure\":\"%s\","
-        "\"frame_fence_ns\":%llu,\"acquire_ns\":%llu,\"submit_ns\":%llu,\"present_ns\":%llu}",
+        "\"frame_fence_ns\":%llu,\"acquire_ns\":%llu,\"submit_ns\":%llu,\"present_ns\":%llu,"
+        "\"acquire_fence_mode\":%d,\"acquire_pending\":%llu,\"acquire_pending_submit\":%llu,"
+        "\"acquire_fence_wait_ns\":%llu,\"acquire_fence_timeouts\":%llu}",
         d.active, d.present_mode, d.requested_interval, d.requested_vsync,
         (unsigned)d.images, (unsigned)d.extent_width, (unsigned)d.extent_height,
         (unsigned long long)d.frames_acquired, (unsigned long long)d.frames_presented,
@@ -962,7 +1017,10 @@ int vk_swapchain_diagnostics_json(char *out, int capacity)
         (unsigned long long)d.present_wait_timeouts, (unsigned long long)d.present_wait_ns_total,
         (unsigned long long)d.present_wait_max_ns, (unsigned long long)d.last_present_id, s_failure,
         (unsigned long long)VKS_GET(s_d_frame_fence_ns), (unsigned long long)VKS_GET(s_d_acquire_ns),
-        (unsigned long long)VKS_GET(s_d_submit_ns), (unsigned long long)VKS_GET(s_d_present_ns));
+        (unsigned long long)VKS_GET(s_d_submit_ns), (unsigned long long)VKS_GET(s_d_present_ns),
+        s_acquire_fence_mode, (unsigned long long)VKS_GET(s_d_acquire_pending),
+        (unsigned long long)VKS_GET(s_d_acquire_pending_submit),
+        (unsigned long long)VKS_GET(s_d_acquire_fence_wait_ns), (unsigned long long)VKS_GET(s_d_acquire_fence_timeouts));
 }
 
 #endif  /* PSX_HAVE_VULKAN */

@@ -6,6 +6,7 @@
 //! variant INTERLOCK_GENERIC_RASTER NATIVE_GPU_INTERLOCK=1 NATIVE_GPU_GENERIC_RASTER=1
 //! variant SPECIALIZED NATIVE_GPU_SPECIALIZED=1
 //! variant CORE_BATCH NATIVE_GPU_CORE_BATCH=1
+//! variant CORE_BATCH_INDEX_SPECIALIZED NATIVE_GPU_CORE_BATCH=1 NATIVE_GPU_SPECIALIZED=1 NATIVE_GPU_RECORD_BUFFER=1
 //! variant CORE_BATCH_SPECIALIZED NATIVE_GPU_CORE_BATCH=1 NATIVE_GPU_SPECIALIZED=1
 //! variant CORE_BATCH_FOOTPRINT NATIVE_GPU_CORE_BATCH=1 NATIVE_GPU_VERTEX_FOOTPRINT=1
 //! variant CORE_BATCH_FOOTPRINT_SPECIALIZED NATIVE_GPU_CORE_BATCH=1 NATIVE_GPU_SPECIALIZED=1 NATIVE_GPU_VERTEX_FOOTPRINT=1
@@ -39,6 +40,10 @@
 #define depth_origin unused_depth_origin
 #define attribute_plane unused_attribute_plane
 #define attribute_dda unused_attribute_dda
+#define page unused_page
+#define window unused_window
+#define hd_map unused_hd_map
+#define hd_lim unused_hd_lim
 #endif
 
 /* Per-draw uniforms. The interlock variant reads them through u_-prefixed names
@@ -89,12 +94,26 @@ PSX_UNIFORMS(NativeDraw, 1, NATIVE_DRAW_UNIFORMS)
 #undef depth_origin
 #undef attribute_plane
 #undef attribute_dda
-PSX_VARYING(4) flat in uvec4 triangle_data[10];
+#undef page
+#undef window
+#undef hd_map
+#undef hd_lim
+#ifdef NATIVE_GPU_RECORD_BUFFER
+PSX_VARYING(4) flat in int triangle_record_index;
+PSX_USAMPLERBUFFER(7, triangle_records)
+uvec4 triangle_data[12];
+#else
+PSX_VARYING(4) flat in uvec4 triangle_data[12];
+#endif
 #define sample_lim ivec4(triangle_data[0])
 #define depth_plane ivec4(triangle_data[1])
 #define attribute_origin uintBitsToFloat(triangle_data[2])
 #define uv_gradient uintBitsToFloat(triangle_data[3])
 #define depth_origin ivec2(triangle_data[4].xy)
+#define page ivec4(triangle_data[10])
+#define window ivec4(triangle_data[11])
+#define hd_map ivec4(triangle_data[3])
+#define hd_lim ivec4(triangle_data[5].w,triangle_data[6].w,triangle_data[7].w,triangle_data[8].w)
 vec4 attribute_plane[5]; ivec4 attribute_dda[5];
 #if defined(VULKAN) && !defined(NATIVE_GPU_CAPTURE)
 layout(std430,set=0,binding=12) readonly buffer DrawDamage { uint damage_words[]; };
@@ -103,14 +122,15 @@ void reject_unchanged_tile(){
  ivec2 p=ivec2(gl_FragCoord.xy);
  ivec4 clip=ivec4(damage_words[offset+1u],damage_words[offset+2u],damage_words[offset+3u],damage_words[offset+4u]);
  if(any(lessThan(p,clip.xy))||any(greaterThanEqual(p,clip.zw)))discard;
- uint tile=uint(p.y/64)*damage_words[offset]+uint(p.x/64);
+ uint geometry=damage_words[offset],shift=geometry>>16u;
+ uint tile=(uint(p.y)>>shift)*(geometry&65535u)+(uint(p.x)>>shift);
  if((damage_words[offset+5u+(tile>>5u)]&(1u<<(tile&31u)))==0u)discard;
 }
 #endif
 #endif
 #ifdef NATIVE_GPU_VERTEX_FOOTPRINT
-PSX_VARYING(14) flat in vec4 triangle_footprint;
-PSX_VARYING(15) flat in int triangle_taps;
+PSX_VARYING(16) flat in vec4 triangle_footprint;
+PSX_VARYING(17) flat in int triangle_taps;
 #endif
 
 #ifdef NATIVE_GPU_SPECIALIZED
@@ -171,6 +191,10 @@ layout(constant_id=26) const int material_hardware_aniso=0;
 PSX_USAMPLER2D(0, words)
 #if defined(VULKAN) && !defined(NATIVE_GPU_INTERLOCK)
 PSX_USAMPLER2D(11, decoded_words)
+#if defined(VULKAN) && !defined(NATIVE_GPU_INTERLOCK)
+layout(set=0,binding=15) uniform usampler2DArray decoded_layers;
+layout(set=0,binding=14) uniform sampler2DArray decoded_filtered;
+#endif
 #endif
 PSX_USAMPLER2D(4, source_depth)
 PSX_SAMPLER2D(2, source_image)
@@ -315,6 +339,7 @@ ivec2 guest_coordinates(ivec2 q){q&=255; if((window.x|window.y)==0)q=clamp(q,sam
  return q;}
 int guest_texel(ivec2 q){q=guest_coordinates(q);
 #if defined(VULKAN) && !defined(NATIVE_GPU_INTERLOCK)
+ if(decoded_on==2)return int(texelFetch(decoded_layers,ivec3(q,page.x),0).r);
  if(decoded_on!=0)return int(texelFetch(decoded_words,q,0).r);
 #endif
  int shift=depth==0?2:depth==1?1:0; int w=word_at(page.xy+ivec2(q.x>>shift,q.y));
@@ -512,7 +537,8 @@ if(xx+yy>0.99){
        vec2 radius=0.5*(abs(ax)+abs(ay))+vec2(2.0);
        vec2 low=max(vec2(sample_lim.xy),vec2(0.0)),high=min(vec2(sample_lim.zw),vec2(255.0));
        if((window.x|window.y)==0&&mip_on==0&&all(greaterThanEqual(filter_uv-radius,low))&&all(lessThanEqual(filter_uv+radius,high))){
-        vec4 h=textureGrad(mip_image,filter_uv/256.0,ax/256.0,ay/256.0);
+        vec4 h=decoded_on==2?textureGrad(decoded_filtered,vec3(filter_uv/256.0,float(page.x)),ax/256.0,ay/256.0)
+            :textureGrad(mip_image,filter_uv/256.0,ax/256.0,ay/256.0);
         if(h.a>0.0)filtered=h.rgb*(255.0/h.a);
         hardware_sampled=true;
        }
@@ -535,7 +561,8 @@ if(xx+yy>0.99){
           ivec2 sample_q=guest_coordinates(ivec2(floor(uv))),tile=sample_q>>1;
           if(any(notEqual(tile,cached_tile))){
            cached_tile=tile;
-           cached_texels=textureGather(decoded_words,(vec2(tile*2)+vec2(1.0))/256.0,0);
+           cached_texels=decoded_on==2?textureGather(decoded_layers,vec3((vec2(tile*2)+vec2(1.0))/256.0,float(page.x)),0)
+               :textureGather(decoded_words,(vec2(tile*2)+vec2(1.0))/256.0,0);
           }
           int x=sample_q.x&1,y=sample_q.y&1;
           tap=int(cached_texels[y==0?3-x:x]);
@@ -596,11 +623,7 @@ void commit_pixel(){
   result.rgb=depth_view.y==0?tint*0.6:mix(result.rgb,tint,0.55);}}
 #ifdef NATIVE_GPU_CAPTURE
 layout(std430,set=0,binding=12) buffer CaptureMetadata { uint capture_meta[]; };
-#ifdef NATIVE_GPU_LINKED_CAPTURE
-layout(std430,set=0,binding=13) writeonly buffer CaptureFragments { uint capture_node_words[]; };
-#else
 layout(std430,set=0,binding=13) writeonly buffer CaptureFragments { uvec4 capture_fragments[]; };
-#endif
 layout(push_constant) uniform CaptureRect {
  layout(offset=4) int capture_x; int capture_y; int capture_width; int capture_height;
 };
@@ -650,25 +673,29 @@ void capture_pixel(){
   (uint(state.w)<<18u)|(uint(flags.y)<<20u)|(uint(depth_state.x)<<21u)|
   (uint(depth_state.y)<<22u)|(uint(min(depth_state.x+depth_state.z,1))<<25u);
 #ifdef NATIVE_GPU_LINKED_CAPTURE
- uint at=node*5u;
- capture_node_words[at]=triangle_data[4].z;capture_node_words[at+1u]=key;
- capture_node_words[at+2u]=tested;capture_node_words[at+3u]=bits;capture_node_words[at+4u]=next;
+ /* Depth bias is clamped to 0..16 by geometry preparation. Keep the full
+  * key and reconstruct the biased key in resolve, preserving uint overflow. */
+ capture_fragments[node]=uvec4(triangle_data[4].z,key,bits|(uint(depth_state.w)<<26u),next);
 #else
  capture_fragments[offset+slot]=uvec4(triangle_data[4].z,key,tested,bits);
 #endif
 }
 #endif
 void main(){result=vec4(0.0);depth_result=uvec4(0);
+#ifdef NATIVE_GPU_RECORD_BUFFER
+ for(int i=0;i<12;++i)triangle_data[i]=texelFetch(triangle_records,triangle_record_index+i);
+#endif
 #ifdef NATIVE_GPU_CORE_BATCH
  for(int a=0;a<5;++a){attribute_plane[a]=uintBitsToFloat(triangle_data[5+a]);attribute_dda[a]=ivec4(triangle_data[5+a]);}
 #endif
 #ifdef NATIVE_GPU_CAPTURE
   if(capture_meta[0]!=0u)discard;
 #ifdef NATIVE_GPU_LINKED_CAPTURE
-  /* Damage rectangles are clipped 64-pixel tiles. Reject untouched tiles
+  /* Damage rectangles are clipped to the configured tiles. Reject untouched tiles
    * before texture filtering, keeping a triangle in a single material batch. */
   if(capture_meta[3]!=0u){
-   uvec2 tile=uvec2(gl_FragCoord.xy)/64u;uint bit=tile.y*capture_meta[3]+tile.x;
+   uint geometry=capture_meta[3];uvec2 tile=uvec2(gl_FragCoord.xy)>>(geometry>>16u);
+   uint bit=tile.y*(geometry&65535u)+tile.x;
    uint at=4u+2u*uint(capture_width*capture_height)+(bit>>5u);
    if((capture_meta[at]&(1u<<(bit&31u)))==0u)discard;
   }

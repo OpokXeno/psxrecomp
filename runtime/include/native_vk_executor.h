@@ -88,6 +88,13 @@ int native_vk_shadow_dump(const char *path, char *err, size_t err_size);
 /* The colour view and the class-mask view (R8; VK_NULL_HANDLE for a CPU-uploaded image) of an
  * endpoint image handle. */
 int native_vk_endpoint_views(uint64_t color_handle, VkImageView *color, VkImageView *mask);
+/* Half-open pixel bounds relative to the preceding phase in the same work.
+ * Zero means no proof: the presenter must refresh the whole image. */
+int native_vk_endpoint_damage(uint64_t color_handle, int32_t bounds[4]);
+enum { NATIVE_VK_DAMAGE_REGIONS = 16 };
+/* Optional fixed source grid. Returns its side length (2 or 4), or zero if
+ * the proof is unavailable. Empty cells and unused entries are zeroed. */
+int native_vk_endpoint_damage_regions(uint64_t color_handle, int32_t regions[NATIVE_VK_DAMAGE_REGIONS][4]);
 #endif
 
 #endif /* PSX_NATIVE_VK_EXECUTOR_H */

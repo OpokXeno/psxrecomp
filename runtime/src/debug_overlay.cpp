@@ -217,10 +217,19 @@ static SDL_Window *s_win = nullptr;
  * GL context (the main thread's context is current at that point — init
  * is called with NULL by design). */
 static bool s_imgui_ready = false;
+/* The runtime menu owns a different context and restores the previous one
+ * after rendering (which may be null). Every overlay entry point must select
+ * its own context instead of relying on the last UI client that ran. */
+static ImGuiContext *s_imgui_ctx = nullptr;
 #if defined(PSX_IMGUI_VULKAN)
-/* Native on Vulkan: the overlay's own ImGui context (no GL). */
-static ImGuiContext *s_vk_ctx = nullptr;
+static bool s_imgui_vulkan = false;
 #endif
+
+struct OverlayContextScope {
+    ImGuiContext *previous = ImGui::GetCurrentContext();
+    OverlayContextScope() { ImGui::SetCurrentContext(s_imgui_ctx); }
+    ~OverlayContextScope() { ImGui::SetCurrentContext(previous); }
+};
 
 /* window_shot arm. The debug server thread sets s_window_shot_armed and
  * copies the path; the next pre_swap consumes the arm and clears it. The
@@ -3557,25 +3566,28 @@ void psx_debug_overlay_init(struct SDL_Window *win, SDL_GLContext ctx)
 
 void psx_debug_overlay_shutdown(void)
 {
-#if defined(PSX_IMGUI_VULKAN)
-    if (s_vk_ctx) {
-        ImGui::SetCurrentContext(s_vk_ctx);
-        PSX_IMGUI_SDL_SHUTDOWN();
-        psx_imgui_vulkan_backend_shutdown();
-        ImGui::DestroyContext(s_vk_ctx);
-        s_vk_ctx = nullptr;
-        s_imgui_ready = false;
-    }
-#endif
+    ImGuiContext *previous = ImGui::GetCurrentContext();
+    if (previous == s_imgui_ctx) previous = nullptr;
     if (s_imgui_ready) {
-        if (s_separate_ready && s_tools_ctx) {
-            SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx);
+        ImGui::SetCurrentContext(s_imgui_ctx);
+#if defined(PSX_IMGUI_VULKAN)
+        if (s_imgui_vulkan) {
+            psx_imgui_vulkan_backend_shutdown();
+            s_imgui_vulkan = false;
+        } else
+#endif
+        {
+            if (s_separate_ready && s_tools_ctx) {
+                SDL_GL_MakeCurrent(s_tools_win, s_tools_ctx);
+            }
+            ImGui_ImplOpenGL3_Shutdown();
         }
-        ImGui_ImplOpenGL3_Shutdown();
         PSX_IMGUI_SDL_SHUTDOWN();
-        ImGui::DestroyContext();
+        ImGui::DestroyContext(s_imgui_ctx);
+        s_imgui_ctx = nullptr;
         s_imgui_ready = false;
     }
+    ImGui::SetCurrentContext(previous);
     if (s_tools_ctx) {
         SDL_GL_DeleteContext(s_tools_ctx);
         s_tools_ctx = nullptr;
@@ -3655,6 +3667,7 @@ SDL_Window* psx_debug_overlay_camera_input_window(void)
 bool psx_debug_overlay_camera_input_blocked(void)
 {
     if (!s_visible || !s_imgui_ready) return false;
+    OverlayContextScope scope;
     const bool blocked = ImGui::GetIO().WantCaptureKeyboard || ImGui::GetIO().WantCaptureMouse;
     return blocked;
 }
@@ -3686,6 +3699,7 @@ bool psx_debug_overlay_process_event(const SDL_Event *ev)
      * (ImGui just queues events internally — no render). The Ctrl+F3
      * consume check below is unchanged. */
     if (s_imgui_ready) {
+        OverlayContextScope scope;
         PSX_IMGUI_SDL_PROCESS_EVENT(ev);
     }
 
@@ -3704,6 +3718,7 @@ bool psx_debug_overlay_process_event(const SDL_Event *ev)
 
 bool psx_debug_overlay_swallow_keyboard(void)
 {
+    OverlayContextScope scope;
     /* The runtime's pad sampler polls SDL_GetKeyboardState every frame —
      * WantCaptureKeyboard alone does NOT stop that, so we MASK it.
      * Legacy in-game path (single window): historic rules — flying with
@@ -3732,6 +3747,7 @@ bool psx_debug_overlay_swallow_keyboard(void)
 void psx_debug_overlay_capture_state(int *visible, int *want_capture,
                                      int *swallow)
 {
+    OverlayContextScope scope;
     if (visible)         *visible = s_visible ? 1 : 0;
     if (want_capture)    *want_capture = (s_visible && s_imgui_ready &&
                                           ImGui::GetIO().WantCaptureKeyboard) ? 1 : 0;
@@ -3775,7 +3791,9 @@ int psx_debug_overlay_set_force_capture(int on)
 static bool imgui_init_for(SDL_Window *win, SDL_GLContext ctx)
 {
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    ImGuiContext *previous = ImGui::GetCurrentContext();
+    ImGuiContext *overlay = ImGui::CreateContext();
+    ImGui::SetCurrentContext(overlay);
     ImGuiIO &io = ImGui::GetIO();
     /* DockingEnable / ViewportsEnable are not present in the vendored
      * ImGui 1.91.9b "master" build (docking branch only); leave
@@ -3794,7 +3812,8 @@ static bool imgui_init_for(SDL_Window *win, SDL_GLContext ctx)
     }
 
     if (!PSX_IMGUI_SDL_INIT_OPENGL(win, ctx)) {
-        ImGui::DestroyContext();
+        ImGui::DestroyContext(overlay);
+        ImGui::SetCurrentContext(previous);
         return false;
     }
     /* "#version 330 core" matches the GL context the runtime creates
@@ -3802,9 +3821,12 @@ static bool imgui_init_for(SDL_Window *win, SDL_GLContext ctx)
      * below requests the same profile. */
     if (!ImGui_ImplOpenGL3_Init("#version 330 core")) {
         PSX_IMGUI_SDL_SHUTDOWN();
-        ImGui::DestroyContext();
+        ImGui::DestroyContext(overlay);
+        ImGui::SetCurrentContext(previous);
         return false;
     }
+    s_imgui_ctx = overlay;
+    ImGui::SetCurrentContext(previous);
     return true;
 }
 
@@ -4074,7 +4096,7 @@ static void overlay_window_shot(GLuint target_fbo);
 #if defined(PSX_IMGUI_VULKAN)
 /* Native on Vulkan: one ImGui context in the legacy in-game layout, platform
  * on SDL and renderer on the shared Vulkan backend (the runtime menu's). The
- * context stays current on success, as the GL path leaves it. */
+ * caller's context is restored after initialization. */
 static bool vk_overlay_init(void)
 {
     if (!s_win || !native_vk_services_active()) return false;
@@ -4097,10 +4119,12 @@ static bool vk_overlay_init(void)
         ImGui::SetCurrentContext(previous);
         return false;
     }
-    s_vk_ctx = ctx;
+    s_imgui_ctx = ctx;
+    s_imgui_vulkan = true;
     s_legacy_inline = true;
     s_imgui_ready = true;
     s_backend_name = "vulkan";
+    ImGui::SetCurrentContext(previous);
     return true;
 }
 
@@ -4115,9 +4139,8 @@ void psx_debug_overlay_vk_record(void *cmd_buffer, int width, int height)
     (void)height;
     if (!s_visible || !cmd_buffer) return;
     if (!s_imgui_ready && !vk_overlay_init()) return;
-    if (!s_vk_ctx) return;
-    ImGuiContext *previous = ImGui::GetCurrentContext();
-    ImGui::SetCurrentContext(s_vk_ctx);
+    if (!s_imgui_vulkan) return;
+    OverlayContextScope scope;
     load_dbg_data_once();
     ImGui_ImplVulkan_NewFrame();
     PSX_IMGUI_SDL_NEW_FRAME();
@@ -4126,7 +4149,6 @@ void psx_debug_overlay_vk_record(void *cmd_buffer, int width, int height)
     drive_text_input(overlay_active_window());
     ImGui::Render();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), (VkCommandBuffer)cmd_buffer);
-    ImGui::SetCurrentContext(previous);
 }
 #else
 int psx_debug_overlay_vk_visible(void) { return 0; }
@@ -4168,6 +4190,7 @@ static void overlay_service(GLuint target_fbo, bool threaded_present)
 {
     prepare_overlay();
     if(!s_imgui_ready)return;
+    OverlayContextScope scope;
     if (s_teleport_target_id >= 0) {
         /* Confirm via the fieldID mirror: the persist step copies the
          * target there as the transition engages. Same-map teleports

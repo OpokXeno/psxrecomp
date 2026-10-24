@@ -139,6 +139,12 @@ typedef struct NvkPlane {
     uint32_t *depth_max;
     uint32_t depth_columns, depth_rows, depth_scale;
     int depth_zero;
+    /* Scanout pixels that may differ from the preceding phase of this work.
+     * Valid only for a proven local replay; immutable after publication. */
+    int damage_valid;
+    int32_t damage_bounds[4];
+    int damage_regions_side;
+    int32_t damage_regions[NATIVE_VK_DAMAGE_REGIONS][4]; /* half-open scanout pixels */
 } NvkPlane;
 
 typedef struct NvkChunk {
@@ -172,9 +178,10 @@ static struct {
     VkDescriptorSetLayout dsl_native0, dsl_native1, dsl_scan0, dsl_scan1, dsl_il0;
     VkPipelineLayout pl_native, pl_scan, pl_il, pl_core_batch;
     VkPipeline pipe_draw[2], pipe_scan, pipe_il, pipe_core_batch[2];
-    int core_batch, vertex_footprint;
-    int phase_damage, depth_bounds, shader_damage;
-    int capture_enabled, linked_capture;
+    int core_batch, hd_batch, hd_record_buffer, vertex_footprint, first_vertex_records, lazy_vertices;
+    int phase_damage, depth_bounds, shader_damage, damage_regions;
+    unsigned damage_tile_shift;
+    int capture_enabled, linked_capture, publish_barriers;
     int merge_capture, sort_capture, direct_capture;
     VkRenderPass pass_capture;
     VkPipeline pipe_capture_draw, pipe_capture_count, pipe_capture_resolve;
@@ -182,11 +189,23 @@ static struct {
     VkDescriptorSetLayout dsl_capture;
     VkCoreBuffer capture_meta, capture_nodes, capture_readback;
     uint32_t capture_capacity, capture_failed_scene;
+    VkFence pace_fences[8];
+    uint32_t pace_limit, pace_head, pace_count;
+    uint64_t pace_margin_ns;
+    int defer_submits, phase_seal;
+    struct { VkCommandBuffer cmd; VkFence fence; } pending_submits[64];
+    uint32_t pending_head, pending_count;
     VkPipeline pipe_decode;
     VkPipelineLayout pl_decode;
     VkDescriptorSetLayout dsl_decode;
+    VkCoreImage decoded_array, filtered_array;
+    uint32_t decoded_layer;
+    int decode_arrays;
     struct { VkCoreImage image, filtered; int32_t key[5]; uint16_t *source; uint32_t source_words; uint64_t used; int valid; } decoded[64];
     struct { int32_t key[6]; uint32_t entry; } decoded_work[64];
+    uint8_t decoded_work_hints[256]; /* one-based indices; 255 is a missing key */
+    int32_t decoded_missing_keys[256][6];
+    int decode_hints;
     uint32_t decoded_count, decoded_work_count;
     uint64_t decoded_generation;
     uint64_t words_generation, decoded_base_generation;
@@ -195,8 +214,9 @@ static struct {
     VkSampler sampler_aniso[5];
     struct { uint64_t key; VkPipeline pipeline; } materials[256];
     uint32_t material_count;
-    int specialize_materials, early_reject, sort_materials, aniso_single_tap, aniso_gather;
+    int specialize_materials, early_reject, sort_materials, sort_hd_readers, aniso_single_tap, aniso_gather;
     uint32_t submit_draw_limit;
+    int clear_spans;
     int interlock;   /* the interlock tier: storage images, batched parameter records */
     int gpu_compute; /* int64 fingerprint; triangle setup additionally requires float64 and interlock */
     VkDescriptorSetLayout dsl_hash;
@@ -225,6 +245,8 @@ static struct {
     uint32_t chunk_count, chunk_cap, chunk_cur;
     NvkSetEntry *set0;
     uint32_t set0_count;
+    uint16_t set0_hints[1024];
+    int descriptor_hints;
     NvkSeed *seeds;
     uint32_t seed_count, seed_cap;
     NvkPlane *garbage;
@@ -260,6 +282,13 @@ typedef struct NvkBound {
     int32_t scissor[4];
 } NvkBound;
 
+typedef struct NvkVertexSource {
+    VkBuffer buf;
+    VkDeviceSize off;
+    const float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOATS];
+    uint32_t count;
+} NvkVertexSource;
+
 typedef struct NvkCounters {
     uint64_t destination_barriers, skipped_barriers, scheduled_layers, geometry_draws, transfer_draws,
         word_uploads, snapshot_commands, depth_tested_triangles;
@@ -279,8 +308,7 @@ static struct {
     NvkView v;
     NvkDraw d;
     NvkSetKey key;
-    struct { VkBuffer buf; VkDeviceSize off; } vsrc;
-    const float (*cpu_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS];
+    NvkVertexSource vsrc;
     VkBufferView recipe;
     VkCoreBuffer recipe_buffer;
     int scheduled_run;
@@ -289,12 +317,14 @@ static struct {
     NvkPlane *planes;       /* S.work_planes */
     NvkPlane *snapshots;    /* S.snapshots */
     int32_t template_ready;
-    struct { VkBuffer buf; VkDeviceSize off; } template_vsrc;
+    NvkVertexSource template_vsrc;
     VkCoreBuffer readback[NVK_IMAGES];
     uint8_t readback_used[NVK_IMAGES];
     struct NvkTemplatePlan *plan;   /* GL work->template_parameters, of this execution */
     int plan_attempted;
     uint32_t hash_groups;   /* groups of the image fingerprint recorded for this work, 0 = none */
+    uint32_t submit_query;
+    uint8_t scanned_images[NVK_IMAGES];
     int damage_active, damage_region;
     int damage_shader_active;
     VkBuffer damage_buffer;
@@ -313,16 +343,25 @@ static int s_retry_phases;
 
 /* Per-phase cost of the executor, in the native_vk_services JSON: CPU phases of nvk_execute and the
  * GPU time between four timestamps (start, after setup, after the journal, end). */
-enum { NVK_CPU_PHASES = 6, NVK_GPU_PHASES = 3, NVK_TS = 8, NVK_CAPTURE_TS = 256 };
+enum { NVK_CPU_PHASES = 6, NVK_GPU_PHASES = 3, NVK_TS = 8, NVK_CAPTURE_TS = 256, NVK_DETAIL_TS = 2048, NVK_SUBMIT_TS = 2048 };
 static const char *const s_cpu_phase_names[NVK_CPU_PHASES] = { "begin", "setup", "journal", "scanout", "submit", "complete" };
 static const char *const s_gpu_phase_names[NVK_GPU_PHASES] = { "setup", "journal", "scanout_readback" };
 static struct {
     uint64_t works, gpu_works;
     uint64_t streamed_works, streamed_chunks;
     uint64_t rendered_phases;
-    uint64_t core_batches, core_batch_triangles;
+    uint64_t cleared_spans, cleared_rects;
+    uint64_t damage_bounds_pixels, capture_pixels, capture_full_pixels;
+    uint64_t core_batches, core_batch_triangles, draw_calls;
+    _Atomic uint64_t submissions;
+    uint64_t raw_vertex_upload_bytes;
+    uint64_t narrow_submits, wide_submits;
+    uint64_t batch_draws[3], batch_triangles[3]; /* capture, HD, ordinary guest */
     uint64_t decoded_pages;
     uint64_t decoded_reuses;
+    uint64_t decoded_hint_hits, decoded_hint_misses, decoded_negative_hits;
+    uint64_t decoded_work_full, decoded_slots_full;
+    uint64_t descriptor_hint_hits, descriptor_hint_misses;
     uint64_t aniso_single_tap_triangles;
     uint64_t damage_phases, damage_pixels, damage_full_pixels;
     uint64_t depth_reads_elided;
@@ -331,10 +370,15 @@ static struct {
     int capture_profile;
     uint32_t capture_queries;
     uint64_t capture_gpu_runs, capture_gpu_ns[3];
+    uint32_t detail_queries, detail_kind[NVK_DETAIL_TS / 2u];
+    uint64_t detail_ns[4], detail_runs[4];
     uint64_t cpu_ns[NVK_CPU_PHASES], cpu_max[NVK_CPU_PHASES];
     uint64_t gpu_ns[NVK_GPU_PHASES], gpu_max[NVK_GPU_PHASES];
     uint64_t base_gpu_ns, phases_gpu_ns;
     VkQueryPool pool;
+    VkQueryPool submit_pool;
+    uint32_t submit_queries;
+    uint64_t timed_submits, submit_gpu_ns, submit_gpu_max_ns, submit_timing_overflow;
     int stamped;
 } P;
 
@@ -348,6 +392,24 @@ static void nvk_prof_stamp(unsigned index)
 {
     if (P.pool) vkCmdWriteTimestamp(R.cmd, index ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, P.pool, index);
 }
+
+/* Optional bounded GPU scopes. These deliberately serialize timestamps and
+ * are diagnostics only; performance runs leave capture profiling disabled. */
+static uint32_t nvk_detail_begin(uint32_t kind)
+{
+    if (!P.pool || !P.capture_profile || !R.recording || P.detail_queries + 2u > NVK_DETAIL_TS) return UINT32_MAX;
+    const uint32_t query = P.detail_queries;
+    P.detail_queries += 2u;
+    P.detail_kind[query / 2u] = kind;
+    nvk_prof_stamp(NVK_TS + NVK_CAPTURE_TS + query);
+    return query;
+}
+
+static void nvk_detail_end(uint32_t query)
+{
+    if (query != UINT32_MAX) nvk_prof_stamp(NVK_TS + NVK_CAPTURE_TS + query + 1u);
+}
+
 
 /* ---- failures ---------------------------------------------------------------------- */
 static int nvk_ok(VkResult result, const char *site)
@@ -497,6 +559,34 @@ static VkWriteDescriptorSet nvk_write_image(VkDescriptorSet set, uint32_t bindin
     return w;
 }
 
+/* Hints store indices, never borrowed VkDescriptorSets: pool reset and cache
+ * rollover replace the entries. Bounds and the entire key are checked before
+ * using an index, including fields omitted from this inexpensive hash. */
+static VkDescriptorSet nvk_set0_cached(const NvkSetKey *key, uint32_t *bucket)
+{
+    *bucket = 0u;
+    if (S.descriptor_hints) {
+        uint64_t hash = (uint64_t)(uintptr_t)key->dest ^ (uint64_t)(uintptr_t)key->scan_input;
+        hash ^= (uint64_t)(uintptr_t)key->hd * UINT64_C(0x9e3779b97f4a7c15);
+        hash ^= (uint64_t)(uintptr_t)key->params * UINT64_C(0x85ebca6b);
+        hash ^= (uint64_t)(uintptr_t)key->src ^ (uint64_t)(uintptr_t)key->filtered_sampler;
+        hash ^= hash >> 33u;
+        *bucket = (uint32_t)((hash * UINT64_C(0xff51afd7ed558ccd)) >> 54u);
+        const uint32_t hint = S.set0_hints[*bucket];
+        if (hint && hint <= S.set0_count && !memcmp(&S.set0[hint - 1u].key, key, sizeof(*key))) {
+            ++P.descriptor_hint_hits;
+            return S.set0[hint - 1u].set;
+        }
+        ++P.descriptor_hint_misses;
+    }
+    for (uint32_t i = S.set0_count; i-- > 0u;)
+        if (!memcmp(&S.set0[i].key, key, sizeof(*key))) {
+            if (S.descriptor_hints) S.set0_hints[*bucket] = (uint16_t)(i + 1u);
+            return S.set0[i].set;
+        }
+    return VK_NULL_HANDLE;
+}
+
 /* Set 0 of the native pipeline for the resources in R.key. */
 static VkDescriptorSet nvk_set0(const NvkSetKey *key)
 {
@@ -504,8 +594,9 @@ static VkDescriptorSet nvk_set0(const NvkSetKey *key)
     complete.capture_meta = key->capture_meta ? key->capture_meta : S.capture_meta.buffer ? S.capture_meta.buffer : S.dummy_texels.buffer;
     complete.capture_nodes = S.capture_nodes.buffer ? S.capture_nodes.buffer : S.dummy_texels.buffer;
     key = &complete;
-    for (uint32_t i = S.set0_count; i-- > 0u;)
-        if (!memcmp(&S.set0[i].key, key, sizeof(*key))) return S.set0[i].set;
+    uint32_t bucket;
+    const VkDescriptorSet cached = nvk_set0_cached(key, &bucket);
+    if (cached) return cached;
     if (S.set0_count == NVK_SET0_CACHE) {
         /* A work with this many distinct resource tuples starts over; the sets
          * it used are not recycled before the pool is reset, so allocate on. */
@@ -521,8 +612,10 @@ static VkDescriptorSet nvk_set0(const NvkSetKey *key)
     VkDescriptorImageInfo src_key = { S.sampler_clamp, key->src_key, g };
     VkDescriptorImageInfo hd = { key->hd_sampler, key->hd, g };
     VkDescriptorImageInfo mip = { key->filtered_sampler ? key->filtered_sampler : S.sampler_clamp,
-        key->filtered ? key->filtered : S.dummy_color.view, g };
-    VkWriteDescriptorSet w[12];
+        !S.decode_arrays && key->filtered ? key->filtered : S.dummy_color.view, g };
+    VkDescriptorImageInfo filtered = { key->filtered_sampler ? key->filtered_sampler : S.sampler_clamp,
+        S.filtered_array.view, g };
+    VkWriteDescriptorSet w[14];
     w[0] = nvk_write_image(set, 0u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &words);
     w[1] = nvk_write_image(set, 1u, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &dest);
     w[2] = nvk_write_image(set, 2u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &src);
@@ -537,7 +630,8 @@ static VkDescriptorSet nvk_set0(const NvkSetKey *key)
     w[7].pTexelBufferView = &key->recipe;
     const VkBufferView parameters = key->params ? key->params : S.dummy_view;
     w[8] = w[7]; w[8].dstBinding = 7u; w[8].pTexelBufferView = &parameters;
-    VkDescriptorImageInfo decoded = { S.sampler_clamp, key->decoded ? key->decoded : S.dummy_uint.view, g };
+    VkDescriptorImageInfo decoded = { S.sampler_clamp, !S.decode_arrays && key->decoded ? key->decoded : S.dummy_uint.view, g };
+    const VkDescriptorImageInfo decoded_array = { S.sampler_clamp, S.decoded_array.view, g };
     w[9] = nvk_write_image(set, 11u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &decoded);
     const VkDescriptorBufferInfo capture[2] = {
         { key->capture_meta, 0u, VK_WHOLE_SIZE }, { key->capture_nodes, 0u, VK_WHOLE_SIZE }
@@ -548,10 +642,13 @@ static VkDescriptorSet nvk_set0(const NvkSetKey *key)
         w[10u+i].dstSet = set; w[10u+i].dstBinding = 12u+i; w[10u+i].descriptorCount = 1u;
         w[10u+i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[10u+i].pBufferInfo = &capture[i];
     }
-    vkUpdateDescriptorSets(vk_core_device(), 12u, w, 0u, NULL);
+    w[12] = nvk_write_image(set, 14u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &filtered);
+    w[13] = nvk_write_image(set, 15u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &decoded_array);
+    vkUpdateDescriptorSets(vk_core_device(), 14u, w, 0u, NULL);
     S.set0[S.set0_count].key = *key;
     S.set0[S.set0_count].set = set;
     ++S.set0_count;
+    if (S.descriptor_hints) S.set0_hints[bucket] = (uint16_t)S.set0_count;
     return set;
 }
 
@@ -559,8 +656,9 @@ static VkDescriptorSet nvk_set0(const NvkSetKey *key)
  * parameter-record texel buffer. */
 static VkDescriptorSet nvk_set0_il(const NvkSetKey *key)
 {
-    for (uint32_t i = S.set0_count; i-- > 0u;)
-        if (!memcmp(&S.set0[i].key, key, sizeof(*key))) return S.set0[i].set;
+    uint32_t bucket;
+    const VkDescriptorSet cached = nvk_set0_cached(key, &bucket);
+    if (cached) return cached;
     if (S.set0_count == NVK_SET0_CACHE) S.set0_count = 0u;
     VkDescriptorSet set = nvk_set_alloc(S.dsl_il0);
     if (!set) return VK_NULL_HANDLE;
@@ -592,6 +690,7 @@ static VkDescriptorSet nvk_set0_il(const NvkSetKey *key)
     S.set0[S.set0_count].key = *key;
     S.set0[S.set0_count].set = set;
     ++S.set0_count;
+    if (S.descriptor_hints) S.set0_hints[bucket] = (uint16_t)S.set0_count;
     return set;
 }
 
@@ -601,8 +700,9 @@ static VkDescriptorSet nvk_scan_set0(VkImageView input)
     NvkSetKey key;
     memset(&key, 0, sizeof(key));
     key.scan_input = input;
-    for (uint32_t i = S.set0_count; i-- > 0u;)
-        if (!memcmp(&S.set0[i].key, &key, sizeof(key))) return S.set0[i].set;
+    uint32_t bucket;
+    const VkDescriptorSet cached = nvk_set0_cached(&key, &bucket);
+    if (cached) return cached;
     if (S.set0_count == NVK_SET0_CACHE) S.set0_count = 0u;
     VkDescriptorSet set = nvk_set_alloc(S.dsl_scan0);
     if (!set) return VK_NULL_HANDLE;
@@ -612,6 +712,7 @@ static VkDescriptorSet nvk_scan_set0(VkImageView input)
     S.set0[S.set0_count].key = key;
     S.set0[S.set0_count].set = set;
     ++S.set0_count;
+    if (S.descriptor_hints) S.set0_hints[bucket] = (uint16_t)S.set0_count;
     return set;
 }
 
@@ -743,7 +844,16 @@ static void nvk_plane_barrier_clear(NvkPlane *p)
 }
 
 /* GL native_gpu_blit / native_gpu_blit_depth for a whole plane. */
+static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, int depth);
+
 static void nvk_plane_copy(const NvkPlane *source, NvkPlane *destination, int depth)
+{
+    const uint32_t query = nvk_detail_begin(0u);
+    nvk_plane_copy_impl(source, destination, depth);
+    nvk_detail_end(query);
+}
+
+static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, int depth)
 {
     if (depth) {
         free(destination->depth_max); destination->depth_max = NULL;
@@ -773,6 +883,8 @@ static void nvk_plane_copy(const NvkPlane *source, NvkPlane *destination, int de
  * so the GPU starts before the journal is fully recorded. They are reset when the next work starts. */
 enum { NVK_SUBMIT_DRAWS = 2048, NVK_SUBMIT_DRAWS_IL = 1024 };
 
+static int nvk_require_vertices(void);
+
 static int nvk_cmd_begin(void)
 {
     if (R.cmd_used == S.cmd_count) {
@@ -790,20 +902,224 @@ static int nvk_cmd_begin(void)
     R.cmd = S.cmds[R.cmd_used++];
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    return nvk_ok(vkResetCommandBuffer(R.cmd, 0), "vkResetCommandBuffer") &&
-           nvk_ok(vkBeginCommandBuffer(R.cmd, &bi), "vkBeginCommandBuffer");
+    if (!nvk_ok(vkResetCommandBuffer(R.cmd, 0), "vkResetCommandBuffer") ||
+        !nvk_ok(vkBeginCommandBuffer(R.cmd, &bi), "vkBeginCommandBuffer")) return 0;
+    R.submit_query = UINT32_MAX;
+    if (P.submit_pool) {
+        if (R.cmd_used == 1u) {
+            P.submit_queries = 0u;
+            vkCmdResetQueryPool(R.cmd, P.submit_pool, 0u, NVK_SUBMIT_TS);
+        }
+        if (P.submit_queries + 2u <= NVK_SUBMIT_TS) {
+            R.submit_query = P.submit_queries;
+            P.submit_queries += 2u;
+            vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P.submit_pool, R.submit_query);
+        } else ++P.submit_timing_overflow;
+    }
+    return 1;
+}
+
+/* Preserve executor FIFO order while letting its CPU record ahead of the
+ * bounded GPU queue. Only the final submit (or a full CPU ring) must wait.
+ * All command buffers/resources still belong to this one work until its
+ * final fence completes; presentation can use already completed endpoints
+ * between these submissions. */
+static uint32_t nvk_pace_window(void)
+{
+    if (!S.pace_margin_ns || S.pace_limit < 2u || !R.work) return S.pace_limit;
+    const uint64_t deadline = R.work->timing.deadline_ns;
+    const uint64_t now = SDL_GetTicksNS();
+    /* Keep space for presentation while this work is comfortably early.
+     * Restore the configured overlap when its existing deadline approaches;
+     * never move that deadline or discard authored phases to meet the target. */
+    return deadline > now && deadline - now > S.pace_margin_ns ? 1u : S.pace_limit;
+}
+
+/* Optional submit-only worker. Recording and resource allocation stay on the
+ * executor thread. A fixed GPU window is replenished as soon as its oldest
+ * fence completes, even while that executor is recording the next phase. */
+static struct {
+    SDL_mutex *mutex;
+    SDL_cond *condition;
+    SDL_Thread *thread;
+    struct { VkCommandBuffer cmd; VkFence fence; } entries[64];
+    uint32_t head, count;
+    int run;
+    VkResult result;
+} SQ;
+
+static int nvk_submit_thread(void *unused)
+{
+    (void)unused;
+    SDL_LockMutex(SQ.mutex);
+    while (SQ.run) {
+        while (SQ.run && (!SQ.count || SQ.result != VK_SUCCESS))
+            SDL_CondWait(SQ.condition, SQ.mutex);
+        if (!SQ.run) break;
+        const VkCommandBuffer cmd = SQ.entries[SQ.head].cmd;
+        VkFence fence = SQ.entries[SQ.head].fence;
+        SDL_UnlockMutex(SQ.mutex);
+        VkResult result = VK_SUCCESS;
+        while (S.pace_count >= S.pace_limit) {
+            VkFence oldest = S.pace_fences[S.pace_head];
+            result = vkWaitForFences(vk_core_device(), 1u, &oldest, VK_TRUE, UINT64_MAX);
+            if (result != VK_SUCCESS) break;
+            S.pace_head = (S.pace_head + 1u) % S.pace_limit;
+            --S.pace_count;
+        }
+        const int paced = fence == VK_NULL_HANDLE;
+        if (result == VK_SUCCESS && paced) {
+            fence = S.pace_fences[(S.pace_head + S.pace_count) % S.pace_limit];
+            result = vkResetFences(vk_core_device(), 1u, &fence);
+        }
+        if (result == VK_SUCCESS) {
+            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            si.commandBufferCount = 1u; si.pCommandBuffers = &cmd;
+            result = vk_core_submit(1u, &si, fence);
+            if (result == VK_SUCCESS) {
+                S.pace_count += paced;
+                ++P.submissions;
+            }
+        }
+        SDL_LockMutex(SQ.mutex);
+        SQ.result = result;
+        SQ.head = (SQ.head + 1u) % 64u;
+        --SQ.count;
+        if (result != VK_SUCCESS) SQ.count = 0u;
+        SDL_CondBroadcast(SQ.condition);
+    }
+    SDL_UnlockMutex(SQ.mutex);
+    return 0;
+}
+
+static int nvk_submit_thread_sync(void)
+{
+    if (!SQ.thread) return 1;
+    SDL_LockMutex(SQ.mutex);
+    while (SQ.count && SQ.result == VK_SUCCESS)
+        SDL_CondWait(SQ.condition, SQ.mutex);
+    const VkResult result = SQ.result;
+    SDL_UnlockMutex(SQ.mutex);
+    return nvk_ok(result, "native submit worker");
+}
+
+static int nvk_submit_thread_enqueue(VkCommandBuffer cmd, VkFence fence)
+{
+    SDL_LockMutex(SQ.mutex);
+    while (SQ.count == 64u && SQ.result == VK_SUCCESS)
+        SDL_CondWait(SQ.condition, SQ.mutex);
+    const VkResult result = SQ.result;
+    if (result == VK_SUCCESS) {
+        const uint32_t tail = (SQ.head + SQ.count) % 64u;
+        SQ.entries[tail].cmd = cmd; SQ.entries[tail].fence = fence;
+        ++SQ.count;
+        SDL_CondBroadcast(SQ.condition);
+    }
+    SDL_UnlockMutex(SQ.mutex);
+    /* A returned final fence must already have been submitted. All its
+     * predecessors retain their buffers/images until that fence completes. */
+    return nvk_ok(result, "native submit enqueue") && (!fence || nvk_submit_thread_sync());
+}
+
+static void nvk_submit_thread_stop(void)
+{
+    if (SQ.thread) {
+        (void)nvk_submit_thread_sync();
+        SDL_LockMutex(SQ.mutex);
+        SQ.run = 0;
+        SDL_CondBroadcast(SQ.condition);
+        SDL_UnlockMutex(SQ.mutex);
+        SDL_WaitThread(SQ.thread, NULL);
+    }
+    if (SQ.condition) SDL_DestroyCond(SQ.condition);
+    if (SQ.mutex) SDL_DestroyMutex(SQ.mutex);
+    memset(&SQ, 0, sizeof(SQ));
+}
+
+static int nvk_pending_submit_drain(int blocking)
+{
+    while (S.pending_count) {
+        while (S.pace_count >= nvk_pace_window()) {
+            VkFence oldest = S.pace_fences[S.pace_head];
+            VkResult status = vkGetFenceStatus(vk_core_device(), oldest);
+            if (status == VK_NOT_READY) {
+                if (!blocking) return 1;
+                status = vkWaitForFences(vk_core_device(), 1u, &oldest, VK_TRUE, UINT64_MAX);
+            }
+            if (!nvk_ok(status, "deferred native queue pace")) return 0;
+            S.pace_head = (S.pace_head + 1u) % S.pace_limit;
+            --S.pace_count;
+        }
+        const uint32_t head = S.pending_head;
+        VkFence fence = S.pending_submits[head].fence;
+        const int paced = fence == VK_NULL_HANDLE;
+        if (paced) {
+            fence = S.pace_fences[(S.pace_head + S.pace_count) % S.pace_limit];
+            if (!nvk_ok(vkResetFences(vk_core_device(), 1u, &fence), "deferred native pace reset")) return 0;
+        }
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1u; si.pCommandBuffers = &S.pending_submits[head].cmd;
+        if (!nvk_ok(vk_core_submit(1u, &si, fence), "deferred native submit")) return 0;
+        S.pace_count += paced;
+        if (S.pace_margin_ns) {
+            if (S.pace_count <= 1u) ++P.narrow_submits;
+            else ++P.wide_submits;
+        }
+        ++P.submissions;
+        S.pending_head = (head + 1u) % 64u;
+        --S.pending_count;
+    }
+    return 1;
 }
 
 /* Ends and submits the recording so far (outside a render pass) and opens the next command buffer. */
 static int nvk_submit_partial(VkFence fence)
 {
     nvk_pass_end();
+    if (R.submit_query != UINT32_MAX)
+        vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, P.submit_pool, R.submit_query + 1u);
     if (!nvk_ok(vkEndCommandBuffer(R.cmd), "vkEndCommandBuffer")) return 0;
     for (uint32_t i = 0u; i < S.chunk_count && S.chunks[i].cursor; ++i)
         vk_core_buffer_flush(&S.chunks[i].buf, 0, S.chunks[i].cursor);
+    if (SQ.thread) {
+        if (!nvk_submit_thread_enqueue(R.cmd, fence)) return 0;
+        R.since_submit = 0u;
+        return fence ? 1 : nvk_cmd_begin();
+    }
+    if (S.defer_submits) {
+        if (S.pending_count == 64u && !nvk_pending_submit_drain(1)) return 0;
+        const uint32_t tail = (S.pending_head + S.pending_count) % 64u;
+        S.pending_submits[tail].cmd = R.cmd;
+        S.pending_submits[tail].fence = fence;
+        ++S.pending_count;
+        if (!nvk_pending_submit_drain(fence != VK_NULL_HANDLE)) return 0;
+        R.since_submit = 0u;
+        return fence ? 1 : nvk_cmd_begin();
+    }
+    /* Bound queued executor batches while allowing CPU recording and GPU
+     * execution to overlap. Waiting on every batch starves the phase compiler;
+     * a small ring allows presentation to interleave without that serialization. */
+    while (S.pace_limit && S.pace_count >= nvk_pace_window()) {
+        VkFence oldest = S.pace_fences[S.pace_head];
+        if (!nvk_ok(vkWaitForFences(vk_core_device(), 1u, &oldest, VK_TRUE, UINT64_MAX), "native queue pace")) return 0;
+        S.pace_head = (S.pace_head + 1u) % S.pace_limit;
+        --S.pace_count;
+    }
+    VkFence submitted = fence;
+    const int paced = !submitted && S.pace_limit;
+    if (paced) {
+        submitted = S.pace_fences[(S.pace_head + S.pace_count) % S.pace_limit];
+        if (!nvk_ok(vkResetFences(vk_core_device(), 1u, &submitted), "native pace fence reset")) return 0;
+    }
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1u; si.pCommandBuffers = &R.cmd;
-    if (!nvk_ok(vk_core_submit(1u, &si, fence), "vk_core_submit")) return 0;
+    if (!nvk_ok(vk_core_submit(1u, &si, submitted), "vk_core_submit")) return 0;
+    if (paced) ++S.pace_count;
+    if (S.pace_margin_ns) {
+        if (S.pace_count <= 1u) ++P.narrow_submits;
+        else ++P.wide_submits;
+    }
+    ++P.submissions;
     R.since_submit = 0u;
     return fence ? 1 : nvk_cmd_begin();
 }
@@ -872,11 +1188,11 @@ static void nvk_pass_end(void)
      * run ahead of the preceding colour/fragment tail. ALL_GRAPHICS also
      * protects earlier vertex reads against later buffer overwrites. */
     VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | (R.capture_active ? 0u : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
         VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+    vkCmdPipelineBarrier(R.cmd, R.capture_active ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         0u, 1u, &barrier, 0u, NULL, 0u, NULL);
@@ -1045,7 +1361,7 @@ static int nvk_il_flush(void)
         const uint32_t first = IB.first[d];
         uint32_t count = IB.count[d++];
         while (d < draw_count && IB.first[d] == first + count) count += IB.count[d++];
-        vkCmdDraw(R.cmd, count, 1u, first, 0u);
+        ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
     }
     return 1;
 }
@@ -1079,7 +1395,7 @@ static int nvk_il_add(NvkPlane *plane, const int32_t scissor[4], uint32_t first,
     return 1;
 }
 
-enum { NVK_CORE_BATCH_TRIANGLES = 512, NVK_CORE_TRIANGLE_TEXELS = 10 };
+enum { NVK_CORE_BATCH_TRIANGLES = 512, NVK_CORE_TRIANGLE_TEXELS = 12 };
 typedef struct NvkCoreBatch {
     NvkView view;
     NvkDraw draw;
@@ -1100,12 +1416,12 @@ static uint32_t s_capture_batch_count;
 
 static VkPipeline nvk_material_pipeline(int key_attached, int batch, const NvkDraw *draw, const NvkView *view);
 
-static int nvk_core_batch_emit(void)
+static int nvk_core_batch_emit(NvkCoreBatch *batch)
 {
-    const uint32_t triangles = CB.triangles;
+    const uint32_t triangles = batch->triangles;
     if (!triangles) return 1;
-    CB.triangles = 0u;
-    const VkDeviceSize bytes = (VkDeviceSize)triangles * sizeof(CB.records[0]);
+    batch->triangles = 0u;
+    const VkDeviceSize bytes = (VkDeviceSize)triangles * sizeof(batch->records[0]);
     /* Parameter views cover the first arena chunk's worth of texels, including
      * when a larger transfer allocation made an oversized arena buffer. */
     if (S.chunk_cur < S.chunk_count && S.chunks[S.chunk_cur].cursor + bytes + 16u > NVK_ARENA_CHUNK) ++S.chunk_cur;
@@ -1113,18 +1429,18 @@ static int nvk_core_batch_emit(void)
     VkDeviceSize offset;
     uint8_t *records = nvk_arena(bytes, 16u, &chunk, &offset);
     if (!records || offset + bytes > NVK_ARENA_CHUNK) return 0;
-    memcpy(records, CB.records, (size_t)bytes);
-    NvkSetKey key = CB.key;
+    memcpy(records, batch->records, (size_t)bytes);
+    NvkSetKey key = batch->key;
     key.params = nvk_chunk_params_view(chunk);
     if (!key.params) return 0;
     const uint32_t record_base = (uint32_t)(offset / 16u);
-    const VkDeviceSize vertex_bytes = (VkDeviceSize)triangles * 3u * sizeof(CB.vertices[0]);
+    const VkDeviceSize vertex_bytes = (VkDeviceSize)triangles * 3u * sizeof(batch->vertices[0]);
     uint8_t *vertices = nvk_arena(vertex_bytes, 16u, &chunk, &offset);
     if (!vertices) return 0;
-    memcpy(vertices, CB.vertices, (size_t)vertex_bytes);
+    memcpy(vertices, batch->vertices, (size_t)vertex_bytes);
     const VkBuffer vertex_buffer = S.chunks[chunk].buf.buffer;
     const VkDeviceSize vertex_offset = offset;
-    VkPipeline pipeline = nvk_material_pipeline(CB.key_attached, 1, &CB.draw, &CB.view);
+    VkPipeline pipeline = nvk_material_pipeline(batch->key_attached, 1, &batch->draw, &batch->view);
     if (R.b.pipeline != pipeline) {
         vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         R.b.pipeline = pipeline;
@@ -1137,32 +1453,31 @@ static int nvk_core_batch_emit(void)
     }
     uint8_t *uniform = nvk_arena(NVK_SLOT, NVK_SLOT_ALIGN, &chunk, &offset);
     if (!uniform) return 0;
-    memcpy(uniform, &CB.view, sizeof(CB.view));
-    memcpy(uniform + NVK_SLOT_ALIGN, &CB.draw, sizeof(CB.draw));
+    memcpy(uniform, &batch->view, sizeof(batch->view));
+    memcpy(uniform + NVK_SLOT_ALIGN, &batch->draw, sizeof(batch->draw));
     VkDescriptorSet set1 = nvk_chunk_set(chunk, 0);
     if (!set1) return 0;
     const uint32_t offsets[2] = { (uint32_t)offset, (uint32_t)offset + NVK_SLOT_ALIGN };
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pl_core_batch, 1u, 1u, &set1, 2u, offsets);
-    R.b.v = CB.view; R.b.d = CB.draw; R.b.slot_valid = 1;
+    R.b.v = batch->view; R.b.d = batch->draw; R.b.slot_valid = 1;
     vkCmdPushConstants(R.cmd, S.pl_core_batch, VK_SHADER_STAGE_VERTEX_BIT, 0u, sizeof(record_base), &record_base);
     if (R.capture_active) vkCmdPushConstants(R.cmd, S.pl_core_batch, VK_SHADER_STAGE_FRAGMENT_BIT,
         4u, sizeof(R.capture_push.rect), R.capture_push.rect);
     vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &vertex_buffer, &vertex_offset);
     R.b.vbuf = vertex_buffer; R.b.voff = vertex_offset;
-    nvk_scissor(CB.plane, CB.scissor);
-    vkCmdDraw(R.cmd, triangles * 3u, 1u, 0u, 0u);
+    nvk_scissor(batch->plane, batch->scissor);
+    ++P.draw_calls; vkCmdDraw(R.cmd, triangles * 3u, 1u, 0u, 0u);
     ++P.core_batches; P.core_batch_triangles += triangles;
+    const unsigned category = R.capture_active ? 0u : batch->draw.hd_on ? 1u : 2u;
+    ++P.batch_draws[category]; P.batch_triangles[category] += triangles;
     return 1;
 }
 
 static int nvk_core_batch_flush(void)
 {
-    if (!nvk_core_batch_emit()) return 0;
-    for (uint32_t i = 0u; i < s_capture_batch_count; ++i) {
-        CB = *s_capture_batches[i];
-        s_capture_batches[i]->triangles = 0u;
-        if (!nvk_core_batch_emit()) return 0;
-    }
+    if (!nvk_core_batch_emit(&CB)) return 0;
+    for (uint32_t i = 0u; i < s_capture_batch_count; ++i)
+        if (!nvk_core_batch_emit(s_capture_batches[i])) return 0;
     s_capture_batch_count = 0u;
     return 1;
 }
@@ -1205,6 +1520,16 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
         if (material.decoded_on) { memset(material.page, 0, sizeof(material.page)); material.u_depth = 0; }
         else if ((material.u_depth & 3) >= 2) material.page[2] = material.page[3] = 0;
     }
+    /* Page, palette and texture-window coordinates travel with each triangle.
+     * They do not require a new draw when the sampled image is unchanged. */
+    memset(material.page, 0, sizeof(material.page));
+    memset(material.window, 0, sizeof(material.window));
+    if (material.hd_on) {
+        memset(material.hd_map, 0, sizeof(material.hd_map));
+        memset(material.hd_lim, 0, sizeof(material.hd_lim));
+        material.anisotropy = material.texture_filter = 0;
+        material.filter_strength = 0.f;
+    }
     NvkCoreBatch *batch = &CB;
     if (R.capture_active && S.sort_capture) {
         uint32_t i = 0u;
@@ -1221,8 +1546,7 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
         }
         batch = s_capture_batches[i];
         if (batch->triangles == NVK_CORE_BATCH_TRIANGLES) {
-            CB = *batch; batch->triangles = 0u;
-            if (!nvk_core_batch_emit()) return 0;
+            if (!nvk_core_batch_emit(batch)) return 0;
         }
     } else if (CB.triangles && (CB.triangles == NVK_CORE_BATCH_TRIANGLES ||
         !nvk_core_batch_matches(&CB, plane, key_attached, scissor, &material))) {
@@ -1233,7 +1557,7 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
         batch->view = R.v; batch->draw = material;
         memcpy(batch->scissor, scissor, sizeof(batch->scissor));
     }
-    if (!R.cpu_vertices) return 0;
+    if (!R.vsrc.vertices) return 0;
     uint32_t (*record)[4] = batch->records[batch->triangles];
     memcpy(record[0], R.d.sample_lim, 16u);
     memcpy(record[1], R.d.depth_plane, 16u);
@@ -1243,6 +1567,15 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
     record[4][2] = R.capture_active ? ++R.capture_order : 0u;
     record[4][3] = !R.capture_active && R.damage_shader_active ? R.damage_word_offset + 1u : 0u;
     memcpy(record[5], R.d.attribute_origin[2] == 1.f ? (void *)R.d.attribute_dda : (void *)R.d.attribute_plane, 80u);
+    memcpy(record[10], R.d.page, sizeof(R.d.page));
+    memcpy(record[11], R.d.window, sizeof(R.d.window));
+    if (R.d.hd_on) {
+        /* HD sampling uses derivatives of its own coordinates, not the
+         * guest anisotropic gradient. The attribute planes consume xyz;
+         * their spare w lanes can hold the per-triangle HD clamp. */
+        memcpy(record[3], R.d.hd_map, sizeof(R.d.hd_map));
+        for (unsigned i = 0u; i < 4u; ++i) record[5u+i][3] = (uint32_t)R.d.hd_lim[i];
+    }
     if (R.capture_active && S.direct_capture) {
         const int32_t *r = R.capture_push.rect;
         const int x0 = R.draw_bounds[0] > r[0] ? R.draw_bounds[0] : r[0];
@@ -1256,7 +1589,7 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
         record[7][3] = width; record[8][3] = 1u; record[9][3] = height;
         R.capture_reserved += (uint64_t)width * height;
     }
-    memcpy(batch->vertices + batch->triangles * 3u, R.cpu_vertices + first, 3u * sizeof(batch->vertices[0]));
+    memcpy(batch->vertices + batch->triangles * 3u, R.vsrc.vertices + first, 3u * sizeof(batch->vertices[0]));
     ++batch->triangles;
     return 1;
 }
@@ -1283,6 +1616,7 @@ static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scis
     ++R.since_submit;
     nvk_pass_begin(plane);
     if (S.interlock) {
+        if (!nvk_require_vertices()) return 0;
         R.key.dest = plane->color.view;
         R.key.dest_key = plane->key.view;
         R.key.recipe = R.recipe;
@@ -1303,12 +1637,13 @@ static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scis
             R.b.vbuf = R.vsrc.buf; R.b.voff = R.vsrc.off;
         }
         nvk_scissor(plane, scissor);
-        vkCmdDraw(R.cmd, count, 1u, first, 0u);
+        ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
         return 1;
     }
     R.key.dest = plane->color.view; R.key.dest_key = plane->key.view; R.key.recipe = R.recipe; R.key.params = VK_NULL_HANDLE;
     R.key.capture_meta = R.damage_shader_active && !R.capture_active ? R.damage_buffer : VK_NULL_HANDLE;
     if (S.core_batch && R.batchable && count == 3u) return nvk_core_batch_add(plane, key_attached, scissor, first);
+    if (!nvk_require_vertices()) return 0;
     if (!nvk_core_batch_flush()) return 0;
     VkPipeline pipeline = nvk_material_pipeline(key_attached, 0, &R.d, &R.v);
     if (R.b.pipeline != pipeline) {
@@ -1342,7 +1677,7 @@ static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scis
         R.b.vbuf = R.vsrc.buf; R.b.voff = R.vsrc.off;
     }
     nvk_scissor(plane, scissor);
-    vkCmdDraw(R.cmd, count, 1u, first, 0u);
+    ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
     return 1;
 }
 
@@ -1356,6 +1691,51 @@ static int nvk_damage_intersects(int left, int top, int right, int bottom)
         if (left < r[0] + r[2] && right > r[0] && top < r[1] + r[3] && bottom > r[1]) return 1;
     }
     return 0;
+}
+
+/* An unconditional rectangular fill does not need the textured fragment
+ * program once per damage rectangle. Clear both color attachments in raster
+ * order, preserving the exact union of covered pixels and all later hazards.
+ * The caller has prepared the same target/depth state as the draw path. */
+static int nvk_clear_span(NvkPlane *plane, const GlNativeGpuCommand *command, unsigned depth)
+{
+    if (!nvk_core_batch_flush() || !nvk_il_flush()) return 0;
+    VkClearRect rects[sizeof(R.damage_rects) / sizeof(R.damage_rects[0])];
+    uint32_t count = 0u;
+    const int damaged = R.damage_active && plane == &R.planes[R.damage_plane];
+    const uint32_t begin = damaged && R.damage_region >= 0 ? (uint32_t)R.damage_region : 0u;
+    const uint32_t end = !damaged ? 1u : R.damage_region >= 0 ? begin + 1u : R.damage_count;
+    for (uint32_t i = begin; i < end; ++i) {
+        int x0 = R.draw_bounds[0], y0 = R.draw_bounds[1];
+        int x1 = R.draw_bounds[2], y1 = R.draw_bounds[3];
+        if (damaged) {
+            const int32_t *r = R.damage_rects[i];
+            if (x0 < r[0]) x0 = r[0]; if (y0 < r[1]) y0 = r[1];
+            if (x1 > r[0] + r[2]) x1 = r[0] + r[2];
+            if (y1 > r[1] + r[3]) y1 = r[1] + r[3];
+        }
+        if (x0 >= x1 || y0 >= y1) continue;
+        rects[count++] = (VkClearRect){
+            .rect = { { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } },
+            .baseArrayLayer = 0u, .layerCount = 1u,
+        };
+    }
+    if (count) {
+        VkClearAttachment clear[2] = {
+            { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0u },
+            { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 1u },
+        };
+        float *rgba = clear[0].clearValue.color.float32;
+        for (uint32_t i = 0u; i < 4u; ++i) rgba[i] = ((command->color >> (8u * i)) & 255u) / 255.f;
+        /* Native alpha encodes mask/AA flags, rather than opacity. */
+        if (command->mask & 1u)
+            rgba[3] = rgba[3] > .83f || (rgba[3] > .16f && rgba[3] < .5f) ? 1.f : 2.f / 3.f;
+        nvk_pass_begin(plane);
+        vkCmdClearAttachments(R.cmd, (depth & NVK_UNIFORM_DEPTH_ATTACHED) ? 2u : 1u, clear, count, rects);
+        ++P.cleared_spans; P.cleared_rects += count;
+    }
+    ++R.c.transfer_draws;
+    return 1;
 }
 
 static int nvk_draw(NvkPlane *plane, int key_attached, const int32_t scissor[4], uint32_t first, uint32_t count)
@@ -1594,16 +1974,52 @@ static VkImageView nvk_decoded_page(const XgRenderIrMaterialState *material, uin
             if (S.decoded_work[i].key[5] == 0) S.decoded_work[i] = S.decoded_work[--S.decoded_work_count];
             else ++i;
         S.decoded_base_generation = S.words_generation;
+        /* Removing base references can make a previously full table admit a
+         * missing key. Drop negative hints as well as displaced indices. */
+        memset(S.decoded_work_hints, 0, sizeof(S.decoded_work_hints));
     }
     const int depth = material->texture_depth < 2 ? material->texture_depth : 2;
     const int32_t key[6] = { (material->texture_page_x * 64) & 1023, (material->texture_page_y * 256) & 511,
         depth < 2 ? material->clut_x & 1023 : 0, depth < 2 ? material->clut_y & 511 : 0, depth, (int32_t)snapshot };
-    for (uint32_t i = 0u; i < S.decoded_work_count; ++i)
-        if (!memcmp(S.decoded_work[i].key, key, sizeof(key))) {
-            *filtered = S.decoded[S.decoded_work[i].entry].filtered.view;
-            return S.decoded[S.decoded_work[i].entry].image.view;
+    /* The work cache is immutable between base-word updates, but this lookup
+     * runs for every triangle. A hint avoids scanning up to 64 keys each time.
+     * Full-key validation is essential: base invalidation swaps entries, and
+     * hash collisions must never reuse a different page or palette. */
+    const uint32_t packed = (uint32_t)(key[0] >> 6) | (uint32_t)(key[1] >> 8) << 4u |
+        (uint32_t)key[2] << 5u | (uint32_t)key[3] << 15u | (uint32_t)depth << 24u;
+    const uint32_t bucket = ((packed ^ snapshot * UINT32_C(0x9e3779b9)) * UINT32_C(0x85ebca6b)) >> 24u;
+    uint32_t found = S.decode_hints ? S.decoded_work_hints[bucket] : 0u;
+    if (found == UINT8_MAX && !memcmp(S.decoded_missing_keys[bucket], key, sizeof(key))) {
+        ++P.decoded_negative_hits;
+        return VK_NULL_HANDLE;
+    }
+    if (found && found <= S.decoded_work_count &&
+        !memcmp(S.decoded_work[found - 1u].key, key, sizeof(key))) {
+        ++P.decoded_hint_hits;
+    } else {
+        if (S.decode_hints) ++P.decoded_hint_misses;
+        found = 0u;
+        for (uint32_t i = 0u; i < S.decoded_work_count; ++i)
+            if (!memcmp(S.decoded_work[i].key, key, sizeof(key))) { found = i + 1u; break; }
+    }
+    if (found) {
+        if (S.decode_hints) S.decoded_work_hints[bucket] = (uint8_t)found;
+        S.decoded_layer = S.decoded_work[found - 1u].entry;
+        *filtered = S.decode_arrays ? (S.hardware_aniso ? S.filtered_array.view : VK_NULL_HANDLE)
+            : S.decoded[S.decoded_layer].filtered.view;
+        return S.decode_arrays ? S.decoded_array.view : S.decoded[S.decoded_layer].image.view;
+    }
+    if (S.decoded_work_count == 64u) {
+        ++P.decoded_work_full;
+        if (S.decode_hints) {
+            /* No reference can be admitted until base invalidation or the
+             * next work, both of which clear all hints. Preserve the original
+             * raw sampling fallback without rescanning 64 keys per triangle. */
+            memcpy(S.decoded_missing_keys[bucket], key, sizeof(key));
+            S.decoded_work_hints[bucket] = UINT8_MAX;
         }
-    if (S.decoded_work_count == 64u) return VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
     const uint16_t *source = snapshot ? R.work->phase_textures->words + (size_t)(snapshot - 1u) * VRAM_W * VRAM_H : S.upload_words;
     const uint32_t source_words = (64u << depth) * 256u + (depth == 0 ? 16u : depth == 1 ? 256u : 0u);
     uint32_t index = UINT32_MAX, replacement = UINT32_MAX;
@@ -1620,7 +2036,7 @@ static VkImageView nvk_decoded_page(const XgRenderIrMaterialState *material, uin
     }
     if (replacement != UINT32_MAX) index = replacement;
     else if (S.decoded_count < 64u) index = S.decoded_count++;
-    else return VK_NULL_HANDLE;
+    else { ++P.decoded_slots_full; return VK_NULL_HANDLE; }
     S.decoded[index].valid = 0;
     if (S.persistent_decode) {
         if (S.decoded[index].source_words != source_words) {
@@ -1630,17 +2046,17 @@ static VkImageView nvk_decoded_page(const XgRenderIrMaterialState *material, uin
         }
         (void)nvk_decoded_source(S.decoded[index].source, source, key, 1);
     }
-    VkCoreImage *image = &S.decoded[index].image;
+    VkCoreImage *image = S.decode_arrays ? &S.decoded_array : &S.decoded[index].image;
+    VkCoreImage *color = S.decode_arrays ? &S.filtered_array : &S.decoded[index].filtered;
     nvk_pass_end();
     if (!image->image) {
         if (!vk_core_image_create(image, VK_FORMAT_R32_UINT, 256u, 256u, 1u,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "native decoded palette")) return VK_NULL_HANDLE;
         vk_core_image_barrier(R.cmd, image->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     }
-    VkCoreImage *color = &S.decoded[index].filtered;
     if (S.hardware_aniso && !color->image) {
         if (!vk_core_image_create(color, VK_FORMAT_R8G8B8A8_UNORM, 256u, 256u, 1u,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "native filterable palette")) return VK_NULL_HANDLE;
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "native filtered palette")) return VK_NULL_HANDLE;
         vk_core_image_barrier(R.cmd, color->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     }
     VkDescriptorSet set = nvk_set_alloc(S.dsl_decode);
@@ -1661,18 +2077,22 @@ static VkImageView nvk_decoded_page(const XgRenderIrMaterialState *material, uin
     vkUpdateDescriptorSets(vk_core_device(), S.hardware_aniso ? 4u : 2u, writes, 0u, NULL);
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipe_decode);
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pl_decode, 0u, 1u, &set, 0u, NULL);
-    vkCmdPushConstants(R.cmd, S.pl_decode, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(key), key);
+    int32_t parameters[7];
+    memcpy(parameters, key, sizeof(key)); parameters[6] = (int32_t)index;
+    vkCmdPushConstants(R.cmd, S.pl_decode, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(parameters), parameters);
     vkCmdDispatch(R.cmd, 32u, 32u, 1u);
     nvk_barrier_all();
     memcpy(S.decoded[index].key, key, sizeof(S.decoded[index].key));
     S.decoded[index].valid = 1;
     ++P.decoded_pages;
 decoded_ready:
-    *filtered = S.decoded[index].filtered.view;
+    S.decoded_layer = index;
+    *filtered = S.decode_arrays ? (S.hardware_aniso ? S.filtered_array.view : VK_NULL_HANDLE) : S.decoded[index].filtered.view;
     S.decoded[index].used = S.decoded_generation;
     memcpy(S.decoded_work[S.decoded_work_count].key, key, sizeof(key));
     S.decoded_work[S.decoded_work_count++].entry = index;
-    return S.decoded[index].image.view;
+    if (S.decode_hints) S.decoded_work_hints[bucket] = (uint8_t)S.decoded_work_count;
+    return S.decode_arrays ? S.decoded_array.view : S.decoded[index].image.view;
 }
 
 /* ---- draw / transfer commands (GL native_gpu_render_layer) --------------------------------------------------- */
@@ -1777,7 +2197,7 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
         /* Interlock tier: a command without replacement textures starts from zeroed uniforms and its triangles go
          * through the batch; the loose state of the other draws is kept aside (GL native_gpu_parameter_capture). */
         const int batched = (S.interlock || (S.core_batch && R.scheduled_run && !lines)) &&
-            !wire && !draw->hd_texture.valid && !command->source;
+            !wire && (!draw->hd_texture.valid || (S.core_batch && S.hd_batch && !R.capture_active)) && !command->source;
         NvkView saved_view = R.v;
         NvkDraw saved_draw = R.d;
         if (batched) { memset(&R.v, 0, sizeof(R.v)); memset(&R.d, 0, sizeof(R.d)); }
@@ -1816,8 +2236,19 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
                      * below one covers float rounding in the vertex shader:
                      * these affine triangles provably never take extra taps.
                      * Specializing them avoids the loop's register footprint. */
-                    const double trace = (double)ax*ax + (double)ay*ay + (double)bx*bx + (double)by*by;
-                    if (trace < 0.98) { anisotropy_value = 0; ++P.aniso_single_tap_triangles; }
+                    const double xx = (double)ax*ax + (double)ay*ay;
+                    const double yy = (double)bx*bx + (double)by*by;
+                    const double trace = xx + yy;
+                    double upper = trace;
+                    if (S.aniso_single_tap == 2 && trace >= 0.98 && trace < 1.96) {
+                        /* The trace bound can reject a magnified footprint
+                         * with two similar axes. Use its major eigenvalue
+                         * only in that narrow ambiguous range; retain the
+                         * same conservative margin and affine-only guard. */
+                        const double xy = (double)ax*bx + (double)ay*by;
+                        upper = 0.5 * (trace + sqrt((xx-yy)*(xx-yy) + 4.0*xy*xy));
+                    }
+                    if (upper < 0.98) { anisotropy_value = 0; ++P.aniso_single_tap_triangles; }
                 }
             }
             const int uv_gradient = !lines && (anisotropy_value > 1);
@@ -1845,7 +2276,7 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
             R.key.filtered = filtered;
             const uint32_t aniso_index = anisotropy_value >= 16 ? 4u : anisotropy_value >= 8 ? 3u : anisotropy_value >= 4 ? 2u : anisotropy_value >= 2 ? 1u : 0u;
             R.key.filtered_sampler = filtered ? S.sampler_aniso[aniso_index] : VK_NULL_HANDLE;
-            R.d.decoded_on = decoded != VK_NULL_HANDLE;
+            R.d.decoded_on = decoded ? (S.decode_arrays ? 2 : 1) : 0;
             R.key.decoded = decoded ? decoded : S.dummy_uint.view;
             R.c.depth_tested_triangles += tested ? 1u : 0u;
             if (!TC.active && !nvk_target(plane, scale, left, top, right - left + 1, bottom - top + 1,
@@ -1874,7 +2305,8 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
                 nvk_set4(R.d.flags, 0, 0, 0, lines ? 1 : 3);
                 nvk_setf4(R.d.constant_color, 0.85f, 1.f, 0.85f, 0.f);
             } else nvk_set4(R.d.flags, m->mask_set, m->mask_check, m->dither, 0);
-            nvk_set4(R.d.page, m->texture_page_x * 64, m->texture_page_y * 256, m->clut_x, m->clut_y);
+            nvk_set4(R.d.page, decoded && S.decode_arrays ? (int)S.decoded_layer : m->texture_page_x * 64,
+                     decoded && S.decode_arrays ? 0 : m->texture_page_y * 256, m->clut_x, m->clut_y);
             nvk_set4(R.d.window, m->texture_window_mask_x, m->texture_window_mask_y,
                      m->texture_window_offset_x, m->texture_window_offset_y);
             R.key.hd = snapshot ? R.planes[command->source].color.view : hd_image ? hd_image->image.view : S.dummy_color.view;
@@ -1938,6 +2370,9 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
     R.key.src_key = copy_depth ? source_plane->key.view : S.dummy_uint.view;
     if (!nvk_target(plane, scale, command->x, command->y, command->w, command->h, (command->mask & 2u) != 0,
                     depth, NULL, NULL, 0, 0.f)) return 0;
+    if (S.clear_spans && !S.interlock && !R.capture_active && !wire && !work->depth_view &&
+        command->kind == NATIVE_GPU_SPAN && command->source == UINT32_MAX && !(command->mask & 2u))
+        return nvk_clear_span(plane, command, depth);
     /* Guest pixels are black in wireframe; copies between VIEW planes keep
      * the previously drawn edges, just as on the GL debug path. */
     const int black = wire && (!texture || command->kind == NATIVE_GPU_SEED || command->source == 0u);
@@ -1972,7 +2407,7 @@ static uint16_t *s_sched_max_layer;
 static uint32_t s_sched_max_capacity;
 static uint32_t *s_sched_emission;
 static uint32_t s_sched_emission_capacity;
-typedef struct NvkMaterialOrder { uint64_t key; uint32_t command, triangle; } NvkMaterialOrder;
+typedef struct NvkMaterialOrder { uint64_t key, hd_key; uint32_t command, triangle; } NvkMaterialOrder;
 static NvkMaterialOrder *s_sched_order;
 static uint32_t s_sched_order_capacity;
 static uint8_t *s_sched_depth_fast;
@@ -1980,6 +2415,7 @@ static uint32_t s_sched_depth_capacity;
 static int nvk_material_order_compare(const void *left, const void *right)
 {
     const NvkMaterialOrder *a = left, *b = right;
+    if (a->hd_key != b->hd_key) return a->hd_key < b->hd_key ? -1 : 1;
     if (a->key != b->key) return a->key < b->key ? -1 : 1;
     if (a->command != b->command) return a->command < b->command ? -1 : 1;
     return a->triangle < b->triangle ? -1 : a->triangle != b->triangle;
@@ -2042,7 +2478,7 @@ static int nvk_capture_reserve(const GlNativeGpuWork *work)
         capacity &= ~(VkDeviceSize)15u;
         if (!capacity || !vk_core_buffer_create(&S.capture_nodes, capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_CORE_MEMORY_DEVICE, "native ordered fragments")) return 0;
-        S.capture_capacity = (uint32_t)(capacity / (S.linked_capture ? 20u : 16u));
+        S.capture_capacity = (uint32_t)(capacity / 16u);
     }
     if (!S.capture_readback.buffer && !vk_core_buffer_create(&S.capture_readback, 4u,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_CORE_MEMORY_READBACK, "native fragment overflow")) return 0;
@@ -2057,7 +2493,15 @@ static void nvk_capture_dispatch(uint32_t stage, uint32_t groups)
     vkCmdPushConstants(R.cmd, S.pl_capture, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
         0u, sizeof(R.capture_push), &R.capture_push);
     vkCmdDispatch(R.cmd, groups, 1u, 1u);
-    nvk_barrier_all();
+    VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT |
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0u, 1u, &barrier, 0u, NULL, 0u, NULL);
 }
 
 static int nvk_capture_bind(NvkPlane *plane, uint32_t scale, const int32_t rect[4],
@@ -2091,31 +2535,65 @@ static int nvk_capture_bind(NvkPlane *plane, uint32_t scale, const int32_t rect[
 
 static int nvk_capture_begin(NvkPlane *plane, uint32_t scale, int x, int y, uint32_t width, uint32_t height)
 {
+    P.capture_full_pixels += (uint64_t)width * height;
+    const char *clip = getenv("PSX_NATIVE_VK_CAPTURE_DAMAGE_BOUNDS");
+    if (clip && clip[0] == '1' && S.linked_capture && R.damage_active &&
+        plane == &R.planes[R.damage_plane] && R.damage_count) {
+        int left = x + (int)width, top = y + (int)height, right = x, bottom = y;
+        for (uint32_t i = 0u; i < R.damage_count; ++i) {
+            const int32_t *r = R.damage_rects[i];
+            if (left > r[0]) left = r[0];
+            if (top > r[1]) top = r[1];
+            if (right < r[0] + r[2]) right = r[0] + r[2];
+            if (bottom < r[1] + r[3]) bottom = r[1] + r[3];
+        }
+        if (left < x) left = x;
+        if (top < y) top = y;
+        if (right > x + (int)width) right = x + (int)width;
+        if (bottom > y + (int)height) bottom = y + (int)height;
+        /* Outside this union the fragment shader already discards every
+         * invocation. Its heads/counts and the resolve need no storage there.
+         * Keep a harmless one-pixel target for an entirely untouched group. */
+        if (left >= right || top >= bottom) { width = height = 1u; }
+        else { x = left; y = top; width = (uint32_t)(right - left); height = (uint32_t)(bottom - top); }
+    }
+    P.capture_pixels += (uint64_t)width * height;
     const uint32_t pixels = width * height;
+    const uint32_t tile = 1u << S.damage_tile_shift;
     nvk_pass_end();
     if (P.capture_profile && P.capture_queries < NVK_CAPTURE_TS) nvk_prof_stamp(NVK_TS + P.capture_queries);
     R.capture_damage_mask = 0;
     uint32_t damage_columns = 0u;
     if (S.linked_capture && R.damage_active) {
-        const uint32_t columns = (plane->width + 63u) / 64u, rows = (plane->height + 63u) / 64u;
+        const uint32_t columns = (plane->width + tile - 1u) / tile, rows = (plane->height + tile - 1u) / tile;
         const VkDeviceSize bytes = ((columns * rows + 31u) / 32u) * sizeof(uint32_t);
         const VkDeviceSize destination = (4u + (VkDeviceSize)pixels * 2u) * sizeof(uint32_t);
         if (destination + bytes <= S.capture_meta.size) {
             uint32_t chunk; VkDeviceSize offset;
-            uint32_t *mask = (uint32_t *)nvk_arena(bytes, 16u, &chunk, &offset);
-            if (!mask) return 0;
+            /* Upload arenas may be write-combined device-local memory.
+             * Build bits in cached RAM: read/modify/write on the mapped
+             * upload pointer can incur uncached device-memory reads. */
+            uint32_t mask[2048];
+            if (bytes > sizeof(mask)) return 0;
             memset(mask, 0, (size_t)bytes);
+            void *upload = nvk_arena(bytes, 16u, &chunk, &offset);
+            if (!upload) return 0;
             for (uint32_t i = 0u; i < R.damage_count; ++i) {
                 const int32_t *r = R.damage_rects[i];
-                for (uint32_t ty = (uint32_t)r[1] / 64u; ty <= (uint32_t)(r[1] + r[3] - 1) / 64u; ++ty)
-                    for (uint32_t tx = (uint32_t)r[0] / 64u; tx <= (uint32_t)(r[0] + r[2] - 1) / 64u; ++tx) {
+                const uint32_t left = (uint32_t)r[0] >> S.damage_tile_shift;
+                const uint32_t right = (uint32_t)(r[0] + r[2] - 1) >> S.damage_tile_shift;
+                const uint32_t top = (uint32_t)r[1] >> S.damage_tile_shift;
+                const uint32_t bottom = (uint32_t)(r[1] + r[3] - 1) >> S.damage_tile_shift;
+                for (uint32_t ty = top; ty <= bottom; ++ty)
+                    for (uint32_t tx = left; tx <= right; ++tx) {
                         const uint32_t bit = ty * columns + tx;
                         mask[bit / 32u] |= 1u << (bit % 32u);
                     }
             }
+            memcpy(upload, mask, (size_t)bytes);
             const VkBufferCopy copy = { offset, destination, bytes };
             vkCmdCopyBuffer(R.cmd, S.chunks[chunk].buf.buffer, S.capture_meta.buffer, 1u, &copy);
-            damage_columns = columns;
+            damage_columns = columns | (S.damage_tile_shift << 16u);
             R.capture_damage_mask = 1;
         }
     }
@@ -2131,7 +2609,12 @@ static int nvk_capture_begin(NvkPlane *plane, uint32_t scale, int x, int y, uint
         vkCmdFillBuffer(R.cmd, S.capture_meta.buffer, 16u, (VkDeviceSize)pixels * 4u, UINT32_MAX);
         vkCmdFillBuffer(R.cmd, S.capture_meta.buffer, 16u + (VkDeviceSize)pixels * 4u, (VkDeviceSize)pixels * 4u, 0u);
     } else vkCmdFillBuffer(R.cmd, S.capture_meta.buffer, 16u, (VkDeviceSize)pixels * 8u, 0u);
-    nvk_barrier_all();
+    VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 1u, &barrier, 0u, NULL, 0u, NULL);
     const int32_t rect[4] = { x, y, (int32_t)width, (int32_t)height };
     if (!nvk_capture_bind(plane, scale, rect, S.capture_meta.buffer, S.capture_nodes.buffer, S.capture_capacity)) return 0;
     R.capture_order = 0u; R.capture_reserved = 0u; R.capture_active = 1;
@@ -2218,6 +2701,7 @@ static int nvk_capture_run(unsigned plane_index, const GlNativeGpuCommand *comma
     if ((uint64_t)x + width > plane->width || (uint64_t)y + height > plane->height) return -1;
     if (!nvk_capture_begin(plane, scale, x, y, width, height)) return 0;
     if (!S.linked_capture) {
+    if (!nvk_require_vertices()) return 0;
     nvk_pass_begin(plane);
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipe_capture_count);
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pl_capture, 0u, 1u, &R.capture_set, 0u, NULL);
@@ -2226,7 +2710,7 @@ static int nvk_capture_run(unsigned plane_index, const GlNativeGpuCommand *comma
     vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &R.vsrc.buf, &R.vsrc.off);
     const VkRect2D scissor = { { x, y }, { width, height } };
     vkCmdSetScissor(R.cmd, 0u, 1u, &scissor);
-    vkCmdDraw(R.cmd, count, 1u, first_vertex, 0u);
+    ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first_vertex, 0u);
     nvk_pass_end();
     nvk_capture_dispatch(0u, (pixels + 255u) / 256u);
     nvk_capture_dispatch(1u, 1u);
@@ -2245,7 +2729,26 @@ static int nvk_capture_run(unsigned plane_index, const GlNativeGpuCommand *comma
 }
 
 /* 1 rendered, 0 failed, -1 not applicable (nothing was drawn). */
+static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand *commands, uint32_t first, uint32_t end,
+                            uint32_t first_vertex, const uint8_t *captured_data,
+                             const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
+                             const GlNativeGpuGeometry *geometry, NvkScheduleCache *cached, int optimize_depth);
+
 static int nvk_schedule_run(unsigned plane_index, const GlNativeGpuCommand *commands, uint32_t first, uint32_t end,
+                            uint32_t first_vertex, const uint8_t *captured_data,
+                             const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
+                             const GlNativeGpuGeometry *geometry, NvkScheduleCache *cached, int optimize_depth)
+{
+    uint32_t kind = 1u;
+    if (P.capture_profile)
+        for (uint32_t i = first; i < end; ++i) if (commands[i].draw.hd_texture.valid) { kind = 3u; break; }
+    const uint32_t query = nvk_detail_begin(kind);
+    const int result = nvk_schedule_run_impl(plane_index, commands, first, end, first_vertex, captured_data, slice_vertices, geometry, cached, optimize_depth);
+    nvk_detail_end(query);
+    return result;
+}
+
+static int nvk_schedule_run_impl(unsigned plane_index, const GlNativeGpuCommand *commands, uint32_t first, uint32_t end,
                             uint32_t first_vertex, const uint8_t *captured_data,
                              const float (*slice_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS],
                              const GlNativeGpuGeometry *geometry, NvkScheduleCache *cached, int optimize_depth)
@@ -2460,24 +2963,29 @@ plan_ready: ;
     }
     /* Readers sharing a layer cannot overlap: the dependency planner would
      * otherwise have placed the later reader in a higher layer. Sort only
-     * contiguous reader segments; write-only/nonlocal/HD draws remain FIFO
-     * boundaries. This permits material batching without changing pixels. */
+     * contiguous reader segments; write-only/nonlocal draws remain FIFO
+     * boundaries. Immutable HD replacements may optionally join these same
+     * proven-disjoint reader segments, grouped by their texture identity. */
     if (S.sort_materials && !work->depth_view && nvk_sched_reserve((void **)&s_sched_order, &s_sched_order_capacity,
                                               total, sizeof(*s_sched_order))) {
         for (uint32_t at = 0u; at < offsets[run_max + 1u]; ++at) {
             const uint32_t ci = emit_command[at], t = emit_triangle[at];
             const GlNativeGpuCommand *command = &commands[command_indices[ci]];
-            if (command->source || command->draw.hd_texture.valid) emit_reads[at] = 0u;
+            const GpuRenderHdTexture *hd = &command->draw.hd_texture;
+            if (command->source || (hd->valid && !S.sort_hd_readers)) emit_reads[at] = 0u;
             const GlNativeTextureState texture = command->mesh_count
                 ? ((const GlNativeGpuMeshTriangle *)(const void *)(captured_data + command->data))[t].texture
                 : native_texture_state(&command->draw.primitive.material);
             const GlNativeGpuDrawGeometry *g = s_sched_cmd[ci].prepared ? &s_sched_cmd[ci].prepared[t]
                 : &sched->geo[s_sched_cmd[ci].base + t];
-            const uint64_t key = (uint64_t)texture.tpage | ((uint64_t)texture.clut_x << 16u) |
-                ((uint64_t)texture.clut_y << 26u) | ((uint64_t)texture.shading << 36u) |
+            const uint64_t guest_key = hd->valid && S.sort_hd_readers ? 0u :
+                (uint64_t)texture.tpage | ((uint64_t)texture.clut_x << 16u) | ((uint64_t)texture.clut_y << 26u);
+            const uint64_t key = guest_key | ((uint64_t)texture.shading << 36u) |
                 ((uint64_t)g->depth.write << 44u) | ((uint64_t)g->depth.bias << 48u) |
                 ((uint64_t)(g->attributes.integral != 0) << 53u) | ((uint64_t)command->texture_snapshot << 54u);
-            s_sched_order[at] = (NvkMaterialOrder){ key, ci, t };
+            const uint64_t hd_key = hd->valid && S.sort_hd_readers ?
+                ((uint64_t)hd->texture_hash << 32u) | hd->palette_hash : 0u;
+            s_sched_order[at] = (NvkMaterialOrder){ .key = key, .hd_key = hd_key, .command = ci, .triangle = t };
         }
         for (uint32_t layer = 0u; layer <= run_max; ++layer) {
             uint32_t at = offsets[layer];
@@ -2593,9 +3101,20 @@ static int nvk_upload_vertices(const float (*vertices)[GL_NATIVE_GPU_VERTEX_FLOA
     uint8_t *dst = nvk_arena(bytes, 16u, &chunk, &offset);
     if (!dst) return 0;
     memcpy(dst, vertices, bytes);
+    P.raw_vertex_upload_bytes += bytes;
     *buf = S.chunks[chunk].buf.buffer;
     *off = offset;
     return 1;
+}
+
+/* Core batches own their packed vertices. Upload the original slice only for
+ * a draw that actually binds it (including count passes and fallback draws).
+ * The CPU slice stays alive until all of its draws have been recorded. */
+static int nvk_require_vertices(void)
+{
+    if (R.vsrc.buf) return 1;
+    return R.vsrc.vertices && R.vsrc.count &&
+        nvk_upload_vertices(R.vsrc.vertices, R.vsrc.count, &R.vsrc.buf, &R.vsrc.off);
 }
 
 /* ---- words ------------------------------------------------------------------------------------------------------------- */
@@ -2905,6 +3424,7 @@ static int nvk_template_render(const GlNativeGpuCommand *command)
     const NvkTemplatePlan *plan = R.plan;
     const NvkTemplateCommand *info = &plan->commands[command->data];
     if (!info->visible) return 1;
+    if (!nvk_require_vertices()) return 0;
     NvkPlane *plane = &R.planes[command->plane];
     const uint32_t scale = native_gpu_plane_scale(R.work, command->plane);
     if (R.since_submit >= NVK_SUBMIT_DRAWS_IL && !nvk_submit_partial(VK_NULL_HANDLE)) return 0;
@@ -2934,7 +3454,7 @@ static int nvk_template_render(const GlNativeGpuCommand *command)
         if (!plan->visible[info->first + t]) { ++t; continue; }
         const uint32_t first = t++;
         while (t < info->count && plan->visible[info->first + t]) ++t;
-        vkCmdDraw(R.cmd, (t - first) * 3u, 1u, (info->first + first) * 3u, 0u);
+        ++P.draw_calls; vkCmdDraw(R.cmd, (t - first) * 3u, 1u, (info->first + first) * 3u, 0u);
         ++R.since_submit;
     }
     R.c.geometry_draws += info->visible;
@@ -3013,12 +3533,12 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
         nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_VERTICES, cursor, 0u);
         return 0;
     }
-    if (!nvk_upload_vertices(slice_vertices, count, &R.vsrc.buf, &R.vsrc.off)) {
+    R.vsrc = (NvkVertexSource){ .vertices = slice_vertices, .count = count };
+    if (!S.lazy_vertices && !nvk_upload_vertices(slice_vertices, count, &R.vsrc.buf, &R.vsrc.off)) {
         nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_VERTICES, cursor, 1u);
         if (!borrowed) free(slice_vertices);
         return 0;
     }
-    R.cpu_vertices = slice_vertices;
     uint32_t first_vertex = 0u;
     int template_vertices_bound = 0;
     for (uint32_t i = cursor; i < command_limit && ok; ++i) {
@@ -3033,9 +3553,7 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
         int32_t capture_rect[4]; uint32_t capture_triangles = 0u;
         const uint32_t capture_end = nvk_capture_group(commands, i, command_limit, geometry, capture_rect, &capture_triangles);
         if (capture_end > i) {
-            const VkBuffer saved_buffer = R.vsrc.buf;
-            const VkDeviceSize saved_offset = R.vsrc.off;
-            const float (*saved_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS] = R.cpu_vertices;
+            const NvkVertexSource saved = R.vsrc;
             NvkPlane *target = &R.planes[command->plane];
             ok = nvk_capture_begin(target, native_gpu_plane_scale(R.work, command->plane),
                 capture_rect[0], capture_rect[1], (uint32_t)capture_rect[2], (uint32_t)capture_rect[3]);
@@ -3044,7 +3562,7 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
                 ok = nvk_slice(commands, captured_data, i, capture_end, geometry);
                 nvk_capture_finish(target, ok, capture_triangles);
             }
-            R.vsrc.buf = saved_buffer; R.vsrc.off = saved_offset; R.cpu_vertices = saved_vertices;
+            R.vsrc = saved;
             R.b.vbuf = VK_NULL_HANDLE;
             first_vertex = command_first_vertex;
             for (uint32_t j = i; j < capture_end; ++j) first_vertex += native_gpu_command_vertex_count(&commands[j]);
@@ -3058,10 +3576,8 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
             while (end < command_limit && end - i < NATIVE_SCHED_CMDS && commands[end].kind == NATIVE_GPU_TEMPLATE &&
                    commands[end].plane == command->plane && commands[end].data == command->data + (end - i)) ++end;
             int scheduled = -1;
-            const struct { VkBuffer buf; VkDeviceSize off; } saved = { R.vsrc.buf, R.vsrc.off };
-            const float (*saved_vertices)[GL_NATIVE_GPU_VERTEX_FLOATS] = R.cpu_vertices;
-            R.cpu_vertices = cache->geometry->vertices;
-            R.vsrc.buf = R.template_vsrc.buf; R.vsrc.off = R.template_vsrc.off;
+            const NvkVertexSource saved = R.vsrc;
+            R.vsrc = R.template_vsrc;
             if (!R.plan_attempted) nvk_template_prepare(command->plane);
             if (R.plan && command->data < cache->count) {
                 ok = nvk_template_render(command);
@@ -3076,8 +3592,8 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
                 ok = nvk_render_command(&draw, cache->data, offset.vertex, cache->geometry->vertices,
                     cache->geometry->gpu_setup ? NULL : cache->geometry->primitives + offset.primitive);
             }
-            R.vsrc.buf = saved.buf; R.vsrc.off = saved.off;
-            R.cpu_vertices = saved_vertices;
+            R.template_vsrc = R.vsrc;
+            R.vsrc = saved;
         } else if (command->kind == NATIVE_GPU_PROVENANCE_CLEAR || command->kind == NATIVE_GPU_CANONICAL_READBACK) {
             ok = 0;
         } else if (command->kind == NATIVE_GPU_WORDS || command->kind == NATIVE_GPU_WORDS_RESET) {
@@ -3194,7 +3710,18 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
 }
 
 /* ---- scanout (GL native_gpu_scanout_*) ---------------------------------------------------------------------------------------- */
+static int nvk_scanout_image_impl(unsigned image);
+
 static int nvk_scanout_image(unsigned image)
+{
+    const uint32_t query = nvk_detail_begin(2u);
+    const int result = nvk_scanout_image_impl(image);
+    nvk_detail_end(query);
+    if (result) R.scanned_images[image] = 1u;
+    return result;
+}
+
+static int nvk_scanout_image_impl(unsigned image)
 {
     const GlNativeGpuWork *work = R.work;
     NvkPlane *output = &S.images[image];
@@ -3250,7 +3777,7 @@ static int nvk_scanout_image(unsigned image)
                                       (int32_t)(span * work->scale), (int32_t)(rows * work->scale) };
             const VkRect2D scissor = { { rect[0], rect[1] }, { (uint32_t)rect[2], (uint32_t)rect[3] } };
             vkCmdSetScissor(R.cmd, 0u, 1u, &scissor);
-            vkCmdDraw(R.cmd, 3u, 1u, 0u, 0u);
+            ++P.draw_calls; vkCmdDraw(R.cmd, 3u, 1u, 0u, 0u);
             x += span;
         }
         y += rows;
@@ -3274,7 +3801,10 @@ static int nvk_hash_record(const NvkPlane *image)
     if (!S.pipe_hash || (option && option[0] == '0')) return 1;
     const uint64_t pixels = (uint64_t)image->width * image->height;
     if (!pixels || pixels > UINT32_MAX) return 1;
-    const uint32_t groups = pixels > 128u * 128u ? 128u : (uint32_t)((pixels + 127u) / 128u);
+    const char *group_option = getenv("PSX_NATIVE_VK_HASH_GROUPS");
+    uint32_t limit = group_option ? (uint32_t)strtoul(group_option, NULL, 10) : 128u;
+    if (!limit || limit > 1024u) limit = 128u;
+    const uint32_t groups = pixels > (uint64_t)limit * 128u ? limit : (uint32_t)((pixels + 127u) / 128u);
     VkDescriptorSet set = nvk_set_alloc(S.dsl_hash);
     if (!set) return 0;
     VkDescriptorBufferInfo buffer = { S.hash_results.buffer, 0, VK_WHOLE_SIZE };
@@ -3406,6 +3936,10 @@ static VkPipeline nvk_make_pipeline_specialized(VkPipelineLayout layout, VkRende
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vm; stages[0].pName = "main";
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fm; stages[1].pName = "main";
         stages[1].pSpecializationInfo = specialization;
+        const VkBool32 first_records = S.first_vertex_records ? VK_TRUE : VK_FALSE;
+        const VkSpecializationMapEntry first_entry = { 0u, 0u, sizeof(first_records) };
+        const VkSpecializationInfo vertex_options = { 1u, &first_entry, sizeof(first_records), &first_records };
+        stages[0].pSpecializationInfo = &vertex_options;
         VkVertexInputBindingDescription binding = { 0u, GL_NATIVE_GPU_VERTEX_FLOATS * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX };
         const VkVertexInputAttributeDescription attrs[4] = {
             { 0u, 0u, VK_FORMAT_R32G32_SFLOAT, 0u },
@@ -3491,7 +4025,12 @@ static VkPipeline nvk_material_pipeline(int key_attached, int batch, const NvkDr
     VkSpecializationMapEntry entries[27];
     for (uint32_t i = 0u; i < 27u; ++i) entries[i] = (VkSpecializationMapEntry){ i, i * sizeof(values[0]), sizeof(values[0]) };
     const VkSpecializationInfo info = { 27u, entries, sizeof(values), values };
-    VkPipeline pipeline = R.capture_active && S.linked_capture && S.vertex_footprint ? nvk_make_pipeline_specialized(S.pl_core_batch, S.pass_capture,
+    VkPipeline pipeline = batch && draw->hd_on && S.hd_record_buffer && !R.capture_active
+        ? nvk_make_pipeline_specialized(S.pl_core_batch, S.pass_draw,
+            spv_native_gpu_vert_CORE_BATCH_INDEX, spv_native_gpu_vert_CORE_BATCH_INDEX_size,
+            spv_native_gpu_frag_CORE_BATCH_INDEX_SPECIALIZED, spv_native_gpu_frag_CORE_BATCH_INDEX_SPECIALIZED_size,
+            1, key_attached, "native HD record buffer", &info)
+        : R.capture_active && S.linked_capture && S.vertex_footprint ? nvk_make_pipeline_specialized(S.pl_core_batch, S.pass_capture,
         spv_native_gpu_vert_CORE_BATCH_FOOTPRINT, spv_native_gpu_vert_CORE_BATCH_FOOTPRINT_size,
         spv_native_gpu_frag_CAPTURE_LINKED_FOOTPRINT_SPECIALIZED, spv_native_gpu_frag_CAPTURE_LINKED_FOOTPRINT_SPECIALIZED_size,
         1, -1, "native linked fragment footprint", &info)
@@ -3544,6 +4083,7 @@ static int nvk_make_hd_sampler(VkSampler *out)
 
 static void nvk_teardown(void)
 {
+    nvk_submit_thread_stop();
     if (!vk_core_ready() || !S.tried) { memset(&S.ready, 0, sizeof(S.ready)); return; }
     VkDevice dev = vk_core_device();
     (void)vk_core_device_wait_idle();
@@ -3592,6 +4132,7 @@ static void nvk_teardown(void)
     vk_core_buffer_destroy(&R.recipe_buffer);
     for (unsigned i = 0u; i < NVK_IMAGES; ++i) vk_core_buffer_destroy(&R.readback[i]);
     if (P.pool) { vkDestroyQueryPool(dev, P.pool, NULL); P.pool = VK_NULL_HANDLE; }
+    if (P.submit_pool) { vkDestroyQueryPool(dev, P.submit_pool, NULL); P.submit_pool = VK_NULL_HANDLE; }
     if (S.pool) vkDestroyCommandPool(dev, S.pool, NULL);
     if (S.sampler_clamp) vkDestroySampler(dev, S.sampler_clamp, NULL);
     for (uint32_t i = 0u; i < 5u; ++i) if (S.sampler_aniso[i]) vkDestroySampler(dev, S.sampler_aniso[i], NULL);
@@ -3603,6 +4144,9 @@ static void nvk_teardown(void)
     for (uint32_t i = 0u; i < sizeof(S.decoded) / sizeof(S.decoded[0]); ++i) {
         vk_core_image_destroy(&S.decoded[i].image); vk_core_image_destroy(&S.decoded[i].filtered); free(S.decoded[i].source);
     }
+    for (uint32_t i = 0u; i < 8u; ++i)
+        if (S.pace_fences[i]) vkDestroyFence(dev, S.pace_fences[i], NULL);
+    vk_core_image_destroy(&S.decoded_array); vk_core_image_destroy(&S.filtered_array);
     if (S.pipe_decode) vkDestroyPipeline(dev, S.pipe_decode, NULL);
     if (S.pl_decode) vkDestroyPipelineLayout(dev, S.pl_decode, NULL);
     if (S.dsl_decode) vkDestroyDescriptorSetLayout(dev, S.dsl_decode, NULL);
@@ -3665,13 +4209,37 @@ static int nvk_init(void)
     const char *early = getenv("PSX_NATIVE_VK_EARLY_REJECT");
     S.early_reject = early && early[0] == '1';
     const char *single_tap = getenv("PSX_NATIVE_VK_ANISO_SINGLE_TAP");
-    S.aniso_single_tap = single_tap && single_tap[0] == '1';
+    S.aniso_single_tap = single_tap && single_tap[0] == '2' ? 2 : single_tap && single_tap[0] == '1' ? 1 : 0;
     const char *gather = getenv("PSX_NATIVE_VK_ANISO_GATHER");
     S.aniso_gather = gather && gather[0] == '1';
     const char *sort = getenv("PSX_NATIVE_VK_SORT_MATERIALS");
     S.sort_materials = sort && sort[0] == '1';
+    const char *sort_hd = getenv("PSX_NATIVE_VK_SORT_HD_READERS");
+    S.sort_hd_readers = sort_hd && sort_hd[0] == '1';
     const char *core_batch = getenv("PSX_NATIVE_VK_CORE_BATCH");
     S.core_batch = !S.interlock && caps->max_texel_buffer_elements >= NVK_ARENA_CHUNK / 16u && !(core_batch && core_batch[0] == '0');
+    const char *publish = getenv("PSX_NATIVE_VK_PUBLISH_BARRIERS");
+    S.publish_barriers = publish && publish[0] == '1';
+    const char *queue_ahead = getenv("PSX_NATIVE_VK_QUEUE_AHEAD");
+    if (S.core_batch && queue_ahead && queue_ahead[0] >= '1' && queue_ahead[0] <= '8') {
+        S.pace_limit = (uint32_t)(queue_ahead[0] - '0');
+        VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        for (uint32_t i = 0u; i < S.pace_limit; ++i)
+            if (!nvk_ok(vkCreateFence(dev, &fi, NULL, &S.pace_fences[i]), "native pace fence")) return 0;
+    }
+    const char *defer_submits = getenv("PSX_NATIVE_VK_DEFER_SUBMITS");
+    S.defer_submits = S.pace_limit && defer_submits && defer_submits[0] == '1';
+    const char *pace_margin = getenv("PSX_NATIVE_VK_QUEUE_MARGIN_MS");
+    if (S.pace_limit > 1u && pace_margin) {
+        const unsigned long margin = strtoul(pace_margin, NULL, 10);
+        if (margin > 0u && margin <= 1000u) S.pace_margin_ns = (uint64_t)margin * 1000000u;
+    }
+    const char *phase_seal = getenv("PSX_NATIVE_VK_PHASE_SEAL");
+    S.phase_seal = phase_seal && phase_seal[0] == '1';
+    const char *hd_batch = getenv("PSX_NATIVE_VK_HD_BATCH");
+    S.hd_batch = hd_batch && hd_batch[0] == '1';
+    const char *hd_records = getenv("PSX_NATIVE_VK_HD_RECORD_BUFFER");
+    S.hd_record_buffer = hd_records && hd_records[0] == '1';
     const char *capture = getenv("PSX_NATIVE_VK_FRAGMENT_LISTS");
     S.capture_enabled = S.core_batch && caps->fragment_stores_and_atomics && capture && capture[0] == '1';
     const char *merge_capture = getenv("PSX_NATIVE_VK_MERGE_CAPTURE");
@@ -3697,14 +4265,27 @@ static int nvk_init(void)
         }
     }
     const char *footprint = getenv("PSX_NATIVE_VK_VERTEX_FOOTPRINT");
-    S.vertex_footprint = !(footprint && footprint[0] == '0');
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(vk_core_physical_device(), &properties);
+    const char *first_records = getenv("PSX_NATIVE_VK_FIRST_VERTEX_RECORDS");
+    S.first_vertex_records = first_records && first_records[0] == '1';
+    const char *lazy_vertices = getenv("PSX_NATIVE_VK_LAZY_VERTICES");
+    S.lazy_vertices = S.core_batch && lazy_vertices && lazy_vertices[0] == '1';
+    S.vertex_footprint = properties.limits.maxVertexOutputComponents >= 72u &&
+        properties.limits.maxFragmentInputComponents >= 72u && !(footprint && footprint[0] == '0');
+    const char *tile = getenv("PSX_NATIVE_VK_DAMAGE_TILE");
+    S.damage_tile_shift = tile && !strcmp(tile, "16") ? 4u : tile && !strcmp(tile, "32") ? 5u : 6u;
     const char *damage = getenv("PSX_NATIVE_VK_PHASE_DAMAGE");
     S.phase_damage = !(damage && damage[0] == '0');
     const char *shader_damage = getenv("PSX_NATIVE_VK_SHADER_DAMAGE");
     S.shader_damage = !(shader_damage && shader_damage[0] == '0');
+    const char *regions = getenv("PSX_NATIVE_VK_SMAA_REGIONS");
+    S.damage_regions = regions && regions[0] == '2' ? 4 : regions && regions[0] == '1' ? 2 : 0;
     const char *depth_bounds = getenv("PSX_NATIVE_VK_DEPTH_BOUNDS");
     S.depth_bounds = !S.interlock && depth_bounds && depth_bounds[0] == '1';
     S.submit_draw_limit = NVK_SUBMIT_DRAWS;
+    const char *clear_spans = getenv("PSX_NATIVE_VK_CLEAR_SPANS");
+    S.clear_spans = clear_spans && clear_spans[0] == '1';
     const char *submit_limit = getenv("PSX_NATIVE_VK_SUBMIT_DRAWS");
     if (submit_limit) {
         const unsigned long limit = strtoul(submit_limit, NULL, 10);
@@ -3721,7 +4302,7 @@ static int nvk_init(void)
     }
     if (!S.pass_draw || !S.pass_scan_clear || !S.pass_scan_load) { nvk_note("render pass creation failed"); return 0; }
     const VkShaderStageFlags frag = VK_SHADER_STAGE_FRAGMENT_BIT;
-    const VkDescriptorSetLayoutBinding native0[12] = {
+    const VkDescriptorSetLayoutBinding native0[14] = {
         { 0u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
         { 1u, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1u, frag, NULL },
         { 2u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
@@ -3730,10 +4311,12 @@ static int nvk_init(void)
         { 5u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
         { 6u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
         { 8u, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1u, frag, NULL },
-        { 7u, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1u, VK_SHADER_STAGE_VERTEX_BIT, NULL },
+        { 7u, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1u, VK_SHADER_STAGE_VERTEX_BIT | frag, NULL },
         { 11u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
         { 12u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u, frag, NULL },
         { 13u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u, frag, NULL },
+        { 14u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
+        { 15u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL },
     };
     const VkDescriptorSetLayoutBinding native1[2] = {
         { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u, VK_SHADER_STAGE_VERTEX_BIT | frag, NULL },
@@ -3741,7 +4324,7 @@ static int nvk_init(void)
     };
     const VkDescriptorSetLayoutBinding scan0 = { 0u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, frag, NULL };
     const VkDescriptorSetLayoutBinding scan1 = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1u, frag, NULL };
-    S.dsl_native0 = nvk_make_layout(native0, 12u);
+    S.dsl_native0 = nvk_make_layout(native0, 14u);
     S.dsl_native1 = nvk_make_layout(native1, 2u);
     S.dsl_scan0 = nvk_make_layout(&scan0, 1u);
     S.dsl_scan1 = nvk_make_layout(&scan1, 1u);
@@ -3806,6 +4389,11 @@ static int nvk_init(void)
             ? vk_core_shader_module(spv_native_capture_linked_comp, spv_native_capture_linked_comp_size, "native linked resolve")
             : vk_core_shader_module(spv_native_capture_resolve_comp, spv_native_capture_resolve_comp_size, "native ordered resolve");
         VkComputePipelineCreateInfo pi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        const char *short_option = getenv("PSX_NATIVE_VK_CAPTURE_SHORT_LISTS");
+        const VkBool32 short_lists = short_option && short_option[0] == '1';
+        const VkSpecializationMapEntry short_entry = { 0u, 0u, sizeof(short_lists) };
+        const VkSpecializationInfo short_info = { 1u, &short_entry, sizeof(short_lists), &short_lists };
+        pi.stage.pSpecializationInfo = S.linked_capture ? &short_info : NULL;
         pi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         pi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; pi.stage.module = module; pi.stage.pName = "main";
         pi.layout = S.pl_capture;
@@ -3856,7 +4444,7 @@ static int nvk_init(void)
         hci.setLayoutCount = 1u; hci.pSetLayouts = &S.dsl_hash;
         VkShaderModule module = vk_core_shader_module(spv_image_hash_comp, spv_image_hash_comp_size, "image hash");
         if (S.dsl_hash && module && vk_core_check(vkCreatePipelineLayout(dev, &hci, NULL, &S.pl_hash), "vkCreatePipelineLayout") &&
-            vk_core_buffer_create(&S.hash_results, 128u * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_CORE_MEMORY_READBACK,
+            vk_core_buffer_create(&S.hash_results, 1024u * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_CORE_MEMORY_READBACK,
                                   "native image hash")) {
             VkComputePipelineCreateInfo pi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
             pi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -3903,9 +4491,15 @@ static int nvk_init(void)
     }
     S.pipe_scan = nvk_make_pipeline(S.pl_scan, S.pass_scan_load, spv_fullscreen_vert, spv_fullscreen_vert_size,
                                     spv_scanout_resolve_frag, spv_scanout_resolve_frag_size, 0, 1, "native scanout");
+    const char *arrays = getenv("PSX_NATIVE_VK_DECODE_ARRAYS");
+    S.decode_arrays = arrays && arrays[0] == '1';
     const char *decode = getenv("PSX_NATIVE_VK_DECODE_TEXTURES");
     const char *persistent_decode = getenv("PSX_NATIVE_VK_PERSISTENT_DECODE");
     S.persistent_decode = S.hardware_aniso || (persistent_decode && persistent_decode[0] == '1');
+    const char *decode_hints = getenv("PSX_NATIVE_VK_DECODE_HINTS");
+    S.decode_hints = decode_hints && decode_hints[0] == '1';
+    const char *descriptor_hints = getenv("PSX_NATIVE_VK_DESCRIPTOR_HINTS");
+    S.descriptor_hints = descriptor_hints && descriptor_hints[0] == '1';
     if (!S.interlock && !(decode && decode[0] == '0')) {
         const VkDescriptorSetLayoutBinding bindings[4] = {
             { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1u, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
@@ -3915,11 +4509,13 @@ static int nvk_init(void)
         };
         S.dsl_decode = nvk_make_layout(bindings, S.hardware_aniso ? 4u : 2u);
         VkPipelineLayoutCreateInfo layout = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        const VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0u, 6u * sizeof(int32_t) };
+        const VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0u, 7u * sizeof(int32_t) };
         layout.setLayoutCount = 1u; layout.pSetLayouts = &S.dsl_decode;
         layout.pushConstantRangeCount = 1u; layout.pPushConstantRanges = &range;
-        VkShaderModule module = S.hardware_aniso
-            ? vk_core_shader_module(spv_native_decode_comp_FILTERED, spv_native_decode_comp_FILTERED_size, "native filterable palette decode")
+        VkShaderModule module = S.decode_arrays && S.hardware_aniso
+            ? vk_core_shader_module(spv_native_decode_comp_FILTERED_ARRAY, spv_native_decode_comp_FILTERED_ARRAY_size, "native filtered layer decode")
+            : S.decode_arrays ? vk_core_shader_module(spv_native_decode_comp_ARRAY, spv_native_decode_comp_ARRAY_size, "native layer decode")
+            : S.hardware_aniso ? vk_core_shader_module(spv_native_decode_comp_FILTERED, spv_native_decode_comp_FILTERED_size, "native filterable palette decode")
             : vk_core_shader_module(spv_native_decode_comp, spv_native_decode_comp_size, "native palette decode");
         if (!S.dsl_decode || !module || !vk_core_check(vkCreatePipelineLayout(dev, &layout, NULL, &S.pl_decode), "vkCreatePipelineLayout")) {
             if (module) vkDestroyShaderModule(dev, module, NULL);
@@ -3957,6 +4553,14 @@ static int nvk_init(void)
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "native dummy uint") ||
         !vk_core_image_create(&S.words, VK_FORMAT_R16_UINT, VRAM_W, VRAM_H, 1u,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, "native words")) return 0;
+    /* Layers retain the original 256x256 sampling coordinates. A 2D atlas
+     * would change anisotropic filter rounding when adding a tile origin. */
+    const uint32_t decode_size = S.decode_arrays ? 256u : 1u, decode_layers = S.decode_arrays ? 64u : 2u;
+    if (!S.interlock &&
+        (!vk_core_image_create_array(&S.decoded_array, VK_FORMAT_R32_UINT, decode_size, decode_size, 1u, decode_layers,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "native decoded layers") ||
+         !vk_core_image_create_array(&S.filtered_array, VK_FORMAT_R8G8B8A8_UNORM, decode_size, decode_size, 1u, decode_layers,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "native filtered layers"))) return 0;
     if (!vk_core_buffer_create(&S.dummy_texels, 16u, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                                VK_CORE_MEMORY_UPLOAD, "native dummy texels"))
         return 0;
@@ -3966,11 +4570,18 @@ static int nvk_init(void)
     bvi.buffer = S.dummy_texels.buffer; bvi.format = VK_FORMAT_R16_UINT; bvi.range = VK_WHOLE_SIZE;
     if (!vk_core_check(vkCreateBufferView(dev, &bvi, NULL, &S.dummy_view), "vkCreateBufferView")) return 0;
     const char *gpu_timing = getenv("PSX_NATIVE_VK_GPU_TIMING");
+    const char *submit_timing = getenv("PSX_NATIVE_VK_SUBMIT_TIMING");
+    if (submit_timing && submit_timing[0] == '1' && caps->timestamps && caps->timestamp_period_ns > 0.f) {
+        VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NVK_SUBMIT_TS;
+        if (!vk_core_check(vkCreateQueryPool(dev, &qi, NULL, &P.submit_pool), "submit timing pool"))
+            P.submit_pool = VK_NULL_HANDLE;
+    }
     if (gpu_timing && gpu_timing[0] == '1' && caps->timestamps && caps->timestamp_period_ns > 0.f) {
         VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
         const char *profile = getenv("PSX_NATIVE_VK_PROFILE_CAPTURE");
         P.capture_profile = profile && profile[0] == '1';
-        qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NVK_TS + (P.capture_profile ? NVK_CAPTURE_TS : 0u);
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = NVK_TS + (P.capture_profile ? NVK_CAPTURE_TS + NVK_DETAIL_TS : 0u);
         if (!vk_core_check(vkCreateQueryPool(dev, &qi, NULL, &P.pool), "vkCreateQueryPool")) P.pool = VK_NULL_HANDLE;
     }
     S.set0 = malloc(NVK_SET0_CACHE * sizeof(*S.set0));
@@ -3985,7 +4596,20 @@ static int nvk_init(void)
         vk_core_image_barrier(cmd, images[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
         vkCmdClearColorImage(cmd, images[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1u, &range);
     }
+    if (S.decoded_array.image) {
+        vk_core_image_barrier(cmd, S.decoded_array.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        vk_core_image_barrier(cmd, S.filtered_array.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    }
     if (!vk_core_oneshot_end_wait(cmd)) return 0;
+    const char *submit_thread = getenv("PSX_NATIVE_VK_SUBMIT_THREAD");
+    if (S.defer_submits && !S.pace_margin_ns && submit_thread && submit_thread[0] == '1') {
+        SQ.mutex = SDL_CreateMutex();
+        SQ.condition = SDL_CreateCond();
+        if (!SQ.mutex || !SQ.condition) return 0;
+        SQ.run = 1;
+        SQ.thread = SDL_CreateThread(nvk_submit_thread, "native-vk-submit", NULL);
+        if (!SQ.thread) return 0;
+    }
     return 1;
 }
 
@@ -4061,11 +4685,12 @@ static int nvk_phase_command_equal(const GlNativeGpuCommand *a, const GlNativeGp
 static void nvk_damage_mark(uint8_t *tiles, uint32_t columns, const int32_t clip[4],
                             int left, int top, int right, int bottom)
 {
+    const int tile = 1 << S.damage_tile_shift;
     if (left < clip[0]) left = clip[0]; if (top < clip[1]) top = clip[1];
     if (right > clip[2]) right = clip[2]; if (bottom > clip[3]) bottom = clip[3];
     if (left >= right || top >= bottom) return;
-    for (int y = top / 64; y <= (bottom - 1) / 64; ++y)
-        for (int x = left / 64; x <= (right - 1) / 64; ++x) tiles[(uint32_t)y * columns + (uint32_t)x] = 1u;
+    for (int y = top / tile; y <= (bottom - 1) / tile; ++y)
+        for (int x = left / tile; x <= (right - 1) / tile; ++x) tiles[(uint32_t)y * columns + (uint32_t)x] = 1u;
 }
 
 static void nvk_damage_primitive(uint8_t *tiles, uint32_t columns, const int32_t clip[4],
@@ -4077,6 +4702,7 @@ static void nvk_damage_primitive(uint8_t *tiles, uint32_t columns, const int32_t
 
 static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuChunk *current)
 {
+    const uint32_t tile = 1u << S.damage_tile_shift;
     R.damage_count = 0u;
     R.damage_shader_active = 0;
     if (!S.phase_damage || S.interlock || !s_backend_mode || R.work->wireframe || R.work->depth_view ||
@@ -4096,7 +4722,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
     const int32_t clip[4] = { seed->x * (int)scale, seed->y * (int)scale,
         (seed->x + seed->w) * (int)scale, (seed->y + seed->h) * (int)scale };
     if (clip[0] < 0 || clip[1] < 0 || clip[2] > (int)plane->width || clip[3] > (int)plane->height) return 0;
-    const uint32_t columns = (plane->width + 63u) / 64u, rows = (plane->height + 63u) / 64u;
+    const uint32_t columns = (plane->width + tile - 1u) / tile, rows = (plane->height + tile - 1u) / tile;
     if (!columns || !rows || (uint64_t)columns * rows > 65536u) return 0;
     uint8_t *tiles = calloc((size_t)columns * rows, 1u);
     if (!tiles) return 0;
@@ -4149,8 +4775,8 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
     unsigned bands = bands_option ? (unsigned)strtoul(bands_option, NULL, 10) : 0u;
     if (bands > 16u) bands = 4u;
     if (bands && valid) {
-        const uint32_t first_row = (uint32_t)clip[1] / 64u;
-        const uint32_t last_row = ((uint32_t)clip[3] + 63u) / 64u;
+        const uint32_t first_row = (uint32_t)clip[1] / tile;
+        const uint32_t last_row = ((uint32_t)clip[3] + tile - 1u) / tile;
         for (uint32_t band = 0u; band < bands; ++band) {
             const uint32_t begin = first_row + (last_row - first_row) * band / bands;
             const uint32_t end = first_row + (last_row - first_row) * (band + 1u) / bands;
@@ -4161,7 +4787,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
                     if (y < top) top = y; if (y + 1u > bottom) bottom = y + 1u;
                 }
             if (left >= right || top >= bottom) continue;
-            int x0 = (int)left * 64, x1 = (int)right * 64, y0 = (int)top * 64, y1 = (int)bottom * 64;
+            int x0 = (int)left * (int)tile, x1 = (int)right * (int)tile, y0 = (int)top * (int)tile, y1 = (int)bottom * (int)tile;
             if (x0 < clip[0]) x0 = clip[0]; if (y0 < clip[1]) y0 = clip[1];
             if (x1 > clip[2]) x1 = clip[2]; if (y1 > clip[3]) y1 = clip[3];
             int32_t *rect = R.damage_rects[R.damage_count++];
@@ -4173,7 +4799,7 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
         if (!tiles[y * columns + x]) { ++x; continue; }
         const uint32_t begin = x++;
         while (x < columns && tiles[y * columns + x]) ++x;
-        int left = (int)begin * 64, right = (int)x * 64, top = (int)y * 64, bottom = top + 64;
+        int left = (int)begin * (int)tile, right = (int)x * (int)tile, top = (int)y * (int)tile, bottom = top + (int)tile;
         if (left < clip[0]) left = clip[0]; if (right > clip[2]) right = clip[2];
         if (top < clip[1]) top = clip[1]; if (bottom > clip[3]) bottom = clip[3];
         if (left >= right || top >= bottom) continue;
@@ -4193,24 +4819,110 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
     }
     const uint64_t full = (uint64_t)seed->w * seed->h * scale * scale;
     if (!valid || area * 5u >= full * 4u) { free(tiles); R.damage_count = 0u; return 0; }
-    if (S.shader_damage && S.core_batch && !S.capture_enabled && !bands) {
+    if (S.shader_damage && S.core_batch && (!S.capture_enabled || S.hd_batch) && !bands) {
         const uint32_t words = 5u + (columns * rows + 31u) / 32u;
         uint32_t chunk; VkDeviceSize offset;
-        uint32_t *mask = (uint32_t *)nvk_arena(words * sizeof(*mask), 16u, &chunk, &offset);
-        if (mask) {
+        uint32_t mask[5u + 2048u];
+        void *upload = nvk_arena(words * sizeof(*mask), 16u, &chunk, &offset);
+        if (upload) {
             memset(mask, 0, words * sizeof(*mask));
-            mask[0] = columns; memcpy(mask + 1u, clip, sizeof(clip));
+            mask[0] = columns | (S.damage_tile_shift << 16u); memcpy(mask + 1u, clip, sizeof(clip));
             for (uint32_t i = 0u; i < columns * rows; ++i)
                 if (tiles[i]) mask[5u + i / 32u] |= 1u << (i % 32u);
+            memcpy(upload, mask, words * sizeof(*mask));
             R.damage_buffer = S.chunks[chunk].buf.buffer;
             R.damage_word_offset = (uint32_t)(offset / sizeof(*mask));
             R.damage_shader_active = 1;
         }
     }
     free(tiles);
-    nvk_plane_copy(old, &R.planes[seed->plane], 0);
-    if (old->has_key) nvk_plane_copy(old, &R.planes[seed->plane], 1);
+    const char *copy_elision = getenv("PSX_NATIVE_VK_PHASE_COPY_ELISION");
+    const char *reuse_plane = getenv("PSX_NATIVE_VK_PHASE_REUSE");
+    if (R.work->scanout && reuse_plane && reuse_plane[0] == '1') {
+        /* Save the completed immutable image before recycling its working
+         * surface. The validated recipe only reads its own destination and
+         * immutable base textures. Later phases therefore need the previous
+         * pixels, not a second allocation containing a copy of those pixels.
+         * Swapping ownership preserves depth, hazard state and single-owner
+         * cleanup; no two plane slots alias the same Vulkan objects. */
+        const uint32_t image = old_seed->plane - GL_NATIVE_GPU_PHASE_BASE + 1u;
+        if (!R.scanned_images[image] && !nvk_scanout_image(image)) {
+            R.damage_count = 0u;
+            R.damage_shader_active = 0;
+            return -1;
+        }
+        NvkPlane spare = R.planes[seed->plane];
+        R.planes[seed->plane] = R.planes[old_seed->plane];
+        R.planes[old_seed->plane] = spare;
+    } else if (copy_elision && copy_elision[0] == '1') {
+        /* Only this crop is scanned out. Every damaged pixel is initialized
+         * by the first unconditional SPAN before any local depth read.
+         * Undamaged depth is neither sampled by scanout nor exported by this
+         * pixel-local recipe, so carrying it from the previous phase is
+         * unnecessary. A later full replay initializes the whole crop. */
+        NvkPlane *target = &R.planes[seed->plane];
+        nvk_pass_end();
+        VkImageCopy region = {0};
+        region.srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+        region.dstSubresource = region.srcSubresource;
+        region.srcOffset = region.dstOffset = (VkOffset3D){ clip[0], clip[1], 0 };
+        region.extent = (VkExtent3D){ (uint32_t)(clip[2] - clip[0]), (uint32_t)(clip[3] - clip[1]), 1u };
+        vkCmdCopyImage(R.cmd, old->color.image, VK_IMAGE_LAYOUT_GENERAL,
+            target->color.image, VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
+        nvk_barrier_all();
+        target->dirty_all = 1;
+        /* Retain conservative CPU bounds until the seed initializes damage. */
+        free(target->depth_max);
+        target->depth_max = NULL;
+        target->depth_zero = 0;
+    } else {
+        nvk_plane_copy(old, &R.planes[seed->plane], 0);
+        if (old->has_key) nvk_plane_copy(old, &R.planes[seed->plane], 1);
+    }
     R.damage_plane = seed->plane;
+    const unsigned image = seed->plane - GL_NATIVE_GPU_PHASE_BASE + 1u;
+    if (R.work->scanout && image < NVK_IMAGES && scale == R.work->scale) {
+        NvkPlane *output = &S.images[image];
+        int32_t bounds[4] = { clip[2], clip[3], clip[0], clip[1] };
+        for (uint32_t i = 0u; i < R.damage_count; ++i) {
+            const int32_t *r = R.damage_rects[i];
+            if (bounds[0] > r[0]) bounds[0] = r[0];
+            if (bounds[1] > r[1]) bounds[1] = r[1];
+            if (bounds[2] < r[0] + r[2]) bounds[2] = r[0] + r[2];
+            if (bounds[3] < r[1] + r[3]) bounds[3] = r[1] + r[3];
+        }
+        if (R.damage_count) {
+            P.damage_bounds_pixels += (uint64_t)(bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
+            for (unsigned i = 0u; i < 4u; ++i) bounds[i] -= clip[i & 1u];
+        } else memset(bounds, 0, sizeof(bounds));
+        memcpy(output->damage_bounds, bounds, sizeof(bounds));
+        output->damage_valid = 1;
+        output->damage_regions_side = S.damage_regions;
+        if (S.damage_regions) {
+            memset(output->damage_regions, 0, sizeof(output->damage_regions));
+            const unsigned side = (unsigned)S.damage_regions;
+            for (unsigned q = 0u; q < side * side; ++q) {
+                const int qx0 = clip[0] + (clip[2] - clip[0]) * (int)(q % side) / (int)side;
+                const int qx1 = clip[0] + (clip[2] - clip[0]) * (int)(q % side + 1u) / (int)side;
+                const int qy0 = clip[1] + (clip[3] - clip[1]) * (int)(q / side) / (int)side;
+                const int qy1 = clip[1] + (clip[3] - clip[1]) * (int)(q / side + 1u) / (int)side;
+                int32_t b[4] = { qx1, qy1, qx0, qy0 };
+                for (uint32_t i = 0u; i < R.damage_count; ++i) {
+                    const int32_t *r = R.damage_rects[i];
+                    const int x0 = r[0] > qx0 ? r[0] : qx0, y0 = r[1] > qy0 ? r[1] : qy0;
+                    const int x1 = r[0] + r[2] < qx1 ? r[0] + r[2] : qx1;
+                    const int y1 = r[1] + r[3] < qy1 ? r[1] + r[3] : qy1;
+                    if (x0 >= x1 || y0 >= y1) continue;
+                    if (b[0] > x0) b[0] = x0; if (b[1] > y0) b[1] = y0;
+                    if (b[2] < x1) b[2] = x1; if (b[3] < y1) b[3] = y1;
+                }
+                if (b[0] < b[2] && b[1] < b[3]) {
+                    for (unsigned j = 0u; j < 4u; ++j) b[j] -= clip[j & 1u];
+                    memcpy(output->damage_regions[q], b, sizeof(b));
+                }
+            }
+        }
+    }
     ++P.damage_phases; P.damage_pixels += area; P.damage_full_pixels += full;
     return 1;
 }
@@ -4255,6 +4967,8 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     R.recipe = S.dummy_view;
     memset(R.readback_used, 0, sizeof(R.readback_used));
     R.hash_groups = 0u;
+    memset(R.scanned_images, 0, sizeof(R.scanned_images));
+    for (unsigned image = 0u; image < NVK_IMAGES; ++image) S.images[image].damage_valid = 0;
     R.scheduled_run = 0;
     R.batchable = 0;
     nvk_template_plan_free();
@@ -4269,6 +4983,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     S.chunk_cur = 0u;
     for (uint32_t i = 0u; i < S.chunk_count; ++i) S.chunks[i].cursor = 0u;
     S.decoded_work_count = 0u; ++S.decoded_generation;
+    memset(S.decoded_work_hints, 0, sizeof(S.decoded_work_hints));
     if (!S.persistent_decode) for (uint32_t i = 0u; i < S.decoded_count; ++i) S.decoded[i].valid = 0;
     int ok = 1;
     R.cmd = VK_NULL_HANDLE;
@@ -4281,8 +4996,8 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     uint64_t t_mark = SDL_GetTicksNS();
     uint64_t t_next;
 #define NVK_LAP(phase) (t_next = SDL_GetTicksNS(), nvk_prof_cpu((phase), t_next - t_mark), t_mark = t_next)
-    P.capture_queries = 0u;
-    if (P.pool) { vkCmdResetQueryPool(R.cmd, P.pool, 0u, NVK_TS + (P.capture_profile ? NVK_CAPTURE_TS : 0u)); P.stamped = 1; }
+    P.capture_queries = P.detail_queries = 0u;
+    if (P.pool) { vkCmdResetQueryPool(R.cmd, P.pool, 0u, NVK_TS + (P.capture_profile ? NVK_CAPTURE_TS + NVK_DETAIL_TS : 0u)); P.stamped = 1; }
     nvk_prof_stamp(0u);
     nvk_barrier_all();   /* orders this work after every earlier submission (presenter reads, earlier works) */
     /* A previous execution that was never committed is dropped. */
@@ -4328,7 +5043,11 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
         nvk_prof_stamp(5u);
         if (ok) ok = nvk_submit_partial(VK_NULL_HANDLE);
         SDL_LockMutex(s_native_state_mutex);
-        while (ok && !work->published_chunk_count && !work->sealed && !work->cancel_requested &&
+        /* Keep base execution overlapped with phase preparation, but optionally
+         * wait for the complete immutable recipe before recording any phases.
+         * Otherwise early chunks cannot use capture/damage proofs and may cost
+         * more GPU time than the preparation overlap saves. */
+        while (ok && (S.phase_seal || !work->published_chunk_count) && !work->sealed && !work->cancel_requested &&
                SDL_AtomicGet(&s_native_gpu_run))
             SDL_CondWaitTimeout(s_native_gpu_condition, s_native_state_mutex, 2);
         const int cancelled = work->cancel_requested || !SDL_AtomicGet(&s_native_gpu_run);
@@ -4379,10 +5098,12 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
         if (!ok) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_PHASE_UPLOAD, 0u, 1u);
     }
     const GlNativePhaseTemplates *cache = ok ? work->phase_templates : NULL;
-    R.template_vsrc.buf = VK_NULL_HANDLE; R.template_vsrc.off = 0;
+    R.template_vsrc = (NvkVertexSource){0};
     if (ok && cache && cache->geometry) {
         const uint32_t count = cache->geometry->offsets[cache->count].vertex;
-        if (count && !nvk_upload_vertices(cache->geometry->vertices, count, &R.template_vsrc.buf, &R.template_vsrc.off)) {
+        R.template_vsrc.vertices = cache->geometry->vertices;
+        R.template_vsrc.count = count;
+        if (count && !S.lazy_vertices && !nvk_upload_vertices(cache->geometry->vertices, count, &R.template_vsrc.buf, &R.template_vsrc.off)) {
             nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_PHASE_UPLOAD, 0u, 2u);
             ok = 0;
         }
@@ -4400,7 +5121,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
             ok = nvk_slice(base_commands, base_data, 0u, base_count, geometry);
     }
     if (!streaming) { nvk_pass_end(); nvk_prof_stamp(5u); }
-    if (streaming && ok) ok = nvk_submit_partial(VK_NULL_HANDLE);
+    if ((streaming || S.pace_limit) && ok) ok = nvk_submit_partial(VK_NULL_HANDLE);
     nvk_prof_stamp(6u);
     for (uint32_t c = 0u; ok; ++c) {
         GlNativeGpuChunk chunk;
@@ -4435,15 +5156,18 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
                 if (ok) R.planes[i].dirty_all = 1;
                 if (ok && work->depth_test) ok = nvk_plane_depth(&R.planes[i]);
             }
-        const int damaged = ok && sealed && c && c < work->phase_count &&
-            nvk_phase_damage(&work->phase_chunks[c - 1u], &chunk);
+        int damaged = 0;
+        if (ok && sealed && c && c < work->phase_count) {
+            damaged = nvk_phase_damage(&work->phase_chunks[c - 1u], &chunk);
+            if (damaged < 0) { ok = 0; break; }
+        }
         R.damage_active = damaged;
         if (ok && chunk.count && (!damaged || R.damage_count))
             ok = nvk_slice(chunk.commands, chunk.data, 0u, chunk.count, chunk.geometry);
         nvk_pass_end();
         R.damage_active = 0;
         R.damage_shader_active = 0;
-        if (streaming && ok) {
+        if ((streaming || S.pace_limit) && ok) {
             P.streamed_chunks += !sealed;
             ok = nvk_submit_partial(VK_NULL_HANDLE);
         }
@@ -4453,7 +5177,8 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     nvk_prof_stamp(2u);
     NVK_LAP(2u);
     if (ok && work->scanout) {
-        for (unsigned image = 0; image <= work->phase_count && ok; ++image) ok = nvk_scanout_image(image);
+        for (unsigned image = 0; image <= work->phase_count && ok; ++image)
+            if (!R.scanned_images[image]) ok = nvk_scanout_image(image);
         if (ok) P.rendered_phases += work->phase_count;
         if (ok) ok = nvk_hash_record(&S.images[0]);
         for (unsigned image = 0; image <= work->phase_count && ok; ++image)
@@ -4469,6 +5194,18 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
             vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         } else if (!R.fail_stage) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_SCANOUT, 0u, 2u);
+    }
+    if (ok && work->scanout && S.publish_barriers) {
+        /* Publish endpoint writes before signalling their compile fence.
+         * A later presenter can read them without stalling unrelated work
+         * recorded since this endpoint became ready. The execution-start
+         * barrier still protects recycled endpoints from prior readers. */
+        VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0u, 1u, &barrier, 0u, NULL, 0u, NULL);
     }
     for (unsigned i = 0u; i < GL_NATIVE_GPU_PLANES; ++i) if (R.snapshots[i].color.image) {
         nvk_plane_free(&S.spare_snapshots[i]);
@@ -4505,6 +5242,8 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
         }
     } else ok = 0;
     if (!ok) {
+        (void)nvk_submit_thread_sync();
+        S.pending_count = S.pending_head = 0u;
         S.upload_valid = 0;
         for (uint32_t i = 0u; i < S.decoded_count; ++i) S.decoded[i].valid = 0;
         (void)vk_core_device_wait_idle();
@@ -4847,6 +5586,8 @@ static struct {
 /* Waits for the device, then drops what an unfinished execution holds. */
 static void nvk_backend_abandon(void)
 {
+    (void)nvk_submit_thread_sync();
+    S.pending_count = S.pending_head = 0u;
     for (uint32_t i = 0u; i < S.decoded_count; ++i) S.decoded[i].valid = 0;
     S.upload_valid = 0;
     (void)vk_core_device_wait_idle();
@@ -4964,7 +5705,28 @@ static int nvk_backend_complete(GlNativeGpuWork *work, uint64_t started, uint64_
     int hashes_ok = 1;
     size_t mapped_bytes = 0u;
     const uint64_t complete_started = SDL_GetTicksNS();
+    if (status == XG_RENDER_FENCE_READY && P.submit_pool && P.submit_queries) {
+        uint64_t times[NVK_SUBMIT_TS];
+        if (vkGetQueryPoolResults(vk_core_device(), P.submit_pool, 0u, P.submit_queries,
+            sizeof(times), times, sizeof(times[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            for (uint32_t q = 0u; q < P.submit_queries; q += 2u) {
+                const uint64_t ns = (uint64_t)((times[q+1u] - times[q]) * (double)vk_core_caps()->timestamp_period_ns);
+                ++P.timed_submits;
+                P.submit_gpu_ns += ns;
+                if (ns > P.submit_gpu_max_ns) P.submit_gpu_max_ns = ns;
+            }
+        }
+    }
     if (status == XG_RENDER_FENCE_READY && P.pool && P.stamped) {
+        uint64_t detail_ts[NVK_DETAIL_TS];
+        if (P.detail_queries && vkGetQueryPoolResults(vk_core_device(), P.pool, NVK_TS + NVK_CAPTURE_TS,
+            P.detail_queries, sizeof(detail_ts), detail_ts, sizeof(detail_ts[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            for (uint32_t q = 0u; q < P.detail_queries; q += 2u) {
+                const uint32_t kind = P.detail_kind[q / 2u];
+                ++P.detail_runs[kind];
+                P.detail_ns[kind] += (uint64_t)((double)(detail_ts[q+1u]-detail_ts[q]) * vk_core_caps()->timestamp_period_ns);
+            }
+        }
         uint64_t capture_ts[NVK_CAPTURE_TS];
         if (P.capture_queries && vkGetQueryPoolResults(vk_core_device(), P.pool, NVK_TS, P.capture_queries,
             sizeof(capture_ts), capture_ts, sizeof(capture_ts[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -5258,6 +6020,13 @@ static int nvk_be_upload_staged(NativeImageSlot *image, int width, int height, c
         region.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
         region.imageExtent = (VkExtent3D){ (uint32_t)width, (uint32_t)height, 1u };
         vkCmdCopyBufferToImage(cmd, stage.buffer, p->color.image, VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
+        if (S.publish_barriers) {
+            VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0u, 1u, &barrier, 0u, NULL, 0u, NULL);
+        }
         ok = vk_core_oneshot_end_wait(cmd);
     }
     vk_core_buffer_destroy(&stage);
@@ -5289,6 +6058,22 @@ int native_vk_endpoint_views(uint64_t color_handle, VkImageView *color, VkImageV
     *color = p->color.view;
     *mask = p->alpha_view;
     return 1;
+}
+
+int native_vk_endpoint_damage(uint64_t color_handle, int32_t bounds[4])
+{
+    const NvkPlane *p = nvk_image_ptr(color_handle);
+    if (!p || !p->color.image || !p->damage_valid) return 0;
+    memcpy(bounds, p->damage_bounds, sizeof(p->damage_bounds));
+    return 1;
+}
+
+int native_vk_endpoint_damage_regions(uint64_t color_handle, int32_t regions[NATIVE_VK_DAMAGE_REGIONS][4])
+{
+    const NvkPlane *p = nvk_image_ptr(color_handle);
+    if (!p || !p->color.image || !p->damage_valid || !p->damage_regions_side) return 0;
+    memcpy(regions, p->damage_regions, sizeof(p->damage_regions));
+    return p->damage_regions_side;
 }
 
 int native_vk_backend_start(char *reason, size_t reason_size)
@@ -5359,23 +6144,48 @@ int native_vk_backend_json(char *out, int capacity)
     int n = snprintf(out, (size_t)capacity,
         "{\"running\":%d,\"tier\":\"%s\",\"works\":%llu,\"failed_works\":%llu,\"last_fail\":{\"stage\":%u,\"command\":%u,\"kind\":%u,\"code\":%d},"
         "\"hd_resident\":%llu,\"hd_bytes\":%llu,\"hd_failed\":%llu,\"material_pipelines\":%u,"
-        "\"streamed_works\":%llu,\"streamed_chunks\":%llu,"
-        "\"rendered_phases\":%llu,\"schedule_cache_hits\":%llu,\"core_batches\":%llu,\"core_batch_triangles\":%llu,"
-        "\"decoded_pages\":%llu,\"decoded_reuses\":%llu,\"aniso_single_tap_triangles\":%llu,\"damage_phases\":%llu,\"damage_pixels\":%llu,\"damage_full_pixels\":%llu,"
+        "\"streamed_works\":%llu,\"streamed_chunks\":%llu,\"cleared_spans\":%llu,\"cleared_rects\":%llu,\"damage_bounds_pixels\":%llu,"
+        "\"capture_pixels\":%llu,\"capture_full_pixels\":%llu,"
+        "\"timed_submits\":%llu,\"submit_gpu_ns\":%llu,\"submit_gpu_max_ns\":%llu,\"submit_timing_overflow\":%llu,"
+        "\"rendered_phases\":%llu,\"schedule_cache_hits\":%llu,\"core_batches\":%llu,\"core_batch_triangles\":%llu,\"draw_calls\":%llu,\"submissions\":%llu,"
+        "\"raw_vertex_upload_bytes\":%llu,\"submit_worker\":%d,\"queue_ahead\":%u,\"fragment_node_bytes\":%u,"
+        "\"narrow_submits\":%llu,\"wide_submits\":%llu,"
+        "\"decoded_pages\":%llu,\"decoded_reuses\":%llu,\"decoded_hint_hits\":%llu,\"decoded_hint_misses\":%llu,\"decoded_negative_hits\":%llu,\"decoded_work_full\":%llu,\"decoded_slots_full\":%llu,\"aniso_single_tap_triangles\":%llu,\"damage_phases\":%llu,\"damage_pixels\":%llu,\"damage_full_pixels\":%llu,"
+        "\"descriptor_hint_hits\":%llu,\"descriptor_hint_misses\":%llu,"
         "\"depth_reads_elided\":%llu,\"capture_runs\":%llu,\"capture_triangles\":%llu,\"capture_retries\":%llu,"
-        "\"linked_capture\":%d,\"capture_retry_bits\":%u,\"hardware_aniso\":%d,\"refusals\":{",
+        "\"decoded_arrays\":%d,\"damage_tile\":%u,\"hd_batch\":%d,\"linked_capture\":%d,\"capture_retry_bits\":%u,\"hardware_aniso\":%d,\"refusals\":{",
         B.thread != NULL, S.interlock ? "interlock" : "core", (unsigned long long)B.works, (unsigned long long)B.failed_works, B.last_fail_stage,
         B.last_fail_command, B.last_fail_kind, B.last_fail_code, (unsigned long long)s_hd_cache.resident,
         (unsigned long long)s_hd_cache.bytes, (unsigned long long)s_hd_cache.failed, S.material_count,
-        (unsigned long long)P.streamed_works, (unsigned long long)P.streamed_chunks, (unsigned long long)P.rendered_phases,
+        (unsigned long long)P.streamed_works, (unsigned long long)P.streamed_chunks,
+        (unsigned long long)P.cleared_spans, (unsigned long long)P.cleared_rects,
+        (unsigned long long)P.damage_bounds_pixels,
+        (unsigned long long)P.capture_pixels, (unsigned long long)P.capture_full_pixels,
+        (unsigned long long)P.timed_submits, (unsigned long long)P.submit_gpu_ns,
+        (unsigned long long)P.submit_gpu_max_ns, (unsigned long long)P.submit_timing_overflow,
+        (unsigned long long)P.rendered_phases,
         (unsigned long long)s_template_schedule_hits, (unsigned long long)P.core_batches, (unsigned long long)P.core_batch_triangles,
+        (unsigned long long)P.draw_calls, (unsigned long long)P.submissions,
+        (unsigned long long)P.raw_vertex_upload_bytes, SQ.thread != NULL, S.pace_limit, S.capture_enabled ? 16u : 0u,
+        (unsigned long long)P.narrow_submits, (unsigned long long)P.wide_submits,
         (unsigned long long)P.decoded_pages, (unsigned long long)P.decoded_reuses,
+        (unsigned long long)P.decoded_hint_hits, (unsigned long long)P.decoded_hint_misses,
+        (unsigned long long)P.decoded_negative_hits,
+        (unsigned long long)P.decoded_work_full, (unsigned long long)P.decoded_slots_full,
         (unsigned long long)P.aniso_single_tap_triangles, (unsigned long long)P.damage_phases,
-        (unsigned long long)P.damage_pixels, (unsigned long long)P.damage_full_pixels, (unsigned long long)P.depth_reads_elided,
-        (unsigned long long)P.capture_runs, (unsigned long long)P.capture_triangles, (unsigned long long)P.capture_retries, S.linked_capture, P.capture_retry_bits, S.hardware_aniso);
+        (unsigned long long)P.damage_pixels, (unsigned long long)P.damage_full_pixels,
+        (unsigned long long)P.descriptor_hint_hits, (unsigned long long)P.descriptor_hint_misses,
+        (unsigned long long)P.depth_reads_elided,
+        (unsigned long long)P.capture_runs, (unsigned long long)P.capture_triangles, (unsigned long long)P.capture_retries, S.decode_arrays, 1u << S.damage_tile_shift, S.hd_batch, S.linked_capture, P.capture_retry_bits, S.hardware_aniso);
     for (unsigned i = 0u; i < NATIVE_VK_REFUSE_COUNT && n < capacity; ++i)
         n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "", s_refusal_names[i],
                       (unsigned long long)B.refusals[i]);
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n),
+        "},\"batch_counts\":{\"capture_draws\":%llu,\"capture_triangles\":%llu,"
+        "\"hd_draws\":%llu,\"hd_triangles\":%llu,\"guest_draws\":%llu,\"guest_triangles\":%llu",
+        (unsigned long long)P.batch_draws[0], (unsigned long long)P.batch_triangles[0],
+        (unsigned long long)P.batch_draws[1], (unsigned long long)P.batch_triangles[1],
+        (unsigned long long)P.batch_draws[2], (unsigned long long)P.batch_triangles[2]);
     if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n),
         "},\"capture_gpu\":{\"runs\":%llu,\"reset_ns\":%llu,\"draw_ns\":%llu,\"resolve_ns\":%llu,\"base_ns\":%llu,\"phases_ns\":%llu",
         (unsigned long long)P.capture_gpu_runs, (unsigned long long)P.capture_gpu_ns[0],
@@ -5396,6 +6206,11 @@ int native_vk_backend_json(char *out, int capacity)
     if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "},\"gpu_us_max\":{");
     for (unsigned i = 0u; i < NVK_GPU_PHASES && n < capacity; ++i)
         n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%.1f", i ? "," : "", s_gpu_phase_names[i], (double)P.gpu_max[i] / 1e3);
+    if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "},\"detail_gpu_ns\":{");
+    const char *detail_names[4] = { "plane_copy", "schedule_guest", "scanout", "schedule_hd" };
+    for (unsigned i = 0u; i < 4u && n < capacity; ++i)
+        n += snprintf(out + n, (size_t)(capacity - n), "%s\"%s\":%llu", i ? "," : "", detail_names[i],
+            (unsigned long long)P.detail_ns[i]);
     if (n < capacity) n += snprintf(out + n, (size_t)(capacity - n), "}}}");
     return n;
 }

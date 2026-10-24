@@ -22,6 +22,7 @@ typedef struct PendingFeedback {
 } PendingFeedback;
 
 static struct wl_display *s_display;
+static struct wl_event_queue *s_queue;
 static struct wl_surface *s_surface;
 static struct wl_registry *s_registry;
 static struct wp_presentation *s_presentation;
@@ -145,9 +146,10 @@ static const struct wl_registry_listener s_registry_listener = {
     registry_global_remove,
 };
 
-int psx_wayland_presentation_init(
+static int presentation_init(
         struct SDL_Window *window,
-        PsxWaylandPresentationCallback callback, void *opaque) {
+        PsxWaylandPresentationCallback callback, void *opaque,
+        int private_queue) {
 #if defined(PSX_SDL3)
     SDL_PropertiesID properties;
 
@@ -176,15 +178,45 @@ int psx_wayland_presentation_init(
     s_callback = callback;
     s_callback_opaque = opaque;
     s_diagnostics.wayland_window = 1;
-    s_registry = wl_display_get_registry(s_display);
-    if (!s_registry) return 0;
+    if (private_queue) {
+        s_queue = wl_display_create_queue(s_display);
+        struct wl_display *wrapper = wl_proxy_create_wrapper(s_display);
+        if (!s_queue || !wrapper) {
+            if (wrapper) wl_proxy_wrapper_destroy(wrapper);
+            psx_wayland_presentation_shutdown();
+            return 0;
+        }
+        wl_proxy_set_queue((struct wl_proxy *)wrapper, s_queue);
+        s_registry = wl_display_get_registry(wrapper);
+        wl_proxy_wrapper_destroy(wrapper);
+    } else {
+        s_registry = wl_display_get_registry(s_display);
+    }
+    if (!s_registry) { psx_wayland_presentation_shutdown(); return 0; }
     wl_registry_add_listener(s_registry, &s_registry_listener, NULL);
-    if (wl_display_roundtrip(s_display) < 0 ||
-        wl_display_roundtrip(s_display) < 0 || !s_presentation) {
+    if (wl_display_roundtrip_queue(s_display, s_queue) < 0 ||
+        wl_display_roundtrip_queue(s_display, s_queue) < 0 || !s_presentation) {
         psx_wayland_presentation_shutdown();
         return 0;
     }
     return 1;
+}
+
+int psx_wayland_presentation_init(
+        struct SDL_Window *window,
+        PsxWaylandPresentationCallback callback, void *opaque) {
+    return presentation_init(window, callback, opaque, 0);
+}
+
+int psx_wayland_presentation_init_private(
+        struct SDL_Window *window,
+        PsxWaylandPresentationCallback callback, void *opaque) {
+    return presentation_init(window, callback, opaque, 1);
+}
+
+void psx_wayland_presentation_poll(void) {
+    if (s_display && s_queue)
+        (void)wl_display_dispatch_queue_pending(s_display, s_queue);
 }
 
 void psx_wayland_presentation_shutdown(void) {
@@ -198,6 +230,8 @@ void psx_wayland_presentation_shutdown(void) {
     }
     if (s_presentation) wp_presentation_destroy(s_presentation);
     if (s_registry) wl_registry_destroy(s_registry);
+    if (s_queue) wl_event_queue_destroy(s_queue);
+    s_queue = NULL;
     s_display = NULL;
     s_surface = NULL;
     s_registry = NULL;
@@ -212,7 +246,7 @@ void psx_wayland_presentation_shutdown(void) {
 int psx_wayland_presentation_request(uint64_t swap_sequence) {
     PendingFeedback *pending;
 
-    if (!s_presentation || !s_surface) return 0;
+    if (!s_presentation || !s_surface || s_diagnostics.pending >= 256u) return 0;
     pending = (PendingFeedback *)calloc(1u, sizeof(*pending));
     if (!pending) return 0;
     {

@@ -35,6 +35,13 @@ typedef void (*PsxWaylandPresentationCallback)(
 int psx_wayland_presentation_init(
     struct SDL_Window *window,
     PsxWaylandPresentationCallback callback, void *opaque);
+/* Private queue for a threaded presenter. After init, only its owner may
+ * request/poll feedback; callbacks run on that owner, never SDL's thread.
+ * Stop the owner before shutdown. Poll dispatches buffered events only. */
+int psx_wayland_presentation_init_private(
+    struct SDL_Window *window,
+    PsxWaylandPresentationCallback callback, void *opaque);
+void psx_wayland_presentation_poll(void);
 void psx_wayland_presentation_shutdown(void);
 int psx_wayland_presentation_request(uint64_t swap_sequence);
 void psx_wayland_presentation_diagnostics(
@@ -49,6 +56,13 @@ static inline int psx_wayland_presentation_init(
     return 0;
 }
 static inline void psx_wayland_presentation_shutdown(void) {}
+static inline int psx_wayland_presentation_init_private(
+        struct SDL_Window *window,
+        PsxWaylandPresentationCallback callback, void *opaque) {
+    (void)window; (void)callback; (void)opaque;
+    return 0;
+}
+static inline void psx_wayland_presentation_poll(void) {}
 static inline int psx_wayland_presentation_request(uint64_t swap_sequence) {
     (void)swap_sequence;
     return 0;

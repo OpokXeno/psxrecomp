@@ -39,6 +39,9 @@ int native_vk_services_active(void);
 
 /* JSON for the debug server (executor, presenter and swapchain counters). */
 int native_vk_services_json(char *out, int capacity);
+/* Any thread: optionally request trace output on the presenter, then report
+ * whether the trace is still active. No waits on the calling thread. */
+int native_vk_services_trace_control(int finish);
 
 #if defined(PSX_HAVE_VULKAN)
 #include "vk_core.h"

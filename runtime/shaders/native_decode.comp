@@ -1,19 +1,29 @@
 #version 450
 //! gl_version 430
 //! variant FILTERED NATIVE_DECODE_FILTERED=1
+//! variant ARRAY NATIVE_DECODE_ARRAY=1
+//! variant FILTERED_ARRAY NATIVE_DECODE_FILTERED=1 NATIVE_DECODE_ARRAY=1
 #include "native_prelude.glsl"
 /* Decode an immutable replay texture/CLUT once, preserving the exact RGB555
  * word, zero transparency and STP bit. Fragment filtering still uses the same
  * taps and integer colour arithmetic; only dependent palette reads disappear. */
 layout(local_size_x=8,local_size_y=8) in;
 PSX_USAMPLERBUFFER(0, words)
+#ifdef NATIVE_DECODE_ARRAY
+layout(r32ui,PSX_BINDING(1,1)) writeonly uniform uimage2DArray decoded;
+#else
 layout(r32ui,PSX_BINDING(1,1)) writeonly uniform uimage2D decoded;
+#endif
 #ifdef NATIVE_DECODE_FILTERED
+#ifdef NATIVE_DECODE_ARRAY
+layout(rgba8,PSX_BINDING(2,2)) writeonly uniform image2DArray filtered;
+#else
 layout(rgba8,PSX_BINDING(2,2)) writeonly uniform image2D filtered;
+#endif
 PSX_USAMPLER2D(3, base_words)
 #endif
 #ifdef VULKAN
-layout(push_constant) uniform DecodePage { ivec4 page; ivec2 state; };
+layout(push_constant) uniform DecodePage { ivec4 page; ivec2 state; int layer; };
 #else
 uniform ivec4 page; uniform ivec2 state;
 #endif
@@ -32,12 +42,17 @@ void main() {
         uint index=state.x==0?(word>>uint((q.x&3)*4))&15u:(word>>uint((q.x&1)*8))&255u;
         word=word_at(page.zw+ivec2(int(index),0));
     }
-    imageStore(decoded,q,uvec4(word));
+#ifdef NATIVE_DECODE_ARRAY
+    ivec3 output_q=ivec3(q,layer);
+#else
+    ivec2 output_q=q;
+#endif
+    imageStore(decoded,output_q,uvec4(word));
 #ifdef NATIVE_DECODE_FILTERED
     /* RGB stores the original 0..31 channel values as bytes. Alpha is
      * coverage, not STP: the original integer word remains authoritative
      * for cutout, blending and mask/depth behavior. */
     vec3 rgb=vec3(uvec3(word,word>>5u,word>>10u)&31u)/255.0;
-    imageStore(filtered,q,vec4(rgb,word!=0u?1.0:0.0));
+    imageStore(filtered,output_q,vec4(rgb,word!=0u?1.0:0.0));
 #endif
 }

@@ -157,6 +157,10 @@ typedef struct VkCoreBuffer {
 int  vk_core_image_create(VkCoreImage *out, VkFormat format, uint32_t width,
                           uint32_t height, uint32_t mip_levels,
                           VkImageUsageFlags usage, const char *name);
+/* Multiple independent 2D layers share one view and descriptor. */
+int  vk_core_image_create_array(VkCoreImage *out, VkFormat format, uint32_t width, uint32_t height,
+                                uint32_t mip_levels, uint32_t layers, VkImageUsageFlags usage,
+                                const char *name);
 void vk_core_image_destroy(VkCoreImage *image);
 int  vk_core_buffer_create(VkCoreBuffer *out, VkDeviceSize size,
                            VkBufferUsageFlags usage, VkCoreMemory memory,

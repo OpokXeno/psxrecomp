@@ -48,7 +48,8 @@ assert 'view_plane ? work->depth_view : GL_NATIVE_DEPTH_VIEW_OFF' in executor
 assert 'work->wireframe && command->plane != 0u' in executor
 assert 'return NATIVE_VK_REFUSE_DEPTH_VIEW' not in executor
 assert 'return NATIVE_VK_REFUSE_WIREFRAME' not in executor
-assert '!wire && !draw->hd_texture.valid && !command->source;' in executor
+assert '!wire && (!draw->hd_texture.valid || (S.core_batch && S.hd_batch && !R.capture_active)) && !command->source;' in executor
+assert "S.hd_batch = hd_batch && hd_batch[0] == '1';" in executor
 assert 'nvk_set4(R.d.flags, 0, 0, 0, lines ? 1 : 3);' in executor
 assert 'const int black = wire &&' in executor
 assert 'command->source == 0u' in executor

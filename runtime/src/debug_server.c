@@ -10486,7 +10486,7 @@ static void handle_native_vk_shadow_dump(int id, const char *json)
 static void handle_native_vk_services(int id, const char *json)
 {
     extern const char *psx_native_vk_fallback_reason(void);
-    (void)json;
+    const int trace_active = native_vk_services_trace_control(json_get_int(json, "finish_trace", 0));
     enum { CAP = 64 * 1024 };
     char *obj = (char *)malloc(CAP);
     if (!obj) {
@@ -10495,8 +10495,8 @@ static void handle_native_vk_services(int id, const char *json)
     }
     int n = native_vk_services_json(obj, CAP);
     if (n >= CAP) send_err(id, "native_vk_services response overflow");
-    else send_fmt("{\"id\":%d,\"ok\":true,\"fallback_reason\":\"%s\",\"native_vk_services\":%s}\n",
-                  id, psx_native_vk_fallback_reason(), obj);
+    else send_fmt("{\"id\":%d,\"ok\":true,\"trace_active\":%d,\"fallback_reason\":\"%s\",\"native_vk_services\":%s}\n",
+                  id, trace_active, psx_native_vk_fallback_reason(), obj);
     free(obj);
 }
 

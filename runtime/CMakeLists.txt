@@ -990,6 +990,9 @@ if(BUILD_TESTING)
         add_test(NAME overlay_region_floor_config_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_region_floor_config.py)
+        add_test(NAME native_vk_fragment_sort_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_vk_fragment_sort.py)
         add_test(NAME screenshot_hires_pitch_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_screenshot_hires_pitch.py)

@@ -4,6 +4,7 @@
 //! gl_variant INTERLOCK_GENERIC_RASTER 420 NATIVE_GPU_INTERLOCK=1 NATIVE_GPU_GENERIC_RASTER=1
 //! variant INTERLOCK NATIVE_GPU_INTERLOCK=1
 //! variant CORE_BATCH NATIVE_GPU_CORE_BATCH=1
+//! variant CORE_BATCH_INDEX NATIVE_GPU_CORE_BATCH=1 NATIVE_GPU_RECORD_BUFFER=1
 //! variant CORE_BATCH_FOOTPRINT NATIVE_GPU_CORE_BATCH=1 NATIVE_GPU_VERTEX_FOOTPRINT=1
 #include "native_gpu_common.glsl"
 layout(location=0) in vec2 p; layout(location=1) in vec2 uv; layout(location=2) in vec4 c;
@@ -26,18 +27,34 @@ PSX_VARYING(5) noperspective out vec3 wire_barycentric;
 PSX_VARYING(4) flat out int parameter_index;
 #endif
 #ifdef NATIVE_GPU_CORE_BATCH
+layout(constant_id=0) const bool first_vertex_records=false;
 PSX_USAMPLERBUFFER(7, triangle_records)
 layout(push_constant) uniform BatchOffset { uint triangle_record_base; };
-PSX_VARYING(4) flat out uvec4 triangle_data[10];
+#ifdef NATIVE_GPU_RECORD_BUFFER
+PSX_VARYING(4) flat out int triangle_record_index;
+#else
+PSX_VARYING(4) flat out uvec4 triangle_data[12];
+#endif
 #endif
 #ifdef NATIVE_GPU_VERTEX_FOOTPRINT
-PSX_VARYING(14) flat out vec4 triangle_footprint;
-PSX_VARYING(15) flat out int triangle_taps;
+PSX_VARYING(16) flat out vec4 triangle_footprint;
+PSX_VARYING(17) flat out int triangle_taps;
 #endif
 void main(){
 #ifdef NATIVE_GPU_CORE_BATCH
-int record=int(triangle_record_base)+(VERTEX_ID/3)*10;
-for(int i=0;i<10;++i)triangle_data[i]=texelFetch(triangle_records,record+i);
+int record=int(triangle_record_base)+(VERTEX_ID/3)*12;
+#ifdef NATIVE_GPU_RECORD_BUFFER
+triangle_record_index=record;
+#else
+/* Vulkan triangle lists take flat values from the first vertex. The
+ * other two vertices only need position/UV/colour; their triangle records
+ * cannot be consumed by a fragment. */
+if(!first_vertex_records||VERTEX_ID%3==0){
+ for(int i=0;i<12;++i)triangle_data[i]=texelFetch(triangle_records,record+i);
+}else{
+ for(int i=0;i<12;++i)triangle_data[i]=uvec4(0);
+}
+#endif
 #endif
 #ifdef NATIVE_GPU_VERTEX_FOOTPRINT
 vec4 gradient=uintBitsToFloat(triangle_data[3]);

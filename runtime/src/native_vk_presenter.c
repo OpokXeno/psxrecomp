@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #if !defined(PSX_HAVE_VULKAN)
 
@@ -38,6 +39,7 @@ int native_vk_services_init(XgRenderWorkerServices *worker, XgRenderPresenterSer
 void native_vk_services_stop_worker(void) {}
 void native_vk_services_shutdown(void) {}
 int native_vk_services_active(void) { return 0; }
+int native_vk_services_trace_control(int finish) { (void)finish; return 0; }
 int native_vk_services_json(char *out, int capacity)
 {
     return snprintf(out, (size_t)capacity, "{\"active\":0,\"reason\":\"built without Vulkan\"}");
@@ -50,6 +52,7 @@ int native_vk_services_json(char *out, int capacity)
 #include "vk_core.h"
 #include "vk_swapchain.h"
 #include "vk_shaders_spv.h"
+#include "wayland_presentation.h"
 
 enum { NVKP_SLOTS = 8, NVKP_UBO_BYTES = 4096, NVKP_SLOT_ALIGN = 256, NVKP_UI_LAYERS = 2 };
 
@@ -73,6 +76,8 @@ typedef struct NvkpSlot {
     VkDescriptorPool pool;
     VkCoreBuffer ubo;
     VkQueryPool timestamps;
+    VkCoreBuffer audit;
+    VkDeviceSize audit_bytes;
 } NvkpSlot;
 
 typedef struct NvkpScene {
@@ -111,9 +116,12 @@ static struct {
     VkPipelineLayout pl_present, pl_tex, pl_copy;
     VkRenderPass pass_scene, pass_ui;
     VkRenderPass pass_edges;
+    VkRenderPass pass_scene_load, pass_edges_load;
     VkPipeline pipe_present, pipe_copy, pipe_blend;
     VkPipeline pipe_edges, pipe_smaa_cached;
-    int smaa_prepass;
+    int smaa_prepass, publish_barriers;
+    int smaa_damage, smaa_audit, smaa_regions;
+    uint64_t partial_composes, partial_pixels, partial_regions, full_pixels, audit_checks, audit_mismatches;
     int limit_postprocess, copy_filter;
     struct { int32_t key[5]; VkPipeline pipeline; } present_pipelines[64];
     uint32_t present_pipeline_count;
@@ -148,14 +156,117 @@ static struct {
 static void nvkp_note(const char *reason) { snprintf(P.reason, sizeof(P.reason), "%s", reason); }
 static uint64_t nvkp_clock_ns(void *user_data);
 
+/* Opt-in, bounded trace. The presenter owns the ring and the private Wayland
+ * event queue; teardown writes it only after that thread has stopped. No file
+ * I/O, readbacks or additional GPU waits occur during measurement. */
+enum { NVKP_TRACE_CAP = 16384 };
+typedef struct NvkpTraceEvent {
+    uint64_t sequence, source, guest_cycle, pixel_digest;
+    uint64_t selected_ns, composed_ns, acquire_begin_ns, acquire_end_ns;
+    uint64_t present_begin_ns, present_end_ns;
+    uint32_t slot, generation, image_index;
+    int queued, requested;
+    PsxWaylandPresentationEvent feedback;
+} NvkpTraceEvent;
+static struct {
+    FILE *file;
+    NvkpTraceEvent *events, *current;
+    uint64_t sequence;
+    int feedback_active;
+} T;
+static _Atomic int s_trace_active, s_trace_finish;
+
+int native_vk_services_trace_control(int finish)
+{
+    if (finish) atomic_store(&s_trace_finish, 1);
+    return atomic_load(&s_trace_active);
+}
+
+static void nvkp_trace_feedback(const PsxWaylandPresentationEvent *feedback, void *opaque)
+{
+    (void)opaque;
+    if (!T.events || !feedback || !feedback->swap_sequence) return;
+    NvkpTraceEvent *event = &T.events[feedback->swap_sequence % NVKP_TRACE_CAP];
+    if (event->sequence == feedback->swap_sequence) event->feedback = *feedback;
+}
+
+static void nvkp_trace_init(struct SDL_Window *window)
+{
+    const char *path = getenv("PSX_NATIVE_VK_PRESENT_TRACE");
+    if (!path || !path[0]) return;
+    T.file = fopen(path, "w");
+    if (!T.file) return;
+    T.events = calloc(NVKP_TRACE_CAP, sizeof(*T.events));
+    if (!T.events) { fclose(T.file); T.file = NULL; return; }
+    T.feedback_active = psx_wayland_presentation_init_private(window, nvkp_trace_feedback, NULL);
+    atomic_store(&s_trace_finish, 0);
+    atomic_store(&s_trace_active, 1);
+}
+
+static void nvkp_trace_finish(void)
+{
+    if (!T.file) return;
+    if (T.feedback_active) {
+        psx_wayland_presentation_poll();
+        psx_wayland_presentation_shutdown();
+    }
+    fprintf(T.file, "sequence,source,guest_cycle,pixel_digest,slot,generation,image_index,"
+        "selected_ns,composed_ns,acquire_begin_ns,acquire_end_ns,present_begin_ns,present_end_ns,"
+        "queued,requested,feedback,request_ns,presentation_ns,refresh_sequence,refresh_ns,flags\n");
+    const uint64_t first = T.sequence >= NVKP_TRACE_CAP ? T.sequence - NVKP_TRACE_CAP + 1u : 1u;
+    for (uint64_t seq = first; seq <= T.sequence; ++seq) {
+        const NvkpTraceEvent *e = &T.events[seq % NVKP_TRACE_CAP];
+        const PsxWaylandPresentationEvent *f = &e->feedback;
+        fprintf(T.file, "%llu,%llu,%llu,%llu,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%d,%d,%d,%llu,%llu,%llu,%u,%u\n",
+            (unsigned long long)e->sequence, (unsigned long long)e->source,
+            (unsigned long long)e->guest_cycle, (unsigned long long)e->pixel_digest,
+            e->slot, e->generation, e->image_index,
+            (unsigned long long)e->selected_ns, (unsigned long long)e->composed_ns,
+            (unsigned long long)e->acquire_begin_ns, (unsigned long long)e->acquire_end_ns,
+            (unsigned long long)e->present_begin_ns, (unsigned long long)e->present_end_ns,
+            e->queued, e->requested, f->swap_sequence ? (f->presented ? 1 : 2) : 0,
+            (unsigned long long)f->request_ns, (unsigned long long)f->presentation_time_ns,
+            (unsigned long long)f->refresh_sequence, f->refresh_ns, f->flags);
+    }
+    fclose(T.file);
+    free(T.events);
+    memset(&T, 0, sizeof(T));
+    atomic_store(&s_trace_active, 0);
+}
+
 /* ---- helpers ------------------------------------------------------------------------------------------------------------- */
 static void nvkp_barrier_all(VkCommandBuffer cmd)
 {
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = mb.srcAccessMask;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+/* Producer-side publication avoids an ALL_COMMANDS wait in every consumer.
+ * Scene edge reads must also finish before the next edge render overwrites
+ * that shared target. UI layers use real consumed fences for that lifetime. */
+static void nvkp_publish_color(VkCommandBuffer cmd, int protect_reads)
+{
+    VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | (protect_reads ? VK_ACCESS_SHADER_READ_BIT : 0u);
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | (protect_reads ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0u);
+    const VkPipelineStageFlags source = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+        (protect_reads ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : 0u);
+    const VkPipelineStageFlags destination = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+        (protect_reads ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : 0u);
+    vkCmdPipelineBarrier(cmd, source, destination, 0u, 1u, &barrier, 0u, NULL, 0u, NULL);
+}
+
+static void nvkp_release_scene(VkCommandBuffer cmd)
+{
+    VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0u, 1u, &barrier, 0u, NULL, 0u, NULL);
 }
 
 static VkDescriptorSetLayout nvkp_layout(const VkDescriptorSetLayoutBinding *bindings, uint32_t count)
@@ -327,7 +438,8 @@ static int nvkp_scene_ensure(uint32_t width, uint32_t height)
     if (!cmd) return 0;
     for (unsigned i = 0u; i < 2u; ++i) {
         if (!vk_core_image_create(&P.scene[i].image, VK_FORMAT_R8G8B8A8_UNORM, width, height, 1u,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, "native present scene")) {
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                (P.smaa_audit ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u), "native present scene")) {
             (void)vk_core_oneshot_end_wait(cmd);
             nvkp_scene_destroy();
             return 0;
@@ -412,11 +524,143 @@ static void nvkp_lut_update(void)
 }
 
 /* ---- compose ---------------------------------------------------------------------------------------------------------------------- */
+static void nvkp_audit_check(NvkpSlot *slot)
+{
+    if (!slot->audit_bytes) return;
+    vk_core_buffer_invalidate(&slot->audit, 0u, slot->audit_bytes * 2u);
+    ++P.audit_checks;
+    if (memcmp(slot->audit.mapped, (const uint8_t *)slot->audit.mapped + slot->audit_bytes,
+               (size_t)slot->audit_bytes)) ++P.audit_mismatches;
+    slot->audit_bytes = 0u;
+}
+
+/* Damage is relative to the preceding phase of this same immutable endpoint.
+ * A jump over phases must include every intervening region. Changing the fit,
+ * source generation, LUT or AA settings always requires a complete resolve. */
+static int nvkp_damage_rect(const NativePresentSel *sel, const NvkpComposeKey *key, VkRect2D *rect)
+{
+    if (!P.smaa_damage || !P.smaa_prepass || key->aa_mode != 2 || !P.cache_valid || P.composed < 0 ||
+        key->slot != P.cache_key.slot || key->generation != P.cache_key.generation ||
+        !P.cache_key.image_index || key->image_index <= P.cache_key.image_index) return 0;
+    NvkpComposeKey previous = P.cache_key;
+    previous.image_index = key->image_index; previous.color = key->color; previous.mask = key->mask;
+    if (memcmp(&previous, key, sizeof(previous)) || !sel->image.width || !sel->image.height) return 0;
+    int32_t bounds[4] = { (int32_t)sel->image.width, (int32_t)sel->image.height, 0, 0 };
+    for (uint32_t i = P.cache_key.image_index + 1u; i <= key->image_index; ++i) {
+        const NativeImageSlot image = native_endpoint_image(&sel->endpoint, i);
+        int32_t b[4];
+        if (image.width != sel->image.width || image.height != sel->image.height ||
+            !native_vk_endpoint_damage(image.color, b)) return 0;
+        if (b[2] <= b[0] || b[3] <= b[1]) continue;
+        if (bounds[0] > b[0]) bounds[0] = b[0];
+        if (bounds[1] > b[1]) bounds[1] = b[1];
+        if (bounds[2] < b[2]) bounds[2] = b[2];
+        if (bounds[3] < b[3]) bounds[3] = b[3];
+    }
+    const double sx = (double)key->rect[2] / sel->image.width;
+    const double sy = (double)key->rect[3] / sel->image.height;
+    /* 32 output-pixel edge search + edge/mask neighbours + bilinear footprint.
+     * Keep the margin conservative even when the source is magnified. */
+    const int pad = 40 + (int)ceil(sx > sy ? sx : sy);
+    int x0 = key->rect[0] + (int)floor(bounds[0] * sx) - pad;
+    int y0 = key->rect[1] + (int)floor(bounds[1] * sy) - pad;
+    int x1 = key->rect[0] + (int)ceil(bounds[2] * sx) + pad;
+    int y1 = key->rect[1] + (int)ceil(bounds[3] * sy) + pad;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int)key->width) x1 = (int)key->width;
+    if (y1 > (int)key->height) y1 = (int)key->height;
+    if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = y1 = 1; }
+    if ((uint64_t)(x1 - x0) * (y1 - y0) >= (uint64_t)key->width * key->height) return 0;
+    *rect = (VkRect2D){ { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+    return 1;
+}
+
+/* Refine a proven bounding box without dropping any intervening phase. Each
+ * source cell gets the same conservative filter halo as the original box.
+ * Overlapping halos are safe: both spatial passes write the same pure result
+ * without blending. Count that repeated shading when choosing the cover. */
+static unsigned nvkp_damage_regions(const NativePresentSel *sel, const NvkpComposeKey *key,
+                                    const VkRect2D *box, VkRect2D output[NATIVE_VK_DAMAGE_REGIONS])
+{
+    output[0] = *box;
+    if (!P.smaa_regions) return 1u;
+    const unsigned side = P.smaa_regions == 2 ? 4u : 2u;
+    int32_t bounds[NATIVE_VK_DAMAGE_REGIONS][4] = {{0}};
+    for (uint32_t i = P.cache_key.image_index + 1u; i <= key->image_index; ++i) {
+        const NativeImageSlot image = native_endpoint_image(&sel->endpoint, i);
+        int32_t regions[NATIVE_VK_DAMAGE_REGIONS][4];
+        if (native_vk_endpoint_damage_regions(image.color, regions) != (int)side) return 1u;
+        for (unsigned q = 0u; q < side * side; ++q) {
+            const int32_t *r = regions[q]; int32_t *b = bounds[q];
+            if (r[0] >= r[2] || r[1] >= r[3]) continue;
+            if (b[0] >= b[2] || b[1] >= b[3]) memcpy(b, r, sizeof(bounds[q]));
+            else {
+                if (b[0] > r[0]) b[0] = r[0]; if (b[1] > r[1]) b[1] = r[1];
+                if (b[2] < r[2]) b[2] = r[2]; if (b[3] < r[3]) b[3] = r[3];
+            }
+        }
+    }
+    const double sx = (double)key->rect[2] / sel->image.width;
+    const double sy = (double)key->rect[3] / sel->image.height;
+    const int pad = 40 + (int)ceil(sx > sy ? sx : sy);
+    VkRect2D regions[NATIVE_VK_DAMAGE_REGIONS]; unsigned count = 0u;
+    uint64_t area = 0u;
+    for (unsigned q = 0u; q < side * side; ++q) {
+        const int32_t *b = bounds[q];
+        if (b[0] >= b[2] || b[1] >= b[3]) continue;
+        int x0 = key->rect[0] + (int)floor(b[0] * sx) - pad;
+        int y0 = key->rect[1] + (int)floor(b[1] * sy) - pad;
+        int x1 = key->rect[0] + (int)ceil(b[2] * sx) + pad;
+        int y1 = key->rect[1] + (int)ceil(b[3] * sy) + pad;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > (int)key->width) x1 = (int)key->width;
+        if (y1 > (int)key->height) y1 = (int)key->height;
+        if (x0 >= x1 || y0 >= y1) continue;
+        regions[count++] = (VkRect2D){ { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+        area += (uint64_t)(x1 - x0) * (y1 - y0);
+    }
+    if (P.smaa_regions == 2) {
+        /* Merge padded cells whenever their bounding rectangle costs no more
+         * shading than the two draws. This removes duplicated halos without
+         * ever excluding a damaged pixel or increasing the counted area. */
+        for (;;) {
+            int64_t saving = -1;
+            unsigned left = 0u, right = 0u;
+            VkRect2D joined = {{0}};
+            for (unsigned a = 0u; a < count; ++a) for (unsigned b = a + 1u; b < count; ++b) {
+                const VkRect2D *ra = &regions[a], *rb = &regions[b];
+                const int32_t x0 = ra->offset.x < rb->offset.x ? ra->offset.x : rb->offset.x;
+                const int32_t y0 = ra->offset.y < rb->offset.y ? ra->offset.y : rb->offset.y;
+                const int32_t ax1 = ra->offset.x + (int32_t)ra->extent.width;
+                const int32_t ay1 = ra->offset.y + (int32_t)ra->extent.height;
+                const int32_t bx1 = rb->offset.x + (int32_t)rb->extent.width;
+                const int32_t by1 = rb->offset.y + (int32_t)rb->extent.height;
+                const int32_t x1 = ax1 > bx1 ? ax1 : bx1, y1 = ay1 > by1 ? ay1 : by1;
+                const int64_t difference = (int64_t)ra->extent.width * ra->extent.height +
+                    (int64_t)rb->extent.width * rb->extent.height - (int64_t)(x1 - x0) * (y1 - y0);
+                if (difference > saving) {
+                    saving = difference; left = a; right = b;
+                    joined = (VkRect2D){ {x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)} };
+                }
+            }
+            if (saving < 0) break;
+            regions[left] = joined;
+            regions[right] = regions[--count];
+            area -= (uint64_t)saving;
+        }
+    }
+    if (!count || area >= (uint64_t)box->extent.width * box->extent.height) return 1u;
+    memcpy(output, regions, count * sizeof(*regions));
+    return count;
+}
+
 static int nvkp_slot_begin(NvkpSlot *slot)
 {
     if (slot->submitted) {
         const uint64_t started = P.wait_diagnostics ? nvkp_clock_ns(NULL) : 0u;
         if (!vk_core_check(vkWaitForFences(vk_core_device(), 1u, &slot->fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return 0;
+        nvkp_audit_check(slot);
         if (P.wait_diagnostics) P.compose_wait_ns += nvkp_clock_ns(NULL) - started;
         if (slot->timestamps) {
             uint64_t times[2];
@@ -440,6 +684,10 @@ static bool nvkp_compose(const XgRenderCompiledEndpoint *compiled, uint64_t alph
                          uint64_t *out_completion_fence, void *user_data)
 {
     (void)user_data;
+    if (atomic_exchange(&s_trace_finish, 0)) nvkp_trace_finish();
+    const uint64_t selected_ns = T.events ? nvkp_clock_ns(NULL) : 0u;
+    if (T.feedback_active) psx_wayland_presentation_poll();
+    T.current = NULL;
     NativePresentSel sel;
     uint32_t blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_NONE;
     int cmd_open = 0;
@@ -525,7 +773,11 @@ static bool nvkp_compose(const XgRenderCompiledEndpoint *compiled, uint64_t alph
     if (!nvkp_slot_begin(slot)) { blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_GL_DRAW; goto failed; }
     cmd_open = 1;
     VkCommandBuffer cmd = slot->cmd;
-    const int target = P.composed < 0 ? 0 : P.composed ^ 1;
+    VkRect2D damage;
+    const int partial = nvkp_damage_rect(&sel, &key, &damage);
+    VkRect2D damage_regions[NATIVE_VK_DAMAGE_REGIONS];
+    const unsigned damage_count = partial ? nvkp_damage_regions(&sel, &key, &damage, damage_regions) : 0u;
+    const int target = partial ? P.composed : P.composed < 0 ? 0 : P.composed ^ 1;
     const int history = target ^ 1;
     /* Per-draw state. */
     uint8_t *ubo = slot->ubo.mapped;
@@ -567,44 +819,84 @@ static bool nvkp_compose(const XgRenderCompiledEndpoint *compiled, uint64_t alph
     }
     vkUpdateDescriptorSets(vk_core_device(), 2u, w, 0u, NULL);
 
-    /* Orders this pass after the executor work that wrote the endpoint image and after the previous frames. */
-    nvkp_barrier_all(cmd);
+    /* Endpoints and reusable scene targets were published by their producers. */
+    if (!P.publish_barriers) nvkp_barrier_all(cmd);
+    if (partial) {
+        VkMemoryBarrier load = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        load.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        load.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0u, 1u, &load, 0u, NULL, 0u, NULL);
+    }
     if (slot->timestamps) {
         vkCmdResetQueryPool(cmd, slot->timestamps, 0u, 2u);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot->timestamps, 0u);
     }
     const VkClearValue clear = { .color = { .float32 = { 0.f, 0.f, 0.f, 1.f } } };
     VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    bi.renderPass = P.pass_scene; bi.framebuffer = P.scene[target].framebuffer;
+    bi.renderPass = partial ? P.pass_scene_load : P.pass_scene; bi.framebuffer = P.scene[target].framebuffer;
     bi.renderArea.extent = (VkExtent2D){ (uint32_t)ww, (uint32_t)wh };
     bi.clearValueCount = 1u; bi.pClearValues = &clear;
     /* A negative viewport height keeps OpenGL's bottom-up clip space. */
     const VkViewport viewport = { (float)lx, (float)(ly + lh), (float)lw, -(float)lh, 0.f, 1.f };
-    const VkRect2D scissor = { { 0, 0 }, { (uint32_t)ww, (uint32_t)wh } };
+    const VkRect2D full = { { 0, 0 }, { (uint32_t)ww, (uint32_t)wh } };
     const uint32_t offsets[2] = { 0u, NVKP_SLOT_ALIGN };
-    if (edge_pass) {
-        VkRenderPassBeginInfo edges = bi;
-        edges.renderPass = P.pass_edges; edges.framebuffer = P.edges.framebuffer;
-        vkCmdBeginRenderPass(cmd, &edges, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdSetViewport(cmd, 0u, 1u, &viewport); vkCmdSetScissor(cmd, 0u, 1u, &scissor);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pipe_edges);
+    const VkDeviceSize audit_bytes = (VkDeviceSize)ww * wh * 4u;
+    int audit = partial && P.smaa_audit;
+    if (audit && slot->audit.size < audit_bytes * 2u) {
+        vk_core_buffer_destroy(&slot->audit);
+        audit = vk_core_buffer_create(&slot->audit, audit_bytes * 2u, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_CORE_MEMORY_READBACK, "SMAA damage comparison");
+    }
+    for (unsigned pass = 0u; pass < (audit ? 2u : 1u); ++pass) {
+        if (pass) bi.renderPass = P.pass_scene;
+        const VkRect2D *scissors = partial && !pass ? damage_regions : &full;
+        const unsigned scissor_count = partial && !pass ? damage_count : 1u;
+        if (edge_pass) {
+            VkRenderPassBeginInfo edges = bi;
+            edges.renderPass = partial && !pass ? P.pass_edges_load : P.pass_edges; edges.framebuffer = P.edges.framebuffer;
+            vkCmdBeginRenderPass(cmd, &edges, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdSetViewport(cmd, 0u, 1u, &viewport);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pipe_edges);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl_present, 0u, 1u, &set0, 0u, NULL);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl_present, 1u, 1u, &set1, 2u, offsets);
+            for (unsigned region = 0u; region < scissor_count; ++region) {
+                vkCmdSetScissor(cmd, 0u, 1u, &scissors[region]);
+                vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+            }
+            vkCmdEndRenderPass(cmd);
+            VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0u, 1u, &barrier, 0u, NULL, 0u, NULL);
+        }
+        vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdSetViewport(cmd, 0u, 1u, &viewport);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nvkp_present_pipeline(&draw));
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl_present, 0u, 1u, &set0, 0u, NULL);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl_present, 1u, 1u, &set1, 2u, offsets);
-        vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+        for (unsigned region = 0u; region < scissor_count; ++region) {
+            vkCmdSetScissor(cmd, 0u, 1u, &scissors[region]);
+            vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+        }
         vkCmdEndRenderPass(cmd);
-        VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            0u, 1u, &barrier, 0u, NULL, 0u, NULL);
+        if (audit) {
+            VkMemoryBarrier copy_barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            copy_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            copy_barrier.dstAccessMask = copy_barrier.srcAccessMask;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0u, 1u, &copy_barrier, 0u, NULL, 0u, NULL);
+            VkBufferImageCopy copy = {0};
+            copy.bufferOffset = pass * audit_bytes;
+            copy.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+            copy.imageExtent = (VkExtent3D){ (uint32_t)ww, (uint32_t)wh, 1u };
+            vkCmdCopyImageToBuffer(cmd, P.scene[target].image.image, VK_IMAGE_LAYOUT_GENERAL, slot->audit.buffer, 1u, &copy);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0u, 1u, &copy_barrier, 0u, NULL, 0u, NULL);
+            slot->audit_bytes = audit_bytes;
+        }
     }
-    vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdSetViewport(cmd, 0u, 1u, &viewport);
-    vkCmdSetScissor(cmd, 0u, 1u, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nvkp_present_pipeline(&draw));
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl_present, 0u, 1u, &set0, 0u, NULL);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl_present, 1u, 1u, &set1, 2u, offsets);
-    vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
-    vkCmdEndRenderPass(cmd);
+    if (P.publish_barriers) nvkp_publish_color(cmd, 1);
     if (slot->timestamps) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot->timestamps, 1u);
     if (!vk_core_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer")) { blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_GL_DRAW; goto failed; }
     cmd_open = 0;
@@ -618,12 +910,29 @@ static bool nvkp_compose(const XgRenderCompiledEndpoint *compiled, uint64_t alph
     P.cache_key = key;
     P.cache_valid = 1;
     ++P.compose_draws;
+    P.full_pixels += (uint64_t)ww * wh;
+    if (partial) {
+        ++P.partial_composes;
+        P.partial_regions += damage_count;
+        for (unsigned region = 0u; region < damage_count; ++region)
+            P.partial_pixels += (uint64_t)damage_regions[region].extent.width * damage_regions[region].extent.height;
+    } else P.partial_pixels += (uint64_t)ww * wh;
     if (source_changed) {
         ++P.image_updates;
         P.phase_composes += sel.image_index != 0u;
     }
 
 composed: ;
+    if (T.events) {
+        const uint64_t sequence = ++T.sequence;
+        T.current = &T.events[sequence % NVKP_TRACE_CAP];
+        *T.current = (NvkpTraceEvent){
+            .sequence = sequence, .source = compiled->identity.source_sequence,
+            .guest_cycle = compiled->identity.guest_cycle, .pixel_digest = sel.image.digest,
+            .slot = sel.slot, .generation = sel.generation, .image_index = sel.image_index,
+            .selected_ns = selected_ns, .composed_ns = nvkp_clock_ns(NULL),
+        };
+    }
     /* The submission is on the queue: the endpoint needs no further protection from this compose. */
     const uint64_t handle = native_register_fence(NULL, GL_NATIVE_FENCE_KIND_SOFTWARE_READY, sel.slot, sel.generation);
     if (!handle) { blocker = GL_RENDERER_NATIVE_PRESENT_BLOCKER_FENCE; goto failed; }
@@ -670,10 +979,12 @@ static void nvkp_swap(void *user_data)
     if (pending && P.composed >= 0) {
         VkSwapFrame frame;
         memset(&frame, 0, sizeof(frame));
+        if (T.current) T.current->acquire_begin_ns = nvkp_clock_ns(NULL);
         const VkSwapAcquire got = vk_swapchain_acquire(&frame);
+        if (T.current) T.current->acquire_end_ns = nvkp_clock_ns(NULL);
         if (got == VK_SWAP_ACQUIRE_OK) {
             VkCommandBuffer cmd = frame.cmd;
-            nvkp_barrier_all(cmd);
+            if (!P.publish_barriers) nvkp_barrier_all(cmd);
             vk_swapchain_begin_render_pass(&frame);
             const VkViewport viewport = { 0.f, 0.f, (float)frame.width, (float)frame.height, 0.f, 1.f };
             const VkRect2D full = { { 0, 0 }, { frame.width, frame.height } };
@@ -722,7 +1033,17 @@ static void nvkp_swap(void *user_data)
                 vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
             } else ui = -1;
             vk_swapchain_end_render_pass(&frame);
+            if (P.publish_barriers) nvkp_release_scene(cmd);
+            if (T.current) {
+                T.current->present_begin_ns = nvkp_clock_ns(NULL);
+                if (T.feedback_active)
+                    T.current->requested = psx_wayland_presentation_request(T.current->sequence);
+            }
             ok = vk_swapchain_present(&frame, 0u, NULL, NULL, 0u, NULL);
+            if (T.current) {
+                T.current->present_end_ns = nvkp_clock_ns(NULL);
+                T.current->queued = ok;
+            }
             if (ui >= 0) {
                 /* Protect EVERY submitted read. An older signalled fence
                  * alone cannot authorize overwriting a layer read by newer
@@ -846,6 +1167,7 @@ int native_vk_ui_end_rect(int x, int y, int width, int height)
     if (!P.ready || P.ui_back < 0) return 0;
     NvkpUiLayer *layer = &P.ui[P.ui_back];
     vkCmdEndRenderPass(layer->cmd);
+    if (P.publish_barriers) nvkp_publish_color(layer->cmd, 0);
     int ok = vk_core_check(vkEndCommandBuffer(layer->cmd), "vkEndCommandBuffer");
     if (ok) {
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -887,6 +1209,7 @@ void native_vk_ui_hide(void)
 /* ---- creation and teardown ------------------------------------------------------------------------------------------------------------ */
 static void nvkp_destroy(void)
 {
+    nvkp_trace_finish();
     if (!vk_core_ready()) { memset(&P, 0, sizeof(P)); return; }
     VkDevice dev = vk_core_device();
     (void)vk_core_device_wait_idle();
@@ -898,6 +1221,8 @@ static void nvkp_destroy(void)
             if (P.ui[i].consumed[j]) vkDestroyFence(dev, P.ui[i].consumed[j], NULL);
     }
     for (unsigned i = 0u; i < NVKP_SLOTS; ++i) {
+        nvkp_audit_check(&P.slots[i]);
+        vk_core_buffer_destroy(&P.slots[i].audit);
         if (P.slots[i].fence) vkDestroyFence(dev, P.slots[i].fence, NULL);
         if (P.slots[i].timestamps) vkDestroyQueryPool(dev, P.slots[i].timestamps, NULL);
         if (P.slots[i].pool) vkDestroyDescriptorPool(dev, P.slots[i].pool, NULL);
@@ -924,6 +1249,8 @@ static void nvkp_destroy(void)
     if (P.dsl_tex) vkDestroyDescriptorSetLayout(dev, P.dsl_tex, NULL);
     if (P.pass_scene) vkDestroyRenderPass(dev, P.pass_scene, NULL);
     if (P.pass_edges) vkDestroyRenderPass(dev, P.pass_edges, NULL);
+    if (P.pass_scene_load) vkDestroyRenderPass(dev, P.pass_scene_load, NULL);
+    if (P.pass_edges_load) vkDestroyRenderPass(dev, P.pass_edges_load, NULL);
     if (P.pass_ui) vkDestroyRenderPass(dev, P.pass_ui, NULL);
     if (P.sampler_nearest) vkDestroySampler(dev, P.sampler_nearest, NULL);
     if (P.sampler_linear) vkDestroySampler(dev, P.sampler_linear, NULL);
@@ -945,6 +1272,8 @@ static int nvkp_create(struct SDL_Window *window)
         unsigned long count = strtoul(slots, NULL, 10);
         if (count >= 3u && count <= NVKP_SLOTS) P.slot_count = (uint32_t)count;
     }
+    const char *publish = getenv("PSX_NATIVE_VK_PUBLISH_BARRIERS");
+    P.publish_barriers = publish && publish[0] == '1';
     const char *compose_cache = getenv("PSX_NATIVE_VK_COMPOSE_CACHE");
     P.compose_cache = !(compose_cache && compose_cache[0] == '0');
     const char *specialize = getenv("PSX_NATIVE_VK_SPECIALIZE_PRESENT");
@@ -953,6 +1282,12 @@ static int nvkp_create(struct SDL_Window *window)
     P.limit_postprocess = !(postprocess_limit && postprocess_limit[0] == '0');
     const char *prepass = getenv("PSX_NATIVE_VK_SMAA_PREPASS");
     P.smaa_prepass = !(prepass && prepass[0] == '0');
+    const char *damage = getenv("PSX_NATIVE_VK_SMAA_DAMAGE");
+    const char *audit = getenv("PSX_NATIVE_VK_SMAA_AUDIT");
+    const char *regions = getenv("PSX_NATIVE_VK_SMAA_REGIONS");
+    P.smaa_damage = damage && damage[0] == '1';
+    P.smaa_audit = P.smaa_damage && audit && audit[0] == '1';
+    P.smaa_regions = !P.smaa_damage || !regions ? 0 : regions[0] == '2' ? 2 : regions[0] == '1' ? 1 : 0;
     if (P.smaa_prepass) {
         VkFormatProperties format;
         vkGetPhysicalDeviceFormatProperties(vk_core_physical_device(), VK_FORMAT_R16G16B16A16_SFLOAT, &format);
@@ -966,6 +1301,12 @@ static int nvkp_create(struct SDL_Window *window)
     P.pass_ui = nvkp_pass(VK_ATTACHMENT_LOAD_OP_CLEAR, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (P.smaa_prepass) P.pass_edges = nvkp_pass_format(VK_FORMAT_R16G16B16A16_SFLOAT, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    if (P.smaa_damage && P.smaa_prepass) {
+        P.pass_scene_load = nvkp_pass(VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+        P.pass_edges_load = nvkp_pass_format(VK_FORMAT_R16G16B16A16_SFLOAT, VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+        if (!P.pass_scene_load || !P.pass_edges_load) { nvkp_note("SMAA load passes failed"); return 0; }
+    }
     if (!P.sampler_nearest || !P.sampler_linear || !P.pass_scene || !P.pass_ui) { nvkp_note("samplers or render passes failed"); return 0; }
     const VkShaderStageFlags frag = VK_SHADER_STAGE_FRAGMENT_BIT;
     const VkDescriptorSetLayoutBinding present0[4] = {
@@ -1061,6 +1402,7 @@ static int nvkp_create(struct SDL_Window *window)
     VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u };
     vk_core_image_barrier(cmd, P.dummy.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     vkCmdClearColorImage(cmd, P.dummy.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1u, &range);
+    if (P.publish_barriers) nvkp_barrier_all(cmd);
     if (!vk_core_oneshot_end_wait(cmd)) return 0;
     P.ready = 1;
     return 1;
@@ -1100,6 +1442,7 @@ int native_vk_services_init(XgRenderWorkerServices *worker, XgRenderPresenterSer
         .source_buffer_intervals = 3u,
     };
     P.services = 1;
+    nvkp_trace_init(window);
     return 1;
 }
 
@@ -1126,6 +1469,16 @@ int native_vk_services_active(void) { return P.services; }
 
 int native_vk_services_json(char *out, int capacity)
 {
+    const int display = P.window ? (int)SDL_GetWindowDisplayIndex(P.window) : -1;
+#if defined(PSX_SDL3)
+    const int primary = (int)SDL_GetPrimaryDisplay();
+#else
+    const int primary = 0;
+#endif
+    SDL_DisplayMode mode;
+    memset(&mode, 0, sizeof(mode));
+    if (display >= 0) (void)SDL_GetCurrentDisplayMode(display, &mode);
+
     char executor[4096];
     (void)native_vk_backend_json(executor, sizeof(executor));
     VkSwapDiagnostics sw;
@@ -1143,20 +1496,24 @@ int native_vk_services_json(char *out, int capacity)
         SDL_UnlockMutex(s_native_state_mutex);
     }
     return snprintf(out, (size_t)capacity,
-        "{\"active\":%d,\"composes\":%llu,\"compose_failures\":%llu,\"swaps\":%llu,\"swap_failures\":%llu,"
+        "{\"window_on_primary\":%d,\"host_display\":%d,\"host_refresh_hz\":%.3f,\"active\":%d,\"composes\":%llu,\"compose_failures\":%llu,\"swaps\":%llu,\"swap_failures\":%llu,"
         "\"swap_skips\":%llu,\"retired\":%llu,\"scene\":[%u,%u],\"lut\":%d,\"frames_presented\":%llu,"
         "\"compose_draws\":%llu,\"compose_reuses\":%llu,\"image_updates\":%llu,\"phase_composes\":%llu,"
+        "\"partial_composes\":%llu,\"partial_pixels\":%llu,\"partial_regions\":%llu,\"full_pixels\":%llu,\"audit_checks\":%llu,\"audit_mismatches\":%llu,"
         "\"gpu_composes\":%llu,\"gpu_compose_ns\":%llu,\"ui_clip\":[%d,%d,%d,%d],\"ui_storage\":[%u,%u],"
-        "\"window_maximized\":%d,\"window_fullscreen\":%d,\"window_focused\":%d,"
+        "\"window_maximized\":%d,\"window_fullscreen\":%d,\"window_focused\":%d,\"window_mouse_focused\":%d,"
         "\"compose_wait_ns\":%llu,\"ui_consume_wait_ns\":%llu,\"scene_rebuilds\":%llu,\"ui_updates\":%llu,\"executor\":%s}",
-        P.services, (unsigned long long)P.composes, (unsigned long long)P.compose_failures, (unsigned long long)P.swaps,
+        display == primary, display, (double)mode.refresh_rate, P.services, (unsigned long long)P.composes, (unsigned long long)P.compose_failures, (unsigned long long)P.swaps,
         (unsigned long long)P.swap_failures, (unsigned long long)P.swap_skips, (unsigned long long)P.retired,
         P.scene_w, P.scene_h, P.lut_valid, (unsigned long long)sw.frames_presented,
         (unsigned long long)P.compose_draws, (unsigned long long)P.compose_reuses,
         (unsigned long long)P.image_updates, (unsigned long long)P.phase_composes,
+        (unsigned long long)P.partial_composes, (unsigned long long)P.partial_pixels,
+        (unsigned long long)P.partial_regions, (unsigned long long)P.full_pixels,
+        (unsigned long long)P.audit_checks, (unsigned long long)P.audit_mismatches,
         (unsigned long long)P.gpu_composes, (unsigned long long)P.gpu_compose_ns, clip[0], clip[1], clip[2], clip[3], ui_storage[0], ui_storage[1],
         (window_flags & SDL_WINDOW_MAXIMIZED) != 0u, (window_flags & SDL_WINDOW_FULLSCREEN) != 0u,
-        (window_flags & SDL_WINDOW_INPUT_FOCUS) != 0u,
+        (window_flags & SDL_WINDOW_INPUT_FOCUS) != 0u, (window_flags & SDL_WINDOW_MOUSE_FOCUS) != 0u,
         (unsigned long long)P.compose_wait_ns, (unsigned long long)P.ui_consume_wait_ns,
         (unsigned long long)P.scene_rebuilds, (unsigned long long)P.ui_updates, executor);
 }

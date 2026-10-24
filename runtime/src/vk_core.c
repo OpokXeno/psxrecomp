@@ -1026,6 +1026,12 @@ void vk_core_name(VkObjectType type, uint64_t handle, const char *name)
 int vk_core_image_create(VkCoreImage *out, VkFormat format, uint32_t width, uint32_t height,
                          uint32_t mip_levels, VkImageUsageFlags usage, const char *name)
 {
+    return vk_core_image_create_array(out, format, width, height, mip_levels, 1u, usage, name);
+}
+
+int vk_core_image_create_array(VkCoreImage *out, VkFormat format, uint32_t width, uint32_t height,
+                               uint32_t mip_levels, uint32_t layers, VkImageUsageFlags usage, const char *name)
+{
     memset(out, 0, sizeof(*out));
     VkImageCreateInfo ci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ci.imageType = VK_IMAGE_TYPE_2D;
@@ -1034,7 +1040,7 @@ int vk_core_image_create(VkCoreImage *out, VkFormat format, uint32_t width, uint
     ci.extent.height = height;
     ci.extent.depth = 1;
     ci.mipLevels = mip_levels ? mip_levels : 1;
-    ci.arrayLayers = 1;
+    ci.arrayLayers = layers;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = usage;
@@ -1057,11 +1063,11 @@ int vk_core_image_create(VkCoreImage *out, VkFormat format, uint32_t width, uint
                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
         VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = out->image;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.viewType = layers > 1u ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         vi.format = format;
         vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         vi.subresourceRange.levelCount = ci.mipLevels;
-        vi.subresourceRange.layerCount = 1;
+        vi.subresourceRange.layerCount = layers;
         r = vkCreateImageView(s_dev, &vi, NULL, &out->view);
         if (!vk_core_check(r, "vkCreateImageView")) {
             vmaDestroyImage(s_alloc, out->image, out->allocation);

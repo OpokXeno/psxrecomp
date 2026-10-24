@@ -3,16 +3,21 @@
 #include "native_prelude.glsl"
 layout(local_size_x=128) in;
 layout(std430,PSX_BINDING(0,0)) buffer Metadata { uint meta[]; };
-layout(std430,PSX_BINDING(1,1)) buffer Fragments { uint words[]; };
+layout(std430,PSX_BINDING(1,1)) buffer Fragments { uvec4 nodes[]; };
 layout(rgba8,PSX_BINDING(2,2)) uniform image2D color_image;
 layout(r32ui,PSX_BINDING(3,3)) uniform uimage2D depth_image;
 #ifdef VULKAN
 layout(push_constant) uniform CapturePush { vec4 view; ivec4 rect; uvec4 info; };
+layout(constant_id=0) const bool short_lists_once=false;
 #else
 uniform vec4 view; uniform ivec4 rect; uniform uvec4 info;
+#define short_lists_once false
 #endif
-uvec4 node_at(uint index){uint at=index*5u;return uvec4(words[at],words[at+1u],words[at+2u],words[at+3u]);}
-uint next_at(uint index){return words[index*5u+4u];}
+/* The biased test key is exact integer arithmetic, so store its five-bit
+ * shift instead of a duplicate key. Nodes remain aligned to sixteen bytes. */
+uvec4 node_at(uint index){uvec4 n=nodes[index];uint bias=(n.z>>26u)&31u;
+ return uvec4(n.xy,n.y+(bias!=0u?n.y>>bias:0u),n.z);}
+uint next_at(uint index){return nodes[index].w;}
 void ordered_pair(inout uvec4 a,inout uvec4 b){if(a.x>b.x){uvec4 t=a;a=b;b=t;}}
 /* A pixel owns its entire chain. Merge its links in place instead of scanning
  * every node for each output fragment when material batches arrive out of order. */
@@ -27,14 +32,14 @@ uint sort_chain(uint head,uint count){
    remaining-=nl+nr;
    while(nl!=0u||nr!=0u){uint selected;
     bool take_left=nr==0u;
-    if(nl!=0u&&nr!=0u)take_left=words[left*5u]<=words[right*5u];
+    if(nl!=0u&&nr!=0u)take_left=nodes[left].x<=nodes[right].x;
     if(take_left){selected=left;left=next_at(left);--nl;}
     else{selected=right;right=next_at(right);--nr;}
-    if(tail==0xffffffffu)first=selected;else words[tail*5u+4u]=selected;
+    if(tail==0xffffffffu)first=selected;else nodes[tail].w=selected;
     tail=selected;
    }
   }
-  words[tail*5u+4u]=0xffffffffu;head=first;
+  nodes[tail].w=0xffffffffu;head=first;
  }
  return head;
 }
@@ -43,30 +48,66 @@ void main(){
  if(pixel>=pixels||meta[0]!=0u)return;
  uint count=meta[4u+pixels+pixel],head=meta[4u+pixel];if(count==0u)return;
  if(count>128u||head>=info.y){atomicOr(meta[0],8u);return;}
- bool ascending=true,descending=true;uint cursor=head,prior=node_at(head).x;
+ bool ascending=true,descending=true;uint cursor=head;
+ uvec4 a=uvec4(0xffffffffu),b=a,c=a,d=a,e=a,f=a,g=a,h=a;
+ if(short_lists_once&&count<=8u){
+  /* Read short chains once. Their order lives in registers; neither a
+   * preliminary traversal nor reversing the global links is necessary. */
+  ascending=false;
+  a=node_at(cursor);
+#define LOAD_NEXT(V) cursor=next_at(cursor);if(cursor>=info.y){atomicOr(meta[0],16u);return;}V=node_at(cursor);
+  if(count>1u){LOAD_NEXT(b)}
+  if(count>2u){LOAD_NEXT(c)}
+  if(count>3u){LOAD_NEXT(d)}
+  if(count>4u){LOAD_NEXT(e)}
+  if(count>5u){LOAD_NEXT(f)}
+  if(count>6u){LOAD_NEXT(g)}
+  if(count>7u){LOAD_NEXT(h)}
+#undef LOAD_NEXT
+  // Short network: two nodes.
+  if(count>1u){ordered_pair(a,b);}
+  // Short network: three or four nodes, with sentinel padding.
+  if(count>2u){ordered_pair(c,d);ordered_pair(a,c);ordered_pair(b,d);ordered_pair(b,c);}
+  // Short network: five through eight nodes.
+  if(count>4u){
+   ordered_pair(e,f);ordered_pair(g,h);ordered_pair(e,g);ordered_pair(f,h);ordered_pair(f,g);
+   ordered_pair(a,e);ordered_pair(b,f);ordered_pair(c,g);ordered_pair(d,h);
+   ordered_pair(b,e);ordered_pair(d,g);ordered_pair(c,e);ordered_pair(d,f);ordered_pair(d,e);
+  }
+ }else{
+ uint prior=node_at(head).x;
  for(uint j=1u;j<count;++j){cursor=next_at(cursor);
   if(cursor>=info.y){atomicOr(meta[0],16u);return;}
   uint order=node_at(cursor).x;ascending=ascending&&order>prior;descending=descending&&order<prior;prior=order;
  }
  if(descending&&!ascending){uint reversed=0xffffffffu;cursor=head;
   for(uint j=0u;j<count;++j){if(cursor>=info.y){atomicOr(meta[0],64u);return;}
-   uint next=next_at(cursor);words[cursor*5u+4u]=reversed;reversed=cursor;cursor=next;}
+   uint next=next_at(cursor);nodes[cursor].w=reversed;reversed=cursor;cursor=next;}
    head=reversed;ascending=true;}
- uvec4 a=uvec4(0xffffffffu),b=a,c=a,d=a;
- bool small=!ascending&&count<=4u;
+ bool small=!ascending&&count<=8u;
  if(small){cursor=head;
   a=node_at(cursor);cursor=next_at(cursor);
   if(count>1u){b=node_at(cursor);cursor=next_at(cursor);}
   if(count>2u){c=node_at(cursor);cursor=next_at(cursor);}
-  if(count>3u)d=node_at(cursor);
+  if(count>3u){d=node_at(cursor);cursor=next_at(cursor);}
+  if(count>4u){e=node_at(cursor);cursor=next_at(cursor);}
+  if(count>5u){f=node_at(cursor);cursor=next_at(cursor);}
+  if(count>6u){g=node_at(cursor);cursor=next_at(cursor);}
+  if(count>7u)h=node_at(cursor);
+  /* Keep short, interleaved material lists in registers. This network
+   * avoids rewriting and chasing the global links for five to eight nodes. */
   ordered_pair(a,b);ordered_pair(c,d);ordered_pair(a,c);ordered_pair(b,d);ordered_pair(b,c);
+  ordered_pair(e,f);ordered_pair(g,h);ordered_pair(e,g);ordered_pair(f,h);ordered_pair(f,g);
+  ordered_pair(a,e);ordered_pair(b,f);ordered_pair(c,g);ordered_pair(d,h);
+  ordered_pair(b,e);ordered_pair(d,g);ordered_pair(c,e);ordered_pair(d,f);ordered_pair(d,e);
  }else if(!ascending){head=sort_chain(head,count);ascending=true;}
+ }
  ivec2 p=ivec2(int(pixel%uint(rect.z)),int(pixel/uint(rect.z)))+rect.xy;
  uint rgba=packUnorm4x8(imageLoad(color_image,p)),key=imageLoad(depth_image,p).r;
  uint previous=0u;cursor=head;
  for(uint done=0u;done<count;++done){uvec4 selected=uvec4(0xffffffffu);
   if(ascending){if(cursor>=info.y){atomicOr(meta[0],128u);return;}selected=node_at(cursor);cursor=next_at(cursor);}
-   else selected=done==0u?a:done==1u?b:done==2u?c:d;
+   else selected=done==0u?a:done==1u?b:done==2u?c:done==3u?d:done==4u?e:done==5u?f:done==6u?g:h;
   if(selected.x==0xffffffffu){atomicOr(meta[0],32u);return;}
   previous=selected.x;uint bits=selected.w;
   if((bits&(1u<<20u))!=0u&&(rgba>>24u)>127u)continue;

@@ -2043,8 +2043,17 @@ extern "C" int psx_frame_interpolation_enabled(void) {
  * (no invented phases) on 60 Hz ticks — the output follows the guest.
  * Forcing 33 ms ticks would halve battle to 30. */
 static uint64_t native_present_period_ns(int fps) {
-    return native_present_cadence_resolve(fps, g_host_refresh_hz,
-        g_video_vsync, native_presenter_threaded()).period_ns;
+    const auto cadence = native_present_cadence_resolve(fps, g_host_refresh_hz,
+        g_video_vsync, native_presenter_threaded());
+    const char *wsi_paced = std::getenv("PSX_NATIVE_VK_WSI_PACED");
+    /* At the panel's own rate, FIFO acquire/present already bounds output.
+     * Leave enough CPU wakeup margin instead of adding an almost-full-period
+     * sleep to WSI's jitter. Keep a finite gate for hidden/skipped windows.
+     * Lower frame-rate targets still need their original CPU cadence. */
+    if (g_native_vk && g_video_vsync > 0 && cadence.swap_interval == 1 &&
+        wsi_paced && wsi_paced[0] == '1')
+        return cadence.period_ns / 4u;
+    return cadence.period_ns;
 }
 
 extern "C" int psx_video_get_fps(void) {
