@@ -721,7 +721,7 @@ static bool nvkp_compose(const XgRenderCompiledEndpoint *compiled, uint64_t alph
     int aa_nearest;
     const int mask_valid = sel.image.mask_valid && mask != VK_NULL_HANDLE;
     const int aa_mode = native_present_aa_mode(&sel.endpoint.metadata, mask_valid, aa_setting, &aa_nearest);
-    if (P.limit_postprocess && aa_mode != 0 && lw > 0 && lh > 0) {
+    if (!sel.endpoint.metadata.render_width && P.limit_postprocess && aa_mode != 0 && lw > 0 && lh > 0) {
         /* Window size must not multiply the cost of every AA pass. Preserve
          * at least the complete internal raster and a full-HD AA canvas;
          * scale to larger/HiDPI windows once, after spatial/temporal resolve.

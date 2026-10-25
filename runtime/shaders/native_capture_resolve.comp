@@ -1,6 +1,7 @@
 #version 450
 //! gl_version 430
 #include "native_prelude.glsl"
+#include "native_depth.glsl"
 layout(local_size_x=128) in;
 layout(std430,PSX_BINDING(0,0)) buffer Metadata { uint meta[]; };
 layout(std430,PSX_BINDING(1,1)) readonly buffer Fragments { uvec4 fragments[]; };
@@ -72,7 +73,7 @@ void main(){
    for(uint j=0u;j<count;++j){uvec4 f=fragments[offset+j];if(f.x>previous&&f.x<selected.x)selected=f;}}
   previous=selected.x;uint bits=selected.w;
   if((bits&(1u<<20u))!=0u&&(rgba>>24u)>127u)continue;
-  if((bits&(1u<<21u))!=0u&&selected.z<key-(key>>10u))continue;
+  if((bits&(1u<<21u))!=0u&&selected.z<depth_threshold(key))continue;
   ivec3 c=ivec3(int(bits&31u),int((bits>>5u)&31u),int((bits>>10u)&31u));
   bool blend=(bits&(1u<<16u))!=0u;
   if(blend){ivec3 old=ivec3(int(rgba&255u),int((rgba>>8u)&255u),int((rgba>>16u)&255u))>>3;

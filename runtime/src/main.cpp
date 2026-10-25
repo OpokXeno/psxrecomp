@@ -75,6 +75,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "frame_pacing.h"
 #include "xenogears_scene.h"
 #include "latency_ring.h"
+#include "native_resolution.h"
 #include "input_replay.h"
 #include "host_input_mapping.h"
 #include "sio.h"
@@ -570,7 +571,9 @@ static void mod_call_frame_hooks() {
 static std::atomic<int> g_smooth_60fps{0};
 static std::atomic<int> g_smooth_60fps_requested{0};
 static bool g_native_render_selected = false;
-static int g_video_scale = 1; /* Requested presentation resolution, not guest VRAM scale. */
+static int g_video_scale = 1; /* Integer-scale renderer preference. */
+static int g_video_internal_width = 1920;
+static int g_video_internal_height = 1080;
 static int g_video_aa = 0; /* Host AA defaults off; also selects Native raster scale. */
 static int g_video_aa_factor = 4; /* Quality multiplier independent of AA mode. */
 static bool g_native_render_source_failed = false;
@@ -736,6 +739,7 @@ static void native_render_native_notify(void *user_data) {
 }
 
 static bool native_render_describe_fields(XgRenderSourceFrameDescription *description);
+static void native_render_describe_resolution(XgSemanticDisplayState *display);
 
 
 static bool native_render_describe_work(XgRenderSourceFrameDescription *description) {
@@ -756,7 +760,9 @@ static bool native_render_describe_fields(XgRenderSourceFrameDescription *descri
     const int aa_scale = g_video_aa >= 3 && g_video_aa <= 5
         ? (g_video_aa_factor >= 16 ? 4 : g_video_aa_factor >= 8 ? 3 :
            g_video_aa_factor >= 2 ? 2 : 1) : 1;
-    description->display.render_scale = (uint16_t)(g_video_scale > aa_scale ? g_video_scale : aa_scale);
+    description->display.render_scale =
+        (uint16_t)(g_video_scale > aa_scale ? g_video_scale : aa_scale);
+    native_render_describe_resolution(&description->display);
     description->display.dithering_disabled = gpu_dithering_enabled() == 0;
     description->display.native_depth_test = gl_renderer_native_depth_test() != 0;
     return true;
@@ -1896,8 +1902,24 @@ static int           g_headless       = 0;   /* debug/CI frontend: no SDL window
  * next scanout), turbo loads (load poll), SPU HQ (lazy SPU-shadow
  * re-resolution), supersampling (renderer raster rebuild at next present —
  * glb_set_scale arms s_scale_apply_pending). */
+static void native_render_describe_resolution(XgSemanticDisplayState *display) {
+    display->render_width = display->render_height = 0u;
+    if (!g_native_vk || display->depth24) return;
+    display->render_scale = 1u;
+    display->render_width = (uint16_t)g_video_internal_width;
+    display->render_height = (uint16_t)g_video_internal_height;
+}
+
 extern "C" {
 int  psx_video_get_supersampling(void)  { return g_video_scale; }
+int psx_video_has_native_resolution(void) { return g_native_render_selected && g_native_vk; }
+int psx_video_get_internal_width(void) { return g_video_internal_width; }
+int psx_video_get_internal_height(void) { return g_video_internal_height; }
+void psx_video_set_internal_resolution(int width, int height) {
+    if (width < 1 || width > 16384 || height < 1 || height > 16384) return;
+    g_video_internal_width = width;
+    g_video_internal_height = height;
+}
 void psx_video_set_supersampling(int s) {
     if (s < 1) s = 1;
     if (s > 8) s = 8;
@@ -5808,7 +5830,12 @@ extern "C" int psx_runtime_menu_save_settings(unsigned int changed, int windowed
             s.has_fullscreen = true;
         }
         if (changed & MENU_VSYNC) { s.vsync = g_video_vsync; s.has_vsync = true; }
-        if (changed & MENU_SCALE) { s.supersampling = g_video_scale; s.has_supersampling = true; }
+        if (changed & MENU_SCALE) {
+            s.supersampling = g_video_scale; s.has_supersampling = true;
+            s.internal_width = g_video_internal_width;
+            s.internal_height = g_video_internal_height;
+            s.has_internal_resolution = true;
+        }
         if (changed & MENU_TEXTURE_FILTER) { s.texture_filter = gr_texture_filter(); s.has_texture_filter = true; }
         if (changed & MENU_SPRITE_FILTER) { s.sprite_filter = gl_renderer_sprite_filter(); s.has_sprite_filter = true; }
         if (changed & MENU_ANISOTROPY) { s.anisotropic_filtering = gl_renderer_anisotropy(); s.has_anisotropic_filtering = true; }
@@ -14371,6 +14398,8 @@ namespace {
         gi->aspect_labels = g_aspect_labels;
         gi->num_aspect_labels = g_aspect_choice_count;
         gi->has_renderer = vulkan_offered_b ? 1 : 0;
+        gi->has_native_resolution = vulkan_offered_b ? 1 : 0;
+        gi->native_resolution_renderer_index = psx_launcher_renderer_index(2, vulkan_offered_b);
         gi->renderer_labels = vulkan_offered_b ? kPsxGraphicsApiLabels : kPsxRendererLabels;
         gi->num_renderers = 2;
         gi->settings_bindings = 1;
@@ -15076,6 +15105,10 @@ int main(int argc, char** argv) {
             for (uint32_t site : gc.vsync_event_horizon_extra_sites)
                 psx_vsync_query_hle_add_extra_event_horizon_site(site);
             g_video_scale      = gc.runtime.video_supersampling;
+            if (gc.runtime.video_internal_width && gc.runtime.video_internal_height) {
+                g_video_internal_width = gc.runtime.video_internal_width;
+                g_video_internal_height = gc.runtime.video_internal_height;
+            }
             if (gc.runtime.video_window_width > 0) {
                 g_video_win_w = gc.runtime.video_window_width;
                 g_video_win_w_explicit = true;
@@ -15785,6 +15818,10 @@ int main(int argc, char** argv) {
             g_lnch_lobby_url = us.netplay_lobby_url;
 #endif
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
+        if (us.has_internal_resolution) {
+            g_video_internal_width = us.internal_width;
+            g_video_internal_height = us.internal_height;
+        }
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_window_width && us.window_width > 0) g_video_win_w_explicit = true;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
@@ -16360,6 +16397,9 @@ int main(int argc, char** argv) {
             bool match_session_bios_set = false;
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
+            seed.internal_width = g_video_internal_width;
+            seed.internal_height = g_video_internal_height;
+            seed.has_internal_resolution = true;
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
             seed.antialiasing_factor = g_video_aa_factor; seed.has_antialiasing_factor = true;
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
@@ -16560,6 +16600,8 @@ int main(int argc, char** argv) {
                 PSXRecompV4::DEFAULT_VIDEO_RENDERER != 0)
                 ls.renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
             ls.supersampling      = seed.supersampling;
+            ls.internal_width = seed.internal_width;
+            ls.internal_height = seed.internal_height;
             ls.antialiasing       = seed.antialiasing;
             ls.antialiasing_factor = seed.antialiasing_factor;
             ls.texture_filter     = seed.texture_filter;
@@ -16878,6 +16920,9 @@ int main(int argc, char** argv) {
                 seed.window_width          = ls.window_width;          seed.has_window_width          = true;
                 seed.renderer              = psx_launcher_renderer_backend(ls.renderer, vulkan_offered); seed.has_renderer = true;
                 seed.supersampling         = ls.supersampling;         seed.has_supersampling         = true;
+                seed.internal_width = ls.internal_width;
+                seed.internal_height = ls.internal_height;
+                seed.has_internal_resolution = true;
                 seed.antialiasing          = ls.antialiasing;          seed.has_antialiasing          = true;
                 seed.antialiasing_factor   = ls.antialiasing_factor;   seed.has_antialiasing_factor   = true;
                 seed.geometry_correction   = ls.geometry_correction != 0;
@@ -17104,6 +17149,8 @@ int main(int argc, char** argv) {
                 }
                 g_video_renderer  = seed.renderer;
                 g_video_scale     = seed.supersampling;
+                g_video_internal_width = seed.internal_width;
+                g_video_internal_height = seed.internal_height;
                 g_video_aa        = seed.antialiasing;
                 g_video_aa_factor = seed.antialiasing_factor;
                 if (g_video_aa == 3 && g_video_aa_factor > 4) g_video_aa_factor = 4;
@@ -17511,13 +17558,14 @@ session_reboot:
     gl_renderer_set_antialiasing(g_video_aa);
     gl_renderer_set_antialiasing_factor(g_video_aa_factor);
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
-     * runs sw_renderer_init). OpenGL supports the fork's extended 8x ceiling;
-     * software and Vulkan retain the shared backend limit. */
-    const int max_internal_scale = gr_backend() == GR_BACKEND_OPENGL
-        ? 8 : SW_MAX_INTERNAL_SCALE;
+     * runs sw_renderer_init). Native and OpenGL support 1x..8x; the original
+     * software/Vulkan backends retain their shared limit. Native Vulkan uses
+     * the independent fixed internal_width/internal_height instead. */
     g_native_render_selected = native_render_mode_resolve(
         config_render_mode.c_str(), std::getenv("PSX_NATIVE_RENDER_MODE"),
         cli_render_mode) == GUEST_RENDER_RENDER_NATIVE;
+    const int max_internal_scale = g_native_render_selected || gr_backend() == GR_BACKEND_OPENGL
+        ? 8 : SW_MAX_INTERNAL_SCALE;
     if (g_video_scale < 1) g_video_scale = 1;
     if (g_video_scale > max_internal_scale)
         g_video_scale = max_internal_scale;
@@ -17591,7 +17639,7 @@ session_reboot:
                      "psxrecomp: geometry correction %s, perspective texturing %s%s\n",
                      g_video_geometry_correction ? "on" : "off",
                      g_video_perspective_texturing ? "on" : "off",
-                     (g_video_geometry_correction && requested_scale < 2)
+                     (g_video_geometry_correction && !g_native_render_selected && requested_scale < 2)
                          ? " (needs [video] supersampling >= 2 to be visible)" : "");
     }
     /* Display aspect. Identity at the default 4:3. The present letterbox uses
@@ -19141,6 +19189,8 @@ soft_return_lobby:
         if (ls.renderer < 0 || ls.renderer > 1)
             ls.renderer = psx_launcher_renderer_index(PSXRecompV4::DEFAULT_VIDEO_RENDERER, vulkan_offered);
         ls.supersampling = g_video_scale;
+        ls.internal_width = g_video_internal_width;
+        ls.internal_height = g_video_internal_height;
         ls.antialiasing = g_video_aa;
         ls.antialiasing_factor = g_video_aa_factor;
         ls.texture_filter = g_video_texfilter;
@@ -19482,6 +19532,9 @@ soft_return_lobby:
                 us.has_renderer = true;
                 us.supersampling = ls.supersampling;
                 us.has_supersampling = true;
+                us.internal_width = ls.internal_width;
+                us.internal_height = ls.internal_height;
+                us.has_internal_resolution = true;
                 us.antialiasing = ls.antialiasing;
                 us.has_antialiasing = true;
                 us.antialiasing_factor = ls.antialiasing_factor;
@@ -19550,6 +19603,8 @@ soft_return_lobby:
             }
             g_video_renderer = psx_launcher_renderer_backend(ls.renderer, vulkan_offered);
             g_video_scale = ls.supersampling;
+            g_video_internal_width = ls.internal_width;
+            g_video_internal_height = ls.internal_height;
             psx_video_set_antialiasing(ls.antialiasing);
             psx_video_set_antialiasing_factor(ls.antialiasing_factor);
             g_video_texfilter = ls.texture_filter;

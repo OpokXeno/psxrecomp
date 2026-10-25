@@ -4,6 +4,7 @@
 #include "runtime_menu_visibility.h"
 #include "runtime_menu_actions.h"
 #include "free_camera.h"
+#include "native_resolution.h"
 
 #ifdef PSX_RUNTIME_MENU
 #include <imgui.h>
@@ -48,6 +49,10 @@
 
 extern "C" {
 int psx_video_get_supersampling(void);
+int psx_video_has_native_resolution(void);
+int psx_video_get_internal_width(void);
+int psx_video_get_internal_height(void);
+void psx_video_set_internal_resolution(int, int);
 void psx_video_set_supersampling(int);
 int psx_video_get_antialiasing(void);
 void psx_video_set_antialiasing(int);
@@ -421,9 +426,26 @@ void video_menu() {
     }
     ImGui::Separator();
     if (ImGui::BeginMenu("Rendering", hardware_rendering)) {
-        int scale = psx_video_get_supersampling();
-        ImGui::SetNextItemWidth(220);
-        if (ImGui::SliderInt("Internal scale", &scale, 1, 8)) { psx_video_set_supersampling(scale); remember(MENU_SCALE); }
+        if (psx_video_has_native_resolution()) {
+            if (ImGui::BeginMenu("Internal resolution")) {
+                for (unsigned i = 0; i < NATIVE_RESOLUTION_PRESET_COUNT; ++i) {
+                    int width, height;
+                    native_resolution_preset(i, &width, &height);
+                    char label[32];
+                    std::snprintf(label, sizeof(label), "%d x %d", width, height);
+                    if (ImGui::MenuItem(label, nullptr,
+                            psx_video_get_internal_width() == width && psx_video_get_internal_height() == height)) {
+                        psx_video_set_internal_resolution(width, height);
+                        remember(MENU_SCALE);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+        } else {
+            int scale = psx_video_get_supersampling();
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::SliderInt("Internal scale", &scale, 1, 8)) { psx_video_set_supersampling(scale); remember(MENU_SCALE); }
+        }
         const char* filters[] = {"Nearest", "Bilinear"};
         const int filter_values[] = {0, 1};
         choice("Texture filtering", gr_texture_filter(), filters, filter_values, 2, gr_set_texture_filter, MENU_TEXTURE_FILTER);

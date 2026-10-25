@@ -172,7 +172,7 @@ void native_gpu_prepare_draw(const GlNativeGpuWork *work,
     const int gpu_setup=!lines && work->gpu_setup;
     if(gpu_setup)memset(&out->attributes,0,sizeof(out->attributes));
     if (!lines && !gpu_setup) native_attribute_planes(tri,
-        x, y, native_gpu_plane_scale(work, command->plane), flags.gouraud, &out->attributes);
+        x, y, work->render_width && command->plane ? 0u : native_gpu_plane_scale(work, command->plane), flags.gouraud, &out->attributes);
     out->depth = (GlNativeDepthMode){0, GL_NATIVE_DEPTH_RESET, flags.semi_transparent ? 1 : 0,
         0, GL_NATIVE_DEPTH_SHOW_NONE, {0}};
     if (wire) out->depth.semi = 0;

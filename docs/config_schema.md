@@ -461,6 +461,8 @@ Runtime video defaults live in `[video]`:
 [video]
 renderer = "opengl"       # "software", "opengl", or "vulkan"
 offer_vulkan = false      # show Vulkan in the launcher only after game validation
+internal_resolution = "1920x1080" # fixed Native Vulkan raster, independent of window size
+supersampling = 1         # integer scale 1..8 for other renderers
 fps = 30                  # 30 = original cadence; 60 = Native interpolation
 auto_skip_fmv = false     # legacy Settings/runtime default
 offer_skip_fmv = true     # false when the game exposes this through Mods
@@ -473,6 +475,15 @@ anisotropic_filtering = 0     # Native 3D scene textures: 0 (Off), 2, 4, 8, 16
 a build compiled with Vulkan support. `offer_vulkan` controls launcher
 visibility only; it defaults to false so game projects must explicitly expose
 Vulkan after validating their visuals and stability.
+
+`internal_resolution = "WIDTHxHEIGHT"` selects fixed raster dimensions for
+Native Vulkan geometry (1..16384 pixels per axis). The launcher and runtime menu
+offer 640×480, 1280×720, 1920×1080, 2560×1440 and 3840×2160. Window resizing,
+fullscreen and HiDPI changes only affect presentation; the internal raster
+remains at the selected size. The chosen aspect ratio still controls the
+displayed image. The same `internal_resolution` key is saved in user settings.
+Guest VRAM and texture coordinates retain their original grid. OpenGL and
+Original rendering retain integer scales. Sprite/FMV source detail is unchanged.
 
 Native Vulkan performance diagnostics (`native_vk_services` on the debug API)
 separate swaps from selected endpoint/phase image updates. `image_updates` and

@@ -351,6 +351,9 @@ struct RuntimeConfig {
     // an N*-scaled mirror of VRAM and downsample on present — true ordered-grid
     // supersampling + edge anti-aliasing. Cost scales ~N^2 in fill rate.
     int                   video_supersampling = 1;
+    // Fixed Native Vulkan raster dimensions; zero uses the frontend default.
+    int                   video_internal_width = 0;
+    int                   video_internal_height = 0;
 
     // Optional initial window width declared by the title profile. Zero keeps
     // the historical fit-to-display behavior; player settings may override it.
@@ -1205,6 +1208,8 @@ struct UserSettings {
     // [video]
     bool has_renderer       = false; int  renderer       = DEFAULT_VIDEO_RENDERER; // 0=software,1=opengl,2=vulkan
     bool has_supersampling  = false; int  supersampling  = 1; // 1..8
+    bool has_internal_resolution = false;
+    int internal_width = 1920, internal_height = 1080;
     // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
     // both the launcher and the emulator window so they boot at the same size.
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960

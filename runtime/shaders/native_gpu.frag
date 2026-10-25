@@ -22,6 +22,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #endif
 #include "native_gpu_common.glsl"
+#include "native_depth.glsl"
 
 #if defined(VULKAN) && !defined(NATIVE_GPU_INTERLOCK)
 #define NATIVE_DECODE_UNIFORM(U) U(int, decoded_on)
@@ -51,8 +52,8 @@
  * the per-triangle parameter records instead. Inclusive sampled texel range of the
  * triangle (gpu_uv.h limits) is sample_lim. depth_state = (test, mode of an
  * unblended fragment 1=far 2=key 3=copy source, per-texel keep, bias);
- * depth_plane = (N0 Q8, a, b, scale) at the logical depth_origin. The key is
- * the CPU reference's integer evaluation, extended to scale S subpixels.
+ * depth_plane = (FP32 seed, physical dx, physical dy, integer scale), with
+ * float bits transported in xyz. The origin is in physical pixels.
  * depth_view = (0 off / 1 depth colour / 2 policy / 3 depth grey,
  * policy colour, log2 key range x256). HD texture replacement: hd_map = (page->
  * upload texel offset u/v, upload size in texels), hd_lim = the draw's sampled
@@ -85,6 +86,7 @@
 #endif
 PSX_UNIFORMS(NativeView, 0, NATIVE_VIEW_UNIFORMS)
 PSX_UNIFORMS(NativeDraw, 1, NATIVE_DRAW_UNIFORMS)
+#include "native_raster.glsl"
 
 #ifdef NATIVE_GPU_CORE_BATCH
 #undef sample_lim
@@ -237,23 +239,9 @@ vec4 result; uvec4 depth_result;
 layout(location=0) out vec4 result; layout(location=1) out uvec4 depth_result;
 #endif
 uint depth_key(){
- int S=depth_plane.w; ivec2 d=ivec2(gl_FragCoord.xy)-depth_origin*S;
-/* Scale is constant for the target, but batched material records make it
- * a shader input rather than a compile-time integer. Avoid four general
- * integer divides per depth-tested pixel at the common 1x/2x/4x scales.
- * Arithmetic shifts give the required floor for negative origins too.
- * The fractional numerator is positive under DEPTH_SLOPE_LIMIT at S<=8. */
-#ifndef NATIVE_GPU_GENERIC_RASTER
- if(S==1){int n=int(uint(depth_plane.x)+uint(depth_plane.y)*uint(d.x)+uint(depth_plane.z)*uint(d.y));return uint(max(n>>8,1));}
- if(S==2||S==4||S==8){int shift=S==2?1:S==4?2:3;ivec2 l=d>>shift,r=d-(l<<shift);
-  int n=int(uint(depth_plane.x)+uint(depth_plane.y)*uint(l.x)+uint(depth_plane.z)*uint(l.y));
-  int k=(n>>8)+(((n&255)*S+depth_plane.y*r.x+depth_plane.z*r.y+S*134217728)>>(8+shift))-524288;
-  return uint(max(k,1));}
-#endif
- ivec2 l=ivec2(d.x>=0?d.x/S:-((S-1-d.x)/S),d.y>=0?d.y/S:-((S-1-d.y)/S)); ivec2 r=d-l*S;
- int n=int(uint(depth_plane.x)+uint(depth_plane.y)*uint(l.x)+uint(depth_plane.z)*uint(l.y));
- int k=(n>>8)+((n&255)*S+depth_plane.y*r.x+depth_plane.z*r.y+S*134217728)/(256*S)-524288;
- return uint(max(k,1));
+ vec2 pos=native_raster_position(gl_FragCoord.xy);
+ ivec2 delta=ivec2(pos)-depth_origin;
+ return NATIVE_RASTER.x>0.0?depth_evaluate_at(depth_plane,native_raster_delta(gl_FragCoord.xy,vec2(depth_origin))):depth_evaluate(depth_plane,delta);
 }
 /* Depth views: black = no certified surface; otherwise t over the frame's
  * written key range (1 = near). Mode 1 maps t on a Turbo ramp (red near,
@@ -261,7 +249,7 @@ uint depth_key(){
 /* lw is the screen-space width of one contour step (fwidth, taken by the
  * caller in uniform control flow): contours stay about one pixel wide. */
 vec3 depth_gray(uint k,float lw){if(k==0u)return vec3(0.0);
- float l=log2(float(k)); float lo=float(depth_view.z)/256.0,hi=float(depth_view.w)/256.0;
+ float l=log2(uintBitsToFloat(k)); float lo=float(depth_view.z)/256.0,hi=float(depth_view.w)/256.0;
  float t=hi>lo+0.01?clamp((l-lo)/(hi-lo),0.0,1.0):0.5;
  float contour=fract(l*16.0)<min(lw,0.5)?0.5:1.0;
  if(depth_view.x==3)return vec3(0.12+0.88*t)*contour;
@@ -318,17 +306,17 @@ uint destination_key(){return DEST_DEPTH().r;}
 float attribute_sample(int a){
 #if defined(NATIVE_GPU_INTERLOCK) && !defined(NATIVE_GPU_GENERIC_RASTER)
  if(parameters_on!=0){uvec4 v=texelFetch(parameters,(parameter_index-parameter_base)*14+9+a);
-  if(attribute_origin.z==1.0){ivec2 delta=ivec2(floor(gl_FragCoord.xy))-ivec2(attribute_origin.xy*size.w);
+  if(attribute_origin.z==1.0){ivec2 delta=ivec2(floor(native_raster_position(gl_FragCoord.xy)))-ivec2(attribute_origin.xy*size.w);
    uint q=v.x+v.y*uint(delta.x)+v.z*uint(delta.y);return float(q&1048575u)/4096.0;}
-  vec3 p=uintBitsToFloat(v.xyz);vec2 delta=(gl_FragCoord.xy-vec2(0.5))/size.w-attribute_origin.xy;
+  vec3 p=uintBitsToFloat(v.xyz);vec2 delta=native_raster_delta(gl_FragCoord.xy,attribute_origin.xy*size.w)/size.w;
   return p.x+dot(p.yz,delta);}
 #endif
  if(attribute_origin.z==1.0){
-  ivec2 delta=ivec2(floor(gl_FragCoord.xy))-ivec2(attribute_origin.xy*size.w);
+  ivec2 delta=ivec2(floor(native_raster_position(gl_FragCoord.xy)))-ivec2(attribute_origin.xy*size.w);
   uvec3 p=uvec3(attribute_dda[a].xyz); uint q=p.x+p.y*uint(delta.x)+p.z*uint(delta.y);
   return float(q&1048575u)/4096.0;
  }
- vec2 delta=(gl_FragCoord.xy-vec2(0.5))/size.w-attribute_origin.xy;
+ vec2 delta=native_raster_delta(gl_FragCoord.xy,attribute_origin.xy*size.w)/size.w;
  return attribute_plane[a].x+dot(attribute_plane[a].yz,delta);
 }
 float attribute_at(int a){return floor(attribute_sample(a));}
@@ -390,8 +378,8 @@ void check_destination(int blending){
  if(flags.y!=0||blending!=0)checked_color=destination_color();
  if(flags.y!=0&&checked_color.a>0.5)discard;
  if(depth_state.x==1||(depth_state.z!=0&&blending!=0))checked_stored=destination_key();
- if(depth_state.x!=0){checked_key=depth_key();uint tested=checked_key+(depth_state.w!=0?checked_key>>uint(depth_state.w):0u);
-  if(depth_state.x==1&&tested<checked_stored-(checked_stored>>10u))discard;}
+ if(depth_state.x!=0){checked_key=depth_key();uint tested=depth_biased(checked_key,uint(depth_state.w));
+  if(depth_state.x==1&&tested<depth_threshold(checked_stored))discard;}
  destination_checked=true;
 }
 #endif
@@ -403,7 +391,7 @@ void shade_source(){
  vec2 hd_uv=vec2(0.0),hd_dx=vec2(0.0),hd_dy=vec2(0.0);
  if(hd_on!=0){vec2 hp=(persp!=0?t_p:t)+vec2(size.z); vec2 fl=floor(hp);
   ivec2 hq=ivec2(fl)&255; hq=(hq&~(window.xy*8))|((window.zw&window.xy)*8);
-  if(hd_on==2){hd_uv=(hp+vec2(hd_map.xy))/vec2(hd_map.zw);}
+  if(hd_on==2){hd_uv=native_source_uv((hp+vec2(hd_map.xy))/vec2(hd_map.zw));}
   else {vec2 k=vec2(textureSize(hd_image,0))/vec2(hd_map.zw);
   vec2 tx=clamp(vec2(hq+hd_map.xy)+(hp-fl),vec2(hd_lim.xy+hd_map.xy)+0.5/k,vec2(hd_lim.zw+hd_map.xy)+1.0-0.5/k);
   hd_uv=tx/vec2(hd_map.zw);}}
@@ -431,10 +419,11 @@ void shade_source(){
     vec3 width=max(sqrt(dx*dx+dy*dy),vec3(0.000001));
     if(all(greaterThan(wire_barycentric,width)))REJECT_PIXEL;}
 #endif
-   result=flags.w==2?texture(source_image,t):constant_color;
+   vec2 transfer_uv=native_transfer_uv(t,vec2(textureSize(source_image,0)));
+   result=flags.w==2?texture(source_image,transfer_uv):constant_color;
   if(flags.z!=0)result.a=result.a>0.5?2.0/3.0:0.0;
   if(flags.x!=0)result.a=result.a>0.83||result.a>0.16&&result.a<0.5?1.0:2.0/3.0;
-  depth_result=uvec4(depth_state.y==3?texture(source_depth,t).r:0u);
+  depth_result=uvec4(depth_state.y==3?texture(source_depth,transfer_uv).r:0u);
   return;}
  vec3 rgb=vec3(128.0);
 #ifndef NATIVE_GPU_GENERIC_RASTER
@@ -450,7 +439,7 @@ if(state.x==0||state.y==0){
 #endif
  ivec3 c=ivec3(clamp(rgb,0.0,255.0)); int mask=flags.x,blend=state.z;
  const int d[16]=int[16](-4,0,-3,1,2,-2,3,-1,-3,1,-4,0,3,-1,2,-2);
- ivec2 dp=ivec2(floor(gl_FragCoord.xy/size.w))+origin; int bias=flags.z!=0?d[(dp.y&3)*4+(dp.x&3)]:0;
+ ivec2 dp=ivec2(floor(native_raster_position(gl_FragCoord.xy)/size.w))+origin; int bias=flags.z!=0?d[(dp.y&3)*4+(dp.x&3)]:0;
  bool hd=false; vec3 hf=vec3(0.0);
  if(state.x!=0){
 #ifdef NATIVE_GPU_GENERIC_RASTER
@@ -600,11 +589,11 @@ void commit_pixel(){
  if(flags.y!=0 || (flags.w==0 && state.z!=0)) old=destination_color();
  if(flags.y!=0 && old.a>0.5) REJECT_PIXEL;
  if(depth_state.x==1||depth_state.z!=0) stored=destination_key();
- if(depth_state.x!=0){key=depth_key(); uint tested=key+(depth_state.w!=0?key>>uint(depth_state.w):0u);
-  if(depth_state.x==1&&tested<stored-(stored>>10u)) REJECT_PIXEL;}
+ if(depth_state.x!=0){key=depth_key(); uint tested=depth_biased(key,uint(depth_state.w));
+  if(depth_state.x==1&&tested<depth_threshold(stored)) REJECT_PIXEL;}
  }
  if(flags.w!=0){if(depth_view.x==1||depth_view.x==3)
-  result.rgb=depth_gray(depth_result.r,fwidth(log2(float(max(depth_result.r,1u)))*16.0));return;}
+  result.rgb=depth_gray(depth_result.r,fwidth(log2(max(uintBitsToFloat(depth_result.r),1.17549435e-38))*16.0));return;}
  ivec3 c=source_c;int mask=source_mask,blend=source_blend;bool hd=source_hd;vec3 hf=source_hf;
  if(hd){if(blend!=0){vec3 b=old.rgb;
   if(state.w==0)hf=(b+hf)*0.5; else if(state.w==1)hf=b+hf; else if(state.w==2)hf=b-hf; else hf=b+hf*0.25;}
@@ -616,7 +605,7 @@ void commit_pixel(){
 /* Blended fragments keep the stored key; opaque ones (including opaque
  * texels of a semi-transparent material) write the key or far. */
  depth_result=uvec4(depth_state.y==4?1u:blend!=0?stored:(depth_state.y==2?key:0u));
- if(depth_view.x==1||depth_view.x==3){float lw=fwidth(log2(float(max(depth_result.r,1u)))*16.0);
+ if(depth_view.x==1||depth_view.x==3){float lw=fwidth(log2(max(uintBitsToFloat(depth_result.r),1.17549435e-38))*16.0);
   result.rgb=blend!=0?old.rgb:depth_gray(depth_result.r,lw);}
  else if(depth_view.x==2){vec3 tint=depth_view.y==1?vec3(1.0,0.85,0.1):depth_view.y==2?vec3(0.1,0.9,0.2):
   depth_view.y==3?vec3(1.0,0.15,0.15):vec3(dot(result.rgb,vec3(0.3,0.59,0.11)));
@@ -667,14 +656,14 @@ void capture_pixel(){
  if(slot>=128u||slot>=capture_meta[4u+pixel]||offset+slot>=capture_meta[2]){atomicOr(capture_meta[0],1u);discard;}
 #endif
  uint key=depth_state.x!=0?depth_key():0u;
- uint tested=key+(depth_state.w!=0?key>>uint(depth_state.w):0u);
+ uint tested=depth_biased(key,uint(depth_state.w));
  uint bits=uint(source_c.r)|(uint(source_c.g)<<5u)|(uint(source_c.b)<<10u)|
   (uint(source_mask)<<15u)|(uint(source_blend)<<16u)|(uint(aa_exempt)<<17u)|
   (uint(state.w)<<18u)|(uint(flags.y)<<20u)|(uint(depth_state.x)<<21u)|
   (uint(depth_state.y)<<22u)|(uint(min(depth_state.x+depth_state.z,1))<<25u);
 #ifdef NATIVE_GPU_LINKED_CAPTURE
  /* Depth bias is clamped to 0..16 by geometry preparation. Keep the full
-  * key and reconstruct the biased key in resolve, preserving uint overflow. */
+  * FP32 key bits and reconstruct the biased key in resolve. */
  capture_fragments[node]=uvec4(triangle_data[4].z,key,bits|(uint(depth_state.w)<<26u),next);
 #else
  capture_fragments[offset+slot]=uvec4(triangle_data[4].z,key,tested,bits);

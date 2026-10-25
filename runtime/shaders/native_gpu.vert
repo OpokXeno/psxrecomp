@@ -10,6 +10,7 @@
 layout(location=0) in vec2 p; layout(location=1) in vec2 uv; layout(location=2) in vec4 c;
 layout(location=3) in float q;   /* reciprocal-z weight; 0 = affine */
 PSX_UNIFORMS(NativeView, 0, NATIVE_VIEW_UNIFORMS)
+#include "native_raster.glsl"
 #ifdef NATIVE_GPU_INTERLOCK
 #define size u_size
 #endif
@@ -78,4 +79,7 @@ t=uv; t_p=uv; color=c; persp=q>0.0?1:0;
   float w=q>0.0?1.0/q:1.0;
 /* Scaling both x/y and w leaves the NDC position unchanged, so coverage is
  * identical to the affine path; only the varying interpolation changes. */
-  gl_Position=vec4(((p+size.z)/size.xy*2.0-1.0)*w,0.0,w);}
+  vec2 grid_shift=vec2(size.z);
+  if(size.z!=0.0)grid_shift+=0.5/size.w*(native_raster_transform().xy-vec2(1.0));
+  vec2 local=p-vec2(0.0,NATIVE_RASTER_PAGES.x);
+  gl_Position=vec4(((local+grid_shift)/size.xy*2.0-1.0)*w,0.0,w);}

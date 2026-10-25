@@ -1,42 +1,35 @@
 #ifndef NATIVE_VK_DEPTH_BOUNDS_H
 #define NATIVE_VK_DEPTH_BOUNDS_H
-#include <stdint.h>
-#include <limits.h>
+#include "native_depth.h"
 
-static inline int64_t nvk_depth_floor_div(int64_t n, int64_t d)
-{
-    return n >= 0 ? n / d : -((d - 1 - n) / d);
-}
-static inline int64_t nvk_depth_floor_shift(int64_t n, unsigned shift)
-{
-    return n >= 0 ? n >> shift : -(((-n) + ((INT64_C(1) << shift) - 1)) >> shift);
-}
-
-/* Conservative extrema of the shader's integer depth key over a physical
- * pixel rectangle. Reject intervals where the shader's intermediate int32
- * accumulator can wrap; those triangles retain the ordinary depth read. */
-static inline int nvk_depth_interval(int32_t n0, int32_t a, int32_t b, int32_t ox, int32_t oy,
+/* Conservative extrema of the FP32 shader plane over a physical rectangle.
+ * Use the signs of the slopes to select two extreme corners, evaluate in
+ * double and widen for FP32 rounding (including separate mul/add on GL 3.3).
+ * This CPU scheduling path needs neither per-corner fmaf nor nextafter calls.
+ * An uncertain interval retains the ordinary per-fragment depth read. */
+static inline int nvk_depth_interval(float seed, float a, float b, int32_t ox, int32_t oy,
                                      uint32_t scale, int left, int top, int right, int bottom,
                                      uint32_t *low, uint32_t *high)
 {
-    if ((scale != 1u && scale != 2u && scale != 4u && scale != 8u) || left >= right || top >= bottom ||
-        a < -(1 << 22) || a > (1 << 22) || b < -(1 << 22) || b > (1 << 22)) return 0;
-    uint32_t minimum = UINT32_MAX, maximum = 0u;
-    const unsigned shift = scale == 1u ? 0u : scale == 2u ? 1u : scale == 4u ? 2u : 3u;
-    for (unsigned corner = 0u; corner < 4u; ++corner) {
-        const int64_t dx = (corner & 1u ? right - 1 : left) - (int64_t)ox * scale;
-        const int64_t dy = (corner & 2u ? bottom - 1 : top) - (int64_t)oy * scale;
-        const int64_t lx = nvk_depth_floor_shift(dx, shift), ly = nvk_depth_floor_shift(dy, shift);
-        const int64_t n = (int64_t)n0 + (int64_t)a * lx + (int64_t)b * ly;
-        if (n < INT32_MIN || n > INT32_MAX) return 0;
-        const int64_t numerator = n * scale + (int64_t)a * (dx - lx * scale) + (int64_t)b * (dy - ly * scale);
-        int64_t key = nvk_depth_floor_shift(numerator, 8u + shift);
-        if (key < 1) key = 1;
-        if (key > UINT32_MAX / 2u) return 0;
-        if ((uint32_t)key < minimum) minimum = (uint32_t)key;
-        if ((uint32_t)key > maximum) maximum = (uint32_t)key;
-    }
-    *low = minimum; *high = maximum;
+    if (!scale || scale > 8u || left >= right || top >= bottom ||
+        !isfinite(seed) || !isfinite(a) || !isfinite(b)) return 0;
+    /* Round the physical gradients exactly as the uploaded FP32 parameters. */
+    const double dx = (float)(a / (float)scale), dy = (float)(b / (float)scale);
+    const double x0 = (int64_t)left - (int64_t)ox * scale, x1 = (int64_t)right - 1 - (int64_t)ox * scale;
+    const double y0 = (int64_t)top - (int64_t)oy * scale, y1 = (int64_t)bottom - 1 - (int64_t)oy * scale;
+    const double minimum = seed + dx * (dx >= 0.0 ? x0 : x1) + dy * (dy >= 0.0 ? y0 : y1);
+    const double maximum = seed + dx * (dx >= 0.0 ? x1 : x0) + dy * (dy >= 0.0 ? y1 : y0);
+    const double ax = fabs(x0) > fabs(x1) ? fabs(x0) : fabs(x1);
+    const double ay = fabs(y0) > fabs(y1) ? fabs(y0) : fabs(y1);
+    const double error = 8.0 * FLT_EPSILON * (fabs((double)seed) + fabs(dx) * ax + fabs(dy) * ay);
+    const double lower = minimum - error, upper = maximum + error;
+    if (upper >= FLT_MAX) return 0;
+    uint32_t lo = native_depth_encode(lower > FLT_MIN ? (float)lower : FLT_MIN);
+    uint32_t hi = native_depth_encode(upper > FLT_MIN ? (float)upper : FLT_MIN);
+    /* Outward by one FP32 ULP, without libm calls in this scheduling loop. */
+    if (lo > UINT32_C(0x00800000)) --lo;
+    if (hi >= UINT32_C(0x7f7fffff)) return 0;
+    *low = lo; *high = hi + 1u;
     return 1;
 }
 #endif

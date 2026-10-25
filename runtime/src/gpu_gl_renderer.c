@@ -6931,14 +6931,16 @@ static unsigned native_gpu_depth_uniforms(const GlNativeGpuWork *work, const GlN
     }
     native_gpu_uniform4(5, s_native_gpu_depth_state, mode->test, mode->write, mode->semi, mode->bias);
     if (mode->test) {
+        const int ox = mode->plane.ox * (int)work->scale, oy = mode->plane.oy * (int)work->scale;
         native_gpu_uniform4(NATIVE_UNIFORM_DEPTH_PLANE,s_native_gpu_depth_plane,
-            mode->plane.n0, mode->plane.a, mode->plane.b, (int)work->scale);
+            native_depth_encode(mode->plane.n0), native_depth_encode(mode->plane.a / (float)work->scale),
+            native_depth_encode(mode->plane.b / (float)work->scale), (int)work->scale);
         if (s_native_gpu_parameter_capture) {
-            s_native_gpu_parameter_capture->value[NATIVE_PARAMETER_DEPTH_ORIGIN][0]=(uint32_t)mode->plane.ox;
-            s_native_gpu_parameter_capture->value[NATIVE_PARAMETER_DEPTH_ORIGIN][1]=(uint32_t)mode->plane.oy;
-        } else if (s_native_gpu_depth_origin_value[0]!=mode->plane.ox || s_native_gpu_depth_origin_value[1]!=mode->plane.oy) {
-            p_glUniform2i(s_native_gpu_depth_origin, mode->plane.ox, mode->plane.oy);
-            s_native_gpu_depth_origin_value[0]=mode->plane.ox;s_native_gpu_depth_origin_value[1]=mode->plane.oy;
+            s_native_gpu_parameter_capture->value[NATIVE_PARAMETER_DEPTH_ORIGIN][0]=(uint32_t)ox;
+            s_native_gpu_parameter_capture->value[NATIVE_PARAMETER_DEPTH_ORIGIN][1]=(uint32_t)oy;
+        } else if (s_native_gpu_depth_origin_value[0]!=ox || s_native_gpu_depth_origin_value[1]!=oy) {
+            p_glUniform2i(s_native_gpu_depth_origin, ox, oy);
+            s_native_gpu_depth_origin_value[0]=ox;s_native_gpu_depth_origin_value[1]=oy;
         }
     }
     return GL_NATIVE_GPU_DEPTH_ATTACHED | (mode->test || mode->semi ? GL_NATIVE_GPU_DEPTH_READ : 0u);

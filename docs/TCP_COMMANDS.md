@@ -581,6 +581,10 @@ the new value; that round-trip is the test contract (see
   open/close with it, re-resolves disc-patching mods and switches the per-disc
   savestate scope. Rejected (`-3`) in netplay, for a single-disc title, an
   unknown or already-inserted disc, or a disc the player has not located.
+- `{"cmd":"overlay_widget_action","name":"aspect_ratio","value":4,"value2":3}`
+  applies the same complete runtime aspect switch as the menu bar, including
+  Native view layout, projection, culling and backdrop stretch. It does not
+  resize the window or persist settings. Use `16,9` to return to widescreen.
 - `{"cmd":"overlay_widget_action","name":"aspect_set","value":16,"value2":9}`
   → sets widescreen aspect to 16:9 via `gte_set_display_aspect`.
 - `{"cmd":"overlay_widget_action","name":"bd_stretch_on","value":1}` and

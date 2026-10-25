@@ -106,6 +106,7 @@ int gl_renderer_ui_context_enter(void);
 void gl_renderer_ui_context_leave(void);
 void gl_renderer_native_set_worker_notify(void (*notify)(void *), void *data);
 void gl_renderer_native_stop_gpu_worker(void);
+void gl_renderer_native_present_settings(int *aa_mode, int *aa_factor, int *stretch_num, int *stretch_den);
 /* Cheap request query; does not enter GL or execute renderer work. */
 int gl_renderer_native_service_pending(void);
 
@@ -147,6 +148,7 @@ typedef struct GlRendererNativeEndpointMetadata {
     int disabled;
     uint16_t temporal_hz;
     uint16_t render_scale;
+    uint16_t render_width, render_height; /* exact host raster request, zero: manual scale */
     uint32_t temporal_phase_count;
     uint32_t temporal_interval_vblanks;
     uint64_t temporal_interval_ns;

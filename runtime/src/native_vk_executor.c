@@ -31,6 +31,7 @@
  * occlusion queries and GPU timestamps are diagnostics only and not recorded. */
 
 #include "native_vk_executor.h"
+#include "native_resolution.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,7 +94,7 @@ enum {
 };
 
 /* std140 NativeView / NativeDraw of the core variant (native_gpu.frag, native_prelude.glsl). */
-typedef struct NvkView { float size[4]; } NvkView;
+typedef struct NvkView { float size[4], raster[4], source_raster[4], raster_pages[4]; } NvkView;
 typedef struct NvkDraw {
     int32_t hd_map[4], hd_lim[4], mip_rect[4], sample_lim[4], state[4], flags[4], page[4], window[4];
     float uv_gradient[4];
@@ -120,7 +121,7 @@ typedef struct NvkDrawIL {
 _Static_assert(sizeof(NvkDrawIL) == 440, "NativeDraw interlock std140 size");
 _Static_assert(offsetof(NvkDrawIL, hd_on) == offsetof(NvkDraw, hd_on), "interlock draw prefix");
 _Static_assert(256 + sizeof(NvkDrawIL) <= NVK_SLOT, "uniform slot");
-_Static_assert(sizeof(NvkView) == 16, "NativeView std140 size");
+_Static_assert(sizeof(NvkView) == 64, "NativeView std140 size");
 _Static_assert(sizeof(NvkDraw) == 432, "NativeDraw std140 size");
 _Static_assert(256 + sizeof(NvkDraw) <= NVK_SLOT, "uniform slot");
 
@@ -131,7 +132,11 @@ typedef struct NvkPlane {
     VkFramebuffer framebuffer;
     VkFramebuffer capture_framebuffer;
     VkImageView alpha_view;  /* scan: the R8 mask read as alpha (GL mask swizzle A<-R) */
-    uint32_t width, height;
+    uint32_t width, height; /* virtual raster extent; color.width/height are physical */
+    float raster[4]; /* virtual/physical X,Y; physical viewport origin X,Y */
+    uint32_t page_rows, page_pixels; /* shared VRAM aliases start on integer pixels */
+    uint64_t layout_generation; /* retired targets belong to one raster layout */
+    uint64_t last_used_work;
     int has_key;    /* GL: the plane carries its depth attachment */
     int dirty_all;  /* GL: unknown writes since the last barrier */
     int scan;
@@ -267,6 +272,8 @@ static struct {
     const GlNativeGpuWork *pending_work;
     XgPresentationIdentity pending_identity;
     int pending_ok;
+    uint64_t layout_generation;
+    uint64_t work_sequence;
 } S;
 
 /* ---- one execution -------------------------------------------------------------- */
@@ -304,6 +311,7 @@ static struct {
     int32_t fail_code;
     NvkCounters c;
     NvkPlane *pass_plane;
+    uint32_t page_y; /* virtual origin of the current viewport */
     NvkBound b;
     NvkView v;
     NvkDraw d;
@@ -350,6 +358,7 @@ static struct {
     uint64_t works, gpu_works;
     uint64_t streamed_works, streamed_chunks;
     uint64_t rendered_phases;
+    uint64_t layout_cache_resets, layout_cache_evictions, layout_cache_evicted_bytes;
     uint64_t cleared_spans, cleared_rects;
     uint64_t damage_bounds_pixels, capture_pixels, capture_full_pixels;
     uint64_t core_batches, core_batch_triangles, draw_calls;
@@ -749,6 +758,61 @@ static void nvk_plane_free(NvkPlane *p)
     memset(p, 0, sizeof(*p));
 }
 
+static void nvk_discard_cached_plane(NvkPlane *p)
+{
+    if (!p->color.image) return;
+    ++P.layout_cache_evictions;
+    P.layout_cache_evicted_bytes += (uint64_t)p->color.width * p->color.height * (p->scan ? 5u : 8u);
+    nvk_plane_free(p);
+}
+
+static int nvk_cached_plane_expired(const NvkPlane *p)
+{
+    /* Keep the recent working set, rather than every peak phase count the
+     * session has ever needed. Auxiliary/late frames can briefly need 15
+     * phases even when normal play settles back to seven. */
+    return p->layout_generation != S.layout_generation ||
+        S.work_sequence - p->last_used_work >= 32u;
+}
+
+/* Called with s_native_state_mutex held, after execution has completed.
+ * Live endpoints keep their images until every presentation fence retires.
+ * Their old allocations can then be discarded on a later publication too. */
+static void nvk_discard_retired_layouts_locked(void)
+{
+    for (uint32_t i = 0u; i < GL_NATIVE_ENDPOINT_CAPACITY; ++i) {
+        GlNativeEndpointSlot *endpoint = &s_native_endpoints[i];
+        if (endpoint->in_use || endpoint->presenter_busy || endpoint->fence_refs) continue;
+        for (uint32_t phase = 0u; phase <= GL_NATIVE_MOTION_PHASE_CAPACITY; ++phase) {
+            NativeImageSlot *image = phase ? &endpoint->phases[phase - 1u] : &endpoint->image;
+            NvkPlane *p = (NvkPlane *)(uintptr_t)image->color;
+            if (!p || !nvk_cached_plane_expired(p)) continue;
+            nvk_discard_cached_plane(p);
+            free(p);
+            image->color = image->mask = image->target = 0u;
+            image->width = image->height = 0u;
+            image->mask_valid = 0;
+        }
+    }
+}
+
+static void nvk_begin_layout(void)
+{
+    ++S.layout_generation;
+    ++P.layout_cache_resets;
+    /* A 4K phase target spans the shared VRAM, and can occupy hundreds of
+     * MiB. Keeping every unused target from previous aspect layouts can
+     * exhaust VRAM even though the newly selected view needs fewer pixels. */
+    for (uint32_t i = 0u; i < GL_NATIVE_GPU_PLANES; ++i) {
+        nvk_discard_cached_plane(&S.spare[i]);
+        nvk_discard_cached_plane(&S.spare_snapshots[i]);
+    }
+    for (uint32_t i = 0u; i < NVK_IMAGES; ++i) nvk_discard_cached_plane(&S.images[i]);
+    SDL_LockMutex(s_native_state_mutex);
+    nvk_discard_retired_layouts_locked();
+    SDL_UnlockMutex(s_native_state_mutex);
+}
+
 static int nvk_plane_create(NvkPlane *p, uint32_t width, uint32_t height, int scan)
 {
     memset(p, 0, sizeof(*p));
@@ -766,6 +830,9 @@ static int nvk_plane_create(NvkPlane *p, uint32_t width, uint32_t height, int sc
         return 0;
     }
     p->width = width; p->height = height; p->scan = scan;
+    p->layout_generation = S.layout_generation;
+    p->last_used_work = S.work_sequence;
+    p->raster[0] = p->raster[1] = 1.f;
     if (scan) {
         VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = p->key.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8_UNORM;
@@ -812,11 +879,76 @@ static void nvk_pass_end(void);
 /* GL native_gpu_plane_size / native_gpu_mask_size. */
 static int nvk_plane_size(NvkPlane *p, uint32_t width, uint32_t height, int scan)
 {
+    p->last_used_work = S.work_sequence;
     /* A CPU-uploaded endpoint image has no framebuffer: it cannot be rendered again. */
-    if (p->color.image && p->framebuffer && p->width == width && p->height == height) return 1;
+    if (p->color.image && p->framebuffer && p->width == width && p->height == height &&
+        p->color.width == width && p->color.height == height && !p->page_rows &&
+        p->raster[0] == 1.f && p->raster[1] == 1.f && p->raster[2] == 0.f && p->raster[3] == 0.f) return 1;
     nvk_pass_end();
     nvk_plane_free(p);
     return nvk_plane_create(p, width, height, scan);
+}
+
+/* Allocate a host-grid plane without changing any guest/journal coordinates.
+ * The viewport can be fractional; the backing allocation conservatively holds it. */
+static int nvk_plane_size_mapped(NvkPlane *p, uint32_t width, uint32_t height,
+        float rx, float ry, uint32_t page_rows, uint32_t page_pixels) {
+    p->last_used_work = S.work_sequence;
+    const uint32_t physical_width = (uint32_t)ceil((double)width * rx);
+    const uint32_t physical_height = page_rows
+        ? (height / page_rows) * page_pixels + (uint32_t)ceil((double)(height % page_rows) * ry)
+        : (uint32_t)ceil((double)height * ry);
+    const float raster[4] = {1.f / rx, 1.f / ry, 0.f, 0.f};
+    if (p->color.image && p->framebuffer && p->width == width && p->height == height &&
+        p->color.width == physical_width && p->color.height == physical_height &&
+        p->page_rows == page_rows && p->page_pixels == page_pixels &&
+        !memcmp(p->raster, raster, sizeof(raster))) return 1;
+    nvk_pass_end();
+    nvk_plane_free(p);
+    if (!nvk_plane_create(p, physical_width, physical_height, 0)) return 0;
+    p->width = width; p->height = height;
+    p->page_rows = page_rows; p->page_pixels = page_pixels;
+    memcpy(p->raster, raster, sizeof(raster));
+    return 1;
+}
+
+static int nvk_work_plane_size(NvkPlane *p, unsigned index, uint32_t width, uint32_t height) {
+    const GlNativeGpuWork *work = R.work;
+    if (!work->render_width || !index) return nvk_plane_size(p, width, height, 0);
+    return nvk_plane_size_mapped(p, width, height, work->raster_scale[0], work->raster_scale[1],
+        work->raster_page_rows * work->scale, work->raster_page_pixels);
+}
+
+static int nvk_clone_plane_size(NvkPlane *p, const NvkPlane *source) {
+    p->last_used_work = S.work_sequence;
+    if (p->color.image && p->framebuffer && p->width == source->width && p->height == source->height &&
+        p->color.width == source->color.width && p->color.height == source->color.height &&
+        p->page_rows == source->page_rows && p->page_pixels == source->page_pixels &&
+        !memcmp(p->raster, source->raster, sizeof(p->raster))) return 1;
+    nvk_pass_end();
+    nvk_plane_free(p);
+    if (!nvk_plane_create(p, source->color.width, source->color.height, 0)) return 0;
+    p->width = source->width; p->height = source->height;
+    p->page_rows = source->page_rows; p->page_pixels = source->page_pixels;
+    memcpy(p->raster, source->raster, sizeof(p->raster));
+    return 1;
+}
+
+static void nvk_source_raster(const NvkPlane *source) {
+    const float raster[4] = { source ? source->width / source->raster[0] / source->color.width : 1.f,
+        source ? source->height / source->raster[1] / source->color.height : 1.f,
+        source ? source->raster[2] / source->color.width : 0.f,
+        source ? source->raster[3] / source->color.height : 0.f };
+    memcpy(R.v.source_raster, raster, sizeof(raster));
+    R.v.raster_pages[2] = source && source->page_rows ? (float)source->height / source->page_rows : 0.f;
+    R.v.raster_pages[3] = source && source->page_rows
+        ? ((float)source->page_pixels - source->page_rows / source->raster[1]) / source->color.height : 0.f;
+}
+
+static int32_t nvk_raster_edge(const NvkPlane *plane, int32_t value, unsigned axis) {
+    const uint32_t origin = axis && plane->page_rows ? R.page_y : 0u;
+    const uint32_t pixel = origin ? (origin / plane->page_rows) * plane->page_pixels : 0u;
+    return (int32_t)ceil(((double)value - origin) / plane->raster[axis] + pixel - 0.5);
 }
 
 /* GL native_gpu_plane_depth: attach (once) and clear-to-far the key. */
@@ -871,7 +1003,7 @@ static void nvk_plane_copy_impl(const NvkPlane *source, NvkPlane *destination, i
     memset(&region, 0, sizeof(region));
     region.srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
     region.dstSubresource = region.srcSubresource;
-    region.extent = (VkExtent3D){ destination->width, destination->height, 1u };
+    region.extent = (VkExtent3D){ destination->color.width, destination->color.height, 1u };
     vkCmdCopyImage(R.cmd, depth ? source->key.image : source->color.image, VK_IMAGE_LAYOUT_GENERAL,
                    depth ? destination->key.image : destination->color.image, VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
     nvk_barrier_all();
@@ -1165,8 +1297,10 @@ static unsigned nvk_depth_uniforms(const NvkPlane *plane, const GlNativeDepthMod
     }
     nvk_set4(R.d.depth_state, mode->test, mode->write, mode->semi, mode->bias);
     if (mode->test) {
-        nvk_set4(R.d.depth_plane, mode->plane.n0, mode->plane.a, mode->plane.b, (int)work->scale);
-        R.d.depth_origin[0] = mode->plane.ox; R.d.depth_origin[1] = mode->plane.oy;
+        nvk_set4(R.d.depth_plane, native_depth_encode(mode->plane.n0), native_depth_encode(mode->plane.a / (float)work->scale),
+            native_depth_encode(mode->plane.b / (float)work->scale), (int)work->scale);
+        R.d.depth_origin[0] = mode->plane.ox * (int)work->scale;
+        R.d.depth_origin[1] = mode->plane.oy * (int)work->scale;
     }
     return NVK_UNIFORM_DEPTH_ATTACHED | (mode->test || mode->semi ? NVK_UNIFORM_DEPTH_READ : 0u);
 }
@@ -1200,17 +1334,47 @@ static void nvk_pass_end(void)
 
 static void nvk_pass_begin(NvkPlane *plane)
 {
-    if (R.pass_plane == plane) return;
+    if (R.pass_plane == plane) {
+        memcpy(R.v.raster, plane->raster, sizeof(R.v.raster));
+        R.v.raster[3] = plane->page_rows ? (float)(R.page_y / plane->page_rows * plane->page_pixels) : 0.f;
+        R.v.raster_pages[0] = (float)R.page_y;
+        R.v.raster_pages[1] = plane->page_rows ? 1.f : 0.f;
+        return;
+    }
     nvk_pass_end();
+    R.page_y = 0u;
+    memcpy(R.v.raster, plane->raster, sizeof(R.v.raster));
+    R.v.raster_pages[0] = 0.f;
+    R.v.raster_pages[1] = plane->page_rows ? 1.f : 0.f;
     VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     bi.renderPass = R.capture_active ? S.pass_capture : S.interlock ? S.pass_il : S.pass_draw;
     bi.framebuffer = R.capture_active ? plane->capture_framebuffer : plane->framebuffer;
-    bi.renderArea.extent = (VkExtent2D){ plane->width, plane->height };
+    bi.renderArea.extent = (VkExtent2D){ plane->color.width, plane->color.height };
     vkCmdBeginRenderPass(R.cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    const VkViewport viewport = { 0.f, 0.f, (float)plane->width, (float)plane->height, 0.f, 1.f };
+    const VkViewport viewport = { plane->raster[2], plane->raster[3],
+        plane->width / plane->raster[0], plane->height / plane->raster[1], 0.f, 1.f };
     vkCmdSetViewport(R.cmd, 0u, 1u, &viewport);
     memset(&R.b, 0, sizeof(R.b));
     R.pass_plane = plane;
+}
+
+/* Draw and sample each framebuffer in its own pixel grid. The allocation
+ * and residency stay fixed while these per-draw viewport origins change. */
+static int nvk_raster_page(NvkPlane *plane, int y)
+{
+    nvk_pass_begin(plane);
+    const uint32_t origin = plane->page_rows && y > 0
+        ? (uint32_t)y / plane->page_rows * plane->page_rows : 0u;
+    if (origin != R.page_y) {
+        if (!nvk_core_batch_flush() || !nvk_il_flush()) return 0;
+        R.page_y = origin;
+        const float pixel = plane->page_rows ? (float)(origin / plane->page_rows * plane->page_pixels) : 0.f;
+        const VkViewport viewport = {0.f, pixel, plane->width / plane->raster[0], plane->height / plane->raster[1], 0.f, 1.f};
+        vkCmdSetViewport(R.cmd, 0u, 1u, &viewport);
+    }
+    R.v.raster_pages[0] = (float)origin;
+    R.v.raster[3] = plane->page_rows ? (float)(origin / plane->page_rows * plane->page_pixels) : 0.f;
+    return 1;
 }
 
 static void nvk_scissor(const NvkPlane *plane, const int32_t s[4])
@@ -1219,6 +1383,11 @@ static void nvk_scissor(const NvkPlane *plane, const int32_t s[4])
     int32_t x1 = s[0] + s[2], y1 = s[1] + s[3];
     if (x1 > (int32_t)plane->width) x1 = (int32_t)plane->width;
     if (y1 > (int32_t)plane->height) y1 = (int32_t)plane->height;
+    x0 = nvk_raster_edge(plane, x0, 0u); y0 = nvk_raster_edge(plane, y0, 1u);
+    x1 = nvk_raster_edge(plane, x1, 0u); y1 = nvk_raster_edge(plane, y1, 1u);
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)plane->color.width) x1 = plane->color.width;
+    if (y1 > (int32_t)plane->color.height) y1 = plane->color.height;
     const int32_t value[4] = { x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0 };
     if (R.b.scissor_valid && !memcmp(R.b.scissor, value, sizeof(value))) return;
     const VkRect2D rect = { { value[0], value[1] }, { (uint32_t)value[2], (uint32_t)value[3] } };
@@ -1246,6 +1415,7 @@ static struct {
     uint32_t first[NVK_IL_CAPACITY], count[NVK_IL_CAPACITY];
     uint32_t base, parameter_count, shared_count, draw_count;
     NvkPlane *plane;
+    NvkView view;
     NvkSetKey key;
     VkBuffer vbuf;
     VkDeviceSize voff;
@@ -1290,7 +1460,7 @@ static VkBufferView nvk_chunk_params_view(uint32_t index)
 }
 
 /* Binds the pipeline, resources, uniform slot and vertex buffer of an interlock draw. */
-static int nvk_il_bind(const NvkDrawIL *il, const float size[4], const NvkSetKey *key)
+static int nvk_il_bind(const NvkDrawIL *il, const float size[4], const NvkSetKey *key, const NvkView *view_state)
 {
     if (R.b.pipeline != S.pipe_il) {
         vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipe_il);
@@ -1302,7 +1472,7 @@ static int nvk_il_bind(const NvkDrawIL *il, const float size[4], const NvkSetKey
         vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pl_il, 0u, 1u, &set0, 0u, NULL);
         R.b.set0 = set0;
     }
-    NvkView view;
+    NvkView view = *view_state;
     memcpy(view.size, size, sizeof(view.size));
     if (!R.b.slot_valid || memcmp(&view, &R.b.v, sizeof(view)) || memcmp(il, &R.b.il, sizeof(*il))) {
         uint32_t chunk;
@@ -1350,7 +1520,7 @@ static int nvk_il_flush(void)
     il.parameters_on = 1;
     il.parameter_base = (int32_t)IB.base - (int32_t)(offset / RECORD_BYTES);
     il.parameter_shared = (int32_t)(offset / 16u + triangle_texels);
-    if (!nvk_il_bind(&il, (const float *)(const void *)IB.shared[0][3], &key)) return 0;
+    if (!nvk_il_bind(&il, (const float *)(const void *)IB.shared[0][3], &key, &IB.view)) return 0;
     if (R.b.vbuf != IB.vbuf || R.b.voff != IB.voff) {
         vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &IB.vbuf, &IB.voff);
         R.b.vbuf = IB.vbuf; R.b.voff = IB.voff;
@@ -1373,14 +1543,14 @@ static int nvk_il_add(NvkPlane *plane, const int32_t scissor[4], uint32_t first,
     nvk_il_pack(record, shared);
     const uint32_t index = first / 3u, records = count / 3u;
     if (IB.draw_count &&
-        (IB.plane != plane || memcmp(IB.scissor, scissor, sizeof(IB.scissor)) || memcmp(&IB.key, &R.key, sizeof(R.key)) ||
+        (IB.plane != plane || memcmp(&IB.view, &R.v, sizeof(R.v)) || memcmp(IB.scissor, scissor, sizeof(IB.scissor)) || memcmp(&IB.key, &R.key, sizeof(R.key)) ||
          IB.vbuf != R.vsrc.buf || IB.voff != R.vsrc.off || index < IB.base ||
          index - IB.base + records > NVK_IL_CAPACITY || IB.draw_count == NVK_IL_CAPACITY ||
          (IB.shared_count == NVK_IL_CAPACITY && memcmp(shared, IB.shared[NVK_IL_CAPACITY - 1u], sizeof(shared)))))
         if (!nvk_il_flush()) return 0;
     if (!IB.draw_count) {
         IB.base = index; IB.parameter_count = IB.shared_count = 0u;
-        IB.plane = plane; IB.key = R.key; IB.vbuf = R.vsrc.buf; IB.voff = R.vsrc.off;
+        IB.plane = plane; IB.view = R.v; IB.key = R.key; IB.vbuf = R.vsrc.buf; IB.voff = R.vsrc.off;
         memcpy(IB.scissor, scissor, sizeof(IB.scissor));
     }
     if (!IB.shared_count || memcmp(shared, IB.shared[IB.shared_count - 1u], sizeof(shared)))
@@ -1595,7 +1765,7 @@ static int nvk_core_batch_add(NvkPlane *plane, int key_attached, const int32_t s
 }
 
 /* One draw of the native pipeline with the current uniform state and resource key. */
-static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scissor[4], uint32_t first, uint32_t count)
+static int nvk_draw_region_page(NvkPlane *plane, int key_attached, const int32_t scissor[4], uint32_t first, uint32_t count)
 {
     if (TC.active) {
         uint32_t shared[NVK_IL_SHARED_TEXELS][4], record[NVK_IL_TRIANGLE_TEXELS][4];
@@ -1614,7 +1784,7 @@ static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scis
     }
     if (R.since_submit >= (S.interlock ? NVK_SUBMIT_DRAWS_IL : S.submit_draw_limit) && !nvk_submit_partial(VK_NULL_HANDLE)) return 0;
     ++R.since_submit;
-    nvk_pass_begin(plane);
+    if (!nvk_raster_page(plane, scissor[1])) return 0;
     if (S.interlock) {
         if (!nvk_require_vertices()) return 0;
         R.key.dest = plane->color.view;
@@ -1631,7 +1801,7 @@ static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scis
         il.anisotropy = R.d.anisotropy; il.filter_strength = R.d.filter_strength;
         NvkSetKey key = R.key;
         key.params = S.dummy_view;
-        if (!nvk_il_bind(&il, R.v.size, &key)) return 0;
+        if (!nvk_il_bind(&il, R.v.size, &key, &R.v)) return 0;
         if (R.b.vbuf != R.vsrc.buf || R.b.voff != R.vsrc.off) {
             vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &R.vsrc.buf, &R.vsrc.off);
             R.b.vbuf = R.vsrc.buf; R.b.voff = R.vsrc.off;
@@ -1678,6 +1848,21 @@ static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scis
     }
     nvk_scissor(plane, scissor);
     ++P.draw_calls; vkCmdDraw(R.cmd, count, 1u, first, 0u);
+    return 1;
+}
+
+static int nvk_draw_region(NvkPlane *plane, int key_attached, const int32_t scissor[4], uint32_t first, uint32_t count)
+{
+    if (!plane->page_rows || TC.active)
+        return nvk_draw_region_page(plane, key_attached, scissor, first, count);
+    const int end = scissor[1] + scissor[3];
+    for (int y = scissor[1] > 0 ? scissor[1] : 0; y < end;) {
+        int next = (int)(((uint32_t)y / plane->page_rows + 1u) * plane->page_rows);
+        if (next > end) next = end;
+        const int32_t clipped[4] = {scissor[0], y, scissor[2], next - y};
+        if (!nvk_draw_region_page(plane, key_attached, clipped, first, count)) return 0;
+        y = next;
+    }
     return 1;
 }
 
@@ -2145,7 +2330,7 @@ static void nvk_depth_bounds_transfer(NvkPlane *plane, uint32_t scale, const GlN
 
 static int nvk_depth_bounds_draw(NvkPlane *plane, uint32_t scale, const GlNativeGpuDrawGeometry *g)
 {
-    if (!S.depth_bounds || !R.work->depth_test || !plane->has_key || R.work->depth_view || R.work->wireframe) return 0;
+    if (R.work->render_width || !S.depth_bounds || !R.work->depth_test || !plane->has_key || R.work->depth_view || R.work->wireframe) return 0;
     const GlNativeDepthMode *mode = &g->depth;
     if (!mode->test && mode->write != 4) return 0; /* far writes cannot raise an upper bound */
     const int left = g->left * (int)scale, top = g->top * (int)scale;
@@ -2167,7 +2352,7 @@ static int nvk_depth_bounds_draw(NvkPlane *plane, uint32_t scale, const GlNative
                     mode->plane.ox, mode->plane.oy, scale, x0, y0, x1, y1, &low, &high)) passes = 0;
             const uint32_t written = mode->write == GL_NATIVE_DEPTH_WRITE && mode->test ? high : mode->write == 4 ? 1u : 0u;
             uint32_t *bound = &plane->depth_max[y * plane->depth_columns + x];
-            if (low < *bound - (*bound >> 10u)) passes = 0;
+            if (low < native_depth_threshold(*bound)) passes = 0;
             if (written > *bound) *bound = written;
         }
     return passes;
@@ -2290,8 +2475,8 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
                 native_gpu_command_flags(command, captured_data, t).gouraud ? 0.f : 1.f);
             if (!lines) nvk_attribute_uniforms(attributes);
             if (uv_gradient)
-                nvk_setf4(R.d.uv_gradient, (float)(attributes->plane[0][1] / scale), (float)(attributes->plane[1][1] / scale),
-                    (float)(attributes->plane[0][2] / scale), (float)(attributes->plane[1][2] / scale));
+                nvk_setf4(R.d.uv_gradient, (float)(attributes->plane[0][1] / scale) * plane->raster[0], (float)(attributes->plane[1][1] / scale) * plane->raster[0],
+                    (float)(attributes->plane[0][2] / scale) * plane->raster[1], (float)(attributes->plane[1][2] / scale) * plane->raster[1]);
             nvk_setf4(R.v.size, (float)plane->width / scale, (float)plane->height / scale, 0.5f / scale - 1.f / 64.f, (float)scale);
             nvk_set4(R.d.state, m->textured, m->raw_texture, m->semi_transparent, m->blend_mode);
             R.d.aa_exempt = draw->aa_exempt || draw->screen_space_2d != GPU_RENDER_SCREEN_SPACE_2D_NONE;
@@ -2312,6 +2497,7 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
             R.key.hd = snapshot ? R.planes[command->source].color.view : hd_image ? hd_image->image.view : S.dummy_color.view;
             R.key.hd_sampler = hd_image ? S.sampler_hd : S.sampler_clamp;
             R.d.hd_on = snapshot ? 2 : hd_image ? 1 : 0;
+            nvk_source_raster(snapshot ? &R.planes[command->source] : NULL);
             if (snapshot)
                 nvk_set4(R.d.hd_map, (int)command->sx, (int)command->sy, (int)command->sw, (int)command->sh);
             else if (hd_image) {
@@ -2370,12 +2556,13 @@ static int nvk_render_layer(const GlNativeGpuCommand *command, const uint8_t *ca
     R.key.src_key = copy_depth ? source_plane->key.view : S.dummy_uint.view;
     if (!nvk_target(plane, scale, command->x, command->y, command->w, command->h, (command->mask & 2u) != 0,
                     depth, NULL, NULL, 0, 0.f)) return 0;
-    if (S.clear_spans && !S.interlock && !R.capture_active && !wire && !work->depth_view &&
+    if (!work->render_width && S.clear_spans && !S.interlock && !R.capture_active && !wire && !work->depth_view &&
         command->kind == NATIVE_GPU_SPAN && command->source == UINT32_MAX && !(command->mask & 2u))
         return nvk_clear_span(plane, command, depth);
     /* Guest pixels are black in wireframe; copies between VIEW planes keep
      * the previously drawn edges, just as on the GL debug path. */
     const int black = wire && (!texture || command->kind == NATIVE_GPU_SEED || command->source == 0u);
+    nvk_source_raster(source_plane);
     R.key.src = texture && !black ? texture : S.dummy_color.view;
     R.key.src_sampler = sampler;
     R.key.hd = S.dummy_color.view;
@@ -3430,7 +3617,7 @@ static int nvk_template_render(const GlNativeGpuCommand *command)
     if (R.since_submit >= NVK_SUBMIT_DRAWS_IL && !nvk_submit_partial(VK_NULL_HANDLE)) return 0;
     if (!nvk_target(plane, scale, info->left, info->top, info->right - info->left + 1, info->bottom - info->top + 1, 0,
                     info->depth, info->scissor, NULL, 0, 0.f)) return 0;
-    if (!nvk_il_flush()) return 0;
+    if (!nvk_il_flush() || !nvk_raster_page(plane, s_scissor_value[1])) return 0;
     memset(&R.key, 0, sizeof(R.key));
     R.key.src_sampler = R.key.hd_sampler = S.sampler_clamp;
     R.key.src = R.key.hd = S.dummy_color.view;
@@ -3444,7 +3631,7 @@ static int nvk_template_render(const GlNativeGpuCommand *command)
     il.parameters_on = 1;
     il.parameter_shared = (int32_t)(plan->triangles * NVK_IL_TRIANGLE_TEXELS);
     const float size[4] = { (float)plane->width / scale, (float)plane->height / scale, 0.5f / scale - 1.f / 64.f, (float)scale };
-    if (!nvk_il_bind(&il, size, &R.key)) return 0;
+    if (!nvk_il_bind(&il, size, &R.key, &R.v)) return 0;
     if (R.b.vbuf != R.vsrc.buf || R.b.voff != R.vsrc.off) {
         vkCmdBindVertexBuffers(R.cmd, 0u, 1u, &R.vsrc.buf, &R.vsrc.off);
         R.b.vbuf = R.vsrc.buf; R.b.voff = R.vsrc.off;
@@ -3647,7 +3834,7 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
             NvkPlane *source = command->plane < GL_NATIVE_GPU_PHASE_BASE ? &R.planes[command->plane] : NULL;
             if (source && source->color.image && command->source < GL_NATIVE_VIEW_TARGET_CAPACITY) {
                 NvkPlane *base = &S.bases[command->source];
-                ok = nvk_plane_size(base, source->width, source->height, 0);
+                ok = nvk_clone_plane_size(base, source);
                 if (ok) nvk_plane_copy(source, base, 0);
                 if (ok && source->has_key) {
                     ok = nvk_plane_depth(base);
@@ -3663,7 +3850,7 @@ static int nvk_slice(const GlNativeGpuCommand *commands, const uint8_t *captured
                         R.snapshots[j] = S.spare_snapshots[j];
                         memset(&S.spare_snapshots[j], 0, sizeof(S.spare_snapshots[j]));
                     }
-                    ok = nvk_plane_size(&R.snapshots[j], R.planes[j].width, R.planes[j].height, 0);
+                    ok = nvk_clone_plane_size(&R.snapshots[j], &R.planes[j]);
                     if (ok) nvk_plane_copy(&R.planes[j], &R.snapshots[j], 0);
                     if (ok && R.planes[j].has_key) {
                         ok = nvk_plane_depth(&R.snapshots[j]);
@@ -3725,7 +3912,11 @@ static int nvk_scanout_image_impl(unsigned image)
 {
     const GlNativeGpuWork *work = R.work;
     NvkPlane *output = &S.images[image];
-    if (!nvk_plane_size(output, work->scanout_width * work->scale, work->scanout_height * work->scale, 1)) {
+    const uint32_t output_width = work->render_width ? work->render_width : work->scanout_width * work->scale;
+    const uint32_t output_height = work->render_height ? work->render_height : work->scanout_height * work->scale;
+    const float output_scale_x = (float)output_width / work->scanout_width;
+    const float output_scale_y = (float)output_height / work->scanout_height;
+    if (!nvk_plane_size(output, output_width, output_height, 1)) {
         nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_SCANOUT, image, 0u);
         return 0;
     }
@@ -3749,19 +3940,27 @@ static int nvk_scanout_image_impl(unsigned image)
     for (unsigned y = 0; y < work->scanout_height && !work->disabled && ok;) {
         const int index = image ? (int)(GL_NATIVE_GPU_PHASE_BASE + image - 1u) : work->row_planes[y];
         const NvkPlane *input = &R.planes[index];
+        const unsigned source_scale = native_gpu_plane_scale(work, index);
         const unsigned sy = image ? y + work->phase_crop_y : (y + work->scanout_y) & (VRAM_H - 1);
         unsigned rows = 1u;
-        while (y + rows < work->scanout_height && (image || (sy + rows < VRAM_H && work->row_planes[y + rows] == index))) ++rows;
+        while (y + rows < work->scanout_height && (image || (sy + rows < VRAM_H && work->row_planes[y + rows] == index)) &&
+            (!input->page_rows || (sy + rows) * source_scale / input->page_rows == sy * source_scale / input->page_rows)) ++rows;
         const unsigned width = index == 0 ? work->scanout_canonical_width : work->scanout_width;
         for (unsigned x = 0; x < width && ok;) {
-            const unsigned source_scale = native_gpu_plane_scale(work, index);
             const unsigned source_width = input->width / source_scale;
             const unsigned sx = (x + (image ? work->phase_crop_x : index == 0 ? work->scanout_x : 0u)) % source_width;
             const unsigned dx = x + (index == 0 ? work->scanout_offset : 0u);
             const unsigned span = width - x > source_width - sx ? source_width - sx : width - x;
-            const float ratio = (float)source_scale / (float)work->scale;
-            const float mapping[4] = { (float)((int)sx - (int)dx) * source_scale, (float)((int)sy - (int)y) * source_scale,
-                                       ratio, ratio };
+            const float source_scale_x = source_scale / input->raster[0];
+            const float source_scale_y = source_scale / input->raster[1];
+            const uint32_t virtual_y = sy * source_scale;
+            const uint32_t page = input->page_rows ? virtual_y / input->page_rows : 0u;
+            const float physical_y = page * input->page_pixels +
+                (virtual_y - page * input->page_rows) / input->raster[1];
+            const float mapping[4] = {
+                sx * source_scale_x + input->raster[2] - dx * source_scale_x,
+                physical_y - y * source_scale_y,
+                source_scale_x / output_scale_x, source_scale_y / output_scale_y };
             uint32_t chunk;
             VkDeviceSize offset;
             uint8_t *slot = nvk_arena(NVK_SLOT_ALIGN, NVK_SLOT_ALIGN, &chunk, &offset);
@@ -3773,8 +3972,11 @@ static int nvk_scanout_image_impl(unsigned image)
             const uint32_t dynamic = (uint32_t)offset;
             vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pl_scan, 0u, 1u, &set0, 0u, NULL);
             vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pl_scan, 1u, 1u, &set1, 1u, &dynamic);
-            const int32_t rect[4] = { (int32_t)(dx * work->scale), (int32_t)(y * work->scale),
-                                      (int32_t)(span * work->scale), (int32_t)(rows * work->scale) };
+            const uint32_t x0 = native_resolution_edge(dx, work->scanout_width, output_width);
+            const uint32_t y0 = native_resolution_edge(y, work->scanout_height, output_height);
+            const int32_t rect[4] = { (int32_t)x0, (int32_t)y0,
+                (int32_t)(native_resolution_edge(dx + span, work->scanout_width, output_width) - x0),
+                (int32_t)(native_resolution_edge(y + rows, work->scanout_height, output_height) - y0) };
             const VkRect2D scissor = { { rect[0], rect[1] }, { (uint32_t)rect[2], (uint32_t)rect[3] } };
             vkCmdSetScissor(R.cmd, 0u, 1u, &scissor);
             ++P.draw_calls; vkCmdDraw(R.cmd, 3u, 1u, 0u, 0u);
@@ -4702,6 +4904,7 @@ static void nvk_damage_primitive(uint8_t *tiles, uint32_t columns, const int32_t
 
 static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuChunk *current)
 {
+    if (R.work->render_width) return 0;
     const uint32_t tile = 1u << S.damage_tile_shift;
     R.damage_count = 0u;
     R.damage_shader_active = 0;
@@ -4932,6 +5135,8 @@ static int nvk_phase_damage(const GlNativeGpuChunk *previous, const GlNativeGpuC
 static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
 {
     const int phase_retry = out_fence && s_retry_phases;
+    if (!phase_retry) ++S.work_sequence;
+    if (s_backend_mode && work->fresh && !phase_retry) nvk_begin_layout();
     /* The base journal stops changing at phase_stream_ready.
      * Only published chunk descriptors/dimensions and the final seal are read
      * concurrently; take those under the same mutex as publication. */
@@ -4952,7 +5157,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
     R.work = work;
     R.capture_active = R.capture_used = 0;
     R.capture_eligible = -1;
-    if (!out_fence || phase_retry || !nvk_capture_reserve(work)) R.capture_eligible = 0;
+    if (work->render_width || !out_fence || phase_retry || !nvk_capture_reserve(work)) R.capture_eligible = 0;
     R.damage_active = 0;
     R.damage_region = -1;
     R.damage_shader_active = 0;
@@ -5008,7 +5213,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
         R.planes[i] = S.spare[i];
         memset(&S.spare[i], 0, sizeof(S.spare[i]));
         const uint32_t plane_scale = native_gpu_plane_scale(work, i);
-        ok = nvk_plane_size(&R.planes[i], widths[i] * plane_scale, heights[i] * plane_scale, 0);
+        ok = nvk_work_plane_size(&R.planes[i], i, widths[i] * plane_scale, heights[i] * plane_scale);
         if (ok) R.planes[i].dirty_all = 1;
         if (ok && i && work->depth_test) ok = nvk_plane_depth(&R.planes[i]);
         if (!ok) nvk_fail(GL_RENDERER_NATIVE_GPU_FAILURE_PLANE, 0u, i);
@@ -5152,7 +5357,7 @@ static int nvk_execute(const GlNativeGpuWork *work, VkFence *out_fence)
                 R.planes[i] = S.spare[i];
                 memset(&S.spare[i], 0, sizeof(S.spare[i]));
                 const uint32_t scale = native_gpu_plane_scale(work, i);
-                ok = nvk_plane_size(&R.planes[i], widths[i] * scale, heights[i] * scale, 0);
+                ok = nvk_work_plane_size(&R.planes[i], i, widths[i] * scale, heights[i] * scale);
                 if (ok) R.planes[i].dirty_all = 1;
                 if (ok && work->depth_test) ok = nvk_plane_depth(&R.planes[i]);
             }
@@ -5803,7 +6008,8 @@ static int nvk_backend_complete(GlNativeGpuWork *work, uint64_t started, uint64_
                     else for (uint32_t y = 0; y < work->scanout_height; ++y)
                         for (uint32_t x = 0; x < work->scanout_width; ++x)
                             work->reference_pixels[(size_t)y * work->scanout_width + x] =
-                                rgba[(size_t)y * work->scale * S.images[0].width + x * work->scale];
+                                rgba[(size_t)native_resolution_edge(y, work->scanout_height, S.images[0].height) * S.images[0].width +
+                                    native_resolution_edge(x, work->scanout_width, S.images[0].width)];
                 }
             }
             work->timing.hash_cpu_ns += native_thread_cpu_ns() - hash_started;
@@ -5976,6 +6182,18 @@ static void nvk_be_adopt_images(GlNativeEndpointSlot *endpoint, GlNativeGpuWork 
             phase->upload_state = GL_NATIVE_ENDPOINT_UPLOAD_READY;
         }
     }
+    nvk_discard_retired_layouts_locked();
+    for (uint32_t i = 0u; i < GL_NATIVE_GPU_PLANES; ++i) {
+        if (nvk_cached_plane_expired(&S.spare[i]))
+            nvk_discard_cached_plane(&S.spare[i]);
+        if (nvk_cached_plane_expired(&S.spare_snapshots[i]))
+            nvk_discard_cached_plane(&S.spare_snapshots[i]);
+    }
+    /* adopt_one can return a retired image from an older layout to the
+     * executor. It must not keep that old cache alive indefinitely. */
+    for (uint32_t i = 0u; i < NVK_IMAGES; ++i)
+        if (nvk_cached_plane_expired(&S.images[i]))
+            nvk_discard_cached_plane(&S.images[i]);
 }
 
 static XgRenderFenceStatus nvk_be_sync_poll(void *sync) { return native_vk_sync_poll(sync); }
@@ -6144,6 +6362,7 @@ int native_vk_backend_json(char *out, int capacity)
     int n = snprintf(out, (size_t)capacity,
         "{\"running\":%d,\"tier\":\"%s\",\"works\":%llu,\"failed_works\":%llu,\"last_fail\":{\"stage\":%u,\"command\":%u,\"kind\":%u,\"code\":%d},"
         "\"hd_resident\":%llu,\"hd_bytes\":%llu,\"hd_failed\":%llu,\"material_pipelines\":%u,"
+        "\"layout_cache_resets\":%llu,\"layout_cache_evictions\":%llu,\"layout_cache_evicted_bytes\":%llu,"
         "\"streamed_works\":%llu,\"streamed_chunks\":%llu,\"cleared_spans\":%llu,\"cleared_rects\":%llu,\"damage_bounds_pixels\":%llu,"
         "\"capture_pixels\":%llu,\"capture_full_pixels\":%llu,"
         "\"timed_submits\":%llu,\"submit_gpu_ns\":%llu,\"submit_gpu_max_ns\":%llu,\"submit_timing_overflow\":%llu,"
@@ -6157,6 +6376,8 @@ int native_vk_backend_json(char *out, int capacity)
         B.thread != NULL, S.interlock ? "interlock" : "core", (unsigned long long)B.works, (unsigned long long)B.failed_works, B.last_fail_stage,
         B.last_fail_command, B.last_fail_kind, B.last_fail_code, (unsigned long long)s_hd_cache.resident,
         (unsigned long long)s_hd_cache.bytes, (unsigned long long)s_hd_cache.failed, S.material_count,
+        (unsigned long long)P.layout_cache_resets, (unsigned long long)P.layout_cache_evictions,
+        (unsigned long long)P.layout_cache_evicted_bytes,
         (unsigned long long)P.streamed_works, (unsigned long long)P.streamed_chunks,
         (unsigned long long)P.cleared_spans, (unsigned long long)P.cleared_rects,
         (unsigned long long)P.damage_bounds_pixels,

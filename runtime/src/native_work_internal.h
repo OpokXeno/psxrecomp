@@ -36,6 +36,7 @@
 #include "psx_sdl.h"
 #include "native_phase_cadence.h"
 #include "native_gpu_hazard.h"
+#include "native_depth.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -195,7 +196,7 @@ typedef struct GlNativeCompileAudit {
     uint32_t depth_draws[3];
     uint64_t depth_tested_fragments, depth_rejected_fragments;
     uint64_t depth_written_fragments, depth_reset_fragments;
-    uint32_t depth_key_min, depth_key_max; /* keys written; 0 = none (depth view range) */
+    uint32_t depth_key_min, depth_key_max; /* positive FP32 key bits; 0 = none (depth view range) */
     /* Only populated entries are read; keep capacity storage out of the reset. */
     XgSemanticPassRecord passes[XG_RENDER_SCENE_PASS_CAPACITY];
     XgSemanticDrawRecord draws[XG_RENDER_SCENE_DRAW_CAPACITY];
@@ -633,6 +634,10 @@ typedef struct GlNativeGpuWork {
     XgRenderSourceCommitHandle commit;
     XgPresentationIdentity identity;
     uint32_t scale, count, capacity, bytes, data_capacity;
+    uint32_t render_width, render_height; /* exact host raster, zero: integer scale */
+    float raster_scale[2]; /* physical pixels per virtual raster pixel */
+    uint32_t raster_page_rows; /* guest rows between framebuffer origins */
+    uint32_t raster_page_pixels; /* integer physical distance between those origins */
     uint32_t published_count;
     GlNativeGpuChunk phase_chunks[GL_NATIVE_MOTION_PHASE_CAPACITY];
     uint32_t chunk_count, published_chunk_count, chunk_cursor, phase_cursor, phase_command_count;
@@ -780,7 +785,7 @@ enum { GL_NATIVE_DEPTH_VIEW_OFF = 0, GL_NATIVE_DEPTH_VIEW_DEPTH = 1, GL_NATIVE_D
  * without a usable depth plane on this triangle. */
 enum { GL_NATIVE_DEPTH_SHOW_NONE = 0, GL_NATIVE_DEPTH_SHOW_TEST = 1,
        GL_NATIVE_DEPTH_SHOW_WRITE = 2, GL_NATIVE_DEPTH_SHOW_FALLBACK = 3 };
-typedef struct GlNativeDepthPlane { int32_t n0, a, b, ox, oy; } GlNativeDepthPlane;
+typedef struct GlNativeDepthPlane { float n0, a, b; int32_t ox, oy; } GlNativeDepthPlane;
 /* write is the mode of an unblended fragment; semi marks per-texel blending,
  * whose blended fragments keep the stored key. */
 typedef struct GlNativeDepthMode {

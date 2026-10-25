@@ -97,7 +97,7 @@ void main() {
     precise dvec3 d;
     for(int i=0;i<3;++i) {
         valid=valid&&t.rgbz[i].w>0;
-        set3(d,i,t.rgbz[i].w>0?1099511627776.0lf/double(t.rgbz[i].w):0.0lf);
+        set3(d,i,t.rgbz[i].w>0?4096.0lf/double(t.rgbz[i].w):0.0lf);
     }
     int show=t.depth.x==0?0:3;
     ivec4 depth_plane=ivec4(0);
@@ -106,16 +106,14 @@ void main() {
         precise double ox=floor(x[0]),oy=floor(y[0]);
         precise double dx=((d[1]-d[0])*(y[2]-y[0])-(d[2]-d[0])*(y[1]-y[0]))/area;
         precise double dy=((x[1]-x[0])*(d[2]-d[0])-(x[2]-x[0])*(d[1]-d[0]))/area;
-        precise double a=roundEven(dx*256.0lf),c=roundEven(dy*256.0lf);
-        precise double n=roundEven((d[0]+dx*(ox-x[0])+dy*(oy-y[0]))*256.0lf);
-        depth_origin=ivec2(ox,oy);
-        if(finite(dx)&&finite(dy)&&abs(a)<=4194304.0lf&&abs(c)<=4194304.0lf&&n>=256.0lf&&n<1073741824.0lf)
-            depth_plane=ivec4(int(n),int(a),int(c),t.config.x);
-        else {
-            precise double far_key=min(min(d[0],d[1]),d[2])*256.0lf;
-            valid=finite(far_key)&&far_key>=256.0lf;
-            if(valid)depth_plane=ivec4(int(min(far_key,1073741823.0lf)),0,0,t.config.x);
-        }
+        precise float seed=float(d[0]+dx*(ox-x[0])+dy*(oy-y[0]));
+        precise float a=float(dx),c=float(dy);
+        depth_origin=ivec2(ox,oy)*t.config.x;
+        bool representable=!isnan(seed)&&!isinf(seed)&&!isnan(a)&&!isinf(a)&&!isnan(c)&&!isinf(c);
+        if(!representable){seed=float(min(min(d[0],d[1]),d[2]));a=0.0;c=0.0;}
+        // Scale gradients once; fragments only evaluate two FP32 FMAs.
+        depth_plane=ivec4(floatBitsToInt(seed),floatBitsToInt(a/float(t.config.x)),
+                         floatBitsToInt(c/float(t.config.x)),t.config.x);
     }
     if(valid)show=t.depth.x==2?2:1;
     parameters[b+2u]=uvec4(valid?1:0,valid&&t.depth.x==2?2:1,t.depth.w,valid?t.depth.y:0);

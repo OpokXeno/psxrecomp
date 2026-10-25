@@ -3,6 +3,7 @@
 from itertools import permutations
 from pathlib import Path
 import re
+import struct
 from random import Random
 
 root = Path(__file__).resolve().parents[1]
@@ -35,18 +36,23 @@ for stage in (vertex, fragment):
 assert int(re.search(r"VERTEX_ID/3\)\*(\d+)", vertex).group(1)) == stride
 assert int(re.search(r"PSX_VARYING\((\d+)\) flat out vec4 triangle_footprint", vertex).group(1)) == 4 + stride
 
-# Stored colour/mask/depth policy bits must survive key compaction, including
-# a biased uint32 key wrapping at its upper bound.
+# Stored colour/mask/depth policy bits must survive FP32 key compaction.
+def encode(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+def decode(bits):
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 rng = Random(0x580)
-keys = [0, 1, 0x7fffffff, 0x80000000, 0xffffffff]
-keys += [rng.getrandbits(32) for _ in range(10000)]
+keys = [0, 1, encode(1.0 / 65535), encode(1.0 / 60000), encode(1.0), encode(4096.0)]
+keys += [rng.randrange(0x00800000, 0x7e800000) for _ in range(10000)]
 for key in keys:
     for bias in range(17):
         policy = rng.getrandbits(26)
         packed = policy | (bias << 26)
         decoded_bias = (packed >> 26) & 31
-        restored = (key + (key >> decoded_bias if decoded_bias else 0)) & 0xffffffff
-        expected = (key + (key >> bias if bias else 0)) & 0xffffffff
+        factor = decode(0x3f800000 + (0x00800000 >> decoded_bias)) if decoded_bias else 1.0
+        restored = encode(decode(key) * factor)
+        expected = encode(decode(key) * (1.0 + 2.0 ** -bias if bias else 1.0))
         assert restored == expected and packed & ((1 << 26) - 1) == policy
 assert "buffer Fragments { uvec4 nodes[]; }" in shader
 assert "capacity / 16u" in executor

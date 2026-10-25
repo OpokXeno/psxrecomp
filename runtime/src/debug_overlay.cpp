@@ -36,6 +36,7 @@
 #ifdef PSX_DEBUG_OVERLAY
 
 #include "debug_overlay.h"
+#include "native_resolution.h"
 #include "free_camera.h"
 #include "debug_overlay_data.h"
 #include "memory.h"
@@ -162,6 +163,10 @@ extern uint64_t g_vblank_raise_count;
 /* Launcher-equivalent video/audio setters defined in main.cpp (extern "C"
  * there). turbo loads is a direct extern "C" global, same as debug_server. */
 extern "C" int  psx_video_get_supersampling(void);
+extern "C" int psx_video_has_native_resolution(void);
+extern "C" int psx_video_get_internal_width(void);
+extern "C" int psx_video_get_internal_height(void);
+extern "C" void psx_video_set_internal_resolution(int width, int height);
 extern "C" void psx_video_set_supersampling(int s);
 extern "C" int  psx_video_get_antialiasing(void);
 extern "C" void psx_video_set_antialiasing(int on);
@@ -1036,7 +1041,8 @@ static void draw_gpu_state_section(void)
     /* Requested presentation scale (same source as the Toggles slider).
      * gr_scale() reports the GL raster, which stays 1 by design under the
      * native renderer — that phantom 1x is what this row used to show. */
-    ImGui::Text("Internal scale  : %dx", psx_video_get_supersampling());
+    if (psx_video_has_native_resolution()) ImGui::Text("Internal raster : %d x %d", psx_video_get_internal_width(), psx_video_get_internal_height());
+    else ImGui::Text("Internal scale  : %dx", psx_video_get_supersampling());
 
     ImGui::Text("Texture filter  : %s",
                 texfilter_label(gr_texture_filter()));
@@ -1313,13 +1319,26 @@ static void draw_toggles_section(void)
         psx_video_set_vsync(modes[vs_index]);
     }
 
-    int ss = psx_video_get_supersampling();
-    if (ImGui::SliderInt("Supersampling (internal scale)", &ss, 1, 8)) {
-        psx_video_set_supersampling(ss);
+    if (psx_video_has_native_resolution()) {
+        char current[32];
+        std::snprintf(current, sizeof(current), "%d x %d", psx_video_get_internal_width(), psx_video_get_internal_height());
+        if (ImGui::BeginCombo("Internal resolution", current)) {
+            for (unsigned i = 0; i < NATIVE_RESOLUTION_PRESET_COUNT; ++i) {
+                int width, height;
+                native_resolution_preset(i, &width, &height);
+                char label[32];
+                std::snprintf(label, sizeof(label), "%d x %d", width, height);
+                if (ImGui::Selectable(label, psx_video_get_internal_width() == width && psx_video_get_internal_height() == height))
+                    psx_video_set_internal_resolution(width, height);
+            }
+            ImGui::EndCombo();
+        }
+    } else {
+        int ss = psx_video_get_supersampling();
+        if (ImGui::SliderInt("Internal scale", &ss, 1, 8, "%dx")) psx_video_set_supersampling(ss);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Live: the GL raster rebuilds at the next present"
-                          " (one-frame hitch).");
+        ImGui::SetTooltip("Internal render resolution. Independent of the window size.");
     }
 
     int ww = psx_video_get_window_width();
@@ -4387,6 +4406,16 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
         if (value == 0) return -2;
         return psx_input_swap_controller_ports() ? 0 : -3;
     }
+    if (std::strcmp(name, "aspect_ratio") == 0) {
+        if (value <= 0 || value2 <= 0 || value > 99 || value2 > 99 ||
+            value * 3 < value2 * 4 || value * 9 > value2 * 32) return -2;
+        const bool wide = value * 3 != value2 * 4;
+        if (!psx_video_set_aspect_runtime(value, value2, wide)) return -2;
+        s_aspect_num = value;
+        s_aspect_den = value2;
+        g_ws_bd_stretch_on = wide ? 1 : 0;
+        return 0;
+    }
     if (std::strcmp(name, "aspect_set") == 0) {
         int num = value  > 0 ? value  : 4;
         int den = value2 > 0 ? value2 : 3;
@@ -4414,6 +4443,12 @@ int psx_debug_overlay_widget_action(const char *name, int value, int value2)
     }
     if (std::strcmp(name, "supersampling") == 0) {
         psx_video_set_supersampling(value);
+        return 0;
+    }
+    if (std::strcmp(name, "internal_resolution") == 0) {
+        if (!psx_video_has_native_resolution() || value < 1 || value > 16384 || value2 < 1 || value2 > 16384)
+            return -2;
+        psx_video_set_internal_resolution(value, value2);
         return 0;
     }
     if (std::strcmp(name, "antialiasing") == 0) {

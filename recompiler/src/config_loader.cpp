@@ -28,6 +28,17 @@ namespace fs = std::filesystem;
 
 namespace {
 
+void parse_internal_resolution(const std::string& text, int& width, int& height) {
+    std::istringstream input(text);
+    int w = 0, h = 0;
+    char separator = 0;
+    if (!(input >> w >> separator >> h) || separator != 'x' ||
+        !(input >> std::ws).eof() || w < 1 || w > 16384 || h < 1 || h > 16384)
+        throw std::runtime_error("[video] internal_resolution must be WIDTHxHEIGHT (1..16384 per axis)");
+    width = w;
+    height = h;
+}
+
 struct ConfigHash {
     uint32_t value = 2166136261u; // FNV-1a 32
 
@@ -600,6 +611,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             }
             rt.video_supersampling = static_cast<int>(n);
         }
+        if (video.contains("internal_resolution"))
+            parse_internal_resolution(toml::find<std::string>(video, "internal_resolution"),
+                rt.video_internal_width, rt.video_internal_height);
         if (video.contains("window_width")) {
             const auto n = toml::find<int64_t>(video, "window_width");
             if (n < 640 || n > 7680) {
@@ -2441,6 +2455,11 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto n = toml::find<int64_t>(v, "supersampling");
             if (n >= 1 && n <= 8) { s.supersampling = (int)n; s.has_supersampling = true; }
         });
+        if (v.contains("internal_resolution")) try_get([&]{
+            parse_internal_resolution(toml::find<std::string>(v, "internal_resolution"),
+                s.internal_width, s.internal_height);
+            s.has_internal_resolution = true;
+        });
         if (v.contains("window_width")) try_get([&]{
             const auto n = toml::find<int64_t>(v, "window_width");
             if (n >= 640 && n <= 3840) { s.window_width = (int)n; s.has_window_width = true; }
@@ -2881,6 +2900,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
           << "\"\n";
     if (s.has_supersampling)
         f << "supersampling     = " << s.supersampling << "\n";
+    if (s.has_internal_resolution)
+        f << "internal_resolution = \"" << s.internal_width << "x" << s.internal_height << "\"\n";
     if (s.has_window_width)
         f << "window_width      = " << s.window_width << "\n";
     if (s.has_antialiasing) {

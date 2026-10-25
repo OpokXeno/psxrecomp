@@ -41,6 +41,8 @@
 #include <time.h>
 #include "png_write.h"   /* png_write_rgb — present_shot readback */
 #include "native_work_internal.h"
+#include "native_raster_layout.h"
+#include "native_resolution.h"
 #include "gpu_uv.h"
 
 /* Adaptive phase budget: how many motion phases each batch may author.
@@ -289,6 +291,7 @@ GlNativeGpuWork *s_native_gpu_work;
 uint8_t *s_native_gpu_readback_spare[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
 size_t s_native_gpu_readback_capacity[GL_NATIVE_MOTION_PHASE_CAPACITY + 1u];
 uint32_t s_native_gpu_scale;
+static GlNativeRasterLayout s_native_raster_layout = {.scale_x = 1.f, .scale_y = 1.f};
 int s_native_gpu_canonical;
 static GlNativeGpuCommand *native_gpu_command(GlNativeGpuWork *, GlNativeGpuOp);
 static int native_gpu_data(GlNativeGpuWork *, const void *, size_t, uint32_t *);
@@ -892,8 +895,8 @@ static void native_publish_compile_audit(const GlNativeCompileAudit *audit,
         s_native_compiler_diag.depth_written_fragments += audit->depth_written_fragments;
         s_native_compiler_diag.depth_reset_fragments += audit->depth_reset_fragments;
         if (audit->depth_key_min && audit->depth_key_max >= audit->depth_key_min) {
-            const int lo = (int)(log2((double)audit->depth_key_min) * 256.0);
-            const int hi = (int)(log2((double)audit->depth_key_max) * 256.0);
+            const int lo = (int)(log2((double)native_depth_decode(audit->depth_key_min)) * 256.0);
+            const int hi = (int)(log2((double)native_depth_decode(audit->depth_key_max)) * 256.0);
             if (!s_native_depth_view_log_max) {
                 s_native_depth_view_log_min = lo; s_native_depth_view_log_max = hi;
             } else {
@@ -1422,7 +1425,7 @@ typedef struct GlNativeCpuSurface {
     /* Writable only on the transaction-private Native canvas, never VIEW or
      * replay targets. Kept in lockstep with pixels at actual fragment writes. */
     uint16_t *words;
-    /* Optional Native depth plane (key 2^40/z_q12, 0 = far), indexed like
+    /* Optional Native depth plane (FP32 reciprocal Z bits, 0 = far), indexed like
      * pixels. Present only on VIEW/replay presentation targets with the option. */
     uint32_t *depth;
     uint32_t width;
@@ -2127,6 +2130,8 @@ void native_attribute_planes(const XgRenderIrTriangle *triangle,
                                 const double x[3], const double y[3],
                                 uint32_t scale, int gouraud,
                                 GlNativeAttributePlanes *out) {
+    const int continuous = scale == 0u;
+    if (continuous) scale = 1u;
     double value[5][3];
     const double area = (x[1]-x[0])*(y[2]-y[0]) - (x[2]-x[0])*(y[1]-y[0]);
     /* Beetle DrawTriangle's core selection, before its Y sort, including its
@@ -2134,7 +2139,7 @@ void native_attribute_planes(const XgRenderIrTriangle *triangle,
     const unsigned core = x[1] <= x[0] ? (x[2] <= x[1] ? 2u : 1u) :
                           x[2] < x[0] ? 2u : 0u;
     memset(out, 0, sizeof(*out));
-    out->x = x[core]; out->y = y[core]; out->integral = 1;
+    out->x = x[core]; out->y = y[core]; out->integral = !continuous;
     {
         /* The PS1 never samples a mapping's exclusive-edge texel (gpu_uv.h).
          * The seed bias above lands on it exactly only for unit uv slopes; a
@@ -2228,17 +2233,12 @@ static int native_triangle_all_projective(const XgRenderIrTriangle *triangle) {
  * wrote it. Blended fragments leave it unchanged. So OT order decides wherever
  * two certified surfaces do not meet directly.
  *
- * Key: D = 2^40 / z_q12 (= 4096 * 65536 / z), affine in screen space for a
- * perspective triangle. Each triangle gets one integer plane: N0 is D in Q8 at
- * the integer raster origin (ox, oy), and a, b are the Q8 gradients per logical
- * pixel. Evaluation is modular uint32 arithmetic; only the in-triangle result
- * has to fit, so the CPU reference (logical pixel corners) and the GPU at scale
- * 1 produce identical keys, and at scale S the GPU produces the same key at the
- * subpixel that coincides with the CPU sample.
- * Test: D + (D >> bias) >= Dold - (Dold >> 10): ties within 2^-10 resolve to
- * the later draw (OT order). Guest VRAM (plane 0 / native_vram) never has one. */
-#define GL_NATIVE_DEPTH_TIE_SHIFT 10
-#define GL_NATIVE_DEPTH_SLOPE_LIMIT (1 << 22)
+ * Key: FP32 D = 4096 / z_q12 (= 1 / view Z), affine in screen space.
+ * The R32UI planes preserve the float bits, not a quantized integer depth.
+ * Each triangle has an FP32 seed at the integer raster origin and logical
+ * gradients; GPU upload scales the gradients once per draw. Two fused
+ * multiply-adds evaluate the plane. Ties within 2^-10 resolve to the later
+ * draw (OT order). Guest VRAM (plane 0 / native_vram) never has depth. */
 
 /* Q12 unfloored view Z as projected. z <= H/2 is where the GTE quotient
  * saturates, so the vertex was placed as if at H/2: use that depth rather than
@@ -2260,17 +2260,15 @@ int32_t native_vertex_depth_q12(const XgRenderIrVertex *vertex) {
         vertex->projective_view_z <= 0xffff ? vertex->projective_view_z * 4096 : 0;
 }
 
-/* The integer plane through the exact raster positions this rasterizer uses.
- * Planes whose gradients exceed the fixed-point range (edge-on slivers, faces
- * reaching up to the camera) take their farthest corner's key, flat; that is
- * decided once here, identically for both rasterizers. */
+/* Reciprocal depth through the exact raster positions used by coverage.
+ * Prepare in double, then round the seed and gradients once to FP32. */
 static int native_depth_plane(const XgRenderIrTriangle *triangle,
                               const double x[3], const double y[3], GlNativeDepthPlane *out) {
     double d[3];
     for (unsigned i = 0u; i < 3u; ++i) {
         const int32_t z = native_vertex_depth_q12(&triangle->vertices[i]);
         if (z <= 0) return 0;
-        d[i] = 1099511627776.0 / z;
+        d[i] = 4096.0 / z;
     }
     const double area = (x[1]-x[0])*(y[2]-y[0]) - (x[2]-x[0])*(y[1]-y[0]);
     if (area == 0.0 || !isfinite(area)) return 0;
@@ -2278,36 +2276,24 @@ static int native_depth_plane(const XgRenderIrTriangle *triangle,
     const double ox = floor(x[0]), oy = floor(y[0]);
     const double dx = ((d[1]-d[0])*(y[2]-y[0]) - (d[2]-d[0])*(y[1]-y[0])) / area;
     const double dy = ((x[1]-x[0])*(d[2]-d[0]) - (x[2]-x[0])*(d[1]-d[0])) / area;
-    if (isfinite(dx) && isfinite(dy)) {
-        const double a = nearbyint(dx * 256.0), b = nearbyint(dy * 256.0);
-        const double n0 = nearbyint((d[0] + dx * (ox - x[0]) + dy * (oy - y[0])) * 256.0);
-        if (fabs(a) <= GL_NATIVE_DEPTH_SLOPE_LIMIT && fabs(b) <= GL_NATIVE_DEPTH_SLOPE_LIMIT &&
-            n0 >= 256.0 && n0 < 1073741824.0) {
-            *out = (GlNativeDepthPlane){(int32_t)n0, (int32_t)a, (int32_t)b, (int32_t)ox, (int32_t)oy};
-            return 1;
-        }
+    const float seed = (float)(d[0] + dx * (ox - x[0]) + dy * (oy - y[0]));
+    const float a = (float)dx, b = (float)dy;
+    if (isfinite(seed) && isfinite(a) && isfinite(b)) {
+        *out = (GlNativeDepthPlane){seed, a, b, (int32_t)ox, (int32_t)oy};
+        return 1;
     }
-    /* Too steep for the fixed-point plane (a face reaching right up to the
-     * camera, a near-plane clip): one constant key, its farthest corner's.
-     * It still occludes what lies behind all of it, and never covers
-     * anything in front of its far end (feet standing on that ground). */
-    const double far_key = fmin(fmin(d[0], d[1]), d[2]) * 256.0;
-    if (!isfinite(far_key) || far_key < 256.0) return 0;
-    *out = (GlNativeDepthPlane){(int32_t)fmin(far_key, 1073741823.0), 0, 0, (int32_t)ox, (int32_t)oy};
+    /* Only non-representable planes need a conservative flat fallback now;
+     * finite steep triangles no longer hit the old fixed-point slope limit. */
+    *out = (GlNativeDepthPlane){(float)fmin(fmin(d[0], d[1]), d[2]), 0.0f, 0.0f, (int32_t)ox, (int32_t)oy};
     return 1;
 }
 
-/* Key at a logical pixel corner (x, y); mirrors the shader at r = 0. */
 static inline uint32_t native_depth_at(const GlNativeDepthPlane *plane, int x, int y) {
-    const uint32_t n = (uint32_t)plane->n0 + (uint32_t)plane->a * (uint32_t)(x - plane->ox) +
-        (uint32_t)plane->b * (uint32_t)(y - plane->oy);
-    const int32_t d = (int32_t)n >> 8;
-    return d < 1 ? 1u : (uint32_t)d;
+    return native_depth_evaluate(plane->n0, plane->a, plane->b, (float)(x - plane->ox), (float)(y - plane->oy));
 }
 
 static inline int native_depth_pass(uint32_t key, int bias, uint32_t stored) {
-    const uint32_t tested = key + (bias ? key >> bias : 0u);
-    return tested >= stored - (stored >> GL_NATIVE_DEPTH_TIE_SHIFT);
+    return native_depth_biased(key, (unsigned)bias) >= native_depth_threshold(stored);
 }
 
 /* Per-triangle mode from the draw's stamp and its FINAL material. */
@@ -4926,7 +4912,7 @@ static int native_gpu_coalesce_append(GlNativeGpuWork *work, GlNativeGpuCommand 
 }
 
 /* The depth view's key range, now that no CPU raster writes fragments:
- * the keys (2^40 / Q12 view Z, as native_depth_plane) of the on-screen
+ * the FP32 keys (4096 / Q12 view Z, as native_depth_plane) of the on-screen
  * corners of the endpoint's depth-writing triangles. */
 static void native_gpu_note_depth_range(GlNativeCpuCompiler *compiler, const XgSemanticDrawRecord *draw,
                                         const GlNativeGpuMeshTriangle *mesh, uint32_t mesh_count) {
@@ -4944,7 +4930,7 @@ static void native_gpu_note_depth_range(GlNativeCpuCompiler *compiler, const XgS
             if (x < 0 || y < 0 || (width && x >= width) || (height && y >= height)) continue;
             const int32_t z = native_vertex_depth_q12(vertex);
             if (z <= 0) continue;
-            const uint32_t key = (uint32_t)fmin(4294967295.0, 1099511627776.0 / z);
+            const uint32_t key = native_depth_encode((float)(4096.0 / z));
             if (!compiler->audit->depth_key_min || key < compiler->audit->depth_key_min)
                 compiler->audit->depth_key_min = key;
             if (key > compiler->audit->depth_key_max) compiler->audit->depth_key_max = key;
@@ -9155,6 +9141,7 @@ static void native_motion_endpoints_compute(const GlNativeRecipe *recipe, const 
  * all OpenGL execution stays on its existing FIFO owner. */
 typedef struct GlNativePhaseJob {
     const GlNativeRecipe *recipe;
+    const GlNativeGpuWork *raster_source;
     const GlNativeVertexCache *vertices;
     const GlNativeMotionEntity *render_entities;
     GlNativeMotionEntity *entities;
@@ -9255,6 +9242,13 @@ static void native_phase_job_execute(GlNativePhaseJob *job, int capture) {
     gpu->capture_templates = job->capture_templates;
     gpu->static_records = job->static_records;
     gpu->scale = job->scale;
+    if (job->raster_source) {
+        gpu->render_width = job->raster_source->render_width;
+        gpu->render_height = job->raster_source->render_height;
+        memcpy(gpu->raster_scale, job->raster_source->raster_scale, sizeof(gpu->raster_scale));
+        gpu->raster_page_rows = job->raster_source->raster_page_rows;
+        gpu->raster_page_pixels = job->raster_source->raster_page_pixels;
+    }
     gpu->wave_phase = (double)(job->phase + 1u) / job->denominator;
     gpu->depth_test = job->depth_test;
     gpu->depth_view = job->depth_view;
@@ -9306,7 +9300,7 @@ static void native_phase_job_execute(GlNativePhaseJob *job, int capture) {
             if (gpu->commands[c].kind == NATIVE_GPU_DRAW &&
                 gpu->commands[c].draw.topology == GPU_RENDER_SEMANTIC_TRIANGLES)
                 triangles += native_gpu_command_triangles(&gpu->commands[c]);
-        gpu->gpu_setup = native_gpu_setup_enabled(triangles);
+        gpu->gpu_setup = !gpu->render_width && native_gpu_setup_enabled(triangles);
     }
     if (job->ok && !s_native_motion_probe.target_vblank)
         gpu->geometry = native_gpu_geometry_prepare(gpu);
@@ -9606,6 +9600,7 @@ static int native_motion_layout_equal(const GlNativeMotionHistory *history, cons
         a->disabled == b->disabled && a->native_width == b->native_width &&
         a->native_height == b->native_height && a->native_offset_x == b->native_offset_x &&
         a->temporal_hz == b->temporal_hz &&
+        a->render_width == b->render_width && a->render_height == b->render_height &&
         a->dithering_disabled == b->dithering_disabled &&
         a->native_depth_test == b->native_depth_test &&
         (a->render_scale ? a->render_scale : 1u) == (b->render_scale ? b->render_scale : 1u);
@@ -9848,7 +9843,7 @@ static void native_motion_prepare(GlNativeCompileAudit *audit, GlNativeViewState
         const size_t entity_bytes = (size_t)recipe->motion_count * sizeof(*entities);
         for (uint32_t phase = 0u; phase < phase_count; ++phase) {
             GlNativePhaseJob *job = &phase_jobs[phase];
-            *job = (GlNativePhaseJob){.recipe = recipe, .vertices = &vertices,
+            *job = (GlNativePhaseJob){.recipe = recipe, .raster_source = views->gpu, .vertices = &vertices,
                 .render_entities = entities, .projections = projections + (size_t)phase * recipe->count,
                 .endpoints = &endpoints,
                 .initial_words = views->gpu->words, .identity = views->gpu->identity,
@@ -11050,6 +11045,38 @@ static GlNativeGpuWork *native_gpu_work_create(XgRenderSourceCommitHandle commit
     gpu->words = malloc((size_t)VRAM_W * VRAM_H * sizeof(*gpu->words));
     if (!gpu->words) { native_gpu_buffers_free(gpu); free(gpu); return NULL; }
     gpu->scale = scale; gpu->commit = commit; gpu->identity = audit->header.identity;
+    const XgSemanticDisplayState *display = &audit->header.display;
+    GlNativeRasterLayout raster;
+    if (!native_raster_layout_build(display, scale, &raster)) {
+        native_gpu_buffers_free(gpu); free(gpu->words); free(gpu); return NULL;
+    }
+    if (raster.width) {
+        /* The display may crop a larger authored framebuffer. Keep the
+         * framebuffer origin, rather than the crop, on an integer pixel. */
+        raster.page_rows = base_gpu ? base_gpu->raster_page_rows : s_native_raster_layout.page_rows;
+        if (raster.page_rows < display->height) raster.page_rows = 0u;
+        const int shown = native_view_cover(base_views, base_views->count,
+            display->display_x, display->display_y, display->width, display->height);
+        const uint32_t origin = shown >= 0 ? base_views->targets[shown].y : display->display_y;
+        if (origin >= display->height) raster.page_rows = origin;
+        if (!raster.page_rows) {
+            for (uint32_t i = 0; i < base_views->count; ++i) {
+                const GlNativeViewTarget *target = &base_views->targets[i];
+                if (target->x == display->display_x && target->width == display->width &&
+                    target->height >= display->height && target->y >= display->height &&
+                    (!raster.page_rows || target->y < raster.page_rows)) raster.page_rows = target->y;
+            }
+        }
+    }
+    gpu->render_width = raster.width;
+    gpu->render_height = raster.height;
+    gpu->raster_scale[0] = raster.scale_x;
+    gpu->raster_scale[1] = raster.scale_y;
+    gpu->raster_page_rows = raster.page_rows;
+    if (raster.page_rows && display->height)
+        raster.page_pixels = native_resolution_page_pixels(raster.page_rows, raster.height, display->height);
+    gpu->raster_page_pixels = raster.page_pixels;
+
     gpu->canonical_gpu = native_gpu_canonical_enabled(&audit->header);
     if (gpu->canonical_gpu) {
         gpu->canonical_pixels = malloc((size_t)VRAM_W * VRAM_H * sizeof(*gpu->canonical_pixels));
@@ -11064,7 +11091,11 @@ static GlNativeGpuWork *native_gpu_work_create(XgRenderSourceCommitHandle commit
     for (uint32_t i = 0u; i < GL_NATIVE_GPU_PHASE_BASE; ++i)
         gpu->base_planes[i] = base_gpu ? base_gpu->widths[i] != 0u : g_native_backend->plane_resident(i);
     gpu->deferred = deferred;
-    gpu->fresh = scale != base_scale ||
+    const GlNativeRasterLayout base_raster = base_gpu
+        ? (GlNativeRasterLayout){base_gpu->render_width, base_gpu->render_height,
+            base_gpu->raster_scale[0], base_gpu->raster_scale[1], base_gpu->raster_page_rows, base_gpu->raster_page_pixels}
+        : s_native_raster_layout;
+    gpu->fresh = scale != base_scale || !native_raster_layout_equal(&raster, &base_raster) ||
         gpu->canonical_gpu != (base_gpu ? base_gpu->canonical_gpu : s_native_gpu_canonical) ||
         base_views->width != audit->header.display.native_width ||
         base_views->offset != audit->header.display.native_offset_x ||
@@ -11492,6 +11523,8 @@ gpu_ready:
         if (gpu) {
             g_native_backend->apply_planes(gpu);
             s_native_gpu_scale=gpu->scale;
+            s_native_raster_layout = (GlNativeRasterLayout){gpu->render_width, gpu->render_height,
+                gpu->raster_scale[0], gpu->raster_scale[1], gpu->raster_page_rows, gpu->raster_page_pixels};
             s_native_gpu_canonical=gpu->canonical_gpu;
             s_native_compiler_diag.gpu.applied++;
             if (gpu->scanout) s_native_compiler_diag.gpu.last_reference_digest=motion.history.reference_digest;
@@ -11570,6 +11603,8 @@ gpu_ready:
         .disabled = audit->header.display.disabled ? 1 : 0,
         .temporal_hz = audit->header.display.temporal_hz,
         .render_scale = (uint16_t)(gpu && gpu->scanout ? gpu->scale : 1u),
+        .render_width = (uint16_t)(gpu && gpu->scanout ? gpu->render_width : 0u),
+        .render_height = (uint16_t)(gpu && gpu->scanout ? gpu->render_height : 0u),
         .temporal_phase_count = motion.count,
         .temporal_interval_vblanks = audit->temporal_interval_vblanks,
         .temporal_interval_ns = motion.interval_ns,
